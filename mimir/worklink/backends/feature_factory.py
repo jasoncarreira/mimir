@@ -17,7 +17,7 @@ from ..compute import ComputeResult, WorkSpec
 from .base import Caps, CheckoutShape, RawResult, WorkOrder
 
 
-FACTORY_VERSION = "0.7.0"
+FACTORY_VERSION = "0.7.2"
 DEFAULT_FACTORY_ENTRYPOINT = "/opt/mimir-opencode/lib/node_modules/feature-factory/bin/factory.js"
 FACTORY_COMMANDS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("init", ("init",)),
@@ -43,12 +43,29 @@ _MAX_STATUS_BYTES = 1024 * 1024
 _MAX_LIST_ITEMS = 1000
 _MAX_TEXT_BYTES = 16 * 1024
 _MAX_JSON_DEPTH = 32
-_ARGUMENT_STRUCTURE = re.compile(
-    r"(?im)(?:^\s*usage\s*:|\b(?:argument|option|operand|required|requires|missing|expected)\b)"
-)
+_DEFAULT_FACTORY_MAX_RETRIES = 5
+_MAX_FACTORY_MAX_RETRIES = 9_007_199_254_740_991
+_FACTORY_MAX_RETRIES_ENV = "MIMIR_FACTORY_MAX_RETRIES"
+_ASCII_DECIMAL = re.compile(r"[0-9]+")
 _UNKNOWN_STRUCTURE = re.compile(r"(?im)\b(?:unknown|unrecognized)\b[^\n]*\bcommand\b")
 
 Runner = Callable[..., subprocess.CompletedProcess[Any]]
+
+
+def _factory_max_retries(environ: Mapping[str, str] | None = None) -> int:
+    source = os.environ if environ is None else environ
+    raw = source.get(_FACTORY_MAX_RETRIES_ENV)
+    if raw is None or _ASCII_DECIMAL.fullmatch(raw) is None:
+        return _DEFAULT_FACTORY_MAX_RETRIES
+    normalized = raw.lstrip("0")
+    if not normalized:
+        return _DEFAULT_FACTORY_MAX_RETRIES
+    maximum = str(_MAX_FACTORY_MAX_RETRIES)
+    if len(normalized) > len(maximum) or (
+        len(normalized) == len(maximum) and normalized > maximum
+    ):
+        return _DEFAULT_FACTORY_MAX_RETRIES
+    return int(normalized)
 
 
 class FactoryContractError(RuntimeError):
@@ -58,13 +75,13 @@ class FactoryContractError(RuntimeError):
 @dataclass(frozen=True)
 class FactoryStatus:
     run_id: str
-    issue_key: str
+    issue_key: str | None
     valid: bool
     sandbox_path: str
     status: str
     mode: str
     branch: str
-    pr_base: str
+    pr_base: str | None
     pr_draft: bool
     lock: str
     dead_lock: bool
@@ -143,7 +160,6 @@ _REQUIRED_STATUS_FIELDS = frozenset(
         "terminal_result",
     }
 )
-_STATUS_FIELDS = _REQUIRED_STATUS_FIELDS | {"next"}
 
 
 def _bounded_text(value: object, name: str, *, nullable: bool = False) -> str | None:
@@ -248,11 +264,8 @@ def parse_factory_status(payload: bytes | str | Mapping[str, Any]) -> FactorySta
         raise FactoryContractError("factory status output exceeds bounds")
     keys = set(decoded)
     missing = _REQUIRED_STATUS_FIELDS - keys
-    unknown = keys - _STATUS_FIELDS
     if missing:
         raise FactoryContractError(f"factory status missing field: {sorted(missing)[0]}")
-    if unknown:
-        raise FactoryContractError(f"factory status contains unknown field: {sorted(unknown)[0]}")
     lock = _bounded_text(decoded["lock"], "lock")
     if lock not in {"fresh", "stale", "absent"}:
         raise FactoryContractError("factory status lock must be fresh, stale, or absent")
@@ -260,13 +273,13 @@ def parse_factory_status(payload: bytes | str | Mapping[str, Any]) -> FactorySta
     next_value = _bounded_text(decoded.get("next"), "next", nullable=True) if next_present else None
     return FactoryStatus(
         run_id=_bounded_text(decoded["run_id"], "run_id") or "",
-        issue_key=_bounded_text(decoded["issue_key"], "issue_key") or "",
+        issue_key=_bounded_text(decoded["issue_key"], "issue_key", nullable=True),
         valid=_bool(decoded["valid"], "valid"),
         sandbox_path=_bounded_text(decoded["sandbox_path"], "sandbox_path") or "",
         status=_bounded_text(decoded["status"], "status") or "",
         mode=_bounded_text(decoded["mode"], "mode") or "",
         branch=_bounded_text(decoded["branch"], "branch") or "",
-        pr_base=_bounded_text(decoded["pr_base"], "pr_base") or "",
+        pr_base=_bounded_text(decoded["pr_base"], "pr_base", nullable=True),
         pr_draft=_bool(decoded["pr_draft"], "pr_draft"),
         lock=lock,
         dead_lock=_bool(decoded["dead_lock"], "dead_lock"),
@@ -515,16 +528,14 @@ def probe_factory_capabilities(entrypoint: Path, *, runner: Runner = subprocess.
         _, unknown = invoke((_UNKNOWN_PROBE,))
         if _UNKNOWN_PROBE not in unknown or _UNKNOWN_STRUCTURE.search(unknown) is None:
             raise FactoryContractError("factory unknown-command control was not structural")
-        unknown_form = unknown.replace(_UNKNOWN_PROBE, "{command}")
         for command, argv in FACTORY_COMMANDS:
             _, diagnostic = invoke(argv)
-            token = re.compile(rf"(?<![A-Za-z0-9_-]){re.escape(command)}(?![A-Za-z0-9_-])")
-            if token.search(diagnostic) is None or _ARGUMENT_STRUCTURE.search(diagnostic) is None:
+            if not diagnostic:
                 raise FactoryContractError(f"factory capability probe failed for {command}")
             if _UNKNOWN_STRUCTURE.search(diagnostic) is not None:
                 raise FactoryContractError(f"factory capability probe treated {command} as unknown")
-            normalized = token.sub("{command}", diagnostic)
-            if normalized == unknown_form or normalized.startswith(unknown_form):
+            unknown_form = unknown.replace(_UNKNOWN_PROBE, command)
+            if diagnostic == unknown_form or diagnostic.startswith(unknown_form):
                 raise FactoryContractError(f"factory capability probe matched unknown form for {command}")
 
 
@@ -584,6 +595,9 @@ class FeatureFactoryBackend:
 
     @staticmethod
     def opencode_argv(operator_checkout: Path, issue_number: int) -> tuple[str, ...]:
+        retries = _factory_max_retries()
+        # feature-factory 0.7.2 stages the workflow inside the run directory, so
+        # OpenCode --auto must not bypass it.
         return (
             "opencode",
             "run",
@@ -594,7 +608,7 @@ class FeatureFactoryBackend:
             str(operator_checkout),
             "--command",
             "feature",
-            f" --autonomous {issue_number}",
+            f" --autonomous --max-retries {retries} {issue_number}",
         )
 
     def _control(

@@ -50,8 +50,8 @@ The in-mimir integrated-epic runner — brief → `work-decomposer` → `decompo
 `integration-validator` → one final draft PR — **was removed in #830** after the
 epic #783 arc concluded (every failure was distribution tax in that layer).
 
-Epics are built by `feature-factory@0.7.0` through the lockstep
-`opencode-feature-factory@0.7.0` adapter. OpenCode's `/feature` workflow owns
+Epics are built by `feature-factory@0.7.2` through the lockstep
+`opencode-feature-factory@0.7.2` adapter. OpenCode's `/feature` workflow owns
 factory transitions. Worklink owns the outer Chainlink claim, isolated attempt
 checkout, OpenCode process, restart record, status observation, repository tests,
 and final PR identity verification.
@@ -64,15 +64,48 @@ and final PR identity verification.
   flag is set, epics are only excluded from leaf dispatch and are never
   dispatched (no dispatch-then-refuse churn).
 - **Launch**: Worklink supervises exactly `opencode run --log-level DEBUG
-  --print-logs --dir <checkout> --command feature " --autonomous <issue>"`.
+  --print-logs --dir <checkout> --command feature " --autonomous --max-retries
+  5 <issue>"`.
   Cancellation is verified process-group cancellation through `mimir worklink
   stop`; feature-factory has no cancel transition.
+- **Retry and staging**: `MIMIR_FACTORY_MAX_RETRIES` defaults to `5`, accepts
+  exactly ASCII `[0-9]+` in range `1..9007199254740991`, and falls back to `5`
+  for absent or invalid values. feature-factory 0.7.2 stages the workflow inside
+  the run directory; exact token `--auto` is never passed. Worklink's base
+  selects the checkout start point and PR target; it is not factory `--base`,
+  which is never passed.
+- **First-dispatch identity**: Before first factory dispatch only, after checkout
+  creation and before process launch, Worklink reads the effective checkout `git
+  config --get user.name` and `git config --get user.email`. Both must be
+  nonblank. The child receives `GIT_AUTHOR_NAME`, `GIT_AUTHOR_EMAIL`,
+  `GIT_COMMITTER_NAME`, and `GIT_COMMITTER_EMAIL`; Worklink never writes sandbox
+  Git identity configuration.
+- **Publication credential**: Worklink reads the nonblank `publishing_identity`
+  only from the trusted controller checkout's `.factory.json`. For GitHub
+  publication Worklink verifies the credential this process is already bound to,
+  `GITHUB_TOKEN`, rather than selecting among candidates: `GH_TOKEN` is a
+  child-only alias for `gh`, and verifying a second credential in a process that
+  already verified one is refused by the forge identity memo before `/user` is
+  ever reached. That token's owner is compared against the declared identity
+  before dispatch, then both child aliases are normalized to it. `GH_TOKEN` and
+  `GITHUB_TOKEN` set to different values fail dispatch as an operator ambiguity
+  rather than one being preferred, and a missing `GITHUB_TOKEN` fails naming that
+  variable - in both cases without disclosing values.
 - **Controls**: Every control is `node <absolute feature-factory/bin/factory.js>`.
-  Worklink admits the launcher only after package/adapter 0.7.0 verification and
+  Worklink admits the launcher only after package/adapter 0.7.2 verification and
   all 16 nonmutating structural command probes. Status is read with `status
   <run-id> --repo <sandbox> --json`; resume and heartbeat reuse the retained
   session; lock actions use `lock <run-id> <claim|steal|release> --session
   <session> --repo <sandbox>`.
+- **Status contract**: Factory status responses are bounded whole JSON payloads
+  with required, typed known fields; additive top-level fields are ignored.
+  `issue_key`, `pr_base`, `lock_session`, and `pr_url` are string-or-null, while
+  `validator` and `terminal_result` are object-or-null. Binding a status to a
+  Worklink record requires a non-null matching issue key. A null PR base is
+  allowed during recovery and ordinary running, parked, blocked, or partial
+  observation, but a populated base must always match the record. Completed
+  publication verification requires a non-null matching PR base before evidence
+  collection or GitHub API calls.
 - **State**: Worklink records live under
   `<MIMIR_HOME>/state/worklink/factory-runs/<numeric-run-id>.json`. They preserve
   the exact launcher, sandbox, session, process handle, strict latest status,
@@ -429,7 +462,7 @@ require touching the orchestrator.
 | Adapter | Invocation sketch | Notes |
 |---|---|---|
 | `opencode` | `opencode run --dir <checkout> -- <prompt>` | Sole coding backend for leaf issues; provider and model are selected by opencode configuration/arguments. |
-| `feature_factory` | `opencode run ... --command feature " --autonomous <issue>"` | Epic adapter with Worklink-supervised OpenCode and absolute 0.7 controls. |
+| `feature_factory` | `opencode run ... --command feature " --autonomous --max-retries 5 <issue>"` | Epic adapter with Worklink-supervised OpenCode and absolute 0.7.2 controls. |
 
 Selection is config, not code (§7): per repo / label / issue-type, with
 a per-category default. The executor consults `Caps` rather than

@@ -78,6 +78,37 @@ def test_factory_record_rejects_identity_and_sandbox_mismatch(tmp_path: Path) ->
         replace(expected, sandbox=str(tmp_path / "different"))
 
 
+def test_factory_record_binds_nullable_status_to_durable_identity(tmp_path: Path) -> None:
+    expected = record(tmp_path)
+    status = expected.status
+    assert status is not None
+
+    nullable_base = replace(
+        expected,
+        status=replace(
+            status,
+            pr_base=None,
+            validator={"status": "approved"},
+            terminal_result={"reason": "opaque"},
+        ),
+    )
+    assert FactoryRunRecord.from_json(nullable_base.to_json()) == nullable_base
+
+    with pytest.raises(FactoryRecordError, match="identity mismatch"):
+        replace(expected, status=replace(status, issue_key=None))
+    with pytest.raises(FactoryRecordError, match="identity mismatch"):
+        replace(expected, status=replace(status, issue_key="1552"))
+    with pytest.raises(FactoryRecordError, match="base mismatch"):
+        replace(expected, status=replace(status, pr_base="develop"))
+
+
+def test_factory_record_schema_remains_exact(tmp_path: Path) -> None:
+    payload = record(tmp_path).to_json()
+    payload["future_record_metadata"] = {"generation": 2}
+    with pytest.raises(FactoryRecordError, match="fields are invalid"):
+        FactoryRunRecord.from_json(payload)
+
+
 def test_factory_record_rejects_symlink_and_non_numeric_names(tmp_path: Path) -> None:
     expected = record(tmp_path)
     path = save_factory_record(tmp_path, expected)

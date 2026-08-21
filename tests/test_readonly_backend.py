@@ -2072,7 +2072,7 @@ class TestBuildFileToolRoutes:
         assert ls_names == {"safe.txt"}
 
     @pytest.mark.parametrize("home_location", ["route", "tmp"])
-    def test_non_admin_home_collections_surface_state_and_memory(
+    def test_non_admin_home_collections_surface_only_admitted_subtrees(
         self,
         home_location: str,
         tmp_path: Path,
@@ -2105,6 +2105,14 @@ class TestBuildFileToolRoutes:
             (home / dirname / "hidden.txt").write_text(
                 f"needle hidden {dirname}\n", encoding="utf-8",
             )
+        # `attachments/` is no longer an admitted home root - only the nested
+        # `attachments/fetch-cache` is - and the collection walker does not
+        # descend into a non-admitted parent. So nothing under `attachments`
+        # surfaces here, including the inbound uploads that must never surface.
+        (home / "attachments" / "inbound").mkdir(parents=True)
+        (home / "attachments" / "inbound" / "hidden.txt").write_text(
+            "needle hidden inbound\n", encoding="utf-8",
+        )
         monkeypatch.setenv("MIMIR_HOME", str(home))
         auth = AuthContext(
             principal="u", canonical_principal="u", roles=("user",),
@@ -2128,10 +2136,12 @@ class TestBuildFileToolRoutes:
                 shutil.rmtree(home, ignore_errors=True)
 
         assert grep_paths == {
-            "/home/memory/hidden.txt", "/home/state/visible.txt",
+            "/home/memory/hidden.txt",
+            "/home/state/visible.txt",
         }
         assert glob_paths == {
-            "/home/memory/hidden.txt", "/home/state/visible.txt",
+            "/home/memory/hidden.txt",
+            "/home/state/visible.txt",
         }
         assert ls_names == {"memory", "state"}
 

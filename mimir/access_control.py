@@ -586,12 +586,25 @@ _CAPABILITY_COMPANIONS: dict[str, frozenset[str]] = {
     "bash_async": frozenset({"bash_jobs_list", "bash_job_output"}),
 }
 
+_PROFILE_CAPABILITY_COMPANIONS: dict[str, dict[str, frozenset[str]]] = {
+    "heartbeat": {
+        "worklink_run": frozenset({"read_file", "ls", "shell_exec"}),
+    },
+    "session-boundary": {
+        "saga_end_session": frozenset({"fetch_url", "read_file", "ls", "shell_exec"}),
+    },
+}
 
-def _missing_capability_companions(capabilities: set[str]) -> set[str]:
+
+def _missing_capability_companions(
+    capabilities: set[str], *, profile: str | None = None,
+) -> set[str]:
+    companions = dict(_CAPABILITY_COMPANIONS)
+    companions.update(_PROFILE_CAPABILITY_COMPANIONS.get(profile or "", {}))
     return {
         companion
         for capability in capabilities
-        for companion in _CAPABILITY_COMPANIONS.get(capability, ())
+        for companion in companions.get(capability, ())
         if companion not in capabilities
     }
 
@@ -649,7 +662,7 @@ TRIGGER_AUTHORITY_PROFILES: dict[str, frozenset[str]] = {
         "memory_store", "saga_feedback", "saga_mark_contributions",
         "saga_end_session", "saga_record_skill_learning",
         "memory_get",
-        "bash_jobs_list", "bash_job_output",
+        "shell_exec", "bash_jobs_list", "bash_job_output", "fetch_url",
         "read_file", "aread", "ls", "als", "glob", "aglob", "grep",
         "agrep", "file_search", "get_turn", "mimir_get_turn",
         "write_file", "edit_file", "rebuild_index", "pr_metadata", "pr_checks",
@@ -688,10 +701,16 @@ _BUILTIN_TRIGGER_PROFILE_CONFIG: dict[str, dict[str, Any]] = {
 _SHELL_PROFILE_BY_AUTHORITY_PROFILE = {
     "github": "repo_review",
     "heartbeat": "maintenance",
+    "session-boundary": "session_boundary",
 }
 _FETCH_URL_POLICY_BY_AUTHORITY_PROFILE = {
     "heartbeat": ("approved_urls", "MIMIR_HEARTBEAT_APPROVED_URLS"),
     "github": ("github_pr_api", "GITHUB_REPOS"),
+    "session-boundary": ("github_pr_api", "GITHUB_REPOS"),
+}
+BOUNDED_PROFILE_CAPABILITIES: dict[str, frozenset[str]] = {
+    "github": frozenset({"fetch_url"}),
+    "session-boundary": frozenset({"fetch_url"}),
 }
 _PR_REVIEW_SCOPE_AUTHORITY_PROFILES = frozenset({"heartbeat"})
 
@@ -719,7 +738,7 @@ def build_trigger_service_principal(
 ) -> ServicePrincipal:
     """Build one immutable instance principal from already-validated authority."""
     capability_set = set(capabilities)
-    missing = _missing_capability_companions(capability_set)
+    missing = _missing_capability_companions(capability_set, profile=profile)
     if missing:
         raise ValueError(
             "capabilities require companions: "
@@ -2965,6 +2984,44 @@ def _target_matches_repo_review_shell_command(
     return False
 
 
+def _gh_repo_operands_are_configured(arguments: list[str]) -> bool:
+    """Require every explicit ``--repo`` operand to name configured server state.
+
+    The syntax matchers accept ``--repo <value>`` without inspecting the value.
+    On a repo-review turn the bound comes from that turn's immutable pull-request
+    scope, but the session-boundary profile carries no such scope, so an
+    unchecked operand would reach any repository the process token can see.
+    """
+    index = 0
+    while index < len(arguments):
+        if arguments[index] != "--repo":
+            index += 1
+            continue
+        if index + 1 >= len(arguments):
+            return False
+        if not is_configured_github_repo(arguments[index + 1]):
+            return False
+        index += 2
+    return True
+
+
+def _target_matches_session_boundary_shell_command(argv: list[str]) -> bool:
+    """Admit only tracker operations and the GitHub reads used at session close."""
+    if _target_matches_chainlink_command(argv):
+        return True
+    if argv[:3] == ["gh", "issue", "view"]:
+        return (
+            _repo_review_gh_issue_view_arguments(argv[3:])
+            and _gh_repo_operands_are_configured(argv[3:])
+        )
+    if argv[:3] == ["gh", "pr", "view"]:
+        return (
+            _target_matches_repo_review_shell_command(argv)
+            and _gh_repo_operands_are_configured(argv[3:])
+        )
+    return False
+
+
 _MAINTENANCE_PINNED_EXECUTABLE_DEFAULTS = {
     "git": Path("/usr/bin/git"),
     "gh": Path("/usr/bin/gh"),
@@ -3996,6 +4053,8 @@ def parse_service_shell_argv_with_diagnostics(
                 )
             return git_argv, "", None
         allowed = _target_matches_maintenance_shell_command(argv)
+    elif destination == "session_boundary":
+        allowed = _target_matches_session_boundary_shell_command(argv)
     elif destination == "upgrade_workspace":
         if argv[0] == "git":
             git_argv = _upgrade_workspace_git_execution_argv(argv)
@@ -5000,7 +5059,7 @@ _REPOSITORY_RESULT_RESOURCE = re.compile(
 def _forge_repository_scope_mismatch(
     ifc_labels: Any,
     scope: Any,
-) -> tuple[str, str] | None:
+) -> tuple[str, str, str] | None:
     """Return the first repository result that is outside a forge sink scope."""
     expected_repo = getattr(scope, "canonical_repo", None)
     expected_issue = getattr(scope, "issue_number", None)
@@ -5015,7 +5074,7 @@ def _forge_repository_scope_mismatch(
             if isinstance(resource_id, str) else None
         )
         if match is None:
-            return str(resource_id or "unknown"), "unknown"
+            return str(resource_id or "unknown"), "unknown", "resource_id"
         source_repo = match.group("repo")
         source_pr = int(match.group("pr"))
         source_head = match.group("head")
@@ -5024,16 +5083,18 @@ def _forge_repository_scope_mismatch(
                 isinstance(expected_repo, str)
                 and source_repo.casefold() == expected_repo.casefold()
             ):
-                return source_repo, str(source_pr)
+                return source_repo, str(source_pr), "canonical_repo"
             continue
-        if not (
-            isinstance(expected_repo, str)
-            and source_repo.casefold() == expected_repo.casefold()
-            and source_pr == expected_pr
-            and isinstance(expected_head, str)
-            and source_head.casefold() == expected_head.casefold()
+        if not isinstance(expected_repo, str) or (
+            source_repo.casefold() != expected_repo.casefold()
         ):
-            return source_repo, str(source_pr)
+            return source_repo, str(source_pr), "canonical_repo"
+        if source_pr != expected_pr:
+            return source_repo, str(source_pr), "pr_number"
+        if not isinstance(expected_head, str) or (
+            source_head.casefold() != expected_head.casefold()
+        ):
+            return source_repo, str(source_pr), "observed_head_sha"
     return None
 
 
@@ -5585,7 +5646,7 @@ class SinkGate:
                 ifc_labels, repo_pr_action_scope,
             )
             if mismatch is not None:
-                source_repo, source_pr = mismatch
+                source_repo, source_pr, mismatch_component = mismatch
                 destination_repo = getattr(
                     repo_pr_action_scope, "canonical_repo", "unknown",
                 )
@@ -5606,7 +5667,8 @@ class SinkGate:
                     refusal_detail=(
                         f"repository result from {source_repo}#{source_pr} cannot "
                         f"flow to {destination_repo}#{destination_pr}: repository, "
-                        "pull request, and observed head must match"
+                        "pull request, and observed head must match "
+                        f"(mismatched component: {mismatch_component})"
                     ),
                 )
 
@@ -7136,8 +7198,8 @@ class ToolRegistry:
         ifc_labels: Any = None,
         sink_category: SinkCategory | None = None,
     ) -> None:
-        """Emit shadow-decision audit log (when enabled)."""
-        if not self._shadow_logging_enabled:
+        """Emit a would-block shadow-decision audit log (when enabled)."""
+        if not self._shadow_logging_enabled or not auth.would_block:
             return
         try:
             import asyncio
@@ -7208,9 +7270,7 @@ class ToolRegistry:
                     log.warning("IFC source audit classification failed: %s", exc)
 
             fields.update({
-                # Shadow decisions cover both compatibility bypasses and trusted
-                # service-capability grants. Bypasses carry the denial reason
-                # that enforcement would apply; capability grants do not.
+                # Emission is restricted to calls enforcement would refuse.
                 "would_block": auth.would_block,
                 "target": redacted_resolved_target,
                 # Caller input is evidence only. It is never resolved, compared
@@ -8378,7 +8438,9 @@ _TRUSTED_SERVICE_PRINCIPALS: dict[str, ServicePrincipal] = {
                 "session", "saga", "filesystem", "turn_history", "shell_jobs",
                 "repository",
             ),
-            sink_destinations=("filesystem", "session_boundary", "saga"),
+            sink_destinations=(
+                "filesystem", "network", "session_boundary", "saga", "shell_process",
+            ),
             sink_policies=(
                 ServiceSinkPolicy(
                     "write_file", "static_service_write_roots",
@@ -8388,6 +8450,8 @@ _TRUSTED_SERVICE_PRINCIPALS: dict[str, ServicePrincipal] = {
                     "edit_file", "static_service_write_roots",
                     "MIMIR_HOME/MIMIR_FILE_TOOL_ROOTS",
                 ),
+                ServiceSinkPolicy("shell_exec", "shell_profile", "session_boundary"),
+                ServiceSinkPolicy("fetch_url", "github_pr_api", "GITHUB_REPOS"),
             ),
             saga_full_corpus_read=True,
             creation_path="mimir.server._on_session_idle",
@@ -8637,12 +8701,31 @@ def _capability_matrix_errors() -> list[str]:
             )
 
         capability_set = set(principal.capabilities)
-        missing = _missing_capability_companions(capability_set)
+        missing = _missing_capability_companions(
+            capability_set, profile=principal.authority_profile,
+        )
         if missing:
             errors.append(
                 f"Service principal '{principal.canonical}' ({trigger}) has "
                 f"capabilities without companions: {', '.join(sorted(missing))}"
             )
+        if principal.capability_tier is not None:
+            bounded = BOUNDED_PROFILE_CAPABILITIES.get(
+                principal.authority_profile or "", frozenset(),
+            )
+            outside_tier = sorted(
+                operation
+                for operation in capability_set - bounded
+                if operation in TRIGGER_CAPABILITY_TIERS
+                and _CAPABILITY_TIER_RANK[TRIGGER_CAPABILITY_TIERS[operation]]
+                > _CAPABILITY_TIER_RANK[principal.capability_tier]
+            )
+            if outside_tier:
+                errors.append(
+                    f"Service principal '{principal.canonical}' capabilities exceed "
+                    f"declared tier '{principal.capability_tier.value}': "
+                    f"{', '.join(outside_tier)}"
+                )
         readable_domains = set(principal.readable_domains)
         sink_destinations = set(principal.sink_destinations)
         policies_by_operation = {policy.operation: policy for policy in principal.sink_policies}
