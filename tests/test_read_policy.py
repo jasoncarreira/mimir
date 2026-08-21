@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from mimir.read_policy import resolve_non_admin_read_target
+from mimir.read_policy import is_protected_read_path, resolve_non_admin_read_target
 
 
 @pytest.mark.parametrize("virtual", [False, True])
@@ -48,3 +48,42 @@ def test_non_admin_attachment_root_refuses_symlink_escape(
     assert resolve_non_admin_read_target(
         "/attachments/escape/private.txt", scan_file=True,
     ) is None
+
+
+def test_non_admin_attachment_grant_is_scoped_to_the_fetch_cache(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Only the fetch cache is admitted, not `attachments/` as a whole.
+
+    `attachments/inbound` holds files delivered by whichever channel sent them,
+    so a generic home root would let a turn on one channel read another
+    channel's uploads. The fetch cache holds tool-produced derivatives of
+    content this agent fetched itself, including the extracted PDF text that
+    `fetch_url` returns as `text_path`.
+    """
+    home = tmp_path / "home"
+    cache = home / "attachments" / "fetch-cache"
+    inbound = home / "attachments" / "inbound"
+    (home / "state").mkdir(parents=True)
+    cache.mkdir(parents=True)
+    inbound.mkdir(parents=True)
+    (cache / "extracted.txt").write_text("cached\n", encoding="utf-8")
+    (inbound / "upload.txt").write_text("someone else's file\n", encoding="utf-8")
+    (home / "attachments" / "loose.txt").write_text("loose\n", encoding="utf-8")
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+
+    assert not is_protected_read_path(cache / "extracted.txt")
+    assert resolve_non_admin_read_target(
+        "/attachments/fetch-cache/extracted.txt", scan_file=True,
+    ) is not None
+
+    assert is_protected_read_path(inbound / "upload.txt")
+    assert resolve_non_admin_read_target(
+        "/attachments/inbound/upload.txt", scan_file=True,
+    ) is None
+
+    assert is_protected_read_path(home / "attachments" / "loose.txt")
+    assert resolve_non_admin_read_target(
+        "/attachments/loose.txt", scan_file=True,
+    ) is None
+    assert resolve_non_admin_read_target(str(home / "attachments")) is None
