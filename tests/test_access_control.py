@@ -10127,3 +10127,77 @@ def test_issue_comment_authorization_requires_and_matches_repository_source(
         ("resolve", "repo-a/project", 220),
         ("resolve", "repo-b/project", 220),
     ]
+
+
+def test_operator_shell_admits_a_second_call_after_the_first_result(
+    tmp_path: Path,
+) -> None:
+    """An operator turn runs several shell steps; the first must not block the rest.
+
+    The first authorized command's output is classified into the turn's label
+    set. If that source were an incomplete untrusted *active ingest*, the IFC
+    sink gate would refuse the second command before the operator admin-tier
+    exception could admit it, and the grant would serve exactly one call per
+    turn. This asserts the sequential case end to end rather than an isolated
+    first call.
+    """
+    from mimir.access_control import classify_protected_result
+
+    resolver = _resolver(
+        tmp_path,
+        """
+        people:
+          - canonical: alice
+            aliases: [slack-U1]
+            access: {roles: [user]}
+        """,
+    )
+    event = AgentEvent(
+        trigger="user_message",
+        channel_id="slack-C1",
+        author="slack-U1",
+        source="slack",
+        content="inspect the repository",
+    )
+    auth, labels = _interactive_operator_auth(event, resolver)
+    registry = ToolRegistry()
+
+    first = registry.authorize_tool(
+        "shell_exec", auth, enforce=True,
+        target_channel="git status --short",
+        arguments={"command": "git status --short"},
+        ifc_labels=labels,
+    )
+    assert first.allowed is True, first.reason
+
+    # Fold the first command's output into the turn's labels, as the runtime does.
+    result_labels = classify_protected_result(
+        "shell_exec",
+        {"command": "git status --short"},
+        auth,
+        first,
+        result=SimpleNamespace(artifact=None, content="M mimir/agent.py\n"),
+        failed=False,
+    )
+    assert result_labels is not None, "shell result produced no labels"
+    for source in result_labels.sources:
+        labels = labels.with_source(source)
+
+    # The shell output is present, untrusted, and complete - not a fresh ingest.
+    shell_sources = [s for s in labels.sources if s.source_kind == "protected_tool"]
+    assert shell_sources, "the shell result contributed no source"
+    assert any(s.integrity == "untrusted" for s in shell_sources)
+    assert all(
+        s.integrity_effect != "active_ingest"
+        for s in shell_sources
+        if s.integrity == "untrusted"
+    )
+    assert all(s.is_complete for s in shell_sources)
+
+    second = registry.authorize_tool(
+        "shell_exec", auth, enforce=True,
+        target_channel="git log --oneline -3",
+        arguments={"command": "git log --oneline -3"},
+        ifc_labels=labels,
+    )
+    assert second.allowed is True, second.reason
