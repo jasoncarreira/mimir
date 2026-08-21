@@ -202,6 +202,11 @@ def test_resolve_entrypoint_is_absolute_package_bound_and_lockstep(tmp_path: Pat
         resolve_factory_entrypoint(Path("feature-factory/bin/factory.js"))
 
 
+def test_admit_rejects_nonexistent_entrypoint(tmp_path: Path) -> None:
+    with pytest.raises(FactoryContractError, match="does not exist"):
+        FeatureFactoryBackend(entrypoint=str(tmp_path / "factory.js")).admit()
+
+
 @pytest.mark.parametrize(
     ("package", "expected_name"),
     [
@@ -254,6 +259,29 @@ def test_capability_probe_matrix_uses_exact_sixteen_nonmutating_commands(
     assert len(FACTORY_COMMANDS) == 16
     assert [call[2:] for call in calls[1:]] == [argv for _, argv in FACTORY_COMMANDS]
     assert calls[0][2:] == ("__mimir_unknown_command_probe__",)
+
+
+def test_capability_probe_accepts_recorded_072_diagnostics(tmp_path: Path) -> None:
+    entrypoint = package_entrypoint(tmp_path)
+    recorded = {
+        "status": "a <run-id> is required",
+        "heartbeat": "a <run-id> is required",
+        "slices-seed": "a <run-id> is required",
+        "terminal": "status must be one of completed | blocked | partial | needs-human",
+        "slice": "status must be one of pending | running | completed | blocked",
+        "gate": "gate must be one of story | brief | pre_pr",
+    }
+
+    def runner(args: list[str], **kwargs: Any) -> subprocess.CompletedProcess[bytes]:
+        command = args[2]
+        if command == "__mimir_unknown_command_probe__":
+            diagnostic = f"unknown command {command}"
+        else:
+            diagnostic = recorded.get(command, f"usage: factory {command}\nmissing argument")
+        return subprocess.CompletedProcess(args, 2, stdout=b"", stderr=diagnostic.encode())
+
+    backend = FeatureFactoryBackend(entrypoint=str(entrypoint), runner=runner)
+    assert backend.admit() == entrypoint.resolve()
 
 
 def test_capability_probe_isolated_execution_contract(tmp_path: Path) -> None:
@@ -330,7 +358,7 @@ def test_bounded_runner_stops_oversize_output_during_execution(tmp_path: Path) -
 
 @pytest.mark.parametrize(
     "mode",
-    ["zero", "signal", "unknown", "nonspecific", "nul", "unknown_prefix"],
+    ["zero", "signal", "unknown", "empty", "nul", "unknown_prefix"],
 )
 def test_capability_probe_fails_closed(tmp_path: Path, mode: str) -> None:
     entrypoint = package_entrypoint(tmp_path)
@@ -347,8 +375,8 @@ def test_capability_probe_fails_closed(tmp_path: Path, mode: str) -> None:
             return subprocess.CompletedProcess(args, -9, stdout=b"", stderr=b"")
         if mode == "unknown":
             detail = f"unknown command {command}".encode()
-        elif mode == "nonspecific":
-            detail = f"failed {command}".encode()
+        elif mode == "empty":
+            detail = b""
         elif mode == "nul":
             detail = f"usage: {command}\x00".encode()
         elif mode == "unknown_prefix":

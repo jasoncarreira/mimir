@@ -47,9 +47,6 @@ _DEFAULT_FACTORY_MAX_RETRIES = 5
 _MAX_FACTORY_MAX_RETRIES = 9_007_199_254_740_991
 _FACTORY_MAX_RETRIES_ENV = "MIMIR_FACTORY_MAX_RETRIES"
 _ASCII_DECIMAL = re.compile(r"[0-9]+")
-_ARGUMENT_STRUCTURE = re.compile(
-    r"(?im)(?:^\s*usage\s*:|\b(?:argument|option|operand|required|requires|missing|expected)\b)"
-)
 _UNKNOWN_STRUCTURE = re.compile(r"(?im)\b(?:unknown|unrecognized)\b[^\n]*\bcommand\b")
 
 Runner = Callable[..., subprocess.CompletedProcess[Any]]
@@ -531,16 +528,14 @@ def probe_factory_capabilities(entrypoint: Path, *, runner: Runner = subprocess.
         _, unknown = invoke((_UNKNOWN_PROBE,))
         if _UNKNOWN_PROBE not in unknown or _UNKNOWN_STRUCTURE.search(unknown) is None:
             raise FactoryContractError("factory unknown-command control was not structural")
-        unknown_form = unknown.replace(_UNKNOWN_PROBE, "{command}")
         for command, argv in FACTORY_COMMANDS:
             _, diagnostic = invoke(argv)
-            token = re.compile(rf"(?<![A-Za-z0-9_-]){re.escape(command)}(?![A-Za-z0-9_-])")
-            if token.search(diagnostic) is None or _ARGUMENT_STRUCTURE.search(diagnostic) is None:
+            if not diagnostic:
                 raise FactoryContractError(f"factory capability probe failed for {command}")
             if _UNKNOWN_STRUCTURE.search(diagnostic) is not None:
                 raise FactoryContractError(f"factory capability probe treated {command} as unknown")
-            normalized = token.sub("{command}", diagnostic)
-            if normalized == unknown_form or normalized.startswith(unknown_form):
+            unknown_form = unknown.replace(_UNKNOWN_PROBE, command)
+            if diagnostic == unknown_form or diagnostic.startswith(unknown_form):
                 raise FactoryContractError(f"factory capability probe matched unknown form for {command}")
 
 
