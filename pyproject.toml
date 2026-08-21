@@ -249,6 +249,10 @@ exclude = [
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+# Report a stalled test early enough for repo_test to retain the traceback before
+# its 1800-second process bound. This reports only; it does not abort the test.
+faulthandler_timeout = 300
+faulthandler_exit_on_timeout = false
 
 # Workspace setup: mimir's pyproject is also the workspace root;
 # benchmarks/saga/ is the second member (the LongMemEval bench shell

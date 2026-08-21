@@ -521,7 +521,9 @@ class RepoProjectTests:
             result.stderr,
             scrubber,
             _RETURN_STDERR_CHARS,
-            keep_tail=result.stderr_dropped_bytes > 0,
+            # pytest's faulthandler writes stall diagnostics after earlier test
+            # output, so return the tail whenever stderr exceeds this result cap.
+            keep_tail=True,
         )
         truncation = {
             "output_limited": result.output_overflow,
