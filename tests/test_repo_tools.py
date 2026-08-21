@@ -24,7 +24,10 @@ import uuid
 import pytest
 from langchain_core.tools import ToolException
 
-from mimir.contained_execution import CollectedExecutionResult
+from mimir.contained_execution import (
+    CollectedExecutionResult,
+    SensitiveMaterialScrubber,
+)
 from mimir.contained_snapshot import SnapshotCredentialsRefused, create_git_snapshot
 from mimir.models import RepoPRAction, RepoPRActionScope, RepoReviewState
 from mimir.pr_checkout_lease import (
@@ -36,6 +39,7 @@ from mimir.project_tests import (
     _TIMEOUT_SECONDS,
     ProjectTestRefusal,
     RepoProjectTests,
+    _safe_stderr_output,
 )
 from mimir.repo_tools import (
     GitCommit,
@@ -1575,9 +1579,48 @@ async def test_project_test_retains_builtin_hang_dump_after_stderr_truncation(
         state, runner=runner, checkout_factory=_test_checkout_factory,
     ).execute(("tracked.txt",))
     assert result.ok
-    assert len(result.stderr) == 4_000
+    assert len(result.stderr) <= 4_000
+    assert result.stderr.startswith("Timeout (0:00:00.100000)!")
+    assert "in blocked_worker" in result.stderr
     assert "in test_synthetic_hang" in result.stderr
-    assert result.stderr.endswith(completed.stderr.decode()[-4_000:])
+    assert "credential-value-must-not-appear" not in result.stderr
+
+
+def test_stderr_without_hang_dump_keeps_existing_positional_policy() -> None:
+    scrubber = SensitiveMaterialScrubber(home=None)
+    stderr = b"head-context\n" + b"x" * 5_000 + b"\ntail-context"
+
+    assert _safe_stderr_output(stderr, scrubber, 100).startswith("head-context")
+    assert _safe_stderr_output(stderr, scrubber, 100, keep_tail=True).endswith(
+        "tail-context"
+    )
+
+
+@pytest.mark.asyncio
+async def test_project_test_timeout_returns_captured_hang_diagnostic(
+    repo_tools, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state = repo_tools[-2]
+    home = tmp_path / "home"
+    _configure_worklink_test(home)
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    stderr = (
+        b"noise\n"
+        + b"x" * 5_000
+        + b"\nTimeout (0:05:00)!\nThread dump\n  File test_hang.py, line 7\n"
+    )
+
+    async def runner(*_args, **_kwargs):
+        return CollectedExecutionResult(None, b"partial stdout", stderr, True, False, 0, 0)
+
+    result = await RepoProjectTests(
+        state, runner=runner, checkout_factory=_test_checkout_factory,
+    ).execute(("tracked.txt",))
+
+    assert result.code == "test_timeout"
+    assert result.stdout == "partial stdout"
+    assert result.stderr.startswith("Timeout (0:05:00)!")
+    assert "test_hang.py" in result.stderr
 
 
 @pytest.mark.asyncio

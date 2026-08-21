@@ -247,6 +247,21 @@ def _safe_output(
     return scrubbed[-limit:] if keep_tail else scrubbed[:limit]
 
 
+def _safe_stderr_output(
+    value: bytes,
+    scrubber: SensitiveMaterialScrubber,
+    limit: int,
+    *,
+    keep_tail: bool = False,
+) -> str:
+    """Prefer a pytest faulthandler dump over positional stderr context."""
+    scrubbed = redact_text(scrubber.scrub_text(value))
+    marker = re.search(r"Timeout \([^\r\n]+\)!", scrubbed)
+    if marker is not None and len(scrubbed) > limit:
+        return scrubbed[marker.start():marker.start() + limit]
+    return scrubbed[-limit:] if keep_tail else scrubbed[:limit]
+
+
 def _worker_can_search(metadata: os.stat_result) -> bool:
     identities = get_identities()
     mode = metadata.st_mode
@@ -505,31 +520,29 @@ class RepoProjectTests:
                     "project test snapshot cleanup failed",
                 ) from exc
 
-        if result.timed_out:
-            return ProjectTestResult(
-                False, "test_timeout", None,
-                command=command, command_source=command_source,
-                git_context=_git_execution_context(),
-            )
         stdout = _safe_output(
             result.stdout,
             scrubber,
             _RETURN_STDOUT_CHARS,
             keep_tail=result.stdout_dropped_bytes > 0,
         )
-        stderr = _safe_output(
+        stderr = _safe_stderr_output(
             result.stderr,
             scrubber,
             _RETURN_STDERR_CHARS,
-            # pytest's faulthandler writes stall diagnostics after earlier test
-            # output, so return the tail whenever stderr exceeds this result cap.
-            keep_tail=True,
+            keep_tail=result.stderr_dropped_bytes > 0,
         )
         truncation = {
             "output_limited": result.output_overflow,
             "stdout_dropped_bytes": result.stdout_dropped_bytes,
             "stderr_dropped_bytes": result.stderr_dropped_bytes,
         }
+        if result.timed_out:
+            return ProjectTestResult(
+                False, "test_timeout", None, stdout, stderr,
+                command, command_source, **truncation,
+                git_context=_git_execution_context(),
+            )
         if result.exit_code != 0 or result.output_overflow:
             return ProjectTestResult(
                 False, "tests_failed", result.exit_code, stdout, stderr,
