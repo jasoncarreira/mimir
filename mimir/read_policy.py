@@ -261,6 +261,7 @@ def is_protected_read_path(path: Path) -> bool:
         docs = home / "docs"
         skills = home / "skills"
         builtin_skills = home / ".mimir_builtin_skills"
+        attachments = home / "attachments"
         artifact_root = framework_large_tool_results_root(home)
         from .access_control import current_turn_scratch_root
 
@@ -276,6 +277,8 @@ def is_protected_read_path(path: Path) -> bool:
             or resolved.is_relative_to(skills)
             or resolved == builtin_skills
             or resolved.is_relative_to(builtin_skills)
+            or resolved == attachments
+            or resolved.is_relative_to(attachments)
             or artifact_root is not None
             and (resolved == artifact_root or resolved.is_relative_to(artifact_root))
             or turn_scratch is not None
@@ -560,6 +563,7 @@ def configured_non_admin_read_roots() -> tuple[Path, ...]:
         home / "docs",
         home / "skills",
         home / ".mimir_builtin_skills",
+        home / "attachments",
         *((artifact_root,) if artifact_root is not None else ()),
         *((turn_scratch,) if turn_scratch is not None else ()),
         *configured_paths,
@@ -619,6 +623,7 @@ def resolve_non_admin_read_target(
         docs = (home / "docs").resolve(strict=False)
         skills = (home / "skills").resolve(strict=False)
         builtin_skills = (home / ".mimir_builtin_skills").resolve(strict=False)
+        attachments = (home / "attachments").resolve(strict=False)
         artifact_root = framework_large_tool_results_root(home)
         from .access_control import current_turn_scratch_root
 
@@ -668,6 +673,8 @@ def resolve_non_admin_read_target(
         or resolved.is_relative_to(skills)
         or resolved == builtin_skills
         or resolved.is_relative_to(builtin_skills)
+        or resolved == attachments
+        or resolved.is_relative_to(attachments)
         or artifact_root is not None
         and (resolved == artifact_root or resolved.is_relative_to(artifact_root))
         or turn_scratch is not None

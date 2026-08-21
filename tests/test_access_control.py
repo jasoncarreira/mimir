@@ -6979,6 +6979,7 @@ def test_github_service_read_scope_includes_only_its_active_checkout_lease(
     for path in (state_root, source, lease_root, outside):
         path.mkdir(parents=True)
     monkeypatch.setenv("MIMIR_HOME", str(home))
+    monkeypatch.setenv("MIMIR_FILE_TOOL_ROOTS", f"{lease_root}:rw")
     monkeypatch.setenv("MIMIR_ACCESS_CONTROL_ENFORCED", "1")
 
     state = _review_state("o/r", 42, "worklink/42", str(source))
