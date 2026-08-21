@@ -110,24 +110,44 @@ another costume.
   reachable through the same bounded-command test once it exists, and then
   removed as redundant rather than left as a parallel path.
 
-## 5. What this does not resolve, and must be established first
+## 5. The poller population, resolved
 
-**The 806 poller events are unexplained.** A `poller:github-activity` review turn
-should already carry `repo_review_state` and therefore already hit the existing
-carve-out. 628 of them did not, plus 178 from `github-ci-failure`. Either those
-turns lack the state object, or they are not review turns, or something else
-refuses them.
+An earlier revision of this document left the 806 poller events unexplained and
+made establishing them task one. They are now measured, and they split on whether
+the turn carried a pull-request scope at all:
 
-Determining which is **task one of any implementation**, not an assumption to
-carry in. If those turns already have the carve-out and still fail, the diagnosis
-in §2 is incomplete and this proposal will not close them. Candidate causes, none
-to be presumed: the turns are non-review poller turns that never acquire the
-state; the state is present but the carve-out is bypassed by an earlier branch;
-the refusals occur on a sink category other than the one the carve-out affects.
+| principal | `scope_provenance` | `scope_id` | events |
+| --- | --- | --- | --- |
+| `poller:github-activity` | `None` | absent | 544 |
+| `poller:github-ci-watch` | `None` | absent | 178 |
+| `poller:github-activity` | `poller_payload` | present | 90 |
 
-The operator population of 945 is separately supported: PR #1617 landed the
-admission half and its scope line records that only the first call per turn is
-admitted, which is precisely this defect.
+**722 of 806 carry no scope.** They are not review turns, never acquire
+`repo_review_state`, and the existing carve-out therefore does not and should not
+reach them. That is §2 applying directly rather than an anomaly: these turns run
+several bounded steps and are refused after the first, exactly like the operator
+population. The proposal in §4 covers them.
+
+**90 carry a scope and are still refused.** Those are the genuine residue. A turn
+holding a `poller_payload` scope should have `repo_review_state` and so should
+already receive the informational classification for a shell result.
+
+Two candidate causes, and this document does not choose between them because the
+distinction is not measurable from the shadow decision alone:
+
+- The tainting source was **not a shell result.** A review turn that reads a file
+  acquires an active-ingest entry from the read, and the shell carve-out is
+  irrelevant to it. If so, those 90 belong to the provenance work rather than
+  here, and this design will not close them.
+- The preceding shell result **failed.** The carve-out is additionally gated on
+  `not failed`, so a command that errored contributes an active ingest even on a
+  review turn.
+
+Either way the number is small and attributable elsewhere. **Scope of the
+proposal, stated precisely: 945 operator events plus 722 unscoped poller events =
+1,667 of the 1,765.** The remaining 98 (90 scoped poller plus ~8 synthesis and
+heartbeat) are out of scope here and should be re-measured after the provenance
+change lands, since the first candidate above predicts most of them dissolve.
 
 ## 6. Dependency on the provenance model
 
