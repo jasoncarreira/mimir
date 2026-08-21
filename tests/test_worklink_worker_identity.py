@@ -68,6 +68,8 @@ def test_ci_runs_the_committed_live_image_proof() -> None:
     proof = (ROOT / "scripts/worklink_image_identity.py").read_text(encoding="utf-8")
     assert "worklink-image-identity:" in workflow
     assert "uv run python scripts/worklink_image_identity.py" in workflow
+    assert 'stat -c %U:%G /opt/mimir-worklink/uv-cache' in proof
+    assert 'stat -c %a /opt/mimir-worklink/uv-cache' in proof
     assert "sibling-access negative control did not detect a cross-write" in proof
     assert "worker reached concurrent sibling checkout" in proof
     assert "issue_id=1411" in proof
