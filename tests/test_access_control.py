@@ -9873,7 +9873,13 @@ async def test_acp_permission_structural_denials_never_reach_broker(
     finally:
         reset_turn_capability_context(token)
 
-    assert denial == "hands_edit permission was rejected before execution"
+    assert denial.startswith(
+        "hands_edit permission eligibility refused: authorization verdict failed"
+    )
+    assert "authorization decision=" in denial
+    assert "reason=" in denial
+    assert "allowed=" in denial
+    assert "would_block=" in denial
     assert broker.calls == []
 
 
@@ -10078,9 +10084,17 @@ async def test_acp_permission_timeout_cancels_local_request(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("context_change", ["closed", "generation", "epoch", "provider"])
+@pytest.mark.parametrize(
+    ("context_change", "group", "condition"),
+    [
+        ("closed", "lease currency", "lease_open"),
+        ("generation", "lease currency", "lease_generation"),
+        ("epoch", "lease currency", "lease_epoch"),
+        ("provider", "capability-context wiring", "provider_open"),
+    ],
+)
 async def test_acp_stale_capability_context_never_requests_permission(
-    context_change: str,
+    context_change: str, group: str, condition: str,
 ) -> None:
     from mimir.tools.budget_gate import _request_permission_async
     from mimir.tools.client_provider import (
@@ -10110,7 +10124,9 @@ async def test_acp_stale_capability_context_never_requests_permission(
     finally:
         reset_turn_capability_context(token)
 
-    assert denial == "hands_edit permission was rejected before execution"
+    assert denial == (
+        f"hands_edit permission eligibility refused: {group} failed ({condition})"
+    )
     assert broker.calls == []
 
 
@@ -10148,6 +10164,204 @@ def _capability_for_broker(broker: object, **changes: object):
     }
     values.update(changes)
     return TurnCapabilityContext(**values)
+
+
+@pytest.mark.parametrize(
+    ("case", "group", "condition"),
+    [
+        ("enforcement", "authorization verdict", "enforcement_enabled"),
+        ("allowed", "authorization verdict", "allowed"),
+        ("shadow", "authorization verdict", "is_shadow_decision"),
+        ("would_block", "authorization verdict", "would_block"),
+        ("decision", "authorization verdict", "decision"),
+        ("tier", "authorization verdict", "required_tier"),
+        ("delivery", "capability-context wiring", "acp_delivery"),
+        ("profile", "capability-context wiring", "profile_policy"),
+        ("provider_missing", "capability-context wiring", "provider_present"),
+        ("provider_closed", "capability-context wiring", "provider_open"),
+        ("broker_missing", "capability-context wiring", "permission_broker_present"),
+        ("broker_callable", "capability-context wiring", "request_permission_callable"),
+        ("lease_missing", "lease currency", "lease_present"),
+        ("lease_closed", "lease currency", "lease_open"),
+        ("generation", "lease currency", "lease_generation"),
+        ("epoch", "lease currency", "lease_epoch"),
+        ("arguments", "argument shape", "arguments_dict"),
+    ],
+)
+def test_permission_eligibility_each_structural_condition_refuses(
+    case: str, group: str, condition: str,
+) -> None:
+    from langchain_core.tools import ToolException
+    from mimir.access_control import AccessTier
+    from mimir.tools.budget_gate import _permission_eligibility
+    from mimir.tools.client_provider import (
+        PermissionDecision,
+        reset_turn_capability_context,
+        set_turn_capability_context,
+    )
+
+    broker = _ImmediatePermissionBroker(PermissionDecision.ALLOW_ONCE)
+    authorization_changes: dict[str, object] = {}
+    context_changes: dict[str, object] = {}
+    arguments: object = {"path": "a"}
+    if case == "enforcement":
+        authorization_changes["enforcement_enabled"] = False
+    elif case == "allowed":
+        authorization_changes["allowed"] = False
+    elif case == "shadow":
+        authorization_changes["is_shadow_decision"] = True
+    elif case == "would_block":
+        authorization_changes["would_block"] = True
+    elif case == "decision":
+        authorization_changes["decision"] = OperationDecision.UNKNOWN
+    elif case == "tier":
+        authorization_changes["required_tier"] = AccessTier.USER
+    elif case == "delivery":
+        context_changes["acp_delivery"] = False
+    elif case == "profile":
+        context_changes["profile_policy"] = object()
+    elif case == "provider_missing":
+        context_changes["provider"] = None
+    elif case == "broker_missing":
+        context_changes["permission_broker"] = None
+    elif case == "broker_callable":
+        context_changes["permission_broker"] = object()
+    elif case == "lease_missing":
+        context_changes["lease"] = None
+    elif case == "arguments":
+        arguments = None
+
+    context = _capability_for_broker(broker, **context_changes)
+    if case == "provider_closed":
+        context.provider.closed = True
+    elif case == "lease_closed":
+        context.lease.close()
+    elif case == "generation":
+        context.lease.generation += 1
+    elif case == "epoch":
+        context.lease.epoch += 1
+    authorization = _permission_test_authorization(**authorization_changes)
+    token = set_turn_capability_context(context)
+    try:
+        with pytest.raises(ToolException) as raised:
+            _permission_eligibility(
+                SimpleNamespace(tool_call={"id": "mutation"}),
+                "hands_edit",
+                authorization,
+                arguments,
+            )
+    finally:
+        reset_turn_capability_context(token)
+
+    diagnostic = str(raised.value)
+    assert f"{group} failed" in diagnostic
+    assert condition in diagnostic
+    assert broker.calls == []
+
+
+def test_permission_eligibility_snapshot_refusal_is_distinct(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from langchain_core.tools import ToolException
+    from mimir.tools import budget_gate
+    from mimir.tools.client_provider import (
+        PermissionDecision,
+        reset_turn_capability_context,
+        set_turn_capability_context,
+    )
+
+    broker = _ImmediatePermissionBroker(PermissionDecision.ALLOW_ONCE)
+    token = set_turn_capability_context(_capability_for_broker(broker))
+    monkeypatch.setattr(budget_gate, "_permission_context_is_current", lambda _snapshot: False)
+    try:
+        with pytest.raises(ToolException) as raised:
+            budget_gate._permission_eligibility(
+                SimpleNamespace(tool_call={"id": "snapshot"}),
+                "hands_edit",
+                _permission_test_authorization(),
+                {"path": "a"},
+            )
+    finally:
+        reset_turn_capability_context(token)
+
+    assert str(raised.value) == "hands_edit permission context snapshot was stale"
+    assert "eligibility refused" not in str(raised.value)
+
+
+@pytest.mark.asyncio
+async def test_hands_refusals_report_independent_causes() -> None:
+    from mimir.tools.budget_gate import _request_permission_async
+    from mimir.tools.client_provider import (
+        PermissionDecision,
+        reset_turn_capability_context,
+        set_turn_capability_context,
+    )
+
+    broker = _ImmediatePermissionBroker(PermissionDecision.ALLOW_ONCE)
+    edit_context = _capability_for_broker(broker)
+    token = set_turn_capability_context(edit_context)
+    try:
+        edit_denial = await _request_permission_async(
+            SimpleNamespace(tool_call={"id": "edit"}),
+            "hands_edit",
+            _permission_test_authorization(
+                allowed=False,
+                reason="ifc_label_blocked:file_write",
+            ),
+            {"path": "a"},
+        )
+    finally:
+        reset_turn_capability_context(token)
+
+    shell_context = _capability_for_broker(broker)
+    shell_context.provider.closed = True
+    token = set_turn_capability_context(shell_context)
+    try:
+        shell_denial = await _request_permission_async(
+            SimpleNamespace(tool_call={"id": "shell"}),
+            "hands_shell",
+            _permission_test_authorization(tool_name="hands_shell"),
+            {"command": "printf ok"},
+        )
+    finally:
+        reset_turn_capability_context(token)
+
+    assert "authorization verdict failed (allowed)" in edit_denial
+    assert "decision=admin_required" in edit_denial
+    assert "reason=ifc_label_blocked:file_write" in edit_denial
+    assert "allowed=false would_block=false" in edit_denial
+    assert "capability-context wiring failed (provider_open)" in shell_denial
+    assert edit_denial != shell_denial
+    assert broker.calls == []
+
+
+@pytest.mark.parametrize("reason", ["token=controller-secret", "/srv/controller/private"])
+def test_permission_authorization_diagnostic_scrubs_untrusted_reason(reason: str) -> None:
+    from langchain_core.tools import ToolException
+    from mimir.tools.budget_gate import _permission_eligibility
+    from mimir.tools.client_provider import (
+        PermissionDecision,
+        reset_turn_capability_context,
+        set_turn_capability_context,
+    )
+
+    broker = _ImmediatePermissionBroker(PermissionDecision.ALLOW_ONCE)
+    token = set_turn_capability_context(_capability_for_broker(broker))
+    try:
+        with pytest.raises(ToolException) as raised:
+            _permission_eligibility(
+                SimpleNamespace(tool_call={"id": "scrub"}),
+                "hands_edit",
+                _permission_test_authorization(allowed=False, reason=reason),
+                {"path": "/srv/controller/private"},
+            )
+    finally:
+        reset_turn_capability_context(token)
+
+    diagnostic = str(raised.value)
+    assert "reason=[REDACTED]" in diagnostic
+    assert "controller-secret" not in diagnostic
+    assert "/srv/controller/private" not in diagnostic
 
 
 @pytest.mark.asyncio
@@ -10864,7 +11078,7 @@ async def test_public_permission_late_allow_revalidates_capability(
         reset_turn_capability_context(token)
 
     assert result.status == "error"
-    assert result.content == "hands_edit permission was rejected before execution"
+    assert result.content == "hands_edit permission context snapshot was stale"
     assert handler_calls == 0
 
 
@@ -10956,7 +11170,7 @@ async def test_public_permission_late_allow_rejects_live_capability_replacement(
 
     assert isinstance(result, ToolMessage)
     assert result.status == "error"
-    assert result.content == "hands_edit permission was rejected before execution"
+    assert result.content == "hands_edit permission context snapshot was stale"
     assert result.tool_call_id == "tc-auth"
     assert handler_calls == 0
     assert any(

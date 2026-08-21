@@ -52,6 +52,7 @@ from langchain_core.tools import ToolException
 from langgraph.types import Command
 
 from ..models import AuthContext
+from ..redaction import redact_text
 from .refusals import ToolPolicyRefusal
 from ..worklink.continuation import HTTP_EVENT_INGRESS_EXTRA_VALUE
 from ..access_control import (
@@ -1394,6 +1395,7 @@ _ACP_SEND_MESSAGE_REFUSAL = (
     "send_message is unavailable on ACP turns; use the ACP bridge"
 )
 _PERMISSION_TIMEOUT_SECONDS = 30.0
+_PERMISSION_REASON_KEY_RE = re.compile(r"[A-Za-z0-9_.:-]{1,200}\Z")
 
 
 def _tool_surface_name(tool: Any) -> str | None:
@@ -1486,29 +1488,49 @@ def _permission_eligibility(
     )
     if not requires_admin:
         return None
-    if context.acp_delivery is not True:
-        raise ToolException(f"{tool_name} permission eligibility was refused")
     lease = context.lease
-    structurally_allowed = (
-        authorization.enforcement_enabled is True
-        and authorization.allowed is True
-        and authorization.is_shadow_decision is False
-        and authorization.would_block is False
-        and authorization.decision is OperationDecision.ADMIN_REQUIRED
-        and authorization.required_tier is AccessTier.ADMIN
-        and context.profile_policy is MIMIR_HANDS_V1
-        and context.provider is not None
-        and getattr(context.provider, "closed", False) is False
-        and context.permission_broker is not None
-        and callable(getattr(context.permission_broker, "request_permission", None))
-        and lease is not None
-        and getattr(lease, "closed", True) is False
-        and getattr(lease, "generation", None) == context.connection_generation
-        and getattr(lease, "epoch", None) == context.prompt_epoch
-        and isinstance(arguments, dict)
+    checks = (
+        ("authorization verdict", (
+            ("enforcement_enabled", authorization.enforcement_enabled is True),
+            ("allowed", authorization.allowed is True),
+            ("is_shadow_decision", authorization.is_shadow_decision is False),
+            ("would_block", authorization.would_block is False),
+            ("decision", authorization.decision is OperationDecision.ADMIN_REQUIRED),
+            ("required_tier", authorization.required_tier is AccessTier.ADMIN),
+        )),
+        ("capability-context wiring", (
+            ("acp_delivery", context.acp_delivery is True),
+            ("profile_policy", context.profile_policy is MIMIR_HANDS_V1),
+            ("provider_present", context.provider is not None),
+            ("provider_open", getattr(context.provider, "closed", False) is False),
+            ("permission_broker_present", context.permission_broker is not None),
+            ("request_permission_callable", callable(
+                getattr(context.permission_broker, "request_permission", None)
+            )),
+        )),
+        ("lease currency", (
+            ("lease_present", lease is not None),
+            ("lease_open", getattr(lease, "closed", True) is False),
+            ("lease_generation", getattr(lease, "generation", None) == context.connection_generation),
+            ("lease_epoch", getattr(lease, "epoch", None) == context.prompt_epoch),
+        )),
+        ("argument shape", (
+            ("arguments_dict", isinstance(arguments, dict)),
+        )),
     )
-    if not structurally_allowed:
-        raise ToolException(f"{tool_name} permission eligibility was refused")
+    failures = [
+        f"{group} failed ({', '.join(name for name, passed in group_checks if not passed)})"
+        for group, group_checks in checks
+        if not all(passed for _, passed in group_checks)
+    ]
+    if failures:
+        if any(group == "authorization verdict" and not all(
+            passed for _, passed in group_checks
+        ) for group, group_checks in checks):
+            failures.append(_permission_authorization_diagnostic(authorization))
+        raise ToolException(
+            f"{tool_name} permission eligibility refused: {'; '.join(failures)}"
+        )
     provider = context.provider
     peer = getattr(provider, "peer", None)
     transport = getattr(peer, "transport", None) if peer is not None else None
@@ -1524,13 +1546,41 @@ def _permission_eligibility(
         transport,
     )
     if not _permission_context_is_current(snapshot):
-        raise ToolException(f"{tool_name} permission eligibility was refused")
+        raise ToolException(_permission_snapshot_refusal(tool_name))
     return context.permission_broker, PermissionEligibility(
         tool_call_id=_tool_call_id(request),
         title=tool_name,
         kind="other",
         arguments=arguments,
     ), snapshot
+
+
+def _permission_authorization_diagnostic(authorization: ToolAuthorization) -> str:
+    decision = authorization.decision
+    decision_value = decision.value if isinstance(decision, OperationDecision) else "[INVALID]"
+    reason = authorization.reason
+    if reason is None:
+        reason_value = "none"
+    elif isinstance(reason, str):
+        reason_value = redact_text(reason)
+        if not _PERMISSION_REASON_KEY_RE.fullmatch(reason_value):
+            reason_value = "[REDACTED]"
+    else:
+        reason_value = "[INVALID]"
+
+    def verdict(value: Any) -> str:
+        return str(value).lower() if isinstance(value, bool) else "[INVALID]"
+
+    return (
+        "authorization "
+        f"decision={decision_value} reason={reason_value} "
+        f"allowed={verdict(authorization.allowed)} "
+        f"would_block={verdict(authorization.would_block)}"
+    )
+
+
+def _permission_snapshot_refusal(tool_name: str) -> str:
+    return f"{tool_name} permission context snapshot was stale"
 
 
 def _permission_context_is_current(snapshot: tuple[Any, ...]) -> bool:
@@ -1621,8 +1671,8 @@ def _request_permission_sync(
 ) -> str | None:
     try:
         eligible = _permission_eligibility(request, tool_name, authorization, arguments)
-    except ToolException:
-        return _permission_denial_message(tool_name)
+    except ToolException as exc:
+        return str(exc)
     if eligible is None:
         return None
     broker, eligibility, snapshot = eligible
@@ -1642,8 +1692,10 @@ def _request_permission_sync(
             return _permission_denial_message(tool_name)
         future = asyncio.run_coroutine_threadsafe(coroutine, loop)
         decision = future.result(timeout=_PERMISSION_TIMEOUT_SECONDS)
-        if decision is PermissionDecision.ALLOW_ONCE and _permission_context_is_current(snapshot):
-            return None
+        if decision is PermissionDecision.ALLOW_ONCE:
+            if _permission_context_is_current(snapshot):
+                return None
+            return _permission_snapshot_refusal(tool_name)
         return _permission_denial_message(tool_name)
     except (Exception, asyncio.CancelledError):
         return _permission_denial_message(tool_name)
@@ -1663,8 +1715,8 @@ async def _request_permission_async(
 ) -> str | None:
     try:
         eligible = _permission_eligibility(request, tool_name, authorization, arguments)
-    except ToolException:
-        return _permission_denial_message(tool_name)
+    except ToolException as exc:
+        return str(exc)
     if eligible is None:
         return None
     broker, eligibility, snapshot = eligible
@@ -1677,8 +1729,10 @@ async def _request_permission_async(
             return _permission_denial_message(tool_name)
         task = asyncio.create_task(awaitable)
         decision = await asyncio.wait_for(task, timeout=_PERMISSION_TIMEOUT_SECONDS)
-        if decision is PermissionDecision.ALLOW_ONCE and _permission_context_is_current(snapshot):
-            return None
+        if decision is PermissionDecision.ALLOW_ONCE:
+            if _permission_context_is_current(snapshot):
+                return None
+            return _permission_snapshot_refusal(tool_name)
         return _permission_denial_message(tool_name)
     except asyncio.CancelledError:
         current = asyncio.current_task()
