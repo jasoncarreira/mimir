@@ -1067,6 +1067,7 @@ async def test_sink_gate_denial_emits_shadow_decision_when_not_enforced() -> Non
         required_tier=AccessTier.ADMIN,
         enforcement_enabled=False,
         is_shadow_decision=True,
+        would_block=True,
     )
 
     async def capture(kind: str, **fields: object) -> None:
