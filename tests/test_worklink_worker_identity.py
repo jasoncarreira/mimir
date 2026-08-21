@@ -37,6 +37,9 @@ def test_root_executor_is_immutable_and_installed_outside_user_homes() -> None:
     assert "/opt/mimir-worklink/venv/bin/pip install --no-cache-dir" in text
     assert "pypdf" in text
     assert "pip install --no-cache-dir --no-deps /opt/mimir-worklink/source" in text
+    assert "UV_CACHE_DIR=/opt/mimir-worklink/uv-cache uv sync" in text
+    assert "--locked --extra dev --extra bench --no-install-workspace" in text
+    assert "rm -rf /opt/mimir-worklink/source/.venv" in text
     assert "rm -rf /opt/mimir-worklink/source" in text
     assert "chmod 0755 /usr/local/libexec/worklink-execd" in text
     assert "PYTHONPATH=" not in text
@@ -65,6 +68,8 @@ def test_ci_runs_the_committed_live_image_proof() -> None:
     proof = (ROOT / "scripts/worklink_image_identity.py").read_text(encoding="utf-8")
     assert "worklink-image-identity:" in workflow
     assert "uv run python scripts/worklink_image_identity.py" in workflow
+    assert 'stat -c %U:%G /opt/mimir-worklink/uv-cache' in proof
+    assert 'stat -c %a /opt/mimir-worklink/uv-cache' in proof
     assert "sibling-access negative control did not detect a cross-write" in proof
     assert "worker reached concurrent sibling checkout" in proof
     assert "issue_id=1411" in proof

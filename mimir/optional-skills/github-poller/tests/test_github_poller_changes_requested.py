@@ -14,7 +14,7 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
-import poller
+from github_poller_test_support import poller
 from mimir import poller_recovery
 from mimir.models import AgentEvent
 

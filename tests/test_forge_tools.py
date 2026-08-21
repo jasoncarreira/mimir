@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import pytest
 from langchain.tools import ToolRuntime
@@ -28,6 +28,7 @@ from mimir.models import (
     RepoPRAction, RepoPRActionScope,
     RepoPRScopeRegistry,
     RepoReviewState,
+    ServerDiscoveredPRScopeStore,
     ServerDiscoveredPRStates,
 )
 from mimir.identities import IdentityResolver
@@ -353,9 +354,162 @@ def test_empty_service_scope_keeps_live_discovery_refusal(
         resolve_review_state_for_context(context, "owner/repo", 2)
 
     assert str(refused.value) == (
-        "pull-request operation rejected: live scope discovery requires an "
-        "authenticated operator user turn"
+        'pull-request operation rejected: requested repository="owner/repo", '
+        "pull_request=2; live scope discovery requires an authenticated operator user turn"
     )
+
+
+def _autonomous_context(store: ServerDiscoveredPRScopeStore) -> AuthContext:
+    return AuthContext(
+        principal="agent", canonical_principal="agent", roles=(),
+        event_ingress=None, trigger="scheduled_tick", channel_id="scheduler:test",
+        interactivity=None, server_discovered_pr_scope_store=store,
+    )
+
+
+def _configure_live_review(
+    monkeypatch: pytest.MonkeyPatch, client: FakeForge,
+) -> None:
+    set_forge_client(client)
+    monkeypatch.setenv("GITHUB_REPOS", "owner/repo")
+    monkeypatch.setenv("MIMIR_GITHUB_SELF_LOGIN", "reviewer")
+    monkeypatch.setattr(
+        access_control, "_canonical_repo_binding_resolution",
+        lambda _repo: access_control.RepoBindingResolution(
+            ("/server/configured/repo", "git@github.com:owner/repo.git"),
+            ("/server/configured/repo",), 1,
+        ),
+    )
+
+
+def test_server_discovered_scope_is_reused_on_later_autonomous_turn(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = FakeForge()
+    _configure_live_review(monkeypatch, client)
+    store = ServerDiscoveredPRScopeStore()
+    operator = AuthContext(
+        principal="operator", canonical_principal="operator", roles=("admin",),
+        event_ingress=None, trigger="user_message", channel_id="operator",
+        interactivity=None, server_discovered_pr_scope_store=store,
+    )
+
+    handed = resolve_review_state_for_context(operator, "owner/repo", 1291)
+    reused = resolve_review_state_for_context(
+        _autonomous_context(store), "OWNER/REPO", 1291,
+    )
+
+    assert handed.action_scope.provenance == "server_discovered"
+    assert reused.action_scope is handed.action_scope
+    assert client.calls == [
+        ("snapshot", "owner/repo", 1291),
+        ("snapshot", "owner/repo", 1291),
+    ]
+
+
+def test_autonomous_turn_cannot_resolve_model_named_unhanded_pr(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = FakeForge()
+    _configure_live_review(monkeypatch, client)
+
+    with pytest.raises(ToolException) as refused:
+        resolve_review_state_for_context(
+            _autonomous_context(ServerDiscoveredPRScopeStore()),
+            "owner/repo", 1291,
+        )
+
+    assert str(refused.value) == (
+        'pull-request operation rejected: requested repository="owner/repo", '
+        "pull_request=1291; live scope discovery requires an authenticated operator user turn"
+    )
+    assert client.calls == []
+
+
+def test_only_server_discovered_scope_can_enter_later_turn_store() -> None:
+    store = ServerDiscoveredPRScopeStore()
+
+    with pytest.raises(ValueError, match="only server-discovered"):
+        store.remember_server_discovery(_scope(RepoPRAction.INSPECT))
+
+    assert store.resolve("owner/repo", 17) is None
+
+
+def test_advanced_head_invalidates_reuse_and_is_not_rechecked_this_turn(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = FakeForge()
+    client.snapshot_heads = ["c" * 40, "d" * 40]
+    _configure_live_review(monkeypatch, client)
+    store = ServerDiscoveredPRScopeStore()
+    operator = AuthContext(
+        principal="operator", canonical_principal="operator", roles=("admin",),
+        event_ingress=None, trigger="user_message", channel_id="operator",
+        interactivity=None, server_discovered_pr_scope_store=store,
+    )
+    resolve_review_state_for_context(operator, "owner/repo", 1291)
+    autonomous = _autonomous_context(store)
+
+    for _ in range(2):
+        with pytest.raises(ToolException) as refused:
+            resolve_review_state_for_context(autonomous, "owner/repo", 1291)
+        assert 'repository="owner/repo", pull_request=1291' in str(refused.value)
+        assert "head advanced" in str(refused.value)
+
+    assert client.calls == [
+        ("snapshot", "owner/repo", 1291),
+        ("snapshot", "owner/repo", 1291),
+    ]
+    assert store.resolve("owner/repo", 1291) is None
+
+
+@pytest.mark.asyncio
+async def test_scope_handed_to_first_turn_authorizes_tool_on_second_autonomous_turn(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = FakeForge()
+    _configure_live_review(monkeypatch, client)
+    store = ServerDiscoveredPRScopeStore()
+    operator = AuthContext(
+        principal="operator", canonical_principal="operator", roles=("admin",),
+        event_ingress=None, trigger="user_message", channel_id="operator",
+        interactivity=None, enforcement_enabled=True,
+        ifc_labels=InformationFlowLabels(),
+        server_discovered_pr_scope_store=store,
+    )
+    resolve_review_state_for_context(operator, "owner/repo", 1291)
+    autonomous = replace(
+        _autonomous_context(store),
+        enforcement_enabled=True,
+        ifc_labels=InformationFlowLabels(),
+    )
+    request = ToolCallRequest(
+        tool_call={
+            "name": "pr_metadata",
+            "args": {"repository": "owner/repo", "pull_request": 1291},
+            "id": "later-turn", "type": "tool_call",
+        },
+        tool=None, state=None, runtime=Runtime(context=autonomous),
+    )
+    calls = 0
+
+    async def handler(_request):
+        nonlocal calls
+        calls += 1
+        return ToolMessage(content="operated", tool_call_id="later-turn")
+
+    result = await BudgetGateMiddleware().awrap_tool_call(request, handler)
+
+    assert result.content == "operated"
+    assert result.status != "error"
+    assert calls == 1
+    assert autonomous.server_discovered_pr_states.resolve(
+        "owner/repo", 1291,
+    ) is not None
+    assert client.calls == [
+        ("snapshot", "owner/repo", 1291),
+        ("snapshot", "owner/repo", 1291),
+    ]
 
 
 @pytest.mark.parametrize(

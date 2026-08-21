@@ -4,7 +4,7 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
-import poller
+from github_poller_test_support import poller
 
 
 NOW = datetime(2026, 7, 31, 12, 0, tzinfo=timezone.utc)

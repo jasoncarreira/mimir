@@ -136,7 +136,8 @@ USER root
 RUN python3 -m venv /opt/mimir-worklink/venv \
     && /opt/mimir-worklink/venv/bin/pip install --no-cache-dir --upgrade pip \
     && /opt/mimir-worklink/venv/bin/pip install --no-cache-dir "mimir-agent[${MIMIR_EXTRAS}]"
-COPY --chown=root:root pyproject.toml README.md LICENSE .env.example /opt/mimir-worklink/source/
+COPY --chown=root:root pyproject.toml uv.lock README.md LICENSE .env.example /opt/mimir-worklink/source/
+COPY --chown=root:root benchmarks/saga/pyproject.toml /opt/mimir-worklink/source/benchmarks/saga/pyproject.toml
 COPY --chown=root:root docs/ /opt/mimir-worklink/source/docs/
 COPY --chown=root:root mimir/ /opt/mimir-worklink/source/mimir/
 # The published package above supplies the worker venv's dependency set, while
@@ -145,6 +146,11 @@ COPY --chown=root:root mimir/ /opt/mimir-worklink/source/mimir/
 # so install it explicitly before importing the overlay during this PR's proof.
 RUN /opt/mimir-worklink/venv/bin/pip install --no-cache-dir "pypdf>=6.16" \
     && /opt/mimir-worklink/venv/bin/pip install --no-cache-dir --no-deps /opt/mimir-worklink/source \
+    && /opt/mimir-worklink/venv/bin/pip install --no-cache-dir uv \
+    && ln -s /opt/mimir-worklink/venv/bin/uv /usr/local/bin/uv \
+    && UV_CACHE_DIR=/opt/mimir-worklink/uv-cache uv sync --directory /opt/mimir-worklink/source \
+        --locked --extra dev --extra bench --no-install-workspace \
+    && rm -rf /opt/mimir-worklink/source/.venv \
     && rm -rf /opt/mimir-worklink/source \
     && chown -R root:root /opt/mimir-worklink \
     && chmod -R go-w /opt/mimir-worklink

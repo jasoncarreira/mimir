@@ -7916,8 +7916,17 @@ def _filesystem_result_integrity(
         return "untrusted", "active_ingest"
 
     if relative.parts and relative.parts[0] in {
-        ".mimir_builtin_skills", "skills", "memory", "state",
+        ".mimir_builtin_skills", "docs", "memory", "prompts", "skills", "state",
     }:
+        # These roots are scaffolded by ``mimir setup`` and thereafter written
+        # only by the operator or by the agent through the protected tool
+        # boundary -- so the path itself is evidence of self-authorship, which
+        # is what earns the trusted default. ``docs`` and ``prompts`` qualify on
+        # the same footing as ``skills``: seeded reference material, not ingest.
+        # Trust still comes from ``_persisted_file_integrity`` below, so a
+        # tainted model write into any of them is downgraded rather than
+        # laundered.
+        #
         # Poller subprocesses write this tree directly, outside the protected
         # tool boundary, and may persist attacker-derived cursor/event fields.
         # A path under state/pollers is therefore not proof of self-authorship.
@@ -7991,10 +8000,31 @@ def record_file_write_integrity(
     requested = Path(resource_id)
     if requested.is_absolute():
         try:
-            requested.relative_to(home)
-            resource = requested
+            resolved_requested = requested.resolve(strict=False)
+        except (OSError, RuntimeError):
+            return False
+        try:
+            resolved_requested.relative_to(home)
+            resource = resolved_requested
         except ValueError:
-            if requested.parts[1:2] in {("memory",), ("state",)}:
+            # A path lexically under the configured home but resolving outside
+            # it is a symlink escape, not an unrelated write to permit.
+            configured_home = Path(os.path.abspath(home_value))
+            try:
+                requested.relative_to(configured_home)
+            except ValueError:
+                pass
+            else:
+                return False
+            # Must list every root the recording set below covers. The
+            # backend runs virtual_mode rooted at the home, so a file tool
+            # addresses these as "/docs/notes.md" rather than
+            # "<home>/docs/notes.md" -- a root recorded only for physical paths
+            # is not recorded for the shape writes actually arrive in, and the
+            # trusted read default then launders it.
+            if requested.parts[1:2] in {
+                ("docs",), ("memory",), ("prompts",), ("state",),
+            }:
                 resource = home / requested.as_posix().lstrip("/")
             else:
                 return True
@@ -8005,7 +8035,13 @@ def record_file_write_integrity(
         relative = resource.relative_to(home)
     except (OSError, RuntimeError, ValueError):
         return False
-    if not relative.parts or relative.parts[0] not in {"memory", "state"}:
+    if not relative.parts or relative.parts[0] not in {
+        "docs", "memory", "prompts", "state",
+    }:
+        # Must stay in step with the trusted roots in
+        # ``_filesystem_result_integrity``: a root that is trusted on read but
+        # unrecorded on write is a laundering path, because content the model
+        # wrote while tainted would be re-read as self-authored.
         return True
     if relative.parts[0:2] == ("state", "pollers"):
         return True

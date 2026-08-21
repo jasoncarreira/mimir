@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-import poller
+from github_poller_test_support import poller
 
 
 _REAL_PR_AUTHOR_IS_TRUSTED = poller._pr_author_is_trusted

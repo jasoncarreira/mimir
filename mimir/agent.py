@@ -85,6 +85,7 @@ from .models import (
     PromptBlock,
     OwnerAttestation,
     SourceLabel,
+    ServerDiscoveredPRScopeStore,
     TurnInteractivity,
     TurnRecord,
 )
@@ -517,10 +518,11 @@ def _create_turn_auth_context(
     ifc_labels: InformationFlowLabels,
     audience_provider: Any = None,
     cross_platform_pull: bool = True,
+    server_discovered_pr_scope_store: ServerDiscoveredPRScopeStore | None = None,
 ) -> AuthContext:
     inherited = _shell_continuation_auth_context(event)
     if inherited is None:
-        return create_auth_context(
+        context = create_auth_context(
             event,
             resolver,
             policy_version=policy_version,
@@ -529,12 +531,26 @@ def _create_turn_auth_context(
             audience_provider=audience_provider,
             cross_platform_pull=cross_platform_pull,
         )
+    else:
+        context = replace(
+            inherited,
+            policy_version=policy_version,
+            enforcement_enabled=enforce,
+            ifc_labels=ifc_labels,
+            ifc_state=InformationFlowState(labels=ifc_labels),
+        )
+    if server_discovered_pr_scope_store is None:
+        return context
+    registry = context.repo_pr_scope_registry
+    if registry is not None:
+        for state in registry.review_states:
+            if state.action_scope.provenance == "server_discovered":
+                server_discovered_pr_scope_store.remember_server_discovery(
+                    state.action_scope,
+                )
     return replace(
-        inherited,
-        policy_version=policy_version,
-        enforcement_enabled=enforce,
-        ifc_labels=ifc_labels,
-        ifc_state=InformationFlowState(labels=ifc_labels),
+        context,
+        server_discovered_pr_scope_store=server_discovered_pr_scope_store,
     )
 
 
@@ -1212,6 +1228,7 @@ class Agent:
         # is found.
         self._saga_store: Any = None
         self._sessions = session_manager
+        self._server_discovered_pr_scope_store = ServerDiscoveredPRScopeStore()
         self._scheduler = scheduler
         self._channels = channel_registry
         self._dispatcher = dispatcher
@@ -1800,6 +1817,7 @@ class Agent:
                 ifc_labels=initial_ifc_labels,
                 audience_provider=self._audience_provider,
                 cross_platform_pull=self._config.cross_platform_pull,
+                server_discovered_pr_scope_store=self._server_discovered_pr_scope_store,
             )
         emitter = TurnEventEmitter(
             self._turn_event_bus,
@@ -1943,6 +1961,10 @@ class Agent:
                     interactivity=turn_interactivity,
                     saga_session_id=saga_session_id,
                     egress_state=session_egress_state,
+                    server_discovered_pr_scope_store=(
+                        self._server_discovered_pr_scope_store
+                        if event_ingress is None else None
+                    ),
                 )
             # IFC exists before any model call or harness panel egress. A resumed
             # event's trusted carrier is unioned with ingress-derived labels; a
