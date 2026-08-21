@@ -1043,6 +1043,31 @@ def _result_labels_for_call(
     provenance: Any = None,
     failed: bool = False,
 ) -> Any:
+    if not failed and tool_name == "repo_checkout" and auth_context is not None:
+        args = _validated_arguments(request) or {}
+        original_scope = authorization.repo_pr_action_scope
+        repository = args.get("repository")
+        pull_request = args.get("pull_request")
+        discovered = auth_context.server_discovered_pr_states.resolve(
+            repository, pull_request,
+        ) if isinstance(repository, str) and isinstance(pull_request, int) else None
+        state = discovered
+        if state is None and auth_context.repo_pr_scope_registry is not None:
+            state = auth_context.repo_pr_scope_registry.resolve(repository, pull_request)
+        current_scope = state.action_scope if state is not None else None
+        if (
+            original_scope is not None
+            and current_scope is not None
+            and original_scope.canonical_repo == current_scope.canonical_repo
+            and original_scope.pr_number == current_scope.pr_number
+        ):
+            # Checkout may revalidate a stale poller snapshot while it executes.
+            # Label the returned bytes with the scope that actually produced them.
+            from dataclasses import replace
+
+            authorization = replace(
+                authorization, repo_pr_action_scope=current_scope,
+            )
     return classify_protected_result(
         tool_name,
         _validated_arguments(request),
