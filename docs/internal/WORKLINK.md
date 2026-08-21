@@ -74,6 +74,19 @@ and final PR identity verification.
   the run directory; exact token `--auto` is never passed. Worklink's base
   selects the checkout start point and PR target; it is not factory `--base`,
   which is never passed.
+- **First-dispatch identity**: Before first factory dispatch only, after checkout
+  creation and before process launch, Worklink reads the effective checkout `git
+  config --get user.name` and `git config --get user.email`. Both must be
+  nonblank. The child receives `GIT_AUTHOR_NAME`, `GIT_AUTHOR_EMAIL`,
+  `GIT_COMMITTER_NAME`, and `GIT_COMMITTER_EMAIL`; Worklink never writes sandbox
+  Git identity configuration.
+- **Publication credential**: Worklink reads the nonblank `publishing_identity`
+  only from the trusted controller checkout's `.factory.json`. For GitHub
+  publication, nonblank `GH_TOKEN` wins over `GITHUB_TOKEN`; otherwise
+  `GITHUB_TOKEN` is selected. The selected token is explicitly verified against
+  the declared identity, then both child aliases are normalized to that verified
+  value. Differing credentials do not trigger fallback, and if neither exists
+  dispatch fails naming both variable names without disclosing values.
 - **Controls**: Every control is `node <absolute feature-factory/bin/factory.js>`.
   Worklink admits the launcher only after package/adapter 0.7.2 verification and
   all 16 nonmutating structural command probes. Status is read with `status

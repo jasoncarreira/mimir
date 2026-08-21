@@ -24,6 +24,7 @@ import warnings
 from typing import Any, Callable, Iterable, Mapping, Sequence
 
 from .._rmtree import rmtree_missing_ok
+from ..forge.github import GitHubForgeClient
 from .backends import (
     BackendRegistry,
     CheckoutShape,
@@ -131,6 +132,61 @@ class WorklinkError(RuntimeError):
 
 class LeafValidationError(WorklinkError):
     """Issue is not structured enough to hand to a backend."""
+
+
+def _read_factory_publishing_identity(repo: Path) -> str:
+    declaration = repo / ".factory.json"
+    try:
+        payload = json.loads(declaration.read_text(encoding="utf-8"))
+    except OSError as exc:
+        raise WorklinkError("factory publishing identity declaration is unreadable") from exc
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise WorklinkError("factory publishing identity declaration is invalid") from exc
+    if not isinstance(payload, Mapping):
+        raise WorklinkError("factory publishing identity declaration is invalid")
+    identity = payload.get("publishing_identity")
+    if not isinstance(identity, str) or not identity.strip():
+        raise WorklinkError("factory publishing identity is missing")
+    return identity.strip()
+
+
+def _read_checkout_git_identity(checkout: Path, runner: Runner) -> tuple[str, str]:
+    values: dict[str, str] = {}
+    missing: list[str] = []
+    failed: list[str] = []
+    for key in ("user.name", "user.email"):
+        argv = ["git", "-C", str(checkout), "config", "--get", key]
+        try:
+            result = runner(argv)
+        except Exception as exc:
+            failed.append(f"{key} ({type(exc).__name__})")
+            continue
+        value = result.stdout.strip()
+        if result.returncode == 1 or (result.returncode == 0 and not value):
+            missing.append(key)
+        elif result.returncode != 0:
+            failed.append(f"{key} (git exit {result.returncode})")
+        else:
+            values[key] = value
+    if missing or failed:
+        details = []
+        if missing:
+            details.append("missing " + ", ".join(missing))
+        if failed:
+            details.append("failed " + ", ".join(failed))
+        raise WorklinkError("factory checkout Git identity preflight failed: " + "; ".join(details))
+    return values["user.name"], values["user.email"]
+
+
+def _resolve_factory_github_credential(
+    environ: Mapping[str, str],
+) -> tuple[str, dict[str, str]]:
+    gh_token = environ.get("GH_TOKEN", "").strip()
+    github_token = environ.get("GITHUB_TOKEN", "").strip()
+    selected = gh_token or github_token
+    if not selected:
+        raise WorklinkError("factory publication requires GH_TOKEN or GITHUB_TOKEN")
+    return selected, {"GH_TOKEN": selected, "GITHUB_TOKEN": selected}
 
 
 def _heartbeat_claim_best_effort(claims: ChainlinkClaims, record: ClaimRecord) -> None:
@@ -1280,13 +1336,24 @@ class WorklinkRunner:
                 event_logger=_log_event,
                 runner=_list_runner(runner),
             )
+            git_name, git_email = _read_checkout_git_identity(lease.path, runner)
+            publishing_identity = _read_factory_publishing_identity(self.repo)
+            github_token, github_env = _resolve_factory_github_credential(os.environ)
+            GitHubForgeClient(token=github_token).verify_identity(publishing_identity)
             order = WorkOrder(
                 issue_id=issue_id,
                 checkout=lease.path,
                 prompt=_epic_prompt(issue),
                 rules=None,
                 timeout_s=int(_epic_run_timeout_s()),
-                env={"MIMIR_HOME": str(self.home)},
+                env={
+                    "MIMIR_HOME": str(self.home),
+                    **github_env,
+                    "GIT_AUTHOR_NAME": git_name,
+                    "GIT_AUTHOR_EMAIL": git_email,
+                    "GIT_COMMITTER_NAME": git_name,
+                    "GIT_COMMITTER_EMAIL": git_email,
+                },
                 transcript_root=self.home / "state" / "worklink" / "transcripts",
             )
             spec = selected.work_spec(

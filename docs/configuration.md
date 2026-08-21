@@ -333,6 +333,20 @@ directory; exact token `--auto` is never passed. Worklink's base selects the
 checkout start point and PR target; it is not factory `--base`, which is never
 passed.
 
+Before first factory dispatch only, after checkout creation and before process
+launch, Worklink reads the effective checkout `git config --get user.name` and
+`git config --get user.email`. Both must be nonblank. The child receives
+`GIT_AUTHOR_NAME`, `GIT_AUTHOR_EMAIL`, `GIT_COMMITTER_NAME`, and
+`GIT_COMMITTER_EMAIL`; Worklink never writes sandbox Git identity configuration.
+
+Worklink reads the nonblank `publishing_identity` only from the trusted
+controller checkout's `.factory.json`. For GitHub publication, nonblank
+`GH_TOKEN` wins over `GITHUB_TOKEN`; otherwise `GITHUB_TOKEN` is selected. The
+selected token is explicitly verified against the declared identity, then both
+child aliases are normalized to that verified value. Differing credentials do
+not trigger fallback, and if neither exists dispatch fails naming both variable
+names without disclosing values.
+
 ## Worklink YAML
 
 Worklink reads `<MIMIR_HOME>/worklink.yaml`. This is separate from `.env`: YAML
@@ -542,7 +556,7 @@ once the corresponding skill is installed.
 | `CLAUDE_CODE_OAUTH_TOKEN` | str | unset | OAuth token for the Claude Code subprocess path (alternative to a `claude login` credentials file). |
 | `CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS` | str | unset | Passed through to the Claude Code CLI to disable its experimental beta headers. |
 | `OPENAI_API_KEY` | str | unset | Used for SAGA embeddings + consolidation; without it SAGA falls back to local fastembed. |
-| `GITHUB_TOKEN` | str | unset | Token for home git push + GitHub-backed tools/pollers. Paired with `MIMIR_STATE_REPO`. |
+| `GH_TOKEN` / `GITHUB_TOKEN` | str | unset | GitHub credentials. `GITHUB_TOKEN` supports home git push and GitHub-backed tools/pollers and is paired with `MIMIR_STATE_REPO`. Before first factory dispatch, nonblank `GH_TOKEN` has GitHub CLI precedence; otherwise `GITHUB_TOKEN` is selected. Worklink explicitly verifies the selected token against `.factory.json` `publishing_identity` and sets both child aliases to that value without fallback. |
 | `MINIMAX_API_KEY` | str | unset | Enables the Minimax usage poller (with `MIMIR_MINIMAX_USAGE_POLL_CRON`). |
 
 ## Tool & skill integration keys
