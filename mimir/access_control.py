@@ -6967,8 +6967,8 @@ class ToolRegistry:
         ifc_labels: Any = None,
         sink_category: SinkCategory | None = None,
     ) -> None:
-        """Emit shadow-decision audit log (when enabled)."""
-        if not self._shadow_logging_enabled:
+        """Emit a would-block shadow-decision audit log (when enabled)."""
+        if not self._shadow_logging_enabled or not auth.would_block:
             return
         try:
             import asyncio
@@ -7039,9 +7039,7 @@ class ToolRegistry:
                     log.warning("IFC source audit classification failed: %s", exc)
 
             fields.update({
-                # Shadow decisions cover both compatibility bypasses and trusted
-                # service-capability grants. Bypasses carry the denial reason
-                # that enforcement would apply; capability grants do not.
+                # Emission is restricted to calls enforcement would refuse.
                 "would_block": auth.would_block,
                 "target": redacted_resolved_target,
                 # Caller input is evidence only. It is never resolved, compared

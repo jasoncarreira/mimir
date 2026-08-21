@@ -4461,7 +4461,7 @@ def _service_auth(
 
 
 @pytest.mark.asyncio
-async def test_service_capability_allowed_admin_operation_emits_non_blocking_audit() -> None:
+async def test_service_capability_allowed_admin_operation_emits_no_shadow_decision() -> None:
     service = get_service_principal("saga_session_end")
     assert service is not None
     registry = ToolRegistry()
@@ -4479,20 +4479,48 @@ async def test_service_capability_allowed_admin_operation_emits_non_blocking_aud
     enforced = registry.authorize_tool("saga_feedback", auth, enforce=True)
 
     assert decision.allowed is True
-    assert captured[0][1]["would_block"] is (not enforced.allowed)
+    assert enforced.allowed is True
     assert decision.is_shadow_decision is True
-    assert captured == [(
-        "shadow_tool_decision",
-        {
-            **decision.as_log_fields(),
-            "would_block": False,
-            "target": "saga",
-            "requested_target": None,
-            "trigger": "saga_session_end",
-        },
-    )]
+    assert decision.would_block is False
+    assert captured == []
+
+
+@pytest.mark.asyncio
+async def test_shadow_emission_uses_would_block_not_reason() -> None:
+    registry = ToolRegistry()
+    registry.enable_shadow_logging()
+    captured: list[tuple[str, dict[str, object]]] = []
+
+    async def capture(kind: str, **fields: object) -> None:
+        captured.append((kind, fields))
+
+    admitted = access_control.ToolAuthorization(
+        tool_name="saga_feedback",
+        decision=OperationDecision.ADMIN_REQUIRED,
+        allowed=True,
+        reason="diagnostic_only",
+        is_shadow_decision=True,
+        would_block=False,
+    )
+    blocked = access_control.ToolAuthorization(
+        tool_name="remove_schedule",
+        decision=OperationDecision.ADMIN_REQUIRED,
+        allowed=True,
+        reason=None,
+        is_shadow_decision=True,
+        would_block=True,
+    )
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        monkeypatch.setattr("mimir.event_logger.log_event", capture)
+        registry._emit_shadow_decision(admitted)
+        registry._emit_shadow_decision(blocked)
+        await asyncio.sleep(0)
+
+    assert len(captured) == 1
+    assert all(fields["would_block"] is True for _, fields in captured)
     assert captured[0][1]["reason"] is None
-    assert captured[0][1]["service_principal"] == service.canonical
+
+
 
 
 @pytest.mark.asyncio
@@ -4515,6 +4543,7 @@ async def test_shadow_denial_event_is_self_classifying() -> None:
 
     assert decision.allowed is True
     assert captured[0][1]["would_block"] is (not enforced.allowed)
+    assert all(fields["would_block"] is True for _, fields in captured)
     assert captured == [(
         "shadow_tool_decision",
         {
