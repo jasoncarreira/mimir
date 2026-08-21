@@ -6891,37 +6891,6 @@ def _consume_task_exception(task: Any) -> None:
         log.error("shadow decision logging failed", exc_info=exc)
 
 
-def _is_authenticated_operator_context(auth_context: "AuthContext | None") -> bool:
-    """Recognize an authenticated human's own interactive bridge ingress.
-
-    This is the auth-context half of `SinkGate._is_trusted_operator_turn`. The
-    label half cannot be evaluated here because this predicate is consulted while
-    *producing* a label. Admission still applies the full predicate, so this only
-    decides the shape of the source a shell result carries - never whether the
-    call was allowed.
-    """
-    from .models import TurnInteractivity
-
-    if auth_context is None or getattr(auth_context, "is_service", False):
-        return False
-    if get_trusted_service_from_auth_context(auth_context) is not None:
-        return False
-    if getattr(auth_context, "trigger", None) != "user_message":
-        return False
-    if getattr(auth_context, "interactivity", None) is not TurnInteractivity.INTERACTIVE:
-        return False
-    if getattr(auth_context, "event_ingress", None) is not None:
-        return False
-    if not {"user", "admin"}.intersection(getattr(auth_context, "roles", ()) or ()):
-        return False
-    return all((
-        getattr(auth_context, "canonical_principal", None),
-        getattr(auth_context, "resource_id", None),
-        getattr(auth_context, "domain", None),
-        getattr(auth_context, "bridge_instance", None),
-    ))
-
-
 def _operator_can_invoke_admin_shell(
     tool_name: str,
     ifc_labels: Any,
@@ -8070,35 +8039,6 @@ def classify_protected_result(
             principal=principal,
             domain="shell",
             resource_id="repo_review",
-            bridge_instance=getattr(auth_context, "bridge_instance", None),
-            sensitivity="internal",
-            authorized_principals=(
-                frozenset({principal}) if principal else frozenset()
-            ),
-            source_kind="protected_tool",
-            integrity="untrusted",
-            integrity_effect="informational",
-        ))
-        channel = getattr(auth_context, "channel_id", None)
-        return labels.with_channel(channel) if channel else labels
-
-    if (
-        tool_name in {"shell_exec", "bash_async"}
-        and not failed
-        and _is_authenticated_operator_context(auth_context)
-    ):
-        # Same reasoning as the review-turn carve-out above, for the other turn
-        # kind that legitimately runs several shell steps. Without this, the
-        # first authorized command's output is an incomplete untrusted active
-        # ingest, and the IFC sink gate refuses the second command before the
-        # operator admin-tier exception can admit it - so the grant would only
-        # ever serve one call per turn. The output stays untrusted; it simply is
-        # not treated as a fresh external ingest.
-        principal = getattr(auth_context, "canonical_principal", None)
-        labels = InformationFlowLabels().with_source(SourceLabel(
-            principal=principal,
-            domain=getattr(auth_context, "domain", None),
-            resource_id=getattr(auth_context, "resource_id", None),
             bridge_instance=getattr(auth_context, "bridge_instance", None),
             sensitivity="internal",
             authorized_principals=(
