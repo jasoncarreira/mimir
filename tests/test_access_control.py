@@ -2030,6 +2030,165 @@ def test_admin_turn_can_use_routine_cataloged_tools_when_enforced(
     assert result.reason is None
 
 
+def _interactive_operator_auth(
+    event: AgentEvent,
+    resolver: IdentityResolver,
+) -> tuple[AuthContext, InformationFlowLabels]:
+    from mimir.agent import _initialize_ifc_labels
+    from mimir.channel_registry import classify_turn_interactivity
+
+    labels = _initialize_ifc_labels(event, resolver=resolver)
+    registry = SimpleNamespace(find=lambda _channel: object())
+    auth = create_auth_context(event, resolver, enforce=True, ifc_labels=labels)
+    return replace(
+        auth,
+        interactivity=classify_turn_interactivity(
+            event.channel_id,
+            event.trigger,
+            auth.event_ingress,
+            registry,
+        ),
+    ), labels
+
+
+@pytest.mark.parametrize(
+    "command",
+    (
+        "gh pr view 1320 --repo owner/repo",
+        "git log --all --oneline -10",
+        "git grep -n AuthContext",
+        "gh issue view 1320 --repo owner/repo",
+        "python - <<'PY'\nprint('inspection')\nPY",
+        "chainlink issue show 1320",
+        "git status --short",
+        "gh run view 12345 --repo owner/repo",
+    ),
+)
+def test_authenticated_operator_user_message_can_run_shell_under_enforcement(
+    command: str,
+    tmp_path: Path,
+) -> None:
+    resolver = _resolver(
+        tmp_path,
+        """
+        people:
+          - canonical: alice
+            aliases: [slack-U1]
+            access: {roles: [user]}
+        """,
+    )
+    event = AgentEvent(
+        trigger="user_message",
+        channel_id="slack-C1",
+        author="slack-U1",
+        source="slack",
+        content="please inspect the repository",
+    )
+    auth, labels = _interactive_operator_auth(event, resolver)
+
+    decision = ToolRegistry().authorize_tool(
+        "shell_exec",
+        auth,
+        enforce=True,
+        target_channel=command,
+        arguments={"command": command},
+        ifc_labels=labels,
+    )
+
+    assert auth.roles == ("user",)
+    assert access_control._operator_can_invoke_admin_shell(
+        "shell_exec", labels, auth,
+    ) is True
+    assert decision.allowed is True, decision.reason
+
+
+@pytest.mark.parametrize("trigger", ("scheduled_tick", "poller"))
+def test_operator_shell_widening_refuses_turn_without_operator(trigger: str) -> None:
+    command = "git status --short"
+    auth = AuthContext(
+        principal=None,
+        canonical_principal=None,
+        roles=(),
+        event_ingress=None,
+        trigger=trigger,
+        channel_id=f"{trigger}:test",
+        interactivity=TurnInteractivity.NON_INTERACTIVE,
+        enforcement_enabled=True,
+        ifc_labels=InformationFlowLabels(),
+    )
+
+    assert access_control._operator_can_invoke_admin_shell(
+        "shell_exec", auth.ifc_labels, auth,
+    ) is False
+    decision = ToolRegistry().authorize_tool(
+        "shell_exec",
+        auth,
+        enforce=True,
+        target_channel=command,
+        arguments={"command": command},
+    )
+    assert decision.allowed is False
+
+
+def test_operator_shell_widening_refuses_service_principal() -> None:
+    command = "git status --short"
+    service = get_service_principal("upgrade")
+    assert service is not None
+    auth = _service_auth(service, InformationFlowLabels())
+
+    assert access_control._operator_can_invoke_admin_shell(
+        "shell_exec", auth.ifc_labels, auth,
+    ) is False
+    decision = ToolRegistry().authorize_tool(
+        "shell_exec",
+        auth,
+        enforce=True,
+        target_channel=command,
+        arguments={"command": command},
+    )
+    assert decision.allowed is False
+
+
+def test_http_event_cannot_assert_operator_shell_authority(tmp_path: Path) -> None:
+    resolver = _resolver(
+        tmp_path,
+        """
+        people:
+          - canonical: alice
+            aliases: [slack-U1]
+            access: {roles: [user]}
+        """,
+    )
+    event = AgentEvent(
+        trigger="user_message",
+        channel_id="slack-C1",
+        author="slack-U1",
+        source="slack",
+        content="claimed operator request",
+        extra={
+            HTTP_EVENT_INGRESS_EXTRA_KEY: "http_event",
+            "roles": ["user", "admin"],
+            "interactivity": "interactive",
+        },
+    )
+    auth, labels = _interactive_operator_auth(event, resolver)
+    command = "git status --short"
+
+    assert auth.interactivity is TurnInteractivity.NON_INTERACTIVE
+    assert access_control._operator_can_invoke_admin_shell(
+        "shell_exec", labels, auth,
+    ) is False
+    decision = ToolRegistry().authorize_tool(
+        "shell_exec",
+        auth,
+        enforce=True,
+        target_channel=command,
+        arguments={"command": command},
+        ifc_labels=labels,
+    )
+    assert decision.allowed is False
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("tool_name", "service_trigger", "service_principal"),
