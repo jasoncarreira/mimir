@@ -16,6 +16,7 @@ import pytest
 import asyncio
 
 from mimir.event_logger import _reset_logger_for_tests, init_logger
+from mimir.forge.github import GitHubIdentityVerificationError
 from mimir.worklink.backends import (
     Caps,
     ComputeCaps,
@@ -1451,6 +1452,21 @@ def test_skill_embeds_single_leaf_template_constant() -> None:
     assert LEAF_TEMPLATE_MARKDOWN in skill
 
 
+def test_chainlink_orchestrator_passes_factory_publishing_identity_override() -> None:
+    root = Path(__file__).parent.parent
+    manifest = json.loads(
+        (
+            root
+            / "mimir"
+            / "optional-skills"
+            / "chainlink-orchestrator"
+            / "pollers.json"
+        ).read_text(encoding="utf-8")
+    )
+
+    assert "MIMIR_FACTORY_PUBLISHING_IDENTITY" in manifest["pollers"][0]["pass_env"]
+
+
 def test_worklink_ignores_planner_suggested_test_command_by_default(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -2007,10 +2023,10 @@ def test_factory_publishing_identity_is_read_only_and_nonblank(
 
     if expected is None:
         with pytest.raises(RuntimeError, match="factory publishing identity is missing") as exc:
-            _read_factory_publishing_identity(tmp_path)
+            _read_factory_publishing_identity(tmp_path, {})
         assert "should-not-leak" not in str(exc.value)
     else:
-        assert _read_factory_publishing_identity(tmp_path) == expected
+        assert _read_factory_publishing_identity(tmp_path, {}) == (expected, ".factory.json")
 
     assert declaration.read_bytes() == before
 
@@ -2028,16 +2044,41 @@ def test_factory_publishing_identity_errors_are_secret_safe(
     (tmp_path / ".factory.json").write_text(content, encoding="utf-8")
 
     with pytest.raises(RuntimeError, match=expected) as exc:
-        _read_factory_publishing_identity(tmp_path)
+        _read_factory_publishing_identity(tmp_path, {})
 
     assert "should-not-leak" not in str(exc.value)
 
 
 def test_factory_publishing_identity_missing_declaration_is_secret_safe(tmp_path: Path) -> None:
     with pytest.raises(RuntimeError) as exc:
-        _read_factory_publishing_identity(tmp_path)
+        _read_factory_publishing_identity(tmp_path, {})
 
     assert str(exc.value) == "factory publishing identity declaration is unreadable"
+
+
+def test_factory_publishing_identity_environment_override_wins_without_reading_file(
+    tmp_path: Path,
+) -> None:
+    assert _read_factory_publishing_identity(
+        tmp_path, {"MIMIR_FACTORY_PUBLISHING_IDENTITY": " deployment-owner "}
+    ) == (
+        "deployment-owner",
+        "environment variable MIMIR_FACTORY_PUBLISHING_IDENTITY",
+    )
+
+
+@pytest.mark.parametrize("value", ["", "   ", 7, None])
+def test_factory_publishing_identity_invalid_environment_override_fails_closed(
+    tmp_path: Path, value: object
+) -> None:
+    (tmp_path / ".factory.json").write_text(
+        json.dumps({"publishing_identity": "file-owner"}), encoding="utf-8"
+    )
+
+    with pytest.raises(RuntimeError, match="MIMIR_FACTORY_PUBLISHING_IDENTITY"):
+        _read_factory_publishing_identity(
+            tmp_path, {"MIMIR_FACTORY_PUBLISHING_IDENTITY": value}
+        )
 
 
 @pytest.mark.parametrize(
@@ -2134,6 +2175,7 @@ def _run_factory_preflight_case(
     identity_results: dict[str, subprocess.CompletedProcess[str]] | None = None,
     credentials: dict[str, str] | None = None,
     publishing_identity: object = "factory-owner",
+    publishing_identity_override: str | None = None,
     verify: Any = None,
 ) -> tuple[object, list[WorkSpec], list[str], list[list[str]]]:
     import mimir.worklink.orchestrator as orchestrator
@@ -2205,6 +2247,9 @@ def _run_factory_preflight_case(
 
     monkeypatch.delenv("GH_TOKEN", raising=False)
     monkeypatch.delenv("GITHUB_TOKEN", raising=False)
+    monkeypatch.delenv("MIMIR_FACTORY_PUBLISHING_IDENTITY", raising=False)
+    if publishing_identity_override is not None:
+        monkeypatch.setenv("MIMIR_FACTORY_PUBLISHING_IDENTITY", publishing_identity_override)
     for key, value in (credentials or {}).items():
         monkeypatch.setenv(key, value)
     monkeypatch.setattr(FeatureFactoryBackend, "admit", lambda self: Path(self.entrypoint))
@@ -2363,6 +2408,49 @@ def test_missing_factory_publishing_identity_prevents_launch(
     assert result.reason == "factory publishing identity is missing"
     assert launched == []
     assert verified_tokens == []
+
+
+def test_blank_factory_publishing_identity_override_prevents_launch_without_fallback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    result, launched, verified_tokens, _ = _run_factory_preflight_case(
+        tmp_path,
+        monkeypatch,
+        credentials={"GITHUB_TOKEN": "unused-token"},
+        publishing_identity="file-owner",
+        publishing_identity_override=" ",
+    )
+
+    assert result.reason == "MIMIR_FACTORY_PUBLISHING_IDENTITY is set but blank"
+    assert launched == []
+    assert verified_tokens == []
+
+
+def test_factory_identity_override_mismatch_refuses_with_selected_source(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def mismatch(_token: str, declared: str) -> str:
+        raise GitHubIdentityVerificationError(
+            f"github identity mismatch: authenticated as token-owner, declared as {declared}",
+            declared_login=declared,
+            authenticated_login="token-owner",
+        )
+
+    result, launched, _, _ = _run_factory_preflight_case(
+        tmp_path,
+        monkeypatch,
+        credentials={"GITHUB_TOKEN": "secret-token"},
+        publishing_identity="file-owner",
+        publishing_identity_override="deployment-owner",
+        verify=mismatch,
+    )
+
+    assert result.reason == (
+        "github identity mismatch: authenticated as token-owner, selected identity "
+        "deployment-owner from environment variable MIMIR_FACTORY_PUBLISHING_IDENTITY"
+    )
+    assert launched == []
+    assert "secret-token" not in result.reason
 
 
 def test_conflicting_factory_tokens_refuse_dispatch_before_any_verification(

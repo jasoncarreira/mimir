@@ -134,7 +134,8 @@ Once installed and configured (see frontmatter env), the scheduler runs the
    in the deterministic core executor.
 
 The detached run inherits the **poller's** env, so `pass_env` must carry anything
-the run needs — notably **`GITHUB_TOKEN`**: the core executor's `_open_pr`
+the run needs - notably **`GITHUB_TOKEN`** and
+**`MIMIR_FACTORY_PUBLISHING_IDENTITY`**: the core executor's `_open_pr`
 (`gh pr create`) runs on the controller side in this subprocess (not in the
 worker), so without the token `gh` can't authenticate and review-ready runs fail
 at PR creation → thrash to `worklink:blocked`. (Manual `bash -lc` dispatch hides
