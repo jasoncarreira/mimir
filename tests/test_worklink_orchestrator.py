@@ -1797,6 +1797,81 @@ def test_run_epic_refuses_review_state_before_claim_or_factory_launch(
     assert not (repo / ".worklink").exists()
 
 
+def test_factory_new_run_uses_single_backend_checkout_placement(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import mimir.worklink.orchestrator as orchestrator
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    epic = json.dumps(
+        {
+            "id": 700,
+            "title": "epic",
+            "description": "build",
+            "labels": ["worklink", "worklink:epic", "worklink:ready"],
+            "comments": [],
+        }
+    )
+    placement_calls: list[tuple[Path, dict[str, object]]] = []
+    claim = ClaimRecord(700, 1, "agent", datetime.now(UTC))
+    lease = CheckoutLease(
+        issue_id=700,
+        attempt=1,
+        repo=repo,
+        path=tmp_path / "factory-checkout",
+        branch="issue/700-a1",
+        base_ref="main",
+        local_base="origin/main",
+        isolated_checkout=True,
+    )
+
+    def runner(args: Sequence[str] | str, **_: object) -> subprocess.CompletedProcess[str]:
+        if isinstance(args, list) and args[:4] == ["chainlink", "issue", "show", "700"]:
+            return cp(args, stdout=epic)
+        if isinstance(args, list) and args[:4] == ["git", "-C", str(repo), "config"]:
+            return cp(args, stdout="git@github.com:owner/repo.git\n")
+        return cp(args)
+
+    def place(checkout_repo: Path, **kwargs: object) -> CheckoutLease:
+        placement_calls.append((checkout_repo, kwargs))
+        return lease
+
+    async def stop_after_placement(self: object, spec: WorkSpec) -> LaunchHandle:
+        raise RuntimeError("stop after placement")
+
+    monkeypatch.setattr(FeatureFactoryBackend, "admit", lambda self: Path(self.entrypoint))
+    monkeypatch.setattr(
+        orchestrator.ChainlinkClaims,
+        "claim_issue",
+        lambda self, *args, **kwargs: ClaimResult(True, claim),
+    )
+    monkeypatch.setattr(
+        orchestrator.ChainlinkClaims, "transition_issue", lambda *args, **kwargs: None
+    )
+    monkeypatch.setattr(
+        orchestrator.ChainlinkClaims, "release_issue", lambda *args, **kwargs: None
+    )
+    monkeypatch.setattr(orchestrator, "_create_backend_checkout", place)
+    monkeypatch.setattr(
+        orchestrator.LocalSubprocessComputeBackend, "launch", stop_after_placement
+    )
+
+    result = asyncio.run(
+        WorklinkRunner(home=tmp_path, repo=repo, runner=runner, agent_id="agent").run_epic(700)
+    )
+
+    assert result.status == "failed"
+    assert result.reason == "stop after placement"
+    assert len(placement_calls) == 1
+    checkout_repo, kwargs = placement_calls[0]
+    assert checkout_repo == repo
+    assert kwargs["issue_id"] == 700
+    assert kwargs["attempt"] == 1
+    assert kwargs["base"] == "main"
+    assert isinstance(kwargs["backend"], FeatureFactoryBackend)
+
+
 @pytest.mark.parametrize("autonomous", [False, True])
 def test_every_epic_claim_uses_factory_concurrency_cap(
     tmp_path: Path,

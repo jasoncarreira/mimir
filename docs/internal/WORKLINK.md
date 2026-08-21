@@ -64,9 +64,16 @@ and final PR identity verification.
   flag is set, epics are only excluded from leaf dispatch and are never
   dispatched (no dispatch-then-refuse churn).
 - **Launch**: Worklink supervises exactly `opencode run --log-level DEBUG
-  --print-logs --dir <checkout> --command feature " --autonomous <issue>"`.
+  --print-logs --dir <checkout> --command feature " --autonomous --max-retries
+  5 <issue>"`.
   Cancellation is verified process-group cancellation through `mimir worklink
   stop`; feature-factory has no cancel transition.
+- **Retry and staging**: `MIMIR_FACTORY_MAX_RETRIES` defaults to `5`, accepts
+  exactly ASCII `[0-9]+` in range `1..9007199254740991`, and falls back to `5`
+  for absent or invalid values. feature-factory 0.7.2 stages the workflow inside
+  the run directory; exact token `--auto` is never passed. Worklink's base
+  selects the checkout start point and PR target; it is not factory `--base`,
+  which is never passed.
 - **Controls**: Every control is `node <absolute feature-factory/bin/factory.js>`.
   Worklink admits the launcher only after package/adapter 0.7.2 verification and
   all 16 nonmutating structural command probes. Status is read with `status
@@ -438,7 +445,7 @@ require touching the orchestrator.
 | Adapter | Invocation sketch | Notes |
 |---|---|---|
 | `opencode` | `opencode run --dir <checkout> -- <prompt>` | Sole coding backend for leaf issues; provider and model are selected by opencode configuration/arguments. |
-| `feature_factory` | `opencode run ... --command feature " --autonomous <issue>"` | Epic adapter with Worklink-supervised OpenCode and absolute 0.7 controls. |
+| `feature_factory` | `opencode run ... --command feature " --autonomous --max-retries 5 <issue>"` | Epic adapter with Worklink-supervised OpenCode and absolute 0.7.2 controls. |
 
 Selection is config, not code (§7): per repo / label / issue-type, with
 a per-category default. The executor consults `Caps` rather than

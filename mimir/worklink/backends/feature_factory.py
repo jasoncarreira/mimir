@@ -43,12 +43,32 @@ _MAX_STATUS_BYTES = 1024 * 1024
 _MAX_LIST_ITEMS = 1000
 _MAX_TEXT_BYTES = 16 * 1024
 _MAX_JSON_DEPTH = 32
+_DEFAULT_FACTORY_MAX_RETRIES = 5
+_MAX_FACTORY_MAX_RETRIES = 9_007_199_254_740_991
+_FACTORY_MAX_RETRIES_ENV = "MIMIR_FACTORY_MAX_RETRIES"
+_ASCII_DECIMAL = re.compile(r"[0-9]+")
 _ARGUMENT_STRUCTURE = re.compile(
     r"(?im)(?:^\s*usage\s*:|\b(?:argument|option|operand|required|requires|missing|expected)\b)"
 )
 _UNKNOWN_STRUCTURE = re.compile(r"(?im)\b(?:unknown|unrecognized)\b[^\n]*\bcommand\b")
 
 Runner = Callable[..., subprocess.CompletedProcess[Any]]
+
+
+def _factory_max_retries(environ: Mapping[str, str] | None = None) -> int:
+    source = os.environ if environ is None else environ
+    raw = source.get(_FACTORY_MAX_RETRIES_ENV)
+    if raw is None or _ASCII_DECIMAL.fullmatch(raw) is None:
+        return _DEFAULT_FACTORY_MAX_RETRIES
+    normalized = raw.lstrip("0")
+    if not normalized:
+        return _DEFAULT_FACTORY_MAX_RETRIES
+    maximum = str(_MAX_FACTORY_MAX_RETRIES)
+    if len(normalized) > len(maximum) or (
+        len(normalized) == len(maximum) and normalized > maximum
+    ):
+        return _DEFAULT_FACTORY_MAX_RETRIES
+    return int(normalized)
 
 
 class FactoryContractError(RuntimeError):
@@ -580,6 +600,9 @@ class FeatureFactoryBackend:
 
     @staticmethod
     def opencode_argv(operator_checkout: Path, issue_number: int) -> tuple[str, ...]:
+        retries = _factory_max_retries()
+        # feature-factory 0.7.2 stages the workflow inside the run directory, so
+        # OpenCode --auto must not bypass it.
         return (
             "opencode",
             "run",
@@ -590,7 +613,7 @@ class FeatureFactoryBackend:
             str(operator_checkout),
             "--command",
             "feature",
-            f" --autonomous {issue_number}",
+            f" --autonomous --max-retries {retries} {issue_number}",
         )
 
     def _control(

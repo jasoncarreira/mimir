@@ -90,6 +90,14 @@ but have separate admission and concurrency. The image installs
 poller dispatch `worklink:epic` issues. `MIMIR_FACTORY_MAX_CONCURRENT` defaults
 to `1`, independently of the leaf default `2`.
 
+The launch ends with `--command feature " --autonomous --max-retries 5
+<issue>"`. `MIMIR_FACTORY_MAX_RETRIES` defaults to `5`, accepts exactly ASCII
+`[0-9]+` in range `1..9007199254740991`, and falls back to `5` for absent or
+invalid values. feature-factory 0.7.2 stages the workflow inside the run
+directory; exact token `--auto` is never passed. Worklink's base selects the
+checkout start point and PR target; it is not factory `--base`, which is never
+passed.
+
 Worklink supervises OpenCode while `/feature` owns factory transitions. The
 12-hour `MIMIR_FACTORY_RUN_TIMEOUT_S` default is only a process liveness
 backstop. The 900-second `MIMIR_FACTORY_STALE_HEARTBEAT_S` threshold produces

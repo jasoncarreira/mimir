@@ -13,6 +13,7 @@ from typing import Sequence
 import pytest
 
 import mimir.worklink.checkout as checkout_module
+from mimir.worklink.backends.feature_factory import DEFAULT_FACTORY_ENTRYPOINT
 from mimir.worklink.checkout import (
     CheckoutAuthorization,
     CheckoutLease,
@@ -208,6 +209,15 @@ def _repo_with_main(tmp_path: Path) -> Path:
     exclude = repo / ".git" / "info" / "exclude"
     exclude.write_text(exclude.read_text(encoding="utf-8") + "\n.worklink/\n", encoding="utf-8")
     return repo
+
+
+def test_default_factory_entrypoint_resolves_outside_allocated_checkout(
+    tmp_path: Path,
+) -> None:
+    lease = create_worktree(_repo_with_main(tmp_path), issue_id=1606, attempt=1)
+
+    entrypoint = Path(DEFAULT_FACTORY_ENTRYPOINT).resolve()
+    assert not entrypoint.is_relative_to(lease.path.resolve())
 
 
 def _repo_with_stale_local_main(tmp_path: Path) -> tuple[Path, Path, str, str]:
@@ -538,7 +548,7 @@ def test_create_worktree_real_git_feature_acp_remote_base(tmp_path: Path) -> Non
     assert lease.local_base == "origin/feature/acp"
     # The worktree must be on the attempt branch, NOT the base branch (the DWIM bug).
     assert _git(lease.path, "branch", "--show-current") == "issue/441-a1"
-    assert _git(lease.path, "merge-base", "HEAD", "origin/feature/acp") == feature_sha
+    assert _git(lease.path, "rev-parse", "HEAD") == feature_sha
     # No stray local branch named after the base was created by DWIM.
     local_branches = _git(repo, "branch", "--format=%(refname:short)").split()
     assert "feature/acp" not in local_branches
