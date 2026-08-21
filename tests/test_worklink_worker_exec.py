@@ -320,6 +320,13 @@ def test_repo_test_uv_cache_seed_copies_cache_and_tolerates_missing_source(
     source.mkdir()
     (source / "seed.whl").write_text("cached", encoding="utf-8")
     (source / "seed-link.whl").symlink_to("seed.whl")
+    # Set the modes explicitly rather than inheriting the process umask. The
+    # seeder rejects a group- or other-writable source, which is the property it
+    # exists to enforce, and the contained repo_test runner executes as the
+    # worklink account with umask 0002 -- so an inherited 0664 makes this
+    # fixture fail the very check it is meant to exercise. Only the real bits
+    # matter here; the symlink's own mode is not inspected.
+    (source / "seed.whl").chmod(0o444)
     source.chmod(0o555)
     monkeypatch.setattr(worker_exec, "REPO_TEST_UV_CACHE", source)
 
