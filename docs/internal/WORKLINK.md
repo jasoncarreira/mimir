@@ -82,11 +82,15 @@ and final PR identity verification.
   Git identity configuration.
 - **Publication credential**: Worklink reads the nonblank `publishing_identity`
   only from the trusted controller checkout's `.factory.json`. For GitHub
-  publication, nonblank `GH_TOKEN` wins over `GITHUB_TOKEN`; otherwise
-  `GITHUB_TOKEN` is selected. The selected token is explicitly verified against
-  the declared identity, then both child aliases are normalized to that verified
-  value. Differing credentials do not trigger fallback, and if neither exists
-  dispatch fails naming both variable names without disclosing values.
+  publication Worklink verifies the credential this process is already bound to,
+  `GITHUB_TOKEN`, rather than selecting among candidates: `GH_TOKEN` is a
+  child-only alias for `gh`, and verifying a second credential in a process that
+  already verified one is refused by the forge identity memo before `/user` is
+  ever reached. That token's owner is compared against the declared identity
+  before dispatch, then both child aliases are normalized to it. `GH_TOKEN` and
+  `GITHUB_TOKEN` set to different values fail dispatch as an operator ambiguity
+  rather than one being preferred, and a missing `GITHUB_TOKEN` fails naming that
+  variable - in both cases without disclosing values.
 - **Controls**: Every control is `node <absolute feature-factory/bin/factory.js>`.
   Worklink admits the launcher only after package/adapter 0.7.2 verification and
   all 16 nonmutating structural command probes. Status is read with `status

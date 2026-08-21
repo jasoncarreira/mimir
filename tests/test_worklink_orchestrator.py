@@ -1905,28 +1905,90 @@ def test_factory_publishing_identity_missing_declaration_is_secret_safe(tmp_path
 
 
 @pytest.mark.parametrize(
-    ("environ", "selected"),
+    ("environ", "expected"),
     [
-        ({"GH_TOKEN": "gh-token"}, "gh-token"),
         ({"GITHUB_TOKEN": "github-token"}, "github-token"),
         ({"GH_TOKEN": "same-token", "GITHUB_TOKEN": "same-token"}, "same-token"),
-        ({"GH_TOKEN": " gh-token ", "GITHUB_TOKEN": "github-token"}, "gh-token"),
+        ({"GITHUB_TOKEN": " github-token "}, "github-token"),
+        ({"GH_TOKEN": " github-token ", "GITHUB_TOKEN": " github-token "}, "github-token"),
     ],
 )
-def test_factory_github_credential_uses_gh_precedence_and_normalizes_aliases(
-    environ: dict[str, str], selected: str
+def test_factory_github_credential_inherits_process_token_and_normalizes_aliases(
+    environ: dict[str, str], expected: str
 ) -> None:
     token, child = _resolve_factory_github_credential(environ)
 
-    assert token == selected
-    assert child == {"GH_TOKEN": selected, "GITHUB_TOKEN": selected}
+    assert token == expected
+    assert child == {"GH_TOKEN": expected, "GITHUB_TOKEN": expected}
 
 
-def test_factory_github_credential_names_both_missing_aliases() -> None:
-    with pytest.raises(RuntimeError, match="GH_TOKEN or GITHUB_TOKEN") as exc:
-        _resolve_factory_github_credential({"GH_TOKEN": " ", "GITHUB_TOKEN": ""})
+@pytest.mark.parametrize(
+    "environ",
+    [
+        {"GH_TOKEN": " ", "GITHUB_TOKEN": ""},
+        {},
+        {"GH_TOKEN": "gh-token-only"},
+    ],
+)
+def test_factory_github_credential_requires_the_process_token(environ: dict[str, str]) -> None:
+    with pytest.raises(RuntimeError) as exc:
+        _resolve_factory_github_credential(environ)
 
-    assert str(exc.value) == "factory publication requires GH_TOKEN or GITHUB_TOKEN"
+    assert str(exc.value) == "factory publication requires GITHUB_TOKEN"
+    assert "gh-token-only" not in str(exc.value)
+
+
+def test_factory_github_credential_refuses_conflicting_aliases_without_values() -> None:
+    with pytest.raises(RuntimeError) as exc:
+        _resolve_factory_github_credential(
+            {"GH_TOKEN": "gh-secret", "GITHUB_TOKEN": "github-secret"}
+        )
+
+    message = str(exc.value)
+    assert "GH_TOKEN" in message
+    assert "GITHUB_TOKEN" in message
+    assert "gh-secret" not in message
+    assert "github-secret" not in message
+
+
+def test_inherited_credential_clears_a_prebound_identity_memo(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The preflight must not collide with a memo an earlier forge call bound.
+
+    `verify_identity` memoizes `(login, fingerprint)` process-wide and refuses a
+    fingerprint change before it ever reaches `/user`. Selecting `GH_TOKEN` while
+    the rest of the process was bound to `GITHUB_TOKEN` therefore failed the
+    preflight even when both credentials belonged to the declared publisher.
+    Inheriting the process credential removes the second fingerprint entirely.
+    """
+    from mimir.forge import github as github_module
+
+    token, child = _resolve_factory_github_credential(
+        {"GITHUB_TOKEN": "process-token", "GH_TOKEN": "process-token"}
+    )
+    assert child == {"GH_TOKEN": "process-token", "GITHUB_TOKEN": "process-token"}
+
+    monkeypatch.setattr(
+        github_module,
+        "_verified_identity",
+        ("factory-owner", github_module._credential_fingerprint("process-token")),
+    )
+
+    def unexpected_request(*args: object, **kwargs: object) -> object:
+        raise AssertionError("a bound memo must answer without re-querying /user")
+
+    monkeypatch.setattr(github_module.GitHubForgeClient, "_request", unexpected_request)
+
+    assert (
+        github_module.GitHubForgeClient(token=token).verify_identity("factory-owner")
+        == "factory-owner"
+    )
+
+    # The other half of the pair: a second credential is what the memo refuses,
+    # so this test fails if the guard it is protecting against stops existing.
+    with pytest.raises(RuntimeError, match="does not match active credential"):
+        github_module.GitHubForgeClient(token="a-second-token").verify_identity("factory-owner")
 
 
 def _run_factory_preflight_case(
@@ -2033,13 +2095,11 @@ def _run_factory_preflight_case(
 @pytest.mark.parametrize(
     ("credentials", "selected"),
     [
-        ({"GH_TOKEN": "gh-token"}, "gh-token"),
         ({"GITHUB_TOKEN": "github-token"}, "github-token"),
         ({"GH_TOKEN": "same-token", "GITHUB_TOKEN": "same-token"}, "same-token"),
-        ({"GH_TOKEN": "gh-token", "GITHUB_TOKEN": "alternate-token"}, "gh-token"),
     ],
 )
-def test_factory_dispatch_verifies_selected_token_and_normalizes_child_aliases(
+def test_factory_dispatch_verifies_process_token_and_normalizes_child_aliases(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     credentials: dict[str, str],
@@ -2132,7 +2192,7 @@ def test_missing_checkout_git_identity_prevents_factory_launch(
         tmp_path,
         monkeypatch,
         identity_results=identity_results,
-        credentials={"GH_TOKEN": "unused-token"},
+        credentials={"GITHUB_TOKEN": "unused-token"},
     )
 
     assert result.reason is not None
@@ -2149,7 +2209,7 @@ def test_missing_checkout_git_identity_prevents_factory_launch(
 def test_missing_factory_github_credential_prevents_launch(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     result, launched, verified_tokens, _ = _run_factory_preflight_case(tmp_path, monkeypatch)
 
-    assert result.reason == "factory publication requires GH_TOKEN or GITHUB_TOKEN"
+    assert result.reason == "factory publication requires GITHUB_TOKEN"
     assert launched == []
     assert verified_tokens == []
 
@@ -2160,7 +2220,7 @@ def test_missing_factory_publishing_identity_prevents_launch(
     result, launched, verified_tokens, _ = _run_factory_preflight_case(
         tmp_path,
         monkeypatch,
-        credentials={"GH_TOKEN": "unused-token"},
+        credentials={"GITHUB_TOKEN": "unused-token"},
         publishing_identity=" ",
     )
 
@@ -2169,29 +2229,27 @@ def test_missing_factory_publishing_identity_prevents_launch(
     assert verified_tokens == []
 
 
-def test_different_factory_tokens_do_not_fallback_after_selected_identity_mismatch(
+def test_conflicting_factory_tokens_refuse_dispatch_before_any_verification(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    def mismatch(token: str, declared: str) -> str:
-        assert token == "selected-secret"
-        raise RuntimeError(
-            f"github identity mismatch: authenticated as other-owner, declared as {declared}"
-        )
+    """Two different credentials are an operator ambiguity, not a precedence question.
 
+    Nothing is verified: preferring one silently is how publication proceeds under
+    the wrong identity, which is what `publishing_identity` exists to catch.
+    """
     result, launched, verified_tokens, _ = _run_factory_preflight_case(
         tmp_path,
         monkeypatch,
-        credentials={"GH_TOKEN": "selected-secret", "GITHUB_TOKEN": "fallback-secret"},
-        verify=mismatch,
+        credentials={"GH_TOKEN": "gh-secret", "GITHUB_TOKEN": "github-secret"},
     )
 
-    assert result.reason == (
-        "github identity mismatch: authenticated as other-owner, declared as factory-owner"
-    )
+    assert result.reason is not None
+    assert "GH_TOKEN" in result.reason
+    assert "GITHUB_TOKEN" in result.reason
     assert launched == []
-    assert verified_tokens == ["selected-secret"]
-    assert "selected-secret" not in result.reason
-    assert "fallback-secret" not in result.reason
+    assert verified_tokens == []
+    assert "gh-secret" not in result.reason
+    assert "github-secret" not in result.reason
 
 
 def test_factory_new_run_uses_single_backend_checkout_placement(
@@ -2290,8 +2348,8 @@ def test_factory_new_run_uses_single_backend_checkout_placement(
             assert declared == "factory-owner"
             return declared
 
-    monkeypatch.delenv("GITHUB_TOKEN", raising=False)
-    monkeypatch.setenv("GH_TOKEN", " selected-token ")
+    monkeypatch.delenv("GH_TOKEN", raising=False)
+    monkeypatch.setenv("GITHUB_TOKEN", " selected-token ")
     monkeypatch.setattr(FeatureFactoryBackend, "admit", lambda self: Path(self.entrypoint))
     monkeypatch.setattr(
         orchestrator.ChainlinkClaims,

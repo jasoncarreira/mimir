@@ -181,12 +181,32 @@ def _read_checkout_git_identity(checkout: Path, runner: Runner) -> tuple[str, st
 def _resolve_factory_github_credential(
     environ: Mapping[str, str],
 ) -> tuple[str, dict[str, str]]:
-    gh_token = environ.get("GH_TOKEN", "").strip()
+    """Return the credential this process is already bound to, plus child aliases.
+
+    The parent does not select among candidate credentials. ``GITHUB_TOKEN`` is
+    what both the forge client and configuration read, so it is *the* process
+    credential; ``GH_TOKEN`` exists only because the factory's child shells out
+    to ``gh``, which prefers that name. Borrowing gh's precedence rule for the
+    parent's own verification would introduce a second credential into a process
+    that already verified one, and the forge identity memo refuses a fingerprint
+    change - so the preflight would fail without ever reaching ``/user``.
+
+    Two different non-blank values are an operator ambiguity, not a precedence
+    question. Silently preferring one is how publication proceeds under the
+    wrong identity, which is the failure ``.factory.json`` ``publishing_identity``
+    exists to catch, so this refuses and names the variables to reconcile.
+    """
     github_token = environ.get("GITHUB_TOKEN", "").strip()
-    selected = gh_token or github_token
-    if not selected:
-        raise WorklinkError("factory publication requires GH_TOKEN or GITHUB_TOKEN")
-    return selected, {"GH_TOKEN": selected, "GITHUB_TOKEN": selected}
+    gh_token = environ.get("GH_TOKEN", "").strip()
+    if gh_token and github_token and gh_token != github_token:
+        raise WorklinkError(
+            "factory publication credentials conflict: GH_TOKEN and GITHUB_TOKEN "
+            "are both set to different values; unset GH_TOKEN or set it to the "
+            "same credential"
+        )
+    if not github_token:
+        raise WorklinkError("factory publication requires GITHUB_TOKEN")
+    return github_token, {"GH_TOKEN": github_token, "GITHUB_TOKEN": github_token}
 
 
 def _heartbeat_claim_best_effort(claims: ChainlinkClaims, record: ClaimRecord) -> None:

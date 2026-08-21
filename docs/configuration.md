@@ -340,12 +340,16 @@ launch, Worklink reads the effective checkout `git config --get user.name` and
 `GIT_COMMITTER_EMAIL`; Worklink never writes sandbox Git identity configuration.
 
 Worklink reads the nonblank `publishing_identity` only from the trusted
-controller checkout's `.factory.json`. For GitHub publication, nonblank
-`GH_TOKEN` wins over `GITHUB_TOKEN`; otherwise `GITHUB_TOKEN` is selected. The
-selected token is explicitly verified against the declared identity, then both
-child aliases are normalized to that verified value. Differing credentials do
-not trigger fallback, and if neither exists dispatch fails naming both variable
-names without disclosing values.
+controller checkout's `.factory.json`. For GitHub publication Worklink
+verifies the credential this process is already bound to, `GITHUB_TOKEN`, rather
+than selecting among candidates: `GH_TOKEN` is a child-only alias for `gh`, and
+verifying a second credential in a process that already verified one is refused
+by the forge identity memo before `/user` is ever reached. That token's owner is
+compared against the declared identity before dispatch, then both child aliases
+are normalized to it. `GH_TOKEN` and `GITHUB_TOKEN` set to different values fail
+dispatch as an operator ambiguity rather than one being preferred, and a missing
+`GITHUB_TOKEN` fails naming that variable - in both cases without disclosing
+values.
 
 ## Worklink YAML
 
@@ -556,7 +560,7 @@ once the corresponding skill is installed.
 | `CLAUDE_CODE_OAUTH_TOKEN` | str | unset | OAuth token for the Claude Code subprocess path (alternative to a `claude login` credentials file). |
 | `CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS` | str | unset | Passed through to the Claude Code CLI to disable its experimental beta headers. |
 | `OPENAI_API_KEY` | str | unset | Used for SAGA embeddings + consolidation; without it SAGA falls back to local fastembed. |
-| `GH_TOKEN` / `GITHUB_TOKEN` | str | unset | GitHub credentials. `GITHUB_TOKEN` supports home git push and GitHub-backed tools/pollers and is paired with `MIMIR_STATE_REPO`. Before first factory dispatch, nonblank `GH_TOKEN` has GitHub CLI precedence; otherwise `GITHUB_TOKEN` is selected. Worklink explicitly verifies the selected token against `.factory.json` `publishing_identity` and sets both child aliases to that value without fallback. |
+| `GH_TOKEN` / `GITHUB_TOKEN` | str | unset | GitHub credentials. `GITHUB_TOKEN` is the process credential: it supports home git push and GitHub-backed tools/pollers, is paired with `MIMIR_STATE_REPO`, and is the credential factory dispatch verifies against `.factory.json` `publishing_identity`. `GH_TOKEN` is a child-only alias for `gh` and is never preferred over it; both set to different values fails dispatch as an ambiguity, and a missing `GITHUB_TOKEN` fails naming that variable. Worklink sets both child aliases to the verified value. |
 | `MINIMAX_API_KEY` | str | unset | Enables the Minimax usage poller (with `MIMIR_MINIMAX_USAGE_POLL_CRON`). |
 
 ## Tool & skill integration keys
