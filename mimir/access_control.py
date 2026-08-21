@@ -4848,7 +4848,7 @@ _REPOSITORY_RESULT_RESOURCE = re.compile(
 def _forge_repository_scope_mismatch(
     ifc_labels: Any,
     scope: Any,
-) -> tuple[str, str] | None:
+) -> tuple[str, str, str] | None:
     """Return the first repository result that is outside a forge sink scope."""
     expected_repo = getattr(scope, "canonical_repo", None)
     expected_issue = getattr(scope, "issue_number", None)
@@ -4863,7 +4863,7 @@ def _forge_repository_scope_mismatch(
             if isinstance(resource_id, str) else None
         )
         if match is None:
-            return str(resource_id or "unknown"), "unknown"
+            return str(resource_id or "unknown"), "unknown", "resource_id"
         source_repo = match.group("repo")
         source_pr = int(match.group("pr"))
         source_head = match.group("head")
@@ -4872,16 +4872,18 @@ def _forge_repository_scope_mismatch(
                 isinstance(expected_repo, str)
                 and source_repo.casefold() == expected_repo.casefold()
             ):
-                return source_repo, str(source_pr)
+                return source_repo, str(source_pr), "canonical_repo"
             continue
-        if not (
-            isinstance(expected_repo, str)
-            and source_repo.casefold() == expected_repo.casefold()
-            and source_pr == expected_pr
-            and isinstance(expected_head, str)
-            and source_head.casefold() == expected_head.casefold()
+        if not isinstance(expected_repo, str) or (
+            source_repo.casefold() != expected_repo.casefold()
         ):
-            return source_repo, str(source_pr)
+            return source_repo, str(source_pr), "canonical_repo"
+        if source_pr != expected_pr:
+            return source_repo, str(source_pr), "pr_number"
+        if not isinstance(expected_head, str) or (
+            source_head.casefold() != expected_head.casefold()
+        ):
+            return source_repo, str(source_pr), "observed_head_sha"
     return None
 
 
@@ -5433,7 +5435,7 @@ class SinkGate:
                 ifc_labels, repo_pr_action_scope,
             )
             if mismatch is not None:
-                source_repo, source_pr = mismatch
+                source_repo, source_pr, mismatch_component = mismatch
                 destination_repo = getattr(
                     repo_pr_action_scope, "canonical_repo", "unknown",
                 )
@@ -5454,7 +5456,8 @@ class SinkGate:
                     refusal_detail=(
                         f"repository result from {source_repo}#{source_pr} cannot "
                         f"flow to {destination_repo}#{destination_pr}: repository, "
-                        "pull request, and observed head must match"
+                        "pull request, and observed head must match "
+                        f"(mismatched component: {mismatch_component})"
                     ),
                 )
 

@@ -6711,7 +6711,20 @@ def test_repo_test_admits_self_trigger_only_and_refuses_monotonic_taint(
     )
     clean = InformationFlowLabels().with_channel(
         "poller:github-activity",
-    ).with_source(self_trigger)
+    ).with_source(self_trigger).with_source(SourceLabel(
+        principal="service:poller:github-activity",
+        domain="repository",
+        resource_id=(
+            f"{state.action_scope.canonical_repo}#pull/{state.action_scope.pr_number}"
+            f"@{state.action_scope.observed_head_sha}"
+        ),
+        bridge_instance="forge",
+        sensitivity="internal",
+        authorized_principals=frozenset({"service:poller:github-activity"}),
+        source_kind="protected_tool",
+        integrity="untrusted",
+        integrity_effect="informational",
+    ))
     untrusted_only = InformationFlowLabels().with_channel(
         "poller:github-activity",
     ).with_source(untrusted_page)
@@ -7148,6 +7161,50 @@ def test_batched_pr_results_are_bound_to_each_call_and_cannot_cross_forge_scopes
     assert stale_head.allowed is False
     assert stale_head.reason == "ifc_label_blocked:forge"
     assert stale_head.refusal_detail is not None
+
+
+def _repository_result_labels(repo: str, pr: int, head: str) -> InformationFlowLabels:
+    return InformationFlowLabels().with_source(SourceLabel(
+        principal="operator",
+        domain="repository",
+        resource_id=f"{repo}#pull/{pr}@{head}",
+        bridge_instance="forge",
+        sensitivity="internal",
+        authorized_principals=frozenset({"operator"}),
+        source_kind="protected_tool",
+        integrity="untrusted",
+        integrity_effect="informational",
+    ))
+
+
+def test_forge_repository_result_from_different_repository_is_refused() -> None:
+    scope = _review_state("owner/repo", 17, "fix", "/srv/repo").action_scope
+
+    mismatch = access_control._forge_repository_scope_mismatch(
+        _repository_result_labels("other/repo", 17, scope.observed_head_sha), scope,
+    )
+
+    assert mismatch == ("other/repo", "17", "canonical_repo")
+
+
+def test_forge_repository_result_from_different_pull_request_is_refused() -> None:
+    scope = _review_state("owner/repo", 17, "fix", "/srv/repo").action_scope
+
+    mismatch = access_control._forge_repository_scope_mismatch(
+        _repository_result_labels("owner/repo", 18, scope.observed_head_sha), scope,
+    )
+
+    assert mismatch == ("owner/repo", "18", "pr_number")
+
+
+def test_forge_repository_result_from_different_observed_head_is_refused() -> None:
+    scope = _review_state("owner/repo", 17, "fix", "/srv/repo").action_scope
+
+    mismatch = access_control._forge_repository_scope_mismatch(
+        _repository_result_labels("owner/repo", 17, "f" * 40), scope,
+    )
+
+    assert mismatch == ("owner/repo", "17", "observed_head_sha")
 
 
 def _attach_test_checkout_lease(

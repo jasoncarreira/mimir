@@ -35,7 +35,14 @@ from langchain_core.tools import ToolException
 from langgraph.runtime import Runtime
 
 from mimir._context import get_current_turn, reset_current_turn, set_current_turn
-from mimir.access_control import ToolRegistry, builtin_trigger_service_principal
+from mimir.access_control import (
+    OperationDecision,
+    SinkGate,
+    ToolAuthorization,
+    ToolRegistry,
+    _forge_repository_scope_mismatch,
+    builtin_trigger_service_principal,
+)
 from mimir.models import (
     AuthContext,
     InformationFlowLabels,
@@ -44,6 +51,7 @@ from mimir.models import (
     RepoPRActionScope,
     RepoPRScopeRegistry,
     RepoReviewState,
+    ServerDiscoveredPRStates,
     SourceLabel,
     TurnContext,
 )
@@ -52,6 +60,7 @@ from mimir.tools.budget_gate import (
     BudgetGateMiddleware,
     _check_and_increment_or_deny,
     _emit_tool_call_sync,
+    _result_labels_for_call,
 )
 from tests.auth_helpers import attach_middleware_auth_context
 
@@ -903,6 +912,97 @@ def _ifc_turn(auth: AuthContext) -> TurnContext:
     ctx.auth_context = auth
     ctx.ifc_labels = auth.ifc_labels
     return ctx
+
+
+@pytest.mark.parametrize("trigger", ["poller", "user_message"])
+def test_repository_result_uses_revalidated_post_execution_scope(
+    trigger: str,
+) -> None:
+    old_scope = RepoPRActionScope(
+        provenance="poller_payload",
+        canonical_repo="owner/repo",
+        canonical_root="/srv/repo",
+        canonical_origin="https://github.com/owner/repo.git",
+        principal="mimir-bot",
+        event_type="pr_changes_requested_stale",
+        allowed_operations=frozenset(action.value for action in RepoPRAction),
+        pr_number=17,
+        head_repo="owner/repo",
+        head_remote="origin",
+        destination_ref="refs/heads/fix",
+        observed_head_sha="a" * 40,
+        base_ref="main",
+        observed_base_sha="b" * 40,
+    )
+    current_scope = RepoPRActionScope(
+        provenance="server_discovered",
+        canonical_repo=old_scope.canonical_repo,
+        canonical_root=old_scope.canonical_root,
+        canonical_origin=old_scope.canonical_origin,
+        principal=old_scope.principal,
+        event_type=old_scope.event_type,
+        allowed_operations=old_scope.allowed_operations,
+        pr_number=old_scope.pr_number,
+        head_repo=old_scope.head_repo,
+        head_remote=old_scope.head_remote,
+        destination_ref=old_scope.destination_ref,
+        observed_head_sha="c" * 40,
+        base_ref=old_scope.base_ref,
+        observed_base_sha=old_scope.observed_base_sha,
+    )
+    discovered = ServerDiscoveredPRStates()
+    discovered.remember(RepoReviewState(current_scope))
+    from dataclasses import replace
+
+    auth = replace(
+        _untainted_ifc_auth(),
+        trigger=trigger,
+        repo_pr_scope_registry=RepoPRScopeRegistry((RepoReviewState(old_scope),)),
+        server_discovered_pr_states=discovered,
+    )
+    authorization = ToolAuthorization(
+        tool_name="repo_checkout",
+        decision=OperationDecision.RESOURCE_SCOPED,
+        allowed=True,
+        repo_pr_action_scope=old_scope,
+    )
+
+    labels = _result_labels_for_call(
+        "repo_checkout",
+        _make_request(
+            "repo_checkout", "checkout", auth,
+            {"repository": "owner/repo", "pull_request": 17},
+        ),
+        auth,
+        authorization,
+        result=ToolMessage(content="checked out", tool_call_id="checkout"),
+    )
+
+    assert labels is not None
+    repository_source = next(
+        source for source in labels.sources if source.domain == "repository"
+    )
+    assert repository_source.resource_id == f"owner/repo#pull/17@{'c' * 40}"
+    stale_labels = InformationFlowLabels().with_source(SourceLabel(
+        principal="user-1",
+        domain="repository",
+        resource_id=f"owner/repo#pull/17@{'a' * 40}",
+        bridge_instance="forge",
+        sensitivity="internal",
+        authorized_principals=frozenset({"user-1"}),
+        source_kind="protected_tool",
+        integrity="untrusted",
+        integrity_effect="informational",
+    ))
+    target = f"owner/repo#pull/17@{'c' * 40}:{current_scope.scope_id}"
+    before_fix = SinkGate.check_sink_flow(
+        "repo_test", target, stale_labels, auth, enforce=True,
+        repo_pr_action_scope=current_scope,
+    )
+    assert before_fix.allowed is False
+    assert before_fix.refusal_detail is not None
+    assert "mismatched component: observed_head_sha" in before_fix.refusal_detail
+    assert _forge_repository_scope_mismatch(labels, current_scope) is None
 
 
 def _install_sink_category_capability(
