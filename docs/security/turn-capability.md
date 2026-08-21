@@ -2,7 +2,7 @@
 
 Status: **proposed**.
 
-A turn that needs more than one shell step is refused after the first. The
+A turn that has ingested untrusted content cannot run a further shell command. The
 mechanism that prevents this already exists and works, but it is keyed on an
 incidental state object rather than on the property it expresses, so exactly one
 turn kind benefits.
@@ -27,8 +27,14 @@ eight days — 26.4% of all `would_block: true` shadow decisions.
 
 The shape is identical in each: a turn runs one authorized command, that
 command's output enters the label set as an untrusted **active ingest**, and the
-sink gate refuses the next command before any tier exemption applies. One step per
-turn.
+sink gate refuses the next command before any tier exemption applies.
+
+This is a **state transition, not a quota.** The first command is admitted because
+the turn has not yet ingested anything untrusted; it is that command's own output,
+entering the label set as an active ingest, that closes the door behind it. The
+boundary is *before versus after untrusted ingestion*, and describing it as "one
+command per turn" misstates it - a single invocation may chain, pipe, and
+substitute freely, so a count would bound nothing.
 
 ## 2. Why one turn kind escapes it
 
@@ -86,7 +92,8 @@ inferred from a string.
 classification on the binding fact it produces.**
 
 Nothing about arbitrary shell changes. `bash -lc` continues to work exactly as
-today, one step per turn, output classified as an active ingest. What is added is a
+today: admitted until the turn ingests untrusted content, output classified as an
+active ingest. What is added is a
 second, narrower path.
 
 The machinery exists and is already the contract for service principals.
@@ -111,6 +118,13 @@ So the shape is:
 This answers the review objection structurally rather than by argument: the fact
 exists because the execution genuinely was bound, so there is nothing to replay
 and no way for an unbounded execution to be mistaken for a bounded one.
+
+It also explains why a bounded command may repeat without limit while an
+unbounded one may not. The restriction was never about how many commands run; it
+is about whether the model could have been steered by something it just read. A
+bound argv executed with `shell=False` introduces no content the model can be
+steered by, so it does not close the door behind itself. An arbitrary command's
+output can, and does.
 
 It also makes the `repo_review_state` branch redundant rather than parallel — a
 review turn's shell is already bound, so it would earn the same classification
