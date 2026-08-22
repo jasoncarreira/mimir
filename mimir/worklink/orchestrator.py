@@ -35,7 +35,13 @@ from .backends import (
     WorklinkConfig,
     checkout_shape_for_backend,
 )
-from .compute import ComputeLaunchError, ComputeResult, LaunchHandle, LocalSubprocessComputeBackend
+from .compute import (
+    ComputeLaunchError,
+    ComputeResult,
+    LaunchHandle,
+    LocalSubprocessComputeBackend,
+    with_worker_environment,
+)
 from .claims import ChainlinkClaims, ClaimRecord
 from .evidence import (
     EvidenceValidation,
@@ -739,7 +745,7 @@ class WorklinkRunner:
                 existing=spec.env.get("PYTEST_ADDOPTS"),
             )
             if report_env:
-                spec = replace(spec, env={**spec.env, **report_env})
+                spec = with_worker_environment(spec, report_env)
             invocation_model = spec.backend_config.get("model")
             _log_event(
                 "worklink_backend_invocation",

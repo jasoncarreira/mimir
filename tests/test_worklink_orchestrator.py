@@ -5183,7 +5183,11 @@ def test_authorized_runner_closes_real_attempt_capabilities(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, scenario: str
 ) -> None:
     import mimir.worklink.orchestrator as orchestrator
-    from mimir.worklink.compute import ComputeLaunchError, LocalSubprocessComputeBackend
+    from mimir.worklink.compute import (
+        ComputeLaunchError,
+        LocalSubprocessComputeBackend,
+        _enabled_child_env,
+    )
 
     repo = tmp_path / "repo"
     repo.mkdir()
@@ -5276,6 +5280,7 @@ def test_authorized_runner_closes_real_attempt_capabilities(
                 "123e4567-e89b-42d3-a456-426614174003",
             )
             index = len(bound_specs) - 1
+            _enabled_child_env(spec, identifiers[index])
             return LaunchHandle(
                 "local_subprocess",
                 identifiers[index],
@@ -5319,6 +5324,8 @@ def test_authorized_runner_closes_real_attempt_capabilities(
                 kwargs["test_command"],
                 self.name,
                 order.timeout_s,
+                env={"OPENCODE_PERMISSION": '{"edit":"allow"}'},
+                backend_config={"pass_env": ()},
                 local_checkout=order.checkout,
                 local_argv=("opencode", "run"),
             )
@@ -5422,6 +5429,9 @@ def test_authorized_runner_closes_real_attempt_capabilities(
         "pr_exception": 3,
     }
     assert len(bound_specs) == expected_launches[scenario]
+    if bound_specs:
+        assert "PYTEST_ADDOPTS" in bound_specs[0].env
+        assert bound_specs[0].backend_config["pass_env"] == ("PYTEST_ADDOPTS",)
     if scenario == "success":
         assert bound_specs[0].local_argv == ("opencode", "run")
         assert all(

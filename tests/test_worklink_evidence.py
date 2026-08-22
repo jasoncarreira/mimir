@@ -388,7 +388,12 @@ async def test_observe_evidence_sees_committed_backend_work(tmp_path: Path) -> N
 
 @pytest.mark.asyncio
 async def test_enabled_opencode_gate_uses_authorized_compute(monkeypatch, tmp_path: Path) -> None:
-    from mimir.worklink.compute import ComputeResult, LaunchHandle, WorkSpec
+    from mimir.worklink.compute import (
+        ComputeResult,
+        LaunchHandle,
+        WorkSpec,
+        _enabled_child_env,
+    )
 
     class Compute:
         def __init__(self) -> None:
@@ -396,6 +401,7 @@ async def test_enabled_opencode_gate_uses_authorized_compute(monkeypatch, tmp_pa
             self.cleaned = []
 
         async def launch(self, spec):
+            _enabled_child_env(spec, "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
             self.specs.append(spec)
             return LaunchHandle("local_subprocess", "job")
 
@@ -414,7 +420,22 @@ async def test_enabled_opencode_gate_uses_authorized_compute(monkeypatch, tmp_pa
     subprocess.run(["git", "add", "a.txt"], cwd=repo, check=True)
     subprocess.run(["git", "commit", "-q", "-m", "seed"], cwd=repo, check=True)
     (repo / "a.txt").write_text("new\n")
-    spec = WorkSpec(1, 1, "url", "main", "branch", "prompt", None, "", "opencode", 30, local_checkout=repo, local_argv=("opencode",))
+    spec = WorkSpec(
+        1,
+        1,
+        "url",
+        "main",
+        "branch",
+        "prompt",
+        None,
+        "",
+        "opencode",
+        30,
+        env={"OPENCODE_PERMISSION": '{"edit":"allow"}'},
+        backend_config={"pass_env": ()},
+        local_checkout=repo,
+        local_argv=("opencode",),
+    )
     compute = Compute()
     monkeypatch.setenv("MIMIR_CODING_ENABLED", "true")
 
@@ -444,6 +465,8 @@ async def test_enabled_opencode_gate_uses_authorized_compute(monkeypatch, tmp_pa
 
     assert result.review_ready is True
     assert compute.specs[0].local_argv == ("/bin/sh", "-c", "pytest -q")
+    assert "PYTEST_ADDOPTS" in compute.specs[0].env
+    assert compute.specs[0].backend_config["pass_env"] == ("PYTEST_ADDOPTS",)
     assert compute.cleaned == [LaunchHandle("local_subprocess", "job")]
 
 
