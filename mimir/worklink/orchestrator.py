@@ -98,7 +98,7 @@ _GITHUB_BARE_CLOSING_REFERENCE_RE = re.compile(
     r"(?P<separator>\s*:\s*|\s+)#(?P<number>[0-9]+)\b",
     re.IGNORECASE,
 )
-_FACTORY_STARTUP_STATUS_TIMEOUT_S = 30.0
+_FACTORY_STARTUP_STATUS_TIMEOUT_S = 120.0
 _FACTORY_PUBLISHING_IDENTITY_ENV = "MIMIR_FACTORY_PUBLISHING_IDENTITY"
 _WORK_ITEM_RUN_ID_RE = re.compile(r"^[a-z0-9](?:[a-z0-9._-]*[a-z0-9])?$")
 
@@ -1846,7 +1846,7 @@ class WorklinkRunner:
                     remaining = startup_deadline - loop.time() if last_status is None else deadline - loop.time()
                     if remaining <= 0:
                         if last_status is None:
-                            raise WorklinkError("factory startup status handshake timed out")
+                            raise WorklinkError("factory never initialised before startup deadline")
                         raise WorklinkError(f"factory exceeded run timeout ({run_timeout:.0f}s)")
                     try:
                         status = await asyncio.wait_for(
@@ -1860,53 +1860,68 @@ class WorklinkRunner:
                         )
                     except TimeoutError as exc:
                         if last_status is None:
-                            raise WorklinkError("factory startup status handshake timed out") from exc
+                            raise WorklinkError(
+                                "factory never initialised before startup deadline"
+                            ) from exc
                         raise WorklinkError(f"factory exceeded run timeout ({run_timeout:.0f}s)") from exc
-                _require_factory_status(status, factory_record)
-                if status != last_status:
-                    last_status = status
-                    last_change = loop.time()
-                if factory_record.session is not None and status.lock_session not in {
-                    None,
-                    factory_record.session,
-                }:
-                    raise WorklinkError("factory lock owner changed")
-                factory_record = factory_record.observed(status, datetime.now(UTC).isoformat())
-                phase = "parked" if status.is_parked else "terminal" if status.is_terminal else "running"
-                factory_record = replace(factory_record, controller_phase=phase)
-                save_factory_record(self.home, factory_record)
-                if status.lock == "fresh" and factory_record.session == status.lock_session:
-                    await asyncio.to_thread(
-                        backend.heartbeat,
-                        factory_record.run_id,
-                        session=factory_record.session,
-                        sandbox=Path(factory_record.sandbox),
-                        launcher=factory_record.launcher,
+                pre_manifest = last_status is None and status == FactoryStatus(
+                    run_id=factory_record.run_id,
+                    valid=False,
+                    sandbox_path=factory_record.sandbox,
+                )
+                if pre_manifest:
+                    if loop.time() >= startup_deadline:
+                        raise WorklinkError("factory never initialised before startup deadline")
+                else:
+                    _require_factory_status(status, factory_record)
+                    if status != last_status:
+                        last_status = status
+                        last_change = loop.time()
+                    if factory_record.session is not None and status.lock_session not in {
+                        None,
+                        factory_record.session,
+                    }:
+                        raise WorklinkError("factory lock owner changed")
+                    factory_record = factory_record.observed(status, datetime.now(UTC).isoformat())
+                    phase = (
+                        "parked"
+                        if status.is_parked
+                        else "terminal" if status.is_terminal else "running"
                     )
-                if loop.time() - last_change >= stale_after:
-                    _log_event(
-                        "worklink_factory_stale_status",
-                        issue_id=issue.issue_id,
-                        diagnostic_after_s=stale_after,
-                        lock=status.lock,
-                        process_alive=compute.job_alive(handle),
-                    )
-                if status.is_terminal or status.is_parked:
-                    if not wait_task.done():
-                        await cancel_once()
-                        await _finish_factory_wait_task(wait_task)
-                    failed = False
-                    return await self._finish_factory_070(
-                        issue=issue,
-                        claim_record=claim_record,
-                        claims=claims,
-                        backend=backend,
-                        compute=compute,
-                        factory_record=factory_record,
-                        test_cmd=test_cmd,
-                        runner=runner,
-                        started_at=started_at,
-                    )
+                    factory_record = replace(factory_record, controller_phase=phase)
+                    save_factory_record(self.home, factory_record)
+                    if status.lock == "fresh" and factory_record.session == status.lock_session:
+                        await asyncio.to_thread(
+                            backend.heartbeat,
+                            factory_record.run_id,
+                            session=factory_record.session,
+                            sandbox=Path(factory_record.sandbox),
+                            launcher=factory_record.launcher,
+                        )
+                    if loop.time() - last_change >= stale_after:
+                        _log_event(
+                            "worklink_factory_stale_status",
+                            issue_id=issue.issue_id,
+                            diagnostic_after_s=stale_after,
+                            lock=status.lock,
+                            process_alive=compute.job_alive(handle),
+                        )
+                    if status.is_terminal or status.is_parked:
+                        if not wait_task.done():
+                            await cancel_once()
+                            await _finish_factory_wait_task(wait_task)
+                        failed = False
+                        return await self._finish_factory_070(
+                            issue=issue,
+                            claim_record=claim_record,
+                            claims=claims,
+                            backend=backend,
+                            compute=compute,
+                            factory_record=factory_record,
+                            test_cmd=test_cmd,
+                            runner=runner,
+                            started_at=started_at,
+                        )
                 if wait_task.done() or not compute.job_alive(handle):
                     try:
                         result = await asyncio.wait_for(asyncio.shield(wait_task), timeout=5)
@@ -1922,7 +1937,10 @@ class WorklinkRunner:
                 if loop.time() >= deadline:
                     raise WorklinkError(f"factory exceeded run timeout ({run_timeout:.0f}s)")
                 _heartbeat_claim_best_effort(claims, claim_record)
-                await asyncio.sleep(max(0.01, float(backend.poll_interval_s)))
+                poll_delay = max(0.01, float(backend.poll_interval_s))
+                if pre_manifest:
+                    poll_delay = min(poll_delay, max(0, startup_deadline - loop.time()))
+                await asyncio.sleep(poll_delay)
                 status = None
         finally:
             if failed and not wait_task.done():
