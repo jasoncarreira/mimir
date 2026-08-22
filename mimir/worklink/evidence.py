@@ -5,11 +5,16 @@ from __future__ import annotations
 import asyncio
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
+import json
 import os
 from pathlib import Path
+import shlex
 import subprocess
+import tempfile
 from typing import Callable, Protocol, Sequence
+import xml.etree.ElementTree as ET
 
+from ..redaction import redact_text
 from .compute import ComputeBackend, ComputeResult, LaunchHandle, WorkSpec
 from .dispatch_failures import terminal_error
 
@@ -23,6 +28,15 @@ class CommandResult:
 
 
 @dataclass(frozen=True)
+class TestCounts:
+    total: int
+    passed: int
+    failed: int
+    errors: int
+    skipped: int
+
+
+@dataclass(frozen=True)
 class TestResult:
     __test__ = False
 
@@ -31,6 +45,8 @@ class TestResult:
     summary: str | None = None
     skipped_reason: str | None = None
     observed: bool = True
+    counts: TestCounts | None = None
+    failed_tests: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -54,6 +70,8 @@ class WorklinkEvidence:
     blocked_reason: str | None = None
     transcript: str | None = None
     diff_observed: bool = True
+    executor_tests: TestResult | None = None
+    gate_result_diverged: bool | None = None
     # chainlink #817: in-attempt gate-repair rounds this evidence reflects
     # (0 = the gate passed/failed without repair).
     repair_rounds: int = 0
@@ -159,10 +177,17 @@ def validate_evidence(evidence: WorklinkEvidence) -> EvidenceValidation:
         reasons.append("gate_command_not_found")
         if status == "completed":
             status = "failed"
+        if not evidence.failure_reason:
+            evidence = replace(
+                evidence,
+                failure_reason="test gate command was not found (exit 127)",
+            )
     else:
         reasons.append("tests_failed")
         if status == "completed":
             status = "failed"
+        if not evidence.failure_reason:
+            evidence = replace(evidence, failure_reason=_gate_failure_reason(evidence.tests))
 
     review_ready = status == "completed" and bool(evidence.files_changed) and tests_ok and evidence.diff_observed
     if status != evidence.status:
@@ -192,6 +217,7 @@ async def observe_evidence(
     blocked_reason: str | None = None,
     model: str | None = None,
     failure_reason: str | None = None,
+    executor_tests: TestResult | None = None,
     skip_test_reason: str | None = None,
     runner: Run | None = None,
 ) -> EvidenceValidation:
@@ -216,6 +242,7 @@ async def observe_evidence(
         blocked_reason=blocked_reason,
         model=model,
         failure_reason=failure_reason,
+        executor_tests=executor_tests,
         skip_test_reason=skip_test_reason,
         runner=runner,
         include_checkout_status=True,
@@ -244,6 +271,7 @@ async def _observe_evidence_from_ref(
     blocked_reason: str | None,
     model: str | None,
     failure_reason: str | None,
+    executor_tests: TestResult | None,
     skip_test_reason: str | None,
     runner: Run | None,
     include_checkout_status: bool,
@@ -307,27 +335,36 @@ async def _observe_evidence_from_ref(
         if checkout_result is not None and checkout_result.returncode != 0:
             tests = TestResult(test_command, None, "checkout failed before test", observed=False)
         else:
-            if worker_required:
-                if compute is None:
-                    raise ValueError("enabled worker evidence requires a compute backend")
-                if work_spec is None:
-                    raise ValueError("worker evidence requires the originating WorkSpec")
-                result = await _run_compute_gate(
-                    test_command,
-                    checkout=checkout,
-                    work_spec=work_spec,
-                    compute=compute,
-                    on_launch=on_gate_launch,
+            with tempfile.TemporaryDirectory(prefix="worklink-gate-") as report_dir_text:
+                report_dir = Path(report_dir_text)
+                if worker_required:
+                    if compute is None:
+                        raise ValueError("enabled worker evidence requires a compute backend")
+                    if work_spec is None:
+                        raise ValueError("worker evidence requires the originating WorkSpec")
+                    result = await _run_compute_gate(
+                        test_command,
+                        checkout=checkout,
+                        work_spec=work_spec,
+                        compute=compute,
+                        on_launch=on_gate_launch,
+                        report_dir=report_dir,
+                    )
+                    test = subprocess.CompletedProcess(
+                        ["/bin/sh", "-c", test_command],
+                        result.exit_code,
+                        stdout=result.stdout,
+                        stderr=result.stderr,
+                    )
+                else:
+                    observed_command = _command_with_pytest_report(test_command, report_dir)
+                    test = runner(observed_command, cwd=checkout)
+                structured = read_pytest_result(test_command, report_dir)
+                tests = replace(
+                    structured or TestResult(test_command),
+                    exit_code=test.returncode,
+                    summary=_summarize_test_output(test),
                 )
-                test = subprocess.CompletedProcess(
-                    ["/bin/sh", "-c", test_command],
-                    result.exit_code,
-                    stdout=result.stdout,
-                    stderr=result.stderr,
-                )
-            else:
-                test = runner(test_command, cwd=checkout)
-            tests = TestResult(test_command, test.returncode, _summarize_test_output(test))
             commands.append(CommandResult(test_command, test.returncode, _summarize(test)))
 
     evidence = WorklinkEvidence(
@@ -349,6 +386,8 @@ async def _observe_evidence_from_ref(
         failure_reason=failure_reason,
         blocked_reason=blocked_reason,
         transcript=transcript,
+        executor_tests=executor_tests,
+        gate_result_diverged=_gate_results_diverge(executor_tests, tests),
         diff_observed=pre_observed
         and committed.returncode == 0
         and stat.returncode == 0
@@ -364,11 +403,22 @@ async def _run_compute_gate(
     work_spec: WorkSpec,
     compute: ComputeBackend,
     on_launch: Callable[[LaunchHandle], None] | None = None,
+    report_dir: Path | None = None,
 ) -> ComputeResult:
+    env = dict(work_spec.env)
+    if report_dir is not None:
+        env.update(
+            pytest_report_environment(
+                command,
+                report_dir,
+                existing=env.get("PYTEST_ADDOPTS"),
+            )
+        )
     gate_spec = replace(
         work_spec,
         local_checkout=checkout,
         local_argv=("/bin/sh", "-c", command),
+        env=env,
     )
     handle = await compute.launch(gate_spec)
     try:
@@ -393,6 +443,120 @@ def _common_status(status: str) -> str:
     if normalized in {"blocked", "needs_human"}:
         return "blocked"
     return "failed"
+
+
+_PYTEST_REPORT_MAX_BYTES = 2_000_000
+
+
+def pytest_report_environment(
+    command: str,
+    report_dir: Path,
+    *,
+    existing: str | None = None,
+) -> dict[str, str]:
+    """Configure pytest's machine reports without changing the retained output."""
+    if not _is_pytest_command(command):
+        return {}
+    report_dir.mkdir(parents=True, exist_ok=True)
+    options = (
+        f"--junitxml={shlex.quote(str(report_dir / 'junit.xml'))} "
+        f"-o cache_dir={shlex.quote(str(report_dir / 'cache'))}"
+    )
+    return {"PYTEST_ADDOPTS": " ".join(part for part in (existing, options) if part)}
+
+
+def read_pytest_result(command: str, report_dir: Path) -> TestResult | None:
+    """Read counts and exact failed node IDs from pytest-owned machine files."""
+    junit_path = report_dir / "junit.xml"
+    lastfailed_path = report_dir / "cache" / "v" / "cache" / "lastfailed"
+    try:
+        if junit_path.stat().st_size > _PYTEST_REPORT_MAX_BYTES:
+            return None
+        root = ET.parse(junit_path).getroot()
+        suites = [root] if root.tag == "testsuite" else list(root.findall("testsuite"))
+        total = sum(_xml_count(suite, "tests") for suite in suites)
+        failed = sum(_xml_count(suite, "failures") for suite in suites)
+        errors = sum(_xml_count(suite, "errors") for suite in suites)
+        skipped = sum(_xml_count(suite, "skipped") for suite in suites)
+    except (OSError, ET.ParseError, ValueError):
+        return None
+
+    failed_tests: tuple[str, ...] = ()
+    try:
+        if lastfailed_path.stat().st_size <= _PYTEST_REPORT_MAX_BYTES:
+            payload = json.loads(lastfailed_path.read_text(encoding="utf-8"))
+            if isinstance(payload, dict):
+                failed_tests = tuple(
+                    redact_text(node_id)[:1000]
+                    for node_id, is_failed in payload.items()
+                    if isinstance(node_id, str) and is_failed is True
+                )
+    except (OSError, json.JSONDecodeError):
+        pass
+
+    counts = TestCounts(
+        total=total,
+        passed=max(0, total - failed - errors - skipped),
+        failed=failed,
+        errors=errors,
+        skipped=skipped,
+    )
+    return TestResult(
+        command,
+        exit_code=0 if failed == 0 and errors == 0 else 1,
+        counts=counts,
+        failed_tests=failed_tests,
+    )
+
+
+def _xml_count(suite: ET.Element, name: str) -> int:
+    return int(suite.attrib.get(name, "0"))
+
+
+def _is_pytest_command(command: str) -> bool:
+    try:
+        tokens = shlex.split(command)
+    except ValueError:
+        return False
+    return any(Path(token).name in {"pytest", "py.test"} for token in tokens)
+
+
+def _command_with_pytest_report(command: str, report_dir: Path) -> str:
+    environment = pytest_report_environment(command, report_dir)
+    if not environment:
+        return command
+    return f"PYTEST_ADDOPTS={shlex.quote(environment['PYTEST_ADDOPTS'])} {command}"
+
+
+def _gate_failure_reason(tests: TestResult) -> str:
+    counts = tests.counts
+    if counts is None:
+        return terminal_error(
+            f"test gate failed (exit {tests.exit_code}); structured counts unavailable"
+        )
+    count_text = (
+        f"{counts.failed} failed, {counts.errors} errors, {counts.passed} passed, "
+        f"{counts.skipped} skipped, {counts.total} total"
+    )
+    failures = ", ".join(tests.failed_tests) or "no failing node IDs reported"
+    return terminal_error(f"test gate failed; counts: {count_text}; failures: {failures}")
+
+
+def _gate_results_diverge(
+    executor: TestResult | None,
+    measured: TestResult | None,
+) -> bool | None:
+    if executor is None or measured is None:
+        return None
+    return (
+        executor.exit_code,
+        executor.counts,
+        executor.failed_tests,
+    ) != (
+        measured.exit_code,
+        measured.counts,
+        measured.failed_tests,
+    )
 
 
 def _run(args: Sequence[str] | str, *, cwd: Path | None = None) -> subprocess.CompletedProcess[str]:

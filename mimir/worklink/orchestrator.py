@@ -19,6 +19,7 @@ import re
 import shutil
 import stat
 import subprocess
+import tempfile
 import unicodedata
 import warnings
 from typing import Any, Callable, Iterable, Mapping, Sequence
@@ -38,8 +39,11 @@ from .compute import ComputeLaunchError, ComputeResult, LaunchHandle, LocalSubpr
 from .claims import ChainlinkClaims, ClaimRecord
 from .evidence import (
     EvidenceValidation,
+    TestResult,
     WorklinkEvidence,
     observe_evidence,
+    pytest_report_environment,
+    read_pytest_result,
 )
 from .planning import (
     missing_leaf_template_parts,
@@ -568,6 +572,7 @@ class WorklinkRunner:
         lease: CheckoutLease | None = None
         publication: ControllerGitPublication | None = None
         delete_authorized_checkout = False
+        executor_report_dir: Path | None = None
         try:
             lease = _create_backend_checkout(
                 self.repo,
@@ -639,6 +644,14 @@ class WorklinkRunner:
                 branch=lease.branch,
                 test_command=test_cmd,
             )
+            executor_report_dir = _make_executor_report_dir(issue.issue_id, record.attempt)
+            report_env = pytest_report_environment(
+                test_cmd,
+                executor_report_dir,
+                existing=spec.env.get("PYTEST_ADDOPTS"),
+            )
+            if report_env:
+                spec = replace(spec, env={**spec.env, **report_env})
             invocation_model = spec.backend_config.get("model")
             _log_event(
                 "worklink_backend_invocation",
@@ -726,6 +739,7 @@ class WorklinkRunner:
                 root_dirty_before=root_dirty_before,
                 runner=runner,
                 publication=publication,
+                executor_report_dir=executor_report_dir,
             )
             delete_authorized_checkout = bool(
                 worker_required and result.review_ready and result.pr_url
@@ -768,6 +782,8 @@ class WorklinkRunner:
                     delete_checkout=delete_authorized_checkout,
                 )
             finally:
+                if executor_report_dir is not None:
+                    rmtree_missing_ok(executor_report_dir)
                 claims.release_issue(issue.issue_id)
                 clear_run_state(self.home, issue.issue_id)
 
@@ -790,6 +806,7 @@ class WorklinkRunner:
         root_dirty_before: Sequence[str],
         runner: Runner,
         publication: ControllerGitPublication | None = None,
+        executor_report_dir: Path | None = None,
     ) -> WorklinkRunResult:
         """Post-launch pipeline: interpret the worker result, observe evidence,
         open the PR on a passing gate, then transition + clean up.
@@ -800,6 +817,10 @@ class WorklinkRunner:
         persisted handle)."""
         selected_name = backend.name
         raw = await backend.interpret(order, compute_result)
+        executor_tests: TestResult | None = None
+        if executor_report_dir is not None:
+            executor_tests = read_pytest_result(test_cmd or "", executor_report_dir)
+            rmtree_missing_ok(executor_report_dir)
         pr_body_section = _read_pr_body_section(lease.path)
         invocation_model = spec.backend_config.get("model")
         executor_failed = raw.exit_code != 0
@@ -854,6 +875,7 @@ class WorklinkRunner:
             blocked_reason=raw.blocked_reason,
             model=invocation_model,
             failure_reason=raw.error if (executor_failed or backend_reported_failure) else None,
+            executor_tests=executor_tests,
             skip_test_reason="executor exited nonzero before the test gate" if executor_failed else None,
             runner=runner,
             safe_git=publication,
@@ -892,6 +914,7 @@ class WorklinkRunner:
                     blocked_reason=raw.blocked_reason,
                     model=invocation_model,
                     failure_reason=raw.error if (executor_failed or backend_reported_failure) else None,
+                    executor_tests=executor_tests,
                     skip_test_reason=(
                         "executor exited nonzero before the test gate" if executor_failed else None
                     ),
@@ -2545,6 +2568,10 @@ def _template_path(home: Path) -> Path:
     if custom.exists():
         return custom
     return Path(__file__).resolve().parents[1] / "prompt_templates" / "worklink-order.md"
+
+
+def _make_executor_report_dir(issue: int, attempt: int) -> Path:
+    return Path(tempfile.mkdtemp(prefix=f"worklink-{issue}-{attempt}-executor-"))
 
 
 def _format_work_order(order: WorkOrder, *, backend: str) -> str:
