@@ -72,6 +72,9 @@ class VectorIndex:
         self._next_pos = 0
         self._lock = threading.Lock()
         self._built = False
+        # Number rejected for a declared or encoded dimension mismatch since
+        # the most recent bulk build, including subsequent incremental adds.
+        self.dimension_mismatch_count = 0
 
     @property
     def total_vectors(self) -> int:
@@ -112,15 +115,17 @@ class VectorIndex:
 
         ids: list[str] = []
         vecs: list[np.ndarray] = []
+        dimension_mismatches = 0
         for atom_id, blob, dim in rows:
             if blob is None or dim is None or dim != self.dimension:
-                # Mismatched dim — likely a provider switch mid-stream.
-                # Skip; a re-embedding pass would re-add these.
+                dimension_mismatches += 1
                 continue
-            if len(blob) < self.dimension * 4:
+            if len(blob) != self.dimension * 4:
+                dimension_mismatches += 1
                 continue
             vec = np.frombuffer(blob, dtype=np.float32).copy()
             if vec.shape[0] != self.dimension:
+                dimension_mismatches += 1
                 continue
             ids.append(atom_id)
             vecs.append(vec)
@@ -133,6 +138,14 @@ class VectorIndex:
                 self._removed.clear()
                 self._next_pos = 0
                 self._built = True
+                self.dimension_mismatch_count = dimension_mismatches
+            if dimension_mismatches:
+                logger.warning(
+                    "VectorIndex dropped %d atom vectors with dimension mismatch "
+                    "(expected dim=%d)",
+                    dimension_mismatches,
+                    self.dimension,
+                )
             return
 
         matrix = np.vstack(vecs).astype(np.float32)
@@ -162,6 +175,15 @@ class VectorIndex:
             self._next_pos = n
             self._removed.clear()
             self._built = True
+            self.dimension_mismatch_count = dimension_mismatches
+
+        if dimension_mismatches:
+            logger.warning(
+                "VectorIndex dropped %d atom vectors with dimension mismatch "
+                "(expected dim=%d)",
+                dimension_mismatches,
+                self.dimension,
+            )
 
         logger.info(
             "VectorIndex built: %d vectors, dim=%d, type=%s",
@@ -188,13 +210,17 @@ class VectorIndex:
 
         ids: list[str] = []
         vecs: list[np.ndarray] = []
+        dimension_mismatches = 0
         for sess_id, blob, dim in rows:
             if blob is None or dim is None or dim != self.dimension:
+                dimension_mismatches += 1
                 continue
-            if len(blob) < self.dimension * 4:
+            if len(blob) != self.dimension * 4:
+                dimension_mismatches += 1
                 continue
             vec = np.frombuffer(blob, dtype=np.float32).copy()
             if vec.shape[0] != self.dimension:
+                dimension_mismatches += 1
                 continue
             ids.append(sess_id)
             vecs.append(vec)
@@ -207,6 +233,14 @@ class VectorIndex:
                 self._removed.clear()
                 self._next_pos = 0
                 self._built = True
+                self.dimension_mismatch_count = dimension_mismatches
+            if dimension_mismatches:
+                logger.warning(
+                    "Sessions VectorIndex dropped %d vectors with dimension "
+                    "mismatch (expected dim=%d)",
+                    dimension_mismatches,
+                    self.dimension,
+                )
             return
 
         matrix = np.vstack(vecs).astype(np.float32)
@@ -225,6 +259,15 @@ class VectorIndex:
             self._next_pos = n
             self._removed.clear()
             self._built = True
+            self.dimension_mismatch_count = dimension_mismatches
+
+        if dimension_mismatches:
+            logger.warning(
+                "Sessions VectorIndex dropped %d vectors with dimension mismatch "
+                "(expected dim=%d)",
+                dimension_mismatches,
+                self.dimension,
+            )
 
         logger.info(
             "Sessions VectorIndex built: %d vectors, dim=%d", n, self.dimension,
@@ -239,10 +282,33 @@ class VectorIndex:
         """
         if not FAISS_AVAILABLE:
             return
-        if len(vec_bytes) < self.dimension * 4:
+        if len(vec_bytes) != self.dimension * 4:
+            with self._lock:
+                self.dimension_mismatch_count += 1
+                mismatch_count = self.dimension_mismatch_count
+            logger.warning(
+                "VectorIndex dropped incremental vector %s with %d bytes; "
+                "expected %d bytes for dim=%d (dimension mismatch count=%d)",
+                atom_id,
+                len(vec_bytes),
+                self.dimension * 4,
+                self.dimension,
+                mismatch_count,
+            )
             return
         vec = np.frombuffer(vec_bytes, dtype=np.float32).copy().reshape(1, -1)
         if vec.shape[1] != self.dimension:
+            with self._lock:
+                self.dimension_mismatch_count += 1
+                mismatch_count = self.dimension_mismatch_count
+            logger.warning(
+                "VectorIndex dropped incremental vector %s with dim=%d; "
+                "expected dim=%d (dimension mismatch count=%d)",
+                atom_id,
+                vec.shape[1],
+                self.dimension,
+                mismatch_count,
+            )
             return
         faiss.normalize_L2(vec)
 

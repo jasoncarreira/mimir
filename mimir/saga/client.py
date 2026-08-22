@@ -345,6 +345,7 @@ class SagaStore:
         self._conn = conn  # may be None until first use
         self._agent_id = agent_id
         self._embedding_dim = embedding_dim
+        self._sessions_embedding_dim = embedding_dim
         # P12 synonyms for FTS5-only query expansion. Saga's canonical
         # bench passes the bench-tuned dict; production callers can
         # pass None (no expansion) or a domain-specific dict.
@@ -663,12 +664,12 @@ class SagaStore:
         store() incremental-adds keep it current; periodic rebuilds
         handle tombstoning accumulation.
 
-        Dimension resolution order — mirrors ``_ensure_sessions_index``:
+        Dimension resolution order:
 
-        1. Pre-set ``self._embedding_dim`` (constructor arg or cached
-           from a prior call).
-        2. First row in the ``embeddings`` table — authoritative once
-           ANY embedding has been stored.
+        1. The uniform dimension in the ``embeddings`` table — authoritative
+           once any embedding has been stored. Mixed dimensions are rejected.
+        2. Pre-set ``self._embedding_dim`` (constructor arg or cached
+           from a prior call) when the table is empty.
         3. The configured provider's reported ``dimensions()`` — the
            right value for an empty DB. Prevents the "fresh DB +
            non-Voyage provider" failure mode where the previous
@@ -683,25 +684,36 @@ class SagaStore:
         if self._index_built:
             return self._index
         dim = self._embedding_dim
-        if dim is None:
-            row = conn.execute("SELECT dim FROM embeddings LIMIT 1").fetchone()
-            if row:
-                dim = row[0]
-            else:
-                try:
-                    from .embeddings import get_provider
+        rows = conn.execute(
+            "SELECT dim, count(*) FROM embeddings "
+            "WHERE dim IS NOT NULL GROUP BY dim ORDER BY count(*) DESC, dim"
+        ).fetchall()
+        if len(rows) > 1:
+            distribution = ", ".join(
+                f"{row_dim}d x {count}" for row_dim, count in rows
+            )
+            log.error("atoms index has mixed embedding dimensions: %s", distribution)
+            raise RuntimeError(
+                f"cannot build atoms index with mixed embedding dimensions: {distribution}"
+            )
+        if rows:
+            dim = rows[0][0]
+            self._embedding_dim = dim
+        elif dim is None:
+            try:
+                from .embeddings import get_provider
 
-                    dim = get_provider().dimensions()
-                except Exception:
-                    # Provider unavailable and DB is genuinely empty.
-                    # Cache the miss and return None — search callers
-                    # (``_make_faiss_search_fn``) already handle None by
-                    # returning empty results, so this gracefully
-                    # degrades to FTS-only retrieval rather than
-                    # building an index at a guessed dim.
-                    self._index_built = True
-                    self._index = None
-                    return None
+                dim = get_provider().dimensions()
+            except Exception:
+                # Provider unavailable and DB is genuinely empty.
+                # Cache the miss and return None — search callers
+                # (``_make_faiss_search_fn``) already handle None by
+                # returning empty results, so this gracefully
+                # degrades to FTS-only retrieval rather than
+                # building an index at a guessed dim.
+                self._index_built = True
+                self._index = None
+                return None
             self._embedding_dim = dim
         self._index = VectorIndex(dimension=dim)
         self._index.build_from_db(conn)
@@ -757,34 +769,37 @@ class SagaStore:
         """
         if self._sessions_index_built:
             return self._sessions_index
-        dim = self._embedding_dim
-        if dim is None:
-            row = conn.execute(
-                "SELECT embedding_dim FROM sessions "
-                "WHERE embedding_dim IS NOT NULL LIMIT 1"
-            ).fetchone()
-            if row:
-                dim = row[0]
-            else:
-                # Fall back to atoms embedding dim; then ask the provider.
-                # Never guess a magic constant — a wrong dim silently builds
-                # an index that filters out every real embedding on arrival.
-                row2 = conn.execute("SELECT dim FROM embeddings LIMIT 1").fetchone()
-                if row2:
-                    dim = row2[0]
-                else:
-                    try:
-                        from .embeddings import get_provider
+        dim = self._sessions_embedding_dim
+        rows = conn.execute(
+            "SELECT embedding_dim, count(*) FROM sessions "
+            "WHERE embedding IS NOT NULL AND embedding_dim IS NOT NULL "
+            "GROUP BY embedding_dim ORDER BY count(*) DESC, embedding_dim"
+        ).fetchall()
+        if len(rows) > 1:
+            distribution = ", ".join(
+                f"{row_dim}d x {count}" for row_dim, count in rows
+            )
+            log.error("sessions index has mixed embedding dimensions: %s", distribution)
+            raise RuntimeError(
+                "cannot build sessions index with mixed embedding dimensions: "
+                f"{distribution}"
+            )
+        if rows:
+            dim = rows[0][0]
+            self._sessions_embedding_dim = dim
+        elif dim is None:
+            try:
+                from .embeddings import get_provider
 
-                        dim = get_provider().dimensions()
-                    except Exception:
-                        # Provider unavailable and DB is genuinely empty.
-                        # Return None so search_sessions falls back to recency-only
-                        # rather than building an index at the wrong dimension.
-                        self._sessions_index_built = True  # cache the miss
-                        self._sessions_index = None
-                        return None
-            self._embedding_dim = dim
+                dim = get_provider().dimensions()
+            except Exception:
+                # Provider unavailable and DB is genuinely empty.
+                # Return None so search_sessions falls back to recency-only
+                # rather than building an index at the wrong dimension.
+                self._sessions_index_built = True  # cache the miss
+                self._sessions_index = None
+                return None
+            self._sessions_embedding_dim = dim
         idx = VectorIndex(dimension=dim)
         idx.build_from_sessions(conn)
         self._sessions_index = idx

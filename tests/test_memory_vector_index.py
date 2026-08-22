@@ -88,14 +88,15 @@ def test_build_from_db_skips_tombstoned(conn):
     assert "a2" not in ids
 
 
-def test_build_from_db_skips_dim_mismatch(conn):
-    """An atom embedded with a different dim (provider switch) gets
-    skipped silently — re-embedding pass would re-add it."""
+def test_build_from_db_reports_dim_mismatch(conn, caplog):
+    """A provider-switch mismatch is counted and reported."""
     _insert_atom_with_embedding(conn, "a1", "alpha", [1.0, 0.0, 0.0])
     _insert_atom_with_embedding(conn, "a2", "wrong", [1.0, 0.0])  # 2d
     idx = VectorIndex(dimension=3)
     idx.build_from_db(conn)
     assert idx.total_vectors == 1
+    assert idx.dimension_mismatch_count == 1
+    assert "dropped 1 atom vectors with dimension mismatch" in caplog.text
 
 
 def test_build_from_db_all_skipped_clears_previous_state(conn):
@@ -167,6 +168,17 @@ def test_add_grows_index(conn):
     results = idx.search([0.0, 1.0, 0.0], top_k=2)
     ids = [aid for aid, _ in results]
     assert "a2" in ids
+
+
+def test_add_reports_dim_mismatch(conn, caplog):
+    idx = VectorIndex(dimension=3)
+    idx.build_from_db(conn)
+
+    idx.add("wrong", _vec_bytes([1.0, 0.0]))
+
+    assert idx.total_vectors == 0
+    assert idx.dimension_mismatch_count == 1
+    assert "dropped incremental vector wrong" in caplog.text
 
 
 def test_add_before_build_is_noop(conn):
