@@ -162,8 +162,9 @@ def test_pull_request_numbers_are_refused(tmp_path: Path) -> None:
     reference. It must not become a work item."""
     bindir, log = _stub_gh(tmp_path, kind="pr")
     proc = _run(_resolve_command(), "1388", bindir)
-    assert proc.returncode == 0, proc.stderr
+    assert proc.returncode != 0, "a pull request reference must fail resolution"
     assert proc.stdout == "", f"a pull request must not resolve, got {proc.stdout!r}"
+    assert proc.stderr == "reference 1388 is not an issue (pr)\n"
     # The probe must actually have run — this is a refusal, not a parse failure.
     assert "api" in log.read_text()
 
@@ -175,3 +176,4 @@ def test_unresolvable_number_errors_rather_than_becoming_free_text(tmp_path: Pat
     proc = _run(_resolve_command(), "999999", bindir)
     assert proc.returncode != 0, "an unresolvable reference must not exit zero"
     assert proc.stdout == ""
+    assert "is not an issue" not in proc.stderr
