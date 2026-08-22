@@ -257,8 +257,8 @@ def test_suite_does_not_write_dispatch_failures_into_an_inherited_state_dir(
 ) -> None:
     """A test must not write into the poller store it happens to inherit.
 
-    ``_record_run_failure`` takes its destination from ``os.environ["STATE_DIR"]``
-    rather than from the ``home`` it was passed, and
+    ``_record_run_failure`` formerly took its destination from
+    ``os.environ["STATE_DIR"]`` rather than from the ``home`` it was passed, and
     ``test_postclaim_failure_emits_same_failure_event`` drives it with
     ``autonomous=True``. Inside mimirbot the worklink gate runs this suite as a
     child of a poller, so that test wrote a fabricated failure record --

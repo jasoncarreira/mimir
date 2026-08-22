@@ -2366,6 +2366,7 @@ def run_worklink(
         )
     except Exception as exc:
         _record_run_failure(
+            home=home,
             issue_id=issue_id,
             attempt=None,
             error=exc,
@@ -2375,6 +2376,7 @@ def run_worklink(
         raise
     if result.status == "failed":
         _record_run_failure(
+            home=home,
             issue_id=issue_id,
             attempt=result.attempt,
             error=result.reason or "Worklink run failed",
@@ -2382,19 +2384,20 @@ def run_worklink(
             autonomous=autonomous,
         )
     elif result.status in {"completed", "blocked"}:
-        _record_run_success(issue_id)
+        _record_run_success(home, issue_id)
     return result
 
 
 def _record_run_failure(
     *,
+    home: Path,
     issue_id: int,
     attempt: int | None,
     error: BaseException | str,
     exit_status: int,
     autonomous: bool,
 ) -> None:
-    from .dispatch_failures import record_failure, terminal_error
+    from .dispatch_failures import dispatch_failure_state_dir, record_failure, terminal_error
 
     safe_error = terminal_error(error)
     _log_event(
@@ -2405,11 +2408,10 @@ def _record_run_failure(
         exit_status=exit_status,
         terminal_error=safe_error,
     )
-    state_dir = os.environ.get("STATE_DIR")
-    if autonomous and state_dir:
+    if autonomous:
         try:
             record_failure(
-                Path(state_dir),
+                dispatch_failure_state_dir(home),
                 issue_id=issue_id,
                 attempt=attempt,
                 exit_status=exit_status,
@@ -2420,15 +2422,13 @@ def _record_run_failure(
             pass
 
 
-def _record_run_success(issue_id: int) -> None:
-    from .dispatch_failures import record_success
+def _record_run_success(home: Path, issue_id: int) -> None:
+    from .dispatch_failures import dispatch_failure_state_dir, record_success
 
-    state_dir = os.environ.get("STATE_DIR")
-    if state_dir:
-        try:
-            record_success(Path(state_dir), issue_id)
-        except OSError:
-            pass
+    try:
+        record_success(dispatch_failure_state_dir(home), issue_id)
+    except OSError:
+        pass
 
 
 def run_worklink_reattach(*, home: Path, repo: Path, issue_id: int) -> WorklinkRunResult:
