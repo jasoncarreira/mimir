@@ -2453,6 +2453,21 @@ def test_inherited_credential_clears_a_prebound_identity_memo(
         github_module.GitHubForgeClient(token="a-second-token").verify_identity("factory-owner")
 
 
+def _configure_opencode_oauth(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
+    monkeypatch.delenv("XDG_DATA_HOME", raising=False)
+    monkeypatch.setenv("MIMIR_MODEL_SPEC", "codex-plus:gpt-5.6-luna")
+    auth = tmp_path / ".local" / "share" / "opencode" / "auth.json"
+    auth.parent.mkdir(parents=True, exist_ok=True)
+    auth.write_text(
+        json.dumps({"openai": {"type": "oauth", "refresh": "subscription"}}),
+        encoding="utf-8",
+    )
+
+
 def _run_factory_preflight_case(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -2465,6 +2480,7 @@ def _run_factory_preflight_case(
 ) -> tuple[object, list[WorkSpec], list[str], list[list[str]]]:
     import mimir.worklink.orchestrator as orchestrator
 
+    _configure_opencode_oauth(tmp_path, monkeypatch)
     repo = tmp_path / "repo"
     repo.mkdir()
     checkout = tmp_path / "factory-checkout"
@@ -2817,6 +2833,7 @@ def test_factory_new_run_uses_resolved_base_for_single_checkout_placement(
 ) -> None:
     import mimir.worklink.orchestrator as orchestrator
 
+    _configure_opencode_oauth(tmp_path, monkeypatch)
     repo = tmp_path / "repo"
     repo.mkdir()
     epic = json.dumps(
@@ -3038,6 +3055,7 @@ def test_factory_early_failed_record_is_archived_before_fresh_run(
 ) -> None:
     import mimir.worklink.orchestrator as orchestrator
 
+    _configure_opencode_oauth(tmp_path, monkeypatch)
     repo = tmp_path / "repo"
     repo.mkdir()
     old_sandbox = tmp_path / "factory-checkout-1"
@@ -4148,10 +4166,12 @@ def test_factory_completion_failure_never_transitions_to_review(
 )
 def test_factory_recovery_uses_run_id_first_lock_resume_and_authoritative_status(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
     lock: str,
     dead_lock: bool,
     action: str | None,
 ) -> None:
+    _configure_opencode_oauth(tmp_path, monkeypatch)
     sandbox = tmp_path / "sandbox"
     sandbox.mkdir()
     historical = {"reason": "opaque and nonauthoritative"}
