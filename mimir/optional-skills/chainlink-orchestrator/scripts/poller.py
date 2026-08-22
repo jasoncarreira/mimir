@@ -42,10 +42,14 @@ _ensure_mimir_import_path()
 from mimir.worklink.autonomy import factory_max_concurrent
 from mimir.worklink.backends.registry import BackendRegistry, WorklinkConfig, WorklinkDefaults
 from mimir.worklink.continuation import consume_worklink_budget_continuations
-from mimir.worklink.dispatch_failures import mark_failure_notified, pending_failure_alerts
+from mimir.worklink.dispatch_failures import (
+    POLLER_NAME,
+    dispatch_failure_state_dir,
+    mark_failure_notified,
+    pending_failure_alerts,
+)
 
 
-POLLER_NAME = os.environ.get("POLLER_NAME", "worklink-ready-queue")
 READY_LABEL = "worklink:ready"
 EPIC_LABEL = "worklink:epic"
 
@@ -355,9 +359,8 @@ def main() -> int:
         )
         return 0
     repo = os.environ.get("WORKLINK_REPO")
-    state_dir = Path(
-        os.environ.get("STATE_DIR") or home / "state" / "pollers" / POLLER_NAME
-    )
+    # Detached workers and this reader must resolve the ledger from the same trusted home.
+    state_dir = dispatch_failure_state_dir(home)
     state_dir.mkdir(parents=True, exist_ok=True)
     try:
         backed_off_ids, alerts = pending_failure_alerts(state_dir)
