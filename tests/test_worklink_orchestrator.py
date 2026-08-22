@@ -7,7 +7,6 @@ import shlex
 import subprocess
 import sys
 import threading
-import time
 from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
@@ -3443,6 +3442,64 @@ def test_factory_supervision_drains_exact_handle_while_status_is_polled(
     assert lifecycle == [("cancel", handle), ("cleanup", handle)]
 
 
+def test_factory_supervision_waits_for_manifest_then_proceeds(tmp_path: Path) -> None:
+    sandbox = tmp_path / "sandbox"
+    sandbox.mkdir()
+    handle = LaunchHandle("local_subprocess", "123", 456)
+    stopped = asyncio.Event()
+    statuses = [
+        parse_factory_status(
+            {
+                "run_id": "700",
+                "valid": False,
+                "sandbox_path": str(sandbox),
+                "error": "run.json does not exist",
+            }
+        ),
+        _factory_lifecycle_status(sandbox, status="needs-human"),
+    ]
+
+    class Compute:
+        async def wait(self, selected: LaunchHandle, timeout_s: int) -> ComputeResult:
+            await stopped.wait()
+            return ComputeResult(-15, "", "cancelled", handle=selected)
+
+        def job_alive(self, selected: LaunchHandle) -> bool:
+            return not stopped.is_set()
+
+        async def cancel(self, selected: LaunchHandle) -> None:
+            stopped.set()
+
+        async def cleanup(self, selected: LaunchHandle) -> None:
+            return None
+
+    class Backend:
+        poll_interval_s = 0
+
+        def status(self, *args: object, **kwargs: object) -> Any:
+            return statuses.pop(0)
+
+        def heartbeat(self, *args: object, **kwargs: object) -> None:
+            return None
+
+    result = asyncio.run(
+        WorklinkRunner(home=tmp_path, repo=tmp_path)._supervise_factory_070(
+            issue=IssueContext(700, "epic", "build", {"worklink:epic"}),
+            claim_record=ClaimRecord(700, 1, "agent", datetime.now(UTC)),
+            claims=object(),
+            backend=Backend(),
+            compute=Compute(),
+            factory_record=_factory_lifecycle_record(sandbox, handle),
+            test_cmd="pytest -q",
+            runner=lambda args: cp(args),
+            started_at=datetime.now(UTC),
+        )
+    )
+
+    assert result.status == "needs-human"
+    assert statuses == []
+
+
 @pytest.mark.parametrize("failure", ["status", "heartbeat", "persistence", "timeout"])
 def test_factory_supervision_cancels_and_cleans_on_every_failure(
     tmp_path: Path,
@@ -3511,7 +3568,7 @@ def test_factory_supervision_cancels_and_cleans_on_every_failure(
     assert lifecycle == ["cancel", "cleanup"]
 
 
-def test_factory_startup_status_handshake_is_bounded(
+def test_factory_pre_manifest_status_is_bounded_by_startup_deadline(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     import mimir.worklink.orchestrator as orchestrator
@@ -3521,6 +3578,7 @@ def test_factory_startup_status_handshake_is_bounded(
     handle = LaunchHandle("local_subprocess", "123", 456)
     stopped = asyncio.Event()
     lifecycle: list[str] = []
+    status_calls = 0
 
     class Compute:
         async def wait(self, selected: LaunchHandle, timeout_s: int) -> ComputeResult:
@@ -3541,11 +3599,19 @@ def test_factory_startup_status_handshake_is_bounded(
         poll_interval_s = 0
 
         def status(self, *args: object, **kwargs: object) -> Any:
-            time.sleep(0.1)
-            return _factory_lifecycle_status(sandbox, status="running")
+            nonlocal status_calls
+            status_calls += 1
+            return parse_factory_status(
+                {
+                    "run_id": "700",
+                    "valid": False,
+                    "sandbox_path": str(sandbox),
+                    "error": "run.json does not exist",
+                }
+            )
 
-    monkeypatch.setattr(orchestrator, "_FACTORY_STARTUP_STATUS_TIMEOUT_S", 0.01)
-    with pytest.raises(orchestrator.WorklinkError, match="startup status handshake timed out"):
+    monkeypatch.setattr(orchestrator, "_FACTORY_STARTUP_STATUS_TIMEOUT_S", 0.03)
+    with pytest.raises(orchestrator.WorklinkError, match="factory never initialised"):
         asyncio.run(
             WorklinkRunner(home=tmp_path, repo=tmp_path)._supervise_factory_070(
                 issue=IssueContext(700, "epic", "build", {"worklink:epic"}),
@@ -3561,6 +3627,67 @@ def test_factory_startup_status_handshake_is_bounded(
         )
 
     assert lifecycle == ["cancel", "cleanup"]
+    assert status_calls >= 2
+
+
+@pytest.mark.parametrize("after_valid", [False, True])
+def test_factory_supervision_immediately_refuses_other_invalid_statuses(
+    tmp_path: Path,
+    after_valid: bool,
+) -> None:
+    import mimir.worklink.orchestrator as orchestrator
+
+    sandbox = tmp_path / "sandbox"
+    sandbox.mkdir()
+    handle = LaunchHandle("local_subprocess", "123", 456)
+    stopped = asyncio.Event()
+    invalid = replace(
+        _factory_lifecycle_status(sandbox, status="running"),
+        valid=False,
+    )
+    statuses = (
+        [_factory_lifecycle_status(sandbox, status="running"), invalid]
+        if after_valid
+        else [invalid]
+    )
+
+    class Compute:
+        async def wait(self, selected: LaunchHandle, timeout_s: int) -> ComputeResult:
+            await stopped.wait()
+            return ComputeResult(-15, "", "cancelled", handle=selected)
+
+        def job_alive(self, selected: LaunchHandle) -> bool:
+            return not stopped.is_set()
+
+        async def cancel(self, selected: LaunchHandle) -> None:
+            stopped.set()
+
+        async def cleanup(self, selected: LaunchHandle) -> None:
+            return None
+
+    class Backend:
+        poll_interval_s = 0
+
+        def status(self, *args: object, **kwargs: object) -> Any:
+            return statuses.pop(0)
+
+        def heartbeat(self, *args: object, **kwargs: object) -> None:
+            return None
+
+    with pytest.raises(orchestrator.WorklinkError, match="factory status is invalid"):
+        asyncio.run(
+            WorklinkRunner(home=tmp_path, repo=tmp_path)._supervise_factory_070(
+                issue=IssueContext(700, "epic", "build", {"worklink:epic"}),
+                claim_record=ClaimRecord(700, 1, "agent", datetime.now(UTC)),
+                claims=object(),
+                backend=Backend(),
+                compute=Compute(),
+                factory_record=_factory_lifecycle_record(sandbox, handle),
+                test_cmd="pytest -q",
+                runner=lambda args: cp(args),
+                started_at=datetime.now(UTC),
+            )
+        )
 
 
 def _completion_record(sandbox: Path) -> FactoryRunRecord:
