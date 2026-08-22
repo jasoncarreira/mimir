@@ -12,6 +12,7 @@ from ..worklink.control import stop_worklink, worklink_status
 from ..worklink.orchestrator import (
     LeafValidationError,
     WorklinkError,
+    read_work_item,
     run_worklink,
     run_worklink_epic,
     run_worklink_reattach,
@@ -37,6 +38,12 @@ def add_argparse(
     stop_p = worklink_sub.add_parser("stop", help="Safely stop one live leaf Worklink run.")
     stop_p.add_argument("issue_id", type=int, help="Chainlink issue id to stop.")
     stop_p.add_argument("--home", type=Path, default=None, help="Agent home.")
+
+    emit_p = worklink_sub.add_parser(
+        "emit-work-item",
+        help="Emit one Chainlink issue as deterministic factory JSON.",
+    )
+    emit_p.add_argument("issue_id", type=int, help="Chainlink issue id to emit.")
     run_p.add_argument(
         "--dry-run",
         action="store_true",
@@ -121,6 +128,9 @@ def dispatch(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
 
     if args.worklink_action == "stop":
         return _stop(args)
+
+    if args.worklink_action == "emit-work-item":
+        return _emit_work_item(args)
 
     if args.worklink_action != "run":
         parser.print_help()
@@ -208,6 +218,16 @@ def _status(args: argparse.Namespace) -> int:
         )
         if row.disagreement:
             print(f"  disagreement: {row.disagreement}")
+    return 0
+
+
+def _emit_work_item(args: argparse.Namespace) -> int:
+    try:
+        payload = read_work_item(args.issue_id)
+    except WorklinkError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    sys.stdout.write(payload)
     return 0
 
 
