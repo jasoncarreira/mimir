@@ -82,6 +82,7 @@ _PR_BODY_SECTION_TRUNCATED = "\n\n[Build summary truncated by Worklink.]"
 _EVIDENCE_HEADING_RE = re.compile(r"(?im)^Worklink evidence:\s*$")
 _FACTORY_STARTUP_STATUS_TIMEOUT_S = 30.0
 _FACTORY_PUBLISHING_IDENTITY_ENV = "MIMIR_FACTORY_PUBLISHING_IDENTITY"
+_WORK_ITEM_RUN_ID_RE = re.compile(r"^[a-z0-9](?:[a-z0-9._-]*[a-z0-9])?$")
 
 
 def _epic_run_timeout_s() -> float:
@@ -292,6 +293,41 @@ class ChainlinkIssueReader:
             comments=tuple(comment for comment in comments if comment),
             created_at=_parse_chainlink_datetime(payload.get("created_at")),
         )
+
+
+def render_work_item(issue: IssueContext) -> str:
+    """Render a Chainlink issue as the factory's deterministic JSON input."""
+    if issue.issue_id <= 0:
+        raise WorklinkError("chainlink issue id must be a positive integer")
+    if not issue.title.strip():
+        raise WorklinkError(f"chainlink issue {issue.issue_id} has an empty title")
+
+    run_id = f"chainlink-{issue.issue_id}"
+    if _WORK_ITEM_RUN_ID_RE.fullmatch(run_id) is None:
+        raise WorklinkError(f"chainlink issue {issue.issue_id} produced an invalid run_id")
+    return json.dumps(
+        {"run_id": run_id, "title": issue.title, "body": issue.description},
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+
+
+def read_work_item(
+    issue_id: int,
+    *,
+    chainlink_bin: str = "chainlink",
+    runner: Runner | None = None,
+) -> str:
+    """Read one local Chainlink issue and return its factory work-item JSON."""
+    if issue_id <= 0:
+        raise WorklinkError("chainlink issue id must be a positive integer")
+    issue = ChainlinkIssueReader(chainlink_bin=chainlink_bin, runner=runner).read(issue_id)
+    if issue.issue_id != issue_id:
+        raise WorklinkError(
+            f"chainlink issue show {issue_id} returned mismatched issue {issue.issue_id}"
+        )
+    return render_work_item(issue)
 
 
 def validate_leaf(issue: IssueContext) -> None:
