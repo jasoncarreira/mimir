@@ -503,6 +503,11 @@ def test_opencode_launch_argv_has_exact_staged_factory_payload(
         prompt="ignored by the host feature workflow",
         rules=None,
         timeout_s=43200,
+        env={
+            "MIMIR_WORK_ITEM_JSON": json.dumps(
+                {"run_id": "chainlink-1551", "title": "epic", "body": "build"}
+            )
+        },
         transcript_root=tmp_path,
     )
     spec = FeatureFactoryBackend(entrypoint="/absolute/factory.js").work_spec(
@@ -525,7 +530,7 @@ def test_opencode_launch_argv_has_exact_staged_factory_payload(
         str(tmp_path),
         "--command",
         "feature",
-        f" --autonomous --max-retries {expected} 1551",
+        f" --autonomous --max-retries {expected} chainlink-1551",
     )
     payload = (spec.local_argv or ())[-1]
     assert payload.startswith(" ") and not payload.startswith("  ")
@@ -534,7 +539,49 @@ def test_opencode_launch_argv_has_exact_staged_factory_payload(
     assert "--base" not in payload.split()
     assert spec.backend_config["model"] == "openai/gpt-5.6-luna"
     assert spec.backend_config["model_diverged"] is False
-    assert epic_run_id(1551) == "1551"
+    assert spec.backend_config["run_id"] == "chainlink-1551"
+    assert epic_run_id(1551) == "chainlink-1551"
+
+
+def test_factory_launch_rejects_work_item_run_id_disagreement(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
+    monkeypatch.delenv("XDG_DATA_HOME", raising=False)
+    auth = tmp_path / ".local" / "share" / "opencode" / "auth.json"
+    auth.parent.mkdir(parents=True)
+    auth.write_text(
+        json.dumps({"openai": {"type": "oauth", "refresh": "subscription"}}),
+        encoding="utf-8",
+    )
+    order = WorkOrder(
+        issue_id=1551,
+        checkout=tmp_path,
+        prompt="ignored",
+        rules=None,
+        timeout_s=43200,
+        env={
+            "MIMIR_MODEL_SPEC": "codex-plus:gpt-5.6-luna",
+            "MIMIR_WORK_ITEM_JSON": '{"run_id":"chainlink-1552"}',
+        },
+    )
+
+    with pytest.raises(FactoryContractError, match="work item run_id does not match"):
+        FeatureFactoryBackend(entrypoint="/absolute/factory.js").work_spec(
+            order,
+            attempt=1,
+            repo_url="https://github.com/owner/repo.git",
+            base_ref="main",
+            branch="feature/chainlink-1551",
+            test_command="uv run pytest -q",
+        )
+
+
+@pytest.mark.parametrize("issue_id", [0, -1, True])
+def test_epic_run_id_rejects_ids_without_a_valid_canonical_shape(issue_id: int) -> None:
+    with pytest.raises(ValueError, match="positive"):
+        epic_run_id(issue_id)
 
 
 def test_opencode_launch_refuses_unresolvable_model_before_launch(

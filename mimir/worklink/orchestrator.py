@@ -64,7 +64,7 @@ from ..redaction import redact_text
 from ..repository_config import RepositoryInventory
 from ..secret_scan import secret_matches
 from .safe_git import ControllerGitPublication
-from .backends.feature_factory import FactoryStatus, FeatureFactoryBackend
+from .backends.feature_factory import FactoryStatus, FeatureFactoryBackend, epic_run_id
 from .backends.opencode import transcript_path, write_transcript
 from .factory_state import (
     FactoryRunRecord,
@@ -334,7 +334,7 @@ def render_work_item(issue: IssueContext) -> str:
     if not issue.title.strip():
         raise WorklinkError(f"chainlink issue {issue.issue_id} has an empty title")
 
-    run_id = f"chainlink-{issue.issue_id}"
+    run_id = epic_run_id(issue.issue_id)
     if _WORK_ITEM_RUN_ID_RE.fullmatch(run_id) is None:
         raise WorklinkError(f"chainlink issue {issue.issue_id} produced an invalid run_id")
     return json.dumps(
@@ -356,7 +356,7 @@ def _validate_epic_work_item(payload: str, issue_id: int) -> str:
     run_id = work_item.get("run_id")
     if not isinstance(run_id, str) or _WORK_ITEM_RUN_ID_RE.fullmatch(run_id) is None:
         raise WorklinkError("rendered factory work item has an invalid run_id")
-    if run_id != f"chainlink-{issue_id}":
+    if run_id != epic_run_id(issue_id):
         raise WorklinkError("rendered factory work item run_id does not match the issue")
     title = work_item.get("title")
     if not isinstance(title, str) or not title.strip():
@@ -364,6 +364,18 @@ def _validate_epic_work_item(payload: str, issue_id: int) -> str:
     if not isinstance(work_item.get("body"), str):
         raise WorklinkError("rendered factory work item has an invalid body")
     return run_id
+
+
+def _require_factory_launch_binding(spec: WorkSpec, run_id: str) -> None:
+    argv = spec.local_argv
+    if (
+        spec.backend_config.get("run_id") != run_id
+        or argv is None
+        or not argv
+        or not argv[-1].split()
+        or argv[-1].split()[-1] != run_id
+    ):
+        raise WorklinkError("factory launch request run_id does not match the supervised run_id")
 
 
 def read_work_item(
@@ -1561,6 +1573,7 @@ class WorklinkRunner:
                 branch=f"feature/{run_id}",
                 test_command=test_cmd,
             )
+            _require_factory_launch_binding(spec, run_id)
             factory_record = FactoryRunRecord(
                 run_id=run_id,
                 issue_id=issue_id,

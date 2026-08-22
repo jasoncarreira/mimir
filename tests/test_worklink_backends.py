@@ -893,7 +893,12 @@ async def test_feature_factory_launch_remains_shell_free_argv(
         prompt="factory owns the prompt",
         rules=None,
         timeout_s=30,
-        env={"MIMIR_HOME": str(tmp_path)},
+        env={
+            "MIMIR_HOME": str(tmp_path),
+            "MIMIR_WORK_ITEM_JSON": json.dumps(
+                {"run_id": "chainlink-1606", "title": "epic", "body": "build"}
+            ),
+        },
     )
     spec = FeatureFactoryBackend(entrypoint="/absolute/factory.js").work_spec(
         order,
@@ -920,7 +925,7 @@ async def test_feature_factory_launch_remains_shell_free_argv(
         str(tmp_path),
         "--command",
         "feature",
-        " --autonomous --max-retries 5 1606",
+        " --autonomous --max-retries 5 chainlink-1606",
     )
     assert "shell" not in calls[0]["kwargs"]
     assert calls[0]["kwargs"]["cwd"] == str(tmp_path)
