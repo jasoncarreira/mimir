@@ -156,16 +156,14 @@ def test_ensure_index_uses_db_row_when_embeddings_exist(
     )
 
 
-# ─── pre-set _embedding_dim wins over both ───────────────────────────
+# ─── populated DB is authoritative over a pre-set dimension ─────────
 
 
-def test_ensure_index_pre_set_dim_takes_precedence(
+def test_ensure_index_populated_db_takes_precedence_over_pre_set_dim(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A SagaStore constructed with ``embedding_dim=N`` uses N
-    regardless of DB rows or provider. Pins the constructor-arg
-    override path used by the bench harness."""
+    """Stored dimensions prevent a stale constructor hint from emptying the index."""
     _patch_provider(monkeypatch, dimensions=9999)
 
     from mimir.saga.client import SagaStore
@@ -173,6 +171,98 @@ def test_ensure_index_pre_set_dim_takes_precedence(
     store = SagaStore(db_path=tmp_path / "test.saga.db", embedding_dim=4)
     conn = store._ensure_conn()
 
+    import struct
+
+    conn.execute(
+        "INSERT INTO atoms (id, content, content_hash, created_at) "
+        "VALUES ('a1', 'x', 'h1', '2026-01-01T00:00:00Z')"
+    )
+    conn.execute(
+        "INSERT INTO embeddings "
+        "(atom_id, vec, provider, model, dim, embedded_at) "
+        "VALUES ('a1', ?, 'p', 'm', 8, '2026-01-01T00:00:00Z')",
+        (struct.pack("8f", *([0.0] * 8)),),
+    )
+    conn.commit()
+
     index = store._ensure_index(conn)
     assert index is not None
-    assert index.dimension == 4
+    assert index.dimension == 8
+
+
+def test_sessions_first_cannot_change_atoms_index_dimension(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_provider(monkeypatch, dimensions=8)
+
+    import struct
+
+    from mimir.saga.client import SagaStore
+
+    store = SagaStore(db_path=tmp_path / "test.saga.db")
+    conn = store._ensure_conn()
+    for i in range(3):
+        atom_id = f"a{i}"
+        conn.execute(
+            "INSERT INTO atoms (id, content, content_hash, created_at) VALUES (?, ?, ?, ?)",
+            (atom_id, atom_id, f"h{i}", "2026-01-01T00:00:00Z"),
+        )
+        conn.execute(
+            "INSERT INTO embeddings "
+            "(atom_id, vec, provider, model, dim, embedded_at) VALUES (?, ?, 'p', 'm', 8, ?)",
+            (atom_id, struct.pack("8f", *([float(i + 1)] * 8)), "2026-01-01T00:00:00Z"),
+        )
+    conn.execute(
+        "INSERT INTO sessions (id, started_at, embedding, embedding_dim) VALUES (?, ?, ?, ?)",
+        ("stale", "2026-01-01T00:00:00Z", struct.pack("4f", *([1.0] * 4)), 4),
+    )
+    conn.commit()
+
+    sessions_index = store._ensure_sessions_index(conn)
+    atoms_index = store._ensure_index(conn)
+
+    assert sessions_index is not None
+    assert sessions_index.dimension == 4
+    assert atoms_index is not None
+    assert atoms_index.dimension == 8
+    assert atoms_index.total_vectors == 3
+
+
+@pytest.mark.parametrize("index_kind", ["atoms", "sessions"])
+def test_mixed_dimensions_refuse_index_build(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    index_kind: str,
+) -> None:
+    _patch_provider(monkeypatch, dimensions=8)
+
+    import struct
+
+    from mimir.saga.client import SagaStore
+
+    store = SagaStore(db_path=tmp_path / "test.saga.db")
+    conn = store._ensure_conn()
+    if index_kind == "atoms":
+        for i, dim in enumerate((8, 4)):
+            conn.execute(
+                "INSERT INTO atoms (id, content, content_hash, created_at) VALUES (?, ?, ?, ?)",
+                (f"a{i}", "x", f"h{i}", "2026-01-01T00:00:00Z"),
+            )
+            conn.execute(
+                "INSERT INTO embeddings "
+                "(atom_id, vec, provider, model, dim, embedded_at) VALUES (?, ?, 'p', 'm', ?, ?)",
+                (f"a{i}", struct.pack(f"{dim}f", *([1.0] * dim)), dim, "2026-01-01T00:00:00Z"),
+            )
+        ensure = store._ensure_index
+    else:
+        for i, dim in enumerate((8, 4)):
+            conn.execute(
+                "INSERT INTO sessions (id, started_at, embedding, embedding_dim) VALUES (?, ?, ?, ?)",
+                (f"s{i}", "2026-01-01T00:00:00Z", struct.pack(f"{dim}f", *([1.0] * dim)), dim),
+            )
+        ensure = store._ensure_sessions_index
+    conn.commit()
+
+    with pytest.raises(RuntimeError, match="mixed embedding dimensions"):
+        ensure(conn)

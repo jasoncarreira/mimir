@@ -90,6 +90,8 @@ def _init_saga(home: Path) -> Path:
             agent_id TEXT, session_id TEXT, created_at TEXT
         );
         CREATE VIRTUAL TABLE atoms_fts USING fts5(content, tokenize='porter unicode61');
+        CREATE TABLE embeddings (atom_id TEXT PRIMARY KEY, vec BLOB);
+        CREATE TABLE sessions (id TEXT PRIMARY KEY, embedding BLOB);
     """)
     conn.execute(
         "INSERT INTO atoms (id, content, content_hash, stream, memory_type, "
@@ -128,7 +130,7 @@ def test_clean_file_corpus_passes_all_checks(tmp_path: Path):
 def test_clean_saga_passes_all_checks(tmp_path: Path):
     _init_saga(tmp_path)
     checks = check_saga(tmp_path)
-    assert len(checks) == 4
+    assert len(checks) == 6
     for c in checks:
         assert c.ok, f"unexpected failure: {c.render()}"
 
@@ -137,8 +139,8 @@ def test_check_all_combines_both_dbs(tmp_path: Path):
     _init_file_corpus(tmp_path)
     _init_saga(tmp_path)
     report = check_all(tmp_path)
-    # 5 file-corpus + 4 saga.
-    assert len(report.checks) == 9
+    # 5 file-corpus + 6 saga.
+    assert len(report.checks) == 11
     assert report.ok
     assert report.failures == []
 
@@ -212,6 +214,36 @@ def test_mixed_embedding_dims_detected(tmp_path: Path):
     assert "4096" in dims.detail  # 1024 * 4
 
 
+@pytest.mark.parametrize(
+    ("table", "column"),
+    [("embeddings", "vec"), ("sessions", "embedding")],
+)
+def test_saga_mixed_embedding_dims_detected(
+    tmp_path: Path, table: str, column: str
+) -> None:
+    db_path = _init_saga(tmp_path)
+    conn = sqlite3.connect(str(db_path))
+    conn.execute(
+        f"INSERT INTO {table} ({'atom_id' if table == 'embeddings' else 'id'}, {column}) "
+        "VALUES ('one', ?)",
+        (b"\0" * 16,),
+    )
+    conn.execute(
+        f"INSERT INTO {table} ({'atom_id' if table == 'embeddings' else 'id'}, {column}) "
+        "VALUES ('two', ?)",
+        (b"\0" * 32,),
+    )
+    conn.commit()
+    conn.close()
+
+    dims = next(
+        check for check in check_saga(tmp_path)
+        if check.name == f"embedding_dim_uniform_{table}"
+    )
+    assert not dims.ok
+    assert "mixed dims" in dims.detail
+
+
 def test_empty_index_doesnt_trip_dim_check(tmp_path: Path):
     """A fresh, empty index has no embeddings — the dim check passes
     (the failure case requires AT LEAST one row of differing length)."""
@@ -269,7 +301,7 @@ def test_render_includes_count_summary(tmp_path: Path):
     _init_saga(tmp_path)
     report = check_all(tmp_path)
     out = report.render()
-    assert "9/9 checks passed" in out
+    assert "11/11 checks passed" in out
 
 
 def test_run_verify_index_cmd_returns_0_on_clean(tmp_path: Path, capsys):
@@ -278,7 +310,7 @@ def test_run_verify_index_cmd_returns_0_on_clean(tmp_path: Path, capsys):
     rc = run_verify_index_cmd(home=tmp_path)
     assert rc == 0
     out = capsys.readouterr().out
-    assert "9/9 checks passed" in out
+    assert "11/11 checks passed" in out
 
 
 def test_run_verify_index_cmd_returns_1_on_failure(tmp_path: Path, capsys):
@@ -319,7 +351,7 @@ async def test_scheduled_check_emits_ok_on_clean(
     assert len(events) == 1
     kind, kw = events[0]
     assert kind == "index_integrity_ok"
-    assert kw["checks"] == 9
+    assert kw["checks"] == 11
 
 
 @pytest.mark.asyncio
