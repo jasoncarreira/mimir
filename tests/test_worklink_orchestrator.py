@@ -372,6 +372,40 @@ def test_read_work_item_missing_issue_fails_without_payload() -> None:
         read_work_item(999, runner=runner)
 
 
+def test_malformed_epic_work_item_fails_before_claim_or_sandbox(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import mimir.worklink.orchestrator as orchestrator
+
+    repo = tmp_path / "repo"
+    calls: list[Sequence[str] | str] = []
+    epic_json = ISSUE_JSON.replace('"id": 441', '"id": 700').replace(
+        '"labels": ["worklink", "worklink:ready"]',
+        '"labels": ["worklink", "worklink:ready", "worklink:epic"]',
+    )
+
+    def runner(args: Sequence[str] | str, **_: object) -> subprocess.CompletedProcess[str]:
+        calls.append(args)
+        if isinstance(args, list) and args[:4] == ["chainlink", "issue", "show", "700"]:
+            return cp(args, stdout=epic_json)
+        if isinstance(args, list) and args[:4] == ["git", "-C", str(repo), "config"]:
+            return cp(args, stdout="git@github.com:owner/repo.git\n")
+        return cp(args)
+
+    monkeypatch.setattr(FeatureFactoryBackend, "admit", lambda self: Path(self.entrypoint))
+    monkeypatch.setattr(orchestrator, "render_work_item", lambda issue: '{"run_id":7}')
+
+    with pytest.raises(WorklinkError, match="invalid run_id"):
+        asyncio.run(WorklinkRunner(home=tmp_path, repo=repo, runner=runner).run_epic(700))
+
+    assert not any(
+        isinstance(call, list) and call[:3] == ["chainlink", "locks", "claim"]
+        for call in calls
+    )
+    assert not (tmp_path / "state" / "worklink" / "factory-runs").exists()
+    assert not (repo.parent / ".worklink").exists()
+
+
 def test_preclaim_registry_crash_emits_scrubbed_failure_event(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -2488,10 +2522,17 @@ def test_factory_dispatch_verifies_process_token_and_normalizes_child_aliases(
     assert len(launched) == 1
     assert launched[0].env["GH_TOKEN"] == selected
     assert launched[0].env["GITHUB_TOKEN"] == selected
+    assert json.loads(launched[0].env["MIMIR_WORK_ITEM_JSON"]) == {
+        "run_id": "chainlink-700",
+        "title": "epic",
+        "body": "build",
+    }
     assert launched[0].env["GIT_AUTHOR_NAME"] == "Factory Author"
     assert launched[0].env["GIT_AUTHOR_EMAIL"] == "factory@example.com"
     assert launched[0].env["GIT_COMMITTER_NAME"] == "Factory Author"
     assert launched[0].env["GIT_COMMITTER_EMAIL"] == "factory@example.com"
+    assert launched[0].branch == "feature/chainlink-700"
+    assert launched[0].local_checkout == tmp_path / "factory-checkout"
     checkout_configs = [
         command
         for command in commands
@@ -2773,8 +2814,15 @@ def test_factory_new_run_uses_resolved_base_for_single_checkout_placement(
 
     async def stop_after_placement(self: object, spec: WorkSpec) -> LaunchHandle:
         preflight_events.append("launch")
+        assert spec.branch == "feature/chainlink-700"
         assert spec.env == {
             "MIMIR_HOME": str(tmp_path),
+            "MIMIR_WORK_ITEM_JSON": json.dumps(
+                {"body": description, "run_id": "chainlink-700", "title": "epic"},
+                ensure_ascii=False,
+                separators=(",", ":"),
+                sort_keys=True,
+            ),
             "GH_TOKEN": "selected-token",
             "GITHUB_TOKEN": "selected-token",
             "GIT_AUTHOR_NAME": "Factory Author",
@@ -2991,7 +3039,11 @@ def test_factory_early_failed_record_is_archived_before_fresh_run(
         current = kwargs["factory_record"]
         assert isinstance(current, FactoryRunRecord)
         assert current.attempt == 2
-        assert current.sandbox == str(fresh_sandbox)
+        assert current.run_id == "chainlink-700"
+        assert current.sandbox == str(
+            fresh_sandbox / ".factory-sandboxes" / "chainlink-700"
+        )
+        assert current.branch == "feature/chainlink-700"
         return orchestrator.WorklinkRunResult(700, 2, "needs-human")
 
     def recover(*args: object, **kwargs: object) -> object:
@@ -3041,7 +3093,7 @@ def test_factory_early_failed_record_is_archived_before_fresh_run(
 
     assert result.status == "needs-human"
     assert transitions == []
-    assert load_factory_record(tmp_path, "700").attempt == 2
+    assert load_factory_record(tmp_path, "chainlink-700").attempt == 2
     archives = list(
         (tmp_path / "state" / "worklink" / "factory-runs" / "archive").glob("*.json")
     )

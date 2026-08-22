@@ -321,6 +321,7 @@ repository files and model-generated values never add permission entries.
 | `MIMIR_FACTORY_MAX_RETRIES` | ASCII decimal integer | `5` | Factory `/feature` retry budget. Accepts exactly ASCII `[0-9]+` valued from `1` through `9007199254740991`; absent or invalid values fall back to `5`. |
 | `MIMIR_FACTORY_RUN_TIMEOUT_S` | float | `43200` (12h) | OpenCode process liveness backstop. Expiry cancels only the verified process group. |
 | `MIMIR_FACTORY_STALE_HEARTBEAT_S` | float | `900` (15m) | Diagnostic threshold for stale factory lock observations. It never authorizes dispatch, lock stealing, cancellation, or deletion. |
+| `MIMIR_WORK_ITEM_JSON` | JSON object | unset | Internal factory-dispatch payload set by Worklink for a claimed Chainlink epic. The repository resolver emits it unchanged and skips GitHub issue lookup; operators should not set it for direct local runs. |
 | `MIMIR_SOURCE_DIR` | path | unset | Override for locating the source checkout in the chainlink-orchestrator poller. |
 | `MIMIR_WORKLINK_MAX_STDOUT_BYTES` | positive int | `67108864` (64 MiB) | Maximum stdout retained from a Worklink backend subprocess. Invalid or non-positive values use the default; exceeding the cap terminates the subprocess. |
 | `MIMIR_WORKLINK_MAX_STDERR_BYTES` | positive int | `16777216` (16 MiB) | Maximum stderr retained from a Worklink backend subprocess. Invalid or non-positive values use the default; exceeding the cap terminates the subprocess. |

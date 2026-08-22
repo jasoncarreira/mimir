@@ -313,6 +313,27 @@ def render_work_item(issue: IssueContext) -> str:
     )
 
 
+def _validate_epic_work_item(payload: str, issue_id: int) -> str:
+    """Validate the rendered factory payload and return its declared run ID."""
+    try:
+        work_item = json.loads(payload)
+    except json.JSONDecodeError as exc:
+        raise WorklinkError("rendered factory work item is malformed") from exc
+    if not isinstance(work_item, dict):
+        raise WorklinkError("rendered factory work item must be a JSON object")
+    run_id = work_item.get("run_id")
+    if not isinstance(run_id, str) or _WORK_ITEM_RUN_ID_RE.fullmatch(run_id) is None:
+        raise WorklinkError("rendered factory work item has an invalid run_id")
+    if run_id != f"chainlink-{issue_id}":
+        raise WorklinkError("rendered factory work item run_id does not match the issue")
+    title = work_item.get("title")
+    if not isinstance(title, str) or not title.strip():
+        raise WorklinkError("rendered factory work item has an invalid title")
+    if not isinstance(work_item.get("body"), str):
+        raise WorklinkError("rendered factory work item has an invalid body")
+    return run_id
+
+
 def read_work_item(
     issue_id: int,
     *,
@@ -1418,6 +1439,8 @@ class WorklinkRunner:
             max_attempts=config.defaults.max_claim_attempts,
         )
         issue = issue_reader.read(issue_id)
+        work_item_json = render_work_item(issue)
+        run_id = _validate_epic_work_item(work_item_json, issue.issue_id)
         claim = claims.claim_issue(
             issue_id,
             issue.comments,
@@ -1432,7 +1455,9 @@ class WorklinkRunner:
                 issue_id, None, "failed", reason=claim.reason or "claim_failed"
             )
         claim_record = claim.record
-        retained = load_factory_record(self.home, str(issue_id))
+        retained = load_factory_record(self.home, run_id)
+        if retained is None:
+            retained = load_factory_record(self.home, str(issue_id))
         lease: CheckoutLease | None = None
         try:
             if retained is not None:
@@ -1487,6 +1512,7 @@ class WorklinkRunner:
                 timeout_s=int(_epic_run_timeout_s()),
                 env={
                     "MIMIR_HOME": str(self.home),
+                    "MIMIR_WORK_ITEM_JSON": work_item_json,
                     **github_env,
                     "GIT_AUTHOR_NAME": git_name,
                     "GIT_AUTHOR_EMAIL": git_email,
@@ -1500,19 +1526,19 @@ class WorklinkRunner:
                 attempt=claim_record.attempt,
                 repo_url=repo_url,
                 base_ref=lease.base_ref,
-                branch=lease.branch,
+                branch=f"feature/{run_id}",
                 test_command=test_cmd,
             )
             handle = await compute.launch(spec)
             factory_record = FactoryRunRecord(
-                run_id=str(issue_id),
+                run_id=run_id,
                 issue_id=issue_id,
                 attempt=claim_record.attempt,
                 repository=repo_slug,
                 base_ref=base,
-                branch=lease.branch,
+                branch=f"feature/{run_id}",
                 launcher=str(launcher),
-                sandbox=str(lease.path),
+                sandbox=str(lease.path / ".factory-sandboxes" / run_id),
                 session=None,
                 handle=handle,
                 status=None,
@@ -1537,7 +1563,9 @@ class WorklinkRunner:
             )
         except Exception as exc:
             try:
-                current = load_factory_record(self.home, str(issue_id))
+                current = load_factory_record(self.home, run_id)
+                if current is None:
+                    current = load_factory_record(self.home, str(issue_id))
             except Exception:
                 current = None
             if current is not None:
@@ -1983,7 +2011,10 @@ def _verify_factory_recovery_binding(
     base: str,
     command_runner: Runner,
 ) -> Path:
-    if retained.issue_id != issue.issue_id or retained.run_id != str(issue.issue_id):
+    if retained.issue_id != issue.issue_id or retained.run_id not in {
+        str(issue.issue_id),
+        f"chainlink-{issue.issue_id}",
+    }:
         raise WorklinkError("retained factory issue identity does not match recovery request")
     if retained.repository.lower() != repo_slug.lower():
         raise WorklinkError("retained factory repository does not match recovery request")
@@ -2031,7 +2062,7 @@ def _require_factory_status(
         raise WorklinkError("factory status run id mismatch")
     if status.issue_key is None:
         raise WorklinkError("factory status issue key is missing")
-    if status.issue_key != str(record.issue_id):
+    if status.issue_key != record.run_id:
         raise WorklinkError("factory status issue key mismatch")
     if status.sandbox_path != record.sandbox:
         raise WorklinkError("factory status sandbox mismatch")

@@ -73,9 +73,40 @@ def _run(command: str, factory_input: str, bindir: Path) -> subprocess.Completed
     env = dict(os.environ)
     env["PATH"] = f"{bindir}{os.pathsep}{env['PATH']}"
     env["FACTORY_INPUT"] = factory_input
+    env.pop("MIMIR_WORK_ITEM_JSON", None)
     return subprocess.run(
         ["sh", "-c", command], capture_output=True, text=True, env=env, cwd=REPO_ROOT
     )
+
+
+@pytest.mark.parametrize("github_object", ["pull request", "unrelated open issue"])
+def test_rendered_chainlink_work_item_bypasses_github_number_space(
+    tmp_path: Path, github_object: str
+) -> None:
+    bindir, log = _stub_gh(tmp_path, kind="pr" if github_object == "pull request" else "issue")
+    payload = (
+        '{"body":"untrusted path\\\\with glob * and $HOME","run_id":"chainlink-1338",'
+        '"title":"Chainlink work"}'
+    )
+    import os
+
+    env = dict(os.environ)
+    env["PATH"] = f"{bindir}{os.pathsep}{env['PATH']}"
+    env["FACTORY_INPUT"] = "1338"
+    env["MIMIR_WORK_ITEM_JSON"] = payload
+
+    proc = subprocess.run(
+        ["sh", "-c", _resolve_command()],
+        capture_output=True,
+        text=True,
+        env=env,
+        cwd=REPO_ROOT,
+    )
+
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout == payload
+    assert proc.stderr == ""
+    assert not log.exists(), f"resolver unexpectedly invoked gh for a {github_object} collision"
 
 
 def test_declaration_is_valid_json_with_exactly_the_expected_keys() -> None:

@@ -124,7 +124,7 @@ def test_factory_record_schema_remains_exact(tmp_path: Path) -> None:
         FactoryRunRecord.from_json(payload)
 
 
-def test_factory_record_rejects_symlink_and_non_numeric_names(tmp_path: Path) -> None:
+def test_factory_record_rejects_symlink_and_unbound_run_ids(tmp_path: Path) -> None:
     expected = record(tmp_path)
     path = save_factory_record(tmp_path, expected)
     path.unlink()
@@ -133,8 +133,8 @@ def test_factory_record_rejects_symlink_and_non_numeric_names(tmp_path: Path) ->
     path.symlink_to(outside)
     with pytest.raises(FactoryRecordError, match="regular"):
         load_factory_record(tmp_path, "1551")
-    with pytest.raises(FactoryRecordError, match="positive decimal"):
-        load_factory_record(tmp_path, "chainlink-1551")
+    with pytest.raises(FactoryRecordError, match="run id"):
+        load_factory_record(tmp_path, "not/a/run-id")
 
 
 def test_clear_factory_record_refuses_symlink(tmp_path: Path) -> None:
