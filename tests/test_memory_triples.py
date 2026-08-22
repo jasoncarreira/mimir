@@ -11,6 +11,7 @@ import pytest
 
 from mimir.models import AuthContext
 from mimir.saga.triples import (
+    _update_world_state,
     detect_contradictions,
     get_current_value,
     get_history,
@@ -471,27 +472,94 @@ def test_world_state_same_valid_from_value_change_keeps_new_current(conn):
 
 
 def test_world_state_late_colliding_assertion_preserves_coherent_history(conn):
-    """A stale assertion colliding with history is recorded at assertion time."""
-    _seed_atom(conn, "obs1", "obs")
-    for value, valid_from in (
-        ("Boston", "2024-01-01"),
-        ("Austin", "2025-01-01"),
-        ("Denver", "2024-01-01"),
+    """The reproduced collision keeps every value and a coherent interval chain."""
+    for value, valid_from, now in (
+        ("Boston", "2024-01-01", "2024-06-01"),
+        ("Austin", "2025-01-01", "2025-06-01"),
+        ("Denver", "2024-01-01", "2026-01-01"),
     ):
-        store_triples(conn, [
-            {"subject": "Jason", "predicate": "lives_in", "object": value,
-             "valid_from": valid_from},
-        ], source_atom_id="obs1")
+        _update_world_state(
+            conn,
+            subject="Jason",
+            predicate="lives_in",
+            value=value,
+            valid_from=valid_from,
+            valid_until=None,
+            source_triple_id=value.lower(),
+            now=now,
+        )
 
     history = get_history(conn, "Jason", "lives_in", auth_context=ADMIN_SCOPE)
 
     assert [row.value for row in history] == ["Boston", "Austin", "Denver"]
-    assert history[0].valid_from == "2024-01-01"
-    assert history[0].valid_until == "2025-01-01"
-    assert history[1].valid_from == "2025-01-01"
-    assert history[1].valid_until == history[2].valid_from
-    assert history[2].valid_from > "2025-01-01"
+    assert [row.valid_from for row in history] == [
+        "2024-01-01", "2025-01-01", "2026-01-01",
+    ]
+    assert [row.valid_until for row in history] == [
+        "2025-01-01", "2026-01-01", None,
+    ]
     assert [row.is_current for row in history] == [False, False, True]
+
+
+def test_world_state_rejects_history_collision_without_deleting_rows(conn):
+    conn.executemany(
+        "INSERT INTO world_state "
+        "(subject, predicate, value, valid_from, valid_until, is_current, "
+        " source_triple_id, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        [
+            ("Jason", "lives_in", "Austin", "2025-01-01", None, 0,
+             "austin", "2025-06-01"),
+            ("Jason", "lives_in", "Denver", None, None, 1,
+             "denver", "2026-06-01"),
+        ],
+    )
+
+    with pytest.raises(ValueError, match="collides with existing history"):
+        _update_world_state(
+            conn,
+            subject="Jason",
+            predicate="lives_in",
+            value="Paris",
+            valid_from="2025-01-01",
+            valid_until=None,
+            source_triple_id="paris",
+            now="2027-01-01",
+        )
+
+    rows = conn.execute(
+        "SELECT value, valid_from, valid_until, is_current FROM world_state "
+        "WHERE subject = 'Jason' AND predicate = 'lives_in' "
+        "ORDER BY is_current",
+    ).fetchall()
+    assert rows == [
+        ("Austin", "2025-01-01", None, 0),
+        ("Denver", None, None, 1),
+    ]
+
+
+def test_world_state_rejects_stale_assertion_when_now_is_not_after_current(conn):
+    _update_world_state(
+        conn,
+        subject="Jason",
+        predicate="lives_in",
+        value="Austin",
+        valid_from="2025-01-01",
+        valid_until=None,
+        source_triple_id="austin",
+        now="2025-01-01",
+    )
+
+    with pytest.raises(ValueError, match="cannot be normalized"):
+        _update_world_state(
+            conn,
+            subject="Jason",
+            predicate="lives_in",
+            value="Boston",
+            valid_from="2024-01-01",
+            valid_until=None,
+            source_triple_id="boston",
+            now="2025-01-01",
+        )
 
 
 def test_world_state_supersedes_current_row_with_null_valid_from(conn):
@@ -527,6 +595,13 @@ def test_world_state_supersedes_current_row_with_null_valid_from(conn):
 def test_world_state_has_one_current_row_after_arbitrary_assertion_order(
     conn, assertion_order,
 ):
+    conn.execute(
+        "INSERT INTO world_state "
+        "(subject, predicate, value, valid_from, valid_until, is_current, "
+        " source_triple_id, updated_at) "
+        "VALUES ('Jason', 'lives_in', 'Unknown', NULL, NULL, 1, NULL, ?)",
+        ("2023-01-01T00:00:00Z",),
+    )
     _seed_atom(conn, "obs1", "obs")
     for value, valid_from in assertion_order:
         store_triples(conn, [
