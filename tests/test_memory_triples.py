@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import sqlite3
 import struct
+from itertools import permutations
 from pathlib import Path
 
 import pytest
@@ -467,6 +468,75 @@ def test_world_state_same_valid_from_value_change_keeps_new_current(conn):
     history = get_history(conn, "Alice", "status", auth_context=ADMIN_SCOPE)
     assert [row.value for row in history] == ["active", "inactive"]
     assert [row.is_current for row in history] == [False, True]
+
+
+def test_world_state_late_colliding_assertion_preserves_coherent_history(conn):
+    """A stale assertion colliding with history is recorded at assertion time."""
+    _seed_atom(conn, "obs1", "obs")
+    for value, valid_from in (
+        ("Boston", "2024-01-01"),
+        ("Austin", "2025-01-01"),
+        ("Denver", "2024-01-01"),
+    ):
+        store_triples(conn, [
+            {"subject": "Jason", "predicate": "lives_in", "object": value,
+             "valid_from": valid_from},
+        ], source_atom_id="obs1")
+
+    history = get_history(conn, "Jason", "lives_in", auth_context=ADMIN_SCOPE)
+
+    assert [row.value for row in history] == ["Boston", "Austin", "Denver"]
+    assert history[0].valid_from == "2024-01-01"
+    assert history[0].valid_until == "2025-01-01"
+    assert history[1].valid_from == "2025-01-01"
+    assert history[1].valid_until == history[2].valid_from
+    assert history[2].valid_from > "2025-01-01"
+    assert [row.is_current for row in history] == [False, False, True]
+
+
+def test_world_state_supersedes_current_row_with_null_valid_from(conn):
+    conn.execute(
+        "INSERT INTO world_state "
+        "(subject, predicate, value, valid_from, valid_until, is_current, "
+        " source_triple_id, updated_at) "
+        "VALUES ('Alice', 'status', 'unknown', NULL, NULL, 1, NULL, ?)",
+        ("2024-01-01T00:00:00Z",),
+    )
+    _seed_atom(conn, "obs1", "obs")
+
+    store_triples(conn, [
+        {"subject": "Alice", "predicate": "status", "object": "active",
+         "valid_from": "2025-01-01"},
+    ], source_atom_id="obs1")
+
+    rows = conn.execute(
+        "SELECT value, valid_from, valid_until, is_current FROM world_state "
+        "WHERE subject = 'Alice' AND predicate = 'status' ORDER BY is_current",
+    ).fetchall()
+    assert rows == [
+        ("unknown", None, "2025-01-01", 0),
+        ("active", "2025-01-01", None, 1),
+    ]
+
+
+@pytest.mark.parametrize("assertion_order", list(permutations((
+    ("Boston", "2024-01-01"),
+    ("Austin", "2025-01-01"),
+    ("Denver", "2026-01-01"),
+))))
+def test_world_state_has_one_current_row_after_arbitrary_assertion_order(
+    conn, assertion_order,
+):
+    _seed_atom(conn, "obs1", "obs")
+    for value, valid_from in assertion_order:
+        store_triples(conn, [
+            {"subject": "Jason", "predicate": "lives_in", "object": value,
+             "valid_from": valid_from},
+        ], source_atom_id="obs1")
+        assert conn.execute(
+            "SELECT COUNT(*) FROM world_state "
+            "WHERE subject = 'Jason' AND predicate = 'lives_in' AND is_current = 1",
+        ).fetchone()[0] == 1
 
 
 def test_get_current_value_is_deterministic_with_dual_current_rows(conn):

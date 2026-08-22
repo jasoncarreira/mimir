@@ -476,9 +476,10 @@ def _update_world_state(
       first claim.
     - Else: mark the prior current row as is_current=0, set its
       valid_until to the new row's valid_from (or now() if missing),
-      then upsert the new row as is_current=1. If both rows share that
-      timestamp, first copy the end-dated value to a nullable-key history
-      row so ``INSERT OR REPLACE`` cannot delete it.
+      then insert the new row as is_current=1. A start before the current
+      row is normalized to assertion time so late extraction cannot create
+      a backwards interval. If both rows share a timestamp, move the
+      end-dated row to SQLite's nullable-key history slot first.
 
     The ACL is inherited from the source triple (chainlink #884).
     """
@@ -486,41 +487,48 @@ def _update_world_state(
         acl = Ownership()
 
     current = conn.execute(
-        "SELECT value, valid_from FROM world_state "
+        "SELECT rowid, value, valid_from FROM world_state "
         "WHERE subject = ? AND predicate = ? AND is_current = 1",
         (subject, predicate),
     ).fetchone()
     new_valid_from = valid_from or now
     if current is not None:
-        cur_value, cur_valid_from = current
+        current_rowid, cur_value, cur_valid_from = current
         if cur_value == value:
             return  # re-assertion; nothing changed
-        # End-date the current row.
-        end_ts = new_valid_from
+
+        if cur_valid_from is not None and new_valid_from < cur_valid_from:
+            if now <= cur_valid_from:
+                raise ValueError(
+                    "stale world-state assertion cannot be normalized after "
+                    "the current valid_from"
+                )
+            new_valid_from = now
+
+        collision = conn.execute(
+            "SELECT rowid FROM world_state "
+            "WHERE subject = ? AND predicate = ? AND valid_from = ?",
+            (subject, predicate, new_valid_from),
+        ).fetchone()
+        if collision is not None and collision[0] != current_rowid:
+            raise ValueError("world-state valid_from collides with existing history")
+
+        # Address the row by rowid because ``valid_from = NULL`` never matches.
         conn.execute(
             "UPDATE world_state SET is_current = 0, valid_until = ?, "
             "updated_at = ? "
-            "WHERE subject = ? AND predicate = ? AND valid_from = ?",
-            (end_ts, now, subject, predicate, cur_valid_from),
+            "WHERE rowid = ?",
+            (new_valid_from, now, current_rowid),
         )
         if cur_valid_from == new_valid_from:
-            # The legacy PK includes valid_from, so preserve the end-dated row
-            # under SQLite's distinct nullable-key slot before replacing its
-            # timestamp with the new current value.
+            # The legacy PK includes valid_from. Move, rather than delete, the
+            # end-dated row to SQLite's distinct nullable-key history slot.
             conn.execute(
-                "INSERT INTO world_state "
-                "(subject, predicate, value, valid_from, valid_until, is_current, "
-                " source_triple_id, updated_at, owner_principal, origin_channel, "
-                " origin_domain, visibility, provenance) "
-                "SELECT subject, predicate, value, NULL, valid_until, is_current, "
-                "source_triple_id, updated_at, owner_principal, origin_channel, "
-                "origin_domain, visibility, provenance FROM world_state "
-                "WHERE subject = ? AND predicate = ? AND valid_from = ?",
-                (subject, predicate, cur_valid_from),
+                "UPDATE world_state SET valid_from = NULL WHERE rowid = ?",
+                (current_rowid,),
             )
     conn.execute(
-        # The same-valid_from case above preserved the old value separately.
-        "INSERT OR REPLACE INTO world_state "
+        "INSERT INTO world_state "
         "(subject, predicate, value, valid_from, valid_until, "
         " is_current, source_triple_id, updated_at, "
         " owner_principal, origin_channel, origin_domain, visibility, provenance) "
