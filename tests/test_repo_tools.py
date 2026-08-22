@@ -1554,7 +1554,11 @@ async def test_project_test_retains_builtin_hang_dump_after_stderr_truncation(
         "    gate = threading.Event()\n"
         "    threading.Thread(target=blocked_worker, args=(gate,), daemon=True).start()\n"
         "    os.write(2, b'x' * 5000)\n"
-        "    time.sleep(0.2)\n"
+        # 0.1s faulthandler threshold against a 3s hang: a 30x margin, because a
+        # contended CI runner can otherwise finish a 0.2s sleep before the dump
+        # is written. Observed failing twice on pytest-macos (3.11) at that margin
+        # while passing locally and on every Linux job.
+        "    time.sleep(3.0)\n"
         "    assert credential\n",
     )
     assert completed.returncode == 0
