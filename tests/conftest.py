@@ -148,6 +148,24 @@ def repo_review_git_root(tmp_path):
     return root.resolve()
 
 
+# Host-only Mimir settings: set by an operator or a deployment, never by a test.
+_HOST_ONLY_ENV = frozenset(
+    {
+        "MIMIR_API_KEY",
+        "MIMIR_HOME",
+        "MIMIR_FACTORY_PUBLISHING_IDENTITY",
+    }
+)
+
+# The poller framework injects these into a poller's child process
+# (``mimir/pollers.py`` sets them; ``_POLLER_INJECTED_ENV_KEYS`` is the source of
+# truth, and ``test_env_isolation`` asserts this set stays in step with it).
+# Inheriting them is not merely noisy -- ``STATE_DIR`` is where
+# ``_record_run_failure`` writes dispatch failures, so a test running under an
+# inherited value writes into the live poller store.
+_POLLER_INJECTED_ENV = frozenset({"STATE_DIR", "POLLER_NAME", "MIMIR_HOME"})
+
+
 @pytest.fixture(autouse=True, scope="session")
 def _clear_host_mimir_environment():
     """Pop host-only Mimir settings from os.environ for the test session.
@@ -179,11 +197,7 @@ def _clear_host_mimir_environment():
     """
     saved = {
         name: os.environ.pop(name)
-        for name in (
-            "MIMIR_API_KEY",
-            "MIMIR_HOME",
-            "MIMIR_FACTORY_PUBLISHING_IDENTITY",
-        )
+        for name in _HOST_ONLY_ENV | _POLLER_INJECTED_ENV
         if name in os.environ
     }
     yield
