@@ -430,7 +430,7 @@ whether it came from `repository` or `deployment` configuration.
 | `defaults.base_branch` | str | `main` | Branch attempt checkouts are based on and leaf PRs target. | `base_branch: release/0.7` |
 | `defaults.base_fetch` | bool | `true` | Refreshes `origin/<base_branch>` before creating an attempt checkout without moving the source checkout. | `base_fetch: false` |
 | `defaults.max_concurrent` | positive int | `2` | Caps claims across autonomous poller/tool dispatch; the operator CLI is uncapped. | `max_concurrent: 4` |
-| `defaults.reaper_ttl_s` | positive int | `86400` | Age in seconds after which the reaper may recover a claim or retained checkout with no heartbeat. Must be at least twice the greater of `timeout_s` and `MIMIR_FACTORY_RUN_TIMEOUT_S`. | `reaper_ttl_s: 86400` |
+| `defaults.reaper_ttl_s` | positive int | `86400` | Age in seconds after which the reaper may recover a claim or retained checkout with no heartbeat. Set existing configs to at least twice the greater of `timeout_s` and `MIMIR_FACTORY_RUN_TIMEOUT_S` (normally `86400`); lower legacy values warn and are raised to that floor at load. | `reaper_ttl_s: 86400` |
 | `defaults.allow_autonomous_local_subprocess` | bool | `false` | Allows autonomous use of `local_subprocess`, which has shared filesystem access and no network isolation. This accepts that blast radius; the operator CLI is unaffected. | `allow_autonomous_local_subprocess: true` |
 | `defaults.epic_branch_prefix` | str | `epic/` | Compatibility-only field retained after integrated epic execution was removed; no 0.7.2 runtime consumes it. | `epic_branch_prefix: "epic/"` |
 | `defaults.max_review_retries` | positive int | `3` | Compatibility-only parsed field; no 0.7.2 runtime consumes it. | `max_review_retries: 3` |

@@ -665,7 +665,7 @@ def test_reap_for_home_uses_config_ttl(
 @pytest.mark.parametrize(
     ("configured_ttl_s", "expected_ttl_s", "emits_violation"),
     [
-        (3599, 3600, True),
+        (3599, 3600, False),
         (3600, 3600, False),
         (3601, 3601, False),
     ],
@@ -695,35 +695,33 @@ def test_reap_for_home_enforces_ttl_floor_boundary(
     assert autonomy.reap_stale_claims_for_home(tmp_path, claims=claims) == []
     assert seen_ttls == [timedelta(seconds=expected_ttl_s)]
     assert bool(events) is emits_violation
-    if emits_violation:
-        assert events == [
-            (
-                "worklink_reaper_misconfigured",
-                {
-                    "configured_reaper_ttl_s": 3599,
-                    "required_reaper_ttl_s": 3600,
-                    "action": "using_required_ttl",
-                },
-            )
-        ]
 
 
-def test_invalid_reaper_ttl_is_rejected_when_config_is_loaded(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+def test_config_load_raises_deployed_legacy_reaper_ttl_to_safe_floor(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
-    monkeypatch.setenv("MIMIR_FACTORY_RUN_TIMEOUT_S", "1800")
-    _write_worklink_yaml(tmp_path, timeout_s=1800, reaper_ttl_s=3599)
+    monkeypatch.delenv("MIMIR_FACTORY_RUN_TIMEOUT_S", raising=False)
+    _write_worklink_yaml(tmp_path, timeout_s=3600, reaper_ttl_s=7800)
 
-    with pytest.raises(ValueError, match="greater of timeout_s and the factory run timeout"):
-        WorklinkConfig.load(tmp_path / "worklink.yaml")
+    with caplog.at_level("WARNING", logger="mimir.worklink.backends.registry"):
+        config = WorklinkConfig.load(tmp_path / "worklink.yaml")
+
+    assert config.defaults.reaper_ttl_s == 86400
+    assert "defaults.reaper_ttl_s=7800 below the safe floor 86400" in caplog.text
+    assert "Update defaults.reaper_ttl_s to at least 86400" in caplog.text
 
 
 def test_reaper_ttl_constraint_is_stated_once() -> None:
     import inspect
 
+    from mimir.worklink.backends.registry import minimum_reaper_ttl_s
+
+    floor_source = inspect.getsource(minimum_reaper_ttl_s)
     validation_source = inspect.getsource(WorklinkDefaults.validate)
     reaper_source = inspect.getsource(autonomy.reap_stale_claims_for_home)
-    assert (validation_source + reaper_source).count("2 * max") == 1
+    assert (floor_source + validation_source + reaper_source).count("2 * max") == 1
 
 
 def test_config_load_validates_the_complete_defaults_object(
@@ -745,29 +743,6 @@ def test_config_load_validates_the_complete_defaults_object(
     assert config.defaults.max_concurrent == 7
     assert config.defaults.timeout_s == 1800
     assert config.defaults.reaper_ttl_s == 3600
-
-
-def test_reaper_config_violation_is_visible_in_worklink_events(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    from mimir.event_logger import _reset_logger_for_tests, init_logger
-
-    monkeypatch.setenv("MIMIR_FACTORY_RUN_TIMEOUT_S", "1800")
-    _write_worklink_yaml(tmp_path, timeout_s=1800, reaper_ttl_s=3599)
-    events_path = tmp_path / "logs" / "events.jsonl"
-    claims = SimpleNamespace(reap_home=lambda *, ttl: [])
-    _reset_logger_for_tests()
-    init_logger(events_path, session_id="worklink-reaper-test")
-    try:
-        autonomy.reap_stale_claims_for_home(tmp_path, claims=claims)
-    finally:
-        _reset_logger_for_tests()
-
-    event = json.loads(events_path.read_text(encoding="utf-8"))
-    assert event["type"] == "worklink_reaper_misconfigured"
-    assert event["configured_reaper_ttl_s"] == 3599
-    assert event["required_reaper_ttl_s"] == 3600
-    assert event["action"] == "using_required_ttl"
 
 
 # ── worklink_run tool: arbiter shed (TIGHT) + cap + dispatch ────────

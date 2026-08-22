@@ -44,6 +44,12 @@ def factory_run_timeout_s() -> float:
     except ValueError:
         return DEFAULT_FACTORY_RUN_TIMEOUT_S
 
+
+def minimum_reaper_ttl_s(timeout_s: int) -> int:
+    """Return the floor that keeps the reaper behind every live Worklink run."""
+    return 2 * max(timeout_s, math.ceil(factory_run_timeout_s()))
+
+
 DEFAULT_HIGH_RISK_SCOPE_PATTERNS: tuple[str, ...] = (
     "**/migrations/**",
     "**/*migration*",
@@ -149,15 +155,15 @@ class WorklinkDefaults:
 
     def validate(self) -> None:
         """Validate all cross-field constraints for Worklink defaults."""
-        min_reaper_ttl_s = 2 * max(self.timeout_s, math.ceil(factory_run_timeout_s()))
-        if self.reaper_ttl_s < min_reaper_ttl_s:
+        required_reaper_ttl_s = minimum_reaper_ttl_s(self.timeout_s)
+        if self.reaper_ttl_s < required_reaper_ttl_s:
             raise WorklinkDefaultsValidationError(
                 "worklink reaper_ttl_s must be at least 2 * the greater of timeout_s "
                 "and the factory run timeout so the TTL reaper cannot steal a live "
-                "worker",
+                f"worker (configured {self.reaper_ttl_s}; required {required_reaper_ttl_s})",
                 field="reaper_ttl_s",
                 configured_value=self.reaper_ttl_s,
-                required_value=min_reaper_ttl_s,
+                required_value=required_reaper_ttl_s,
             )
 
 
@@ -218,9 +224,26 @@ class WorklinkConfig:
             raise ValueError("worklink category defaults must be a mapping")
         default_values = WorklinkDefaults()
         backend_name = str(defaults_data.get("backend", default_values.backend))
+        timeout_s = int(defaults_data.get("timeout_s", default_values.timeout_s))
+        configured_reaper_ttl_s = _positive_int(
+            defaults_data.get("reaper_ttl_s"),
+            default=WorklinkDefaults.reaper_ttl_s,
+        )
+        required_reaper_ttl_s = minimum_reaper_ttl_s(timeout_s)
+        reaper_ttl_s = max(configured_reaper_ttl_s, required_reaper_ttl_s)
+        if configured_reaper_ttl_s < required_reaper_ttl_s:
+            log.warning(
+                "Worklink config %s sets defaults.reaper_ttl_s=%s below the safe floor %s; "
+                "using %s for compatibility. Update defaults.reaper_ttl_s to at least %s.",
+                path,
+                configured_reaper_ttl_s,
+                required_reaper_ttl_s,
+                required_reaper_ttl_s,
+                required_reaper_ttl_s,
+            )
         defaults = WorklinkDefaults(
             backend=backend_name,
-            timeout_s=int(defaults_data.get("timeout_s", default_values.timeout_s)),
+            timeout_s=timeout_s,
             priority=str(defaults_data.get("priority", default_values.priority)),
             test_command=str(
                 defaults_data.get("test_command", default_values.test_command)
@@ -242,10 +265,7 @@ class WorklinkConfig:
                 defaults_data.get("max_concurrent"),
                 default=WorklinkDefaults.max_concurrent,
             ),
-            reaper_ttl_s=_positive_int(
-                defaults_data.get("reaper_ttl_s"),
-                default=WorklinkDefaults.reaper_ttl_s,
-            ),
+            reaper_ttl_s=reaper_ttl_s,
             allow_autonomous_local_subprocess=_coerce_safety_bool(
                 defaults_data.get("allow_autonomous_local_subprocess", False)
             ),

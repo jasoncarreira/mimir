@@ -198,6 +198,7 @@ def test_reaper_ttl_covers_factory_run_timeout(monkeypatch: pytest.MonkeyPatch) 
 
     assert excinfo.value.configured_value == 10001
     assert excinfo.value.required_value == 10002
+    assert "configured 10001; required 10002" in str(excinfo.value)
     assert WorklinkDefaults(timeout_s=1800, reaper_ttl_s=10002).reaper_ttl_s == 10002
 
 
