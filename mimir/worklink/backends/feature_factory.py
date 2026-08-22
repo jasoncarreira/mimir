@@ -13,8 +13,10 @@ import tempfile
 import threading
 from typing import Any, Callable, ClassVar, Mapping, Sequence
 
+from ...opencode_config import OpenCodeConfigError
 from ..compute import ComputeResult, WorkSpec
 from .base import Caps, CheckoutShape, RawResult, WorkOrder
+from .opencode import resolve_worklink_opencode_invocation
 
 
 FACTORY_VERSION = "0.7.2"
@@ -566,7 +568,14 @@ class FeatureFactoryBackend:
         branch: str,
         test_command: str,
     ) -> WorkSpec:
-        command = self.opencode_argv(order.checkout, order.issue_id)
+        try:
+            resolution = resolve_worklink_opencode_invocation(order.env)
+        except OpenCodeConfigError as exc:
+            raise FactoryContractError(
+                f"feature_factory_opencode_resolution_failed:{exc.reason_code}"
+            ) from exc
+        invocation = resolution.invocation
+        command = self.opencode_argv(order.checkout, order.issue_id, invocation.model)
         return WorkSpec(
             issue_id=order.issue_id,
             attempt=attempt,
@@ -579,13 +588,21 @@ class FeatureFactoryBackend:
             backend=self.name,
             timeout_s=order.timeout_s,
             env=order.env,
-            backend_config={"entrypoint": str(self.entrypoint)},
+            backend_config={
+                "entrypoint": str(self.entrypoint),
+                "model": invocation.model,
+                "configured_model": resolution.configured_model,
+                "model_diverged": resolution.model_diverged,
+                "model_source": invocation.model_source,
+            },
             local_checkout=order.checkout,
             local_argv=command,
         )
 
     @staticmethod
-    def opencode_argv(operator_checkout: Path, issue_number: int) -> tuple[str, ...]:
+    def opencode_argv(
+        operator_checkout: Path, issue_number: int, model: str
+    ) -> tuple[str, ...]:
         retries = _factory_max_retries()
         # feature-factory 0.7.2 stages the workflow inside the run directory, so
         # OpenCode --auto must not bypass it.
@@ -595,6 +612,8 @@ class FeatureFactoryBackend:
             "--log-level",
             "DEBUG",
             "--print-logs",
+            "-m",
+            model,
             "--dir",
             str(operator_checkout),
             "--command",

@@ -483,6 +483,16 @@ def test_opencode_launch_argv_has_exact_staged_factory_payload(
     configured: str | None,
     expected: int,
 ) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
+    monkeypatch.delenv("XDG_DATA_HOME", raising=False)
+    monkeypatch.setenv("MIMIR_MODEL_SPEC", "codex-plus:gpt-5.6-luna")
+    auth = tmp_path / ".local" / "share" / "opencode" / "auth.json"
+    auth.parent.mkdir(parents=True)
+    auth.write_text(
+        json.dumps({"openai": {"type": "oauth", "refresh": "subscription"}}),
+        encoding="utf-8",
+    )
     if configured is None:
         monkeypatch.delenv("MIMIR_FACTORY_MAX_RETRIES", raising=False)
     else:
@@ -509,6 +519,8 @@ def test_opencode_launch_argv_has_exact_staged_factory_payload(
         "--log-level",
         "DEBUG",
         "--print-logs",
+        "-m",
+        "openai/gpt-5.6-luna",
         "--dir",
         str(tmp_path),
         "--command",
@@ -520,7 +532,35 @@ def test_opencode_launch_argv_has_exact_staged_factory_payload(
     assert "--autonomous" in payload.split()
     assert "--auto" not in payload.split()
     assert "--base" not in payload.split()
+    assert spec.backend_config["model"] == "openai/gpt-5.6-luna"
+    assert spec.backend_config["model_diverged"] is False
     assert epic_run_id(1551) == "1551"
+
+
+def test_opencode_launch_refuses_unresolvable_model_before_launch(
+    tmp_path: Path,
+) -> None:
+    order = WorkOrder(
+        issue_id=1551,
+        checkout=tmp_path,
+        prompt="ignored",
+        rules=None,
+        timeout_s=43200,
+        env={"MIMIR_MODEL_SPEC": ""},
+    )
+
+    with pytest.raises(
+        FactoryContractError,
+        match="^feature_factory_opencode_resolution_failed:config_provider_selection$",
+    ):
+        FeatureFactoryBackend(entrypoint="/absolute/factory.js").work_spec(
+            order,
+            attempt=1,
+            repo_url="https://github.com/owner/repo.git",
+            base_ref="main",
+            branch="epic/1551",
+            test_command="uv run pytest -q",
+        )
 
 
 def test_controls_are_absolute_run_id_first_and_resume_reads_status(tmp_path: Path) -> None:
