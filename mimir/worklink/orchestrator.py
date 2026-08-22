@@ -80,6 +80,24 @@ _PR_BODY_SECTION_FILE = ".worklink-pr-body.md"
 _PR_BODY_SECTION_MAX_BYTES = 4000
 _PR_BODY_SECTION_TRUNCATED = "\n\n[Build summary truncated by Worklink.]"
 _EVIDENCE_HEADING_RE = re.compile(r"(?im)^Worklink evidence:\s*$")
+# GitHub's documented closing-keyword set:
+# https://docs.github.com/en/issues/tracking-your-work-with-issues/using-issues/linking-a-pull-request-to-an-issue
+_GITHUB_CLOSING_KEYWORDS = (
+    "close",
+    "closes",
+    "closed",
+    "fix",
+    "fixes",
+    "fixed",
+    "resolve",
+    "resolves",
+    "resolved",
+)
+_GITHUB_BARE_CLOSING_REFERENCE_RE = re.compile(
+    rf"(?P<keyword>\b(?:{'|'.join(_GITHUB_CLOSING_KEYWORDS)}))"
+    r"(?P<separator>\s*:\s*|\s+)#(?P<number>[0-9]+)\b",
+    re.IGNORECASE,
+)
 _FACTORY_STARTUP_STATUS_TIMEOUT_S = 30.0
 _FACTORY_PUBLISHING_IDENTITY_ENV = "MIMIR_FACTORY_PUBLISHING_IDENTITY"
 _WORK_ITEM_RUN_ID_RE = re.compile(r"^[a-z0-9](?:[a-z0-9._-]*[a-z0-9])?$")
@@ -103,9 +121,21 @@ def _epic_stale_heartbeat_s() -> float:
 
 def _epic_prompt(issue: "IssueContext") -> str:
     header = f"Build chainlink #{issue.issue_id}: {issue.title}".strip()
-    body = issue.description.strip()
+    body = _render_chainlink_text(issue.description.strip())
     base = f"{header}\n\n{body}".strip() if body else header
     return base
+
+
+def _render_chainlink_text(text: str) -> str:
+    """Give ambiguous bare closing references their originating namespace.
+
+    A bare ``#N`` cannot say whether its author meant Chainlink or GitHub. Text
+    rendered from a Chainlink work item defaults to Chainlink; an intentional
+    GitHub reference remains expressible as GitHub's explicit ``owner/repo#N``.
+    """
+    return _GITHUB_BARE_CLOSING_REFERENCE_RE.sub(
+        r"\g<keyword>\g<separator>chainlink #\g<number>", text
+    )
 
 
 @dataclass(frozen=True)
@@ -416,7 +446,7 @@ def render_work_order(
     return template.format(
         issue_id=issue.issue_id,
         title=issue.title,
-        description=issue.description.strip(),
+        description=_render_chainlink_text(issue.description.strip()),
         labels=", ".join(sorted(issue.labels)) or "(none)",
         parent_id=issue.parent_id if issue.parent_id is not None else "(none)",
         backend=backend_name,
@@ -3110,6 +3140,7 @@ def _read_pr_body_section(checkout: Path) -> str | None:
     text = redact_text(text).strip()
     # A build-authored lookalike must not precede the canonical parser anchor.
     text = _EVIDENCE_HEADING_RE.sub("[Build-authored evidence heading removed]", text)
+    text = _render_chainlink_text(text)
     encoded = text.encode("utf-8")
     truncated = len(raw) > _PR_BODY_SECTION_MAX_BYTES or len(encoded) > _PR_BODY_SECTION_MAX_BYTES
     if truncated:
