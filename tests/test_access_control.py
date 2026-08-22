@@ -8892,11 +8892,11 @@ def test_repo_review_shell_profile_denies_destructive_or_unbounded_commands(
         ("gh issue list --state open --label security", "gh"),
         ("gh issue view 922 --comments", "gh"),
         ("ls -la", "ls"),
-        ("grep -n needle sample.txt", "grep"),
-        ("wc -l sample.txt", "wc"),
+        ("grep -n needle state/sample.txt", "grep"),
+        ("wc -l state/sample.txt", "wc"),
         ("pwd -P", "pwd"),
-        ("jq -r .name sample.json", "jq"),
-        ("rg --no-config -n needle .", "rg"),
+        ("jq -r .name state/sample.json", "jq"),
+        ("rg --no-config -n needle state", "rg"),
         (
             "/usr/local/bin/chainlink issue list --status all "
             "--label worklink:ready --json",
@@ -8921,6 +8921,9 @@ def test_maintenance_shell_profile_admits_prompt_inspection_commands(
 
     home = tmp_path / "home"
     home.mkdir()
+    (home / "state").mkdir()
+    (home / "state" / "sample.txt").write_text("needle\n", encoding="utf-8")
+    (home / "state" / "sample.json").write_text('{"name": "sample"}\n', encoding="utf-8")
     subprocess.run(["git", "init", "-q", str(home)], check=True)
     monkeypatch.setenv("MIMIR_HOME", str(home))
     assert maintenance_pinned_executables[command_key].exists()
@@ -8941,6 +8944,201 @@ def test_maintenance_shell_profile_admits_prompt_inspection_commands(
         "bash_async", "shell_profile", "maintenance",
     )
     assert decision.allowed is True, decision.reason
+
+
+@pytest.mark.parametrize(
+    ("profile", "canonical", "trigger", "authority_profile"),
+    [
+        ("scheduler_read_only", "scheduler:test", "scheduled_tick", "custom"),
+        ("maintenance", "heartbeat", "scheduled_tick", "heartbeat"),
+        ("repo_review", "poller:github-activity", "poller", "github"),
+    ],
+)
+def test_service_shell_profiles_refuse_credential_file_operands(
+    profile: str,
+    canonical: str,
+    trigger: str,
+    authority_profile: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / "home"
+    root = tmp_path / "checkout"
+    home.mkdir()
+    root.mkdir()
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    credential = root / ".env"
+    credential.write_text("GITHUB_TOKEN=ghp_" + "a" * 36 + "\n", encoding="utf-8")
+    service = replace(
+        build_trigger_service_principal(
+            canonical=canonical,
+            trigger=trigger,
+            profile=authority_profile,
+            tier=CapabilityTier.CODE_EXECUTION,
+            capabilities=("shell_exec", "bash_jobs_list", "bash_job_output"),
+            creation_path="test",
+        ),
+        filesystem_read_roots=(str(root.resolve()),),
+    )
+    review_state = (
+        _review_state("o/r", 1352, "worklink/1352", str(root.resolve()))
+        if profile == "repo_review"
+        else None
+    )
+    auth = _service_auth(
+        service, InformationFlowLabels(), repo_review_state=review_state,
+    )
+
+    decision = ToolRegistry().authorize_tool(
+        "shell_exec",
+        auth,
+        enforce=True,
+        target_channel=f"grep -n TOKEN -- {credential}",
+    )
+
+    assert service.sink_policy_for("shell_exec") == ServiceSinkPolicy(
+        "shell_exec", "shell_profile", profile,
+    )
+    assert decision.allowed is False
+    assert decision.reason == "service_sink_destination_denied"
+    assert decision.refusal_detail is not None
+    assert "protected-read policy" in decision.refusal_detail
+
+
+def test_service_shell_refuses_whole_argv_when_any_read_operand_is_unsafe(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / "home"
+    root = tmp_path / "read-root"
+    home.mkdir()
+    root.mkdir()
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    safe = root / "notes.txt"
+    secret = root / "ordinary-name.txt"
+    safe.write_text("ordinary text\n", encoding="utf-8")
+    secret.write_text("AKIA" + "A" * 16 + "\n", encoding="utf-8")
+    service = replace(
+        build_trigger_service_principal(
+            canonical="scheduler:test",
+            trigger="scheduled_tick",
+            profile="custom",
+            tier=CapabilityTier.CODE_EXECUTION,
+            capabilities=("shell_exec", "bash_jobs_list", "bash_job_output"),
+            creation_path="test",
+        ),
+        filesystem_read_roots=(str(root.resolve()),),
+    )
+
+    decision = ToolRegistry().authorize_tool(
+        "shell_exec",
+        _service_auth(service, InformationFlowLabels()),
+        enforce=True,
+        target_channel=f"wc -l -- {safe} {secret}",
+    )
+
+    assert decision.allowed is False
+    assert decision.reason == "service_sink_destination_denied"
+
+
+def test_service_shell_refuses_read_operand_outside_principal_roots(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / "home"
+    root = tmp_path / "read-root"
+    home.mkdir()
+    root.mkdir()
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    outside = tmp_path / "outside.txt"
+    outside.write_text("ordinary text\n", encoding="utf-8")
+    service = replace(
+        build_trigger_service_principal(
+            canonical="scheduler:test",
+            trigger="scheduled_tick",
+            profile="custom",
+            tier=CapabilityTier.CODE_EXECUTION,
+            capabilities=("shell_exec", "bash_jobs_list", "bash_job_output"),
+            creation_path="test",
+        ),
+        filesystem_read_roots=(str(root.resolve()),),
+    )
+
+    decision = ToolRegistry().authorize_tool(
+        "shell_exec",
+        _service_auth(service, InformationFlowLabels()),
+        enforce=True,
+        target_channel=f"wc -l -- {outside}",
+    )
+
+    assert decision.allowed is False
+    assert decision.reason == "service_sink_destination_denied"
+
+
+@pytest.mark.parametrize(
+    ("command", "expected"),
+    [
+        ("head -n 5 -- notes.txt", ("notes.txt",)),
+        ("head -n5 notes.txt", ("notes.txt",)),
+        ("stat -c %n -- notes.txt", ("notes.txt",)),
+        ("grep --include=*.py -- -needle src", ("src",)),
+        ("rg --no-config -g *.py needle -- src", ("src",)),
+        ("rg --no-config --glob=*.py needle src", ("src",)),
+    ],
+)
+def test_service_shell_read_operand_parser_distinguishes_option_values(
+    command: str, expected: tuple[str, ...],
+) -> None:
+    assert access_control._shell_read_path_operands(shlex.split(command)) == expected
+
+
+@pytest.mark.parametrize(
+    ("authority_profile", "command"),
+    [
+        ("custom", "grep -n needle -- {path}"),
+        ("heartbeat", "head -n 1 -- {path}"),
+        ("github", "rg --no-config -g '*.txt' needle -- {path}"),
+    ],
+)
+def test_service_shell_profiles_keep_legitimate_scoped_reads(
+    authority_profile: str,
+    command: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / "home"
+    root = tmp_path / "checkout"
+    home.mkdir()
+    root.mkdir()
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    sample = root / "notes.txt"
+    sample.write_text("needle\n", encoding="utf-8")
+    canonical = "poller:github-activity" if authority_profile == "github" else "scheduler:test"
+    service = replace(
+        build_trigger_service_principal(
+            canonical=canonical,
+            trigger="poller" if authority_profile == "github" else "scheduled_tick",
+            profile=authority_profile,
+            tier=CapabilityTier.CODE_EXECUTION,
+            capabilities=("shell_exec", "bash_jobs_list", "bash_job_output"),
+            creation_path="test",
+        ),
+        filesystem_read_roots=(str(root.resolve()),),
+    )
+    review_state = (
+        _review_state("o/r", 1352, "worklink/1352", str(root.resolve()))
+        if authority_profile == "github"
+        else None
+    )
+
+    decision = ToolRegistry().authorize_tool(
+        "shell_exec",
+        _service_auth(
+            service, InformationFlowLabels(), repo_review_state=review_state,
+        ),
+        enforce=True,
+        target_channel=command.format(path=sample),
+    )
+
+    assert decision.allowed is True, decision.refusal_detail
 
 
 @pytest.mark.parametrize(

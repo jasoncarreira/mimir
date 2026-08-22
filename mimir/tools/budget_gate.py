@@ -749,6 +749,8 @@ def _request_for_authorized_execution(
             policy.destination,
             review_state=review_state,
             declared=getattr(service, "declared_shell_commands", ()) or (),
+            service=service,
+            auth_context=auth_context,
         )
         if state_refusal is not None:
             argv = None
@@ -758,6 +760,8 @@ def _request_for_authorized_execution(
         argv, refusal, binding_rule = parse_service_shell_argv_with_diagnostics(
             target, policy.destination,
             declared=getattr(service, "declared_shell_commands", ()) or (),
+            service=service,
+            auth_context=auth_context,
         )
     if argv is None:
         refused_argv, argv_truncated = service_shell_argv_for_log(target)
@@ -831,6 +835,26 @@ def _request_for_authorized_execution(
         return sanitized_request.override(
             tool_call={**request.tool_call, "args": args}
         )
+    confined_argv, confinement_refusal, confinement_rule = (
+        parse_service_shell_argv_with_diagnostics(
+            target,
+            policy.destination,
+            review_state=review_state if policy.destination == "repo_review" else None,
+            declared=getattr(service, "declared_shell_commands", ()) or (),
+            service=service,
+            auth_context=auth_context,
+            read_cwd=resolved_cwd,
+        )
+    )
+    if confined_argv is None:
+        args["mimir_shell_refusal"] = (
+            f"{tool_name} was refused before execution: {confinement_refusal} "
+            f"binding_rule={confinement_rule.value if confinement_rule is not None else 'unknown'}"
+        )
+        return sanitized_request.override(
+            tool_call={**request.tool_call, "args": args}
+        )
+    argv = confined_argv
     if resolved_cwd is not None:
         args["cwd"] = resolved_cwd
     args["mimir_direct_argv"] = argv
