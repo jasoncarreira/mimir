@@ -1952,14 +1952,28 @@ def _require_factory_status(
         raise WorklinkError("factory status is invalid")
     if status.run_id != record.run_id:
         raise WorklinkError("factory status run id mismatch")
+    if status.issue_key is None:
+        raise WorklinkError("factory status issue key is missing")
     if status.issue_key != str(record.issue_id):
         raise WorklinkError("factory status issue key mismatch")
     if status.sandbox_path != record.sandbox:
         raise WorklinkError("factory status sandbox mismatch")
+    if status.status is None:
+        raise WorklinkError("factory status is missing lifecycle status")
+    if status.mode is None:
+        raise WorklinkError("factory status mode is missing")
     if status.mode != "autonomous":
         raise WorklinkError("factory status mode mismatch")
+    if status.branch is None:
+        raise WorklinkError("factory status branch is missing")
     if status.branch != record.branch:
         raise WorklinkError("factory status branch mismatch")
+    if status.pr_draft is None:
+        raise WorklinkError("factory status PR draft state is missing")
+    if status.lock is None:
+        raise WorklinkError("factory status lock state is missing")
+    if status.dead_lock is None:
+        raise WorklinkError("factory status dead-lock state is missing")
     if status.pr_base is not None and status.pr_base != record.base_ref:
         raise WorklinkError("factory status base mismatch")
     if require_pr_base and status.pr_base is None:

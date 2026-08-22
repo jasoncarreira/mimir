@@ -75,23 +75,23 @@ class FactoryContractError(RuntimeError):
 @dataclass(frozen=True)
 class FactoryStatus:
     run_id: str
-    issue_key: str | None
     valid: bool
     sandbox_path: str
-    status: str
-    mode: str
-    branch: str
-    pr_base: str | None
-    pr_draft: bool
-    lock: str
-    dead_lock: bool
-    lock_session: str | None
-    gates: dict[str, Any]
-    steps: tuple[str, ...]
-    slices: tuple[str, ...]
-    validator: dict[str, Any] | None
-    pr_url: str | None
-    terminal_result: dict[str, Any] | None
+    issue_key: str | None = None
+    status: str | None = None
+    mode: str | None = None
+    branch: str | None = None
+    pr_base: str | None = None
+    pr_draft: bool | None = None
+    lock: str | None = None
+    dead_lock: bool | None = None
+    lock_session: str | None = None
+    gates: dict[str, Any] | None = None
+    steps: tuple[str, ...] | None = None
+    slices: tuple[str, ...] | None = None
+    validator: dict[str, Any] | None = None
+    pr_url: str | None = None
+    terminal_result: dict[str, Any] | None = None
     next: str | None = None
     next_present: bool = False
 
@@ -127,8 +127,8 @@ class FactoryStatus:
             "dead_lock": self.dead_lock,
             "lock_session": self.lock_session,
             "gates": self.gates,
-            "steps": list(self.steps),
-            "slices": list(self.slices),
+            "steps": list(self.steps) if self.steps is not None else None,
+            "slices": list(self.slices) if self.slices is not None else None,
             "validator": self.validator,
             "pr_url": self.pr_url,
             "terminal_result": self.terminal_result,
@@ -141,23 +141,8 @@ class FactoryStatus:
 _REQUIRED_STATUS_FIELDS = frozenset(
     {
         "run_id",
-        "issue_key",
         "valid",
         "sandbox_path",
-        "status",
-        "mode",
-        "branch",
-        "pr_base",
-        "pr_draft",
-        "lock",
-        "dead_lock",
-        "lock_session",
-        "gates",
-        "steps",
-        "slices",
-        "validator",
-        "pr_url",
-        "terminal_result",
     }
 )
 
@@ -173,7 +158,9 @@ def _bounded_text(value: object, name: str, *, nullable: bool = False) -> str | 
     return text
 
 
-def _bool(value: object, name: str) -> bool:
+def _bool(value: object, name: str, *, nullable: bool = False) -> bool | None:
+    if value is None and nullable:
+        return None
     if not isinstance(value, bool):
         raise FactoryContractError(f"factory status {name} must be a boolean")
     return value
@@ -199,7 +186,11 @@ def _opaque_dict(value: object, name: str, *, nullable: bool = False) -> dict[st
     return dict(value)
 
 
-def _compact_strings(value: object, name: str) -> tuple[str, ...]:
+def _compact_strings(
+    value: object, name: str, *, nullable: bool = False
+) -> tuple[str, ...] | None:
+    if value is None and nullable:
+        return None
     if not isinstance(value, list) or len(value) > _MAX_LIST_ITEMS:
         raise FactoryContractError(f"factory status {name} must be a bounded string list")
     result: list[str] = []
@@ -266,31 +257,31 @@ def parse_factory_status(payload: bytes | str | Mapping[str, Any]) -> FactorySta
     missing = _REQUIRED_STATUS_FIELDS - keys
     if missing:
         raise FactoryContractError(f"factory status missing field: {sorted(missing)[0]}")
-    lock = _bounded_text(decoded["lock"], "lock")
-    if lock not in {"fresh", "stale", "absent"}:
+    lock = _bounded_text(decoded.get("lock"), "lock", nullable=True)
+    if lock is not None and lock not in {"fresh", "stale", "absent"}:
         raise FactoryContractError("factory status lock must be fresh, stale, or absent")
     next_present = "next" in decoded
     next_value = _bounded_text(decoded.get("next"), "next", nullable=True) if next_present else None
     return FactoryStatus(
         run_id=_bounded_text(decoded["run_id"], "run_id") or "",
-        issue_key=_bounded_text(decoded["issue_key"], "issue_key", nullable=True),
         valid=_bool(decoded["valid"], "valid"),
         sandbox_path=_bounded_text(decoded["sandbox_path"], "sandbox_path") or "",
-        status=_bounded_text(decoded["status"], "status") or "",
-        mode=_bounded_text(decoded["mode"], "mode") or "",
-        branch=_bounded_text(decoded["branch"], "branch") or "",
-        pr_base=_bounded_text(decoded["pr_base"], "pr_base", nullable=True),
-        pr_draft=_bool(decoded["pr_draft"], "pr_draft"),
+        issue_key=_bounded_text(decoded.get("issue_key"), "issue_key", nullable=True),
+        status=_bounded_text(decoded.get("status"), "status", nullable=True),
+        mode=_bounded_text(decoded.get("mode"), "mode", nullable=True),
+        branch=_bounded_text(decoded.get("branch"), "branch", nullable=True),
+        pr_base=_bounded_text(decoded.get("pr_base"), "pr_base", nullable=True),
+        pr_draft=_bool(decoded.get("pr_draft"), "pr_draft", nullable=True),
         lock=lock,
-        dead_lock=_bool(decoded["dead_lock"], "dead_lock"),
-        lock_session=_bounded_text(decoded["lock_session"], "lock_session", nullable=True),
-        gates=_opaque_dict(decoded["gates"], "gates") or {},
-        steps=_compact_strings(decoded["steps"], "steps"),
-        slices=_compact_strings(decoded["slices"], "slices"),
-        validator=_opaque_dict(decoded["validator"], "validator", nullable=True),
-        pr_url=_bounded_text(decoded["pr_url"], "pr_url", nullable=True),
+        dead_lock=_bool(decoded.get("dead_lock"), "dead_lock", nullable=True),
+        lock_session=_bounded_text(decoded.get("lock_session"), "lock_session", nullable=True),
+        gates=_opaque_dict(decoded.get("gates"), "gates", nullable=True),
+        steps=_compact_strings(decoded.get("steps"), "steps", nullable=True),
+        slices=_compact_strings(decoded.get("slices"), "slices", nullable=True),
+        validator=_opaque_dict(decoded.get("validator"), "validator", nullable=True),
+        pr_url=_bounded_text(decoded.get("pr_url"), "pr_url", nullable=True),
         terminal_result=_opaque_dict(
-            decoded["terminal_result"], "terminal_result", nullable=True
+            decoded.get("terminal_result"), "terminal_result", nullable=True
         ),
         next=next_value,
         next_present=next_present,

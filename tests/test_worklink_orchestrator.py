@@ -2860,6 +2860,62 @@ def test_factory_status_binding_rejects_populated_base_mismatch(tmp_path: Path) 
         orchestrator._require_factory_status(status, record)
 
 
+@pytest.mark.parametrize(
+    ("field", "reason"),
+    [
+        ("issue_key", "issue key is missing"),
+        ("status", "missing lifecycle status"),
+        ("mode", "mode is missing"),
+        ("branch", "branch is missing"),
+        ("pr_draft", "PR draft state is missing"),
+        ("lock", "lock state is missing"),
+        ("dead_lock", "dead-lock state is missing"),
+    ],
+)
+def test_factory_status_binding_names_missing_consumed_lifecycle_field(
+    tmp_path: Path,
+    field: str,
+    reason: str,
+) -> None:
+    import mimir.worklink.orchestrator as orchestrator
+
+    sandbox = tmp_path / "sandbox"
+    sandbox.mkdir()
+    record = _factory_lifecycle_record(
+        sandbox,
+        LaunchHandle("local_subprocess", "123", 456),
+    )
+    status = replace(
+        _factory_lifecycle_status(sandbox, status="running"),
+        **{field: None},
+    )
+
+    with pytest.raises(orchestrator.WorklinkError, match=reason):
+        orchestrator._require_factory_status(status, record)
+
+
+def test_factory_status_binding_refuses_pre_manifest_diagnostic(tmp_path: Path) -> None:
+    import mimir.worklink.orchestrator as orchestrator
+
+    sandbox = tmp_path / "sandbox"
+    sandbox.mkdir()
+    record = _factory_lifecycle_record(
+        sandbox,
+        LaunchHandle("local_subprocess", "123", 456),
+    )
+    status = parse_factory_status(
+        {
+            "run_id": "700",
+            "valid": False,
+            "sandbox_path": str(sandbox),
+            "error": "run.json does not exist",
+        }
+    )
+
+    with pytest.raises(orchestrator.WorklinkError, match="factory status is invalid"):
+        orchestrator._require_factory_status(status, record)
+
+
 def test_factory_supervision_drains_exact_handle_while_status_is_polled(
     tmp_path: Path,
 ) -> None:
