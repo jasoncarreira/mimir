@@ -65,6 +65,7 @@ from ..repository_config import RepositoryInventory
 from ..secret_scan import secret_matches
 from .safe_git import ControllerGitPublication
 from .backends.feature_factory import FactoryStatus, FeatureFactoryBackend, epic_run_id
+from .backends.registry import factory_run_timeout_s
 from .backends.opencode import transcript_path, write_transcript
 from .factory_state import (
     FactoryRunRecord,
@@ -106,11 +107,7 @@ _WORK_ITEM_RUN_ID_RE = re.compile(r"^[a-z0-9](?:[a-z0-9._-]*[a-z0-9])?$")
 
 
 def _epic_run_timeout_s() -> float:
-    try:
-        value = float(os.environ.get("MIMIR_FACTORY_RUN_TIMEOUT_S", "43200"))
-        return value if value > 0 else 43200.0
-    except ValueError:
-        return 43200.0
+    return factory_run_timeout_s()
 
 
 def _epic_stale_heartbeat_s() -> float:
