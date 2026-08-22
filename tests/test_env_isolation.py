@@ -7,6 +7,9 @@ Two invariants live here, both prerequisites for running the suite with
    that loaded it (``tests/conftest.py::_isolate_process_env``).
 2. No test may be skipped *because* enforcement is on — otherwise the enforced
    CI job stays green while the paths it exists to cover quietly stop running.
+3. A host-only setting that overrides a value the suite asserts on must be
+   cleared for the session (``tests/conftest.py::_clear_host_mimir_environment``),
+   so the suite's result does not depend on the deployment it runs inside.
 """
 
 from __future__ import annotations
@@ -179,4 +182,43 @@ def test_longmemeval_memory_smoke_cases_are_collected():
         "LongMemEval via_memory collection changed:\n"
         f"missing: {sorted(_LONGMEMEVAL_NODE_IDS - collected)}\n"
         f"unexpected: {sorted(collected - _LONGMEMEVAL_NODE_IDS)}"
+    )
+
+
+# ── 3. host-only overrides must not change the suite's result ─────────
+
+_PUBLISHING_IDENTITY = "MIMIR_FACTORY_PUBLISHING_IDENTITY"
+_DECLARED_IDENTITY_TESTS = (
+    "tests/test_worklink_orchestrator.py"
+    "::test_factory_new_run_uses_resolved_base_for_single_checkout_placement"
+)
+
+
+def test_declared_publishing_identity_tests_ignore_the_host_override() -> None:
+    """The suite must pass with the deployment's publishing identity exported.
+
+    ``MIMIR_FACTORY_PUBLISHING_IDENTITY`` overrides the ``publishing_identity``
+    a checkout declares in ``.factory.json``. The tests that assert on the
+    declared value therefore read the deployment's value instead whenever it is
+    set, which is why this ran green in CI -- where it is unset -- and failed
+    inside mimirbot, where ``compose.env`` sets it. The worklink test gate went
+    red on every build, so ``review_ready`` stayed false and no build reached
+    the commit step or published a PR.
+
+    Asserting the variable is absent would only restate the fixture. Running the
+    affected tests in a child process with it *present* is the property that
+    actually matters, and it fails if the name is dropped from
+    ``_clear_host_mimir_environment``.
+    """
+    env = dict(os.environ)
+    env[_PUBLISHING_IDENTITY] = "deployment-owner"
+    completed = subprocess.run(
+        [sys.executable, "-m", "pytest", "-q", "-p", "no:randomly", _DECLARED_IDENTITY_TESTS],
+        capture_output=True,
+        cwd=Path(__file__).resolve().parent.parent,
+        env=env,
+    )
+    assert completed.returncode == 0, (
+        f"{_PUBLISHING_IDENTITY} leaked into the suite:\n"
+        f"{completed.stdout.decode(errors='replace')[-2000:]}"
     )
