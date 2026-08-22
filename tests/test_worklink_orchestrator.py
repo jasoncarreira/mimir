@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shlex
 import subprocess
 import sys
 import threading
@@ -836,6 +837,112 @@ def test_backend_failure_with_zero_exit_still_names_its_reason(tmp_path: Path) -
     assert evidence["tests"]["skipped_reason"] != (
         "executor exited nonzero before the test gate"
     )
+
+
+def test_zero_exit_executor_and_failed_gate_record_structured_reason_and_divergence(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression for #1330: the executor passes, but Worklink's gate fails."""
+    repo = tmp_path / "repo"
+    worktree = repo.parent / ".worklink" / repo.name / "441-1"
+    calls, base_runner = _orchestrator_runner(repo, worktree)
+    executor_report_dir = tmp_path / "executor-report"
+
+    def make_executor_report_dir(issue: int, attempt: int) -> Path:
+        executor_report_dir.mkdir()
+        return executor_report_dir
+
+    monkeypatch.setattr(
+        "mimir.worklink.orchestrator._make_executor_report_dir",
+        make_executor_report_dir,
+    )
+
+    def write_report(report_dir: Path, *, total: int, failed: tuple[str, ...]) -> None:
+        report_dir.mkdir(parents=True, exist_ok=True)
+        (report_dir / "junit.xml").write_text(
+            '<testsuites><testsuite tests="{}" failures="{}" errors="0" skipped="0" />'
+            "</testsuites>".format(total, len(failed)),
+            encoding="utf-8",
+        )
+        cache = report_dir / "cache" / "v" / "cache"
+        cache.mkdir(parents=True, exist_ok=True)
+        (cache / "lastfailed").write_text(
+            json.dumps({node_id: True for node_id in failed}),
+            encoding="utf-8",
+        )
+
+    class PassingExecutorBackend(FakeBackend):
+        async def interpret(self, order: WorkOrder, result: object) -> RawResult:
+            (order.checkout / "changed.txt").write_text("hello\n", encoding="utf-8")
+            write_report(
+                executor_report_dir,
+                total=9906,
+                failed=(),
+            )
+            return RawResult(0, order.transcript_root / "fake.json", "success", None)
+
+    failed_nodes = (
+        "tests/test_alpha.py::test_environment_boundary",
+        "tests/test_beta.py::test_gate_uses_clean_state",
+    )
+
+    def runner(
+        args: Sequence[str] | str,
+        *,
+        cwd: Path | None = None,
+        text: bool = True,
+    ) -> subprocess.CompletedProcess:
+        if isinstance(args, str) and args.endswith("pytest -q"):
+            assignment = shlex.split(args)[0]
+            addopts = shlex.split(assignment.partition("=")[2])
+            junit = Path(
+                next(
+                    option.split("=", 1)[1]
+                    for option in addopts
+                    if option.startswith("--junitxml=")
+                )
+            )
+            cache_dir = Path(
+                next(
+                    option.split("=", 1)[1]
+                    for option in addopts
+                    if option.startswith("cache_dir=")
+                )
+            )
+            write_report(junit.parent, total=9908, failed=failed_nodes)
+            assert cache_dir == junit.parent / "cache"
+            return cp(args, returncode=1, stdout="gate failed without prose identifiers\n")
+        return base_runner(args, cwd=cwd, text=text)
+
+    registry = BackendRegistry(WorklinkConfig())
+    registry.register(PassingExecutorBackend())
+
+    result = asyncio.run(
+        WorklinkRunner(home=tmp_path, repo=repo, runner=runner, registry=registry).run(
+            441, backend_name="fake", test_command="pytest -q"
+        )
+    )
+
+    assert result.status == "failed"
+    evidence = json.loads(
+        (tmp_path / "state" / "worklink" / "evidence" / "441-1.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert evidence["tests"]["failed_tests"] == list(failed_nodes)
+    assert evidence["tests"]["counts"] == {
+        "errors": 0,
+        "failed": 2,
+        "passed": 9906,
+        "skipped": 0,
+        "total": 9908,
+    }
+    assert evidence["executor_tests"]["counts"]["passed"] == 9906
+    assert evidence["gate_result_diverged"] is True
+    assert all(node_id in evidence["failure_reason"] for node_id in failed_nodes)
+    assert "2 failed" in evidence["failure_reason"]
+    assert "gate failed without prose identifiers" not in evidence["failure_reason"]
 
 
 def test_executor_crash_publishes_only_scrubbed_bounded_failure_reason(tmp_path: Path) -> None:

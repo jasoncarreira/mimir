@@ -2,12 +2,19 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 import asyncio
+import json
 import subprocess
 import pytest
 from pathlib import Path
 from typing import Sequence
 
-from mimir.worklink.evidence import TestResult, WorklinkEvidence, observe_evidence, validate_evidence
+from mimir.worklink.evidence import (
+    TestResult,
+    WorklinkEvidence,
+    observe_evidence,
+    read_pytest_result,
+    validate_evidence,
+)
 
 
 def base_evidence(**overrides: object) -> WorklinkEvidence:
@@ -171,6 +178,26 @@ def test_gate_test_summary_keeps_output_tail_not_head() -> None:
     assert len(summary) <= 6000
 
 
+def test_structured_pytest_failures_are_scrubbed_before_evidence(tmp_path: Path) -> None:
+    (tmp_path / "junit.xml").write_text(
+        '<testsuites><testsuite tests="1" failures="1" errors="0" skipped="0" />'
+        "</testsuites>",
+        encoding="utf-8",
+    )
+    cache = tmp_path / "cache" / "v" / "cache"
+    cache.mkdir(parents=True)
+    (cache / "lastfailed").write_text(
+        json.dumps({"tests/test_api.py::test_token[token=top-secret]": True}),
+        encoding="utf-8",
+    )
+
+    result = read_pytest_result("pytest -q", tmp_path)
+
+    assert result is not None
+    assert "top-secret" not in result.failed_tests[0]
+    assert "[REDACTED]" in result.failed_tests[0]
+
+
 def test_evidence_test_command_uses_bare_command_without_model_spec(
     monkeypatch,
 ) -> None:
@@ -202,6 +229,7 @@ def test_gate_command_not_found_is_not_tests_failed() -> None:
     assert result.review_ready is False
     assert "gate_command_not_found" in result.reasons
     assert "tests_failed" not in result.reasons
+    assert result.evidence.failure_reason == "test gate command was not found (exit 127)"
 
 
 def test_completed_requires_tests_or_skipped_reason() -> None:
