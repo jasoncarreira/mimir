@@ -24,7 +24,7 @@ import pytest
 
 from mimir.worklink import autonomy
 from mimir.worklink.claims import CLAIM_RESET_PREFIX, ChainlinkClaims, ClaimRecord
-from mimir.worklink.backends.registry import WorklinkDefaults
+from mimir.worklink.backends.registry import WorklinkConfig, WorklinkDefaults
 from mimir.worklink.dispatch_failures import (
     failure_state_transaction,
     load_failure_state,
@@ -567,18 +567,104 @@ def test_reap_for_home_uses_config_ttl(tmp_path: Path) -> None:
     assert [r.issue_id for r in reaped] == [60]
 
 
-def test_reap_for_home_refuses_ttl_not_greater_than_timeout(tmp_path: Path) -> None:
-    _write_worklink_yaml(tmp_path, timeout_s=7200, reaper_ttl_s=7200)
-    claims = ChainlinkClaims(agent_id="t", runner=FakeChainlink(in_progress=[60]))
-    with pytest.raises(RuntimeError, match="reaper_ttl_s must be greater"):
-        autonomy.reap_stale_claims_for_home(tmp_path, claims=claims)
+@pytest.mark.parametrize(
+    ("configured_ttl_s", "expected_ttl_s", "emits_violation"),
+    [
+        (3599, 3600, True),
+        (3600, 3600, False),
+        (3601, 3601, False),
+    ],
+)
+def test_reap_for_home_enforces_ttl_floor_boundary(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    configured_ttl_s: int,
+    expected_ttl_s: int,
+    emits_violation: bool,
+) -> None:
+    _write_worklink_yaml(
+        tmp_path, timeout_s=1800, reaper_ttl_s=configured_ttl_s
+    )
+    seen_ttls: list[timedelta] = []
+    events: list[tuple[str, dict[str, object]]] = []
+    claims = SimpleNamespace(
+        reap_home=lambda *, ttl: seen_ttls.append(ttl) or [],
+    )
+    monkeypatch.setattr(
+        autonomy,
+        "log_event_sync",
+        lambda event_type, **payload: events.append((event_type, payload)),
+    )
+
+    assert autonomy.reap_stale_claims_for_home(tmp_path, claims=claims) == []
+    assert seen_ttls == [timedelta(seconds=expected_ttl_s)]
+    assert bool(events) is emits_violation
+    if emits_violation:
+        assert events == [
+            (
+                "worklink_reaper_misconfigured",
+                {
+                    "configured_reaper_ttl_s": 3599,
+                    "required_reaper_ttl_s": 3600,
+                    "action": "using_required_ttl",
+                },
+            )
+        ]
 
 
-def test_reap_for_home_refuses_ttl_inside_finalize_window(tmp_path: Path) -> None:
-    _write_worklink_yaml(tmp_path, timeout_s=1800, reaper_ttl_s=1860)
-    claims = ChainlinkClaims(agent_id="t", runner=FakeChainlink(in_progress=[60]))
-    with pytest.raises(RuntimeError, match=r"2 \* timeout_s"):
+def test_invalid_reaper_ttl_is_rejected_when_config_is_loaded(tmp_path: Path) -> None:
+    _write_worklink_yaml(tmp_path, timeout_s=1800, reaper_ttl_s=3599)
+
+    with pytest.raises(ValueError, match=r"at least 2 \* timeout_s"):
+        WorklinkConfig.load(tmp_path / "worklink.yaml")
+
+
+def test_reaper_ttl_constraint_is_stated_once() -> None:
+    import inspect
+
+    validation_source = inspect.getsource(WorklinkDefaults.validate)
+    reaper_source = inspect.getsource(autonomy.reap_stale_claims_for_home)
+    assert (validation_source + reaper_source).count("timeout_s * 2") == 1
+
+
+def test_config_load_validates_the_complete_defaults_object(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _write_worklink_yaml(tmp_path, max_concurrent=7, timeout_s=1800, reaper_ttl_s=3600)
+    validated: list[WorklinkDefaults] = []
+    original_validate = WorklinkDefaults.validate
+
+    def capture(defaults: WorklinkDefaults) -> None:
+        validated.append(defaults)
+        original_validate(defaults)
+
+    monkeypatch.setattr(WorklinkDefaults, "validate", capture)
+    config = WorklinkConfig.load(tmp_path / "worklink.yaml")
+
+    assert config.defaults in validated
+    assert config.defaults.max_concurrent == 7
+    assert config.defaults.timeout_s == 1800
+    assert config.defaults.reaper_ttl_s == 3600
+
+
+def test_reaper_config_violation_is_visible_in_worklink_events(tmp_path: Path) -> None:
+    from mimir.event_logger import _reset_logger_for_tests, init_logger
+
+    _write_worklink_yaml(tmp_path, timeout_s=1800, reaper_ttl_s=3599)
+    events_path = tmp_path / "logs" / "events.jsonl"
+    claims = SimpleNamespace(reap_home=lambda *, ttl: [])
+    _reset_logger_for_tests()
+    init_logger(events_path, session_id="worklink-reaper-test")
+    try:
         autonomy.reap_stale_claims_for_home(tmp_path, claims=claims)
+    finally:
+        _reset_logger_for_tests()
+
+    event = json.loads(events_path.read_text(encoding="utf-8"))
+    assert event["type"] == "worklink_reaper_misconfigured"
+    assert event["configured_reaper_ttl_s"] == 3599
+    assert event["required_reaper_ttl_s"] == 3600
+    assert event["action"] == "using_required_ttl"
 
 
 # ── worklink_run tool: arbiter shed (TIGHT) + cap + dispatch ────────

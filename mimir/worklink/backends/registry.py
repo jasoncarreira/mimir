@@ -61,6 +61,23 @@ DEFAULT_HIGH_RISK_LABELS: tuple[str, ...] = (
 )
 
 
+class WorklinkDefaultsValidationError(ValueError):
+    """A cross-field ``WorklinkDefaults`` constraint was violated."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        field: str,
+        configured_value: int,
+        required_value: int,
+    ) -> None:
+        super().__init__(message)
+        self.field = field
+        self.configured_value = configured_value
+        self.required_value = required_value
+
+
 @dataclass(frozen=True)
 class TieredReviewConfig:
     # Default high-risk markers are ecosystem-agnostic glob patterns. A
@@ -117,6 +134,20 @@ class WorklinkDefaults:
     def __post_init__(self) -> None:
         if self.reviewer_backend is None:
             object.__setattr__(self, "reviewer_backend", self.backend)
+        self.validate()
+
+    def validate(self) -> None:
+        """Validate all cross-field constraints for Worklink defaults."""
+        min_reaper_ttl_s = self.timeout_s * 2
+        if self.reaper_ttl_s < min_reaper_ttl_s:
+            raise WorklinkDefaultsValidationError(
+                "worklink reaper_ttl_s must be at least 2 * timeout_s so the TTL "
+                "reaper cannot steal a worker that is still finalizing its remote "
+                "test job",
+                field="reaper_ttl_s",
+                configured_value=self.reaper_ttl_s,
+                required_value=min_reaper_ttl_s,
+            )
 
 
 @dataclass(frozen=True)
