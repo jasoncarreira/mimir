@@ -17,6 +17,19 @@ FACTORY_RECORD_VERSION = 1
 _MAX_RECORD_BYTES = 2 * 1024 * 1024
 
 
+def _valid_record_run_id(run_id: str) -> bool:
+    if run_id.isascii() and run_id.isdecimal():
+        return bool(run_id.strip("0"))
+    prefix = "chainlink-"
+    issue_id = run_id.removeprefix(prefix)
+    return (
+        run_id.startswith(prefix)
+        and issue_id.isascii()
+        and issue_id.isdecimal()
+        and issue_id[0] != "0"
+    )
+
+
 class FactoryRecordError(RuntimeError):
     pass
 
@@ -42,9 +55,10 @@ class FactoryRunRecord:
     def __post_init__(self) -> None:
         if self.version != FACTORY_RECORD_VERSION:
             raise FactoryRecordError("unsupported factory record version")
-        if not self.run_id.isascii() or not self.run_id.isdecimal() or int(self.run_id) <= 0:
-            raise FactoryRecordError("factory run id must be a positive decimal string")
-        if self.issue_id != int(self.run_id) or self.issue_id <= 0 or self.attempt <= 0:
+        if not _valid_record_run_id(self.run_id):
+            raise FactoryRecordError("factory run id is invalid")
+        expected_run_ids = {str(self.issue_id), f"chainlink-{self.issue_id}"}
+        if self.run_id not in expected_run_ids or self.issue_id <= 0 or self.attempt <= 0:
             raise FactoryRecordError("factory record identity is invalid")
         if not Path(self.launcher).is_absolute() or not Path(self.sandbox).is_absolute():
             raise FactoryRecordError("factory launcher and sandbox must be absolute")
@@ -62,7 +76,7 @@ class FactoryRunRecord:
             if (
                 self.status.run_id != self.run_id
                 or self.status.issue_key is None
-                or self.status.issue_key != str(self.issue_id)
+                or self.status.issue_key != self.run_id
             ):
                 raise FactoryRecordError("factory record status identity mismatch")
             if self.status.sandbox_path != self.sandbox:
@@ -179,8 +193,8 @@ def factory_records_dir(home: Path) -> Path:
 
 
 def factory_record_path(home: Path, run_id: str) -> Path:
-    if not run_id.isascii() or not run_id.isdecimal() or int(run_id) <= 0:
-        raise FactoryRecordError("factory run id must be a positive decimal string")
+    if not _valid_record_run_id(run_id):
+        raise FactoryRecordError("factory run id is invalid")
     return factory_records_dir(home) / f"{run_id}.json"
 
 
@@ -283,7 +297,7 @@ def list_factory_records(home: Path) -> list[FactoryRunRecord]:
         return []
     records: list[FactoryRunRecord] = []
     for path in sorted(directory.iterdir(), key=lambda item: item.name):
-        if not path.name.endswith(".json") or not path.stem.isdecimal():
+        if not path.name.endswith(".json") or not _valid_record_run_id(path.stem):
             continue
         records.append(load_factory_record(home, path.stem))
     return [record for record in records if record is not None]
