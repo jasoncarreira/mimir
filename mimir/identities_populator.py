@@ -55,6 +55,10 @@ log = logging.getLogger(__name__)
 PairingRequestStatus = Literal["changed", "unchanged", "capped"]
 
 
+class LastWebKeyError(ValueError):
+    """Raised when a protected revocation would remove the final web key."""
+
+
 # ---------------------------------------------------------------------------
 # YAML merge — the heart of the idempotency contract.
 # ---------------------------------------------------------------------------
@@ -251,11 +255,18 @@ def issue_web_key(
 
 
 @_serialized_identities_write
-def revoke_web_key(home: Path, canonical: str) -> bool:
+def revoke_web_key(
+    home: Path,
+    canonical: str,
+    *,
+    allow_last: bool = True,
+) -> bool:
     """Drop ``canonical``'s web key alias so the key stops resolving.
 
     Returns True if a key was removed, False if the person is unknown or had
-    none. Access roles are left intact (revoke a key ≠ deauthorize the person)."""
+    none. Access roles are left intact (revoke a key ≠ deauthorize the person).
+    When ``allow_last`` is false, removing the final web key is refused while
+    holding the identities write lock so concurrent revocations cannot race."""
     yaml_path = home / "state" / "identities.yaml"
     doc, header = _load_yaml(yaml_path)
     people = doc.get("people")
@@ -274,6 +285,18 @@ def revoke_web_key(home: Path, canonical: str) -> bool:
     ]
     if len(aliases) == before:
         return False
+    if not allow_last:
+        remaining = any(
+            isinstance(alias, str) and alias.startswith(WEB_KEY_ALIAS_PREFIX)
+            for person in people
+            if isinstance(person, dict)
+            for alias in (person.get("aliases") or [])
+            if isinstance(person.get("aliases"), list)
+        )
+        if not remaining:
+            raise LastWebKeyError(
+                "cannot revoke the last web key while MIMIR_API_KEY is unset"
+            )
     _atomic_write_identities(yaml_path, header, doc)
     try:
         log_event_sync("identity_web_key_revoked", canonical=canonical)
