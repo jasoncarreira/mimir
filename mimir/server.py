@@ -32,7 +32,7 @@ from .channel_registry import ChannelRegistry
 from .config import Config
 from .dispatcher import Dispatcher
 from .event_logger import init_logger, log_event, log_event_sync
-from .http_ingress import strip_bridge_authority_extra
+from .http_ingress import strip_bridge_authority_extra, strip_server_owned_extra
 from .models import AgentEvent, make_process_session_id
 from .access_control import builtin_trigger_service_principal, repo_binding_startup_alerts
 from .rate_limits import RateLimitStore
@@ -55,6 +55,11 @@ from .worklink.continuation import (
 from . import web_ui
 
 log = logging.getLogger(__name__)
+
+# Generic HTTP callers may submit user turns only. Internal trigger constructors
+# carry server-owned service authority; authenticated admins retain the legacy
+# arbitrary-trigger automation surface without receiving that authority.
+NON_ADMIN_HTTP_EVENT_TRIGGERS = frozenset({"user_message"})
 
 async def _start_mcp_servers(
     mcp_manager: Any,
@@ -455,8 +460,10 @@ async def _handle_event(request: web.Request) -> web.Response:
     # continuation hints, and bridge-owned authority metadata before constructing
     # the AgentEvent. Otherwise a client could forge privileged metadata or
     # declassify its synthesized durable outputs as public.
-    extra = strip_bridge_authority_extra(
-        strip_worklink_hint_extra(strip_chat_skill_extra(extra))
+    extra = strip_server_owned_extra(
+        strip_bridge_authority_extra(
+            strip_worklink_hint_extra(strip_chat_skill_extra(extra))
+        )
     )
     extra = stamp_http_event_ingress_extra(extra)
     attachment_names = body.get("attachment_names")
@@ -494,8 +501,25 @@ async def _handle_event(request: web.Request) -> web.Response:
         author_display = body.get("author_display")
         author_id = body.get("author_id")
 
+    trigger = body.get("trigger", "user_message")
+    if not isinstance(trigger, str) or not trigger:
+        return web.json_response(
+            {"error": "trigger must be a non-empty string"}, status=400,
+        )
+    if (
+        not request.get("auth_is_admin", False)
+        and trigger not in NON_ADMIN_HTTP_EVENT_TRIGGERS
+    ):
+        return web.json_response(
+            {
+                "error": "trigger not permitted for non-admin HTTP callers",
+                "allowed_triggers": sorted(NON_ADMIN_HTTP_EVENT_TRIGGERS),
+            },
+            status=403,
+        )
+
     event = AgentEvent(
-        trigger=body.get("trigger", "user_message"),
+        trigger=trigger,
         channel_id=channel_id,
         content=body.get("content", ""),
         author=author,
