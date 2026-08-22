@@ -11,7 +11,7 @@ opt-in gate that the rest of the executor already enforces.
 from __future__ import annotations
 
 import asyncio
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 import json
 import os
 import posixpath
@@ -64,6 +64,31 @@ class WorkSpec:
     backend_config: Mapping[str, Any] = field(default_factory=dict)
     local_checkout: Path | None = None
     local_argv: Sequence[str] | None = None
+
+
+def with_worker_environment(
+    spec: WorkSpec, additions: Mapping[str, str]
+) -> WorkSpec:
+    """Supply injected environment and request it from a closed worker together.
+
+    Specs without ``pass_env`` use the legacy direct environment unchanged. For a
+    closed worker, deriving requested names here means every future injection made
+    through this boundary automatically participates in the worker contract.
+    """
+    if not additions:
+        return spec
+    env = {**spec.env, **additions}
+    if "pass_env" not in spec.backend_config:
+        return replace(spec, env=env)
+    requested = spec.backend_config["pass_env"]
+    if isinstance(requested, (str, bytes)) or not isinstance(requested, Sequence):
+        raise ComputeLaunchError("worker pass_env must be a sequence")
+    pass_env = tuple(dict.fromkeys((*requested, *additions)))
+    return replace(
+        spec,
+        env=env,
+        backend_config={**spec.backend_config, "pass_env": pass_env},
+    )
 
 
 @dataclass(frozen=True)
