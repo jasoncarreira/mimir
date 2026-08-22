@@ -38,6 +38,7 @@ from mimir.worklink.orchestrator import (
     WorklinkRunner,
     _PR_BODY_SECTION_MAX_BYTES,
     _demote_template_invalid_ready_leaf,
+    _epic_prompt,
     _epic_run_timeout_s,
     _epic_stale_heartbeat_s,
     _read_checkout_git_identity,
@@ -45,6 +46,7 @@ from mimir.worklink.orchestrator import (
     _read_pr_body_section,
     _resolve_factory_github_credential,
     render_decomposition_prompt,
+    render_work_order,
     run_worklink,
     validate_leaf,
 )
@@ -780,6 +782,63 @@ def test_worklink_pr_body_without_build_section_is_unchanged(tmp_path: Path) -> 
         "- Tests: `echo ok` → 0\n"
         f"- Transcript: `{tmp_path / 'state' / 'worklink' / 'transcripts' / 'fake.json'}`\n"
     )
+
+
+def test_chainlink_rendering_rewrites_every_github_closing_keyword(
+    tmp_path: Path,
+) -> None:
+    # GitHub's supported set is documented at:
+    # https://docs.github.com/en/issues/tracking-your-work-with-issues/using-issues/linking-a-pull-request-to-an-issue
+    keywords = (
+        "close",
+        "closes",
+        "closed",
+        "fix",
+        "fixes",
+        "fixed",
+        "resolve",
+        "resolves",
+        "resolved",
+    )
+    description = "\n".join(
+        f"{keyword.upper()}: #{number}"
+        for number, keyword in enumerate(keywords, 1)
+    )
+    description += "\nFixes octo-org/octo-repo#100"
+    issue = IssueContext(441, "render safely", description, {"worklink:ready"})
+    template = tmp_path / "order.md"
+    template.write_text("{description}", encoding="utf-8")
+
+    rendered = (
+        render_work_order(
+            issue,
+            template_path=template,
+            backend_name="fake",
+            test_command="echo ok",
+        ),
+        _epic_prompt(issue),
+    )
+    actionable = re.compile(
+        r"(?i)\b(?:close|closes|closed|fix|fixes|fixed|resolve|resolves|resolved)"
+        r"(?:\s*:\s*|\s+)#[0-9]+\b"
+    )
+    for text in rendered:
+        assert actionable.search(text) is None
+        for number, keyword in enumerate(keywords, 1):
+            assert f"{keyword.upper()}: chainlink #{number}" in text
+        assert "Fixes octo-org/octo-repo#100" in text
+
+
+def test_pr_build_summary_rewrites_ambiguous_closing_reference(tmp_path: Path) -> None:
+    section_path = tmp_path / ".worklink-pr-body.md"
+    section_path.write_text(
+        "Closes #1327\nFixes octo-org/octo-repo#100",
+        encoding="utf-8",
+    )
+
+    section = _read_pr_body_section(tmp_path)
+
+    assert section == "Closes chainlink #1327\nFixes octo-org/octo-repo#100"
 
 
 def test_pr_body_section_is_scrubbed_and_visibly_truncated(tmp_path: Path) -> None:
