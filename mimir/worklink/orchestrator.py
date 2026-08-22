@@ -1559,7 +1559,6 @@ class WorklinkRunner:
                 branch=f"feature/{run_id}",
                 test_command=test_cmd,
             )
-            handle = await compute.launch(spec)
             factory_record = FactoryRunRecord(
                 run_id=run_id,
                 issue_id=issue_id,
@@ -1570,11 +1569,14 @@ class WorklinkRunner:
                 launcher=str(launcher),
                 sandbox=str(lease.path / ".factory-sandboxes" / run_id),
                 session=None,
-                handle=handle,
+                handle=None,
                 status=None,
                 observed_at=None,
                 controller_phase="running",
             )
+            _create_factory_sandbox(factory_record, lease)
+            handle = await compute.launch(spec)
+            factory_record = replace(factory_record, handle=handle)
             try:
                 save_factory_record(self.home, factory_record)
             except BaseException:
@@ -2077,6 +2079,19 @@ def _verify_factory_recovery_binding(
         command_runner,
         repository=retained.repository,
     )
+    return sandbox
+
+
+def _create_factory_sandbox(record: FactoryRunRecord, lease: CheckoutLease) -> Path:
+    """Create a validated factory sandbox owned by the controller process."""
+    sandbox = Path(record.sandbox)
+    root = lease.path / ".factory-sandboxes"
+    if sandbox != root / record.run_id:
+        raise WorklinkError("factory sandbox does not match the validated run identity")
+    if lease.path.is_symlink() or root.is_symlink() or sandbox.is_symlink():
+        raise WorklinkError("factory sandbox path may not be a symlink")
+    root.mkdir(mode=0o700, exist_ok=True)
+    sandbox.mkdir(mode=0o700, exist_ok=True)
     return sandbox
 
 

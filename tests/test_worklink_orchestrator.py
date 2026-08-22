@@ -3092,6 +3092,9 @@ def test_factory_early_failed_record_is_archived_before_fresh_run(
         return cp(args)
 
     async def launch(self: object, spec: WorkSpec) -> LaunchHandle:
+        sandbox = fresh_sandbox / ".factory-sandboxes" / "chainlink-700"
+        assert sandbox.is_dir()
+        assert not sandbox.is_symlink()
         return LaunchHandle("local_subprocess", "123", 456)
 
     async def supervise(self: object, **kwargs: object) -> object:
