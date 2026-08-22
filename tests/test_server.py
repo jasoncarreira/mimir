@@ -2097,6 +2097,32 @@ class TestHandleEvent:
         )
         assert durable_acl.visibility == "private"
 
+    async def test_event_strips_client_asserted_saga_session_id(self) -> None:
+        from mimir.worklink.continuation import (
+            HTTP_EVENT_INGRESS_EXTRA_KEY,
+            HTTP_EVENT_INGRESS_EXTRA_VALUE,
+        )
+
+        app, stub = _event_app()
+        async with TestClient(TestServer(app)) as client:
+            resp = await client.post(
+                "/event",
+                json={
+                    "channel_id": "c",
+                    "extra": {
+                        "saga_session_id": "saga-foreign-123-abc",
+                        "keep": "me",
+                    },
+                },
+            )
+
+        assert resp.status == 200
+        event = stub.enqueue.call_args.args[0]
+        assert event.extra == {
+            HTTP_EVENT_INGRESS_EXTRA_KEY: HTTP_EVENT_INGRESS_EXTRA_VALUE,
+            "keep": "me",
+        }
+
     async def test_event_strips_forged_worklink_hint_extra(self) -> None:
         from mimir.worklink.continuation import (
             HTTP_EVENT_INGRESS_EXTRA_KEY,
@@ -2334,15 +2360,72 @@ class TestHandleEvent:
         assert event.trigger == "user_message"
 
     @pytest.mark.asyncio
-    async def test_explicit_trigger_forwarded(self) -> None:
-        app, stub = _event_app()
+    async def test_non_admin_arbitrary_trigger_is_rejected(self) -> None:
+        from types import SimpleNamespace
+
+        from mimir.web_channels import web_channel_for_identity
+
+        bob = SimpleNamespace(canonical="bob", display_name="Bob")
+        app, stub = _event_app_authed(bob, is_admin=False)
         async with TestClient(TestServer(app)) as client:
-            await client.post(
+            resp = await client.post(
                 "/event",
-                json={"channel_id": "ch", "trigger": "scheduled_tick"},
+                json={
+                    "channel_id": web_channel_for_identity("bob"),
+                    "trigger": "arbitrary_internal_wake",
+                },
             )
+            body = await resp.json()
+
+        assert resp.status == 403
+        assert body == {
+            "error": "trigger not permitted for non-admin HTTP callers",
+            "allowed_triggers": ["user_message"],
+        }
+        stub.enqueue.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_non_admin_privileged_trigger_is_rejected(self) -> None:
+        from types import SimpleNamespace
+
+        from mimir.web_channels import web_channel_for_identity
+
+        bob = SimpleNamespace(canonical="bob", display_name="Bob")
+        app, stub = _event_app_authed(bob, is_admin=False)
+        async with TestClient(TestServer(app)) as client:
+            resp = await client.post(
+                "/event",
+                json={
+                    "channel_id": web_channel_for_identity("bob"),
+                    "trigger": "saga_session_end",
+                },
+            )
+
+        assert resp.status == 403
+        stub.enqueue.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_admin_explicit_trigger_is_forwarded_without_session_selector(
+        self,
+    ) -> None:
+        from types import SimpleNamespace
+
+        admin = SimpleNamespace(canonical="op", display_name="Op")
+        app, stub = _event_app_authed(admin, is_admin=True)
+        async with TestClient(TestServer(app)) as client:
+            resp = await client.post(
+                "/event",
+                json={
+                    "channel_id": "ch",
+                    "trigger": "scheduled_tick",
+                    "extra": {"saga_session_id": "saga-foreign-123-abc"},
+                },
+            )
+
+        assert resp.status == 200
         event = stub.enqueue.call_args.args[0]
         assert event.trigger == "scheduled_tick"
+        assert "saga_session_id" not in event.extra
 
     @pytest.mark.asyncio
     async def test_content_forwarded(self) -> None:
@@ -2399,7 +2482,7 @@ class TestHandleEvent:
                     "channel_id": web_channel_for_identity("alice"),
                     "author": "operator",
                     "author_id": "operator",
-                    "trigger": "scheduled_tick",
+                    "trigger": "user_message",
                     "source": "api",
                     "service_principal": "scheduler",
                 },

@@ -590,10 +590,10 @@ def _filter_session_turns(
     turns_path: Path,
     saga_session_id: str,
     *,
+    channel_id: str,
     idle_minutes: int = 10,
 ) -> list[dict]:
-    """Read turns.jsonl tail-first and return records with the given
-    saga_session_id, in chronological order.
+    """Return records for the given session and channel in chronological order.
 
     Time-based break: saga ends a session after ``idle_minutes`` of no
     activity, so any record older than ``newest_match_ts - 2 *
@@ -611,7 +611,10 @@ def _filter_session_turns(
     try:
         for rec in tail_jsonl_records(turns_path):
             rec_ts = _turn_record_ts(rec)
-            if rec.get("saga_session_id") == saga_session_id:
+            if (
+                rec.get("saga_session_id") == saga_session_id
+                and rec.get("channel_id") == channel_id
+            ):
                 out.append(rec)
                 if rec_ts is not None and (
                     newest_match_ts is None or rec_ts > newest_match_ts
@@ -3949,7 +3952,7 @@ class Agent:
 
     async def _build_synthesis_prompt(
         self, ctx: Any, event: AgentEvent,
-    ) -> str:
+    ) -> PromptBlock:
         """For trigger='saga_session_end' — load the synthesis template,
         embed the session's turn window from turns.jsonl. Off-loops the
         turns.jsonl scan via to_thread."""
@@ -3961,6 +3964,7 @@ class Agent:
             _filter_session_turns,
             self._config.turns_log,
             saga_session_id,
+            channel_id=event.channel_id or "",
             idle_minutes=idle_minutes,
         )
         if not turns_window:
@@ -3972,12 +3976,20 @@ class Agent:
                     reason="turns.jsonl rotated past this session's records",
                 )
             )
-        return render_saga_session_end(
-            channel_id=event.channel_id or "",
-            saga_session_id=saga_session_id,
-            idle_minutes=idle_minutes,
-            turns_window=turns_window,
-            prompts_dir=self._config.prompts_dir,
+        labels = InformationFlowLabels()
+        if turns_window:
+            labels = event.ifc_labels or ctx.ifc_labels
+            if not labels.sources:
+                raise ValueError("session turn history omitted provenance")
+        return PromptBlock(
+            render_saga_session_end(
+                channel_id=event.channel_id or "",
+                saga_session_id=saga_session_id,
+                idle_minutes=idle_minutes,
+                turns_window=turns_window,
+                prompts_dir=self._config.prompts_dir,
+            ),
+            labels,
         )
 
     async def _build_turn_prompt(
@@ -3996,18 +4008,6 @@ class Agent:
         Returns ``(turn_prompt, recent)`` — recent is needed for the
         ``turn_started`` event's ``recent_message_count``.
         """
-        if event.trigger == "saga_session_end":
-            synthesis_prompt = await self._build_synthesis_prompt(ctx, event)
-            scratch_path = self._config.home / "scratch" / "turns" / ctx.turn_id
-            return (
-                "## Current turn scratch\n\n"
-                f"Use `{scratch_path}/` for ordinary ephemeral files. This workspace "
-                "is private to this turn; the shared `scratch/` root and other turns' "
-                f"workspaces are unreadable.\n\n{synthesis_prompt}",
-                [],
-            )
-
-        auth_context = _require_auth_context(initial_auth_context or ctx.auth_context)
         source_blocks: list[PromptBlock] = []
 
         def use(block: PromptBlock | None) -> str | None:
@@ -4024,6 +4024,28 @@ class Agent:
             source_blocks.append(block)
             return block.content
 
+        if event.trigger == "saga_session_end":
+            synthesis_block = await self._build_synthesis_prompt(ctx, event)
+            if not isinstance(synthesis_block, PromptBlock):
+                raise TypeError("synthesis prompt loader omitted provenance")
+            if any(not source.is_complete for source in synthesis_block.labels.sources):
+                raise ValueError("session turn history returned incomplete provenance")
+            synthesis_prompt = synthesis_block.content
+            if synthesis_block.labels.sources:
+                source_blocks.append(synthesis_block)
+            scratch_path = self._config.home / "scratch" / "turns" / ctx.turn_id
+            ctx.ifc_labels = _merge_ifc_labels(
+                ctx.ifc_labels, *(block.labels for block in source_blocks),
+            )
+            return (
+                "## Current turn scratch\n\n"
+                f"Use `{scratch_path}/` for ordinary ephemeral files. This workspace "
+                "is private to this turn; the shared `scratch/` root and other turns' "
+                f"workspaces are unreadable.\n\n{synthesis_prompt}",
+                [],
+            )
+
+        auth_context = _require_auth_context(initial_auth_context or ctx.auth_context)
         recent = self._buffer.assemble_recent_activity(
             channel_id=event.channel_id or "",
             author=event.author,
