@@ -239,11 +239,13 @@ async def test_unauthorized_identity_rejected(tmp_path: Path) -> None:
 
 
 async def test_dev_open_mode_when_no_key_and_no_users(tmp_path: Path) -> None:
-    # No master key + no web keys → legacy open path (localhost dev).
+    # No master key + no web keys → legacy open path for ordinary localhost
+    # development, but administration is never part of that open surface.
     async with TestClient(TestServer(_app(tmp_path, ""))) as c:
         r = await c.get("/api/v1/turns")
         assert r.status == 200
         assert (await r.json())["canonical"] is None  # no identity attached
+        assert (await c.get("/api/v1/admin/config")).status == 401
 
 
 async def test_failsafe_gate_active_when_users_exist_without_master(tmp_path: Path) -> None:
@@ -254,6 +256,27 @@ async def test_failsafe_gate_active_when_users_exist_without_master(tmp_path: Pa
         assert (await c.get("/api/v1/turns")).status == 401  # no key → blocked
         ok = await c.get("/api/v1/turns", headers={"X-API-Key": user_key})
         assert ok.status == 200 and (await ok.json())["canonical"] == "alice"
+
+
+async def test_gate_stays_closed_after_all_web_keys_disappear(
+    tmp_path: Path, caplog,
+) -> None:
+    user_key = issue_web_key(tmp_path, "alice", roles=["user"])
+    app = _app(tmp_path, "")
+    resolver = app["identity_resolver"]
+    async with TestClient(TestServer(app)) as c:
+        assert (await c.get("/api/v1/turns", headers={"X-API-Key": user_key})).status == 200
+        from mimir.identities_populator import revoke_web_key
+
+        revoke_web_key(tmp_path, "alice")
+        with caplog.at_level("WARNING", logger="mimir.identities"):
+            resolver.reload()
+
+        assert web_gate_active("", resolver) is True
+        assert "removed every web key" in caplog.text
+        assert "gate closed" in caplog.text
+        assert (await c.get("/api/v1/turns")).status == 401
+        assert (await c.get("/api/v1/admin/config")).status == 401
 
 
 # ── /whoami payload ─────────────────────────────────────────────────────

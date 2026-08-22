@@ -699,13 +699,14 @@ def _make_auth_middleware(expected_key: str, web_host: str | None = None):
         # after this middleware; populated by request time). github #726.
         resolver = request.app.get("identity_resolver")
 
-        # The gate activates when EITHER a master key is set OR per-user web
-        # keys exist — so configuring users can't leave the server open even if
-        # MIMIR_API_KEY is unset. Neither → legacy dev/open path (no identity,
-        # no RBAC), preserving localhost behavior. Shared with /web/bootstrap
-        # (web_ui.web_gate_active) so the browser's reported auth state can't
-        # drift from what's enforced here (#770 review).
+        # The gate activates when a master key is set, per-user web keys exist,
+        # or the resolver has previously loaded web keys. The last condition
+        # prevents credential loss from restoring open mode. A never-configured
+        # loopback deployment keeps the legacy first-run path for non-admin
+        # routes, but administration is never unauthenticated.
         if not web_ui.web_gate_active(expected_key, resolver):
+            if _is_admin_required(request.path):
+                return web.json_response({"error": "unauthorized"}, status=401)
             return await handler(request)
 
         provided = request.headers.get("X-API-Key", "")

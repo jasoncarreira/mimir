@@ -637,11 +637,14 @@ def web_gate_active(api_key: str | None, resolver: Any) -> bool:
     Single source of truth shared by the auth middleware (server.py) AND
     /web/bootstrap, so the auth state the browser is told never drifts from
     what the middleware actually enforces. The gate is on when a master key is
-    set OR per-user web keys exist (the fail-safe: configuring users can't
-    leave the server open even if MIMIR_API_KEY is unset)."""
+    set, per-user web keys exist, or the resolver latched closed after prior
+    credentials or a load failure."""
     if api_key:
         return True
-    return resolver is not None and resolver.has_web_keys()
+    return resolver is not None and (
+        resolver.has_web_keys()
+        or bool(getattr(resolver, "web_gate_latched", lambda: False)())
+    )
 
 
 def _whoami_payload(identity: Any, is_master: bool) -> dict[str, Any]:
@@ -1681,9 +1684,17 @@ def register_routes(
         canonical = str((body or {}).get("canonical") or "").strip()
         if not canonical:
             return json_error("bad_request", "canonical required", status=400)
-        from .identities_populator import revoke_web_key
+        from .identities_populator import LastWebKeyError, revoke_web_key
 
-        revoked = await asyncio.to_thread(revoke_web_key, home, canonical)
+        try:
+            revoked = await asyncio.to_thread(
+                revoke_web_key,
+                home,
+                canonical,
+                allow_last=bool(request.app.get("api_key")),
+            )
+        except LastWebKeyError as exc:
+            return json_error("last_web_key", str(exc), status=409)
         resolver = request.app.get("identity_resolver")
         if resolver is not None:
             await asyncio.to_thread(resolver.reload)
