@@ -26,6 +26,7 @@ import dataclasses
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 import json
+import logging
 import os
 from pathlib import Path
 import re
@@ -35,7 +36,7 @@ from typing import Callable, Sequence
 
 from ..event_logger import log_event_sync
 from .backends import WorklinkConfig
-from .backends.registry import WorklinkDefaults
+from .backends.registry import WorklinkDefaults, WorklinkDefaultsValidationError
 from .claims import ChainlinkClaims, ClaimRecord
 from .checkout import prune_attempt_checkouts
 from .factory_state import factory_process_is_alive, list_factory_records
@@ -45,6 +46,8 @@ from .factory_state import factory_process_is_alive, list_factory_records
 DEFAULT_AGENT_ID = "mimir-worklink"
 WORKLINK_AGENT_ID_ENV = "MIMIR_WORKLINK_AGENT_ID"
 FACTORY_MAX_CONCURRENT_DEFAULT = 1
+
+log = logging.getLogger(__name__)
 
 
 def chainlink_bin() -> str:
@@ -231,17 +234,26 @@ def reap_stale_claims_for_home(
     """TTL-reaper entry point: recover claims whose worker died.
 
     Reads ``reaper_ttl_s`` from worklink.yaml and delegates discovery +
-    staleness to :meth:`ChainlinkClaims.reap_home`.
+    staleness to :meth:`ChainlinkClaims.reap_home`. If a live config edit puts
+    the TTL below its safe floor, emit an operator-visible event and use the
+    floor for this pass; startup config loading rejects the same violation.
     """
-    defaults = worklink_defaults(home)
-    min_reaper_ttl_s = defaults.timeout_s * 2
-    if defaults.reaper_ttl_s <= min_reaper_ttl_s:
-        raise RuntimeError(
-            "worklink reaper_ttl_s must be greater than 2 * timeout_s so the TTL "
-            "reaper cannot steal a worker that is still finalizing its remote "
-            "test job"
-        )
-    ttl = timedelta(seconds=defaults.reaper_ttl_s)
+    try:
+        ttl_s = worklink_defaults(home).reaper_ttl_s
+    except WorklinkDefaultsValidationError as exc:
+        if exc.field != "reaper_ttl_s":
+            raise
+        try:
+            log_event_sync(
+                "worklink_reaper_misconfigured",
+                configured_reaper_ttl_s=exc.configured_value,
+                required_reaper_ttl_s=exc.required_value,
+                action="using_required_ttl",
+            )
+        except Exception as log_exc:  # noqa: BLE001
+            log.warning("could not emit worklink reaper config event: %s", log_exc)
+        ttl_s = exc.required_value
+    ttl = timedelta(seconds=ttl_s)
     cl = claims or make_claims(home, agent_id=agent_id)
     return cl.reap_home(ttl=ttl)
 
