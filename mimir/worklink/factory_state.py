@@ -13,7 +13,7 @@ from .compute import LaunchHandle
 from .run_state import process_is_zombie, process_start_ticks
 
 
-FACTORY_RECORD_VERSION = 1
+FACTORY_RECORD_VERSION = 2
 _MAX_RECORD_BYTES = 2 * 1024 * 1024
 
 
@@ -50,6 +50,7 @@ class FactoryRunRecord:
     observed_at: str | None
     controller_phase: str
     controller_error: str | None = None
+    transcript: str | None = None
     version: int = FACTORY_RECORD_VERSION
 
     def __post_init__(self) -> None:
@@ -85,6 +86,10 @@ class FactoryRunRecord:
                 raise FactoryRecordError("factory record status base mismatch")
         if self.controller_error is not None and len(self.controller_error.encode("utf-8")) > 65536:
             raise FactoryRecordError("factory record error exceeds size limit")
+        if self.transcript is not None and (
+            not Path(self.transcript).is_absolute() or "\x00" in self.transcript
+        ):
+            raise FactoryRecordError("factory record transcript path is invalid")
 
     def to_json(self) -> dict[str, Any]:
         return {
@@ -103,6 +108,7 @@ class FactoryRunRecord:
             "observed_at": self.observed_at,
             "controller_phase": self.controller_phase,
             "controller_error": self.controller_error,
+            "transcript": self.transcript,
         }
 
     @classmethod
@@ -125,8 +131,15 @@ class FactoryRunRecord:
             "observed_at",
             "controller_phase",
             "controller_error",
+            "transcript",
         }
-        if set(data) != expected:
+        version = data.get("version")
+        legacy = version == 1 and set(data) == expected - {"transcript"}
+        if version not in {1, FACTORY_RECORD_VERSION}:
+            raise FactoryRecordError("unsupported factory record version")
+        if (version == 1 and not legacy) or (
+            version == FACTORY_RECORD_VERSION and set(data) != expected
+        ):
             raise FactoryRecordError("factory record fields are invalid")
         handle_data = data["handle"]
         if handle_data is None:
@@ -160,8 +173,11 @@ class FactoryRunRecord:
             raise FactoryRecordError("factory record observation time is invalid")
         if controller_error is not None and not isinstance(controller_error, str):
             raise FactoryRecordError("factory record controller error is invalid")
+        transcript = None if legacy else data["transcript"]
+        if transcript is not None and not isinstance(transcript, str):
+            raise FactoryRecordError("factory record transcript path is invalid")
         return cls(
-            version=int(data["version"]),
+            version=FACTORY_RECORD_VERSION,
             run_id=str(data["run_id"]),
             issue_id=int(data["issue_id"]),
             attempt=int(data["attempt"]),
@@ -176,6 +192,7 @@ class FactoryRunRecord:
             observed_at=observed_at,
             controller_phase=str(data["controller_phase"]),
             controller_error=controller_error,
+            transcript=transcript,
         )
 
     def observed(self, status: FactoryStatus, observed_at: str) -> FactoryRunRecord:

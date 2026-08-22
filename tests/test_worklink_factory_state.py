@@ -124,6 +124,17 @@ def test_factory_record_schema_remains_exact(tmp_path: Path) -> None:
         FactoryRunRecord.from_json(payload)
 
 
+def test_factory_record_upgrades_legacy_record_without_transcript(tmp_path: Path) -> None:
+    payload = record(tmp_path).to_json()
+    payload["version"] = 1
+    del payload["transcript"]
+
+    upgraded = FactoryRunRecord.from_json(payload)
+
+    assert upgraded.version == 2
+    assert upgraded.transcript is None
+
+
 def test_factory_record_rejects_symlink_and_unbound_run_ids(tmp_path: Path) -> None:
     expected = record(tmp_path)
     path = save_factory_record(tmp_path, expected)

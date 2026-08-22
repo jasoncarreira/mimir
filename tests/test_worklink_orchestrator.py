@@ -3500,6 +3500,70 @@ def test_factory_supervision_waits_for_manifest_then_proceeds(tmp_path: Path) ->
     assert statuses == []
 
 
+def test_factory_executor_exit_retains_scrubbed_tail_and_record_pointer(
+    tmp_path: Path,
+) -> None:
+    sandbox = tmp_path / "sandbox"
+    sandbox.mkdir()
+    handle = LaunchHandle("local_subprocess", "123", 456)
+    cleaned: list[LaunchHandle] = []
+
+    class Compute:
+        async def wait(self, selected: LaunchHandle, timeout_s: int) -> ComputeResult:
+            return ComputeResult(
+                23,
+                "executor stdout tail",
+                "api_key=super-secret-value\nexecutor captured tail",
+                handle=selected,
+                command=("opencode", "run"),
+            )
+
+        def job_alive(self, selected: LaunchHandle) -> bool:
+            return False
+
+        async def cancel(self, selected: LaunchHandle) -> None:
+            raise AssertionError("exited executor was cancelled")
+
+        async def cleanup(self, selected: LaunchHandle) -> None:
+            cleaned.append(selected)
+
+    class Backend:
+        poll_interval_s = 0
+
+        def status(self, *args: object, **kwargs: object) -> Any:
+            return _factory_lifecycle_status(sandbox, status="running")
+
+        def heartbeat(self, *args: object, **kwargs: object) -> None:
+            return None
+
+    with pytest.raises(WorklinkError, match="OpenCode process exited"):
+        asyncio.run(
+            WorklinkRunner(home=tmp_path, repo=tmp_path)._supervise_factory_070(
+                issue=IssueContext(700, "epic", "build", {"worklink:epic"}),
+                claim_record=ClaimRecord(700, 1, "agent", datetime.now(UTC)),
+                claims=object(),
+                backend=Backend(),
+                compute=Compute(),
+                factory_record=_factory_lifecycle_record(sandbox, handle),
+                test_cmd="pytest -q",
+                runner=lambda args: cp(args),
+                started_at=datetime.now(UTC),
+            )
+        )
+
+    retained = load_factory_record(tmp_path, "700")
+    assert retained is not None
+    assert retained.transcript is not None
+    transcript_path = Path(retained.transcript)
+    assert transcript_path.parent == tmp_path / "state" / "worklink" / "transcripts"
+    transcript = json.loads(transcript_path.read_text(encoding="utf-8"))
+    assert transcript["exit_code"] == 23
+    assert transcript["status"] == "failed"
+    assert transcript["stderr"].endswith("executor captured tail")
+    assert "super-secret-value" not in transcript["stderr"]
+    assert cleaned == [handle]
+
+
 @pytest.mark.parametrize("failure", ["status", "heartbeat", "persistence", "timeout"])
 def test_factory_supervision_cancels_and_cleans_on_every_failure(
     tmp_path: Path,

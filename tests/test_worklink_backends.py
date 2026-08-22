@@ -28,6 +28,7 @@ from mimir.worklink.backends.base import blocked_reason_from_output
 from mimir.worklink.backends.registry import SHIPPING_BACKENDS, SHIPPING_COMPUTE_BACKENDS
 from mimir.worklink.compute import ComputeCaps, ComputeLaunchError, LaunchHandle, WorkSpec
 import mimir.worklink.compute as compute_module
+import mimir.worklink.backends.opencode as opencode_module
 
 
 class FakeProcess:
@@ -1130,6 +1131,37 @@ async def test_opencode_backend_transcript_filename_contract(
     assert str(issue_id) in filename, f"expected issue id {issue_id} in filename, got {filename}"
     transcript = json.loads(result.transcript_path.read_text())
     assert transcript["backend"] == "opencode"
+
+
+def test_shared_transcript_writer_scrubs_bounds_tail_and_count(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(opencode_module, "TRANSCRIPT_STREAM_MAX_BYTES", 80)
+    monkeypatch.setattr(opencode_module, "TRANSCRIPTS_PER_ISSUE", 3)
+    paths: list[Path] = []
+    for index in range(5):
+        path = opencode_module.transcript_path(tmp_path, 1344)
+        opencode_module.write_transcript(
+            path,
+            command=("opencode", "run"),
+            exit_code=index,
+            status="failed",
+            stdout="x" * 100 + f" stdout-tail-{index}",
+            stderr="api_key=super-secret-value\n" + f"stderr-tail-{index}",
+            timed_out=False,
+            output_overflow=False,
+        )
+        paths.append(path)
+
+    retained = sorted(tmp_path.glob("opencode-1344-*.json"))
+    assert len(retained) == 3
+    assert not paths[0].exists()
+    newest = json.loads(paths[-1].read_text(encoding="utf-8"))
+    assert newest["stdout"].startswith("[earlier output omitted by Worklink]")
+    assert newest["stdout"].endswith("stdout-tail-4")
+    assert newest["stderr"].endswith("stderr-tail-4")
+    assert "super-secret-value" not in newest["stderr"]
+    assert paths[-1].stat().st_size <= opencode_module.TRANSCRIPT_MAX_BYTES
 
 
 def test_registry_builds_opencode_backend_with_settings() -> None:
