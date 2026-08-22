@@ -27,6 +27,7 @@ from mimir.worklink import autonomy, orchestrator
 from mimir.worklink.claims import CLAIM_RESET_PREFIX, ChainlinkClaims, ClaimRecord
 from mimir.worklink.backends.registry import WorklinkConfig, WorklinkDefaults
 from mimir.worklink.dispatch_failures import (
+    dispatch_failure_state_dir,
     failure_state_transaction,
     load_failure_state,
     mark_failure_notified,
@@ -1286,12 +1287,14 @@ def test_poller_dispatches_up_to_free_slots(tmp_path: Path) -> None:
 
 def test_poller_failure_escalation_dedupes_by_signature_and_recovers(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     home = tmp_path / "home"
     home.mkdir()
     repo = tmp_path / "repo"
     repo.mkdir()
-    state_dir = tmp_path / "state"
+    state_dir = dispatch_failure_state_dir(home)
+    ambient_state_dir = tmp_path / "injected-state" / "different-poller"
     log_path = state_dir / "run-201.log"
     chainlink = _fake_chainlink_script(tmp_path, ready=[201], active_locks=[])
     runbin = _fake_run_bin(tmp_path)
@@ -1301,15 +1304,19 @@ def test_poller_failure_escalation_dedupes_by_signature_and_recovers(
         "WORKLINK_RUN_BIN": sys.executable + " " + str(runbin),
         "WORKLINK_REPO": str(repo),
         "WORKLINK_MAX_CONCURRENT": "1",
-        "STATE_DIR": str(state_dir),
+        "STATE_DIR": str(ambient_state_dir),
+        "POLLER_NAME": "different-poller",
     }
-    record_failure(
-        state_dir,
+    monkeypatch.setenv("STATE_DIR", str(ambient_state_dir))
+    monkeypatch.setenv("POLLER_NAME", "different-poller")
+    monkeypatch.setenv("WORKLINK_RUN_LOG", str(log_path))
+    orchestrator._record_run_failure(
+        home=home,
         issue_id=201,
         attempt=None,
         exit_status=1,
         error="ValueError: bad config token=top-secret",
-        log_path=str(log_path),
+        autonomous=True,
     )
 
     first = _run_poller(tmp_path, env)
@@ -1319,19 +1326,21 @@ def test_poller_failure_escalation_dedupes_by_signature_and_recovers(
     assert alerts[0]["log"] == str(log_path)
     assert alerts[0]["terminal_error"] == "ValueError: bad config token=[REDACTED]"
     assert alerts[0]["source_id"].endswith(alerts[0]["error_signature"])
+    assert alerts[0]["poller"] == "worklink-ready-queue"
     assert not [e for e in first if e.get("signal") == "worklink_dispatched"]
+    assert not ambient_state_dir.exists()
 
     second = _run_poller(tmp_path, env)
     assert not [e for e in second if e.get("signal") == "worklink_run_failure_escalated"]
     assert not [e for e in second if e.get("signal") == "worklink_dispatched"]
 
-    record_failure(
-        state_dir,
+    orchestrator._record_run_failure(
+        home=home,
         issue_id=201,
         attempt=None,
         exit_status=1,
         error="RuntimeError: a distinct failure",
-        log_path=str(log_path),
+        autonomous=True,
     )
     distinct = _run_poller(tmp_path, env)
     distinct_alerts = [
