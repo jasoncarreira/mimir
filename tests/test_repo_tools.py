@@ -17,13 +17,17 @@ import struct
 import sys
 from types import SimpleNamespace
 import subprocess
+import tomllib
 import traceback
 import uuid
 
 import pytest
 from langchain_core.tools import ToolException
 
-from mimir.contained_execution import CollectedExecutionResult
+from mimir.contained_execution import (
+    CollectedExecutionResult,
+    SensitiveMaterialScrubber,
+)
 from mimir.contained_snapshot import SnapshotCredentialsRefused, create_git_snapshot
 from mimir.models import RepoPRAction, RepoPRActionScope, RepoReviewState
 from mimir.pr_checkout_lease import (
@@ -35,6 +39,7 @@ from mimir.project_tests import (
     _TIMEOUT_SECONDS,
     ProjectTestRefusal,
     RepoProjectTests,
+    _safe_stderr_output,
 )
 from mimir.repo_tools import (
     GitCommit,
@@ -1505,6 +1510,143 @@ async def test_project_tests_scrub_checkout_home_and_sensitive_output(
     assert str(home) not in result.stdout + result.stderr
     assert str(state.checkout_lease.path) not in result.stdout + result.stderr
     assert secret not in result.stdout + result.stderr
+
+
+def _run_synthetic_pytest(tmp_path: Path, test_source: str) -> subprocess.CompletedProcess[bytes]:
+    test_path = tmp_path / "test_synthetic_hang.py"
+    test_path.write_text(test_source, encoding="utf-8")
+    return subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "pytest",
+            "-q",
+            "-s",
+            str(test_path),
+            "-o",
+            "faulthandler_timeout=0.1",
+            "-o",
+            "faulthandler_exit_on_timeout=false",
+        ],
+        cwd=tmp_path,
+        capture_output=True,
+        check=False,
+        timeout=10,
+    )
+
+
+@pytest.mark.asyncio
+async def test_project_test_retains_builtin_hang_dump_after_stderr_truncation(
+    repo_tools, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    completed = await asyncio.to_thread(
+        _run_synthetic_pytest,
+        tmp_path,
+        "import os\n"
+        "import threading\n"
+        "import time\n"
+        "\n"
+        "def blocked_worker(gate):\n"
+        "    gate.wait()\n"
+        "\n"
+        "def test_synthetic_hang():\n"
+        "    credential = 'credential-value-must-not-appear'\n"
+        "    gate = threading.Event()\n"
+        "    threading.Thread(target=blocked_worker, args=(gate,), daemon=True).start()\n"
+        "    os.write(2, b'x' * 5000)\n"
+        # 0.1s faulthandler threshold against a 3s hang: a 30x margin, because a
+        # contended CI runner can otherwise finish a 0.2s sleep before the dump
+        # is written. Observed failing twice on pytest-macos (3.11) at that margin
+        # while passing locally and on every Linux job.
+        "    time.sleep(3.0)\n"
+        "    assert credential\n",
+    )
+    assert completed.returncode == 0
+    assert len(completed.stderr) > 4_000
+    assert b"Timeout (0:00:00.100000)!" in completed.stderr
+    assert b"in blocked_worker" in completed.stderr
+    assert b"in test_synthetic_hang" in completed.stderr
+    # Python's faulthandler emits stack locations, not frame local values.
+    assert b"credential-value-must-not-appear" not in completed.stderr
+
+    state = repo_tools[-2]
+    home = tmp_path / "home"
+    _configure_worklink_test(home)
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+
+    async def runner(*_args, **_kwargs):
+        return CollectedExecutionResult(
+            completed.returncode, b"", completed.stderr, False, False, 0, 0,
+        )
+
+    result = await RepoProjectTests(
+        state, runner=runner, checkout_factory=_test_checkout_factory,
+    ).execute(("tracked.txt",))
+    assert result.ok
+    assert len(result.stderr) <= 4_000
+    assert result.stderr.startswith("Timeout (0:00:00.100000)!")
+    assert "in blocked_worker" in result.stderr
+    assert "in test_synthetic_hang" in result.stderr
+    assert "credential-value-must-not-appear" not in result.stderr
+
+
+def test_stderr_without_hang_dump_keeps_existing_positional_policy() -> None:
+    scrubber = SensitiveMaterialScrubber(home=None)
+    stderr = b"head-context\n" + b"x" * 5_000 + b"\ntail-context"
+
+    assert _safe_stderr_output(stderr, scrubber, 100).startswith("head-context")
+    assert _safe_stderr_output(stderr, scrubber, 100, keep_tail=True).endswith(
+        "tail-context"
+    )
+
+
+@pytest.mark.asyncio
+async def test_project_test_timeout_returns_captured_hang_diagnostic(
+    repo_tools, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state = repo_tools[-2]
+    home = tmp_path / "home"
+    _configure_worklink_test(home)
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    stderr = (
+        b"noise\n"
+        + b"x" * 5_000
+        + b"\nTimeout (0:05:00)!\nThread dump\n  File test_hang.py, line 7\n"
+    )
+
+    async def runner(*_args, **_kwargs):
+        return CollectedExecutionResult(None, b"partial stdout", stderr, True, False, 0, 0)
+
+    result = await RepoProjectTests(
+        state, runner=runner, checkout_factory=_test_checkout_factory,
+    ).execute(("tracked.txt",))
+
+    assert result.code == "test_timeout"
+    assert result.stdout == "partial stdout"
+    assert result.stderr.startswith("Timeout (0:05:00)!")
+    assert "test_hang.py" in result.stderr
+
+
+@pytest.mark.asyncio
+async def test_builtin_hang_diagnostic_configuration_leaves_fast_test_quiet(
+    tmp_path: Path,
+) -> None:
+    config = tomllib.loads(
+        (Path(__file__).parent.parent / "pyproject.toml").read_text(encoding="utf-8")
+    )["tool"]["pytest"]["ini_options"]
+    assert config["faulthandler_timeout"] == 300
+    assert config["faulthandler_timeout"] < _TIMEOUT_SECONDS / 2
+    assert config["faulthandler_exit_on_timeout"] is False
+
+    completed = await asyncio.to_thread(
+        _run_synthetic_pytest,
+        tmp_path,
+        "def test_fast():\n"
+        "    pass\n",
+    )
+    assert completed.returncode == 0
+    assert completed.stderr == b""
+    assert b"Timeout" not in completed.stdout
 
 
 @pytest.mark.asyncio

@@ -24,7 +24,7 @@ import warnings
 from typing import Any, Callable, Iterable, Mapping, Sequence
 
 from .._rmtree import rmtree_missing_ok
-from ..forge.github import GitHubForgeClient
+from ..forge.github import GitHubForgeClient, GitHubIdentityVerificationError
 from .backends import (
     BackendRegistry,
     CheckoutShape,
@@ -76,6 +76,7 @@ _PR_BODY_SECTION_MAX_BYTES = 4000
 _PR_BODY_SECTION_TRUNCATED = "\n\n[Build summary truncated by Worklink.]"
 _EVIDENCE_HEADING_RE = re.compile(r"(?im)^Worklink evidence:\s*$")
 _FACTORY_STARTUP_STATUS_TIMEOUT_S = 30.0
+_FACTORY_PUBLISHING_IDENTITY_ENV = "MIMIR_FACTORY_PUBLISHING_IDENTITY"
 
 
 def _epic_run_timeout_s() -> float:
@@ -134,7 +135,19 @@ class LeafValidationError(WorklinkError):
     """Issue is not structured enough to hand to a backend."""
 
 
-def _read_factory_publishing_identity(repo: Path) -> str:
+def _read_factory_publishing_identity(
+    repo: Path, environ: Mapping[str, object] = os.environ
+) -> tuple[str, str]:
+    if _FACTORY_PUBLISHING_IDENTITY_ENV in environ:
+        identity = environ[_FACTORY_PUBLISHING_IDENTITY_ENV]
+        if not isinstance(identity, str):
+            raise WorklinkError(
+                f"{_FACTORY_PUBLISHING_IDENTITY_ENV} must be a string when set"
+            )
+        if not identity.strip():
+            raise WorklinkError(f"{_FACTORY_PUBLISHING_IDENTITY_ENV} is set but blank")
+        return identity.strip(), f"environment variable {_FACTORY_PUBLISHING_IDENTITY_ENV}"
+
     declaration = repo / ".factory.json"
     try:
         payload = json.loads(declaration.read_text(encoding="utf-8"))
@@ -147,7 +160,7 @@ def _read_factory_publishing_identity(repo: Path) -> str:
     identity = payload.get("publishing_identity")
     if not isinstance(identity, str) or not identity.strip():
         raise WorklinkError("factory publishing identity is missing")
-    return identity.strip()
+    return identity.strip(), ".factory.json"
 
 
 def _read_checkout_git_identity(checkout: Path, runner: Runner) -> tuple[str, str]:
@@ -1384,9 +1397,17 @@ class WorklinkRunner:
                 runner=_list_runner(runner),
             )
             git_name, git_email = _read_checkout_git_identity(lease.path, runner)
-            publishing_identity = _read_factory_publishing_identity(self.repo)
+            publishing_identity, publishing_identity_source = (
+                _read_factory_publishing_identity(self.repo)
+            )
             github_token, github_env = _resolve_factory_github_credential(os.environ)
-            GitHubForgeClient(token=github_token).verify_identity(publishing_identity)
+            try:
+                GitHubForgeClient(token=github_token).verify_identity(publishing_identity)
+            except GitHubIdentityVerificationError as exc:
+                raise WorklinkError(
+                    f"{exc}; selected identity {publishing_identity} "
+                    f"from {publishing_identity_source}"
+                ) from exc
             order = WorkOrder(
                 issue_id=issue_id,
                 checkout=lease.path,
