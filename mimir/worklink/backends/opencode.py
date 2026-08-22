@@ -19,6 +19,7 @@ from ...opencode_config import (
     opencode_worker_documents,
     resolve_opencode_invocation,
 )
+from ...redaction import redact_text
 from ..compute import ComputeResult, WorkSpec
 from .base import (
     Caps,
@@ -53,6 +54,11 @@ STARTUP_CONTENTION_INITIAL_BACKOFF_S = 0.1
 STARTUP_CONTENTION_WINDOW_S = 5.0
 STARTUP_CONTENTION_RESOURCE = "opencode_sqlite_session_store"
 STARTUP_CONTENTION_EXHAUSTED_REASON = "opencode_startup_sqlite_contention_exhausted"
+TRANSCRIPT_STREAM_MAX_BYTES = 1024 * 1024
+TRANSCRIPT_MAX_BYTES = 16 * 1024 * 1024
+TRANSCRIPTS_PER_ISSUE = 10
+_TRANSCRIPT_COMMAND_MAX_BYTES = 256 * 1024
+_TRANSCRIPT_TRUNCATED = "[earlier output omitted by Worklink]\n"
 _SQLITE_CONTENTION_PATTERNS = (
     re.compile(r"\bdatabase(?: table)? is locked\b", re.IGNORECASE),
     re.compile(r"\bdatabase is busy\b", re.IGNORECASE),
@@ -255,10 +261,10 @@ class OpenCodeBackend:
     async def interpret(self, order: WorkOrder, result: object) -> RawResult:
         if not isinstance(result, ComputeResult):
             raise TypeError("OpenCodeBackend.interpret expects ComputeResult")
-        transcript_path = _transcript_path(order.transcript_root, order.issue_id)
+        transcript_file = transcript_path(order.transcript_root, order.issue_id)
         if result.launch_error:
-            _write_transcript(
-                transcript_path,
+            write_transcript(
+                transcript_file,
                 command=list(result.command),
                 exit_code=None,
                 status="backend_error",
@@ -267,7 +273,7 @@ class OpenCodeBackend:
                 timed_out=False,
                 output_overflow=False,
             )
-            return RawResult(-1, transcript_path, "backend_error", result.launch_error)
+            return RawResult(-1, transcript_file, "backend_error", result.launch_error)
 
         blocked_reason = blocked_reason_from_output(result.stdout, result.stderr)
         permission_refusal = _permission_refusal_reason(
@@ -289,8 +295,8 @@ class OpenCodeBackend:
                 status, result.stdout, result.stderr, result.command
             )
         )
-        _write_transcript(
-            transcript_path,
+        write_transcript(
+            transcript_file,
             command=list(result.command),
             exit_code=result.exit_code,
             status=status,
@@ -301,7 +307,7 @@ class OpenCodeBackend:
         )
         return RawResult(
             result.exit_code,
-            transcript_path,
+            transcript_file,
             status,
             error,
             blocked_reason,
@@ -441,8 +447,8 @@ def _permission_refusal_reason(
     )
 
 
-def _transcript_path(transcript_root: Path | None, issue_id: int) -> Path:
-    stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
+def transcript_path(transcript_root: Path | None, issue_id: int) -> Path:
+    stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%S%fZ")
     directory = transcript_root or _default_transcript_root()
     directory.mkdir(parents=True, exist_ok=True)
     return directory / f"opencode-{issue_id}-{stamp}.json"
@@ -455,7 +461,33 @@ def _default_transcript_root() -> Path:
     return home / "state" / "worklink" / "transcripts"
 
 
-def _write_transcript(
+def _bounded_transcript_tail(value: str, limit: int) -> str:
+    scrubbed = redact_text(value)
+    encoded = scrubbed.encode("utf-8")
+    if len(encoded) <= limit:
+        return scrubbed
+    marker = _TRANSCRIPT_TRUNCATED.encode("utf-8")
+    if limit <= len(marker):
+        return encoded[-limit:].decode("utf-8", errors="ignore")
+    return _TRANSCRIPT_TRUNCATED + encoded[-(limit - len(marker)):].decode(
+        "utf-8", errors="ignore"
+    )
+
+
+def _bounded_transcript_command(command: Sequence[str]) -> list[str]:
+    retained: list[str] = []
+    remaining = _TRANSCRIPT_COMMAND_MAX_BYTES
+    for arg in command:
+        if remaining <= 0:
+            retained.append("[remaining command omitted by Worklink]")
+            break
+        bounded = _bounded_transcript_tail(str(arg), remaining)
+        retained.append(bounded)
+        remaining -= len(bounded.encode("utf-8"))
+    return retained
+
+
+def write_transcript(
     path: Path,
     *,
     command: Sequence[str],
@@ -468,17 +500,26 @@ def _write_transcript(
 ) -> None:
     payload = {
         "backend": "opencode",
-        "command": list(command),
+        "command": _bounded_transcript_command(command),
         "exit_code": exit_code,
         "status": status,
-        "stdout": stdout,
-        "stderr": stderr,
+        "stdout": _bounded_transcript_tail(stdout, TRANSCRIPT_STREAM_MAX_BYTES),
+        "stderr": _bounded_transcript_tail(stderr, TRANSCRIPT_STREAM_MAX_BYTES),
         "timed_out": timed_out,
         "output_overflow": output_overflow,
         "recorded_at": datetime.now(UTC).isoformat(),
     }
-    path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
-
+    encoded = json.dumps(payload, indent=2, sort_keys=True).encode("utf-8")
+    if len(encoded) > TRANSCRIPT_MAX_BYTES:
+        raise ValueError("OpenCode transcript exceeds size limit")
+    path.write_bytes(encoded)
+    siblings = sorted(
+        path.parent.glob(f"opencode-{path.name.split('-', 2)[1]}-*.json"),
+        key=lambda candidate: (candidate.stat().st_mtime_ns, candidate.name),
+        reverse=True,
+    )
+    for stale in siblings[TRANSCRIPTS_PER_ISSUE:]:
+        stale.unlink(missing_ok=True)
 
 def _status_from_output(exit_code: int, stdout: str, stderr: str) -> str:
     combined = f"{stdout}\n{stderr}".lower()

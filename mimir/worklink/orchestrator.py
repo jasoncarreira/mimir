@@ -65,6 +65,7 @@ from ..repository_config import RepositoryInventory
 from ..secret_scan import secret_matches
 from .safe_git import ControllerGitPublication
 from .backends.feature_factory import FactoryStatus, FeatureFactoryBackend
+from .backends.opencode import transcript_path, write_transcript
 from .factory_state import (
     FactoryRunRecord,
     archive_factory_record,
@@ -79,6 +80,7 @@ _CLAIM_HEARTBEAT_INTERVAL_S = 60.0
 _PR_BODY_SECTION_FILE = ".worklink-pr-body.md"
 _PR_BODY_SECTION_MAX_BYTES = 4000
 _PR_BODY_SECTION_TRUNCATED = "\n\n[Build summary truncated by Worklink.]"
+_FACTORY_CONTROLLER_ERROR_MAX_BYTES = 4000
 _EVIDENCE_HEADING_RE = re.compile(r"(?im)^Worklink evidence:\s*$")
 # GitHub's documented closing-keyword set:
 # https://docs.github.com/en/issues/tracking-your-work-with-issues/using-issues/linking-a-pull-request-to-an-issue
@@ -1573,6 +1575,7 @@ class WorklinkRunner:
                 status=None,
                 observed_at=None,
                 controller_phase="running",
+                transcript=None,
             )
             _create_factory_sandbox(factory_record, lease)
             handle = await compute.launch(spec)
@@ -1606,7 +1609,7 @@ class WorklinkRunner:
                     replace(
                         current,
                         controller_phase="failed",
-                        controller_error=str(exc),
+                        controller_error=_factory_controller_error(exc),
                     ),
                 )
             claims.transition_issue(
@@ -1776,6 +1779,7 @@ class WorklinkRunner:
             retained.observed(resumed, datetime.now(UTC).isoformat()),
             handle=handle,
             controller_phase="running",
+            transcript=None,
         )
         try:
             save_factory_record(self.home, relaunched)
@@ -1832,6 +1836,32 @@ class WorklinkRunner:
         status = initial_status
         failed = True
         cancel_attempted = False
+        wait_result: ComputeResult | None = None
+
+        def retain_result(result: ComputeResult | None, outcome: str) -> None:
+            nonlocal factory_record
+            if factory_record.transcript is not None:
+                return
+            path = transcript_path(
+                self.home / "state" / "worklink" / "transcripts",
+                issue.issue_id,
+            )
+            write_transcript(
+                path,
+                command=() if result is None else result.command,
+                exit_code=None if result is None else result.exit_code,
+                status=outcome,
+                stdout="" if result is None else result.stdout,
+                stderr=(
+                    "OpenCode supervision result was not drainable"
+                    if result is None
+                    else result.stderr
+                ),
+                timed_out=False if result is None else result.timed_out,
+                output_overflow=False if result is None else result.output_overflow,
+            )
+            factory_record = replace(factory_record, transcript=str(path))
+            save_factory_record(self.home, factory_record)
 
         async def cancel_once() -> None:
             nonlocal cancel_attempted
@@ -1909,7 +1939,10 @@ class WorklinkRunner:
                     if status.is_terminal or status.is_parked:
                         if not wait_task.done():
                             await cancel_once()
-                            await _finish_factory_wait_task(wait_task)
+                            wait_result = await _finish_factory_wait_task(wait_task)
+                        else:
+                            wait_result = await wait_task
+                        retain_result(wait_result, status.status or phase)
                         failed = False
                         return await self._finish_factory_070(
                             issue=issue,
@@ -1925,10 +1958,12 @@ class WorklinkRunner:
                 if wait_task.done() or not compute.job_alive(handle):
                     try:
                         result = await asyncio.wait_for(asyncio.shield(wait_task), timeout=5)
+                        wait_result = result
                     except TimeoutError as exc:
                         raise WorklinkError(
                             "OpenCode process stopped without a drainable supervision result"
                         ) from exc
+                    retain_result(result, "failed")
                     detail = result.stderr.strip() or result.stdout.strip()
                     suffix = f": {detail[:300]}" if detail else ""
                     raise WorklinkError(
@@ -1943,14 +1978,20 @@ class WorklinkRunner:
                 await asyncio.sleep(poll_delay)
                 status = None
         finally:
-            if failed and not wait_task.done():
-                try:
-                    await cancel_once()
-                finally:
-                    await _finish_factory_wait_task(wait_task)
-            elif wait_task.done():
-                await asyncio.gather(wait_task, return_exceptions=True)
-            await compute.cleanup(handle)
+            try:
+                if failed and not wait_task.done():
+                    try:
+                        await cancel_once()
+                    finally:
+                        wait_result = await _finish_factory_wait_task(wait_task)
+                        retain_result(wait_result, "refused")
+                elif wait_task.done():
+                    drained = await asyncio.gather(wait_task, return_exceptions=True)
+                    if wait_result is None and drained and isinstance(drained[0], ComputeResult):
+                        wait_result = drained[0]
+                    retain_result(wait_result, "refused" if failed else "completed")
+            finally:
+                await compute.cleanup(handle)
 
     async def _finish_factory_070(
         self,
@@ -2019,12 +2060,26 @@ class WorklinkRunner:
             branch=factory_record.branch,
         )
 
-async def _finish_factory_wait_task(task: asyncio.Task[ComputeResult]) -> None:
+async def _finish_factory_wait_task(
+    task: asyncio.Task[ComputeResult],
+) -> ComputeResult | None:
     try:
-        await asyncio.wait_for(asyncio.shield(task), timeout=5)
+        return await asyncio.wait_for(asyncio.shield(task), timeout=5)
     except TimeoutError:
         task.cancel()
         await asyncio.gather(task, return_exceptions=True)
+        return None
+
+
+def _factory_controller_error(error: BaseException) -> str:
+    encoded = redact_text(str(error)).encode("utf-8")
+    if len(encoded) <= _FACTORY_CONTROLLER_ERROR_MAX_BYTES:
+        return encoded.decode("utf-8")
+    marker = b"[controller error truncated; see transcript]"
+    prefix = encoded[: _FACTORY_CONTROLLER_ERROR_MAX_BYTES - len(marker)].decode(
+        "utf-8", errors="ignore"
+    )
+    return prefix.rstrip() + marker.decode("ascii")
 
 
 async def _cancel_and_cleanup_factory_handle(compute: Any, handle: LaunchHandle) -> None:
