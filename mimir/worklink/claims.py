@@ -21,6 +21,10 @@ from typing import Any, Callable, Iterable, Sequence
 
 CLAIM_PREFIX = "WORKLINK_CLAIM "
 
+# Standalone callers without a Worklink config get the same finite safety
+# budget as a missing or malformed defaults.max_claim_attempts setting.
+DEFAULT_MAX_CLAIM_ATTEMPTS = 3
+
 #: Operator marker that forgives the attempts consumed before it. The attempt
 #: budget is derived from claim comments, so an infrastructure fault that fails
 #: every attempt — a broken base-repo fetch, a reclaimed object store — exhausts a
@@ -290,7 +294,7 @@ class ChainlinkClaims:
         agent_id: str,
         runner: Runner = _default_runner,
         clock: Callable[[], datetime] | None = None,
-        max_attempts: int = 3,
+        max_attempts: int = DEFAULT_MAX_CLAIM_ATTEMPTS,
         duplicate_freshness_s: float = 600.0,
         home_path: str | Path | None = None,
         event_logger: EventLogger | None = None,

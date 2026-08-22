@@ -498,6 +498,7 @@ class WorklinkRunner:
             runner=_list_runner(runner),
             home_path=self.home,
             event_logger=_log_event,
+            max_attempts=config.defaults.max_claim_attempts,
         )
         # Re-read immediately before claiming so retries in a long-lived caller do
         # not use stale comments and collide with prior attempt-scoped branches.
@@ -1039,12 +1040,14 @@ class WorklinkRunner:
             return WorklinkRunResult(issue_id, None, "failed", reason="reattach: no run state")
 
         runner = self.runner or _runner_for_home(self.home, self.chainlink_bin)
+        config = WorklinkConfig.load(self.home / "worklink.yaml")
         claims = ChainlinkClaims(
             chainlink_bin=self.chainlink_bin,
             agent_id=self.agent_id,
             runner=_list_runner(runner),
             home_path=self.home,
             event_logger=_log_event,
+            max_attempts=config.defaults.max_claim_attempts,
         )
         if state.shim_pid is not None:
             handle = LaunchHandle(
@@ -1150,7 +1153,6 @@ class WorklinkRunner:
                 issue_id, state.attempt, "failed", reason="reattach: leaf no longer in-progress"
             )
 
-        config = WorklinkConfig.load(self.home / "worklink.yaml")
         registry = self.registry or BackendRegistry(config)
         try:
             backend = registry.get(state.backend)
@@ -1376,6 +1378,7 @@ class WorklinkRunner:
             runner=_list_runner(runner),
             home_path=self.home,
             event_logger=_log_event,
+            max_attempts=config.defaults.max_claim_attempts,
         )
         issue = issue_reader.read(issue_id)
         claim = claims.claim_issue(
