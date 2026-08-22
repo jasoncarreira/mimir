@@ -48,7 +48,7 @@ defaults:
   timeout_s: 1800
   test_command: uv run pytest -q
   max_concurrent: 2
-  reaper_ttl_s: 7200
+  reaper_ttl_s: 86400
   allow_autonomous_local_subprocess: true
 backends:
   opencode:
@@ -252,9 +252,13 @@ The detached executor, not the poller, owns the claim protocol:
 5. It releases the lock after the terminal label transition.
 
 The stale-claim reaper is enabled by setting a schedule for
-`MIMIR_WORKLINK_REAPER_CRON`. It uses `defaults.reaper_ttl_s` (default 7200)
+`MIMIR_WORKLINK_REAPER_CRON`. It uses `defaults.reaper_ttl_s` (default 86400)
 against the latest claim/heartbeat timestamp, steals only stale locks, and
 returns the leaf to `worklink:ready` unless its attempt budget is exhausted.
+Existing deployments must set this value to at least twice the greater of
+`defaults.timeout_s` and `MIMIR_FACTORY_RUN_TIMEOUT_S` (86400 with the shipped
+12-hour factory timeout). During migration, lower configured values are raised
+to that floor with a warning rather than disabling Worklink at startup.
 
 The leaf claim budget is three charged attempts in the current runtime. The
 parsed `defaults.max_claim_attempts` key is compatibility-only and does not

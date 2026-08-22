@@ -847,7 +847,7 @@ defaults:
   timeout_s: 1800
   priority: normal          # arbiter priority for autonomous dispatch (low|normal|high)
   max_concurrent: 2         # cap on concurrent autonomous claims (poller + tool); CLI uncapped
-  reaper_ttl_s: 7200        # claim age (no heartbeat) before the TTL reaper steals it back
+  reaper_ttl_s: 86400       # >= 2 * max(timeout_s, factory timeout); lower legacy values warn + clamp
   allow_autonomous_local_subprocess: false  # autonomy policy (#460, #832): autonomous dispatch
                             # refuses the unsandboxed local_subprocess substrate unless this
                             # is true. The operator CLI is never gated. See §6.5.

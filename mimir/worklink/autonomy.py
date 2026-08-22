@@ -191,7 +191,10 @@ def _attempt_is_active(child: Path, records: Sequence[object] = ()) -> bool:
     resolved = child.resolve()
     for candidate in records:
         sandbox = getattr(candidate, "sandbox", None)
-        if not isinstance(sandbox, str) or Path(sandbox).resolve() != resolved:
+        if not isinstance(sandbox, str):
+            continue
+        resolved_sandbox = Path(sandbox).resolve()
+        if resolved_sandbox != resolved and resolved not in resolved_sandbox.parents:
             continue
         status = getattr(candidate, "status", None)
         if status is not None and (status.is_terminal or status.is_parked):
