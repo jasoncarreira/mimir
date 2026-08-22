@@ -407,6 +407,29 @@ def test_malformed_epic_work_item_fails_before_claim_or_sandbox(
     assert not (repo.parent / ".worklink").exists()
 
 
+def test_factory_launch_binding_rejects_argv_controller_disagreement(tmp_path: Path) -> None:
+    import mimir.worklink.orchestrator as orchestrator
+
+    spec = WorkSpec(
+        issue_id=700,
+        attempt=1,
+        repo_url="https://github.com/owner/repo.git",
+        base_ref="main",
+        branch="feature/chainlink-700",
+        prompt="",
+        rules=None,
+        test_command="pytest",
+        backend="feature_factory",
+        timeout_s=30,
+        backend_config={"run_id": "chainlink-700"},
+        local_checkout=tmp_path,
+        local_argv=("opencode", "run", " --autonomous chainlink-701"),
+    )
+
+    with pytest.raises(WorklinkError, match="does not match the supervised run_id"):
+        orchestrator._require_factory_launch_binding(spec, "chainlink-700")
+
+
 def test_preclaim_registry_crash_emits_scrubbed_failure_event(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -3112,6 +3135,9 @@ def test_factory_early_failed_record_is_archived_before_fresh_run(
         sandbox = fresh_sandbox / ".factory-sandboxes" / "chainlink-700"
         assert sandbox.is_dir()
         assert not sandbox.is_symlink()
+        assert spec.local_argv is not None
+        assert spec.local_argv[-1].split()[-1] == "chainlink-700"
+        assert json.loads(spec.env["MIMIR_WORK_ITEM_JSON"])["run_id"] == "chainlink-700"
         return LaunchHandle("local_subprocess", "123", 456)
 
     async def supervise(self: object, **kwargs: object) -> object:

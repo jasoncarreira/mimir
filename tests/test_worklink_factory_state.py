@@ -93,6 +93,18 @@ def test_factory_record_rejects_identity_and_sandbox_mismatch(tmp_path: Path) ->
         replace(expected, sandbox=str(tmp_path / "different"))
 
 
+def test_factory_record_rejects_sandbox_path_for_another_run(tmp_path: Path) -> None:
+    expected = replace(
+        record(tmp_path),
+        run_id="chainlink-1551",
+        sandbox=str(tmp_path / "chainlink-1551"),
+        status=None,
+    )
+
+    with pytest.raises(FactoryRecordError, match="sandbox does not match run id"):
+        replace(expected, sandbox=str(tmp_path / "chainlink-1552"))
+
+
 def test_factory_record_binds_nullable_status_to_durable_identity(tmp_path: Path) -> None:
     expected = record(tmp_path)
     status = expected.status

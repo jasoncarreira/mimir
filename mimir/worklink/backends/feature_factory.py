@@ -49,6 +49,7 @@ _DEFAULT_FACTORY_MAX_RETRIES = 5
 _MAX_FACTORY_MAX_RETRIES = 9_007_199_254_740_991
 _FACTORY_MAX_RETRIES_ENV = "MIMIR_FACTORY_MAX_RETRIES"
 _ASCII_DECIMAL = re.compile(r"[0-9]+")
+_RUN_ID = re.compile(r"[a-z0-9](?:[a-z0-9._-]*[a-z0-9])?")
 _UNKNOWN_STRUCTURE = re.compile(r"(?im)\b(?:unknown|unrecognized)\b[^\n]*\bcommand\b")
 
 Runner = Callable[..., subprocess.CompletedProcess[Any]]
@@ -575,7 +576,16 @@ class FeatureFactoryBackend:
                 f"feature_factory_opencode_resolution_failed:{exc.reason_code}"
             ) from exc
         invocation = resolution.invocation
-        command = self.opencode_argv(order.checkout, order.issue_id, invocation.model)
+        run_id = epic_run_id(order.issue_id)
+        work_item_json = order.env.get("MIMIR_WORK_ITEM_JSON")
+        if work_item_json is not None:
+            try:
+                work_item = json.loads(work_item_json)
+            except json.JSONDecodeError as exc:
+                raise FactoryContractError("factory work item JSON is malformed") from exc
+            if not isinstance(work_item, dict) or work_item.get("run_id") != run_id:
+                raise FactoryContractError("factory work item run_id does not match the launch run_id")
+        command = self.opencode_argv(order.checkout, run_id, invocation.model)
         return WorkSpec(
             issue_id=order.issue_id,
             attempt=attempt,
@@ -590,6 +600,7 @@ class FeatureFactoryBackend:
             env=order.env,
             backend_config={
                 "entrypoint": str(self.entrypoint),
+                "run_id": run_id,
                 "model": invocation.model,
                 "configured_model": resolution.configured_model,
                 "model_diverged": resolution.model_diverged,
@@ -601,8 +612,10 @@ class FeatureFactoryBackend:
 
     @staticmethod
     def opencode_argv(
-        operator_checkout: Path, issue_number: int, model: str
+        operator_checkout: Path, run_id: str, model: str
     ) -> tuple[str, ...]:
+        if _RUN_ID.fullmatch(run_id) is None:
+            raise FactoryContractError("factory launch run_id has an invalid shape")
         retries = _factory_max_retries()
         # feature-factory 0.7.2 stages the workflow inside the run directory, so
         # OpenCode --auto must not bypass it.
@@ -618,7 +631,7 @@ class FeatureFactoryBackend:
             str(operator_checkout),
             "--command",
             "feature",
-            f" --autonomous --max-retries {retries} {issue_number}",
+            f" --autonomous --max-retries {retries} {run_id}",
         )
 
     def _control(
@@ -740,4 +753,7 @@ def _control_environment() -> dict[str, str]:
 def epic_run_id(issue_id: int) -> str:
     if isinstance(issue_id, bool) or issue_id <= 0:
         raise ValueError("factory issue id must be positive")
-    return str(issue_id)
+    run_id = f"chainlink-{issue_id}"
+    if _RUN_ID.fullmatch(run_id) is None:
+        raise ValueError("factory issue id does not produce a valid run id")
+    return run_id

@@ -84,6 +84,8 @@ class FactoryRunRecord:
                 raise FactoryRecordError("factory record status sandbox mismatch")
             if self.status.pr_base is not None and self.status.pr_base != self.base_ref:
                 raise FactoryRecordError("factory record status base mismatch")
+        if self.run_id.startswith("chainlink-") and Path(self.sandbox).name != self.run_id:
+            raise FactoryRecordError("factory record sandbox does not match run id")
         if self.controller_error is not None and len(self.controller_error.encode("utf-8")) > 65536:
             raise FactoryRecordError("factory record error exceeds size limit")
         if self.transcript is not None and (
