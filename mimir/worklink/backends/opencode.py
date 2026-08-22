@@ -11,10 +11,11 @@ import os
 from pathlib import Path
 import re
 import time
-from typing import Awaitable, Callable, Sequence
+from typing import Awaitable, Callable, Mapping, Sequence
 
 from ...config import model_spec_at_call_time
 from ...opencode_config import (
+    OpenCodeInvocation,
     opencode_model_from_agent_spec,
     opencode_worker_documents,
     resolve_opencode_invocation,
@@ -90,6 +91,40 @@ class WorkerProjection:
 
 
 @dataclass(frozen=True)
+class WorklinkOpenCodeResolution:
+    invocation: OpenCodeInvocation
+    configured_model: str
+    model_diverged: bool
+    env: Mapping[str, str] = field(repr=False)
+
+
+def resolve_worklink_opencode_invocation(
+    env: Mapping[str, str],
+) -> WorklinkOpenCodeResolution:
+    """Resolve an OpenCode invocation consistently for every Worklink path."""
+    model_home = Path(env["MIMIR_HOME"]) if env.get("MIMIR_HOME") else None
+    dotenv_model_spec = model_spec_at_call_time(model_home)
+    configured_model_spec = env.get("MIMIR_MODEL_SPEC", dotenv_model_spec)
+    resolution_env = {**os.environ, **env}
+    resolution_env.setdefault("MIMIR_MODEL_SPEC", configured_model_spec)
+    invocation = resolve_opencode_invocation(env=resolution_env)
+    configured_model = opencode_model_from_agent_spec(configured_model_spec)
+    model_diverged = invocation.model != configured_model
+    if model_diverged:
+        log.warning(
+            "Worklink OpenCode model %s differs from configured agent model %s",
+            invocation.model,
+            configured_model,
+        )
+    return WorklinkOpenCodeResolution(
+        invocation=invocation,
+        configured_model=configured_model,
+        model_diverged=model_diverged,
+        env=resolution_env,
+    )
+
+
+@dataclass(frozen=True)
 class OpenCodeBackend:
     """Adapter for ``opencode run`` Worklink jobs.
 
@@ -130,21 +165,10 @@ class OpenCodeBackend:
         prompt = _prompt_for_order(order)
         args = list(self.extra_args)
         env = dict(order.env)
-        model_home = Path(env["MIMIR_HOME"]) if env.get("MIMIR_HOME") else None
-        dotenv_model_spec = model_spec_at_call_time(model_home)
-        configured_model_spec = env.get("MIMIR_MODEL_SPEC", dotenv_model_spec)
-        resolution_env = {**os.environ, **env}
-        resolution_env.setdefault("MIMIR_MODEL_SPEC", configured_model_spec)
-        invocation = resolve_opencode_invocation(env=resolution_env)
+        resolution = resolve_worklink_opencode_invocation(env)
+        invocation = resolution.invocation
+        resolution_env = resolution.env
         args.extend(("-m", invocation.model))
-        configured_model = opencode_model_from_agent_spec(configured_model_spec)
-        model_diverged = invocation.model != configured_model
-        if model_diverged:
-            log.warning(
-                "Worklink OpenCode model %s differs from configured agent model %s",
-                invocation.model,
-                configured_model,
-            )
         if invocation.config_path.exists() or "OPENCODE_CONFIG" in env:
             env["OPENCODE_CONFIG"] = str(invocation.config_path)
         for key in invocation.pass_env:
@@ -165,8 +189,8 @@ class OpenCodeBackend:
             "args": args,
             "bash_allowlist": list(self.bash_allowlist),
             "model": invocation.model,
-            "configured_model": configured_model,
-            "model_diverged": model_diverged,
+            "configured_model": resolution.configured_model,
+            "model_diverged": resolution.model_diverged,
             "model_source": invocation.model_source,
         }
         enabled = _coding_enabled()

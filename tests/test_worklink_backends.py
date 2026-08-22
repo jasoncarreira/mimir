@@ -877,6 +877,16 @@ async def test_feature_factory_launch_remains_shell_free_argv(
     monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
     monkeypatch.setattr("mimir.worklink.compute._local_child_env", dict)
     monkeypatch.delenv("MIMIR_FACTORY_MAX_RETRIES", raising=False)
+    monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
+    monkeypatch.delenv("XDG_DATA_HOME", raising=False)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("MIMIR_MODEL_SPEC", "codex-plus:gpt-5.6-luna")
+    auth = tmp_path / ".local" / "share" / "opencode" / "auth.json"
+    auth.parent.mkdir(parents=True)
+    auth.write_text(
+        json.dumps({"openai": {"type": "oauth", "refresh": "subscription"}}),
+        encoding="utf-8",
+    )
     order = WorkOrder(
         issue_id=1606,
         checkout=tmp_path,
@@ -904,6 +914,8 @@ async def test_feature_factory_launch_remains_shell_free_argv(
         "--log-level",
         "DEBUG",
         "--print-logs",
+        "-m",
+        "openai/gpt-5.6-luna",
         "--dir",
         str(tmp_path),
         "--command",
