@@ -67,6 +67,7 @@ from .safe_git import ControllerGitPublication
 from .backends.feature_factory import FactoryStatus, FeatureFactoryBackend
 from .factory_state import (
     FactoryRunRecord,
+    archive_factory_record,
     factory_process_is_alive,
     factory_process_is_verified_dead,
     load_factory_record,
@@ -1396,19 +1397,27 @@ class WorklinkRunner:
         lease: CheckoutLease | None = None
         try:
             if retained is not None:
-                return await self._recover_factory_070(
-                    issue=issue,
-                    claim_record=claim_record,
-                    claims=claims,
-                    backend=selected,
-                    compute=compute,
-                    retained=retained,
-                    launcher=launcher,
-                    repo_slug=repo_slug,
-                    base=base,
-                    test_cmd=test_cmd,
-                    runner=runner,
-                )
+                recoverable_phase = retained.controller_phase in {
+                    "running",
+                    "parked",
+                    "failed",
+                    "terminal",
+                }
+                if _factory_record_is_recoverable(retained) or not recoverable_phase:
+                    return await self._recover_factory_070(
+                        issue=issue,
+                        claim_record=claim_record,
+                        claims=claims,
+                        backend=selected,
+                        compute=compute,
+                        retained=retained,
+                        launcher=launcher,
+                        repo_slug=repo_slug,
+                        base=base,
+                        test_cmd=test_cmd,
+                        runner=runner,
+                    )
+                archive_factory_record(self.home, retained)
             lease = _create_backend_checkout(
                 self.repo,
                 issue_id=issue_id,
@@ -1906,6 +1915,12 @@ async def _cancel_and_cleanup_factory_handle(compute: Any, handle: LaunchHandle)
         await compute.cancel(handle)
     finally:
         await compute.cleanup(handle)
+
+
+def _factory_record_is_recoverable(record: FactoryRunRecord) -> bool:
+    return record.controller_phase in {"running", "parked", "failed", "terminal"} and bool(
+        record.session
+    )
 
 
 def _opaque_json_bytes(value: dict[str, Any] | None) -> bytes:

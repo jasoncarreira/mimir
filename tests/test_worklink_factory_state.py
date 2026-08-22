@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
+import json
 from pathlib import Path
 
 import pytest
@@ -10,6 +11,7 @@ from mimir.worklink.compute import LaunchHandle
 from mimir.worklink.factory_state import (
     FactoryRecordError,
     FactoryRunRecord,
+    archive_factory_record,
     clear_factory_record,
     list_factory_records,
     load_factory_record,
@@ -68,6 +70,19 @@ def test_factory_record_round_trip_is_atomic_and_has_no_cost_fields(tmp_path: Pa
     assert list_factory_records(tmp_path) == [expected]
     assert "cost" not in path.read_text(encoding="utf-8")
     assert not list(path.parent.glob("*.tmp"))
+
+
+def test_archive_factory_record_preserves_evidence_and_vacates_active_slot(
+    tmp_path: Path,
+) -> None:
+    expected = replace(record(tmp_path), controller_phase="failed", session=None)
+    source = save_factory_record(tmp_path, expected)
+
+    archived = archive_factory_record(tmp_path, expected)
+
+    assert archived == source.parent / "archive" / "1551-attempt-1.json"
+    assert FactoryRunRecord.from_json(json.loads(archived.read_text(encoding="utf-8"))) == expected
+    assert load_factory_record(tmp_path, "1551") is None
 
 
 def test_factory_record_rejects_identity_and_sandbox_mismatch(tmp_path: Path) -> None:

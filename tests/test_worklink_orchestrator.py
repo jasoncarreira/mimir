@@ -31,7 +31,7 @@ from mimir.worklink.claims import ChainlinkClaims, ClaimRecord, ClaimResult, cla
 from mimir.worklink.compute import LaunchHandle, WorkSpec
 from mimir.worklink.checkout import CheckoutLease
 from mimir.worklink.backends.feature_factory import FeatureFactoryBackend, parse_factory_status
-from mimir.worklink.factory_state import FactoryRunRecord
+from mimir.worklink.factory_state import FactoryRunRecord, load_factory_record, save_factory_record
 from mimir.worklink.orchestrator import (
     IssueContext,
     LeafValidationError,
@@ -2796,7 +2796,21 @@ def test_factory_identity_preflight_is_not_repeated_for_retained_run(
         return cp(args)
 
     claim = ClaimRecord(700, 1, "agent", datetime.now(UTC))
-    retained = object()
+    retained = FactoryRunRecord(
+        run_id="700",
+        issue_id=700,
+        attempt=1,
+        repository="owner/repo",
+        base_ref="main",
+        branch="epic/700",
+        launcher="/opt/factory/bin/factory.js",
+        sandbox=str(tmp_path / "sandbox"),
+        session="session-1",
+        handle=None,
+        status=None,
+        observed_at=None,
+        controller_phase="running",
+    )
 
     async def recover(self: object, **kwargs: object) -> object:
         assert kwargs["retained"] is retained
@@ -2825,6 +2839,155 @@ def test_factory_identity_preflight_is_not_repeated_for_retained_run(
     )
 
     assert result.status == "needs-human"
+
+
+def test_factory_early_failed_record_is_archived_before_fresh_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import mimir.worklink.orchestrator as orchestrator
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    old_sandbox = tmp_path / "factory-checkout-1"
+    old_sandbox.mkdir()
+    fresh_sandbox = tmp_path / "factory-checkout-2"
+    fresh_sandbox.mkdir()
+    epic = json.dumps(
+        {
+            "id": 700,
+            "title": "epic",
+            "description": "build",
+            "labels": ["worklink", "worklink:epic", "worklink:ready"],
+            "comments": [],
+        }
+    )
+    retained = FactoryRunRecord(
+        run_id="700",
+        issue_id=700,
+        attempt=1,
+        repository="owner/repo",
+        base_ref="main",
+        branch="issue/700-a1",
+        launcher="/opt/factory/bin/factory.js",
+        sandbox=str(old_sandbox),
+        session=None,
+        handle=LaunchHandle("local_subprocess", "999999999", 1),
+        status=None,
+        observed_at=None,
+        controller_phase="failed",
+        controller_error="factory status missing field: branch",
+    )
+    save_factory_record(tmp_path, retained)
+    claim = ClaimRecord(700, 2, "agent", datetime.now(UTC), budget_attempt=2)
+    lease = CheckoutLease(
+        issue_id=700,
+        attempt=2,
+        repo=repo,
+        path=fresh_sandbox,
+        branch="issue/700-a2",
+        base_ref="main",
+        local_base="origin/main",
+        isolated_checkout=True,
+    )
+    transitions: list[dict[str, object]] = []
+
+    def runner(args: Sequence[str] | str, **_: object) -> subprocess.CompletedProcess[str]:
+        if isinstance(args, list) and args[:4] == ["chainlink", "issue", "show", "700"]:
+            return cp(args, stdout=epic)
+        if isinstance(args, list) and args[:4] == ["git", "-C", str(repo), "config"]:
+            return cp(args, stdout="git@github.com:owner/repo.git\n")
+        return cp(args)
+
+    async def launch(self: object, spec: WorkSpec) -> LaunchHandle:
+        return LaunchHandle("local_subprocess", "123", 456)
+
+    async def supervise(self: object, **kwargs: object) -> object:
+        current = kwargs["factory_record"]
+        assert isinstance(current, FactoryRunRecord)
+        assert current.attempt == 2
+        assert current.sandbox == str(fresh_sandbox)
+        return orchestrator.WorklinkRunResult(700, 2, "needs-human")
+
+    def recover(*args: object, **kwargs: object) -> object:
+        raise AssertionError("sessionless record routed to recovery")
+
+    class VerifiedClient:
+        def __init__(self, *, token: str) -> None:
+            pass
+
+        def verify_identity(self, expected: str) -> None:
+            pass
+
+    monkeypatch.setattr(FeatureFactoryBackend, "admit", lambda self: Path(retained.launcher))
+    monkeypatch.setattr(
+        orchestrator.ChainlinkClaims,
+        "claim_issue",
+        lambda self, *args, **kwargs: ClaimResult(True, claim),
+    )
+    monkeypatch.setattr(
+        orchestrator.ChainlinkClaims, "release_issue", lambda *args, **kwargs: None
+    )
+    monkeypatch.setattr(
+        orchestrator.ChainlinkClaims,
+        "transition_issue",
+        lambda self, *args, **kwargs: transitions.append(kwargs),
+    )
+    monkeypatch.setattr(orchestrator, "_create_backend_checkout", lambda *args, **kwargs: lease)
+    monkeypatch.setattr(
+        orchestrator, "_read_checkout_git_identity", lambda *args: ("Factory", "factory@test")
+    )
+    monkeypatch.setattr(
+        orchestrator, "_read_factory_publishing_identity", lambda *args: ("owner", "test")
+    )
+    monkeypatch.setattr(
+        orchestrator,
+        "_resolve_factory_github_credential",
+        lambda *args: ("token", {"GH_TOKEN": "token", "GITHUB_TOKEN": "token"}),
+    )
+    monkeypatch.setattr(orchestrator, "GitHubForgeClient", VerifiedClient)
+    monkeypatch.setattr(orchestrator.LocalSubprocessComputeBackend, "launch", launch)
+    monkeypatch.setattr(WorklinkRunner, "_supervise_factory_070", supervise)
+    monkeypatch.setattr(WorklinkRunner, "_recover_factory_070", recover)
+
+    result = asyncio.run(
+        WorklinkRunner(home=tmp_path, repo=repo, runner=runner, agent_id="agent").run_epic(700)
+    )
+
+    assert result.status == "needs-human"
+    assert transitions == []
+    assert load_factory_record(tmp_path, "700").attempt == 2
+    archives = list(
+        (tmp_path / "state" / "worklink" / "factory-runs" / "archive").glob("*.json")
+    )
+    assert len(archives) == 1
+    assert FactoryRunRecord.from_json(
+        json.loads(archives[0].read_text(encoding="utf-8"))
+    ) == retained
+    assert old_sandbox.is_dir()
+
+
+@pytest.mark.parametrize("phase", ["running", "parked", "failed", "terminal"])
+def test_factory_recovery_selection_requires_session(phase: str, tmp_path: Path) -> None:
+    import mimir.worklink.orchestrator as orchestrator
+
+    record = FactoryRunRecord(
+        run_id="700",
+        issue_id=700,
+        attempt=1,
+        repository="owner/repo",
+        base_ref="main",
+        branch="epic/700",
+        launcher="/opt/factory/bin/factory.js",
+        sandbox=str(tmp_path / "sandbox"),
+        session="session-1",
+        handle=None,
+        status=None,
+        observed_at=None,
+        controller_phase=phase,
+    )
+
+    assert orchestrator._factory_record_is_recoverable(record)
+    assert not orchestrator._factory_record_is_recoverable(replace(record, session=None))
 
 
 @pytest.mark.parametrize("autonomous", [False, True])

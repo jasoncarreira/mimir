@@ -184,6 +184,10 @@ def factory_record_path(home: Path, run_id: str) -> Path:
     return factory_records_dir(home) / f"{run_id}.json"
 
 
+def factory_record_archive_dir(home: Path) -> Path:
+    return factory_records_dir(home) / "archive"
+
+
 def _require_safe_directory(path: Path, *, create: bool) -> bool:
     absolute = path.absolute()
     chain = tuple(reversed((absolute, *absolute.parents)))
@@ -251,6 +255,26 @@ def load_factory_record(home: Path, run_id: str) -> FactoryRunRecord | None:
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise FactoryRecordError("factory record is malformed") from exc
     return FactoryRunRecord.from_json(data)
+
+
+def archive_factory_record(home: Path, record: FactoryRunRecord) -> Path:
+    source = factory_record_path(home, record.run_id)
+    loaded = load_factory_record(home, record.run_id)
+    if loaded != record:
+        raise FactoryRecordError("factory record changed before archival")
+    directory = factory_record_archive_dir(home)
+    _require_safe_directory(directory, create=True)
+    stem = f"{record.run_id}-attempt-{record.attempt}"
+    destination = directory / f"{stem}.json"
+    suffix = 1
+    while destination.exists() or destination.is_symlink():
+        destination = directory / f"{stem}-{suffix}.json"
+        suffix += 1
+    try:
+        os.replace(source, destination)
+    except OSError as exc:
+        raise FactoryRecordError("factory record cannot be archived") from exc
+    return destination
 
 
 def list_factory_records(home: Path) -> list[FactoryRunRecord]:
