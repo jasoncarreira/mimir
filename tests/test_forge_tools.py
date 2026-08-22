@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass, replace
+from types import SimpleNamespace
 
 import pytest
 from langchain.tools import ToolRuntime
@@ -12,6 +13,9 @@ from langgraph.prebuilt import ToolNode
 from langgraph.runtime import Runtime
 
 import mimir.access_control as access_control
+import mimir.tools.budget_gate as budget_gate
+import mimir.tools.github_review_guard as github_review_guard
+from mimir._context import reset_current_turn, set_current_turn
 from mimir.event_logger import _reset_logger_for_tests, init_logger
 from mimir.forge import (
     CheckProjection,
@@ -1161,18 +1165,17 @@ async def test_schema_invalid_standing_review_call_is_recoverable(
         },
         tool=forge_tool, state={}, runtime=Runtime(context=context),
     )
-    node = ToolNode([forge_tool])
     middleware = BudgetGateMiddleware()
 
     if is_async:
-        async def handler(tool_request):
-            return await node._execute_tool_async(tool_request, "tool_calls", {})
+        async def handler(_tool_request):
+            pytest.fail("schema-invalid call reached the handler")
 
         result = await middleware.awrap_tool_call(request, handler)
     else:
         result = middleware.wrap_tool_call(
             request,
-            lambda tool_request: node._execute_tool_sync(tool_request, "tool_calls", {}),
+            lambda _tool_request: pytest.fail("schema-invalid call reached the handler"),
         )
 
     assert isinstance(result, ToolMessage)
@@ -1180,6 +1183,130 @@ async def test_schema_invalid_standing_review_call_is_recoverable(
     assert missing_field in str(result.content)
     assert "field required" in str(result.content).lower()
     assert "fix the error and try again" in str(result.content).lower()
+
+
+@pytest.mark.parametrize("model_runtime", [None, "model-supplied"])
+@pytest.mark.parametrize("is_async", [False, True])
+@pytest.mark.asyncio
+async def test_model_supplied_runtime_cannot_bypass_standing_review_gates(
+    monkeypatch: pytest.MonkeyPatch,
+    model_runtime: object,
+    is_async: bool,
+) -> None:
+    client = FakeForge()
+    client.snapshot_heads = ["c" * 40]
+    set_forge_client(client)
+    runtime = _runtime(_scope(RepoPRAction.PR_REVIEW, head_sha="c" * 40))
+    context = runtime.context
+    request = ToolCallRequest(
+        tool_call={
+            "name": "pr_submit_review",
+            "args": {
+                "repository": "owner/repo", "pull_request": 17,
+                "verdict": "approve", "body": "Looks good",
+                "runtime": model_runtime,
+            },
+            "id": "model-runtime", "type": "tool_call",
+        },
+        tool=pr_submit_review, state={}, runtime=Runtime(context=context),
+    )
+    authorization_calls = []
+    authorize = access_control.ToolRegistry.authorize_tool
+
+    def capture_authorization(registry, *args, **kwargs):
+        authorization_calls.append((args, kwargs))
+        return authorize(registry, *args, **kwargs)
+
+    monkeypatch.setattr(
+        access_control.ToolRegistry, "authorize_tool", capture_authorization,
+    )
+    turn = SimpleNamespace(
+        turn_id="model-runtime", tool_call_budget=1, tool_call_count=99,
+        auth_context=context, ifc_labels=context.ifc_labels,
+    )
+    token = set_current_turn(turn)
+    try:
+        if is_async:
+            async def handler(_request):
+                pytest.fail("budget-refused tool reached the handler")
+
+            result = await BudgetGateMiddleware().awrap_tool_call(request, handler)
+        else:
+            result = BudgetGateMiddleware().wrap_tool_call(
+                request,
+                lambda _request: pytest.fail("budget-refused tool reached the handler"),
+            )
+    finally:
+        reset_current_turn(token)
+
+    assert result.status == "error"
+    assert "Tool-call budget exhausted" in str(result.content)
+    assert authorization_calls
+    assert client.calls == [("snapshot", "owner/repo", 17)]
+    assert turn.tool_call_count == 99
+    assert context.ifc_state.current(context.ifc_labels) == context.ifc_labels
+
+
+def test_model_supplied_runtime_reaches_remaining_post_authorization_gates(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = FakeForge()
+    client.snapshot_heads = ["c" * 40]
+    set_forge_client(client)
+    runtime = _runtime(_scope(RepoPRAction.PR_REVIEW, head_sha="c" * 40))
+    context = runtime.context
+    request = ToolCallRequest(
+        tool_call={
+            "name": "pr_submit_review",
+            "args": {
+                "repository": "owner/repo", "pull_request": 17,
+                "verdict": "approve", "body": "Looks good", "runtime": None,
+            },
+            "id": "model-runtime-admitted", "type": "tool_call",
+        },
+        tool=pr_submit_review, state={}, runtime=Runtime(context=context),
+    )
+    reached = []
+    check_prohibited = budget_gate._check_prohibited
+    check_budget = budget_gate._check_and_increment_or_deny
+    merge_labels = budget_gate._merge_result_labels
+
+    def capture_prohibited(*args, **kwargs):
+        reached.append("prohibited")
+        return check_prohibited(*args, **kwargs)
+
+    def capture_budget(*args, **kwargs):
+        reached.append("budget")
+        return check_budget(*args, **kwargs)
+
+    def capture_merge(*args, **kwargs):
+        reached.append("label_merge")
+        return merge_labels(*args, **kwargs)
+
+    monkeypatch.setattr(budget_gate, "_check_prohibited", capture_prohibited)
+    monkeypatch.setattr(budget_gate, "_check_and_increment_or_deny", capture_budget)
+    monkeypatch.setattr(budget_gate, "_merge_result_labels", capture_merge)
+    monkeypatch.setattr(
+        github_review_guard,
+        "review_submission_from_request",
+        lambda _request: SimpleNamespace(),
+    )
+    monkeypatch.setattr(
+        github_review_guard,
+        "claim_review_submission",
+        lambda _spec: reached.append("duplicate_claim"),
+    )
+
+    result = BudgetGateMiddleware().wrap_tool_call(
+        request,
+        lambda tool_request: ToolMessage(
+            content="submitted", tool_call_id=tool_request.tool_call["id"],
+        ),
+    )
+
+    assert result.status == "success"
+    assert client.calls == [("snapshot", "owner/repo", 17)]
+    assert reached == ["prohibited", "budget", "duplicate_claim", "label_merge"]
 
 
 @pytest.mark.parametrize("arguments", [None, [], "not-a-mapping"])

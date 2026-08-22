@@ -957,13 +957,15 @@ def _record_argument_validation_failure(
 
 
 def _validated_arguments(request: ToolCallRequest) -> dict[str, Any] | None:
-    """Validate and normalize the concrete call arguments before authz."""
+    """Validate model-supplied arguments before authz, excluding injected fields."""
     tool_call = getattr(request, "tool_call", None) or {}
     arguments = tool_call.get("args", {})
     if not isinstance(arguments, dict):
         return None
     tool = getattr(request, "tool", None)
-    schema = getattr(tool, "args_schema", None)
+    schema = getattr(tool, "tool_call_schema", None)
+    if schema is None:
+        schema = getattr(tool, "args_schema", None)
     if schema is None:
         return dict(arguments)
     normalized = dict(arguments)
@@ -981,6 +983,45 @@ def _validated_arguments(request: ToolCallRequest) -> dict[str, Any] | None:
         _record_argument_validation_failure(exc, set(schema.model_fields))
         return None
     return validated.model_dump(exclude_unset=False)
+
+
+def _argument_validation_refusal(request: ToolCallRequest) -> str:
+    """Describe a schema refusal without rendering model-supplied values."""
+    tool_call = getattr(request, "tool_call", None) or {}
+    arguments = tool_call.get("args", {})
+    if not isinstance(arguments, dict):
+        return "Tool arguments must be an object. Fix the error and try again."
+    tool = getattr(request, "tool", None)
+    schema = getattr(tool, "tool_call_schema", None)
+    if schema is None:
+        schema = getattr(tool, "args_schema", None)
+    if schema is None:
+        return "Tool argument validation failed. Fix the error and try again."
+    try:
+        schema.model_validate(arguments)
+    except Exception as exc:
+        errors = getattr(exc, "errors", None)
+        if callable(errors):
+            try:
+                entries = errors(
+                    include_url=False, include_context=False, include_input=False,
+                )
+            except TypeError:
+                entries = errors()
+            details = []
+            for entry in entries:
+                field = next(
+                    (part for part in entry.get("loc", ()) if isinstance(part, str)),
+                    "arguments",
+                )
+                reason = "Field required" if entry.get("type") == "missing" else "Invalid value"
+                details.append(f"{field}: {reason}")
+            if details:
+                return (
+                    f"Tool argument validation failed: {'; '.join(details)}. "
+                    "Fix the error and try again."
+                )
+    return "Tool argument validation failed. Fix the error and try again."
 
 
 _IFC_DELEGATION_TOOLS = frozenset({
@@ -1458,7 +1499,15 @@ class BudgetGateMiddleware(AgentMiddleware):
                 name=tool_name, status="error",
             )
         if validated_arguments is None and tool_name in _STANDING_REVIEW_TOOLS:
-            return handler(request)
+            refusal = _argument_validation_refusal(request)
+            _record_tool_outcome(tool_name, refused_reason=refusal)
+            _emit_tool_call_sync(
+                tool_name, ok=False, error=refusal, denied=True, arguments=None,
+            )
+            return ToolMessage(
+                content=refusal, tool_call_id=_tool_call_id(request),
+                name=tool_name, status="error",
+            )
         target_channels = _extract_sink_targets(request, auth_context)
         ifc_labels = _current_ifc_labels(auth_context)
 
@@ -1488,6 +1537,16 @@ class BudgetGateMiddleware(AgentMiddleware):
                 tool_call_id=_tool_call_id(request),
                 name=tool_name,
                 status="error",
+            )
+        if validated_arguments is None:
+            refusal = _argument_validation_refusal(request)
+            _record_tool_outcome(tool_name, refused_reason=refusal)
+            _emit_tool_call_sync(
+                tool_name, ok=False, error=refusal, denied=True, arguments=None,
+            )
+            return ToolMessage(
+                content=refusal, tool_call_id=_tool_call_id(request),
+                name=tool_name, status="error",
             )
         if tool_name == "approve_declassification":
             denial = _check_and_increment_or_deny(tool_name)
@@ -1752,7 +1811,15 @@ class BudgetGateMiddleware(AgentMiddleware):
                 name=tool_name, status="error",
             )
         if validated_arguments is None and tool_name in _STANDING_REVIEW_TOOLS:
-            return await handler(request)
+            refusal = _argument_validation_refusal(request)
+            _record_tool_outcome(tool_name, refused_reason=refusal)
+            _emit_tool_call_sync(
+                tool_name, ok=False, error=refusal, denied=True, arguments=None,
+            )
+            return ToolMessage(
+                content=refusal, tool_call_id=_tool_call_id(request),
+                name=tool_name, status="error",
+            )
         target_channels = _extract_sink_targets(request, auth_context)
         ifc_labels = _current_ifc_labels(auth_context)
 
@@ -1782,6 +1849,16 @@ class BudgetGateMiddleware(AgentMiddleware):
                 tool_call_id=_tool_call_id(request),
                 name=tool_name,
                 status="error",
+            )
+        if validated_arguments is None:
+            refusal = _argument_validation_refusal(request)
+            _record_tool_outcome(tool_name, refused_reason=refusal)
+            _emit_tool_call_sync(
+                tool_name, ok=False, error=refusal, denied=True, arguments=None,
+            )
+            return ToolMessage(
+                content=refusal, tool_call_id=_tool_call_id(request),
+                name=tool_name, status="error",
             )
         if tool_name == "approve_declassification":
             denial = _check_and_increment_or_deny(tool_name)
