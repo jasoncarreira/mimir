@@ -148,6 +148,24 @@ def repo_review_git_root(tmp_path):
     return root.resolve()
 
 
+# Host-only Mimir settings: set by an operator or a deployment, never by a test.
+_HOST_ONLY_ENV = frozenset(
+    {
+        "MIMIR_API_KEY",
+        "MIMIR_HOME",
+        "MIMIR_FACTORY_PUBLISHING_IDENTITY",
+    }
+)
+
+# The poller framework injects these into a poller's child process
+# (``mimir/pollers.py`` sets them; ``_POLLER_INJECTED_ENV_KEYS`` is the source of
+# truth, and ``test_env_isolation`` asserts this set stays in step with it).
+# Inheriting them is not merely noisy -- ``STATE_DIR`` is where
+# ``_record_run_failure`` writes dispatch failures, so a test running under an
+# inherited value writes into the live poller store.
+_POLLER_INJECTED_ENV = frozenset({"STATE_DIR", "POLLER_NAME", "MIMIR_HOME"})
+
+
 @pytest.fixture(autouse=True, scope="session")
 def _clear_host_mimir_environment():
     """Pop host-only Mimir settings from os.environ for the test session.
@@ -163,13 +181,23 @@ def _clear_host_mimir_environment():
     ``repositories.yaml`` override temporary ``GITHUB_REPOS`` and writable-root
     settings in authorization tests.
 
+    ``MIMIR_FACTORY_PUBLISHING_IDENTITY`` is host-only for the same reason and
+    was missed when #1624 introduced it. It overrides the ``publishing_identity``
+    a checkout declares in ``.factory.json``, so a deployment that sets it makes
+    every test asserting on the declared identity read the deployment's value
+    instead. That is not hypothetical: it ran green in CI, where the variable is
+    unset, and failed inside mimirbot, where ``compose.env`` sets it -- taking
+    the worklink test gate down, and with it ``review_ready``, the commit step
+    and publication for every build. Tests that exercise the override set it
+    explicitly in the test body.
+
     Same shape as the SAGA_CONFIG cleanup proposed in chainlink #129's
     PR #75 precedent. Session-scoped so we don't churn os.environ on
     every test; autouse so individual test files don't have to opt in.
     """
     saved = {
         name: os.environ.pop(name)
-        for name in ("MIMIR_API_KEY", "MIMIR_HOME")
+        for name in _HOST_ONLY_ENV | _POLLER_INJECTED_ENV
         if name in os.environ
     }
     yield
