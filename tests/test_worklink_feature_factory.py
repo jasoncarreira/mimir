@@ -151,11 +151,60 @@ def test_status_accepts_additive_top_level_fields_after_payload_validation() -> 
         )
 
 
-def test_status_rejects_missing_known_fields_trailing_json_and_nul() -> None:
+@pytest.mark.parametrize("field", ["run_id", "valid", "sandbox_path"])
+def test_status_rejects_missing_guaranteed_fields(field: str) -> None:
     missing = status_payload()
-    missing.pop("mode")
-    with pytest.raises(FactoryContractError, match="missing field"):
+    missing.pop(field)
+    with pytest.raises(FactoryContractError, match=f"missing field: {field}"):
         parse_factory_status(missing)
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        "issue_key",
+        "status",
+        "mode",
+        "branch",
+        "pr_base",
+        "pr_draft",
+        "lock",
+        "dead_lock",
+        "lock_session",
+        "gates",
+        "steps",
+        "slices",
+        "validator",
+        "pr_url",
+        "terminal_result",
+        "next",
+    ],
+)
+def test_status_accepts_each_lifecycle_projection_omitted(field: str) -> None:
+    payload = status_payload()
+    payload.pop(field)
+
+    status = parse_factory_status(payload)
+
+    assert getattr(status, field, None) is None
+
+
+def test_status_parses_072_pre_manifest_diagnostic_shape() -> None:
+    status = parse_factory_status(
+        {
+            "run_id": "1551",
+            "valid": False,
+            "sandbox_path": "/tmp/operator",
+            "error": "run.json does not exist",
+        }
+    )
+
+    assert status.valid is False
+    assert status.branch is None
+    assert status.status is None
+
+
+def test_status_rejects_trailing_json_and_nul() -> None:
     with pytest.raises(FactoryContractError, match="one JSON object"):
         parse_factory_status(json.dumps(status_payload()) + "\n{}")
     with pytest.raises(FactoryContractError, match="bounds"):

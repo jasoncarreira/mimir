@@ -1482,9 +1482,9 @@ def register_routes(
     def _serialize_factory_run_detail(record: FactoryRunRecord) -> dict[str, Any]:
         result = _serialize_factory_run_summary(record)
         state = record.status
-        result["gates"] = state.gates if state is not None else {}
-        result["steps"] = list(state.steps) if state is not None else []
-        result["slices"] = list(state.slices) if state is not None else []
+        result["gates"] = state.gates if state is not None and state.gates is not None else {}
+        result["steps"] = list(state.steps) if state is not None and state.steps is not None else []
+        result["slices"] = list(state.slices) if state is not None and state.slices is not None else []
         result["validator"] = state.validator if state is not None else None
         result["terminal_result"] = (
             state.terminal_result if state is not None else None
