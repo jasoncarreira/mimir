@@ -1737,7 +1737,7 @@ def test_skill_embeds_single_leaf_template_constant() -> None:
     assert LEAF_TEMPLATE_MARKDOWN in skill
 
 
-def test_chainlink_orchestrator_passes_factory_publishing_identity_override() -> None:
+def test_chainlink_orchestrator_passes_controller_environment_overrides() -> None:
     root = Path(__file__).parent.parent
     manifest = json.loads(
         (
@@ -1749,7 +1749,9 @@ def test_chainlink_orchestrator_passes_factory_publishing_identity_override() ->
         ).read_text(encoding="utf-8")
     )
 
-    assert "MIMIR_FACTORY_PUBLISHING_IDENTITY" in manifest["pollers"][0]["pass_env"]
+    pass_env = manifest["pollers"][0]["pass_env"]
+    assert "MIMIR_FACTORY_PUBLISHING_IDENTITY" in pass_env
+    assert "MIMIR_CODING_ENABLED" in pass_env
 
 
 def test_worklink_ignores_planner_suggested_test_command_by_default(

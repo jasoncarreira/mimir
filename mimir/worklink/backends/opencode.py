@@ -342,12 +342,7 @@ class OpenCodeBackend:
 def _coding_enabled() -> bool:
     from .. import checkout
 
-    resolver = getattr(checkout, "coding_enabled", None)
-    if resolver is not None:
-        return bool(resolver())
-    return os.environ.get("MIMIR_CODING_ENABLED", "").strip().lower() in {
-        "1", "true", "yes", "on"
-    }
+    return checkout.coding_enabled()
 
 
 def _is_sqlite_contention(result: ComputeResult) -> bool:
