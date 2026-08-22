@@ -371,9 +371,13 @@ def protected_read_denial_reason(path: Path) -> str | None:
         is_memory_read_path(path)
         and not is_memory_read_path_allowed(path, auth_context)
     )
-    general_protected = not service_scoped and is_protected_read_path(path)
     service_name_protected = is_current_service_protected_read_path(path)
     protected_name = _has_protected_read_name(path)
+    general_protected = is_protected_read_path(path)
+    # A service root may widen the general home boundary, but it must not erase
+    # a protected component consumed by that root.
+    if service_scoped and not (service_name_protected or protected_name):
+        general_protected = False
     if not (
         memory_scope_denied
         or general_protected

@@ -878,7 +878,6 @@ def service_filesystem_read_roots(service: ServicePrincipal | None) -> tuple[Pat
             home_root / "state",
             home_root / "skills",
             home_root / ".mimir_builtin_skills",
-            home_root / ".mimir",
             home_root / "CHANGELOG.md",
         ))
     turn_scratch = current_turn_scratch_root()
@@ -4295,9 +4294,10 @@ def _is_trigger_service_protected_read_path(path: Path) -> bool:
 def _is_service_protected_read_path(
     service: ServicePrincipal | None, root: Path, relative: Path,
 ) -> bool:
-    """Apply protected names, except shipped prompt files in upgrade proposals."""
+    """Apply protected names to the full target, including its matched root."""
+    target = root / relative
     protected = {
-        part.lower() for part in relative.parts
+        part.lower() for part in target.parts
         if part.lower() in _TRIGGER_SERVICE_PROTECTED_READ_NAMES
     }
     return bool(protected) and not (
