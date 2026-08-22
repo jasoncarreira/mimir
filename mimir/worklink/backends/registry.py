@@ -13,6 +13,7 @@ from typing import Any, Mapping
 import yaml
 
 from ...repository_config import valid_repository_slug
+from ..claims import DEFAULT_MAX_CLAIM_ATTEMPTS
 from ..compute import (
     ComputeBackend,
     ComputeCaps,
@@ -127,7 +128,7 @@ class WorklinkDefaults:
     max_review_retries: int = 3
     # chainlink #825: epic claim retry budget (whole-run attempts). Debugging
     # epics legitimately need more headroom than production ones.
-    max_claim_attempts: int = 3
+    max_claim_attempts: int = DEFAULT_MAX_CLAIM_ATTEMPTS
     reviewer_backend: str | None = None
     tiered_review: TieredReviewConfig = field(default_factory=TieredReviewConfig)
 

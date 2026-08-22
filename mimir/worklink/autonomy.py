@@ -107,12 +107,14 @@ def current_agent_id() -> str:
 
 
 def make_claims(home: Path, *, agent_id: str | None = None) -> ChainlinkClaims:
+    defaults = worklink_defaults(home)
     return ChainlinkClaims(
         chainlink_bin=chainlink_bin(),
         agent_id=agent_id or current_agent_id(),
         runner=_home_runner(home),
         home_path=home,
         event_logger=log_event_sync,
+        max_attempts=defaults.max_claim_attempts,
     )
 
 
@@ -145,6 +147,7 @@ def release_claims_for_graceful_shutdown(
         agent_id=agent_id,
         runner=bounded_runner,
         home_path=home,
+        max_attempts=worklink_defaults(home).max_claim_attempts,
     )
     return claims.release_owned_claims_for_shutdown()
 

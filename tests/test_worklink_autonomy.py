@@ -9,6 +9,7 @@ ready-queue poller's discovery/dispatch (cap-respecting, detached).
 
 from __future__ import annotations
 
+import ast
 import json
 import os
 import signal
@@ -22,7 +23,7 @@ from typing import Sequence
 
 import pytest
 
-from mimir.worklink import autonomy
+from mimir.worklink import autonomy, orchestrator
 from mimir.worklink.claims import CLAIM_RESET_PREFIX, ChainlinkClaims, ClaimRecord
 from mimir.worklink.backends.registry import WorklinkConfig, WorklinkDefaults
 from mimir.worklink.dispatch_failures import (
@@ -127,6 +128,74 @@ def test_active_worklink_lock_count_reads_locks_json() -> None:
     claims = ChainlinkClaims(agent_id="t", runner=fake)
     assert claims.active_worklink_lock_count() == 3
     assert claims.issue_ids_with_label("worklink:ready") == []
+
+
+def test_configured_attempt_budget_reaches_every_blocking_boundary(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    (tmp_path / "worklink.yaml").write_text(
+        "defaults:\n  max_claim_attempts: 4\n",
+        encoding="utf-8",
+    )
+    fake = FakeChainlink(in_progress=[62, 63], active_locks=[62, 63])
+    monkeypatch.setattr(autonomy, "_home_runner", lambda home: fake)
+    monkeypatch.setattr(autonomy, "log_event_sync", lambda *args, **kwargs: None)
+    claims = autonomy.make_claims(tmp_path)
+    now = datetime.now(UTC)
+
+    def history(issue_id: int, count: int) -> list[str]:
+        return [
+            ClaimRecord(issue_id, attempt, "old", now - timedelta(days=attempt)).to_comment()
+            for attempt in range(1, count + 1)
+        ]
+
+    # Claim acquisition admits work below the configured budget and blocks at it.
+    assert claims.claim_issue(60, history(60, 3)).claimed is True
+    exhausted = claims.claim_issue(61, history(61, 4))
+    assert exhausted.attempts_exhausted is True
+
+    # The TTL reaper applies that same boundary to stale attempts.
+    claims.reap_stale_claims(
+        [
+            ClaimRecord(62, 3, "stale", now - timedelta(hours=3)),
+            ClaimRecord(63, 4, "stale", now - timedelta(hours=3)),
+        ],
+        ttl=timedelta(hours=2),
+    )
+
+    # The attempts-exhausted transition also blocks at, but not below, the budget.
+    claims.transition_issue(64, status="failed", review_ready=False, attempt=3)
+    claims.transition_issue(65, status="failed", review_ready=False, attempt=4)
+
+    labels = {
+        (int(call[3]), call[4])
+        for call in fake.calls
+        if call[1:3] == ["issue", "label"]
+    }
+    assert claims.max_attempts == 4
+    assert (61, "worklink:blocked") in labels
+    assert (62, "worklink:ready") in labels
+    assert (63, "worklink:blocked") in labels
+    assert (64, "worklink:ready") in labels
+    assert (65, "worklink:blocked") in labels
+
+
+def test_production_claim_constructors_pass_configured_attempt_budget() -> None:
+    missing: list[str] = []
+    construction_sites = 0
+    for module in (autonomy, orchestrator):
+        tree = ast.parse(Path(module.__file__).read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Name):
+                continue
+            if node.func.id != "ChainlinkClaims":
+                continue
+            construction_sites += 1
+            if not any(keyword.arg == "max_attempts" for keyword in node.keywords):
+                missing.append(f"{Path(module.__file__).name}:{node.lineno}")
+
+    assert construction_sites > 0
+    assert missing == []
 
 
 def test_shutdown_release_timeout_is_fail_soft(

@@ -151,12 +151,14 @@ def test_worklink_config_malformed_autonomy_ints_fall_back(tmp_path: Path) -> No
 defaults:
   max_concurrent: definitely-not-an-int
   reaper_ttl_s: -5
+  max_claim_attempts: unlimited
 """,
         encoding="utf-8",
     )
     defaults = WorklinkConfig.load(config_path).defaults
     assert defaults.max_concurrent == 2
     assert defaults.reaper_ttl_s == 7200
+    assert defaults.max_claim_attempts == 3
 
 
 def test_worklink_config_epic_defaults_and_merged_label_constant(tmp_path: Path) -> None:
