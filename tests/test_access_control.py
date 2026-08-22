@@ -507,7 +507,6 @@ def test_secret_content_in_own_turn_scratch_remains_unreadable(
     ("relative", "content"),
     [
         ("state/deployment.json", "state-ok\n"),
-        (".mimir/last-booted-version", "0.7.0\n"),
         ("CHANGELOG.md", "# Changes\n"),
     ],
 )
@@ -546,6 +545,89 @@ def test_service_turns_read_admitted_home_surfaces_under_enforcement(
         ] == content
     finally:
         reset_current_turn(token)
+
+
+def test_service_read_roots_do_not_consume_protected_names(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / "home"
+    state_file = home / "state" / "deployment.json"
+    skill_file = home / "skills" / "demo" / "SKILL.md"
+    for target in (state_file, skill_file):
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text("ordinary data\n", encoding="utf-8")
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    service = get_service_principal("scheduled_tick")
+    assert service is not None
+
+    roots = access_control.service_filesystem_read_roots(service)
+    collisions = {
+        (root, name)
+        for root in roots
+        for name in access_control._TRIGGER_SERVICE_PROTECTED_READ_NAMES
+        if name in {part.lower() for part in root.parts}
+    }
+
+    assert collisions == set()
+    assert home / "state" in roots
+    assert home / "skills" in roots
+    assert home / ".mimir" not in roots
+    for target in (state_file, skill_file):
+        assert access_control._trigger_service_read_target_is_allowed(
+            service, "read_file", {"file_path": str(target)},
+        ) is True
+
+
+def test_service_protected_predicates_agree_when_matched_root_is_protected(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / "home"
+    target = home / ".mimir" / "saga.db"
+    target.parent.mkdir(parents=True)
+    target.touch()
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    service = get_service_principal("scheduled_tick")
+    assert service is not None
+
+    protected = access_control._is_trigger_service_protected_read_path(
+        target.relative_to(home),
+    )
+    service_protected = access_control._is_service_protected_read_path(
+        service, home / ".mimir", Path("saga.db"),
+    )
+
+    assert protected is True
+    assert service_protected is protected
+
+
+@pytest.mark.parametrize(
+    "tool_name", ["read_file", "aread", "ls", "glob", "grep", "file_search"],
+)
+@pytest.mark.parametrize("name", ["saga.db", "index.db", "file-integrity.json"])
+def test_service_typed_reads_refuse_protected_mimir_runtime_files(
+    tool_name: str,
+    name: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / "home"
+    target = home / ".mimir" / name
+    target.parent.mkdir(parents=True)
+    target.write_text("runtime data\n", encoding="utf-8")
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    base = get_service_principal("scheduled_tick")
+    assert base is not None
+    service = replace(base, saga_full_corpus_read=False)
+    arguments = (
+        {"file_path": str(target)}
+        if tool_name in {"read_file", "aread"}
+        else {"path": str(target)}
+    )
+
+    assert service.saga_full_corpus_read is False
+    assert access_control._trigger_service_read_target_is_allowed(
+        service, tool_name, arguments,
+    ) is False
 
 
 def test_upgrade_service_read_scope_includes_docs_only_as_a_read_root(
