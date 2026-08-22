@@ -69,6 +69,43 @@ def test_worklink_run_cli_dispatches_operator_vertical(
     assert "worklink #441 attempt 1: completed review-ready" in capsys.readouterr().out
 
 
+def test_worklink_emit_work_item_has_wire_clean_stdout(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    import mimir.commands.worklink as worklink_cmd
+
+    payload = '{"body":"path\\\\to\\\\file","run_id":"chainlink-441","title":"Title"}'
+    monkeypatch.setattr(worklink_cmd, "read_work_item", lambda issue_id: payload)
+
+    with pytest.raises(SystemExit) as exc:
+        main(["worklink", "emit-work-item", "441"])
+
+    assert exc.value.code == 0
+    captured = capsys.readouterr()
+    assert captured.out == payload
+    assert captured.err == ""
+
+
+def test_worklink_emit_work_item_failure_has_no_stdout(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    import mimir.commands.worklink as worklink_cmd
+    from mimir.worklink.orchestrator import WorklinkError
+
+    def missing(_issue_id: int) -> str:
+        raise WorklinkError("issue not found")
+
+    monkeypatch.setattr(worklink_cmd, "read_work_item", missing)
+
+    with pytest.raises(SystemExit) as exc:
+        main(["worklink", "emit-work-item", "999"])
+
+    assert exc.value.code == 1
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == "error: issue not found\n"
+
+
 def test_worklink_run_cli_forwards_base_flag(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

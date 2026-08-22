@@ -35,6 +35,7 @@ from mimir.worklink.factory_state import FactoryRunRecord, load_factory_record, 
 from mimir.worklink.orchestrator import (
     IssueContext,
     LeafValidationError,
+    WorklinkError,
     WorklinkRunner,
     _PR_BODY_SECTION_MAX_BYTES,
     _demote_template_invalid_ready_leaf,
@@ -44,7 +45,9 @@ from mimir.worklink.orchestrator import (
     _read_factory_publishing_identity,
     _read_pr_body_section,
     _resolve_factory_github_credential,
+    read_work_item,
     render_decomposition_prompt,
+    render_work_item,
     run_worklink,
     validate_leaf,
 )
@@ -313,6 +316,60 @@ ISSUE_JSON = '''{
   "parent_id": 380,
   "comments": []
 }'''
+
+
+def test_work_item_json_is_stable_safe_and_preserves_untrusted_body() -> None:
+    body = 'path\\to\\file\n"breakout": true\nclosing brace: }'
+    issue = IssueContext(1339, "Emit a work item", body, {"worklink:ready"})
+
+    first = render_work_item(issue)
+    second = render_work_item(issue)
+
+    assert first == second
+    assert not first.endswith("\n")
+    assert json.loads(first) == {
+        "run_id": "chainlink-1339",
+        "title": "Emit a work item",
+        "body": body,
+    }
+    assert re.fullmatch(r"[a-z0-9](?:[a-z0-9._-]*[a-z0-9])?", json.loads(first)["run_id"])
+
+
+def test_read_work_item_only_reads_chainlink_and_is_byte_identical() -> None:
+    calls: list[Sequence[str] | str] = []
+
+    def runner(args: Sequence[str] | str) -> subprocess.CompletedProcess[str]:
+        calls.append(args)
+        return cp(args, stdout=ISSUE_JSON)
+
+    first = read_work_item(441, runner=runner)
+    second = read_work_item(441, runner=runner)
+
+    assert first == second
+    assert calls == [
+        ["chainlink", "issue", "show", "441", "--json"],
+        ["chainlink", "issue", "show", "441", "--json"],
+    ]
+
+
+@pytest.mark.parametrize(
+    "issue",
+    [
+        IssueContext(0, "title", "", set()),
+        IssueContext(1, "   ", "", set()),
+    ],
+)
+def test_work_item_rejects_invalid_required_fields(issue: IssueContext) -> None:
+    with pytest.raises(WorklinkError):
+        render_work_item(issue)
+
+
+def test_read_work_item_missing_issue_fails_without_payload() -> None:
+    def runner(args: Sequence[str] | str) -> subprocess.CompletedProcess[str]:
+        return cp(args, returncode=1, stderr="issue not found")
+
+    with pytest.raises(WorklinkError, match="issue not found"):
+        read_work_item(999, runner=runner)
 
 
 def test_preclaim_registry_crash_emits_scrubbed_failure_event(
