@@ -3911,18 +3911,22 @@ def _service_shell_not_admitted_reason(argv: list[str], destination: str) -> str
     )
 
 
-def _service_shell_read_operands_are_allowed(
+_SHELL_RECURSIVE_READ_ENTRY_LIMIT = 256
+_SHELL_RECURSIVE_READ_BYTE_LIMIT = 8 * 1024 * 1024
+
+
+def _service_shell_read_operand_refusal(
     service: "ServicePrincipal",
     argv: list[str],
     *,
     auth_context: "AuthContext | None" = None,
     read_cwd: str | Path | None = None,
     review_state: Any = None,
-) -> bool:
-    """Apply the typed-read boundary to every shell filesystem operand."""
+) -> str | None:
+    """Apply the typed-read boundary, returning a bounded refusal reason."""
     operands = _shell_read_path_operands(argv)
     if operands is None:
-        return True
+        return None
     spec = _SHELL_READ_COMMAND_SPECS[argv[0]]
     base = Path(read_cwd) if read_cwd is not None else None
     if base is None and review_state is not None:
@@ -3948,56 +3952,92 @@ def _service_shell_read_operands_are_allowed(
         )
     )
     if argv[0] == "rg" and "-L" in argv[1:]:
-        # Following directory symlinks cannot be bounded by a one-time tree walk.
-        return False
+        return "ripgrep symlink following cannot be bounded by the admission walk"
 
+    entry_count = 0
+    content_bytes = 0
     for raw in operands:
         candidate = Path(raw)
         if not candidate.is_absolute():
             if base is None:
-                return False
+                return "a relative filesystem operand has no authoritative execution cwd"
             candidate = base / candidate
         try:
             resolved = candidate.resolve(strict=True)
         except (OSError, RuntimeError):
-            return False
+            return "a filesystem operand could not be resolved"
         tool_name = "ls" if resolved.is_dir() else "read_file" if reads_content else "ls"
         if not _trigger_service_read_target_is_allowed(
             service, tool_name, {"path": str(candidate)}, auth_context=auth_context,
         ):
-            return False
+            return "a filesystem operand is outside the read roots or withheld"
         if not resolved.is_dir():
             continue
         if not recursive:
             # Content readers do not accept directory operands unless their
             # admitted recursive mode can be checked entry by entry.
             if reads_content:
-                return False
+                return "a content reader needs recursive mode for a directory operand"
             continue
-        walk_errors: list[OSError] = []
-        for directory, directory_names, file_names in os.walk(
-            resolved, followlinks=False, onerror=walk_errors.append,
-        ):
-            if not include_hidden:
-                directory_names[:] = [name for name in directory_names if not name.startswith(".")]
-                file_names = [name for name in file_names if not name.startswith(".")]
-            directory_path = Path(directory)
-            for name in tuple(directory_names):
-                child = directory_path / name
-                if not _trigger_service_read_target_is_allowed(
-                    service, "ls", {"path": str(child)}, auth_context=auth_context,
-                ):
-                    return False
-            for name in file_names:
-                child = directory_path / name
-                child_tool = "read_file" if reads_content else "ls"
-                if not _trigger_service_read_target_is_allowed(
-                    service, child_tool, {"path": str(child)}, auth_context=auth_context,
-                ):
-                    return False
-        if walk_errors:
-            return False
-    return True
+
+        # A content reader can print an entire matching line, and options such as
+        # grep -h remove source-path provenance from the result. The result layer
+        # therefore cannot reliably apply the path/content veto after execution.
+        # Preflight only the entries the command may read, but cap that speculative
+        # work by both entry count and candidate content bytes so admission never
+        # scans an unbounded tree or a few enormous files. os.scandir is used
+        # directly because os.walk materializes every child of one directory before
+        # yielding, which would make even an entry cap scale with a wide directory.
+        pending = [resolved]
+        while pending:
+            directory_path = pending.pop()
+            try:
+                with os.scandir(directory_path) as entries:
+                    for entry in entries:
+                        if not include_hidden and entry.name.startswith("."):
+                            continue
+                        entry_count += 1
+                        if entry_count > _SHELL_RECURSIVE_READ_ENTRY_LIMIT:
+                            return (
+                                "recursive read preflight exceeded the "
+                                f"{_SHELL_RECURSIVE_READ_ENTRY_LIMIT}-entry limit at "
+                                f"{directory_path}; narrow the operand or use a typed search tool"
+                            )
+                        child = Path(entry.path)
+                        try:
+                            child_is_directory = entry.is_dir(follow_symlinks=False)
+                        except OSError:
+                            return f"recursive read preflight could not inspect {child}"
+                        if reads_content and not child_is_directory:
+                            try:
+                                content_bytes += entry.stat(follow_symlinks=False).st_size
+                            except OSError:
+                                return f"recursive read preflight could not inspect {child}"
+                            if content_bytes > _SHELL_RECURSIVE_READ_BYTE_LIMIT:
+                                return (
+                                    "recursive read preflight exceeded the "
+                                    f"{_SHELL_RECURSIVE_READ_BYTE_LIMIT}-byte content limit at "
+                                    f"{child}; narrow the operand or use a typed search tool"
+                                )
+                        child_tool = "ls" if child_is_directory or not reads_content else "read_file"
+                        if not _trigger_service_read_target_is_allowed(
+                            service,
+                            child_tool,
+                            {"path": str(child)},
+                            auth_context=auth_context,
+                        ):
+                            return f"recursive read preflight withheld {child}"
+                        if child_is_directory:
+                            pending.append(child)
+            except OSError:
+                return f"recursive read preflight could not inspect directory {directory_path}"
+
+        # This is deliberately a point-in-time hardening check, not a claim that
+        # the tree is immutable. Root confinement is re-derived from each resolved
+        # path; a later entry can race the walk, but it cannot widen the principal's
+        # declared roots. A provenance-preserving execution/result filter would be
+        # needed to close that residual race without refusing recursive readers.
+    return None
 
 
 def parse_service_shell_argv_with_diagnostics(
@@ -4080,15 +4120,15 @@ def parse_service_shell_argv_with_diagnostics(
         return declared_argv, "", None
 
     if service is not None and _shell_read_path_operands(argv) is not None:
-        if not _service_shell_read_operands_are_allowed(
+        read_refusal = _service_shell_read_operand_refusal(
             service, argv, auth_context=auth_context,
             read_cwd=read_cwd, review_state=review_state,
-        ):
+        )
+        if read_refusal is not None:
             return None, (
-                "a filesystem operand is outside this principal's read roots or "
-                "is withheld by the protected-read policy. The command is refused "
-                "whole; use a path within the declared read scope that contains no "
-                "protected credential material."
+                f"{read_refusal}. The command is refused whole; use a path within "
+                "the declared read scope that contains no protected credential "
+                "material."
             ), ServiceShellBindingRule.READ_OPERAND_POLICY
 
     allowed = False
@@ -4214,8 +4254,6 @@ def parse_service_shell_argv(
 
 def _service_shell_refusal_detail(
     target: object, policy: "ServiceSinkPolicy | None", review_state: Any = None,
-    service: "ServicePrincipal | None" = None,
-    auth_context: "AuthContext | None" = None,
 ) -> str | None:
     """Prose for a shell-profile refusal; ``None`` for every other adapter.
 
@@ -4231,7 +4269,6 @@ def _service_shell_refusal_detail(
         return None
     argv, reason = parse_service_shell_argv_with_reason(
         target, policy.destination, review_state=review_state,
-        service=service, auth_context=auth_context,
     )
     return None if argv is not None else reason
 
@@ -4853,10 +4890,13 @@ def _sink_adapter_admits(
     if adapter is None:
         return False
     if adapter is _target_matches_shell_profile:
+        # Authorization validates the argv shape only. Filesystem operands are
+        # resolved once by the execution binder after it has the authoritative
+        # cwd; doing it here both duplicates the admission walk and resolves
+        # relative operands against the wrong base.
         return parse_service_shell_argv(
             target, destination, review_state=review_state,
             declared=getattr(service, "declared_shell_commands", ()) or (),
-            service=service, auth_context=auth_context,
         ) is not None
     return bool(adapter(target, destination))
 
@@ -5610,7 +5650,7 @@ class SinkGate:
                     refusal_detail=(
                         repo_review_state_refusal
                         or _service_shell_refusal_detail(
-                            target, service_policy, review_state, service, auth_context,
+                            target, service_policy, review_state,
                         )
                         or (
                             "MIMIR_OPERATOR_ALERT_CHANNEL is not configured"

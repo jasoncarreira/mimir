@@ -26,6 +26,7 @@ from mimir.access_control import (
     OperationCatalog,
     OperationDecision,
     ServicePrincipal,
+    ServiceShellBindingRule,
     ServiceSinkPolicy,
     SinkGate,
     ToolRegistry,
@@ -8989,20 +8990,32 @@ def test_service_shell_profiles_refuse_credential_file_operands(
         service, InformationFlowLabels(), repo_review_state=review_state,
     )
 
+    from mimir.tools import budget_gate
+
     decision = ToolRegistry().authorize_tool(
         "shell_exec",
         auth,
         enforce=True,
         target_channel=f"grep -n TOKEN -- {credential}",
     )
+    bound = budget_gate._request_for_authorized_execution(
+        _tool_request(
+            auth,
+            args={"command": f"grep -n TOKEN -- {credential}"},
+        ),
+        "shell_exec",
+        auth,
+    )
 
     assert service.sink_policy_for("shell_exec") == ServiceSinkPolicy(
         "shell_exec", "shell_profile", profile,
     )
-    assert decision.allowed is False
-    assert decision.reason == "service_sink_destination_denied"
-    assert decision.refusal_detail is not None
-    assert "protected-read policy" in decision.refusal_detail
+    # Shape authorization is cheap; the execution binder performs the one
+    # authoritative path/content check after resolving cwd.
+    assert decision.allowed is True
+    assert "outside the read roots or withheld" in bound.tool_call["args"][
+        "mimir_shell_refusal"
+    ]
 
 
 def test_service_shell_refuses_whole_argv_when_any_read_operand_is_unsafe(
@@ -9029,15 +9042,23 @@ def test_service_shell_refuses_whole_argv_when_any_read_operand_is_unsafe(
         filesystem_read_roots=(str(root.resolve()),),
     )
 
+    from mimir.tools import budget_gate
+
+    auth = _service_auth(service, InformationFlowLabels())
     decision = ToolRegistry().authorize_tool(
         "shell_exec",
-        _service_auth(service, InformationFlowLabels()),
+        auth,
         enforce=True,
         target_channel=f"wc -l -- {safe} {secret}",
     )
+    bound = budget_gate._request_for_authorized_execution(
+        _tool_request(auth, args={"command": f"wc -l -- {safe} {secret}"}),
+        "shell_exec",
+        auth,
+    )
 
-    assert decision.allowed is False
-    assert decision.reason == "service_sink_destination_denied"
+    assert decision.allowed is True
+    assert "mimir_shell_refusal" in bound.tool_call["args"]
 
 
 def test_service_shell_refuses_read_operand_outside_principal_roots(
@@ -9062,15 +9083,23 @@ def test_service_shell_refuses_read_operand_outside_principal_roots(
         filesystem_read_roots=(str(root.resolve()),),
     )
 
+    from mimir.tools import budget_gate
+
+    auth = _service_auth(service, InformationFlowLabels())
     decision = ToolRegistry().authorize_tool(
         "shell_exec",
-        _service_auth(service, InformationFlowLabels()),
+        auth,
         enforce=True,
         target_channel=f"wc -l -- {outside}",
     )
+    bound = budget_gate._request_for_authorized_execution(
+        _tool_request(auth, args={"command": f"wc -l -- {outside}"}),
+        "shell_exec",
+        auth,
+    )
 
-    assert decision.allowed is False
-    assert decision.reason == "service_sink_destination_denied"
+    assert decision.allowed is True
+    assert "mimir_shell_refusal" in bound.tool_call["args"]
 
 
 @pytest.mark.parametrize(
@@ -9139,6 +9168,139 @@ def test_service_shell_profiles_keep_legitimate_scoped_reads(
     )
 
     assert decision.allowed is True, decision.refusal_detail
+
+
+def test_service_shell_execution_binds_relative_read_operand_to_authoritative_cwd(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from mimir.tools import budget_gate
+
+    home = tmp_path / "home"
+    checkout = tmp_path / "checkout"
+    home.mkdir()
+    checkout.mkdir()
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    (checkout / "notes.txt").write_text("needle\n", encoding="utf-8")
+    service = replace(
+        build_trigger_service_principal(
+            canonical="scheduler:test",
+            trigger="scheduled_tick",
+            profile="custom",
+            tier=CapabilityTier.CODE_EXECUTION,
+            capabilities=("shell_exec", "bash_jobs_list", "bash_job_output"),
+            creation_path="test",
+        ),
+        filesystem_read_roots=(str(checkout.resolve()),),
+    )
+    auth = _service_auth(service, InformationFlowLabels())
+
+    bound = budget_gate._request_for_authorized_execution(
+        _tool_request(
+            auth,
+            args={
+                "command": "grep -n needle notes.txt",
+                "cwd": str(checkout),
+            },
+        ),
+        "shell_exec",
+        auth,
+    )
+
+    assert "mimir_shell_refusal" not in bound.tool_call["args"]
+    assert bound.tool_call["args"]["cwd"] == str(checkout.resolve())
+    assert bound.tool_call["args"]["mimir_direct_argv"][-1] == "notes.txt"
+
+
+def test_service_shell_recursive_preflight_runs_once_and_is_bounded(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from mimir.tools import budget_gate
+
+    home = tmp_path / "home"
+    root = tmp_path / "read-root"
+    home.mkdir()
+    root.mkdir()
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    for index in range(access_control._SHELL_RECURSIVE_READ_ENTRY_LIMIT + 1):
+        (root / f"file-{index}.txt").write_text("needle\n", encoding="utf-8")
+    service = replace(
+        build_trigger_service_principal(
+            canonical="scheduler:test",
+            trigger="scheduled_tick",
+            profile="custom",
+            tier=CapabilityTier.CODE_EXECUTION,
+            capabilities=("shell_exec", "bash_jobs_list", "bash_job_output"),
+            creation_path="test",
+        ),
+        filesystem_read_roots=(str(root.resolve()),),
+    )
+    auth = _service_auth(service, InformationFlowLabels())
+    original = access_control._service_shell_read_operand_refusal
+    calls = 0
+
+    def counted(*args: object, **kwargs: object) -> str | None:
+        nonlocal calls
+        calls += 1
+        return original(*args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(access_control, "_service_shell_read_operand_refusal", counted)
+
+    bound = budget_gate._request_for_authorized_execution(
+        _tool_request(
+            auth,
+            args={"command": "grep -r needle .", "cwd": str(root)},
+        ),
+        "shell_exec",
+        auth,
+    )
+
+    refusal = bound.tool_call["args"]["mimir_shell_refusal"]
+    assert calls == 1
+    assert (
+        f"exceeded the {access_control._SHELL_RECURSIVE_READ_ENTRY_LIMIT}-entry limit"
+        in refusal
+    )
+    assert str(root) in refusal
+
+
+def test_service_shell_recursive_preflight_names_unreadable_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / "home"
+    root = tmp_path / "read-root"
+    home.mkdir()
+    root.mkdir()
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    service = replace(
+        build_trigger_service_principal(
+            canonical="scheduler:test",
+            trigger="scheduled_tick",
+            profile="custom",
+            tier=CapabilityTier.CODE_EXECUTION,
+            capabilities=("shell_exec", "bash_jobs_list", "bash_job_output"),
+            creation_path="test",
+        ),
+        filesystem_read_roots=(str(root.resolve()),),
+    )
+    original_scandir = os.scandir
+
+    def refused_scandir(path: str | os.PathLike[str]) -> os.ScandirIterator[str]:
+        if Path(path) == root:
+            raise PermissionError("synthetic unreadable directory")
+        return original_scandir(path)
+
+    monkeypatch.setattr(access_control.os, "scandir", refused_scandir)
+
+    _argv, reason, rule = access_control.parse_service_shell_argv_with_diagnostics(
+        "grep -r needle .",
+        "scheduler_read_only",
+        service=service,
+        auth_context=_service_auth(service, InformationFlowLabels()),
+        read_cwd=root,
+    )
+
+    assert rule == ServiceShellBindingRule.READ_OPERAND_POLICY
+    assert f"could not inspect directory {root}" in reason
 
 
 @pytest.mark.parametrize(
