@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import math
 import os
 import re
 import shlex
@@ -33,6 +34,15 @@ log = logging.getLogger(__name__)
 WORKLINK_MERGED_LABEL = "worklink:merged"
 SHIPPING_BACKENDS = frozenset({"feature_factory", "opencode"})
 SHIPPING_COMPUTE_BACKENDS = frozenset({"local_subprocess"})
+DEFAULT_FACTORY_RUN_TIMEOUT_S = 43200.0
+
+
+def factory_run_timeout_s() -> float:
+    try:
+        value = float(os.environ.get("MIMIR_FACTORY_RUN_TIMEOUT_S", DEFAULT_FACTORY_RUN_TIMEOUT_S))
+        return value if value > 0 else DEFAULT_FACTORY_RUN_TIMEOUT_S
+    except ValueError:
+        return DEFAULT_FACTORY_RUN_TIMEOUT_S
 
 DEFAULT_HIGH_RISK_SCOPE_PATTERNS: tuple[str, ...] = (
     "**/migrations/**",
@@ -114,7 +124,7 @@ class WorklinkDefaults:
     # how long a claim may sit without a heartbeat before the TTL reaper
     # steals it back to ready/blocked.
     max_concurrent: int = 2
-    reaper_ttl_s: int = 7200
+    reaper_ttl_s: int = 86400
     # Autonomy safety posture (#460, #832). local_subprocess runs the backend with
     # full container-filesystem access (no sandbox) — fine for an operator who
     # accepts the blast radius, unsafe as an autonomous default. Autonomous
@@ -139,12 +149,12 @@ class WorklinkDefaults:
 
     def validate(self) -> None:
         """Validate all cross-field constraints for Worklink defaults."""
-        min_reaper_ttl_s = self.timeout_s * 2
+        min_reaper_ttl_s = 2 * max(self.timeout_s, math.ceil(factory_run_timeout_s()))
         if self.reaper_ttl_s < min_reaper_ttl_s:
             raise WorklinkDefaultsValidationError(
-                "worklink reaper_ttl_s must be at least 2 * timeout_s so the TTL "
-                "reaper cannot steal a worker that is still finalizing its remote "
-                "test job",
+                "worklink reaper_ttl_s must be at least 2 * the greater of timeout_s "
+                "and the factory run timeout so the TTL reaper cannot steal a live "
+                "worker",
                 field="reaper_ttl_s",
                 configured_value=self.reaper_ttl_s,
                 required_value=min_reaper_ttl_s,
