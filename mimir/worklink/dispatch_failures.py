@@ -15,6 +15,7 @@ from .._atomic import atomic_write_json
 from ..redaction import redact_text
 
 STATE_FILE = "dispatch_failures.json"
+POLLER_NAME = "worklink-ready-queue"
 INITIAL_BACKOFF_MINUTES = 15
 MAX_BACKOFF_MINUTES = 240
 MAX_NOTIFIED_SIGNATURES = 32
@@ -23,6 +24,11 @@ _TRANSIENT_CONTENTION_MARKERS = (
     ("cannot lock ref",),
     ("could not write new index file",),
 )
+
+
+def dispatch_failure_state_dir(home: Path) -> Path:
+    """Return the durable failure ledger owned by a Worklink home."""
+    return home / "state" / "pollers" / POLLER_NAME
 
 
 def terminal_error(value: BaseException | str) -> str:
