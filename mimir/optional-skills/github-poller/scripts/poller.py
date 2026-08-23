@@ -173,23 +173,55 @@ _CHANGES_REQUESTED_TURN_EVENT_TYPES = frozenset({"pr_changes_requested_stale"})
 # without changing the intended hourly cadence. After bounded attempts give up,
 # a daily backstop starts a fresh series so an unresolved PR cannot go silent
 # forever merely because its queued turns were never delivered.
-# The framework hard-caps a poller tick at 60s (mimir/pollers.py) and will SIGKILL
-# past it, so per-PR reconciliation has to fit inside a self-imposed deadline that
-# leaves headroom. Reconciling every open PR in every pass exceeded 60s at 16 open
-# PRs, which wedged this poller: a killed tick never commits its cursor, so the next
-# tick re-scans the same window plus everything new and is guaranteed to be larger
-# (chainlink #1433). A tick that truncates and commits is strictly better than one
-# that completes nothing.
-PR_RECONCILE_DEADLINE_SECONDS = 35.0
+# The framework SIGKILLs a poller tick at its cap and discards everything the tick
+# emitted, so per-PR reconciliation has to fit inside a self-imposed deadline that
+# leaves headroom. Reconciling every open PR in every pass exceeded the cap at 16
+# open PRs, which wedged this poller: a killed tick never commits its cursor, so
+# the next tick re-scans the same window plus everything new and is guaranteed to
+# be larger (chainlink #1433). A tick that truncates and commits is strictly
+# better than one that completes nothing.
+#
+# The deadlines below are derived from the cap rather than hardcoded against it.
+# They were originally 35s/50s against a 60s cap; the cap is now per-poller
+# (mimir/pollers.py raised the default to 120s and clamps it below each poller's
+# own cadence), so a hardcoded copy would silently leave the extra headroom
+# unused — and would be wrong in the dangerous direction for any poller whose
+# cadence clamps the cap *below* 60s.
+def _env_float(name: str, default: float) -> float:
+    """Positive float from the environment, or ``default``."""
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        value = float(raw)
+    except ValueError:
+        return default
+    return value if value > 0 else default
+
+
+#: The cap this run will actually be killed at. ``run_poller`` exports the
+#: *effective* per-poller value, which may be clamped below the framework default
+#: when a poller's cadence is tighter. The 60s fallback is deliberately the old
+#: cap rather than the new one: a standalone or dry-run invocation with no
+#: framework around it should assume less headroom, not more.
+POLLER_CAP_SECONDS = _env_float("POLLER_TIMEOUT_SECONDS", 60.0)
+#: Reserved after the hard deadline for saving the cursor and flushing stdout.
+#: Overrunning the cap loses every event the tick emitted, so this margin is what
+#: separates a late tick from a lost one.
+TICK_SAVE_RESERVE_SECONDS = 10.0
+#: Hard stop. Past this point no new per-PR work starts and every outstanding API
+#: call is clamped to whatever time is left.
+TICK_HARD_DEADLINE_SECONDS = max(5.0, POLLER_CAP_SECONDS - TICK_SAVE_RESERVE_SECONDS)
+#: Fraction of the hard deadline after which discretionary per-PR reconciliation
+#: stops. 0.7 preserves the 35/50 ratio the live measurements were taken against.
+PR_RECONCILE_SOFT_FRACTION = 0.7
+PR_RECONCILE_DEADLINE_SECONDS = (
+    TICK_HARD_DEADLINE_SECONDS * PR_RECONCILE_SOFT_FRACTION
+)
 #: Minimum PRs a pass reconciles even if the soft deadline has passed, so a slow
 #: API cannot starve every PR forever and stall reminders entirely. This floor is
-#: subordinate to the hard deadline below — it is not an exception to it.
+#: subordinate to the hard deadline — it is not an exception to it.
 PR_RECONCILE_MIN_PER_PASS = 2
-#: Hard stop. The framework SIGKILLs the tick at POLLER_TIMEOUT_SECONDS (60) and
-#: discards everything it emitted, so the tick must return under its own power
-#: well before that. Past this point no new per-PR work starts and every
-#: outstanding API call is clamped to whatever time is left.
-TICK_HARD_DEADLINE_SECONDS = 50.0
 #: Ceiling for one `gh api` invocation, used when no budget is active.
 GH_API_TIMEOUT_SECONDS = 30
 #: A clamped call still gets this much time — below it a request cannot

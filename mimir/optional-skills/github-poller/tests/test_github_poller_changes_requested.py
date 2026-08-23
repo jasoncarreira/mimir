@@ -1643,3 +1643,81 @@ def test_subminimum_budget_refusal_holds_since_window_with_time_remaining(
     assert 0 < budget.hard_remaining() < poller.GH_API_MIN_TIMEOUT_SECONDS
     assert budget.hard_truncated is True
     assert budget.truncated.get("review_comments_window") == 1
+
+
+# --- deadlines derived from the framework cap (follow-up to #1433/#1711) ------
+
+
+def _poller_with_cap(cap: str | None):
+    """Load a fresh copy of the poller with POLLER_TIMEOUT_SECONDS set.
+
+    The deadlines are module-level constants computed at import, because the
+    poller is a fresh process per tick — so exercising them means importing
+    again under a different environment rather than patching attributes.
+    """
+    import importlib.util
+    import os
+    from pathlib import Path
+
+    script = (
+        Path(__file__).resolve().parent.parent / "scripts" / "poller.py"
+    )
+    previous = os.environ.get("POLLER_TIMEOUT_SECONDS")
+    if cap is None:
+        os.environ.pop("POLLER_TIMEOUT_SECONDS", None)
+    else:
+        os.environ["POLLER_TIMEOUT_SECONDS"] = cap
+    try:
+        spec = importlib.util.spec_from_file_location("_poller_cap_probe", script)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+    finally:
+        if previous is None:
+            os.environ.pop("POLLER_TIMEOUT_SECONDS", None)
+        else:
+            os.environ["POLLER_TIMEOUT_SECONDS"] = previous
+
+
+def test_deadlines_scale_with_the_exported_cap():
+    """The tick must use the cap it will actually be killed at.
+
+    `run_poller` exports the *effective* per-poller timeout, which the scheduler
+    may clamp below the framework default when a poller's cadence is tighter.
+    Hardcoding leaves extra headroom unused at a raised cap, and is wrong in the
+    dangerous direction at a clamped one.
+    """
+    raised = _poller_with_cap("120")
+    assert raised.TICK_HARD_DEADLINE_SECONDS == 110.0
+    assert raised.PR_RECONCILE_DEADLINE_SECONDS == pytest.approx(77.0)
+    # Soft must stay strictly inside hard, and hard strictly inside the cap.
+    assert (
+        raised.PR_RECONCILE_DEADLINE_SECONDS
+        < raised.TICK_HARD_DEADLINE_SECONDS
+        < 120.0
+    )
+
+    # A cadence-clamped poller gets *less* headroom, not the default.
+    clamped = _poller_with_cap("45")
+    assert clamped.TICK_HARD_DEADLINE_SECONDS == 35.0
+    assert clamped.PR_RECONCILE_DEADLINE_SECONDS == pytest.approx(24.5)
+
+
+def test_absent_cap_preserves_the_measured_tuning():
+    """No cap in the environment must reproduce the 35s/50s the live
+    measurements were taken against — and assume the old 60s cap, not the new
+    120s one, so a standalone run is conservative rather than optimistic."""
+    for cap in (None, "60"):
+        mod = _poller_with_cap(cap)
+        assert mod.POLLER_CAP_SECONDS == 60.0
+        assert mod.TICK_HARD_DEADLINE_SECONDS == 50.0
+        assert mod.PR_RECONCILE_DEADLINE_SECONDS == pytest.approx(35.0)
+
+
+def test_malformed_cap_falls_back_instead_of_disabling_the_bound():
+    """A junk or non-positive value must not produce a zero/negative deadline,
+    which would make every call refuse and look like a total API outage."""
+    for junk in ("", "abc", "0", "-5"):
+        mod = _poller_with_cap(junk)
+        assert mod.POLLER_CAP_SECONDS == 60.0
+        assert mod.TICK_HARD_DEADLINE_SECONDS == 50.0
