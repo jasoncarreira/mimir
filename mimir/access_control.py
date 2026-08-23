@@ -59,6 +59,7 @@ from .read_policy import (
 )
 
 HTTP_EVENT_INGRESS_EXTRA_KEY = "_mimir_event_ingress"
+POLLER_RECOVERY_REPLAY_EXTRA_KEY = "_mimir_poller_recovery_replay"
 
 if TYPE_CHECKING:
     from .identities import IdentityResolver
@@ -693,13 +694,16 @@ def build_trigger_service_principal(
         if is_github_activity and home
         else ()
     )
+    implicit_write_roots = () if trigger == "poller" else (
+        *(() if is_github_activity else _configured_repo_write_roots()),
+        *home_data_roots,
+        *((Path(home) / "scratch",) if is_github_activity and home else ()),
+    )
     write_roots = tuple(dict.fromkeys(
         root.resolve()
         for root in (
             *roots,
-            *(() if is_github_activity else _configured_repo_write_roots()),
-            *home_data_roots,
-            *((Path(home) / "scratch",) if is_github_activity and home else ()),
+            *implicit_write_roots,
         )
     ))
     operations = tuple(dict.fromkeys(capabilities))
@@ -1349,6 +1353,7 @@ def _repo_review_state_from_event(event: "AgentEvent", service: ServicePrincipal
         or service.authority_profile != "github"
         or event.trigger != "poller"
         or not isinstance(event.extra, dict)
+        or event.extra.get(POLLER_RECOVERY_REPLAY_EXTRA_KEY) is not None
     ):
         return None
     items = event.extra.get("items")
