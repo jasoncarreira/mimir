@@ -200,6 +200,23 @@ class TickBudget:
             self.truncated[pass_name] = self.truncated.get(pass_name, 0) + skipped
 
 
+def _truncate_here(
+    tick_budget: "TickBudget | None", reconciled: int, pass_name: str,
+) -> bool:
+    """Whether this pass should stop reconciling PRs for the rest of the tick.
+
+    ``PR_RECONCILE_MIN_PER_PASS`` is a floor, not a target: every pass gets that
+    many PRs even on an already-spent budget, so each one always makes forward
+    progress and rotation eventually covers the whole set.
+    """
+    if tick_budget is None or reconciled < PR_RECONCILE_MIN_PER_PASS:
+        return False
+    if not tick_budget.exhausted():
+        return False
+    tick_budget.note_truncation(pass_name, 1)
+    return True
+
+
 def _rotate(items: list, offset: int) -> list:
     """Rotate so successive ticks start where the previous one stopped."""
     if not items:
@@ -1750,7 +1767,7 @@ def _check_own_changes_requested(
     *,
     now: datetime | None = None,
     reminder_interval: timedelta = CHANGES_REQUESTED_REMINDER_INTERVAL,
-    budget: TickBudget | None = None,
+    tick_budget: TickBudget | None = None,
     rotate_offset: int = 0,
 ) -> tuple[int, dict[str, object]]:
     """State-reconciling reminder for the agent's OWN open PRs stuck at
@@ -1825,14 +1842,9 @@ def _check_own_changes_requested(
         # dropping it. `new` REPLACES the cursor entry, so omitting a key would
         # reset that PR's last_reminded_at and attempts — re-arming a reminder the
         # debounce exists to suppress and rewinding the give-up budget.
-        if (
-            budget is not None
-            and reconciled >= PR_RECONCILE_MIN_PER_PASS
-            and budget.exhausted()
-        ):
+        if _truncate_here(tick_budget, reconciled, "changes_requested"):
             if key in prior:
                 new[key] = prior[key]
-            budget.note_truncation("changes_requested", 1)
             continue
         reconciled += 1
         reviews = _gh_api(f"repos/{repo}/pulls/{number}/reviews", token)
@@ -2133,6 +2145,8 @@ def _check_pr_ci_failures(
     prior: dict[str, object],
     *,
     now: datetime | None = None,
+    tick_budget: TickBudget | None = None,
+    rotate_offset: int = 0,
 ) -> tuple[int, dict[str, object]]:
     """Route newly completed check failures for open PRs.
 
@@ -2156,11 +2170,21 @@ def _check_pr_ci_failures(
     count = 0
     new: dict[str, object] = {}
     collection_complete = True
+    reconciled = 0
+    prs = _rotate(list(prs), rotate_offset)
     for listed in prs:
         number = listed.get("number")
         if not isinstance(number, int) or isinstance(number, bool):
             continue
         key = str(number)
+        if _truncate_here(tick_budget, reconciled, "ci_failures"):
+            # An incomplete collection holds `_last_checked` at window_since, so
+            # a truncated PR's checks are re-examined next tick rather than lost.
+            collection_complete = False
+            if key in prior:
+                new[key] = prior[key]
+            continue
+        reconciled += 1
         pr = _gh_api(f"repos/{repo}/pulls/{number}", token)
         if not isinstance(pr, dict):
             collection_complete = False
@@ -2312,6 +2336,8 @@ def _check_own_mergeability(
     now: datetime | None = None,
     attempt_budget: list[int] | None = None,
     retry_interval: timedelta = MERGEABILITY_RETRY_INTERVAL,
+    tick_budget: TickBudget | None = None,
+    rotate_offset: int = 0,
 ) -> tuple[int, dict[str, object]]:
     """Reconcile non-review merge failures on the agent's own open PRs.
 
@@ -2335,6 +2361,8 @@ def _check_own_mergeability(
 
     count = 0
     new: dict[str, object] = {}
+    reconciled = 0
+    prs = _rotate(list(prs), rotate_offset)
     for listed_pr in prs:
         if (listed_pr.get("user") or {}).get("login") != me:
             continue
@@ -2342,6 +2370,11 @@ def _check_own_mergeability(
         if not isinstance(number, int) or isinstance(number, bool):
             continue
         key = str(number)
+        if _truncate_here(tick_budget, reconciled, "mergeability"):
+            if key in prior:
+                new[key] = prior[key]
+            continue
+        reconciled += 1
         pr = _gh_api(f"repos/{repo}/pulls/{number}", token)
         if not isinstance(pr, dict):
             if key in prior:
@@ -2709,15 +2742,15 @@ def main() -> None:
         new_pr_heads_all[repo] = new_repo_heads
         new_rr_all[repo] = new_repo_rr
         new_untrusted_all[repo] = sorted(surfaced_untrusted)
+        # One offset drives all three per-PR passes, so a tick concentrates its
+        # budget on the same slice of PRs instead of three disjoint partial views.
+        repo_offset = int(reconcile_offsets.get(repo, 0) or 0)
+        truncated_before = sum(budget.truncated.values())
         repo_cr = cr_all.get(repo, {}) or {}
         cr_count, new_repo_cr = _check_own_changes_requested(
             repo, token, me, repo_cr,
-            budget=budget,
-            rotate_offset=int(reconcile_offsets.get(repo, 0) or 0),
-        )
-        # Advance past what this tick reconciled so the next one resumes at the tail.
-        new_reconcile_offsets[repo] = int(reconcile_offsets.get(repo, 0) or 0) + max(
-            1, len(repo_cr) - budget.truncated.get("changes_requested", 0)
+            tick_budget=budget,
+            rotate_offset=repo_offset,
         )
         total += cr_count
         new_cr_all[repo] = new_repo_cr
@@ -2725,15 +2758,25 @@ def main() -> None:
         mergeability_count, new_repo_mergeability = _check_own_mergeability(
             repo, token, me, repo_mergeability,
             attempt_budget=mergeability_attempt_budget,
+            tick_budget=budget,
+            rotate_offset=repo_offset,
         )
         total += mergeability_count
         new_mergeability_all[repo] = new_repo_mergeability
         repo_ci = ci_failures_all.get(repo, {}) or {}
         ci_count, new_repo_ci = _check_pr_ci_failures(
             repo, since, token, me, repo_ci,
+            tick_budget=budget,
+            rotate_offset=repo_offset,
         )
         total += ci_count
         new_ci_failures_all[repo] = new_repo_ci
+        # Move the window only when this repo actually left PRs unreconciled; a
+        # complete pass already covered every PR, so restart it at the head.
+        if sum(budget.truncated.values()) > truncated_before:
+            new_reconcile_offsets[repo] = repo_offset + PR_RECONCILE_MIN_PER_PASS
+        else:
+            new_reconcile_offsets[repo] = 0
 
     cursor["last_checked"] = new_cursor_ts
     cursor["pr_heads"] = new_pr_heads_all

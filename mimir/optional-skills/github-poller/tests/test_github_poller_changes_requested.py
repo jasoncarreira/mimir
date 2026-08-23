@@ -1026,7 +1026,7 @@ def test_exhausted_budget_still_reconciles_the_guaranteed_minimum(
     assert budget.exhausted()
 
     count, cursor = poller._check_own_changes_requested(
-        "o/r", "tok", "mimir-bot", {}, now=NOW, budget=budget,
+        "o/r", "tok", "mimir-bot", {}, now=NOW, tick_budget=budget,
     )
     assert count == poller.PR_RECONCILE_MIN_PER_PASS
     assert budget.truncated == {
@@ -1049,7 +1049,7 @@ def test_truncated_prs_keep_their_prior_cursor_entry(monkeypatch, captured_emits
 
     budget = poller.TickBudget(deadline_seconds=0.0)
     count, cursor = poller._check_own_changes_requested(
-        "o/r", "tok", "mimir-bot", prior, now=NOW, budget=budget,
+        "o/r", "tok", "mimir-bot", prior, now=NOW, tick_budget=budget,
     )
     # Nothing is due (reminded a minute ago), so no PR — reconciled or skipped —
     # changes, and the cursor round-trips intact.
@@ -1069,7 +1069,7 @@ def test_rotate_offset_advances_the_reconciled_window(monkeypatch, captured_emit
         _patch_many(monkeypatch, numbers)
         poller._check_own_changes_requested(
             "o/r", "tok", "mimir-bot", {}, now=NOW,
-            budget=poller.TickBudget(deadline_seconds=0.0),
+            tick_budget=poller.TickBudget(deadline_seconds=0.0),
             rotate_offset=offset,
         )
         return sorted(e["number"] for e in emits)
@@ -1089,7 +1089,7 @@ def test_unexhausted_budget_reconciles_every_pr(monkeypatch, captured_emits):
     _patch_many(monkeypatch, numbers)
     budget = poller.TickBudget(deadline_seconds=600.0)
     count, cursor = poller._check_own_changes_requested(
-        "o/r", "tok", "mimir-bot", {}, now=NOW, budget=budget,
+        "o/r", "tok", "mimir-bot", {}, now=NOW, tick_budget=budget,
     )
     assert count == len(numbers)
     assert budget.truncated == {}
