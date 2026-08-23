@@ -114,6 +114,7 @@ def parse_poller_budget_config(
     *,
     source: Path | str,
     poller_name: str,
+    rejections: list[str] | None = None,
 ) -> PollerBudgetConfig | None:
     """Parse one poller's ``budget`` block, returning ``None`` on invalid input.
 
@@ -124,8 +125,14 @@ def parse_poller_budget_config(
     if raw is None:
         return None
     prefix = f"poller_budget_invalid: {source} — {poller_name}.budget"
+
+    def reject(reason: str) -> None:
+        if rejections is not None:
+            rejections.append(f"budget {reason}")
+
     if not isinstance(raw, dict):
         log.warning("%s must be a mapping; ignoring budget", prefix)
+        reject("must be a mapping")
         return None
 
     on_exceed = str(raw.get("on_exceed", "suppress")).strip().lower()
@@ -134,11 +141,13 @@ def parse_poller_budget_config(
             "%s.on_exceed=%r unsupported (expected 'suppress'); ignoring budget",
             prefix, raw.get("on_exceed"),
         )
+        reject("on_exceed must be 'suppress'")
         return None
 
     windows_raw = raw.get("windows")
     if not isinstance(windows_raw, dict) or not windows_raw:
         log.warning("%s.windows must be a non-empty mapping; ignoring budget", prefix)
+        reject("windows must be a non-empty mapping")
         return None
 
     windows: dict[str, PollerBudgetWindowConfig] = {}
@@ -146,6 +155,7 @@ def parse_poller_budget_config(
         label = str(label_raw).strip()
         if not label:
             log.warning("%s.windows has an empty window label; ignoring budget", prefix)
+            reject("windows has an empty window label")
             return None
         if label not in _SUPPORTED_BUDGET_WINDOWS:
             log.warning(
@@ -154,18 +164,24 @@ def parse_poller_budget_config(
                 label,
                 ", ".join(sorted(_SUPPORTED_BUDGET_WINDOWS)),
             )
+            reject(f"window {label!r} is unsupported")
             continue
         if not isinstance(window_raw, dict):
             log.warning(
                 "%s.windows.%s must be a mapping; ignoring budget",
                 prefix, label,
             )
+            reject(f"window {label!r} must be a mapping")
             return None
         unknown = set(window_raw) - _BUDGET_CAPS
         if unknown:
             log.warning(
                 "%s.windows.%s has unknown cap(s): %s; ignoring budget",
                 prefix, label, ", ".join(sorted(str(k) for k in unknown)),
+            )
+            reject(
+                f"window {label!r} has unknown cap(s): "
+                f"{', '.join(sorted(str(k) for k in unknown))}"
             )
             return None
         parsed: dict[str, int | float] = {}
@@ -179,6 +195,7 @@ def parse_poller_budget_config(
                     "%s.windows.%s.%s=%r is invalid; ignoring budget",
                     prefix, label, key, value,
                 )
+                reject(f"window {label!r} cap {key!r} has invalid value {value!r}")
                 return None
             parsed[str(key)] = coerced
         if not parsed:
@@ -186,11 +203,13 @@ def parse_poller_budget_config(
                 "%s.windows.%s must configure at least one cap; ignoring budget",
                 prefix, label,
             )
+            reject(f"window {label!r} must configure at least one cap")
             return None
         windows[label] = PollerBudgetWindowConfig(**parsed)
 
     if not windows:
         log.warning("%s.windows has no supported windows; ignoring budget", prefix)
+        reject("windows has no supported windows")
         return None
 
     return PollerBudgetConfig(windows=windows, on_exceed=on_exceed)
