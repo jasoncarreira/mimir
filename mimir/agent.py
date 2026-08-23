@@ -3139,6 +3139,11 @@ class Agent:
                         record=record,
                         repo=current_worktree,
                         current_worktree=current_worktree,
+                        run_id=(
+                            continuation_event.extra.get("run_id")
+                            if isinstance(continuation_event.extra.get("run_id"), str)
+                            else None
+                        ),
                     ),
                     timeout=continuation_timeout_s,
                 )
