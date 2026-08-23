@@ -11,12 +11,14 @@ import pytest
 
 from mimir.models import AuthContext
 from mimir.saga.triples import (
+    TRIPLE_CANDIDATE_LIMIT,
     _update_world_state,
     detect_contradictions,
     get_current_value,
     get_history,
     make_triple_id,
     parse_triples,
+    rank_triple_candidates,
     repair_world_state_dual_current,
     resolve_contradictions_to_supersedes,
     retrieve_by_entity,
@@ -813,6 +815,83 @@ def test_triple_augment_search_includes_future_valid_until(conn):
     results = triple_augment_search(conn, [1.0, 0.0, 0.0, 0.0], top_k=5,
                                     reference_date=ref, auth_context=ADMIN_SCOPE)
     assert results  # not expired
+
+
+def test_rank_triple_candidates_uses_bounded_recent_window(conn):
+    _seed_atom(conn, "obs1", "source")
+    exact = struct.pack("4f", 1.0, 0.0, 0.0, 0.0)
+    orthogonal = struct.pack("4f", 0.0, 1.0, 0.0, 0.0)
+    rows = []
+    for index in range(TRIPLE_CANDIDATE_LIMIT + 1):
+        rows.append((
+            f"t-{index:04d}",
+            f"subject-{index}",
+            "prefers",
+            "value",
+            "obs1",
+            exact if index == 0 else orthogonal,
+            4,
+            f"2026-01-{index + 1:04d}",
+        ))
+    conn.executemany(
+        "INSERT INTO triples "
+        "(id, subject, predicate, object, source_atom_id, embedding, embedding_dim, created_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        rows,
+    )
+
+    ranked = rank_triple_candidates(
+        conn, [1.0, 0.0, 0.0, 0.0], dim=4, auth_context=ADMIN_SCOPE,
+    )
+
+    assert len(ranked) == TRIPLE_CANDIDATE_LIMIT
+    assert "t-0000" not in {item["id"] for item in ranked}
+
+
+def test_rank_triple_candidates_filters_dimension_before_window_limit(conn):
+    _seed_atom(conn, "obs1", "source")
+    matching = struct.pack("4f", 1.0, 0.0, 0.0, 0.0)
+    stale = struct.pack("2f", 1.0, 0.0)
+    rows = [
+        ("matching", "matching", matching, 4, "2025-01-01"),
+        *[
+            (f"stale-{index:04d}", f"stale-{index}", stale, 2, f"2026-{index:04d}")
+            for index in range(TRIPLE_CANDIDATE_LIMIT)
+        ],
+    ]
+    conn.executemany(
+        "INSERT INTO triples "
+        "(id, subject, predicate, object, source_atom_id, embedding, embedding_dim, created_at) "
+        "VALUES (?, ?, 'prefers', 'value', 'obs1', ?, ?, ?)",
+        rows,
+    )
+
+    ranked = rank_triple_candidates(
+        conn, [1.0, 0.0, 0.0, 0.0], dim=4, auth_context=ADMIN_SCOPE,
+    )
+
+    assert [item["id"] for item in ranked] == ["matching"]
+
+
+def test_triple_candidate_query_uses_recency_index_without_temp_sort(conn):
+    plan = conn.execute(
+        "EXPLAIN QUERY PLAN "
+        "SELECT t.id, t.embedding FROM triples t "
+        "INDEXED BY idx_triples_embedding_recency "
+        "JOIN atoms a ON t.source_atom_id = a.id "
+        "WHERE t.tombstoned = 0 AND a.tombstoned = 0 "
+        "AND t.embedding IS NOT NULL "
+        "AND (? IS NULL OR t.embedding_dim IS NULL OR t.embedding_dim = ?) "
+        "AND (t.valid_until IS NULL OR t.valid_until > ?) "
+        "AND (a.visibility = ? OR a.owner_principal = ?) "
+        "AND (t.visibility = ? OR t.owner_principal = ?) "
+        "ORDER BY t.created_at DESC, t.id ASC LIMIT ?",
+        (4, 4, "2026-01-01", "public", "alice", "public", "alice",
+         TRIPLE_CANDIDATE_LIMIT),
+    ).fetchall()
+    detail = " ".join(row[3] for row in plan)
+    assert "idx_triples_embedding_recency" in detail
+    assert "TEMP B-TREE" not in detail
 
 
 # ─── retrieve_by_entity ──────────────────────────────────────────────

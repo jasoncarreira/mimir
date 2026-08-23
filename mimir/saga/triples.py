@@ -61,6 +61,10 @@ MAX_SUBJECT_CHARS = 30
 MAX_OBJECT_CHARS = 30
 MIN_TERM_CHARS = 2
 _EMBED_RETRY_KEY = "_mimir_embedding_retry"
+# Triple cosine ranking is intentionally limited to the newest eligible rows.
+# This bounds BLOB transfer and scoring work while giving truncation a stable,
+# meaningful policy instead of relying on SQLite's arbitrary table order.
+TRIPLE_CANDIDATE_LIMIT = 500
 
 
 # ─── Triple identity ─────────────────────────────────────────────────
@@ -745,43 +749,25 @@ def _cosine_scores(
     return out
 
 
-def triple_augment_search(
+def rank_triple_candidates(
     conn: sqlite3.Connection,
     query_emb: list[float],
     *,
-    top_k: int = 10,
     dim: int | None = None,
     reference_date=None,
     auth_context: Any = None,
     read_authorization=None,
-) -> list[tuple[str, float]]:
-    """P41-style triple-augmented retrieval.
+) -> list[dict]:
+    """Read and cosine-rank one bounded pool of eligible triples.
 
-    Embed the query, cosine-match against every live triple's
-    embedding, return ``[(source_atom_id, cosine)]`` sorted by score.
-    The caller plugs these into the RRF fusion as a third pathway
-    alongside FAISS-semantic and FTS-keyword.
-
-    Triples without embeddings are skipped (they can still be queried
-    by entity name via ``retrieve_by_entity``). Triples whose
-    embedding dim doesn't match ``dim`` are skipped — protects against
-    provider switches that produced mixed-dim triples.
-
-    ``reference_date`` (datetime or None) anchors the ``valid_until``
-    expiry filter. Expired triples (valid_until ≤ reference_date) are
-    excluded from the candidate set — they represent superseded facts
-
-    Authorization is the intersection of the joined source atom's ACL and the
-    triple's stored ACL. The latter is enforced because deduplication can narrow
-    a triple below its original source.
-
-    chainlinks #883/#1117: authorization filters on both ownership boundaries.
+    The newest :data:`TRIPLE_CANDIDATE_LIMIT` rows are selected before BLOBs
+    enter Python. Both query retrieval views consume this same ranked list.
     """
     from .ownership import SagaReadAuthorization
 
     owns_read_authorization = read_authorization is None
     read_authorization = read_authorization or SagaReadAuthorization(
-        auth_context, "triple_augment_search"
+        auth_context, "rank_triple_candidates"
     )
     auth_where, auth_params = _triple_read_authorization_predicate(read_authorization)
 
@@ -791,31 +777,87 @@ def triple_augment_search(
         else datetime.now(timezone.utc).isoformat()
     )
     rows = conn.execute(
-        f"""SELECT t.id, t.source_atom_id, t.embedding, t.embedding_dim
+        f"""SELECT t.id, t.source_atom_id, t.subject, t.predicate, t.object,
+                  t.valid_from, t.valid_until, t.confidence, t.embedding, t.embedding_dim
             FROM triples t
+            INDEXED BY idx_triples_embedding_recency
             JOIN atoms a ON t.source_atom_id = a.id
             WHERE t.tombstoned = 0 AND a.tombstoned = 0
               AND t.embedding IS NOT NULL
+              AND (? IS NULL OR t.embedding_dim IS NULL OR t.embedding_dim = ?)
               AND (t.valid_until IS NULL OR t.valid_until > ?)
               AND {auth_where}
+            ORDER BY t.created_at DESC, t.id ASC
+            LIMIT ?
         """,
-        (ref_iso,) + tuple(auth_params),
+        (dim, dim, ref_iso) + tuple(auth_params) + (TRIPLE_CANDIDATE_LIMIT,),
     ).fetchall()
     if not rows:
         return []
     candidates = [r for r in rows if r[1] is not None]
     scores = _cosine_scores(
         query_emb,
-        [(r[2], r[3]) for r in candidates],
+        [(r[8], r[9]) for r in candidates],
         dim=dim,
     )
-    best: dict[str, float] = {}
+    ranked: list[dict] = []
     for i, sim in scores:
-        source_atom_id = candidates[i][1]
+        row = candidates[i]
+        ranked.append({
+            "id": row[0],
+            "source_atom_id": row[1],
+            "subject": row[2],
+            "predicate": row[3],
+            "object": row[4],
+            "valid_from": row[5],
+            "valid_until": row[6],
+            "confidence": row[7],
+            "_cosine": sim,
+        })
+    ranked.sort(key=lambda item: (-item["_cosine"], item["id"]))
+    if owns_read_authorization:
+        read_authorization.finalize()
+    return ranked
+
+
+def triple_augment_search(
+    conn: sqlite3.Connection,
+    query_emb: list[float],
+    *,
+    top_k: int = 10,
+    dim: int | None = None,
+    reference_date=None,
+    auth_context: Any = None,
+    read_authorization=None,
+    ranked_candidates: list[dict] | None = None,
+) -> list[tuple[str, float]]:
+    """Return best-per-source-atom matches for the triple RRF pathway.
+
+    ``ranked_candidates`` lets :meth:`SagaStore.query` share the bounded SQL
+    read and cosine pass with :func:`top_triples_with_payload`.
+    """
+    from .ownership import SagaReadAuthorization
+
+    owns_read_authorization = read_authorization is None
+    read_authorization = read_authorization or SagaReadAuthorization(
+        auth_context, "triple_augment_search"
+    )
+    if ranked_candidates is None:
+        ranked_candidates = rank_triple_candidates(
+            conn,
+            query_emb,
+            dim=dim,
+            reference_date=reference_date,
+            auth_context=auth_context,
+            read_authorization=read_authorization,
+        )
+    best: dict[str, float] = {}
+    for item in ranked_candidates:
+        source_atom_id = item["source_atom_id"]
+        sim = item["_cosine"]
         if sim > best.get(source_atom_id, -1.0):
             best[source_atom_id] = sim
-    ordered = sorted(best.items(), key=lambda x: -x[1])
-    result = ordered[:top_k]
+    result = sorted(best.items(), key=lambda item: (-item[1], item[0]))[:top_k]
     read_authorization.observe_selected(
         conn, "atom", "atoms", [atom_id for atom_id, _ in result]
     )
@@ -833,6 +875,7 @@ def top_triples_with_payload(
     reference_date=None,
     auth_context: Any = None,
     read_authorization=None,
+    ranked_candidates: list[dict] | None = None,
 ) -> list[dict]:
     """Same cosine match as ``triple_augment_search`` but returns the
     FULL triple data — subject/predicate/object/source_atom_id/valid
@@ -865,65 +908,16 @@ def top_triples_with_payload(
     read_authorization = read_authorization or SagaReadAuthorization(
         auth_context, "top_triples_with_payload"
     )
-    auth_where, auth_params = _triple_read_authorization_predicate(read_authorization)
-
-    ref_iso = (
-        reference_date.isoformat()
-        if reference_date is not None
-        else datetime.now(timezone.utc).isoformat()
-    )
-    rows = conn.execute(
-        f"""SELECT t.id, t.source_atom_id, t.subject, t.predicate, t.object,
-                  t.valid_from, t.valid_until, t.confidence, t.embedding, t.embedding_dim
-            FROM triples t
-            JOIN atoms a ON t.source_atom_id = a.id
-            WHERE t.tombstoned = 0 AND a.tombstoned = 0
-              AND t.embedding IS NOT NULL
-              AND (t.valid_until IS NULL OR t.valid_until > ?)
-              AND {auth_where}
-        """,
-        (ref_iso,) + tuple(auth_params),
-    ).fetchall()
-    if not rows:
-        return []
-    candidates = [r for r in rows if r[1] is not None]
-    scores = _cosine_scores(
-        query_emb,
-        [(r[8], r[9]) for r in candidates],
-        dim=dim,
-    )
-    scored: list[tuple[float, dict]] = []
-    for i, sim in scores:
-        (
-            triple_id,
-            source_atom_id,
-            subj,
-            pred,
-            obj,
-            valid_from,
-            valid_until,
-            confidence,
-            _blob,
-            _t_dim,
-        ) = candidates[i]
-        scored.append(
-            (
-                sim,
-                {
-                    "id": triple_id,
-                    "source_atom_id": source_atom_id,
-                    "subject": subj,
-                    "predicate": pred,
-                    "object": obj,
-                    "valid_from": valid_from,
-                    "valid_until": valid_until,
-                    "confidence": confidence,
-                    "_cosine": sim,
-                },
-            )
+    if ranked_candidates is None:
+        ranked_candidates = rank_triple_candidates(
+            conn,
+            query_emb,
+            dim=dim,
+            reference_date=reference_date,
+            auth_context=auth_context,
+            read_authorization=read_authorization,
         )
-    scored.sort(key=lambda x: -x[0])
-    result = [t for _, t in scored[:top_n]]
+    result = ranked_candidates[:top_n]
     read_authorization.observe_selected(
         conn,
         "triple",
