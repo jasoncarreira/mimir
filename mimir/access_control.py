@@ -7682,6 +7682,16 @@ _READ_BACKEND_RESULT_TOOLS = frozenset({
     "repo_unmerged",
 })
 
+_SELF_AUTHORED_FILE_ROOTS = frozenset({
+    ".mimir_builtin_skills",
+    "docs",
+    "memory",
+    "prompts",
+    "skills",
+    "state",
+})
+_FILE_INTEGRITY_EXCLUDED_SUBTREES = frozenset({("state", "pollers")})
+
 
 @dataclass(frozen=True)
 class ProtectedResultProvenance:
@@ -7819,9 +7829,7 @@ def _filesystem_result_integrity(
     except (OSError, RuntimeError, ValueError):
         return "untrusted", "active_ingest"
 
-    if relative.parts and relative.parts[0] in {
-        ".mimir_builtin_skills", "docs", "memory", "prompts", "skills", "state",
-    }:
+    if relative.parts and relative.parts[0] in _SELF_AUTHORED_FILE_ROOTS:
         # These roots are scaffolded by ``mimir setup`` and thereafter written
         # only by the operator or by the agent through the protected tool
         # boundary -- so the path itself is evidence of self-authorship, which
@@ -7834,7 +7842,7 @@ def _filesystem_result_integrity(
         # Poller subprocesses write this tree directly, outside the protected
         # tool boundary, and may persist attacker-derived cursor/event fields.
         # A path under state/pollers is therefore not proof of self-authorship.
-        if relative.parts[0:2] == ("state", "pollers"):
+        if relative.parts[0:2] in _FILE_INTEGRITY_EXCLUDED_SUBTREES:
             return "untrusted", "active_ingest"
         persisted = _persisted_file_integrity(home, relative)
         return persisted, (
@@ -7920,15 +7928,15 @@ def record_file_write_integrity(
                 pass
             else:
                 return False
-            # Must list every root the recording set below covers. The
-            # backend runs virtual_mode rooted at the home, so a file tool
+            # The backend runs virtual_mode rooted at the home, so a file tool
             # addresses these as "/docs/notes.md" rather than
             # "<home>/docs/notes.md" -- a root recorded only for physical paths
             # is not recorded for the shape writes actually arrive in, and the
             # trusted read default then launders it.
-            if requested.parts[1:2] in {
-                ("docs",), ("memory",), ("prompts",), ("state",),
-            }:
+            if (
+                len(requested.parts) > 1
+                and requested.parts[1] in _SELF_AUTHORED_FILE_ROOTS
+            ):
                 resource = home / requested.as_posix().lstrip("/")
             else:
                 return True
@@ -7939,15 +7947,9 @@ def record_file_write_integrity(
         relative = resource.relative_to(home)
     except (OSError, RuntimeError, ValueError):
         return False
-    if not relative.parts or relative.parts[0] not in {
-        "docs", "memory", "prompts", "state",
-    }:
-        # Must stay in step with the trusted roots in
-        # ``_filesystem_result_integrity``: a root that is trusted on read but
-        # unrecorded on write is a laundering path, because content the model
-        # wrote while tainted would be re-read as self-authored.
+    if not relative.parts or relative.parts[0] not in _SELF_AUTHORED_FILE_ROOTS:
         return True
-    if relative.parts[0:2] == ("state", "pollers"):
+    if relative.parts[0:2] in _FILE_INTEGRITY_EXCLUDED_SUBTREES:
         return True
     integrity = "untrusted"
     sources = getattr(labels, "sources", ())
