@@ -1906,10 +1906,17 @@ def test_chainlink_orchestrator_passes_controller_environment_overrides() -> Non
     # opencode build with EACCES because a 0700 attempt directory cannot be
     # traversed by a backend that re-resolves its project root by pathname.
     #
-    # Re-add the key in the SAME change that lands per-run worker UIDs. Until the
-    # worker identity is unique per run, no directory-mode arrangement isolates
-    # concurrent runs: ptrace_scope is 0, so a sibling worker sharing the uid can
-    # take another's checkout FD outright. Re-adding it alone reopens the outage.
+    # The containment this would activate was EVALUATED AND DECLINED (#1434
+    # closed won't-fix, 2026-08-23), so this is the permanent posture rather than
+    # a temporary hold. It would have bought build-from-build isolation only; the
+    # containment that matters — model-generated code cannot reach the agent's
+    # home or secrets — comes from the worker running as `worklink` rather than
+    # `mimir` and is unaffected either way.
+    #
+    # Re-adding this key requires per-run worker identity first. While the worker
+    # uid is shared no directory-mode arrangement isolates concurrent runs:
+    # ptrace_scope is 0, so a sibling worker sharing the uid can take another's
+    # checkout FD outright. Re-adding it alone reopens the outage.
     assert "MIMIR_CODING_ENABLED" not in pass_env
 
 
