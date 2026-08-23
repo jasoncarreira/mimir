@@ -219,6 +219,11 @@ Overridable fields: `cron`, `priority`, `batch_size`, `recover_failed_turns`,
 `authority`, `capabilities`, `tier`, `profile`, `principal_id`, `scoped_roots`,
 and `operator_alert` are rejected by the strict write path and dropped during
 discovery. Environment values never add capabilities.
+The agent-facing `set_poller_overrides` tool accepts `env` and `pass_env` names
+only from narrow allowlists of non-secret poller tuning variables. Literal
+`env` overrides are narrower than operator-controlled `pass_env` passthroughs,
+so the agent cannot supply a new repository or account selector. Operator edits
+loaded during discovery remain fail-safe and lenient for custom pollers.
 Anything else (notably `command`) is refused with a warning: overrides tune
 behavior, they don't redefine what runs. Field-level fail-safety: an invalid
 value (typo'd cron, unknown priority) warns and keeps the manifest value —

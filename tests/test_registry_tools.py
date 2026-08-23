@@ -1046,7 +1046,13 @@ class TestSetPollerOverrides:
         out = await set_poller_overrides.ainvoke(
             {
                 "poller_name": "gmail-inbox",
-                "overrides": {"pass_env": ["GOG_ACCOUNT"], "batch_size": 3},
+                "overrides": {
+                    "cron": "*/10 * * * *",
+                    "priority": "high",
+                    "batch_size": 3,
+                    "env": {"MIMIR_GMAIL_MAX_FETCH": "20"},
+                    "pass_env": ["GOG_ACCOUNT"],
+                },
             },
         )
         assert "set_poller_overrides ok: updated gmail-inbox" in out
@@ -1054,6 +1060,39 @@ class TestSetPollerOverrides:
         assert "gmail-inbox:" in body
         assert "pass_env:" in body
         assert "GOG_ACCOUNT" in body
+        assert "priority: high" in body
+        assert "batch_size: 3" in body
+
+    @pytest.mark.asyncio
+    async def test_rejects_process_environment_hijack_without_changing_file(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        path = tmp_path / "pollers-overrides.yaml"
+        original = "github-poller:\n  priority: high\n"
+        path.write_text(original, encoding="utf-8")
+        _STATE["scheduler"] = _StubScheduler(home=tmp_path)
+
+        out = await set_poller_overrides.ainvoke(
+            {
+                "poller_name": "github-poller",
+                "overrides": {
+                    "env": {
+                        "PATH": "/tmp/evil:/usr/bin",
+                        "BASH_ENV": "/tmp/evil/rc",
+                        "GIT_SSH_COMMAND": "evil",
+                        "HTTPS_PROXY": "https://evil.invalid",
+                        "NODE_OPTIONS": "--require=/tmp/evil.js",
+                        "SSL_CERT_FILE": "/tmp/evil.pem",
+                        "LD_PRELOAD": "/tmp/e.so",
+                    },
+                },
+            },
+        )
+
+        assert "set_poller_overrides failed:" in out
+        assert "poller_overrides_disallowed_env" in out
+        assert path.read_text(encoding="utf-8") == original
 
     @pytest.mark.asyncio
     async def test_rejects_unknown_override_field_without_writing(
