@@ -67,6 +67,14 @@ import signal
 import subprocess
 import sys
 import time
+
+#: Wall clock at interpreter start for this tick, captured before any of the
+#: module's own setup runs. The framework kills the tick at a fixed cap measured
+#: from process start, so a budget anchored at its own construction silently
+#: excludes everything that happened first — module import, cursor load, token
+#: resolution. Measured at ~0.8s today, but the bound must not depend on that
+#: staying small: `/mimir-home` is virtiofs and the package keeps growing.
+_PROCESS_START = time.monotonic()
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -245,10 +253,24 @@ class TickBudget:
         self,
         deadline_seconds: float = PR_RECONCILE_DEADLINE_SECONDS,
         hard_deadline_seconds: float = TICK_HARD_DEADLINE_SECONDS,
+        started_at: float | None = None,
     ) -> None:
-        self._start = time.monotonic()
-        self._deadline = deadline_seconds
-        self._hard_deadline = hard_deadline_seconds
+        """``started_at`` is when the *tick* began, not when this was built.
+
+        The deadlines are budgets against the framework cap, which is measured
+        from process start. Anything that ran before this object exists has
+        already spent part of that budget, so it is subtracted here rather than
+        silently ignored. ``main()`` passes ``_PROCESS_START``; callers that omit
+        it get a budget measured from construction, which is what a test means.
+        """
+        now = time.monotonic()
+        self._start = now
+        consumed = max(0.0, now - started_at) if started_at is not None else 0.0
+        self._deadline = max(0.0, deadline_seconds - consumed)
+        self._hard_deadline = max(0.0, hard_deadline_seconds - consumed)
+        #: Pre-budget time already spent, reported with the truncation signal so
+        #: a tick squeezed by slow startup is distinguishable from a slow API.
+        self.startup_consumed = consumed
         self.truncated: dict[str, int] = {}
         #: True once the hard deadline forced a truncation. The tick must not
         #: advance its `since` watermark in that case — see main().
@@ -3023,7 +3045,7 @@ def main() -> None:
     # Changes-requested reconciliation cursor (chainlink #449):
     # ``{repo: {pr_key: {head_sha, last_reminded_at, attempts}}}`` — bounded
     # unresolved own-PR remediation attempts, rate-limited by elapsed time.
-    budget = TickBudget()
+    budget = TickBudget(started_at=_PROCESS_START)
     # Clamp every gh api call for the rest of this tick so no single slow request
     # can carry the subprocess past the framework's SIGKILL.
     set_active_tick_budget(budget)
@@ -3133,6 +3155,7 @@ def main() -> None:
         _emit_signal(
             "poller_tick_hard_deadline",
             elapsed_seconds=round(budget.elapsed(), 1),
+            startup_consumed_seconds=round(budget.startup_consumed, 1),
             hard_deadline_seconds=TICK_HARD_DEADLINE_SECONDS,
             truncated=dict(budget.truncated),
         )

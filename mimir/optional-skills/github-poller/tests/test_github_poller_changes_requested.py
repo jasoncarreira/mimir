@@ -1222,9 +1222,14 @@ def _slow_main_harness(
         return []
 
     real_budget = poller.TickBudget
+    # Accepts and ignores ``started_at``: these deadlines are scaled to keep the
+    # test fast, and subtracting the real elapsed time of a long pytest session
+    # would zero them. The subtraction itself is covered separately.
     monkeypatch.setattr(
         poller, "TickBudget",
-        lambda: real_budget(deadline_seconds=soft, hard_deadline_seconds=hard),
+        lambda started_at=None: real_budget(
+            deadline_seconds=soft, hard_deadline_seconds=hard,
+        ),
     )
     monkeypatch.setattr(poller, "STATE_DIR", tmp_path)
     monkeypatch.setattr(poller, "_resolve_token", lambda: "tok")
@@ -1314,7 +1319,9 @@ def test_final_pr_review_timeout_holds_watermark_through_cursor_save(
     monkeypatch.setattr(
         poller,
         "TickBudget",
-        lambda: real_budget(deadline_seconds=0.02, hard_deadline_seconds=0.05),
+        lambda started_at=None: real_budget(
+            deadline_seconds=0.02, hard_deadline_seconds=0.05,
+        ),
     )
     monkeypatch.setattr(poller, "STATE_DIR", tmp_path)
     monkeypatch.setattr(poller, "_resolve_token", lambda: "tok")
@@ -1721,3 +1728,66 @@ def test_malformed_cap_falls_back_instead_of_disabling_the_bound():
         mod = _poller_with_cap(junk)
         assert mod.POLLER_CAP_SECONDS == 60.0
         assert mod.TICK_HARD_DEADLINE_SECONDS == 50.0
+
+
+def test_budget_subtracts_time_spent_before_it_was_built():
+    """The framework kills the tick at a cap measured from *process* start.
+
+    A budget anchored at its own construction silently excludes module import,
+    cursor load and token resolution, so a 110s budget plus slow startup can run
+    past a 120s kill and lose everything the tick emitted. Measured startup is
+    ~0.8s today, well inside the reserve — this asserts the bound does not depend
+    on that staying true.
+    """
+    import time as _time
+
+    started = _time.monotonic() - 20.0  # pretend 20s of startup already happened
+    budget = poller.TickBudget(
+        deadline_seconds=35.0, hard_deadline_seconds=50.0, started_at=started,
+    )
+    assert budget.startup_consumed == pytest.approx(20.0, abs=0.5)
+    # Both deadlines shrink by what startup already spent.
+    assert budget.hard_remaining() == pytest.approx(30.0, abs=0.5)
+    assert budget.exhausted() is False
+    fresh = poller.TickBudget(deadline_seconds=35.0, hard_deadline_seconds=50.0)
+    assert fresh.hard_remaining() == pytest.approx(50.0, abs=0.5)
+    assert fresh.startup_consumed == 0.0
+
+    # Startup that outran the whole budget leaves nothing, rather than going
+    # negative and reading as "plenty of time left".
+    spent = poller.TickBudget(
+        deadline_seconds=35.0, hard_deadline_seconds=50.0,
+        started_at=_time.monotonic() - 999.0,
+    )
+    assert spent.hard_exhausted() is True
+    assert spent.exhausted() is True
+    assert spent.call_timeout() is None
+
+
+def test_main_anchors_the_budget_to_process_start(monkeypatch, tmp_path):
+    """Pin that main() actually passes the anchor — the guarantee is worthless
+    if a future edit constructs the budget without it."""
+    seen: list[object] = []
+    real_budget = poller.TickBudget
+
+    def capture(*args, **kwargs):
+        seen.append(kwargs.get("started_at"))
+        return real_budget(*args, **kwargs)
+
+    monkeypatch.setattr(poller, "TickBudget", capture)
+    monkeypatch.setattr(poller, "STATE_DIR", tmp_path)
+    monkeypatch.setattr(poller, "_resolve_token", lambda: "tok")
+    monkeypatch.setattr(poller, "_gh_api", lambda ep, tok: [])
+    monkeypatch.setattr(poller, "_emit", lambda *a, **k: None)
+    monkeypatch.setattr(poller, "_emit_signal", lambda *a, **k: None)
+    monkeypatch.setattr(poller, "_save_cursor", lambda c: None)
+    monkeypatch.setattr(poller, "_load_cursor", lambda: {"last_checked": "2026-08-23T10:00:00Z"})
+    monkeypatch.setenv("GITHUB_REPOS", "o/r")
+    monkeypatch.setenv("MIMIR_GITHUB_SELF_LOGIN", "mimir-bot")
+
+    poller.main()
+
+    assert seen, "main() never constructed a TickBudget"
+    assert seen[0] == poller._PROCESS_START, (
+        "main() built the budget without anchoring it to process start"
+    )
