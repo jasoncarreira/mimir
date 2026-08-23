@@ -59,6 +59,7 @@ _EVENT_RULES: dict[str, tuple[Polarity, str]] = {
     # detects a flood that persisted across multiple turns.
     "cross_turn_send_duplicate": ("negative", "cross_turn_loop"),
     "saga_query_error": ("negative", "saga_query_error"),
+    "saga_vector_search_degraded": ("negative", "saga_vector_search_degraded"),
     "saga_feedback_error": ("negative", "saga_feedback_error"),
     "saga_consolidate_error": ("negative", "saga_consolidate_error"),
     "saga_decay_error": ("negative", "saga_decay_error"),

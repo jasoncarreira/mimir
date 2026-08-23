@@ -19,6 +19,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from dataclasses import replace
+from pathlib import Path
 from typing import Any, Awaitable, Callable
 
 from langchain.agents.middleware import AgentMiddleware, ToolCallRequest
@@ -42,23 +43,30 @@ def _file_path_arg(request: ToolCallRequest) -> str:
     return str(args.get("file_path") or "")
 
 
-def _skill_from_path(path: str) -> str | None:
-    """Skill name for a ``.../<skill>/SKILL.md`` path, else ``None``.
+def _skill_from_path(path: str, skill_sources: tuple[Path, ...]) -> str | None:
+    """Registered skill name for a ``<source>/<skill>/SKILL.md`` path.
 
-    The skill name is the immediate parent directory of ``SKILL.md`` —
-    the same identifier deepagents' SkillsMiddleware shows in its catalog
-    and that the write path (``saga_record_skill_learning``) records
-    under. A bare ``SKILL.md`` with no parent dir yields ``None`` (can't
-    be scoped).
+    The resolved file must be an immediate child of one of the same source
+    roots registered with deepagents. This prevents an arbitrary model-named
+    directory (and symlink escapes) from selecting a learning set.
     """
-    if not path:
+    if not path or not skill_sources:
         return None
-    norm = path.replace("\\", "/").rstrip("/")
-    parts = norm.split("/")
-    if len(parts) < 2 or parts[-1] != _SKILL_FILENAME:
+    try:
+        candidate = Path(path).resolve(strict=False)
+    except (OSError, RuntimeError):
         return None
-    skill = parts[-2].strip()
-    return skill or None
+    if candidate.name != _SKILL_FILENAME:
+        return None
+    for source in reversed(skill_sources):
+        try:
+            relative = candidate.relative_to(source)
+        except ValueError:
+            continue
+        if len(relative.parts) == 2 and relative.parts[-1] == _SKILL_FILENAME:
+            skill = relative.parts[0].strip()
+            return skill or None
+    return None
 
 
 def _resolve_client() -> Any | None:
@@ -97,7 +105,7 @@ def _is_success_text(result: Any) -> bool:
 
 
 def _compute_augmented(
-    file_path: str, content: Any, client: Any,
+    file_path: str, content: Any, client: Any, skill_sources: tuple[Path, ...],
 ) -> tuple[str | None, list[str], list[dict[str, str | None]]]:
     """Return ``(augmented_content_or_None, injected_atom_ids, ifc_sources)``.
 
@@ -107,7 +115,7 @@ def _compute_augmented(
     so the async path can offload it to a thread; the SQL runs inside
     ``client.run_locked_read`` so the shared connection is never touched
     cross-thread without the store's lock (chainlink #411)."""
-    skill = _skill_from_path(file_path)
+    skill = _skill_from_path(file_path, skill_sources)
     if skill is None or client is None or not isinstance(content, str):
         return None, [], []
     try:
@@ -169,6 +177,15 @@ class SkillMemoryInjectionMiddleware(AgentMiddleware):
     reading the file itself.
     """
 
+    def __init__(self, skill_sources: list[str] | None = None) -> None:
+        self.set_skill_sources(skill_sources or [])
+
+    def set_skill_sources(self, skill_sources: list[str]) -> None:
+        """Refresh the roots shared with deepagents' live skill catalog."""
+        self._skill_sources = tuple(
+            Path(source).resolve(strict=False) for source in skill_sources
+        )
+
     def wrap_tool_call(
         self,
         request: ToolCallRequest,
@@ -179,6 +196,7 @@ class SkillMemoryInjectionMiddleware(AgentMiddleware):
             return result
         augmented, ids, ifc_sources = _compute_augmented(
             _file_path_arg(request), result.content, _resolve_client(),
+            self._skill_sources,
         )
         if augmented is not None:
             result.content = augmented
@@ -196,6 +214,7 @@ class SkillMemoryInjectionMiddleware(AgentMiddleware):
         augmented, ids, ifc_sources = await asyncio.to_thread(
             _compute_augmented,
             _file_path_arg(request), result.content, _resolve_client(),
+            self._skill_sources,
         )
         if augmented is not None:
             result.content = augmented

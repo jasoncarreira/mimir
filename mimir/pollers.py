@@ -763,6 +763,23 @@ POLLER_OVERRIDE_KEYS = frozenset(
     {"cron", "priority", "batch_size", "recover_failed_turns", "env", "pass_env",
      "deliver", "budget"}
 )
+#: Non-secret deployment tuning that the agent-facing override tool may place in
+#: a poller's environment. Operator-authored manifests and override files remain
+#: lenient; this allowlist applies only to the strict write path.
+POLLER_OVERRIDE_ENV_KEYS = frozenset({
+    "MIMIR_GMAIL_MAX_FETCH",
+    "MIMIR_SOCIAL_FEED_LIMIT",
+    "MIMIR_SOCIAL_LIMIT",
+    "WORKLINK_MAX_CONCURRENT",
+})
+#: Names whose operator-controlled host values the agent may select for a
+#: poller. Scope selectors are safe here but not as agent-provided literals.
+POLLER_OVERRIDE_PASS_ENV_KEYS = POLLER_OVERRIDE_ENV_KEYS | frozenset({
+    "GITHUB_REPOS",
+    "GOG_ACCOUNT",
+    "MIMIR_GMAIL_QUERY",
+    "MIMIR_SOCIAL_PLATFORMS",
+})
 
 POLLER_AUTHORITY_FIELDS = frozenset({
     "authority", "capabilities", "tier", "profile", "principal_id",
@@ -1020,6 +1037,42 @@ def _parse_poller_overrides_raw(
                     raise PollerOverridesValidationError(msg)
                 log.warning("%s; dropping", msg)
                 continue
+            if strict and key == "env":
+                if not isinstance(value, dict):
+                    raise PollerOverridesValidationError(
+                        f"poller_overrides_invalid_env: {path} — {name}.env "
+                        "must be a mapping"
+                    )
+                invalid = [
+                    env_key for env_key in value
+                    if not isinstance(env_key, str)
+                    or env_key not in POLLER_OVERRIDE_ENV_KEYS
+                ]
+                if invalid:
+                    raise PollerOverridesValidationError(
+                        f"poller_overrides_disallowed_env: {path} — {name}.env "
+                        f"contains disallowed names: {', '.join(sorted(map(str, invalid)))} "
+                        f"(allowed: {', '.join(sorted(POLLER_OVERRIDE_ENV_KEYS))})"
+                    )
+            if strict and key == "pass_env":
+                if not isinstance(value, list) or not all(
+                    isinstance(env_key, str) for env_key in value
+                ):
+                    raise PollerOverridesValidationError(
+                        f"poller_overrides_invalid_pass_env: {path} — "
+                        f"{name}.pass_env must be a list of strings"
+                    )
+                invalid = [
+                    env_key for env_key in value
+                    if env_key not in POLLER_OVERRIDE_PASS_ENV_KEYS
+                ]
+                if invalid:
+                    raise PollerOverridesValidationError(
+                        f"poller_overrides_disallowed_env: {path} — "
+                        f"{name}.pass_env contains disallowed names: "
+                        f"{', '.join(sorted(invalid))} (allowed: "
+                        f"{', '.join(sorted(POLLER_OVERRIDE_PASS_ENV_KEYS))})"
+                    )
             kept[str(key)] = value
         if kept:
             out[str(name)] = kept

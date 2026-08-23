@@ -5,7 +5,7 @@ import json
 import os
 from pathlib import Path
 import stat
-from typing import Any
+from typing import Any, Callable
 
 from .._atomic import atomic_write_json
 from .backends.feature_factory import FactoryStatus, parse_factory_status
@@ -290,7 +290,14 @@ def load_factory_record(home: Path, run_id: str) -> FactoryRunRecord | None:
     return FactoryRunRecord.from_json(data)
 
 
-def archive_factory_record(home: Path, record: FactoryRunRecord) -> Path:
+def archive_factory_record(
+    home: Path,
+    record: FactoryRunRecord,
+    *,
+    event_logger: Callable[..., None] | None = None,
+    source_kind: str | None = None,
+    reason: str | None = None,
+) -> Path:
     source = factory_record_path(home, record.run_id)
     loaded = load_factory_record(home, record.run_id)
     if loaded != record:
@@ -307,6 +314,32 @@ def archive_factory_record(home: Path, record: FactoryRunRecord) -> Path:
         os.replace(source, destination)
     except OSError as exc:
         raise FactoryRecordError("factory record cannot be archived") from exc
+    if event_logger is not None:
+        if not source_kind or not reason:
+            os.replace(destination, source)
+            raise FactoryRecordError("factory archive event context is incomplete")
+        try:
+            # Shared with the silent-path inventory in Chainlink #1395: that work
+            # should reuse this event rather than introduce a second archive name.
+            event_logger(
+                "worklink_factory_record_archived",
+                source=source_kind,
+                issue_id=record.issue_id,
+                run_id=record.run_id,
+                attempt=record.attempt,
+                session=record.session,
+                phase=record.controller_phase,
+                reason=reason,
+                archive_path=str(destination),
+            )
+        except Exception as exc:
+            try:
+                os.replace(destination, source)
+            except OSError as rollback_exc:
+                raise FactoryRecordError(
+                    "factory archive event failed and the record could not be restored"
+                ) from rollback_exc
+            raise FactoryRecordError("factory archive event could not be persisted") from exc
     return destination
 
 
@@ -320,19 +353,6 @@ def list_factory_records(home: Path) -> list[FactoryRunRecord]:
             continue
         records.append(load_factory_record(home, path.stem))
     return [record for record in records if record is not None]
-
-
-def clear_factory_record(home: Path, run_id: str) -> None:
-    if not _require_safe_directory(factory_records_dir(home), create=False):
-        return
-    path = factory_record_path(home, run_id)
-    try:
-        value = path.lstat()
-    except FileNotFoundError:
-        return
-    if stat.S_ISLNK(value.st_mode) or not stat.S_ISREG(value.st_mode):
-        raise FactoryRecordError("refusing to remove non-regular factory record")
-    path.unlink()
 
 
 def factory_process_is_alive(record: FactoryRunRecord) -> bool:

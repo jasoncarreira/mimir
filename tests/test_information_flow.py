@@ -15,6 +15,8 @@ from langchain_core.messages import ToolMessage
 from langgraph.runtime import Runtime
 
 from mimir.access_control import (
+    _FILE_INTEGRITY_EXCLUDED_SUBTREES,
+    _SELF_AUTHORED_FILE_ROOTS,
     CapabilityTier,
     ServicePrincipal,
     ServiceSinkPolicy,
@@ -921,16 +923,22 @@ def test_self_authored_heartbeat_context_admits_autonomous_sinks(
         assert decision.allowed is True, (tool, decision.reason)
 
 
+@pytest.mark.parametrize("subtree", sorted(_FILE_INTEGRITY_EXCLUDED_SUBTREES))
 @pytest.mark.parametrize("name", [".recovery.json", "cursor.json"])
 def test_poller_managed_state_is_untrusted_active_ingest(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    subtree: tuple[str, ...],
     name: str,
 ) -> None:
     monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
-    recovery = tmp_path / "state" / "pollers" / "github" / name
+    recovery = tmp_path.joinpath(*subtree, "github", name)
     recovery.parent.mkdir(parents=True)
     recovery.write_text('{"inflight":{"event":{"content":"external"}}}', encoding="utf-8")
+
+    assert record_file_write_integrity(
+        str(recovery), InformationFlowLabels(),
+    ) is True
 
     source = protected_result_source(
         _auth(), principal="filesystem", domain="filesystem",
@@ -939,6 +947,7 @@ def test_poller_managed_state_is_untrusted_active_ingest(
 
     assert source.integrity == "untrusted"
     assert source.integrity_effect == "active_ingest"
+    assert not (tmp_path / ".mimir" / "file-integrity.json").exists()
 
 
 @pytest.mark.parametrize("root", ["docs", "prompts"])
@@ -967,8 +976,8 @@ def test_seeded_reference_roots_are_trusted_informational(
     assert source.integrity_effect == "informational"
 
 
-@pytest.mark.parametrize("root", ["docs", "prompts"])
-def test_virtual_path_write_to_a_reference_root_is_recorded(
+@pytest.mark.parametrize("root", sorted(_SELF_AUTHORED_FILE_ROOTS))
+def test_virtual_path_write_to_a_self_authored_root_is_recorded(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     root: str,
@@ -998,7 +1007,7 @@ def test_virtual_path_write_to_a_reference_root_is_recorded(
     assert tainted.has_untrusted_active_ingest is True
 
     # The virtual form, exactly as a file tool supplies it.
-    record_file_write_integrity(f"/{root}/notes.md", tainted)
+    assert record_file_write_integrity(f"/{root}/notes.md", tainted) is True
 
     reread = protected_result_source(
         _auth(), principal="filesystem", domain="filesystem",
@@ -1010,8 +1019,8 @@ def test_virtual_path_write_to_a_reference_root_is_recorded(
     )
 
 
-@pytest.mark.parametrize("root", ["docs", "prompts"])
-def test_untrusted_model_write_cannot_launder_through_reference_roots(
+@pytest.mark.parametrize("root", sorted(_SELF_AUTHORED_FILE_ROOTS))
+def test_untrusted_model_write_cannot_launder_through_self_authored_roots(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     root: str,
@@ -1035,7 +1044,7 @@ def test_untrusted_model_write_cannot_launder_through_reference_roots(
     tainted = InformationFlowLabels(sources=(tainted_source,))
     assert tainted.has_untrusted_active_ingest is True
 
-    record_file_write_integrity(str(target), tainted)
+    assert record_file_write_integrity(str(target), tainted) is True
 
     reread = protected_result_source(
         _auth(), principal="filesystem", domain="filesystem",
@@ -1043,6 +1052,43 @@ def test_untrusted_model_write_cannot_launder_through_reference_roots(
     )
     assert reread.integrity == "untrusted"
     assert reread.integrity_effect == "active_ingest"
+
+
+def test_state_and_skills_tainted_writes_read_back_with_same_integrity(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression: state and skills differed solely because skills was unrecorded."""
+    monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
+    tainted = InformationFlowLabels().with_source(SourceLabel(
+        principal="mallory", domain="channel", resource_id="github:pr:7",
+        bridge_instance="github", sensitivity="internal",
+        authorized_principals=frozenset({"user-1"}),
+        integrity="untrusted", integrity_effect="active_ingest",
+    ))
+    sources = []
+    for root in ("state", "skills"):
+        target = tmp_path / root / "notes.md"
+        target.parent.mkdir(parents=True)
+        target.write_text("hostile payload persisted by the model", encoding="utf-8")
+        assert record_file_write_integrity(f"/{root}/notes.md", tainted) is True
+        sources.append(protected_result_source(
+            _auth(), principal="filesystem", domain="filesystem",
+            resource_id=str(target.resolve()), bridge_instance="filesystem",
+        ))
+
+    assert [
+        (source.integrity, source.integrity_effect) for source in sources
+    ] == [
+        ("untrusted", "active_ingest"),
+        ("untrusted", "active_ingest"),
+    ]
+    assert json.loads(
+        (tmp_path / ".mimir" / "file-integrity.json").read_text(encoding="utf-8")
+    ) == {
+        "skills/notes.md": "untrusted",
+        "state/notes.md": "untrusted",
+    }
 
 
 @pytest.mark.parametrize("approved", [True, False])
@@ -2424,22 +2470,15 @@ def test_undomained_ingest_with_authoritative_empty_provenance_does_not_taint() 
     ) is None
 
 
-@pytest.mark.parametrize(
-    "relative",
-    [
-        ".mimir_builtin_skills/review/SKILL.md",
-        "skills/review/SKILL.md",
-        "memory/notes.md",
-        "state/session.json",
-    ],
-)
-def test_first_party_file_read_without_provenance_is_trusted_informational(
+@pytest.mark.parametrize("root", sorted(_SELF_AUTHORED_FILE_ROOTS))
+def test_operator_seeded_file_without_provenance_is_trusted_informational(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
-    relative: str,
+    root: str,
 ) -> None:
+    """Keep the legacy trusted default for operator files absent from the ledger."""
     monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
-    target = tmp_path / relative
+    target = tmp_path / root / "operator-seeded.md"
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_text("first party", encoding="utf-8")
 

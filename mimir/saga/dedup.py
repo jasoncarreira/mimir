@@ -17,7 +17,7 @@ Why this is its own pass:
 
 Canonical-pick rule (in priority order):
     1. ACT-R activation B_i (higher = more retrieval-validated)
-    2. is_pinned (pinned wins)
+    2. is_pinned (pinned wins only when activation ties)
     3. confidence_tier on observations_metadata (high>medium>low; raws
        don't have this so falls through for raw-only clusters)
     4. evidence_count on observations_metadata (more downstream support)
@@ -30,6 +30,8 @@ What we preserve on the canonical:
   history is preserved (sum of (now - t_j)^(-d) is linear, so transfer
   is correct under Petrov OL)
 - Topics + metadata.tags are unioned
+- ``is_pinned`` is ORed across the canonical and every duplicate, so a
+  pin survives even when its atom loses the activation tiebreak
 - ``metadata.dedup_merged_ids`` is appended with the dropped atom IDs
   (audit trail; survives in the canonical's metadata JSON)
 - Atom relations are rewritten (source/target redirected to canonical,
@@ -425,7 +427,8 @@ def merge_duplicate_into_canonical(
     # even if candidate selection or a custom clusterer is defective.
     rows = conn.execute(
         "SELECT id, topics, metadata, agent_id, owner_principal, "
-        "origin_domain, visibility, tombstoned, encoding_confidence, integrity "
+        "origin_domain, visibility, tombstoned, encoding_confidence, integrity, "
+        "is_pinned "
         "FROM atoms WHERE id IN (?, ?)",
         (can_id, dup_id),
     ).fetchall()
@@ -470,6 +473,7 @@ def merge_duplicate_into_canonical(
         dup_enc = BASELINE_ENCODING_CONFIDENCE
     starting = max(float(can_enc), float(dup_enc))
     new_enc_conf = _bump_encoding_confidence(starting)
+    merged_is_pinned = 1 if can_row[10] or dup_row[10] else 0
     # Cache the new value on the canonical dict so the caller's
     # in-memory view stays consistent (relevant when a single dedup
     # pass folds N duplicates into the same canonical — each
@@ -478,11 +482,12 @@ def merge_duplicate_into_canonical(
 
     conn.execute(
         "UPDATE atoms SET topics = ?, metadata = ?, "
-        "encoding_confidence = ? WHERE id = ?",
+        "encoding_confidence = ?, is_pinned = ? WHERE id = ?",
         (
             json.dumps(merged_topics),
             json.dumps(merged_meta),
             new_enc_conf,
+            merged_is_pinned,
             can_id,
         ),
     )

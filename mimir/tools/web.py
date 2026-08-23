@@ -280,6 +280,7 @@ def _validate_public_host(hostname: str) -> None:
             or ip.is_reserved
             or ip.is_multicast
             or ip.is_unspecified
+            or not ip.is_global
         ):
             raise SSRFBlocked(
                 f"fetch target {hostname!r} resolves to non-public address {ip_str}"

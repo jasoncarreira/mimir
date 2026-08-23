@@ -29,6 +29,8 @@ from langchain.agents.middleware import AgentMiddleware
 from langchain_core.messages import HumanMessage
 from langgraph.config import get_config
 
+from .prompt_safety import sanitize_prompt_field
+
 if TYPE_CHECKING:
     from .models import AgentEvent
 
@@ -382,7 +384,9 @@ def deferred_records(channel_id: str | None) -> list[tuple["AgentEvent", str]]:
         ]
 
 
-def render_injected_message(event: "AgentEvent") -> str:
+def render_injected_message(
+    event: "AgentEvent", *, resolver: object | None = None,
+) -> str:
     """Render a folded event into the text the model sees mid-turn.
 
     A normal ``user_message`` reaches the model via
@@ -392,15 +396,31 @@ def render_injected_message(event: "AgentEvent") -> str:
     a mid-turn attachment (mimir's #593 review). This mirrors that body
     rendering so a folded message carries the same actionable content.
     """
-    author = event.author_display or event.author or "-"
-    msg_id_part = f", msg_id: {event.source_id}" if event.source_id else ""
+    if resolver is None:
+        from ._context import get_current_turn
+
+        ctx = get_current_turn()
+        resolver = getattr(ctx, "identity_resolver", None) if ctx is not None else None
+    author = (
+        resolver.display_name(event.author)
+        if resolver is not None and event.author
+        else None
+    )
+    author = sanitize_prompt_field(author or event.author_display or event.author or "-")
+    msg_id_part = (
+        f", msg_id: {sanitize_prompt_field(event.source_id)}"
+        if event.source_id else ""
+    )
     body = event.content or "(no content)"
     if event.attachment_names:
-        paths = "\n".join(f"- {p}" for p in event.attachment_names)
+        paths = "\n".join(
+            f"- {sanitize_prompt_field(path)}" for path in event.attachment_names
+        )
         body = f"{body}\n\nAttachments:\n{paths}"
     approval_failure = event.extra.get(_APPROVAL_FAILURE_EXTRA_KEY)
     if isinstance(approval_failure, str) and approval_failure:
-        body = f"{body}\n\n[operator approval refused: {approval_failure}]"
+        failure = sanitize_prompt_field(approval_failure)
+        body = f"{body}\n\n[operator approval refused: {failure}]"
     return f"[mid-turn message from {author}{msg_id_part}]\n{body}"
 
 

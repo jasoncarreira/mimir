@@ -281,6 +281,44 @@ def test_consolidate_groups_across_sessions(conn):
     assert set(ids) == evidence
 
 
+def test_consolidate_tombstones_orphan_when_relations_write_fails(
+    conn, monkeypatch,
+):
+    import mimir.saga.consolidate as consolidate_module
+
+    embed_fn = _embed_fn_factory({
+        "crash_a": [1.0, 0.0, 0.0, 0.0],
+        "crash_b": [1.0, 0.0, 0.0, 0.0],
+        "crash_c": [1.0, 0.0, 0.0, 0.0],
+    })
+    for content in ("crash_a", "crash_b", "crash_c"):
+        store(conn, content, embed_fn=embed_fn)
+
+    def fail_relations(*args, **kwargs):
+        raise RuntimeError("injected relations transaction failure")
+
+    monkeypatch.setattr(
+        consolidate_module, "find_superseded_observations", fail_relations,
+    )
+    with pytest.raises(RuntimeError, match="injected relations transaction failure"):
+        consolidate(
+            conn,
+            embed_fn=embed_fn,
+            cluster_fn=lambda raws: [raws],
+            observation_synth_fn=_stub_synth,
+        )
+
+    live_unbacked = conn.execute(
+        "SELECT a.id FROM atoms a "
+        "WHERE a.memory_type = 'observation' AND a.tombstoned = 0 "
+        "AND NOT EXISTS (SELECT 1 FROM atom_relations ar "
+        "  WHERE ar.source_id = a.id AND ar.relation_type = 'evidenced_by') "
+        "AND NOT EXISTS (SELECT 1 FROM observations_metadata om "
+        "  WHERE om.atom_id = a.id)"
+    ).fetchall()
+    assert live_unbacked == []
+
+
 def test_consolidate_observation_inherits_intersected_acl(conn):
     embed_fn = _embed_fn_factory({
         "acl_a": [1.0, 0.05, 0.0, 0.0],

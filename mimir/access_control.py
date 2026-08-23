@@ -36,6 +36,8 @@ from dataclasses import dataclass, field, replace
 from enum import StrEnum
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
+
+from .coding import coding_enabled
 from urllib.parse import urlsplit, urlunsplit
 
 from langchain_core.tools import ToolException
@@ -57,6 +59,7 @@ from .read_policy import (
 )
 
 HTTP_EVENT_INGRESS_EXTRA_KEY = "_mimir_event_ingress"
+POLLER_RECOVERY_REPLAY_EXTRA_KEY = "_mimir_poller_recovery_replay"
 
 if TYPE_CHECKING:
     from .identities import IdentityResolver
@@ -691,13 +694,16 @@ def build_trigger_service_principal(
         if is_github_activity and home
         else ()
     )
+    implicit_write_roots = () if trigger == "poller" else (
+        *(() if is_github_activity else _configured_repo_write_roots()),
+        *home_data_roots,
+        *((Path(home) / "scratch",) if is_github_activity and home else ()),
+    )
     write_roots = tuple(dict.fromkeys(
         root.resolve()
         for root in (
             *roots,
-            *(() if is_github_activity else _configured_repo_write_roots()),
-            *home_data_roots,
-            *((Path(home) / "scratch",) if is_github_activity and home else ()),
+            *implicit_write_roots,
         )
     ))
     operations = tuple(dict.fromkeys(capabilities))
@@ -1347,6 +1353,7 @@ def _repo_review_state_from_event(event: "AgentEvent", service: ServicePrincipal
         or service.authority_profile != "github"
         or event.trigger != "poller"
         or not isinstance(event.extra, dict)
+        or event.extra.get(POLLER_RECOVERY_REPLAY_EXTRA_KEY) is not None
     ):
         return None
     items = event.extra.get("items")
@@ -3699,10 +3706,7 @@ def _service_shell_command_shape(argv: list[str]) -> str:
 
 def _service_shell_coding_enabled() -> bool:
     """Whether this deployment exposes coding tools, using config's bool syntax."""
-    raw = os.environ.get("MIMIR_CODING_ENABLED")
-    # Keep this truthy set aligned with config._env_bool without importing config
-    # here: access_control is imported by config, so that would create a cycle.
-    return bool(raw and raw.strip().lower() in {"1", "true", "yes", "on", "y"})
+    return coding_enabled()
 
 
 def _service_shell_typed_tool_guidance(
@@ -7683,6 +7687,16 @@ _READ_BACKEND_RESULT_TOOLS = frozenset({
     "repo_unmerged",
 })
 
+_SELF_AUTHORED_FILE_ROOTS = frozenset({
+    ".mimir_builtin_skills",
+    "docs",
+    "memory",
+    "prompts",
+    "skills",
+    "state",
+})
+_FILE_INTEGRITY_EXCLUDED_SUBTREES = frozenset({("state", "pollers")})
+
 
 @dataclass(frozen=True)
 class ProtectedResultProvenance:
@@ -7691,34 +7705,81 @@ class ProtectedResultProvenance:
     sources: tuple["SourceLabel", ...]
 
 
-_protected_result_provenance: ContextVar[ProtectedResultProvenance | None] = ContextVar(
+@dataclass
+class _ProtectedResultCapture:
+    """One tool call's thread-safe, context-propagating provenance window."""
+
+    sources: list["SourceLabel"] = field(default_factory=list)
+    seen: set["SourceLabel"] = field(default_factory=set)
+    published: bool = False
+    invalid: bool = False
+    closed: bool = False
+    lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
+
+
+_ProtectedResultState = ProtectedResultProvenance | _ProtectedResultCapture | None
+
+
+_protected_result_provenance: ContextVar[_ProtectedResultState] = ContextVar(
     "protected_result_provenance", default=None,
 )
 
 
-def begin_protected_result_capture() -> Token[ProtectedResultProvenance | None]:
+def begin_protected_result_capture() -> Token[_ProtectedResultState]:
     """Start an isolated result-provenance capture around one tool execution."""
-    return _protected_result_provenance.set(None)
+    return _protected_result_provenance.set(_ProtectedResultCapture())
 
 
 def publish_protected_result(sources: tuple["SourceLabel", ...]) -> None:
-    """Publish exact server-derived sources, including an authoritative empty set."""
+    """Accumulate exact sources in this capture, including authoritative empty."""
     from .models import SourceLabel
 
     if not isinstance(sources, tuple) or not all(
         isinstance(source, SourceLabel) for source in sources
     ):
         raise TypeError("protected result provenance must be a tuple of SourceLabel")
+    capture = _protected_result_provenance.get()
+    if isinstance(capture, _ProtectedResultCapture):
+        with capture.lock:
+            if capture.closed:
+                return
+            capture.published = True
+            for source in sources:
+                if source not in capture.seen:
+                    capture.seen.add(source)
+                    capture.sources.append(source)
+        return
     _protected_result_provenance.set(ProtectedResultProvenance(sources))
 
 
+def invalidate_protected_result_capture() -> None:
+    """Mark the active capture incomplete so partial sources are not authoritative."""
+    capture = _protected_result_provenance.get()
+    if isinstance(capture, _ProtectedResultCapture):
+        with capture.lock:
+            if not capture.closed:
+                capture.invalid = True
+        return
+    _protected_result_provenance.set(None)
+
+
 def end_protected_result_capture(
-    token: Token[ProtectedResultProvenance | None],
+    token: Token[_ProtectedResultState],
 ) -> ProtectedResultProvenance | None:
     """Return the captured provenance and restore any enclosing capture."""
     captured = _protected_result_provenance.get()
+    if isinstance(captured, _ProtectedResultCapture):
+        with captured.lock:
+            captured.closed = True
+            result = (
+                ProtectedResultProvenance(tuple(captured.sources))
+                if captured.published and not captured.invalid
+                else None
+            )
+    else:
+        result = captured
     _protected_result_provenance.reset(token)
-    return captured
+    return result
 
 
 def protected_result_source(
@@ -7773,9 +7834,7 @@ def _filesystem_result_integrity(
     except (OSError, RuntimeError, ValueError):
         return "untrusted", "active_ingest"
 
-    if relative.parts and relative.parts[0] in {
-        ".mimir_builtin_skills", "docs", "memory", "prompts", "skills", "state",
-    }:
+    if relative.parts and relative.parts[0] in _SELF_AUTHORED_FILE_ROOTS:
         # These roots are scaffolded by ``mimir setup`` and thereafter written
         # only by the operator or by the agent through the protected tool
         # boundary -- so the path itself is evidence of self-authorship, which
@@ -7788,7 +7847,7 @@ def _filesystem_result_integrity(
         # Poller subprocesses write this tree directly, outside the protected
         # tool boundary, and may persist attacker-derived cursor/event fields.
         # A path under state/pollers is therefore not proof of self-authorship.
-        if relative.parts[0:2] == ("state", "pollers"):
+        if relative.parts[0:2] in _FILE_INTEGRITY_EXCLUDED_SUBTREES:
             return "untrusted", "active_ingest"
         persisted = _persisted_file_integrity(home, relative)
         return persisted, (
@@ -7874,15 +7933,15 @@ def record_file_write_integrity(
                 pass
             else:
                 return False
-            # Must list every root the recording set below covers. The
-            # backend runs virtual_mode rooted at the home, so a file tool
+            # The backend runs virtual_mode rooted at the home, so a file tool
             # addresses these as "/docs/notes.md" rather than
             # "<home>/docs/notes.md" -- a root recorded only for physical paths
             # is not recorded for the shape writes actually arrive in, and the
             # trusted read default then launders it.
-            if requested.parts[1:2] in {
-                ("docs",), ("memory",), ("prompts",), ("state",),
-            }:
+            if (
+                len(requested.parts) > 1
+                and requested.parts[1] in _SELF_AUTHORED_FILE_ROOTS
+            ):
                 resource = home / requested.as_posix().lstrip("/")
             else:
                 return True
@@ -7893,15 +7952,9 @@ def record_file_write_integrity(
         relative = resource.relative_to(home)
     except (OSError, RuntimeError, ValueError):
         return False
-    if not relative.parts or relative.parts[0] not in {
-        "docs", "memory", "prompts", "state",
-    }:
-        # Must stay in step with the trusted roots in
-        # ``_filesystem_result_integrity``: a root that is trusted on read but
-        # unrecorded on write is a laundering path, because content the model
-        # wrote while tainted would be re-read as self-authored.
+    if not relative.parts or relative.parts[0] not in _SELF_AUTHORED_FILE_ROOTS:
         return True
-    if relative.parts[0:2] == ("state", "pollers"):
+    if relative.parts[0:2] in _FILE_INTEGRITY_EXCLUDED_SUBTREES:
         return True
     integrity = "untrusted"
     sources = getattr(labels, "sources", ())

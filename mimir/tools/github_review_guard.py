@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import os
 import shlex
 import subprocess
 import threading
@@ -11,6 +10,7 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
+from ._shell_env import direct_exec_env
 from .extra import _effective_shell_cwd
 from .refusals import ToolPolicyRefusal
 
@@ -19,6 +19,7 @@ _locks_guard = threading.Lock()
 _locks: dict[tuple[str, int, str, str, str], threading.Lock] = {}
 _lock_users: dict[tuple[str, int, str, str, str], int] = {}
 _LOCK_ACQUIRE_TIMEOUT_SECONDS = 15.0
+_GH_EXECUTABLE = "gh"
 
 
 @dataclass(frozen=True)
@@ -203,19 +204,21 @@ def review_submission_from_request(request: Any) -> ReviewSubmission | None:
     )
 
 
-def _gh_env() -> dict[str, str] | None:
-    token = os.environ.get("GITHUB_TOKEN", "").strip()
-    return {**os.environ, "GH_TOKEN": token} if token else None
+def _gh_env() -> dict[str, str]:
+    return direct_exec_env([_GH_EXECUTABLE])
 
 
 def _run(spec: ReviewSubmission, arguments: list[str]) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
-        [spec.executable, *arguments],
+        # Guard-owned probes resolve gh from the server's trusted PATH. The
+        # model-supplied executable remains useful only for recognizing argv.
+        [_GH_EXECUTABLE, *arguments],
         capture_output=True,
         text=True,
         timeout=15,
         cwd=spec.cwd,
         env=_gh_env(),
+        stdin=subprocess.DEVNULL,
     )
 
 

@@ -186,9 +186,12 @@ def build_vocab_block(
         if not owner_principal:
             raise ValueError("owner scope is required for DB vocabulary")
         rows = conn.execute(
-            "SELECT predicate, COUNT(*) c FROM triples "
-            "WHERE tombstoned = 0 AND owner_principal = ? "
-            "GROUP BY predicate ORDER BY c DESC LIMIT ?",
+            "SELECT t.predicate, COUNT(*) c FROM triples t "
+            "LEFT JOIN atoms a ON a.id = t.source_atom_id "
+            "WHERE t.tombstoned = 0 "
+            "AND (t.source_atom_id IS NULL OR a.tombstoned = 0) "
+            "AND t.owner_principal = ? "
+            "GROUP BY t.predicate ORDER BY c DESC LIMIT ?",
             (owner_principal, top_n_predicates),
         ).fetchall()
         for pred, cnt in rows:
@@ -196,9 +199,12 @@ def build_vocab_block(
                 pred_lines.append((pred, int(cnt or 0)))
                 seen_preds.add(pred)
         rows = conn.execute(
-            "SELECT subject, COUNT(*) c FROM triples "
-            "WHERE tombstoned = 0 AND owner_principal = ? "
-            "GROUP BY subject ORDER BY c DESC LIMIT ?",
+            "SELECT t.subject, COUNT(*) c FROM triples t "
+            "LEFT JOIN atoms a ON a.id = t.source_atom_id "
+            "WHERE t.tombstoned = 0 "
+            "AND (t.source_atom_id IS NULL OR a.tombstoned = 0) "
+            "AND t.owner_principal = ? "
+            "GROUP BY t.subject ORDER BY c DESC LIMIT ?",
             (owner_principal, top_n_subjects),
         ).fetchall()
         for subj, cnt in rows:

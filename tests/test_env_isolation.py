@@ -195,6 +195,14 @@ _DECLARED_IDENTITY_TESTS = (
     "tests/test_worklink_orchestrator.py"
     "::test_factory_new_run_uses_resolved_base_for_single_checkout_placement"
 )
+_CODING_ENABLED = "MIMIR_CODING_ENABLED"
+_CODING_STATE_TESTS = (
+    "tests/test_tool_registry.py",
+    "tests/test_worklink_backends.py",
+    "tests/test_worklink_evidence.py",
+    "tests/test_runtime.py",
+    "tests/test_bench_runner.py",
+)
 
 
 def test_declared_publishing_identity_tests_ignore_the_host_override() -> None:
@@ -224,6 +232,30 @@ def test_declared_publishing_identity_tests_ignore_the_host_override() -> None:
     assert completed.returncode == 0, (
         f"{_PUBLISHING_IDENTITY} leaked into the suite:\n"
         f"{completed.stdout.decode(errors='replace')[-2000:]}"
+    )
+
+
+def test_coding_state_tests_ignore_the_host_override() -> None:
+    """The Worklink gate must pass with deployment coding enabled.
+
+    The chainlink-orchestrator deliberately passes ``MIMIR_CODING_ENABLED`` to
+    every Worklink build. Without the session fixture clearing that host value,
+    disabled-default tool-registry tests and backend/evidence tests silently run
+    against the enabled worker path. Running the affected files in a child
+    process makes the ambient-enabled deployment condition executable evidence.
+    """
+    env = dict(os.environ)
+    env[_CODING_ENABLED] = "true"
+    completed = subprocess.run(
+        [sys.executable, "-m", "pytest", "-q", "-p", "no:randomly", *_CODING_STATE_TESTS],
+        capture_output=True,
+        cwd=Path(__file__).resolve().parent.parent,
+        env=env,
+    )
+    assert completed.returncode == 0, (
+        f"{_CODING_ENABLED} leaked into the suite:\n"
+        f"{completed.stdout.decode(errors='replace')[-4000:]}\n"
+        f"{completed.stderr.decode(errors='replace')[-2000:]}"
     )
 
 

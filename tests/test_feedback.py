@@ -2516,6 +2516,28 @@ def test_chain_consumed_kinds_not_duplicated(tmp_path: Path):
     assert not any(s.kind == "git_push_failed" for s in all_signals)
 
 
+def test_saga_vector_search_degradation_surfaces_to_next_turn(tmp_path: Path):
+    log = _make_log(
+        tmp_path,
+        events=[
+            {
+                "type": "saga_vector_search_degraded",
+                "timestamp": _ts(0.1),
+                "reason": "query_dimension_mismatch",
+                "expected_dimension": 1024,
+                "observed_dimension": 384,
+            }
+        ],
+    )
+
+    block = log.recent_block()
+
+    assert block is not None
+    assert "SAGA semantic search degraded to FTS5" in block
+    assert "query_dimension_mismatch" in block
+    assert "expected dim=1024, observed dim=384" in block
+
+
 def test_non_grouped_kind_unaffected(tmp_path: Path):
     """A kind not in any valence group uses the existing count-display path."""
     events = [
