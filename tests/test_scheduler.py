@@ -4752,43 +4752,72 @@ async def test_effective_poller_timeout_clamps_to_cadence(tmp_path, monkeypatch)
     assert events == []
 
 
-@pytest.mark.asyncio
-async def test_poller_cadence_finds_a_minimum_beyond_the_first_fires(tmp_path):
-    """Cron gaps are not monotonic, so a fixed prefix of samples is unsound.
+def test_cron_min_gap_bounds_sparse_and_irregular_schedules():
+    """The cadence bound comes from the cron fields, not from simulating fires.
 
-    ``0,9,18,27,28,42,51 * * * *`` has mostly 9-minute gaps and one 1-minute gap
-    (27 -> 28). Whether that gap falls inside the first few fires depends purely
-    on when the scan starts: with a 5-sample prefix, 15 of the 60 possible start
-    minutes reported 540s and let the full 120s cap be admitted across a 60s
-    interval — intermittently, which is worse than always.
-
-    Asserts the minimum is found from *every* start minute, not just a lucky one.
+    Simulation cannot establish it. Gregorian recurrence is unbounded, so
+    ``0,2 0 29 2 *`` — two leap-day fires two minutes apart — has its next pair
+    years out; a finite horizon that ends first yields nothing, and falling back
+    to the framework cap hands a 120s timeout to a 120s cadence. A fixed prefix
+    of samples fails differently: with ``0,9,18,27,28,42,51 * * * *`` the
+    one-minute gap sits outside the first five fires for 15 of 60 start minutes.
     """
-    from mimir.pollers import PollerConfig
-    import mimir.scheduler as ms
+    from mimir.scheduler import _cron_min_gap_seconds
+
+    # Sparse: the close pair is years away and no horizon reaches it.
+    assert _cron_min_gap_seconds("0,2 0 29 2 *") == 120.0
+    # Irregular: the tight pair is not among the first fires.
+    assert _cron_min_gap_seconds("0,9,18,27,28,42,51 * * * *") == 60.0
+    # Wrap across the hour boundary counts.
+    assert _cron_min_gap_seconds("0,59 * * * *") == 60.0
+    # A bare value with a step means "from a, every step" — more values, tighter
+    # gap, which is the safe direction for a lower bound.
+    assert _cron_min_gap_seconds("5/10 * * * *") == 600.0
+    # Single minute: the hour field bounds it. Single hour: at most daily.
+    assert _cron_min_gap_seconds("0 9,10 * * *") == 3600.0
+    assert _cron_min_gap_seconds("0 9 * * *") == 86400.0
+    # Shipped cadences.
+    assert _cron_min_gap_seconds("*/15 * * * *") == 900.0
+    assert _cron_min_gap_seconds("*/10 * * * *") == 600.0
+    # Unparseable is reported, not guessed.
+    assert _cron_min_gap_seconds("not a cron") is None
+
+
+@pytest.mark.asyncio
+async def test_effective_timeout_never_exceeds_a_sparse_cadence(tmp_path):
+    """The invariant, on the schedule that broke the horizon approach.
+
+    A 120s cadence must not receive the 120s framework cap: the run would span
+    the next fire and `max_instances=1` would skip it.
+    """
+    from mimir.pollers import POLLER_TIMEOUT_SECONDS, PollerConfig
 
     async def noop(event: AgentEvent) -> bool:
         return True
 
     sched = Scheduler(scheduler_yaml=tmp_path / "s.yaml", enqueue=noop)
-    cfg = PollerConfig(
-        name="irregular", command="x", cron="0,9,18,27,28,42,51 * * * *",
-        env={}, skill_dir=tmp_path,
-    )
+    got = await sched._effective_poller_timeout(PollerConfig(
+        name="leap", command="x", cron="0,2 0 29 2 *", env={}, skill_dir=tmp_path,
+    ))
+    assert got < 120.0, "a 120s cadence was handed a timeout that spans its next fire"
+    assert got < float(POLLER_TIMEOUT_SECONDS)
 
-    reported = []
-    for minute in range(60):
-        sched._poller_cadence_cache.clear()
-        with mock.patch.object(ms, "datetime") as fake_dt:
-            fake_dt.now.return_value = datetime(
-                2026, 1, 1, 0, minute, tzinfo=timezone.utc,
-            )
-            reported.append(sched._poller_cadence_seconds(cfg))
 
-    assert set(reported) == {60.0}, (
-        f"cadence scan missed the minimum from some start minutes: "
-        f"{sorted(set(reported))}"
-    )
+@pytest.mark.asyncio
+async def test_unparseable_cron_degrades_conservatively(tmp_path):
+    """An unknown cadence must clamp toward safety, not to the full cap."""
+    from mimir.pollers import POLLER_TIMEOUT_SECONDS, PollerConfig
+    from mimir.scheduler import CRON_MIN_GRANULARITY_SECONDS
+
+    async def noop(event: AgentEvent) -> bool:
+        return True
+
+    sched = Scheduler(scheduler_yaml=tmp_path / "s.yaml", enqueue=noop)
+    got = await sched._effective_poller_timeout(PollerConfig(
+        name="bad", command="x", cron="not a cron", env={}, skill_dir=tmp_path,
+    ))
+    assert got < float(POLLER_TIMEOUT_SECONDS)
+    assert got <= CRON_MIN_GRANULARITY_SECONDS
 
 
 @pytest.mark.asyncio
@@ -4822,17 +4851,3 @@ async def _noop_coro():
     return None
 
 
-@pytest.mark.asyncio
-async def test_effective_poller_timeout_falls_back_on_unparseable_cron(tmp_path):
-    """An invalid cron must not make the timeout zero or raise — it is reported
-    elsewhere, and this path should degrade to the framework cap."""
-    from mimir.pollers import POLLER_TIMEOUT_SECONDS, PollerConfig
-
-    async def noop(event: AgentEvent) -> bool:
-        return True
-
-    sched = Scheduler(scheduler_yaml=tmp_path / "s.yaml", enqueue=noop)
-    got = await sched._effective_poller_timeout(PollerConfig(
-        name="bad", command="x", cron="not a cron", env={}, skill_dir=tmp_path,
-    ))
-    assert got == float(POLLER_TIMEOUT_SECONDS)

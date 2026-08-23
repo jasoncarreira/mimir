@@ -84,16 +84,8 @@ UTC = timezone.utc
 #: makes APScheduler skip it. Keeping the timeout strictly under the cadence
 #: means a slow run degrades into a late result rather than a lost tick.
 POLLER_CADENCE_MARGIN_SECONDS = 10.0
-#: Smallest gap a 5-field cron can express. Reaching it means the minimum has
-#: been found and the scan can stop.
+#: Smallest gap a 5-field cron can express.
 CRON_MIN_GRANULARITY_SECONDS = 60.0
-#: Bounds the cadence scan. A fixed prefix of samples is NOT sufficient: with
-#: ``0,9,18,27,28,42,51 * * * *`` the 1-minute gap falls outside the first five
-#: fires for 15 of 60 possible start minutes, so a prefix scan reported 540s and
-#: admitted the full cap into a 60s window a quarter of the time — intermittently,
-#: depending only on when the poller happened to be evaluated.
-POLLER_CADENCE_MAX_SAMPLES = 4000
-POLLER_CADENCE_HORIZON_DAYS = 400
 
 
 def _loop_stall_alert_threshold() -> float:
@@ -548,6 +540,75 @@ def _expand_standard_dow_numeric_part(part: str) -> str:
             names.append(name)
             seen.add(name)
     return ",".join(names)
+
+
+def _expand_cron_field(spec: str, lo: int, hi: int) -> set[int] | None:
+    """Values a single cron field admits, or None if it cannot be parsed.
+
+    Handles ``*``, ``a``, ``a-b``, ``*/step``, ``a-b/step`` and ``a/step``. A
+    bare value with a step is read as "from a, every step" (standard cron), which
+    yields more values and therefore a tighter gap — the safe direction for a
+    lower bound.
+    """
+    values: set[int] = set()
+    for raw in spec.split(","):
+        part = raw.strip()
+        if not part:
+            return None
+        step = 1
+        if "/" in part:
+            part, _, step_text = part.partition("/")
+            if not step_text.isdigit() or int(step_text) < 1:
+                return None
+            step = int(step_text)
+        part = part.strip()
+        if part in ("*", "?"):
+            start, end = lo, hi
+        elif "-" in part:
+            low_text, _, high_text = part.partition("-")
+            if not (low_text.isdigit() and high_text.isdigit()):
+                return None
+            start, end = int(low_text), int(high_text)
+        elif part.isdigit():
+            start = int(part)
+            end = hi if step > 1 else start
+        else:
+            return None
+        if start < lo or end > hi or start > end:
+            return None
+        values.update(range(start, end + 1, step))
+    return values or None
+
+
+def _min_circular_gap(values: set[int], modulus: int) -> int:
+    """Smallest distance between two members, wrapping at ``modulus``."""
+    ordered = sorted(values)
+    if len(ordered) < 2:
+        return modulus
+    gaps = [b - a for a, b in zip(ordered, ordered[1:])]
+    gaps.append(ordered[0] + modulus - ordered[-1])
+    return min(gaps)
+
+
+def _cron_min_gap_seconds(cron: str) -> float | None:
+    """Lower bound, in seconds, on the gap between two fires of ``cron``.
+
+    Two or more admitted minutes bound the gap by the closest pair of them; with
+    a single minute the hour field bounds it; with a single hour there is at most
+    one fire per day. None means the expression could not be parsed.
+    """
+    fields = cron.split()
+    if len(fields) < 2:
+        return None
+    minutes = _expand_cron_field(fields[0], 0, 59)
+    hours = _expand_cron_field(fields[1], 0, 23)
+    if minutes is None or hours is None:
+        return None
+    if len(minutes) >= 2:
+        return 60.0 * _min_circular_gap(minutes, 60)
+    if len(hours) >= 2:
+        return 3600.0 * _min_circular_gap(hours, 24)
+    return 86400.0
 
 
 def _cron_with_standard_dow(cron: str) -> str:
@@ -2149,52 +2210,32 @@ class Scheduler:
             self._poller_semaphore.release()
 
     def _poller_cadence_seconds(self, poller: PollerConfig) -> float | None:
-        """Shortest gap between this poller's successive fires, or None.
+        """Lower bound on the gap between two of this poller's fires.
 
-        Measured from the poller's *effective* cron — the one it was registered
-        with, after ``pollers-overrides.yaml`` — so a locally installed or
-        overridden poller is covered too. Scanning the repo's bundled manifests
-        would miss both.
+        Derived from the cron *fields*, not by simulating fires. Simulation
+        cannot establish this bound: Gregorian recurrence is unbounded, so a
+        leap-day expression like ``0,2 0 29 2 *`` has its next pair of fires
+        years away, and any finite horizon that ends first yields no information
+        at all — which previously degraded to the full cap, exactly the unsafe
+        direction.
 
-        Scans until the minimum is provably found rather than sampling a fixed
-        prefix: cron gaps are not monotonic, and the smallest one can sit
-        arbitrarily far into the sequence. The scan stops early at
-        ``CRON_MIN_GRANULARITY_SECONDS`` because a 5-field cron cannot express a
-        smaller gap, which makes dense schedules O(1). Sparse ones are bounded by
-        ``POLLER_CADENCE_MAX_SAMPLES`` and the horizon.
+        Reads the effective cron (post ``pollers-overrides.yaml``), so locally
+        installed and overridden pollers are covered.
 
-        Cached per (name, cron): the value changes only when the manifest does,
-        and this is consulted on every fire.
+        The bound may be tighter than the true minimum when day/month fields
+        restrict which hours actually recur — e.g. ``0,59 0 * * *`` reports 60s
+        though its real gap is 59 minutes. That direction is safe: it clamps a
+        little harder than strictly necessary and never the reverse.
+
+        Returns None only when the expression cannot be parsed.
         """
         cache_key = (poller.name, poller.cron)
         cached = self._poller_cadence_cache.get(cache_key)
         if cached is not None:
             return cached[0]
-        try:
-            trigger = CronTrigger.from_crontab(
-                _cron_with_standard_dow(poller.cron), timezone=self._tz,
-            )
-        except Exception:  # noqa: BLE001 — an invalid cron is reported elsewhere
-            self._poller_cadence_cache[cache_key] = (None,)
-            return None
-        start = datetime.now(self._tz)
-        horizon = start + timedelta(days=POLLER_CADENCE_HORIZON_DAYS)
-        smallest: float | None = None
-        previous = trigger.get_next_fire_time(None, start)
-        for _ in range(POLLER_CADENCE_MAX_SAMPLES):
-            if previous is None or previous > horizon:
-                break
-            nxt = trigger.get_next_fire_time(previous, previous)
-            if nxt is None:
-                break
-            gap = (nxt - previous).total_seconds()
-            if smallest is None or gap < smallest:
-                smallest = gap
-            if smallest <= CRON_MIN_GRANULARITY_SECONDS:
-                break  # provably the minimum a cron can express
-            previous = nxt
-        self._poller_cadence_cache[cache_key] = (smallest,)
-        return smallest
+        bound = _cron_min_gap_seconds(poller.cron)
+        self._poller_cadence_cache[cache_key] = (bound,)
+        return bound
 
     async def _effective_poller_timeout(self, poller: PollerConfig) -> float:
         """The framework cap, clamped below this poller's own fire interval.
@@ -2207,7 +2248,11 @@ class Scheduler:
         cadence = await asyncio.to_thread(self._poller_cadence_seconds, poller)
         cap = float(POLLER_TIMEOUT_SECONDS)
         if cadence is None:
-            return cap
+            # Unparseable cron: such a poller cannot register a trigger anyway,
+            # but if it somehow fires, assume the tightest schedule cron can
+            # express rather than handing it the full cap. An unknown cadence
+            # must degrade toward safety, not away from it.
+            return max(1.0, CRON_MIN_GRANULARITY_SECONDS - POLLER_CADENCE_MARGIN_SECONDS)
         allowed = max(1.0, cadence - POLLER_CADENCE_MARGIN_SECONDS)
         if allowed >= cap:
             return cap
