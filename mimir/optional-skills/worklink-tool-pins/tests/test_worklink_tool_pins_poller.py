@@ -168,6 +168,41 @@ def test_reuses_existing_issue_by_dedupe_key(fresh_poller, monkeypatch, capsys):
     assert _events(capsys)[0]["issue_id"] == 901
 
 
+def test_dedupe_search_failure_skips_create_and_emits_durable_signal(
+    fresh_poller, monkeypatch, capsys,
+):
+    home = Path(sys.modules["os"].environ["MIMIR_HOME"])
+    _write_config(
+        home,
+        """
+        tool_pins:
+          - name: codex
+            category: coding-cli
+            pin: "0.139.0"
+            smoke: "codex --version"
+            source: npm
+        """,
+    )
+    monkeypatch.setattr(fresh_poller, "_resolvers", lambda: {"npm": FakeNpmResolver("0.140.0", fresh_poller)})
+    calls: list[list[str]] = []
+
+    def runner(cwd):
+        def run(args, **kwargs):
+            calls.append(args)
+            return subprocess.CompletedProcess(args, 1, "", "index.lock exists")
+
+        return run
+
+    monkeypatch.setattr(fresh_poller, "_chainlink_runner", runner)
+
+    assert fresh_poller.main() == 0
+    assert len(calls) == 1
+    event = _events(capsys)[0]
+    assert event["signal"] == "worklink_tool_pin_dedupe_check_failed"
+    assert event["dedupe_key"] == "worklink-tool-pin:coding-cli:codex:0.139.0->0.140.0"
+    assert event["reason"] == "chainlink issue search failed: index.lock exists"
+
+
 def test_lookup_failure_is_diagnostic_not_emit_or_nonzero(fresh_poller, monkeypatch, capsys):
     home = Path(sys.modules["os"].environ["MIMIR_HOME"])
     _write_config(

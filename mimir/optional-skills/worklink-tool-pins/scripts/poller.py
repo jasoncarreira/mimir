@@ -83,6 +83,10 @@ class ToolPinResolver(Protocol):
 Runner = Callable[..., subprocess.CompletedProcess[str]]
 
 
+class DedupeCheckUnavailable(RuntimeError):
+    """The existing-issue search did not produce a usable result."""
+
+
 def _log(message: str) -> None:
     print(message, file=sys.stderr)
 
@@ -236,17 +240,19 @@ class ChainlinkBumpFiler:
     def __init__(self, *, chainlink_bin: str = "chainlink", runner: Runner | None = None) -> None:
         self.chainlink_bin = chainlink_bin
         self.runner = runner or _run
+        self.last_skip_reason: str | None = None
 
     def existing_issue_id(self, dedupe_key: str) -> int | None:
         result = self.runner([self.chainlink_bin, "issue", "search", dedupe_key, "--json"])
         if result.returncode != 0:
-            return None
+            detail = (result.stderr or result.stdout).strip() or "no error detail"
+            raise DedupeCheckUnavailable(f"chainlink issue search failed: {detail[:500]}")
         try:
             issues = json.loads(result.stdout or "[]")
-        except json.JSONDecodeError:
-            return None
+        except json.JSONDecodeError as exc:
+            raise DedupeCheckUnavailable("chainlink issue search returned invalid JSON") from exc
         if not isinstance(issues, list):
-            return None
+            raise DedupeCheckUnavailable("chainlink issue search JSON was not a list")
         for issue in issues:
             if not isinstance(issue, dict):
                 continue
@@ -259,11 +265,16 @@ class ChainlinkBumpFiler:
                 try:
                     return int(issue_id)
                 except (TypeError, ValueError):
-                    return None
+                    continue
         return None
 
     def file(self, drift: ToolPinDrift) -> int | None:
-        existing = self.existing_issue_id(drift.dedupe_key)
+        self.last_skip_reason = None
+        try:
+            existing = self.existing_issue_id(drift.dedupe_key)
+        except DedupeCheckUnavailable as exc:
+            self.last_skip_reason = str(exc)
+            return None
         if existing is not None:
             return existing
         result = self.runner(
@@ -493,6 +504,16 @@ def _event_for_drift(drift: ToolPinDrift, issue_id: int | None) -> dict:
     }
 
 
+def _signal_for_dedupe_failure(drift: ToolPinDrift, reason: str) -> dict:
+    return {
+        "poller": POLLER_NAME,
+        "signal": "worklink_tool_pin_dedupe_check_failed",
+        "dedupe_key": drift.dedupe_key,
+        "tool_name": drift.pin.name,
+        "reason": reason,
+    }
+
+
 def main() -> int:
     home = _home()
     if home is None:
@@ -516,6 +537,9 @@ def main() -> int:
     filer = ChainlinkBumpFiler(chainlink_bin=_chainlink_bin(), runner=_chainlink_runner(_chainlink_cwd(home)))
     for drift in inventory.drift:
         issue_id = filer.file(drift)
+        if filer.last_skip_reason is not None:
+            _emit(_signal_for_dedupe_failure(drift, filer.last_skip_reason))
+            continue
         _emit(_event_for_drift(drift, issue_id))
     return 0
 
