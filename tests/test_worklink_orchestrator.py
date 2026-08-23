@@ -635,6 +635,7 @@ def _orchestrator_runner(
     files_stdout: str = "changed.txt\n",
     dirty_after_commit: bool = False,
     cleanup_returncode: int = 0,
+    release_returncode: int = 0,
     issue_json: str = ISSUE_JSON,
     fetch_failure_base: str | None = None,
 ):
@@ -657,7 +658,11 @@ def _orchestrator_runner(
         if isinstance(args, list) and args[:3] == ["chainlink", "locks", "claim"]:
             return cp(args)
         if isinstance(args, list) and args[:3] == ["chainlink", "locks", "release"]:
-            return cp(args)
+            return cp(
+                args,
+                returncode=release_returncode,
+                stderr="release denied\n" if release_returncode else "",
+            )
         if isinstance(args, list) and args[:3] == ["chainlink", "issue", "comment"]:
             return cp(args)
         if isinstance(args, list) and args[:3] == ["chainlink", "issue", "close"]:
@@ -869,6 +874,37 @@ def test_report_cleanup_failure_cannot_skip_lock_release_or_state_clear(
     assert result.status == "completed"
     assert ["chainlink", "locks", "release", "441"] in calls
     assert load_run_state(tmp_path, 441) is None
+
+
+def test_failed_lock_release_is_logged_and_retains_run_state(tmp_path: Path) -> None:
+    _reset_logger_for_tests()
+    events = tmp_path / "logs" / "events.jsonl"
+    init_logger(events, session_id="test-worklink")
+    repo = tmp_path / "repo"
+    worktree = repo.parent / ".worklink" / repo.name / "441-1"
+    _, runner = _orchestrator_runner(repo, worktree, release_returncode=1)
+    registry = BackendRegistry(WorklinkConfig())
+    registry.register(FakeBackend())
+
+    result = asyncio.run(
+        WorklinkRunner(home=tmp_path, repo=repo, runner=runner, registry=registry).run(
+            441, backend_name="fake", test_command="echo ok"
+        )
+    )
+
+    assert result.status == "completed"
+    assert load_run_state(tmp_path, 441) is not None
+    records = [json.loads(line) for line in events.read_text(encoding="utf-8").splitlines()]
+    failure = next(
+        record
+        for record in records
+        if record["type"] == "worklink_cleanup_failed"
+        and record["cleanup"] == "lock_release"
+    )
+    assert failure["issue_id"] == 441
+    assert failure["attempt"] == 1
+    assert failure["error"] == "Chainlink did not confirm lock release"
+    _reset_logger_for_tests()
 
 
 def test_worklink_pr_body_includes_build_section_and_intact_evidence(tmp_path: Path) -> None:
