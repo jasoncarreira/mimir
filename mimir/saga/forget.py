@@ -26,6 +26,9 @@ Side effects on observations citing forgotten raws:
 What's NOT removed when an atom is tombstoned:
 
 - The atom row itself (still in atoms table; ``tombstoned=1``)
+- Derived triple rows (retained for audit, but ``tombstoned=1``)
+- Derived world-state rows (retained as history; current rows are
+  end-dated and have ``is_current=0``)
 - access_events for the atom (history is preserved)
 - atom_relations involving the atom (historical record)
 - embedding row (could be deleted to reclaim space; defer to a
@@ -101,6 +104,20 @@ def forget(
             "UPDATE atoms SET tombstoned = 1, tombstoned_at = ?, "
             "tombstoned_reason = ? WHERE id = ? AND tombstoned = 0",
             [(now, reason or "explicit_forget", aid) for aid in eligible_ids],
+        )
+        eligible_placeholders = ",".join(["?"] * len(eligible_ids))
+        conn.execute(
+            "UPDATE world_state SET is_current = 0, valid_until = ?, updated_at = ? "
+            "WHERE is_current = 1 AND source_triple_id IN ("
+            "SELECT id FROM triples "
+            f"WHERE source_atom_id IN ({eligible_placeholders}))",
+            (now, now, *eligible_ids),
+        )
+        conn.execute(
+            "UPDATE triples SET tombstoned = 1 "
+            f"WHERE source_atom_id IN ({eligible_placeholders}) "
+            "AND tombstoned = 0",
+            eligible_ids,
         )
         for obs_id in affected_obs_ids:
             refresh_trend(conn, obs_id, manage_transaction=False)

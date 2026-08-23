@@ -582,12 +582,16 @@ def get_current_value(
     auth_where, auth_params = read_authorization.selection_predicate("ws")
     pred = _PREDICATE_NORM.sub("_", predicate.lower()).strip("_")
     row = conn.execute(
-        "SELECT ws.rowid, subject, predicate, value, valid_from, valid_until, "
-        "is_current, source_triple_id "
-        "FROM world_state ws WHERE subject = ? AND predicate = ? "
-        "AND is_current = 1 "
+        "SELECT ws.rowid, ws.subject, ws.predicate, ws.value, ws.valid_from, "
+        "ws.valid_until, ws.is_current, ws.source_triple_id "
+        "FROM world_state ws "
+        "LEFT JOIN triples t ON t.id = ws.source_triple_id "
+        "LEFT JOIN atoms a ON a.id = t.source_atom_id "
+        "WHERE ws.subject = ? AND ws.predicate = ? AND ws.is_current = 1 "
+        "AND (t.id IS NULL OR t.tombstoned = 0) "
+        "AND (t.source_atom_id IS NULL OR a.tombstoned = 0) "
         f"AND {auth_where} "
-        "ORDER BY valid_from DESC, rowid DESC LIMIT 1",
+        "ORDER BY ws.valid_from DESC, ws.rowid DESC LIMIT 1",
         (subject, pred, *auth_params),
     ).fetchone()
     if row is None:

@@ -19,10 +19,24 @@ from pathlib import Path
 
 import pytest
 
+from mimir.models import AuthContext
 from mimir.saga.forget import ForgetResult, forget, forget_by_criteria
 from mimir.saga.mark_access import AccessEvent, mark_access
 from mimir.saga.recall import recall
 from mimir.saga.store import store
+from mimir.saga.synthesize import build_vocab_block
+from mimir.saga.triples import get_current_value, store_triples, triple_augment_search
+
+
+ADMIN_SCOPE = AuthContext(
+    principal="admin",
+    canonical_principal="admin",
+    roles=("admin",),
+    event_ingress=None,
+    trigger="test",
+    channel_id=None,
+    interactivity=None,
+)
 
 
 @pytest.fixture
@@ -61,6 +75,64 @@ def test_forget_marks_atom_tombstoned(conn):
     ).fetchone()
     assert row[0] == 1
     assert row[1] == "test"
+
+
+def test_forget_retracts_derived_triple_and_world_state(conn):
+    atom_id = store(conn, "Acme employs Dana", embed_fn=_fake_embed).atom_id
+    triple = {"subject": "Dana", "predicate": "works_at", "object": "Acme"}
+    triple_id = store_triples(
+        conn,
+        [triple],
+        source_atom_id=atom_id,
+        evidence_ids=[atom_id],
+        embed_fn=_fake_embed,
+    )[0]
+    conn.commit()
+
+    assert get_current_value(
+        conn, "Dana", "works_at", auth_context=ADMIN_SCOPE,
+    ) is not None
+    assert triple_augment_search(
+        conn, _qf("Dana works at Acme"), dim=4, auth_context=ADMIN_SCOPE,
+    )
+    assert "Dana" in build_vocab_block(conn, owner_principal="legacy_admin")
+
+    forget(conn, [atom_id], reason="erase")
+
+    assert conn.execute(
+        "SELECT tombstoned FROM triples WHERE id = ?", (triple_id,),
+    ).fetchone() == (1,)
+    world_state = conn.execute(
+        "SELECT is_current, valid_until FROM world_state "
+        "WHERE source_triple_id = ?",
+        (triple_id,),
+    ).fetchone()
+    assert world_state[0] == 0
+    assert world_state[1] is not None
+    assert get_current_value(
+        conn, "Dana", "works_at", auth_context=ADMIN_SCOPE,
+    ) is None
+    assert triple_augment_search(
+        conn, _qf("Dana works at Acme"), dim=4, auth_context=ADMIN_SCOPE,
+    ) == []
+    assert "Dana" not in build_vocab_block(conn, owner_principal="legacy_admin")
+
+
+def test_derived_reads_ignore_legacy_rows_with_tombstoned_source(conn):
+    atom_id = store(conn, "Globex employs Casey", embed_fn=_fake_embed).atom_id
+    store_triples(
+        conn,
+        [{"subject": "Casey", "predicate": "works_at", "object": "Globex"}],
+        source_atom_id=atom_id,
+        evidence_ids=[atom_id],
+    )
+    conn.execute("UPDATE atoms SET tombstoned = 1 WHERE id = ?", (atom_id,))
+    conn.commit()
+
+    assert get_current_value(
+        conn, "Casey", "works_at", auth_context=ADMIN_SCOPE,
+    ) is None
+    assert "Casey" not in build_vocab_block(conn, owner_principal="legacy_admin")
 
 
 def test_forget_is_idempotent(conn):
