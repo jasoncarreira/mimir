@@ -21,6 +21,7 @@ from __future__ import annotations
 import ast
 import asyncio
 import inspect
+import json
 import logging
 import sys
 from dataclasses import dataclass, field, replace
@@ -1067,25 +1068,72 @@ async def test_failed_factory_cancels_resistant_app_tasks_and_preserves_original
 
 
 @pytest.mark.asyncio
-async def test_liveness_write_then_raise_is_compensated_and_clears_state(
+async def test_liveness_write_then_raise_preserves_unclean_marker_and_logs_failure(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    from mimir.event_logger import init_logger as init_event_logger
+    from mimir.event_logger import log_event as write_event
+    from mimir.liveness import detect_unclean_restart, mark_session_running, read_session_marker
+
     original = RuntimeError("liveness write failed")
     control = _ServerControl()
-    control.failures["liveness:running"] = original
     app, control = _controlled_server_app(tmp_path, monkeypatch, control)
+    events_path = app["config"].events_log
+    init_event_logger(events_path, "failed-startup-test")
+    monkeypatch.setattr("mimir.server.log_event", write_event)
+
+    def mark_then_raise(*args: Any, **kwargs: Any) -> None:
+        mark_session_running(*args, **kwargs)
+        raise original
+
+    monkeypatch.setattr("mimir.liveness.mark_session_running", mark_then_raise)
 
     with pytest.raises(RuntimeError) as caught:
         await _run_startup(app)
 
     assert caught.value is original
-    assert "liveness:clean" in control.events
+    records = [json.loads(line) for line in events_path.read_text(encoding="utf-8").splitlines()]
+    failure = next(record for record in records if record["type"] == "startup_failed")
+    assert failure["phase"] == "liveness_marker"
+    assert failure["exception"] == repr(original)
+    marker = read_session_marker(tmp_path)
+    assert marker is not None and marker["clean"] is False
+    assert detect_unclean_restart(tmp_path) == marker
+    assert "liveness:clean" not in control.events
     assert "bundle:close" in control.events
     assert "pairing:close" in control.events
     assert app["agent"] is None
     assert app["runtime_slot"].bundle is None
     assert app["startup_state"].compensated is True
+
+
+@pytest.mark.asyncio
+async def test_next_start_reports_aborted_startup_as_unclean_restart(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import mimir.liveness
+    from mimir.liveness import detect_unclean_restart, mark_session_running
+
+    mark_session_running(tmp_path, started_at=1000.0)
+    prior = detect_unclean_restart(tmp_path)
+    assert prior is not None
+    app, control = _controlled_server_app(tmp_path, monkeypatch)
+    notified: list[dict[str, Any]] = []
+
+    async def notify(home: Path, *, prior: dict[str, Any]) -> None:
+        notified.append(prior)
+
+    monkeypatch.setattr(mimir.liveness, "detect_unclean_restart", detect_unclean_restart)
+    monkeypatch.setattr(mimir.liveness, "notify_unclean_restart", notify)
+
+    await _run_startup(app)
+    await asyncio.sleep(0)
+
+    assert "log:liveness_unclean_restart" in control.events
+    assert notified == [prior]
+    await _run_cleanup(app)
 
 
 @pytest.mark.asyncio
@@ -1236,6 +1284,8 @@ async def test_server_startup_and_cleanup_resource_order(
     app, control = _controlled_server_app(tmp_path, monkeypatch, control)
     await _run_startup(app)
     await asyncio.sleep(0)
+    assert "log:app_started" in control.events
+    assert "log:api_started" in control.events
     control.events.clear()
 
     await _run_cleanup(app)
