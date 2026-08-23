@@ -1608,16 +1608,17 @@ print(json.dumps({
         ((204, None), None, True),
         ((404, None), (200, {"state": "active"}), True),
         ((404, None), (404, None), False),
-        (None, None, False),
-        (None, (200, {"state": "active"}), False),
-        ((403, {"message": "rate limited"}), (200, {"state": "active"}), False),
+        (None, None, None),
+        (None, (200, {"state": "active"}), None),
+        ((403, {"message": "rate limited"}), (200, {"state": "active"}), None),
+        ((404, None), None, None),
     ],
 )
 def test_github_author_trust_is_server_attested_and_fail_closed(
     monkeypatch: pytest.MonkeyPatch,
     collaborator: object,
     membership: object,
-    expected: bool,
+    expected: bool | None,
 ) -> None:
     calls: list[str] = []
 
