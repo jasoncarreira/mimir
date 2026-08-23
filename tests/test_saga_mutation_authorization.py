@@ -685,11 +685,16 @@ async def test_platform_service_full_read_does_not_widen_mutation_scope(
 
 
 @pytest.mark.asyncio
-async def test_trusted_service_requires_capability_and_readable_domain(
+async def test_trusted_service_readable_domain_does_not_authorize_mutation(
     client: SagaStore,
 ):
-    allowed = await _atom(client, "tenant a", owner="owner-a", domain="tenant:a")
-    denied = await _atom(client, "tenant b", owner="owner-b", domain="tenant:b")
+    allowed = await _atom(
+        client,
+        "service owned",
+        owner="service:test-service",
+        domain="tenant:b",
+    )
+    denied = await _atom(client, "tenant a", owner="owner-a", domain="tenant:a")
     trigger = "test_saga_service"
     original = _TRUSTED_SERVICE_PRINCIPALS.get(trigger)
     _TRUSTED_SERVICE_PRINCIPALS[trigger] = ServicePrincipal(
@@ -714,7 +719,6 @@ async def test_trusted_service_requires_capability_and_readable_domain(
             feedback="positive",
             auth_context=auth_context,
         )
-        forget_result = await client.forget(dry_run=True, auth_context=auth_context)
     finally:
         if original is None:
             _TRUSTED_SERVICE_PRINCIPALS.pop(trigger, None)
@@ -723,7 +727,6 @@ async def test_trusted_service_requires_capability_and_readable_domain(
 
     assert allowed_result["marked"] == 1
     assert denied_result == {"marked": 0, "total": 1, "authorized": 0}
-    assert forget_result["preview_ids"] == []
 
 
 @pytest.mark.asyncio

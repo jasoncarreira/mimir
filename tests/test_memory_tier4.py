@@ -296,6 +296,63 @@ def test_forget_by_criteria_min_age_days(conn):
     assert young not in result.tombstoned_ids
 
 
+@pytest.mark.parametrize("origin_domains", [None, ("session",)])
+def test_forget_by_criteria_domains_cannot_widen_owner_scope(conn, origin_domains):
+    owned = store(
+        conn,
+        "scheduler atom",
+        embed_fn=_fake_embed,
+        owner_principal="service:scheduler",
+        origin_domain="schedule_metadata",
+    ).atom_id
+    foreign = store(
+        conn,
+        "Jason private atom",
+        embed_fn=_fake_embed,
+        owner_principal="U_jason",
+        origin_domain="session",
+        visibility="private",
+    ).atom_id
+    old_ts = (datetime.now(timezone.utc) - timedelta(days=60)).isoformat()
+    conn.execute("UPDATE atoms SET created_at = ?", (old_ts,))
+    conn.commit()
+
+    result = forget_by_criteria(
+        conn,
+        owner_principal="service:scheduler",
+        origin_domains=origin_domains,
+        min_age_days=30,
+        dry_run=False,
+    )
+
+    assert result.tombstoned_ids == [owned]
+    assert conn.execute(
+        "SELECT tombstoned FROM atoms WHERE id = ?", (foreign,)
+    ).fetchone()[0] == 0
+
+
+def test_forget_by_criteria_domains_without_owner_do_not_authorize(conn):
+    atom_id = store(
+        conn,
+        "private session atom",
+        embed_fn=_fake_embed,
+        owner_principal="U_jason",
+        origin_domain="session",
+        visibility="private",
+    ).atom_id
+
+    result = forget_by_criteria(
+        conn,
+        origin_domains=("session",),
+        dry_run=False,
+    )
+
+    assert result.tombstoned_ids == []
+    assert conn.execute(
+        "SELECT tombstoned FROM atoms WHERE id = ?", (atom_id,)
+    ).fetchone()[0] == 0
+
+
 def test_forget_by_criteria_max_atoms_caps_result(conn):
     """max_atoms guards against runaway bulk-forget on a misconfigured
     criterion."""
