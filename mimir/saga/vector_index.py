@@ -75,6 +75,48 @@ class VectorIndex:
         # Number rejected for a declared or encoded dimension mismatch since
         # the most recent bulk build, including subsequent incremental adds.
         self.dimension_mismatch_count = 0
+        # Search degradation is reported once per reason/observed dimension for
+        # each uninterrupted degraded streak. A valid vector clears the set so
+        # a later recurrence remains observable without logging every query.
+        self._reported_search_degradations: set[tuple[str, int | None]] = set()
+
+    def _report_search_degradation(
+        self,
+        reason: str,
+        *,
+        observed_dimension: int | None = None,
+        emit_event: bool = False,
+    ) -> None:
+        """Report a semantic-search failure without breaking FTS fallback."""
+        key = (reason, observed_dimension)
+        with self._lock:
+            if key in self._reported_search_degradations:
+                return
+            self._reported_search_degradations.add(key)
+
+        logger.warning(
+            "VectorIndex semantic search degraded to FTS5: reason=%s "
+            "expected_dim=%d observed_dim=%s",
+            reason,
+            self.dimension,
+            observed_dimension,
+        )
+        if not emit_event:
+            return
+        try:
+            from mimir.event_logger import log_event_sync
+
+            log_event_sync(
+                "saga_vector_search_degraded",
+                reason=reason,
+                expected_dimension=self.dimension,
+                observed_dimension=observed_dimension,
+            )
+        except Exception:  # noqa: BLE001 — telemetry must not break recall fallback
+            logger.debug(
+                "Could not persist saga_vector_search_degraded event",
+                exc_info=True,
+            )
 
     @property
     def total_vectors(self) -> int:
@@ -350,19 +392,39 @@ class VectorIndex:
         Empty list if the query vector is malformed, the index is missing or
         empty, or FAISS is unavailable — callers must be tolerant (recall.py
         treats empty FAISS results as "no semantic candidates" and falls back
-        to FTS5).
+        to FTS5). A missing/empty vector is an expected provider degradation
+        and is warning-logged. Conversion failures and dimension mismatches are
+        anomalous and additionally emit a durable event.
         """
         if not FAISS_AVAILABLE:
             return []
 
         if query_vec is None:
+            self._report_search_degradation("missing_query_vector")
             return []
         try:
             q = np.asarray(query_vec, dtype=np.float32).reshape(-1)
         except (TypeError, ValueError):
+            self._report_search_degradation(
+                "malformed_query_vector",
+                emit_event=True,
+            )
+            return []
+        if q.size == 0:
+            self._report_search_degradation(
+                "empty_query_vector",
+                observed_dimension=0,
+            )
             return []
         if q.size != self.dimension:
+            self._report_search_degradation(
+                "query_dimension_mismatch",
+                observed_dimension=int(q.size),
+                emit_event=True,
+            )
             return []
+        with self._lock:
+            self._reported_search_degradations.clear()
         q = q.reshape(1, -1)
         faiss.normalize_L2(q)
 

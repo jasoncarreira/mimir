@@ -16,7 +16,7 @@ from dataclasses import replace
 import pytest
 
 from mimir.models import AuthContext
-from mimir.saga.client import SagaStore
+from mimir.saga.client import SagaStore, _query_embed_sync
 ADMIN_AUTH = AuthContext(
     principal="test-admin",
     canonical_principal="test-admin",
@@ -199,6 +199,26 @@ async def test_client_query_returns_two_tier_shape(client, monkeypatch):
     assert "raws" in result
     assert "items_returned" in result
     assert "two_tier" in result
+
+
+def test_empty_query_embedding_warns_before_fts_fallback(monkeypatch, caplog):
+    class _EmptyProvider:
+        def embed(self, text, *, input_type="query"):
+            return []
+
+    monkeypatch.setattr(
+        "mimir.saga.embeddings.get_provider", lambda: _EmptyProvider()
+    )
+    monkeypatch.setattr(
+        "mimir.saga._config_io.get_config",
+        lambda: lambda _section, _key, default=None: default,
+    )
+
+    with caplog.at_level("WARNING", logger="mimir.saga.client"):
+        assert _query_embed_sync("query") == []
+
+    assert "query embedding was empty" in caplog.text
+    assert "degraded to FTS5" in caplog.text
 
 
 @pytest.mark.asyncio

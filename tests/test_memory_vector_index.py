@@ -155,14 +155,68 @@ def test_search_unbuilt_index_returns_empty():
     assert results == []
 
 
-@pytest.mark.parametrize("query_vec", [[], [1.0, 0.0], [1.0, 0.0, 0.0, 0.0]])
-def test_search_rejects_malformed_query_vector_with_populated_index(conn, query_vec):
+@pytest.mark.parametrize(
+    ("query_vec", "reason", "observed_dimension"),
+    [
+        (None, "missing_query_vector", None),
+        ([], "empty_query_vector", 0),
+        ([1.0, 0.0], "query_dimension_mismatch", 2),
+        ([1.0, 0.0, 0.0, 0.0], "query_dimension_mismatch", 4),
+        (["not-a-float"], "malformed_query_vector", None),
+    ],
+)
+def test_search_rejects_and_reports_malformed_query_vector(
+    conn, caplog, monkeypatch, query_vec, reason, observed_dimension,
+):
     _insert_atom_with_embedding(conn, "a1", "alpha", [1.0, 0.0, 0.0])
     idx = VectorIndex(dimension=3)
     idx.build_from_db(conn)
+    events = []
+    monkeypatch.setattr(
+        "mimir.event_logger.log_event_sync",
+        lambda event_type, **payload: events.append((event_type, payload)),
+    )
+
+    with caplog.at_level("WARNING", logger="mimir.saga.vector_index"):
+        assert idx.search(query_vec, top_k=5) == []
 
     assert idx.total_vectors == 1
-    assert idx.search(query_vec, top_k=5) == []
+    assert reason in caplog.text
+    assert "expected_dim=3" in caplog.text
+    if reason in {"malformed_query_vector", "query_dimension_mismatch"}:
+        assert events == [
+            (
+                "saga_vector_search_degraded",
+                {
+                    "reason": reason,
+                    "expected_dimension": 3,
+                    "observed_dimension": observed_dimension,
+                },
+            )
+        ]
+    else:
+        assert events == []
+
+
+def test_search_dimension_mismatch_event_rearms_after_recovery(
+    conn, monkeypatch,
+):
+    _insert_atom_with_embedding(conn, "a1", "alpha", [1.0, 0.0, 0.0])
+    idx = VectorIndex(dimension=3)
+    idx.build_from_db(conn)
+    events = []
+    monkeypatch.setattr(
+        "mimir.event_logger.log_event_sync",
+        lambda event_type, **payload: events.append((event_type, payload)),
+    )
+
+    assert idx.search([1.0, 0.0], top_k=5) == []
+    assert idx.search([1.0, 0.0], top_k=5) == []
+    assert len(events) == 1
+
+    assert idx.search([1.0, 0.0, 0.0], top_k=5)
+    assert idx.search([1.0, 0.0], top_k=5) == []
+    assert len(events) == 2
 
 
 # ─── incremental add ─────────────────────────────────────────────────

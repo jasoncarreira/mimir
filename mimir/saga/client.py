@@ -170,10 +170,20 @@ def _query_embed_sync(text: str) -> list[float]:
 
         cfg = get_config()
         provider = get_provider()
-        return provider.embed(
+        query_vec = provider.embed(
             text[: cfg("embedding", "max_input_chars", 2000)], input_type="query"
         )
-    except Exception:
+        if not query_vec:
+            log.warning(
+                "SAGA query embedding was empty; semantic recall degraded to FTS5"
+            )
+            return []
+        return query_vec
+    except Exception as exc:
+        log.warning(
+            "SAGA query embedding unavailable; semantic recall degraded to FTS5: %s",
+            exc,
+        )
         return []
 
 
