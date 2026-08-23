@@ -1426,9 +1426,16 @@ class _RootAwareFilesystemBackend(_BoundedFilesystemBackend):
         before_context: int = 0,
         after_context: int = 0,
     ) -> GrepResult:
-        return await asyncio.to_thread(
+        result = await asyncio.to_thread(
             self.grep, pattern, path, glob, before_context, after_context,
         )
+        if result.error is None:
+            self._publish_read_paths([
+                str(match.get("path"))
+                for match in result.matches or ()
+                if match.get("path")
+            ])
+        return result
 
     def write(self, file_path: str, content: str) -> WriteResult:
         result = _exclusive_write(self.cwd, file_path, content)

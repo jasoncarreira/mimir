@@ -9,6 +9,8 @@ working against the full home tree.
 
 from __future__ import annotations
 
+import inspect
+import json
 import os
 import threading
 import time
@@ -23,7 +25,14 @@ from deepagents.middleware.skills import SkillsMiddleware
 from langchain_core.messages import ToolMessage
 
 from mimir._context import reset_current_turn, set_current_turn
-from mimir.access_control import ServicePrincipal
+from mimir.access_control import (
+    OperationDecision,
+    ServicePrincipal,
+    ToolAuthorization,
+    begin_protected_result_capture,
+    classify_protected_result,
+    end_protected_result_capture,
+)
 from mimir.models import AuthContext
 from mimir.read_policy import framework_large_tool_results_root
 from mimir.readonly_backend import (
@@ -60,6 +69,127 @@ def home(tmp_path: Path) -> Path:
 
 
 class TestWriteGuardBackend:
+    @staticmethod
+    def _provenance_paths(provenance) -> tuple[str, ...]:
+        assert provenance is not None
+        return tuple(source.resource_id for source in provenance.sources)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("path_form", ["absolute", "virtual", "default"])
+    async def test_agrep_matches_sync_grep_provenance(
+        self,
+        home: Path,
+        path_form: str,
+    ) -> None:
+        docs = home / "docs"
+        docs.mkdir()
+        matches = [docs / "one.txt", docs / "two.txt"]
+        for match in matches:
+            match.write_text("shared needle\n", encoding="utf-8")
+        backend = WriteGuardBackend(root_dir=home, writable_dirs=["state"])
+        path = {"absolute": str(docs), "virtual": "/docs", "default": None}[path_form]
+
+        sync_token = begin_protected_result_capture()
+        try:
+            sync_result = backend.grep("shared needle", path)
+        finally:
+            sync_provenance = end_protected_result_capture(sync_token)
+
+        async_token = begin_protected_result_capture()
+        try:
+            async_result = await backend.agrep("shared needle", path)
+        finally:
+            async_provenance = end_protected_result_capture(async_token)
+
+        expected = {str(match.resolve()) for match in matches}
+        assert sync_result.error is None
+        assert async_result.error is None
+        sync_paths = self._provenance_paths(sync_provenance)
+        async_paths = self._provenance_paths(async_provenance)
+        assert len(async_paths) == len(sync_paths) == len(expected)
+        assert set(async_paths) == set(sync_paths) == expected
+
+    @pytest.mark.asyncio
+    async def test_agrep_provenance_preserves_per_file_integrity_downgrade(
+        self,
+        home: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setenv("MIMIR_HOME", str(home))
+        docs = home / "docs"
+        docs.mkdir()
+        trusted = docs / "trusted.txt"
+        untrusted = docs / "untrusted.txt"
+        trusted.write_text("shared needle\n", encoding="utf-8")
+        untrusted.write_text("shared needle\n", encoding="utf-8")
+        (home / ".mimir" / "file-integrity.json").write_text(
+            json.dumps({"docs/untrusted.txt": "untrusted"}),
+            encoding="utf-8",
+        )
+        backend = WriteGuardBackend(root_dir=home, writable_dirs=["state"])
+
+        token = begin_protected_result_capture()
+        try:
+            result = await backend.agrep("shared needle", str(docs))
+        finally:
+            provenance = end_protected_result_capture(token)
+
+        assert result.error is None
+        assert set(self._provenance_paths(provenance)) == {
+            str(trusted.resolve()), str(untrusted.resolve()),
+        }
+        labels = classify_protected_result(
+            "agrep",
+            {"path": str(docs)},
+            None,
+            ToolAuthorization(
+                tool_name="agrep",
+                decision=OperationDecision.RESOURCE_SCOPED,
+                allowed=True,
+            ),
+            provenance=provenance,
+        )
+        assert labels is not None
+        assert labels.has_untrusted_active_ingest is True
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "method",
+        [
+            name
+            for name, member in vars(_RootAwareFilesystemBackend).items()
+            if inspect.iscoroutinefunction(member)
+            and name.startswith("a")
+            and name[1:] in vars(_RootAwareFilesystemBackend)
+            and "_publish_read" in vars(_RootAwareFilesystemBackend)[name[1:]].__code__.co_names
+        ],
+    )
+    async def test_every_async_read_override_publishes_exact_provenance(
+        self,
+        home: Path,
+        method: str,
+    ) -> None:
+        docs = home / "docs"
+        docs.mkdir()
+        target = docs / "match.txt"
+        target.write_text("shared needle\n", encoding="utf-8")
+        backend = WriteGuardBackend(root_dir=home, writable_dirs=["state"])
+        calls = {
+            "aread": lambda: backend.aread(str(target)),
+            "als": lambda: backend.als(str(docs)),
+            "aglob": lambda: backend.aglob("*.txt", str(docs)),
+            "agrep": lambda: backend.agrep("shared needle", str(docs)),
+        }
+
+        token = begin_protected_result_capture()
+        try:
+            result = await calls[method]()
+        finally:
+            provenance = end_protected_result_capture(token)
+
+        assert result.error is None
+        assert self._provenance_paths(provenance) == (str(target.resolve()),)
+
     @pytest.mark.parametrize("is_service", [False, True], ids=["non-admin", "service"])
     def test_skill_roots_are_readable_but_protected_names_and_writes_are_refused(
         self, home: Path, monkeypatch: pytest.MonkeyPatch, is_service: bool,
