@@ -140,6 +140,53 @@ def test_mark_contributions_filters_stopword_only_ngrams(conn):
     assert "a1" not in result.contributed_atom_ids
 
 
+def test_mark_contributions_failed_write_reports_no_credit(conn, monkeypatch):
+    from mimir.saga import contributions
+
+    _seed_atom(conn, "a1", "Alice has a degree in Business Administration")
+
+    def fail_mark_access(*args, **kwargs):
+        raise sqlite3.OperationalError("injected access write failure")
+
+    monkeypatch.setattr(contributions, "mark_access", fail_mark_access)
+    result = contributions.mark_contributions(
+        conn,
+        [{"id": "a1", "content": "Alice has a degree in Business Administration"}],
+        "Alice has a degree in Business Administration.",
+    )
+
+    assert result.credit_written is False
+    assert result.contributed_atom_ids == []
+    assert result.contribution_rate == 0.0
+    assert conn.execute(
+        "SELECT 1 FROM access_events WHERE source = 'feedback_positive'"
+    ).fetchall() == []
+
+
+def test_mark_contributions_does_not_rollback_callers_transaction(conn):
+    from mimir.saga.contributions import mark_contributions
+
+    _seed_atom(conn, "a1", "Alice has a degree in Business Administration")
+    conn.execute("BEGIN IMMEDIATE")
+    conn.execute(
+        "UPDATE atoms SET metadata = 'caller-owned' WHERE id = 'a1'"
+    )
+
+    result = mark_contributions(
+        conn,
+        [{"id": "a1", "content": "Alice has a degree in Business Administration"}],
+        "Alice has a degree in Business Administration.",
+    )
+
+    assert result.credit_written is False
+    assert result.contributed_atom_ids == []
+    assert conn.in_transaction is True
+    assert conn.execute("SELECT metadata FROM atoms WHERE id = 'a1'").fetchone()[0] == (
+        "caller-owned"
+    )
+    conn.rollback()
+
+
 # ─── Session near-duplicate dedup ────────────────────────────────────
 
 
@@ -183,6 +230,59 @@ def test_session_dedup_collapses_near_duplicate(conn):
     assert r2.stored is False
     assert r2.reason == "session_near_duplicate"
     assert r1.atom_id == r2.atom_id
+
+
+def test_session_dedup_does_not_cross_owners(conn):
+    from mimir.saga.store import store
+
+    same_vec = struct.pack("4f", 1.0, 0.0, 0.0, 0.0)
+    embed = lambda text: (same_vec, "stub", "stub", 4)
+    first = store(
+        conn, "Alice prefers concise replies", embed_fn=embed,
+        session_id="shared", owner_principal="principal:a",
+        visibility="private", integrity="trusted",
+    )
+    second = store(
+        conn, "Alice likes terse responses", embed_fn=embed,
+        session_id="shared", owner_principal="principal:b",
+        visibility="private", integrity="trusted",
+        session_dedup_threshold=0.95,
+    )
+
+    assert second.stored is True
+    assert second.atom_id != first.atom_id
+    assert conn.execute(
+        "SELECT owner_principal FROM atoms WHERE id = ?", (second.atom_id,)
+    ).fetchone()[0] == "principal:b"
+
+
+@pytest.mark.parametrize(
+    ("first_kwargs", "second_kwargs"),
+    [
+        ({"visibility": "private"}, {"visibility": "public"}),
+        ({"integrity": "trusted"}, {"integrity": "untrusted"}),
+        ({"origin_domain": "tenant:a"}, {"origin_domain": "tenant:b"}),
+    ],
+)
+def test_session_dedup_respects_acl_partition(conn, first_kwargs, second_kwargs):
+    from mimir.saga.store import store
+
+    same_vec = struct.pack("4f", 1.0, 0.0, 0.0, 0.0)
+    embed = lambda text: (same_vec, "stub", "stub", 4)
+    common = {
+        "embed_fn": embed,
+        "session_id": "shared",
+        "owner_principal": "principal:a",
+    }
+    first = store(conn, "first phrasing", **common, **first_kwargs)
+    second = store(
+        conn, "second phrasing", **common, **second_kwargs,
+        session_dedup_threshold=0.95,
+    )
+
+    assert first.stored is True
+    assert second.stored is True
+    assert second.atom_id != first.atom_id
 
 
 def test_session_dedup_does_not_cross_sessions(conn):

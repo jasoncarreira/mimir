@@ -394,7 +394,10 @@ async def bash_async(
         "everything in the registry."
     ),
 )
-async def bash_jobs_list(scope: Optional[str] = None) -> str:
+async def bash_jobs_list(
+    scope: Optional[str] = None,
+    runtime: ToolRuntime[AuthContext] = None,  # type: ignore[assignment]
+) -> str:
     """Args:
         scope: One of ``running`` (default), ``visible``, ``all``.
     """
@@ -404,13 +407,18 @@ async def bash_jobs_list(scope: Optional[str] = None) -> str:
         resolved_scope = normalize_shell_job_scope(scope)
     except ValueError as exc:
         return f"bash_jobs_list failed: {exc}"
-    snapshots = shell_job_snapshots(_REGISTRY, scope=resolved_scope)
+    auth_context = _reading_auth_context(runtime)
+    snapshots = shell_job_snapshots(
+        _REGISTRY, auth_context=auth_context, scope=resolved_scope,
+    )
     if not snapshots:
         from ..access_control import publish_protected_result
 
         publish_protected_result(())
         return f"No jobs in scope={resolved_scope}."
-    _publish_shell_job_provenance([str(s["job_id"]) for s in snapshots])
+    _publish_shell_job_provenance(
+        [str(s["job_id"]) for s in snapshots], auth_context,
+    )
     lines = [f"Jobs (scope={resolved_scope}, count={len(snapshots)}):"]
     for s in snapshots:
         cmd = (s.get("command") or "")[:120]
@@ -435,6 +443,7 @@ async def bash_job_output(
     job_id: str,
     tail_lines: Optional[int] = None,
     stream: Optional[str] = None,
+    runtime: ToolRuntime[AuthContext] = None,  # type: ignore[assignment]
 ) -> str:
     """Args:
         job_id: The ``job_id`` returned by ``bash_async``.
@@ -455,13 +464,15 @@ async def bash_job_output(
     # ``read_output`` does sync file IO (seek-from-end tail). Wrap in
     # ``asyncio.to_thread`` so a multi-MB read doesn't freeze the
     # event loop while the tail walks backward through chunks.
+    auth_context = _reading_auth_context(runtime)
     result = await asyncio.to_thread(
         _REGISTRY.read_output,
-        job_id, tail_lines=resolved_tail, stream=resolved_stream,
+        job_id, auth_context=auth_context,
+        tail_lines=resolved_tail, stream=resolved_stream,
     )
     if "error" in result:
         return result["error"]
-    _publish_shell_job_provenance([job_id])
+    _publish_shell_job_provenance([job_id], auth_context)
     lines = [
         f"Job {result['job_id']} [{result['status']}] "
         f"elapsed={result['elapsed_seconds']}s pid={result['pid']} "
@@ -481,17 +492,30 @@ async def bash_job_output(
     return "\n".join(lines)
 
 
-def _publish_shell_job_provenance(job_ids: list[str]) -> None:
-    """Preserve both job metadata ACLs and the labels inherited at spawn."""
+def _reading_auth_context(runtime: ToolRuntime[AuthContext] | None) -> AuthContext | None:
+    """Resolve only a server-created reading-turn authorization carrier."""
+    if runtime is not None and isinstance(runtime.context, AuthContext):
+        return runtime.context
     from .._context import get_current_turn
+
+    auth_context = getattr(get_current_turn(), "auth_context", None)
+    return auth_context if isinstance(auth_context, AuthContext) else None
+
+
+def _publish_shell_job_provenance(
+    job_ids: list[str], auth_context: AuthContext | None,
+) -> None:
+    """Preserve both job metadata ACLs and the labels inherited at spawn."""
     from ..access_control import protected_result_source, publish_protected_result
     from ..models import InformationFlowLabels
 
-    turn = get_current_turn()
-    auth_context = getattr(turn, "auth_context", None)
     sources = []
     for job_id in job_ids:
-        job = _REGISTRY.get(job_id) if _REGISTRY is not None else None
+        job = (
+            _REGISTRY.get_owned(job_id, auth_context=auth_context)
+            if _REGISTRY is not None
+            else None
+        )
         sources.append(protected_result_source(
             auth_context,
             principal="mimir:shell-jobs",

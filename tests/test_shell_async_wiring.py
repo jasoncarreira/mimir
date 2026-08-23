@@ -28,7 +28,7 @@ from typing import Any
 
 import pytest
 
-from mimir.shell_jobs import ShellJobRegistry
+from mimir.shell_jobs import ShellJob, ShellJobRegistry
 from mimir.tools import shell_async
 from mimir.tools._shell_env import direct_exec_env_overlay
 
@@ -333,7 +333,9 @@ async def test_job_complete_inherits_enforced_auth_for_same_channel_reply(
     monkeypatch.setattr(agent_module, "log_event", _log_event)
     agent = SimpleNamespace(
         _shell_jobs=SimpleNamespace(
-            read_output=lambda *args, **kwargs: {"stdout_tail": "ok", "stderr_tail": ""}
+            read_job_output=lambda *args, **kwargs: {
+                "stdout_tail": "ok", "stderr_tail": "",
+            }
         ),
         _dispatcher=SimpleNamespace(enqueue=_enqueue),
     )
@@ -418,6 +420,84 @@ async def test_bash_jobs_list_invalid_scope(fake_registry: ShellJobRegistry) -> 
     assert "bash_jobs_list failed" in out
 
 
+@pytest.mark.asyncio
+async def test_shell_job_reads_are_scoped_to_reading_turn_owner(
+    fake_registry: ShellJobRegistry,
+) -> None:
+    auth_a = _turn_auth("slack:DM-private", "alice")
+    auth_b = _turn_auth("web:heartbeat", "service-bob")
+
+    def _register(job_id: str, command: str, secret: str, auth: Any) -> None:
+        stdout_path = fake_registry.jobs_dir / f"{job_id}.out"
+        stderr_path = fake_registry.jobs_dir / f"{job_id}.err"
+        stdout_path.write_text(secret, encoding="utf-8")
+        stderr_path.write_text("", encoding="utf-8")
+        fake_registry._jobs[job_id] = ShellJob(
+            job_id=job_id,
+            command=command,
+            pid=123,
+            started_at=0.0,
+            stdout_path=stdout_path,
+            stderr_path=stderr_path,
+            last_live_signal=0.0,
+            channel_id=auth.channel_id,
+            auth_context=auth,
+        )
+
+    _register("job-private", "echo private-command", "private-secret", auth_a)
+    _register("job-heartbeat", "echo heartbeat-command", "heartbeat", auth_b)
+    runtime = SimpleNamespace(context=auth_a)
+
+    listed = await shell_async.bash_jobs_list.coroutine(  # type: ignore[misc]
+        scope="all", runtime=runtime,
+    )
+    own_output = await shell_async.bash_job_output.coroutine(  # type: ignore[misc]
+        job_id="job-private", runtime=runtime,
+    )
+    foreign_output = await shell_async.bash_job_output.coroutine(  # type: ignore[misc]
+        job_id="job-heartbeat", runtime=runtime,
+    )
+
+    assert "job-private" in listed
+    assert "private-command" in listed
+    assert "job-heartbeat" not in listed
+    assert "heartbeat-command" not in listed
+    assert "private-secret" in own_output
+    assert foreign_output == "unknown job_id: job-heartbeat"
+
+
+@pytest.mark.asyncio
+async def test_shell_job_reads_without_auth_carrier_serve_nothing(
+    fake_registry: ShellJobRegistry,
+) -> None:
+    auth = _turn_auth("slack:DM-private", "alice")
+    stdout_path = fake_registry.jobs_dir / "job-private.out"
+    stderr_path = fake_registry.jobs_dir / "job-private.err"
+    stdout_path.write_text("private-secret", encoding="utf-8")
+    stderr_path.write_text("", encoding="utf-8")
+    fake_registry._jobs["job-private"] = ShellJob(
+        job_id="job-private",
+        command="echo private-command",
+        pid=123,
+        started_at=0.0,
+        stdout_path=stdout_path,
+        stderr_path=stderr_path,
+        last_live_signal=0.0,
+        channel_id=auth.channel_id,
+        auth_context=auth,
+    )
+
+    listed = await shell_async.bash_jobs_list.coroutine(  # type: ignore[misc]
+        scope="all",
+    )
+    output = await shell_async.bash_job_output.coroutine(  # type: ignore[misc]
+        job_id="job-private",
+    )
+
+    assert listed == "No jobs in scope=all."
+    assert output == "unknown job_id: job-private"
+
+
 # ─── bash_job_output ──────────────────────────────────────────────
 
 
@@ -431,7 +511,9 @@ async def test_bash_job_output_requires_job_id(fake_registry: ShellJobRegistry) 
 async def test_bash_job_output_unknown_job_propagates_error(
     fake_registry: ShellJobRegistry, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    def _err_read(job_id: str, *, tail_lines: int, stream: str) -> dict:
+    def _err_read(
+        job_id: str, *, auth_context: Any, tail_lines: int, stream: str,
+    ) -> dict:
         return {"error": f"unknown job {job_id}"}
 
     monkeypatch.setattr(fake_registry, "read_output", _err_read)
@@ -445,7 +527,9 @@ async def test_bash_job_output_renders_tail(
 ) -> None:
     """Verify both stdout + stderr blocks surface when stream=both."""
 
-    def _ok_read(job_id: str, *, tail_lines: int, stream: str) -> dict:
+    def _ok_read(
+        job_id: str, *, auth_context: Any, tail_lines: int, stream: str,
+    ) -> dict:
         return {
             "job_id": job_id,
             "status": "complete",

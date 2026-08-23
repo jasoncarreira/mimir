@@ -35,7 +35,7 @@ _MAX_EXTERNAL_COMMANDS = 5
 _MAX_EXTERNAL_COMMAND_LEN = 160
 _MAX_LABEL_ACTIONS = 5
 _MAX_LABEL_ACTION_LEN = 80
-_EXTERNAL_COMMAND_TIMEOUT_SECONDS = 15
+_EXTERNAL_COMMAND_TIMEOUT_SECONDS = 10
 _CONTINUATION_RETENTION = timedelta(days=30)
 
 _RUN_ID_RE = re.compile(r"\bchainlink-\d+\b", re.IGNORECASE)
@@ -124,6 +124,10 @@ class WorklinkContinuationAction:
     issue_id: int | None
     pr_url: str | None
     occurrences: int
+
+    @property
+    def delivery_key(self) -> str:
+        return f"worklink-continuation:{self.idempotency_key}"
 
 
 def continuations_dir(home: Path) -> Path:
@@ -408,8 +412,9 @@ def consume_worklink_budget_continuations(
     runner: Runner | None = None,
     now: datetime | None = None,
     retention: timedelta = _CONTINUATION_RETENTION,
+    delivery_receipt_exists: Callable[[str], bool] | None = None,
 ) -> list[WorklinkContinuationAction]:
-    """Claim unresolved sidecars once and reap them after terminal resolution.
+    """Offer unresolved sidecars and claim them after framework delivery.
 
     This is intentionally a deterministic Worklink process, not an agent tool:
     it has only the fixed Chainlink comment/status operations below and does not
@@ -436,6 +441,25 @@ def consume_worklink_budget_continuations(
                 _unlink_best_effort(path)
             continue
 
+        actioned_at = _parse_datetime(payload.get("actioned_at"))
+        idempotency_key = str(payload.get("idempotency_key") or path.stem)
+        delivery_key = f"worklink-continuation:{idempotency_key}"
+        if (
+            actioned_at is None
+            and (delivery_receipt_exists is None or not delivery_receipt_exists(delivery_key))
+        ):
+            association = payload.get("association")
+            association = association if isinstance(association, Mapping) else {}
+            issue_id = association.get("issue_id")
+            actions.append(WorklinkContinuationAction(
+                sidecar_path=path,
+                idempotency_key=idempotency_key,
+                issue_id=int(issue_id) if isinstance(issue_id, int) else None,
+                pr_url=_truncate_str(association.get("pr_url"), 400),
+                occurrences=_positive_int(payload.get("occurrences"), default=1),
+            ))
+            break
+
         terminal_reason, check_error, issue_payload = _continuation_terminal_state(
             home=home,
             payload=payload,
@@ -449,18 +473,17 @@ def consume_worklink_budget_continuations(
             payload["resolved_at"] = current.isoformat()
             payload["resolved_reason"] = terminal_reason
             atomic_write_json(path, payload)
-            continue
+            break
         if check_error is not None:
             atomic_write_json(path, payload)
-            continue
+            break
 
-        actioned_at = _parse_datetime(payload.get("actioned_at"))
         if actioned_at is not None:
             if current - actioned_at >= retention:
                 payload["resolved_at"] = current.isoformat()
                 payload["resolved_reason"] = "manual_triage_timeout"
             atomic_write_json(path, payload)
-            continue
+            break
 
         payload["external_comment"] = _post_consumer_comment(
             payload=payload,
@@ -474,17 +497,9 @@ def consume_worklink_budget_continuations(
         )
         payload["actioned_at"] = current.isoformat()
         atomic_write_json(path, payload)
-
-        association = payload.get("association")
-        association = association if isinstance(association, Mapping) else {}
-        issue_id = association.get("issue_id")
-        actions.append(WorklinkContinuationAction(
-            sidecar_path=path,
-            idempotency_key=str(payload.get("idempotency_key") or path.stem),
-            issue_id=int(issue_id) if isinstance(issue_id, int) else None,
-            pr_url=_truncate_str(association.get("pr_url"), 400),
-            occurrences=_positive_int(payload.get("occurrences"), default=1),
-        ))
+        # At most three external commands are possible per sidecar. Processing
+        # one keeps this poller's total subprocess budget below its timeout.
+        break
     return actions
 
 

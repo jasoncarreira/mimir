@@ -16,7 +16,7 @@ from dataclasses import replace
 import pytest
 
 from mimir.models import AuthContext
-from mimir.saga.client import SagaStore
+from mimir.saga.client import SagaStore, _query_embed_sync
 ADMIN_AUTH = AuthContext(
     principal="test-admin",
     canonical_principal="test-admin",
@@ -199,6 +199,49 @@ async def test_client_query_returns_two_tier_shape(client, monkeypatch):
     assert "raws" in result
     assert "items_returned" in result
     assert "two_tier" in result
+
+
+def test_empty_query_embedding_warns_before_fts_fallback(monkeypatch, caplog):
+    class _EmptyProvider:
+        def embed(self, text, *, input_type="query"):
+            return []
+
+    monkeypatch.setattr(
+        "mimir.saga.embeddings.get_provider", lambda: _EmptyProvider()
+    )
+    monkeypatch.setattr(
+        "mimir.saga._config_io.get_config",
+        lambda: lambda _section, _key, default=None: default,
+    )
+
+    with caplog.at_level("WARNING", logger="mimir.saga.client"):
+        assert _query_embed_sync("query") == []
+
+    assert "query embedding was empty" in caplog.text
+    assert "degraded to FTS5" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_query_falls_back_to_fts_when_query_embedding_is_empty(
+    client, monkeypatch,
+):
+    _patch_provider(monkeypatch)
+    stored = await client.store("Alice prefers concise replies")
+    assert client.connection().execute("SELECT COUNT(*) FROM embeddings").fetchone()[0] == 1
+
+    monkeypatch.setattr("mimir.saga.client._query_embed_sync", lambda _query: [])
+
+    def unexpected_vector_search(*args, **kwargs):
+        raise AssertionError("empty query embedding reached VectorIndex.search")
+
+    monkeypatch.setattr(
+        "mimir.saga.vector_index.VectorIndex.search", unexpected_vector_search
+    )
+
+    result = await client.query("Alice concise replies", top_k=5, auth_context=ADMIN_SCOPE)
+
+    returned_ids = [item["id"] for item in result["observations"] + result["raws"]]
+    assert stored["atom_id"] in returned_ids
 
 
 @pytest.mark.asyncio

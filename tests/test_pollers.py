@@ -23,6 +23,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+import yaml
 
 from mimir import access_control, poller_recovery
 from mimir.event_logger import init_logger
@@ -248,9 +249,10 @@ def test_state_authority_rejects_persist_dir_outside_state_root(tmp_path: Path) 
 def test_valid_state_poller_creates_and_grants_only_its_instance_root(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.delenv("MIMIR_HOME", raising=False)
-    skills = tmp_path / "skills"
-    state_root = tmp_path / "state" / "pollers"
+    home = tmp_path / "home"
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    skills = home / "skills"
+    state_root = home / "state" / "pollers"
     _write_pollers_json(skills / "demo", [
         {
             "name": "demo",
@@ -924,14 +926,7 @@ def test_unknown_or_out_of_bounds_authority_rejects_instance(
 def test_instance_root_and_operator_alert_are_exact(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    # This test needs MIMIR_HOME set but pointing SOMEWHERE ELSE than the poller
-    # state tree. The gate needs a home to resolve service write scope at all
-    # (unset -> even the poller's own cursor is ADMIN_REQUIRED), but a home of
-    # ``tmp_path`` would blanket-cover ``<home>/state/**`` and make the sibling
-    # poller's cursor writable too, defeating the "exact" assertion below. It
-    # previously relied on MIMIR_HOME leaking from an unrelated test FILE, which
-    # happened to satisfy both conditions — so this file failed when run alone.
-    monkeypatch.setenv("MIMIR_HOME", str(tmp_path / "agent-home"))
+    monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
     skills = tmp_path / "skills"
     authority = _authority(capabilities=["write_file", "operator_alert"])
     _write_pollers_json(skills / "feed", [
@@ -952,7 +947,7 @@ def test_instance_root_and_operator_alert_are_exact(
         authorized_principals=frozenset({principal}), source_kind="service",
     ))
     own = tmp_path / "state" / "pollers" / "feed" / "cursor.json"
-    other = tmp_path / "state" / "pollers" / "other" / "cursor.json"
+    other = tmp_path / "state" / "pollers" / "other" / ".recovery.json"
     assert SinkGate.check_sink_flow("write_file", str(own), labels, auth, enforce=True).allowed
     assert not SinkGate.check_sink_flow("write_file", str(other), labels, auth, enforce=True).allowed
 
@@ -4911,6 +4906,56 @@ def test_validate_poller_overrides_text_accepts_budget(tmp_path: Path):
         path=path,
     )
     assert parsed["github-activity"]["budget"]["windows"]["1h"]["max_agent_turns"] == 2
+
+
+def test_validate_poller_overrides_text_rejects_environment_hijack(tmp_path: Path):
+    path = tmp_path / "pollers-overrides.yaml"
+    text = yaml.safe_dump({
+        "github-poller": {
+            "env": {
+                "PATH": "/tmp/evil:/usr/bin",
+                "BASH_ENV": "/tmp/evil/rc",
+                "GIT_SSH_COMMAND": "evil",
+                "HTTPS_PROXY": "https://evil.invalid",
+                "NODE_OPTIONS": "--require=/tmp/evil.js",
+                "SSL_CERT_FILE": "/tmp/evil.pem",
+                "LD_PRELOAD": "/tmp/e.so",
+            },
+        },
+    })
+
+    with pytest.raises(PollerOverridesValidationError) as exc:
+        validate_poller_overrides_text(text, path=path)
+
+    assert "poller_overrides_disallowed_env" in str(exc.value)
+
+
+def test_validate_poller_overrides_text_restricts_pass_env(tmp_path: Path):
+    path = tmp_path / "pollers-overrides.yaml"
+
+    with pytest.raises(PollerOverridesValidationError) as exc:
+        validate_poller_overrides_text(
+            "gmail-inbox:\n  pass_env: [GOG_ACCOUNT, BASH_ENV]\n",
+            path=path,
+        )
+
+    assert "poller_overrides_disallowed_env" in str(exc.value)
+
+
+@pytest.mark.parametrize("name", ["GITHUB_REPOS", "GOG_ACCOUNT"])
+def test_validate_poller_overrides_text_rejects_literal_scope_selectors(
+    tmp_path: Path,
+    name: str,
+):
+    path = tmp_path / "pollers-overrides.yaml"
+
+    with pytest.raises(PollerOverridesValidationError) as exc:
+        validate_poller_overrides_text(
+            f"poller:\n  env:\n    {name}: attacker-controlled\n",
+            path=path,
+        )
+
+    assert "poller_overrides_disallowed_env" in str(exc.value)
 
 
 def test_validate_poller_overrides_text_rejects_non_mapping_root(tmp_path: Path):

@@ -475,7 +475,11 @@ class RepoGitTools:
                 stderr=_redact_git_output(result.stderr),
             )
         except (OSError, subprocess.SubprocessError) as exc:
-            raise GitRefusal("git_failed", "pinned Git execution failed") from exc
+            raise GitRefusal(
+                "git_failed",
+                "pinned Git execution failed",
+                execution_started=True,
+            ) from exc
 
     def _checked(
         self,
@@ -938,8 +942,8 @@ class RepoGitTools:
                     or records[0][0].lower() != self._scope.observed_head_sha.lower()
                     or records[0][1] != self._scope.destination_ref
                 ):
-                    return GitOperationResult(
-                        False, "stale_scope", stderr=self._stranded_work_message(),
+                    raise GitRefusal(
+                        "stale_scope", self._stranded_work_message(),
                     )
                 push_args = ["push", "--porcelain"]
                 if rewritten_history:

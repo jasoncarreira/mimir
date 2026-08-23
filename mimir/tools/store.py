@@ -101,7 +101,7 @@ async def memory_store(
         Integrity.TRUSTED
         if isinstance(labels, InformationFlowLabels)
         and labels.sources
-        and not labels.has_untrusted_active_ingest
+        and all(source.integrity == Integrity.TRUSTED for source in labels.sources)
         else Integrity.UNTRUSTED
     )
 

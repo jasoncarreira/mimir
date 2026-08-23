@@ -1457,7 +1457,8 @@ async def set_poller_overrides(poller_name: str, overrides: dict[str, Any]) -> s
 
     Writes ``<home>/pollers-overrides.yaml`` through a narrow validated path.
     ``overrides`` may contain only poller override keys such as ``cron``,
-    ``priority``, ``batch_size``, ``env``, ``pass_env``, and ``budget``. Passing an empty
+    ``priority``, ``batch_size``, ``env``, ``pass_env``, and ``budget``. Environment
+    names are restricted to non-secret poller tuning variables. Passing an empty
     dict removes that poller's override entry. Call ``reload_pollers`` after a
     successful write to apply the new values to the running scheduler.
     """
@@ -1491,6 +1492,10 @@ async def set_poller_overrides(poller_name: str, overrides: dict[str, Any]) -> s
             sort_keys=True,
         )
         validate_poller_overrides_text(body, path=path)
+        # Unlike file-tool content, this scheduler config is never returned as a
+        # trusted filesystem result. Its mutation is audited as the dedicated
+        # set_poller_overrides scheduler sink, so file-read integrity metadata
+        # would not be consumed and is intentionally not recorded here.
         _atomic_write_text(path, body)
     except PollerOverridesValidationError as exc:
         return f"set_poller_overrides failed: {exc}"

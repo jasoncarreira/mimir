@@ -56,6 +56,10 @@ from typing import Any, Awaitable, Callable
 
 from ._atomic import atomic_write_json
 from ._jsonl_tail import tail_jsonl_records
+from .access_control import (
+    HTTP_EVENT_INGRESS_EXTRA_KEY,
+    POLLER_RECOVERY_REPLAY_EXTRA_KEY,
+)
 from .event_logger import log_event
 from .models import AgentEvent, InformationFlowLabels, SourceLabel
 
@@ -393,8 +397,14 @@ def _restore_event(
     event.channel_id = channel_id
     event.trigger = "poller"
     event.source = "poller"
+    event.author = None
+    event.author_display = None
+    event.author_id = None
     event.service_principal = service_principal
     event.service_authority = service_authority
+    event.repo_pr_action_scope = None
+    event.continuation_auth_context = None
+    event.source_session_acl = None
     if service_authority is not None and service_principal:
         source_principal = f"service:{service_principal}"
         event.ifc_labels = InformationFlowLabels().with_channel(
@@ -409,7 +419,11 @@ def _restore_event(
             source_kind="service",
         ))
     if isinstance(event.extra, dict):
+        event.extra.pop(HTTP_EVENT_INGRESS_EXTRA_KEY, None)
+        event.extra.pop("channel_visibility", None)
+        event.extra.pop("bridge_instance", None)
         event.extra["poller_name"] = poller_name
+        event.extra[POLLER_RECOVERY_REPLAY_EXTRA_KEY] = True
     return event
 
 

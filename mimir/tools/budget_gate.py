@@ -1665,9 +1665,6 @@ class BudgetGateMiddleware(AgentMiddleware):
                 )
         direct_argv = execution_request.tool_call.get("args", {}).get("mimir_direct_argv")
         direct_argv_token = None
-        from .github_review_guard import review_submission_from_request
-
-        review_spec = review_submission_from_request(execution_request)
         review_claim = None
         capture_token = None
         provenance = None
@@ -1675,6 +1672,17 @@ class BudgetGateMiddleware(AgentMiddleware):
         policy_refusal = None
         fetch_token = None
         try:
+            from .github_review_guard import (
+                claim_review_submission,
+                review_submission_from_request,
+            )
+
+            review_spec = review_submission_from_request(execution_request)
+            review_claim = (
+                claim_review_submission(review_spec)
+                if review_spec is not None
+                else None
+            )
             if (
                 tool_name in {"shell_exec", "bash_async"}
                 and isinstance(direct_argv, list)
@@ -1691,23 +1699,6 @@ class BudgetGateMiddleware(AgentMiddleware):
             from ..read_policy import begin_read_policy_refusal_capture
 
             read_refusal_token = begin_read_policy_refusal_capture()
-            from .github_review_guard import (
-                claim_review_submission,
-            )
-
-            review_claim = (
-                claim_review_submission(review_spec)
-                if review_spec is not None
-                else None
-            )
-            if review_claim is not None and review_claim.duplicate:
-                result = _duplicate_review_result(request, review_claim)
-                _emit_tool_call_sync(
-                    tool_name,
-                    ok=True,
-                    duration_ms=(time.monotonic() - started) * 1000.0,
-                )
-                return result
             authorized_fetch_urls = _authorized_fetch_urls_for_tool(
                 tool_name, auth_context, _extract_sink_target(request, auth_context),
             )
@@ -1715,7 +1706,10 @@ class BudgetGateMiddleware(AgentMiddleware):
                 from .web import begin_authorized_fetch
 
                 fetch_token = begin_authorized_fetch(authorized_fetch_urls)
-            result = handler(execution_request)
+            if review_claim is not None and review_claim.duplicate:
+                result = _duplicate_review_result(request, review_claim)
+            else:
+                result = handler(execution_request)
         except ToolException as exc:
             if capture_token is not None:
                 provenance = end_protected_result_capture(capture_token)
@@ -1725,8 +1719,14 @@ class BudgetGateMiddleware(AgentMiddleware):
 
                 policy_refusal = end_read_policy_refusal_capture(read_refusal_token)
                 read_refusal_token = None
+            _record_repo_review_checkout(
+                execution_request, auth_context, failed=True,
+            )
             if isinstance(exc, ToolPolicyRefusal):
                 _record_tool_outcome(tool_name, refused_reason=str(exc))
+                # A server-authored refusal adds no result provenance, but it
+                # still traverses the common label-accounting boundary.
+                _merge_result_labels(auth_context, None)
             else:
                 result_labels = _result_labels_for_call(
                     tool_name,
@@ -2008,9 +2008,6 @@ class BudgetGateMiddleware(AgentMiddleware):
                 )
         direct_argv = execution_request.tool_call.get("args", {}).get("mimir_direct_argv")
         direct_argv_token = None
-        from .github_review_guard import review_submission_from_request
-
-        review_spec = review_submission_from_request(execution_request)
         review_claim = None
         capture_token = None
         provenance = None
@@ -2018,6 +2015,19 @@ class BudgetGateMiddleware(AgentMiddleware):
         policy_refusal = None
         fetch_token = None
         try:
+            from .github_review_guard import (
+                claim_review_submission,
+                review_submission_from_request,
+            )
+
+            review_spec = review_submission_from_request(execution_request)
+            review_claim = (
+                await _claim_review_submission_async(
+                    lambda: claim_review_submission(review_spec)
+                )
+                if review_spec is not None
+                else None
+            )
             if (
                 tool_name in {"shell_exec", "bash_async"}
                 and isinstance(direct_argv, list)
@@ -2034,25 +2044,6 @@ class BudgetGateMiddleware(AgentMiddleware):
             from ..read_policy import begin_read_policy_refusal_capture
 
             read_refusal_token = begin_read_policy_refusal_capture()
-            from .github_review_guard import (
-                claim_review_submission,
-            )
-
-            review_claim = (
-                await _claim_review_submission_async(
-                    lambda: claim_review_submission(review_spec)
-                )
-                if review_spec is not None
-                else None
-            )
-            if review_claim is not None and review_claim.duplicate:
-                result = _duplicate_review_result(request, review_claim)
-                _emit_tool_call_sync(
-                    tool_name,
-                    ok=True,
-                    duration_ms=(time.monotonic() - started) * 1000.0,
-                )
-                return result
             authorized_fetch_urls = _authorized_fetch_urls_for_tool(
                 tool_name, auth_context, _extract_sink_target(request, auth_context),
             )
@@ -2060,7 +2051,10 @@ class BudgetGateMiddleware(AgentMiddleware):
                 from .web import begin_authorized_fetch
 
                 fetch_token = begin_authorized_fetch(authorized_fetch_urls)
-            result = await handler(execution_request)
+            if review_claim is not None and review_claim.duplicate:
+                result = _duplicate_review_result(request, review_claim)
+            else:
+                result = await handler(execution_request)
         except ToolException as exc:
             if capture_token is not None:
                 provenance = end_protected_result_capture(capture_token)
@@ -2070,8 +2064,14 @@ class BudgetGateMiddleware(AgentMiddleware):
 
                 policy_refusal = end_read_policy_refusal_capture(read_refusal_token)
                 read_refusal_token = None
+            _record_repo_review_checkout(
+                execution_request, auth_context, failed=True,
+            )
             if isinstance(exc, ToolPolicyRefusal):
                 _record_tool_outcome(tool_name, refused_reason=str(exc))
+                # A server-authored refusal adds no result provenance, but it
+                # still traverses the common label-accounting boundary.
+                _merge_result_labels(auth_context, None)
             else:
                 result_labels = _result_labels_for_call(
                     tool_name,

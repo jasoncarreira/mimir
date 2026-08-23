@@ -545,6 +545,15 @@ async def test_reconcile_reenqueue_restamps_forged_stash_fields(tmp_path: Path):
     forged.channel_id = "discord:operator-dm"
     forged.trigger = "user_message"
     forged.source = "discord"
+    forged.author = "discord-operator"
+    forged.author_display = "Operator"
+    forged.author_id = "operator"
+    forged.repo_pr_action_scope = {"forged": True}
+    forged.continuation_auth_context = {"forged": True}
+    forged.source_session_acl = {"forged": True}
+    forged.extra["_mimir_event_ingress"] = "http"
+    forged.extra["channel_visibility"] = "private"
+    forged.extra["bridge_instance"] = "discord"
     forged.extra["poller_name"] = "not-gmail"
     await poller_recovery.stash_enqueued_event(tmp_path, forged)
     _write_outcome(events, type_="turn_failed", channel_id="poller:gmail",
@@ -559,7 +568,17 @@ async def test_reconcile_reenqueue_restamps_forged_stash_fields(tmp_path: Path):
     assert ev.channel_id == "poller:gmail"
     assert ev.trigger == "poller"
     assert ev.source == "poller"
+    assert ev.author is None
+    assert ev.author_display is None
+    assert ev.author_id is None
+    assert ev.repo_pr_action_scope is None
+    assert ev.continuation_auth_context is None
+    assert ev.source_session_acl is None
+    assert "_mimir_event_ingress" not in ev.extra
+    assert "channel_visibility" not in ev.extra
+    assert "bridge_instance" not in ev.extra
     assert ev.extra["poller_name"] == "gmail"
+    assert ev.extra[poller_recovery.POLLER_RECOVERY_REPLAY_EXTRA_KEY] is True
     # The correlation key is preserved — it's how the retry's own
     # outcome is matched back to this entry.
     assert ev.source_id == "sid-1"

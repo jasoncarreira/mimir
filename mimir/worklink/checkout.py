@@ -17,6 +17,7 @@ import sys
 from typing import Any, Callable, Sequence
 
 from .._rmtree import rmtree_missing_ok
+from ..coding import coding_enabled
 from .identities import get_identities
 
 Runner = Callable[[Sequence[str]], subprocess.CompletedProcess[str]]
@@ -25,12 +26,7 @@ EventLogger = Callable[..., None]
 _ENABLED_CHECKOUT_ROOT = Path("/var/lib/mimir-worklink/checkouts")
 _REPO_TEST_CHECKOUT_ROOT = Path("/var/lib/mimir-worklink/repo-test-checkouts")
 _OPENCODE_CHECKOUT_ROOT = Path("/var/lib/mimir-worklink/opencode-checkouts")
-_ENABLED_VALUES = frozenset({"1", "true", "yes", "on"})
 _AUTHORIZATION_FACTORY = object()
-
-
-def coding_enabled() -> bool:
-    return os.environ.get("MIMIR_CODING_ENABLED", "").strip().lower() in _ENABLED_VALUES
 
 
 def _default_runner(args: Sequence[str]) -> subprocess.CompletedProcess[str]:

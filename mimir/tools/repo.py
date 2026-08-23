@@ -52,7 +52,7 @@ def _tool_refusal(
     message: str,
     exc: BaseException,
     *,
-    execution_started: bool = False,
+    execution_started: bool = True,
 ) -> ToolException:
     """Preserve pre-execution policy refusals without downgrading execution faults."""
     if isinstance(exc, ToolPolicyRefusal) and not execution_started:
@@ -132,8 +132,8 @@ def _execute(
     except (GitRefusal, ToolException, RuntimeError, ValueError) as exc:
         cause_code = getattr(exc, "code", None)
         execution_started = bool(
-            getattr(exc, "execution_started", False)
-            or (git_tools is not None and getattr(git_tools, "execution_started", False))
+            (exc.execution_started if isinstance(exc, GitRefusal) else False)
+            or (git_tools is not None and git_tools.execution_started)
         )
         if isinstance(exc, ToolPolicyRefusal):
             code = _REPOSITORY_AUTHORIZATION_REFUSED
@@ -247,7 +247,11 @@ async def repo_test(
         raise _tool_refusal(
             message,
             exc,
-            execution_started=bool(getattr(exc, "execution_started", False)),
+            execution_started=(
+                exc.execution_started
+                if isinstance(exc, ProjectTestRefusal)
+                else True
+            ),
         ) from exc
 
 

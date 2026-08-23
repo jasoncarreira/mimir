@@ -88,6 +88,7 @@ _PR_BODY_SECTION_FILE = ".worklink-pr-body.md"
 _PR_BODY_SECTION_MAX_BYTES = 4000
 _PR_BODY_SECTION_TRUNCATED = "\n\n[Build summary truncated by Worklink.]"
 _FACTORY_CONTROLLER_ERROR_MAX_BYTES = 4000
+_RECOVERABLE_FACTORY_PHASES = {"running", "parked", "failed", "terminal"}
 _EVIDENCE_HEADING_RE = re.compile(r"(?im)^Worklink evidence:\s*$")
 # GitHub's documented closing-keyword set:
 # https://docs.github.com/en/issues/tracking-your-work-with-issues/using-issues/linking-a-pull-request-to-an-issue
@@ -851,7 +852,24 @@ class WorklinkRunner:
                 worker_required and result.review_ready and result.pr_url
             )
             if delete_authorized_checkout and publication is not None:
-                publication.run("update-ref", "-d", f"refs/heads/{lease.branch}", check=True)
+                cleanup_errors: list[str] = []
+                _run_post_publication_bookkeeping(
+                    "authorized branch cleanup",
+                    lambda: publication.run(
+                        "update-ref", "-d", f"refs/heads/{lease.branch}", check=True
+                    ),
+                    issue_id=issue.issue_id,
+                    attempt=record.attempt,
+                    pr_url=result.pr_url,
+                    errors=cleanup_errors,
+                )
+                if cleanup_errors:
+                    result = replace(
+                        result,
+                        reason=_append_post_publication_error(
+                            result.reason, "; ".join(cleanup_errors)
+                        ),
+                    )
             return result
         except Exception as exc:
             try:
@@ -1060,26 +1078,55 @@ class WorklinkRunner:
                 runner=runner,
             )
             validation = _with_pr_url(validation, pr_url)
-            evidence_path = _write_evidence(self.home, validation.evidence)
-        _comment_evidence(
-            claims,
-            validation.evidence,
-            validation,
-            evidence_path,
-            gate_test_tail=(
-                None if validation.review_ready else _local_gate_failure_tail(validation)
-            ),
-        )
-        _log_event(
-            "worklink_evidence",
-            issue_id=issue.issue_id,
-            attempt=attempt,
-            status=validation.status,
-            review_ready=validation.review_ready,
-            reasons=list(validation.reasons),
-            model=validation.evidence.model,
-            failure_reason=validation.evidence.failure_reason,
-        )
+        post_publication_errors: list[str] = []
+
+        def run_bookkeeping(name: str, action: Callable[[], Any]) -> Any | None:
+            return _run_post_publication_bookkeeping(
+                name,
+                action,
+                issue_id=issue.issue_id,
+                attempt=attempt,
+                pr_url=pr_url,
+                errors=post_publication_errors,
+            )
+
+        if pr_url:
+            written_path = run_bookkeeping(
+                "completed evidence write",
+                lambda: _write_evidence(self.home, validation.evidence),
+            )
+            if isinstance(written_path, Path):
+                evidence_path = written_path
+
+        def comment_evidence() -> None:
+            _comment_evidence(
+                claims,
+                validation.evidence,
+                validation,
+                evidence_path,
+                gate_test_tail=(
+                    None if validation.review_ready else _local_gate_failure_tail(validation)
+                ),
+            )
+
+        def log_evidence() -> None:
+            _log_event(
+                "worklink_evidence",
+                issue_id=issue.issue_id,
+                attempt=attempt,
+                status=validation.status,
+                review_ready=validation.review_ready,
+                reasons=list(validation.reasons),
+                model=validation.evidence.model,
+                failure_reason=validation.evidence.failure_reason,
+            )
+
+        if pr_url:
+            run_bookkeeping("evidence comment", comment_evidence)
+            run_bookkeeping("evidence event", log_evidence)
+        else:
+            comment_evidence()
+            log_evidence()
         transition_status = "blocked" if raw.output_overflow else validation.status
         transition_reason = (
             validation.evidence.failure_reason
@@ -1088,21 +1135,31 @@ class WorklinkRunner:
             if validation.status == "blocked"
             else (", ".join(validation.reasons) if validation.reasons else None)
         )
-        claims.transition_issue(
-            issue.issue_id,
-            status=transition_status,
-            review_ready=validation.review_ready,
-            attempt=claim_record.budget_attempt or attempt,
-            reason=transition_reason,
-        )
-        _log_event(
-            "worklink_transition",
-            issue_id=issue.issue_id,
-            attempt=attempt,
-            status=transition_status,
-            review_ready=validation.review_ready,
-            pr_url=pr_url,
-        )
+        def transition_issue() -> None:
+            claims.transition_issue(
+                issue.issue_id,
+                status=transition_status,
+                review_ready=validation.review_ready,
+                attempt=claim_record.budget_attempt or attempt,
+                reason=transition_reason,
+            )
+
+        def log_transition() -> None:
+            _log_event(
+                "worklink_transition",
+                issue_id=issue.issue_id,
+                attempt=attempt,
+                status=transition_status,
+                review_ready=validation.review_ready,
+                pr_url=pr_url,
+            )
+
+        if pr_url:
+            run_bookkeeping("issue transition", transition_issue)
+            run_bookkeeping("transition event", log_transition)
+        else:
+            transition_issue()
+            log_transition()
         cleanup_error = None
         if publication is None:
             cleanup_error = _cleanup_checkout_after_transition(
@@ -1112,6 +1169,8 @@ class WorklinkRunner:
                 issue_id=issue.issue_id,
                 attempt=attempt,
             )
+            if cleanup_error and pr_url:
+                post_publication_errors.append(f"checkout cleanup: {cleanup_error}")
         return WorklinkRunResult(
             issue.issue_id,
             attempt,
@@ -1122,7 +1181,9 @@ class WorklinkRunner:
             checkout=lease.path,
             branch=lease.branch,
             reason=(
-                f"post-transition cleanup failed: {cleanup_error}"
+                _append_post_publication_error(None, "; ".join(post_publication_errors))
+                if post_publication_errors
+                else f"post-transition cleanup failed: {cleanup_error}"
                 if cleanup_error
                 else validation.evidence.failure_reason if raw.exit_code != 0 else None
             ),
@@ -1488,12 +1549,48 @@ class WorklinkRunner:
         issue = issue_reader.read(issue_id)
         work_item_json = render_work_item(issue)
         run_id = _validate_epic_work_item(work_item_json, issue.issue_id)
+        retained: FactoryRunRecord | None = None
+
+        def prepare_factory_claim() -> None:
+            nonlocal retained
+            candidates = [
+                record
+                for record_id in (run_id, str(issue_id))
+                if (record := load_factory_record(self.home, record_id)) is not None
+            ]
+            candidates.sort(
+                key=lambda record: (record.attempt, record.run_id == run_id), reverse=True
+            )
+            for candidate in candidates:
+                try:
+                    _verify_factory_recovery_target(
+                        runner=self,
+                        issue=issue,
+                        retained=candidate,
+                        launcher=launcher,
+                        repo_slug=repo_slug,
+                        base=base,
+                        command_runner=runner,
+                    )
+                except WorklinkError as exc:
+                    archive_factory_record(
+                        self.home,
+                        candidate,
+                        event_logger=_log_durable_event,
+                        source_kind="dispatch_abandonment",
+                        reason=str(exc),
+                    )
+                    continue
+                if retained is None:
+                    retained = candidate
+
         claim = claims.claim_issue(
             issue_id,
             issue.comments,
             labels=issue.labels,
             max_active_locks=factory_max_concurrent(),
             active_label="worklink:epic",
+            before_claim=prepare_factory_claim,
         )
         if claim.attempts_exhausted:
             return WorklinkRunResult(issue_id, None, "blocked", reason="attempts_exhausted")
@@ -1502,33 +1599,22 @@ class WorklinkRunner:
                 issue_id, None, "failed", reason=claim.reason or "claim_failed"
             )
         claim_record = claim.record
-        retained = load_factory_record(self.home, run_id)
-        if retained is None:
-            retained = load_factory_record(self.home, str(issue_id))
         lease: CheckoutLease | None = None
         try:
             if retained is not None:
-                recoverable_phase = retained.controller_phase in {
-                    "running",
-                    "parked",
-                    "failed",
-                    "terminal",
-                }
-                if _factory_record_is_recoverable(retained) or not recoverable_phase:
-                    return await self._recover_factory_070(
-                        issue=issue,
-                        claim_record=claim_record,
-                        claims=claims,
-                        backend=selected,
-                        compute=compute,
-                        retained=retained,
-                        launcher=launcher,
-                        repo_slug=repo_slug,
-                        base=base,
-                        test_cmd=test_cmd,
-                        runner=runner,
-                    )
-                archive_factory_record(self.home, retained)
+                return await self._recover_factory_070(
+                    issue=issue,
+                    claim_record=claim_record,
+                    claims=claims,
+                    backend=selected,
+                    compute=compute,
+                    retained=retained,
+                    launcher=launcher,
+                    repo_slug=repo_slug,
+                    base=base,
+                    test_cmd=test_cmd,
+                    runner=runner,
+                )
             lease = _create_backend_checkout(
                 self.repo,
                 issue_id=issue_id,
@@ -2105,12 +2191,6 @@ async def _cancel_and_cleanup_factory_handle(compute: Any, handle: LaunchHandle)
         await compute.cleanup(handle)
 
 
-def _factory_record_is_recoverable(record: FactoryRunRecord) -> bool:
-    return record.controller_phase in {"running", "parked", "failed", "terminal"} and bool(
-        record.session
-    )
-
-
 def _opaque_json_bytes(value: dict[str, Any] | None) -> bytes:
     return json.dumps(
         value,
@@ -2126,6 +2206,34 @@ def _verify_factory_recovery_binding(
     issue: IssueContext,
     claim_record: ClaimRecord,
     claims: ChainlinkClaims,
+    retained: FactoryRunRecord,
+    launcher: Path,
+    repo_slug: str,
+    base: str,
+    command_runner: Runner,
+) -> Path:
+    sandbox = _verify_factory_recovery_target(
+        runner=runner,
+        issue=issue,
+        retained=retained,
+        launcher=launcher,
+        repo_slug=repo_slug,
+        base=base,
+        command_runner=command_runner,
+    )
+    if claim_record.issue_id != issue.issue_id:
+        raise WorklinkError("factory recovery claim issue does not match")
+    if claim_record.agent_id != claims.agent_id or claims.agent_id != runner.agent_id:
+        raise WorklinkError("factory recovery claim owner does not match")
+    if not getattr(claims, "_lock_still_held_by")(claim_record):
+        raise WorklinkError("factory recovery claim is not retained")
+    return sandbox
+
+
+def _verify_factory_recovery_target(
+    *,
+    runner: WorklinkRunner,
+    issue: IssueContext,
     retained: FactoryRunRecord,
     launcher: Path,
     repo_slug: str,
@@ -2148,16 +2256,10 @@ def _verify_factory_recovery_binding(
         raise WorklinkError("retained factory base does not match recovery request")
     if retained.launcher != str(launcher):
         raise WorklinkError("retained factory launcher does not match recovery request")
-    if retained.controller_phase not in {"running", "parked", "failed", "terminal"}:
+    if retained.controller_phase not in _RECOVERABLE_FACTORY_PHASES:
         raise WorklinkError("retained factory lifecycle is not recoverable")
     if not retained.session:
         raise WorklinkError("retained factory session is missing")
-    if claim_record.issue_id != issue.issue_id:
-        raise WorklinkError("factory recovery claim issue does not match")
-    if claim_record.agent_id != claims.agent_id or claims.agent_id != runner.agent_id:
-        raise WorklinkError("factory recovery claim owner does not match")
-    if not getattr(claims, "_lock_still_held_by")(claim_record):
-        raise WorklinkError("factory recovery claim is not retained")
     sandbox = Path(retained.sandbox)
     if not sandbox.is_absolute() or not sandbox.is_dir() or sandbox.is_symlink():
         raise WorklinkError("retained factory sandbox is unavailable")
@@ -2560,6 +2662,56 @@ def _cleanup_checkout_after_transition(
         )
         return error
     return None
+
+
+def _run_post_publication_bookkeeping(
+    name: str,
+    action: Callable[[], Any],
+    *,
+    issue_id: int,
+    attempt: int,
+    pr_url: str | None,
+    errors: list[str],
+) -> Any | None:
+    """Run secondary publication work without reopening the failure path."""
+    try:
+        return action()
+    except Exception as exc:
+        error = f"{name}: {exc}"
+        errors.append(error)
+        _record_post_publication_error(
+            error,
+            issue_id=issue_id,
+            attempt=attempt,
+            pr_url=pr_url,
+        )
+        return None
+
+
+def _append_post_publication_error(reason: str | None, error: str) -> str:
+    detail = f"post-publication bookkeeping failed: {error}"
+    return f"{reason}; {detail}" if reason else detail
+
+
+def _record_post_publication_error(
+    error: str,
+    *,
+    issue_id: int,
+    attempt: int,
+    pr_url: str | None,
+) -> None:
+    """Report secondary publication work without reopening the failure path."""
+    try:
+        _log_event(
+            "worklink_post_publication_failed",
+            level="warning",
+            issue_id=issue_id,
+            attempt=attempt,
+            pr_url=pr_url,
+            error=error,
+        )
+    except Exception:
+        pass
 
 
 def run_worklink(
@@ -3436,3 +3588,10 @@ def _log_event(event_type: str, **payload: Any) -> None:
         log_event_sync(event_type, **payload)
     except RuntimeError:
         pass
+
+
+def _log_durable_event(event_type: str, **payload: Any) -> None:
+    """Persist a load-bearing Worklink state transition before continuing."""
+    from ..event_logger import log_durable_event_sync
+
+    log_durable_event_sync(event_type, **payload)
