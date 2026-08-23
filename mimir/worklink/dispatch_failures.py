@@ -19,6 +19,7 @@ POLLER_NAME = "worklink-ready-queue"
 INITIAL_BACKOFF_MINUTES = 15
 MAX_BACKOFF_MINUTES = 240
 MAX_NOTIFIED_SIGNATURES = 32
+_DELIVERY_RECEIPTS_DIR = ".delivery-receipts"
 _TRANSIENT_CONTENTION_MARKERS = (
     ("unable to create", "index.lock"),
     ("cannot lock ref",),
@@ -57,6 +58,12 @@ def load_failure_state(state_dir: Path) -> dict[str, Any]:
 
 def save_failure_state(state_dir: Path, state: dict[str, Any]) -> None:
     atomic_write_json(state_dir / STATE_FILE, state)
+
+
+def delivery_receipt_exists(state_dir: Path, delivery_key: str) -> bool:
+    """Return whether the framework durably accepted a poller record."""
+    digest = hashlib.sha256(delivery_key.encode()).hexdigest()
+    return (state_dir / _DELIVERY_RECEIPTS_DIR / digest).is_file()
 
 
 @contextmanager
