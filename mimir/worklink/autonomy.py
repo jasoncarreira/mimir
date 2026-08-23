@@ -37,7 +37,13 @@ from typing import Callable, Sequence
 from ..event_logger import log_event_sync
 from .backends import WorklinkConfig
 from .backends.registry import WorklinkDefaults, WorklinkDefaultsValidationError
-from .claims import ChainlinkClaims, ClaimRecord, ReapResult, ShutdownClaimFailure
+from .claims import (
+    ChainlinkClaims,
+    ClaimRecord,
+    ReapResult,
+    ShutdownClaimFailure,
+    WORKLINK_EPIC_LABEL,
+)
 from .checkout import prune_attempt_checkouts
 from .factory_state import factory_process_is_alive, list_factory_records
 
@@ -174,16 +180,16 @@ def check_concurrency(
 ) -> ConcurrencyCheck:
     """Whether autonomous dispatch may start one more leaf right now.
 
-    ``allowed`` is ``active < cap`` where ``active`` is the active Chainlink
-    lock count. Per-issue exclusivity and the final hard-cap reservation are
-    both enforced by ``chainlink locks claim`` inside
+    ``allowed`` is ``active < cap`` where ``active`` is the active non-epic
+    Chainlink lock count. Per-issue exclusivity and the final hard-cap reservation
+    are both enforced by ``chainlink locks claim`` inside
     :meth:`ChainlinkClaims.claim_issue`; this preflight is advisory/fail-closed
     so callers can skip work before entering the executor when the cap is
     already full.
     """
     cap = worklink_defaults(home).max_concurrent
     cl = claims or make_claims(home, agent_id=agent_id)
-    active = cl.active_worklink_lock_count()
+    active = cl.active_worklink_lock_count(exclude_label=WORKLINK_EPIC_LABEL)
     return ConcurrencyCheck(allowed=active < cap, active=active, cap=cap)
 
 
