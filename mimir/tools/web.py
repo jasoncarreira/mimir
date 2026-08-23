@@ -52,6 +52,8 @@ log = logging.getLogger(__name__)
 FETCH_CHUNK_SIZE_BYTES = 64 * 1024
 FETCH_PDF_MAX_PAGES_DEFAULT = 100
 FETCH_PDF_MAX_TEXT_BYTES_DEFAULT = 1_000_000
+FETCH_CONTENT_TYPE_MAX_CHARS = 127
+FETCH_CONTENT_TYPE_FALLBACK = "application/octet-stream"
 UTC = timezone.utc
 
 # ─── Module-level dependency injection ─────────────────────────────
@@ -99,6 +101,29 @@ def _positive_env_int(name: str, default: int) -> int:
 
 def _pdf_content_type(content_type: object) -> bool:
     return str(content_type).partition(";")[0].strip().lower() == "application/pdf"
+
+
+def _parsed_content_type(value: object) -> str:
+    """Return one bounded RFC media type, never raw header text."""
+    media_type = str(value).partition(";")[0].strip().lower()
+    token = r"[!#$%&'*+.^_`|~0-9a-z-]+"
+    if (
+        len(media_type) <= FETCH_CONTENT_TYPE_MAX_CHARS
+        and re.fullmatch(rf"{token}/{token}", media_type)
+    ):
+        return media_type
+    return FETCH_CONTENT_TYPE_FALLBACK
+
+
+def _inline_fetch_metadata(metadata: dict[str, Any]) -> dict[str, Any]:
+    """Build the model-visible fetch result from the server-owned schema."""
+    keys = (
+        "url", "status", "content_type", "bytes", "sha256",
+        "file_path", "metadata_path", "text_path", "pdf_extraction",
+    )
+    payload = {key: metadata[key] for key in keys if key in metadata}
+    payload["content_type"] = _parsed_content_type(payload.get("content_type", ""))
+    return payload
 
 
 def _truncate_utf8(text: str, max_bytes: int) -> tuple[str, bool]:
@@ -336,8 +361,7 @@ def _download_url_bytes(
     request = Request(url=url, headers={"User-Agent": "mimir/fetch_url"})
     with _open_url(request, timeout=timeout_seconds) as response:
         status = int(response.getcode() or 0)
-        final_url = str(response.geturl())
-        content_type = str(response.headers.get("Content-Type", ""))
+        content_type = _parsed_content_type(response.headers.get("Content-Type", ""))
         # Content-Length pre-check: refuse the download before writing
         # a single byte if the server advertises a size beyond max_bytes.
         # The streaming check below remains the source of truth for
@@ -346,10 +370,7 @@ def _download_url_bytes(
         if advertised_len is not None:
             try:
                 if int(advertised_len) > max_bytes:
-                    raise ValueError(
-                        f"server advertised Content-Length={advertised_len} > "
-                        f"max_bytes={max_bytes} for url={url}",
-                    )
+                    raise ValueError("download exceeded max_bytes")
             except (TypeError, ValueError) as exc:
                 # Re-raise our own ValueError; ignore unparseable
                 # Content-Length headers and fall back to streaming check.
@@ -364,14 +385,11 @@ def _download_url_bytes(
                     break
                 total_bytes += len(chunk)
                 if total_bytes > max_bytes:
-                    raise ValueError(
-                        f"download exceeded max_bytes={max_bytes} for url={url}",
-                    )
+                    raise ValueError("download exceeded max_bytes")
                 hasher.update(chunk)
                 f.write(chunk)
     return {
         "status": status,
-        "final_url": final_url,
         "content_type": content_type,
         "bytes": total_bytes,
         "sha256": hasher.hexdigest(),
@@ -577,15 +595,19 @@ async def fetch_url(
             needs_extraction = not isinstance(extraction, dict) or (
                 extraction.get("status") == "success" and not text_path.is_file()
             )
-            if _pdf_content_type(existing_meta.get("content_type")) and needs_extraction:
+            existing_meta["content_type"] = _parsed_content_type(
+                existing_meta.get("content_type", "")
+            )
+            if _pdf_content_type(existing_meta["content_type"]) and needs_extraction:
                 await _add_pdf_extraction(
                     existing_meta, body_path=body_path, text_path=text_path,
                 )
-                meta_path.write_text(
-                    json.dumps(existing_meta, ensure_ascii=True, sort_keys=False, indent=2) + "\n",
-                    encoding="utf-8",
-                )
-            return yaml.safe_dump(existing_meta, sort_keys=False)
+            cached_payload = _inline_fetch_metadata(existing_meta)
+            meta_path.write_text(
+                json.dumps(cached_payload, ensure_ascii=True, sort_keys=False, indent=2) + "\n",
+                encoding="utf-8",
+            )
+            return yaml.safe_dump(cached_payload, sort_keys=False)
 
     try:
         fetched = await asyncio.to_thread(
@@ -595,10 +617,10 @@ async def fetch_url(
             timeout_seconds=timeout_seconds,
             max_bytes=max_bytes,
         )
-    except HTTPError as exc:
-        return f"fetch_url failed: HTTP {exc.code} ({exc.reason})"
-    except URLError as exc:
-        return f"fetch_url failed: {getattr(exc, 'reason', exc)}"
+    except HTTPError:
+        return "fetch_url failed: HTTP request failed."
+    except URLError:
+        return "fetch_url failed: URL request failed."
     except ValueError as exc:
         body_path.unlink(missing_ok=True)
         return f"fetch_url failed: {exc}"
@@ -613,7 +635,6 @@ async def fetch_url(
     meta_virtual_path = _virtual_path(meta_path, root=_home)
     meta_payload = {
         "url": normalized_url,
-        "final_url": fetched["final_url"],
         "status": fetched["status"],
         "content_type": fetched["content_type"],
         "bytes": fetched["bytes"],
@@ -625,6 +646,7 @@ async def fetch_url(
         await _add_pdf_extraction(
             meta_payload, body_path=body_path, text_path=text_path,
         )
+    meta_payload = _inline_fetch_metadata(meta_payload)
     meta_path.write_text(
         json.dumps(meta_payload, ensure_ascii=True, sort_keys=False, indent=2) + "\n",
         encoding="utf-8",
