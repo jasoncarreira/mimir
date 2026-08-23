@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 import subprocess
 import sys
@@ -587,6 +588,8 @@ def test_runner_for_home_overrides_explicit_cwd_only_for_chainlink(
 def test_consumer_posts_once_and_marks_sidecar_actioned_after_delivery(tmp_path: Path) -> None:
     home = tmp_path / "home"
     home.mkdir()
+    events_path = home / "logs" / "events.jsonl"
+    event_logger.init_logger(events_path, session_id="test")
     repo = _init_repo(tmp_path, branch="chainlink-740-consume")
     _save_run_state(home, issue_id=740, branch="chainlink-740-consume", test_command="pytest")
     event = _make_event(trigger="user_message", source="slack")
@@ -626,6 +629,78 @@ def test_consumer_posts_once_and_marks_sidecar_actioned_after_delivery(tmp_path:
         for argv, cwd in consumer.calls
         if argv and argv[0] == "chainlink"
     )
+    records = [json.loads(line) for line in events_path.read_text(encoding="utf-8").splitlines()]
+    assert [record["type"] for record in records] == ["worklink_continuation_created"]
+
+
+def test_part_c_consumer_emits_stalled_once_and_abandoned_once(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    repo = _init_repo(tmp_path, branch="chainlink-740-observability")
+    _save_run_state(home, issue_id=740, branch="chainlink-740-observability", test_command="pytest")
+    events_path = home / "logs" / "events.jsonl"
+    event_logger.init_logger(events_path, session_id="test")
+    event = _make_event(trigger="user_message", source="slack")
+    created = maybe_create_worklink_budget_continuation(
+        home=home,
+        event=event,
+        ctx=_make_ctx(event),
+        record=_make_record(event),
+        repo=repo,
+        current_worktree=repo,
+        runner=SpyRunner(),
+    )
+    assert created is not None
+    current = datetime(2026, 8, 23, tzinfo=UTC)
+
+    def unavailable(
+        args: Sequence[str], cwd: Path | None = None
+    ) -> subprocess.CompletedProcess[str]:
+        return subprocess.CompletedProcess(list(args), 1, stdout="", stderr="chainlink unavailable")
+
+    for _ in range(2):
+        assert consume_worklink_budget_continuations(
+            home,
+            runner=unavailable,
+            now=current,
+            delivery_receipt_exists=lambda _key: True,
+        ) == []
+
+    payload = json.loads(created.sidecar_path.read_text(encoding="utf-8"))
+    assert payload["consumer_error"] == "chainlink unavailable"
+    consumer = ContinuationConsumerRunner()
+    assert consume_worklink_budget_continuations(
+        home,
+        runner=consumer,
+        now=current + timedelta(minutes=1),
+        delivery_receipt_exists=lambda _key: True,
+    ) == []
+    assert len(consumer.comments) == 1
+
+    abandoned_at = current + timedelta(hours=25)
+    for _ in range(2):
+        assert consume_worklink_budget_continuations(
+            home,
+            runner=consumer,
+            now=abandoned_at,
+            retention=timedelta(hours=24),
+            delivery_receipt_exists=lambda _key: True,
+        ) == []
+
+    records = [json.loads(line) for line in events_path.read_text(encoding="utf-8").splitlines()]
+    assert [record["type"] for record in records] == [
+        "worklink_continuation_created",
+        "worklink_continuation_stalled",
+        "worklink_continuation_abandoned",
+    ]
+    stalled = records[1]
+    assert stalled["sidecar"] == str(created.sidecar_path)
+    assert stalled["issue_id"] == 740
+    assert stalled["consumer_error"] == "chainlink unavailable"
+    abandoned = records[2]
+    assert abandoned["sidecar"] == str(created.sidecar_path)
+    assert abandoned["issue_id"] == 740
+    assert abandoned["reason"] == "manual_triage_timeout"
 
 
 def test_consumer_resolves_closed_issue_without_reaction(tmp_path: Path) -> None:

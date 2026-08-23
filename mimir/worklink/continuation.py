@@ -390,6 +390,7 @@ def maybe_create_worklink_budget_continuation(
     atomic_write_json(path, payload)
 
     _emit_continuation_event(
+        "worklink_continuation_created",
         idempotency_key=idempotency_key,
         sidecar=str(path),
         issue_id=validated_issue_id,
@@ -467,6 +468,7 @@ def consume_worklink_budget_continuations(
             gh_bin=gh_bin,
             runner=run,
         )
+        was_stalled = bool(payload.get("consumer_error"))
         payload["last_checked_at"] = current.isoformat()
         payload["consumer_error"] = _truncate_str(check_error, 300)
         if terminal_reason is not None:
@@ -476,6 +478,15 @@ def consume_worklink_budget_continuations(
             break
         if check_error is not None:
             atomic_write_json(path, payload)
+            if not was_stalled:
+                association = payload.get("association")
+                association = association if isinstance(association, Mapping) else {}
+                _emit_continuation_event(
+                    "worklink_continuation_stalled",
+                    sidecar=str(path),
+                    issue_id=association.get("issue_id"),
+                    consumer_error=payload["consumer_error"],
+                )
             break
 
         if actioned_at is not None:
@@ -483,6 +494,15 @@ def consume_worklink_budget_continuations(
                 payload["resolved_at"] = current.isoformat()
                 payload["resolved_reason"] = "manual_triage_timeout"
             atomic_write_json(path, payload)
+            if payload.get("resolved_reason") == "manual_triage_timeout":
+                association = payload.get("association")
+                association = association if isinstance(association, Mapping) else {}
+                _emit_continuation_event(
+                    "worklink_continuation_abandoned",
+                    sidecar=str(path),
+                    issue_id=association.get("issue_id"),
+                    reason="manual_triage_timeout",
+                )
             break
 
         payload["external_comment"] = _post_consumer_comment(
@@ -1319,11 +1339,11 @@ def _normalize_labels(values: Sequence[str] | None) -> list[str]:
     return sorted({value.strip() for value in values if isinstance(value, str) and value.strip()})
 
 
-def _emit_continuation_event(**payload: Any) -> None:
+def _emit_continuation_event(event_type: str, **payload: Any) -> None:
     try:
         from ..event_logger import log_event_sync
 
-        log_event_sync("worklink_continuation_created", **payload)
+        log_event_sync(event_type, **payload)
     except Exception:
         return
 

@@ -395,6 +395,17 @@ def test_reaper_enforces_own_ttl_before_steal() -> None:
     assert payload["resulting_label"] == "worklink:ready"
     assert events == [
         (
+            "worklink_claim_stolen",
+            {
+                "issue_id": 2,
+                "prior_agent_id": "stale",
+                "heartbeat_age_s": 7200.0,
+                "guard_outcome": "stale_lock_confirmed",
+                "steal_succeeded": True,
+                "error": None,
+            },
+        ),
+        (
             "worklink_claim_reaped",
             {
                 "issue_id": 2,
@@ -606,6 +617,95 @@ def test_same_agent_reclaim_with_stale_heartbeat_steals_and_proceeds():
 
     assert result.claimed is True
     assert any(call[1:3] == ["locks", "steal"] for call in calls)
+
+
+def test_part_b_claim_steals_report_degraded_guard_and_both_steal_outcomes() -> None:
+    now = datetime(2026, 7, 3, 19, 0, tzinfo=UTC)
+    stale = ClaimRecord(
+        issue_id=783,
+        attempt=1,
+        agent_id="prior-worker",
+        claimed_at=now - timedelta(hours=2),
+        heartbeat_at=now - timedelta(hours=1),
+    )
+    events: list[tuple[str, dict[str, object]]] = []
+    issue_show_calls = 0
+
+    def degraded_runner(args: Sequence[str]) -> subprocess.CompletedProcess[str]:
+        nonlocal issue_show_calls
+        call = list(args)
+        if call[1:3] == ["issue", "show"]:
+            issue_show_calls += 1
+            if issue_show_calls == 2:
+                raise OSError("comments unavailable")
+            return subprocess.CompletedProcess(call, 0, stdout="{}", stderr="")
+        if call[1:3] == ["locks", "claim"]:
+            return subprocess.CompletedProcess(call, 0, stdout="already hold", stderr="")
+        if call[1:3] == ["locks", "steal"]:
+            return subprocess.CompletedProcess(call, 1, stdout="", stderr="steal denied")
+        return completed(call)
+
+    result = ChainlinkClaims(
+        agent_id="mimir-worklink-epic",
+        runner=degraded_runner,
+        clock=lambda: now,
+        event_logger=lambda event, **payload: events.append((event, payload)),
+    ).claim_issue(783, [stale.to_comment()])
+
+    assert result.claimed is True
+    relevant_events = [
+        item
+        for item in events
+        if item[0] in {"worklink_claim_guard_degraded", "worklink_claim_stolen"}
+    ]
+    assert relevant_events == [
+        (
+            "worklink_claim_guard_degraded",
+            {"issue_id": 783, "error": "OSError: comments unavailable"},
+        ),
+        (
+            "worklink_claim_stolen",
+            {
+                "issue_id": 783,
+                "prior_agent_id": "prior-worker",
+                "heartbeat_age_s": 3600.0,
+                "guard_outcome": "degraded",
+                "steal_succeeded": False,
+                "error": "steal denied",
+            },
+        ),
+    ]
+
+    reaper_events: list[tuple[str, dict[str, object]]] = []
+
+    def reaper_runner(args: Sequence[str]) -> subprocess.CompletedProcess[str]:
+        call = list(args)
+        if call[1:3] == ["locks", "list"]:
+            return subprocess.CompletedProcess(
+                call, 0, stdout=json.dumps({"locks": {"783": {"issue_id": 783}}}), stderr=""
+            )
+        if call[1:3] == ["issue", "show"]:
+            return subprocess.CompletedProcess(
+                call, 0, stdout=json.dumps({"labels": ["worklink:in-progress"]}), stderr=""
+            )
+        return completed(call)
+
+    ChainlinkClaims(
+        agent_id="reaper",
+        runner=reaper_runner,
+        clock=lambda: now,
+        event_logger=lambda event, **payload: reaper_events.append((event, payload)),
+    ).reap_stale_claims([stale], ttl=timedelta(minutes=30))
+
+    stolen = next(payload for event, payload in reaper_events if event == "worklink_claim_stolen")
+    assert stolen == {
+        "issue_id": 783,
+        "prior_agent_id": "prior-worker",
+        "heartbeat_age_s": 3600.0,
+        "guard_outcome": "stale_lock_confirmed",
+        "steal_succeeded": True,
+        "error": None,
+    }
 
 
 def test_duplicate_vs_live_final_attempt_never_labels_blocked():
