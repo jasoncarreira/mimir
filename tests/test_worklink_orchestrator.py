@@ -3132,8 +3132,11 @@ def test_factory_early_failed_record_is_archived_before_fresh_run(
         return cp(args)
 
     async def launch(self: object, spec: WorkSpec) -> LaunchHandle:
+        root = fresh_sandbox / ".factory-sandboxes"
         sandbox = fresh_sandbox / ".factory-sandboxes" / "chainlink-700"
-        assert sandbox.is_dir()
+        assert root.is_dir()
+        assert root.stat().st_mode & 0o777 == 0o700
+        assert not sandbox.exists()
         assert not sandbox.is_symlink()
         assert spec.local_argv is not None
         assert spec.local_argv[-1].split()[-1] == "chainlink-700"
@@ -3207,6 +3210,47 @@ def test_factory_early_failed_record_is_archived_before_fresh_run(
         json.loads(archives[0].read_text(encoding="utf-8"))
     ) == retained
     assert old_sandbox.is_dir()
+
+
+def test_factory_launch_preflight_refuses_existing_run_sandbox(tmp_path: Path) -> None:
+    import mimir.worklink.orchestrator as orchestrator
+
+    checkout = tmp_path / "checkout"
+    checkout.mkdir()
+    root = checkout / ".factory-sandboxes"
+    root.mkdir(mode=0o700)
+    sandbox = root / "chainlink-700"
+    sandbox.mkdir(mode=0o700)
+    lease = CheckoutLease(
+        issue_id=700,
+        attempt=2,
+        repo=tmp_path / "repo",
+        path=checkout,
+        branch="issue/700-a2",
+        base_ref="main",
+        local_base="origin/main",
+        isolated_checkout=True,
+    )
+    record = FactoryRunRecord(
+        run_id="chainlink-700",
+        issue_id=700,
+        attempt=2,
+        repository="owner/repo",
+        base_ref="main",
+        branch="feature/chainlink-700",
+        launcher="/opt/factory/bin/factory.js",
+        sandbox=str(sandbox),
+        session=None,
+        handle=None,
+        status=None,
+        observed_at=None,
+        controller_phase="running",
+    )
+
+    with pytest.raises(WorklinkError, match=re.escape(str(sandbox))):
+        orchestrator._create_factory_sandbox(record, lease)
+
+    assert sandbox.is_dir()
 
 
 @pytest.mark.parametrize("phase", ["running", "parked", "failed", "terminal"])
