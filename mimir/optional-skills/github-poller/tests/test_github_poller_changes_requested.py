@@ -1430,4 +1430,47 @@ def test_unresolvable_trust_in_pushes_carries_the_prior_head_forward(monkeypatch
     assert new_heads == {"700": "o" * 40}, (
         "prior head not carried forward — next tick would miss the push"
     )
-    assert spent.hard_truncated is True
+    # The watermark is intentionally NOT held here — see
+    # test_pushes_trust_denial_does_not_freeze_the_watermark.
+    assert spent.truncated.get("pushes_trust") == 1
+
+
+def test_pushes_trust_denial_does_not_freeze_the_watermark(monkeypatch):
+    """`_check_pr_pushes` takes no `since` — it defers through `pr_heads`.
+
+    Holding the global watermark for a skipped PR here froze `last_checked` on an
+    ordinary 48s tick over a single denial, which would stop the since-window
+    advancing at all. `_check_prs` still needs the hold, because it filters on
+    `created_at > since` and has nowhere else to defer to.
+    """
+    monkeypatch.setattr(poller, "_pr_author_is_trusted", _REAL_TRUST_RESOLVER)
+    monkeypatch.setattr(poller, "_emit", lambda *a, **k: None)
+    monkeypatch.setattr(poller, "_emit_signal", lambda *a, **k: None)
+    pr = {
+        "number": 700, "title": "t", "state": "open",
+        "html_url": "https://github.com/o/r/pull/700",
+        "user": {"login": "outside-contributor"},
+        "created_at": "2026-08-23T11:00:00Z",
+        "head": {"sha": "n" * 40, "ref": "f", "repo": {"full_name": "o/r"}},
+        "base": {"sha": "b" * 40, "ref": "main"},
+    }
+    monkeypatch.setattr(
+        poller, "_gh_api",
+        lambda ep, tok: [pr] if "pulls?state=open" in ep else [],
+    )
+
+    spent = poller.TickBudget(hard_deadline_seconds=0.0)
+    poller._check_pr_pushes(
+        "o/r", "tok", "mimir-bot", {"700": "o" * 40}, tick_budget=spent,
+    )
+    assert spent.truncated.get("pushes_trust") == 1, "denial not recorded"
+    assert spent.hard_truncated is False, "watermark frozen by a pushes denial"
+
+    # _check_prs is the opposite case: it filters on `since`, so a skipped PR
+    # there must hold the watermark or the review request is lost for good.
+    spent_prs = poller.TickBudget(hard_deadline_seconds=0.0)
+    poller._check_prs(
+        "o/r", "2026-08-23T10:00:00Z", "tok", "mimir-bot",
+        tick_budget=spent_prs,
+    )
+    assert spent_prs.hard_truncated is True

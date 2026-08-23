@@ -1475,11 +1475,16 @@ def _check_pr_pushes(
         if trusted_author is None:
             # Unresolved for lack of budget. Carry the prior head forward — a
             # dropped key would make the next tick treat this PR as first-seen
-            # and miss the push entirely — and hold the watermark.
+            # and miss the push entirely.
+            #
+            # Deliberately does NOT hold the watermark: this pass takes no
+            # ``since`` and defers entirely through ``pr_heads``, so the skipped
+            # PR is compared again next tick regardless. Holding it here froze
+            # `last_checked` on an ordinary tick over a single skipped PR, which
+            # would stop the since-window advancing at all.
             if key in pr_heads:
                 new_heads[key] = pr_heads[key]
             if tick_budget is not None:
-                tick_budget.hard_truncated = True
                 tick_budget.note_truncation("pushes_trust", 1)
             continue
         if not trusted_author:
