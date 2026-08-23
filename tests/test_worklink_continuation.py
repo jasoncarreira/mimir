@@ -471,7 +471,7 @@ def test_runner_for_home_overrides_explicit_cwd_only_for_chainlink(
     ]
 
 
-def test_consumer_posts_once_and_marks_sidecar_actioned(tmp_path: Path) -> None:
+def test_consumer_posts_once_and_marks_sidecar_actioned_after_delivery(tmp_path: Path) -> None:
     home = tmp_path / "home"
     home.mkdir()
     repo = _init_repo(tmp_path, branch="chainlink-740-consume")
@@ -490,11 +490,20 @@ def test_consumer_posts_once_and_marks_sidecar_actioned(tmp_path: Path) -> None:
     assert created is not None
     consumer = ContinuationConsumerRunner()
 
+    before = created.sidecar_path.read_bytes()
     first = consume_worklink_budget_continuations(home, runner=consumer)
-    second = consume_worklink_budget_continuations(home, runner=consumer)
+    after_offer = created.sidecar_path.read_bytes()
+    retried = consume_worklink_budget_continuations(home, runner=consumer)
+    delivered = consume_worklink_budget_continuations(
+        home,
+        runner=consumer,
+        delivery_receipt_exists=lambda key: key == first[0].delivery_key,
+    )
 
     assert len(first) == 1
-    assert second == []
+    assert [action.delivery_key for action in retried] == [first[0].delivery_key]
+    assert delivered == []
+    assert after_offer == before
     assert len(consumer.comments) == 1
     payload = json.loads(created.sidecar_path.read_text(encoding="utf-8"))
     assert payload["actioned_at"]
@@ -524,7 +533,9 @@ def test_consumer_resolves_closed_issue_without_reaction(tmp_path: Path) -> None
     assert created is not None
     consumer = ContinuationConsumerRunner(status="closed", labels=[])
 
-    assert consume_worklink_budget_continuations(home, runner=consumer) == []
+    assert consume_worklink_budget_continuations(
+        home, runner=consumer, delivery_receipt_exists=lambda _key: True,
+    ) == []
 
     payload = json.loads(created.sidecar_path.read_text(encoding="utf-8"))
     assert payload["resolved_at"]
@@ -556,7 +567,9 @@ def test_consumer_treats_completed_evidence_as_terminal(tmp_path: Path) -> None:
     )
     consumer = ContinuationConsumerRunner()
 
-    assert consume_worklink_budget_continuations(home, runner=consumer) == []
+    assert consume_worklink_budget_continuations(
+        home, runner=consumer, delivery_receipt_exists=lambda _key: True,
+    ) == []
 
     payload = json.loads(created.sidecar_path.read_text(encoding="utf-8"))
     assert payload["resolved_reason"] == "completed_evidence"
