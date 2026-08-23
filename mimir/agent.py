@@ -293,9 +293,9 @@ def _auto_recall_source_labels(
             ),
             source_kind="auto_recall",
             integrity=integrity,
-            # Accepted residual (#948): an untrusted fact can influence a later
-            # trusted turn. Auto-recall remains informational so it never
-            # handcuffs a user turn; see enforcement-enablement.md section 5.3.
+            # Accepted residual (#948): untrusted recall remains informational
+            # so it does not handcuff a user turn at sink gates. Persisted
+            # derivatives still inherit untrusted integrity in memory_store.
             integrity_effect=IntegrityEffect.INFORMATIONAL,
         ))
     return labels
@@ -1716,9 +1716,14 @@ class Agent:
                     IterationGateMiddleware(),
                     BudgetGateMiddleware(),
                     FetchedContentReminderMiddleware(self._config.home),
-                    SkillMemoryInjectionMiddleware(),
+                    SkillMemoryInjectionMiddleware(skill_sources),
                     MidTurnInjectionMiddleware(),
                 )
+
+            for middleware in self._agent_middleware:
+                set_skill_sources = getattr(middleware, "set_skill_sources", None)
+                if callable(set_skill_sources):
+                    set_skill_sources(skill_sources)
 
             from .subagents import build_mimir_subagents
             from ._deepagents_subagent_auth import install_subagent_auth_context_patch
