@@ -2646,9 +2646,62 @@ def test_poller_config_channel_id_format():
 
 
 def test_poller_timeout_constant_reasonable():
-    """Locks the contract: the framework's hard-cap is 60s. Skill
-    authors who need longer-running pollers must restructure."""
-    assert POLLER_TIMEOUT_SECONDS == 60
+    """Locks the contract: the framework hard-cap a poller is killed at.
+
+    Raised 60 -> 120 for chainlink #1433. Still a hard cap — a poller needing
+    longer must bound its own work or restructure, because overrunning discards
+    everything the tick emitted rather than returning a partial result.
+    """
+    assert POLLER_TIMEOUT_SECONDS == 120
+
+
+def test_poller_timeout_stays_below_every_shipped_cadence():
+    """The invariant the constant's value actually has to satisfy.
+
+    Jobs register with ``max_instances=1``, so a cap longer than a poller's fire
+    interval means a slow run silently swallows the next fire. Asserting the
+    number alone would not catch that; this computes each shipped poller's real
+    period from its own cron expression, so it fails if the cap is raised too far
+    *or* if a fast-firing poller is added later.
+    """
+    from datetime import datetime, timezone
+
+    from apscheduler.triggers.cron import CronTrigger
+
+    from mimir.scheduler import _cron_with_standard_dow
+
+    manifests = sorted(Path("mimir/optional-skills").glob("*/pollers.json"))
+    assert manifests, "no shipped poller manifests found — test is vacuous"
+
+    now = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    checked: list[tuple[str, float]] = []
+    for manifest in manifests:
+        raw = json.loads(manifest.read_text(encoding="utf-8"))
+        entries = raw.get("pollers", raw) if isinstance(raw, dict) else raw
+        for entry in entries if isinstance(entries, list) else [entries]:
+            if not isinstance(entry, dict):
+                continue
+            name = str(entry.get("name"))
+            interval = entry.get("interval_seconds")
+            if isinstance(interval, (int, float)) and interval > 0:
+                checked.append((name, float(interval)))
+                continue
+            cron = entry.get("cron")
+            if not isinstance(cron, str) or not cron.strip():
+                continue
+            trigger = CronTrigger.from_crontab(
+                _cron_with_standard_dow(cron), timezone=timezone.utc,
+            )
+            first = trigger.get_next_fire_time(None, now)
+            second = trigger.get_next_fire_time(first, first)
+            checked.append((name, (second - first).total_seconds()))
+
+    assert checked, "no cadences resolved — test is vacuous"
+    for name, period in checked:
+        assert POLLER_TIMEOUT_SECONDS < period, (
+            f"{name} fires every {period:.0f}s but the cap is "
+            f"{POLLER_TIMEOUT_SECONDS}s; a slow run would swallow the next fire"
+        )
 
 
 def test_pollers_module_annotations_resolve():

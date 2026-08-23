@@ -109,7 +109,23 @@ from .poller_budget import (
 
 log = logging.getLogger(__name__)
 
-POLLER_TIMEOUT_SECONDS = 60
+# Wall-clock ceiling for one poller subprocess. Overrunning it is not a partial
+# result: the timeout path discards the stdout already collected (see the
+# ``asyncio.TimeoutError`` handler in ``run_poller``), so every event the tick had
+# emitted is lost and its cursor never advances.
+#
+# Raised 60 -> 120 (chainlink #1433). Safe against fire-stacking because the
+# shortest configured cadence is ``*/10`` (600s) and jobs register with
+# ``max_instances=1``; the APScheduler misfire grace is an independent 5s and was
+# deliberately decoupled from this value (see the PR #107 note in scheduler.py).
+# Keep this comfortably below the shortest poller cadence — a cap longer than the
+# interval means a slow run silently swallows the next fire. Enforced by
+# ``test_poller_timeout_stays_below_every_shipped_cadence``.
+#
+# ``run_poller`` exports the effective value as POLLER_TIMEOUT_SECONDS in the
+# subprocess env so a poller can size its own internal deadlines against the real
+# cap instead of hardcoding a copy that drifts.
+POLLER_TIMEOUT_SECONDS = 120
 # Cap stderr text recorded in events.jsonl so a chatty poller doesn't
 # blow the algedonic stream's storage budget.
 POLLER_STDERR_LOG_CHARS = 2000
@@ -1902,6 +1918,10 @@ async def run_poller(
             )
     env["STATE_DIR"] = str(persist_dir)
     env["POLLER_NAME"] = poller.name
+    # Let a poller bound its own work against the cap it will actually be killed
+    # at, rather than duplicating the constant. Injected like the vars above, so
+    # it is not subject to ``pass_env`` gating.
+    env["POLLER_TIMEOUT_SECONDS"] = str(int(timeout))
     # Scheduler passes Config.home here. Direct test/niche callers that omit
     # it still get a deterministic home path from the install layout
     # (``<home>/skills/<skill>`` → home) rather than reading
