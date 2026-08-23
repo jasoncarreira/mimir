@@ -1082,6 +1082,7 @@ def _result_labels_for_call(
     *,
     result: ToolMessage | Command | None = None,
     provenance: Any = None,
+    policy_refusal: ToolPolicyRefusal | None = None,
     failed: bool = False,
 ) -> Any:
     if not failed and tool_name == "repo_checkout" and auth_context is not None:
@@ -1116,6 +1117,7 @@ def _result_labels_for_call(
         authorization,
         result=result,
         provenance=provenance,
+        policy_refusal=policy_refusal,
         failed=failed,
     )
 
@@ -1677,6 +1679,8 @@ class BudgetGateMiddleware(AgentMiddleware):
             return result
         capture_token = None
         provenance = None
+        read_refusal_token = None
+        policy_refusal = None
         fetch_token = None
         try:
             if (
@@ -1692,6 +1696,9 @@ class BudgetGateMiddleware(AgentMiddleware):
             )
 
             capture_token = begin_protected_result_capture()
+            from ..read_policy import begin_read_policy_refusal_capture
+
+            read_refusal_token = begin_read_policy_refusal_capture()
             authorized_fetch_urls = _authorized_fetch_urls_for_tool(
                 tool_name, auth_context, _extract_sink_target(request, auth_context),
             )
@@ -1704,6 +1711,11 @@ class BudgetGateMiddleware(AgentMiddleware):
             if capture_token is not None:
                 provenance = end_protected_result_capture(capture_token)
                 capture_token = None
+            if read_refusal_token is not None:
+                from ..read_policy import end_read_policy_refusal_capture
+
+                policy_refusal = end_read_policy_refusal_capture(read_refusal_token)
+                read_refusal_token = None
             if isinstance(exc, ToolPolicyRefusal):
                 _record_tool_outcome(tool_name, refused_reason=str(exc))
             else:
@@ -1729,6 +1741,11 @@ class BudgetGateMiddleware(AgentMiddleware):
             if capture_token is not None:
                 provenance = end_protected_result_capture(capture_token)
                 capture_token = None
+            if read_refusal_token is not None:
+                from ..read_policy import end_read_policy_refusal_capture
+
+                end_read_policy_refusal_capture(read_refusal_token)
+                read_refusal_token = None
             result_labels = _result_labels_for_call(
                 tool_name,
                 request,
@@ -1759,6 +1776,10 @@ class BudgetGateMiddleware(AgentMiddleware):
                 end_authorized_fetch(fetch_token)
             if capture_token is not None:
                 provenance = end_protected_result_capture(capture_token)
+            if read_refusal_token is not None:
+                from ..read_policy import end_read_policy_refusal_capture
+
+                policy_refusal = end_read_policy_refusal_capture(read_refusal_token)
         is_error = _result_is_error(result)
         if not is_error:
             _record_tool_outcome(tool_name)
@@ -1772,6 +1793,7 @@ class BudgetGateMiddleware(AgentMiddleware):
             authorization,
             result=result,
             provenance=provenance,
+            policy_refusal=policy_refusal,
             failed=is_error,
         )
         _merge_result_labels(auth_context, result_labels)
@@ -1997,6 +2019,8 @@ class BudgetGateMiddleware(AgentMiddleware):
             return result
         capture_token = None
         provenance = None
+        read_refusal_token = None
+        policy_refusal = None
         fetch_token = None
         try:
             if (
@@ -2012,6 +2036,9 @@ class BudgetGateMiddleware(AgentMiddleware):
             )
 
             capture_token = begin_protected_result_capture()
+            from ..read_policy import begin_read_policy_refusal_capture
+
+            read_refusal_token = begin_read_policy_refusal_capture()
             authorized_fetch_urls = _authorized_fetch_urls_for_tool(
                 tool_name, auth_context, _extract_sink_target(request, auth_context),
             )
@@ -2024,6 +2051,11 @@ class BudgetGateMiddleware(AgentMiddleware):
             if capture_token is not None:
                 provenance = end_protected_result_capture(capture_token)
                 capture_token = None
+            if read_refusal_token is not None:
+                from ..read_policy import end_read_policy_refusal_capture
+
+                policy_refusal = end_read_policy_refusal_capture(read_refusal_token)
+                read_refusal_token = None
             if isinstance(exc, ToolPolicyRefusal):
                 _record_tool_outcome(tool_name, refused_reason=str(exc))
             else:
@@ -2049,6 +2081,11 @@ class BudgetGateMiddleware(AgentMiddleware):
             if capture_token is not None:
                 provenance = end_protected_result_capture(capture_token)
                 capture_token = None
+            if read_refusal_token is not None:
+                from ..read_policy import end_read_policy_refusal_capture
+
+                end_read_policy_refusal_capture(read_refusal_token)
+                read_refusal_token = None
             result_labels = _result_labels_for_call(
                 tool_name,
                 request,
@@ -2079,6 +2116,10 @@ class BudgetGateMiddleware(AgentMiddleware):
                 end_authorized_fetch(fetch_token)
             if capture_token is not None:
                 provenance = end_protected_result_capture(capture_token)
+            if read_refusal_token is not None:
+                from ..read_policy import end_read_policy_refusal_capture
+
+                policy_refusal = end_read_policy_refusal_capture(read_refusal_token)
         is_error = _result_is_error(result)
         if not is_error:
             _record_tool_outcome(tool_name)
@@ -2092,6 +2133,7 @@ class BudgetGateMiddleware(AgentMiddleware):
             authorization,
             result=result,
             provenance=provenance,
+            policy_refusal=policy_refusal,
             failed=is_error,
         )
         _merge_result_labels(auth_context, result_labels)

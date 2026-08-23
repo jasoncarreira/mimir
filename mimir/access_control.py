@@ -61,6 +61,7 @@ HTTP_EVENT_INGRESS_EXTRA_KEY = "_mimir_event_ingress"
 if TYPE_CHECKING:
     from .identities import IdentityResolver
     from .models import AgentEvent, AuthContext, InformationFlowLabels, SourceLabel
+    from .tools.refusals import ToolPolicyRefusal
 
 log = logging.getLogger(__name__)
 
@@ -7958,6 +7959,19 @@ def _incomplete_protected_result(
     ))
 
 
+def _result_matches_policy_refusal(result: Any, refusal: "ToolPolicyRefusal") -> bool:
+    """Return whether the model-visible result contains only this typed refusal."""
+    from langchain_core.messages import ToolMessage
+
+    if not isinstance(result, ToolMessage) or getattr(result, "status", None) != "error":
+        return False
+    content = getattr(result, "content", None)
+    if not isinstance(content, str):
+        return False
+    refusal_text = str(refusal)
+    return content in {refusal_text, f"Error: {refusal_text}"}
+
+
 def classify_protected_result(
     tool_name: str,
     arguments: dict[str, Any] | None,
@@ -7966,6 +7980,7 @@ def classify_protected_result(
     *,
     result: Any = None,
     provenance: ProtectedResultProvenance | None = None,
+    policy_refusal: ToolPolicyRefusal | None = None,
     failed: bool = False,
 ) -> "InformationFlowLabels | None":
     """Return server-authoritative labels for content a protected call may expose.
@@ -7976,6 +7991,16 @@ def classify_protected_result(
     fails closed at every egress gate.
     """
     from .models import InformationFlowLabels, SourceLabel
+
+    artifact = getattr(result, "artifact", None)
+    if provenance is None and isinstance(artifact, ProtectedResultProvenance):
+        provenance = artifact
+    if (
+        policy_refusal is not None
+        and provenance is None
+        and _result_matches_policy_refusal(result, policy_refusal)
+    ):
+        return None
 
     args = arguments or {}
     if tool_name in {
@@ -8083,10 +8108,6 @@ def classify_protected_result(
         ))
         channel = getattr(auth_context, "channel_id", None)
         return labels.with_channel(channel) if channel else labels
-
-    artifact = getattr(result, "artifact", None)
-    if provenance is None and isinstance(artifact, ProtectedResultProvenance):
-        provenance = artifact
 
     domain = _PROTECTED_RESULT_DOMAINS.get(tool_name)
     if domain is None:
