@@ -1509,6 +1509,13 @@ print(json.dumps({
     assert len(enq2.events) == 1
     assert "cap=45" in enq2.events[0].content
 
+    # Fractional timeouts must survive: `str(int(timeout))` turned 0.5 into "0",
+    # so a poller sizing deadlines from this would have read a cap of zero.
+    enq3 = _CapturingEnqueue()
+    await run_poller(cfg, enqueue=enq3, home=home, timeout=0.5)
+    assert len(enq3.events) == 1
+    assert "cap=0.5" in enq3.events[0].content
+
 
 @pytest.mark.asyncio
 async def test_run_poller_mimir_home_falls_back_to_install_layout(
@@ -2691,13 +2698,15 @@ def test_poller_timeout_constant_reasonable():
 
 
 def test_poller_timeout_stays_below_every_shipped_cadence():
-    """The invariant the constant's value actually has to satisfy.
+    """Sanity check on the *bundled* manifests only.
 
-    Jobs register with ``max_instances=1``, so a cap longer than a poller's fire
-    interval means a slow run silently swallows the next fire. Asserting the
-    number alone would not catch that; this computes each shipped poller's real
-    period from its own cron expression, so it fails if the cap is raised too far
-    *or* if a fast-firing poller is added later.
+    This is deliberately not the enforcement: pollers are discovered from
+    ``<home>/skills/**/pollers.json`` and ``pollers-overrides.yaml`` can replace
+    a cron, so a locally installed or overridden fast poller would never appear
+    here. The runtime constraint is enforced per poller at fire time — see
+    ``Scheduler._effective_poller_timeout`` and its tests in test_scheduler.py.
+    Kept because it catches the common case (someone adds a fast shipped poller)
+    directly in this repo.
     """
     from datetime import datetime, timezone
 

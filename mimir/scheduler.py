@@ -66,6 +66,7 @@ from .quota_windows import provider_store_keys
 from .models import AgentEvent
 from .pollers import (
     POLLER_CHANNEL_PREFIX,
+    POLLER_TIMEOUT_SECONDS,
     PollerConfig,
     discover_pollers,
     forget_circuit_breakers_except,
@@ -77,6 +78,16 @@ from .saga_client import SagaClient, SagaError
 log = logging.getLogger(__name__)
 
 UTC = timezone.utc
+
+#: Headroom between a poller's subprocess timeout and its own fire interval.
+#: Jobs register with ``max_instances=1``, so a run that spans the next fire
+#: makes APScheduler skip it. Keeping the timeout strictly under the cadence
+#: means a slow run degrades into a late result rather than a lost tick.
+POLLER_CADENCE_MARGIN_SECONDS = 10.0
+#: How many successive fires to sample when measuring a cadence. Cron can be
+#: irregular (``0 9,10 * * *`` alternates 1h and 23h), so the *minimum* gap is
+#: the constraint, not the first one.
+POLLER_CADENCE_SAMPLES = 5
 
 
 def _loop_stall_alert_threshold() -> float:
@@ -2118,9 +2129,65 @@ class Scheduler:
                 budget_exceeded["stage"] = "post_acquire"
                 await log_event("poller_budget_suppressed", **budget_exceeded)
                 return
-            await run_poller(poller, enqueue=self._enqueue, home=self._home)
+            await run_poller(
+                poller,
+                enqueue=self._enqueue,
+                home=self._home,
+                timeout=await self._effective_poller_timeout(poller),
+            )
         finally:
             self._poller_semaphore.release()
+
+    def _poller_cadence_seconds(self, poller: PollerConfig) -> float | None:
+        """Shortest gap between this poller's successive fires, or None.
+
+        Measured from the poller's *effective* cron — the one it was registered
+        with, after ``pollers-overrides.yaml`` — so a locally installed or
+        overridden poller is covered too. Scanning the repo's bundled manifests
+        would miss both.
+        """
+        try:
+            trigger = CronTrigger.from_crontab(
+                _cron_with_standard_dow(poller.cron), timezone=self._tz,
+            )
+        except Exception:  # noqa: BLE001 — an invalid cron is reported elsewhere
+            return None
+        gaps: list[float] = []
+        previous = trigger.get_next_fire_time(None, datetime.now(self._tz))
+        for _ in range(POLLER_CADENCE_SAMPLES):
+            if previous is None:
+                break
+            nxt = trigger.get_next_fire_time(previous, previous)
+            if nxt is None:
+                break
+            gaps.append((nxt - previous).total_seconds())
+            previous = nxt
+        return min(gaps) if gaps else None
+
+    async def _effective_poller_timeout(self, poller: PollerConfig) -> float:
+        """The framework cap, clamped below this poller's own fire interval.
+
+        Enforces the constraint at registration-time rather than trusting a test
+        over bundled manifests: ``max_instances=1`` means a run longer than the
+        cadence swallows the next fire, and the cadence is only knowable from the
+        effective config.
+        """
+        cadence = await asyncio.to_thread(self._poller_cadence_seconds, poller)
+        cap = float(POLLER_TIMEOUT_SECONDS)
+        if cadence is None:
+            return cap
+        allowed = max(1.0, cadence - POLLER_CADENCE_MARGIN_SECONDS)
+        if allowed >= cap:
+            return cap
+        await log_event(
+            "poller_timeout_clamped_to_cadence",
+            poller=poller.name,
+            cron=poller.cron,
+            cadence_seconds=round(cadence, 3),
+            framework_cap_seconds=cap,
+            effective_timeout_seconds=round(allowed, 3),
+        )
+        return allowed
 
     def registered_pollers(self) -> list[str]:
         """Names of all currently-registered pollers. Used by the

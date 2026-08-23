@@ -63,9 +63,13 @@ Subprocess gets these env vars injected automatically:
   passthrough keys, plus literal ``env`` overrides from the poller's
   pollers.json entry.
 
-The 60-second timeout is hard-capped; longer-running pollers should
-either run faster or restructure as ``async-tasks``-style background
-jobs that emit on completion.
+The subprocess timeout is hard-capped at ``POLLER_TIMEOUT_SECONDS`` (120s), and
+clamped further per poller so it always stays below that poller's own fire
+interval. The effective value is exported to the child as
+``POLLER_TIMEOUT_SECONDS`` so a poller can bound its own work against the cap it
+will actually be killed at. Longer-running pollers should still run faster or
+restructure as ``async-tasks``-style background jobs that emit on completion —
+overrunning discards every event the run had already emitted.
 """
 
 from __future__ import annotations
@@ -1921,7 +1925,10 @@ async def run_poller(
     # Let a poller bound its own work against the cap it will actually be killed
     # at, rather than duplicating the constant. Injected like the vars above, so
     # it is not subject to ``pass_env`` gating.
-    env["POLLER_TIMEOUT_SECONDS"] = str(int(timeout))
+    # ``:g`` keeps whole values clean ("120") while preserving fractional ones
+    # ("0.5"). ``int()`` truncated 0.5 to "0", so a poller sizing its deadlines
+    # from this would have read a cap of zero.
+    env["POLLER_TIMEOUT_SECONDS"] = f"{float(timeout):g}"
     # Scheduler passes Config.home here. Direct test/niche callers that omit
     # it still get a deterministic home path from the install layout
     # (``<home>/skills/<skill>`` → home) rather than reading

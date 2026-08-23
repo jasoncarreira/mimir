@@ -4702,3 +4702,95 @@ def test_scheduler_job_deliver_unset_not_emitted():
     job = SchedulerJob.from_yaml_entry({"name": "t2", "prompt": "x", "cron": "0 * * * *"})
     assert job.deliver is None
     assert "deliver" not in job.to_yaml_entry()
+
+
+@pytest.mark.asyncio
+async def test_effective_poller_timeout_clamps_to_cadence(tmp_path, monkeypatch):
+    """The runtime enforcement, which a test over bundled manifests cannot give.
+
+    Pollers are discovered from ``<home>/skills/**/pollers.json`` and
+    ``pollers-overrides.yaml`` may replace a cron, so a locally installed or
+    overridden fast poller never appears in this repo. ``max_instances=1`` means a
+    run longer than the cadence swallows the next fire, so the cap is clamped per
+    poller against the cadence it was actually registered with.
+    """
+    from mimir.pollers import POLLER_TIMEOUT_SECONDS, PollerConfig
+    from mimir.scheduler import POLLER_CADENCE_MARGIN_SECONDS
+
+    async def noop(event: AgentEvent) -> bool:
+        return True
+
+    sched = Scheduler(scheduler_yaml=tmp_path / "s.yaml", enqueue=noop)
+    events: list[tuple[str, dict]] = []
+
+    async def fake_log_event(name: str, **kw):
+        events.append((name, kw))
+
+    monkeypatch.setattr("mimir.scheduler.log_event", fake_log_event)
+
+    def cfg(cron: str) -> PollerConfig:
+        return PollerConfig(
+            name=f"p-{cron.replace(' ', '_')}", command="x", cron=cron,
+            env={}, skill_dir=tmp_path,
+        )
+
+    # Every minute: 60s cadence, so the 120s cap must not apply.
+    fast = await sched._effective_poller_timeout(cfg("* * * * *"))
+    assert fast == 60.0 - POLLER_CADENCE_MARGIN_SECONDS
+    assert fast < POLLER_TIMEOUT_SECONDS
+    clamped = [kw for name, kw in events if name == "poller_timeout_clamped_to_cadence"]
+    assert len(clamped) == 1, "clamping was not reported to the operator"
+    assert clamped[0]["poller"] == "p-*_*_*_*_*"
+    assert clamped[0]["cadence_seconds"] == 60.0
+
+    # Every 15 minutes: far above the cap, so the cap applies unchanged and
+    # nothing is reported.
+    events.clear()
+    slow = await sched._effective_poller_timeout(cfg("*/15 * * * *"))
+    assert slow == float(POLLER_TIMEOUT_SECONDS)
+    assert events == []
+
+
+@pytest.mark.asyncio
+async def test_effective_poller_timeout_uses_the_shortest_irregular_gap(
+    tmp_path, monkeypatch,
+):
+    """Irregular cron must be measured by its *minimum* gap.
+
+    ``0 9,10 * * *`` alternates 1h and 23h. Sampling only the first gap from
+    "now" would report 23h half the time and admit the full cap into a 1h window.
+    """
+    from mimir.pollers import PollerConfig
+    from mimir.scheduler import POLLER_CADENCE_MARGIN_SECONDS
+
+    async def noop(event: AgentEvent) -> bool:
+        return True
+
+    sched = Scheduler(scheduler_yaml=tmp_path / "s.yaml", enqueue=noop)
+    monkeypatch.setattr("mimir.scheduler.log_event", lambda *a, **k: _noop_coro())
+
+    cadence = sched._poller_cadence_seconds(PollerConfig(
+        name="irregular", command="x", cron="0 9,10 * * *",
+        env={}, skill_dir=tmp_path,
+    ))
+    assert cadence == 3600.0, f"took a gap other than the minimum: {cadence}"
+
+
+async def _noop_coro():
+    return None
+
+
+@pytest.mark.asyncio
+async def test_effective_poller_timeout_falls_back_on_unparseable_cron(tmp_path):
+    """An invalid cron must not make the timeout zero or raise — it is reported
+    elsewhere, and this path should degrade to the framework cap."""
+    from mimir.pollers import POLLER_TIMEOUT_SECONDS, PollerConfig
+
+    async def noop(event: AgentEvent) -> bool:
+        return True
+
+    sched = Scheduler(scheduler_yaml=tmp_path / "s.yaml", enqueue=noop)
+    got = await sched._effective_poller_timeout(PollerConfig(
+        name="bad", command="x", cron="not a cron", env={}, skill_dir=tmp_path,
+    ))
+    assert got == float(POLLER_TIMEOUT_SECONDS)
