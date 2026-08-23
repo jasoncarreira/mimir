@@ -247,7 +247,12 @@ async def test_fire_enqueues_scheduled_tick_event(tmp_path: Path):
     sched = Scheduler(
         scheduler_yaml=tmp_path / "s.yaml", enqueue=fake_enqueue, home=tmp_path,
     )
-    job = SchedulerJob(name="morning", prompt="review extended memory", cron="0 8 * * *")
+    job = SchedulerJob(
+        name="morning",
+        prompt="review extended memory",
+        cron="0 8 * * *",
+        deliver="slack-ops",
+    )
     await sched._fire(job=job)
 
     assert len(enqueued) == 1
@@ -262,6 +267,7 @@ async def test_fire_enqueues_scheduled_tick_event(tmp_path: Path):
     assert scheduled_tick is not None
     assert set(e.service_authority.capabilities) == set(scheduled_tick.capabilities)
     assert e.service_authority.channel_memory_directory == "scheduler:morning"
+    assert e.service_authority.configured_delivery_channel == "slack-ops"
     assert str((tmp_path / "scripts").resolve()) in e.service_authority.filesystem_read_roots
 
 

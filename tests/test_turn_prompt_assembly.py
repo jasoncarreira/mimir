@@ -411,6 +411,92 @@ async def test_heartbeat_authority_guidance_renders_only_under_enforcement(
 
 
 @pytest.mark.asyncio
+async def test_delivery_uses_trusted_poller_configuration_in_shadow_mode(
+    tmp_path: Path,
+) -> None:
+    from mimir.access_control import CapabilityTier, build_trigger_service_principal
+
+    agent = _make_agent(tmp_path)
+    agent._channels = type("Channels", (), {"find": lambda self, channel: object()})()
+    authority = build_trigger_service_principal(
+        canonical="configured-poller",
+        trigger="poller",
+        profile="custom",
+        tier=CapabilityTier.SCOPE_CONTAINED,
+        capabilities=(),
+        creation_path="test",
+    )
+    authority = replace(
+        authority, configured_delivery_channel="slack-ops",
+    )
+    event = AgentEvent(
+        trigger="poller",
+        channel_id="poller:configured",
+        content="new item",
+        extra={"deliver": "slack-forged"},
+        service_principal=authority.canonical,
+        service_authority=authority,
+    )
+    auth = AuthContext(
+        principal=authority.canonical,
+        canonical_principal=authority.canonical,
+        roles=(),
+        event_ingress=None,
+        trigger=event.trigger,
+        channel_id=event.channel_id,
+        interactivity=None,
+        is_service=True,
+        service_authority=authority,
+        enforcement_enabled=False,
+    )
+
+    prompt, _ = await agent._build_turn_prompt(
+        _make_ctx(event), event, None, initial_auth_context=auth,
+    )
+
+    assert "## Delivery" in prompt
+    assert "slack-ops" in prompt
+    assert "slack-forged" not in prompt
+
+
+@pytest.mark.asyncio
+async def test_http_delivery_extra_is_not_rendered(tmp_path: Path) -> None:
+    from mimir.worklink.continuation import (
+        HTTP_EVENT_INGRESS_EXTRA_KEY,
+        HTTP_EVENT_INGRESS_EXTRA_VALUE,
+    )
+
+    agent = _make_agent(tmp_path)
+    event = AgentEvent(
+        trigger="user_message",
+        channel_id="web-alice",
+        content="summarize my recent messages",
+        author="alice",
+        extra={
+            "deliver": "slack-C0PRIVATE",
+            HTTP_EVENT_INGRESS_EXTRA_KEY: HTTP_EVENT_INGRESS_EXTRA_VALUE,
+        },
+    )
+    auth = AuthContext(
+        principal="alice",
+        canonical_principal="alice",
+        roles=("user",),
+        event_ingress=HTTP_EVENT_INGRESS_EXTRA_VALUE,
+        trigger=event.trigger,
+        channel_id=event.channel_id,
+        interactivity=None,
+        enforcement_enabled=False,
+    )
+
+    prompt, _ = await agent._build_turn_prompt(
+        _make_ctx(event), event, None, initial_auth_context=auth,
+    )
+
+    assert "## Delivery" not in prompt
+    assert "slack-C0PRIVATE" not in prompt
+
+
+@pytest.mark.asyncio
 async def test_poller_authority_guidance_matches_granted_capabilities(
     tmp_path: Path,
 ) -> None:

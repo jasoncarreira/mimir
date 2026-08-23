@@ -332,7 +332,7 @@ def build_turn_prompt(
     # channel is already resolved by the caller (the OPERATOR_CHANNEL sentinel →
     # the operator alert channel). On a non-interactive turn, send_message
     # requires an explicit channel_id — which the instruction supplies.
-    if deliver_channel:
+    if deliver_channel and event.trigger in {"poller", "scheduled_tick"}:
         _job_kind = "poller" if event.trigger == "poller" else "scheduled tick"
         _add_labeled(
             "Delivery",
