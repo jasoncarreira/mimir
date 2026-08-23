@@ -1700,7 +1700,7 @@ async def test_project_test_snapshot_credentials_are_named_refusal(
 
 
 @pytest.mark.asyncio
-async def test_public_repo_test_credential_refusal_persists_no_sensitive_material(
+async def test_public_repo_test_credential_fault_persists_no_sensitive_material(
     repo_tools,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1736,7 +1736,7 @@ async def test_public_repo_test_credential_refusal_persists_no_sensitive_materia
     )
     assert repo_module.repo_test.coroutine is not None
     try:
-        with pytest.raises(ToolPolicyRefusal) as refusal:
+        with pytest.raises(ToolException) as refusal:
             await repo_module.repo_test.coroutine(
                 repository="owner/repo",
                 pull_request=7,
@@ -1746,6 +1746,7 @@ async def test_public_repo_test_credential_refusal_persists_no_sensitive_materia
     finally:
         event_logger._logger = previous_logger
 
+    assert not isinstance(refusal.value, ToolPolicyRefusal)
     persisted_events = event_path.read_bytes()
     event_records = [json.loads(line) for line in persisted_events.splitlines()]
     assert [(record["type"], record["reason_code"]) for record in event_records] == [
@@ -2547,7 +2548,11 @@ def test_repo_wrapper_git_stderr_redacts_embedded_remote_credential(
             self.review_state = review_state
 
         def execute(self, operation):
-            raise GitRefusal("git_failed", f"fatal: unable to access {secret_url}")
+            raise GitRefusal(
+                "git_failed",
+                f"fatal: unable to access {secret_url}",
+                execution_started=True,
+            )
 
     monkeypatch.setattr(repo_module, "_state", lambda *_args: repo_tools[-2])
     monkeypatch.setattr(repo_module, "RepoGitTools", FailingRepoGitTools)

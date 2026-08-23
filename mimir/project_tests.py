@@ -75,9 +75,16 @@ _PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 class ProjectTestRefusal(RuntimeError):
     """A named policy refusal, distinct from a red test suite."""
 
-    def __init__(self, code: str, message: str) -> None:
+    def __init__(
+        self,
+        code: str,
+        message: str,
+        *,
+        execution_started: bool = False,
+    ) -> None:
         super().__init__(message)
         self.code = code
+        self.execution_started = execution_started
 
 
 @dataclass(frozen=True)
@@ -351,12 +358,29 @@ class RepoProjectTests:
         scope = self._state.action_scope
         if RepoPRAction.TEST.value not in scope.allowed_operations:
             raise ProjectTestRefusal("scope_action_denied", "scope does not grant repo.test")
+        git_tools: RepoGitTools | None = None
         try:
-            root = RepoGitTools(self._state).validated_checkout_root()
+            git_tools = RepoGitTools(self._state)
+            root = git_tools.validated_checkout_root()
         except GitRefusal as exc:
-            raise ProjectTestRefusal(exc.code, str(exc)) from exc
-        command, configured_env, command_source = _configured_command(scope.canonical_repo)
-        selected = _validated_selectors(root, selectors)
+            raise ProjectTestRefusal(
+                exc.code,
+                str(exc),
+                execution_started=bool(
+                    git_tools is not None and git_tools.execution_started
+                ),
+            ) from exc
+        try:
+            command, configured_env, command_source = _configured_command(
+                scope.canonical_repo
+            )
+            selected = _validated_selectors(root, selectors)
+        except ProjectTestRefusal as exc:
+            raise ProjectTestRefusal(
+                exc.code,
+                str(exc),
+                execution_started=True,
+            ) from exc
         scrubber = SensitiveMaterialScrubber(
             checkout=root,
             source_paths=(os.environ.get("MIMIR_HOME", ""),),
@@ -378,6 +402,7 @@ class RepoProjectTests:
             raise ProjectTestRefusal(
                 "test_snapshot_credentials_refused",
                 "project test snapshot contains credential-like material",
+                execution_started=True,
             ) from exc
         except SnapshotEmbeddedRepository as exc:
             # Distinct from the generic branch below on purpose: this one is an
@@ -393,6 +418,7 @@ class RepoProjectTests:
             raise ProjectTestRefusal(
                 "test_snapshot_embedded_repository",
                 "project test snapshot source contains an embedded Git repository",
+                execution_started=True,
             ) from exc
         except (ContainedSnapshotError, OSError, RuntimeError, ValueError) as exc:
             await safe_log_event(
@@ -402,7 +428,9 @@ class RepoProjectTests:
                 pull_request=scope.pr_number,
             )
             raise ProjectTestRefusal(
-                "test_snapshot_unavailable", "project test snapshot is unavailable"
+                "test_snapshot_unavailable",
+                "project test snapshot is unavailable",
+                execution_started=True,
             ) from exc
 
         identifier = str(uuid.uuid4())
@@ -438,10 +466,12 @@ class RepoProjectTests:
                 raise ProjectTestRefusal(
                     "test_snapshot_cleanup_failed",
                     "project test snapshot cleanup failed",
+                    execution_started=True,
                 ) from exc
             raise ProjectTestRefusal(
                 "test_config_invalid",
                 "project test command or environment contains a controller path",
+                execution_started=True,
             )
         try:
             try:
@@ -466,6 +496,7 @@ class RepoProjectTests:
                 raise ProjectTestRefusal(
                     "test_stale_root_executor",
                     str(exc),
+                    execution_started=True,
                 ) from exc
             except (OSError, RuntimeError, ValueError) as exc:
                 diagnostic = _permission_diagnostic_from_error(exc)
@@ -480,6 +511,7 @@ class RepoProjectTests:
                     raise ProjectTestRefusal(
                         "test_path_permission_denied",
                         _permission_refusal_message(diagnostic),
+                        execution_started=True,
                     ) from exc
                 await safe_log_event(
                     "repo_test_containment_refused",
@@ -490,6 +522,7 @@ class RepoProjectTests:
                 raise ProjectTestRefusal(
                     "test_containment_unavailable",
                     "contained project test execution is unavailable",
+                    execution_started=True,
                 ) from exc
             if result.exit_code not in {None, 0}:
                 diagnostic = _permission_diagnostic_from_error(result.stderr)
@@ -504,6 +537,7 @@ class RepoProjectTests:
                     raise ProjectTestRefusal(
                         "test_path_permission_denied",
                         _permission_refusal_message(diagnostic),
+                        execution_started=True,
                     )
         finally:
             try:
@@ -518,6 +552,7 @@ class RepoProjectTests:
                 raise ProjectTestRefusal(
                     "test_snapshot_cleanup_failed",
                     "project test snapshot cleanup failed",
+                    execution_started=True,
                 ) from exc
 
         stdout = _safe_output(
@@ -552,7 +587,11 @@ class RepoProjectTests:
         if not selectors:
             head = self._state.git_expected_head
             if head is None:
-                raise ProjectTestRefusal("inactive_checkout", "the checkout has no current HEAD")
+                raise ProjectTestRefusal(
+                    "inactive_checkout",
+                    "the checkout has no current HEAD",
+                    execution_started=True,
+                )
             self._state.record_full_test(scope.scope_id, head)
         return ProjectTestResult(
             True, "tests_passed", 0, stdout, stderr, command, command_source,

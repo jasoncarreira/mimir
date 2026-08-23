@@ -37,13 +37,6 @@ from .refusals import ToolPolicyRefusal
 log = logging.getLogger(__name__)
 
 
-_GIT_EXECUTION_REFUSAL_CODES = frozenset({
-    "git_failed",
-    "invalid_git_output",
-    "output_limit",
-    "push_not_applied",
-    "timeout",
-})
 _GIT_BINDING_REFUSAL_CODES = frozenset({
     "cross_pr_checkout",
     "inactive_checkout",
@@ -53,24 +46,18 @@ _GIT_BINDING_REFUSAL_CODES = frozenset({
 _REPOSITORY_AUTHORIZATION_REFUSED = "repository_authorization_refused"
 _REPOSITORY_BINDING_INVALID = "repository_binding_invalid"
 _REPOSITORY_GIT_FAILED = "repository_git_failed"
-_PROJECT_TEST_EXECUTION_REFUSAL_CODES = frozenset({
-    "test_execution_failed",
-    "test_timeout",
-    "tests_failed",
-})
 
 
 def _tool_refusal(
     message: str,
     exc: BaseException,
     *,
-    code: str | None = None,
-    execution_codes: frozenset[str] = frozenset(),
+    execution_started: bool = False,
 ) -> ToolException:
     """Preserve pre-execution policy refusals without downgrading execution faults."""
-    if isinstance(exc, ToolPolicyRefusal) or (
-        code is not None and code not in execution_codes
-    ):
+    if isinstance(exc, ToolPolicyRefusal) and not execution_started:
+        return ToolPolicyRefusal(message)
+    if not execution_started and isinstance(exc, (GitRefusal, ProjectTestRefusal)):
         return ToolPolicyRefusal(message)
     return ToolException(message)
 
@@ -128,29 +115,36 @@ def _execute(
     pull_request: int,
     operation: Any,
 ) -> dict[str, Any]:
+    git_tools: RepoGitTools | None = None
     try:
         state = _state(runtime, repository, pull_request)
+        git_tools = RepoGitTools(
+            state,
+            enforce=_enforcement_enabled(
+                runtime,
+                repository=repository,
+                pull_request=pull_request,
+            ),
+        )
         return asdict(
-            RepoGitTools(
-                state,
-                enforce=_enforcement_enabled(
-                    runtime,
-                    repository=repository,
-                    pull_request=pull_request,
-                ),
-            ).execute(operation)
+            git_tools.execute(operation)
         )
     except (GitRefusal, ToolException, RuntimeError, ValueError) as exc:
         cause_code = getattr(exc, "code", None)
-        if isinstance(exc, ToolPolicyRefusal) or (
-            isinstance(exc, GitRefusal)
-            and cause_code not in _GIT_EXECUTION_REFUSAL_CODES | _GIT_BINDING_REFUSAL_CODES
-        ):
+        execution_started = bool(
+            getattr(exc, "execution_started", False)
+            or (git_tools is not None and getattr(git_tools, "execution_started", False))
+        )
+        if isinstance(exc, ToolPolicyRefusal):
             code = _REPOSITORY_AUTHORIZATION_REFUSED
+        elif execution_started:
+            code = _REPOSITORY_GIT_FAILED
         elif isinstance(exc, ValueError) or cause_code in _GIT_BINDING_REFUSAL_CODES or (
             isinstance(exc, ToolException) and not isinstance(exc, GitRefusal)
         ):
             code = _REPOSITORY_BINDING_INVALID
+        elif isinstance(exc, GitRefusal):
+            code = _REPOSITORY_AUTHORIZATION_REFUSED
         else:
             code = _REPOSITORY_GIT_FAILED
         cause = f" [{cause_code}]" if cause_code else ""
@@ -159,8 +153,7 @@ def _execute(
         raise _tool_refusal(
             message,
             exc,
-            code=code,
-            execution_codes=frozenset({_REPOSITORY_GIT_FAILED}),
+            execution_started=execution_started,
         ) from None
 
 
@@ -187,7 +180,7 @@ def repo_checkout(
         )
     except (OSError, RuntimeError, ValueError) as exc:
         detail = _redact_git_output(str(exc))
-        raise ToolPolicyRefusal(f"repository checkout rejected: {detail}") from exc
+        raise ToolException(f"repository checkout rejected: {detail}") from exc
     return {
         "status": "resumed" if candidates else "checked_out",
         "path": str(lease.path),
@@ -212,7 +205,7 @@ def repo_cleanup(
         removed = cleanup_pr_checkout_lease(lease, review_state=state)
     except (OSError, RuntimeError, ValueError) as exc:
         detail = _redact_git_output(str(exc))
-        raise ToolPolicyRefusal(f"repository cleanup rejected: {detail}") from exc
+        raise ToolException(f"repository cleanup rejected: {detail}") from exc
     return {"status": "cleaned", "removed": removed, "scope_id": state.action_scope.scope_id}
 
 
@@ -254,8 +247,7 @@ async def repo_test(
         raise _tool_refusal(
             message,
             exc,
-            code=code,
-            execution_codes=_PROJECT_TEST_EXECUTION_REFUSAL_CODES,
+            execution_started=bool(getattr(exc, "execution_started", False)),
         ) from exc
 
 

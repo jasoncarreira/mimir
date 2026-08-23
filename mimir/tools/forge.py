@@ -284,7 +284,7 @@ def resolve_review_state_for_context(
         )
         if isinstance(cache, ServerDiscoveredPRStates):
             cache.remember_refusal(repository, pull_request, stale_refusal)
-        raise ToolPolicyRefusal(stale_refusal)
+        raise ToolException(stale_refusal)
     if (
         context is None
         or context.trigger != "user_message"
@@ -344,7 +344,7 @@ def resolve_review_state_for_context(
         or scope.canonical_repo != repository.lower()
         or scope.pr_number != pull_request
     ):
-        raise ToolPolicyRefusal(resolution.refusal_reason or (
+        raise ToolException(resolution.refusal_reason or (
             "pull-request operation rejected: live pull request is closed or invalid"
         ))
     state = RepoReviewState(scope)
@@ -376,7 +376,7 @@ def revalidate_review_head_for_context(
         or snapshot.state != "open"
         or snapshot.head_sha.lower() != scope.observed_head_sha
     ):
-        raise ToolPolicyRefusal(
+        raise ToolException(
             "pull-request operation rejected: pull request head advanced after scope issuance"
         )
 
@@ -539,7 +539,7 @@ def _call(operation: Any) -> Any:
 
         if isinstance(exc, GitHubIdentityVerificationError):
             _latch_github_identity_degraded(exc)
-            raise ToolPolicyRefusal(
+            raise ToolException(
                 f"coding capability disabled: GitHub identity verification failed: {exc}"
             ) from exc
         # The adapter may have contacted the forge before failing, so this is a

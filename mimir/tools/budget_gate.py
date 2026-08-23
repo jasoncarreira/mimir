@@ -1665,18 +1665,10 @@ class BudgetGateMiddleware(AgentMiddleware):
                 )
         direct_argv = execution_request.tool_call.get("args", {}).get("mimir_direct_argv")
         direct_argv_token = None
-        from .github_review_guard import (
-            claim_review_submission,
-            review_submission_from_request,
-        )
+        from .github_review_guard import review_submission_from_request
 
         review_spec = review_submission_from_request(execution_request)
-        review_claim = claim_review_submission(review_spec) if review_spec is not None else None
-        if review_claim is not None and review_claim.duplicate:
-            review_claim.release()
-            result = _duplicate_review_result(request, review_claim)
-            _emit_tool_call_sync(tool_name, ok=True, duration_ms=(time.monotonic() - started) * 1000.0)
-            return result
+        review_claim = None
         capture_token = None
         provenance = None
         read_refusal_token = None
@@ -1699,6 +1691,23 @@ class BudgetGateMiddleware(AgentMiddleware):
             from ..read_policy import begin_read_policy_refusal_capture
 
             read_refusal_token = begin_read_policy_refusal_capture()
+            from .github_review_guard import (
+                claim_review_submission,
+            )
+
+            review_claim = (
+                claim_review_submission(review_spec)
+                if review_spec is not None
+                else None
+            )
+            if review_claim is not None and review_claim.duplicate:
+                result = _duplicate_review_result(request, review_claim)
+                _emit_tool_call_sync(
+                    tool_name,
+                    ok=True,
+                    duration_ms=(time.monotonic() - started) * 1000.0,
+                )
+                return result
             authorized_fetch_urls = _authorized_fetch_urls_for_tool(
                 tool_name, auth_context, _extract_sink_target(request, auth_context),
             )
@@ -1999,24 +2008,10 @@ class BudgetGateMiddleware(AgentMiddleware):
                 )
         direct_argv = execution_request.tool_call.get("args", {}).get("mimir_direct_argv")
         direct_argv_token = None
-        from .github_review_guard import (
-            claim_review_submission,
-            review_submission_from_request,
-        )
+        from .github_review_guard import review_submission_from_request
 
         review_spec = review_submission_from_request(execution_request)
-        review_claim = (
-            await _claim_review_submission_async(
-                lambda: claim_review_submission(review_spec)
-            )
-            if review_spec is not None
-            else None
-        )
-        if review_claim is not None and review_claim.duplicate:
-            review_claim.release()
-            result = _duplicate_review_result(request, review_claim)
-            _emit_tool_call_sync(tool_name, ok=True, duration_ms=(time.monotonic() - started) * 1000.0)
-            return result
+        review_claim = None
         capture_token = None
         provenance = None
         read_refusal_token = None
@@ -2039,6 +2034,25 @@ class BudgetGateMiddleware(AgentMiddleware):
             from ..read_policy import begin_read_policy_refusal_capture
 
             read_refusal_token = begin_read_policy_refusal_capture()
+            from .github_review_guard import (
+                claim_review_submission,
+            )
+
+            review_claim = (
+                await _claim_review_submission_async(
+                    lambda: claim_review_submission(review_spec)
+                )
+                if review_spec is not None
+                else None
+            )
+            if review_claim is not None and review_claim.duplicate:
+                result = _duplicate_review_result(request, review_claim)
+                _emit_tool_call_sync(
+                    tool_name,
+                    ok=True,
+                    duration_ms=(time.monotonic() - started) * 1000.0,
+                )
+                return result
             authorized_fetch_urls = _authorized_fetch_urls_for_tool(
                 tool_name, auth_context, _extract_sink_target(request, auth_context),
             )
