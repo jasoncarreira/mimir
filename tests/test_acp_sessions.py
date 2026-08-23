@@ -19,7 +19,7 @@ from mimir.agent import _initialize_ifc_labels
 from mimir.acp.journal import JournalLease
 from mimir.acp.updates import UpdateDispatcher
 from mimir.models import InformationFlowState, TurnInteractivity
-from mimir.tools.client_provider import MIMIR_HANDS_V1, PermissionDecision, PermissionEligibility, get_turn_capability_context, hands_edit
+from mimir.tools.client_provider import MIMIR_HANDS_V1, PermissionDecision, PermissionEligibility, get_turn_capability_context, hands_edit, hands_shell
 from mimir.channel_registry import ChannelRegistry
 from mimir.identities import IdentityResolver, hash_web_key
 from mimir.turn_event_bus import TurnEventBus
@@ -313,6 +313,119 @@ async def test_prompt_auth_context_is_scoped_to_the_session_channel(
             interactivity=TurnInteractivity.NON_INTERACTIVE,
         ),
     ) is False
+
+
+@pytest.mark.asyncio
+async def test_authenticated_acp_hands_shell_reaches_execution_after_permission(
+    tmp_path: Path,
+) -> None:
+    """The authenticated ACP carrier survives every gate before hands execution.
+
+    ``ActivePrompt.request_permission`` is live for hands calls. Its ordinary
+    success path snapshots the matching public tool call, asks the ACP client,
+    receives ``allow_once``, and only then lets ``wrap_tool_call`` invoke the
+    hands provider. Missing/stale prompt state, cancellation, snapshot mismatch,
+    missing peer, transport error, or any non-allow client answer fail closed.
+    """
+    from langchain.agents.middleware import ToolCallRequest
+    from langchain_core.messages import ToolMessage
+    from langgraph.runtime import Runtime
+
+    from mimir.tools.budget_gate import BudgetGateMiddleware
+
+    bundle, core = _bundle(tmp_path)
+    agent = MimirAcpAgent(bundle)
+
+    class PermissionClient(McpClient):
+        def __init__(self) -> None:
+            super().__init__()
+            self.permission_snapshots: list[Any] = []
+
+        async def request_tool_permission(self, session_id: str, snapshot: Any) -> Any:
+            self.permission_snapshots.append(snapshot)
+            return sdk.PermissionCompletion("allow_once")
+
+        async def message_mcp(
+            self, connection_id: str, method: str, params: Any = None,
+        ) -> Any:
+            if method == "tools/call":
+                self.messages.append((connection_id, method, params))
+                assert params["name"] == "shell"
+                assert params["arguments"] == {"command": "printf ok"}
+                assert isinstance(params.get("_meta", {}).get("progressToken"), str)
+                return {
+                    "content": [{"type": "text", "text": "ok"}],
+                    "structuredContent": {"stdout": "ok", "stderr": "", "exitCode": 0},
+                }
+            return await super().message_mcp(connection_id, method, params)
+
+    client = PermissionClient()
+    agent.on_connect(client)
+    await agent.authenticate("mimir-web-key", **{"mimir.webKey": "secret"})
+    session_id = (await agent.new_session("/one", mcp_servers=_hands("server"))).session_id
+
+    async def integrated_turn(event: Any, **kwargs: Any) -> None:
+        bound_auth = event.continuation_auth_context
+        assert bound_auth is not None
+        labels = _initialize_ifc_labels(
+            event, event.attachment_names, resolver=bundle.core.identity_resolver,
+        )
+        auth = dataclasses.replace(
+            bound_auth,
+            interactivity=TurnInteractivity.INTERACTIVE,
+            ifc_labels=labels,
+            ifc_state=InformationFlowState(labels=labels),
+            saga_session_id=kwargs["saga_session_id"],
+        )
+        turn_id = kwargs["turn_id"]
+        active = agent._active_prompts[session_id]
+        queue = bundle.turn_event_bus._exact_turn_subscribers[turn_id]
+        arguments = {"command": "printf ok"}
+        bundle.turn_event_bus.publish({
+            "turn_id": turn_id, "channel_id": event.channel_id, "seq": 1,
+            "ts": "now", "type": "tool_call", "phase": "start",
+            "id": "shell-1", "tool_name": "hands_shell", "args": arguments,
+        })
+        await queue.join()
+        await active.dispatcher.drain()
+        request = ToolCallRequest(
+            tool_call={
+                "name": "hands_shell", "args": arguments,
+                "id": "shell-1", "type": "tool_call",
+            },
+            tool=None, state=None, runtime=Runtime(context=auth),
+        )
+
+        async def handler(call: ToolCallRequest) -> ToolMessage:
+            result = await hands_shell.ainvoke(call.tool_call["args"])
+            return ToolMessage(
+                content=json.dumps(result), tool_call_id="shell-1", name="hands_shell",
+            )
+
+        result = await BudgetGateMiddleware().awrap_tool_call(request, handler)
+        assert result.status != "error", result.content
+        assert json.loads(str(result.content)) == {
+            "stdout": "ok", "stderr": "", "exitCode": 0,
+        }
+
+    core.run_turn = integrated_turn
+    prompt = asyncio.create_task(
+        agent.prompt(session_id, [sdk.TextContentBlock(type="text", text="run shell")]),
+    )
+    for _ in range(100):
+        if client.permission_snapshots:
+            break
+        await asyncio.sleep(0.01)
+    assert client.permission_snapshots
+    response = await prompt
+
+    assert response.stop_reason == "end_turn"
+    assert len(client.permission_snapshots) == 1
+    snapshot = client.permission_snapshots[0]
+    assert snapshot.tool_call_id == "shell-1"
+    assert snapshot.title == "hands_shell"
+    assert snapshot.raw_input == {"command": "printf ok"}
+    assert any(method == "tools/call" for _connection, method, _params in client.messages)
 
 
 async def test_cancelled_bound_turn_terminalizes_open_tools(tmp_path: Path) -> None:
