@@ -612,10 +612,19 @@ content verbatim into acceptance criteria.
   default `normal`, configurable — so worker launches shed under TIGHT
   with everything else. Operator-invoked `mimir worklink run` always
   proceeds.
-- **Events.** `worklink_claimed`, `worklink_evidence`,
-  `worklink_transition`, `worklink_attempts_exhausted` land in
-  events.jsonl with feedback rules (attempts-exhausted negative), so
-  the agent sees its delegated work's health in the algedonic block.
+- **Events.** Leaf and epic runs share `worklink_autonomous_refused`,
+  `worklink_attempts_exhausted`, `worklink_claim_failed`, `worklink_claimed`,
+  `worklink_transition`, and `worklink_run_failed`. Epic-only admission failures
+  (a non-epic issue or an unavailable base branch) use
+  `worklink_epic_refused`. Leaf runs additionally emit `worklink_evidence` after
+  their controller evidence pass; epic runs deliberately do not duplicate that
+  event because feature-factory owns its staged evidence lifecycle and the epic
+  controller emits the terminal transition after completion verification. All
+  transition events carry `status`, `review_ready`, and `pr_url`. These events
+  land in events.jsonl with feedback rules (attempts-exhausted negative), so the
+  agent sees its delegated work's health in the algedonic block. Existing event
+  consumers match event names and read only their required fields; the optional
+  `reason` added to epic refusal and transition records is additive.
 - **Tool-pin inventory (external-toolchain drift).** `worklink.yaml`
   may carry deployment-specific `tool_pins:`, but the source-controlled
   seed inventory lives in `mimir.worklink.tool_pins.DEFAULT_TOOL_PINS`.
