@@ -195,7 +195,7 @@ def _make_faiss_search_fn(
     """
 
     def _fn(query_emb: list[float], top_k: int) -> list[tuple[str, float]]:
-        if index is None:
+        if index is None or not query_emb:
             return []
         if read_authorization is not None and not read_authorization.enforcement_enabled:
             return index.search(query_emb, top_k=top_k)

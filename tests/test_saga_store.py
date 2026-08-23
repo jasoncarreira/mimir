@@ -202,6 +202,29 @@ async def test_client_query_returns_two_tier_shape(client, monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_query_falls_back_to_fts_when_query_embedding_is_empty(
+    client, monkeypatch,
+):
+    _patch_provider(monkeypatch)
+    stored = await client.store("Alice prefers concise replies")
+    assert client.connection().execute("SELECT COUNT(*) FROM embeddings").fetchone()[0] == 1
+
+    monkeypatch.setattr("mimir.saga.client._query_embed_sync", lambda _query: [])
+
+    def unexpected_vector_search(*args, **kwargs):
+        raise AssertionError("empty query embedding reached VectorIndex.search")
+
+    monkeypatch.setattr(
+        "mimir.saga.vector_index.VectorIndex.search", unexpected_vector_search
+    )
+
+    result = await client.query("Alice concise replies", top_k=5, auth_context=ADMIN_SCOPE)
+
+    returned_ids = [item["id"] for item in result["observations"] + result["raws"]]
+    assert stored["atom_id"] in returned_ids
+
+
+@pytest.mark.asyncio
 async def test_query_enables_session_boundary_rrf_by_default(tmp_path, monkeypatch):
     _patch_provider(monkeypatch, enable_session_boundary_rrf=True)
     client = SagaStore(db_path=tmp_path / "mimir.saga.db", embedding_dim=4)

@@ -347,14 +347,23 @@ class VectorIndex:
     def search(self, query_vec, top_k: int = 20) -> list[tuple[str, float]]:
         """Return up to ``top_k`` ``(atom_id, cosine_similarity)`` matches.
 
-        Empty list if the index is missing, empty, or FAISS unavailable —
-        callers must be tolerant (recall.py treats empty FAISS results
-        as "no semantic candidates" and falls back to FTS5).
+        Empty list if the query vector is malformed, the index is missing or
+        empty, or FAISS is unavailable — callers must be tolerant (recall.py
+        treats empty FAISS results as "no semantic candidates" and falls back
+        to FTS5).
         """
         if not FAISS_AVAILABLE:
             return []
 
-        q = np.array(query_vec, dtype=np.float32).reshape(1, -1)
+        if query_vec is None:
+            return []
+        try:
+            q = np.asarray(query_vec, dtype=np.float32).reshape(-1)
+        except (TypeError, ValueError):
+            return []
+        if q.size != self.dimension:
+            return []
+        q = q.reshape(1, -1)
         faiss.normalize_L2(q)
 
         # chainlink #319: hold the lock for the WHOLE read. The emptiness

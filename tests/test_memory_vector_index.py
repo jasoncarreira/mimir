@@ -155,6 +155,16 @@ def test_search_unbuilt_index_returns_empty():
     assert results == []
 
 
+@pytest.mark.parametrize("query_vec", [[], [1.0, 0.0], [1.0, 0.0, 0.0, 0.0]])
+def test_search_rejects_malformed_query_vector_with_populated_index(conn, query_vec):
+    _insert_atom_with_embedding(conn, "a1", "alpha", [1.0, 0.0, 0.0])
+    idx = VectorIndex(dimension=3)
+    idx.build_from_db(conn)
+
+    assert idx.total_vectors == 1
+    assert idx.search(query_vec, top_k=5) == []
+
+
 # ─── incremental add ─────────────────────────────────────────────────
 
 
