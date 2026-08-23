@@ -830,6 +830,9 @@ class SagaStore:
         session_boundary_atoms_per_session: int | None = None,
         auth_context: Any = None,
     ) -> dict[str, Any]:
+        from ._config_io import get_config
+
+        cfg = get_config()
         # Three paths into the rewrite:
         # 1. Caller pre-resolved the rewrite via ``contextual_rewrite()``
         #    and passes ``pre_rewritten_query`` — we skip the inline
@@ -848,10 +851,8 @@ class SagaStore:
         #    toml flag through every call site. Bench / test code can
         #    force-off by passing ``enable_contextual_rewrite=False``.
         if enable_contextual_rewrite is None:
-            from ._config_io import get_config
-
             enable_contextual_rewrite = bool(
-                get_config()("retrieval", "enable_contextual_rewrite", False)
+                cfg("retrieval", "enable_contextual_rewrite", False)
             )
         # Surface the precedence ambiguity so a future call site that
         # sets both kwargs gets a log line — the pre-resolved path
@@ -878,11 +879,16 @@ class SagaStore:
 
         read_authorization = SagaReadAuthorization(auth_context, "query")
 
-        cfg = None
-        if enable_session_boundary_rrf is None:
-            from ._config_io import get_config
+        confidence_gating_enabled = bool(
+            cfg("retrieval", "enable_confidence_gating", True)
+        )
+        effective_min_confidence_tier = None
+        if confidence_gating_enabled:
+            effective_min_confidence_tier = min_confidence_tier or str(
+                cfg("retrieval", "default_min_confidence_tier", "low")
+            )
 
-            cfg = get_config()
+        if enable_session_boundary_rrf is None:
             enable_session_boundary_rrf = bool(
                 cfg("retrieval", "enable_session_boundary_rrf", True)
             )
@@ -905,10 +911,6 @@ class SagaStore:
             )
         )
         if should_add_boundary_pathway:
-            if cfg is None:
-                from ._config_io import get_config
-
-                cfg = get_config()
             boundary_limit = int(
                 session_boundary_limit
                 if session_boundary_limit is not None
@@ -994,7 +996,7 @@ class SagaStore:
                 session_id=session_id,
                 agent_id=self._agent_id,
                 reference_date=reference_date,
-                min_confidence_tier=min_confidence_tier,
+                min_confidence_tier=effective_min_confidence_tier,
                 fire_access_events=False,
                 auth_context=auth_context,
                 read_authorization=read_authorization,

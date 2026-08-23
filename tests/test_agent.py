@@ -271,13 +271,16 @@ class _FakeSaga:
     async def query(
         self, content: str, *, top_k: int = 12,
         session_id: str | None = None,
+        min_confidence_tier: str | None = None,
         context: list[dict[str, str]] | None = None,
         **_ignored: object,
     ):
         self.query_calls.append(
             {
                 "content": content, "top_k": top_k,
-                "session_id": session_id, "context": context,
+                "session_id": session_id,
+                "min_confidence_tier": min_confidence_tier,
+                "context": context,
             },
         )
         return {"atoms": self._hits, "triples": self._triples}
@@ -776,7 +779,10 @@ def test_agent_wires_resolved_provider_into_budget_arbiter(
     assert agent._arbiter.active_quota_providers == ("openai",)
 
 
-async def test_run_turn_writes_record_with_extracted_events(tmp_path: Path):
+async def test_run_turn_writes_record_with_extracted_events(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setenv("MIMIR_SAGA_PRE_MSG_MIN_TIER", "medium")
     fake_agent = _FakeAgent(response_messages=[
         AIMessage(
             content="Stored.",
@@ -810,6 +816,7 @@ async def test_run_turn_writes_record_with_extracted_events(tmp_path: Path):
     # SAGA was queried with the user content
     assert len(fake_saga.query_calls) == 1
     assert fake_saga.query_calls[0]["content"] == "store my favorite color"
+    assert fake_saga.query_calls[0]["min_confidence_tier"] == "medium"
 
     # The pre-message memory block landed in the prompt to the agent
     invocation = fake_agent.invocations[0]
