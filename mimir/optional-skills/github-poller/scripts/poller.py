@@ -284,7 +284,11 @@ def _truncate_here(
     if tick_budget is None:
         return False
     if tick_budget.hard_exhausted():
-        tick_budget.hard_truncated = True
+        # Deliberately does not set ``hard_truncated``: these passes defer a
+        # skipped PR through their own dedupe cursor (a preserved prior entry,
+        # or ``collection_complete=False``), so the global ``last_checked``
+        # watermark can still advance. Only the since-based passes, which have
+        # no per-item state to defer into, need it held.
         tick_budget.note_truncation(pass_name, 1)
         return True
     if reconciled < PR_RECONCILE_MIN_PER_PASS:

@@ -1154,7 +1154,10 @@ def test_hard_deadline_overrides_the_minimum_floor():
     spent_hard = poller.TickBudget(deadline_seconds=0.0, hard_deadline_seconds=0.0)
     # Hard-exhausted: truncates immediately, floor or not.
     assert poller._truncate_here(spent_hard, 0, "changes_requested") is True
-    assert spent_hard.hard_truncated is True
+    # ...but does NOT freeze the watermark. These passes defer through their own
+    # dedupe cursor, so holding `last_checked` here would stop the since-window
+    # advancing on every busy tick — a slow-motion version of #1433.
+    assert spent_hard.hard_truncated is False
 
 
 def test_hard_stop_has_no_floor_and_marks_the_tick():
