@@ -7690,34 +7690,81 @@ class ProtectedResultProvenance:
     sources: tuple["SourceLabel", ...]
 
 
-_protected_result_provenance: ContextVar[ProtectedResultProvenance | None] = ContextVar(
+@dataclass
+class _ProtectedResultCapture:
+    """One tool call's thread-safe, context-propagating provenance window."""
+
+    sources: list["SourceLabel"] = field(default_factory=list)
+    seen: set["SourceLabel"] = field(default_factory=set)
+    published: bool = False
+    invalid: bool = False
+    closed: bool = False
+    lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
+
+
+_ProtectedResultState = ProtectedResultProvenance | _ProtectedResultCapture | None
+
+
+_protected_result_provenance: ContextVar[_ProtectedResultState] = ContextVar(
     "protected_result_provenance", default=None,
 )
 
 
-def begin_protected_result_capture() -> Token[ProtectedResultProvenance | None]:
+def begin_protected_result_capture() -> Token[_ProtectedResultState]:
     """Start an isolated result-provenance capture around one tool execution."""
-    return _protected_result_provenance.set(None)
+    return _protected_result_provenance.set(_ProtectedResultCapture())
 
 
 def publish_protected_result(sources: tuple["SourceLabel", ...]) -> None:
-    """Publish exact server-derived sources, including an authoritative empty set."""
+    """Accumulate exact sources in this capture, including authoritative empty."""
     from .models import SourceLabel
 
     if not isinstance(sources, tuple) or not all(
         isinstance(source, SourceLabel) for source in sources
     ):
         raise TypeError("protected result provenance must be a tuple of SourceLabel")
+    capture = _protected_result_provenance.get()
+    if isinstance(capture, _ProtectedResultCapture):
+        with capture.lock:
+            if capture.closed:
+                return
+            capture.published = True
+            for source in sources:
+                if source not in capture.seen:
+                    capture.seen.add(source)
+                    capture.sources.append(source)
+        return
     _protected_result_provenance.set(ProtectedResultProvenance(sources))
 
 
+def invalidate_protected_result_capture() -> None:
+    """Mark the active capture incomplete so partial sources are not authoritative."""
+    capture = _protected_result_provenance.get()
+    if isinstance(capture, _ProtectedResultCapture):
+        with capture.lock:
+            if not capture.closed:
+                capture.invalid = True
+        return
+    _protected_result_provenance.set(None)
+
+
 def end_protected_result_capture(
-    token: Token[ProtectedResultProvenance | None],
+    token: Token[_ProtectedResultState],
 ) -> ProtectedResultProvenance | None:
     """Return the captured provenance and restore any enclosing capture."""
     captured = _protected_result_provenance.get()
+    if isinstance(captured, _ProtectedResultCapture):
+        with captured.lock:
+            captured.closed = True
+            result = (
+                ProtectedResultProvenance(tuple(captured.sources))
+                if captured.published and not captured.invalid
+                else None
+            )
+    else:
+        result = captured
     _protected_result_provenance.reset(token)
-    return captured
+    return result
 
 
 def protected_result_source(
