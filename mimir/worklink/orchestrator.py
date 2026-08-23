@@ -2172,7 +2172,7 @@ def _verify_factory_recovery_binding(
 
 
 def _create_factory_sandbox(record: FactoryRunRecord, lease: CheckoutLease) -> Path:
-    """Create a validated factory sandbox owned by the controller process."""
+    """Create the parent for a validated sandbox that the factory will create."""
     sandbox = Path(record.sandbox)
     root = lease.path / ".factory-sandboxes"
     if sandbox != root / record.run_id:
@@ -2180,7 +2180,8 @@ def _create_factory_sandbox(record: FactoryRunRecord, lease: CheckoutLease) -> P
     if lease.path.is_symlink() or root.is_symlink() or sandbox.is_symlink():
         raise WorklinkError("factory sandbox path may not be a symlink")
     root.mkdir(mode=0o700, exist_ok=True)
-    sandbox.mkdir(mode=0o700, exist_ok=True)
+    if sandbox.exists():
+        raise WorklinkError(f"factory sandbox already exists: {sandbox}")
     return sandbox
 
 
