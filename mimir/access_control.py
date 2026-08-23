@@ -7095,7 +7095,11 @@ def _operator_can_invoke_admin_shell(
     ifc_labels: Any,
     auth_context: "AuthContext | None",
 ) -> bool:
-    """Admit shell only for an authenticated human on their live bridge turn."""
+    """Widen ``shell_exec`` to authenticated users on their live bridge turn.
+
+    Admin-only tools, including ``hands_shell``, use the ordinary admin-role
+    authorization path instead of this user-level shell exception.
+    """
     roles = (getattr(auth_context, "roles", ()) or ()) if auth_context else ()
     return (
         tool_name == "shell_exec"

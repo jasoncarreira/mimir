@@ -12,10 +12,13 @@ import yaml
 
 import mimir
 import mimir.acp.agent as agent_module
+from mimir.access_control import SinkGate
 from mimir.acp import sdk
 from mimir.acp.agent import ActivePrompt, MimirAcpAgent
+from mimir.agent import _initialize_ifc_labels
 from mimir.acp.journal import JournalLease
 from mimir.acp.updates import UpdateDispatcher
+from mimir.models import InformationFlowState, TurnInteractivity
 from mimir.tools.client_provider import MIMIR_HANDS_V1, PermissionDecision, PermissionEligibility, get_turn_capability_context, hands_edit
 from mimir.channel_registry import ChannelRegistry
 from mimir.identities import IdentityResolver, hash_web_key
@@ -269,6 +272,47 @@ async def test_prompt_auth_context_is_scoped_to_the_session_channel(
     assert context.audience_provider.audience_for(
         context.channel_id, principal="operator",
     ) == frozenset({"operator"})
+
+    labels = _initialize_ifc_labels(
+        event, resolver=agent._bundle.core.identity_resolver,
+    )
+    turn_context = dataclasses.replace(
+        context,
+        interactivity=TurnInteractivity.INTERACTIVE,
+        ifc_labels=labels,
+        ifc_state=InformationFlowState(labels=labels),
+    )
+    assert labels.sources
+    assert SinkGate._is_trusted_operator_turn(labels, turn_context) is True
+    assert SinkGate._is_admin_operator_turn(labels, turn_context) is True
+
+    shell = SinkGate.check_sink_flow(
+        "hands_shell", "git status", labels, turn_context, enforce=True,
+    )
+    file = SinkGate.check_sink_flow(
+        "write_file", "/workspace/notes.txt", labels, turn_context, enforce=True,
+    )
+    assert shell.allowed is True, shell.reason
+    assert file.allowed is True, file.reason
+
+    # Both fields independently fail closed. Non-None ingress values are
+    # server-owned HTTP markers today, but arbitrary marked bridge values must
+    # retain the same verdict; pollers also fail on their non-user trigger.
+    assert SinkGate._is_trusted_operator_turn(
+        labels, dataclasses.replace(turn_context, trigger="acp_authenticate"),
+    ) is False
+    for ingress in ("acp", "http_event", "bridge"):
+        assert SinkGate._is_trusted_operator_turn(
+            labels, dataclasses.replace(turn_context, event_ingress=ingress),
+        ) is False
+    assert SinkGate._is_trusted_operator_turn(
+        labels,
+        dataclasses.replace(
+            turn_context,
+            trigger="poller",
+            interactivity=TurnInteractivity.NON_INTERACTIVE,
+        ),
+    ) is False
 
 
 async def test_cancelled_bound_turn_terminalizes_open_tools(tmp_path: Path) -> None:
@@ -1747,6 +1791,8 @@ async def test_integrated_hands_edit_permission_wire_and_provider_result(
             assert bound_auth.canonical_principal == "operator"
             assert "admin" in bound_auth.roles
             assert bound_auth.enforcement_enabled
+            assert bound_auth.trigger == "user_message"
+            assert bound_auth.event_ingress is None
 
             # Match CoreAgent.run_turn's bound-session IFC initialization.  The
             # replacement classifies request context but derives every authority
@@ -1761,6 +1807,7 @@ async def test_integrated_hands_edit_permission_wire_and_provider_result(
             )
             auth = dataclasses.replace(
                 bound_auth,
+                interactivity=TurnInteractivity.INTERACTIVE,
                 ifc_labels=labels,
                 ifc_state=InformationFlowState(labels=labels),
                 saga_session_id=kwargs["saga_session_id"],

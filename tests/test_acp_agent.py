@@ -186,7 +186,7 @@ async def test_authenticate_uses_resolved_identity_and_factory(
     assert response is not None
     assert _dump(response) == {}
     event = captured["event"]
-    assert event.trigger == "acp_authenticate"
+    assert event.trigger == "user_message"
     assert event.channel_id == "acp:stdio"
     assert event.content == ""
     assert event.author == "operator"
@@ -200,14 +200,15 @@ async def test_authenticate_uses_resolved_identity_and_factory(
     }
     assert captured["resolver"] is resolver
     assert captured["kwargs"]["enforce"] is True
-    assert captured["kwargs"]["event_ingress"] == "acp"
+    assert captured["kwargs"]["event_ingress"] is None
     assert captured["kwargs"]["audience_provider"] is agent._audience_provider
     assert captured["kwargs"]["cross_platform_pull"] is True
     assert agent._auth_context is not None
     assert agent._auth_context.principal == "operator"
     assert agent._auth_context.canonical_principal == "operator"
     assert agent._auth_context.roles == ("admin",)
-    assert agent._auth_context.event_ingress == "acp"
+    assert agent._auth_context.trigger == "user_message"
+    assert agent._auth_context.event_ingress is None
     assert agent._auth_context.enforcement_enabled is True
     assert agent._auth_context.is_service is False
     assert raw_key not in repr(agent.__dict__)
