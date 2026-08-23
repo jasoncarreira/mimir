@@ -6,6 +6,7 @@ import logging
 from typing import Any
 
 from .access_control import SinkGate, get_sink_category
+from .coding import env_bool
 from .event_logger import log_event_sync
 
 log = logging.getLogger(__name__)
@@ -20,8 +21,11 @@ def harness_sink_allowed(
     """Check one harness sink and record enforced or shadow denials."""
     if auth_context is not None:
         ifc_labels = auth_context.ifc_state.current(ifc_labels)
-    enforcement_enabled = bool(
-        getattr(auth_context, "enforcement_enabled", False)
+    carrier_enforcement = getattr(auth_context, "enforcement_enabled", None)
+    enforcement_enabled = (
+        bool(carrier_enforcement)
+        if carrier_enforcement is not None
+        else env_bool("MIMIR_ACCESS_CONTROL_ENFORCED", False, logger=log)
     )
     decision = SinkGate.check_sink_flow(
         sink_name,

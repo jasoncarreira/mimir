@@ -3913,6 +3913,75 @@ async def test_shadow_harness_sink_emits_would_block_and_still_delivers(monkeypa
     )]
 
 
+def test_missing_auth_context_uses_process_enforcement(monkeypatch):
+    sink_events: list[tuple[str, dict[str, object]]] = []
+    monkeypatch.setattr(
+        "mimir.harness_egress.log_event_sync",
+        lambda kind, **fields: sink_events.append((kind, fields)),
+    )
+    target = "slack-C-public"
+    incompatible = _labels(sources=frozenset({"slack-C-private"}))
+    assert SinkGate.check_sink_flow(
+        "send_message", target, incompatible, None, enforce=True,
+    ).allowed is False
+
+    monkeypatch.setenv("MIMIR_ACCESS_CONTROL_ENFORCED", "true")
+    assert harness_sink_allowed(
+        "send_message", target, incompatible, None,
+    ) is False
+    assert sink_events[-1] == (
+        "sink_blocked",
+        {
+            "sink": "send_message",
+            "reason": "ifc_label_blocked:same_channel",
+            "sink_category": "same_channel",
+            "target_channel": target,
+            "allowed": False,
+            "status": "denied",
+            "enforcement_enabled": True,
+            "is_shadow_decision": False,
+        },
+    )
+
+    monkeypatch.setenv("MIMIR_ACCESS_CONTROL_ENFORCED", "false")
+    assert harness_sink_allowed(
+        "send_message", target, incompatible, None,
+    ) is True
+    assert sink_events[-1] == (
+        "sink_blocked",
+        {
+            "sink": "send_message",
+            "reason": "ifc_label_blocked:same_channel",
+            "sink_category": "same_channel",
+            "target_channel": target,
+            "allowed": True,
+            "status": "would_block",
+            "enforcement_enabled": False,
+            "is_shadow_decision": True,
+        },
+    )
+
+
+def test_missing_auth_context_disagrees_with_shadow_carrier_under_enforcement(
+    monkeypatch,
+):
+    monkeypatch.setenv("MIMIR_ACCESS_CONTROL_ENFORCED", "true")
+    monkeypatch.setattr("mimir.harness_egress.log_event_sync", lambda *args, **kwargs: None)
+    target = "slack-C-public"
+    incompatible = _labels(sources=frozenset({"slack-C-private"}))
+    shadow_auth = replace(_auth(target), enforcement_enabled=False)
+
+    with_carrier = harness_sink_allowed(
+        "send_message", target, incompatible, shadow_auth,
+    )
+    without_carrier = harness_sink_allowed(
+        "send_message", target, incompatible, None,
+    )
+
+    assert with_carrier is True
+    assert without_carrier is False
+
+
 def test_allowed_harness_sink_emits_no_denial_event(monkeypatch):
     sink_events: list[tuple[str, dict[str, object]]] = []
     monkeypatch.setattr(

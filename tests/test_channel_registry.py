@@ -218,6 +218,26 @@ async def test_post_job_failure_notice_sends():
 
 
 @pytest.mark.asyncio
+async def test_post_job_failure_notice_redacts_credentials():
+    reg = ChannelRegistry()
+    bridge = _bridge("rec", ("rec-",))
+    reg.register(bridge)
+    credential = "xoxb-A0123456789-abcdef"
+
+    await post_job_failure_notice(
+        reg,
+        "rec-ops",
+        label="github-activity",
+        error=f"RuntimeError: auth failed for https://user:{credential}@host/x",
+    )
+
+    assert len(bridge.sent) == 1
+    _, text = bridge.sent[0]
+    assert "[REDACTED]" in text
+    assert credential not in text
+
+
+@pytest.mark.asyncio
 async def test_post_job_failure_notice_noops_without_channel_or_registry():
     reg = ChannelRegistry()
     bridge = _bridge("rec", ("rec-",))
