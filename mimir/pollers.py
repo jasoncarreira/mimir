@@ -359,8 +359,14 @@ def _github_api_attestation(
         return None
 
 
-def _github_author_is_trusted(repo: Any, author: Any, token: str) -> bool:
-    """Resolve collaborator/org trust from GitHub, never from poller claims."""
+def _github_author_is_trusted(
+    repo: Any, author: Any, token: str, *, timeout: float | None = None,
+) -> bool:
+    """Resolve collaborator/org trust from GitHub, never from poller claims.
+
+    ``timeout`` bounds each of the two attestation requests this makes; see
+    ``_github_content_author`` for why callers on a budget must pass it.
+    """
     if not isinstance(repo, str) or not isinstance(author, str):
         return False
     parts = repo.split("/")
@@ -376,8 +382,9 @@ def _github_author_is_trusted(repo: Any, author: Any, token: str) -> bool:
     # The permission endpoint reports ``read`` for any user on a public repo,
     # including non-collaborators.  The collaborator-existence endpoint keeps
     # those cases distinct: 204 means collaborator, 404 means not one.
+    kwargs = {} if timeout is None else {"timeout": timeout}
     collaborator = _github_api_attestation(
-        f"repos/{escaped_repo}/collaborators/{escaped_author}", token,
+        f"repos/{escaped_repo}/collaborators/{escaped_author}", token, **kwargs,
     )
     if collaborator is None:
         return False
@@ -388,7 +395,7 @@ def _github_author_is_trusted(repo: Any, author: Any, token: str) -> bool:
 
     membership = _github_api_attestation(
         f"orgs/{urllib.parse.quote(parts[0], safe='')}/memberships/{escaped_author}",
-        token,
+        token, **kwargs,
     )
     return bool(
         membership is not None
@@ -398,8 +405,16 @@ def _github_author_is_trusted(repo: Any, author: Any, token: str) -> bool:
     )
 
 
-def _github_content_author(repo: Any, extras: Any, token: str) -> str | None:
-    """Resolve a GitHub body/comment author from GitHub, never poller output."""
+def _github_content_author(
+    repo: Any, extras: Any, token: str, *, timeout: float | None = None,
+) -> str | None:
+    """Resolve a GitHub body/comment author from GitHub, never poller output.
+
+    ``timeout`` bounds the attestation request; callers running under a
+    wall-clock budget pass their remaining time so this transport cannot outlive
+    it (chainlink #1433 — the poller's other transport is `gh api`, and bounding
+    only that one left this path free to overrun).
+    """
     if not isinstance(repo, str) or not isinstance(extras, dict):
         return None
     event_type = extras.get("event_type")
@@ -435,7 +450,9 @@ def _github_content_author(repo: Any, extras: Any, token: str) -> str | None:
             endpoint = f"repos/{repo}/pulls/{number}/reviews/{review_id}"
     if endpoint is None:
         return None
-    attestation = _github_api_attestation(endpoint, token)
+    attestation = _github_api_attestation(
+        endpoint, token, **({} if timeout is None else {"timeout": timeout}),
+    )
     if (
         attestation is None
         or attestation[0] != 200

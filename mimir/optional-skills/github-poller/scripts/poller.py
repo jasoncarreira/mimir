@@ -232,9 +232,22 @@ class TickBudget:
     def hard_exhausted(self) -> bool:
         return self.hard_remaining() <= 0.0
 
-    def call_timeout(self, ceiling: float = GH_API_TIMEOUT_SECONDS) -> float:
-        """Seconds to allow one API call so it cannot outlive the hard deadline."""
-        return max(GH_API_MIN_TIMEOUT_SECONDS, min(ceiling, self.hard_remaining()))
+    def call_timeout(
+        self, ceiling: float = GH_API_TIMEOUT_SECONDS,
+    ) -> float | None:
+        """Seconds to allow one API call, or ``None`` if it must not be made.
+
+        Returning the *remaining* time rather than flooring it is what makes the
+        bound real: a call that starts is guaranteed to finish by the hard
+        deadline, so total elapsed is the deadline plus local work — never the
+        deadline plus a full call timeout. Below
+        ``GH_API_MIN_TIMEOUT_SECONDS`` there is no point starting one, so the
+        caller is told to skip instead.
+        """
+        remaining = self.hard_remaining()
+        if remaining < GH_API_MIN_TIMEOUT_SECONDS:
+            return None
+        return min(ceiling, remaining)
 
     def note_truncation(self, pass_name: str, skipped: int) -> None:
         if skipped > 0:
@@ -579,10 +592,20 @@ def _gh_api(endpoint: str, token: str) -> list | dict | None:
     try:
         env = {**os.environ, "GH_TOKEN": token} if token else None
         budget = _ACTIVE_TICK_BUDGET
-        timeout = (
-            budget.call_timeout() if budget is not None
-            else float(GH_API_TIMEOUT_SECONDS)
-        )
+        if budget is None:
+            timeout: float = float(GH_API_TIMEOUT_SECONDS)
+        else:
+            allowed = budget.call_timeout()
+            if allowed is None:
+                # Past the hard deadline. Returning None is the same shape every
+                # caller already handles for an API failure, so cursor entries
+                # are preserved rather than rebuilt from a partial view.
+                print(
+                    f"gh api {endpoint} skipped: tick budget exhausted",
+                    file=sys.stderr,
+                )
+                return None
+            timeout = allowed
         result = subprocess.run(
             ["gh", "api", endpoint, "--paginate"],
             capture_output=True, text=True, timeout=timeout, env=env,
@@ -878,25 +901,69 @@ def _emit_signal(signal_type: str, **extras: object) -> None:
     )
 
 
+#: Ceiling for one trust attestation, matching `_github_api_attestation`'s own
+#: default. Trust resolution can make up to three of these per uncached author.
+TRUST_ATTESTATION_TIMEOUT_SECONDS = 10.0
+
+
 def _pr_author_is_trusted(
     repo: str,
     number: int,
     url: str,
     token: str,
     trust_cache: dict[tuple[str, object], object],
-) -> bool:
-    """Resolve PR-author trust from GitHub and cache it for this poll cycle."""
+    *,
+    tick_budget: "TickBudget | None" = None,
+) -> bool | None:
+    """Resolve PR-author trust from GitHub and cache it for this poll cycle.
+
+    Returns ``None`` when the tick has no budget left to resolve trust. That is
+    deliberately distinct from ``False``: an unresolved author must be *skipped*,
+    not classified, because ``False`` routes the PR through
+    ``_surface_untrusted_pr_once`` which emits a signal and records the verdict
+    as already-surfaced. Failing closed here would permanently mislabel a
+    trusted contributor's PR because the poller ran out of time.
+
+    This path reaches GitHub through `urllib` in ``mimir.pollers``, not through
+    ``_gh_api``'s subprocess, so it needs its own budget plumbing — bounding only
+    the `gh api` transport left this one free to overrun the tick.
+    """
+    _DENIED = object()
+
+    def _budget_kwargs() -> dict | object:
+        """``{"timeout": t}``, ``{}`` with no budget, or ``_DENIED``.
+
+        With no budget the helpers are called exactly as before, so the
+        attestation keeps its own 10s default and nothing about the unbudgeted
+        path changes.
+        """
+        if tick_budget is None:
+            return {}
+        allowed = tick_budget.call_timeout(
+            ceiling=TRUST_ATTESTATION_TIMEOUT_SECONDS,
+        )
+        return _DENIED if allowed is None else {"timeout": allowed}
+
     author_key = (repo, number)
     if author_key not in trust_cache:
+        extra = _budget_kwargs()
+        if extra is _DENIED:
+            return None
         trust_cache[author_key] = _github_content_author(
             repo,
             {"event_type": "pr_opened", "url": url},
             token,
+            **extra,
         )
     author = trust_cache[author_key]
     trust_key = (repo, author if isinstance(author, str) else "")
     if trust_key not in trust_cache:
-        trust_cache[trust_key] = _github_author_is_trusted(repo, author, token)
+        extra = _budget_kwargs()
+        if extra is _DENIED:
+            return None
+        trust_cache[trust_key] = _github_author_is_trusted(
+            repo, author, token, **extra,
+        )
     return trust_cache[trust_key] is True
 
 
@@ -1060,6 +1127,7 @@ def _check_prs(
     surfaced_untrusted: set[str] | None = None,
     review_needed_pr_numbers: set[str] | None = None,
     review_context: dict[str, str] | None = None,
+    tick_budget: "TickBudget | None" = None,
 ) -> int:
     """New pull requests."""
     data = _gh_api(
@@ -1090,9 +1158,17 @@ def _check_prs(
         # author. Do not also report them as skipped automatic reviews.
         if _review_requested(pr, me):
             continue
-        if not _pr_author_is_trusted(
-            repo, number, url, token, trust_cache,
-        ):
+        trusted = _pr_author_is_trusted(
+            repo, number, url, token, trust_cache, tick_budget=tick_budget,
+        )
+        if trusted is None:
+            # No budget left to resolve trust. Skip without classifying, and
+            # hold the watermark so this PR is reconsidered next tick.
+            if tick_budget is not None:
+                tick_budget.hard_truncated = True
+                tick_budget.note_truncation("prs_trust", 1)
+            continue
+        if not trusted:
             count += _surface_untrusted_pr_once(
                 repo, number, url, surfaced_untrusted,
             )
@@ -1298,6 +1374,7 @@ def _check_pr_pushes(
     surfaced_untrusted: set[str] | None = None,
     review_needed_pr_numbers: set[str] | None = None,
     review_context: dict[str, str] | None = None,
+    tick_budget: "TickBudget | None" = None,
 ) -> tuple[int, dict[str, str], dict[str, int]]:
     """Detect new commits pushed to existing open PRs AND new
     review-requests addressed to ``me`` on those same PRs.
@@ -1392,8 +1469,18 @@ def _check_pr_pushes(
         url = pr.get("html_url", "")
         explicitly_requested = _review_requested(pr, me)
         trusted_author = _pr_author_is_trusted(
-            repo, number, url, token, trust_cache,
+            repo, number, url, token, trust_cache, tick_budget=tick_budget,
         )
+        if trusted_author is None:
+            # Unresolved for lack of budget. Carry the prior head forward — a
+            # dropped key would make the next tick treat this PR as first-seen
+            # and miss the push entirely — and hold the watermark.
+            if key in pr_heads:
+                new_heads[key] = pr_heads[key]
+            if tick_budget is not None:
+                tick_budget.hard_truncated = True
+                tick_budget.note_truncation("pushes_trust", 1)
+            continue
         if not trusted_author:
             if not explicitly_requested and (not me or pr_author != me):
                 count += _surface_untrusted_pr_once(
@@ -2815,6 +2902,7 @@ def main() -> None:
             repo, since, token, me, trust_cache, surfaced_untrusted,
             review_needed_pr_numbers=review_needed_pr_numbers,
             review_context=review_context,
+            tick_budget=budget,
         )
         total += pr_opened_count
         total += _check_pr_review_comments(repo, since, token, me)
@@ -2827,6 +2915,7 @@ def main() -> None:
             surfaced_untrusted=surfaced_untrusted,
             review_needed_pr_numbers=review_needed_pr_numbers,
             review_context=review_context,
+            tick_budget=budget,
         )
         total += push_count
         total += _check_issue_comments(

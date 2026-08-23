@@ -1132,11 +1132,13 @@ def test_gh_api_timeout_is_clamped_to_the_remaining_hard_budget(monkeypatch):
     assert poller.GH_API_MIN_TIMEOUT_SECONDS <= seen[-1] <= 5.0
     assert seen[-1] < poller.GH_API_TIMEOUT_SECONDS
 
-    # Budget already spent: floored, not zero or negative — a 0s timeout would
-    # fail every call instantly and look like a total API outage.
+    # Budget already spent: the call is not made at all. Flooring it to a
+    # minimum instead would let each late call overshoot the hard deadline, so
+    # the bound would be "deadline + one full timeout" rather than the deadline.
+    before = len(seen)
     poller.set_active_tick_budget(poller.TickBudget(hard_deadline_seconds=0.0))
-    poller._gh_api("repos/o/r/pulls", "tok")
-    assert seen[-1] == poller.GH_API_MIN_TIMEOUT_SECONDS
+    assert poller._gh_api("repos/o/r/pulls", "tok") is None
+    assert len(seen) == before, "a call was made past the hard deadline"
     poller.set_active_tick_budget(None)
 
 
@@ -1172,7 +1174,10 @@ def test_hard_stop_has_no_floor_and_marks_the_tick():
     assert spent.hard_truncated is True
 
 
-def _slow_main_harness(monkeypatch, tmp_path, *, n_prs, call_seconds, soft, hard):
+def _slow_main_harness(
+    monkeypatch, tmp_path, *, n_prs, call_seconds, soft, hard,
+    author="mimir-bot",
+):
     """Drive the real pass sequence through main() with deliberately slow calls.
 
     Deadlines are scaled down rather than faked, so the wall-clock path under
@@ -1188,7 +1193,8 @@ def _slow_main_harness(monkeypatch, tmp_path, *, n_prs, call_seconds, soft, hard
         return {
             "number": n, "title": f"PR {n}", "state": "open", "merged": False,
             "merged_at": None, "html_url": f"https://github.com/o/r/pull/{n}",
-            "user": {"login": "mimir-bot"}, "mergeable": True,
+            "user": {"login": author}, "mergeable": True,
+            "created_at": "2026-08-23T11:00:00Z",
             "head": {"sha": f"{n:040d}", "ref": f"worklink/{n}",
                      "repo": {"full_name": "o/r"}},
             "base": {"sha": "b" * 40, "ref": "main"},
@@ -1280,3 +1286,109 @@ def test_untruncated_tick_still_advances_its_watermark(monkeypatch, tmp_path):
         monkeypatch, tmp_path, n_prs=2, call_seconds=0.0, soft=600.0, hard=600.0,
     )
     assert saved[0]["last_checked"] != "2026-08-23T10:00:00Z"
+
+
+#: Captured at import, before the autouse fixture stubs it out. That fixture
+#: replacing `_pr_author_is_trusted` with an instant lambda is precisely why the
+#: first wall-clock regression could not see the attestation transport.
+_REAL_TRUST_RESOLVER = poller._pr_author_is_trusted
+
+
+def test_slow_trust_attestations_cannot_overrun_the_tick(monkeypatch, tmp_path):
+    """The second GitHub transport.
+
+    `_check_prs` and `_check_pr_pushes` resolve author trust through
+    `mimir.pollers._github_content_author` / `_github_author_is_trusted`, which
+    reach GitHub over `urllib` with their own 10s timeouts — not through
+    `_gh_api`'s subprocess. Clamping only `_gh_api` left this path free to carry
+    the tick past the framework cap, so it needs its own budget plumbing.
+    """
+    import time as _time
+
+    monkeypatch.setattr(poller, "_pr_author_is_trusted", _REAL_TRUST_RESOLVER)
+    # The deadlines here are scaled to keep the test fast, so the *minimum* call
+    # timeout has to scale with them. Left at its real 2.0s it exceeds the whole
+    # 0.5s hard deadline, every call is refused before it starts, and the test
+    # silently proves nothing — which is how the first draft of this test passed
+    # while never reaching the transport it exists to cover.
+    monkeypatch.setattr(poller, "GH_API_MIN_TIMEOUT_SECONDS", 0.02)
+    handed: list[object] = []
+
+    def slow_author(repo, extras, token, **kwargs):
+        handed.append(kwargs.get("timeout"))
+        _time.sleep(0.05)
+        return "outside-contributor"
+
+    def slow_trust(repo, author, token, **kwargs):
+        handed.append(kwargs.get("timeout"))
+        _time.sleep(0.05)
+        return True
+
+    monkeypatch.setattr(poller, "_github_content_author", slow_author)
+    monkeypatch.setattr(poller, "_github_author_is_trusted", slow_trust)
+
+    elapsed, _calls, saved = _slow_main_harness(
+        monkeypatch, tmp_path, n_prs=150, call_seconds=0.01,
+        soft=0.3, hard=0.5, author="outside-contributor",
+    )
+
+    assert elapsed < 1.2, f"tick ran {elapsed:.2f}s; trust path not bounded"
+    assert len(saved) == 1
+    # The budget actually reached this transport...
+    assert handed, "trust path never exercised — the test cannot see the bug"
+    # ...and every timeout it handed over was budget-derived, never the
+    # attestation's own 10s default.
+    assert all(
+        isinstance(t, float) and 0 < t <= poller.TRUST_ATTESTATION_TIMEOUT_SECONDS
+        for t in handed
+    ), handed
+
+
+def test_unresolvable_trust_skips_the_pr_instead_of_marking_it_untrusted(
+    monkeypatch, tmp_path,
+):
+    """A budget-denied trust lookup must not fail closed.
+
+    `False` routes the PR through `_surface_untrusted_pr_once`, which emits a
+    signal and records the verdict as already-surfaced — so a trusted
+    contributor's PR would be permanently mislabelled because the poller ran out
+    of time. `None` means "unresolved": skip, hold the watermark, retry next tick.
+    """
+    monkeypatch.setattr(poller, "_pr_author_is_trusted", _REAL_TRUST_RESOLVER)
+    surfaced: set[str] = set()
+    calls: list[str] = []
+
+    monkeypatch.setattr(
+        poller, "_github_content_author",
+        lambda *a, **k: calls.append("author") or "outside-contributor",
+    )
+    monkeypatch.setattr(
+        poller, "_github_author_is_trusted",
+        lambda *a, **k: calls.append("trust") or True,
+    )
+    monkeypatch.setattr(
+        poller, "_gh_api",
+        lambda ep, tok: [{
+            "number": 700, "title": "t", "state": "open",
+            "html_url": "https://github.com/o/r/pull/700",
+            "user": {"login": "outside-contributor"},
+            "created_at": "2026-08-23T11:00:00Z",
+            "head": {"sha": "a" * 40, "ref": "f", "repo": {"full_name": "o/r"}},
+            "base": {"sha": "b" * 40, "ref": "main"},
+        }] if "pulls?state=open" in ep else [],
+    )
+    emitted: list[dict] = []
+    monkeypatch.setattr(poller, "_emit", lambda p, **e: emitted.append(e))
+    monkeypatch.setattr(poller, "_emit_signal", lambda s, **e: emitted.append(e))
+
+    spent = poller.TickBudget(hard_deadline_seconds=0.0)
+    count = poller._check_prs(
+        "o/r", "2026-08-23T10:00:00Z", "tok", "mimir-bot",
+        surfaced_untrusted=surfaced, tick_budget=spent,
+    )
+
+    assert count == 0
+    assert calls == [], "an attestation was made past the hard deadline"
+    assert surfaced == set(), "unresolved trust was recorded as untrusted"
+    assert emitted == [], "unresolved trust emitted a verdict"
+    assert spent.hard_truncated is True, "watermark not held for a skipped PR"
