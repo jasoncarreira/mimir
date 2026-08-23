@@ -884,9 +884,30 @@ class Scheduler:
         this method. The synchronous ``reload`` convenience does that read on
         its caller's thread.
         """
-        # Drop existing scheduler:* jobs; leave non-prefixed (e.g. saga-consolidate).
+        # Validate prompt-style entries before removing anything so a malformed
+        # operator edit cannot knock the last-known-good job offline.
+        valid_prompt_jobs: list[tuple[SchedulerJob, CronTrigger]] = []
+        invalid_prompt_names: set[str] = set()
+        invalid = 0
+        for job in yaml_jobs:
+            if job.callable_name is not None:
+                continue
+            try:
+                trigger = _build_trigger(job, self._tz)
+            except ValueError:
+                invalid += 1
+                invalid_prompt_names.add(job.name)
+                continue
+            valid_prompt_jobs.append((job, trigger))
+
+        # Drop existing scheduler:* jobs except entries whose replacement did
+        # not validate; those continue running with their prior trigger.
         for job in list(self._scheduler.get_jobs()):
-            if job.id.startswith(SCHEDULER_CHANNEL_PREFIX):
+            if (
+                job.id.startswith(SCHEDULER_CHANNEL_PREFIX)
+                and job.id[len(SCHEDULER_CHANNEL_PREFIX):]
+                not in invalid_prompt_names
+            ):
                 self._scheduler.remove_job(job.id)
 
         # Re-resolve registered callables against the new yaml. A yaml
@@ -900,6 +921,10 @@ class Scheduler:
                     "reload: callable %r install failed: %s",
                     cdef.name, exc,
                 )
+                self._dispatch_reload_events(
+                    "scheduler_invalid_cron",
+                    [{"job": cdef.name, "error": str(exc)}],
+                )
 
         # Warn-skip yaml entries naming an unregistered callable.
         # Don't crash startup — could be a stale yaml after a refactor
@@ -907,22 +932,17 @@ class Scheduler:
         registered_names = set(self._callables.keys())
 
         registered = 0
-        invalid = 0
         for job in yaml_jobs:
-            # Skip callable-typed entries — they're handled above.
-            if job.callable_name is not None:
-                if job.callable_name not in registered_names:
-                    log.warning(
-                        "scheduler.yaml entry %r references unregistered "
-                        "callable %r; skipping",
-                        job.name, job.callable_name,
-                    )
-                continue
-            try:
-                trigger = _build_trigger(job, self._tz)
-            except ValueError:
-                invalid += 1
-                continue
+            if (
+                job.callable_name is not None
+                and job.callable_name not in registered_names
+            ):
+                log.warning(
+                    "scheduler.yaml entry %r references unregistered "
+                    "callable %r; skipping",
+                    job.name, job.callable_name,
+                )
+        for job, trigger in valid_prompt_jobs:
             self._scheduler.add_job(
                 self._fire,
                 trigger=trigger,
@@ -1449,14 +1469,6 @@ class Scheduler:
     ) -> bool:
         """Resolve the effective cron for ``cdef`` and (re-)add the
         APScheduler job. Returns True if a job was installed."""
-        # Drop any existing APScheduler job under this id. This makes
-        # reload() idempotent — it can re-register without leaking
-        # the prior job.
-        try:
-            self._scheduler.remove_job(cdef.job_id)
-        except Exception:  # noqa: BLE001 — JobLookupError or other; both fine
-            pass
-
         if yaml_jobs is None:
             try:
                 yaml_jobs = load_jobs(self._yaml_path)
@@ -1467,6 +1479,10 @@ class Scheduler:
             yaml_jobs, cdef.name, cdef.default_cron,
         )
         if not effective_cron:
+            try:
+                self._scheduler.remove_job(cdef.job_id)
+            except Exception:  # noqa: BLE001 — JobLookupError or other; both fine
+                pass
             log.info(
                 "callable %r: no effective cron (source=%s); "
                 "not installing",
@@ -1484,6 +1500,12 @@ class Scheduler:
                 f"callable {cdef.name!r} (source={source}): {exc}"
             ) from exc
 
+        # APScheduler keeps duplicate pending jobs before start(), so explicit
+        # replacement remains necessary. It must happen after trigger parsing.
+        try:
+            self._scheduler.remove_job(cdef.job_id)
+        except Exception:  # noqa: BLE001 — JobLookupError or other; both fine
+            pass
         self._scheduler.add_job(
             cdef.fn,
             trigger=trigger,
@@ -1541,10 +1563,10 @@ class Scheduler:
         # ``reload_pollers`` (below) overrides with the live total
         # to handle the preserved case correctly.
         self._last_invalid_manifest_events = list(invalid_events)
-        self._dispatch_poller_reload_events(
+        self._dispatch_reload_events(
             "poller_reload_invalid_manifest", invalid_events,
         )
-        self._dispatch_poller_reload_events(
+        self._dispatch_reload_events(
             "poller_reload_invalid_cron", invalid_cron_events,
         )
         return installed
@@ -1707,7 +1729,7 @@ class Scheduler:
         as a ``poller_reload_invalid_manifest`` /
         ``poller_reload_invalid_cron`` algedonic event;
         ``add_poller_jobs`` (sync) routes through
-        ``_dispatch_poller_reload_events``.
+        ``_dispatch_reload_events``.
 
         **Per-entry pre-population, not end-of-loop swap (PR #107
         review fix).** A previous version of this function built a
@@ -1896,14 +1918,14 @@ class Scheduler:
             })
         return installed, invalid_events, invalid_cron_events
 
-    def _dispatch_poller_reload_events(
+    def _dispatch_reload_events(
         self,
         event_type: str,
         events: list[dict[str, Any]],
     ) -> None:
-        """Emit ``poller_reload_invalid_manifest`` /
-        ``poller_reload_invalid_cron`` events from a sync context
-        (``add_poller_jobs``). When a running event loop is available
+        """Emit scheduler reload events from a synchronous mutation path.
+
+        When a running event loop is available
         (server.py startup is awaited init), schedule the async
         ``log_event`` via ``create_task``. Otherwise fall back to
         ``log.warning`` so the event isn't silently lost. Mirrors the
@@ -1924,7 +1946,7 @@ class Scheduler:
         for payload in events:
             self._spawn(
                 log_event(event_type, **payload),
-                name="scheduler-poller-reload-event",
+                name="scheduler-reload-event",
             )
 
 

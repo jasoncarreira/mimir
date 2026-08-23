@@ -1336,6 +1336,110 @@ def test_reload_re_resolves_registered_callables(tmp_path: Path):
     assert "hour='6'" in str(job_after.trigger)
 
 
+@pytest.mark.asyncio
+async def test_reload_invalid_callable_cron_preserves_job_and_emits_event(
+    tmp_path: Path,
+):
+    """A bad operator edit keeps the callable's last-known-good trigger."""
+    from unittest.mock import patch
+
+    yaml_path = tmp_path / "s.yaml"
+
+    async def noop(_e):
+        return True
+
+    async def _fn():
+        return None
+
+    sched = Scheduler(scheduler_yaml=yaml_path, enqueue=noop)
+    sched.register_callable("demo", _fn, default_cron="0 4 * * *")
+    job_before = sched._scheduler.get_job("demo")
+    trigger_before = job_before.trigger
+
+    yaml_path.write_text(
+        "- name: broken-demo\n"
+        "  callable: demo\n"
+        '  cron: "0 25 * * *"\n',
+        encoding="utf-8",
+    )
+    captured: list[tuple[str, dict]] = []
+
+    async def fake_log_event(event_type: str, **kwargs):
+        captured.append((event_type, kwargs))
+
+    with patch("mimir.scheduler.log_event", new=fake_log_event):
+        sched.reload()
+        await asyncio.sleep(0)
+
+    job_after = sched._scheduler.get_job("demo")
+    assert job_after is job_before
+    assert job_after.trigger is trigger_before
+    assert len(captured) == 1
+    event_type, payload = captured[0]
+    assert event_type == "scheduler_invalid_cron"
+    assert payload["job"] == "demo"
+    assert "0 25 * * *" in payload["error"]
+
+
+def test_reload_valid_callable_is_idempotent(tmp_path: Path):
+    yaml_path = tmp_path / "s.yaml"
+    yaml_path.write_text(
+        "- name: demo-entry\n"
+        "  callable: demo\n"
+        '  cron: "15 6 * * *"\n',
+        encoding="utf-8",
+    )
+
+    async def noop(_e):
+        return True
+
+    async def _fn():
+        return None
+
+    sched = Scheduler(scheduler_yaml=yaml_path, enqueue=noop)
+    sched.register_callable("demo", _fn, default_cron="0 4 * * *")
+
+    sched.reload()
+    sched.reload()
+
+    jobs = [job for job in sched._scheduler.get_jobs() if job.id == "demo"]
+    assert len(jobs) == 1
+    assert "minute='15'" in str(jobs[0].trigger)
+    assert "hour='6'" in str(jobs[0].trigger)
+
+
+def test_reload_invalid_prompt_cron_preserves_existing_job(tmp_path: Path):
+    """Prompt jobs use the same validate-before-remove ordering."""
+    yaml_path = tmp_path / "s.yaml"
+    yaml_path.write_text(
+        "- name: morning\n"
+        "  prompt: review\n"
+        '  cron: "0 8 * * *"\n',
+        encoding="utf-8",
+    )
+
+    async def noop(_e):
+        return True
+
+    sched = Scheduler(scheduler_yaml=yaml_path, enqueue=noop)
+    sched.reload()
+    job_before = sched._scheduler.get_job("scheduler:morning")
+    trigger_before = job_before.trigger
+
+    yaml_path.write_text(
+        "- name: morning\n"
+        "  prompt: review\n"
+        '  cron: "0 25 * * *"\n',
+        encoding="utf-8",
+    )
+    stats = sched.reload()
+
+    job_after = sched._scheduler.get_job("scheduler:morning")
+    assert stats == {"registered": 0, "invalid": 1}
+    assert job_after is job_before
+    assert job_after.trigger is trigger_before
+
+
 def test_reload_warns_on_unregistered_callable(tmp_path: Path, caplog):
     """A yaml entry naming an unregistered callable is warn-skipped,
     not an error."""
@@ -2606,10 +2710,10 @@ async def test_on_job_missed_task_is_held_in_background_tasks(tmp_path: Path):
 
 
 @pytest.mark.asyncio
-async def test_dispatch_poller_reload_events_task_is_held_in_background_tasks(
+async def test_dispatch_reload_events_task_is_held_in_background_tasks(
     tmp_path: Path,
 ):
-    """_dispatch_poller_reload_events uses _spawn() which holds strong refs
+    """_dispatch_reload_events uses _spawn() which holds strong refs
     for each event task until completion (chainlink #118)."""
     from unittest.mock import patch
 
@@ -2630,7 +2734,7 @@ async def test_dispatch_poller_reload_events_task_is_held_in_background_tasks(
         {"manifest_path": "/b.json", "error": "missing field"},
     ]
     with patch("mimir.scheduler.log_event", new=blocking_log_event):
-        sched._dispatch_poller_reload_events(
+        sched._dispatch_reload_events(
             "poller_reload_invalid_manifest", events,
         )
         # Yield to let tasks start.
