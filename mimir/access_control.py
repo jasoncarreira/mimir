@@ -36,6 +36,8 @@ from dataclasses import dataclass, field, replace
 from enum import StrEnum
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
+
+from .coding import coding_enabled
 from urllib.parse import urlsplit, urlunsplit
 
 from langchain_core.tools import ToolException
@@ -3699,10 +3701,7 @@ def _service_shell_command_shape(argv: list[str]) -> str:
 
 def _service_shell_coding_enabled() -> bool:
     """Whether this deployment exposes coding tools, using config's bool syntax."""
-    raw = os.environ.get("MIMIR_CODING_ENABLED")
-    # Keep this truthy set aligned with config._env_bool without importing config
-    # here: access_control is imported by config, so that would create a cycle.
-    return bool(raw and raw.strip().lower() in {"1", "true", "yes", "on", "y"})
+    return coding_enabled()
 
 
 def _service_shell_typed_tool_guidance(

@@ -39,6 +39,7 @@ def _ensure_mimir_import_path() -> None:
 
 _ensure_mimir_import_path()
 
+from mimir.coding import coding_enabled
 from mimir.worklink.autonomy import factory_max_concurrent
 from mimir.worklink.backends.registry import BackendRegistry, WorklinkConfig, WorklinkDefaults
 from mimir.worklink.continuation import consume_worklink_budget_continuations
@@ -284,6 +285,7 @@ def _dispatch(
     leaf_cap: int,
     factory_cap: int,
 ) -> bool:
+    effective_coding_enabled = coding_enabled()
     argv = [
         *run_bin,
         "worklink",
@@ -320,6 +322,7 @@ def _dispatch(
                 "signal": "worklink_dispatch_failed",
                 "issue_id": item.issue_id,
                 "reason": str(exc),
+                "coding_enabled": effective_coding_enabled,
             }
         )
         return False
@@ -338,6 +341,7 @@ def _dispatch(
             "active_before": active,
             "cap": leaf_cap,
             "factory_cap": factory_cap,
+            "coding_enabled": effective_coding_enabled,
         }
     )
     return True

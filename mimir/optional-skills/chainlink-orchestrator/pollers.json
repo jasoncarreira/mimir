@@ -17,6 +17,7 @@
       ],
       "pass_env": [
         "MIMIR_HOME",
+        "MIMIR_CODING_ENABLED",
         "MIMIR_MODEL_SPEC",
         "MIMIR_SOURCE_DIR",
         "CHAINLINK_BIN",

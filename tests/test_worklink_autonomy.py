@@ -1063,6 +1063,7 @@ def _fake_run_bin(tmp: Path) -> Path:
         "finally:\n"
         "    os.close(devnull)\n"
         f"open({str(pids)!r}, 'a', encoding='utf-8').write(str(os.getpid()) + '\\n')\n"
+        f"open({str(tmp / 'coding-enabled.txt')!r}, 'a', encoding='utf-8').write(os.environ.get('MIMIR_CODING_ENABLED', '<unset>') + '\\n')\n"
         f"open({str(record)!r}, 'a', encoding='utf-8').write(' '.join(sys.argv[1:]) + '\\n')\n",
         encoding="utf-8",
     )
@@ -1158,7 +1159,7 @@ def _load_poller_module():
 def _run_poller(tmp: Path, env_extra: dict[str, str]) -> list[dict]:
     env = {k: v for k, v in os.environ.items() if k not in {
         "WORKLINK_REPO", "WORKLINK_RUN_BIN", "WORKLINK_MAX_CONCURRENT", "CHAINLINK_BIN",
-        "MIMIR_FACTORY_EPICS_ENABLED",
+        "MIMIR_CODING_ENABLED", "MIMIR_FACTORY_EPICS_ENABLED",
     }}
     env.update(env_extra)
     proc = subprocess.run(
@@ -1306,6 +1307,35 @@ def test_poller_dispatches_up_to_free_slots(tmp_path: Path) -> None:
     assert dispatched[0]["issue_id"] == 201  # lowest id first
     scan = [e for e in events if e.get("signal") == "worklink_ready_scan"][-1]
     assert scan["ready_count"] == 3 and scan["active"] == 1 and scan["dispatched"] == 1
+
+
+@pytest.mark.parametrize(
+    ("configured", "effective"),
+    [("true", True), ("false", False), (None, False)],
+)
+def test_poller_dispatch_reports_and_propagates_coding_state(
+    tmp_path: Path, configured: str | None, effective: bool
+) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    env = {
+        "MIMIR_HOME": str(home),
+        "CHAINLINK_BIN": str(_fake_chainlink_script(tmp_path, ready=[201], active_locks=[])),
+        "WORKLINK_RUN_BIN": sys.executable + " " + str(_fake_run_bin(tmp_path)),
+        "WORKLINK_REPO": str(home),
+        "WORKLINK_MAX_CONCURRENT": "1",
+        "STATE_DIR": str(tmp_path / "state"),
+    }
+    if configured is not None:
+        env["MIMIR_CODING_ENABLED"] = configured
+
+    events = _run_poller(tmp_path, env)
+
+    dispatched = [event for event in events if event.get("signal") == "worklink_dispatched"]
+    assert len(dispatched) == 1
+    assert dispatched[0]["coding_enabled"] is effective
+    inherited = (tmp_path / "coding-enabled.txt").read_text(encoding="utf-8").splitlines()
+    assert inherited == [configured if configured is not None else "<unset>"]
 
 
 def test_poller_failure_escalation_dedupes_by_signature_and_recovers(

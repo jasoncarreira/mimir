@@ -153,6 +153,7 @@ _HOST_ONLY_ENV = frozenset(
     {
         "MIMIR_API_KEY",
         "MIMIR_HOME",
+        "MIMIR_CODING_ENABLED",
         "MIMIR_FACTORY_PUBLISHING_IDENTITY",
     }
 )
@@ -190,6 +191,13 @@ def _clear_host_mimir_environment():
     the worklink test gate down, and with it ``review_ready``, the commit step
     and publication for every build. Tests that exercise the override set it
     explicitly in the test body.
+
+    ``MIMIR_CODING_ENABLED`` is likewise a deployment capability switch. Tests
+    that exercise enabled coding already opt in explicitly through the function
+    argument or ``monkeypatch.setenv``; allowing the host value to leak instead
+    changes disabled-default assertions and routes Worklink tests through the
+    enabled worker path. A Worklink test gate must therefore be invariant to the
+    controller's configured coding state.
 
     Same shape as the SAGA_CONFIG cleanup proposed in chainlink #129's
     PR #75 precedent. Session-scoped so we don't churn os.environ on
