@@ -4658,6 +4658,15 @@ def _tainted_admin_operator_write_auth() -> AuthContext:
             False,
         ),
         (
+            "admin_scheduled_tick",
+            lambda: replace(
+                _write_auth(admin=True),
+                trigger="scheduled_tick",
+                interactivity=TurnInteractivity.NON_INTERACTIVE,
+            ),
+            False,
+        ),
+        (
             "non_admin_operator",
             _trusted_operator_write_auth,
             False,
@@ -4686,23 +4695,49 @@ def _tainted_admin_operator_write_auth() -> AuthContext:
     "relative",
     ["pollers.json", "SKILL.md", "scripts/fetch-news.ts"],
 )
+@pytest.mark.parametrize("spelling", ["physical", "relative", "virtual"])
 def test_skill_writes_require_an_untainted_admin_operator_turn(
     case: str,
     auth_factory,
     allowed: bool,
     relative: str,
+    spelling: str,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     home = tmp_path / "home"
-    target = home / "skills" / "ai-news" / relative
-    target.parent.mkdir(parents=True)
+    physical_target = home / "skills" / "ai-news" / relative
+    physical_target.parent.mkdir(parents=True)
     monkeypatch.setenv("MIMIR_HOME", str(home))
+    target = {
+        "physical": str(physical_target),
+        "relative": str(Path("skills") / "ai-news" / relative),
+        "virtual": str(Path("/skills") / "ai-news" / relative),
+    }[spelling]
 
     auth = auth_factory()
     assert auth is not None, case
+    boundary = access_control.WriteResourceAdapter.authorize_skill_write(
+        "edit_file", target, auth, auth.ifc_labels, enforce=True,
+    )
+    assert boundary is not None, (case, spelling)
+    assert boundary.allowed is allowed, (case, spelling)
+    assert boundary.reason == (
+        None if allowed else "skill_write_requires_admin_operator"
+    ), (case, spelling)
+    assert boundary.is_shadow_decision is False, (case, spelling)
+    assert boundary.would_block is not allowed, (case, spelling)
+    if case == "admin_scheduled_tick":
+        direct_operation = access_control.WriteResourceAdapter.authorize_operation(
+            "edit_file", target, auth, enforce=True, service_allowed=False,
+            ifc_labels=auth.ifc_labels,
+        )
+        assert direct_operation.allowed is False, spelling
+        assert direct_operation.reason == "skill_write_requires_admin_operator"
+        assert direct_operation.would_block is True
+
     decision = ToolRegistry().authorize_tool(
-        "edit_file", auth, enforce=True, target_channel=str(target),
+        "edit_file", auth, enforce=True, target_channel=target,
     )
 
     assert decision.allowed is allowed, case
@@ -4711,12 +4746,28 @@ def test_skill_writes_require_an_untainted_admin_operator_turn(
         None if allowed else "writes under skills/ require an untainted admin operator turn"
     )
     compatibility_decision = ToolRegistry().authorize_tool(
-        "edit_file", auth, enforce=False, target_channel=str(target),
+        "edit_file", auth, enforce=False, target_channel=target,
     )
     assert compatibility_decision.allowed is allowed, case
     assert compatibility_decision.reason == (
         None if allowed else "skill_write_requires_admin_operator"
     )
+    assert compatibility_decision.is_shadow_decision is False
+    assert compatibility_decision.would_block is not allowed
+
+
+def test_skill_write_boundary_has_no_opinion_on_non_skill_target(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / "home"
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    auth = _write_auth()
+
+    assert access_control.WriteResourceAdapter.authorize_skill_write(
+        "write_file", str(home / "state" / "note.md"), auth, auth.ifc_labels,
+        enforce=True,
+    ) is None
 
 
 @pytest.mark.parametrize("tool_name", ["write_file", "edit_file"])
@@ -4876,6 +4927,12 @@ def test_non_admin_human_write_is_confined_to_unprotected_state(
         enforce=True,
         target_channel="state/notes/result.md",
     )
+    virtual_state = registry.authorize_tool(
+        tool_name,
+        _write_auth(),
+        enforce=True,
+        target_channel="/state/notes/result.md",
+    )
     denied = (
         home / "root.txt",
         repo / "source.py",
@@ -4891,6 +4948,7 @@ def test_non_admin_human_write_is_confined_to_unprotected_state(
 
     assert allowed.allowed is True
     assert relative_state.allowed is True
+    assert virtual_state.allowed is True
     assert allowed.decision == OperationDecision.RESOURCE_SCOPED
     assert registry.authorize_tool(
         tool_name,
@@ -6085,6 +6143,8 @@ def test_static_service_write_allows_home_when_file_tool_roots_unset(
         home / "memory" / "issues" / "970.md",
         Path("state/journal/relative.md"),
         Path("memory/issues/relative.md"),
+        Path("/state/journal/virtual.md"),
+        Path("/memory/issues/virtual.md"),
     ):
         decision = registry.authorize_tool(
             "write_file", auth, enforce=True, target_channel=str(target),
@@ -6123,6 +6183,7 @@ def test_poller_write_uses_only_its_declared_root(
         trigger_state / "cursor.json",
         trigger_state / ".gitignore",
         trigger_state / ".gitattributes",
+        Path("/state/triggers/poller/virtual.json"),
     ):
         assert registry.authorize_tool(
             "write_file", auth, enforce=True, target_channel=str(target),
