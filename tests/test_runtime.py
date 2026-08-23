@@ -703,15 +703,15 @@ async def test_runtime_preflight_recovers_after_bounded_transient_retries(
     monkeypatch.setattr("mimir.forge.github.GitHubForgeClient", Client)
     now = [0.0]
     monkeypatch.setattr(runtime.time, "monotonic", lambda: now[0])
-    logged: list[str] = []
+    logged: list[tuple[str, dict[str, Any]]] = []
     monkeypatch.setattr(
         mimir.event_logger,
         "log_event_sync",
-        lambda name, **kwargs: logged.append(name),
+        lambda name, **kwargs: logged.append((name, kwargs)),
     )
 
     async def log_event(name: str, **kwargs: Any) -> None:
-        logged.append(name)
+        logged.append((name, kwargs))
 
     monkeypatch.setattr(mimir.event_logger, "log_event", log_event)
 
@@ -756,8 +756,29 @@ async def test_runtime_preflight_recovers_after_bounded_transient_retries(
     assert attempts == [1, 2, 3, 4]
     assert forge_tools.github_identity_is_degraded() is False
     assert isinstance(forge_tools._default_client, Client)
-    assert logged.count("github_identity_degraded") == 1
-    assert logged.count("github_identity_recovered") == 1
+
+    for failure in range(3):
+        forge_tools._latch_github_identity_degraded(
+            GitHubIdentityVerificationError(
+                f"second outage {failure + 1}",
+                declared_login="reviewer",
+                failure_kind=GitHubIdentityFailureKind.TRANSIENT,
+            )
+        )
+    await asyncio.sleep(0)
+
+    assert [name for name, _ in logged].count("github_identity_degraded") == 2
+    assert sent == ["ops", "ops"]
+
+    now[0] = 240.0
+    await adapters.dispatcher._run_turn(object())
+
+    assert attempts == [1, 2, 3, 4, 5]
+    assert forge_tools.github_identity_is_degraded() is False
+    recovery_events = [
+        details for name, details in logged if name == "github_identity_recovered"
+    ]
+    assert recovery_events == [{"attempts": 3}, {"attempts": 3}]
     await bundle.aclose()
 
 
