@@ -11,6 +11,7 @@ import sys
 import threading
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -51,7 +52,7 @@ def test_spawn_captures_stdout_and_stderr(tmp_path: Path):
     job = registry.spawn(cmd, argv=["bash", "-c", cmd])
     _wait_until_done(registry, job.job_id)
 
-    result = registry.read_output(job.job_id, tail_lines=10)
+    result = registry.read_job_output(job, tail_lines=10)
     assert result["status"] == "exited_ok"
     assert result["exit_code"] == 0
     assert "out" in result["stdout_tail"]
@@ -158,7 +159,7 @@ def test_output_write_failure_keeps_draining_and_completes(
     assert failed_writes, "the injected write failure did not execute"
     assert job.exit_code == 0
     assert job._process is not None and job._process.poll() == 0
-    result = registry.read_output(job.job_id, stream="stdout")
+    result = registry.read_job_output(job, stream="stdout")
     assert result["output_truncated"] is True
     assert result["truncated_streams"] == ["stdout"]
     assert result["stdout_tail"].startswith("[shell job output incomplete;")
@@ -199,7 +200,7 @@ def test_output_write_bound_discards_excess_without_wedging(
         job.stdout_path.stat().st_size + job.stderr_path.stat().st_size
         == 2 * limit
     )
-    result = registry.read_output(job.job_id, stream="both")
+    result = registry.read_job_output(job, stream="both")
     assert result["output_truncated"] is True
     assert result["truncated_streams"] == ["stdout", "stderr"]
     warning = (
@@ -269,7 +270,7 @@ def test_on_complete_error_isolated_from_registry(tmp_path: Path):
     # And the registry can still spawn / read.
     job2 = registry.spawn("echo two", argv=["bash", "-c", "echo two"])
     _wait_until_done(registry, job2.job_id)
-    assert "two" in registry.read_output(job2.job_id)["stdout_tail"]
+    assert "two" in registry.read_job_output(job2)["stdout_tail"]
 
 
 def test_on_complete_runs_for_nonzero_exit(tmp_path: Path):
@@ -316,7 +317,7 @@ def test_env_overlay_sets_value_visible_to_child(tmp_path: Path):
         env_overlay={"SHELL_JOB_TEST_VAR": "from-overlay"},
     )
     _wait_until_done(registry, job.job_id)
-    out = registry.read_output(job.job_id)["stdout_tail"]
+    out = registry.read_job_output(job)["stdout_tail"]
     assert "from-overlay" in out
 
 
@@ -337,7 +338,7 @@ def test_env_overlay_none_unsets_inherited_var(tmp_path: Path, monkeypatch):
         env_overlay={"SHELL_JOB_INHERIT_ME": None},
     )
     _wait_until_done(registry, job.job_id)
-    out = registry.read_output(job.job_id)["stdout_tail"]
+    out = registry.read_job_output(job)["stdout_tail"]
     assert "UNSET" in out
     assert "SET" not in out.replace("UNSET", "")
 
@@ -353,7 +354,7 @@ def test_env_overlay_default_inherits_parent_env(tmp_path: Path, monkeypatch):
         argv=["bash", "-c", "echo $SHELL_JOB_INHERIT_PASSTHRU"],
     )
     _wait_until_done(registry, job.job_id)
-    out = registry.read_output(job.job_id)["stdout_tail"]
+    out = registry.read_job_output(job)["stdout_tail"]
     assert "kept" in out
 
 
@@ -368,7 +369,7 @@ def test_cwd_kwarg_honored_by_subprocess(tmp_path: Path):
         cwd=work,
     )
     _wait_until_done(registry, job.job_id)
-    out = registry.read_output(job.job_id)["stdout_tail"].strip()
+    out = registry.read_job_output(job)["stdout_tail"].strip()
     # macOS resolves /var → /private/var; compare via realpath so the
     # test passes on both Linux and macOS dev environments.
     import os as _os
@@ -414,7 +415,7 @@ def test_finished_job_persists_in_all_jobs_after_grace(tmp_path: Path):
     later = time.time() + 9999
     assert any(j.job_id == job.job_id for j in registry.visible_jobs(now=later)) is False
     assert any(j.job_id == job.job_id for j in registry.all_jobs()) is True
-    assert "persisted" in registry.read_output(job.job_id)["stdout_tail"]
+    assert "persisted" in registry.read_job_output(job)["stdout_tail"]
 
 
 # ─── read_output ──────────────────────────────────────────────────────
@@ -422,7 +423,7 @@ def test_finished_job_persists_in_all_jobs_after_grace(tmp_path: Path):
 
 def test_read_output_returns_error_for_unknown_job(tmp_path: Path):
     registry = _make_registry(tmp_path)
-    result = registry.read_output("j_doesnotexist")
+    result = registry.read_output("j_doesnotexist", auth_context=None)
     assert "error" in result
     assert "j_doesnotexist" in result["error"]
 
@@ -433,11 +434,11 @@ def test_read_output_supports_stream_filter(tmp_path: Path):
     job = registry.spawn(cmd, argv=["bash", "-c", cmd])
     _wait_until_done(registry, job.job_id)
 
-    out_only = registry.read_output(job.job_id, stream="stdout")
+    out_only = registry.read_job_output(job, stream="stdout")
     assert "only-out" in out_only["stdout_tail"]
     assert out_only["stderr_tail"] == ""
 
-    err_only = registry.read_output(job.job_id, stream="stderr")
+    err_only = registry.read_job_output(job, stream="stderr")
     assert err_only["stdout_tail"] == ""
     assert "only-err" in err_only["stderr_tail"]
 
@@ -450,7 +451,7 @@ def test_read_output_tail_lines_truncates(tmp_path: Path):
     job = registry.spawn(cmd, argv=["bash", "-c", cmd])
     _wait_until_done(registry, job.job_id)
 
-    result = registry.read_output(job.job_id, tail_lines=2, stream="stdout")
+    result = registry.read_job_output(job, tail_lines=2, stream="stdout")
     lines = result["stdout_tail"].splitlines()
     # First line is the truncation marker; followed by the kept tail.
     assert lines[0].startswith("[…truncated;")
@@ -514,16 +515,25 @@ def test_parse_shell_job_tail_lines_rejects_non_numeric_string():
 
 def test_shell_job_snapshots_running_scope_filters(tmp_path: Path):
     registry = _make_registry(tmp_path)
+    auth = SimpleNamespace(
+        channel_id="test-channel", canonical_principal="tester",
+        principal="tester", is_service=False,
+    )
     finished = registry.spawn("done", argv=["bash", "-c", "true"])
     _wait_until_done(registry, finished.job_id)
     sleeping = registry.spawn("sleeping", argv=["bash", "-c", "sleep 2"])
+    for job in (finished, sleeping):
+        job.channel_id = auth.channel_id
+        job.auth_context = auth
 
-    running_snaps = shell_job_snapshots(registry, scope="running")
+    running_snaps = shell_job_snapshots(
+        registry, auth_context=auth, scope="running",
+    )
     running_ids = [s["job_id"] for s in running_snaps]
     assert sleeping.job_id in running_ids
     assert finished.job_id not in running_ids
 
-    all_snaps = shell_job_snapshots(registry, scope="all")
+    all_snaps = shell_job_snapshots(registry, auth_context=auth, scope="all")
     all_ids = [s["job_id"] for s in all_snaps]
     assert sleeping.job_id in all_ids
     assert finished.job_id in all_ids
@@ -531,7 +541,7 @@ def test_shell_job_snapshots_running_scope_filters(tmp_path: Path):
 
 def test_shell_job_snapshots_returns_empty_when_no_registry():
     # Caller passes None when shell jobs are disabled — must not blow up.
-    assert shell_job_snapshots(None) == []
+    assert shell_job_snapshots(None, auth_context=None) == []
 
 
 # ─── PR #111 review-fix-2: read_output truncation marker ──────────────
@@ -554,7 +564,7 @@ def test_read_output_marker_fires_when_file_fits_one_chunk_but_has_extra_lines(
     )
     _wait_until_done(registry, job.job_id)
     # File is 100 lines × ~10 bytes ≈ 1 KB — fits in one CHUNK (64KB).
-    out = registry.read_output(job.job_id, tail_lines=5, stream="stdout")
+    out = registry.read_job_output(job, tail_lines=5, stream="stdout")
     assert out["status"] == "exited_ok"
     tail = out["stdout_tail"]
     # We asked for 5 lines; file has 100 → 95 dropped → marker MUST fire.
@@ -581,7 +591,7 @@ def test_read_output_no_marker_when_file_has_fewer_lines_than_tail(
         argv=["bash", "-c", "for i in $(seq 1 5); do echo line_$i; done"],
     )
     _wait_until_done(registry, job.job_id)
-    out = registry.read_output(job.job_id, tail_lines=100, stream="stdout")
+    out = registry.read_job_output(job, tail_lines=100, stream="stdout")
     tail = out["stdout_tail"]
     assert "[…truncated;" not in tail
     assert "line_1" in tail

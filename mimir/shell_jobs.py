@@ -488,8 +488,48 @@ class ShellJobRegistry:
         return job
 
     def get(self, job_id: str) -> Optional[ShellJob]:
+        """Return a job for trusted lifecycle code, without caller authorization."""
         with self._lock:
             return self._jobs.get(job_id)
+
+    @staticmethod
+    def _is_owned_by(job: ShellJob, auth_context: object | None) -> bool:
+        """Whether a server-created turn carrier owns ``job``.
+
+        Caller-facing reads fail closed when no carrier is available. Channel is
+        the primary isolation boundary; when spawn recorded a principal, require
+        the reading carrier to represent that same principal as well.
+        """
+        if auth_context is None or job.channel_id is None:
+            return False
+        if getattr(auth_context, "channel_id", None) != job.channel_id:
+            return False
+        spawned_auth = job.auth_context
+        if spawned_auth is None:
+            return True
+        if getattr(spawned_auth, "channel_id", None) != job.channel_id:
+            return False
+
+        def _principal(carrier: object) -> object:
+            return (
+                getattr(carrier, "canonical_principal", None)
+                or getattr(carrier, "principal", None)
+            )
+
+        spawned_principal = _principal(spawned_auth)
+        reading_principal = _principal(auth_context)
+        return (
+            spawned_principal == reading_principal
+            and getattr(spawned_auth, "is_service", False)
+            == getattr(auth_context, "is_service", False)
+        )
+
+    def get_owned(
+        self, job_id: str, *, auth_context: object | None,
+    ) -> Optional[ShellJob]:
+        """Return ``job_id`` only when ``auth_context`` owns it."""
+        job = self.get(job_id)
+        return job if job is not None and self._is_owned_by(job, auth_context) else None
 
     def all_jobs(self) -> list[ShellJob]:
         with self._lock:
@@ -533,13 +573,15 @@ class ShellJobRegistry:
         self,
         job_id: str,
         *,
+        auth_context: object | None,
         tail_lines: int = SHELL_JOB_OUTPUT_DEFAULT_TAIL_LINES,
         stream: str = DEFAULT_SHELL_JOB_STREAM,
     ) -> dict:
         """Return tail of stdout/stderr for ``job_id``.
 
         ``stream`` ∈ {"stdout", "stderr", "both"}. Returns
-        ``{"error": ...}`` for unknown jobs.
+        ``{"error": ...}`` for unknown jobs and jobs not owned by the supplied
+        turn carrier, so callers cannot distinguish those cases.
 
         **Sync I/O note (PR #111 review).** This method does file IO
         (seek-from-end tail, up to 10 MiB) and is intentionally
@@ -552,9 +594,22 @@ class ShellJobRegistry:
         end up needing this, the right escalation is to split into
         ``_read_output_sync`` private + async ``read_output`` public,
         not to async-ify the whole call chain."""
-        job = self.get(job_id)
+        job = self.get_owned(job_id, auth_context=auth_context)
         if job is None:
             return {"error": f"unknown job_id: {job_id}"}
+
+        return self.read_job_output(job, tail_lines=tail_lines, stream=stream)
+
+    def read_job_output(
+        self,
+        job: ShellJob,
+        *,
+        tail_lines: int = SHELL_JOB_OUTPUT_DEFAULT_TAIL_LINES,
+        stream: str = DEFAULT_SHELL_JOB_STREAM,
+    ) -> dict:
+        """Read output for an exact registry job held by trusted lifecycle code."""
+        if self.get(job.job_id) is not job:
+            return {"error": f"unknown job_id: {job.job_id}"}
 
         def _tail(path: Path, n: int) -> str:
             # CR2 (external I/O / Pattern A residual) fix: seek-from-end
@@ -705,6 +760,7 @@ def parse_shell_job_tail_lines(
 def shell_job_snapshots(
     registry: ShellJobRegistry | None,
     *,
+    auth_context: object | None,
     scope: str = DEFAULT_SHELL_JOB_SCOPE,
 ) -> list[dict]:
     if registry is None:
@@ -717,6 +773,7 @@ def shell_job_snapshots(
         jobs = registry.visible_jobs()
     else:
         jobs = registry._sorted_jobs(registry.all_jobs())
+    jobs = [job for job in jobs if registry._is_owned_by(job, auth_context)]
     return [job.snapshot() for job in jobs]
 
 
