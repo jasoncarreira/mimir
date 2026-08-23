@@ -249,6 +249,18 @@ class TickBudget:
             return None
         return min(ceiling, remaining)
 
+    def affords(self, seconds: float) -> bool:
+        """Whether ``seconds`` of work can finish before the hard deadline.
+
+        For transports this module cannot hand a timeout to — the trust
+        attestations reach GitHub through ``urllib`` inside ``mimir.pollers`` —
+        reserving their worst-case cost up front is what keeps the bound real.
+        Passing a timeout across that boundary instead would couple the installed
+        skill script to the mimir package version, which is a deploy hazard: the
+        two are updated by the same pull, but a skew breaks the whole tick.
+        """
+        return self.hard_remaining() >= seconds
+
     def note_truncation(self, pass_name: str, skipped: int) -> None:
         if skipped > 0:
             self.truncated[pass_name] = self.truncated.get(pass_name, 0) + skipped
@@ -901,9 +913,14 @@ def _emit_signal(signal_type: str, **extras: object) -> None:
     )
 
 
-#: Ceiling for one trust attestation, matching `_github_api_attestation`'s own
-#: default. Trust resolution can make up to three of these per uncached author.
+#: One trust attestation's worst case, matching `_github_api_attestation`'s own
+#: `timeout` default in `mimir.pollers`. If that default changes, this must too —
+#: it is the reservation that keeps the tick bounded across that boundary.
 TRUST_ATTESTATION_TIMEOUT_SECONDS = 10.0
+#: `_github_content_author` makes one attestation; `_github_author_is_trusted`
+#: makes up to two (collaborator, then org membership).
+AUTHOR_LOOKUP_WORST_CASE_SECONDS = TRUST_ATTESTATION_TIMEOUT_SECONDS
+TRUST_LOOKUP_WORST_CASE_SECONDS = 2 * TRUST_ATTESTATION_TIMEOUT_SECONDS
 
 
 def _pr_author_is_trusted(
@@ -928,42 +945,26 @@ def _pr_author_is_trusted(
     ``_gh_api``'s subprocess, so it needs its own budget plumbing — bounding only
     the `gh api` transport left this one free to overrun the tick.
     """
-    _DENIED = object()
-
-    def _budget_kwargs() -> dict | object:
-        """``{"timeout": t}``, ``{}`` with no budget, or ``_DENIED``.
-
-        With no budget the helpers are called exactly as before, so the
-        attestation keeps its own 10s default and nothing about the unbudgeted
-        path changes.
-        """
-        if tick_budget is None:
-            return {}
-        allowed = tick_budget.call_timeout(
-            ceiling=TRUST_ATTESTATION_TIMEOUT_SECONDS,
-        )
-        return _DENIED if allowed is None else {"timeout": allowed}
+    def _affords(worst_case: float) -> bool:
+        return tick_budget is None or tick_budget.affords(worst_case)
 
     author_key = (repo, number)
     if author_key not in trust_cache:
-        extra = _budget_kwargs()
-        if extra is _DENIED:
+        # Only start a lookup that can finish inside the hard deadline. A cached
+        # author costs nothing and is never gated.
+        if not _affords(AUTHOR_LOOKUP_WORST_CASE_SECONDS):
             return None
         trust_cache[author_key] = _github_content_author(
             repo,
             {"event_type": "pr_opened", "url": url},
             token,
-            **extra,
         )
     author = trust_cache[author_key]
     trust_key = (repo, author if isinstance(author, str) else "")
     if trust_key not in trust_cache:
-        extra = _budget_kwargs()
-        if extra is _DENIED:
+        if not _affords(TRUST_LOOKUP_WORST_CASE_SECONDS):
             return None
-        trust_cache[trust_key] = _github_author_is_trusted(
-            repo, author, token, **extra,
-        )
+        trust_cache[trust_key] = _github_author_is_trusted(repo, author, token)
     return trust_cache[trust_key] is True
 
 

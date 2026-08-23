@@ -1301,26 +1301,29 @@ def test_slow_trust_attestations_cannot_overrun_the_tick(monkeypatch, tmp_path):
     `mimir.pollers._github_content_author` / `_github_author_is_trusted`, which
     reach GitHub over `urllib` with their own 10s timeouts — not through
     `_gh_api`'s subprocess. Clamping only `_gh_api` left this path free to carry
-    the tick past the framework cap, so it needs its own budget plumbing.
+    the tick past the framework cap.
+
+    It is bounded by reserving each lookup's worst case rather than by passing a
+    timeout across the module boundary: doing the latter would make the installed
+    skill script require a matching `mimir` package, and a live dry run against a
+    slightly older checkout failed with exactly that `TypeError`.
     """
     import time as _time
 
     monkeypatch.setattr(poller, "_pr_author_is_trusted", _REAL_TRUST_RESOLVER)
-    # The deadlines here are scaled to keep the test fast, so the *minimum* call
-    # timeout has to scale with them. Left at its real 2.0s it exceeds the whole
-    # 0.5s hard deadline, every call is refused before it starts, and the test
-    # silently proves nothing — which is how the first draft of this test passed
-    # while never reaching the transport it exists to cover.
-    monkeypatch.setattr(poller, "GH_API_MIN_TIMEOUT_SECONDS", 0.02)
-    handed: list[object] = []
+    # Scale the reservations with the scaled deadlines, or every lookup is
+    # refused before it starts and the test silently proves nothing.
+    monkeypatch.setattr(poller, "AUTHOR_LOOKUP_WORST_CASE_SECONDS", 0.06)
+    monkeypatch.setattr(poller, "TRUST_LOOKUP_WORST_CASE_SECONDS", 0.12)
+    started: list[str] = []
 
-    def slow_author(repo, extras, token, **kwargs):
-        handed.append(kwargs.get("timeout"))
+    def slow_author(repo, extras, token):
+        started.append("author")
         _time.sleep(0.05)
         return "outside-contributor"
 
-    def slow_trust(repo, author, token, **kwargs):
-        handed.append(kwargs.get("timeout"))
+    def slow_trust(repo, author, token):
+        started.append("trust")
         _time.sleep(0.05)
         return True
 
@@ -1334,14 +1337,10 @@ def test_slow_trust_attestations_cannot_overrun_the_tick(monkeypatch, tmp_path):
 
     assert elapsed < 1.2, f"tick ran {elapsed:.2f}s; trust path not bounded"
     assert len(saved) == 1
-    # The budget actually reached this transport...
-    assert handed, "trust path never exercised — the test cannot see the bug"
-    # ...and every timeout it handed over was budget-derived, never the
-    # attestation's own 10s default.
-    assert all(
-        isinstance(t, float) and 0 < t <= poller.TRUST_ATTESTATION_TIMEOUT_SECONDS
-        for t in handed
-    ), handed
+    # The transport was genuinely exercised...
+    assert started, "trust path never reached — the test cannot see the bug"
+    # ...and stopped well short of one lookup per PR, which unbounded would be.
+    assert len(started) < 40, f"{len(started)} lookups; headroom not reserved"
 
 
 def test_unresolvable_trust_skips_the_pr_instead_of_marking_it_untrusted(
@@ -1360,11 +1359,11 @@ def test_unresolvable_trust_skips_the_pr_instead_of_marking_it_untrusted(
 
     monkeypatch.setattr(
         poller, "_github_content_author",
-        lambda *a, **k: calls.append("author") or "outside-contributor",
+        lambda *a: calls.append("author") or "outside-contributor",
     )
     monkeypatch.setattr(
         poller, "_github_author_is_trusted",
-        lambda *a, **k: calls.append("trust") or True,
+        lambda *a: calls.append("trust") or True,
     )
     monkeypatch.setattr(
         poller, "_gh_api",
@@ -1406,7 +1405,7 @@ def test_unresolvable_trust_in_pushes_carries_the_prior_head_forward(monkeypatch
     attempted: list[str] = []
     monkeypatch.setattr(
         poller, "_github_content_author",
-        lambda *a, **k: attempted.append("author") or "outside-contributor",
+        lambda *a: attempted.append("author") or "outside-contributor",
     )
     monkeypatch.setattr(poller, "_emit", lambda *a, **k: None)
     monkeypatch.setattr(poller, "_emit_signal", lambda *a, **k: None)
