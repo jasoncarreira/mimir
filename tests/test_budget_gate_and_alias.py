@@ -23,6 +23,8 @@ from __future__ import annotations
 
 import asyncio
 import contextvars
+import json
+import subprocess
 import time
 from pathlib import Path
 from textwrap import dedent
@@ -3671,6 +3673,172 @@ async def test_middleware_emits_tool_call_events_for_success_and_error(
     assert tool_errors[0]["arguments"] == {"path": "/mimir-home/state/x"}
     assert "private content" not in str(tool_calls[1])
     assert "private content" not in str(tool_errors[0])
+
+
+@pytest.mark.asyncio
+async def test_middleware_records_raised_returned_and_typed_failures(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: list[tuple[str, dict[str, Any]]] = []
+
+    async def _capture(kind: str, **kw: Any) -> None:
+        captured.append((kind, kw))
+
+    monkeypatch.setattr("mimir.event_logger.log_event", _capture)
+    mw = BudgetGateMiddleware()
+
+    async def raised_handler(req: ToolCallRequest) -> ToolMessage:
+        raise RuntimeError("raised failure")
+
+    async def returned_handler(req: ToolCallRequest) -> ToolMessage:
+        return ToolMessage(
+            content="memory_query failed: returned failure",
+            tool_call_id=req.tool_call["id"],
+            name=req.tool_call["name"],
+        )
+
+    async def success_handler(req: ToolCallRequest) -> ToolMessage:
+        return ToolMessage(
+            content="memory query complete",
+            tool_call_id=req.tool_call["id"],
+            name=req.tool_call["name"],
+        )
+
+    async def typed_handler(req: ToolCallRequest) -> ToolMessage:
+        return ToolMessage(
+            content=json.dumps({
+                "ok": False,
+                "code": "tests_failed",
+                "returncode": 1,
+                "stdout": "",
+                "stderr": "failed",
+                "command": ["pytest"],
+                "command_source": "deployment",
+                "output_limited": False,
+                "stdout_dropped_bytes": 0,
+                "stderr_dropped_bytes": 0,
+                "git_context": "clean",
+            }),
+            tool_call_id=req.tool_call["id"],
+            name=req.tool_call["name"],
+        )
+
+    async def git_handler(req: ToolCallRequest) -> ToolMessage:
+        return ToolMessage(
+            content=json.dumps({
+                "ok": False,
+                "code": "git_failed",
+                "stdout": "",
+                "stderr": "fatal",
+            }),
+            tool_call_id=req.tool_call["id"],
+            name=req.tool_call["name"],
+        )
+
+    async def arbitrary_dict_handler(req: ToolCallRequest) -> ToolMessage:
+        return ToolMessage(
+            content=json.dumps({"ok": False, "code": "not-a-declared-contract"}),
+            tool_call_id=req.tool_call["id"],
+            name=req.tool_call["name"],
+        )
+
+    async def missing_executable_handler(req: ToolCallRequest) -> ToolMessage:
+        return ToolMessage(
+            content="shell_exec failed: executable 'missing' not found",
+            tool_call_id=req.tool_call["id"],
+            name=req.tool_call["name"],
+        )
+
+    ctx = _make_ctx(budget=10)
+    token = set_current_turn(ctx)
+    try:
+        with pytest.raises(RuntimeError, match="raised failure"):
+            await mw.awrap_tool_call(
+                _make_request("memory_query", "id-raised"), raised_handler,
+            )
+        await mw.awrap_tool_call(
+            _make_request("memory_query", "id-returned"), returned_handler,
+        )
+        await mw.awrap_tool_call(
+            _make_request("memory_query", "id-success"), success_handler,
+        )
+        await mw.awrap_tool_call(
+            _make_request("repo_test", "id-typed"), typed_handler,
+        )
+        await mw.awrap_tool_call(
+            _make_request("repo_status", "id-git"), git_handler,
+        )
+        await mw.awrap_tool_call(
+            _make_request("memory_query", "id-arbitrary"), arbitrary_dict_handler,
+        )
+        await mw.awrap_tool_call(
+            _make_request(
+                "shell_exec", "id-missing", args={"command": "missing --version"},
+            ),
+            missing_executable_handler,
+        )
+    finally:
+        reset_current_turn(token)
+
+    await asyncio.sleep(0)
+    tool_calls = [kw for kind, kw in captured if kind == "tool_call"]
+    tool_errors = [kw for kind, kw in captured if kind == "tool_error"]
+    assert [event["ok"] for event in tool_calls] == [
+        False, False, True, False, False, True, False,
+    ]
+    assert [event["tool"] for event in tool_errors] == [
+        "memory_query", "memory_query", "repo_test", "repo_status", "shell_exec",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_shell_exec_timeout_event_contains_redacted_bounded_command(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from mimir.tools.extra import shell_exec
+
+    captured: list[tuple[str, dict[str, Any]]] = []
+    secret = "ghp_" + "a" * 36
+    command = f"curl https://example.invalid/?token={secret} " + "x" * 300
+
+    async def _capture(kind: str, **kw: Any) -> None:
+        captured.append((kind, kw))
+
+    def _timeout(*args: Any, **kwargs: Any) -> None:
+        raise subprocess.TimeoutExpired(cmd="bash", timeout=900)
+
+    monkeypatch.setattr("mimir.event_logger.log_event", _capture)
+    monkeypatch.setattr("mimir.tools.extra.subprocess.run", _timeout)
+    mw = BudgetGateMiddleware()
+
+    async def handler(req: ToolCallRequest) -> ToolMessage:
+        content = shell_exec.invoke(req.tool_call["args"])
+        return ToolMessage(
+            content=content,
+            tool_call_id=req.tool_call["id"],
+            name=req.tool_call["name"],
+        )
+
+    ctx = _make_ctx(budget=5)
+    token = set_current_turn(ctx)
+    try:
+        await mw.awrap_tool_call(
+            _make_request("shell_exec", "id-timeout", args={"command": command}),
+            handler,
+        )
+    finally:
+        reset_current_turn(token)
+
+    await asyncio.sleep(0)
+    tool_call = next(kw for kind, kw in captured if kind == "tool_call")
+    tool_error = next(kw for kind, kw in captured if kind == "tool_error")
+    assert tool_call["ok"] is False
+    assert tool_call["arguments"]["command"].startswith(
+        "curl https://example.invalid/?token=[REDACTED]",
+    )
+    assert len(tool_call["arguments"]["command"]) == 200
+    assert secret not in str(tool_call)
+    assert tool_error["arguments"] == tool_call["arguments"]
 
 
 def test_failed_tool_events_keep_error_head_and_tail_within_existing_limit(
