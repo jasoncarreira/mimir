@@ -1481,7 +1481,11 @@ def build_app(config: Config) -> web.Application:
                 home=config.home,
             )
         except ValueError as exc:
-            await log_event("scheduler_invalid_cron", error=str(exc))
+            await log_event(
+                "scheduler_invalid_cron",
+                job="saga-consolidate",
+                error=str(exc),
+            )
             consolidate_registered = False
 
         # Check FAISS soft-removal fragmentation independently of the
