@@ -3025,6 +3025,16 @@ def test_factory_identity_preflight_is_not_repeated_for_retained_run(
             return cp(args, stdout=epic)
         if isinstance(args, list) and args[:4] == ["git", "-C", str(repo), "config"]:
             return cp(args, stdout="git@github.com:owner/repo.git\n")
+        if isinstance(args, list) and args[-2:] == ["rev-parse", "--show-toplevel"]:
+            return cp(args, stdout=f"{tmp_path / 'sandbox'}\n")
+        if isinstance(args, list) and args[-2:] == ["rev-parse", "--absolute-git-dir"]:
+            return cp(args, stdout=f"{tmp_path / 'sandbox' / '.git'}\n")
+        if isinstance(args, list) and args[-3:] == ["config", "--get", "remote.origin.url"]:
+            return cp(args, stdout="git@github.com:owner/repo.git\n")
+        if isinstance(args, list) and args[-2:] == ["branch", "--show-current"]:
+            return cp(args, stdout="epic/700\n")
+        if isinstance(args, list) and "rev-parse" in args:
+            return cp(args, stdout="a" * 40 + "\n")
         return cp(args)
 
     claim = ClaimRecord(700, 1, "agent", datetime.now(UTC))
@@ -3043,24 +3053,26 @@ def test_factory_identity_preflight_is_not_repeated_for_retained_run(
         observed_at=None,
         controller_phase="running",
     )
+    (tmp_path / "sandbox").mkdir()
+    save_factory_record(tmp_path, retained)
 
     async def recover(self: object, **kwargs: object) -> object:
-        assert kwargs["retained"] is retained
+        assert kwargs["retained"] == retained
         return orchestrator.WorklinkRunResult(700, 1, "needs-human")
 
     def unexpected(*args: object, **kwargs: object) -> object:
         raise AssertionError("new-run identity preflight reached during recovery")
 
-    monkeypatch.setattr(FeatureFactoryBackend, "admit", lambda self: Path(self.entrypoint))
-    monkeypatch.setattr(
-        orchestrator.ChainlinkClaims,
-        "claim_issue",
-        lambda self, *args, **kwargs: ClaimResult(True, claim),
-    )
+    monkeypatch.setattr(FeatureFactoryBackend, "admit", lambda self: Path(retained.launcher))
+
+    def claim_issue(self: object, *args: object, **kwargs: object) -> ClaimResult:
+        kwargs["before_claim"]()
+        return ClaimResult(True, claim)
+
+    monkeypatch.setattr(orchestrator.ChainlinkClaims, "claim_issue", claim_issue)
     monkeypatch.setattr(
         orchestrator.ChainlinkClaims, "release_issue", lambda *args, **kwargs: None
     )
-    monkeypatch.setattr(orchestrator, "load_factory_record", lambda *args: retained)
     monkeypatch.setattr(WorklinkRunner, "_recover_factory_070", recover)
     monkeypatch.setattr(orchestrator, "_read_checkout_git_identity", unexpected)
     monkeypatch.setattr(orchestrator, "_read_factory_publishing_identity", unexpected)
@@ -3070,11 +3082,12 @@ def test_factory_identity_preflight_is_not_repeated_for_retained_run(
         WorklinkRunner(home=tmp_path, repo=repo, runner=runner, agent_id="agent").run_epic(700)
     )
 
-    assert result.status == "needs-human"
+    assert result.status == "needs-human", result.reason
 
 
-def test_factory_early_failed_record_is_archived_before_fresh_run(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize("refusal", ["sandbox", "launcher", "base", "session", "lifecycle"])
+def test_unbindable_factory_record_is_archived_before_claim_and_fresh_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, refusal: str
 ) -> None:
     import mimir.worklink.orchestrator as orchestrator
 
@@ -3103,13 +3116,23 @@ def test_factory_early_failed_record_is_archived_before_fresh_run(
         branch="issue/700-a1",
         launcher="/opt/factory/bin/factory.js",
         sandbox=str(old_sandbox),
-        session=None,
+        session="session-1",
         handle=LaunchHandle("local_subprocess", "999999999", 1),
         status=None,
         observed_at=None,
         controller_phase="failed",
         controller_error="factory status missing field: branch",
     )
+    if refusal == "sandbox":
+        old_sandbox.rmdir()
+    elif refusal == "launcher":
+        retained = replace(retained, launcher="/opt/old/factory.js")
+    elif refusal == "base":
+        retained = replace(retained, base_ref="develop")
+    elif refusal == "session":
+        retained = replace(retained, session=None)
+    elif refusal == "lifecycle":
+        retained = replace(retained, controller_phase="stopped")
     save_factory_record(tmp_path, retained)
     claim = ClaimRecord(700, 2, "agent", datetime.now(UTC), budget_attempt=2)
     lease = CheckoutLease(
@@ -3123,6 +3146,7 @@ def test_factory_early_failed_record_is_archived_before_fresh_run(
         isolated_checkout=True,
     )
     transitions: list[dict[str, object]] = []
+    claimed_after_archive: list[bool] = []
 
     def runner(args: Sequence[str] | str, **_: object) -> subprocess.CompletedProcess[str]:
         if isinstance(args, list) and args[:4] == ["chainlink", "issue", "show", "700"]:
@@ -3164,12 +3188,16 @@ def test_factory_early_failed_record_is_archived_before_fresh_run(
         def verify_identity(self, expected: str) -> None:
             pass
 
-    monkeypatch.setattr(FeatureFactoryBackend, "admit", lambda self: Path(retained.launcher))
     monkeypatch.setattr(
-        orchestrator.ChainlinkClaims,
-        "claim_issue",
-        lambda self, *args, **kwargs: ClaimResult(True, claim),
+        FeatureFactoryBackend, "admit", lambda self: Path("/opt/factory/bin/factory.js")
     )
+
+    def claim_issue(self: object, *args: object, **kwargs: object) -> ClaimResult:
+        kwargs["before_claim"]()
+        claimed_after_archive.append(load_factory_record(tmp_path, "700") is None)
+        return ClaimResult(True, claim)
+
+    monkeypatch.setattr(orchestrator.ChainlinkClaims, "claim_issue", claim_issue)
     monkeypatch.setattr(
         orchestrator.ChainlinkClaims, "release_issue", lambda *args, **kwargs: None
     )
@@ -3200,6 +3228,7 @@ def test_factory_early_failed_record_is_archived_before_fresh_run(
     )
 
     assert result.status == "needs-human"
+    assert claimed_after_archive == [True]
     assert transitions == []
     assert load_factory_record(tmp_path, "chainlink-700").attempt == 2
     archives = list(
@@ -3209,7 +3238,7 @@ def test_factory_early_failed_record_is_archived_before_fresh_run(
     assert FactoryRunRecord.from_json(
         json.loads(archives[0].read_text(encoding="utf-8"))
     ) == retained
-    assert old_sandbox.is_dir()
+    assert old_sandbox.is_dir() is (refusal != "sandbox")
 
 
 def test_factory_launch_preflight_refuses_existing_run_sandbox(tmp_path: Path) -> None:
@@ -3254,27 +3283,11 @@ def test_factory_launch_preflight_refuses_existing_run_sandbox(tmp_path: Path) -
 
 
 @pytest.mark.parametrize("phase", ["running", "parked", "failed", "terminal"])
-def test_factory_recovery_selection_requires_session(phase: str, tmp_path: Path) -> None:
+def test_factory_recovery_phases_are_explicit(phase: str) -> None:
     import mimir.worklink.orchestrator as orchestrator
 
-    record = FactoryRunRecord(
-        run_id="700",
-        issue_id=700,
-        attempt=1,
-        repository="owner/repo",
-        base_ref="main",
-        branch="epic/700",
-        launcher="/opt/factory/bin/factory.js",
-        sandbox=str(tmp_path / "sandbox"),
-        session="session-1",
-        handle=None,
-        status=None,
-        observed_at=None,
-        controller_phase=phase,
-    )
-
-    assert orchestrator._factory_record_is_recoverable(record)
-    assert not orchestrator._factory_record_is_recoverable(replace(record, session=None))
+    assert phase in orchestrator._RECOVERABLE_FACTORY_PHASES
+    assert "stopped" not in orchestrator._RECOVERABLE_FACTORY_PHASES
 
 
 @pytest.mark.parametrize("autonomous", [False, True])
@@ -3323,6 +3336,8 @@ def test_every_epic_claim_uses_factory_concurrency_cap(
     )
 
     assert result.reason == "concurrency cap reached (1/1 active claims)"
+    before_claim = observed[0].pop("before_claim")
+    assert callable(before_claim)
     assert observed == [{
         "labels": {"worklink", "worklink:epic", "worklink:ready"},
         "max_active_locks": 1,

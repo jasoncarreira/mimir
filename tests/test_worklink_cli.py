@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 import json
 import os
@@ -246,6 +247,45 @@ def test_worklink_cli_has_no_factory_cancel_transition() -> None:
 
     with pytest.raises(SystemExit):
         parser.parse_args(["worklink", "factory-cancel", "700"])
+
+
+def test_worklink_archive_factory_run_cli_archives_canonical_and_legacy_records(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    canonical = FactoryRunRecord(
+        run_id="chainlink-700",
+        issue_id=700,
+        attempt=2,
+        repository="owner/repo",
+        base_ref="main",
+        branch="feature/chainlink-700",
+        launcher="/opt/factory/bin/factory.js",
+        sandbox=str(tmp_path / "chainlink-700"),
+        session="session-2",
+        handle=None,
+        status=None,
+        observed_at=None,
+        controller_phase="stopped",
+    )
+    legacy = replace(
+        canonical,
+        run_id="700",
+        attempt=1,
+        branch="epic/700",
+        sandbox=str(tmp_path / "legacy"),
+        session="session-1",
+    )
+    save_factory_record(tmp_path, canonical)
+    save_factory_record(tmp_path, legacy)
+
+    with pytest.raises(SystemExit) as exc:
+        main(["worklink", "archive-factory-run", "700", "--home", str(tmp_path)])
+
+    assert exc.value.code == 0
+    assert load_factory_record(tmp_path, "chainlink-700") is None
+    assert load_factory_record(tmp_path, "700") is None
+    assert len(list((tmp_path / "state/worklink/factory-runs/archive").glob("*.json"))) == 2
+    assert "archived 2 factory record(s)" in capsys.readouterr().out
 
 
 def test_worklink_cli_rejects_unknown_subcommand(

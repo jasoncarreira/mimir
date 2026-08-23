@@ -88,6 +88,7 @@ _PR_BODY_SECTION_FILE = ".worklink-pr-body.md"
 _PR_BODY_SECTION_MAX_BYTES = 4000
 _PR_BODY_SECTION_TRUNCATED = "\n\n[Build summary truncated by Worklink.]"
 _FACTORY_CONTROLLER_ERROR_MAX_BYTES = 4000
+_RECOVERABLE_FACTORY_PHASES = {"running", "parked", "failed", "terminal"}
 _EVIDENCE_HEADING_RE = re.compile(r"(?im)^Worklink evidence:\s*$")
 # GitHub's documented closing-keyword set:
 # https://docs.github.com/en/issues/tracking-your-work-with-issues/using-issues/linking-a-pull-request-to-an-issue
@@ -1488,12 +1489,41 @@ class WorklinkRunner:
         issue = issue_reader.read(issue_id)
         work_item_json = render_work_item(issue)
         run_id = _validate_epic_work_item(work_item_json, issue.issue_id)
+        retained: FactoryRunRecord | None = None
+
+        def prepare_factory_claim() -> None:
+            nonlocal retained
+            candidates = [
+                record
+                for record_id in (run_id, str(issue_id))
+                if (record := load_factory_record(self.home, record_id)) is not None
+            ]
+            candidates.sort(
+                key=lambda record: (record.attempt, record.run_id == run_id), reverse=True
+            )
+            for candidate in candidates:
+                recoverable = _factory_record_is_recoverable(
+                    candidate,
+                    runner=self,
+                    issue=issue,
+                    launcher=launcher,
+                    repo_slug=repo_slug,
+                    base=base,
+                    command_runner=runner,
+                )
+                if recoverable:
+                    if retained is None:
+                        retained = candidate
+                    continue
+                archive_factory_record(self.home, candidate)
+
         claim = claims.claim_issue(
             issue_id,
             issue.comments,
             labels=issue.labels,
             max_active_locks=factory_max_concurrent(),
             active_label="worklink:epic",
+            before_claim=prepare_factory_claim,
         )
         if claim.attempts_exhausted:
             return WorklinkRunResult(issue_id, None, "blocked", reason="attempts_exhausted")
@@ -1502,33 +1532,22 @@ class WorklinkRunner:
                 issue_id, None, "failed", reason=claim.reason or "claim_failed"
             )
         claim_record = claim.record
-        retained = load_factory_record(self.home, run_id)
-        if retained is None:
-            retained = load_factory_record(self.home, str(issue_id))
         lease: CheckoutLease | None = None
         try:
             if retained is not None:
-                recoverable_phase = retained.controller_phase in {
-                    "running",
-                    "parked",
-                    "failed",
-                    "terminal",
-                }
-                if _factory_record_is_recoverable(retained) or not recoverable_phase:
-                    return await self._recover_factory_070(
-                        issue=issue,
-                        claim_record=claim_record,
-                        claims=claims,
-                        backend=selected,
-                        compute=compute,
-                        retained=retained,
-                        launcher=launcher,
-                        repo_slug=repo_slug,
-                        base=base,
-                        test_cmd=test_cmd,
-                        runner=runner,
-                    )
-                archive_factory_record(self.home, retained)
+                return await self._recover_factory_070(
+                    issue=issue,
+                    claim_record=claim_record,
+                    claims=claims,
+                    backend=selected,
+                    compute=compute,
+                    retained=retained,
+                    launcher=launcher,
+                    repo_slug=repo_slug,
+                    base=base,
+                    test_cmd=test_cmd,
+                    runner=runner,
+                )
             lease = _create_backend_checkout(
                 self.repo,
                 issue_id=issue_id,
@@ -2105,10 +2124,36 @@ async def _cancel_and_cleanup_factory_handle(compute: Any, handle: LaunchHandle)
         await compute.cleanup(handle)
 
 
-def _factory_record_is_recoverable(record: FactoryRunRecord) -> bool:
-    return record.controller_phase in {"running", "parked", "failed", "terminal"} and bool(
-        record.session
-    )
+def _factory_record_is_recoverable(
+    record: FactoryRunRecord,
+    *,
+    runner: WorklinkRunner,
+    issue: IssueContext,
+    launcher: Path,
+    repo_slug: str,
+    base: str,
+    command_runner: Runner,
+) -> bool:
+    """Return whether the retained controller binding can still be resumed.
+
+    ``running`` is active work, ``parked`` awaits a human gate, ``failed`` may
+    resume after a controller error, and ``terminal`` may finish reconciliation.
+    ``stopped`` records a deliberate operator cancellation and starts no recovery;
+    unknown phases are likewise abandoned fail-closed.
+    """
+    try:
+        _verify_factory_recovery_target(
+            runner=runner,
+            issue=issue,
+            retained=record,
+            launcher=launcher,
+            repo_slug=repo_slug,
+            base=base,
+            command_runner=command_runner,
+        )
+    except WorklinkError:
+        return False
+    return True
 
 
 def _opaque_json_bytes(value: dict[str, Any] | None) -> bytes:
@@ -2132,6 +2177,34 @@ def _verify_factory_recovery_binding(
     base: str,
     command_runner: Runner,
 ) -> Path:
+    sandbox = _verify_factory_recovery_target(
+        runner=runner,
+        issue=issue,
+        retained=retained,
+        launcher=launcher,
+        repo_slug=repo_slug,
+        base=base,
+        command_runner=command_runner,
+    )
+    if claim_record.issue_id != issue.issue_id:
+        raise WorklinkError("factory recovery claim issue does not match")
+    if claim_record.agent_id != claims.agent_id or claims.agent_id != runner.agent_id:
+        raise WorklinkError("factory recovery claim owner does not match")
+    if not getattr(claims, "_lock_still_held_by")(claim_record):
+        raise WorklinkError("factory recovery claim is not retained")
+    return sandbox
+
+
+def _verify_factory_recovery_target(
+    *,
+    runner: WorklinkRunner,
+    issue: IssueContext,
+    retained: FactoryRunRecord,
+    launcher: Path,
+    repo_slug: str,
+    base: str,
+    command_runner: Runner,
+) -> Path:
     if retained.issue_id != issue.issue_id or retained.run_id not in {
         str(issue.issue_id),
         f"chainlink-{issue.issue_id}",
@@ -2148,16 +2221,10 @@ def _verify_factory_recovery_binding(
         raise WorklinkError("retained factory base does not match recovery request")
     if retained.launcher != str(launcher):
         raise WorklinkError("retained factory launcher does not match recovery request")
-    if retained.controller_phase not in {"running", "parked", "failed", "terminal"}:
+    if retained.controller_phase not in _RECOVERABLE_FACTORY_PHASES:
         raise WorklinkError("retained factory lifecycle is not recoverable")
     if not retained.session:
         raise WorklinkError("retained factory session is missing")
-    if claim_record.issue_id != issue.issue_id:
-        raise WorklinkError("factory recovery claim issue does not match")
-    if claim_record.agent_id != claims.agent_id or claims.agent_id != runner.agent_id:
-        raise WorklinkError("factory recovery claim owner does not match")
-    if not getattr(claims, "_lock_still_held_by")(claim_record):
-        raise WorklinkError("factory recovery claim is not retained")
     sandbox = Path(retained.sandbox)
     if not sandbox.is_absolute() or not sandbox.is_dir() or sandbox.is_symlink():
         raise WorklinkError("retained factory sandbox is unavailable")

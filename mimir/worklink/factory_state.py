@@ -322,19 +322,6 @@ def list_factory_records(home: Path) -> list[FactoryRunRecord]:
     return [record for record in records if record is not None]
 
 
-def clear_factory_record(home: Path, run_id: str) -> None:
-    if not _require_safe_directory(factory_records_dir(home), create=False):
-        return
-    path = factory_record_path(home, run_id)
-    try:
-        value = path.lstat()
-    except FileNotFoundError:
-        return
-    if stat.S_ISLNK(value.st_mode) or not stat.S_ISREG(value.st_mode):
-        raise FactoryRecordError("refusing to remove non-regular factory record")
-    path.unlink()
-
-
 def factory_process_is_alive(record: FactoryRunRecord) -> bool:
     handle = record.handle
     if handle is None or handle.substrate != "local_subprocess":
