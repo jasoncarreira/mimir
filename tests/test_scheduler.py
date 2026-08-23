@@ -3677,7 +3677,12 @@ async def test_fire_quota_recovery_enqueues_heartbeat(tmp_path: Path):
     home = tmp_path / "home"
     (home / "prompts").mkdir(parents=True)
     (home / "prompts" / "heartbeat.md").write_text("run the heartbeat\n")
-    sched = Scheduler(scheduler_yaml=tmp_path / "s.yaml", enqueue=fake_enqueue, home=home)
+    scheduler_yaml = tmp_path / "s.yaml"
+    write_jobs(scheduler_yaml, [SchedulerJob(
+        name="heartbeat", prompt_file="heartbeat.md", cron="0 * * * *",
+        authority_profile="heartbeat",
+    )])
+    sched = Scheduler(scheduler_yaml=scheduler_yaml, enqueue=fake_enqueue, home=home)
 
     await sched._fire_quota_recovery()
 
@@ -3689,6 +3694,56 @@ async def test_fire_quota_recovery_enqueues_heartbeat(tmp_path: Path):
     assert synthetic is not None
     assert set(synthetic.capabilities) == set(scheduled.capabilities)
     assert synthetic == scheduled
+
+
+@pytest.mark.asyncio
+async def test_quota_recovery_uses_configured_heartbeat_authority_and_commands(
+    tmp_path: Path,
+):
+    """Part C: recovery carries the live scheduler.yaml job unchanged."""
+    executable = Path(shutil.which("printf") or "/usr/bin/printf").resolve()
+    scheduler_yaml = tmp_path / "scheduler.yaml"
+    write_jobs(scheduler_yaml, [SchedulerJob(
+        name="heartbeat",
+        prompt="configured heartbeat",
+        cron="0 * * * *",
+        authority_profile="heartbeat",
+        shell_commands=[{
+            "exec": executable.name,
+            "path": str(executable),
+            "subcommands": [["quota-recovery"]],
+            "options": [],
+        }],
+    )])
+    enqueued: list[AgentEvent] = []
+
+    async def enqueue(event: AgentEvent) -> bool:
+        enqueued.append(event)
+        return True
+
+    sched = Scheduler(scheduler_yaml=scheduler_yaml, enqueue=enqueue, home=tmp_path)
+    await sched._fire_quota_recovery()
+
+    [event] = enqueued
+    assert event.content == "configured heartbeat"
+    assert event.service_authority is not None
+    assert event.service_authority.authority_profile == "heartbeat"
+    assert len(event.service_authority.declared_shell_commands) == 1
+
+
+@pytest.mark.asyncio
+async def test_quota_recovery_paths_skip_disabled_heartbeat(tmp_path: Path):
+    """Part C: neither reset-time nor early recovery invents a heartbeat."""
+    enqueued: list[AgentEvent] = []
+    sched, home, store = _paused_scheduler(tmp_path, enqueued)
+    write_jobs(sched._yaml_path, [])
+
+    await sched._fire_quota_recovery()
+    _record_pause(home)
+    _fresh_snap(store, "five_hour", 0.30)
+    await sched._recheck_quota_pause()
+
+    assert enqueued == []
 
 
 @pytest.mark.asyncio
@@ -4082,6 +4137,81 @@ async def test_fire_poller_budget_under_limit_still_runs(tmp_path: Path, monkeyp
 
 
 @pytest.mark.asyncio
+async def test_fire_poller_budget_caps_events_enqueued_by_one_fire(
+    tmp_path: Path, monkeypatch,
+):
+    """Part A: 40 batches against three turns of headroom enqueue only three."""
+    from mimir.event_logger import init_logger
+    init_logger(tmp_path / "logs" / "events.jsonl", session_id="test-session")
+    accepted: list[AgentEvent] = []
+
+    async def enqueue(event: AgentEvent) -> bool:
+        accepted.append(event)
+        return True
+
+    sched = Scheduler(
+        scheduler_yaml=tmp_path / "s.yaml", enqueue=enqueue,
+        arbiter=_StubArbiter(fire=True), home=tmp_path,
+    )
+    skills = tmp_path / "skills"
+    _drop_priority_poller(
+        skills, "p1", priority="normal",
+        budget={"windows": {"1h": {"max_agent_turns": 3}}},
+    )
+    sched.add_poller_jobs(skills)
+    results: list[bool] = []
+
+    async def fake_run_poller(poller, enqueue, home=None):
+        for index in range(40):
+            results.append(await enqueue(AgentEvent(
+                trigger="poller", channel_id=f"poller:{poller.name}",
+                content=str(index),
+            )))
+
+    monkeypatch.setattr("mimir.scheduler.run_poller", fake_run_poller)
+    await sched._fire_poller(poller_name="p1")
+
+    assert len(accepted) == 3
+    assert results.count(True) == 3
+    assert results.count(False) == 37
+
+
+@pytest.mark.asyncio
+async def test_fire_poller_budget_admits_all_events_within_headroom(
+    tmp_path: Path, monkeypatch,
+):
+    """Part A positive control: healthy fires remain unthrottled."""
+    accepted: list[AgentEvent] = []
+
+    async def enqueue(event: AgentEvent) -> bool:
+        accepted.append(event)
+        return True
+
+    sched = Scheduler(
+        scheduler_yaml=tmp_path / "s.yaml", enqueue=enqueue,
+        arbiter=_StubArbiter(fire=True), home=tmp_path,
+    )
+    skills = tmp_path / "skills"
+    _drop_priority_poller(
+        skills, "p1", priority="normal",
+        budget={"windows": {"1h": {"max_agent_turns": 3}}},
+    )
+    sched.add_poller_jobs(skills)
+
+    async def fake_run_poller(poller, enqueue, home=None):
+        for index in range(2):
+            assert await enqueue(AgentEvent(
+                trigger="poller", channel_id=f"poller:{poller.name}",
+                content=str(index),
+            )) is True
+
+    monkeypatch.setattr("mimir.scheduler.run_poller", fake_run_poller)
+    await sched._fire_poller(poller_name="p1")
+
+    assert len(accepted) == 2
+
+
+@pytest.mark.asyncio
 async def test_fire_poller_budget_checks_do_not_block_loop_and_reuse_snapshot(
     tmp_path: Path, monkeypatch,
 ):
@@ -4368,8 +4498,13 @@ def _paused_scheduler(tmp_path: Path, enqueued: list):
         rate_limit_store=store,
         plan_window_suppress_threshold=0.80,
     )
+    scheduler_yaml = tmp_path / "s.yaml"
+    write_jobs(scheduler_yaml, [SchedulerJob(
+        name="heartbeat", prompt="heartbeat", cron="0 * * * *",
+        authority_profile="heartbeat",
+    )])
     sched = Scheduler(
-        scheduler_yaml=tmp_path / "s.yaml", enqueue=fake_enqueue,
+        scheduler_yaml=scheduler_yaml, enqueue=fake_enqueue,
         home=home, arbiter=arbiter,
     )
     return sched, home, store
