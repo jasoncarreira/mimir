@@ -12,7 +12,6 @@ from mimir.worklink.factory_state import (
     FactoryRecordError,
     FactoryRunRecord,
     archive_factory_record,
-    clear_factory_record,
     list_factory_records,
     load_factory_record,
     save_factory_record,
@@ -83,6 +82,29 @@ def test_archive_factory_record_preserves_evidence_and_vacates_active_slot(
     assert archived == source.parent / "archive" / "1551-attempt-1.json"
     assert FactoryRunRecord.from_json(json.loads(archived.read_text(encoding="utf-8"))) == expected
     assert load_factory_record(tmp_path, "1551") is None
+
+
+def test_archive_factory_record_restores_active_record_when_event_persistence_fails(
+    tmp_path: Path,
+) -> None:
+    expected = replace(record(tmp_path), controller_phase="failed", session=None)
+    source = save_factory_record(tmp_path, expected)
+
+    def fail_event(*args: object, **kwargs: object) -> None:
+        raise OSError("event sink unavailable")
+
+    with pytest.raises(FactoryRecordError, match="event could not be persisted"):
+        archive_factory_record(
+            tmp_path,
+            expected,
+            event_logger=fail_event,
+            source_kind="dispatch_abandonment",
+            reason="retained factory session is missing",
+        )
+
+    assert load_factory_record(tmp_path, "1551") == expected
+    assert source.is_file()
+    assert not list(source.parent.joinpath("archive").glob("*.json"))
 
 
 def test_factory_record_rejects_identity_and_sandbox_mismatch(tmp_path: Path) -> None:
@@ -160,19 +182,7 @@ def test_factory_record_rejects_symlink_and_unbound_run_ids(tmp_path: Path) -> N
         load_factory_record(tmp_path, "not/a/run-id")
 
 
-def test_clear_factory_record_refuses_symlink(tmp_path: Path) -> None:
-    expected = record(tmp_path)
-    path = save_factory_record(tmp_path, expected)
-    path.unlink()
-    target = tmp_path / "target"
-    target.write_text("keep", encoding="utf-8")
-    path.symlink_to(target)
-    with pytest.raises(FactoryRecordError, match="non-regular"):
-        clear_factory_record(tmp_path, "1551")
-    assert target.read_text(encoding="utf-8") == "keep"
-
-
-@pytest.mark.parametrize("operation", ["load", "list", "save", "clear"])
+@pytest.mark.parametrize("operation", ["load", "list", "save"])
 def test_factory_record_rejects_symlink_in_complete_parent_chain(
     tmp_path: Path, operation: str
 ) -> None:
@@ -189,5 +199,3 @@ def test_factory_record_rejects_symlink_in_complete_parent_chain(
             list_factory_records(home)
         elif operation == "save":
             save_factory_record(home, replace(record(tmp_path), sandbox=str(tmp_path / "sandbox")))
-        else:
-            clear_factory_record(home, "1551")
