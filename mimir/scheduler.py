@@ -1310,7 +1310,8 @@ class Scheduler:
         if not fresh_below_wall:
             return
 
-        tracker.clear()
+        if not tracker.clear():
+            return
         await log_event(
             "quota_recovered",
             reset_at=status.reset_at.isoformat() if status.reset_at else None,
@@ -2763,17 +2764,17 @@ class Scheduler:
                     snooze_pileup_threshold=snooze_pileup_threshold,
                 )
                 # Rollup event — single line per sweep, not per record.
-                # Only emit when SOMETHING happened (due / expired /
-                # pileup) to keep events.jsonl from accruing one no-op
-                # record per poll tick.
-                if (result.due_emitted or result.expired_emitted
-                        or result.snooze_pileup_emitted):
+                # A non-empty sweep is observable even when every attempted
+                # lifecycle transition failed. Empty-store ticks stay silent.
+                if result.scanned > 0 or result.corrupt_lines > 0:
                     await log_event(
                         "commitments_due_check_ok",
                         due_emitted=result.due_emitted,
                         expired_emitted=result.expired_emitted,
                         snooze_pileup_emitted=result.snooze_pileup_emitted,
                         scanned=result.scanned,
+                        failed=result.failed,
+                        corrupt_lines=result.corrupt_lines,
                     )
             except Exception as exc:  # noqa: BLE001
                 await log_event(

@@ -614,3 +614,32 @@ async def test_pileup_alarm_failure_skips_log_event(tmp_path: Path, home: Path):
         "an algedonic row without a cooldown marker)."
     )
     assert result.snooze_pileup_emitted == 0
+
+
+@pytest.mark.asyncio
+async def test_part_c_delivery_failure_is_counted_and_emitted(
+    tmp_path: Path, home: Path,
+):
+    store = CommitmentsStore(path=tmp_path / "c.jsonl")
+    now = time.time()
+    rec = await store.add(CommitmentRecord(
+        id=make_commitment_id(), channel_id="c1", text="must surface",
+        due_window_start_unix=now - 60,
+        due_window_end_unix=now + 3600,
+    ))
+
+    async def fail_deliver(*args, **kwargs):
+        raise OSError("commitments disk full")
+
+    store.deliver = fail_deliver  # type: ignore[method-assign]
+    result = await check_due_and_expired(store, now_unix=now)
+
+    assert result.scanned == 1
+    assert result.failed == 1
+    assert result.due_emitted == 0
+    failures = [
+        e for e in _events(home) if e.get("type") == "commitment_deliver_failed"
+    ]
+    assert len(failures) == 1
+    assert failures[0]["commitment_id"] == rec.id
+    assert "OSError" in failures[0]["error"]

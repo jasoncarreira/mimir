@@ -224,6 +224,33 @@ async def test_record_api_usage_skips_unparseable_buckets(tmp_path: Path):
     assert set(recorded.keys()) == {"five_hour"}
 
 
+@pytest.mark.asyncio
+async def test_part_b_failed_quota_writes_are_not_reported_or_flooded(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    from mimir.event_logger import init_logger
+    from mimir.rate_limits import record_api_usage
+
+    events_path = tmp_path / "events.jsonl"
+    init_logger(events_path, session_id="quota-write-failure")
+    store = RateLimitStore(path=tmp_path / "rate_limits.json")
+
+    def fail_write(*args, **kwargs):
+        raise OSError("read-only home")
+
+    monkeypatch.setattr("mimir.rate_limits.atomic_write_json", fail_write)
+    recorded = await record_api_usage(store, {
+        "five_hour": {"utilization": 0.93},
+        "seven_day": {"utilization": 0.70},
+    })
+
+    assert recorded == {}
+    assert store.current() == {}
+    events = [json.loads(line) for line in events_path.read_text().splitlines()]
+    failures = [e for e in events if e["type"] == "quota_state_write_failed"]
+    assert len(failures) == 1
+
+
 # ---- running_on_claude_max ---------------------------------------------
 
 
