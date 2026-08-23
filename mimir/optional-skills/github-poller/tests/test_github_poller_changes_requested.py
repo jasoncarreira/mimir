@@ -991,3 +991,106 @@ def test_reviews_api_failure_preserves_entry(monkeypatch, captured_emits):
         assert count == 0
         assert cursor == prior
     assert captured_emits == []
+
+
+def _cr_review() -> dict:
+    return _review("jasoncarreira", "CHANGES_REQUESTED", "2026-06-11T12:00:00Z")
+
+
+def _patch_many(monkeypatch, numbers):
+    """Every listed PR is the agent's own and stuck at CHANGES_REQUESTED."""
+    _patch_api(
+        monkeypatch,
+        prs=[_pr(n, f"sha{n}") for n in numbers],
+        reviews_by_pr={n: [_cr_review()] for n in numbers},
+        commit_dates={f"sha{n}": "2026-06-11T05:00:00Z" for n in numbers},
+    )
+
+
+def test_rotate_preserves_every_element_and_wraps():
+    assert poller._rotate([1, 2, 3, 4], 0) == [1, 2, 3, 4]
+    assert poller._rotate([1, 2, 3, 4], 2) == [3, 4, 1, 2]
+    assert poller._rotate([1, 2, 3, 4], 6) == [3, 4, 1, 2]  # offset wraps
+    assert sorted(poller._rotate([1, 2, 3, 4], 3)) == [1, 2, 3, 4]  # nothing lost
+    assert poller._rotate([], 5) == []
+
+
+def test_exhausted_budget_still_reconciles_the_guaranteed_minimum(
+    monkeypatch, captured_emits,
+):
+    """An already-spent budget must not starve the pass to zero: chainlink
+    #1433's floor is what guarantees forward progress every tick."""
+    numbers = [601, 602, 603, 604, 605]
+    _patch_many(monkeypatch, numbers)
+    budget = poller.TickBudget(deadline_seconds=0.0)
+    assert budget.exhausted()
+
+    count, cursor = poller._check_own_changes_requested(
+        "o/r", "tok", "mimir-bot", {}, now=NOW, budget=budget,
+    )
+    assert count == poller.PR_RECONCILE_MIN_PER_PASS
+    assert budget.truncated == {
+        "changes_requested": len(numbers) - poller.PR_RECONCILE_MIN_PER_PASS,
+    }
+    assert sorted(cursor) == ["601", "602"]
+
+
+def test_truncated_prs_keep_their_prior_cursor_entry(monkeypatch, captured_emits):
+    """The passes rebuild their cursor from scratch, so a skipped PR must be
+    carried over explicitly. Dropping the key would reset ``last_reminded_at``
+    (reminder storm on the next tick) and rewind ``attempts`` (give-up budget
+    never reached)."""
+    numbers = [601, 602, 603, 604, 605]
+    _patch_many(monkeypatch, numbers)
+    recent = (NOW - timedelta(minutes=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    prior = {
+        str(n): _entry(f"sha{n}", reminded_at=recent, attempts=3) for n in numbers
+    }
+
+    budget = poller.TickBudget(deadline_seconds=0.0)
+    count, cursor = poller._check_own_changes_requested(
+        "o/r", "tok", "mimir-bot", prior, now=NOW, budget=budget,
+    )
+    # Nothing is due (reminded a minute ago), so no PR — reconciled or skipped —
+    # changes, and the cursor round-trips intact.
+    assert count == 0
+    assert captured_emits == []
+    assert cursor == prior
+
+
+def test_rotate_offset_advances_the_reconciled_window(monkeypatch, captured_emits):
+    """Successive truncated ticks must cover different PRs, or the tail is
+    never reconciled at all."""
+    numbers = [601, 602, 603, 604, 605]
+
+    def _reconciled_with(offset: int) -> list[int]:
+        emits: list[dict] = []
+        monkeypatch.setattr(poller, "_emit", lambda p, **e: emits.append(e))
+        _patch_many(monkeypatch, numbers)
+        poller._check_own_changes_requested(
+            "o/r", "tok", "mimir-bot", {}, now=NOW,
+            budget=poller.TickBudget(deadline_seconds=0.0),
+            rotate_offset=offset,
+        )
+        return sorted(e["number"] for e in emits)
+
+    first = _reconciled_with(0)
+    second = _reconciled_with(poller.PR_RECONCILE_MIN_PER_PASS)
+    third = _reconciled_with(poller.PR_RECONCILE_MIN_PER_PASS * 2)
+    assert first == [601, 602]
+    assert second == [603, 604]
+    assert third == [601, 605]  # wraps, and 605 is finally reached
+    assert set(first) | set(second) | set(third) == set(numbers)
+
+
+def test_unexhausted_budget_reconciles_every_pr(monkeypatch, captured_emits):
+    """The bound must be inert when the tick has time left."""
+    numbers = [601, 602, 603]
+    _patch_many(monkeypatch, numbers)
+    budget = poller.TickBudget(deadline_seconds=600.0)
+    count, cursor = poller._check_own_changes_requested(
+        "o/r", "tok", "mimir-bot", {}, now=NOW, budget=budget,
+    )
+    assert count == len(numbers)
+    assert budget.truncated == {}
+    assert sorted(cursor) == ["601", "602", "603"]

@@ -64,6 +64,7 @@ import json
 import os
 import subprocess
 import sys
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -170,6 +171,43 @@ _CHANGES_REQUESTED_TURN_EVENT_TYPES = frozenset({"pr_changes_requested_stale"})
 # without changing the intended hourly cadence. After bounded attempts give up,
 # a daily backstop starts a fresh series so an unresolved PR cannot go silent
 # forever merely because its queued turns were never delivered.
+# The framework hard-caps a poller tick at 60s (mimir/pollers.py) and will SIGKILL
+# past it, so per-PR reconciliation has to fit inside a self-imposed deadline that
+# leaves headroom. Reconciling every open PR in every pass exceeded 60s at 16 open
+# PRs, which wedged this poller: a killed tick never commits its cursor, so the next
+# tick re-scans the same window plus everything new and is guaranteed to be larger
+# (chainlink #1433). A tick that truncates and commits is strictly better than one
+# that completes nothing.
+PR_RECONCILE_DEADLINE_SECONDS = 35.0
+#: Minimum PRs a pass reconciles even if the deadline has passed, so a slow API
+#: cannot starve every PR forever and stall reminders entirely.
+PR_RECONCILE_MIN_PER_PASS = 2
+
+
+class TickBudget:
+    """Wall-clock budget for one poller tick's per-PR reconciliation."""
+
+    def __init__(self, deadline_seconds: float = PR_RECONCILE_DEADLINE_SECONDS) -> None:
+        self._start = time.monotonic()
+        self._deadline = deadline_seconds
+        self.truncated: dict[str, int] = {}
+
+    def exhausted(self) -> bool:
+        return (time.monotonic() - self._start) >= self._deadline
+
+    def note_truncation(self, pass_name: str, skipped: int) -> None:
+        if skipped > 0:
+            self.truncated[pass_name] = self.truncated.get(pass_name, 0) + skipped
+
+
+def _rotate(items: list, offset: int) -> list:
+    """Rotate so successive ticks start where the previous one stopped."""
+    if not items:
+        return items
+    start = offset % len(items)
+    return items[start:] + items[:start]
+
+
 CHANGES_REQUESTED_REMINDER_INTERVAL = timedelta(minutes=60)
 CHANGES_REQUESTED_REMINDER_SLACK = timedelta(minutes=1)
 CHANGES_REQUESTED_GAVE_UP_BACKSTOP = timedelta(hours=24)
@@ -1712,6 +1750,8 @@ def _check_own_changes_requested(
     *,
     now: datetime | None = None,
     reminder_interval: timedelta = CHANGES_REQUESTED_REMINDER_INTERVAL,
+    budget: TickBudget | None = None,
+    rotate_offset: int = 0,
 ) -> tuple[int, dict[str, object]]:
     """State-reconciling reminder for the agent's OWN open PRs stuck at
     CHANGES_REQUESTED (chainlink #449).
@@ -1768,6 +1808,10 @@ def _check_own_changes_requested(
         return 0, dict(prior)
     count = 0
     new: dict[str, object] = {}
+    # Reconcile from where the previous tick stopped, so a truncated tick does not
+    # starve the same tail every time (#1433).
+    data = _rotate(list(data), rotate_offset)
+    reconciled = 0
     for pr in data:
         if (pr.get("user") or {}).get("login") != me:
             continue
@@ -1777,6 +1821,20 @@ def _check_own_changes_requested(
         if not number or not head_sha:
             continue
         key = str(number)
+        # Out of budget: carry the prior entry forward untouched rather than
+        # dropping it. `new` REPLACES the cursor entry, so omitting a key would
+        # reset that PR's last_reminded_at and attempts — re-arming a reminder the
+        # debounce exists to suppress and rewinding the give-up budget.
+        if (
+            budget is not None
+            and reconciled >= PR_RECONCILE_MIN_PER_PASS
+            and budget.exhausted()
+        ):
+            if key in prior:
+                new[key] = prior[key]
+            budget.note_truncation("changes_requested", 1)
+            continue
+        reconciled += 1
         reviews = _gh_api(f"repos/{repo}/pulls/{number}/reviews", token)
         if not isinstance(reviews, list):
             # Cannot determine review state — preserve the dedupe entry
@@ -2594,6 +2652,11 @@ def main() -> None:
     # Changes-requested reconciliation cursor (chainlink #449):
     # ``{repo: {pr_key: {head_sha, last_reminded_at, attempts}}}`` — bounded
     # unresolved own-PR remediation attempts, rate-limited by elapsed time.
+    budget = TickBudget()
+    # Rotation offsets per repo, so a truncated tick resumes at the tail it skipped
+    # instead of starving it every tick (#1433).
+    reconcile_offsets: dict = cursor.get("pr_reconcile_offsets", {}) or {}
+    new_reconcile_offsets: dict[str, int] = {}
     cr_all: dict = cursor.get("pr_changes_requested", {}) or {}
     new_cr_all: dict[str, dict[str, object]] = {}
     mergeability_all: dict = cursor.get("pr_mergeability", {}) or {}
@@ -2649,6 +2712,12 @@ def main() -> None:
         repo_cr = cr_all.get(repo, {}) or {}
         cr_count, new_repo_cr = _check_own_changes_requested(
             repo, token, me, repo_cr,
+            budget=budget,
+            rotate_offset=int(reconcile_offsets.get(repo, 0) or 0),
+        )
+        # Advance past what this tick reconciled so the next one resumes at the tail.
+        new_reconcile_offsets[repo] = int(reconcile_offsets.get(repo, 0) or 0) + max(
+            1, len(repo_cr) - budget.truncated.get("changes_requested", 0)
         )
         total += cr_count
         new_cr_all[repo] = new_repo_cr
@@ -2669,6 +2738,15 @@ def main() -> None:
     cursor["last_checked"] = new_cursor_ts
     cursor["pr_heads"] = new_pr_heads_all
     cursor["pr_review_requests"] = new_rr_all
+    cursor["pr_reconcile_offsets"] = new_reconcile_offsets or reconcile_offsets
+    if budget.truncated:
+        # Never truncate silently: a tick that skipped PRs must say so, or the
+        # next reader mistakes partial coverage for a quiet repository.
+        _emit_signal(
+            "poller_pr_reconcile_truncated",
+            truncated=dict(budget.truncated),
+            deadline_seconds=PR_RECONCILE_DEADLINE_SECONDS,
+        )
     cursor["pr_changes_requested"] = new_cr_all
     cursor["pr_mergeability"] = new_mergeability_all
     cursor["pr_ci_failures"] = new_ci_failures_all
