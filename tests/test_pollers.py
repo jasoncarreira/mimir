@@ -1476,6 +1476,41 @@ print(json.dumps({"poller": "x", "prompt": prompt}))
 
 
 @pytest.mark.asyncio
+async def test_run_poller_exports_its_effective_timeout(
+    tmp_path: Path, home: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A poller must be able to bound its own work against the cap it will be
+    killed at, without hardcoding a copy that drifts from the constant.
+
+    Asserts the *effective* timeout, not the default: a caller passing a
+    different one must have that value reach the subprocess, or a poller sizing
+    its deadlines from the env would overrun.
+    """
+    monkeypatch.delenv("POLLER_TIMEOUT_SECONDS", raising=False)
+    skill_dir = tmp_path / "skill"
+    _install_script(skill_dir, "poller.py", """
+import json, os
+print(json.dumps({
+    "poller": "x",
+    "prompt": f"cap={os.environ['POLLER_TIMEOUT_SECONDS']}",
+}))
+""")
+    cfg = PollerConfig(
+        name="my-poller", command=f"{sys.executable} poller.py",
+        cron="* * * * *", env={}, skill_dir=skill_dir,
+    )
+    enq = _CapturingEnqueue()
+    await run_poller(cfg, enqueue=enq, home=home)
+    assert len(enq.events) == 1
+    assert f"cap={POLLER_TIMEOUT_SECONDS}" in enq.events[0].content
+
+    enq2 = _CapturingEnqueue()
+    await run_poller(cfg, enqueue=enq2, home=home, timeout=45)
+    assert len(enq2.events) == 1
+    assert "cap=45" in enq2.events[0].content
+
+
+@pytest.mark.asyncio
 async def test_run_poller_mimir_home_falls_back_to_install_layout(
     tmp_path: Path, home: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
