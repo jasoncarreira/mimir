@@ -84,10 +84,16 @@ UTC = timezone.utc
 #: makes APScheduler skip it. Keeping the timeout strictly under the cadence
 #: means a slow run degrades into a late result rather than a lost tick.
 POLLER_CADENCE_MARGIN_SECONDS = 10.0
-#: How many successive fires to sample when measuring a cadence. Cron can be
-#: irregular (``0 9,10 * * *`` alternates 1h and 23h), so the *minimum* gap is
-#: the constraint, not the first one.
-POLLER_CADENCE_SAMPLES = 5
+#: Smallest gap a 5-field cron can express. Reaching it means the minimum has
+#: been found and the scan can stop.
+CRON_MIN_GRANULARITY_SECONDS = 60.0
+#: Bounds the cadence scan. A fixed prefix of samples is NOT sufficient: with
+#: ``0,9,18,27,28,42,51 * * * *`` the 1-minute gap falls outside the first five
+#: fires for 15 of 60 possible start minutes, so a prefix scan reported 540s and
+#: admitted the full cap into a 60s window a quarter of the time — intermittently,
+#: depending only on when the poller happened to be evaluated.
+POLLER_CADENCE_MAX_SAMPLES = 4000
+POLLER_CADENCE_HORIZON_DAYS = 400
 
 
 def _loop_stall_alert_threshold() -> float:
@@ -737,6 +743,10 @@ class Scheduler:
         # clock terms instead of mentally subtracting hours twice a
         # year for DST.
         self._tz = _resolve_tz(scheduler_tz)
+        #: (name, cron) -> (shortest gap or None). See
+        #: ``_poller_cadence_seconds``; keyed on the cron string so a manifest
+        #: edit that changes the schedule recomputes rather than serving stale.
+        self._poller_cadence_cache: dict[tuple[str, str], tuple[float | None]] = {}
         self._scheduler = AsyncIOScheduler(timezone=self._tz)
         self._yaml_path = scheduler_yaml
         self._enqueue = enqueue
@@ -2145,24 +2155,46 @@ class Scheduler:
         with, after ``pollers-overrides.yaml`` — so a locally installed or
         overridden poller is covered too. Scanning the repo's bundled manifests
         would miss both.
+
+        Scans until the minimum is provably found rather than sampling a fixed
+        prefix: cron gaps are not monotonic, and the smallest one can sit
+        arbitrarily far into the sequence. The scan stops early at
+        ``CRON_MIN_GRANULARITY_SECONDS`` because a 5-field cron cannot express a
+        smaller gap, which makes dense schedules O(1). Sparse ones are bounded by
+        ``POLLER_CADENCE_MAX_SAMPLES`` and the horizon.
+
+        Cached per (name, cron): the value changes only when the manifest does,
+        and this is consulted on every fire.
         """
+        cache_key = (poller.name, poller.cron)
+        cached = self._poller_cadence_cache.get(cache_key)
+        if cached is not None:
+            return cached[0]
         try:
             trigger = CronTrigger.from_crontab(
                 _cron_with_standard_dow(poller.cron), timezone=self._tz,
             )
         except Exception:  # noqa: BLE001 — an invalid cron is reported elsewhere
+            self._poller_cadence_cache[cache_key] = (None,)
             return None
-        gaps: list[float] = []
-        previous = trigger.get_next_fire_time(None, datetime.now(self._tz))
-        for _ in range(POLLER_CADENCE_SAMPLES):
-            if previous is None:
+        start = datetime.now(self._tz)
+        horizon = start + timedelta(days=POLLER_CADENCE_HORIZON_DAYS)
+        smallest: float | None = None
+        previous = trigger.get_next_fire_time(None, start)
+        for _ in range(POLLER_CADENCE_MAX_SAMPLES):
+            if previous is None or previous > horizon:
                 break
             nxt = trigger.get_next_fire_time(previous, previous)
             if nxt is None:
                 break
-            gaps.append((nxt - previous).total_seconds())
+            gap = (nxt - previous).total_seconds()
+            if smallest is None or gap < smallest:
+                smallest = gap
+            if smallest <= CRON_MIN_GRANULARITY_SECONDS:
+                break  # provably the minimum a cron can express
             previous = nxt
-        return min(gaps) if gaps else None
+        self._poller_cadence_cache[cache_key] = (smallest,)
+        return smallest
 
     async def _effective_poller_timeout(self, poller: PollerConfig) -> float:
         """The framework cap, clamped below this poller's own fire interval.

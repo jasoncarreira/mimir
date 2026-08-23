@@ -6,6 +6,7 @@ import asyncio
 import json as _json
 import shutil
 from datetime import datetime, timezone
+from unittest import mock
 from pathlib import Path
 
 import pytest
@@ -4752,28 +4753,69 @@ async def test_effective_poller_timeout_clamps_to_cadence(tmp_path, monkeypatch)
 
 
 @pytest.mark.asyncio
-async def test_effective_poller_timeout_uses_the_shortest_irregular_gap(
-    tmp_path, monkeypatch,
-):
-    """Irregular cron must be measured by its *minimum* gap.
+async def test_poller_cadence_finds_a_minimum_beyond_the_first_fires(tmp_path):
+    """Cron gaps are not monotonic, so a fixed prefix of samples is unsound.
 
-    ``0 9,10 * * *`` alternates 1h and 23h. Sampling only the first gap from
-    "now" would report 23h half the time and admit the full cap into a 1h window.
+    ``0,9,18,27,28,42,51 * * * *`` has mostly 9-minute gaps and one 1-minute gap
+    (27 -> 28). Whether that gap falls inside the first few fires depends purely
+    on when the scan starts: with a 5-sample prefix, 15 of the 60 possible start
+    minutes reported 540s and let the full 120s cap be admitted across a 60s
+    interval — intermittently, which is worse than always.
+
+    Asserts the minimum is found from *every* start minute, not just a lucky one.
     """
     from mimir.pollers import PollerConfig
-    from mimir.scheduler import POLLER_CADENCE_MARGIN_SECONDS
+    import mimir.scheduler as ms
 
     async def noop(event: AgentEvent) -> bool:
         return True
 
     sched = Scheduler(scheduler_yaml=tmp_path / "s.yaml", enqueue=noop)
-    monkeypatch.setattr("mimir.scheduler.log_event", lambda *a, **k: _noop_coro())
-
-    cadence = sched._poller_cadence_seconds(PollerConfig(
-        name="irregular", command="x", cron="0 9,10 * * *",
+    cfg = PollerConfig(
+        name="irregular", command="x", cron="0,9,18,27,28,42,51 * * * *",
         env={}, skill_dir=tmp_path,
-    ))
-    assert cadence == 3600.0, f"took a gap other than the minimum: {cadence}"
+    )
+
+    reported = []
+    for minute in range(60):
+        sched._poller_cadence_cache.clear()
+        with mock.patch.object(ms, "datetime") as fake_dt:
+            fake_dt.now.return_value = datetime(
+                2026, 1, 1, 0, minute, tzinfo=timezone.utc,
+            )
+            reported.append(sched._poller_cadence_seconds(cfg))
+
+    assert set(reported) == {60.0}, (
+        f"cadence scan missed the minimum from some start minutes: "
+        f"{sorted(set(reported))}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_poller_cadence_is_cached_per_cron(tmp_path):
+    """Consulted on every fire, so a sparse schedule must not rescan each time.
+
+    Also pins that a changed cron invalidates: the key is the cron string, so an
+    edited manifest recomputes rather than serving a stale cadence.
+    """
+    from mimir.pollers import PollerConfig
+
+    async def noop(event: AgentEvent) -> bool:
+        return True
+
+    sched = Scheduler(scheduler_yaml=tmp_path / "s.yaml", enqueue=noop)
+
+    def cfg(cron: str) -> PollerConfig:
+        return PollerConfig(
+            name="p", command="x", cron=cron, env={}, skill_dir=tmp_path,
+        )
+
+    first = sched._poller_cadence_seconds(cfg("*/15 * * * *"))
+    assert ("p", "*/15 * * * *") in sched._poller_cadence_cache
+    assert sched._poller_cadence_seconds(cfg("*/15 * * * *")) == first
+
+    # A different cron is a different key, and is measured on its own terms.
+    assert sched._poller_cadence_seconds(cfg("* * * * *")) == 60.0
 
 
 async def _noop_coro():
