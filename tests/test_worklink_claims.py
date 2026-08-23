@@ -654,6 +654,9 @@ def test_claim_issue_refuses_when_review_ready_evidence_exists(tmp_path: Path, c
     assert result.claimed is False
     assert result.reason == "review_ready_evidence_exists"
     assert not any(call[1:3] == ["locks", "claim"] for call in calls)
+    assert ["chainlink", "issue", "unlabel", "200", "worklink:ready"] in calls
+    assert ["chainlink", "issue", "label", "200", "worklink:review"] in calls
+    assert ["chainlink", "issue", "label", "200", "worklink:ready"] not in calls
     assert "issue_id=200 reason=review_ready_evidence_exists" in caplog.text
     assert str(tmp_path / "state" / "worklink" / "evidence" / "200-1.json") in caplog.text
     assert "pr_url=https://github.com/owner/repo/pull/123" in caplog.text

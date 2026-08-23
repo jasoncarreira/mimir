@@ -851,7 +851,20 @@ class WorklinkRunner:
                 worker_required and result.review_ready and result.pr_url
             )
             if delete_authorized_checkout and publication is not None:
-                publication.run("update-ref", "-d", f"refs/heads/{lease.branch}", check=True)
+                try:
+                    publication.run("update-ref", "-d", f"refs/heads/{lease.branch}", check=True)
+                except Exception as exc:
+                    error = f"authorized branch cleanup: {exc}"
+                    _record_post_publication_error(
+                        error,
+                        issue_id=issue.issue_id,
+                        attempt=record.attempt,
+                        pr_url=result.pr_url,
+                    )
+                    result = replace(
+                        result,
+                        reason=_append_post_publication_error(result.reason, error),
+                    )
             return result
         except Exception as exc:
             try:
@@ -1060,26 +1073,59 @@ class WorklinkRunner:
                 runner=runner,
             )
             validation = _with_pr_url(validation, pr_url)
-            evidence_path = _write_evidence(self.home, validation.evidence)
-        _comment_evidence(
-            claims,
-            validation.evidence,
-            validation,
-            evidence_path,
-            gate_test_tail=(
-                None if validation.review_ready else _local_gate_failure_tail(validation)
-            ),
-        )
-        _log_event(
-            "worklink_evidence",
-            issue_id=issue.issue_id,
-            attempt=attempt,
-            status=validation.status,
-            review_ready=validation.review_ready,
-            reasons=list(validation.reasons),
-            model=validation.evidence.model,
-            failure_reason=validation.evidence.failure_reason,
-        )
+        post_publication_errors: list[str] = []
+
+        def run_bookkeeping(name: str, action: Callable[[], Any]) -> Any | None:
+            try:
+                return action()
+            except Exception as exc:
+                error = f"{name}: {exc}"
+                post_publication_errors.append(error)
+                _record_post_publication_error(
+                    error,
+                    issue_id=issue.issue_id,
+                    attempt=attempt,
+                    pr_url=pr_url,
+                )
+                return None
+
+        if pr_url:
+            written_path = run_bookkeeping(
+                "completed evidence write",
+                lambda: _write_evidence(self.home, validation.evidence),
+            )
+            if isinstance(written_path, Path):
+                evidence_path = written_path
+
+        def comment_evidence() -> None:
+            _comment_evidence(
+                claims,
+                validation.evidence,
+                validation,
+                evidence_path,
+                gate_test_tail=(
+                    None if validation.review_ready else _local_gate_failure_tail(validation)
+                ),
+            )
+
+        def log_evidence() -> None:
+            _log_event(
+                "worklink_evidence",
+                issue_id=issue.issue_id,
+                attempt=attempt,
+                status=validation.status,
+                review_ready=validation.review_ready,
+                reasons=list(validation.reasons),
+                model=validation.evidence.model,
+                failure_reason=validation.evidence.failure_reason,
+            )
+
+        if pr_url:
+            run_bookkeeping("evidence comment", comment_evidence)
+            run_bookkeeping("evidence event", log_evidence)
+        else:
+            comment_evidence()
+            log_evidence()
         transition_status = "blocked" if raw.output_overflow else validation.status
         transition_reason = (
             validation.evidence.failure_reason
@@ -1088,21 +1134,31 @@ class WorklinkRunner:
             if validation.status == "blocked"
             else (", ".join(validation.reasons) if validation.reasons else None)
         )
-        claims.transition_issue(
-            issue.issue_id,
-            status=transition_status,
-            review_ready=validation.review_ready,
-            attempt=claim_record.budget_attempt or attempt,
-            reason=transition_reason,
-        )
-        _log_event(
-            "worklink_transition",
-            issue_id=issue.issue_id,
-            attempt=attempt,
-            status=transition_status,
-            review_ready=validation.review_ready,
-            pr_url=pr_url,
-        )
+        def transition_issue() -> None:
+            claims.transition_issue(
+                issue.issue_id,
+                status=transition_status,
+                review_ready=validation.review_ready,
+                attempt=claim_record.budget_attempt or attempt,
+                reason=transition_reason,
+            )
+
+        def log_transition() -> None:
+            _log_event(
+                "worklink_transition",
+                issue_id=issue.issue_id,
+                attempt=attempt,
+                status=transition_status,
+                review_ready=validation.review_ready,
+                pr_url=pr_url,
+            )
+
+        if pr_url:
+            run_bookkeeping("issue transition", transition_issue)
+            run_bookkeeping("transition event", log_transition)
+        else:
+            transition_issue()
+            log_transition()
         cleanup_error = None
         if publication is None:
             cleanup_error = _cleanup_checkout_after_transition(
@@ -1112,6 +1168,8 @@ class WorklinkRunner:
                 issue_id=issue.issue_id,
                 attempt=attempt,
             )
+            if cleanup_error and pr_url:
+                post_publication_errors.append(f"checkout cleanup: {cleanup_error}")
         return WorklinkRunResult(
             issue.issue_id,
             attempt,
@@ -1122,7 +1180,9 @@ class WorklinkRunner:
             checkout=lease.path,
             branch=lease.branch,
             reason=(
-                f"post-transition cleanup failed: {cleanup_error}"
+                _append_post_publication_error(None, "; ".join(post_publication_errors))
+                if post_publication_errors
+                else f"post-transition cleanup failed: {cleanup_error}"
                 if cleanup_error
                 else validation.evidence.failure_reason if raw.exit_code != 0 else None
             ),
@@ -2560,6 +2620,32 @@ def _cleanup_checkout_after_transition(
         )
         return error
     return None
+
+
+def _append_post_publication_error(reason: str | None, error: str) -> str:
+    detail = f"post-publication bookkeeping failed: {error}"
+    return f"{reason}; {detail}" if reason else detail
+
+
+def _record_post_publication_error(
+    error: str,
+    *,
+    issue_id: int,
+    attempt: int,
+    pr_url: str | None,
+) -> None:
+    """Report secondary publication work without reopening the failure path."""
+    try:
+        _log_event(
+            "worklink_post_publication_failed",
+            level="warning",
+            issue_id=issue_id,
+            attempt=attempt,
+            pr_url=pr_url,
+            error=error,
+        )
+    except Exception:
+        pass
 
 
 def run_worklink(

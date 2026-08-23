@@ -352,6 +352,14 @@ class ChainlinkClaims:
 
         review_ready = self.review_ready_evidence(issue_id, home_path=home_path)
         if review_ready is not None:
+            # Completed PR evidence is the publication authority. Repair labels
+            # before refusing a duplicate run so ready and undispatchable cannot
+            # persist together after transient post-publication bookkeeping fails.
+            self.transition_issue(
+                issue_id,
+                status="completed",
+                review_ready=True,
+            )
             log.info(
                 "Worklink claim refused: issue_id=%s reason=review_ready_evidence_exists "
                 "evidence_path=%s pr_url=%s",

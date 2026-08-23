@@ -834,6 +834,58 @@ def test_worklink_runner_happy_path_fake_backend(tmp_path: Path) -> None:
     _reset_logger_for_tests()
 
 
+def test_post_pr_comment_failure_does_not_demote_completed_run(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    worktree = repo.parent / ".worklink" / repo.name / "441-1"
+    calls, base_runner = _orchestrator_runner(repo, worktree)
+    pr_opened = False
+
+    def runner(
+        args: Sequence[str] | str,
+        *,
+        cwd: Path | None = None,
+        text: bool = True,
+    ) -> subprocess.CompletedProcess:
+        nonlocal pr_opened
+        if isinstance(args, list) and args[:3] == ["gh", "pr", "create"]:
+            pr_opened = True
+        if (
+            pr_opened
+            and isinstance(args, list)
+            and args[:3] == ["chainlink", "issue", "comment"]
+            and args[-1].startswith("WORKLINK_EVIDENCE ")
+        ):
+            calls.append(args)
+            return cp(args, returncode=1, stderr="temporary Chainlink failure")
+        return base_runner(args, cwd=cwd, text=text)
+
+    registry = BackendRegistry(WorklinkConfig())
+    registry.register(FakeBackend())
+
+    result = asyncio.run(
+        WorklinkRunner(home=tmp_path, repo=repo, runner=runner, registry=registry).run(
+            441, backend_name="fake", test_command="echo ok"
+        )
+    )
+
+    assert result.status == "completed"
+    assert result.review_ready is True
+    assert result.pr_url == "https://github.com/jasoncarreira/mimir/pull/999"
+    assert result.reason == (
+        "post-publication bookkeeping failed: evidence comment: temporary Chainlink failure"
+    )
+    assert ["chainlink", "issue", "label", "441", "worklink:review"] in calls
+    assert ["chainlink", "issue", "label", "441", "worklink:failed"] not in calls
+    assert ["chainlink", "issue", "label", "441", "worklink:ready"] not in calls
+    evidence = json.loads(
+        (tmp_path / "state" / "worklink" / "evidence" / "441-1.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert evidence["status"] == "completed"
+    assert evidence["pr_url"] == result.pr_url
+
+
 def test_worklink_pr_body_includes_build_section_and_intact_evidence(tmp_path: Path) -> None:
     repo = tmp_path / "repo"
     worktree = repo.parent / ".worklink" / repo.name / "441-1"
