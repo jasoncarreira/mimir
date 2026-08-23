@@ -364,9 +364,9 @@ def main() -> int:
     # Detached workers and this reader must resolve the ledger from the same trusted home.
     state_dir = dispatch_failure_state_dir(home)
     state_dir.mkdir(parents=True, exist_ok=True)
+    emitted_delivery = False
     try:
         backed_off_ids, alerts = pending_failure_alerts(state_dir)
-        emitted_delivery = False
         for alert in alerts:
             delivery_key = (
                 f"worklink-run-failure:{alert['issue_id']}:"
@@ -385,7 +385,6 @@ def main() -> int:
             emitted_delivery = True
     except OSError as exc:
         backed_off_ids = set()
-        emitted_delivery = False
         _emit({"signal": "worklink_dispatch_failure_state_error", "reason": str(exc)})
     if emitted_delivery:
         return 0

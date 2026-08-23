@@ -10,6 +10,7 @@ ready-queue poller's discovery/dispatch (cap-respecting, detached).
 from __future__ import annotations
 
 import ast
+import importlib.util
 import json
 import os
 import signal
@@ -1141,6 +1142,19 @@ def _live_pids(pids: list[int]) -> list[int]:
     return live
 
 
+def _load_poller_module():
+    spec = importlib.util.spec_from_file_location("chainlink_orchestrator_poller_under_test", POLLER)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    try:
+        spec.loader.exec_module(module)
+    except Exception:
+        sys.modules.pop(spec.name, None)
+        raise
+    return module
+
+
 def _run_poller(tmp: Path, env_extra: dict[str, str]) -> list[dict]:
     env = {k: v for k, v in os.environ.items() if k not in {
         "WORKLINK_REPO", "WORKLINK_RUN_BIN", "WORKLINK_MAX_CONCURRENT", "CHAINLINK_BIN",
@@ -1392,6 +1406,58 @@ def test_poller_failure_escalation_dedupes_by_signature_and_recovers(
     save_failure_state(state_dir, state)
     recovered = _run_poller(tmp_path, env)
     assert [e["issue_id"] for e in recovered if e.get("signal") == "worklink_dispatched"] == [201]
+
+
+def test_poller_stops_after_emitting_when_later_failure_ack_errors(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    poller = _load_poller_module()
+    first = {
+        "signal": "worklink_run_failure_escalated",
+        "issue_id": 201,
+        "error_signature": "first-signature",
+        "failure_occurrence_id": "first-occurrence",
+    }
+    second = {
+        "signal": "worklink_run_failure_escalated",
+        "issue_id": 202,
+        "error_signature": "second-signature",
+        "failure_occurrence_id": "second-occurrence",
+    }
+    emitted: list[dict] = []
+    continuation_called = False
+
+    monkeypatch.setattr(poller, "pending_failure_alerts", lambda _state_dir: ({201, 202}, [first, second]))
+    monkeypatch.setattr(
+        poller,
+        "delivery_receipt_exists",
+        lambda _state_dir, key: key.endswith("second-signature:second-occurrence"),
+    )
+    monkeypatch.setattr(
+        poller,
+        "mark_failure_notified",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("ack failed")),
+    )
+    monkeypatch.setattr(poller, "_emit", lambda event: emitted.append(event.copy()))
+
+    def consume(*_args, **_kwargs):
+        nonlocal continuation_called
+        continuation_called = True
+        return []
+
+    monkeypatch.setattr(poller, "consume_worklink_budget_continuations", consume)
+
+    assert poller.main() == 0
+    assert [event["signal"] for event in emitted] == [
+        "worklink_run_failure_escalated",
+        "worklink_dispatch_failure_state_error",
+    ]
+    assert emitted[0]["delivery_key"].endswith("first-signature:first-occurrence")
+    assert continuation_called is False
 
 
 def test_failure_alert_is_not_deduped_until_delivery_is_recorded(tmp_path: Path) -> None:
