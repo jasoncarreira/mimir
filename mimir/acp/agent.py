@@ -429,12 +429,14 @@ class MimirAcpAgent:
             identity = self._identity_resolver.resolve_web_key(raw_key)
             if identity is None or not identity.access.is_admin or identity.access.is_service:
                 raise ValueError
-            event = AgentEvent(trigger="acp_authenticate", channel_id="acp:stdio", content="", author=identity.canonical, author_display=identity.display_name or identity.canonical, author_id=None, source_id=None, source="acp", extra={"channel_visibility": "private", "bridge_instance": _ACP_BRIDGE_INSTANCE})
+            # This enforced carrier authorizes the local prompt turns that follow;
+            # ACP authentication remains recorded by its source and bridge fields.
+            event = AgentEvent(trigger="user_message", channel_id="acp:stdio", content="", author=identity.canonical, author_display=identity.display_name or identity.canonical, author_id=None, source_id=None, source="acp", extra={"channel_visibility": "private", "bridge_instance": _ACP_BRIDGE_INSTANCE})
             auth_context = create_auth_context(
                 event,
                 self._identity_resolver,
                 enforce=True,
-                event_ingress="acp",
+                event_ingress=None,
                 audience_provider=self._audience_provider,
                 cross_platform_pull=getattr(
                     getattr(self._bundle, "config", None),
