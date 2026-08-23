@@ -31,6 +31,7 @@ from mimir.worklink.compute import LaunchHandle, WorkSpec
 from mimir.worklink.checkout import CheckoutLease
 from mimir.worklink.backends.feature_factory import FeatureFactoryBackend, parse_factory_status
 from mimir.worklink.factory_state import FactoryRunRecord, load_factory_record, save_factory_record
+from mimir.worklink.run_state import load_run_state
 from mimir.worklink.orchestrator import (
     IssueContext,
     LeafValidationError,
@@ -832,6 +833,42 @@ def test_worklink_runner_happy_path_fake_backend(tmp_path: Path) -> None:
     assert "worklink_evidence" in body
     assert "worklink_transition" in body
     _reset_logger_for_tests()
+
+
+def test_report_cleanup_failure_cannot_skip_lock_release_or_state_clear(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repo = tmp_path / "repo"
+    worktree = repo.parent / ".worklink" / repo.name / "441-1"
+    calls, runner = _orchestrator_runner(repo, worktree)
+    report_dir = tmp_path / "executor-report"
+    report_dir.mkdir()
+    monkeypatch.setattr(
+        "mimir.worklink.orchestrator._make_executor_report_dir",
+        lambda issue_id, attempt: report_dir,
+    )
+
+    def deny_report_removal(path: Path) -> None:
+        if path == report_dir:
+            raise PermissionError("executor-owned report is not removable")
+
+    monkeypatch.setattr(
+        "mimir.worklink.orchestrator.rmtree_missing_ok",
+        deny_report_removal,
+    )
+    registry = BackendRegistry(WorklinkConfig())
+    registry.register(FakeBackend())
+
+    result = asyncio.run(
+        WorklinkRunner(home=tmp_path, repo=repo, runner=runner, registry=registry).run(
+            441, backend_name="fake", test_command="echo ok"
+        )
+    )
+
+    assert result.status == "completed"
+    assert ["chainlink", "locks", "release", "441"] in calls
+    assert load_run_state(tmp_path, 441) is None
 
 
 def test_worklink_pr_body_includes_build_section_and_intact_evidence(tmp_path: Path) -> None:

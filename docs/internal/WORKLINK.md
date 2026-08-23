@@ -787,11 +787,14 @@ Current slice-1 recovery is manual:
   the evidence bundle or `<home>/state/worklink/transcripts/`, adjust
   `<home>/worklink.yaml`, and rerun only if the Chainlink comments/attempt
   state indicate the next attempt will use a fresh attempt number.
-- **Claim lock left behind:** inspect with `cd /mimir-home && chainlink locks
-  check <issue-id>` and release the executor's own known-stale lock with
-  `chainlink locks release <issue-id>`. Use `locks steal` only after independent
-  TTL/heartbeat evidence; Chainlink can report a fresh lock as stale when no
-  heartbeat has been written yet.
+- **Claim lock left behind:** list capacity-consuming ids with `cd /mimir-home &&
+  chainlink locks list --json`, inspect one with `chainlink locks check
+  <issue-id>`, and release the executor's own known-stale lock with `chainlink
+  locks release <issue-id>`. The Worklink TTL reaper also discovers lock-only
+  claims and releases them after their structured claim heartbeat is stale. Use
+  `locks steal` manually only after independent TTL/heartbeat evidence;
+  Chainlink can report a fresh lock as stale when no heartbeat has been written
+  yet.
 - **Retained failed checkout/branch:** failed or blocked attempts are retained
   for autopsy under `.worklink/<issue>-<attempt>` with branch
   `issue/<issue>-a<attempt>`. Remove them only after evidence has been copied

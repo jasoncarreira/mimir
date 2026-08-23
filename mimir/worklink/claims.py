@@ -412,20 +412,27 @@ class ChainlinkClaims:
 
         if max_active_locks is not None:
             try:
-                active = self.active_worklink_lock_count(
+                active_ids = self._active_worklink_lock_ids_for_scope(
                     label=active_label,
                     exclude_label=exclude_active_label,
                 )
+                active = len(active_ids)
             except Exception:
                 self.release_issue(issue_id)
                 raise
             if active > max_active_locks:
                 self.release_issue(issue_id)
+                consuming_ids = sorted(
+                    lock_id
+                    for lock_id in active_ids
+                    if lock_id > 0 and lock_id != issue_id
+                )
+                ids_suffix = f"; active issue ids: {consuming_ids}" if consuming_ids else ""
                 return ClaimResult(
                     False,
                     reason=(
                         f"concurrency cap reached ({active - 1}/{max_active_locks} active "
-                        "claims before this reservation)"
+                        f"claims before this reservation{ids_suffix})"
                     ),
                 )
 
@@ -537,9 +544,10 @@ class ChainlinkClaims:
             return None
         return ReviewReadyEvidence(path=path, payload=payload)
 
-    def release_issue(self, issue_id: int) -> None:
-        """Release the Chainlink lock for ``issue_id`` best-effort."""
-        self._run("locks", "release", str(issue_id), check=False)
+    def release_issue(self, issue_id: int) -> bool:
+        """Attempt to release ``issue_id`` and report whether Chainlink confirmed it."""
+        result = self._run("locks", "release", str(issue_id), check=False)
+        return result.returncode == 0
 
     def release_owned_claims_for_shutdown(self) -> list[ClaimRecord]:
         """Return this process's in-flight claims to ready, best-effort.
@@ -907,6 +915,19 @@ class ChainlinkClaims:
         them avoids the label-based check-then-act window where a worker has
         been admitted but has not yet applied ``worklink:in-progress``.
         """
+        return len(
+            self._active_worklink_lock_ids_for_scope(
+                label=label,
+                exclude_label=exclude_label,
+            )
+        )
+
+    def _active_worklink_lock_ids_for_scope(
+        self,
+        *,
+        label: str | None = None,
+        exclude_label: str | None = None,
+    ) -> set[int]:
         if label is not None and exclude_label is not None:
             raise ValueError("active lock scope accepts label or exclude_label, not both")
         active_ids = self._active_worklink_lock_ids(
@@ -914,11 +935,11 @@ class ChainlinkClaims:
         )
         if label is not None:
             scoped_ids = set(self._list_issue_ids(label))
-            return len(active_ids & scoped_ids)
+            return active_ids & scoped_ids
         if exclude_label is not None:
             excluded_ids = set(self._list_issue_ids(exclude_label))
-            return len(active_ids - excluded_ids)
-        return len(active_ids)
+            return active_ids - excluded_ids
+        return active_ids
 
     def _active_worklink_lock_ids(self, *, require_identity: bool) -> set[int]:
         result = self._run("locks", "list", "--json", check=False)
@@ -978,7 +999,15 @@ class ChainlinkClaims:
         records-in transform that's trivial to unit-test.
         """
         latest: dict[int, ClaimRecord] = {}
-        for issue_id in self.issue_ids_with_label("worklink:in-progress"):
+        issue_ids = set(self.issue_ids_with_label("worklink:in-progress"))
+        try:
+            # Locks are the authoritative reservation surface. Including them
+            # recovers terminal-phase leaks after transition removed in-progress;
+            # freshness and holder checks below still prevent stealing live runs.
+            issue_ids.update(self._active_worklink_lock_ids(require_identity=True))
+        except RuntimeError as exc:
+            log.warning("Worklink reaper lock discovery failed: %s", exc)
+        for issue_id in sorted(issue_ids):
             if self._issue_has_label(issue_id, "worklink:epic"):
                 continue
             for record in claim_records_from_comments(self._issue_comments(issue_id)):
