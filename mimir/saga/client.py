@@ -62,7 +62,6 @@ _ALL_SAGA_ATOMS = object()
 @dataclass(frozen=True)
 class _ServiceMutationScope:
     owner_principal: str
-    readable_domains: tuple[str, ...]
 
 
 def _saga_mutation_scope(
@@ -83,11 +82,7 @@ def _saga_mutation_scope(
     if service is not None:
         if not service.has_capability(operation):
             return None
-        domains = tuple(d for d in service.readable_domains if isinstance(d, str))
-        return _ServiceMutationScope(
-            owner_principal=f"service:{service.canonical}",
-            readable_domains=domains,
-        )
+        return _ServiceMutationScope(owner_principal=f"service:{service.canonical}")
     principal = getattr(auth_context, "canonical_principal", None)
     if isinstance(principal, str) and principal:
         if principal not in RESERVED_SENTINEL_PRINCIPALS:
@@ -111,13 +106,8 @@ def _authorized_atom_ids(
         sql += " AND owner_principal = ?"
         params.append(scope)
     elif isinstance(scope, _ServiceMutationScope):
-        grants = ["owner_principal = ?"]
+        sql += " AND owner_principal = ?"
         params.append(scope.owner_principal)
-        if scope.readable_domains:
-            domain_placeholders = ",".join(["?"] * len(scope.readable_domains))
-            grants.append(f"origin_domain IN ({domain_placeholders})")
-            params.extend(scope.readable_domains)
-        sql += f" AND ({' OR '.join(grants)})"
     found = {row[0] for row in conn.execute(sql, params).fetchall()}
     return requested if found == set(requested) else None
 
@@ -2543,11 +2533,6 @@ class SagaStore:
                     scope.owner_principal
                     if isinstance(scope, _ServiceMutationScope)
                     else scope if isinstance(scope, str) else None
-                ),
-                origin_domains=(
-                    scope.readable_domains
-                    if isinstance(scope, _ServiceMutationScope)
-                    else None
                 ),
             )
             candidate_ids = preview.tombstoned_ids
