@@ -1239,20 +1239,24 @@ def test_main_returns_within_the_tick_bound_when_every_call_is_slow(
     monkeypatch, tmp_path,
 ):
     """The postcondition that matters: a slow API cannot carry main() past the
-    framework cap. Deadlines are scaled (0.4s soft / 0.8s hard) so the test is
-    fast, but nothing about the timing path is stubbed.
+    framework cap. Deadlines are scaled (0.3s soft / 0.5s hard) so the test is
+    fast, but nothing about the timing path is stubbed — `time.monotonic` is
+    real.
 
-    Unbounded, 40 PRs x ~6 calls/PR x 0.02s is >4.8s of API time; the bound must
-    bring it in near the 0.8s hard deadline.
+    The thresholds are chosen so the *unbounded* path cannot satisfy them:
+    `_check_pr_reviews` alone walks all 150 open PRs at 0.01s per call, so
+    without a hard stop the tick spends >=1.5s and makes >=150 calls before the
+    reconcile passes even begin. Bounded, it stops near the 0.5s deadline.
+    Removing the hard stop must fail this test, not squeeze under it.
     """
     elapsed, calls, saved = _slow_main_harness(
-        monkeypatch, tmp_path, n_prs=40, call_seconds=0.02, soft=0.4, hard=0.8,
+        monkeypatch, tmp_path, n_prs=150, call_seconds=0.01, soft=0.3, hard=0.5,
     )
     # Scaled equivalent of "returns before POLLER_TIMEOUT_SECONDS": the tick
     # finishes near its hard deadline plus one in-flight call, not at the
     # unbounded cost of the work it was asked to do.
-    assert elapsed < 2.0, f"tick ran {elapsed:.2f}s; bound not enforced"
-    assert len(calls) < 80, f"{len(calls)} calls; per-item loops not bounded"
+    assert elapsed < 1.2, f"tick ran {elapsed:.2f}s; wall-clock bound not enforced"
+    assert len(calls) < 100, f"{len(calls)} calls; per-item loops not bounded"
     # It must still have returned under its own power and saved a cursor.
     assert len(saved) == 1
 
@@ -1261,7 +1265,7 @@ def test_hard_truncated_tick_holds_its_watermark(monkeypatch, tmp_path):
     """A hard-truncated tick skipped items in since-based passes that keep no
     dedupe cursor, so advancing `last_checked` would step over them for good."""
     _elapsed, _calls, saved = _slow_main_harness(
-        monkeypatch, tmp_path, n_prs=40, call_seconds=0.02, soft=0.4, hard=0.8,
+        monkeypatch, tmp_path, n_prs=150, call_seconds=0.01, soft=0.3, hard=0.5,
     )
     assert saved[0]["last_checked"] == "2026-08-23T10:00:00Z"
 
