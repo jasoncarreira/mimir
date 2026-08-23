@@ -2034,8 +2034,8 @@ class SagaStore:
         def _restructure():
             from .consolidate import (
                 _compute_intersected_acl,
+                emit_observation,
                 find_equal_evidence_obs,
-                find_superseded_observations,
             )
             from .observations import refresh_trend
             from .store import store as _store_atom
@@ -2066,92 +2066,8 @@ class SagaStore:
 
                 intersected_acl = _compute_intersected_acl(conn, evidence_ids)
 
-                store_result = _store_atom(
-                    conn,
-                    content,
-                    # chainlink #417: embedding was precomputed above,
-                    # before the write lock / transactions; embed_fn is
-                    # the unused fallback (store never calls it when
-                    # precomputed_embedding is supplied).
-                    embed_fn=_embed_text_sync,
-                    precomputed_embedding=obs_emb,
-                    memory_type="observation",
-                    stream="semantic",
-                    topics=topics,
-                    agent_id=self._agent_id,
-                    session_id=None,
-                    owner_principal=intersected_acl.owner_principal,
-                    origin_channel=intersected_acl.origin_channel,
-                    origin_domain=intersected_acl.origin_domain,
-                    visibility=intersected_acl.visibility,
-                    provenance=intersected_acl.provenance,
-                )
-                if not store_result.stored:
-                    # A hard kill can land the observation atom while missing
-                    # the following relations transaction. Complete exactly
-                    # that orphan on retry; ordinary content dedupe remains a
-                    # no-op (including observations backed by other evidence).
-                    repairable = conn.execute(
-                        "SELECT 1 FROM atoms a "
-                        "WHERE a.id = ? AND a.memory_type = 'observation' "
-                        "AND a.tombstoned = 0 "
-                        "AND NOT EXISTS ("
-                        "  SELECT 1 FROM atom_relations ar "
-                        "  WHERE ar.source_id = a.id "
-                        "    AND ar.relation_type = 'evidenced_by'"
-                        ") AND NOT EXISTS ("
-                        "  SELECT 1 FROM observations_metadata om "
-                        "  WHERE om.atom_id = a.id"
-                        ")",
-                        (store_result.atom_id,),
-                    ).fetchone()
-                    if repairable is None:
-                        continue
-
-                observation_id = store_result.atom_id
-                try:
-                    conn.execute("BEGIN IMMEDIATE")
-                    conn.executemany(
-                        "INSERT INTO atom_relations "
-                        "(source_id, target_id, relation_type, confidence, created_at) "
-                        "VALUES (?, ?, 'evidenced_by', 1.0, ?)",
-                        [(observation_id, rid, now) for rid in evidence_ids],
-                    )
-                    conn.executemany(
-                        "INSERT INTO atom_relations "
-                        "(source_id, target_id, relation_type, confidence, created_at) "
-                        "VALUES (?, ?, 'consolidated_into', 1.0, ?)",
-                        [(rid, observation_id, now) for rid in evidence_ids],
-                    )
-                    # No mark_access on evidence raws: consolidation is
-                    # system-internal. The evidence_boost on retrieval
-                    # provides the ranking signal; access_events stays
-                    # a pure external-access record.
-
-                    old_obs = find_superseded_observations(
-                        conn,
-                        observation_id,
-                        set(evidence_ids),
-                    )
-                    for old_id in old_obs:
-                        conn.execute(
-                            "INSERT OR IGNORE INTO atom_relations "
-                            "(source_id, target_id, relation_type, confidence, "
-                            "created_at, metadata) "
-                            "VALUES (?, ?, 'supersedes', 1.0, ?, ?)",
-                            (
-                                observation_id,
-                                old_id,
-                                now,
-                                json.dumps({"trigger": "consolidate"}),
-                            ),
-                        )
-                    conn.execute(
-                        "INSERT INTO observations_metadata "
-                        "(atom_id, evidence_count, trend, last_evidence_at, "
-                        "consolidated_at) VALUES (?, ?, ?, ?, ?)",
-                        (observation_id, len(evidence_ids), "strengthening", now, now),
-                    )
+                def _extra_writes(observation_id: str) -> None:
+                    nonlocal triples_stored, contradicts_stored
                     # P42: store any triples the LLM extracted. Source
                     # them to the new observation atom (not the raws)
                     # so triple retrieval surfaces the observation —
@@ -2209,38 +2125,33 @@ class SagaStore:
                             )
                             if cursor.rowcount > 0:
                                 contradicts_stored += 1
-                    conn.commit()
-                except Exception:
-                    conn.rollback()
-                    # chainlink #391: _store_atom above committed the observation
-                    # in its OWN transaction before this relations transaction.
-                    # On rollback it would remain an orphan — no evidenced_by /
-                    # observations_metadata — that recall surfaces unbacked, and
-                    # find_equal_evidence_obs can't match on retry (it has no
-                    # evidence edges) so a re-run duplicates it. Tombstone it
-                    # (matches forget's removal model; avoids FK/FTS/embedding
-                    # orphan issues a DELETE would risk) before re-raising. It
-                    # was never added to the FAISS index (that happens only after
-                    # the commit below), so no index cleanup is needed.
-                    try:
-                        conn.execute("BEGIN IMMEDIATE")
-                        conn.execute(
-                            "UPDATE atoms SET tombstoned=1 WHERE id=?",
-                            (observation_id,),
-                        )
-                        conn.commit()
-                    except Exception:  # noqa: BLE001
-                        try:
-                            conn.rollback()
-                        except Exception:  # noqa: BLE001
-                            pass
-                        log.warning(
-                            "failed to tombstone orphaned observation %s after "
-                            "restructure rollback",
-                            observation_id,
-                            exc_info=True,
-                        )
-                    raise
+
+                emitted_observation = emit_observation(
+                    conn,
+                    evidence_ids=evidence_ids,
+                    store_observation=lambda: _store_atom(
+                        conn,
+                        content,
+                        embed_fn=_embed_text_sync,
+                        precomputed_embedding=obs_emb,
+                        memory_type="observation",
+                        stream="semantic",
+                        topics=topics,
+                        agent_id=self._agent_id,
+                        session_id=None,
+                        owner_principal=intersected_acl.owner_principal,
+                        origin_channel=intersected_acl.origin_channel,
+                        origin_domain=intersected_acl.origin_domain,
+                        visibility=intersected_acl.visibility,
+                        provenance=intersected_acl.provenance,
+                    ),
+                    extra_writes=_extra_writes,
+                    now=now,
+                )
+                if emitted_observation is None:
+                    continue
+                observation_id = emitted_observation.observation_id
+                old_obs = emitted_observation.superseded_ids
 
                 # Trend recompute in its own short txn (refresh_trend
                 # manages its own BEGIN/COMMIT).
@@ -2999,6 +2910,7 @@ class SagaStore:
                 "contributed": [],
                 "threshold": thr,
                 "authorized": 0,
+                "credit_written": False,
             }
         return {
             "contributed_count": len(result.contributed_atom_ids),
@@ -3007,6 +2919,7 @@ class SagaStore:
             "contributed": result.contributed_atom_ids,
             "threshold": result.threshold,
             "authorized": len(retrieved_atoms),
+            "credit_written": result.credit_written,
         }
 
     async def health(self) -> bool:

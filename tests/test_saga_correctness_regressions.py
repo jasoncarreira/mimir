@@ -1072,6 +1072,14 @@ async def test_consolidate_restructure_tombstones_orphan_on_rollback(
         "orphaned observation must be tombstoned after the relations rollback "
         "(#391) — found a live unbacked observation"
     )
+    assert conn.execute(
+        "SELECT a.id FROM atoms a "
+        "WHERE a.memory_type = 'observation' AND a.tombstoned = 0 "
+        "AND NOT EXISTS (SELECT 1 FROM atom_relations ar "
+        "  WHERE ar.source_id = a.id AND ar.relation_type = 'evidenced_by') "
+        "AND NOT EXISTS (SELECT 1 FROM observations_metadata om "
+        "  WHERE om.atom_id = a.id)"
+    ).fetchall() == []
 
 
 @pytest.mark.asyncio

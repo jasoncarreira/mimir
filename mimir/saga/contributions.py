@@ -74,6 +74,7 @@ class ContributionResult:
     contribution_rate: float          # fraction of retrieved atoms above threshold
     scores: dict[str, float]          # atom_id → contribution score [0, 1]
     threshold: float
+    credit_written: bool
 
 
 def mark_contributions(
@@ -100,7 +101,7 @@ def mark_contributions(
 
     Returns:
         ContributionResult with the contributor list, aggregate rate,
-        per-atom scores, and the threshold used.
+        per-atom scores, threshold, and whether credit was durably written.
 
     Empty inputs are safe — returns an empty result without raising.
     """
@@ -110,6 +111,7 @@ def mark_contributions(
             contribution_rate=0.0,
             scores={},
             threshold=threshold,
+            credit_written=False,
         )
 
     response_ngrams = _ngrams_of(response_text, NGRAM_N)
@@ -119,6 +121,7 @@ def mark_contributions(
             contribution_rate=0.0,
             scores={},
             threshold=threshold,
+            credit_written=False,
         )
 
     scores: dict[str, float] = {}
@@ -144,6 +147,7 @@ def mark_contributions(
 
     rate = len(contributors) / len(retrieved_atoms)
 
+    credit_written = False
     if write_events and contributors:
         events = [
             AccessEvent(
@@ -157,19 +161,26 @@ def mark_contributions(
             )
             for aid in contributors
         ]
+        began = False
         try:
             conn.execute("BEGIN IMMEDIATE")
+            began = True
             mark_access(conn, events)
             conn.commit()
+            credit_written = True
         except Exception as exc:
-            conn.rollback()
+            if began:
+                conn.rollback()
             logger.warning("mark_contributions event write failed: %s", exc)
+            contributors = []
+            rate = 0.0
 
     return ContributionResult(
         contributed_atom_ids=contributors,
         contribution_rate=rate,
         scores=scores,
         threshold=threshold,
+        credit_written=credit_written,
     )
 
 
