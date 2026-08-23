@@ -1716,6 +1716,9 @@ class BudgetGateMiddleware(AgentMiddleware):
 
                 policy_refusal = end_read_policy_refusal_capture(read_refusal_token)
                 read_refusal_token = None
+            _record_repo_review_checkout(
+                execution_request, auth_context, failed=True,
+            )
             if isinstance(exc, ToolPolicyRefusal):
                 _record_tool_outcome(tool_name, refused_reason=str(exc))
             else:
@@ -2056,6 +2059,9 @@ class BudgetGateMiddleware(AgentMiddleware):
 
                 policy_refusal = end_read_policy_refusal_capture(read_refusal_token)
                 read_refusal_token = None
+            _record_repo_review_checkout(
+                execution_request, auth_context, failed=True,
+            )
             if isinstance(exc, ToolPolicyRefusal):
                 _record_tool_outcome(tool_name, refused_reason=str(exc))
             else:

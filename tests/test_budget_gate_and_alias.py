@@ -3806,8 +3806,11 @@ async def test_middleware_emits_tool_error_for_budget_denial(
 
 
 @pytest.mark.asyncio
-async def test_tool_refusal_is_a_result_and_next_tool_call_can_run() -> None:
+async def test_tool_refusal_is_a_result_and_next_tool_call_can_run(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     from mimir.tools.refusals import ToolPolicyRefusal
+    from mimir.tools import budget_gate as budget_gate_module
 
     middleware = BudgetGateMiddleware()
     calls: list[str] = []
@@ -3837,11 +3840,42 @@ async def test_tool_refusal_is_a_result_and_next_tool_call_can_run() -> None:
         repo_pr_action_scope=scope,
     )
     ctx = _ifc_turn(auth)
+    repo_checkout_failures: list[bool] = []
+    repo_classification_failures: list[bool] = []
+    repo_events: list[bool] = []
+
+    original_record_checkout = budget_gate_module._record_repo_review_checkout
+    original_result_labels = budget_gate_module._result_labels_for_call
+    original_emit_tool_call = budget_gate_module._emit_tool_call_sync
+
+    def record_checkout(request, auth_context, *, failed):
+        if request.tool_call["name"] == "repo_push":
+            repo_checkout_failures.append(failed)
+        return original_record_checkout(request, auth_context, failed=failed)
+
+    def record_result_labels(tool_name, *args, failed=False, **kwargs):
+        if tool_name == "repo_push" and (failed or kwargs.get("result") is not None):
+            repo_classification_failures.append(failed)
+        return original_result_labels(tool_name, *args, failed=failed, **kwargs)
+
+    def record_tool_call(tool_name, *, ok, **kwargs):
+        if tool_name == "repo_push":
+            repo_events.append(ok)
+        return original_emit_tool_call(tool_name, ok=ok, **kwargs)
+
+    monkeypatch.setattr(budget_gate_module, "_record_repo_review_checkout", record_checkout)
+    monkeypatch.setattr(budget_gate_module, "_result_labels_for_call", record_result_labels)
+    monkeypatch.setattr(budget_gate_module, "_emit_tool_call_sync", record_tool_call)
 
     async def handler(request: ToolCallRequest) -> ToolMessage:
         calls.append(request.tool_call["id"])
         if request.tool_call["id"] == "refused":
             raise ToolPolicyRefusal("pull-request operation rejected: repo.inspect not granted")
+        if request.tool_call["id"] == "stale":
+            raise ToolException(
+                "repository operation rejected (repository_git_failed) [stale_scope]: "
+                "local commit remains unpushed in preserved checkout"
+            )
         return ToolMessage(content="adapted", tool_call_id=request.tool_call["id"])
 
     assert ctx.ifc_labels.has_untrusted_active_ingest is False
@@ -3850,6 +3884,13 @@ async def test_tool_refusal_is_a_result_and_next_tool_call_can_run() -> None:
         refusal = await middleware.awrap_tool_call(
             _make_request(
                 "pr_metadata", "refused", auth,
+                {"repository": "owner/repo", "pull_request": 17},
+            ),
+            handler,
+        )
+        stale = await middleware.awrap_tool_call(
+            _make_request(
+                "repo_push", "stale", auth,
                 {"repository": "owner/repo", "pull_request": 17},
             ),
             handler,
@@ -3874,11 +3915,14 @@ async def test_tool_refusal_is_a_result_and_next_tool_call_can_run() -> None:
     assert isinstance(refusal, ToolMessage)
     assert refusal.status == "error"
     assert "repo.inspect not granted" in str(refusal.content)
+    assert isinstance(stale, ToolMessage)
+    assert stale.status == "error"
+    assert "remains unpushed in preserved checkout" in str(stale.content)
     assert adapted.content == "adapted"
     assert unsupported.content == "adapted"
-    assert calls == ["refused", "adapted", "unsupported"]
+    assert calls == ["refused", "stale", "adapted", "unsupported"]
     assert ctx.ifc_labels.has_untrusted_active_ingest is False
-    assert ctx.tool_call_count == 3
+    assert ctx.tool_call_count == 4
     assert ctx.hard_boundary_denials == [
         {
             "tool": "pr_metadata",
@@ -3892,6 +3936,9 @@ async def test_tool_refusal_is_a_result_and_next_tool_call_can_run() -> None:
         },
     ]
     assert ctx.remediation_effects == ["repo_push"]
+    assert repo_checkout_failures == [True, False]
+    assert repo_classification_failures == [True, False]
+    assert repo_events == [False, True]
 
 
 @pytest.mark.asyncio

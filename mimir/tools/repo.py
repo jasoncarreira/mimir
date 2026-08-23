@@ -42,6 +42,7 @@ _GIT_EXECUTION_REFUSAL_CODES = frozenset({
     "invalid_git_output",
     "output_limit",
     "push_not_applied",
+    "stale_scope",
     "timeout",
 })
 _GIT_BINDING_REFUSAL_CODES = frozenset({

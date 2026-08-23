@@ -573,7 +573,7 @@ def test_revert_conflict_has_separately_authorized_abort(repo_tools) -> None:
     assert _git(lease.path, "status", "--porcelain") == ""
 
 
-def test_stale_remote_head_returns_named_refusal_and_never_pushes(repo_tools) -> None:
+def test_stale_remote_head_raises_named_refusal_and_never_pushes(repo_tools) -> None:
     origin, source, _scope, state, _tools = repo_tools
     _git(source, "checkout", "-q", "worklink/7")
     (source / "remote.txt").write_text("advanced\n", encoding="utf-8")
@@ -588,10 +588,11 @@ def test_stale_remote_head_returns_named_refusal_and_never_pushes(repo_tools) ->
             argv, env=env, timeout=timeout, output_limit=output_limit,
         )
 
-    result = RepoGitTools(state, runner=recording_runner).execute(GitPush())
+    with pytest.raises(GitRefusal) as refusal:
+        RepoGitTools(state, runner=recording_runner).execute(GitPush())
 
-    assert result.ok is False
-    assert result.code == "stale_scope"
+    assert refusal.value.code == "stale_scope"
+    assert str(refusal.value) == "the checkout lease was preserved for retry"
     assert any("ls-remote" in argv for argv in calls)
     assert not any("push" in argv for argv in calls)
     assert _git(origin, "rev-parse", "refs/heads/worklink/7") != state.checkout_lease.head_sha
@@ -746,10 +747,10 @@ def test_mergeability_rebase_stale_lease_refuses_concurrent_push(tmp_path: Path)
     concurrent_head = _git(source, "rev-parse", "HEAD")
     _git(source, "push", "-q", "origin", "HEAD:worklink/7")
 
-    result = RepoGitTools(state).execute(GitPush())
+    with pytest.raises(GitRefusal) as refusal:
+        RepoGitTools(state).execute(GitPush())
 
-    assert result.ok is False
-    assert result.code == "stale_scope"
+    assert refusal.value.code == "stale_scope"
     assert _git(origin, "rev-parse", scope.destination_ref) == concurrent_head
 
 
@@ -773,10 +774,10 @@ def test_changes_requested_rebase_stale_lease_refuses_concurrent_push(
             argv, env=env, timeout=timeout, output_limit=output_limit,
         )
 
-    result = RepoGitTools(state, runner=recording_runner).execute(GitPush())
+    with pytest.raises(GitRefusal) as refusal:
+        RepoGitTools(state, runner=recording_runner).execute(GitPush())
 
-    assert result.ok is False
-    assert result.code == "stale_scope"
+    assert refusal.value.code == "stale_scope"
     assert any("ls-remote" in argv for argv in calls)
     assert not any("push" in argv for argv in calls)
     assert _git(origin, "rev-parse", scope.destination_ref) == concurrent_head
@@ -2501,6 +2502,7 @@ def test_git_execution_os_failure_is_a_named_refusal(repo_tools) -> None:
     [
         (ToolPolicyRefusal("scope action denied"), "repository_authorization_refused", ToolPolicyRefusal),
         (GitRefusal("inactive_checkout", "lease binding missing"), "repository_binding_invalid", ToolPolicyRefusal),
+        (GitRefusal("stale_scope", "local commit remains unpushed in preserved checkout"), "repository_git_failed", ToolException),
         (RuntimeError("plain Git invocation failed"), "repository_git_failed", ToolException),
     ],
 )
@@ -2533,6 +2535,8 @@ def test_repo_wrapper_failure_classes_have_distinct_stable_codes(
 
     assert f"repository operation rejected ({expected_code})" in str(refusal.value)
     assert "repository_operation_failed" not in str(refusal.value)
+    if isinstance(failure, GitRefusal) and failure.code == "stale_scope":
+        assert "local commit remains unpushed in preserved checkout" in str(refusal.value)
 
 
 def test_repo_wrapper_git_stderr_redacts_embedded_remote_credential(
