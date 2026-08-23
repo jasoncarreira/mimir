@@ -1222,9 +1222,14 @@ def _slow_main_harness(
         return []
 
     real_budget = poller.TickBudget
+    # Accepts and ignores ``started_at``: these deadlines are scaled to keep the
+    # test fast, and subtracting the real elapsed time of a long pytest session
+    # would zero them. The subtraction itself is covered separately.
     monkeypatch.setattr(
         poller, "TickBudget",
-        lambda: real_budget(deadline_seconds=soft, hard_deadline_seconds=hard),
+        lambda started_at=None: real_budget(
+            deadline_seconds=soft, hard_deadline_seconds=hard,
+        ),
     )
     monkeypatch.setattr(poller, "STATE_DIR", tmp_path)
     monkeypatch.setattr(poller, "_resolve_token", lambda: "tok")
@@ -1314,7 +1319,9 @@ def test_final_pr_review_timeout_holds_watermark_through_cursor_save(
     monkeypatch.setattr(
         poller,
         "TickBudget",
-        lambda: real_budget(deadline_seconds=0.02, hard_deadline_seconds=0.05),
+        lambda started_at=None: real_budget(
+            deadline_seconds=0.02, hard_deadline_seconds=0.05,
+        ),
     )
     monkeypatch.setattr(poller, "STATE_DIR", tmp_path)
     monkeypatch.setattr(poller, "_resolve_token", lambda: "tok")
@@ -1643,3 +1650,144 @@ def test_subminimum_budget_refusal_holds_since_window_with_time_remaining(
     assert 0 < budget.hard_remaining() < poller.GH_API_MIN_TIMEOUT_SECONDS
     assert budget.hard_truncated is True
     assert budget.truncated.get("review_comments_window") == 1
+
+
+# --- deadlines derived from the framework cap (follow-up to #1433/#1711) ------
+
+
+def _poller_with_cap(cap: str | None):
+    """Load a fresh copy of the poller with POLLER_TIMEOUT_SECONDS set.
+
+    The deadlines are module-level constants computed at import, because the
+    poller is a fresh process per tick — so exercising them means importing
+    again under a different environment rather than patching attributes.
+    """
+    import importlib.util
+    import os
+    from pathlib import Path
+
+    script = (
+        Path(__file__).resolve().parent.parent / "scripts" / "poller.py"
+    )
+    previous = os.environ.get("POLLER_TIMEOUT_SECONDS")
+    if cap is None:
+        os.environ.pop("POLLER_TIMEOUT_SECONDS", None)
+    else:
+        os.environ["POLLER_TIMEOUT_SECONDS"] = cap
+    try:
+        spec = importlib.util.spec_from_file_location("_poller_cap_probe", script)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+    finally:
+        if previous is None:
+            os.environ.pop("POLLER_TIMEOUT_SECONDS", None)
+        else:
+            os.environ["POLLER_TIMEOUT_SECONDS"] = previous
+
+
+def test_deadlines_scale_with_the_exported_cap():
+    """The tick must use the cap it will actually be killed at.
+
+    `run_poller` exports the *effective* per-poller timeout, which the scheduler
+    may clamp below the framework default when a poller's cadence is tighter.
+    Hardcoding leaves extra headroom unused at a raised cap, and is wrong in the
+    dangerous direction at a clamped one.
+    """
+    raised = _poller_with_cap("120")
+    assert raised.TICK_HARD_DEADLINE_SECONDS == 110.0
+    assert raised.PR_RECONCILE_DEADLINE_SECONDS == pytest.approx(77.0)
+    # Soft must stay strictly inside hard, and hard strictly inside the cap.
+    assert (
+        raised.PR_RECONCILE_DEADLINE_SECONDS
+        < raised.TICK_HARD_DEADLINE_SECONDS
+        < 120.0
+    )
+
+    # A cadence-clamped poller gets *less* headroom, not the default.
+    clamped = _poller_with_cap("45")
+    assert clamped.TICK_HARD_DEADLINE_SECONDS == 35.0
+    assert clamped.PR_RECONCILE_DEADLINE_SECONDS == pytest.approx(24.5)
+
+
+def test_absent_cap_preserves_the_measured_tuning():
+    """No cap in the environment must reproduce the 35s/50s the live
+    measurements were taken against — and assume the old 60s cap, not the new
+    120s one, so a standalone run is conservative rather than optimistic."""
+    for cap in (None, "60"):
+        mod = _poller_with_cap(cap)
+        assert mod.POLLER_CAP_SECONDS == 60.0
+        assert mod.TICK_HARD_DEADLINE_SECONDS == 50.0
+        assert mod.PR_RECONCILE_DEADLINE_SECONDS == pytest.approx(35.0)
+
+
+def test_malformed_cap_falls_back_instead_of_disabling_the_bound():
+    """A junk or non-positive value must not produce a zero/negative deadline,
+    which would make every call refuse and look like a total API outage."""
+    for junk in ("", "abc", "0", "-5"):
+        mod = _poller_with_cap(junk)
+        assert mod.POLLER_CAP_SECONDS == 60.0
+        assert mod.TICK_HARD_DEADLINE_SECONDS == 50.0
+
+
+def test_budget_subtracts_time_spent_before_it_was_built():
+    """The framework kills the tick at a cap measured from *process* start.
+
+    A budget anchored at its own construction silently excludes module import,
+    cursor load and token resolution, so a 110s budget plus slow startup can run
+    past a 120s kill and lose everything the tick emitted. Measured startup is
+    ~0.8s today, well inside the reserve — this asserts the bound does not depend
+    on that staying true.
+    """
+    import time as _time
+
+    started = _time.monotonic() - 20.0  # pretend 20s of startup already happened
+    budget = poller.TickBudget(
+        deadline_seconds=35.0, hard_deadline_seconds=50.0, started_at=started,
+    )
+    assert budget.startup_consumed == pytest.approx(20.0, abs=0.5)
+    # Both deadlines shrink by what startup already spent.
+    assert budget.hard_remaining() == pytest.approx(30.0, abs=0.5)
+    assert budget.exhausted() is False
+    fresh = poller.TickBudget(deadline_seconds=35.0, hard_deadline_seconds=50.0)
+    assert fresh.hard_remaining() == pytest.approx(50.0, abs=0.5)
+    assert fresh.startup_consumed == 0.0
+
+    # Startup that outran the whole budget leaves nothing, rather than going
+    # negative and reading as "plenty of time left".
+    spent = poller.TickBudget(
+        deadline_seconds=35.0, hard_deadline_seconds=50.0,
+        started_at=_time.monotonic() - 999.0,
+    )
+    assert spent.hard_exhausted() is True
+    assert spent.exhausted() is True
+    assert spent.call_timeout() is None
+
+
+def test_main_anchors_the_budget_to_process_start(monkeypatch, tmp_path):
+    """Pin that main() actually passes the anchor — the guarantee is worthless
+    if a future edit constructs the budget without it."""
+    seen: list[object] = []
+    real_budget = poller.TickBudget
+
+    def capture(*args, **kwargs):
+        seen.append(kwargs.get("started_at"))
+        return real_budget(*args, **kwargs)
+
+    monkeypatch.setattr(poller, "TickBudget", capture)
+    monkeypatch.setattr(poller, "STATE_DIR", tmp_path)
+    monkeypatch.setattr(poller, "_resolve_token", lambda: "tok")
+    monkeypatch.setattr(poller, "_gh_api", lambda ep, tok: [])
+    monkeypatch.setattr(poller, "_emit", lambda *a, **k: None)
+    monkeypatch.setattr(poller, "_emit_signal", lambda *a, **k: None)
+    monkeypatch.setattr(poller, "_save_cursor", lambda c: None)
+    monkeypatch.setattr(poller, "_load_cursor", lambda: {"last_checked": "2026-08-23T10:00:00Z"})
+    monkeypatch.setenv("GITHUB_REPOS", "o/r")
+    monkeypatch.setenv("MIMIR_GITHUB_SELF_LOGIN", "mimir-bot")
+
+    poller.main()
+
+    assert seen, "main() never constructed a TickBudget"
+    assert seen[0] == poller._PROCESS_START, (
+        "main() built the budget without anchoring it to process start"
+    )
