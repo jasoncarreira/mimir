@@ -2032,6 +2032,199 @@ def test_sync_protected_read_allows_compatible_harness_egress():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("tool_name", ["read_file", "ls", "glob"])
+async def test_real_read_policy_refusal_is_audited_without_tainting_reply(
+    tool_name: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from dataclasses import replace
+
+    from mimir.readonly_backend import _RootAwareFilesystemBackend
+
+    home = tmp_path / "home"
+    denied = home / "logs"
+    denied.mkdir(parents=True)
+    (denied / "private.txt").write_text("private\n", encoding="utf-8")
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    auth = _untainted_ifc_auth(roles=("user",))
+    shadow_auth = replace(auth, enforcement_enabled=False)
+    ctx = _ifc_turn(auth)
+    middleware = BudgetGateMiddleware()
+    backend = _RootAwareFilesystemBackend(root_dir=home, virtual_mode=True)
+    events: list[tuple[str, dict[str, Any]]] = []
+    monkeypatch.setattr(
+        "mimir.tools.budget_gate._emit_event_sync",
+        lambda kind, **fields: events.append((kind, fields)),
+    )
+
+    async def refused(req: ToolCallRequest) -> ToolMessage:
+        if tool_name == "read_file":
+            result = await backend.aread("/logs/private.txt")
+        elif tool_name == "ls":
+            result = await backend.als("/logs")
+        else:
+            result = await backend.aglob("*.txt", path="/logs")
+        assert result.error is not None
+        return ToolMessage(
+            content=f"Error: {result.error}",
+            tool_call_id=req.tool_call["id"],
+            status="error",
+        )
+
+    send_calls = 0
+
+    async def send(req: ToolCallRequest) -> ToolMessage:
+        nonlocal send_calls
+        send_calls += 1
+        return ToolMessage(content="sent", tool_call_id=req.tool_call["id"])
+
+    args = (
+        {"file_path": "/logs/private.txt"}
+        if tool_name == "read_file"
+        else {"path": "/logs", "pattern": "*.txt"}
+    )
+    token = set_current_turn(ctx)
+    try:
+        refusal = await middleware.awrap_tool_call(
+            _make_request(tool_name, "refused-read", shadow_auth, args), refused,
+        )
+        reply = await middleware.awrap_tool_call(
+            _make_request("send_message", "reply", auth, {"channel_id": "ch-1"}), send,
+        )
+    finally:
+        reset_current_turn(token)
+
+    assert refusal.status == "error"
+    assert ctx.ifc_labels.sources == ()
+    assert reply.status != "error"
+    assert send_calls == 1
+    hard_denials = [fields for kind, fields in events if kind == "hard_boundary_denied"]
+    assert [event["boundary"] for event in hard_denials] == ["protected_read_policy"]
+
+
+@pytest.mark.asyncio
+async def test_read_refusal_does_not_clear_separate_untrusted_ingestion(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from dataclasses import replace
+
+    from mimir.access_control import publish_protected_result
+    from mimir.readonly_backend import _RootAwareFilesystemBackend
+
+    home = tmp_path / "home"
+    (home / "logs").mkdir(parents=True)
+    (home / "logs" / "private.txt").write_text("private\n", encoding="utf-8")
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    auth = _untainted_ifc_auth(roles=("user",))
+    shadow_auth = replace(auth, enforcement_enabled=False)
+    ctx = _ifc_turn(auth)
+    middleware = BudgetGateMiddleware()
+    backend = _RootAwareFilesystemBackend(root_dir=home, virtual_mode=True)
+
+    async def refused(req: ToolCallRequest) -> ToolMessage:
+        result = await backend.aread("/logs/private.txt")
+        return ToolMessage(
+            content=f"Error: {result.error}", tool_call_id=req.tool_call["id"], status="error",
+        )
+
+    async def untrusted(req: ToolCallRequest) -> ToolMessage:
+        publish_protected_result((SourceLabel(
+            principal="other-user",
+            domain="filesystem",
+            resource_id=str(tmp_path / "external.txt"),
+            bridge_instance="filesystem",
+            sensitivity="internal",
+            authorized_principals=frozenset({"other-user"}),
+            source_kind="protected_tool",
+            integrity="untrusted",
+            integrity_effect="active_ingest",
+        ),))
+        return ToolMessage(content="untrusted", tool_call_id=req.tool_call["id"])
+
+    async def send(req: ToolCallRequest) -> ToolMessage:
+        return ToolMessage(content="sent", tool_call_id=req.tool_call["id"])
+
+    token = set_current_turn(ctx)
+    try:
+        await middleware.awrap_tool_call(
+            _make_request(
+                "read_file", "refused", shadow_auth, {"file_path": "/logs/private.txt"},
+            ),
+            refused,
+        )
+        await middleware.awrap_tool_call(
+            _make_request("write_todos", "untrusted", auth), untrusted,
+        )
+        reply = await middleware.awrap_tool_call(
+            _make_request("send_message", "reply", auth, {"channel_id": "ch-1"}), send,
+        )
+    finally:
+        reset_current_turn(token)
+
+    assert len(ctx.ifc_labels.sources) == 1
+    assert reply.status == "error"
+    assert "ifc_label_blocked:same_channel" in str(reply.content)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("tool_name", ["grep", "glob", "ls", "file_search"])
+async def test_partial_collection_denial_preserves_successful_path_labels(
+    tool_name: str,
+) -> None:
+    from dataclasses import replace
+
+    from mimir.access_control import publish_protected_result
+    from mimir.read_policy import emit_hard_read_denial
+
+    auth = _untainted_ifc_auth(roles=("user",))
+    shadow_auth = replace(auth, enforcement_enabled=False)
+    ctx = _ifc_turn(auth)
+    middleware = BudgetGateMiddleware()
+    safe_source = SourceLabel(
+        principal="other-user",
+        domain="filesystem",
+        resource_id="/returned/safe.txt",
+        bridge_instance="filesystem",
+        sensitivity="internal",
+        authorized_principals=frozenset({"other-user"}),
+        source_kind="protected_tool",
+        integrity="untrusted",
+        integrity_effect="active_ingest",
+    )
+
+    async def partial(req: ToolCallRequest) -> ToolMessage:
+        emit_hard_read_denial(tool_name, "/withheld/private.txt", "protected_name_match")
+        publish_protected_result((safe_source,))
+        return ToolMessage(content="/returned/safe.txt", tool_call_id=req.tool_call["id"])
+
+    async def send(req: ToolCallRequest) -> ToolMessage:
+        return ToolMessage(content="sent", tool_call_id=req.tool_call["id"])
+
+    args = {
+        "grep": {"pattern": "needle", "path": "/"},
+        "glob": {"pattern": "*.txt", "path": "/"},
+        "ls": {"path": "/"},
+        "file_search": {"query": "needle"},
+    }[tool_name]
+    token = set_current_turn(ctx)
+    try:
+        await middleware.awrap_tool_call(
+            _make_request(tool_name, "partial-collection", shadow_auth, args), partial,
+        )
+        reply = await middleware.awrap_tool_call(
+            _make_request("send_message", "reply", auth, {"channel_id": "ch-1"}), send,
+        )
+    finally:
+        reset_current_turn(token)
+
+    assert ctx.ifc_labels.sources == (safe_source,)
+    assert reply.status == "error"
+    assert "ifc_label_blocked:same_channel" in str(reply.content)
+
+
+@pytest.mark.asyncio
 async def test_real_commitment_list_with_ownerless_record_allows_same_channel_reply(
     tmp_path: Path,
 ):
@@ -2263,6 +2456,160 @@ async def test_async_partial_error_taints_and_blocks_next_same_channel_send():
     assert denied.status == "error"
     assert "ifc_label_blocked:same_channel" in str(denied.content)
     assert send_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_filesystem_error_after_visible_output_still_taints_and_blocks_reply():
+    auth = _untainted_ifc_auth()
+    ctx = _ifc_turn(auth)
+    middleware = BudgetGateMiddleware()
+
+    async def partial(req: ToolCallRequest) -> ToolMessage:
+        return ToolMessage(
+            content="visible file output before I/O failure",
+            tool_call_id=req.tool_call["id"],
+            status="error",
+        )
+
+    async def send(req: ToolCallRequest) -> ToolMessage:
+        return ToolMessage(content="sent", tool_call_id=req.tool_call["id"])
+
+    token = set_current_turn(ctx)
+    try:
+        await middleware.awrap_tool_call(
+            _make_request(
+                "read_file", "partial-file", auth, {"file_path": "/external.txt"},
+            ),
+            partial,
+        )
+        reply = await middleware.awrap_tool_call(
+            _make_request("send_message", "reply", auth, {"channel_id": "ch-1"}), send,
+        )
+    finally:
+        reset_current_turn(token)
+
+    filesystem = [source for source in ctx.ifc_labels.sources if source.domain == "filesystem"]
+    assert len(filesystem) == 1
+    assert filesystem[0].is_complete is False
+    assert reply.status == "error"
+    assert "ifc_label_blocked:same_channel" in str(reply.content)
+
+
+@pytest.mark.asyncio
+async def test_read_refusal_followed_by_visible_output_still_taints_and_blocks_reply(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from dataclasses import replace
+
+    from mimir.readonly_backend import _RootAwareFilesystemBackend
+
+    home = tmp_path / "home"
+    (home / "logs").mkdir(parents=True)
+    (home / "logs" / "private.txt").write_text("private\n", encoding="utf-8")
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    auth = _untainted_ifc_auth(roles=("user",))
+    shadow_auth = replace(auth, enforcement_enabled=False)
+    ctx = _ifc_turn(auth)
+    middleware = BudgetGateMiddleware()
+    backend = _RootAwareFilesystemBackend(root_dir=home, virtual_mode=True)
+
+    async def partial(req: ToolCallRequest) -> ToolMessage:
+        refusal = await backend.aread("/logs/private.txt")
+        return ToolMessage(
+            content=f"Error: {refusal.error}\nvisible output from later execution",
+            tool_call_id=req.tool_call["id"],
+            status="error",
+        )
+
+    async def send(req: ToolCallRequest) -> ToolMessage:
+        return ToolMessage(content="sent", tool_call_id=req.tool_call["id"])
+
+    token = set_current_turn(ctx)
+    try:
+        await middleware.awrap_tool_call(
+            _make_request(
+                "read_file", "partial-after-refusal", shadow_auth,
+                {"file_path": "/logs/private.txt"},
+            ),
+            partial,
+        )
+        reply = await middleware.awrap_tool_call(
+            _make_request("send_message", "reply", auth, {"channel_id": "ch-1"}), send,
+        )
+    finally:
+        reset_current_turn(token)
+
+    filesystem = [source for source in ctx.ifc_labels.sources if source.domain == "filesystem"]
+    assert len(filesystem) == 1
+    assert filesystem[0].is_complete is False
+    assert reply.status == "error"
+    assert "ifc_label_blocked:same_channel" in str(reply.content)
+
+
+@pytest.mark.asyncio
+async def test_read_refusal_with_artifact_provenance_still_gates_reply(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from dataclasses import replace
+
+    from mimir.access_control import ProtectedResultProvenance
+    from mimir.readonly_backend import _RootAwareFilesystemBackend
+
+    home = tmp_path / "home"
+    (home / "logs").mkdir(parents=True)
+    (home / "logs" / "private.txt").write_text("private\n", encoding="utf-8")
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    auth = _untainted_ifc_auth(roles=("user",))
+    shadow_auth = replace(auth, enforcement_enabled=False)
+    ctx = _ifc_turn(auth)
+    middleware = BudgetGateMiddleware()
+    backend = _RootAwareFilesystemBackend(root_dir=home, virtual_mode=True)
+    artifact_source = SourceLabel(
+        principal="other-user",
+        domain="filesystem",
+        resource_id=str(tmp_path / "exposed.txt"),
+        bridge_instance="filesystem",
+        sensitivity="internal",
+        authorized_principals=frozenset({"other-user"}),
+        source_kind="protected_tool",
+        integrity="untrusted",
+        integrity_effect="active_ingest",
+    )
+
+    async def refused_with_artifact(req: ToolCallRequest) -> ToolMessage:
+        refusal = await backend.aread("/logs/private.txt")
+        return ToolMessage(
+            content=f"Error: {refusal.error}",
+            artifact=ProtectedResultProvenance((artifact_source,)),
+            tool_call_id=req.tool_call["id"],
+            status="error",
+        )
+
+    async def send(req: ToolCallRequest) -> ToolMessage:
+        return ToolMessage(content="sent", tool_call_id=req.tool_call["id"])
+
+    token = set_current_turn(ctx)
+    try:
+        await middleware.awrap_tool_call(
+            _make_request(
+                "read_file", "refusal-with-artifact", shadow_auth,
+                {"file_path": "/logs/private.txt"},
+            ),
+            refused_with_artifact,
+        )
+        reply = await middleware.awrap_tool_call(
+            _make_request("send_message", "reply", auth, {"channel_id": "ch-1"}), send,
+        )
+    finally:
+        reset_current_turn(token)
+
+    filesystem = [source for source in ctx.ifc_labels.sources if source.domain == "filesystem"]
+    assert len(filesystem) == 1
+    assert filesystem[0].is_complete is False
+    assert reply.status == "error"
+    assert "ifc_label_blocked:same_channel" in str(reply.content)
 
 
 @pytest.mark.asyncio
