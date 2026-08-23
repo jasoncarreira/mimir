@@ -1502,20 +1502,27 @@ class WorklinkRunner:
                 key=lambda record: (record.attempt, record.run_id == run_id), reverse=True
             )
             for candidate in candidates:
-                recoverable = _factory_record_is_recoverable(
-                    candidate,
-                    runner=self,
-                    issue=issue,
-                    launcher=launcher,
-                    repo_slug=repo_slug,
-                    base=base,
-                    command_runner=runner,
-                )
-                if recoverable:
-                    if retained is None:
-                        retained = candidate
+                try:
+                    _verify_factory_recovery_target(
+                        runner=self,
+                        issue=issue,
+                        retained=candidate,
+                        launcher=launcher,
+                        repo_slug=repo_slug,
+                        base=base,
+                        command_runner=runner,
+                    )
+                except WorklinkError as exc:
+                    archive_factory_record(
+                        self.home,
+                        candidate,
+                        event_logger=_log_durable_event,
+                        source_kind="dispatch_abandonment",
+                        reason=str(exc),
+                    )
                     continue
-                archive_factory_record(self.home, candidate)
+                if retained is None:
+                    retained = candidate
 
         claim = claims.claim_issue(
             issue_id,
@@ -2122,38 +2129,6 @@ async def _cancel_and_cleanup_factory_handle(compute: Any, handle: LaunchHandle)
         await compute.cancel(handle)
     finally:
         await compute.cleanup(handle)
-
-
-def _factory_record_is_recoverable(
-    record: FactoryRunRecord,
-    *,
-    runner: WorklinkRunner,
-    issue: IssueContext,
-    launcher: Path,
-    repo_slug: str,
-    base: str,
-    command_runner: Runner,
-) -> bool:
-    """Return whether the retained controller binding can still be resumed.
-
-    ``running`` is active work, ``parked`` awaits a human gate, ``failed`` may
-    resume after a controller error, and ``terminal`` may finish reconciliation.
-    ``stopped`` records a deliberate operator cancellation and starts no recovery;
-    unknown phases are likewise abandoned fail-closed.
-    """
-    try:
-        _verify_factory_recovery_target(
-            runner=runner,
-            issue=issue,
-            retained=record,
-            launcher=launcher,
-            repo_slug=repo_slug,
-            base=base,
-            command_runner=command_runner,
-        )
-    except WorklinkError:
-        return False
-    return True
 
 
 def _opaque_json_bytes(value: dict[str, Any] | None) -> bytes:
@@ -3503,3 +3478,10 @@ def _log_event(event_type: str, **payload: Any) -> None:
         log_event_sync(event_type, **payload)
     except RuntimeError:
         pass
+
+
+def _log_durable_event(event_type: str, **payload: Any) -> None:
+    """Persist a load-bearing Worklink state transition before continuing."""
+    from ..event_logger import log_durable_event_sync
+
+    log_durable_event_sync(event_type, **payload)

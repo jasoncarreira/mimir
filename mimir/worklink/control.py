@@ -245,14 +245,27 @@ def _claim_mutex(home: Path) -> Iterator[None]:
             fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
 
-def archive_worklink_factory_records(home: Path, issue_id: int) -> list[Path]:
+def archive_worklink_factory_records(
+    home: Path,
+    issue_id: int,
+    *,
+    event_logger: EventLogger | None = None,
+) -> list[Path]:
     """Archive canonical and legacy records for an epic under the claim mutex."""
     archived: list[Path] = []
     with _claim_mutex(home):
         for run_id in (f"chainlink-{issue_id}", str(issue_id)):
             record = load_factory_record(home, run_id)
-            if record is not None:
-                archived.append(archive_factory_record(home, record))
+            if record is None:
+                continue
+            destination = archive_factory_record(
+                home,
+                record,
+                event_logger=event_logger,
+                source_kind="operator_command",
+                reason="operator requested archival",
+            )
+            archived.append(destination)
     return archived
 
 

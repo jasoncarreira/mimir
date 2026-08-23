@@ -3147,6 +3147,7 @@ def test_unbindable_factory_record_is_archived_before_claim_and_fresh_run(
     )
     transitions: list[dict[str, object]] = []
     claimed_after_archive: list[bool] = []
+    archive_events: list[tuple[str, dict[str, object]]] = []
 
     def runner(args: Sequence[str] | str, **_: object) -> subprocess.CompletedProcess[str]:
         if isinstance(args, list) and args[:4] == ["chainlink", "issue", "show", "700"]:
@@ -3219,6 +3220,11 @@ def test_unbindable_factory_record_is_archived_before_claim_and_fresh_run(
         lambda *args: ("token", {"GH_TOKEN": "token", "GITHUB_TOKEN": "token"}),
     )
     monkeypatch.setattr(orchestrator, "GitHubForgeClient", VerifiedClient)
+    monkeypatch.setattr(
+        orchestrator,
+        "_log_durable_event",
+        lambda event, **payload: archive_events.append((event, payload)),
+    )
     monkeypatch.setattr(orchestrator.LocalSubprocessComputeBackend, "launch", launch)
     monkeypatch.setattr(WorklinkRunner, "_supervise_factory_070", supervise)
     monkeypatch.setattr(WorklinkRunner, "_recover_factory_070", recover)
@@ -3238,6 +3244,28 @@ def test_unbindable_factory_record_is_archived_before_claim_and_fresh_run(
     assert FactoryRunRecord.from_json(
         json.loads(archives[0].read_text(encoding="utf-8"))
     ) == retained
+    expected_reasons = {
+        "sandbox": "retained factory sandbox is unavailable",
+        "launcher": "retained factory launcher does not match recovery request",
+        "base": "retained factory base does not match recovery request",
+        "session": "retained factory session is missing",
+        "lifecycle": "retained factory lifecycle is not recoverable",
+    }
+    assert archive_events == [
+        (
+            "worklink_factory_record_archived",
+            {
+                "source": "dispatch_abandonment",
+                "issue_id": 700,
+                "run_id": "700",
+                "attempt": 1,
+                "session": retained.session,
+                "phase": retained.controller_phase,
+                "reason": expected_reasons[refusal],
+                "archive_path": str(archives[0]),
+            },
+        )
+    ]
     assert old_sandbox.is_dir() is (refusal != "sandbox")
 
 

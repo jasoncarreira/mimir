@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 import sys
 
+from ..event_logger import log_durable_event_sync
 from ..worklink.control import (
     archive_worklink_factory_records,
     stop_worklink,
@@ -261,7 +262,17 @@ def _stop(args: argparse.Namespace) -> int:
 
 def _archive_factory_run(args: argparse.Namespace) -> int:
     home = (args.home or Path(os.environ.get("MIMIR_HOME") or Path.cwd())).resolve()
-    archived = archive_worklink_factory_records(home, args.issue_id)
+    from ..event_logger import init_logger
+
+    init_logger(
+        home / "logs" / "events.jsonl",
+        session_id=f"worklink-archive-factory-{args.issue_id}",
+    )
+    archived = archive_worklink_factory_records(
+        home,
+        args.issue_id,
+        event_logger=log_durable_event_sync,
+    )
     if not archived:
         print(f"worklink:epic #{args.issue_id}: no retained factory record")
         return 1

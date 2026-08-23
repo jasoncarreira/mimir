@@ -84,6 +84,29 @@ def test_archive_factory_record_preserves_evidence_and_vacates_active_slot(
     assert load_factory_record(tmp_path, "1551") is None
 
 
+def test_archive_factory_record_restores_active_record_when_event_persistence_fails(
+    tmp_path: Path,
+) -> None:
+    expected = replace(record(tmp_path), controller_phase="failed", session=None)
+    source = save_factory_record(tmp_path, expected)
+
+    def fail_event(*args: object, **kwargs: object) -> None:
+        raise OSError("event sink unavailable")
+
+    with pytest.raises(FactoryRecordError, match="event could not be persisted"):
+        archive_factory_record(
+            tmp_path,
+            expected,
+            event_logger=fail_event,
+            source_kind="dispatch_abandonment",
+            reason="retained factory session is missing",
+        )
+
+    assert load_factory_record(tmp_path, "1551") == expected
+    assert source.is_file()
+    assert not list(source.parent.joinpath("archive").glob("*.json"))
+
+
 def test_factory_record_rejects_identity_and_sandbox_mismatch(tmp_path: Path) -> None:
     expected = record(tmp_path)
     with pytest.raises(FactoryRecordError, match="identity"):

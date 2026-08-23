@@ -250,7 +250,9 @@ def test_worklink_cli_has_no_factory_cancel_transition() -> None:
 
 
 def test_worklink_archive_factory_run_cli_archives_canonical_and_legacy_records(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
     canonical = FactoryRunRecord(
         run_id="chainlink-700",
@@ -277,6 +279,17 @@ def test_worklink_archive_factory_run_cli_archives_canonical_and_legacy_records(
     )
     save_factory_record(tmp_path, canonical)
     save_factory_record(tmp_path, legacy)
+    events: list[tuple[str, dict[str, object]]] = []
+    import mimir.commands.worklink as worklink_cmd
+
+    monkeypatch.setattr(
+        worklink_cmd,
+        "log_durable_event_sync",
+        lambda event, **payload: events.append((event, payload)),
+    )
+    import mimir.event_logger as event_logger
+
+    monkeypatch.setattr(event_logger, "init_logger", lambda *args, **kwargs: None)
 
     with pytest.raises(SystemExit) as exc:
         main(["worklink", "archive-factory-run", "700", "--home", str(tmp_path)])
@@ -284,7 +297,24 @@ def test_worklink_archive_factory_run_cli_archives_canonical_and_legacy_records(
     assert exc.value.code == 0
     assert load_factory_record(tmp_path, "chainlink-700") is None
     assert load_factory_record(tmp_path, "700") is None
-    assert len(list((tmp_path / "state/worklink/factory-runs/archive").glob("*.json"))) == 2
+    archives = sorted((tmp_path / "state/worklink/factory-runs/archive").glob("*.json"))
+    assert len(archives) == 2
+    assert [(event, payload["source"], payload["reason"]) for event, payload in events] == [
+        (
+            "worklink_factory_record_archived",
+            "operator_command",
+            "operator requested archival",
+        ),
+        (
+            "worklink_factory_record_archived",
+            "operator_command",
+            "operator requested archival",
+        ),
+    ]
+    assert {(payload["run_id"], payload["phase"]) for _, payload in events} == {
+        ("chainlink-700", "stopped"),
+        ("700", "stopped"),
+    }
     assert "archived 2 factory record(s)" in capsys.readouterr().out
 
 
