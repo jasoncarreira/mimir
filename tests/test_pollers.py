@@ -1710,6 +1710,65 @@ print(json.dumps({"poller": "x", "prompt": "untrusted", "event_type": "issue_ope
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("verdicts", "expected_integrities", "expected_calls"),
+    [
+        ([None, True], ["untrusted", "trusted"], 2),
+        ([False, True], ["untrusted", "untrusted"], 1),
+    ],
+)
+async def test_github_poller_caches_only_resolved_author_trust(
+    tmp_path: Path,
+    home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    verdicts: list[bool | None],
+    expected_integrities: list[str],
+    expected_calls: int,
+) -> None:
+    """Unknown retries within a fire; authoritative false remains cached."""
+    skill_dir = tmp_path / "skill"
+    _install_script(skill_dir, "poller.py", """
+import json
+for number in (1, 2):
+    print(json.dumps({"poller": "x", "prompt": f"issue {number}", "event_type": "issue_opened", "repo": "acme/widget", "url": f"https://github.com/acme/widget/issues/{number}"}))
+""")
+    calls: list[tuple[object, object, str]] = []
+    remaining = iter(verdicts)
+
+    def fake_lookup(repo: object, author: object, token: str) -> bool | None:
+        calls.append((repo, author, token))
+        return next(remaining)
+
+    monkeypatch.setattr(
+        "mimir.pollers._github_content_author",
+        lambda _repo, _extras, _token: "alice",
+    )
+    monkeypatch.setattr("mimir.pollers._github_author_is_trusted", fake_lookup)
+    cfg = PollerConfig(
+        name="x",
+        command=f"{sys.executable} poller.py",
+        cron="* * * * *",
+        env={"GITHUB_TOKEN": "server-token"},
+        skill_dir=skill_dir,
+        batch_size=1,
+        trust_source="github",
+    )
+    enq = _CapturingEnqueue()
+
+    await run_poller(cfg, enqueue=enq)
+
+    assert len(enq.events) == 2
+    assert [
+        next(iter(event.ifc_labels.sources)).integrity
+        for event in enq.events
+        if event.ifc_labels is not None
+    ] == expected_integrities
+    assert calls == [
+        ("acme/widget", "alice", "server-token"),
+    ] * expected_calls
+
+
+@pytest.mark.asyncio
 async def test_contributor_github_content_is_trusted_from_server_checks(
     tmp_path: Path,
     home: Path,

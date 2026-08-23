@@ -2374,14 +2374,20 @@ async def run_poller(
                         repo if isinstance(repo, str) else "",
                         author if isinstance(author, str) else "",
                     )
-                    if cache_key not in github_trust_cache:
-                        github_trust_cache[cache_key] = await asyncio.to_thread(
+                    if cache_key in github_trust_cache:
+                        trusted = github_trust_cache[cache_key]
+                    else:
+                        resolved_trust = await asyncio.to_thread(
                             _github_author_is_trusted,
                             repo,
                             author,
                             env.get("GITHUB_TOKEN", ""),
                         )
-                    trusted = github_trust_cache[cache_key]
+                        # Unknown still fails closed for this event, but is not a
+                        # durable verdict: a later event in the fire must retry.
+                        trusted = resolved_trust
+                        if resolved_trust is not None:
+                            github_trust_cache[cache_key] = resolved_trust
             item_labels = item_labels.with_source(SourceLabel(
                 principal=service_principal,
                 domain="channel",
