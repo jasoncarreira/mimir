@@ -3846,11 +3846,18 @@ async def test_worklink_reaper_job_runs_in_thread_and_logs_event(
         def __init__(self, issue_id: int) -> None:
             self.issue_id = issue_id
 
+    from mimir.worklink.claims import ReapResult
+
     calls: list[tuple[str, Path]] = []
 
     def fake_reap(home: Path):
         calls.append(("reap", home))
-        return [Rec(476), Rec(477)]
+        return ReapResult(
+            reaped=[Rec(476), Rec(477)],
+            examined=3,
+            skipped={"lock_not_held": 1},
+            skipped_issue_ids={"lock_not_held": [478]},
+        )
 
     def fake_prune(home: Path):
         calls.append(("prune", home))
@@ -3875,6 +3882,9 @@ async def test_worklink_reaper_job_runs_in_thread_and_logs_event(
     [ev] = [e for e in events if e["type"] == "worklink_claims_reaped"]
     assert ev["count"] == 2
     assert ev["issue_ids"] == [476, 477]
+    assert ev["examined"] == 3
+    assert ev["skipped"] == {"lock_not_held": 1}
+    assert ev["skipped_issue_ids"] == {"lock_not_held": [478]}
     [pruned] = [e for e in events if e["type"] == "worklink_attempt_checkouts_pruned"]
     assert pruned["count"] == 1
     assert pruned["paths"] == [str(tmp_path / ".worklink" / "repo" / "613-1")]
@@ -3890,7 +3900,12 @@ async def test_worklink_reaper_job_logs_completed_sweep_when_nothing_reaped(
     async def noop(_e):
         return True
 
-    monkeypatch.setattr("mimir.worklink.autonomy.reap_stale_claims_for_home", lambda home: [])
+    from mimir.worklink.claims import ReapResult
+
+    monkeypatch.setattr(
+        "mimir.worklink.autonomy.reap_stale_claims_for_home",
+        lambda home: ReapResult(reaped=[], examined=0, skipped={}, skipped_issue_ids={}),
+    )
     monkeypatch.setattr("mimir.worklink.autonomy.prune_stale_attempt_checkouts_for_home", lambda home: [])
     monkeypatch.setattr("mimir.worklink.autonomy.close_merged_chainlinks_for_home", lambda home: [])
     sched = Scheduler(scheduler_yaml=tmp_path / "s.yaml", enqueue=noop)
@@ -3904,6 +3919,8 @@ async def test_worklink_reaper_job_logs_completed_sweep_when_nothing_reaped(
     [event] = [e for e in events if e["type"] == "worklink_claims_reaped"]
     assert event["count"] == 0
     assert event["issue_ids"] == []
+    assert event["examined"] == 0
+    assert event["skipped"] == {}
 
 
 def test_poller_reload_prunes_circuit_breakers_for_removed_pollers(tmp_path: Path):

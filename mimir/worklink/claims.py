@@ -47,6 +47,7 @@ SHUTDOWN_ABORT_PREFIX = "WORKLINK_SHUTDOWN_ABORT "
 # restarts must not turn max_attempts into an infinite-retry loophole.
 MAX_SHUTDOWN_ABORT_FORGIVENESS = 2
 REAPER_PREFIX = "WORKLINK_REAPER "
+REAPER_SKIP_SAMPLE_LIMIT = 20
 
 # Retrying remains useful even with Mimir's mutex: another Chainlink caller may
 # not participate in it. Five total attempts (including the first call) sleep for
@@ -168,6 +169,20 @@ class ClaimResult:
     record: ClaimRecord | None = None
     attempts_exhausted: bool = False
     reason: str | None = None
+
+
+@dataclass(frozen=True)
+class ReapResult:
+    reaped: list[ClaimRecord]
+    examined: int
+    skipped: dict[str, int]
+    skipped_issue_ids: dict[str, list[int]]
+
+
+@dataclass(frozen=True)
+class ShutdownClaimFailure:
+    issue_id: int | None
+    reason: str
 
 
 @dataclass(frozen=True)
@@ -557,7 +572,9 @@ class ChainlinkClaims:
         result = self._run("locks", "release", str(issue_id), check=False)
         return result.returncode == 0
 
-    def release_owned_claims_for_shutdown(self) -> list[ClaimRecord]:
+    def release_owned_claims_for_shutdown(
+        self,
+    ) -> tuple[list[ClaimRecord], list[ShutdownClaimFailure]]:
         """Return this process's in-flight claims to ready, best-effort.
 
         Ownership is taken only from the latest structured claim comment. A
@@ -565,13 +582,16 @@ class ChainlinkClaims:
         the same underlying Chainlink tracker identity.
         """
         released: list[ClaimRecord] = []
+        failed: list[ShutdownClaimFailure] = []
         try:
             issue_ids = self._list_issue_ids("worklink:in-progress")
         except Exception as exc:  # noqa: BLE001 - shutdown must continue
             log.warning("Worklink shutdown claim discovery failed: %s", exc)
-            return released
+            failed.append(ShutdownClaimFailure(issue_id=None, reason=f"discovery_failed: {exc}"))
+            self._emit_shutdown_release_failures(released, failed)
+            return released, failed
 
-        for issue_id in issue_ids:
+        for index, issue_id in enumerate(issue_ids):
             try:
                 latest: ClaimRecord | None = None
                 for record in claim_records_from_comments(self._issue_comments(issue_id)):
@@ -607,9 +627,42 @@ class ChainlinkClaims:
                     issue_id,
                     exc,
                 )
+                failed.append(
+                    ShutdownClaimFailure(
+                        issue_id=issue_id,
+                        reason=f"{type(exc).__name__}: {exc}"[:500],
+                    )
+                )
                 if isinstance(exc, subprocess.TimeoutExpired):
+                    failed.extend(
+                        ShutdownClaimFailure(
+                            issue_id=remaining_issue_id,
+                            reason="abandoned_after_timeout",
+                        )
+                        for remaining_issue_id in issue_ids[index + 1 :]
+                    )
                     break
-        return released
+        self._emit_shutdown_release_failures(released, failed)
+        return released, failed
+
+    def _emit_shutdown_release_failures(
+        self,
+        released: list[ClaimRecord],
+        failed: list[ShutdownClaimFailure],
+    ) -> None:
+        if self.event_logger is None or not failed:
+            return
+        try:
+            self.event_logger(
+                "worklink_shutdown_claim_release_failed",
+                released_issue_ids=[record.issue_id for record in released],
+                failed=[
+                    {"issue_id": failure.issue_id, "reason": failure.reason}
+                    for failure in failed
+                ],
+            )
+        except Exception:  # noqa: BLE001 - telemetry cannot block shutdown
+            pass
 
     def heartbeat_issue(self, record: ClaimRecord) -> ClaimRecord:
         """Append a refreshed claim record so the TTL reaper sees liveness."""
@@ -697,7 +750,12 @@ class ChainlinkClaims:
         }
         return len(active_claims - forgiven)
 
-    def reap_stale_claims(self, records: Iterable[ClaimRecord], *, ttl: timedelta) -> list[ClaimRecord]:
+    def reap_stale_claims(
+        self,
+        records: Iterable[ClaimRecord],
+        *,
+        ttl: timedelta,
+    ) -> ReapResult:
         """Release stale claims and move the issue back to ready or blocked.
 
         ``chainlink locks steal`` is forceful in the verified Chainlink version,
@@ -706,16 +764,35 @@ class ChainlinkClaims:
         """
         now = self.clock()
         reaped: list[ClaimRecord] = []
+        examined = 0
+        skipped: dict[str, int] = {}
+        skipped_issue_ids: dict[str, list[int]] = {}
+
+        def record_skip(reason: str, issue_id: int) -> None:
+            skipped[reason] = skipped.get(reason, 0) + 1
+            sample = skipped_issue_ids.setdefault(reason, [])
+            if len(sample) < REAPER_SKIP_SAMPLE_LIMIT:
+                sample.append(issue_id)
+
         for record in records:
             if not record.is_stale(now, ttl):
                 continue
-            if not self._lock_still_held_by(record):
+            examined += 1
+            try:
+                lock_held = self._lock_still_held_by(record)
+            except RuntimeError:
+                record_skip("lock_query_failed", record.issue_id)
+                continue
+            if not lock_held:
+                record_skip("lock_not_held", record.issue_id)
                 continue
             steal = self._run("locks", "steal", str(record.issue_id), check=False)
             if steal.returncode != 0:
+                record_skip("lock_steal_failed", record.issue_id)
                 continue
             if not self._issue_has_label(record.issue_id, "worklink:in-progress"):
                 self._run("locks", "release", str(record.issue_id), check=False)
+                record_skip("in_progress_label_missing", record.issue_id)
                 continue
             self._run("locks", "release", str(record.issue_id), check=False)
             self._run("issue", "unlabel", str(record.issue_id), "worklink:in-progress", check=False)
@@ -751,7 +828,20 @@ class ChainlinkClaims:
                     resulting_label=payload["resulting_label"],
                 )
             reaped.append(record)
-        return reaped
+        if self.event_logger is not None and skipped:
+            self.event_logger(
+                "worklink_claim_reap_skipped",
+                examined=examined,
+                skipped=skipped,
+                skipped_issue_ids=skipped_issue_ids,
+                sample_limit=REAPER_SKIP_SAMPLE_LIMIT,
+            )
+        return ReapResult(
+            reaped=reaped,
+            examined=examined,
+            skipped=skipped,
+            skipped_issue_ids=skipped_issue_ids,
+        )
 
     def _issue_labels(self, issue_id: int) -> set[str]:
         """Return current labels when Chainlink exposes them, otherwise empty."""
@@ -821,11 +911,14 @@ class ChainlinkClaims:
         """
         result = self._run("locks", "list", "--json", check=False)
         if result.returncode != 0:
-            return False
+            raise RuntimeError(
+                (result.stderr or result.stdout).strip()
+                or f"chainlink locks list failed (rc={result.returncode})"
+            )
         try:
             data = json.loads(result.stdout or "{}")
-        except json.JSONDecodeError:
-            return False
+        except json.JSONDecodeError as exc:
+            raise RuntimeError("chainlink locks list returned invalid JSON") from exc
         locks = data.get("locks", data if isinstance(data, list) else {})
         lock: Any | None = None
         if isinstance(locks, dict):
@@ -998,7 +1091,7 @@ class ChainlinkClaims:
                     out.append(str(text))
         return out
 
-    def reap_home(self, *, ttl: timedelta) -> list[ClaimRecord]:
+    def reap_home(self, *, ttl: timedelta) -> ReapResult:
         """Discover ``worklink:in-progress`` issues, gather the latest claim
         record per issue from their comments, and reap any stale ones.
 

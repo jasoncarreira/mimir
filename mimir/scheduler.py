@@ -2475,20 +2475,24 @@ class Scheduler:
             prune_stale_attempt_checkouts_for_home,
             reap_stale_claims_for_home,
         )
+        from .worklink.claims import ReapResult
 
         async def _fire() -> None:
-            def _reap() -> tuple[list[object], list[Path], list[object]]:
+            def _reap() -> tuple[ReapResult, list[Path], list[object]]:
                 return (
                     reap_stale_claims_for_home(home),
                     prune_stale_attempt_checkouts_for_home(home),
                     close_merged_chainlinks_for_home(home),
                 )
 
-            reaped, pruned_paths, closed_chainlinks = await asyncio.to_thread(_reap)
+            reap_result, pruned_paths, closed_chainlinks = await asyncio.to_thread(_reap)
             await log_event(
                 "worklink_claims_reaped",
-                count=len(reaped),
-                issue_ids=[record.issue_id for record in reaped],
+                count=len(reap_result.reaped),
+                issue_ids=[record.issue_id for record in reap_result.reaped],
+                examined=reap_result.examined,
+                skipped=reap_result.skipped,
+                skipped_issue_ids=reap_result.skipped_issue_ids,
             )
             if pruned_paths:
                 await log_event(

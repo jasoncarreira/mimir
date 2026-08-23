@@ -37,7 +37,7 @@ from typing import Callable, Sequence
 from ..event_logger import log_event_sync
 from .backends import WorklinkConfig
 from .backends.registry import WorklinkDefaults, WorklinkDefaultsValidationError
-from .claims import ChainlinkClaims, ClaimRecord
+from .claims import ChainlinkClaims, ClaimRecord, ReapResult, ShutdownClaimFailure
 from .checkout import prune_attempt_checkouts
 from .factory_state import factory_process_is_alive, list_factory_records
 
@@ -123,10 +123,10 @@ def release_claims_for_graceful_shutdown(
     *,
     agent_id: str,
     timeout_s: float,
-) -> list[ClaimRecord]:
+) -> tuple[list[ClaimRecord], list[ShutdownClaimFailure]]:
     """Release only ``agent_id`` claims within one wall-clock deadline."""
     if timeout_s <= 0:
-        return []
+        return [], []
     deadline = time.monotonic() + timeout_s
 
     def bounded_runner(args: Sequence[str]) -> subprocess.CompletedProcess[str]:
@@ -147,6 +147,7 @@ def release_claims_for_graceful_shutdown(
         agent_id=agent_id,
         runner=bounded_runner,
         home_path=home,
+        event_logger=log_event_sync,
         max_attempts=worklink_defaults(home).max_claim_attempts,
     )
     return claims.release_owned_claims_for_shutdown()
@@ -236,7 +237,7 @@ def reap_stale_claims_for_home(
     *,
     agent_id: str | None = None,
     claims: ChainlinkClaims | None = None,
-) -> list[ClaimRecord]:
+) -> ReapResult:
     """TTL-reaper entry point: recover claims whose worker died.
 
     Reads ``reaper_ttl_s`` from worklink.yaml and delegates discovery +

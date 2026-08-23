@@ -25,7 +25,7 @@ from typing import Sequence
 import pytest
 
 from mimir.worklink import autonomy, orchestrator
-from mimir.worklink.claims import CLAIM_RESET_PREFIX, ChainlinkClaims, ClaimRecord
+from mimir.worklink.claims import CLAIM_RESET_PREFIX, ChainlinkClaims, ClaimRecord, ReapResult
 from mimir.worklink.backends.registry import WorklinkConfig, WorklinkDefaults
 from mimir.worklink.dispatch_failures import (
     dispatch_failure_state_dir,
@@ -211,13 +211,14 @@ def test_shutdown_release_timeout_is_fail_soft(
     )
 
     with caplog.at_level("WARNING", logger="mimir.worklink.claims"):
-        released = autonomy.release_claims_for_graceful_shutdown(
+        released, failed = autonomy.release_claims_for_graceful_shutdown(
             tmp_path,
             agent_id="mimir-worklink:process-a",
             timeout_s=0.01,
         )
 
     assert released == []
+    assert failed[0].issue_id is None
     assert "shutdown claim discovery failed" in caplog.text
 
 
@@ -256,7 +257,7 @@ def test_reap_home_reads_content_keyed_comment_dicts() -> None:
     fake = FakeChainlink(in_progress=[49], comments={49: [comment]})  # type: ignore[list-item]
     claims = ChainlinkClaims(agent_id="t", runner=fake)
     reaped = claims.reap_home(ttl=timedelta(hours=2))
-    assert [r.issue_id for r in reaped] == [49]
+    assert [r.issue_id for r in reaped.reaped] == [49]
 
 
 def test_reap_home_does_not_reap_a_heartbeating_claim_made_after_a_reset() -> None:
@@ -282,7 +283,7 @@ def test_reap_home_does_not_reap_a_heartbeating_claim_made_after_a_reset() -> No
     fake = FakeChainlink(in_progress=[1019], comments={1019: comments})
     claims = ChainlinkClaims(agent_id="t", runner=fake)
 
-    assert claims.reap_home(ttl=timedelta(hours=2)) == []
+    assert claims.reap_home(ttl=timedelta(hours=2)).reaped == []
 
 
 def test_reap_home_still_reaps_a_genuinely_stale_post_reset_claim() -> None:
@@ -300,7 +301,7 @@ def test_reap_home_still_reaps_a_genuinely_stale_post_reset_claim() -> None:
 
     reaped = claims.reap_home(ttl=timedelta(hours=2))
 
-    assert [(r.issue_id, r.attempt, r.generation) for r in reaped] == [(1019, 1, 1)]
+    assert [(r.issue_id, r.attempt, r.generation) for r in reaped.reaped] == [(1019, 1, 1)]
 
 
 def test_reap_home_fail_soft_when_in_progress_list_errors() -> None:
@@ -310,7 +311,7 @@ def test_reap_home_fail_soft_when_in_progress_list_errors() -> None:
         raise AssertionError(f"unexpected call after discovery failure: {args}")
 
     claims = ChainlinkClaims(agent_id="t", runner=runner)
-    assert claims.reap_home(ttl=timedelta(hours=2)) == []
+    assert claims.reap_home(ttl=timedelta(hours=2)).reaped == []
 
 
 def test_reap_home_recovers_stale_claim_to_ready() -> None:
@@ -320,7 +321,7 @@ def test_reap_home_recovers_stale_claim_to_ready() -> None:
     )
     claims = ChainlinkClaims(agent_id="t", runner=fake, max_attempts=3)
     reaped = claims.reap_home(ttl=timedelta(hours=2))
-    assert [r.issue_id for r in reaped] == [50]
+    assert [r.issue_id for r in reaped.reaped] == [50]
     names = fake.names()
     assert "locks steal 50" in names
     assert "locks release 50" in names
@@ -337,7 +338,7 @@ def test_reap_home_blocks_when_attempts_exhausted() -> None:
     )
     claims = ChainlinkClaims(agent_id="t", runner=fake, max_attempts=3)
     reaped = claims.reap_home(ttl=timedelta(hours=2))
-    assert [r.issue_id for r in reaped] == [51]
+    assert [r.issue_id for r in reaped.reaped] == [51]
     assert any(c[1:] == ["issue", "label", "51", "worklink:blocked"] for c in fake.calls)
 
 
@@ -348,7 +349,7 @@ def test_reap_home_skips_when_lock_was_already_released() -> None:
         comments={54: [_claim_comment(54, attempt=1, age=timedelta(hours=3))]},
     )
     claims = ChainlinkClaims(agent_id="t", runner=fake)
-    assert claims.reap_home(ttl=timedelta(hours=2)) == []
+    assert claims.reap_home(ttl=timedelta(hours=2)).reaped == []
     assert "locks steal 54" not in fake.names()
 
 
@@ -362,7 +363,7 @@ def test_reap_home_skips_when_issue_already_transitioned() -> None:
     assert claims.reap_stale_claims(
         [ClaimRecord(56, 1, "mimir-worklink", datetime.now(UTC) - timedelta(hours=3))],
         ttl=timedelta(hours=2),
-    ) == []
+    ).reaped == []
     assert not any(c[1:] == ["issue", "label", "56", "worklink:ready"] for c in fake.calls)
 
 
@@ -389,7 +390,7 @@ def test_reap_home_does_not_steal_fresh_lock_after_label_transition() -> None:
     )
     claims = ChainlinkClaims(agent_id="t", runner=fake)
 
-    assert claims.reap_home(ttl=timedelta(hours=2)) == []
+    assert claims.reap_home(ttl=timedelta(hours=2)).reaped == []
     assert "locks steal 59" not in fake.names()
 
 
@@ -419,7 +420,7 @@ def test_reap_home_reclaims_lock_with_distinct_chainlink_tracker_owner() -> None
     claims = ChainlinkClaims(agent_id="t", runner=fake)
     reaped = claims.reap_home(ttl=timedelta(hours=2))
 
-    assert [record.issue_id for record in reaped] == [55]
+    assert [record.issue_id for record in reaped.reaped] == [55]
     assert "locks steal 55" in fake.names()
     assert "locks release 55" in fake.names()
 
@@ -430,7 +431,7 @@ def test_reap_home_leaves_fresh_claim_untouched() -> None:
         comments={52: [_claim_comment(52, attempt=1, age=timedelta(minutes=5))]},
     )
     claims = ChainlinkClaims(agent_id="t", runner=fake)
-    assert claims.reap_home(ttl=timedelta(hours=2)) == []
+    assert claims.reap_home(ttl=timedelta(hours=2)).reaped == []
     assert "locks steal 52" not in fake.names()
 
 
@@ -453,7 +454,7 @@ def test_reap_home_leaves_finalizing_claim_with_fresh_heartbeat_untouched() -> N
     )
     claims = ChainlinkClaims(agent_id="t", runner=fake)
 
-    assert claims.reap_home(ttl=timedelta(seconds=1860)) == []
+    assert claims.reap_home(ttl=timedelta(seconds=1860)).reaped == []
     assert "locks steal 57" not in fake.names()
 
 
@@ -473,7 +474,7 @@ def test_reap_home_leaves_old_claim_with_current_heartbeat_untouched() -> None:
     )
     claims = ChainlinkClaims(agent_id="t", runner=fake)
 
-    assert claims.reap_home(ttl=timedelta(hours=2)) == []
+    assert claims.reap_home(ttl=timedelta(hours=2)).reaped == []
     assert "locks steal 58" not in fake.names()
 
 
@@ -488,7 +489,7 @@ def test_reap_home_uses_latest_record_per_issue() -> None:
         ]},
     )
     claims = ChainlinkClaims(agent_id="t", runner=fake)
-    assert claims.reap_home(ttl=timedelta(hours=2)) == []
+    assert claims.reap_home(ttl=timedelta(hours=2)).reaped == []
 
 
 # ── claims.py: per-issue exclusivity (lock fail → not claimed) ──────
@@ -688,7 +689,7 @@ def test_reap_for_home_uses_config_ttl(
     )
     claims = ChainlinkClaims(agent_id="t", runner=fake)
     reaped = autonomy.reap_stale_claims_for_home(tmp_path, claims=claims)
-    assert [r.issue_id for r in reaped] == [60]
+    assert [r.issue_id for r in reaped.reaped] == [60]
 
 
 @pytest.mark.parametrize(
@@ -713,7 +714,8 @@ def test_reap_for_home_enforces_ttl_floor_boundary(
     seen_ttls: list[timedelta] = []
     events: list[tuple[str, dict[str, object]]] = []
     claims = SimpleNamespace(
-        reap_home=lambda *, ttl: seen_ttls.append(ttl) or [],
+        reap_home=lambda *, ttl: seen_ttls.append(ttl)
+        or ReapResult(reaped=[], examined=0, skipped={}, skipped_issue_ids={}),
     )
     monkeypatch.setattr(
         autonomy,
@@ -721,7 +723,7 @@ def test_reap_for_home_enforces_ttl_floor_boundary(
         lambda event_type, **payload: events.append((event_type, payload)),
     )
 
-    assert autonomy.reap_stale_claims_for_home(tmp_path, claims=claims) == []
+    assert autonomy.reap_stale_claims_for_home(tmp_path, claims=claims).reaped == []
     assert seen_ttls == [timedelta(seconds=expected_ttl_s)]
     assert bool(events) is emits_violation
 
