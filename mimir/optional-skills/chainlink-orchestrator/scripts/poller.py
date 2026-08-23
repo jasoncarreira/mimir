@@ -42,6 +42,7 @@ _ensure_mimir_import_path()
 from mimir.coding import coding_enabled
 from mimir.worklink.autonomy import factory_max_concurrent
 from mimir.worklink.backends.registry import BackendRegistry, WorklinkConfig, WorklinkDefaults
+from mimir.worklink.claims import WORKLINK_EPIC_LABEL, scope_active_worklink_lock_ids
 from mimir.worklink.continuation import consume_worklink_budget_continuations
 from mimir.worklink.dispatch_failures import (
     POLLER_NAME,
@@ -53,7 +54,7 @@ from mimir.worklink.dispatch_failures import (
 
 
 READY_LABEL = "worklink:ready"
-EPIC_LABEL = "worklink:epic"
+EPIC_LABEL = WORKLINK_EPIC_LABEL
 _CHAINLINK_READ_TIMEOUT_SECONDS = 5
 
 
@@ -436,8 +437,10 @@ def main() -> int:
     dispatch_ready = [item for item in ready if item.issue_id not in backed_off_ids]
     leaf_cap = _configured_cap(home)
     factory_cap = factory_max_concurrent()
-    active = len(active_lock_ids - epic_ids)
-    factory_active = len(active_lock_ids & epic_ids)
+    active = len(scope_active_worklink_lock_ids(active_lock_ids, exclude_ids=epic_ids))
+    factory_active = len(
+        scope_active_worklink_lock_ids(active_lock_ids, label_ids=epic_ids)
+    )
     leaf_slots = max(0, leaf_cap - active)
     factory_slots = max(0, factory_cap - factory_active)
     leaves = [item for item in dispatch_ready if item.mode == "leaf"][:leaf_slots]

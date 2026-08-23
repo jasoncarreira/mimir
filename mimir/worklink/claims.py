@@ -20,6 +20,7 @@ import time
 from typing import Any, Callable, Iterable, Sequence
 
 CLAIM_PREFIX = "WORKLINK_CLAIM "
+WORKLINK_EPIC_LABEL = "worklink:epic"
 
 # Standalone callers without a Worklink config get the same finite safety
 # budget as a missing or malformed defaults.max_claim_attempts setting.
@@ -70,6 +71,23 @@ Runner = Callable[[Sequence[str]], subprocess.CompletedProcess[str]]
 EventLogger = Callable[..., None]
 
 log = logging.getLogger(__name__)
+
+
+def scope_active_worklink_lock_ids(
+    active_ids: Iterable[int],
+    *,
+    label_ids: Iterable[int] | None = None,
+    exclude_ids: Iterable[int] | None = None,
+) -> set[int]:
+    """Apply the label scope shared by every Worklink concurrency consumer."""
+    if label_ids is not None and exclude_ids is not None:
+        raise ValueError("active lock scope accepts label ids or excluded ids, not both")
+    scoped = set(active_ids)
+    if label_ids is not None:
+        return scoped & set(label_ids)
+    if exclude_ids is not None:
+        return scoped - set(exclude_ids)
+    return scoped
 
 
 def _default_runner(args: Sequence[str]) -> subprocess.CompletedProcess[str]:
@@ -1034,13 +1052,13 @@ class ChainlinkClaims:
         active_ids = self._active_worklink_lock_ids(
             require_identity=label is not None or exclude_label is not None
         )
-        if label is not None:
-            scoped_ids = set(self._list_issue_ids(label))
-            return active_ids & scoped_ids
-        if exclude_label is not None:
-            excluded_ids = set(self._list_issue_ids(exclude_label))
-            return active_ids - excluded_ids
-        return active_ids
+        label_ids = self._list_issue_ids(label) if label is not None else None
+        exclude_ids = self._list_issue_ids(exclude_label) if exclude_label is not None else None
+        return scope_active_worklink_lock_ids(
+            active_ids,
+            label_ids=label_ids,
+            exclude_ids=exclude_ids,
+        )
 
     def _active_worklink_lock_ids(self, *, require_identity: bool) -> set[int]:
         result = self._run("locks", "list", "--json", check=False)
@@ -1109,7 +1127,7 @@ class ChainlinkClaims:
         except RuntimeError as exc:
             log.warning("Worklink reaper lock discovery failed: %s", exc)
         for issue_id in sorted(issue_ids):
-            if self._issue_has_label(issue_id, "worklink:epic"):
+            if self._issue_has_label(issue_id, WORKLINK_EPIC_LABEL):
                 continue
             for record in claim_records_from_comments(self._issue_comments(issue_id)):
                 current = latest.get(record.issue_id)
