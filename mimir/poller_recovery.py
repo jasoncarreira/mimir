@@ -119,26 +119,51 @@ def _state_path(persist_dir: Path) -> Path:
 def _load_state(persist_dir: Path) -> dict:
     """Load ``{last_reconciled: iso, inflight: {source_id: {...}}}``.
 
-    Tolerant of a missing / corrupt / hand-edited file — always returns a
-    well-shaped dict so callers never have to guard the structure.
+    A missing file returns an empty state. An unreadable or corrupt file also
+    returns a well-shaped state, but marks it read-only so callers can report
+    the failure without overwriting the original ledger.
     """
     p = _state_path(persist_dir)
-    if p.exists():
-        try:
-            data = json.loads(p.read_text(encoding="utf-8"))
-            if isinstance(data, dict):
-                last = data.get("last_reconciled")
-                inflight = data.get("inflight")
-                return {
-                    "last_reconciled": last if isinstance(last, str) else "",
-                    "inflight": inflight if isinstance(inflight, dict) else {},
-                }
-        except (json.JSONDecodeError, OSError):
-            pass
-    return {"last_reconciled": "", "inflight": {}}
+    try:
+        raw = p.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return {"last_reconciled": "", "inflight": {}}
+    except OSError as exc:
+        log.warning("poller recovery: state unreadable at %s: %s", p, exc)
+        return {
+            "last_reconciled": "", "inflight": {},
+            "_unreadable_path": str(p),
+        }
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        log.warning("poller recovery: state corrupt at %s: %s", p, exc)
+        return {
+            "last_reconciled": "", "inflight": {},
+            "_unreadable_path": str(p),
+        }
+    if isinstance(data, dict):
+        last = data.get("last_reconciled")
+        inflight = data.get("inflight")
+        return {
+            "last_reconciled": last if isinstance(last, str) else "",
+            "inflight": inflight if isinstance(inflight, dict) else {},
+        }
+    log.warning("poller recovery: state has invalid shape at %s", p)
+    return {
+        "last_reconciled": "", "inflight": {},
+        "_unreadable_path": str(p),
+    }
 
 
 def _save_state(persist_dir: Path, state: dict) -> None:
+    unreadable_path = state.get("_unreadable_path")
+    if unreadable_path:
+        log.warning(
+            "poller recovery: refusing to overwrite unreadable state at %s",
+            unreadable_path,
+        )
+        return
     try:
         persist_dir.mkdir(parents=True, exist_ok=True)
         # Atomic write (#329): a crash mid-write must not corrupt
@@ -272,16 +297,20 @@ def _event_from_stash(d: Any) -> AgentEvent | None:
         return None
 
 
-def _gc_expired_inflight(inflight: dict, ttl_hours: float, now_dt: datetime) -> int:
+def _gc_expired_inflight(
+    inflight: dict, ttl_hours: float, now_dt: datetime,
+) -> tuple[int, int]:
     """Drop in-flight entries with no terminal outcome within ``ttl_hours``
     — turns that vanished (mid-turn crash/restart) without logging
     turn_failed/turn_completed, so ``.recovery.json`` can't grow unbounded
-    (#310). Returns the number dropped.
+    (#310). Returns ``(expired, dropped)``; malformed entries are schema drops,
+    not TTL expirations.
 
     Backfills a missing/garbled ``stashed_at`` to now rather than GC-ing the
     entry on sight, so entries stashed by a pre-#310 mimir get a fresh TTL.
     """
     cutoff_secs = ttl_hours * 3600.0
+    expired = 0
     dropped = 0
     for source_id in list(inflight.keys()):
         entry = inflight.get(source_id)
@@ -295,8 +324,8 @@ def _gc_expired_inflight(inflight: dict, ttl_hours: float, now_dt: datetime) -> 
             continue
         if (now_dt - dt).total_seconds() > cutoff_secs:
             del inflight[source_id]
-            dropped += 1
-    return dropped
+            expired += 1
+    return expired, dropped
 
 
 def _read_outcomes_since(
@@ -489,22 +518,26 @@ async def reconcile_failed_turns(
     outcome's own timestamp — never wall-now — so an outcome written
     between this read and the state save is picked up next cycle.
 
-    Returns a ``{reenqueued, completed, gave_up, deferred, expired}``
+    Returns a ``{reenqueued, completed, gave_up, deferred, expired, dropped}``
     summary (for the ``poller_recovery`` log event + tests). Best-effort
     throughout — any I/O hiccup is logged and the poll cycle continues.
     """
     summary = {
         "reenqueued": 0, "completed": 0, "gave_up": 0,
-        "deferred": 0, "expired": 0, "unclean_reenqueued": 0,
+        "deferred": 0, "expired": 0, "dropped": 0,
+        "unclean_reenqueued": 0,
     }
     state = await asyncio.to_thread(_load_state, persist_dir)
+    summary["state_unreadable"] = state.get("_unreadable_path", "")
     inflight: dict = state["inflight"]
     now_dt = _utc_now()
     now_iso = now_dt.isoformat()
 
     # GC abandoned entries first so a vanished turn can't pin the stash
     # forever (#310).
-    summary["expired"] = _gc_expired_inflight(inflight, stash_ttl_hours, now_dt)
+    summary["expired"], summary["dropped"] = _gc_expired_inflight(
+        inflight, stash_ttl_hours, now_dt,
+    )
 
     # Fast path: nothing stashed → nothing to reconcile. Advance the
     # watermark so the first real reconcile after events accrue doesn't
@@ -631,6 +664,7 @@ async def reconcile_failed_turns(
                         # Unreconstructable stash (older schema) — drop so we
                         # don't loop on it forever.
                         del inflight[source_id]
+                        summary["dropped"] += 1
                     else:
                         try:
                             accepted = await enqueue(event)
@@ -708,6 +742,7 @@ async def reconcile_failed_turns(
             )
             if event is None:
                 del inflight[source_id]
+                summary["dropped"] += 1
                 continue
             try:
                 accepted = await enqueue(event)
