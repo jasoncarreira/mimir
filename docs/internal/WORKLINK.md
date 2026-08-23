@@ -223,7 +223,25 @@ calling `steal`; it must not trust `steal` to reject live claims.
 
 ### State machine
 
-Labels on the leaf issue (chainlink `status` stays open/closed):
+The ready-queue poller treats the Worklink label vocabulary as follows. Removing
+`worklink:ready` is the common way to park either a leaf or an epic; no other
+label admits dispatch.
+
+| Label | Leaf dispatch | Factory-epic dispatch |
+|---|---|---|
+| `worklink:ready` | Required | Required, together with `worklink:epic` |
+| `worklink:epic` | Excludes the issue and children whose parent carries it | Required to select the `run-epic` path |
+| `worklink:in-progress` | Not consulted directly; the active claim lock excludes redispatch and consumes a leaf slot | Not consulted directly; the active claim lock excludes redispatch and consumes a factory slot |
+| `worklink:review` | Not consulted; normal transitions remove `worklink:ready`, so review work is parked | Not consulted; normal transitions remove `worklink:ready`, so review work is parked |
+| `worklink:blocked` | Always excludes dispatch, even if stale `worklink:ready` remains | Always excludes dispatch, even if stale `worklink:ready` and `worklink:epic` remain |
+
+Dependency actionability remains a separate, additional requirement from
+`chainlink issue ready`. Attempt-budget exhaustion is enforced authoritatively
+by the executor after its race-safe claim checks. That first refusal adds
+`worklink:blocked`; the poller then excludes the issue, so exhaustion is
+reported once rather than launching another refusal every poll cycle.
+
+Labels on the issue (chainlink `status` stays open/closed):
 
 ```
 needs-decomposition ──planner──▶ worklink:ready

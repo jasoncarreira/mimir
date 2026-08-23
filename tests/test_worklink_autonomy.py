@@ -978,7 +978,7 @@ def _fake_chainlink_script(
     *,
     ready: list[int],
     epics: list[int] | None = None,
-    blocked_epics: list[int] | None = None,
+    blocked: list[int] | None = None,
     review_epics: list[int] | None = None,
     parents: dict[int, int] | None = None,
     in_progress: list[int] | None = None,
@@ -993,7 +993,7 @@ def _fake_chainlink_script(
         "a = sys.argv[1:]\n"
         f"ready = {ready!r}\n"
         f"epics = {(epics or [])!r}\n"
-        f"blocked_epics = {(blocked_epics or [])!r}\n"
+        f"blocked = {(blocked or [])!r}\n"
         f"review_epics = {(review_epics or [])!r}\n"
         f"parents = {(parents or {})!r}\n"
         f"actionable = {(ready if actionable is None else actionable)!r}\n"
@@ -1007,7 +1007,7 @@ def _fake_chainlink_script(
         "    sys.exit(0)\n"
         "if a[:2] == ['issue','list']:\n"
         "    label = a[a.index('--label')+1] if '--label' in a else ''\n"
-        "    ids = epics if label=='worklink:epic' else blocked_epics if label=='worklink:blocked' else review_epics if label=='worklink:review' else inprog if label=='worklink:in-progress' else ready if label=='worklink:ready' else []\n"
+        "    ids = epics if label=='worklink:epic' else blocked if label=='worklink:blocked' else review_epics if label=='worklink:review' else inprog if label=='worklink:in-progress' else ready if label=='worklink:ready' else []\n"
         "    print(json.dumps([{'id': i, 'parent_id': parents.get(i)} for i in ids]))\n"
         "sys.exit(0)\n",
         encoding="utf-8",
@@ -1660,9 +1660,8 @@ def test_poller_does_not_dispatch_worklink_epic_issues(tmp_path: Path) -> None:
 
 
 @pytest.mark.skipif(not POLLER.exists(), reason="poller not present")
-def test_poller_dispatches_epic_when_factory_epics_enabled(tmp_path: Path) -> None:
-    """chainlink #833: with MIMIR_FACTORY_EPICS_ENABLED set, an actionable epic is
-    dispatched to the feature-factory via run-epic (mode='epic'), not as a leaf."""
+def test_poller_dispatches_only_ready_epic_when_factory_epics_enabled(tmp_path: Path) -> None:
+    """The ready label arms epic dispatch just as it arms leaf dispatch."""
     home = tmp_path / "home"
     home.mkdir()
     repo = tmp_path / "repo"
@@ -1670,8 +1669,8 @@ def test_poller_dispatches_epic_when_factory_epics_enabled(tmp_path: Path) -> No
     chainlink = _fake_chainlink_script(
         tmp_path,
         ready=[100],
-        epics=[100],
-        actionable=[100],
+        epics=[100, 101],
+        actionable=[100, 101],
         active_locks=[],
     )
     runbin = _fake_run_bin(tmp_path)
@@ -1690,6 +1689,41 @@ def test_poller_dispatches_epic_when_factory_epics_enabled(tmp_path: Path) -> No
     assert len(dispatched) == 1
     assert dispatched[0]["issue_id"] == 100
     assert dispatched[0]["mode"] == "epic"
+    assert 101 not in [event.get("issue_id") for event in dispatched]
+
+
+@pytest.mark.skipif(not POLLER.exists(), reason="poller not present")
+def test_poller_excludes_worklink_blocked_from_leaf_and_epic_dispatch(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    chainlink = _fake_chainlink_script(
+        tmp_path,
+        ready=[100, 101, 200, 201],
+        epics=[100, 101],
+        blocked=[100, 200],
+        actionable=[100, 101, 200, 201],
+        active_locks=[],
+    )
+    runbin = _fake_run_bin(tmp_path)
+
+    events = _run_poller(tmp_path, {
+        "MIMIR_HOME": str(home),
+        "CHAINLINK_BIN": str(chainlink),
+        "WORKLINK_RUN_BIN": sys.executable + " " + str(runbin),
+        "WORKLINK_REPO": str(repo),
+        "WORKLINK_MAX_CONCURRENT": "3",
+        "STATE_DIR": str(tmp_path / "state"),
+        "MIMIR_FACTORY_EPICS_ENABLED": "true",
+    })
+
+    dispatched = [
+        (event["mode"], event["issue_id"])
+        for event in events
+        if event.get("signal") == "worklink_dispatched"
+    ]
+    assert dispatched == [("leaf", 201), ("epic", 101)]
 
 
 def test_poller_keeps_bare_ready_leaf_on_per_leaf_run(tmp_path: Path) -> None:
