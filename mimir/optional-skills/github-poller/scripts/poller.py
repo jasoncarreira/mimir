@@ -179,25 +179,95 @@ _CHANGES_REQUESTED_TURN_EVENT_TYPES = frozenset({"pr_changes_requested_stale"})
 # (chainlink #1433). A tick that truncates and commits is strictly better than one
 # that completes nothing.
 PR_RECONCILE_DEADLINE_SECONDS = 35.0
-#: Minimum PRs a pass reconciles even if the deadline has passed, so a slow API
-#: cannot starve every PR forever and stall reminders entirely.
+#: Minimum PRs a pass reconciles even if the soft deadline has passed, so a slow
+#: API cannot starve every PR forever and stall reminders entirely. This floor is
+#: subordinate to the hard deadline below — it is not an exception to it.
 PR_RECONCILE_MIN_PER_PASS = 2
+#: Hard stop. The framework SIGKILLs the tick at POLLER_TIMEOUT_SECONDS (60) and
+#: discards everything it emitted, so the tick must return under its own power
+#: well before that. Past this point no new per-PR work starts and every
+#: outstanding API call is clamped to whatever time is left.
+TICK_HARD_DEADLINE_SECONDS = 50.0
+#: Ceiling for one `gh api` invocation, used when no budget is active.
+GH_API_TIMEOUT_SECONDS = 30
+#: A clamped call still gets this much time — below it a request cannot
+#: meaningfully complete, so the worst-case tick is
+#: TICK_HARD_DEADLINE_SECONDS + this + serialization, not the 30s ceiling.
+GH_API_MIN_TIMEOUT_SECONDS = 2.0
 
 
 class TickBudget:
-    """Wall-clock budget for one poller tick's per-PR reconciliation."""
+    """Two-tier wall-clock budget for one poller tick.
 
-    def __init__(self, deadline_seconds: float = PR_RECONCILE_DEADLINE_SECONDS) -> None:
+    The soft deadline (``exhausted``) stops discretionary per-PR reconciliation
+    beyond ``PR_RECONCILE_MIN_PER_PASS``. The hard deadline
+    (``hard_exhausted``) stops *all* per-PR work and clamps individual API
+    calls, so elapsed time is bounded no matter how slow the API is. Checking
+    the budget only between PRs would leave a single 30s call free to carry the
+    tick past the framework cap.
+    """
+
+    def __init__(
+        self,
+        deadline_seconds: float = PR_RECONCILE_DEADLINE_SECONDS,
+        hard_deadline_seconds: float = TICK_HARD_DEADLINE_SECONDS,
+    ) -> None:
         self._start = time.monotonic()
         self._deadline = deadline_seconds
+        self._hard_deadline = hard_deadline_seconds
         self.truncated: dict[str, int] = {}
+        #: True once the hard deadline forced a truncation. The tick must not
+        #: advance its `since` watermark in that case — see main().
+        self.hard_truncated = False
+
+    def elapsed(self) -> float:
+        return time.monotonic() - self._start
 
     def exhausted(self) -> bool:
-        return (time.monotonic() - self._start) >= self._deadline
+        return self.elapsed() >= self._deadline
+
+    def hard_remaining(self) -> float:
+        return self._hard_deadline - self.elapsed()
+
+    def hard_exhausted(self) -> bool:
+        return self.hard_remaining() <= 0.0
+
+    def call_timeout(self, ceiling: float = GH_API_TIMEOUT_SECONDS) -> float:
+        """Seconds to allow one API call so it cannot outlive the hard deadline."""
+        return max(GH_API_MIN_TIMEOUT_SECONDS, min(ceiling, self.hard_remaining()))
 
     def note_truncation(self, pass_name: str, skipped: int) -> None:
         if skipped > 0:
             self.truncated[pass_name] = self.truncated.get(pass_name, 0) + skipped
+
+
+#: Set for the duration of one tick so `_gh_api` can clamp its subprocess
+#: timeout without threading the budget through every pass signature. The
+#: poller is a single-shot process, so a module-level handle is the whole
+#: lifetime of the run.
+_ACTIVE_TICK_BUDGET: "TickBudget | None" = None
+
+
+def set_active_tick_budget(budget: "TickBudget | None") -> None:
+    """Install (or clear) the budget that clamps `_gh_api` call timeouts."""
+    global _ACTIVE_TICK_BUDGET
+    _ACTIVE_TICK_BUDGET = budget
+
+
+def _hard_stop(tick_budget: "TickBudget | None", pass_name: str) -> bool:
+    """Hard-deadline check for the since-based passes.
+
+    These keep no per-item dedupe cursor, so they cannot defer an item the way
+    the reconcile passes do — truncating them is only safe because a tick that
+    sets ``hard_truncated`` leaves its ``last_checked`` watermark alone, so the
+    next tick re-scans the same window. There is deliberately no minimum-items
+    floor here: past the hard deadline the tick must stop, not make progress.
+    """
+    if tick_budget is None or not tick_budget.hard_exhausted():
+        return False
+    tick_budget.hard_truncated = True
+    tick_budget.note_truncation(pass_name, 1)
+    return True
 
 
 def _truncate_here(
@@ -205,11 +275,19 @@ def _truncate_here(
 ) -> bool:
     """Whether this pass should stop reconciling PRs for the rest of the tick.
 
-    ``PR_RECONCILE_MIN_PER_PASS`` is a floor, not a target: every pass gets that
-    many PRs even on an already-spent budget, so each one always makes forward
-    progress and rotation eventually covers the whole set.
+    ``PR_RECONCILE_MIN_PER_PASS`` is a floor on the *soft* deadline: every pass
+    gets that many PRs even on a spent budget, so each one makes forward progress
+    and rotation eventually covers the whole set. The floor is **subordinate to
+    the hard deadline** — past it, no new per-PR work starts at all, because a
+    guaranteed minimum that can still start a 30s call is not a bound.
     """
-    if tick_budget is None or reconciled < PR_RECONCILE_MIN_PER_PASS:
+    if tick_budget is None:
+        return False
+    if tick_budget.hard_exhausted():
+        tick_budget.hard_truncated = True
+        tick_budget.note_truncation(pass_name, 1)
+        return True
+    if reconciled < PR_RECONCILE_MIN_PER_PASS:
         return False
     if not tick_budget.exhausted():
         return False
@@ -496,9 +574,14 @@ def _gh_api(endpoint: str, token: str) -> list | dict | None:
     Returns None on error so callers can skip silently."""
     try:
         env = {**os.environ, "GH_TOKEN": token} if token else None
+        budget = _ACTIVE_TICK_BUDGET
+        timeout = (
+            budget.call_timeout() if budget is not None
+            else float(GH_API_TIMEOUT_SECONDS)
+        )
         result = subprocess.run(
             ["gh", "api", endpoint, "--paginate"],
-            capture_output=True, text=True, timeout=30, env=env,
+            capture_output=True, text=True, timeout=timeout, env=env,
         )
         if result.returncode == 0 and result.stdout.strip():
             return json.loads(result.stdout)
@@ -1076,6 +1159,7 @@ def _check_issue_comments(
     *,
     review_needed_pr_numbers: set[str] | None = None,
     comments: list[dict] | None = None,
+    tick_budget: "TickBudget | None" = None,
 ) -> int:
     """New issue + PR conversation comments.
 
@@ -1106,6 +1190,8 @@ def _check_issue_comments(
     count = 0
     parent_cache: dict[str, dict | None] = {}
     for comment in data:
+        if _hard_stop(tick_budget, "issue_comments"):
+            break
         if me and comment.get("user", {}).get("login") == me:
             continue
         if (comment.get("created_at", "") or "") <= since:
@@ -2541,7 +2627,10 @@ def _check_own_mergeability(
     return count, new
 
 
-def _check_pr_reviews(repo: str, since: str, token: str, me: str) -> int:
+def _check_pr_reviews(
+    repo: str, since: str, token: str, me: str,
+    *, tick_budget: "TickBudget | None" = None,
+) -> int:
     """New PR reviews (approve / changes-requested / commented).
     No ``since=`` query on reviews endpoint — walk open PRs + filter
     by ``submitted_at``. ``_gh_api`` passes ``--paginate``, so all
@@ -2560,6 +2649,8 @@ def _check_pr_reviews(repo: str, since: str, token: str, me: str) -> int:
         pr_number = pr.get("number")
         if not pr_number:
             continue
+        if _hard_stop(tick_budget, "pr_reviews"):
+            break
         reviews = _gh_api(f"repos/{repo}/pulls/{pr_number}/reviews", token)
         if not isinstance(reviews, list):
             continue
@@ -2686,6 +2777,9 @@ def main() -> None:
     # ``{repo: {pr_key: {head_sha, last_reminded_at, attempts}}}`` — bounded
     # unresolved own-PR remediation attempts, rate-limited by elapsed time.
     budget = TickBudget()
+    # Clamp every gh api call for the rest of this tick so no single slow request
+    # can carry the subprocess past the framework's SIGKILL.
+    set_active_tick_budget(budget)
     # Rotation offsets per repo, so a truncated tick resumes at the tail it skipped
     # instead of starving it every tick (#1433).
     reconcile_offsets: dict = cursor.get("pr_reconcile_offsets", {}) or {}
@@ -2720,7 +2814,7 @@ def main() -> None:
         )
         total += pr_opened_count
         total += _check_pr_review_comments(repo, since, token, me)
-        total += _check_pr_reviews(repo, since, token, me)
+        total += _check_pr_reviews(repo, since, token, me, tick_budget=budget)
         repo_heads = pr_heads_all.get(repo, {}) or {}
         repo_rr = _coerce_review_requests(rr_all.get(repo))
         push_count, new_repo_heads, new_repo_rr = _check_pr_pushes(
@@ -2738,6 +2832,7 @@ def main() -> None:
             me,
             review_needed_pr_numbers=review_needed_pr_numbers,
             comments=issue_comments,
+            tick_budget=budget,
         )
         new_pr_heads_all[repo] = new_repo_heads
         new_rr_all[repo] = new_repo_rr
@@ -2778,7 +2873,20 @@ def main() -> None:
         else:
             new_reconcile_offsets[repo] = 0
 
-    cursor["last_checked"] = new_cursor_ts
+    if budget.hard_truncated:
+        # The hard deadline cut per-PR work short. Holding the watermark keeps
+        # the since-based passes (notably _check_pr_reviews, which has no dedupe
+        # cursor of its own) from stepping over events this tick never reached.
+        # Re-delivering a nudge is recoverable; dropping a review is not, and
+        # today's SIGKILL already leaves the watermark unadvanced.
+        _emit_signal(
+            "poller_tick_hard_deadline",
+            elapsed_seconds=round(budget.elapsed(), 1),
+            hard_deadline_seconds=TICK_HARD_DEADLINE_SECONDS,
+            truncated=dict(budget.truncated),
+        )
+    else:
+        cursor["last_checked"] = new_cursor_ts
     cursor["pr_heads"] = new_pr_heads_all
     cursor["pr_review_requests"] = new_rr_all
     cursor["pr_reconcile_offsets"] = new_reconcile_offsets or reconcile_offsets
@@ -2794,6 +2902,7 @@ def main() -> None:
     cursor["pr_mergeability"] = new_mergeability_all
     cursor["pr_ci_failures"] = new_ci_failures_all
     cursor["pr_untrusted_authors"] = new_untrusted_all
+    set_active_tick_budget(None)
     _save_cursor(cursor)
     print(
         f"Emitted {total} event(s) across {len(repos)} repo(s)",
