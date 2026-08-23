@@ -795,6 +795,18 @@ Current slice-1 recovery is manual:
   `locks steal` manually only after independent TTL/heartbeat evidence;
   Chainlink can report a fresh lock as stale when no heartbeat has been written
   yet.
+- **Claims leaked before the lifecycle telemetry fix:** inspect
+  `<home>/logs/events.jsonl` for `worklink_reattach_dispatch_failed`,
+  `worklink_shutdown_claim_release_failed`, and `worklink_claim_reap_skipped`.
+  Compare their issue ids with `chainlink locks list --json` and current
+  `worklink:in-progress` issues. A `worklink_claims_reaped` event with
+  `examined=0` means no stale claim was found; nonzero `skipped` counts identify
+  why stale candidates remained among records discovered in that pass. Skip
+  issue ids are bounded samples, so use the lock table as the complete inventory
+  before manually releasing anything.
+- **Concurrency-cap refusal:** the current refusal reports only active and cap,
+  not the blocking lock ids. It should include a bounded id sample in a separate
+  observability change; this fix leaves cap behavior and payloads unchanged.
 - **Retained failed checkout/branch:** failed or blocked attempts are retained
   for autopsy under `.worklink/<issue>-<attempt>` with branch
   `issue/<issue>-a<attempt>`. Remove them only after evidence has been copied

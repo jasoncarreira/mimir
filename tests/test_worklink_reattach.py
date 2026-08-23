@@ -854,6 +854,68 @@ def test_factory_startup_recovery_routes_only_verified_dead_runs_through_run_epi
         assert spawned == []
 
 
+def test_part_b_startup_recovery_emits_for_all_five_outcomes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from mimir import server
+    import mimir.worklink.factory_state as factory_state
+
+    monkeypatch.setenv("WORKLINK_REPO", "/workspace/mimir")
+    monkeypatch.setenv("WORKLINK_RUN_BIN", "mimir")
+
+    def capture() -> tuple[list[tuple[str, dict[str, object]]], object]:
+        events: list[tuple[str, dict[str, object]]] = []
+        return events, lambda event, **payload: events.append((event, payload))
+
+    state_home = tmp_path / "state-arms"
+    _save_inflight_state(state_home, tmp_path / "repo", issue_id=4242, job="j1")
+    for spawn in (
+        lambda *args, **kwargs: object(),
+        lambda *args, **kwargs: (_ for _ in ()).throw(OSError("spawn failed")),
+    ):
+        events, logger = capture()
+        server.reattach_inflight_worklink_runs(
+            state_home,
+            popen=spawn,
+            event_logger=logger,
+        )
+        assert events
+
+    factory_home = tmp_path / "factory-arms"
+    factory_home.mkdir()
+    _factory_restart_record(factory_home, status="running", ticks=1)
+    for spawn in (
+        lambda *args, **kwargs: object(),
+        lambda *args, **kwargs: (_ for _ in ()).throw(OSError("spawn failed")),
+    ):
+        events, logger = capture()
+        server.reattach_inflight_worklink_runs(
+            factory_home,
+            popen=spawn,
+            event_logger=logger,
+        )
+        assert events
+
+    enumeration_home = tmp_path / "enumeration-arm"
+    monkeypatch.setattr(
+        factory_state,
+        "list_factory_records",
+        lambda home: (_ for _ in ()).throw(OSError("records unavailable")),
+    )
+    events, logger = capture()
+    server.reattach_inflight_worklink_runs(
+        enumeration_home,
+        popen=lambda *args, **kwargs: object(),
+        event_logger=logger,
+    )
+    assert any(
+        event == "worklink_reattach_dispatch_failed"
+        and payload["reason"] == "factory_record_enumeration_failed"
+        for event, payload in events
+    )
+
+
 @pytest.mark.parametrize(
     ("scenario", "alive", "cancel_error", "expected_cancel"),
     [
