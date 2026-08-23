@@ -1392,3 +1392,43 @@ def test_unresolvable_trust_skips_the_pr_instead_of_marking_it_untrusted(
     assert surfaced == set(), "unresolved trust was recorded as untrusted"
     assert emitted == [], "unresolved trust emitted a verdict"
     assert spent.hard_truncated is True, "watermark not held for a skipped PR"
+
+
+def test_unresolvable_trust_in_pushes_carries_the_prior_head_forward(monkeypatch):
+    """`_check_pr_pushes` rebuilds its head map from scratch, so a PR skipped for
+    lack of trust budget must have its *prior* head carried forward.
+
+    Dropping the key makes the next tick treat the PR as first-seen and miss the
+    push; writing the *current* head makes the next tick see no change and miss
+    it just as thoroughly. Only the prior head preserves the comparison.
+    """
+    monkeypatch.setattr(poller, "_pr_author_is_trusted", _REAL_TRUST_RESOLVER)
+    attempted: list[str] = []
+    monkeypatch.setattr(
+        poller, "_github_content_author",
+        lambda *a, **k: attempted.append("author") or "outside-contributor",
+    )
+    monkeypatch.setattr(poller, "_emit", lambda *a, **k: None)
+    monkeypatch.setattr(poller, "_emit_signal", lambda *a, **k: None)
+    monkeypatch.setattr(
+        poller, "_gh_api",
+        lambda ep, tok: [{
+            "number": 700, "title": "t", "state": "open",
+            "html_url": "https://github.com/o/r/pull/700",
+            "user": {"login": "outside-contributor"},
+            "head": {"sha": "n" * 40, "ref": "f", "repo": {"full_name": "o/r"}},
+            "base": {"sha": "b" * 40, "ref": "main"},
+        }] if "pulls?state=open" in ep else [],
+    )
+
+    spent = poller.TickBudget(hard_deadline_seconds=0.0)
+    count, new_heads, _rr = poller._check_pr_pushes(
+        "o/r", "tok", "mimir-bot", {"700": "o" * 40}, tick_budget=spent,
+    )
+
+    assert count == 0
+    assert attempted == [], "an attestation was made past the hard deadline"
+    assert new_heads == {"700": "o" * 40}, (
+        "prior head not carried forward — next tick would miss the push"
+    )
+    assert spent.hard_truncated is True
