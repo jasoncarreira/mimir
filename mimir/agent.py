@@ -3472,8 +3472,8 @@ class Agent:
             return
 
         try:
-            data = self._shell_jobs.read_output(
-                job.job_id, tail_lines=100, stream="both",
+            data = self._shell_jobs.read_job_output(
+                job, tail_lines=100, stream="both",
             )
         except Exception:  # noqa: BLE001
             data = {"stdout_tail": "", "stderr_tail": ""}
