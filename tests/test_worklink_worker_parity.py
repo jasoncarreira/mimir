@@ -11,6 +11,7 @@ import subprocess
 import sys
 import threading
 from typing import Any
+import uuid
 
 import pytest
 
@@ -266,6 +267,90 @@ async def test_job_alive_tracks_contained_task_and_direct_process(
     await direct.cleanup(direct_handle)
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stuck_layer", ["cancel", "collection"])
+async def test_contained_timeout_bounds_cancel_and_collection_independently(
+    monkeypatch: pytest.MonkeyPatch, stuck_layer: str
+) -> None:
+    job = asyncio.create_task(asyncio.Event().wait())
+    handle = LaunchHandle("local_subprocess", str(uuid.uuid4()))
+
+    class Client:
+        async def cancel(self, _identifier: str) -> None:
+            if stuck_layer == "cancel":
+                await asyncio.Event().wait()
+
+    backend = LocalSubprocessComputeBackend()
+    backend._jobs[handle.identifier] = (job, spec(), ("worker",))
+    backend._handles[handle.identifier] = handle
+    backend._worker_clients[handle.identifier] = Client()
+    monkeypatch.setattr(compute, "_WORKER_CANCEL_TIMEOUT_S", 0.01)
+    monkeypatch.setattr(compute, "_WORKER_COLLECTION_TIMEOUT_S", 0.01)
+
+    message = (
+        "worker cancellation exceeded"
+        if stuck_layer == "cancel"
+        else "worker did not report a terminal result"
+    )
+    with pytest.raises(RuntimeError, match=message):
+        await asyncio.wait_for(backend.wait(handle, 0.001), timeout=0.2)
+
+    job.cancel()
+    await asyncio.gather(job, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_worker_cancel_socket_receive_has_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import mimir.worklink.worker_client as worker_client
+
+    observed_timeouts: list[float] = []
+
+    class TimeoutSocket:
+        def settimeout(self, timeout_s: float) -> None:
+            observed_timeouts.append(timeout_s)
+
+        def connect(self, _path: str) -> None:
+            pass
+
+        def getsockopt(self, *_args: Any) -> bytes:
+            return struct.pack("3i", 4321, 0, 4321)
+
+        def send(self, _payload: bytes) -> None:
+            pass
+
+        def recv(self, _size: int) -> bytes:
+            raise socket.timeout("cancel acknowledgement timed out")
+
+        def close(self) -> None:
+            pass
+
+    monkeypatch.setattr(worker_client.socket, "socket", lambda *_args: TimeoutSocket())
+    monkeypatch.setattr(worker_client.socket, "SO_PEERCRED", 17, raising=False)
+
+    with pytest.raises(socket.timeout, match="acknowledgement timed out"):
+        await worker_client.WorkerClient(Authorization()).cancel(str(uuid.uuid4()))
+
+    assert observed_timeouts == [worker_client.CANCEL_SOCKET_TIMEOUT_S]
+
+
+@pytest.mark.asyncio
+async def test_direct_process_reap_is_bounded(monkeypatch: pytest.MonkeyPatch) -> None:
+    class Process:
+        pid = 4321
+
+        async def wait(self) -> None:
+            await asyncio.Event().wait()
+
+    monkeypatch.setattr(compute.os, "getpgid", lambda _pid: 4321)
+    monkeypatch.setattr(worker_exec, "_terminate_process_group_pid", lambda _pgid: None)
+    monkeypatch.setattr(compute, "_DIRECT_PROCESS_WAIT_TIMEOUT_S", 0.01)
+
+    with pytest.raises(RuntimeError, match="leader was not reaped after SIGKILL"):
+        await asyncio.wait_for(compute._kill_process_group(Process()), timeout=0.2)
+
+
 def direct_spec(source: str) -> WorkSpec:
     work = spec()
     object.__setattr__(work, "local_checkout", Path.cwd())
@@ -479,6 +564,10 @@ async def test_closed_worker_direct_parity_inventory(
                 assert path == str(worker_client.DEFAULT_EXECUTOR_SOCKET)
                 socket_events.append("connect")
 
+            def settimeout(self, timeout_s: float) -> None:
+                assert timeout_s == worker_client.CANCEL_SOCKET_TIMEOUT_S
+                socket_events.append("timeout")
+
             def getsockopt(self, *_args: Any) -> bytes:
                 socket_events.append("peer-credentials")
                 return struct.pack("3i", 4321, 0, 4321)
@@ -534,6 +623,7 @@ async def test_closed_worker_direct_parity_inventory(
         ]
         assert socket_events == [
             "socket",
+            "timeout",
             "connect",
             "peer-credentials",
             "cancel-request",

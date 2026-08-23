@@ -281,9 +281,11 @@ async def _heartbeat_while(
     *,
     claims: ChainlinkClaims,
     record: ClaimRecord,
-    interval_s: float = _CLAIM_HEARTBEAT_INTERVAL_S,
+    interval_s: float | None = None,
 ) -> Any:
     """Keep the Chainlink claim fresh while a long compute await is active."""
+    if interval_s is None:
+        interval_s = _CLAIM_HEARTBEAT_INTERVAL_S
 
     async def beat_loop() -> None:
         _heartbeat_claim_best_effort(claims, record)

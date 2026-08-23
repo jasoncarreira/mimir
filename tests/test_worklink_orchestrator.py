@@ -278,6 +278,95 @@ def test_orchestrator_passes_configured_compute_backend_to_tool_backend(tmp_path
     assert compute.cleaned == [LaunchHandle("fake_compute", "job-1")]
 
 
+def test_stuck_cancellation_stops_heartbeat_and_releases_claim(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import mimir.worklink.orchestrator as orchestrator
+    import mimir.worklink.worker_exec as worker_exec
+
+    repo = tmp_path / "repo"
+    worktree = repo.parent / ".worklink" / repo.name / "441-1"
+    repo.mkdir()
+    heartbeats: list[ClaimRecord] = []
+    releases: list[int] = []
+    transitions: list[dict[str, object]] = []
+    claim = ClaimRecord(441, 1, "agent", datetime.now(UTC))
+
+    class StuckCompute(FakeCompute):
+        async def wait(self, handle: LaunchHandle, timeout_s: int) -> ComputeResult:
+            await asyncio.to_thread(worker_exec._terminate_process_group_pid, 4321, 0)
+            raise AssertionError("unreapable cancellation unexpectedly converged")
+
+    compute_backend = StuckCompute(shared_filesystem=True)
+    registry = BackendRegistry(
+        WorklinkConfig(defaults=WorklinkDefaults(compute_backend="fake_compute"))
+    )
+    registry.register(FakeBackend())
+    registry.register_compute(compute_backend)
+
+    def runner(
+        args: Sequence[str] | str, **_kwargs: object
+    ) -> subprocess.CompletedProcess[str]:
+        checkout_result = _isolated_checkout_result(args, repo, worktree)
+        if checkout_result is not None:
+            return checkout_result
+        if isinstance(args, list) and args[:4] == ["chainlink", "issue", "show", "441"]:
+            return cp(args, stdout=ISSUE_JSON)
+        if isinstance(args, list) and args[:4] == ["git", "-C", str(repo), "config"]:
+            return cp(args, stdout="git@github.com:jasoncarreira/mimir.git\n")
+        return cp(args)
+
+    monkeypatch.setattr(
+        orchestrator.ChainlinkClaims,
+        "claim_issue",
+        lambda self, *args, **kwargs: ClaimResult(True, claim),
+    )
+    monkeypatch.setattr(
+        orchestrator.ChainlinkClaims,
+        "heartbeat_issue",
+        lambda self, record: (heartbeats.append(record) or record),
+    )
+    monkeypatch.setattr(
+        orchestrator.ChainlinkClaims,
+        "release_issue",
+        lambda self, issue_id: (releases.append(issue_id) or True),
+    )
+    monkeypatch.setattr(
+        orchestrator.ChainlinkClaims,
+        "transition_issue",
+        lambda self, *args, **kwargs: transitions.append(kwargs),
+    )
+    monkeypatch.setattr(orchestrator, "_CLAIM_HEARTBEAT_INTERVAL_S", 0.001)
+    monkeypatch.setattr(
+        worker_exec, "_wait_process_group", lambda _process_group, _deadline: False
+    )
+    monkeypatch.setattr(
+        worker_exec, "_process_group_has_live_members", lambda _process_group: True
+    )
+    monkeypatch.setattr(worker_exec.os, "killpg", lambda *_args: None)
+
+    async def exercise() -> tuple[object, int]:
+        result = await WorklinkRunner(
+            home=tmp_path,
+            repo=repo,
+            runner=runner,
+            registry=registry,
+            agent_id="agent",
+        ).run(441, backend_name="fake", test_command="echo ok")
+        stopped_at = len(heartbeats)
+        await asyncio.sleep(0.01)
+        return result, stopped_at
+
+    result, stopped_at = asyncio.run(exercise())
+
+    assert result.status == "failed"
+    assert result.reason and "still has live members after SIGKILL" in result.reason
+    assert len(heartbeats) == stopped_at == 1
+    assert releases == [claim.issue_id]
+    assert transitions[-1]["status"] == "failed"
+    assert compute_backend.cleaned == [LaunchHandle("fake_compute", "job-1")]
+
+
 def cp(
     args: Sequence[str] | str,
     returncode: int = 0,
