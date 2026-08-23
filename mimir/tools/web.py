@@ -115,14 +115,56 @@ def _parsed_content_type(value: object) -> str:
     return FETCH_CONTENT_TYPE_FALLBACK
 
 
+def _inline_pdf_extraction(value: object) -> dict[str, Any] | None:
+    """Rebuild nested PDF metadata from fixed strings and typed scalars."""
+    if not isinstance(value, dict):
+        return None
+
+    payload: dict[str, Any] = {}
+    status = value.get("status")
+    if isinstance(status, str) and status in {"success", "failed"}:
+        payload["status"] = status
+
+    for key in (
+        "max_pages", "max_output_bytes", "pages_extracted",
+        "total_pages", "output_bytes",
+    ):
+        item = value.get(key)
+        if isinstance(item, int) and not isinstance(item, bool) and item >= 0:
+            payload[key] = item
+
+    truncated = value.get("truncated")
+    if isinstance(truncated, bool):
+        payload["truncated"] = truncated
+
+    truncation_reasons = value.get("truncation_reasons")
+    if isinstance(truncation_reasons, list):
+        allowed_reasons = {"page_limit", "output_byte_limit"}
+        payload["truncation_reasons"] = [
+            reason for reason in truncation_reasons
+            if isinstance(reason, str) and reason in allowed_reasons
+        ]
+
+    reason = value.get("reason")
+    if isinstance(reason, str) and reason in {
+        "PDF contains no extractable text", "PDF extraction failed",
+    }:
+        payload["reason"] = reason
+
+    return payload
+
+
 def _inline_fetch_metadata(metadata: dict[str, Any]) -> dict[str, Any]:
     """Build the model-visible fetch result from the server-owned schema."""
     keys = (
         "url", "status", "content_type", "bytes", "sha256",
-        "file_path", "metadata_path", "text_path", "pdf_extraction",
+        "file_path", "metadata_path", "text_path",
     )
     payload = {key: metadata[key] for key in keys if key in metadata}
     payload["content_type"] = _parsed_content_type(payload.get("content_type", ""))
+    pdf_extraction = _inline_pdf_extraction(metadata.get("pdf_extraction"))
+    if pdf_extraction is not None:
+        payload["pdf_extraction"] = pdf_extraction
     return payload
 
 
@@ -188,12 +230,12 @@ def _extract_pdf_text(
             "truncation_reasons": truncation_reasons,
         })
         return result
-    except Exception as exc:
+    except Exception:
         try:
             text_path.unlink(missing_ok=True)
         except OSError:
             pass
-        result["reason"] = f"{type(exc).__name__}: {exc}"
+        result["reason"] = "PDF extraction failed"
         return result
 
 
@@ -602,6 +644,18 @@ async def fetch_url(
                 await _add_pdf_extraction(
                     existing_meta, body_path=body_path, text_path=text_path,
                 )
+            cache_root = cache_dir.parent.parent
+            existing_meta["file_path"] = _virtual_path(body_path, root=cache_root)
+            existing_meta["metadata_path"] = _virtual_path(meta_path, root=cache_root)
+            extraction = existing_meta.get("pdf_extraction")
+            if (
+                isinstance(extraction, dict)
+                and extraction.get("status") == "success"
+                and text_path.is_file()
+            ):
+                existing_meta["text_path"] = _virtual_path(text_path, root=cache_root)
+            else:
+                existing_meta.pop("text_path", None)
             cached_payload = _inline_fetch_metadata(existing_meta)
             meta_path.write_text(
                 json.dumps(cached_payload, ensure_ascii=True, sort_keys=False, indent=2) + "\n",
