@@ -705,7 +705,7 @@ async def test_async_wrap_releases_review_claim_when_cancelled_in_prologue(
             handler,
         )
 
-    assert releases == []
+    assert releases == [None]
 
 
 def test_multi_target_result_labels_use_operative_authorization(

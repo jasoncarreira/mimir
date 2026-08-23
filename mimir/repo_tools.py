@@ -97,7 +97,7 @@ class GitRefusal(RuntimeError):
         code: str,
         message: str,
         *,
-        execution_started: bool = False,
+        execution_started: bool = True,
     ) -> None:
         super().__init__(message)
         self.code = code

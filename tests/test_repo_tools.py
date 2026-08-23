@@ -2533,6 +2533,7 @@ def test_repo_wrapper_failure_classes_have_distinct_stable_codes(
         class FailingRepoGitTools:
             def __init__(self, review_state, *, enforce=True):
                 self.review_state = review_state
+                self.execution_started = False
 
             def execute(self, operation):
                 raise failure
@@ -2558,6 +2559,7 @@ def test_repo_wrapper_git_stderr_redacts_embedded_remote_credential(
     class FailingRepoGitTools:
         def __init__(self, review_state, *, enforce=True):
             self.review_state = review_state
+            self.execution_started = False
 
         def execute(self, operation):
             raise GitRefusal(

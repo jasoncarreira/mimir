@@ -4083,6 +4083,7 @@ def test_real_repo_execution_fault_taints_turn(
     class FailingRepoGitTools:
         def __init__(self, state, *, enforce=True):  # type: ignore[no-untyped-def]
             self.state = state
+            self.execution_started = False
 
         def execute(self, operation):  # type: ignore[no-untyped-def]
             raise GitRefusal(
