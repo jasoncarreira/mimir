@@ -253,7 +253,7 @@ def test_validate_checkout_refuses_arbitrary_and_replaced_fds(tmp_path: Path, mo
         ),
     )
     issued.chmod(0o2770)
-    issued.parent.chmod(0o700)
+    issued.parent.chmod(0o710)
 
     def request(fd: int) -> dict[str, object]:
         observed = os.fstat(fd)
@@ -278,13 +278,27 @@ def test_validate_checkout_refuses_arbitrary_and_replaced_fds(tmp_path: Path, mo
         finally:
             os.close(fd)
 
+    # #1434: the boundary is now controller-owned traverse-only (0710) so the
+    # worker can resolve its own checkout by path for a Node backend that
+    # re-resolves its project root. A 0700 boundary is the violation now, because
+    # it is the mode that made every opencode build fail with EACCES; 0710 must be
+    # accepted. Group READ is still absent either way, so sibling attempts remain
+    # unenumerable, and the device/inode check above is unchanged.
     issued.chmod(0o2770)
-    issued.parent.chmod(0o710)
+    issued.parent.chmod(0o700)
     fd = os.open(issued, os.O_RDONLY | os.O_DIRECTORY)
     monkeypatch.setattr(worker_exec.os, "readlink", lambda _name: str(issued))
     try:
         with pytest.raises(RuntimeError, match="isolation boundary"):
             worker_exec._validate_checkout(fd, request(fd))
+    finally:
+        os.close(fd)
+
+    issued.parent.chmod(0o710)
+    fd = os.open(issued, os.O_RDONLY | os.O_DIRECTORY)
+    monkeypatch.setattr(worker_exec.os, "readlink", lambda _name: str(issued))
+    try:
+        assert worker_exec._validate_checkout(fd, request(fd)) == root
     finally:
         os.close(fd)
 
@@ -1148,7 +1162,8 @@ def test_executor_accepts_only_the_three_issued_checkout_shapes(
     )
     path = roots[root_name] / ("a" * 64) / f"{issue}-{attempt}" / "checkout"
     path.mkdir(parents=True)
-    path.parent.chmod(0o700)
+    # #1434: the boundary is controller-owned traverse-only (0710), not 0700.
+    path.parent.chmod(0o710)
     path.chmod(0o2770)
     fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
     observed = os.fstat(fd)
@@ -1201,6 +1216,77 @@ def test_executor_refuses_a_fourth_checkout_root(
                     "inode": observed.st_ino,
                     "issue": 41,
                     "attempt": 2,
+                },
+            )
+    finally:
+        os.close(fd)
+
+
+def test_tokenised_attempt_directory_is_accepted_and_pins_issue_attempt(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """#1434: the isolated attempt directory carries entropy so a sibling's path
+    cannot be guessed. The validator must accept ``<issue>-<attempt>-<token>``
+    while still refusing a directory that names a different issue or attempt."""
+    root = tmp_path / "checkouts"
+    monkeypatch.setattr(worker_exec, "ENABLED_CHECKOUT_ROOT", root)
+    monkeypatch.setattr(
+        worker_exec,
+        "get_identities",
+        lambda: SimpleNamespace(
+            mimir_uid=os.getuid(), worklink_uid=os.getuid(), worklink_gid=os.getgid()
+        ),
+    )
+
+    def issued_at(name: str) -> Path:
+        path = root / ("b" * 64) / name / "checkout"
+        path.mkdir(parents=True)
+        path.chmod(0o2770)
+        path.parent.chmod(0o710)
+        return path
+
+    token = "0123456789abcdef0123456789abcdef"
+    accepted = issued_at(f"41-2-{token}")
+    fd = os.open(accepted, os.O_RDONLY | os.O_DIRECTORY)
+    observed = os.fstat(fd)
+    request = {
+        "device": observed.st_dev, "inode": observed.st_ino, "issue": 41, "attempt": 2,
+    }
+    monkeypatch.setattr(worker_exec.os, "readlink", lambda _n: str(accepted))
+    try:
+        assert worker_exec._validate_checkout(fd, request) == root
+    finally:
+        os.close(fd)
+
+    # A token does not let a directory stand in for a different issue/attempt.
+    foreign = issued_at(f"99-7-{token}")
+    fd = os.open(foreign, os.O_RDONLY | os.O_DIRECTORY)
+    observed = os.fstat(fd)
+    monkeypatch.setattr(worker_exec.os, "readlink", lambda _n: str(foreign))
+    try:
+        with pytest.raises(RuntimeError, match="exact issued"):
+            worker_exec._validate_checkout(
+                fd,
+                {
+                    "device": observed.st_dev, "inode": observed.st_ino,
+                    "issue": 41, "attempt": 2,
+                },
+            )
+    finally:
+        os.close(fd)
+
+    # A malformed token is refused rather than treated as a bare attempt name.
+    bad = issued_at("41-2-nothex")
+    fd = os.open(bad, os.O_RDONLY | os.O_DIRECTORY)
+    observed = os.fstat(fd)
+    monkeypatch.setattr(worker_exec.os, "readlink", lambda _n: str(bad))
+    try:
+        with pytest.raises(RuntimeError, match="exact issued"):
+            worker_exec._validate_checkout(
+                fd,
+                {
+                    "device": observed.st_dev, "inode": observed.st_ino,
+                    "issue": 41, "attempt": 2,
                 },
             )
     finally:

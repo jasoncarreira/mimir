@@ -198,17 +198,25 @@ def _validate_checkout(fd: int, request: dict[str, Any]) -> Path:
     if (
         len(relative.parts) != 3
         or re.fullmatch(r"[0-9a-f]{64}", relative.parts[0]) is None
-        or relative.parts[1] != f"{issue}-{attempt}"
+        or re.fullmatch(
+            rf"{issue}-{attempt}(?:-[0-9a-f]{{32}})?", relative.parts[1]
+        ) is None
         or relative.parts[2] != "checkout"
         or (root == OPENCODE_CHECKOUT_ROOT and attempt != 1)
     ):
         raise RuntimeError("received checkout FD is not the exact issued checkout")
+    # The boundary is controller-owned and worker-traversable (0710) but NOT
+    # readable, so the worker can resolve its own issued checkout by path — which
+    # a third-party Node backend requires — while still being unable to enumerate
+    # sibling attempts. The directory name carries 128 bits of entropy, and the
+    # device/inode check above pins the exact issued directory, so reaching a
+    # sibling would require guessing its token AND would still fail identity.
     boundary = resolved.parent.stat(follow_symlinks=False)
     if (
         not stat.S_ISDIR(boundary.st_mode)
         or boundary.st_uid != get_identities().mimir_uid
         or boundary.st_gid != get_identities().worklink_gid
-        or stat.S_IMODE(boundary.st_mode) != 0o700
+        or stat.S_IMODE(boundary.st_mode) != 0o710
     ):
         raise RuntimeError("issued checkout isolation boundary is invalid")
     if observed.st_uid != get_identities().mimir_uid or observed.st_gid != get_identities().worklink_gid:

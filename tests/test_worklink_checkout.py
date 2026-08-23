@@ -4,6 +4,7 @@ from datetime import UTC, datetime, timedelta
 import errno
 import inspect
 import os
+import re
 import stat
 import subprocess
 from pathlib import Path
@@ -1071,7 +1072,13 @@ def test_enabled_eligible_checkout_retains_exact_authorization_and_shared_modes(
         assert lease.worker_authorized is True
         assert lease.authorization is not None
         assert lease.path.parent.parent.parent == enabled_root
-        assert stat.S_IMODE(lease.path.parent.stat().st_mode) == 0o700
+        # #1434: traverse-only for the worker gid, so a Node backend can resolve
+        # its own checkout by path. Group READ stays absent, so sibling attempts
+        # are still unenumerable, and the name below carries the entropy.
+        assert stat.S_IMODE(lease.path.parent.stat().st_mode) == 0o710
+        assert re.fullmatch(
+            r"\d+-\d+-[0-9a-f]{32}", lease.path.parent.name
+        ) is not None
         lease.authorization.verify(lease.path)
         retained = lease.authorization.duplicate_fd()
         try:
@@ -1217,3 +1224,41 @@ def test_non_linux_issued_checkout_rejects_paths_outside_root(
 
     with pytest.raises(ValueError, match="beneath its trusted root"):
         checkout_module._open_issued_checkout(root, relative_path)
+
+
+def test_prune_recognises_tokenised_isolated_attempt_directories(tmp_path: Path) -> None:
+    """#1434: isolated attempt directories carry a name token. A pruner that only
+    understood ``<issue>-<attempt>`` would silently stop reaping them, leaking both
+    the checkout and its branch, so both shapes must be recognised — and a
+    malformed token must still be ignored rather than parsed as an attempt."""
+    root = tmp_path / ".worklink"
+    token = "0123456789abcdef0123456789abcdef"
+    tokenised = root / f"441-3-{token}"
+    bare = root / "442-1"
+    bad_token = root / "443-1-not-hex"
+    for path in (tokenised, bare, bad_token):
+        path.mkdir(parents=True)
+
+    calls: list[list[str]] = []
+
+    def runner(args: Sequence[str]) -> subprocess.CompletedProcess[str]:
+        calls.append(list(args))
+        return completed(args)
+
+    now = datetime.now(UTC)
+    stale = (now - timedelta(days=10)).timestamp()
+    import os
+
+    for path in (tokenised, bare, bad_token):
+        path.touch()
+        os.utime(path, (stale, stale))
+
+    pruned = prune_attempt_checkouts(
+        tmp_path, older_than=timedelta(days=3), now=now, runner=runner
+    )
+
+    assert sorted(pruned) == sorted([tokenised, bare])
+    assert bad_token not in pruned
+    branch_deletes = [c for c in calls if c[3:5] == ["branch", "-D"]]
+    assert ["git", "-C", str(tmp_path), "branch", "-D", "issue/441-a3"] in branch_deletes
+    assert ["git", "-C", str(tmp_path), "branch", "-D", "issue/442-a1"] in branch_deletes

@@ -10,6 +10,7 @@ import hashlib
 import os
 from pathlib import Path
 import re
+import secrets
 import shutil
 import stat
 import subprocess
@@ -27,6 +28,10 @@ _ENABLED_CHECKOUT_ROOT = Path("/var/lib/mimir-worklink/checkouts")
 _REPO_TEST_CHECKOUT_ROOT = Path("/var/lib/mimir-worklink/repo-test-checkouts")
 _OPENCODE_CHECKOUT_ROOT = Path("/var/lib/mimir-worklink/opencode-checkouts")
 _AUTHORIZATION_FACTORY = object()
+#: Entropy in an isolated attempt directory name. The worker may traverse the
+#: directory (0710) but not list its parent, so an unguessable name is what keeps
+#: one attempt from reaching another attempt's checkout by path.
+_ATTEMPT_TOKEN_BYTES = 16
 
 
 def _default_runner(args: Sequence[str]) -> subprocess.CompletedProcess[str]:
@@ -463,8 +468,19 @@ def create_isolated_checkout(
 
     enabled = coding_enabled() and worker_eligible
     identities = get_identities() if enabled else None
+    # The worker resolves its own checkout path from the issued FD
+    # (``readlink /proc/self/fd/<n>``) and hands that path to the backend. A
+    # third-party Node backend re-resolves its project root as an absolute path,
+    # so the attempt directory has to be traversable by the worker gid; a 0700
+    # barrier here fails every opencode build with EACCES (#1434). Traversal is
+    # granted (0710) WITHOUT read, so the worker still cannot enumerate the
+    # attempt directory, and the directory name carries 128 bits of entropy so a
+    # sibling attempt's path cannot be guessed. The repo directory above stays
+    # 0710 (traverse, no read) for the same reason, and worker_exec still pins
+    # the FD's device/inode, so a guessed path is refused even if reached.
+    token = secrets.token_hex(_ATTEMPT_TOKEN_BYTES) if enabled else None
     path = _isolated_checkout_path(
-        repo, worklink_dir, issue_id, attempt, worker_authorized=enabled
+        repo, worklink_dir, issue_id, attempt, worker_authorized=enabled, token=token
     )
     branch = f"issue/{issue_id}-a{attempt}"
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -473,7 +489,7 @@ def create_isolated_checkout(
         os.chown(repo_parent, identities.mimir_uid, identities.worklink_gid)
         os.chmod(repo_parent, 0o710)
         os.chown(path.parent, identities.mimir_uid, identities.worklink_gid)
-        os.chmod(path.parent, 0o700)
+        os.chmod(path.parent, 0o710)
     if path.exists():
         raise RuntimeError(f"attempt checkout already exists: {path}")
 
@@ -997,6 +1013,7 @@ def _isolated_checkout_path(
     attempt: int,
     *,
     worker_authorized: bool | None = None,
+    token: str | None = None,
 ) -> Path:
     """Location for an isolated attempt checkout, OUTSIDE the parent repo (#517).
 
@@ -1007,20 +1024,20 @@ def _isolated_checkout_path(
     ``<repo.parent>/<worklink_dir>/<repo.name>/<issue>-<attempt>`` keeps the
     independent clone fully detached, and the ``<repo.name>`` segment keeps
     attempts for repos that share a parent directory from colliding. Worker
-    checkouts add ``<issue>-<attempt>/checkout``: the attempt directory is a
-    controller-owned mode-0700 pathname barrier, while the worker enters the
-    writable checkout through its issued directory FD.
+    checkouts add ``<issue>-<attempt>-<token>/checkout``: the attempt directory is
+    controller-owned and worker-traversable but not readable (0710), so the worker
+    can resolve its own checkout by path without being able to enumerate siblings,
+    and the token makes a sibling's path unguessable. The worker still enters the
+    writable checkout through its issued directory FD, which pins device/inode.
     """
     if worker_authorized is None:
         worker_authorized = coding_enabled()
     if worker_authorized:
         repo_id = hashlib.sha256(str(repo.resolve()).encode("utf-8")).hexdigest()
-        return (
-            _ENABLED_CHECKOUT_ROOT
-            / repo_id
-            / f"{issue_id}-{attempt}"
-            / "checkout"
-        )
+        attempt_dir = f"{issue_id}-{attempt}"
+        if token is not None:
+            attempt_dir = f"{attempt_dir}-{token}"
+        return _ENABLED_CHECKOUT_ROOT / repo_id / attempt_dir / "checkout"
     return repo.parent / worklink_dir / repo.name / f"{issue_id}-{attempt}"
 
 
@@ -1153,7 +1170,16 @@ def _attempt_dir_name(name: str) -> bool:
 
 
 def _attempt_branch_name(name: str) -> str | None:
-    left, sep, right = name.partition("-")
-    if not (sep and left.isdigit() and right.isdigit()):
+    # ``<issue>-<attempt>`` and the isolated ``<issue>-<attempt>-<token>`` shape.
+    # Both are accepted so pruning keeps working across the token rollout; a
+    # parser that only understood the two-part form would silently stop reaping
+    # isolated checkouts and leak them plus their branches.
+    parts = name.split("-")
+    if len(parts) not in {2, 3}:
+        return None
+    left, right = parts[0], parts[1]
+    if not (left.isdigit() and right.isdigit()):
+        return None
+    if len(parts) == 3 and re.fullmatch(r"[0-9a-f]{32}", parts[2]) is None:
         return None
     return f"issue/{left}-a{right}"
