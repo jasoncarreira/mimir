@@ -4304,17 +4304,25 @@ class Agent:
                 auto_skill_block[1],
                 auto_skill_labels,
             ))
-        # chainlink #508: resolve an optional deliver: channel (poller / tick),
-        # mapping the OPERATOR_CHANNEL sentinel → the operator alert channel.
+        trusted_trigger = (
+            get_trusted_service_from_auth_context(auth_context)
+            if event.trigger in {"scheduled_tick", "poller"}
+            else None
+        )
+        # Delivery is framework authority, so derive it from the immutable
+        # server-created poller/schedule grant rather than event.extra. Registry
+        # lookup proves routability only; the exact config value is the grant.
         deliver_channel = resolve_deliver_channel(
-            (event.extra or {}).get("deliver"),
+            trusted_trigger.configured_delivery_channel if trusted_trigger else None,
             getattr(self._config, "operator_alert_channel", ""),
         )
+        if (
+            deliver_channel is not None
+            and (self._channels is None or self._channels.find(deliver_channel) is None)
+        ):
+            deliver_channel = None
         trigger_authority = (
-            get_trusted_service_from_auth_context(auth_context)
-            if self._config.access_control_enforced
-            and event.trigger in {"scheduled_tick", "poller"}
-            else None
+            trusted_trigger if self._config.access_control_enforced else None
         )
         turn_prompt = build_turn_prompt(
             event,

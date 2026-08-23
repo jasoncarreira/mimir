@@ -785,3 +785,13 @@ def test_build_turn_prompt_no_deliver_section_when_unset():
 
     event = AgentEvent(trigger="poller", channel_id="poller:gmail", content="x")
     assert "## Delivery" not in build_turn_prompt(event)
+
+
+def test_build_turn_prompt_rejects_delivery_for_non_autonomous_trigger():
+    from mimir.models import AgentEvent
+    from mimir.prompts import build_turn_prompt
+
+    event = AgentEvent(trigger="user_message", channel_id="web-alice", content="x")
+    prompt = build_turn_prompt(event, deliver_channel="slack-C0PRIVATE")
+    assert "## Delivery" not in prompt
+    assert "slack-C0PRIVATE" not in prompt

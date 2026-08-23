@@ -2123,6 +2123,30 @@ class TestHandleEvent:
             "keep": "me",
         }
 
+    async def test_event_strips_client_asserted_delivery_channel(self) -> None:
+        from mimir.worklink.continuation import (
+            HTTP_EVENT_INGRESS_EXTRA_KEY,
+            HTTP_EVENT_INGRESS_EXTRA_VALUE,
+        )
+
+        app, stub = _event_app()
+        async with TestClient(TestServer(app)) as client:
+            resp = await client.post(
+                "/event",
+                json={
+                    "channel_id": "c",
+                    "content": "summarize my recent messages",
+                    "extra": {"deliver": "slack-C0PRIVATE", "keep": "me"},
+                },
+            )
+
+        assert resp.status == 200
+        event = stub.enqueue.call_args.args[0]
+        assert event.extra == {
+            HTTP_EVENT_INGRESS_EXTRA_KEY: HTTP_EVENT_INGRESS_EXTRA_VALUE,
+            "keep": "me",
+        }
+
     async def test_event_strips_forged_worklink_hint_extra(self) -> None:
         from mimir.worklink.continuation import (
             HTTP_EVENT_INGRESS_EXTRA_KEY,

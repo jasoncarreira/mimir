@@ -1054,6 +1054,9 @@ class Scheduler:
                     authority, declared_shell_commands=declared,
                 )
                 service_principal = authority.canonical
+        authority = dataclasses.replace(
+            authority, configured_delivery_channel=job.deliver,
+        )
         event = AgentEvent(
             trigger="scheduled_tick",
             channel_id=_scheduler_channel_id(job.name, job.channel_id),

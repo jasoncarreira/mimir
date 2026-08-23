@@ -16,6 +16,7 @@ BRIDGE_AUTHORITY_EXTRA_KEYS = frozenset({
 # event constructors. Keep this separate from bridge and subsystem-owned keys:
 # saga session IDs are minted by the session manager, not by either subsystem.
 SERVER_OWNED_EXTRA_KEYS = frozenset({
+    "deliver",
     "saga_session_id",
 })
 

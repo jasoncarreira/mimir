@@ -421,6 +421,9 @@ class ServicePrincipal:
     #: in scheduler.yaml or a poller manifest -- neither of which any service
     #: principal can write -- and validated into this shape before it lands here.
     declared_shell_commands: tuple["DeclaredShellCommand", ...] = ()
+    # Exact delivery destination nominated by trusted poller/schedule config.
+    # Prompt assembly uses this carrier instead of client-readable event.extra.
+    configured_delivery_channel: str | None = None
 
     def can_read_domain(self, domain: str) -> bool:
         return domain in self.readable_domains

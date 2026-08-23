@@ -71,6 +71,7 @@ jobs that emit on completion.
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import hashlib
 import json
 import logging
@@ -732,18 +733,22 @@ class PollerConfig:
 
     def resolved_authority(self) -> ServicePrincipal:
         if self.authority is not None:
-            return self.authority
-        canonical = f"poller:{self.name}"
-        return build_trigger_service_principal(
-            canonical=canonical,
-            trigger="poller",
-            profile="custom",
-            tier=CapabilityTier.SCOPE_CONTAINED,
-            capabilities=(),
-            roots=(self.resolved_persist_dir().resolve(),),
-            owned_skill_directory=self.skill_dir,
-            channel_memory_directory=canonical,
-            creation_path="mimir.pollers.run_poller",
+            authority = self.authority
+        else:
+            canonical = f"poller:{self.name}"
+            authority = build_trigger_service_principal(
+                canonical=canonical,
+                trigger="poller",
+                profile="custom",
+                tier=CapabilityTier.SCOPE_CONTAINED,
+                capabilities=(),
+                roots=(self.resolved_persist_dir().resolve(),),
+                owned_skill_directory=self.skill_dir,
+                channel_memory_directory=canonical,
+                creation_path="mimir.pollers.run_poller",
+            )
+        return dataclasses.replace(
+            authority, configured_delivery_channel=self.deliver,
         )
 
 

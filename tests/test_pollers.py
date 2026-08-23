@@ -1544,7 +1544,7 @@ print(json.dumps({
 """)
     cfg = PollerConfig(
         name="x", command=f"{sys.executable} poller.py",
-        cron="* * * * *", env={}, skill_dir=skill_dir,
+        cron="* * * * *", env={}, skill_dir=skill_dir, deliver="slack-ops",
     )
     enq = _CapturingEnqueue()
     await run_poller(cfg, enqueue=enq)
@@ -1553,6 +1553,7 @@ print(json.dumps({
     assert extra["poller_name"] == "x"
     assert extra["batch_index"] == 0
     assert extra["batch_count"] == 1
+    assert enq.events[0].service_authority.configured_delivery_channel == "slack-ops"
     # Per-item metadata under .items[0].
     assert len(extra["items"]) == 1
     item = extra["items"][0]
