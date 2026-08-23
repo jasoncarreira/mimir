@@ -17,6 +17,7 @@ from typing import Iterable
 from .history import Message, render_identity_context, render_recent_activity
 from .core_blocks import CoreBlock, render_core_section
 from .models import AgentEvent
+from .prompt_safety import sanitize_prompt_field
 
 _DEFAULT_PERSONA = """You are Mimir, a memory-centric agent. You communicate through
 channels (Slack, Discord, web, benchmark stdout).
@@ -485,7 +486,11 @@ def build_turn_prompt(
     # contemporaneous date, not the wall clock). Production agents always
     # see now() unless a bridge/handler explicitly sets the override.
     ts_override = (event.extra or {}).get("event_ts_iso")
-    ts = ts_override if ts_override else datetime.now(tz=timezone.utc).isoformat()
+    ts = sanitize_prompt_field(
+        ts_override if ts_override else datetime.now(tz=timezone.utc).isoformat()
+    )
+    header_trigger = sanitize_prompt_field(event.trigger)
+    header_channel = sanitize_prompt_field(event.channel_id)
     # ALWAYS surface "Today's date: YYYY-MM-DD" — bare ISO timestamps in
     # the event header alone get misread (haiku saw a 2023-04-01 ts: but
     # answered against the wall-clock 2026 because nothing told it that
@@ -502,9 +507,10 @@ def build_turn_prompt(
         # heartbeat-driven saga_query / saga_store calls need it too
         # (chainlink #23 #26 Option P).
         saga_part = (
-            f", saga_session_id: {saga_session_id}" if saga_session_id else ""
+            f", saga_session_id: {sanitize_prompt_field(saga_session_id)}"
+            if saga_session_id else ""
         )
-        header = f"[scheduled_tick: {event.channel_id}, ts: {ts}{saga_part}]"
+        header = f"[scheduled_tick: {header_channel}, ts: {ts}{saga_part}]"
         body = event.content or HEARTBEAT_DEFAULT_PROMPT
         sections.append(f"{header}\n{body}")
     elif event.trigger == "shell_job_complete":
@@ -513,39 +519,45 @@ def build_turn_prompt(
         # stdout/stderr tails) built by ``Agent._on_shell_job_complete``.
         # Header gives the routing context — channel + the completion
         # signature so the agent can grep events.jsonl if it needs more.
-        job_id = (event.extra or {}).get("job_id", "?")
-        exit_code = (event.extra or {}).get("exit_code")
+        job_id = sanitize_prompt_field((event.extra or {}).get("job_id", "?"))
+        exit_code = sanitize_prompt_field((event.extra or {}).get("exit_code"))
         saga_part = (
-            f", saga_session_id: {saga_session_id}" if saga_session_id else ""
+            f", saga_session_id: {sanitize_prompt_field(saga_session_id)}"
+            if saga_session_id else ""
         )
         header = (
-            f"[shell_job_complete: {event.channel_id}, job_id: {job_id}, "
+            f"[shell_job_complete: {header_channel}, job_id: {job_id}, "
             f"exit_code: {exit_code}, ts: {ts}{saga_part}]"
         )
         body = event.content or "(no payload)"
         sections.append(f"{header}\n{body}")
     else:
-        # Prefer the canonical's display name (or the event's author_display)
-        # over the raw matching key in the header — the agent reads "alice",
-        # not "discord-99".
-        header_author = event.author_display
-        if not header_author and resolver is not None and event.author:
+        # Prefer the operator-configured canonical display name over platform
+        # metadata, then sanitize whichever value will enter framework text.
+        header_author = None
+        if resolver is not None and event.author:
             header_author = resolver.display_name(event.author)
         if not header_author:
-            header_author = event.author or "-"
+            header_author = event.author_display or event.author or "-"
+        header_author = sanitize_prompt_field(header_author)
         # Highlight the current message — bordered separator + heading
         # so the agent reads "this is what I'm responding to" clearly,
         # vs. ambient context blocks above. Recent activity already
         # shows the message tail; this block is the *active* one.
         body = event.content or "(no content)"
         if event.attachment_names:
-            paths = "\n".join(f"- {p}" for p in event.attachment_names)
+            paths = "\n".join(
+                f"- {sanitize_prompt_field(path)}" for path in event.attachment_names
+            )
             body = f"{body}\n\nAttachments:\n{paths}"
         # Include the inbound message id so the agent can target it with
         # ``<react message="<id>" />`` (otherwise the directive falls back
         # to the just-sent assistant reply, which is the wrong target for
         # an "on it" ack — see memory/core/40-learned-behaviors.md).
-        msg_id_part = f", msg_id: {event.source_id}" if event.source_id else ""
+        msg_id_part = (
+            f", msg_id: {sanitize_prompt_field(event.source_id)}"
+            if event.source_id else ""
+        )
         # Include the turn's saga_session_id so the agent can pass it as
         # ``session_id`` on saga_query / saga_store / saga_feedback /
         # saga_mark_contributions (chainlink #23 #26 — Option P). MCP tool
@@ -554,11 +566,12 @@ def build_turn_prompt(
         # model passing the session_id at tool-call construction time is
         # the structural fit (skill-as-method-call pattern).
         saga_part = (
-            f", saga_session_id: {saga_session_id}" if saga_session_id else ""
+            f", saga_session_id: {sanitize_prompt_field(saga_session_id)}"
+            if saga_session_id else ""
         )
         sections.append(
             f"## ▶ Current message — respond to this\n\n"
-            f"[event_kind: {event.trigger}, channel: {event.channel_id}, "
+            f"[event_kind: {header_trigger}, channel: {header_channel}, "
             f"author: {header_author}, ts: {ts}{msg_id_part}{saga_part}]\n\n"
             f"{body}"
         )

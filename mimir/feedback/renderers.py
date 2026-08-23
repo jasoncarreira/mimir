@@ -1,45 +1,21 @@
 """Event-line renderers for the algedonic-surfacing block.
 
-Contains _sanitize_field, _render_event_line (all event kinds), and
-_render_turn_error.  Purely functional — takes dicts, returns strings.
+Contains _render_event_line (all event kinds) and _render_turn_error. Purely
+functional — takes dicts, returns strings.
 """
 from __future__ import annotations
 import json
 import logging
-import re
 from datetime import datetime, timezone
 from pathlib import Path
 
+from ..prompt_safety import (
+    CONTROL_CHARS_RE as _CONTROL_CHARS_RE,
+    FIELD_MAX_LEN as _FIELD_MAX_LEN,
+    sanitize_prompt_field as _sanitize_field,
+)
+
 log = logging.getLogger(__name__)
-
-# ---------------------------------------------------------------------------
-# Prompt-injection hardening helper
-# ---------------------------------------------------------------------------
-
-_FIELD_MAX_LEN = 240  # per-field cap for sanitized event-payload strings
-_CONTROL_CHARS_RE = re.compile(r"[\x00-\x1f\x7f]")
-
-
-def _sanitize_field(value: object, max_len: int = _FIELD_MAX_LEN) -> str:
-    """Collapse whitespace, strip control chars, cap length.
-
-    Applied to every event-payload field that surfaces in the rendered
-    algedonic prompt block.  Prevents prompt-injection via external event
-    sources: GitHub PR author names, poller error strings, bridge errors,
-    shell intent prefixes, Discord/Slack display names.
-
-    Operations (in order):
-      1. Coerce to str.
-      2. Collapse all whitespace runs (including \\n, \\r, \\t) → single space.
-      3. Strip remaining C0 + DEL control characters (\\x00–\\x1f, \\x7f).
-      4. Truncate to *max_len* chars with "…" suffix on overflow.
-    """
-    s = " ".join(str(value).split())  # step 1+2: coerce + collapse whitespace
-    s = _CONTROL_CHARS_RE.sub("", s)  # step 3: strip residual controls
-    if len(s) > max_len:
-        s = s[: max_len - 1] + "…"  # step 4: cap
-    return s
-
 
 # Render hooks: per-kind one-liner builders. Defaults to a generic
 # "<kind>: <event-type-specific note>" if no specialized renderer fits.
