@@ -1899,7 +1899,18 @@ def test_chainlink_orchestrator_passes_controller_environment_overrides() -> Non
 
     pass_env = manifest["pollers"][0]["pass_env"]
     assert "MIMIR_FACTORY_PUBLISHING_IDENTITY" in pass_env
-    assert "MIMIR_CODING_ENABLED" in pass_env
+    # MIMIR_CODING_ENABLED is deliberately NOT passed through (#1434). This
+    # assertion is inverted from the one that pinned it, and the inversion is the
+    # point: passing it flips coding_enabled() True for poller-dispatched builds,
+    # which selects the contained checkout path, and that path fails every
+    # opencode build with EACCES because a 0700 attempt directory cannot be
+    # traversed by a backend that re-resolves its project root by pathname.
+    #
+    # Re-add the key in the SAME change that lands per-run worker UIDs. Until the
+    # worker identity is unique per run, no directory-mode arrangement isolates
+    # concurrent runs: ptrace_scope is 0, so a sibling worker sharing the uid can
+    # take another's checkout FD outright. Re-adding it alone reopens the outage.
+    assert "MIMIR_CODING_ENABLED" not in pass_env
 
 
 def test_worklink_ignores_planner_suggested_test_command_by_default(
