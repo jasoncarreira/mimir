@@ -9193,6 +9193,11 @@ def test_service_shell_execution_binds_relative_read_operand_to_authoritative_cw
         filesystem_read_roots=(str(checkout.resolve()),),
     )
     auth = _service_auth(service, InformationFlowLabels())
+    # This regression is about the principal's declared checkout root, not the
+    # platform's ambient temporary-directory spelling (/tmp vs $TMPDIR).
+    monkeypatch.setattr(
+        "mimir.read_policy.configured_non_admin_read_roots", lambda: (),
+    )
 
     bound = budget_gate._request_for_authorized_execution(
         _tool_request(
@@ -9235,6 +9240,11 @@ def test_service_shell_recursive_preflight_runs_once_and_is_bounded(
         filesystem_read_roots=(str(root.resolve()),),
     )
     auth = _service_auth(service, InformationFlowLabels())
+    # Keep cwd admission owned by this fixture so only the once-and-bounded
+    # recursive preflight behavior can make the test fail.
+    monkeypatch.setattr(
+        "mimir.read_policy.configured_non_admin_read_roots", lambda: (),
+    )
     original = access_control._service_shell_read_operand_refusal
     calls = 0
 
