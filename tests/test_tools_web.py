@@ -604,6 +604,20 @@ async def test_fetch_url_blocks_redirect_to_metadata_service(
         )
 
 
+def test_fetch_url_blocks_redirect_to_shared_address_space() -> None:
+    handler = web_tools_mod._SSRFCheckingRedirectHandler()
+
+    with pytest.raises(web_tools_mod.SSRFBlocked, match="non-public address"):
+        handler.redirect_request(
+            web_tools_mod.Request("https://example.com/"),
+            None,
+            302,
+            "Found",
+            {},
+            "http://100.64.0.1/internal",
+        )
+
+
 def test_fetch_url_rejects_public_redirect_not_on_exact_url_allowlist(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -656,9 +670,30 @@ async def test_fetch_url_content_length_precheck(
 
 
 class TestValidateFetchURL:
-    def test_passes_public_dns(self) -> None:
-        # example.com is a well-known public host.
-        web_tools_mod._validate_fetch_url("https://example.com/")
+    @pytest.mark.parametrize(
+        ("address", "allowed"),
+        [
+            ("100.64.0.1", False),
+            ("100.127.255.254", False),
+            ("::ffff:100.64.0.1", False),
+            ("64:ff9b::7f00:1", False),
+            ("2002:7f00:1::", False),
+            ("10.0.0.1", False),
+            ("172.16.0.1", False),
+            ("192.168.1.1", False),
+            ("169.254.169.254", False),
+            ("198.18.0.1", False),
+            ("::ffff:127.0.0.1", False),
+            ("fd00::1", False),
+            ("8.8.8.8", True),
+        ],
+    )
+    def test_public_address_verdicts(self, address: str, allowed: bool) -> None:
+        if allowed:
+            web_tools_mod._validate_public_host(address)
+        else:
+            with pytest.raises(web_tools_mod.SSRFBlocked):
+                web_tools_mod._validate_public_host(address)
 
     def test_blocks_non_http(self) -> None:
         with pytest.raises(web_tools_mod.SSRFBlocked):
