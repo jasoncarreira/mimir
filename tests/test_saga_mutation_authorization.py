@@ -333,8 +333,64 @@ async def test_missing_auth_fails_closed(client: SagaStore):
 
     result = await client.feedback([atom_id], "reply", feedback="positive")
 
-    assert result == {"marked": 0, "total": 1, "authorized": 0}
+    assert result == {
+        "marked": 0,
+        "total": 1,
+        "authorized": 0,
+        "status": "refused",
+        "reason": "invalid_auth_context",
+    }
     assert _feedback_count(client, atom_id) == 0
+
+
+@pytest.mark.asyncio
+async def test_service_missing_capability_emits_one_distinguishable_refusal(
+    client: SagaStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    atom_id = await _atom(client, "service target", owner="service:telemetry-test")
+    trigger = "test_saga_refusal_telemetry"
+    original = _TRUSTED_SERVICE_PRINCIPALS.get(trigger)
+    _TRUSTED_SERVICE_PRINCIPALS[trigger] = ServicePrincipal(
+        canonical="telemetry-test",
+        trigger=trigger,
+        capabilities=("memory_store",),
+        readable_domains=("saga",),
+        sink_destinations=("saga",),
+        creation_path="test",
+    )
+    events: list[tuple[str, dict]] = []
+    monkeypatch.setattr(
+        "mimir.event_logger.log_event_sync",
+        lambda event_type, **payload: events.append((event_type, payload)),
+    )
+    auth_context = _service_auth(trigger, "telemetry-test")
+    try:
+        refused = await client.feedback(
+            [atom_id], "reply", feedback="positive", auth_context=auth_context
+        )
+        nothing_requested = await client.feedback(
+            [], "reply", feedback="positive", auth_context=auth_context
+        )
+    finally:
+        if original is None:
+            _TRUSTED_SERVICE_PRINCIPALS.pop(trigger, None)
+        else:
+            _TRUSTED_SERVICE_PRINCIPALS[trigger] = original
+
+    assert refused["status"] == "refused"
+    assert "status" not in nothing_requested
+    assert events == [
+        (
+            "saga_mutation_refused",
+            {
+                "operation": "saga_feedback",
+                "canonical_principal": "telemetry-test",
+                "reason": "missing_operation_capability",
+                "requested_count": 1,
+            },
+        )
+    ]
 
 
 @pytest.mark.asyncio
@@ -364,7 +420,8 @@ async def test_regular_principal_denied_other_legacy_and_service_atoms(
             feedback="positive",
             auth_context=_auth("alice"),
         )
-        assert result == {"marked": 0, "total": 1, "authorized": 0}
+        assert result["status"] == "refused"
+        assert result["reason"] == "atom_outside_scope"
 
     allowed = await client.feedback(
         [own],
@@ -412,6 +469,8 @@ async def test_mixed_outcome_batch_fails_atomically(client: SagaStore):
         "total": 2,
         "signal": "negative",
         "authorized": 0,
+        "status": "refused",
+        "reason": "atom_outside_scope",
     }
     assert _feedback_count(client, own) == 0
 
@@ -480,7 +539,13 @@ async def test_forget_denies_unauthorized_dependent_observation_before_write(
 
     result = await client.forget(dry_run=False, auth_context=_auth("alice"))
 
-    assert result == {"tombstoned_count": 0, "preview_ids": [], "dry_run": False}
+    assert result == {
+        "tombstoned_count": 0,
+        "preview_ids": [],
+        "dry_run": False,
+        "status": "refused",
+        "reason": "atom_outside_scope",
+    }
     assert (
         conn.execute("SELECT tombstoned FROM atoms WHERE id = ?", (own,)).fetchone()[0]
         == 0
@@ -648,7 +713,8 @@ async def test_forgeable_read_scopes_cannot_authorize_mutation(
         auth_context=scope,
     )
 
-    assert result == {"marked": 0, "total": 1, "authorized": 0}
+    assert result["status"] == "refused"
+    assert result["reason"] == "invalid_auth_context"
 
 
 @pytest.mark.asyncio
@@ -681,7 +747,8 @@ async def test_platform_service_full_read_does_not_widen_mutation_scope(
         else:
             _TRUSTED_SERVICE_PRINCIPALS[trigger] = original
 
-    assert result == {"marked": 0, "total": 1, "authorized": 0}
+    assert result["status"] == "refused"
+    assert result["reason"] == "atom_outside_scope"
 
 
 @pytest.mark.asyncio
@@ -726,7 +793,8 @@ async def test_trusted_service_readable_domain_does_not_authorize_mutation(
             _TRUSTED_SERVICE_PRINCIPALS[trigger] = original
 
     assert allowed_result["marked"] == 1
-    assert denied_result == {"marked": 0, "total": 1, "authorized": 0}
+    assert denied_result["status"] == "refused"
+    assert denied_result["reason"] == "atom_outside_scope"
 
 
 @pytest.mark.asyncio
