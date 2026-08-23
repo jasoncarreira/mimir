@@ -1154,11 +1154,12 @@ async def test_slack_supervisor_fires_algedonic_after_three_attempts(monkeypatch
     bridge._RECONNECT_BACKOFF_CAP_SECONDS = 0.01
 
     attempts = {"n": 0}
+    hold_open = asyncio.Event()
 
     async def fake_start_async():
         attempts["n"] += 1
         if attempts["n"] >= 5:
-            return None
+            await hold_open.wait()
         raise SlackApiError(
             message="503", response={"ok": False, "error": "service_unavailable"},
         )
@@ -1172,14 +1173,23 @@ async def test_slack_supervisor_fires_algedonic_after_three_attempts(monkeypatch
     )
 
     bridge._runner = asyncio.create_task(bridge._supervised_run())
-    await asyncio.wait_for(bridge._runner, timeout=2.0)
+    for _ in range(100):
+        if attempts["n"] >= 5:
+            break
+        await asyncio.sleep(0.01)
+    assert attempts["n"] == 5
     for _ in range(20):
         await asyncio.sleep(0)
 
     retry_events = [(k, f) for k, f in captured if k == "slack_bridge_retry"]
-    assert len(retry_events) == 2  # attempts 3, 4 (5th succeeded)
+    assert len(retry_events) == 2  # attempts 3, 4; the fifth remains in progress
     assert retry_events[0][1]["attempt"] == 3
     assert retry_events[0][1]["slack_error"] == "service_unavailable"
+    assert not any(k == "bridge_exited" for k, _ in captured)
+
+    bridge._runner.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await bridge._runner
 
 
 @pytest.mark.asyncio
@@ -1192,11 +1202,16 @@ async def test_slack_supervisor_clean_exit_when_handler_returns(monkeypatch, tmp
     bridge._RECONNECT_BACKOFF_INITIAL_SECONDS = 0.01
 
     attempts = {"n": 0}
+    captured: list[tuple[str, dict]] = []
+
+    async def fake_log_event(kind: str, **fields):
+        captured.append((kind, fields))
 
     async def fake_start_async():
         attempts["n"] += 1
         return None
 
+    monkeypatch.setattr("mimir.bridges.slack._safe_log_event", fake_log_event)
     fake_handler = SimpleNamespace(start_async=fake_start_async, close_async=AsyncMock())
     bridge._app = SimpleNamespace(client=SimpleNamespace(auth_test=AsyncMock()))
     bridge._handler = fake_handler
@@ -1208,6 +1223,13 @@ async def test_slack_supervisor_clean_exit_when_handler_returns(monkeypatch, tmp
     bridge._runner = asyncio.create_task(bridge._supervised_run())
     await asyncio.wait_for(bridge._runner, timeout=1.0)
     assert attempts["n"] == 1
+    assert captured == [(
+        "bridge_exited",
+        {
+            "bridge": "slack",
+            "reason": "handler.start_async() returned cleanly",
+        },
+    )]
 
 
 @pytest.mark.asyncio
