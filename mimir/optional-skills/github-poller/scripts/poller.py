@@ -59,9 +59,11 @@ Output contract:
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import os
+import signal
 import subprocess
 import sys
 import time
@@ -277,6 +279,61 @@ def set_active_tick_budget(budget: "TickBudget | None") -> None:
     """Install (or clear) the budget that clamps `_gh_api` call timeouts."""
     global _ACTIVE_TICK_BUDGET
     _ACTIVE_TICK_BUDGET = budget
+
+
+class _DeadlineExceeded(Exception):
+    """A synchronous call outran the wall-clock deadline imposed on it."""
+
+
+@contextlib.contextmanager
+def _wall_clock_deadline(seconds: float):
+    """Impose a genuine total deadline on a blocking synchronous call.
+
+    ``urllib.request.urlopen(timeout=...)`` is a *socket-operation* timeout, not a
+    total one: a server trickling bytes keeps ``response.read()`` alive as long as
+    each individual read makes progress inside the timeout. Reserving the nominal
+    timeout as if it bounded the call is therefore unsound — the attestation can
+    outlive its reservation and carry the tick past the framework cap.
+
+    ``setitimer`` gives the real thing. Only usable on the main thread of the main
+    interpreter, which is what a poller subprocess is; if the platform or thread
+    cannot support it the deadline degrades to unenforced rather than raising, and
+    the caller keeps the budget check it already had.
+    """
+    def _fire(_signum, _frame):
+        raise _DeadlineExceeded
+
+    try:
+        previous = signal.signal(signal.SIGALRM, _fire)
+    except (ValueError, AttributeError, OSError):
+        yield False
+        return
+    signal.setitimer(signal.ITIMER_REAL, max(seconds, 0.001))
+    try:
+        yield True
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0.0)
+        signal.signal(signal.SIGALRM, previous)
+
+
+def _refused_window(
+    tick_budget: "TickBudget | None", data: object, pass_name: str,
+) -> bool:
+    """Whether a since-gated listing call came back empty because of the budget.
+
+    These passes rebuild their entire window from one listing call, so a refusal
+    is indistinguishable from "nothing new" at the call site — and advancing
+    ``last_checked`` past an uncollected window drops those events for good.
+    Only the caller knows its window is since-gated, which is why this is checked
+    here rather than inside ``_gh_api``.
+    """
+    if tick_budget is None or data is not None:
+        return False
+    if not tick_budget.hard_exhausted():
+        return False
+    tick_budget.hard_truncated = True
+    tick_budget.note_truncation(pass_name, 1)
+    return True
 
 
 def _hard_stop(tick_budget: "TickBudget | None", pass_name: str) -> bool:
@@ -612,6 +669,14 @@ def _gh_api(endpoint: str, token: str) -> list | dict | None:
                 # Past the hard deadline. Returning None is the same shape every
                 # caller already handles for an API failure, so cursor entries
                 # are preserved rather than rebuilt from a partial view.
+                #
+                # Deliberately does NOT mark the tick truncated: only the
+                # caller knows whether its window is since-gated. Marking here
+                # froze `last_checked` when a *reconcile* pass had a listing call
+                # refused, and those passes defer through their own cursors. The
+                # since-based passes check for this refusal themselves via
+                # ``_refused_window`` below.
+                budget.note_truncation("gh_api_refused", 1)
                 print(
                     f"gh api {endpoint} skipped: tick budget exhausted",
                     file=sys.stderr,
@@ -913,14 +978,11 @@ def _emit_signal(signal_type: str, **extras: object) -> None:
     )
 
 
-#: One trust attestation's worst case, matching `_github_api_attestation`'s own
-#: `timeout` default in `mimir.pollers`. If that default changes, this must too —
-#: it is the reservation that keeps the tick bounded across that boundary.
+#: Ceiling for one trust lookup, matching `_github_api_attestation`'s own
+#: `timeout` default in `mimir.pollers`. That default is a socket-operation
+#: timeout, not a total one, so it is enforced here with a real wall-clock
+#: deadline rather than trusted as a bound.
 TRUST_ATTESTATION_TIMEOUT_SECONDS = 10.0
-#: `_github_content_author` makes one attestation; `_github_author_is_trusted`
-#: makes up to two (collaborator, then org membership).
-AUTHOR_LOOKUP_WORST_CASE_SECONDS = TRUST_ATTESTATION_TIMEOUT_SECONDS
-TRUST_LOOKUP_WORST_CASE_SECONDS = 2 * TRUST_ATTESTATION_TIMEOUT_SECONDS
 
 
 def _pr_author_is_trusted(
@@ -945,26 +1007,45 @@ def _pr_author_is_trusted(
     ``_gh_api``'s subprocess, so it needs its own budget plumbing — bounding only
     the `gh api` transport left this one free to overrun the tick.
     """
-    def _affords(worst_case: float) -> bool:
-        return tick_budget is None or tick_budget.affords(worst_case)
+    def _allowance() -> float | None:
+        """Wall-clock seconds this lookup may take, or None to skip it."""
+        if tick_budget is None:
+            return TRUST_ATTESTATION_TIMEOUT_SECONDS
+        return tick_budget.call_timeout(
+            ceiling=TRUST_ATTESTATION_TIMEOUT_SECONDS,
+        )
 
+    # A cached author costs nothing and is never gated.
     author_key = (repo, number)
     if author_key not in trust_cache:
-        # Only start a lookup that can finish inside the hard deadline. A cached
-        # author costs nothing and is never gated.
-        if not _affords(AUTHOR_LOOKUP_WORST_CASE_SECONDS):
+        allowed = _allowance()
+        if allowed is None:
             return None
-        trust_cache[author_key] = _github_content_author(
-            repo,
-            {"event_type": "pr_opened", "url": url},
-            token,
-        )
+        try:
+            with _wall_clock_deadline(allowed):
+                resolved = _github_content_author(
+                    repo,
+                    {"event_type": "pr_opened", "url": url},
+                    token,
+                )
+        except _DeadlineExceeded:
+            # Unresolved, not untrusted — see the tri-state note above. Do not
+            # cache: the next tick should retry rather than inherit a verdict
+            # produced by a timeout.
+            return None
+        trust_cache[author_key] = resolved
     author = trust_cache[author_key]
     trust_key = (repo, author if isinstance(author, str) else "")
     if trust_key not in trust_cache:
-        if not _affords(TRUST_LOOKUP_WORST_CASE_SECONDS):
+        allowed = _allowance()
+        if allowed is None:
             return None
-        trust_cache[trust_key] = _github_author_is_trusted(repo, author, token)
+        try:
+            with _wall_clock_deadline(allowed):
+                trusted = _github_author_is_trusted(repo, author, token)
+        except _DeadlineExceeded:
+            return None
+        trust_cache[trust_key] = trusted
     return trust_cache[trust_key] is True
 
 
@@ -1084,7 +1165,10 @@ def _surface_untrusted_pr_once(
 # ─── per-resource checks ──────────────────────────────────────────────
 
 
-def _check_issues(repo: str, since: str, token: str, me: str) -> int:
+def _check_issues(
+    repo: str, since: str, token: str, me: str,
+    *, tick_budget: "TickBudget | None" = None,
+) -> int:
     """New issues (NOT PRs — GitHub's /issues endpoint returns both;
     we filter PRs out via the ``pull_request`` field)."""
     data = _gh_api(
@@ -1093,6 +1177,7 @@ def _check_issues(repo: str, since: str, token: str, me: str) -> int:
         token,
     )
     if not isinstance(data, list):
+        _refused_window(tick_budget, data, "issues_window")
         return 0
     count = 0
     for issue in data:
@@ -1136,6 +1221,7 @@ def _check_prs(
         token,
     )
     if not isinstance(data, list):
+        _refused_window(tick_budget, data, "prs_window")
         return 0
     trust_cache = trust_cache if trust_cache is not None else {}
     surfaced_untrusted = surfaced_untrusted if surfaced_untrusted is not None else set()
@@ -1321,7 +1407,10 @@ def _check_issue_comments(
     return count
 
 
-def _check_pr_review_comments(repo: str, since: str, token: str, me: str) -> int:
+def _check_pr_review_comments(
+    repo: str, since: str, token: str, me: str,
+    *, tick_budget: "TickBudget | None" = None,
+) -> int:
     """New PR review comments — these are INLINE diff comments,
     distinct from issue/PR conversation comments. The bulk of code
     review feedback lives here. Open-strix's poller missed this
@@ -1332,6 +1421,7 @@ def _check_pr_review_comments(repo: str, since: str, token: str, me: str) -> int
         token,
     )
     if not isinstance(data, list):
+        _refused_window(tick_budget, data, "review_comments_window")
         return 0
     count = 0
     for comment in data:
@@ -2740,6 +2830,7 @@ def _check_pr_reviews(
         token,
     )
     if not isinstance(prs, list):
+        _refused_window(tick_budget, prs, "pr_reviews_window")
         return 0
     count = 0
     for pr in prs:
@@ -2895,7 +2986,7 @@ def main() -> None:
     total = 0
     for repo in repos:
         print(f"Checking {repo} since {since}...", file=sys.stderr)
-        total += _check_issues(repo, since, token, me)
+        total += _check_issues(repo, since, token, me, tick_budget=budget)
         surfaced_untrusted = {
             str(value) for value in (untrusted_all.get(repo, []) or [])
             if isinstance(value, (str, int)) and not isinstance(value, bool)
@@ -2911,7 +3002,9 @@ def main() -> None:
             tick_budget=budget,
         )
         total += pr_opened_count
-        total += _check_pr_review_comments(repo, since, token, me)
+        total += _check_pr_review_comments(
+            repo, since, token, me, tick_budget=budget,
+        )
         total += _check_pr_reviews(repo, since, token, me, tick_budget=budget)
         repo_heads = pr_heads_all.get(repo, {}) or {}
         repo_rr = _coerce_review_requests(rr_all.get(repo))

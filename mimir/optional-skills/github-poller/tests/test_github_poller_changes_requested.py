@@ -1295,52 +1295,69 @@ _REAL_TRUST_RESOLVER = poller._pr_author_is_trusted
 
 
 def test_slow_trust_attestations_cannot_overrun_the_tick(monkeypatch, tmp_path):
-    """The second GitHub transport.
+    """The second GitHub transport, bounded by enforcement rather than trust.
 
-    `_check_prs` and `_check_pr_pushes` resolve author trust through
-    `mimir.pollers._github_content_author` / `_github_author_is_trusted`, which
-    reach GitHub over `urllib` with their own 10s timeouts — not through
-    `_gh_api`'s subprocess. Clamping only `_gh_api` left this path free to carry
-    the tick past the framework cap.
+    `_check_prs` / `_check_pr_pushes` resolve author trust through
+    `mimir.pollers._github_content_author` / `_github_author_is_trusted`, which go
+    out over `urllib` — not through `_gh_api`'s subprocess. Their nominal 10s
+    `urlopen` timeout is a *socket-operation* timeout, so a trickling response can
+    outlive it; reserving that number as a bound would be unsound. A real
+    wall-clock deadline is imposed instead.
 
-    It is bounded by reserving each lookup's worst case rather than by passing a
-    timeout across the module boundary: doing the latter would make the installed
-    skill script require a matching `mimir` package, and a live dry run against a
-    slightly older checkout failed with exactly that `TypeError`.
+    The fake here sleeps far longer than the allowance, which no socket timeout
+    would catch, so this fails unless the deadline is genuinely enforced.
     """
     import time as _time
 
     monkeypatch.setattr(poller, "_pr_author_is_trusted", _REAL_TRUST_RESOLVER)
-    # Scale the reservations with the scaled deadlines, or every lookup is
-    # refused before it starts and the test silently proves nothing.
-    monkeypatch.setattr(poller, "AUTHOR_LOOKUP_WORST_CASE_SECONDS", 0.06)
-    monkeypatch.setattr(poller, "TRUST_LOOKUP_WORST_CASE_SECONDS", 0.12)
+    monkeypatch.setattr(poller, "TRUST_ATTESTATION_TIMEOUT_SECONDS", 0.05)
     started: list[str] = []
 
-    def slow_author(repo, extras, token):
+    def very_slow_author(repo, extras, token):
         started.append("author")
-        _time.sleep(0.05)
+        _time.sleep(5.0)  # >> the allowance; only a real deadline stops this
         return "outside-contributor"
 
-    def slow_trust(repo, author, token):
-        started.append("trust")
-        _time.sleep(0.05)
-        return True
-
-    monkeypatch.setattr(poller, "_github_content_author", slow_author)
-    monkeypatch.setattr(poller, "_github_author_is_trusted", slow_trust)
-
-    elapsed, _calls, saved = _slow_main_harness(
-        monkeypatch, tmp_path, n_prs=150, call_seconds=0.01,
-        soft=0.3, hard=0.5, author="outside-contributor",
+    monkeypatch.setattr(poller, "_github_content_author", very_slow_author)
+    monkeypatch.setattr(
+        poller, "_github_author_is_trusted", lambda *a: True,
     )
 
-    assert elapsed < 1.2, f"tick ran {elapsed:.2f}s; trust path not bounded"
-    assert len(saved) == 1
-    # The transport was genuinely exercised...
+    elapsed, _calls, saved = _slow_main_harness(
+        monkeypatch, tmp_path, n_prs=4, call_seconds=0.0,
+        soft=30.0, hard=30.0, author="outside-contributor",
+    )
+
     assert started, "trust path never reached — the test cannot see the bug"
-    # ...and stopped well short of one lookup per PR, which unbounded would be.
-    assert len(started) < 40, f"{len(started)} lookups; headroom not reserved"
+    # Without enforcement this is >=5s per uncached author; with it, each lookup
+    # is cut at ~0.05s.
+    assert elapsed < 3.0, f"tick ran {elapsed:.2f}s; deadline not enforced"
+    assert len(saved) == 1
+
+
+def test_deadline_exceeded_trust_lookup_is_unresolved_not_untrusted(monkeypatch):
+    """A lookup cut off by the deadline must not be cached or classified.
+
+    Collapsing it to False would surface a trusted contributor's PR as untrusted
+    and record the verdict; caching the timed-out result would make the next tick
+    inherit it instead of retrying.
+    """
+    import time as _time
+
+    monkeypatch.setattr(poller, "TRUST_ATTESTATION_TIMEOUT_SECONDS", 0.05)
+    monkeypatch.setattr(
+        poller, "_github_content_author",
+        lambda *a: _time.sleep(5.0) or "outside-contributor",
+    )
+    monkeypatch.setattr(poller, "_github_author_is_trusted", lambda *a: True)
+
+    cache: dict = {}
+    verdict = _REAL_TRUST_RESOLVER(
+        "o/r", 700, "https://github.com/o/r/pull/700", "tok", cache,
+        tick_budget=poller.TickBudget(hard_deadline_seconds=600.0),
+    )
+    assert verdict is None, "a timed-out lookup was classified"
+    assert cache == {}, "a timed-out lookup was cached"
 
 
 def test_unresolvable_trust_skips_the_pr_instead_of_marking_it_untrusted(
@@ -1474,3 +1491,48 @@ def test_pushes_trust_denial_does_not_freeze_the_watermark(monkeypatch):
         tick_budget=spent_prs,
     )
     assert spent_prs.hard_truncated is True
+
+
+def test_refused_listing_holds_the_watermark_only_for_since_gated_passes(
+    monkeypatch,
+):
+    """The discriminating pair.
+
+    A since-gated pass rebuilds its entire window from one listing call and cannot
+    tell a refusal from "nothing new", so a refusal there must hold
+    `last_checked`. `_check_pr_review_comments` is the sharp case — its docstring
+    calls it the bulk of review feedback, and it had no budget plumbing at all.
+
+    A reconcile pass defers through its own dedupe cursor, so a refusal there must
+    NOT hold the watermark. Marking inside `_gh_api` instead of at the call site
+    got this wrong: one refused listing call in the last reconcile pass froze the
+    window on an ordinary 50s tick.
+    """
+    made: list[str] = []
+    monkeypatch.setattr(
+        poller, "_gh_api", lambda ep, tok: made.append(ep) or None,
+    )
+    monkeypatch.setattr(poller, "_emit", lambda *a, **k: None)
+    monkeypatch.setattr(poller, "_emit_signal", lambda *a, **k: None)
+
+    # Since-gated: holds.
+    since_budget = poller.TickBudget(hard_deadline_seconds=0.0)
+    poller._check_pr_review_comments(
+        "o/r", "2026-08-23T10:00:00Z", "tok", "mimir-bot",
+        tick_budget=since_budget,
+    )
+    assert since_budget.hard_truncated is True, (
+        "a refused since-gated window did not hold the watermark"
+    )
+
+    # Reconcile: does not hold — it defers through its own cursor.
+    prior = {"700": _entry("a" * 40)}
+    recon_budget = poller.TickBudget(hard_deadline_seconds=0.0)
+    _count, cursor = poller._check_own_changes_requested(
+        "o/r", "tok", "mimir-bot", prior, now=NOW, tick_budget=recon_budget,
+    )
+    assert recon_budget.hard_truncated is False, (
+        "a refused reconcile listing froze the watermark"
+    )
+    # ...and its prior state survives, which is what makes that safe.
+    assert cursor == prior
