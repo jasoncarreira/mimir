@@ -289,14 +289,20 @@ def maybe_create_worklink_budget_continuation(
         issue_id=validated_issue_id,
         repo=validated_repo,
         pr_url=validated_pr_url,
-        worktree=validated_worktree,
-        branch=current_branch,
         source_id=event.source_id,
         turn_id=ctx.turn_id or record.turn_id,
     )
 
     path = continuation_sidecar_path(home, idempotency_key)
     existing = _load_json_dict(path)
+    if path.exists() and existing is None:
+        raise RuntimeError(f"refusing to replace unreadable continuation sidecar: {path}")
+    if existing is not None and (
+        existing.get("idempotency_key") != idempotency_key
+        or existing.get("dedupe_scope") != dedupe_scope
+        or existing.get("dedupe_material") != dedupe_material
+    ):
+        raise RuntimeError(f"refusing continuation sidecar identity collision: {path}")
     # A later exhaustion after work landed is a new occurrence window. Reuse the
     # stable filename, but not the old window's comment/action dedupe state.
     if existing and existing.get("resolved_at"):
@@ -1011,8 +1017,6 @@ def _idempotency(
     issue_id: int | None,
     repo: str | None,
     pr_url: str | None,
-    worktree: Path | None,
-    branch: str | None,
     source_id: str | None,
     turn_id: str | None,
 ) -> tuple[str, str, Any]:
@@ -1021,13 +1025,8 @@ def _idempotency(
         return _hash_material(material), "issue", material
     if pr_url is not None:
         return _hash_material(pr_url), "pr", pr_url
-    if worktree is not None and branch:
-        material = {
-            "scope": "worktree_branch",
-            "worktree": str(worktree),
-            "branch": branch,
-        }
-        return _hash_material(material), "worktree_branch", material
+    # The production checkout and branch identify the long-lived server, not the
+    # work. An inbound source id is the stable work identity across its turns.
     if source_id:
         return _hash_material(source_id), "source_id", source_id
     material = turn_id or "unknown-turn"

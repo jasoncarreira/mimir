@@ -325,7 +325,7 @@ def test_generic_high_priority_fallback_when_issue_pr_unknown(tmp_path: Path) ->
     payload = json.loads(result.sidecar_path.read_text(encoding="utf-8"))
     assert payload["association"]["issue_id"] is None
     assert payload["association"]["pr_url"] is None
-    assert payload["dedupe_scope"] == "worktree_branch"
+    assert payload["dedupe_scope"] == "source_id"
     assert payload["priority"] == "high"
     assert payload["association"]["branch"] == "feature/worklink-recovery"
     assert payload["external_comment"]["posted"] is False
@@ -335,6 +335,119 @@ def test_generic_high_priority_fallback_when_issue_pr_unknown(tmp_path: Path) ->
         for item in payload["next"]["labels_or_status_changes_needed"]
     )
     assert runner.issue_comments == []
+
+
+def test_unknown_production_continuations_use_work_identity_not_server_checkout(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    server_checkout = _init_repo(tmp_path, branch="feature/worklink-recovery")
+
+    results = []
+    for source_id, turn_id, content in (
+        ("work-a", "turn-a", "generic worklink follow-up A"),
+        ("work-b", "turn-b", "generic worklink follow-up B"),
+    ):
+        event = _make_event(content=content, source_id=source_id)
+        results.append(
+            maybe_create_worklink_budget_continuation(
+                home=home,
+                event=event,
+                ctx=_make_ctx(event, turn_id=turn_id),
+                record=_make_record(event, turn_id=turn_id, input_text=content),
+                repo=server_checkout,
+                current_worktree=server_checkout,
+                runner=SpyRunner(),
+            )
+        )
+
+    assert all(result is not None for result in results)
+    assert results[0].sidecar_path != results[1].sidecar_path
+    sidecars = sorted((home / "state" / "worklink" / "continuations").glob("*.json"))
+    assert len(sidecars) == 2
+    payloads = [json.loads(path.read_text(encoding="utf-8")) for path in sidecars]
+    assert {payload["dedupe_scope"] for payload in payloads} == {"source_id"}
+    assert {payload["source_event"]["source_id"] for payload in payloads} == {
+        "work-a",
+        "work-b",
+    }
+
+
+def test_unknown_same_source_work_merges_across_turns(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    server_checkout = _init_repo(tmp_path, branch="feature/worklink-recovery")
+    results = []
+
+    for turn_id in ("turn-a", "turn-b"):
+        event = _make_event(content="generic worklink follow-up", source_id="same-work")
+        results.append(
+            maybe_create_worklink_budget_continuation(
+                home=home,
+                event=event,
+                ctx=_make_ctx(event, turn_id=turn_id),
+                record=_make_record(event, turn_id=turn_id, input_text=event.content),
+                repo=server_checkout,
+                current_worktree=server_checkout,
+                runner=SpyRunner(),
+            )
+        )
+
+    assert all(result is not None for result in results)
+    assert results[0].sidecar_path == results[1].sidecar_path
+    payload = json.loads(results[1].sidecar_path.read_text(encoding="utf-8"))
+    assert payload["occurrences"] == 2
+    assert {turn["turn_id"] for turn in payload["turns"]} == {"turn-a", "turn-b"}
+
+
+def test_unknown_work_without_source_id_uses_turn_id(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    server_checkout = _init_repo(tmp_path, branch="feature/worklink-recovery")
+    event = _make_event(content="generic worklink follow-up", source_id=None)
+
+    result = maybe_create_worklink_budget_continuation(
+        home=home,
+        event=event,
+        ctx=_make_ctx(event, turn_id="fallback-turn"),
+        record=_make_record(event, turn_id="fallback-turn", input_text=event.content),
+        repo=server_checkout,
+        current_worktree=server_checkout,
+        runner=SpyRunner(),
+    )
+
+    assert result is not None
+    assert result.payload["dedupe_scope"] == "turn_id"
+    assert result.payload["dedupe_material"] == "fallback-turn"
+
+
+def test_existing_sidecar_identity_mismatch_is_refused(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    server_checkout = _init_repo(tmp_path, branch="feature/worklink-recovery")
+    event = _make_event(content="generic worklink follow-up", source_id="stable-work")
+    kwargs = {
+        "home": home,
+        "event": event,
+        "ctx": _make_ctx(event, turn_id="turn-a"),
+        "record": _make_record(event, turn_id="turn-a", input_text=event.content),
+        "repo": server_checkout,
+        "current_worktree": server_checkout,
+        "runner": SpyRunner(),
+    }
+    first = maybe_create_worklink_budget_continuation(**kwargs)
+    assert first is not None
+    collided = dict(first.payload)
+    collided["dedupe_material"] = "different-work"
+    collided["source_event"] = {"source_id": "different-work"}
+    first.sidecar_path.write_text(json.dumps(collided), encoding="utf-8")
+
+    with pytest.raises(RuntimeError, match="identity collision"):
+        maybe_create_worklink_budget_continuation(**kwargs)
+
+    retained = json.loads(first.sidecar_path.read_text(encoding="utf-8"))
+    assert retained["source_event"] == {"source_id": "different-work"}
 
 
 def test_generic_continuation_never_reads_legacy_factory_directory(
