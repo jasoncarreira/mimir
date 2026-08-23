@@ -225,7 +225,7 @@ def _actionable_issue_ids(home: Path) -> list[int] | None:
 
 def _worklink_dispatch_plan(
     home: Path, *, active_lock_ids: set[int]
-) -> tuple[list[DispatchItem], int, int, set[int]] | None:
+) -> tuple[list[DispatchItem], int, int, int, set[int]] | None:
     ready_records = _issue_records_with_label(home, READY_LABEL)
     epic_records = _issue_records_with_label(home, EPIC_LABEL)
     blocked_records = _issue_records_with_label(home, BLOCKED_LABEL)
@@ -266,7 +266,7 @@ def _worklink_dispatch_plan(
     plan = [DispatchItem(issue_id, "leaf") for issue_id in leaves]
     if _factory_epics_enabled():
         plan.extend(DispatchItem(issue_id, "epic") for issue_id in factory_epics)
-    return plan, len(labeled), len(labeled - actionable), epics
+    return plan, len(labeled), len(labeled - actionable), len(labeled & blocked), epics
 
 
 def _configured_cap(home: Path) -> int:
@@ -443,7 +443,13 @@ def main() -> int:
             }
         )
         return 0
-    ready, labeled_ready_count, blocked_ready_count, epic_ids = ready_result
+    (
+        ready,
+        labeled_ready_count,
+        blocked_ready_count,
+        label_blocked_ready_count,
+        epic_ids,
+    ) = ready_result
     actionable_epic_count = len(epic_ids)
     dispatch_ready = [item for item in ready if item.issue_id not in backed_off_ids]
     leaf_cap = _configured_cap(home)
@@ -463,6 +469,7 @@ def main() -> int:
                 "ready_count": len(ready),
                 "labeled_ready_count": labeled_ready_count,
                 "blocked_ready_count": blocked_ready_count,
+                "label_blocked_ready_count": label_blocked_ready_count,
                 "actionable_epic_count": actionable_epic_count,
                 "active": active,
                 "cap": leaf_cap,
@@ -494,6 +501,7 @@ def main() -> int:
             "ready_count": len(ready),
             "labeled_ready_count": labeled_ready_count,
             "blocked_ready_count": blocked_ready_count,
+            "label_blocked_ready_count": label_blocked_ready_count,
             "actionable_epic_count": actionable_epic_count,
             "active": active,
             "cap": leaf_cap,

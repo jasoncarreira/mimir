@@ -1724,6 +1724,12 @@ def test_poller_excludes_worklink_blocked_from_leaf_and_epic_dispatch(tmp_path: 
         if event.get("signal") == "worklink_dispatched"
     ]
     assert dispatched == [("leaf", 201), ("epic", 101)]
+    scan = [
+        event for event in events if event.get("signal") == "worklink_ready_scan"
+    ][-1]
+    assert scan["labeled_ready_count"] == 4
+    assert scan["blocked_ready_count"] == 0
+    assert scan["label_blocked_ready_count"] == 2
 
 
 def test_poller_keeps_bare_ready_leaf_on_per_leaf_run(tmp_path: Path) -> None:
