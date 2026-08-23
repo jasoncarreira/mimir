@@ -51,17 +51,20 @@ lock across the (potentially many) LLM synthesis calls.
 from __future__ import annotations
 
 import json
+import logging
 import sqlite3
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Callable
 
-from .mark_access import AccessEvent, mark_access
 from .observations import (
     find_equal_evidence_obs, find_superseded_observations, refresh_trend,
 )
 from .ownership import Ownership, intersect_acl_from_rows
-from .store import store
+from .store import StoreResult, store
+
+
+logger = logging.getLogger("mimir.saga.consolidate")
 
 
 # Default cadence. Weekly is appropriate for a single-agent workload —
@@ -112,8 +115,108 @@ class ConsolidateResult:
     skipped_already_covered: int = 0
 
 
+@dataclass(frozen=True)
+class EmittedObservation:
+    observation_id: str
+    superseded_ids: list[str]
+
+
 def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def emit_observation(
+    conn: sqlite3.Connection,
+    *,
+    evidence_ids: list[str],
+    store_observation: Callable[[], StoreResult],
+    extra_writes: Callable[[str], None] | None = None,
+    now: str | None = None,
+) -> EmittedObservation | None:
+    """Store and link one observation, repairing or tombstoning split writes."""
+    store_result = store_observation()
+    if not store_result.stored:
+        repairable = conn.execute(
+            "SELECT 1 FROM atoms a "
+            "WHERE a.id = ? AND a.memory_type = 'observation' "
+            "AND a.tombstoned = 0 "
+            "AND NOT EXISTS ("
+            "  SELECT 1 FROM atom_relations ar "
+            "  WHERE ar.source_id = a.id "
+            "    AND ar.relation_type = 'evidenced_by'"
+            ") AND NOT EXISTS ("
+            "  SELECT 1 FROM observations_metadata om "
+            "  WHERE om.atom_id = a.id"
+            ")",
+            (store_result.atom_id,),
+        ).fetchone()
+        if repairable is None:
+            return None
+
+    observation_id = store_result.atom_id
+    emitted_at = now or _utc_now_iso()
+    began = False
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        began = True
+        conn.executemany(
+            "INSERT INTO atom_relations "
+            "(source_id, target_id, relation_type, confidence, created_at) "
+            "VALUES (?, ?, 'evidenced_by', 1.0, ?)",
+            [(observation_id, raw_id, emitted_at) for raw_id in evidence_ids],
+        )
+        conn.executemany(
+            "INSERT INTO atom_relations "
+            "(source_id, target_id, relation_type, confidence, created_at) "
+            "VALUES (?, ?, 'consolidated_into', 1.0, ?)",
+            [(raw_id, observation_id, emitted_at) for raw_id in evidence_ids],
+        )
+        superseded = find_superseded_observations(
+            conn, observation_id, set(evidence_ids),
+        )
+        for old_obs_id in superseded:
+            conn.execute(
+                "INSERT OR IGNORE INTO atom_relations "
+                "(source_id, target_id, relation_type, confidence, "
+                "created_at, metadata) "
+                "VALUES (?, ?, 'supersedes', 1.0, ?, ?)",
+                (
+                    observation_id, old_obs_id, emitted_at,
+                    json.dumps({"trigger": "consolidate"}),
+                ),
+            )
+        conn.execute(
+            "INSERT INTO observations_metadata "
+            "(atom_id, evidence_count, trend, last_evidence_at, "
+            "consolidated_at) VALUES (?, ?, ?, ?, ?)",
+            (
+                observation_id, len(evidence_ids), "strengthening",
+                emitted_at, emitted_at,
+            ),
+        )
+        if extra_writes:
+            extra_writes(observation_id)
+        conn.commit()
+    except Exception:
+        if began:
+            conn.rollback()
+        tombstone_began = False
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            tombstone_began = True
+            conn.execute("UPDATE atoms SET tombstoned=1 WHERE id=?", (observation_id,))
+            conn.commit()
+        except Exception:
+            if tombstone_began:
+                conn.rollback()
+            logger.warning(
+                "failed to tombstone orphaned observation %s after emit rollback",
+                observation_id,
+                exc_info=True,
+            )
+        raise
+
+    return EmittedObservation(observation_id, superseded)
 
 
 def _compute_intersected_acl(
@@ -331,84 +434,33 @@ def consolidate(
         if not content or not content.strip():
             continue
 
-        # store() opens its own transaction.
-        store_result = store(
-            conn, content,
-            embed_fn=embed_fn,
-            memory_type="observation",
-            stream="semantic",
-            topics=topics,
-            agent_id=agent_id,
-            # session_id intentionally None — this observation is
-            # cross-session by construction. The atom is created
-            # outside any session's scope.
-            session_id=None,
-            owner_principal=intersected_acl.owner_principal,
-            origin_channel=intersected_acl.origin_channel,
-            origin_domain=intersected_acl.origin_domain,
-            visibility=intersected_acl.visibility,
-            provenance=intersected_acl.provenance,
+        emitted = emit_observation(
+            conn,
+            evidence_ids=evidence_ids,
+            store_observation=lambda: store(
+                conn, content,
+                embed_fn=embed_fn,
+                memory_type="observation",
+                stream="semantic",
+                topics=topics,
+                agent_id=agent_id,
+                session_id=None,
+                owner_principal=intersected_acl.owner_principal,
+                origin_channel=intersected_acl.origin_channel,
+                origin_domain=intersected_acl.origin_domain,
+                visibility=intersected_acl.visibility,
+                provenance=intersected_acl.provenance,
+            ),
         )
-        if not store_result.stored:
-            # Content-hash dedupe hit on the observation. Relations
-            # were already in place from the prior cluster pass; no
-            # access_event fired (consolidation stays out of activation).
+        if emitted is None:
             continue
-
-        observation_id = store_result.atom_id
-        now = _utc_now_iso()
-
-        # One transaction for the observation's relations + access
-        # events + metadata.
-        try:
-            conn.execute("BEGIN IMMEDIATE")
-            conn.executemany(
-                "INSERT INTO atom_relations "
-                "(source_id, target_id, relation_type, confidence, created_at) "
-                "VALUES (?, ?, 'evidenced_by', 1.0, ?)",
-                [(observation_id, raw_id, now) for raw_id in evidence_ids],
-            )
-            conn.executemany(
-                "INSERT INTO atom_relations "
-                "(source_id, target_id, relation_type, confidence, created_at) "
-                "VALUES (?, ?, 'consolidated_into', 1.0, ?)",
-                [(raw_id, observation_id, now) for raw_id in evidence_ids],
-            )
-            # No mark_access on evidence raws: consolidation is
-            # system-internal. The evidence_boost on retrieval is the
-            # only ranking signal consolidation produces; activation
-            # stays a pure external-access record.
-
-            superseded = find_superseded_observations(
-                conn, observation_id, set(evidence_ids),
-            )
-            for old_obs_id in superseded:
-                conn.execute(
-                    "INSERT OR IGNORE INTO atom_relations "
-                    "(source_id, target_id, relation_type, confidence, "
-                    "created_at, metadata) "
-                    "VALUES (?, ?, 'supersedes', 1.0, ?, ?)",
-                    (observation_id, old_obs_id, now,
-                     json.dumps({"trigger": "consolidate"})),
-                )
-
-            conn.execute(
-                "INSERT INTO observations_metadata "
-                "(atom_id, evidence_count, trend, last_evidence_at, "
-                "consolidated_at) VALUES (?, ?, ?, ?, ?)",
-                (observation_id, len(evidence_ids),
-                 "strengthening", now, now),
-            )
-            conn.commit()
-        except Exception:
-            conn.rollback()
-            raise
+        observation_id = emitted.observation_id
 
         # Trend recompute in its own short txn.
         refresh_trend(conn, observation_id)
 
         result.observations_emitted.append(observation_id)
-        for old_id in superseded:
+        for old_id in emitted.superseded_ids:
             result.observations_superseded.append((observation_id, old_id))
 
     return result
