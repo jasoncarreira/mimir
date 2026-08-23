@@ -851,19 +851,23 @@ class WorklinkRunner:
                 worker_required and result.review_ready and result.pr_url
             )
             if delete_authorized_checkout and publication is not None:
-                try:
-                    publication.run("update-ref", "-d", f"refs/heads/{lease.branch}", check=True)
-                except Exception as exc:
-                    error = f"authorized branch cleanup: {exc}"
-                    _record_post_publication_error(
-                        error,
-                        issue_id=issue.issue_id,
-                        attempt=record.attempt,
-                        pr_url=result.pr_url,
-                    )
+                cleanup_errors: list[str] = []
+                _run_post_publication_bookkeeping(
+                    "authorized branch cleanup",
+                    lambda: publication.run(
+                        "update-ref", "-d", f"refs/heads/{lease.branch}", check=True
+                    ),
+                    issue_id=issue.issue_id,
+                    attempt=record.attempt,
+                    pr_url=result.pr_url,
+                    errors=cleanup_errors,
+                )
+                if cleanup_errors:
                     result = replace(
                         result,
-                        reason=_append_post_publication_error(result.reason, error),
+                        reason=_append_post_publication_error(
+                            result.reason, "; ".join(cleanup_errors)
+                        ),
                     )
             return result
         except Exception as exc:
@@ -1076,18 +1080,14 @@ class WorklinkRunner:
         post_publication_errors: list[str] = []
 
         def run_bookkeeping(name: str, action: Callable[[], Any]) -> Any | None:
-            try:
-                return action()
-            except Exception as exc:
-                error = f"{name}: {exc}"
-                post_publication_errors.append(error)
-                _record_post_publication_error(
-                    error,
-                    issue_id=issue.issue_id,
-                    attempt=attempt,
-                    pr_url=pr_url,
-                )
-                return None
+            return _run_post_publication_bookkeeping(
+                name,
+                action,
+                issue_id=issue.issue_id,
+                attempt=attempt,
+                pr_url=pr_url,
+                errors=post_publication_errors,
+            )
 
         if pr_url:
             written_path = run_bookkeeping(
@@ -2620,6 +2620,30 @@ def _cleanup_checkout_after_transition(
         )
         return error
     return None
+
+
+def _run_post_publication_bookkeeping(
+    name: str,
+    action: Callable[[], Any],
+    *,
+    issue_id: int,
+    attempt: int,
+    pr_url: str | None,
+    errors: list[str],
+) -> Any | None:
+    """Run secondary publication work without reopening the failure path."""
+    try:
+        return action()
+    except Exception as exc:
+        error = f"{name}: {exc}"
+        errors.append(error)
+        _record_post_publication_error(
+            error,
+            issue_id=issue_id,
+            attempt=attempt,
+            pr_url=pr_url,
+        )
+        return None
 
 
 def _append_post_publication_error(reason: str | None, error: str) -> str:

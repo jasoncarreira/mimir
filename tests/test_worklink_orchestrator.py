@@ -5299,6 +5299,7 @@ def test_worker_capability_cleanup_tolerates_entry_removed_concurrently(
         "push_exception",
         "pr_exception",
         "publication_exception",
+        "branch_cleanup_exception",
     ],
 )
 def test_authorized_runner_closes_real_attempt_capabilities(
@@ -5371,6 +5372,11 @@ def test_authorized_runner_closes_real_attempt_capabilities(
                 return cp(args)
             if args == ("rev-parse", "HEAD"):
                 return cp(args, stdout="a" * 40 + "\n")
+            if (
+                args[:2] == ("update-ref", "-d")
+                and scenario == "branch_cleanup_exception"
+            ):
+                raise RuntimeError("branch cleanup failed")
             return cp(args)
 
         def push(self):
@@ -5535,9 +5541,11 @@ def test_authorized_runner_closes_real_attempt_capabilities(
     assert lifecycle[-2:] == ["publication", "authorization"]
     assert publication.closed == 1
     assert authorization.closed == 1
-    expected_success = scenario == "success"
-    assert result.status == ("completed" if expected_success else ("blocked" if scenario == "blocked" else "failed"))
-    assert checkout.exists() is (not expected_success)
+    expected_published = scenario in {"success", "branch_cleanup_exception"}
+    assert result.status == (
+        "completed" if expected_published else ("blocked" if scenario == "blocked" else "failed")
+    )
+    assert checkout.exists() is (not expected_published)
     expected_launches = {
         "work_spec_exception": 0,
         "pre_launch_exception": 1,
@@ -5547,6 +5555,7 @@ def test_authorized_runner_closes_real_attempt_capabilities(
         "blocked": 2,
         "commit_exception": 2,
         "success": 3,
+        "branch_cleanup_exception": 3,
         "push_exception": 3,
         "pr_exception": 3,
     }
@@ -5554,7 +5563,7 @@ def test_authorized_runner_closes_real_attempt_capabilities(
     if bound_specs:
         assert "PYTEST_ADDOPTS" in bound_specs[0].env
         assert bound_specs[0].backend_config["pass_env"] == ("PYTEST_ADDOPTS",)
-    if scenario == "success":
+    if expected_published:
         assert bound_specs[0].local_argv == ("opencode", "run")
         assert all(
             spec.local_argv == ("/bin/sh", "-c", "pytest -q")
@@ -5565,3 +5574,13 @@ def test_authorized_runner_closes_real_attempt_capabilities(
             ("123e4567-e89b-42d3-a456-426614174003", 202, 102),
         ]
         assert ("push",) in publication.calls
+    if scenario == "branch_cleanup_exception":
+        assert result.review_ready is True
+        assert result.pr_url == "https://github.com/example/repo/pull/1"
+        assert result.reason == (
+            "post-publication bookkeeping failed: "
+            "authorized branch cleanup: branch cleanup failed"
+        )
+        assert ["chainlink", "issue", "label", "1410", "worklink:review"] in calls
+        assert ["chainlink", "issue", "label", "1410", "worklink:failed"] not in calls
+        assert ["chainlink", "issue", "label", "1410", "worklink:ready"] not in calls
