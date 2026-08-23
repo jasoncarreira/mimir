@@ -361,11 +361,13 @@ def _github_api_attestation(
 
 def _github_author_is_trusted(
     repo: Any, author: Any, token: str, *, timeout: float | None = None,
-) -> bool:
+) -> bool | None:
     """Resolve collaborator/org trust from GitHub, never from poller claims.
 
-    ``timeout`` bounds each of the two attestation requests this makes; see
-    ``_github_content_author`` for why callers on a budget must pass it.
+    ``None`` means the server attestation was unavailable and is retryable. It
+    must not be persisted as an untrusted verdict. ``timeout`` bounds each of the
+    two attestation requests this makes; see ``_github_content_author`` for why
+    callers on a budget must pass it.
     """
     if not isinstance(repo, str) or not isinstance(author, str):
         return False
@@ -387,22 +389,23 @@ def _github_author_is_trusted(
         f"repos/{escaped_repo}/collaborators/{escaped_author}", token, **kwargs,
     )
     if collaborator is None:
-        return False
+        return None
     if collaborator[0] == 204:
         return True
     if collaborator[0] != 404:
-        return False
+        return None
 
     membership = _github_api_attestation(
         f"orgs/{urllib.parse.quote(parts[0], safe='')}/memberships/{escaped_author}",
         token, **kwargs,
     )
-    return bool(
-        membership is not None
-        and membership[0] == 200
-        and isinstance(membership[1], dict)
-        and membership[1].get("state") == "active"
-    )
+    if membership is None:
+        return None
+    if membership[0] == 404:
+        return False
+    if membership[0] != 200 or not isinstance(membership[1], dict):
+        return None
+    return membership[1].get("state") == "active"
 
 
 def _github_content_author(

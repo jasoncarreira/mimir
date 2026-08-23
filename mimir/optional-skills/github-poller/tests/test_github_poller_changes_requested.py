@@ -1137,7 +1137,7 @@ def test_gh_api_timeout_is_clamped_to_the_remaining_hard_budget(monkeypatch):
     # the bound would be "deadline + one full timeout" rather than the deadline.
     before = len(seen)
     poller.set_active_tick_budget(poller.TickBudget(hard_deadline_seconds=0.0))
-    assert poller._gh_api("repos/o/r/pulls", "tok") is None
+    assert poller._gh_api("repos/o/r/pulls", "tok") is poller._GH_API_BUDGET_REFUSED
     assert len(seen) == before, "a call was made past the hard deadline"
     poller.set_active_tick_budget(None)
 
@@ -1536,3 +1536,31 @@ def test_refused_listing_holds_the_watermark_only_for_since_gated_passes(
     )
     # ...and its prior state survives, which is what makes that safe.
     assert cursor == prior
+
+
+def test_subminimum_budget_refusal_holds_since_window_with_time_remaining(
+    monkeypatch,
+):
+    """A positive remainder below the useful-call floor is still a refusal."""
+    budget = poller.TickBudget(
+        hard_deadline_seconds=poller.GH_API_MIN_TIMEOUT_SECONDS / 2,
+    )
+    started: list[object] = []
+    monkeypatch.setattr(
+        poller.subprocess,
+        "run",
+        lambda *args, **kwargs: started.append(args) or pytest.fail(
+            "a subminimum-budget API call started"
+        ),
+    )
+    poller.set_active_tick_budget(budget)
+
+    poller._check_pr_review_comments(
+        "o/r", "2026-08-23T10:00:00Z", "tok", "mimir-bot",
+        tick_budget=budget,
+    )
+
+    assert started == []
+    assert 0 < budget.hard_remaining() < poller.GH_API_MIN_TIMEOUT_SECONDS
+    assert budget.hard_truncated is True
+    assert budget.truncated.get("review_comments_window") == 1

@@ -327,9 +327,10 @@ def _refused_window(
     Only the caller knows its window is since-gated, which is why this is checked
     here rather than inside ``_gh_api``.
     """
-    if tick_budget is None or data is not None:
+    if tick_budget is None:
         return False
-    if not tick_budget.hard_exhausted():
+    explicitly_refused = data is _GH_API_BUDGET_REFUSED
+    if not explicitly_refused and (data is not None or not tick_budget.hard_exhausted()):
         return False
     tick_budget.hard_truncated = True
     tick_budget.note_truncation(pass_name, 1)
@@ -655,9 +656,20 @@ def _resolve_token() -> str:
     return ""
 
 
-def _gh_api(endpoint: str, token: str) -> list | dict | None:
+class _GhApiBudgetRefused:
+    """Marker returned when the tick budget prevents an API call from starting."""
+
+
+_GH_API_BUDGET_REFUSED = _GhApiBudgetRefused()
+
+
+def _gh_api(endpoint: str, token: str) -> list | dict | None | _GhApiBudgetRefused:
     """Call ``gh api <endpoint> --paginate`` and return parsed JSON.
-    Returns None on error so callers can skip silently."""
+
+    Returns ``None`` on an ordinary API error and a private marker when the tick
+    budget refuses the call. Since-gated callers must distinguish those cases so
+    they do not advance their watermark over a window they never collected.
+    """
     try:
         env = {**os.environ, "GH_TOKEN": token} if token else None
         budget = _ACTIVE_TICK_BUDGET
@@ -681,7 +693,7 @@ def _gh_api(endpoint: str, token: str) -> list | dict | None:
                     f"gh api {endpoint} skipped: tick budget exhausted",
                     file=sys.stderr,
                 )
-                return None
+                return _GH_API_BUDGET_REFUSED
             timeout = allowed
         result = subprocess.run(
             ["gh", "api", endpoint, "--paginate"],
@@ -996,9 +1008,9 @@ def _pr_author_is_trusted(
 ) -> bool | None:
     """Resolve PR-author trust from GitHub and cache it for this poll cycle.
 
-    Returns ``None`` when the tick has no budget left to resolve trust. That is
-    deliberately distinct from ``False``: an unresolved author must be *skipped*,
-    not classified, because ``False`` routes the PR through
+    Returns ``None`` when the tick has no budget left or a server attestation is
+    unavailable. That is deliberately distinct from ``False``: an unresolved
+    author must be *skipped*, not classified, because ``False`` routes the PR through
     ``_surface_untrusted_pr_once`` which emits a signal and records the verdict
     as already-surfaced. Failing closed here would permanently mislabel a
     trusted contributor's PR because the poller ran out of time.
@@ -1033,6 +1045,10 @@ def _pr_author_is_trusted(
             # cache: the next tick should retry rather than inherit a verdict
             # produced by a timeout.
             return None
+        if resolved is None:
+            # Transport failure or malformed response is unresolved, not an
+            # authoritative untrusted verdict. Do not cache it; retry next tick.
+            return None
         trust_cache[author_key] = resolved
     author = trust_cache[author_key]
     trust_key = (repo, author if isinstance(author, str) else "")
@@ -1044,6 +1060,9 @@ def _pr_author_is_trusted(
             with _wall_clock_deadline(allowed):
                 trusted = _github_author_is_trusted(repo, author, token)
         except _DeadlineExceeded:
+            return None
+        if trusted is None:
+            # Preserve the transport's unavailable state separately from False.
             return None
         trust_cache[trust_key] = trusted
     return trust_cache[trust_key] is True
@@ -1562,9 +1581,15 @@ def _check_pr_pushes(
         trusted_author = _pr_author_is_trusted(
             repo, number, url, token, trust_cache, tick_budget=tick_budget,
         )
+        if trusted_author is None and explicitly_requested:
+            # An explicit request is actionable regardless of author trust. Keep
+            # the unresolved author fail-closed for automatic push review while
+            # still allowing review-request reconciliation below.
+            trusted_author = False
         if trusted_author is None:
-            # Unresolved for lack of budget. Carry the prior head forward — a
-            # dropped key would make the next tick treat this PR as first-seen
+            # Unresolved for lack of budget or a transport failure. Carry the
+            # prior head forward — a dropped key would make the next tick treat
+            # this PR as first-seen
             # and miss the push entirely.
             #
             # Deliberately does NOT hold the watermark: this pass takes no
