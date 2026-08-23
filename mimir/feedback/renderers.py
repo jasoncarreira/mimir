@@ -117,6 +117,14 @@ def _render_event_line(rule_kind: str, ev: dict) -> str:
         )
     if rule_kind == "saga_query_error":
         return f"SAGA query failed: {_sanitize_field(ev.get('error') or '(no detail)')}"
+    if rule_kind == "saga_vector_search_degraded":
+        reason = _sanitize_field(ev.get("reason") or "unknown")
+        expected = ev.get("expected_dimension", "?")
+        observed = ev.get("observed_dimension", "?")
+        return (
+            "SAGA semantic search degraded to FTS5: "
+            f"{reason} (expected dim={expected}, observed dim={observed})"
+        )
     if rule_kind == "saga_feedback_error":
         return f"SAGA feedback failed: {_sanitize_field(ev.get('error') or '(no detail)')}"
     if rule_kind == "saga_consolidate_error":
