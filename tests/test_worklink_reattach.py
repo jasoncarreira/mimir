@@ -539,7 +539,34 @@ def test_reattach_skips_when_leaf_no_longer_in_progress(tmp_path: Path) -> None:
     assert result.status == "failed"
     assert "no longer in-progress" in (result.reason or "")
     assert compute.waited == []  # never touched the worker
+    assert ["chainlink", "locks", "release", str(issue_id)] in calls
     assert load_run_state(tmp_path, issue_id) is None
+
+
+def test_reattach_retains_state_when_transitioned_lock_release_fails(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    issue_id = 567
+    _save_inflight_state(tmp_path, repo, issue_id=issue_id, job="job-x")
+    calls: list = []
+    base_runner = _remote_runner(repo, calls, issue_id=issue_id, labels=["worklink:ready"])
+
+    def runner(args, *, cwd=None):
+        result = base_runner(args, cwd=cwd)
+        if isinstance(args, list) and args[:3] == ["chainlink", "locks", "release"]:
+            return cp(args, returncode=1, stderr="release denied")
+        return result
+
+    registry = BackendRegistry(WorklinkConfig())
+    registry.register(FakeBackend())
+    registry.register_compute(FakeRemoteCompute())
+
+    result = asyncio.run(
+        WorklinkRunner(home=tmp_path, repo=repo, runner=runner, registry=registry).reattach(issue_id)
+    )
+
+    assert "no longer in-progress" in (result.reason or "")
+    assert load_run_state(tmp_path, issue_id) is not None
 
 
 def test_reattach_no_state_is_noop(tmp_path: Path) -> None:

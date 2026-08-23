@@ -899,17 +899,34 @@ class WorklinkRunner:
             )
         finally:
             try:
-                _close_attempt_capabilities(
-                    publication,
-                    lease.authorization if lease is not None else None,
-                    lease.path if lease is not None else None,
-                    delete_checkout=delete_authorized_checkout,
-                )
-            finally:
+                try:
+                    _close_attempt_capabilities(
+                        publication,
+                        lease.authorization if lease is not None else None,
+                        lease.path if lease is not None else None,
+                        delete_checkout=delete_authorized_checkout,
+                    )
+                except Exception as exc:  # noqa: BLE001 - teardown must continue
+                    _log_event(
+                        "worklink_cleanup_failed",
+                        issue_id=issue.issue_id,
+                        attempt=record.attempt,
+                        cleanup="attempt_capabilities",
+                        error=str(exc),
+                    )
                 if executor_report_dir is not None:
-                    rmtree_missing_ok(executor_report_dir)
-                claims.release_issue(issue.issue_id)
-                clear_run_state(self.home, issue.issue_id)
+                    _remove_executor_report_dir_best_effort(
+                        executor_report_dir,
+                        issue_id=issue.issue_id,
+                        attempt=record.attempt,
+                    )
+            finally:
+                _release_issue_and_clear_run_state(
+                    claims,
+                    home=self.home,
+                    issue_id=issue.issue_id,
+                    attempt=record.attempt,
+                )
 
     async def _finalize(
         self,
@@ -944,7 +961,11 @@ class WorklinkRunner:
         executor_tests: TestResult | None = None
         if executor_report_dir is not None:
             executor_tests = read_pytest_result(test_cmd or "", executor_report_dir)
-            rmtree_missing_ok(executor_report_dir)
+            _remove_executor_report_dir_best_effort(
+                executor_report_dir,
+                issue_id=issue.issue_id,
+                attempt=attempt,
+            )
         pr_body_section = _read_pr_body_section(lease.path)
         invocation_model = spec.backend_config.get("model")
         executor_failed = raw.exit_code != 0
@@ -1239,8 +1260,12 @@ class WorklinkRunner:
                     reason=reason,
                 )
             finally:
-                claims.release_issue(issue_id)
-                clear_run_state(self.home, issue_id)
+                _release_issue_and_clear_run_state(
+                    claims,
+                    home=self.home,
+                    issue_id=issue_id,
+                    attempt=state.attempt,
+                )
             _log_event(
                 "worklink_reattach_cleanup",
                 issue_id=issue_id,
@@ -1305,8 +1330,12 @@ class WorklinkRunner:
                     reason="reattach: reconciled completed evidence",
                 )
             finally:
-                claims.release_issue(issue_id)
-                clear_run_state(self.home, issue_id)
+                _release_issue_and_clear_run_state(
+                    claims,
+                    home=self.home,
+                    issue_id=issue_id,
+                    attempt=state.attempt,
+                )
         # Only resume a leaf still in-progress. If the reaper already recovered it
         # (or a prior run transitioned it) the work is no longer ours to finish —
         # drop the stale state and stop. ``_issue_has_label`` fails open (assume
@@ -1314,7 +1343,12 @@ class WorklinkRunner:
         # doesn't strand the worker.
         if not claims._issue_has_label(issue_id, "worklink:in-progress"):  # noqa: SLF001
             _log_event("worklink_reattach_skipped", issue_id=issue_id, reason="not_in_progress")
-            clear_run_state(self.home, issue_id)
+            _release_issue_and_clear_run_state(
+                claims,
+                home=self.home,
+                issue_id=issue_id,
+                attempt=state.attempt,
+            )
             return WorklinkRunResult(
                 issue_id, state.attempt, "failed", reason="reattach: leaf no longer in-progress"
             )
@@ -1454,10 +1488,25 @@ class WorklinkRunner:
                 issue_id, state.attempt, "failed", reason=f"reattach failed: {exc}"
             )
         finally:
-            if lease is not None:
-                _remove_observation_worktree(self.repo, lease, runner=_list_runner(runner))
-            claims.release_issue(issue_id)
-            clear_run_state(self.home, issue_id)
+            try:
+                if lease is not None:
+                    try:
+                        _remove_observation_worktree(self.repo, lease, runner=_list_runner(runner))
+                    except Exception as exc:  # noqa: BLE001 - teardown must continue
+                        _log_event(
+                            "worklink_cleanup_failed",
+                            issue_id=issue_id,
+                            attempt=state.attempt,
+                            cleanup="reattach_observation_worktree",
+                            error=str(exc),
+                        )
+            finally:
+                _release_issue_and_clear_run_state(
+                    claims,
+                    home=self.home,
+                    issue_id=issue_id,
+                    attempt=state.attempt,
+                )
 
     async def run_epic(
         self,
@@ -2630,6 +2679,58 @@ def _close_attempt_capabilities(
         finally:
             if delete_checkout and checkout is not None:
                 rmtree_missing_ok(checkout.parent)
+
+
+def _release_issue_and_clear_run_state(
+    claims: ChainlinkClaims,
+    *,
+    home: Path,
+    issue_id: int,
+    attempt: int,
+) -> bool:
+    """Release a claim and clear local state only after confirmed release."""
+    try:
+        released = claims.release_issue(issue_id)
+    except BaseException as exc:
+        _log_event(
+            "worklink_cleanup_failed",
+            issue_id=issue_id,
+            attempt=attempt,
+            cleanup="lock_release",
+            error=str(exc),
+        )
+        raise
+    if not released:
+        _log_event(
+            "worklink_cleanup_failed",
+            issue_id=issue_id,
+            attempt=attempt,
+            cleanup="lock_release",
+            error="Chainlink did not confirm lock release",
+        )
+        return False
+    clear_run_state(home, issue_id)
+    return True
+
+
+def _remove_executor_report_dir_best_effort(
+    report_dir: Path,
+    *,
+    issue_id: int,
+    attempt: int,
+) -> None:
+    """Remove executor-owned report data without interrupting teardown."""
+    try:
+        rmtree_missing_ok(report_dir)
+    except Exception as exc:  # noqa: BLE001 - executor-owned paths are disposable
+        _log_event(
+            "worklink_cleanup_failed",
+            issue_id=issue_id,
+            attempt=attempt,
+            cleanup="executor_report_dir",
+            path=str(report_dir),
+            error=str(exc),
+        )
 
 
 def _cleanup_checkout_after_transition(

@@ -305,9 +305,9 @@ def test_reap_home_still_reaps_a_genuinely_stale_post_reset_claim() -> None:
 
 def test_reap_home_fail_soft_when_in_progress_list_errors() -> None:
     def runner(args: Sequence[str]) -> subprocess.CompletedProcess[str]:
-        if list(args)[1:3] == ["issue", "list"]:
+        if list(args)[1:3] in (["issue", "list"], ["locks", "list"]):
             return cp(returncode=1, stderr="list failed")
-        raise AssertionError(f"unexpected call after list failure: {args}")
+        raise AssertionError(f"unexpected call after discovery failure: {args}")
 
     claims = ChainlinkClaims(agent_id="t", runner=runner)
     assert claims.reap_home(ttl=timedelta(hours=2)) == []
@@ -364,6 +364,33 @@ def test_reap_home_skips_when_issue_already_transitioned() -> None:
         ttl=timedelta(hours=2),
     ) == []
     assert not any(c[1:] == ["issue", "label", "56", "worklink:ready"] for c in fake.calls)
+
+
+def test_reap_home_releases_stale_lock_after_issue_transition() -> None:
+    fake = FakeChainlink(
+        in_progress=[],
+        active_locks=[56],
+        comments={56: [_claim_comment(56, attempt=1, age=timedelta(hours=3))]},
+    )
+    claims = ChainlinkClaims(agent_id="t", runner=fake)
+
+    claims.reap_home(ttl=timedelta(hours=2))
+
+    assert "locks steal 56" in fake.names()
+    assert "locks release 56" in fake.names()
+    assert not any(c[1:] == ["issue", "label", "56", "worklink:ready"] for c in fake.calls)
+
+
+def test_reap_home_does_not_steal_fresh_lock_after_label_transition() -> None:
+    fake = FakeChainlink(
+        in_progress=[],
+        active_locks=[59],
+        comments={59: [_claim_comment(59, attempt=1, age=timedelta(minutes=5))]},
+    )
+    claims = ChainlinkClaims(agent_id="t", runner=fake)
+
+    assert claims.reap_home(ttl=timedelta(hours=2)) == []
+    assert "locks steal 59" not in fake.names()
 
 
 def test_reap_home_reclaims_lock_with_distinct_chainlink_tracker_owner() -> None:

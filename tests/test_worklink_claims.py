@@ -286,6 +286,26 @@ def test_claim_issue_enforces_max_active_locks_after_reservation() -> None:
     assert not any(call[:3] == ["chainlink", "issue", "comment"] for call in calls)
 
 
+def test_claim_issue_cap_reports_known_capacity_consuming_issue_ids() -> None:
+    def runner(args: Sequence[str]) -> subprocess.CompletedProcess[str]:
+        args = list(args)
+        if args[1:4] == ["locks", "list", "--json"]:
+            return subprocess.CompletedProcess(
+                args,
+                0,
+                stdout='{"locks":{"7":{"issue_id":7},"8":{"issue_id":8}}}',
+                stderr="",
+            )
+        return completed(args)
+
+    result = ChainlinkClaims(agent_id="mimir-a", runner=runner).claim_issue(
+        8,
+        max_active_locks=1,
+    )
+
+    assert result.reason and "active issue ids: [7]" in result.reason
+
+
 def test_list_issue_ids_falls_back_when_id_is_null() -> None:
     def runner(args: Sequence[str]) -> subprocess.CompletedProcess[str]:
         if list(args)[1:3] == ["issue", "list"]:
