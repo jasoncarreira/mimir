@@ -2866,6 +2866,8 @@ def _check_pr_reviews(
             break
         reviews = _gh_api(f"repos/{repo}/pulls/{pr_number}/reviews", token)
         if not isinstance(reviews, list):
+            if _refused_window(tick_budget, reviews, "pr_reviews_window"):
+                break
             continue
         for review in reviews:
             if me and review.get("user", {}).get("login") == me:

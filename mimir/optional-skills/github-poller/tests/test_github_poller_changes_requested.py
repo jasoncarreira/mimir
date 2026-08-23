@@ -1279,6 +1279,85 @@ def test_hard_truncated_tick_holds_its_watermark(monkeypatch, tmp_path):
     assert saved[0]["last_checked"] == "2026-08-23T10:00:00Z"
 
 
+def test_final_pr_review_timeout_holds_watermark_through_cursor_save(
+    monkeypatch, tmp_path,
+):
+    """A final admitted review call can exhaust the budget with no next loop."""
+    import time as _time
+
+    previous = "2026-08-23T10:00:00Z"
+    saved: list[dict] = []
+    calls: list[str] = []
+    pr = {
+        "number": 700,
+        "title": "PR 700",
+        "user": {"login": "outside-contributor"},
+    }
+
+    class _Result:
+        returncode = 0
+        stderr = ""
+
+        def __init__(self, payload):
+            self.stdout = json.dumps(payload)
+
+    def api_run(argv, **kwargs):
+        endpoint = argv[2]
+        calls.append(endpoint)
+        if endpoint.endswith("/reviews"):
+            _time.sleep(kwargs["timeout"] + 0.005)
+            raise poller.subprocess.TimeoutExpired(argv, kwargs["timeout"])
+        return _Result([pr])
+
+    real_budget = poller.TickBudget
+    monkeypatch.setattr(poller, "GH_API_MIN_TIMEOUT_SECONDS", 0.001)
+    monkeypatch.setattr(
+        poller,
+        "TickBudget",
+        lambda: real_budget(deadline_seconds=0.02, hard_deadline_seconds=0.05),
+    )
+    monkeypatch.setattr(poller, "STATE_DIR", tmp_path)
+    monkeypatch.setattr(poller, "_resolve_token", lambda: "tok")
+    monkeypatch.setattr(poller.subprocess, "run", api_run)
+    monkeypatch.setattr(poller, "_load_cursor", lambda: {"last_checked": previous})
+    monkeypatch.setattr(poller, "_save_cursor", lambda cursor: saved.append(cursor))
+    monkeypatch.setattr(poller, "_utc_now_iso", lambda: "2026-08-23T12:00:00Z")
+    monkeypatch.setattr(poller, "_emit", lambda *args, **kwargs: None)
+    monkeypatch.setattr(poller, "_emit_signal", lambda *args, **kwargs: None)
+    monkeypatch.setattr(poller, "_check_issues", lambda *args, **kwargs: 0)
+    monkeypatch.setattr(
+        poller, "_collect_issue_comment_context", lambda *args, **kwargs: ([], {}),
+    )
+    monkeypatch.setattr(poller, "_check_prs", lambda *args, **kwargs: 0)
+    monkeypatch.setattr(
+        poller, "_check_pr_review_comments", lambda *args, **kwargs: 0,
+    )
+    monkeypatch.setattr(
+        poller, "_check_pr_pushes", lambda *args, **kwargs: (0, {}, {}),
+    )
+    monkeypatch.setattr(poller, "_check_issue_comments", lambda *args, **kwargs: 0)
+    monkeypatch.setattr(
+        poller, "_check_own_changes_requested", lambda *args, **kwargs: (0, {}),
+    )
+    monkeypatch.setattr(
+        poller, "_check_own_mergeability", lambda *args, **kwargs: (0, {}),
+    )
+    monkeypatch.setattr(
+        poller, "_check_pr_ci_failures", lambda *args, **kwargs: (0, {}),
+    )
+    monkeypatch.setenv("GITHUB_REPOS", "o/r")
+    monkeypatch.setenv("MIMIR_GITHUB_SELF_LOGIN", "mimir-bot")
+
+    poller.main()
+
+    assert calls == [
+        "repos/o/r/pulls?state=open&sort=updated&direction=desc",
+        "repos/o/r/pulls/700/reviews",
+    ]
+    assert len(saved) == 1
+    assert saved[0]["last_checked"] == previous
+
+
 def test_untruncated_tick_still_advances_its_watermark(monkeypatch, tmp_path):
     """The hold must be specific to hard truncation — a tick with room to spare
     has to advance, or the window grows forever."""
