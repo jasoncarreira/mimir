@@ -181,7 +181,7 @@ describe("API key changes reset browser-scoped user data (#594)", () => {
 
     resetBrowserSessionStateForApiKeyChange(qc, navigate);
 
-    expect(qc.getQueryData(["web-bootstrap"])).toEqual(protectedBootstrap);
+    expect(qc.getQueryData(["web-bootstrap"])).toBeUndefined();
     expect(qc.getQueryData(["whoami"])).toBeUndefined();
     expect(qc.getQueryData(["turns", { channel: "web-alice" }])).toBeUndefined();
     expect(useChatStore.getState().messages).toEqual([]);

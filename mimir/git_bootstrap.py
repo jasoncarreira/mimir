@@ -44,7 +44,7 @@ event loop).
 
 |         | .git missing                       | .git present                |
 |---------|------------------------------------|-----------------------------|
-| repo+token set | ``git clone <token-url>`` to home  | refresh creds + ``git pull --ff-only`` |
+| repo+token set | authenticated ``git clone`` to home | refresh creds + ``git pull --ff-only`` |
 | neither set    | ``git init`` + bootstrap commit    | no-op (still ensure hook)   |
 
 ## Token rotation
@@ -68,6 +68,7 @@ itself) and the remote URL stays the clean canonical form.
 from __future__ import annotations
 
 import asyncio
+import base64
 import logging
 import os
 import shutil
@@ -171,15 +172,10 @@ def bootstrap_git_repo(
     # (clone elsewhere, move .git in). Defer that to the operator.
     if not git_dir.exists():
         if state_repo and github_token:
-            # Clone is the one place we still inject the token into the
-            # URL: ``.git/`` doesn't exist yet, so ``git config --local``
-            # has nowhere to live, and we can't pre-stage the credential
-            # helper before clone. The injection is transient — we
-            # rewrite the remote to the clean URL immediately on
-            # success. Argv-level exposure is bounded to one subprocess.
-            transient_url = _inject_token_into_url(state_repo, github_token)
             if _is_dir_effectively_empty(home):
-                ok = _clone(home, transient_url, log_event=log_event)
+                ok = _clone(
+                    home, state_repo, github_token, log_event=log_event,
+                )
                 if ok:
                     result.cloned = True
                     # Rewrite remote to the clean URL right away.
@@ -787,17 +783,33 @@ def _ensure_upstream_tracking(
 def _clone(
     home: Path,
     push_url: str,
+    github_token: str,
     *,
     log_event: callable,
 ) -> bool:
     """Clone ``push_url`` into ``home`` (which must be empty). Returns
-    True on success, False on failure (logs ``git_clone_failed``)."""
+    True on success, False on failure (logs ``git_clone_failed``).
+
+    Authentication uses Git's process environment config so neither the
+    credential nor its encoded header appears in the clone argv.
+    """
     # Use ``git clone <url> .`` from inside the dir so we don't have to
     # delete and recreate the dir to satisfy git's "empty target" rule.
+    env = os.environ.copy()
+    parsed = urllib.parse.urlparse(push_url)
+    if parsed.scheme in {"http", "https"}:
+        encoded = base64.b64encode(
+            f"x-access-token:{github_token}".encode()
+        ).decode()
+        env.update({
+            "GIT_CONFIG_COUNT": "1",
+            "GIT_CONFIG_KEY_0": f"http.{push_url}.extraheader",
+            "GIT_CONFIG_VALUE_0": f"Authorization: Basic {encoded}",
+        })
     try:
         _run(
             ["git", "clone", "--quiet", push_url, "."],
-            cwd=home, check=True, capture=True,
+            cwd=home, check=True, capture=True, env=env,
         )
         return True
     except subprocess.CalledProcessError as exc:
@@ -859,6 +871,7 @@ def _run(
     cwd: Path | None = None,
     check: bool = False,
     capture: bool = False,
+    env: dict[str, str] | None = None,
 ) -> subprocess.CompletedProcess:
     """Tiny wrapper so we get uniform timeout + capture behavior across
     helpers. 30s timeout matches PUSH_TIMEOUT_SECONDS in git_tracking
@@ -891,6 +904,7 @@ def _run(
             capture_output=capture,
             text=True,
             timeout=30,
+            env=env,
         )
     except subprocess.TimeoutExpired as exc:
         stdout = (
@@ -902,7 +916,7 @@ def _run(
             exc.stderr.decode("utf-8", "replace")
             if isinstance(exc.stderr, bytes)
             else (exc.stderr or "")
-        ) + f"\n[git_bootstrap _run timed out after 30s: {' '.join(cmd)}]"
+        ) + "\n[git_bootstrap _run timed out after 30s]"
         if check:
             raise subprocess.CalledProcessError(
                 returncode=124,

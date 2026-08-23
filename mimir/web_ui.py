@@ -1336,11 +1336,18 @@ def register_routes(
     async def web_bootstrap(request: web.Request) -> web.Response:
         api_key = str(request.app.get("api_key") or "")
         gate = web_gate_active(api_key, request.app.get("identity_resolver"))
+        public_payload = {"version": __version__, "auth": {"required": gate}}
+        if gate and not (
+            request.get("auth_is_master")
+            or request.get("auth_identity") is not None
+        ):
+            return web.json_response(public_payload, headers=_no_store_headers())
         config = request.app.get("config")
         web_host = str(getattr(config, "web_host", "") or "")
         public_bind = web_host not in ("", "127.0.0.1", "::1", "localhost")
         return web.json_response(
             {
+                "version": __version__,
                 "auth": {
                     "required": gate,
                     "scheme": "x-api-key",
@@ -1364,6 +1371,12 @@ def register_routes(
     async def web_bootstrap_v1(request: web.Request) -> web.Response:
         api_key = str(request.app.get("api_key") or "")
         gate = web_gate_active(api_key, request.app.get("identity_resolver"))
+        public_payload = {"version": __version__, "auth": {"required": gate}}
+        if gate and not (
+            request.get("auth_is_master")
+            or request.get("auth_identity") is not None
+        ):
+            return json_success(public_payload, headers=_no_store_headers())
         config = request.app.get("config")
         web_host = str(getattr(config, "web_host", "") or "")
         public_bind = web_host not in ("", "127.0.0.1", "::1", "localhost")
@@ -1713,6 +1726,8 @@ def register_routes(
         return MCPPolicyStore(home / "state" / "mcp-policy.json")
 
     def _mcp_payload() -> dict[str, Any]:
+        from .admin_config import _redact_config_value
+
         store = _mcp_store()
         tools = store.load()
         servers = []
@@ -1721,23 +1736,13 @@ def register_routes(
                 dict(tool) for tool in tools.values()
                 if tool.get("server_config_id") == server_id
             ]
-            env = {
-                str(key): (
-                    str(value)
-                    if "${" in str(value) or not any(
-                        marker in str(key).lower()
-                        for marker in ("token", "secret", "password", "key", "auth", "credential")
-                    )
-                    else "[REDACTED]"
-                )
-                for key, value in dict(record.get("env", {})).items()
-            }
+            env = _redact_config_value(dict(record.get("env", {})))
             servers.append({
                 "server_config_id": server_id,
                 "name": str(record.get("name", "")),
                 "transport": "stdio",
-                "command": str(record.get("command", "")),
-                "args": list(record.get("args", [])),
+                "command": _redact_config_value(str(record.get("command", ""))),
+                "args": _redact_config_value(list(record.get("args", []))),
                 "env": env,
                 "policy_version": str(record.get("policy_version", "")),
                 "tools": sorted(server_tools, key=lambda item: str(item.get("original_tool_name", ""))),
@@ -1781,6 +1786,27 @@ def register_routes(
                 "direction": "neither",
             }],
         }
+
+    def _restore_redacted_values(value: Any, prior: Any) -> Any:
+        from .admin_config import _redact_config_value
+
+        if value == "[REDACTED]":
+            return prior if prior is not None else value
+        if value == _redact_config_value(prior):
+            return prior
+        if isinstance(value, dict) and isinstance(prior, dict):
+            return {
+                key: _restore_redacted_values(item, prior.get(key))
+                for key, item in value.items()
+            }
+        if isinstance(value, list) and isinstance(prior, list):
+            return [
+                _restore_redacted_values(
+                    item, prior[index] if index < len(prior) else None,
+                )
+                for index, item in enumerate(value)
+            ]
+        return value
 
     async def _discover_mcp_server(record: dict[str, Any]) -> None:
         from .mcp_client import MCPManager, MCPServerConfig, get_tool_provenance, _provenance_record
@@ -1837,11 +1863,9 @@ def register_routes(
             if path_id and path_id not in existing_servers:
                 return json_error("not_found", "MCP server not found", status=404)
             if path_id:
-                prior_env = dict(existing_servers[path_id].get("env", {}))
-                record["env"] = {
-                    key: prior_env.get(key, value) if value == "[REDACTED]" else value
-                    for key, value in record["env"].items()
-                }
+                record = _restore_redacted_values(
+                    record, existing_servers[path_id],
+                )
             await _discover_mcp_server(record)
             store.upsert_server(record)
             payload = _mcp_payload()
