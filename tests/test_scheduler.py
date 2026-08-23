@@ -1963,7 +1963,7 @@ async def test_fire_poller_serializes_through_semaphore(
     max_in_flight = 0
     lock = asyncio.Lock()
 
-    async def fake_run_poller(poller, enqueue, home=None):
+    async def fake_run_poller(poller, enqueue, home=None, timeout=None):
         assert home is sched._home
         nonlocal in_flight, max_in_flight
         async with lock:
@@ -2008,7 +2008,7 @@ async def test_fire_poller_passes_scheduler_home_to_run_poller(
 
     captured = {}
 
-    async def fake_run_poller(poller, enqueue, home=None):
+    async def fake_run_poller(poller, enqueue, home=None, timeout=None):
         captured["poller"] = poller.name
         captured["home"] = home
 
@@ -2060,7 +2060,7 @@ async def test_fire_poller_resheds_after_acquiring_semaphore(
 
     ran = False
 
-    async def fake_run_poller(poller, enqueue, home=None):
+    async def fake_run_poller(poller, enqueue, home=None, timeout=None):
         nonlocal ran
         ran = True
 
@@ -3970,7 +3970,7 @@ async def test_fire_poller_suppressed_skips_subprocess_and_emits(
 
     ran: list[str] = []
 
-    async def fake_run_poller(poller, enqueue, home=None):
+    async def fake_run_poller(poller, enqueue, home=None, timeout=None):
         ran.append(poller.name)
 
     monkeypatch.setattr("mimir.scheduler.run_poller", fake_run_poller)
@@ -4020,7 +4020,7 @@ async def test_fire_poller_budget_suppressed_skips_subprocess_and_emits(
 
     ran: list[str] = []
 
-    async def fake_run_poller(poller, enqueue, home=None):
+    async def fake_run_poller(poller, enqueue, home=None, timeout=None):
         ran.append(poller.name)
 
     monkeypatch.setattr("mimir.scheduler.run_poller", fake_run_poller)
@@ -4069,7 +4069,7 @@ async def test_fire_poller_budget_under_limit_still_runs(tmp_path: Path, monkeyp
 
     ran: list[str] = []
 
-    async def fake_run_poller(poller, enqueue, home=None):
+    async def fake_run_poller(poller, enqueue, home=None, timeout=None):
         ran.append(poller.name)
 
     monkeypatch.setattr("mimir.scheduler.run_poller", fake_run_poller)
@@ -4128,7 +4128,7 @@ async def test_fire_poller_budget_checks_do_not_block_loop_and_reuse_snapshot(
 
     ran: list[str] = []
 
-    async def fake_run_poller(poller, enqueue, home=None):
+    async def fake_run_poller(poller, enqueue, home=None, timeout=None):
         ran.append(poller.name)
 
     monkeypatch.setattr("mimir.scheduler.aggregate_poller_turn_usage", slow_aggregate)
@@ -4195,7 +4195,7 @@ async def test_fire_poller_budget_suppresses_on_external_usage(
 
     ran: list[str] = []
 
-    async def fake_run_poller(poller, enqueue, home=None):
+    async def fake_run_poller(poller, enqueue, home=None, timeout=None):
         ran.append(poller.name)
 
     monkeypatch.setattr("mimir.scheduler.run_poller", fake_run_poller)
@@ -4226,7 +4226,7 @@ async def test_fire_poller_fires_when_arbiter_clear(
 
     ran: list[str] = []
 
-    async def fake_run_poller(poller, enqueue, home=None):
+    async def fake_run_poller(poller, enqueue, home=None, timeout=None):
         ran.append(poller.name)
 
     monkeypatch.setattr("mimir.scheduler.run_poller", fake_run_poller)
@@ -4262,7 +4262,7 @@ async def test_fire_poller_fail_open_when_arbiter_raises(
 
     ran: list[str] = []
 
-    async def fake_run_poller(poller, enqueue, home=None):
+    async def fake_run_poller(poller, enqueue, home=None, timeout=None):
         ran.append(poller.name)
 
     monkeypatch.setattr("mimir.scheduler.run_poller", fake_run_poller)
