@@ -18,6 +18,12 @@ _SECRET_PATTERNS = (
     ),
     # Common provider / GitHub / AWS token prefixes.
     re.compile(r"\b(?:github_pat_[A-Za-z0-9_]+|gh[pousr]_[A-Za-z0-9_]+|sk-[A-Za-z0-9_-]{8,}|AKIA[0-9A-Z]{16})\b"),
+    re.compile(r"xapp-[0-9A-Za-z-]{20,}"),
+    re.compile(r"tvly-[A-Za-z0-9_-]{20,}"),
+    re.compile(r"pa-[A-Za-z0-9_-]{20,}"),
+    re.compile(r"AIza[A-Za-z0-9_-]{35}"),
+    # Preserve a JWT's header while masking its payload and signature.
+    re.compile(r"(\b[A-Za-z0-9_-]{25,}\.)([A-Za-z0-9_-]{6,}\.[A-Za-z0-9_-]{27,}\b)"),
     # Conservative high-entropy fallback for long unbroken credential-like blobs.
     re.compile(r"\b(?=[A-Za-z0-9_+/=-]{40,}\b)(?=.*[A-Z])(?=.*[a-z])(?=.*\d)[A-Za-z0-9_+/=-]+\b"),
 )
@@ -70,7 +76,8 @@ def scrub_value(value: Any, *, key: str | None = None) -> Any:
 def scrub_text(text: str) -> str:
     redacted = text
     for pattern in _SECRET_PATTERNS:
-        redacted = pattern.sub("[redacted]", redacted)
+        replacement = r"\1[redacted]" if pattern.groups == 2 else "[redacted]"
+        redacted = pattern.sub(replacement, redacted)
     return _PATH_PATTERN.sub("[path]", redacted)
 
 
