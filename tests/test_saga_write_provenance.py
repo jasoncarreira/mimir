@@ -182,7 +182,35 @@ async def test_synthesis_memory_store_preserves_service_provenance(
 
 
 @pytest.mark.asyncio
-async def test_memory_store_ignores_untrusted_informational_recall_for_integrity(
+@pytest.mark.parametrize("integrity_effect", ["informational", "active_ingest"])
+async def test_memory_store_stamps_untrusted_for_any_untrusted_source_effect(
+    integrity_effect: str,
+    tmp_path: Path, write_store: _WriteStore,
+) -> None:
+    context = _user_context(tmp_path, "discord-alice", "discord-private")
+    labels = InformationFlowLabels().with_source(SourceLabel(
+        principal="memory", domain="saga", resource_id="atom:recall",
+        bridge_instance="saga", sensitivity="private",
+        authorized_principals=frozenset({"alice"}), integrity="untrusted",
+        integrity_effect=integrity_effect,
+    ))
+    context = replace(
+        context,
+        ifc_labels=labels,
+        ifc_state=InformationFlowState(labels=labels),
+    )
+
+    out = await memory_store.coroutine(
+        content="restated recalled fact", stream="semantic",
+        runtime=_runtime(context, f"{integrity_effect}-recall-store"),
+    )
+
+    assert "stored" in out
+    assert write_store.atom_calls[-1]["integrity"] == Integrity.UNTRUSTED
+
+
+@pytest.mark.asyncio
+async def test_memory_store_stamps_trusted_when_all_sources_are_trusted(
     tmp_path: Path, write_store: _WriteStore,
 ) -> None:
     context = _user_context(tmp_path, "discord-alice", "discord-private")
@@ -191,11 +219,6 @@ async def test_memory_store_ignores_untrusted_informational_recall_for_integrity
         bridge_instance="discord", sensitivity="private",
         authorized_principals=frozenset({"alice"}), integrity="trusted",
         integrity_effect="active_ingest",
-    )).with_source(SourceLabel(
-        principal="memory", domain="saga", resource_id="atom:recall",
-        bridge_instance="saga", sensitivity="private",
-        authorized_principals=frozenset({"alice"}), integrity="untrusted",
-        integrity_effect="informational",
     ))
     context = replace(
         context,
@@ -205,12 +228,11 @@ async def test_memory_store_ignores_untrusted_informational_recall_for_integrity
 
     out = await memory_store.coroutine(
         content="trusted operator fact", stream="semantic",
-        runtime=_runtime(context, "trusted-recall-store"),
+        runtime=_runtime(context, "trusted-store"),
     )
 
     assert "stored" in out
-    assert labels.has_untrusted_active_ingest is False
-    assert write_store.atom_calls[-1]["integrity"] == "trusted"
+    assert write_store.atom_calls[-1]["integrity"] == Integrity.TRUSTED
 
 
 @pytest.mark.asyncio
