@@ -207,7 +207,10 @@ unfamiliar senders' requests.
 
 - **Don't `--max` very high** without narrowing the query. gog
   walks the full result set; 500-message returns blow the poll's
-  60-second timeout.
+  subprocess timeout (the framework cap, clamped below this poller's
+  own fire interval — read the effective value from the injected
+  `POLLER_TIMEOUT_SECONDS`). Overrunning discards every event the run
+  had already emitted, so it loses the whole poll, not just the tail.
 - **Don't put credentials in `pass_env`**. gog reads its own creds
   from `~/.config/gogcli/`. The poller subprocess doesn't need an
   API key — `pass_env` carries only configuration (account name,

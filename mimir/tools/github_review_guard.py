@@ -10,6 +10,8 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
+from langchain_core.tools import ToolException
+
 from ._shell_env import direct_exec_env
 from .extra import _effective_shell_cwd
 from .refusals import ToolPolicyRefusal
@@ -314,7 +316,7 @@ def claim_review_submission(spec: ReviewSubmission) -> ReviewClaim | None:
             _lock_users[key] = _lock_users.get(key, 0) + 1
         if not lock.acquire(timeout=_LOCK_ACQUIRE_TIMEOUT_SECONDS):
             _release_lock_user(key, lock)
-            raise _review_refusal(
+            raise ToolException(
                 "timed out waiting for another matching review submission"
             )
         # If the PR moved while this caller waited, claim the new-head key

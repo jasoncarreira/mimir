@@ -26,6 +26,7 @@ from mimir.access_control import (
     OperationCatalog,
     OperationDecision,
     ServicePrincipal,
+    ServiceShellBindingRule,
     ServiceSinkPolicy,
     SinkGate,
     ToolRegistry,
@@ -2033,6 +2034,47 @@ def test_deepagents_synthetic_inventory_uses_dispatchable_mimir_tools() -> None:
         "execute",
         "task",
     )
+
+
+def test_maximal_model_tool_inventory_has_total_protected_result_partition(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from mimir.tools import forge, mcp
+    from mimir.tools.registry import all_mimir_tools
+
+    monkeypatch.setenv("TAVILY_API_KEY", "tvly-test")
+    monkeypatch.delenv("MIMIR_FETCH_URL_DISABLED", raising=False)
+    monkeypatch.setattr(forge, "_github_identity_degraded", False)
+    monkeypatch.setattr(mcp, "get_mcp_tools", lambda: [])
+    names = {
+        *(tool.name for tool in all_mimir_tools(
+            model_spec="openai:test",
+            coding_enabled=True,
+            require_coding_available=False,
+        )),
+        *access_control._deepagents_builtin_tool_names(),
+    }
+    mapped = names & access_control._PROTECTED_RESULT_DOMAINS.keys()
+    exempted = names & access_control._NON_INGESTING_RESULT_TOOLS
+
+    assert mapped.isdisjoint(exempted)
+    assert mapped | exempted == names
+
+
+def test_inventory_assertion_rejects_tool_without_result_classification(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        access_control,
+        "_deepagents_builtin_tool_names",
+        lambda: ("harness_auto_deliver",),
+    )
+
+    with pytest.raises(
+        access_control.CapabilityMatrixError,
+        match="without explicit protected-result classification: harness_auto_deliver",
+    ):
+        access_control.assert_model_tool_inventory_cataloged(model_spec="openai:test")
 
 
 def test_inventory_assertion_rejects_uncataloged_registered_mcp_tool() -> None:
@@ -6173,7 +6215,7 @@ def test_static_service_write_allows_home_when_file_tool_roots_unset(
         assert decision.allowed is True, target
 
 
-def test_autonomous_write_uses_trigger_state_and_explicit_repo_rw_roots(
+def test_poller_write_uses_only_its_declared_root(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -6201,13 +6243,9 @@ def test_autonomous_write_uses_trigger_state_and_explicit_repo_rw_roots(
     registry = ToolRegistry()
 
     for target in (
-        repo / "src" / "x.py",
         trigger_state / "cursor.json",
-        home / "state" / "reports" / "x.md",
-        home / "memory" / "issues" / "x.md",
-        home / "memory" / "channels" / "C1" / "notes.md",
-        repo / ".gitignore",
-        repo / ".gitattributes",
+        trigger_state / ".gitignore",
+        trigger_state / ".gitattributes",
     ):
         assert registry.authorize_tool(
             "write_file", auth, enforce=True, target_channel=str(target),
@@ -6215,6 +6253,10 @@ def test_autonomous_write_uses_trigger_state_and_explicit_repo_rw_roots(
     for target in (
         home,
         home / "root.txt",
+        repo / "src" / "x.py",
+        home / "state" / "reports" / "x.md",
+        home / "memory" / "issues" / "x.md",
+        home / "memory" / "channels" / "C1" / "notes.md",
         readonly / "data.txt",
         outside / "data.txt",
         Path("/tmp/unscoped.txt"),
@@ -7422,6 +7464,36 @@ def test_github_poller_binds_review_scope_from_server_event_and_origin(
         }]},
     )
     assert create_auth_context(steered, enforce=True).repo_review_state is None
+
+
+def test_replayed_github_poller_payload_cannot_mint_repo_pr_scope(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _root, authority, item = _github_scope_test_setup(tmp_path, monkeypatch)
+    live = AgentEvent(
+        trigger="poller", channel_id="poller:github-activity",
+        service_principal=authority.canonical, service_authority=authority,
+        extra={"poller_name": "github-activity", "items": [item]},
+    )
+    replayed = replace(
+        live,
+        extra={
+            **live.extra,
+            access_control.POLLER_RECOVERY_REPLAY_EXTRA_KEY: True,
+        },
+    )
+
+    live_scope = create_auth_context(live, enforce=True).repo_pr_action_scope
+    replayed_scope = create_auth_context(replayed, enforce=True).repo_pr_action_scope
+
+    assert live_scope is not None
+    assert {
+        access_control.RepoPRAction.WRITE.value,
+        access_control.RepoPRAction.COMMIT.value,
+        access_control.RepoPRAction.PUSH.value,
+    } <= live_scope.allowed_operations
+    assert replayed_scope is None
 
 
 def _github_scope_test_setup(
@@ -9215,11 +9287,11 @@ def test_repo_review_shell_profile_denies_destructive_or_unbounded_commands(
         ("gh issue list --state open --label security", "gh"),
         ("gh issue view 922 --comments", "gh"),
         ("ls -la", "ls"),
-        ("grep -n needle sample.txt", "grep"),
-        ("wc -l sample.txt", "wc"),
+        ("grep -n needle state/sample.txt", "grep"),
+        ("wc -l state/sample.txt", "wc"),
         ("pwd -P", "pwd"),
-        ("jq -r .name sample.json", "jq"),
-        ("rg --no-config -n needle .", "rg"),
+        ("jq -r .name state/sample.json", "jq"),
+        ("rg --no-config -n needle state", "rg"),
         (
             "/usr/local/bin/chainlink issue list --status all "
             "--label worklink:ready --json",
@@ -9244,6 +9316,9 @@ def test_maintenance_shell_profile_admits_prompt_inspection_commands(
 
     home = tmp_path / "home"
     home.mkdir()
+    (home / "state").mkdir()
+    (home / "state" / "sample.txt").write_text("needle\n", encoding="utf-8")
+    (home / "state" / "sample.json").write_text('{"name": "sample"}\n', encoding="utf-8")
     subprocess.run(["git", "init", "-q", str(home)], check=True)
     monkeypatch.setenv("MIMIR_HOME", str(home))
     assert maintenance_pinned_executables[command_key].exists()
@@ -9293,6 +9368,369 @@ def test_maintenance_github_repository_operands_are_configured(
     argv = parse_service_shell_argv(command, "maintenance")
 
     assert (argv is not None) is admitted
+    ("profile", "canonical", "trigger", "authority_profile"),
+    [
+        ("scheduler_read_only", "scheduler:test", "scheduled_tick", "custom"),
+        ("maintenance", "heartbeat", "scheduled_tick", "heartbeat"),
+        ("repo_review", "poller:github-activity", "poller", "github"),
+    ],
+)
+def test_service_shell_profiles_refuse_credential_file_operands(
+    profile: str,
+    canonical: str,
+    trigger: str,
+    authority_profile: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / "home"
+    root = tmp_path / "checkout"
+    home.mkdir()
+    root.mkdir()
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    credential = root / ".env"
+    credential.write_text("GITHUB_TOKEN=ghp_" + "a" * 36 + "\n", encoding="utf-8")
+    service = replace(
+        build_trigger_service_principal(
+            canonical=canonical,
+            trigger=trigger,
+            profile=authority_profile,
+            tier=CapabilityTier.CODE_EXECUTION,
+            capabilities=("shell_exec", "bash_jobs_list", "bash_job_output"),
+            creation_path="test",
+        ),
+        filesystem_read_roots=(str(root.resolve()),),
+    )
+    review_state = (
+        _review_state("o/r", 1352, "worklink/1352", str(root.resolve()))
+        if profile == "repo_review"
+        else None
+    )
+    auth = _service_auth(
+        service, InformationFlowLabels(), repo_review_state=review_state,
+    )
+
+    from mimir.tools import budget_gate
+
+    decision = ToolRegistry().authorize_tool(
+        "shell_exec",
+        auth,
+        enforce=True,
+        target_channel=f"grep -n TOKEN -- {credential}",
+    )
+    bound = budget_gate._request_for_authorized_execution(
+        _tool_request(
+            auth,
+            args={"command": f"grep -n TOKEN -- {credential}"},
+        ),
+        "shell_exec",
+        auth,
+    )
+
+    assert service.sink_policy_for("shell_exec") == ServiceSinkPolicy(
+        "shell_exec", "shell_profile", profile,
+    )
+    # Shape authorization is cheap; the execution binder performs the one
+    # authoritative path/content check after resolving cwd.
+    assert decision.allowed is True
+    assert "outside the read roots or withheld" in bound.tool_call["args"][
+        "mimir_shell_refusal"
+    ]
+
+
+def test_service_shell_refuses_whole_argv_when_any_read_operand_is_unsafe(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / "home"
+    root = tmp_path / "read-root"
+    home.mkdir()
+    root.mkdir()
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    safe = root / "notes.txt"
+    secret = root / "ordinary-name.txt"
+    safe.write_text("ordinary text\n", encoding="utf-8")
+    secret.write_text("AKIA" + "A" * 16 + "\n", encoding="utf-8")
+    service = replace(
+        build_trigger_service_principal(
+            canonical="scheduler:test",
+            trigger="scheduled_tick",
+            profile="custom",
+            tier=CapabilityTier.CODE_EXECUTION,
+            capabilities=("shell_exec", "bash_jobs_list", "bash_job_output"),
+            creation_path="test",
+        ),
+        filesystem_read_roots=(str(root.resolve()),),
+    )
+
+    from mimir.tools import budget_gate
+
+    auth = _service_auth(service, InformationFlowLabels())
+    decision = ToolRegistry().authorize_tool(
+        "shell_exec",
+        auth,
+        enforce=True,
+        target_channel=f"wc -l -- {safe} {secret}",
+    )
+    bound = budget_gate._request_for_authorized_execution(
+        _tool_request(auth, args={"command": f"wc -l -- {safe} {secret}"}),
+        "shell_exec",
+        auth,
+    )
+
+    assert decision.allowed is True
+    assert "mimir_shell_refusal" in bound.tool_call["args"]
+
+
+def test_service_shell_refuses_read_operand_outside_principal_roots(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / "home"
+    root = tmp_path / "read-root"
+    home.mkdir()
+    root.mkdir()
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    outside = tmp_path / "outside.txt"
+    outside.write_text("ordinary text\n", encoding="utf-8")
+    service = replace(
+        build_trigger_service_principal(
+            canonical="scheduler:test",
+            trigger="scheduled_tick",
+            profile="custom",
+            tier=CapabilityTier.CODE_EXECUTION,
+            capabilities=("shell_exec", "bash_jobs_list", "bash_job_output"),
+            creation_path="test",
+        ),
+        filesystem_read_roots=(str(root.resolve()),),
+    )
+
+    from mimir.tools import budget_gate
+
+    auth = _service_auth(service, InformationFlowLabels())
+    decision = ToolRegistry().authorize_tool(
+        "shell_exec",
+        auth,
+        enforce=True,
+        target_channel=f"wc -l -- {outside}",
+    )
+    bound = budget_gate._request_for_authorized_execution(
+        _tool_request(auth, args={"command": f"wc -l -- {outside}"}),
+        "shell_exec",
+        auth,
+    )
+
+    assert decision.allowed is True
+    assert "mimir_shell_refusal" in bound.tool_call["args"]
+
+
+@pytest.mark.parametrize(
+    ("command", "expected"),
+    [
+        ("head -n 5 -- notes.txt", ("notes.txt",)),
+        ("head -n5 notes.txt", ("notes.txt",)),
+        ("stat -c %n -- notes.txt", ("notes.txt",)),
+        ("grep --include=*.py -- -needle src", ("src",)),
+        ("rg --no-config -g *.py needle -- src", ("src",)),
+        ("rg --no-config --glob=*.py needle src", ("src",)),
+    ],
+)
+def test_service_shell_read_operand_parser_distinguishes_option_values(
+    command: str, expected: tuple[str, ...],
+) -> None:
+    assert access_control._shell_read_path_operands(shlex.split(command)) == expected
+
+
+@pytest.mark.parametrize(
+    ("authority_profile", "command"),
+    [
+        ("custom", "grep -n needle -- {path}"),
+        ("heartbeat", "head -n 1 -- {path}"),
+        ("github", "rg --no-config -g '*.txt' needle -- {path}"),
+    ],
+)
+def test_service_shell_profiles_keep_legitimate_scoped_reads(
+    authority_profile: str,
+    command: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / "home"
+    root = tmp_path / "checkout"
+    home.mkdir()
+    root.mkdir()
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    sample = root / "notes.txt"
+    sample.write_text("needle\n", encoding="utf-8")
+    canonical = "poller:github-activity" if authority_profile == "github" else "scheduler:test"
+    service = replace(
+        build_trigger_service_principal(
+            canonical=canonical,
+            trigger="poller" if authority_profile == "github" else "scheduled_tick",
+            profile=authority_profile,
+            tier=CapabilityTier.CODE_EXECUTION,
+            capabilities=("shell_exec", "bash_jobs_list", "bash_job_output"),
+            creation_path="test",
+        ),
+        filesystem_read_roots=(str(root.resolve()),),
+    )
+    review_state = (
+        _review_state("o/r", 1352, "worklink/1352", str(root.resolve()))
+        if authority_profile == "github"
+        else None
+    )
+
+    decision = ToolRegistry().authorize_tool(
+        "shell_exec",
+        _service_auth(
+            service, InformationFlowLabels(), repo_review_state=review_state,
+        ),
+        enforce=True,
+        target_channel=command.format(path=sample),
+    )
+
+    assert decision.allowed is True, decision.refusal_detail
+
+
+def test_service_shell_execution_binds_relative_read_operand_to_authoritative_cwd(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from mimir.tools import budget_gate
+
+    home = tmp_path / "home"
+    checkout = tmp_path / "checkout"
+    home.mkdir()
+    checkout.mkdir()
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    (checkout / "notes.txt").write_text("needle\n", encoding="utf-8")
+    service = replace(
+        build_trigger_service_principal(
+            canonical="scheduler:test",
+            trigger="scheduled_tick",
+            profile="custom",
+            tier=CapabilityTier.CODE_EXECUTION,
+            capabilities=("shell_exec", "bash_jobs_list", "bash_job_output"),
+            creation_path="test",
+        ),
+        filesystem_read_roots=(str(checkout.resolve()),),
+    )
+    auth = _service_auth(service, InformationFlowLabels())
+    # This regression is about the principal's declared checkout root, not the
+    # platform's ambient temporary-directory spelling (/tmp vs $TMPDIR).
+    monkeypatch.setattr(
+        "mimir.read_policy.configured_non_admin_read_roots", lambda: (),
+    )
+
+    bound = budget_gate._request_for_authorized_execution(
+        _tool_request(
+            auth,
+            args={
+                "command": "grep -n needle notes.txt",
+                "cwd": str(checkout),
+            },
+        ),
+        "shell_exec",
+        auth,
+    )
+
+    assert "mimir_shell_refusal" not in bound.tool_call["args"]
+    assert bound.tool_call["args"]["cwd"] == str(checkout.resolve())
+    assert bound.tool_call["args"]["mimir_direct_argv"][-1] == "notes.txt"
+
+
+def test_service_shell_recursive_preflight_runs_once_and_is_bounded(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from mimir.tools import budget_gate
+
+    home = tmp_path / "home"
+    root = tmp_path / "read-root"
+    home.mkdir()
+    root.mkdir()
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    for index in range(access_control._SHELL_RECURSIVE_READ_ENTRY_LIMIT + 1):
+        (root / f"file-{index}.txt").write_text("needle\n", encoding="utf-8")
+    service = replace(
+        build_trigger_service_principal(
+            canonical="scheduler:test",
+            trigger="scheduled_tick",
+            profile="custom",
+            tier=CapabilityTier.CODE_EXECUTION,
+            capabilities=("shell_exec", "bash_jobs_list", "bash_job_output"),
+            creation_path="test",
+        ),
+        filesystem_read_roots=(str(root.resolve()),),
+    )
+    auth = _service_auth(service, InformationFlowLabels())
+    # Keep cwd admission owned by this fixture so only the once-and-bounded
+    # recursive preflight behavior can make the test fail.
+    monkeypatch.setattr(
+        "mimir.read_policy.configured_non_admin_read_roots", lambda: (),
+    )
+    original = access_control._service_shell_read_operand_refusal
+    calls = 0
+
+    def counted(*args: object, **kwargs: object) -> str | None:
+        nonlocal calls
+        calls += 1
+        return original(*args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(access_control, "_service_shell_read_operand_refusal", counted)
+
+    bound = budget_gate._request_for_authorized_execution(
+        _tool_request(
+            auth,
+            args={"command": "grep -r needle .", "cwd": str(root)},
+        ),
+        "shell_exec",
+        auth,
+    )
+
+    refusal = bound.tool_call["args"]["mimir_shell_refusal"]
+    assert calls == 1
+    assert (
+        f"exceeded the {access_control._SHELL_RECURSIVE_READ_ENTRY_LIMIT}-entry limit"
+        in refusal
+    )
+    assert str(root) in refusal
+
+
+def test_service_shell_recursive_preflight_names_unreadable_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / "home"
+    root = tmp_path / "read-root"
+    home.mkdir()
+    root.mkdir()
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    service = replace(
+        build_trigger_service_principal(
+            canonical="scheduler:test",
+            trigger="scheduled_tick",
+            profile="custom",
+            tier=CapabilityTier.CODE_EXECUTION,
+            capabilities=("shell_exec", "bash_jobs_list", "bash_job_output"),
+            creation_path="test",
+        ),
+        filesystem_read_roots=(str(root.resolve()),),
+    )
+    original_scandir = os.scandir
+
+    def refused_scandir(path: str | os.PathLike[str]) -> os.ScandirIterator[str]:
+        if Path(path) == root:
+            raise PermissionError("synthetic unreadable directory")
+        return original_scandir(path)
+
+    monkeypatch.setattr(access_control.os, "scandir", refused_scandir)
+
+    _argv, reason, rule = access_control.parse_service_shell_argv_with_diagnostics(
+        "grep -r needle .",
+        "scheduler_read_only",
+        service=service,
+        auth_context=_service_auth(service, InformationFlowLabels()),
+        read_cwd=root,
+    )
+
+    assert rule == ServiceShellBindingRule.READ_OPERAND_POLICY
+    assert f"could not inspect directory {root}" in reason
 
 
 @pytest.mark.parametrize(

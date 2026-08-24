@@ -358,6 +358,11 @@ def _default_saga_toml(
         token_budget_ceiling = 1000000
         auto_compact_threshold_pct = 90
         refuse_threshold_pct = 99
+        # Semantic triple retrieval considers only the newest eligible rows.
+        # If the live store grows past this bound, older triples stop being
+        # candidates and saga logs triple_candidate_pool_truncated. Consolidation
+        # does not guarantee that the live triple count remains below this value.
+        triple_candidate_limit = 500
 
         """
     ) + embedding_block + dedent(
@@ -610,10 +615,27 @@ def _ensure_env_secure(path: Path) -> None:
 
     Called after any write that puts API keys into ``.env`` files so that
     secrets are not world-readable at the process umask default (0644).
-    No-op when the file does not exist (defensive).
+    The chmod is attempted unconditionally so callers do not introduce a
+    check-then-chmod race around first creation.
     """
-    if path.exists():
+    try:
         path.chmod(0o600)
+    except FileNotFoundError:
+        pass
+
+
+def _write_env_text(path: Path, content: str) -> None:
+    """Write an env file and enforce owner-only access on every write."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as stream:
+            fd = -1
+            stream.write(content)
+    finally:
+        if fd >= 0:
+            os.close(fd)
 
 
 def _generate_api_key() -> str:
@@ -651,8 +673,7 @@ def _env_set_var(env_path: Path, var_name: str, value: str, line_re: re.Pattern[
         if body and not body.endswith("\n"):
             body += "\n"
         body += new_line + "\n"
-    env_path.parent.mkdir(parents=True, exist_ok=True)
-    env_path.write_text(body, encoding="utf-8")
+    _write_env_text(env_path, body)
 
 
 def _env_get_var(env_path: Path, line_re: re.Pattern[str]) -> str | None:
