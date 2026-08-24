@@ -629,6 +629,7 @@ WHERE a.source_type = 'session_boundary'
 
         UPDATE atoms AS duplicate
         SET tombstoned = 1,
+            tombstoned_at = strftime('%Y-%m-%dT%H:%M:%f+00:00', 'now'),
             tombstoned_reason = COALESCE(duplicate.tombstoned_reason, 'merged')
         WHERE duplicate.tombstoned = 0
           AND EXISTS (

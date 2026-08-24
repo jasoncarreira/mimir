@@ -1551,10 +1551,14 @@ class TestV9OwnerScopedDedupMigration:
             "SELECT id FROM atoms WHERE content_hash = 'H' AND agent_id = 'default' "
             "AND owner_principal = 'legacy_admin' AND tombstoned = 0"
         ).fetchall() == [("a-survivor",)]
-        assert migrated.execute(
+        tombstoned, tombstoned_at, tombstoned_reason = migrated.execute(
             "SELECT tombstoned, tombstoned_at, tombstoned_reason "
             "FROM atoms WHERE id = 'z-loser'"
-        ).fetchone() == (1, None, "merged")
+        ).fetchone()
+        assert tombstoned == 1
+        assert tombstoned_at is not None
+        assert tombstoned_at.endswith("+00:00")
+        assert tombstoned_reason == "merged"
         assert migrated.execute(
             "SELECT version FROM schema_version ORDER BY version"
         ).fetchall() == [
