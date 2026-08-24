@@ -17,6 +17,9 @@ from typing import Callable, Mapping, Protocol, Sequence
 from .backends import ToolPin
 
 
+OPENCODE_VERSION = "1.18.21"
+
+
 DEFAULT_TOOL_PINS: tuple[ToolPin, ...] = (
     ToolPin(
         name="chainlink",
@@ -64,7 +67,7 @@ DEFAULT_TOOL_PINS: tuple[ToolPin, ...] = (
     ToolPin(
         name="opencode",
         category="coding-cli",
-        pin="1.18.9",
+        pin=OPENCODE_VERSION,
         smoke="opencode --version",
         source="npm",
         package="opencode-ai",
