@@ -890,6 +890,8 @@ class WorklinkRunner:
                 issue_id=issue.issue_id,
                 attempt=record.attempt,
                 status="failed",
+                review_ready=False,
+                pr_url=None,
                 reason=str(exc),
                 transition_applied=transition_applied,
                 error=transition_error,
@@ -1548,6 +1550,11 @@ class WorklinkRunner:
         issue_reader = ChainlinkIssueReader(chainlink_bin=self.chainlink_bin, runner=runner)
         issue = issue_reader.read(issue_id)
         if "worklink:epic" not in issue.labels:
+            _log_event(
+                "worklink_epic_refused",
+                issue_id=issue_id,
+                reason="not an epic issue",
+            )
             return WorklinkRunResult(issue_id, None, "failed", reason="not an epic issue")
         validate_leaf(issue)
         config = WorklinkConfig.load(self.home / "worklink.yaml")
@@ -1567,6 +1574,12 @@ class WorklinkRunner:
                 compute.name, compute.capabilities()
             )
             if not allowed:
+                _log_event(
+                    "worklink_autonomous_refused",
+                    issue_id=issue_id,
+                    compute_backend=compute.name,
+                    reason=reason,
+                )
                 return WorklinkRunResult(issue_id, None, "refused", reason=reason)
         launcher = selected.admit()
         inventory = RepositoryInventory.load(self.home / "repositories.yaml")
@@ -1595,6 +1608,11 @@ class WorklinkRunner:
                     "base branch lookup failed for origin: "
                     f"{base} (git ls-remote exit code {base_check.returncode})"
                 )
+            )
+            _log_event(
+                "worklink_epic_refused",
+                issue_id=issue_id,
+                reason=reason,
             )
             return WorklinkRunResult(
                 issue_id,
@@ -1662,12 +1680,29 @@ class WorklinkRunner:
             before_claim=prepare_factory_claim,
         )
         if claim.attempts_exhausted:
+            _log_event(
+                "worklink_attempts_exhausted",
+                issue_id=issue_id,
+                reason="attempts_exhausted",
+            )
             return WorklinkRunResult(issue_id, None, "blocked", reason="attempts_exhausted")
         if not claim.claimed or claim.record is None:
+            reason = claim.reason or "claim_failed"
+            _log_event(
+                "worklink_claim_failed",
+                issue_id=issue_id,
+                reason=reason,
+            )
             return WorklinkRunResult(
-                issue_id, None, "failed", reason=claim.reason or "claim_failed"
+                issue_id, None, "failed", reason=reason
             )
         claim_record = claim.record
+        _log_event(
+            "worklink_claimed",
+            issue_id=issue_id,
+            attempt=claim_record.attempt,
+            backend=selected.name,
+        )
         lease: CheckoutLease | None = None
         try:
             if retained is not None:
@@ -1788,6 +1823,15 @@ class WorklinkRunner:
                 status="failed",
                 review_ready=False,
                 attempt=claim_record.budget_attempt or claim_record.attempt,
+                reason=str(exc),
+            )
+            _log_event(
+                "worklink_transition",
+                issue_id=issue_id,
+                attempt=claim_record.attempt,
+                status="failed",
+                review_ready=False,
+                pr_url=None,
                 reason=str(exc),
             )
             return WorklinkRunResult(
@@ -2188,7 +2232,7 @@ class WorklinkRunner:
                 attempt=claim_record.budget_attempt or claim_record.attempt,
                 reason="factory run is parked",
             )
-            return WorklinkRunResult(
+            result = WorklinkRunResult(
                 issue.issue_id,
                 factory_record.attempt,
                 "needs-human",
@@ -2196,6 +2240,16 @@ class WorklinkRunner:
                 branch=factory_record.branch,
                 reason="factory run is parked",
             )
+            _log_event(
+                "worklink_transition",
+                issue_id=issue.issue_id,
+                attempt=factory_record.attempt,
+                status=result.status,
+                review_ready=result.review_ready,
+                pr_url=result.pr_url,
+                reason=result.reason,
+            )
+            return result
         if status.status in {"blocked", "partial"}:
             claims.transition_issue(
                 issue.issue_id,
@@ -2204,7 +2258,7 @@ class WorklinkRunner:
                 attempt=claim_record.budget_attempt or claim_record.attempt,
                 reason=f"factory status: {status.status}",
             )
-            return WorklinkRunResult(
+            result = WorklinkRunResult(
                 issue.issue_id,
                 factory_record.attempt,
                 "blocked",
@@ -2213,6 +2267,16 @@ class WorklinkRunner:
                 branch=factory_record.branch,
                 reason=f"factory status: {status.status}",
             )
+            _log_event(
+                "worklink_transition",
+                issue_id=issue.issue_id,
+                attempt=factory_record.attempt,
+                status=result.status,
+                review_ready=result.review_ready,
+                pr_url=result.pr_url,
+                reason=result.reason,
+            )
+            return result
         evidence_path, pr_url = await _verify_factory_completion(
             home=self.home,
             issue=issue,
@@ -2227,7 +2291,7 @@ class WorklinkRunner:
             review_ready=True,
             attempt=claim_record.budget_attempt or claim_record.attempt,
         )
-        return WorklinkRunResult(
+        result = WorklinkRunResult(
             issue.issue_id,
             factory_record.attempt,
             "review_ready",
@@ -2237,6 +2301,15 @@ class WorklinkRunner:
             checkout=Path(factory_record.sandbox),
             branch=factory_record.branch,
         )
+        _log_event(
+            "worklink_transition",
+            issue_id=issue.issue_id,
+            attempt=factory_record.attempt,
+            status=result.status,
+            review_ready=result.review_ready,
+            pr_url=result.pr_url,
+        )
+        return result
 
 async def _finish_factory_wait_task(
     task: asyncio.Task[ComputeResult],
@@ -2969,7 +3042,7 @@ def run_worklink_epic(
             exit_status=1,
             autonomous=autonomous,
         )
-    elif result.status in {"completed", "review_ready", "blocked", "needs-human"}:
+    elif result.status in {"completed", "review_ready"}:
         _record_run_success(home, issue_id)
     return result
 
