@@ -3841,10 +3841,6 @@ async def test_shell_exec_timeout_event_contains_redacted_bounded_command(
     assert tool_error["arguments"] == tool_call["arguments"]
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="#1391/#1691 must add bare xapp- masking before this PR can land",
-)
 def test_shell_command_event_redacts_bare_xapp_credential() -> None:
     from mimir.tools.budget_gate import _tool_event_arguments
 
