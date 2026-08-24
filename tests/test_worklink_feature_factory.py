@@ -614,10 +614,10 @@ def test_controls_are_absolute_run_id_first_and_resume_reads_status(tmp_path: Pa
     entrypoint = package_entrypoint(tmp_path)
     sandbox = tmp_path / "operator"
     sandbox.mkdir()
-    calls: list[tuple[str, ...]] = []
+    calls: list[tuple[tuple[str, ...], dict[str, Any]]] = []
 
     def runner(args: list[str], **kwargs: Any) -> subprocess.CompletedProcess[bytes]:
-        calls.append(tuple(args))
+        calls.append((tuple(args), kwargs))
         if args[2] == "status":
             return subprocess.CompletedProcess(
                 args,
@@ -647,13 +647,56 @@ def test_controls_are_absolute_run_id_first_and_resume_reads_status(tmp_path: Pa
         launcher=entrypoint,
     )
     assert status.status == "running"
-    assert [call[2:] for call in calls] == [
+    assert [args[2:] for args, _ in calls] == [
         ("resume", "1551", "--session", "session-1", "--repo", str(sandbox)),
         ("status", "1551", "--repo", str(sandbox), "--json"),
         ("heartbeat", "1551", "--session", "session-1", "--repo", str(sandbox)),
         ("lock", "1551", "steal", "--session", "session-1", "--repo", str(sandbox)),
     ]
-    assert all(call[:2] == ("node", str(entrypoint.resolve())) for call in calls)
+    assert all(args[:2] == ("node", str(entrypoint.resolve())) for args, _ in calls)
+    assert all("cwd" not in kwargs for _, kwargs in calls)
+
+
+def test_status_before_sandbox_creation_returns_not_ready(tmp_path: Path) -> None:
+    entrypoint = package_entrypoint(tmp_path)
+    sandbox = tmp_path / "not-created"
+
+    def runner(args: list[str], **kwargs: Any) -> subprocess.CompletedProcess[bytes]:
+        assert not sandbox.exists()
+        assert "cwd" not in kwargs
+        assert args[2:] == ["status", "1551", "--repo", str(sandbox), "--json"]
+        return subprocess.CompletedProcess(
+            args,
+            0,
+            stdout=json.dumps(
+                {
+                    "run_id": "1551",
+                    "valid": False,
+                    "sandbox_path": str(sandbox),
+                    "error": "run.json does not exist",
+                }
+            ).encode(),
+            stderr=b"",
+        )
+
+    status = FeatureFactoryBackend(
+        entrypoint=str(entrypoint), runner=runner
+    ).status("1551", sandbox=sandbox, launcher=entrypoint)
+
+    assert status.valid is False
+    assert status.sandbox_path == str(sandbox)
+
+
+def test_status_spawn_failure_remains_infrastructure_error(tmp_path: Path) -> None:
+    entrypoint = package_entrypoint(tmp_path)
+    sandbox = tmp_path / "not-created"
+
+    def runner(args: list[str], **kwargs: Any) -> subprocess.CompletedProcess[bytes]:
+        raise FileNotFoundError("node executable is unavailable")
+
+    backend = FeatureFactoryBackend(entrypoint=str(entrypoint), runner=runner)
+    with pytest.raises(FileNotFoundError, match="node executable is unavailable"):
+        backend.status("1551", sandbox=sandbox, launcher=entrypoint)
 
 
 def test_status_control_rejects_malformed_trailing_and_nonfinite_output(tmp_path: Path) -> None:

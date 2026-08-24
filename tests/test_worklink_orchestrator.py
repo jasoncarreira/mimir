@@ -4488,7 +4488,6 @@ def test_factory_pre_manifest_status_is_bounded_by_startup_deadline(
     import mimir.worklink.orchestrator as orchestrator
 
     sandbox = tmp_path / "sandbox"
-    sandbox.mkdir()
     handle = LaunchHandle("local_subprocess", "123", 456)
     stopped = asyncio.Event()
     lifecycle: list[str] = []
