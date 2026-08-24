@@ -88,6 +88,30 @@ async def test_search_sessions_empty_db(store):
     assert results == []
 
 
+def test_session_recency_plans_use_indexes_without_temp_sort(store):
+    conn = store._ensure_conn()
+    plans = [
+        conn.execute(
+            "EXPLAIN QUERY PLAN SELECT id FROM sessions "
+            "INDEXED BY idx_sessions_recency "
+            "WHERE visibility = ? OR owner_principal = ? "
+            "ORDER BY COALESCE(ended_at, reflected_at) DESC, id ASC LIMIT 500",
+            ("public", "alice"),
+        ).fetchall(),
+        conn.execute(
+            "EXPLAIN QUERY PLAN SELECT id FROM sessions "
+            "INDEXED BY idx_sessions_channel_recency "
+            "WHERE (visibility = ? OR owner_principal = ?) AND channel_id = ? "
+            "ORDER BY COALESCE(ended_at, reflected_at) DESC, id ASC LIMIT 500",
+            ("public", "alice", "channel"),
+        ).fetchall(),
+    ]
+    details = [" ".join(row[3] for row in plan) for plan in plans]
+    assert "idx_sessions_recency" in details[0]
+    assert "idx_sessions_channel_recency" in details[1]
+    assert all("TEMP B-TREE" not in detail for detail in details)
+
+
 @pytest.mark.asyncio
 async def test_search_sessions_basic_result_shape(store):
     """After ending two sessions, search returns dicts with required keys."""
@@ -596,7 +620,8 @@ def test_migration_v6_cleans_orphaned_access_events_rows(tmp_path):
 
     # Schema version must be stamped at the current version.
     v = conn.execute("SELECT MAX(version) FROM schema_version").fetchone()[0]
-    assert v == 10, f"schema_version should be 10 post-migration, got {v}"
+    from mimir.saga import migrations
+    assert v == migrations.CURRENT_SCHEMA_VERSION
 
     # PRAGMA foreign_key_check must return empty — no orphans remain.
     conn2 = sqlite3.connect(str(db_path))
@@ -710,9 +735,10 @@ def test_migration_v7_is_idempotent_on_fresh_db(tmp_path):
     store = SagaStore(db_path=db_path, embedding_dim=4)
     conn = store._ensure_conn()
 
-    # Schema version must be stamped at v10 (CURRENT_SCHEMA_VERSION).
+    # Schema version must be stamped at CURRENT_SCHEMA_VERSION.
     v = conn.execute("SELECT MAX(version) FROM schema_version").fetchone()[0]
-    assert v == 10, f"fresh DB must be at v10; got {v}"
+    from mimir.saga import migrations
+    assert v == migrations.CURRENT_SCHEMA_VERSION
 
     # Insert an atom and then delete it — dependents must cascade.
     now = "2026-05-24T03:00:00+00:00"
