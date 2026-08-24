@@ -64,6 +64,7 @@ _EMBED_RETRY_KEY = "_mimir_embedding_retry"
 # Triple cosine ranking is intentionally limited to the newest eligible rows.
 # This bounds BLOB transfer and scoring work while giving truncation a stable,
 # meaningful policy instead of relying on SQLite's arbitrary table order.
+# Operators can override this default with [storage].triple_candidate_limit.
 TRIPLE_CANDIDATE_LIMIT = 500
 
 
@@ -760,10 +761,21 @@ def rank_triple_candidates(
 ) -> list[dict]:
     """Read and cosine-rank one bounded pool of eligible triples.
 
-    The newest :data:`TRIPLE_CANDIDATE_LIMIT` rows are selected before BLOBs
-    enter Python. Both query retrieval views consume this same ranked list.
+    The newest ``[storage].triple_candidate_limit`` eligible rows are selected
+    before BLOBs enter Python. If more rows are eligible, the oldest triples are
+    excluded from semantic candidacy and a warning makes that partial-recall
+    tradeoff visible. Consolidation adds and merges knowledge but does not
+    guarantee the live triple count remains below this independently configured
+    retrieval bound. Both query retrieval views consume this same ranked list.
     """
+    from ._config_io import get_config
     from .ownership import SagaReadAuthorization
+
+    candidate_limit = int(
+        get_config()("storage", "triple_candidate_limit", TRIPLE_CANDIDATE_LIMIT)
+    )
+    if candidate_limit < 1:
+        raise ValueError("storage.triple_candidate_limit must be at least 1")
 
     owns_read_authorization = read_authorization is None
     read_authorization = read_authorization or SagaReadAuthorization(
@@ -790,10 +802,18 @@ def rank_triple_candidates(
             ORDER BY t.created_at DESC, t.id ASC
             LIMIT ?
         """,
-        (dim, dim, ref_iso) + tuple(auth_params) + (TRIPLE_CANDIDATE_LIMIT,),
+        (dim, dim, ref_iso) + tuple(auth_params) + (candidate_limit + 1,),
     ).fetchall()
     if not rows:
         return []
+    if len(rows) > candidate_limit:
+        logger.warning(
+            "triple_candidate_pool_truncated: semantic recall considered only "
+            "the newest %d eligible triples; older eligible triples were excluded "
+            "(configure [storage].triple_candidate_limit to change this bound)",
+            candidate_limit,
+        )
+        rows = rows[:candidate_limit]
     candidates = [r for r in rows if r[1] is not None]
     scores = _cosine_scores(
         query_emb,

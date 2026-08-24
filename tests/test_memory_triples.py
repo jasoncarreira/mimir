@@ -817,22 +817,26 @@ def test_triple_augment_search_includes_future_valid_until(conn):
     assert results  # not expired
 
 
-def test_rank_triple_candidates_uses_bounded_recent_window(conn):
+def test_rank_triple_candidates_uses_configured_recent_window_and_warns(
+    conn, monkeypatch, caplog,
+):
+    from mimir.saga import _config_io
+
+    monkeypatch.setattr(
+        _config_io,
+        "get_config",
+        lambda: lambda section, key, default=None: (
+            2 if (section, key) == ("storage", "triple_candidate_limit") else default
+        ),
+    )
     _seed_atom(conn, "obs1", "source")
     exact = struct.pack("4f", 1.0, 0.0, 0.0, 0.0)
     orthogonal = struct.pack("4f", 0.0, 1.0, 0.0, 0.0)
-    rows = []
-    for index in range(TRIPLE_CANDIDATE_LIMIT + 1):
-        rows.append((
-            f"t-{index:04d}",
-            f"subject-{index}",
-            "prefers",
-            "value",
-            "obs1",
-            exact if index == 0 else orthogonal,
-            4,
-            f"2026-01-{index + 1:04d}",
-        ))
+    rows = [
+        ("oldest", "oldest", "prefers", "value", "obs1", exact, 4, "2026-01-01"),
+        ("middle", "middle", "prefers", "value", "obs1", orthogonal, 4, "2026-01-02"),
+        ("newest", "newest", "prefers", "value", "obs1", orthogonal, 4, "2026-01-03"),
+    ]
     conn.executemany(
         "INSERT INTO triples "
         "(id, subject, predicate, object, source_atom_id, embedding, embedding_dim, created_at) "
@@ -844,8 +848,17 @@ def test_rank_triple_candidates_uses_bounded_recent_window(conn):
         conn, [1.0, 0.0, 0.0, 0.0], dim=4, auth_context=ADMIN_SCOPE,
     )
 
-    assert len(ranked) == TRIPLE_CANDIDATE_LIMIT
-    assert "t-0000" not in {item["id"] for item in ranked}
+    assert len(ranked) == 2
+    assert "oldest" not in {item["id"] for item in ranked}
+    assert "triple_candidate_pool_truncated" in caplog.text
+    assert "newest 2 eligible triples" in caplog.text
+
+    conn.execute("DELETE FROM triples WHERE id = 'oldest'")
+    caplog.clear()
+    rank_triple_candidates(
+        conn, [1.0, 0.0, 0.0, 0.0], dim=4, auth_context=ADMIN_SCOPE,
+    )
+    assert "triple_candidate_pool_truncated" not in caplog.text
 
 
 def test_rank_triple_candidates_filters_dimension_before_window_limit(conn):
