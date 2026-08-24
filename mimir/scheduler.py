@@ -56,7 +56,7 @@ from .access_control import (
     parse_declared_shell_commands,
 )
 from .core_blocks import read_text_lossy
-from .event_logger import get_events_path, log_event, log_event_sync
+from .event_logger import get_events_path, log_event, log_event_sync, safe_log_event
 from ._context import active_pr_checkout_lease_paths, active_turn_snapshots
 from .loop_watchdog import (
     LoopStallWatchdog,
@@ -1197,6 +1197,10 @@ class Scheduler:
     #      which skill the agent should run.
     # loop_id: 4.1
     async def _fire(self, *, job: SchedulerJob) -> None:
+        # Import lazily for the same scheduler/tool-registry cycle avoided by
+        # ``_on_job_error`` above.
+        from .tools.budget_gate import _bounded_tool_event_error
+
         # Resolve the cron's prompt body. Precedence:
         #   1. ``prompt_file`` (relative to ``<home>/prompts/`` — escapes
         #      via ``..`` are rejected so an agent can't reference an
@@ -1239,6 +1243,12 @@ class Scheduler:
                     "scheduler %r: no scheduled_tick authority to extend; job not fired",
                     job.name,
                 )
+                await safe_log_event(
+                    "scheduled_tick_dropped",
+                    schedule_name=job.name,
+                    channel_id=_scheduler_channel_id(job.name, job.channel_id),
+                    reason="scheduled_tick_authority_unavailable",
+                )
                 return
         else:
             try:
@@ -1249,6 +1259,14 @@ class Scheduler:
                 )
             except ValueError as exc:
                 log.error("scheduler %r: %s; job not fired", job.name, exc)
+                await safe_log_event(
+                    "scheduled_tick_dropped",
+                    schedule_name=job.name,
+                    channel_id=_scheduler_channel_id(job.name, job.channel_id),
+                    reason=_bounded_tool_event_error(
+                        f"authority_profile_rejected: {exc}"
+                    ),
+                )
                 return
         service_principal = authority.canonical
 
@@ -1275,6 +1293,14 @@ class Scheduler:
                 log.error(
                     "scheduler %r: shell_commands rejected — %s; job not fired",
                     job.name, exc,
+                )
+                await safe_log_event(
+                    "scheduled_tick_dropped",
+                    schedule_name=job.name,
+                    channel_id=_scheduler_channel_id(job.name, job.channel_id),
+                    reason=_bounded_tool_event_error(
+                        f"shell_commands_rejected: {exc}"
+                    ),
                 )
                 return
             if declared:
