@@ -22,6 +22,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 from langchain.tools import ToolRuntime
+from langchain_core.tools import ToolException
 import pytest
 
 import mimir.tools.registry as registry
@@ -1945,6 +1946,75 @@ class TestSendMessageSkiplistGuard:
         )
         tok = set_current_turn(ctx)
         return ctx, tok, reset_current_turn
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "trigger",
+        [
+            "poller",
+            "github-poller:github-activity",
+            "custom-poller:arxiv-agent-memory",
+            "research-poller:pypi-deps-watch",
+            "scheduled_tick",
+            "shell_job_complete",
+            "saga_session_end",
+            "upgrade",
+        ],
+    )
+    async def test_skiplist_guard_arms_for_autonomous_trigger_families(
+        self, tmp_path, trigger: str,
+    ) -> None:
+        from mimir.event_logger import init_logger
+
+        init_logger(tmp_path / "events.jsonl", session_id="test-session")
+        bridge = _StubBridge()
+        set_channel_registry(_StubRegistry(bridge, channel_id="operator"))
+        _ctx, tok, reset = self._turn_ctx(trigger)
+        try:
+            with pytest.raises(ToolException, match="send_message rejected"):
+                assert send_message.coroutine is not None
+                await send_message.coroutine(
+                    text="end silent",
+                    channel_id="operator",
+                )
+        finally:
+            reset(tok)
+
+        assert bridge.send_calls == []
+        events = [
+            json.loads(line)
+            for line in (tmp_path / "events.jsonl").read_text().splitlines()
+        ]
+        [ev] = [e for e in events if e["type"] == "send_message_blocked_skiplist"]
+        assert ev["trigger"] == trigger
+        assert ev["matched_phrase"] == "end silent"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "trigger",
+        [
+            "user_message",
+            "github-poller-event:github-activity",
+            "worker:poller",
+            "poller-adjacent",
+        ],
+    )
+    async def test_skiplist_guard_does_not_arm_for_unrelated_triggers(
+        self, trigger: str,
+    ) -> None:
+        bridge = _StubBridge()
+        set_channel_registry(_StubRegistry(bridge, channel_id="operator"))
+        _ctx, tok, reset = self._turn_ctx(trigger)
+        try:
+            out = await send_message.ainvoke({
+                "text": "end silent",
+                "channel_id": "operator",
+            })
+        finally:
+            reset(tok)
+
+        assert "send_message ok" in out
+        assert bridge.send_calls == [{"cid": "operator", "text": "end silent"}]
 
     @pytest.mark.asyncio
     async def test_poller_skiplist_narration_is_rejected_and_logged(
