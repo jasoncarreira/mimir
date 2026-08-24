@@ -95,6 +95,18 @@ COMMITMENTS_JSONL_SCHEMA_VERSION = 1
 _LARGE_STORE_WARN_THRESHOLD = 500
 
 
+@dataclass(frozen=True)
+class CommitmentsReplay:
+    """One immutable store replay and its diagnostics.
+
+    Keeping diagnostics beside the records prevents a concurrent replay from
+    changing the metadata observed by the caller.
+    """
+
+    records: dict[str, CommitmentRecord]
+    corrupt_line_count: int = 0
+
+
 @dataclass
 class CommitmentsStore:
     """Owns ``<path>`` — typically ``<home>/.mimir/commitments.jsonl``.
@@ -114,7 +126,6 @@ class CommitmentsStore:
         self._inflight_lifecycle_ids: set[str] = set()
         # Guard: warn at most once per process instance to avoid log spam.
         self._warned_large_store: bool = False
-        self.last_corrupt_line_count: int = 0
 
     # ─── Appenders ──────────────────────────────────────────────────
 
@@ -539,13 +550,11 @@ class CommitmentsStore:
 
     # ─── Replay-to-state ────────────────────────────────────────────
 
-    def current_state(self) -> dict[str, CommitmentRecord]:
-        """Read the JSONL, apply all events in order, return
-        ``id → CommitmentRecord``. Missing file → empty dict."""
+    def replay(self) -> CommitmentsReplay:
+        """Replay the JSONL and return records with immutable diagnostics."""
         records: dict[str, CommitmentRecord] = {}
-        self.last_corrupt_line_count = 0
         if not self.path.exists():
-            return records
+            return CommitmentsReplay(records=records)
         # JSONL is append-chronological; we read full-file (small,
         # bounded by trim policy). tail-streaming the FULL file via
         # ``tail_jsonl_records`` reverses order; use a forward scan.
@@ -563,7 +572,6 @@ class CommitmentsStore:
                     corrupt_line_count += 1
                     continue
                 self._apply_event(records, event)
-        self.last_corrupt_line_count = corrupt_line_count
         if corrupt_line_count:
             log.warning(
                 "commitments: skipped %d corrupt jsonl line(s)",
@@ -583,7 +591,15 @@ class CommitmentsStore:
                 event_count,
                 _LARGE_STORE_WARN_THRESHOLD,
             )
-        return records
+        return CommitmentsReplay(
+            records=records,
+            corrupt_line_count=corrupt_line_count,
+        )
+
+    def current_state(self) -> dict[str, CommitmentRecord]:
+        """Read the JSONL, apply all events in order, return
+        ``id → CommitmentRecord``. Missing file → empty dict."""
+        return self.replay().records
 
     @staticmethod
     def _apply_event(

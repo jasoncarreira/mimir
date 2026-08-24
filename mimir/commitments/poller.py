@@ -103,10 +103,10 @@ async def check_due_and_expired(
         now_unix = time.time()
 
     result = DueCheckResult()
-    state = await asyncio.to_thread(store.current_state)
-    result.corrupt_lines = store.last_corrupt_line_count
+    replay = await asyncio.to_thread(store.replay)
+    result.corrupt_lines = replay.corrupt_line_count
 
-    for rec in state.values():
+    for rec in replay.records.values():
         result.scanned += 1
         if rec.is_terminal():
             continue

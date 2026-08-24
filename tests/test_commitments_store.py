@@ -1152,9 +1152,10 @@ def test_part_c_current_state_reports_corrupt_line_count(tmp_path: Path, caplog)
     store = CommitmentsStore(path=path)
 
     with caplog.at_level(logging.WARNING, logger="mimir.commitments.store"):
-        assert store.current_state() == {}
+        replay = store.replay()
 
-    assert store.last_corrupt_line_count == 2
+    assert replay.records == {}
+    assert replay.corrupt_line_count == 2
     assert any("skipped 2 corrupt jsonl line(s)" in r.getMessage() for r in caplog.records)
 
 
