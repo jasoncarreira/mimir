@@ -55,6 +55,7 @@ from mimir.worklink.dispatch_failures import (
 
 READY_LABEL = "worklink:ready"
 EPIC_LABEL = WORKLINK_EPIC_LABEL
+BLOCKED_LABEL = "worklink:blocked"
 _CHAINLINK_READ_TIMEOUT_SECONDS = 5
 
 
@@ -225,14 +226,21 @@ def _actionable_issue_ids(home: Path) -> list[int] | None:
 
 def _worklink_dispatch_plan(
     home: Path, *, active_lock_ids: set[int]
-) -> tuple[list[DispatchItem], int, int, set[int]] | None:
+) -> tuple[list[DispatchItem], int, int, int, set[int]] | None:
     ready_records = _issue_records_with_label(home, READY_LABEL)
     epic_records = _issue_records_with_label(home, EPIC_LABEL)
+    blocked_records = _issue_records_with_label(home, BLOCKED_LABEL)
     actionable_ids = _actionable_issue_ids(home)
-    if ready_records is None or epic_records is None or actionable_ids is None:
+    if (
+        ready_records is None
+        or epic_records is None
+        or blocked_records is None
+        or actionable_ids is None
+    ):
         return None
     labeled = {record.issue_id for record in ready_records}
     epics = {record.issue_id for record in epic_records}
+    blocked = {record.issue_id for record in blocked_records}
     actionable = set(actionable_ids)
     # An issue holding an active lock is not a dispatch candidate. Slots are reduced by the
     # active count, so leaving it in the sorted candidates lets a low id consume the slot its
@@ -245,17 +253,21 @@ def _worklink_dispatch_plan(
         if record.issue_id in actionable
         and record.issue_id not in epics
         and record.parent_id not in epics
+        and record.issue_id not in blocked
         and record.issue_id not in active_lock_ids
     )
     factory_epics = sorted(
         record.issue_id
         for record in epic_records
-        if record.issue_id in actionable and record.issue_id not in active_lock_ids
+        if record.issue_id in labeled
+        and record.issue_id in actionable
+        and record.issue_id not in blocked
+        and record.issue_id not in active_lock_ids
     )
     plan = [DispatchItem(issue_id, "leaf") for issue_id in leaves]
     if _factory_epics_enabled():
         plan.extend(DispatchItem(issue_id, "epic") for issue_id in factory_epics)
-    return plan, len(labeled), len(labeled - actionable), epics
+    return plan, len(labeled), len(labeled - actionable), len(labeled & blocked), epics
 
 
 def _configured_cap(home: Path) -> int:
@@ -432,7 +444,13 @@ def main() -> int:
             }
         )
         return 0
-    ready, labeled_ready_count, blocked_ready_count, epic_ids = ready_result
+    (
+        ready,
+        labeled_ready_count,
+        blocked_ready_count,
+        label_blocked_ready_count,
+        epic_ids,
+    ) = ready_result
     actionable_epic_count = len(epic_ids)
     dispatch_ready = [item for item in ready if item.issue_id not in backed_off_ids]
     leaf_cap = _configured_cap(home)
@@ -454,6 +472,7 @@ def main() -> int:
                 "ready_count": len(ready),
                 "labeled_ready_count": labeled_ready_count,
                 "blocked_ready_count": blocked_ready_count,
+                "label_blocked_ready_count": label_blocked_ready_count,
                 "actionable_epic_count": actionable_epic_count,
                 "active": active,
                 "cap": leaf_cap,
@@ -485,6 +504,7 @@ def main() -> int:
             "ready_count": len(ready),
             "labeled_ready_count": labeled_ready_count,
             "blocked_ready_count": blocked_ready_count,
+            "label_blocked_ready_count": label_blocked_ready_count,
             "actionable_epic_count": actionable_epic_count,
             "active": active,
             "cap": leaf_cap,

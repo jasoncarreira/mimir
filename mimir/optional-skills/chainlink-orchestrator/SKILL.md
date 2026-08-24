@@ -123,10 +123,13 @@ silently with an unlabeled executable leaf.
 Once installed and configured (see frontmatter env), the scheduler runs the
 `worklink-ready-queue` poller on its cron (default every 10 min). Each fire:
 
-1. Lists open `worklink:ready` leaves, intersects them with `chainlink issue ready`
-   actionability, and counts active Chainlink locks. A pre-labeled leaf blocked by
-   open dependencies stays untouched until Chainlink reports it ready; once its
-   blocker closes it is eligible on the next poller fire.
+1. Lists open `worklink:ready` issues, excludes `worklink:blocked`, intersects the
+   remainder with `chainlink issue ready` actionability, and counts active
+   Chainlink locks. A pre-labeled leaf blocked by open dependencies stays
+   untouched until Chainlink reports it ready; once its blocker closes it is
+   eligible on the next poller fire. With `MIMIR_FACTORY_EPICS_ENABLED`, an epic
+   must carry both `worklink:ready` and `worklink:epic`; removing
+   `worklink:ready` parks either dispatch path.
 2. Computes free slots from `worklink.yaml` `defaults.max_concurrent` minus active claims. Default cap is 2; `WORKLINK_MAX_CONCURRENT` is only a legacy fallback when the YAML key is absent.
 3. Launches `mimir worklink run <id>` **detached** for up to that many actionable leaves,
    then returns immediately (a run can take minutes; the poller's own 60s budget
@@ -153,6 +156,9 @@ Safety properties (do not bypass these in the poller):
 - **Stale recovery**: a worker that dies leaves a claim; the core TTL reaper
   (`MIMIR_WORKLINK_REAPER_CRON`) steals it back to `worklink:ready` (or
   `worklink:blocked` once attempts are spent).
+- **Attempt exhaustion**: the executor remains the authoritative budget check.
+  Its first exhausted refusal adds `worklink:blocked`, which excludes the issue
+  from later poller cycles even if a stale `worklink:ready` label remains.
 
 The poller never decides *what* is implementable — only the planner half (and
 the `worklink:ready` label it applies) does. The poller dispatches only the
