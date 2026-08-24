@@ -31,7 +31,7 @@ from .chat_skills import strip_chat_skill_extra
 from .channel_registry import ChannelRegistry
 from .config import Config
 from .dispatcher import Dispatcher
-from .event_logger import init_logger, log_event, log_event_sync
+from .event_logger import init_logger, log_durable_event_sync, log_event, log_event_sync
 from .http_ingress import strip_bridge_authority_extra, strip_server_owned_extra
 from .models import AgentEvent, make_process_session_id
 from .access_control import builtin_trigger_service_principal, repo_binding_startup_alerts
@@ -378,8 +378,15 @@ def _cleanup_exception(exc: BaseException) -> Exception:
 
 
 def _cleanup_note(errors: list[Exception]) -> str:
-    details = "; ".join(f"{type(error).__name__}: {error}" for error in errors)
-    return f"server startup compensation had {len(errors)} cleanup failure(s): {details}"[:2000]
+    details: list[str] = []
+    for error in errors:
+        try:
+            rendered = str(error)
+        except BaseException:
+            rendered = "<unprintable>"
+        details.append(f"{type(error).__name__}: {rendered}")
+    joined = "; ".join(details)
+    return f"server startup compensation had {len(errors)} cleanup failure(s): {joined}"[:2000]
 
 
 def _clear_runtime_app_state(
@@ -1073,9 +1080,11 @@ def reattach_inflight_worklink_runs(
 
 def build_app(config: Config) -> web.Application:
     # The structured event stream does not exist until init_logger below.
-    # Pending-update application, config parsing, bind validation, dependency
-    # preflight, session-id generation, logs-dir creation, and logger construction
-    # can therefore fail before a startup event can be written.
+    # Pending-update application, Config.from_env, and bind validation run in
+    # main before build_app; dependency preflight, session-id generation,
+    # logs-dir creation, and logger construction run here before init_logger.
+    # Failures in those phases genuinely cannot emit startup_failed. Every
+    # _start_application phase runs after init_logger and is covered below.
     # Preserve the early dependency preflight: explicit coding opt-in still
     # fails loudly before broader server construction when the runtime is absent.
     from .tools import all_mimir_tools
@@ -1342,6 +1351,46 @@ def build_app(config: Config) -> web.Application:
     web_chat.register_routes(app)
 
     async def _start_application(app: web.Application) -> None:
+        # Capture the prior boot before replacing its marker, then mark this boot
+        # unclean before the first fallible application phase. Startup
+        # compensation intentionally leaves that marker unclean; only graceful
+        # _on_cleanup may flip it to clean=true.
+        from .liveness import (
+            UNCLEAN_NOTIFY_WINDOW,
+            detect_unclean_restart,
+            mark_session_running,
+            notify_unclean_restart,
+            read_session_marker,
+            write_session_marker,
+        )
+
+        startup_state.phase = "liveness_detection"
+        _now = time.time()
+        _prior_session = detect_unclean_restart(config.home)
+        # Coalesce notices across a crash-loop: notify only if we haven't
+        # already paged within UNCLEAN_NOTIFY_WINDOW. The event is logged every
+        # time regardless; only the out-of-band notify is rate-limited.
+        _notify = False
+        _carry_ts: float | None = None
+        if _prior_session is not None:
+            _last = _prior_session.get("last_unclean_notify_ts")
+            _within = (
+                isinstance(_last, (int, float))
+                and (_now - _last) < UNCLEAN_NOTIFY_WINDOW
+            )
+            _notify = not _within
+            # Carry only a notification that an earlier boot actually attempted.
+            # A newly detected incident stays pending until this boot reaches the
+            # notification handoff below; if startup aborts first, the next boot
+            # must still try rather than rate-limit an alert that never happened.
+            _carry_ts = _last if _within else None
+        startup_state.phase = "liveness_marker"
+        startup_state.liveness_mark_attempted = True
+        if not mark_session_running(
+            config.home, started_at=_now, last_unclean_notify_ts=_carry_ts,
+        ):
+            raise RuntimeError("failed to persist unclean startup marker")
+
         startup_state.phase = "agent_runtime"
         startup_state.runtime_attempted = True
         bundle = await create_agent_runtime(config, core, runtime_adapters)
@@ -2044,39 +2093,9 @@ def build_app(config: Config) -> web.Application:
             name="mimir-startup-indexer-sweep",
         )
 
-        # Clean-shutdown / unclean-restart detection (chainlink #507). A
-        # complementary, sidecar-free signal to the out-of-process watchdog:
-        # mark_session_running writes a clean=false marker now; _on_cleanup
-        # flips it to clean=true on a graceful (SIGTERM-initiated) stop. If the
-        # prior marker is still clean=false at this boot, the last run died
-        # without cleanup — crash, OOM-kill, hard restart, or a wedge that got
-        # killed. Log it (so it surfaces in the algedonic feedback block) and
-        # push an out-of-band notice on the same sinks as the watchdog. First
-        # boot (no marker) and a clean prior stop both no-op.
-        from .liveness import (
-            UNCLEAN_NOTIFY_WINDOW,
-            detect_unclean_restart,
-            mark_session_running,
-            notify_unclean_restart,
-        )
-        startup_state.phase = "liveness_detection"
-        _now = time.time()
-        _prior_session = detect_unclean_restart(config.home)
-        # Coalesce notices across a crash-loop: notify only if we haven't
-        # already paged within UNCLEAN_NOTIFY_WINDOW. The event is logged every
-        # time regardless; only the out-of-band notify is rate-limited.
-        _notify = False
-        _carry_ts: float | None = None
-        if _prior_session is not None:
-            _last = _prior_session.get("last_unclean_notify_ts")
-            _within = isinstance(_last, (int, float)) and (_now - _last) < UNCLEAN_NOTIFY_WINDOW
-            _notify = not _within
-            _carry_ts = _now if _notify else _last
-        startup_state.phase = "liveness_marker"
-        startup_state.liveness_mark_attempted = True
-        mark_session_running(
-            config.home, started_at=_now, last_unclean_notify_ts=_carry_ts,
-        )
+        # Report the prior marker captured before this boot marked itself
+        # unclean. Delaying only the event/notification preserves the existing
+        # startup ordering while protecting every earlier fallible phase.
         if _prior_session is not None:
             startup_state.phase = "unclean_restart_event"
             await log_event(
@@ -2086,11 +2105,35 @@ def build_app(config: Config) -> web.Application:
                 notified=_notify,
             )
             if _notify:
-                # Background — the notify POSTs to ntfy/webhook (up to 8s) and
-                # must not block startup.
+                # Stamp the handoff only after the notification coroutine returns.
+                # A spawn failure, cancellation during startup compensation, or
+                # marker-fsync failure therefore leaves the incident retryable on
+                # the next boot instead of exposing a timestamp for work that was
+                # cancelled before it ran.
+                async def _notify_and_record_handoff() -> None:
+                    await notify_unclean_restart(config.home, prior=_prior_session)
+                    # Never rewrite marker state here: graceful cleanup may have
+                    # already set clean=true while this network task was in flight.
+                    # The crash-loop timestamp is telemetry, not permission to
+                    # resurrect the current session as unclean.
+                    current_marker = read_session_marker(config.home)
+                    if current_marker is None:
+                        raise RuntimeError(
+                            "cannot persist unclean-restart notification handoff: "
+                            "session marker is unreadable"
+                        )
+                    if current_marker.get("started_at") != _now:
+                        return
+                    current_marker["last_unclean_notify_ts"] = time.time()
+                    if not write_session_marker(config.home, current_marker):
+                        raise RuntimeError(
+                            "failed to persist unclean-restart notification handoff"
+                        )
+
+                startup_state.phase = "unclean_restart_notify_handoff"
                 spawn_background(
                     startup_background_tasks,
-                    notify_unclean_restart(config.home, prior=_prior_session),
+                    _notify_and_record_handoff(),
                     name="mimir-unclean-restart-notify",
                 )
 
@@ -2156,16 +2199,29 @@ def build_app(config: Config) -> web.Application:
             await _start_application(app)
         except BaseException as original_exception:
             try:
-                await log_event(
+                # Startup can terminate the process immediately after this
+                # handler returns, so use the propagating fsync-backed path
+                # rather than the ordinary buffered async telemetry append.
+                await asyncio.to_thread(
+                    log_durable_event_sync,
                     "startup_failed",
                     phase=startup_state.phase,
                     exception=repr(original_exception),
                 )
             except BaseException:  # Preserve the startup failure if its diagnostic cannot be written.
-                log.exception("failed to write server startup failure event")
+                try:
+                    log.exception("failed to write durable server startup failure event")
+                except BaseException:
+                    pass
             errors = await _compensate_startup(app)
+            logging_errors: list[Exception] = []
             for error in errors:
-                log.error("server startup compensation failed: %s", error)
+                try:
+                    log.error("server startup compensation failed: %s", error)
+                except BaseException as exc:
+                    logging_errors.append(_cleanup_exception(exc))
+            if logging_errors:
+                errors.extend(logging_errors)
             if errors:
                 original_exception.add_note(_cleanup_note(errors))
             raise
@@ -2204,7 +2260,11 @@ def build_app(config: Config) -> web.Application:
             cleanup_started = time.monotonic()
             from .liveness import mark_clean_shutdown
 
-            attempt_sync(lambda: mark_clean_shutdown(config.home))
+            def persist_clean_shutdown() -> None:
+                if not mark_clean_shutdown(config.home):
+                    raise RuntimeError("failed to persist clean-shutdown marker")
+
+            attempt_sync(persist_clean_shutdown)
             from .worklink.autonomy import release_claims_for_graceful_shutdown
 
             release_timeout = 5.0

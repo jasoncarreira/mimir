@@ -6,6 +6,7 @@ import asyncio
 import fcntl
 import json
 import multiprocessing
+import os
 import threading
 import time
 from pathlib import Path
@@ -41,6 +42,50 @@ async def test_log_appends_record_with_session_and_type(tmp_path: Path):
     assert lines[0]["home"] == "/h"
     assert "timestamp" in lines[0]
     assert lines[1]["tool"] == "echo"
+
+
+def test_durable_log_fsyncs_new_file_and_parent_directory(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    logger = EventLogger(tmp_path / "events.jsonl", session_id="proc-1")
+    fsynced: list[int] = []
+    monkeypatch.setattr("mimir.event_logger.os.fsync", lambda fd: fsynced.append(fd))
+
+    logger.log_durable_sync("startup_failed", phase="agent_runtime")
+
+    expected = 2 if hasattr(os, "O_DIRECTORY") else 1
+    assert len(fsynced) == expected
+
+
+def test_durable_log_after_nondurable_creation_fsyncs_file_and_directory(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "events.jsonl"
+    logger = EventLogger(path, session_id="proc-1")
+    logger.log_sync("startup_progress", phase="agent_runtime")
+    fsynced: list[int] = []
+    monkeypatch.setattr("mimir.event_logger.os.fsync", lambda fd: fsynced.append(fd))
+
+    logger.log_durable_sync("startup_failed", phase="scheduler_start")
+
+    expected = 2 if hasattr(os, "O_DIRECTORY") else 1
+    assert len(fsynced) == expected
+
+
+def test_durable_log_propagates_fsync_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    logger = EventLogger(tmp_path / "events.jsonl", session_id="proc-1")
+
+    def fail_fsync(fd: int) -> None:
+        raise OSError("fsync failed")
+
+    monkeypatch.setattr("mimir.event_logger.os.fsync", fail_fsync)
+    with pytest.raises(OSError, match="fsync failed"):
+        logger.log_durable_sync("startup_failed", phase="scheduler_start")
 
 
 @pytest.mark.asyncio
@@ -361,7 +406,7 @@ def test_process_append_survives_trim_rename_window(tmp_path, monkeypatch):
 
 
 def test_process_lock_timeout_degrades_to_append(tmp_path, monkeypatch, caplog):
-    """A stuck process lock cannot block a turn indefinitely."""
+    """A stuck process lock cannot block an ordinary event indefinitely."""
     import mimir.event_logger as event_logger
 
     path = tmp_path / "events.jsonl"
@@ -379,3 +424,24 @@ def test_process_lock_timeout_degrades_to_append(tmp_path, monkeypatch, caplog):
     assert json.loads(path.read_text())["type"] == "lock_degraded"
     assert "process lock timed out" in caplog.text
     assert "continuing with an unlocked append" in caplog.text
+
+
+def test_durable_process_lock_timeout_fails_instead_of_claiming_success(
+    tmp_path, monkeypatch, caplog,
+):
+    """A durable append must not race trim's rename by writing unlocked."""
+    import mimir.event_logger as event_logger
+
+    path = tmp_path / "events.jsonl"
+    logger = EventLogger(path, session_id="server")
+    monkeypatch.setattr(event_logger, "PROCESS_LOCK_TIMEOUT_SECONDS", 0.05)
+    logger._process_lock_path.touch()
+
+    with logger._process_lock_path.open("a", encoding="utf-8") as holder:
+        fcntl.flock(holder.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        with pytest.raises(TimeoutError, match="durable append"):
+            logger.log_durable_sync("startup_failed", phase="agent_runtime")
+
+    assert not path.exists()
+    assert "process lock timed out" in caplog.text
+    assert "failing durable append" in caplog.text
