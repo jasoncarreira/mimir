@@ -1446,6 +1446,7 @@ def test_closing_principals_reach_bounded_tracker_operations_when_enforced(
     "command",
     [
         "gh pr view 7 --repo acme/widget --json number,title",
+        "gh pr view 7 -R acme/widget --json number,title",
         "gh issue view 9 --repo acme/widget --json number,title --comments",
     ],
 )
@@ -1500,6 +1501,86 @@ def test_session_boundary_github_reads_refuse_unconfigured_repository(
     )
 
     assert decision.allowed is False, decision.reason
+
+
+@pytest.mark.parametrize(
+    ("repository_option", "repository", "admitted"),
+    [
+        ("--repo {}", "acme/widget", True),
+        ("-R {}", "acme/widget", True),
+        ("--repo={}", "acme/widget", True),
+        ("-R{}", "acme/widget", True),
+        ("--repo {}", "other/repo", False),
+        ("-R {}", "other/repo", False),
+        ("--repo={}", "other/repo", False),
+        ("-R{}", "other/repo", False),
+    ],
+)
+@pytest.mark.parametrize(
+    "command_template",
+    [
+        "gh pr view 7 {} --json number,title",
+        "gh issue view 7 {} --json number,title",
+    ],
+)
+def test_session_boundary_github_repository_aliases_share_the_configured_bound(
+    command_template: str,
+    repository_option: str,
+    repository: str,
+    admitted: bool,
+    monkeypatch: pytest.MonkeyPatch,
+    maintenance_pinned_executables: dict[str, Path],
+) -> None:
+    """Every gh spelling accepted by syntax must reach the same repository guard."""
+    monkeypatch.setenv("GITHUB_REPOS", "acme/widget")
+    command = command_template.format(repository_option.format(repository))
+
+    argv = parse_service_shell_argv(command, "session_boundary")
+
+    assert (argv is not None) is admitted
+
+
+def test_session_boundary_github_repository_refusal_is_flag_independent(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    maintenance_pinned_executables: dict[str, Path],
+) -> None:
+    monkeypatch.setenv("GITHUB_REPOS", "acme/widget")
+    monkeypatch.delenv("MIMIR_ACCESS_CONTROL_ENFORCED", raising=False)
+    service = access_control.builtin_trigger_service_principal(
+        "session-boundary", tmp_path,
+    )
+    auth = _trusted_service_auth(service, channel_id="channel-a")
+    command = "gh pr view 7 -Rother/repo --json number,title"
+
+    assert parse_service_shell_argv(command, "session_boundary") is None
+    decision = ToolRegistry().authorize_tool(
+        "shell_exec", auth, enforce=True, target_channel=command,
+        arguments={"command": command},
+    )
+
+    assert decision.allowed is False
+
+
+def test_gh_repository_allowlist_and_guard_use_the_same_option_table(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("GITHUB_REPOS", "acme/widget")
+
+    assert access_control._GH_REPOSITORY_EXACT_OPTIONS == {
+        option for option, _prefix in access_control._GH_REPOSITORY_OPTION_FORMS
+    }
+    assert access_control._GH_REPOSITORY_OPTION_PREFIXES == tuple(
+        prefix for _option, prefix in access_control._GH_REPOSITORY_OPTION_FORMS
+    )
+    for rendered in (
+        ["--repo", "other/repo"],
+        ["-R", "other/repo"],
+        ["--repo=other/repo"],
+        ["-Rother/repo"],
+    ):
+        assert access_control._gh_repository_operand(rendered) is not None
+        assert access_control._gh_repo_operands_are_configured(rendered) is False
 
 
 def test_session_boundary_github_read_refuses_repo_flag_without_value(
@@ -6372,9 +6453,9 @@ def test_dynamic_trigger_write_denies_symlinked_protected_paths(
 @pytest.mark.parametrize(
     "command",
     [
-        "gh pr view 979 --json number,title,headRefOid",
-        "gh pr diff 979 --patch",
-        "gh pr checks 979 --required",
+        "gh pr view 979 --repo owner/repo --json number,title,headRefOid",
+        "gh pr diff 979 --repo owner/repo --patch",
+        "gh pr checks 979 --repo owner/repo --required",
         "git status --short",
         "git log --oneline --max-count=10",
         "git diff --stat HEAD~1",
@@ -6472,9 +6553,9 @@ def test_repo_review_commands_agree_for_host_and_contained_git_identity(
         "owner/repo", 1279, "worklink/1279", str(repo_review_git_root),
     )
     commands = (
-        "gh pr view 979 --json number,title,headRefOid",
-        "gh pr diff 979 --patch",
-        "gh pr checks 979 --required",
+        "gh pr view 979 --repo owner/repo --json number,title,headRefOid",
+        "gh pr diff 979 --repo owner/repo --patch",
+        "gh pr checks 979 --repo owner/repo --required",
         "git status --short",
         "git log --oneline --max-count=10",
         "git diff --stat HEAD~1",
@@ -6651,14 +6732,166 @@ def test_repo_review_git_inspection_suppresses_hostile_repository_helpers(
 def test_repo_review_shell_profile_admits_pr_view_repo_alias(
     maintenance_pinned_executables: dict[str, Path],
 ) -> None:
+    state = _review_state("jasoncarreira/mimir", 1220, "worklink/1220", "/tmp")
     argv = parse_service_shell_argv(
         "gh pr view 1220 -R jasoncarreira/mimir --json "
         "number,title,state,isDraft,author,headRefOid,reviews,comments,body,files",
-        "repo_review",
+        "repo_review", review_state=state,
     )
 
     assert argv is not None
     assert argv[0] == str(maintenance_pinned_executables["gh"])
+
+
+@pytest.mark.parametrize(
+    "command_template",
+    [
+        "gh pr view 5 {} --json body",
+        "gh pr diff 5 {}",
+        "gh pr checks 5 {}",
+        "gh issue view 5 {} --json body",
+    ],
+)
+@pytest.mark.parametrize(
+    ("repository_option", "repository", "admitted"),
+    [
+        ("--repo {}", "acme/widget", True),
+        ("-R {}", "acme/widget", True),
+        ("--repo={}", "acme/widget", True),
+        ("-R{}", "acme/widget", True),
+        ("--repo {}", "victim/private", False),
+        ("-R {}", "victim/private", False),
+        ("--repo={}", "victim/private", False),
+        ("-R{}", "victim/private", False),
+    ],
+)
+def test_repo_review_github_reads_bind_every_repository_alias_to_scope(
+    command_template: str,
+    repository_option: str,
+    repository: str,
+    admitted: bool,
+    maintenance_pinned_executables: dict[str, Path],
+) -> None:
+    state = _review_state("acme/widget", 5, "worklink/5", "/tmp")
+    command = command_template.format(repository_option.format(repository))
+
+    argv = parse_service_shell_argv(
+        command, "repo_review", review_state=state,
+    )
+
+    assert (argv is not None) is admitted, command
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "gh pr view 5 --json body",
+        "gh pr diff 5",
+        "gh pr checks 5",
+        "gh issue view 5 --json body",
+    ],
+)
+def test_repo_review_github_reads_require_explicit_repository(
+    command: str,
+    maintenance_pinned_executables: dict[str, Path],
+) -> None:
+    state = _review_state("acme/widget", 5, "worklink/5", "/tmp")
+
+    argv = parse_service_shell_argv(
+        command, "repo_review", review_state=state,
+    )
+
+    assert argv is None, command
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "gh pr view 5 --repo acme/widget --json body",
+        "gh pr diff 5 --repo acme/widget",
+        "gh pr checks 5 --repo acme/widget",
+        "gh issue view 5 --repo acme/widget --json body",
+    ],
+)
+def test_repo_review_github_reads_refuse_absent_review_state(
+    command: str,
+    maintenance_pinned_executables: dict[str, Path],
+) -> None:
+    argv = parse_service_shell_argv(command, "repo_review")
+
+    assert argv is None, command
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        ["-R=acme/widget"],
+        ["-R", "=acme/widget"],
+    ],
+)
+def test_gh_repository_operand_rejects_equals_prefixed_short_option_value(
+    arguments: list[str],
+) -> None:
+    assert access_control._gh_repository_operand(arguments) is None
+
+
+@pytest.mark.parametrize(
+    ("path", "admitted"),
+    [
+        ("repos/acme/widget/contents/README.md", True),
+        ("repos/acme/widget/pulls/5/reviews", True),
+        ("repos/victim/private/contents/README.md", False),
+        ("user/repos", False),
+        ("orgs/secret-org/members", False),
+    ],
+)
+def test_repo_review_gh_api_is_bounded_to_scope_repository(
+    path: str,
+    admitted: bool,
+    maintenance_pinned_executables: dict[str, Path],
+) -> None:
+    state = _review_state("acme/widget", 5, "worklink/5", "/tmp")
+
+    argv = parse_service_shell_argv(
+        f"gh api {path} --paginate", "repo_review", review_state=state,
+    )
+
+    assert (argv is not None) is admitted
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "gh pr view 5 --repo victim/private --json body",
+        "gh pr diff 5 --repo victim/private",
+        "gh pr checks 5 --repo victim/private",
+        "gh issue view 5 --repo victim/private",
+        "gh api repos/victim/private/contents/README.md",
+        "gh api user/repos --paginate",
+        "gh api orgs/secret-org/members",
+    ],
+)
+def test_repo_review_sink_gate_refuses_reads_outside_bound_repository(
+    command: str,
+    maintenance_pinned_executables: dict[str, Path],
+) -> None:
+    state = _review_state("acme/widget", 5, "worklink/5", "/tmp")
+    service = build_trigger_service_principal(
+        canonical="poller:github-activity", trigger="poller", profile="github",
+        tier=CapabilityTier.CODE_EXECUTION,
+        capabilities=("shell_exec", "bash_jobs_list", "bash_job_output"),
+        creation_path="test",
+    )
+    auth = _service_auth(
+        service, InformationFlowLabels(), repo_review_state=state,
+    )
+
+    decision = ToolRegistry().authorize_tool(
+        "shell_exec", auth, enforce=True, target_channel=command,
+        arguments={"command": command},
+    )
+
+    assert decision.allowed is False, command
 
 
 @pytest.mark.parametrize(
@@ -6705,7 +6938,6 @@ def test_repo_review_profile_admits_bounded_review_and_remediation_surface(
     worktree = root / "review-worktree"
     admitted = (
         "gh api repos/o/r/pulls/1243/reviews --paginate",
-        "gh api user -X GET",
         "gh issue view 1028 --repo o/r --json number,title --comments",
         "gh auth status",
         "git log --oneline -5 -- mimir/access_control.py",
@@ -6729,6 +6961,15 @@ def test_repo_review_profile_admits_bounded_review_and_remediation_surface(
             "shell_exec", auth, enforce=True, target_channel=command,
         )
         assert decision.allowed is True, (command, decision.refusal_detail)
+
+    for command in (
+        "gh api user/repos --paginate",
+        "gh api orgs/secret-org/members",
+    ):
+        decision = registry.authorize_tool(
+            "shell_exec", auth, enforce=True, target_channel=command,
+        )
+        assert decision.allowed is False, command
 
     commit_argv = parse_service_shell_argv(
         "git commit -m safe", "repo_review", review_state=state,
@@ -8310,7 +8551,7 @@ def test_every_service_shell_profile_returns_absolute_executables(
         "repo_review": (
             "pwd -P", "ls -la", "wc -l sample.txt", "grep -n needle sample.txt",
             "jq -r .name sample.json", "rg --no-config -n needle .",
-            "git status --short", "gh pr view 979 --json title",
+            "git status --short", "gh pr view 979 --repo owner/repo --json title",
             "npm ci --ignore-scripts",
         ),
         "maintenance": (
@@ -9159,6 +9400,35 @@ def test_maintenance_shell_profile_admits_prompt_inspection_commands(
         "bash_async", "shell_profile", "maintenance",
     )
     assert decision.allowed is True, decision.reason
+
+
+@pytest.mark.parametrize(
+    ("repository_option", "repository", "admitted"),
+    [
+        ("--repo {}", "acme/widget", True),
+        ("-R {}", "acme/widget", True),
+        ("--repo={}", "acme/widget", True),
+        ("-R{}", "acme/widget", True),
+        ("--repo {}", "other/repo", False),
+        ("-R {}", "other/repo", False),
+        ("--repo={}", "other/repo", False),
+        ("-R{}", "other/repo", False),
+    ],
+)
+def test_maintenance_github_repository_operands_are_configured(
+    repository_option: str,
+    repository: str,
+    admitted: bool,
+    monkeypatch: pytest.MonkeyPatch,
+    maintenance_pinned_executables: dict[str, Path],
+) -> None:
+    """The shared gh operand guard also closes the other built-in read profile."""
+    monkeypatch.setenv("GITHUB_REPOS", "acme/widget")
+    command = f"gh pr view 7 {repository_option.format(repository)} --json number"
+
+    argv = parse_service_shell_argv(command, "maintenance")
+
+    assert (argv is not None) is admitted
 
 
 @pytest.mark.parametrize(
@@ -10698,7 +10968,7 @@ def test_review_skill_only_demonstrates_commands_the_poller_can_run() -> None:
 
     # Shapes the trusted-service shell profile can never admit, and the reason.
     forbidden = (
-        ("gh api", "`gh api` is not in the repo_review allow-list"),
+        ("gh api", "review instructions use bounded gh subcommands, not raw API paths"),
         ("--jq", "--jq is a credential read (jq env/$ENV) and is admitted nowhere"),
         ("<<", "a heredoc cannot survive single-argv exec with shell=False"),
         ("$(", "command substitution cannot survive single-argv exec"),

@@ -2747,8 +2747,98 @@ def _repo_review_push_refspec(refspec: str, event_branch: str) -> bool:
     )
 
 
-def _repo_review_gh_api_arguments(arguments: list[str]) -> bool:
-    """Admit one parameterized API path and GET-only transport options."""
+_GH_REPOSITORY_OPTION_FORMS = (
+    ("--repo", "--repo="),
+    ("-R", "-R"),
+)
+_GH_REPOSITORY_EXACT_OPTIONS = frozenset(
+    option for option, _prefix in _GH_REPOSITORY_OPTION_FORMS
+)
+_GH_REPOSITORY_OPTION_PREFIXES = tuple(
+    prefix for _option, prefix in _GH_REPOSITORY_OPTION_FORMS
+)
+
+
+def _gh_repository_operand(
+    arguments: list[str],
+) -> tuple[str | None, list[str]] | None:
+    """Extract one gh repository selector in any admitted spelling.
+
+    The option names and attached-value prefixes come from the same table used
+    by the command allowlists. Returning the remaining arguments lets custom
+    syntax matchers consume repository options without maintaining an alias list.
+    """
+    repository: str | None = None
+    remaining: list[str] = []
+    index = 0
+    options_ended = False
+    while index < len(arguments):
+        argument = arguments[index]
+        if options_ended:
+            remaining.append(argument)
+            index += 1
+            continue
+        if argument == "--":
+            options_ended = True
+            remaining.append(argument)
+            index += 1
+            continue
+
+        value: str | None = None
+        width = 1
+        for option, prefix in _GH_REPOSITORY_OPTION_FORMS:
+            if argument == option:
+                if index + 1 >= len(arguments):
+                    return None
+                value = arguments[index + 1]
+                width = 2
+                break
+            if argument.startswith(prefix) and argument != option:
+                value = argument[len(prefix):]
+                break
+        if value is None:
+            remaining.append(argument)
+            index += 1
+            continue
+        if (
+            not value
+            or value.startswith(("-", "="))
+            or repository is not None
+        ):
+            return None
+        repository = value
+        index += width
+    return repository, remaining
+
+
+def _repo_review_bound_repository(review_state: Any) -> str | None:
+    scope = getattr(review_state, "action_scope", None)
+    repository = getattr(scope, "canonical_repo", None)
+    return repository if isinstance(repository, str) and repository else None
+
+
+def _gh_arguments_match_bound_repository(
+    arguments: list[str], bound_repository: str | None,
+) -> bool:
+    parsed = _gh_repository_operand(arguments)
+    return (
+        parsed is not None
+        and _repositories_match(parsed[0], bound_repository)
+    )
+
+
+def _repositories_match(left: str | None, right: str | None) -> bool:
+    return (
+        isinstance(left, str)
+        and isinstance(right, str)
+        and left.casefold() == right.casefold()
+    )
+
+
+def _repo_review_gh_api_arguments(
+    arguments: list[str], review_state: Any = None,
+) -> bool:
+    """Admit a GET-only API path beneath the review scope's repository."""
     path: str | None = None
     index = 0
     while index < len(arguments):
@@ -2767,10 +2857,30 @@ def _repo_review_gh_api_arguments(arguments: list[str]) -> bool:
         index += 1
     if path is None or re.fullmatch(r"[A-Za-z0-9._~!()+,=:@%/-]+", path) is None:
         return False
-    return all(segment not in {"", ".", ".."} for segment in path.split("/"))
+    segments = path.split("/")
+    if not all(segment not in {"", ".", ".."} for segment in segments):
+        return False
+    return (
+        len(segments) >= 3
+        and segments[0] == "repos"
+        and _repositories_match(
+            f"{segments[1]}/{segments[2]}",
+            _repo_review_bound_repository(review_state),
+        )
+    )
 
 
-def _repo_review_gh_issue_view_arguments(arguments: list[str]) -> bool:
+def _repo_review_gh_issue_view_arguments(
+    arguments: list[str], review_state: Any = None, *, bind_repository: bool = True,
+) -> bool:
+    parsed = _gh_repository_operand(arguments)
+    if parsed is None:
+        return False
+    repository, arguments = parsed
+    if bind_repository and not _repositories_match(
+        repository, _repo_review_bound_repository(review_state),
+    ):
+        return False
     if not arguments or arguments[0].startswith("-"):
         return False
     index = 1
@@ -2779,7 +2889,7 @@ def _repo_review_gh_issue_view_arguments(arguments: list[str]) -> bool:
         if option == "--comments":
             index += 1
             continue
-        if option in {"--json", "--repo"}:
+        if option == "--json":
             if index + 1 >= len(arguments) or arguments[index + 1].startswith("-"):
                 return False
             index += 2
@@ -2943,13 +3053,15 @@ def _target_matches_repo_review_shell_command(
     # set is fixed and exposes no environment accessor — verify that claim again
     # before adding any option that evaluates a caller-supplied expression.
     if argv[0] == "gh" and argv[1:2] == ["api"]:
-        return _repo_review_gh_api_arguments(argv[2:])
+        return _repo_review_gh_api_arguments(argv[2:], review_state)
 
     if argv[0] == "gh" and argv[1:] == ["auth", "status"]:
         return True
 
     if argv[0] == "gh" and len(argv) >= 3 and argv[1] == "issue":
-        return argv[2] == "view" and _repo_review_gh_issue_view_arguments(argv[3:])
+        return argv[2] == "view" and _repo_review_gh_issue_view_arguments(
+            argv[3:], review_state,
+        )
 
     if argv[0] == "gh" and len(argv) >= 3 and argv[1] == "pr":
         subcommand = argv[2]
@@ -2990,11 +3102,11 @@ def _target_matches_repo_review_shell_command(
             )
         options = {
             "view": frozenset({
-                "-R", "--comments", "--json", "--repo", "--template",
+                "--comments", "--json", "--template",
             }),
-            "diff": frozenset({"--color", "--name-only", "--patch", "--repo"}),
+            "diff": frozenset({"--color", "--name-only", "--patch"}),
             "checks": frozenset({
-                "--fail-fast", "--interval", "--json", "--repo",
+                "--fail-fast", "--interval", "--json",
                 "--required", "--watch",
             }),
             # Submitting the review is the point of the repo_review profile —
@@ -3019,8 +3131,18 @@ def _target_matches_repo_review_shell_command(
                 "--request-changes",
             }),
         }.get(subcommand)
+        read_subcommand = subcommand in {"view", "diff", "checks"}
+        if read_subcommand:
+            options = options | _GH_REPOSITORY_EXACT_OPTIONS
         if options is None or not _arguments_match_allowlist(
             argv[3:], exact_options=options,
+            option_prefixes=(
+                _GH_REPOSITORY_OPTION_PREFIXES if read_subcommand else ()
+            ),
+        ):
+            return False
+        if read_subcommand and not _gh_arguments_match_bound_repository(
+            argv[3:], _repo_review_bound_repository(review_state),
         ):
             return False
         if subcommand == "review":
@@ -3073,24 +3195,17 @@ def _target_matches_repo_review_shell_command(
 
 
 def _gh_repo_operands_are_configured(arguments: list[str]) -> bool:
-    """Require every explicit ``--repo`` operand to name configured server state.
+    """Require an explicit gh repository operand to name configured server state.
 
     The syntax matchers accept ``--repo <value>`` without inspecting the value.
     On a repo-review turn the bound comes from that turn's immutable pull-request
     scope, but the session-boundary profile carries no such scope, so an
     unchecked operand would reach any repository the process token can see.
     """
-    index = 0
-    while index < len(arguments):
-        if arguments[index] != "--repo":
-            index += 1
-            continue
-        if index + 1 >= len(arguments):
-            return False
-        if not is_configured_github_repo(arguments[index + 1]):
-            return False
-        index += 2
-    return True
+    parsed = _gh_repository_operand(arguments)
+    return parsed is not None and (
+        parsed[0] is None or is_configured_github_repo(parsed[0])
+    )
 
 
 def _target_matches_session_boundary_shell_command(argv: list[str]) -> bool:
@@ -3099,12 +3214,22 @@ def _target_matches_session_boundary_shell_command(argv: list[str]) -> bool:
         return True
     if argv[:3] == ["gh", "issue", "view"]:
         return (
-            _repo_review_gh_issue_view_arguments(argv[3:])
+            _repo_review_gh_issue_view_arguments(
+                argv[3:], bind_repository=False,
+            )
             and _gh_repo_operands_are_configured(argv[3:])
         )
     if argv[:3] == ["gh", "pr", "view"]:
+        parsed_repository = _gh_repository_operand(argv[3:])
+        if parsed_repository is None:
+            return False
+        repository, arguments = parsed_repository
         return (
-            _target_matches_repo_review_shell_command(argv)
+            _arguments_match_allowlist(
+                arguments,
+                exact_options=frozenset({"--comments", "--json", "--template"}),
+            )
+            and repository is not None
             and _gh_repo_operands_are_configured(argv[3:])
         )
     return False
@@ -3558,24 +3683,25 @@ def _target_matches_maintenance_shell_command(argv: list[str]) -> bool:
         options = {
             ("pr", "list"): frozenset({
                 "--app", "--assignee", "--author", "--base", "--draft", "--head",
-                "--json", "--label", "--limit", "--repo", "--search",
+                "--json", "--label", "--limit", "--search",
                 "--state", "--template",
             }),
             ("pr", "view"): frozenset({
-                "--comments", "--json", "--repo", "--template",
+                "--comments", "--json", "--template",
             }),
             ("issue", "list"): frozenset({
                 "--app", "--assignee", "--author", "--json", "--label",
-                "--limit", "--mention", "--milestone", "--repo", "--search",
+                "--limit", "--mention", "--milestone", "--search",
                 "--state", "--template",
             }),
             ("issue", "view"): frozenset({
-                "--comments", "--json", "--repo", "--template",
+                "--comments", "--json", "--template",
             }),
         }.get((resource, subcommand))
         return options is not None and _arguments_match_allowlist(
-            argv[3:], exact_options=options,
-        )
+            argv[3:], exact_options=options | _GH_REPOSITORY_EXACT_OPTIONS,
+            option_prefixes=_GH_REPOSITORY_OPTION_PREFIXES,
+        ) and _gh_repo_operands_are_configured(argv[3:])
 
     return False
 
@@ -4490,12 +4616,19 @@ def resolve_repository_review_state(
             argv = shlex.split(command)
         except ValueError:
             argv = []
-    if argv[:2] == ["gh", "pr"] and len(argv) >= 4:
+    if (
+        len(argv) >= 4
+        and (
+            argv[:2] == ["gh", "pr"]
+            or argv[:3] == ["gh", "issue", "view"]
+        )
+    ):
         try:
             pull_request = int(argv[3])
         except ValueError:
             pull_request = None
-        repository = _option_value(argv[4:], "--repo") or _option_value(argv[4:], "-R")
+        parsed_repository = _gh_repository_operand(argv[4:])
+        repository = parsed_repository[0] if parsed_repository is not None else None
         state = registry.resolve(repository, pull_request)
         if state is not None:
             return state, None
