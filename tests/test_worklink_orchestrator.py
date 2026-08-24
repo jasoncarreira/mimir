@@ -1700,6 +1700,158 @@ def test_worklink_runner_backend_nonzero_transitions_failed_without_pr(tmp_path:
     assert ["chainlink", "locks", "release", "441"] in calls
 
 
+def test_part_a_backend_exception_failed_transition_reports_not_applied(tmp_path: Path) -> None:
+    _reset_logger_for_tests()
+    events_path = tmp_path / "logs" / "events.jsonl"
+    init_logger(events_path, session_id="test-worklink")
+    repo = tmp_path / "repo"
+    worktree = repo.parent / ".worklink" / repo.name / "441-1"
+    calls, base_runner = _orchestrator_runner(repo, worktree)
+
+    def runner(
+        args: Sequence[str] | str,
+        *,
+        cwd: Path | None = None,
+        text: bool = True,
+    ) -> subprocess.CompletedProcess:
+        if isinstance(args, list) and args == [
+            "chainlink", "issue", "label", "441", "worklink:ready"
+        ]:
+            calls.append(args)
+            return cp(args, returncode=1, stderr="label add failed")
+        return base_runner(args, cwd=cwd, text=text)
+
+    class ExplodingBackend(FakeBackend):
+        async def interpret(self, order: WorkOrder, result: object) -> RawResult:
+            raise RuntimeError("interpret exploded")
+
+    registry = BackendRegistry(WorklinkConfig())
+    registry.register(ExplodingBackend())
+
+    result = asyncio.run(
+        WorklinkRunner(home=tmp_path, repo=repo, runner=runner, registry=registry).run(
+            441, backend_name="fake", test_command="echo ok"
+        )
+    )
+
+    assert result.status == "failed"
+    records = [json.loads(line) for line in events_path.read_text(encoding="utf-8").splitlines()]
+    transition = [record for record in records if record["type"] == "worklink_transition"][-1]
+    assert transition["status"] == "failed"
+    assert transition["reason"] == "interpret exploded"
+    assert transition["transition_applied"] is False
+    assert transition["error"] == "label add failed"
+    _reset_logger_for_tests()
+
+
+def test_no_pr_blocked_failed_transition_still_emits_and_propagates(tmp_path: Path) -> None:
+    _reset_logger_for_tests()
+    events_path = tmp_path / "logs" / "events.jsonl"
+    init_logger(events_path, session_id="test-worklink")
+    repo = tmp_path / "repo"
+    worktree = repo.parent / ".worklink" / repo.name / "441-1"
+    calls, base_runner = _orchestrator_runner(repo, worktree)
+
+    def runner(
+        args: Sequence[str] | str,
+        *,
+        cwd: Path | None = None,
+        text: bool = True,
+    ) -> subprocess.CompletedProcess:
+        if isinstance(args, list) and args == [
+            "chainlink", "issue", "label", "441", "worklink:blocked"
+        ]:
+            calls.append(args)
+            return cp(args, returncode=1, stderr="label add failed")
+        return base_runner(args, cwd=cwd, text=text)
+
+    class BlockingBackend(FakeBackend):
+        async def interpret(self, order: WorkOrder, result: object) -> RawResult:
+            self.orders.append(order)
+            return RawResult(
+                1,
+                order.transcript_root / "fake.json",
+                "blocked",
+                "planner gave contradictory acceptance criteria",
+                "planner gave contradictory acceptance criteria",
+            )
+
+    registry = BackendRegistry(WorklinkConfig())
+    registry.register(BlockingBackend(write_change=False))
+
+    result = asyncio.run(
+        WorklinkRunner(home=tmp_path, repo=repo, runner=runner, registry=registry).run(
+            441, backend_name="fake", test_command="echo ok"
+        )
+    )
+
+    # The completion-path exception reaches the runner's failure handler instead
+    # of returning ``blocked``, so run_worklink records a failure rather than
+    # clearing the failure ledger through _record_run_success.
+    assert result.status == "failed"
+    assert result.reason == "label add failed"
+    assert not any(
+        isinstance(call, list) and call[:3] == ["gh", "pr", "create"] for call in calls
+    )
+    records = [json.loads(line) for line in events_path.read_text(encoding="utf-8").splitlines()]
+    transitions = [record for record in records if record["type"] == "worklink_transition"]
+    assert len(transitions) == 2
+    blocked_transition, failure_transition = transitions
+    assert blocked_transition["status"] == "blocked"
+    assert blocked_transition["review_ready"] is False
+    assert blocked_transition["pr_url"] is None
+    assert blocked_transition["transition_applied"] is False
+    assert blocked_transition["error"] == "label add failed"
+    assert failure_transition["status"] == "failed"
+    assert failure_transition["reason"] == "label add failed"
+    assert failure_transition["transition_applied"] is True
+    _reset_logger_for_tests()
+
+
+def test_published_completion_failed_transition_still_emits_not_applied(tmp_path: Path) -> None:
+    _reset_logger_for_tests()
+    events_path = tmp_path / "logs" / "events.jsonl"
+    init_logger(events_path, session_id="test-worklink")
+    repo = tmp_path / "repo"
+    worktree = repo.parent / ".worklink" / repo.name / "441-1"
+    calls, base_runner = _orchestrator_runner(repo, worktree)
+
+    def runner(
+        args: Sequence[str] | str,
+        *,
+        cwd: Path | None = None,
+        text: bool = True,
+    ) -> subprocess.CompletedProcess:
+        if isinstance(args, list) and args == [
+            "chainlink", "issue", "label", "441", "worklink:review"
+        ]:
+            calls.append(args)
+            return cp(args, returncode=1, stderr="label add failed")
+        return base_runner(args, cwd=cwd, text=text)
+
+    registry = BackendRegistry(WorklinkConfig())
+    registry.register(FakeBackend())
+
+    result = asyncio.run(
+        WorklinkRunner(home=tmp_path, repo=repo, runner=runner, registry=registry).run(
+            441, backend_name="fake", test_command="echo ok"
+        )
+    )
+
+    assert result.status == "completed"
+    assert result.pr_url == "https://github.com/jasoncarreira/mimir/pull/999"
+    records = [json.loads(line) for line in events_path.read_text(encoding="utf-8").splitlines()]
+    transitions = [record for record in records if record["type"] == "worklink_transition"]
+    assert len(transitions) == 1
+    transition = transitions[0]
+    assert transition["status"] == "completed"
+    assert transition["review_ready"] is True
+    assert transition["pr_url"] == result.pr_url
+    assert transition["transition_applied"] is False
+    assert transition["error"] == "label add failed"
+    _reset_logger_for_tests()
+
+
 def test_worklink_runner_timeout_transitions_failed_without_pr(tmp_path: Path) -> None:
     repo = tmp_path / "repo"
     worktree = repo.parent / ".worklink" / repo.name / "441-1"

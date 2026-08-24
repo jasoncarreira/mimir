@@ -423,10 +423,17 @@ class ChainlinkClaims:
             # caller's parse — a caller-side key mismatch here means stealing a
             # LIVE run's lock (exactly how the guard's first live test failed).
             guard_comments = list(comments) or []
+            guard_outcome = "claim_record_missing"
             try:
                 guard_comments = self._issue_comments(issue_id) or guard_comments
-            except Exception:
-                pass
+            except Exception as exc:
+                guard_outcome = "degraded"
+                if self.event_logger is not None:
+                    self.event_logger(
+                        "worklink_claim_guard_degraded",
+                        issue_id=issue_id,
+                        error=f"{type(exc).__name__}: {exc}"[:500],
+                    )
             for existing in claim_records_from_comments(guard_comments):
                 if existing.issue_id != issue_id:
                     continue
@@ -437,7 +444,16 @@ class ChainlinkClaims:
                 age_s = (self.clock() - anchor).total_seconds()
                 if age_s < self.duplicate_freshness_s:
                     return ClaimResult(False, reason="duplicate_run_live")
-            self._run("locks", "steal", str(issue_id), check=False)
+                if guard_outcome != "degraded":
+                    guard_outcome = "stale_heartbeat"
+            steal = self._run("locks", "steal", str(issue_id), check=False)
+            self._emit_claim_stolen(
+                issue_id=issue_id,
+                prior=latest,
+                now=self.clock(),
+                guard_outcome=guard_outcome,
+                result=steal,
+            )
 
         # chainlink #825: exhaustion is judged AFTER the duplicate-liveness
         # guard — a duplicate bouncing off a LIVE final-attempt run must yield
@@ -558,6 +574,32 @@ class ChainlinkClaims:
             retry_attempt=attempt,
             max_attempts=self.contention_max_attempts,
             outcome=outcome,
+        )
+
+    def _emit_claim_stolen(
+        self,
+        *,
+        issue_id: int,
+        prior: ClaimRecord | None,
+        now: datetime,
+        guard_outcome: str,
+        result: subprocess.CompletedProcess[str],
+    ) -> None:
+        if self.event_logger is None:
+            return
+        anchor = (prior.heartbeat_at or prior.claimed_at) if prior is not None else None
+        self.event_logger(
+            "worklink_claim_stolen",
+            issue_id=issue_id,
+            prior_agent_id=prior.agent_id if prior is not None else None,
+            heartbeat_age_s=(now - anchor).total_seconds() if anchor is not None else None,
+            guard_outcome=guard_outcome,
+            steal_succeeded=result.returncode == 0,
+            error=(
+                None
+                if result.returncode == 0
+                else ((result.stderr or result.stdout).strip() or "lock_steal_failed")[:500]
+            ),
         )
 
     def review_ready_evidence(
@@ -805,6 +847,13 @@ class ChainlinkClaims:
                 record_skip("lock_not_held", record.issue_id)
                 continue
             steal = self._run("locks", "steal", str(record.issue_id), check=False)
+            self._emit_claim_stolen(
+                issue_id=record.issue_id,
+                prior=record,
+                now=now,
+                guard_outcome="stale_lock_confirmed",
+                result=steal,
+            )
             if steal.returncode != 0:
                 record_skip("lock_steal_failed", record.issue_id)
                 continue

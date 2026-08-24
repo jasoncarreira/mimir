@@ -872,6 +872,8 @@ class WorklinkRunner:
                     )
             return result
         except Exception as exc:
+            transition_applied = False
+            transition_error = None
             try:
                 claims.transition_issue(
                     issue.issue_id,
@@ -880,14 +882,17 @@ class WorklinkRunner:
                     attempt=record.budget_attempt or record.attempt,
                     reason=str(exc),
                 )
-            except Exception:
-                pass
+                transition_applied = True
+            except Exception as transition_exc:
+                transition_error = str(transition_exc)
             _log_event(
                 "worklink_transition",
                 issue_id=issue.issue_id,
                 attempt=record.attempt,
                 status="failed",
                 reason=str(exc),
+                transition_applied=transition_applied,
+                error=transition_error,
             )
             return WorklinkRunResult(
                 issue.issue_id,
@@ -1156,14 +1161,23 @@ class WorklinkRunner:
             if validation.status == "blocked"
             else (", ".join(validation.reasons) if validation.reasons else None)
         )
+        transition_applied = False
+        transition_error = None
+
         def transition_issue() -> None:
-            claims.transition_issue(
-                issue.issue_id,
-                status=transition_status,
-                review_ready=validation.review_ready,
-                attempt=claim_record.budget_attempt or attempt,
-                reason=transition_reason,
-            )
+            nonlocal transition_applied, transition_error
+            try:
+                claims.transition_issue(
+                    issue.issue_id,
+                    status=transition_status,
+                    review_ready=validation.review_ready,
+                    attempt=claim_record.budget_attempt or attempt,
+                    reason=transition_reason,
+                )
+            except Exception as exc:
+                transition_error = str(exc)
+                raise
+            transition_applied = True
 
         def log_transition() -> None:
             _log_event(
@@ -1173,14 +1187,20 @@ class WorklinkRunner:
                 status=transition_status,
                 review_ready=validation.review_ready,
                 pr_url=pr_url,
+                transition_applied=transition_applied,
+                error=transition_error,
             )
 
         if pr_url:
             run_bookkeeping("issue transition", transition_issue)
             run_bookkeeping("transition event", log_transition)
         else:
-            transition_issue()
-            log_transition()
+            try:
+                transition_issue()
+            finally:
+                # The transition event is the observable record of this failure;
+                # emit it without turning a failed mutation into a successful run.
+                log_transition()
         cleanup_error = None
         if publication is None:
             cleanup_error = _cleanup_checkout_after_transition(
