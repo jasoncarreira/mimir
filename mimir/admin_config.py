@@ -25,6 +25,8 @@ SECRET_MARKERS = (
     "AUTH",
 )
 
+_ENV_REFERENCE_RE = re.compile(r"\$\{[A-Za-z_][A-Za-z0-9_]*\}")
+
 # ``raw_config`` is an operator-facing diagnostic surface, not a full config
 # dump. Keep it schema-aware so newly added Config fields are hidden by default
 # until they are explicitly classified here. That fail-closed posture avoids
@@ -171,7 +173,11 @@ def _split_model_spec(model_spec: str) -> tuple[str, str]:
 
 def _is_secret_name(name: str) -> bool:
     upper = name.upper()
-    return any(marker in upper for marker in SECRET_MARKERS)
+    return (
+        upper == "BEARER"
+        or upper.endswith("_PAT")
+        or any(marker in upper for marker in SECRET_MARKERS)
+    )
 
 
 def _is_secret_env_name(name: str) -> bool:
@@ -247,7 +253,20 @@ def _redact_config_value(value: Any, *, key: str | None = None) -> Any:
     """Recursively redact secret-looking config fields at any nesting depth."""
 
     if key is not None and _is_secret_name(key):
-        return "[REDACTED]" if value else ""
+        if not value:
+            return ""
+        if isinstance(value, str) and "${" in value:
+            parts: list[str] = []
+            offset = 0
+            for match in _ENV_REFERENCE_RE.finditer(value):
+                if match.start() > offset:
+                    parts.append("[REDACTED]")
+                parts.append(match.group(0))
+                offset = match.end()
+            if offset < len(value):
+                parts.append("[REDACTED]")
+            return "".join(parts) or "[REDACTED]"
+        return "[REDACTED]"
     if isinstance(value, dict):
         return {
             str(child_key): _redact_config_value(child_value, key=str(child_key))

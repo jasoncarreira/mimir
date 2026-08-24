@@ -49,6 +49,7 @@ from pathlib import Path
 
 from mimir._atomic import atomic_write_json
 from mimir._rmtree import rmtree_missing_ok
+from mimir.commands.setup import _write_env_text
 from mimir.redaction import redact_text
 from mimir.skill_defs import (
     home_builtin_skills_dir,
@@ -343,7 +344,6 @@ def _read_env_file(env_path: Path) -> dict[str, str]:
 
 def _write_env_var(env_path: Path, var_name: str, value: str) -> None:
     """Write or replace ``VAR_NAME=value`` in a Docker-style ``.env`` file."""
-    env_path.parent.mkdir(parents=True, exist_ok=True)
     body = env_path.read_text(encoding="utf-8") if env_path.is_file() else ""
     line_re = re.compile(
         rf"^(\s*){re.escape(var_name)}\s*=.*$", re.MULTILINE
@@ -355,7 +355,7 @@ def _write_env_var(env_path: Path, var_name: str, value: str) -> None:
         if body and not body.endswith("\n"):
             body += "\n"
         body += new_line + "\n"
-    env_path.write_text(body, encoding="utf-8")
+    _write_env_text(env_path, body)
 
 
 def read_env_specs(

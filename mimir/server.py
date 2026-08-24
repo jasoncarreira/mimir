@@ -724,12 +724,31 @@ def _make_auth_middleware(expected_key: str, web_host: str | None = None):
             ):
                 return web.json_response({"error": "cross_site_request"}, status=403)
 
-        if _is_auth_exempt(request.method, request.path):
-            return await handler(request)
-
         # Per-user resolution reads the live resolver from the app (constructed
         # after this middleware; populated by request time). github #726.
         resolver = request.app.get("identity_resolver")
+
+        provided = request.headers.get("X-API-Key", "")
+        identity = None
+        is_master = False
+        if expected_key and provided and _safe_str_eq(provided, expected_key):
+            is_master = True
+        elif resolver is not None and provided:
+            identity = resolver.resolve_web_key(provided)
+        authorized = is_master or (
+            identity is not None and identity.access.is_authorized
+        )
+
+        if _is_auth_exempt(request.method, request.path):
+            # Bootstrap remains reachable before login, but a valid credential
+            # lets its handler return the authenticated operator payload.
+            if authorized:
+                request["auth_identity"] = identity
+                request["auth_is_master"] = is_master
+                request["auth_is_admin"] = is_master or (
+                    identity is not None and identity.access.is_admin
+                )
+            return await handler(request)
 
         # The gate activates when a master key is set, per-user web keys exist,
         # or the resolver has previously loaded web keys. The last condition
@@ -741,19 +760,6 @@ def _make_auth_middleware(expected_key: str, web_host: str | None = None):
                 return web.json_response({"error": "unauthorized"}, status=401)
             return await handler(request)
 
-        provided = request.headers.get("X-API-Key", "")
-        identity = None
-        is_master = False
-        if expected_key and provided and _safe_str_eq(provided, expected_key):
-            # Admin master key (MIMIR_API_KEY): admin for admin/automation
-            # routes, but NOT a chat/user identity (enforced per-route).
-            is_master = True
-        elif resolver is not None and provided:
-            identity = resolver.resolve_web_key(provided)
-
-        authorized = is_master or (
-            identity is not None and identity.access.is_authorized
-        )
         if not authorized:
             return web.json_response({"error": "unauthorized"}, status=401)
 

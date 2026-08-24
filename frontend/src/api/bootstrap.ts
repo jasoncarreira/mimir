@@ -4,8 +4,8 @@ import { useQuery } from "@tanstack/react-query";
 import { apiFetchEnvelope } from ".";
 import type { WebBootstrapData } from "./generated/contracts";
 
-// Public, no-auth policy + UI config + build version. Shared query key so the
-// app shell, SkinProvider, and routes all read one cached result.
+// Public auth policy before login; a credentialed request also returns UI and
+// runtime data. Shared query key keeps all consumers on that one response.
 export const WEB_BOOTSTRAP_QUERY_KEY = ["web-bootstrap"] as const;
 
 export function useBootstrap() {
