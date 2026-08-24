@@ -59,11 +59,22 @@ Output contract:
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import os
+import signal
 import subprocess
 import sys
+import time
+
+#: Wall clock at interpreter start for this tick, captured before any of the
+#: module's own setup runs. The framework kills the tick at a fixed cap measured
+#: from process start, so a budget anchored at its own construction silently
+#: excludes everything that happened first — module import, cursor load, token
+#: resolution. Measured at ~0.8s today, but the bound must not depend on that
+#: staying small: `/mimir-home` is virtiofs and the package keeps growing.
+_PROCESS_START = time.monotonic()
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -170,6 +181,269 @@ _CHANGES_REQUESTED_TURN_EVENT_TYPES = frozenset({"pr_changes_requested_stale"})
 # without changing the intended hourly cadence. After bounded attempts give up,
 # a daily backstop starts a fresh series so an unresolved PR cannot go silent
 # forever merely because its queued turns were never delivered.
+# The framework SIGKILLs a poller tick at its cap and discards everything the tick
+# emitted, so per-PR reconciliation has to fit inside a self-imposed deadline that
+# leaves headroom. Reconciling every open PR in every pass exceeded the cap at 16
+# open PRs, which wedged this poller: a killed tick never commits its cursor, so
+# the next tick re-scans the same window plus everything new and is guaranteed to
+# be larger (chainlink #1433). A tick that truncates and commits is strictly
+# better than one that completes nothing.
+#
+# The deadlines below are derived from the cap rather than hardcoded against it.
+# They were originally 35s/50s against a 60s cap; the cap is now per-poller
+# (mimir/pollers.py raised the default to 120s and clamps it below each poller's
+# own cadence), so a hardcoded copy would silently leave the extra headroom
+# unused — and would be wrong in the dangerous direction for any poller whose
+# cadence clamps the cap *below* 60s.
+def _env_float(name: str, default: float) -> float:
+    """Positive float from the environment, or ``default``."""
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        value = float(raw)
+    except ValueError:
+        return default
+    return value if value > 0 else default
+
+
+#: The cap this run will actually be killed at. ``run_poller`` exports the
+#: *effective* per-poller value, which may be clamped below the framework default
+#: when a poller's cadence is tighter. The 60s fallback is deliberately the old
+#: cap rather than the new one: a standalone or dry-run invocation with no
+#: framework around it should assume less headroom, not more.
+POLLER_CAP_SECONDS = _env_float("POLLER_TIMEOUT_SECONDS", 60.0)
+#: Reserved after the hard deadline for saving the cursor and flushing stdout.
+#: Overrunning the cap loses every event the tick emitted, so this margin is what
+#: separates a late tick from a lost one.
+TICK_SAVE_RESERVE_SECONDS = 10.0
+#: Hard stop. Past this point no new per-PR work starts and every outstanding API
+#: call is clamped to whatever time is left.
+TICK_HARD_DEADLINE_SECONDS = max(5.0, POLLER_CAP_SECONDS - TICK_SAVE_RESERVE_SECONDS)
+#: Fraction of the hard deadline after which discretionary per-PR reconciliation
+#: stops. 0.7 preserves the 35/50 ratio the live measurements were taken against.
+PR_RECONCILE_SOFT_FRACTION = 0.7
+PR_RECONCILE_DEADLINE_SECONDS = (
+    TICK_HARD_DEADLINE_SECONDS * PR_RECONCILE_SOFT_FRACTION
+)
+#: Minimum PRs a pass reconciles even if the soft deadline has passed, so a slow
+#: API cannot starve every PR forever and stall reminders entirely. This floor is
+#: subordinate to the hard deadline — it is not an exception to it.
+PR_RECONCILE_MIN_PER_PASS = 2
+#: Ceiling for one `gh api` invocation, used when no budget is active.
+GH_API_TIMEOUT_SECONDS = 30
+#: A clamped call still gets this much time — below it a request cannot
+#: meaningfully complete, so the worst-case tick is
+#: TICK_HARD_DEADLINE_SECONDS + this + serialization, not the 30s ceiling.
+GH_API_MIN_TIMEOUT_SECONDS = 2.0
+
+
+class TickBudget:
+    """Two-tier wall-clock budget for one poller tick.
+
+    The soft deadline (``exhausted``) stops discretionary per-PR reconciliation
+    beyond ``PR_RECONCILE_MIN_PER_PASS``. The hard deadline
+    (``hard_exhausted``) stops *all* per-PR work and clamps individual API
+    calls, so elapsed time is bounded no matter how slow the API is. Checking
+    the budget only between PRs would leave a single 30s call free to carry the
+    tick past the framework cap.
+    """
+
+    def __init__(
+        self,
+        deadline_seconds: float = PR_RECONCILE_DEADLINE_SECONDS,
+        hard_deadline_seconds: float = TICK_HARD_DEADLINE_SECONDS,
+        started_at: float | None = None,
+    ) -> None:
+        """``started_at`` is when the *tick* began, not when this was built.
+
+        The deadlines are budgets against the framework cap, which is measured
+        from process start. Anything that ran before this object exists has
+        already spent part of that budget, so it is subtracted here rather than
+        silently ignored. ``main()`` passes ``_PROCESS_START``; callers that omit
+        it get a budget measured from construction, which is what a test means.
+        """
+        now = time.monotonic()
+        self._start = now
+        consumed = max(0.0, now - started_at) if started_at is not None else 0.0
+        self._deadline = max(0.0, deadline_seconds - consumed)
+        self._hard_deadline = max(0.0, hard_deadline_seconds - consumed)
+        #: Pre-budget time already spent, reported with the truncation signal so
+        #: a tick squeezed by slow startup is distinguishable from a slow API.
+        self.startup_consumed = consumed
+        self.truncated: dict[str, int] = {}
+        #: True once the hard deadline forced a truncation. The tick must not
+        #: advance its `since` watermark in that case — see main().
+        self.hard_truncated = False
+
+    def elapsed(self) -> float:
+        return time.monotonic() - self._start
+
+    def exhausted(self) -> bool:
+        return self.elapsed() >= self._deadline
+
+    def hard_remaining(self) -> float:
+        return self._hard_deadline - self.elapsed()
+
+    def hard_exhausted(self) -> bool:
+        return self.hard_remaining() <= 0.0
+
+    def call_timeout(
+        self, ceiling: float = GH_API_TIMEOUT_SECONDS,
+    ) -> float | None:
+        """Seconds to allow one API call, or ``None`` if it must not be made.
+
+        Returning the *remaining* time rather than flooring it is what makes the
+        bound real: a call that starts is guaranteed to finish by the hard
+        deadline, so total elapsed is the deadline plus local work — never the
+        deadline plus a full call timeout. Below
+        ``GH_API_MIN_TIMEOUT_SECONDS`` there is no point starting one, so the
+        caller is told to skip instead.
+        """
+        remaining = self.hard_remaining()
+        if remaining < GH_API_MIN_TIMEOUT_SECONDS:
+            return None
+        return min(ceiling, remaining)
+
+    def affords(self, seconds: float) -> bool:
+        """Whether ``seconds`` of work can finish before the hard deadline.
+
+        For transports this module cannot hand a timeout to — the trust
+        attestations reach GitHub through ``urllib`` inside ``mimir.pollers`` —
+        reserving their worst-case cost up front is what keeps the bound real.
+        Passing a timeout across that boundary instead would couple the installed
+        skill script to the mimir package version, which is a deploy hazard: the
+        two are updated by the same pull, but a skew breaks the whole tick.
+        """
+        return self.hard_remaining() >= seconds
+
+    def note_truncation(self, pass_name: str, skipped: int) -> None:
+        if skipped > 0:
+            self.truncated[pass_name] = self.truncated.get(pass_name, 0) + skipped
+
+
+#: Set for the duration of one tick so `_gh_api` can clamp its subprocess
+#: timeout without threading the budget through every pass signature. The
+#: poller is a single-shot process, so a module-level handle is the whole
+#: lifetime of the run.
+_ACTIVE_TICK_BUDGET: "TickBudget | None" = None
+
+
+def set_active_tick_budget(budget: "TickBudget | None") -> None:
+    """Install (or clear) the budget that clamps `_gh_api` call timeouts."""
+    global _ACTIVE_TICK_BUDGET
+    _ACTIVE_TICK_BUDGET = budget
+
+
+class _DeadlineExceeded(Exception):
+    """A synchronous call outran the wall-clock deadline imposed on it."""
+
+
+@contextlib.contextmanager
+def _wall_clock_deadline(seconds: float):
+    """Impose a genuine total deadline on a blocking synchronous call.
+
+    ``urllib.request.urlopen(timeout=...)`` is a *socket-operation* timeout, not a
+    total one: a server trickling bytes keeps ``response.read()`` alive as long as
+    each individual read makes progress inside the timeout. Reserving the nominal
+    timeout as if it bounded the call is therefore unsound — the attestation can
+    outlive its reservation and carry the tick past the framework cap.
+
+    ``setitimer`` gives the real thing. Only usable on the main thread of the main
+    interpreter, which is what a poller subprocess is; if the platform or thread
+    cannot support it the deadline degrades to unenforced rather than raising, and
+    the caller keeps the budget check it already had.
+    """
+    def _fire(_signum, _frame):
+        raise _DeadlineExceeded
+
+    try:
+        previous = signal.signal(signal.SIGALRM, _fire)
+    except (ValueError, AttributeError, OSError):
+        yield False
+        return
+    signal.setitimer(signal.ITIMER_REAL, max(seconds, 0.001))
+    try:
+        yield True
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0.0)
+        signal.signal(signal.SIGALRM, previous)
+
+
+def _refused_window(
+    tick_budget: "TickBudget | None", data: object, pass_name: str,
+) -> bool:
+    """Whether a since-gated listing call came back empty because of the budget.
+
+    These passes rebuild their entire window from one listing call, so a refusal
+    is indistinguishable from "nothing new" at the call site — and advancing
+    ``last_checked`` past an uncollected window drops those events for good.
+    Only the caller knows its window is since-gated, which is why this is checked
+    here rather than inside ``_gh_api``.
+    """
+    if tick_budget is None:
+        return False
+    explicitly_refused = data is _GH_API_BUDGET_REFUSED
+    if not explicitly_refused and (data is not None or not tick_budget.hard_exhausted()):
+        return False
+    tick_budget.hard_truncated = True
+    tick_budget.note_truncation(pass_name, 1)
+    return True
+
+
+def _hard_stop(tick_budget: "TickBudget | None", pass_name: str) -> bool:
+    """Hard-deadline check for the since-based passes.
+
+    These keep no per-item dedupe cursor, so they cannot defer an item the way
+    the reconcile passes do — truncating them is only safe because a tick that
+    sets ``hard_truncated`` leaves its ``last_checked`` watermark alone, so the
+    next tick re-scans the same window. There is deliberately no minimum-items
+    floor here: past the hard deadline the tick must stop, not make progress.
+    """
+    if tick_budget is None or not tick_budget.hard_exhausted():
+        return False
+    tick_budget.hard_truncated = True
+    tick_budget.note_truncation(pass_name, 1)
+    return True
+
+
+def _truncate_here(
+    tick_budget: "TickBudget | None", reconciled: int, pass_name: str,
+) -> bool:
+    """Whether this pass should stop reconciling PRs for the rest of the tick.
+
+    ``PR_RECONCILE_MIN_PER_PASS`` is a floor on the *soft* deadline: every pass
+    gets that many PRs even on a spent budget, so each one makes forward progress
+    and rotation eventually covers the whole set. The floor is **subordinate to
+    the hard deadline** — past it, no new per-PR work starts at all, because a
+    guaranteed minimum that can still start a 30s call is not a bound.
+    """
+    if tick_budget is None:
+        return False
+    if tick_budget.hard_exhausted():
+        # Deliberately does not set ``hard_truncated``: these passes defer a
+        # skipped PR through their own dedupe cursor (a preserved prior entry,
+        # or ``collection_complete=False``), so the global ``last_checked``
+        # watermark can still advance. Only the since-based passes, which have
+        # no per-item state to defer into, need it held.
+        tick_budget.note_truncation(pass_name, 1)
+        return True
+    if reconciled < PR_RECONCILE_MIN_PER_PASS:
+        return False
+    if not tick_budget.exhausted():
+        return False
+    tick_budget.note_truncation(pass_name, 1)
+    return True
+
+
+def _rotate(items: list, offset: int) -> list:
+    """Rotate so successive ticks start where the previous one stopped."""
+    if not items:
+        return items
+    start = offset % len(items)
+    return items[start:] + items[:start]
+
+
 CHANGES_REQUESTED_REMINDER_INTERVAL = timedelta(minutes=60)
 CHANGES_REQUESTED_REMINDER_SLACK = timedelta(minutes=1)
 CHANGES_REQUESTED_GAVE_UP_BACKSTOP = timedelta(hours=24)
@@ -436,14 +710,48 @@ def _resolve_token() -> str:
     return ""
 
 
-def _gh_api(endpoint: str, token: str) -> list | dict | None:
+class _GhApiBudgetRefused:
+    """Marker returned when the tick budget prevents an API call from starting."""
+
+
+_GH_API_BUDGET_REFUSED = _GhApiBudgetRefused()
+
+
+def _gh_api(endpoint: str, token: str) -> list | dict | None | _GhApiBudgetRefused:
     """Call ``gh api <endpoint> --paginate`` and return parsed JSON.
-    Returns None on error so callers can skip silently."""
+
+    Returns ``None`` on an ordinary API error and a private marker when the tick
+    budget refuses the call. Since-gated callers must distinguish those cases so
+    they do not advance their watermark over a window they never collected.
+    """
     try:
         env = {**os.environ, "GH_TOKEN": token} if token else None
+        budget = _ACTIVE_TICK_BUDGET
+        if budget is None:
+            timeout: float = float(GH_API_TIMEOUT_SECONDS)
+        else:
+            allowed = budget.call_timeout()
+            if allowed is None:
+                # Past the hard deadline. Returning None is the same shape every
+                # caller already handles for an API failure, so cursor entries
+                # are preserved rather than rebuilt from a partial view.
+                #
+                # Deliberately does NOT mark the tick truncated: only the
+                # caller knows whether its window is since-gated. Marking here
+                # froze `last_checked` when a *reconcile* pass had a listing call
+                # refused, and those passes defer through their own cursors. The
+                # since-based passes check for this refusal themselves via
+                # ``_refused_window`` below.
+                budget.note_truncation("gh_api_refused", 1)
+                print(
+                    f"gh api {endpoint} skipped: tick budget exhausted",
+                    file=sys.stderr,
+                )
+                return _GH_API_BUDGET_REFUSED
+            timeout = allowed
         result = subprocess.run(
             ["gh", "api", endpoint, "--paginate"],
-            capture_output=True, text=True, timeout=30, env=env,
+            capture_output=True, text=True, timeout=timeout, env=env,
         )
         if result.returncode == 0 and result.stdout.strip():
             return json.loads(result.stdout)
@@ -736,25 +1044,81 @@ def _emit_signal(signal_type: str, **extras: object) -> None:
     )
 
 
+#: Ceiling for one trust lookup, matching `_github_api_attestation`'s own
+#: `timeout` default in `mimir.pollers`. That default is a socket-operation
+#: timeout, not a total one, so it is enforced here with a real wall-clock
+#: deadline rather than trusted as a bound.
+TRUST_ATTESTATION_TIMEOUT_SECONDS = 10.0
+
+
 def _pr_author_is_trusted(
     repo: str,
     number: int,
     url: str,
     token: str,
     trust_cache: dict[tuple[str, object], object],
-) -> bool:
-    """Resolve PR-author trust from GitHub and cache it for this poll cycle."""
+    *,
+    tick_budget: "TickBudget | None" = None,
+) -> bool | None:
+    """Resolve PR-author trust from GitHub and cache it for this poll cycle.
+
+    Returns ``None`` when the tick has no budget left or a server attestation is
+    unavailable. That is deliberately distinct from ``False``: an unresolved
+    author must be *skipped*, not classified, because ``False`` routes the PR through
+    ``_surface_untrusted_pr_once`` which emits a signal and records the verdict
+    as already-surfaced. Failing closed here would permanently mislabel a
+    trusted contributor's PR because the poller ran out of time.
+
+    This path reaches GitHub through `urllib` in ``mimir.pollers``, not through
+    ``_gh_api``'s subprocess, so it needs its own budget plumbing — bounding only
+    the `gh api` transport left this one free to overrun the tick.
+    """
+    def _allowance() -> float | None:
+        """Wall-clock seconds this lookup may take, or None to skip it."""
+        if tick_budget is None:
+            return TRUST_ATTESTATION_TIMEOUT_SECONDS
+        return tick_budget.call_timeout(
+            ceiling=TRUST_ATTESTATION_TIMEOUT_SECONDS,
+        )
+
+    # A cached author costs nothing and is never gated.
     author_key = (repo, number)
     if author_key not in trust_cache:
-        trust_cache[author_key] = _github_content_author(
-            repo,
-            {"event_type": "pr_opened", "url": url},
-            token,
-        )
+        allowed = _allowance()
+        if allowed is None:
+            return None
+        try:
+            with _wall_clock_deadline(allowed):
+                resolved = _github_content_author(
+                    repo,
+                    {"event_type": "pr_opened", "url": url},
+                    token,
+                )
+        except _DeadlineExceeded:
+            # Unresolved, not untrusted — see the tri-state note above. Do not
+            # cache: the next tick should retry rather than inherit a verdict
+            # produced by a timeout.
+            return None
+        if resolved is None:
+            # Transport failure or malformed response is unresolved, not an
+            # authoritative untrusted verdict. Do not cache it; retry next tick.
+            return None
+        trust_cache[author_key] = resolved
     author = trust_cache[author_key]
     trust_key = (repo, author if isinstance(author, str) else "")
     if trust_key not in trust_cache:
-        trust_cache[trust_key] = _github_author_is_trusted(repo, author, token)
+        allowed = _allowance()
+        if allowed is None:
+            return None
+        try:
+            with _wall_clock_deadline(allowed):
+                trusted = _github_author_is_trusted(repo, author, token)
+        except _DeadlineExceeded:
+            return None
+        if trusted is None:
+            # Preserve the transport's unavailable state separately from False.
+            return None
+        trust_cache[trust_key] = trusted
     return trust_cache[trust_key] is True
 
 
@@ -874,7 +1238,10 @@ def _surface_untrusted_pr_once(
 # ─── per-resource checks ──────────────────────────────────────────────
 
 
-def _check_issues(repo: str, since: str, token: str, me: str) -> int:
+def _check_issues(
+    repo: str, since: str, token: str, me: str,
+    *, tick_budget: "TickBudget | None" = None,
+) -> int:
     """New issues (NOT PRs — GitHub's /issues endpoint returns both;
     we filter PRs out via the ``pull_request`` field)."""
     data = _gh_api(
@@ -883,6 +1250,7 @@ def _check_issues(repo: str, since: str, token: str, me: str) -> int:
         token,
     )
     if not isinstance(data, list):
+        _refused_window(tick_budget, data, "issues_window")
         return 0
     count = 0
     for issue in data:
@@ -918,6 +1286,7 @@ def _check_prs(
     surfaced_untrusted: set[str] | None = None,
     review_needed_pr_numbers: set[str] | None = None,
     review_context: dict[str, str] | None = None,
+    tick_budget: "TickBudget | None" = None,
 ) -> int:
     """New pull requests."""
     data = _gh_api(
@@ -925,6 +1294,7 @@ def _check_prs(
         token,
     )
     if not isinstance(data, list):
+        _refused_window(tick_budget, data, "prs_window")
         return 0
     trust_cache = trust_cache if trust_cache is not None else {}
     surfaced_untrusted = surfaced_untrusted if surfaced_untrusted is not None else set()
@@ -948,9 +1318,17 @@ def _check_prs(
         # author. Do not also report them as skipped automatic reviews.
         if _review_requested(pr, me):
             continue
-        if not _pr_author_is_trusted(
-            repo, number, url, token, trust_cache,
-        ):
+        trusted = _pr_author_is_trusted(
+            repo, number, url, token, trust_cache, tick_budget=tick_budget,
+        )
+        if trusted is None:
+            # No budget left to resolve trust. Skip without classifying, and
+            # hold the watermark so this PR is reconsidered next tick.
+            if tick_budget is not None:
+                tick_budget.hard_truncated = True
+                tick_budget.note_truncation("prs_trust", 1)
+            continue
+        if not trusted:
             count += _surface_untrusted_pr_once(
                 repo, number, url, surfaced_untrusted,
             )
@@ -1021,6 +1399,7 @@ def _check_issue_comments(
     *,
     review_needed_pr_numbers: set[str] | None = None,
     comments: list[dict] | None = None,
+    tick_budget: "TickBudget | None" = None,
 ) -> int:
     """New issue + PR conversation comments.
 
@@ -1051,6 +1430,8 @@ def _check_issue_comments(
     count = 0
     parent_cache: dict[str, dict | None] = {}
     for comment in data:
+        if _hard_stop(tick_budget, "issue_comments"):
+            break
         if me and comment.get("user", {}).get("login") == me:
             continue
         if (comment.get("created_at", "") or "") <= since:
@@ -1099,7 +1480,10 @@ def _check_issue_comments(
     return count
 
 
-def _check_pr_review_comments(repo: str, since: str, token: str, me: str) -> int:
+def _check_pr_review_comments(
+    repo: str, since: str, token: str, me: str,
+    *, tick_budget: "TickBudget | None" = None,
+) -> int:
     """New PR review comments — these are INLINE diff comments,
     distinct from issue/PR conversation comments. The bulk of code
     review feedback lives here. Open-strix's poller missed this
@@ -1110,6 +1494,7 @@ def _check_pr_review_comments(repo: str, since: str, token: str, me: str) -> int
         token,
     )
     if not isinstance(data, list):
+        _refused_window(tick_budget, data, "review_comments_window")
         return 0
     count = 0
     for comment in data:
@@ -1153,6 +1538,7 @@ def _check_pr_pushes(
     surfaced_untrusted: set[str] | None = None,
     review_needed_pr_numbers: set[str] | None = None,
     review_context: dict[str, str] | None = None,
+    tick_budget: "TickBudget | None" = None,
 ) -> tuple[int, dict[str, str], dict[str, int]]:
     """Detect new commits pushed to existing open PRs AND new
     review-requests addressed to ``me`` on those same PRs.
@@ -1247,8 +1633,29 @@ def _check_pr_pushes(
         url = pr.get("html_url", "")
         explicitly_requested = _review_requested(pr, me)
         trusted_author = _pr_author_is_trusted(
-            repo, number, url, token, trust_cache,
+            repo, number, url, token, trust_cache, tick_budget=tick_budget,
         )
+        if trusted_author is None and explicitly_requested:
+            # An explicit request is actionable regardless of author trust. Keep
+            # the unresolved author fail-closed for automatic push review while
+            # still allowing review-request reconciliation below.
+            trusted_author = False
+        if trusted_author is None:
+            # Unresolved for lack of budget or a transport failure. Carry the
+            # prior head forward — a dropped key would make the next tick treat
+            # this PR as first-seen
+            # and miss the push entirely.
+            #
+            # Deliberately does NOT hold the watermark: this pass takes no
+            # ``since`` and defers entirely through ``pr_heads``, so the skipped
+            # PR is compared again next tick regardless. Holding it here froze
+            # `last_checked` on an ordinary tick over a single skipped PR, which
+            # would stop the since-window advancing at all.
+            if key in pr_heads:
+                new_heads[key] = pr_heads[key]
+            if tick_budget is not None:
+                tick_budget.note_truncation("pushes_trust", 1)
+            continue
         if not trusted_author:
             if not explicitly_requested and (not me or pr_author != me):
                 count += _surface_untrusted_pr_once(
@@ -1712,6 +2119,8 @@ def _check_own_changes_requested(
     *,
     now: datetime | None = None,
     reminder_interval: timedelta = CHANGES_REQUESTED_REMINDER_INTERVAL,
+    tick_budget: TickBudget | None = None,
+    rotate_offset: int = 0,
 ) -> tuple[int, dict[str, object]]:
     """State-reconciling reminder for the agent's OWN open PRs stuck at
     CHANGES_REQUESTED (chainlink #449).
@@ -1768,6 +2177,10 @@ def _check_own_changes_requested(
         return 0, dict(prior)
     count = 0
     new: dict[str, object] = {}
+    # Reconcile from where the previous tick stopped, so a truncated tick does not
+    # starve the same tail every time (#1433).
+    data = _rotate(list(data), rotate_offset)
+    reconciled = 0
     for pr in data:
         if (pr.get("user") or {}).get("login") != me:
             continue
@@ -1777,6 +2190,15 @@ def _check_own_changes_requested(
         if not number or not head_sha:
             continue
         key = str(number)
+        # Out of budget: carry the prior entry forward untouched rather than
+        # dropping it. `new` REPLACES the cursor entry, so omitting a key would
+        # reset that PR's last_reminded_at and attempts — re-arming a reminder the
+        # debounce exists to suppress and rewinding the give-up budget.
+        if _truncate_here(tick_budget, reconciled, "changes_requested"):
+            if key in prior:
+                new[key] = prior[key]
+            continue
+        reconciled += 1
         reviews = _gh_api(f"repos/{repo}/pulls/{number}/reviews", token)
         if not isinstance(reviews, list):
             # Cannot determine review state — preserve the dedupe entry
@@ -2075,6 +2497,8 @@ def _check_pr_ci_failures(
     prior: dict[str, object],
     *,
     now: datetime | None = None,
+    tick_budget: TickBudget | None = None,
+    rotate_offset: int = 0,
 ) -> tuple[int, dict[str, object]]:
     """Route newly completed check failures for open PRs.
 
@@ -2098,11 +2522,21 @@ def _check_pr_ci_failures(
     count = 0
     new: dict[str, object] = {}
     collection_complete = True
+    reconciled = 0
+    prs = _rotate(list(prs), rotate_offset)
     for listed in prs:
         number = listed.get("number")
         if not isinstance(number, int) or isinstance(number, bool):
             continue
         key = str(number)
+        if _truncate_here(tick_budget, reconciled, "ci_failures"):
+            # An incomplete collection holds `_last_checked` at window_since, so
+            # a truncated PR's checks are re-examined next tick rather than lost.
+            collection_complete = False
+            if key in prior:
+                new[key] = prior[key]
+            continue
+        reconciled += 1
         pr = _gh_api(f"repos/{repo}/pulls/{number}", token)
         if not isinstance(pr, dict):
             collection_complete = False
@@ -2254,6 +2688,8 @@ def _check_own_mergeability(
     now: datetime | None = None,
     attempt_budget: list[int] | None = None,
     retry_interval: timedelta = MERGEABILITY_RETRY_INTERVAL,
+    tick_budget: TickBudget | None = None,
+    rotate_offset: int = 0,
 ) -> tuple[int, dict[str, object]]:
     """Reconcile non-review merge failures on the agent's own open PRs.
 
@@ -2277,6 +2713,8 @@ def _check_own_mergeability(
 
     count = 0
     new: dict[str, object] = {}
+    reconciled = 0
+    prs = _rotate(list(prs), rotate_offset)
     for listed_pr in prs:
         if (listed_pr.get("user") or {}).get("login") != me:
             continue
@@ -2284,6 +2722,11 @@ def _check_own_mergeability(
         if not isinstance(number, int) or isinstance(number, bool):
             continue
         key = str(number)
+        if _truncate_here(tick_budget, reconciled, "mergeability"):
+            if key in prior:
+                new[key] = prior[key]
+            continue
+        reconciled += 1
         pr = _gh_api(f"repos/{repo}/pulls/{number}", token)
         if not isinstance(pr, dict):
             if key in prior:
@@ -2450,7 +2893,10 @@ def _check_own_mergeability(
     return count, new
 
 
-def _check_pr_reviews(repo: str, since: str, token: str, me: str) -> int:
+def _check_pr_reviews(
+    repo: str, since: str, token: str, me: str,
+    *, tick_budget: "TickBudget | None" = None,
+) -> int:
     """New PR reviews (approve / changes-requested / commented).
     No ``since=`` query on reviews endpoint — walk open PRs + filter
     by ``submitted_at``. ``_gh_api`` passes ``--paginate``, so all
@@ -2463,14 +2909,19 @@ def _check_pr_reviews(repo: str, since: str, token: str, me: str) -> int:
         token,
     )
     if not isinstance(prs, list):
+        _refused_window(tick_budget, prs, "pr_reviews_window")
         return 0
     count = 0
     for pr in prs:
         pr_number = pr.get("number")
         if not pr_number:
             continue
+        if _hard_stop(tick_budget, "pr_reviews"):
+            break
         reviews = _gh_api(f"repos/{repo}/pulls/{pr_number}/reviews", token)
         if not isinstance(reviews, list):
+            if _refused_window(tick_budget, reviews, "pr_reviews_window"):
+                break
             continue
         for review in reviews:
             if me and review.get("user", {}).get("login") == me:
@@ -2594,6 +3045,14 @@ def main() -> None:
     # Changes-requested reconciliation cursor (chainlink #449):
     # ``{repo: {pr_key: {head_sha, last_reminded_at, attempts}}}`` — bounded
     # unresolved own-PR remediation attempts, rate-limited by elapsed time.
+    budget = TickBudget(started_at=_PROCESS_START)
+    # Clamp every gh api call for the rest of this tick so no single slow request
+    # can carry the subprocess past the framework's SIGKILL.
+    set_active_tick_budget(budget)
+    # Rotation offsets per repo, so a truncated tick resumes at the tail it skipped
+    # instead of starving it every tick (#1433).
+    reconcile_offsets: dict = cursor.get("pr_reconcile_offsets", {}) or {}
+    new_reconcile_offsets: dict[str, int] = {}
     cr_all: dict = cursor.get("pr_changes_requested", {}) or {}
     new_cr_all: dict[str, dict[str, object]] = {}
     mergeability_all: dict = cursor.get("pr_mergeability", {}) or {}
@@ -2608,7 +3067,7 @@ def main() -> None:
     total = 0
     for repo in repos:
         print(f"Checking {repo} since {since}...", file=sys.stderr)
-        total += _check_issues(repo, since, token, me)
+        total += _check_issues(repo, since, token, me, tick_budget=budget)
         surfaced_untrusted = {
             str(value) for value in (untrusted_all.get(repo, []) or [])
             if isinstance(value, (str, int)) and not isinstance(value, bool)
@@ -2621,10 +3080,13 @@ def main() -> None:
             repo, since, token, me, trust_cache, surfaced_untrusted,
             review_needed_pr_numbers=review_needed_pr_numbers,
             review_context=review_context,
+            tick_budget=budget,
         )
         total += pr_opened_count
-        total += _check_pr_review_comments(repo, since, token, me)
-        total += _check_pr_reviews(repo, since, token, me)
+        total += _check_pr_review_comments(
+            repo, since, token, me, tick_budget=budget,
+        )
+        total += _check_pr_reviews(repo, since, token, me, tick_budget=budget)
         repo_heads = pr_heads_all.get(repo, {}) or {}
         repo_rr = _coerce_review_requests(rr_all.get(repo))
         push_count, new_repo_heads, new_repo_rr = _check_pr_pushes(
@@ -2633,6 +3095,7 @@ def main() -> None:
             surfaced_untrusted=surfaced_untrusted,
             review_needed_pr_numbers=review_needed_pr_numbers,
             review_context=review_context,
+            tick_budget=budget,
         )
         total += push_count
         total += _check_issue_comments(
@@ -2642,13 +3105,20 @@ def main() -> None:
             me,
             review_needed_pr_numbers=review_needed_pr_numbers,
             comments=issue_comments,
+            tick_budget=budget,
         )
         new_pr_heads_all[repo] = new_repo_heads
         new_rr_all[repo] = new_repo_rr
         new_untrusted_all[repo] = sorted(surfaced_untrusted)
+        # One offset drives all three per-PR passes, so a tick concentrates its
+        # budget on the same slice of PRs instead of three disjoint partial views.
+        repo_offset = int(reconcile_offsets.get(repo, 0) or 0)
+        truncated_before = sum(budget.truncated.values())
         repo_cr = cr_all.get(repo, {}) or {}
         cr_count, new_repo_cr = _check_own_changes_requested(
             repo, token, me, repo_cr,
+            tick_budget=budget,
+            rotate_offset=repo_offset,
         )
         total += cr_count
         new_cr_all[repo] = new_repo_cr
@@ -2656,23 +3126,57 @@ def main() -> None:
         mergeability_count, new_repo_mergeability = _check_own_mergeability(
             repo, token, me, repo_mergeability,
             attempt_budget=mergeability_attempt_budget,
+            tick_budget=budget,
+            rotate_offset=repo_offset,
         )
         total += mergeability_count
         new_mergeability_all[repo] = new_repo_mergeability
         repo_ci = ci_failures_all.get(repo, {}) or {}
         ci_count, new_repo_ci = _check_pr_ci_failures(
             repo, since, token, me, repo_ci,
+            tick_budget=budget,
+            rotate_offset=repo_offset,
         )
         total += ci_count
         new_ci_failures_all[repo] = new_repo_ci
+        # Move the window only when this repo actually left PRs unreconciled; a
+        # complete pass already covered every PR, so restart it at the head.
+        if sum(budget.truncated.values()) > truncated_before:
+            new_reconcile_offsets[repo] = repo_offset + PR_RECONCILE_MIN_PER_PASS
+        else:
+            new_reconcile_offsets[repo] = 0
 
-    cursor["last_checked"] = new_cursor_ts
+    if budget.hard_truncated:
+        # The hard deadline cut per-PR work short. Holding the watermark keeps
+        # the since-based passes (notably _check_pr_reviews, which has no dedupe
+        # cursor of its own) from stepping over events this tick never reached.
+        # Re-delivering a nudge is recoverable; dropping a review is not, and
+        # today's SIGKILL already leaves the watermark unadvanced.
+        _emit_signal(
+            "poller_tick_hard_deadline",
+            elapsed_seconds=round(budget.elapsed(), 1),
+            startup_consumed_seconds=round(budget.startup_consumed, 1),
+            hard_deadline_seconds=TICK_HARD_DEADLINE_SECONDS,
+            truncated=dict(budget.truncated),
+        )
+    else:
+        cursor["last_checked"] = new_cursor_ts
     cursor["pr_heads"] = new_pr_heads_all
     cursor["pr_review_requests"] = new_rr_all
+    cursor["pr_reconcile_offsets"] = new_reconcile_offsets or reconcile_offsets
+    if budget.truncated:
+        # Never truncate silently: a tick that skipped PRs must say so, or the
+        # next reader mistakes partial coverage for a quiet repository.
+        _emit_signal(
+            "poller_pr_reconcile_truncated",
+            truncated=dict(budget.truncated),
+            deadline_seconds=PR_RECONCILE_DEADLINE_SECONDS,
+        )
     cursor["pr_changes_requested"] = new_cr_all
     cursor["pr_mergeability"] = new_mergeability_all
     cursor["pr_ci_failures"] = new_ci_failures_all
     cursor["pr_untrusted_authors"] = new_untrusted_all
+    set_active_tick_budget(None)
     _save_cursor(cursor)
     print(
         f"Emitted {total} event(s) across {len(repos)} repo(s)",

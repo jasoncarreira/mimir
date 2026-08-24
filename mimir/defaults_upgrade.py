@@ -473,9 +473,11 @@ def _merge_scheduler_defaults(
         return None, []
     from .scheduler import load_jobs_from_text
 
-    base_names = {j.name for j in load_jobs_from_text(base_text)}
-    their_jobs = load_jobs_from_text(their_text)
-    home_names = {j.name for j in load_jobs_from_text(home_text)}
+    base_jobs, _ = load_jobs_from_text(base_text)
+    their_jobs, _ = load_jobs_from_text(their_text)
+    home_jobs, _ = load_jobs_from_text(home_text)
+    base_names = {j.name for j in base_jobs}
+    home_names = {j.name for j in home_jobs}
     to_add = [
         j for j in their_jobs
         if j.name not in base_names and j.name not in home_names

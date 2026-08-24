@@ -1546,6 +1546,43 @@ async def test_budget_exhaustion_creates_worklink_continuation_sidecar(
     )
 
 
+async def test_budget_exhaustion_passes_run_identity_to_continuation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    repo = _init_continuation_repo(tmp_path)
+    monkeypatch.chdir(repo)
+    agent = _build_agent(
+        tmp_path,
+        fake_agent=_BudgetExhaustingAgent(
+            response_messages=[AIMessage(content="continuing worklink recovery")],
+        ),
+        fake_saga=None,
+    )
+    captured: dict[str, object] = {}
+
+    def _capture_continuation(**kwargs):
+        captured.update(kwargs)
+        return None
+
+    monkeypatch.setattr(
+        "mimir.agent.maybe_create_worklink_budget_continuation",
+        _capture_continuation,
+    )
+
+    await agent.run_turn(
+        AgentEvent(
+            trigger="scheduled_tick",
+            channel_id="ops",
+            content="generic worklink follow-up",
+            source_id="budget-run-id",
+            extra={"run_id": "chainlink-700"},
+        )
+    )
+
+    assert captured["run_id"] == "chainlink-700"
+
+
 async def test_continuation_written_even_without_assistant_output(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
