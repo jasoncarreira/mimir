@@ -2242,6 +2242,38 @@ async def test_run_poller_reports_and_preserves_corrupt_recovery_state(
 
 
 @pytest.mark.asyncio
+async def test_run_poller_reports_and_preserves_invalid_inflight_state(
+    tmp_path: Path, home: Path,
+) -> None:
+    skill_dir = tmp_path / "skill"
+    persist_dir = tmp_path / "persist" / "x"
+    _install_script(skill_dir, "poller.py", "pass\n")
+    cfg = PollerConfig(
+        name="x", command=f"{sys.executable} poller.py",
+        cron="* * * * *", env={}, skill_dir=skill_dir,
+        persist_dir=persist_dir,
+    )
+    persist_dir.mkdir(parents=True)
+    state_path = persist_dir / poller_recovery.RECOVERY_STATE_FILE
+    invalid = b'{"last_reconciled":"2026-08-23T18:00:00+00:00","inflight":null}'
+    state_path.write_bytes(invalid)
+
+    await run_poller(cfg, enqueue=_CapturingEnqueue())
+
+    assert state_path.read_bytes() == invalid
+    unreadable_events = [
+        event for event in _read_events(home)
+        if event["type"] == "poller_recovery_state_unreadable"
+    ]
+    assert len(unreadable_events) == 1
+    assert unreadable_events[0]["poller"] == "x"
+    assert unreadable_events[0]["path"] == str(state_path)
+    assert not any(
+        event["type"] == "poller_recovery" for event in _read_events(home)
+    )
+
+
+@pytest.mark.asyncio
 async def test_run_poller_recovery_back_pressure_does_not_advance_attempts(
     tmp_path: Path, home: Path,
 ) -> None:

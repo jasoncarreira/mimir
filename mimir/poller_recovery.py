@@ -145,7 +145,15 @@ def _load_state(persist_dir: Path) -> dict:
     if isinstance(data, dict):
         last = data.get("last_reconciled")
         inflight = data.get("inflight")
+        if "inflight" in data and not isinstance(inflight, dict):
+            log.warning("poller recovery: inflight has invalid shape at %s", p)
+            return {
+                "last_reconciled": "", "inflight": {},
+                "_unreadable_path": str(p),
+            }
         return {
+            # An invalid watermark is conservative: widening the next scan
+            # cannot discard stashed events, unlike coercing malformed inflight.
             "last_reconciled": last if isinstance(last, str) else "",
             "inflight": inflight if isinstance(inflight, dict) else {},
         }
