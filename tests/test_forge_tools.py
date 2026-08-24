@@ -592,11 +592,25 @@ def test_poller_turn_discovers_live_scope_for_own_open_pr(
     ]
 
 
-def test_poller_turn_refuses_live_scope_for_third_party_open_pr(
+@pytest.mark.parametrize(
+    ("self_login", "snapshot_author"),
+    [
+        pytest.param("reviewer", "untrusted-author", id="third-party-author"),
+        pytest.param(None, "", id="unset-self-login-authorless-snapshot"),
+    ],
+)
+def test_poller_turn_refuses_live_scope_for_unowned_open_pr(
     monkeypatch: pytest.MonkeyPatch,
+    self_login: str | None,
+    snapshot_author: str,
 ) -> None:
     client = FakeForge()
+    client.snapshot_author = snapshot_author
     _configure_live_review(monkeypatch, client)
+    if self_login is None:
+        monkeypatch.delenv("MIMIR_GITHUB_SELF_LOGIN")
+    else:
+        monkeypatch.setenv("MIMIR_GITHUB_SELF_LOGIN", self_login)
 
     with pytest.raises(ToolException) as refused:
         resolve_review_state_for_context(
