@@ -545,13 +545,13 @@ async def create_agent_runtime(
                         from .event_logger import log_event
 
                         recovery_attempts = transient_failures
+                        degradation_recorded = False
+                        degradation_alert_scheduled = False
+                        transient_failures = 0
                         await log_event(
                             "github_identity_recovered",
                             attempts=recovery_attempts,
                         )
-                        degradation_recorded = False
-                        degradation_alert_scheduled = False
-                        transient_failures = 0
         return await agent.run_turn(event)
 
     adapters.dispatcher.set_run_turn(run_turn_with_identity_preflight)
