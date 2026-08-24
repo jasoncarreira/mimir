@@ -2463,7 +2463,7 @@ def test_failed_trusted_mcp_result_remains_untrusted() -> None:
 
 @pytest.mark.parametrize(
     "tool_name",
-    ["shell_exec", "bash", "Bash", "execute", "shell", "web_search", "http_request"],
+    ["bash", "Bash", "shell", "http_request"],
 )
 def test_undomained_ingesting_native_result_taints_active_turn(tool_name: str) -> None:
     authorization = ToolAuthorization(
@@ -2485,7 +2485,32 @@ def test_undomained_ingesting_native_result_taints_active_turn(tool_name: str) -
     assert labels.has_untrusted_active_ingest is True
 
 
-@pytest.mark.parametrize("tool_name", ["fetch_url", "bash_async"])
+def test_failed_newly_mapped_web_search_has_attributable_source() -> None:
+    authorization = ToolAuthorization(
+        tool_name="web_search",
+        decision=OperationDecision.OPEN,
+        allowed=True,
+        flow_direction=ToolFlowDirection.BOTH,
+    )
+
+    labels = classify_protected_result(
+        "web_search",
+        {"query": "chainlink taint refusals"},
+        _auth(),
+        authorization,
+        result="partial attacker-controlled output",
+        failed=True,
+    )
+
+    assert labels is not None
+    source = next(iter(labels.sources))
+    assert source.domain == "web"
+    assert source.resource_id == "chainlink taint refusals"
+    assert source.integrity == "untrusted"
+    assert source.integrity_effect == "active_ingest"
+
+
+@pytest.mark.parametrize("tool_name", ["fetch_url", "bash_async", "write_file"])
 def test_metadata_only_result_does_not_taint_inline_result(tool_name: str) -> None:
     authorization = ToolAuthorization(
         tool_name=tool_name,
