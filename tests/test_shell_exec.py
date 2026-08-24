@@ -81,6 +81,20 @@ def test_shell_exec_does_not_emit_rejection_message_for_unfamiliar_command():
     assert "allowlist" not in result
 
 
+def test_shell_exec_description_routes_broad_service_searches_to_typed_grep():
+    """The model-facing surface must state the hard recursive-read boundary.
+
+    Service turns see the tool description, not deployment notes. Keep the
+    entry/byte caps and the usable fallback there so repo-wide grep commands
+    are not repeatedly generated only to fail admission.
+    """
+    description = shell_exec.description
+
+    assert "256 entries" in description
+    assert "8 MiB" in description
+    assert "typed ``grep`` tool" in description
+
+
 def test_set_shell_allowlist_no_longer_exists_on_public_surface():
     """chainlink #226: the dead setter must not be re-exported from
     mimir.tools — the trust model is documented in shell_exec's docstring

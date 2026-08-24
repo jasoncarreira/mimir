@@ -56,7 +56,8 @@ def test_job_yaml_round_trip(tmp_path: Path):
     assert parsed[0]["cron"] == "0 8 * * *"
     assert parsed[1]["time_of_day"] == "07:30"
 
-    reloaded = load_jobs(path)
+    reloaded, rejections = load_jobs(path)
+    assert rejections == []
     assert len(reloaded) == 2
     assert reloaded[0].cron == "0 8 * * *"
     assert reloaded[1].time_of_day == "07:30"
@@ -75,12 +76,35 @@ def test_load_jobs_skips_invalid_entries(tmp_path: Path):
             ]
         )
     )
-    jobs = load_jobs(path)
+    jobs, rejections = load_jobs(path)
     assert [j.name for j in jobs] == ["good"]
+    assert len(rejections) == 3
 
 
 def test_load_jobs_handles_missing_file(tmp_path: Path):
-    assert load_jobs(tmp_path / "nope.yaml") == []
+    assert load_jobs(tmp_path / "nope.yaml") == ([], [])
+
+
+def test_load_jobs_reports_missing_shell_binary_but_keeps_job(tmp_path: Path):
+    path = tmp_path / "scheduler.yaml"
+    missing = tmp_path / "worklink-image-only-cli"
+    path.write_text(yaml.safe_dump([{
+        "name": "heartbeat",
+        "prompt": "continue",
+        "cron": "* * * * *",
+        "shell_commands": [{
+            "exec": "worklink-image-only-cli",
+            "path": str(missing),
+            "subcommands": [["check"]],
+        }],
+    }]))
+
+    jobs, rejections = load_jobs(path)
+
+    assert [job.name for job in jobs] == ["heartbeat"]
+    assert len(rejections) == 1
+    assert rejections[0]["job"] == "heartbeat"
+    assert rejections[0]["reason"].endswith(f"path does not exist: {missing}")
 
 
 def test_scheduler_job_authority_profile_round_trip_and_unknown_rejected(
@@ -94,7 +118,8 @@ def test_scheduler_job_authority_profile_round_trip_and_unknown_rejected(
         authority_profile="heartbeat",
     )])
 
-    [job] = load_jobs(path)
+    [job], rejections = load_jobs(path)
+    assert rejections == []
     assert job.authority_profile == "heartbeat"
     assert job.cron == "0 * * * *"
 
@@ -105,7 +130,9 @@ def test_scheduler_job_authority_profile_round_trip_and_unknown_rejected(
         "authority_profile": "heartbeet",
     }]))
     with caplog.at_level("WARNING", logger="mimir.scheduler"):
-        assert load_jobs(path) == []
+        jobs, rejections = load_jobs(path)
+        assert jobs == []
+        assert len(rejections) == 1
     assert "unknown authority_profile 'heartbeet'" in caplog.text
 
 
@@ -120,7 +147,8 @@ def test_load_jobs_warns_when_heartbeat_omits_authority_profile(
     }]))
 
     with caplog.at_level("WARNING", logger="mimir.scheduler"):
-        [job] = load_jobs(path)
+        [job], rejections = load_jobs(path)
+        assert rejections == []
 
     assert job.name == "heartbeat"
     assert job.authority_profile is None
@@ -129,6 +157,58 @@ def test_load_jobs_warns_when_heartbeat_omits_authority_profile(
         "with the shared scheduled_tick authority"
     ) in caplog.text
     assert "authority_profile: heartbeat" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_scheduler_reload_reports_every_rejected_yaml_entry(tmp_path: Path):
+    from unittest.mock import patch
+
+    path = tmp_path / "scheduler.yaml"
+    path.write_text(yaml.safe_dump([
+        {"name": "valid", "prompt": "run", "cron": "0 8 * * *"},
+        {"prompt": "unnamed", "cron": "0 9 * * *"},
+        {
+            "name": "bad-kind",
+            "prompt": "ambiguous",
+            "callable": "also-set",
+            "cron": "0 10 * * *",
+        },
+        {
+            "name": "bad-authority",
+            "prompt": "run",
+            "cron": "0 11 * * *",
+            "authority_profile": "unknown",
+        },
+        {
+            "name": "bad-shell",
+            "prompt": "run",
+            "cron": "0 12 * * *",
+            "shell_commands": {},
+        },
+    ]), encoding="utf-8")
+
+    async def noop(_event):
+        return True
+
+    captured: list[tuple[str, dict]] = []
+
+    async def fake_log_event(event_type: str, **payload):
+        captured.append((event_type, payload))
+
+    sched = Scheduler(scheduler_yaml=path, enqueue=noop, home=tmp_path)
+    with patch("mimir.scheduler.log_event", new=fake_log_event):
+        stats = sched.reload()
+        await asyncio.sleep(0)
+
+    rejected = [payload for kind, payload in captured if kind == "scheduler_job_rejected"]
+    assert stats == {"registered": 1, "invalid": 4}
+    assert len(rejected) == 4
+    assert {item["job"] for item in rejected} == {
+        "entry[1]", "bad-kind", "bad-authority", "bad-shell",
+    }
+    assert all(item["path"] == str(path) and item["reason"] for item in rejected)
+    assert sched._scheduler.get_job("scheduler:valid") is not None
+    assert sched._scheduler.get_job("scheduler:bad-shell") is None
 
 
 def test_scheduler_channel_id_synthetic_for_global():
@@ -1377,11 +1457,13 @@ async def test_reload_invalid_callable_cron_preserves_job_and_emits_event(
     job_after = sched._scheduler.get_job("demo")
     assert job_after is job_before
     assert job_after.trigger is trigger_before
-    assert len(captured) == 1
-    event_type, payload = captured[0]
-    assert event_type == "scheduler_invalid_cron"
-    assert payload["job"] == "demo"
-    assert "0 25 * * *" in payload["error"]
+    invalid_cron = [item for item in captured if item[0] == "scheduler_invalid_cron"]
+    rejected = [item for item in captured if item[0] == "scheduler_job_rejected"]
+    assert len(invalid_cron) == 1
+    assert invalid_cron[0][1]["job"] == "demo"
+    assert "0 25 * * *" in invalid_cron[0][1]["error"]
+    assert len(rejected) == 1
+    assert rejected[0][1]["job"] == "broken-demo"
 
 
 def test_reload_valid_callable_is_idempotent(tmp_path: Path):
@@ -1460,7 +1542,7 @@ def test_reload_warns_on_unregistered_callable(tmp_path: Path, caplog):
     import logging
     with caplog.at_level(logging.WARNING):
         result = sched.reload()
-    assert result == {"registered": 0, "invalid": 0}
+    assert result == {"registered": 0, "invalid": 1}
     # The log should mention the unregistered callable.
     assert any("never-registered" in r.message for r in caplog.records)
 
@@ -1599,6 +1681,70 @@ async def test_add_poller_jobs_registers_apscheduler_jobs(tmp_path: Path):
     assert sched.registered_pollers() == ["p1", "p2"]
     assert sched._scheduler.get_job("poller:p1") is not None
     assert sched._scheduler.get_job("poller:p2") is not None
+
+
+@pytest.mark.asyncio
+async def test_add_poller_jobs_reports_each_rejected_manifest_entry(tmp_path: Path):
+    from unittest.mock import patch
+
+    skills = tmp_path / "skills"
+    skill = skills / "mixed"
+    skill.mkdir(parents=True)
+    manifest = skill / "pollers.json"
+    manifest.write_text(_json.dumps({"pollers": [
+        {"name": "valid", "command": "true", "cron": "* * * * *"},
+        {"name": "../bad", "command": "true", "cron": "* * * * *"},
+        {"name": "valid", "command": "true", "cron": "* * * * *"},
+        {"name": "missing-command", "cron": "* * * * *"},
+        {
+            "name": "bad-authority",
+            "command": "true",
+            "cron": "* * * * *",
+            "capabilities": ["shell_exec"],
+        },
+        {
+            "name": "uncapped",
+            "command": "true",
+            "cron": "* * * * *",
+            "budget": {"windows": {"24h": {"max_agent_turns": "many"}}},
+        },
+    ]}), encoding="utf-8")
+
+    async def noop(_event):
+        return True
+
+    captured: list[tuple[str, dict]] = []
+
+    async def fake_log_event(event_type: str, **payload):
+        captured.append((event_type, payload))
+
+    sched = Scheduler(scheduler_yaml=tmp_path / "scheduler.yaml", enqueue=noop)
+    with patch("mimir.scheduler.log_event", new=fake_log_event):
+        installed = sched.add_poller_jobs(skills)
+        await asyncio.sleep(0)
+
+    rejected = [
+        payload for kind, payload in captured
+        if kind == "poller_reload_invalid_entry"
+    ]
+    assert installed == 2
+    assert sched.registered_pollers() == ["uncapped", "valid"]
+    assert len(rejected) == 5
+    assert {item["poller"] for item in rejected} == {
+        "../bad", "valid", "missing-command", "bad-authority", "uncapped",
+    }
+    assert all(
+        item["manifest_path"] == str(manifest) and item["reason"]
+        for item in rejected
+    )
+    uncapped = next(
+        item for item in sched.registered_poller_details()
+        if item["name"] == "uncapped"
+    )
+    assert "budget" not in uncapped
+    assert "budget" in next(
+        item["reason"] for item in rejected if item["poller"] == "uncapped"
+    )
 
 
 @pytest.mark.asyncio
@@ -3703,7 +3849,9 @@ def test_bundled_scheduler_template_ships_audit_ticks():
     from mimir.skill_defs import _BUNDLED_SCHEDULER
     import mimir.prompt_templates as pt
 
-    jobs = {j.name: j for j in load_jobs(_BUNDLED_SCHEDULER)}
+    loaded, rejections = load_jobs(_BUNDLED_SCHEDULER)
+    assert rejections == []
+    jobs = {j.name: j for j in loaded}
     for name in ("heartbeat", "reflect", "memory-hygiene", "issues-audit", "commitments-review"):
         assert name in jobs, f"{name} missing from bundled scheduler template"
 
@@ -3730,7 +3878,8 @@ async def test_bundled_scheduler_template_authority_profiles(
 ):
     template_text = bundled_scheduler_template_text()
     with caplog.at_level("WARNING", logger="mimir.scheduler"):
-        jobs = load_jobs_from_text(template_text)
+        jobs, rejections = load_jobs_from_text(template_text)
+        assert rejections == []
     assert "declares no authority_profile" not in caplog.text
 
     enqueued: list[AgentEvent] = []
@@ -3766,7 +3915,8 @@ async def test_bundled_scheduler_template_authority_profiles(
     mutated = yaml.safe_load(template_text)
     heartbeat_entry = next(entry for entry in mutated if entry["name"] == "heartbeat")
     assert heartbeat_entry.pop("authority_profile") == "heartbeat"
-    mutated_jobs = load_jobs_from_text(yaml.safe_dump(mutated))
+    mutated_jobs, rejections = load_jobs_from_text(yaml.safe_dump(mutated))
+    assert rejections == []
     mutated_heartbeat = next(job for job in mutated_jobs if job.name == "heartbeat")
     enqueued.clear()
     await scheduler._fire(job=mutated_heartbeat)
@@ -4655,7 +4805,9 @@ def test_scheduler_job_priority_yaml_round_trip(tmp_path: Path):
         SchedulerJob(name="hb", prompt="x", cron="0 8 * * *"),
         SchedulerJob(name="digest", prompt="y", cron="0 9 * * *", priority="high"),
     ])
-    jobs = {j.name: j for j in load_jobs(path)}
+    loaded, rejections = load_jobs(path)
+    assert rejections == []
+    jobs = {j.name: j for j in loaded}
     assert jobs["hb"].priority == "normal"     # default, not serialized
     assert jobs["digest"].priority == "high"   # explicit, round-trips
     # Default priority isn't written to yaml (uncluttered).
@@ -4666,7 +4818,7 @@ def test_scheduler_job_priority_yaml_round_trip(tmp_path: Path):
         SchedulerJob(name="nice", prompt="z", cron="0 10 * * *", priority="low"),
     ])
     assert "priority: low" in low_path.read_text()
-    assert load_jobs(low_path)[0].priority == "low"
+    assert load_jobs(low_path)[0][0].priority == "low"
 
 
 def test_scheduler_job_invalid_priority_falls_back_to_normal():

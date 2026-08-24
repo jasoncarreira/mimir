@@ -219,6 +219,34 @@ def test_load_channel_memory_multiple_files_sorted(tmp_path: Path):
     assert "---" in result
 
 
+def test_load_channel_memory_rejects_traversal_and_loads_sanitized_valid_id(
+    tmp_path: Path,
+):
+    home = tmp_path / "a" / "b" / "home"
+    valid = home / "memory" / "channels" / "slack-C123"
+    valid.mkdir(parents=True)
+    (valid / "context.md").write_text("valid channel")
+    (home / "escape.md").write_text("escaped home")
+    etc_escape = tmp_path / "a" / "b" / "etc"
+    etc_escape.mkdir(parents=True)
+    (etc_escape / "escape.md").write_text("escaped etc")
+
+    assert load_channel_memory(home, "../..") is None
+    assert load_channel_memory(home, "../../../../etc") is None
+    assert load_channel_memory(home, "slack-C123") == "valid channel"
+
+
+def test_load_channel_memory_rejects_symlink_outside_channel_root(tmp_path: Path):
+    root = tmp_path / "memory" / "channels"
+    root.mkdir(parents=True)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "secret.md").write_text("outside context")
+    (root / "slack-C123").symlink_to(outside, target_is_directory=True)
+
+    assert load_channel_memory(tmp_path, "slack-C123") is None
+
+
 def test_load_channel_memory_returns_none_for_missing_dir(tmp_path: Path):
     """Returns None when channel directory doesn't exist."""
     result = load_channel_memory(tmp_path, "discord-nonexistent")

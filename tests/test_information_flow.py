@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 from dataclasses import replace
@@ -38,6 +39,7 @@ from mimir.access_control import (
     ProtectedResultProvenance,
     protected_result_source,
     record_file_write_integrity,
+    repair_file_write_integrity,
 )
 from mimir.agent import (
     Agent,
@@ -1216,6 +1218,238 @@ def test_file_write_fails_closed_when_integrity_metadata_is_invalid(
     metadata.write_text("not-json", encoding="utf-8")
 
     assert record_file_write_integrity(str(target), InformationFlowLabels()) is False
+
+
+def test_file_write_integrity_discriminates_clean_empty_from_tainted_ingest(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
+    clean = tmp_path / "memory" / "clean.md"
+    unknown = tmp_path / "memory" / "unknown.md"
+    tainted = tmp_path / "memory" / "tainted.md"
+    clean.parent.mkdir()
+    clean.write_text("self-authored", encoding="utf-8")
+    unknown.write_text("missing provenance", encoding="utf-8")
+    tainted.write_text("external-derived", encoding="utf-8")
+    external = SourceLabel(
+        principal="mallory", domain="channel", resource_id="github:issue:7",
+        bridge_instance="github", sensitivity="internal",
+        authorized_principals=frozenset({"user-1"}),
+        integrity="untrusted", integrity_effect="active_ingest",
+    )
+
+    assert record_file_write_integrity(str(clean), InformationFlowLabels()) is True
+    assert record_file_write_integrity(str(unknown), None) is True
+    assert record_file_write_integrity(
+        str(tainted), InformationFlowLabels(sources=(external,)),
+    ) is True
+
+    assert protected_result_source(
+        _auth(), principal="filesystem", domain="filesystem",
+        resource_id=str(clean), bridge_instance="filesystem",
+    ).integrity == "trusted"
+    assert protected_result_source(
+        _auth(), principal="filesystem", domain="filesystem",
+        resource_id=str(unknown), bridge_instance="filesystem",
+    ).integrity == "untrusted"
+    assert protected_result_source(
+        _auth(), principal="filesystem", domain="filesystem",
+        resource_id=str(tainted), bridge_instance="filesystem",
+    ).integrity == "untrusted"
+
+
+def test_untrusted_self_authored_content_remains_tainted_through_copy(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
+    first = tmp_path / "memory" / "first.md"
+    second = tmp_path / "memory" / "second.md"
+    first.parent.mkdir()
+    first.write_text("external-derived", encoding="utf-8")
+    second.write_text("copied external content", encoding="utf-8")
+    external = SourceLabel(
+        principal="mallory", domain="channel", resource_id="github:issue:7",
+        bridge_instance="github", sensitivity="internal",
+        authorized_principals=frozenset({"user-1"}),
+        integrity="untrusted", integrity_effect="active_ingest",
+    )
+    assert record_file_write_integrity(
+        str(first), InformationFlowLabels(sources=(external,)),
+    ) is True
+    reread = protected_result_source(
+        _auth(), principal="filesystem", domain="filesystem",
+        resource_id=str(first), bridge_instance="filesystem",
+    )
+
+    assert record_file_write_integrity(
+        str(second), InformationFlowLabels(sources=(reread,)),
+    ) is True
+    copied = protected_result_source(
+        _auth(), principal="filesystem", domain="filesystem",
+        resource_id=str(second), bridge_instance="filesystem",
+    )
+    assert (copied.integrity, copied.integrity_effect) == (
+        "untrusted", "active_ingest",
+    )
+
+
+def test_digest_bound_repair_breaks_self_authored_integrity_ratchet(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
+    memory = tmp_path / "memory" / "curated.md"
+    followup = tmp_path / "memory" / "followup.md"
+    memory.parent.mkdir()
+    memory.write_text("operator-inspected notes", encoding="utf-8")
+    metadata = tmp_path / ".mimir" / "file-integrity.json"
+    metadata.parent.mkdir()
+    metadata.write_text(
+        json.dumps({"memory/curated.md": "untrusted"}), encoding="utf-8",
+    )
+    before = protected_result_source(
+        _auth(), principal="filesystem", domain="filesystem",
+        resource_id=str(memory), bridge_instance="filesystem",
+    )
+    assert (before.integrity, before.integrity_effect) == (
+        "untrusted", "active_ingest",
+    )
+    assert record_file_write_integrity(
+        str(memory), InformationFlowLabels(),
+    ) is True
+    assert protected_result_source(
+        _auth(), principal="filesystem", domain="filesystem",
+        resource_id=str(memory), bridge_instance="filesystem",
+    ).integrity == "untrusted"
+
+    digest = hashlib.sha256(memory.read_bytes()).hexdigest()
+    assert repair_file_write_integrity(
+        str(memory), expected_sha256="0" * 64,
+        operator="admin@example.test", reason="reviewed curated memory",
+    ) is False
+    assert repair_file_write_integrity(
+        str(memory), expected_sha256=digest,
+        operator="admin@example.test", reason="reviewed curated memory",
+    ) is True
+
+    repaired = protected_result_source(
+        _auth(), principal="filesystem", domain="filesystem",
+        resource_id=str(memory), bridge_instance="filesystem",
+    )
+    assert (repaired.integrity, repaired.integrity_effect) == (
+        "trusted", "informational",
+    )
+    followup.write_text("new self-authored note", encoding="utf-8")
+    assert record_file_write_integrity(
+        str(followup), InformationFlowLabels(sources=(repaired,)),
+    ) is True
+    assert protected_result_source(
+        _auth(), principal="filesystem", domain="filesystem",
+        resource_id=str(followup), bridge_instance="filesystem",
+    ).integrity == "trusted"
+    payload = json.loads(metadata.read_text(encoding="utf-8"))
+    assert payload["memory/curated.md"] == "trusted"
+    assert payload["memory/followup.md"] == "trusted"
+    assert payload["__declassifications__"] == [{
+        "operator": "admin@example.test",
+        "path": "memory/curated.md",
+        "prior": "untrusted",
+        "reason": "reviewed curated memory",
+        "sha256": digest,
+    }]
+
+
+def test_legacy_untrusted_integrity_records_are_deliberately_retained(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
+    entries = {
+        **{f"memory/issues/{index}.md": "untrusted" for index in range(71)},
+        **{f"state/{index}.json": "untrusted" for index in range(123)},
+    }
+    metadata = tmp_path / ".mimir" / "file-integrity.json"
+    metadata.parent.mkdir()
+    metadata.write_text(json.dumps(entries), encoding="utf-8")
+    clean = tmp_path / "memory" / "new.md"
+    clean.parent.mkdir()
+
+    assert record_file_write_integrity(str(clean), InformationFlowLabels()) is True
+
+    payload = json.loads(metadata.read_text(encoding="utf-8"))
+    assert {key: payload[key] for key in entries} == entries
+    assert payload["memory/new.md"] == "trusted"
+
+
+def test_invalid_legacy_integrity_value_stays_fail_closed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
+    memory = tmp_path / "memory" / "unknown.md"
+    memory.parent.mkdir()
+    memory.write_text("unknown provenance", encoding="utf-8")
+    metadata = tmp_path / ".mimir" / "file-integrity.json"
+    metadata.parent.mkdir()
+    metadata.write_text(
+        json.dumps({"memory/unknown.md": None}), encoding="utf-8",
+    )
+
+    assert protected_result_source(
+        _auth(), principal="filesystem", domain="filesystem",
+        resource_id=str(memory), bridge_instance="filesystem",
+    ).integrity == "untrusted"
+    assert record_file_write_integrity(
+        str(memory), InformationFlowLabels(),
+    ) is True
+    assert json.loads(metadata.read_text(encoding="utf-8")) == {
+        "memory/unknown.md": None,
+    }
+
+
+def test_integrity_repair_rejects_untrusted_paths_and_malformed_audit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    memory = home / "memory" / "notes.md"
+    symlink_target = home / "memory" / "symlink-target.md"
+    poller = home / "state" / "pollers" / "github" / "cursor.json"
+    outside = tmp_path / "outside.md"
+    memory.parent.mkdir()
+    poller.parent.mkdir(parents=True)
+    memory.write_text("notes", encoding="utf-8")
+    symlink_target.write_text("reviewed target", encoding="utf-8")
+    poller.write_text("external cursor", encoding="utf-8")
+    outside.write_text("outside", encoding="utf-8")
+    linked = home / "memory" / "linked.md"
+    linked.symlink_to(symlink_target)
+    metadata = home / ".mimir" / "file-integrity.json"
+    metadata.parent.mkdir()
+    metadata.write_text(json.dumps({
+        "memory/notes.md": "untrusted",
+        "memory/symlink-target.md": "untrusted",
+        "state/pollers/github/cursor.json": "untrusted",
+    }), encoding="utf-8")
+
+    for path in (poller, outside, linked):
+        assert repair_file_write_integrity(
+            str(path), expected_sha256=hashlib.sha256(path.read_bytes()).hexdigest(),
+            operator="admin", reason="reviewed",
+        ) is False
+
+    metadata.write_text(json.dumps({
+        "memory/notes.md": "untrusted",
+        "__declassifications__": {},
+    }), encoding="utf-8")
+    assert repair_file_write_integrity(
+        str(memory), expected_sha256=hashlib.sha256(memory.read_bytes()).hexdigest(),
+        operator="admin", reason="reviewed",
+    ) is False
 
 
 
@@ -2463,7 +2697,7 @@ def test_failed_trusted_mcp_result_remains_untrusted() -> None:
 
 @pytest.mark.parametrize(
     "tool_name",
-    ["shell_exec", "bash", "Bash", "execute", "shell", "web_search", "http_request"],
+    ["bash", "Bash", "shell", "http_request"],
 )
 def test_undomained_ingesting_native_result_taints_active_turn(tool_name: str) -> None:
     authorization = ToolAuthorization(
@@ -2485,7 +2719,32 @@ def test_undomained_ingesting_native_result_taints_active_turn(tool_name: str) -
     assert labels.has_untrusted_active_ingest is True
 
 
-@pytest.mark.parametrize("tool_name", ["fetch_url", "bash_async"])
+def test_failed_newly_mapped_web_search_has_attributable_source() -> None:
+    authorization = ToolAuthorization(
+        tool_name="web_search",
+        decision=OperationDecision.OPEN,
+        allowed=True,
+        flow_direction=ToolFlowDirection.BOTH,
+    )
+
+    labels = classify_protected_result(
+        "web_search",
+        {"query": "chainlink taint refusals"},
+        _auth(),
+        authorization,
+        result="partial attacker-controlled output",
+        failed=True,
+    )
+
+    assert labels is not None
+    source = next(iter(labels.sources))
+    assert source.domain == "web"
+    assert source.resource_id == "chainlink taint refusals"
+    assert source.integrity == "untrusted"
+    assert source.integrity_effect == "active_ingest"
+
+
+@pytest.mark.parametrize("tool_name", ["fetch_url", "bash_async", "write_file"])
 def test_metadata_only_result_does_not_taint_inline_result(tool_name: str) -> None:
     authorization = ToolAuthorization(
         tool_name=tool_name,

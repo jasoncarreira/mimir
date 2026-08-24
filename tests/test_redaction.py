@@ -10,6 +10,7 @@ import re
 
 import pytest
 
+from mimir.contained_execution import SensitiveMaterialScrubber
 from mimir.redaction import (
     _COLON_CREDENTIAL_PATTERNS,
     _TOKEN_PATTERNS,
@@ -18,7 +19,13 @@ from mimir.redaction import (
     redact_text,
 )
 from mimir.turn_event_redaction import scrub_text
-from tests.redaction_corpus import FAKE_SECRET, SECRET_TEXT_CORPUS
+from tests.redaction_corpus import (
+    BARE_SECRET_TEXT_CORPUS,
+    COMPACT_HS256_JWT,
+    FAKE_SECRET,
+    RS256_JWT,
+    SECRET_TEXT_CORPUS,
+)
 
 
 # ─── #499: AWS keys + JSON OAuth-token forms ───────────────────────────
@@ -68,6 +75,80 @@ def test_durable_redaction_is_superset_of_ephemeral_redaction() -> None:
         assert not ephemeral_masked or durable_masked, (
             f"ephemeral path masked {text!r}, but durable path did not"
         )
+
+
+@pytest.mark.parametrize(
+    ("text", "preserved_prefix"),
+    [
+        pytest.param(BARE_SECRET_TEXT_CORPUS[0], "", id="bare-xapp"),
+        pytest.param(BARE_SECRET_TEXT_CORPUS[1], "", id="bare-tvly"),
+        pytest.param(BARE_SECRET_TEXT_CORPUS[2], "", id="bare-pa"),
+        pytest.param(BARE_SECRET_TEXT_CORPUS[3], "", id="bare-aiza"),
+        pytest.param(
+            COMPACT_HS256_JWT,
+            "eyJhbGciOiJIUzI1NiJ9.",
+            id="compact-hs256-jwt",
+        ),
+        pytest.param(
+            RS256_JWT,
+            "eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.",
+            id="rs256-jwt",
+        ),
+    ],
+)
+def test_bare_secret_shapes_are_masked_by_durable_and_live_redactors(
+    text: str, preserved_prefix: str
+) -> None:
+    durable = redact_text(text)
+    live = scrub_text(text)
+
+    assert durable != text
+    assert live != text
+    assert text not in durable
+    assert text not in live
+    assert durable.startswith(preserved_prefix)
+    assert live.startswith(preserved_prefix)
+    if preserved_prefix:
+        assert durable == preserved_prefix + "[REDACTED]"
+        assert live == preserved_prefix + "[redacted]"
+
+
+def test_39_character_google_api_key_is_masked() -> None:
+    google_key = BARE_SECRET_TEXT_CORPUS[3]
+
+    assert len(google_key) == 39
+    assert redact_text(google_key) == "[REDACTED]"
+    assert scrub_text(google_key) == "[redacted]"
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "see europa-mission-telemetry-archive-2026 for detail",
+        "/opt/data-pa-partition-export-archive/file.txt",
+        "com.example.averylongpackagename.submodule.ClassName",
+    ],
+)
+def test_bare_secret_patterns_preserve_ordinary_text(text: str) -> None:
+    assert redact_text(text) == text
+    expected_live = (
+        "[path]"
+        if text == "/opt/data-pa-partition-export-archive/file.txt"
+        else text
+    )
+    assert scrub_text(text) == expected_live
+
+
+def test_shared_corpus_pins_contained_scrubber_registration_asymmetry() -> None:
+    scrubber = SensitiveMaterialScrubber(home="", checkout=None)
+
+    for text in BARE_SECRET_TEXT_CORPUS:
+        assert redact_text(text) != text
+        assert scrub_text(text) != text
+        assert scrubber.scrub_text(text) == text
+
+        scrubber.add_scalar(text)
+        assert scrubber.scrub_text(text) != text
 
 
 @pytest.mark.parametrize(

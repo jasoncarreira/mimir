@@ -265,7 +265,13 @@ def load_channel_memory(home: Path, channel_id: str) -> str | None:
     if any(channel_id.startswith(p) for p in _SYNTHETIC_PREFIXES):
         return None
 
-    channel_dir = home / "memory" / "channels" / channel_id
+    safe_channel_id = "".join(
+        ch if ch.isalnum() or ch in "-_" else "_" for ch in channel_id
+    )
+    channel_root = (home / "memory" / "channels").resolve()
+    channel_dir = (channel_root / safe_channel_id).resolve()
+    if not channel_dir.is_relative_to(channel_root):
+        return None
     if not channel_dir.is_dir():
         return None
 

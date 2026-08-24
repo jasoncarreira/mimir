@@ -16,6 +16,7 @@ from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 import json
 import os
+import re
 import shutil
 import stat
 import sys
@@ -37,6 +38,9 @@ from mimir.pollers import (
     PollerConfig,
     PollerOverridesValidationError,
     _CircuitBreakerState,
+    _GITHUB_ACTIVITY_EVENT_TYPES,
+    _GITHUB_ACTOR_EVENT_TYPES,
+    _GITHUB_FRAMEWORK_TRIGGER_EVENT_TYPES,
     _cb_record_failure,
     _circuit_breakers,
     _github_author_is_trusted,
@@ -44,6 +48,7 @@ from mimir.pollers import (
     _github_framework_trigger_is_trusted,
     _parse_poller_authority,
     discover_pollers,
+    GITHUB_TRUST_ATTEMPTS_PER_FIRE,
     run_poller,
     validate_poller_overrides_text,
 )
@@ -1712,6 +1717,65 @@ print(json.dumps({"poller": "x", "prompt": "untrusted", "event_type": "issue_ope
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("verdicts", "expected_integrities", "expected_calls"),
+    [
+        ([None, True], ["untrusted", "trusted"], 2),
+        ([False, True], ["untrusted", "untrusted"], 1),
+    ],
+)
+async def test_github_poller_caches_only_resolved_author_trust(
+    tmp_path: Path,
+    home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    verdicts: list[bool | None],
+    expected_integrities: list[str],
+    expected_calls: int,
+) -> None:
+    """Unknown retries within a fire; authoritative false remains cached."""
+    skill_dir = tmp_path / "skill"
+    _install_script(skill_dir, "poller.py", """
+import json
+for number in (1, 2):
+    print(json.dumps({"poller": "x", "prompt": f"issue {number}", "event_type": "issue_opened", "repo": "acme/widget", "url": f"https://github.com/acme/widget/issues/{number}"}))
+""")
+    calls: list[tuple[object, object, str]] = []
+    remaining = iter(verdicts)
+
+    def fake_lookup(repo: object, author: object, token: str) -> bool | None:
+        calls.append((repo, author, token))
+        return next(remaining)
+
+    monkeypatch.setattr(
+        "mimir.pollers._github_content_author",
+        lambda _repo, _extras, _token: "alice",
+    )
+    monkeypatch.setattr("mimir.pollers._github_author_is_trusted", fake_lookup)
+    cfg = PollerConfig(
+        name="x",
+        command=f"{sys.executable} poller.py",
+        cron="* * * * *",
+        env={"GITHUB_TOKEN": "server-token"},
+        skill_dir=skill_dir,
+        batch_size=1,
+        trust_source="github",
+    )
+    enq = _CapturingEnqueue()
+
+    await run_poller(cfg, enqueue=enq)
+
+    assert len(enq.events) == 2
+    assert [
+        next(iter(event.ifc_labels.sources)).integrity
+        for event in enq.events
+        if event.ifc_labels is not None
+    ] == expected_integrities
+    assert calls == [
+        ("acme/widget", "alice", "server-token"),
+    ] * expected_calls
+
+
+@pytest.mark.asyncio
 async def test_contributor_github_content_is_trusted_from_server_checks(
     tmp_path: Path,
     home: Path,
@@ -1788,23 +1852,112 @@ print(json.dumps({"poller": "x", "prompt": "hostile PR body", "event_type": "pr_
     ).allowed is False
 
 
-def test_pr_synchronize_commit_author_is_not_used_as_trust_attestation(
+def test_pr_synchronize_actor_is_resolved_from_server_compare(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     calls: list[str] = []
     monkeypatch.setattr(
         "mimir.pollers._github_api_attestation",
-        lambda endpoint, _token: calls.append(endpoint) or (200, {"user": {"login": "alice"}}),
+        lambda endpoint, _token: calls.append(endpoint)
+        or (200, {"commits": [{"author": {"login": "alice"}}]}),
     )
 
     author = _github_content_author("acme/widget", {
         "event_type": "pr_synchronize",
         "url": "https://github.com/acme/widget/pull/11",
         "author": "trusted-looking-commit-author",
+        "previous_head": "a" * 40,
+        "new_head": "b" * 40,
     }, "server-token")
 
-    assert author is None
-    assert calls == []
+    assert author == "alice"
+    assert calls == [f"repos/acme/widget/compare/{'a' * 40}...{'b' * 40}"]
+
+
+def test_github_activity_integrity_classification_is_total() -> None:
+    poller_source = (
+        Path(__file__).parents[1]
+        / "mimir/optional-skills/github-poller/scripts/poller.py"
+    ).read_text(encoding="utf-8")
+    emitted = frozenset(re.findall(r'\bevent_type\s*=\s*["\']([^"\']+)', poller_source))
+
+    assert emitted == _GITHUB_ACTIVITY_EVENT_TYPES
+    assert not (_GITHUB_ACTOR_EVENT_TYPES.keys() & _GITHUB_FRAMEWORK_TRIGGER_EVENT_TYPES.keys())
+    assert all(_GITHUB_ACTOR_EVENT_TYPES.values())
+    assert all(_GITHUB_FRAMEWORK_TRIGGER_EVENT_TYPES.values())
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("event_type", ["pr_synchronize", "pr_review_requested"])
+@pytest.mark.parametrize("collaborator", [True, False])
+async def test_new_github_activity_actors_use_discriminating_server_trust(
+    tmp_path: Path,
+    home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    event_type: str,
+    collaborator: bool,
+) -> None:
+    actor = "collaborator" if collaborator else "outsider"
+    item = {
+        "poller": "x",
+        "prompt": "GitHub activity",
+        "event_type": event_type,
+        "repo": "acme/widget",
+        "number": 11,
+        "url": "https://github.com/acme/widget/pull/11",
+        "author": "payload-impostor",
+        "previous_head": "a" * 40,
+        "new_head": "b" * 40,
+        "requested_reviewer": "mimir-bot",
+    }
+    skill_dir = tmp_path / "skill"
+    _install_script(skill_dir, "poller.py", f"""
+import json
+print(json.dumps({item!r}))
+""")
+    calls: list[str] = []
+
+    def fake_api(endpoint: str, token: str):
+        assert token == "server-token"
+        calls.append(endpoint)
+        if "/compare/" in endpoint:
+            return 200, {"commits": [{"author": {"login": actor}}]}
+        if "/timeline?" in endpoint:
+            return 200, [{
+                "event": "review_requested",
+                "requested_reviewer": {"login": "mimir-bot"},
+                "actor": {"login": actor},
+            }]
+        if endpoint == f"repos/acme/widget/collaborators/{actor}":
+            return (204, None) if collaborator else (404, None)
+        if endpoint == f"orgs/acme/memberships/{actor}":
+            return 404, None
+        pytest.fail(f"unexpected GitHub endpoint: {endpoint}")
+
+    monkeypatch.setattr("mimir.pollers._github_api_attestation", fake_api)
+    cfg = PollerConfig(
+        name="x", command=f"{sys.executable} poller.py", cron="* * * * *",
+        env={"GITHUB_TOKEN": "server-token"}, skill_dir=skill_dir,
+        trust_source="github",
+    )
+    enq = _CapturingEnqueue()
+
+    await run_poller(cfg, enqueue=enq)
+
+    source = next(iter(enq.events[0].ifc_labels.sources))
+    assert (source.integrity, source.integrity_effect) == (
+        "trusted" if collaborator else "untrusted",
+        "active_ingest",
+    )
+    identity_endpoint = (
+        f"repos/acme/widget/compare/{'a' * 40}...{'b' * 40}"
+        if event_type == "pr_synchronize"
+        else "repos/acme/widget/issues/11/timeline?per_page=100"
+    )
+    expected = [identity_endpoint, f"repos/acme/widget/collaborators/{actor}"]
+    if not collaborator:
+        expected.append(f"orgs/acme/memberships/{actor}")
+    assert calls == expected
 
 
 def test_github_content_author_uses_api_and_ignores_payload_claim(
@@ -5328,3 +5481,62 @@ def test_discover_parses_deliver_field(tmp_path: Path):
     assert by_name["p1"].deliver == "OPERATOR_CHANNEL"
     assert by_name["p2"].deliver is None
     assert by_name["p3"].deliver == "slack-ops"
+
+
+@pytest.mark.asyncio
+async def test_github_poller_bounds_unresolved_author_trust_attempts_per_fire(
+    tmp_path: Path,
+    home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An unresolved attestation retries, but a same-author batch cannot turn it
+    into one network call per item.
+
+    Review of chainlink #1441: this loop runs after the subprocess drains, so
+    POLLER_TIMEOUT_SECONDS does not bound it, and scheduler.py awaits run_poller()
+    without wait_for while holding a poller semaphore slot. Five same-author items
+    with the attestation permanently unavailable must spend the fire's attempt
+    budget and stop calling out, while every event still fails closed.
+    """
+    skill_dir = tmp_path / "skill"
+    _install_script(skill_dir, "poller.py", """
+import json
+for number in (1, 2, 3, 4, 5):
+    print(json.dumps({"poller": "x", "prompt": f"issue {number}", "event_type": "issue_opened", "repo": "acme/widget", "url": f"https://github.com/acme/widget/issues/{number}"}))
+""")
+    calls: list[tuple[object, object, str]] = []
+
+    def never_resolves(repo: object, author: object, token: str) -> bool | None:
+        calls.append((repo, author, token))
+        return None
+
+    monkeypatch.setattr(
+        "mimir.pollers._github_content_author",
+        lambda _repo, _extras, _token: "alice",
+    )
+    monkeypatch.setattr("mimir.pollers._github_author_is_trusted", never_resolves)
+    cfg = PollerConfig(
+        name="x",
+        command=f"{sys.executable} poller.py",
+        cron="* * * * *",
+        env={"GITHUB_TOKEN": "server-token"},
+        skill_dir=skill_dir,
+        batch_size=1,
+        trust_source="github",
+    )
+    enq = _CapturingEnqueue()
+
+    await run_poller(cfg, enqueue=enq)
+
+    assert len(enq.events) == 5
+    # The cap, not the item count, decides how many times we call GitHub.
+    assert len(calls) == GITHUB_TRUST_ATTEMPTS_PER_FIRE
+    assert len(calls) < len(enq.events)
+    # Every event still fails closed, including those that never triggered a call.
+    integrities = [
+        source.integrity
+        for event in enq.events
+        for source in event.ifc_labels.sources
+        if source.domain == "channel"
+    ]
+    assert integrities == ["untrusted"] * 5

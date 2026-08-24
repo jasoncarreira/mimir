@@ -130,6 +130,12 @@ log = logging.getLogger(__name__)
 # subprocess env so a poller can size its own internal deadlines against the real
 # cap instead of hardcoding a copy that drifts.
 POLLER_TIMEOUT_SECONDS = 120
+
+# Bounded attestation retries per (repo, author) within one poller fire.
+# 2 = the initial attempt plus one retry: enough for chainlink #1441's
+# "a later event re-resolves", bounded so a same-author batch cannot turn an
+# unresolved attestation into O(items) network calls in an unbounded loop.
+GITHUB_TRUST_ATTEMPTS_PER_FIRE = 2
 # Cap stderr text recorded in events.jsonl so a chatty poller doesn't
 # blow the algedonic stream's storage budget.
 POLLER_STDERR_LOG_CHARS = 2000
@@ -165,12 +171,24 @@ POLLER_REJECTION_PREVIEW_CHARS = 200
 # into fewer turns.
 POLLER_BATCH_SIZE_DEFAULT = 1
 _POLLER_TRUST_SOURCES = frozenset({"external", "github", "trusted_system"})
-_GITHUB_FRAMEWORK_TRIGGER_EVENT_TYPES = frozenset({
-    "pr_changes_requested_stale",
-    "pr_ci_failure",
-    "pr_mergeability_rebase",
-    "pr_mergeability_conflicting",
-})
+_GITHUB_ACTOR_EVENT_TYPES = {
+    "issue_opened": "issue author",
+    "pr_opened": "pull request author",
+    "issue_comment": "comment author",
+    "pr_review_comment": "review comment author",
+    "pr_review": "reviewer",
+    "pr_synchronize": "server-linked head commit author or committer",
+    "pr_review_requested": "review requester",
+}
+_GITHUB_FRAMEWORK_TRIGGER_EVENT_TYPES = {
+    "pr_changes_requested_stale": "derived from live review and pull request state",
+    "pr_ci_failure": "derived from checks on the agent's live pull request head",
+    "pr_mergeability_rebase": "derived from live pull request mergeability",
+    "pr_mergeability_conflicting": "derived from live pull request mergeability",
+}
+_GITHUB_ACTIVITY_EVENT_TYPES = frozenset(
+    _GITHUB_ACTOR_EVENT_TYPES | _GITHUB_FRAMEWORK_TRIGGER_EVENT_TYPES,
+)
 _DELIVERY_RECEIPTS_DIR = ".delivery-receipts"
 
 
@@ -431,7 +449,7 @@ def _github_author_is_trusted(
 def _github_content_author(
     repo: Any, extras: Any, token: str, *, timeout: float | None = None,
 ) -> str | None:
-    """Resolve a GitHub body/comment author from GitHub, never poller output.
+    """Resolve a GitHub activity actor from GitHub, never poller output.
 
     ``timeout`` bounds the attestation request; callers running under a
     wall-clock budget pass their remaining time so this transport cannot outlive
@@ -454,6 +472,8 @@ def _github_content_author(
     number = path[3]
     if not number.isdigit():
         return None
+    if event_type not in _GITHUB_ACTOR_EVENT_TYPES:
+        return None
 
     endpoint: str | None = None
     fragment = parsed.fragment
@@ -471,6 +491,20 @@ def _github_content_author(
         review_id = fragment.removeprefix("pullrequestreview-")
         if review_id.isdigit():
             endpoint = f"repos/{repo}/pulls/{number}/reviews/{review_id}"
+    elif event_type == "pr_review":
+        endpoint = f"repos/{repo}/pulls/{number}/reviews"
+    elif event_type == "pr_synchronize":
+        previous_head = extras.get("previous_head")
+        new_head = extras.get("new_head")
+        if all(
+            isinstance(value, str)
+            and 7 <= len(value) <= 64
+            and all(character in "0123456789abcdefABCDEF" for character in value)
+            for value in (previous_head, new_head)
+        ):
+            endpoint = f"repos/{repo}/compare/{previous_head}...{new_head}"
+    elif event_type == "pr_review_requested":
+        endpoint = f"repos/{repo}/issues/{number}/timeline?per_page=100"
     if endpoint is None:
         return None
     attestation = _github_api_attestation(
@@ -479,10 +513,40 @@ def _github_content_author(
     if (
         attestation is None
         or attestation[0] != 200
-        or not isinstance(attestation[1], dict)
     ):
         return None
-    user = attestation[1].get("user")
+
+    payload = attestation[1]
+    if event_type == "pr_synchronize":
+        commits = payload.get("commits") if isinstance(payload, dict) else None
+        commit = commits[-1] if isinstance(commits, list) and commits else None
+        if not isinstance(commit, dict):
+            return None
+        user = commit.get("author") or commit.get("committer")
+    elif event_type == "pr_review_requested":
+        requested_reviewer = extras.get("requested_reviewer")
+        if not isinstance(payload, list) or not isinstance(requested_reviewer, str):
+            return None
+        matching = [
+            event for event in payload
+            if isinstance(event, dict)
+            and event.get("event") == "review_requested"
+            and isinstance(event.get("requested_reviewer"), dict)
+            and event["requested_reviewer"].get("login") == requested_reviewer
+        ]
+        if not matching:
+            return None
+        user = matching[-1].get("actor")
+    elif event_type == "pr_review" and isinstance(payload, list):
+        matching = [
+            review for review in payload
+            if isinstance(review, dict) and review.get("html_url") == url
+        ]
+        if not matching:
+            return None
+        user = matching[-1].get("user")
+    else:
+        user = payload.get("user") if isinstance(payload, dict) else None
     author = user.get("login") if isinstance(user, dict) else None
     return author if isinstance(author, str) and author else None
 
@@ -1042,6 +1106,7 @@ def _parse_poller_overrides_raw(
     *,
     path: Path,
     strict: bool,
+    rejections: list[tuple[Path, str, str]] | None = None,
 ) -> dict[str, dict]:
     if raw is None:
         return {}
@@ -1053,6 +1118,8 @@ def _parse_poller_overrides_raw(
         if strict:
             raise PollerOverridesValidationError(msg)
         log.warning("%s; ignoring file", msg)
+        if rejections is not None:
+            rejections.append((path, "<overrides>", "root must be a mapping"))
         return {}
     out: dict[str, dict] = {}
     for name, entry in raw.items():
@@ -1064,6 +1131,8 @@ def _parse_poller_overrides_raw(
             if strict:
                 raise PollerOverridesValidationError(msg)
             log.warning("%s; skipping", msg)
+            if rejections is not None:
+                rejections.append((path, str(name), "override entry must be a mapping"))
             continue
         kept = {}
         for key, value in entry.items():
@@ -1076,6 +1145,8 @@ def _parse_poller_overrides_raw(
                 if strict:
                     raise PollerOverridesValidationError(msg)
                 log.warning("%s; dropping", msg)
+                if rejections is not None:
+                    rejections.append((path, str(name), f"unknown override field {key!r}"))
                 continue
             if strict and key == "env":
                 if not isinstance(value, dict):
@@ -1137,7 +1208,11 @@ def validate_poller_overrides_text(text: str, *, path: Path) -> dict[str, dict]:
     return _parse_poller_overrides_raw(raw, path=path, strict=True)
 
 
-def load_poller_overrides(path: Path | None) -> dict[str, dict]:
+def load_poller_overrides(
+    path: Path | None,
+    *,
+    rejections: list[tuple[Path, str, str]] | None = None,
+) -> dict[str, dict]:
     """Parse ``pollers-overrides.yaml`` → ``{poller_name: {field: value}}``.
 
     Best-effort and fail-safe: a missing file is a no-op, a malformed
@@ -1154,12 +1229,20 @@ def load_poller_overrides(path: Path | None) -> dict[str, dict]:
         raw = yaml.safe_load(path.read_text(encoding="utf-8"))
     except Exception as exc:  # noqa: BLE001 — config parse must never abort discovery
         log.warning("poller_overrides_invalid: %s — %s; ignoring file", path, exc)
+        if rejections is not None:
+            rejections.append((path, "<overrides>", f"{type(exc).__name__}: {exc}"))
         return {}
-    return _parse_poller_overrides_raw(raw, path=path, strict=False)
+    return _parse_poller_overrides_raw(
+        raw, path=path, strict=False, rejections=rejections,
+    )
 
 
 def _apply_poller_overrides(
-    poller: "PollerConfig", overrides: dict, *, source: Path,
+    poller: "PollerConfig",
+    overrides: dict,
+    *,
+    source: Path,
+    rejections: list[tuple[Path, str, str]] | None = None,
 ) -> "PollerConfig":
     """Return ``poller`` with validated operator overrides applied.
 
@@ -1174,6 +1257,11 @@ def _apply_poller_overrides(
     import dataclasses
 
     updates: dict = {}
+
+    def reject(reason: str) -> None:
+        if rejections is not None:
+            rejections.append((source, poller.name, reason))
+
     if "cron" in overrides:
         cron = str(overrides["cron"]).strip()
         try:
@@ -1188,6 +1276,7 @@ def _apply_poller_overrides(
                 "keeping manifest cron %r",
                 source, poller.name, cron, exc, poller.cron,
             )
+            reject(f"invalid cron override {cron!r}: {exc}")
     if "priority" in overrides:
         raw_p = overrides["priority"]
         norm = normalize_priority(raw_p, default=poller.priority)
@@ -1197,6 +1286,7 @@ def _apply_poller_overrides(
                 "(expected low|normal|high); keeping %r",
                 source, poller.name, raw_p, norm,
             )
+            reject(f"invalid priority override {raw_p!r}")
         updates["priority"] = norm
     if "batch_size" in overrides:
         try:
@@ -1211,6 +1301,7 @@ def _apply_poller_overrides(
                 "keeping %d", source, poller.name,
                 overrides["batch_size"], poller.batch_size,
             )
+            reject(f"invalid batch_size override {overrides['batch_size']!r}")
     if "recover_failed_turns" in overrides:
         parsed = _parse_override_bool(overrides["recover_failed_turns"])
         if parsed is None:
@@ -1220,6 +1311,10 @@ def _apply_poller_overrides(
                 "true/false/yes/no/1/0); keeping %r",
                 source, poller.name, overrides["recover_failed_turns"],
                 poller.recover_failed_turns,
+            )
+            reject(
+                "invalid recover_failed_turns override "
+                f"{overrides['recover_failed_turns']!r}"
             )
         else:
             updates["recover_failed_turns"] = parsed
@@ -1232,6 +1327,7 @@ def _apply_poller_overrides(
                 "poller_overrides_invalid_env: %s — %s.env must be a "
                 "mapping; keeping manifest env", source, poller.name,
             )
+            reject("env override must be a mapping")
     if "pass_env" in overrides:
         pe = overrides["pass_env"]
         if isinstance(pe, list) and all(isinstance(x, str) for x in pe):
@@ -1242,6 +1338,7 @@ def _apply_poller_overrides(
                 "be a list of strings; keeping manifest pass_env",
                 source, poller.name,
             )
+            reject("pass_env override must be a list of strings")
     if "deliver" in overrides:  # chainlink #508
         dv = overrides["deliver"]
         if dv is None or isinstance(dv, str):
@@ -1252,12 +1349,17 @@ def _apply_poller_overrides(
                 "string (channel id or OPERATOR_CHANNEL) or null; keeping %r",
                 source, poller.name, poller.deliver,
             )
+            reject(f"deliver override must be a string or null, got {dv!r}")
     if "budget" in overrides:
+        budget_rejections: list[str] = []
         budget = parse_poller_budget_config(
             overrides["budget"],
             source=source,
             poller_name=poller.name,
+            rejections=budget_rejections,
         )
+        if budget_rejections:
+            reject("; ".join(budget_rejections))
         if budget is not None:
             updates["budget"] = budget
     if not updates:
@@ -1274,6 +1376,7 @@ def discover_pollers(
     *,
     state_root: Path | None = None,
     invalid_manifests: list[tuple[Path, str]] | None = None,
+    invalid_entries: list[tuple[Path, str, str]] | None = None,
     overrides_path: Path | None = None,
 ) -> list[PollerConfig]:
     """Walk ``skills_dir/**/pollers.json`` and parse out poller configs.
@@ -1304,6 +1407,10 @@ def discover_pollers(
     as "preserve previously installed" would mask real misconfig.
     Out-list rather than tuple return so existing call sites that
     don't care about the new signal need no unpacking change.
+
+    ``invalid_entries`` collects rejected entries and rejected optional fields
+    as ``(source_path, poller_name, reason)`` tuples. The scheduler emits them
+    after discovery returns, keeping this parser safe in synchronous contexts.
     """
     pollers: list[PollerConfig] = []
     if not skills_dir.exists():
@@ -1359,6 +1466,12 @@ def discover_pollers(
                 "poller_invalid_format: %s — expected dict with 'pollers' key",
                 pollers_file,
             )
+            if invalid_entries is not None:
+                invalid_entries.append((
+                    pollers_file,
+                    "<manifest>",
+                    "expected a mapping with a 'pollers' key",
+                ))
             continue
 
         # Schema-version gate: absent means v1 (backwards compatible).
@@ -1381,10 +1494,20 @@ def discover_pollers(
                 "poller_invalid_format: %s — 'pollers' must be a list",
                 pollers_file,
             )
+            if invalid_entries is not None:
+                invalid_entries.append((
+                    pollers_file, "<manifest>", "'pollers' must be a list",
+                ))
             continue
 
-        for entry in entries:
+        for entry_index, entry in enumerate(entries):
             if not isinstance(entry, dict):
+                if invalid_entries is not None:
+                    invalid_entries.append((
+                        pollers_file,
+                        f"entry[{entry_index}]",
+                        "entry must be a mapping",
+                    ))
                 continue
             name_raw = entry.get("name")
             command_raw = entry.get("command")
@@ -1405,6 +1528,17 @@ def discover_pollers(
                     "poller_missing_fields: %s — entry %r",
                     pollers_file, entry,
                 )
+                if invalid_entries is not None:
+                    missing = [
+                        field for field, value in (
+                            ("name", name), ("command", command), ("cron", cron),
+                        ) if not value
+                    ]
+                    invalid_entries.append((
+                        pollers_file,
+                        name or f"entry[{entry_index}]",
+                        f"missing required field(s): {', '.join(missing)}",
+                    ))
                 continue
             try:
                 _validate_path_component(name, label="poller name")
@@ -1414,6 +1548,8 @@ def discover_pollers(
                     "poller_invalid_name: %s name=%r — %s; poller not registered",
                     pollers_file, name, exc,
                 )
+                if invalid_entries is not None:
+                    invalid_entries.append((pollers_file, name, str(exc)))
                 continue
             misplaced_authority = (set(entry) & POLLER_AUTHORITY_FIELDS) - {"authority"}
             if misplaced_authority:
@@ -1422,6 +1558,13 @@ def discover_pollers(
                     "be inside authority: %s",
                     pollers_file, name, ", ".join(sorted(misplaced_authority)),
                 )
+                if invalid_entries is not None:
+                    invalid_entries.append((
+                        pollers_file,
+                        name,
+                        "authority fields must be inside authority: "
+                        f"{', '.join(sorted(misplaced_authority))}",
+                    ))
                 continue
             # chainlink #420: duplicate-name guard. ``log.warning``
             # (sync context, same as the other discovery warnings —
@@ -1433,9 +1576,19 @@ def discover_pollers(
                     "wins)",
                     pollers_file, name, seen_names[name],
                 )
+                if invalid_entries is not None:
+                    invalid_entries.append((
+                        pollers_file,
+                        name,
+                        f"duplicate name already declared by {seen_names[name]}",
+                    ))
                 continue
             env_raw = entry.get("env", {})
             if not isinstance(env_raw, dict):
+                if invalid_entries is not None:
+                    invalid_entries.append((
+                        pollers_file, name, "env must be a mapping; ignored",
+                    ))
                 env_raw = {}
             pass_env_raw = entry.get("pass_env", [])
             if not isinstance(pass_env_raw, list):
@@ -1444,6 +1597,12 @@ def discover_pollers(
                     "(expected list of strings); ignoring",
                     pollers_file, name, pass_env_raw,
                 )
+                if invalid_entries is not None:
+                    invalid_entries.append((
+                        pollers_file,
+                        name,
+                        "pass_env must be a list of strings; ignored",
+                    ))
                 pass_env_raw = []
             pass_env_clean: list[str] = []
             for item in pass_env_raw:
@@ -1453,6 +1612,12 @@ def discover_pollers(
                         "item=%r (expected string); skipping",
                         pollers_file, name, item,
                     )
+                    if invalid_entries is not None:
+                        invalid_entries.append((
+                            pollers_file,
+                            name,
+                            f"pass_env item {item!r} is not a string; skipped",
+                        ))
                     continue
                 key = item.strip()
                 if key:
@@ -1465,6 +1630,12 @@ def discover_pollers(
                     "(expected list of strings); ignoring",
                     pollers_file, name, env_required_raw,
                 )
+                if invalid_entries is not None:
+                    invalid_entries.append((
+                        pollers_file,
+                        name,
+                        "env_required must be a list of strings; ignored",
+                    ))
                 env_required_raw = []
             env_required_clean: list[str] = []
             for item in env_required_raw:
@@ -1474,6 +1645,12 @@ def discover_pollers(
                         "item=%r (expected string); skipping",
                         pollers_file, name, item,
                     )
+                    if invalid_entries is not None:
+                        invalid_entries.append((
+                            pollers_file,
+                            name,
+                            f"env_required item {item!r} is not a string; skipped",
+                        ))
                     continue
                 key = item.strip()
                 if key:
@@ -1497,6 +1674,12 @@ def discover_pollers(
                         "required env unset: %s",
                         pollers_file, name, ", ".join(_missing_req),
                     )
+                    if invalid_entries is not None:
+                        invalid_entries.append((
+                            pollers_file,
+                            name,
+                            f"required environment unset: {', '.join(_missing_req)}",
+                        ))
                     continue
             persist_dir: Path | None = None
             if state_root is not None:
@@ -1512,6 +1695,8 @@ def discover_pollers(
                         "poller not registered",
                         pollers_file, name, exc,
                     )
+                    if invalid_entries is not None:
+                        invalid_entries.append((pollers_file, name, str(exc)))
                     continue
             # Create the per-poller STATE_DIR at discovery time so
             # operators can drop credentials (`.env`) and cursor seed
@@ -1530,6 +1715,12 @@ def discover_pollers(
                         "persist_dir=%s — %s",
                         pollers_file, name, persist_dir, exc,
                     )
+                    if invalid_entries is not None:
+                        invalid_entries.append((
+                            pollers_file,
+                            name,
+                            f"could not create persist directory: {exc}",
+                        ))
                     continue
             authority: ServicePrincipal | None = None
             if "authority" in entry:
@@ -1539,6 +1730,13 @@ def discover_pollers(
                         "be interpreted under unknown schema_version=%r",
                         pollers_file, name, schema_version,
                     )
+                    if invalid_entries is not None:
+                        invalid_entries.append((
+                            pollers_file,
+                            name,
+                            "authority cannot be interpreted under unknown "
+                            f"schema_version {schema_version!r}",
+                        ))
                     continue
                 try:
                     authority = _parse_poller_authority(
@@ -1553,6 +1751,8 @@ def discover_pollers(
                         "poller_authority_rejected: %s name=%r — %s; poller not registered",
                         pollers_file, name, exc,
                     )
+                    if invalid_entries is not None:
+                        invalid_entries.append((pollers_file, name, str(exc)))
                     continue
             # ``batch_size`` is optional; defaults to per-item-per-turn
             # to preserve the open-strix-equivalent shape. Garbage
@@ -1560,12 +1760,8 @@ def discover_pollers(
             # with a stderr-visible warning so a typo doesn't silently
             # break batching for a skill the operator just installed.
             #
-            # ``log.warning`` (stdlib) rather than ``log_event``
-            # (events.jsonl) because ``discover_pollers`` is sync
-            # and runs at startup before the asyncio loop spins up;
-            # ``log_event`` is async and would deadlock here. Operator
-            # scanning events.jsonl for poller config issues won't
-            # see this — check container stderr / docker logs instead.
+            # Discovery remains synchronous, so diagnostics are collected in
+            # ``invalid_entries`` and emitted by the scheduler on its loop.
             batch_size = POLLER_BATCH_SIZE_DEFAULT
             raw_batch = entry.get("batch_size", POLLER_BATCH_SIZE_DEFAULT)
             try:
@@ -1579,6 +1775,12 @@ def discover_pollers(
                         pollers_file, name, raw_batch,
                         POLLER_BATCH_SIZE_DEFAULT,
                     )
+                    if invalid_entries is not None:
+                        invalid_entries.append((
+                            pollers_file,
+                            name,
+                            f"batch_size {raw_batch!r} is invalid; using default",
+                        ))
             except (TypeError, ValueError):
                 log.warning(
                     "poller_invalid_batch_size: %s name=%r value=%r "
@@ -1586,6 +1788,12 @@ def discover_pollers(
                     pollers_file, name, raw_batch,
                     POLLER_BATCH_SIZE_DEFAULT,
                 )
+                if invalid_entries is not None:
+                    invalid_entries.append((
+                        pollers_file,
+                        name,
+                        f"batch_size {raw_batch!r} is invalid; using default",
+                    ))
             # chainlink #262: opt-in framework recovery of failed poller
             # turns. ``bool(...)`` coerces truthy json values; a stray
             # non-bool just reads as on/off rather than erroring (low-stakes
@@ -1608,11 +1816,24 @@ def discover_pollers(
                         "(expected low|normal|high); using %r",
                         pollers_file, name, raw_priority, priority,
                     )
+                    if invalid_entries is not None:
+                        invalid_entries.append((
+                            pollers_file,
+                            name,
+                            f"priority {raw_priority!r} is invalid; using {priority!r}",
+                        ))
+            budget_rejections: list[str] = []
             budget = parse_poller_budget_config(
                 entry.get("budget"),
                 source=pollers_file,
                 poller_name=name,
+                rejections=budget_rejections,
             )
+            if invalid_entries is not None:
+                if budget_rejections:
+                    invalid_entries.append((
+                        pollers_file, name, "; ".join(budget_rejections),
+                    ))
             raw_trust_source = entry.get("trust_source", "external")
             trust_source = (
                 raw_trust_source.strip()
@@ -1625,6 +1846,12 @@ def discover_pollers(
                     "using fail-closed external",
                     pollers_file, name, raw_trust_source,
                 )
+                if invalid_entries is not None:
+                    invalid_entries.append((
+                        pollers_file,
+                        name,
+                        f"trust_source {raw_trust_source!r} is invalid; using 'external'",
+                    ))
                 trust_source = "external"
             seen_names[name] = pollers_file
             pollers.append(
@@ -1652,7 +1879,9 @@ def discover_pollers(
     # AFTER manifest parse + duplicate-name dedupe so the override keys
     # win over whatever the skill shipped. Unknown poller names warn —
     # a renamed/uninstalled poller shouldn't silently orphan its tuning.
-    overrides = load_poller_overrides(overrides_path)
+    overrides = load_poller_overrides(
+        overrides_path, rejections=invalid_entries,
+    )
     if overrides:
         by_name = {p.name for p in pollers}
         for name in sorted(set(overrides) - by_name):
@@ -1660,8 +1889,17 @@ def discover_pollers(
                 "poller_overrides_unknown_poller: %s — %r has no installed "
                 "poller; overrides not applied", overrides_path, name,
             )
+            if invalid_entries is not None and overrides_path is not None:
+                invalid_entries.append((
+                    overrides_path, name, "override names no installed poller",
+                ))
         pollers = [
-            _apply_poller_overrides(p, overrides[p.name], source=overrides_path)
+            _apply_poller_overrides(
+                p,
+                overrides[p.name],
+                source=overrides_path,
+                rejections=invalid_entries,
+            )
             if p.name in overrides else p
             for p in pollers
         ]
@@ -2323,6 +2561,15 @@ async def run_poller(
     # practice.
     fire_ts_ms = int(time.time() * 1000)
     github_trust_cache: dict[tuple[str, str], bool] = {}
+    # chainlink #1441 review: an unresolved attestation is retryable, but the retry
+    # must be BOUNDED. This loop runs after the subprocess drains, so
+    # POLLER_TIMEOUT_SECONDS does not cover it and scheduler.py awaits run_poller()
+    # without wait_for while holding a poller semaphore slot. Unbounded, a large
+    # same-author batch under a GitHub outage or rate limit turns into O(items)
+    # attestation calls at up to 2 x 10s each, pinning that slot. One retry per
+    # (repo, author) per fire keeps the #1441 requirement -- a later event does
+    # re-resolve -- while capping the amplification at a constant.
+    github_trust_attempts: dict[tuple[str, str], int] = {}
 
     # Phase 3: assemble + dispatch each batch as one AgentEvent.
     event_count = 0
@@ -2367,14 +2614,20 @@ async def run_poller(
             trusted = poller.trust_source == "trusted_system"
             if poller.trust_source == "github":
                 repo = item_extras.get("repo")
-                trusted = await asyncio.to_thread(
-                    _github_framework_trigger_is_trusted,
-                    repo,
-                    item_extras,
-                    env.get("GITHUB_TOKEN", ""),
-                    env.get("MIMIR_GITHUB_SELF_LOGIN", ""),
-                )
-                if not trusted:
+                event_type = item_extras.get("event_type")
+                trusted = False
+                if event_type in _GITHUB_FRAMEWORK_TRIGGER_EVENT_TYPES:
+                    # These contain repository facts computed by the poller, not
+                    # third-party prose. Trust still requires a matching live,
+                    # agent-owned PR; active ingest remains recorded below.
+                    trusted = await asyncio.to_thread(
+                        _github_framework_trigger_is_trusted,
+                        repo,
+                        item_extras,
+                        env.get("GITHUB_TOKEN", ""),
+                        env.get("MIMIR_GITHUB_SELF_LOGIN", ""),
+                    )
+                elif event_type in _GITHUB_ACTOR_EVENT_TYPES:
                     author = await asyncio.to_thread(
                         _github_content_author,
                         repo,
@@ -2385,14 +2638,31 @@ async def run_poller(
                         repo if isinstance(repo, str) else "",
                         author if isinstance(author, str) else "",
                     )
-                    if cache_key not in github_trust_cache:
-                        github_trust_cache[cache_key] = await asyncio.to_thread(
+                    if cache_key in github_trust_cache:
+                        trusted = github_trust_cache[cache_key]
+                    elif (
+                        github_trust_attempts.get(cache_key, 0)
+                        >= GITHUB_TRUST_ATTEMPTS_PER_FIRE
+                    ):
+                        # Budget spent for this key in this fire. Fail closed
+                        # without another request; the next fire starts fresh.
+                        trusted = None
+                    else:
+                        github_trust_attempts[cache_key] = (
+                            github_trust_attempts.get(cache_key, 0) + 1
+                        )
+                        resolved_trust = await asyncio.to_thread(
                             _github_author_is_trusted,
                             repo,
                             author,
                             env.get("GITHUB_TOKEN", ""),
                         )
-                    trusted = github_trust_cache[cache_key]
+                        # Unknown still fails closed for this event, but is not a
+                        # durable verdict: a later event in the fire may retry,
+                        # up to GITHUB_TRUST_ATTEMPTS_PER_FIRE.
+                        trusted = resolved_trust
+                        if resolved_trust is not None:
+                            github_trust_cache[cache_key] = resolved_trust
             item_labels = item_labels.with_source(SourceLabel(
                 principal=service_principal,
                 domain="channel",

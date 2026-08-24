@@ -160,6 +160,15 @@ class TestDetectSchemaVersion:
         )
         assert m.detect_schema_version(conn) == 10
 
+    def test_query_indexes_return_v11(self) -> None:
+        conn = sqlite3.connect(":memory:")
+        conn.executescript(
+            "CREATE TABLE triples (id TEXT, created_at TEXT, tombstoned INTEGER, embedding BLOB);"
+            "CREATE TABLE sessions (id TEXT, channel_id TEXT, ended_at TEXT, reflected_at TEXT);"
+            + m.MIGRATIONS[11]
+        )
+        assert m.detect_schema_version(conn) == 11
+
     def test_missing_session_backfill_targets_data_repair_through_real_open(
         self, tmp_path: Path
     ) -> None:
@@ -218,7 +227,7 @@ class TestDetectSchemaVersion:
         expected_ownership = (
             "U_jason", "slack:C1", "workspace:T1", "private", '{"k":1}'
         )
-        assert m.detect_schema_version(conn) == 10
+        assert m.detect_schema_version(conn) == m.CURRENT_SCHEMA_VERSION
         assert conn.execute(
             f"SELECT {ownership_sql} FROM observations_metadata WHERE atom_id = 'o1'"
         ).fetchone() == expected_ownership
@@ -456,9 +465,15 @@ class TestApplyPendingMigrations:
                 id TEXT PRIMARY KEY, content_hash TEXT, agent_id TEXT,
                 tombstoned INTEGER DEFAULT 0, {ownership}
             );
-            CREATE TABLE sessions (id TEXT PRIMARY KEY, {ownership});
+            CREATE TABLE sessions (
+                id TEXT PRIMARY KEY, channel_id TEXT, ended_at TEXT,
+                reflected_at TEXT, {ownership}
+            );
             CREATE TABLE observations_metadata (id TEXT PRIMARY KEY, {ownership});
-            CREATE TABLE triples (id TEXT PRIMARY KEY, {ownership});
+            CREATE TABLE triples (
+                id TEXT PRIMARY KEY, created_at TEXT,
+                tombstoned INTEGER DEFAULT 0, embedding BLOB, {ownership}
+            );
             CREATE TABLE world_state (
                 id TEXT PRIMARY KEY, owner_principal TEXT,
                 origin_channel TEXT, visibility TEXT
@@ -1443,6 +1458,9 @@ class TestV7OwnershipMigration:
             );
             CREATE TABLE triples (
                 id TEXT PRIMARY KEY,
+                created_at TEXT,
+                tombstoned INTEGER DEFAULT 0,
+                embedding BLOB,
                 owner_principal TEXT NOT NULL DEFAULT 'legacy_admin',
                 origin_channel TEXT,
                 origin_domain TEXT,
@@ -1477,7 +1495,7 @@ class TestV7OwnershipMigration:
                 "WHERE type = 'index' AND tbl_name = 'world_state'"
             )
         }
-        assert max(versions) == m.CURRENT_SCHEMA_VERSION == 10
+        assert max(versions) == m.CURRENT_SCHEMA_VERSION == 11
         assert {
             "owner_principal",
             "origin_channel",
@@ -1518,7 +1536,7 @@ def test_current_schema_has_owner_dedup_and_recall_provenance() -> None:
         assert {"integrity", "origin_trigger", "origin_ref"} <= atom_columns.keys()
         assert atom_columns["integrity"][3] == 1
         assert atom_columns["integrity"][4] == "'untrusted'"
-        assert m.detect_schema_version(conn) == 10
+        assert m.detect_schema_version(conn) == 11
     finally:
         conn.close()
 
@@ -1538,3 +1556,33 @@ def test_v10_migration_backfills_legacy_atoms_fail_closed() -> None:
         m._execute_migration_script(conn, m.MIGRATIONS[10])
     finally:
         conn.close()
+
+
+def test_v11_fresh_and_migrated_indexes_have_identical_pragma_output() -> None:
+    schema = Path("mimir/saga/schema.sql").read_text()
+    fresh = sqlite3.connect(":memory:")
+    migrated = sqlite3.connect(":memory:")
+    try:
+        fresh.executescript(schema)
+        migrated.executescript(schema)
+        for name in (
+            "idx_triples_embedding_recency",
+            "idx_sessions_recency",
+            "idx_sessions_channel_recency",
+        ):
+            migrated.execute(f"DROP INDEX {name}")
+        assert m.detect_schema_version(migrated) == 10
+        m._execute_migration_script(migrated, m.MIGRATIONS[11])
+        assert m.detect_schema_version(migrated) == 11
+
+        for name in (
+            "idx_triples_embedding_recency",
+            "idx_sessions_recency",
+            "idx_sessions_channel_recency",
+        ):
+            fresh_pragma = fresh.execute(f"PRAGMA index_xinfo({name})").fetchall()
+            migrated_pragma = migrated.execute(f"PRAGMA index_xinfo({name})").fetchall()
+            assert migrated_pragma == fresh_pragma
+    finally:
+        fresh.close()
+        migrated.close()

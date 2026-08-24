@@ -11,6 +11,7 @@ from types import SimpleNamespace
 import pytest
 from langchain.agents.middleware import ToolCallRequest
 from langchain_core.messages import ToolMessage
+from langchain_core.tools import ToolException
 from langgraph.runtime import Runtime
 
 from mimir.tools import github_review_guard as guard
@@ -587,7 +588,7 @@ def test_review_claim_lock_timeout_refuses_instead_of_proceeding(
     monkeypatch.setattr(guard, "_LOCK_ACQUIRE_TIMEOUT_SECONDS", 0.01)
 
     try:
-        with pytest.raises(ToolPolicyRefusal, match="timed out waiting"):
+        with pytest.raises(ToolException, match="timed out waiting"):
             guard.claim_review_submission(
                 guard.ReviewSubmission("gh", "o/r", 152, "APPROVED", None),
             )
@@ -704,7 +705,7 @@ async def test_async_wrap_releases_review_claim_when_cancelled_in_prologue(
             handler,
         )
 
-    assert len(releases) == 1
+    assert releases == [None]
 
 
 def test_multi_target_result_labels_use_operative_authorization(

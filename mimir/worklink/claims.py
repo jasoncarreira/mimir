@@ -1191,6 +1191,9 @@ class ChainlinkClaims:
             log.warning("Worklink reaper lock discovery failed: %s", exc)
             discovery_skipped["lock_discovery_failed"] = 1
         for issue_id in sorted(issue_ids):
+            # Failing open here is safe only while reaper_ttl_s remains at least
+            # 2 * factory_run_timeout_s: anything reapable has already outlived
+            # a legitimate epic run by 2x. Keep that coupling if TTLs diverge.
             if self._issue_has_label(
                 issue_id,
                 WORKLINK_EPIC_LABEL,

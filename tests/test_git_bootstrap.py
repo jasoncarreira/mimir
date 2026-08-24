@@ -358,6 +358,51 @@ def test_bootstrap_clone_path_into_empty_home(
     assert (home / ".git" / "hooks" / "pre-commit").is_file()
 
 
+@pytest.mark.parametrize("token", ["opaque-token-shape", "opaque/+==token"])
+def test_clone_credentials_are_not_in_argv(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, token: str,
+) -> None:
+    calls: list[tuple[list[str], dict[str, str]]] = []
+
+    def fake_run(cmd, **kwargs):
+        calls.append((cmd, kwargs["env"]))
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    assert git_bootstrap._clone(
+        tmp_path, "https://github.com/example/state.git", token,
+        log_event=lambda *_args, **_kwargs: None,
+    )
+    argv, env = calls[0]
+    assert token not in " ".join(argv)
+    assert argv == [
+        "git", "clone", "--quiet", "https://github.com/example/state.git", ".",
+    ]
+    assert env["GIT_CONFIG_KEY_0"] == (
+        "http.https://github.com/example/state.git.extraheader"
+    )
+
+
+@pytest.mark.parametrize("token", ["opaque-token-shape", "opaque/+==token"])
+def test_clone_timeout_message_and_event_exclude_credentials(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, token: str,
+) -> None:
+    events: list[tuple[str, dict]] = []
+
+    def fake_run(cmd, **kwargs):
+        raise subprocess.TimeoutExpired(cmd=cmd, timeout=30)
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    assert not git_bootstrap._clone(
+        tmp_path, "https://github.com/example/state.git", token,
+        log_event=lambda kind, **fields: events.append((kind, fields)),
+    )
+
+    assert events[0][0] == "git_clone_failed"
+    assert token not in events[0][1]["stderr"]
+    assert "git clone" not in events[0][1]["stderr"]
+
+
 # ─── bootstrap on existing repo with divergent remote → pull blocked ─
 
 
