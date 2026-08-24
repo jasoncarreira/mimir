@@ -374,6 +374,8 @@ class MimirAcpAgent:
         adapters = getattr(bundle, "adapters", None)
         channels = getattr(adapters, "channels", None)
         if channels is not None:
+            # Registration is runtime-wide so the owning ACP turn can use the
+            # normal delivery path; send_message gates acp: targets to that turn.
             channels.register(self._bridge)
 
     def on_connect(self, conn: Client) -> int:

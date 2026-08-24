@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import dataclasses
 import json
+import time
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -12,13 +13,16 @@ import yaml
 
 import mimir
 import mimir.acp.agent as agent_module
+import mimir.tools.registry as tool_registry
+from mimir._context import reset_current_turn, set_current_turn
 from mimir.access_control import SinkGate
 from mimir.acp import sdk
 from mimir.acp.agent import ActivePrompt, MimirAcpAgent
 from mimir.agent import _initialize_ifc_labels
 from mimir.acp.journal import JournalLease
 from mimir.acp.updates import UpdateDispatcher
-from mimir.models import InformationFlowState, TurnInteractivity
+from mimir.models import InformationFlowState, TurnContext, TurnInteractivity
+from mimir.tools.registry import send_message
 from mimir.tools.client_provider import MIMIR_HANDS_V1, PermissionDecision, PermissionEligibility, get_turn_capability_context, hands_edit, hands_shell
 from mimir.channel_registry import ChannelRegistry
 from mimir.identities import IdentityResolver, hash_web_key
@@ -178,6 +182,77 @@ async def test_new_prompt_runs_bound_core_and_preserves_update_order(tmp_path: P
     assert kwargs["session_id"] == kwargs["saga_session_id"] == f"acp:{session_id}"
     assert core.subscriptions[0] is not None
     assert agent._bundle.turn_event_bus._exact_turn_subscribers == {}
+
+
+async def test_acp_send_message_rejects_slack_turn_without_journal_append_and_allows_owner(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    agent, client, core = await _ready(tmp_path)
+    session_id = (await agent.new_session("/workspace")).session_id
+    channel_id = f"acp:{session_id}"
+    core.gate = asyncio.Event()
+    prompting = asyncio.create_task(
+        agent.prompt(
+            session_id,
+            [sdk.TextContentBlock(type="text", text="hello")],
+        )
+    )
+    await core.entered.wait()
+    monkeypatch.setitem(
+        tool_registry._STATE,
+        "channel_registry",
+        agent._bundle.adapters.channels,
+    )
+    journal_path = agent._store.paths(session_id)[0]
+    before_foreign_send = journal_path.read_bytes()
+    slack_turn = TurnContext(
+        turn_id="slack-turn",
+        session_id="slack-GROUP",
+        trigger="user_message",
+        channel_id="slack-GROUP",
+        started_at=time.monotonic(),
+        access_control_enforced=False,
+    )
+    token = set_current_turn(slack_turn)
+    try:
+        refused = await send_message.ainvoke(
+            {"text": "foreign", "channel_id": channel_id}
+        )
+    finally:
+        reset_current_turn(token)
+
+    assert "not a deliverable channel" in refused
+    assert journal_path.read_bytes() == before_foreign_send
+    assert all(
+        getattr(getattr(update, "content", None), "text", None) != "foreign"
+        for update in client.updates
+    )
+
+    acp_turn = TurnContext(
+        turn_id=core.calls[0][1]["turn_id"],
+        session_id=channel_id,
+        trigger="user_message",
+        channel_id=channel_id,
+        started_at=time.monotonic(),
+        access_control_enforced=False,
+    )
+    token = set_current_turn(acp_turn)
+    try:
+        delivered = await send_message.ainvoke(
+            {"text": "owned", "channel_id": channel_id}
+        )
+    finally:
+        reset_current_turn(token)
+
+    assert "send_message ok" in delivered
+    assert journal_path.read_bytes() != before_foreign_send
+    assert any(
+        getattr(getattr(update, "content", None), "text", None) == "owned"
+        for update in client.updates
+    )
+    core.gate.set()
+    await prompting
 
 
 async def test_prompt_validates_all_blocks_before_any_update(tmp_path: Path) -> None:

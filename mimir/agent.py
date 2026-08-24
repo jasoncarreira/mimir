@@ -4184,15 +4184,25 @@ class Agent:
                 owner_attestation=owner_attestation,
             )
             source = labels.sources[0]
-            if not _source_is_triggering_channel_compatible(
+            compatible = _source_is_triggering_channel_compatible(
                 source,
                 effective_principal=effective_principal,
                 triggering_principal=auth_context.principal,
                 resolved_triggering=resolved_triggering,
                 audience_provider=auth_context.audience_provider,
                 cross_platform_pull=auth_context.cross_platform_pull,
-            ):
-                continue
+            )
+            if not compatible:
+                if auth_context.enforcement_enabled:
+                    continue
+                # Preserve compatibility-mode prompt assembly while recording
+                # the same would-block event as the eventual harness sink.
+                harness_sink_allowed(
+                    "harness_auto_deliver",
+                    event.channel_id,
+                    labels,
+                    auth_context,
+                )
             admitted.append(message)
             blocks.append(PromptBlock(message.content, labels))
         return admitted, tuple(blocks)
