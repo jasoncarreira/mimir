@@ -316,6 +316,68 @@ def test_poller_trust_requires_service_stamp_and_non_http_ingress(
     assert ingress.integrity == expected_integrity
 
 
+def test_poller_own_channel_is_trusted_informational_without_external_ingest() -> None:
+    service = ServicePrincipal(
+        canonical="poller:github-activity",
+        trigger="poller",
+        channel_memory_directory="poller:github-activity",
+    )
+    event = AgentEvent(
+        trigger="poller",
+        channel_id="poller:github-activity",
+        source="poller",
+        service_principal=service.canonical,
+        service_authority=service,
+    )
+
+    labels = _initialize_ifc_labels(event)
+    source = next(iter(labels.sources))
+
+    assert (source.integrity, source.integrity_effect) == (
+        "trusted", "informational",
+    )
+    assert labels.has_untrusted_active_ingest is False
+
+
+def test_poller_own_channel_does_not_declassify_external_item() -> None:
+    service = ServicePrincipal(
+        canonical="poller:github-activity",
+        trigger="poller",
+        channel_memory_directory="poller:github-activity",
+    )
+    external = SourceLabel(
+        principal="service:poller:github-activity",
+        domain="poller_payload",
+        resource_id="github:pr:7",
+        bridge_instance="poller",
+        sensitivity="internal",
+        authorized_principals=frozenset({"service:poller:github-activity"}),
+        source_kind="service",
+        integrity="untrusted",
+        integrity_effect="active_ingest",
+    )
+    event = AgentEvent(
+        trigger="poller",
+        channel_id="poller:github-activity",
+        source="poller",
+        service_principal=service.canonical,
+        service_authority=service,
+        ifc_labels=InformationFlowLabels().with_source(external),
+    )
+
+    labels = _initialize_ifc_labels(event)
+    own_channel = next(
+        source for source in labels.sources
+        if source.resource_id == event.channel_id
+    )
+
+    assert (own_channel.integrity, own_channel.integrity_effect) == (
+        "trusted", "informational",
+    )
+    assert external in labels.sources
+    assert labels.has_untrusted_active_ingest is True
+
+
 def test_mixed_principal_sources_fail_closed_without_declassification():
     labels = _merge_ifc_labels(_labels(), _labels(principal="user-2"))
     decision = SinkGate.check_sink_flow(
@@ -923,6 +985,60 @@ def test_self_authored_heartbeat_context_admits_autonomous_sinks(
     ):
         decision = SinkGate.check_sink_flow(tool, target, labels, auth, enforce=True)
         assert decision.allowed is True, (tool, decision.reason)
+
+
+@pytest.mark.parametrize(
+    "relative",
+    [
+        ".mimir_builtin_skills/github/SKILL.md",
+        "memory/channels/poller:github-activity/notes.md",
+    ],
+)
+def test_framework_and_agent_owned_files_are_trusted_informational(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    relative: str,
+) -> None:
+    monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
+    target = tmp_path / relative
+    target.parent.mkdir(parents=True)
+    target.write_text("first-party content\n", encoding="utf-8")
+
+    source = protected_result_source(
+        _auth(), principal="filesystem", domain="filesystem",
+        resource_id=str(target), bridge_instance="filesystem",
+    )
+
+    assert (source.integrity, source.integrity_effect) == (
+        "trusted", "informational",
+    )
+    assert InformationFlowLabels().with_source(
+        source
+    ).has_untrusted_active_ingest is False
+
+
+@pytest.mark.parametrize(
+    "relative",
+    ["skills/operator/SKILL.md", "attachments/upload.txt"],
+)
+def test_home_location_does_not_make_external_or_operator_files_trusted(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    relative: str,
+) -> None:
+    monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
+    target = tmp_path / relative
+    target.parent.mkdir(parents=True)
+    target.write_text("not framework-owned\n", encoding="utf-8")
+
+    source = protected_result_source(
+        _auth(), principal="filesystem", domain="filesystem",
+        resource_id=str(target), bridge_instance="filesystem",
+    )
+
+    assert (source.integrity, source.integrity_effect) == (
+        "untrusted", "active_ingest",
+    )
 
 
 @pytest.mark.parametrize("subtree", sorted(_FILE_INTEGRITY_EXCLUDED_SUBTREES))
