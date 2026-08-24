@@ -294,8 +294,14 @@ async def test_reauthenticate_fence_still_dispatches_session_cancel(
     assert not authentication_started.is_set()
     await asyncio.wait_for(authentication_started.wait(), 1)
     await asyncio.wait_for(ordered_dispatch, 1)
-    while dispatcher._runner_tasks:
-        await asyncio.gather(*tuple(dispatcher._runner_tasks), return_exceptions=True)
+
+    async def drain_runners() -> None:
+        while dispatcher._runner_tasks:
+            await asyncio.gather(
+                *tuple(dispatcher._runner_tasks), return_exceptions=True
+            )
+
+    await asyncio.wait_for(drain_runners(), 1)
     assert agent._sessions[session_id].active_prompt is None
 
 
