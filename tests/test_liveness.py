@@ -349,12 +349,51 @@ def test_watchdog_has_sink(monkeypatch) -> None:
 
 def test_session_marker_roundtrip(tmp_path: Path) -> None:
     home = _home(tmp_path)
-    mark_session_running(home, started_at=1000.0)
+    assert mark_session_running(home, started_at=1000.0)
     marker = read_session_marker(home)
     assert isinstance(marker, dict)
     assert marker["started_at"] == 1000.0
     assert marker["clean"] is False
     assert marker["pid"] > 0
+
+
+def test_atomic_marker_write_fsyncs_file_before_replace_and_directory_after(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import mimir.liveness as liveness
+
+    home = _home(tmp_path)
+    calls: list[str] = []
+    real_replace = liveness.os.replace
+    real_fsync = liveness.os.fsync
+
+    def track_fsync(fd: int) -> None:
+        calls.append("fsync")
+        real_fsync(fd)
+
+    def track_replace(src: Path, dst: Path) -> None:
+        calls.append("replace")
+        real_replace(src, dst)
+
+    monkeypatch.setattr(liveness.os, "fsync", track_fsync)
+    monkeypatch.setattr(liveness.os, "replace", track_replace)
+
+    assert mark_session_running(home, started_at=1000.0)
+
+    assert calls == ["fsync", "replace", "fsync"]
+
+
+def test_atomic_marker_write_reports_fsync_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fail_fsync(fd: int) -> None:
+        raise OSError("fsync failed")
+
+    monkeypatch.setattr("mimir.liveness.os.fsync", fail_fsync)
+
+    assert not mark_session_running(_home(tmp_path), started_at=1000.0)
 
 
 def test_first_boot_is_not_unclean(tmp_path: Path) -> None:
@@ -366,12 +405,23 @@ def test_first_boot_is_not_unclean(tmp_path: Path) -> None:
 def test_clean_shutdown_then_boot_is_clean(tmp_path: Path) -> None:
     home = _home(tmp_path)
     mark_session_running(home, started_at=1000.0)
-    mark_clean_shutdown(home)
+    assert mark_clean_shutdown(home)
     # Next boot inspects the prior marker — a graceful stop is not unclean.
     assert detect_unclean_restart(home) is None
     marker = read_session_marker(home)
     assert marker["clean"] is True
     assert "stopped_iso" in marker
+
+
+def test_clean_shutdown_reports_marker_persistence_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = _home(tmp_path)
+    assert mark_session_running(home, started_at=1000.0)
+    monkeypatch.setattr("mimir.liveness._atomic_write_json", lambda *args, **kwargs: False)
+
+    assert mark_clean_shutdown(home) is False
 
 
 def test_crash_without_cleanup_is_unclean(tmp_path: Path) -> None:

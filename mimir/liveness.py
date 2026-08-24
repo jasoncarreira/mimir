@@ -75,16 +75,31 @@ def _atomic_write_json(
     *,
     _on_error: Callable[[OSError], None] | None = None,
 ) -> bool:
-    """Atomically write ``payload`` as JSON to ``path`` (tmp-file + rename, so
-    a concurrent reader never sees a torn file). Soft-fail: returns ``False``
-    on ``OSError`` and never raises — a state-file write must never disrupt the
-    agent (or the watchdog). The temp name is pid-scoped so two writers don't
-    clobber each other's tmp."""
+    """Crash-durably write ``payload`` as JSON to ``path``.
+
+    The temporary file is flushed/fsynced before the atomic rename and the
+    parent directory is fsynced on POSIX platforms that expose ``O_DIRECTORY``.
+    Soft-fail: returns ``False`` on ``OSError`` and never raises; callers decide
+    whether their state transition may continue. The temp name is pid-scoped so
+    two writers do not clobber each other's tmp."""
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         tmp = path.with_suffix(path.suffix + f".{os.getpid()}.tmp")
-        tmp.write_text(json.dumps(payload), encoding="utf-8")
+        with tmp.open("w", encoding="utf-8") as handle:
+            handle.write(json.dumps(payload))
+            handle.flush()
+            os.fsync(handle.fileno())
         os.replace(tmp, path)
+        # Persist the directory entry as well as the file contents. Platforms
+        # without O_DIRECTORY cannot provide this POSIX crash-durability step;
+        # on those platforms the atomic replace remains the strongest available
+        # guarantee and the file fsync above still applies.
+        if hasattr(os, "O_DIRECTORY"):
+            directory_fd = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
         return True
     except OSError as exc:
         log.warning("atomic json write to %s failed: %s", path, exc)
@@ -295,10 +310,15 @@ def read_session_marker(home: Path) -> dict[str, Any] | None:
     return data if isinstance(data, dict) else None
 
 
+def write_session_marker(home: Path, marker: dict[str, Any]) -> bool:
+    """Crash-durably replace the session marker with caller-validated state."""
+    return _atomic_write_json(session_marker_path(home), marker)
+
+
 def mark_session_running(
     home: Path, *, started_at: float, last_unclean_notify_ts: float | None = None,
     ts: float | None = None,
-) -> None:
+) -> bool:
     """Record that a session is live and has NOT shut down cleanly yet.
 
     ``last_unclean_notify_ts`` carries the timestamp of the most recent
@@ -315,19 +335,23 @@ def mark_session_running(
     }
     if last_unclean_notify_ts is not None:
         payload["last_unclean_notify_ts"] = last_unclean_notify_ts
-    _atomic_write_json(session_marker_path(home), payload)
+    return _atomic_write_json(session_marker_path(home), payload)
 
 
-def mark_clean_shutdown(home: Path, *, ts: float | None = None) -> None:
-    """Flip the current session marker to ``clean: true``. Called from the
-    graceful-shutdown path — i.e. an *intended* stop. A hard kill (OOM /
-    SIGKILL) never reaches here, so the marker stays ``clean: false`` and the
-    next boot reports an unclean restart."""
+def mark_clean_shutdown(home: Path, *, ts: float | None = None) -> bool:
+    """Flip the current session marker to ``clean: true`` crash-durably.
+
+    Called from the graceful-shutdown path — i.e. an *intended* stop. A hard
+    kill (OOM / SIGKILL) never reaches here, so the marker stays ``clean: false``
+    and the next boot reports an unclean restart. Returns ``False`` when the
+    marker cannot be persisted so cleanup can report the failed state transition
+    instead of silently claiming success.
+    """
     now = time.time() if ts is None else ts
     marker = read_session_marker(home) or {}
     marker["clean"] = True
     marker["stopped_iso"] = _iso(now)
-    _atomic_write_json(session_marker_path(home), marker)
+    return _atomic_write_json(session_marker_path(home), marker)
 
 
 def detect_unclean_restart(home: Path) -> dict[str, Any] | None:
