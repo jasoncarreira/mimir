@@ -130,6 +130,12 @@ log = logging.getLogger(__name__)
 # subprocess env so a poller can size its own internal deadlines against the real
 # cap instead of hardcoding a copy that drifts.
 POLLER_TIMEOUT_SECONDS = 120
+
+# Bounded attestation retries per (repo, author) within one poller fire.
+# 2 = the initial attempt plus one retry: enough for chainlink #1441's
+# "a later event re-resolves", bounded so a same-author batch cannot turn an
+# unresolved attestation into O(items) network calls in an unbounded loop.
+GITHUB_TRUST_ATTEMPTS_PER_FIRE = 2
 # Cap stderr text recorded in events.jsonl so a chatty poller doesn't
 # blow the algedonic stream's storage budget.
 POLLER_STDERR_LOG_CHARS = 2000
@@ -2323,6 +2329,15 @@ async def run_poller(
     # practice.
     fire_ts_ms = int(time.time() * 1000)
     github_trust_cache: dict[tuple[str, str], bool] = {}
+    # chainlink #1441 review: an unresolved attestation is retryable, but the retry
+    # must be BOUNDED. This loop runs after the subprocess drains, so
+    # POLLER_TIMEOUT_SECONDS does not cover it and scheduler.py awaits run_poller()
+    # without wait_for while holding a poller semaphore slot. Unbounded, a large
+    # same-author batch under a GitHub outage or rate limit turns into O(items)
+    # attestation calls at up to 2 x 10s each, pinning that slot. One retry per
+    # (repo, author) per fire keeps the #1441 requirement -- a later event does
+    # re-resolve -- while capping the amplification at a constant.
+    github_trust_attempts: dict[tuple[str, str], int] = {}
 
     # Phase 3: assemble + dispatch each batch as one AgentEvent.
     event_count = 0
@@ -2385,14 +2400,31 @@ async def run_poller(
                         repo if isinstance(repo, str) else "",
                         author if isinstance(author, str) else "",
                     )
-                    if cache_key not in github_trust_cache:
-                        github_trust_cache[cache_key] = await asyncio.to_thread(
+                    if cache_key in github_trust_cache:
+                        trusted = github_trust_cache[cache_key]
+                    elif (
+                        github_trust_attempts.get(cache_key, 0)
+                        >= GITHUB_TRUST_ATTEMPTS_PER_FIRE
+                    ):
+                        # Budget spent for this key in this fire. Fail closed
+                        # without another request; the next fire starts fresh.
+                        trusted = None
+                    else:
+                        github_trust_attempts[cache_key] = (
+                            github_trust_attempts.get(cache_key, 0) + 1
+                        )
+                        resolved_trust = await asyncio.to_thread(
                             _github_author_is_trusted,
                             repo,
                             author,
                             env.get("GITHUB_TOKEN", ""),
                         )
-                    trusted = github_trust_cache[cache_key]
+                        # Unknown still fails closed for this event, but is not a
+                        # durable verdict: a later event in the fire may retry,
+                        # up to GITHUB_TRUST_ATTEMPTS_PER_FIRE.
+                        trusted = resolved_trust
+                        if resolved_trust is not None:
+                            github_trust_cache[cache_key] = resolved_trust
             item_labels = item_labels.with_source(SourceLabel(
                 principal=service_principal,
                 domain="channel",
