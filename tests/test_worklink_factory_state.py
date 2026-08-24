@@ -12,6 +12,7 @@ from mimir.worklink.factory_state import (
     FactoryRecordError,
     FactoryRunRecord,
     archive_factory_record,
+    load_factory_records_for_issue,
     list_factory_records,
     load_factory_record,
     save_factory_record,
@@ -69,6 +70,24 @@ def test_factory_record_round_trip_is_atomic_and_has_no_cost_fields(tmp_path: Pa
     assert list_factory_records(tmp_path) == [expected]
     assert "cost" not in path.read_text(encoding="utf-8")
     assert not list(path.parent.glob("*.tmp"))
+
+
+def test_issue_lookup_reads_both_keys_without_legacy_shadowing_canonical(
+    tmp_path: Path,
+) -> None:
+    legacy = record(tmp_path)
+    canonical = replace(
+        legacy,
+        run_id="chainlink-1551",
+        attempt=legacy.attempt,
+        branch="feature/chainlink-1551",
+        sandbox=str(tmp_path / "chainlink-1551"),
+        status=None,
+    )
+    save_factory_record(tmp_path, legacy)
+    save_factory_record(tmp_path, canonical)
+
+    assert load_factory_records_for_issue(tmp_path, 1551) == [canonical, legacy]
 
 
 def test_archive_factory_record_preserves_evidence_and_vacates_active_slot(

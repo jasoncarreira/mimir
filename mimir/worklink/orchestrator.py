@@ -78,7 +78,8 @@ from .factory_state import (
     archive_factory_record,
     factory_process_is_alive,
     factory_process_is_verified_dead,
-    load_factory_record,
+    factory_record_run_ids,
+    load_factory_records_for_issue,
     save_factory_record,
 )
 
@@ -1642,14 +1643,7 @@ class WorklinkRunner:
 
         def prepare_factory_claim() -> None:
             nonlocal retained
-            candidates = [
-                record
-                for record_id in (run_id, str(issue_id))
-                if (record := load_factory_record(self.home, record_id)) is not None
-            ]
-            candidates.sort(
-                key=lambda record: (record.attempt, record.run_id == run_id), reverse=True
-            )
+            candidates = load_factory_records_for_issue(self.home, issue_id)
             for candidate in candidates:
                 try:
                     _verify_factory_recovery_target(
@@ -1806,9 +1800,8 @@ class WorklinkRunner:
             )
         except Exception as exc:
             try:
-                current = load_factory_record(self.home, run_id)
-                if current is None:
-                    current = load_factory_record(self.home, str(issue_id))
+                records = load_factory_records_for_issue(self.home, issue_id)
+                current = records[0] if records else None
             except Exception:
                 current = None
             if current is not None:
@@ -2391,10 +2384,9 @@ def _verify_factory_recovery_target(
     base: str,
     command_runner: Runner,
 ) -> Path:
-    if retained.issue_id != issue.issue_id or retained.run_id not in {
-        str(issue.issue_id),
-        f"chainlink-{issue.issue_id}",
-    }:
+    if retained.issue_id != issue.issue_id or retained.run_id not in factory_record_run_ids(
+        issue.issue_id
+    ):
         raise WorklinkError("retained factory issue identity does not match recovery request")
     if retained.repository.lower() != repo_slug.lower():
         raise WorklinkError("retained factory repository does not match recovery request")

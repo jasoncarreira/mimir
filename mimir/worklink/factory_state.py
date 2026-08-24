@@ -8,7 +8,7 @@ import stat
 from typing import Any, Callable
 
 from .._atomic import atomic_write_json
-from .backends.feature_factory import FactoryStatus, parse_factory_status
+from .backends.feature_factory import FactoryStatus, epic_run_id, parse_factory_status
 from .compute import LaunchHandle
 from .run_state import process_is_zombie, process_start_ticks
 
@@ -58,7 +58,7 @@ class FactoryRunRecord:
             raise FactoryRecordError("unsupported factory record version")
         if not _valid_record_run_id(self.run_id):
             raise FactoryRecordError("factory run id is invalid")
-        expected_run_ids = {str(self.issue_id), f"chainlink-{self.issue_id}"}
+        expected_run_ids = set(factory_record_run_ids(self.issue_id))
         if self.run_id not in expected_run_ids or self.issue_id <= 0 or self.attempt <= 0:
             raise FactoryRecordError("factory record identity is invalid")
         if not Path(self.launcher).is_absolute() or not Path(self.sandbox).is_absolute():
@@ -211,6 +211,11 @@ def factory_records_dir(home: Path) -> Path:
     return home / "state" / "worklink" / "factory-runs"
 
 
+def factory_record_run_ids(issue_id: int) -> tuple[str, str]:
+    """Return canonical and legacy record keys for an epic issue."""
+    return epic_run_id(issue_id), str(issue_id)
+
+
 def factory_record_path(home: Path, run_id: str) -> Path:
     if not _valid_record_run_id(run_id):
         raise FactoryRecordError("factory run id is invalid")
@@ -288,6 +293,23 @@ def load_factory_record(home: Path, run_id: str) -> FactoryRunRecord | None:
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise FactoryRecordError("factory record is malformed") from exc
     return FactoryRunRecord.from_json(data)
+
+
+def load_factory_records_for_issue(home: Path, issue_id: int) -> list[FactoryRunRecord]:
+    """Load both live-store key shapes, newest attempt first and canonical on ties."""
+    canonical, legacy = factory_record_run_ids(issue_id)
+    # Canonical-first construction is deliberate: it is a stable-sort fallback for
+    # the explicit canonical tie-break below, not an interchangeable iteration order.
+    records = [
+        record
+        for run_id in (canonical, legacy)
+        if (record := load_factory_record(home, run_id)) is not None
+    ]
+    records.sort(
+        key=lambda record: (record.attempt, record.run_id == canonical),
+        reverse=True,
+    )
+    return records
 
 
 def archive_factory_record(
