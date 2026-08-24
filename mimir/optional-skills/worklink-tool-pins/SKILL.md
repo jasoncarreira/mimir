@@ -26,7 +26,21 @@ from the configured pin.
   sources (`npm` and GitHub release sources).
 - Files or reuses low-priority Chainlink issues carrying the stable
   `Dedupe-Key: worklink-tool-pin:<category>:<name>:<old>-><new>`.
-- Emits JSONL only when at least one bump issue was filed or reused.
+- Fails closed when the dedupe search exits non-zero or returns malformed
+  data: no issue is created, the cycle still completes, and the framework
+  records a durable `worklink_tool_pin_dedupe_check_failed` signal with the
+  tool, dedupe key, and bounded reason.
+- Emits JSONL when at least one bump issue was filed/reused or a dedupe check
+  failed. Healthy no-drift runs remain silent.
+
+The search is the pre-create defence: creation is skipped unless it returns a
+valid result set. A second search immediately before creation would repeat the
+same check but would not make the separate search/create operations atomic, so
+it is not claimed as additional race protection. Chainlink has no atomic
+unique-key constraint; concurrent poller instances remain serialized by the
+scheduler's per-poller job. The fix is forward-only: existing valid duplicate
+issues are reused and are never compounded, but historical duplicates are not
+auto-closed because cleanup requires an operator disposition decision.
 
 ## What it does not do
 

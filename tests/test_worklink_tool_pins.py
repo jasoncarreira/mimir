@@ -283,6 +283,64 @@ def test_chainlink_bump_filer_skips_malformed_match_and_reuses_later_duplicate()
     assert calls == [["chainlink", "issue", "search", drift.dedupe_key, "--json"]]
 
 
+@pytest.mark.parametrize(
+    "issue_id",
+    [
+        pytest.param("invalid", id="malformed-string"),
+        pytest.param("901", id="numeric-string"),
+        pytest.param(True, id="boolean"),
+        pytest.param(1.5, id="float"),
+        pytest.param(0, id="zero"),
+        pytest.param(-1, id="negative"),
+        pytest.param(None, id="missing"),
+    ],
+)
+def test_chainlink_bump_filer_refuses_create_for_sole_exact_match_without_valid_id(
+    issue_id: object,
+) -> None:
+    calls: list[list[str]] = []
+    drift = ToolPinDrift(
+        pin=ToolPin("codex", "coding-cli", "0.139.0", "codex --version", source="npm"),
+        current="0.140.0",
+    )
+
+    def runner(args: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        calls.append(args)
+        issue = {"description": f"Dedupe-Key: {drift.dedupe_key}"}
+        if issue_id is not None:
+            issue["id"] = issue_id
+        return subprocess.CompletedProcess(args, 0, json.dumps([issue]), "")
+
+    filer = ChainlinkBumpFiler(runner=runner)
+
+    assert filer.file(drift) is None
+    assert filer.last_skip_reason == (
+        "chainlink issue search returned an exact dedupe-key match "
+        "without a strict positive-integer issue id"
+    )
+    assert calls == [["chainlink", "issue", "search", drift.dedupe_key, "--json"]]
+
+
+def test_chainlink_bump_filer_uses_valid_number_when_id_field_is_malformed() -> None:
+    calls: list[list[str]] = []
+    drift = ToolPinDrift(
+        pin=ToolPin("codex", "coding-cli", "0.139.0", "codex --version", source="npm"),
+        current="0.140.0",
+    )
+
+    def runner(args: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        calls.append(args)
+        issue = {
+            "id": "malformed",
+            "number": 902,
+            "description": f"Dedupe-Key: {drift.dedupe_key}",
+        }
+        return subprocess.CompletedProcess(args, 0, json.dumps([issue]), "")
+
+    assert ChainlinkBumpFiler(runner=runner).file(drift) == 902
+    assert calls == [["chainlink", "issue", "search", drift.dedupe_key, "--json"]]
+
+
 def test_chainlink_bump_filer_raises_on_create_failure() -> None:
     def runner(args: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
         if args[:3] == ["chainlink", "issue", "search"]:

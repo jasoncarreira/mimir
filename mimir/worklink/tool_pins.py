@@ -295,6 +295,7 @@ class ChainlinkBumpFiler:
             raise DedupeCheckUnavailable("chainlink issue search returned invalid JSON") from exc
         if not isinstance(issues, list):
             raise DedupeCheckUnavailable("chainlink issue search JSON was not a list")
+        malformed_exact_match = False
         for issue in issues:
             if not isinstance(issue, dict):
                 continue
@@ -303,11 +304,24 @@ class ChainlinkBumpFiler:
                 for field in ("title", "description", "body")
             )
             if dedupe_key in haystack:
-                issue_id = issue.get("id") or issue.get("number")
-                try:
-                    return int(issue_id)
-                except (TypeError, ValueError):
-                    continue
+                issue_ids = (
+                    (issue.get("id"), issue.get("number"))
+                    if "id" in issue and "number" in issue
+                    else (issue["id"],) if "id" in issue else (issue.get("number"),)
+                )
+                for issue_id in issue_ids:
+                    if (
+                        isinstance(issue_id, int)
+                        and not isinstance(issue_id, bool)
+                        and issue_id > 0
+                    ):
+                        return issue_id
+                malformed_exact_match = True
+        if malformed_exact_match:
+            raise DedupeCheckUnavailable(
+                "chainlink issue search returned an exact dedupe-key match "
+                "without a strict positive-integer issue id"
+            )
         return None
 
     def file(self, drift: ToolPinDrift) -> int | None:
