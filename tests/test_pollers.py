@@ -42,6 +42,7 @@ from mimir.pollers import (
     _github_framework_trigger_is_trusted,
     _parse_poller_authority,
     discover_pollers,
+    GITHUB_TRUST_ATTEMPTS_PER_FIRE,
     run_poller,
     validate_poller_overrides_text,
 )
@@ -5206,3 +5207,62 @@ def test_discover_parses_deliver_field(tmp_path: Path):
     assert by_name["p1"].deliver == "OPERATOR_CHANNEL"
     assert by_name["p2"].deliver is None
     assert by_name["p3"].deliver == "slack-ops"
+
+
+@pytest.mark.asyncio
+async def test_github_poller_bounds_unresolved_author_trust_attempts_per_fire(
+    tmp_path: Path,
+    home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An unresolved attestation retries, but a same-author batch cannot turn it
+    into one network call per item.
+
+    Review of chainlink #1441: this loop runs after the subprocess drains, so
+    POLLER_TIMEOUT_SECONDS does not bound it, and scheduler.py awaits run_poller()
+    without wait_for while holding a poller semaphore slot. Five same-author items
+    with the attestation permanently unavailable must spend the fire's attempt
+    budget and stop calling out, while every event still fails closed.
+    """
+    skill_dir = tmp_path / "skill"
+    _install_script(skill_dir, "poller.py", """
+import json
+for number in (1, 2, 3, 4, 5):
+    print(json.dumps({"poller": "x", "prompt": f"issue {number}", "event_type": "issue_opened", "repo": "acme/widget", "url": f"https://github.com/acme/widget/issues/{number}"}))
+""")
+    calls: list[tuple[object, object, str]] = []
+
+    def never_resolves(repo: object, author: object, token: str) -> bool | None:
+        calls.append((repo, author, token))
+        return None
+
+    monkeypatch.setattr(
+        "mimir.pollers._github_content_author",
+        lambda _repo, _extras, _token: "alice",
+    )
+    monkeypatch.setattr("mimir.pollers._github_author_is_trusted", never_resolves)
+    cfg = PollerConfig(
+        name="x",
+        command=f"{sys.executable} poller.py",
+        cron="* * * * *",
+        env={"GITHUB_TOKEN": "server-token"},
+        skill_dir=skill_dir,
+        batch_size=1,
+        trust_source="github",
+    )
+    enq = _CapturingEnqueue()
+
+    await run_poller(cfg, enqueue=enq)
+
+    assert len(enq.events) == 5
+    # The cap, not the item count, decides how many times we call GitHub.
+    assert len(calls) == GITHUB_TRUST_ATTEMPTS_PER_FIRE
+    assert len(calls) < len(enq.events)
+    # Every event still fails closed, including those that never triggered a call.
+    integrities = [
+        source.integrity
+        for event in enq.events
+        for source in event.ifc_labels.sources
+        if source.domain == "channel"
+    ]
+    assert integrities == ["untrusted"] * 5
