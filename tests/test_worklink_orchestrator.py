@@ -604,6 +604,38 @@ def test_manual_success_clears_autonomous_failure_ledger(
     assert not (tmp_path / "ambient-state").exists()
 
 
+def test_epic_dispatch_failure_enters_and_clears_ledger(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import mimir.worklink.orchestrator as orchestrator
+    from mimir.worklink.dispatch_failures import (
+        dispatch_failure_state_dir,
+        load_failure_state,
+        pending_failure_alerts,
+    )
+
+    async def failed_epic(self: WorklinkRunner, issue_id: int, **_: object):
+        return orchestrator.WorklinkRunResult(
+            issue_id, 2, "failed", reason="retained factory record cannot be bound"
+        )
+
+    monkeypatch.setattr(WorklinkRunner, "run_epic", failed_epic)
+    result = run_worklink_epic(home=tmp_path, repo=tmp_path, issue_id=700, autonomous=True)
+
+    assert result.status == "failed"
+    backed_off, alerts = pending_failure_alerts(dispatch_failure_state_dir(tmp_path))
+    assert backed_off == {700}
+    assert [alert["issue_id"] for alert in alerts] == [700]
+
+    async def parked_epic(self: WorklinkRunner, issue_id: int, **_: object):
+        return orchestrator.WorklinkRunResult(issue_id, 3, "needs-human")
+
+    monkeypatch.setattr(WorklinkRunner, "run_epic", parked_epic)
+    run_worklink_epic(home=tmp_path, repo=tmp_path, issue_id=700, autonomous=False)
+    entry = load_failure_state(dispatch_failure_state_dir(tmp_path))["issues"]["700"]
+    assert entry["active"] is False
+
+
 def test_validate_leaf_refuses_missing_planner_template() -> None:
     issue = IssueContext(1, "vague", "please do thing", set())
 
@@ -1697,6 +1729,160 @@ def test_worklink_runner_backend_nonzero_transitions_failed_without_pr(tmp_path:
     assert ["chainlink", "locks", "release", "441"] in calls
 
 
+def test_part_a_backend_exception_failed_transition_reports_not_applied(tmp_path: Path) -> None:
+    _reset_logger_for_tests()
+    events_path = tmp_path / "logs" / "events.jsonl"
+    init_logger(events_path, session_id="test-worklink")
+    repo = tmp_path / "repo"
+    worktree = repo.parent / ".worklink" / repo.name / "441-1"
+    calls, base_runner = _orchestrator_runner(repo, worktree)
+
+    def runner(
+        args: Sequence[str] | str,
+        *,
+        cwd: Path | None = None,
+        text: bool = True,
+    ) -> subprocess.CompletedProcess:
+        if isinstance(args, list) and args == [
+            "chainlink", "issue", "label", "441", "worklink:ready"
+        ]:
+            calls.append(args)
+            return cp(args, returncode=1, stderr="label add failed")
+        return base_runner(args, cwd=cwd, text=text)
+
+    class ExplodingBackend(FakeBackend):
+        async def interpret(self, order: WorkOrder, result: object) -> RawResult:
+            raise RuntimeError("interpret exploded")
+
+    registry = BackendRegistry(WorklinkConfig())
+    registry.register(ExplodingBackend())
+
+    result = asyncio.run(
+        WorklinkRunner(home=tmp_path, repo=repo, runner=runner, registry=registry).run(
+            441, backend_name="fake", test_command="echo ok"
+        )
+    )
+
+    assert result.status == "failed"
+    records = [json.loads(line) for line in events_path.read_text(encoding="utf-8").splitlines()]
+    transition = [record for record in records if record["type"] == "worklink_transition"][-1]
+    assert transition["status"] == "failed"
+    assert transition["review_ready"] is False
+    assert transition["pr_url"] is None
+    assert transition["reason"] == "interpret exploded"
+    assert transition["transition_applied"] is False
+    assert transition["error"] == "label add failed"
+    _reset_logger_for_tests()
+
+
+def test_no_pr_blocked_failed_transition_still_emits_and_propagates(tmp_path: Path) -> None:
+    _reset_logger_for_tests()
+    events_path = tmp_path / "logs" / "events.jsonl"
+    init_logger(events_path, session_id="test-worklink")
+    repo = tmp_path / "repo"
+    worktree = repo.parent / ".worklink" / repo.name / "441-1"
+    calls, base_runner = _orchestrator_runner(repo, worktree)
+
+    def runner(
+        args: Sequence[str] | str,
+        *,
+        cwd: Path | None = None,
+        text: bool = True,
+    ) -> subprocess.CompletedProcess:
+        if isinstance(args, list) and args == [
+            "chainlink", "issue", "label", "441", "worklink:blocked"
+        ]:
+            calls.append(args)
+            return cp(args, returncode=1, stderr="label add failed")
+        return base_runner(args, cwd=cwd, text=text)
+
+    class BlockingBackend(FakeBackend):
+        async def interpret(self, order: WorkOrder, result: object) -> RawResult:
+            self.orders.append(order)
+            return RawResult(
+                1,
+                order.transcript_root / "fake.json",
+                "blocked",
+                "planner gave contradictory acceptance criteria",
+                "planner gave contradictory acceptance criteria",
+            )
+
+    registry = BackendRegistry(WorklinkConfig())
+    registry.register(BlockingBackend(write_change=False))
+
+    result = asyncio.run(
+        WorklinkRunner(home=tmp_path, repo=repo, runner=runner, registry=registry).run(
+            441, backend_name="fake", test_command="echo ok"
+        )
+    )
+
+    # The completion-path exception reaches the runner's failure handler instead
+    # of returning ``blocked``, so run_worklink records a failure rather than
+    # clearing the failure ledger through _record_run_success.
+    assert result.status == "failed"
+    assert result.reason == "label add failed"
+    assert not any(
+        isinstance(call, list) and call[:3] == ["gh", "pr", "create"] for call in calls
+    )
+    records = [json.loads(line) for line in events_path.read_text(encoding="utf-8").splitlines()]
+    transitions = [record for record in records if record["type"] == "worklink_transition"]
+    assert len(transitions) == 2
+    blocked_transition, failure_transition = transitions
+    assert blocked_transition["status"] == "blocked"
+    assert blocked_transition["review_ready"] is False
+    assert blocked_transition["pr_url"] is None
+    assert blocked_transition["transition_applied"] is False
+    assert blocked_transition["error"] == "label add failed"
+    assert failure_transition["status"] == "failed"
+    assert failure_transition["reason"] == "label add failed"
+    assert failure_transition["transition_applied"] is True
+    _reset_logger_for_tests()
+
+
+def test_published_completion_failed_transition_still_emits_not_applied(tmp_path: Path) -> None:
+    _reset_logger_for_tests()
+    events_path = tmp_path / "logs" / "events.jsonl"
+    init_logger(events_path, session_id="test-worklink")
+    repo = tmp_path / "repo"
+    worktree = repo.parent / ".worklink" / repo.name / "441-1"
+    calls, base_runner = _orchestrator_runner(repo, worktree)
+
+    def runner(
+        args: Sequence[str] | str,
+        *,
+        cwd: Path | None = None,
+        text: bool = True,
+    ) -> subprocess.CompletedProcess:
+        if isinstance(args, list) and args == [
+            "chainlink", "issue", "label", "441", "worklink:review"
+        ]:
+            calls.append(args)
+            return cp(args, returncode=1, stderr="label add failed")
+        return base_runner(args, cwd=cwd, text=text)
+
+    registry = BackendRegistry(WorklinkConfig())
+    registry.register(FakeBackend())
+
+    result = asyncio.run(
+        WorklinkRunner(home=tmp_path, repo=repo, runner=runner, registry=registry).run(
+            441, backend_name="fake", test_command="echo ok"
+        )
+    )
+
+    assert result.status == "completed"
+    assert result.pr_url == "https://github.com/jasoncarreira/mimir/pull/999"
+    records = [json.loads(line) for line in events_path.read_text(encoding="utf-8").splitlines()]
+    transitions = [record for record in records if record["type"] == "worklink_transition"]
+    assert len(transitions) == 1
+    transition = transitions[0]
+    assert transition["status"] == "completed"
+    assert transition["review_ready"] is True
+    assert transition["pr_url"] == result.pr_url
+    assert transition["transition_applied"] is False
+    assert transition["error"] == "label add failed"
+    _reset_logger_for_tests()
+
+
 def test_worklink_runner_timeout_transitions_failed_without_pr(tmp_path: Path) -> None:
     repo = tmp_path / "repo"
     worktree = repo.parent / ".worklink" / repo.name / "441-1"
@@ -1929,7 +2115,18 @@ def test_chainlink_orchestrator_passes_controller_environment_overrides() -> Non
 
     pass_env = manifest["pollers"][0]["pass_env"]
     assert "MIMIR_FACTORY_PUBLISHING_IDENTITY" in pass_env
-    assert "MIMIR_CODING_ENABLED" in pass_env
+    # MIMIR_CODING_ENABLED is deliberately NOT passed through (#1434). This
+    # assertion is inverted from the one that pinned it, and the inversion is the
+    # point: passing it flips coding_enabled() True for poller-dispatched builds,
+    # which selects the contained checkout path, and that path fails every
+    # opencode build with EACCES because a 0700 attempt directory cannot be
+    # traversed by a backend that re-resolves its project root by pathname.
+    #
+    # Re-add the key in the SAME change that lands per-run worker UIDs. Until the
+    # worker identity is unique per run, no directory-mode arrangement isolates
+    # concurrent runs: ptrace_scope is 0, so a sibling worker sharing the uid can
+    # take another's checkout FD outright. Re-adding it alone reopens the outage.
+    assert "MIMIR_CODING_ENABLED" not in pass_env
 
 
 def test_worklink_ignores_planner_suggested_test_command_by_default(
@@ -3744,6 +3941,11 @@ def _factory_lifecycle_record(sandbox: Path, handle: LaunchHandle) -> FactoryRun
     )
 
 
+class _FactoryLifecycleClaims:
+    def transition_issue(self, *args: object, **kwargs: object) -> None:
+        return None
+
+
 @pytest.mark.parametrize(
     ("factory_status", "expected_status", "review_ready", "pr_url"),
     [
@@ -3955,7 +4157,7 @@ def test_factory_supervision_drains_exact_handle_while_status_is_polled(
         WorklinkRunner(home=tmp_path, repo=tmp_path)._supervise_factory_070(
             issue=IssueContext(700, "epic", "build", {"worklink:epic"}),
             claim_record=ClaimRecord(700, 1, "agent", datetime.now(UTC)),
-            claims=object(),
+            claims=_FactoryLifecycleClaims(),
             backend=Backend(),
             compute=Compute(),
             factory_record=_factory_lifecycle_record(sandbox, handle),
@@ -4014,7 +4216,7 @@ def test_factory_supervision_waits_for_manifest_then_proceeds(tmp_path: Path) ->
         WorklinkRunner(home=tmp_path, repo=tmp_path)._supervise_factory_070(
             issue=IssueContext(700, "epic", "build", {"worklink:epic"}),
             claim_record=ClaimRecord(700, 1, "agent", datetime.now(UTC)),
-            claims=object(),
+            claims=_FactoryLifecycleClaims(),
             backend=Backend(),
             compute=Compute(),
             factory_record=_factory_lifecycle_record(sandbox, handle),
@@ -4670,6 +4872,50 @@ def test_factory_completion_failure_never_transitions_to_review(
     assert transitions == []
 
 
+def test_factory_needs_human_transitions_epic_to_parked_tracker_state(
+    tmp_path: Path,
+) -> None:
+    sandbox = tmp_path / "sandbox"
+    sandbox.mkdir()
+    transitions: list[tuple[int, dict[str, object]]] = []
+
+    class Claims:
+        def transition_issue(self, issue_id: int, **kwargs: object) -> None:
+            transitions.append((issue_id, kwargs))
+
+    record = _factory_lifecycle_record(sandbox, LaunchHandle("local_subprocess", "123", 456))
+    record = record.observed(
+        _factory_lifecycle_status(sandbox, status="needs-human"),
+        datetime.now(UTC).isoformat(),
+    )
+    result = asyncio.run(
+        WorklinkRunner(home=tmp_path, repo=tmp_path)._finish_factory_070(
+            issue=IssueContext(700, "epic", "build", {"worklink:epic"}),
+            claim_record=ClaimRecord(700, 1, "agent", datetime.now(UTC), budget_attempt=1),
+            claims=Claims(),
+            backend=object(),
+            compute=object(),
+            factory_record=record,
+            test_cmd="pytest -q",
+            runner=lambda args: cp(args),
+            started_at=datetime.now(UTC),
+        )
+    )
+
+    assert result.status == "needs-human"
+    assert transitions == [
+        (
+            700,
+            {
+                "status": "blocked",
+                "review_ready": False,
+                "attempt": 1,
+                "reason": "factory run is parked",
+            },
+        )
+    ]
+
+
 @pytest.mark.parametrize(
     ("lock", "dead_lock", "action"),
     [("absent", False, "claim"), ("stale", True, "steal"), ("fresh", False, None)],
@@ -4807,6 +5053,9 @@ def test_factory_recovery_uses_run_id_first_lock_resume_and_authoritative_status
 
         def _lock_still_held_by(self, record: ClaimRecord) -> bool:
             return record is claim
+
+        def transition_issue(self, *args: object, **kwargs: object) -> None:
+            return None
 
     compute = Compute()
     result = asyncio.run(

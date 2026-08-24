@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import replace
+from datetime import datetime, timedelta, timezone
 import json
 import os
 import shutil
@@ -1476,6 +1477,48 @@ print(json.dumps({"poller": "x", "prompt": prompt}))
 
 
 @pytest.mark.asyncio
+async def test_run_poller_exports_its_effective_timeout(
+    tmp_path: Path, home: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A poller must be able to bound its own work against the cap it will be
+    killed at, without hardcoding a copy that drifts from the constant.
+
+    Asserts the *effective* timeout, not the default: a caller passing a
+    different one must have that value reach the subprocess, or a poller sizing
+    its deadlines from the env would overrun.
+    """
+    monkeypatch.delenv("POLLER_TIMEOUT_SECONDS", raising=False)
+    skill_dir = tmp_path / "skill"
+    _install_script(skill_dir, "poller.py", """
+import json, os
+print(json.dumps({
+    "poller": "x",
+    "prompt": f"cap={os.environ['POLLER_TIMEOUT_SECONDS']}",
+}))
+""")
+    cfg = PollerConfig(
+        name="my-poller", command=f"{sys.executable} poller.py",
+        cron="* * * * *", env={}, skill_dir=skill_dir,
+    )
+    enq = _CapturingEnqueue()
+    await run_poller(cfg, enqueue=enq, home=home)
+    assert len(enq.events) == 1
+    assert f"cap={POLLER_TIMEOUT_SECONDS}" in enq.events[0].content
+
+    enq2 = _CapturingEnqueue()
+    await run_poller(cfg, enqueue=enq2, home=home, timeout=45)
+    assert len(enq2.events) == 1
+    assert "cap=45" in enq2.events[0].content
+
+    # Fractional timeouts must survive: `str(int(timeout))` turned 0.5 into "0",
+    # so a poller sizing deadlines from this would have read a cap of zero.
+    enq3 = _CapturingEnqueue()
+    await run_poller(cfg, enqueue=enq3, home=home, timeout=0.5)
+    assert len(enq3.events) == 1
+    assert "cap=0.5" in enq3.events[0].content
+
+
+@pytest.mark.asyncio
 async def test_run_poller_mimir_home_falls_back_to_install_layout(
     tmp_path: Path, home: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1566,16 +1609,17 @@ print(json.dumps({
         ((204, None), None, True),
         ((404, None), (200, {"state": "active"}), True),
         ((404, None), (404, None), False),
-        (None, None, False),
-        (None, (200, {"state": "active"}), False),
-        ((403, {"message": "rate limited"}), (200, {"state": "active"}), False),
+        (None, None, None),
+        (None, (200, {"state": "active"}), None),
+        ((403, {"message": "rate limited"}), (200, {"state": "active"}), None),
+        ((404, None), None, None),
     ],
 )
 def test_github_author_trust_is_server_attested_and_fail_closed(
     monkeypatch: pytest.MonkeyPatch,
     collaborator: object,
     membership: object,
-    expected: bool,
+    expected: bool | None,
 ) -> None:
     calls: list[str] = []
 
@@ -2006,6 +2050,17 @@ print(json.dumps({
 # ─── poller_recovery framework wiring (chainlink #314) ────────────────
 
 
+def _make_recovery_event(source_id: str) -> AgentEvent:
+    return AgentEvent(
+        trigger="poller",
+        channel_id="poller:x",
+        content="recover me",
+        source="poller",
+        source_id=source_id,
+        extra={"poller_name": "x", "items": []},
+    )
+
+
 def test_discover_pollers_reads_recover_failed_turns_flag(tmp_path: Path):
     skills = tmp_path / "skills"
     _write_pollers_json(skills / "skill", [
@@ -2118,8 +2173,147 @@ async def test_run_poller_reconciles_failed_turn_before_next_poll(
     recovery_events = [
         e for e in _read_events(home) if e["type"] == "poller_recovery"
     ]
+    assert len(recovery_events) == 1
     assert recovery_events[-1]["poller"] == "x"
     assert recovery_events[-1]["reenqueued"] == 1
+    assert recovery_events[-1]["expired"] == 0
+    assert recovery_events[-1]["dropped"] == 0
+
+
+@pytest.mark.asyncio
+async def test_run_poller_recovery_expiration_logs_loss(
+    tmp_path: Path, home: Path,
+) -> None:
+    skill_dir = tmp_path / "skill"
+    persist_dir = tmp_path / "persist" / "x"
+    _install_script(skill_dir, "poller.py", "pass\n")
+    cfg = PollerConfig(
+        name="x", command=f"{sys.executable} poller.py",
+        cron="* * * * *", env={}, skill_dir=skill_dir,
+        persist_dir=persist_dir,
+    )
+    await poller_recovery.stash_enqueued_event(
+        persist_dir, _make_recovery_event("poller:x:expired"),
+    )
+    state = poller_recovery._load_state(persist_dir)
+    state["inflight"]["poller:x:expired"]["stashed_at"] = (
+        datetime.now(tz=timezone.utc) - timedelta(hours=72)
+    ).isoformat()
+    poller_recovery._save_state(persist_dir, state)
+
+    await run_poller(cfg, enqueue=_CapturingEnqueue())
+
+    recovery_events = [
+        event for event in _read_events(home)
+        if event["type"] == "poller_recovery"
+    ]
+    assert len(recovery_events) == 1
+    assert recovery_events[0]["expired"] == 1
+    assert recovery_events[0]["dropped"] == 0
+
+
+@pytest.mark.asyncio
+async def test_run_poller_recovery_schema_drop_logs_loss(
+    tmp_path: Path, home: Path,
+) -> None:
+    skill_dir = tmp_path / "skill"
+    persist_dir = tmp_path / "persist" / "x"
+    _install_script(skill_dir, "poller.py", "pass\n")
+    cfg = PollerConfig(
+        name="x", command=f"{sys.executable} poller.py",
+        cron="* * * * *", env={}, skill_dir=skill_dir,
+        persist_dir=persist_dir, recover_failed_turns=True,
+    )
+    source_id = "poller:x:obsolete"
+    await poller_recovery.stash_enqueued_event(
+        persist_dir, _make_recovery_event(source_id),
+        enqueued_at="2026-06-04T07:59:00+00:00",
+    )
+    state = poller_recovery._load_state(persist_dir)
+    state["inflight"][source_id]["event"]["obsolete_field"] = True
+    poller_recovery._save_state(persist_dir, state)
+    events_path = home / "logs" / "events.jsonl"
+    with events_path.open("a", encoding="utf-8") as f:
+        f.write(json.dumps({
+            "type": "turn_failed",
+            "timestamp": "2026-06-04T08:00:00+00:00",
+            "channel_id": "poller:x",
+            "source_id": source_id,
+        }) + "\n")
+
+    await run_poller(cfg, enqueue=_CapturingEnqueue())
+
+    recovery_events = [
+        event for event in _read_events(home)
+        if event["type"] == "poller_recovery"
+    ]
+    assert len(recovery_events) == 1
+    assert recovery_events[0]["expired"] == 0
+    assert recovery_events[0]["dropped"] == 1
+
+
+@pytest.mark.asyncio
+async def test_run_poller_reports_and_preserves_corrupt_recovery_state(
+    tmp_path: Path, home: Path,
+) -> None:
+    skill_dir = tmp_path / "skill"
+    persist_dir = tmp_path / "persist" / "x"
+    _install_script(skill_dir, "poller.py", "pass\n")
+    cfg = PollerConfig(
+        name="x", command=f"{sys.executable} poller.py",
+        cron="* * * * *", env={}, skill_dir=skill_dir,
+        persist_dir=persist_dir,
+    )
+    persist_dir.mkdir(parents=True)
+    state_path = persist_dir / poller_recovery.RECOVERY_STATE_FILE
+    corrupt = b'{"last_reconciled":"","inflight":{"sid-1":'
+    state_path.write_bytes(corrupt)
+
+    await run_poller(cfg, enqueue=_CapturingEnqueue())
+
+    assert state_path.read_bytes() == corrupt
+    unreadable_events = [
+        event for event in _read_events(home)
+        if event["type"] == "poller_recovery_state_unreadable"
+    ]
+    assert len(unreadable_events) == 1
+    assert unreadable_events[0]["poller"] == "x"
+    assert unreadable_events[0]["path"] == str(state_path)
+    assert not any(
+        event["type"] == "poller_recovery" for event in _read_events(home)
+    )
+
+
+@pytest.mark.asyncio
+async def test_run_poller_reports_and_preserves_invalid_inflight_state(
+    tmp_path: Path, home: Path,
+) -> None:
+    skill_dir = tmp_path / "skill"
+    persist_dir = tmp_path / "persist" / "x"
+    _install_script(skill_dir, "poller.py", "pass\n")
+    cfg = PollerConfig(
+        name="x", command=f"{sys.executable} poller.py",
+        cron="* * * * *", env={}, skill_dir=skill_dir,
+        persist_dir=persist_dir,
+    )
+    persist_dir.mkdir(parents=True)
+    state_path = persist_dir / poller_recovery.RECOVERY_STATE_FILE
+    invalid = b'{"last_reconciled":"2026-08-23T18:00:00+00:00","inflight":null}'
+    state_path.write_bytes(invalid)
+
+    await run_poller(cfg, enqueue=_CapturingEnqueue())
+
+    assert state_path.read_bytes() == invalid
+    unreadable_events = [
+        event for event in _read_events(home)
+        if event["type"] == "poller_recovery_state_unreadable"
+    ]
+    assert len(unreadable_events) == 1
+    assert unreadable_events[0]["poller"] == "x"
+    assert unreadable_events[0]["path"] == str(state_path)
+    assert not any(
+        event["type"] == "poller_recovery" for event in _read_events(home)
+    )
 
 
 @pytest.mark.asyncio
@@ -2646,9 +2840,64 @@ def test_poller_config_channel_id_format():
 
 
 def test_poller_timeout_constant_reasonable():
-    """Locks the contract: the framework's hard-cap is 60s. Skill
-    authors who need longer-running pollers must restructure."""
-    assert POLLER_TIMEOUT_SECONDS == 60
+    """Locks the contract: the framework hard-cap a poller is killed at.
+
+    Raised 60 -> 120 for chainlink #1433. Still a hard cap — a poller needing
+    longer must bound its own work or restructure, because overrunning discards
+    everything the tick emitted rather than returning a partial result.
+    """
+    assert POLLER_TIMEOUT_SECONDS == 120
+
+
+def test_poller_timeout_stays_below_every_shipped_cadence():
+    """Sanity check on the *bundled* manifests only.
+
+    This is deliberately not the enforcement: pollers are discovered from
+    ``<home>/skills/**/pollers.json`` and ``pollers-overrides.yaml`` can replace
+    a cron, so a locally installed or overridden fast poller would never appear
+    here. The runtime constraint is enforced per poller at fire time — see
+    ``Scheduler._effective_poller_timeout`` and its tests in test_scheduler.py.
+    Kept because it catches the common case (someone adds a fast shipped poller)
+    directly in this repo.
+    """
+    from datetime import datetime, timezone
+
+    from apscheduler.triggers.cron import CronTrigger
+
+    from mimir.scheduler import _cron_with_standard_dow
+
+    manifests = sorted(Path("mimir/optional-skills").glob("*/pollers.json"))
+    assert manifests, "no shipped poller manifests found — test is vacuous"
+
+    now = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    checked: list[tuple[str, float]] = []
+    for manifest in manifests:
+        raw = json.loads(manifest.read_text(encoding="utf-8"))
+        entries = raw.get("pollers", raw) if isinstance(raw, dict) else raw
+        for entry in entries if isinstance(entries, list) else [entries]:
+            if not isinstance(entry, dict):
+                continue
+            name = str(entry.get("name"))
+            interval = entry.get("interval_seconds")
+            if isinstance(interval, (int, float)) and interval > 0:
+                checked.append((name, float(interval)))
+                continue
+            cron = entry.get("cron")
+            if not isinstance(cron, str) or not cron.strip():
+                continue
+            trigger = CronTrigger.from_crontab(
+                _cron_with_standard_dow(cron), timezone=timezone.utc,
+            )
+            first = trigger.get_next_fire_time(None, now)
+            second = trigger.get_next_fire_time(first, first)
+            checked.append((name, (second - first).total_seconds()))
+
+    assert checked, "no cadences resolved — test is vacuous"
+    for name, period in checked:
+        assert POLLER_TIMEOUT_SECONDS < period, (
+            f"{name} fires every {period:.0f}s but the cap is "
+            f"{POLLER_TIMEOUT_SECONDS}s; a slow run would swallow the next fire"
+        )
 
 
 def test_pollers_module_annotations_resolve():

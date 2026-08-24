@@ -42,7 +42,7 @@ from .compute import (
     LocalSubprocessComputeBackend,
     with_worker_environment,
 )
-from .claims import ChainlinkClaims, ClaimRecord
+from .claims import ChainlinkClaims, ClaimRecord, WORKLINK_EPIC_LABEL
 from .evidence import (
     EvidenceValidation,
     TestResult,
@@ -645,7 +645,7 @@ class WorklinkRunner:
                 issue.comments,
                 labels=issue.labels,
                 max_active_locks=config.defaults.max_concurrent if autonomous else None,
-                exclude_active_label="worklink:epic",
+                exclude_active_label=WORKLINK_EPIC_LABEL,
                 before_claim=record_claiming,
             )
         except Exception:
@@ -872,6 +872,8 @@ class WorklinkRunner:
                     )
             return result
         except Exception as exc:
+            transition_applied = False
+            transition_error = None
             try:
                 claims.transition_issue(
                     issue.issue_id,
@@ -880,14 +882,19 @@ class WorklinkRunner:
                     attempt=record.budget_attempt or record.attempt,
                     reason=str(exc),
                 )
-            except Exception:
-                pass
+                transition_applied = True
+            except Exception as transition_exc:
+                transition_error = str(transition_exc)
             _log_event(
                 "worklink_transition",
                 issue_id=issue.issue_id,
                 attempt=record.attempt,
                 status="failed",
+                review_ready=False,
+                pr_url=None,
                 reason=str(exc),
+                transition_applied=transition_applied,
+                error=transition_error,
             )
             return WorklinkRunResult(
                 issue.issue_id,
@@ -1156,14 +1163,23 @@ class WorklinkRunner:
             if validation.status == "blocked"
             else (", ".join(validation.reasons) if validation.reasons else None)
         )
+        transition_applied = False
+        transition_error = None
+
         def transition_issue() -> None:
-            claims.transition_issue(
-                issue.issue_id,
-                status=transition_status,
-                review_ready=validation.review_ready,
-                attempt=claim_record.budget_attempt or attempt,
-                reason=transition_reason,
-            )
+            nonlocal transition_applied, transition_error
+            try:
+                claims.transition_issue(
+                    issue.issue_id,
+                    status=transition_status,
+                    review_ready=validation.review_ready,
+                    attempt=claim_record.budget_attempt or attempt,
+                    reason=transition_reason,
+                )
+            except Exception as exc:
+                transition_error = str(exc)
+                raise
+            transition_applied = True
 
         def log_transition() -> None:
             _log_event(
@@ -1173,14 +1189,20 @@ class WorklinkRunner:
                 status=transition_status,
                 review_ready=validation.review_ready,
                 pr_url=pr_url,
+                transition_applied=transition_applied,
+                error=transition_error,
             )
 
         if pr_url:
             run_bookkeeping("issue transition", transition_issue)
             run_bookkeeping("transition event", log_transition)
         else:
-            transition_issue()
-            log_transition()
+            try:
+                transition_issue()
+            finally:
+                # The transition event is the observable record of this failure;
+                # emit it without turning a failed mutation into a successful run.
+                log_transition()
         cleanup_error = None
         if publication is None:
             cleanup_error = _cleanup_checkout_after_transition(
@@ -1654,7 +1676,7 @@ class WorklinkRunner:
             issue.comments,
             labels=issue.labels,
             max_active_locks=factory_max_concurrent(),
-            active_label="worklink:epic",
+            active_label=WORKLINK_EPIC_LABEL,
             before_claim=prepare_factory_claim,
         )
         if claim.attempts_exhausted:
@@ -2203,6 +2225,13 @@ class WorklinkRunner:
         if status is None:
             raise WorklinkError("factory terminal projection is missing")
         if status.is_parked:
+            claims.transition_issue(
+                issue.issue_id,
+                status="blocked",
+                review_ready=False,
+                attempt=claim_record.budget_attempt or claim_record.attempt,
+                reason="factory run is parked",
+            )
             result = WorklinkRunResult(
                 issue.issue_id,
                 factory_record.attempt,
@@ -3000,7 +3029,7 @@ def run_worklink_epic(
             issue_id=issue_id,
             attempt=None,
             error=exc,
-            exit_status=2 if isinstance(exc, LeafValidationError) else 1,
+            exit_status=1,
             autonomous=autonomous,
         )
         raise
@@ -3013,7 +3042,7 @@ def run_worklink_epic(
             exit_status=1,
             autonomous=autonomous,
         )
-    elif result.status in {"completed", "review_ready", "blocked"}:
+    elif result.status in {"completed", "review_ready"}:
         _record_run_success(home, issue_id)
     return result
 

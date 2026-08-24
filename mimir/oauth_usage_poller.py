@@ -1342,13 +1342,15 @@ async def record_usage(
                     derived=True,
                 )
                 try:
-                    await store.record(window_type, derived_snap)
+                    persisted = await store.record(window_type, derived_snap)
                 except Exception:  # noqa: BLE001
                     log.exception(
                         "oauth_usage: store.record failed for derived %s",
                         window_type,
                     )
                 else:
+                    if not persisted:
+                        continue
                     await log_event(
                         "quota_5h_derived",
                         utilization=derived_util,
@@ -1378,9 +1380,11 @@ async def record_usage(
             }
             continue
         try:
-            await store.record(window_type, snapshot)
+            persisted = await store.record(window_type, snapshot)
         except Exception:  # noqa: BLE001
             log.exception("oauth_usage: store.record failed for %s", window_type)
+            continue
+        if not persisted:
             continue
         recorded[window_type] = {
             "utilization": snapshot.utilization,

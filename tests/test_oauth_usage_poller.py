@@ -466,6 +466,21 @@ async def test_record_usage_writes_known_windows(rate_store: RateLimitStore) -> 
     assert persisted["five_hour"].utilization == pytest.approx(0.05)
 
 
+@pytest.mark.asyncio
+async def test_part_b_record_usage_drops_windows_that_did_not_persist(
+    rate_store: RateLimitStore, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fail_write(*args, **kwargs):
+        raise OSError("read-only home")
+
+    monkeypatch.setattr("mimir.rate_limits.atomic_write_json", fail_write)
+
+    recorded = await record_usage(rate_store, _usage_response())
+
+    assert recorded == {}
+    assert rate_store.current() == {}
+
+
 # ─── CR#22 layer a: cross-window anomaly detection ──────────────────
 
 
