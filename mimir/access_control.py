@@ -8272,6 +8272,9 @@ def classify_protected_result(
         )
         labels = InformationFlowLabels()
         for resource in resources:
+            # protected_tool intentionally skips destination-audience checks here:
+            # hands_read is an explicit read by the principal in this channel,
+            # unlike automatic auto_recall or requester-scoped MCP provenance.
             labels = labels.with_source(SourceLabel(
                 principal=principal,
                 domain="client_provider",

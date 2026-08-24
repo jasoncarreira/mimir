@@ -180,6 +180,158 @@ async def test_new_prompt_runs_bound_core_and_preserves_update_order(tmp_path: P
     assert agent._bundle.turn_event_bus._exact_turn_subscribers == {}
 
 
+async def test_dead_update_forwarder_fails_prompt_without_wedging_session(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    agent, _client, core = await _ready(tmp_path)
+    session_id = (await agent.new_session("/workspace")).session_id
+    original_run_turn = core.run_turn
+    original_submit = UpdateDispatcher.submit
+    submit_calls = 0
+    turn_calls = 0
+
+    async def fail_first_submit(
+        dispatcher: UpdateDispatcher, event: dict[str, Any]
+    ) -> None:
+        nonlocal submit_calls
+        submit_calls += 1
+        if submit_calls == 1:
+            raise RuntimeError("forwarder failed")
+        await original_submit(dispatcher, event)
+
+    async def first_turn_only_publishes(event: Any, **kwargs: Any) -> None:
+        nonlocal turn_calls
+        turn_calls += 1
+        if turn_calls > 1:
+            await original_run_turn(event, **kwargs)
+            return
+        core.bus.publish({
+            "turn_id": kwargs["turn_id"], "channel_id": event.channel_id,
+            "seq": 1, "ts": "now", "type": "tool_call", "phase": "start",
+            "id": "broken", "tool_name": "lookup",
+        })
+        await core.channels.send(event.channel_id, "unreachable")
+
+    monkeypatch.setattr(UpdateDispatcher, "submit", fail_first_submit)
+    core.run_turn = first_turn_only_publishes
+
+    with pytest.raises(sdk.RequestError, match="Internal error"):
+        await asyncio.wait_for(
+            agent.prompt(
+                session_id, [sdk.TextContentBlock(type="text", text="first")]
+            ),
+            1,
+        )
+
+    response = await asyncio.wait_for(
+        agent.prompt(session_id, [sdk.TextContentBlock(type="text", text="second")]),
+        1,
+    )
+    assert response.stop_reason == "end_turn"
+    assert agent._sessions[session_id].active_prompt is None
+
+
+async def test_reauthenticate_fence_still_dispatches_session_cancel(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    agent, _client, core = await _ready(tmp_path)
+    session_id = (await agent.new_session("/workspace")).session_id
+    core.gate = asyncio.Event()
+    cancel_reached = asyncio.Event()
+    authentication_started = asyncio.Event()
+    original_cancel = agent.cancel
+
+    async def observed_cancel(*args: Any, **kwargs: Any) -> None:
+        cancel_reached.set()
+        await original_cancel(*args, **kwargs)
+
+    monkeypatch.setattr(agent, "cancel", observed_cancel)
+
+    async def request_runner(message: dict[str, Any]) -> Any:
+        if message["method"] == "session/prompt":
+            return await agent.prompt(
+                session_id, [sdk.TextContentBlock(type="text", text="wait")]
+            )
+        authentication_started.set()
+        return await agent.authenticate(
+            "mimir-web-key", **{"mimir.webKey": "secret"}
+        )
+
+    async def notification_runner(message: dict[str, Any]) -> None:
+        assert message["method"] == "session/cancel"
+        await agent.cancel(session_id)
+
+    class Supervisor:
+        def create(self, coroutine: Any, *, name: str) -> asyncio.Task[Any]:
+            del name
+            return asyncio.create_task(coroutine)
+
+    dispatcher = sdk.BoundedMessageDispatcher(
+        sdk.BoundedMessageQueue(),
+        Supervisor(),
+        sdk.StrictMessageStateStore(),
+        request_runner,
+        notification_runner,
+    )
+
+    async def dispatch_in_order() -> None:
+        await dispatcher._dispatch_request({
+            "jsonrpc": "2.0", "id": 1, "method": "session/prompt", "params": {},
+        })
+        await core.entered.wait()
+        await dispatcher._dispatch_request({
+            "jsonrpc": "2.0", "id": 2, "method": "authenticate", "params": {},
+        })
+        await dispatcher._dispatch_notification({
+            "jsonrpc": "2.0", "method": "session/cancel",
+            "params": {"sessionId": session_id},
+        })
+
+    ordered_dispatch = asyncio.create_task(dispatch_in_order())
+
+    await asyncio.wait_for(core.entered.wait(), 1)
+    await asyncio.wait_for(cancel_reached.wait(), 1)
+    assert not authentication_started.is_set()
+    await asyncio.wait_for(authentication_started.wait(), 1)
+    await asyncio.wait_for(ordered_dispatch, 1)
+
+    deadline = asyncio.get_running_loop().time() + 1
+    while dispatcher._runner_tasks:
+        remaining = deadline - asyncio.get_running_loop().time()
+        assert remaining > 0, "dispatcher runners did not drain"
+        _, pending = await asyncio.wait(
+            tuple(dispatcher._runner_tasks), timeout=remaining
+        )
+        assert not pending, "dispatcher runners did not drain"
+    assert agent._sessions[session_id].active_prompt is None
+
+
+async def test_unscrubbable_tool_result_does_not_fail_acp_turn(tmp_path: Path) -> None:
+    agent, _client, core = await _ready(tmp_path)
+    session_id = (await agent.new_session("/workspace")).session_id
+
+    async def run_turn(event: Any, **kwargs: Any) -> None:
+        cyclic: dict[str, Any] = {}
+        cyclic["self"] = cyclic
+        core.bus.publish({
+            "turn_id": kwargs["turn_id"], "channel_id": event.channel_id,
+            "seq": 1, "ts": "now", "type": "tool_result", "phase": "end",
+            "id": "cyclic", "tool_name": "lookup", "content": cyclic,
+            "status": "ok",
+        })
+        result = await core.channels.send(event.channel_id, "answer")
+        assert result.sent
+
+    core.run_turn = run_turn
+
+    response = await agent.prompt(
+        session_id, [sdk.TextContentBlock(type="text", text="cyclic result")]
+    )
+
+    assert response.stop_reason == "end_turn"
+    assert agent._sessions[session_id].active_prompt is None
+
+
 async def test_prompt_validates_all_blocks_before_any_update(tmp_path: Path) -> None:
     agent, client, core = await _ready(tmp_path)
     session_id = (await agent.new_session("/workspace")).session_id
