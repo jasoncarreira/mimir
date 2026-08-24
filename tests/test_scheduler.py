@@ -274,6 +274,108 @@ async def test_fire_enqueues_scheduled_tick_event(tmp_path: Path):
     assert str((tmp_path / "scripts").resolve()) in e.service_authority.filesystem_read_roots
 
 
+def _scheduler_events(tmp_path: Path) -> list[dict]:
+    path = tmp_path / "logs" / "events.jsonl"
+    return [
+        _json.loads(line)
+        for line in path.read_text(encoding="utf-8").splitlines()
+        if line
+    ]
+
+
+@pytest.mark.asyncio
+async def test_fire_records_missing_scheduled_tick_authority(tmp_path: Path):
+    async def fake_enqueue(_event: AgentEvent) -> bool:
+        pytest.fail("a job without scheduled-tick authority must not be enqueued")
+
+    sched = Scheduler(
+        scheduler_yaml=tmp_path / "s.yaml", enqueue=fake_enqueue, home=tmp_path,
+    )
+    job = SchedulerJob(name="memory-hygiene", prompt="clean", cron="0 8 * * 2")
+
+    with mock.patch(
+        "mimir.scheduler.build_scheduled_tick_service_principal", return_value=None,
+    ):
+        await sched._fire(job=job)
+
+    [event] = _scheduler_events(tmp_path)
+    assert event["type"] == "scheduled_tick_dropped"
+    assert event["schedule_name"] == "memory-hygiene"
+    assert event["channel_id"] == "scheduler:memory-hygiene"
+    assert event["reason"] == "scheduled_tick_authority_unavailable"
+
+
+@pytest.mark.asyncio
+async def test_fire_records_rejected_authority_profile(tmp_path: Path):
+    async def fake_enqueue(_event: AgentEvent) -> bool:
+        pytest.fail("a job with an unknown authority profile must not be enqueued")
+
+    sched = Scheduler(
+        scheduler_yaml=tmp_path / "s.yaml", enqueue=fake_enqueue, home=tmp_path,
+    )
+    job = SchedulerJob(
+        name="memory-hygiene",
+        prompt="clean",
+        cron="0 8 * * 2",
+        authority_profile="unknown-profile",
+    )
+
+    await sched._fire(job=job)
+
+    [event] = _scheduler_events(tmp_path)
+    assert event["type"] == "scheduled_tick_dropped"
+    assert event["schedule_name"] == "memory-hygiene"
+    assert event["channel_id"] == "scheduler:memory-hygiene"
+    assert event["reason"].startswith("authority_profile_rejected: ")
+    assert "unknown-profile" in event["reason"]
+
+
+@pytest.mark.asyncio
+async def test_fire_records_rejected_shell_commands(tmp_path: Path):
+    async def fake_enqueue(_event: AgentEvent) -> bool:
+        pytest.fail("a job with rejected shell commands must not be enqueued")
+
+    sched = Scheduler(
+        scheduler_yaml=tmp_path / "s.yaml", enqueue=fake_enqueue, home=tmp_path,
+    )
+    missing = tmp_path / "missing" / "bash"
+    job = SchedulerJob(
+        name="memory-hygiene",
+        prompt="clean",
+        cron="0 8 * * 2",
+        shell_commands=[{"exec": "bash", "path": str(missing)}],
+    )
+
+    await sched._fire(job=job)
+
+    [event] = _scheduler_events(tmp_path)
+    assert event["type"] == "scheduled_tick_dropped"
+    assert event["schedule_name"] == "memory-hygiene"
+    assert event["channel_id"] == "scheduler:memory-hygiene"
+    assert event["reason"].startswith("shell_commands_rejected: ")
+    assert str(missing) in event["reason"]
+
+
+@pytest.mark.asyncio
+async def test_fire_dropped_event_failure_does_not_escape(tmp_path: Path, monkeypatch):
+    async def fake_enqueue(_event: AgentEvent) -> bool:
+        pytest.fail("a job without scheduled-tick authority must not be enqueued")
+
+    async def fail_log_event(*_args, **_kwargs) -> None:
+        raise OSError("event sink unavailable")
+
+    sched = Scheduler(
+        scheduler_yaml=tmp_path / "s.yaml", enqueue=fake_enqueue, home=tmp_path,
+    )
+    job = SchedulerJob(name="memory-hygiene", prompt="clean", cron="0 8 * * 2")
+    monkeypatch.setattr("mimir.event_logger.log_event", fail_log_event)
+
+    with mock.patch(
+        "mimir.scheduler.build_scheduled_tick_service_principal", return_value=None,
+    ):
+        await sched._fire(job=job)
+
+
 @pytest.mark.asyncio
 async def test_fire_heartbeat_principal_is_unchanged(tmp_path: Path):
     enqueued: list[AgentEvent] = []
@@ -5190,5 +5292,4 @@ async def test_poller_cadence_is_cached_per_cron(tmp_path):
 
 async def _noop_coro():
     return None
-
 

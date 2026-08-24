@@ -55,7 +55,7 @@ from .access_control import (
     parse_declared_shell_commands,
 )
 from .core_blocks import read_text_lossy
-from .event_logger import get_events_path, log_event, log_event_sync
+from .event_logger import get_events_path, log_event, log_event_sync, safe_log_event
 from ._context import active_pr_checkout_lease_paths, active_turn_snapshots
 from .loop_watchdog import (
     LoopStallWatchdog,
@@ -1136,6 +1136,12 @@ class Scheduler:
                     "scheduler %r: no scheduled_tick authority to extend; job not fired",
                     job.name,
                 )
+                await safe_log_event(
+                    "scheduled_tick_dropped",
+                    schedule_name=job.name,
+                    channel_id=_scheduler_channel_id(job.name, job.channel_id),
+                    reason="scheduled_tick_authority_unavailable",
+                )
                 return
         else:
             try:
@@ -1146,6 +1152,12 @@ class Scheduler:
                 )
             except ValueError as exc:
                 log.error("scheduler %r: %s; job not fired", job.name, exc)
+                await safe_log_event(
+                    "scheduled_tick_dropped",
+                    schedule_name=job.name,
+                    channel_id=_scheduler_channel_id(job.name, job.channel_id),
+                    reason=f"authority_profile_rejected: {exc}",
+                )
                 return
         service_principal = authority.canonical
 
@@ -1172,6 +1184,12 @@ class Scheduler:
                 log.error(
                     "scheduler %r: shell_commands rejected — %s; job not fired",
                     job.name, exc,
+                )
+                await safe_log_event(
+                    "scheduled_tick_dropped",
+                    schedule_name=job.name,
+                    channel_id=_scheduler_channel_id(job.name, job.channel_id),
+                    reason=f"shell_commands_rejected: {exc}",
                 )
                 return
             if declared:

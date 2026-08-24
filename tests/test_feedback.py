@@ -980,6 +980,12 @@ def test_turn_errors_surface_when_chain_signals_fill_negative_bucket(tmp_path: P
 # ---- gave_up suffix convention (chainlink #299) -------------------------
 
 
+def test_scheduled_tick_dropped_is_negative_feedback():
+    from mimir.feedback import classify
+
+    assert classify("scheduled_tick_dropped") == ("negative", "tick_dropped")
+
+
 def test_classify_gave_up_suffix_is_negative():
     """Any ``*_gave_up`` event type classifies as a negative ``gave_up``
     signal via the suffix convention — even without an explicit
