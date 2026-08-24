@@ -21,6 +21,8 @@ the wiring without taking on subprocess flakiness in CI.
 
 from __future__ import annotations
 
+import asyncio
+import json
 import subprocess
 from pathlib import Path
 from types import SimpleNamespace
@@ -364,6 +366,44 @@ async def test_job_complete_inherits_enforced_auth_for_same_channel_reply(
     assert same_channel.allowed is True
     assert same_channel.reason != "ifc_label_blocked:same_channel"
     assert cross_channel.allowed is False
+
+
+@pytest.mark.asyncio
+async def test_shell_job_complete_handler_failure_is_persisted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Part D: an async handler exception is observed with its job id."""
+    from mimir.agent import Agent
+    from mimir.event_logger import init_logger
+
+    events_path = tmp_path / "events.jsonl"
+    init_logger(events_path, session_id="test-session")
+
+    async def fail_handler(_job: Any) -> None:
+        raise ValueError("invalid completion labels")
+
+    agent = SimpleNamespace(
+        _loop=asyncio.get_running_loop(),
+        _dispatcher=object(),
+        _shell_completion_futures=set(),
+        _on_shell_job_complete=fail_handler,
+    )
+    Agent._handle_shell_job_complete(agent, _FakeJob(job_id="job-failed"))
+
+    for _ in range(100):
+        if not agent._shell_completion_futures:
+            break
+        await asyncio.sleep(0)
+
+    records = [
+        json.loads(line) for line in events_path.read_text(encoding="utf-8").splitlines()
+    ]
+    [failure] = [
+        record for record in records
+        if record["type"] == "shell_job_complete_handler_failed"
+    ]
+    assert failure["job_id"] == "job-failed"
+    assert "ValueError: invalid completion labels" in failure["error"]
 
 
 def test_job_complete_preserves_registered_service_provenance() -> None:

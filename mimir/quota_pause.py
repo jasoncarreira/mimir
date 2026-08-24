@@ -38,6 +38,7 @@ import contextlib
 import json
 import logging
 import re
+import threading
 from dataclasses import dataclass
 
 try:
@@ -51,6 +52,9 @@ from typing import Any
 from ._atomic import atomic_write_json
 
 log = logging.getLogger(__name__)
+
+_failure_state_lock = threading.Lock()
+_active_persistence_failures: set[tuple[Path, str]] = set()
 
 
 # Fallback pause length when the exception carries no usable reset
@@ -138,7 +142,8 @@ class QuotaPauseTracker:
         # (cleared) so they don't seed the burst escalation.
         self._consecutive: int = 0
         self._last_transient_at: datetime | None = None
-        self._load()
+        self.last_load_ok = self._load()
+        self.last_save_ok: bool | None = None
 
     @property
     def state_path(self) -> Path:
@@ -166,7 +171,29 @@ class QuotaPauseTracker:
 
     # ── persistence ─────────────────────────────────────────────────
 
-    def _load(self) -> None:
+    def _transition_failure(self, event_type: str, exc: BaseException) -> None:
+        key = (self._path, event_type)
+        with _failure_state_lock:
+            if key in _active_persistence_failures:
+                return
+            _active_persistence_failures.add(key)
+        try:
+            from .event_logger import log_event_sync
+            log_event_sync(
+                event_type,
+                path=str(self._path),
+                error=f"{type(exc).__name__}: {exc}",
+            )
+        except Exception:  # noqa: BLE001
+            with _failure_state_lock:
+                _active_persistence_failures.discard(key)
+            log.debug("quota pause failure event could not be emitted", exc_info=True)
+
+    def _clear_failure(self, event_type: str) -> None:
+        with _failure_state_lock:
+            _active_persistence_failures.discard((self._path, event_type))
+
+    def _load(self) -> bool:
         if not self._path.is_file():
             # Absent file = no pause on disk. Fully clear in-memory state so a
             # reload under the record_rate_limit lock of a since-cleared file
@@ -180,14 +207,22 @@ class QuotaPauseTracker:
             self._recorded_at = None
             self._consecutive = 0
             self._last_transient_at = None
-            return
+            self._clear_failure("quota_pause_state_unreadable")
+            self.last_load_ok = True
+            return True
         try:
             data = json.loads(self._path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError) as exc:
             log.warning("quota_pause: state file unreadable: %s", exc)
-            return
+            self._transition_failure("quota_pause_state_unreadable", exc)
+            self.last_load_ok = False
+            return False
         if not isinstance(data, dict):
-            return
+            exc = ValueError("state file root is not an object")
+            log.warning("quota_pause: state file unreadable: %s", exc)
+            self._transition_failure("quota_pause_state_unreadable", exc)
+            self.last_load_ok = False
+            return False
         # Reset the timestamp fields first so a reload (e.g. under the
         # record_rate_limit lock) fully reflects the file — an absent field
         # means "cleared", not "keep the stale in-memory value" (#484).
@@ -222,8 +257,11 @@ class QuotaPauseTracker:
                 self._last_transient_at = datetime.fromisoformat(raw_last.replace("Z", "+00:00"))
             except ValueError:
                 self._last_transient_at = None
+        self._clear_failure("quota_pause_state_unreadable")
+        self.last_load_ok = True
+        return True
 
-    def _save(self) -> None:
+    def _save(self) -> bool:
         payload: dict[str, Any] = {
             "reset_at": self._reset_at.isoformat() if self._reset_at else None,
             "reason": self._reason,
@@ -236,12 +274,18 @@ class QuotaPauseTracker:
         # invariant (fsync file + fsync parent dir). Prior shape only
         # fsynced the file — a crash between rename and writeback could
         # revert the pause state. The helper raises on failure; we log
-        # + swallow here because a missed quota_pause.json write self-
-        # heals at the next pause_until call.
+        # + report here because a missed quota_pause.json write self-
+        # heals at the next pause_until call but must not be presented as saved.
         try:
             atomic_write_json(self._path, payload)
         except OSError as exc:
             log.warning("quota_pause: state write failed: %s", exc)
+            self._transition_failure("quota_state_write_failed", exc)
+            self.last_save_ok = False
+            return False
+        self._clear_failure("quota_state_write_failed")
+        self.last_save_ok = True
+        return True
 
     # ── public API ──────────────────────────────────────────────────
 
@@ -252,7 +296,7 @@ class QuotaPauseTracker:
         reason: str = "quota_exhausted",
         provider: str | None = None,
         now: datetime | None = None,
-    ) -> None:
+    ) -> bool:
         """Record that the agent should treat itself as quota-paused
         until ``reset_at``. Idempotent — overwrites any existing pause
         (the newest pause wins, since it has the freshest reset info).
@@ -266,7 +310,7 @@ class QuotaPauseTracker:
         self._reason = reason
         self._provider = provider
         self._recorded_at = now or datetime.now(tz=timezone.utc)
-        self._save()
+        return self._save()
 
     @contextlib.contextmanager
     def _exclusive_lock(self):
@@ -380,19 +424,23 @@ class QuotaPauseTracker:
         self.pause_until(reset_at, reason="rate_limited_backoff", provider=provider, now=now)
         return reset_at, "rate_limited_backoff"
 
-    def _mark_recovered(self) -> None:
+    def _mark_recovered(self) -> bool:
         """Clear the active pause on lazy-expiry but KEEP the transient
         escalation state (``_consecutive`` / ``_last_transient_at``), so a
         real header-less cap that recovers and immediately 429s again keeps
         escalating instead of resetting to the 60s floor every cycle. The
         decay in :meth:`record_rate_limit` is what eventually resets it."""
+        previous = (self._reset_at, self._reason, self._provider, self._recorded_at)
         self._reset_at = None
         self._reason = None
         self._provider = None
         self._recorded_at = None
-        self._save()
+        if self._save():
+            return True
+        self._reset_at, self._reason, self._provider, self._recorded_at = previous
+        return False
 
-    def clear(self) -> None:
+    def clear(self) -> bool:
         """Drop the pause AND the escalation state unconditionally —
         for tests and explicit resets. (Lazy-expiry uses
         :meth:`_mark_recovered`, which preserves escalation state.)"""
@@ -406,6 +454,12 @@ class QuotaPauseTracker:
             self._path.unlink(missing_ok=True)
         except OSError as exc:
             log.warning("quota_pause: state delete failed: %s", exc)
+            self._transition_failure("quota_state_write_failed", exc)
+            self.last_save_ok = False
+            return False
+        self._clear_failure("quota_state_write_failed")
+        self.last_save_ok = True
+        return True
 
     def is_paused(self, *, now: datetime | None = None) -> PauseStatus:
         """Return current pause status. Lazy-expires when ``now`` is
@@ -442,7 +496,10 @@ class QuotaPauseTracker:
                 )
             saved_reset = self._reset_at
             saved_reason = self._reason
-            self._mark_recovered()
+            if not self._mark_recovered():
+                return PauseStatus(
+                    paused=True, reset_at=saved_reset, reason=saved_reason,
+                )
             return PauseStatus(
                 paused=False, reset_at=saved_reset, reason=saved_reason,
             )

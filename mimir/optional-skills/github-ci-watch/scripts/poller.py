@@ -63,9 +63,23 @@ def _save_seen(ids: set[int]) -> None:
     STATE_DIR.mkdir(parents=True, exist_ok=True)
     # Keep only the last 200 seen IDs to prevent unbounded growth.
     trimmed = sorted(ids)[-200:]
-    SEEN_FILE.write_text(
-        json.dumps({"ids": trimmed}), encoding="utf-8"
-    )
+    tmp = STATE_DIR / f"seen_run_ids.{os.getpid()}.tmp"
+    try:
+        with tmp.open("w", encoding="utf-8") as handle:
+            json.dump({"ids": trimmed}, handle)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp, SEEN_FILE)
+        directory_fd = os.open(STATE_DIR, os.O_RDONLY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    finally:
+        try:
+            tmp.unlink()
+        except FileNotFoundError:
+            pass
 
 
 def _gh(*args: str) -> dict | list | None:

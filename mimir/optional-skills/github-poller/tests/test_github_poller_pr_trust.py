@@ -124,21 +124,52 @@ def test_active_org_member_pr_is_reviewed_via_existing_trust_primitive(monkeypat
     ]
 
 
-def test_trust_lookup_failure_fails_closed(monkeypatch):
+def test_trust_lookup_failure_is_retryable_and_not_cached(monkeypatch):
     events, signals = _capture(monkeypatch)
     _use_real_trust_filter(monkeypatch)
     monkeypatch.setattr(poller, "_github_content_author", lambda *args: None)
     monkeypatch.setattr(poller, "_gh_api", lambda endpoint, token: [_pr(4)])
+    cache: dict[tuple[str, object], object] = {}
+    budget = poller.TickBudget()
 
     poller._check_prs(
         "acme/widget", "2026-07-28T11:00:00Z", "token", "",
-        trust_cache={}, surfaced_untrusted=set(),
+        trust_cache=cache, surfaced_untrusted=set(), tick_budget=budget,
     )
 
     assert events == []
-    assert [signal["signal"] for signal in signals] == [
-        "pr_auto_review_skipped_untrusted_author",
-    ]
+    assert signals == []
+    assert cache == {}
+    assert budget.hard_truncated is True
+
+    monkeypatch.setattr(poller, "_github_content_author", lambda *args: "alice")
+    monkeypatch.setattr(poller, "_github_author_is_trusted", lambda *args: True)
+    poller._check_prs(
+        "acme/widget", "2026-07-28T11:00:00Z", "token", "",
+        trust_cache=cache, surfaced_untrusted=set(), tick_budget=poller.TickBudget(),
+    )
+    assert [event["event_type"] for event in events] == ["pr_opened"]
+
+
+def test_trust_verdict_transport_failure_is_retryable_and_not_cached(monkeypatch):
+    _use_real_trust_filter(monkeypatch)
+    monkeypatch.setattr(poller, "_github_content_author", lambda *args: "alice")
+    monkeypatch.setattr(poller, "_github_author_is_trusted", lambda *args: None)
+    cache: dict[tuple[str, object], object] = {}
+
+    assert _REAL_PR_AUTHOR_IS_TRUSTED(
+        "acme/widget", 4, "https://github.com/acme/widget/pull/4", "token", cache,
+    ) is None
+    assert cache == {("acme/widget", 4): "alice"}
+
+    monkeypatch.setattr(poller, "_github_author_is_trusted", lambda *args: True)
+    assert _REAL_PR_AUTHOR_IS_TRUSTED(
+        "acme/widget", 4, "https://github.com/acme/widget/pull/4", "token", cache,
+    ) is True
+    assert cache == {
+        ("acme/widget", 4): "alice",
+        ("acme/widget", "alice"): True,
+    }
 
 
 def test_explicit_review_request_bypasses_failed_author_trust(monkeypatch):

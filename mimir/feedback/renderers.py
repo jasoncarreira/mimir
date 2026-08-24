@@ -506,6 +506,12 @@ def _render_event_line(rule_kind: str, ev: dict) -> str:
             f"in the Discord developer portal for this bot, then "
             f"restart the container."
         )
+    if rule_kind == "discord_bridge_exited":
+        reason = _sanitize_field(ev.get("reason") or "clean gateway close")
+        return (
+            f"Discord bridge supervisor exited after {reason}. "
+            f"Inbound + outbound Discord traffic is down until restart."
+        )
     if rule_kind == "slack_bridge_retry":
         attempt = ev.get("attempt", "?")
         backoff = ev.get("backoff_seconds")
@@ -536,6 +542,12 @@ def _render_event_line(rule_kind: str, ev: dict) -> str:
             f"required scope in the Slack app dashboard (api.slack.com → "
             f"OAuth & Permissions), reinstall the app to refresh the "
             f"token, then restart the container."
+        )
+    if rule_kind == "slack_bridge_exited":
+        reason = _sanitize_field(ev.get("reason") or "clean gateway close")
+        return (
+            f"Slack bridge supervisor exited after {reason}. "
+            f"Inbound + outbound Slack traffic is down until restart."
         )
     if rule_kind in ("spawn_ok", "spawn_auth_fail", "spawn_work_fail"):
         job_id = ev.get("job_id") or "?"

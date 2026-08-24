@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import json
 import logging
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterator
 
@@ -31,20 +32,53 @@ log = logging.getLogger(__name__)
 _CHUNK_BYTES = 8192
 
 
-def tail_jsonl_records(path: Path, *, max_records: int | None = None) -> Iterator[dict]:
+@dataclass
+class JsonlReadStatus:
+    """Outcome populated by a JSONL tail read without changing its data shape."""
+
+    error: OSError | None = None
+
+    @property
+    def degraded(self) -> bool:
+        return self.error is not None
+
+
+def tail_jsonl_records(
+    path: Path,
+    *,
+    max_records: int | None = None,
+    max_lines: int | None = None,
+    read_status: JsonlReadStatus | None = None,
+) -> Iterator[dict]:
     """Yield JSON-decoded records from ``path`` newest-first.
 
     Streams chunks from the end of the file rather than reading the
     whole file into memory. Skips lines that fail to JSON-decode (the
     firehose may have torn lines from a crash). Yields nothing when the
     file is missing or unreadable. When ``max_records`` is set, stops
-    after yielding that many decoded records.
+    after yielding that many decoded records. ``max_lines`` bounds scanned
+    lines, including malformed records. Callers that need to distinguish an
+    unreadable file from an empty one can provide ``read_status``.
     """
     if max_records is not None and max_records <= 0:
         return
+    if max_lines is not None and max_lines <= 0:
+        return
+    try:
+        path.stat()
+    except FileNotFoundError:
+        return
+    except OSError as exc:
+        if read_status is not None:
+            read_status.error = exc
+        return
     yielded = 0
+    scanned = 0
     try:
         for line in _tail_lines(path):
+            scanned += 1
+            if max_lines is not None and scanned > max_lines:
+                break
             line = line.strip()
             if not line:
                 continue
@@ -55,7 +89,9 @@ def tail_jsonl_records(path: Path, *, max_records: int | None = None) -> Iterato
                     break
             except json.JSONDecodeError:
                 continue
-    except OSError:
+    except OSError as exc:
+        if read_status is not None:
+            read_status.error = exc
         return
 
 
