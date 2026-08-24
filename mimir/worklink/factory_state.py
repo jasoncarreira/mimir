@@ -298,6 +298,8 @@ def load_factory_record(home: Path, run_id: str) -> FactoryRunRecord | None:
 def load_factory_records_for_issue(home: Path, issue_id: int) -> list[FactoryRunRecord]:
     """Load both live-store key shapes, newest attempt first and canonical on ties."""
     canonical, legacy = factory_record_run_ids(issue_id)
+    # Canonical-first construction is deliberate: it is a stable-sort fallback for
+    # the explicit canonical tie-break below, not an interchangeable iteration order.
     records = [
         record
         for run_id in (canonical, legacy)
