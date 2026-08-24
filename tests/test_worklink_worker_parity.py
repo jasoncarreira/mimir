@@ -396,10 +396,14 @@ async def test_direct_termination_kills_pipe_holding_grandchild(
         monkeypatch.setenv("MIMIR_WORKLINK_MAX_STDOUT_BYTES", "1")
     output = "overflow" if trigger == "overflow" else "ready"
     source = (
-        "import subprocess,sys,time; "
-        "subprocess.Popen([sys.executable,'-c',"
-        "'import signal,time; signal.signal(signal.SIGTERM,signal.SIG_IGN); time.sleep(30)']); "
-        "time.sleep(.1); "
+        "import os,subprocess,sys,time; "
+        "ready_r,ready_w=os.pipe(); "
+        "child_source=f\"import os,signal,time; "
+        "signal.signal(signal.SIGTERM,signal.SIG_IGN); "
+        "os.write({ready_w},b'1'); os.close({ready_w}); time.sleep(30)\"; "
+        "subprocess.Popen([sys.executable,'-c',child_source],pass_fds=(ready_w,)); "
+        "os.close(ready_w); "
+        "assert os.read(ready_r,1)==b'1'; os.close(ready_r); "
         f"print({output!r},flush=True); "
         "time.sleep(30)"
     )
@@ -407,8 +411,8 @@ async def test_direct_termination_kills_pipe_holding_grandchild(
     handle = await backend.launch(direct_spec(source))
 
     result = await asyncio.wait_for(
-        # Let the source pass its 100ms startup delay so the grandchild owns
-        # the SIGTERM-ignore state this assertion is intended to exercise.
+        # The source prints only after the grandchild has installed its
+        # SIGTERM-ignore handler, so timeout termination is deterministic.
         backend.wait(handle, 0.2 if trigger == "timeout" else 2), timeout=3
     )
     await backend.cleanup(handle)
