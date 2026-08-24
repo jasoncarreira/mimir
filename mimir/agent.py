@@ -67,7 +67,7 @@ from . import health
 from . import mid_turn_injection
 from . import _deepagents_patches
 from .history import Message, MessageBuffer
-from .harness_egress import harness_sink_allowed
+from .harness_egress import harness_sink_allowed, record_harness_shadow_block
 from .index import IndexGenerator
 from . import _langchain_claude_code_patches as _lcc_patches
 from ._deepagents_summarization import install_offload_traceback_logging_patch
@@ -4184,15 +4184,26 @@ class Agent:
                 owner_attestation=owner_attestation,
             )
             source = labels.sources[0]
-            if not _source_is_triggering_channel_compatible(
+            compatible = _source_is_triggering_channel_compatible(
                 source,
                 effective_principal=effective_principal,
                 triggering_principal=auth_context.principal,
                 resolved_triggering=resolved_triggering,
                 audience_provider=auth_context.audience_provider,
                 cross_platform_pull=auth_context.cross_platform_pull,
-            ):
-                continue
+            )
+            if not compatible:
+                if auth_context.enforcement_enabled:
+                    continue
+                # Preserve compatibility-mode prompt assembly while recording
+                # the exact predicate that enforcement would use to omit it.
+                # Re-checking the eventual sink gate would undercount failures
+                # that only this recent-activity compatibility predicate sees.
+                record_harness_shadow_block(
+                    "harness_auto_deliver",
+                    event.channel_id,
+                    "ifc_label_blocked:same_channel",
+                )
             admitted.append(message)
             blocks.append(PromptBlock(message.content, labels))
         return admitted, tuple(blocks)
