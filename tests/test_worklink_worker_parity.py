@@ -295,8 +295,12 @@ async def test_contained_timeout_bounds_cancel_and_collection_independently(
     with pytest.raises(RuntimeError, match=message):
         await asyncio.wait_for(backend.wait(handle, 0.001), timeout=0.2)
 
-    job.cancel()
-    await asyncio.gather(job, return_exceptions=True)
+    if stuck_layer == "collection":
+        assert job.done()
+        assert job.cancelled()
+    else:
+        job.cancel()
+        await asyncio.gather(job, return_exceptions=True)
 
 
 @pytest.mark.asyncio

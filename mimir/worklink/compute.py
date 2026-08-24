@@ -540,7 +540,7 @@ class LocalSubprocessComputeBackend:
                 await _cancel_worker(client, handle.identifier)
                 try:
                     collected = await asyncio.wait_for(
-                        asyncio.shield(job), _WORKER_COLLECTION_TIMEOUT_S
+                        job, _WORKER_COLLECTION_TIMEOUT_S
                     )
                 except TimeoutError as exc:
                     raise RuntimeError(
