@@ -4869,7 +4869,23 @@ def _source_is_triggering_channel_compatible(
     admin_operator_cross_channel: bool = False,
     triggering_bridge_instance: str | None = None,
 ) -> bool:
-    """Return whether one IFC source may flow to the triggering channel."""
+    """Return whether one IFC source may flow to the triggering channel.
+
+    After completeness and requester-ACL checks, ``agent_self`` permits trusted
+    informational data, while ``auto_recall`` and ``mcp`` require the destination
+    audience to be within their source ACL. All remaining kinds may use the
+    same-channel shortcut. Otherwise, ``recent_activity_user`` requires an owner
+    attestation and the requester-only destination audience;
+    ``owner_attested_feedback`` requires an attestation and the requester-only
+    canonical human audience; ``protected_prompt`` and
+    ``recent_activity_assistant`` require the destination audience to be within
+    the source channel audience; non-channel ``service`` data and
+    ``protected_tool`` retain their explicit allowances. ``channel``,
+    ``channel_scoped_feedback``, ``channel_bound_unowned_feedback``, and
+    ``feedback_chain`` have no further allowance. Unknown kinds likewise fail
+    closed after the shortcut. The admin-operator cross-channel path remains an
+    explicit bypass for every complete, requester-authorized kind.
+    """
     if not getattr(source, "is_complete", False):
         return False
     if not effective_principal:
@@ -4885,6 +4901,22 @@ def _source_is_triggering_channel_compatible(
         and source.integrity_effect == "informational"
     ):
         return True
+    if source_kind in {"auto_recall", "mcp"}:
+        if audience_provider is None or not resolved_triggering:
+            return False
+        try:
+            destination_audience = audience_provider.audience_for(
+                resolved_triggering, principal=effective_principal,
+            )
+        except Exception:
+            return False
+        # Membership above only proves that the requester may read the source.
+        # Both producers mint ACLs containing the requester, so it cannot prove
+        # that every other member of the destination audience may read it.
+        return bool(
+            destination_audience
+            and destination_audience <= source.authorized_principals
+        )
     source_channel = ChannelResourceAdapter._resolve_channel(source.resource_id)
     if (
         source_channel
@@ -4978,7 +5010,9 @@ def _source_is_triggering_channel_compatible(
         )
     if source_kind == "service":
         return not source.domain.startswith("channel")
-    return source_kind in {"protected_tool", "auto_recall", "mcp"}
+    if source_kind == "protected_tool":
+        return True
+    return False
 
 
 def _ifc_blocking_source(

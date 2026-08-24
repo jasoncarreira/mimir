@@ -2940,8 +2940,143 @@ def test_acl_authorized_untrusted_protected_prompt_is_channel_bound():
 
 
 @pytest.mark.parametrize(
+    ("source_kind", "domain", "source_acl", "integrity", "integrity_effect"),
+    [
+        (
+            "auto_recall", "saga", frozenset({"user-1", "user-2"}),
+            "untrusted", "informational",
+        ),
+        (
+            "mcp", "mcp", frozenset({"user-1"}),
+            "trusted", "active_ingest",
+        ),
+    ],
+)
+def test_auto_recall_and_mcp_require_destination_audience_within_source_acl(
+    source_kind: str,
+    domain: str,
+    source_acl: frozenset[str],
+    integrity: str,
+    integrity_effect: str,
+):
+    class AudienceProvider:
+        def __init__(self, audience: frozenset[str]):
+            self.audience = audience
+
+        def audience_for(self, channel_id, *, principal):
+            assert (channel_id, principal) == ("slack-C1", "user-1")
+            return self.audience
+
+    source = SourceLabel(
+        principal="user-2" if source_kind == "auto_recall" else "user-1",
+        domain=domain,
+        resource_id=f"{domain}-private-record",
+        bridge_instance=domain,
+        sensitivity="private",
+        authorized_principals=source_acl,
+        source_kind=source_kind,
+        integrity=integrity,
+        integrity_effect=integrity_effect,
+    )
+    labels = InformationFlowLabels(
+        labels=frozenset({"private"}), sources=(source,),
+    )
+
+    within_source_acl = SinkGate.check_sink_flow(
+        "harness_auto_deliver", "slack-C1", labels,
+        replace(
+            _auth(),
+            audience_provider=AudienceProvider(frozenset({"user-1"})),
+        ),
+        enforce=True,
+    )
+    wider_than_source_acl = SinkGate.check_sink_flow(
+        "harness_auto_deliver", "slack-C1", labels,
+        replace(
+            _auth(),
+            audience_provider=AudienceProvider(source_acl | {"user-3"}),
+        ),
+        enforce=True,
+    )
+
+    assert "user-1" in source.authorized_principals
+    assert within_source_acl.allowed is True
+    assert within_source_acl.reason == "ifc_allowed"
+    assert wider_than_source_acl.allowed is False
+    assert wider_than_source_acl.reason == "ifc_label_blocked:same_channel"
+
+
+class ExplodingAudienceProvider:
+    def audience_for(self, channel_id, *, principal):
+        raise AssertionError("audience lookup must not fail open")
+
+
+@pytest.mark.parametrize(
+    "audience_provider",
+    [None, ExplodingAudienceProvider()],
+    ids=["missing", "raises"],
+)
+def test_auto_recall_fails_closed_when_destination_audience_is_unavailable(
+    audience_provider,
+):
+    source = SourceLabel(
+        principal="user-2",
+        domain="saga",
+        resource_id="saga-private-record",
+        bridge_instance="saga",
+        sensitivity="private",
+        authorized_principals=frozenset({"user-1", "user-2"}),
+        source_kind="auto_recall",
+        integrity="untrusted",
+        integrity_effect="informational",
+    )
+    labels = InformationFlowLabels(
+        labels=frozenset({"private"}), sources=(source,),
+    )
+
+    decision = SinkGate.check_sink_flow(
+        "harness_auto_deliver", "slack-C1", labels,
+        replace(_auth(), audience_provider=audience_provider),
+        enforce=True,
+    )
+
+    assert "user-1" in source.authorized_principals
+    assert decision.allowed is False
+    assert decision.reason == "ifc_label_blocked:same_channel"
+
+
+def test_protected_tool_same_channel_compatibility_remains_audience_independent():
+    source = SourceLabel(
+        principal="protected-reader",
+        domain="filesystem",
+        resource_id="private-record",
+        bridge_instance="filesystem",
+        sensitivity="private",
+        authorized_principals=frozenset({"user-1"}),
+        source_kind="protected_tool",
+        integrity="trusted",
+        integrity_effect="informational",
+    )
+    labels = InformationFlowLabels(
+        labels=frozenset({"private"}), sources=(source,),
+    )
+
+    decision = SinkGate.check_sink_flow(
+        "harness_auto_deliver", "slack-C1", labels,
+        replace(_auth(), audience_provider=ExplodingAudienceProvider()),
+        enforce=True,
+    )
+
+    assert decision.allowed is True
+    assert decision.reason == "ifc_allowed"
+
+
+@pytest.mark.parametrize(
     "source_kind",
-    ["channel", "service", "protected_prompt", "protected_tool"],
+    [
+        "channel", "service", "protected_prompt", "protected_tool",
+        "auto_recall", "mcp",
+    ],
 )
 def test_incomplete_source_kind_still_blocks_triggering_channel(source_kind: str):
     source = SourceLabel(
