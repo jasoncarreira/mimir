@@ -2130,10 +2130,33 @@ def test_chainlink_orchestrator_passes_controller_environment_overrides() -> Non
     # opencode build with EACCES because a 0700 attempt directory cannot be
     # traversed by a backend that re-resolves its project root by pathname.
     #
-    # Re-add the key in the SAME change that lands per-run worker UIDs. Until the
-    # worker identity is unique per run, no directory-mode arrangement isolates
-    # concurrent runs: ptrace_scope is 0, so a sibling worker sharing the uid can
-    # take another's checkout FD outright. Re-adding it alone reopens the outage.
+    # The containment this would activate was EVALUATED AND DECLINED (#1434
+    # closed won't-fix, 2026-08-23), so this is the permanent posture rather than
+    # a temporary hold. Be exact about what that costs, because an earlier draft of
+    # this comment claimed the opposite. With the key absent, coding_enabled() is
+    # false, so worker_required is false (orchestrator.py:543-547), the authorized-
+    # checkout / WorkerClient path at :695-701 is skipped, and compute.py:404 falls
+    # through to the ordinary create_subprocess_exec branch. That branch performs NO
+    # uid switch: the child inherits the controller uid (`mimir`), so
+    # model-generated code runs with the agent's privileges over /workspace/mimir
+    # and over other builds' trees. There is no filesystem/uid boundary on this
+    # path, and asserting one here would be wrong.
+    #
+    # What actually limits exposure is narrower. The env is allowlisted
+    # (compute.py:406+): infra vars and provider credential families are passed,
+    # bridge/operator secrets (DISCORD_/SLACK_/MIMIR_API_KEY, ...) never are. The
+    # build also works in a per-run lease checkout rather than the source tree.
+    # That is the accepted tradeoff -- a limited blast radius, not containment.
+    #
+    # The uid drop is tracked separately as #1436, which decouples it from the
+    # contained-checkout path this key activates. Note even #1436 would not isolate
+    # secrets: <home> is a virtiofs bind mount that ignores guest ownership, so
+    # .env stays readable to the worker uid regardless (#1435).
+    #
+    # Re-adding this key requires per-run worker identity first. While the worker
+    # uid is shared no directory-mode arrangement isolates concurrent runs:
+    # ptrace_scope is 0, so a sibling worker sharing the uid can take another's
+    # checkout FD outright. Re-adding it alone reopens the outage.
     assert "MIMIR_CODING_ENABLED" not in pass_env
 
 
