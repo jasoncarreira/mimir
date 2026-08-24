@@ -1109,6 +1109,155 @@ def test_recent_content_and_labels_are_selected_together(tmp_path: Path) -> None
     assert source.resource_id == "discord-D1"
 
 
+def test_recent_activity_admission_respects_enforcement_and_shadow_logs_would_block(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from mimir.identities import Identity
+
+    class Resolver:
+        def identity(self, author):
+            return Identity(canonical="alice") if author == "slack-alice" else None
+
+        def resolve(self, author):
+            raise AssertionError("selection must not call resolve")
+
+    class Provider:
+        def audience_for(self, channel_id, *, principal):
+            if channel_id == "slack-D-alice" and principal == "alice":
+                return frozenset({"alice"})
+            return None
+
+    events: list[tuple[str, dict[str, object]]] = []
+    monkeypatch.setattr(
+        "mimir.harness_egress.log_event_sync",
+        lambda kind, **fields: events.append((kind, fields)),
+    )
+    agent = _make_agent(tmp_path)
+    resolver = Resolver()
+    agent._identity_resolver = resolver
+    agent._buffer.resolver = resolver
+    candidate = agent._buffer.make_message(
+        channel_id="slack-D-alice",
+        kind="user_message",
+        content="CROSS-CHANNEL-CONTEXT",
+        author="slack-alice",
+        msg_id="cross-channel",
+        source="slack",
+    )
+    agent._buffer._append_in_memory(candidate)
+    event = AgentEvent(
+        trigger="user_message",
+        channel_id="slack-GROUP",
+        author="slack-alice",
+        content="now",
+        source="slack",
+    )
+    shadow_auth = AuthContext(
+        principal="slack-alice",
+        canonical_principal="alice",
+        roles=("user",),
+        event_ingress=None,
+        trigger="user_message",
+        channel_id=event.channel_id,
+        interactivity=None,
+        enforcement_enabled=False,
+        bridge_instance="slack",
+        audience_provider=Provider(),
+    )
+
+    shadow_recent, shadow_blocks = agent._select_recent_activity(event, shadow_auth)
+    enforced_recent, enforced_blocks = agent._select_recent_activity(
+        event,
+        replace(shadow_auth, enforcement_enabled=True),
+    )
+
+    assert shadow_recent == [candidate]
+    assert [block.content for block in shadow_blocks] == ["CROSS-CHANNEL-CONTEXT"]
+    assert enforced_recent == []
+    assert enforced_blocks == ()
+    assert events == [(
+        "sink_blocked",
+        {
+            "sink": "harness_auto_deliver",
+            "reason": "ifc_label_blocked:same_channel",
+            "sink_category": "same_channel",
+            "target_channel": "slack-GROUP",
+            "allowed": True,
+            "status": "would_block",
+            "enforcement_enabled": False,
+            "is_shadow_decision": True,
+        },
+    )]
+
+
+def test_recent_activity_shadow_records_predicate_without_rechecking_sink_gate(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from mimir.identities import Identity
+
+    class Resolver:
+        def identity(self, author):
+            return Identity(canonical="alice") if author == "slack-alice" else None
+
+    class Provider:
+        def audience_for(self, channel_id, *, principal):
+            return None
+
+    events: list[tuple[str, dict[str, object]]] = []
+    monkeypatch.setattr(
+        "mimir.harness_egress.log_event_sync",
+        lambda kind, **fields: events.append((kind, fields)),
+    )
+    monkeypatch.setattr(
+        "mimir.agent.harness_sink_allowed",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("recent-activity shadowing must not recheck the sink gate")
+        ),
+    )
+    agent = _make_agent(tmp_path)
+    resolver = Resolver()
+    agent._identity_resolver = resolver
+    agent._buffer.resolver = resolver
+    candidate = agent._buffer.make_message(
+        channel_id="slack-D-alice",
+        kind="user_message",
+        content="CROSS-CHANNEL-CONTEXT",
+        author="slack-alice",
+        msg_id="cross-channel-predicate",
+        source="slack",
+    )
+    agent._buffer._append_in_memory(candidate)
+    event = AgentEvent(
+        trigger="user_message",
+        channel_id="slack-GROUP",
+        author="slack-alice",
+        content="now",
+        source="slack",
+    )
+    auth = AuthContext(
+        principal="slack-alice",
+        canonical_principal="alice",
+        roles=("user",),
+        event_ingress=None,
+        trigger="user_message",
+        channel_id=event.channel_id,
+        interactivity=None,
+        enforcement_enabled=False,
+        bridge_instance="slack",
+        audience_provider=Provider(),
+    )
+
+    recent, blocks = agent._select_recent_activity(event, auth)
+
+    assert recent == [candidate]
+    assert [block.content for block in blocks] == ["CROSS-CHANNEL-CONTEXT"]
+    assert events[0][0] == "sink_blocked"
+    assert events[0][1]["status"] == "would_block"
+    assert events[0][1]["reason"] == "ifc_label_blocked:same_channel"
+
+
 def test_excluded_recent_messages_add_no_identity_or_recent_labels(
     tmp_path: Path,
 ) -> None:
@@ -1376,7 +1525,7 @@ def test_channel_bearing_source_inventory_is_closed() -> None:
         ("feedback_loader", "mimir/agent.py", "Agent._build_turn_prompt", "self._feedback.recent_prompt_block"): 1,
         ("feedback_stream", "mimir/feedback/__init__.py", "FeedbackLog._select_prompt_recent", "admit"): 2,
         ("producer", "mimir/access_control.py", "_incomplete_protected_result", "SourceLabel"): 1,
-        ("producer", "mimir/access_control.py", "classify_protected_result", "SourceLabel"): 4,
+        ("producer", "mimir/access_control.py", "classify_protected_result", "SourceLabel"): 5,
         ("producer", "mimir/access_control.py", "protected_result_source", "SourceLabel"): 1,
         ("producer", "mimir/agent.py", "Agent._assemble_commitments_block", "_prompt_source_labels"): 1,
         ("producer", "mimir/agent.py", "Agent._assemble_self_state_block", "_prompt_source_labels"): 1,

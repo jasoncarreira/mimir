@@ -487,6 +487,80 @@ class _ServiceMemoryReadProbeAgent(_FakeAgent):
             yield chunk
 
 
+class _AcpHandsReadProbeAgent(_FakeAgent):
+    """Run hands_read through live middleware before returning final ACP text."""
+
+    def __init__(self) -> None:
+        super().__init__([AIMessage(content="NOTES ANSWER")])
+        self.result: ToolMessage | None = None
+        self.provider_calls: list[tuple[str, dict[str, Any]]] = []
+
+    async def astream(
+        self,
+        state: dict[str, Any],
+        *,
+        config: dict[str, Any],
+        context=None,
+        stream_mode: str = "values",
+    ):
+        from mimir._context import get_current_turn
+        from mimir.tools.client_provider import (
+            MIMIR_HANDS_V1,
+            get_turn_capability_context,
+            hands_read,
+            reset_turn_capability_context,
+            set_turn_capability_context,
+        )
+
+        probe = self
+
+        class Provider:
+            async def call_tool(
+                self, name: str, arguments: dict[str, Any]
+            ) -> dict[str, str]:
+                probe.provider_calls.append((name, arguments))
+                return {"content": "notes contents"}
+
+        turn = get_current_turn()
+        capability = get_turn_capability_context()
+        assert turn is not None
+        assert capability is not None
+        token = set_turn_capability_context(replace(
+            capability,
+            provider=Provider(),
+            profile_policy=MIMIR_HANDS_V1,
+        ))
+        try:
+            async def _handler(req: ToolCallRequest) -> ToolMessage:
+                payload = await hands_read.ainvoke(req.tool_call["args"])
+                return ToolMessage(
+                    content=payload["content"],
+                    tool_call_id=req.tool_call["id"],
+                )
+
+            self.result = await BudgetGateMiddleware().awrap_tool_call(
+                ToolCallRequest(
+                    tool_call={
+                        "name": "hands_read",
+                        "args": {"path": "./notes.txt"},
+                        "id": "tc-acp-hands-read",
+                        "type": "tool_call",
+                    },
+                    tool=None,
+                    state=None,
+                    runtime=Runtime(context=turn.auth_context),
+                ),
+                _handler,
+            )
+        finally:
+            reset_turn_capability_context(token)
+
+        async for chunk in super().astream(
+            state, config=config, context=context, stream_mode=stream_mode,
+        ):
+            yield chunk
+
+
 class _HttpEventAdminProbeAgent(_FakeAgent):
     """Probe the TurnContext Agent installs before admin-tool auth runs."""
 
@@ -5479,6 +5553,8 @@ async def test_acp_lifecycle_reloads_owned_session_and_delivers_bound_reply(
 async def _refusal_test_acp(
     tmp_path: Path,
     response: str,
+    *,
+    fake_agent: Any | None = None,
 ) -> tuple[MimirAcpAgent, str, Any]:
     class Client:
         def __init__(self) -> None:
@@ -5502,7 +5578,11 @@ async def _refusal_test_acp(
     bus = TurnEventBus()
     core = _build_agent(
         tmp_path,
-        fake_agent=_FakeAgent(response_messages=[AIMessage(content=response)]),
+        fake_agent=(
+            fake_agent
+            if fake_agent is not None
+            else _FakeAgent(response_messages=[AIMessage(content=response)])
+        ),
         channel_registry=channels,
         turn_event_bus=bus,
     )
@@ -5602,6 +5682,30 @@ async def test_acp_successful_final_text_delivery_is_unchanged(
         "agent_message_chunk",
     ]
     assert client.updates[1].content.text == "ANSWER"
+
+
+async def test_acp_hands_read_result_allows_final_response_delivery(
+    tmp_path: Path,
+) -> None:
+    probe = _AcpHandsReadProbeAgent()
+    acp, session_id, client = await _refusal_test_acp(
+        tmp_path, "unused", fake_agent=probe,
+    )
+
+    response = await acp.prompt(
+        session_id,
+        [acp_sdk.TextContentBlock(type="text", text="what's in ./notes.txt")],
+    )
+
+    assert response.stop_reason == "end_turn"
+    assert probe.result is not None
+    assert probe.result.content == "notes contents"
+    assert probe.provider_calls == [("read", {"path": "./notes.txt"})]
+    assert [update.session_update for update in client.updates] == [
+        "user_message_chunk",
+        "agent_message_chunk",
+    ]
+    assert client.updates[1].content.text == "NOTES ANSWER"
 
 
 async def test_acp_empty_final_text_remains_normal_silent_end_turn(

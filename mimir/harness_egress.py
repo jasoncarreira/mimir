@@ -12,6 +12,29 @@ from .event_logger import log_event_sync
 log = logging.getLogger(__name__)
 
 
+def record_harness_shadow_block(
+    sink_name: str,
+    target_channel: str | None,
+    reason: str,
+) -> None:
+    """Record a shadow denial already decided by a harness-owned predicate."""
+    try:
+        log_event_sync(
+            "sink_blocked",
+            sink=sink_name,
+            reason=reason,
+            sink_category=get_sink_category(sink_name).value,
+            target_channel=target_channel,
+            allowed=True,
+            status="would_block",
+            enforcement_enabled=False,
+            is_shadow_decision=True,
+        )
+    except Exception:  # noqa: BLE001 - observability must not break delivery
+        log.debug("harness shadow decision event failed", exc_info=True)
+    log.warning("harness IFC sink would block: sink=%s reason=%s", sink_name, reason)
+
+
 def harness_sink_allowed(
     sink_name: str,
     target_channel: str | None,

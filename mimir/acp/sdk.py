@@ -851,15 +851,27 @@ class BoundedMessageDispatcher(DefaultMessageDispatcher):
             raise ValueError("max_active must be positive")
         self._runner_slots = asyncio.BoundedSemaphore(max_active)
         self._runner_tasks: set[asyncio.Task[Any]] = set()
+        self._authentication_fence: asyncio.Task[Any] | None = None
 
     async def _dispatch_request(self, message: dict[str, Any]) -> None:
         method = message.get("method", "")
-        if method == "authenticate" and self._runner_tasks:
-            # The dispatcher loop is ordered: waiting here drains all earlier
-            # handlers while preventing later work from being admitted. The
-            # authentication runner itself is then awaited below, making
-            # authentication an exclusive fence without consuming waiter slots.
-            await asyncio.wait(tuple(self._runner_tasks))
+        fence: tuple[asyncio.Task[Any], ...] = ()
+        if method == "authenticate":
+            # Authentication mutates connection authority. Sequence it after
+            # earlier handlers, and gate later work on it, without blocking the
+            # ordered dispatcher loop that must still admit session/cancel.
+            fence = tuple(self._runner_tasks)
+        elif (
+            method != "session/cancel"
+            and self._authentication_fence is not None
+            and not self._authentication_fence.done()
+        ):
+            fence = (self._authentication_fence,)
+        if fence:
+            task = self._create_deferred_request(message, fence)
+            if method == "authenticate":
+                self._authentication_fence = task
+            return
         await self._runner_slots.acquire()
         try:
             record = self._store.begin_incoming(method, message.get("params"))
@@ -880,9 +892,17 @@ class BoundedMessageDispatcher(DefaultMessageDispatcher):
 
         task = self._create_runner(runner(), "mimir.acp.Dispatcher.request")
         if method == "authenticate":
-            await asyncio.wait((task,))
+            self._authentication_fence = task
 
     async def _dispatch_notification(self, message: dict[str, Any]) -> None:
+        method = message.get("method", "")
+        if (
+            method != "session/cancel"
+            and self._authentication_fence is not None
+            and not self._authentication_fence.done()
+        ):
+            self._create_deferred_notification(message, (self._authentication_fence,))
+            return
         await self._runner_slots.acquire()
 
         async def runner() -> None:
@@ -892,6 +912,50 @@ class BoundedMessageDispatcher(DefaultMessageDispatcher):
                 self._runner_slots.release()
 
         self._create_runner(runner(), "mimir.acp.Dispatcher.notification")
+
+    def _create_deferred_request(
+        self,
+        message: dict[str, Any],
+        fence: tuple[asyncio.Task[Any], ...],
+    ) -> asyncio.Task[Any]:
+        async def deferred() -> None:
+            await asyncio.wait(fence)
+            await self._runner_slots.acquire()
+            try:
+                record = self._store.begin_incoming(
+                    message.get("method", ""), message.get("params")
+                )
+            except BaseException:
+                self._runner_slots.release()
+                raise
+            try:
+                result = await self._request_runner(message)
+            except Exception as exc:
+                self._store.fail_incoming(record, exc)
+                raise
+            else:
+                self._store.complete_incoming(record, result)
+            finally:
+                self._runner_slots.release()
+
+        return self._create_waiter(deferred(), "mimir.acp.Dispatcher.request_waiter")
+
+    def _create_deferred_notification(
+        self,
+        message: dict[str, Any],
+        fence: tuple[asyncio.Task[Any], ...],
+    ) -> asyncio.Task[Any]:
+        async def deferred() -> None:
+            await asyncio.wait(fence)
+            await self._runner_slots.acquire()
+            try:
+                await self._notification_runner(message)
+            finally:
+                self._runner_slots.release()
+
+        return self._create_waiter(
+            deferred(), "mimir.acp.Dispatcher.notification_waiter"
+        )
 
     async def stop(self) -> None:
         task = self._task
@@ -961,6 +1025,16 @@ class BoundedMessageDispatcher(DefaultMessageDispatcher):
         except BaseException:
             coroutine.close()
             self._runner_slots.release()
+            raise
+        self._runner_tasks.add(task)
+        task.add_done_callback(self._runner_tasks.discard)
+        return task
+
+    def _create_waiter(self, coroutine: Any, name: str) -> asyncio.Task[Any]:
+        try:
+            task = self._supervisor.create(coroutine, name=name)
+        except BaseException:
+            coroutine.close()
             raise
         self._runner_tasks.add(task)
         task.add_done_callback(self._runner_tasks.discard)
