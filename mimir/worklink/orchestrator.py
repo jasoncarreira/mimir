@@ -1195,7 +1195,12 @@ class WorklinkRunner:
             run_bookkeeping("issue transition", transition_issue)
             run_bookkeeping("transition event", log_transition)
         else:
-            transition_issue()
+            try:
+                transition_issue()
+            except Exception:
+                # The transition event is the observable record of this failure;
+                # do not let the failed mutation suppress its own telemetry.
+                pass
             log_transition()
         cleanup_error = None
         if publication is None:
