@@ -38,7 +38,7 @@ _MAX_LABEL_ACTION_LEN = 80
 _EXTERNAL_COMMAND_TIMEOUT_SECONDS = 10
 _CONTINUATION_RETENTION = timedelta(days=30)
 
-_RUN_ID_RE = re.compile(r"\bchainlink-\d+\b", re.IGNORECASE)
+_RUN_ID_RE = re.compile(r"\bchainlink-(\d+)\b", re.IGNORECASE)
 _PR_URL_RE = re.compile(r"https?://github\.com/[^\s)]+/pull/\d+", re.IGNORECASE)
 _ISSUE_PATTERNS = (
     re.compile(r"\bchainlink\s*#(\d+)\b", re.IGNORECASE),
@@ -178,6 +178,14 @@ def maybe_create_worklink_budget_continuation(
         ([run_id] if isinstance(run_id, str) and run_id.strip() else [])
         + [match.group(0) for text in hint_strings for match in _RUN_ID_RE.finditer(text)]
     )
+    explicit_run_match = (
+        _RUN_ID_RE.fullmatch(run_id.strip())
+        if isinstance(run_id, str)
+        else None
+    )
+    # Prose issue references deliberately require ``#`` to avoid treating an
+    # incidental number as an issue. A caller-supplied canonical run ID is a
+    # separate identity format, validated below through durable run state.
     candidate_issue_ids = _unique_ints(
         [
             int(match.group(1))
@@ -198,26 +206,23 @@ def maybe_create_worklink_budget_continuation(
         issue_candidates=candidate_issue_ids,
         pr_candidates=candidate_pr_urls,
     )
-    if not worklink_related:
+    if not worklink_related and explicit_run_match is None:
         return None
 
-    validated_issue_id: int | None = None
+    validated_issue_id = int(explicit_run_match.group(1)) if explicit_run_match else None
     validated_repo = repo_slug
 
     run_state = None
     run_state_file: Path | None = None
     run_state_test_command: str | None = None
     if validated_issue_id is not None:
-        run_state = load_run_state(home, validated_issue_id)
-        if run_state is not None:
-            run_state_repo = _normalize_repo(run_state.repo or run_state.repo_url)
-            if validated_repo is None:
-                validated_repo = repo_slug or run_state_repo
-            if validated_repo is not None and run_state_repo not in (None, validated_repo):
-                run_state = None
-            else:
-                run_state_file = run_state_path(home, validated_issue_id)
-                run_state_test_command = run_state.test_command
+        validated_issue_id, validated_repo, run_state, run_state_file, run_state_test_command = (
+            _validate_issue_from_run_state(
+                home,
+                [validated_issue_id],
+                current_repo=repo_slug,
+            )
+        )
 
     if validated_issue_id is None:
         validated_issue_id, validated_repo, run_state, run_state_file, run_state_test_command = (
@@ -390,6 +395,7 @@ def maybe_create_worklink_budget_continuation(
     atomic_write_json(path, payload)
 
     _emit_continuation_event(
+        "worklink_continuation_created",
         idempotency_key=idempotency_key,
         sidecar=str(path),
         issue_id=validated_issue_id,
@@ -467,15 +473,27 @@ def consume_worklink_budget_continuations(
             gh_bin=gh_bin,
             runner=run,
         )
+        was_stalled = bool(payload.get("consumer_error"))
         payload["last_checked_at"] = current.isoformat()
         payload["consumer_error"] = _truncate_str(check_error, 300)
         if terminal_reason is not None:
+            if terminal_reason == "no_validated_target" and actioned_at is None:
+                payload["actioned_at"] = current.isoformat()
             payload["resolved_at"] = current.isoformat()
             payload["resolved_reason"] = terminal_reason
             atomic_write_json(path, payload)
             break
         if check_error is not None:
             atomic_write_json(path, payload)
+            if not was_stalled:
+                association = payload.get("association")
+                association = association if isinstance(association, Mapping) else {}
+                _emit_continuation_event(
+                    "worklink_continuation_stalled",
+                    sidecar=str(path),
+                    issue_id=association.get("issue_id"),
+                    consumer_error=payload["consumer_error"],
+                )
             break
 
         if actioned_at is not None:
@@ -483,6 +501,15 @@ def consume_worklink_budget_continuations(
                 payload["resolved_at"] = current.isoformat()
                 payload["resolved_reason"] = "manual_triage_timeout"
             atomic_write_json(path, payload)
+            if payload.get("resolved_reason") == "manual_triage_timeout":
+                association = payload.get("association")
+                association = association if isinstance(association, Mapping) else {}
+                _emit_continuation_event(
+                    "worklink_continuation_abandoned",
+                    sidecar=str(path),
+                    issue_id=association.get("issue_id"),
+                    reason="manual_triage_timeout",
+                )
             break
 
         payload["external_comment"] = _post_consumer_comment(
@@ -596,7 +623,7 @@ def _continuation_terminal_state(
             return None, (result.stderr or result.stdout).strip() or "pr_status_failed", None
 
     if issue_payload is None and pr_url is None:
-        return None, "no_validated_target", None
+        return "no_validated_target", None, None
     return None, None, issue_payload
 
 
@@ -1319,11 +1346,11 @@ def _normalize_labels(values: Sequence[str] | None) -> list[str]:
     return sorted({value.strip() for value in values if isinstance(value, str) and value.strip()})
 
 
-def _emit_continuation_event(**payload: Any) -> None:
+def _emit_continuation_event(event_type: str, **payload: Any) -> None:
     try:
         from ..event_logger import log_event_sync
 
-        log_event_sync("worklink_continuation_created", **payload)
+        log_event_sync(event_type, **payload)
     except Exception:
         return
 

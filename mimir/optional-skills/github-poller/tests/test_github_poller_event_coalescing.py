@@ -332,7 +332,9 @@ def test_current_head_review_suppresses_new_pr_pass(
         raise AssertionError(endpoint)
 
     monkeypatch.setattr(poller, "_gh_api", fake_api)
-    monkeypatch.setattr(poller, "_pr_author_is_trusted", lambda *args: True)
+    monkeypatch.setattr(
+        poller, "_pr_author_is_trusted", lambda *args, **kwargs: True,
+    )
 
     count = poller._check_prs("o/r", SINCE, "t", "mimir-carreira")
 

@@ -1954,6 +1954,47 @@ def test_deepagents_synthetic_inventory_uses_dispatchable_mimir_tools() -> None:
     )
 
 
+def test_maximal_model_tool_inventory_has_total_protected_result_partition(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from mimir.tools import forge, mcp
+    from mimir.tools.registry import all_mimir_tools
+
+    monkeypatch.setenv("TAVILY_API_KEY", "tvly-test")
+    monkeypatch.delenv("MIMIR_FETCH_URL_DISABLED", raising=False)
+    monkeypatch.setattr(forge, "_github_identity_degraded", False)
+    monkeypatch.setattr(mcp, "get_mcp_tools", lambda: [])
+    names = {
+        *(tool.name for tool in all_mimir_tools(
+            model_spec="openai:test",
+            coding_enabled=True,
+            require_coding_available=False,
+        )),
+        *access_control._deepagents_builtin_tool_names(),
+    }
+    mapped = names & access_control._PROTECTED_RESULT_DOMAINS.keys()
+    exempted = names & access_control._NON_INGESTING_RESULT_TOOLS
+
+    assert mapped.isdisjoint(exempted)
+    assert mapped | exempted == names
+
+
+def test_inventory_assertion_rejects_tool_without_result_classification(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        access_control,
+        "_deepagents_builtin_tool_names",
+        lambda: ("harness_auto_deliver",),
+    )
+
+    with pytest.raises(
+        access_control.CapabilityMatrixError,
+        match="without explicit protected-result classification: harness_auto_deliver",
+    ):
+        access_control.assert_model_tool_inventory_cataloged(model_spec="openai:test")
+
+
 def test_inventory_assertion_rejects_uncataloged_registered_mcp_tool() -> None:
     from mimir.access_control import (
         CapabilityMatrixError,
@@ -6092,7 +6133,7 @@ def test_static_service_write_allows_home_when_file_tool_roots_unset(
         assert decision.allowed is True, target
 
 
-def test_autonomous_write_uses_trigger_state_and_explicit_repo_rw_roots(
+def test_poller_write_uses_only_its_declared_root(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -6120,13 +6161,9 @@ def test_autonomous_write_uses_trigger_state_and_explicit_repo_rw_roots(
     registry = ToolRegistry()
 
     for target in (
-        repo / "src" / "x.py",
         trigger_state / "cursor.json",
-        home / "state" / "reports" / "x.md",
-        home / "memory" / "issues" / "x.md",
-        home / "memory" / "channels" / "C1" / "notes.md",
-        repo / ".gitignore",
-        repo / ".gitattributes",
+        trigger_state / ".gitignore",
+        trigger_state / ".gitattributes",
     ):
         assert registry.authorize_tool(
             "write_file", auth, enforce=True, target_channel=str(target),
@@ -6134,6 +6171,10 @@ def test_autonomous_write_uses_trigger_state_and_explicit_repo_rw_roots(
     for target in (
         home,
         home / "root.txt",
+        repo / "src" / "x.py",
+        home / "state" / "reports" / "x.md",
+        home / "memory" / "issues" / "x.md",
+        home / "memory" / "channels" / "C1" / "notes.md",
         readonly / "data.txt",
         outside / "data.txt",
         Path("/tmp/unscoped.txt"),
@@ -7181,6 +7222,36 @@ def test_github_poller_binds_review_scope_from_server_event_and_origin(
         }]},
     )
     assert create_auth_context(steered, enforce=True).repo_review_state is None
+
+
+def test_replayed_github_poller_payload_cannot_mint_repo_pr_scope(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _root, authority, item = _github_scope_test_setup(tmp_path, monkeypatch)
+    live = AgentEvent(
+        trigger="poller", channel_id="poller:github-activity",
+        service_principal=authority.canonical, service_authority=authority,
+        extra={"poller_name": "github-activity", "items": [item]},
+    )
+    replayed = replace(
+        live,
+        extra={
+            **live.extra,
+            access_control.POLLER_RECOVERY_REPLAY_EXTRA_KEY: True,
+        },
+    )
+
+    live_scope = create_auth_context(live, enforce=True).repo_pr_action_scope
+    replayed_scope = create_auth_context(replayed, enforce=True).repo_pr_action_scope
+
+    assert live_scope is not None
+    assert {
+        access_control.RepoPRAction.WRITE.value,
+        access_control.RepoPRAction.COMMIT.value,
+        access_control.RepoPRAction.PUSH.value,
+    } <= live_scope.allowed_operations
+    assert replayed_scope is None
 
 
 def _github_scope_test_setup(

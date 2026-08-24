@@ -3921,7 +3921,10 @@ async def test_tool_refusal_is_a_result_and_next_tool_call_can_run(
     assert adapted.content == "adapted"
     assert unsupported.content == "adapted"
     assert calls == ["refused", "stale", "adapted", "unsupported"]
-    assert ctx.ifc_labels.has_untrusted_active_ingest is False
+    assert ctx.ifc_labels.has_untrusted_active_ingest is True
+    source = next(iter(ctx.ifc_labels.sources))
+    assert source.domain == "repository"
+    assert source.resource_id == f"owner/repo#pull/17@{'a' * 40}"
     assert ctx.tool_call_count == 4
     assert ctx.hard_boundary_denials == [
         {

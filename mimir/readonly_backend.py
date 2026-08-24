@@ -1333,7 +1333,11 @@ class _RootAwareFilesystemBackend(_BoundedFilesystemBackend):
     def _publish_read_paths(self, file_paths: list[str]) -> None:
         """Publish every exact resource in a successful backend collection result."""
         from ._context import get_current_turn
-        from .access_control import protected_result_source, publish_protected_result
+        from .access_control import (
+            invalidate_protected_result_capture,
+            protected_result_source,
+            publish_protected_result,
+        )
 
         turn = get_current_turn()
         auth_context = getattr(turn, "auth_context", None)
@@ -1342,6 +1346,7 @@ class _RootAwareFilesystemBackend(_BoundedFilesystemBackend):
             try:
                 resolved_paths.append(str(self._resolve_path(file_path).resolve(strict=True)))
             except (OSError, RuntimeError, ValueError):
+                invalidate_protected_result_capture()
                 return
         publish_protected_result(tuple(
             protected_result_source(
@@ -1426,16 +1431,9 @@ class _RootAwareFilesystemBackend(_BoundedFilesystemBackend):
         before_context: int = 0,
         after_context: int = 0,
     ) -> GrepResult:
-        result = await asyncio.to_thread(
+        return await asyncio.to_thread(
             self.grep, pattern, path, glob, before_context, after_context,
         )
-        if result.error is None:
-            self._publish_read_paths([
-                str(match.get("path"))
-                for match in result.matches or ()
-                if match.get("path")
-            ])
-        return result
 
     def write(self, file_path: str, content: str) -> WriteResult:
         result = _exclusive_write(self.cwd, file_path, content)

@@ -103,20 +103,14 @@ class VectorIndex:
         )
         if not emit_event:
             return
-        try:
-            from mimir.event_logger import log_event_sync
+        from .ownership import _emit_saga_event
 
-            log_event_sync(
-                "saga_vector_search_degraded",
-                reason=reason,
-                expected_dimension=self.dimension,
-                observed_dimension=observed_dimension,
-            )
-        except Exception:  # noqa: BLE001 — telemetry must not break recall fallback
-            logger.debug(
-                "Could not persist saga_vector_search_degraded event",
-                exc_info=True,
-            )
+        _emit_saga_event(
+            "saga_vector_search_degraded",
+            reason=reason,
+            expected_dimension=self.dimension,
+            observed_dimension=observed_dimension,
+        )
 
     @property
     def total_vectors(self) -> int:

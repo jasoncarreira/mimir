@@ -1009,6 +1009,86 @@ async def test_api_turns_handles_missing_file(app):
 
 
 @pytest.mark.asyncio
+async def test_log_read_failure_is_degraded_and_emits_once_per_path(
+    app,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from mimir import _jsonl_tail
+
+    a, turns_log, events_log = app
+    turns_log.write_text("", encoding="utf-8")
+    events_log.write_text("", encoding="utf-8")
+    emitted: list[tuple[str, dict[str, str]]] = []
+
+    def unreadable(_path: Path):
+        raise PermissionError("permission denied")
+
+    async def record_event(event_type: str, **payload: str) -> None:
+        emitted.append((event_type, payload))
+
+    monkeypatch.setattr(_jsonl_tail, "_tail_lines", unreadable)
+    monkeypatch.setattr(web_ui, "safe_log_event", record_event)
+
+    async with TestClient(TestServer(a)) as client:
+        legacy_turns = await client.get("/api/turns?limit=2")
+        repeated_turns = await client.get("/api/v1/turns?limit=2")
+        legacy_events = await client.get("/api/events")
+        repeated_events = await client.get("/api/v1/events")
+        live_events = await client.get("/api/v1/live-events?once=1")
+
+        assert await legacy_turns.json() == {"turns": [], "degraded": True}
+        assert (await repeated_turns.json())["data"] == {
+            "turns": [],
+            "degraded": True,
+        }
+        assert await legacy_events.json() == {"events": [], "degraded": True}
+        assert (await repeated_events.json())["data"] == {
+            "events": [],
+            "degraded": True,
+        }
+        assert 'event: state-degraded\ndata: {"degraded": true}' in await live_events.text()
+
+    assert [event_type for event_type, _payload in emitted] == [
+        "state_read_failed",
+        "state_read_failed",
+    ]
+    assert {payload["path"] for _event_type, payload in emitted} == {
+        str(turns_log),
+        str(events_log),
+    }
+    assert all("PermissionError: permission denied" in payload["error"] for _, payload in emitted)
+
+
+@pytest.mark.asyncio
+async def test_empty_logs_are_healthy_empty_without_event(
+    app,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    a, turns_log, events_log = app
+    turns_log.write_text("", encoding="utf-8")
+    events_log.write_text("", encoding="utf-8")
+    emitted: list[str] = []
+
+    async def record_event(event_type: str, **_payload: str) -> None:
+        emitted.append(event_type)
+
+    monkeypatch.setattr(web_ui, "safe_log_event", record_event)
+
+    async with TestClient(TestServer(a)) as client:
+        turns = await client.get("/api/turns?limit=2")
+        events = await client.get("/api/events")
+        live_events = await client.get("/api/v1/live-events?once=1")
+
+        assert turns.status == 200
+        assert await turns.json() == {"turns": []}
+        assert events.status == 200
+        assert await events.json() == {"events": []}
+        assert "degraded" not in await live_events.text()
+
+    assert emitted == []
+
+
+@pytest.mark.asyncio
 async def test_api_events_filters_by_type_and_limit(app):
     a, _, events_log = app
     rows = [

@@ -376,19 +376,32 @@ async def poll_once(
         "minimax_five_hour": interval_snapshot(entry),
         "minimax_seven_day": weekly_snapshot(entry),
     }
+    recorded: dict[str, dict[str, Any]] = {}
     for key, snap in snapshots.items():
-        await store.record(key, snap)
-
-    await log_event(
-        "minimax_usage_ok",
-        model_name=entry.get("model_name"),
-        recorded={
-            key: {
+        try:
+            persisted = await store.record(key, snap)
+        except Exception:  # noqa: BLE001
+            log.exception("minimax_usage: store.record failed for %s", key)
+            persisted = False
+        if persisted:
+            recorded[key] = {
                 "utilization": snap.utilization,
                 "resets_at": snap.resets_at,
                 "status": snap.status,
             }
-            for key, snap in snapshots.items()
-        },
+
+    if len(recorded) != len(snapshots):
+        await log_event(
+            "minimax_usage_failed",
+            stage="state_write",
+            recorded=recorded,
+            failed_windows=[key for key in snapshots if key not in recorded],
+        )
+        return {"ok": False, "stage": "state_write", "recorded": recorded}
+
+    await log_event(
+        "minimax_usage_ok",
+        model_name=entry.get("model_name"),
+        recorded=recorded,
     )
     return {"ok": True, "snapshots": snapshots, "model_name": entry.get("model_name")}
