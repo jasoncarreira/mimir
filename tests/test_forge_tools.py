@@ -117,6 +117,7 @@ class FakeForge:
     def __init__(self) -> None:
         self.calls: list[tuple] = []
         self.diff = "diff --git a/src/app.py b/src/app.py"
+        self.snapshot_state = "open"
         self.snapshot_author = "untrusted-author"
         self.snapshot_heads = ["c" * 40]
         self.snapshot_repo = "owner/repo"
@@ -140,7 +141,7 @@ class FakeForge:
         )
         return NormalizedPullRequestSnapshot(
             repo=self.snapshot_repo,
-            state="open", number=number, author=self.snapshot_author,
+            state=self.snapshot_state, number=number, author=self.snapshot_author,
             head_repo=(
                 repository if self.snapshot_author == "reviewer" else "contributor/repo"
             ),
@@ -562,6 +563,88 @@ def test_operator_registry_miss_still_discovers_live_scope(
 
     assert resolved.pr_number == 2
     assert client.calls == [("snapshot", "owner/repo", 2)]
+
+
+def _poller_operator_context() -> AuthContext:
+    return AuthContext(
+        principal="operator", canonical_principal="operator", roles=("admin",),
+        event_ingress=None, trigger="poller", channel_id="poller:forge",
+        interactivity=None,
+    )
+
+
+def test_poller_turn_discovers_live_scope_for_own_open_pr(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = FakeForge()
+    client.snapshot_author = "reviewer"
+    _configure_live_review(monkeypatch, client)
+
+    resolved = resolve_review_state_for_context(
+        _poller_operator_context(), "owner/repo", 1291,
+    )
+
+    assert resolved.pr_number == 1291
+    assert resolved.action_scope.principal == "reviewer"
+    assert client.calls == [
+        ("snapshot", "owner/repo", 1291),
+        ("reviews", resolved.action_scope),
+    ]
+
+
+def test_poller_turn_refuses_live_scope_for_third_party_open_pr(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = FakeForge()
+    _configure_live_review(monkeypatch, client)
+
+    with pytest.raises(ToolException) as refused:
+        resolve_review_state_for_context(
+            _poller_operator_context(), "owner/repo", 1291,
+        )
+
+    assert str(refused.value) == (
+        'pull-request operation rejected: requested repository="owner/repo", '
+        "pull_request=1291; live scope discovery requires an authenticated operator user turn"
+    )
+    assert client.calls == [("snapshot", "owner/repo", 1291)]
+
+
+def test_poller_turn_own_merged_pr_yields_terminal_state(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = FakeForge()
+    client.snapshot_author = "reviewer"
+    client.snapshot_state = "closed"
+    _configure_live_review(monkeypatch, client)
+
+    with pytest.raises(ToolException) as refused:
+        resolve_review_state_for_context(
+            _poller_operator_context(), "owner/repo", 1291,
+        )
+
+    assert str(refused.value) == (
+        "pull-request operation rejected: live pull request is closed or invalid"
+    )
+    assert client.calls == [("snapshot", "owner/repo", 1291)]
+
+
+def test_user_message_turn_still_discovers_third_party_open_pr(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = FakeForge()
+    _configure_live_review(monkeypatch, client)
+    context = AuthContext(
+        principal="operator", canonical_principal="operator", roles=("admin",),
+        event_ingress=None, trigger="user_message", channel_id="operator",
+        interactivity=None,
+    )
+
+    resolved = resolve_review_state_for_context(context, "owner/repo", 1291)
+
+    assert resolved.pr_number == 1291
+    assert resolved.action_scope.principal == "reviewer"
+    assert client.calls == [("snapshot", "owner/repo", 1291)]
 
 
 def test_scope_refusal_escapes_hostile_requested_repository(
