@@ -249,6 +249,12 @@ _SINK_CATEGORY_MAP: dict[str, SinkCategory] = {
     "repo_push": SinkCategory.FORGE,
 }
 
+SHELL_PROCESS_TOOL_NAMES: frozenset[str] = frozenset(
+    name
+    for name, category in _SINK_CATEGORY_MAP.items()
+    if category is SinkCategory.SHELL_PROCESS
+)
+
 _TOOL_FLOW_MAP: dict[str, ToolFlowDirection] = {
     # Native model tools. This is intentionally exhaustive rather than derived
     # from the sink map: startup checks the assembled surface against this map,

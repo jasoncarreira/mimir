@@ -37,6 +37,7 @@ from mimir.pollers import (
     PollerConfig,
     PollerOverridesValidationError,
     _CircuitBreakerState,
+    _cb_record_failure,
     _circuit_breakers,
     _github_author_is_trusted,
     _github_content_author,
@@ -4567,6 +4568,35 @@ async def test_circuit_breaker_open_suppresses_subsequent_runs(tmp_path, home, c
 
 
 @pytest.mark.asyncio
+async def test_circuit_breaker_deadline_ignores_wall_clock_step(
+    tmp_path, home, clear_circuit_breakers, monkeypatch,
+):
+    cfg = _ok_poller_cfg(tmp_path, name="cb-monotonic")
+    monotonic_now = [100.0]
+    wall_now = [1_000.0]
+    monkeypatch.setattr("mimir.pollers.time.monotonic", lambda: monotonic_now[0])
+    monkeypatch.setattr("mimir.pollers.time.time", lambda: wall_now[0])
+
+    for _ in range(POLLER_CIRCUIT_BREAKER_THRESHOLD):
+        _cb_record_failure(cfg.name)
+    deadline = 100.0 + POLLER_CIRCUIT_BREAKER_BACKOFF_SECONDS
+    assert _circuit_breakers[cfg.name].disabled_until == deadline
+
+    wall_now[0] = 100_000.0
+    await run_poller(cfg, enqueue=_CapturingEnqueue())
+    assert _circuit_breakers[cfg.name].disabled_until == deadline
+
+    wall_now[0] = -100_000.0
+    monotonic_now[0] = deadline + 1.0
+    await run_poller(cfg, enqueue=_CapturingEnqueue())
+
+    state = _circuit_breakers[cfg.name]
+    assert state.consecutive_failures == 0
+    assert state.disabled_until == 0.0
+    assert any(e["type"] == "poller_circuit_open" for e in _read_events(home))
+
+
+@pytest.mark.asyncio
 async def test_circuit_breaker_resets_after_successful_run(tmp_path, home, clear_circuit_breakers):
     """A successful run (exit 0) resets the circuit-breaker state so the
     poller can fail again without carrying over the prior failure count.
@@ -4632,8 +4662,8 @@ async def test_circuit_breaker_rearms_after_backoff_expiry(
     for _ in range(POLLER_CIRCUIT_BREAKER_THRESHOLD):
         await run_poller(cfg, enqueue=enq)
     state = _circuit_breakers[cfg.name]
-    assert state.disabled_until > time.time()
-    state.disabled_until = time.time() - 1.0
+    assert state.disabled_until > time.monotonic()
+    state.disabled_until = time.monotonic() - 1.0
 
     # The poller is still hard-down: this run executes (circuit no
     # longer open), fails, and pushes the count PAST the threshold —
@@ -4641,7 +4671,7 @@ async def test_circuit_breaker_rearms_after_backoff_expiry(
     await run_poller(cfg, enqueue=enq)
     state = _circuit_breakers[cfg.name]
     assert state.consecutive_failures == POLLER_CIRCUIT_BREAKER_THRESHOLD + 1
-    assert state.disabled_until > time.time(), (
+    assert state.disabled_until > time.monotonic(), (
         "circuit must re-open on every failure at/past the threshold "
         "(chainlink #409) — exact-equality arming storms forever after "
         "the first backoff expires"

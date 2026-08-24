@@ -933,25 +933,33 @@ class ChainlinkClaims:
             labels.update(str(name) for name in raw_labels)
         return labels
 
-    def _issue_has_label(self, issue_id: int, label: str) -> bool:
+    def _issue_has_label(
+        self,
+        issue_id: int,
+        label: str,
+        *,
+        default_on_unavailable: bool = True,
+    ) -> bool:
         """Best-effort current-label check for reaper race avoidance.
 
         Reaper discovery is necessarily two-step (list in-progress, then inspect
         comments). A worker can transition the issue to review/blocked between
         discovery and ``locks steal``. When ``issue show --json`` exposes labels,
         refuse to relabel anything no longer in-progress. If the label shape is
-        unavailable, preserve the prior behavior rather than disabling reaping.
+        unavailable, callers choose the safe default for their operation. The
+        in-progress race guards preserve prior behavior with the default True;
+        exclusion predicates such as the epic guard use False.
         """
         result = self._run("issue", "show", str(issue_id), "--json", check=False)
         if result.returncode != 0:
-            return True
+            return default_on_unavailable
         try:
             data = json.loads(result.stdout or "{}")
         except json.JSONDecodeError:
-            return True
+            return default_on_unavailable
         raw_labels = data.get("labels")
         if raw_labels is None:
-            return True
+            return default_on_unavailable
         labels: set[str] = set()
         if isinstance(raw_labels, list):
             for item in raw_labels:
@@ -1167,7 +1175,13 @@ class ChainlinkClaims:
         records-in transform that's trivial to unit-test.
         """
         latest: dict[int, ClaimRecord] = {}
-        issue_ids = set(self.issue_ids_with_label("worklink:in-progress"))
+        discovery_skipped: dict[str, int] = {}
+        try:
+            issue_ids = set(self._list_issue_ids("worklink:in-progress"))
+        except RuntimeError as exc:
+            log.warning("Worklink reaper issue discovery failed: %s", exc)
+            issue_ids = set()
+            discovery_skipped["issue_discovery_failed"] = 1
         try:
             # Locks are the authoritative reservation surface. Including them
             # recovers terminal-phase leaks after transition removed in-progress;
@@ -1175,14 +1189,27 @@ class ChainlinkClaims:
             issue_ids.update(self._active_worklink_lock_ids(require_identity=True))
         except RuntimeError as exc:
             log.warning("Worklink reaper lock discovery failed: %s", exc)
+            discovery_skipped["lock_discovery_failed"] = 1
         for issue_id in sorted(issue_ids):
-            if self._issue_has_label(issue_id, WORKLINK_EPIC_LABEL):
+            if self._issue_has_label(
+                issue_id,
+                WORKLINK_EPIC_LABEL,
+                default_on_unavailable=False,
+            ):
                 continue
             for record in claim_records_from_comments(self._issue_comments(issue_id)):
                 current = latest.get(record.issue_id)
                 if current is None or _claim_is_newer(record, current):
                     latest[record.issue_id] = record
-        return self.reap_stale_claims(latest.values(), ttl=ttl)
+        result = self.reap_stale_claims(latest.values(), ttl=ttl)
+        if not discovery_skipped:
+            return result
+        return ReapResult(
+            reaped=result.reaped,
+            examined=result.examined,
+            skipped={**discovery_skipped, **result.skipped},
+            skipped_issue_ids=result.skipped_issue_ids,
+        )
 
     def _attempts_exhausted(self, issue_id: int, attempts: int) -> None:
         self._run("issue", "unlabel", str(issue_id), "worklink:ready", check=False)

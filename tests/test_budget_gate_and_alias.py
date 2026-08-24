@@ -3144,10 +3144,10 @@ async def test_middleware_catches_unregistered_tools():
     try:
         # First call: deepagents built-in shell_exec — ``tool`` would
         # be the deepagents-supplied tool. Passes the cap.
-        req1 = _make_request("shell_exec", "id-a")
+        req1 = _make_request("shell_exec", "id-a", args={"command": "true"})
         await mw.awrap_tool_call(req1, handler)
         # Second call: at the cap. Same shape, refused.
-        req2 = _make_request("shell_exec", "id-b")
+        req2 = _make_request("shell_exec", "id-b", args={"command": "true"})
         out = await mw.awrap_tool_call(req2, handler)
     finally:
         reset_current_turn(token)
@@ -3351,7 +3351,10 @@ async def test_admin_gate_missing_context_allows_sensitive_tool_when_not_enforce
         handler_calls += 1
         return ToolMessage(content="ran", tool_call_id=req.tool_call["id"])
 
-    out = await mw.awrap_tool_call(_make_request("shell_exec", "id-no-enforce"), handler)
+    out = await mw.awrap_tool_call(
+        _make_request("shell_exec", "id-no-enforce", args={"command": "true"}),
+        handler,
+    )
 
     assert isinstance(out, ToolMessage)
     assert out.content == "ran"
@@ -3791,8 +3794,14 @@ async def test_middleware_emits_tool_error_for_budget_denial(
     ctx = _make_ctx(budget=1)
     token = set_current_turn(ctx)
     try:
-        await mw.awrap_tool_call(_make_request("shell_exec", "id-1"), handler)
-        await mw.awrap_tool_call(_make_request("shell_exec", "id-2"), handler)
+        await mw.awrap_tool_call(
+            _make_request("shell_exec", "id-1", args={"command": "true"}),
+            handler,
+        )
+        await mw.awrap_tool_call(
+            _make_request("shell_exec", "id-2", args={"command": "true"}),
+            handler,
+        )
     finally:
         reset_current_turn(token)
 

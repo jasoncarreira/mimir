@@ -568,8 +568,8 @@ class _CircuitBreakerState:
 
     ``consecutive_failures`` counts runs that ended in a non-zero exit,
     timeout, or subprocess launch error since the last clean exit.
-    ``disabled_until`` is a Unix timestamp; when it is in the future the
-    poller is suppressed and ``run_poller`` returns immediately.  Both
+    ``disabled_until`` is a monotonic-clock deadline; when it is in the future
+    the poller is suppressed and ``run_poller`` returns immediately.  Both
     fields reset to their defaults on the first clean run after a trip.
     """
 
@@ -602,7 +602,7 @@ def _cb_record_failure(name: str) -> bool:
     # forever after. Every failure at or past the threshold re-arms
     # the window; only the threshold-crossing failure reports a trip.
     if cb.consecutive_failures >= POLLER_CIRCUIT_BREAKER_THRESHOLD:
-        cb.disabled_until = time.time() + POLLER_CIRCUIT_BREAKER_BACKOFF_SECONDS
+        cb.disabled_until = time.monotonic() + POLLER_CIRCUIT_BREAKER_BACKOFF_SECONDS
         return cb.consecutive_failures == POLLER_CIRCUIT_BREAKER_THRESHOLD
     return False
 
@@ -1763,7 +1763,7 @@ async def run_poller(
     # suppression (operator can see "poller X is tripped" without needing
     # to wonder why it went silent).
     _cb = _circuit_breakers.setdefault(poller.name, _CircuitBreakerState())
-    _now = time.time()
+    _now = time.monotonic()
     if _cb.disabled_until > _now:
         _remaining = int(_cb.disabled_until - _now)
         await log_event(

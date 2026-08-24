@@ -1437,10 +1437,18 @@ def _check_prohibited(tool_name: str, request: "ToolCallRequest") -> str | None:
     if not is_bash_tool(tool_name):
         return None
     tc = getattr(request, "tool_call", None) or {}
-    args = tc.get("args") or {}
-    command = args.get("command", "")
-    if not command:
-        return None
+    args = tc.get("args") if isinstance(tc, dict) else None
+    command = None
+    if isinstance(args, dict):
+        command = next(
+            (args[name] for name in ("command", "cmd", "script") if name in args),
+            None,
+        )
+    if not isinstance(command, str) or not command.strip():
+        return (
+            "PROHIBITED_ACTION: shell tool call has no non-empty string "
+            "command, cmd, or script argument; refused because it cannot be screened"
+        )
     return check_prohibited_bash(command)
 
 
