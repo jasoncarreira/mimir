@@ -212,6 +212,26 @@ async def test_log_redacts_token_shaped_values_recursively(tmp_path: Path):
 
 
 @pytest.mark.asyncio
+async def test_part_a_log_payload_failures_never_reach_caller(tmp_path: Path):
+    class RaisingRepr:
+        def __str__(self) -> str:
+            raise ValueError("cannot stringify")
+
+        def __repr__(self) -> str:
+            raise ValueError("cannot represent")
+
+    path = tmp_path / "events.jsonl"
+    logger = EventLogger(path, session_id="proc-bad-payload")
+    cyclic: dict[str, object] = {}
+    cyclic["self"] = cyclic
+
+    await logger.log("bad_repr", value=RaisingRepr())
+    await logger.log("cyclic", value=cyclic)
+
+    assert not path.exists()
+
+
+@pytest.mark.asyncio
 async def test_event_logger_redacts_yaml_block_scalars_without_erasing_context(
     tmp_path: Path,
 ) -> None:

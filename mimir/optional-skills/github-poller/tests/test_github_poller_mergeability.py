@@ -239,3 +239,101 @@ def test_attempt_budget_backs_off_then_reports_named_exhaustion(monkeypatch, eve
     assert cursor["42"]["attempts"] == cap + 1
     assert events[0]["signal"] == "pr_mergeability_rebase_gave_up"
     assert events[0]["reason"] == "behind_base"
+
+
+# --- chainlink #1433: per-tick reconciliation bound -------------------------
+
+
+def _patch_many(monkeypatch, numbers, *, mergeable=False, behind=2):
+    listed = [_pr(mergeable=None, number=n) for n in numbers]
+    details = {n: _pr(mergeable=mergeable, number=n) for n in numbers}
+
+    def fake_api(endpoint: str, token: str):
+        if endpoint.endswith("/reviews"):
+            return []
+        if "/compare/" in endpoint:
+            return {"behind_by": behind}
+        if "pulls?state=open" in endpoint:
+            return listed
+        if "/pulls/" in endpoint:
+            return details[int(endpoint.rsplit("/", 1)[1])]
+        raise AssertionError(endpoint)
+
+    monkeypatch.setattr(poller, "_gh_api", fake_api)
+
+
+def test_truncated_mergeability_pass_preserves_skipped_cursor_entries(
+    monkeypatch, events,
+):
+    """A skipped PR must keep its prior entry — the pass rebuilds its cursor
+    from scratch, so an omitted key would rewind the rebase attempt count."""
+    numbers = [41, 42, 43, 44, 45]
+    _patch_many(monkeypatch, numbers)
+    prior = {
+        str(n): {
+            "head_sha": HEAD,
+            "base_sha": BASE,
+            "reason": "conflicting",
+            "attempts": 2,
+            "last_attempt_at": "2026-07-30T12:00:00Z",
+        }
+        for n in numbers
+    }
+
+    spent = poller.TickBudget(deadline_seconds=0.0)
+    count, cursor = poller._check_own_mergeability(
+        "o/r", "token", "mimir-bot", prior, now=NOW,
+        attempt_budget=[10], tick_budget=spent,
+    )
+    assert spent.truncated == {
+        "mergeability": len(numbers) - poller.PR_RECONCILE_MIN_PER_PASS,
+    }
+    # Reconciled PRs got fresh entries; truncated ones were carried over verbatim
+    # so their attempt count and retry floor survive the skip.
+    assert sorted(cursor) == sorted(str(n) for n in numbers)
+    for n in numbers[poller.PR_RECONCILE_MIN_PER_PASS:]:
+        assert cursor[str(n)] == prior[str(n)]
+    assert count == poller.PR_RECONCILE_MIN_PER_PASS
+
+
+def test_unbudgeted_mergeability_pass_reconciles_every_pr(monkeypatch, events):
+    """The bound is inert when the tick has time left (attempt budget raised so
+    it is not the thing doing the limiting)."""
+    numbers = [41, 42, 43]
+    _patch_many(monkeypatch, numbers)
+    fresh = poller.TickBudget(deadline_seconds=600.0)
+    count, cursor = poller._check_own_mergeability(
+        "o/r", "token", "mimir-bot", {}, now=NOW,
+        attempt_budget=[10], tick_budget=fresh,
+    )
+    assert fresh.truncated == {}
+    assert sorted(cursor) == [str(n) for n in numbers]
+    assert count == len(numbers)
+
+
+def test_spent_attempt_budget_still_costs_api_calls_without_the_tick_bound(
+    monkeypatch, events,
+):
+    """Why the tick bound is needed here at all: an exhausted attempt budget
+    `continue`s rather than breaking, so every remaining PR is still fetched."""
+    numbers = [41, 42, 43, 44, 45]
+    _patch_many(monkeypatch, numbers)
+    calls: list[str] = []
+    real = poller._gh_api
+    monkeypatch.setattr(
+        poller, "_gh_api",
+        lambda ep, tok: (calls.append(ep), real(ep, tok))[1],
+    )
+    poller._check_own_mergeability(
+        "o/r", "token", "mimir-bot", {}, now=NOW, attempt_budget=[1],
+    )
+    detail_calls = [c for c in calls if c.endswith(tuple(f"/pulls/{n}" for n in numbers))]
+    assert len(detail_calls) == len(numbers)  # all five, for one emission
+
+    calls.clear()
+    poller._check_own_mergeability(
+        "o/r", "token", "mimir-bot", {}, now=NOW, attempt_budget=[1],
+        tick_budget=poller.TickBudget(deadline_seconds=0.0),
+    )
+    bounded = [c for c in calls if c.endswith(tuple(f"/pulls/{n}" for n in numbers))]
+    assert len(bounded) == poller.PR_RECONCILE_MIN_PER_PASS

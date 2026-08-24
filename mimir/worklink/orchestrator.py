@@ -42,7 +42,7 @@ from .compute import (
     LocalSubprocessComputeBackend,
     with_worker_environment,
 )
-from .claims import ChainlinkClaims, ClaimRecord
+from .claims import ChainlinkClaims, ClaimRecord, WORKLINK_EPIC_LABEL
 from .evidence import (
     EvidenceValidation,
     TestResult,
@@ -645,7 +645,7 @@ class WorklinkRunner:
                 issue.comments,
                 labels=issue.labels,
                 max_active_locks=config.defaults.max_concurrent if autonomous else None,
-                exclude_active_label="worklink:epic",
+                exclude_active_label=WORKLINK_EPIC_LABEL,
                 before_claim=record_claiming,
             )
         except Exception:
@@ -1638,7 +1638,7 @@ class WorklinkRunner:
             issue.comments,
             labels=issue.labels,
             max_active_locks=factory_max_concurrent(),
-            active_label="worklink:epic",
+            active_label=WORKLINK_EPIC_LABEL,
             before_claim=prepare_factory_claim,
         )
         if claim.attempts_exhausted:
@@ -2161,6 +2161,13 @@ class WorklinkRunner:
         if status is None:
             raise WorklinkError("factory terminal projection is missing")
         if status.is_parked:
+            claims.transition_issue(
+                issue.issue_id,
+                status="blocked",
+                review_ready=False,
+                attempt=claim_record.budget_attempt or claim_record.attempt,
+                reason="factory run is parked",
+            )
             return WorklinkRunResult(
                 issue.issue_id,
                 factory_record.attempt,
@@ -2916,12 +2923,35 @@ def run_worklink_epic(
     issue_id: int,
     autonomous: bool = False,
 ) -> WorklinkRunResult:
-    return asyncio.run(
-        WorklinkRunner(home=home, repo=repo).run_epic(
-            issue_id,
+    try:
+        result = asyncio.run(
+            WorklinkRunner(home=home, repo=repo).run_epic(
+                issue_id,
+                autonomous=autonomous,
+            )
+        )
+    except Exception as exc:
+        _record_run_failure(
+            home=home,
+            issue_id=issue_id,
+            attempt=None,
+            error=exc,
+            exit_status=1,
             autonomous=autonomous,
         )
-    )
+        raise
+    if result.status == "failed":
+        _record_run_failure(
+            home=home,
+            issue_id=issue_id,
+            attempt=result.attempt,
+            error=result.reason or "Worklink epic run failed",
+            exit_status=1,
+            autonomous=autonomous,
+        )
+    elif result.status in {"completed", "review_ready", "blocked", "needs-human"}:
+        _record_run_success(home, issue_id)
+    return result
 
 
 def _persist_run_state(

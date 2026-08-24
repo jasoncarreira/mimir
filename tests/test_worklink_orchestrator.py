@@ -51,6 +51,7 @@ from mimir.worklink.orchestrator import (
     render_work_item,
     render_work_order,
     run_worklink,
+    run_worklink_epic,
     validate_leaf,
 )
 
@@ -572,6 +573,38 @@ def test_manual_success_clears_autonomous_failure_ledger(
     assert result.status == "completed"
     assert load_failure_state(state_dir)["issues"]["441"]["active"] is False
     assert not (tmp_path / "ambient-state").exists()
+
+
+def test_epic_dispatch_failure_enters_and_clears_ledger(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import mimir.worklink.orchestrator as orchestrator
+    from mimir.worklink.dispatch_failures import (
+        dispatch_failure_state_dir,
+        load_failure_state,
+        pending_failure_alerts,
+    )
+
+    async def failed_epic(self: WorklinkRunner, issue_id: int, **_: object):
+        return orchestrator.WorklinkRunResult(
+            issue_id, 2, "failed", reason="retained factory record cannot be bound"
+        )
+
+    monkeypatch.setattr(WorklinkRunner, "run_epic", failed_epic)
+    result = run_worklink_epic(home=tmp_path, repo=tmp_path, issue_id=700, autonomous=True)
+
+    assert result.status == "failed"
+    backed_off, alerts = pending_failure_alerts(dispatch_failure_state_dir(tmp_path))
+    assert backed_off == {700}
+    assert [alert["issue_id"] for alert in alerts] == [700]
+
+    async def parked_epic(self: WorklinkRunner, issue_id: int, **_: object):
+        return orchestrator.WorklinkRunResult(issue_id, 3, "needs-human")
+
+    monkeypatch.setattr(WorklinkRunner, "run_epic", parked_epic)
+    run_worklink_epic(home=tmp_path, repo=tmp_path, issue_id=700, autonomous=False)
+    entry = load_failure_state(dispatch_failure_state_dir(tmp_path))["issues"]["700"]
+    assert entry["active"] is False
 
 
 def test_validate_leaf_refuses_missing_planner_template() -> None:
@@ -3562,6 +3595,11 @@ def _factory_lifecycle_record(sandbox: Path, handle: LaunchHandle) -> FactoryRun
     )
 
 
+class _FactoryLifecycleClaims:
+    def transition_issue(self, *args: object, **kwargs: object) -> None:
+        return None
+
+
 @pytest.mark.parametrize("lifecycle", ["running", "needs-human", "blocked", "partial"])
 def test_factory_status_binding_allows_null_base_before_completion(
     tmp_path: Path,
@@ -3696,7 +3734,7 @@ def test_factory_supervision_drains_exact_handle_while_status_is_polled(
         WorklinkRunner(home=tmp_path, repo=tmp_path)._supervise_factory_070(
             issue=IssueContext(700, "epic", "build", {"worklink:epic"}),
             claim_record=ClaimRecord(700, 1, "agent", datetime.now(UTC)),
-            claims=object(),
+            claims=_FactoryLifecycleClaims(),
             backend=Backend(),
             compute=Compute(),
             factory_record=_factory_lifecycle_record(sandbox, handle),
@@ -3755,7 +3793,7 @@ def test_factory_supervision_waits_for_manifest_then_proceeds(tmp_path: Path) ->
         WorklinkRunner(home=tmp_path, repo=tmp_path)._supervise_factory_070(
             issue=IssueContext(700, "epic", "build", {"worklink:epic"}),
             claim_record=ClaimRecord(700, 1, "agent", datetime.now(UTC)),
-            claims=object(),
+            claims=_FactoryLifecycleClaims(),
             backend=Backend(),
             compute=Compute(),
             factory_record=_factory_lifecycle_record(sandbox, handle),
@@ -4411,6 +4449,50 @@ def test_factory_completion_failure_never_transitions_to_review(
     assert transitions == []
 
 
+def test_factory_needs_human_transitions_epic_to_parked_tracker_state(
+    tmp_path: Path,
+) -> None:
+    sandbox = tmp_path / "sandbox"
+    sandbox.mkdir()
+    transitions: list[tuple[int, dict[str, object]]] = []
+
+    class Claims:
+        def transition_issue(self, issue_id: int, **kwargs: object) -> None:
+            transitions.append((issue_id, kwargs))
+
+    record = _factory_lifecycle_record(sandbox, LaunchHandle("local_subprocess", "123", 456))
+    record = record.observed(
+        _factory_lifecycle_status(sandbox, status="needs-human"),
+        datetime.now(UTC).isoformat(),
+    )
+    result = asyncio.run(
+        WorklinkRunner(home=tmp_path, repo=tmp_path)._finish_factory_070(
+            issue=IssueContext(700, "epic", "build", {"worklink:epic"}),
+            claim_record=ClaimRecord(700, 1, "agent", datetime.now(UTC), budget_attempt=1),
+            claims=Claims(),
+            backend=object(),
+            compute=object(),
+            factory_record=record,
+            test_cmd="pytest -q",
+            runner=lambda args: cp(args),
+            started_at=datetime.now(UTC),
+        )
+    )
+
+    assert result.status == "needs-human"
+    assert transitions == [
+        (
+            700,
+            {
+                "status": "blocked",
+                "review_ready": False,
+                "attempt": 1,
+                "reason": "factory run is parked",
+            },
+        )
+    ]
+
+
 @pytest.mark.parametrize(
     ("lock", "dead_lock", "action"),
     [("absent", False, "claim"), ("stale", True, "steal"), ("fresh", False, None)],
@@ -4548,6 +4630,9 @@ def test_factory_recovery_uses_run_id_first_lock_resume_and_authoritative_status
 
         def _lock_still_held_by(self, record: ClaimRecord) -> bool:
             return record is claim
+
+        def transition_issue(self, *args: object, **kwargs: object) -> None:
+            return None
 
     compute = Compute()
     result = asyncio.run(

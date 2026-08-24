@@ -6,6 +6,7 @@ import asyncio
 import json as _json
 import shutil
 from datetime import datetime, timezone
+from unittest import mock
 from pathlib import Path
 
 import pytest
@@ -1963,7 +1964,7 @@ async def test_fire_poller_serializes_through_semaphore(
     max_in_flight = 0
     lock = asyncio.Lock()
 
-    async def fake_run_poller(poller, enqueue, home=None):
+    async def fake_run_poller(poller, enqueue, home=None, timeout=None):
         assert home is sched._home
         nonlocal in_flight, max_in_flight
         async with lock:
@@ -2008,7 +2009,7 @@ async def test_fire_poller_passes_scheduler_home_to_run_poller(
 
     captured = {}
 
-    async def fake_run_poller(poller, enqueue, home=None):
+    async def fake_run_poller(poller, enqueue, home=None, timeout=None):
         captured["poller"] = poller.name
         captured["home"] = home
 
@@ -2060,7 +2061,7 @@ async def test_fire_poller_resheds_after_acquiring_semaphore(
 
     ran = False
 
-    async def fake_run_poller(poller, enqueue, home=None):
+    async def fake_run_poller(poller, enqueue, home=None, timeout=None):
         nonlocal ran
         ran = True
 
@@ -2607,6 +2608,38 @@ async def test_commitments_due_check_error_includes_traceback(
     assert "traceback" in evt, "traceback field missing from error event (chainlink #99)"
     assert "RuntimeError" in evt["traceback"]
     assert "boom from test" in evt["traceback"]
+
+
+@pytest.mark.asyncio
+async def test_part_c_nonempty_failed_sweep_emits_rollup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    import json
+    import mimir.commitments.poller as poller_mod
+    from mimir.commitments.poller import DueCheckResult
+
+    events_path = tmp_path / "events.jsonl"
+    init_logger(events_path, session_id="failed-commitment-sweep")
+
+    async def failed_sweep(*args, **kwargs):
+        return DueCheckResult(scanned=2, failed=2)
+
+    monkeypatch.setattr(poller_mod, "check_due_and_expired", failed_sweep)
+
+    async def noop(_event):
+        return True
+
+    sched = Scheduler(scheduler_yaml=tmp_path / "s.yaml", enqueue=noop)
+    sched.add_commitments_due_check_job(object(), "*/5 * * * *")  # type: ignore[arg-type]
+    job = sched._scheduler.get_job("commitments-due-check")
+    assert job is not None
+    await job.func()
+
+    events = [json.loads(line) for line in events_path.read_text().splitlines()]
+    rollups = [e for e in events if e["type"] == "commitments_due_check_ok"]
+    assert len(rollups) == 1
+    assert rollups[0]["scanned"] == 2
+    assert rollups[0]["failed"] == 2
 
 
 # ─── saga_consolidate_error traceback (PR #345 follow-up) ─────────────
@@ -4049,7 +4082,7 @@ async def test_fire_poller_suppressed_skips_subprocess_and_emits(
 
     ran: list[str] = []
 
-    async def fake_run_poller(poller, enqueue, home=None):
+    async def fake_run_poller(poller, enqueue, home=None, timeout=None):
         ran.append(poller.name)
 
     monkeypatch.setattr("mimir.scheduler.run_poller", fake_run_poller)
@@ -4099,7 +4132,7 @@ async def test_fire_poller_budget_suppressed_skips_subprocess_and_emits(
 
     ran: list[str] = []
 
-    async def fake_run_poller(poller, enqueue, home=None):
+    async def fake_run_poller(poller, enqueue, home=None, timeout=None):
         ran.append(poller.name)
 
     monkeypatch.setattr("mimir.scheduler.run_poller", fake_run_poller)
@@ -4148,7 +4181,7 @@ async def test_fire_poller_budget_under_limit_still_runs(tmp_path: Path, monkeyp
 
     ran: list[str] = []
 
-    async def fake_run_poller(poller, enqueue, home=None):
+    async def fake_run_poller(poller, enqueue, home=None, timeout=None):
         ran.append(poller.name)
 
     monkeypatch.setattr("mimir.scheduler.run_poller", fake_run_poller)
@@ -4185,7 +4218,7 @@ async def test_fire_poller_budget_caps_events_enqueued_by_one_fire(
     sched.add_poller_jobs(skills)
     results: list[bool] = []
 
-    async def fake_run_poller(poller, enqueue, home=None):
+    async def fake_run_poller(poller, enqueue, home=None, timeout=None):
         for index in range(40):
             results.append(await enqueue(AgentEvent(
                 trigger="poller", channel_id=f"poller:{poller.name}",
@@ -4222,7 +4255,7 @@ async def test_fire_poller_budget_admits_all_events_within_headroom(
     )
     sched.add_poller_jobs(skills)
 
-    async def fake_run_poller(poller, enqueue, home=None):
+    async def fake_run_poller(poller, enqueue, home=None, timeout=None):
         for index in range(2):
             assert await enqueue(AgentEvent(
                 trigger="poller", channel_id=f"poller:{poller.name}",
@@ -4282,7 +4315,7 @@ async def test_fire_poller_budget_checks_do_not_block_loop_and_reuse_snapshot(
 
     ran: list[str] = []
 
-    async def fake_run_poller(poller, enqueue, home=None):
+    async def fake_run_poller(poller, enqueue, home=None, timeout=None):
         ran.append(poller.name)
 
     monkeypatch.setattr("mimir.scheduler.aggregate_poller_turn_usage", slow_aggregate)
@@ -4349,7 +4382,7 @@ async def test_fire_poller_budget_suppresses_on_external_usage(
 
     ran: list[str] = []
 
-    async def fake_run_poller(poller, enqueue, home=None):
+    async def fake_run_poller(poller, enqueue, home=None, timeout=None):
         ran.append(poller.name)
 
     monkeypatch.setattr("mimir.scheduler.run_poller", fake_run_poller)
@@ -4380,7 +4413,7 @@ async def test_fire_poller_fires_when_arbiter_clear(
 
     ran: list[str] = []
 
-    async def fake_run_poller(poller, enqueue, home=None):
+    async def fake_run_poller(poller, enqueue, home=None, timeout=None):
         ran.append(poller.name)
 
     monkeypatch.setattr("mimir.scheduler.run_poller", fake_run_poller)
@@ -4416,7 +4449,7 @@ async def test_fire_poller_fail_open_when_arbiter_raises(
 
     ran: list[str] = []
 
-    async def fake_run_poller(poller, enqueue, home=None):
+    async def fake_run_poller(poller, enqueue, home=None, timeout=None):
         ran.append(poller.name)
 
     monkeypatch.setattr("mimir.scheduler.run_poller", fake_run_poller)
@@ -4861,3 +4894,151 @@ def test_scheduler_job_deliver_unset_not_emitted():
     job = SchedulerJob.from_yaml_entry({"name": "t2", "prompt": "x", "cron": "0 * * * *"})
     assert job.deliver is None
     assert "deliver" not in job.to_yaml_entry()
+
+
+@pytest.mark.asyncio
+async def test_effective_poller_timeout_clamps_to_cadence(tmp_path, monkeypatch):
+    """The runtime enforcement, which a test over bundled manifests cannot give.
+
+    Pollers are discovered from ``<home>/skills/**/pollers.json`` and
+    ``pollers-overrides.yaml`` may replace a cron, so a locally installed or
+    overridden fast poller never appears in this repo. ``max_instances=1`` means a
+    run longer than the cadence swallows the next fire, so the cap is clamped per
+    poller against the cadence it was actually registered with.
+    """
+    from mimir.pollers import POLLER_TIMEOUT_SECONDS, PollerConfig
+    from mimir.scheduler import POLLER_CADENCE_MARGIN_SECONDS
+
+    async def noop(event: AgentEvent) -> bool:
+        return True
+
+    sched = Scheduler(scheduler_yaml=tmp_path / "s.yaml", enqueue=noop)
+    events: list[tuple[str, dict]] = []
+
+    async def fake_log_event(name: str, **kw):
+        events.append((name, kw))
+
+    monkeypatch.setattr("mimir.scheduler.log_event", fake_log_event)
+
+    def cfg(cron: str) -> PollerConfig:
+        return PollerConfig(
+            name=f"p-{cron.replace(' ', '_')}", command="x", cron=cron,
+            env={}, skill_dir=tmp_path,
+        )
+
+    # Every minute: 60s cadence, so the 120s cap must not apply.
+    fast = await sched._effective_poller_timeout(cfg("* * * * *"))
+    assert fast == 60.0 - POLLER_CADENCE_MARGIN_SECONDS
+    assert fast < POLLER_TIMEOUT_SECONDS
+    clamped = [kw for name, kw in events if name == "poller_timeout_clamped_to_cadence"]
+    assert len(clamped) == 1, "clamping was not reported to the operator"
+    assert clamped[0]["poller"] == "p-*_*_*_*_*"
+    assert clamped[0]["cadence_seconds"] == 60.0
+
+    # Every 15 minutes: far above the cap, so the cap applies unchanged and
+    # nothing is reported.
+    events.clear()
+    slow = await sched._effective_poller_timeout(cfg("*/15 * * * *"))
+    assert slow == float(POLLER_TIMEOUT_SECONDS)
+    assert events == []
+
+
+def test_cron_min_gap_bounds_sparse_and_irregular_schedules():
+    """The cadence bound comes from the cron fields, not from simulating fires.
+
+    Simulation cannot establish it. Gregorian recurrence is unbounded, so
+    ``0,2 0 29 2 *`` — two leap-day fires two minutes apart — has its next pair
+    years out; a finite horizon that ends first yields nothing, and falling back
+    to the framework cap hands a 120s timeout to a 120s cadence. A fixed prefix
+    of samples fails differently: with ``0,9,18,27,28,42,51 * * * *`` the
+    one-minute gap sits outside the first five fires for 15 of 60 start minutes.
+    """
+    from mimir.scheduler import _cron_min_gap_seconds
+
+    # Sparse: the close pair is years away and no horizon reaches it.
+    assert _cron_min_gap_seconds("0,2 0 29 2 *") == 120.0
+    # Irregular: the tight pair is not among the first fires.
+    assert _cron_min_gap_seconds("0,9,18,27,28,42,51 * * * *") == 60.0
+    # Wrap across the hour boundary counts.
+    assert _cron_min_gap_seconds("0,59 * * * *") == 60.0
+    # A bare value with a step means "from a, every step" — more values, tighter
+    # gap, which is the safe direction for a lower bound.
+    assert _cron_min_gap_seconds("5/10 * * * *") == 600.0
+    # Single minute: the hour field bounds it. Single hour: at most daily.
+    assert _cron_min_gap_seconds("0 9,10 * * *") == 3600.0
+    assert _cron_min_gap_seconds("0 9 * * *") == 86400.0
+    # Shipped cadences.
+    assert _cron_min_gap_seconds("*/15 * * * *") == 900.0
+    assert _cron_min_gap_seconds("*/10 * * * *") == 600.0
+    # Unparseable is reported, not guessed.
+    assert _cron_min_gap_seconds("not a cron") is None
+
+
+@pytest.mark.asyncio
+async def test_effective_timeout_never_exceeds_a_sparse_cadence(tmp_path):
+    """The invariant, on the schedule that broke the horizon approach.
+
+    A 120s cadence must not receive the 120s framework cap: the run would span
+    the next fire and `max_instances=1` would skip it.
+    """
+    from mimir.pollers import POLLER_TIMEOUT_SECONDS, PollerConfig
+
+    async def noop(event: AgentEvent) -> bool:
+        return True
+
+    sched = Scheduler(scheduler_yaml=tmp_path / "s.yaml", enqueue=noop)
+    got = await sched._effective_poller_timeout(PollerConfig(
+        name="leap", command="x", cron="0,2 0 29 2 *", env={}, skill_dir=tmp_path,
+    ))
+    assert got < 120.0, "a 120s cadence was handed a timeout that spans its next fire"
+    assert got < float(POLLER_TIMEOUT_SECONDS)
+
+
+@pytest.mark.asyncio
+async def test_unparseable_cron_degrades_conservatively(tmp_path):
+    """An unknown cadence must clamp toward safety, not to the full cap."""
+    from mimir.pollers import POLLER_TIMEOUT_SECONDS, PollerConfig
+    from mimir.scheduler import CRON_MIN_GRANULARITY_SECONDS
+
+    async def noop(event: AgentEvent) -> bool:
+        return True
+
+    sched = Scheduler(scheduler_yaml=tmp_path / "s.yaml", enqueue=noop)
+    got = await sched._effective_poller_timeout(PollerConfig(
+        name="bad", command="x", cron="not a cron", env={}, skill_dir=tmp_path,
+    ))
+    assert got < float(POLLER_TIMEOUT_SECONDS)
+    assert got <= CRON_MIN_GRANULARITY_SECONDS
+
+
+@pytest.mark.asyncio
+async def test_poller_cadence_is_cached_per_cron(tmp_path):
+    """Consulted on every fire, so a sparse schedule must not rescan each time.
+
+    Also pins that a changed cron invalidates: the key is the cron string, so an
+    edited manifest recomputes rather than serving a stale cadence.
+    """
+    from mimir.pollers import PollerConfig
+
+    async def noop(event: AgentEvent) -> bool:
+        return True
+
+    sched = Scheduler(scheduler_yaml=tmp_path / "s.yaml", enqueue=noop)
+
+    def cfg(cron: str) -> PollerConfig:
+        return PollerConfig(
+            name="p", command="x", cron=cron, env={}, skill_dir=tmp_path,
+        )
+
+    first = sched._poller_cadence_seconds(cfg("*/15 * * * *"))
+    assert ("p", "*/15 * * * *") in sched._poller_cadence_cache
+    assert sched._poller_cadence_seconds(cfg("*/15 * * * *")) == first
+
+    # A different cron is a different key, and is measured on its own terms.
+    assert sched._poller_cadence_seconds(cfg("* * * * *")) == 60.0
+
+
+async def _noop_coro():
+    return None
+
+
