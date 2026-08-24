@@ -2126,8 +2126,14 @@ def build_app(config: Config) -> web.Application:
                         return
                     current_marker["last_unclean_notify_ts"] = time.time()
                     if not write_session_marker(config.home, current_marker):
-                        raise RuntimeError(
-                            "failed to persist unclean-restart notification handoff"
+                        # The unchanged marker intentionally leaves the handoff
+                        # pending for the next boot. Surface the failed persist,
+                        # but do not turn that retryable state into a delayed
+                        # cleanup failure from this background task.
+                        await log_event(
+                            "liveness_unclean_restart_handoff_persist_failed",
+                            prior_started_iso=_prior_session.get("started_iso"),
+                            prior_pid=_prior_session.get("pid"),
                         )
 
                 startup_state.phase = "unclean_restart_notify_handoff"

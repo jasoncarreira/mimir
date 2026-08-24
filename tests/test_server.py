@@ -1350,11 +1350,12 @@ async def test_notify_handoff_marker_failure_stays_retryable(
 
     real_detect = mimir.liveness.detect_unclean_restart
     real_mark = mimir.liveness.mark_session_running
-    app, _ = _controlled_server_app(tmp_path, monkeypatch)
+    app, control = _controlled_server_app(tmp_path, monkeypatch)
     assert real_mark(tmp_path, started_at=1000.0)
 
     monkeypatch.setattr(mimir.liveness, "detect_unclean_restart", real_detect)
     monkeypatch.setattr(mimir.liveness, "mark_session_running", real_mark)
+    monkeypatch.setattr(mimir.liveness, "notify_unclean_restart", AsyncMock())
     monkeypatch.setattr(mimir.liveness, "write_session_marker", lambda *args, **kwargs: False)
 
     await _run_startup(app)
@@ -1364,6 +1365,11 @@ async def test_notify_handoff_marker_failure_stays_retryable(
     assert marker is not None and marker["clean"] is False
     assert marker.get("last_unclean_notify_ts") is None
     await _run_cleanup(app)
+    assert any(
+        kind == "liveness_unclean_restart_handoff_persist_failed"
+        and fields["prior_started_iso"] == "1970-01-01T00:16:40+00:00"
+        for kind, fields in control.event_payloads
+    )
 
 
 @pytest.mark.asyncio
