@@ -124,6 +124,35 @@ def test_malformed_state_file_doesnt_crash(tmp_path: Path):
     assert not tracker.is_paused().paused
 
 
+def test_part_b_pause_persistence_failures_report_once_per_transition(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    from mimir.event_logger import init_logger
+
+    events_path = tmp_path / "events.jsonl"
+    init_logger(events_path, session_id="pause-state-failure")
+    corrupt_path = tmp_path / "corrupt.json"
+    corrupt_path.write_text("{not json")
+
+    first = QuotaPauseTracker(corrupt_path)
+    second = QuotaPauseTracker(corrupt_path)
+    assert first.last_load_ok is False
+    assert second.last_load_ok is False
+
+    def fail_write(*args, **kwargs):
+        raise OSError("read-only home")
+
+    monkeypatch.setattr("mimir.quota_pause.atomic_write_json", fail_write)
+    tracker = QuotaPauseTracker(tmp_path / "pause.json")
+    reset = datetime.now(tz=timezone.utc) + timedelta(hours=1)
+    assert tracker.pause_until(reset) is False
+    assert tracker.pause_until(reset) is False
+
+    events = [json.loads(line) for line in events_path.read_text().splitlines()]
+    assert sum(e["type"] == "quota_pause_state_unreadable" for e in events) == 1
+    assert sum(e["type"] == "quota_state_write_failed" for e in events) == 1
+
+
 def test_state_write_is_atomic(tmp_path: Path):
     """tempfile + rename pattern — leftover tmp files are cleaned up
     on the happy path. Confirms via filesystem state, not behavior."""

@@ -346,9 +346,66 @@ def test_shadow_recall_reports_pre_rrf_candidate_exclusions(
     assert payload["event_ingress"] == "discord"
     assert payload["aggregation"] == "one_event_per_read_operation"
     assert payload["sampling"] == "none"
+    assert payload["mode"] == "shadow"
     serialized = repr(payload)
     assert hidden not in serialized
     assert visible not in serialized
+
+
+@pytest.mark.asyncio
+async def test_same_denied_read_emits_in_shadow_and_enforced_modes(
+    conn: sqlite3.Connection,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    hidden = _store(conn, "hidden", owner="user:bob", visibility="private")
+    events: list[tuple[str, dict]] = []
+    monkeypatch.setattr(
+        "mimir.event_logger.log_event_sync",
+        lambda event_type, **payload: events.append((event_type, payload)),
+    )
+    client = SagaStore(conn=conn, embedding_dim=4)
+
+    shadow_result = await client.get_atoms(
+        [hidden],
+        auth_context=AuthContext(
+            principal="alice",
+            canonical_principal="user:alice",
+            roles=("user",),
+            event_ingress="test",
+            trigger="user_message",
+            channel_id=None,
+            interactivity=None,
+            enforcement_enabled=False,
+        ),
+    )
+    enforced_result = await client.get_atoms(
+        [hidden],
+        auth_context=AuthContext(
+            principal="alice",
+            canonical_principal="user:alice",
+            roles=("user",),
+            event_ingress="test",
+            trigger="user_message",
+            channel_id=None,
+            interactivity=None,
+            enforcement_enabled=True,
+        ),
+    )
+
+    assert [atom["id"] for atom in shadow_result["atoms"]] == [hidden]
+    assert enforced_result == {"atoms": [], "missing": [hidden], "_ifc_sources": []}
+    assert len(events) == 2
+    shadow_event, enforced_event = [payload for _, payload in events]
+    assert (shadow_event["mode"], shadow_event["status"]) == (
+        "shadow",
+        "would_block",
+    )
+    assert (enforced_event["mode"], enforced_event["status"]) == (
+        "enforced",
+        "blocked",
+    )
+    assert shadow_event["resource_counts"] == {"get_atoms": 1}
+    assert enforced_event["resource_counts"] == {"get_atoms": 1}
 
 
 def test_shadow_read_events_aggregate_all_surfaces_once_per_turn(
@@ -1212,3 +1269,38 @@ async def test_shadow_policy_probe_failure_is_reported_without_changing_read(
     assert event["resource_count"] == 0
     assert event["probe_failure_count"] == 1
     assert event["probe_failure_counts"] == {"get_atoms": 1}
+
+
+def test_enforced_probe_failures_emit_once_with_bounded_count(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[tuple[str, dict]] = []
+    monkeypatch.setattr(
+        "mimir.event_logger.log_event_sync",
+        lambda event_type, **payload: events.append((event_type, payload)),
+    )
+    authorization = SagaReadAuthorization(
+        AuthContext(
+            principal="alice",
+            canonical_principal="user:alice",
+            roles=("user",),
+            event_ingress="test",
+            trigger="user_message",
+            channel_id=None,
+            interactivity=None,
+            enforcement_enabled=True,
+        ),
+        "get_atoms",
+    )
+
+    for _ in range(1001):
+        authorization.observe_probe_failure()
+    authorization.finalize()
+
+    assert len(events) == 1
+    event_type, event = events[0]
+    assert event_type == "saga_read_would_block"
+    assert event["mode"] == "enforced"
+    assert event["status"] == "probe_failed"
+    assert event["probe_failure_count"] == 1000
+    assert event["counts_truncated"] is True

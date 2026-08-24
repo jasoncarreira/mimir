@@ -12,7 +12,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Iterable
 
-from ._jsonl_tail import tail_jsonl_records
+from ._jsonl_tail import JsonlReadStatus, tail_jsonl_records
 
 
 # Match the shipped React client's default backfillLimit. Larger explicit
@@ -153,6 +153,7 @@ def read_live_event_items_since(
     limit: int | None = None,
     max_records: int | None = None,
     tail_reader: Callable[[Path], Iterable[dict[str, Any]]] = tail_jsonl_records,
+    read_status: JsonlReadStatus | None = None,
 ) -> list[LiveEventItem]:
     """Read the newest turn-log tail and return live events after ``since``.
 
@@ -160,9 +161,6 @@ def read_live_event_items_since(
     stop once the tail has crossed the acknowledged monotonic cursor instead
     of reparsing/sorting the full retained turn window every second.
     """
-    if not turns_log.is_file():
-        return []
-
     records: list[dict[str, Any]] = []
     record_limit = max_records
     if record_limit is None:
@@ -174,7 +172,12 @@ def read_live_event_items_since(
             record_limit = max(FRESH_BACKFILL_MAX_RECORDS, limit or 0)
     since_ts = _cursor_ts(since)
     try:
-        for record in tail_reader(turns_log):
+        records_newest_first = (
+            tail_reader(turns_log, read_status=read_status)
+            if tail_reader is tail_jsonl_records
+            else tail_reader(turns_log)
+        )
+        for record in records_newest_first:
             if not isinstance(record, dict):
                 continue
             record_ts = _turn_sort_ts(record)
@@ -187,7 +190,9 @@ def read_live_event_items_since(
             records.append(record)
             if len(records) >= record_limit:
                 break
-    except OSError:
+    except OSError as exc:
+        if read_status is not None:
+            read_status.error = exc
         return []
 
     records.reverse()

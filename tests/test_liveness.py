@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import signal
 import time
 from pathlib import Path
@@ -13,6 +14,7 @@ from mimir.liveness import (
     _kill_agent,
     beat_age_seconds,
     detect_unclean_restart,
+    liveness_beat_loop,
     liveness_path,
     mark_clean_shutdown,
     mark_session_running,
@@ -33,9 +35,10 @@ async def test_liveness_beat_loop_writes_off_loop(tmp_path: Path, monkeypatch) -
 
     async def fake_to_thread(func, /, *args, **kwargs):
         calls.append((func, args, kwargs))
-        func(*args, **kwargs)
+        result = func(*args, **kwargs)
         if len(calls) >= 2:
             raise asyncio.CancelledError
+        return result
 
     async def fake_sleep(_interval: float) -> None:
         return None
@@ -43,14 +46,13 @@ async def test_liveness_beat_loop_writes_off_loop(tmp_path: Path, monkeypatch) -
     monkeypatch.setattr(asyncio, "to_thread", fake_to_thread)
     monkeypatch.setattr(asyncio, "sleep", fake_sleep)
 
-    from mimir.liveness import liveness_beat_loop
-
     with pytest.raises(asyncio.CancelledError):
         await liveness_beat_loop(home, interval=60, started_at=1000.0)
 
     assert [call[0] for call in calls] == [write_beat, write_beat]
     assert all(call[1] == (home,) for call in calls)
-    assert all(call[2] == {"started_at": 1000.0} for call in calls)
+    assert all(call[2]["started_at"] == 1000.0 for call in calls)
+    assert all(call[2]["_on_error"] is not None for call in calls)
     beat = read_beat(home)
     assert beat is not None
     assert beat["started_at"] == 1000.0
@@ -71,7 +73,7 @@ def _home(tmp_path: Path) -> Path:
 
 def test_write_and_read_beat(tmp_path: Path) -> None:
     home = _home(tmp_path)
-    write_beat(home, started_at=1000.0)
+    assert write_beat(home, started_at=1000.0) is True
     beat = read_beat(home)
     assert isinstance(beat, dict)
     assert isinstance(beat["ts"], (int, float))
@@ -79,6 +81,113 @@ def test_write_and_read_beat(tmp_path: Path) -> None:
     assert beat["started_at"] == 1000.0
     age = beat_age_seconds(home)
     assert age is not None and 0 <= age < 5
+
+
+@pytest.mark.asyncio
+async def test_beat_loop_records_unwritable_marker_failure(
+    tmp_path: Path, monkeypatch, caplog,
+) -> None:
+    from mimir.event_logger import EventLogger
+
+    home = _home(tmp_path)
+    marker_dir = liveness_path(home).parent
+    marker_dir.chmod(0o500)
+    real_write_text = Path.write_text
+
+    def reject_marker_write(path: Path, *args, **kwargs):
+        if path.parent == marker_dir:
+            raise PermissionError(13, "Permission denied", str(path))
+        return real_write_text(path, *args, **kwargs)
+
+    async def stop_after_first(_interval: float) -> None:
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr(Path, "write_text", reject_marker_write)
+    monkeypatch.setattr(asyncio, "sleep", stop_after_first)
+    events_path = tmp_path / "logs" / "events.jsonl"
+    event_logger = EventLogger(events_path, "test-session")
+    try:
+        with pytest.raises(asyncio.CancelledError):
+            await liveness_beat_loop(
+                home,
+                interval=0,
+                _event_logger=event_logger.log_durable_sync,
+            )
+    finally:
+        marker_dir.chmod(0o700)
+
+    events = [json.loads(line) for line in events_path.read_text().splitlines()]
+    assert len(events) == 1
+    assert events[0]["type"] == "liveness_beat_write_failed"
+    assert events[0]["path"] == str(liveness_path(home))
+    assert "PermissionError" in events[0]["error"]
+    assert "Permission denied" in events[0]["error"]
+    assert "atomic json write" in caplog.text
+    assert "Permission denied" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_beat_loop_emits_once_on_failure_and_recovery(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    import mimir.liveness as liveness
+
+    home = _home(tmp_path)
+    outcomes = iter([False, False, True, True])
+    events: list[tuple[str, dict]] = []
+
+    def fake_write_beat(*_args, **_kwargs) -> bool:
+        return next(outcomes)
+
+    sleeps = 0
+
+    async def fake_sleep(_interval: float) -> None:
+        nonlocal sleeps
+        sleeps += 1
+        if sleeps == 4:
+            raise asyncio.CancelledError
+
+    monkeypatch.setattr(liveness, "write_beat", fake_write_beat)
+    monkeypatch.setattr(asyncio, "sleep", fake_sleep)
+
+    with pytest.raises(asyncio.CancelledError):
+        await liveness_beat_loop(
+            home,
+            interval=0,
+            _event_logger=lambda event, **payload: events.append((event, payload)),
+        )
+
+    assert [event for event, _payload in events] == [
+        "liveness_beat_write_failed",
+        "liveness_beat_write_recovered",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_beat_loop_success_emits_no_events(tmp_path: Path, monkeypatch) -> None:
+    import mimir.liveness as liveness
+
+    home = _home(tmp_path)
+    events: list[tuple[str, dict]] = []
+    sleeps = 0
+
+    async def fake_sleep(_interval: float) -> None:
+        nonlocal sleeps
+        sleeps += 1
+        if sleeps == 3:
+            raise asyncio.CancelledError
+
+    monkeypatch.setattr(liveness, "write_beat", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(asyncio, "sleep", fake_sleep)
+
+    with pytest.raises(asyncio.CancelledError):
+        await liveness_beat_loop(
+            home,
+            interval=0,
+            _event_logger=lambda event, **payload: events.append((event, payload)),
+        )
+
+    assert events == []
 
 
 def test_beat_age_none_when_missing(tmp_path: Path) -> None:
@@ -240,12 +349,51 @@ def test_watchdog_has_sink(monkeypatch) -> None:
 
 def test_session_marker_roundtrip(tmp_path: Path) -> None:
     home = _home(tmp_path)
-    mark_session_running(home, started_at=1000.0)
+    assert mark_session_running(home, started_at=1000.0)
     marker = read_session_marker(home)
     assert isinstance(marker, dict)
     assert marker["started_at"] == 1000.0
     assert marker["clean"] is False
     assert marker["pid"] > 0
+
+
+def test_atomic_marker_write_fsyncs_file_before_replace_and_directory_after(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import mimir.liveness as liveness
+
+    home = _home(tmp_path)
+    calls: list[str] = []
+    real_replace = liveness.os.replace
+    real_fsync = liveness.os.fsync
+
+    def track_fsync(fd: int) -> None:
+        calls.append("fsync")
+        real_fsync(fd)
+
+    def track_replace(src: Path, dst: Path) -> None:
+        calls.append("replace")
+        real_replace(src, dst)
+
+    monkeypatch.setattr(liveness.os, "fsync", track_fsync)
+    monkeypatch.setattr(liveness.os, "replace", track_replace)
+
+    assert mark_session_running(home, started_at=1000.0)
+
+    assert calls == ["fsync", "replace", "fsync"]
+
+
+def test_atomic_marker_write_reports_fsync_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fail_fsync(fd: int) -> None:
+        raise OSError("fsync failed")
+
+    monkeypatch.setattr("mimir.liveness.os.fsync", fail_fsync)
+
+    assert not mark_session_running(_home(tmp_path), started_at=1000.0)
 
 
 def test_first_boot_is_not_unclean(tmp_path: Path) -> None:
@@ -257,12 +405,23 @@ def test_first_boot_is_not_unclean(tmp_path: Path) -> None:
 def test_clean_shutdown_then_boot_is_clean(tmp_path: Path) -> None:
     home = _home(tmp_path)
     mark_session_running(home, started_at=1000.0)
-    mark_clean_shutdown(home)
+    assert mark_clean_shutdown(home)
     # Next boot inspects the prior marker — a graceful stop is not unclean.
     assert detect_unclean_restart(home) is None
     marker = read_session_marker(home)
     assert marker["clean"] is True
     assert "stopped_iso" in marker
+
+
+def test_clean_shutdown_reports_marker_persistence_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = _home(tmp_path)
+    assert mark_session_running(home, started_at=1000.0)
+    monkeypatch.setattr("mimir.liveness._atomic_write_json", lambda *args, **kwargs: False)
+
+    assert mark_clean_shutdown(home) is False
 
 
 def test_crash_without_cleanup_is_unclean(tmp_path: Path) -> None:

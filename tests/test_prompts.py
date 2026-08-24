@@ -50,7 +50,8 @@ def test_system_prompt_renders_accurate_enforcement_guidance():
     assert "ergonomic guidance, not a security boundary" in sp
     assert "both untrusted and actively ingested this turn" in sp
     assert "auto-recall is informational and never gates" in sp
-    assert "``fetch_url`` and ``web_search`` are destination-safe and taint-independent" in sp
+    assert "``fetch_url`` exact/session-approved URLs" in sp
+    assert "admitted only by a trailing ``/*`` scope are turn-taint gated" in sp
     assert "regardless of turn taint" in sp
     assert "``webhook``, ``http_request``, and external MCP arguments are turn-taint gated" in sp
     assert "External MCP posture is per tool" in sp
@@ -688,8 +689,9 @@ def test_turn_prompt_renders_exact_autonomous_trigger_authority():
 
     assert "## Autonomous trigger authority" in prompt
     assert "profile: ``heartbeat``" in prompt
-    assert "``fetch_url`` may reach only this profile's approved exact-URL list" in prompt
-    assert "remains usable regardless of turn taint" in prompt
+    assert "``fetch_url`` may reach this profile's approved exact URLs and URL scopes" in prompt
+    assert "Exact URLs remain usable regardless of turn taint" in prompt
+    assert "scoped URLs require a clean turn" in prompt
     assert "fetched responses are untrusted active ingest" in prompt
     assert "``web_search`` is not available to this trigger" in prompt
     assert "``worklink_run`` is usable only before any untrusted active ingest" in prompt

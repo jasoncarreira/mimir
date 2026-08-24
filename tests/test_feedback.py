@@ -1343,6 +1343,42 @@ def test_background_task_failed_surfaces_as_negative(tmp_path: Path):
     assert "background task 'boom-task' failed: RuntimeError: boom" in block
 
 
+def test_liveness_startup_failures_surface_as_negative_feedback(tmp_path: Path):
+    from mimir.feedback import classify
+
+    expected = {
+        "liveness_unclean_restart_handoff_persist_failed": (
+            "negative", "liveness_unclean_restart_handoff_persist_failed",
+        ),
+        "startup_failed": ("negative", "startup_failed"),
+    }
+    for event_type, rule in expected.items():
+        assert classify(event_type) == rule
+
+    log = _make_log(
+        tmp_path,
+        events=[
+            {
+                "timestamp": _ts(0.1),
+                "type": "liveness_unclean_restart_handoff_persist_failed",
+                "prior_pid": 123,
+            },
+            {
+                "timestamp": _ts(0.2),
+                "type": "startup_failed",
+                "phase": "liveness_marker",
+                "exception": "RuntimeError('boom')",
+            },
+        ],
+    )
+
+    block = log.recent_block()
+
+    assert block is not None
+    assert "liveness_unclean_restart_handoff_persist_failed" in block
+    assert "startup_failed" in block
+
+
 def test_pr_review_request_gave_up_surfaces_as_negative(tmp_path: Path):
     """End-to-end: a ``*_gave_up`` poller event surfaces in the agent's
     negative algedonic block with a human one-liner naming what was
@@ -1929,6 +1965,38 @@ def test_escalation_rows_collapse_by_escalated_kind(tmp_path: Path):
     assert len(lines) == 1
     assert "37× ≥ 5×" in lines[0]
     assert "(×2 in 24h)" in lines[0]
+
+
+def test_bridge_clean_exits_classify_and_render_negative(tmp_path: Path):
+    """A clean bridge-supervisor return must be operator-visible, not merely
+    an events.jsonl record indistinguishable from a quiet channel."""
+    from mimir.feedback import classify
+
+    assert classify("discord_bridge_exited") == (
+        "negative", "discord_bridge_exited",
+    )
+    assert classify("slack_bridge_exited") == (
+        "negative", "slack_bridge_exited",
+    )
+
+    log = _make_log(tmp_path, events=[
+        {
+            "timestamp": _ts(0.1),
+            "type": "discord_bridge_exited",
+            "reason": "client.start() returned cleanly",
+        },
+        {
+            "timestamp": _ts(0.2),
+            "type": "slack_bridge_exited",
+            "reason": "handler.start_async() returned cleanly",
+        },
+    ])
+    block = log.recent_block()
+    assert block is not None
+    assert "Discord bridge supervisor exited" in block
+    assert "Discord traffic is down until restart" in block
+    assert "Slack bridge supervisor exited" in block
+    assert "Slack traffic is down until restart" in block
 
 
 def test_poller_reload_invalid_cron_classified_negative():

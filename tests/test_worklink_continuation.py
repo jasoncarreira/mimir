@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 import subprocess
 import sys
@@ -337,6 +338,32 @@ def test_generic_high_priority_fallback_when_issue_pr_unknown(tmp_path: Path) ->
     assert runner.issue_comments == []
 
 
+def test_canonical_run_id_resolves_validated_issue(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    repo = _init_repo(tmp_path, branch="feature/worklink-recovery")
+    _save_run_state(home, issue_id=700, branch="feature/worklink-recovery", test_command="pytest")
+    event = _make_event(content="generic worklink follow-up")
+
+    result = maybe_create_worklink_budget_continuation(
+        home=home,
+        event=event,
+        ctx=_make_ctx(event),
+        record=_make_record(event, input_text="generic worklink follow-up"),
+        repo=repo,
+        current_worktree=repo,
+        run_id="chainlink-700",
+        runner=SpyRunner(),
+    )
+
+    assert result is not None
+    assert result.payload["association"]["issue_id"] == 700
+    assert result.payload["association"]["run_state_path"] == str(
+        home / "state" / "worklink" / "runs" / "700.json"
+    )
+    assert result.payload["source_event"]["run_id_hint"] == "chainlink-700"
+
+
 def test_unknown_production_continuations_use_work_identity_not_server_checkout(
     tmp_path: Path,
 ) -> None:
@@ -587,6 +614,8 @@ def test_runner_for_home_overrides_explicit_cwd_only_for_chainlink(
 def test_consumer_posts_once_and_marks_sidecar_actioned_after_delivery(tmp_path: Path) -> None:
     home = tmp_path / "home"
     home.mkdir()
+    events_path = home / "logs" / "events.jsonl"
+    event_logger.init_logger(events_path, session_id="test")
     repo = _init_repo(tmp_path, branch="chainlink-740-consume")
     _save_run_state(home, issue_id=740, branch="chainlink-740-consume", test_command="pytest")
     event = _make_event(trigger="user_message", source="slack")
@@ -626,6 +655,133 @@ def test_consumer_posts_once_and_marks_sidecar_actioned_after_delivery(tmp_path:
         for argv, cwd in consumer.calls
         if argv and argv[0] == "chainlink"
     )
+    records = [json.loads(line) for line in events_path.read_text(encoding="utf-8").splitlines()]
+    assert [record["type"] for record in records] == ["worklink_continuation_created"]
+
+
+def test_part_c_consumer_emits_stalled_once_and_abandoned_once(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    repo = _init_repo(tmp_path, branch="chainlink-740-observability")
+    _save_run_state(home, issue_id=740, branch="chainlink-740-observability", test_command="pytest")
+    events_path = home / "logs" / "events.jsonl"
+    event_logger.init_logger(events_path, session_id="test")
+    event = _make_event(trigger="user_message", source="slack")
+    created = maybe_create_worklink_budget_continuation(
+        home=home,
+        event=event,
+        ctx=_make_ctx(event),
+        record=_make_record(event),
+        repo=repo,
+        current_worktree=repo,
+        runner=SpyRunner(),
+    )
+    assert created is not None
+    current = datetime(2026, 8, 23, tzinfo=UTC)
+
+    def unavailable(
+        args: Sequence[str], cwd: Path | None = None
+    ) -> subprocess.CompletedProcess[str]:
+        return subprocess.CompletedProcess(list(args), 1, stdout="", stderr="chainlink unavailable")
+
+    for _ in range(2):
+        assert consume_worklink_budget_continuations(
+            home,
+            runner=unavailable,
+            now=current,
+            delivery_receipt_exists=lambda _key: True,
+        ) == []
+
+    payload = json.loads(created.sidecar_path.read_text(encoding="utf-8"))
+    assert payload["consumer_error"] == "chainlink unavailable"
+    consumer = ContinuationConsumerRunner()
+    assert consume_worklink_budget_continuations(
+        home,
+        runner=consumer,
+        now=current + timedelta(minutes=1),
+        delivery_receipt_exists=lambda _key: True,
+    ) == []
+    assert len(consumer.comments) == 1
+
+    abandoned_at = current + timedelta(hours=25)
+    for _ in range(2):
+        assert consume_worklink_budget_continuations(
+            home,
+            runner=consumer,
+            now=abandoned_at,
+            retention=timedelta(hours=24),
+            delivery_receipt_exists=lambda _key: True,
+        ) == []
+
+    records = [json.loads(line) for line in events_path.read_text(encoding="utf-8").splitlines()]
+    assert [record["type"] for record in records] == [
+        "worklink_continuation_created",
+        "worklink_continuation_stalled",
+        "worklink_continuation_abandoned",
+    ]
+    stalled = records[1]
+    assert stalled["sidecar"] == str(created.sidecar_path)
+    assert stalled["issue_id"] == 740
+    assert stalled["consumer_error"] == "chainlink unavailable"
+    abandoned = records[2]
+    assert abandoned["sidecar"] == str(created.sidecar_path)
+    assert abandoned["issue_id"] == 740
+    assert abandoned["reason"] == "manual_triage_timeout"
+
+
+def test_no_target_continuation_routes_once_without_churn_then_expires(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    repo = _init_repo(tmp_path, branch="feature/worklink-recovery")
+    event = _make_event(content="generic worklink follow-up", source_id="no-target")
+    created = maybe_create_worklink_budget_continuation(
+        home=home,
+        event=event,
+        ctx=_make_ctx(event, turn_id="no-target"),
+        record=_make_record(event, turn_id="no-target", input_text=event.content),
+        repo=repo,
+        current_worktree=repo,
+        runner=SpyRunner(),
+    )
+    assert created is not None
+    routed_at = datetime(2026, 8, 1, tzinfo=UTC)
+
+    before_offer = created.sidecar_path.read_bytes()
+    offered = consume_worklink_budget_continuations(home, runner=SpyRunner(), now=routed_at)
+    assert len(offered) == 1
+    assert created.sidecar_path.read_bytes() == before_offer
+
+    assert consume_worklink_budget_continuations(
+        home,
+        runner=SpyRunner(),
+        now=routed_at,
+        delivery_receipt_exists=lambda key: key == offered[0].delivery_key,
+    ) == []
+    payload = json.loads(created.sidecar_path.read_text(encoding="utf-8"))
+    assert payload["actioned_at"] == routed_at.isoformat()
+    assert payload["resolved_at"] == routed_at.isoformat()
+    assert payload["resolved_reason"] == "no_validated_target"
+
+    with monkeypatch.context() as patch:
+        patch.setattr(
+            "mimir.worklink.continuation.atomic_write_json",
+            lambda *_args, **_kwargs: pytest.fail("resolved sidecar was rewritten"),
+        )
+        assert consume_worklink_budget_continuations(
+            home,
+            runner=SpyRunner(),
+            now=routed_at + timedelta(days=1),
+        ) == []
+
+    assert consume_worklink_budget_continuations(
+        home,
+        runner=SpyRunner(),
+        now=routed_at + timedelta(days=30),
+    ) == []
+    assert not created.sidecar_path.exists()
 
 
 def test_consumer_resolves_closed_issue_without_reaction(tmp_path: Path) -> None:

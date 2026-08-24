@@ -67,6 +67,10 @@ _DEFAULTS = {
         "token_budget_ceiling": 40000,
         "auto_compact_threshold_pct": 85,
         "db_busy_timeout_ms": 5000,
+        # Maximum newest eligible triples considered by one semantic query.
+        # Stores above this bound exclude older triples from cosine candidacy;
+        # rank_triple_candidates logs whenever that truncation occurs.
+        "triple_candidate_limit": 500,
         "refuse_threshold_pct": 95,
     },
     "retrieval": {
