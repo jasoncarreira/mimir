@@ -221,8 +221,15 @@ async def test_client_names_stale_old_launch_contract_with_timeout(
         "version", "op", "id", "issue", "attempt", "device", "inode",
         "argv", "env", "projections",
     }
-    assert set(requests[0]) == old_launch_fields | {"timeout_s", "executor_identity"}
+    assert set(requests[0]) == old_launch_fields | {
+        "timeout_s",
+        "stdout_limit",
+        "stderr_limit",
+        "executor_identity",
+    }
     assert requests[0]["timeout_s"] == 30
+    assert requests[0]["stdout_limit"] == 1
+    assert requests[0]["stderr_limit"] == 1
 
 
 @pytest.mark.asyncio
@@ -555,6 +562,8 @@ def test_executor_rejects_mismatched_launch_protocol_identity() -> None:
         "env": {},
         "projections": [],
         "timeout_s": 30,
+        "stdout_limit": 100,
+        "stderr_limit": 100,
     }
 
     with pytest.raises(RuntimeError, match=worker_exec._STALE_EXECUTOR_DIAGNOSTIC):
@@ -726,6 +735,8 @@ def test_duplicate_worker_id_is_refused_before_popen_without_touching_live_job(
         "env": {},
         "projections": [],
         "timeout_s": 1,
+        "stdout_limit": 100,
+        "stderr_limit": 100,
     }
     monkeypatch.setattr(worker_exec, "_validate_checkout", lambda *args: None)
     monkeypatch.setattr(
@@ -800,6 +811,8 @@ def test_terminal_waits_for_in_group_writers_before_cleanup(tmp_path: Path, monk
         "env": {"PATH": "/usr/bin:/bin"},
         "projections": [],
         "timeout_s": 5,
+        "stdout_limit": 100,
+        "stderr_limit": 100,
     }
     fds = [checkout_fd, stdout_write, stderr_write]
     try:
@@ -865,6 +878,8 @@ def test_executor_enforces_worker_deadline(tmp_path: Path, monkeypatch) -> None:
         process.wait()
 
     monkeypatch.setattr(worker_exec, "_terminate_process_group", terminate)
+    times = iter((0.0, 100.0))
+    monkeypatch.setattr(worker_exec.time, "monotonic", lambda: next(times))
     request = {
         "version": 1,
         "op": "launch",
@@ -878,16 +893,19 @@ def test_executor_enforces_worker_deadline(tmp_path: Path, monkeypatch) -> None:
         "env": {},
         "projections": [],
         "timeout_s": 0.25,
+        "stdout_limit": 100,
+        "stderr_limit": 100,
     }
     fds = [checkout_fd, stdout_write, stderr_write]
     try:
         worker_exec._handle_launch(Connection(), request, fds)
-        assert waits[0] == 0.25 + worker_exec._CONTROLLER_CANCELLATION_GRACE_S
+        assert waits == [None]
         assert responses[-1] == {
             "id": identifier,
             "status": "terminal",
             "exit_code": -signal.SIGKILL,
             "timed_out": True,
+            "output_overflow": False,
         }
     finally:
         for fd in fds:
@@ -897,6 +915,58 @@ def test_executor_enforces_worker_deadline(tmp_path: Path, monkeypatch) -> None:
                 except OSError:
                     pass
 
+
+def test_executor_truncates_and_terminates_on_output_overflow(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    stdout_path = tmp_path / "stdout.log"
+    stderr_path = tmp_path / "stderr.log"
+    stdout_fd = os.open(stdout_path, os.O_RDWR | os.O_CREAT | os.O_EXCL, 0o600)
+    stderr_fd = os.open(stderr_path, os.O_RDWR | os.O_CREAT | os.O_EXCL, 0o600)
+    os.write(stdout_fd, b"overflow")
+
+    class Process:
+        pid = 4321
+        returncode: int | None = None
+
+        def poll(self) -> int | None:
+            return self.returncode
+
+    process = Process()
+
+    def terminate(observed: Process, timeout_s: float = 5.0) -> None:
+        assert observed is process
+        process.returncode = -signal.SIGKILL
+
+    monkeypatch.setattr(worker_exec, "_terminate_process_group", terminate)
+    try:
+        assert worker_exec._wait_with_output_limits(
+            process, 30, stdout_fd, 4, stderr_fd, 4
+        ) == (-signal.SIGKILL, False, True)
+        assert stdout_path.read_bytes() == b"over"
+    finally:
+        os.close(stdout_fd)
+        os.close(stderr_fd)
+
+
+
+def test_arm_parent_death_signal_closes_pre_prctl_race(monkeypatch) -> None:
+    calls: list[tuple[int, int, int, int, int]] = []
+
+    class Libc:
+        def prctl(self, *args: int) -> int:
+            calls.append(args)
+            return 0
+
+    monkeypatch.setattr(worker_exec.ctypes, "CDLL", lambda *args, **kwargs: Libc())
+    monkeypatch.setattr(worker_exec.os, "getppid", lambda: 99)
+    exits: list[int] = []
+    monkeypatch.setattr(worker_exec.os, "_exit", lambda code: exits.append(code))
+
+    worker_exec._arm_parent_death_signal(100)
+
+    assert calls == [(1, signal.SIGKILL, 0, 0, 0)]
+    assert exits == [128 + signal.SIGKILL]
 
 def test_process_group_cancellation_reports_unreapable_member(monkeypatch) -> None:
     waits: list[tuple[int, float]] = []
@@ -959,26 +1029,39 @@ def test_worker_payload_cannot_reach_controller_canary_and_detector_is_live() ->
         detector_live = canary.read_text() == "control"
         canary.write_text("original")
         with _authorization(checkout) as authorization:
-            process = await WorkerClient(authorization, socket_path=socket_path).launch(
-                local_checkout=checkout,
-                argv=["/bin/sh", "-c", (
-                    'cd "$HOME" || exit 60; printf "home-ok\n"; cd /; '
-                    'parent=${HOME%/*}; '
-                    'if ls "$parent" >/dev/null 2>&1; then exit 61; fi; '
-                    'if touch "$parent/sibling" 2>/dev/null; then exit 62; fi; '
-                    'if mkdir "$parent/sibling-dir" 2>/dev/null; then exit 63; fi; '
-                    'if mv "$HOME" "$parent/renamed" 2>/dev/null; then exit 64; fi; '
-                    'if rmdir "$HOME" 2>/dev/null; then exit 65; fi; '
-                    'if cat "$CANARY" >/dev/null 2>&1; then exit 66; fi; '
-                    'if printf attack > "$CANARY" 2>/dev/null; then exit 67; fi; '
-                    'exit 23'
-                )],
-                env={"PATH": "/usr/bin:/bin", "CANARY": str(canary)},
-                identifier=str(uuid.uuid4()),
-                timeout_s=5,
-            )
-            stdout, stderr = await asyncio.gather(process.stdout.read(), process.stderr.read())
-            returncode = await process.wait()
+            stdout_path = boundary / "worker.stdout"
+            stderr_path = boundary / "worker.stderr"
+            stdout_fd = os.open(stdout_path, os.O_RDWR | os.O_CREAT | os.O_EXCL, 0o600)
+            stderr_fd = os.open(stderr_path, os.O_RDWR | os.O_CREAT | os.O_EXCL, 0o600)
+            from mimir.output_capture import OutputSink
+
+            try:
+                process = await WorkerClient(authorization, socket_path=socket_path).launch(
+                    local_checkout=checkout,
+                    argv=["/bin/sh", "-c", (
+                        'cd "$HOME" || exit 60; printf "home-ok\n"; cd /; '
+                        'parent=${HOME%/*}; '
+                        'if ls "$parent" >/dev/null 2>&1; then exit 61; fi; '
+                        'if touch "$parent/sibling" 2>/dev/null; then exit 62; fi; '
+                        'if mkdir "$parent/sibling-dir" 2>/dev/null; then exit 63; fi; '
+                        'if mv "$HOME" "$parent/renamed" 2>/dev/null; then exit 64; fi; '
+                        'if rmdir "$HOME" 2>/dev/null; then exit 65; fi; '
+                        'if cat "$CANARY" >/dev/null 2>&1; then exit 66; fi; '
+                        'if printf attack > "$CANARY" 2>/dev/null; then exit 67; fi; '
+                        'exit 23'
+                    )],
+                    env={"PATH": "/usr/bin:/bin", "CANARY": str(canary)},
+                    identifier=str(uuid.uuid4()),
+                    timeout_s=5,
+                    stdout_sink=OutputSink(stdout_fd, 4096, stdout_path),
+                    stderr_sink=OutputSink(stderr_fd, 4096, stderr_path),
+                )
+                returncode = await process.wait()
+                stdout = stdout_path.read_bytes()
+                stderr = stderr_path.read_bytes()
+            finally:
+                os.close(stdout_fd)
+                os.close(stderr_fd)
         return {
             "detector_live": detector_live,
             "returncode": returncode,

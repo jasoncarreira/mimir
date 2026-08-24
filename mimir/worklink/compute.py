@@ -182,7 +182,7 @@ def _output_limit(env_name: str, default: int) -> int:
         value = int(raw)
     except ValueError:
         return default
-    return value if value > 0 else default
+    return min(value, default) if value > 0 else default
 
 
 def _worklink_output_limits() -> tuple[int, int]:
@@ -192,10 +192,15 @@ def _worklink_output_limits() -> tuple[int, int]:
     )
 
 
+_OUTPUT_COMPONENT = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}\Z")
+
+
 def _output_paths(spec: WorkSpec, identifier: str) -> tuple[Path | None, Path | None]:
     root = spec.output_root
     if root is None:
         return None, None
+    if _OUTPUT_COMPONENT.fullmatch(spec.backend) is None or spec.backend in {".", ".."}:
+        raise ComputeLaunchError("backend name is not a safe output path component")
     stem = f"{spec.backend}-{spec.issue_id}-a{spec.attempt}-{identifier}-{uuid.uuid4()}"
     return root / f"{stem}.stdout.log", root / f"{stem}.stderr.log"
 
@@ -444,6 +449,9 @@ class LocalSubprocessComputeBackend:
         except OSError as exc:
             raise ComputeLaunchError(str(exc)) from exc
         try:
+            from .worker_exec import _arm_parent_death_signal
+
+            parent_pid = os.getpid()
             proc = await asyncio.create_subprocess_exec(
                 *command,
                 stdin=asyncio.subprocess.DEVNULL,
@@ -452,15 +460,19 @@ class LocalSubprocessComputeBackend:
                 cwd=str(spec.local_checkout),
                 env=env,
                 start_new_session=True,
+                preexec_fn=lambda: _arm_parent_death_signal(parent_pid),
             )
-        except OSError as exc:
+        except BaseException as exc:
             stdout_sink.close()
             stderr_sink.close()
             for path in (stdout_path, stderr_path):
-                try:
-                    path.unlink()
-                except FileNotFoundError:
-                    pass
+                if path is not None:
+                    try:
+                        path.unlink()
+                    except FileNotFoundError:
+                        pass
+            if isinstance(exc, asyncio.CancelledError):
+                raise
             raise ComputeLaunchError(str(exc)) from exc
         pid = getattr(proc, "pid", None)
         start_ticks = None
@@ -551,6 +563,10 @@ class LocalSubprocessComputeBackend:
                     stdout_sink=stdout_sink,
                     stderr_sink=stderr_sink,
                 )
+            except asyncio.CancelledError:
+                if not started.done():
+                    started.cancel()
+                raise
             except BaseException as exc:
                 if not started.done():
                     started.set_exception(exc)
@@ -561,12 +577,13 @@ class LocalSubprocessComputeBackend:
 
         task = asyncio.create_task(collect_contained())
         try:
-            process = await started
+            process = await asyncio.shield(started)
+        except asyncio.CancelledError:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+            raise
         except (OSError, RuntimeError, ValueError) as exc:
-            try:
-                await task
-            except (OSError, RuntimeError, ValueError):
-                pass
+            await asyncio.gather(task, return_exceptions=True)
             raise ComputeLaunchError(str(exc)) from exc
         pid = getattr(process, "pid", None)
         ticks = None

@@ -568,11 +568,12 @@ async def test_local_subprocess_compute_backend_preserves_subprocess_shape(
                 "kwargs": {
                     "stdin": asyncio.subprocess.DEVNULL,
                     "stdout": calls[0]["kwargs"]["stdout"],
-                "stderr": calls[0]["kwargs"]["stderr"],
-                "cwd": str(tmp_path),
-                "env": {"PATH": "/custom/bin", "X": "1"},
-                "start_new_session": True,
-            },
+                    "stderr": calls[0]["kwargs"]["stderr"],
+                    "cwd": str(tmp_path),
+                    "env": {"PATH": "/custom/bin", "X": "1"},
+                    "start_new_session": True,
+                    "preexec_fn": calls[0]["kwargs"]["preexec_fn"],
+                },
         }
     ]
 
@@ -661,6 +662,54 @@ def test_output_paths_require_explicit_run_owned_root(
     assert not (tmp_path / "ambient-home").exists()
 
 
+def test_output_paths_reject_backend_path_components(tmp_path: Path) -> None:
+    for backend in ("../escape", "nested/tool", ".", "bad name"):
+        spec = WorkSpec(
+            issue_id=1,
+            attempt=1,
+            repo_url="repo",
+            base_ref="main",
+            branch="issue/1-a1",
+            prompt="prompt",
+            rules=None,
+            test_command="true",
+            backend=backend,
+            timeout_s=5,
+            output_root=tmp_path,
+        )
+        with pytest.raises(ComputeLaunchError, match="safe output path component"):
+            compute_module._output_paths(spec, "run")
+
+
+@pytest.mark.asyncio
+async def test_anonymous_launch_failure_does_not_unlink_none_paths(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    async def fail_exec(*_args: str, **_kwargs: Any) -> FakeProcess:
+        raise OSError("spawn failed")
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fail_exec)
+    monkeypatch.setattr("mimir.worklink.compute._local_child_env", dict)
+    backend = LocalSubprocessComputeBackend()
+    spec = WorkSpec(
+        issue_id=1,
+        attempt=1,
+        repo_url="repo",
+        base_ref="main",
+        branch="issue/1-a1",
+        prompt="prompt",
+        rules=None,
+        test_command="true",
+        backend="opencode",
+        timeout_s=5,
+        local_checkout=tmp_path,
+        local_argv=("opencode", "run"),
+    )
+
+    with pytest.raises(ComputeLaunchError, match="spawn failed"):
+        await backend.launch(spec)
+
+
 def test_worklink_output_limits_use_safe_defaults_and_env_overrides(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -674,6 +723,10 @@ def test_worklink_output_limits_use_safe_defaults_and_env_overrides(
 
     monkeypatch.setenv("MIMIR_WORKLINK_MAX_STDOUT_BYTES", "invalid")
     monkeypatch.setenv("MIMIR_WORKLINK_MAX_STDERR_BYTES", "0")
+    assert compute_module._worklink_output_limits() == (64 * 1024 * 1024, 16 * 1024 * 1024)
+
+    monkeypatch.setenv("MIMIR_WORKLINK_MAX_STDOUT_BYTES", str(128 * 1024 * 1024))
+    monkeypatch.setenv("MIMIR_WORKLINK_MAX_STDERR_BYTES", str(32 * 1024 * 1024))
     assert compute_module._worklink_output_limits() == (64 * 1024 * 1024, 16 * 1024 * 1024)
 
 

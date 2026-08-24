@@ -21,7 +21,7 @@ MAX_PROJECTION_BYTES = 1024 * 1024
 CANCEL_SOCKET_TIMEOUT_S = 20.0
 # Keep this literal independent from worker_exec. The executor runs its image-owned
 # copy, so changing either side of the launch contract requires an image rebuild.
-EXECUTOR_PROTOCOL_IDENTITY = "worklink-executor-v4-direct-output-fds"
+EXECUTOR_PROTOCOL_IDENTITY = "worklink-executor-v5-bounded-output-fds"
 STALE_EXECUTOR_DIAGNOSTIC = (
     "stale root executor image: controller and mimir.worklink.worker_exec protocol "
     "identities do not match; rebuild the image and restart the container"
@@ -71,6 +71,7 @@ class WorkerProcess:
     _socket: socket.socket
     returncode: int | None = None
     timed_out: bool = False
+    output_overflow: bool = False
 
     async def wait(self) -> int:
         if self.returncode is None:
@@ -83,6 +84,7 @@ class WorkerProcess:
                 raise RuntimeError("worker executor returned an invalid terminal result")
             self.returncode = int(response["exit_code"])
             self.timed_out = response.get("timed_out") is True
+            self.output_overflow = response.get("output_overflow") is True
             self._socket.close()
         return self.returncode
 
@@ -173,6 +175,8 @@ class WorkerClient:
                 for item in projections
             ],
             "timeout_s": timeout_s,
+            "stdout_limit": stdout_sink.limit if stdout_sink is not None else 1,
+            "stderr_limit": stderr_sink.limit if stderr_sink is not None else 1,
         }
         payload = json.dumps(request, separators=(",", ":")).encode()
         if len(payload) > MAX_REQUEST_BYTES:

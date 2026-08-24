@@ -260,8 +260,8 @@ async def execute_contained(
     client = (
         getattr(directory, "_contained_worker_client", None) or client_class(directory)
     )
-    try:
-        process = await client.launch(
+    launch_task = asyncio.create_task(
+        client.launch(
             local_checkout=directory.path,
             argv=tuple(argv),
             env=dict(worker_env),
@@ -271,6 +271,28 @@ async def execute_contained(
             stdout_sink=stdout_sink,
             stderr_sink=stderr_sink,
         )
+    )
+    try:
+        process = await asyncio.shield(launch_task)
+    except asyncio.CancelledError:
+        # Do not abandon a launch after its request has crossed the socket.  Let
+        # the identity-bound handshake settle, then cancel and reap that exact
+        # worker before propagating cancellation to the caller.
+        try:
+            process = await asyncio.shield(launch_task)
+        except BaseException:
+            if opened_here:
+                stdout_sink.close()
+                stderr_sink.close()
+            raise
+        try:
+            await asyncio.shield(client.cancel(identifier))
+            await asyncio.shield(process.wait())
+        finally:
+            if opened_here:
+                stdout_sink.close()
+                stderr_sink.close()
+        raise
     except BaseException:
         if opened_here:
             stdout_sink.close()
@@ -282,6 +304,14 @@ async def execute_contained(
     output_overflow = False
     cancel_task: asyncio.Task[None] | None = None
 
+    async def cancel_for_overflow() -> None:
+        try:
+            await client.cancel(identifier)
+        except RuntimeError:
+            # The executor independently enforces the same cap and may have
+            # already reaped the worker before this advisory cancellation lands.
+            pass
+
     async def monitor_output() -> None:
         nonlocal output_overflow, cancel_task
         while True:
@@ -290,7 +320,7 @@ async def execute_contained(
             )
             if overflow and not output_overflow:
                 output_overflow = True
-                cancel_task = asyncio.create_task(client.cancel(identifier))
+                cancel_task = asyncio.create_task(cancel_for_overflow())
             if overflow:
                 lookahead = scrubber.lookahead_bytes() if scrubber is not None else 0
                 stdout_sink.truncate_to_limit(lookahead)
@@ -326,10 +356,14 @@ async def execute_contained(
         await cancel_task
     stdout, stdout_dropped = stdout_sink.read_bounded(scrubber=scrubber)
     stderr, stderr_dropped = stderr_sink.read_bounded(scrubber=scrubber)
-    observed_overflow = stdout_sink.did_overflow or stderr_sink.did_overflow
+    observed_overflow = (
+        stdout_sink.did_overflow
+        or stderr_sink.did_overflow
+        or getattr(process, "output_overflow", False)
+    )
     if observed_overflow and not output_overflow:
         output_overflow = True
-        await client.cancel(identifier)
+        await cancel_for_overflow()
     stdout_sink.truncate_to_limit()
     stderr_sink.truncate_to_limit()
     result = CollectedExecutionResult(

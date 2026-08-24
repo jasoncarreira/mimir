@@ -227,6 +227,42 @@ async def launch_worker(
 
 
 @pytest.mark.asyncio
+async def test_enabled_launch_cancellation_waits_for_handshake_then_cancels(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class SuspendedClient(WorkerClient):
+        def __init__(self) -> None:
+            super().__init__(immediate=False)
+            self.entered = asyncio.Event()
+            self.resume = asyncio.Event()
+
+        async def launch(self, **kwargs: Any) -> WorkerProcess:
+            self.entered.set()
+            await self.resume.wait()
+            return await super().launch(**kwargs)
+
+    client = SuspendedClient()
+    monkeypatch.setattr("mimir.worklink.checkout.coding_enabled", lambda: True)
+    monkeypatch.setattr("mimir.worklink.run_state.process_start_ticks", lambda pid: pid)
+    backend = LocalSubprocessComputeBackend.for_authorized_checkout(
+        Authorization(), worker_client=client
+    )
+    launch = asyncio.create_task(backend.launch(spec()))
+    await client.entered.wait()
+    launch.cancel()
+    client.resume.set()
+
+    with pytest.raises(asyncio.CancelledError):
+        await launch
+
+    assert len(client.cancelled) == 1
+    identifier = client.cancelled[0]
+    assert client.processes[identifier].returncode == -15
+    assert backend._jobs == {}
+    assert backend._handles == {}
+
+
+@pytest.mark.asyncio
 async def test_enabled_launch_failure_after_suspension_is_a_launch_error(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
