@@ -34,6 +34,8 @@ def test_create_worktree_uses_attempt_scoped_branch_and_path(tmp_path: Path) -> 
 
     def runner(args: Sequence[str]) -> subprocess.CompletedProcess[str]:
         calls.append(list(args))
+        if args[-2:] == ["--verify", "origin/main"]:
+            return subprocess.CompletedProcess(list(args), 0, stdout="main123\n", stderr="")
         if args[-1] == "refs/remotes/origin/main":
             return completed(args, returncode=1)
         return completed(args)
@@ -46,6 +48,7 @@ def test_create_worktree_uses_attempt_scoped_branch_and_path(tmp_path: Path) -> 
     assert lease.local_base == "main"
     assert calls == [
         ["git", "-C", str(tmp_path), "fetch", "origin", "main"],
+        ["git", "-C", str(tmp_path), "rev-parse", "--verify", "origin/main"],
         [
             "git",
             "-C",
@@ -56,7 +59,7 @@ def test_create_worktree_uses_attempt_scoped_branch_and_path(tmp_path: Path) -> 
             "refs/remotes/origin/main",
         ],
         ["git", "-C", str(tmp_path), "rev-parse", "--verify", "--quiet", "refs/heads/main"],
-        ["git", "-C", str(tmp_path), "merge-base", "--is-ancestor", "FETCH_HEAD", "main"],
+        ["git", "-C", str(tmp_path), "merge-base", "--is-ancestor", "main123", "main"],
         [
             "git",
             "-C",
@@ -493,28 +496,76 @@ def test_alternate_repair_refuses_objects_available_only_from_alternate(tmp_path
     assert refused["retained_refs"] == [f"refs/heads/rescue-alternate@{unique_sha}"]
 
 
-def test_stale_remote_tracking_base_fails_with_shas_and_behind_count(tmp_path: Path) -> None:
+def test_requested_base_ignores_first_fetch_head_entry_when_current(tmp_path: Path) -> None:
+    fetch_head = tmp_path / ".git" / "FETCH_HEAD"
+    fetch_head.parent.mkdir()
+    fetch_head.write_text(
+        "main123\t\tbranch 'main' of example.invalid/repo\n"
+        "feature123\t\tbranch 'feature/acp' of example.invalid/repo\n",
+        encoding="utf-8",
+    )
     calls: list[list[str]] = []
 
     def runner(args: Sequence[str]) -> subprocess.CompletedProcess[str]:
         calls.append(list(args))
-        if args[-3:] == ["--is-ancestor", "FETCH_HEAD", "origin/main"]:
+        if args[-2:] == ["--verify", "origin/feature/acp"]:
+            return subprocess.CompletedProcess(list(args), 0, stdout="feature123\n", stderr="")
+        return completed(args)
+
+    lease = create_worktree(
+        tmp_path,
+        issue_id=1458,
+        attempt=1,
+        base="feature/acp",
+        runner=runner,
+    )
+
+    assert lease.local_base == "origin/feature/acp"
+    assert [
+        "git", "-C", str(tmp_path), "merge-base", "--is-ancestor",
+        "feature123", "origin/feature/acp",
+    ] in calls
+    assert not any("FETCH_HEAD" in call for call in calls)
+
+
+@pytest.mark.parametrize("base,first_base", [("main", "feature/acp"), ("feature/acp", "main")])
+def test_stale_remote_tracking_base_fails_with_named_ref_and_behind_count(
+    tmp_path: Path,
+    base: str,
+    first_base: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    remote_ref = f"origin/{base}"
+    fetch_head = tmp_path / ".git" / "FETCH_HEAD"
+    fetch_head.parent.mkdir()
+    fetch_head.write_text(
+        f"other456\t\tbranch '{first_base}' of example.invalid/repo\n"
+        f"origin456\t\tbranch '{base}' of example.invalid/repo\n",
+        encoding="utf-8",
+    )
+    calls: list[list[str]] = []
+    monkeypatch.setattr(checkout_module, "_resolve_local_base", lambda *_args, **_kwargs: base)
+
+    def runner(args: Sequence[str]) -> subprocess.CompletedProcess[str]:
+        calls.append(list(args))
+        if args[-3:] == ["--is-ancestor", "origin456", base]:
             return completed(args, returncode=1)
-        if args[-2:] == ["--verify", "origin/main"]:
-            return subprocess.CompletedProcess(list(args), 0, stdout="local123\n", stderr="")
-        if args[-2:] == ["--verify", "FETCH_HEAD"]:
+        if args[-2:] == ["--verify", remote_ref]:
             return subprocess.CompletedProcess(list(args), 0, stdout="origin456\n", stderr="")
-        if args[-2:] == ["--count", "origin/main..FETCH_HEAD"]:
+        if args[-2:] == ["--verify", base]:
+            return subprocess.CompletedProcess(list(args), 0, stdout="local123\n", stderr="")
+        if args[-2:] == ["--count", f"{base}..origin456"]:
             return subprocess.CompletedProcess(list(args), 0, stdout="3\n", stderr="")
         return completed(args)
 
     with pytest.raises(
         RuntimeError,
-        match="stale base local123, origin origin456, 3 commits behind",
+        match=rf"stale base local123, {remote_ref} origin456, 3 commits behind",
     ):
-        create_worktree(tmp_path, issue_id=967, attempt=2, runner=runner)
+        create_worktree(tmp_path, issue_id=967, attempt=2, base=base, runner=runner)
 
     assert not any(call[3:5] == ["worktree", "add"] for call in calls)
+    assert not any("FETCH_HEAD" in call for call in calls)
 
 
 def test_create_worktree_real_git_feature_acp_remote_base(tmp_path: Path) -> None:
