@@ -2175,6 +2175,137 @@ def _arguments_match_allowlist(
     return True
 
 
+@dataclass(frozen=True)
+class _ShellReadCommandSpec:
+    exact_options: frozenset[str]
+    option_prefixes: tuple[str, ...] = ()
+    value_options: frozenset[str] = frozenset()
+    positional_values_before_paths: int = 0
+    default_path: str | None = None
+    reads_content: bool = True
+
+
+_SHELL_READ_COMMAND_SPECS = {
+    "ls": _ShellReadCommandSpec(
+        exact_options=frozenset({
+            "-1", "-A", "-a", "-d", "-F", "-h", "-l", "-la", "-al",
+            "-ld", "-dl", "-lh", "-hl", "--all", "--almost-all", "--directory",
+            "--classify", "--human-readable",
+        }),
+        option_prefixes=("--color=",),
+        reads_content=False,
+    ),
+    "wc": _ShellReadCommandSpec(exact_options=frozenset({
+        "-c", "-l", "-L", "-m", "-w", "--bytes", "--chars",
+        "--lines", "--max-line-length", "--words",
+    })),
+    "grep": _ShellReadCommandSpec(
+        exact_options=frozenset({
+            "-E", "-F", "-H", "-h", "-i", "-l", "-n", "-q", "-r", "-s",
+            "-v", "-w", "-x", "--extended-regexp", "--fixed-strings",
+            "--files-with-matches", "--ignore-case", "--line-number",
+            "--no-messages", "--quiet", "--recursive", "--invert-match",
+            "--with-filename", "--no-filename", "--word-regexp", "--line-regexp",
+        }),
+        option_prefixes=("--exclude=", "--include=", "--exclude-dir="),
+        positional_values_before_paths=1,
+    ),
+    "jq": _ShellReadCommandSpec(
+        exact_options=frozenset({
+            "-C", "-M", "-R", "-S", "-c", "-e", "-j", "-r", "-s",
+            "--ascii-output", "--compact-output", "--exit-status",
+            "--join-output", "--monochrome-output", "--null-input",
+            "--raw-input", "--raw-output", "--slurp", "--sort-keys",
+        }),
+        positional_values_before_paths=1,
+    ),
+    "rg": _ShellReadCommandSpec(
+        exact_options=frozenset({
+            "-F", "-H", "-L", "-S", "-g", "-h", "-i", "-l", "-n",
+            "-s", "-u", "-v", "-w", "--case-sensitive", "--files",
+            "--files-with-matches", "--fixed-strings", "--glob", "--hidden",
+            "--ignore-case", "--line-number", "--no-heading", "--no-ignore",
+            "--smart-case", "--type", "--type-not", "--word-regexp",
+        }),
+        option_prefixes=("--glob=", "--type=", "--type-not="),
+        value_options=frozenset({"-g", "--glob", "--type", "--type-not"}),
+        positional_values_before_paths=1,
+        default_path=".",
+    ),
+    "cat": _ShellReadCommandSpec(exact_options=frozenset({
+        "-n", "--number", "-s", "--squeeze-blank", "-E", "--show-ends",
+    })),
+    "head": _ShellReadCommandSpec(
+        exact_options=frozenset({"-q", "-v", "--quiet", "--verbose", "-n", "-c"}),
+        option_prefixes=("-n", "-c", "--lines=", "--bytes="),
+        value_options=frozenset({"-n", "-c"}),
+    ),
+    "tail": _ShellReadCommandSpec(
+        exact_options=frozenset({"-q", "-v", "--quiet", "--verbose", "-n", "-c"}),
+        option_prefixes=("-n", "-c", "--lines=", "--bytes="),
+        value_options=frozenset({"-n", "-c"}),
+    ),
+    "stat": _ShellReadCommandSpec(
+        exact_options=frozenset({"-t", "--terse", "-L", "--dereference", "-c"}),
+        option_prefixes=("-c", "--format=", "--printf="),
+        value_options=frozenset({"-c"}),
+        reads_content=False,
+    ),
+}
+_READ_ONLY_SHELL_READ_COMMANDS = frozenset({"ls", "wc", "grep", "jq", "rg"})
+
+
+def _shell_read_path_operands(argv: list[str]) -> tuple[str, ...] | None:
+    """Validate one filesystem reader and return only its path operands."""
+    if not argv:
+        return None
+    command = argv[0]
+    spec = _SHELL_READ_COMMAND_SPECS.get(command)
+    if spec is None:
+        return None
+    arguments = argv[1:]
+    if command == "rg":
+        if not arguments or arguments[0] != "--no-config":
+            return None
+        arguments = arguments[1:]
+
+    positional: list[str] = []
+    options_ended = False
+    index = 0
+    while index < len(arguments):
+        argument = arguments[index]
+        if not options_ended and argument == "--":
+            options_ended = True
+            index += 1
+            continue
+        if not options_ended and argument.startswith("-") and argument != "-":
+            if argument in spec.value_options:
+                if index + 1 >= len(arguments):
+                    return None
+                index += 2
+                continue
+            if argument in spec.exact_options or argument.startswith(spec.option_prefixes):
+                index += 1
+                continue
+            return None
+        positional.append(argument)
+        index += 1
+
+    skipped = 0 if command == "rg" and "--files" in arguments else spec.positional_values_before_paths
+    if len(positional) < skipped:
+        return None
+    paths = positional[skipped:]
+    if (
+        command == "grep"
+        and not paths
+        and any(option in arguments for option in ("-r", "--recursive"))
+    ):
+        paths = ["."]
+    if not paths and spec.default_path is not None:
+        paths = [spec.default_path]
+    return tuple(paths)
+
+
 def _target_matches_read_only_shell_command(argv: list[str]) -> bool:
     """Validate an argv against the scheduler/poller read-only profile."""
     if _target_matches_chainlink_command(argv):
@@ -2187,66 +2318,11 @@ def _target_matches_read_only_shell_command(argv: list[str]) -> bool:
 
     if command == "pwd":
         return set(arguments) <= {"-L", "-P"}
-    if command == "ls":
-        return _arguments_match_allowlist(
-            arguments,
-            exact_options=frozenset({
-                "-1", "-A", "-a", "-d", "-F", "-h", "-l", "-la", "-al",
-                "-ld", "-dl", "-lh", "-hl", "--all", "--almost-all", "--directory",
-                "--classify", "--human-readable",
-            }),
-            option_prefixes=("--color=",),
-        )
-    if command == "wc":
-        return _arguments_match_allowlist(
-            arguments,
-            exact_options=frozenset({
-                "-c", "-l", "-L", "-m", "-w", "--bytes", "--chars",
-                "--lines", "--max-line-length", "--words",
-            }),
-        )
-    if command == "grep":
-        return _arguments_match_allowlist(
-            arguments,
-            exact_options=frozenset({
-                "-E", "-F", "-H", "-h", "-i", "-l", "-n", "-q", "-r", "-s",
-                "-v", "-w", "-x", "--extended-regexp", "--fixed-strings",
-                "--files-with-matches", "--ignore-case", "--line-number",
-                "--no-messages", "--quiet", "--recursive", "--invert-match",
-                "--with-filename", "--no-filename", "--word-regexp",
-                "--line-regexp",
-            }),
-            option_prefixes=("--exclude=", "--include=", "--exclude-dir="),
-        )
-    if command == "jq":
-        # Filters are intentionally unconstrained: jq is useful precisely as a
-        # JSON expression language. direct_exec_env() must therefore give the
-        # pinned jq child only a minimal non-secret environment; never replace
-        # that control with a filter-text denylist for env/$ENV.
-        return _arguments_match_allowlist(
-            arguments,
-            exact_options=frozenset({
-                "-C", "-M", "-R", "-S", "-c", "-e", "-j", "-r", "-s",
-                "--ascii-output", "--compact-output", "--exit-status",
-                "--join-output", "--monochrome-output", "--null-input",
-                "--raw-input", "--raw-output", "--slurp", "--sort-keys",
-            }),
-        )
-    if command == "rg":
-        # ripgrep's config file can inject --pre. Require --no-config in the
-        # command itself so the allowlist is independent of ambient process env.
-        if not arguments or arguments[0] != "--no-config":
-            return False
-        return _arguments_match_allowlist(
-            arguments[1:],
-            exact_options=frozenset({
-                "-F", "-H", "-L", "-S", "-g", "-h", "-i", "-l", "-n",
-                "-s", "-u", "-v", "-w", "--case-sensitive", "--files",
-                "--files-with-matches", "--fixed-strings", "--glob", "--hidden",
-                "--ignore-case", "--line-number", "--no-heading", "--no-ignore",
-                "--smart-case", "--type", "--type-not", "--word-regexp",
-            }),
-        )
+    # jq filters are intentionally unconstrained. direct_exec_env() gives the
+    # child a minimal environment instead of trying to denylist its language.
+    # rg requires --no-config so ambient configuration cannot inject --pre.
+    if command in _READ_ONLY_SHELL_READ_COMMANDS:
+        return _shell_read_path_operands(argv) is not None
     if command != "git" or not arguments:
         return False
 
@@ -3414,25 +3490,8 @@ def _target_matches_maintenance_shell_command(argv: list[str]) -> bool:
     # readable: ``grep`` and ``rg`` are already admitted and reach the same
     # bytes. Per-command option allowlists, so nothing here can mutate --
     # note ``date`` admits no ``-s``/``--set``, which would set the clock.
-    if argv[0] == "cat":
-        return _arguments_match_allowlist(
-            argv[1:],
-            exact_options=frozenset({
-                "-n", "--number", "-s", "--squeeze-blank", "-E", "--show-ends",
-            }),
-        )
-    if argv[0] in {"head", "tail"}:
-        return _arguments_match_allowlist(
-            argv[1:],
-            exact_options=frozenset({"-q", "-v", "--quiet", "--verbose"}),
-            option_prefixes=("-n", "-c", "--lines=", "--bytes="),
-        )
-    if argv[0] == "stat":
-        return _arguments_match_allowlist(
-            argv[1:],
-            exact_options=frozenset({"-t", "--terse", "-L", "--dereference"}),
-            option_prefixes=("-c", "--format=", "--printf="),
-        )
+    if argv[0] in _SHELL_READ_COMMAND_SPECS:
+        return _shell_read_path_operands(argv) is not None
     if argv[0] == "date":
         return _arguments_match_allowlist(
             argv[1:],
@@ -3665,6 +3724,7 @@ class ServiceShellBindingRule(StrEnum):
     REVIEW_BODY_CAPTURE = "review_body_capture"
     UNKNOWN_PROFILE = "unknown_profile"
     DECLARED_COMMAND_MISMATCH = "declared_command_mismatch"
+    READ_OPERAND_POLICY = "read_operand_policy"
 
 
 def service_shell_argv_for_log(target: str) -> tuple[list[str], bool]:
@@ -3883,9 +3943,141 @@ def _service_shell_not_admitted_reason(argv: list[str], destination: str) -> str
     )
 
 
+_SHELL_RECURSIVE_READ_ENTRY_LIMIT = 256
+_SHELL_RECURSIVE_READ_BYTE_LIMIT = 8 * 1024 * 1024
+
+
+def _service_shell_read_operand_refusal(
+    service: "ServicePrincipal",
+    argv: list[str],
+    *,
+    auth_context: "AuthContext | None" = None,
+    read_cwd: str | Path | None = None,
+    review_state: Any = None,
+) -> str | None:
+    """Apply the typed-read boundary, returning a bounded refusal reason."""
+    operands = _shell_read_path_operands(argv)
+    if operands is None:
+        return None
+    spec = _SHELL_READ_COMMAND_SPECS[argv[0]]
+    base = Path(read_cwd) if read_cwd is not None else None
+    if base is None and review_state is not None:
+        review_root = getattr(review_state, "root", None)
+        if isinstance(review_root, str) and review_root:
+            base = Path(review_root)
+    if base is None:
+        home = os.environ.get("MIMIR_HOME", "").strip()
+        base = Path(home) if home else None
+
+    recursive = argv[0] == "rg" or (
+        argv[0] == "grep" and any(value in argv[1:] for value in ("-r", "--recursive"))
+    )
+    reads_content = spec.reads_content and not (
+        argv[0] == "rg" and "--files" in argv[1:]
+    )
+    include_hidden = argv[0] != "rg" or (
+        "--hidden" in argv[1:]
+        or argv[1:].count("-u") >= 2
+        or any(
+            value in {"-g", "--glob"} or value.startswith("--glob=")
+            for value in argv[1:]
+        )
+    )
+    if argv[0] == "rg" and "-L" in argv[1:]:
+        return "ripgrep symlink following cannot be bounded by the admission walk"
+
+    entry_count = 0
+    content_bytes = 0
+    for raw in operands:
+        candidate = Path(raw)
+        if not candidate.is_absolute():
+            if base is None:
+                return "a relative filesystem operand has no authoritative execution cwd"
+            candidate = base / candidate
+        try:
+            resolved = candidate.resolve(strict=True)
+        except (OSError, RuntimeError):
+            return "a filesystem operand could not be resolved"
+        tool_name = "ls" if resolved.is_dir() else "read_file" if reads_content else "ls"
+        if not _trigger_service_read_target_is_allowed(
+            service, tool_name, {"path": str(candidate)}, auth_context=auth_context,
+        ):
+            return "a filesystem operand is outside the read roots or withheld"
+        if not resolved.is_dir():
+            continue
+        if not recursive:
+            # Content readers do not accept directory operands unless their
+            # admitted recursive mode can be checked entry by entry.
+            if reads_content:
+                return "a content reader needs recursive mode for a directory operand"
+            continue
+
+        # A content reader can print an entire matching line, and options such as
+        # grep -h remove source-path provenance from the result. The result layer
+        # therefore cannot reliably apply the path/content veto after execution.
+        # Preflight only the entries the command may read, but cap that speculative
+        # work by both entry count and candidate content bytes so admission never
+        # scans an unbounded tree or a few enormous files. os.scandir is used
+        # directly because os.walk materializes every child of one directory before
+        # yielding, which would make even an entry cap scale with a wide directory.
+        pending = [resolved]
+        while pending:
+            directory_path = pending.pop()
+            try:
+                with os.scandir(directory_path) as entries:
+                    for entry in entries:
+                        if not include_hidden and entry.name.startswith("."):
+                            continue
+                        entry_count += 1
+                        if entry_count > _SHELL_RECURSIVE_READ_ENTRY_LIMIT:
+                            return (
+                                "recursive read preflight exceeded the "
+                                f"{_SHELL_RECURSIVE_READ_ENTRY_LIMIT}-entry limit at "
+                                f"{directory_path}; narrow the operand or use a typed search tool"
+                            )
+                        child = Path(entry.path)
+                        try:
+                            child_is_directory = entry.is_dir(follow_symlinks=False)
+                        except OSError:
+                            return f"recursive read preflight could not inspect {child}"
+                        if reads_content and not child_is_directory:
+                            try:
+                                content_bytes += entry.stat(follow_symlinks=False).st_size
+                            except OSError:
+                                return f"recursive read preflight could not inspect {child}"
+                            if content_bytes > _SHELL_RECURSIVE_READ_BYTE_LIMIT:
+                                return (
+                                    "recursive read preflight exceeded the "
+                                    f"{_SHELL_RECURSIVE_READ_BYTE_LIMIT}-byte content limit at "
+                                    f"{child}; narrow the operand or use a typed search tool"
+                                )
+                        child_tool = "ls" if child_is_directory or not reads_content else "read_file"
+                        if not _trigger_service_read_target_is_allowed(
+                            service,
+                            child_tool,
+                            {"path": str(child)},
+                            auth_context=auth_context,
+                        ):
+                            return f"recursive read preflight withheld {child}"
+                        if child_is_directory:
+                            pending.append(child)
+            except OSError:
+                return f"recursive read preflight could not inspect directory {directory_path}"
+
+        # This is deliberately a point-in-time hardening check, not a claim that
+        # the tree is immutable. Root confinement is re-derived from each resolved
+        # path; a later entry can race the walk, but it cannot widen the principal's
+        # declared roots. A provenance-preserving execution/result filter would be
+        # needed to close that residual race without refusing recursive readers.
+    return None
+
+
 def parse_service_shell_argv_with_diagnostics(
     target: str, destination: str, *, review_state: Any = None,
     declared: tuple["DeclaredShellCommand", ...] = (),
+    service: "ServicePrincipal | None" = None,
+    auth_context: "AuthContext | None" = None,
+    read_cwd: str | Path | None = None,
 ) -> tuple[list[str] | None, str, ServiceShellBindingRule | None]:
     """Return the admitted argv, refusal reason, and stable rejecting rule.
 
@@ -3958,6 +4150,18 @@ def parse_service_shell_argv_with_diagnostics(
     declared_argv = _declared_command_execution_argv(argv, declared)
     if declared_argv is not None:
         return declared_argv, "", None
+
+    if service is not None and _shell_read_path_operands(argv) is not None:
+        read_refusal = _service_shell_read_operand_refusal(
+            service, argv, auth_context=auth_context,
+            read_cwd=read_cwd, review_state=review_state,
+        )
+        if read_refusal is not None:
+            return None, (
+                f"{read_refusal}. The command is refused whole; use a path within "
+                "the declared read scope that contains no protected credential "
+                "material."
+            ), ServiceShellBindingRule.READ_OPERAND_POLICY
 
     allowed = False
     if destination == "scheduler_read_only":
@@ -4054,10 +4258,14 @@ def parse_service_shell_argv_with_diagnostics(
 def parse_service_shell_argv_with_reason(
     target: str, destination: str, *, review_state: Any = None,
     declared: tuple["DeclaredShellCommand", ...] = (),
+    service: "ServicePrincipal | None" = None,
+    auth_context: "AuthContext | None" = None,
+    read_cwd: str | Path | None = None,
 ) -> tuple[list[str] | None, str]:
     """Compatibility view returning only the admitted argv and refusal prose."""
     argv, reason, _rule = parse_service_shell_argv_with_diagnostics(
         target, destination, review_state=review_state, declared=declared,
+        service=service, auth_context=auth_context, read_cwd=read_cwd,
     )
     return argv, reason
 
@@ -4065,10 +4273,14 @@ def parse_service_shell_argv_with_reason(
 def parse_service_shell_argv(
     target: str, destination: str, *, review_state: Any = None,
     declared: tuple["DeclaredShellCommand", ...] = (),
+    service: "ServicePrincipal | None" = None,
+    auth_context: "AuthContext | None" = None,
+    read_cwd: str | Path | None = None,
 ) -> list[str] | None:
     """Argv-only view of :func:`parse_service_shell_argv_with_reason`."""
     return parse_service_shell_argv_with_reason(
         target, destination, review_state=review_state, declared=declared,
+        service=service, auth_context=auth_context, read_cwd=read_cwd,
     )[0]
 
 
@@ -4699,6 +4911,7 @@ def _sink_adapter_admits(
     service: "ServicePrincipal | None" = None,
     *,
     review_state: Any = None,
+    auth_context: "AuthContext | None" = None,
 ) -> bool:
     """Invoke a sink adapter, handing the shell adapter the principal's grants.
 
@@ -4710,6 +4923,10 @@ def _sink_adapter_admits(
     if adapter is None:
         return False
     if adapter is _target_matches_shell_profile:
+        # Authorization validates the argv shape only. Filesystem operands are
+        # resolved once by the execution binder after it has the authoritative
+        # cwd; doing it here both duplicates the admission walk and resolves
+        # relative operands against the wrong base.
         return parse_service_shell_argv(
             target, destination, review_state=review_state,
             declared=getattr(service, "declared_shell_commands", ()) or (),
@@ -5353,6 +5570,7 @@ class SinkGate:
                 if target != triggering:
                     if not _sink_adapter_admits(
                         adapter, target, candidate.destination, service,
+                        auth_context=auth_context,
                     ):
                         return ToolAuthorization(
                             tool_name=tool_name,
@@ -5417,7 +5635,7 @@ class SinkGate:
                     )
                     and _sink_adapter_admits(
                         adapter, target, service_policy.destination, service,
-                        review_state=review_state,
+                        review_state=review_state, auth_context=auth_context,
                     )
                 )
             if (

@@ -68,7 +68,9 @@ from ..access_control import (
     normalize_sink_destination,
     parse_service_shell_argv_with_diagnostics,
     resolve_repository_review_state,
+    ServicePrincipal,
     ServiceShellBindingRule,
+    service_filesystem_read_roots,
     service_shell_argv_for_log,
 )
 from .prohibited_action_guard import check_prohibited_bash, is_bash_tool
@@ -659,10 +661,11 @@ def _record_repo_review_checkout(
         state.mark_checked_out()
 
 
-def _resolve_service_shell_cwd(raw_cwd: object) -> tuple[str | None, str | None]:
-    """Resolve an explicit service cwd within the non-admin read roots."""
-    from ..read_policy import configured_non_admin_read_roots
-
+def _resolve_service_shell_cwd(
+    raw_cwd: object,
+    service: ServicePrincipal | None = None,
+) -> tuple[str | None, str | None]:
+    """Resolve an explicit service cwd within that principal's read roots."""
     if raw_cwd is None:
         # Keep cwd omitted. Direct service execution deliberately bypasses
         # interactive per-session cwd; configured project/Chainlink commands
@@ -680,8 +683,18 @@ def _resolve_service_shell_cwd(raw_cwd: object) -> tuple[str | None, str | None]
     if not resolved.is_dir():
         return None, "working directory is not an accessible directory"
 
+    # Deployment roots keep the ordinary file-tool cwd contract, while the
+    # principal's instance roots cover server-issued workspaces such as a bound
+    # repository checkout. Neither set widens the other principal: both are
+    # server-owned grants and the read-operand boundary applies the principal's
+    # narrower path/content veto before execution.
+    from ..read_policy import configured_non_admin_read_roots
+
     roots: list[Path] = []
-    for root in configured_non_admin_read_roots():
+    for root in (
+        *configured_non_admin_read_roots(),
+        *service_filesystem_read_roots(service),
+    ):
         try:
             resolved_root = root.resolve(strict=True)
         except (OSError, RuntimeError):
@@ -845,7 +858,9 @@ def _request_for_authorized_execution(
     elif Path(argv[0]).name == "chainlink":
         resolved_cwd, cwd_refusal = _resolve_chainlink_service_cwd()
     else:
-        resolved_cwd, cwd_refusal = _resolve_service_shell_cwd(args.get("cwd"))
+        resolved_cwd, cwd_refusal = _resolve_service_shell_cwd(
+            args.get("cwd"), service,
+        )
     if cwd_refusal is not None:
         args["mimir_shell_refusal"] = (
             f"{tool_name} was refused before execution: {cwd_refusal}."
@@ -853,6 +868,26 @@ def _request_for_authorized_execution(
         return sanitized_request.override(
             tool_call={**request.tool_call, "args": args}
         )
+    confined_argv, confinement_refusal, confinement_rule = (
+        parse_service_shell_argv_with_diagnostics(
+            target,
+            policy.destination,
+            review_state=review_state if policy.destination == "repo_review" else None,
+            declared=getattr(service, "declared_shell_commands", ()) or (),
+            service=service,
+            auth_context=auth_context,
+            read_cwd=resolved_cwd,
+        )
+    )
+    if confined_argv is None:
+        args["mimir_shell_refusal"] = (
+            f"{tool_name} was refused before execution: {confinement_refusal} "
+            f"binding_rule={confinement_rule.value if confinement_rule is not None else 'unknown'}"
+        )
+        return sanitized_request.override(
+            tool_call={**request.tool_call, "args": args}
+        )
+    argv = confined_argv
     if resolved_cwd is not None:
         args["cwd"] = resolved_cwd
     args["mimir_direct_argv"] = argv
