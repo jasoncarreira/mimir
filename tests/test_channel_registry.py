@@ -222,23 +222,21 @@ async def test_post_job_failure_notice_applies_boundary_redaction():
     reg = ChannelRegistry()
     bridge = _bridge("rec", ("rec-",))
     reg.register(bridge)
-    covered = "xoxb-A0123456789-abcdef"
-    uncovered = "xapp-1-A0LEAKPROBE1234"
+    slack_bot = "xoxb-A0123456789-abcdef"
+    slack_app = "xapp-1-A0LEAKPROBE1234567890abc"
 
     await post_job_failure_notice(
         reg,
         "rec-ops",
         label="github-activity",
-        error=f"RuntimeError: covered={covered} uncovered={uncovered}",
+        error=f"RuntimeError: slack_bot={slack_bot} slack_app={slack_app}",
     )
 
     assert len(bridge.sent) == 1
     _, text = bridge.sent[0]
     assert "[REDACTED]" in text
-    assert covered not in text
-    # This test proves the notice uses the shared redaction boundary. Expanding
-    # the shared token corpus to cover xapp-/tvly-/pa-/bare JWTs is #1391.
-    assert uncovered in text
+    assert slack_bot not in text
+    assert slack_app not in text
 
 
 @pytest.mark.asyncio
