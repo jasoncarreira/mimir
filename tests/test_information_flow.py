@@ -316,7 +316,18 @@ def test_poller_trust_requires_service_stamp_and_non_http_ingress(
     assert ingress.integrity == expected_integrity
 
 
-def test_poller_own_channel_is_trusted_informational_without_external_ingest() -> None:
+@pytest.mark.parametrize(
+    ("channel_id", "expected_integrity", "expected_effect"),
+    [
+        ("poller:github-activity", "trusted", "informational"),
+        ("poller:other", "untrusted", "active_ingest"),
+    ],
+)
+def test_poller_own_channel_trust_requires_configured_memory_directory(
+    channel_id: str,
+    expected_integrity: str,
+    expected_effect: str,
+) -> None:
     service = ServicePrincipal(
         canonical="poller:github-activity",
         trigger="poller",
@@ -324,7 +335,7 @@ def test_poller_own_channel_is_trusted_informational_without_external_ingest() -
     )
     event = AgentEvent(
         trigger="poller",
-        channel_id="poller:github-activity",
+        channel_id=channel_id,
         source="poller",
         service_principal=service.canonical,
         service_authority=service,
@@ -334,9 +345,9 @@ def test_poller_own_channel_is_trusted_informational_without_external_ingest() -
     source = next(iter(labels.sources))
 
     assert (source.integrity, source.integrity_effect) == (
-        "trusted", "informational",
+        expected_integrity, expected_effect,
     )
-    assert labels.has_untrusted_active_ingest is False
+    assert labels.has_untrusted_active_ingest is (expected_integrity == "untrusted")
 
 
 def test_poller_own_channel_does_not_declassify_external_item() -> None:
