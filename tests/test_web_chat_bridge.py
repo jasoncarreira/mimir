@@ -210,7 +210,7 @@ async def test_authenticated_web_and_discord_continuity_both_directions(tmp_path
         )
     )
 
-    discord_activity = buf.assemble_recent_activity(
+    discord_activity = buf.assemble_recent_activity_candidates(
         channel_id="discord-general",
         author="discord-238367217903730690",
         recent_per_channel=10,
@@ -231,7 +231,7 @@ async def test_authenticated_web_and_discord_continuity_both_directions(tmp_path
 
     replayed = MessageBuffer(history_path=history_path, resolver=resolver)
     assert replayed.replay() == 2
-    replayed_activity = replayed.assemble_recent_activity(
+    replayed_activity = replayed.assemble_recent_activity_candidates(
         channel_id="discord-general",
         author="discord-238367217903730690",
         recent_per_channel=10,
@@ -266,7 +266,7 @@ async def test_authenticated_web_and_discord_continuity_both_directions(tmp_path
             source="discord",
         )
     )
-    web_activity = reverse.assemble_recent_activity(
+    web_activity = reverse.assemble_recent_activity_candidates(
         channel_id=web_event.channel_id,
         author=web_event.author,
         recent_per_channel=10,
@@ -278,39 +278,6 @@ async def test_authenticated_web_and_discord_continuity_both_directions(tmp_path
         "discord question",
         "discord answer",
     ]
-
-
-@pytest.mark.asyncio
-async def test_cross_platform_pull_never_matches_shared_display_name_or_public_dm(tmp_path):
-    resolver = _cross_platform_resolver(tmp_path)
-    buf = MessageBuffer(
-        history_path=tmp_path / "chat_history.jsonl",
-        resolver=resolver,
-    )
-    for channel_id, content, author in (
-        ("web-riley", "other user's public message", "riley"),
-        ("dm-discord-jason", "same user's private message", "jason"),
-    ):
-        await buf.append(
-            buf.make_message(
-                channel_id=channel_id,
-                kind="user_message",
-                content=content,
-                author=author,
-                author_display="Jason Carreira",
-                source="web" if channel_id.startswith("web-") else "discord",
-            )
-        )
-
-    activity = buf.assemble_recent_activity(
-        channel_id="discord-general",
-        author="discord-238367217903730690",
-        recent_per_channel=10,
-        recent_author_cross=10,
-        cross_hours=24,
-        source_allowlist=frozenset({"web", "discord"}),
-    )
-    assert activity == []
 
 
 @pytest.mark.asyncio

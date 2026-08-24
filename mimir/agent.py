@@ -1470,7 +1470,7 @@ class Agent:
         ifc_labels: InformationFlowLabels,
     ) -> None:
         """Append an inbound event to the ``MessageBuffer`` so future
-        ``assemble_recent_activity`` calls see it. Skip rules match
+        ``assemble_recent_activity_candidates`` calls see it. Skip rules match
         pre-#181's ``_record_inbound``: drop empty-content events
         and internal-wake triggers (``saga_session_end``,
         ``shell_job_complete``); log everything else.
@@ -2651,7 +2651,7 @@ class Agent:
     ) -> TurnRecord:
 
         # Persist the inbound event to the chat-history buffer + JSONL
-        # BEFORE any other turn work so ``assemble_recent_activity``
+        # BEFORE any other turn work so ``assemble_recent_activity_candidates``
         # in ``_build_turn_prompt`` sees this turn's own trigger as
         # context. No-op for triggers that don't represent conversation
         # (scheduled_tick / saga_session_end / shell_job_complete).

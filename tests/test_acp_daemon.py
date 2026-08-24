@@ -50,6 +50,24 @@ def test_enabled_false_values_skip_unsupported(monkeypatch: pytest.MonkeyPatch) 
         assert acp_enabled_from_env() is False
 
 
+@pytest.mark.parametrize("value", [None, "", "   "])
+def test_acp_is_disabled_without_explicit_truthy_value(
+    monkeypatch: pytest.MonkeyPatch,
+    value: str | None,
+) -> None:
+    if value is None:
+        monkeypatch.delenv("MIMIR_ACP_ENABLED", raising=False)
+    else:
+        monkeypatch.setenv("MIMIR_ACP_ENABLED", value)
+    assert acp_enabled_from_env() is False
+
+
+def test_acp_typo_is_startup_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("MIMIR_ACP_ENABLED", "flase")
+    with pytest.raises(AcpDaemonError, match="not a recognised boolean"):
+        acp_enabled_from_env()
+
+
 def test_explicit_enable_fails_without_peer_credentials(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr("mimir.acp.daemon.peer_credentials_supported", lambda: False)
     monkeypatch.setenv("MIMIR_ACP_ENABLED", "true")

@@ -176,6 +176,7 @@ async def test_recent_for_channel_is_exactly_channel_scoped(tmp_path: Path):
 @pytest.mark.asyncio
 async def test_assemble_public_activity_pulls_same_user_not_global_pool(tmp_path: Path):
     buf = _make_buffer(tmp_path)
+    buf.resolver = _StrictResolver({"alice": "alice", "bob": "bob"})
     for channel, kind, content, author, offset in [
         ("eng", "user_message", "alice-elsewhere", "alice", -3),
         ("eng", "assistant_message", "assistant-reply", None, -2),
@@ -186,7 +187,7 @@ async def test_assemble_public_activity_pulls_same_user_not_global_pool(tmp_path
             channel_id=channel, kind=kind, content=content, author=author,
             ts=_now_iso(offset_minutes=offset),
         ))
-    out = buf.assemble_recent_activity(
+    out = buf.assemble_recent_activity_candidates(
         channel_id="help", author="alice", recent_per_channel=10,
         recent_author_cross=10, cross_hours=24,
     )
@@ -202,6 +203,7 @@ async def test_assemble_activity_excludes_other_users_adjacent_replies(
 ):
     """Only assistant replies following the target user's anchor may cross channels."""
     buf = _make_buffer(tmp_path)
+    buf.resolver = _StrictResolver({"alice": "alice", "bob": "bob"})
     for channel, kind, content, author, offset in [
         ("general", "user_message", "alice-anchor", "alice", -4),
         ("general", "assistant_message", "reply-to-alice", None, -3),
@@ -214,7 +216,7 @@ async def test_assemble_activity_excludes_other_users_adjacent_replies(
             ts=_now_iso(offset_minutes=offset),
         ))
 
-    out = buf.assemble_recent_activity(
+    out = buf.assemble_recent_activity_candidates(
         channel_id=target_channel, author="alice", recent_per_channel=10,
         recent_author_cross=10, cross_hours=24,
     )
@@ -226,16 +228,16 @@ async def test_assemble_activity_excludes_other_users_adjacent_replies(
 
 @pytest.mark.asyncio
 async def test_assemble_public_activity_resolves_cross_platform_aliases(tmp_path: Path):
-    class Resolver:
-        def resolve(self, author):
-            return {"discord-alice": "alice", "slack-alice": "alice"}.get(author, author)
-
-    buf = MessageBuffer(history_path=tmp_path / "chat.jsonl", resolver=Resolver())
+    resolver = _StrictResolver({
+        "discord-alice": "alice",
+        "slack-alice": "alice",
+    })
+    buf = MessageBuffer(history_path=tmp_path / "chat.jsonl", resolver=resolver)
     await buf.append(buf.make_message(
         channel_id="discord-eng", kind="user_message", content="same-person",
         author="discord-alice", ts=_now_iso(offset_minutes=-1),
     ))
-    out = buf.assemble_recent_activity(
+    out = buf.assemble_recent_activity_candidates(
         channel_id="slack-help", author="slack-alice", recent_per_channel=10,
         recent_author_cross=10, cross_hours=24,
     )
@@ -245,6 +247,7 @@ async def test_assemble_public_activity_resolves_cross_platform_aliases(tmp_path
 @pytest.mark.asyncio
 async def test_assemble_dm_activity_never_imports_other_users_dms(tmp_path: Path):
     buf = _make_buffer(tmp_path)
+    buf.resolver = _StrictResolver({"alice": "alice", "bob": "bob"})
     for channel, content, author, offset in [
         ("dm-discord-alice", "alice-private", "alice", -2),
         ("dm-discord-bob", "bob-secret", "bob", -1),
@@ -254,7 +257,7 @@ async def test_assemble_dm_activity_never_imports_other_users_dms(tmp_path: Path
             channel_id=channel, kind="user_message", content=content, author=author,
             ts=_now_iso(offset_minutes=offset),
         ))
-    out = buf.assemble_recent_activity(
+    out = buf.assemble_recent_activity_candidates(
         channel_id="dm-slack-alice", author="alice", recent_per_channel=10,
         recent_author_cross=10, cross_hours=24,
     )
@@ -651,7 +654,7 @@ async def test_assemble_recent_activity_skips_synthetic_scheduler_channels(tmp_p
     # is the load-bearing thing (per PR #127 review tightening).
     assert len(buf.recent_for_channel("scheduler:heartbeat", limit=10)) == 1
 
-    out = buf.assemble_recent_activity(
+    out = buf.assemble_recent_activity_candidates(
         channel_id="scheduler:heartbeat",
         author=None,  # ticks have no inbound author
         recent_per_channel=10,
@@ -683,7 +686,7 @@ async def test_assemble_recent_activity_skips_all_scheduler_prefixed_channels(
         # ``channel_id`` to isolate this iteration's contribution.
         pool = buf.recent_for_channel(ch, limit=100)
         assert any(m.channel_id == ch for m in pool)
-        out = buf.assemble_recent_activity(
+        out = buf.assemble_recent_activity_candidates(
             channel_id=ch,
             author=None,
             recent_per_channel=10,
@@ -717,7 +720,7 @@ async def test_assemble_recent_activity_skips_synthetic_poller_channels(
         # ``channel_id`` to isolate this iteration's contribution.
         pool = buf.recent_for_channel(ch, limit=100)
         assert any(m.channel_id == ch for m in pool)
-        out = buf.assemble_recent_activity(
+        out = buf.assemble_recent_activity_candidates(
             channel_id=ch,
             author=None,
             recent_per_channel=10,
@@ -741,7 +744,7 @@ async def test_assemble_recent_activity_real_channel_still_pulls(tmp_path: Path)
         )
     )
 
-    out = buf.assemble_recent_activity(
+    out = buf.assemble_recent_activity_candidates(
         channel_id="discord-100000000000000002",
         author="jason",
         recent_per_channel=10,
@@ -1044,7 +1047,6 @@ def test_message_buffer_consumer_inventory_is_closed() -> None:
         "recent_in_channel",
         "cross_author_messages",
         "cross_author_context",
-        "assemble_recent_activity",
         "assemble_recent_activity_candidates",
         "replay",
         "evict_channel",
@@ -1121,8 +1123,6 @@ def test_message_buffer_consumer_inventory_is_closed() -> None:
         ("mimir/bridges/web_chat.py", "WebChatBridge._handle_history", "buffer.recent_in_channel"),
         ("mimir/bridges/web_chat.py", "WebChatBridge._handle_history", "get_global_buffer"),
         ("mimir/history.py", "MessageBuffer.append", "self._append_in_memory"),
-        ("mimir/history.py", "MessageBuffer.assemble_recent_activity", "self.cross_author_context"),
-        ("mimir/history.py", "MessageBuffer.assemble_recent_activity", "self.recent_for_channel"),
         ("mimir/history.py", "MessageBuffer.cross_author_context", "self.cross_author_messages"),
         ("mimir/history.py", "MessageBuffer.replay", "self._append_in_memory"),
         ("mimir/runtime.py", "_clear_runtime_globals", "set_global_buffer"),

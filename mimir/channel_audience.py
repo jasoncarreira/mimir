@@ -26,6 +26,20 @@ class ServerChannelAudienceProvider:
     identity_resolver: IdentityResolver | None = field(
         default=None, repr=False, kw_only=True
     )
+    _session_store: SessionStore | None = field(
+        default=None, init=False, repr=False, compare=False
+    )
+    _session_audiences: dict[
+        tuple[str, str], tuple[tuple[object, object], Audience]
+    ] = field(
+        default_factory=dict, init=False, repr=False, compare=False
+    )
+
+    def __post_init__(self) -> None:
+        if self.identity_resolver is None:
+            resolver = IdentityResolver(self.home)
+            resolver.reload()
+            object.__setattr__(self, "identity_resolver", resolver)
 
     def audience_for(
         self,
@@ -38,11 +52,32 @@ class ServerChannelAudienceProvider:
         try:
             if channel_id.startswith("acp:"):
                 session_id = channel_id.removeprefix("acp:")
-                record = SessionStore(self.home).load_owned(session_id, principal)
-                return frozenset({record.owner_principal})
-            resolver = IdentityResolver(self.home)
-            resolver.reload()
-            identity = resolver.identity(principal)
+                key = (session_id, principal)
+                store = self._session_store
+                if store is None:
+                    store = SessionStore(self.home)
+                    object.__setattr__(self, "_session_store", store)
+                journal, metadata = store.paths(session_id)
+
+                def signature(path: Path) -> object:
+                    try:
+                        info = path.lstat()
+                    except OSError:
+                        return None
+                    return (info.st_mtime_ns, info.st_size, info.st_mode, info.st_uid)
+
+                signatures = (signature(metadata), signature(journal))
+                cached = self._session_audiences.get(key)
+                if cached is not None and cached[0] == signatures:
+                    return cached[1]
+                try:
+                    record = store.load_owned(session_id, principal)
+                    audience: Audience = frozenset({record.owner_principal})
+                except Exception:
+                    audience = None
+                self._session_audiences[key] = (signatures, audience)
+                return audience
+            identity = self.identity_resolver.identity(principal)
             if identity is None or channel_id not in identity.dm_channels.values():
                 return None
             return frozenset({identity.canonical})

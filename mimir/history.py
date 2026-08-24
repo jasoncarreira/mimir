@@ -32,7 +32,7 @@ from .scheduler import SCHEDULER_CHANNEL_PREFIX
 
 #: Channel-id prefixes that identify synthetic per-tick channels (no
 #: narrative continuity across turns — each turn has a discrete job).
-#: Used by :meth:`MessageBuffer.assemble_recent_activity` to skip the
+#: Used by :meth:`MessageBuffer.assemble_recent_activity_candidates` to skip the
 #: within-channel pull for these channels. Chainlink #78 (2026-05-11)
 #: extended via PR #127 review (poller:* added 2026-05-11).
 SYNTHETIC_CHANNEL_PREFIXES = (SCHEDULER_CHANNEL_PREFIX, POLLER_CHANNEL_PREFIX)
@@ -366,7 +366,7 @@ class MessageBuffer:
         """Last ``limit`` messages from exactly ``channel_id``.
 
         Cross-channel context is assembled separately by
-        :meth:`assemble_recent_activity`, where it can be scoped to the
+        :meth:`assemble_recent_activity_candidates`, where it can be scoped to the
         initiating user's canonical identity. Keeping this primitive exact is
         also the privacy boundary for DMs and contextual query rewriting.
 
@@ -513,82 +513,6 @@ class MessageBuffer:
         if self.resolver is None or author is None:
             return author
         return self.resolver.resolve(author)
-
-    def assemble_recent_activity(
-        self,
-        *,
-        channel_id: str,
-        author: str | None,
-        recent_per_channel: int,
-        recent_author_cross: int,
-        cross_hours: int,
-        source_allowlist: frozenset[str] | None = None,
-    ) -> list[Message]:
-        """Merge within-channel + cross-channel author streams, chronological.
-
-        Cross-channel pull is skipped when ``author`` is None (e.g. scheduled
-        ticks have no inbound author).
-
-        Within-channel pull is **also** skipped when ``channel_id`` is a
-        synthetic per-tick channel — ``scheduler:*`` (heartbeat, reflect,
-        saga-consolidate, introspection-report) or ``poller:*`` (each
-        registered poller's emitted-event channel). See
-        :data:`SYNTHETIC_CHANNEL_PREFIXES`. Those channels only ever
-        hold prior assistant scheduled-tick or poller-event replies —
-        no narrative continuity, no useful prior context. Each
-        synthetic tick has a specific job (heartbeat picks ONE backlog
-        item; reflect looks at agent behavior across the week; a
-        poller turn responds to one discrete external event) that
-        doesn't benefit from chat-tail context, and cross-tick
-        assistant-reply tail just inflates the prompt without
-        informing the work. Chainlink #78 (2026-05-11); ``poller:``
-        added via PR #127 review (same review-thread).
-
-        ``source_allowlist`` (SPEC §5.4) keeps benchmark / API / scheduler
-        events out of the prompt by default — only "real conversation"
-        sources participate. Mirrors open-strix's hard-coded
-        ``{"discord","web","stdin"}`` filter (``app.py:734``).
-        """
-        if (
-            channel_id.startswith(SYNTHETIC_CHANNEL_PREFIXES)
-            or recent_per_channel <= 0
-        ):
-            # Synthetic scheduler:* or poller:* channel — no useful
-            # prior context. See docstring above for rationale.
-            within: list[Message] = []
-        else:
-            within = self.recent_for_channel(
-                channel_id, recent_per_channel, source_allowlist=source_allowlist
-            )
-        cross: list[Message] = []
-        if author:
-            # Public targets import only the same canonical user's public
-            # activity. Private targets may also import that same user's
-            # other DMs (for example, their Slack and Discord aliases), but
-            # never another canonical user's private conversation.
-            cross = self.cross_author_context(
-                author=author,
-                exclude_channel=channel_id,
-                limit=recent_author_cross,
-                within_hours=cross_hours,
-                source_allowlist=source_allowlist,
-                include_private=_is_private_channel(channel_id),
-            )
-
-        # Merge by ts (string ISO compares lexicographically).
-        merged = sorted(within + cross, key=lambda m: m.ts)
-
-        # De-dup on (channel_id, msg_id, ts) so the same message doesn't
-        # appear twice if a cross-pull happens to overlap (unlikely but cheap).
-        seen: set[tuple] = set()
-        unique: list[Message] = []
-        for m in merged:
-            key = (m.channel_id, m.msg_id, m.ts)
-            if key in seen:
-                continue
-            seen.add(key)
-            unique.append(m)
-        return unique
 
     def assemble_recent_activity_candidates(
         self,
