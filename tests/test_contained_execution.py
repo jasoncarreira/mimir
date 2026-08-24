@@ -68,11 +68,13 @@ def install_client(monkeypatch: pytest.MonkeyPatch, client: Client) -> None:
 
 @pytest.mark.asyncio
 async def test_execute_contained_returns_only_a_capped_collected_value(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     client = Client(b"abcdef", b"12345")
     install_client(monkeypatch, client)
 
+    stdout_path = tmp_path / "run.stdout.log"
+    stderr_path = tmp_path / "run.stderr.log"
     result = await execute_contained(
         ("tool", "arg"),
         Capability(),
@@ -81,6 +83,8 @@ async def test_execute_contained_returns_only_a_capped_collected_value(
         timeout_s=1,
         stdout_limit=4,
         stderr_limit=3,
+        stdout_path=stdout_path,
+        stderr_path=stderr_path,
     )
 
     assert result.exit_code == 0
@@ -92,6 +96,10 @@ async def test_execute_contained_returns_only_a_capped_collected_value(
     assert client.cancelled == ["aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"]
     assert client.launched[0]["local_checkout"] == Capability.path
     assert client.launched[0]["timeout_s"] == 1
+    assert stdout_path.read_bytes() == b"abcd"
+    assert stderr_path.read_bytes() == b"123"
+    assert stdout_path.stat().st_mode & 0o777 == 0o600
+    assert stderr_path.stat().st_mode & 0o777 == 0o600
 
 
 @pytest.mark.asyncio

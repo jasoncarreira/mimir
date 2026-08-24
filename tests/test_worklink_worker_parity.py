@@ -374,6 +374,48 @@ async def run_direct(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("termination", ["sigterm", "timeout"])
+async def test_direct_terminated_output_is_durable_while_running(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, termination: str
+) -> None:
+    monkeypatch.setattr("mimir.worklink.checkout.coding_enabled", lambda: False)
+    backend = LocalSubprocessComputeBackend()
+    work = direct_spec(
+        "import os,time; "
+        "os.write(1,b'before termination\\n'); "
+        "os.write(2,b'diagnostic stderr\\n'); time.sleep(30)"
+    )
+    output_root = tmp_path / "state" / "worklink" / "transcripts"
+    object.__setattr__(work, "output_root", output_root)
+    handle = await backend.launch(work)
+
+    stdout_files: list[Path] = []
+    for _ in range(200):
+        stdout_files = list(output_root.glob("*.stdout.log"))
+        if stdout_files and stdout_files[0].read_bytes() == b"before termination\n":
+            break
+        await asyncio.sleep(0.01)
+    assert len(stdout_files) == 1
+    assert stdout_files[0].read_bytes() == b"before termination\n"
+
+    if termination == "sigterm":
+        await backend.cancel(handle)
+        result = await backend.wait(handle, 2)
+        assert result.timed_out is False
+    else:
+        result = await backend.wait(handle, 0.01)
+        assert result.timed_out is True
+    await backend.cleanup(handle)
+
+    assert result.stdout_path == stdout_files[0]
+    assert result.stdout_path.read_text() == "before termination\n"
+    assert result.stderr_path is not None
+    assert result.stderr_path.read_text() == "diagnostic stderr\n"
+    assert result.stdout_path.stat().st_mode & 0o777 == 0o600
+    assert result.stderr_path.stat().st_mode & 0o777 == 0o600
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("trigger", ["timeout", "overflow"])
 async def test_direct_termination_kills_pipe_holding_grandchild(
     monkeypatch: pytest.MonkeyPatch, trigger: str

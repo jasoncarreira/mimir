@@ -203,6 +203,7 @@ async def _drain(
     limit: int,
     overflow: Any,
     scrubber: Any = None,
+    output_path: Path | None = None,
 ) -> tuple[bytes, int]:
     if stream is None:
         return b"", 0
@@ -214,14 +215,35 @@ async def _drain(
     retained = bytearray()
     total = 0
     overflowed = False
-    while chunk := await stream.read(64 * 1024):
-        total += len(chunk)
-        room = max(0, ceiling - len(retained))
-        if room:
-            retained.extend(chunk[:room])
-        if total > limit and not overflowed:
-            overflowed = True
-            overflow()
+    output_fd = None
+    if output_path is not None:
+        output_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        output_fd = os.open(
+            output_path,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+            0o600,
+        )
+    try:
+        while chunk := await stream.read(64 * 1024):
+            previous_total = total
+            total += len(chunk)
+            captured = chunk[:max(0, limit - previous_total)]
+            if captured and output_fd is not None:
+                remaining = memoryview(captured)
+                while remaining:
+                    written = os.write(output_fd, remaining)
+                    if written <= 0:
+                        raise OSError("incomplete Worklink output write")
+                    remaining = remaining[written:]
+            room = max(0, ceiling - len(retained))
+            if room:
+                retained.extend(chunk[:room])
+            if total > limit and not overflowed:
+                overflowed = True
+                overflow()
+    finally:
+        if output_fd is not None:
+            os.close(output_fd)
     if total <= limit:
         return bytes(retained), 0
     keep = (
@@ -254,6 +276,8 @@ async def execute_contained(
     stdout_limit: int,
     stderr_limit: int,
     scrubber: Any = None,
+    stdout_path: Path | None = None,
+    stderr_path: Path | None = None,
 ) -> CollectedExecutionResult:
     if stdout_limit <= 0 or stderr_limit <= 0:
         raise ValueError("worker output limits must be positive")
@@ -303,10 +327,10 @@ async def execute_contained(
 
     async def collect() -> tuple[int | None, bytes, int, bytes, int]:
         stdout_task = asyncio.create_task(
-            _drain(process.stdout, stdout_limit, overflow, scrubber)
+            _drain(process.stdout, stdout_limit, overflow, scrubber, stdout_path)
         )
         stderr_task = asyncio.create_task(
-            _drain(process.stderr, stderr_limit, overflow, scrubber)
+            _drain(process.stderr, stderr_limit, overflow, scrubber, stderr_path)
         )
         try:
             exit_code = await process.wait()

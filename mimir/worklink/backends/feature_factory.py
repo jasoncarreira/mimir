@@ -612,6 +612,7 @@ class FeatureFactoryBackend:
             },
             local_checkout=order.checkout,
             local_argv=command,
+            output_root=order.transcript_root,
         )
 
     @staticmethod

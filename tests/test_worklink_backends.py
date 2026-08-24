@@ -599,6 +599,7 @@ async def test_local_subprocess_compute_caps_output_and_kills_on_overflow(
         timeout_s=5,
         local_checkout=tmp_path,
         local_argv=("opencode", "run"),
+        output_root=tmp_path / "transcripts",
     )
 
     handle = await backend.launch(spec)
@@ -608,6 +609,10 @@ async def test_local_subprocess_compute_caps_output_and_kills_on_overflow(
     assert result.stdout == "abcd"
     assert result.stderr == "err"
     assert result.output_overflow is True
+    assert result.stdout_path is not None
+    assert result.stderr_path is not None
+    assert result.stdout_path.read_bytes() == b"abcd"
+    assert result.stderr_path.read_bytes() == b"err"
 
     order = WorkOrder(
         issue_id=1,
@@ -625,6 +630,8 @@ async def test_local_subprocess_compute_caps_output_and_kills_on_overflow(
     transcript = json.loads(raw.transcript_path.read_text(encoding="utf-8"))
     assert transcript["stdout"] == "abcd"
     assert transcript["output_overflow"] is True
+    assert transcript["stdout_path"] == str(result.stdout_path)
+    assert transcript["stderr_path"] == str(result.stderr_path)
 
 
 def test_worklink_output_limits_use_safe_defaults_and_env_overrides(
@@ -1168,8 +1175,13 @@ def test_shared_transcript_writer_scrubs_bounds_tail_and_count(
     monkeypatch.setattr(opencode_module, "TRANSCRIPT_STREAM_MAX_BYTES", 80)
     monkeypatch.setattr(opencode_module, "TRANSCRIPTS_PER_ISSUE", 3)
     paths: list[Path] = []
+    output_paths: list[tuple[Path, Path]] = []
     for index in range(5):
         path = opencode_module.transcript_path(tmp_path, 1344)
+        stdout_path = tmp_path / f"opencode-1344-a1-{index}.stdout.log"
+        stderr_path = tmp_path / f"opencode-1344-a1-{index}.stderr.log"
+        stdout_path.write_text(f"raw stdout {index}")
+        stderr_path.write_text(f"raw stderr {index}")
         opencode_module.write_transcript(
             path,
             command=("opencode", "run"),
@@ -1179,12 +1191,17 @@ def test_shared_transcript_writer_scrubs_bounds_tail_and_count(
             stderr="api_key=super-secret-value\n" + f"stderr-tail-{index}",
             timed_out=False,
             output_overflow=False,
+            stdout_path=stdout_path,
+            stderr_path=stderr_path,
         )
         paths.append(path)
+        output_paths.append((stdout_path, stderr_path))
 
     retained = sorted(tmp_path.glob("opencode-1344-*.json"))
     assert len(retained) == 3
     assert not paths[0].exists()
+    assert all(not output.exists() for pair in output_paths[:2] for output in pair)
+    assert all(output.exists() for pair in output_paths[2:] for output in pair)
     newest = json.loads(paths[-1].read_text(encoding="utf-8"))
     assert newest["stdout"].startswith("[earlier output omitted by Worklink]")
     assert newest["stdout"].endswith("stdout-tail-4")
