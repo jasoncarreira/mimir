@@ -245,6 +245,40 @@ async def test_query_falls_back_to_fts_when_query_embedding_is_empty(
 
 
 @pytest.mark.asyncio
+async def test_query_reads_and_scores_triples_once(client, monkeypatch):
+    _patch_provider(monkeypatch)
+    atom = await client.store("Alice prefers concise replies")
+    conn = client._ensure_conn()
+    from mimir.saga.triples import store_triples
+
+    store_triples(
+        conn,
+        [{"subject": "Alice", "predicate": "prefers", "object": "concise"}],
+        source_atom_id=atom["atom_id"],
+        embed_fn=lambda _text: (b"\x00\x00\x80?" * 4, "stub", "stub-4d", 4),
+    )
+    conn.commit()
+    statements: list[str] = []
+    original_operation_conn = client._operation_conn
+
+    def traced_operation_conn():
+        operation_conn, should_close = original_operation_conn()
+        operation_conn.set_trace_callback(statements.append)
+        return operation_conn, should_close
+
+    monkeypatch.setattr(client, "_operation_conn", traced_operation_conn)
+
+    result = await client.query("Alice", top_k=3, auth_context=ADMIN_SCOPE)
+
+    triple_reads = [
+        statement for statement in statements
+        if "FROM triples t" in statement and "JOIN atoms a" in statement
+    ]
+    assert len(triple_reads) == 1
+    assert result["triples"]
+
+
+@pytest.mark.asyncio
 async def test_query_enables_session_boundary_rrf_by_default(tmp_path, monkeypatch):
     _patch_provider(monkeypatch, enable_session_boundary_rrf=True)
     client = SagaStore(db_path=tmp_path / "mimir.saga.db", embedding_dim=4)

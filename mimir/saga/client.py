@@ -309,6 +309,7 @@ def _make_triple_search_fn(
     reference_date=None,
     auth_context: Any = None,
     read_authorization=None,
+    ranked_candidates: list[dict] | None = None,
 ):
     """Closure over the connection matching recall.TripleSearchFn shape.
     Returns None when triples are disabled (the dim arg is None, meaning
@@ -330,6 +331,7 @@ def _make_triple_search_fn(
             reference_date=reference_date,
             auth_context=auth_context,
             read_authorization=read_authorization,
+            ranked_candidates=ranked_candidates,
         )
 
     return _fn
@@ -1014,6 +1016,16 @@ class SagaStore:
             # same provider). Pass dim through so triples with a stale
             # dim get filtered.
             triple_dim = self._embedding_dim
+            from .triples import rank_triple_candidates
+
+            ranked_triples = rank_triple_candidates(
+                conn,
+                query_emb,
+                dim=triple_dim,
+                reference_date=reference_date,
+                auth_context=auth_context,
+                read_authorization=read_authorization,
+            )
             result = _recall(
                 conn,
                 effective_query,
@@ -1036,6 +1048,7 @@ class SagaStore:
                     reference_date=reference_date,
                     auth_context=auth_context,
                     read_authorization=read_authorization,
+                    ranked_candidates=ranked_triples,
                 ),
                 extra_atom_ranked_pathways=extra_pathways,
                 rrf_pathway_weights=pathway_weights,
@@ -1076,6 +1089,7 @@ class SagaStore:
                     reference_date=reference_date,
                     auth_context=auth_context,
                     read_authorization=read_authorization,
+                    ranked_candidates=ranked_triples,
                 )
                 # Strip the internal _cosine field from the wire shape;
                 # keep it out of the agent-facing dict.
@@ -2673,14 +2687,17 @@ class SagaStore:
         params: list = list(auth_params)
         if channel_id:
             params.append(channel_id)
+        recency_index = (
+            "idx_sessions_channel_recency" if channel_id else "idx_sessions_recency"
+        )
 
         rows = conn.execute(
             f"""
             SELECT id, channel_id, started_at, ended_at, summary, reflected_at,
                    embedding
-            FROM sessions
+            FROM sessions INDEXED BY {recency_index}
             WHERE {auth_where} {channel_clause}
-            ORDER BY COALESCE(ended_at, reflected_at) DESC
+            ORDER BY COALESCE(ended_at, reflected_at) DESC, id ASC
             LIMIT 500
             """,
             params,
