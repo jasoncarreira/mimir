@@ -1954,6 +1954,47 @@ def test_deepagents_synthetic_inventory_uses_dispatchable_mimir_tools() -> None:
     )
 
 
+def test_maximal_model_tool_inventory_has_total_protected_result_partition(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from mimir.tools import forge, mcp
+    from mimir.tools.registry import all_mimir_tools
+
+    monkeypatch.setenv("TAVILY_API_KEY", "tvly-test")
+    monkeypatch.delenv("MIMIR_FETCH_URL_DISABLED", raising=False)
+    monkeypatch.setattr(forge, "_github_identity_degraded", False)
+    monkeypatch.setattr(mcp, "get_mcp_tools", lambda: [])
+    names = {
+        *(tool.name for tool in all_mimir_tools(
+            model_spec="openai:test",
+            coding_enabled=True,
+            require_coding_available=False,
+        )),
+        *access_control._deepagents_builtin_tool_names(),
+    }
+    mapped = names & access_control._PROTECTED_RESULT_DOMAINS.keys()
+    exempted = names & access_control._NON_INGESTING_RESULT_TOOLS
+
+    assert mapped.isdisjoint(exempted)
+    assert mapped | exempted == names
+
+
+def test_inventory_assertion_rejects_tool_without_result_classification(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        access_control,
+        "_deepagents_builtin_tool_names",
+        lambda: ("harness_auto_deliver",),
+    )
+
+    with pytest.raises(
+        access_control.CapabilityMatrixError,
+        match="without explicit protected-result classification: harness_auto_deliver",
+    ):
+        access_control.assert_model_tool_inventory_cataloged(model_spec="openai:test")
+
+
 def test_inventory_assertion_rejects_uncataloged_registered_mcp_tool() -> None:
     from mimir.access_control import (
         CapabilityMatrixError,

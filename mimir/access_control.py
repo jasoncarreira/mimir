@@ -5678,6 +5678,20 @@ class SinkGate:
             and category in {SinkCategory.SHELL_PROCESS, SinkCategory.FILE}
         ):
             return frozenset({target})
+        if (
+            category is SinkCategory.FORGE
+            and target is not None
+            and isinstance(sources, tuple)
+            and bool(sources)
+            and all(source.domain == "repository" for source in sources)
+            and _forge_repository_scope_mismatch(
+                ifc_labels,
+                getattr(auth_context, "repo_pr_action_scope", None),
+            ) is None
+        ):
+            # Repository command output may flow only back to the immutable
+            # PR/head scope from which it was produced.
+            return frozenset({target})
         is_triggering_channel_reply = (
             service is not None
             and category is SinkCategory.SAME_CHANNEL
@@ -7653,6 +7667,7 @@ class ToolRegistry:
 
 
 _PROTECTED_RESULT_DOMAINS: dict[str, str] = {
+    "fetch_channel_history": "channel_history",
     "list_channels": "channel_metadata",
     "list_schedules": "schedule_metadata",
     "bash_jobs_list": "shell_jobs",
@@ -7675,7 +7690,13 @@ _PROTECTED_RESULT_DOMAINS: dict[str, str] = {
     "mimir_get_turn": "turn_history",
     "memory_query": "saga",
     "memory_get": "saga",
+    "saga_forget": "saga",
     "commitment_list": "commitments",
+    "shell_exec": "shell",
+    "execute": "shell",
+    "web_search": "web",
+    "worklink_run": "worklink",
+    "spawn_open_code": "coding_worker",
     "pr_metadata": "repository",
     "pr_files": "repository",
     "pr_diff": "repository",
@@ -7689,11 +7710,83 @@ _PROTECTED_RESULT_DOMAINS: dict[str, str] = {
     "repo_test": "repository",
     "repo_diff": "repository",
     "repo_unmerged": "repository",
+    "pr_submit_review": "repository",
+    "pr_inline_review_comment": "repository",
+    "pr_comment": "repository",
+    "issue_comment": "repository",
+    "repo_commit": "repository",
+    "repo_merge": "repository",
+    "repo_merge_abort": "repository",
+    "repo_rebase": "repository",
+    "repo_rebase_abort": "repository",
+    "repo_revert": "repository",
+    "repo_revert_abort": "repository",
+    "repo_push": "repository",
 }
 
-# These BOTH tools return only server-created metadata inline. Their external
-# content remains behind a separately classified read boundary.
-_METADATA_ONLY_RESULT_TOOLS = frozenset({"bash_async", "fetch_url"})
+# Every model-bound tool that does not ingest model-visible content is listed
+# explicitly. This makes exemption a reviewed semantic claim rather than an
+# inference from flow direction.
+_NON_INGESTING_RESULT_TOOLS = frozenset({
+    # Authorization/workflow actions return only server-created status.
+    "approve_declassification",
+    "request_operator_approval",
+    # These writes return identifiers, counts, or fixed status, not stored data.
+    "memory_store",
+    "open_proposal",
+    "submit_proposal",
+    "abandon_proposal",
+    "saga_feedback",
+    "saga_mark_contributions",
+    "saga_end_session",
+    "saga_record_skill_learning",
+    "rebuild_index",
+    # Async shell and fetch return metadata; content is read through a mapped tool.
+    "bash_async",
+    "fetch_url",
+    # Delivery and queue mutations return acknowledgements only.
+    "operator_alert",
+    "send_message",
+    "react",
+    "defer_injected_message",
+    # Scheduler and commitment mutations return normalized status only.
+    "add_schedule",
+    "set_schedule_priority",
+    "remove_schedule",
+    "set_poller_overrides",
+    "reload_pollers",
+    "commitment_complete",
+    "commitment_snooze",
+    "commitment_dismiss",
+    # Self-update returns the server-created pending-update status.
+    "request_mimir_update",
+    # These repository actions construct local acknowledgements without readback.
+    "pr_rerequest_review",
+    "unsupported_operation",
+    "repo_cleanup",
+    "repo_stage",
+    # DeepAgents state/write tools return acknowledgements or remain in-carrier.
+    "write_todos",
+    "write_file",
+    "edit_file",
+    "task",
+})
+
+_REPOSITORY_RESULT_TOOLS = frozenset({
+    "pr_metadata", "pr_files", "pr_diff", "pr_checks", "pr_reviews",
+    "pr_comments", "pr_review_requests", "repo_checkout", "repo_fetch",
+    "repo_status", "repo_test", "repo_diff", "repo_unmerged",
+    "pr_submit_review", "pr_inline_review_comment", "pr_comment",
+    "repo_commit", "repo_merge", "repo_merge_abort",
+    "repo_rebase", "repo_rebase_abort", "repo_revert", "repo_revert_abort",
+    "repo_push",
+})
+_REPOSITORY_MUTATION_RESULT_TOOLS = frozenset({
+    "pr_submit_review", "pr_inline_review_comment", "pr_comment",
+    "repo_commit", "repo_merge", "repo_merge_abort",
+    "repo_rebase", "repo_rebase_abort", "repo_revert", "repo_revert_abort",
+    "repo_push",
+})
 
 # Independent semantic inventory for tools whose results come from a read
 # backend. Startup rejects drift toward SINK/NEITHER before it can suppress
@@ -8096,13 +8189,9 @@ def classify_protected_result(
         return None
 
     args = arguments or {}
-    if tool_name in {
-        "pr_metadata", "pr_files", "pr_diff", "pr_checks", "pr_reviews",
-        "pr_comments", "pr_review_requests", "repo_checkout", "repo_fetch",
-        "repo_status", "repo_test", "repo_diff", "repo_unmerged",
-    }:
+    if tool_name in _REPOSITORY_RESULT_TOOLS:
         scope = authorization.repo_pr_action_scope
-        if scope is None or failed:
+        if scope is None:
             return _incomplete_protected_result("repository", args)
         principal = getattr(auth_context, "canonical_principal", None)
         if getattr(auth_context, "is_service", False) and principal:
@@ -8121,10 +8210,14 @@ def classify_protected_result(
             ),
             source_kind="protected_tool",
             integrity="untrusted",
-            # The immutable authority record already selected this exact PR.
-            # Preserve its confidentiality label without deadlocking the next
-            # scope-bound edit/review operation as fresh active ingress.
-            integrity_effect="informational",
+            # Read results are informational within the immutable PR scope.
+            # Mutation responses and failures can contain Git/forge output, so
+            # they remain active ingestion attributed to that exact scope.
+            integrity_effect=(
+                "active_ingest"
+                if failed or tool_name in _REPOSITORY_MUTATION_RESULT_TOOLS
+                else "informational"
+            ),
         )
         labels = InformationFlowLabels().with_source(source)
         channel = getattr(auth_context, "channel_id", None)
@@ -8219,14 +8312,7 @@ def classify_protected_result(
                 labels = labels.with_source(source)
             return labels
 
-        metadata_only = tool_name in _METADATA_ONLY_RESULT_TOOLS
-        flow_direction = authorization.flow_direction
-        if flow_direction is ToolFlowDirection.UNKNOWN:
-            flow_direction = get_tool_flow_direction(tool_name)
-        if metadata_only or flow_direction not in {
-            ToolFlowDirection.SOURCE,
-            ToolFlowDirection.BOTH,
-        }:
+        if tool_name in _NON_INGESTING_RESULT_TOOLS:
             return None
         # An ingesting native tool without a confidentiality domain still
         # introduces model-visible content. Unknown provenance must taint the
@@ -8810,6 +8896,15 @@ def assert_model_tool_inventory_cataloged(
             ToolFlowDirection.SOURCE, ToolFlowDirection.BOTH,
         }
     })
+    unclassified_results = sorted({
+        tool_name for tool_name in tool_names
+        if not tool_name.startswith(MCPResourceAdapter._MCP_TOOL_PREFIX)
+        and tool_name not in _PROTECTED_RESULT_DOMAINS
+        and tool_name not in _NON_INGESTING_RESULT_TOOLS
+    })
+    overlapping_result_policies = sorted(
+        _PROTECTED_RESULT_DOMAINS.keys() & _NON_INGESTING_RESULT_TOOLS
+    )
     errors: list[str] = []
     if unknown_tools:
         errors.append("UNKNOWN model-bound tools: " + ", ".join(unknown_tools))
@@ -8821,6 +8916,16 @@ def assert_model_tool_inventory_cataloged(
         errors.append(
             "read-backend tools must be IFC SOURCE/BOTH: "
             + ", ".join(misclassified_read_backends)
+        )
+    if unclassified_results:
+        errors.append(
+            "model-bound tools without explicit protected-result classification: "
+            + ", ".join(unclassified_results)
+        )
+    if overlapping_result_policies:
+        errors.append(
+            "model-bound tools both mapped and exempted from result classification: "
+            + ", ".join(overlapping_result_policies)
         )
     if errors:
         raise CapabilityMatrixError(
