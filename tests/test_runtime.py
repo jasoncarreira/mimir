@@ -704,6 +704,7 @@ async def test_runtime_preflight_recovers_after_bounded_transient_retries(
     now = [0.0]
     monkeypatch.setattr(runtime.time, "monotonic", lambda: now[0])
     logged: list[tuple[str, dict[str, Any]]] = []
+    interleave_degradation_on_recovery = [False]
     monkeypatch.setattr(
         mimir.event_logger,
         "log_event_sync",
@@ -712,6 +713,18 @@ async def test_runtime_preflight_recovers_after_bounded_transient_retries(
 
     async def log_event(name: str, **kwargs: Any) -> None:
         logged.append((name, kwargs))
+        if (
+            name == "github_identity_recovered"
+            and interleave_degradation_on_recovery[0]
+        ):
+            interleave_degradation_on_recovery[0] = False
+            forge_tools._latch_github_identity_degraded(
+                GitHubIdentityVerificationError(
+                    "failure during recovery event write",
+                    declared_login="reviewer",
+                    failure_kind=GitHubIdentityFailureKind.TRANSIENT,
+                )
+            )
 
     monkeypatch.setattr(mimir.event_logger, "log_event", log_event)
 
@@ -771,14 +784,25 @@ async def test_runtime_preflight_recovers_after_bounded_transient_retries(
     assert sent == ["ops", "ops"]
 
     now[0] = 240.0
+    interleave_degradation_on_recovery[0] = True
     await adapters.dispatcher._run_turn(object())
 
     assert attempts == [1, 2, 3, 4, 5]
-    assert forge_tools.github_identity_is_degraded() is False
+    assert forge_tools.github_identity_is_degraded() is True
     recovery_events = [
         details for name, details in logged if name == "github_identity_recovered"
     ]
     assert recovery_events == [{"attempts": 3}, {"attempts": 3}]
+
+    degraded_events = [name for name, _ in logged].count("github_identity_degraded")
+    forge_tools._latch_github_identity_degraded(
+        GitHubIdentityVerificationError(
+            "another failure after interleaved degradation",
+            declared_login="reviewer",
+            failure_kind=GitHubIdentityFailureKind.TRANSIENT,
+        )
+    )
+    assert [name for name, _ in logged].count("github_identity_degraded") == degraded_events
     await bundle.aclose()
 
 
