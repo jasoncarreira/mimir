@@ -85,6 +85,28 @@ def test_load_jobs_handles_missing_file(tmp_path: Path):
     assert load_jobs(tmp_path / "nope.yaml") == ([], [])
 
 
+def test_load_jobs_reports_missing_shell_binary_but_keeps_job(tmp_path: Path):
+    path = tmp_path / "scheduler.yaml"
+    missing = tmp_path / "worklink-image-only-cli"
+    path.write_text(yaml.safe_dump([{
+        "name": "heartbeat",
+        "prompt": "continue",
+        "cron": "* * * * *",
+        "shell_commands": [{
+            "exec": "worklink-image-only-cli",
+            "path": str(missing),
+            "subcommands": [["check"]],
+        }],
+    }]))
+
+    jobs, rejections = load_jobs(path)
+
+    assert [job.name for job in jobs] == ["heartbeat"]
+    assert len(rejections) == 1
+    assert rejections[0]["job"] == "heartbeat"
+    assert rejections[0]["reason"].endswith(f"path does not exist: {missing}")
+
+
 def test_scheduler_job_authority_profile_round_trip_and_unknown_rejected(
     tmp_path: Path, caplog: pytest.LogCaptureFixture,
 ):

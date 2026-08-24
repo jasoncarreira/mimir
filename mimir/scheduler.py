@@ -49,6 +49,7 @@ from .billing import normalize_priority
 from .background_tasks import cancel_background_tasks, spawn_background
 from .access_control import (
     SCHEDULER_AUTHORITY_PROFILES,
+    DeclaredShellCommandError,
     agent_writable_roots,
     build_scheduled_tick_service_principal,
     builtin_trigger_service_principal,
@@ -415,10 +416,19 @@ def load_jobs_from_text(
         try:
             job = SchedulerJob.from_yaml_entry(entry)
             if job.shell_commands is not None:
-                parse_declared_shell_commands(
-                    job.shell_commands,
-                    writable_roots=writable_roots,
-                )
+                try:
+                    parse_declared_shell_commands(
+                        job.shell_commands,
+                        writable_roots=writable_roots,
+                    )
+                except DeclaredShellCommandError as exc:
+                    if not exc.environment_dependent:
+                        raise
+                    rejections.append({
+                        "path": str(source),
+                        "job": entry_name,
+                        "reason": str(exc),
+                    })
             if job.name == "heartbeat" and job.authority_profile is None:
                 log.warning(
                     "scheduler job 'heartbeat' declares no authority_profile; "

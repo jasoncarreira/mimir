@@ -1829,8 +1829,24 @@ class DeclaredShellCommand:
     script: Path | None = None
 
 
-def _declaration_error(name: str, detail: str) -> ValueError:
-    return ValueError(f"shell_commands[{name!r}]: {detail}")
+class DeclaredShellCommandError(ValueError):
+    """A shell declaration error, classified by whether host state caused it."""
+
+    def __init__(self, message: str, *, environment_dependent: bool = False) -> None:
+        super().__init__(message)
+        self.environment_dependent = environment_dependent
+
+
+def _declaration_error(
+    name: str,
+    detail: str,
+    *,
+    environment_dependent: bool = False,
+) -> DeclaredShellCommandError:
+    return DeclaredShellCommandError(
+        f"shell_commands[{name!r}]: {detail}",
+        environment_dependent=environment_dependent,
+    )
 
 
 def agent_writable_roots(home: Path | str | None = None) -> tuple[Path, ...]:
@@ -1952,19 +1968,28 @@ def parse_declared_shell_commands(
         if not path.is_absolute():
             raise _declaration_error(name, f"path must be absolute, got {raw_path!r}")
         if not path.exists():
-            # Fail at load, matching the existing scoped-root precedent: a grant
-            # naming a binary that is not installed is a config error, and
-            # deferring it surfaces later as an unexplained refusal.
-            raise _declaration_error(name, f"path does not exist: {raw_path}")
+            raise _declaration_error(
+                name,
+                f"path does not exist: {raw_path}",
+                environment_dependent=True,
+            )
         # The EXECUTABLE gets the same immutability rule as a script. Without
         # this, declaring a CLI under an agent-writable location lets the agent
         # replace the binary and run anything through an admitted command shape,
         # which would make every other check here decorative.
         path = path.resolve()
         if not path.is_file():
-            raise _declaration_error(name, f"path is not a regular file: {raw_path}")
+            raise _declaration_error(
+                name,
+                f"path is not a regular file: {raw_path}",
+                environment_dependent=True,
+            )
         if not os.access(path, os.X_OK):
-            raise _declaration_error(name, f"path is not executable: {raw_path}")
+            raise _declaration_error(
+                name,
+                f"path is not executable: {raw_path}",
+                environment_dependent=True,
+            )
         writable_root = _agent_writable_root_for_path(
             path, resolved_writable, admin_operator_turn=False,
         )
