@@ -128,6 +128,7 @@ def store(
     # Scoped by owner_principal to prevent cross-owner existence oracle
     # (item #7 of chainlink #895).
     effective_owner = owner_principal or "legacy_admin"
+    effective_visibility = visibility or "legacy_admin"
     existing = conn.execute(
         "SELECT id FROM atoms WHERE content_hash = ? "
         "AND agent_id = ? AND owner_principal = ? AND tombstoned = 0",
@@ -137,8 +138,10 @@ def store(
         atom_id = existing[0]
         # Fire a 'store' access_event on the existing atom in its
         # own transaction.
+        began = False
         try:
             conn.execute("BEGIN IMMEDIATE")
+            began = True
             mark_access(conn, [AccessEvent(
                 atom_id=atom_id,
                 source="store",
@@ -147,7 +150,8 @@ def store(
             )])
             conn.commit()
         except Exception:
-            conn.rollback()
+            if began:
+                conn.rollback()
             raise
         return StoreResult(atom_id=atom_id, stored=False, reason="duplicate")
 
@@ -173,10 +177,16 @@ def store(
             conn, session_id, agent_id,
             cand_vec_bytes, cand_dim,
             threshold=session_dedup_threshold,
+            owner_principal=effective_owner,
+            origin_domain=origin_domain,
+            visibility=effective_visibility,
+            integrity=integrity,
         )
         if existing_id is not None:
+            began = False
             try:
                 conn.execute("BEGIN IMMEDIATE")
+                began = True
                 mark_access(conn, [AccessEvent(
                     atom_id=existing_id,
                     source="store",
@@ -185,7 +195,8 @@ def store(
                 )])
                 conn.commit()
             except Exception:
-                conn.rollback()
+                if began:
+                    conn.rollback()
                 raise
             return StoreResult(
                 atom_id=existing_id, stored=False,
@@ -207,8 +218,10 @@ def store(
     # initial access_event(s). Pre-restructure this opened BEGIN twice
     # (once here, once in mark_access) which collided. Now mark_access
     # is non-transactional; this is the only BEGIN/COMMIT pair.
+    began = False
     try:
         conn.execute("BEGIN IMMEDIATE")
+        began = True
         conn.execute(
             "INSERT INTO atoms (id, content, content_hash, created_at, "
             "stream, profile, memory_type, arousal, valence, "
@@ -255,7 +268,8 @@ def store(
 
         conn.commit()
     except Exception:
-        conn.rollback()
+        if began:
+            conn.rollback()
         raise
 
     return StoreResult(atom_id=atom_id, stored=True)
@@ -269,6 +283,10 @@ def _find_session_near_duplicate(
     cand_dim: int,
     *,
     threshold: float,
+    owner_principal: str,
+    origin_domain: str | None,
+    visibility: str,
+    integrity: str,
 ) -> str | None:
     """Cosine-scan every atom in ``session_id`` for one whose embedding
     is **strictly greater than** ``threshold`` similar to ``cand_vec_bytes``.
@@ -277,10 +295,9 @@ def _find_session_near_duplicate(
     not-duplicate — the threshold itself is the line that must be
     crossed, not touched.)
 
-    Scoped per-session because the bench / production case for this is
-    "the user is paraphrasing the same fact within a single conversation."
-    Cross-session paraphrases get caught later by the consolidation
-    similarity clustering, not here.
+    Scoped by session and the same owner/domain/visibility/integrity ACL
+    partition used by the later consolidation dedup pass. Cross-session
+    paraphrases get caught later by consolidation, not here.
 
     Atoms with mismatched embedding dim are skipped (provider switch
     safety).
@@ -296,8 +313,13 @@ def _find_session_near_duplicate(
     rows = conn.execute(
         "SELECT a.id, e.vec, e.dim FROM atoms a "
         "JOIN embeddings e ON e.atom_id = a.id "
-        "WHERE a.session_id = ? AND a.agent_id = ? AND a.tombstoned = 0",
-        (session_id, agent_id),
+        "WHERE a.session_id = ? AND a.agent_id = ? AND a.tombstoned = 0 "
+        "AND a.owner_principal = ? AND a.origin_domain IS ? "
+        "AND a.visibility = ? AND a.integrity = ?",
+        (
+            session_id, agent_id, owner_principal, origin_domain,
+            visibility, integrity,
+        ),
     ).fetchall()
 
     best_id: str | None = None

@@ -293,6 +293,7 @@ class _ShadowReadObservation:
 
     auth_context: Any
     strict_scope: AuthorizationScope
+    enforcement_enabled: bool
     resource_counts: dict[str, int] = field(default_factory=dict)
     resource_type_counts: dict[str, dict[str, int]] = field(default_factory=dict)
     probe_failure_counts: dict[str, int] = field(default_factory=dict)
@@ -380,19 +381,26 @@ def _shadow_event_payload(
         else "user" if principal
         else "unknown"
     )
-    would_block = total > 0
+    mode = "enforced" if observation.enforcement_enabled else "shadow"
+    would_block = total > 0 and mode == "shadow"
+    blocked = total > 0 and mode == "enforced"
     payload = {
         "surface": visible_surfaces[0] if len(visible_surfaces) == 1 else "multiple",
         "surfaces": visible_surfaces,
-        "allowed": True,
-        "status": "would_block" if would_block else "probe_failed",
-        "reason": (
-            "saga_read_policy_would_exclude_candidates"
-            if would_block
-            else "saga_read_shadow_probe_failed"
+        "allowed": not blocked,
+        "status": (
+            "blocked" if blocked else "would_block" if would_block else "probe_failed"
         ),
-        "enforcement_enabled": False,
-        "is_shadow_decision": True,
+        "reason": (
+            "saga_read_policy_excluded_candidates"
+            if blocked
+            else "saga_read_policy_would_exclude_candidates"
+            if would_block
+            else "saga_read_policy_probe_failed"
+        ),
+        "mode": mode,
+        "enforcement_enabled": observation.enforcement_enabled,
+        "is_shadow_decision": not observation.enforcement_enabled,
         "would_block": would_block,
         "risk_direction": "over_serving",
         "observation_stage": "pre_rrf_candidates",
@@ -437,21 +445,26 @@ def _shadow_event_payload(
     return payload
 
 
+def _emit_saga_event(event_type: str, **payload: Any) -> None:
+    """Emit SAGA telemetry best-effort through the package's single seam."""
+    try:
+        from mimir.event_logger import log_event_sync
+
+        log_event_sync(event_type, **payload)
+    except Exception as exc:  # noqa: BLE001 - telemetry cannot affect SAGA results
+        log.debug("saga event failed event_type=%s: %s", event_type, exc)
+
+
 def _emit_shadow_observation(
     observation: _ShadowReadObservation,
     *,
     turn_id: str | None,
 ) -> None:
     """Emit best-effort telemetry without changing the read result."""
-    try:
-        from mimir.event_logger import log_event_sync
-
-        log_event_sync(
-            "saga_read_would_block",
-            **_shadow_event_payload(observation, turn_id=turn_id),
-        )
-    except Exception as exc:  # noqa: BLE001 - telemetry cannot affect reads
-        log.debug("saga shadow read event failed: %s", exc)
+    _emit_saga_event(
+        "saga_read_would_block",
+        **_shadow_event_payload(observation, turn_id=turn_id),
+    )
 
 
 def finalize_shadow_read_turn(turn: Any) -> None:
@@ -515,8 +528,6 @@ class SagaReadAuthorization:
         id_column: str = "id",
     ) -> None:
         """Record selected rows that strict enforcement would have removed."""
-        if self.enforcement_enabled:
-            return
         try:
             strict_where, strict_params = self.strict_predicate(table)
             denied = self._would_deny.setdefault(resource_type, set())
@@ -557,14 +568,14 @@ class SagaReadAuthorization:
 
     def observe_probe_failure(self) -> None:
         """Count a failed strict counterfactual without exposing failure detail."""
-        if not self.enforcement_enabled:
-            self._probe_failure_count = min(
-                self._probe_failure_count + 1, _SHADOW_COUNT_LIMIT
-            )
+        if self._probe_failure_count == _SHADOW_COUNT_LIMIT:
+            self._counts_truncated = True
+            return
+        self._probe_failure_count += 1
 
     def observe_would_deny(self, resource_type: str, resource_ids: set[Any]) -> None:
         """Record counterfactual denials already computed by a read adapter."""
-        if not self.enforcement_enabled and resource_ids:
+        if resource_ids:
             denied = self._would_deny.setdefault(resource_type, set())
             for resource_id in resource_ids:
                 if len(denied) < _SHADOW_COUNT_LIMIT:
@@ -574,9 +585,7 @@ class SagaReadAuthorization:
 
     def finalize(self) -> None:
         """Accumulate per-turn telemetry or emit one standalone read event."""
-        if self.enforcement_enabled or (
-            not self._would_deny and not self._probe_failure_count
-        ):
+        if not self._would_deny and not self._probe_failure_count:
             return
         try:
             from mimir._context import get_current_turn
@@ -590,6 +599,7 @@ class SagaReadAuthorization:
                         observation = _ShadowReadObservation(
                             auth_context=self.auth_context,
                             strict_scope=self.strict_scope,
+                            enforcement_enabled=self.enforcement_enabled,
                         )
                         _SHADOW_TURN_ACCUMULATORS[turn_id] = observation
                     observation.merge_operation(self)
@@ -606,6 +616,7 @@ class SagaReadAuthorization:
         observation = _ShadowReadObservation(
             auth_context=self.auth_context,
             strict_scope=self.strict_scope,
+            enforcement_enabled=self.enforcement_enabled,
         )
         observation.merge_operation(self)
         _emit_shadow_observation(observation, turn_id=turn_id)

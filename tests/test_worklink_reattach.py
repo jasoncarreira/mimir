@@ -539,7 +539,34 @@ def test_reattach_skips_when_leaf_no_longer_in_progress(tmp_path: Path) -> None:
     assert result.status == "failed"
     assert "no longer in-progress" in (result.reason or "")
     assert compute.waited == []  # never touched the worker
+    assert ["chainlink", "locks", "release", str(issue_id)] in calls
     assert load_run_state(tmp_path, issue_id) is None
+
+
+def test_reattach_retains_state_when_transitioned_lock_release_fails(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    issue_id = 567
+    _save_inflight_state(tmp_path, repo, issue_id=issue_id, job="job-x")
+    calls: list = []
+    base_runner = _remote_runner(repo, calls, issue_id=issue_id, labels=["worklink:ready"])
+
+    def runner(args, *, cwd=None):
+        result = base_runner(args, cwd=cwd)
+        if isinstance(args, list) and args[:3] == ["chainlink", "locks", "release"]:
+            return cp(args, returncode=1, stderr="release denied")
+        return result
+
+    registry = BackendRegistry(WorklinkConfig())
+    registry.register(FakeBackend())
+    registry.register_compute(FakeRemoteCompute())
+
+    result = asyncio.run(
+        WorklinkRunner(home=tmp_path, repo=repo, runner=runner, registry=registry).reattach(issue_id)
+    )
+
+    assert "no longer in-progress" in (result.reason or "")
+    assert load_run_state(tmp_path, issue_id) is not None
 
 
 def test_reattach_no_state_is_noop(tmp_path: Path) -> None:
@@ -827,6 +854,68 @@ def test_factory_startup_recovery_routes_only_verified_dead_runs_through_run_epi
         assert spawned == []
 
 
+def test_part_b_startup_recovery_emits_for_all_five_outcomes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from mimir import server
+    import mimir.worklink.factory_state as factory_state
+
+    monkeypatch.setenv("WORKLINK_REPO", "/workspace/mimir")
+    monkeypatch.setenv("WORKLINK_RUN_BIN", "mimir")
+
+    def capture() -> tuple[list[tuple[str, dict[str, object]]], object]:
+        events: list[tuple[str, dict[str, object]]] = []
+        return events, lambda event, **payload: events.append((event, payload))
+
+    state_home = tmp_path / "state-arms"
+    _save_inflight_state(state_home, tmp_path / "repo", issue_id=4242, job="j1")
+    for spawn in (
+        lambda *args, **kwargs: object(),
+        lambda *args, **kwargs: (_ for _ in ()).throw(OSError("spawn failed")),
+    ):
+        events, logger = capture()
+        server.reattach_inflight_worklink_runs(
+            state_home,
+            popen=spawn,
+            event_logger=logger,
+        )
+        assert events
+
+    factory_home = tmp_path / "factory-arms"
+    factory_home.mkdir()
+    _factory_restart_record(factory_home, status="running", ticks=1)
+    for spawn in (
+        lambda *args, **kwargs: object(),
+        lambda *args, **kwargs: (_ for _ in ()).throw(OSError("spawn failed")),
+    ):
+        events, logger = capture()
+        server.reattach_inflight_worklink_runs(
+            factory_home,
+            popen=spawn,
+            event_logger=logger,
+        )
+        assert events
+
+    enumeration_home = tmp_path / "enumeration-arm"
+    monkeypatch.setattr(
+        factory_state,
+        "list_factory_records",
+        lambda home: (_ for _ in ()).throw(OSError("records unavailable")),
+    )
+    events, logger = capture()
+    server.reattach_inflight_worklink_runs(
+        enumeration_home,
+        popen=lambda *args, **kwargs: object(),
+        event_logger=logger,
+    )
+    assert any(
+        event == "worklink_reattach_dispatch_failed"
+        and payload["reason"] == "factory_record_enumeration_failed"
+        for event, payload in events
+    )
+
+
 @pytest.mark.parametrize(
     ("scenario", "alive", "cancel_error", "expected_cancel"),
     [
@@ -884,8 +973,8 @@ def test_worker_restart_is_cleanup_only_and_retains_checkout(
             class Process:
                 pid = 4321
 
-                def wait(self):
-                    process_waited.append(True)
+                def wait(self, timeout=None):
+                    process_waited.append(timeout)
 
             monkeypatch.setattr(
                 worker_exec.os,
@@ -895,7 +984,9 @@ def test_worker_restart_is_cleanup_only_and_retains_checkout(
             monkeypatch.setattr(
                 worker_exec,
                 "_wait_process_group",
-                lambda pgid, deadline: escalation_waits.append((pgid, deadline)),
+                lambda pgid, deadline: (
+                    escalation_waits.append((pgid, deadline)) or True
+                ),
             )
             monkeypatch.setattr(
                 worker_exec, "_process_group_has_live_members", lambda pgid: True
@@ -945,5 +1036,6 @@ def test_worker_restart_is_cleanup_only_and_retains_checkout(
         assert escalation_signals == [(4321, signal.SIGTERM), (4321, signal.SIGKILL)]
         assert len(escalation_waits) == 2
         assert escalation_waits[0][1] is not None
-        assert escalation_waits[1] == (4321, None)
-        assert process_waited == [True]
+        assert escalation_waits[1][0] == 4321
+        assert escalation_waits[1][1] is not None
+        assert process_waited == [5.0]

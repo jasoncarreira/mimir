@@ -348,8 +348,8 @@ async def test_bootstrap_reports_gate_active_with_webkeys_and_no_master(tmp_path
         for path in ("/api/web/bootstrap", "/api/v1/web/bootstrap"):
             body = await (await c.get(path)).json()
             data = body.get("data", body)  # v1 is enveloped, legacy is flat
-            assert data["auth"]["required"] is True, path
-            assert data["server"]["unauthenticated_allowed"] is False, path
+            assert set(data) == {"version", "auth"}, path
+            assert data["auth"] == {"required": True}, path
 
 
 async def test_bootstrap_dev_mode_reports_no_auth(tmp_path: Path) -> None:

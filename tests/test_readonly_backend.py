@@ -9,6 +9,8 @@ working against the full home tree.
 
 from __future__ import annotations
 
+import inspect
+import json
 import os
 import threading
 import time
@@ -23,7 +25,15 @@ from deepagents.middleware.skills import SkillsMiddleware
 from langchain_core.messages import ToolMessage
 
 from mimir._context import reset_current_turn, set_current_turn
-from mimir.access_control import ServicePrincipal
+from mimir.access_control import (
+    OperationDecision,
+    ServicePrincipal,
+    ToolAuthorization,
+    ToolFlowDirection,
+    begin_protected_result_capture,
+    classify_protected_result,
+    end_protected_result_capture,
+)
 from mimir.models import AuthContext
 from mimir.read_policy import framework_large_tool_results_root
 from mimir.readonly_backend import (
@@ -60,6 +70,132 @@ def home(tmp_path: Path) -> Path:
 
 
 class TestWriteGuardBackend:
+    @staticmethod
+    def _provenance_paths(provenance) -> tuple[str, ...]:
+        assert provenance is not None
+        return tuple(source.resource_id for source in provenance.sources)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("path_form", ["absolute", "virtual", "default"])
+    async def test_agrep_matches_sync_grep_provenance(
+        self,
+        home: Path,
+        path_form: str,
+    ) -> None:
+        docs = home / "docs"
+        docs.mkdir()
+        matches = [docs / "one.txt", docs / "two.txt"]
+        for match in matches:
+            match.write_text("shared needle\n", encoding="utf-8")
+        backend = WriteGuardBackend(root_dir=home, writable_dirs=["state"])
+        path = {"absolute": str(docs), "virtual": "/docs", "default": None}[path_form]
+
+        sync_token = begin_protected_result_capture()
+        try:
+            sync_result = backend.grep("shared needle", path)
+        finally:
+            sync_provenance = end_protected_result_capture(sync_token)
+
+        async_token = begin_protected_result_capture()
+        try:
+            async_result = await backend.agrep("shared needle", path)
+        finally:
+            async_provenance = end_protected_result_capture(async_token)
+
+        expected = {str(match.resolve()) for match in matches}
+        assert sync_result.error is None
+        assert async_result.error is None
+        sync_paths = self._provenance_paths(sync_provenance)
+        async_paths = self._provenance_paths(async_provenance)
+        assert len(async_paths) == len(sync_paths) == len(expected)
+        assert set(async_paths) == set(sync_paths) == expected
+
+    @pytest.mark.asyncio
+    async def test_agrep_provenance_preserves_per_file_integrity_downgrade(
+        self,
+        home: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setenv("MIMIR_HOME", str(home))
+        docs = home / "docs"
+        docs.mkdir()
+        trusted = docs / "trusted.txt"
+        untrusted = docs / "untrusted.txt"
+        trusted.write_text("shared needle\n", encoding="utf-8")
+        untrusted.write_text("shared needle\n", encoding="utf-8")
+        (home / ".mimir" / "file-integrity.json").write_text(
+            json.dumps({"docs/untrusted.txt": "untrusted"}),
+            encoding="utf-8",
+        )
+        backend = WriteGuardBackend(root_dir=home, writable_dirs=["state"])
+
+        token = begin_protected_result_capture()
+        try:
+            result = await backend.agrep("shared needle", str(docs))
+        finally:
+            provenance = end_protected_result_capture(token)
+
+        assert result.error is None
+        assert set(self._provenance_paths(provenance)) == {
+            str(trusted.resolve()), str(untrusted.resolve()),
+        }
+        labels = classify_protected_result(
+            "agrep",
+            {"path": str(docs)},
+            None,
+            ToolAuthorization(
+                tool_name="agrep",
+                decision=OperationDecision.RESOURCE_SCOPED,
+                allowed=True,
+            ),
+            provenance=provenance,
+        )
+        assert labels is not None
+        assert labels.has_untrusted_active_ingest is True
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "method",
+        [
+            name
+            for name, member in vars(_RootAwareFilesystemBackend).items()
+            if inspect.iscoroutinefunction(member)
+            and name.startswith("a")
+            and name[1:] in vars(_RootAwareFilesystemBackend)
+            and any(
+                "_publish_read" in referenced_name
+                for referenced_name in vars(
+                    _RootAwareFilesystemBackend
+                )[name[1:]].__code__.co_names
+            )
+        ],
+    )
+    async def test_every_async_read_override_publishes_exact_provenance(
+        self,
+        home: Path,
+        method: str,
+    ) -> None:
+        docs = home / "docs"
+        docs.mkdir()
+        target = docs / "match.txt"
+        target.write_text("shared needle\n", encoding="utf-8")
+        backend = WriteGuardBackend(root_dir=home, writable_dirs=["state"])
+        calls = {
+            "aread": lambda: backend.aread(str(target)),
+            "als": lambda: backend.als(str(docs)),
+            "aglob": lambda: backend.aglob("*.txt", str(docs)),
+            "agrep": lambda: backend.agrep("shared needle", str(docs)),
+        }
+
+        token = begin_protected_result_capture()
+        try:
+            result = await calls[method]()
+        finally:
+            provenance = end_protected_result_capture(token)
+
+        assert result.error is None
+        assert self._provenance_paths(provenance) == (str(target.resolve()),)
+
     @pytest.mark.parametrize("is_service", [False, True], ids=["non-admin", "service"])
     def test_skill_roots_are_readable_but_protected_names_and_writes_are_refused(
         self, home: Path, monkeypatch: pytest.MonkeyPatch, is_service: bool,
@@ -2228,6 +2364,171 @@ class TestFileToolRouter:
         assert FileToolRouter.delete is CompositeBackend.delete
         assert FileToolRouter.adelete is CompositeBackend.adelete
 
+    def test_broad_grep_provenance_covers_all_matches_in_any_route_order(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        home = _split_home(tmp_path)
+        home_file = home / "state" / "home.txt"
+        home_file.write_text("fanout needle\n")
+        first = tmp_path / "first"
+        first.mkdir()
+        first_file = first / "first.txt"
+        first_file.write_text("fanout needle\n")
+        second = tmp_path / "second"
+        second.mkdir()
+        second_file = second / "second.txt"
+        second_file.write_text("fanout needle\n")
+        monkeypatch.setenv("MIMIR_HOME", str(home))
+        auth = AuthContext(
+            principal="user:test", canonical_principal="test", roles=("admin",),
+            event_ingress=None, trigger="user_message", channel_id="channel",
+            interactivity=None, enforcement_enabled=True,
+        )
+        turn_token = set_current_turn(SimpleNamespace(
+            turn_id="fanout-grep", auth_context=auth,
+        ))
+        observed = []
+        try:
+            for roots in ((first, second), (second, first)):
+                router = FileToolRouter(
+                    default=WriteGuardBackend(root_dir=home, writable_dirs=["state"]),
+                    routes=build_file_tool_routes([(str(root), "rw") for root in roots]),
+                )
+                capture_token = begin_protected_result_capture()
+                result = router.grep("fanout needle")
+                provenance = end_protected_result_capture(capture_token)
+
+                assert result.error is None
+                assert provenance is not None
+                assert {source.resource_id for source in provenance.sources} == {
+                    str(home_file.resolve()),
+                    str(first_file.resolve()),
+                    str(second_file.resolve()),
+                }
+                labels = classify_protected_result(
+                    "grep", {}, auth,
+                    ToolAuthorization(
+                        tool_name="grep", decision=OperationDecision.RESOURCE_SCOPED,
+                        allowed=True, flow_direction=ToolFlowDirection.SOURCE,
+                    ),
+                    result=result, provenance=provenance,
+                )
+                assert labels is not None
+                assert labels.has_untrusted_active_ingest is True
+                observed.append(frozenset(labels.sources))
+        finally:
+            reset_current_turn(turn_token)
+
+        assert observed[0] == observed[1]
+
+    @pytest.mark.asyncio
+    async def test_broad_glob_and_aglob_keep_home_taint_when_last_route_is_empty(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        home = _split_home(tmp_path)
+        home_file = home / "state" / "untrusted.txt"
+        home_file.write_text("content\n")
+        populated = tmp_path / "populated"
+        populated.mkdir()
+        populated_file = populated / "outside.txt"
+        populated_file.write_text("content\n")
+        empty = tmp_path / "empty"
+        empty.mkdir()
+        monkeypatch.setenv("MIMIR_HOME", str(home))
+        auth = AuthContext(
+            principal="user:test", canonical_principal="test", roles=("admin",),
+            event_ingress=None, trigger="user_message", channel_id="channel",
+            interactivity=None, enforcement_enabled=True,
+        )
+        router = FileToolRouter(
+            default=WriteGuardBackend(root_dir=home, writable_dirs=["state"]),
+            routes=build_file_tool_routes([
+                (str(populated), "rw"),
+                (str(empty), "rw"),
+            ]),
+        )
+        turn_token = set_current_turn(SimpleNamespace(
+            turn_id="fanout-glob", auth_context=auth,
+        ))
+        try:
+            for method in (router.glob, router.aglob):
+                capture_token = begin_protected_result_capture()
+                result = method("**/*.txt")
+                if method == router.aglob:
+                    result = await result
+                provenance = end_protected_result_capture(capture_token)
+
+                assert result.error is None
+                assert provenance is not None
+                assert {source.resource_id for source in provenance.sources} == {
+                    str(home_file.resolve()), str(populated_file.resolve()),
+                }
+                labels = classify_protected_result(
+                    "glob", {}, auth,
+                    ToolAuthorization(
+                        tool_name="glob", decision=OperationDecision.RESOURCE_SCOPED,
+                        allowed=True, flow_direction=ToolFlowDirection.SOURCE,
+                    ),
+                    result=result, provenance=provenance,
+                )
+                assert labels is not None
+                assert labels.has_untrusted_active_ingest is True
+        finally:
+            reset_current_turn(turn_token)
+
+    def test_broad_glob_with_no_matches_is_authoritatively_empty(
+        self, tmp_path: Path,
+    ) -> None:
+        home = _split_home(tmp_path)
+        empty = tmp_path / "empty"
+        empty.mkdir()
+        router = FileToolRouter(
+            default=WriteGuardBackend(root_dir=home, writable_dirs=["state"]),
+            routes=build_file_tool_routes([(str(empty), "rw")]),
+        )
+
+        capture_token = begin_protected_result_capture()
+        result = router.glob("**/*.does-not-exist")
+        provenance = end_protected_result_capture(capture_token)
+
+        assert result.error is None
+        assert provenance is not None
+        assert provenance.sources == ()
+        assert classify_protected_result(
+            "glob", {}, None,
+            ToolAuthorization(
+                tool_name="glob", decision=OperationDecision.RESOURCE_SCOPED,
+                allowed=True, flow_direction=ToolFlowDirection.SOURCE,
+            ),
+            result=result, provenance=provenance,
+        ) is None
+
+    def test_unresolved_collection_path_invalidates_prior_route_provenance(
+        self, tmp_path: Path,
+    ) -> None:
+        home = _split_home(tmp_path)
+        home_file = home / "state" / "home.txt"
+        home_file.write_text("content\n")
+        route = tmp_path / "route"
+        route.mkdir()
+        broken = route / "broken.txt"
+        broken.symlink_to(route / "missing.txt")
+        home_backend = WriteGuardBackend(root_dir=home, writable_dirs=["state"])
+        routes = build_file_tool_routes([(str(route), "rw")])
+        router = FileToolRouter(
+            default=home_backend,
+            routes=routes,
+        )
+
+        capture_token = begin_protected_result_capture()
+        home_backend._fs._publish_read_paths(["/state/home.txt"])
+        routes[str(route) + "/"]._publish_read_paths([str(broken)])
+        provenance = end_protected_result_capture(capture_token)
+
+        assert router.routes[str(route) + "/"] is routes[str(route) + "/"]
+        assert home_file.exists()
+        assert provenance is None
+
     @pytest.mark.asyncio
     async def test_broad_grep_keeps_default_and_route_matches_when_later_route_caps(
         self, tmp_path: Path,
@@ -2251,13 +2552,21 @@ class TestFileToolRouter:
         data_route._fs._max_grep_matches = 1
         router = FileToolRouter(default=home_be, routes=routes)
 
+        capture_token = begin_protected_result_capture()
         result = await router.agrep("needle")
+        provenance = end_protected_result_capture(capture_token)
         paths = {m["path"] for m in (result.matches or [])}
 
         assert result.error is None
         assert "/state/home.txt" in paths
         assert f"{repo}/repo.txt" in paths
         assert len([p for p in paths if p.startswith(str(data))]) == 1
+        assert provenance is not None
+        assert {source.resource_id for source in provenance.sources} == {
+            str((home / path.lstrip("/")).resolve())
+            if path.startswith("/state/") else str(Path(path).resolve())
+            for path in paths
+        }
 
 
 def test_denial_buffer_is_bounded(tmp_path: Path):

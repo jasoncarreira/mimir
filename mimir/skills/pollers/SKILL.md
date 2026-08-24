@@ -79,6 +79,7 @@ The script runs with the skill directory as its **cwd**. It receives these envir
 |----------|-------------|
 | `STATE_DIR` | Persistent cursor/state directory at `<home>/state/pollers/<poller_name>/` — created lazily on first run, on the home volume so cursor files survive container rebuilds even when the skill itself ships in the image. |
 | `POLLER_NAME` | The poller's name from pollers.json (matches the `STATE_DIR` subpath). |
+| `POLLER_TIMEOUT_SECONDS` | Seconds this run will be killed after — the framework cap clamped below this poller's own fire interval. Parse with `float()`; it may be fractional. Size any internal deadlines against this rather than a hardcoded constant, and leave headroom to finish writing state. |
 
 Plus any literal env vars from the `env` field, plus any pass-throughs declared in `pass_env` (see field docs below), plus the deny-filtered allowlist of the agent's process environment.
 
@@ -219,6 +220,11 @@ Overridable fields: `cron`, `priority`, `batch_size`, `recover_failed_turns`,
 `authority`, `capabilities`, `tier`, `profile`, `principal_id`, `scoped_roots`,
 and `operator_alert` are rejected by the strict write path and dropped during
 discovery. Environment values never add capabilities.
+The agent-facing `set_poller_overrides` tool accepts `env` and `pass_env` names
+only from narrow allowlists of non-secret poller tuning variables. Literal
+`env` overrides are narrower than operator-controlled `pass_env` passthroughs,
+so the agent cannot supply a new repository or account selector. Operator edits
+loaded during discovery remain fail-safe and lenient for custom pollers.
 Anything else (notably `command`) is refused with a warning: overrides tune
 behavior, they don't redefine what runs. Field-level fail-safety: an invalid
 value (typo'd cron, unknown priority) warns and keeps the manifest value —
@@ -295,7 +301,7 @@ See [security.md](security.md) for guidance on:
 
 ## Key Constraints
 
-- **60-second timeout.** If a poller doesn't finish in 60s, it's killed and the cycle is skipped. The framework reaps the subprocess on every exit path so long-lived mimir processes don't accumulate zombies.
+- **Subprocess timeout.** The framework cap is 120s, and it is clamped further per poller so it always stays below that poller's own fire interval (`max_instances=1` means a run spanning the next fire makes that fire be skipped). Read the value you will actually be killed at from the injected `POLLER_TIMEOUT_SECONDS` rather than hardcoding it. Overrunning is not a partial result: the run is killed and **every event it had already emitted is discarded**, so bound your own work against the cap. The framework reaps the subprocess on every exit path so long-lived mimir processes don't accumulate zombies.
 - **Silence means nothing to report.** Only output lines when there's something actionable.
 - **One JSON object per line.** Each line must parse independently.
 - **`prompt` is the only required field.** Lines missing it are silently dropped (a poller can emit metadata-only diagnostic lines without firing turns). Other keys flow into the AgentEvent's `extra` for prompt rendering.

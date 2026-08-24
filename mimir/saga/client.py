@@ -112,6 +112,55 @@ def _authorized_atom_ids(
     return requested if found == set(requested) else None
 
 
+def _mutation_refusal_reason(
+    auth_context: Any,
+    operation: str,
+    scope: object | str | _ServiceMutationScope | None,
+) -> str:
+    """Classify a failed mutation authorization without widening authority."""
+    from ..access_control import get_trusted_service_from_auth_context
+    from ..models import AuthContext
+
+    if not isinstance(auth_context, AuthContext):
+        return "invalid_auth_context"
+    if scope is not None:
+        return "atom_outside_scope"
+    service = get_trusted_service_from_auth_context(auth_context)
+    if service is not None and not service.has_capability(operation):
+        return "missing_operation_capability"
+    if auth_context.canonical_principal in RESERVED_SENTINEL_PRINCIPALS:
+        return "reserved_principal"
+    return "missing_canonical_principal"
+
+
+def _mutation_refused_result(
+    *,
+    auth_context: Any,
+    operation: str,
+    scope: object | str | _ServiceMutationScope | None,
+    requested_count: int,
+    result: dict[str, Any],
+) -> dict[str, Any]:
+    """Convert the shared None refusal signal into one observable result shape."""
+    from ..models import AuthContext
+    from .ownership import _emit_saga_event
+
+    reason = _mutation_refusal_reason(auth_context, operation, scope)
+    canonical_principal = (
+        auth_context.canonical_principal
+        if isinstance(auth_context, AuthContext)
+        else None
+    )
+    _emit_saga_event(
+        "saga_mutation_refused",
+        operation=operation,
+        canonical_principal=canonical_principal,
+        reason=reason,
+        requested_count=min(max(requested_count, 0), 1000),
+    )
+    return {**result, "status": "refused", "reason": reason}
+
+
 # ─── Provider/index adapters ─────────────────────────────────────────
 
 
@@ -160,10 +209,20 @@ def _query_embed_sync(text: str) -> list[float]:
 
         cfg = get_config()
         provider = get_provider()
-        return provider.embed(
+        query_vec = provider.embed(
             text[: cfg("embedding", "max_input_chars", 2000)], input_type="query"
         )
-    except Exception:
+        if not query_vec:
+            log.warning(
+                "SAGA query embedding was empty; semantic recall degraded to FTS5"
+            )
+            return []
+        return query_vec
+    except Exception as exc:
+        log.warning(
+            "SAGA query embedding unavailable; semantic recall degraded to FTS5: %s",
+            exc,
+        )
         return []
 
 
@@ -185,7 +244,7 @@ def _make_faiss_search_fn(
     """
 
     def _fn(query_emb: list[float], top_k: int) -> list[tuple[str, float]]:
-        if index is None:
+        if index is None or not query_emb:
             return []
         if read_authorization is not None and not read_authorization.enforcement_enabled:
             return index.search(query_emb, top_k=top_k)
@@ -250,6 +309,7 @@ def _make_triple_search_fn(
     reference_date=None,
     auth_context: Any = None,
     read_authorization=None,
+    ranked_candidates: list[dict] | None = None,
 ):
     """Closure over the connection matching recall.TripleSearchFn shape.
     Returns None when triples are disabled (the dim arg is None, meaning
@@ -271,6 +331,7 @@ def _make_triple_search_fn(
             reference_date=reference_date,
             auth_context=auth_context,
             read_authorization=read_authorization,
+            ranked_candidates=ranked_candidates,
         )
 
     return _fn
@@ -955,6 +1016,16 @@ class SagaStore:
             # same provider). Pass dim through so triples with a stale
             # dim get filtered.
             triple_dim = self._embedding_dim
+            from .triples import rank_triple_candidates
+
+            ranked_triples = rank_triple_candidates(
+                conn,
+                query_emb,
+                dim=triple_dim,
+                reference_date=reference_date,
+                auth_context=auth_context,
+                read_authorization=read_authorization,
+            )
             result = _recall(
                 conn,
                 effective_query,
@@ -977,6 +1048,7 @@ class SagaStore:
                     reference_date=reference_date,
                     auth_context=auth_context,
                     read_authorization=read_authorization,
+                    ranked_candidates=ranked_triples,
                 ),
                 extra_atom_ranked_pathways=extra_pathways,
                 rrf_pathway_weights=pathway_weights,
@@ -1017,6 +1089,7 @@ class SagaStore:
                     reference_date=reference_date,
                     auth_context=auth_context,
                     read_authorization=read_authorization,
+                    ranked_candidates=ranked_triples,
                 )
                 # Strip the internal _cosine field from the wire shape;
                 # keep it out of the agent-facing dict.
@@ -1311,8 +1384,20 @@ class SagaStore:
                     for a in atoms
                 ],
             }
+            observed_ids = [atom["id"] for atom in atoms]
+            if read_authorization.enforcement_enabled:
+                rows = conn.execute(
+                    f"SELECT id, agent_id FROM atoms WHERE id IN ({placeholders}) "
+                    "AND tombstoned = 0",
+                    unique,
+                ).fetchall()
+                observed_ids = [
+                    atom_id
+                    for atom_id, agent_id in rows
+                    if agent_id in (self._agent_id, "shared")
+                ]
             read_authorization.observe_selected(
-                conn, "atom", "atoms", [atom["id"] for atom in atoms]
+                conn, "atom", "atoms", observed_ids
             )
             return payload
 
@@ -1481,7 +1566,13 @@ class SagaStore:
             conn = self._ensure_conn()
             authorized_ids = _authorized_atom_ids(conn, atom_ids, scope)
             if authorized_ids is None:
-                return {"marked": 0, "total": len(atom_ids), "authorized": 0}
+                return _mutation_refused_result(
+                    auth_context=auth_context,
+                    operation="saga_feedback",
+                    scope=scope,
+                    requested_count=len(atom_ids),
+                    result={"marked": 0, "total": len(atom_ids), "authorized": 0},
+                )
             if not authorized_ids:
                 return {"marked": 0, "total": len(atom_ids), "authorized": 0}
             n = _feedback(conn, authorized_ids, signal=signal, session_id=session_id)
@@ -1534,12 +1625,18 @@ class SagaStore:
                 conn = self._ensure_conn()
                 authorized_ids = _authorized_atom_ids(conn, atom_ids, scope)
                 if authorized_ids is None:
-                    return {
-                        "marked": 0,
-                        "total": len(atom_ids),
-                        "signal": "negative",
-                        "authorized": 0,
-                    }
+                    return _mutation_refused_result(
+                        auth_context=auth_context,
+                        operation="saga_feedback",
+                        scope=scope,
+                        requested_count=len(atom_ids),
+                        result={
+                            "marked": 0,
+                            "total": len(atom_ids),
+                            "signal": "negative",
+                            "authorized": 0,
+                        },
+                    )
                 if not authorized_ids:
                     return {
                         "marked": 0,
@@ -2034,8 +2131,8 @@ class SagaStore:
         def _restructure():
             from .consolidate import (
                 _compute_intersected_acl,
+                emit_observation,
                 find_equal_evidence_obs,
-                find_superseded_observations,
             )
             from .observations import refresh_trend
             from .store import store as _store_atom
@@ -2066,92 +2163,8 @@ class SagaStore:
 
                 intersected_acl = _compute_intersected_acl(conn, evidence_ids)
 
-                store_result = _store_atom(
-                    conn,
-                    content,
-                    # chainlink #417: embedding was precomputed above,
-                    # before the write lock / transactions; embed_fn is
-                    # the unused fallback (store never calls it when
-                    # precomputed_embedding is supplied).
-                    embed_fn=_embed_text_sync,
-                    precomputed_embedding=obs_emb,
-                    memory_type="observation",
-                    stream="semantic",
-                    topics=topics,
-                    agent_id=self._agent_id,
-                    session_id=None,
-                    owner_principal=intersected_acl.owner_principal,
-                    origin_channel=intersected_acl.origin_channel,
-                    origin_domain=intersected_acl.origin_domain,
-                    visibility=intersected_acl.visibility,
-                    provenance=intersected_acl.provenance,
-                )
-                if not store_result.stored:
-                    # A hard kill can land the observation atom while missing
-                    # the following relations transaction. Complete exactly
-                    # that orphan on retry; ordinary content dedupe remains a
-                    # no-op (including observations backed by other evidence).
-                    repairable = conn.execute(
-                        "SELECT 1 FROM atoms a "
-                        "WHERE a.id = ? AND a.memory_type = 'observation' "
-                        "AND a.tombstoned = 0 "
-                        "AND NOT EXISTS ("
-                        "  SELECT 1 FROM atom_relations ar "
-                        "  WHERE ar.source_id = a.id "
-                        "    AND ar.relation_type = 'evidenced_by'"
-                        ") AND NOT EXISTS ("
-                        "  SELECT 1 FROM observations_metadata om "
-                        "  WHERE om.atom_id = a.id"
-                        ")",
-                        (store_result.atom_id,),
-                    ).fetchone()
-                    if repairable is None:
-                        continue
-
-                observation_id = store_result.atom_id
-                try:
-                    conn.execute("BEGIN IMMEDIATE")
-                    conn.executemany(
-                        "INSERT INTO atom_relations "
-                        "(source_id, target_id, relation_type, confidence, created_at) "
-                        "VALUES (?, ?, 'evidenced_by', 1.0, ?)",
-                        [(observation_id, rid, now) for rid in evidence_ids],
-                    )
-                    conn.executemany(
-                        "INSERT INTO atom_relations "
-                        "(source_id, target_id, relation_type, confidence, created_at) "
-                        "VALUES (?, ?, 'consolidated_into', 1.0, ?)",
-                        [(rid, observation_id, now) for rid in evidence_ids],
-                    )
-                    # No mark_access on evidence raws: consolidation is
-                    # system-internal. The evidence_boost on retrieval
-                    # provides the ranking signal; access_events stays
-                    # a pure external-access record.
-
-                    old_obs = find_superseded_observations(
-                        conn,
-                        observation_id,
-                        set(evidence_ids),
-                    )
-                    for old_id in old_obs:
-                        conn.execute(
-                            "INSERT OR IGNORE INTO atom_relations "
-                            "(source_id, target_id, relation_type, confidence, "
-                            "created_at, metadata) "
-                            "VALUES (?, ?, 'supersedes', 1.0, ?, ?)",
-                            (
-                                observation_id,
-                                old_id,
-                                now,
-                                json.dumps({"trigger": "consolidate"}),
-                            ),
-                        )
-                    conn.execute(
-                        "INSERT INTO observations_metadata "
-                        "(atom_id, evidence_count, trend, last_evidence_at, "
-                        "consolidated_at) VALUES (?, ?, ?, ?, ?)",
-                        (observation_id, len(evidence_ids), "strengthening", now, now),
-                    )
+                def _extra_writes(observation_id: str) -> None:
+                    nonlocal triples_stored, contradicts_stored
                     # P42: store any triples the LLM extracted. Source
                     # them to the new observation atom (not the raws)
                     # so triple retrieval surfaces the observation —
@@ -2209,38 +2222,33 @@ class SagaStore:
                             )
                             if cursor.rowcount > 0:
                                 contradicts_stored += 1
-                    conn.commit()
-                except Exception:
-                    conn.rollback()
-                    # chainlink #391: _store_atom above committed the observation
-                    # in its OWN transaction before this relations transaction.
-                    # On rollback it would remain an orphan — no evidenced_by /
-                    # observations_metadata — that recall surfaces unbacked, and
-                    # find_equal_evidence_obs can't match on retry (it has no
-                    # evidence edges) so a re-run duplicates it. Tombstone it
-                    # (matches forget's removal model; avoids FK/FTS/embedding
-                    # orphan issues a DELETE would risk) before re-raising. It
-                    # was never added to the FAISS index (that happens only after
-                    # the commit below), so no index cleanup is needed.
-                    try:
-                        conn.execute("BEGIN IMMEDIATE")
-                        conn.execute(
-                            "UPDATE atoms SET tombstoned=1 WHERE id=?",
-                            (observation_id,),
-                        )
-                        conn.commit()
-                    except Exception:  # noqa: BLE001
-                        try:
-                            conn.rollback()
-                        except Exception:  # noqa: BLE001
-                            pass
-                        log.warning(
-                            "failed to tombstone orphaned observation %s after "
-                            "restructure rollback",
-                            observation_id,
-                            exc_info=True,
-                        )
-                    raise
+
+                emitted_observation = emit_observation(
+                    conn,
+                    evidence_ids=evidence_ids,
+                    store_observation=lambda: _store_atom(
+                        conn,
+                        content,
+                        embed_fn=_embed_text_sync,
+                        precomputed_embedding=obs_emb,
+                        memory_type="observation",
+                        stream="semantic",
+                        topics=topics,
+                        agent_id=self._agent_id,
+                        session_id=None,
+                        owner_principal=intersected_acl.owner_principal,
+                        origin_channel=intersected_acl.origin_channel,
+                        origin_domain=intersected_acl.origin_domain,
+                        visibility=intersected_acl.visibility,
+                        provenance=intersected_acl.provenance,
+                    ),
+                    extra_writes=_extra_writes,
+                    now=now,
+                )
+                if emitted_observation is None:
+                    continue
+                observation_id = emitted_observation.observation_id
+                old_obs = emitted_observation.superseded_ids
 
                 # Trend recompute in its own short txn (refresh_trend
                 # manages its own BEGIN/COMMIT).
@@ -2517,11 +2525,17 @@ class SagaStore:
 
             conn = self._ensure_conn()
             if scope is None:
-                return {
-                    "tombstoned_count": 0,
-                    "preview_ids": [],
-                    "dry_run": dry_run,
-                }
+                return _mutation_refused_result(
+                    auth_context=auth_context,
+                    operation="saga_forget",
+                    scope=scope,
+                    requested_count=0,
+                    result={
+                        "tombstoned_count": 0,
+                        "preview_ids": [],
+                        "dry_run": dry_run,
+                    },
+                )
             preview = forget_by_criteria(
                 conn,
                 agent_id=self._agent_id,
@@ -2550,11 +2564,17 @@ class SagaStore:
                 ]
             closure = list(dict.fromkeys(candidate_ids + affected_observation_ids))
             if _authorized_atom_ids(conn, closure, scope) is None:
-                return {
-                    "tombstoned_count": 0,
-                    "preview_ids": [],
-                    "dry_run": dry_run,
-                }
+                return _mutation_refused_result(
+                    auth_context=auth_context,
+                    operation="saga_forget",
+                    scope=scope,
+                    requested_count=len(closure),
+                    result={
+                        "tombstoned_count": 0,
+                        "preview_ids": [],
+                        "dry_run": dry_run,
+                    },
+                )
             if dry_run:
                 return {
                     "tombstoned_count": len(candidate_ids),
@@ -2667,14 +2687,17 @@ class SagaStore:
         params: list = list(auth_params)
         if channel_id:
             params.append(channel_id)
+        recency_index = (
+            "idx_sessions_channel_recency" if channel_id else "idx_sessions_recency"
+        )
 
         rows = conn.execute(
             f"""
             SELECT id, channel_id, started_at, ended_at, summary, reflected_at,
                    embedding
-            FROM sessions
+            FROM sessions INDEXED BY {recency_index}
             WHERE {auth_where} {channel_clause}
-            ORDER BY COALESCE(ended_at, reflected_at) DESC
+            ORDER BY COALESCE(ended_at, reflected_at) DESC, id ASC
             LIMIT 500
             """,
             params,
@@ -2977,7 +3000,21 @@ class SagaStore:
             ):
                 return None
             if _authorized_atom_ids(conn, atom_ids, scope) is None:
-                return None
+                return _mutation_refused_result(
+                    auth_context=auth_context,
+                    operation="saga_mark_contributions",
+                    scope=scope,
+                    requested_count=len(atom_ids),
+                    result={
+                        "contributed_count": 0,
+                        "total": len(retrieved_atoms),
+                        "contribution_rate": 0.0,
+                        "contributed": [],
+                        "threshold": thr,
+                        "authorized": 0,
+                        "credit_written": False,
+                    },
+                )
             return (
                 _mc(
                     conn,
@@ -2991,6 +3028,8 @@ class SagaStore:
             )
 
         result = await self._write_locked(_do)
+        if isinstance(result, dict):
+            return result
         if result is None:
             return {
                 "contributed_count": 0,
@@ -2999,6 +3038,7 @@ class SagaStore:
                 "contributed": [],
                 "threshold": thr,
                 "authorized": 0,
+                "credit_written": False,
             }
         return {
             "contributed_count": len(result.contributed_atom_ids),
@@ -3007,6 +3047,7 @@ class SagaStore:
             "contributed": result.contributed_atom_ids,
             "threshold": result.threshold,
             "authorized": len(retrieved_atoms),
+            "credit_written": result.credit_written,
         }
 
     async def health(self) -> bool:

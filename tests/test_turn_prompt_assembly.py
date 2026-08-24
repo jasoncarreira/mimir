@@ -401,7 +401,8 @@ async def test_heartbeat_authority_guidance_renders_only_under_enforcement(
     )
     assert "## Autonomous trigger authority" in prompt
     assert "profile: ``heartbeat``" in prompt
-    assert "``fetch_url`` may reach only this profile's approved exact-URL list" in prompt
+    assert "``fetch_url`` may reach this profile's approved exact URLs and URL scopes" in prompt
+    assert "scoped URLs require a clean turn" in prompt
 
     agent._config.access_control_enforced = False
     shadow_prompt, _ = await agent._build_turn_prompt(

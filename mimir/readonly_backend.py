@@ -1333,7 +1333,11 @@ class _RootAwareFilesystemBackend(_BoundedFilesystemBackend):
     def _publish_read_paths(self, file_paths: list[str]) -> None:
         """Publish every exact resource in a successful backend collection result."""
         from ._context import get_current_turn
-        from .access_control import protected_result_source, publish_protected_result
+        from .access_control import (
+            invalidate_protected_result_capture,
+            protected_result_source,
+            publish_protected_result,
+        )
 
         turn = get_current_turn()
         auth_context = getattr(turn, "auth_context", None)
@@ -1342,6 +1346,7 @@ class _RootAwareFilesystemBackend(_BoundedFilesystemBackend):
             try:
                 resolved_paths.append(str(self._resolve_path(file_path).resolve(strict=True)))
             except (OSError, RuntimeError, ValueError):
+                invalidate_protected_result_capture()
                 return
         publish_protected_result(tuple(
             protected_result_source(

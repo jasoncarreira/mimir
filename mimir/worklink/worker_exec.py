@@ -42,6 +42,8 @@ _STALE_EXECUTOR_DIAGNOSTIC = (
     "identities do not match; rebuild the image and restart the container"
 )
 _CONTROLLER_CANCELLATION_GRACE_S = 10.0
+_PROCESS_GROUP_KILL_TIMEOUT_S = 5.0
+_PROCESS_REAP_TIMEOUT_S = 5.0
 _PR_SET_NO_NEW_PRIVS = 38
 _PR_CAPBSET_DROP = 24
 _PR_CAP_AMBIENT = 47
@@ -391,11 +393,12 @@ def _process_group_has_live_members(process_group: int) -> bool:
     return True
 
 
-def _wait_process_group(process_group: int, deadline: float | None) -> None:
+def _wait_process_group(process_group: int, deadline: float) -> bool:
     while _process_group_has_live_members(process_group):
-        if deadline is not None and time.monotonic() >= deadline:
-            return
+        if time.monotonic() >= deadline:
+            return False
         time.sleep(0.01)
+    return True
 
 
 def _terminate_process_group_pid(process_group: int, timeout_s: float = 5.0) -> None:
@@ -409,12 +412,22 @@ def _terminate_process_group_pid(process_group: int, timeout_s: float = 5.0) -> 
             os.killpg(process_group, signal.SIGKILL)
         except ProcessLookupError:
             pass
-        _wait_process_group(process_group, None)
+        if not _wait_process_group(
+            process_group, time.monotonic() + _PROCESS_GROUP_KILL_TIMEOUT_S
+        ):
+            raise RuntimeError(
+                f"process group {process_group} still has live members after SIGKILL"
+            )
 
 
 def _terminate_process_group(proc: subprocess.Popen[bytes], timeout_s: float = 5.0) -> None:
     _terminate_process_group_pid(proc.pid, timeout_s)
-    proc.wait()
+    try:
+        proc.wait(timeout=_PROCESS_REAP_TIMEOUT_S)
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError(
+            f"process group {proc.pid} leader was not reaped after SIGKILL"
+        ) from exc
 
 
 def _cancel(identifier: str) -> None:
