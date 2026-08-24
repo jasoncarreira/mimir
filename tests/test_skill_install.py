@@ -12,6 +12,7 @@ from __future__ import annotations
 
 from argparse import ArgumentParser, Namespace
 import os
+import stat
 from pathlib import Path
 
 import pytest
@@ -1844,6 +1845,31 @@ def test_prompt_and_write_env_writes_required_var(tmp_path, monkeypatch, capsys)
     written = prompt_and_write_env([_REQ], [], env_path)
     assert "MY_REQUIRED" in written
     assert "MY_REQUIRED=my-value" in env_path.read_text()
+
+
+def test_skill_env_first_write_is_owner_only_with_permissive_umask(
+    tmp_path, monkeypatch, capsys,
+):
+    env_path = tmp_path / ".env"
+    monkeypatch.setattr("builtins.input", lambda _: "my-secret")
+    previous = os.umask(0o022)
+    try:
+        prompt_and_write_env([_REQ], [], env_path)
+    finally:
+        os.umask(previous)
+
+    assert stat.S_IMODE(env_path.stat().st_mode) == 0o600
+
+
+def test_skill_env_existing_mode_is_not_loosened(tmp_path, monkeypatch, capsys):
+    env_path = tmp_path / ".env"
+    env_path.write_text("MY_REQUIRED=old\n")
+    env_path.chmod(0o640)
+    monkeypatch.setattr("builtins.input", lambda _: "new")
+
+    prompt_and_write_env([_REQ], [], env_path, reconfigure=True)
+
+    assert stat.S_IMODE(env_path.stat().st_mode) == 0o600
 
 
 def test_prompt_and_write_env_skips_already_set_var(tmp_path, monkeypatch, capsys):

@@ -237,6 +237,10 @@ CREATE INDEX IF NOT EXISTS idx_triples_current ON triples(subject, predicate) WH
 -- Ownership indexes (chainlink #881)
 CREATE INDEX IF NOT EXISTS idx_triples_visibility ON triples(visibility);
 CREATE INDEX IF NOT EXISTS idx_triples_owner ON triples(owner_principal);
+-- Bounds query-time cosine candidates to a deterministic recent window.
+CREATE INDEX IF NOT EXISTS idx_triples_embedding_recency
+    ON triples(created_at DESC, id ASC)
+    WHERE tombstoned = 0 AND embedding IS NOT NULL;
 
 -- ──────────────────────────────────────────────────────────────────
 -- World state (P37, derived from triples)
@@ -347,6 +351,10 @@ CREATE TABLE IF NOT EXISTS sessions (
 CREATE INDEX IF NOT EXISTS idx_sessions_visibility ON sessions(visibility);
 CREATE INDEX IF NOT EXISTS idx_sessions_owner ON sessions(owner_principal);
 CREATE INDEX IF NOT EXISTS idx_sessions_channel ON sessions(channel_id);
+CREATE INDEX IF NOT EXISTS idx_sessions_recency
+    ON sessions(COALESCE(ended_at, reflected_at) DESC, id ASC);
+CREATE INDEX IF NOT EXISTS idx_sessions_channel_recency
+    ON sessions(channel_id, COALESCE(ended_at, reflected_at) DESC, id ASC);
 
 -- ──────────────────────────────────────────────────────────────────
 -- Schema version

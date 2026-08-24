@@ -747,32 +747,32 @@ export interface WebBootstrapData {
   /** mimir build/release version, for the app shell's version label. */
   version: string;
   /** The model the agent is running on (e.g. "gpt-5.5"), for the dossier. */
-  model: string;
+  model?: string;
   /** Running turn total (latest turn record's seq), for the dossier. */
-  turns_total: number;
+  turns_total?: number;
   auth: {
     required: boolean;
-    scheme: "x-api-key";
-    storage: "browser-localStorage";
+    scheme?: "x-api-key";
+    storage?: "browser-localStorage";
   };
-  server: {
+  server?: {
     web_host: string;
     public_bind: boolean;
     unauthenticated_allowed: boolean;
   };
-  stream_auth: {
+  stream_auth?: {
     shape: "fetch-event-stream";
     header: "X-API-Key";
     native_eventsource_supported_when_auth_required: false;
   };
   /** Agent-owned UI config (<home>/state/web_ui.json), editable by the agent. */
-  ui: {
+  ui?: {
     agent_name: string;
     skin: string;
   };
   /** Available skins: built-in ids plus full operator-installed manifests. */
-  skins: WebSkinsData;
-  dashboard_extensions: DashboardExtensionManifest[];
+  skins?: WebSkinsData;
+  dashboard_extensions?: DashboardExtensionManifest[];
 }
 
 export interface ChatPostRequest {

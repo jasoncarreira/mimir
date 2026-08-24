@@ -16,6 +16,7 @@ from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 import json
 import os
+import re
 import shutil
 import stat
 import sys
@@ -37,6 +38,10 @@ from mimir.pollers import (
     PollerConfig,
     PollerOverridesValidationError,
     _CircuitBreakerState,
+    _GITHUB_ACTIVITY_EVENT_TYPES,
+    _GITHUB_ACTOR_EVENT_TYPES,
+    _GITHUB_FRAMEWORK_TRIGGER_EVENT_TYPES,
+    _cb_record_failure,
     _circuit_breakers,
     _github_author_is_trusted,
     _github_content_author,
@@ -1847,23 +1852,112 @@ print(json.dumps({"poller": "x", "prompt": "hostile PR body", "event_type": "pr_
     ).allowed is False
 
 
-def test_pr_synchronize_commit_author_is_not_used_as_trust_attestation(
+def test_pr_synchronize_actor_is_resolved_from_server_compare(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     calls: list[str] = []
     monkeypatch.setattr(
         "mimir.pollers._github_api_attestation",
-        lambda endpoint, _token: calls.append(endpoint) or (200, {"user": {"login": "alice"}}),
+        lambda endpoint, _token: calls.append(endpoint)
+        or (200, {"commits": [{"author": {"login": "alice"}}]}),
     )
 
     author = _github_content_author("acme/widget", {
         "event_type": "pr_synchronize",
         "url": "https://github.com/acme/widget/pull/11",
         "author": "trusted-looking-commit-author",
+        "previous_head": "a" * 40,
+        "new_head": "b" * 40,
     }, "server-token")
 
-    assert author is None
-    assert calls == []
+    assert author == "alice"
+    assert calls == [f"repos/acme/widget/compare/{'a' * 40}...{'b' * 40}"]
+
+
+def test_github_activity_integrity_classification_is_total() -> None:
+    poller_source = (
+        Path(__file__).parents[1]
+        / "mimir/optional-skills/github-poller/scripts/poller.py"
+    ).read_text(encoding="utf-8")
+    emitted = frozenset(re.findall(r'\bevent_type\s*=\s*["\']([^"\']+)', poller_source))
+
+    assert emitted == _GITHUB_ACTIVITY_EVENT_TYPES
+    assert not (_GITHUB_ACTOR_EVENT_TYPES.keys() & _GITHUB_FRAMEWORK_TRIGGER_EVENT_TYPES.keys())
+    assert all(_GITHUB_ACTOR_EVENT_TYPES.values())
+    assert all(_GITHUB_FRAMEWORK_TRIGGER_EVENT_TYPES.values())
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("event_type", ["pr_synchronize", "pr_review_requested"])
+@pytest.mark.parametrize("collaborator", [True, False])
+async def test_new_github_activity_actors_use_discriminating_server_trust(
+    tmp_path: Path,
+    home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    event_type: str,
+    collaborator: bool,
+) -> None:
+    actor = "collaborator" if collaborator else "outsider"
+    item = {
+        "poller": "x",
+        "prompt": "GitHub activity",
+        "event_type": event_type,
+        "repo": "acme/widget",
+        "number": 11,
+        "url": "https://github.com/acme/widget/pull/11",
+        "author": "payload-impostor",
+        "previous_head": "a" * 40,
+        "new_head": "b" * 40,
+        "requested_reviewer": "mimir-bot",
+    }
+    skill_dir = tmp_path / "skill"
+    _install_script(skill_dir, "poller.py", f"""
+import json
+print(json.dumps({item!r}))
+""")
+    calls: list[str] = []
+
+    def fake_api(endpoint: str, token: str):
+        assert token == "server-token"
+        calls.append(endpoint)
+        if "/compare/" in endpoint:
+            return 200, {"commits": [{"author": {"login": actor}}]}
+        if "/timeline?" in endpoint:
+            return 200, [{
+                "event": "review_requested",
+                "requested_reviewer": {"login": "mimir-bot"},
+                "actor": {"login": actor},
+            }]
+        if endpoint == f"repos/acme/widget/collaborators/{actor}":
+            return (204, None) if collaborator else (404, None)
+        if endpoint == f"orgs/acme/memberships/{actor}":
+            return 404, None
+        pytest.fail(f"unexpected GitHub endpoint: {endpoint}")
+
+    monkeypatch.setattr("mimir.pollers._github_api_attestation", fake_api)
+    cfg = PollerConfig(
+        name="x", command=f"{sys.executable} poller.py", cron="* * * * *",
+        env={"GITHUB_TOKEN": "server-token"}, skill_dir=skill_dir,
+        trust_source="github",
+    )
+    enq = _CapturingEnqueue()
+
+    await run_poller(cfg, enqueue=enq)
+
+    source = next(iter(enq.events[0].ifc_labels.sources))
+    assert (source.integrity, source.integrity_effect) == (
+        "trusted" if collaborator else "untrusted",
+        "active_ingest",
+    )
+    identity_endpoint = (
+        f"repos/acme/widget/compare/{'a' * 40}...{'b' * 40}"
+        if event_type == "pr_synchronize"
+        else "repos/acme/widget/issues/11/timeline?per_page=100"
+    )
+    expected = [identity_endpoint, f"repos/acme/widget/collaborators/{actor}"]
+    if not collaborator:
+        expected.append(f"orgs/acme/memberships/{actor}")
+    assert calls == expected
 
 
 def test_github_content_author_uses_api_and_ignores_payload_claim(
@@ -4627,6 +4721,35 @@ async def test_circuit_breaker_open_suppresses_subsequent_runs(tmp_path, home, c
 
 
 @pytest.mark.asyncio
+async def test_circuit_breaker_deadline_ignores_wall_clock_step(
+    tmp_path, home, clear_circuit_breakers, monkeypatch,
+):
+    cfg = _ok_poller_cfg(tmp_path, name="cb-monotonic")
+    monotonic_now = [100.0]
+    wall_now = [1_000.0]
+    monkeypatch.setattr("mimir.pollers.time.monotonic", lambda: monotonic_now[0])
+    monkeypatch.setattr("mimir.pollers.time.time", lambda: wall_now[0])
+
+    for _ in range(POLLER_CIRCUIT_BREAKER_THRESHOLD):
+        _cb_record_failure(cfg.name)
+    deadline = 100.0 + POLLER_CIRCUIT_BREAKER_BACKOFF_SECONDS
+    assert _circuit_breakers[cfg.name].disabled_until == deadline
+
+    wall_now[0] = 100_000.0
+    await run_poller(cfg, enqueue=_CapturingEnqueue())
+    assert _circuit_breakers[cfg.name].disabled_until == deadline
+
+    wall_now[0] = -100_000.0
+    monotonic_now[0] = deadline + 1.0
+    await run_poller(cfg, enqueue=_CapturingEnqueue())
+
+    state = _circuit_breakers[cfg.name]
+    assert state.consecutive_failures == 0
+    assert state.disabled_until == 0.0
+    assert any(e["type"] == "poller_circuit_open" for e in _read_events(home))
+
+
+@pytest.mark.asyncio
 async def test_circuit_breaker_resets_after_successful_run(tmp_path, home, clear_circuit_breakers):
     """A successful run (exit 0) resets the circuit-breaker state so the
     poller can fail again without carrying over the prior failure count.
@@ -4692,8 +4815,8 @@ async def test_circuit_breaker_rearms_after_backoff_expiry(
     for _ in range(POLLER_CIRCUIT_BREAKER_THRESHOLD):
         await run_poller(cfg, enqueue=enq)
     state = _circuit_breakers[cfg.name]
-    assert state.disabled_until > time.time()
-    state.disabled_until = time.time() - 1.0
+    assert state.disabled_until > time.monotonic()
+    state.disabled_until = time.monotonic() - 1.0
 
     # The poller is still hard-down: this run executes (circuit no
     # longer open), fails, and pushes the count PAST the threshold —
@@ -4701,7 +4824,7 @@ async def test_circuit_breaker_rearms_after_backoff_expiry(
     await run_poller(cfg, enqueue=enq)
     state = _circuit_breakers[cfg.name]
     assert state.consecutive_failures == POLLER_CIRCUIT_BREAKER_THRESHOLD + 1
-    assert state.disabled_until > time.time(), (
+    assert state.disabled_until > time.monotonic(), (
         "circuit must re-open on every failure at/past the threshold "
         "(chainlink #409) — exact-equality arming storms forever after "
         "the first backoff expires"

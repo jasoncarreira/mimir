@@ -973,8 +973,8 @@ def test_worker_restart_is_cleanup_only_and_retains_checkout(
             class Process:
                 pid = 4321
 
-                def wait(self):
-                    process_waited.append(True)
+                def wait(self, timeout=None):
+                    process_waited.append(timeout)
 
             monkeypatch.setattr(
                 worker_exec.os,
@@ -984,7 +984,9 @@ def test_worker_restart_is_cleanup_only_and_retains_checkout(
             monkeypatch.setattr(
                 worker_exec,
                 "_wait_process_group",
-                lambda pgid, deadline: escalation_waits.append((pgid, deadline)),
+                lambda pgid, deadline: (
+                    escalation_waits.append((pgid, deadline)) or True
+                ),
             )
             monkeypatch.setattr(
                 worker_exec, "_process_group_has_live_members", lambda pgid: True
@@ -1034,5 +1036,6 @@ def test_worker_restart_is_cleanup_only_and_retains_checkout(
         assert escalation_signals == [(4321, signal.SIGTERM), (4321, signal.SIGKILL)]
         assert len(escalation_waits) == 2
         assert escalation_waits[0][1] is not None
-        assert escalation_waits[1] == (4321, None)
-        assert process_waited == [True]
+        assert escalation_waits[1][0] == 4321
+        assert escalation_waits[1][1] is not None
+        assert process_waited == [5.0]

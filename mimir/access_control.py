@@ -249,6 +249,12 @@ _SINK_CATEGORY_MAP: dict[str, SinkCategory] = {
     "repo_push": SinkCategory.FORGE,
 }
 
+SHELL_PROCESS_TOOL_NAMES: frozenset[str] = frozenset(
+    name
+    for name, category in _SINK_CATEGORY_MAP.items()
+    if category is SinkCategory.SHELL_PROCESS
+)
+
 _TOOL_FLOW_MAP: dict[str, ToolFlowDirection] = {
     # Native model tools. This is intentionally exhaustive rather than derived
     # from the sink map: startup checks the assembled surface against this map,
@@ -1829,8 +1835,24 @@ class DeclaredShellCommand:
     script: Path | None = None
 
 
-def _declaration_error(name: str, detail: str) -> ValueError:
-    return ValueError(f"shell_commands[{name!r}]: {detail}")
+class DeclaredShellCommandError(ValueError):
+    """A shell declaration error, classified by whether host state caused it."""
+
+    def __init__(self, message: str, *, environment_dependent: bool = False) -> None:
+        super().__init__(message)
+        self.environment_dependent = environment_dependent
+
+
+def _declaration_error(
+    name: str,
+    detail: str,
+    *,
+    environment_dependent: bool = False,
+) -> DeclaredShellCommandError:
+    return DeclaredShellCommandError(
+        f"shell_commands[{name!r}]: {detail}",
+        environment_dependent=environment_dependent,
+    )
 
 
 def agent_writable_roots(home: Path | str | None = None) -> tuple[Path, ...]:
@@ -1952,19 +1974,28 @@ def parse_declared_shell_commands(
         if not path.is_absolute():
             raise _declaration_error(name, f"path must be absolute, got {raw_path!r}")
         if not path.exists():
-            # Fail at load, matching the existing scoped-root precedent: a grant
-            # naming a binary that is not installed is a config error, and
-            # deferring it surfaces later as an unexplained refusal.
-            raise _declaration_error(name, f"path does not exist: {raw_path}")
+            raise _declaration_error(
+                name,
+                f"path does not exist: {raw_path}",
+                environment_dependent=True,
+            )
         # The EXECUTABLE gets the same immutability rule as a script. Without
         # this, declaring a CLI under an agent-writable location lets the agent
         # replace the binary and run anything through an admitted command shape,
         # which would make every other check here decorative.
         path = path.resolve()
         if not path.is_file():
-            raise _declaration_error(name, f"path is not a regular file: {raw_path}")
+            raise _declaration_error(
+                name,
+                f"path is not a regular file: {raw_path}",
+                environment_dependent=True,
+            )
         if not os.access(path, os.X_OK):
-            raise _declaration_error(name, f"path is not executable: {raw_path}")
+            raise _declaration_error(
+                name,
+                f"path is not executable: {raw_path}",
+                environment_dependent=True,
+            )
         writable_root = _agent_writable_root_for_path(
             path, resolved_writable, admin_operator_turn=False,
         )
@@ -2150,6 +2181,137 @@ def _arguments_match_allowlist(
     return True
 
 
+@dataclass(frozen=True)
+class _ShellReadCommandSpec:
+    exact_options: frozenset[str]
+    option_prefixes: tuple[str, ...] = ()
+    value_options: frozenset[str] = frozenset()
+    positional_values_before_paths: int = 0
+    default_path: str | None = None
+    reads_content: bool = True
+
+
+_SHELL_READ_COMMAND_SPECS = {
+    "ls": _ShellReadCommandSpec(
+        exact_options=frozenset({
+            "-1", "-A", "-a", "-d", "-F", "-h", "-l", "-la", "-al",
+            "-ld", "-dl", "-lh", "-hl", "--all", "--almost-all", "--directory",
+            "--classify", "--human-readable",
+        }),
+        option_prefixes=("--color=",),
+        reads_content=False,
+    ),
+    "wc": _ShellReadCommandSpec(exact_options=frozenset({
+        "-c", "-l", "-L", "-m", "-w", "--bytes", "--chars",
+        "--lines", "--max-line-length", "--words",
+    })),
+    "grep": _ShellReadCommandSpec(
+        exact_options=frozenset({
+            "-E", "-F", "-H", "-h", "-i", "-l", "-n", "-q", "-r", "-s",
+            "-v", "-w", "-x", "--extended-regexp", "--fixed-strings",
+            "--files-with-matches", "--ignore-case", "--line-number",
+            "--no-messages", "--quiet", "--recursive", "--invert-match",
+            "--with-filename", "--no-filename", "--word-regexp", "--line-regexp",
+        }),
+        option_prefixes=("--exclude=", "--include=", "--exclude-dir="),
+        positional_values_before_paths=1,
+    ),
+    "jq": _ShellReadCommandSpec(
+        exact_options=frozenset({
+            "-C", "-M", "-R", "-S", "-c", "-e", "-j", "-r", "-s",
+            "--ascii-output", "--compact-output", "--exit-status",
+            "--join-output", "--monochrome-output", "--null-input",
+            "--raw-input", "--raw-output", "--slurp", "--sort-keys",
+        }),
+        positional_values_before_paths=1,
+    ),
+    "rg": _ShellReadCommandSpec(
+        exact_options=frozenset({
+            "-F", "-H", "-L", "-S", "-g", "-h", "-i", "-l", "-n",
+            "-s", "-u", "-v", "-w", "--case-sensitive", "--files",
+            "--files-with-matches", "--fixed-strings", "--glob", "--hidden",
+            "--ignore-case", "--line-number", "--no-heading", "--no-ignore",
+            "--smart-case", "--type", "--type-not", "--word-regexp",
+        }),
+        option_prefixes=("--glob=", "--type=", "--type-not="),
+        value_options=frozenset({"-g", "--glob", "--type", "--type-not"}),
+        positional_values_before_paths=1,
+        default_path=".",
+    ),
+    "cat": _ShellReadCommandSpec(exact_options=frozenset({
+        "-n", "--number", "-s", "--squeeze-blank", "-E", "--show-ends",
+    })),
+    "head": _ShellReadCommandSpec(
+        exact_options=frozenset({"-q", "-v", "--quiet", "--verbose", "-n", "-c"}),
+        option_prefixes=("-n", "-c", "--lines=", "--bytes="),
+        value_options=frozenset({"-n", "-c"}),
+    ),
+    "tail": _ShellReadCommandSpec(
+        exact_options=frozenset({"-q", "-v", "--quiet", "--verbose", "-n", "-c"}),
+        option_prefixes=("-n", "-c", "--lines=", "--bytes="),
+        value_options=frozenset({"-n", "-c"}),
+    ),
+    "stat": _ShellReadCommandSpec(
+        exact_options=frozenset({"-t", "--terse", "-L", "--dereference", "-c"}),
+        option_prefixes=("-c", "--format=", "--printf="),
+        value_options=frozenset({"-c"}),
+        reads_content=False,
+    ),
+}
+_READ_ONLY_SHELL_READ_COMMANDS = frozenset({"ls", "wc", "grep", "jq", "rg"})
+
+
+def _shell_read_path_operands(argv: list[str]) -> tuple[str, ...] | None:
+    """Validate one filesystem reader and return only its path operands."""
+    if not argv:
+        return None
+    command = argv[0]
+    spec = _SHELL_READ_COMMAND_SPECS.get(command)
+    if spec is None:
+        return None
+    arguments = argv[1:]
+    if command == "rg":
+        if not arguments or arguments[0] != "--no-config":
+            return None
+        arguments = arguments[1:]
+
+    positional: list[str] = []
+    options_ended = False
+    index = 0
+    while index < len(arguments):
+        argument = arguments[index]
+        if not options_ended and argument == "--":
+            options_ended = True
+            index += 1
+            continue
+        if not options_ended and argument.startswith("-") and argument != "-":
+            if argument in spec.value_options:
+                if index + 1 >= len(arguments):
+                    return None
+                index += 2
+                continue
+            if argument in spec.exact_options or argument.startswith(spec.option_prefixes):
+                index += 1
+                continue
+            return None
+        positional.append(argument)
+        index += 1
+
+    skipped = 0 if command == "rg" and "--files" in arguments else spec.positional_values_before_paths
+    if len(positional) < skipped:
+        return None
+    paths = positional[skipped:]
+    if (
+        command == "grep"
+        and not paths
+        and any(option in arguments for option in ("-r", "--recursive"))
+    ):
+        paths = ["."]
+    if not paths and spec.default_path is not None:
+        paths = [spec.default_path]
+    return tuple(paths)
+
+
 def _target_matches_read_only_shell_command(argv: list[str]) -> bool:
     """Validate an argv against the scheduler/poller read-only profile."""
     if _target_matches_chainlink_command(argv):
@@ -2162,66 +2324,11 @@ def _target_matches_read_only_shell_command(argv: list[str]) -> bool:
 
     if command == "pwd":
         return set(arguments) <= {"-L", "-P"}
-    if command == "ls":
-        return _arguments_match_allowlist(
-            arguments,
-            exact_options=frozenset({
-                "-1", "-A", "-a", "-d", "-F", "-h", "-l", "-la", "-al",
-                "-ld", "-dl", "-lh", "-hl", "--all", "--almost-all", "--directory",
-                "--classify", "--human-readable",
-            }),
-            option_prefixes=("--color=",),
-        )
-    if command == "wc":
-        return _arguments_match_allowlist(
-            arguments,
-            exact_options=frozenset({
-                "-c", "-l", "-L", "-m", "-w", "--bytes", "--chars",
-                "--lines", "--max-line-length", "--words",
-            }),
-        )
-    if command == "grep":
-        return _arguments_match_allowlist(
-            arguments,
-            exact_options=frozenset({
-                "-E", "-F", "-H", "-h", "-i", "-l", "-n", "-q", "-r", "-s",
-                "-v", "-w", "-x", "--extended-regexp", "--fixed-strings",
-                "--files-with-matches", "--ignore-case", "--line-number",
-                "--no-messages", "--quiet", "--recursive", "--invert-match",
-                "--with-filename", "--no-filename", "--word-regexp",
-                "--line-regexp",
-            }),
-            option_prefixes=("--exclude=", "--include=", "--exclude-dir="),
-        )
-    if command == "jq":
-        # Filters are intentionally unconstrained: jq is useful precisely as a
-        # JSON expression language. direct_exec_env() must therefore give the
-        # pinned jq child only a minimal non-secret environment; never replace
-        # that control with a filter-text denylist for env/$ENV.
-        return _arguments_match_allowlist(
-            arguments,
-            exact_options=frozenset({
-                "-C", "-M", "-R", "-S", "-c", "-e", "-j", "-r", "-s",
-                "--ascii-output", "--compact-output", "--exit-status",
-                "--join-output", "--monochrome-output", "--null-input",
-                "--raw-input", "--raw-output", "--slurp", "--sort-keys",
-            }),
-        )
-    if command == "rg":
-        # ripgrep's config file can inject --pre. Require --no-config in the
-        # command itself so the allowlist is independent of ambient process env.
-        if not arguments or arguments[0] != "--no-config":
-            return False
-        return _arguments_match_allowlist(
-            arguments[1:],
-            exact_options=frozenset({
-                "-F", "-H", "-L", "-S", "-g", "-h", "-i", "-l", "-n",
-                "-s", "-u", "-v", "-w", "--case-sensitive", "--files",
-                "--files-with-matches", "--fixed-strings", "--glob", "--hidden",
-                "--ignore-case", "--line-number", "--no-heading", "--no-ignore",
-                "--smart-case", "--type", "--type-not", "--word-regexp",
-            }),
-        )
+    # jq filters are intentionally unconstrained. direct_exec_env() gives the
+    # child a minimal environment instead of trying to denylist its language.
+    # rg requires --no-config so ambient configuration cannot inject --pre.
+    if command in _READ_ONLY_SHELL_READ_COMMANDS:
+        return _shell_read_path_operands(argv) is not None
     if command != "git" or not arguments:
         return False
 
@@ -3389,25 +3496,8 @@ def _target_matches_maintenance_shell_command(argv: list[str]) -> bool:
     # readable: ``grep`` and ``rg`` are already admitted and reach the same
     # bytes. Per-command option allowlists, so nothing here can mutate --
     # note ``date`` admits no ``-s``/``--set``, which would set the clock.
-    if argv[0] == "cat":
-        return _arguments_match_allowlist(
-            argv[1:],
-            exact_options=frozenset({
-                "-n", "--number", "-s", "--squeeze-blank", "-E", "--show-ends",
-            }),
-        )
-    if argv[0] in {"head", "tail"}:
-        return _arguments_match_allowlist(
-            argv[1:],
-            exact_options=frozenset({"-q", "-v", "--quiet", "--verbose"}),
-            option_prefixes=("-n", "-c", "--lines=", "--bytes="),
-        )
-    if argv[0] == "stat":
-        return _arguments_match_allowlist(
-            argv[1:],
-            exact_options=frozenset({"-t", "--terse", "-L", "--dereference"}),
-            option_prefixes=("-c", "--format=", "--printf="),
-        )
+    if argv[0] in _SHELL_READ_COMMAND_SPECS:
+        return _shell_read_path_operands(argv) is not None
     if argv[0] == "date":
         return _arguments_match_allowlist(
             argv[1:],
@@ -3640,6 +3730,7 @@ class ServiceShellBindingRule(StrEnum):
     REVIEW_BODY_CAPTURE = "review_body_capture"
     UNKNOWN_PROFILE = "unknown_profile"
     DECLARED_COMMAND_MISMATCH = "declared_command_mismatch"
+    READ_OPERAND_POLICY = "read_operand_policy"
 
 
 def service_shell_argv_for_log(target: str) -> tuple[list[str], bool]:
@@ -3858,9 +3949,141 @@ def _service_shell_not_admitted_reason(argv: list[str], destination: str) -> str
     )
 
 
+_SHELL_RECURSIVE_READ_ENTRY_LIMIT = 256
+_SHELL_RECURSIVE_READ_BYTE_LIMIT = 8 * 1024 * 1024
+
+
+def _service_shell_read_operand_refusal(
+    service: "ServicePrincipal",
+    argv: list[str],
+    *,
+    auth_context: "AuthContext | None" = None,
+    read_cwd: str | Path | None = None,
+    review_state: Any = None,
+) -> str | None:
+    """Apply the typed-read boundary, returning a bounded refusal reason."""
+    operands = _shell_read_path_operands(argv)
+    if operands is None:
+        return None
+    spec = _SHELL_READ_COMMAND_SPECS[argv[0]]
+    base = Path(read_cwd) if read_cwd is not None else None
+    if base is None and review_state is not None:
+        review_root = getattr(review_state, "root", None)
+        if isinstance(review_root, str) and review_root:
+            base = Path(review_root)
+    if base is None:
+        home = os.environ.get("MIMIR_HOME", "").strip()
+        base = Path(home) if home else None
+
+    recursive = argv[0] == "rg" or (
+        argv[0] == "grep" and any(value in argv[1:] for value in ("-r", "--recursive"))
+    )
+    reads_content = spec.reads_content and not (
+        argv[0] == "rg" and "--files" in argv[1:]
+    )
+    include_hidden = argv[0] != "rg" or (
+        "--hidden" in argv[1:]
+        or argv[1:].count("-u") >= 2
+        or any(
+            value in {"-g", "--glob"} or value.startswith("--glob=")
+            for value in argv[1:]
+        )
+    )
+    if argv[0] == "rg" and "-L" in argv[1:]:
+        return "ripgrep symlink following cannot be bounded by the admission walk"
+
+    entry_count = 0
+    content_bytes = 0
+    for raw in operands:
+        candidate = Path(raw)
+        if not candidate.is_absolute():
+            if base is None:
+                return "a relative filesystem operand has no authoritative execution cwd"
+            candidate = base / candidate
+        try:
+            resolved = candidate.resolve(strict=True)
+        except (OSError, RuntimeError):
+            return "a filesystem operand could not be resolved"
+        tool_name = "ls" if resolved.is_dir() else "read_file" if reads_content else "ls"
+        if not _trigger_service_read_target_is_allowed(
+            service, tool_name, {"path": str(candidate)}, auth_context=auth_context,
+        ):
+            return "a filesystem operand is outside the read roots or withheld"
+        if not resolved.is_dir():
+            continue
+        if not recursive:
+            # Content readers do not accept directory operands unless their
+            # admitted recursive mode can be checked entry by entry.
+            if reads_content:
+                return "a content reader needs recursive mode for a directory operand"
+            continue
+
+        # A content reader can print an entire matching line, and options such as
+        # grep -h remove source-path provenance from the result. The result layer
+        # therefore cannot reliably apply the path/content veto after execution.
+        # Preflight only the entries the command may read, but cap that speculative
+        # work by both entry count and candidate content bytes so admission never
+        # scans an unbounded tree or a few enormous files. os.scandir is used
+        # directly because os.walk materializes every child of one directory before
+        # yielding, which would make even an entry cap scale with a wide directory.
+        pending = [resolved]
+        while pending:
+            directory_path = pending.pop()
+            try:
+                with os.scandir(directory_path) as entries:
+                    for entry in entries:
+                        if not include_hidden and entry.name.startswith("."):
+                            continue
+                        entry_count += 1
+                        if entry_count > _SHELL_RECURSIVE_READ_ENTRY_LIMIT:
+                            return (
+                                "recursive read preflight exceeded the "
+                                f"{_SHELL_RECURSIVE_READ_ENTRY_LIMIT}-entry limit at "
+                                f"{directory_path}; narrow the operand or use a typed search tool"
+                            )
+                        child = Path(entry.path)
+                        try:
+                            child_is_directory = entry.is_dir(follow_symlinks=False)
+                        except OSError:
+                            return f"recursive read preflight could not inspect {child}"
+                        if reads_content and not child_is_directory:
+                            try:
+                                content_bytes += entry.stat(follow_symlinks=False).st_size
+                            except OSError:
+                                return f"recursive read preflight could not inspect {child}"
+                            if content_bytes > _SHELL_RECURSIVE_READ_BYTE_LIMIT:
+                                return (
+                                    "recursive read preflight exceeded the "
+                                    f"{_SHELL_RECURSIVE_READ_BYTE_LIMIT}-byte content limit at "
+                                    f"{child}; narrow the operand or use a typed search tool"
+                                )
+                        child_tool = "ls" if child_is_directory or not reads_content else "read_file"
+                        if not _trigger_service_read_target_is_allowed(
+                            service,
+                            child_tool,
+                            {"path": str(child)},
+                            auth_context=auth_context,
+                        ):
+                            return f"recursive read preflight withheld {child}"
+                        if child_is_directory:
+                            pending.append(child)
+            except OSError:
+                return f"recursive read preflight could not inspect directory {directory_path}"
+
+        # This is deliberately a point-in-time hardening check, not a claim that
+        # the tree is immutable. Root confinement is re-derived from each resolved
+        # path; a later entry can race the walk, but it cannot widen the principal's
+        # declared roots. A provenance-preserving execution/result filter would be
+        # needed to close that residual race without refusing recursive readers.
+    return None
+
+
 def parse_service_shell_argv_with_diagnostics(
     target: str, destination: str, *, review_state: Any = None,
     declared: tuple["DeclaredShellCommand", ...] = (),
+    service: "ServicePrincipal | None" = None,
+    auth_context: "AuthContext | None" = None,
+    read_cwd: str | Path | None = None,
 ) -> tuple[list[str] | None, str, ServiceShellBindingRule | None]:
     """Return the admitted argv, refusal reason, and stable rejecting rule.
 
@@ -3933,6 +4156,18 @@ def parse_service_shell_argv_with_diagnostics(
     declared_argv = _declared_command_execution_argv(argv, declared)
     if declared_argv is not None:
         return declared_argv, "", None
+
+    if service is not None and _shell_read_path_operands(argv) is not None:
+        read_refusal = _service_shell_read_operand_refusal(
+            service, argv, auth_context=auth_context,
+            read_cwd=read_cwd, review_state=review_state,
+        )
+        if read_refusal is not None:
+            return None, (
+                f"{read_refusal}. The command is refused whole; use a path within "
+                "the declared read scope that contains no protected credential "
+                "material."
+            ), ServiceShellBindingRule.READ_OPERAND_POLICY
 
     allowed = False
     if destination == "scheduler_read_only":
@@ -4029,10 +4264,14 @@ def parse_service_shell_argv_with_diagnostics(
 def parse_service_shell_argv_with_reason(
     target: str, destination: str, *, review_state: Any = None,
     declared: tuple["DeclaredShellCommand", ...] = (),
+    service: "ServicePrincipal | None" = None,
+    auth_context: "AuthContext | None" = None,
+    read_cwd: str | Path | None = None,
 ) -> tuple[list[str] | None, str]:
     """Compatibility view returning only the admitted argv and refusal prose."""
     argv, reason, _rule = parse_service_shell_argv_with_diagnostics(
         target, destination, review_state=review_state, declared=declared,
+        service=service, auth_context=auth_context, read_cwd=read_cwd,
     )
     return argv, reason
 
@@ -4040,10 +4279,14 @@ def parse_service_shell_argv_with_reason(
 def parse_service_shell_argv(
     target: str, destination: str, *, review_state: Any = None,
     declared: tuple["DeclaredShellCommand", ...] = (),
+    service: "ServicePrincipal | None" = None,
+    auth_context: "AuthContext | None" = None,
+    read_cwd: str | Path | None = None,
 ) -> list[str] | None:
     """Argv-only view of :func:`parse_service_shell_argv_with_reason`."""
     return parse_service_shell_argv_with_reason(
         target, destination, review_state=review_state, declared=declared,
+        service=service, auth_context=auth_context, read_cwd=read_cwd,
     )[0]
 
 
@@ -4674,6 +4917,7 @@ def _sink_adapter_admits(
     service: "ServicePrincipal | None" = None,
     *,
     review_state: Any = None,
+    auth_context: "AuthContext | None" = None,
 ) -> bool:
     """Invoke a sink adapter, handing the shell adapter the principal's grants.
 
@@ -4685,6 +4929,10 @@ def _sink_adapter_admits(
     if adapter is None:
         return False
     if adapter is _target_matches_shell_profile:
+        # Authorization validates the argv shape only. Filesystem operands are
+        # resolved once by the execution binder after it has the authoritative
+        # cwd; doing it here both duplicates the admission walk and resolves
+        # relative operands against the wrong base.
         return parse_service_shell_argv(
             target, destination, review_state=review_state,
             declared=getattr(service, "declared_shell_commands", ()) or (),
@@ -5328,6 +5576,7 @@ class SinkGate:
                 if target != triggering:
                     if not _sink_adapter_admits(
                         adapter, target, candidate.destination, service,
+                        auth_context=auth_context,
                     ):
                         return ToolAuthorization(
                             tool_name=tool_name,
@@ -5392,7 +5641,7 @@ class SinkGate:
                     )
                     and _sink_adapter_admits(
                         adapter, target, service_policy.destination, service,
-                        review_state=review_state,
+                        review_state=review_state, auth_context=auth_context,
                     )
                 )
             if (
@@ -5677,6 +5926,20 @@ class SinkGate:
             and target is not None
             and category in {SinkCategory.SHELL_PROCESS, SinkCategory.FILE}
         ):
+            return frozenset({target})
+        if (
+            category is SinkCategory.FORGE
+            and target is not None
+            and isinstance(sources, tuple)
+            and bool(sources)
+            and all(source.domain == "repository" for source in sources)
+            and _forge_repository_scope_mismatch(
+                ifc_labels,
+                getattr(auth_context, "repo_pr_action_scope", None),
+            ) is None
+        ):
+            # Repository command output may flow only back to the immutable
+            # PR/head scope from which it was produced.
             return frozenset({target})
         is_triggering_channel_reply = (
             service is not None
@@ -7653,6 +7916,7 @@ class ToolRegistry:
 
 
 _PROTECTED_RESULT_DOMAINS: dict[str, str] = {
+    "fetch_channel_history": "channel_history",
     "list_channels": "channel_metadata",
     "list_schedules": "schedule_metadata",
     "bash_jobs_list": "shell_jobs",
@@ -7675,7 +7939,13 @@ _PROTECTED_RESULT_DOMAINS: dict[str, str] = {
     "mimir_get_turn": "turn_history",
     "memory_query": "saga",
     "memory_get": "saga",
+    "saga_forget": "saga",
     "commitment_list": "commitments",
+    "shell_exec": "shell",
+    "execute": "shell",
+    "web_search": "web",
+    "worklink_run": "worklink",
+    "spawn_open_code": "coding_worker",
     "pr_metadata": "repository",
     "pr_files": "repository",
     "pr_diff": "repository",
@@ -7689,11 +7959,83 @@ _PROTECTED_RESULT_DOMAINS: dict[str, str] = {
     "repo_test": "repository",
     "repo_diff": "repository",
     "repo_unmerged": "repository",
+    "pr_submit_review": "repository",
+    "pr_inline_review_comment": "repository",
+    "pr_comment": "repository",
+    "issue_comment": "repository",
+    "repo_commit": "repository",
+    "repo_merge": "repository",
+    "repo_merge_abort": "repository",
+    "repo_rebase": "repository",
+    "repo_rebase_abort": "repository",
+    "repo_revert": "repository",
+    "repo_revert_abort": "repository",
+    "repo_push": "repository",
 }
 
-# These BOTH tools return only server-created metadata inline. Their external
-# content remains behind a separately classified read boundary.
-_METADATA_ONLY_RESULT_TOOLS = frozenset({"bash_async", "fetch_url"})
+# Every model-bound tool that does not ingest model-visible content is listed
+# explicitly. This makes exemption a reviewed semantic claim rather than an
+# inference from flow direction.
+_NON_INGESTING_RESULT_TOOLS = frozenset({
+    # Authorization/workflow actions return only server-created status.
+    "approve_declassification",
+    "request_operator_approval",
+    # These writes return identifiers, counts, or fixed status, not stored data.
+    "memory_store",
+    "open_proposal",
+    "submit_proposal",
+    "abandon_proposal",
+    "saga_feedback",
+    "saga_mark_contributions",
+    "saga_end_session",
+    "saga_record_skill_learning",
+    "rebuild_index",
+    # Async shell and fetch return metadata; content is read through a mapped tool.
+    "bash_async",
+    "fetch_url",
+    # Delivery and queue mutations return acknowledgements only.
+    "operator_alert",
+    "send_message",
+    "react",
+    "defer_injected_message",
+    # Scheduler and commitment mutations return normalized status only.
+    "add_schedule",
+    "set_schedule_priority",
+    "remove_schedule",
+    "set_poller_overrides",
+    "reload_pollers",
+    "commitment_complete",
+    "commitment_snooze",
+    "commitment_dismiss",
+    # Self-update returns the server-created pending-update status.
+    "request_mimir_update",
+    # These repository actions construct local acknowledgements without readback.
+    "pr_rerequest_review",
+    "unsupported_operation",
+    "repo_cleanup",
+    "repo_stage",
+    # DeepAgents state/write tools return acknowledgements or remain in-carrier.
+    "write_todos",
+    "write_file",
+    "edit_file",
+    "task",
+})
+
+_REPOSITORY_RESULT_TOOLS = frozenset({
+    "pr_metadata", "pr_files", "pr_diff", "pr_checks", "pr_reviews",
+    "pr_comments", "pr_review_requests", "repo_checkout", "repo_fetch",
+    "repo_status", "repo_test", "repo_diff", "repo_unmerged",
+    "pr_submit_review", "pr_inline_review_comment", "pr_comment",
+    "repo_commit", "repo_merge", "repo_merge_abort",
+    "repo_rebase", "repo_rebase_abort", "repo_revert", "repo_revert_abort",
+    "repo_push",
+})
+_REPOSITORY_MUTATION_RESULT_TOOLS = frozenset({
+    "pr_submit_review", "pr_inline_review_comment", "pr_comment",
+    "repo_commit", "repo_merge", "repo_merge_abort",
+    "repo_rebase", "repo_rebase_abort", "repo_revert", "repo_revert_abort",
+    "repo_push",
+})
 
 # Independent semantic inventory for tools whose results come from a read
 # backend. Startup rejects drift toward SINK/NEITHER before it can suppress
@@ -7736,6 +8078,7 @@ _SELF_AUTHORED_FILE_ROOTS = frozenset({
     "state",
 })
 _FILE_INTEGRITY_EXCLUDED_SUBTREES = frozenset({("state", "pollers")})
+_FILE_INTEGRITY_DECLASSIFICATIONS_KEY = "__declassifications__"
 
 
 @dataclass(frozen=True)
@@ -7934,9 +8277,10 @@ def _persisted_file_integrity(home: Path, relative: Path) -> str:
         return "untrusted"
     if not isinstance(payload, dict):
         return "untrusted"
-    value = payload.get(relative.as_posix())
-    if value is None:
+    key = relative.as_posix()
+    if key not in payload:
         return "trusted"
+    value = payload[key]
     return "trusted" if value == "trusted" else "untrusted"
 
 
@@ -7996,10 +8340,13 @@ def record_file_write_integrity(
         return True
     if relative.parts[0:2] in _FILE_INTEGRITY_EXCLUDED_SUBTREES:
         return True
-    integrity = "untrusted"
     sources = getattr(labels, "sources", ())
-    if sources and all(source.integrity == "trusted" for source in sources):
-        integrity = "trusted"
+    integrity = (
+        "trusted"
+        if labels is not None
+        and all(source.integrity == "trusted" for source in sources)
+        else "untrusted"
+    )
 
     metadata_path = home / ".mimir" / "file-integrity.json"
     with _persisted_file_integrity_lock:
@@ -8011,7 +8358,14 @@ def record_file_write_integrity(
             )
             if not isinstance(payload, dict):
                 return False
-            payload[relative.as_posix()] = integrity
+            key = relative.as_posix()
+            existing = payload.get(key)
+            # This hook runs before the file mutation. A clean turn therefore
+            # cannot prove that an existing tainted file was fully replaced (or
+            # that the write succeeded), so ordinary writes never clear a mark.
+            # Exact, digest-bound operator repair is the declassification path.
+            if integrity == "untrusted" or key not in payload or existing == "trusted":
+                payload[key] = integrity
             metadata_path.parent.mkdir(parents=True, exist_ok=True)
             tmp = metadata_path.with_suffix(".tmp")
             tmp.write_text(
@@ -8022,6 +8376,86 @@ def record_file_write_integrity(
             return True
         except (OSError, json.JSONDecodeError):
             log.exception("failed to persist file integrity for %s", relative)
+            return False
+
+
+def repair_file_write_integrity(
+    resource_id: str,
+    *,
+    expected_sha256: str,
+    operator: str,
+    reason: str,
+) -> bool:
+    """Declassify one inspected file with a digest-bound audit record.
+
+    This is an offline operator primitive, not a model tool. Existing untrusted
+    records contain too little provenance for automatic repair, so the operator
+    must attest to the exact current bytes and explain the trust decision.
+    """
+    home_value = os.environ.get("MIMIR_HOME", "").strip()
+    if (
+        not home_value
+        or not isinstance(resource_id, str)
+        or not re.fullmatch(r"[0-9a-f]{64}", expected_sha256)
+        or not operator.strip()
+        or not reason.strip()
+    ):
+        return False
+    try:
+        home = Path(home_value).resolve(strict=True)
+        requested = Path(resource_id)
+        resource = requested.resolve(strict=True)
+        relative = resource.relative_to(home)
+    except (OSError, RuntimeError, ValueError):
+        return False
+    if (
+        requested.is_symlink()
+        or not resource.is_file()
+        or not relative.parts
+        or relative.parts[0] not in _SELF_AUTHORED_FILE_ROOTS
+        or relative.parts[0:2] in _FILE_INTEGRITY_EXCLUDED_SUBTREES
+    ):
+        return False
+    try:
+        digest = hashlib.sha256(resource.read_bytes()).hexdigest()
+    except OSError:
+        return False
+    if digest != expected_sha256:
+        return False
+
+    metadata_path = home / ".mimir" / "file-integrity.json"
+    with _persisted_file_integrity_lock:
+        try:
+            payload = json.loads(metadata_path.read_text(encoding="utf-8"))
+            if not isinstance(payload, dict):
+                return False
+            key = relative.as_posix()
+            prior = payload.get(key)
+            if key not in payload or prior == "trusted":
+                return False
+            audit = payload.get(_FILE_INTEGRITY_DECLASSIFICATIONS_KEY, [])
+            if not isinstance(audit, list):
+                return False
+            payload[key] = "trusted"
+            payload[_FILE_INTEGRITY_DECLASSIFICATIONS_KEY] = [
+                *audit,
+                {
+                    "path": key,
+                    "prior": prior,
+                    "sha256": digest,
+                    "operator": operator.strip(),
+                    "reason": reason.strip(),
+                },
+            ]
+            tmp = metadata_path.with_suffix(".tmp")
+            tmp.write_text(
+                json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n",
+                encoding="utf-8",
+            )
+            tmp.replace(metadata_path)
+            return True
+        except (OSError, json.JSONDecodeError):
+            log.exception("failed to repair file integrity for %s", relative)
             return False
 
 
@@ -8096,13 +8530,9 @@ def classify_protected_result(
         return None
 
     args = arguments or {}
-    if tool_name in {
-        "pr_metadata", "pr_files", "pr_diff", "pr_checks", "pr_reviews",
-        "pr_comments", "pr_review_requests", "repo_checkout", "repo_fetch",
-        "repo_status", "repo_test", "repo_diff", "repo_unmerged",
-    }:
+    if tool_name in _REPOSITORY_RESULT_TOOLS:
         scope = authorization.repo_pr_action_scope
-        if scope is None or failed:
+        if scope is None:
             return _incomplete_protected_result("repository", args)
         principal = getattr(auth_context, "canonical_principal", None)
         if getattr(auth_context, "is_service", False) and principal:
@@ -8121,10 +8551,14 @@ def classify_protected_result(
             ),
             source_kind="protected_tool",
             integrity="untrusted",
-            # The immutable authority record already selected this exact PR.
-            # Preserve its confidentiality label without deadlocking the next
-            # scope-bound edit/review operation as fresh active ingress.
-            integrity_effect="informational",
+            # Read results are informational within the immutable PR scope.
+            # Mutation responses and failures can contain Git/forge output, so
+            # they remain active ingestion attributed to that exact scope.
+            integrity_effect=(
+                "active_ingest"
+                if failed or tool_name in _REPOSITORY_MUTATION_RESULT_TOOLS
+                else "informational"
+            ),
         )
         labels = InformationFlowLabels().with_source(source)
         channel = getattr(auth_context, "channel_id", None)
@@ -8219,14 +8653,7 @@ def classify_protected_result(
                 labels = labels.with_source(source)
             return labels
 
-        metadata_only = tool_name in _METADATA_ONLY_RESULT_TOOLS
-        flow_direction = authorization.flow_direction
-        if flow_direction is ToolFlowDirection.UNKNOWN:
-            flow_direction = get_tool_flow_direction(tool_name)
-        if metadata_only or flow_direction not in {
-            ToolFlowDirection.SOURCE,
-            ToolFlowDirection.BOTH,
-        }:
+        if tool_name in _NON_INGESTING_RESULT_TOOLS:
             return None
         # An ingesting native tool without a confidentiality domain still
         # introduces model-visible content. Unknown provenance must taint the
@@ -8810,6 +9237,15 @@ def assert_model_tool_inventory_cataloged(
             ToolFlowDirection.SOURCE, ToolFlowDirection.BOTH,
         }
     })
+    unclassified_results = sorted({
+        tool_name for tool_name in tool_names
+        if not tool_name.startswith(MCPResourceAdapter._MCP_TOOL_PREFIX)
+        and tool_name not in _PROTECTED_RESULT_DOMAINS
+        and tool_name not in _NON_INGESTING_RESULT_TOOLS
+    })
+    overlapping_result_policies = sorted(
+        _PROTECTED_RESULT_DOMAINS.keys() & _NON_INGESTING_RESULT_TOOLS
+    )
     errors: list[str] = []
     if unknown_tools:
         errors.append("UNKNOWN model-bound tools: " + ", ".join(unknown_tools))
@@ -8821,6 +9257,16 @@ def assert_model_tool_inventory_cataloged(
         errors.append(
             "read-backend tools must be IFC SOURCE/BOTH: "
             + ", ".join(misclassified_read_backends)
+        )
+    if unclassified_results:
+        errors.append(
+            "model-bound tools without explicit protected-result classification: "
+            + ", ".join(unclassified_results)
+        )
+    if overlapping_result_policies:
+        errors.append(
+            "model-bound tools both mapped and exempted from result classification: "
+            + ", ".join(overlapping_result_policies)
         )
     if errors:
         raise CapabilityMatrixError(

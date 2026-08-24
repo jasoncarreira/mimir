@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import replace
 
 import pytest
+from langchain_core.tools import ToolException
 import requests
 
 from mimir.forge import ForgeError, ForgeResponseTooLarge, ReviewVerdict
@@ -181,9 +182,8 @@ def test_mismatched_authenticated_identity_refuses_effect_without_post() -> None
     ]
 
 
-def test_midflight_forge_identity_change_returns_policy_refusal_and_latches(monkeypatch) -> None:
+def test_midflight_forge_identity_change_returns_execution_fault_and_latches(monkeypatch) -> None:
     from mimir.tools import forge as forge_tools
-    from mimir.tools.refusals import ToolPolicyRefusal
 
     error = github_module.GitHubIdentityVerificationError(
         "github identity verification cache does not match active credential",
@@ -191,7 +191,7 @@ def test_midflight_forge_identity_change_returns_policy_refusal_and_latches(monk
         authenticated_login="reviewer",
     )
 
-    with pytest.raises(ToolPolicyRefusal, match="active credential"):
+    with pytest.raises(ToolException, match="active credential"):
         forge_tools._call(lambda: (_ for _ in ()).throw(error))
 
     assert forge_tools.github_identity_is_degraded() is True

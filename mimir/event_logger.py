@@ -143,13 +143,37 @@ class EventLogger:
                 process_lock: TextIO | None = None
                 try:
                     process_lock = self._acquire_process_lock(
-                        "continuing with an unlocked append"
+                        "failing durable append"
+                        if durable
+                        else "continuing with an unlocked append"
                     )
+                    if durable and process_lock is None:
+                        # A trim holding the sibling-process lock may already have
+                        # snapshotted the old file. Appending without the lock could
+                        # fsync successfully and then be erased by trim's rename,
+                        # falsely reporting durability. Ordinary telemetry remains
+                        # best-effort; durability callers must see the failure.
+                        raise TimeoutError(
+                            "events.jsonl process lock timed out during durable append"
+                        )
                     with self._path.open("a", encoding="utf-8") as f:
                         f.write(json.dumps(record, ensure_ascii=True, default=str) + "\n")
                         if durable:
                             f.flush()
                             os.fsync(f.fileno())
+                    if durable and hasattr(os, "O_DIRECTORY"):
+                        # A file fsync persists contents but not a potentially new
+                        # directory entry. Fsync the parent on every rare durable
+                        # append: an earlier non-durable append may have created the
+                        # file without making that name crash-durable.
+                        directory_fd = os.open(
+                            self._path.parent,
+                            os.O_RDONLY | os.O_DIRECTORY,
+                        )
+                        try:
+                            os.fsync(directory_fd)
+                        finally:
+                            os.close(directory_fd)
                     self._line_count += 1
                     return
                 except FileNotFoundError:

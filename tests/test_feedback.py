@@ -1349,6 +1349,42 @@ def test_background_task_failed_surfaces_as_negative(tmp_path: Path):
     assert "background task 'boom-task' failed: RuntimeError: boom" in block
 
 
+def test_liveness_startup_failures_surface_as_negative_feedback(tmp_path: Path):
+    from mimir.feedback import classify
+
+    expected = {
+        "liveness_unclean_restart_handoff_persist_failed": (
+            "negative", "liveness_unclean_restart_handoff_persist_failed",
+        ),
+        "startup_failed": ("negative", "startup_failed"),
+    }
+    for event_type, rule in expected.items():
+        assert classify(event_type) == rule
+
+    log = _make_log(
+        tmp_path,
+        events=[
+            {
+                "timestamp": _ts(0.1),
+                "type": "liveness_unclean_restart_handoff_persist_failed",
+                "prior_pid": 123,
+            },
+            {
+                "timestamp": _ts(0.2),
+                "type": "startup_failed",
+                "phase": "liveness_marker",
+                "exception": "RuntimeError('boom')",
+            },
+        ],
+    )
+
+    block = log.recent_block()
+
+    assert block is not None
+    assert "liveness_unclean_restart_handoff_persist_failed" in block
+    assert "startup_failed" in block
+
+
 def test_pr_review_request_gave_up_surfaces_as_negative(tmp_path: Path):
     """End-to-end: a ``*_gave_up`` poller event surfaces in the agent's
     negative algedonic block with a human one-liner naming what was
