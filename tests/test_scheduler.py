@@ -2021,6 +2021,32 @@ async def test_job_error_from_executor_thread_uses_sync_event_fallback(tmp_path:
     assert failure["exception"] == "ValueError('bad threaded job')"
 
 
+def test_job_error_bounds_exception_repr(tmp_path: Path):
+    from types import SimpleNamespace
+    from unittest.mock import patch
+
+    async def noop(_e):
+        return True
+
+    sched = Scheduler(scheduler_yaml=tmp_path / "s.yaml", enqueue=noop)
+    event = SimpleNamespace(
+        job_id="large-error-test-job",
+        exception=RuntimeError("X" * 20_000),
+    )
+
+    with patch("mimir.scheduler.log_event_sync") as log_sync:
+        sched._on_job_error(event)
+
+    log_sync.assert_called_once()
+    event_type, = log_sync.call_args.args
+    exception = log_sync.call_args.kwargs["exception"]
+    assert event_type == "scheduled_job_error"
+    assert len(exception) == 500
+    assert "...[truncated]..." in exception
+    assert exception.startswith("RuntimeError('XXX")
+    assert exception.endswith("XXX')")
+
+
 @pytest.mark.asyncio
 async def test_self_wrapping_job_does_not_emit_generic_error_twice(
     tmp_path: Path, monkeypatch,

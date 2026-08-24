@@ -845,9 +845,13 @@ class Scheduler:
 
     def _on_job_error(self, event: JobExecutionEvent) -> None:
         """Record every APScheduler job exception without changing its result."""
+        # Import lazily: importing ``mimir.tools`` while this module is still
+        # initializing reaches the tool registry, which imports ``SchedulerJob``.
+        from .tools.budget_gate import _bounded_tool_event_error
+
         payload = {
             "job_id": event.job_id,
-            "exception": repr(event.exception),
+            "exception": _bounded_tool_event_error(repr(event.exception)),
         }
         try:
             asyncio.get_running_loop()
