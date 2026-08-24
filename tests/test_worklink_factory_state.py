@@ -79,7 +79,7 @@ def test_issue_lookup_reads_both_keys_without_legacy_shadowing_canonical(
     canonical = replace(
         legacy,
         run_id="chainlink-1551",
-        attempt=2,
+        attempt=legacy.attempt,
         branch="feature/chainlink-1551",
         sandbox=str(tmp_path / "chainlink-1551"),
         status=None,
