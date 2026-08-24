@@ -36,6 +36,7 @@ that need uncapped exploration).
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import re
@@ -88,6 +89,7 @@ _PULL_REQUEST_TOOLS = _STANDING_REVIEW_TOOLS | frozenset({
     "repo_revert_abort", "repo_push",
 })
 _TOOL_EVENT_ARGUMENT_ALLOWLIST = (
+    "command",
     "path",
     "file_path",
     "paths",
@@ -101,6 +103,26 @@ _TOOL_EVENT_ARGUMENT_ALLOWLIST = (
 _TOOL_EVENT_ARGUMENT_VALUE_LIMIT = 200
 _TOOL_EVENT_ERROR_LIMIT = 500
 _TOOL_EVENT_ELISION = "...[truncated]..."
+_GIT_OPERATION_RESULT_TOOLS = frozenset({
+    "repo_fetch", "repo_status", "repo_diff", "repo_unmerged", "repo_stage",
+    "repo_commit", "repo_merge", "repo_merge_abort", "repo_rebase",
+    "repo_rebase_abort", "repo_revert", "repo_revert_abort", "repo_push",
+})
+_GIT_OPERATION_RESULT_FIELDS = frozenset({"ok", "code", "stdout", "stderr"})
+_PROJECT_TEST_RESULT_FIELDS = frozenset({
+    "ok", "code", "returncode", "stdout", "stderr", "command",
+    "command_source", "output_limited", "stdout_dropped_bytes",
+    "stderr_dropped_bytes", "git_context",
+})
+_SPAWN_OPEN_CODE_RESULT_FIELDS = frozenset({
+    "run_id", "status", "exit_code", "stdout", "result", "stderr",
+    "artifact_dir", "name", "proposal",
+})
+_SPAWN_OPEN_CODE_ERROR_STATUSES = frozenset({
+    "artifact_unavailable", "configuration_refused", "authentication_refused",
+    "prompt_refused", "containment_unavailable", "timeout", "output_overflow",
+    "authentication_required", "failed", "proposal_unavailable",
+})
 _REMEDIATION_EFFECT_TOOLS = frozenset({
     "repo_commit", "repo_push", "pr_comment", "pr_inline_review_comment",
     "pr_rerequest_review",
@@ -1317,11 +1339,13 @@ def _bounded_tool_event_error(error: str) -> str:
 def _tool_event_arguments(arguments: Mapping[str, Any] | None) -> dict[str, Any]:
     if arguments is None:
         return {}
+    from ..redaction import redact_payload
+
     summary: dict[str, Any] = {}
     for key in _TOOL_EVENT_ARGUMENT_ALLOWLIST:
         if key not in arguments:
             continue
-        value = arguments[key]
+        value = redact_payload(arguments[key])
         if isinstance(value, str):
             summary[key] = value[:_TOOL_EVENT_ARGUMENT_VALUE_LIMIT]
         elif value is None or isinstance(value, (bool, int, float)):
@@ -1403,13 +1427,89 @@ def _execute_declassification_action(
     )
 
 
-def _result_is_error(result: ToolMessage | Command) -> bool:
+def _returned_value_is_error(tool_name: str, content: Any) -> bool:
+    """Recognize only first-party prose and exact typed-result contracts."""
+    text = content if isinstance(content, str) else str(content)
+    result_prefixes = {tool_name}
+    if tool_name == "mimir_get_turn":
+        result_prefixes.add("get_turn")
+    if any(
+        text.startswith(f"{prefix} {outcome}")
+        for prefix in result_prefixes
+        for outcome in ("failed", "refused", "timed out")
+    ):
+        return True
+    if tool_name == "worklink_run" and text.startswith(
+        ("worklink_run shed:", "worklink_run skipped:")
+    ):
+        return True
+    if tool_name == "worklink_run" and re.match(
+        r"worklink_run #\d+: (?:blocked|failed)(?:\s|$)", text,
+    ):
+        return True
+    if tool_name == "bash_job_output" and text.startswith("unknown job_id:"):
+        return True
+    if tool_name == "web_search" and text.startswith((
+        "query is required.", "limit must be > 0.", "topic must be one of:",
+        "time_range must be one of:", "timeout_seconds must be > 0.",
+        "web_search is disabled ",
+    )):
+        return True
+    if tool_name == "fetch_url" and text.startswith((
+        "url is required.", "timeout_seconds must be > 0.",
+        "max_bytes must be > 0.",
+    )):
+        return True
+    if tool_name == "shell_exec" and text.startswith("exit="):
+        first_line = text.partition("\n")[0]
+        try:
+            return int(first_line.removeprefix("exit=")) != 0
+        except ValueError:
+            return False
+
+    if tool_name == "spawn_open_code":
+        try:
+            value = json.loads(text)
+        except (TypeError, ValueError):
+            return False
+        return (
+            isinstance(value, dict)
+            and frozenset(value) == _SPAWN_OPEN_CODE_RESULT_FIELDS
+            and value.get("status") in _SPAWN_OPEN_CODE_ERROR_STATUSES
+        )
+
+    expected_fields: frozenset[str] | None = None
+    if tool_name in _GIT_OPERATION_RESULT_TOOLS:
+        expected_fields = _GIT_OPERATION_RESULT_FIELDS
+    elif tool_name == "repo_test":
+        expected_fields = _PROJECT_TEST_RESULT_FIELDS
+    if expected_fields is None:
+        return False
+    try:
+        value = json.loads(text)
+    except (TypeError, ValueError):
+        return False
+    return (
+        isinstance(value, dict)
+        and frozenset(value) == expected_fields
+        and value.get("ok") is False
+    )
+
+
+def _result_is_error(tool_name: str, result: ToolMessage | Command) -> bool:
     if isinstance(result, ToolMessage):
-        return getattr(result, "status", None) == "error"
+        return (
+            getattr(result, "status", None) == "error"
+            or _returned_value_is_error(tool_name, getattr(result, "content", ""))
+        )
     update = getattr(result, "update", None)
     messages = update.get("messages", ()) if isinstance(update, dict) else ()
     return any(
-        isinstance(message, ToolMessage) and getattr(message, "status", None) == "error"
+        isinstance(message, ToolMessage)
+        and (
+            getattr(message, "status", None) == "error"
+            or _returned_value_is_error(tool_name, getattr(message, "content", ""))
+        )
         for message in messages
     )
 
@@ -1789,7 +1889,7 @@ class BudgetGateMiddleware(AgentMiddleware):
                 from ..read_policy import end_read_policy_refusal_capture
 
                 policy_refusal = end_read_policy_refusal_capture(read_refusal_token)
-        is_error = _result_is_error(result)
+        is_error = _result_is_error(tool_name, result)
         if not is_error:
             _record_tool_outcome(tool_name)
         _record_repo_review_checkout(
@@ -2134,7 +2234,7 @@ class BudgetGateMiddleware(AgentMiddleware):
                 from ..read_policy import end_read_policy_refusal_capture
 
                 policy_refusal = end_read_policy_refusal_capture(read_refusal_token)
-        is_error = _result_is_error(result)
+        is_error = _result_is_error(tool_name, result)
         if not is_error:
             _record_tool_outcome(tool_name)
         _record_repo_review_checkout(
