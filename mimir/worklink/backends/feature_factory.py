@@ -379,7 +379,7 @@ def _terminate_bounded_process(process: subprocess.Popen[bytes]) -> None:
 def _run_bounded(
     args: Sequence[str],
     *,
-    cwd: Path,
+    cwd: Path | None,
     env: Mapping[str, str],
     timeout: float,
     output_limit: int,
@@ -451,7 +451,7 @@ def _invoke_bounded_or_injected(
     runner: Runner,
     args: Sequence[str],
     *,
-    cwd: Path,
+    cwd: Path | None = None,
     env: Mapping[str, str],
     timeout: float,
     output_limit: int,
@@ -464,17 +464,21 @@ def _invoke_bounded_or_injected(
             timeout=timeout,
             output_limit=output_limit,
         )
+    kwargs: dict[str, Any] = {
+        "env": dict(env),
+        "stdin": subprocess.DEVNULL,
+        "stdout": subprocess.PIPE,
+        "stderr": subprocess.PIPE,
+        "timeout": timeout,
+        "check": False,
+        "shell": False,
+        "start_new_session": True,
+    }
+    if cwd is not None:
+        kwargs["cwd"] = cwd
     return runner(
         list(args),
-        cwd=cwd,
-        env=dict(env),
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        timeout=timeout,
-        check=False,
-        shell=False,
-        start_new_session=True,
+        **kwargs,
     )
 
 
@@ -646,7 +650,6 @@ class FeatureFactoryBackend:
             result = _invoke_bounded_or_injected(
                 self.runner,
                 ["node", str(entrypoint), *args],
-                cwd=sandbox,
                 env=_control_environment(),
                 timeout=30,
                 output_limit=_MAX_STATUS_BYTES,
