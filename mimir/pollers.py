@@ -171,12 +171,24 @@ POLLER_REJECTION_PREVIEW_CHARS = 200
 # into fewer turns.
 POLLER_BATCH_SIZE_DEFAULT = 1
 _POLLER_TRUST_SOURCES = frozenset({"external", "github", "trusted_system"})
-_GITHUB_FRAMEWORK_TRIGGER_EVENT_TYPES = frozenset({
-    "pr_changes_requested_stale",
-    "pr_ci_failure",
-    "pr_mergeability_rebase",
-    "pr_mergeability_conflicting",
-})
+_GITHUB_ACTOR_EVENT_TYPES = {
+    "issue_opened": "issue author",
+    "pr_opened": "pull request author",
+    "issue_comment": "comment author",
+    "pr_review_comment": "review comment author",
+    "pr_review": "reviewer",
+    "pr_synchronize": "server-linked head commit author or committer",
+    "pr_review_requested": "review requester",
+}
+_GITHUB_FRAMEWORK_TRIGGER_EVENT_TYPES = {
+    "pr_changes_requested_stale": "derived from live review and pull request state",
+    "pr_ci_failure": "derived from checks on the agent's live pull request head",
+    "pr_mergeability_rebase": "derived from live pull request mergeability",
+    "pr_mergeability_conflicting": "derived from live pull request mergeability",
+}
+_GITHUB_ACTIVITY_EVENT_TYPES = frozenset(
+    _GITHUB_ACTOR_EVENT_TYPES | _GITHUB_FRAMEWORK_TRIGGER_EVENT_TYPES,
+)
 _DELIVERY_RECEIPTS_DIR = ".delivery-receipts"
 
 
@@ -437,7 +449,7 @@ def _github_author_is_trusted(
 def _github_content_author(
     repo: Any, extras: Any, token: str, *, timeout: float | None = None,
 ) -> str | None:
-    """Resolve a GitHub body/comment author from GitHub, never poller output.
+    """Resolve a GitHub activity actor from GitHub, never poller output.
 
     ``timeout`` bounds the attestation request; callers running under a
     wall-clock budget pass their remaining time so this transport cannot outlive
@@ -460,6 +472,8 @@ def _github_content_author(
     number = path[3]
     if not number.isdigit():
         return None
+    if event_type not in _GITHUB_ACTOR_EVENT_TYPES:
+        return None
 
     endpoint: str | None = None
     fragment = parsed.fragment
@@ -477,6 +491,20 @@ def _github_content_author(
         review_id = fragment.removeprefix("pullrequestreview-")
         if review_id.isdigit():
             endpoint = f"repos/{repo}/pulls/{number}/reviews/{review_id}"
+    elif event_type == "pr_review":
+        endpoint = f"repos/{repo}/pulls/{number}/reviews"
+    elif event_type == "pr_synchronize":
+        previous_head = extras.get("previous_head")
+        new_head = extras.get("new_head")
+        if all(
+            isinstance(value, str)
+            and 7 <= len(value) <= 64
+            and all(character in "0123456789abcdefABCDEF" for character in value)
+            for value in (previous_head, new_head)
+        ):
+            endpoint = f"repos/{repo}/compare/{previous_head}...{new_head}"
+    elif event_type == "pr_review_requested":
+        endpoint = f"repos/{repo}/issues/{number}/timeline?per_page=100"
     if endpoint is None:
         return None
     attestation = _github_api_attestation(
@@ -485,10 +513,40 @@ def _github_content_author(
     if (
         attestation is None
         or attestation[0] != 200
-        or not isinstance(attestation[1], dict)
     ):
         return None
-    user = attestation[1].get("user")
+
+    payload = attestation[1]
+    if event_type == "pr_synchronize":
+        commits = payload.get("commits") if isinstance(payload, dict) else None
+        commit = commits[-1] if isinstance(commits, list) and commits else None
+        if not isinstance(commit, dict):
+            return None
+        user = commit.get("author") or commit.get("committer")
+    elif event_type == "pr_review_requested":
+        requested_reviewer = extras.get("requested_reviewer")
+        if not isinstance(payload, list) or not isinstance(requested_reviewer, str):
+            return None
+        matching = [
+            event for event in payload
+            if isinstance(event, dict)
+            and event.get("event") == "review_requested"
+            and isinstance(event.get("requested_reviewer"), dict)
+            and event["requested_reviewer"].get("login") == requested_reviewer
+        ]
+        if not matching:
+            return None
+        user = matching[-1].get("actor")
+    elif event_type == "pr_review" and isinstance(payload, list):
+        matching = [
+            review for review in payload
+            if isinstance(review, dict) and review.get("html_url") == url
+        ]
+        if not matching:
+            return None
+        user = matching[-1].get("user")
+    else:
+        user = payload.get("user") if isinstance(payload, dict) else None
     author = user.get("login") if isinstance(user, dict) else None
     return author if isinstance(author, str) and author else None
 
@@ -2382,14 +2440,20 @@ async def run_poller(
             trusted = poller.trust_source == "trusted_system"
             if poller.trust_source == "github":
                 repo = item_extras.get("repo")
-                trusted = await asyncio.to_thread(
-                    _github_framework_trigger_is_trusted,
-                    repo,
-                    item_extras,
-                    env.get("GITHUB_TOKEN", ""),
-                    env.get("MIMIR_GITHUB_SELF_LOGIN", ""),
-                )
-                if not trusted:
+                event_type = item_extras.get("event_type")
+                trusted = False
+                if event_type in _GITHUB_FRAMEWORK_TRIGGER_EVENT_TYPES:
+                    # These contain repository facts computed by the poller, not
+                    # third-party prose. Trust still requires a matching live,
+                    # agent-owned PR; active ingest remains recorded below.
+                    trusted = await asyncio.to_thread(
+                        _github_framework_trigger_is_trusted,
+                        repo,
+                        item_extras,
+                        env.get("GITHUB_TOKEN", ""),
+                        env.get("MIMIR_GITHUB_SELF_LOGIN", ""),
+                    )
+                elif event_type in _GITHUB_ACTOR_EVENT_TYPES:
                     author = await asyncio.to_thread(
                         _github_content_author,
                         repo,
