@@ -296,7 +296,12 @@ async def test_query_enables_session_boundary_rrf_by_default(tmp_path, monkeypat
     monkeypatch.setattr(client, "_search_sessions_with_conn", fake_search_sessions)
     monkeypatch.setattr(client, "_ensure_index", lambda conn: None)
 
-    result = await client.query("unmatched-query", top_k=5, auth_context=ADMIN_SCOPE)
+    result = await client.query(
+        "unmatched-query",
+        top_k=5,
+        min_confidence_tier="none",
+        auth_context=ADMIN_SCOPE,
+    )
 
     assert [a["id"] for a in result["raws"]] == [boundary_atom["atom_id"]]
 
