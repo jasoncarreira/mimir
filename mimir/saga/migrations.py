@@ -31,7 +31,7 @@ from datetime import datetime, timezone
 from typing import Callable, Iterator
 
 
-CURRENT_SCHEMA_VERSION: int = 10
+CURRENT_SCHEMA_VERSION: int = 11
 
 # Registry of post-greenfield schema changes. Keys are version
 # numbers (must be > 1, must be contiguous, must equal
@@ -630,6 +630,16 @@ WHERE a.source_type = 'session_boundary'
         ALTER TABLE atoms ADD COLUMN origin_trigger TEXT;
         ALTER TABLE atoms ADD COLUMN origin_ref TEXT;
     """,
+    11: """
+        -- v11: Bound triple candidate reads and index session recency ordering.
+        CREATE INDEX IF NOT EXISTS idx_triples_embedding_recency
+            ON triples(created_at DESC, id ASC)
+            WHERE tombstoned = 0 AND embedding IS NOT NULL;
+        CREATE INDEX IF NOT EXISTS idx_sessions_recency
+            ON sessions(COALESCE(ended_at, reflected_at) DESC, id ASC);
+        CREATE INDEX IF NOT EXISTS idx_sessions_channel_recency
+            ON sessions(channel_id, COALESCE(ended_at, reflected_at) DESC, id ASC);
+    """,
 }
 
 
@@ -672,6 +682,24 @@ def detect_schema_version(conn: sqlite3.Connection) -> int:
     so this is robust to bare-bones DBs (like the in-memory
     fixtures used by unit tests).
     """
+    # v11 marker: bounded triple candidate ordering (chainlink #1373).
+    try:
+        triple_indexes = {
+            row[1] for row in conn.execute("PRAGMA index_list(triples)").fetchall()
+        }
+        session_indexes = {
+            row[1] for row in conn.execute("PRAGMA index_list(sessions)").fetchall()
+        }
+    except sqlite3.OperationalError:
+        triple_indexes = set()
+        session_indexes = set()
+    if (
+        "idx_triples_embedding_recency" in triple_indexes
+        and "idx_sessions_recency" in session_indexes
+        and "idx_sessions_channel_recency" in session_indexes
+    ):
+        return 11
+
     # v10 marker: recallable-write integrity provenance (chainlink #948).
     try:
         atoms_cols = {
