@@ -382,6 +382,36 @@ def test_safe_truncation_length_without_materials_is_the_limit() -> None:
     assert scrubber.safe_truncation_length(b"plain output", 5) == 5
 
 
+def test_output_sink_creation_uses_exclusive_nofollow_private_flags(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "private" / "transcripts" / "stdout.log"
+    real_open = os.open
+    output_open: tuple[int, int] | None = None
+
+    def observed_open(
+        target: str | bytes | os.PathLike[str] | os.PathLike[bytes],
+        flags: int,
+        mode: int = 0o777,
+        *,
+        dir_fd: int | None = None,
+    ) -> int:
+        nonlocal output_open
+        if target == path.name and dir_fd is not None:
+            output_open = (flags, mode)
+        return real_open(target, flags, mode, dir_fd=dir_fd)
+
+    monkeypatch.setattr(output_capture.os, "open", observed_open)
+    sink = output_capture.open_output_sink(path, 100)
+    sink.close()
+
+    assert output_open is not None
+    flags, mode = output_open
+    assert flags & os.O_EXCL
+    assert flags & getattr(os, "O_NOFOLLOW", 0) == getattr(os, "O_NOFOLLOW", 0)
+    assert mode == 0o600
+
+
 def test_output_sink_exclusive_create_symlink_refusal_and_private_modes(tmp_path: Path) -> None:
     root = tmp_path / "private" / "transcripts"
     path = root / "stdout.log"

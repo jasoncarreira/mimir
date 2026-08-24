@@ -421,17 +421,11 @@ async def test_direct_terminated_output_is_durable_while_running(
 ) -> None:
     monkeypatch.setattr("mimir.worklink.checkout.coding_enabled", lambda: False)
     backend = LocalSubprocessComputeBackend()
-    work = direct_spec("import time; time.sleep(30)")
-    object.__setattr__(
-        work,
-        "local_argv",
-        (
-            "/usr/bin/node",
-            "-e",
-            "process.stdout.write('before termination\\n'); "
-            "process.stderr.write('diagnostic stderr\\n'); "
-            "setTimeout(() => {}, 30000)",
-        ),
+    work = direct_spec(
+        "import sys,time; "
+        "sys.stdout.write('before termination\\n'); "
+        "sys.stderr.write('diagnostic stderr\\n'); "
+        "sys.stdout.flush(); sys.stderr.flush(); time.sleep(30)"
     )
     output_root = tmp_path / "state" / "worklink" / "transcripts"
     object.__setattr__(work, "output_root", output_root)
