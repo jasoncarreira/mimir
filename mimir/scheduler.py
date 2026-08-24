@@ -1203,8 +1203,14 @@ class Scheduler:
             pass
 
     async def _configured_heartbeat_job(self) -> SchedulerJob | None:
-        """Resolve the operator-configured heartbeat, or ``None`` if disabled."""
-        jobs = await asyncio.to_thread(load_jobs, self._yaml_path)
+        """Resolve the operator-configured heartbeat, or ``None`` if disabled.
+
+        ``load_jobs`` returns a list today, while the writable-root validation
+        work in PR #1704 changes it to ``(jobs, rejections)``. Accept both
+        shapes so either PR can merge first without breaking quota recovery.
+        """
+        loaded = await asyncio.to_thread(load_jobs, self._yaml_path)
+        jobs = loaded[0] if isinstance(loaded, tuple) else loaded
         return next((job for job in jobs if job.name == "heartbeat"), None)
 
     async def _fire_configured_heartbeat(self) -> None:

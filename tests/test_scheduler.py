@@ -3732,6 +3732,30 @@ async def test_quota_recovery_uses_configured_heartbeat_authority_and_commands(
 
 
 @pytest.mark.asyncio
+async def test_configured_heartbeat_accepts_load_jobs_tuple_shape(
+    tmp_path: Path, monkeypatch,
+):
+    """Quota recovery remains compatible with PR #1704's loader result."""
+    heartbeat = SchedulerJob(
+        name="heartbeat", prompt="configured heartbeat", cron="0 * * * *",
+        authority_profile="heartbeat",
+    )
+
+    def load_jobs_with_rejections(_path):
+        return [heartbeat], [{"reason": "unrelated invalid job"}]
+
+    async def enqueue(_event: AgentEvent) -> bool:
+        return True
+
+    monkeypatch.setattr("mimir.scheduler.load_jobs", load_jobs_with_rejections)
+    sched = Scheduler(
+        scheduler_yaml=tmp_path / "scheduler.yaml", enqueue=enqueue, home=tmp_path,
+    )
+
+    assert await sched._configured_heartbeat_job() is heartbeat
+
+
+@pytest.mark.asyncio
 async def test_quota_recovery_paths_skip_disabled_heartbeat(tmp_path: Path):
     """Part C: neither reset-time nor early recovery invents a heartbeat."""
     enqueued: list[AgentEvent] = []

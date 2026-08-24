@@ -1333,6 +1333,9 @@ class Agent:
         # the completion handler back onto the loop via
         # ``run_coroutine_threadsafe``.
         self._loop: asyncio.AbstractEventLoop | None = None
+        # Shell-job waiter threads add these futures; their done callbacks may
+        # discard them on an event-loop thread. CPython set add/discard are
+        # atomic under the GIL, and no compound iteration is performed here.
         self._shell_completion_futures: set[concurrent.futures.Future[Any]] = set()
 
         # Build the deepagent singleton. Done lazily to keep import-time
