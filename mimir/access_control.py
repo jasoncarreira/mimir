@@ -7010,8 +7010,8 @@ class ToolAuthorization:
     protected_source_resources: tuple[str, ...] | None = None
     protected_sink_resources: tuple[str, ...] | None = None
     flow_direction: ToolFlowDirection = ToolFlowDirection.UNKNOWN
-    # Resolved once from immutable MCP provenance. Non-MCP and error paths use
-    # the fail-closed posture and never perform a mutable policy lookup.
+    # Resolved once from immutable authorization provenance. MCP tools and
+    # hands_read consume it without performing a mutable policy lookup.
     result_integrity: str = "untrusted"
     argument_egress: str = "taint_gated"
     repo_pr_action_scope: Any = field(default=None, repr=False)
@@ -8258,6 +8258,34 @@ def classify_protected_result(
             integrity_effect="active_ingest",
         )
         return InformationFlowLabels().with_source(source)
+
+    if tool_name == "hands_read":
+        resources = authorization.protected_source_resources
+        if resources == ():
+            return None
+        if resources is None or failed:
+            return _incomplete_protected_result("client_provider", args)
+        principal = getattr(auth_context, "canonical_principal", None)
+        bridge_instance = getattr(auth_context, "bridge_instance", None)
+        integrity = (
+            "trusted" if authorization.result_integrity == "trusted" else "untrusted"
+        )
+        labels = InformationFlowLabels()
+        for resource in resources:
+            labels = labels.with_source(SourceLabel(
+                principal=principal,
+                domain="client_provider",
+                resource_id=resource,
+                bridge_instance=bridge_instance,
+                sensitivity="internal",
+                authorized_principals=(
+                    frozenset({principal}) if principal else frozenset()
+                ),
+                source_kind="protected_tool",
+                integrity=integrity,
+                integrity_effect="active_ingest",
+            ))
+        return labels
 
     if tool_name.startswith(MCPResourceAdapter._MCP_TOOL_PREFIX):
         resources = authorization.protected_source_resources
