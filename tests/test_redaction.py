@@ -21,7 +21,9 @@ from mimir.redaction import (
 from mimir.turn_event_redaction import scrub_text
 from tests.redaction_corpus import (
     BARE_SECRET_TEXT_CORPUS,
+    COMPACT_HS256_JWT,
     FAKE_SECRET,
+    RS256_JWT,
     SECRET_TEXT_CORPUS,
 )
 
@@ -83,9 +85,14 @@ def test_durable_redaction_is_superset_of_ephemeral_redaction() -> None:
         pytest.param(BARE_SECRET_TEXT_CORPUS[2], "", id="bare-pa"),
         pytest.param(BARE_SECRET_TEXT_CORPUS[3], "", id="bare-aiza"),
         pytest.param(
-            BARE_SECRET_TEXT_CORPUS[4],
-            "abcdefghijklmnopqrstuvwxyz.",
-            id="bare-long-header-jwt",
+            COMPACT_HS256_JWT,
+            "eyJhbGciOiJIUzI1NiJ9.",
+            id="compact-hs256-jwt",
+        ),
+        pytest.param(
+            RS256_JWT,
+            "eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.",
+            id="rs256-jwt",
         ),
     ],
 )
@@ -101,6 +108,9 @@ def test_bare_secret_shapes_are_masked_by_durable_and_live_redactors(
     assert text not in live
     assert durable.startswith(preserved_prefix)
     assert live.startswith(preserved_prefix)
+    if preserved_prefix:
+        assert durable == preserved_prefix + "[REDACTED]"
+        assert live == preserved_prefix + "[redacted]"
 
 
 def test_39_character_google_api_key_is_masked() -> None:
@@ -109,6 +119,24 @@ def test_39_character_google_api_key_is_masked() -> None:
     assert len(google_key) == 39
     assert redact_text(google_key) == "[REDACTED]"
     assert scrub_text(google_key) == "[redacted]"
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "see europa-mission-telemetry-archive-2026 for detail",
+        "/opt/data-pa-partition-export-archive/file.txt",
+        "com.example.averylongpackagename.submodule.ClassName",
+    ],
+)
+def test_bare_secret_patterns_preserve_ordinary_text(text: str) -> None:
+    assert redact_text(text) == text
+    expected_live = (
+        "[path]"
+        if text == "/opt/data-pa-partition-export-archive/file.txt"
+        else text
+    )
+    assert scrub_text(text) == expected_live
 
 
 def test_shared_corpus_pins_contained_scrubber_registration_asymmetry() -> None:

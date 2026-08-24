@@ -14,6 +14,11 @@ from typing import Any
 
 import yaml
 
+from mimir.shared_redaction_patterns import (
+    BARE_PROVIDER_TOKEN_PATTERNS,
+    JWT_PATTERN,
+)
+
 
 _CREDENTIAL_KEY = re.compile(
     r"[A-Za-z0-9_.:-]*(?:token|api[_-]?key|password|passwd|secret)", re.IGNORECASE
@@ -139,11 +144,10 @@ _TOKEN_PATTERNS: tuple[re.Pattern[str], ...] = (
     # Slack bot, user, app, refresh, and config tokens. Prefix is the
     # disambiguator; payload alphabet is base62-ish + dashes.
     re.compile(r"xox[bpasr]-[A-Za-z0-9-]+"),
-    re.compile(r"xapp-[0-9A-Za-z-]{20,}"),
-    # Provider keys that commonly appear as bare values in subprocess output.
-    re.compile(r"tvly-[A-Za-z0-9_-]{20,}"),
-    re.compile(r"pa-[A-Za-z0-9_-]{20,}"),
-    re.compile(r"AIza[A-Za-z0-9_-]{35}"),
+    # Provider keys and JWTs that commonly appear as bare values in subprocess
+    # output. Shared with the live turn-event scrubber so the two paths cannot
+    # drift when another provider shape is added.
+    *BARE_PROVIDER_TOKEN_PATTERNS,
     # OpenAI-style secret keys (``sk-…`` and ``sk-proj-…``). The ``sk-ant-``
     # case is already covered above; this matches the OpenAI shapes without
     # colliding.
@@ -215,9 +219,7 @@ _TOKEN_PATTERNS: tuple[re.Pattern[str], ...] = (
     # pre-commit hook already catches; keep the redactor in sync so a token in a
     # subprocess stderr / event payload doesn't land cleartext in events.jsonl.
     re.compile(r'(?i)("(?:access_token|refresh_token|client_secret)"\s*:\s*")([^"]{6,})'),
-    # Generic JWTs with long first segments. Preserve the header for diagnosis
-    # while masking the payload and signature.
-    re.compile(r"(\b[A-Za-z0-9_-]{25,}\.)([A-Za-z0-9_-]{6,}\.[A-Za-z0-9_-]{27,}\b)"),
+    JWT_PATTERN,
     # Discord bot tokens — JWT-shaped with ``MTk…`` / ``MzU…`` prefix for many
     # of them. Use the well-documented 24+.6+27 segment shape.
     re.compile(r"\b[A-Za-z0-9_-]{24}\.[A-Za-z0-9_-]{6}\.[A-Za-z0-9_-]{27,}\b"),
