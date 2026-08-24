@@ -295,13 +295,14 @@ async def test_reauthenticate_fence_still_dispatches_session_cancel(
     await asyncio.wait_for(authentication_started.wait(), 1)
     await asyncio.wait_for(ordered_dispatch, 1)
 
-    async def drain_runners() -> None:
-        while dispatcher._runner_tasks:
-            await asyncio.gather(
-                *tuple(dispatcher._runner_tasks), return_exceptions=True
-            )
-
-    await asyncio.wait_for(drain_runners(), 1)
+    deadline = asyncio.get_running_loop().time() + 1
+    while dispatcher._runner_tasks:
+        remaining = deadline - asyncio.get_running_loop().time()
+        assert remaining > 0, "dispatcher runners did not drain"
+        _, pending = await asyncio.wait(
+            tuple(dispatcher._runner_tasks), timeout=remaining
+        )
+        assert not pending, "dispatcher runners did not drain"
     assert agent._sessions[session_id].active_prompt is None
 
 
