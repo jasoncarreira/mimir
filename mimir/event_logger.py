@@ -161,9 +161,9 @@ class EventLogger:
                     self._release_process_lock(process_lock)
 
     async def log(self, event_type: str, **payload: Any) -> None:
-        record = self._record(event_type, payload)
-        async with self._ensure_lock():
-            try:
+        try:
+            record = self._record(event_type, payload)
+            async with self._ensure_lock():
                 await asyncio.to_thread(self._append_record_sync, record)
                 # Hysteresis: trim only when over cap by ≥10%. Without the
                 # buffer, every event past the cap triggers an O(file)
@@ -175,8 +175,8 @@ class EventLogger:
                     and self._line_count > self._max_events + max(self._max_events // 10, 1)
                 ):
                     await self._trim()
-            except OSError as exc:
-                log.warning("events.jsonl write failed: %s", exc)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("events.jsonl write failed: %s", exc)
 
     def log_sync(self, event_type: str, **payload: Any) -> None:
         """Synchronous append — see ``log_event_sync`` for callsite
@@ -184,14 +184,14 @@ class EventLogger:
         ``O_APPEND`` atomicity. Errors are swallowed at WARN (same as
         the async path) so a misbehaving log sink never crashes the
         primary work path."""
-        record = self._record(event_type, payload)
         try:
+            record = self._record(event_type, payload)
             # chainlink #393: _append_record_sync holds _io_lock so this append
             # can't interleave with _trim_sync's tail-read + rename on the worker
             # thread.
             self._append_record_sync(record)
             # Trim deferred to the async path — see comment in log().
-        except OSError as exc:
+        except Exception as exc:  # noqa: BLE001
             log.warning("events.jsonl sync write failed: %s", exc)
 
     def log_durable_sync(self, event_type: str, **payload: Any) -> None:

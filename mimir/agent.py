@@ -2765,28 +2765,29 @@ class Agent:
                     # a header-less 429 → short escalating backoff (so a
                     # transient burst doesn't sit out a full window).
                     reset_at, pause_reason = tracker.record_rate_limit(exc)
-                    await log_event(
-                        "quota_exhausted",
-                        channel_id=event.channel_id,
-                        turn_id=turn_id,
-                        reset_at=reset_at.isoformat(),
-                        pause_reason=pause_reason,
-                        provider=tracker.provider,
-                        exception_class=type(exc).__name__,
-                        exception_message=str(exc)[:240],
-                    )
-                    # Arm a recovery wake so the agent retries exactly
-                    # when the window should roll over, instead of idling
-                    # until the next hourly scheduled tick.
-                    sched = getattr(self, "_scheduler", None)
-                    if sched is not None and hasattr(sched, "arm_quota_recovery_wake"):
-                        try:
-                            sched.arm_quota_recovery_wake(reset_at)
-                        except Exception:  # noqa: BLE001
-                            log.exception(
-                                "arm_quota_recovery_wake failed; next "
-                                "scheduled tick will still recover"
-                            )
+                    if tracker.last_save_ok is not False:
+                        await log_event(
+                            "quota_exhausted",
+                            channel_id=event.channel_id,
+                            turn_id=turn_id,
+                            reset_at=reset_at.isoformat(),
+                            pause_reason=pause_reason,
+                            provider=tracker.provider,
+                            exception_class=type(exc).__name__,
+                            exception_message=str(exc)[:240],
+                        )
+                        # Arm a recovery wake so the agent retries exactly
+                        # when the window should roll over, instead of idling
+                        # until the next hourly scheduled tick.
+                        sched = getattr(self, "_scheduler", None)
+                        if sched is not None and hasattr(sched, "arm_quota_recovery_wake"):
+                            try:
+                                sched.arm_quota_recovery_wake(reset_at)
+                            except Exception:  # noqa: BLE001
+                                log.exception(
+                                    "arm_quota_recovery_wake failed; next "
+                                    "scheduled tick will still recover"
+                                )
             except Exception:  # noqa: BLE001 — defensive boundary
                 log.exception("quota_pause emit failed; continuing")
         finally:
@@ -3139,6 +3140,11 @@ class Agent:
                         record=record,
                         repo=current_worktree,
                         current_worktree=current_worktree,
+                        run_id=(
+                            continuation_event.extra.get("run_id")
+                            if isinstance(continuation_event.extra.get("run_id"), str)
+                            else None
+                        ),
                     ),
                     timeout=continuation_timeout_s,
                 )

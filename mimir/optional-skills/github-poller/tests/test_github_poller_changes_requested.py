@@ -991,3 +991,803 @@ def test_reviews_api_failure_preserves_entry(monkeypatch, captured_emits):
         assert count == 0
         assert cursor == prior
     assert captured_emits == []
+
+
+def _cr_review() -> dict:
+    return _review("jasoncarreira", "CHANGES_REQUESTED", "2026-06-11T12:00:00Z")
+
+
+def _patch_many(monkeypatch, numbers):
+    """Every listed PR is the agent's own and stuck at CHANGES_REQUESTED."""
+    _patch_api(
+        monkeypatch,
+        prs=[_pr(n, f"sha{n}") for n in numbers],
+        reviews_by_pr={n: [_cr_review()] for n in numbers},
+        commit_dates={f"sha{n}": "2026-06-11T05:00:00Z" for n in numbers},
+    )
+
+
+def test_rotate_preserves_every_element_and_wraps():
+    assert poller._rotate([1, 2, 3, 4], 0) == [1, 2, 3, 4]
+    assert poller._rotate([1, 2, 3, 4], 2) == [3, 4, 1, 2]
+    assert poller._rotate([1, 2, 3, 4], 6) == [3, 4, 1, 2]  # offset wraps
+    assert sorted(poller._rotate([1, 2, 3, 4], 3)) == [1, 2, 3, 4]  # nothing lost
+    assert poller._rotate([], 5) == []
+
+
+def test_exhausted_budget_still_reconciles_the_guaranteed_minimum(
+    monkeypatch, captured_emits,
+):
+    """An already-spent budget must not starve the pass to zero: chainlink
+    #1433's floor is what guarantees forward progress every tick."""
+    numbers = [601, 602, 603, 604, 605]
+    _patch_many(monkeypatch, numbers)
+    budget = poller.TickBudget(deadline_seconds=0.0)
+    assert budget.exhausted()
+
+    count, cursor = poller._check_own_changes_requested(
+        "o/r", "tok", "mimir-bot", {}, now=NOW, tick_budget=budget,
+    )
+    assert count == poller.PR_RECONCILE_MIN_PER_PASS
+    assert budget.truncated == {
+        "changes_requested": len(numbers) - poller.PR_RECONCILE_MIN_PER_PASS,
+    }
+    assert sorted(cursor) == ["601", "602"]
+
+
+def test_truncated_prs_keep_their_prior_cursor_entry(monkeypatch, captured_emits):
+    """The passes rebuild their cursor from scratch, so a skipped PR must be
+    carried over explicitly. Dropping the key would reset ``last_reminded_at``
+    (reminder storm on the next tick) and rewind ``attempts`` (give-up budget
+    never reached)."""
+    numbers = [601, 602, 603, 604, 605]
+    _patch_many(monkeypatch, numbers)
+    recent = (NOW - timedelta(minutes=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    prior = {
+        str(n): _entry(f"sha{n}", reminded_at=recent, attempts=3) for n in numbers
+    }
+
+    budget = poller.TickBudget(deadline_seconds=0.0)
+    count, cursor = poller._check_own_changes_requested(
+        "o/r", "tok", "mimir-bot", prior, now=NOW, tick_budget=budget,
+    )
+    # Nothing is due (reminded a minute ago), so no PR — reconciled or skipped —
+    # changes, and the cursor round-trips intact.
+    assert count == 0
+    assert captured_emits == []
+    assert cursor == prior
+
+
+def test_rotate_offset_advances_the_reconciled_window(monkeypatch, captured_emits):
+    """Successive truncated ticks must cover different PRs, or the tail is
+    never reconciled at all."""
+    numbers = [601, 602, 603, 604, 605]
+
+    def _reconciled_with(offset: int) -> list[int]:
+        emits: list[dict] = []
+        monkeypatch.setattr(poller, "_emit", lambda p, **e: emits.append(e))
+        _patch_many(monkeypatch, numbers)
+        poller._check_own_changes_requested(
+            "o/r", "tok", "mimir-bot", {}, now=NOW,
+            tick_budget=poller.TickBudget(deadline_seconds=0.0),
+            rotate_offset=offset,
+        )
+        return sorted(e["number"] for e in emits)
+
+    first = _reconciled_with(0)
+    second = _reconciled_with(poller.PR_RECONCILE_MIN_PER_PASS)
+    third = _reconciled_with(poller.PR_RECONCILE_MIN_PER_PASS * 2)
+    assert first == [601, 602]
+    assert second == [603, 604]
+    assert third == [601, 605]  # wraps, and 605 is finally reached
+    assert set(first) | set(second) | set(third) == set(numbers)
+
+
+def test_unexhausted_budget_reconciles_every_pr(monkeypatch, captured_emits):
+    """The bound must be inert when the tick has time left."""
+    numbers = [601, 602, 603]
+    _patch_many(monkeypatch, numbers)
+    budget = poller.TickBudget(deadline_seconds=600.0)
+    count, cursor = poller._check_own_changes_requested(
+        "o/r", "tok", "mimir-bot", {}, now=NOW, tick_budget=budget,
+    )
+    assert count == len(numbers)
+    assert budget.truncated == {}
+    assert sorted(cursor) == ["601", "602", "603"]
+
+
+# --- #1705 review: the bound must be wall-clock, not call-count -------------
+
+
+def test_gh_api_timeout_is_clamped_to_the_remaining_hard_budget(monkeypatch):
+    """Checking the budget only between PRs leaves a single call free to carry
+    the tick past the framework's SIGKILL. Each call must be clamped instead."""
+    seen: list[float] = []
+
+    class _Result:
+        returncode = 0
+        stdout = "[]"
+        stderr = ""
+
+    def fake_run(argv, **kwargs):
+        seen.append(kwargs["timeout"])
+        return _Result()
+
+    monkeypatch.setattr(poller.subprocess, "run", fake_run)
+
+    # No budget installed: the standing ceiling applies.
+    poller.set_active_tick_budget(None)
+    poller._gh_api("repos/o/r/pulls", "tok")
+    assert seen[-1] == float(poller.GH_API_TIMEOUT_SECONDS)
+
+    # Plenty of budget left: still capped by the ceiling, never above it.
+    poller.set_active_tick_budget(poller.TickBudget(hard_deadline_seconds=600.0))
+    poller._gh_api("repos/o/r/pulls", "tok")
+    assert seen[-1] == float(poller.GH_API_TIMEOUT_SECONDS)
+
+    # Little budget left: clamped down, so the call cannot outlive the tick.
+    budget = poller.TickBudget(hard_deadline_seconds=5.0)
+    poller.set_active_tick_budget(budget)
+    poller._gh_api("repos/o/r/pulls", "tok")
+    assert poller.GH_API_MIN_TIMEOUT_SECONDS <= seen[-1] <= 5.0
+    assert seen[-1] < poller.GH_API_TIMEOUT_SECONDS
+
+    # Budget already spent: the call is not made at all. Flooring it to a
+    # minimum instead would let each late call overshoot the hard deadline, so
+    # the bound would be "deadline + one full timeout" rather than the deadline.
+    before = len(seen)
+    poller.set_active_tick_budget(poller.TickBudget(hard_deadline_seconds=0.0))
+    assert poller._gh_api("repos/o/r/pulls", "tok") is poller._GH_API_BUDGET_REFUSED
+    assert len(seen) == before, "a call was made past the hard deadline"
+    poller.set_active_tick_budget(None)
+
+
+def test_hard_deadline_overrides_the_minimum_floor():
+    """The floor guarantees progress against the soft deadline only. Past the
+    hard deadline it must not authorise even one more PR, or the 'minimum' is an
+    unbounded exception to the tick bound."""
+    spent_soft = poller.TickBudget(deadline_seconds=0.0, hard_deadline_seconds=600.0)
+    # Soft-exhausted: the floor still admits the first PRs.
+    assert poller._truncate_here(spent_soft, 0, "changes_requested") is False
+    assert poller._truncate_here(spent_soft, 1, "changes_requested") is False
+    assert poller._truncate_here(spent_soft, 2, "changes_requested") is True
+    assert spent_soft.hard_truncated is False
+
+    spent_hard = poller.TickBudget(deadline_seconds=0.0, hard_deadline_seconds=0.0)
+    # Hard-exhausted: truncates immediately, floor or not.
+    assert poller._truncate_here(spent_hard, 0, "changes_requested") is True
+    # ...but does NOT freeze the watermark. These passes defer through their own
+    # dedupe cursor, so holding `last_checked` here would stop the since-window
+    # advancing on every busy tick — a slow-motion version of #1433.
+    assert spent_hard.hard_truncated is False
+
+
+def test_hard_stop_has_no_floor_and_marks_the_tick():
+    """The since-based passes keep no dedupe cursor, so they get no floor —
+    and their truncation must mark the tick so the watermark is held."""
+    live = poller.TickBudget(hard_deadline_seconds=600.0)
+    assert poller._hard_stop(live, "pr_reviews") is False
+    assert poller._hard_stop(None, "pr_reviews") is False
+
+    spent = poller.TickBudget(hard_deadline_seconds=0.0)
+    assert poller._hard_stop(spent, "pr_reviews") is True
+    assert spent.hard_truncated is True
+
+
+def _slow_main_harness(
+    monkeypatch, tmp_path, *, n_prs, call_seconds, soft, hard,
+    author="mimir-bot",
+):
+    """Drive the real pass sequence through main() with deliberately slow calls.
+
+    Deadlines are scaled down rather than faked, so the wall-clock path under
+    test is the real one — `time.monotonic` is not patched.
+    """
+    import time as _time
+
+    numbers = list(range(600, 600 + n_prs))
+    calls: list[str] = []
+    saved: list[dict] = []
+
+    def pr(n):
+        return {
+            "number": n, "title": f"PR {n}", "state": "open", "merged": False,
+            "merged_at": None, "html_url": f"https://github.com/o/r/pull/{n}",
+            "user": {"login": author}, "mergeable": True,
+            "created_at": "2026-08-23T11:00:00Z",
+            "head": {"sha": f"{n:040d}", "ref": f"worklink/{n}",
+                     "repo": {"full_name": "o/r"}},
+            "base": {"sha": "b" * 40, "ref": "main"},
+        }
+
+    prs = [pr(n) for n in numbers]
+
+    def slow_api(endpoint: str, token: str):
+        calls.append(endpoint)
+        _time.sleep(call_seconds)
+        if "pulls?state=open" in endpoint:
+            return prs
+        if endpoint.endswith("/reviews"):
+            return [_review("jasoncarreira", "CHANGES_REQUESTED",
+                            "2026-08-22T12:00:00Z")]
+        if "/check-runs" in endpoint:
+            return {"check_runs": []}
+        if "/compare/" in endpoint:
+            return {"behind_by": 1}
+        if "/commits/" in endpoint:
+            return {"commit": {"committer": {"date": "2026-08-20T00:00:00Z"}}}
+        tail = endpoint.rsplit("/", 1)[1]
+        if "/pulls/" in endpoint and tail.isdigit():
+            return prs[numbers.index(int(tail))]
+        return []
+
+    real_budget = poller.TickBudget
+    # Accepts and ignores ``started_at``: these deadlines are scaled to keep the
+    # test fast, and subtracting the real elapsed time of a long pytest session
+    # would zero them. The subtraction itself is covered separately.
+    monkeypatch.setattr(
+        poller, "TickBudget",
+        lambda started_at=None: real_budget(
+            deadline_seconds=soft, hard_deadline_seconds=hard,
+        ),
+    )
+    monkeypatch.setattr(poller, "STATE_DIR", tmp_path)
+    monkeypatch.setattr(poller, "_resolve_token", lambda: "tok")
+    monkeypatch.setattr(poller, "_gh_api", slow_api)
+    monkeypatch.setattr(poller, "_emit", lambda *a, **k: None)
+    monkeypatch.setattr(poller, "_emit_signal", lambda *a, **k: None)
+    monkeypatch.setattr(poller, "_save_cursor", lambda c: saved.append(c))
+    monkeypatch.setattr(
+        poller, "_load_cursor",
+        lambda: {"last_checked": "2026-08-23T10:00:00Z"},
+    )
+    monkeypatch.setenv("GITHUB_REPOS", "o/r")
+    monkeypatch.setenv("MIMIR_GITHUB_SELF_LOGIN", "mimir-bot")
+
+    started = _time.monotonic()
+    poller.main()
+    return _time.monotonic() - started, calls, saved
+
+
+def test_main_returns_within_the_tick_bound_when_every_call_is_slow(
+    monkeypatch, tmp_path,
+):
+    """The postcondition that matters: a slow API cannot carry main() past the
+    framework cap. Deadlines are scaled (0.3s soft / 0.5s hard) so the test is
+    fast, but nothing about the timing path is stubbed — `time.monotonic` is
+    real.
+
+    The thresholds are chosen so the *unbounded* path cannot satisfy them:
+    `_check_pr_reviews` alone walks all 150 open PRs at 0.01s per call, so
+    without a hard stop the tick spends >=1.5s and makes >=150 calls before the
+    reconcile passes even begin. Bounded, it stops near the 0.5s deadline.
+    Removing the hard stop must fail this test, not squeeze under it.
+    """
+    elapsed, calls, saved = _slow_main_harness(
+        monkeypatch, tmp_path, n_prs=150, call_seconds=0.01, soft=0.3, hard=0.5,
+    )
+    # Scaled equivalent of "returns before POLLER_TIMEOUT_SECONDS": the tick
+    # finishes near its hard deadline plus one in-flight call, not at the
+    # unbounded cost of the work it was asked to do.
+    assert elapsed < 1.2, f"tick ran {elapsed:.2f}s; wall-clock bound not enforced"
+    assert len(calls) < 100, f"{len(calls)} calls; per-item loops not bounded"
+    # It must still have returned under its own power and saved a cursor.
+    assert len(saved) == 1
+
+
+def test_hard_truncated_tick_holds_its_watermark(monkeypatch, tmp_path):
+    """A hard-truncated tick skipped items in since-based passes that keep no
+    dedupe cursor, so advancing `last_checked` would step over them for good."""
+    _elapsed, _calls, saved = _slow_main_harness(
+        monkeypatch, tmp_path, n_prs=150, call_seconds=0.01, soft=0.3, hard=0.5,
+    )
+    assert saved[0]["last_checked"] == "2026-08-23T10:00:00Z"
+
+
+def test_final_pr_review_timeout_holds_watermark_through_cursor_save(
+    monkeypatch, tmp_path,
+):
+    """A final admitted review call can exhaust the budget with no next loop."""
+    import time as _time
+
+    previous = "2026-08-23T10:00:00Z"
+    saved: list[dict] = []
+    calls: list[str] = []
+    pr = {
+        "number": 700,
+        "title": "PR 700",
+        "user": {"login": "outside-contributor"},
+    }
+
+    class _Result:
+        returncode = 0
+        stderr = ""
+
+        def __init__(self, payload):
+            self.stdout = json.dumps(payload)
+
+    def api_run(argv, **kwargs):
+        endpoint = argv[2]
+        calls.append(endpoint)
+        if endpoint.endswith("/reviews"):
+            _time.sleep(kwargs["timeout"] + 0.005)
+            raise poller.subprocess.TimeoutExpired(argv, kwargs["timeout"])
+        return _Result([pr])
+
+    real_budget = poller.TickBudget
+    monkeypatch.setattr(poller, "GH_API_MIN_TIMEOUT_SECONDS", 0.001)
+    monkeypatch.setattr(
+        poller,
+        "TickBudget",
+        lambda started_at=None: real_budget(
+            deadline_seconds=0.02, hard_deadline_seconds=0.05,
+        ),
+    )
+    monkeypatch.setattr(poller, "STATE_DIR", tmp_path)
+    monkeypatch.setattr(poller, "_resolve_token", lambda: "tok")
+    monkeypatch.setattr(poller.subprocess, "run", api_run)
+    monkeypatch.setattr(poller, "_load_cursor", lambda: {"last_checked": previous})
+    monkeypatch.setattr(poller, "_save_cursor", lambda cursor: saved.append(cursor))
+    monkeypatch.setattr(poller, "_utc_now_iso", lambda: "2026-08-23T12:00:00Z")
+    monkeypatch.setattr(poller, "_emit", lambda *args, **kwargs: None)
+    monkeypatch.setattr(poller, "_emit_signal", lambda *args, **kwargs: None)
+    monkeypatch.setattr(poller, "_check_issues", lambda *args, **kwargs: 0)
+    monkeypatch.setattr(
+        poller, "_collect_issue_comment_context", lambda *args, **kwargs: ([], {}),
+    )
+    monkeypatch.setattr(poller, "_check_prs", lambda *args, **kwargs: 0)
+    monkeypatch.setattr(
+        poller, "_check_pr_review_comments", lambda *args, **kwargs: 0,
+    )
+    monkeypatch.setattr(
+        poller, "_check_pr_pushes", lambda *args, **kwargs: (0, {}, {}),
+    )
+    monkeypatch.setattr(poller, "_check_issue_comments", lambda *args, **kwargs: 0)
+    monkeypatch.setattr(
+        poller, "_check_own_changes_requested", lambda *args, **kwargs: (0, {}),
+    )
+    monkeypatch.setattr(
+        poller, "_check_own_mergeability", lambda *args, **kwargs: (0, {}),
+    )
+    monkeypatch.setattr(
+        poller, "_check_pr_ci_failures", lambda *args, **kwargs: (0, {}),
+    )
+    monkeypatch.setenv("GITHUB_REPOS", "o/r")
+    monkeypatch.setenv("MIMIR_GITHUB_SELF_LOGIN", "mimir-bot")
+
+    poller.main()
+
+    assert calls == [
+        "repos/o/r/pulls?state=open&sort=updated&direction=desc",
+        "repos/o/r/pulls/700/reviews",
+    ]
+    assert len(saved) == 1
+    assert saved[0]["last_checked"] == previous
+
+
+def test_untruncated_tick_still_advances_its_watermark(monkeypatch, tmp_path):
+    """The hold must be specific to hard truncation — a tick with room to spare
+    has to advance, or the window grows forever."""
+    _elapsed, _calls, saved = _slow_main_harness(
+        monkeypatch, tmp_path, n_prs=2, call_seconds=0.0, soft=600.0, hard=600.0,
+    )
+    assert saved[0]["last_checked"] != "2026-08-23T10:00:00Z"
+
+
+#: Captured at import, before the autouse fixture stubs it out. That fixture
+#: replacing `_pr_author_is_trusted` with an instant lambda is precisely why the
+#: first wall-clock regression could not see the attestation transport.
+_REAL_TRUST_RESOLVER = poller._pr_author_is_trusted
+
+
+def test_slow_trust_attestations_cannot_overrun_the_tick(monkeypatch, tmp_path):
+    """The second GitHub transport, bounded by enforcement rather than trust.
+
+    `_check_prs` / `_check_pr_pushes` resolve author trust through
+    `mimir.pollers._github_content_author` / `_github_author_is_trusted`, which go
+    out over `urllib` — not through `_gh_api`'s subprocess. Their nominal 10s
+    `urlopen` timeout is a *socket-operation* timeout, so a trickling response can
+    outlive it; reserving that number as a bound would be unsound. A real
+    wall-clock deadline is imposed instead.
+
+    The fake here sleeps far longer than the allowance, which no socket timeout
+    would catch, so this fails unless the deadline is genuinely enforced.
+    """
+    import time as _time
+
+    monkeypatch.setattr(poller, "_pr_author_is_trusted", _REAL_TRUST_RESOLVER)
+    monkeypatch.setattr(poller, "TRUST_ATTESTATION_TIMEOUT_SECONDS", 0.05)
+    started: list[str] = []
+
+    def very_slow_author(repo, extras, token):
+        started.append("author")
+        _time.sleep(5.0)  # >> the allowance; only a real deadline stops this
+        return "outside-contributor"
+
+    monkeypatch.setattr(poller, "_github_content_author", very_slow_author)
+    monkeypatch.setattr(
+        poller, "_github_author_is_trusted", lambda *a: True,
+    )
+
+    elapsed, _calls, saved = _slow_main_harness(
+        monkeypatch, tmp_path, n_prs=4, call_seconds=0.0,
+        soft=30.0, hard=30.0, author="outside-contributor",
+    )
+
+    assert started, "trust path never reached — the test cannot see the bug"
+    # Without enforcement this is >=5s per uncached author; with it, each lookup
+    # is cut at ~0.05s.
+    assert elapsed < 3.0, f"tick ran {elapsed:.2f}s; deadline not enforced"
+    assert len(saved) == 1
+
+
+def test_deadline_exceeded_trust_lookup_is_unresolved_not_untrusted(monkeypatch):
+    """A lookup cut off by the deadline must not be cached or classified.
+
+    Collapsing it to False would surface a trusted contributor's PR as untrusted
+    and record the verdict; caching the timed-out result would make the next tick
+    inherit it instead of retrying.
+    """
+    import time as _time
+
+    monkeypatch.setattr(poller, "TRUST_ATTESTATION_TIMEOUT_SECONDS", 0.05)
+    monkeypatch.setattr(
+        poller, "_github_content_author",
+        lambda *a: _time.sleep(5.0) or "outside-contributor",
+    )
+    monkeypatch.setattr(poller, "_github_author_is_trusted", lambda *a: True)
+
+    cache: dict = {}
+    verdict = _REAL_TRUST_RESOLVER(
+        "o/r", 700, "https://github.com/o/r/pull/700", "tok", cache,
+        tick_budget=poller.TickBudget(hard_deadline_seconds=600.0),
+    )
+    assert verdict is None, "a timed-out lookup was classified"
+    assert cache == {}, "a timed-out lookup was cached"
+
+
+def test_unresolvable_trust_skips_the_pr_instead_of_marking_it_untrusted(
+    monkeypatch, tmp_path,
+):
+    """A budget-denied trust lookup must not fail closed.
+
+    `False` routes the PR through `_surface_untrusted_pr_once`, which emits a
+    signal and records the verdict as already-surfaced — so a trusted
+    contributor's PR would be permanently mislabelled because the poller ran out
+    of time. `None` means "unresolved": skip, hold the watermark, retry next tick.
+    """
+    monkeypatch.setattr(poller, "_pr_author_is_trusted", _REAL_TRUST_RESOLVER)
+    surfaced: set[str] = set()
+    calls: list[str] = []
+
+    monkeypatch.setattr(
+        poller, "_github_content_author",
+        lambda *a: calls.append("author") or "outside-contributor",
+    )
+    monkeypatch.setattr(
+        poller, "_github_author_is_trusted",
+        lambda *a: calls.append("trust") or True,
+    )
+    monkeypatch.setattr(
+        poller, "_gh_api",
+        lambda ep, tok: [{
+            "number": 700, "title": "t", "state": "open",
+            "html_url": "https://github.com/o/r/pull/700",
+            "user": {"login": "outside-contributor"},
+            "created_at": "2026-08-23T11:00:00Z",
+            "head": {"sha": "a" * 40, "ref": "f", "repo": {"full_name": "o/r"}},
+            "base": {"sha": "b" * 40, "ref": "main"},
+        }] if "pulls?state=open" in ep else [],
+    )
+    emitted: list[dict] = []
+    monkeypatch.setattr(poller, "_emit", lambda p, **e: emitted.append(e))
+    monkeypatch.setattr(poller, "_emit_signal", lambda s, **e: emitted.append(e))
+
+    spent = poller.TickBudget(hard_deadline_seconds=0.0)
+    count = poller._check_prs(
+        "o/r", "2026-08-23T10:00:00Z", "tok", "mimir-bot",
+        surfaced_untrusted=surfaced, tick_budget=spent,
+    )
+
+    assert count == 0
+    assert calls == [], "an attestation was made past the hard deadline"
+    assert surfaced == set(), "unresolved trust was recorded as untrusted"
+    assert emitted == [], "unresolved trust emitted a verdict"
+    assert spent.hard_truncated is True, "watermark not held for a skipped PR"
+
+
+def test_unresolvable_trust_in_pushes_carries_the_prior_head_forward(monkeypatch):
+    """`_check_pr_pushes` rebuilds its head map from scratch, so a PR skipped for
+    lack of trust budget must have its *prior* head carried forward.
+
+    Dropping the key makes the next tick treat the PR as first-seen and miss the
+    push; writing the *current* head makes the next tick see no change and miss
+    it just as thoroughly. Only the prior head preserves the comparison.
+    """
+    monkeypatch.setattr(poller, "_pr_author_is_trusted", _REAL_TRUST_RESOLVER)
+    attempted: list[str] = []
+    monkeypatch.setattr(
+        poller, "_github_content_author",
+        lambda *a: attempted.append("author") or "outside-contributor",
+    )
+    monkeypatch.setattr(poller, "_emit", lambda *a, **k: None)
+    monkeypatch.setattr(poller, "_emit_signal", lambda *a, **k: None)
+    monkeypatch.setattr(
+        poller, "_gh_api",
+        lambda ep, tok: [{
+            "number": 700, "title": "t", "state": "open",
+            "html_url": "https://github.com/o/r/pull/700",
+            "user": {"login": "outside-contributor"},
+            "head": {"sha": "n" * 40, "ref": "f", "repo": {"full_name": "o/r"}},
+            "base": {"sha": "b" * 40, "ref": "main"},
+        }] if "pulls?state=open" in ep else [],
+    )
+
+    spent = poller.TickBudget(hard_deadline_seconds=0.0)
+    count, new_heads, _rr = poller._check_pr_pushes(
+        "o/r", "tok", "mimir-bot", {"700": "o" * 40}, tick_budget=spent,
+    )
+
+    assert count == 0
+    assert attempted == [], "an attestation was made past the hard deadline"
+    assert new_heads == {"700": "o" * 40}, (
+        "prior head not carried forward — next tick would miss the push"
+    )
+    # The watermark is intentionally NOT held here — see
+    # test_pushes_trust_denial_does_not_freeze_the_watermark.
+    assert spent.truncated.get("pushes_trust") == 1
+
+
+def test_pushes_trust_denial_does_not_freeze_the_watermark(monkeypatch):
+    """`_check_pr_pushes` takes no `since` — it defers through `pr_heads`.
+
+    Holding the global watermark for a skipped PR here froze `last_checked` on an
+    ordinary 48s tick over a single denial, which would stop the since-window
+    advancing at all. `_check_prs` still needs the hold, because it filters on
+    `created_at > since` and has nowhere else to defer to.
+    """
+    monkeypatch.setattr(poller, "_pr_author_is_trusted", _REAL_TRUST_RESOLVER)
+    monkeypatch.setattr(poller, "_emit", lambda *a, **k: None)
+    monkeypatch.setattr(poller, "_emit_signal", lambda *a, **k: None)
+    pr = {
+        "number": 700, "title": "t", "state": "open",
+        "html_url": "https://github.com/o/r/pull/700",
+        "user": {"login": "outside-contributor"},
+        "created_at": "2026-08-23T11:00:00Z",
+        "head": {"sha": "n" * 40, "ref": "f", "repo": {"full_name": "o/r"}},
+        "base": {"sha": "b" * 40, "ref": "main"},
+    }
+    monkeypatch.setattr(
+        poller, "_gh_api",
+        lambda ep, tok: [pr] if "pulls?state=open" in ep else [],
+    )
+
+    spent = poller.TickBudget(hard_deadline_seconds=0.0)
+    poller._check_pr_pushes(
+        "o/r", "tok", "mimir-bot", {"700": "o" * 40}, tick_budget=spent,
+    )
+    assert spent.truncated.get("pushes_trust") == 1, "denial not recorded"
+    assert spent.hard_truncated is False, "watermark frozen by a pushes denial"
+
+    # _check_prs is the opposite case: it filters on `since`, so a skipped PR
+    # there must hold the watermark or the review request is lost for good.
+    spent_prs = poller.TickBudget(hard_deadline_seconds=0.0)
+    poller._check_prs(
+        "o/r", "2026-08-23T10:00:00Z", "tok", "mimir-bot",
+        tick_budget=spent_prs,
+    )
+    assert spent_prs.hard_truncated is True
+
+
+def test_refused_listing_holds_the_watermark_only_for_since_gated_passes(
+    monkeypatch,
+):
+    """The discriminating pair.
+
+    A since-gated pass rebuilds its entire window from one listing call and cannot
+    tell a refusal from "nothing new", so a refusal there must hold
+    `last_checked`. `_check_pr_review_comments` is the sharp case — its docstring
+    calls it the bulk of review feedback, and it had no budget plumbing at all.
+
+    A reconcile pass defers through its own dedupe cursor, so a refusal there must
+    NOT hold the watermark. Marking inside `_gh_api` instead of at the call site
+    got this wrong: one refused listing call in the last reconcile pass froze the
+    window on an ordinary 50s tick.
+    """
+    made: list[str] = []
+    monkeypatch.setattr(
+        poller, "_gh_api", lambda ep, tok: made.append(ep) or None,
+    )
+    monkeypatch.setattr(poller, "_emit", lambda *a, **k: None)
+    monkeypatch.setattr(poller, "_emit_signal", lambda *a, **k: None)
+
+    # Since-gated: holds.
+    since_budget = poller.TickBudget(hard_deadline_seconds=0.0)
+    poller._check_pr_review_comments(
+        "o/r", "2026-08-23T10:00:00Z", "tok", "mimir-bot",
+        tick_budget=since_budget,
+    )
+    assert since_budget.hard_truncated is True, (
+        "a refused since-gated window did not hold the watermark"
+    )
+
+    # Reconcile: does not hold — it defers through its own cursor.
+    prior = {"700": _entry("a" * 40)}
+    recon_budget = poller.TickBudget(hard_deadline_seconds=0.0)
+    _count, cursor = poller._check_own_changes_requested(
+        "o/r", "tok", "mimir-bot", prior, now=NOW, tick_budget=recon_budget,
+    )
+    assert recon_budget.hard_truncated is False, (
+        "a refused reconcile listing froze the watermark"
+    )
+    # ...and its prior state survives, which is what makes that safe.
+    assert cursor == prior
+
+
+def test_subminimum_budget_refusal_holds_since_window_with_time_remaining(
+    monkeypatch,
+):
+    """A positive remainder below the useful-call floor is still a refusal."""
+    budget = poller.TickBudget(
+        hard_deadline_seconds=poller.GH_API_MIN_TIMEOUT_SECONDS / 2,
+    )
+    started: list[object] = []
+    monkeypatch.setattr(
+        poller.subprocess,
+        "run",
+        lambda *args, **kwargs: started.append(args) or pytest.fail(
+            "a subminimum-budget API call started"
+        ),
+    )
+    poller.set_active_tick_budget(budget)
+
+    poller._check_pr_review_comments(
+        "o/r", "2026-08-23T10:00:00Z", "tok", "mimir-bot",
+        tick_budget=budget,
+    )
+
+    assert started == []
+    assert 0 < budget.hard_remaining() < poller.GH_API_MIN_TIMEOUT_SECONDS
+    assert budget.hard_truncated is True
+    assert budget.truncated.get("review_comments_window") == 1
+
+
+# --- deadlines derived from the framework cap (follow-up to #1433/#1711) ------
+
+
+def _poller_with_cap(cap: str | None):
+    """Load a fresh copy of the poller with POLLER_TIMEOUT_SECONDS set.
+
+    The deadlines are module-level constants computed at import, because the
+    poller is a fresh process per tick — so exercising them means importing
+    again under a different environment rather than patching attributes.
+    """
+    import importlib.util
+    import os
+    from pathlib import Path
+
+    script = (
+        Path(__file__).resolve().parent.parent / "scripts" / "poller.py"
+    )
+    previous = os.environ.get("POLLER_TIMEOUT_SECONDS")
+    if cap is None:
+        os.environ.pop("POLLER_TIMEOUT_SECONDS", None)
+    else:
+        os.environ["POLLER_TIMEOUT_SECONDS"] = cap
+    try:
+        spec = importlib.util.spec_from_file_location("_poller_cap_probe", script)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+    finally:
+        if previous is None:
+            os.environ.pop("POLLER_TIMEOUT_SECONDS", None)
+        else:
+            os.environ["POLLER_TIMEOUT_SECONDS"] = previous
+
+
+def test_deadlines_scale_with_the_exported_cap():
+    """The tick must use the cap it will actually be killed at.
+
+    `run_poller` exports the *effective* per-poller timeout, which the scheduler
+    may clamp below the framework default when a poller's cadence is tighter.
+    Hardcoding leaves extra headroom unused at a raised cap, and is wrong in the
+    dangerous direction at a clamped one.
+    """
+    raised = _poller_with_cap("120")
+    assert raised.TICK_HARD_DEADLINE_SECONDS == 110.0
+    assert raised.PR_RECONCILE_DEADLINE_SECONDS == pytest.approx(77.0)
+    # Soft must stay strictly inside hard, and hard strictly inside the cap.
+    assert (
+        raised.PR_RECONCILE_DEADLINE_SECONDS
+        < raised.TICK_HARD_DEADLINE_SECONDS
+        < 120.0
+    )
+
+    # A cadence-clamped poller gets *less* headroom, not the default.
+    clamped = _poller_with_cap("45")
+    assert clamped.TICK_HARD_DEADLINE_SECONDS == 35.0
+    assert clamped.PR_RECONCILE_DEADLINE_SECONDS == pytest.approx(24.5)
+
+
+def test_absent_cap_preserves_the_measured_tuning():
+    """No cap in the environment must reproduce the 35s/50s the live
+    measurements were taken against — and assume the old 60s cap, not the new
+    120s one, so a standalone run is conservative rather than optimistic."""
+    for cap in (None, "60"):
+        mod = _poller_with_cap(cap)
+        assert mod.POLLER_CAP_SECONDS == 60.0
+        assert mod.TICK_HARD_DEADLINE_SECONDS == 50.0
+        assert mod.PR_RECONCILE_DEADLINE_SECONDS == pytest.approx(35.0)
+
+
+def test_malformed_cap_falls_back_instead_of_disabling_the_bound():
+    """A junk or non-positive value must not produce a zero/negative deadline,
+    which would make every call refuse and look like a total API outage."""
+    for junk in ("", "abc", "0", "-5"):
+        mod = _poller_with_cap(junk)
+        assert mod.POLLER_CAP_SECONDS == 60.0
+        assert mod.TICK_HARD_DEADLINE_SECONDS == 50.0
+
+
+def test_budget_subtracts_time_spent_before_it_was_built():
+    """The framework kills the tick at a cap measured from *process* start.
+
+    A budget anchored at its own construction silently excludes module import,
+    cursor load and token resolution, so a 110s budget plus slow startup can run
+    past a 120s kill and lose everything the tick emitted. Measured startup is
+    ~0.8s today, well inside the reserve — this asserts the bound does not depend
+    on that staying true.
+    """
+    import time as _time
+
+    started = _time.monotonic() - 20.0  # pretend 20s of startup already happened
+    budget = poller.TickBudget(
+        deadline_seconds=35.0, hard_deadline_seconds=50.0, started_at=started,
+    )
+    assert budget.startup_consumed == pytest.approx(20.0, abs=0.5)
+    # Both deadlines shrink by what startup already spent.
+    assert budget.hard_remaining() == pytest.approx(30.0, abs=0.5)
+    assert budget.exhausted() is False
+    fresh = poller.TickBudget(deadline_seconds=35.0, hard_deadline_seconds=50.0)
+    assert fresh.hard_remaining() == pytest.approx(50.0, abs=0.5)
+    assert fresh.startup_consumed == 0.0
+
+    # Startup that outran the whole budget leaves nothing, rather than going
+    # negative and reading as "plenty of time left".
+    spent = poller.TickBudget(
+        deadline_seconds=35.0, hard_deadline_seconds=50.0,
+        started_at=_time.monotonic() - 999.0,
+    )
+    assert spent.hard_exhausted() is True
+    assert spent.exhausted() is True
+    assert spent.call_timeout() is None
+
+
+def test_main_anchors_the_budget_to_process_start(monkeypatch, tmp_path):
+    """Pin that main() actually passes the anchor — the guarantee is worthless
+    if a future edit constructs the budget without it."""
+    seen: list[object] = []
+    real_budget = poller.TickBudget
+
+    def capture(*args, **kwargs):
+        seen.append(kwargs.get("started_at"))
+        return real_budget(*args, **kwargs)
+
+    monkeypatch.setattr(poller, "TickBudget", capture)
+    monkeypatch.setattr(poller, "STATE_DIR", tmp_path)
+    monkeypatch.setattr(poller, "_resolve_token", lambda: "tok")
+    monkeypatch.setattr(poller, "_gh_api", lambda ep, tok: [])
+    monkeypatch.setattr(poller, "_emit", lambda *a, **k: None)
+    monkeypatch.setattr(poller, "_emit_signal", lambda *a, **k: None)
+    monkeypatch.setattr(poller, "_save_cursor", lambda c: None)
+    monkeypatch.setattr(poller, "_load_cursor", lambda: {"last_checked": "2026-08-23T10:00:00Z"})
+    monkeypatch.setenv("GITHUB_REPOS", "o/r")
+    monkeypatch.setenv("MIMIR_GITHUB_SELF_LOGIN", "mimir-bot")
+
+    poller.main()
+
+    assert seen, "main() never constructed a TickBudget"
+    assert seen[0] == poller._PROCESS_START, (
+        "main() built the budget without anchoring it to process start"
+    )

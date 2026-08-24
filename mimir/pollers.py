@@ -63,9 +63,13 @@ Subprocess gets these env vars injected automatically:
   passthrough keys, plus literal ``env`` overrides from the poller's
   pollers.json entry.
 
-The 60-second timeout is hard-capped; longer-running pollers should
-either run faster or restructure as ``async-tasks``-style background
-jobs that emit on completion.
+The subprocess timeout is hard-capped at ``POLLER_TIMEOUT_SECONDS`` (120s), and
+clamped further per poller so it always stays below that poller's own fire
+interval. The effective value is exported to the child as
+``POLLER_TIMEOUT_SECONDS`` so a poller can bound its own work against the cap it
+will actually be killed at. Longer-running pollers should still run faster or
+restructure as ``async-tasks``-style background jobs that emit on completion —
+overrunning discards every event the run had already emitted.
 """
 
 from __future__ import annotations
@@ -109,7 +113,23 @@ from .poller_budget import (
 
 log = logging.getLogger(__name__)
 
-POLLER_TIMEOUT_SECONDS = 60
+# Wall-clock ceiling for one poller subprocess. Overrunning it is not a partial
+# result: the timeout path discards the stdout already collected (see the
+# ``asyncio.TimeoutError`` handler in ``run_poller``), so every event the tick had
+# emitted is lost and its cursor never advances.
+#
+# Raised 60 -> 120 (chainlink #1433). Safe against fire-stacking because the
+# shortest configured cadence is ``*/10`` (600s) and jobs register with
+# ``max_instances=1``; the APScheduler misfire grace is an independent 5s and was
+# deliberately decoupled from this value (see the PR #107 note in scheduler.py).
+# Keep this comfortably below the shortest poller cadence — a cap longer than the
+# interval means a slow run silently swallows the next fire. Enforced by
+# ``test_poller_timeout_stays_below_every_shipped_cadence``.
+#
+# ``run_poller`` exports the effective value as POLLER_TIMEOUT_SECONDS in the
+# subprocess env so a poller can size its own internal deadlines against the real
+# cap instead of hardcoding a copy that drifts.
+POLLER_TIMEOUT_SECONDS = 120
 # Cap stderr text recorded in events.jsonl so a chatty poller doesn't
 # blow the algedonic stream's storage budget.
 POLLER_STDERR_LOG_CHARS = 2000
@@ -359,8 +379,16 @@ def _github_api_attestation(
         return None
 
 
-def _github_author_is_trusted(repo: Any, author: Any, token: str) -> bool:
-    """Resolve collaborator/org trust from GitHub, never from poller claims."""
+def _github_author_is_trusted(
+    repo: Any, author: Any, token: str, *, timeout: float | None = None,
+) -> bool | None:
+    """Resolve collaborator/org trust from GitHub, never from poller claims.
+
+    ``None`` means the server attestation was unavailable and is retryable. It
+    must not be persisted as an untrusted verdict. ``timeout`` bounds each of the
+    two attestation requests this makes; see ``_github_content_author`` for why
+    callers on a budget must pass it.
+    """
     if not isinstance(repo, str) or not isinstance(author, str):
         return False
     parts = repo.split("/")
@@ -376,30 +404,40 @@ def _github_author_is_trusted(repo: Any, author: Any, token: str) -> bool:
     # The permission endpoint reports ``read`` for any user on a public repo,
     # including non-collaborators.  The collaborator-existence endpoint keeps
     # those cases distinct: 204 means collaborator, 404 means not one.
+    kwargs = {} if timeout is None else {"timeout": timeout}
     collaborator = _github_api_attestation(
-        f"repos/{escaped_repo}/collaborators/{escaped_author}", token,
+        f"repos/{escaped_repo}/collaborators/{escaped_author}", token, **kwargs,
     )
     if collaborator is None:
-        return False
+        return None
     if collaborator[0] == 204:
         return True
     if collaborator[0] != 404:
-        return False
+        return None
 
     membership = _github_api_attestation(
         f"orgs/{urllib.parse.quote(parts[0], safe='')}/memberships/{escaped_author}",
-        token,
+        token, **kwargs,
     )
-    return bool(
-        membership is not None
-        and membership[0] == 200
-        and isinstance(membership[1], dict)
-        and membership[1].get("state") == "active"
-    )
+    if membership is None:
+        return None
+    if membership[0] == 404:
+        return False
+    if membership[0] != 200 or not isinstance(membership[1], dict):
+        return None
+    return membership[1].get("state") == "active"
 
 
-def _github_content_author(repo: Any, extras: Any, token: str) -> str | None:
-    """Resolve a GitHub body/comment author from GitHub, never poller output."""
+def _github_content_author(
+    repo: Any, extras: Any, token: str, *, timeout: float | None = None,
+) -> str | None:
+    """Resolve a GitHub body/comment author from GitHub, never poller output.
+
+    ``timeout`` bounds the attestation request; callers running under a
+    wall-clock budget pass their remaining time so this transport cannot outlive
+    it (chainlink #1433 — the poller's other transport is `gh api`, and bounding
+    only that one left this path free to overrun).
+    """
     if not isinstance(repo, str) or not isinstance(extras, dict):
         return None
     event_type = extras.get("event_type")
@@ -435,7 +473,9 @@ def _github_content_author(repo: Any, extras: Any, token: str) -> str | None:
             endpoint = f"repos/{repo}/pulls/{number}/reviews/{review_id}"
     if endpoint is None:
         return None
-    attestation = _github_api_attestation(endpoint, token)
+    attestation = _github_api_attestation(
+        endpoint, token, **({} if timeout is None else {"timeout": timeout}),
+    )
     if (
         attestation is None
         or attestation[0] != 200
@@ -1902,6 +1942,13 @@ async def run_poller(
             )
     env["STATE_DIR"] = str(persist_dir)
     env["POLLER_NAME"] = poller.name
+    # Let a poller bound its own work against the cap it will actually be killed
+    # at, rather than duplicating the constant. Injected like the vars above, so
+    # it is not subject to ``pass_env`` gating.
+    # ``:g`` keeps whole values clean ("120") while preserving fractional ones
+    # ("0.5"). ``int()`` truncated 0.5 to "0", so a poller sizing its deadlines
+    # from this would have read a cap of zero.
+    env["POLLER_TIMEOUT_SECONDS"] = f"{float(timeout):g}"
     # Scheduler passes Config.home here. Direct test/niche callers that omit
     # it still get a deterministic home path from the install layout
     # (``<home>/skills/<skill>`` → home) rather than reading
