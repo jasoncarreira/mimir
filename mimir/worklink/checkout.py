@@ -636,21 +636,26 @@ def _prepare_fresh_base(
     if not _fetch_base_from_origin(repo, base, runner=runner, event_logger=event_logger):
         raise RuntimeError(f"base repo fetch failed for origin/{base.removeprefix('origin/')}")
 
-    start_point = _resolve_local_base(repo, base.removeprefix("origin/"), prefer_origin=True, runner=runner)
+    remote_base = base.removeprefix("origin/")
+    fetched_ref = f"origin/{remote_base}"
+    fetched = runner(["git", "-C", str(repo), "rev-parse", "--verify", fetched_ref])
+    if fetched.returncode != 0 or not fetched.stdout.strip():
+        raise RuntimeError(f"fetched base tip is not resolvable as {fetched_ref}")
+    fetched_tip = fetched.stdout.strip()
+    start_point = _resolve_local_base(repo, remote_base, prefer_origin=True, runner=runner)
     fresh = runner(
-        ["git", "-C", str(repo), "merge-base", "--is-ancestor", "FETCH_HEAD", start_point]
+        ["git", "-C", str(repo), "merge-base", "--is-ancestor", fetched_tip, start_point]
     )
     if fresh.returncode == 0:
         return start_point
 
     local_sha = _rev_parse_for_error(repo, start_point, runner=runner)
-    origin_sha = _rev_parse_for_error(repo, "FETCH_HEAD", runner=runner)
     behind = runner(
-        ["git", "-C", str(repo), "rev-list", "--count", f"{start_point}..FETCH_HEAD"]
+        ["git", "-C", str(repo), "rev-list", "--count", f"{start_point}..{fetched_tip}"]
     )
     count = behind.stdout.strip() if behind.returncode == 0 and behind.stdout.strip() else "unknown"
     raise RuntimeError(
-        f"stale base {local_sha}, origin {origin_sha}, {count} commits behind"
+        f"stale base {local_sha}, {fetched_ref} {fetched_tip}, {count} commits behind"
     )
 
 
