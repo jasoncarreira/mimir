@@ -49,6 +49,7 @@ from .billing import normalize_priority
 from .background_tasks import cancel_background_tasks, spawn_background
 from .access_control import (
     SCHEDULER_AUTHORITY_PROFILES,
+    DeclaredShellCommandError,
     agent_writable_roots,
     build_scheduled_tick_service_principal,
     builtin_trigger_service_principal,
@@ -374,22 +375,60 @@ class SchedulerJob:
         )
 
 
-def load_jobs_from_text(text: str) -> list[SchedulerJob]:
-    """Parse scheduler.yaml *content*. Returns [] for empty/invalid text —
-    one bad job shouldn't take the whole list down."""
+def load_jobs_from_text(
+    text: str,
+    *,
+    source: Path | str = "scheduler.yaml",
+    writable_roots: tuple[Path, ...] = (),
+) -> tuple[list[SchedulerJob], list[dict[str, Any]]]:
+    """Parse scheduler.yaml content without letting one bad job abort siblings."""
+    rejections: list[dict[str, Any]] = []
     try:
         raw = yaml.safe_load(text)
     except yaml.YAMLError as exc:
         log.warning("scheduler.yaml parse failed: %s", exc)
-        return []
+        return [], [{
+            "path": str(source),
+            "job": "<document>",
+            "reason": f"{type(exc).__name__}: {exc}",
+        }]
+    if raw is None:
+        return [], []
     if not isinstance(raw, list):
-        return []
+        return [], [{
+            "path": str(source),
+            "job": "<document>",
+            "reason": "scheduler document must be a list",
+        }]
     out: list[SchedulerJob] = []
-    for entry in raw:
+    for index, entry in enumerate(raw):
+        entry_name = f"entry[{index}]"
         if not isinstance(entry, dict):
+            rejections.append({
+                "path": str(source),
+                "job": entry_name,
+                "reason": "entry must be a mapping",
+            })
             continue
+        raw_name = entry.get("name")
+        if isinstance(raw_name, str) and raw_name.strip():
+            entry_name = raw_name.strip()
         try:
             job = SchedulerJob.from_yaml_entry(entry)
+            if job.shell_commands is not None:
+                try:
+                    parse_declared_shell_commands(
+                        job.shell_commands,
+                        writable_roots=writable_roots,
+                    )
+                except DeclaredShellCommandError as exc:
+                    if not exc.environment_dependent:
+                        raise
+                    rejections.append({
+                        "path": str(source),
+                        "job": entry_name,
+                        "reason": str(exc),
+                    })
             if job.name == "heartbeat" and job.authority_profile is None:
                 log.warning(
                     "scheduler job 'heartbeat' declares no authority_profile; "
@@ -399,15 +438,27 @@ def load_jobs_from_text(text: str) -> list[SchedulerJob]:
             out.append(job)
         except ValueError as exc:
             log.warning("invalid scheduler job: %s", exc)
-    return out
+            rejections.append({
+                "path": str(source),
+                "job": entry_name,
+                "reason": str(exc),
+            })
+    return out, rejections
 
 
-def load_jobs(path: Path) -> list[SchedulerJob]:
-    """Read scheduler.yaml. Returns [] for missing/empty/invalid files —
-    one bad job shouldn't take the whole list down."""
+def load_jobs(
+    path: Path,
+    *,
+    writable_roots: tuple[Path, ...] = (),
+) -> tuple[list[SchedulerJob], list[dict[str, Any]]]:
+    """Read scheduler.yaml, returning accepted jobs and named rejections."""
     if not path.is_file():
-        return []
-    return load_jobs_from_text(path.read_text(encoding="utf-8"))
+        return [], []
+    return load_jobs_from_text(
+        path.read_text(encoding="utf-8"),
+        source=path,
+        writable_roots=writable_roots,
+    )
 
 
 _BUNDLED_TEMPLATE = Path(__file__).parent / "scheduler_template.yaml"
@@ -963,14 +1014,21 @@ class Scheduler:
         yaml so runtime cron overrides take effect on the next tick.
         Returns ``{registered, invalid}`` counts. Caller logs.
 
-        ``registered`` and ``invalid`` only count prompt-style entries.
-        Callable entries are tracked separately via the registry.
+        ``registered`` counts prompt-style entries. ``invalid`` counts every
+        scheduler.yaml entry rejected during loading or installation.
 
         Sync convenience (loads the yaml, then applies). Async callers on
         the event loop should use ``_reload_async`` instead so the
         APScheduler mutations run on the loop thread (chainlink #259
         item 16)."""
-        return self._apply_reload(load_jobs(self._yaml_path))
+        if self._home is None:
+            yaml_jobs, rejections = load_jobs(self._yaml_path)
+        else:
+            yaml_jobs, rejections = load_jobs(
+                self._yaml_path,
+                writable_roots=agent_writable_roots(self._home),
+            )
+        return self._apply_reload(yaml_jobs, rejections)
 
     async def _reload_async(self) -> dict[str, int]:
         """``reload`` with the yaml read off the loop (``to_thread``) and
@@ -979,10 +1037,23 @@ class Scheduler:
         whole reload via ``asyncio.to_thread`` (the prior behavior) raced
         the scheduler's own on-loop job dispatch (chainlink #259 item 16).
         """
-        yaml_jobs = await asyncio.to_thread(load_jobs, self._yaml_path)
-        return self._apply_reload(yaml_jobs)
+        if self._home is None:
+            yaml_jobs, rejections = await asyncio.to_thread(
+                load_jobs, self._yaml_path,
+            )
+        else:
+            yaml_jobs, rejections = await asyncio.to_thread(
+                load_jobs,
+                self._yaml_path,
+                writable_roots=agent_writable_roots(self._home),
+            )
+        return self._apply_reload(yaml_jobs, rejections)
 
-    def _apply_reload(self, yaml_jobs: list[SchedulerJob]) -> dict[str, int]:
+    def _apply_reload(
+        self,
+        yaml_jobs: list[SchedulerJob],
+        rejections: list[dict[str, Any]] | None = None,
+    ) -> dict[str, int]:
         """Apply pre-loaded jobs and mutate APScheduler on the loop thread.
 
         Async callers load the workload-sized YAML off-loop before entering
@@ -992,16 +1063,27 @@ class Scheduler:
         # Validate prompt-style entries before removing anything so a malformed
         # operator edit cannot knock the last-known-good job offline.
         valid_prompt_jobs: list[tuple[SchedulerJob, CronTrigger]] = []
-        invalid_prompt_names: set[str] = set()
-        invalid = 0
+        rejection_events = list(rejections or [])
+        invalid_prompt_names = {
+            str(item["job"])
+            for item in rejection_events
+            if not str(item.get("job", "")).startswith("<")
+            and not str(item.get("job", "")).startswith("entry[")
+        }
+        invalid = len(rejection_events)
         for job in yaml_jobs:
             if job.callable_name is not None:
                 continue
             try:
                 trigger = _build_trigger(job, self._tz)
-            except ValueError:
+            except ValueError as exc:
                 invalid += 1
                 invalid_prompt_names.add(job.name)
+                rejection_events.append({
+                    "path": str(self._yaml_path),
+                    "job": job.name,
+                    "reason": str(exc),
+                })
                 continue
             valid_prompt_jobs.append((job, trigger))
 
@@ -1030,6 +1112,20 @@ class Scheduler:
                     "scheduler_invalid_cron",
                     [{"job": cdef.name, "error": str(exc)}],
                 )
+                matching_job = next(
+                    (
+                        job for job in yaml_jobs
+                        if job.callable_name == cdef.name and job.cron
+                    ),
+                    None,
+                )
+                if matching_job is not None:
+                    invalid += 1
+                    rejection_events.append({
+                        "path": str(self._yaml_path),
+                        "job": matching_job.name,
+                        "reason": str(exc),
+                    })
 
         # Warn-skip yaml entries naming an unregistered callable.
         # Don't crash startup — could be a stale yaml after a refactor
@@ -1047,6 +1143,12 @@ class Scheduler:
                     "callable %r; skipping",
                     job.name, job.callable_name,
                 )
+                invalid += 1
+                rejection_events.append({
+                    "path": str(self._yaml_path),
+                    "job": job.name,
+                    "reason": f"unregistered callable {job.callable_name!r}",
+                })
         for job, trigger in valid_prompt_jobs:
             self._scheduler.add_job(
                 self._fire,
@@ -1063,6 +1165,7 @@ class Scheduler:
                 misfire_grace_time=job.misfire_grace_time,
             )
             registered += 1
+        self._dispatch_reload_events("scheduler_job_rejected", rejection_events)
         return {"registered": registered, "invalid": invalid}
 
     async def _consult_arbiter(self, *, priority: str) -> Any | None:
@@ -1504,7 +1607,9 @@ class Scheduler:
         else:
             _build_trigger(job, self._tz)  # validate up front
         async with self._mutate_lock:
-            current = await asyncio.to_thread(load_jobs, self._yaml_path)
+            current, _rejections = await asyncio.to_thread(
+                load_jobs, self._yaml_path,
+            )
             current = [j for j in current if j.name != job.name]
             current.append(job)
             await asyncio.to_thread(write_jobs, self._yaml_path, current)
@@ -1513,7 +1618,9 @@ class Scheduler:
 
     async def remove_job(self, name: str) -> bool:
         async with self._mutate_lock:
-            current = await asyncio.to_thread(load_jobs, self._yaml_path)
+            current, _rejections = await asyncio.to_thread(
+                load_jobs, self._yaml_path,
+            )
             kept = [j for j in current if j.name != name]
             if len(kept) == len(current):
                 return False
@@ -1522,7 +1629,8 @@ class Scheduler:
         return True
 
     async def list_jobs(self) -> list[SchedulerJob]:
-        return await asyncio.to_thread(load_jobs, self._yaml_path)
+        jobs, _rejections = await asyncio.to_thread(load_jobs, self._yaml_path)
+        return jobs
 
     # ---- Named-callable registry -------------------------------------
 
@@ -1583,7 +1691,7 @@ class Scheduler:
         APScheduler job. Returns True if a job was installed."""
         if yaml_jobs is None:
             try:
-                yaml_jobs = load_jobs(self._yaml_path)
+                yaml_jobs, _rejections = load_jobs(self._yaml_path)
             except Exception:  # noqa: BLE001 — already logged inside load_jobs
                 yaml_jobs = []
 
@@ -1665,7 +1773,7 @@ class Scheduler:
         ``_on_job_missed``.
         """
         self._pollers_dir = skills_dir
-        installed, invalid_events, invalid_cron_events = (
+        installed, invalid_events, invalid_entry_events, invalid_cron_events = (
             self._reinstall_pollers()
         )
         # Snapshot for the MCP reply (PR #141 review item #1+2).
@@ -1677,6 +1785,9 @@ class Scheduler:
         self._last_invalid_manifest_events = list(invalid_events)
         self._dispatch_reload_events(
             "poller_reload_invalid_manifest", invalid_events,
+        )
+        self._dispatch_reload_events(
+            "poller_reload_invalid_entry", invalid_entry_events,
         )
         self._dispatch_reload_events(
             "poller_reload_invalid_cron", invalid_cron_events,
@@ -1713,7 +1824,12 @@ class Scheduler:
             self._last_invalid_manifest_events = []
             return {"registered": 0, "replaced": 0, "removed": 0, "total": 0}
         async with self._mutate_lock:
-            _installed_fresh, invalid_events, invalid_cron_events = (
+            (
+                _installed_fresh,
+                invalid_events,
+                invalid_entry_events,
+                invalid_cron_events,
+            ) = (
                 await self._reinstall_pollers_async()
             )
             # PR #141 review item #2: ``_reinstall_pollers`` returns
@@ -1751,6 +1867,8 @@ class Scheduler:
         # concurrent reloads is intentionally non-deterministic.
         for payload in invalid_events:
             await log_event("poller_reload_invalid_manifest", **payload)
+        for payload in invalid_entry_events:
+            await log_event("poller_reload_invalid_entry", **payload)
         # chainlink #419: cron-invalid entries surface algedonically
         # too — same emission point + caveats as the manifest events.
         for payload in invalid_cron_events:
@@ -1764,19 +1882,29 @@ class Scheduler:
 
     def _reinstall_pollers(
         self,
-    ) -> tuple[int, list[dict[str, Any]], list[dict[str, Any]]]:
+    ) -> tuple[
+        int,
+        list[dict[str, Any]],
+        list[dict[str, Any]],
+        list[dict[str, Any]],
+    ]:
         """Wipe + re-discover + re-register (sync): discovery IO then
         apply. Used by the on-loop sync bootstrap ``add_poller_jobs``.
         Async callers use ``_reinstall_pollers_async`` so the scheduler
         mutations stay on the loop thread (chainlink #259 item 16)."""
         if self._pollers_dir is None:
-            return 0, [], []
-        discovered, invalid_manifests = self._discover_pollers_io()
-        return self._apply_reinstall(discovered, invalid_manifests)
+            return 0, [], [], []
+        discovered, invalid_manifests, invalid_entries = self._discover_pollers_io()
+        return self._apply_reinstall(discovered, invalid_manifests, invalid_entries)
 
     async def _reinstall_pollers_async(
         self,
-    ) -> tuple[int, list[dict[str, Any]], list[dict[str, Any]]]:
+    ) -> tuple[
+        int,
+        list[dict[str, Any]],
+        list[dict[str, Any]],
+        list[dict[str, Any]],
+    ]:
         """``_reinstall_pollers`` with filesystem discovery off the loop
         (``to_thread``) and the APScheduler / ``self._pollers`` mutations
         on the loop thread. AsyncIOScheduler's jobstore is only safe to
@@ -1784,15 +1912,19 @@ class Scheduler:
         ``asyncio.to_thread`` raced the scheduler's own on-loop job
         dispatch (chainlink #259 item 16)."""
         if self._pollers_dir is None:
-            return 0, [], []
-        discovered, invalid_manifests = await asyncio.to_thread(
+            return 0, [], [], []
+        discovered, invalid_manifests, invalid_entries = await asyncio.to_thread(
             self._discover_pollers_io,
         )
-        return self._apply_reinstall(discovered, invalid_manifests)
+        return self._apply_reinstall(discovered, invalid_manifests, invalid_entries)
 
     def _discover_pollers_io(
         self,
-    ) -> tuple[list[PollerConfig], list[tuple[Path, str]]]:
+    ) -> tuple[
+        list[PollerConfig],
+        list[tuple[Path, str]],
+        list[tuple[Path, str, str]],
+    ]:
         """Phase 1: filesystem discovery only. No APScheduler or
         ``self._pollers`` mutation, so it is safe to run in a worker
         thread. ``list(...)`` materializes the iterator so the caller
@@ -1807,11 +1939,13 @@ class Scheduler:
             if self._home is not None else None
         )
         invalid_manifests: list[tuple[Path, str]] = []
+        invalid_entries: list[tuple[Path, str, str]] = []
         discovered = list(
             discover_pollers(
                 self._pollers_dir,
                 state_root=state_root,
                 invalid_manifests=invalid_manifests,
+                invalid_entries=invalid_entries,
                 # Operator tuning surface (<home>/pollers-overrides.yaml):
                 # cron/priority/batch_size/... overrides that skill updates
                 # can never clobber. None when no home (tests/bench).
@@ -1821,20 +1955,26 @@ class Scheduler:
                 ),
             )
         )
-        return discovered, invalid_manifests
+        return discovered, invalid_manifests, invalid_entries
 
     def _apply_reinstall(
         self,
         discovered: list[PollerConfig],
         invalid_manifests: list[tuple[Path, str]],
-    ) -> tuple[int, list[dict[str, Any]]]:
+        invalid_entries: list[tuple[Path, str, str]],
+    ) -> tuple[
+        int,
+        list[dict[str, Any]],
+        list[dict[str, Any]],
+        list[dict[str, Any]],
+    ]:
         """Phases 2-3: drop stale jobs + register discovered pollers.
         Mutates APScheduler and ``self._pollers``, so it MUST run on the
         loop thread. ``discovered`` / ``invalid_manifests`` come from
         ``_discover_pollers_io`` (the only IO).
 
         Returns ``(installed_count, invalid_manifest_events,
-        invalid_cron_events)``. The second element is a list of event
+        invalid_entry_events, invalid_cron_events)``. The second element is a list of event
         payloads (one per ``pollers.json`` whose JSON parse failed this
         reload); the third one payload per entry whose cron failed to
         validate (chainlink #419). Callers in async contexts emit each
@@ -2028,7 +2168,15 @@ class Scheduler:
                     preserved_names_by_path.get(path, []),
                 ),
             })
-        return installed, invalid_events, invalid_cron_events
+        invalid_entry_events = [
+            {
+                "manifest_path": str(path),
+                "poller": poller_name,
+                "reason": reason,
+            }
+            for path, poller_name, reason in invalid_entries
+        ]
+        return installed, invalid_events, invalid_entry_events, invalid_cron_events
 
     def _dispatch_reload_events(
         self,

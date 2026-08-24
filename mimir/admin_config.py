@@ -320,7 +320,8 @@ def _schedules(home: Path | None) -> list[dict[str, Any]]:
     if home is None:
         return []
     rows: list[dict[str, Any]] = []
-    for job in load_jobs(home / "scheduler.yaml"):
+    jobs, _rejections = load_jobs(home / "scheduler.yaml")
+    for job in jobs:
         rows.append({
             "name": job.name,
             "kind": "callable" if job.callable_name else "prompt",
