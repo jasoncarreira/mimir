@@ -11,6 +11,7 @@ from mimir.worklink.backends import ToolPin
 from mimir.worklink.backends.feature_factory import FACTORY_VERSION
 from mimir.worklink.tool_pins import (
     ChainlinkBumpFiler,
+    OPENCODE_VERSION,
     ToolPinDrift,
     UpstreamVersion,
     default_tool_pins,
@@ -51,6 +52,7 @@ def test_default_tool_pin_inventory_covers_distinct_executable_risk_surfaces() -
     assert pins["gogcli"].category == "integration-cli"
     assert pins["osv-scanner"].category == "security-scanner"
     assert pins["opencode"].category == "coding-cli"
+    assert pins["opencode"].pin == OPENCODE_VERSION
     assert pins["feature-factory"].pin == FACTORY_VERSION
     assert pins["opencode-feature-factory"].pin == FACTORY_VERSION
     assert pins["opencode-feature-factory"].category == "coding-plugin"

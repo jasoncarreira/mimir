@@ -37,6 +37,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal
 
+from .worklink.tool_pins import OPENCODE_VERSION
+
 
 # ── Data shapes ──────────────────────────────────────────────────────
 
@@ -481,7 +483,7 @@ def _opencode_install_block(install_opencode: bool) -> str:
         return "# (OpenCode runtime not installed — MIMIR_ENABLE_OPENCODE not set)"
     return (
         "# OpenCode runtime — opt-in via MIMIR_ENABLE_OPENCODE=1.\n"
-        "# Pins: opencode-ai@1.18.9, feature-factory@0.7.2,\n"
+        f"# Pins: opencode-ai@{OPENCODE_VERSION}, feature-factory@0.7.2,\n"
         "# opencode-feature-factory@0.7.2,\n"
         "# opencode-project-memory@0.1.0, opencode-openai-codex-auth@4.4.0,\n"
         "# opencode-anthropic-auth@0.0.13.\n"
@@ -490,7 +492,7 @@ def _opencode_install_block(install_opencode: bool) -> str:
         "ARG MIMIR_ENABLE_OPENCODE=0\n"
         "RUN if [ \"$MIMIR_ENABLE_OPENCODE\" = \"1\" ]; then \\\n"
         "        npm install --global --prefix /opt/mimir-opencode \\\n"
-        "            opencode-ai@1.18.9 \\\n"
+        f"            opencode-ai@{OPENCODE_VERSION} \\\n"
         "            feature-factory@0.7.2 \\\n"
         "            opencode-feature-factory@0.7.2 \\\n"
         "            opencode-project-memory@0.1.0 \\\n"
@@ -1059,7 +1061,7 @@ def _existing_scaffold_settings(
 
     install_opencode: bool | None = None
     if docker_text:
-        install_opencode = "opencode-ai@1.18.9" in docker_text
+        install_opencode = re.search(r"\bopencode-ai@[^\s\\;]+", docker_text) is not None
     return mode, web_port, service_name, install_opencode
 
 

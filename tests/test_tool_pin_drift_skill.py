@@ -13,7 +13,7 @@ from mimir.access_control import (
     parse_service_shell_argv,
 )
 from mimir.skill_defs import refresh_builtin_skills
-from mimir.worklink.tool_pins import default_tool_pins
+from mimir.worklink.tool_pins import OPENCODE_VERSION, default_tool_pins
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / "mimir/skills/tool-pin-drift/scripts/check_tool_pins.py"
@@ -46,7 +46,7 @@ def test_recorded_payload_parsing_and_drift_comparison() -> None:
         "name": "opencode",
         "source": "npm",
         "package": "opencode-ai",
-        "pinned_version": "1.18.9",
+        "pinned_version": OPENCODE_VERSION,
     }
     github = {
         "name": "chainlink",
@@ -55,7 +55,7 @@ def test_recorded_payload_parsing_and_drift_comparison() -> None:
         "pinned_version": "chainlink-1.6.0",
     }
 
-    npm_latest = module.parse_latest_version(npm, "1.18.9\n")
+    npm_latest = module.parse_latest_version(npm, f"{OPENCODE_VERSION}\n")
     gh_latest = module.parse_latest_version(
         github,
         json.dumps({"tagName": "chainlink-1.7.0", "url": "https://example.test/release"}),
@@ -87,7 +87,7 @@ def test_lookup_failure_is_recorded_and_remaining_targets_continue() -> None:
         )
 
     targets = [
-        {"name": "opencode", "source": "npm", "package": "opencode-ai", "pinned_version": "1.18.9"},
+        {"name": "opencode", "source": "npm", "package": "opencode-ai", "pinned_version": OPENCODE_VERSION},
         {"name": "osv-scanner", "source": "github-release", "repo": "google/osv-scanner", "pinned_version": "v2.4.0"},
     ]
     results = module.check_targets(targets, runner=runner)

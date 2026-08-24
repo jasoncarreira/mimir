@@ -3,7 +3,7 @@
     "name": "opencode",
     "source": "npm",
     "package": "opencode-ai",
-    "pinned_version": "1.18.9"
+    "pinned_version": "1.18.21"
   },
   {
     "name": "feature-factory",

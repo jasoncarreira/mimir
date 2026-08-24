@@ -367,7 +367,7 @@ above configures the Mimir process. Omitted keys use the defaults below.
 | `routes` | list[mapping] | `[]` | Selects tool/compute backends using first-match-wins rules. | `routes: [{label: worklink:epic, backend: feature_factory}]` |
 | `backends` | mapping | `{}` | Configures the shipping tool-backend adapters. | `backends: {opencode: {bin: opencode}}` |
 | `compute_backends` | mapping | `{}` | Configures compute substrates; the sole shipping substrate accepts an empty block only. | `compute_backends: {local_subprocess: {}}` |
-| `tool_pins` | list[mapping] | `[]` | Records operator-owned external-tool pins for drift and bump issue generation. | `tool_pins: [{name: opencode, category: coding-cli, pin: "1.18.9", smoke: "opencode --version"}]` |
+| `tool_pins` | list[mapping] | `[]` | Records operator-owned external-tool pins for drift and bump issue generation. | `tool_pins: [{name: opencode, category: coding-cli, pin: "1.18.21", smoke: "opencode --version"}]` |
 
 ### Repository Inventory
 
@@ -518,7 +518,7 @@ remaining fields are optional and default to unset.
 |---|---|---|---|---|
 | `tool_pins[].name` | str | required | Stable local tool name. | `name: opencode` |
 | `tool_pins[].category` | str | required | Tool class used in maintenance output. | `category: coding-cli` |
-| `tool_pins[].pin` | str | required | Expected version, tag, or SHA. | `pin: "1.18.9"` |
+| `tool_pins[].pin` | str | required | Expected version, tag, or SHA. | `pin: "1.18.21"` |
 | `tool_pins[].smoke` | str | required | Command recorded as bump evidence; issue rendering does not execute it. | `smoke: "opencode --version"` |
 | `tool_pins[].source` | str | unset | Upstream lookup strategy. | `source: npm` |
 | `tool_pins[].package` | str | unset | Upstream package identifier. | `package: opencode-ai` |

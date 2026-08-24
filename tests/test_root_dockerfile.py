@@ -16,6 +16,7 @@ from pathlib import Path
 import pytest
 
 from mimir.worklink.backends.feature_factory import FACTORY_VERSION
+from mimir.worklink.tool_pins import OPENCODE_VERSION
 
 DOCKERFILE = Path(__file__).resolve().parents[1] / "Dockerfile"
 ROOT = DOCKERFILE.parent
@@ -125,7 +126,7 @@ def test_opencode_build_arg_installs_pinned_runtime() -> None:
     text = _text()
     assert "ARG MIMIR_ENABLE_OPENCODE=0" in text
     assert "npm install --global --prefix /opt/mimir-opencode" in text
-    assert "opencode-ai@1.18.9" in text
+    assert f"opencode-ai@{OPENCODE_VERSION}" in text
     assert f"            feature-factory@{FACTORY_VERSION} \\" in text
     assert f"            opencode-feature-factory@{FACTORY_VERSION} \\" in text
     assert "opencode-project-memory@0.1.0" in text
