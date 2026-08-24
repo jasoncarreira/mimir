@@ -6350,9 +6350,9 @@ def test_dynamic_trigger_write_denies_symlinked_protected_paths(
 @pytest.mark.parametrize(
     "command",
     [
-        "gh pr view 979 --json number,title,headRefOid",
-        "gh pr diff 979 --patch",
-        "gh pr checks 979 --required",
+        "gh pr view 979 --repo owner/repo --json number,title,headRefOid",
+        "gh pr diff 979 --repo owner/repo --patch",
+        "gh pr checks 979 --repo owner/repo --required",
         "git status --short",
         "git log --oneline --max-count=10",
         "git diff --stat HEAD~1",
@@ -6450,9 +6450,9 @@ def test_repo_review_commands_agree_for_host_and_contained_git_identity(
         "owner/repo", 1279, "worklink/1279", str(repo_review_git_root),
     )
     commands = (
-        "gh pr view 979 --json number,title,headRefOid",
-        "gh pr diff 979 --patch",
-        "gh pr checks 979 --required",
+        "gh pr view 979 --repo owner/repo --json number,title,headRefOid",
+        "gh pr diff 979 --repo owner/repo --patch",
+        "gh pr checks 979 --repo owner/repo --required",
         "git status --short",
         "git log --oneline --max-count=10",
         "git diff --stat HEAD~1",
@@ -6677,6 +6677,59 @@ def test_repo_review_github_reads_bind_every_repository_alias_to_scope(
     )
 
     assert (argv is not None) is admitted, command
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "gh pr view 5 --json body",
+        "gh pr diff 5",
+        "gh pr checks 5",
+        "gh issue view 5 --json body",
+    ],
+)
+def test_repo_review_github_reads_require_explicit_repository(
+    command: str,
+    maintenance_pinned_executables: dict[str, Path],
+) -> None:
+    state = _review_state("acme/widget", 5, "worklink/5", "/tmp")
+
+    argv = parse_service_shell_argv(
+        command, "repo_review", review_state=state,
+    )
+
+    assert argv is None, command
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "gh pr view 5 --repo acme/widget --json body",
+        "gh pr diff 5 --repo acme/widget",
+        "gh pr checks 5 --repo acme/widget",
+        "gh issue view 5 --repo acme/widget --json body",
+    ],
+)
+def test_repo_review_github_reads_refuse_absent_review_state(
+    command: str,
+    maintenance_pinned_executables: dict[str, Path],
+) -> None:
+    argv = parse_service_shell_argv(command, "repo_review")
+
+    assert argv is None, command
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        ["-R=acme/widget"],
+        ["-R", "=acme/widget"],
+    ],
+)
+def test_gh_repository_operand_rejects_equals_prefixed_short_option_value(
+    arguments: list[str],
+) -> None:
+    assert access_control._gh_repository_operand(arguments) is None
 
 
 @pytest.mark.parametrize(
@@ -8365,7 +8418,7 @@ def test_every_service_shell_profile_returns_absolute_executables(
         "repo_review": (
             "pwd -P", "ls -la", "wc -l sample.txt", "grep -n needle sample.txt",
             "jq -r .name sample.json", "rg --no-config -n needle .",
-            "git status --short", "gh pr view 979 --json title",
+            "git status --short", "gh pr view 979 --repo owner/repo --json title",
             "npm ci --ignore-scripts",
         ),
         "maintenance": (

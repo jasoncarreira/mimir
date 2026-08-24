@@ -2643,7 +2643,11 @@ def _gh_repository_operand(
             remaining.append(argument)
             index += 1
             continue
-        if not value or value.startswith("-") or repository is not None:
+        if (
+            not value
+            or value.startswith(("-", "="))
+            or repository is not None
+        ):
             return None
         repository = value
         index += width
@@ -2654,6 +2658,16 @@ def _repo_review_bound_repository(review_state: Any) -> str | None:
     scope = getattr(review_state, "action_scope", None)
     repository = getattr(scope, "canonical_repo", None)
     return repository if isinstance(repository, str) and repository else None
+
+
+def _gh_arguments_match_bound_repository(
+    arguments: list[str], bound_repository: str | None,
+) -> bool:
+    parsed = _gh_repository_operand(arguments)
+    return (
+        parsed is not None
+        and _repositories_match(parsed[0], bound_repository)
+    )
 
 
 def _repositories_match(left: str | None, right: str | None) -> bool:
@@ -2700,18 +2714,14 @@ def _repo_review_gh_api_arguments(
 
 
 def _repo_review_gh_issue_view_arguments(
-    arguments: list[str], review_state: Any = None,
+    arguments: list[str], review_state: Any = None, *, bind_repository: bool = True,
 ) -> bool:
     parsed = _gh_repository_operand(arguments)
     if parsed is None:
         return False
     repository, arguments = parsed
-    if (
-        repository is not None
-        and review_state is not None
-        and not _repositories_match(
-            repository, _repo_review_bound_repository(review_state),
-        )
+    if bind_repository and not _repositories_match(
+        repository, _repo_review_bound_repository(review_state),
     ):
         return False
     if not arguments or arguments[0].startswith("-"):
@@ -2974,19 +2984,10 @@ def _target_matches_repo_review_shell_command(
             ),
         ):
             return False
-        if read_subcommand:
-            parsed_repository = _gh_repository_operand(argv[3:])
-            if parsed_repository is None:
-                return False
-            repository, _remaining = parsed_repository
-            if (
-                repository is not None
-                and review_state is not None
-                and not _repositories_match(
-                    repository, _repo_review_bound_repository(review_state),
-                )
-            ):
-                return False
+        if read_subcommand and not _gh_arguments_match_bound_repository(
+            argv[3:], _repo_review_bound_repository(review_state),
+        ):
+            return False
         if subcommand == "review":
             if (
                 not _repo_review_action_allowed(review_state, RepoPRAction.PR_REVIEW)
@@ -3056,12 +3057,22 @@ def _target_matches_session_boundary_shell_command(argv: list[str]) -> bool:
         return True
     if argv[:3] == ["gh", "issue", "view"]:
         return (
-            _repo_review_gh_issue_view_arguments(argv[3:])
+            _repo_review_gh_issue_view_arguments(
+                argv[3:], bind_repository=False,
+            )
             and _gh_repo_operands_are_configured(argv[3:])
         )
     if argv[:3] == ["gh", "pr", "view"]:
+        parsed_repository = _gh_repository_operand(argv[3:])
+        if parsed_repository is None:
+            return False
+        repository, arguments = parsed_repository
         return (
-            _target_matches_repo_review_shell_command(argv)
+            _arguments_match_allowlist(
+                arguments,
+                exact_options=frozenset({"--comments", "--json", "--template"}),
+            )
+            and repository is not None
             and _gh_repo_operands_are_configured(argv[3:])
         )
     return False
