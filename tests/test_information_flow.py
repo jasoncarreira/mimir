@@ -2411,6 +2411,46 @@ def test_failed_trusted_mcp_result_remains_untrusted() -> None:
     assert next(iter(labels.sources)).integrity == "untrusted"
 
 
+def test_hands_read_result_uses_authorization_provenance() -> None:
+    auth = replace(
+        _auth(channel="acp:session", roles=("admin",)),
+        principal="operator",
+        canonical_principal="operator",
+        domain="channel",
+        resource_id="acp:session",
+        bridge_instance="acp-stdio",
+    )
+    resource = "client-file:%2Fworkspace%2Fnotes.txt"
+    authorization = ToolAuthorization(
+        tool_name="hands_read",
+        decision=OperationDecision.RESOURCE_SCOPED,
+        allowed=True,
+        protected_source_resources=(resource,),
+        flow_direction=ToolFlowDirection.SOURCE,
+        result_integrity="untrusted",
+    )
+
+    labels = classify_protected_result(
+        "hands_read",
+        {"path": "spoofed.txt", "result_integrity": "trusted"},
+        auth,
+        authorization,
+        result={"content": "client input", "result_integrity": "trusted"},
+    )
+
+    assert labels is not None
+    [source] = labels.sources
+    assert source.is_complete is True
+    assert source.domain == "client_provider"
+    assert source.resource_id == resource
+    assert source.principal == "operator"
+    assert source.bridge_instance == "acp-stdio"
+    assert source.authorized_principals == frozenset({"operator"})
+    assert source.integrity == "untrusted"
+    assert source.integrity_effect == "active_ingest"
+    assert labels.has_untrusted_active_ingest is True
+
+
 @pytest.mark.parametrize(
     "tool_name",
     ["shell_exec", "bash", "Bash", "execute", "shell", "web_search", "http_request"],

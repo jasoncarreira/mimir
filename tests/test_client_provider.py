@@ -394,6 +394,8 @@ async def test_hands_read_central_authorization_allows_admitted_admin(
         )
         assert authorization.allowed is True
         assert authorization.protected_source_resources == (resource,)
+        assert authorization.flow_direction is ToolFlowDirection.SOURCE
+        assert authorization.result_integrity == "untrusted"
         assert provider.calls == []
         assert await hands_read.ainvoke({"path": path}) == {
             "content": "trusted route"
