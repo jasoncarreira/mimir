@@ -76,7 +76,16 @@ _current_turn_interactive_var: contextvars.ContextVar[bool | None] = contextvars
 )
 
 SEND_MESSAGE_SKIPLIST_TRIGGERS: frozenset[str] = frozenset(
-    {"poller", "scheduled_tick"}
+    {
+        "poller",
+        "scheduled_tick",
+        # Shell wake-ups use interactive send defaults, but often correctly end silent.
+        "shell_job_complete",
+        # Session synthesis is internal housekeeping, not a direct user reply.
+        "saga_session_end",
+        # Upgrade maintenance is framework-originated with no awaiting user.
+        "upgrade",
+    }
 )
 
 # Tunable list of phrases that indicate the model is narrating a
@@ -211,6 +220,19 @@ def _matched_send_message_skiplist_phrase(text: str) -> str | None:
             if text_word_count <= SEND_MESSAGE_SKIPLIST_SHORT_MAX_WORDS or phrase_is_tail:
                 return phrase
     return None
+
+
+def _send_message_skiplist_guard_armed(trigger: str) -> bool:
+    if trigger in SEND_MESSAGE_SKIPLIST_TRIGGERS:
+        return True
+
+    namespace, separator, name = trigger.partition(":")
+    return bool(
+        separator
+        and name
+        and namespace.endswith("-poller")
+        and namespace != "-poller"
+    )
 
 
 def _channel_from_config_or_state(
@@ -635,7 +657,7 @@ async def send_message(
     trigger = (getattr(ctx, "trigger", "") if ctx is not None else "").strip()
     matched_skiplist_phrase = (
         _matched_send_message_skiplist_phrase(text)
-        if trigger in SEND_MESSAGE_SKIPLIST_TRIGGERS
+        if _send_message_skiplist_guard_armed(trigger)
         else None
     )
     if matched_skiplist_phrase is not None:
