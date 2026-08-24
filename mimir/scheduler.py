@@ -38,7 +38,7 @@ if TYPE_CHECKING:
     from .commitments.store import CommitmentsStore
 
 import yaml
-from apscheduler.events import EVENT_JOB_MISSED, JobExecutionEvent
+from apscheduler.events import EVENT_JOB_ERROR, EVENT_JOB_MISSED, JobExecutionEvent
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.date import DateTrigger
@@ -55,7 +55,7 @@ from .access_control import (
     parse_declared_shell_commands,
 )
 from .core_blocks import read_text_lossy
-from .event_logger import get_events_path, log_event
+from .event_logger import get_events_path, log_event, log_event_sync
 from ._context import active_pr_checkout_lease_paths, active_turn_snapshots
 from .loop_watchdog import (
     LoopStallWatchdog,
@@ -884,6 +884,9 @@ class Scheduler:
         self._scheduler.add_listener(
             self._on_job_missed, EVENT_JOB_MISSED,
         )
+        self._scheduler.add_listener(
+            self._on_job_error, EVENT_JOB_ERROR,
+        )
 
     def set_arbiter(self, arbiter: Any | None) -> None:
         self._arbiter = arbiter
@@ -920,6 +923,26 @@ class Scheduler:
                 event.scheduled_run_time.isoformat()
                 if event.scheduled_run_time else None
             ),
+        )
+
+    def _on_job_error(self, event: JobExecutionEvent) -> None:
+        """Record every APScheduler job exception without changing its result."""
+        # Import lazily: importing ``mimir.tools`` while this module is still
+        # initializing reaches the tool registry, which imports ``SchedulerJob``.
+        from .tools.budget_gate import _bounded_tool_event_error
+
+        payload = {
+            "job_id": event.job_id,
+            "exception": _bounded_tool_event_error(repr(event.exception)),
+        }
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            log_event_sync("scheduled_job_error", **payload)
+            return
+        self._spawn(
+            log_event("scheduled_job_error", **payload),
+            name="scheduler-log-job-error",
         )
 
     def _spawn(self, coro: Awaitable[Any], *, name: str | None = None) -> asyncio.Task[Any]:
