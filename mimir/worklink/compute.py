@@ -11,7 +11,7 @@ opt-in gate that the rest of the executor already enforces.
 from __future__ import annotations
 
 import asyncio
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 import json
 import os
 import posixpath
@@ -64,6 +64,31 @@ class WorkSpec:
     backend_config: Mapping[str, Any] = field(default_factory=dict)
     local_checkout: Path | None = None
     local_argv: Sequence[str] | None = None
+
+
+def with_worker_environment(
+    spec: WorkSpec, additions: Mapping[str, str]
+) -> WorkSpec:
+    """Supply injected environment and request it from a closed worker together.
+
+    Specs without ``pass_env`` use the legacy direct environment unchanged. For a
+    closed worker, deriving requested names here means every future injection made
+    through this boundary automatically participates in the worker contract.
+    """
+    if not additions:
+        return spec
+    env = {**spec.env, **additions}
+    if "pass_env" not in spec.backend_config:
+        return replace(spec, env=env)
+    requested = spec.backend_config["pass_env"]
+    if isinstance(requested, (str, bytes)) or not isinstance(requested, Sequence):
+        raise ComputeLaunchError("worker pass_env must be a sequence")
+    pass_env = tuple(dict.fromkeys((*requested, *additions)))
+    return replace(
+        spec,
+        env=env,
+        backend_config={**spec.backend_config, "pass_env": pass_env},
+    )
 
 
 @dataclass(frozen=True)
@@ -128,6 +153,20 @@ _LOCAL_ENV_CRED_PREFIXES = (
 DEFAULT_WORKLINK_STDOUT_BYTES = 64 * 1024 * 1024
 DEFAULT_WORKLINK_STDERR_BYTES = 16 * 1024 * 1024
 _TERMINATED_DRAIN_TIMEOUT_S = 5.0
+_WORKER_CANCEL_TIMEOUT_S = 25.0
+_WORKER_COLLECTION_TIMEOUT_S = 10.0
+_DIRECT_PROCESS_WAIT_TIMEOUT_S = 5.0
+
+
+async def _cancel_worker(client: object, identifier: str) -> None:
+    try:
+        await asyncio.wait_for(
+            getattr(client, "cancel")(identifier), _WORKER_CANCEL_TIMEOUT_S
+        )
+    except TimeoutError as exc:
+        raise RuntimeError(
+            f"worker cancellation exceeded {_WORKER_CANCEL_TIMEOUT_S:g}s"
+        ) from exc
 
 
 def _output_limit(env_name: str, default: int) -> int:
@@ -498,8 +537,16 @@ class LocalSubprocessComputeBackend:
             except TimeoutError:
                 timed_out = True
                 client = self._worker_clients[handle.identifier]
-                await getattr(client, "cancel")(handle.identifier)
-                collected = await job
+                await _cancel_worker(client, handle.identifier)
+                try:
+                    collected = await asyncio.wait_for(
+                        job, _WORKER_COLLECTION_TIMEOUT_S
+                    )
+                except TimeoutError as exc:
+                    raise RuntimeError(
+                        "worker did not report a terminal result within "
+                        f"{_WORKER_COLLECTION_TIMEOUT_S:g}s of cancellation"
+                    ) from exc
             if not isinstance(collected, CollectedExecutionResult):
                 raise RuntimeError("contained execution returned an invalid result")
             return ComputeResult(
@@ -606,12 +653,12 @@ class LocalSubprocessComputeBackend:
             proc = _verified_external_process(handle, self.name)
         client = self._worker_clients.get(handle.identifier)
         if client is not None:
-            await getattr(client, "cancel")(handle.identifier)
+            await _cancel_worker(client, handle.identifier)
             return
         if handle.shim_pid is not None:
             from .worker_client import WorkerClient
 
-            await WorkerClient(None).cancel(handle.identifier)  # type: ignore[arg-type]
+            await _cancel_worker(WorkerClient(None), handle.identifier)  # type: ignore[arg-type]
             return
         await _kill_process_group(proc)
 
@@ -697,4 +744,9 @@ async def _kill_process_group(proc: object) -> None:
     await asyncio.to_thread(_terminate_process_group_pid, pgid)
     wait = getattr(proc, "wait", None)
     if wait is not None:
-        await wait()
+        try:
+            await asyncio.wait_for(wait(), _DIRECT_PROCESS_WAIT_TIMEOUT_S)
+        except TimeoutError as exc:
+            raise RuntimeError(
+                f"process group {pgid} leader was not reaped after SIGKILL"
+            ) from exc

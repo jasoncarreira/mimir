@@ -13,8 +13,10 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import replace
+from datetime import datetime, timedelta, timezone
 import json
 import os
+import re
 import shutil
 import stat
 import sys
@@ -23,6 +25,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+import yaml
 
 from mimir import access_control, poller_recovery
 from mimir.event_logger import init_logger
@@ -35,12 +38,16 @@ from mimir.pollers import (
     PollerConfig,
     PollerOverridesValidationError,
     _CircuitBreakerState,
+    _GITHUB_ACTIVITY_EVENT_TYPES,
+    _GITHUB_ACTOR_EVENT_TYPES,
+    _GITHUB_FRAMEWORK_TRIGGER_EVENT_TYPES,
     _circuit_breakers,
     _github_author_is_trusted,
     _github_content_author,
     _github_framework_trigger_is_trusted,
     _parse_poller_authority,
     discover_pollers,
+    GITHUB_TRUST_ATTEMPTS_PER_FIRE,
     run_poller,
     validate_poller_overrides_text,
 )
@@ -248,9 +255,10 @@ def test_state_authority_rejects_persist_dir_outside_state_root(tmp_path: Path) 
 def test_valid_state_poller_creates_and_grants_only_its_instance_root(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.delenv("MIMIR_HOME", raising=False)
-    skills = tmp_path / "skills"
-    state_root = tmp_path / "state" / "pollers"
+    home = tmp_path / "home"
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    skills = home / "skills"
+    state_root = home / "state" / "pollers"
     _write_pollers_json(skills / "demo", [
         {
             "name": "demo",
@@ -924,14 +932,7 @@ def test_unknown_or_out_of_bounds_authority_rejects_instance(
 def test_instance_root_and_operator_alert_are_exact(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    # This test needs MIMIR_HOME set but pointing SOMEWHERE ELSE than the poller
-    # state tree. The gate needs a home to resolve service write scope at all
-    # (unset -> even the poller's own cursor is ADMIN_REQUIRED), but a home of
-    # ``tmp_path`` would blanket-cover ``<home>/state/**`` and make the sibling
-    # poller's cursor writable too, defeating the "exact" assertion below. It
-    # previously relied on MIMIR_HOME leaking from an unrelated test FILE, which
-    # happened to satisfy both conditions — so this file failed when run alone.
-    monkeypatch.setenv("MIMIR_HOME", str(tmp_path / "agent-home"))
+    monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
     skills = tmp_path / "skills"
     authority = _authority(capabilities=["write_file", "operator_alert"])
     _write_pollers_json(skills / "feed", [
@@ -952,7 +953,7 @@ def test_instance_root_and_operator_alert_are_exact(
         authorized_principals=frozenset({principal}), source_kind="service",
     ))
     own = tmp_path / "state" / "pollers" / "feed" / "cursor.json"
-    other = tmp_path / "state" / "pollers" / "other" / "cursor.json"
+    other = tmp_path / "state" / "pollers" / "other" / ".recovery.json"
     assert SinkGate.check_sink_flow("write_file", str(own), labels, auth, enforce=True).allowed
     assert not SinkGate.check_sink_flow("write_file", str(other), labels, auth, enforce=True).allowed
 
@@ -1481,6 +1482,48 @@ print(json.dumps({"poller": "x", "prompt": prompt}))
 
 
 @pytest.mark.asyncio
+async def test_run_poller_exports_its_effective_timeout(
+    tmp_path: Path, home: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A poller must be able to bound its own work against the cap it will be
+    killed at, without hardcoding a copy that drifts from the constant.
+
+    Asserts the *effective* timeout, not the default: a caller passing a
+    different one must have that value reach the subprocess, or a poller sizing
+    its deadlines from the env would overrun.
+    """
+    monkeypatch.delenv("POLLER_TIMEOUT_SECONDS", raising=False)
+    skill_dir = tmp_path / "skill"
+    _install_script(skill_dir, "poller.py", """
+import json, os
+print(json.dumps({
+    "poller": "x",
+    "prompt": f"cap={os.environ['POLLER_TIMEOUT_SECONDS']}",
+}))
+""")
+    cfg = PollerConfig(
+        name="my-poller", command=f"{sys.executable} poller.py",
+        cron="* * * * *", env={}, skill_dir=skill_dir,
+    )
+    enq = _CapturingEnqueue()
+    await run_poller(cfg, enqueue=enq, home=home)
+    assert len(enq.events) == 1
+    assert f"cap={POLLER_TIMEOUT_SECONDS}" in enq.events[0].content
+
+    enq2 = _CapturingEnqueue()
+    await run_poller(cfg, enqueue=enq2, home=home, timeout=45)
+    assert len(enq2.events) == 1
+    assert "cap=45" in enq2.events[0].content
+
+    # Fractional timeouts must survive: `str(int(timeout))` turned 0.5 into "0",
+    # so a poller sizing deadlines from this would have read a cap of zero.
+    enq3 = _CapturingEnqueue()
+    await run_poller(cfg, enqueue=enq3, home=home, timeout=0.5)
+    assert len(enq3.events) == 1
+    assert "cap=0.5" in enq3.events[0].content
+
+
+@pytest.mark.asyncio
 async def test_run_poller_mimir_home_falls_back_to_install_layout(
     tmp_path: Path, home: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1544,7 +1587,7 @@ print(json.dumps({
 """)
     cfg = PollerConfig(
         name="x", command=f"{sys.executable} poller.py",
-        cron="* * * * *", env={}, skill_dir=skill_dir,
+        cron="* * * * *", env={}, skill_dir=skill_dir, deliver="slack-ops",
     )
     enq = _CapturingEnqueue()
     await run_poller(cfg, enqueue=enq)
@@ -1553,6 +1596,7 @@ print(json.dumps({
     assert extra["poller_name"] == "x"
     assert extra["batch_index"] == 0
     assert extra["batch_count"] == 1
+    assert enq.events[0].service_authority.configured_delivery_channel == "slack-ops"
     # Per-item metadata under .items[0].
     assert len(extra["items"]) == 1
     item = extra["items"][0]
@@ -1570,16 +1614,17 @@ print(json.dumps({
         ((204, None), None, True),
         ((404, None), (200, {"state": "active"}), True),
         ((404, None), (404, None), False),
-        (None, None, False),
-        (None, (200, {"state": "active"}), False),
-        ((403, {"message": "rate limited"}), (200, {"state": "active"}), False),
+        (None, None, None),
+        (None, (200, {"state": "active"}), None),
+        ((403, {"message": "rate limited"}), (200, {"state": "active"}), None),
+        ((404, None), None, None),
     ],
 )
 def test_github_author_trust_is_server_attested_and_fail_closed(
     monkeypatch: pytest.MonkeyPatch,
     collaborator: object,
     membership: object,
-    expected: bool,
+    expected: bool | None,
 ) -> None:
     calls: list[str] = []
 
@@ -1671,6 +1716,65 @@ print(json.dumps({"poller": "x", "prompt": "untrusted", "event_type": "issue_ope
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("verdicts", "expected_integrities", "expected_calls"),
+    [
+        ([None, True], ["untrusted", "trusted"], 2),
+        ([False, True], ["untrusted", "untrusted"], 1),
+    ],
+)
+async def test_github_poller_caches_only_resolved_author_trust(
+    tmp_path: Path,
+    home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    verdicts: list[bool | None],
+    expected_integrities: list[str],
+    expected_calls: int,
+) -> None:
+    """Unknown retries within a fire; authoritative false remains cached."""
+    skill_dir = tmp_path / "skill"
+    _install_script(skill_dir, "poller.py", """
+import json
+for number in (1, 2):
+    print(json.dumps({"poller": "x", "prompt": f"issue {number}", "event_type": "issue_opened", "repo": "acme/widget", "url": f"https://github.com/acme/widget/issues/{number}"}))
+""")
+    calls: list[tuple[object, object, str]] = []
+    remaining = iter(verdicts)
+
+    def fake_lookup(repo: object, author: object, token: str) -> bool | None:
+        calls.append((repo, author, token))
+        return next(remaining)
+
+    monkeypatch.setattr(
+        "mimir.pollers._github_content_author",
+        lambda _repo, _extras, _token: "alice",
+    )
+    monkeypatch.setattr("mimir.pollers._github_author_is_trusted", fake_lookup)
+    cfg = PollerConfig(
+        name="x",
+        command=f"{sys.executable} poller.py",
+        cron="* * * * *",
+        env={"GITHUB_TOKEN": "server-token"},
+        skill_dir=skill_dir,
+        batch_size=1,
+        trust_source="github",
+    )
+    enq = _CapturingEnqueue()
+
+    await run_poller(cfg, enqueue=enq)
+
+    assert len(enq.events) == 2
+    assert [
+        next(iter(event.ifc_labels.sources)).integrity
+        for event in enq.events
+        if event.ifc_labels is not None
+    ] == expected_integrities
+    assert calls == [
+        ("acme/widget", "alice", "server-token"),
+    ] * expected_calls
+
+
+@pytest.mark.asyncio
 async def test_contributor_github_content_is_trusted_from_server_checks(
     tmp_path: Path,
     home: Path,
@@ -1747,23 +1851,112 @@ print(json.dumps({"poller": "x", "prompt": "hostile PR body", "event_type": "pr_
     ).allowed is False
 
 
-def test_pr_synchronize_commit_author_is_not_used_as_trust_attestation(
+def test_pr_synchronize_actor_is_resolved_from_server_compare(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     calls: list[str] = []
     monkeypatch.setattr(
         "mimir.pollers._github_api_attestation",
-        lambda endpoint, _token: calls.append(endpoint) or (200, {"user": {"login": "alice"}}),
+        lambda endpoint, _token: calls.append(endpoint)
+        or (200, {"commits": [{"author": {"login": "alice"}}]}),
     )
 
     author = _github_content_author("acme/widget", {
         "event_type": "pr_synchronize",
         "url": "https://github.com/acme/widget/pull/11",
         "author": "trusted-looking-commit-author",
+        "previous_head": "a" * 40,
+        "new_head": "b" * 40,
     }, "server-token")
 
-    assert author is None
-    assert calls == []
+    assert author == "alice"
+    assert calls == [f"repos/acme/widget/compare/{'a' * 40}...{'b' * 40}"]
+
+
+def test_github_activity_integrity_classification_is_total() -> None:
+    poller_source = (
+        Path(__file__).parents[1]
+        / "mimir/optional-skills/github-poller/scripts/poller.py"
+    ).read_text(encoding="utf-8")
+    emitted = frozenset(re.findall(r'\bevent_type\s*=\s*["\']([^"\']+)', poller_source))
+
+    assert emitted == _GITHUB_ACTIVITY_EVENT_TYPES
+    assert not (_GITHUB_ACTOR_EVENT_TYPES.keys() & _GITHUB_FRAMEWORK_TRIGGER_EVENT_TYPES.keys())
+    assert all(_GITHUB_ACTOR_EVENT_TYPES.values())
+    assert all(_GITHUB_FRAMEWORK_TRIGGER_EVENT_TYPES.values())
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("event_type", ["pr_synchronize", "pr_review_requested"])
+@pytest.mark.parametrize("collaborator", [True, False])
+async def test_new_github_activity_actors_use_discriminating_server_trust(
+    tmp_path: Path,
+    home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    event_type: str,
+    collaborator: bool,
+) -> None:
+    actor = "collaborator" if collaborator else "outsider"
+    item = {
+        "poller": "x",
+        "prompt": "GitHub activity",
+        "event_type": event_type,
+        "repo": "acme/widget",
+        "number": 11,
+        "url": "https://github.com/acme/widget/pull/11",
+        "author": "payload-impostor",
+        "previous_head": "a" * 40,
+        "new_head": "b" * 40,
+        "requested_reviewer": "mimir-bot",
+    }
+    skill_dir = tmp_path / "skill"
+    _install_script(skill_dir, "poller.py", f"""
+import json
+print(json.dumps({item!r}))
+""")
+    calls: list[str] = []
+
+    def fake_api(endpoint: str, token: str):
+        assert token == "server-token"
+        calls.append(endpoint)
+        if "/compare/" in endpoint:
+            return 200, {"commits": [{"author": {"login": actor}}]}
+        if "/timeline?" in endpoint:
+            return 200, [{
+                "event": "review_requested",
+                "requested_reviewer": {"login": "mimir-bot"},
+                "actor": {"login": actor},
+            }]
+        if endpoint == f"repos/acme/widget/collaborators/{actor}":
+            return (204, None) if collaborator else (404, None)
+        if endpoint == f"orgs/acme/memberships/{actor}":
+            return 404, None
+        pytest.fail(f"unexpected GitHub endpoint: {endpoint}")
+
+    monkeypatch.setattr("mimir.pollers._github_api_attestation", fake_api)
+    cfg = PollerConfig(
+        name="x", command=f"{sys.executable} poller.py", cron="* * * * *",
+        env={"GITHUB_TOKEN": "server-token"}, skill_dir=skill_dir,
+        trust_source="github",
+    )
+    enq = _CapturingEnqueue()
+
+    await run_poller(cfg, enqueue=enq)
+
+    source = next(iter(enq.events[0].ifc_labels.sources))
+    assert (source.integrity, source.integrity_effect) == (
+        "trusted" if collaborator else "untrusted",
+        "active_ingest",
+    )
+    identity_endpoint = (
+        f"repos/acme/widget/compare/{'a' * 40}...{'b' * 40}"
+        if event_type == "pr_synchronize"
+        else "repos/acme/widget/issues/11/timeline?per_page=100"
+    )
+    expected = [identity_endpoint, f"repos/acme/widget/collaborators/{actor}"]
+    if not collaborator:
+        expected.append(f"orgs/acme/memberships/{actor}")
+    assert calls == expected
 
 
 def test_github_content_author_uses_api_and_ignores_payload_claim(
@@ -2010,6 +2203,17 @@ print(json.dumps({
 # ─── poller_recovery framework wiring (chainlink #314) ────────────────
 
 
+def _make_recovery_event(source_id: str) -> AgentEvent:
+    return AgentEvent(
+        trigger="poller",
+        channel_id="poller:x",
+        content="recover me",
+        source="poller",
+        source_id=source_id,
+        extra={"poller_name": "x", "items": []},
+    )
+
+
 def test_discover_pollers_reads_recover_failed_turns_flag(tmp_path: Path):
     skills = tmp_path / "skills"
     _write_pollers_json(skills / "skill", [
@@ -2122,8 +2326,147 @@ async def test_run_poller_reconciles_failed_turn_before_next_poll(
     recovery_events = [
         e for e in _read_events(home) if e["type"] == "poller_recovery"
     ]
+    assert len(recovery_events) == 1
     assert recovery_events[-1]["poller"] == "x"
     assert recovery_events[-1]["reenqueued"] == 1
+    assert recovery_events[-1]["expired"] == 0
+    assert recovery_events[-1]["dropped"] == 0
+
+
+@pytest.mark.asyncio
+async def test_run_poller_recovery_expiration_logs_loss(
+    tmp_path: Path, home: Path,
+) -> None:
+    skill_dir = tmp_path / "skill"
+    persist_dir = tmp_path / "persist" / "x"
+    _install_script(skill_dir, "poller.py", "pass\n")
+    cfg = PollerConfig(
+        name="x", command=f"{sys.executable} poller.py",
+        cron="* * * * *", env={}, skill_dir=skill_dir,
+        persist_dir=persist_dir,
+    )
+    await poller_recovery.stash_enqueued_event(
+        persist_dir, _make_recovery_event("poller:x:expired"),
+    )
+    state = poller_recovery._load_state(persist_dir)
+    state["inflight"]["poller:x:expired"]["stashed_at"] = (
+        datetime.now(tz=timezone.utc) - timedelta(hours=72)
+    ).isoformat()
+    poller_recovery._save_state(persist_dir, state)
+
+    await run_poller(cfg, enqueue=_CapturingEnqueue())
+
+    recovery_events = [
+        event for event in _read_events(home)
+        if event["type"] == "poller_recovery"
+    ]
+    assert len(recovery_events) == 1
+    assert recovery_events[0]["expired"] == 1
+    assert recovery_events[0]["dropped"] == 0
+
+
+@pytest.mark.asyncio
+async def test_run_poller_recovery_schema_drop_logs_loss(
+    tmp_path: Path, home: Path,
+) -> None:
+    skill_dir = tmp_path / "skill"
+    persist_dir = tmp_path / "persist" / "x"
+    _install_script(skill_dir, "poller.py", "pass\n")
+    cfg = PollerConfig(
+        name="x", command=f"{sys.executable} poller.py",
+        cron="* * * * *", env={}, skill_dir=skill_dir,
+        persist_dir=persist_dir, recover_failed_turns=True,
+    )
+    source_id = "poller:x:obsolete"
+    await poller_recovery.stash_enqueued_event(
+        persist_dir, _make_recovery_event(source_id),
+        enqueued_at="2026-06-04T07:59:00+00:00",
+    )
+    state = poller_recovery._load_state(persist_dir)
+    state["inflight"][source_id]["event"]["obsolete_field"] = True
+    poller_recovery._save_state(persist_dir, state)
+    events_path = home / "logs" / "events.jsonl"
+    with events_path.open("a", encoding="utf-8") as f:
+        f.write(json.dumps({
+            "type": "turn_failed",
+            "timestamp": "2026-06-04T08:00:00+00:00",
+            "channel_id": "poller:x",
+            "source_id": source_id,
+        }) + "\n")
+
+    await run_poller(cfg, enqueue=_CapturingEnqueue())
+
+    recovery_events = [
+        event for event in _read_events(home)
+        if event["type"] == "poller_recovery"
+    ]
+    assert len(recovery_events) == 1
+    assert recovery_events[0]["expired"] == 0
+    assert recovery_events[0]["dropped"] == 1
+
+
+@pytest.mark.asyncio
+async def test_run_poller_reports_and_preserves_corrupt_recovery_state(
+    tmp_path: Path, home: Path,
+) -> None:
+    skill_dir = tmp_path / "skill"
+    persist_dir = tmp_path / "persist" / "x"
+    _install_script(skill_dir, "poller.py", "pass\n")
+    cfg = PollerConfig(
+        name="x", command=f"{sys.executable} poller.py",
+        cron="* * * * *", env={}, skill_dir=skill_dir,
+        persist_dir=persist_dir,
+    )
+    persist_dir.mkdir(parents=True)
+    state_path = persist_dir / poller_recovery.RECOVERY_STATE_FILE
+    corrupt = b'{"last_reconciled":"","inflight":{"sid-1":'
+    state_path.write_bytes(corrupt)
+
+    await run_poller(cfg, enqueue=_CapturingEnqueue())
+
+    assert state_path.read_bytes() == corrupt
+    unreadable_events = [
+        event for event in _read_events(home)
+        if event["type"] == "poller_recovery_state_unreadable"
+    ]
+    assert len(unreadable_events) == 1
+    assert unreadable_events[0]["poller"] == "x"
+    assert unreadable_events[0]["path"] == str(state_path)
+    assert not any(
+        event["type"] == "poller_recovery" for event in _read_events(home)
+    )
+
+
+@pytest.mark.asyncio
+async def test_run_poller_reports_and_preserves_invalid_inflight_state(
+    tmp_path: Path, home: Path,
+) -> None:
+    skill_dir = tmp_path / "skill"
+    persist_dir = tmp_path / "persist" / "x"
+    _install_script(skill_dir, "poller.py", "pass\n")
+    cfg = PollerConfig(
+        name="x", command=f"{sys.executable} poller.py",
+        cron="* * * * *", env={}, skill_dir=skill_dir,
+        persist_dir=persist_dir,
+    )
+    persist_dir.mkdir(parents=True)
+    state_path = persist_dir / poller_recovery.RECOVERY_STATE_FILE
+    invalid = b'{"last_reconciled":"2026-08-23T18:00:00+00:00","inflight":null}'
+    state_path.write_bytes(invalid)
+
+    await run_poller(cfg, enqueue=_CapturingEnqueue())
+
+    assert state_path.read_bytes() == invalid
+    unreadable_events = [
+        event for event in _read_events(home)
+        if event["type"] == "poller_recovery_state_unreadable"
+    ]
+    assert len(unreadable_events) == 1
+    assert unreadable_events[0]["poller"] == "x"
+    assert unreadable_events[0]["path"] == str(state_path)
+    assert not any(
+        event["type"] == "poller_recovery" for event in _read_events(home)
+    )
 
 
 @pytest.mark.asyncio
@@ -2650,9 +2993,64 @@ def test_poller_config_channel_id_format():
 
 
 def test_poller_timeout_constant_reasonable():
-    """Locks the contract: the framework's hard-cap is 60s. Skill
-    authors who need longer-running pollers must restructure."""
-    assert POLLER_TIMEOUT_SECONDS == 60
+    """Locks the contract: the framework hard-cap a poller is killed at.
+
+    Raised 60 -> 120 for chainlink #1433. Still a hard cap — a poller needing
+    longer must bound its own work or restructure, because overrunning discards
+    everything the tick emitted rather than returning a partial result.
+    """
+    assert POLLER_TIMEOUT_SECONDS == 120
+
+
+def test_poller_timeout_stays_below_every_shipped_cadence():
+    """Sanity check on the *bundled* manifests only.
+
+    This is deliberately not the enforcement: pollers are discovered from
+    ``<home>/skills/**/pollers.json`` and ``pollers-overrides.yaml`` can replace
+    a cron, so a locally installed or overridden fast poller would never appear
+    here. The runtime constraint is enforced per poller at fire time — see
+    ``Scheduler._effective_poller_timeout`` and its tests in test_scheduler.py.
+    Kept because it catches the common case (someone adds a fast shipped poller)
+    directly in this repo.
+    """
+    from datetime import datetime, timezone
+
+    from apscheduler.triggers.cron import CronTrigger
+
+    from mimir.scheduler import _cron_with_standard_dow
+
+    manifests = sorted(Path("mimir/optional-skills").glob("*/pollers.json"))
+    assert manifests, "no shipped poller manifests found — test is vacuous"
+
+    now = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    checked: list[tuple[str, float]] = []
+    for manifest in manifests:
+        raw = json.loads(manifest.read_text(encoding="utf-8"))
+        entries = raw.get("pollers", raw) if isinstance(raw, dict) else raw
+        for entry in entries if isinstance(entries, list) else [entries]:
+            if not isinstance(entry, dict):
+                continue
+            name = str(entry.get("name"))
+            interval = entry.get("interval_seconds")
+            if isinstance(interval, (int, float)) and interval > 0:
+                checked.append((name, float(interval)))
+                continue
+            cron = entry.get("cron")
+            if not isinstance(cron, str) or not cron.strip():
+                continue
+            trigger = CronTrigger.from_crontab(
+                _cron_with_standard_dow(cron), timezone=timezone.utc,
+            )
+            first = trigger.get_next_fire_time(None, now)
+            second = trigger.get_next_fire_time(first, first)
+            checked.append((name, (second - first).total_seconds()))
+
+    assert checked, "no cadences resolved — test is vacuous"
+    for name, period in checked:
+        assert POLLER_TIMEOUT_SECONDS < period, (
+            f"{name} fires every {period:.0f}s but the cap is "
+            f"{POLLER_TIMEOUT_SECONDS}s; a slow run would swallow the next fire"
+        )
 
 
 def test_pollers_module_annotations_resolve():
@@ -4912,6 +5310,56 @@ def test_validate_poller_overrides_text_accepts_budget(tmp_path: Path):
     assert parsed["github-activity"]["budget"]["windows"]["1h"]["max_agent_turns"] == 2
 
 
+def test_validate_poller_overrides_text_rejects_environment_hijack(tmp_path: Path):
+    path = tmp_path / "pollers-overrides.yaml"
+    text = yaml.safe_dump({
+        "github-poller": {
+            "env": {
+                "PATH": "/tmp/evil:/usr/bin",
+                "BASH_ENV": "/tmp/evil/rc",
+                "GIT_SSH_COMMAND": "evil",
+                "HTTPS_PROXY": "https://evil.invalid",
+                "NODE_OPTIONS": "--require=/tmp/evil.js",
+                "SSL_CERT_FILE": "/tmp/evil.pem",
+                "LD_PRELOAD": "/tmp/e.so",
+            },
+        },
+    })
+
+    with pytest.raises(PollerOverridesValidationError) as exc:
+        validate_poller_overrides_text(text, path=path)
+
+    assert "poller_overrides_disallowed_env" in str(exc.value)
+
+
+def test_validate_poller_overrides_text_restricts_pass_env(tmp_path: Path):
+    path = tmp_path / "pollers-overrides.yaml"
+
+    with pytest.raises(PollerOverridesValidationError) as exc:
+        validate_poller_overrides_text(
+            "gmail-inbox:\n  pass_env: [GOG_ACCOUNT, BASH_ENV]\n",
+            path=path,
+        )
+
+    assert "poller_overrides_disallowed_env" in str(exc.value)
+
+
+@pytest.mark.parametrize("name", ["GITHUB_REPOS", "GOG_ACCOUNT"])
+def test_validate_poller_overrides_text_rejects_literal_scope_selectors(
+    tmp_path: Path,
+    name: str,
+):
+    path = tmp_path / "pollers-overrides.yaml"
+
+    with pytest.raises(PollerOverridesValidationError) as exc:
+        validate_poller_overrides_text(
+            f"poller:\n  env:\n    {name}: attacker-controlled\n",
+            path=path,
+        )
+
+    assert "poller_overrides_disallowed_env" in str(exc.value)
+
+
 def test_validate_poller_overrides_text_rejects_non_mapping_root(tmp_path: Path):
     path = tmp_path / "pollers-overrides.yaml"
     with pytest.raises(PollerOverridesValidationError) as exc:
@@ -5003,3 +5451,62 @@ def test_discover_parses_deliver_field(tmp_path: Path):
     assert by_name["p1"].deliver == "OPERATOR_CHANNEL"
     assert by_name["p2"].deliver is None
     assert by_name["p3"].deliver == "slack-ops"
+
+
+@pytest.mark.asyncio
+async def test_github_poller_bounds_unresolved_author_trust_attempts_per_fire(
+    tmp_path: Path,
+    home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An unresolved attestation retries, but a same-author batch cannot turn it
+    into one network call per item.
+
+    Review of chainlink #1441: this loop runs after the subprocess drains, so
+    POLLER_TIMEOUT_SECONDS does not bound it, and scheduler.py awaits run_poller()
+    without wait_for while holding a poller semaphore slot. Five same-author items
+    with the attestation permanently unavailable must spend the fire's attempt
+    budget and stop calling out, while every event still fails closed.
+    """
+    skill_dir = tmp_path / "skill"
+    _install_script(skill_dir, "poller.py", """
+import json
+for number in (1, 2, 3, 4, 5):
+    print(json.dumps({"poller": "x", "prompt": f"issue {number}", "event_type": "issue_opened", "repo": "acme/widget", "url": f"https://github.com/acme/widget/issues/{number}"}))
+""")
+    calls: list[tuple[object, object, str]] = []
+
+    def never_resolves(repo: object, author: object, token: str) -> bool | None:
+        calls.append((repo, author, token))
+        return None
+
+    monkeypatch.setattr(
+        "mimir.pollers._github_content_author",
+        lambda _repo, _extras, _token: "alice",
+    )
+    monkeypatch.setattr("mimir.pollers._github_author_is_trusted", never_resolves)
+    cfg = PollerConfig(
+        name="x",
+        command=f"{sys.executable} poller.py",
+        cron="* * * * *",
+        env={"GITHUB_TOKEN": "server-token"},
+        skill_dir=skill_dir,
+        batch_size=1,
+        trust_source="github",
+    )
+    enq = _CapturingEnqueue()
+
+    await run_poller(cfg, enqueue=enq)
+
+    assert len(enq.events) == 5
+    # The cap, not the item count, decides how many times we call GitHub.
+    assert len(calls) == GITHUB_TRUST_ATTEMPTS_PER_FIRE
+    assert len(calls) < len(enq.events)
+    # Every event still fails closed, including those that never triggered a call.
+    integrities = [
+        source.integrity
+        for event in enq.events
+        for source in event.ifc_labels.sources
+        if source.domain == "channel"
+    ]
+    assert integrities == ["untrusted"] * 5

@@ -185,6 +185,43 @@ def test_dedup_pass_merges_near_duplicates(conn):
     assert rel == 1
 
 
+@pytest.mark.parametrize("pin_high_activation_atom", [False, True])
+def test_dedup_pass_preserves_pin_from_either_cluster_member(
+    conn, pin_high_activation_atom,
+):
+    embed_fn = _embed_fn_factory({
+        "canonical candidate": [1.0, 0.0, 0.0, 0.0],
+        "near duplicate": [1.0, 0.0, 0.0, 0.0],
+    })
+    high_activation = store(
+        conn, "canonical candidate", embed_fn=embed_fn,
+    ).atom_id
+    low_activation = store(
+        conn, "near duplicate", embed_fn=embed_fn,
+    ).atom_id
+    for _ in range(5):
+        mark_access(
+            conn,
+            [AccessEvent(atom_id=high_activation, source="retrieval")],
+        )
+    pinned = high_activation if pin_high_activation_atom else low_activation
+    conn.execute("UPDATE atoms SET is_pinned = 1 WHERE id = ?", (pinned,))
+    conn.commit()
+
+    result = dedup_pass(
+        conn,
+        cluster_fn=make_default_cluster_fn(conn, threshold=0.5),
+        min_cluster_size=2,
+    )
+
+    assert result.canonicals_kept == [high_activation]
+    assert result.duplicates_tombstoned == [low_activation]
+    live_pinned = conn.execute(
+        "SELECT id FROM atoms WHERE tombstoned = 0 AND is_pinned = 1"
+    ).fetchall()
+    assert live_pinned == [(high_activation,)]
+
+
 @pytest.mark.parametrize(
     ("canonical_integrity", "duplicate_integrity"),
     [("trusted", "untrusted"), ("untrusted", "trusted")],

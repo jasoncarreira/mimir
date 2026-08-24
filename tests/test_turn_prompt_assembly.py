@@ -110,6 +110,17 @@ def _block(content: str) -> PromptBlock:
     )
 
 
+def _session_labels(channel_id: str) -> InformationFlowLabels:
+    return InformationFlowLabels().with_source(SourceLabel(
+        principal="alice",
+        domain="channel",
+        resource_id=channel_id,
+        bridge_instance="web",
+        sensitivity="private",
+        authorized_principals=frozenset({"alice"}),
+    ))
+
+
 def _insert_session_boundary(
     conn: sqlite3.Connection,
     *,
@@ -390,13 +401,100 @@ async def test_heartbeat_authority_guidance_renders_only_under_enforcement(
     )
     assert "## Autonomous trigger authority" in prompt
     assert "profile: ``heartbeat``" in prompt
-    assert "``fetch_url`` may reach only this profile's approved exact-URL list" in prompt
+    assert "``fetch_url`` may reach this profile's approved exact URLs and URL scopes" in prompt
+    assert "scoped URLs require a clean turn" in prompt
 
     agent._config.access_control_enforced = False
     shadow_prompt, _ = await agent._build_turn_prompt(
         _make_ctx(event), event, None, initial_auth_context=auth,
     )
     assert "## Autonomous trigger authority" not in shadow_prompt
+
+
+@pytest.mark.asyncio
+async def test_delivery_uses_trusted_poller_configuration_in_shadow_mode(
+    tmp_path: Path,
+) -> None:
+    from mimir.access_control import CapabilityTier, build_trigger_service_principal
+
+    agent = _make_agent(tmp_path)
+    agent._channels = type("Channels", (), {"find": lambda self, channel: object()})()
+    authority = build_trigger_service_principal(
+        canonical="configured-poller",
+        trigger="poller",
+        profile="custom",
+        tier=CapabilityTier.SCOPE_CONTAINED,
+        capabilities=(),
+        creation_path="test",
+    )
+    authority = replace(
+        authority, configured_delivery_channel="slack-ops",
+    )
+    event = AgentEvent(
+        trigger="poller",
+        channel_id="poller:configured",
+        content="new item",
+        extra={"deliver": "slack-forged"},
+        service_principal=authority.canonical,
+        service_authority=authority,
+    )
+    auth = AuthContext(
+        principal=authority.canonical,
+        canonical_principal=authority.canonical,
+        roles=(),
+        event_ingress=None,
+        trigger=event.trigger,
+        channel_id=event.channel_id,
+        interactivity=None,
+        is_service=True,
+        service_authority=authority,
+        enforcement_enabled=False,
+    )
+
+    prompt, _ = await agent._build_turn_prompt(
+        _make_ctx(event), event, None, initial_auth_context=auth,
+    )
+
+    assert "## Delivery" in prompt
+    assert "slack-ops" in prompt
+    assert "slack-forged" not in prompt
+
+
+@pytest.mark.asyncio
+async def test_http_delivery_extra_is_not_rendered(tmp_path: Path) -> None:
+    from mimir.worklink.continuation import (
+        HTTP_EVENT_INGRESS_EXTRA_KEY,
+        HTTP_EVENT_INGRESS_EXTRA_VALUE,
+    )
+
+    agent = _make_agent(tmp_path)
+    event = AgentEvent(
+        trigger="user_message",
+        channel_id="web-alice",
+        content="summarize my recent messages",
+        author="alice",
+        extra={
+            "deliver": "slack-C0PRIVATE",
+            HTTP_EVENT_INGRESS_EXTRA_KEY: HTTP_EVENT_INGRESS_EXTRA_VALUE,
+        },
+    )
+    auth = AuthContext(
+        principal="alice",
+        canonical_principal="alice",
+        roles=("user",),
+        event_ingress=HTTP_EVENT_INGRESS_EXTRA_VALUE,
+        trigger=event.trigger,
+        channel_id=event.channel_id,
+        interactivity=None,
+        enforcement_enabled=False,
+    )
+
+    prompt, _ = await agent._build_turn_prompt(
+        _make_ctx(event), event, None, initial_auth_context=auth,
+    )
+
+    assert "## Delivery" not in prompt
+    assert "slack-C0PRIVATE" not in prompt
 
 
 @pytest.mark.asyncio
@@ -517,14 +615,21 @@ async def test_build_turn_prompt_routes_synthesis_to_dedicated_template(
 ) -> None:
     """``trigger='saga_session_end'`` must route through
     ``_build_synthesis_prompt`` (which loads the saga_session_end
-    template), NOT the standard build_turn_prompt path. Empty
-    turns.jsonl → the lean template fires."""
+    template), NOT the standard build_turn_prompt path."""
     agent = _make_agent(tmp_path)
+    agent._config.turns_log.write_text(json.dumps({
+        "turn_id": "turn-session",
+        "ts": "2026-06-28T05:30:00+00:00",
+        "saga_session_id": "sess-xyz",
+        "channel_id": "ch-3",
+        "output": "session content",
+    }))
     event = AgentEvent(
         trigger="saga_session_end",
         channel_id="ch-3",
         content="(unused)",
         extra={"saga_session_id": "sess-xyz"},
+        ifc_labels=_session_labels("ch-3"),
     )
     ctx = _make_ctx(event, saga_session_id="sess-xyz")
     turn_prompt, recent = await agent._build_turn_prompt(
@@ -539,6 +644,8 @@ async def test_build_turn_prompt_routes_synthesis_to_dedicated_template(
     assert "## Today's date" not in turn_prompt
     # No recent list when synthesis branch fires.
     assert recent == []
+    assert event.ifc_labels is not None
+    assert all(source in ctx.ifc_labels.sources for source in event.ifc_labels.sources)
 
 
 # ─── Direct synthesis prompt builder ────────────────────────────────
@@ -558,6 +665,7 @@ def test_filter_session_turns_uses_turn_record_ts_for_window_break(
             "turn_id": "too-old-match",
             "ts": "2026-06-28T05:00:00+00:00",
             "saga_session_id": "sess-1",
+            "channel_id": "ch-1",
         },
         {
             "turn_id": "old-nonmatch",
@@ -568,11 +676,13 @@ def test_filter_session_turns_uses_turn_record_ts_for_window_break(
             "turn_id": "recent-match-1",
             "ts": "2026-06-28T05:30:00+00:00",
             "saga_session_id": "sess-1",
+            "channel_id": "ch-1",
         },
         {
             "turn_id": "recent-match-2",
             "ts": "2026-06-28T05:31:00+00:00",
             "saga_session_id": "sess-1",
+            "channel_id": "ch-1",
         },
         {
             "turn_id": "newest-nonmatch",
@@ -582,12 +692,43 @@ def test_filter_session_turns_uses_turn_record_ts_for_window_break(
     ]
     turns_path.write_text("\n".join(json.dumps(r) for r in records))
 
-    filtered = _filter_session_turns(turns_path, "sess-1", idle_minutes=10)
+    filtered = _filter_session_turns(
+        turns_path, "sess-1", channel_id="ch-1", idle_minutes=10,
+    )
 
     assert [rec["turn_id"] for rec in filtered] == [
         "recent-match-1",
         "recent-match-2",
     ]
+
+
+def test_filter_session_turns_rejects_foreign_channel_with_same_session_id(
+    tmp_path: Path,
+) -> None:
+    turns_path = tmp_path / "turns.jsonl"
+    records = [
+        {
+            "turn_id": "foreign",
+            "ts": "2026-06-28T05:30:00+00:00",
+            "saga_session_id": "sess-known",
+            "channel_id": "ch-foreign",
+            "output": "foreign secret",
+        },
+        {
+            "turn_id": "own",
+            "ts": "2026-06-28T05:31:00+00:00",
+            "saga_session_id": "sess-known",
+            "channel_id": "ch-own",
+            "output": "own content",
+        },
+    ]
+    turns_path.write_text("\n".join(json.dumps(record) for record in records))
+
+    filtered = _filter_session_turns(
+        turns_path, "sess-known", channel_id="ch-own",
+    )
+
+    assert [record["turn_id"] for record in filtered] == ["own"]
 
 
 @pytest.mark.asyncio
@@ -604,11 +745,14 @@ async def test_build_synthesis_prompt_handles_empty_window(
         trigger="saga_session_end",
         channel_id="ch-empty",
         extra={"saga_session_id": "sess-empty"},
+        ifc_labels=_session_labels("ch-empty"),
     )
     ctx = _make_ctx(event, saga_session_id="sess-empty")
     rendered = await agent._build_synthesis_prompt(ctx, event)
-    assert "sess-empty" in rendered
-    assert rendered  # non-empty
+    assert isinstance(rendered, PromptBlock)
+    assert "sess-empty" in rendered.content
+    assert rendered.content  # non-empty
+    assert rendered.labels == InformationFlowLabels()
 
 
 # ─── Full-block-stack regression coverage ───────────────────────────

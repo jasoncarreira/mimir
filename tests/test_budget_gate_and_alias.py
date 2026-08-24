@@ -23,6 +23,8 @@ from __future__ import annotations
 
 import asyncio
 import contextvars
+import json
+import subprocess
 import time
 from pathlib import Path
 from textwrap import dedent
@@ -2032,6 +2034,199 @@ def test_sync_protected_read_allows_compatible_harness_egress():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("tool_name", ["read_file", "ls", "glob"])
+async def test_real_read_policy_refusal_is_audited_without_tainting_reply(
+    tool_name: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from dataclasses import replace
+
+    from mimir.readonly_backend import _RootAwareFilesystemBackend
+
+    home = tmp_path / "home"
+    denied = home / "logs"
+    denied.mkdir(parents=True)
+    (denied / "private.txt").write_text("private\n", encoding="utf-8")
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    auth = _untainted_ifc_auth(roles=("user",))
+    shadow_auth = replace(auth, enforcement_enabled=False)
+    ctx = _ifc_turn(auth)
+    middleware = BudgetGateMiddleware()
+    backend = _RootAwareFilesystemBackend(root_dir=home, virtual_mode=True)
+    events: list[tuple[str, dict[str, Any]]] = []
+    monkeypatch.setattr(
+        "mimir.tools.budget_gate._emit_event_sync",
+        lambda kind, **fields: events.append((kind, fields)),
+    )
+
+    async def refused(req: ToolCallRequest) -> ToolMessage:
+        if tool_name == "read_file":
+            result = await backend.aread("/logs/private.txt")
+        elif tool_name == "ls":
+            result = await backend.als("/logs")
+        else:
+            result = await backend.aglob("*.txt", path="/logs")
+        assert result.error is not None
+        return ToolMessage(
+            content=f"Error: {result.error}",
+            tool_call_id=req.tool_call["id"],
+            status="error",
+        )
+
+    send_calls = 0
+
+    async def send(req: ToolCallRequest) -> ToolMessage:
+        nonlocal send_calls
+        send_calls += 1
+        return ToolMessage(content="sent", tool_call_id=req.tool_call["id"])
+
+    args = (
+        {"file_path": "/logs/private.txt"}
+        if tool_name == "read_file"
+        else {"path": "/logs", "pattern": "*.txt"}
+    )
+    token = set_current_turn(ctx)
+    try:
+        refusal = await middleware.awrap_tool_call(
+            _make_request(tool_name, "refused-read", shadow_auth, args), refused,
+        )
+        reply = await middleware.awrap_tool_call(
+            _make_request("send_message", "reply", auth, {"channel_id": "ch-1"}), send,
+        )
+    finally:
+        reset_current_turn(token)
+
+    assert refusal.status == "error"
+    assert ctx.ifc_labels.sources == ()
+    assert reply.status != "error"
+    assert send_calls == 1
+    hard_denials = [fields for kind, fields in events if kind == "hard_boundary_denied"]
+    assert [event["boundary"] for event in hard_denials] == ["protected_read_policy"]
+
+
+@pytest.mark.asyncio
+async def test_read_refusal_does_not_clear_separate_untrusted_ingestion(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from dataclasses import replace
+
+    from mimir.access_control import publish_protected_result
+    from mimir.readonly_backend import _RootAwareFilesystemBackend
+
+    home = tmp_path / "home"
+    (home / "logs").mkdir(parents=True)
+    (home / "logs" / "private.txt").write_text("private\n", encoding="utf-8")
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    auth = _untainted_ifc_auth(roles=("user",))
+    shadow_auth = replace(auth, enforcement_enabled=False)
+    ctx = _ifc_turn(auth)
+    middleware = BudgetGateMiddleware()
+    backend = _RootAwareFilesystemBackend(root_dir=home, virtual_mode=True)
+
+    async def refused(req: ToolCallRequest) -> ToolMessage:
+        result = await backend.aread("/logs/private.txt")
+        return ToolMessage(
+            content=f"Error: {result.error}", tool_call_id=req.tool_call["id"], status="error",
+        )
+
+    async def untrusted(req: ToolCallRequest) -> ToolMessage:
+        publish_protected_result((SourceLabel(
+            principal="other-user",
+            domain="filesystem",
+            resource_id=str(tmp_path / "external.txt"),
+            bridge_instance="filesystem",
+            sensitivity="internal",
+            authorized_principals=frozenset({"other-user"}),
+            source_kind="protected_tool",
+            integrity="untrusted",
+            integrity_effect="active_ingest",
+        ),))
+        return ToolMessage(content="untrusted", tool_call_id=req.tool_call["id"])
+
+    async def send(req: ToolCallRequest) -> ToolMessage:
+        return ToolMessage(content="sent", tool_call_id=req.tool_call["id"])
+
+    token = set_current_turn(ctx)
+    try:
+        await middleware.awrap_tool_call(
+            _make_request(
+                "read_file", "refused", shadow_auth, {"file_path": "/logs/private.txt"},
+            ),
+            refused,
+        )
+        await middleware.awrap_tool_call(
+            _make_request("write_todos", "untrusted", auth), untrusted,
+        )
+        reply = await middleware.awrap_tool_call(
+            _make_request("send_message", "reply", auth, {"channel_id": "ch-1"}), send,
+        )
+    finally:
+        reset_current_turn(token)
+
+    assert len(ctx.ifc_labels.sources) == 1
+    assert reply.status == "error"
+    assert "ifc_label_blocked:same_channel" in str(reply.content)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("tool_name", ["grep", "glob", "ls", "file_search"])
+async def test_partial_collection_denial_preserves_successful_path_labels(
+    tool_name: str,
+) -> None:
+    from dataclasses import replace
+
+    from mimir.access_control import publish_protected_result
+    from mimir.read_policy import emit_hard_read_denial
+
+    auth = _untainted_ifc_auth(roles=("user",))
+    shadow_auth = replace(auth, enforcement_enabled=False)
+    ctx = _ifc_turn(auth)
+    middleware = BudgetGateMiddleware()
+    safe_source = SourceLabel(
+        principal="other-user",
+        domain="filesystem",
+        resource_id="/returned/safe.txt",
+        bridge_instance="filesystem",
+        sensitivity="internal",
+        authorized_principals=frozenset({"other-user"}),
+        source_kind="protected_tool",
+        integrity="untrusted",
+        integrity_effect="active_ingest",
+    )
+
+    async def partial(req: ToolCallRequest) -> ToolMessage:
+        emit_hard_read_denial(tool_name, "/withheld/private.txt", "protected_name_match")
+        publish_protected_result((safe_source,))
+        return ToolMessage(content="/returned/safe.txt", tool_call_id=req.tool_call["id"])
+
+    async def send(req: ToolCallRequest) -> ToolMessage:
+        return ToolMessage(content="sent", tool_call_id=req.tool_call["id"])
+
+    args = {
+        "grep": {"pattern": "needle", "path": "/"},
+        "glob": {"pattern": "*.txt", "path": "/"},
+        "ls": {"path": "/"},
+        "file_search": {"query": "needle"},
+    }[tool_name]
+    token = set_current_turn(ctx)
+    try:
+        await middleware.awrap_tool_call(
+            _make_request(tool_name, "partial-collection", shadow_auth, args), partial,
+        )
+        reply = await middleware.awrap_tool_call(
+            _make_request("send_message", "reply", auth, {"channel_id": "ch-1"}), send,
+        )
+    finally:
+        reset_current_turn(token)
+
+    assert ctx.ifc_labels.sources == (safe_source,)
+    assert reply.status == "error"
+    assert "ifc_label_blocked:same_channel" in str(reply.content)
+
+
+@pytest.mark.asyncio
 async def test_real_commitment_list_with_ownerless_record_allows_same_channel_reply(
     tmp_path: Path,
 ):
@@ -2263,6 +2458,160 @@ async def test_async_partial_error_taints_and_blocks_next_same_channel_send():
     assert denied.status == "error"
     assert "ifc_label_blocked:same_channel" in str(denied.content)
     assert send_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_filesystem_error_after_visible_output_still_taints_and_blocks_reply():
+    auth = _untainted_ifc_auth()
+    ctx = _ifc_turn(auth)
+    middleware = BudgetGateMiddleware()
+
+    async def partial(req: ToolCallRequest) -> ToolMessage:
+        return ToolMessage(
+            content="visible file output before I/O failure",
+            tool_call_id=req.tool_call["id"],
+            status="error",
+        )
+
+    async def send(req: ToolCallRequest) -> ToolMessage:
+        return ToolMessage(content="sent", tool_call_id=req.tool_call["id"])
+
+    token = set_current_turn(ctx)
+    try:
+        await middleware.awrap_tool_call(
+            _make_request(
+                "read_file", "partial-file", auth, {"file_path": "/external.txt"},
+            ),
+            partial,
+        )
+        reply = await middleware.awrap_tool_call(
+            _make_request("send_message", "reply", auth, {"channel_id": "ch-1"}), send,
+        )
+    finally:
+        reset_current_turn(token)
+
+    filesystem = [source for source in ctx.ifc_labels.sources if source.domain == "filesystem"]
+    assert len(filesystem) == 1
+    assert filesystem[0].is_complete is False
+    assert reply.status == "error"
+    assert "ifc_label_blocked:same_channel" in str(reply.content)
+
+
+@pytest.mark.asyncio
+async def test_read_refusal_followed_by_visible_output_still_taints_and_blocks_reply(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from dataclasses import replace
+
+    from mimir.readonly_backend import _RootAwareFilesystemBackend
+
+    home = tmp_path / "home"
+    (home / "logs").mkdir(parents=True)
+    (home / "logs" / "private.txt").write_text("private\n", encoding="utf-8")
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    auth = _untainted_ifc_auth(roles=("user",))
+    shadow_auth = replace(auth, enforcement_enabled=False)
+    ctx = _ifc_turn(auth)
+    middleware = BudgetGateMiddleware()
+    backend = _RootAwareFilesystemBackend(root_dir=home, virtual_mode=True)
+
+    async def partial(req: ToolCallRequest) -> ToolMessage:
+        refusal = await backend.aread("/logs/private.txt")
+        return ToolMessage(
+            content=f"Error: {refusal.error}\nvisible output from later execution",
+            tool_call_id=req.tool_call["id"],
+            status="error",
+        )
+
+    async def send(req: ToolCallRequest) -> ToolMessage:
+        return ToolMessage(content="sent", tool_call_id=req.tool_call["id"])
+
+    token = set_current_turn(ctx)
+    try:
+        await middleware.awrap_tool_call(
+            _make_request(
+                "read_file", "partial-after-refusal", shadow_auth,
+                {"file_path": "/logs/private.txt"},
+            ),
+            partial,
+        )
+        reply = await middleware.awrap_tool_call(
+            _make_request("send_message", "reply", auth, {"channel_id": "ch-1"}), send,
+        )
+    finally:
+        reset_current_turn(token)
+
+    filesystem = [source for source in ctx.ifc_labels.sources if source.domain == "filesystem"]
+    assert len(filesystem) == 1
+    assert filesystem[0].is_complete is False
+    assert reply.status == "error"
+    assert "ifc_label_blocked:same_channel" in str(reply.content)
+
+
+@pytest.mark.asyncio
+async def test_read_refusal_with_artifact_provenance_still_gates_reply(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from dataclasses import replace
+
+    from mimir.access_control import ProtectedResultProvenance
+    from mimir.readonly_backend import _RootAwareFilesystemBackend
+
+    home = tmp_path / "home"
+    (home / "logs").mkdir(parents=True)
+    (home / "logs" / "private.txt").write_text("private\n", encoding="utf-8")
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    auth = _untainted_ifc_auth(roles=("user",))
+    shadow_auth = replace(auth, enforcement_enabled=False)
+    ctx = _ifc_turn(auth)
+    middleware = BudgetGateMiddleware()
+    backend = _RootAwareFilesystemBackend(root_dir=home, virtual_mode=True)
+    artifact_source = SourceLabel(
+        principal="other-user",
+        domain="filesystem",
+        resource_id=str(tmp_path / "exposed.txt"),
+        bridge_instance="filesystem",
+        sensitivity="internal",
+        authorized_principals=frozenset({"other-user"}),
+        source_kind="protected_tool",
+        integrity="untrusted",
+        integrity_effect="active_ingest",
+    )
+
+    async def refused_with_artifact(req: ToolCallRequest) -> ToolMessage:
+        refusal = await backend.aread("/logs/private.txt")
+        return ToolMessage(
+            content=f"Error: {refusal.error}",
+            artifact=ProtectedResultProvenance((artifact_source,)),
+            tool_call_id=req.tool_call["id"],
+            status="error",
+        )
+
+    async def send(req: ToolCallRequest) -> ToolMessage:
+        return ToolMessage(content="sent", tool_call_id=req.tool_call["id"])
+
+    token = set_current_turn(ctx)
+    try:
+        await middleware.awrap_tool_call(
+            _make_request(
+                "read_file", "refusal-with-artifact", shadow_auth,
+                {"file_path": "/logs/private.txt"},
+            ),
+            refused_with_artifact,
+        )
+        reply = await middleware.awrap_tool_call(
+            _make_request("send_message", "reply", auth, {"channel_id": "ch-1"}), send,
+        )
+    finally:
+        reset_current_turn(token)
+
+    filesystem = [source for source in ctx.ifc_labels.sources if source.domain == "filesystem"]
+    assert len(filesystem) == 1
+    assert filesystem[0].is_complete is False
+    assert reply.status == "error"
+    assert "ifc_label_blocked:same_channel" in str(reply.content)
 
 
 @pytest.mark.asyncio
@@ -3326,6 +3675,186 @@ async def test_middleware_emits_tool_call_events_for_success_and_error(
     assert "private content" not in str(tool_errors[0])
 
 
+@pytest.mark.asyncio
+async def test_middleware_records_raised_returned_and_typed_failures(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: list[tuple[str, dict[str, Any]]] = []
+
+    async def _capture(kind: str, **kw: Any) -> None:
+        captured.append((kind, kw))
+
+    monkeypatch.setattr("mimir.event_logger.log_event", _capture)
+    mw = BudgetGateMiddleware()
+
+    async def raised_handler(req: ToolCallRequest) -> ToolMessage:
+        raise RuntimeError("raised failure")
+
+    async def returned_handler(req: ToolCallRequest) -> ToolMessage:
+        return ToolMessage(
+            content="memory_query failed: returned failure",
+            tool_call_id=req.tool_call["id"],
+            name=req.tool_call["name"],
+        )
+
+    async def success_handler(req: ToolCallRequest) -> ToolMessage:
+        return ToolMessage(
+            content="memory query complete",
+            tool_call_id=req.tool_call["id"],
+            name=req.tool_call["name"],
+        )
+
+    async def typed_handler(req: ToolCallRequest) -> ToolMessage:
+        return ToolMessage(
+            content=json.dumps({
+                "ok": False,
+                "code": "tests_failed",
+                "returncode": 1,
+                "stdout": "",
+                "stderr": "failed",
+                "command": ["pytest"],
+                "command_source": "deployment",
+                "output_limited": False,
+                "stdout_dropped_bytes": 0,
+                "stderr_dropped_bytes": 0,
+                "git_context": "clean",
+            }),
+            tool_call_id=req.tool_call["id"],
+            name=req.tool_call["name"],
+        )
+
+    async def git_handler(req: ToolCallRequest) -> ToolMessage:
+        return ToolMessage(
+            content=json.dumps({
+                "ok": False,
+                "code": "git_failed",
+                "stdout": "",
+                "stderr": "fatal",
+            }),
+            tool_call_id=req.tool_call["id"],
+            name=req.tool_call["name"],
+        )
+
+    async def arbitrary_dict_handler(req: ToolCallRequest) -> ToolMessage:
+        return ToolMessage(
+            content=json.dumps({"ok": False, "code": "not-a-declared-contract"}),
+            tool_call_id=req.tool_call["id"],
+            name=req.tool_call["name"],
+        )
+
+    async def missing_executable_handler(req: ToolCallRequest) -> ToolMessage:
+        return ToolMessage(
+            content="shell_exec failed: executable 'missing' not found",
+            tool_call_id=req.tool_call["id"],
+            name=req.tool_call["name"],
+        )
+
+    ctx = _make_ctx(budget=10)
+    token = set_current_turn(ctx)
+    try:
+        with pytest.raises(RuntimeError, match="raised failure"):
+            await mw.awrap_tool_call(
+                _make_request("memory_query", "id-raised"), raised_handler,
+            )
+        await mw.awrap_tool_call(
+            _make_request("memory_query", "id-returned"), returned_handler,
+        )
+        await mw.awrap_tool_call(
+            _make_request("memory_query", "id-success"), success_handler,
+        )
+        await mw.awrap_tool_call(
+            _make_request("repo_test", "id-typed"), typed_handler,
+        )
+        await mw.awrap_tool_call(
+            _make_request("repo_status", "id-git"), git_handler,
+        )
+        await mw.awrap_tool_call(
+            _make_request("memory_query", "id-arbitrary"), arbitrary_dict_handler,
+        )
+        await mw.awrap_tool_call(
+            _make_request(
+                "shell_exec", "id-missing", args={"command": "missing --version"},
+            ),
+            missing_executable_handler,
+        )
+    finally:
+        reset_current_turn(token)
+
+    await asyncio.sleep(0)
+    tool_calls = [kw for kind, kw in captured if kind == "tool_call"]
+    tool_errors = [kw for kind, kw in captured if kind == "tool_error"]
+    assert [event["ok"] for event in tool_calls] == [
+        False, False, True, False, False, True, False,
+    ]
+    assert [event["tool"] for event in tool_errors] == [
+        "memory_query", "memory_query", "repo_test", "repo_status", "shell_exec",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_shell_exec_timeout_event_contains_redacted_bounded_command(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from mimir.tools.extra import shell_exec
+
+    captured: list[tuple[str, dict[str, Any]]] = []
+    secret = "ghp_" + "a" * 36
+    command = f"curl https://example.invalid/?token={secret} " + "x" * 300
+
+    async def _capture(kind: str, **kw: Any) -> None:
+        captured.append((kind, kw))
+
+    def _timeout(*args: Any, **kwargs: Any) -> None:
+        raise subprocess.TimeoutExpired(cmd="bash", timeout=900)
+
+    monkeypatch.setattr("mimir.event_logger.log_event", _capture)
+    monkeypatch.setattr("mimir.tools.extra.subprocess.run", _timeout)
+    mw = BudgetGateMiddleware()
+
+    async def handler(req: ToolCallRequest) -> ToolMessage:
+        content = shell_exec.invoke(req.tool_call["args"])
+        return ToolMessage(
+            content=content,
+            tool_call_id=req.tool_call["id"],
+            name=req.tool_call["name"],
+        )
+
+    ctx = _make_ctx(budget=5)
+    token = set_current_turn(ctx)
+    try:
+        await mw.awrap_tool_call(
+            _make_request("shell_exec", "id-timeout", args={"command": command}),
+            handler,
+        )
+    finally:
+        reset_current_turn(token)
+
+    await asyncio.sleep(0)
+    tool_call = next(kw for kind, kw in captured if kind == "tool_call")
+    tool_error = next(kw for kind, kw in captured if kind == "tool_error")
+    assert tool_call["ok"] is False
+    assert tool_call["arguments"]["command"].startswith(
+        "curl https://example.invalid/?token=[REDACTED]",
+    )
+    assert len(tool_call["arguments"]["command"]) == 200
+    assert secret not in str(tool_call)
+    assert tool_error["arguments"] == tool_call["arguments"]
+
+
+def test_shell_command_event_redacts_bare_xapp_credential() -> None:
+    from mimir.tools.budget_gate import _tool_event_arguments
+
+    secret = "xapp-1-A0LEAKPROBE1234567890abc"
+    arguments = _tool_event_arguments({
+        "command": f'curl -H "X-App: {secret}" https://example.invalid/',
+    })
+
+    assert arguments["command"] == (
+        'curl -H "X-App: [REDACTED]" https://example.invalid/'
+    )
+    assert secret not in str(arguments)
+
+
 def test_failed_tool_events_keep_error_head_and_tail_within_existing_limit(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -3459,8 +3988,11 @@ async def test_middleware_emits_tool_error_for_budget_denial(
 
 
 @pytest.mark.asyncio
-async def test_tool_refusal_is_a_result_and_next_tool_call_can_run() -> None:
+async def test_tool_refusal_is_a_result_and_next_tool_call_can_run(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     from mimir.tools.refusals import ToolPolicyRefusal
+    from mimir.tools import budget_gate as budget_gate_module
 
     middleware = BudgetGateMiddleware()
     calls: list[str] = []
@@ -3490,11 +4022,42 @@ async def test_tool_refusal_is_a_result_and_next_tool_call_can_run() -> None:
         repo_pr_action_scope=scope,
     )
     ctx = _ifc_turn(auth)
+    repo_checkout_failures: list[bool] = []
+    repo_classification_failures: list[bool] = []
+    repo_events: list[bool] = []
+
+    original_record_checkout = budget_gate_module._record_repo_review_checkout
+    original_result_labels = budget_gate_module._result_labels_for_call
+    original_emit_tool_call = budget_gate_module._emit_tool_call_sync
+
+    def record_checkout(request, auth_context, *, failed):
+        if request.tool_call["name"] == "repo_push":
+            repo_checkout_failures.append(failed)
+        return original_record_checkout(request, auth_context, failed=failed)
+
+    def record_result_labels(tool_name, *args, failed=False, **kwargs):
+        if tool_name == "repo_push" and (failed or kwargs.get("result") is not None):
+            repo_classification_failures.append(failed)
+        return original_result_labels(tool_name, *args, failed=failed, **kwargs)
+
+    def record_tool_call(tool_name, *, ok, **kwargs):
+        if tool_name == "repo_push":
+            repo_events.append(ok)
+        return original_emit_tool_call(tool_name, ok=ok, **kwargs)
+
+    monkeypatch.setattr(budget_gate_module, "_record_repo_review_checkout", record_checkout)
+    monkeypatch.setattr(budget_gate_module, "_result_labels_for_call", record_result_labels)
+    monkeypatch.setattr(budget_gate_module, "_emit_tool_call_sync", record_tool_call)
 
     async def handler(request: ToolCallRequest) -> ToolMessage:
         calls.append(request.tool_call["id"])
         if request.tool_call["id"] == "refused":
             raise ToolPolicyRefusal("pull-request operation rejected: repo.inspect not granted")
+        if request.tool_call["id"] == "stale":
+            raise ToolException(
+                "repository operation rejected (repository_git_failed) [stale_scope]: "
+                "local commit remains unpushed in preserved checkout"
+            )
         return ToolMessage(content="adapted", tool_call_id=request.tool_call["id"])
 
     assert ctx.ifc_labels.has_untrusted_active_ingest is False
@@ -3503,6 +4066,14 @@ async def test_tool_refusal_is_a_result_and_next_tool_call_can_run() -> None:
         refusal = await middleware.awrap_tool_call(
             _make_request(
                 "pr_metadata", "refused", auth,
+                {"repository": "owner/repo", "pull_request": 17},
+            ),
+            handler,
+        )
+        assert not auth.ifc_state.current(auth.ifc_labels).sources
+        stale = await middleware.awrap_tool_call(
+            _make_request(
+                "repo_push", "stale", auth,
                 {"repository": "owner/repo", "pull_request": 17},
             ),
             handler,
@@ -3527,11 +4098,17 @@ async def test_tool_refusal_is_a_result_and_next_tool_call_can_run() -> None:
     assert isinstance(refusal, ToolMessage)
     assert refusal.status == "error"
     assert "repo.inspect not granted" in str(refusal.content)
+    assert isinstance(stale, ToolMessage)
+    assert stale.status == "error"
+    assert "remains unpushed in preserved checkout" in str(stale.content)
     assert adapted.content == "adapted"
     assert unsupported.content == "adapted"
-    assert calls == ["refused", "adapted", "unsupported"]
-    assert ctx.ifc_labels.has_untrusted_active_ingest is False
-    assert ctx.tool_call_count == 3
+    assert calls == ["refused", "stale", "adapted", "unsupported"]
+    assert ctx.ifc_labels.has_untrusted_active_ingest is True
+    source = next(iter(ctx.ifc_labels.sources))
+    assert source.domain == "repository"
+    assert source.resource_id == f"owner/repo#pull/17@{'a' * 40}"
+    assert ctx.tool_call_count == 4
     assert ctx.hard_boundary_denials == [
         {
             "tool": "pr_metadata",
@@ -3545,6 +4122,9 @@ async def test_tool_refusal_is_a_result_and_next_tool_call_can_run() -> None:
         },
     ]
     assert ctx.remediation_effects == ["repo_push"]
+    assert repo_checkout_failures == [True, False]
+    assert repo_classification_failures == [True, False]
+    assert repo_events == [False, True]
 
 
 @pytest.mark.asyncio
@@ -3631,6 +4211,7 @@ async def test_real_repo_test_policy_refusal_does_not_taint_turn(
             ),
             handler,
         )
+        assert not auth.ifc_state.current(auth.ifc_labels).sources
         adapted = await middleware.awrap_tool_call(
             _make_request("shell_exec", "adapted", auth, {"command": "pwd"}),
             handler,
@@ -3645,9 +4226,13 @@ async def test_real_repo_test_policy_refusal_does_not_taint_turn(
     assert ctx.ifc_labels.has_untrusted_active_ingest is False
 
 
-@pytest.mark.asyncio
-async def test_real_repo_execution_fault_taints_turn(
+@pytest.mark.parametrize(
+    "refusal_code",
+    ("stale_scope", "base_advanced", "base_history_rewritten"),
+)
+def test_real_repo_execution_fault_taints_turn(
     monkeypatch: pytest.MonkeyPatch,
+    refusal_code: str,
 ) -> None:
     from dataclasses import replace
 
@@ -3683,13 +4268,17 @@ async def test_real_repo_execution_fault_taints_turn(
     class FailingRepoGitTools:
         def __init__(self, state, *, enforce=True):  # type: ignore[no-untyped-def]
             self.state = state
+            self.execution_started = False
 
         def execute(self, operation):  # type: ignore[no-untyped-def]
-            raise GitRefusal("git_failed", "git exited 128 after execution started")
+            raise GitRefusal(
+                refusal_code,
+                "remote ref changed after fetch",
+            )
 
     monkeypatch.setattr("mimir.tools.repo.RepoGitTools", FailingRepoGitTools)
 
-    async def handler(request: ToolCallRequest) -> ToolMessage:
+    def handler(request: ToolCallRequest) -> ToolMessage:
         repo_fetch.func(
             repository="owner/repo",
             pull_request=17,
@@ -3700,7 +4289,7 @@ async def test_real_repo_execution_fault_taints_turn(
     assert ctx.ifc_labels.has_untrusted_active_ingest is False
     token = set_current_turn(ctx)
     try:
-        result = await middleware.awrap_tool_call(
+        result = middleware.wrap_tool_call(
             _make_request(
                 "repo_fetch", "repo-fault", auth,
                 {"repository": "owner/repo", "pull_request": 17},
@@ -3714,6 +4303,150 @@ async def test_real_repo_execution_fault_taints_turn(
     assert result.status == "error"
     assert "repository operation rejected (repository_git_failed)" in str(result.content)
     assert ctx.ifc_labels.has_untrusted_active_ingest is True
+    assert auth.ifc_state.current(auth.ifc_labels).sources
+
+
+def test_repo_checkout_post_fetch_failure_taints_turn(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from dataclasses import replace
+
+    from mimir.tools.repo import repo_checkout
+
+    middleware = BudgetGateMiddleware()
+    scope = RepoPRActionScope(
+        provenance="poller_payload",
+        canonical_repo="owner/repo",
+        canonical_root="/srv/repo",
+        canonical_origin="https://github.com/owner/repo.git",
+        principal="mimir-bot",
+        event_type="pr_changes_requested_stale",
+        allowed_operations=frozenset(action.value for action in RepoPRAction),
+        pr_number=17,
+        head_repo="owner/repo",
+        head_remote="origin",
+        destination_ref="refs/heads/fix",
+        observed_head_sha="a" * 40,
+        base_ref="main",
+        observed_base_sha="b" * 40,
+    )
+    state = RepoReviewState(scope)
+    auth = replace(
+        _untainted_ifc_auth(),
+        repo_pr_scope_registry=RepoPRScopeRegistry((state,)),
+        repo_review_state=state,
+        repo_pr_action_scope=scope,
+    )
+    ctx = _ifc_turn(auth)
+    monkeypatch.setattr(
+        "mimir.tools.forge.remediation_checkout_preflight",
+        lambda *_args: (state, None),
+    )
+    monkeypatch.setattr(
+        "mimir.tools.repo.acquire_pr_checkout_lease",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            RuntimeError("git fetch failed after contacting origin")
+        ),
+    )
+
+    def handler(request: ToolCallRequest) -> ToolMessage:
+        repo_checkout.func(
+            repository="owner/repo",
+            pull_request=17,
+            runtime=Runtime(context=auth),
+        )
+        raise AssertionError("repo_checkout should have raised")
+
+    token = set_current_turn(ctx)
+    try:
+        result = middleware.wrap_tool_call(
+            _make_request(
+                "repo_checkout", "checkout-fault", auth,
+                {"repository": "owner/repo", "pull_request": 17},
+            ),
+            handler,
+        )
+    finally:
+        reset_current_turn(token)
+
+    assert isinstance(result, ToolMessage)
+    assert result.status == "error"
+    assert auth.ifc_state.current(auth.ifc_labels).sources
+
+
+def test_repo_test_post_execution_permission_failure_taints_turn(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from dataclasses import replace
+
+    from mimir.project_tests import ProjectTestRefusal
+    from mimir.tools import repo as repo_module
+
+    middleware = BudgetGateMiddleware()
+    scope = RepoPRActionScope(
+        provenance="poller_payload",
+        canonical_repo="owner/repo",
+        canonical_root="/srv/repo",
+        canonical_origin="https://github.com/owner/repo.git",
+        principal="mimir-bot",
+        event_type="pr_changes_requested_stale",
+        allowed_operations=frozenset(action.value for action in RepoPRAction),
+        pr_number=17,
+        head_repo="owner/repo",
+        head_remote="origin",
+        destination_ref="refs/heads/fix",
+        observed_head_sha="a" * 40,
+        base_ref="main",
+        observed_base_sha="b" * 40,
+    )
+    state = RepoReviewState(scope)
+    auth = replace(
+        _untainted_ifc_auth(),
+        repo_pr_scope_registry=RepoPRScopeRegistry((state,)),
+        repo_review_state=state,
+        repo_pr_action_scope=scope,
+    )
+    ctx = _ifc_turn(auth)
+    monkeypatch.setattr(repo_module, "_state", lambda *_args: state)
+
+    class FailingProjectTests:
+        def __init__(self, review_state):  # type: ignore[no-untyped-def]
+            self.review_state = review_state
+
+        async def execute(self, selectors):  # type: ignore[no-untyped-def]
+            raise ProjectTestRefusal(
+                "test_path_permission_denied",
+                "path_mode=0o700 path_uid=1000 path_gid=1000",
+            )
+
+    monkeypatch.setattr(repo_module, "RepoProjectTests", FailingProjectTests)
+
+    def handler(request: ToolCallRequest) -> ToolMessage:
+        asyncio.run(
+            repo_module.repo_test.coroutine(
+                repository="owner/repo",
+                pull_request=17,
+                runtime=Runtime(context=auth),
+            )
+        )
+        raise AssertionError("repo_test should have raised")
+
+    token = set_current_turn(ctx)
+    try:
+        result = middleware.wrap_tool_call(
+            _make_request(
+                "repo_test", "test-fault", auth,
+                {"repository": "owner/repo", "pull_request": 17},
+            ),
+            handler,
+        )
+    finally:
+        reset_current_turn(token)
+
+    assert isinstance(result, ToolMessage)
+    assert result.status == "error"
+    assert "test_path_permission_denied" in str(result.content)
+    assert auth.ifc_state.current(auth.ifc_labels).sources
 
 
 @pytest.mark.asyncio

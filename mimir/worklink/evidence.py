@@ -15,7 +15,13 @@ from typing import Callable, Protocol, Sequence
 import xml.etree.ElementTree as ET
 
 from ..redaction import redact_text
-from .compute import ComputeBackend, ComputeResult, LaunchHandle, WorkSpec
+from .compute import (
+    ComputeBackend,
+    ComputeResult,
+    LaunchHandle,
+    WorkSpec,
+    with_worker_environment,
+)
 from .dispatch_failures import terminal_error
 
 
@@ -405,21 +411,20 @@ async def _run_compute_gate(
     on_launch: Callable[[LaunchHandle], None] | None = None,
     report_dir: Path | None = None,
 ) -> ComputeResult:
-    env = dict(work_spec.env)
-    if report_dir is not None:
-        env.update(
-            pytest_report_environment(
-                command,
-                report_dir,
-                existing=env.get("PYTEST_ADDOPTS"),
-            )
-        )
     gate_spec = replace(
         work_spec,
         local_checkout=checkout,
         local_argv=("/bin/sh", "-c", command),
-        env=env,
     )
+    if report_dir is not None:
+        gate_spec = with_worker_environment(
+            gate_spec,
+            pytest_report_environment(
+                command,
+                report_dir,
+                existing=gate_spec.env.get("PYTEST_ADDOPTS"),
+            ),
+        )
     handle = await compute.launch(gate_spec)
     try:
         if on_launch is not None:

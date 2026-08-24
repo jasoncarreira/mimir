@@ -6,10 +6,13 @@ import asyncio
 import json as _json
 import shutil
 from datetime import datetime, timezone
+from unittest import mock
 from pathlib import Path
 
 import pytest
 import yaml
+from apscheduler.events import EVENT_JOB_ERROR, EVENT_JOB_MISSED
+from apscheduler.triggers.date import DateTrigger
 
 from mimir.event_logger import init_logger
 from mimir.access_control import (
@@ -53,7 +56,8 @@ def test_job_yaml_round_trip(tmp_path: Path):
     assert parsed[0]["cron"] == "0 8 * * *"
     assert parsed[1]["time_of_day"] == "07:30"
 
-    reloaded = load_jobs(path)
+    reloaded, rejections = load_jobs(path)
+    assert rejections == []
     assert len(reloaded) == 2
     assert reloaded[0].cron == "0 8 * * *"
     assert reloaded[1].time_of_day == "07:30"
@@ -72,12 +76,35 @@ def test_load_jobs_skips_invalid_entries(tmp_path: Path):
             ]
         )
     )
-    jobs = load_jobs(path)
+    jobs, rejections = load_jobs(path)
     assert [j.name for j in jobs] == ["good"]
+    assert len(rejections) == 3
 
 
 def test_load_jobs_handles_missing_file(tmp_path: Path):
-    assert load_jobs(tmp_path / "nope.yaml") == []
+    assert load_jobs(tmp_path / "nope.yaml") == ([], [])
+
+
+def test_load_jobs_reports_missing_shell_binary_but_keeps_job(tmp_path: Path):
+    path = tmp_path / "scheduler.yaml"
+    missing = tmp_path / "worklink-image-only-cli"
+    path.write_text(yaml.safe_dump([{
+        "name": "heartbeat",
+        "prompt": "continue",
+        "cron": "* * * * *",
+        "shell_commands": [{
+            "exec": "worklink-image-only-cli",
+            "path": str(missing),
+            "subcommands": [["check"]],
+        }],
+    }]))
+
+    jobs, rejections = load_jobs(path)
+
+    assert [job.name for job in jobs] == ["heartbeat"]
+    assert len(rejections) == 1
+    assert rejections[0]["job"] == "heartbeat"
+    assert rejections[0]["reason"].endswith(f"path does not exist: {missing}")
 
 
 def test_scheduler_job_authority_profile_round_trip_and_unknown_rejected(
@@ -91,7 +118,8 @@ def test_scheduler_job_authority_profile_round_trip_and_unknown_rejected(
         authority_profile="heartbeat",
     )])
 
-    [job] = load_jobs(path)
+    [job], rejections = load_jobs(path)
+    assert rejections == []
     assert job.authority_profile == "heartbeat"
     assert job.cron == "0 * * * *"
 
@@ -102,7 +130,9 @@ def test_scheduler_job_authority_profile_round_trip_and_unknown_rejected(
         "authority_profile": "heartbeet",
     }]))
     with caplog.at_level("WARNING", logger="mimir.scheduler"):
-        assert load_jobs(path) == []
+        jobs, rejections = load_jobs(path)
+        assert jobs == []
+        assert len(rejections) == 1
     assert "unknown authority_profile 'heartbeet'" in caplog.text
 
 
@@ -117,7 +147,8 @@ def test_load_jobs_warns_when_heartbeat_omits_authority_profile(
     }]))
 
     with caplog.at_level("WARNING", logger="mimir.scheduler"):
-        [job] = load_jobs(path)
+        [job], rejections = load_jobs(path)
+        assert rejections == []
 
     assert job.name == "heartbeat"
     assert job.authority_profile is None
@@ -126,6 +157,58 @@ def test_load_jobs_warns_when_heartbeat_omits_authority_profile(
         "with the shared scheduled_tick authority"
     ) in caplog.text
     assert "authority_profile: heartbeat" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_scheduler_reload_reports_every_rejected_yaml_entry(tmp_path: Path):
+    from unittest.mock import patch
+
+    path = tmp_path / "scheduler.yaml"
+    path.write_text(yaml.safe_dump([
+        {"name": "valid", "prompt": "run", "cron": "0 8 * * *"},
+        {"prompt": "unnamed", "cron": "0 9 * * *"},
+        {
+            "name": "bad-kind",
+            "prompt": "ambiguous",
+            "callable": "also-set",
+            "cron": "0 10 * * *",
+        },
+        {
+            "name": "bad-authority",
+            "prompt": "run",
+            "cron": "0 11 * * *",
+            "authority_profile": "unknown",
+        },
+        {
+            "name": "bad-shell",
+            "prompt": "run",
+            "cron": "0 12 * * *",
+            "shell_commands": {},
+        },
+    ]), encoding="utf-8")
+
+    async def noop(_event):
+        return True
+
+    captured: list[tuple[str, dict]] = []
+
+    async def fake_log_event(event_type: str, **payload):
+        captured.append((event_type, payload))
+
+    sched = Scheduler(scheduler_yaml=path, enqueue=noop, home=tmp_path)
+    with patch("mimir.scheduler.log_event", new=fake_log_event):
+        stats = sched.reload()
+        await asyncio.sleep(0)
+
+    rejected = [payload for kind, payload in captured if kind == "scheduler_job_rejected"]
+    assert stats == {"registered": 1, "invalid": 4}
+    assert len(rejected) == 4
+    assert {item["job"] for item in rejected} == {
+        "entry[1]", "bad-kind", "bad-authority", "bad-shell",
+    }
+    assert all(item["path"] == str(path) and item["reason"] for item in rejected)
+    assert sched._scheduler.get_job("scheduler:valid") is not None
+    assert sched._scheduler.get_job("scheduler:bad-shell") is None
 
 
 def test_scheduler_channel_id_synthetic_for_global():
@@ -247,7 +330,12 @@ async def test_fire_enqueues_scheduled_tick_event(tmp_path: Path):
     sched = Scheduler(
         scheduler_yaml=tmp_path / "s.yaml", enqueue=fake_enqueue, home=tmp_path,
     )
-    job = SchedulerJob(name="morning", prompt="review extended memory", cron="0 8 * * *")
+    job = SchedulerJob(
+        name="morning",
+        prompt="review extended memory",
+        cron="0 8 * * *",
+        deliver="slack-ops",
+    )
     await sched._fire(job=job)
 
     assert len(enqueued) == 1
@@ -262,6 +350,7 @@ async def test_fire_enqueues_scheduled_tick_event(tmp_path: Path):
     assert scheduled_tick is not None
     assert set(e.service_authority.capabilities) == set(scheduled_tick.capabilities)
     assert e.service_authority.channel_memory_directory == "scheduler:morning"
+    assert e.service_authority.configured_delivery_channel == "slack-ops"
     assert str((tmp_path / "scripts").resolve()) in e.service_authority.filesystem_read_roots
 
 
@@ -1330,6 +1419,112 @@ def test_reload_re_resolves_registered_callables(tmp_path: Path):
     assert "hour='6'" in str(job_after.trigger)
 
 
+@pytest.mark.asyncio
+async def test_reload_invalid_callable_cron_preserves_job_and_emits_event(
+    tmp_path: Path,
+):
+    """A bad operator edit keeps the callable's last-known-good trigger."""
+    from unittest.mock import patch
+
+    yaml_path = tmp_path / "s.yaml"
+
+    async def noop(_e):
+        return True
+
+    async def _fn():
+        return None
+
+    sched = Scheduler(scheduler_yaml=yaml_path, enqueue=noop)
+    sched.register_callable("demo", _fn, default_cron="0 4 * * *")
+    job_before = sched._scheduler.get_job("demo")
+    trigger_before = job_before.trigger
+
+    yaml_path.write_text(
+        "- name: broken-demo\n"
+        "  callable: demo\n"
+        '  cron: "0 25 * * *"\n',
+        encoding="utf-8",
+    )
+    captured: list[tuple[str, dict]] = []
+
+    async def fake_log_event(event_type: str, **kwargs):
+        captured.append((event_type, kwargs))
+
+    with patch("mimir.scheduler.log_event", new=fake_log_event):
+        sched.reload()
+        await asyncio.sleep(0)
+
+    job_after = sched._scheduler.get_job("demo")
+    assert job_after is job_before
+    assert job_after.trigger is trigger_before
+    invalid_cron = [item for item in captured if item[0] == "scheduler_invalid_cron"]
+    rejected = [item for item in captured if item[0] == "scheduler_job_rejected"]
+    assert len(invalid_cron) == 1
+    assert invalid_cron[0][1]["job"] == "demo"
+    assert "0 25 * * *" in invalid_cron[0][1]["error"]
+    assert len(rejected) == 1
+    assert rejected[0][1]["job"] == "broken-demo"
+
+
+def test_reload_valid_callable_is_idempotent(tmp_path: Path):
+    yaml_path = tmp_path / "s.yaml"
+    yaml_path.write_text(
+        "- name: demo-entry\n"
+        "  callable: demo\n"
+        '  cron: "15 6 * * *"\n',
+        encoding="utf-8",
+    )
+
+    async def noop(_e):
+        return True
+
+    async def _fn():
+        return None
+
+    sched = Scheduler(scheduler_yaml=yaml_path, enqueue=noop)
+    sched.register_callable("demo", _fn, default_cron="0 4 * * *")
+
+    sched.reload()
+    sched.reload()
+
+    jobs = [job for job in sched._scheduler.get_jobs() if job.id == "demo"]
+    assert len(jobs) == 1
+    assert "minute='15'" in str(jobs[0].trigger)
+    assert "hour='6'" in str(jobs[0].trigger)
+
+
+def test_reload_invalid_prompt_cron_preserves_existing_job(tmp_path: Path):
+    """Prompt jobs use the same validate-before-remove ordering."""
+    yaml_path = tmp_path / "s.yaml"
+    yaml_path.write_text(
+        "- name: morning\n"
+        "  prompt: review\n"
+        '  cron: "0 8 * * *"\n',
+        encoding="utf-8",
+    )
+
+    async def noop(_e):
+        return True
+
+    sched = Scheduler(scheduler_yaml=yaml_path, enqueue=noop)
+    sched.reload()
+    job_before = sched._scheduler.get_job("scheduler:morning")
+    trigger_before = job_before.trigger
+
+    yaml_path.write_text(
+        "- name: morning\n"
+        "  prompt: review\n"
+        '  cron: "0 25 * * *"\n',
+        encoding="utf-8",
+    )
+    stats = sched.reload()
+
+    job_after = sched._scheduler.get_job("scheduler:morning")
+    assert stats == {"registered": 0, "invalid": 1}
+    assert job_after is job_before
+    assert job_after.trigger is trigger_before
+
+
 def test_reload_warns_on_unregistered_callable(tmp_path: Path, caplog):
     """A yaml entry naming an unregistered callable is warn-skipped,
     not an error."""
@@ -1347,7 +1542,7 @@ def test_reload_warns_on_unregistered_callable(tmp_path: Path, caplog):
     import logging
     with caplog.at_level(logging.WARNING):
         result = sched.reload()
-    assert result == {"registered": 0, "invalid": 0}
+    assert result == {"registered": 0, "invalid": 1}
     # The log should mention the unregistered callable.
     assert any("never-registered" in r.message for r in caplog.records)
 
@@ -1486,6 +1681,70 @@ async def test_add_poller_jobs_registers_apscheduler_jobs(tmp_path: Path):
     assert sched.registered_pollers() == ["p1", "p2"]
     assert sched._scheduler.get_job("poller:p1") is not None
     assert sched._scheduler.get_job("poller:p2") is not None
+
+
+@pytest.mark.asyncio
+async def test_add_poller_jobs_reports_each_rejected_manifest_entry(tmp_path: Path):
+    from unittest.mock import patch
+
+    skills = tmp_path / "skills"
+    skill = skills / "mixed"
+    skill.mkdir(parents=True)
+    manifest = skill / "pollers.json"
+    manifest.write_text(_json.dumps({"pollers": [
+        {"name": "valid", "command": "true", "cron": "* * * * *"},
+        {"name": "../bad", "command": "true", "cron": "* * * * *"},
+        {"name": "valid", "command": "true", "cron": "* * * * *"},
+        {"name": "missing-command", "cron": "* * * * *"},
+        {
+            "name": "bad-authority",
+            "command": "true",
+            "cron": "* * * * *",
+            "capabilities": ["shell_exec"],
+        },
+        {
+            "name": "uncapped",
+            "command": "true",
+            "cron": "* * * * *",
+            "budget": {"windows": {"24h": {"max_agent_turns": "many"}}},
+        },
+    ]}), encoding="utf-8")
+
+    async def noop(_event):
+        return True
+
+    captured: list[tuple[str, dict]] = []
+
+    async def fake_log_event(event_type: str, **payload):
+        captured.append((event_type, payload))
+
+    sched = Scheduler(scheduler_yaml=tmp_path / "scheduler.yaml", enqueue=noop)
+    with patch("mimir.scheduler.log_event", new=fake_log_event):
+        installed = sched.add_poller_jobs(skills)
+        await asyncio.sleep(0)
+
+    rejected = [
+        payload for kind, payload in captured
+        if kind == "poller_reload_invalid_entry"
+    ]
+    assert installed == 2
+    assert sched.registered_pollers() == ["uncapped", "valid"]
+    assert len(rejected) == 5
+    assert {item["poller"] for item in rejected} == {
+        "../bad", "valid", "missing-command", "bad-authority", "uncapped",
+    }
+    assert all(
+        item["manifest_path"] == str(manifest) and item["reason"]
+        for item in rejected
+    )
+    uncapped = next(
+        item for item in sched.registered_poller_details()
+        if item["name"] == "uncapped"
+    )
+    assert "budget" not in uncapped
+    assert "budget" in next(
+        item["reason"] for item in rejected if item["poller"] == "uncapped"
+    )
 
 
 @pytest.mark.asyncio
@@ -1830,6 +2089,154 @@ async def test_on_job_missed_emits_scheduled_job_misfired_for_other_jobs(
     assert event_type == "scheduled_job_misfired"
 
 
+def test_scheduler_registers_separate_missed_and_error_listeners(tmp_path: Path):
+    async def noop(_e):
+        return True
+
+    sched = Scheduler(scheduler_yaml=tmp_path / "s.yaml", enqueue=noop)
+    listeners = sched._scheduler._listeners
+
+    assert (sched._on_job_missed, EVENT_JOB_MISSED) in listeners
+    assert (sched._on_job_error, EVENT_JOB_ERROR) in listeners
+
+
+@pytest.mark.asyncio
+async def test_raising_job_emits_durable_error_event(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("MIMIR_LOOP_STALL_ALERT_SECONDS", "0")
+
+    async def noop(_e):
+        return True
+
+    async def raises() -> None:
+        raise RuntimeError("cron body exploded")
+
+    sched = Scheduler(scheduler_yaml=tmp_path / "s.yaml", enqueue=noop)
+    sched._scheduler.add_job(
+        raises,
+        trigger=DateTrigger(run_date=datetime.now(tz=timezone.utc)),
+        id="raising-test-job",
+    )
+    sched.start()
+    try:
+        events_path = tmp_path / "logs" / "events.jsonl"
+        for _ in range(200):
+            events = []
+            if events_path.exists():
+                events = [
+                    _json.loads(line)
+                    for line in events_path.read_text(encoding="utf-8").splitlines()
+                    if line.strip()
+                ]
+            failures = [e for e in events if e.get("type") == "scheduled_job_error"]
+            if failures:
+                break
+            await asyncio.sleep(0.01)
+        else:
+            pytest.fail("scheduled_job_error was not written")
+    finally:
+        await sched.stop()
+
+    assert len(failures) == 1
+    assert failures[0]["job_id"] == "raising-test-job"
+    assert failures[0]["exception"] == "RuntimeError('cron body exploded')"
+
+
+@pytest.mark.asyncio
+async def test_job_error_from_executor_thread_uses_sync_event_fallback(tmp_path: Path):
+    from types import SimpleNamespace
+
+    async def noop(_e):
+        return True
+
+    sched = Scheduler(scheduler_yaml=tmp_path / "s.yaml", enqueue=noop)
+    event = SimpleNamespace(
+        job_id="threaded-test-job",
+        exception=ValueError("bad threaded job"),
+    )
+
+    await asyncio.to_thread(sched._on_job_error, event)
+
+    [failure] = [
+        _json.loads(line)
+        for line in (tmp_path / "logs" / "events.jsonl")
+        .read_text(encoding="utf-8")
+        .splitlines()
+        if line.strip()
+    ]
+    assert failure["type"] == "scheduled_job_error"
+    assert failure["job_id"] == "threaded-test-job"
+    assert failure["exception"] == "ValueError('bad threaded job')"
+
+
+def test_job_error_bounds_exception_repr(tmp_path: Path):
+    from types import SimpleNamespace
+    from unittest.mock import patch
+
+    async def noop(_e):
+        return True
+
+    sched = Scheduler(scheduler_yaml=tmp_path / "s.yaml", enqueue=noop)
+    event = SimpleNamespace(
+        job_id="large-error-test-job",
+        exception=RuntimeError("X" * 20_000),
+    )
+
+    with patch("mimir.scheduler.log_event_sync") as log_sync:
+        sched._on_job_error(event)
+
+    log_sync.assert_called_once()
+    event_type, = log_sync.call_args.args
+    exception = log_sync.call_args.kwargs["exception"]
+    assert event_type == "scheduled_job_error"
+    assert len(exception) == 500
+    assert "...[truncated]..." in exception
+    assert exception.startswith("RuntimeError('XXX")
+    assert exception.endswith("XXX')")
+
+
+@pytest.mark.asyncio
+async def test_self_wrapping_job_does_not_emit_generic_error_twice(
+    tmp_path: Path, monkeypatch,
+):
+    from mimir.event_logger import log_event
+
+    monkeypatch.setenv("MIMIR_LOOP_STALL_ALERT_SECONDS", "0")
+    completed = asyncio.Event()
+
+    async def noop(_e):
+        return True
+
+    async def self_wrapping() -> None:
+        try:
+            raise RuntimeError("handled by body")
+        except RuntimeError as exc:
+            await log_event("self_wrapped_job_error", error=repr(exc))
+        finally:
+            completed.set()
+
+    sched = Scheduler(scheduler_yaml=tmp_path / "s.yaml", enqueue=noop)
+    sched._scheduler.add_job(
+        self_wrapping,
+        trigger=DateTrigger(run_date=datetime.now(tz=timezone.utc)),
+        id="self-wrapping-test-job",
+    )
+    sched.start()
+    try:
+        await asyncio.wait_for(completed.wait(), timeout=2)
+        await asyncio.sleep(0.05)
+    finally:
+        await sched.stop()
+
+    events = [
+        _json.loads(line)
+        for line in (tmp_path / "logs" / "events.jsonl")
+        .read_text(encoding="utf-8")
+        .splitlines()
+        if line.strip()
+    ]
+    assert [e["type"] for e in events] == ["self_wrapped_job_error"]
+
+
 @pytest.mark.asyncio
 async def test_fire_poller_serializes_through_semaphore(
     tmp_path: Path, monkeypatch
@@ -1853,7 +2260,7 @@ async def test_fire_poller_serializes_through_semaphore(
     max_in_flight = 0
     lock = asyncio.Lock()
 
-    async def fake_run_poller(poller, enqueue, home=None):
+    async def fake_run_poller(poller, enqueue, home=None, timeout=None):
         assert home is sched._home
         nonlocal in_flight, max_in_flight
         async with lock:
@@ -1898,7 +2305,7 @@ async def test_fire_poller_passes_scheduler_home_to_run_poller(
 
     captured = {}
 
-    async def fake_run_poller(poller, enqueue, home=None):
+    async def fake_run_poller(poller, enqueue, home=None, timeout=None):
         captured["poller"] = poller.name
         captured["home"] = home
 
@@ -1950,7 +2357,7 @@ async def test_fire_poller_resheds_after_acquiring_semaphore(
 
     ran = False
 
-    async def fake_run_poller(poller, enqueue, home=None):
+    async def fake_run_poller(poller, enqueue, home=None, timeout=None):
         nonlocal ran
         ran = True
 
@@ -2499,6 +2906,38 @@ async def test_commitments_due_check_error_includes_traceback(
     assert "boom from test" in evt["traceback"]
 
 
+@pytest.mark.asyncio
+async def test_part_c_nonempty_failed_sweep_emits_rollup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    import json
+    import mimir.commitments.poller as poller_mod
+    from mimir.commitments.poller import DueCheckResult
+
+    events_path = tmp_path / "events.jsonl"
+    init_logger(events_path, session_id="failed-commitment-sweep")
+
+    async def failed_sweep(*args, **kwargs):
+        return DueCheckResult(scanned=2, failed=2)
+
+    monkeypatch.setattr(poller_mod, "check_due_and_expired", failed_sweep)
+
+    async def noop(_event):
+        return True
+
+    sched = Scheduler(scheduler_yaml=tmp_path / "s.yaml", enqueue=noop)
+    sched.add_commitments_due_check_job(object(), "*/5 * * * *")  # type: ignore[arg-type]
+    job = sched._scheduler.get_job("commitments-due-check")
+    assert job is not None
+    await job.func()
+
+    events = [json.loads(line) for line in events_path.read_text().splitlines()]
+    rollups = [e for e in events if e["type"] == "commitments_due_check_ok"]
+    assert len(rollups) == 1
+    assert rollups[0]["scanned"] == 2
+    assert rollups[0]["failed"] == 2
+
+
 # ─── saga_consolidate_error traceback (PR #345 follow-up) ─────────────
 
 
@@ -2600,10 +3039,10 @@ async def test_on_job_missed_task_is_held_in_background_tasks(tmp_path: Path):
 
 
 @pytest.mark.asyncio
-async def test_dispatch_poller_reload_events_task_is_held_in_background_tasks(
+async def test_dispatch_reload_events_task_is_held_in_background_tasks(
     tmp_path: Path,
 ):
-    """_dispatch_poller_reload_events uses _spawn() which holds strong refs
+    """_dispatch_reload_events uses _spawn() which holds strong refs
     for each event task until completion (chainlink #118)."""
     from unittest.mock import patch
 
@@ -2624,7 +3063,7 @@ async def test_dispatch_poller_reload_events_task_is_held_in_background_tasks(
         {"manifest_path": "/b.json", "error": "missing field"},
     ]
     with patch("mimir.scheduler.log_event", new=blocking_log_event):
-        sched._dispatch_poller_reload_events(
+        sched._dispatch_reload_events(
             "poller_reload_invalid_manifest", events,
         )
         # Yield to let tasks start.
@@ -3410,7 +3849,9 @@ def test_bundled_scheduler_template_ships_audit_ticks():
     from mimir.skill_defs import _BUNDLED_SCHEDULER
     import mimir.prompt_templates as pt
 
-    jobs = {j.name: j for j in load_jobs(_BUNDLED_SCHEDULER)}
+    loaded, rejections = load_jobs(_BUNDLED_SCHEDULER)
+    assert rejections == []
+    jobs = {j.name: j for j in loaded}
     for name in ("heartbeat", "reflect", "memory-hygiene", "issues-audit", "commitments-review"):
         assert name in jobs, f"{name} missing from bundled scheduler template"
 
@@ -3437,7 +3878,8 @@ async def test_bundled_scheduler_template_authority_profiles(
 ):
     template_text = bundled_scheduler_template_text()
     with caplog.at_level("WARNING", logger="mimir.scheduler"):
-        jobs = load_jobs_from_text(template_text)
+        jobs, rejections = load_jobs_from_text(template_text)
+        assert rejections == []
     assert "declares no authority_profile" not in caplog.text
 
     enqueued: list[AgentEvent] = []
@@ -3473,7 +3915,8 @@ async def test_bundled_scheduler_template_authority_profiles(
     mutated = yaml.safe_load(template_text)
     heartbeat_entry = next(entry for entry in mutated if entry["name"] == "heartbeat")
     assert heartbeat_entry.pop("authority_profile") == "heartbeat"
-    mutated_jobs = load_jobs_from_text(yaml.safe_dump(mutated))
+    mutated_jobs, rejections = load_jobs_from_text(yaml.safe_dump(mutated))
+    assert rejections == []
     mutated_heartbeat = next(job for job in mutated_jobs if job.name == "heartbeat")
     enqueued.clear()
     await scheduler._fire(job=mutated_heartbeat)
@@ -3567,7 +4010,12 @@ async def test_fire_quota_recovery_enqueues_heartbeat(tmp_path: Path):
     home = tmp_path / "home"
     (home / "prompts").mkdir(parents=True)
     (home / "prompts" / "heartbeat.md").write_text("run the heartbeat\n")
-    sched = Scheduler(scheduler_yaml=tmp_path / "s.yaml", enqueue=fake_enqueue, home=home)
+    scheduler_yaml = tmp_path / "s.yaml"
+    write_jobs(scheduler_yaml, [SchedulerJob(
+        name="heartbeat", prompt_file="heartbeat.md", cron="0 * * * *",
+        authority_profile="heartbeat",
+    )])
+    sched = Scheduler(scheduler_yaml=scheduler_yaml, enqueue=fake_enqueue, home=home)
 
     await sched._fire_quota_recovery()
 
@@ -3579,6 +4027,80 @@ async def test_fire_quota_recovery_enqueues_heartbeat(tmp_path: Path):
     assert synthetic is not None
     assert set(synthetic.capabilities) == set(scheduled.capabilities)
     assert synthetic == scheduled
+
+
+@pytest.mark.asyncio
+async def test_quota_recovery_uses_configured_heartbeat_authority_and_commands(
+    tmp_path: Path,
+):
+    """Part C: recovery carries the live scheduler.yaml job unchanged."""
+    executable = Path(shutil.which("printf") or "/usr/bin/printf").resolve()
+    scheduler_yaml = tmp_path / "scheduler.yaml"
+    write_jobs(scheduler_yaml, [SchedulerJob(
+        name="heartbeat",
+        prompt="configured heartbeat",
+        cron="0 * * * *",
+        authority_profile="heartbeat",
+        shell_commands=[{
+            "exec": executable.name,
+            "path": str(executable),
+            "subcommands": [["quota-recovery"]],
+            "options": [],
+        }],
+    )])
+    enqueued: list[AgentEvent] = []
+
+    async def enqueue(event: AgentEvent) -> bool:
+        enqueued.append(event)
+        return True
+
+    sched = Scheduler(scheduler_yaml=scheduler_yaml, enqueue=enqueue, home=tmp_path)
+    await sched._fire_quota_recovery()
+
+    [event] = enqueued
+    assert event.content == "configured heartbeat"
+    assert event.service_authority is not None
+    assert event.service_authority.authority_profile == "heartbeat"
+    assert len(event.service_authority.declared_shell_commands) == 1
+
+
+@pytest.mark.asyncio
+async def test_configured_heartbeat_accepts_load_jobs_tuple_shape(
+    tmp_path: Path, monkeypatch,
+):
+    """Quota recovery remains compatible with PR #1704's loader result."""
+    heartbeat = SchedulerJob(
+        name="heartbeat", prompt="configured heartbeat", cron="0 * * * *",
+        authority_profile="heartbeat",
+    )
+
+    def load_jobs_with_rejections(_path):
+        return [heartbeat], [{"reason": "unrelated invalid job"}]
+
+    async def enqueue(_event: AgentEvent) -> bool:
+        return True
+
+    monkeypatch.setattr("mimir.scheduler.load_jobs", load_jobs_with_rejections)
+    sched = Scheduler(
+        scheduler_yaml=tmp_path / "scheduler.yaml", enqueue=enqueue, home=tmp_path,
+    )
+
+    assert await sched._configured_heartbeat_job() is heartbeat
+
+
+@pytest.mark.asyncio
+async def test_quota_recovery_paths_skip_disabled_heartbeat(tmp_path: Path):
+    """Part C: neither reset-time nor early recovery invents a heartbeat."""
+    enqueued: list[AgentEvent] = []
+    sched, home, store = _paused_scheduler(tmp_path, enqueued)
+    write_jobs(sched._yaml_path, [])
+
+    await sched._fire_quota_recovery()
+    _record_pause(home)
+    _fresh_snap(store, "five_hour", 0.30)
+    await sched._recheck_quota_pause()
+
+    assert enqueued == []
 
 
 @pytest.mark.asyncio
@@ -3736,11 +4258,18 @@ async def test_worklink_reaper_job_runs_in_thread_and_logs_event(
         def __init__(self, issue_id: int) -> None:
             self.issue_id = issue_id
 
+    from mimir.worklink.claims import ReapResult
+
     calls: list[tuple[str, Path]] = []
 
     def fake_reap(home: Path):
         calls.append(("reap", home))
-        return [Rec(476), Rec(477)]
+        return ReapResult(
+            reaped=[Rec(476), Rec(477)],
+            examined=3,
+            skipped={"lock_not_held": 1},
+            skipped_issue_ids={"lock_not_held": [478]},
+        )
 
     def fake_prune(home: Path):
         calls.append(("prune", home))
@@ -3765,6 +4294,9 @@ async def test_worklink_reaper_job_runs_in_thread_and_logs_event(
     [ev] = [e for e in events if e["type"] == "worklink_claims_reaped"]
     assert ev["count"] == 2
     assert ev["issue_ids"] == [476, 477]
+    assert ev["examined"] == 3
+    assert ev["skipped"] == {"lock_not_held": 1}
+    assert ev["skipped_issue_ids"] == {"lock_not_held": [478]}
     [pruned] = [e for e in events if e["type"] == "worklink_attempt_checkouts_pruned"]
     assert pruned["count"] == 1
     assert pruned["paths"] == [str(tmp_path / ".worklink" / "repo" / "613-1")]
@@ -3780,7 +4312,12 @@ async def test_worklink_reaper_job_logs_completed_sweep_when_nothing_reaped(
     async def noop(_e):
         return True
 
-    monkeypatch.setattr("mimir.worklink.autonomy.reap_stale_claims_for_home", lambda home: [])
+    from mimir.worklink.claims import ReapResult
+
+    monkeypatch.setattr(
+        "mimir.worklink.autonomy.reap_stale_claims_for_home",
+        lambda home: ReapResult(reaped=[], examined=0, skipped={}, skipped_issue_ids={}),
+    )
     monkeypatch.setattr("mimir.worklink.autonomy.prune_stale_attempt_checkouts_for_home", lambda home: [])
     monkeypatch.setattr("mimir.worklink.autonomy.close_merged_chainlinks_for_home", lambda home: [])
     sched = Scheduler(scheduler_yaml=tmp_path / "s.yaml", enqueue=noop)
@@ -3794,6 +4331,8 @@ async def test_worklink_reaper_job_logs_completed_sweep_when_nothing_reaped(
     [event] = [e for e in events if e["type"] == "worklink_claims_reaped"]
     assert event["count"] == 0
     assert event["issue_ids"] == []
+    assert event["examined"] == 0
+    assert event["skipped"] == {}
 
 
 def test_poller_reload_prunes_circuit_breakers_for_removed_pollers(tmp_path: Path):
@@ -3843,7 +4382,7 @@ async def test_fire_poller_suppressed_skips_subprocess_and_emits(
 
     ran: list[str] = []
 
-    async def fake_run_poller(poller, enqueue, home=None):
+    async def fake_run_poller(poller, enqueue, home=None, timeout=None):
         ran.append(poller.name)
 
     monkeypatch.setattr("mimir.scheduler.run_poller", fake_run_poller)
@@ -3893,7 +4432,7 @@ async def test_fire_poller_budget_suppressed_skips_subprocess_and_emits(
 
     ran: list[str] = []
 
-    async def fake_run_poller(poller, enqueue, home=None):
+    async def fake_run_poller(poller, enqueue, home=None, timeout=None):
         ran.append(poller.name)
 
     monkeypatch.setattr("mimir.scheduler.run_poller", fake_run_poller)
@@ -3942,7 +4481,7 @@ async def test_fire_poller_budget_under_limit_still_runs(tmp_path: Path, monkeyp
 
     ran: list[str] = []
 
-    async def fake_run_poller(poller, enqueue, home=None):
+    async def fake_run_poller(poller, enqueue, home=None, timeout=None):
         ran.append(poller.name)
 
     monkeypatch.setattr("mimir.scheduler.run_poller", fake_run_poller)
@@ -3952,6 +4491,81 @@ async def test_fire_poller_budget_under_limit_still_runs(tmp_path: Path, monkeyp
     assert arbiter.consulted_priorities == ["normal", "normal"]
     events = _read_event_types(tmp_path / "logs" / "events.jsonl")
     assert not [e for e in events if e["type"] == "poller_budget_suppressed"]
+
+
+@pytest.mark.asyncio
+async def test_fire_poller_budget_caps_events_enqueued_by_one_fire(
+    tmp_path: Path, monkeypatch,
+):
+    """Part A: 40 batches against three turns of headroom enqueue only three."""
+    from mimir.event_logger import init_logger
+    init_logger(tmp_path / "logs" / "events.jsonl", session_id="test-session")
+    accepted: list[AgentEvent] = []
+
+    async def enqueue(event: AgentEvent) -> bool:
+        accepted.append(event)
+        return True
+
+    sched = Scheduler(
+        scheduler_yaml=tmp_path / "s.yaml", enqueue=enqueue,
+        arbiter=_StubArbiter(fire=True), home=tmp_path,
+    )
+    skills = tmp_path / "skills"
+    _drop_priority_poller(
+        skills, "p1", priority="normal",
+        budget={"windows": {"1h": {"max_agent_turns": 3}}},
+    )
+    sched.add_poller_jobs(skills)
+    results: list[bool] = []
+
+    async def fake_run_poller(poller, enqueue, home=None, timeout=None):
+        for index in range(40):
+            results.append(await enqueue(AgentEvent(
+                trigger="poller", channel_id=f"poller:{poller.name}",
+                content=str(index),
+            )))
+
+    monkeypatch.setattr("mimir.scheduler.run_poller", fake_run_poller)
+    await sched._fire_poller(poller_name="p1")
+
+    assert len(accepted) == 3
+    assert results.count(True) == 3
+    assert results.count(False) == 37
+
+
+@pytest.mark.asyncio
+async def test_fire_poller_budget_admits_all_events_within_headroom(
+    tmp_path: Path, monkeypatch,
+):
+    """Part A positive control: healthy fires remain unthrottled."""
+    accepted: list[AgentEvent] = []
+
+    async def enqueue(event: AgentEvent) -> bool:
+        accepted.append(event)
+        return True
+
+    sched = Scheduler(
+        scheduler_yaml=tmp_path / "s.yaml", enqueue=enqueue,
+        arbiter=_StubArbiter(fire=True), home=tmp_path,
+    )
+    skills = tmp_path / "skills"
+    _drop_priority_poller(
+        skills, "p1", priority="normal",
+        budget={"windows": {"1h": {"max_agent_turns": 3}}},
+    )
+    sched.add_poller_jobs(skills)
+
+    async def fake_run_poller(poller, enqueue, home=None, timeout=None):
+        for index in range(2):
+            assert await enqueue(AgentEvent(
+                trigger="poller", channel_id=f"poller:{poller.name}",
+                content=str(index),
+            )) is True
+
+    monkeypatch.setattr("mimir.scheduler.run_poller", fake_run_poller)
+    await sched._fire_poller(poller_name="p1")
+
+    assert len(accepted) == 2
 
 
 @pytest.mark.asyncio
@@ -4001,7 +4615,7 @@ async def test_fire_poller_budget_checks_do_not_block_loop_and_reuse_snapshot(
 
     ran: list[str] = []
 
-    async def fake_run_poller(poller, enqueue, home=None):
+    async def fake_run_poller(poller, enqueue, home=None, timeout=None):
         ran.append(poller.name)
 
     monkeypatch.setattr("mimir.scheduler.aggregate_poller_turn_usage", slow_aggregate)
@@ -4068,7 +4682,7 @@ async def test_fire_poller_budget_suppresses_on_external_usage(
 
     ran: list[str] = []
 
-    async def fake_run_poller(poller, enqueue, home=None):
+    async def fake_run_poller(poller, enqueue, home=None, timeout=None):
         ran.append(poller.name)
 
     monkeypatch.setattr("mimir.scheduler.run_poller", fake_run_poller)
@@ -4099,7 +4713,7 @@ async def test_fire_poller_fires_when_arbiter_clear(
 
     ran: list[str] = []
 
-    async def fake_run_poller(poller, enqueue, home=None):
+    async def fake_run_poller(poller, enqueue, home=None, timeout=None):
         ran.append(poller.name)
 
     monkeypatch.setattr("mimir.scheduler.run_poller", fake_run_poller)
@@ -4135,7 +4749,7 @@ async def test_fire_poller_fail_open_when_arbiter_raises(
 
     ran: list[str] = []
 
-    async def fake_run_poller(poller, enqueue, home=None):
+    async def fake_run_poller(poller, enqueue, home=None, timeout=None):
         ran.append(poller.name)
 
     monkeypatch.setattr("mimir.scheduler.run_poller", fake_run_poller)
@@ -4191,7 +4805,9 @@ def test_scheduler_job_priority_yaml_round_trip(tmp_path: Path):
         SchedulerJob(name="hb", prompt="x", cron="0 8 * * *"),
         SchedulerJob(name="digest", prompt="y", cron="0 9 * * *", priority="high"),
     ])
-    jobs = {j.name: j for j in load_jobs(path)}
+    loaded, rejections = load_jobs(path)
+    assert rejections == []
+    jobs = {j.name: j for j in loaded}
     assert jobs["hb"].priority == "normal"     # default, not serialized
     assert jobs["digest"].priority == "high"   # explicit, round-trips
     # Default priority isn't written to yaml (uncluttered).
@@ -4202,7 +4818,7 @@ def test_scheduler_job_priority_yaml_round_trip(tmp_path: Path):
         SchedulerJob(name="nice", prompt="z", cron="0 10 * * *", priority="low"),
     ])
     assert "priority: low" in low_path.read_text()
-    assert load_jobs(low_path)[0].priority == "low"
+    assert load_jobs(low_path)[0][0].priority == "low"
 
 
 def test_scheduler_job_invalid_priority_falls_back_to_normal():
@@ -4241,8 +4857,13 @@ def _paused_scheduler(tmp_path: Path, enqueued: list):
         rate_limit_store=store,
         plan_window_suppress_threshold=0.80,
     )
+    scheduler_yaml = tmp_path / "s.yaml"
+    write_jobs(scheduler_yaml, [SchedulerJob(
+        name="heartbeat", prompt="heartbeat", cron="0 * * * *",
+        authority_profile="heartbeat",
+    )])
     sched = Scheduler(
-        scheduler_yaml=tmp_path / "s.yaml", enqueue=fake_enqueue,
+        scheduler_yaml=scheduler_yaml, enqueue=fake_enqueue,
         home=home, arbiter=arbiter,
     )
     return sched, home, store
@@ -4575,3 +5196,151 @@ def test_scheduler_job_deliver_unset_not_emitted():
     job = SchedulerJob.from_yaml_entry({"name": "t2", "prompt": "x", "cron": "0 * * * *"})
     assert job.deliver is None
     assert "deliver" not in job.to_yaml_entry()
+
+
+@pytest.mark.asyncio
+async def test_effective_poller_timeout_clamps_to_cadence(tmp_path, monkeypatch):
+    """The runtime enforcement, which a test over bundled manifests cannot give.
+
+    Pollers are discovered from ``<home>/skills/**/pollers.json`` and
+    ``pollers-overrides.yaml`` may replace a cron, so a locally installed or
+    overridden fast poller never appears in this repo. ``max_instances=1`` means a
+    run longer than the cadence swallows the next fire, so the cap is clamped per
+    poller against the cadence it was actually registered with.
+    """
+    from mimir.pollers import POLLER_TIMEOUT_SECONDS, PollerConfig
+    from mimir.scheduler import POLLER_CADENCE_MARGIN_SECONDS
+
+    async def noop(event: AgentEvent) -> bool:
+        return True
+
+    sched = Scheduler(scheduler_yaml=tmp_path / "s.yaml", enqueue=noop)
+    events: list[tuple[str, dict]] = []
+
+    async def fake_log_event(name: str, **kw):
+        events.append((name, kw))
+
+    monkeypatch.setattr("mimir.scheduler.log_event", fake_log_event)
+
+    def cfg(cron: str) -> PollerConfig:
+        return PollerConfig(
+            name=f"p-{cron.replace(' ', '_')}", command="x", cron=cron,
+            env={}, skill_dir=tmp_path,
+        )
+
+    # Every minute: 60s cadence, so the 120s cap must not apply.
+    fast = await sched._effective_poller_timeout(cfg("* * * * *"))
+    assert fast == 60.0 - POLLER_CADENCE_MARGIN_SECONDS
+    assert fast < POLLER_TIMEOUT_SECONDS
+    clamped = [kw for name, kw in events if name == "poller_timeout_clamped_to_cadence"]
+    assert len(clamped) == 1, "clamping was not reported to the operator"
+    assert clamped[0]["poller"] == "p-*_*_*_*_*"
+    assert clamped[0]["cadence_seconds"] == 60.0
+
+    # Every 15 minutes: far above the cap, so the cap applies unchanged and
+    # nothing is reported.
+    events.clear()
+    slow = await sched._effective_poller_timeout(cfg("*/15 * * * *"))
+    assert slow == float(POLLER_TIMEOUT_SECONDS)
+    assert events == []
+
+
+def test_cron_min_gap_bounds_sparse_and_irregular_schedules():
+    """The cadence bound comes from the cron fields, not from simulating fires.
+
+    Simulation cannot establish it. Gregorian recurrence is unbounded, so
+    ``0,2 0 29 2 *`` — two leap-day fires two minutes apart — has its next pair
+    years out; a finite horizon that ends first yields nothing, and falling back
+    to the framework cap hands a 120s timeout to a 120s cadence. A fixed prefix
+    of samples fails differently: with ``0,9,18,27,28,42,51 * * * *`` the
+    one-minute gap sits outside the first five fires for 15 of 60 start minutes.
+    """
+    from mimir.scheduler import _cron_min_gap_seconds
+
+    # Sparse: the close pair is years away and no horizon reaches it.
+    assert _cron_min_gap_seconds("0,2 0 29 2 *") == 120.0
+    # Irregular: the tight pair is not among the first fires.
+    assert _cron_min_gap_seconds("0,9,18,27,28,42,51 * * * *") == 60.0
+    # Wrap across the hour boundary counts.
+    assert _cron_min_gap_seconds("0,59 * * * *") == 60.0
+    # A bare value with a step means "from a, every step" — more values, tighter
+    # gap, which is the safe direction for a lower bound.
+    assert _cron_min_gap_seconds("5/10 * * * *") == 600.0
+    # Single minute: the hour field bounds it. Single hour: at most daily.
+    assert _cron_min_gap_seconds("0 9,10 * * *") == 3600.0
+    assert _cron_min_gap_seconds("0 9 * * *") == 86400.0
+    # Shipped cadences.
+    assert _cron_min_gap_seconds("*/15 * * * *") == 900.0
+    assert _cron_min_gap_seconds("*/10 * * * *") == 600.0
+    # Unparseable is reported, not guessed.
+    assert _cron_min_gap_seconds("not a cron") is None
+
+
+@pytest.mark.asyncio
+async def test_effective_timeout_never_exceeds_a_sparse_cadence(tmp_path):
+    """The invariant, on the schedule that broke the horizon approach.
+
+    A 120s cadence must not receive the 120s framework cap: the run would span
+    the next fire and `max_instances=1` would skip it.
+    """
+    from mimir.pollers import POLLER_TIMEOUT_SECONDS, PollerConfig
+
+    async def noop(event: AgentEvent) -> bool:
+        return True
+
+    sched = Scheduler(scheduler_yaml=tmp_path / "s.yaml", enqueue=noop)
+    got = await sched._effective_poller_timeout(PollerConfig(
+        name="leap", command="x", cron="0,2 0 29 2 *", env={}, skill_dir=tmp_path,
+    ))
+    assert got < 120.0, "a 120s cadence was handed a timeout that spans its next fire"
+    assert got < float(POLLER_TIMEOUT_SECONDS)
+
+
+@pytest.mark.asyncio
+async def test_unparseable_cron_degrades_conservatively(tmp_path):
+    """An unknown cadence must clamp toward safety, not to the full cap."""
+    from mimir.pollers import POLLER_TIMEOUT_SECONDS, PollerConfig
+    from mimir.scheduler import CRON_MIN_GRANULARITY_SECONDS
+
+    async def noop(event: AgentEvent) -> bool:
+        return True
+
+    sched = Scheduler(scheduler_yaml=tmp_path / "s.yaml", enqueue=noop)
+    got = await sched._effective_poller_timeout(PollerConfig(
+        name="bad", command="x", cron="not a cron", env={}, skill_dir=tmp_path,
+    ))
+    assert got < float(POLLER_TIMEOUT_SECONDS)
+    assert got <= CRON_MIN_GRANULARITY_SECONDS
+
+
+@pytest.mark.asyncio
+async def test_poller_cadence_is_cached_per_cron(tmp_path):
+    """Consulted on every fire, so a sparse schedule must not rescan each time.
+
+    Also pins that a changed cron invalidates: the key is the cron string, so an
+    edited manifest recomputes rather than serving a stale cadence.
+    """
+    from mimir.pollers import PollerConfig
+
+    async def noop(event: AgentEvent) -> bool:
+        return True
+
+    sched = Scheduler(scheduler_yaml=tmp_path / "s.yaml", enqueue=noop)
+
+    def cfg(cron: str) -> PollerConfig:
+        return PollerConfig(
+            name="p", command="x", cron=cron, env={}, skill_dir=tmp_path,
+        )
+
+    first = sched._poller_cadence_seconds(cfg("*/15 * * * *"))
+    assert ("p", "*/15 * * * *") in sched._poller_cadence_cache
+    assert sched._poller_cadence_seconds(cfg("*/15 * * * *")) == first
+
+    # A different cron is a different key, and is measured on its own terms.
+    assert sched._poller_cadence_seconds(cfg("* * * * *")) == 60.0
+
+
+async def _noop_coro():
+    return None
+
+

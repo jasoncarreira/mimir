@@ -8,7 +8,12 @@ import os
 from pathlib import Path
 import sys
 
-from ..worklink.control import stop_worklink, worklink_status
+from ..event_logger import log_durable_event_sync
+from ..worklink.control import (
+    archive_worklink_factory_records,
+    stop_worklink,
+    worklink_status,
+)
 from ..worklink.orchestrator import (
     LeafValidationError,
     WorklinkError,
@@ -38,6 +43,12 @@ def add_argparse(
     stop_p = worklink_sub.add_parser("stop", help="Safely stop one live leaf Worklink run.")
     stop_p.add_argument("issue_id", type=int, help="Chainlink issue id to stop.")
     stop_p.add_argument("--home", type=Path, default=None, help="Agent home.")
+
+    archive_p = worklink_sub.add_parser(
+        "archive-factory-run", help="Archive retained factory state for one epic."
+    )
+    archive_p.add_argument("issue_id", type=int, help="Chainlink epic issue id to clear.")
+    archive_p.add_argument("--home", type=Path, default=None, help="Agent home.")
 
     emit_p = worklink_sub.add_parser(
         "emit-work-item",
@@ -128,6 +139,9 @@ def dispatch(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
 
     if args.worklink_action == "stop":
         return _stop(args)
+
+    if args.worklink_action == "archive-factory-run":
+        return _archive_factory_run(args)
 
     if args.worklink_action == "emit-work-item":
         return _emit_work_item(args)
@@ -243,6 +257,26 @@ def _stop(args: argparse.Namespace) -> int:
         f"claim={'released' if result.claim_released else 'unchanged'}, "
         f"in-progress label={'cleared' if result.label_cleared else 'unchanged'}"
     )
+    return 0
+
+
+def _archive_factory_run(args: argparse.Namespace) -> int:
+    home = (args.home or Path(os.environ.get("MIMIR_HOME") or Path.cwd())).resolve()
+    from ..event_logger import init_logger
+
+    init_logger(
+        home / "logs" / "events.jsonl",
+        session_id=f"worklink-archive-factory-{args.issue_id}",
+    )
+    archived = archive_worklink_factory_records(
+        home,
+        args.issue_id,
+        event_logger=log_durable_event_sync,
+    )
+    if not archived:
+        print(f"worklink:epic #{args.issue_id}: no retained factory record")
+        return 1
+    print(f"worklink:epic #{args.issue_id}: archived {len(archived)} factory record(s)")
     return 0
 
 

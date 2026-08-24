@@ -65,6 +65,8 @@ class DueCheckResult:
     scanned: int = 0
     skipped_no_due_window: int = 0
     skipped_not_yet_due: int = 0
+    failed: int = 0
+    corrupt_lines: int = 0
 
 
 # Per-commitment snooze count above which we emit a pileup alarm.
@@ -101,9 +103,10 @@ async def check_due_and_expired(
         now_unix = time.time()
 
     result = DueCheckResult()
-    state = await asyncio.to_thread(store.current_state)
+    replay = await asyncio.to_thread(store.replay)
+    result.corrupt_lines = replay.corrupt_line_count
 
-    for rec in state.values():
+    for rec in replay.records.values():
         result.scanned += 1
         if rec.is_terminal():
             continue
@@ -168,10 +171,16 @@ async def check_due_and_expired(
                         sensitivity=rec.sensitivity,
                     )
                     result.snooze_pileup_emitted += 1
-                except Exception:  # noqa: BLE001
+                except Exception as exc:  # noqa: BLE001
+                    result.failed += 1
                     log.exception(
                         "commitment snooze pileup emit failed for %s",
                         rec.id,
+                    )
+                    await log_event(
+                        "commitment_snooze_pileup_failed",
+                        commitment_id=rec.id,
+                        error=f"{type(exc).__name__}: {exc}",
                     )
         # Expired check first — even if we'd also fire a "due" event on
         # the same tick (rare: commitment due window fully elapsed
@@ -202,10 +211,16 @@ async def check_due_and_expired(
                         kind=rec.kind,
                         sensitivity=rec.sensitivity,
                     )
-            except Exception:  # noqa: BLE001
+            except Exception as exc:  # noqa: BLE001
+                result.failed += 1
                 log.exception(
                     "commitment expire failed for %s; continuing sweep",
                     rec.id,
+                )
+                await log_event(
+                    "commitment_expire_failed",
+                    commitment_id=rec.id,
+                    error=f"{type(exc).__name__}: {exc}",
                 )
             continue
 
@@ -236,10 +251,16 @@ async def check_due_and_expired(
                     kind=rec.kind,
                     sensitivity=rec.sensitivity,
                 )
-        except Exception:  # noqa: BLE001
+        except Exception as exc:  # noqa: BLE001
+            result.failed += 1
             log.exception(
                 "commitment deliver failed for %s; continuing sweep",
                 rec.id,
+            )
+            await log_event(
+                "commitment_deliver_failed",
+                commitment_id=rec.id,
+                error=f"{type(exc).__name__}: {exc}",
             )
 
     return result

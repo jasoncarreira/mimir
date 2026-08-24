@@ -33,6 +33,7 @@ currently stubbed — re-wire in a follow-up.
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import contextlib
 import hashlib
 import json
@@ -60,7 +61,12 @@ from .channel_registry import (
 from .chat_skills import CHAT_SKILL_EXTRA_KEY, ChatSkillRegistry
 from .config import Config
 from .model_registry import DEFAULT_MODEL_SPEC
-from .event_logger import log_event, log_event_sync, safe_log_event
+from .event_logger import (
+    log_durable_event_sync,
+    log_event,
+    log_event_sync,
+    safe_log_event,
+)
 from .feedback import FeedbackLog
 from . import health
 from . import mid_turn_injection
@@ -293,9 +299,9 @@ def _auto_recall_source_labels(
             ),
             source_kind="auto_recall",
             integrity=integrity,
-            # Accepted residual (#948): an untrusted fact can influence a later
-            # trusted turn. Auto-recall remains informational so it never
-            # handcuffs a user turn; see enforcement-enablement.md section 5.3.
+            # Accepted residual (#948): untrusted recall remains informational
+            # so it does not handcuff a user turn at sink gates. Persisted
+            # derivatives still inherit untrusted integrity in memory_store.
             integrity_effect=IntegrityEffect.INFORMATIONAL,
         ))
     return labels
@@ -590,10 +596,10 @@ def _filter_session_turns(
     turns_path: Path,
     saga_session_id: str,
     *,
+    channel_id: str,
     idle_minutes: int = 10,
 ) -> list[dict]:
-    """Read turns.jsonl tail-first and return records with the given
-    saga_session_id, in chronological order.
+    """Return records for the given session and channel in chronological order.
 
     Time-based break: saga ends a session after ``idle_minutes`` of no
     activity, so any record older than ``newest_match_ts - 2 *
@@ -611,7 +617,10 @@ def _filter_session_turns(
     try:
         for rec in tail_jsonl_records(turns_path):
             rec_ts = _turn_record_ts(rec)
-            if rec.get("saga_session_id") == saga_session_id:
+            if (
+                rec.get("saga_session_id") == saga_session_id
+                and rec.get("channel_id") == channel_id
+            ):
                 out.append(rec)
                 if rec_ts is not None and (
                     newest_match_ts is None or rec_ts > newest_match_ts
@@ -1324,6 +1333,10 @@ class Agent:
         # the completion handler back onto the loop via
         # ``run_coroutine_threadsafe``.
         self._loop: asyncio.AbstractEventLoop | None = None
+        # Shell-job waiter threads add these futures; their done callbacks may
+        # discard them on an event-loop thread. CPython set add/discard are
+        # atomic under the GIL, and no compound iteration is performed here.
+        self._shell_completion_futures: set[concurrent.futures.Future[Any]] = set()
 
         # Build the deepagent singleton. Done lazily to keep import-time
         # fast and to let tests construct Agent without a real model.
@@ -1713,9 +1726,14 @@ class Agent:
                     IterationGateMiddleware(),
                     BudgetGateMiddleware(),
                     FetchedContentReminderMiddleware(self._config.home),
-                    SkillMemoryInjectionMiddleware(),
+                    SkillMemoryInjectionMiddleware(skill_sources),
                     MidTurnInjectionMiddleware(),
                 )
+
+            for middleware in self._agent_middleware:
+                set_skill_sources = getattr(middleware, "set_skill_sources", None)
+                if callable(set_skill_sources):
+                    set_skill_sources(skill_sources)
 
             from .subagents import build_mimir_subagents
             from ._deepagents_subagent_auth import install_subagent_auth_context_patch
@@ -2757,28 +2775,29 @@ class Agent:
                     # a header-less 429 → short escalating backoff (so a
                     # transient burst doesn't sit out a full window).
                     reset_at, pause_reason = tracker.record_rate_limit(exc)
-                    await log_event(
-                        "quota_exhausted",
-                        channel_id=event.channel_id,
-                        turn_id=turn_id,
-                        reset_at=reset_at.isoformat(),
-                        pause_reason=pause_reason,
-                        provider=tracker.provider,
-                        exception_class=type(exc).__name__,
-                        exception_message=str(exc)[:240],
-                    )
-                    # Arm a recovery wake so the agent retries exactly
-                    # when the window should roll over, instead of idling
-                    # until the next hourly scheduled tick.
-                    sched = getattr(self, "_scheduler", None)
-                    if sched is not None and hasattr(sched, "arm_quota_recovery_wake"):
-                        try:
-                            sched.arm_quota_recovery_wake(reset_at)
-                        except Exception:  # noqa: BLE001
-                            log.exception(
-                                "arm_quota_recovery_wake failed; next "
-                                "scheduled tick will still recover"
-                            )
+                    if tracker.last_save_ok is not False:
+                        await log_event(
+                            "quota_exhausted",
+                            channel_id=event.channel_id,
+                            turn_id=turn_id,
+                            reset_at=reset_at.isoformat(),
+                            pause_reason=pause_reason,
+                            provider=tracker.provider,
+                            exception_class=type(exc).__name__,
+                            exception_message=str(exc)[:240],
+                        )
+                        # Arm a recovery wake so the agent retries exactly
+                        # when the window should roll over, instead of idling
+                        # until the next hourly scheduled tick.
+                        sched = getattr(self, "_scheduler", None)
+                        if sched is not None and hasattr(sched, "arm_quota_recovery_wake"):
+                            try:
+                                sched.arm_quota_recovery_wake(reset_at)
+                            except Exception:  # noqa: BLE001
+                                log.exception(
+                                    "arm_quota_recovery_wake failed; next "
+                                    "scheduled tick will still recover"
+                                )
             except Exception:  # noqa: BLE001 — defensive boundary
                 log.exception("quota_pause emit failed; continuing")
         finally:
@@ -3131,6 +3150,11 @@ class Agent:
                         record=record,
                         repo=current_worktree,
                         current_worktree=current_worktree,
+                        run_id=(
+                            continuation_event.extra.get("run_id")
+                            if isinstance(continuation_event.extra.get("run_id"), str)
+                            else None
+                        ),
                     ),
                     timeout=continuation_timeout_s,
                 )
@@ -3445,9 +3469,39 @@ class Agent:
             )
             return
         try:
-            asyncio.run_coroutine_threadsafe(
+            future = asyncio.run_coroutine_threadsafe(
                 self._on_shell_job_complete(job), loop,
             )
+            self._shell_completion_futures.add(future)
+            job_id = getattr(job, "job_id", "?")
+
+            def observe_handler(done: concurrent.futures.Future[Any]) -> None:
+                self._shell_completion_futures.discard(done)
+                try:
+                    done.result()
+                except concurrent.futures.CancelledError:
+                    log.warning(
+                        "shell-job-complete handler cancelled: job_id=%s", job_id,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    log.exception(
+                        "shell-job-complete handler failed: job_id=%s", job_id,
+                        exc_info=exc,
+                    )
+                    try:
+                        log_durable_event_sync(
+                            "shell_job_complete_handler_failed",
+                            job_id=job_id,
+                            error=f"{type(exc).__name__}: {exc}"[:500],
+                        )
+                    except Exception:  # noqa: BLE001
+                        log.exception(
+                            "durable shell-job-complete failure event failed: "
+                            "job_id=%s",
+                            job_id,
+                        )
+
+            future.add_done_callback(observe_handler)
         except Exception:  # noqa: BLE001
             # Never let a daemon-thread invocation crash the registry.
             log.exception("schedule of shell-job-complete handler failed")
@@ -3469,8 +3523,8 @@ class Agent:
             return
 
         try:
-            data = self._shell_jobs.read_output(
-                job.job_id, tail_lines=100, stream="both",
+            data = self._shell_jobs.read_job_output(
+                job, tail_lines=100, stream="both",
             )
         except Exception:  # noqa: BLE001
             data = {"stdout_tail": "", "stderr_tail": ""}
@@ -3949,7 +4003,7 @@ class Agent:
 
     async def _build_synthesis_prompt(
         self, ctx: Any, event: AgentEvent,
-    ) -> str:
+    ) -> PromptBlock:
         """For trigger='saga_session_end' — load the synthesis template,
         embed the session's turn window from turns.jsonl. Off-loops the
         turns.jsonl scan via to_thread."""
@@ -3961,6 +4015,7 @@ class Agent:
             _filter_session_turns,
             self._config.turns_log,
             saga_session_id,
+            channel_id=event.channel_id or "",
             idle_minutes=idle_minutes,
         )
         if not turns_window:
@@ -3972,12 +4027,20 @@ class Agent:
                     reason="turns.jsonl rotated past this session's records",
                 )
             )
-        return render_saga_session_end(
-            channel_id=event.channel_id or "",
-            saga_session_id=saga_session_id,
-            idle_minutes=idle_minutes,
-            turns_window=turns_window,
-            prompts_dir=self._config.prompts_dir,
+        labels = InformationFlowLabels()
+        if turns_window:
+            labels = event.ifc_labels or ctx.ifc_labels
+            if not labels.sources:
+                raise ValueError("session turn history omitted provenance")
+        return PromptBlock(
+            render_saga_session_end(
+                channel_id=event.channel_id or "",
+                saga_session_id=saga_session_id,
+                idle_minutes=idle_minutes,
+                turns_window=turns_window,
+                prompts_dir=self._config.prompts_dir,
+            ),
+            labels,
         )
 
     async def _build_turn_prompt(
@@ -3996,18 +4059,6 @@ class Agent:
         Returns ``(turn_prompt, recent)`` — recent is needed for the
         ``turn_started`` event's ``recent_message_count``.
         """
-        if event.trigger == "saga_session_end":
-            synthesis_prompt = await self._build_synthesis_prompt(ctx, event)
-            scratch_path = self._config.home / "scratch" / "turns" / ctx.turn_id
-            return (
-                "## Current turn scratch\n\n"
-                f"Use `{scratch_path}/` for ordinary ephemeral files. This workspace "
-                "is private to this turn; the shared `scratch/` root and other turns' "
-                f"workspaces are unreadable.\n\n{synthesis_prompt}",
-                [],
-            )
-
-        auth_context = _require_auth_context(initial_auth_context or ctx.auth_context)
         source_blocks: list[PromptBlock] = []
 
         def use(block: PromptBlock | None) -> str | None:
@@ -4024,6 +4075,28 @@ class Agent:
             source_blocks.append(block)
             return block.content
 
+        if event.trigger == "saga_session_end":
+            synthesis_block = await self._build_synthesis_prompt(ctx, event)
+            if not isinstance(synthesis_block, PromptBlock):
+                raise TypeError("synthesis prompt loader omitted provenance")
+            if any(not source.is_complete for source in synthesis_block.labels.sources):
+                raise ValueError("session turn history returned incomplete provenance")
+            synthesis_prompt = synthesis_block.content
+            if synthesis_block.labels.sources:
+                source_blocks.append(synthesis_block)
+            scratch_path = self._config.home / "scratch" / "turns" / ctx.turn_id
+            ctx.ifc_labels = _merge_ifc_labels(
+                ctx.ifc_labels, *(block.labels for block in source_blocks),
+            )
+            return (
+                "## Current turn scratch\n\n"
+                f"Use `{scratch_path}/` for ordinary ephemeral files. This workspace "
+                "is private to this turn; the shared `scratch/` root and other turns' "
+                f"workspaces are unreadable.\n\n{synthesis_prompt}",
+                [],
+            )
+
+        auth_context = _require_auth_context(initial_auth_context or ctx.auth_context)
         recent = self._buffer.assemble_recent_activity(
             channel_id=event.channel_id or "",
             author=event.author,
@@ -4282,17 +4355,25 @@ class Agent:
                 auto_skill_block[1],
                 auto_skill_labels,
             ))
-        # chainlink #508: resolve an optional deliver: channel (poller / tick),
-        # mapping the OPERATOR_CHANNEL sentinel → the operator alert channel.
+        trusted_trigger = (
+            get_trusted_service_from_auth_context(auth_context)
+            if event.trigger in {"scheduled_tick", "poller"}
+            else None
+        )
+        # Delivery is framework authority, so derive it from the immutable
+        # server-created poller/schedule grant rather than event.extra. Registry
+        # lookup proves routability only; the exact config value is the grant.
         deliver_channel = resolve_deliver_channel(
-            (event.extra or {}).get("deliver"),
+            trusted_trigger.configured_delivery_channel if trusted_trigger else None,
             getattr(self._config, "operator_alert_channel", ""),
         )
+        if (
+            deliver_channel is not None
+            and (self._channels is None or self._channels.find(deliver_channel) is None)
+        ):
+            deliver_channel = None
         trigger_authority = (
-            get_trusted_service_from_auth_context(auth_context)
-            if self._config.access_control_enforced
-            and event.trigger in {"scheduled_tick", "poller"}
-            else None
+            trusted_trigger if self._config.access_control_enforced else None
         )
         turn_prompt = build_turn_prompt(
             event,

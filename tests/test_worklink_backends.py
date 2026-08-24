@@ -158,7 +158,7 @@ defaults:
     )
     defaults = WorklinkConfig.load(config_path).defaults
     assert defaults.max_concurrent == 2
-    assert defaults.reaper_ttl_s == 7200
+    assert defaults.reaper_ttl_s == 86400
     assert defaults.max_claim_attempts == 3
 
 
@@ -188,6 +188,18 @@ defaults:
     assert all("mimir/" not in pattern for pattern in defaults.tiered_review.high_risk_scope_patterns)
     assert WorklinkDefaults(backend="opencode").reviewer_backend == "opencode"
     assert WORKLINK_MERGED_LABEL == "worklink:merged"
+
+
+def test_reaper_ttl_covers_factory_run_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("MIMIR_FACTORY_RUN_TIMEOUT_S", "5000.5")
+
+    with pytest.raises(ValueError) as excinfo:
+        WorklinkDefaults(timeout_s=1800, reaper_ttl_s=10001)
+
+    assert excinfo.value.configured_value == 10001
+    assert excinfo.value.required_value == 10002
+    assert "configured 10001; required 10002" in str(excinfo.value)
+    assert WorklinkDefaults(timeout_s=1800, reaper_ttl_s=10002).reaper_ttl_s == 10002
 
 
 def test_worklink_config_epic_overrides_and_tiered_review_parse(tmp_path: Path) -> None:
@@ -893,7 +905,12 @@ async def test_feature_factory_launch_remains_shell_free_argv(
         prompt="factory owns the prompt",
         rules=None,
         timeout_s=30,
-        env={"MIMIR_HOME": str(tmp_path)},
+        env={
+            "MIMIR_HOME": str(tmp_path),
+            "MIMIR_WORK_ITEM_JSON": json.dumps(
+                {"run_id": "chainlink-1606", "title": "epic", "body": "build"}
+            ),
+        },
     )
     spec = FeatureFactoryBackend(entrypoint="/absolute/factory.js").work_spec(
         order,
@@ -920,7 +937,7 @@ async def test_feature_factory_launch_remains_shell_free_argv(
         str(tmp_path),
         "--command",
         "feature",
-        " --autonomous --max-retries 5 1606",
+        " --autonomous --max-retries 5 chainlink-1606",
     )
     assert "shell" not in calls[0]["kwargs"]
     assert calls[0]["kwargs"]["cwd"] == str(tmp_path)
