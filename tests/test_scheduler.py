@@ -11,6 +11,8 @@ from pathlib import Path
 
 import pytest
 import yaml
+from apscheduler.events import EVENT_JOB_ERROR, EVENT_JOB_MISSED
+from apscheduler.triggers.date import DateTrigger
 
 from mimir.event_logger import init_logger
 from mimir.access_control import (
@@ -1939,6 +1941,154 @@ async def test_on_job_missed_emits_scheduled_job_misfired_for_other_jobs(
     assert len(captured) == 1
     event_type, _ = captured[0]
     assert event_type == "scheduled_job_misfired"
+
+
+def test_scheduler_registers_separate_missed_and_error_listeners(tmp_path: Path):
+    async def noop(_e):
+        return True
+
+    sched = Scheduler(scheduler_yaml=tmp_path / "s.yaml", enqueue=noop)
+    listeners = sched._scheduler._listeners
+
+    assert (sched._on_job_missed, EVENT_JOB_MISSED) in listeners
+    assert (sched._on_job_error, EVENT_JOB_ERROR) in listeners
+
+
+@pytest.mark.asyncio
+async def test_raising_job_emits_durable_error_event(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("MIMIR_LOOP_STALL_ALERT_SECONDS", "0")
+
+    async def noop(_e):
+        return True
+
+    async def raises() -> None:
+        raise RuntimeError("cron body exploded")
+
+    sched = Scheduler(scheduler_yaml=tmp_path / "s.yaml", enqueue=noop)
+    sched._scheduler.add_job(
+        raises,
+        trigger=DateTrigger(run_date=datetime.now(tz=timezone.utc)),
+        id="raising-test-job",
+    )
+    sched.start()
+    try:
+        events_path = tmp_path / "logs" / "events.jsonl"
+        for _ in range(200):
+            events = []
+            if events_path.exists():
+                events = [
+                    _json.loads(line)
+                    for line in events_path.read_text(encoding="utf-8").splitlines()
+                    if line.strip()
+                ]
+            failures = [e for e in events if e.get("type") == "scheduled_job_error"]
+            if failures:
+                break
+            await asyncio.sleep(0.01)
+        else:
+            pytest.fail("scheduled_job_error was not written")
+    finally:
+        await sched.stop()
+
+    assert len(failures) == 1
+    assert failures[0]["job_id"] == "raising-test-job"
+    assert failures[0]["exception"] == "RuntimeError('cron body exploded')"
+
+
+@pytest.mark.asyncio
+async def test_job_error_from_executor_thread_uses_sync_event_fallback(tmp_path: Path):
+    from types import SimpleNamespace
+
+    async def noop(_e):
+        return True
+
+    sched = Scheduler(scheduler_yaml=tmp_path / "s.yaml", enqueue=noop)
+    event = SimpleNamespace(
+        job_id="threaded-test-job",
+        exception=ValueError("bad threaded job"),
+    )
+
+    await asyncio.to_thread(sched._on_job_error, event)
+
+    [failure] = [
+        _json.loads(line)
+        for line in (tmp_path / "logs" / "events.jsonl")
+        .read_text(encoding="utf-8")
+        .splitlines()
+        if line.strip()
+    ]
+    assert failure["type"] == "scheduled_job_error"
+    assert failure["job_id"] == "threaded-test-job"
+    assert failure["exception"] == "ValueError('bad threaded job')"
+
+
+def test_job_error_bounds_exception_repr(tmp_path: Path):
+    from types import SimpleNamespace
+    from unittest.mock import patch
+
+    async def noop(_e):
+        return True
+
+    sched = Scheduler(scheduler_yaml=tmp_path / "s.yaml", enqueue=noop)
+    event = SimpleNamespace(
+        job_id="large-error-test-job",
+        exception=RuntimeError("X" * 20_000),
+    )
+
+    with patch("mimir.scheduler.log_event_sync") as log_sync:
+        sched._on_job_error(event)
+
+    log_sync.assert_called_once()
+    event_type, = log_sync.call_args.args
+    exception = log_sync.call_args.kwargs["exception"]
+    assert event_type == "scheduled_job_error"
+    assert len(exception) == 500
+    assert "...[truncated]..." in exception
+    assert exception.startswith("RuntimeError('XXX")
+    assert exception.endswith("XXX')")
+
+
+@pytest.mark.asyncio
+async def test_self_wrapping_job_does_not_emit_generic_error_twice(
+    tmp_path: Path, monkeypatch,
+):
+    from mimir.event_logger import log_event
+
+    monkeypatch.setenv("MIMIR_LOOP_STALL_ALERT_SECONDS", "0")
+    completed = asyncio.Event()
+
+    async def noop(_e):
+        return True
+
+    async def self_wrapping() -> None:
+        try:
+            raise RuntimeError("handled by body")
+        except RuntimeError as exc:
+            await log_event("self_wrapped_job_error", error=repr(exc))
+        finally:
+            completed.set()
+
+    sched = Scheduler(scheduler_yaml=tmp_path / "s.yaml", enqueue=noop)
+    sched._scheduler.add_job(
+        self_wrapping,
+        trigger=DateTrigger(run_date=datetime.now(tz=timezone.utc)),
+        id="self-wrapping-test-job",
+    )
+    sched.start()
+    try:
+        await asyncio.wait_for(completed.wait(), timeout=2)
+        await asyncio.sleep(0.05)
+    finally:
+        await sched.stop()
+
+    events = [
+        _json.loads(line)
+        for line in (tmp_path / "logs" / "events.jsonl")
+        .read_text(encoding="utf-8")
+        .splitlines()
+        if line.strip()
+    ]
+    assert [e["type"] for e in events] == ["self_wrapped_job_error"]
 
 
 @pytest.mark.asyncio

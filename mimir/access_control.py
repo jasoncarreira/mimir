@@ -4726,6 +4726,41 @@ _FIXED_SERVICE_SINK_OPERATIONS = frozenset({"rebuild_index"})
 
 _TAINT_INDEPENDENT_EGRESS_TOOLS = frozenset({"fetch_url", "web_search"})
 
+
+def _egress_target_requires_taint_gate(
+    tool_name: str, target: str | None, auth_context: Any,
+) -> bool:
+    """Gate egress generally, including fetch targets approved only by scope."""
+    if tool_name not in _TAINT_INDEPENDENT_EGRESS_TOOLS:
+        return True
+    if tool_name == "web_search":
+        return False
+    if target is None:
+        return False
+    normalized = normalize_sink_destination(SinkCategory.NETWORK, target)
+    if normalized is None:
+        return False
+    if (
+        normalized in approved_fetch_urls(auth_context)
+        or _target_matches_configured_github_repo_fetch(target)
+    ):
+        return False
+    service = get_trusted_service_from_auth_context(auth_context)
+    policy = service.sink_policy_for("fetch_url") if service is not None else None
+    if (
+        policy is not None
+        and policy.adapter != "approved_urls"
+        and _sink_adapter_admits(
+            _SERVICE_SINK_ADAPTERS.get(policy.adapter),
+            normalized,
+            policy.destination,
+            service,
+        )
+    ):
+        return False
+    return fetch_url_is_approved(target, auth_context)
+
+
 _CHAINLINK_TAINT_REFUSAL = (
     "this turn carries untrusted active ingest, so Chainlink tracker mutations "
     "are unavailable for this turn. Read-only queries remain admitted: issue "
@@ -5018,7 +5053,9 @@ class SinkGate:
             )
         if capability_tier is CapabilityTier.UNBOUNDED:
             return (
-                tool_name in _TAINT_INDEPENDENT_EGRESS_TOOLS
+                not _egress_target_requires_taint_gate(
+                    tool_name, target, auth_context,
+                )
                 or not has_untrusted_active_ingest,
                 None,
             )
@@ -5170,9 +5207,12 @@ class SinkGate:
         resolved_target = resolve_sink_target(
             tool_name, sink_category, target, service,
         )
+        egress_target_requires_taint_gate = _egress_target_requires_taint_gate(
+            tool_name, target, auth_context,
+        )
         if (
             is_application_egress
-            and tool_name not in _TAINT_INDEPENDENT_EGRESS_TOOLS
+            and egress_target_requires_taint_gate
             and ifc_labels.labels
             and not ifc_labels.sources
         ):
@@ -5194,7 +5234,7 @@ class SinkGate:
         )
         if (
             is_application_egress
-            and tool_name not in _TAINT_INDEPENDENT_EGRESS_TOOLS
+            and egress_target_requires_taint_gate
             and not allow_untrusted_active_ingest
             and has_untrusted_active_ingest
         ):
@@ -5637,6 +5677,20 @@ class SinkGate:
             and target is not None
             and category in {SinkCategory.SHELL_PROCESS, SinkCategory.FILE}
         ):
+            return frozenset({target})
+        if (
+            category is SinkCategory.FORGE
+            and target is not None
+            and isinstance(sources, tuple)
+            and bool(sources)
+            and all(source.domain == "repository" for source in sources)
+            and _forge_repository_scope_mismatch(
+                ifc_labels,
+                getattr(auth_context, "repo_pr_action_scope", None),
+            ) is None
+        ):
+            # Repository command output may flow only back to the immutable
+            # PR/head scope from which it was produced.
             return frozenset({target})
         is_triggering_channel_reply = (
             service is not None
@@ -7613,6 +7667,7 @@ class ToolRegistry:
 
 
 _PROTECTED_RESULT_DOMAINS: dict[str, str] = {
+    "fetch_channel_history": "channel_history",
     "list_channels": "channel_metadata",
     "list_schedules": "schedule_metadata",
     "bash_jobs_list": "shell_jobs",
@@ -7635,7 +7690,13 @@ _PROTECTED_RESULT_DOMAINS: dict[str, str] = {
     "mimir_get_turn": "turn_history",
     "memory_query": "saga",
     "memory_get": "saga",
+    "saga_forget": "saga",
     "commitment_list": "commitments",
+    "shell_exec": "shell",
+    "execute": "shell",
+    "web_search": "web",
+    "worklink_run": "worklink",
+    "spawn_open_code": "coding_worker",
     "pr_metadata": "repository",
     "pr_files": "repository",
     "pr_diff": "repository",
@@ -7649,11 +7710,83 @@ _PROTECTED_RESULT_DOMAINS: dict[str, str] = {
     "repo_test": "repository",
     "repo_diff": "repository",
     "repo_unmerged": "repository",
+    "pr_submit_review": "repository",
+    "pr_inline_review_comment": "repository",
+    "pr_comment": "repository",
+    "issue_comment": "repository",
+    "repo_commit": "repository",
+    "repo_merge": "repository",
+    "repo_merge_abort": "repository",
+    "repo_rebase": "repository",
+    "repo_rebase_abort": "repository",
+    "repo_revert": "repository",
+    "repo_revert_abort": "repository",
+    "repo_push": "repository",
 }
 
-# These BOTH tools return only server-created metadata inline. Their external
-# content remains behind a separately classified read boundary.
-_METADATA_ONLY_RESULT_TOOLS = frozenset({"bash_async", "fetch_url"})
+# Every model-bound tool that does not ingest model-visible content is listed
+# explicitly. This makes exemption a reviewed semantic claim rather than an
+# inference from flow direction.
+_NON_INGESTING_RESULT_TOOLS = frozenset({
+    # Authorization/workflow actions return only server-created status.
+    "approve_declassification",
+    "request_operator_approval",
+    # These writes return identifiers, counts, or fixed status, not stored data.
+    "memory_store",
+    "open_proposal",
+    "submit_proposal",
+    "abandon_proposal",
+    "saga_feedback",
+    "saga_mark_contributions",
+    "saga_end_session",
+    "saga_record_skill_learning",
+    "rebuild_index",
+    # Async shell and fetch return metadata; content is read through a mapped tool.
+    "bash_async",
+    "fetch_url",
+    # Delivery and queue mutations return acknowledgements only.
+    "operator_alert",
+    "send_message",
+    "react",
+    "defer_injected_message",
+    # Scheduler and commitment mutations return normalized status only.
+    "add_schedule",
+    "set_schedule_priority",
+    "remove_schedule",
+    "set_poller_overrides",
+    "reload_pollers",
+    "commitment_complete",
+    "commitment_snooze",
+    "commitment_dismiss",
+    # Self-update returns the server-created pending-update status.
+    "request_mimir_update",
+    # These repository actions construct local acknowledgements without readback.
+    "pr_rerequest_review",
+    "unsupported_operation",
+    "repo_cleanup",
+    "repo_stage",
+    # DeepAgents state/write tools return acknowledgements or remain in-carrier.
+    "write_todos",
+    "write_file",
+    "edit_file",
+    "task",
+})
+
+_REPOSITORY_RESULT_TOOLS = frozenset({
+    "pr_metadata", "pr_files", "pr_diff", "pr_checks", "pr_reviews",
+    "pr_comments", "pr_review_requests", "repo_checkout", "repo_fetch",
+    "repo_status", "repo_test", "repo_diff", "repo_unmerged",
+    "pr_submit_review", "pr_inline_review_comment", "pr_comment",
+    "repo_commit", "repo_merge", "repo_merge_abort",
+    "repo_rebase", "repo_rebase_abort", "repo_revert", "repo_revert_abort",
+    "repo_push",
+})
+_REPOSITORY_MUTATION_RESULT_TOOLS = frozenset({
+    "pr_submit_review", "pr_inline_review_comment", "pr_comment",
+    "repo_commit", "repo_merge", "repo_merge_abort",
+    "repo_rebase", "repo_rebase_abort", "repo_revert", "repo_revert_abort",
+    "repo_push",
+})
 
 # Independent semantic inventory for tools whose results come from a read
 # backend. Startup rejects drift toward SINK/NEITHER before it can suppress
@@ -7696,6 +7829,7 @@ _SELF_AUTHORED_FILE_ROOTS = frozenset({
     "state",
 })
 _FILE_INTEGRITY_EXCLUDED_SUBTREES = frozenset({("state", "pollers")})
+_FILE_INTEGRITY_DECLASSIFICATIONS_KEY = "__declassifications__"
 
 
 @dataclass(frozen=True)
@@ -7894,9 +8028,10 @@ def _persisted_file_integrity(home: Path, relative: Path) -> str:
         return "untrusted"
     if not isinstance(payload, dict):
         return "untrusted"
-    value = payload.get(relative.as_posix())
-    if value is None:
+    key = relative.as_posix()
+    if key not in payload:
         return "trusted"
+    value = payload[key]
     return "trusted" if value == "trusted" else "untrusted"
 
 
@@ -7956,10 +8091,13 @@ def record_file_write_integrity(
         return True
     if relative.parts[0:2] in _FILE_INTEGRITY_EXCLUDED_SUBTREES:
         return True
-    integrity = "untrusted"
     sources = getattr(labels, "sources", ())
-    if sources and all(source.integrity == "trusted" for source in sources):
-        integrity = "trusted"
+    integrity = (
+        "trusted"
+        if labels is not None
+        and all(source.integrity == "trusted" for source in sources)
+        else "untrusted"
+    )
 
     metadata_path = home / ".mimir" / "file-integrity.json"
     with _persisted_file_integrity_lock:
@@ -7971,7 +8109,14 @@ def record_file_write_integrity(
             )
             if not isinstance(payload, dict):
                 return False
-            payload[relative.as_posix()] = integrity
+            key = relative.as_posix()
+            existing = payload.get(key)
+            # This hook runs before the file mutation. A clean turn therefore
+            # cannot prove that an existing tainted file was fully replaced (or
+            # that the write succeeded), so ordinary writes never clear a mark.
+            # Exact, digest-bound operator repair is the declassification path.
+            if integrity == "untrusted" or key not in payload or existing == "trusted":
+                payload[key] = integrity
             metadata_path.parent.mkdir(parents=True, exist_ok=True)
             tmp = metadata_path.with_suffix(".tmp")
             tmp.write_text(
@@ -7982,6 +8127,86 @@ def record_file_write_integrity(
             return True
         except (OSError, json.JSONDecodeError):
             log.exception("failed to persist file integrity for %s", relative)
+            return False
+
+
+def repair_file_write_integrity(
+    resource_id: str,
+    *,
+    expected_sha256: str,
+    operator: str,
+    reason: str,
+) -> bool:
+    """Declassify one inspected file with a digest-bound audit record.
+
+    This is an offline operator primitive, not a model tool. Existing untrusted
+    records contain too little provenance for automatic repair, so the operator
+    must attest to the exact current bytes and explain the trust decision.
+    """
+    home_value = os.environ.get("MIMIR_HOME", "").strip()
+    if (
+        not home_value
+        or not isinstance(resource_id, str)
+        or not re.fullmatch(r"[0-9a-f]{64}", expected_sha256)
+        or not operator.strip()
+        or not reason.strip()
+    ):
+        return False
+    try:
+        home = Path(home_value).resolve(strict=True)
+        requested = Path(resource_id)
+        resource = requested.resolve(strict=True)
+        relative = resource.relative_to(home)
+    except (OSError, RuntimeError, ValueError):
+        return False
+    if (
+        requested.is_symlink()
+        or not resource.is_file()
+        or not relative.parts
+        or relative.parts[0] not in _SELF_AUTHORED_FILE_ROOTS
+        or relative.parts[0:2] in _FILE_INTEGRITY_EXCLUDED_SUBTREES
+    ):
+        return False
+    try:
+        digest = hashlib.sha256(resource.read_bytes()).hexdigest()
+    except OSError:
+        return False
+    if digest != expected_sha256:
+        return False
+
+    metadata_path = home / ".mimir" / "file-integrity.json"
+    with _persisted_file_integrity_lock:
+        try:
+            payload = json.loads(metadata_path.read_text(encoding="utf-8"))
+            if not isinstance(payload, dict):
+                return False
+            key = relative.as_posix()
+            prior = payload.get(key)
+            if key not in payload or prior == "trusted":
+                return False
+            audit = payload.get(_FILE_INTEGRITY_DECLASSIFICATIONS_KEY, [])
+            if not isinstance(audit, list):
+                return False
+            payload[key] = "trusted"
+            payload[_FILE_INTEGRITY_DECLASSIFICATIONS_KEY] = [
+                *audit,
+                {
+                    "path": key,
+                    "prior": prior,
+                    "sha256": digest,
+                    "operator": operator.strip(),
+                    "reason": reason.strip(),
+                },
+            ]
+            tmp = metadata_path.with_suffix(".tmp")
+            tmp.write_text(
+                json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n",
+                encoding="utf-8",
+            )
+            tmp.replace(metadata_path)
+            return True
+        except (OSError, json.JSONDecodeError):
+            log.exception("failed to repair file integrity for %s", relative)
             return False
 
 
@@ -8056,13 +8281,9 @@ def classify_protected_result(
         return None
 
     args = arguments or {}
-    if tool_name in {
-        "pr_metadata", "pr_files", "pr_diff", "pr_checks", "pr_reviews",
-        "pr_comments", "pr_review_requests", "repo_checkout", "repo_fetch",
-        "repo_status", "repo_test", "repo_diff", "repo_unmerged",
-    }:
+    if tool_name in _REPOSITORY_RESULT_TOOLS:
         scope = authorization.repo_pr_action_scope
-        if scope is None or failed:
+        if scope is None:
             return _incomplete_protected_result("repository", args)
         principal = getattr(auth_context, "canonical_principal", None)
         if getattr(auth_context, "is_service", False) and principal:
@@ -8081,10 +8302,14 @@ def classify_protected_result(
             ),
             source_kind="protected_tool",
             integrity="untrusted",
-            # The immutable authority record already selected this exact PR.
-            # Preserve its confidentiality label without deadlocking the next
-            # scope-bound edit/review operation as fresh active ingress.
-            integrity_effect="informational",
+            # Read results are informational within the immutable PR scope.
+            # Mutation responses and failures can contain Git/forge output, so
+            # they remain active ingestion attributed to that exact scope.
+            integrity_effect=(
+                "active_ingest"
+                if failed or tool_name in _REPOSITORY_MUTATION_RESULT_TOOLS
+                else "informational"
+            ),
         )
         labels = InformationFlowLabels().with_source(source)
         channel = getattr(auth_context, "channel_id", None)
@@ -8179,14 +8404,7 @@ def classify_protected_result(
                 labels = labels.with_source(source)
             return labels
 
-        metadata_only = tool_name in _METADATA_ONLY_RESULT_TOOLS
-        flow_direction = authorization.flow_direction
-        if flow_direction is ToolFlowDirection.UNKNOWN:
-            flow_direction = get_tool_flow_direction(tool_name)
-        if metadata_only or flow_direction not in {
-            ToolFlowDirection.SOURCE,
-            ToolFlowDirection.BOTH,
-        }:
+        if tool_name in _NON_INGESTING_RESULT_TOOLS:
             return None
         # An ingesting native tool without a confidentiality domain still
         # introduces model-visible content. Unknown provenance must taint the
@@ -8770,6 +8988,15 @@ def assert_model_tool_inventory_cataloged(
             ToolFlowDirection.SOURCE, ToolFlowDirection.BOTH,
         }
     })
+    unclassified_results = sorted({
+        tool_name for tool_name in tool_names
+        if not tool_name.startswith(MCPResourceAdapter._MCP_TOOL_PREFIX)
+        and tool_name not in _PROTECTED_RESULT_DOMAINS
+        and tool_name not in _NON_INGESTING_RESULT_TOOLS
+    })
+    overlapping_result_policies = sorted(
+        _PROTECTED_RESULT_DOMAINS.keys() & _NON_INGESTING_RESULT_TOOLS
+    )
     errors: list[str] = []
     if unknown_tools:
         errors.append("UNKNOWN model-bound tools: " + ", ".join(unknown_tools))
@@ -8781,6 +9008,16 @@ def assert_model_tool_inventory_cataloged(
         errors.append(
             "read-backend tools must be IFC SOURCE/BOTH: "
             + ", ".join(misclassified_read_backends)
+        )
+    if unclassified_results:
+        errors.append(
+            "model-bound tools without explicit protected-result classification: "
+            + ", ".join(unclassified_results)
+        )
+    if overlapping_result_policies:
+        errors.append(
+            "model-bound tools both mapped and exempted from result classification: "
+            + ", ".join(overlapping_result_policies)
         )
     if errors:
         raise CapabilityMatrixError(

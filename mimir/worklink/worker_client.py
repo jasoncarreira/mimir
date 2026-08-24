@@ -16,6 +16,7 @@ DEFAULT_EXECUTOR_SOCKET = Path("/run/mimir-worklink/socket/worklink-execd.sock")
 ENABLED_CHECKOUT_ROOT = Path("/var/lib/mimir-worklink/checkouts")
 MAX_REQUEST_BYTES = 256 * 1024
 MAX_PROJECTION_BYTES = 1024 * 1024
+CANCEL_SOCKET_TIMEOUT_S = 20.0
 # Keep this literal independent from worker_exec. The executor runs its image-owned
 # copy, so changing either side of the launch contract requires an image rebuild.
 EXECUTOR_PROTOCOL_IDENTITY = "worklink-executor-v3-repo-uv-cache"
@@ -96,9 +97,11 @@ class WorkerClient:
         self.checkout = checkout
         self.socket_path = socket_path
 
-    def _connect(self) -> socket.socket:
+    def _connect(self, timeout_s: float | None = None) -> socket.socket:
         sock = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
         try:
+            if timeout_s is not None:
+                sock.settimeout(timeout_s)
             sock.connect(str(self.socket_path))
             _pid, uid, _gid = struct.unpack(
                 "3i",
@@ -224,7 +227,7 @@ class WorkerClient:
             },
             separators=(",", ":"),
         ).encode()
-        sock = await asyncio.to_thread(self._connect)
+        sock = await asyncio.to_thread(self._connect, CANCEL_SOCKET_TIMEOUT_S)
         try:
             sock.send(payload)
             response = json.loads(await asyncio.to_thread(sock.recv, 4096))
