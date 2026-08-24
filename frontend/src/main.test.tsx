@@ -259,11 +259,14 @@ describe("AppFrame login gate + admin surface gating (#563 / #577)", () => {
     // The header status chip doubles as sign-out (clears the stored key).
     fireEvent.click(screen.getByRole("button", { name: "Sign out" }));
 
-    // Key gone -> gated again: dashboard nav disappears, login screen returns.
+    // Key gone -> bootstrap is invalidated so the prior user's UI data cannot
+    // survive sign-out. The loading state is transient, then login returns.
+    expect(screen.getByText("Loading server auth policy…")).toBeTruthy();
     await waitFor(() =>
       expect(screen.queryByRole("link", { name: /Users/ })).toBeNull()
     );
-    expect(screen.getByRole("button", { name: "Sign in" })).toBeTruthy();
+    expect(await screen.findByRole("button", { name: "Sign in" })).toBeTruthy();
+    expect(screen.queryByText("Loading server auth policy…")).toBeNull();
   });
 
   it("shows a re-authentication message and lets the user replace a rejected key", async () => {
