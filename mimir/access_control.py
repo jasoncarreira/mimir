@@ -7736,6 +7736,7 @@ _SELF_AUTHORED_FILE_ROOTS = frozenset({
     "state",
 })
 _FILE_INTEGRITY_EXCLUDED_SUBTREES = frozenset({("state", "pollers")})
+_FILE_INTEGRITY_DECLASSIFICATIONS_KEY = "__declassifications__"
 
 
 @dataclass(frozen=True)
@@ -7934,9 +7935,10 @@ def _persisted_file_integrity(home: Path, relative: Path) -> str:
         return "untrusted"
     if not isinstance(payload, dict):
         return "untrusted"
-    value = payload.get(relative.as_posix())
-    if value is None:
+    key = relative.as_posix()
+    if key not in payload:
         return "trusted"
+    value = payload[key]
     return "trusted" if value == "trusted" else "untrusted"
 
 
@@ -7996,10 +7998,13 @@ def record_file_write_integrity(
         return True
     if relative.parts[0:2] in _FILE_INTEGRITY_EXCLUDED_SUBTREES:
         return True
-    integrity = "untrusted"
     sources = getattr(labels, "sources", ())
-    if sources and all(source.integrity == "trusted" for source in sources):
-        integrity = "trusted"
+    integrity = (
+        "trusted"
+        if labels is not None
+        and all(source.integrity == "trusted" for source in sources)
+        else "untrusted"
+    )
 
     metadata_path = home / ".mimir" / "file-integrity.json"
     with _persisted_file_integrity_lock:
@@ -8011,7 +8016,14 @@ def record_file_write_integrity(
             )
             if not isinstance(payload, dict):
                 return False
-            payload[relative.as_posix()] = integrity
+            key = relative.as_posix()
+            existing = payload.get(key)
+            # This hook runs before the file mutation. A clean turn therefore
+            # cannot prove that an existing tainted file was fully replaced (or
+            # that the write succeeded), so ordinary writes never clear a mark.
+            # Exact, digest-bound operator repair is the declassification path.
+            if integrity == "untrusted" or key not in payload or existing == "trusted":
+                payload[key] = integrity
             metadata_path.parent.mkdir(parents=True, exist_ok=True)
             tmp = metadata_path.with_suffix(".tmp")
             tmp.write_text(
@@ -8022,6 +8034,86 @@ def record_file_write_integrity(
             return True
         except (OSError, json.JSONDecodeError):
             log.exception("failed to persist file integrity for %s", relative)
+            return False
+
+
+def repair_file_write_integrity(
+    resource_id: str,
+    *,
+    expected_sha256: str,
+    operator: str,
+    reason: str,
+) -> bool:
+    """Declassify one inspected file with a digest-bound audit record.
+
+    This is an offline operator primitive, not a model tool. Existing untrusted
+    records contain too little provenance for automatic repair, so the operator
+    must attest to the exact current bytes and explain the trust decision.
+    """
+    home_value = os.environ.get("MIMIR_HOME", "").strip()
+    if (
+        not home_value
+        or not isinstance(resource_id, str)
+        or not re.fullmatch(r"[0-9a-f]{64}", expected_sha256)
+        or not operator.strip()
+        or not reason.strip()
+    ):
+        return False
+    try:
+        home = Path(home_value).resolve(strict=True)
+        requested = Path(resource_id)
+        resource = requested.resolve(strict=True)
+        relative = resource.relative_to(home)
+    except (OSError, RuntimeError, ValueError):
+        return False
+    if (
+        requested.is_symlink()
+        or not resource.is_file()
+        or not relative.parts
+        or relative.parts[0] not in _SELF_AUTHORED_FILE_ROOTS
+        or relative.parts[0:2] in _FILE_INTEGRITY_EXCLUDED_SUBTREES
+    ):
+        return False
+    try:
+        digest = hashlib.sha256(resource.read_bytes()).hexdigest()
+    except OSError:
+        return False
+    if digest != expected_sha256:
+        return False
+
+    metadata_path = home / ".mimir" / "file-integrity.json"
+    with _persisted_file_integrity_lock:
+        try:
+            payload = json.loads(metadata_path.read_text(encoding="utf-8"))
+            if not isinstance(payload, dict):
+                return False
+            key = relative.as_posix()
+            prior = payload.get(key)
+            if key not in payload or prior == "trusted":
+                return False
+            audit = payload.get(_FILE_INTEGRITY_DECLASSIFICATIONS_KEY, [])
+            if not isinstance(audit, list):
+                return False
+            payload[key] = "trusted"
+            payload[_FILE_INTEGRITY_DECLASSIFICATIONS_KEY] = [
+                *audit,
+                {
+                    "path": key,
+                    "prior": prior,
+                    "sha256": digest,
+                    "operator": operator.strip(),
+                    "reason": reason.strip(),
+                },
+            ]
+            tmp = metadata_path.with_suffix(".tmp")
+            tmp.write_text(
+                json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n",
+                encoding="utf-8",
+            )
+            tmp.replace(metadata_path)
+            return True
+        except (OSError, json.JSONDecodeError):
+            log.exception("failed to repair file integrity for %s", relative)
             return False
 
 
