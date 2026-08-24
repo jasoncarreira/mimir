@@ -422,8 +422,7 @@ class DiscordBridge(Bridge):
                     "DiscordBridge supervisor: client.start() returned cleanly; exiting"
                 )
                 await _safe_log_event(
-                    "bridge_exited",
-                    bridge="discord",
+                    "discord_bridge_exited",
                     reason="client.start() returned cleanly",
                 )
                 return

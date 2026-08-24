@@ -1185,7 +1185,7 @@ async def test_slack_supervisor_fires_algedonic_after_three_attempts(monkeypatch
     assert len(retry_events) == 2  # attempts 3, 4; the fifth remains in progress
     assert retry_events[0][1]["attempt"] == 3
     assert retry_events[0][1]["slack_error"] == "service_unavailable"
-    assert not any(k == "bridge_exited" for k, _ in captured)
+    assert not any(k == "slack_bridge_exited" for k, _ in captured)
 
     bridge._runner.cancel()
     with pytest.raises(asyncio.CancelledError):
@@ -1224,11 +1224,8 @@ async def test_slack_supervisor_clean_exit_when_handler_returns(monkeypatch, tmp
     await asyncio.wait_for(bridge._runner, timeout=1.0)
     assert attempts["n"] == 1
     assert captured == [(
-        "bridge_exited",
-        {
-            "bridge": "slack",
-            "reason": "handler.start_async() returned cleanly",
-        },
+        "slack_bridge_exited",
+        {"reason": "handler.start_async() returned cleanly"},
     )]
 
 

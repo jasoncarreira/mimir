@@ -1931,6 +1931,38 @@ def test_escalation_rows_collapse_by_escalated_kind(tmp_path: Path):
     assert "(×2 in 24h)" in lines[0]
 
 
+def test_bridge_clean_exits_classify_and_render_negative(tmp_path: Path):
+    """A clean bridge-supervisor return must be operator-visible, not merely
+    an events.jsonl record indistinguishable from a quiet channel."""
+    from mimir.feedback import classify
+
+    assert classify("discord_bridge_exited") == (
+        "negative", "discord_bridge_exited",
+    )
+    assert classify("slack_bridge_exited") == (
+        "negative", "slack_bridge_exited",
+    )
+
+    log = _make_log(tmp_path, events=[
+        {
+            "timestamp": _ts(0.1),
+            "type": "discord_bridge_exited",
+            "reason": "client.start() returned cleanly",
+        },
+        {
+            "timestamp": _ts(0.2),
+            "type": "slack_bridge_exited",
+            "reason": "handler.start_async() returned cleanly",
+        },
+    ])
+    block = log.recent_block()
+    assert block is not None
+    assert "Discord bridge supervisor exited" in block
+    assert "Discord traffic is down until restart" in block
+    assert "Slack bridge supervisor exited" in block
+    assert "Slack traffic is down until restart" in block
+
+
 def test_poller_reload_invalid_cron_classified_negative():
     """chainlink #419: the invalid-cron reload event must be in
     _EVENT_RULES so the operator sees a broken poller schedule

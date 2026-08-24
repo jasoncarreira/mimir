@@ -416,8 +416,7 @@ class SlackBridge(Bridge):
                     "returned cleanly; exiting"
                 )
                 await _safe_log_event(
-                    "bridge_exited",
-                    bridge="slack",
+                    "slack_bridge_exited",
                     reason="handler.start_async() returned cleanly",
                 )
                 return

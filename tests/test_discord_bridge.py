@@ -1291,7 +1291,7 @@ async def test_supervisor_fires_algedonic_after_three_attempts(monkeypatch, tmp_
     assert len(retry_events) == 2
     assert retry_events[0][1]["attempt"] == 3
     assert retry_events[1][1]["attempt"] == 4
-    assert not any(k == "bridge_exited" for k, _ in captured)
+    assert not any(k == "discord_bridge_exited" for k, _ in captured)
 
     assert bridge._runner is not None
     bridge._runner.cancel()
@@ -1329,11 +1329,8 @@ async def test_supervisor_clean_exit_when_client_returns(monkeypatch, tmp_path: 
     await asyncio.wait_for(bridge._runner, timeout=1.0)
     assert attempts["n"] == 1  # no retries on clean exit
     assert captured == [(
-        "bridge_exited",
-        {
-            "bridge": "discord",
-            "reason": "client.start() returned cleanly",
-        },
+        "discord_bridge_exited",
+        {"reason": "client.start() returned cleanly"},
     )]
 
 
