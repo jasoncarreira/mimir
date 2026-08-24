@@ -401,6 +401,7 @@ async def test_sagastore_query_accepts_extra_atom_ranked_pathways(
     result = await client.query(
         "zzq-no-keyword-match",
         top_k=5,
+        min_confidence_tier="none",
         extra_atom_ranked_pathways={"session_boundary": [stored["atom_id"]]},
         rrf_pathway_weights={"session_boundary": 0.5},
         auth_context=ADMIN_AUTH,

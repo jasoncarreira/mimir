@@ -218,6 +218,28 @@ async def test_post_job_failure_notice_sends():
 
 
 @pytest.mark.asyncio
+async def test_post_job_failure_notice_applies_boundary_redaction():
+    reg = ChannelRegistry()
+    bridge = _bridge("rec", ("rec-",))
+    reg.register(bridge)
+    slack_bot = "xoxb-A0123456789-abcdef"
+    slack_app = "xapp-1-A0LEAKPROBE1234567890abc"
+
+    await post_job_failure_notice(
+        reg,
+        "rec-ops",
+        label="github-activity",
+        error=f"RuntimeError: slack_bot={slack_bot} slack_app={slack_app}",
+    )
+
+    assert len(bridge.sent) == 1
+    _, text = bridge.sent[0]
+    assert "[REDACTED]" in text
+    assert slack_bot not in text
+    assert slack_app not in text
+
+
+@pytest.mark.asyncio
 async def test_post_job_failure_notice_noops_without_channel_or_registry():
     reg = ChannelRegistry()
     bridge = _bridge("rec", ("rec-",))

@@ -77,7 +77,8 @@ _RESERVED_RRF_PATHWAYS = frozenset(DEFAULT_RRF_WEIGHTS)
 #: Per-atom confidence_tier thresholds. Saga bench TOML defaults:
 #: ``confidence_sim_high = 0.45``, ``_medium = 0.30``, ``_low = 0.10``.
 #: An atom's similarity (max of FAISS cosine vs query embedding,
-#: triple cosine, and a small floor) maps to a tier label. Production
+#: triple cosine, and the low-tier floor for keyword-path candidates) maps
+#: to a tier label. Production
 #: callers filter retrieval by ``min_confidence_tier`` to suppress
 #: weakly-grounded atoms; prompt rendering uses the tag for the
 #: per-atom label (``observation/high``, ``raw/medium``).
@@ -484,15 +485,18 @@ def recall(
         # compete.
         if not atom["is_pinned"] and activation < threshold:
             continue
-        # The atom's "best" similarity is the max of its FAISS cosine
-        # and its triple-augment cosine — both are embedding-cosine
-        # comparable; keyword BM25 isn't. This drives the
+        # The atom's "best" similarity is the max of its FAISS cosine,
+        # triple-augment cosine, and (for keyword-path candidates) the low-tier
+        # floor. Keyword BM25 isn't cosine-comparable, but its candidates still
+        # need that baseline so an exact keyword-only hit survives a low floor.
+        # This drives the
         # confidence_tier label saga's prompt uses for the
         # per-atom tag (observation/high, raw/medium, etc.) and that
         # min_confidence_tier filters on.
         best_sim = max(
             sim_map.get(atom_id, 0.0),
             triple_sim_map.get(atom_id, 0.0),
+            CONFIDENCE_TIER_THRESHOLDS["low"] if atom_id in kw_map else 0.0,
         )
         tier = _tier_for_similarity(best_sim)
         if not _passes_min_tier(tier, min_confidence_tier):

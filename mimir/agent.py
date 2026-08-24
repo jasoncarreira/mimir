@@ -2586,6 +2586,9 @@ class Agent:
                     event.content,
                     top_k=12,
                     session_id=saga_session_id,
+                    min_confidence_tier=(
+                        self._config.saga_pre_message_min_tier.strip() or None
+                    ),
                     context=rewrite_context,
                     auth_context=initial_auth_context,
                 )

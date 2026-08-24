@@ -23,12 +23,9 @@ from dotenv import load_dotenv
 
 from .access_control import resolve_access_control_enforcement
 from .billing import BillingMode, detect_billing_mode
-from .coding import (
-    _ENV_BOOL_FALSY,
-    _ENV_BOOL_TRUTHY,
-    coding_enabled,
-    env_bool,
-)
+from .coding import coding_enabled
+from .env import _ENV_BOOL_FALSY, _ENV_BOOL_TRUTHY, env_bool
+
 # Single source of the shipped default. ``mimir setup`` writes this same
 # spec via ``detect_route(None)``, so a setup-created home and a home that
 # never ran setup select the same model. model_registry imports only
