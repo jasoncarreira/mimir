@@ -1476,6 +1476,48 @@ print(json.dumps({"poller": "x", "prompt": prompt}))
 
 
 @pytest.mark.asyncio
+async def test_run_poller_exports_its_effective_timeout(
+    tmp_path: Path, home: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A poller must be able to bound its own work against the cap it will be
+    killed at, without hardcoding a copy that drifts from the constant.
+
+    Asserts the *effective* timeout, not the default: a caller passing a
+    different one must have that value reach the subprocess, or a poller sizing
+    its deadlines from the env would overrun.
+    """
+    monkeypatch.delenv("POLLER_TIMEOUT_SECONDS", raising=False)
+    skill_dir = tmp_path / "skill"
+    _install_script(skill_dir, "poller.py", """
+import json, os
+print(json.dumps({
+    "poller": "x",
+    "prompt": f"cap={os.environ['POLLER_TIMEOUT_SECONDS']}",
+}))
+""")
+    cfg = PollerConfig(
+        name="my-poller", command=f"{sys.executable} poller.py",
+        cron="* * * * *", env={}, skill_dir=skill_dir,
+    )
+    enq = _CapturingEnqueue()
+    await run_poller(cfg, enqueue=enq, home=home)
+    assert len(enq.events) == 1
+    assert f"cap={POLLER_TIMEOUT_SECONDS}" in enq.events[0].content
+
+    enq2 = _CapturingEnqueue()
+    await run_poller(cfg, enqueue=enq2, home=home, timeout=45)
+    assert len(enq2.events) == 1
+    assert "cap=45" in enq2.events[0].content
+
+    # Fractional timeouts must survive: `str(int(timeout))` turned 0.5 into "0",
+    # so a poller sizing deadlines from this would have read a cap of zero.
+    enq3 = _CapturingEnqueue()
+    await run_poller(cfg, enqueue=enq3, home=home, timeout=0.5)
+    assert len(enq3.events) == 1
+    assert "cap=0.5" in enq3.events[0].content
+
+
+@pytest.mark.asyncio
 async def test_run_poller_mimir_home_falls_back_to_install_layout(
     tmp_path: Path, home: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1566,16 +1608,17 @@ print(json.dumps({
         ((204, None), None, True),
         ((404, None), (200, {"state": "active"}), True),
         ((404, None), (404, None), False),
-        (None, None, False),
-        (None, (200, {"state": "active"}), False),
-        ((403, {"message": "rate limited"}), (200, {"state": "active"}), False),
+        (None, None, None),
+        (None, (200, {"state": "active"}), None),
+        ((403, {"message": "rate limited"}), (200, {"state": "active"}), None),
+        ((404, None), None, None),
     ],
 )
 def test_github_author_trust_is_server_attested_and_fail_closed(
     monkeypatch: pytest.MonkeyPatch,
     collaborator: object,
     membership: object,
-    expected: bool,
+    expected: bool | None,
 ) -> None:
     calls: list[str] = []
 
@@ -2646,9 +2689,64 @@ def test_poller_config_channel_id_format():
 
 
 def test_poller_timeout_constant_reasonable():
-    """Locks the contract: the framework's hard-cap is 60s. Skill
-    authors who need longer-running pollers must restructure."""
-    assert POLLER_TIMEOUT_SECONDS == 60
+    """Locks the contract: the framework hard-cap a poller is killed at.
+
+    Raised 60 -> 120 for chainlink #1433. Still a hard cap — a poller needing
+    longer must bound its own work or restructure, because overrunning discards
+    everything the tick emitted rather than returning a partial result.
+    """
+    assert POLLER_TIMEOUT_SECONDS == 120
+
+
+def test_poller_timeout_stays_below_every_shipped_cadence():
+    """Sanity check on the *bundled* manifests only.
+
+    This is deliberately not the enforcement: pollers are discovered from
+    ``<home>/skills/**/pollers.json`` and ``pollers-overrides.yaml`` can replace
+    a cron, so a locally installed or overridden fast poller would never appear
+    here. The runtime constraint is enforced per poller at fire time — see
+    ``Scheduler._effective_poller_timeout`` and its tests in test_scheduler.py.
+    Kept because it catches the common case (someone adds a fast shipped poller)
+    directly in this repo.
+    """
+    from datetime import datetime, timezone
+
+    from apscheduler.triggers.cron import CronTrigger
+
+    from mimir.scheduler import _cron_with_standard_dow
+
+    manifests = sorted(Path("mimir/optional-skills").glob("*/pollers.json"))
+    assert manifests, "no shipped poller manifests found — test is vacuous"
+
+    now = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    checked: list[tuple[str, float]] = []
+    for manifest in manifests:
+        raw = json.loads(manifest.read_text(encoding="utf-8"))
+        entries = raw.get("pollers", raw) if isinstance(raw, dict) else raw
+        for entry in entries if isinstance(entries, list) else [entries]:
+            if not isinstance(entry, dict):
+                continue
+            name = str(entry.get("name"))
+            interval = entry.get("interval_seconds")
+            if isinstance(interval, (int, float)) and interval > 0:
+                checked.append((name, float(interval)))
+                continue
+            cron = entry.get("cron")
+            if not isinstance(cron, str) or not cron.strip():
+                continue
+            trigger = CronTrigger.from_crontab(
+                _cron_with_standard_dow(cron), timezone=timezone.utc,
+            )
+            first = trigger.get_next_fire_time(None, now)
+            second = trigger.get_next_fire_time(first, first)
+            checked.append((name, (second - first).total_seconds()))
+
+    assert checked, "no cadences resolved — test is vacuous"
+    for name, period in checked:
+        assert POLLER_TIMEOUT_SECONDS < period, (
+            f"{name} fires every {period:.0f}s but the cap is "
+            f"{POLLER_TIMEOUT_SECONDS}s; a slow run would swallow the next fire"
+        )
 
 
 def test_pollers_module_annotations_resolve():

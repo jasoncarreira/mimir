@@ -913,6 +913,7 @@ def reattach_inflight_worklink_runs(
     home: Path,
     *,
     popen: Any = None,
+    event_logger: Any = None,
 ) -> list[int]:
     """Startup reconcile (#561): resume Worklink runs orphaned by a restart.
 
@@ -933,10 +934,18 @@ def reattach_inflight_worklink_runs(
     from .worklink.run_state import reattach_dispatch_argv
 
     spawn = popen or subprocess.Popen
+    event_callback = event_logger or log_event_sync
+    failures: list[dict[str, Any]] = []
+
+    def emit(event: str, **payload: Any) -> None:
+        try:
+            event_callback(event, **payload)
+        except Exception:  # noqa: BLE001 - telemetry cannot block startup recovery
+            pass
     # Local workers cannot survive a restart. Reap their records first, even on
     # homes without a configured reattach repository; malformed records emit an
     # event and never abort startup.
-    states = reconcile_run_states(home, event_logger=log_event_sync)
+    states = reconcile_run_states(home, event_logger=emit)
     try:
         factory_records = [
             record
@@ -945,12 +954,31 @@ def reattach_inflight_worklink_runs(
             and record.controller_phase not in {"parked", "terminal", "stopped"}
             and (record.status is None or not record.status.is_terminal)
         ]
-    except Exception:
+    except Exception as exc:
         factory_records = []
+        failure = {
+            "issue_id": None,
+            "reason": "factory_record_enumeration_failed",
+            "error": str(exc)[:500],
+        }
+        failures.append(failure)
+        emit("worklink_reattach_dispatch_failed", **failure)
     repo = os.environ.get("WORKLINK_REPO")
     if not repo:
+        emit(
+            "worklink_reattach_attempted",
+            examined=0,
+            dispatched_issue_ids=[],
+            failures=failures,
+        )
         return []
     if not states and not factory_records:
+        emit(
+            "worklink_reattach_attempted",
+            examined=0,
+            dispatched_issue_ids=[],
+            failures=failures,
+        )
         return []
     run_bin = shlex.split(os.environ.get("WORKLINK_RUN_BIN") or "mimir")
     state_dir = home / "state" / "worklink" / "runs"
@@ -975,7 +1003,14 @@ def reattach_inflight_worklink_runs(
                 stderr=log_fh,
                 start_new_session=True,  # detach: survive this startup + outlive it
             )
-        except (OSError, subprocess.SubprocessError):
+        except (OSError, subprocess.SubprocessError) as exc:
+            failure = {
+                "issue_id": state.issue_id,
+                "reason": "reattach_spawn_failed",
+                "error": str(exc)[:500],
+            }
+            failures.append(failure)
+            emit("worklink_reattach_dispatch_failed", **failure)
             continue
         finally:
             if log_fh not in (subprocess.DEVNULL, None):
@@ -1010,7 +1045,14 @@ def reattach_inflight_worklink_runs(
                 stderr=log_fh,
                 start_new_session=True,
             )
-        except (OSError, subprocess.SubprocessError):
+        except (OSError, subprocess.SubprocessError) as exc:
+            failure = {
+                "issue_id": record.issue_id,
+                "reason": "factory_recovery_spawn_failed",
+                "error": str(exc)[:500],
+            }
+            failures.append(failure)
+            emit("worklink_reattach_dispatch_failed", **failure)
             continue
         finally:
             if log_fh not in (subprocess.DEVNULL, None):
@@ -1019,6 +1061,12 @@ def reattach_inflight_worklink_runs(
                 except OSError:
                     pass
         dispatched.append(record.issue_id)
+    emit(
+        "worklink_reattach_attempted",
+        examined=len(states) + len(factory_records),
+        dispatched_issue_ids=dispatched,
+        failures=failures,
+    )
     return dispatched
 
 
@@ -1561,8 +1609,7 @@ def build_app(config: Config) -> web.Application:
         # Best-effort + non-blocking (each resume runs detached).
         try:
             resumed = reattach_inflight_worklink_runs(config.home)
-            if resumed:
-                await log_event("worklink_reattach_dispatched", issues=resumed)
+            await log_event("worklink_reattach_dispatched", issues=resumed)
         except Exception as exc:  # noqa: BLE001 — startup reconcile must never abort boot
             await log_event("worklink_reattach_dispatch_failed", error=str(exc))
 
@@ -2146,18 +2193,23 @@ def build_app(config: Config) -> web.Application:
                     release_timeout,
                     float(config.drain_timeout_seconds),
                 )
-            released = attempt_sync(
+            release_result = attempt_sync(
                 lambda: release_claims_for_graceful_shutdown(
                     config.home,
                     agent_id=worklink_agent_id,
                     timeout_s=release_timeout,
                 )
             )
-            if released is not None:
+            if release_result is not None:
+                released, failed = release_result
                 await attempt(
                     lambda: log_event(
                         "worklink_shutdown_claims_released",
                         issue_ids=[record.issue_id for record in released],
+                        failed=[
+                            {"issue_id": failure.issue_id, "reason": failure.reason}
+                            for failure in failed
+                        ],
                     )
                 )
             await attempt(lambda: log_event("shutdown", reason="cleanup"))

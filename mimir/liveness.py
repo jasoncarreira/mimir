@@ -37,6 +37,8 @@ from typing import Any, Awaitable, Callable
 
 import aiohttp
 
+from .event_logger import log_durable_event_sync
+
 log = logging.getLogger(__name__)
 
 LIVENESS_FILENAME = "liveness.json"
@@ -67,7 +69,12 @@ _CATEGORY = "agent-liveness"
 UNCLEAN_NOTIFY_WINDOW = 120.0
 
 
-def _atomic_write_json(path: Path, payload: dict[str, Any]) -> bool:
+def _atomic_write_json(
+    path: Path,
+    payload: dict[str, Any],
+    *,
+    _on_error: Callable[[OSError], None] | None = None,
+) -> bool:
     """Atomically write ``payload`` as JSON to ``path`` (tmp-file + rename, so
     a concurrent reader never sees a torn file). Soft-fail: returns ``False``
     on ``OSError`` and never raises — a state-file write must never disrupt the
@@ -80,7 +87,9 @@ def _atomic_write_json(path: Path, payload: dict[str, Any]) -> bool:
         os.replace(tmp, path)
         return True
     except OSError as exc:
-        log.debug("atomic json write to %s failed: %s", path, exc)
+        log.warning("atomic json write to %s failed: %s", path, exc)
+        if _on_error is not None:
+            _on_error(exc)
         return False
 
 
@@ -98,7 +107,8 @@ def write_beat(
     *,
     started_at: float | None = None,
     ts: float | None = None,
-) -> None:
+    _on_error: Callable[[OSError], None] | None = None,
+) -> bool:
     """Atomically rewrite ``<home>/.mimir/liveness.json`` with the current
     timestamp. Cheap (a few bytes); tmp-file + rename so the watcher never
     reads a torn file. ``ts`` is injectable for tests."""
@@ -112,7 +122,7 @@ def write_beat(
     if started_at is not None:
         payload["started_at"] = started_at
         payload["uptime_s"] = round(now - started_at, 1)
-    _atomic_write_json(path, payload)
+    return _atomic_write_json(path, payload, _on_error=_on_error)
 
 
 def read_beat(home: Path) -> dict[str, Any] | None:
@@ -143,18 +153,55 @@ async def liveness_beat_loop(
     *,
     interval: float,
     started_at: float | None = None,
+    _event_logger: Callable[..., None] | None = None,
 ) -> None:
     """Background task: write a beat every ``interval`` seconds, forever.
     Stops (and the beat goes stale) if the event loop dies or wedges — which
     is exactly the signal the watchdog keys on."""
     started_at = time.time() if started_at is None else started_at
+    event_logger = _event_logger or log_durable_event_sync
+    marker_path = liveness_path(home)
+    write_failed = False
+
+    async def write_once() -> None:
+        nonlocal write_failed
+        write_error: OSError | None = None
+
+        def capture_error(exc: OSError) -> None:
+            nonlocal write_error
+            write_error = exc
+
+        succeeded = await asyncio.to_thread(
+            write_beat, home, started_at=started_at, _on_error=capture_error,
+        )
+        event_type: str | None = None
+        payload: dict[str, Any] = {"path": str(marker_path)}
+        if not succeeded and not write_failed:
+            event_type = "liveness_beat_write_failed"
+            payload["error"] = (
+                f"{type(write_error).__name__}: {write_error}"
+                if write_error is not None
+                else "atomic liveness marker write returned false"
+            )
+            write_failed = True
+        elif succeeded and write_failed:
+            event_type = "liveness_beat_write_recovered"
+            write_failed = False
+        if event_type is not None:
+            try:
+                await asyncio.to_thread(event_logger, event_type, **payload)
+            except Exception as exc:  # noqa: BLE001 - observability must not stop beats
+                log.warning("failed to record %s event: %s", event_type, exc)
+
     # Keep the heartbeat task loop-sensitive while moving the filesystem write
     # itself off-loop. A wedged event loop still stops scheduling new beats, but
     # a slow bind mount / os.replace no longer stalls the scheduler loop.
-    await asyncio.to_thread(write_beat, home, started_at=started_at)  # first beat immediately
+    # Failure events are transition-debounced: one on the first failed beat and
+    # one when a later beat succeeds, regardless of the configured interval.
+    await write_once()  # first beat immediately
     while True:
         await asyncio.sleep(interval)
-        await asyncio.to_thread(write_beat, home, started_at=started_at)
+        await write_once()
 
 
 async def _post_webhook(title: str, body: str) -> None:
