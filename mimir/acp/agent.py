@@ -577,7 +577,9 @@ class MimirAcpAgent:
         dispatcher = UpdateDispatcher(publisher, lease, epoch)
         queue = self._bundle.turn_event_bus.subscribe_exact_turn(turn_id)
         forwarder = asyncio.create_task(self._forward_updates(queue, dispatcher))
-        bridge_publisher = _OrderedTurnPublisher(publisher, queue, dispatcher)
+        bridge_publisher = _OrderedTurnPublisher(
+            publisher, queue, forwarder, dispatcher
+        )
         active = ActivePrompt(state, state.generation, epoch, asyncio.current_task(), None, forwarder, dispatcher, lease)
         state.active_prompt = active
         self._active_prompts[record.session_id] = active
@@ -597,13 +599,13 @@ class MimirAcpAgent:
                     raise asyncio.CancelledError
                 active.model_task = asyncio.create_task(self._bundle.agent.run_turn(event, turn_id=turn_id, session_id=record.thread_id, saga_session_id=record.thread_id))
             await active.model_task
-            await queue.join()
+            await _wait_for_forwarded_updates(queue, forwarder)
             await dispatcher.drain()
         except asyncio.CancelledError as exc:
             if not active.cancelling:
                 failed = exc
                 try:
-                    await queue.join()
+                    await _wait_for_forwarded_updates(queue, forwarder)
                     await asyncio.sleep(0)
                     await dispatcher.terminalize_failure(exc)
                 except BaseException:
@@ -616,7 +618,7 @@ class MimirAcpAgent:
         except BaseException as exc:
             failed = exc
             try:
-                await queue.join()
+                await _wait_for_forwarded_updates(queue, forwarder)
                 await asyncio.sleep(0)
                 await dispatcher.terminalize_failure(exc)
             except BaseException:
@@ -1245,15 +1247,36 @@ class _TurnPublisher:
 
 
 class _OrderedTurnPublisher:
-    def __init__(self, publisher: _TurnPublisher, queue: asyncio.Queue[dict[str, Any]], dispatcher: UpdateDispatcher) -> None:
+    def __init__(self, publisher: _TurnPublisher, queue: asyncio.Queue[dict[str, Any]], forwarder: asyncio.Task[None], dispatcher: UpdateDispatcher) -> None:
         self._publisher = publisher
         self._queue = queue
+        self._forwarder = forwarder
         self._dispatcher = dispatcher
 
     async def publish_live(self, update: Any) -> Any:
-        await self._queue.join()
+        await _wait_for_forwarded_updates(self._queue, self._forwarder)
         await self._dispatcher.drain()
         return await self._publisher.publish_live(update)
+
+
+async def _wait_for_forwarded_updates(
+    queue: asyncio.Queue[dict[str, Any]],
+    forwarder: asyncio.Task[None],
+) -> None:
+    """Wait for delivery without waiting forever on a dead consumer."""
+    joined = asyncio.create_task(queue.join())
+    try:
+        done, _ = await asyncio.wait(
+            (joined, forwarder), return_when=asyncio.FIRST_COMPLETED
+        )
+        if forwarder in done:
+            forwarder.result()
+            raise RuntimeError("ACP update forwarder stopped unexpectedly")
+        await joined
+    finally:
+        if not joined.done():
+            joined.cancel()
+            await _await_cancelled(joined)
 
 
 def _strict_arguments(value: Mapping[str, Any]) -> dict[str, Any]:

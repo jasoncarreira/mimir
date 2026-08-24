@@ -130,10 +130,13 @@ class TurnEventBus:
         )
         try:
             event = scrub_turn_event(event)
-        except Exception:  # noqa: BLE001 — exact delivery failures reach the caller
-            if exact is not None:
-                raise
-            log.debug("turn-event publish failed", exc_info=True)
+        except Exception:  # noqa: BLE001 — presentation scrubbing is best-effort
+            log.warning(
+                "turn-event scrub failed; dropping event for turn_id=%r exact_subscriber=%s",
+                raw_turn_id,
+                exact is not None,
+                exc_info=True,
+            )
             return
 
         turn_id = event.get("turn_id")
