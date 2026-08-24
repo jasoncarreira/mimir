@@ -3841,6 +3841,24 @@ async def test_shell_exec_timeout_event_contains_redacted_bounded_command(
     assert tool_error["arguments"] == tool_call["arguments"]
 
 
+@pytest.mark.xfail(
+    strict=True,
+    reason="#1391/#1691 must add bare xapp- masking before this PR can land",
+)
+def test_shell_command_event_redacts_bare_xapp_credential() -> None:
+    from mimir.tools.budget_gate import _tool_event_arguments
+
+    secret = "xapp-1-A0LEAKPROBE1234567890abc"
+    arguments = _tool_event_arguments({
+        "command": f'curl -H "X-App: {secret}" https://example.invalid/',
+    })
+
+    assert arguments["command"] == (
+        'curl -H "X-App: [REDACTED]" https://example.invalid/'
+    )
+    assert secret not in str(arguments)
+
+
 def test_failed_tool_events_keep_error_head_and_tail_within_existing_limit(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
