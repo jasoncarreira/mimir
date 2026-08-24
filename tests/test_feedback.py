@@ -1327,6 +1327,76 @@ def test_worklink_continuation_created_surfaces_as_negative_feedback(tmp_path: P
     assert "worklink_continuation" in block
 
 
+def test_worklink_tool_pin_dedupe_failure_is_registered_and_rendered():
+    from mimir.feedback import (
+        _EVENT_RULES,
+        classify,
+    )
+    from mimir.feedback.renderers import _render_event_line
+
+    event_type = "worklink_tool_pin_dedupe_check_failed"
+    expected_rule = ("negative", event_type)
+
+    # Pin the canonical declaration, rather than only exercising classify(), so
+    # this cannot pass through a fallback classification convention.
+    assert _EVENT_RULES[event_type] == expected_rule
+    assert classify(event_type) == expected_rule
+
+    line = _render_event_line(
+        event_type,
+        {
+            "tool_name": "codex",
+            "dedupe_key": "worklink-tool-pin:coding-cli:codex:0.139.0->0.140.0",
+            "reason": "chainlink issue search returned invalid JSON",
+        },
+    )
+
+    assert "codex" in line
+    assert "worklink-tool-pin:coding-cli:codex:0.139.0->0.140.0" in line
+    assert "chainlink issue search returned invalid JSON" in line
+    assert "issue creation skipped" in line
+
+
+def test_worklink_tool_pin_dedupe_failure_surfaces_with_cap_and_content_dedup(
+    tmp_path: Path,
+):
+    event_type = "worklink_tool_pin_dedupe_check_failed"
+    log = _make_log(
+        tmp_path,
+        events=[
+            {
+                "timestamp": _ts(0.2),
+                "type": event_type,
+                "tool_name": "codex",
+                "dedupe_key": "worklink-tool-pin:coding-cli:codex:0.139.0->0.140.0",
+                "reason": "latest failure",
+            },
+            {
+                "timestamp": _ts(0.1),
+                "type": event_type,
+                "tool_name": "codex",
+                "dedupe_key": "worklink-tool-pin:coding-cli:codex:0.139.0->0.140.0",
+                "reason": "latest failure",
+            },
+        ],
+    )
+
+    negatives, positives = log.recent(limit_per_polarity=1)
+
+    assert positives == []
+    assert len(negatives) == 1
+    assert negatives[0].kind == event_type
+    assert negatives[0].count == 2
+    assert "codex" in negatives[0].content
+    assert "latest failure" in negatives[0].content
+
+    block = log.recent_block(limit_per_polarity=1)
+    assert block is not None
+    assert "Negative (last 24h):" in block
+    assert "Worklink tool-pin dedupe check failed for codex" in block
+    assert "×2 in 24h" in block
+
+
 def test_background_task_failed_surfaces_as_negative(tmp_path: Path):
     from mimir.feedback import classify
 

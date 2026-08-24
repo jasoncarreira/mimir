@@ -63,6 +63,14 @@ def _render_event_line(rule_kind: str, ev: dict) -> str:
         name = _sanitize_field(ev.get("name") or "?")
         error = _sanitize_field(ev.get("error") or "(no detail)")
         return f"background task {name!r} failed: {error}"
+    if rule_kind == "worklink_tool_pin_dedupe_check_failed":
+        tool = _sanitize_field(ev.get("tool_name") or "?")
+        pin = _sanitize_field(ev.get("dedupe_key") or "?")
+        reason = _sanitize_field(ev.get("reason") or "(no detail)")
+        return (
+            f"Worklink tool-pin dedupe check failed for {tool} "
+            f"({pin}): {reason} — issue creation skipped"
+        )
     if rule_kind == "loop_stall_watchdog_fired":
         stall = ev.get("stall_s")
         threshold = ev.get("threshold_s")

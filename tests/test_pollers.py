@@ -2165,6 +2165,48 @@ print(json.dumps({
 
 
 @pytest.mark.asyncio
+async def test_run_poller_persists_tool_pin_dedupe_failure_without_agent_event(
+    tmp_path: Path, home: Path,
+) -> None:
+    """Tool-pin fail-closed signals land durably without waking an agent turn."""
+    skill_dir = tmp_path / "skill"
+    _install_script(skill_dir, "poller.py", """
+import json
+print(json.dumps({
+    "poller": "worklink-tool-pins",
+    "signal": "worklink_tool_pin_dedupe_check_failed",
+    "tool_name": "codex",
+    "dedupe_key": "worklink-tool-pin:coding-cli:codex:0.139.0->0.140.0",
+    "reason": "chainlink issue search failed: index.lock exists",
+}))
+""")
+    cfg = PollerConfig(
+        name="worklink-tool-pins", command=f"{sys.executable} poller.py",
+        cron="* * * * *", env={}, skill_dir=skill_dir,
+    )
+    enq = _CapturingEnqueue()
+
+    n = await run_poller(cfg, enqueue=enq)
+
+    assert n == 0
+    assert enq.events == []
+    events = _read_events(home)
+    [failure] = [
+        event for event in events
+        if event["type"] == "worklink_tool_pin_dedupe_check_failed"
+    ]
+    assert failure["poller"] == "worklink-tool-pins"
+    assert failure["tool_name"] == "codex"
+    assert failure["dedupe_key"] == (
+        "worklink-tool-pin:coding-cli:codex:0.139.0->0.140.0"
+    )
+    assert failure["reason"] == "chainlink issue search failed: index.lock exists"
+    complete = [event for event in events if event["type"] == "poller_complete"][-1]
+    assert complete["signals_emitted"] == 1
+    assert complete["events_emitted"] == 0
+
+
+@pytest.mark.asyncio
 async def test_run_poller_invalid_usage_signal_logs_diagnostic_only(
     tmp_path: Path, home: Path,
 ) -> None:
