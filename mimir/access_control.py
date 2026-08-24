@@ -946,7 +946,9 @@ def _resolve_file_tool_target(
         # CompositeBackend routes real absolute paths before its default home
         # backend. Preserve those spellings instead of remapping them as virtual.
         external_roots = tuple(dict.fromkeys(
-            root.resolve() for root in (*_configured_file_roots()[1:], *physical_roots)
+            resolved
+            for root in (*_configured_file_roots(), *physical_roots)
+            if (resolved := root.resolve()) != home_root
         ))
         for root in sorted(external_roots, key=lambda item: len(item.parts), reverse=True):
             if requested == root or requested.is_relative_to(root):
