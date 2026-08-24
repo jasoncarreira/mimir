@@ -63,6 +63,10 @@ token_budget_ceiling = 40000                # max tokens across all active atoms
 auto_compact_threshold_pct = 85             # above this: force lightweight profile on new atoms
 refuse_threshold_pct = 95                   # above this: reject new atoms entirely
 db_busy_timeout_ms = 5000                    # SQLite busy timeout in milliseconds
+# Semantic triple queries score only the newest eligible rows up to this bound.
+# Above it, the oldest eligible triples are excluded and saga logs
+# triple_candidate_pool_truncated. Consolidation does not guarantee a smaller pool.
+triple_candidate_limit = 500
 
 [retrieval]
 default_top_k = 12                          # atoms returned per query

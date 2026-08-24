@@ -651,22 +651,22 @@ def test_reconcile_reaps_orphan_and_leaves_live_state(tmp_path: Path) -> None:
     ]
 
 
-def test_factory_stop_cancels_verified_handle_without_factory_transition(
+def test_factory_stop_finds_production_record_and_cancels_verified_handle(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     import mimir.worklink.control as control
 
-    sandbox = tmp_path / "sandbox"
+    sandbox = tmp_path / "chainlink-700"
     sandbox.mkdir()
     status = parse_factory_status(
         {
-            "run_id": "700",
-            "issue_key": "700",
+            "run_id": "chainlink-700",
+            "issue_key": "chainlink-700",
             "valid": True,
             "sandbox_path": str(sandbox),
             "status": "running",
             "mode": "autonomous",
-            "branch": "epic/700",
+            "branch": "feature/chainlink-700",
             "pr_base": "main",
             "pr_draft": False,
             "lock": "fresh",
@@ -685,12 +685,12 @@ def test_factory_stop_cancels_verified_handle_without_factory_transition(
     save_factory_record(
         tmp_path,
         FactoryRunRecord(
-            run_id="700",
+            run_id="chainlink-700",
             issue_id=700,
             attempt=1,
             repository="owner/repo",
             base_ref="main",
-            branch="epic/700",
+            branch="feature/chainlink-700",
             launcher="/opt/factory/bin/factory.js",
             sandbox=str(sandbox),
             session="session-1",
@@ -717,7 +717,13 @@ def test_factory_stop_cancels_verified_handle_without_factory_transition(
 
     assert result.stopped
     assert cancelled == [handle]
-    assert load_factory_record(tmp_path, "700").controller_phase == "stopped"
+    stopped = load_factory_record(tmp_path, "chainlink-700")
+    assert stopped is not None
+    assert stopped.controller_phase == "stopped"
+    assert commands == [
+        ["chainlink", "locks", "release", "700"],
+        ["chainlink", "issue", "unlabel", "700", "worklink:in-progress"],
+    ]
     assert all("factory" not in command for command in commands)
 
 
@@ -727,7 +733,7 @@ def test_factory_stop_refuses_unverified_or_reused_process_identity(
     import mimir.worklink.control as control
 
     monkeypatch.setattr(control, "load_run_state", lambda home, issue_id: None)
-    monkeypatch.setattr(control, "load_factory_record", lambda home, run_id: object())
+    monkeypatch.setattr(control, "load_factory_records_for_issue", lambda home, issue_id: [object()])
     monkeypatch.setattr(control, "factory_process_is_alive", lambda record: False)
     monkeypatch.setattr(
         control.LocalSubprocessComputeBackend,

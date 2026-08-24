@@ -17,7 +17,7 @@ from .compute import LaunchHandle, LocalSubprocessComputeBackend
 from .factory_state import (
     archive_factory_record,
     factory_process_is_alive,
-    load_factory_record,
+    load_factory_records_for_issue,
     save_factory_record,
 )
 from .run_state import (
@@ -254,10 +254,7 @@ def archive_worklink_factory_records(
     """Archive canonical and legacy records for an epic under the claim mutex."""
     archived: list[Path] = []
     with _claim_mutex(home):
-        for run_id in (f"chainlink-{issue_id}", str(issue_id)):
-            record = load_factory_record(home, run_id)
-            if record is None:
-                continue
+        for record in load_factory_records_for_issue(home, issue_id):
             destination = archive_factory_record(
                 home,
                 record,
@@ -281,8 +278,15 @@ def stop_worklink(
     with _claim_mutex(home):
         state = load_run_state(home, issue_id)
         if state is None:
-            factory = load_factory_record(home, str(issue_id))
-            if factory is None or not factory_process_is_alive(factory) or factory.handle is None:
+            factory = next(
+                (
+                    record
+                    for record in load_factory_records_for_issue(home, issue_id)
+                    if factory_process_is_alive(record) and record.handle is not None
+                ),
+                None,
+            )
+            if factory is None or factory.handle is None:
                 return WorklinkStopResult(issue_id, False, reason="no live run")
             try:
                 asyncio.run(LocalSubprocessComputeBackend().cancel(factory.handle))

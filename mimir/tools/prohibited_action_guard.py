@@ -36,20 +36,12 @@ from __future__ import annotations
 import re
 from typing import NamedTuple
 
+from mimir.access_control import SHELL_PROCESS_TOOL_NAMES
 
-_BASH_TOOL_NAMES: frozenset[str] = frozenset({
-    # claude-code's native shell built-in surfaces as "Bash" (capital B)
-    # when registered through deepagents. Must be in this set or the guard
-    # short-circuits and the call is forwarded to the handler unchecked.
-    "Bash",
-    "shell_exec",
-    "bash_async",
-    "bash_exec",
-    "execute",
-    "aexecute",
-    "mcp__mimir__shell_exec",
-    "mcp__mimir__bash_async",
-})
+
+_NORMALIZED_SHELL_PROCESS_TOOL_NAMES = frozenset(
+    name.casefold() for name in SHELL_PROCESS_TOOL_NAMES
+)
 
 
 class _Prohibition(NamedTuple):
@@ -124,21 +116,20 @@ def check_prohibited_bash(command: str) -> str | None:
 
 def is_bash_tool(tool_name: str) -> bool:
     """True if tool_name is one of the tracked bash/shell execution tools."""
-    if tool_name in _BASH_TOOL_NAMES:
+    normalized = tool_name.casefold()
+    if normalized in _NORMALIZED_SHELL_PROCESS_TOOL_NAMES:
         return True
     # Claude Code / MCP bridge names are not stable across adapters:
     # ``mcp__mimir__shell_exec`` and ``mcp_mimir_shell_exec`` have both
     # appeared. Match the final component so a normalized MCP shell alias
     # still gets screened before execution.
-    return any(
-        tool_name.endswith(f"__{name}") or tool_name.endswith(f"_{name}")
-        for name in (
-            "shell_exec",
-            "bash_async",
-            "bash_exec",
-            "execute",
-            "aexecute",
-            "Bash",
-            "bash",
-        )
+    suffix_match = any(
+        normalized.endswith(f"__{name}") or normalized.endswith(f"_{name}")
+        for name in _NORMALIZED_SHELL_PROCESS_TOOL_NAMES - {"shell"}
     )
+    # Bare ``shell`` is a common word, so only provider-generated MCP aliases
+    # receive suffix matching; unrelated application tools ending in _shell do not.
+    mcp_shell_match = normalized.startswith("mcp_") and (
+        normalized.endswith("__shell") or normalized.endswith("_shell")
+    )
+    return suffix_match or mcp_shell_match

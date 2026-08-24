@@ -132,14 +132,12 @@ function isSignedIn(
 // Clears browser-scoped authenticated state when the key changes. React Query
 // data and module-level stores can otherwise keep rendering user A's data after
 // the browser switches to user B in the same page session (#594). Bootstrap is
-// intentionally kept because it is public server policy, not per-user data.
+// refetched because authenticated responses include operator-facing UI data.
 export function resetBrowserSessionStateForApiKeyChange(
   client: QueryClient,
   navigate?: (to: string, options: { replace: boolean }) => void
 ) {
-  client.removeQueries({
-    predicate: (query) => query.queryKey[0] !== "web-bootstrap"
-  });
+  client.removeQueries();
   useChatStore.setState({ messages: [] });
   useUiState.setState({
     selectedChatMessageId: "",
@@ -216,7 +214,7 @@ function AuthPanel({ bootstrap, error, isError, isLoading }: {
               ? "Loading server auth policy."
               : isError
                 ? `Bootstrap failed: ${error instanceof Error ? error.message : String(error)}`
-                : `${requiresKey ? "Protected" : "Local unauthenticated"} server on ${bootstrap?.server.web_host || "default host"}.`)
+                : `${requiresKey ? "Protected" : "Local unauthenticated"} server on ${bootstrap?.server?.web_host || "default host"}.`)
           : undefined
       }
       title={<span id="auth-title">Status</span>}
@@ -253,8 +251,8 @@ function AuthPanel({ bootstrap, error, isError, isLoading }: {
           {!isLoading && !isError ? (
             <dl className="facts-grid facts-grid--compact">
               <div><dt>Browser key</dt><dd>{apiKeyPresent ? "stored" : "not stored"}</dd></div>
-              <div><dt>Bind</dt><dd>{bootstrap?.server.public_bind ? "public" : "localhost"}</dd></div>
-              <div><dt>Streams</dt><dd>{bootstrap?.stream_auth.shape || "loading"}</dd></div>
+              <div><dt>Bind</dt><dd>{bootstrap?.server?.public_bind ? "public" : "localhost"}</dd></div>
+              <div><dt>Streams</dt><dd>{bootstrap?.stream_auth?.shape || "loading"}</dd></div>
             </dl>
           ) : null}
         </div>
@@ -550,7 +548,7 @@ function LoginScreen({ bootstrap, error, isError, isLoading, reauthenticate = fa
 }) {
   const [entry, setEntry] = React.useState("");
   const setApiKey = useSetApiKey();
-  const host = bootstrap?.server.web_host || "this server";
+  const host = bootstrap?.server?.web_host || "this server";
 
   return (
     <div className="login-screen">
@@ -766,7 +764,7 @@ function AppFrameContent() {
   const isAdmin = (whoami?.is_admin ?? false) || !(bootstrap?.auth.required ?? false);
   const surfaces = React.useMemo(
     () => (bootstrap
-      ? visibleSurfaces(getDashboardSurfaces(bootstrap.dashboard_extensions), isAdmin)
+      ? visibleSurfaces(getDashboardSurfaces(bootstrap.dashboard_extensions ?? []), isAdmin)
       : []),
     [bootstrap, isAdmin]
   );
@@ -834,7 +832,7 @@ function RoutedLiveEventsProvider({ children }: { children: React.ReactNode }) {
     () => (apiKeyPresent ? readStoredKey() || undefined : undefined),
     [apiKeyPresent, apiKeyEpoch]
   );
-  // Shares the cached ["web-bootstrap"] query with AppFrame (public, no auth).
+  // Shares AppFrame's bootstrap query; after login it carries authenticated UI data.
   const { data: bootstrap } = useBootstrap();
   const signedIn = isSignedIn(bootstrap, apiKeyPresent);
 

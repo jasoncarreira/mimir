@@ -269,6 +269,26 @@ def test_reap_home_reads_content_keyed_comment_dicts() -> None:
     assert [r.issue_id for r in reaped.reaped] == [49]
 
 
+def test_reap_home_reaps_stale_leaf_when_labels_are_unavailable() -> None:
+    comment = _claim_comment(1416, attempt=1, age=timedelta(hours=3))
+    fake = FakeChainlink(in_progress=[1416], comments={1416: [comment]})
+
+    def runner(args: Sequence[str]) -> subprocess.CompletedProcess[str]:
+        result = fake(args)
+        if list(args)[1:3] == ["issue", "show"]:
+            payload = json.loads(result.stdout)
+            payload.pop("labels")
+            return cp(stdout=json.dumps(payload))
+        return result
+
+    reaped = ChainlinkClaims(agent_id="t", runner=runner).reap_home(
+        ttl=timedelta(hours=2)
+    )
+
+    assert [record.issue_id for record in reaped.reaped] == [1416]
+    assert "locks steal 1416" in fake.names()
+
+
 def test_reap_home_does_not_reap_a_heartbeating_claim_made_after_a_reset() -> None:
     """A reset restarts attempt numbering, so attempt order is not history order.
 
@@ -320,7 +340,12 @@ def test_reap_home_fail_soft_when_in_progress_list_errors() -> None:
         raise AssertionError(f"unexpected call after discovery failure: {args}")
 
     claims = ChainlinkClaims(agent_id="t", runner=runner)
-    assert claims.reap_home(ttl=timedelta(hours=2)).reaped == []
+    result = claims.reap_home(ttl=timedelta(hours=2))
+    assert result.reaped == []
+    assert result.skipped == {
+        "issue_discovery_failed": 1,
+        "lock_discovery_failed": 1,
+    }
 
 
 def test_reap_home_recovers_stale_claim_to_ready() -> None:

@@ -902,6 +902,34 @@ def test_executor_enforces_worker_deadline(tmp_path: Path, monkeypatch) -> None:
                     pass
 
 
+def test_process_group_cancellation_reports_unreapable_member(monkeypatch) -> None:
+    waits: list[tuple[int, float]] = []
+    signals: list[int] = []
+
+    monkeypatch.setattr(
+        worker_exec,
+        "_wait_process_group",
+        lambda process_group, deadline: (
+            waits.append((process_group, deadline)) or False
+        ),
+    )
+    monkeypatch.setattr(
+        worker_exec, "_process_group_has_live_members", lambda _process_group: True
+    )
+    monkeypatch.setattr(
+        worker_exec.os,
+        "killpg",
+        lambda _process_group, sent_signal: signals.append(sent_signal),
+    )
+
+    with pytest.raises(RuntimeError, match="still has live members after SIGKILL"):
+        worker_exec._terminate_process_group_pid(4321, timeout_s=0)
+
+    assert signals == [signal.SIGTERM, signal.SIGKILL]
+    assert len(waits) == 2
+    assert all(deadline is not None for _process_group, deadline in waits)
+
+
 def test_worker_payload_cannot_reach_controller_canary_and_detector_is_live() -> None:
     if sys.platform != "linux" or os.geteuid() != 0:
         pytest.skip("requires Linux root to exercise the executor identity boundary")
