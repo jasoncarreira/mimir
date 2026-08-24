@@ -1197,6 +1197,10 @@ class Scheduler:
     #      which skill the agent should run.
     # loop_id: 4.1
     async def _fire(self, *, job: SchedulerJob) -> None:
+        # Import lazily for the same scheduler/tool-registry cycle avoided by
+        # ``_on_job_error`` above.
+        from .tools.budget_gate import _bounded_tool_event_error
+
         # Resolve the cron's prompt body. Precedence:
         #   1. ``prompt_file`` (relative to ``<home>/prompts/`` — escapes
         #      via ``..`` are rejected so an agent can't reference an
@@ -1259,7 +1263,9 @@ class Scheduler:
                     "scheduled_tick_dropped",
                     schedule_name=job.name,
                     channel_id=_scheduler_channel_id(job.name, job.channel_id),
-                    reason=f"authority_profile_rejected: {exc}",
+                    reason=_bounded_tool_event_error(
+                        f"authority_profile_rejected: {exc}"
+                    ),
                 )
                 return
         service_principal = authority.canonical
@@ -1292,7 +1298,9 @@ class Scheduler:
                     "scheduled_tick_dropped",
                     schedule_name=job.name,
                     channel_id=_scheduler_channel_id(job.name, job.channel_id),
-                    reason=f"shell_commands_rejected: {exc}",
+                    reason=_bounded_tool_event_error(
+                        f"shell_commands_rejected: {exc}"
+                    ),
                 )
                 return
             if declared:

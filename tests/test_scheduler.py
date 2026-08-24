@@ -411,6 +411,37 @@ async def test_fire_records_rejected_authority_profile(tmp_path: Path):
 
 
 @pytest.mark.asyncio
+async def test_fire_bounds_rejected_authority_profile_reason(tmp_path: Path):
+    async def fake_enqueue(_event: AgentEvent) -> bool:
+        pytest.fail("a job with a rejected authority profile must not be enqueued")
+
+    sched = Scheduler(
+        scheduler_yaml=tmp_path / "s.yaml", enqueue=fake_enqueue, home=tmp_path,
+    )
+    job = SchedulerJob(
+        name="memory-hygiene",
+        prompt="clean",
+        cron="0 8 * * 2",
+        authority_profile="oversized-profile",
+    )
+    error = "profile lookup failed for oversized-profile: " + "X" * 20_000
+
+    with mock.patch(
+        "mimir.scheduler.builtin_trigger_service_principal",
+        side_effect=ValueError(error),
+    ):
+        await sched._fire(job=job)
+
+    [event] = _scheduler_events(tmp_path)
+    reason = event["reason"]
+    assert len(reason) == 500
+    assert reason.startswith(
+        "authority_profile_rejected: profile lookup failed for oversized-profile: "
+    )
+    assert "...[truncated]..." in reason
+
+
+@pytest.mark.asyncio
 async def test_fire_records_rejected_shell_commands(tmp_path: Path):
     async def fake_enqueue(_event: AgentEvent) -> bool:
         pytest.fail("a job with rejected shell commands must not be enqueued")
@@ -434,6 +465,37 @@ async def test_fire_records_rejected_shell_commands(tmp_path: Path):
     assert event["channel_id"] == "scheduler:memory-hygiene"
     assert event["reason"].startswith("shell_commands_rejected: ")
     assert str(missing) in event["reason"]
+
+
+@pytest.mark.asyncio
+async def test_fire_bounds_rejected_shell_commands_reason(tmp_path: Path):
+    async def fake_enqueue(_event: AgentEvent) -> bool:
+        pytest.fail("a job with rejected shell commands must not be enqueued")
+
+    sched = Scheduler(
+        scheduler_yaml=tmp_path / "s.yaml", enqueue=fake_enqueue, home=tmp_path,
+    )
+    job = SchedulerJob(
+        name="memory-hygiene",
+        prompt="clean",
+        cron="0 8 * * 2",
+        shell_commands=[{"exec": "bash", "path": "/bin/bash"}],
+    )
+    error = "declaration invalid for /bin/bash: " + "Y" * 20_000
+
+    with mock.patch(
+        "mimir.scheduler.parse_declared_shell_commands",
+        side_effect=ValueError(error),
+    ):
+        await sched._fire(job=job)
+
+    [event] = _scheduler_events(tmp_path)
+    reason = event["reason"]
+    assert len(reason) == 500
+    assert reason.startswith(
+        "shell_commands_rejected: declaration invalid for /bin/bash: "
+    )
+    assert "...[truncated]..." in reason
 
 
 @pytest.mark.asyncio
