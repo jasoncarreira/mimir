@@ -604,7 +604,7 @@ def test_manual_success_clears_autonomous_failure_ledger(
     assert not (tmp_path / "ambient-state").exists()
 
 
-def test_epic_dispatch_failure_enters_and_clears_ledger(
+def test_epic_dispatch_failure_clears_ledger_only_after_success(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     import mimir.worklink.orchestrator as orchestrator
@@ -631,6 +631,14 @@ def test_epic_dispatch_failure_enters_and_clears_ledger(
         return orchestrator.WorklinkRunResult(issue_id, 3, "needs-human")
 
     monkeypatch.setattr(WorklinkRunner, "run_epic", parked_epic)
+    run_worklink_epic(home=tmp_path, repo=tmp_path, issue_id=700, autonomous=False)
+    entry = load_failure_state(dispatch_failure_state_dir(tmp_path))["issues"]["700"]
+    assert entry["active"] is True
+
+    async def completed_epic(self: WorklinkRunner, issue_id: int, **_: object):
+        return orchestrator.WorklinkRunResult(issue_id, 4, "review_ready")
+
+    monkeypatch.setattr(WorklinkRunner, "run_epic", completed_epic)
     run_worklink_epic(home=tmp_path, repo=tmp_path, issue_id=700, autonomous=False)
     entry = load_failure_state(dispatch_failure_state_dir(tmp_path))["issues"]["700"]
     assert entry["active"] is False
