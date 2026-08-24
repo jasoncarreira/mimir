@@ -122,17 +122,9 @@ class TurnEventBus:
 
         Exact delivery errors propagate. Presentation delivery remains best-effort.
         """
-        raw_turn_id = event.get("turn_id")
-        exact = (
-            self._exact_turn_subscribers.get(raw_turn_id)
-            if isinstance(raw_turn_id, str)
-            else None
-        )
         try:
             event = scrub_turn_event(event)
-        except Exception:  # noqa: BLE001 — exact delivery failures reach the caller
-            if exact is not None:
-                raise
+        except Exception:  # noqa: BLE001 — presentation scrubbing is best-effort
             log.debug("turn-event publish failed", exc_info=True)
             return
 
