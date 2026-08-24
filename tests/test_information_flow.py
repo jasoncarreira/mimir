@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import subprocess
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -18,6 +19,8 @@ from langgraph.runtime import Runtime
 from mimir.access_control import (
     _FILE_INTEGRITY_EXCLUDED_SUBTREES,
     _SELF_AUTHORED_FILE_ROOTS,
+    _filesystem_result_integrity,
+    _persisted_file_integrity,
     CapabilityTier,
     ServicePrincipal,
     ServiceSinkPolicy,
@@ -33,6 +36,7 @@ from mimir.access_control import (
     get_service_principal,
     get_sink_category,
     get_tool_flow_direction,
+    initialize_file_integrity_ledger,
     classify_protected_result,
     builtin_trigger_service_principal,
     OperationDecision,
@@ -952,6 +956,112 @@ def test_poller_managed_state_is_untrusted_active_ingest(
     assert not (tmp_path / ".mimir" / "file-integrity.json").exists()
 
 
+def test_ledger_epoch_distinguishes_seeded_file_from_unrecorded_shell_write(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
+    seeded = tmp_path / "skills" / "operator" / "SKILL.md"
+    seeded.parent.mkdir(parents=True)
+    seeded.write_text("operator-authored content", encoding="utf-8")
+
+    assert initialize_file_integrity_ledger(tmp_path) is True
+
+    shell_written = tmp_path / "skills" / "evil" / "SKILL.md"
+    subprocess.run(
+        [
+            "sh", "-c",
+            'mkdir -p "$1" && printf "%s\\n" "attacker-derived content" > "$2"',
+            "sh", str(shell_written.parent), str(shell_written),
+        ],
+        check=True,
+    )
+    poller_written = tmp_path / "state" / "pollers" / "github" / "cursor.json"
+    poller_written.parent.mkdir(parents=True)
+    poller_written.write_text('{"cursor":"external"}', encoding="utf-8")
+
+    assert _filesystem_result_integrity(None, str(shell_written)) == (
+        "untrusted", "active_ingest",
+    )
+    assert _filesystem_result_integrity(None, str(seeded)) == (
+        "trusted", "informational",
+    )
+    assert _filesystem_result_integrity(None, str(poller_written)) == (
+        "untrusted", "active_ingest",
+    )
+
+
+@pytest.mark.parametrize(
+    "epoch_ns",
+    ["not-an-int", None, 1.5, [], {}, True, False, 0, -1],
+    ids=[
+        "string", "null", "float", "list", "object", "true", "false", "zero",
+        "negative",
+    ],
+)
+def test_malformed_nonpositive_and_bool_ledger_epochs_fail_closed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    epoch_ns: object,
+) -> None:
+    monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
+    target = tmp_path / "skills" / "operator" / "SKILL.md"
+    target.parent.mkdir(parents=True)
+    target.write_text("unrecorded content", encoding="utf-8")
+    metadata = tmp_path / ".mimir" / "file-integrity.json"
+    metadata.parent.mkdir()
+    metadata.write_text(
+        json.dumps({"__ledger_epoch_ns__": epoch_ns}), encoding="utf-8",
+    )
+
+    assert _filesystem_result_integrity(None, str(target)) == (
+        "untrusted", "active_ingest",
+    )
+
+
+def test_unstatable_unrecorded_file_fails_closed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    target = tmp_path / "skills" / "operator" / "SKILL.md"
+    target.parent.mkdir(parents=True)
+    target.write_text("unrecorded content", encoding="utf-8")
+    metadata = tmp_path / ".mimir" / "file-integrity.json"
+    metadata.parent.mkdir()
+    metadata.write_text(
+        json.dumps({"__ledger_epoch_ns__": target.stat().st_ctime_ns}),
+        encoding="utf-8",
+    )
+    original_stat = Path.stat
+
+    def fail_target_stat(path: Path, *args: object, **kwargs: object):
+        if path == target:
+            raise OSError("simulated stat failure")
+        return original_stat(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "stat", fail_target_stat)
+
+    assert _persisted_file_integrity(tmp_path, Path("skills/operator/SKILL.md")) == (
+        "untrusted"
+    )
+
+
+def test_ledger_epoch_migration_preserves_existing_untrusted_marks(
+    tmp_path: Path,
+) -> None:
+    metadata = tmp_path / ".mimir" / "file-integrity.json"
+    metadata.parent.mkdir(parents=True)
+    metadata.write_text(
+        '{"skills/tainted.md":"untrusted"}\n', encoding="utf-8",
+    )
+
+    assert initialize_file_integrity_ledger(tmp_path) is True
+
+    payload = json.loads(metadata.read_text(encoding="utf-8"))
+    assert payload["skills/tainted.md"] == "untrusted"
+    assert isinstance(payload["__ledger_epoch_ns__"], int)
+
+
 @pytest.mark.parametrize("root", ["docs", "prompts"])
 def test_seeded_reference_roots_are_trusted_informational(
     tmp_path: Path,
@@ -1085,12 +1195,11 @@ def test_state_and_skills_tainted_writes_read_back_with_same_integrity(
         ("untrusted", "active_ingest"),
         ("untrusted", "active_ingest"),
     ]
-    assert json.loads(
+    payload = json.loads(
         (tmp_path / ".mimir" / "file-integrity.json").read_text(encoding="utf-8")
-    ) == {
-        "skills/notes.md": "untrusted",
-        "state/notes.md": "untrusted",
-    }
+    )
+    assert payload["skills/notes.md"] == "untrusted"
+    assert payload["state/notes.md"] == "untrusted"
 
 
 @pytest.mark.parametrize("approved", [True, False])
@@ -1153,7 +1262,7 @@ def test_untrusted_model_write_cannot_launder_through_self_authored_state(
     )
     assert json.loads(
         (tmp_path / ".mimir" / "file-integrity.json").read_text(encoding="utf-8")
-    ) == {"state/notes.md": "untrusted"}
+    )["state/notes.md"] == "untrusted"
 
 
 def test_file_write_integrity_records_through_symlinked_home(
@@ -1176,7 +1285,7 @@ def test_file_write_integrity_records_through_symlinked_home(
     assert record_file_write_integrity(str(target), tainted) is True
     assert json.loads(
         (real_home / ".mimir" / "file-integrity.json").read_text(encoding="utf-8")
-    ) == {"memory/notes.md": "untrusted"}
+    )["memory/notes.md"] == "untrusted"
 
 
 @pytest.mark.parametrize("symlinked_home", [False, True])
@@ -1404,9 +1513,9 @@ def test_invalid_legacy_integrity_value_stays_fail_closed(
     assert record_file_write_integrity(
         str(memory), InformationFlowLabels(),
     ) is True
-    assert json.loads(metadata.read_text(encoding="utf-8")) == {
-        "memory/unknown.md": None,
-    }
+    payload = json.loads(metadata.read_text(encoding="utf-8"))
+    assert payload["memory/unknown.md"] is None
+    assert isinstance(payload["__ledger_epoch_ns__"], int)
 
 
 def test_integrity_repair_rejects_untrusted_paths_and_malformed_audit(
