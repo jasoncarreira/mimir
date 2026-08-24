@@ -2966,11 +2966,46 @@ def test_auto_recall_and_mcp_require_destination_audience_within_source_acl(
     assert wider_than_source_acl.reason == "ifc_label_blocked:same_channel"
 
 
-def test_protected_tool_same_channel_compatibility_remains_audience_independent():
-    class ExplodingAudienceProvider:
-        def audience_for(self, channel_id, *, principal):
-            raise AssertionError("protected_tool must retain its existing allowance")
+class ExplodingAudienceProvider:
+    def audience_for(self, channel_id, *, principal):
+        raise AssertionError("audience lookup must not fail open")
 
+
+@pytest.mark.parametrize(
+    "audience_provider",
+    [None, ExplodingAudienceProvider()],
+    ids=["missing", "raises"],
+)
+def test_auto_recall_fails_closed_when_destination_audience_is_unavailable(
+    audience_provider,
+):
+    source = SourceLabel(
+        principal="user-2",
+        domain="saga",
+        resource_id="saga-private-record",
+        bridge_instance="saga",
+        sensitivity="private",
+        authorized_principals=frozenset({"user-1", "user-2"}),
+        source_kind="auto_recall",
+        integrity="untrusted",
+        integrity_effect="informational",
+    )
+    labels = InformationFlowLabels(
+        labels=frozenset({"private"}), sources=(source,),
+    )
+
+    decision = SinkGate.check_sink_flow(
+        "harness_auto_deliver", "slack-C1", labels,
+        replace(_auth(), audience_provider=audience_provider),
+        enforce=True,
+    )
+
+    assert "user-1" in source.authorized_principals
+    assert decision.allowed is False
+    assert decision.reason == "ifc_label_blocked:same_channel"
+
+
+def test_protected_tool_same_channel_compatibility_remains_audience_independent():
     source = SourceLabel(
         principal="protected-reader",
         domain="filesystem",
