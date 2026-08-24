@@ -132,6 +132,7 @@ class RateLimitStore:
     path: Path
     _lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False)
     _thread_lock: threading.RLock = field(init=False, repr=False)
+    _write_failed: bool = field(default=False, init=False, repr=False)
 
     def __post_init__(self) -> None:
         # Agent callbacks and scheduler pollers may construct separate store
@@ -143,11 +144,11 @@ class RateLimitStore:
         self,
         rate_limit_type: str,
         snapshot: RateLimitSnapshot,
-    ) -> None:
+    ) -> bool:
         """Replace the entry for ``rate_limit_type`` with ``snapshot``.
         Best effort — on IO failure we log and move on; the prompt
         section degrades to "no plan data" rather than crashing the
-        turn.
+        turn. Returns whether the snapshot was persisted.
 
         The asyncio.Lock serializes concurrent coroutine callers.
         Writes are atomic (temp + rename) so a crash mid-write cannot
@@ -160,12 +161,16 @@ class RateLimitStore:
                     atomic_write_json(self.path, data)
                 except OSError as exc:
                     log.warning("rate_limits.json write failed: %s", exc)
+                    self._report_write_failure(exc)
+                    return False
+                self._write_failed = False
+                return True
 
     def record_sync(
         self,
         rate_limit_type: str,
         snapshot: RateLimitSnapshot,
-    ) -> None:
+    ) -> bool:
         """Synchronous version of :meth:`record` for callers that can't
         ``await`` (e.g. ``ChatCodexPlus.rate_limit_callback``, which
         fires inline from a streaming SSE handler on either the loop
@@ -176,7 +181,7 @@ class RateLimitStore:
         the file. Last-write-wins semantics are acceptable because
         snapshots are monotonically refreshed (each successful response
         carries the latest quota state). Best-effort: IO errors are
-        logged and swallowed.
+        logged and swallowed. Returns whether the snapshot was persisted.
         """
         with self._thread_lock:
             data = self._load()
@@ -185,13 +190,17 @@ class RateLimitStore:
                 atomic_write_json(self.path, data)
             except OSError as exc:
                 log.warning("rate_limits.json write failed: %s", exc)
+                self._report_write_failure(exc)
+                return False
+            self._write_failed = False
+            return True
 
     def reconcile_sync(
         self,
         updates: dict[str, RateLimitSnapshot],
         *,
         owned_keys: Iterable[str],
-    ) -> None:
+    ) -> bool:
         """Atomically apply ``updates`` AND drop any ``owned_keys`` absent
         from ``updates``, in one locked write.
 
@@ -206,7 +215,8 @@ class RateLimitStore:
         for this provider exactly equal to what the snapshot reported.
 
         Keys outside ``owned_keys`` (other providers' windows) are left
-        untouched. Best-effort: IO errors are logged and swallowed."""
+        untouched. Best-effort: IO errors are logged and swallowed. Returns
+        whether the reconciliation was persisted."""
         owned = set(owned_keys)
         with self._thread_lock:
             data = self._load()
@@ -218,6 +228,25 @@ class RateLimitStore:
                 atomic_write_json(self.path, data)
             except OSError as exc:
                 log.warning("rate_limits.json write failed: %s", exc)
+                self._report_write_failure(exc)
+                return False
+            self._write_failed = False
+            return True
+
+    def _report_write_failure(self, exc: OSError) -> None:
+        """Emit once when persistence enters a failed state."""
+        if self._write_failed:
+            return
+        self._write_failed = True
+        try:
+            from .event_logger import log_event_sync
+            log_event_sync(
+                "quota_state_write_failed",
+                path=str(self.path),
+                error=f"{type(exc).__name__}: {exc}",
+            )
+        except Exception:  # noqa: BLE001
+            log.debug("quota state failure event could not be emitted", exc_info=True)
 
     def current(self) -> dict[str, RateLimitSnapshot]:
         """Return only entries whose window hasn't reset. Drops stale
@@ -694,9 +723,11 @@ async def record_api_usage(
             )
             continue
         try:
-            await store.record(window_type, snapshot)
+            persisted = await store.record(window_type, snapshot)
         except Exception:  # noqa: BLE001
             log.exception("apiUsage: store.record failed for %s", window_type)
+            continue
+        if not persisted:
             continue
         recorded[window_type] = {
             "utilization": snapshot.utilization,

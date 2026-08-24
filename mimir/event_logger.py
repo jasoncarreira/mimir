@@ -7,18 +7,23 @@ module-level singleton via ``log_event(event_type, **payload)``.
 from __future__ import annotations
 
 import asyncio
+import fcntl
 import json
 import logging
 import os
 import threading
+import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, TextIO
 
 from ._jsonl_tail import _tail_lines, count_lines_chunked
 from .redaction import redact_payload
 
 log = logging.getLogger(__name__)
+
+PROCESS_LOCK_TIMEOUT_SECONDS = 1.0
+PROCESS_LOCK_POLL_SECONDS = 0.01
 
 
 def _utc_now_iso() -> str:
@@ -42,6 +47,10 @@ class EventLogger:
         # who haven't set MIMIR_AGENT_ID.
         self._agent_id = agent_id
         self._max_events = max_events
+        # A sibling lock remains stable while events.jsonl is atomically
+        # replaced. Locking the events file itself would protect the old inode,
+        # not the new path, after trim's rename.
+        self._process_lock_path = Path(f"{path}.lock")
         self._lock: asyncio.Lock | None = None
         # chainlink #393: serialize the SYNC file mutators that can run on
         # different threads — log_sync (loop thread) and _trim_sync (worker
@@ -68,6 +77,40 @@ class EventLogger:
         if self._lock is None:
             self._lock = asyncio.Lock()
         return self._lock
+
+    def _acquire_process_lock(self, operation: str) -> TextIO | None:
+        """Take the events-file process lock without blocking indefinitely.
+
+        A stuck holder must not wedge an agent turn. After one second, appends
+        continue best-effort and trims are skipped by their caller. Both cases
+        emit a warning so the degraded serialization is observable.
+        """
+        handle = self._process_lock_path.open("a", encoding="utf-8")
+        deadline = time.monotonic() + PROCESS_LOCK_TIMEOUT_SECONDS
+        while True:
+            try:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                return handle
+            except BlockingIOError:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    handle.close()
+                    log.warning(
+                        "events.jsonl process lock timed out after %.1fs; %s",
+                        PROCESS_LOCK_TIMEOUT_SECONDS,
+                        operation,
+                    )
+                    return None
+                time.sleep(min(PROCESS_LOCK_POLL_SECONDS, remaining))
+
+    @staticmethod
+    def _release_process_lock(handle: TextIO | None) -> None:
+        if handle is None:
+            return
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        finally:
+            handle.close()
 
     def _ensure_dir(self, *, force: bool = False) -> None:
         """Ensure the parent directory exists without a per-event mkdir.
@@ -97,7 +140,11 @@ class EventLogger:
         with self._io_lock:
             for attempt in range(2):
                 self._ensure_dir(force=attempt > 0)
+                process_lock: TextIO | None = None
                 try:
+                    process_lock = self._acquire_process_lock(
+                        "continuing with an unlocked append"
+                    )
                     with self._path.open("a", encoding="utf-8") as f:
                         f.write(json.dumps(record, ensure_ascii=True, default=str) + "\n")
                         if durable:
@@ -110,11 +157,13 @@ class EventLogger:
                     if attempt == 0:
                         continue
                     raise
+                finally:
+                    self._release_process_lock(process_lock)
 
     async def log(self, event_type: str, **payload: Any) -> None:
-        record = self._record(event_type, payload)
-        async with self._ensure_lock():
-            try:
+        try:
+            record = self._record(event_type, payload)
+            async with self._ensure_lock():
                 await asyncio.to_thread(self._append_record_sync, record)
                 # Hysteresis: trim only when over cap by ≥10%. Without the
                 # buffer, every event past the cap triggers an O(file)
@@ -126,8 +175,8 @@ class EventLogger:
                     and self._line_count > self._max_events + max(self._max_events // 10, 1)
                 ):
                     await self._trim()
-            except OSError as exc:
-                log.warning("events.jsonl write failed: %s", exc)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("events.jsonl write failed: %s", exc)
 
     def log_sync(self, event_type: str, **payload: Any) -> None:
         """Synchronous append — see ``log_event_sync`` for callsite
@@ -135,14 +184,14 @@ class EventLogger:
         ``O_APPEND`` atomicity. Errors are swallowed at WARN (same as
         the async path) so a misbehaving log sink never crashes the
         primary work path."""
-        record = self._record(event_type, payload)
         try:
+            record = self._record(event_type, payload)
             # chainlink #393: _append_record_sync holds _io_lock so this append
             # can't interleave with _trim_sync's tail-read + rename on the worker
             # thread.
             self._append_record_sync(record)
             # Trim deferred to the async path — see comment in log().
-        except OSError as exc:
+        except Exception as exc:  # noqa: BLE001
             log.warning("events.jsonl sync write failed: %s", exc)
 
     def log_durable_sync(self, event_type: str, **payload: Any) -> None:
@@ -180,30 +229,35 @@ class EventLogger:
             log.warning("events.jsonl trim failed: %s", exc)
 
     def _trim_sync(self) -> None:
-        # chainlink #393: hold _io_lock across the whole tail-read → rename so a
-        # concurrent log_sync append (loop thread) can't be lost in the rename
-        # window, and _line_count is written under the same lock as log_sync's.
+        # _io_lock covers this process's threads; the sibling flock covers
+        # detached Worklink processes that append to the same stream.
         with self._io_lock:
-            kept_reversed: list[str] = []
+            process_lock = self._acquire_process_lock("skipping trim")
+            if process_lock is None:
+                return
             try:
-                for line in _tail_lines(self._path):
-                    stripped = line.strip()
-                    if not stripped:
-                        continue
-                    kept_reversed.append(stripped)
-                    if len(kept_reversed) >= self._max_events:
-                        break
-            except OSError as exc:
-                log.warning("events.jsonl trim tail-read failed: %s", exc)
-                return
-            if not kept_reversed:
-                return
-            # tail yields newest-first; reverse for chronological rewrite.
-            kept = list(reversed(kept_reversed))
-            tmp = self._path.with_suffix(".jsonl.tmp")
-            tmp.write_text("\n".join(kept) + "\n", encoding="utf-8")
-            tmp.rename(self._path)
-            self._line_count = len(kept)
+                kept_reversed: list[str] = []
+                try:
+                    for line in _tail_lines(self._path):
+                        stripped = line.strip()
+                        if not stripped:
+                            continue
+                        kept_reversed.append(stripped)
+                        if len(kept_reversed) >= self._max_events:
+                            break
+                except OSError as exc:
+                    log.warning("events.jsonl trim tail-read failed: %s", exc)
+                    return
+                if not kept_reversed:
+                    return
+                # tail yields newest-first; reverse for chronological rewrite.
+                kept = list(reversed(kept_reversed))
+                tmp = self._path.with_suffix(".jsonl.tmp")
+                tmp.write_text("\n".join(kept) + "\n", encoding="utf-8")
+                tmp.rename(self._path)
+                self._line_count = len(kept)
+            finally:
+                self._release_process_lock(process_lock)
 
 
 _logger: EventLogger | None = None

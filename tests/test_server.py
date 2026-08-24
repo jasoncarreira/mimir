@@ -399,6 +399,7 @@ async def test_pairing_notifier_aclose_is_idempotent_and_clears_tasks(
 @dataclass
 class _ServerControl:
     events: list[str] = field(default_factory=list)
+    event_payloads: list[tuple[str, dict[str, Any]]] = field(default_factory=list)
     failures: dict[str, BaseException] = field(default_factory=dict)
     runtime_failure: BaseException | None = None
     mcp_enabled: bool = False
@@ -687,6 +688,7 @@ def _controlled_server_app(
         return None, []
 
     async def event(kind: str, **fields: Any) -> None:
+        control.event_payloads.append((kind, fields))
         control.hit(f"log:{kind}")
 
     def register_routes(app: web.Application, **kwargs: Any) -> None:
@@ -746,7 +748,7 @@ def _controlled_server_app(
     monkeypatch.setattr(
         mimir.worklink.autonomy,
         "release_claims_for_graceful_shutdown",
-        lambda *args, **kwargs: control.hit("claims:release") or [],
+        lambda *args, **kwargs: control.hit("claims:release") or ([], []),
     )
     monkeypatch.setattr(mimir.mcp_client, "MCPManager", MCPManager)
     monkeypatch.setattr(mimir.mcp_client, "MCPPolicyStore", MCPPolicyStore)
@@ -1305,6 +1307,52 @@ async def test_server_startup_and_cleanup_resource_order(
     ]
     positions = [control.events.index(name) for name in ordered]
     assert positions == sorted(positions)
+
+
+@pytest.mark.asyncio
+async def test_part_b_startup_summary_emits_when_nothing_dispatched(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    app, control = _controlled_server_app(tmp_path, monkeypatch)
+
+    await _run_startup(app)
+
+    assert (
+        "worklink_reattach_dispatched",
+        {"issues": []},
+    ) in control.event_payloads
+    await _run_cleanup(app)
+
+
+@pytest.mark.asyncio
+async def test_part_c_server_shutdown_summary_includes_released_and_failed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import mimir.worklink.autonomy
+    from mimir.worklink.claims import ShutdownClaimFailure
+
+    app, control = _controlled_server_app(tmp_path, monkeypatch)
+    await _run_startup(app)
+    monkeypatch.setattr(
+        mimir.worklink.autonomy,
+        "release_claims_for_graceful_shutdown",
+        lambda *args, **kwargs: (
+            [SimpleNamespace(issue_id=1400)],
+            [ShutdownClaimFailure(issue_id=1401, reason="release denied")],
+        ),
+    )
+
+    await _run_cleanup(app)
+
+    assert (
+        "worklink_shutdown_claims_released",
+        {
+            "issue_ids": [1400],
+            "failed": [{"issue_id": 1401, "reason": "release denied"}],
+        },
+    ) in control.event_payloads
 
 
 @pytest.mark.asyncio

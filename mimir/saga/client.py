@@ -112,6 +112,55 @@ def _authorized_atom_ids(
     return requested if found == set(requested) else None
 
 
+def _mutation_refusal_reason(
+    auth_context: Any,
+    operation: str,
+    scope: object | str | _ServiceMutationScope | None,
+) -> str:
+    """Classify a failed mutation authorization without widening authority."""
+    from ..access_control import get_trusted_service_from_auth_context
+    from ..models import AuthContext
+
+    if not isinstance(auth_context, AuthContext):
+        return "invalid_auth_context"
+    if scope is not None:
+        return "atom_outside_scope"
+    service = get_trusted_service_from_auth_context(auth_context)
+    if service is not None and not service.has_capability(operation):
+        return "missing_operation_capability"
+    if auth_context.canonical_principal in RESERVED_SENTINEL_PRINCIPALS:
+        return "reserved_principal"
+    return "missing_canonical_principal"
+
+
+def _mutation_refused_result(
+    *,
+    auth_context: Any,
+    operation: str,
+    scope: object | str | _ServiceMutationScope | None,
+    requested_count: int,
+    result: dict[str, Any],
+) -> dict[str, Any]:
+    """Convert the shared None refusal signal into one observable result shape."""
+    from ..models import AuthContext
+    from .ownership import _emit_saga_event
+
+    reason = _mutation_refusal_reason(auth_context, operation, scope)
+    canonical_principal = (
+        auth_context.canonical_principal
+        if isinstance(auth_context, AuthContext)
+        else None
+    )
+    _emit_saga_event(
+        "saga_mutation_refused",
+        operation=operation,
+        canonical_principal=canonical_principal,
+        reason=reason,
+        requested_count=min(max(requested_count, 0), 1000),
+    )
+    return {**result, "status": "refused", "reason": reason}
+
+
 # ─── Provider/index adapters ─────────────────────────────────────────
 
 
@@ -1321,8 +1370,20 @@ class SagaStore:
                     for a in atoms
                 ],
             }
+            observed_ids = [atom["id"] for atom in atoms]
+            if read_authorization.enforcement_enabled:
+                rows = conn.execute(
+                    f"SELECT id, agent_id FROM atoms WHERE id IN ({placeholders}) "
+                    "AND tombstoned = 0",
+                    unique,
+                ).fetchall()
+                observed_ids = [
+                    atom_id
+                    for atom_id, agent_id in rows
+                    if agent_id in (self._agent_id, "shared")
+                ]
             read_authorization.observe_selected(
-                conn, "atom", "atoms", [atom["id"] for atom in atoms]
+                conn, "atom", "atoms", observed_ids
             )
             return payload
 
@@ -1491,7 +1552,13 @@ class SagaStore:
             conn = self._ensure_conn()
             authorized_ids = _authorized_atom_ids(conn, atom_ids, scope)
             if authorized_ids is None:
-                return {"marked": 0, "total": len(atom_ids), "authorized": 0}
+                return _mutation_refused_result(
+                    auth_context=auth_context,
+                    operation="saga_feedback",
+                    scope=scope,
+                    requested_count=len(atom_ids),
+                    result={"marked": 0, "total": len(atom_ids), "authorized": 0},
+                )
             if not authorized_ids:
                 return {"marked": 0, "total": len(atom_ids), "authorized": 0}
             n = _feedback(conn, authorized_ids, signal=signal, session_id=session_id)
@@ -1544,12 +1611,18 @@ class SagaStore:
                 conn = self._ensure_conn()
                 authorized_ids = _authorized_atom_ids(conn, atom_ids, scope)
                 if authorized_ids is None:
-                    return {
-                        "marked": 0,
-                        "total": len(atom_ids),
-                        "signal": "negative",
-                        "authorized": 0,
-                    }
+                    return _mutation_refused_result(
+                        auth_context=auth_context,
+                        operation="saga_feedback",
+                        scope=scope,
+                        requested_count=len(atom_ids),
+                        result={
+                            "marked": 0,
+                            "total": len(atom_ids),
+                            "signal": "negative",
+                            "authorized": 0,
+                        },
+                    )
                 if not authorized_ids:
                     return {
                         "marked": 0,
@@ -2438,11 +2511,17 @@ class SagaStore:
 
             conn = self._ensure_conn()
             if scope is None:
-                return {
-                    "tombstoned_count": 0,
-                    "preview_ids": [],
-                    "dry_run": dry_run,
-                }
+                return _mutation_refused_result(
+                    auth_context=auth_context,
+                    operation="saga_forget",
+                    scope=scope,
+                    requested_count=0,
+                    result={
+                        "tombstoned_count": 0,
+                        "preview_ids": [],
+                        "dry_run": dry_run,
+                    },
+                )
             preview = forget_by_criteria(
                 conn,
                 agent_id=self._agent_id,
@@ -2471,11 +2550,17 @@ class SagaStore:
                 ]
             closure = list(dict.fromkeys(candidate_ids + affected_observation_ids))
             if _authorized_atom_ids(conn, closure, scope) is None:
-                return {
-                    "tombstoned_count": 0,
-                    "preview_ids": [],
-                    "dry_run": dry_run,
-                }
+                return _mutation_refused_result(
+                    auth_context=auth_context,
+                    operation="saga_forget",
+                    scope=scope,
+                    requested_count=len(closure),
+                    result={
+                        "tombstoned_count": 0,
+                        "preview_ids": [],
+                        "dry_run": dry_run,
+                    },
+                )
             if dry_run:
                 return {
                     "tombstoned_count": len(candidate_ids),
@@ -2898,7 +2983,21 @@ class SagaStore:
             ):
                 return None
             if _authorized_atom_ids(conn, atom_ids, scope) is None:
-                return None
+                return _mutation_refused_result(
+                    auth_context=auth_context,
+                    operation="saga_mark_contributions",
+                    scope=scope,
+                    requested_count=len(atom_ids),
+                    result={
+                        "contributed_count": 0,
+                        "total": len(retrieved_atoms),
+                        "contribution_rate": 0.0,
+                        "contributed": [],
+                        "threshold": thr,
+                        "authorized": 0,
+                        "credit_written": False,
+                    },
+                )
             return (
                 _mc(
                     conn,
@@ -2912,6 +3011,8 @@ class SagaStore:
             )
 
         result = await self._write_locked(_do)
+        if isinstance(result, dict):
+            return result
         if result is None:
             return {
                 "contributed_count": 0,

@@ -33,6 +33,7 @@ currently stubbed — re-wire in a follow-up.
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import contextlib
 import hashlib
 import json
@@ -60,7 +61,12 @@ from .channel_registry import (
 from .chat_skills import CHAT_SKILL_EXTRA_KEY, ChatSkillRegistry
 from .config import Config
 from .model_registry import DEFAULT_MODEL_SPEC
-from .event_logger import log_event, log_event_sync, safe_log_event
+from .event_logger import (
+    log_durable_event_sync,
+    log_event,
+    log_event_sync,
+    safe_log_event,
+)
 from .feedback import FeedbackLog
 from . import health
 from . import mid_turn_injection
@@ -1327,6 +1333,10 @@ class Agent:
         # the completion handler back onto the loop via
         # ``run_coroutine_threadsafe``.
         self._loop: asyncio.AbstractEventLoop | None = None
+        # Shell-job waiter threads add these futures; their done callbacks may
+        # discard them on an event-loop thread. CPython set add/discard are
+        # atomic under the GIL, and no compound iteration is performed here.
+        self._shell_completion_futures: set[concurrent.futures.Future[Any]] = set()
 
         # Build the deepagent singleton. Done lazily to keep import-time
         # fast and to let tests construct Agent without a real model.
@@ -2765,28 +2775,29 @@ class Agent:
                     # a header-less 429 → short escalating backoff (so a
                     # transient burst doesn't sit out a full window).
                     reset_at, pause_reason = tracker.record_rate_limit(exc)
-                    await log_event(
-                        "quota_exhausted",
-                        channel_id=event.channel_id,
-                        turn_id=turn_id,
-                        reset_at=reset_at.isoformat(),
-                        pause_reason=pause_reason,
-                        provider=tracker.provider,
-                        exception_class=type(exc).__name__,
-                        exception_message=str(exc)[:240],
-                    )
-                    # Arm a recovery wake so the agent retries exactly
-                    # when the window should roll over, instead of idling
-                    # until the next hourly scheduled tick.
-                    sched = getattr(self, "_scheduler", None)
-                    if sched is not None and hasattr(sched, "arm_quota_recovery_wake"):
-                        try:
-                            sched.arm_quota_recovery_wake(reset_at)
-                        except Exception:  # noqa: BLE001
-                            log.exception(
-                                "arm_quota_recovery_wake failed; next "
-                                "scheduled tick will still recover"
-                            )
+                    if tracker.last_save_ok is not False:
+                        await log_event(
+                            "quota_exhausted",
+                            channel_id=event.channel_id,
+                            turn_id=turn_id,
+                            reset_at=reset_at.isoformat(),
+                            pause_reason=pause_reason,
+                            provider=tracker.provider,
+                            exception_class=type(exc).__name__,
+                            exception_message=str(exc)[:240],
+                        )
+                        # Arm a recovery wake so the agent retries exactly
+                        # when the window should roll over, instead of idling
+                        # until the next hourly scheduled tick.
+                        sched = getattr(self, "_scheduler", None)
+                        if sched is not None and hasattr(sched, "arm_quota_recovery_wake"):
+                            try:
+                                sched.arm_quota_recovery_wake(reset_at)
+                            except Exception:  # noqa: BLE001
+                                log.exception(
+                                    "arm_quota_recovery_wake failed; next "
+                                    "scheduled tick will still recover"
+                                )
             except Exception:  # noqa: BLE001 — defensive boundary
                 log.exception("quota_pause emit failed; continuing")
         finally:
@@ -3139,6 +3150,11 @@ class Agent:
                         record=record,
                         repo=current_worktree,
                         current_worktree=current_worktree,
+                        run_id=(
+                            continuation_event.extra.get("run_id")
+                            if isinstance(continuation_event.extra.get("run_id"), str)
+                            else None
+                        ),
                     ),
                     timeout=continuation_timeout_s,
                 )
@@ -3453,9 +3469,39 @@ class Agent:
             )
             return
         try:
-            asyncio.run_coroutine_threadsafe(
+            future = asyncio.run_coroutine_threadsafe(
                 self._on_shell_job_complete(job), loop,
             )
+            self._shell_completion_futures.add(future)
+            job_id = getattr(job, "job_id", "?")
+
+            def observe_handler(done: concurrent.futures.Future[Any]) -> None:
+                self._shell_completion_futures.discard(done)
+                try:
+                    done.result()
+                except concurrent.futures.CancelledError:
+                    log.warning(
+                        "shell-job-complete handler cancelled: job_id=%s", job_id,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    log.exception(
+                        "shell-job-complete handler failed: job_id=%s", job_id,
+                        exc_info=exc,
+                    )
+                    try:
+                        log_durable_event_sync(
+                            "shell_job_complete_handler_failed",
+                            job_id=job_id,
+                            error=f"{type(exc).__name__}: {exc}"[:500],
+                        )
+                    except Exception:  # noqa: BLE001
+                        log.exception(
+                            "durable shell-job-complete failure event failed: "
+                            "job_id=%s",
+                            job_id,
+                        )
+
+            future.add_done_callback(observe_handler)
         except Exception:  # noqa: BLE001
             # Never let a daemon-thread invocation crash the registry.
             log.exception("schedule of shell-job-complete handler failed")

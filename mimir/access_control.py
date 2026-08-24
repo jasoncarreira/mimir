@@ -4726,6 +4726,41 @@ _FIXED_SERVICE_SINK_OPERATIONS = frozenset({"rebuild_index"})
 
 _TAINT_INDEPENDENT_EGRESS_TOOLS = frozenset({"fetch_url", "web_search"})
 
+
+def _egress_target_requires_taint_gate(
+    tool_name: str, target: str | None, auth_context: Any,
+) -> bool:
+    """Gate egress generally, including fetch targets approved only by scope."""
+    if tool_name not in _TAINT_INDEPENDENT_EGRESS_TOOLS:
+        return True
+    if tool_name == "web_search":
+        return False
+    if target is None:
+        return False
+    normalized = normalize_sink_destination(SinkCategory.NETWORK, target)
+    if normalized is None:
+        return False
+    if (
+        normalized in approved_fetch_urls(auth_context)
+        or _target_matches_configured_github_repo_fetch(target)
+    ):
+        return False
+    service = get_trusted_service_from_auth_context(auth_context)
+    policy = service.sink_policy_for("fetch_url") if service is not None else None
+    if (
+        policy is not None
+        and policy.adapter != "approved_urls"
+        and _sink_adapter_admits(
+            _SERVICE_SINK_ADAPTERS.get(policy.adapter),
+            normalized,
+            policy.destination,
+            service,
+        )
+    ):
+        return False
+    return fetch_url_is_approved(target, auth_context)
+
+
 _CHAINLINK_TAINT_REFUSAL = (
     "this turn carries untrusted active ingest, so Chainlink tracker mutations "
     "are unavailable for this turn. Read-only queries remain admitted: issue "
@@ -5018,7 +5053,9 @@ class SinkGate:
             )
         if capability_tier is CapabilityTier.UNBOUNDED:
             return (
-                tool_name in _TAINT_INDEPENDENT_EGRESS_TOOLS
+                not _egress_target_requires_taint_gate(
+                    tool_name, target, auth_context,
+                )
                 or not has_untrusted_active_ingest,
                 None,
             )
@@ -5170,9 +5207,12 @@ class SinkGate:
         resolved_target = resolve_sink_target(
             tool_name, sink_category, target, service,
         )
+        egress_target_requires_taint_gate = _egress_target_requires_taint_gate(
+            tool_name, target, auth_context,
+        )
         if (
             is_application_egress
-            and tool_name not in _TAINT_INDEPENDENT_EGRESS_TOOLS
+            and egress_target_requires_taint_gate
             and ifc_labels.labels
             and not ifc_labels.sources
         ):
@@ -5194,7 +5234,7 @@ class SinkGate:
         )
         if (
             is_application_egress
-            and tool_name not in _TAINT_INDEPENDENT_EGRESS_TOOLS
+            and egress_target_requires_taint_gate
             and not allow_untrusted_active_ingest
             and has_untrusted_active_ingest
         ):

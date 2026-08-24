@@ -381,7 +381,9 @@ def test_reaper_enforces_own_ttl_before_steal() -> None:
 
     reaped = claims.reap_stale_claims([fresh, stale], ttl=timedelta(hours=1))
 
-    assert reaped == [stale]
+    assert reaped.reaped == [stale]
+    assert reaped.examined == 1
+    assert reaped.skipped == {}
     assert ["chainlink", "locks", "steal", "1"] not in calls
     assert ["chainlink", "locks", "steal", "2"] in calls
     assert ["chainlink", "locks", "release", "2"] in calls
@@ -392,6 +394,17 @@ def test_reaper_enforces_own_ttl_before_steal() -> None:
     assert payload["last_heartbeat"] == heartbeat.isoformat()
     assert payload["resulting_label"] == "worklink:ready"
     assert events == [
+        (
+            "worklink_claim_stolen",
+            {
+                "issue_id": 2,
+                "prior_agent_id": "stale",
+                "heartbeat_age_s": 7200.0,
+                "guard_outcome": "stale_lock_confirmed",
+                "steal_succeeded": True,
+                "error": None,
+            },
+        ),
         (
             "worklink_claim_reaped",
             {
@@ -424,9 +437,83 @@ def test_reaper_blocks_after_max_attempts() -> None:
 
     reaped = claims.reap_stale_claims([stale], ttl=timedelta(hours=1))
 
-    assert reaped == [stale]
+    assert reaped.reaped == [stale]
     assert ["chainlink", "issue", "label", "2", "worklink:blocked"] in calls
     assert ["chainlink", "issue", "label", "2", "worklink:ready"] not in calls
+
+
+@pytest.mark.parametrize(
+    ("scenario", "reason", "event_type"),
+    [
+        ("lock_absent", "lock_not_held", "worklink_claim_reap_skipped"),
+        ("lock_query_broken", "lock_query_failed", "worklink_claim_reap_skipped"),
+        ("steal_failed", "lock_steal_failed", "worklink_claim_reap_skipped"),
+        ("reaped", None, "worklink_claim_reaped"),
+    ],
+)
+def test_part_a_reaper_reports_each_stale_claim_outcome(
+    scenario: str,
+    reason: str | None,
+    event_type: str,
+) -> None:
+    events: list[tuple[str, dict[str, object]]] = []
+    now = datetime(2026, 8, 23, tzinfo=UTC)
+    stale = ClaimRecord(1400, 1, "orphan", now - timedelta(hours=3))
+
+    def runner(args: Sequence[str]) -> subprocess.CompletedProcess[str]:
+        call = list(args)
+        if call[1:3] == ["locks", "list"]:
+            if scenario == "lock_query_broken":
+                return subprocess.CompletedProcess(call, 1, stdout="", stderr="tracker down")
+            locks = {} if scenario == "lock_absent" else {"1400": {"issue_id": 1400}}
+            return subprocess.CompletedProcess(call, 0, stdout=json.dumps({"locks": locks}), stderr="")
+        if call[1:3] == ["locks", "steal"] and scenario == "steal_failed":
+            return subprocess.CompletedProcess(call, 1, stdout="", stderr="busy")
+        if call[1:3] == ["issue", "show"]:
+            return subprocess.CompletedProcess(
+                call, 0, stdout=json.dumps({"labels": ["worklink:in-progress"]}), stderr=""
+            )
+        return completed(call)
+
+    result = ChainlinkClaims(
+        agent_id="mimir-a",
+        runner=runner,
+        clock=lambda: now,
+        event_logger=lambda event, **payload: events.append((event, payload)),
+    ).reap_stale_claims([stale], ttl=timedelta(hours=1))
+
+    assert result.examined == 1
+    assert [event for event, _payload in events][-1] == event_type
+    if reason is None:
+        assert result.reaped == [stale]
+        assert result.skipped == {}
+    else:
+        assert result.reaped == []
+        assert result.skipped == {reason: 1}
+        assert result.skipped_issue_ids == {reason: [1400]}
+
+
+def test_part_a_reaper_skip_event_uses_bounded_issue_samples() -> None:
+    events: list[tuple[str, dict[str, object]]] = []
+    now = datetime(2026, 8, 23, tzinfo=UTC)
+    records = [
+        ClaimRecord(issue_id, 1, "orphan", now - timedelta(hours=3))
+        for issue_id in range(1, 26)
+    ]
+    claims = ChainlinkClaims(
+        agent_id="mimir-a",
+        runner=lambda args: subprocess.CompletedProcess(
+            list(args), 0, stdout=json.dumps({"locks": {}}), stderr=""
+        ),
+        clock=lambda: now,
+        event_logger=lambda event, **payload: events.append((event, payload)),
+    )
+
+    result = claims.reap_stale_claims(records, ttl=timedelta(hours=1))
+
+    assert result.skipped == {"lock_not_held": 25}
+    assert len(result.skipped_issue_ids["lock_not_held"]) == 20
+    assert [event for event, _payload in events] == ["worklink_claim_reap_skipped"]
 
 
 def test_transition_failed_attempt_with_retries_returns_to_ready() -> None:
@@ -530,6 +617,95 @@ def test_same_agent_reclaim_with_stale_heartbeat_steals_and_proceeds():
 
     assert result.claimed is True
     assert any(call[1:3] == ["locks", "steal"] for call in calls)
+
+
+def test_part_b_claim_steals_report_degraded_guard_and_both_steal_outcomes() -> None:
+    now = datetime(2026, 7, 3, 19, 0, tzinfo=UTC)
+    stale = ClaimRecord(
+        issue_id=783,
+        attempt=1,
+        agent_id="prior-worker",
+        claimed_at=now - timedelta(hours=2),
+        heartbeat_at=now - timedelta(hours=1),
+    )
+    events: list[tuple[str, dict[str, object]]] = []
+    issue_show_calls = 0
+
+    def degraded_runner(args: Sequence[str]) -> subprocess.CompletedProcess[str]:
+        nonlocal issue_show_calls
+        call = list(args)
+        if call[1:3] == ["issue", "show"]:
+            issue_show_calls += 1
+            if issue_show_calls == 2:
+                raise OSError("comments unavailable")
+            return subprocess.CompletedProcess(call, 0, stdout="{}", stderr="")
+        if call[1:3] == ["locks", "claim"]:
+            return subprocess.CompletedProcess(call, 0, stdout="already hold", stderr="")
+        if call[1:3] == ["locks", "steal"]:
+            return subprocess.CompletedProcess(call, 1, stdout="", stderr="steal denied")
+        return completed(call)
+
+    result = ChainlinkClaims(
+        agent_id="mimir-worklink-epic",
+        runner=degraded_runner,
+        clock=lambda: now,
+        event_logger=lambda event, **payload: events.append((event, payload)),
+    ).claim_issue(783, [stale.to_comment()])
+
+    assert result.claimed is True
+    relevant_events = [
+        item
+        for item in events
+        if item[0] in {"worklink_claim_guard_degraded", "worklink_claim_stolen"}
+    ]
+    assert relevant_events == [
+        (
+            "worklink_claim_guard_degraded",
+            {"issue_id": 783, "error": "OSError: comments unavailable"},
+        ),
+        (
+            "worklink_claim_stolen",
+            {
+                "issue_id": 783,
+                "prior_agent_id": "prior-worker",
+                "heartbeat_age_s": 3600.0,
+                "guard_outcome": "degraded",
+                "steal_succeeded": False,
+                "error": "steal denied",
+            },
+        ),
+    ]
+
+    reaper_events: list[tuple[str, dict[str, object]]] = []
+
+    def reaper_runner(args: Sequence[str]) -> subprocess.CompletedProcess[str]:
+        call = list(args)
+        if call[1:3] == ["locks", "list"]:
+            return subprocess.CompletedProcess(
+                call, 0, stdout=json.dumps({"locks": {"783": {"issue_id": 783}}}), stderr=""
+            )
+        if call[1:3] == ["issue", "show"]:
+            return subprocess.CompletedProcess(
+                call, 0, stdout=json.dumps({"labels": ["worklink:in-progress"]}), stderr=""
+            )
+        return completed(call)
+
+    ChainlinkClaims(
+        agent_id="reaper",
+        runner=reaper_runner,
+        clock=lambda: now,
+        event_logger=lambda event, **payload: reaper_events.append((event, payload)),
+    ).reap_stale_claims([stale], ttl=timedelta(minutes=30))
+
+    stolen = next(payload for event, payload in reaper_events if event == "worklink_claim_stolen")
+    assert stolen == {
+        "issue_id": 783,
+        "prior_agent_id": "prior-worker",
+        "heartbeat_age_s": 3600.0,
+        "guard_outcome": "stale_lock_confirmed",
+        "steal_succeeded": True,
+        "error": None,
+    }
 
 
 def test_duplicate_vs_live_final_attempt_never_labels_blocked():
@@ -728,9 +904,10 @@ def test_graceful_shutdown_releases_only_this_process_claim_and_forgives_budget(
         runner=runner,
         clock=lambda: now + timedelta(minutes=1),
     )
-    released = claims.release_owned_claims_for_shutdown()
+    released, failed = claims.release_owned_claims_for_shutdown()
 
     assert released == [own]
+    assert failed == []
     assert ["chainlink", "issue", "label", "1033", "worklink:ready"] in calls
     assert ["chainlink", "locks", "release", "1033"] in calls
     assert ["chainlink", "issue", "unlabel", "1033", "worklink:in-progress"] in calls
@@ -745,6 +922,56 @@ def test_graceful_shutdown_releases_only_this_process_claim_and_forgives_budget(
     history = [own.to_comment(), abort_comment]
     assert claims.attempts_used(history) == 0
     assert claims.next_attempt(history) == 2
+
+
+def test_part_c_shutdown_reports_partial_failure_and_timeout_remainder() -> None:
+    now = datetime(2026, 8, 23, tzinfo=UTC)
+    records = {
+        issue_id: ClaimRecord(issue_id, 1, "mimir-worklink:process-a", now)
+        for issue_id in (1, 2, 3)
+    }
+
+    def run_case(*, timeout: bool) -> tuple[list[ClaimRecord], list[object], list[tuple[str, dict[str, object]]]]:
+        events: list[tuple[str, dict[str, object]]] = []
+
+        def runner(args: Sequence[str]) -> subprocess.CompletedProcess[str]:
+            call = list(args)
+            if call[1:3] == ["issue", "list"]:
+                return subprocess.CompletedProcess(
+                    call, 0, stdout=json.dumps([{"id": 1}, {"id": 2}, {"id": 3}]), stderr=""
+                )
+            if call[1:3] == ["issue", "show"]:
+                issue_id = int(call[3])
+                if timeout and issue_id == 1:
+                    raise subprocess.TimeoutExpired(call, 0.01)
+                return subprocess.CompletedProcess(
+                    call,
+                    0,
+                    stdout=json.dumps({"comments": [{"content": records[issue_id].to_comment()}]}),
+                    stderr="",
+                )
+            if not timeout and call[1:4] == ["locks", "release", "1"]:
+                return subprocess.CompletedProcess(call, 1, stdout="", stderr="release denied")
+            return completed(call)
+
+        released, failed = ChainlinkClaims(
+            agent_id="mimir-worklink:process-a",
+            runner=runner,
+            event_logger=lambda event, **payload: events.append((event, payload)),
+        ).release_owned_claims_for_shutdown()
+        return released, failed, events
+
+    released, failed, events = run_case(timeout=False)
+    assert [record.issue_id for record in released] == [2, 3]
+    assert [failure.issue_id for failure in failed] == [1]
+    assert events[0][1]["released_issue_ids"] == [2, 3]
+    assert events[0][1]["failed"][0]["issue_id"] == 1
+
+    released, failed, events = run_case(timeout=True)
+    assert released == []
+    assert [failure.issue_id for failure in failed] == [1, 2, 3]
+    assert [item["issue_id"] for item in events[0][1]["failed"]] == [1, 2, 3]
+    assert events[0][1]["failed"][1]["reason"] == "abandoned_after_timeout"
 
 
 def test_shutdown_abort_forgiveness_is_capped_and_attempt_ordinals_keep_advancing() -> None:
