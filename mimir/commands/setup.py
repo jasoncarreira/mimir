@@ -358,6 +358,11 @@ def _default_saga_toml(
         token_budget_ceiling = 1000000
         auto_compact_threshold_pct = 90
         refuse_threshold_pct = 99
+        # Semantic triple retrieval considers only the newest eligible rows.
+        # If the live store grows past this bound, older triples stop being
+        # candidates and saga logs triple_candidate_pool_truncated. Consolidation
+        # does not guarantee that the live triple count remains below this value.
+        triple_candidate_limit = 500
 
         """
     ) + embedding_block + dedent(
