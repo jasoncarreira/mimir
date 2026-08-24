@@ -6,7 +6,7 @@ import logging
 from typing import Any
 
 from .access_control import SinkGate, get_sink_category
-from .coding import env_bool
+from .env import env_bool
 from .event_logger import log_event_sync
 
 log = logging.getLogger(__name__)
