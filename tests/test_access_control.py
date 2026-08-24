@@ -9368,6 +9368,9 @@ def test_maintenance_github_repository_operands_are_configured(
     argv = parse_service_shell_argv(command, "maintenance")
 
     assert (argv is not None) is admitted
+
+
+@pytest.mark.parametrize(
     ("profile", "canonical", "trigger", "authority_profile"),
     [
         ("scheduler_read_only", "scheduler:test", "scheduled_tick", "custom"),
