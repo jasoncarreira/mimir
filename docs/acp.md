@@ -14,7 +14,7 @@ stock ACP client
 
 One already-running `mimir run` daemon owns the brain and its `AgentRuntimeBundle`. `mimir acp` is only a local stdio proxy, and `mimir acp relay` is only a credential-blind relay. Neither calls a runtime factory or silently starts Mimir. The proxy never creates a standalone runtime.
 
-ACP is enabled when `MIMIR_ACP_ENABLED` is unset or true and disabled when it is false. The daemon listens at `$MIMIR_HOME/.mimir/acp/daemon.sock`. The `.mimir/acp` directory is owned by the daemon UID with mode `0700`; the socket is owner-only with mode `0600`.
+ACP is enabled only when `MIMIR_ACP_ENABLED` is explicitly truthy and is disabled when the variable is unset, blank, or false. Unrecognised values fail startup. The daemon listens at `$MIMIR_HOME/.mimir/acp/daemon.sock`. The `.mimir/acp` directory is owned by the daemon UID with mode `0700`; the socket is owner-only with mode `0600`.
 
 stdin and stdout carry UTF-8 JSONL ACP frames only. stdout is reserved before command imports and diagnostics go to stderr. Local socket and relay connection attempts are bounded to 5 seconds. SSH process creation and establishment are bounded to 12 seconds. Once established, a session has no duration limit. Cleanup uses writer drain, close, and abort bounds of 2, 1, and 1 seconds within a 5-second force-close bound, then waits 1 second for SSH, terminates and waits 2 seconds, and kills and waits 1 second.
 
@@ -130,6 +130,6 @@ Native Mimir tools operate on the daemon host. Mimir Hands operates on the clien
 
 ## Troubleshooting
 
-The proxy intentionally reports the generic diagnostic `error: connection-failed`. Confirm the selected profile, then confirm `mimir run` is running with `MIMIR_ACP_ENABLED` unset or true. As the owner UID, inspect `<MIMIR_HOME>/.mimir/acp`: the directory must be mode `0700`, and `daemon.sock` must be mode `0600`. Start or restart `mimir run` if the daemon is missing or disabled; the proxy will not start it.
+The proxy intentionally reports the generic diagnostic `error: connection-failed`. Confirm the selected profile, then confirm `mimir run` is running with `MIMIR_ACP_ENABLED=true`. As the owner UID, inspect `<MIMIR_HOME>/.mimir/acp`: the directory must be mode `0700`, and `daemon.sock` must be mode `0600`. Start or restart `mimir run` if the daemon is missing or disabled; the proxy will not start it.
 
 For SSH profiles, additionally confirm the remote `mimir-agent` version is 0.9.0, it is on the noninteractive PATH, identity and known-hosts permissions are correct, the host-key entry matches, and remote stdout is banner-free.

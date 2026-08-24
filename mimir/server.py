@@ -1277,28 +1277,16 @@ def build_app(config: Config) -> web.Application:
         _publish_runtime(app, runtime_slot, startup_state, bundle)
         from .acp.daemon import (
             AcpDaemon,
-            AcpDaemonError,
             _acp_enablement_from_env,
         )
 
-        acp_enabled, acp_explicitly_enabled = _acp_enablement_from_env()
+        acp_enabled, _ = _acp_enablement_from_env()
         if acp_enabled:
             acp_daemon = AcpDaemon(bundle)
             startup_state.acp_start_attempted = True
-            try:
-                await acp_daemon.start()
-            except (AcpDaemonError, OSError) as exc:
-                if acp_explicitly_enabled:
-                    raise
-                app["acp_daemon"] = None
-                log.warning(
-                    "ACP daemon unavailable at %s: %s; continuing without ACP",
-                    acp_daemon.socket_path,
-                    exc,
-                )
-            else:
-                startup_state.acp_daemon = acp_daemon
-                app["acp_daemon"] = acp_daemon
+            await acp_daemon.start()
+            startup_state.acp_daemon = acp_daemon
+            app["acp_daemon"] = acp_daemon
         agent = bundle.agent
         indexer = bundle.indexer
         saga_client = bundle.saga_client

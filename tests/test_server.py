@@ -2746,68 +2746,43 @@ async def test_acp_daemon_uses_published_bundle_and_stops_before_runtime(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("explicit", [False, True], ids=["defaulted", "explicit"])
-async def test_acp_overlong_socket_path_obeys_enablement_intent(
+async def test_explicit_acp_overlong_socket_path_fails_startup(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
-    caplog: pytest.LogCaptureFixture,
-    explicit: bool,
 ) -> None:
     long_home = tmp_path / ("h" * 160)
     long_home.mkdir()
     socket_path = long_home / ".mimir" / "acp" / "daemon.sock"
     assert len(os.fsencode(socket_path)) > 108
     app, control = _controlled_server_app(long_home, monkeypatch)
-    if explicit:
-        monkeypatch.setenv("MIMIR_ACP_ENABLED", "true")
-    else:
-        monkeypatch.delenv("MIMIR_ACP_ENABLED")
+    monkeypatch.setenv("MIMIR_ACP_ENABLED", "true")
 
-    if explicit:
-        with pytest.raises(OSError, match="too long"):
-            await _run_startup(app)
-        assert control.bundle.closed is True
-    else:
-        with caplog.at_level(logging.WARNING, logger="mimir.server"):
-            await _run_startup(app)
-        assert app["agent_runtime"] is control.bundle
-        assert app["acp_daemon"] is None
-        assert str(socket_path) in caplog.text
-        assert "too long" in caplog.text.lower()
-        await _run_cleanup(app)
+    with pytest.raises(OSError, match="too long"):
+        await _run_startup(app)
+    assert control.bundle.closed is True
 
     assert not socket_path.exists()
     assert app["startup_state"].acp_daemon is None
 
 
 @pytest.mark.asyncio
-async def test_defaulted_acp_daemon_error_is_visible_and_not_published(
+async def test_disabled_acp_does_not_construct_daemon(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
-    caplog: pytest.LogCaptureFixture,
 ) -> None:
     import mimir.acp.daemon
-    from mimir.acp.daemon import AcpDaemonError
 
     app, control = _controlled_server_app(tmp_path, monkeypatch)
     monkeypatch.delenv("MIMIR_ACP_ENABLED")
 
     class Daemon:
-        socket_path = tmp_path / ".mimir" / "acp" / "daemon.sock"
-
         def __init__(self, bundle: Any) -> None:
-            assert bundle is control.bundle
-
-        async def start(self) -> None:
-            raise AcpDaemonError("ACP directory must have mode 0700")
+            raise AssertionError("disabled ACP must not construct the daemon")
 
     monkeypatch.setattr(mimir.acp.daemon, "AcpDaemon", Daemon)
-    with caplog.at_level(logging.WARNING, logger="mimir.server"):
-        await _run_startup(app)
+    await _run_startup(app)
 
-    assert app["acp_daemon"] is None
-    assert str(Daemon.socket_path) in caplog.text
-    assert "must have mode 0700" in caplog.text
+    assert app.get("acp_daemon") is None
     await _run_cleanup(app)
 
 
@@ -2819,7 +2794,7 @@ async def test_acp_daemon_construction_error_is_not_suppressed(
     import mimir.acp.daemon
 
     app, _ = _controlled_server_app(tmp_path, monkeypatch)
-    monkeypatch.delenv("MIMIR_ACP_ENABLED")
+    monkeypatch.setenv("MIMIR_ACP_ENABLED", "true")
 
     class Daemon:
         def __init__(self, bundle: Any) -> None:

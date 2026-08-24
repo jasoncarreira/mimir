@@ -8,6 +8,7 @@ from types import SimpleNamespace
 import pytest
 
 import mimir.channel_audience as channel_audience
+import mimir.identities as identities_module
 from mimir.access_control import _source_is_triggering_channel_compatible
 from mimir.agent import Agent
 from mimir.acp.session_store import SessionStore
@@ -74,23 +75,52 @@ def test_empty_and_missing_audiences_are_unknown(tmp_path: Path) -> None:
     assert provider.audience_for("dm", principal=None) is None
 
 
-def test_provider_absence_failure_and_live_reload_fail_closed_without_cache(
+def test_provider_self_invalidates_injected_resolver_after_out_of_band_edit(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    provider = ServerChannelAudienceProvider(tmp_path)
+    identities_path = tmp_path / "state" / "identities.yaml"
     _write_identities(
         tmp_path,
         "people:\n  - canonical: alice\n    dm_channels: {discord: dm-old}\n",
     )
+    resolver = IdentityResolver(tmp_path)
+    resolver.reload()
+    provider = ServerChannelAudienceProvider(tmp_path, identity_resolver=resolver)
     assert provider.audience_for("dm-old", principal="alice") == frozenset({"alice"})
+
+    reads = 0
+    parses = 0
+    original_read_text = Path.read_text
+    original_safe_load = identities_module.yaml.safe_load
+
+    def counted_read_text(path: Path, *args, **kwargs):
+        nonlocal reads
+        if path == identities_path:
+            reads += 1
+        return original_read_text(path, *args, **kwargs)
+
+    def counted_safe_load(*args, **kwargs):
+        nonlocal parses
+        parses += 1
+        return original_safe_load(*args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", counted_read_text)
+    monkeypatch.setattr(identities_module.yaml, "safe_load", counted_safe_load)
+    prior = identities_path.stat()
     _write_identities(
         tmp_path,
-        "people:\n  - canonical: alice\n    dm_channels: {discord: dm-new}\n",
+        "people:\n  - canonical: alice\n    dm_channels: {discord: dm-new-longer}\n",
     )
+    assert identities_path.stat().st_size != prior.st_size
+
     assert provider.audience_for("dm-old", principal="alice") is None
-    assert provider.audience_for("dm-new", principal="alice") == frozenset({"alice"})
-    _write_identities(tmp_path, "people: [")
-    assert provider.audience_for("dm-new", principal="alice") is None
+    for _ in range(20):
+        assert provider.audience_for(
+            "dm-new-longer", principal="alice"
+        ) == frozenset({"alice"})
+    assert provider.identity_resolver is resolver
+    assert (reads, parses) == (1, 1)
 
 
 def test_group_slack_and_guild_channels_are_unknown_without_visibility_reads(
@@ -434,18 +464,48 @@ def test_recent_user_requires_bound_minted_attestation_and_singleton_destination
     ) is False
 
 
-def test_provider_retains_injected_resolver_without_changing_audience_semantics(
+def test_provider_reuses_injected_resolver_and_reads_each_source_once(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    _write_identities(
+        tmp_path,
+        "people:\n  - canonical: alice\n    dm_channels: {discord: dm-alice}\n",
+    )
     resolver = IdentityResolver(tmp_path)
+    resolver.reload()
+    session = SessionStore(tmp_path).create_owned_session("alice")
+    reads: dict[str, int] = {"identities": 0, "session": 0}
+    parses = 0
+    original_read_text = Path.read_text
+    original_safe_load = identities_module.yaml.safe_load
+
+    def counted_read_text(path: Path, *args, **kwargs):
+        if path.name == "identities.yaml":
+            reads["identities"] += 1
+        elif path == session.metadata_path:
+            reads["session"] += 1
+        return original_read_text(path, *args, **kwargs)
+
+    def counted_safe_load(*args, **kwargs):
+        nonlocal parses
+        parses += 1
+        return original_safe_load(*args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", counted_read_text)
+    monkeypatch.setattr(identities_module.yaml, "safe_load", counted_safe_load)
     provider = ServerChannelAudienceProvider(
         tmp_path,
         identity_resolver=resolver,
     )
 
+    for _ in range(20):
+        assert provider.audience_for("dm-alice", principal="alice") == frozenset({"alice"})
+        assert provider.audience_for(session.thread_id, principal="alice") == frozenset({"alice"})
+
     assert provider.identity_resolver is resolver
-    assert provider.audience_for("discord-guild", principal="alice") is None
-    assert ServerChannelAudienceProvider(tmp_path).identity_resolver is None
+    assert reads == {"identities": 0, "session": 1}
+    assert parses == 0
 
 
 def test_recent_activity_and_owner_attested_feedback_use_distinct_audience_policies() -> None:

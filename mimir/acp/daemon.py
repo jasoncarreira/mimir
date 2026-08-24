@@ -56,24 +56,21 @@ def peer_credentials_supported() -> bool:
 
 def _acp_enablement_from_env() -> tuple[bool, bool]:
     raw = os.environ.get("MIMIR_ACP_ENABLED")
-    supported = os.name == "posix" and peer_credentials_supported()
     if raw is None or not raw.strip():
-        return supported, False
+        return False, False
     normalized = raw.strip().lower()
     if normalized in _FALSE_VALUES:
         return False, False
     if normalized in _TRUE_VALUES:
+        supported = os.name == "posix" and peer_credentials_supported()
         if not supported:
             raise AcpDaemonError(
                 "MIMIR_ACP_ENABLED is true, but owner-verifiable Unix peers are unsupported"
             )
         return True, True
-    _LOGGER.warning(
-        "MIMIR_ACP_ENABLED=%r is not a recognised boolean; using default %r",
-        raw,
-        supported,
+    raise AcpDaemonError(
+        f"MIMIR_ACP_ENABLED={raw!r} is not a recognised boolean"
     )
-    return supported, False
 
 
 def acp_enabled_from_env() -> bool:

@@ -36,6 +36,7 @@ from mimir.acp import sdk as acp_sdk
 from mimir.acp.agent import MimirAcpAgent
 from mimir.acp.session_store import SessionStore
 from mimir.agent import Agent, _initialize_ifc_labels
+from mimir.channel_audience import ServerChannelAudienceProvider
 from mimir.chat_skills import (
     CHAT_SKILL_EXTRA_KEY,
     ChatSkillInvocation,
@@ -5262,6 +5263,10 @@ async def test_owned_acp_and_dm_recent_activity_matrix_survives_restart(
     )
     agent._identity_resolver = resolver
     agent._buffer.resolver = resolver
+    agent._audience_provider = ServerChannelAudienceProvider(
+        home,
+        identity_resolver=resolver,
+    )
     store = SessionStore(home)
     first = store.create_owned_session("alice")
     second = store.create_owned_session("alice")
