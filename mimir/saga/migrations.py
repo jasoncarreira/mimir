@@ -617,6 +617,31 @@ WHERE a.source_type = 'session_boundary'
         -- v9: exact-content dedup is owner-scoped (chainlink #895).
         -- The old index made a different owner's equal content conflict even
         -- though the read-side dedup lookup correctly excluded that row.
+        --
+        -- Pre-migration stores did not enforce exact-content uniqueness. Keep
+        -- the lexicographically smallest stable atom id in each owner-scoped
+        -- group and retract every other row. The id is durable logical data,
+        -- unlike rowid or insertion order, so replicas of the same store choose
+        -- the same survivor. Legacy schemas may lack the lifecycle detail
+        -- columns used by ordinary tombstones.
+        ALTER TABLE atoms ADD COLUMN tombstoned_at TEXT;
+        ALTER TABLE atoms ADD COLUMN tombstoned_reason TEXT;
+
+        UPDATE atoms AS duplicate
+        SET tombstoned = 1,
+            tombstoned_at = strftime('%Y-%m-%dT%H:%M:%f+00:00', 'now'),
+            tombstoned_reason = COALESCE(duplicate.tombstoned_reason, 'merged')
+        WHERE duplicate.tombstoned = 0
+          AND EXISTS (
+              SELECT 1
+              FROM atoms AS survivor
+              WHERE survivor.tombstoned = 0
+                AND survivor.content_hash = duplicate.content_hash
+                AND survivor.agent_id = duplicate.agent_id
+                AND survivor.owner_principal = duplicate.owner_principal
+                AND survivor.id < duplicate.id
+          );
+
         DROP INDEX IF EXISTS idx_atoms_dedup;
         CREATE UNIQUE INDEX idx_atoms_dedup
             ON atoms(content_hash, agent_id, owner_principal)
@@ -854,6 +879,34 @@ def _execute_migration_script(conn: sqlite3.Connection, ddl: str) -> None:
     for statement in _iter_sql_statements(ddl):
         try:
             conn.execute(statement)
+        except sqlite3.IntegrityError as exc:
+            message = str(exc)
+            dedup_constraint = (
+                "UNIQUE constraint failed: atoms.content_hash, "
+                "atoms.agent_id, atoms.owner_principal"
+            )
+            if dedup_constraint.casefold() in message.casefold():
+                collision = conn.execute(
+                    "SELECT content_hash, agent_id, owner_principal "
+                    "FROM atoms WHERE tombstoned = 0 "
+                    "GROUP BY content_hash, agent_id, owner_principal "
+                    "HAVING COUNT(*) > 1 LIMIT 1"
+                ).fetchone()
+                if collision is not None:
+                    key = (
+                        f"content_hash={collision[0]!r}, agent_id={collision[1]!r}, "
+                        f"owner_principal={collision[2]!r}"
+                    )
+                else:
+                    key = "colliding key could not be read"
+                raise sqlite3.IntegrityError(
+                    "migration could not create unique constraint "
+                    "idx_atoms_dedup(content_hash, agent_id, owner_principal); "
+                    f"at least one live collision remains: {key}"
+                ) from exc
+            raise sqlite3.IntegrityError(
+                f"migration integrity constraint failed: {message}"
+            ) from exc
         except sqlite3.OperationalError as exc:
             if _is_duplicate_add_column(conn, statement, exc):
                 continue

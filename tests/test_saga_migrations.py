@@ -536,6 +536,13 @@ class TestSagaStoreInitialization:
         assert conn.execute(
             "SELECT MAX(version) FROM schema_version"
         ).fetchone() == (m.CURRENT_SCHEMA_VERSION,)
+        assert [
+            row[2]
+            for row in conn.execute("PRAGMA index_info(idx_atoms_dedup)")
+        ] == ["content_hash", "agent_id", "owner_principal"]
+        assert conn.execute(
+            "SELECT COUNT(*) FROM atoms WHERE tombstoned != 0"
+        ).fetchone() == (0,)
 
     def test_partial_schema_does_not_commit_inferred_version_rows(
         self, tmp_path: Path
@@ -1516,6 +1523,138 @@ class TestV7OwnershipMigration:
             "idx_world_visibility",
             "idx_world_owner",
         } <= indexes
+
+
+class TestV9OwnerScopedDedupMigration:
+    @pytest.mark.parametrize("reverse_insert", [False, True])
+    def test_legacy_collision_is_deterministically_tombstoned(
+        self, tmp_path: Path, reverse_insert: bool
+    ) -> None:
+        from mimir.saga.client import SagaStore
+        from mimir.saga.forget import forget
+
+        db_path = tmp_path / f"v9-collision-{reverse_insert}.db"
+        _create_unstamped_v4_db(db_path)
+        rows = [
+            (
+                "a-survivor",
+                "same logical content",
+                "H",
+                "default",
+                "2024-01-01T00:00:00+00:00",
+            ),
+            (
+                "z-loser",
+                "same logical content",
+                "H",
+                "default",
+                "2024-01-01T00:00:00+00:00",
+            ),
+        ]
+        if reverse_insert:
+            rows.reverse()
+        seed = sqlite3.connect(db_path)
+        seed.executemany(
+            "INSERT INTO atoms "
+            "(id, content, content_hash, agent_id, created_at) "
+            "VALUES (?, ?, ?, ?, ?)",
+            rows,
+        )
+        seed.commit()
+        seed.close()
+
+        migrated = SagaStore(db_path=db_path)._ensure_conn()
+
+        assert migrated.execute(
+            "SELECT id FROM atoms WHERE content_hash = 'H' AND agent_id = 'default' "
+            "AND owner_principal = 'legacy_admin' AND tombstoned = 0"
+        ).fetchall() == [("a-survivor",)]
+        tombstoned, tombstoned_at, tombstoned_reason = migrated.execute(
+            "SELECT tombstoned, tombstoned_at, tombstoned_reason "
+            "FROM atoms WHERE id = 'z-loser'"
+        ).fetchone()
+        assert tombstoned == 1
+        assert tombstoned_at is not None
+        assert tombstoned_at.endswith("+00:00")
+        assert tombstoned_reason == "merged"
+        assert migrated.execute(
+            "SELECT version FROM schema_version ORDER BY version"
+        ).fetchall() == [
+            (version,) for version in range(1, m.CURRENT_SCHEMA_VERSION + 1)
+        ]
+        assert [
+            row[2]
+            for row in migrated.execute("PRAGMA index_info(idx_atoms_dedup)")
+        ] == ["content_hash", "agent_id", "owner_principal"]
+
+        # Runtime exact-dedup sees only the survivor, and ordinary forget is
+        # idempotent for the migration-created tombstone.
+        assert migrated.execute(
+            "SELECT id FROM atoms WHERE content_hash = 'H' AND agent_id = 'default' "
+            "AND owner_principal = 'legacy_admin' AND tombstoned = 0"
+        ).fetchone() == ("a-survivor",)
+        assert forget(migrated, ["z-loser"]).tombstoned_count == 0
+        migrated.close()
+
+        reopened = SagaStore(db_path=db_path)._ensure_conn()
+        assert reopened.execute(
+            "SELECT id, tombstoned FROM atoms ORDER BY id"
+        ).fetchall() == [("a-survivor", 0), ("z-loser", 1)]
+        reopened.close()
+
+    def test_unresolvable_collision_reports_same_key_on_every_open(
+        self, tmp_path: Path
+    ) -> None:
+        db_path = tmp_path / "v9-unresolvable.db"
+        seed = sqlite3.connect(db_path)
+        seed.executescript(
+            "CREATE TABLE atoms ("
+            "id TEXT PRIMARY KEY, content_hash TEXT NOT NULL, "
+            "agent_id TEXT, owner_principal TEXT NOT NULL, "
+            "tombstoned INTEGER DEFAULT 0, created_at TEXT NOT NULL);"
+            "CREATE TABLE schema_version ("
+            "version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL);"
+        )
+        seed.executemany(
+            "INSERT INTO schema_version VALUES (?, '2000-01-01T00:00:00+00:00')",
+            [(version,) for version in range(1, 9)],
+        )
+        # SQLite permits NULL in a non-INTEGER PRIMARY KEY. With neither a
+        # stable id nor another durable difference, v9 must refuse to guess.
+        seed.executemany(
+            "INSERT INTO atoms VALUES (NULL, 'H', 'agent', 'owner', 0, '2024-01-01')",
+            [(), ()],
+        )
+        seed.commit()
+        seed.close()
+
+        messages = []
+        for _ in range(2):
+            conn = sqlite3.connect(db_path)
+            with pytest.raises(sqlite3.IntegrityError) as raised:
+                m.apply_pending_migrations(
+                    conn,
+                    fresh=False,
+                    target_version=9,
+                    migrations={9: m.MIGRATIONS[9]},
+                )
+            messages.append(str(raised.value))
+            assert conn.execute(
+                "SELECT version FROM schema_version ORDER BY version"
+            ).fetchall() == [(version,) for version in range(1, 9)]
+            assert {
+                row[1] for row in conn.execute("PRAGMA table_info(atoms)")
+            }.isdisjoint({"tombstoned_at", "tombstoned_reason"})
+            conn.close()
+
+        assert messages[0] == messages[1]
+        assert (
+            "idx_atoms_dedup(content_hash, agent_id, owner_principal)" in messages[0]
+        )
+        assert (
+            "content_hash='H', agent_id='agent', owner_principal='owner'"
+            in messages[0]
+        )
 
 
 def test_current_schema_has_owner_dedup_and_recall_provenance() -> None:
