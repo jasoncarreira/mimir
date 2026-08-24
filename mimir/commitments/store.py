@@ -95,6 +95,18 @@ COMMITMENTS_JSONL_SCHEMA_VERSION = 1
 _LARGE_STORE_WARN_THRESHOLD = 500
 
 
+@dataclass(frozen=True)
+class CommitmentsReplay:
+    """One immutable store replay and its diagnostics.
+
+    Keeping diagnostics beside the records prevents a concurrent replay from
+    changing the metadata observed by the caller.
+    """
+
+    records: dict[str, CommitmentRecord]
+    corrupt_line_count: int = 0
+
+
 @dataclass
 class CommitmentsStore:
     """Owns ``<path>`` — typically ``<home>/.mimir/commitments.jsonl``.
@@ -117,6 +129,19 @@ class CommitmentsStore:
 
     # ─── Appenders ──────────────────────────────────────────────────
 
+    def _append_line_sync(self, event: dict[str, Any]) -> None:
+        """Durably append one complete JSONL record.
+
+        Atomic whole-file replacement is intentionally not used for this
+        append-only, multi-process log: replacing a stale snapshot can discard
+        sibling appends. O_APPEND plus one buffered write preserves append
+        ordering; flush/fsync prevents a reported transition remaining buffered.
+        """
+        with self.path.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(event, ensure_ascii=True, default=str) + "\n")
+            f.flush()
+            os.fsync(f.fileno())
+
     async def _append(self, event: dict[str, Any]) -> None:
         # Stamp the schema version (chainlink #82 sub #86): every
         # appended event carries ``"v": COMMITMENTS_JSONL_SCHEMA_VERSION``
@@ -127,8 +152,7 @@ class CommitmentsStore:
         event = {**event, "v": COMMITMENTS_JSONL_SCHEMA_VERSION}
         async with self._lock:
             self.path.parent.mkdir(parents=True, exist_ok=True)
-            with self.path.open("a", encoding="utf-8") as f:
-                f.write(json.dumps(event, ensure_ascii=True, default=str) + "\n")
+            self._append_line_sync(event)
 
     async def add(self, record: CommitmentRecord) -> CommitmentRecord:
         """Append ``commitment_added`` with the full initial record.
@@ -336,8 +360,7 @@ class CommitmentsStore:
                 ):
                     return False
                 self.path.parent.mkdir(parents=True, exist_ok=True)
-                with self.path.open("a", encoding="utf-8") as f:
-                    f.write(json.dumps(event, ensure_ascii=True, default=str) + "\n")
+                self._append_line_sync(event)
             return True
         finally:
             self._inflight_lifecycle_ids.remove(id)
@@ -527,16 +550,16 @@ class CommitmentsStore:
 
     # ─── Replay-to-state ────────────────────────────────────────────
 
-    def current_state(self) -> dict[str, CommitmentRecord]:
-        """Read the JSONL, apply all events in order, return
-        ``id → CommitmentRecord``. Missing file → empty dict."""
+    def replay(self) -> CommitmentsReplay:
+        """Replay the JSONL and return records with immutable diagnostics."""
         records: dict[str, CommitmentRecord] = {}
         if not self.path.exists():
-            return records
+            return CommitmentsReplay(records=records)
         # JSONL is append-chronological; we read full-file (small,
         # bounded by trim policy). tail-streaming the FULL file via
         # ``tail_jsonl_records`` reverses order; use a forward scan.
         event_count = 0
+        corrupt_line_count = 0
         with self.path.open("r", encoding="utf-8") as f:
             for line in f:
                 line = line.strip()
@@ -546,9 +569,14 @@ class CommitmentsStore:
                 try:
                     event = json.loads(line)
                 except json.JSONDecodeError:
-                    log.warning("commitments: skipping bad jsonl line")
+                    corrupt_line_count += 1
                     continue
                 self._apply_event(records, event)
+        if corrupt_line_count:
+            log.warning(
+                "commitments: skipped %d corrupt jsonl line(s)",
+                corrupt_line_count,
+            )
         # Warn once when the store has grown large enough that per-call
         # full-file replay (O(events) per ``_can_apply`` write) starts
         # to matter. Run ``mimir commitments trim`` to prune terminal
@@ -563,7 +591,15 @@ class CommitmentsStore:
                 event_count,
                 _LARGE_STORE_WARN_THRESHOLD,
             )
-        return records
+        return CommitmentsReplay(
+            records=records,
+            corrupt_line_count=corrupt_line_count,
+        )
+
+    def current_state(self) -> dict[str, CommitmentRecord]:
+        """Read the JSONL, apply all events in order, return
+        ``id → CommitmentRecord``. Missing file → empty dict."""
+        return self.replay().records
 
     @staticmethod
     def _apply_event(
