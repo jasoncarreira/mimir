@@ -2256,7 +2256,7 @@ class WorklinkRunner:
             result = WorklinkRunResult(
                 issue.issue_id,
                 factory_record.attempt,
-                "blocked",
+                status.status,
                 pr_url=status.pr_url,
                 checkout=Path(factory_record.sandbox),
                 branch=factory_record.branch,
@@ -2950,8 +2950,10 @@ def run_worklink(
             exit_status=1,
             autonomous=autonomous,
         )
-    elif result.status in {"completed", "blocked"}:
+    elif result.status == "completed":
         _record_run_success(home, issue_id)
+    # Parked outcomes do not resolve or replace prior failure attention. Leaving
+    # it active keeps the issue backed off without inflating its consecutive count.
     return result
 
 

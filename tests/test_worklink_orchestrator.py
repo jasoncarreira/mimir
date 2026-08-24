@@ -693,6 +693,58 @@ def test_manual_success_clears_autonomous_failure_ledger(
     assert not (tmp_path / "ambient-state").exists()
 
 
+def test_leaf_dispatch_failure_clears_ledger_only_after_success(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import mimir.worklink.orchestrator as orchestrator
+    from mimir.worklink.dispatch_failures import (
+        dispatch_failure_state_dir,
+        load_failure_state,
+        pending_failure_alerts,
+    )
+
+    state_dir = dispatch_failure_state_dir(tmp_path)
+
+    async def failed_leaf(self: WorklinkRunner, issue_id: int, **_: object):
+        return orchestrator.WorklinkRunResult(
+            issue_id, 2, "failed", reason="backend process exited without evidence"
+        )
+
+    monkeypatch.setattr(WorklinkRunner, "run", failed_leaf)
+    result = run_worklink(home=tmp_path, repo=tmp_path, issue_id=701, autonomous=True)
+
+    assert result.status == "failed"
+    backed_off, alerts = pending_failure_alerts(state_dir)
+    assert backed_off == {701}
+    assert [alert["issue_id"] for alert in alerts] == [701]
+    failed_entry = load_failure_state(state_dir)["issues"]["701"]
+
+    async def blocked_leaf(self: WorklinkRunner, issue_id: int, **_: object):
+        return orchestrator.WorklinkRunResult(issue_id, 3, "blocked")
+
+    monkeypatch.setattr(WorklinkRunner, "run", blocked_leaf)
+    run_worklink(home=tmp_path, repo=tmp_path, issue_id=701, autonomous=True)
+    run_worklink(home=tmp_path, repo=tmp_path, issue_id=701, autonomous=True)
+
+    parked_entry = load_failure_state(state_dir)["issues"]["701"]
+    assert parked_entry["active"] is True
+    assert parked_entry["consecutive"] == failed_entry["consecutive"] == 1
+    assert parked_entry["retry_after"] == failed_entry["retry_after"]
+    assert parked_entry["notified_signatures"] == failed_entry["notified_signatures"]
+    assert parked_entry["occurrence_id"] == failed_entry["occurrence_id"]
+    backed_off, alerts = pending_failure_alerts(state_dir)
+    assert backed_off == {701}
+    assert [alert["issue_id"] for alert in alerts] == [701]
+
+    async def completed_leaf(self: WorklinkRunner, issue_id: int, **_: object):
+        return orchestrator.WorklinkRunResult(issue_id, 4, "completed")
+
+    monkeypatch.setattr(WorklinkRunner, "run", completed_leaf)
+    run_worklink(home=tmp_path, repo=tmp_path, issue_id=701, autonomous=False)
+    entry = load_failure_state(state_dir)["issues"]["701"]
+    assert entry["active"] is False
+
+
 def test_epic_dispatch_failure_clears_ledger_only_after_success(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -4071,6 +4123,7 @@ class _FactoryLifecycleClaims:
     [
         ("needs-human", "needs-human", False, None),
         ("blocked", "blocked", False, None),
+        ("partial", "partial", False, None),
         ("completed", "review_ready", True, "https://github.com/owner/repo/pull/42"),
     ],
 )
@@ -4141,6 +4194,67 @@ def test_factory_terminal_outcomes_emit_transition_payload(
             },
         )
     ]
+
+
+def test_factory_partial_survives_leaf_ledger_boundary_without_clearing_attention(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import mimir.worklink.orchestrator as orchestrator
+    from mimir.worklink.dispatch_failures import (
+        dispatch_failure_state_dir,
+        load_failure_state,
+        pending_failure_alerts,
+        record_failure,
+    )
+
+    sandbox = tmp_path / "sandbox"
+    sandbox.mkdir()
+    record = _factory_lifecycle_record(
+        sandbox,
+        LaunchHandle("local_subprocess", "123", 456),
+    ).observed(
+        _factory_lifecycle_status(sandbox, status="partial"),
+        datetime.now(UTC).isoformat(),
+    )
+    factory_result = asyncio.run(
+        WorklinkRunner(home=tmp_path, repo=tmp_path)._finish_factory_070(
+            issue=IssueContext(700, "leaf", "build", set()),
+            claim_record=ClaimRecord(700, 1, "agent", datetime.now(UTC)),
+            claims=_FactoryLifecycleClaims(),
+            backend=object(),
+            compute=object(),
+            factory_record=record,
+            test_cmd="pytest -q",
+            runner=lambda args: cp(args),
+            started_at=datetime.now(UTC),
+        )
+    )
+    assert factory_result.status == "partial"
+
+    state_dir = dispatch_failure_state_dir(tmp_path)
+    failed_entry = record_failure(
+        state_dir,
+        issue_id=700,
+        attempt=1,
+        exit_status=1,
+        error="backend process exited without evidence",
+        log_path=None,
+    )
+
+    async def partial_leaf(self: WorklinkRunner, issue_id: int, **_: object):
+        return factory_result
+
+    monkeypatch.setattr(WorklinkRunner, "run", partial_leaf)
+    result = run_worklink(home=tmp_path, repo=tmp_path, issue_id=700, autonomous=True)
+
+    assert result.status == "partial"
+    entry = load_failure_state(state_dir)["issues"]["700"]
+    assert entry["active"] is True
+    assert entry["consecutive"] == failed_entry["consecutive"] == 1
+    assert entry["occurrence_id"] == failed_entry["occurrence_id"]
+    backed_off, alerts = pending_failure_alerts(state_dir)
+    assert backed_off == {700}
+    assert [alert["issue_id"] for alert in alerts] == [700]
 
 
 @pytest.mark.parametrize("lifecycle", ["running", "needs-human", "blocked", "partial"])
