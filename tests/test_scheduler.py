@@ -2610,6 +2610,38 @@ async def test_commitments_due_check_error_includes_traceback(
     assert "boom from test" in evt["traceback"]
 
 
+@pytest.mark.asyncio
+async def test_part_c_nonempty_failed_sweep_emits_rollup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    import json
+    import mimir.commitments.poller as poller_mod
+    from mimir.commitments.poller import DueCheckResult
+
+    events_path = tmp_path / "events.jsonl"
+    init_logger(events_path, session_id="failed-commitment-sweep")
+
+    async def failed_sweep(*args, **kwargs):
+        return DueCheckResult(scanned=2, failed=2)
+
+    monkeypatch.setattr(poller_mod, "check_due_and_expired", failed_sweep)
+
+    async def noop(_event):
+        return True
+
+    sched = Scheduler(scheduler_yaml=tmp_path / "s.yaml", enqueue=noop)
+    sched.add_commitments_due_check_job(object(), "*/5 * * * *")  # type: ignore[arg-type]
+    job = sched._scheduler.get_job("commitments-due-check")
+    assert job is not None
+    await job.func()
+
+    events = [json.loads(line) for line in events_path.read_text().splitlines()]
+    rollups = [e for e in events if e["type"] == "commitments_due_check_ok"]
+    assert len(rollups) == 1
+    assert rollups[0]["scanned"] == 2
+    assert rollups[0]["failed"] == 2
+
+
 # ─── saga_consolidate_error traceback (PR #345 follow-up) ─────────────
 
 
