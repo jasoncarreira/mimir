@@ -1197,11 +1197,10 @@ class WorklinkRunner:
         else:
             try:
                 transition_issue()
-            except Exception:
+            finally:
                 # The transition event is the observable record of this failure;
-                # do not let the failed mutation suppress its own telemetry.
-                pass
-            log_transition()
+                # emit it without turning a failed mutation into a successful run.
+                log_transition()
         cleanup_error = None
         if publication is None:
             cleanup_error = _cleanup_checkout_after_transition(
