@@ -38,7 +38,7 @@ if TYPE_CHECKING:
     from .commitments.store import CommitmentsStore
 
 import yaml
-from apscheduler.events import EVENT_JOB_MISSED, JobExecutionEvent
+from apscheduler.events import EVENT_JOB_ERROR, EVENT_JOB_MISSED, JobExecutionEvent
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.date import DateTrigger
@@ -55,7 +55,7 @@ from .access_control import (
     parse_declared_shell_commands,
 )
 from .core_blocks import read_text_lossy
-from .event_logger import get_events_path, log_event
+from .event_logger import get_events_path, log_event, log_event_sync
 from ._context import active_pr_checkout_lease_paths, active_turn_snapshots
 from .loop_watchdog import (
     LoopStallWatchdog,
@@ -884,6 +884,9 @@ class Scheduler:
         self._scheduler.add_listener(
             self._on_job_missed, EVENT_JOB_MISSED,
         )
+        self._scheduler.add_listener(
+            self._on_job_error, EVENT_JOB_ERROR,
+        )
 
     def set_arbiter(self, arbiter: Any | None) -> None:
         self._arbiter = arbiter
@@ -920,6 +923,26 @@ class Scheduler:
                 event.scheduled_run_time.isoformat()
                 if event.scheduled_run_time else None
             ),
+        )
+
+    def _on_job_error(self, event: JobExecutionEvent) -> None:
+        """Record every APScheduler job exception without changing its result."""
+        # Import lazily: importing ``mimir.tools`` while this module is still
+        # initializing reaches the tool registry, which imports ``SchedulerJob``.
+        from .tools.budget_gate import _bounded_tool_event_error
+
+        payload = {
+            "job_id": event.job_id,
+            "exception": _bounded_tool_event_error(repr(event.exception)),
+        }
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            log_event_sync("scheduled_job_error", **payload)
+            return
+        self._spawn(
+            log_event("scheduled_job_error", **payload),
+            name="scheduler-log-job-error",
         )
 
     def _spawn(self, coro: Awaitable[Any], *, name: str | None = None) -> asyncio.Task[Any]:
@@ -1284,6 +1307,24 @@ class Scheduler:
         except Exception:  # noqa: BLE001 — already gone / never armed
             pass
 
+    async def _configured_heartbeat_job(self) -> SchedulerJob | None:
+        """Resolve the operator-configured heartbeat, or ``None`` if disabled.
+
+        ``load_jobs`` returns a list today, while the writable-root validation
+        work in PR #1704 changes it to ``(jobs, rejections)``. Accept both
+        shapes so either PR can merge first without breaking quota recovery.
+        """
+        loaded = await asyncio.to_thread(load_jobs, self._yaml_path)
+        jobs = loaded[0] if isinstance(loaded, tuple) else loaded
+        return next((job for job in jobs if job.name == "heartbeat"), None)
+
+    async def _fire_configured_heartbeat(self) -> None:
+        job = await self._configured_heartbeat_job()
+        if job is None:
+            log.info("quota recovery heartbeat skipped: not configured")
+            return
+        await self._fire(job=job)
+
     async def _recheck_quota_pause(self) -> None:
         """Interval-probe body. Three outcomes:
 
@@ -1392,7 +1433,8 @@ class Scheduler:
         if not fresh_below_wall:
             return
 
-        tracker.clear()
+        if not tracker.clear():
+            return
         await log_event(
             "quota_recovered",
             reset_at=status.reset_at.isoformat() if status.reset_at else None,
@@ -1408,11 +1450,7 @@ class Scheduler:
         # Catch-up heartbeat now — through the normal arbiter gate, so
         # a still-degraded environment (e.g. cost-rate TIGHT) can
         # still veto the actual turn.
-        await self._fire(job=SchedulerJob(
-            name="heartbeat",
-            prompt_file="heartbeat.md",
-            authority_profile="heartbeat",
-        ))
+        await self._fire_configured_heartbeat()
 
     async def _fire_quota_recovery(self) -> None:
         """One-shot wake body: re-run the heartbeat through the normal
@@ -1420,15 +1458,7 @@ class Scheduler:
         (emitting ``quota_recovered``) and fires if utilization allows —
         so this both clears the pause and resumes maintenance work."""
         await log_event("quota_recovery_wake_fired")
-        # Synthetic heartbeat job: reuses the heartbeat channel + prompt
-        # (prompt_file falls back to the default heartbeat prompt if the
-        # operator hasn't customized prompts/heartbeat.md).
-        job = SchedulerJob(
-            name="heartbeat",
-            prompt_file="heartbeat.md",
-            authority_profile="heartbeat",
-        )
-        await self._fire(job=job)
+        await self._fire_configured_heartbeat()
 
     def rearm_quota_recovery_on_start(self) -> None:
         """If a pause is recorded on disk, (re)arm the recovery wake.
@@ -2032,17 +2062,18 @@ class Scheduler:
             )
 
 
-    def _poller_budget_exceeded(
+    def _poller_budget_status(
         self, poller: PollerConfig, *, now: datetime | None = None,
-    ) -> dict[str, Any] | None:
-        """Return suppression payload when ``poller`` is over budget.
+    ) -> tuple[dict[str, Any] | None, int | None]:
+        """Return suppression payload and remaining per-fire turn headroom.
 
         Budget checks are fail-open: missing home, missing logs, unknown windows,
         or unavailable cost samples do not suppress. Caps are inclusive: a poller
-        at its configured limit is suppressed before it can exceed it.
+        at its configured limit is suppressed before it can exceed it. Headroom
+        reserves accepted events within this fire before their turn records exist.
         """
         if poller.budget is None or self._home is None:
-            return None
+            return None, None
         try:
             usage = aggregate_poller_turn_usage(
                 self._home / "logs" / "turns.jsonl",
@@ -2052,9 +2083,7 @@ class Scheduler:
             ).get(poller.name)
         except Exception as exc:  # noqa: BLE001 - fail-open on accounting issues
             log.warning("poller budget check failed for %s: %s", poller.name, exc)
-            return None
-        if usage is None:
-            return None
+            return None, None
 
         cap_fields = (
             ("max_agent_turns", "agent_turns"),
@@ -2063,8 +2092,17 @@ class Scheduler:
             ("max_api_bytes", "api_bytes"),
             ("max_external_usd", "estimated_external_cost_usd"),
         )
+        turn_headroom: int | None = None
         for window_label, budget_window in sorted(poller.budget.windows.items()):
-            usage_window = usage.windows.get(window_label)
+            usage_window = usage.windows.get(window_label) if usage is not None else None
+            turn_limit = budget_window.max_agent_turns
+            if turn_limit is not None:
+                turns_used = usage_window.agent_turns if usage_window is not None else 0
+                remaining = max(0, turn_limit - turns_used)
+                turn_headroom = (
+                    remaining if turn_headroom is None
+                    else min(turn_headroom, remaining)
+                )
             if usage_window is None:
                 continue
             for cap_field, usage_field in cap_fields:
@@ -2087,8 +2125,14 @@ class Scheduler:
                         "used": round(float(used), 6),
                         "limit": limit,
                         "reason": reason,
-                    }
-        return None
+                    }, turn_headroom
+        return None, turn_headroom
+
+    def _poller_budget_exceeded(
+        self, poller: PollerConfig, *, now: datetime | None = None,
+    ) -> dict[str, Any] | None:
+        """Return the persisted-usage suppression payload for ``poller``."""
+        return self._poller_budget_status(poller, now=now)[0]
 
     async def _fire_poller(self, *, poller_name: str) -> None:
         """APScheduler-side cron callback. Looks up the live PollerConfig
@@ -2193,16 +2237,39 @@ class Scheduler:
                     ),
                 )
                 return
-            budget_exceeded = await asyncio.to_thread(
-                self._poller_budget_exceeded, poller,
+            budget_exceeded, turn_headroom = await asyncio.to_thread(
+                self._poller_budget_status, poller,
             )
             if budget_exceeded is not None:
                 budget_exceeded["stage"] = "post_acquire"
                 await log_event("poller_budget_suppressed", **budget_exceeded)
                 return
+            accepted_this_fire = 0
+            headroom_logged = False
+
+            async def enqueue_with_turn_budget(event: AgentEvent) -> bool:
+                nonlocal accepted_this_fire, headroom_logged
+                if turn_headroom is not None and accepted_this_fire >= turn_headroom:
+                    if not headroom_logged:
+                        headroom_logged = True
+                        await log_event(
+                            "poller_budget_suppressed",
+                            poller=poller.name,
+                            metric="agent_turns",
+                            used_in_fire=accepted_this_fire,
+                            remaining_at_fire=turn_headroom,
+                            stage="event_enqueue",
+                            reason="poller_budget_exceeded:agent_turns:per_fire_headroom",
+                        )
+                    return False
+                accepted = await self._enqueue(event)
+                if accepted:
+                    accepted_this_fire += 1
+                return accepted
+
             await run_poller(
                 poller,
-                enqueue=self._enqueue,
+                enqueue=enqueue_with_turn_budget,
                 home=self._home,
                 timeout=await self._effective_poller_timeout(poller),
             )
@@ -2907,17 +2974,17 @@ class Scheduler:
                     snooze_pileup_threshold=snooze_pileup_threshold,
                 )
                 # Rollup event — single line per sweep, not per record.
-                # Only emit when SOMETHING happened (due / expired /
-                # pileup) to keep events.jsonl from accruing one no-op
-                # record per poll tick.
-                if (result.due_emitted or result.expired_emitted
-                        or result.snooze_pileup_emitted):
+                # A non-empty sweep is observable even when every attempted
+                # lifecycle transition failed. Empty-store ticks stay silent.
+                if result.scanned > 0 or result.corrupt_lines > 0:
                     await log_event(
                         "commitments_due_check_ok",
                         due_emitted=result.due_emitted,
                         expired_emitted=result.expired_emitted,
                         snooze_pileup_emitted=result.snooze_pileup_emitted,
                         scanned=result.scanned,
+                        failed=result.failed,
+                        corrupt_lines=result.corrupt_lines,
                     )
             except Exception as exc:  # noqa: BLE001
                 await log_event(

@@ -1813,7 +1813,16 @@ async def run_poller(
                 service_authority=authority,
                 recover_failed_turns=poller.recover_failed_turns,
             )
-            if _rec["reenqueued"] or _rec["gave_up"]:
+            if _rec["state_unreadable"]:
+                await log_event(
+                    "poller_recovery_state_unreadable",
+                    poller=poller.name,
+                    path=_rec["state_unreadable"],
+                )
+            if any(
+                _rec[key]
+                for key in ("reenqueued", "gave_up", "expired", "dropped")
+            ):
                 await log_event(
                     "poller_recovery",
                     poller=poller.name,
@@ -1821,6 +1830,8 @@ async def run_poller(
                     completed=_rec["completed"],
                     gave_up=_rec["gave_up"],
                     unclean_reenqueued=_rec["unclean_reenqueued"],
+                    expired=_rec["expired"],
+                    dropped=_rec["dropped"],
                 )
         except Exception as exc:  # noqa: BLE001 — recovery must not break polling
             log.warning(

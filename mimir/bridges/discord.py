@@ -421,6 +421,10 @@ class DiscordBridge(Bridge):
                 log.info(
                     "DiscordBridge supervisor: client.start() returned cleanly; exiting"
                 )
+                await _safe_log_event(
+                    "discord_bridge_exited",
+                    reason="client.start() returned cleanly",
+                )
                 return
             except asyncio.CancelledError:
                 raise

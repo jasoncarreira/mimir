@@ -51,6 +51,7 @@ from mimir.worklink.orchestrator import (
     render_work_item,
     render_work_order,
     run_worklink,
+    run_worklink_epic,
     validate_leaf,
 )
 
@@ -75,6 +76,35 @@ def test_factory_stale_diagnostic_defaults_and_falls_back_to_fifteen_minutes(
     else:
         monkeypatch.setenv("MIMIR_FACTORY_STALE_HEARTBEAT_S", value)
     assert _epic_stale_heartbeat_s() == 900.0
+
+
+def test_run_worklink_epic_records_unhandled_failure_at_sync_boundary(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import mimir.worklink.orchestrator as orchestrator
+
+    recorded: list[dict[str, object]] = []
+
+    async def fail(self: WorklinkRunner, issue_id: int, *, autonomous: bool = False):
+        raise RuntimeError("factory crashed")
+
+    monkeypatch.setattr(WorklinkRunner, "run_epic", fail)
+    monkeypatch.setattr(
+        orchestrator,
+        "_record_run_failure",
+        lambda **fields: recorded.append(fields),
+    )
+
+    with pytest.raises(RuntimeError, match="factory crashed"):
+        run_worklink_epic(home=tmp_path, repo=tmp_path, issue_id=1395, autonomous=True)
+
+    assert len(recorded) == 1
+    assert recorded[0]["home"] == tmp_path
+    assert recorded[0]["issue_id"] == 1395
+    assert recorded[0]["attempt"] is None
+    assert recorded[0]["exit_status"] == 1
+    assert recorded[0]["autonomous"] is True
+    assert isinstance(recorded[0]["error"], RuntimeError)
 
 
 class FakeCompute:
@@ -572,6 +602,46 @@ def test_manual_success_clears_autonomous_failure_ledger(
     assert result.status == "completed"
     assert load_failure_state(state_dir)["issues"]["441"]["active"] is False
     assert not (tmp_path / "ambient-state").exists()
+
+
+def test_epic_dispatch_failure_clears_ledger_only_after_success(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import mimir.worklink.orchestrator as orchestrator
+    from mimir.worklink.dispatch_failures import (
+        dispatch_failure_state_dir,
+        load_failure_state,
+        pending_failure_alerts,
+    )
+
+    async def failed_epic(self: WorklinkRunner, issue_id: int, **_: object):
+        return orchestrator.WorklinkRunResult(
+            issue_id, 2, "failed", reason="retained factory record cannot be bound"
+        )
+
+    monkeypatch.setattr(WorklinkRunner, "run_epic", failed_epic)
+    result = run_worklink_epic(home=tmp_path, repo=tmp_path, issue_id=700, autonomous=True)
+
+    assert result.status == "failed"
+    backed_off, alerts = pending_failure_alerts(dispatch_failure_state_dir(tmp_path))
+    assert backed_off == {700}
+    assert [alert["issue_id"] for alert in alerts] == [700]
+
+    async def parked_epic(self: WorklinkRunner, issue_id: int, **_: object):
+        return orchestrator.WorklinkRunResult(issue_id, 3, "needs-human")
+
+    monkeypatch.setattr(WorklinkRunner, "run_epic", parked_epic)
+    run_worklink_epic(home=tmp_path, repo=tmp_path, issue_id=700, autonomous=False)
+    entry = load_failure_state(dispatch_failure_state_dir(tmp_path))["issues"]["700"]
+    assert entry["active"] is True
+
+    async def completed_epic(self: WorklinkRunner, issue_id: int, **_: object):
+        return orchestrator.WorklinkRunResult(issue_id, 4, "review_ready")
+
+    monkeypatch.setattr(WorklinkRunner, "run_epic", completed_epic)
+    run_worklink_epic(home=tmp_path, repo=tmp_path, issue_id=700, autonomous=False)
+    entry = load_failure_state(dispatch_failure_state_dir(tmp_path))["issues"]["700"]
+    assert entry["active"] is False
 
 
 def test_validate_leaf_refuses_missing_planner_template() -> None:
@@ -1667,6 +1737,160 @@ def test_worklink_runner_backend_nonzero_transitions_failed_without_pr(tmp_path:
     assert ["chainlink", "locks", "release", "441"] in calls
 
 
+def test_part_a_backend_exception_failed_transition_reports_not_applied(tmp_path: Path) -> None:
+    _reset_logger_for_tests()
+    events_path = tmp_path / "logs" / "events.jsonl"
+    init_logger(events_path, session_id="test-worklink")
+    repo = tmp_path / "repo"
+    worktree = repo.parent / ".worklink" / repo.name / "441-1"
+    calls, base_runner = _orchestrator_runner(repo, worktree)
+
+    def runner(
+        args: Sequence[str] | str,
+        *,
+        cwd: Path | None = None,
+        text: bool = True,
+    ) -> subprocess.CompletedProcess:
+        if isinstance(args, list) and args == [
+            "chainlink", "issue", "label", "441", "worklink:ready"
+        ]:
+            calls.append(args)
+            return cp(args, returncode=1, stderr="label add failed")
+        return base_runner(args, cwd=cwd, text=text)
+
+    class ExplodingBackend(FakeBackend):
+        async def interpret(self, order: WorkOrder, result: object) -> RawResult:
+            raise RuntimeError("interpret exploded")
+
+    registry = BackendRegistry(WorklinkConfig())
+    registry.register(ExplodingBackend())
+
+    result = asyncio.run(
+        WorklinkRunner(home=tmp_path, repo=repo, runner=runner, registry=registry).run(
+            441, backend_name="fake", test_command="echo ok"
+        )
+    )
+
+    assert result.status == "failed"
+    records = [json.loads(line) for line in events_path.read_text(encoding="utf-8").splitlines()]
+    transition = [record for record in records if record["type"] == "worklink_transition"][-1]
+    assert transition["status"] == "failed"
+    assert transition["review_ready"] is False
+    assert transition["pr_url"] is None
+    assert transition["reason"] == "interpret exploded"
+    assert transition["transition_applied"] is False
+    assert transition["error"] == "label add failed"
+    _reset_logger_for_tests()
+
+
+def test_no_pr_blocked_failed_transition_still_emits_and_propagates(tmp_path: Path) -> None:
+    _reset_logger_for_tests()
+    events_path = tmp_path / "logs" / "events.jsonl"
+    init_logger(events_path, session_id="test-worklink")
+    repo = tmp_path / "repo"
+    worktree = repo.parent / ".worklink" / repo.name / "441-1"
+    calls, base_runner = _orchestrator_runner(repo, worktree)
+
+    def runner(
+        args: Sequence[str] | str,
+        *,
+        cwd: Path | None = None,
+        text: bool = True,
+    ) -> subprocess.CompletedProcess:
+        if isinstance(args, list) and args == [
+            "chainlink", "issue", "label", "441", "worklink:blocked"
+        ]:
+            calls.append(args)
+            return cp(args, returncode=1, stderr="label add failed")
+        return base_runner(args, cwd=cwd, text=text)
+
+    class BlockingBackend(FakeBackend):
+        async def interpret(self, order: WorkOrder, result: object) -> RawResult:
+            self.orders.append(order)
+            return RawResult(
+                1,
+                order.transcript_root / "fake.json",
+                "blocked",
+                "planner gave contradictory acceptance criteria",
+                "planner gave contradictory acceptance criteria",
+            )
+
+    registry = BackendRegistry(WorklinkConfig())
+    registry.register(BlockingBackend(write_change=False))
+
+    result = asyncio.run(
+        WorklinkRunner(home=tmp_path, repo=repo, runner=runner, registry=registry).run(
+            441, backend_name="fake", test_command="echo ok"
+        )
+    )
+
+    # The completion-path exception reaches the runner's failure handler instead
+    # of returning ``blocked``, so run_worklink records a failure rather than
+    # clearing the failure ledger through _record_run_success.
+    assert result.status == "failed"
+    assert result.reason == "label add failed"
+    assert not any(
+        isinstance(call, list) and call[:3] == ["gh", "pr", "create"] for call in calls
+    )
+    records = [json.loads(line) for line in events_path.read_text(encoding="utf-8").splitlines()]
+    transitions = [record for record in records if record["type"] == "worklink_transition"]
+    assert len(transitions) == 2
+    blocked_transition, failure_transition = transitions
+    assert blocked_transition["status"] == "blocked"
+    assert blocked_transition["review_ready"] is False
+    assert blocked_transition["pr_url"] is None
+    assert blocked_transition["transition_applied"] is False
+    assert blocked_transition["error"] == "label add failed"
+    assert failure_transition["status"] == "failed"
+    assert failure_transition["reason"] == "label add failed"
+    assert failure_transition["transition_applied"] is True
+    _reset_logger_for_tests()
+
+
+def test_published_completion_failed_transition_still_emits_not_applied(tmp_path: Path) -> None:
+    _reset_logger_for_tests()
+    events_path = tmp_path / "logs" / "events.jsonl"
+    init_logger(events_path, session_id="test-worklink")
+    repo = tmp_path / "repo"
+    worktree = repo.parent / ".worklink" / repo.name / "441-1"
+    calls, base_runner = _orchestrator_runner(repo, worktree)
+
+    def runner(
+        args: Sequence[str] | str,
+        *,
+        cwd: Path | None = None,
+        text: bool = True,
+    ) -> subprocess.CompletedProcess:
+        if isinstance(args, list) and args == [
+            "chainlink", "issue", "label", "441", "worklink:review"
+        ]:
+            calls.append(args)
+            return cp(args, returncode=1, stderr="label add failed")
+        return base_runner(args, cwd=cwd, text=text)
+
+    registry = BackendRegistry(WorklinkConfig())
+    registry.register(FakeBackend())
+
+    result = asyncio.run(
+        WorklinkRunner(home=tmp_path, repo=repo, runner=runner, registry=registry).run(
+            441, backend_name="fake", test_command="echo ok"
+        )
+    )
+
+    assert result.status == "completed"
+    assert result.pr_url == "https://github.com/jasoncarreira/mimir/pull/999"
+    records = [json.loads(line) for line in events_path.read_text(encoding="utf-8").splitlines()]
+    transitions = [record for record in records if record["type"] == "worklink_transition"]
+    assert len(transitions) == 1
+    transition = transitions[0]
+    assert transition["status"] == "completed"
+    assert transition["review_ready"] is True
+    assert transition["pr_url"] == result.pr_url
+    assert transition["transition_applied"] is False
+    assert transition["error"] == "label add failed"
+    _reset_logger_for_tests()
+
+
 def test_worklink_runner_timeout_transitions_failed_without_pr(tmp_path: Path) -> None:
     repo = tmp_path / "repo"
     worktree = repo.parent / ".worklink" / repo.name / "441-1"
@@ -1906,10 +2130,33 @@ def test_chainlink_orchestrator_passes_controller_environment_overrides() -> Non
     # opencode build with EACCES because a 0700 attempt directory cannot be
     # traversed by a backend that re-resolves its project root by pathname.
     #
-    # Re-add the key in the SAME change that lands per-run worker UIDs. Until the
-    # worker identity is unique per run, no directory-mode arrangement isolates
-    # concurrent runs: ptrace_scope is 0, so a sibling worker sharing the uid can
-    # take another's checkout FD outright. Re-adding it alone reopens the outage.
+    # The containment this would activate was EVALUATED AND DECLINED (#1434
+    # closed won't-fix, 2026-08-23), so this is the permanent posture rather than
+    # a temporary hold. Be exact about what that costs, because an earlier draft of
+    # this comment claimed the opposite. With the key absent, coding_enabled() is
+    # false, so worker_required is false (orchestrator.py:543-547), the authorized-
+    # checkout / WorkerClient path at :695-701 is skipped, and compute.py:404 falls
+    # through to the ordinary create_subprocess_exec branch. That branch performs NO
+    # uid switch: the child inherits the controller uid (`mimir`), so
+    # model-generated code runs with the agent's privileges over /workspace/mimir
+    # and over other builds' trees. There is no filesystem/uid boundary on this
+    # path, and asserting one here would be wrong.
+    #
+    # What actually limits exposure is narrower. The env is allowlisted
+    # (compute.py:406+): infra vars and provider credential families are passed,
+    # bridge/operator secrets (DISCORD_/SLACK_/MIMIR_API_KEY, ...) never are. The
+    # build also works in a per-run lease checkout rather than the source tree.
+    # That is the accepted tradeoff -- a limited blast radius, not containment.
+    #
+    # The uid drop is tracked separately as #1436, which decouples it from the
+    # contained-checkout path this key activates. Note even #1436 would not isolate
+    # secrets: <home> is a virtiofs bind mount that ignores guest ownership, so
+    # .env stays readable to the worker uid regardless (#1435).
+    #
+    # Re-adding this key requires per-run worker identity first. While the worker
+    # uid is shared no directory-mode arrangement isolates concurrent runs:
+    # ptrace_scope is 0, so a sibling worker sharing the uid can take another's
+    # checkout FD outright. Re-adding it alone reopens the outage.
     assert "MIMIR_CODING_ENABLED" not in pass_env
 
 
@@ -2294,6 +2541,7 @@ def test_run_epic_refuses_nonexistent_target_branch_before_claim_or_checkout(
         }
     )
     calls: list[list[str]] = []
+    events: list[tuple[str, dict[str, object]]] = []
 
     def runner(args: Sequence[str] | str, **_: object) -> subprocess.CompletedProcess[str]:
         assert isinstance(args, list)
@@ -2311,12 +2559,157 @@ def test_run_epic_refuses_nonexistent_target_branch_before_claim_or_checkout(
 
     monkeypatch.setattr(FeatureFactoryBackend, "admit", lambda self: Path(self.entrypoint))
     monkeypatch.setattr(orchestrator, "_create_backend_checkout", unexpected_checkout)
+    monkeypatch.setattr(
+        orchestrator,
+        "_log_event",
+        lambda name, **fields: events.append((name, fields)),
+    )
 
     result = asyncio.run(WorklinkRunner(home=tmp_path, repo=repo, runner=runner).run_epic(701))
 
     assert result.status == "refused"
     assert result.reason == "base branch does not exist in origin: feature/does-not-exist"
+    assert events == [
+        (
+            "worklink_epic_refused",
+            {
+                "issue_id": 701,
+                "reason": "base branch does not exist in origin: feature/does-not-exist",
+            },
+        )
+    ]
     assert not any(call[1:3] == ["locks", "claim"] for call in calls)
+
+
+def test_run_epic_non_epic_issue_emits_refusal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import mimir.worklink.orchestrator as orchestrator
+
+    issue_json = json.dumps(
+        {
+            "id": 701,
+            "title": "leaf",
+            "description": "build",
+            "labels": ["worklink", "worklink:ready"],
+            "comments": [],
+        }
+    )
+    events: list[tuple[str, dict[str, object]]] = []
+
+    def runner(args: Sequence[str] | str, **_: object) -> subprocess.CompletedProcess[str]:
+        return cp(args, stdout=issue_json)
+
+    monkeypatch.setattr(
+        orchestrator,
+        "_log_event",
+        lambda name, **fields: events.append((name, fields)),
+    )
+
+    result = asyncio.run(WorklinkRunner(home=tmp_path, repo=tmp_path, runner=runner).run_epic(701))
+
+    assert result.reason == "not an epic issue"
+    assert events == [
+        ("worklink_epic_refused", {"issue_id": 701, "reason": "not an epic issue"})
+    ]
+
+
+def test_run_epic_autonomy_refusal_emits_leaf_event_name(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import mimir.worklink.orchestrator as orchestrator
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    epic_json = json.dumps(
+        {
+            "id": 701,
+            "title": "epic",
+            "description": "build",
+            "labels": ["worklink", "worklink:epic", "worklink:ready"],
+            "comments": [],
+        }
+    )
+    events: list[tuple[str, dict[str, object]]] = []
+
+    def runner(args: Sequence[str] | str, **_: object) -> subprocess.CompletedProcess[str]:
+        if isinstance(args, list) and args[:4] == ["chainlink", "issue", "show", "701"]:
+            return cp(args, stdout=epic_json)
+        if isinstance(args, list) and args[:4] == ["git", "-C", str(repo), "config"]:
+            return cp(args, stdout="git@github.com:owner/repo.git\n")
+        return cp(args)
+
+    monkeypatch.setattr(
+        orchestrator,
+        "_log_event",
+        lambda name, **fields: events.append((name, fields)),
+    )
+
+    result = asyncio.run(
+        WorklinkRunner(home=tmp_path, repo=repo, runner=runner).run_epic(701, autonomous=True)
+    )
+
+    assert result.status == "refused"
+    assert events == [
+        (
+            "worklink_autonomous_refused",
+            {
+                "issue_id": 701,
+                "compute_backend": "local_subprocess",
+                "reason": result.reason,
+            },
+        )
+    ]
+
+
+@pytest.mark.parametrize(
+    ("claim", "event_name", "reason"),
+    [
+        (ClaimResult(False, attempts_exhausted=True), "worklink_attempts_exhausted", "attempts_exhausted"),
+        (ClaimResult(False, reason="lock held"), "worklink_claim_failed", "lock held"),
+    ],
+)
+def test_run_epic_claim_refusals_emit_leaf_event_names(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    claim: ClaimResult,
+    event_name: str,
+    reason: str,
+) -> None:
+    import mimir.worklink.orchestrator as orchestrator
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    epic_json = json.dumps(
+        {
+            "id": 701,
+            "title": "epic",
+            "description": "build",
+            "labels": ["worklink", "worklink:epic", "worklink:ready"],
+            "comments": [],
+        }
+    )
+    events: list[tuple[str, dict[str, object]]] = []
+
+    def runner(args: Sequence[str] | str, **_: object) -> subprocess.CompletedProcess[str]:
+        if isinstance(args, list) and args[:4] == ["chainlink", "issue", "show", "701"]:
+            return cp(args, stdout=epic_json)
+        if isinstance(args, list) and args[:4] == ["git", "-C", str(repo), "config"]:
+            return cp(args, stdout="git@github.com:owner/repo.git\n")
+        return cp(args)
+
+    monkeypatch.setattr(FeatureFactoryBackend, "admit", lambda self: Path(self.entrypoint))
+    monkeypatch.setattr(orchestrator.ChainlinkClaims, "claim_issue", lambda *args, **kwargs: claim)
+    monkeypatch.setattr(
+        orchestrator,
+        "_log_event",
+        lambda name, **fields: events.append((name, fields)),
+    )
+
+    result = asyncio.run(WorklinkRunner(home=tmp_path, repo=repo, runner=runner).run_epic(701))
+
+    assert result.reason == reason
+    assert events == [(event_name, {"issue_id": 701, "reason": reason})]
 
 
 def test_run_epic_reports_target_branch_lookup_failure_without_stderr(
@@ -3008,6 +3401,7 @@ def test_factory_new_run_uses_resolved_base_for_single_checkout_placement(
     )
     placement_calls: list[tuple[Path, dict[str, object]]] = []
     preflight_events: list[str] = []
+    worklink_events: list[tuple[str, dict[str, object]]] = []
     claim = ClaimRecord(700, 1, "agent", datetime.now(UTC))
     lease = CheckoutLease(
         issue_id=700,
@@ -3115,6 +3509,11 @@ def test_factory_new_run_uses_resolved_base_for_single_checkout_placement(
     monkeypatch.setattr(
         orchestrator.LocalSubprocessComputeBackend, "launch", stop_after_placement
     )
+    monkeypatch.setattr(
+        orchestrator,
+        "_log_event",
+        lambda name, **fields: worklink_events.append((name, fields)),
+    )
 
     result = asyncio.run(
         WorklinkRunner(home=tmp_path, repo=repo, runner=runner, agent_id="agent").run_epic(700)
@@ -3137,6 +3536,17 @@ def test_factory_new_run_uses_resolved_base_for_single_checkout_placement(
         "verify",
         "launch",
     ]
+    assert worklink_events[-1] == (
+        "worklink_transition",
+        {
+            "issue_id": 700,
+            "attempt": 1,
+            "status": "failed",
+            "review_ready": False,
+            "pr_url": None,
+            "reason": "stop after placement",
+        },
+    )
     assert declaration.read_bytes() == declaration_before
     assert sandbox_declaration.read_bytes() == sandbox_declaration_before
 
@@ -3562,6 +3972,88 @@ def _factory_lifecycle_record(sandbox: Path, handle: LaunchHandle) -> FactoryRun
     )
 
 
+class _FactoryLifecycleClaims:
+    def transition_issue(self, *args: object, **kwargs: object) -> None:
+        return None
+
+
+@pytest.mark.parametrize(
+    ("factory_status", "expected_status", "review_ready", "pr_url"),
+    [
+        ("needs-human", "needs-human", False, None),
+        ("blocked", "blocked", False, None),
+        ("completed", "review_ready", True, "https://github.com/owner/repo/pull/42"),
+    ],
+)
+def test_factory_terminal_outcomes_emit_transition_payload(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    factory_status: str,
+    expected_status: str,
+    review_ready: bool,
+    pr_url: str | None,
+) -> None:
+    import mimir.worklink.orchestrator as orchestrator
+
+    sandbox = tmp_path / "sandbox"
+    sandbox.mkdir()
+    record = _factory_lifecycle_record(
+        sandbox,
+        LaunchHandle("local_subprocess", "123", 456),
+    ).observed(
+        _factory_lifecycle_status(sandbox, status=factory_status),
+        datetime.now(UTC).isoformat(),
+    )
+    events: list[tuple[str, dict[str, object]]] = []
+
+    class Claims:
+        def transition_issue(self, *args: object, **kwargs: object) -> None:
+            return None
+
+    async def verify(**kwargs: object) -> tuple[Path, str]:
+        return tmp_path / "evidence.json", "https://github.com/owner/repo/pull/42"
+
+    monkeypatch.setattr(orchestrator, "_verify_factory_completion", verify)
+    monkeypatch.setattr(
+        orchestrator,
+        "_log_event",
+        lambda name, **fields: events.append((name, fields)),
+    )
+
+    result = asyncio.run(
+        WorklinkRunner(home=tmp_path, repo=tmp_path)._finish_factory_070(
+            issue=IssueContext(700, "epic", "build", {"worklink:epic"}),
+            claim_record=ClaimRecord(700, 1, "agent", datetime.now(UTC)),
+            claims=Claims(),
+            backend=object(),
+            compute=object(),
+            factory_record=record,
+            test_cmd="pytest -q",
+            runner=lambda args: cp(args),
+            started_at=datetime.now(UTC),
+        )
+    )
+
+    assert result.status == expected_status
+    assert events == [
+        (
+            "worklink_transition",
+            {
+                "issue_id": 700,
+                "attempt": 1,
+                "status": expected_status,
+                "review_ready": review_ready,
+                "pr_url": pr_url,
+                **(
+                    {"reason": result.reason}
+                    if result.reason is not None
+                    else {}
+                ),
+            },
+        )
+    ]
+
+
 @pytest.mark.parametrize("lifecycle", ["running", "needs-human", "blocked", "partial"])
 def test_factory_status_binding_allows_null_base_before_completion(
     tmp_path: Path,
@@ -3696,7 +4188,7 @@ def test_factory_supervision_drains_exact_handle_while_status_is_polled(
         WorklinkRunner(home=tmp_path, repo=tmp_path)._supervise_factory_070(
             issue=IssueContext(700, "epic", "build", {"worklink:epic"}),
             claim_record=ClaimRecord(700, 1, "agent", datetime.now(UTC)),
-            claims=object(),
+            claims=_FactoryLifecycleClaims(),
             backend=Backend(),
             compute=Compute(),
             factory_record=_factory_lifecycle_record(sandbox, handle),
@@ -3755,7 +4247,7 @@ def test_factory_supervision_waits_for_manifest_then_proceeds(tmp_path: Path) ->
         WorklinkRunner(home=tmp_path, repo=tmp_path)._supervise_factory_070(
             issue=IssueContext(700, "epic", "build", {"worklink:epic"}),
             claim_record=ClaimRecord(700, 1, "agent", datetime.now(UTC)),
-            claims=object(),
+            claims=_FactoryLifecycleClaims(),
             backend=Backend(),
             compute=Compute(),
             factory_record=_factory_lifecycle_record(sandbox, handle),
@@ -4411,6 +4903,50 @@ def test_factory_completion_failure_never_transitions_to_review(
     assert transitions == []
 
 
+def test_factory_needs_human_transitions_epic_to_parked_tracker_state(
+    tmp_path: Path,
+) -> None:
+    sandbox = tmp_path / "sandbox"
+    sandbox.mkdir()
+    transitions: list[tuple[int, dict[str, object]]] = []
+
+    class Claims:
+        def transition_issue(self, issue_id: int, **kwargs: object) -> None:
+            transitions.append((issue_id, kwargs))
+
+    record = _factory_lifecycle_record(sandbox, LaunchHandle("local_subprocess", "123", 456))
+    record = record.observed(
+        _factory_lifecycle_status(sandbox, status="needs-human"),
+        datetime.now(UTC).isoformat(),
+    )
+    result = asyncio.run(
+        WorklinkRunner(home=tmp_path, repo=tmp_path)._finish_factory_070(
+            issue=IssueContext(700, "epic", "build", {"worklink:epic"}),
+            claim_record=ClaimRecord(700, 1, "agent", datetime.now(UTC), budget_attempt=1),
+            claims=Claims(),
+            backend=object(),
+            compute=object(),
+            factory_record=record,
+            test_cmd="pytest -q",
+            runner=lambda args: cp(args),
+            started_at=datetime.now(UTC),
+        )
+    )
+
+    assert result.status == "needs-human"
+    assert transitions == [
+        (
+            700,
+            {
+                "status": "blocked",
+                "review_ready": False,
+                "attempt": 1,
+                "reason": "factory run is parked",
+            },
+        )
+    ]
+
+
 @pytest.mark.parametrize(
     ("lock", "dead_lock", "action"),
     [("absent", False, "claim"), ("stale", True, "steal"), ("fresh", False, None)],
@@ -4548,6 +5084,9 @@ def test_factory_recovery_uses_run_id_first_lock_resume_and_authoritative_status
 
         def _lock_still_held_by(self, record: ClaimRecord) -> bool:
             return record is claim
+
+        def transition_issue(self, *args: object, **kwargs: object) -> None:
+            return None
 
     compute = Compute()
     result = asyncio.run(

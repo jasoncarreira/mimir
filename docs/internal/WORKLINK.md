@@ -223,7 +223,25 @@ calling `steal`; it must not trust `steal` to reject live claims.
 
 ### State machine
 
-Labels on the leaf issue (chainlink `status` stays open/closed):
+The ready-queue poller treats the Worklink label vocabulary as follows. Removing
+`worklink:ready` is the common way to park either a leaf or an epic; no other
+label admits dispatch.
+
+| Label | Leaf dispatch | Factory-epic dispatch |
+|---|---|---|
+| `worklink:ready` | Required | Required, together with `worklink:epic` |
+| `worklink:epic` | Excludes the issue and children whose parent carries it | Required to select the `run-epic` path |
+| `worklink:in-progress` | Not consulted directly; the active claim lock excludes redispatch and consumes a leaf slot | Not consulted directly; the active claim lock excludes redispatch and consumes a factory slot |
+| `worklink:review` | Not consulted; normal transitions remove `worklink:ready`, so review work is parked | Not consulted; normal transitions remove `worklink:ready`, so review work is parked |
+| `worklink:blocked` | Always excludes dispatch, even if stale `worklink:ready` remains | Always excludes dispatch, even if stale `worklink:ready` and `worklink:epic` remain |
+
+Dependency actionability remains a separate, additional requirement from
+`chainlink issue ready`. Attempt-budget exhaustion is enforced authoritatively
+by the executor after its race-safe claim checks. That first refusal adds
+`worklink:blocked`; the poller then excludes the issue, so exhaustion is
+reported once rather than launching another refusal every poll cycle.
+
+Labels on the issue (chainlink `status` stays open/closed):
 
 ```
 needs-decomposition ──planner──▶ worklink:ready
@@ -612,10 +630,19 @@ content verbatim into acceptance criteria.
   default `normal`, configurable — so worker launches shed under TIGHT
   with everything else. Operator-invoked `mimir worklink run` always
   proceeds.
-- **Events.** `worklink_claimed`, `worklink_evidence`,
-  `worklink_transition`, `worklink_attempts_exhausted` land in
-  events.jsonl with feedback rules (attempts-exhausted negative), so
-  the agent sees its delegated work's health in the algedonic block.
+- **Events.** Leaf and epic runs share `worklink_autonomous_refused`,
+  `worklink_attempts_exhausted`, `worklink_claim_failed`, `worklink_claimed`,
+  `worklink_transition`, and `worklink_run_failed`. Epic-only admission failures
+  (a non-epic issue or an unavailable base branch) use
+  `worklink_epic_refused`. Leaf runs additionally emit `worklink_evidence` after
+  their controller evidence pass; epic runs deliberately do not duplicate that
+  event because feature-factory owns its staged evidence lifecycle and the epic
+  controller emits the terminal transition after completion verification. All
+  transition events carry `status`, `review_ready`, and `pr_url`. These events
+  land in events.jsonl with feedback rules (attempts-exhausted negative), so the
+  agent sees its delegated work's health in the algedonic block. Existing event
+  consumers match event names and read only their required fields; the optional
+  `reason` added to epic refusal and transition records is additive.
 - **Tool-pin inventory (external-toolchain drift).** `worklink.yaml`
   may carry deployment-specific `tool_pins:`, but the source-controlled
   seed inventory lives in `mimir.worklink.tool_pins.DEFAULT_TOOL_PINS`.

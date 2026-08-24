@@ -526,7 +526,8 @@ async def create_agent_runtime(
     identity_retry_lock = asyncio.Lock()
 
     async def run_turn_with_identity_preflight(event: Any) -> Any:
-        nonlocal next_identity_retry_at
+        nonlocal degradation_recorded, degradation_alert_scheduled
+        nonlocal transient_failures, next_identity_retry_at
         if (
             getattr(config, "coding_enabled", False)
             and github_identity_recovery_pending()
@@ -543,9 +544,13 @@ async def create_agent_runtime(
                     if recovered:
                         from .event_logger import log_event
 
+                        recovery_attempts = transient_failures
+                        degradation_recorded = False
+                        degradation_alert_scheduled = False
+                        transient_failures = 0
                         await log_event(
                             "github_identity_recovered",
-                            attempts=transient_failures,
+                            attempts=recovery_attempts,
                         )
         return await agent.run_turn(event)
 

@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import replace
+from datetime import datetime, timedelta, timezone
 import json
 import os
 import shutil
@@ -2049,6 +2050,17 @@ print(json.dumps({
 # ─── poller_recovery framework wiring (chainlink #314) ────────────────
 
 
+def _make_recovery_event(source_id: str) -> AgentEvent:
+    return AgentEvent(
+        trigger="poller",
+        channel_id="poller:x",
+        content="recover me",
+        source="poller",
+        source_id=source_id,
+        extra={"poller_name": "x", "items": []},
+    )
+
+
 def test_discover_pollers_reads_recover_failed_turns_flag(tmp_path: Path):
     skills = tmp_path / "skills"
     _write_pollers_json(skills / "skill", [
@@ -2161,8 +2173,147 @@ async def test_run_poller_reconciles_failed_turn_before_next_poll(
     recovery_events = [
         e for e in _read_events(home) if e["type"] == "poller_recovery"
     ]
+    assert len(recovery_events) == 1
     assert recovery_events[-1]["poller"] == "x"
     assert recovery_events[-1]["reenqueued"] == 1
+    assert recovery_events[-1]["expired"] == 0
+    assert recovery_events[-1]["dropped"] == 0
+
+
+@pytest.mark.asyncio
+async def test_run_poller_recovery_expiration_logs_loss(
+    tmp_path: Path, home: Path,
+) -> None:
+    skill_dir = tmp_path / "skill"
+    persist_dir = tmp_path / "persist" / "x"
+    _install_script(skill_dir, "poller.py", "pass\n")
+    cfg = PollerConfig(
+        name="x", command=f"{sys.executable} poller.py",
+        cron="* * * * *", env={}, skill_dir=skill_dir,
+        persist_dir=persist_dir,
+    )
+    await poller_recovery.stash_enqueued_event(
+        persist_dir, _make_recovery_event("poller:x:expired"),
+    )
+    state = poller_recovery._load_state(persist_dir)
+    state["inflight"]["poller:x:expired"]["stashed_at"] = (
+        datetime.now(tz=timezone.utc) - timedelta(hours=72)
+    ).isoformat()
+    poller_recovery._save_state(persist_dir, state)
+
+    await run_poller(cfg, enqueue=_CapturingEnqueue())
+
+    recovery_events = [
+        event for event in _read_events(home)
+        if event["type"] == "poller_recovery"
+    ]
+    assert len(recovery_events) == 1
+    assert recovery_events[0]["expired"] == 1
+    assert recovery_events[0]["dropped"] == 0
+
+
+@pytest.mark.asyncio
+async def test_run_poller_recovery_schema_drop_logs_loss(
+    tmp_path: Path, home: Path,
+) -> None:
+    skill_dir = tmp_path / "skill"
+    persist_dir = tmp_path / "persist" / "x"
+    _install_script(skill_dir, "poller.py", "pass\n")
+    cfg = PollerConfig(
+        name="x", command=f"{sys.executable} poller.py",
+        cron="* * * * *", env={}, skill_dir=skill_dir,
+        persist_dir=persist_dir, recover_failed_turns=True,
+    )
+    source_id = "poller:x:obsolete"
+    await poller_recovery.stash_enqueued_event(
+        persist_dir, _make_recovery_event(source_id),
+        enqueued_at="2026-06-04T07:59:00+00:00",
+    )
+    state = poller_recovery._load_state(persist_dir)
+    state["inflight"][source_id]["event"]["obsolete_field"] = True
+    poller_recovery._save_state(persist_dir, state)
+    events_path = home / "logs" / "events.jsonl"
+    with events_path.open("a", encoding="utf-8") as f:
+        f.write(json.dumps({
+            "type": "turn_failed",
+            "timestamp": "2026-06-04T08:00:00+00:00",
+            "channel_id": "poller:x",
+            "source_id": source_id,
+        }) + "\n")
+
+    await run_poller(cfg, enqueue=_CapturingEnqueue())
+
+    recovery_events = [
+        event for event in _read_events(home)
+        if event["type"] == "poller_recovery"
+    ]
+    assert len(recovery_events) == 1
+    assert recovery_events[0]["expired"] == 0
+    assert recovery_events[0]["dropped"] == 1
+
+
+@pytest.mark.asyncio
+async def test_run_poller_reports_and_preserves_corrupt_recovery_state(
+    tmp_path: Path, home: Path,
+) -> None:
+    skill_dir = tmp_path / "skill"
+    persist_dir = tmp_path / "persist" / "x"
+    _install_script(skill_dir, "poller.py", "pass\n")
+    cfg = PollerConfig(
+        name="x", command=f"{sys.executable} poller.py",
+        cron="* * * * *", env={}, skill_dir=skill_dir,
+        persist_dir=persist_dir,
+    )
+    persist_dir.mkdir(parents=True)
+    state_path = persist_dir / poller_recovery.RECOVERY_STATE_FILE
+    corrupt = b'{"last_reconciled":"","inflight":{"sid-1":'
+    state_path.write_bytes(corrupt)
+
+    await run_poller(cfg, enqueue=_CapturingEnqueue())
+
+    assert state_path.read_bytes() == corrupt
+    unreadable_events = [
+        event for event in _read_events(home)
+        if event["type"] == "poller_recovery_state_unreadable"
+    ]
+    assert len(unreadable_events) == 1
+    assert unreadable_events[0]["poller"] == "x"
+    assert unreadable_events[0]["path"] == str(state_path)
+    assert not any(
+        event["type"] == "poller_recovery" for event in _read_events(home)
+    )
+
+
+@pytest.mark.asyncio
+async def test_run_poller_reports_and_preserves_invalid_inflight_state(
+    tmp_path: Path, home: Path,
+) -> None:
+    skill_dir = tmp_path / "skill"
+    persist_dir = tmp_path / "persist" / "x"
+    _install_script(skill_dir, "poller.py", "pass\n")
+    cfg = PollerConfig(
+        name="x", command=f"{sys.executable} poller.py",
+        cron="* * * * *", env={}, skill_dir=skill_dir,
+        persist_dir=persist_dir,
+    )
+    persist_dir.mkdir(parents=True)
+    state_path = persist_dir / poller_recovery.RECOVERY_STATE_FILE
+    invalid = b'{"last_reconciled":"2026-08-23T18:00:00+00:00","inflight":null}'
+    state_path.write_bytes(invalid)
+
+    await run_poller(cfg, enqueue=_CapturingEnqueue())
+
+    assert state_path.read_bytes() == invalid
+    unreadable_events = [
+        event for event in _read_events(home)
+        if event["type"] == "poller_recovery_state_unreadable"
+    ]
+    assert len(unreadable_events) == 1
+    assert unreadable_events[0]["poller"] == "x"
+    assert unreadable_events[0]["path"] == str(state_path)
+    assert not any(
+        event["type"] == "poller_recovery" for event in _read_events(home)
+    )
 
 
 @pytest.mark.asyncio

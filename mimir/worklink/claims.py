@@ -20,6 +20,7 @@ import time
 from typing import Any, Callable, Iterable, Sequence
 
 CLAIM_PREFIX = "WORKLINK_CLAIM "
+WORKLINK_EPIC_LABEL = "worklink:epic"
 
 # Standalone callers without a Worklink config get the same finite safety
 # budget as a missing or malformed defaults.max_claim_attempts setting.
@@ -70,6 +71,23 @@ Runner = Callable[[Sequence[str]], subprocess.CompletedProcess[str]]
 EventLogger = Callable[..., None]
 
 log = logging.getLogger(__name__)
+
+
+def scope_active_worklink_lock_ids(
+    active_ids: Iterable[int],
+    *,
+    label_ids: Iterable[int] | None = None,
+    exclude_ids: Iterable[int] | None = None,
+) -> set[int]:
+    """Apply the label scope shared by every Worklink concurrency consumer."""
+    if label_ids is not None and exclude_ids is not None:
+        raise ValueError("active lock scope accepts label ids or excluded ids, not both")
+    scoped = set(active_ids)
+    if label_ids is not None:
+        return scoped & set(label_ids)
+    if exclude_ids is not None:
+        return scoped - set(exclude_ids)
+    return scoped
 
 
 def _default_runner(args: Sequence[str]) -> subprocess.CompletedProcess[str]:
@@ -405,10 +423,17 @@ class ChainlinkClaims:
             # caller's parse — a caller-side key mismatch here means stealing a
             # LIVE run's lock (exactly how the guard's first live test failed).
             guard_comments = list(comments) or []
+            guard_outcome = "claim_record_missing"
             try:
                 guard_comments = self._issue_comments(issue_id) or guard_comments
-            except Exception:
-                pass
+            except Exception as exc:
+                guard_outcome = "degraded"
+                if self.event_logger is not None:
+                    self.event_logger(
+                        "worklink_claim_guard_degraded",
+                        issue_id=issue_id,
+                        error=f"{type(exc).__name__}: {exc}"[:500],
+                    )
             for existing in claim_records_from_comments(guard_comments):
                 if existing.issue_id != issue_id:
                     continue
@@ -419,7 +444,16 @@ class ChainlinkClaims:
                 age_s = (self.clock() - anchor).total_seconds()
                 if age_s < self.duplicate_freshness_s:
                     return ClaimResult(False, reason="duplicate_run_live")
-            self._run("locks", "steal", str(issue_id), check=False)
+                if guard_outcome != "degraded":
+                    guard_outcome = "stale_heartbeat"
+            steal = self._run("locks", "steal", str(issue_id), check=False)
+            self._emit_claim_stolen(
+                issue_id=issue_id,
+                prior=latest,
+                now=self.clock(),
+                guard_outcome=guard_outcome,
+                result=steal,
+            )
 
         # chainlink #825: exhaustion is judged AFTER the duplicate-liveness
         # guard — a duplicate bouncing off a LIVE final-attempt run must yield
@@ -540,6 +574,32 @@ class ChainlinkClaims:
             retry_attempt=attempt,
             max_attempts=self.contention_max_attempts,
             outcome=outcome,
+        )
+
+    def _emit_claim_stolen(
+        self,
+        *,
+        issue_id: int,
+        prior: ClaimRecord | None,
+        now: datetime,
+        guard_outcome: str,
+        result: subprocess.CompletedProcess[str],
+    ) -> None:
+        if self.event_logger is None:
+            return
+        anchor = (prior.heartbeat_at or prior.claimed_at) if prior is not None else None
+        self.event_logger(
+            "worklink_claim_stolen",
+            issue_id=issue_id,
+            prior_agent_id=prior.agent_id if prior is not None else None,
+            heartbeat_age_s=(now - anchor).total_seconds() if anchor is not None else None,
+            guard_outcome=guard_outcome,
+            steal_succeeded=result.returncode == 0,
+            error=(
+                None
+                if result.returncode == 0
+                else ((result.stderr or result.stdout).strip() or "lock_steal_failed")[:500]
+            ),
         )
 
     def review_ready_evidence(
@@ -787,6 +847,13 @@ class ChainlinkClaims:
                 record_skip("lock_not_held", record.issue_id)
                 continue
             steal = self._run("locks", "steal", str(record.issue_id), check=False)
+            self._emit_claim_stolen(
+                issue_id=record.issue_id,
+                prior=record,
+                now=now,
+                guard_outcome="stale_lock_confirmed",
+                result=steal,
+            )
             if steal.returncode != 0:
                 record_skip("lock_steal_failed", record.issue_id)
                 continue
@@ -1034,13 +1101,13 @@ class ChainlinkClaims:
         active_ids = self._active_worklink_lock_ids(
             require_identity=label is not None or exclude_label is not None
         )
-        if label is not None:
-            scoped_ids = set(self._list_issue_ids(label))
-            return active_ids & scoped_ids
-        if exclude_label is not None:
-            excluded_ids = set(self._list_issue_ids(exclude_label))
-            return active_ids - excluded_ids
-        return active_ids
+        label_ids = self._list_issue_ids(label) if label is not None else None
+        exclude_ids = self._list_issue_ids(exclude_label) if exclude_label is not None else None
+        return scope_active_worklink_lock_ids(
+            active_ids,
+            label_ids=label_ids,
+            exclude_ids=exclude_ids,
+        )
 
     def _active_worklink_lock_ids(self, *, require_identity: bool) -> set[int]:
         result = self._run("locks", "list", "--json", check=False)
@@ -1109,7 +1176,7 @@ class ChainlinkClaims:
         except RuntimeError as exc:
             log.warning("Worklink reaper lock discovery failed: %s", exc)
         for issue_id in sorted(issue_ids):
-            if self._issue_has_label(issue_id, "worklink:epic"):
+            if self._issue_has_label(issue_id, WORKLINK_EPIC_LABEL):
                 continue
             for record in claim_records_from_comments(self._issue_comments(issue_id)):
                 current = latest.get(record.issue_id)

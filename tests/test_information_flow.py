@@ -1994,6 +1994,75 @@ def test_poller_destination_safe_fetch_is_taint_independent(
     assert untrusted.allowed is True
 
 
+@pytest.mark.parametrize("approval_source", ["operator", "heartbeat"])
+def test_fetch_url_scope_is_taint_gated_but_exact_url_is_not(
+    approval_source: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    exact = "https://collector.example/ingest/fixed?slot=1"
+    scoped_query = "https://collector.example/ingest/x?leak=ghp_SECRET"
+    scoped_path = "https://collector.example/ingest/ghp_SECRET_IN_PATH"
+    variable = (
+        "MIMIR_EGRESS_APPROVED_URLS"
+        if approval_source == "operator"
+        else "MIMIR_HEARTBEAT_APPROVED_URLS"
+    )
+    monkeypatch.setenv(
+        variable,
+        json.dumps([exact, "https://collector.example/ingest/*"]),
+    )
+
+    if approval_source == "heartbeat":
+        service = ServicePrincipal(
+            canonical="heartbeat",
+            trigger="scheduled_tick",
+            capabilities=("fetch_url",),
+            readable_domains=("configured_inputs",),
+            sink_policies=(ServiceSinkPolicy(
+                "fetch_url", "approved_urls", "MIMIR_HEARTBEAT_APPROVED_URLS",
+            ),),
+            capability_tier=CapabilityTier.UNBOUNDED,
+        )
+        tainted_auth, tainted_labels = _trigger_service_context(
+            service, integrity="untrusted",
+        )
+        clean_auth, clean_labels = _trigger_service_context(
+            service, integrity="trusted",
+        )
+    else:
+        tainted_labels = _labels()
+        tainted_auth = replace(_auth(), ifc_labels=tainted_labels)
+        clean_labels = InformationFlowLabels()
+        clean_auth = replace(_auth(), ifc_labels=clean_labels)
+
+    exact_decision = SinkGate.check_sink_flow(
+        "fetch_url", exact, tainted_labels, tainted_auth, enforce=True,
+    )
+    query_decision = SinkGate.check_sink_flow(
+        "fetch_url", scoped_query, tainted_labels, tainted_auth, enforce=True,
+    )
+    path_decision = SinkGate.check_sink_flow(
+        "fetch_url", scoped_path, tainted_labels, tainted_auth, enforce=True,
+    )
+    clean_decision = SinkGate.check_sink_flow(
+        "fetch_url", scoped_path, clean_labels, clean_auth, enforce=True,
+    )
+    shadow_decision = SinkGate.check_sink_flow(
+        "fetch_url", scoped_path, tainted_labels, tainted_auth, enforce=False,
+    )
+
+    assert exact_decision.allowed is True
+    assert exact_decision.reason == "ifc_allowed"
+    for refused in (query_decision, path_decision):
+        assert refused.allowed is False
+        assert refused.reason == "ifc_label_blocked:network"
+        assert refused.would_block is True
+    assert clean_decision.allowed is True
+    assert shadow_decision.allowed is True
+    assert shadow_decision.would_block is True
+    assert shadow_decision.is_shadow_decision is True
+
+
 def test_heartbeat_fetches_multiple_approved_exact_urls_after_untrusted_ingest(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

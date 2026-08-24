@@ -25,6 +25,7 @@ from typing import Sequence
 import pytest
 
 from mimir.worklink import autonomy, orchestrator
+from mimir.worklink.autonomy import check_concurrency
 from mimir.worklink.claims import CLAIM_RESET_PREFIX, ChainlinkClaims, ClaimRecord, ReapResult
 from mimir.worklink.backends.registry import WorklinkConfig, WorklinkDefaults
 from mimir.worklink.dispatch_failures import (
@@ -74,7 +75,15 @@ class FakeChainlink:
         tail = args[1:]
         if tail[:2] == ["issue", "list"]:
             label = tail[tail.index("--label") + 1] if "--label" in tail else ""
-            ids = self.in_progress if label == "worklink:in-progress" else self.ready if label == "worklink:ready" else []
+            ids = (
+                self.in_progress
+                if label == "worklink:in-progress"
+                else self.ready
+                if label == "worklink:ready"
+                else sorted(self.epic_ids)
+                if label == "worklink:epic"
+                else []
+            )
             return cp(stdout=json.dumps([{"id": i} for i in ids]))
         if tail[:2] == ["issue", "show"]:
             issue_id = int(tail[2])
@@ -942,6 +951,30 @@ async def test_worklink_run_skips_at_cap(_tool_env, monkeypatch: pytest.MonkeyPa
 
 
 @pytest.mark.asyncio
+async def test_worklink_run_leaf_cap_excludes_epic_locks(
+    _tool_env, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    registry, dispatched, _repo = _tool_env
+    registry.set_arbiter(_FakeArbiter(fire=True))
+    fake = FakeChainlink(active_locks=[100, 200], epic_ids={100})
+    claims = ChainlinkClaims(agent_id="t", runner=fake)
+    monkeypatch.setattr(
+        autonomy,
+        "check_concurrency",
+        lambda home, **_: check_concurrency(home, claims=claims),
+    )
+
+    allowed = await registry.worklink_run.ainvoke({"issue_id": 443})
+    assert "completed" in allowed
+    assert [item["issue_id"] for item in dispatched] == [443]
+
+    fake.active_locks = [100, 200, 201]
+    blocked = await registry.worklink_run.ainvoke({"issue_id": 444})
+    assert "concurrency cap reached (2/2 active claims)" in blocked
+    assert [item["issue_id"] for item in dispatched] == [443]
+
+
+@pytest.mark.asyncio
 async def test_worklink_run_fails_closed_when_cap_unreadable(_tool_env, monkeypatch: pytest.MonkeyPatch) -> None:
     registry, dispatched, _repo = _tool_env
     registry.set_arbiter(_FakeArbiter(fire=True))
@@ -978,7 +1011,7 @@ def _fake_chainlink_script(
     *,
     ready: list[int],
     epics: list[int] | None = None,
-    blocked_epics: list[int] | None = None,
+    blocked: list[int] | None = None,
     review_epics: list[int] | None = None,
     parents: dict[int, int] | None = None,
     in_progress: list[int] | None = None,
@@ -993,7 +1026,7 @@ def _fake_chainlink_script(
         "a = sys.argv[1:]\n"
         f"ready = {ready!r}\n"
         f"epics = {(epics or [])!r}\n"
-        f"blocked_epics = {(blocked_epics or [])!r}\n"
+        f"blocked = {(blocked or [])!r}\n"
         f"review_epics = {(review_epics or [])!r}\n"
         f"parents = {(parents or {})!r}\n"
         f"actionable = {(ready if actionable is None else actionable)!r}\n"
@@ -1007,7 +1040,7 @@ def _fake_chainlink_script(
         "    sys.exit(0)\n"
         "if a[:2] == ['issue','list']:\n"
         "    label = a[a.index('--label')+1] if '--label' in a else ''\n"
-        "    ids = epics if label=='worklink:epic' else blocked_epics if label=='worklink:blocked' else review_epics if label=='worklink:review' else inprog if label=='worklink:in-progress' else ready if label=='worklink:ready' else []\n"
+        "    ids = epics if label=='worklink:epic' else blocked if label=='worklink:blocked' else review_epics if label=='worklink:review' else inprog if label=='worklink:in-progress' else ready if label=='worklink:ready' else []\n"
         "    print(json.dumps([{'id': i, 'parent_id': parents.get(i)} for i in ids]))\n"
         "sys.exit(0)\n",
         encoding="utf-8",
@@ -1467,6 +1500,44 @@ def test_poller_failure_escalation_dedupes_by_signature_and_recovers(
     assert [e["issue_id"] for e in recovered if e.get("signal") == "worklink_dispatched"] == [201]
 
 
+def test_epic_dispatch_backoff_prevents_attempt_each_poll_cycle(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    state_dir = dispatch_failure_state_dir(home)
+    record_failure(
+        state_dir,
+        issue_id=100,
+        attempt=1,
+        exit_status=1,
+        error="deterministic epic failure",
+        log_path=None,
+    )
+    env = {
+        "MIMIR_HOME": str(home),
+        "CHAINLINK_BIN": str(
+            _fake_chainlink_script(
+                tmp_path,
+                ready=[100],
+                epics=[100],
+                actionable=[100],
+                active_locks=[],
+            )
+        ),
+        "WORKLINK_RUN_BIN": sys.executable + " " + str(_fake_run_bin(tmp_path)),
+        "WORKLINK_REPO": str(repo),
+        "MIMIR_FACTORY_EPICS_ENABLED": "true",
+    }
+
+    first = _run_poller(tmp_path, env)
+    second = _run_poller(tmp_path, env)
+
+    assert not [event for event in first if event.get("signal") == "worklink_dispatched"]
+    assert not [event for event in second if event.get("signal") == "worklink_dispatched"]
+    assert not (tmp_path / "dispatched.txt").exists()
+
+
 def test_poller_stops_after_emitting_when_later_failure_ack_errors(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1660,9 +1731,8 @@ def test_poller_does_not_dispatch_worklink_epic_issues(tmp_path: Path) -> None:
 
 
 @pytest.mark.skipif(not POLLER.exists(), reason="poller not present")
-def test_poller_dispatches_epic_when_factory_epics_enabled(tmp_path: Path) -> None:
-    """chainlink #833: with MIMIR_FACTORY_EPICS_ENABLED set, an actionable epic is
-    dispatched to the feature-factory via run-epic (mode='epic'), not as a leaf."""
+def test_poller_dispatches_only_ready_epic_when_factory_epics_enabled(tmp_path: Path) -> None:
+    """The ready label arms epic dispatch just as it arms leaf dispatch."""
     home = tmp_path / "home"
     home.mkdir()
     repo = tmp_path / "repo"
@@ -1670,8 +1740,8 @@ def test_poller_dispatches_epic_when_factory_epics_enabled(tmp_path: Path) -> No
     chainlink = _fake_chainlink_script(
         tmp_path,
         ready=[100],
-        epics=[100],
-        actionable=[100],
+        epics=[100, 101],
+        actionable=[100, 101],
         active_locks=[],
     )
     runbin = _fake_run_bin(tmp_path)
@@ -1690,6 +1760,47 @@ def test_poller_dispatches_epic_when_factory_epics_enabled(tmp_path: Path) -> No
     assert len(dispatched) == 1
     assert dispatched[0]["issue_id"] == 100
     assert dispatched[0]["mode"] == "epic"
+    assert 101 not in [event.get("issue_id") for event in dispatched]
+
+
+@pytest.mark.skipif(not POLLER.exists(), reason="poller not present")
+def test_poller_excludes_worklink_blocked_from_leaf_and_epic_dispatch(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    chainlink = _fake_chainlink_script(
+        tmp_path,
+        ready=[100, 101, 200, 201],
+        epics=[100, 101],
+        blocked=[100, 200],
+        actionable=[100, 101, 200, 201],
+        active_locks=[],
+    )
+    runbin = _fake_run_bin(tmp_path)
+
+    events = _run_poller(tmp_path, {
+        "MIMIR_HOME": str(home),
+        "CHAINLINK_BIN": str(chainlink),
+        "WORKLINK_RUN_BIN": sys.executable + " " + str(runbin),
+        "WORKLINK_REPO": str(repo),
+        "WORKLINK_MAX_CONCURRENT": "3",
+        "STATE_DIR": str(tmp_path / "state"),
+        "MIMIR_FACTORY_EPICS_ENABLED": "true",
+    })
+
+    dispatched = [
+        (event["mode"], event["issue_id"])
+        for event in events
+        if event.get("signal") == "worklink_dispatched"
+    ]
+    assert dispatched == [("leaf", 201), ("epic", 101)]
+    scan = [
+        event for event in events if event.get("signal") == "worklink_ready_scan"
+    ][-1]
+    assert scan["labeled_ready_count"] == 4
+    assert scan["blocked_ready_count"] == 0
+    assert scan["label_blocked_ready_count"] == 2
 
 
 def test_poller_keeps_bare_ready_leaf_on_per_leaf_run(tmp_path: Path) -> None:

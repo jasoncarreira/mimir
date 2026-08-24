@@ -1259,11 +1259,12 @@ async def test_supervisor_fires_algedonic_after_three_attempts(monkeypatch, tmp_
     bridge._RECONNECT_BACKOFF_CAP_SECONDS = 0.01
 
     attempts = {"n": 0}
+    hold_open = asyncio.Event()
 
     async def fake_start(token):
         attempts["n"] += 1
         if attempts["n"] >= 5:
-            return None
+            await hold_open.wait()
         raise discord.DiscordServerError(
             _FakeResp(status=503), {"code": 0, "message": "boom"},
         )
@@ -1276,16 +1277,26 @@ async def test_supervisor_fires_algedonic_after_three_attempts(monkeypatch, tmp_
     )
 
     await bridge.connect()
-    await asyncio.wait_for(bridge._runner, timeout=2.0)
+    for _ in range(100):
+        if attempts["n"] >= 5:
+            break
+        await asyncio.sleep(0.01)
+    assert attempts["n"] == 5
     # Wait briefly for any pending log-event tasks to drain.
     for _ in range(20):
         await asyncio.sleep(0)
 
     retry_events = [(k, f) for k, f in captured if k == "discord_bridge_retry"]
-    # 4 failed attempts before success (5th); algedonic fires on attempts 3, 4.
+    # Four failures before the fifth attempt blocks; events fire on attempts 3, 4.
     assert len(retry_events) == 2
     assert retry_events[0][1]["attempt"] == 3
     assert retry_events[1][1]["attempt"] == 4
+    assert not any(k == "discord_bridge_exited" for k, _ in captured)
+
+    assert bridge._runner is not None
+    bridge._runner.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await bridge._runner
 
 
 @pytest.mark.asyncio
@@ -1297,11 +1308,16 @@ async def test_supervisor_clean_exit_when_client_returns(monkeypatch, tmp_path: 
     bridge._RECONNECT_BACKOFF_INITIAL_SECONDS = 0.01
 
     attempts = {"n": 0}
+    captured: list[tuple[str, dict]] = []
+
+    async def fake_log_event(kind: str, **fields):
+        captured.append((kind, fields))
 
     async def fake_start(token):
         attempts["n"] += 1
         return None  # immediate clean exit
 
+    monkeypatch.setattr("mimir.bridges.discord._safe_log_event", fake_log_event)
     monkeypatch.setattr(
         "mimir.bridges.discord._DiscordClient",
         lambda owner: SimpleNamespace(
@@ -1312,6 +1328,10 @@ async def test_supervisor_clean_exit_when_client_returns(monkeypatch, tmp_path: 
     await bridge.connect()
     await asyncio.wait_for(bridge._runner, timeout=1.0)
     assert attempts["n"] == 1  # no retries on clean exit
+    assert captured == [(
+        "discord_bridge_exited",
+        {"reason": "client.start() returned cleanly"},
+    )]
 
 
 @pytest.mark.asyncio
