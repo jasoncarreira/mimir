@@ -4070,6 +4070,7 @@ async def test_tool_refusal_is_a_result_and_next_tool_call_can_run(
             ),
             handler,
         )
+        assert not auth.ifc_state.current(auth.ifc_labels).sources
         stale = await middleware.awrap_tool_call(
             _make_request(
                 "repo_push", "stale", auth,
@@ -4210,6 +4211,7 @@ async def test_real_repo_test_policy_refusal_does_not_taint_turn(
             ),
             handler,
         )
+        assert not auth.ifc_state.current(auth.ifc_labels).sources
         adapted = await middleware.awrap_tool_call(
             _make_request("shell_exec", "adapted", auth, {"command": "pwd"}),
             handler,
@@ -4224,9 +4226,13 @@ async def test_real_repo_test_policy_refusal_does_not_taint_turn(
     assert ctx.ifc_labels.has_untrusted_active_ingest is False
 
 
-@pytest.mark.asyncio
-async def test_real_repo_execution_fault_taints_turn(
+@pytest.mark.parametrize(
+    "refusal_code",
+    ("stale_scope", "base_advanced", "base_history_rewritten"),
+)
+def test_real_repo_execution_fault_taints_turn(
     monkeypatch: pytest.MonkeyPatch,
+    refusal_code: str,
 ) -> None:
     from dataclasses import replace
 
@@ -4262,13 +4268,17 @@ async def test_real_repo_execution_fault_taints_turn(
     class FailingRepoGitTools:
         def __init__(self, state, *, enforce=True):  # type: ignore[no-untyped-def]
             self.state = state
+            self.execution_started = False
 
         def execute(self, operation):  # type: ignore[no-untyped-def]
-            raise GitRefusal("git_failed", "git exited 128 after execution started")
+            raise GitRefusal(
+                refusal_code,
+                "remote ref changed after fetch",
+            )
 
     monkeypatch.setattr("mimir.tools.repo.RepoGitTools", FailingRepoGitTools)
 
-    async def handler(request: ToolCallRequest) -> ToolMessage:
+    def handler(request: ToolCallRequest) -> ToolMessage:
         repo_fetch.func(
             repository="owner/repo",
             pull_request=17,
@@ -4279,7 +4289,7 @@ async def test_real_repo_execution_fault_taints_turn(
     assert ctx.ifc_labels.has_untrusted_active_ingest is False
     token = set_current_turn(ctx)
     try:
-        result = await middleware.awrap_tool_call(
+        result = middleware.wrap_tool_call(
             _make_request(
                 "repo_fetch", "repo-fault", auth,
                 {"repository": "owner/repo", "pull_request": 17},
@@ -4293,6 +4303,150 @@ async def test_real_repo_execution_fault_taints_turn(
     assert result.status == "error"
     assert "repository operation rejected (repository_git_failed)" in str(result.content)
     assert ctx.ifc_labels.has_untrusted_active_ingest is True
+    assert auth.ifc_state.current(auth.ifc_labels).sources
+
+
+def test_repo_checkout_post_fetch_failure_taints_turn(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from dataclasses import replace
+
+    from mimir.tools.repo import repo_checkout
+
+    middleware = BudgetGateMiddleware()
+    scope = RepoPRActionScope(
+        provenance="poller_payload",
+        canonical_repo="owner/repo",
+        canonical_root="/srv/repo",
+        canonical_origin="https://github.com/owner/repo.git",
+        principal="mimir-bot",
+        event_type="pr_changes_requested_stale",
+        allowed_operations=frozenset(action.value for action in RepoPRAction),
+        pr_number=17,
+        head_repo="owner/repo",
+        head_remote="origin",
+        destination_ref="refs/heads/fix",
+        observed_head_sha="a" * 40,
+        base_ref="main",
+        observed_base_sha="b" * 40,
+    )
+    state = RepoReviewState(scope)
+    auth = replace(
+        _untainted_ifc_auth(),
+        repo_pr_scope_registry=RepoPRScopeRegistry((state,)),
+        repo_review_state=state,
+        repo_pr_action_scope=scope,
+    )
+    ctx = _ifc_turn(auth)
+    monkeypatch.setattr(
+        "mimir.tools.forge.remediation_checkout_preflight",
+        lambda *_args: (state, None),
+    )
+    monkeypatch.setattr(
+        "mimir.tools.repo.acquire_pr_checkout_lease",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            RuntimeError("git fetch failed after contacting origin")
+        ),
+    )
+
+    def handler(request: ToolCallRequest) -> ToolMessage:
+        repo_checkout.func(
+            repository="owner/repo",
+            pull_request=17,
+            runtime=Runtime(context=auth),
+        )
+        raise AssertionError("repo_checkout should have raised")
+
+    token = set_current_turn(ctx)
+    try:
+        result = middleware.wrap_tool_call(
+            _make_request(
+                "repo_checkout", "checkout-fault", auth,
+                {"repository": "owner/repo", "pull_request": 17},
+            ),
+            handler,
+        )
+    finally:
+        reset_current_turn(token)
+
+    assert isinstance(result, ToolMessage)
+    assert result.status == "error"
+    assert auth.ifc_state.current(auth.ifc_labels).sources
+
+
+def test_repo_test_post_execution_permission_failure_taints_turn(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from dataclasses import replace
+
+    from mimir.project_tests import ProjectTestRefusal
+    from mimir.tools import repo as repo_module
+
+    middleware = BudgetGateMiddleware()
+    scope = RepoPRActionScope(
+        provenance="poller_payload",
+        canonical_repo="owner/repo",
+        canonical_root="/srv/repo",
+        canonical_origin="https://github.com/owner/repo.git",
+        principal="mimir-bot",
+        event_type="pr_changes_requested_stale",
+        allowed_operations=frozenset(action.value for action in RepoPRAction),
+        pr_number=17,
+        head_repo="owner/repo",
+        head_remote="origin",
+        destination_ref="refs/heads/fix",
+        observed_head_sha="a" * 40,
+        base_ref="main",
+        observed_base_sha="b" * 40,
+    )
+    state = RepoReviewState(scope)
+    auth = replace(
+        _untainted_ifc_auth(),
+        repo_pr_scope_registry=RepoPRScopeRegistry((state,)),
+        repo_review_state=state,
+        repo_pr_action_scope=scope,
+    )
+    ctx = _ifc_turn(auth)
+    monkeypatch.setattr(repo_module, "_state", lambda *_args: state)
+
+    class FailingProjectTests:
+        def __init__(self, review_state):  # type: ignore[no-untyped-def]
+            self.review_state = review_state
+
+        async def execute(self, selectors):  # type: ignore[no-untyped-def]
+            raise ProjectTestRefusal(
+                "test_path_permission_denied",
+                "path_mode=0o700 path_uid=1000 path_gid=1000",
+            )
+
+    monkeypatch.setattr(repo_module, "RepoProjectTests", FailingProjectTests)
+
+    def handler(request: ToolCallRequest) -> ToolMessage:
+        asyncio.run(
+            repo_module.repo_test.coroutine(
+                repository="owner/repo",
+                pull_request=17,
+                runtime=Runtime(context=auth),
+            )
+        )
+        raise AssertionError("repo_test should have raised")
+
+    token = set_current_turn(ctx)
+    try:
+        result = middleware.wrap_tool_call(
+            _make_request(
+                "repo_test", "test-fault", auth,
+                {"repository": "owner/repo", "pull_request": 17},
+            ),
+            handler,
+        )
+    finally:
+        reset_current_turn(token)
+
+    assert isinstance(result, ToolMessage)
+    assert result.status == "error"
+    assert "test_path_permission_denied" in str(result.content)
+    assert auth.ifc_state.current(auth.ifc_labels).sources
 
 
 @pytest.mark.asyncio
