@@ -30,7 +30,7 @@ import shlex
 import subprocess
 import sys
 import threading
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from contextvars import ContextVar, Token
 from dataclasses import dataclass, field, replace
 from enum import StrEnum
@@ -930,6 +930,46 @@ def _configured_file_write_roots() -> list[Path]:
     return [Path(home), *(Path(path) for path, mode in extra_roots if mode == "rw")]
 
 
+def _resolve_file_tool_target(
+    target: str,
+    home: Path | str | None = None,
+    *,
+    physical_roots: Iterable[Path] = (),
+) -> Path | None:
+    """Resolve a caller path using the live file backend's virtual convention."""
+    home_value = str(home or os.environ.get("MIMIR_HOME", "")).strip()
+    if not home_value or not target or "\x00" in target:
+        return None
+    requested = Path(target)
+    if ".." in requested.parts:
+        return None
+    try:
+        configured_home = Path(os.path.abspath(home_value))
+        home_root = Path(home_value).resolve()
+        if not requested.is_absolute():
+            return home_root / requested
+
+        # CompositeBackend routes real absolute paths before its default home
+        # backend. Preserve those spellings instead of remapping them as virtual.
+        external_roots = tuple(dict.fromkeys(
+            resolved
+            for root in (*_configured_file_roots(), *physical_roots)
+            if (resolved := root.resolve()) != home_root
+        ))
+        for root in sorted(external_roots, key=lambda item: len(item.parts), reverse=True):
+            if requested == root or requested.is_relative_to(root):
+                return requested
+
+        # The home backend accepts both its physical spelling and an absolute
+        # virtual spelling rooted at home (for example /state/x or /skills/x).
+        for spelling in dict.fromkeys((configured_home, home_root)):
+            if requested == spelling or requested.is_relative_to(spelling):
+                return home_root / requested.relative_to(spelling)
+        return home_root / requested.as_posix().lstrip("/")
+    except (OSError, RuntimeError, ValueError):
+        return None
+
+
 def _configured_repo_write_roots() -> list[Path]:
     """Return only explicit external RW roots, excluding home and implicit /tmp."""
     home = os.environ.get("MIMIR_HOME", "").strip()
@@ -1438,7 +1478,10 @@ def _target_within_configured_write_roots(target: str, _destination: str) -> boo
     from ._paths import PathOutsideHomeError
 
     try:
-        resolve_configured_write_target(target)
+        candidate = _resolve_file_tool_target(target)
+        if candidate is None:
+            return False
+        resolve_configured_write_target(str(candidate))
     except (OSError, PathOutsideHomeError):
         return False
     return True
@@ -1509,9 +1552,11 @@ def _target_within_static_service_write_roots(
         *((artifact_root,) if artifact_root is not None else ()),
     }
     roots = _static_service_write_roots()
-    candidate = Path(target)
-    if not candidate.is_absolute():
-        candidate = home_root / candidate
+    candidate = _resolve_file_tool_target(
+        target, home_root, physical_roots=roots,
+    )
+    if candidate is None:
+        return False
     try:
         # Check both the lexical spelling and resolved destination.  The former
         # prevents a protected component that is itself a symlink (for example
@@ -1596,9 +1641,9 @@ def _target_within_upgrade_proposals(target: str, _destination: str) -> bool:
     root = _upgrade_proposals_root()
     if root is None:
         return False
-    candidate = Path(target)
-    if not candidate.is_absolute():
-        candidate = Path(os.environ["MIMIR_HOME"]).resolve() / candidate
+    candidate = _resolve_file_tool_target(target, physical_roots=(root,))
+    if candidate is None:
+        return False
     try:
         resolve_within_roots([root], str(candidate))
     except (OSError, PathOutsideHomeError, RuntimeError):
@@ -4332,12 +4377,9 @@ def _target_within_trigger_service_write_roots(target: str, destination: str) ->
     from ._paths import PathOutsideHomeError, resolve_within_roots
 
     home = os.environ.get("MIMIR_HOME", "").strip()
-    candidate = Path(target)
     if not home:
         return False
     home_root = Path(home).resolve()
-    if not candidate.is_absolute():
-        candidate = home_root / candidate
     try:
         raw = json.loads(destination)
         if not isinstance(raw, list) or not raw or not all(isinstance(p, str) for p in raw):
@@ -4346,6 +4388,11 @@ def _target_within_trigger_service_write_roots(target: str, destination: str) ->
         turn_scratch = current_turn_scratch_root()
         if turn_scratch is not None:
             roots.append(turn_scratch)
+        candidate = _resolve_file_tool_target(
+            target, home_root, physical_roots=roots,
+        )
+        if candidate is None:
+            return False
         scratch_root = (home_root / "scratch").resolve()
         if (candidate == scratch_root or candidate.is_relative_to(scratch_root)) and (
             turn_scratch is None
@@ -6433,7 +6480,10 @@ class WriteResourceAdapter:
         try:
             home_root = Path(home).resolve()
             state_root = (Path(home) / "state").resolve()
-            resolved = resolve_within_roots([home_root], target)
+            candidate = _resolve_file_tool_target(target, home_root)
+            if candidate is None:
+                return False
+            resolved = resolve_within_roots([home_root], str(candidate))
             turn_scratch = current_turn_scratch_root()
             root = next(
                 root for root in (state_root, turn_scratch) if root is not None
@@ -6462,9 +6512,9 @@ class WriteResourceAdapter:
         if not home:
             return None
         roots = agent_writable_roots(home)
-        candidate = Path(target)
-        if not candidate.is_absolute():
-            candidate = Path(home).resolve() / candidate
+        candidate = _resolve_file_tool_target(target, home)
+        if candidate is None:
+            return None
         writable_for_admin_operator = _agent_writable_root_for_path(
             candidate, roots, admin_operator_turn=True,
         )
@@ -6504,7 +6554,13 @@ class WriteResourceAdapter:
         *,
         enforce: bool,
         service_allowed: bool,
+        ifc_labels: Any = None,
     ) -> ToolAuthorization:
+        skill_write = cls.authorize_skill_write(
+            tool_name, target, auth_context, ifc_labels, enforce=enforce,
+        )
+        if skill_write is not None:
+            return skill_write
         roles = (getattr(auth_context, "roles", ()) or ()) if auth_context else ()
         if "admin" in roles or service_allowed:
             return ToolAuthorization(
@@ -7758,6 +7814,7 @@ class ToolRegistry:
                     auth_context,
                     enforce=enforce,
                     service_allowed=service_allowed,
+                    ifc_labels=ifc_labels,
                 )
                 write_auth.flow_direction = flow_direction
                 write_auth.repo_pr_action_scope = repo_pr_action_scope
@@ -8298,39 +8355,9 @@ def record_file_write_integrity(
     if not home_value or not isinstance(resource_id, str) or not resource_id:
         return True
     home = Path(home_value).resolve(strict=False)
-    requested = Path(resource_id)
-    if requested.is_absolute():
-        try:
-            resolved_requested = requested.resolve(strict=False)
-        except (OSError, RuntimeError):
-            return False
-        try:
-            resolved_requested.relative_to(home)
-            resource = resolved_requested
-        except ValueError:
-            # A path lexically under the configured home but resolving outside
-            # it is a symlink escape, not an unrelated write to permit.
-            configured_home = Path(os.path.abspath(home_value))
-            try:
-                requested.relative_to(configured_home)
-            except ValueError:
-                pass
-            else:
-                return False
-            # The backend runs virtual_mode rooted at the home, so a file tool
-            # addresses these as "/docs/notes.md" rather than
-            # "<home>/docs/notes.md" -- a root recorded only for physical paths
-            # is not recorded for the shape writes actually arrive in, and the
-            # trusted read default then launders it.
-            if (
-                len(requested.parts) > 1
-                and requested.parts[1] in _SELF_AUTHORED_FILE_ROOTS
-            ):
-                resource = home / requested.as_posix().lstrip("/")
-            else:
-                return True
-    else:
-        resource = home / requested
+    resource = _resolve_file_tool_target(resource_id, home_value)
+    if resource is None:
+        return False
     try:
         resource = resource.resolve(strict=False)
         relative = resource.relative_to(home)
