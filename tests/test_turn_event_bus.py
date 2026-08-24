@@ -140,16 +140,19 @@ def test_scrub_failure_remains_best_effort_without_exact_subscriber(monkeypatch)
     bus.publish({"type": "turn", "phase": "start", "turn_id": "t1"})
 
 
-def test_scrub_failure_propagates_with_exact_subscriber(monkeypatch):
+def test_scrub_failure_drops_event_with_exact_subscriber(monkeypatch, caplog):
     bus = TurnEventBus()
-    bus.subscribe_exact_turn("t1")
+    exact = bus.subscribe_exact_turn("t1")
 
     def fail_scrub(event):
         raise RuntimeError("scrub failed")
 
     monkeypatch.setattr(turn_event_bus, "scrub_turn_event", fail_scrub)
-    with pytest.raises(RuntimeError, match="scrub failed"):
+    with caplog.at_level("WARNING", logger=turn_event_bus.__name__):
         bus.publish({"type": "turn", "phase": "start", "turn_id": "t1"})
+
+    assert exact.empty()
+    assert "turn_id='t1' exact_subscriber=True" in caplog.text
 
 
 def test_emitter_propagates_exact_turn_delivery_failure():
