@@ -1191,6 +1191,73 @@ def test_recent_activity_admission_respects_enforcement_and_shadow_logs_would_bl
     )]
 
 
+def test_recent_activity_shadow_records_predicate_without_rechecking_sink_gate(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from mimir.identities import Identity
+
+    class Resolver:
+        def identity(self, author):
+            return Identity(canonical="alice") if author == "slack-alice" else None
+
+    class Provider:
+        def audience_for(self, channel_id, *, principal):
+            return None
+
+    events: list[tuple[str, dict[str, object]]] = []
+    monkeypatch.setattr(
+        "mimir.harness_egress.log_event_sync",
+        lambda kind, **fields: events.append((kind, fields)),
+    )
+    monkeypatch.setattr(
+        "mimir.agent.harness_sink_allowed",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("recent-activity shadowing must not recheck the sink gate")
+        ),
+    )
+    agent = _make_agent(tmp_path)
+    resolver = Resolver()
+    agent._identity_resolver = resolver
+    agent._buffer.resolver = resolver
+    candidate = agent._buffer.make_message(
+        channel_id="slack-D-alice",
+        kind="user_message",
+        content="CROSS-CHANNEL-CONTEXT",
+        author="slack-alice",
+        msg_id="cross-channel-predicate",
+        source="slack",
+    )
+    agent._buffer._append_in_memory(candidate)
+    event = AgentEvent(
+        trigger="user_message",
+        channel_id="slack-GROUP",
+        author="slack-alice",
+        content="now",
+        source="slack",
+    )
+    auth = AuthContext(
+        principal="slack-alice",
+        canonical_principal="alice",
+        roles=("user",),
+        event_ingress=None,
+        trigger="user_message",
+        channel_id=event.channel_id,
+        interactivity=None,
+        enforcement_enabled=False,
+        bridge_instance="slack",
+        audience_provider=Provider(),
+    )
+
+    recent, blocks = agent._select_recent_activity(event, auth)
+
+    assert recent == [candidate]
+    assert [block.content for block in blocks] == ["CROSS-CHANNEL-CONTEXT"]
+    assert events[0][0] == "sink_blocked"
+    assert events[0][1]["status"] == "would_block"
+    assert events[0][1]["reason"] == "ifc_label_blocked:same_channel"
+
+
 def test_excluded_recent_messages_add_no_identity_or_recent_labels(
     tmp_path: Path,
 ) -> None:
