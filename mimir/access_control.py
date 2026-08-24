@@ -8449,6 +8449,9 @@ def _filesystem_result_integrity(
             pass
         else:
             review_state = getattr(auth_context, "repo_review_state", None)
+            registry = getattr(auth_context, "repo_pr_scope_registry", None)
+            if registry is not None:
+                review_state = registry.resolve_checkout_path(resource)
             scope = getattr(review_state, "action_scope", None)
             lease = getattr(review_state, "checkout_lease", None)
             self_login = os.environ.get("MIMIR_GITHUB_SELF_LOGIN", "").strip()
@@ -8620,6 +8623,21 @@ def record_file_write_integrity(
         resource = resource.resolve(strict=False)
     except (OSError, RuntimeError):
         return False
+    requested = Path(resource_id)
+    if requested.is_absolute():
+        configured_home = Path(os.path.abspath(home_value))
+        for spelling in dict.fromkeys((configured_home, home)):
+            try:
+                requested.relative_to(spelling)
+            except ValueError:
+                continue
+            try:
+                resource.relative_to(home)
+            except ValueError:
+                # A target lexically under home that resolves outside is a
+                # symlink escape, not an unrelated external-root write.
+                return False
+            break
     try:
         relative = resource.relative_to(home)
     except ValueError:
@@ -8632,6 +8650,9 @@ def record_file_write_integrity(
             return True
         integrity_key = relative
     elif lease_root is not None and _resolved_path_contains(lease_root, resource):
+        # The configured root grants the backend access, not integrity. Writes
+        # still get an absolute integrity key so any later provenance-authorized
+        # read of the same checkout cannot launder a tainted mutation.
         integrity_key = resource
     else:
         return True
