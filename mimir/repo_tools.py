@@ -90,7 +90,11 @@ _BASE_CONFIG = (
 
 
 class GitRefusal(RuntimeError):
-    """A named policy refusal, distinct from a Git command failure."""
+    """A named policy refusal, distinct from a Git command failure.
+
+    Omitted phase information deliberately fails closed to the post-execution
+    verdict; known pre-execution sites pass ``execution_started=False``.
+    """
 
     def __init__(
         self,

@@ -4232,7 +4232,6 @@ def test_repo_test_post_execution_permission_failure_taints_turn(
             raise ProjectTestRefusal(
                 "test_path_permission_denied",
                 "path_mode=0o700 path_uid=1000 path_gid=1000",
-                execution_started=True,
             )
 
     monkeypatch.setattr(repo_module, "RepoProjectTests", FailingProjectTests)

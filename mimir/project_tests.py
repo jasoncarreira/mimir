@@ -73,14 +73,18 @@ _PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 
 
 class ProjectTestRefusal(RuntimeError):
-    """A named policy refusal, distinct from a red test suite."""
+    """A named policy refusal, distinct from a red test suite.
+
+    Omitted phase information deliberately fails closed to the post-execution
+    verdict; genuinely pre-execution sites must opt out explicitly.
+    """
 
     def __init__(
         self,
         code: str,
         message: str,
         *,
-        execution_started: bool = False,
+        execution_started: bool = True,
     ) -> None:
         super().__init__(message)
         self.code = code
@@ -121,7 +125,11 @@ def _configured_command(repo_slug: str) -> tuple[tuple[str, ...], dict[str, str]
     """Resolve Worklink's deployment command into one shell-free fixed argv."""
     home = os.environ.get("MIMIR_HOME", "").strip()
     if not home:
-        raise ProjectTestRefusal("test_not_configured", "MIMIR_HOME is not configured")
+        raise ProjectTestRefusal(
+            "test_not_configured",
+            "MIMIR_HOME is not configured",
+            execution_started=False,
+        )
     try:
         config = WorklinkConfig.load(Path(home) / "worklink.yaml")
         inventory = RepositoryInventory.load(Path(home) / "repositories.yaml")
@@ -134,11 +142,16 @@ def _configured_command(repo_slug: str) -> tuple[tuple[str, ...], dict[str, str]
             source = "deployment"
         words = shlex.split(command, posix=True)
     except (OSError, RuntimeError, ValueError) as exc:
-        raise ProjectTestRefusal("test_config_invalid", "project test command is invalid") from exc
+        raise ProjectTestRefusal(
+            "test_config_invalid",
+            "project test command is invalid",
+            execution_started=False,
+        ) from exc
     if not words:
         raise ProjectTestRefusal(
             "test_command_unresolvable",
             f"project test command from {source} configuration is empty",
+            execution_started=False,
         )
 
     env = {
@@ -164,12 +177,18 @@ def _configured_command(repo_slug: str) -> tuple[tuple[str, ...], dict[str, str]
         index = 1
         while index < len(words) and words[index] in {"-u", "--unset"}:
             if index + 1 >= len(words) or not words[index + 1].isidentifier():
-                raise ProjectTestRefusal("test_config_invalid", "invalid env unset directive")
+                raise ProjectTestRefusal(
+                    "test_config_invalid",
+                    "invalid env unset directive",
+                    execution_started=False,
+                )
             env.pop(words[index + 1], None)
             index += 2
         words = words[index:]
         if not words:
-            raise ProjectTestRefusal("test_config_invalid", "test runner is missing")
+            raise ProjectTestRefusal(
+                "test_config_invalid", "test runner is missing", execution_started=False
+            )
 
     executable = Path(words[0])
     try:
@@ -179,28 +198,60 @@ def _configured_command(repo_slug: str) -> tuple[tuple[str, ...], dict[str, str]
             else shutil.which(words[0], path=_PATH)
         )
     except OSError as exc:
-        raise ProjectTestRefusal("test_command_unresolvable", "configured test runner is unavailable") from exc
+        raise ProjectTestRefusal(
+            "test_command_unresolvable",
+            "configured test runner is unavailable",
+            execution_started=False,
+        ) from exc
     if not resolved_text:
-        raise ProjectTestRefusal("test_command_unresolvable", "configured test runner is unavailable")
+        raise ProjectTestRefusal(
+            "test_command_unresolvable",
+            "configured test runner is unavailable",
+            execution_started=False,
+        )
     resolved = Path(resolved_text)
     try:
         resolved = resolved.resolve(strict=True)
     except OSError as exc:
-        raise ProjectTestRefusal("test_command_unresolvable", "configured test runner is unavailable") from exc
+        raise ProjectTestRefusal(
+            "test_command_unresolvable",
+            "configured test runner is unavailable",
+            execution_started=False,
+        ) from exc
     if not resolved.is_file() or not os.access(resolved, os.X_OK):
-        raise ProjectTestRefusal("test_command_unresolvable", "configured test runner is unavailable")
+        raise ProjectTestRefusal(
+            "test_command_unresolvable",
+            "configured test runner is unavailable",
+            execution_started=False,
+        )
     return (str(resolved), *words[1:]), env, source
 
 
 def _validated_selectors(root: Path, selectors: tuple[str, ...]) -> tuple[str, ...]:
     if not isinstance(selectors, tuple):
-        raise ProjectTestRefusal("test_selector_invalid", "test selectors must be a tuple")
+        raise ProjectTestRefusal(
+            "test_selector_invalid",
+            "test selectors must be a tuple",
+            execution_started=False,
+        )
     if len(selectors) > _MAX_SELECTORS:
-        raise ProjectTestRefusal("test_selector_count_exceeded", "too many test selectors")
+        raise ProjectTestRefusal(
+            "test_selector_count_exceeded",
+            "too many test selectors",
+            execution_started=False,
+        )
     if any(not isinstance(item, str) for item in selectors):
-        raise ProjectTestRefusal("test_selector_invalid", "test selectors must be strings")
+        raise ProjectTestRefusal(
+            "test_selector_invalid",
+            "test selectors must be strings",
+            execution_started=False,
+        )
     if sum(len(item.encode("utf-8")) for item in selectors) > _MAX_SELECTOR_BYTES:
-        raise ProjectTestRefusal("test_selectors_too_large", "test selectors are too large")
+        raise ProjectTestRefusal(
+            "test_selectors_too_large",
+            "test selectors are too large",
+            execution_started=False,
+        )
     validated: list[str] = []
     for item in selectors:
         path_text, separator, node_id = item.partition("::")
@@ -215,7 +266,11 @@ def _validated_selectors(root: Path, selectors: tuple[str, ...]) -> tuple[str, .
             or any(part in {"", ".", ".."} for part in candidate.parts)
             or "\\" in path_text
         ):
-            raise ProjectTestRefusal("test_selector_invalid", "test selector is not a relative path or node id")
+            raise ProjectTestRefusal(
+                "test_selector_invalid",
+                "test selector is not a relative path or node id",
+                execution_started=False,
+            )
         try:
             unresolved = root / path_text
             if any(
@@ -229,6 +284,7 @@ def _validated_selectors(root: Path, selectors: tuple[str, ...]) -> tuple[str, .
             raise ProjectTestRefusal(
                 "test_selector_outside_checkout",
                 "test selector does not resolve inside the authorized checkout",
+                execution_started=False,
             ) from exc
         validated.append(f"{canonical}::{node_id}" if separator else canonical)
     return tuple(validated)
@@ -357,7 +413,7 @@ class RepoProjectTests:
     async def execute(self, selectors: tuple[str, ...] = ()) -> ProjectTestResult:
         scope = self._state.action_scope
         if RepoPRAction.TEST.value not in scope.allowed_operations:
-            raise ProjectTestRefusal("scope_action_denied", "scope does not grant repo.test")
+            raise ProjectTestRefusal("scope_action_denied", "scope does not grant repo.test", execution_started=False)
         git_tools: RepoGitTools | None = None
         try:
             git_tools = RepoGitTools(self._state)
