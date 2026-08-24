@@ -1279,6 +1279,75 @@ def test_seeded_reference_roots_are_trusted_informational(
     assert source.integrity_effect == "informational"
 
 
+def test_configured_server_owned_lease_root_is_trusted_but_arbitrary_root_is_not(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / "home"
+    lease_root = tmp_path / "pr-checkout-leases"
+    external = tmp_path / "benchmark-inputs"
+    for root in (home, lease_root, external):
+        root.mkdir()
+    lease = lease_root / "lease-7.json"
+    lease.write_text('{"lease":"7"}', encoding="utf-8")
+    benchmark = external / "prompt.txt"
+    benchmark.write_text("external instructions", encoding="utf-8")
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    monkeypatch.setenv("MIMIR_PR_CHECKOUT_LEASE_ROOT", str(lease_root))
+    monkeypatch.setenv(
+        "MIMIR_FILE_TOOL_ROOTS", f"{lease_root}:rw,{external}:ro",
+    )
+
+    sources = [
+        protected_result_source(
+            _auth(), principal="filesystem", domain="filesystem",
+            resource_id=str(path), bridge_instance="filesystem",
+        )
+        for path in (lease, benchmark, lease_root / "missing.json")
+    ]
+
+    assert [
+        (source.integrity, source.integrity_effect) for source in sources
+    ] == [
+        ("trusted", "informational"),
+        ("untrusted", "active_ingest"),
+        ("untrusted", "active_ingest"),
+    ]
+
+
+def test_untrusted_model_write_cannot_launder_through_configured_lease_root(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / "home"
+    lease_root = tmp_path / "server-leases"
+    home.mkdir()
+    lease_root.mkdir()
+    target = lease_root / "lease-8.json"
+    target.write_text("attacker-derived lease data", encoding="utf-8")
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    monkeypatch.setenv("MIMIR_PR_CHECKOUT_LEASE_ROOT", str(lease_root))
+    tainted = InformationFlowLabels().with_source(SourceLabel(
+        principal="mallory", domain="channel", resource_id="github:pr:8",
+        bridge_instance="github", sensitivity="internal",
+        authorized_principals=frozenset({"user-1"}),
+        integrity="untrusted", integrity_effect="active_ingest",
+    ))
+
+    assert record_file_write_integrity(str(target), tainted) is True
+    reread = protected_result_source(
+        _auth(), principal="filesystem", domain="filesystem",
+        resource_id=str(target), bridge_instance="filesystem",
+    )
+
+    assert (reread.integrity, reread.integrity_effect) == (
+        "untrusted", "active_ingest",
+    )
+    assert json.loads(
+        (home / ".mimir" / "file-integrity.json").read_text(encoding="utf-8")
+    ) == {str(target): "untrusted"}
+
+
 @pytest.mark.parametrize("root", sorted(_SELF_AUTHORED_FILE_ROOTS))
 def test_virtual_path_write_to_a_self_authored_root_is_recorded(
     tmp_path: Path,

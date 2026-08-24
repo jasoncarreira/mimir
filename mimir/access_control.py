@@ -1283,6 +1283,7 @@ def _repo_pr_scope_resolution(
         base_ref=base_ref,
         observed_base_sha=base_sha.lower(),
         checkout_ref=None if is_remediation else f"refs/pull/{number}/head",
+        pull_request_author=principal,
     ))
 
 
@@ -8271,6 +8272,7 @@ _FILE_INTEGRITY_RECORDED_ROOTS = _SELF_AUTHORED_FILE_ROOTS | {"skills"}
 _FILE_INTEGRITY_EXCLUDED_SUBTREES = frozenset({("state", "pollers")})
 _FILE_INTEGRITY_DECLASSIFICATIONS_KEY = "__declassifications__"
 _FILE_INTEGRITY_EPOCH_KEY = "__ledger_epoch_ns__"
+_PR_CHECKOUT_LEASE_ROOT_ENV = "MIMIR_PR_CHECKOUT_LEASE_ROOT"
 
 
 @dataclass(frozen=True)
@@ -8405,11 +8407,19 @@ def _filesystem_result_integrity(
     try:
         home = Path(home_value).resolve(strict=True)
         resource = Path(resource_id).resolve(strict=True)
-        relative = resource.relative_to(home)
-    except (OSError, RuntimeError, ValueError):
+    except (OSError, RuntimeError):
         return "untrusted", "active_ingest"
 
-    if relative.parts and relative.parts[0] in _SELF_AUTHORED_FILE_ROOTS:
+    try:
+        relative = resource.relative_to(home)
+    except ValueError:
+        relative = None
+
+    if (
+        relative is not None
+        and relative.parts
+        and relative.parts[0] in _SELF_AUTHORED_FILE_ROOTS
+    ):
         # These roots are scaffolded by ``mimir setup`` and contain first-party
         # reference material. Operator- or agent-authored files under ``skills``
         # do not receive this default merely because of their location; only
@@ -8427,6 +8437,35 @@ def _filesystem_result_integrity(
         return persisted, (
             "informational" if persisted == "trusted" else "active_ingest"
         )
+
+    # A checkout root is only an access boundary. Trust comes from the immutable
+    # PR scope attached to this turn, so relaxing PR discovery to permit an
+    # outside author's branch cannot silently make that checkout informational.
+    lease_root = _configured_pr_checkout_lease_root()
+    if lease_root is not None:
+        try:
+            resource.relative_to(lease_root)
+        except ValueError:
+            pass
+        else:
+            review_state = getattr(auth_context, "repo_review_state", None)
+            scope = getattr(review_state, "action_scope", None)
+            lease = getattr(review_state, "checkout_lease", None)
+            self_login = os.environ.get("MIMIR_GITHUB_SELF_LOGIN", "").strip()
+            if not (
+                self_login
+                and getattr(scope, "principal", None) == self_login
+                and getattr(scope, "pull_request_author", None) == self_login
+                and getattr(lease, "is_active", False)
+                and getattr(lease, "scope_id", None) == getattr(scope, "scope_id", None)
+                and _resolved_path_equals(getattr(lease, "lease_root", None), lease_root)
+                and _resolved_path_contains(getattr(lease, "path", None), resource)
+            ):
+                return "untrusted", "active_ingest"
+            persisted = _persisted_file_integrity(home, resource)
+            return persisted, (
+                "informational" if persisted == "trusted" else "active_ingest"
+            )
 
     cache_root = home / "attachments" / "fetch-cache"
     try:
@@ -8455,6 +8494,38 @@ def _filesystem_result_integrity(
     # URL approval authorizes GET egress only. It never vouches for returned
     # bytes, including redirects or cached copies (#1139).
     return "untrusted", "active_ingest"
+
+
+def _configured_pr_checkout_lease_root() -> Path | None:
+    """Return the validated physical lease root, never an access-only alias."""
+    raw = os.environ.get(_PR_CHECKOUT_LEASE_ROOT_ENV, "").strip()
+    configured = Path(raw) if raw else None
+    if configured is None or not configured.is_absolute() or configured.is_symlink():
+        return None
+    try:
+        resolved = configured.resolve(strict=True)
+    except (OSError, RuntimeError):
+        return None
+    return resolved if resolved.is_dir() else None
+
+
+def _resolved_path_equals(candidate: object, expected: Path) -> bool:
+    if not isinstance(candidate, (str, Path)):
+        return False
+    try:
+        return Path(candidate).resolve(strict=True) == expected
+    except (OSError, RuntimeError):
+        return False
+
+
+def _resolved_path_contains(root: object, resource: Path) -> bool:
+    if not isinstance(root, (str, Path)):
+        return False
+    try:
+        resource.relative_to(Path(root).resolve(strict=True))
+    except (OSError, RuntimeError, ValueError):
+        return False
+    return True
 
 
 def _persisted_file_integrity(home: Path, relative: Path) -> str:
@@ -8537,17 +8608,32 @@ def record_file_write_integrity(
     if not home_value or not isinstance(resource_id, str) or not resource_id:
         return True
     home = Path(home_value).resolve(strict=False)
-    resource = _resolve_file_tool_target(resource_id, home_value)
+    lease_root = _configured_pr_checkout_lease_root()
+    resource = _resolve_file_tool_target(
+        resource_id,
+        home_value,
+        physical_roots=(lease_root,) if lease_root is not None else (),
+    )
     if resource is None:
         return False
     try:
         resource = resource.resolve(strict=False)
-        relative = resource.relative_to(home)
-    except (OSError, RuntimeError, ValueError):
+    except (OSError, RuntimeError):
         return False
-    if not relative.parts or relative.parts[0] not in _FILE_INTEGRITY_RECORDED_ROOTS:
-        return True
-    if relative.parts[0:2] in _FILE_INTEGRITY_EXCLUDED_SUBTREES:
+    try:
+        relative = resource.relative_to(home)
+    except ValueError:
+        relative = None
+
+    if relative is not None:
+        if not relative.parts or relative.parts[0] not in _FILE_INTEGRITY_RECORDED_ROOTS:
+            return True
+        if relative.parts[0:2] in _FILE_INTEGRITY_EXCLUDED_SUBTREES:
+            return True
+        integrity_key = relative
+    elif lease_root is not None and _resolved_path_contains(lease_root, resource):
+        integrity_key = resource
+    else:
         return True
     sources = getattr(labels, "sources", ())
     integrity = (
@@ -8577,7 +8663,7 @@ def record_file_write_integrity(
                     or epoch_ns <= 0
                 ):
                     return False
-            key = relative.as_posix()
+            key = integrity_key.as_posix()
             existing = payload.get(key)
             # This hook runs before the file mutation. A clean turn therefore
             # cannot prove that an existing tainted file was fully replaced (or
@@ -8594,7 +8680,7 @@ def record_file_write_integrity(
             tmp.replace(metadata_path)
             return True
         except (OSError, json.JSONDecodeError):
-            log.exception("failed to persist file integrity for %s", relative)
+            log.exception("failed to persist file integrity for %s", integrity_key)
             return False
 
 

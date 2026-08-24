@@ -728,6 +728,9 @@ class RepoPRActionScope:
     # A provider-owned immutable ref used only to obtain the observed head.
     # Write scopes leave this unset and continue to fetch/push destination_ref.
     checkout_ref: str | None = None
+    # Provider-observed content provenance. The executing principal is always the
+    # configured bot, so it cannot stand in for the author of fetched PR bytes.
+    pull_request_author: str | None = None
     scope_id: str = field(init=False)
 
     def __post_init__(self) -> None:
@@ -758,6 +761,8 @@ class RepoPRActionScope:
         }
         if self.checkout_ref is not None:
             authority["checkout_ref"] = self.checkout_ref
+        if self.pull_request_author is not None:
+            authority["pull_request_author"] = self.pull_request_author
         encoded = json.dumps(authority, sort_keys=True, separators=(",", ":")).encode()
         object.__setattr__(self, "scope_id", hashlib.sha256(encoded).hexdigest())
 
