@@ -36,7 +36,7 @@ REPO_TEST_UV_CACHE = Path("/opt/mimir-worklink/uv-cache")
 MAX_FDS = 3
 # Deliberately not imported from worker_client: this value must describe the
 # immutable executor installed in the root-owned image, not mutable controller code.
-EXECUTOR_PROTOCOL_IDENTITY = "worklink-executor-v3-repo-uv-cache"
+EXECUTOR_PROTOCOL_IDENTITY = "worklink-executor-v4-direct-output-fds"
 _STALE_EXECUTOR_DIAGNOSTIC = (
     "stale root executor image: controller and mimir.worklink.worker_exec protocol "
     "identities do not match; rebuild the image and restart the container"
@@ -478,6 +478,10 @@ def _handle_launch(connection: socket.socket, request: dict[str, Any], fds: list
         raise RuntimeError("invalid worker id")
     _validate_identifier(identifier)
     checkout_root = _validate_checkout(fds[0], request)
+    for fd in fds[1:]:
+        metadata = os.fstat(fd)
+        if not stat.S_ISREG(metadata.st_mode):
+            raise RuntimeError("worker output FD must be a regular file")
     command = _validate_command(request)
     environment = _validate_environment(request["env"])
     timeout_s = request["timeout_s"]

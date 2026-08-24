@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 import signal
 import socket
+import stat
 import struct
 import subprocess
 import sys
@@ -98,6 +99,8 @@ class WorkerClient:
             if self.outputs is not None
             else (self.stdout, self.stderr)
         )
+        kwargs["stdout_sink"].file.write(stdout)
+        kwargs["stderr_sink"].file.write(stderr)
         process = WorkerProcess(
             kwargs["identifier"],
             4000 + len(self.launched),
@@ -138,6 +141,7 @@ def spec(
         backend_config=config or {},
         local_checkout=Path("/authorized"),
         local_argv=("python", "-c", "print('ok')"),
+        output_root=Path.cwd() / ".pytest-worklink-output",
     )
 
 
@@ -153,6 +157,7 @@ async def test_operator_issued_opencode_uses_fd_anchored_dir_but_direct_keeps_ab
     monkeypatch.setattr("mimir.worklink.checkout.coding_enabled", lambda: True)
     monkeypatch.setattr("mimir.worklink.run_state.process_start_ticks", lambda pid: pid)
     work = spec()
+    object.__setattr__(work, "output_root", tmp_path / "output")
     object.__setattr__(work, "local_checkout", checkout)
     object.__setattr__(
         work,
@@ -380,10 +385,17 @@ async def test_direct_terminated_output_is_durable_while_running(
 ) -> None:
     monkeypatch.setattr("mimir.worklink.checkout.coding_enabled", lambda: False)
     backend = LocalSubprocessComputeBackend()
-    work = direct_spec(
-        "import os,time; "
-        "os.write(1,b'before termination\\n'); "
-        "os.write(2,b'diagnostic stderr\\n'); time.sleep(30)"
+    work = direct_spec("import time; time.sleep(30)")
+    object.__setattr__(
+        work,
+        "local_argv",
+        (
+            "/usr/bin/node",
+            "-e",
+            "process.stdout.write('before termination\\n'); "
+            "process.stderr.write('diagnostic stderr\\n'); "
+            "setTimeout(() => {}, 30000)",
+        ),
     )
     output_root = tmp_path / "state" / "worklink" / "transcripts"
     object.__setattr__(work, "output_root", output_root)
@@ -397,6 +409,7 @@ async def test_direct_terminated_output_is_durable_while_running(
         await asyncio.sleep(0.01)
     assert len(stdout_files) == 1
     assert stdout_files[0].read_bytes() == b"before termination\n"
+    assert stat.S_ISREG(stdout_files[0].stat().st_mode)
 
     if termination == "sigterm":
         await backend.cancel(handle)

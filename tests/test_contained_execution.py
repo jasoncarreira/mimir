@@ -1,12 +1,16 @@
 from __future__ import annotations
 
 import asyncio
+import errno
+import os
 from pathlib import Path
+import stat
 from typing import Any
 
 import pytest
 
 import mimir.contained_execution as contained
+import mimir.output_capture as output_capture
 from mimir.contained_execution import (
     SensitiveMaterialScrubber,
     base_worker_environment,
@@ -54,6 +58,10 @@ class Client:
 
     async def launch(self, **kwargs: Any) -> Process:
         self.launched.append(kwargs)
+        kwargs["stdout_sink"].file.write(bytes(self.process.stdout._buffer))
+        kwargs["stdout_sink"].file.flush()
+        kwargs["stderr_sink"].file.write(bytes(self.process.stderr._buffer))
+        kwargs["stderr_sink"].file.flush()
         return self.process
 
     async def cancel(self, identifier: str) -> None:
@@ -372,3 +380,62 @@ def test_safe_truncation_length_without_materials_is_the_limit() -> None:
 
     assert scrubber.lookahead_bytes() == 0
     assert scrubber.safe_truncation_length(b"plain output", 5) == 5
+
+
+def test_output_sink_exclusive_create_symlink_refusal_and_private_modes(tmp_path: Path) -> None:
+    root = tmp_path / "private" / "transcripts"
+    path = root / "stdout.log"
+    sink = output_capture.open_output_sink(path, 100)
+    try:
+        assert stat.S_IMODE(root.stat().st_mode) == 0o700
+        assert stat.S_IMODE(path.stat().st_mode) == 0o600
+    finally:
+        sink.close()
+
+    with pytest.raises(FileExistsError):
+        output_capture.open_output_sink(path, 100)
+
+    link = root / "stderr.log"
+    link.symlink_to(path)
+    with pytest.raises(OSError) as raised:
+        output_capture.open_output_sink(link, 100)
+    assert raised.value.errno in {errno.EEXIST, errno.ELOOP}
+
+
+def test_output_sink_refuses_unsafe_parent_and_relative_root(tmp_path: Path) -> None:
+    unsafe = tmp_path / "unsafe"
+    unsafe.mkdir(mode=0o777)
+    unsafe.chmod(0o777)
+    with pytest.raises(PermissionError, match="unsafe writable"):
+        output_capture.open_output_sink(unsafe / "run" / "stdout.log", 100)
+    with pytest.raises(ValueError, match="absolute"):
+        output_capture.open_output_sink(Path("relative/stdout.log"), 100)
+
+
+@pytest.mark.parametrize("written", [0, -1, 2])
+def test_output_writer_refuses_zero_negative_and_short_writes(
+    monkeypatch: pytest.MonkeyPatch, written: int
+) -> None:
+    sink = output_capture.open_output_sink(None, 100)
+    real_write = os.write
+    calls = 0
+
+    def faulty_write(fd: int, value: bytes | memoryview) -> int:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            if written > 0:
+                real_write(fd, bytes(value)[:written])
+            return written
+        return real_write(fd, value)
+
+    monkeypatch.setattr(output_capture.os, "write", faulty_write)
+    try:
+        if written <= 0:
+            with pytest.raises(OSError, match="incomplete Worklink output write"):
+                sink.file.write(b"abcd")
+        else:
+            assert sink.file.write(b"abcd") == 4
+            assert sink.read_bounded()[0] == b"abcd"
+    finally:
+        sink.close()

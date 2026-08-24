@@ -236,7 +236,7 @@ async def test_worker_process_requires_identity_bound_terminal_result(monkeypatc
         def close(self) -> None:
             pass
 
-    process = WorkerProcess(identifier, 12, asyncio.StreamReader(), asyncio.StreamReader(), Peer())
+    process = WorkerProcess(identifier, 12, Peer())
     with pytest.raises(RuntimeError, match="invalid terminal"):
         await process.wait()
 
@@ -749,8 +749,10 @@ def test_terminal_waits_for_in_group_writers_before_cleanup(tmp_path: Path, monk
     checkout = tmp_path / "checkout"
     checkout.mkdir()
     checkout_fd = os.open(checkout, os.O_RDONLY | os.O_DIRECTORY)
-    stdout_read, stdout_write = os.pipe()
-    stderr_read, stderr_write = os.pipe()
+    stdout_path = tmp_path / "stdout.log"
+    stderr_path = tmp_path / "stderr.log"
+    stdout_write = os.open(stdout_path, os.O_RDWR | os.O_CREAT | os.O_EXCL, 0o600)
+    stderr_write = os.open(stderr_path, os.O_RDWR | os.O_CREAT | os.O_EXCL, 0o600)
     identifier = str(uuid.uuid4())
     responses: list[dict[str, object]] = []
     events: list[str] = []
@@ -776,13 +778,7 @@ def test_terminal_waits_for_in_group_writers_before_cleanup(tmp_path: Path, monk
     def observed_cleanup(home: Path) -> None:
         pid = int(responses[0]["pid"])
         assert not worker_exec._process_group_has_live_members(pid)
-        output = bytearray()
-        while True:
-            chunk = os.read(stdout_read, 4096)
-            if not chunk:
-                break
-            output.extend(chunk)
-        assert bytes(output) == b"ready"
+        assert stdout_path.read_bytes() == b"ready"
         events.append("cleanup")
         cleanup_home(home)
 
@@ -811,9 +807,9 @@ def test_terminal_waits_for_in_group_writers_before_cleanup(tmp_path: Path, monk
         assert events == ["started", "cleanup", "terminal"]
         assert responses[-1]["exit_code"] == 0
         assert not (tmp_path / "homes" / identifier).exists()
-        assert os.read(stderr_read, 4096) == b""
+        assert stderr_path.read_bytes() == b""
     finally:
-        for fd in (*fds, stdout_read, stderr_read):
+        for fd in fds:
             if fd >= 0:
                 try:
                     os.close(fd)
@@ -825,8 +821,8 @@ def test_executor_enforces_worker_deadline(tmp_path: Path, monkeypatch) -> None:
     checkout = tmp_path / "checkout"
     checkout.mkdir()
     checkout_fd = os.open(checkout, os.O_RDONLY | os.O_DIRECTORY)
-    stdout_read, stdout_write = os.pipe()
-    stderr_read, stderr_write = os.pipe()
+    stdout_write = os.open(tmp_path / "stdout.log", os.O_RDWR | os.O_CREAT | os.O_EXCL, 0o600)
+    stderr_write = os.open(tmp_path / "stderr.log", os.O_RDWR | os.O_CREAT | os.O_EXCL, 0o600)
     identifier = str(uuid.uuid4())
     responses: list[dict[str, object]] = []
     waits: list[float | None] = []
@@ -894,7 +890,7 @@ def test_executor_enforces_worker_deadline(tmp_path: Path, monkeypatch) -> None:
             "timed_out": True,
         }
     finally:
-        for fd in (*fds, stdout_read, stderr_read):
+        for fd in fds:
             if fd >= 0:
                 try:
                     os.close(fd)

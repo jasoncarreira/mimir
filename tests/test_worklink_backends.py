@@ -519,6 +519,7 @@ async def test_local_subprocess_compute_backend_preserves_subprocess_shape(
 
     async def fake_exec(*args: str, **kwargs: Any) -> FakeProcess:
         calls.append({"args": args, "kwargs": kwargs})
+        kwargs["stdout"].write(b"ok")
         return FakeProcess(returncode=0, stdout=b"ok", stderr=b"")
 
     monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
@@ -540,6 +541,7 @@ async def test_local_subprocess_compute_backend_preserves_subprocess_shape(
         backend_config={"bin": "other", "args": ["ignored"]},
         local_checkout=tmp_path,
         local_argv=("tool", "arg", "--cd", str(tmp_path), "prompt"),
+        output_root=tmp_path / "transcripts",
     )
     handle = await backend.launch(spec)
     result = await backend.wait(handle, 5)
@@ -557,14 +559,16 @@ async def test_local_subprocess_compute_backend_preserves_subprocess_shape(
         stderr="",
         handle=result.handle,
         command=("tool", "arg", "--cd", str(tmp_path), "prompt"),
+        stdout_path=result.stdout_path,
+        stderr_path=result.stderr_path,
     )
     assert calls == [
         {
             "args": ("tool", "arg", "--cd", str(tmp_path), "prompt"),
                 "kwargs": {
                     "stdin": asyncio.subprocess.DEVNULL,
-                    "stdout": asyncio.subprocess.PIPE,
-                "stderr": asyncio.subprocess.PIPE,
+                    "stdout": calls[0]["kwargs"]["stdout"],
+                "stderr": calls[0]["kwargs"]["stderr"],
                 "cwd": str(tmp_path),
                 "env": {"PATH": "/custom/bin", "X": "1"},
                 "start_new_session": True,
@@ -580,6 +584,8 @@ async def test_local_subprocess_compute_caps_output_and_kills_on_overflow(
     process = FakeProcess(returncode=None, stdout=b"abcdefgh", stderr=b"err")
 
     async def fake_exec(*args: str, **kwargs: Any) -> FakeProcess:
+        kwargs["stdout"].write(b"abcdefgh")
+        kwargs["stderr"].write(b"err")
         return process
 
     monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
@@ -632,6 +638,27 @@ async def test_local_subprocess_compute_caps_output_and_kills_on_overflow(
     assert transcript["output_overflow"] is True
     assert transcript["stdout_path"] == str(result.stdout_path)
     assert transcript["stderr_path"] == str(result.stderr_path)
+
+
+def test_output_paths_require_explicit_run_owned_root(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("MIMIR_HOME", str(tmp_path / "ambient-home"))
+    spec = WorkSpec(
+        issue_id=1,
+        attempt=1,
+        repo_url="repo",
+        base_ref="main",
+        branch="issue/1-a1",
+        prompt="prompt",
+        rules=None,
+        test_command="true",
+        backend="opencode",
+        timeout_s=5,
+    )
+
+    assert compute_module._output_paths(spec, "run") == (None, None)
+    assert not (tmp_path / "ambient-home").exists()
 
 
 def test_worklink_output_limits_use_safe_defaults_and_env_overrides(
