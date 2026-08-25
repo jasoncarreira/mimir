@@ -253,7 +253,14 @@ class WorkerClient:
                 error = str(response["error"])
                 # Executors predating the identity operation can only signal drift
                 # through their exact-contract error; keep that legacy fallback.
-                if "exact contract" in error or "stale root executor image" in error:
+                if any(
+                    marker in error
+                    for marker in (
+                        "exact contract",
+                        "stale root executor image",
+                        "unsupported worker operation",
+                    )
+                ):
                     raise StaleWorkerExecutorError(STALE_EXECUTOR_DIAGNOSTIC)
                 raise RuntimeError(error)
             if response.get("id") != identifier:

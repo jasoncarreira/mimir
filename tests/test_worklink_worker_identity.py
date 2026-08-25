@@ -73,5 +73,8 @@ def test_ci_runs_the_committed_live_image_proof() -> None:
     assert "sibling-access negative control did not detect a cross-write" in proof
     assert "intentionally shared sibling checkout" in proof
     assert "printf attacked > /workspace/mimir/tracked" in proof
+    assert "worklink-publication-attack" in proof
+    assert 'remote", "set-url", "--push"' in proof
+    assert "ControllerGitPublication.capture" in proof
     assert "Worklink unexpectedly selected the contained checkout path" in proof
     assert "issue_id=1411" in proof

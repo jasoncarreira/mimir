@@ -10,6 +10,7 @@ import threading
 from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Sequence
 
 import pytest
@@ -5999,6 +6000,13 @@ def test_authorized_publication_ignores_hostile_checkout_git_metadata(tmp_path: 
     subprocess.run(["git", "init", "-q", "--bare", str(remote)], check=True)
     subprocess.run(["git", "-C", str(trusted), "config", "user.name", "controller"], check=True)
     subprocess.run(["git", "-C", str(trusted), "config", "user.email", "controller@example.com"], check=True)
+    subprocess.run(
+        [
+            "git", "-C", str(trusted), "config", "credential.helper",
+            "!f() { echo username=controller; echo password=trusted; }; f",
+        ],
+        check=True,
+    )
     subprocess.run(["git", "-C", str(trusted), "remote", "add", "origin", str(remote)], check=True)
     (trusted / "tracked.txt").write_text("old\n")
     subprocess.run(["git", "-C", str(trusted), "add", "tracked.txt"], check=True)
@@ -6018,13 +6026,27 @@ def test_authorized_publication_ignores_hostile_checkout_git_metadata(tmp_path: 
     marker = tmp_path / "executed"
     hooks = checkout / "hooks"
     hooks.mkdir()
-    hook = hooks / "pre-commit"
-    hook.write_text(f"#!/bin/sh\ntouch {marker}\n")
-    hook.chmod(0o755)
+    for name in ("pre-commit", "pre-push"):
+        hook = hooks / name
+        hook.write_text(f"#!/bin/sh\ntouch {marker}\nexit 91\n")
+        hook.chmod(0o755)
     included = checkout / "hostile.config"
     included.write_text(f"[core]\n\tfsmonitor = touch {marker}\n")
+    hostile_remote = tmp_path / "hostile.git"
+    subprocess.run(["git", "init", "-q", "--bare", str(hostile_remote)], check=True)
     subprocess.run(["git", "-C", str(checkout), "config", "core.hooksPath", str(hooks)], check=True)
     subprocess.run(["git", "-C", str(checkout), "config", "include.path", str(included)], check=True)
+    subprocess.run(
+        [
+            "git", "-C", str(checkout), "config", "credential.helper",
+            f"!f() {{ touch {marker}; echo username=worker; echo password=hostile; }}; f",
+        ],
+        check=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(checkout), "remote", "set-url", "--push", "origin", str(hostile_remote)],
+        check=True,
+    )
     (checkout / "tracked.txt").write_text("new\n")
 
     try:
@@ -6039,10 +6061,34 @@ def test_authorized_publication_ignores_hostile_checkout_git_metadata(tmp_path: 
             runner=lambda args: (_ for _ in ()).throw(AssertionError(args)),
             publication=publication,
         )
+        credentials = publication.run(
+            "credential", "fill",
+            input="protocol=https\nhost=example.test\n\n",
+            check=True,
+        )
+        orchestrator._git_push(
+            checkout,
+            "issue/1-a1",
+            runner=lambda args: (_ for _ in ()).throw(AssertionError(args)),
+            publication=publication,
+        )
     finally:
         publication.close()
 
+    assert "username=controller" in credentials.stdout
+    assert "password=trusted" in credentials.stdout
+    assert "worker" not in credentials.stdout
     assert not marker.exists()
+    assert subprocess.run(
+        ["git", "--git-dir", str(remote), "show-ref", "--verify", "refs/heads/issue/1-a1"],
+        capture_output=True,
+        check=False,
+    ).returncode == 0
+    assert subprocess.run(
+        ["git", "--git-dir", str(hostile_remote), "show-ref", "--verify", "refs/heads/issue/1-a1"],
+        capture_output=True,
+        check=False,
+    ).returncode != 0
 
 
 @pytest.mark.parametrize(
@@ -6127,7 +6173,19 @@ def test_worker_capability_cleanup_tolerates_entry_removed_concurrently(
 
 @pytest.mark.parametrize(
     "scenario",
-    ["pre_launch_exception"],
+    [
+        "success",
+        "blocked",
+        "failed",
+        "work_spec_exception",
+        "pre_launch_exception",
+        "evidence_exception",
+        "commit_exception",
+        "push_exception",
+        "pr_exception",
+        "publication_exception",
+        "branch_cleanup_exception",
+    ],
 )
 def test_authorized_runner_closes_real_attempt_capabilities(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, scenario: str
@@ -6347,7 +6405,13 @@ def test_authorized_runner_closes_real_attempt_capabilities(
             return cp(args, stdout="https://github.com/example/repo/pull/1\n")
         return cp(args)
 
+    worker_uid = 4242
     monkeypatch.setenv("MIMIR_CODING_ENABLED", "true")
+    monkeypatch.setattr(
+        orchestrator,
+        "get_identities",
+        lambda: SimpleNamespace(worklink_uid=worker_uid),
+    )
     monkeypatch.setattr(orchestrator, "OpenCodeBackend", WorkerBackend)
     monkeypatch.setattr(orchestrator, "create_isolated_checkout", create_checkout)
     monkeypatch.setattr(orchestrator.ControllerGitPublication, "capture", capture)
@@ -6364,14 +6428,52 @@ def test_authorized_runner_closes_real_attempt_capabilities(
     )
 
     assert checkout_kwargs["worker_eligible"] is True
-    assert requested_uids == [orchestrator.get_identities().worklink_uid]
-    assert lifecycle == []
-    assert publication.closed == 0
+    assert requested_uids == [worker_uid]
+    assert lifecycle.count("publication-acquired") == 1
+    assert lifecycle[-1:] == ["publication"]
+    assert publication.closed == 1
     assert authorization.closed == 0
     authorization.close()
-    assert result.status == "failed"
-    assert checkout.exists()
-    assert len(bound_specs) == 1
+    expected_published = scenario in {"success", "branch_cleanup_exception"}
+    assert result.status == (
+        "completed" if expected_published else ("blocked" if scenario == "blocked" else "failed")
+    )
+    assert checkout.exists() is (not expected_published)
+    expected_launches = {
+        "work_spec_exception": 0,
+        "pre_launch_exception": 1,
+        "failed": 1,
+        "evidence_exception": 1,
+        "publication_exception": 1,
+        "blocked": 2,
+        "commit_exception": 2,
+        "success": 3,
+        "branch_cleanup_exception": 3,
+        "push_exception": 3,
+        "pr_exception": 3,
+    }
+    assert len(bound_specs) == expected_launches[scenario]
     if bound_specs:
         assert "PYTEST_ADDOPTS" in bound_specs[0].env
         assert bound_specs[0].backend_config["pass_env"] == ("PYTEST_ADDOPTS",)
+    if expected_published:
+        assert bound_specs[0].local_argv == ("opencode", "run")
+        assert all(
+            spec.local_argv == ("/bin/sh", "-c", "pytest -q")
+            for spec in bound_specs[1:]
+        )
+        assert persisted_gate_handles == [
+            ("123e4567-e89b-42d3-a456-426614174002", 201, 101),
+            ("123e4567-e89b-42d3-a456-426614174003", 202, 102),
+        ]
+        assert ("push",) in publication.calls
+    if scenario == "branch_cleanup_exception":
+        assert result.review_ready is True
+        assert result.pr_url == "https://github.com/example/repo/pull/1"
+        assert result.reason == (
+            "post-publication bookkeeping failed: "
+            "authorized branch cleanup: branch cleanup failed"
+        )
+        assert ["chainlink", "issue", "label", "1410", "worklink:review"] in calls
+        assert ["chainlink", "issue", "label", "1410", "worklink:failed"] not in calls
+        assert ["chainlink", "issue", "label", "1410", "worklink:ready"] not in calls

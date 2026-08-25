@@ -702,6 +702,22 @@ class WorklinkRunner:
                 compute = LocalSubprocessComputeBackend.for_path_checkout(
                     get_identities().worklink_uid
                 )
+                checkout_fd = os.open(
+                    lease.path,
+                    os.O_RDONLY
+                    | os.O_DIRECTORY
+                    | os.O_CLOEXEC
+                    | getattr(os, "O_NOFOLLOW", 0),
+                )
+                try:
+                    publication = ControllerGitPublication.capture(
+                        checkout_fd,
+                        self.repo,
+                        lease.branch,
+                        self.home / "state" / "worklink" / "publication",
+                    )
+                finally:
+                    os.close(checkout_fd)
             if not lease.isolated_checkout:
                 _log_event(
                     "worklink_unsafe_backend_checkout",
@@ -843,7 +859,7 @@ class WorklinkRunner:
                 executor_report_dir=executor_report_dir,
             )
             delete_authorized_checkout = bool(
-                lease.worker_authorized and result.review_ready and result.pr_url
+                worker_uid_drop and result.review_ready and result.pr_url
             )
             if delete_authorized_checkout and publication is not None:
                 cleanup_errors: list[str] = []

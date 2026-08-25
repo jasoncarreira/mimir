@@ -293,6 +293,48 @@ async def test_client_names_stale_old_launch_contract_with_timeout(
 
 
 @pytest.mark.asyncio
+async def test_path_client_names_unsupported_operation_as_stale_executor(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    checkout = tmp_path / ".worklink" / "repo" / "41-2"
+    checkout.mkdir(parents=True)
+
+    class Peer:
+        def connect(self, _path: str) -> None:
+            pass
+
+        def getsockopt(self, *args: object) -> bytes:
+            return struct.pack("3i", 123, 0, 0)
+
+        def sendmsg(self, _buffers: list[bytes], _ancillary: object) -> None:
+            pass
+
+        def recv(self, _size: int) -> bytes:
+            return json.dumps({
+                "id": None,
+                "error": "unsupported worker operation",
+            }).encode()
+
+        def close(self) -> None:
+            pass
+
+    monkeypatch.setattr(socket, "SO_PEERCRED", getattr(socket, "SO_PEERCRED", 17), raising=False)
+    monkeypatch.setattr(socket, "socket", lambda *args: Peer())
+    client = WorkerClient.for_path_checkout(
+        checkout, issue_id=41, attempt=2, run_uid=1002
+    )
+
+    with pytest.raises(StaleWorkerExecutorError, match="rebuild the image and restart"):
+        await client.launch(
+            local_checkout=checkout,
+            argv=["true"],
+            env={},
+            identifier=str(uuid.uuid4()),
+            timeout_s=30,
+        )
+
+
+@pytest.mark.asyncio
 async def test_worker_process_requires_identity_bound_terminal_result(monkeypatch) -> None:
     identifier = str(uuid.uuid4())
 
@@ -380,7 +422,9 @@ def test_path_checkout_accepts_group_checkout_without_0700_boundary(
         "run_uid": 1002,
     })
     try:
-        assert os.path.samefile(f"/proc/self/fd/{fd}", checkout)
+        observed = os.fstat(fd)
+        expected = os.stat(checkout)
+        assert (observed.st_dev, observed.st_ino) == (expected.st_dev, expected.st_ino)
         assert stat.S_IMODE(checkout.parent.stat().st_mode) == 0o755
     finally:
         os.close(fd)
@@ -658,6 +702,32 @@ def test_executor_rejects_mismatched_launch_protocol_identity() -> None:
 
     with pytest.raises(RuntimeError, match=worker_exec._STALE_EXECUTOR_DIAGNOSTIC):
         worker_exec._handle_launch(object(), request, [-1, -1, -1])
+
+
+def test_executor_dispatches_path_launch_through_the_connection_handler(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    identifier = str(uuid.uuid4())
+    request = {"version": 1, "op": "launch_path", "id": identifier}
+    dispatched: list[tuple[dict[str, object], list[int]]] = []
+
+    class Connection:
+        def recvmsg(self, *args: object) -> tuple[bytes, list[object], int, None]:
+            return json.dumps(request).encode(), [], 0, None
+
+        def send(self, _data: bytes) -> None:
+            raise AssertionError("dispatch must not return an error")
+
+        def close(self) -> None:
+            pass
+
+    def handle(_connection: object, observed: dict[str, object], fds: list[int]) -> None:
+        dispatched.append((observed, fds))
+
+    monkeypatch.setattr(worker_exec, "_handle_launch", handle)
+    worker_exec.handle_connection(Connection())
+
+    assert dispatched == [(request, [])]
 
 
 def test_executor_rejects_fd_count_and_extra_request_fields() -> None:
