@@ -2859,18 +2859,26 @@ class Scheduler:
             close_merged_chainlinks_for_home,
             prune_stale_attempt_checkouts_for_home,
             reap_stale_claims_for_home,
+            report_foreign_owned_git_objects_for_home,
         )
         from .worklink.claims import ReapResult
+        from .worklink.identities import get_identities
 
         async def _fire() -> None:
-            def _reap() -> tuple[ReapResult, list[Path], list[object]]:
+            def _reap() -> tuple[ReapResult, list[Path], list[Path], list[object]]:
                 return (
                     reap_stale_claims_for_home(home),
+                    report_foreign_owned_git_objects_for_home(
+                        home, expected_uid=get_identities().mimir_uid
+                    )
+                    if os.environ.get("WORKLINK_REPO")
+                    or os.environ.get("MIMIR_WORKLINK_REPO")
+                    else [],
                     prune_stale_attempt_checkouts_for_home(home),
                     close_merged_chainlinks_for_home(home),
                 )
 
-            reap_result, pruned_paths, closed_chainlinks = await asyncio.to_thread(_reap)
+            reap_result, _, pruned_paths, closed_chainlinks = await asyncio.to_thread(_reap)
             await log_event(
                 "worklink_claims_reaped",
                 count=len(reap_result.reaped),

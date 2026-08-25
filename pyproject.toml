@@ -249,6 +249,9 @@ exclude = [
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+markers = [
+    "allow_empty_parametrize: permit an intentionally empty parameter set to skip",
+]
 # Report a stalled test early enough for repo_test to retain the traceback before
 # its 1800-second process bound. This reports only; it does not abort the test.
 faulthandler_timeout = 300
