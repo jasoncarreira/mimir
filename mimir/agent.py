@@ -382,6 +382,16 @@ def _initialize_ifc_labels(
     canonical_principal = event.author
     source_kind = "channel"
     registered_service = get_event_service_principal(event)
+    poller_own_channel = (
+        event.trigger == "poller"
+        and registered_service is not None
+        and event.service_principal == registered_service.canonical
+        and HTTP_EVENT_INGRESS_EXTRA_KEY not in (
+            event.extra if isinstance(event.extra, dict) else {}
+        )
+        and isinstance(registered_service.channel_memory_directory, str)
+        and event.channel_id == registered_service.channel_memory_directory
+    )
     if (
         canonical_principal is None
         and registered_service is not None
@@ -461,10 +471,16 @@ def _initialize_ifc_labels(
             for source in event.ifc_labels.sources
         ):
             integrity = Integrity.TRUSTED
+    if poller_own_channel:
+        # The synthetic queue channel is framework-owned routing metadata, not
+        # poller content. Exact equality with the server-carried authority's
+        # configured memory directory establishes that boundary; per-item
+        # labels already merged above continue to classify external content.
+        integrity = Integrity.TRUSTED
     # The boundary service authors the summary; it does not turn the completed
     # session into a fresh external ingest. Inherited session sources remain on
     # the carrier and continue to gate channel/network egress.
-    boundary_synthesis = event.trigger == "saga_session_end"
+    informational_ingress = event.trigger == "saga_session_end" or poller_own_channel
     labels = labels.with_source(SourceLabel(
         principal=canonical_principal,
         domain=domain,
@@ -478,7 +494,7 @@ def _initialize_ifc_labels(
         integrity=integrity,
         integrity_effect=(
             IntegrityEffect.INFORMATIONAL
-            if boundary_synthesis else IntegrityEffect.ACTIVE_INGEST
+            if informational_ingress else IntegrityEffect.ACTIVE_INGEST
         ),
     ))
 

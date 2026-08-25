@@ -8265,9 +8265,9 @@ _SELF_AUTHORED_FILE_ROOTS = frozenset({
     "docs",
     "memory",
     "prompts",
-    "skills",
     "state",
 })
+_FILE_INTEGRITY_RECORDED_ROOTS = _SELF_AUTHORED_FILE_ROOTS | {"skills"}
 _FILE_INTEGRITY_EXCLUDED_SUBTREES = frozenset({("state", "pollers")})
 _FILE_INTEGRITY_DECLASSIFICATIONS_KEY = "__declassifications__"
 _FILE_INTEGRITY_EPOCH_KEY = "__ledger_epoch_ns__"
@@ -8411,9 +8411,12 @@ def _filesystem_result_integrity(
 
     if relative.parts and relative.parts[0] in _SELF_AUTHORED_FILE_ROOTS:
         # These roots are scaffolded by ``mimir setup`` and contain first-party
-        # reference material. Trust still comes from persisted provenance below:
-        # explicit writer records win, while the ledger epoch distinguishes
-        # pre-existing operator files from later writes that bypassed the tools.
+        # reference material. Operator- or agent-authored files under ``skills``
+        # do not receive this default merely because of their location; only
+        # shipped ``.mimir_builtin_skills`` are first-party reference material.
+        # Trust still comes from persisted provenance below: explicit writer
+        # records win, while the ledger epoch distinguishes pre-existing files
+        # from later writes that bypassed the protected tool boundary.
         #
         # Poller subprocesses write this tree directly, outside the protected
         # tool boundary, and may persist attacker-derived cursor/event fields.
@@ -8542,7 +8545,7 @@ def record_file_write_integrity(
         relative = resource.relative_to(home)
     except (OSError, RuntimeError, ValueError):
         return False
-    if not relative.parts or relative.parts[0] not in _SELF_AUTHORED_FILE_ROOTS:
+    if not relative.parts or relative.parts[0] not in _FILE_INTEGRITY_RECORDED_ROOTS:
         return True
     if relative.parts[0:2] in _FILE_INTEGRITY_EXCLUDED_SUBTREES:
         return True

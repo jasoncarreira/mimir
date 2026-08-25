@@ -320,6 +320,79 @@ def test_poller_trust_requires_service_stamp_and_non_http_ingress(
     assert ingress.integrity == expected_integrity
 
 
+@pytest.mark.parametrize(
+    ("channel_id", "expected_integrity", "expected_effect"),
+    [
+        ("poller:github-activity", "trusted", "informational"),
+        ("poller:other", "untrusted", "active_ingest"),
+    ],
+)
+def test_poller_own_channel_trust_requires_configured_memory_directory(
+    channel_id: str,
+    expected_integrity: str,
+    expected_effect: str,
+) -> None:
+    service = ServicePrincipal(
+        canonical="poller:github-activity",
+        trigger="poller",
+        channel_memory_directory="poller:github-activity",
+    )
+    event = AgentEvent(
+        trigger="poller",
+        channel_id=channel_id,
+        source="poller",
+        service_principal=service.canonical,
+        service_authority=service,
+    )
+
+    labels = _initialize_ifc_labels(event)
+    source = next(iter(labels.sources))
+
+    assert (source.integrity, source.integrity_effect) == (
+        expected_integrity, expected_effect,
+    )
+    assert labels.has_untrusted_active_ingest is (expected_integrity == "untrusted")
+
+
+def test_poller_own_channel_does_not_declassify_external_item() -> None:
+    service = ServicePrincipal(
+        canonical="poller:github-activity",
+        trigger="poller",
+        channel_memory_directory="poller:github-activity",
+    )
+    external = SourceLabel(
+        principal="service:poller:github-activity",
+        domain="poller_payload",
+        resource_id="github:pr:7",
+        bridge_instance="poller",
+        sensitivity="internal",
+        authorized_principals=frozenset({"service:poller:github-activity"}),
+        source_kind="service",
+        integrity="untrusted",
+        integrity_effect="active_ingest",
+    )
+    event = AgentEvent(
+        trigger="poller",
+        channel_id="poller:github-activity",
+        source="poller",
+        service_principal=service.canonical,
+        service_authority=service,
+        ifc_labels=InformationFlowLabels().with_source(external),
+    )
+
+    labels = _initialize_ifc_labels(event)
+    own_channel = next(
+        source for source in labels.sources
+        if source.resource_id == event.channel_id
+    )
+
+    assert (own_channel.integrity, own_channel.integrity_effect) == (
+        "trusted", "informational",
+    )
+    assert external in labels.sources
+    assert labels.has_untrusted_active_ingest is True
+
+
 def test_mixed_principal_sources_fail_closed_without_declassification():
     labels = _merge_ifc_labels(_labels(), _labels(principal="user-2"))
     decision = SinkGate.check_sink_flow(
@@ -929,6 +1002,60 @@ def test_self_authored_heartbeat_context_admits_autonomous_sinks(
         assert decision.allowed is True, (tool, decision.reason)
 
 
+@pytest.mark.parametrize(
+    "relative",
+    [
+        ".mimir_builtin_skills/github/SKILL.md",
+        "memory/channels/poller:github-activity/notes.md",
+    ],
+)
+def test_framework_and_agent_owned_files_are_trusted_informational(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    relative: str,
+) -> None:
+    monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
+    target = tmp_path / relative
+    target.parent.mkdir(parents=True)
+    target.write_text("first-party content\n", encoding="utf-8")
+
+    source = protected_result_source(
+        _auth(), principal="filesystem", domain="filesystem",
+        resource_id=str(target), bridge_instance="filesystem",
+    )
+
+    assert (source.integrity, source.integrity_effect) == (
+        "trusted", "informational",
+    )
+    assert InformationFlowLabels().with_source(
+        source
+    ).has_untrusted_active_ingest is False
+
+
+@pytest.mark.parametrize(
+    "relative",
+    ["skills/operator/SKILL.md", "attachments/upload.txt"],
+)
+def test_home_location_does_not_make_external_or_operator_files_trusted(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    relative: str,
+) -> None:
+    monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
+    target = tmp_path / relative
+    target.parent.mkdir(parents=True)
+    target.write_text("not framework-owned\n", encoding="utf-8")
+
+    source = protected_result_source(
+        _auth(), principal="filesystem", domain="filesystem",
+        resource_id=str(target), bridge_instance="filesystem",
+    )
+
+    assert (source.integrity, source.integrity_effect) == (
+        "untrusted", "active_ingest",
+    )
+
+
 @pytest.mark.parametrize("subtree", sorted(_FILE_INTEGRITY_EXCLUDED_SUBTREES))
 @pytest.mark.parametrize("name", [".recovery.json", "cursor.json"])
 def test_poller_managed_state_is_untrusted_active_ingest(
@@ -961,13 +1088,13 @@ def test_ledger_epoch_distinguishes_seeded_file_from_unrecorded_shell_write(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
-    seeded = tmp_path / "skills" / "operator" / "SKILL.md"
+    seeded = tmp_path / "memory" / "operator" / "notes.md"
     seeded.parent.mkdir(parents=True)
     seeded.write_text("operator-authored content", encoding="utf-8")
 
     assert initialize_file_integrity_ledger(tmp_path) is True
 
-    shell_written = tmp_path / "skills" / "evil" / "SKILL.md"
+    shell_written = tmp_path / "memory" / "evil" / "notes.md"
     subprocess.run(
         [
             "sh", "-c",
@@ -1016,7 +1143,7 @@ def test_malformed_nonpositive_and_bool_ledger_epochs_fail_closed(
     file_ctime_ns: int,
 ) -> None:
     monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
-    target = tmp_path / "skills" / "operator" / "SKILL.md"
+    target = tmp_path / "memory" / "operator" / "notes.md"
     target.parent.mkdir(parents=True)
     target.write_text("unrecorded content", encoding="utf-8")
     metadata = tmp_path / ".mimir" / "file-integrity.json"
@@ -1087,7 +1214,7 @@ def test_unstatable_unrecorded_file_fails_closed(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    target = tmp_path / "skills" / "operator" / "SKILL.md"
+    target = tmp_path / "memory" / "operator" / "notes.md"
     target.parent.mkdir(parents=True)
     target.write_text("unrecorded content", encoding="utf-8")
     metadata = tmp_path / ".mimir" / "file-integrity.json"
@@ -1105,7 +1232,7 @@ def test_unstatable_unrecorded_file_fails_closed(
 
     monkeypatch.setattr(Path, "stat", fail_target_stat)
 
-    assert _persisted_file_integrity(tmp_path, Path("skills/operator/SKILL.md")) == (
+    assert _persisted_file_integrity(tmp_path, Path("memory/operator/notes.md")) == (
         "untrusted"
     )
 
@@ -1116,13 +1243,13 @@ def test_ledger_epoch_migration_preserves_existing_untrusted_marks(
     metadata = tmp_path / ".mimir" / "file-integrity.json"
     metadata.parent.mkdir(parents=True)
     metadata.write_text(
-        '{"skills/tainted.md":"untrusted"}\n', encoding="utf-8",
+        '{"memory/tainted.md":"untrusted"}\n', encoding="utf-8",
     )
 
     assert initialize_file_integrity_ledger(tmp_path) is True
 
     payload = json.loads(metadata.read_text(encoding="utf-8"))
-    assert payload["skills/tainted.md"] == "untrusted"
+    assert payload["memory/tainted.md"] == "untrusted"
     assert isinstance(payload["__ledger_epoch_ns__"], int)
 
 
