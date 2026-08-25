@@ -93,6 +93,9 @@ _OUTCOME_SCAN_GRACE_SECONDS = 5.0
 
 # Re-enqueue callback shape, matching ``run_poller``'s ``enqueue`` param.
 EnqueueFn = Callable[[AgentEvent], Awaitable[bool]]
+# ``None`` means the source could not determine relevance. Recovery must fail
+# open in that case so transient source/API failures cannot discard real work.
+RelevanceFn = Callable[[AgentEvent], Awaitable[bool | None]]
 
 
 def _utc_now() -> datetime:
@@ -488,6 +491,21 @@ async def _emit_gave_up(poller_name: str, channel_id: str, entry: dict, source_i
     )
 
 
+async def _is_stale(event: AgentEvent, relevance_check: RelevanceFn | None) -> bool:
+    """Return true only when the source authoritatively rejects the subject."""
+    if relevance_check is None:
+        return False
+    try:
+        return await relevance_check(event) is False
+    except Exception as exc:  # noqa: BLE001 - relevance failures must fail open
+        log.warning(
+            "poller recovery: relevance check failed open for %s: %s",
+            event.source_id,
+            exc,
+        )
+        return False
+
+
 async def reconcile_failed_turns(
     *,
     poller_name: str,
@@ -498,6 +516,7 @@ async def reconcile_failed_turns(
     service_principal: str | None = None,
     service_authority: Any = None,
     recover_failed_turns: bool = True,
+    relevance_check: RelevanceFn | None = None,
     max_attempts: int = DEFAULT_MAX_RECOVERY_ATTEMPTS,
     stash_ttl_hours: float = DEFAULT_STASH_TTL_HOURS,
 ) -> dict:
@@ -526,13 +545,18 @@ async def reconcile_failed_turns(
     outcome's own timestamp — never wall-now — so an outcome written
     between this read and the state save is picked up next cycle.
 
-    Returns a ``{reenqueued, completed, gave_up, deferred, expired, dropped}``
-    summary (for the ``poller_recovery`` log event + tests). Best-effort
-    throughout — any I/O hiccup is logged and the poll cycle continues.
+    Before either replay path, an optional source-owned ``relevance_check`` can
+    reject a subject that is no longer actionable. ``False`` drops it as stale;
+    ``True`` or ``None`` preserves normal recovery. Exceptions also fail open.
+
+    Returns a ``{reenqueued, completed, gave_up, deferred, expired, dropped,
+    stale_dropped}`` summary (for the ``poller_recovery`` log event + tests).
+    Best-effort throughout — any I/O hiccup is logged and the poll cycle continues.
     """
     summary = {
         "reenqueued": 0, "completed": 0, "gave_up": 0,
         "deferred": 0, "expired": 0, "dropped": 0,
+        "stale_dropped": 0,
         "unclean_reenqueued": 0,
     }
     state = await asyncio.to_thread(_load_state, persist_dir)
@@ -648,6 +672,19 @@ async def reconcile_failed_turns(
                         watermark = max(watermark, ts)
                     continue
                 attempts = int(entry.get("attempts", 0)) + 1
+                event = _restore_event(
+                    entry,
+                    poller_name=poller_name,
+                    channel_id=channel_id,
+                    service_principal=service_principal,
+                    service_authority=service_authority,
+                )
+                if event is not None and await _is_stale(event, relevance_check):
+                    del inflight[source_id]
+                    summary["stale_dropped"] += 1
+                    if isinstance(ts, str):
+                        watermark = max(watermark, ts)
+                    continue
                 if attempts > max_attempts:
                     # Wedge guard hit. Emit best-effort (#318): a log
                     # failure must not strand the entry — we still give up.
@@ -661,13 +698,6 @@ async def reconcile_failed_turns(
                     del inflight[source_id]
                     summary["gave_up"] += 1
                 else:
-                    event = _restore_event(
-                        entry,
-                        poller_name=poller_name,
-                        channel_id=channel_id,
-                        service_principal=service_principal,
-                        service_authority=service_authority,
-                    )
                     if event is None:
                         # Unreconstructable stash (older schema) — drop so we
                         # don't loop on it forever.
@@ -730,6 +760,17 @@ async def reconcile_failed_turns(
             ):
                 continue
             attempts = int(entry.get("attempts", 0)) + 1
+            event = _restore_event(
+                entry,
+                poller_name=poller_name,
+                channel_id=channel_id,
+                service_principal=service_principal,
+                service_authority=service_authority,
+            )
+            if event is not None and await _is_stale(event, relevance_check):
+                del inflight[source_id]
+                summary["stale_dropped"] += 1
+                continue
             if attempts > max_attempts:
                 try:
                     await _emit_gave_up(poller_name, channel_id, entry, source_id)
@@ -741,13 +782,6 @@ async def reconcile_failed_turns(
                 del inflight[source_id]
                 summary["gave_up"] += 1
                 continue
-            event = _restore_event(
-                entry,
-                poller_name=poller_name,
-                channel_id=channel_id,
-                service_principal=service_principal,
-                service_authority=service_authority,
-            )
             if event is None:
                 del inflight[source_id]
                 summary["dropped"] += 1

@@ -46,6 +46,7 @@ from mimir.pollers import (
     _github_author_is_trusted,
     _github_content_author,
     _github_framework_trigger_is_trusted,
+    _github_recovery_relevance_check,
     _parse_poller_authority,
     discover_pollers,
     GITHUB_TRUST_ATTEMPTS_PER_FIRE,
@@ -2374,6 +2375,144 @@ async def test_run_poller_reconciles_failed_turn_before_next_poll(
     assert recovery_events[-1]["reenqueued"] == 1
     assert recovery_events[-1]["expired"] == 0
     assert recovery_events[-1]["dropped"] == 0
+
+
+@pytest.mark.parametrize(
+    ("payload", "expected"),
+    [
+        ({"state": "open", "merged": False}, True),
+        ({"state": "closed", "merged": False}, False),
+        ({"state": "closed", "merged": True}, False),
+    ],
+    ids=["open", "closed", "merged"],
+)
+async def test_github_recovery_relevance_uses_live_pr_state(
+    monkeypatch, payload, expected,
+):
+    calls = []
+
+    def attest(endpoint, token):
+        calls.append((endpoint, token))
+        return 200, payload
+
+    monkeypatch.setattr("mimir.pollers._github_api_attestation", attest)
+    check = _github_recovery_relevance_check("token")
+    event = AgentEvent(
+        trigger="poller",
+        channel_id="poller:github-activity",
+        content="review",
+        source_id="sid",
+        extra={"items": [{
+            "event_type": "pr_review_requested",
+            "repo": "owner/repo",
+            "number": 42,
+        }]},
+    )
+
+    assert await check(event) is expected
+    assert calls == [("repos/owner/repo/pulls/42", "token")]
+
+
+async def test_github_recovery_relevance_api_failure_is_indeterminate(monkeypatch):
+    monkeypatch.setattr("mimir.pollers._github_api_attestation", lambda *args: None)
+    check = _github_recovery_relevance_check("token")
+    event = AgentEvent(
+        trigger="poller",
+        channel_id="poller:github-activity",
+        content="review",
+        source_id="sid",
+        extra={"items": [{
+            "event_type": "pr_opened", "repo": "owner/repo", "number": 42,
+        }]},
+    )
+
+    assert await check(event) is None
+
+
+async def test_github_recovery_relevance_skips_non_pr_and_caches_distinct_prs(
+    monkeypatch,
+):
+    calls = []
+
+    def attest(endpoint, token):
+        calls.append(endpoint)
+        return 200, {"state": "closed"}
+
+    monkeypatch.setattr("mimir.pollers._github_api_attestation", attest)
+    check = _github_recovery_relevance_check("token")
+    issue = AgentEvent(
+        trigger="poller", channel_id="poller:github-activity", content="issue",
+        source_id="issue", extra={"items": [{
+            "event_type": "issue_comment",
+            "repo": "owner/repo",
+            "number": "42",
+            "url": "https://github.com/owner/repo/issues/42#issuecomment-1",
+        }]},
+    )
+    pr = replace(issue, source_id="pr", extra={"items": [{
+        "event_type": "issue_comment",
+        "repo": "owner/repo",
+        "number": "42",
+        "url": "https://github.com/owner/repo/pull/42#issuecomment-1",
+    }]})
+
+    assert await check(issue) is None
+    assert await check(pr) is False
+    assert await check(pr) is False
+    assert calls == ["repos/owner/repo/pulls/42"]
+
+
+@pytest.mark.asyncio
+async def test_run_github_poller_logs_stale_recovery_drop(
+    tmp_path: Path, home: Path, monkeypatch,
+) -> None:
+    skill_dir = tmp_path / "github-poller"
+    persist_dir = tmp_path / "persist" / "github-activity"
+    _install_script(skill_dir, "poller.py", "pass\n")
+    cfg = PollerConfig(
+        name="github-activity",
+        command=f"{sys.executable} poller.py",
+        cron="* * * * *",
+        env={},
+        skill_dir=skill_dir,
+        persist_dir=persist_dir,
+        recover_failed_turns=True,
+    )
+    source_id = "poller:github-activity:stale"
+    prior = AgentEvent(
+        trigger="poller",
+        channel_id="poller:github-activity",
+        content="review merged PR",
+        source="poller",
+        source_id=source_id,
+        extra={"poller_name": "github-activity", "items": [{
+            "event_type": "pr_opened", "repo": "owner/repo", "number": 42,
+        }]},
+    )
+    await poller_recovery.stash_enqueued_event(
+        persist_dir, prior, enqueued_at="2026-06-04T07:59:00+00:00",
+    )
+    with (home / "logs" / "events.jsonl").open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps({
+            "type": "turn_failed",
+            "timestamp": "2026-06-04T08:00:00+00:00",
+            "channel_id": "poller:github-activity",
+            "source_id": source_id,
+        }) + "\n")
+    monkeypatch.setattr(
+        "mimir.pollers._github_api_attestation",
+        lambda *args: (200, {"state": "closed", "merged": True}),
+    )
+
+    enqueue = _CapturingEnqueue()
+    await run_poller(cfg, enqueue=enqueue)
+
+    assert enqueue.events == []
+    assert poller_recovery._load_state(persist_dir)["inflight"] == {}
+    recovery = [event for event in _read_events(home) if event["type"] == "poller_recovery"]
+    assert recovery[-1]["stale_dropped"] == 1
+    assert recovery[-1]["gave_up"] == 0
+    assert not any(event["type"] == "poller_turn_gave_up" for event in _read_events(home))
 
 
 @pytest.mark.asyncio
