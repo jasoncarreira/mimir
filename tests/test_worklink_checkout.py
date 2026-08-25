@@ -47,6 +47,10 @@ def test_create_worktree_uses_attempt_scoped_branch_and_path(tmp_path: Path) -> 
     assert lease.base_ref == "main"
     assert lease.local_base == "main"
     assert calls == [
+        [
+            "git", "-C", str(tmp_path), "status", "--porcelain=v1", "-z",
+            "--untracked-files=all", "--ignored=no",
+        ],
         ["git", "-C", str(tmp_path), "fetch", "origin", "main"],
         ["git", "-C", str(tmp_path), "rev-parse", "--verify", "origin/main"],
         [
@@ -214,6 +218,119 @@ def _repo_with_main(tmp_path: Path) -> Path:
     return repo
 
 
+def _base_refusal(repo: Path) -> tuple[str, dict[str, object]]:
+    events: list[tuple[str, dict[str, object]]] = []
+    with pytest.raises(RuntimeError) as raised:
+        create_worktree(
+            repo,
+            issue_id=1459,
+            attempt=1,
+            event_logger=lambda name, **payload: events.append((name, payload)),
+        )
+    assert len(events) == 1
+    return str(raised.value), events[0]
+
+
+def test_clean_base_is_accepted_without_an_event(tmp_path: Path) -> None:
+    repo = _repo_with_main(tmp_path)
+    events: list[tuple[str, dict[str, object]]] = []
+
+    lease = create_worktree(
+        repo,
+        issue_id=1459,
+        attempt=1,
+        event_logger=lambda name, **payload: events.append((name, payload)),
+    )
+
+    assert lease.path.exists()
+    assert events == []
+
+
+def test_staged_addition_refuses_base_and_names_path(tmp_path: Path) -> None:
+    repo = _repo_with_main(tmp_path)
+    (repo / "staged.txt").write_text("foreign\n", encoding="utf-8")
+    _git(repo, "add", "staged.txt")
+
+    message, event = _base_refusal(repo)
+
+    assert "staged (1): 'staged.txt'" in message
+    assert event == (
+        "worklink_base_repo_refused",
+        {
+            "repo": str(repo),
+            "reason": "dirty",
+            "detail": "1 dirty path(s); staged (1): 'staged.txt'",
+            "dirty_count": 1,
+            "staged_count": 1,
+            "staged_paths": ["staged.txt"],
+            "unstaged_count": 0,
+            "unstaged_paths": [],
+            "untracked_count": 0,
+            "untracked_paths": [],
+            "sample_limit": 20,
+        },
+    )
+
+
+def test_unstaged_modification_refuses_base_and_names_path(tmp_path: Path) -> None:
+    repo = _repo_with_main(tmp_path)
+    (repo / "shared.txt").write_text("foreign\n", encoding="utf-8")
+
+    message, event = _base_refusal(repo)
+
+    assert "unstaged (1): 'shared.txt'" in message
+    assert event[1]["unstaged_paths"] == ["shared.txt"]
+
+
+def test_ignored_only_untracked_content_is_accepted(tmp_path: Path) -> None:
+    repo = _repo_with_main(tmp_path)
+    (repo / ".gitignore").write_text(".venv/\n.worktrees/\n", encoding="utf-8")
+    _git(repo, "add", ".gitignore")
+    _git(repo, "commit", "-q", "-m", "ignore local directories")
+    (repo / ".venv").mkdir()
+    (repo / ".venv" / "python").write_text("ignored\n", encoding="utf-8")
+    (repo / ".worktrees").mkdir()
+    (repo / ".worktrees" / "attempt").write_text("ignored\n", encoding="utf-8")
+    events: list[tuple[str, dict[str, object]]] = []
+
+    lease = create_worktree(
+        repo,
+        issue_id=1459,
+        attempt=1,
+        event_logger=lambda name, **payload: events.append((name, payload)),
+    )
+
+    assert lease.path.exists()
+    assert events == []
+
+
+def test_git_status_ownership_failure_refuses_instead_of_reading_empty_stdout(
+    tmp_path: Path,
+) -> None:
+    events: list[tuple[str, dict[str, object]]] = []
+
+    def runner(args: Sequence[str]) -> subprocess.CompletedProcess[str]:
+        assert args[3] == "status"
+        return subprocess.CompletedProcess(
+            list(args),
+            128,
+            stdout="",
+            stderr="fatal: detected dubious ownership in repository\n",
+        )
+
+    with pytest.raises(RuntimeError, match="status_failed.*dubious ownership"):
+        create_worktree(
+            tmp_path,
+            issue_id=1459,
+            attempt=1,
+            runner=runner,
+            event_logger=lambda name, **payload: events.append((name, payload)),
+        )
+
+    assert events[0][0] == "worklink_base_repo_refused"
+    assert events[0][1]["reason"] == "status_failed"
+
+
 def test_default_factory_entrypoint_resolves_outside_allocated_checkout(
     tmp_path: Path,
 ) -> None:
@@ -306,6 +423,10 @@ def test_base_fetch_failure_gates_build_and_logs_real_reason(tmp_path: Path) -> 
     # attempts). Here the probe finds nothing, so the fetch must NOT be retried —
     # a genuine network failure should fail closed immediately, not double up.
     assert calls == [
+        [
+            "git", "-C", str(tmp_path), "status", "--porcelain=v1", "-z",
+            "--untracked-files=all", "--ignored=no",
+        ],
         ["git", "-C", str(tmp_path), "fetch", "origin", "main"],
         ["git", "-C", str(tmp_path), "for-each-ref", "--format=%(refname) %(objectname)"],
     ]
