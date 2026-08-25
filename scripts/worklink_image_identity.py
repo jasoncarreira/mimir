@@ -430,15 +430,27 @@ for name in ("pre-commit", "pre-push"):
     hook = hooks / name
     hook.write_text("#!/bin/sh\ntouch /tmp/worklink-publication-attack\nexit 91\n")
     hook.chmod(0o755)
-subprocess.run(["git", "config", "core.hooksPath", str(hooks.resolve())], check=True)
-subprocess.run(
-    ["git", "config", "credential.helper", "!f() { touch /tmp/worklink-publication-attack; echo username=worker; echo password=hostile; }; f"],
-    check=True,
-)
-subprocess.run(
-    ["git", "remote", "set-url", "--push", "origin", "/tmp/worklink-hostile.git"],
-    check=True,
-)
+# The worker runs as ``worklink`` while the checkout is owned by ``mimir``, so bare
+# git refuses with "detected dubious ownership" and plants nothing. Name the checkout
+# explicitly and mark it safe: a hostile worker would do exactly this, and a proof that
+# cannot plant proves nothing.
+checkout = str(Path.cwd().resolve())
+git = ["git", "-c", f"safe.directory={checkout}", "-C", checkout]
+hostile_helper = "!f() { touch /tmp/worklink-publication-attack; echo username=worker; echo password=hostile; }; f"
+subprocess.run([*git, "config", "--local", "core.hooksPath", str(hooks.resolve())], check=True)
+subprocess.run([*git, "config", "--local", "credential.helper", hostile_helper], check=True)
+subprocess.run([*git, "remote", "set-url", "--push", "origin", "/tmp/worklink-hostile.git"], check=True)
+
+# Read every planted value back. Without this the proof passes vacuously whenever the
+# plant silently fails, which is the failure mode it exists to rule out.
+def planted(args, expected):
+    got = subprocess.run([*git, *args], capture_output=True, text=True, check=True).stdout.strip()
+    if expected not in got:
+        raise SystemExit(f"hostile setup did not persist: {args} -> {got!r}")
+
+planted(["config", "--local", "--get", "core.hooksPath"], str(hooks.resolve()))
+planted(["config", "--local", "--get", "credential.helper"], "worklink-publication-attack")
+planted(["remote", "get-url", "--push", "origin"], "/tmp/worklink-hostile.git")
 print(f"build-euid={os.geteuid()}")
 PY
             chmod 0755 /tmp/opencode-proof
