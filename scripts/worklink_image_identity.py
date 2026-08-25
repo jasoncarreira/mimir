@@ -195,6 +195,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import subprocess
 import uuid
 
 from mimir.tools.registry import set_spawn_config, spawn_open_code
@@ -215,14 +216,22 @@ async def main():
         "MIMIR_MODEL_SPEC": "proof:model",
     })
     set_spawn_config({
-        "default_cwd": Path("/home/mimir"),
+        "default_cwd": SEED,
         "artifact_root": ARTIFACTS,
         "opencode_config_path": CONFIG,
     })
     source_head = (SEED / ".git/HEAD").read_bytes()
-    source_status = os.popen(
-        "git -C /workspace/mimir status --porcelain=v1 -z"
-    ).read()
+
+    def seed_status() -> bytes:
+        return subprocess.run(
+            ["git", "-C", str(SEED), "status", "--porcelain=v1", "-z"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=True,
+        ).stdout
+
+    source_status = seed_status()
     raw = await spawn_open_code.ainvoke({
         "prompt": "generate and execute the containment proof payload",
         "cwd": str(SEED),
@@ -275,7 +284,7 @@ async def main():
         raise RuntimeError("generated OpenCode payload changed controller canary")
     if (SEED / ".git/HEAD").read_bytes() != source_head:
         raise RuntimeError("spawn changed the seed repository HEAD")
-    if os.popen("git -C /home/mimir/worklink-source status --porcelain=v1 -z").read() != source_status:
+    if seed_status() != source_status:
         raise RuntimeError("spawn changed the seed repository working tree")
     for path in sorted(ARTIFACTS.rglob("*"), reverse=True):
         if path.is_file() or path.is_symlink():

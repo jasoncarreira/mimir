@@ -6139,7 +6139,7 @@ def test_worker_capabilities_close_in_order_and_retain_non_success(
 
     assert closed == ["publication", "authorization"]
     assert checkout.exists() is (not delete_checkout)
-    assert boundary.exists() is (not delete_checkout)
+    assert boundary.exists()
     if not delete_checkout:
         assert (checkout / "output.txt").read_text() == "worker output\n"
 
@@ -6168,7 +6168,8 @@ def test_worker_capability_cleanup_tolerates_entry_removed_concurrently(
     orchestrator._close_attempt_capabilities(None, None, checkout, delete_checkout=True)
 
     assert raced
-    assert not boundary.exists()
+    assert not checkout.exists()
+    assert boundary.exists()
 
 
 @pytest.mark.parametrize(
@@ -6199,8 +6200,13 @@ def test_authorized_runner_closes_real_attempt_capabilities(
 
     repo = tmp_path / "repo"
     repo.mkdir()
-    checkout = tmp_path / ("a" * 64) / "1410-1" / "checkout"
+    checkout_root = tmp_path / ".worklink" / repo.name
+    checkout = checkout_root / "1410-1"
+    sibling_checkout = checkout_root / "1411-1"
     checkout.mkdir(parents=True)
+    sibling_checkout.mkdir()
+    sibling_marker = sibling_checkout / "sibling-canary"
+    sibling_marker.write_text("keep me\n")
     (checkout / ".git" / "objects").mkdir(parents=True)
     lifecycle = []
     checkout_kwargs = {}
@@ -6439,6 +6445,7 @@ def test_authorized_runner_closes_real_attempt_capabilities(
         "completed" if expected_published else ("blocked" if scenario == "blocked" else "failed")
     )
     assert checkout.exists() is (not expected_published)
+    assert sibling_marker.read_text() == "keep me\n"
     expected_launches = {
         "work_spec_exception": 0,
         "pre_launch_exception": 1,

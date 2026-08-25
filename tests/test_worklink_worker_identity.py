@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import runpy
 from pathlib import Path
 
 
@@ -61,6 +62,18 @@ def test_executor_service_recreates_ephemeral_socket_layout() -> None:
     run = (SERVICE / "run").read_text(encoding="utf-8")
     assert "install -d -o root -g root -m 0711 /run/mimir-worklink" in run
     assert "install -d -o root -g mimir -m 0710 /run/mimir-worklink/socket" in run
+
+
+def test_spawn_image_proof_uses_one_checked_seed_tree() -> None:
+    namespace = runpy.run_path(ROOT / "scripts/worklink_image_identity.py")
+    spawn_proof = namespace["SPAWN_PROOF"]
+
+    compile(spawn_proof, "SPAWN_PROOF", "exec")
+    assert '"default_cwd": SEED' in spawn_proof
+    assert '["git", "-C", str(SEED), "status", "--porcelain=v1", "-z"]' in spawn_proof
+    assert "def seed_status() -> bytes:" in spawn_proof
+    assert "check=True" in spawn_proof
+    assert "/home/mimir/worklink-source" not in spawn_proof
 
 
 def test_ci_runs_the_committed_live_image_proof() -> None:

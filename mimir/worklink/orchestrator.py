@@ -2781,7 +2781,9 @@ def _close_attempt_capabilities(
                 authorization.close()
         finally:
             if delete_checkout and checkout is not None:
-                rmtree_missing_ok(checkout.parent)
+                # Path-addressed attempts are siblings under one repository root.
+                # Delete only this attempt; removing the parent destroys concurrent runs.
+                rmtree_missing_ok(checkout)
 
 
 def _release_issue_and_clear_run_state(
