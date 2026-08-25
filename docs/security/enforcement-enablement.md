@@ -543,12 +543,21 @@ some request field looks like a payload:
 - **Destination-safe egress is taint-independent.** `fetch_url` carries no
   model-controlled data out: the destination must match an exact approved URL,
   the request is GET-only, there is no model-supplied body or arbitrary header,
-  and every redirect hop is re-checked against the same allowlist. `web_search`
-  reaches one fixed, operator-pre-approved search service; approving that tool
-  includes accepting that its query is visible to that trusted provider. These
-  tools remain usable after untrusted active ingest. The choice/order/timing of
+  and every redirect hop is re-checked against the same allowlist. `web_search` is
+  a deliberate, distinct exception: its model-composed query is an accepted
+  outbound channel because it reaches only one operator-fixed trusted service.
+  Its results remain untrusted active ingest, which taints its own turn; gating
+  the query would therefore cap every research turn at one search, so gating is
+  not an available option. The `fetch_url` trailing-`/*` mitigation does not
+  transfer: search has no model-chosen destination to narrow to an exact URL,
+  only a model-chosen query to the fixed endpoint. This acceptance, like the
+  trusted-operator `shell_exec` allowance in `access_control.py`, is limited to
+  the current single-operator posture. It is unsafe under untrusted multi-user
+  chat, where an attacker could induce a tainted turn to encode data into a
+  query. Search result labelling is unchanged: trusting the service transport
+  does not trust the third-party content it returns. The choice/order/timing of
   approved fetches is a low-bandwidth invocation-pattern channel that this
-  single-operator threat model explicitly accepts.
+  single-operator threat model also explicitly accepts.
 - **Audience-bearing egress stays behind the turn-taint gate.** `webhook` and
   `http_request` can send a free-form model body to an approved URL that may be
   a human or multi-party audience, so exact destination approval is necessary
@@ -561,8 +570,9 @@ reads trusted and untrusted content together and emits new strings. For the
 remaining audience-bearing sinks, conservatively use the turn's integrity
 state: a model-composed body/args is allowed only before any untrusted
 active-ingest source, otherwise blocked or one-use declassified. This does not
-apply to `fetch_url` or `web_search`; their destination controls are the
-security boundary.
+apply to exact/session-approved `fetch_url` destinations. It also does not apply
+to `web_search` under the explicit fixed-service, single-operator decision above;
+that exception accepts the query channel rather than claiming it does not exist.
 
 #### Operator-owned MCP trust posture
 

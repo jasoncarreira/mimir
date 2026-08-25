@@ -115,9 +115,11 @@ Trust/taint model: Content that is both untrusted and actively ingested this tur
 unbounded/audience egress, and model-emitted egress payloads; auto-recall is \
 informational and never gates.
 
-- ``fetch_url`` exact/session-approved URLs and ``web_search``'s fixed service are
-  destination-safe and remain usable regardless of turn taint. ``fetch_url`` URLs
-  admitted only by a trailing ``/*`` scope are turn-taint gated.
+- ``fetch_url`` exact/session-approved URLs remain usable regardless of turn taint;
+  URLs admitted only by a trailing ``/*`` scope are turn-taint gated.
+- ``web_search`` sends its model-composed query only to one operator-fixed service
+  and remains usable regardless of turn taint. Its results are untrusted active
+  ingest, so gating it would limit a research turn to one search.
 - ``webhook``, ``http_request``, and external MCP arguments are turn-taint gated.
   Prefer config/server-derived payloads; when a model-emitted payload is needed,
   send it before ingesting untrusted content in this turn.
