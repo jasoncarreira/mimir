@@ -235,6 +235,7 @@ def resolve_review_state_for_context(
             "must be a positive integer; for example, repository='owner/repo', pull_request=17"
         )
     from ..access_control import (
+        can_resolve_forge_review_scope,
         create_server_discovered_review_scope,
         is_configured_github_repo,
         resolve_server_discovered_review_scope,
@@ -253,7 +254,7 @@ def resolve_review_state_for_context(
     stored_scope = store.resolve(repository, pull_request) if (
         isinstance(store, ServerDiscoveredPRScopeStore)
         and context is not None
-        and context.event_ingress is None
+        and can_resolve_forge_review_scope(context, stage="stored")
     ) else None
     if stored_scope is not None:
         client = _client_for_repository(repository)
@@ -286,11 +287,7 @@ def resolve_review_state_for_context(
             cache.remember_refusal(repository, pull_request, stale_refusal)
         raise ToolException(stale_refusal)
     if (
-        context is None
-        or context.is_service
-        or context.event_ingress is not None
-        or not context.canonical_principal
-        or "admin" not in context.roles
+        not can_resolve_forge_review_scope(context, stage="fetch")
     ):
         scope_refusal = _scope_miss_refusal(
             cache, registry, repository, pull_request,
@@ -319,8 +316,12 @@ def resolve_review_state_for_context(
         raise ToolException(f"pull-request operation rejected: {exc}") from exc
     self_login = os.environ.get("MIMIR_GITHUB_SELF_LOGIN", "").strip()
     if (
-        context.trigger != "user_message"
-        and (not self_login or snapshot.author != self_login)
+        not can_resolve_forge_review_scope(
+            context,
+            stage="accept",
+            pr_author=snapshot.author,
+            self_login=self_login,
+        )
     ):
         scope_refusal = (
             "pull-request operation rejected: requested "
