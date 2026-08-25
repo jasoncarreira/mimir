@@ -8485,6 +8485,17 @@ def _filesystem_result_integrity(
                 "informational" if persisted == "trusted" else "active_ingest"
             )
 
+    integrity_key = _configured_external_file_integrity_key(home, resource)
+    if integrity_key is not None:
+        # A configured root is an access boundary, not evidence that its existing
+        # contents are trusted. Only protected writes acquire integrity here.
+        persisted = _persisted_file_integrity(
+            home, integrity_key, require_recorded=True,
+        )
+        return persisted, (
+            "informational" if persisted == "trusted" else "active_ingest"
+        )
+
     cache_root = home / "attachments" / "fetch-cache"
     try:
         resource.relative_to(cache_root.resolve(strict=True))
@@ -8546,21 +8557,45 @@ def _resolved_path_contains(root: object, resource: Path) -> bool:
     return True
 
 
-def _persisted_file_integrity(home: Path, relative: Path) -> str:
-    """Return server-recorded integrity for a mutable self-authored file."""
+def _configured_external_file_integrity_key(home: Path, resource: Path) -> Path | None:
+    """Key a canonical resource only when an external writable root contains it."""
+    for root in _configured_file_write_roots():
+        try:
+            resolved_root = root.resolve(strict=False)
+        except (OSError, RuntimeError):
+            continue
+        if resolved_root == home:
+            continue
+        try:
+            resource.relative_to(resolved_root)
+        except ValueError:
+            continue
+        return resource
+    return None
+
+
+def _persisted_file_integrity(
+    home: Path,
+    integrity_key: Path,
+    *,
+    require_recorded: bool = False,
+) -> str:
+    """Return server-recorded integrity for one relative or absolute ledger key."""
     metadata_path = home / ".mimir" / "file-integrity.json"
     if not metadata_path.exists():
-        return "trusted"
+        return "untrusted" if require_recorded else "trusted"
     try:
         payload = json.loads(metadata_path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         return "untrusted"
     if not isinstance(payload, dict):
         return "untrusted"
-    key = relative.as_posix()
+    key = integrity_key.as_posix()
     if key in payload:
         value = payload[key]
         return "trusted" if value == "trusted" else "untrusted"
+    if require_recorded:
+        return "untrusted"
     epoch_ns = payload.get(_FILE_INTEGRITY_EPOCH_KEY)
     # A ledger without an epoch predates this migration. Preserve its missing-key
     # default until runtime initialization records the migration boundary.
@@ -8569,7 +8604,7 @@ def _persisted_file_integrity(home: Path, relative: Path) -> str:
     if not isinstance(epoch_ns, int) or isinstance(epoch_ns, bool) or epoch_ns <= 0:
         return "untrusted"
     try:
-        file_ctime_ns = (home / relative).stat().st_ctime_ns
+        file_ctime_ns = (home / integrity_key).stat().st_ctime_ns
     except OSError:
         return "untrusted"
     return "trusted" if file_ctime_ns <= epoch_ns else "untrusted"
@@ -8670,7 +8705,11 @@ def record_file_write_integrity(
         # read of the same checkout cannot launder a tainted mutation.
         integrity_key = resource
     else:
-        return True
+        integrity_key = _configured_external_file_integrity_key(home, resource)
+        if integrity_key is None:
+            return False
+        # Canonical absolute keys preserve root identity, so equal relative paths
+        # in different configured roots cannot collide.
     sources = getattr(labels, "sources", ())
     integrity = (
         "trusted"
