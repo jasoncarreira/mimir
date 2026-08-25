@@ -222,6 +222,7 @@ async def test_identity_probe_accepts_matching_image_executor(monkeypatch) -> No
             return json.dumps({
                 "status": "identity",
                 "executor_identity": EXECUTOR_PROTOCOL_IDENTITY,
+                "source_commit": "a" * 40,
             }).encode()
 
         def close(self) -> None:
@@ -230,13 +231,56 @@ async def test_identity_probe_accepts_matching_image_executor(monkeypatch) -> No
     monkeypatch.setattr(socket, "SO_PEERCRED", getattr(socket, "SO_PEERCRED", 17), raising=False)
     monkeypatch.setattr(socket, "socket", lambda *args: Peer())
 
-    await verify_executor_identity(Path("/executor.sock"))
+    assert await verify_executor_identity(Path("/executor.sock")) == "a" * 40
 
     assert sent == [{
         "version": 1,
         "op": "identity",
         "executor_identity": EXECUTOR_PROTOCOL_IDENTITY,
     }]
+
+
+@pytest.mark.asyncio
+async def test_identity_probe_refuses_missing_or_malformed_source_commit(monkeypatch) -> None:
+    class Peer:
+        def connect(self, _path: str) -> None:
+            pass
+
+        def getsockopt(self, *args: object) -> bytes:
+            return struct.pack("3i", 123, 0, 0)
+
+        def send(self, _payload: bytes) -> None:
+            pass
+
+        def recv(self, _size: int) -> bytes:
+            return json.dumps({
+                "status": "identity",
+                "executor_identity": EXECUTOR_PROTOCOL_IDENTITY,
+                "source_commit": "dirty-or-unpinned",
+            }).encode()
+
+        def close(self) -> None:
+            pass
+
+    monkeypatch.setattr(socket, "SO_PEERCRED", getattr(socket, "SO_PEERCRED", 17), raising=False)
+    monkeypatch.setattr(socket, "socket", lambda *args: Peer())
+
+    with pytest.raises(StaleWorkerExecutorError, match="stale root executor image"):
+        await verify_executor_identity(Path("/executor.sock"))
+
+
+def test_executor_identity_reports_image_recorded_source_commit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source_commit = tmp_path / "executor-source-commit"
+    source_commit.write_text("b" * 40 + "\n", encoding="ascii")
+    monkeypatch.setattr(worker_exec, "EXECUTOR_SOURCE_COMMIT_PATH", source_commit)
+
+    assert worker_exec._executor_source_commit() == "b" * 40
+
+    source_commit.write_text("dirty\n", encoding="ascii")
+    with pytest.raises(RuntimeError, match="invalid recorded source commit"):
+        worker_exec._executor_source_commit()
 
 
 @pytest.mark.asyncio

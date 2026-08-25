@@ -334,6 +334,20 @@ no) and an auto-registering poller via `skill_install.py` without model-mediatin
 the deterministic core. The slice-3 `worklink_run` *tool* stays core regardless
 (tools have no skill-contributed mechanism).
 
+**Root executor provenance (decided 2026-08-25).** Deployment builds must never
+install the root-owned executor from a local directory or named context backed
+by a checkout. The executor source is an immutable released distribution or a
+Git reference pinned by full SHA. The SHA path is the supported way to deploy an
+unreleased branch commit: the build resolves and checks out that commit, refuses
+unless it exactly matches the controller commit, and records it in the image's
+OCI revision label and `/opt/mimir-worklink/executor-source-commit`. The executor
+identity operation exposes the recorded SHA and `/health` reports it as
+`worklink_executor_source_commit`. Dirty-tree executor builds are unsupported;
+working-directory edits cannot enter this root-owned artifact. Deployment
+compose files must pin the immutable Git source and pass the same resolved full
+SHA for `MIMIR_CONTROLLER_COMMIT` and `MIMIR_EXECUTOR_COMMIT`; “point it at
+whichever checkout you want” is not a valid deployment contract.
+
 Entry points:
 
 1. `mimir worklink run <issue-id> [--backend X] [--dry-run]` — CLI,

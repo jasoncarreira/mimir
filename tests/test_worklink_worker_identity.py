@@ -28,7 +28,12 @@ def test_image_provisions_protected_worklink_roots() -> None:
 
 def test_root_executor_is_immutable_and_installed_outside_user_homes() -> None:
     text = DOCKERFILE.read_text(encoding="utf-8")
-    assert "COPY --chown=root:root mimir/ /opt/mimir-worklink/source/mimir/" in text
+    assert 'ARG MIMIR_EXECUTOR_COMMIT' in text
+    assert "grep -Eq '^[0-9a-f]{40}$'" in text
+    assert 'git -C /opt/mimir-worklink/source checkout --detach "$MIMIR_EXECUTOR_COMMIT"' in text
+    assert 'git -C /opt/mimir-worklink/source status --porcelain=v1' in text
+    assert 'executor-source-commit' in text
+    assert "COPY --chown=root:root mimir/ /opt/mimir-worklink/source/mimir/" not in text
     # TRANSITIONAL, and deliberately version-agnostic. The worker venv takes its
     # dependency set from the published wheel and then overlays this checkout with
     # --no-deps, so a runtime dependency newer than the last release is absent and
@@ -47,6 +52,11 @@ def test_root_executor_is_immutable_and_installed_outside_user_homes() -> None:
     assert "/opt/mimir-worklink/venv/bin/python -m mimir.worklink.worker_exec" in text
     assert "chown -R root:root /opt/mimir-worklink" in text
     assert "chmod -R go-w /opt/mimir-worklink" in text
+
+
+def test_executor_build_refuses_controller_commit_mismatch() -> None:
+    text = DOCKERFILE.read_text(encoding="utf-8")
+    assert 'test "$MIMIR_EXECUTOR_COMMIT" = "$MIMIR_CONTROLLER_COMMIT"' in text
 
 
 def test_s6_registers_one_root_executor_service() -> None:

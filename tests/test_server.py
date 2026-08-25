@@ -2092,6 +2092,32 @@ class TestHandleHealth:
         assert "stale root executor image" in body["error"]
         assert "rebuild the image and restart the container" in body["error"]
 
+    @pytest.mark.asyncio
+    async def test_health_reports_root_executor_source_commit(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from mimir.worklink import worker_client
+
+        socket_path = tmp_path / "executor.sock"
+        socket_path.touch()
+        monkeypatch.setattr(worker_client, "DEFAULT_EXECUTOR_SOCKET", socket_path)
+
+        async def identity(_socket_path: Path = socket_path) -> str:
+            return "c" * 40
+
+        monkeypatch.setattr(worker_client, "verify_executor_identity", identity)
+        app = _health_app()
+        app["check_worker_executor_health"] = True
+        async with TestClient(TestServer(app)) as client:
+            resp = await client.get("/health")
+            body = await resp.json()
+
+        assert resp.status == 200
+        assert body == {
+            "ok": True,
+            "worklink_executor_source_commit": "c" * 40,
+        }
+
 
 # ──────────────────────────────────────────────────────────────────────────────
 # _make_auth_middleware

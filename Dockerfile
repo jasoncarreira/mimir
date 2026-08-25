@@ -133,15 +133,27 @@ RUN pip install --no-cache-dir --upgrade pip \
     && pip install --no-cache-dir "mimir-agent[${MIMIR_EXTRAS}]"
 
 USER root
-RUN python3 -m venv /opt/mimir-worklink/venv \
+ARG MIMIR_GIT_URL=https://github.com/jasoncarreira/mimir.git
+ARG MIMIR_CONTROLLER_COMMIT
+ARG MIMIR_EXECUTOR_COMMIT
+LABEL org.opencontainers.image.revision="${MIMIR_EXECUTOR_COMMIT}"
+# The root executor may run unreleased code, but only from an immutable full SHA.
+# The separate controller value makes a deployment wiring mistake fail during the
+# build instead of surfacing from /health after the container has been deployed.
+RUN printf '%s\n' "$MIMIR_CONTROLLER_COMMIT" | grep -Eq '^[0-9a-f]{40}$' \
+    && printf '%s\n' "$MIMIR_EXECUTOR_COMMIT" | grep -Eq '^[0-9a-f]{40}$' \
+    && test "$MIMIR_EXECUTOR_COMMIT" = "$MIMIR_CONTROLLER_COMMIT" \
+    && git clone --no-checkout "$MIMIR_GIT_URL" /opt/mimir-worklink/source \
+    && git -C /opt/mimir-worklink/source checkout --detach "$MIMIR_EXECUTOR_COMMIT" \
+    && test "$(git -C /opt/mimir-worklink/source rev-parse HEAD)" = "$MIMIR_EXECUTOR_COMMIT" \
+    && test -z "$(git -C /opt/mimir-worklink/source status --porcelain=v1)" \
+    && printf '%s\n' "$MIMIR_EXECUTOR_COMMIT" > /opt/mimir-worklink/executor-source-commit \
+    && rm -rf /opt/mimir-worklink/source/.git \
+    && python3 -m venv /opt/mimir-worklink/venv \
     && /opt/mimir-worklink/venv/bin/pip install --no-cache-dir --upgrade pip \
     && /opt/mimir-worklink/venv/bin/pip install --no-cache-dir "mimir-agent[${MIMIR_EXTRAS}]"
-COPY --chown=root:root pyproject.toml uv.lock README.md LICENSE .env.example /opt/mimir-worklink/source/
-COPY --chown=root:root benchmarks/saga/pyproject.toml /opt/mimir-worklink/source/benchmarks/saga/pyproject.toml
-COPY --chown=root:root docs/ /opt/mimir-worklink/source/docs/
-COPY --chown=root:root mimir/ /opt/mimir-worklink/source/mimir/
 # The published package above supplies the worker venv's dependency set, while
-# the no-deps source overlay keeps the image proof on this checkout's code. A
+# the no-deps source overlay keeps the image proof on the pinned commit's code. A
 # newly introduced runtime dependency is not in the previously published wheel,
 # so install it explicitly before importing the overlay during this PR's proof.
 RUN /opt/mimir-worklink/venv/bin/pip install --no-cache-dir "pypdf>=6.16" \

@@ -6,11 +6,30 @@ in-process workspace dep (v0.5 §2), so there's no sidecar to supervise.
 ## Build
 
 ```sh
-docker build -t mimir:latest .
+MIMIR_COMMIT=$(git rev-parse HEAD)
+test -z "$(git status --porcelain=v1)"
+docker build \
+  --build-arg MIMIR_CONTROLLER_COMMIT="$MIMIR_COMMIT" \
+  --build-arg MIMIR_EXECUTOR_COMMIT="$MIMIR_COMMIT" \
+  -t mimir:latest .
 ```
 
 The root-owned Worklink executor is installed into the image under
 `/opt/mimir-worklink`; it is not updated by a bind-mounted controller checkout.
+Its source is cloned from `MIMIR_GIT_URL` (the upstream repository by default)
+and checked out at the full `MIMIR_EXECUTOR_COMMIT` SHA. This supports commits on
+unreleased branches without accepting mutable working-directory contents. The
+build requires `MIMIR_CONTROLLER_COMMIT` to be the same full SHA and fails on a
+mismatch. The SHA is retained in the OCI revision label and in
+`/opt/mimir-worklink/executor-source-commit`; `/health` reports it as
+`worklink_executor_source_commit`.
+
+Deployment wrappers must derive the controller SHA from the immutable source
+they deploy, not accept an operator's unverified description of a mutable
+checkout. In particular, do not use a local directory as a BuildKit additional
+context for `/opt/mimir-worklink`. Pin a Git context by full SHA and pass that
+same resolved SHA as both commit arguments. A dirty-tree executor build is not
+supported.
 After any change to `mimir/worklink/worker_exec.py` or its protocol, rebuild the
 image and recreate/restart the container. The `/health` endpoint reports a stale
 executor identity until the rebuilt image and root executor are running.
