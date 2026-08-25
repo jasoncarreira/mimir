@@ -27,6 +27,7 @@ _ENABLED_CHECKOUT_ROOT = Path("/var/lib/mimir-worklink/checkouts")
 _REPO_TEST_CHECKOUT_ROOT = Path("/var/lib/mimir-worklink/repo-test-checkouts")
 _OPENCODE_CHECKOUT_ROOT = Path("/var/lib/mimir-worklink/opencode-checkouts")
 _AUTHORIZATION_FACTORY = object()
+_DIRTY_PATH_SAMPLE_LIMIT = 20
 
 
 def _default_runner(args: Sequence[str]) -> subprocess.CompletedProcess[str]:
@@ -632,6 +633,7 @@ def _prepare_fresh_base(
     """Return a fetched, locally resolvable base that contains origin's fetched tip."""
     if not base_fetch:
         raise RuntimeError("base repo fetch is disabled; refusing to build on an unverified base")
+    _assert_base_repo_clean(repo, runner=runner, event_logger=event_logger)
     _repair_base_alternates(repo, base=base, runner=runner, event_logger=event_logger)
     if not _fetch_base_from_origin(repo, base, runner=runner, event_logger=event_logger):
         raise RuntimeError(f"base repo fetch failed for origin/{base.removeprefix('origin/')}")
@@ -657,6 +659,121 @@ def _prepare_fresh_base(
     raise RuntimeError(
         f"stale base {local_sha}, {fetched_ref} {fetched_tip}, {count} commits behind"
     )
+
+
+def _assert_base_repo_clean(
+    repo: Path,
+    *,
+    runner: Runner,
+    event_logger: EventLogger | None,
+) -> None:
+    """Refuse a base with foreign content, without changing any of it."""
+    try:
+        owner_uid = repo.stat().st_uid
+    except OSError as exc:
+        _refuse_base_repo(repo, event_logger, reason="owner_check_failed", detail=str(exc))
+    effective_uid = os.geteuid()
+    if effective_uid != owner_uid:
+        _refuse_base_repo(
+            repo,
+            event_logger,
+            reason="owner_mismatch",
+            detail=f"base owner uid {owner_uid}, status account uid {effective_uid}",
+            owner_uid=owner_uid,
+            effective_uid=effective_uid,
+        )
+
+    status = runner([
+        "git", "-C", str(repo), "status", "--porcelain=v1", "-z",
+        "--untracked-files=all", "--ignored=no",
+    ])
+    if status.returncode != 0:
+        detail = (status.stderr or status.stdout).strip() or "git status failed"
+        _refuse_base_repo(
+            repo,
+            event_logger,
+            reason="status_failed",
+            detail=detail,
+            returncode=status.returncode,
+        )
+
+    staged: list[str] = []
+    unstaged: list[str] = []
+    untracked: list[str] = []
+    records = (status.stdout or "").split("\0")
+    index = 0
+    while index < len(records):
+        record = records[index]
+        index += 1
+        if not record:
+            continue
+        if len(record) < 4 or record[2] != " ":
+            _refuse_base_repo(
+                repo,
+                event_logger,
+                reason="status_malformed",
+                detail="git status returned malformed porcelain output",
+            )
+        index_state, worktree_state = record[0], record[1]
+        path = record[3:]
+        if index_state == "?" and worktree_state == "?":
+            untracked.append(path)
+        else:
+            if index_state != " ":
+                staged.append(path)
+            if worktree_state != " ":
+                unstaged.append(path)
+        if index_state in {"R", "C"}:
+            index += 1  # porcelain -z follows a renamed/copied path with its source path
+
+    if not (staged or unstaged or untracked):
+        return
+    dirty_count = len(set(staged) | set(unstaged) | set(untracked))
+    payload = {
+        "dirty_count": dirty_count,
+        "staged_count": len(staged),
+        "staged_paths": staged[:_DIRTY_PATH_SAMPLE_LIMIT],
+        "unstaged_count": len(unstaged),
+        "unstaged_paths": unstaged[:_DIRTY_PATH_SAMPLE_LIMIT],
+        "untracked_count": len(untracked),
+        "untracked_paths": untracked[:_DIRTY_PATH_SAMPLE_LIMIT],
+        "sample_limit": _DIRTY_PATH_SAMPLE_LIMIT,
+    }
+    detail = "; ".join(
+        f"{label} ({len(paths)}): {', '.join(repr(path) for path in paths[:_DIRTY_PATH_SAMPLE_LIMIT])}"
+        for label, paths in (
+            ("staged", staged),
+            ("unstaged", unstaged),
+            ("untracked-and-not-ignored", untracked),
+        )
+        if paths
+    )
+    _refuse_base_repo(
+        repo,
+        event_logger,
+        reason="dirty",
+        detail=f"{dirty_count} dirty path(s); {detail}",
+        **payload,
+    )
+
+
+def _refuse_base_repo(
+    repo: Path,
+    event_logger: EventLogger | None,
+    *,
+    reason: str,
+    detail: str,
+    **payload: Any,
+) -> None:
+    if event_logger is not None:
+        event_logger(
+            "worklink_base_repo_refused",
+            repo=str(repo),
+            reason=reason,
+            detail=detail[:1000],
+            **payload,
+        )
+    raise RuntimeError(f"base repo refused ({reason}): {detail}")
 
 
 def _rev_parse_for_error(repo: Path, ref: str, *, runner: Runner) -> str:

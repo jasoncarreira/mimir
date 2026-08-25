@@ -409,6 +409,9 @@ def cp(
 def _isolated_checkout_result(
     args: Sequence[str] | str, repo: Path, checkout: Path
 ) -> subprocess.CompletedProcess[str] | None:
+    # The checkout factory requires a real, owner-verifiable base directory even
+    # though this helper mocks all of its Git contents and clone operations.
+    repo.mkdir(parents=True, exist_ok=True)
     if not isinstance(args, list):
         return None
     if args[:4] == ["git", "clone", "--local", "--quiet"]:

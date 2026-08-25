@@ -364,7 +364,12 @@ Per-issue flow (one `run`):
    `attempts < 3` could never actually run more than once. Each retry
    gets a fresh path + branch; autopsy artifacts from prior attempts
    stay untouched until the reaper prunes them. Never a long-lived
-   per-worker branch.
+   per-worker branch. Immediately before fetching and branching, Worklink runs
+   one porcelain status check as the account that owns the base repository and
+   refuses a dirty index or working tree. The refusal event and error name
+   bounded samples of staged, unstaged, and non-ignored untracked paths; ignored
+   local directories such as `.venv/` and `.worktrees/` do not count. Worklink
+   never resets or cleans the shared base automatically.
 4. **Render the prompt** from issue fields: description, acceptance
    criteria, review criteria, parent context, repo conventions pointer.
    Template lives at `mimir/prompt_templates/worklink-order.md` (operator-tunable). The
@@ -575,6 +580,15 @@ the backend process. The checkout cwd limits where opencode is asked to
 work, but it does not prevent reads or writes elsewhere in `/workspace`
 or `/mimir-home` if the backend agent/tool chooses to do them. Treat
 checkout isolation as an audit/review boundary, not a security boundary.
+
+The configured base repository currently has two coupled roles: it is both the
+source from which every attempt branches and the running controller's own source
+tree (`WORKLINK_REPO=/workspace/mimir` in the production layout). A backend write
+outside its checkout can therefore contaminate future builds and alter files
+beneath the live process. The pre-branch cleanliness check is a liveness guard as
+well as an input-integrity check, and fails closed if the controller is not
+running as the base directory's owner. Separating these roles is a deployment
+change outside Worklink's checkout lifecycle.
 
 This is acceptable for **operator-invoked** slice-1 runs on bounded issues
 because the output still lands as a review PR and the executor observes
