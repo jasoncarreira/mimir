@@ -39,6 +39,7 @@ from mimir.access_control import (
     get_service_principal,
     parse_service_shell_argv,
     parse_service_shell_argv_with_reason,
+    protected_result_source,
 )
 from mimir.identities import IdentityResolver
 from mimir.models import (
@@ -235,6 +236,7 @@ def _review_state(repo: str, number: int, branch: str, root: str) -> RepoReviewS
         observed_head_sha="a" * 40,
         base_ref="main",
         observed_base_sha="b" * 40,
+        pull_request_author="mimir-bot",
     ))
 
 
@@ -7327,8 +7329,19 @@ def test_repo_review_push_is_still_gated_by_untrusted_active_ingest(
 
 def test_repo_test_admits_self_trigger_only_and_refuses_monotonic_taint(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    home = tmp_path / "home"
+    lease_root = tmp_path / "server-leases"
+    home.mkdir()
+    lease_root.mkdir()
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    monkeypatch.setenv("MIMIR_GITHUB_SELF_LOGIN", "mimir-bot")
+    monkeypatch.setenv("MIMIR_PR_CHECKOUT_LEASE_ROOT", str(lease_root))
     state = _review_state("o/r", 7, "worklink/7", str(tmp_path))
+    checkout = _attach_test_checkout_lease(state, lease_root, "lease-7")
+    lease_file = checkout / "lease-7.json"
+    lease_file.write_text('{"lease":"7"}', encoding="utf-8")
     service = build_trigger_service_principal(
         canonical="poller:github-activity", trigger="poller", profile="github",
         tier=CapabilityTier.CODE_EXECUTION, capabilities=("repo_test",),
@@ -7369,6 +7382,14 @@ def test_repo_test_admits_self_trigger_only_and_refuses_monotonic_taint(
         "poller:github-activity",
     ).with_source(untrusted_page)
     mixed = clean.with_source(untrusted_page)
+    lease_auth = replace(
+        _service_auth(service, clean), repo_review_state=state,
+    )
+    lease_source = protected_result_source(
+        lease_auth, principal="filesystem", domain="filesystem",
+        resource_id=str(lease_file), bridge_instance="filesystem",
+    )
+    after_lease_read = clean.with_source(lease_source)
     target = (
         f"{state.action_scope.canonical_repo}#pull/{state.action_scope.pr_number}"
         f"@{state.action_scope.observed_head_sha}:{state.action_scope.scope_id}"
@@ -7388,6 +7409,11 @@ def test_repo_test_admits_self_trigger_only_and_refuses_monotonic_taint(
 
     clean_decision = decision(clean)
     assert clean_decision.allowed is True, clean_decision.reason
+    assert (lease_source.integrity, lease_source.integrity_effect) == (
+        "trusted", "informational",
+    )
+    lease_decision = decision(after_lease_read)
+    assert lease_decision.allowed is True, lease_decision.reason
     for labels in (untrusted_only, mixed):
         blocked = decision(labels)
         assert blocked.allowed is False

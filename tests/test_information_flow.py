@@ -7,6 +7,7 @@ import json
 import logging
 import subprocess
 from dataclasses import replace
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -19,6 +20,7 @@ from langgraph.runtime import Runtime
 from mimir.access_control import (
     _FILE_INTEGRITY_EXCLUDED_SUBTREES,
     _SELF_AUTHORED_FILE_ROOTS,
+    _configured_pr_checkout_lease_root,
     _filesystem_result_integrity,
     _persisted_file_integrity,
     CapabilityTier,
@@ -67,9 +69,11 @@ from mimir.models import (
     InformationFlowState,
     IntegrityEffect,
     RepoPRActionScope,
+    RepoReviewState,
     SourceLabel,
     TurnInteractivity,
 )
+from mimir.pr_checkout_lease import PRCheckoutLease
 from mimir.prompt_sources import prompt_source_label
 from mimir.turn_event_bus import TurnEventBus, TurnEventEmitter
 from mimir.worklink.continuation import (
@@ -1277,6 +1281,226 @@ def test_seeded_reference_roots_are_trusted_informational(
 
     assert source.integrity == "trusted"
     assert source.integrity_effect == "informational"
+
+
+def _lease_read_auth(
+    lease_root: Path,
+    checkout: Path,
+    *,
+    pull_request_author: str,
+) -> AuthContext:
+    scope = RepoPRActionScope(
+        provenance="server_discovered",
+        canonical_repo="o/r",
+        canonical_root=str(lease_root.parent),
+        canonical_origin="https://github.com/o/r.git",
+        principal="mimir-bot",
+        event_type="pr_review",
+        allowed_operations=frozenset({"repo.checkout"}),
+        pr_number=7,
+        head_repo="o/r",
+        head_remote="origin",
+        destination_ref="refs/heads/worklink/7",
+        observed_head_sha="a" * 40,
+        base_ref="main",
+        observed_base_sha="b" * 40,
+        pull_request_author=pull_request_author,
+    )
+    state = RepoReviewState(scope)
+    now = datetime.now(UTC)
+    state.attach_checkout_lease(PRCheckoutLease(
+        canonical_repo=scope.canonical_repo,
+        canonical_origin=scope.canonical_origin,
+        source_root=Path(scope.canonical_root),
+        scope_base_sha=scope.observed_base_sha,
+        base_sha=scope.observed_base_sha,
+        head_sha=scope.observed_head_sha,
+        destination_ref=scope.destination_ref,
+        owner=scope.principal,
+        scope_id=scope.scope_id,
+        path=checkout,
+        lease_root=lease_root,
+        created_at=now,
+        expires_at=now + timedelta(hours=1),
+        recovery_id="lease-7",
+        pr_number=scope.pr_number,
+    ))
+    return replace(_auth(), repo_review_state=state, repo_pr_action_scope=scope)
+
+
+def test_self_authored_active_lease_is_trusted_but_arbitrary_root_is_not(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / "home"
+    lease_root = tmp_path / "pr-checkout-leases"
+    checkout = lease_root / "lease-7"
+    external = tmp_path / "benchmark-inputs"
+    for root in (home, checkout, external):
+        root.mkdir(parents=True)
+    lease = checkout / "lease-7.json"
+    lease.write_text('{"lease":"7"}', encoding="utf-8")
+    sibling = lease_root / "unbound.json"
+    sibling.write_text("not an attached checkout", encoding="utf-8")
+    benchmark = external / "prompt.txt"
+    benchmark.write_text("external instructions", encoding="utf-8")
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    monkeypatch.setenv("MIMIR_GITHUB_SELF_LOGIN", "mimir-bot")
+    monkeypatch.setenv("MIMIR_PR_CHECKOUT_LEASE_ROOT", str(lease_root))
+    monkeypatch.setenv(
+        "MIMIR_FILE_TOOL_ROOTS", f"{lease_root}:rw,{external}:ro",
+    )
+    auth = _lease_read_auth(
+        lease_root, checkout, pull_request_author="mimir-bot",
+    )
+
+    sources = [
+        protected_result_source(
+            auth, principal="filesystem", domain="filesystem",
+            resource_id=str(path), bridge_instance="filesystem",
+        )
+        for path in (lease, sibling, benchmark, checkout / "missing.json")
+    ]
+
+    assert [
+        (source.integrity, source.integrity_effect) for source in sources
+    ] == [
+        ("trusted", "informational"),
+        ("untrusted", "active_ingest"),
+        ("untrusted", "active_ingest"),
+        ("untrusted", "active_ingest"),
+    ]
+
+
+def test_non_self_authored_active_lease_is_untrusted_active_ingest(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / "home"
+    lease_root = tmp_path / "pr-checkout-leases"
+    checkout = lease_root / "outside-author"
+    checkout.mkdir(parents=True)
+    home.mkdir()
+    target = checkout / "contribution.py"
+    target.write_text("third-party branch bytes", encoding="utf-8")
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    monkeypatch.setenv("MIMIR_GITHUB_SELF_LOGIN", "mimir-bot")
+    monkeypatch.setenv("MIMIR_PR_CHECKOUT_LEASE_ROOT", str(lease_root))
+    auth = _lease_read_auth(
+        lease_root, checkout, pull_request_author="outside-contributor",
+    )
+
+    source = protected_result_source(
+        auth, principal="filesystem", domain="filesystem",
+        resource_id=str(target), bridge_instance="filesystem",
+    )
+
+    assert (source.integrity, source.integrity_effect) == (
+        "untrusted", "active_ingest",
+    )
+
+
+def test_active_lease_does_not_trust_sibling_path_within_lease_root(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / "home"
+    lease_root = tmp_path / "pr-checkout-leases"
+    checkout = lease_root / "lease-7"
+    sibling_checkout = lease_root / "unbound-checkout"
+    for root in (home, checkout, sibling_checkout):
+        root.mkdir(parents=True)
+    leased_target = checkout / "contribution.py"
+    leased_target.write_text("bytes inside the attached lease", encoding="utf-8")
+    sibling_target = sibling_checkout / "contribution.py"
+    sibling_target.write_text("bytes outside the attached lease", encoding="utf-8")
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    monkeypatch.setenv("MIMIR_GITHUB_SELF_LOGIN", "mimir-bot")
+    monkeypatch.setenv("MIMIR_PR_CHECKOUT_LEASE_ROOT", str(lease_root))
+    auth = _lease_read_auth(
+        lease_root, checkout, pull_request_author="mimir-bot",
+    )
+
+    sources = [
+        protected_result_source(
+            auth, principal="filesystem", domain="filesystem",
+            resource_id=str(target), bridge_instance="filesystem",
+        )
+        for target in (leased_target, sibling_target)
+    ]
+
+    assert [
+        (source.integrity, source.integrity_effect) for source in sources
+    ] == [
+        ("trusted", "informational"),
+        ("untrusted", "active_ingest"),
+    ]
+
+
+@pytest.mark.parametrize("configured_root", ["relative", "missing", "symlink"])
+def test_invalid_configured_lease_root_is_rejected(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    configured_root: str,
+) -> None:
+    lease_root = tmp_path / "pr-checkout-leases"
+    lease_root.mkdir()
+    if configured_root == "relative":
+        monkeypatch.chdir(tmp_path)
+        value = lease_root.name
+    elif configured_root == "missing":
+        value = str(tmp_path / "does-not-exist")
+    else:
+        alias = tmp_path / "lease-root-alias"
+        alias.symlink_to(lease_root, target_is_directory=True)
+        value = str(alias)
+    monkeypatch.setenv("MIMIR_PR_CHECKOUT_LEASE_ROOT", value)
+
+    assert _configured_pr_checkout_lease_root() is None
+
+
+def test_untrusted_model_write_is_recorded_and_taints_later_trusted_lease_read(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / "home"
+    lease_root = tmp_path / "server-leases"
+    checkout = lease_root / "lease-8"
+    home.mkdir()
+    checkout.mkdir(parents=True)
+    target = checkout / "attacker-derived.py"
+    target.write_text("attacker-derived lease data", encoding="utf-8")
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    monkeypatch.setenv("MIMIR_GITHUB_SELF_LOGIN", "mimir-bot")
+    monkeypatch.setenv("MIMIR_PR_CHECKOUT_LEASE_ROOT", str(lease_root))
+    auth = _lease_read_auth(
+        lease_root, checkout, pull_request_author="mimir-bot",
+    )
+    assert _configured_pr_checkout_lease_root() == lease_root
+    assert protected_result_source(
+        auth, principal="filesystem", domain="filesystem",
+        resource_id=str(target), bridge_instance="filesystem",
+    ).integrity == "trusted"
+    tainted = InformationFlowLabels().with_source(SourceLabel(
+        principal="mallory", domain="channel", resource_id="github:pr:8",
+        bridge_instance="github", sensitivity="internal",
+        authorized_principals=frozenset({"user-1"}),
+        integrity="untrusted", integrity_effect="active_ingest",
+    ))
+
+    assert record_file_write_integrity(str(target), tainted) is True
+    reread = protected_result_source(
+        auth, principal="filesystem", domain="filesystem",
+        resource_id=str(target), bridge_instance="filesystem",
+    )
+
+    assert (reread.integrity, reread.integrity_effect) == (
+        "untrusted", "active_ingest",
+    )
+    ledger = json.loads(
+        (home / ".mimir" / "file-integrity.json").read_text(encoding="utf-8")
+    )
+    assert ledger[str(target)] == "untrusted"
 
 
 @pytest.mark.parametrize("root", sorted(_SELF_AUTHORED_FILE_ROOTS))
