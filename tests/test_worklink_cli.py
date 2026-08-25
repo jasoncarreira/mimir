@@ -15,7 +15,9 @@ import pytest
 from mimir.cli import main
 from mimir.worklink.orchestrator import WorklinkRunResult
 from mimir.worklink.control import reconcile_run_states, stop_worklink, worklink_status
+from mimir.worklink.autonomy import check_concurrency
 from mimir.worklink.backends.feature_factory import parse_factory_status
+from mimir.worklink.claims import ChainlinkClaims
 from mimir.worklink.compute import LaunchHandle
 from mimir.worklink.factory_state import FactoryRunRecord, load_factory_record, save_factory_record
 from mimir.worklink.run_state import WorklinkRunState, load_run_state, process_start_ticks, save_run_state
@@ -603,7 +605,9 @@ def test_stop_clears_state_for_reused_pid_without_signalling(tmp_path: Path) -> 
     assert load_run_state(tmp_path, 9) is None
 
 
-def test_reconcile_reaps_orphan_and_leaves_live_state(tmp_path: Path) -> None:
+def test_reconcile_releases_orphan_slot_routes_label_and_leaves_live_lock(
+    tmp_path: Path,
+) -> None:
     now = datetime.now(UTC)
     _state(
         tmp_path,
@@ -612,42 +616,156 @@ def test_reconcile_reaps_orphan_and_leaves_live_state(tmp_path: Path) -> None:
         ticks=process_start_ticks(os.getpid()),
         started_at=now,
     )
-    _state(tmp_path, 11, 999_999_999, ticks=1, started_at=now - timedelta(seconds=90))
-    shim_state = WorklinkRunState(
-        **{
-            **_state(
-                tmp_path,
-                12,
-                999_999_998,
-                ticks=1,
-                started_at=now - timedelta(seconds=60),
-            ).to_json(),
-            "handle_identifier": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
-            "shim_pid": 999_999_998,
-        }
+    dead = _state(
+        tmp_path, 11, 999_999_999, ticks=1, started_at=now - timedelta(seconds=90)
     )
-    save_run_state(tmp_path, shim_state)
+    checkout = tmp_path / "checkout-11"
+    checkout.mkdir()
+    dead = replace(dead, checkout=str(checkout), local_base="base-sha")
+    save_run_state(tmp_path, dead)
     events: list[tuple[str, dict[str, object]]] = []
+    locks = {10, 11}
+    labels = {10: {"worklink:in-progress"}, 11: {"worklink:in-progress"}}
+    calls: list[list[str]] = []
+
+    def runner(args: list[str]) -> subprocess.CompletedProcess[str]:
+        calls.append(list(args))
+        if args[1:3] == ["locks", "release"]:
+            locks.discard(int(args[3]))
+        elif args[1:3] == ["locks", "list"]:
+            return subprocess.CompletedProcess(
+                args,
+                0,
+                stdout=json.dumps(
+                    {"locks": [{"issue_id": issue} for issue in locks]}
+                ),
+                stderr="",
+            )
+        elif args[1:3] == ["issue", "unlabel"]:
+            labels[int(args[3])].discard(args[4])
+        elif args[1:3] == ["issue", "label"]:
+            labels[int(args[3])].add(args[4])
+        elif args[1:3] == ["issue", "show"]:
+            issue_id = int(args[3])
+            return subprocess.CompletedProcess(
+                args,
+                0,
+                stdout=json.dumps(
+                    {"id": issue_id, "labels": sorted(labels[issue_id])}
+                ),
+                stderr="",
+            )
+        elif args[1:3] == ["issue", "list"]:
+            return subprocess.CompletedProcess(args, 0, stdout="[]", stderr="")
+        return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+
+    def git_runner(args: list[str]) -> subprocess.CompletedProcess[str]:
+        if args[3:5] == ["rev-parse", "HEAD"]:
+            stdout = "local-head\n"
+        elif args[3:5] == ["rev-list", "--count"]:
+            stdout = "4\n"
+        elif args[3:5] == ["ls-remote", "--heads"]:
+            stdout = "remote-head\trefs/heads/issue/11-a2\n"
+        else:
+            raise AssertionError(args)
+        return subprocess.CompletedProcess(args, 0, stdout=stdout, stderr="")
 
     alive = reconcile_run_states(
         tmp_path,
         event_logger=lambda event, **payload: events.append((event, payload)),
+        runner=runner,
+        git_runner=git_runner,
         now=now,
     )
 
     assert [state.issue_id for state in alive] == [10]
     assert load_run_state(tmp_path, 10) is not None
     assert load_run_state(tmp_path, 11) is None
+    assert locks == {10}
+    assert labels[10] == {"worklink:in-progress"}
+    assert labels[11] == {"worklink:blocked"}
+    assert [call for call in calls if call[1:3] == ["locks", "release"]] == [
+        ["chainlink", "locks", "release", "11"]
+    ]
+    event, payload = events[0]
+    assert event == "worklink_run_orphaned"
+    assert payload["unpublished_commits"] is True
+    assert payload["resulting_label"] == "worklink:blocked"
+    assert payload["lock_released"] is True
+
+    # The authoritative lock count, not merely a mocked call, proves that the
+    # dead run returned its slot. Status also has no unrecorded disagreement.
+    claims = ChainlinkClaims(agent_id="test", runner=runner)
+    assert claims.active_worklink_lock_count() == 1
+    concurrency = check_concurrency(tmp_path, claims=claims)
+    assert (concurrency.active, concurrency.cap, concurrency.allowed) == (1, 2, True)
+    rows = worklink_status(tmp_path, issue_ids=[11], runner=runner)
+    assert rows[0].classification == "clean"
+    assert rows[0].disagreement is None
+
+
+def test_reconcile_empty_orphan_returns_ready(tmp_path: Path) -> None:
+    now = datetime.now(UTC)
+    state = _state(tmp_path, 12, 999_999_998, ticks=1, started_at=now)
+    checkout = tmp_path / "checkout-12"
+    checkout.mkdir()
+    save_run_state(tmp_path, replace(state, checkout=str(checkout), local_base="base-sha"))
+    calls: list[list[str]] = []
+
+    reconcile_run_states(
+        tmp_path,
+        runner=lambda args: calls.append(list(args))
+        or subprocess.CompletedProcess(args, 0, stdout="", stderr=""),
+        git_runner=lambda args: subprocess.CompletedProcess(
+            args,
+            0,
+            stdout="head\n" if args[3] == "rev-parse" else "0\n",
+            stderr="",
+        ),
+        now=now,
+    )
+
+    assert ["chainlink", "issue", "label", "12", "worklink:ready"] in calls
     assert load_run_state(tmp_path, 12) is None
+
+
+def test_reconcile_lock_release_failure_retains_state_and_emits_actionable_event(
+    tmp_path: Path,
+) -> None:
+    now = datetime.now(UTC)
+    state = _state(tmp_path, 13, 999_999_997, ticks=1, started_at=now)
+    checkout = tmp_path / "checkout-13"
+    checkout.mkdir()
+    save_run_state(tmp_path, replace(state, checkout=str(checkout), local_base="base-sha"))
+    events: list[tuple[str, dict[str, object]]] = []
+    calls: list[list[str]] = []
+
+    reconcile_run_states(
+        tmp_path,
+        runner=lambda args: calls.append(list(args))
+        or subprocess.CompletedProcess(args, 1, stdout="", stderr="lock owner mismatch"),
+        git_runner=lambda args: subprocess.CompletedProcess(
+            args, 0, stdout="head\n" if args[3] == "rev-parse" else "0\n", stderr=""
+        ),
+        event_logger=lambda event, **payload: events.append((event, payload)),
+        now=now,
+    )
+
+    assert calls == [["chainlink", "locks", "release", "13"]]
+    assert load_run_state(tmp_path, 13) is not None
     assert events == [
         (
-            "worklink_run_orphaned",
-            {"issue_id": 11, "attempt": 2, "elapsed_s": 90.0, "reaped": True},
-        ),
-        (
-            "worklink_run_orphaned",
-            {"issue_id": 12, "attempt": 2, "elapsed_s": 60.0, "reaped": True},
-        ),
+            "worklink_run_orphan_reconcile_failed",
+            {
+                "issue_id": 13,
+                "attempt": 2,
+                "branch": "issue/13-a2",
+                "checkout": str(checkout),
+                "reason": "lock_release_failed",
+                "error": "lock owner mismatch",
+                "state_retained": True,
+            },
+        )
     ]
 
 

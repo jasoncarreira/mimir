@@ -1191,13 +1191,13 @@ class ChainlinkClaims:
             log.warning("Worklink reaper lock discovery failed: %s", exc)
             discovery_skipped["lock_discovery_failed"] = 1
         for issue_id in sorted(issue_ids):
-            # Failing open here is safe only while reaper_ttl_s remains at least
-            # 2 * factory_run_timeout_s: anything reapable has already outlived
-            # a legitimate epic run by 2x. Keep that coupling if TTLs diverge.
+            # Factory claims have a longer runtime than leaves. If labels cannot
+            # be read, fail closed and skip the issue rather than applying the
+            # leaf TTL to a factory lock whose epic marker could not be observed.
             if self._issue_has_label(
                 issue_id,
                 WORKLINK_EPIC_LABEL,
-                default_on_unavailable=False,
+                default_on_unavailable=True,
             ):
                 continue
             for record in claim_records_from_comments(self._issue_comments(issue_id)):

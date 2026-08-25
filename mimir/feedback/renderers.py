@@ -71,6 +71,23 @@ def _render_event_line(rule_kind: str, ev: dict) -> str:
             f"Worklink tool-pin dedupe check failed for {tool} "
             f"({pin}): {reason} — issue creation skipped"
         )
+    if rule_kind == "worklink_run_orphaned":
+        issue = _sanitize_field(ev.get("issue_id") or "?")
+        label = _sanitize_field(ev.get("resulting_label") or "?")
+        branch = _sanitize_field(ev.get("branch") or "?")
+        if ev.get("unpublished_commits"):
+            return (
+                f"Worklink run #{issue} died; lock released and {label} applied "
+                f"because branch {branch} has unpublished commits — recover the checkout"
+            )
+        return f"Worklink run #{issue} died; lock released and issue returned to {label}"
+    if rule_kind == "worklink_run_orphan_reconcile_failed":
+        issue = _sanitize_field(ev.get("issue_id") or "?")
+        reason = _sanitize_field(ev.get("reason") or "unknown failure")
+        return (
+            f"Worklink orphan reconciliation failed for #{issue}: {reason}; "
+            "run state retained for operator recovery"
+        )
     if rule_kind == "loop_stall_watchdog_fired":
         stall = ev.get("stall_s")
         threshold = ev.get("threshold_s")
