@@ -992,8 +992,18 @@ def test_ledger_epoch_distinguishes_seeded_file_from_unrecorded_shell_write(
 
 
 @pytest.mark.parametrize(
-    "epoch_ns",
-    ["not-an-int", None, 1.5, [], {}, True, False, 0, -1],
+    ("epoch_ns", "file_ctime_ns"),
+    [
+        ("not-an-int", 0),
+        (None, 0),
+        (1.5, 0),
+        ([], 0),
+        ({}, 0),
+        (True, 0),
+        (False, 0),
+        (0, 0),
+        (-1, -1),
+    ],
     ids=[
         "string", "null", "float", "list", "object", "true", "false", "zero",
         "negative",
@@ -1003,6 +1013,7 @@ def test_malformed_nonpositive_and_bool_ledger_epochs_fail_closed(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     epoch_ns: object,
+    file_ctime_ns: int,
 ) -> None:
     monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
     target = tmp_path / "skills" / "operator" / "SKILL.md"
@@ -1013,10 +1024,63 @@ def test_malformed_nonpositive_and_bool_ledger_epochs_fail_closed(
     metadata.write_text(
         json.dumps({"__ledger_epoch_ns__": epoch_ns}), encoding="utf-8",
     )
+    original_stat = Path.stat
+
+    def controlled_target_stat(path: Path, *args: object, **kwargs: object):
+        if path == target:
+            return SimpleNamespace(st_ctime_ns=file_ctime_ns)
+        return original_stat(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "stat", controlled_target_stat)
 
     assert _filesystem_result_integrity(None, str(target)) == (
         "untrusted", "active_ingest",
     )
+
+
+@pytest.mark.parametrize(
+    "epoch_ns",
+    [1.5, True, 0, -1],
+    ids=["non-int", "bool", "zero", "negative"],
+)
+def test_existing_invalid_ledger_epoch_rejected_during_initialization(
+    tmp_path: Path,
+    epoch_ns: object,
+) -> None:
+    metadata = tmp_path / ".mimir" / "file-integrity.json"
+    metadata.parent.mkdir()
+    metadata.write_text(
+        json.dumps({"__ledger_epoch_ns__": epoch_ns}), encoding="utf-8",
+    )
+
+    assert initialize_file_integrity_ledger(tmp_path) is False
+
+
+@pytest.mark.parametrize(
+    "epoch_ns",
+    [1.5, True, 0, -1],
+    ids=["non-int", "bool", "zero", "negative"],
+)
+def test_existing_invalid_ledger_epoch_rejected_before_recording_write(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    epoch_ns: object,
+) -> None:
+    monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
+    target = tmp_path / "memory" / "notes.md"
+    target.parent.mkdir()
+    metadata = tmp_path / ".mimir" / "file-integrity.json"
+    metadata.parent.mkdir()
+    metadata.write_text(
+        json.dumps({"__ledger_epoch_ns__": epoch_ns}), encoding="utf-8",
+    )
+
+    assert record_file_write_integrity(
+        str(target), InformationFlowLabels(),
+    ) is False
+    assert json.loads(metadata.read_text(encoding="utf-8")) == {
+        "__ledger_epoch_ns__": epoch_ns,
+    }
 
 
 def test_unstatable_unrecorded_file_fails_closed(
