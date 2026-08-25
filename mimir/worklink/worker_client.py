@@ -272,7 +272,8 @@ class WorkerClient:
             sock.close()
             raise
         finally:
-            os.close(checkout_fd)
+            if checkout_fd >= 0:
+                os.close(checkout_fd)
             if opened_here:
                 stdout_sink.close()
                 stderr_sink.close()
