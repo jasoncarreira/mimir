@@ -1768,6 +1768,52 @@ async def test_soft_warning_fires_once_per_turn(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("call_path", ["sync", "async"])
+async def test_file_write_refuses_when_integrity_cannot_be_recorded(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    call_path: str,
+) -> None:
+    monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
+    monkeypatch.setattr(
+        "mimir.access_control.record_file_write_integrity",
+        lambda _target, _labels: False,
+    )
+    auth = _untainted_ifc_auth()
+    turn = _ifc_turn(auth)
+    handler_calls = 0
+
+    def sync_handler(request: ToolCallRequest) -> ToolMessage:
+        nonlocal handler_calls
+        handler_calls += 1
+        return ToolMessage(content="ran", tool_call_id=request.tool_call["id"])
+
+    async def async_handler(request: ToolCallRequest) -> ToolMessage:
+        return sync_handler(request)
+
+    request = _make_request(
+        "write_file", "integrity-refusal", auth,
+        {"file_path": str(tmp_path / "memory" / "notes.md"), "content": "x"},
+    )
+    token = set_current_turn(turn)
+    try:
+        if call_path == "sync":
+            result = BudgetGateMiddleware().wrap_tool_call(request, sync_handler)
+        else:
+            result = await BudgetGateMiddleware().awrap_tool_call(
+                request, async_handler,
+            )
+    finally:
+        reset_current_turn(token)
+
+    assert result.status == "error"
+    assert result.content == (
+        "file write refused: integrity metadata could not be persisted"
+    )
+    assert handler_calls == 0
+
+
+@pytest.mark.asyncio
 async def test_middleware_awrap_passes_through_under_budget():
     """Below the cap, ``awrap_tool_call`` delegates to the handler
     unchanged."""

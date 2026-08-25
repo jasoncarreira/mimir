@@ -1503,6 +1503,99 @@ def test_untrusted_model_write_is_recorded_and_taints_later_trusted_lease_read(
     assert ledger[str(target)] == "untrusted"
 
 
+def test_configured_rw_root_integrity_round_trip_distinguishes_roots(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / "home"
+    first_root = tmp_path / "first-repo"
+    second_root = tmp_path / "second-repo"
+    for root in (home, first_root, second_root):
+        root.mkdir()
+    first = first_root / "README.md"
+    second = second_root / "README.md"
+    first.write_text("attacker-derived change", encoding="utf-8")
+    second.write_text("self-authored change", encoding="utf-8")
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    monkeypatch.setenv(
+        "MIMIR_FILE_TOOL_ROOTS", f"{first_root}:rw,{second_root}:rw",
+    )
+    tainted = InformationFlowLabels().with_source(SourceLabel(
+        principal="mallory", domain="channel", resource_id="github:pr:9",
+        bridge_instance="github", sensitivity="internal",
+        authorized_principals=frozenset({"user-1"}),
+        integrity="untrusted", integrity_effect="active_ingest",
+    ))
+
+    assert protected_result_source(
+        _auth(), principal="filesystem", domain="filesystem",
+        resource_id=str(second), bridge_instance="filesystem",
+    ).integrity == "untrusted"
+    assert record_file_write_integrity(str(first), tainted) is True
+    assert record_file_write_integrity(
+        str(second), InformationFlowLabels(),
+    ) is True
+
+    # Exercise the real writer and reader together; neither side constructs the
+    # key independently in this round trip.
+    assert _persisted_file_integrity(
+        home, first.resolve(), require_recorded=True,
+    ) == "untrusted"
+    assert _persisted_file_integrity(
+        home, second.resolve(), require_recorded=True,
+    ) == "trusted"
+    assert protected_result_source(
+        _auth(), principal="filesystem", domain="filesystem",
+        resource_id=str(first), bridge_instance="filesystem",
+    ).integrity == "untrusted"
+    assert protected_result_source(
+        _auth(), principal="filesystem", domain="filesystem",
+        resource_id=str(second), bridge_instance="filesystem",
+    ).integrity == "trusted"
+    ledger = json.loads(
+        (home / ".mimir" / "file-integrity.json").read_text(encoding="utf-8")
+    )
+    assert ledger[str(first.resolve())] == "untrusted"
+    assert ledger[str(second.resolve())] == "trusted"
+
+
+def test_configured_ro_root_integrity_is_not_recorded(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / "home"
+    readonly = tmp_path / "reference"
+    home.mkdir()
+    readonly.mkdir()
+    target = readonly / "README.md"
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    monkeypatch.setenv("MIMIR_FILE_TOOL_ROOTS", f"{readonly}:ro")
+
+    assert record_file_write_integrity(
+        str(target), InformationFlowLabels(),
+    ) is False
+    assert not (home / ".mimir" / "file-integrity.json").exists()
+
+
+def test_configured_rw_root_integrity_rejects_symlink_escape(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / "home"
+    writable = tmp_path / "repo"
+    outside = tmp_path / "outside"
+    for root in (home, writable, outside):
+        root.mkdir()
+    (writable / "escape").symlink_to(outside, target_is_directory=True)
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    monkeypatch.setenv("MIMIR_FILE_TOOL_ROOTS", f"{writable}:rw")
+
+    assert record_file_write_integrity(
+        str(writable / "escape" / "README.md"), InformationFlowLabels(),
+    ) is False
+    assert not (home / ".mimir" / "file-integrity.json").exists()
+
+
 @pytest.mark.parametrize("root", sorted(_SELF_AUTHORED_FILE_ROOTS))
 def test_virtual_path_write_to_a_self_authored_root_is_recorded(
     tmp_path: Path,
