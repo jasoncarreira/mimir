@@ -683,6 +683,37 @@ def _git_objects_dir(repo: Path) -> Path | None:
     return None
 
 
+def report_foreign_owned_git_objects(
+    repo: Path,
+    *,
+    expected_uid: int,
+    event_logger: EventLogger,
+) -> list[Path]:
+    """Report regular files in ``repo``'s object store owned by another uid."""
+    objects = _git_objects_dir(repo)
+    if objects is None:
+        return []
+
+    foreign: list[Path] = []
+    for object_path in sorted(objects.rglob("*")):
+        try:
+            metadata = object_path.stat(follow_symlinks=False)
+        except OSError:
+            continue
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_uid == expected_uid:
+            continue
+        foreign.append(object_path)
+        event_logger(
+            "worklink_foreign_owned_git_object",
+            repo=str(repo),
+            object_path=str(object_path),
+            owner_uid=metadata.st_uid,
+            expected_owner_uid=expected_uid,
+            mode=oct(stat.S_IMODE(metadata.st_mode)),
+        )
+    return foreign
+
+
 def _alternate_entries(repo: Path) -> tuple[Path | None, list[tuple[str, Path]]]:
     objects = _git_objects_dir(repo)
     if objects is None:

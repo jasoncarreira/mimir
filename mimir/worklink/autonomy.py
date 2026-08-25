@@ -44,7 +44,7 @@ from .claims import (
     ShutdownClaimFailure,
     WORKLINK_EPIC_LABEL,
 )
-from .checkout import prune_attempt_checkouts
+from .checkout import prune_attempt_checkouts, report_foreign_owned_git_objects
 from .factory_state import factory_process_is_alive, list_factory_records
 
 #: Chainlink agent identity the executor + reaper claim under. Mirrors
@@ -235,6 +235,24 @@ def prune_stale_attempt_checkouts_for_home(home: Path, *, repo: Path | str | Non
         older_than=timedelta(seconds=defaults.reaper_ttl_s),
         now=datetime.now(timezone.utc),
         is_active=lambda child: _attempt_is_active(child, factory_records),
+    )
+
+
+def report_foreign_owned_git_objects_for_home(
+    home: Path,
+    *,
+    expected_uid: int,
+    repo: Path | str | None = None,
+) -> list[Path]:
+    """Run the base-repository ownership check from periodic maintenance."""
+    del home
+    repo_raw = repo or os.environ.get("WORKLINK_REPO") or os.environ.get("MIMIR_WORKLINK_REPO")
+    if not repo_raw:
+        return []
+    return report_foreign_owned_git_objects(
+        Path(repo_raw),
+        expected_uid=expected_uid,
+        event_logger=log_event_sync,
     )
 
 

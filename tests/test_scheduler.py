@@ -6,6 +6,7 @@ import asyncio
 import json as _json
 import shutil
 from datetime import datetime, timezone
+from types import SimpleNamespace
 from unittest import mock
 from pathlib import Path
 
@@ -4439,13 +4440,27 @@ async def test_worklink_reaper_job_runs_in_thread_and_logs_event(
         calls.append(("prune", home))
         return [home / ".worklink" / "repo" / "613-1"]
 
+    def fake_ownership_check(home: Path, *, expected_uid: int):
+        assert expected_uid == 1234
+        calls.append(("ownership", home))
+        return []
+
     def fake_close(home: Path):
         calls.append(("close", home))
         return [Rec(844)]
 
     monkeypatch.setattr("mimir.worklink.autonomy.reap_stale_claims_for_home", fake_reap)
+    monkeypatch.setattr(
+        "mimir.worklink.autonomy.report_foreign_owned_git_objects_for_home",
+        fake_ownership_check,
+    )
     monkeypatch.setattr("mimir.worklink.autonomy.prune_stale_attempt_checkouts_for_home", fake_prune)
     monkeypatch.setattr("mimir.worklink.autonomy.close_merged_chainlinks_for_home", fake_close)
+    monkeypatch.setattr(
+        "mimir.worklink.identities.get_identities",
+        lambda: SimpleNamespace(mimir_uid=1234),
+    )
+    monkeypatch.setenv("WORKLINK_REPO", str(tmp_path / "repo"))
     sched = Scheduler(scheduler_yaml=tmp_path / "s.yaml", enqueue=noop)
     assert sched.add_worklink_reaper_job(tmp_path, cron_expr="* * * * *") is True
     job = sched._scheduler.get_job("worklink-reaper")
@@ -4453,7 +4468,12 @@ async def test_worklink_reaper_job_runs_in_thread_and_logs_event(
 
     await job.func()
 
-    assert calls == [("reap", tmp_path), ("prune", tmp_path), ("close", tmp_path)]
+    assert calls == [
+        ("reap", tmp_path),
+        ("ownership", tmp_path),
+        ("prune", tmp_path),
+        ("close", tmp_path),
+    ]
     events = _read_event_types(tmp_path / "logs" / "events.jsonl")
     [ev] = [e for e in events if e["type"] == "worklink_claims_reaped"]
     assert ev["count"] == 2
@@ -4482,8 +4502,16 @@ async def test_worklink_reaper_job_logs_completed_sweep_when_nothing_reaped(
         "mimir.worklink.autonomy.reap_stale_claims_for_home",
         lambda home: ReapResult(reaped=[], examined=0, skipped={}, skipped_issue_ids={}),
     )
+    monkeypatch.setattr(
+        "mimir.worklink.autonomy.report_foreign_owned_git_objects_for_home",
+        lambda home, *, expected_uid: [],
+    )
     monkeypatch.setattr("mimir.worklink.autonomy.prune_stale_attempt_checkouts_for_home", lambda home: [])
     monkeypatch.setattr("mimir.worklink.autonomy.close_merged_chainlinks_for_home", lambda home: [])
+    monkeypatch.setattr(
+        "mimir.worklink.identities.get_identities",
+        lambda: SimpleNamespace(mimir_uid=1234),
+    )
     sched = Scheduler(scheduler_yaml=tmp_path / "s.yaml", enqueue=noop)
     assert sched.add_worklink_reaper_job(tmp_path, cron_expr="* * * * *") is True
     job = sched._scheduler.get_job("worklink-reaper")
@@ -5506,4 +5534,3 @@ async def test_poller_cadence_is_cached_per_cron(tmp_path):
 
 async def _noop_coro():
     return None
-
