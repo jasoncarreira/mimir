@@ -837,6 +837,25 @@ def test_dry_run_prints_rendered_work_order_without_mutations(
     assert backend.orders == []
 
 
+def test_bundled_work_order_requires_discriminating_fail_closed_mutation_test() -> None:
+    issue = IssueContext(1460, "pin fail-closed guards", "Acceptance criteria", {"worklink:ready"})
+    template = Path(__file__).parent.parent / "mimir" / "prompt_templates" / "worklink-order.md"
+
+    prompt = render_work_order(
+        issue,
+        template_path=template,
+        backend_name="opencode",
+        test_command="uv run pytest -q",
+    )
+
+    assert "security-relevant guard whose permissive alternative changes behaviour" in prompt
+    assert "change a deny `return False` to `return True`" in prompt
+    assert "change an integrity default to trusted" in prompt
+    assert "delete an `and <equality>` clause from a boundary condition" in prompt
+    assert "confirm a test fails" in prompt
+    assert "Restore the guard before running the gate command below" in prompt
+    assert "provably unreachable or semantically equivalent" in prompt
+    assert "explain why the mutation cannot discriminate instead of inventing a fixture" in prompt
 
 
 def _orchestrator_runner(
