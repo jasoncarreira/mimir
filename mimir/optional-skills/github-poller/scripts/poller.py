@@ -957,6 +957,8 @@ def _emit(prompt: str, **extras: object) -> None:
     ``poller_review_missed_submission`` algedonically.
     """
     event_type = extras.get("event_type")
+    if isinstance(event_type, str) and event_type.startswith("pr_"):
+        extras.setdefault("subject_type", "pull_request")
     if isinstance(event_type, str) and event_type in REVIEW_NEEDED_EVENT_TYPES:
         related_comment = extras.pop("related_comment", "")
         if isinstance(related_comment, str) and related_comment:
@@ -1467,6 +1469,7 @@ def _check_issue_comments(
                 reviewer=me,
                 activity_at=comment.get("created_at"),
                 event_type="issue_comment",
+                subject_type="pull_request",
                 repo=repo,
                 number=issue_num,
                 url=url,

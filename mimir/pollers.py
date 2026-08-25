@@ -189,6 +189,11 @@ _GITHUB_FRAMEWORK_TRIGGER_EVENT_TYPES = {
 _GITHUB_ACTIVITY_EVENT_TYPES = frozenset(
     _GITHUB_ACTOR_EVENT_TYPES | _GITHUB_FRAMEWORK_TRIGGER_EVENT_TYPES,
 )
+_GITHUB_PR_EVENT_TYPES = frozenset(
+    event_type
+    for event_type in _GITHUB_ACTIVITY_EVENT_TYPES
+    if event_type not in {"issue_opened", "issue_comment"}
+)
 _DELIVERY_RECEIPTS_DIR = ".delivery-receipts"
 
 
@@ -608,6 +613,86 @@ def _github_framework_trigger_is_trusted(
         and extras.get("base_sha") == base.get("sha")
         and extras.get("url") == pull_request.get("html_url")
     )
+
+
+def _github_recovery_relevance_check(
+    token: str,
+) -> poller_recovery.RelevanceFn:
+    """Build a per-reconcile, per-PR-cached actionability predicate.
+
+    A mixed batch is stale only when every item is an authoritatively closed PR.
+    Non-PR items and API uncertainty keep the batch actionable (fail open).
+    """
+    cache: dict[tuple[str, int], bool | None] = {}
+
+    async def check(event: AgentEvent) -> bool | None:
+        items = event.extra.get("items") if isinstance(event.extra, dict) else None
+        if not isinstance(items, list) or not items:
+            return None
+        saw_pr = False
+        saw_unknown = False
+        for item in items:
+            if not isinstance(item, dict):
+                saw_unknown = True
+                continue
+            event_type = item.get("event_type")
+            url = item.get("url")
+            is_pr = (
+                item.get("subject_type") == "pull_request"
+                or event_type in _GITHUB_PR_EVENT_TYPES
+                or (
+                    event_type == "issue_comment"
+                    and isinstance(url, str)
+                    and "/pull/" in urllib.parse.urlsplit(url).path
+                )
+            )
+            if not is_pr:
+                saw_unknown = True
+                continue
+            repo = item.get("repo")
+            number = item.get("number")
+            if isinstance(number, str) and number.isdigit():
+                number = int(number)
+            parts = repo.split("/") if isinstance(repo, str) else []
+            if (
+                len(parts) != 2
+                or not all(parts)
+                or not isinstance(number, int)
+                or isinstance(number, bool)
+                or number < 1
+            ):
+                saw_unknown = True
+                continue
+            saw_pr = True
+            key = (repo, number)
+            if key not in cache:
+                escaped_repo = "/".join(
+                    urllib.parse.quote(value, safe="") for value in parts
+                )
+                attestation = await asyncio.to_thread(
+                    _github_api_attestation,
+                    f"repos/{escaped_repo}/pulls/{number}",
+                    token,
+                )
+                if (
+                    attestation is None
+                    or attestation[0] != 200
+                    or not isinstance(attestation[1], dict)
+                    or attestation[1].get("state") not in {"open", "closed"}
+                ):
+                    cache[key] = None
+                else:
+                    cache[key] = attestation[1]["state"] == "open"
+            verdict = cache[key]
+            if verdict is True:
+                return True
+            if verdict is None:
+                saw_unknown = True
+        if saw_unknown or not saw_pr:
+            return None
+        return False
+
+    return check
 
 
 # Pollers manifest schema version history:
@@ -2050,6 +2135,14 @@ async def run_poller(
                 service_principal=authority.canonical,
                 service_authority=authority,
                 recover_failed_turns=poller.recover_failed_turns,
+                relevance_check=(
+                    _github_recovery_relevance_check(
+                        poller.env.get("GITHUB_TOKEN", "")
+                        or os.environ.get("GITHUB_TOKEN", "")
+                    )
+                    if poller.name == "github-activity"
+                    else None
+                ),
             )
             if _rec["state_unreadable"]:
                 await log_event(
@@ -2059,7 +2152,9 @@ async def run_poller(
                 )
             if any(
                 _rec[key]
-                for key in ("reenqueued", "gave_up", "expired", "dropped")
+                for key in (
+                    "reenqueued", "gave_up", "expired", "dropped", "stale_dropped",
+                )
             ):
                 await log_event(
                     "poller_recovery",
@@ -2070,6 +2165,7 @@ async def run_poller(
                     unclean_reenqueued=_rec["unclean_reenqueued"],
                     expired=_rec["expired"],
                     dropped=_rec["dropped"],
+                    stale_dropped=_rec["stale_dropped"],
                 )
         except Exception as exc:  # noqa: BLE001 — recovery must not break polling
             log.warning(

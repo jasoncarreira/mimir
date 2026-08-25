@@ -103,6 +103,7 @@ def test_open_pr_comment_still_emits_when_it_is_the_only_signal(
 
     assert count == 1
     assert [event["event_type"] for event in captured_emits] == ["issue_comment"]
+    assert captured_emits[0]["subject_type"] == "pull_request"
     assert captured_emits[0]["number"] == "42"
 
 
