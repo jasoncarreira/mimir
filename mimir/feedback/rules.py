@@ -48,6 +48,10 @@ _EVENT_RULES: dict[str, tuple[Polarity, str]] = {
     "worklink_transition": ("positive", "worklink_transition"),
     "worklink_continuation_created": ("negative", "worklink_continuation"),
     "worklink_attempts_exhausted": ("negative", "worklink_attempts_exhausted"),
+    "worklink_run_orphaned": ("negative", "worklink_run_orphaned"),
+    "worklink_run_orphan_reconcile_failed": (
+        "negative", "worklink_run_orphan_reconcile_failed",
+    ),
     "worklink_tool_pin_dedupe_check_failed": (
         "negative", "worklink_tool_pin_dedupe_check_failed",
     ),
@@ -579,6 +583,10 @@ _FIRST_OCCURRENCE_ONLY_KINDS: set[str] = {
     # drained on next boot). Re-emitting on subsequent turns confuses the
     # operator — the digest is the one-shot "what changed on upgrade" signal.
     "mimir_update_digest",
+    # Startup may reconcile several stale records in one pass. Keep the latest
+    # per kind within the bounded negative bucket instead of crowding it out.
+    "worklink_run_orphaned",
+    "worklink_run_orphan_reconcile_failed",
 }
 
 # CR2 (memory & retrieval) invariant: polarity-dynamic kinds (their

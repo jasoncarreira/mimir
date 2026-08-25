@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import logging
-import math
 import os
 import re
 import shlex
@@ -46,8 +45,13 @@ def factory_run_timeout_s() -> float:
 
 
 def minimum_reaper_ttl_s(timeout_s: int) -> int:
-    """Return the floor that keeps the reaper behind every live Worklink run."""
-    return 2 * max(timeout_s, math.ceil(factory_run_timeout_s()))
+    """Return the leaf-claim floor, twice the maximum leaf worker runtime.
+
+    Factory claims are excluded by ``ChainlinkClaims.reap_home`` and have their
+    own durable recovery path, so leaf locks must not inherit the much longer
+    factory timeout.
+    """
+    return 2 * timeout_s
 
 
 DEFAULT_HIGH_RISK_SCOPE_PATTERNS: tuple[str, ...] = (
@@ -158,8 +162,8 @@ class WorklinkDefaults:
         required_reaper_ttl_s = minimum_reaper_ttl_s(self.timeout_s)
         if self.reaper_ttl_s < required_reaper_ttl_s:
             raise WorklinkDefaultsValidationError(
-                "worklink reaper_ttl_s must be at least 2 * the greater of timeout_s "
-                "and the factory run timeout so the TTL reaper cannot steal a live "
+                "worklink reaper_ttl_s must be at least 2 * timeout_s "
+                "so the TTL reaper cannot steal a live leaf "
                 f"worker (configured {self.reaper_ttl_s}; required {required_reaper_ttl_s})",
                 field="reaper_ttl_s",
                 configured_value=self.reaper_ttl_s,

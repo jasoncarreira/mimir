@@ -191,16 +191,18 @@ defaults:
     assert WORKLINK_MERGED_LABEL == "worklink:merged"
 
 
-def test_reaper_ttl_covers_factory_run_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_reaper_ttl_floor_is_dimensioned_by_leaf_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     monkeypatch.setenv("MIMIR_FACTORY_RUN_TIMEOUT_S", "5000.5")
 
     with pytest.raises(ValueError) as excinfo:
-        WorklinkDefaults(timeout_s=1800, reaper_ttl_s=10001)
+        WorklinkDefaults(timeout_s=1800, reaper_ttl_s=3599)
 
-    assert excinfo.value.configured_value == 10001
-    assert excinfo.value.required_value == 10002
-    assert "configured 10001; required 10002" in str(excinfo.value)
-    assert WorklinkDefaults(timeout_s=1800, reaper_ttl_s=10002).reaper_ttl_s == 10002
+    assert excinfo.value.configured_value == 3599
+    assert excinfo.value.required_value == 3600
+    assert "configured 3599; required 3600" in str(excinfo.value)
+    assert WorklinkDefaults(timeout_s=1800, reaper_ttl_s=3600).reaper_ttl_s == 3600
 
 
 def test_worklink_config_epic_overrides_and_tiered_review_parse(tmp_path: Path) -> None:

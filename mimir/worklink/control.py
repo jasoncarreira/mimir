@@ -352,10 +352,23 @@ def reconcile_run_states(
     home: Path,
     *,
     event_logger: EventLogger | None = None,
+    runner: Runner | None = None,
+    git_runner: Runner | None = None,
+    chainlink_bin: str = "chainlink",
     now: datetime | None = None,
 ) -> list[WorklinkRunState]:
-    """Clear dead local run records without allowing one bad file to fail startup."""
+    """Reconcile dead local runs without discarding their only recovery pointer.
+
+    A dead run with no unpublished commits is returned to ``worklink:ready``.
+    A checkout with commits absent from its remote branch is instead parked at
+    ``worklink:blocked`` so autonomous dispatch cannot redo or overwrite finished
+    work. In both cases the checkout is preserved. The Chainlink lock is released
+    before labels or local state are changed; if release fails, the state remains
+    as an actionable pointer and a failure event records the partial recovery.
+    """
     alive: list[WorklinkRunState] = []
+    run = runner or _runner(home, chainlink_bin)
+    run_git = git_runner or _git_runner(home)
     known_paths = {str(state.issue_id): state for state in list_run_states(home)}
     directory = runs_dir(home)
     if directory.exists():
@@ -371,16 +384,134 @@ def reconcile_run_states(
         if state.compute_name != "local_subprocess" or process_is_alive(state):
             alive.append(state)
             continue
-        clear_run_state(home, state.issue_id)
-        _emit_reconcile_event(
-            event_logger,
-            "worklink_run_orphaned",
-            issue_id=state.issue_id,
-            attempt=state.attempt,
-            elapsed_s=round(elapsed_seconds(state, now=now), 3),
-            reaped=load_run_state(home, state.issue_id) is None,
+        unpublished, publication_reason = _checkout_has_unpublished_commits(
+            state, run_git
         )
+        with _claim_mutex(home):
+            release = run([chainlink_bin, "locks", "release", str(state.issue_id)])
+            if release.returncode != 0:
+                _emit_orphan_reconcile_failed(
+                    event_logger, state, "lock_release_failed", release
+                )
+                continue
+
+            target = "worklink:blocked" if unpublished else "worklink:ready"
+            unlabel = run(
+                [
+                    chainlink_bin,
+                    "issue",
+                    "unlabel",
+                    str(state.issue_id),
+                    "worklink:in-progress",
+                ]
+            )
+            if unlabel.returncode != 0:
+                _emit_orphan_reconcile_failed(
+                    event_logger, state, "in_progress_unlabel_failed", unlabel
+                )
+                continue
+            label = run(
+                [chainlink_bin, "issue", "label", str(state.issue_id), target]
+            )
+            if label.returncode != 0:
+                _emit_orphan_reconcile_failed(
+                    event_logger, state, f"{target}_label_failed", label
+                )
+                continue
+
+            clear_run_state(home, state.issue_id)
+            _emit_reconcile_event(
+                event_logger,
+                "worklink_run_orphaned",
+                issue_id=state.issue_id,
+                attempt=state.attempt,
+                branch=state.branch,
+                checkout=state.checkout,
+                elapsed_s=round(elapsed_seconds(state, now=now), 3),
+                unpublished_commits=unpublished,
+                publication_reason=publication_reason,
+                resulting_label=target,
+                lock_released=True,
+                reaped=load_run_state(home, state.issue_id) is None,
+            )
     return alive
+
+
+def _git_runner(home: Path) -> Runner:
+    def run(args: Sequence[str]) -> subprocess.CompletedProcess[str]:
+        try:
+            return subprocess.run(
+                list(args),
+                cwd=home,
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=_CHAINLINK_COMMAND_TIMEOUT_SECONDS,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            return subprocess.CompletedProcess(args, 124, stdout="", stderr=str(exc))
+
+    return run
+
+
+def _checkout_has_unpublished_commits(
+    state: WorklinkRunState, run: Runner
+) -> tuple[bool, str]:
+    """Conservatively identify commits not published on this attempt's branch."""
+    checkout = Path(state.checkout)
+    if not state.checkout or not checkout.is_dir():
+        return True, "checkout unavailable"
+    head = run(["git", "-C", str(checkout), "rev-parse", "HEAD"])
+    if head.returncode != 0 or not head.stdout.strip():
+        return True, "checkout HEAD unavailable"
+    head_sha = head.stdout.strip().lower()
+    ahead = run(
+        ["git", "-C", str(checkout), "rev-list", "--count", f"{state.local_base}..HEAD"]
+    )
+    if ahead.returncode != 0:
+        return True, "checkout base comparison failed"
+    try:
+        ahead_count = int(ahead.stdout.strip())
+    except ValueError:
+        return True, "checkout base comparison invalid"
+    if ahead_count == 0:
+        return False, "checkout has no commits beyond its base"
+    remote = run(
+        [
+            "git",
+            "-C",
+            str(checkout),
+            "ls-remote",
+            "--heads",
+            "origin",
+            f"refs/heads/{state.branch}",
+        ]
+    )
+    if remote.returncode != 0:
+        return True, "remote branch lookup failed"
+    remote_sha = (remote.stdout.strip().split() or [""])[0].lower()
+    if remote_sha == head_sha:
+        return False, "checkout HEAD is published on its remote branch"
+    return True, "checkout HEAD is absent from its remote branch"
+
+
+def _emit_orphan_reconcile_failed(
+    event_logger: EventLogger | None,
+    state: WorklinkRunState,
+    reason: str,
+    result: subprocess.CompletedProcess[str],
+) -> None:
+    _emit_reconcile_event(
+        event_logger,
+        "worklink_run_orphan_reconcile_failed",
+        issue_id=state.issue_id,
+        attempt=state.attempt,
+        branch=state.branch,
+        checkout=state.checkout,
+        reason=reason,
+        error=(result.stderr or result.stdout).strip()[:500],
+        state_retained=True,
+    )
 
 
 def _emit_reconcile_event(

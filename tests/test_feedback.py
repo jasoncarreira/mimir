@@ -1016,6 +1016,29 @@ def test_classify_gave_up_suffix_is_negative():
     assert classify(123) is None
 
 
+def test_worklink_run_orphaned_is_negative_and_names_recovery_route():
+    from mimir.feedback import classify
+    from mimir.feedback.renderers import _render_event_line
+
+    assert classify("worklink_run_orphaned") == (
+        "negative",
+        "worklink_run_orphaned",
+    )
+    line = _render_event_line(
+        "worklink_run_orphaned",
+        {
+            "issue_id": 1454,
+            "branch": "issue/1454-a1",
+            "unpublished_commits": True,
+            "resulting_label": "worklink:blocked",
+        },
+    )
+    assert "#1454" in line
+    assert "issue/1454-a1" in line
+    assert "worklink:blocked" in line
+    assert "recover the checkout" in line
+
+
 def test_non_utf8_home_file_is_negative_and_renders_actionably():
     """chainlink #470: a non-UTF-8 home file surfaces as a negative algedonic
     signal that names the file + byte and tells the agent to clean it."""

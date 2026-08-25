@@ -269,7 +269,7 @@ def test_reap_home_reads_content_keyed_comment_dicts() -> None:
     assert [r.issue_id for r in reaped.reaped] == [49]
 
 
-def test_reap_home_reaps_stale_leaf_when_labels_are_unavailable() -> None:
+def test_reap_home_skips_stale_claim_when_leaf_vs_factory_is_unknown() -> None:
     comment = _claim_comment(1416, attempt=1, age=timedelta(hours=3))
     fake = FakeChainlink(in_progress=[1416], comments={1416: [comment]})
 
@@ -285,8 +285,39 @@ def test_reap_home_reaps_stale_leaf_when_labels_are_unavailable() -> None:
         ttl=timedelta(hours=2)
     )
 
-    assert [record.issue_id for record in reaped.reaped] == [1416]
-    assert "locks steal 1416" in fake.names()
+    # The leaf TTL is intentionally shorter than the factory runtime. Without
+    # labels the reaper cannot prove this is a leaf, so it must fail closed and
+    # expose why the issue was skipped instead of silently stalling the sweep.
+    assert reaped.reaped == []
+    assert reaped.skipped == {"epic_label_unavailable": 1}
+    assert not any(call[1:3] == ["locks", "steal"] for call in fake.calls)
+
+
+@pytest.mark.parametrize(
+    "unavailable_result",
+    [
+        cp(returncode=1, stderr="tracker unavailable"),
+        cp(stdout="not json"),
+        cp(stdout=json.dumps({"comments": []})),
+    ],
+)
+def test_reap_home_reports_each_unreadable_epic_label_shape(
+    unavailable_result: subprocess.CompletedProcess[str],
+) -> None:
+    comment = _claim_comment(1417, attempt=1, age=timedelta(hours=3))
+    fake = FakeChainlink(in_progress=[1417], comments={1417: [comment]})
+
+    def runner(args: Sequence[str]) -> subprocess.CompletedProcess[str]:
+        if list(args)[1:3] == ["issue", "show"]:
+            return unavailable_result
+        return fake(args)
+
+    reaped = ChainlinkClaims(agent_id="t", runner=runner).reap_home(
+        ttl=timedelta(hours=2)
+    )
+
+    assert reaped.reaped == []
+    assert reaped.skipped == {"epic_label_unavailable": 1}
 
 
 def test_reap_home_does_not_reap_a_heartbeating_claim_made_after_a_reset() -> None:
@@ -762,7 +793,7 @@ def test_reap_for_home_enforces_ttl_floor_boundary(
     assert bool(events) is emits_violation
 
 
-def test_config_load_raises_deployed_legacy_reaper_ttl_to_safe_floor(
+def test_config_load_does_not_raise_leaf_ttl_to_factory_timeout(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
@@ -773,9 +804,8 @@ def test_config_load_raises_deployed_legacy_reaper_ttl_to_safe_floor(
     with caplog.at_level("WARNING", logger="mimir.worklink.backends.registry"):
         config = WorklinkConfig.load(tmp_path / "worklink.yaml")
 
-    assert config.defaults.reaper_ttl_s == 86400
-    assert "defaults.reaper_ttl_s=7800 below the safe floor 86400" in caplog.text
-    assert "Update defaults.reaper_ttl_s to at least 86400" in caplog.text
+    assert config.defaults.reaper_ttl_s == 7800
+    assert "below the safe floor" not in caplog.text
 
 
 def test_reaper_ttl_constraint_is_stated_once() -> None:
@@ -786,7 +816,9 @@ def test_reaper_ttl_constraint_is_stated_once() -> None:
     floor_source = inspect.getsource(minimum_reaper_ttl_s)
     validation_source = inspect.getsource(WorklinkDefaults.validate)
     reaper_source = inspect.getsource(autonomy.reap_stale_claims_for_home)
-    assert (floor_source + validation_source + reaper_source).count("2 * max") == 1
+    assert (floor_source + validation_source + reaper_source).count(
+        "return 2 * timeout_s"
+    ) == 1
 
 
 def test_config_load_validates_the_complete_defaults_object(
