@@ -344,9 +344,14 @@ OCI revision label and `/opt/mimir-worklink/executor-source-commit`. The executo
 identity operation exposes the recorded SHA and `/health` reports it as
 `worklink_executor_source_commit`. Dirty-tree executor builds are unsupported;
 working-directory edits cannot enter this root-owned artifact. Deployment
-compose files must pin the immutable Git source and pass the same resolved full
-SHA for `MIMIR_CONTROLLER_COMMIT` and `MIMIR_EXECUTOR_COMMIT`; “point it at
-whichever checkout you want” is not a valid deployment contract.
+compose files must pass a fully qualified `MIMIR_GIT_REF` plus the same resolved
+full SHA for `MIMIR_CONTROLLER_COMMIT` and `MIMIR_EXECUTOR_COMMIT`. The build
+fetches exactly that ref and refuses unless `FETCH_HEAD` equals the pinned SHA.
+This permits CI to name `refs/pull/<number>/merge` while keeping the SHA
+authoritative; “point it at whichever checkout you want” is not a valid
+deployment contract. All three provenance arguments are required, so plain
+`docker build .` intentionally fails. Deploying a new executor requires rebuilding
+and recreating the image; pulling a controller checkout is insufficient.
 
 Entry points:
 

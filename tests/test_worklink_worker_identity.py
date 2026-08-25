@@ -28,9 +28,13 @@ def test_image_provisions_protected_worklink_roots() -> None:
 
 def test_root_executor_is_immutable_and_installed_outside_user_homes() -> None:
     text = DOCKERFILE.read_text(encoding="utf-8")
+    assert 'ARG MIMIR_GIT_REF' in text
     assert 'ARG MIMIR_EXECUTOR_COMMIT' in text
     assert "grep -Eq '^[0-9a-f]{40}$'" in text
-    assert 'git -C /opt/mimir-worklink/source checkout --detach "$MIMIR_EXECUTOR_COMMIT"' in text
+    assert 'git check-ref-format "$MIMIR_GIT_REF"' in text
+    assert 'git -C /opt/mimir-worklink/source fetch --no-tags --depth=1 origin "$MIMIR_GIT_REF"' in text
+    assert 'rev-parse FETCH_HEAD' in text
+    assert 'git -C /opt/mimir-worklink/source checkout --detach FETCH_HEAD' in text
     assert 'git -C /opt/mimir-worklink/source status --porcelain=v1' in text
     assert 'executor-source-commit' in text
     assert "COPY --chown=root:root mimir/ /opt/mimir-worklink/source/mimir/" not in text
@@ -84,6 +88,15 @@ def test_spawn_image_proof_uses_one_checked_seed_tree() -> None:
     assert "def seed_status() -> bytes:" in spawn_proof
     assert "check=True" in spawn_proof
     assert "/home/mimir/worklink-source" not in spawn_proof
+
+
+def test_image_proof_passes_the_github_remote_ref(monkeypatch) -> None:
+    namespace = runpy.run_path(ROOT / "scripts/worklink_image_identity.py")
+    monkeypatch.delenv("MIMIR_GIT_REF", raising=False)
+    monkeypatch.setenv("GITHUB_REF", "refs/pull/1755/merge")
+
+    assert namespace["source_ref"]() == "refs/pull/1755/merge"
+    assert 'f"MIMIR_GIT_REF={git_ref}"' in (ROOT / "scripts/worklink_image_identity.py").read_text()
 
 
 def test_ci_runs_the_committed_live_image_proof() -> None:

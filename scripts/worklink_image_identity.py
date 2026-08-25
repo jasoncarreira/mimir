@@ -297,9 +297,28 @@ asyncio.run(main())
 """
 
 
+def source_ref() -> str:
+    """Return the exact remote ref expected to contain this checkout's HEAD."""
+    explicit = os.environ.get("MIMIR_GIT_REF") or os.environ.get("GITHUB_REF")
+    if explicit:
+        return explicit
+    try:
+        branch = run(["git", "symbolic-ref", "--quiet", "--short", "HEAD"]).stdout.strip()
+        tracked_ref = run(["git", "config", "--get", f"branch.{branch}.merge"]).stdout.strip()
+    except RuntimeError as exc:
+        raise RuntimeError(
+            "set MIMIR_GIT_REF to the fully qualified remote branch, tag, or pull ref "
+            "that contains this commit"
+        ) from exc
+    if not tracked_ref.startswith("refs/"):
+        raise RuntimeError(f"tracked Git ref is not fully qualified: {tracked_ref!r}")
+    return tracked_ref
+
+
 def main() -> None:
     run(["docker", "info"], timeout=30)
     source_commit = run(["git", "rev-parse", "HEAD"]).stdout.strip()
+    git_ref = source_ref()
     if run(["git", "status", "--porcelain=v1"]).stdout.strip():
         raise RuntimeError("live image proof requires a clean source checkout")
     service = (ROOT / "deploy/s6-overlay/s6-rc.d/mimir/run").read_text()
@@ -309,6 +328,7 @@ def main() -> None:
     try:
         run([
             "docker", "build",
+            "--build-arg", f"MIMIR_GIT_REF={git_ref}",
             "--build-arg", f"MIMIR_CONTROLLER_COMMIT={source_commit}",
             "--build-arg", f"MIMIR_EXECUTOR_COMMIT={source_commit}",
             "--tag", IMAGE, ".",
