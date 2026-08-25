@@ -9739,12 +9739,13 @@ def can_resolve_forge_review_scope(
 
     - Authenticated operator ``user_message`` turns may reuse stored scope and
       discover any configured pull request.
-    - Admin service ``poller`` turns arriving through stamped ingress may
-      discover scope only for an open pull request authored by Mimir's own
-      configured forge login. Fetch is provisionally allowed so ownership can
-      be established from the forge snapshot; acceptance enforces ownership.
-    - Local ``scheduled_tick`` service turns may reuse scope previously
-      discovered by the server, but may not perform new live discovery.
+    - Trusted ``poller`` services that were granted ``pr_metadata`` may reuse
+      stored scope and provisionally fetch an open pull request. Acceptance
+      still requires the pull request to be authored by Mimir's configured
+      forge login.
+    - Trusted ``scheduled_tick`` services in a review-scope authority profile
+      may reuse scope previously discovered by the server, but may not perform
+      new live discovery.
 
     No other turn kind may reuse or discover forge review scope.
     """
@@ -9755,6 +9756,7 @@ def can_resolve_forge_review_scope(
     is_service = getattr(auth_context, "is_service", False)
     principal = getattr(auth_context, "canonical_principal", None)
     roles = getattr(auth_context, "roles", ())
+    trusted_service = get_trusted_service_from_auth_context(auth_context)
 
     operator_user = (
         trigger == "user_message"
@@ -9765,20 +9767,17 @@ def can_resolve_forge_review_scope(
     )
     poller_service = (
         trigger == "poller"
-        and is_service
-        and ingress is not None
-        and bool(principal)
-        and "admin" in roles
+        and trusted_service is not None
+        and trusted_service.has_capability("pr_metadata")
     )
     scheduled_service = (
         trigger == "scheduled_tick"
-        and is_service
-        and ingress is None
-        and bool(principal)
+        and trusted_service is not None
+        and trusted_service.authority_profile in _PR_REVIEW_SCOPE_AUTHORITY_PROFILES
     )
 
     if stage == "stored":
-        return operator_user or scheduled_service
+        return operator_user or poller_service or scheduled_service
     if stage == "fetch":
         return operator_user or poller_service
     if stage == "accept":

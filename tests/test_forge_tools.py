@@ -90,23 +90,15 @@ def _scope(
     )
 
 
-_FORGE_AUTHORIZATION_FIELDS = (
-    "canonical_principal", "roles", "event_ingress", "trigger", "is_service",
-)
-
-
 def _production_auth_context(tmp_path, turn_kind: str) -> AuthContext:
-    """Build a real caller shape through the production ingress builder."""
+    """Build real caller shapes through the event forms production dispatches."""
     state = tmp_path / "state"
     state.mkdir(exist_ok=True)
     (state / "identities.yaml").write_text(
         "people:\n"
         "  - canonical: operator\n"
         "    aliases: [chat-operator]\n"
-        "    access: {roles: [admin]}\n"
-        "  - canonical: poller-operator\n"
-        "    aliases: [worklink-poller]\n"
-        "    access: {roles: [admin], is_service: true}\n",
+        "    access: {roles: [admin]}\n",
         encoding="utf-8",
     )
     resolver = IdentityResolver(tmp_path)
@@ -115,37 +107,41 @@ def _production_auth_context(tmp_path, turn_kind: str) -> AuthContext:
         event = AgentEvent(
             trigger="user_message", channel_id="operator", author="chat-operator",
         )
-        event_ingress = None
     elif turn_kind == "poller_service":
-        event = AgentEvent(
-            trigger="poller", channel_id="poller:forge", author="worklink-poller",
+        authority = access_control.build_trigger_service_principal(
+            canonical="poller:github-activity",
+            trigger="poller",
+            profile="github",
+            tier=access_control.CapabilityTier.CODE_EXECUTION,
+            capabilities=("pr_metadata",),
+            creation_path="mimir.pollers.run_poller",
         )
-        event_ingress = "worklink"
+        event = AgentEvent(
+            trigger="poller",
+            channel_id="poller:github-activity",
+            service_principal=authority.canonical,
+            service_authority=authority,
+        )
     elif turn_kind == "scheduled_tick":
-        event = AgentEvent(
-            trigger="scheduled_tick", channel_id="scheduler:test",
-            service_principal="scheduler",
+        authority = access_control.build_trigger_service_principal(
+            canonical="heartbeat",
+            trigger="scheduled_tick",
+            profile="heartbeat",
+            tier=access_control.CapabilityTier.UNBOUNDED,
+            capabilities=("pr_metadata",),
+            creation_path="mimir.scheduler.Scheduler._fire:heartbeat",
         )
-        event_ingress = None
+        event = AgentEvent(
+            trigger="scheduled_tick",
+            channel_id="scheduler:test",
+            service_principal=authority.canonical,
+            service_authority=authority,
+        )
     else:
         raise ValueError(f"unknown production turn kind: {turn_kind!r}")
     return access_control.create_auth_context(
-        event, resolver, enforce=True, event_ingress=event_ingress,
-        ifc_labels=InformationFlowLabels(),
+        event, resolver, enforce=True, ifc_labels=InformationFlowLabels(),
     )
-
-
-def _assert_production_auth_context(
-    actual: AuthContext, tmp_path, turn_kind: str,
-) -> None:
-    expected = _production_auth_context(tmp_path, turn_kind)
-    for field_name in _FORGE_AUTHORIZATION_FIELDS:
-        actual_value = getattr(actual, field_name)
-        expected_value = getattr(expected, field_name)
-        assert actual_value == expected_value, (
-            f"AuthContext field {field_name} diverges from production builder: "
-            f"test={actual_value!r}, production={expected_value!r}"
-        )
 
 
 def _runtime(scope: RepoPRActionScope) -> ToolRuntime[AuthContext]:
@@ -432,6 +428,13 @@ def _autonomous_context(tmp_path, store: ServerDiscoveredPRScopeStore) -> AuthCo
     )
 
 
+def _poller_context(tmp_path, store: ServerDiscoveredPRScopeStore | None = None) -> AuthContext:
+    return replace(
+        _production_auth_context(tmp_path, "poller_service"),
+        server_discovered_pr_scope_store=store,
+    )
+
+
 def _configure_live_review(
     monkeypatch: pytest.MonkeyPatch, client: FakeForge,
 ) -> None:
@@ -465,6 +468,30 @@ def test_server_discovered_scope_is_reused_on_later_autonomous_turn(
     )
 
     assert handed.action_scope.provenance == "server_discovered"
+    assert reused.action_scope is handed.action_scope
+    assert client.calls == [
+        ("snapshot", "owner/repo", 1291),
+        ("snapshot", "owner/repo", 1291),
+    ]
+
+
+def test_server_discovered_scope_is_reused_on_later_production_poller_turn(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = FakeForge()
+    _configure_live_review(monkeypatch, client)
+    store = ServerDiscoveredPRScopeStore()
+    operator = replace(
+        _production_auth_context(tmp_path, "operator_user"),
+        server_discovered_pr_scope_store=store,
+    )
+
+    handed = resolve_review_state_for_context(operator, "owner/repo", 1291)
+    reused = resolve_review_state_for_context(
+        _poller_context(tmp_path, store), "OWNER/REPO", 1291,
+    )
+
     assert reused.action_scope is handed.action_scope
     assert client.calls == [
         ("snapshot", "owner/repo", 1291),
@@ -625,7 +652,7 @@ def test_operator_registry_miss_still_discovers_live_scope(
 
 
 def _poller_operator_context(tmp_path) -> AuthContext:
-    return _production_auth_context(tmp_path, "poller_service")
+    return _poller_context(tmp_path)
 
 
 @pytest.mark.parametrize(
@@ -635,7 +662,7 @@ def _poller_operator_context(tmp_path) -> AuthContext:
             "operator_user", (True, True, True, True), id="operator-user-turn",
         ),
         pytest.param(
-            "poller_service", (False, True, True, False), id="poller-service-turn",
+            "poller_service", (True, True, True, False), id="poller-service-turn",
         ),
         pytest.param(
             "scheduled_tick", (True, False, False, False), id="scheduled-tick",
@@ -661,25 +688,39 @@ def test_real_turn_kind_forge_review_scope_policy(
     assert actual == expected
 
 
-@pytest.mark.parametrize(
-    "turn_kind", ["operator_user", "poller_service", "scheduled_tick"],
-)
-def test_forge_authorization_contexts_conform_to_production_builder(
-    tmp_path, turn_kind: str,
-) -> None:
-    context = _production_auth_context(tmp_path, turn_kind)
+def test_production_poller_context_uses_declared_service_authority(tmp_path) -> None:
+    context = _production_auth_context(tmp_path, "poller_service")
 
-    _assert_production_auth_context(context, tmp_path, turn_kind)
+    assert context.trigger == "poller"
+    assert context.is_service is True
+    assert context.event_ingress is None
+    assert context.roles == ()
+    assert context.canonical_principal == "poller:github-activity"
+    assert context.service_authority is not None
+    assert context.service_authority.authority_profile == "github"
+    assert context.service_authority.has_capability("pr_metadata")
 
 
-def test_forge_authorization_context_conformance_names_divergent_field(tmp_path) -> None:
-    impossible = replace(
-        _production_auth_context(tmp_path, "poller_service"),
-        event_ingress=None,
+def test_poller_without_review_capability_cannot_resolve_forge_scope(tmp_path) -> None:
+    context = _production_auth_context(tmp_path, "poller_service")
+    unprivileged = replace(
+        context,
+        service_authority=access_control.build_trigger_service_principal(
+            canonical="poller:github-activity",
+            trigger="poller",
+            profile="github",
+            tier=access_control.CapabilityTier.CODE_EXECUTION,
+            capabilities=(),
+            creation_path="mimir.pollers.run_poller",
+        ),
     )
 
-    with pytest.raises(AssertionError, match="field event_ingress diverges"):
-        _assert_production_auth_context(impossible, tmp_path, "poller_service")
+    assert not access_control.can_resolve_forge_review_scope(
+        unprivileged, stage="stored",
+    )
+    assert not access_control.can_resolve_forge_review_scope(
+        unprivileged, stage="fetch",
+    )
 
 
 def test_forge_review_scope_path_has_no_raw_authorization_field_reads() -> None:
