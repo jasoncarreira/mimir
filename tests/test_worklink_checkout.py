@@ -970,6 +970,79 @@ def test_clone_raises_when_the_object_copy_also_fails() -> None:
         )
 
 
+def test_foreign_owned_git_objects_are_reported_with_path_uid_and_mode(
+    tmp_path: Path,
+) -> None:
+    repo = tmp_path / "repo"
+    object_path = repo / ".git" / "objects" / "aa" / "object"
+    object_path.parent.mkdir(parents=True)
+    object_path.write_bytes(b"object")
+    object_path.chmod(0o444)
+    events: list[tuple[str, dict]] = []
+
+    foreign = checkout_module.report_foreign_owned_git_objects(
+        repo,
+        expected_uid=object_path.stat().st_uid + 1,
+        event_logger=lambda name, **fields: events.append((name, fields)),
+    )
+
+    assert foreign == [object_path]
+    assert events == [
+        (
+            "worklink_foreign_owned_git_object",
+            {
+                "repo": str(repo),
+                "object_path": str(object_path),
+                "owner_uid": object_path.stat().st_uid,
+                "expected_owner_uid": object_path.stat().st_uid + 1,
+                "mode": "0o444",
+            },
+        )
+    ]
+
+
+def test_git_object_ownership_check_stays_quiet_when_every_object_matches(
+    tmp_path: Path,
+) -> None:
+    repo = tmp_path / "repo"
+    object_path = repo / ".git" / "objects" / "bb" / "object"
+    object_path.parent.mkdir(parents=True)
+    object_path.write_bytes(b"object")
+    events: list[tuple[str, dict]] = []
+
+    foreign = checkout_module.report_foreign_owned_git_objects(
+        repo,
+        expected_uid=object_path.stat().st_uid,
+        event_logger=lambda name, **fields: events.append((name, fields)),
+    )
+
+    assert foreign == []
+    assert events == []
+
+
+def test_git_object_ownership_check_is_not_reachable_from_clone_path(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scanner_name = checkout_module.report_foreign_owned_git_objects.__name__
+
+    monkeypatch.setattr(
+        checkout_module,
+        scanner_name,
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("ownership check reached from clone path")
+        ),
+    )
+    checkout_module._clone_attempt_checkout(
+        Path("/repo"),
+        Path("/checkout"),
+        runner=lambda args: completed(args),
+        event_logger=None,
+    )
+
+    assert scanner_name not in inspect.getsource(checkout_module._clone_attempt_checkout)
+    assert scanner_name not in inspect.getsource(checkout_module.create_isolated_checkout)
+
+
 @pytest.mark.parametrize("value", [None, "", "0", "false", "off"])
 def test_disabled_coding_keeps_legacy_checkout_path(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, value: str | None
