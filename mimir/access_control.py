@@ -8197,17 +8197,29 @@ def record_file_write_integrity(
 def _incomplete_protected_result(
     domain: str,
     arguments: dict[str, Any],
+    *,
+    tool_name: str,
+    auth_context: "AuthContext | None",
 ) -> "InformationFlowLabels":
     from .models import InformationFlowLabels, SourceLabel
 
     resource = next(
         (
             arguments.get(key)
-            for key in ("path", "file_path", "query", "turn_id", "atom_id", "job_id")
+            for key in ("path", "file_path", "turn_id", "atom_id", "job_id")
             if isinstance(arguments.get(key), str) and arguments.get(key)
         ),
-        "unknown",
+        None,
     )
+    channel = getattr(auth_context, "channel_id", None)
+    bridge = getattr(auth_context, "bridge_instance", None)
+    if resource is None and (
+        bridge == "acp-stdio"
+        or isinstance(channel, str) and channel.startswith("acp:")
+    ):
+        resource = channel
+    if resource is None:
+        resource = f"<unresolved-resource:protected_tool:{tool_name}>"
     return InformationFlowLabels().with_source(SourceLabel(
         principal=None,
         domain=domain,
@@ -8248,7 +8260,9 @@ def classify_protected_result(
     }:
         scope = authorization.repo_pr_action_scope
         if scope is None or failed:
-            return _incomplete_protected_result("repository", args)
+            return _incomplete_protected_result(
+                "repository", args, tool_name=tool_name, auth_context=auth_context,
+            )
         principal = getattr(auth_context, "canonical_principal", None)
         if getattr(auth_context, "is_service", False) and principal:
             principal = f"service:{principal}"
@@ -8298,7 +8312,11 @@ def classify_protected_result(
         if resources == ():
             return None
         if resources is None or failed:
-            return _incomplete_protected_result("client_provider", args)
+            return _incomplete_protected_result(
+                "client_provider", args,
+                tool_name=tool_name,
+                auth_context=auth_context,
+            )
         principal = getattr(auth_context, "canonical_principal", None)
         bridge_instance = getattr(auth_context, "bridge_instance", None)
         integrity = (
@@ -8335,7 +8353,8 @@ def classify_protected_result(
             if not failed and authorization.result_integrity == "trusted"
             else "untrusted"
         )
-        for resource in resources or ("unknown",):
+        unresolved = f"<unresolved-resource:mcp:{tool_name}>"
+        for resource in resources or (unresolved,):
             labels = labels.with_source(SourceLabel(
                 principal=principal if resources is not None else None,
                 domain="mcp",
@@ -8414,7 +8433,9 @@ def classify_protected_result(
         domain = "unknown"
 
     if failed:
-        return _incomplete_protected_result(domain, args)
+        return _incomplete_protected_result(
+            domain, args, tool_name=tool_name, auth_context=auth_context,
+        )
 
     if provenance is not None:
         if not provenance.sources:
@@ -8444,7 +8465,9 @@ def classify_protected_result(
             if source.integrity == "trusted":
                 return InformationFlowLabels().with_source(source)
 
-    return _incomplete_protected_result(domain, args)
+    return _incomplete_protected_result(
+        domain, args, tool_name=tool_name, auth_context=auth_context,
+    )
 
 
 _global_tool_registry = ToolRegistry()
