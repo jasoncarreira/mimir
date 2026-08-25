@@ -938,17 +938,19 @@ class ChainlinkClaims:
         issue_id: int,
         label: str,
         *,
-        default_on_unavailable: bool = True,
-    ) -> bool:
+        default_on_unavailable: bool | None = True,
+    ) -> bool | None:
         """Best-effort current-label check for reaper race avoidance.
 
         Reaper discovery is necessarily two-step (list in-progress, then inspect
         comments). A worker can transition the issue to review/blocked between
         discovery and ``locks steal``. When ``issue show --json`` exposes labels,
         refuse to relabel anything no longer in-progress. If the label shape is
-        unavailable, callers choose the safe default for their operation. The
-        in-progress race guards preserve prior behavior with the default True;
-        exclusion predicates such as the epic guard use False.
+        unavailable, callers choose the safe result for their operation. The
+        in-progress race guards preserve prior behavior with the default ``True``;
+        the epic exclusion passes ``None`` so it can fail closed *and* record that
+        the label read was unavailable instead of silently treating every issue
+        as an epic.
         """
         result = self._run("issue", "show", str(issue_id), "--json", check=False)
         if result.returncode != 0:
@@ -1194,11 +1196,17 @@ class ChainlinkClaims:
             # Factory claims have a longer runtime than leaves. If labels cannot
             # be read, fail closed and skip the issue rather than applying the
             # leaf TTL to a factory lock whose epic marker could not be observed.
-            if self._issue_has_label(
+            epic_status = self._issue_has_label(
                 issue_id,
                 WORKLINK_EPIC_LABEL,
-                default_on_unavailable=True,
-            ):
+                default_on_unavailable=None,
+            )
+            if epic_status is None:
+                discovery_skipped["epic_label_unavailable"] = (
+                    discovery_skipped.get("epic_label_unavailable", 0) + 1
+                )
+                continue
+            if epic_status:
                 continue
             for record in claim_records_from_comments(self._issue_comments(issue_id)):
                 current = latest.get(record.issue_id)

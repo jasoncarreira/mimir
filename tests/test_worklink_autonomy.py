@@ -286,9 +286,38 @@ def test_reap_home_skips_stale_claim_when_leaf_vs_factory_is_unknown() -> None:
     )
 
     # The leaf TTL is intentionally shorter than the factory runtime. Without
-    # labels the reaper cannot prove this is a leaf, so it must fail closed.
+    # labels the reaper cannot prove this is a leaf, so it must fail closed and
+    # expose why the issue was skipped instead of silently stalling the sweep.
     assert reaped.reaped == []
+    assert reaped.skipped == {"epic_label_unavailable": 1}
     assert not any(call[1:3] == ["locks", "steal"] for call in fake.calls)
+
+
+@pytest.mark.parametrize(
+    "unavailable_result",
+    [
+        cp(returncode=1, stderr="tracker unavailable"),
+        cp(stdout="not json"),
+        cp(stdout=json.dumps({"comments": []})),
+    ],
+)
+def test_reap_home_reports_each_unreadable_epic_label_shape(
+    unavailable_result: subprocess.CompletedProcess[str],
+) -> None:
+    comment = _claim_comment(1417, attempt=1, age=timedelta(hours=3))
+    fake = FakeChainlink(in_progress=[1417], comments={1417: [comment]})
+
+    def runner(args: Sequence[str]) -> subprocess.CompletedProcess[str]:
+        if list(args)[1:3] == ["issue", "show"]:
+            return unavailable_result
+        return fake(args)
+
+    reaped = ChainlinkClaims(agent_id="t", runner=runner).reap_home(
+        ttl=timedelta(hours=2)
+    )
+
+    assert reaped.reaped == []
+    assert reaped.skipped == {"epic_label_unavailable": 1}
 
 
 def test_reap_home_does_not_reap_a_heartbeating_claim_made_after_a_reset() -> None:
