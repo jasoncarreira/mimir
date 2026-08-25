@@ -287,7 +287,6 @@ def resolve_review_state_for_context(
         raise ToolException(stale_refusal)
     if (
         context is None
-        or context.trigger != "user_message"
         or context.is_service
         or context.event_ingress is not None
         or not context.canonical_principal
@@ -318,10 +317,21 @@ def resolve_review_state_for_context(
         snapshot = client.get_pull_request_snapshot(repository.lower(), pull_request)
     except ForgeError as exc:
         raise ToolException(f"pull-request operation rejected: {exc}") from exc
+    self_login = os.environ.get("MIMIR_GITHUB_SELF_LOGIN", "").strip()
+    if (
+        context.trigger != "user_message"
+        and (not self_login or snapshot.author != self_login)
+    ):
+        scope_refusal = (
+            "pull-request operation rejected: requested "
+            f"repository={json.dumps(repository)}, pull_request={pull_request}; "
+            "live scope discovery requires an authenticated operator user turn"
+        )
+        if isinstance(cache, ServerDiscoveredPRStates):
+            cache.remember_refusal(repository, pull_request, scope_refusal)
+        raise ToolPolicyRefusal(scope_refusal)
     review_state = None
-    if snapshot.state == "open" and snapshot.author == os.environ.get(
-        "MIMIR_GITHUB_SELF_LOGIN", ""
-    ).strip():
+    if snapshot.state == "open" and snapshot.author == self_login:
         discovery_scope = create_server_discovered_review_scope(repository, snapshot)
         if discovery_scope is not None:
             try:
