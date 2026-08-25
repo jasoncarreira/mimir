@@ -17,6 +17,7 @@ import os
 import posixpath
 import re
 from pathlib import Path
+import sys
 import uuid
 from typing import Any, Callable, Mapping, Protocol, Sequence
 
@@ -451,7 +452,12 @@ class LocalSubprocessComputeBackend:
         try:
             from .worker_exec import _arm_parent_death_signal
 
-            parent_pid = os.getpid()
+            launch_options: dict[str, Any] = {}
+            if sys.platform.startswith("linux"):
+                parent_pid = os.getpid()
+                launch_options["preexec_fn"] = (
+                    lambda: _arm_parent_death_signal(parent_pid)
+                )
             proc = await asyncio.create_subprocess_exec(
                 *command,
                 stdin=asyncio.subprocess.DEVNULL,
@@ -460,7 +466,7 @@ class LocalSubprocessComputeBackend:
                 cwd=str(spec.local_checkout),
                 env=env,
                 start_new_session=True,
-                preexec_fn=lambda: _arm_parent_death_signal(parent_pid),
+                **launch_options,
             )
         except BaseException as exc:
             stdout_sink.close()

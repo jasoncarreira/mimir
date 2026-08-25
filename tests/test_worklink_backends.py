@@ -5,6 +5,7 @@ import json
 import subprocess
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -562,20 +563,60 @@ async def test_local_subprocess_compute_backend_preserves_subprocess_shape(
         stdout_path=result.stdout_path,
         stderr_path=result.stderr_path,
     )
+    expected_kwargs = {
+        "stdin": asyncio.subprocess.DEVNULL,
+        "stdout": calls[0]["kwargs"]["stdout"],
+        "stderr": calls[0]["kwargs"]["stderr"],
+        "cwd": str(tmp_path),
+        "env": {"PATH": "/custom/bin", "X": "1"},
+        "start_new_session": True,
+    }
+    if compute_module.sys.platform.startswith("linux"):
+        expected_kwargs["preexec_fn"] = calls[0]["kwargs"]["preexec_fn"]
     assert calls == [
         {
             "args": ("tool", "arg", "--cd", str(tmp_path), "prompt"),
-                "kwargs": {
-                    "stdin": asyncio.subprocess.DEVNULL,
-                    "stdout": calls[0]["kwargs"]["stdout"],
-                    "stderr": calls[0]["kwargs"]["stderr"],
-                    "cwd": str(tmp_path),
-                    "env": {"PATH": "/custom/bin", "X": "1"},
-                    "start_new_session": True,
-                    "preexec_fn": calls[0]["kwargs"]["preexec_fn"],
-                },
+            "kwargs": expected_kwargs,
         }
     ]
+
+
+@pytest.mark.asyncio
+async def test_local_subprocess_compute_omits_parent_death_hook_off_linux(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    calls: list[dict[str, Any]] = []
+
+    async def fake_exec(*args: str, **kwargs: Any) -> FakeProcess:
+        calls.append({"args": args, "kwargs": kwargs})
+        return FakeProcess(returncode=0)
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+    monkeypatch.setattr("mimir.worklink.compute._local_child_env", dict)
+    monkeypatch.setattr(compute_module, "sys", SimpleNamespace(platform="darwin"))
+    backend = LocalSubprocessComputeBackend()
+    spec = WorkSpec(
+        issue_id=1,
+        attempt=1,
+        repo_url="repo",
+        base_ref="main",
+        branch="issue/1-a1",
+        prompt="prompt",
+        rules=None,
+        test_command="echo ok",
+        backend="other_tool",
+        timeout_s=5,
+        local_checkout=tmp_path,
+        local_argv=("tool", "arg"),
+        output_root=tmp_path / "transcripts",
+    )
+
+    handle = await backend.launch(spec)
+    await backend.wait(handle, 5)
+    await backend.cleanup(handle)
+
+    assert len(calls) == 1
+    assert "preexec_fn" not in calls[0]["kwargs"]
 
 
 @pytest.mark.asyncio

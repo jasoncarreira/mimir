@@ -965,8 +965,28 @@ def test_arm_parent_death_signal_closes_pre_prctl_race(monkeypatch) -> None:
 
     worker_exec._arm_parent_death_signal(100)
 
-    assert calls == [(1, signal.SIGKILL, 0, 0, 0)]
-    assert exits == [128 + signal.SIGKILL]
+    if sys.platform.startswith("linux"):
+        assert calls == [(1, signal.SIGKILL, 0, 0, 0)]
+        assert exits == [128 + signal.SIGKILL]
+    else:
+        # No portable PDEATHSIG equivalent exists. Launch remains available, with
+        # controller cancellation/reaping but no sudden-parent-death guarantee.
+        assert calls == []
+        assert exits == []
+
+
+def test_arm_parent_death_signal_is_noop_off_linux(monkeypatch) -> None:
+    monkeypatch.setattr(worker_exec, "sys", SimpleNamespace(platform="darwin"))
+    monkeypatch.setattr(
+        worker_exec.ctypes,
+        "CDLL",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("non-Linux fallback must not load libc prctl")
+        ),
+    )
+
+    worker_exec._arm_parent_death_signal(100)
+
 
 def test_process_group_cancellation_reports_unreapable_member(monkeypatch) -> None:
     waits: list[tuple[int, float]] = []

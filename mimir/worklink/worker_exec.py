@@ -13,6 +13,7 @@ import socket
 import stat
 import struct
 import subprocess
+import sys
 import threading
 import time
 from typing import Any
@@ -104,7 +105,14 @@ def _last_capability() -> int:
 
 
 def _arm_parent_death_signal(expected_parent_pid: int) -> None:
-    """Kill a direct worker if its controller dies between launch and reap."""
+    """Arm Linux's parent-death signal, with a documented portable fallback.
+
+    Non-Linux kernels do not provide ``prctl(PR_SET_PDEATHSIG)``. On those
+    platforms normal controller cancellation and reaping still apply, but a
+    sudden controller death may orphan the worker.
+    """
+    if not sys.platform.startswith("linux"):
+        return
     libc = ctypes.CDLL(None, use_errno=True)
     if libc.prctl(1, signal.SIGKILL, 0, 0, 0) != 0:  # PR_SET_PDEATHSIG
         error = ctypes.get_errno()
