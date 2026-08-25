@@ -304,6 +304,40 @@ def test_ignored_only_untracked_content_is_accepted(tmp_path: Path) -> None:
     assert events == []
 
 
+def test_base_repo_owner_mismatch_refuses_before_git_runs(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A base repo owned by another account is refused without consulting git.
+
+    Running ``git status`` as a non-owner yields "dubious ownership" and an EMPTY
+    porcelain result, which reads as clean. The sibling test covers that reactive
+    path; this one covers the proactive uid comparison that avoids it entirely.
+    """
+    events: list[tuple[str, dict[str, object]]] = []
+    owner_uid = tmp_path.stat().st_uid
+
+    def runner(args: Sequence[str]) -> subprocess.CompletedProcess[str]:
+        raise AssertionError(f"git must not run when the base owner differs: {list(args)}")
+
+    monkeypatch.setattr(checkout_module.os, "geteuid", lambda: owner_uid + 1)
+
+    with pytest.raises(RuntimeError, match="owner_mismatch.*status account uid"):
+        create_worktree(
+            tmp_path,
+            issue_id=1459,
+            attempt=1,
+            runner=runner,
+            event_logger=lambda name, **payload: events.append((name, payload)),
+        )
+
+    assert events[0][0] == "worklink_base_repo_refused"
+    payload = events[0][1]
+    assert payload["reason"] == "owner_mismatch"
+    assert payload["owner_uid"] == owner_uid
+    assert payload["effective_uid"] == owner_uid + 1
+
+
 def test_git_status_ownership_failure_refuses_instead_of_reading_empty_stdout(
     tmp_path: Path,
 ) -> None:
