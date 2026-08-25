@@ -28,6 +28,7 @@ from .worker_client import (
     MAX_REQUEST_BYTES,
     _PROJECTION_PATHS,
     _validate_identifier,
+    WORKLINK_CHECKOUT_ROOT,
 )
 
 HOME_ROOT = Path("/var/lib/mimir-worklink/homes")
@@ -37,7 +38,7 @@ REPO_TEST_UV_CACHE = Path("/opt/mimir-worklink/uv-cache")
 MAX_FDS = 3
 # Deliberately not imported from worker_client: this value must describe the
 # immutable executor installed in the root-owned image, not mutable controller code.
-EXECUTOR_PROTOCOL_IDENTITY = "worklink-executor-v5-bounded-output-fds"
+EXECUTOR_PROTOCOL_IDENTITY = "worklink-executor-v6-bounded-output-path-checkout"
 _STALE_EXECUTOR_DIAGNOSTIC = (
     "stale root executor image: controller and mimir.worklink.worker_exec protocol "
     "identities do not match; rebuild the image and restart the container"
@@ -56,6 +57,11 @@ _LINUX_CAPABILITY_VERSION_3 = 0x20080522
 _LINUX_CAPABILITY_U32S_3 = 2
 _LAUNCH_FIELDS = frozenset({
     "version", "op", "id", "issue", "attempt", "device", "inode",
+    "argv", "env", "projections", "timeout_s", "stdout_limit", "stderr_limit",
+    "executor_identity",
+})
+_PATH_LAUNCH_FIELDS = frozenset({
+    "version", "op", "id", "issue", "attempt", "path", "run_uid",
     "argv", "env", "projections", "timeout_s", "stdout_limit", "stderr_limit",
     "executor_identity",
 })
@@ -239,6 +245,42 @@ def _validate_checkout(fd: int, request: dict[str, Any]) -> Path:
     if stat.S_IMODE(observed.st_mode) != 0o2770:
         raise RuntimeError("issued checkout mode is invalid")
     return root
+
+
+def _open_path_checkout(request: dict[str, Any]) -> int:
+    issue = _positive_integer(request, "issue")
+    attempt = _positive_integer(request, "attempt")
+    path_value = request.get("path")
+    if not isinstance(path_value, str) or not path_value.startswith("/") or "\x00" in path_value:
+        raise RuntimeError("path-addressed checkout path is invalid")
+    if request.get("run_uid") != get_identities().worklink_uid:
+        raise RuntimeError("path-addressed checkout requested an invalid worker uid")
+    try:
+        root = WORKLINK_CHECKOUT_ROOT.resolve(strict=True)
+        requested = Path(path_value)
+        resolved = requested.resolve(strict=True)
+        relative = resolved.relative_to(root)
+    except (OSError, ValueError):
+        raise RuntimeError("path-addressed checkout is outside the Worklink root") from None
+    if (
+        requested != resolved
+        or len(relative.parts) != 2
+        or re.fullmatch(r"[A-Za-z0-9._-]+", relative.parts[0]) is None
+        or relative.parts[1] != f"{issue}-{attempt}"
+    ):
+        raise RuntimeError("path-addressed checkout shape is invalid")
+    observed = resolved.stat(follow_symlinks=False)
+    if (
+        not stat.S_ISDIR(observed.st_mode)
+        or observed.st_uid != get_identities().mimir_uid
+        or observed.st_gid != get_identities().worklink_gid
+        or stat.S_IMODE(observed.st_mode) != 0o2770
+    ):
+        raise RuntimeError("path-addressed checkout ownership or mode is invalid")
+    return os.open(
+        resolved,
+        os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0),
+    )
 
 
 def _validate_command(request: dict[str, Any]) -> list[str]:
@@ -523,14 +565,24 @@ def _wait_with_output_limits(
 
 
 def _handle_launch(connection: socket.socket, request: dict[str, Any], fds: list[int]) -> None:
-    if set(request) != _LAUNCH_FIELDS or len(fds) != MAX_FDS:
-        raise RuntimeError("launch request must carry the exact contract and three FDs")
+    path_addressed = request.get("op") == "launch_path"
+    expected_fields = _PATH_LAUNCH_FIELDS if path_addressed else _LAUNCH_FIELDS
+    expected_fds = 2 if path_addressed else MAX_FDS
+    if set(request) != expected_fields or len(fds) != expected_fds:
+        raise RuntimeError(
+            "launch request must carry the exact contract and "
+            f"{'two' if path_addressed else 'three'} FDs"
+        )
     _validate_executor_identity(request)
     identifier = request.get("id")
     if not isinstance(identifier, str):
         raise RuntimeError("invalid worker id")
     _validate_identifier(identifier)
-    checkout_root = _validate_checkout(fds[0], request)
+    if path_addressed:
+        fds.insert(0, _open_path_checkout(request))
+        checkout_root = None
+    else:
+        checkout_root = _validate_checkout(fds[0], request)
     for fd in fds[1:]:
         metadata = os.fstat(fd)
         if not stat.S_ISREG(metadata.st_mode):
@@ -638,7 +690,7 @@ def handle_connection(connection: socket.socket) -> None:
             raise RuntimeError("unsupported worker request")
         raw_identifier = request.get("id")
         identifier = raw_identifier if isinstance(raw_identifier, str) else None
-        if request.get("op") == "launch":
+        if request.get("op") in {"launch", "launch_path"}:
             _handle_launch(connection, request, fds)
         elif request.get("op") == "cancel":
             _handle_cancel(connection, request, fds)

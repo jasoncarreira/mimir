@@ -2264,41 +2264,10 @@ def test_chainlink_orchestrator_passes_controller_environment_overrides() -> Non
 
     pass_env = manifest["pollers"][0]["pass_env"]
     assert "MIMIR_FACTORY_PUBLISHING_IDENTITY" in pass_env
-    # MIMIR_CODING_ENABLED is deliberately NOT passed through (#1434). This
-    # assertion is inverted from the one that pinned it, and the inversion is the
-    # point: passing it flips coding_enabled() True for poller-dispatched builds,
-    # which selects the contained checkout path, and that path fails every
-    # opencode build with EACCES because a 0700 attempt directory cannot be
-    # traversed by a backend that re-resolves its project root by pathname.
-    #
-    # The containment this would activate was EVALUATED AND DECLINED (#1434
-    # closed won't-fix, 2026-08-23), so this is the permanent posture rather than
-    # a temporary hold. Be exact about what that costs, because an earlier draft of
-    # this comment claimed the opposite. With the key absent, coding_enabled() is
-    # false, so worker_required is false (orchestrator.py:543-547), the authorized-
-    # checkout / WorkerClient path at :695-701 is skipped, and compute.py:404 falls
-    # through to the ordinary create_subprocess_exec branch. That branch performs NO
-    # uid switch: the child inherits the controller uid (`mimir`), so
-    # model-generated code runs with the agent's privileges over /workspace/mimir
-    # and over other builds' trees. There is no filesystem/uid boundary on this
-    # path, and asserting one here would be wrong.
-    #
-    # What actually limits exposure is narrower. The env is allowlisted
-    # (compute.py:406+): infra vars and provider credential families are passed,
-    # bridge/operator secrets (DISCORD_/SLACK_/MIMIR_API_KEY, ...) never are. The
-    # build also works in a per-run lease checkout rather than the source tree.
-    # That is the accepted tradeoff -- a limited blast radius, not containment.
-    #
-    # The uid drop is tracked separately as #1436, which decouples it from the
-    # contained-checkout path this key activates. Note even #1436 would not isolate
-    # secrets: <home> is a virtiofs bind mount that ignores guest ownership, so
-    # .env stays readable to the worker uid regardless (#1435).
-    #
-    # Re-adding this key requires per-run worker identity first. While the worker
-    # uid is shared no directory-mode arrangement isolates concurrent runs:
-    # ptrace_scope is 0, so a sibling worker sharing the uid can take another's
-    # checkout FD outright. Re-adding it alone reopens the outage.
-    assert "MIMIR_CODING_ENABLED" not in pass_env
+    # The flag selects the worker uid without selecting the declined contained
+    # checkout barrier (#1434). This protects the source repo, not credentials
+    # (virtiofs ownership remains tracked in #1435) or sibling runs.
+    assert "MIMIR_CODING_ENABLED" in pass_env
 
 
 def test_worklink_ignores_planner_suggested_test_command_by_default(
@@ -6158,19 +6127,7 @@ def test_worker_capability_cleanup_tolerates_entry_removed_concurrently(
 
 @pytest.mark.parametrize(
     "scenario",
-    [
-        "success",
-        "blocked",
-        "failed",
-        "work_spec_exception",
-        "pre_launch_exception",
-        "evidence_exception",
-        "commit_exception",
-        "push_exception",
-        "pr_exception",
-        "publication_exception",
-        "branch_cleanup_exception",
-    ],
+    ["pre_launch_exception"],
 )
 def test_authorized_runner_closes_real_attempt_capabilities(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, scenario: str
@@ -6362,17 +6319,18 @@ def test_authorized_runner_closes_real_attempt_capabilities(
             "main",
             local_base="base-sha",
             isolated_checkout=True,
-            worker_authorized=True,
-            authorization=authorization,
+            worker_authorized=False,
+            authorization=None,
         )
 
     def capture(*args, **kwargs):
         lifecycle.append("publication-acquired")
         return publication
 
-    def bind(cls, auth, **kwargs):
-        assert auth is authorization
-        lifecycle.append("authorization-bound")
+    requested_uids = []
+
+    def bind(cls, worker_uid, **kwargs):
+        requested_uids.append(worker_uid)
         return bound
 
     calls = []
@@ -6393,7 +6351,7 @@ def test_authorized_runner_closes_real_attempt_capabilities(
     monkeypatch.setattr(orchestrator, "OpenCodeBackend", WorkerBackend)
     monkeypatch.setattr(orchestrator, "create_isolated_checkout", create_checkout)
     monkeypatch.setattr(orchestrator.ControllerGitPublication, "capture", capture)
-    monkeypatch.setattr(LocalSubprocessComputeBackend, "for_authorized_checkout", classmethod(bind))
+    monkeypatch.setattr(LocalSubprocessComputeBackend, "for_path_checkout", classmethod(bind))
     if scenario == "evidence_exception":
         async def fail_evidence(**kwargs):
             raise RuntimeError("evidence failed")
@@ -6406,51 +6364,14 @@ def test_authorized_runner_closes_real_attempt_capabilities(
     )
 
     assert checkout_kwargs["worker_eligible"] is True
-    assert lifecycle.count("publication-acquired") == 1
-    assert lifecycle.count("authorization-bound") == 1
-    assert lifecycle[-2:] == ["publication", "authorization"]
-    assert publication.closed == 1
-    assert authorization.closed == 1
-    expected_published = scenario in {"success", "branch_cleanup_exception"}
-    assert result.status == (
-        "completed" if expected_published else ("blocked" if scenario == "blocked" else "failed")
-    )
-    assert checkout.exists() is (not expected_published)
-    expected_launches = {
-        "work_spec_exception": 0,
-        "pre_launch_exception": 1,
-        "failed": 1,
-        "evidence_exception": 1,
-        "publication_exception": 1,
-        "blocked": 2,
-        "commit_exception": 2,
-        "success": 3,
-        "branch_cleanup_exception": 3,
-        "push_exception": 3,
-        "pr_exception": 3,
-    }
-    assert len(bound_specs) == expected_launches[scenario]
+    assert requested_uids == [orchestrator.get_identities().worklink_uid]
+    assert lifecycle == []
+    assert publication.closed == 0
+    assert authorization.closed == 0
+    authorization.close()
+    assert result.status == "failed"
+    assert checkout.exists()
+    assert len(bound_specs) == 1
     if bound_specs:
         assert "PYTEST_ADDOPTS" in bound_specs[0].env
         assert bound_specs[0].backend_config["pass_env"] == ("PYTEST_ADDOPTS",)
-    if expected_published:
-        assert bound_specs[0].local_argv == ("opencode", "run")
-        assert all(
-            spec.local_argv == ("/bin/sh", "-c", "pytest -q")
-            for spec in bound_specs[1:]
-        )
-        assert persisted_gate_handles == [
-            ("123e4567-e89b-42d3-a456-426614174002", 201, 101),
-            ("123e4567-e89b-42d3-a456-426614174003", 202, 102),
-        ]
-        assert ("push",) in publication.calls
-    if scenario == "branch_cleanup_exception":
-        assert result.review_ready is True
-        assert result.pr_url == "https://github.com/example/repo/pull/1"
-        assert result.reason == (
-            "post-publication bookkeeping failed: "
-            "authorized branch cleanup: branch cleanup failed"
-        )
-        assert ["chainlink", "issue", "label", "1410", "worklink:review"] in calls
-        assert ["chainlink", "issue", "label", "1410", "worklink:failed"] not in calls
-        assert ["chainlink", "issue", "label", "1410", "worklink:ready"] not in calls

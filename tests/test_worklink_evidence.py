@@ -471,23 +471,32 @@ async def test_enabled_opencode_gate_uses_authorized_compute(monkeypatch, tmp_pa
 
 
 @pytest.mark.asyncio
-async def test_enabled_opencode_evidence_refuses_controller_git_fallback(
+async def test_enabled_opencode_evidence_uses_controller_git_without_fd_publication(
     monkeypatch, tmp_path: Path
 ) -> None:
     monkeypatch.setenv("MIMIR_CODING_ENABLED", "true")
+    calls: list[object] = []
 
-    with pytest.raises(ValueError, match="requires controller Git publication"):
-        await observe_evidence(
-            issue=1,
-            attempt=1,
-            backend="opencode",
-            branch="branch",
-            checkout=tmp_path,
-            started_at=datetime.now(UTC),
-            base_ref="main",
-            backend_status="failed",
-            test_command=None,
-        )
+    def runner(args, **_kwargs):
+        calls.append(args)
+        return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+
+    result = await observe_evidence(
+        issue=1,
+        attempt=1,
+        backend="opencode",
+        branch="branch",
+        checkout=tmp_path,
+        started_at=datetime.now(UTC),
+        base_ref="main",
+        backend_status="failed",
+        test_command=None,
+        runner=runner,
+    )
+
+    assert result.review_ready is False
+    assert calls
+    assert all(call[:3] == ["git", "-C", str(tmp_path)] for call in calls)
 
 
 @pytest.mark.asyncio

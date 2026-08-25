@@ -288,9 +288,7 @@ async def _observe_evidence_from_ref(
     runner = runner or _run
     from .checkout import coding_enabled
 
-    worker_required = coding_enabled() and backend == "opencode"
-    if worker_required and safe_git is None:
-        raise ValueError("enabled worker evidence requires controller Git publication")
+    worker_uid_drop = coding_enabled() and backend == "opencode"
     range_ref = f"{base_ref}...{head_ref}"
     def git_run(*args: str) -> subprocess.CompletedProcess[str]:
         if safe_git is not None:
@@ -343,7 +341,7 @@ async def _observe_evidence_from_ref(
         else:
             with tempfile.TemporaryDirectory(prefix="worklink-gate-") as report_dir_text:
                 report_dir = Path(report_dir_text)
-                if worker_required:
+                if worker_uid_drop:
                     if compute is None:
                         raise ValueError("enabled worker evidence requires a compute backend")
                     if work_spec is None:

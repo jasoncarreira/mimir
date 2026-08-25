@@ -377,12 +377,18 @@ class _ClientBoundCapability:
         return getattr(self._capability, name)
 
 
+@dataclass(frozen=True)
+class _PathCheckoutCapability:
+    path: Path
+
+
 @dataclass
 class LocalSubprocessComputeBackend:
     """Run a WorkSpec as a local subprocess in the current container."""
 
     name: str = "local_subprocess"
     _authorized_checkout: object | None = field(default=None, repr=False)
+    _worker_uid: int | None = field(default=None, repr=False)
     _worker_client: object | None = field(default=None, repr=False)
 
     @classmethod
@@ -397,6 +403,17 @@ class LocalSubprocessComputeBackend:
         ):
             raise TypeError("authorization is not a checkout capability")
         return cls(_authorized_checkout=authorization, _worker_client=worker_client)
+
+    @classmethod
+    def for_path_checkout(
+        cls,
+        worker_uid: int,
+        *,
+        worker_client: object | None = None,
+    ) -> LocalSubprocessComputeBackend:
+        if type(worker_uid) is not int or worker_uid < 0:
+            raise ValueError("worker uid must be a non-negative integer")
+        return cls(_worker_uid=worker_uid, _worker_client=worker_client)
 
     def __post_init__(self) -> None:
         self._jobs: dict[str, tuple[object, WorkSpec, tuple[str, ...]]] = {}
@@ -516,14 +533,25 @@ class LocalSubprocessComputeBackend:
     async def _launch_enabled(self, spec: WorkSpec, command: tuple[str, ...]) -> LaunchHandle:
         from .worker_client import WorkerClient, WorkerProjection
 
-        # The executor has already fchdir'd through the issued checkout FD. An
-        # absolute --dir would re-traverse the controller-owned 0700 boundary.
         command = _fd_anchored_opencode_argv(command, spec.local_checkout)
         authorization = self._authorized_checkout
-        if authorization is None or not all(
+        if authorization is not None and all(
             hasattr(authorization, member) for member in ("verify", "duplicate_fd", "path")
         ):
-            raise ComputeLaunchError("enabled local_subprocess requires an AuthorizedCheckout")
+            capability: object = authorization
+            client = self._worker_client or WorkerClient(authorization)
+        elif self._worker_uid is not None and spec.local_checkout is not None:
+            capability = _PathCheckoutCapability(spec.local_checkout)
+            client = self._worker_client or WorkerClient.for_path_checkout(
+                spec.local_checkout,
+                issue_id=spec.issue_id,
+                attempt=spec.attempt,
+                run_uid=self._worker_uid,
+            )
+        else:
+            raise ComputeLaunchError(
+                "enabled local_subprocess requires an authorized or path-addressed worker checkout"
+            )
         projections_raw = spec.backend_config.get("worker_projections", ())
         if isinstance(projections_raw, (str, bytes)) or not isinstance(
             projections_raw, Sequence
@@ -536,9 +564,8 @@ class LocalSubprocessComputeBackend:
         except (AttributeError, TypeError, ValueError) as exc:
             raise ComputeLaunchError("worker projection is invalid") from exc
         identifier = str(uuid.uuid4())
-        client = self._worker_client or WorkerClient(authorization)
         started: asyncio.Future[object] = asyncio.get_running_loop().create_future()
-        capability = _ClientBoundCapability(authorization, client, started)
+        capability = _ClientBoundCapability(capability, client, started)
         stdout_limit, stderr_limit = _worklink_output_limits()
         stdout_path, stderr_path = _output_paths(spec, identifier)
         try:

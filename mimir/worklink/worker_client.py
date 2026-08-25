@@ -16,12 +16,13 @@ from ..output_capture import OutputSink, open_output_pair
 
 DEFAULT_EXECUTOR_SOCKET = Path("/run/mimir-worklink/socket/worklink-execd.sock")
 ENABLED_CHECKOUT_ROOT = Path("/var/lib/mimir-worklink/checkouts")
+WORKLINK_CHECKOUT_ROOT = Path("/workspace/.worklink")
 MAX_REQUEST_BYTES = 256 * 1024
 MAX_PROJECTION_BYTES = 1024 * 1024
 CANCEL_SOCKET_TIMEOUT_S = 20.0
 # Keep this literal independent from worker_exec. The executor runs its image-owned
 # copy, so changing either side of the launch contract requires an image rebuild.
-EXECUTOR_PROTOCOL_IDENTITY = "worklink-executor-v5-bounded-output-fds"
+EXECUTOR_PROTOCOL_IDENTITY = "worklink-executor-v6-bounded-output-path-checkout"
 STALE_EXECUTOR_DIAGNOSTIC = (
     "stale root executor image: controller and mimir.worklink.worker_exec protocol "
     "identities do not match; rebuild the image and restart the container"
@@ -92,12 +93,41 @@ class WorkerProcess:
 class WorkerClient:
     def __init__(
         self,
-        checkout: CheckoutCapability,
+        checkout: CheckoutCapability | None,
         *,
         socket_path: Path = DEFAULT_EXECUTOR_SOCKET,
+        path_checkout: Path | None = None,
+        issue_id: int | None = None,
+        attempt: int | None = None,
+        run_uid: int | None = None,
     ) -> None:
         self.checkout = checkout
         self.socket_path = socket_path
+        self.path_checkout = path_checkout
+        self.issue_id = issue_id
+        self.attempt = attempt
+        self.run_uid = run_uid
+
+    @classmethod
+    def for_path_checkout(
+        cls,
+        path: Path,
+        *,
+        issue_id: int,
+        attempt: int,
+        run_uid: int,
+        socket_path: Path = DEFAULT_EXECUTOR_SOCKET,
+    ) -> WorkerClient:
+        if issue_id < 1 or attempt < 1 or run_uid < 0:
+            raise ValueError("path-addressed worker launch identity is invalid")
+        return cls(
+            None,
+            socket_path=socket_path,
+            path_checkout=Path(os.path.abspath(path)),
+            issue_id=issue_id,
+            attempt=attempt,
+            run_uid=run_uid,
+        )
 
     def _connect(self, timeout_s: float | None = None) -> socket.socket:
         sock = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
@@ -132,7 +162,14 @@ class WorkerClient:
         stdout_sink: OutputSink | None = None,
         stderr_sink: OutputSink | None = None,
     ) -> WorkerProcess:
-        self.checkout.verify(local_checkout)
+        path_addressed = self.path_checkout is not None
+        if path_addressed:
+            if local_checkout is None or Path(os.path.abspath(local_checkout)) != self.path_checkout:
+                raise ValueError("work spec checkout does not match path-addressed checkout")
+        else:
+            if self.checkout is None:
+                raise ValueError("worker launch requires a checkout")
+            self.checkout.verify(local_checkout)
         _validate_identifier(identifier)
         if (
             not isinstance(argv, (list, tuple))
@@ -159,15 +196,11 @@ class WorkerClient:
             for key, value in env.items()
         ):
             raise ValueError("worker environment must contain string pairs")
-        request = {
+        request: dict[str, object] = {
             "version": 1,
-            "op": "launch",
+            "op": "launch_path" if path_addressed else "launch",
             "executor_identity": EXECUTOR_PROTOCOL_IDENTITY,
             "id": identifier,
-            "issue": self.checkout.issue_id,
-            "attempt": self.checkout.attempt,
-            "device": self.checkout.device,
-            "inode": self.checkout.inode,
             "argv": list(argv),
             "env": dict(env),
             "projections": [
@@ -178,6 +211,21 @@ class WorkerClient:
             "stdout_limit": stdout_sink.limit if stdout_sink is not None else 1,
             "stderr_limit": stderr_sink.limit if stderr_sink is not None else 1,
         }
+        if path_addressed:
+            request.update({
+                "path": str(self.path_checkout),
+                "issue": self.issue_id,
+                "attempt": self.attempt,
+                "run_uid": self.run_uid,
+            })
+        else:
+            assert self.checkout is not None
+            request.update({
+                "issue": self.checkout.issue_id,
+                "attempt": self.checkout.attempt,
+                "device": self.checkout.device,
+                "inode": self.checkout.inode,
+            })
         payload = json.dumps(request, separators=(",", ":")).encode()
         if len(payload) > MAX_REQUEST_BYTES:
             raise ValueError("worker request exceeds size limit")
@@ -186,10 +234,19 @@ class WorkerClient:
             raise ValueError("worker output sinks must be supplied together")
         if stdout_sink is None or stderr_sink is None:
             stdout_sink, stderr_sink = open_output_pair(None, 1, None, 1)
-        checkout_fd = self.checkout.duplicate_fd()
+        if path_addressed:
+            checkout_fd = -1
+        else:
+            assert self.checkout is not None
+            checkout_fd = self.checkout.duplicate_fd()
         sock = await asyncio.to_thread(self._connect)
         try:
-            rights = array.array("i", [checkout_fd, stdout_sink.fd, stderr_sink.fd])
+            rights = array.array(
+                "i",
+                [stdout_sink.fd, stderr_sink.fd]
+                if path_addressed
+                else [checkout_fd, stdout_sink.fd, stderr_sink.fd],
+            )
             sock.sendmsg([payload], [(socket.SOL_SOCKET, socket.SCM_RIGHTS, rights)])
             response = json.loads(await asyncio.to_thread(sock.recv, 4096))
             if "error" in response:

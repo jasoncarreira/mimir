@@ -145,6 +145,66 @@ async def test_client_reports_executor_peer_uid_refusal(tmp_path: Path, monkeypa
 
 
 @pytest.mark.asyncio
+async def test_path_client_requests_worker_uid_and_projects_provider_documents(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    checkout = tmp_path / ".worklink" / "repo" / "41-2"
+    checkout.mkdir(parents=True)
+    requests: list[dict[str, object]] = []
+    fd_counts: list[int] = []
+
+    class Peer:
+        def connect(self, _path: str) -> None:
+            pass
+
+        def getsockopt(self, *args: object) -> bytes:
+            return struct.pack("3i", 123, 0, 0)
+
+        def sendmsg(self, buffers: list[bytes], ancillary: list[tuple[int, int, bytes]]) -> None:
+            requests.append(json.loads(buffers[0]))
+            rights = ancillary[0][2]
+            fd_counts.append(len(rights))
+
+        def recv(self, _size: int) -> bytes:
+            return json.dumps({
+                "id": requests[0]["id"],
+                "status": "started",
+                "pid": 123,
+            }).encode()
+
+        def close(self) -> None:
+            pass
+
+    monkeypatch.setattr(socket, "SO_PEERCRED", getattr(socket, "SO_PEERCRED", 17), raising=False)
+    monkeypatch.setattr(socket, "socket", lambda *args: Peer())
+    client = WorkerClient.for_path_checkout(
+        checkout, issue_id=41, attempt=2, run_uid=1002
+    )
+    process = await client.launch(
+        local_checkout=checkout,
+        argv=["opencode", "run", "--dir", "."],
+        env={"OPENCODE_PERMISSION": "{}"},
+        projections=[
+            WorkerProjection(".config/opencode/opencode.json", b'{"model":"provider/model"}'),
+            WorkerProjection(".local/share/opencode/auth.json", b'{"provider":{"token":"x"}}'),
+        ],
+        identifier=str(uuid.uuid4()),
+        timeout_s=30,
+    )
+    process._socket.close()
+
+    request = requests[0]
+    assert request["op"] == "launch_path"
+    assert request["path"] == str(checkout)
+    assert request["run_uid"] == 1002
+    assert fd_counts == [2]
+    assert [item["path"] for item in request["projections"]] == [
+        ".config/opencode/opencode.json",
+        ".local/share/opencode/auth.json",
+    ]
+
+
+@pytest.mark.asyncio
 async def test_identity_probe_accepts_matching_image_executor(monkeypatch) -> None:
     sent: list[dict[str, object]] = []
 
@@ -292,6 +352,36 @@ def test_validate_checkout_refuses_arbitrary_and_replaced_fds(tmp_path: Path, mo
     try:
         with pytest.raises(RuntimeError, match="isolation boundary"):
             worker_exec._validate_checkout(fd, request(fd))
+    finally:
+        os.close(fd)
+
+
+def test_path_checkout_accepts_group_checkout_without_0700_boundary(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / ".worklink"
+    checkout = root / "repo" / "41-2"
+    checkout.mkdir(parents=True)
+    checkout.chmod(0o2770)
+    checkout.parent.chmod(0o755)
+    monkeypatch.setattr(worker_exec, "WORKLINK_CHECKOUT_ROOT", root)
+    monkeypatch.setattr(
+        worker_exec,
+        "get_identities",
+        lambda: SimpleNamespace(
+            mimir_uid=os.getuid(), worklink_uid=1002, worklink_gid=os.getgid()
+        ),
+    )
+
+    fd = worker_exec._open_path_checkout({
+        "path": str(checkout),
+        "issue": 41,
+        "attempt": 2,
+        "run_uid": 1002,
+    })
+    try:
+        assert os.path.samefile(f"/proc/self/fd/{fd}", checkout)
+        assert stat.S_IMODE(checkout.parent.stat().st_mode) == 0o755
     finally:
         os.close(fd)
 

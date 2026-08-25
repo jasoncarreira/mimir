@@ -71,5 +71,7 @@ def test_ci_runs_the_committed_live_image_proof() -> None:
     assert 'stat -c %U:%G /opt/mimir-worklink/uv-cache' in proof
     assert 'stat -c %a /opt/mimir-worklink/uv-cache' in proof
     assert "sibling-access negative control did not detect a cross-write" in proof
-    assert "worker reached concurrent sibling checkout" in proof
+    assert "intentionally shared sibling checkout" in proof
+    assert "printf attacked > /workspace/mimir/tracked" in proof
+    assert "Worklink unexpectedly selected the contained checkout path" in proof
     assert "issue_id=1411" in proof

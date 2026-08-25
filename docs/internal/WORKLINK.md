@@ -21,7 +21,13 @@ The **planner/decomposer contract** (the leaf template in §2.5) is enforced: a
 leaf missing the required sections is auto-demoted to `worklink:blocked` with a
 `WORKLINK_BLOCKED` reason before dispatch (re-plan → re-add `worklink:ready`).
 Execution uses self-contained per-leaf attempt checkouts via the configured
-compute backend (§5). **The only Worklink compute substrate is
+compute backend (§5). Poller-dispatched OpenCode builds run as the distinct
+`worklink` uid in the existing `/workspace/.worklink` checkout. The checkout is
+group-writable and setgid, but there is deliberately no per-run pathname barrier:
+this protects the source repository checkout from build writes, not one build
+from another. It is also **not credential isolation** because the deployment's
+virtiofs home mount ignores guest ownership; that separate prerequisite is
+tracked in #1435. **The only Worklink compute substrate is
 `local_subprocess`** (chainlink
 #832 — `docker_sibling` and `ecs_runtask` were retired); autonomous dispatch
 needs `defaults.allow_autonomous_local_subprocess: true` in `worklink.yaml` to
@@ -678,11 +684,13 @@ substrate cleanup the only Worklink compute substrate is `local_subprocess`
 added without an orchestrator change). Both registered tool backends run on
 local subprocess compute; a route matches first, otherwise the defaults apply.
 
-`local_subprocess` runs the backend **unsandboxed**, with full
-container-filesystem access. That is an **explicit accept-the-risk fallback**, not the
-recommended autonomous path. With no built-in isolated substrate to fall back
-to after #832, the only escape from the autonomous refusal is the
-`allow_autonomous_local_subprocess: true` opt-in.
+`local_subprocess` is still **not a sandbox**. Poller-dispatched OpenCode is
+uid-dropped to `worklink`, which prevents writes to the agent-owned source
+checkout, but shared Worklink checkouts and the virtiofs-mounted credential home
+remain reachable. Feature-factory retains the agent uid. This is therefore still
+an **explicit accept-the-risk fallback** rather than an isolated substrate. With
+no built-in isolated substrate to fall back to after #832, the only escape from
+the autonomous refusal is the `allow_autonomous_local_subprocess: true` opt-in.
 
 **Policy (enforced in the core executor, `WorklinkConfig.autonomous_compute_allowed`):**
 
@@ -696,10 +704,11 @@ to after #832, the only escape from the autonomous refusal is the
   substrate" alternative is no longer available — there is no built-in
   isolated substrate to route to).
 - **Operator-invoked `mimir worklink run`** (no `--autonomous`) is **never
-  gated** — it always proceeds. The blast radius is real: on `local_subprocess`
-  the backend can read/write the whole container filesystem, so reserve manual
-  unsandboxed runs for issues you've scoped and trust. The gate lives in core
-  Python ahead of the claim, so no model-facing caller can bypass it.
+  gated** — it always proceeds. Enabled OpenCode receives the same repo-checkout
+  uid protection, but not credential or cross-run isolation; other backends keep
+  the agent uid. Reserve manual runs for issues you've scoped and trust. The gate
+  lives in core Python ahead of the claim, so no model-facing caller can bypass
+  it.
 
 ## 7. Operator runbook
 
