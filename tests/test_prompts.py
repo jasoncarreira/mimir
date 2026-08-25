@@ -53,6 +53,8 @@ def test_system_prompt_renders_accurate_enforcement_guidance():
     assert "``fetch_url`` exact/session-approved URLs" in sp
     assert "admitted only by a trailing ``/*`` scope are turn-taint gated" in sp
     assert "regardless of turn taint" in sp
+    assert "model-composed query only to one operator-fixed service" in sp
+    assert "limit a research turn to one search" in sp
     assert "``webhook``, ``http_request``, and external MCP arguments are turn-taint gated" in sp
     assert "External MCP posture is per tool" in sp
     assert "``worklink_run``" in sp

@@ -5154,7 +5154,20 @@ _ACTIVE_SERVICE_SINK_DESTINATIONS: dict[SinkCategory, str] = {
 _FIXED_SERVICE_SINK_OPERATIONS = frozenset({"rebuild_index"})
 
 
-_TAINT_INDEPENDENT_EGRESS_TOOLS = frozenset({"fetch_url", "web_search"})
+_TAINT_INDEPENDENT_EGRESS_TOOLS = frozenset({
+    "fetch_url",
+    # Deliberate single-operator exception: the model-composed search query is
+    # an accepted outbound channel, permitted on a tainted turn because it goes
+    # to one operator-fixed trusted service. Search results are untrusted active
+    # ingest, so gating this channel would make the first search taint the turn
+    # and cap every research turn at one search.
+    # Unlike a fetch_url ``/*`` scope, there is no model-chosen destination and
+    # thus no exact-URL mitigation analogue. This is unsafe if untrusted
+    # multi-user chat is enabled: induced queries could encode other data. The
+    # trusted-operator shell_exec/file allowance below has the same deployment
+    # condition; neither exception may be carried into that posture unchanged.
+    "web_search",
+})
 
 
 def _egress_target_requires_taint_gate(
@@ -6102,6 +6115,8 @@ class SinkGate:
             )
         ):
             return frozenset({resolved_target_channel})
+        # As with web_search query egress, this trusted-operator allowance is a
+        # single-operator deployment decision, not a safe multi-user default.
         if (
             trusted_operator_turn
             and not has_untrusted_active_ingest

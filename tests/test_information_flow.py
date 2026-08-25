@@ -3007,7 +3007,7 @@ def test_non_json_comma_separated_exact_urls_warn(
     assert "Configure multiple URLs as a JSON array" in caplog.text
 
 
-def test_web_search_is_allowed_after_untrusted_active_ingest(
+def test_web_search_fixed_service_exception_deliberately_allows_tainted_turn(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     target = "https://api.tavily.com/search"
@@ -3028,6 +3028,7 @@ def test_web_search_is_allowed_after_untrusted_active_ingest(
     )
 
     assert decision.allowed is True
+    assert decision.reason == "ifc_allowed"
 
 
 @pytest.mark.parametrize("configured_url", ["", "   "])
