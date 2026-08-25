@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import runpy
 from pathlib import Path
 
 
@@ -63,6 +64,18 @@ def test_executor_service_recreates_ephemeral_socket_layout() -> None:
     assert "install -d -o root -g mimir -m 0710 /run/mimir-worklink/socket" in run
 
 
+def test_spawn_image_proof_uses_one_checked_seed_tree() -> None:
+    namespace = runpy.run_path(ROOT / "scripts/worklink_image_identity.py")
+    spawn_proof = namespace["SPAWN_PROOF"]
+
+    compile(spawn_proof, "SPAWN_PROOF", "exec")
+    assert '"default_cwd": SEED' in spawn_proof
+    assert '["git", "-C", str(SEED), "status", "--porcelain=v1", "-z"]' in spawn_proof
+    assert "def seed_status() -> bytes:" in spawn_proof
+    assert "check=True" in spawn_proof
+    assert "/home/mimir/worklink-source" not in spawn_proof
+
+
 def test_ci_runs_the_committed_live_image_proof() -> None:
     workflow = (ROOT / ".github/workflows/tests.yml").read_text(encoding="utf-8")
     proof = (ROOT / "scripts/worklink_image_identity.py").read_text(encoding="utf-8")
@@ -71,5 +84,10 @@ def test_ci_runs_the_committed_live_image_proof() -> None:
     assert 'stat -c %U:%G /opt/mimir-worklink/uv-cache' in proof
     assert 'stat -c %a /opt/mimir-worklink/uv-cache' in proof
     assert "sibling-access negative control did not detect a cross-write" in proof
-    assert "worker reached concurrent sibling checkout" in proof
+    assert "intentionally shared sibling checkout" in proof
+    assert "printf attacked > /workspace/mimir/tracked" in proof
+    assert "worklink-publication-attack" in proof
+    assert 'remote", "set-url", "--push"' in proof
+    assert "ControllerGitPublication.capture" in proof
+    assert "Worklink unexpectedly selected the contained checkout path" in proof
     assert "issue_id=1411" in proof

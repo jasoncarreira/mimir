@@ -53,6 +53,7 @@ from datetime import UTC, datetime
 import json
 import os
 from pathlib import Path
+import subprocess
 
 from mimir.worklink.backends.base import WorkOrder
 from mimir.worklink.backends.opencode import OpenCodeBackend
@@ -61,7 +62,7 @@ from mimir.worklink.compute import LocalSubprocessComputeBackend
 from mimir.worklink.evidence import observe_evidence
 from mimir.worklink.safe_git import ControllerGitPublication
 
-REPO = Path("/home/mimir/worklink-source")
+REPO = Path("/workspace/mimir")
 METADATA = Path("/home/mimir/worklink-publication")
 CONFIG = Path("/home/mimir/worklink-opencode/opencode.json")
 DATA = Path("/home/mimir/worklink-opencode/data")
@@ -82,23 +83,23 @@ async def main():
     sibling = create_isolated_checkout(
         REPO, issue_id=1411, attempt=1, base="main", worker_eligible=True
     )
-    if not lease.worker_authorized or lease.authorization is None:
-        raise RuntimeError("production checkout factory did not authorize worker checkout")
-    if not sibling.worker_authorized or sibling.authorization is None:
-        raise RuntimeError("concurrent checkout factory did not authorize worker checkout")
+    if lease.worker_authorized or lease.authorization is not None:
+        raise RuntimeError("Worklink unexpectedly selected the contained checkout path")
+    if sibling.worker_authorized or sibling.authorization is not None:
+        raise RuntimeError("concurrent checkout unexpectedly selected the contained path")
     sibling.path.joinpath("sibling-canary").write_text("sibling-original")
     source_object = next(REPO.joinpath(".git/objects").glob("[0-9a-f][0-9a-f]/*"))
     checkout_object = lease.path / ".git/objects" / source_object.relative_to(REPO / ".git/objects")
     if source_object.stat().st_ino == checkout_object.stat().st_ino:
         raise RuntimeError("issued checkout retained a source hardlink")
-    checkout_fd = lease.authorization.duplicate_fd()
+    checkout_fd = os.open(lease.path, os.O_RDONLY | os.O_DIRECTORY)
     try:
         publication = ControllerGitPublication.capture(
             checkout_fd, REPO, lease.branch, METADATA
         )
     finally:
         os.close(checkout_fd)
-    compute = LocalSubprocessComputeBackend.for_authorized_checkout(lease.authorization)
+    compute = LocalSubprocessComputeBackend.for_path_checkout(1002)
     backend = OpenCodeBackend(bin=CLI)
     order = WorkOrder(
         issue_id=1410,
@@ -158,20 +159,27 @@ test -r "$HOME/.local/share/opencode/auth.json"
         raise RuntimeError("controller did not observe evidence-gate worker identity")
     if "tracked" not in gate.evidence.files_changed:
         raise RuntimeError("controller evidence did not observe worker changes")
+    publication.run("add", "-A", check=True)
+    publication.run("commit", "-m", "runtime proof", check=True)
+    publication.push(check=True)
+    if Path("/tmp/worklink-publication-attack").exists():
+        raise RuntimeError("controller publication executed worker-planted Git metadata")
+    trusted_head = publication.run("rev-parse", "HEAD", check=True).stdout.strip()
+    remote_head = os.popen(
+        "git --git-dir=/home/mimir/worklink-remote.git rev-parse refs/heads/issue/1410-a1"
+    ).read().strip()
+    if remote_head != trusted_head:
+        raise RuntimeError("controller publication followed the worker push URL")
+    if os.system(
+        "git --git-dir=/tmp/worklink-hostile.git show-ref --verify refs/heads/issue/1410-a1 >/dev/null 2>&1"
+    ) == 0:
+        raise RuntimeError("worker-controlled remote received the publication")
     if Path("/home/mimir/worklink-canary").read_text() != "controller-reset":
         raise RuntimeError("worker changed controller canary")
     if sibling.path.joinpath("sibling-canary").read_text() != "sibling-original":
         raise RuntimeError("worker changed concurrent sibling checkout")
-    cleanup_checkout(lease, outcome="completed", safe_git=publication)
-    sibling_fd = sibling.authorization.duplicate_fd()
-    try:
-        sibling_publication = ControllerGitPublication.capture(
-            sibling_fd, REPO, sibling.branch, METADATA / "sibling"
-        )
-    finally:
-        os.close(sibling_fd)
-    cleanup_checkout(sibling, outcome="completed", safe_git=sibling_publication)
-    sibling_publication.close()
+    cleanup_checkout(lease, outcome="completed")
+    cleanup_checkout(sibling, outcome="completed")
     publication.close()
     if lease.path.exists():
         raise RuntimeError("production checkout cleanup failed")
@@ -187,11 +195,12 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import subprocess
 import uuid
 
 from mimir.tools.registry import set_spawn_config, spawn_open_code
 
-SEED = Path("/home/mimir/worklink-source")
+SEED = Path("/workspace/mimir")
 ARTIFACTS = Path("/home/mimir/worklink-spawn-artifacts")
 CONFIG = Path("/home/mimir/worklink-opencode/opencode.json")
 AUTH = Path("/home/mimir/worklink-opencode/data/opencode/auth.json")
@@ -207,14 +216,22 @@ async def main():
         "MIMIR_MODEL_SPEC": "proof:model",
     })
     set_spawn_config({
-        "default_cwd": Path("/home/mimir"),
+        "default_cwd": SEED,
         "artifact_root": ARTIFACTS,
         "opencode_config_path": CONFIG,
     })
     source_head = (SEED / ".git/HEAD").read_bytes()
-    source_status = os.popen(
-        "git -C /home/mimir/worklink-source status --porcelain=v1 -z"
-    ).read()
+
+    def seed_status() -> bytes:
+        return subprocess.run(
+            ["git", "-C", str(SEED), "status", "--porcelain=v1", "-z"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=True,
+        ).stdout
+
+    source_status = seed_status()
     raw = await spawn_open_code.ainvoke({
         "prompt": "generate and execute the containment proof payload",
         "cwd": str(SEED),
@@ -267,7 +284,7 @@ async def main():
         raise RuntimeError("generated OpenCode payload changed controller canary")
     if (SEED / ".git/HEAD").read_bytes() != source_head:
         raise RuntimeError("spawn changed the seed repository HEAD")
-    if os.popen("git -C /home/mimir/worklink-source status --porcelain=v1 -z").read() != source_status:
+    if seed_status() != source_status:
         raise RuntimeError("spawn changed the seed repository working tree")
     for path in sorted(ARTIFACTS.rglob("*"), reverse=True):
         if path.is_file() or path.is_symlink():
@@ -328,15 +345,17 @@ def main() -> None:
         if not any(uid == "0" and "mimir.worklink.worker_exec" in cmd for _, uid, cmd in rows):
             raise RuntimeError(f"live worker executor is not root\n{process_table}")
 
-        setup = """
+        setup = r"""
             set -eu
+            install -d -o mimir -g mimir -m 0755 /workspace
             /command/s6-setuidgid mimir sh -ceu 'printf controller-writable > /home/mimir/worklink-canary; printf controller-reset > /home/mimir/worklink-canary'
             test "$(cat /home/mimir/worklink-canary)" = controller-reset
             /command/s6-setuidgid mimir sh -ceu '
-              rm -rf /home/mimir/worklink-source /home/mimir/worklink-remote.git /home/mimir/worklink-opencode /home/mimir/worklink-publication
+              rm -rf /workspace/mimir /workspace/.worklink /home/mimir/worklink-remote.git /home/mimir/worklink-opencode /home/mimir/worklink-publication
+              mkdir -p /workspace
               git init --bare -q /home/mimir/worklink-remote.git
-              git init -q /home/mimir/worklink-source
-              cd /home/mimir/worklink-source
+              git init -q /workspace/mimir
+              cd /workspace/mimir
               git remote add origin /home/mimir/worklink-remote.git
               printf base > tracked
               printf remove > deleted
@@ -346,7 +365,10 @@ def main() -> None:
               git push -q -u origin main
               git config user.name test
               git config user.email test@example.com
+              git config credential.helper "!f() { echo username=controller; echo password=trusted; }; f"
               mkdir -p /home/mimir/worklink-opencode/data/opencode
+              rm -rf /tmp/worklink-hostile.git /tmp/worklink-publication-attack
+              git init --bare -q /tmp/worklink-hostile.git
             '
             cat > /home/mimir/worklink-opencode/opencode.json <<'JSON'
 {"model":"proof/model","provider":{"proof":{"endpoint":"https://proof.invalid","apiKey":"{env:PROOF_TOKEN}"},"unrelated":{"apiKey":"must-not-project"}}}
@@ -391,19 +413,9 @@ if (Path("../b") / "cross-write").read_text() != "detector-live":
     raise SystemExit("sibling-access negative control did not detect a cross-write")
 os.fchdir(checkout_fd)
 os.close(checkout_fd)
-sibling_relative = Path("../../1411-1/checkout")
-sibling_absolute = checkout.parent.parent / "1411-1" / "checkout"
-checks = [
-    ["cat", str(sibling_relative / "sibling-canary")],
-    ["sh", "-c", f"printf attacked > {sibling_relative / 'sibling-canary'}"],
-    ["rm", "-f", str(sibling_relative / "sibling-canary")],
-    ["cat", str(sibling_absolute / "sibling-canary")],
-    ["sh", "-c", f"printf attacked > {sibling_absolute / 'sibling-canary'}"],
-    ["rm", "-f", str(sibling_absolute / "sibling-canary")],
-]
-for command in checks:
-    if subprocess.run(command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0:
-        raise SystemExit(f"worker reached concurrent sibling checkout: {command}")
+sibling = checkout.parent / "1411-1" / "sibling-canary"
+if sibling.read_text() != "sibling-original":
+    raise SystemExit("worker could not reach the intentionally shared sibling checkout")
 parent = home.parent
 checks = [
     ["ls", str(parent)],
@@ -413,6 +425,7 @@ checks = [
     ["rmdir", str(home)],
     ["cat", "/home/mimir/worklink-canary"],
     ["sh", "-c", "printf attacked > /home/mimir/worklink-canary"],
+    ["sh", "-c", "printf attacked > /workspace/mimir/tracked"],
 ]
 for command in checks:
     if subprocess.run(command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0:
@@ -420,6 +433,33 @@ for command in checks:
 Path("tracked").write_text("worker-modified")
 Path("created").write_text("worker-created")
 Path("deleted").unlink()
+hooks = Path("worker-hooks")
+hooks.mkdir()
+for name in ("pre-commit", "pre-push"):
+    hook = hooks / name
+    hook.write_text("#!/bin/sh\ntouch /tmp/worklink-publication-attack\nexit 91\n")
+    hook.chmod(0o755)
+# The worker runs as ``worklink`` while the checkout is owned by ``mimir``, so bare
+# git refuses with "detected dubious ownership" and plants nothing. Name the checkout
+# explicitly and mark it safe: a hostile worker would do exactly this, and a proof that
+# cannot plant proves nothing.
+checkout = str(Path.cwd().resolve())
+git = ["git", "-c", f"safe.directory={checkout}", "-C", checkout]
+hostile_helper = "!f() { touch /tmp/worklink-publication-attack; echo username=worker; echo password=hostile; }; f"
+subprocess.run([*git, "config", "--local", "core.hooksPath", str(hooks.resolve())], check=True)
+subprocess.run([*git, "config", "--local", "credential.helper", hostile_helper], check=True)
+subprocess.run([*git, "remote", "set-url", "--push", "origin", "/tmp/worklink-hostile.git"], check=True)
+
+# Read every planted value back. Without this the proof passes vacuously whenever the
+# plant silently fails, which is the failure mode it exists to rule out.
+def planted(args, expected):
+    got = subprocess.run([*git, *args], capture_output=True, text=True, check=True).stdout.strip()
+    if expected not in got:
+        raise SystemExit(f"hostile setup did not persist: {args} -> {got!r}")
+
+planted(["config", "--local", "--get", "core.hooksPath"], str(hooks.resolve()))
+planted(["config", "--local", "--get", "credential.helper"], "worklink-publication-attack")
+planted(["remote", "get-url", "--push", "origin"], "/tmp/worklink-hostile.git")
 print(f"build-euid={os.geteuid()}")
 PY
             chmod 0755 /tmp/opencode-proof

@@ -462,19 +462,13 @@ def create_isolated_checkout(
     depend on an object directory under the scratch janitor's swept roots.
     """
 
-    enabled = coding_enabled() and worker_eligible
-    identities = get_identities() if enabled else None
+    worker_accessible = coding_enabled() and worker_eligible
+    identities = get_identities() if worker_accessible else None
     path = _isolated_checkout_path(
-        repo, worklink_dir, issue_id, attempt, worker_authorized=enabled
+        repo, worklink_dir, issue_id, attempt, worker_authorized=False
     )
     branch = f"issue/{issue_id}-a{attempt}"
     path.parent.mkdir(parents=True, exist_ok=True)
-    if identities is not None:
-        repo_parent = path.parent.parent
-        os.chown(repo_parent, identities.mimir_uid, identities.worklink_gid)
-        os.chmod(repo_parent, 0o710)
-        os.chown(path.parent, identities.mimir_uid, identities.worklink_gid)
-        os.chmod(path.parent, 0o700)
     if path.exists():
         raise RuntimeError(f"attempt checkout already exists: {path}")
 
@@ -498,10 +492,10 @@ def create_isolated_checkout(
         )
     wanted_push_target = parent_push.stdout.strip()
 
-    previous_umask = os.umask(0o007) if enabled else None
+    previous_umask = os.umask(0o007) if worker_accessible else None
     try:
         _clone_attempt_checkout(
-            repo, path, runner=runner, event_logger=event_logger, no_hardlinks=enabled
+            repo, path, runner=runner, event_logger=event_logger, no_hardlinks=worker_accessible
         )
     finally:
         if previous_umask is not None:
@@ -543,9 +537,11 @@ def create_isolated_checkout(
     authorization = None
     try:
         _assert_self_contained_checkout(path, runner=runner)
-        if enabled:
-            relative_path = path.relative_to(_ENABLED_CHECKOUT_ROOT)
-            checkout_fd = _open_worklink_checkout(relative_path)
+        if worker_accessible:
+            checkout_fd = os.open(
+                path,
+                os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0),
+            )
             try:
                 assert identities is not None
                 _normalize_checkout_fd(
@@ -553,11 +549,8 @@ def create_isolated_checkout(
                     owner_uid=identities.mimir_uid,
                     group_gid=identities.worklink_gid,
                 )
-                authorization = _mint_checkout_authorization(path, issue_id, attempt, checkout_fd)
-                checkout_fd = -1
             finally:
-                if checkout_fd >= 0:
-                    os.close(checkout_fd)
+                os.close(checkout_fd)
     except (OSError, RuntimeError):
         shutil.rmtree(path, ignore_errors=True)
         raise
@@ -571,7 +564,7 @@ def create_isolated_checkout(
         base_ref=base,
         local_base=local_base,
         isolated_checkout=True,
-        worker_authorized=enabled,
+        worker_authorized=False,
         authorization=authorization,
     )
 

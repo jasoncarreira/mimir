@@ -1321,14 +1321,14 @@ def test_fd_normalization_rejects_special_files(
         os.close(checkout_fd)
 
 
-def test_enabled_eligible_checkout_retains_exact_authorization_and_shared_modes(
+def test_enabled_eligible_checkout_uses_normal_path_and_shared_modes_without_authorization(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     repo = _repo_with_main(tmp_path)
-    enabled_root = tmp_path / "enabled"
     calls: list[list[str]] = []
     monkeypatch.setenv("MIMIR_CODING_ENABLED", "true")
-    monkeypatch.setattr(checkout_module, "_ENABLED_CHECKOUT_ROOT", enabled_root)
+    forbidden_root = tmp_path / "enabled"
+    monkeypatch.setattr(checkout_module, "_ENABLED_CHECKOUT_ROOT", forbidden_root)
     monkeypatch.setattr(
         checkout_module,
         "get_identities",
@@ -1339,6 +1339,7 @@ def test_enabled_eligible_checkout_retains_exact_authorization_and_shared_modes(
         calls.append(list(args))
         return subprocess.run(list(args), capture_output=True, text=True, check=False)
 
+    source_before = repo.stat()
     lease = create_isolated_checkout(
         repo,
         issue_id=1410,
@@ -1347,24 +1348,21 @@ def test_enabled_eligible_checkout_retains_exact_authorization_and_shared_modes(
         worker_eligible=True,
     )
     try:
-        assert lease.worker_authorized is True
-        assert lease.authorization is not None
-        assert lease.path.parent.parent.parent == enabled_root
-        assert stat.S_IMODE(lease.path.parent.stat().st_mode) == 0o700
-        lease.authorization.verify(lease.path)
-        retained = lease.authorization.duplicate_fd()
-        try:
-            observed = os.fstat(retained)
-            assert (observed.st_dev, observed.st_ino) == (
-                lease.authorization.device,
-                lease.authorization.inode,
-            )
-        finally:
-            os.close(retained)
+        assert lease.path == tmp_path / ".worklink" / repo.name / "1410-1"
+        assert lease.worker_authorized is False
+        assert lease.authorization is None
+        assert not forbidden_root.exists()
         assert stat.S_IMODE(lease.path.stat().st_mode) == 0o2770
+        assert lease.path.stat().st_gid == os.getgid()
         assert stat.S_IMODE((lease.path / ".git").stat().st_mode) == 0o2770
         clone = next(call for call in calls if call[:3] == ["git", "clone", "--local"])
         assert "--no-hardlinks" in clone
+        source_after = repo.stat()
+        assert (source_after.st_uid, source_after.st_gid, source_after.st_mode) == (
+            source_before.st_uid,
+            source_before.st_gid,
+            source_before.st_mode,
+        )
     finally:
         if lease.authorization is not None:
             lease.authorization.close()

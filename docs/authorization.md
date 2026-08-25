@@ -495,7 +495,14 @@ protect an admitted seed from code the operator already approved.
 
 ### Surfaces that still execute as the agent user
 
-Feature-factory runs remain outside the two contained paths above and still
+Poller-dispatched Worklink OpenCode builds use the `worklink` uid in a
+group-writable checkout under `/workspace/.worklink`. This prevents generated
+code from writing the source repository checkout as the agent user. It is not a
+sandbox, does not provide cross-run isolation, and is explicitly not credential
+isolation: the virtiofs home mount remains readable across guest identities
+(#1435).
+
+Feature-factory runs remain outside the contained paths above and still
 execute as the agent user. Track that OS-isolation gap separately; tool-level
 authorization alone does not provide an OS boundary.
 

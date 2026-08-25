@@ -51,6 +51,7 @@ from .evidence import (
     pytest_report_environment,
     read_pytest_result,
 )
+from .identities import get_identities
 from .planning import (
     missing_leaf_template_parts,
     render_decompose_prompt,
@@ -543,7 +544,7 @@ class WorklinkRunner:
         )
         compute = registry.select_compute(labels=issue.labels, repo=repo_slug)
         selected_name = backend.name
-        worker_required = (
+        worker_uid_drop = (
             coding_enabled()
             and isinstance(backend, OpenCodeBackend)
             and compute.name == "local_subprocess"
@@ -693,15 +694,21 @@ class WorklinkRunner:
                 base_fetch=config.defaults.base_fetch,
                 event_logger=_log_event,
                 runner=_list_runner(runner),
-                worker_eligible=worker_required,
+                worker_eligible=worker_uid_drop,
             )
-            if worker_required:
-                if lease.authorization is None:
-                    raise WorklinkError("worker checkout did not provide authorization")
+            if worker_uid_drop:
                 if not isinstance(compute, LocalSubprocessComputeBackend):
-                    raise WorklinkError("worker checkout requires local subprocess compute")
-                compute = LocalSubprocessComputeBackend.for_authorized_checkout(lease.authorization)
-                checkout_fd = lease.authorization.duplicate_fd()
+                    raise WorklinkError("worker uid drop requires local subprocess compute")
+                compute = LocalSubprocessComputeBackend.for_path_checkout(
+                    get_identities().worklink_uid
+                )
+                checkout_fd = os.open(
+                    lease.path,
+                    os.O_RDONLY
+                    | os.O_DIRECTORY
+                    | os.O_CLOEXEC
+                    | getattr(os, "O_NOFOLLOW", 0),
+                )
                 try:
                     publication = ControllerGitPublication.capture(
                         checkout_fd,
@@ -852,7 +859,7 @@ class WorklinkRunner:
                 executor_report_dir=executor_report_dir,
             )
             delete_authorized_checkout = bool(
-                worker_required and result.review_ready and result.pr_url
+                worker_uid_drop and result.review_ready and result.pr_url
             )
             if delete_authorized_checkout and publication is not None:
                 cleanup_errors: list[str] = []
@@ -2774,7 +2781,9 @@ def _close_attempt_capabilities(
                 authorization.close()
         finally:
             if delete_checkout and checkout is not None:
-                rmtree_missing_ok(checkout.parent)
+                # Path-addressed attempts are siblings under one repository root.
+                # Delete only this attempt; removing the parent destroys concurrent runs.
+                rmtree_missing_ok(checkout)
 
 
 def _release_issue_and_clear_run_state(
