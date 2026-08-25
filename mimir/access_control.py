@@ -8264,9 +8264,9 @@ _SELF_AUTHORED_FILE_ROOTS = frozenset({
     "docs",
     "memory",
     "prompts",
-    "skills",
     "state",
 })
+_FILE_INTEGRITY_RECORDED_ROOTS = _SELF_AUTHORED_FILE_ROOTS | {"skills"}
 _FILE_INTEGRITY_EXCLUDED_SUBTREES = frozenset({("state", "pollers")})
 _FILE_INTEGRITY_DECLASSIFICATIONS_KEY = "__declassifications__"
 
@@ -8412,7 +8412,9 @@ def _filesystem_result_integrity(
         # only by the operator or by the agent through the protected tool
         # boundary -- so the path itself is evidence of self-authorship, which
         # is what earns the trusted default. ``docs`` and ``prompts`` qualify on
-        # the same footing as ``skills``: seeded reference material, not ingest.
+        # the same footing as builtin skills: seeded reference material, not
+        # ingest. Operator- or agent-authored files under ``skills`` do not
+        # receive this default merely because of their location.
         # Trust still comes from ``_persisted_file_integrity`` below, so a
         # tainted model write into any of them is downgraded rather than
         # laundered.
@@ -8496,7 +8498,7 @@ def record_file_write_integrity(
         relative = resource.relative_to(home)
     except (OSError, RuntimeError, ValueError):
         return False
-    if not relative.parts or relative.parts[0] not in _SELF_AUTHORED_FILE_ROOTS:
+    if not relative.parts or relative.parts[0] not in _FILE_INTEGRITY_RECORDED_ROOTS:
         return True
     if relative.parts[0:2] in _FILE_INTEGRITY_EXCLUDED_SUBTREES:
         return True
