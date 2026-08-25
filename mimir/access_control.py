@@ -9726,6 +9726,69 @@ def is_admin(auth_context: Any) -> bool:
     return "admin" in roles
 
 
+def can_resolve_forge_review_scope(
+    auth_context: Any,
+    *,
+    stage: str,
+    pr_author: str | None = None,
+    self_login: str | None = None,
+) -> bool:
+    """Authorize one stage of forge review-scope resolution.
+
+    The admitted production turn kinds are explicit here:
+
+    - Authenticated operator ``user_message`` turns may reuse stored scope and
+      discover any configured pull request.
+    - Trusted ``poller`` services that were granted ``pr_metadata`` may reuse
+      stored scope and provisionally fetch an open pull request. Acceptance
+      still requires the pull request to be authored by Mimir's configured
+      forge login.
+    - Trusted ``scheduled_tick`` services in a review-scope authority profile
+      may reuse scope previously discovered by the server, but may not perform
+      new live discovery.
+
+    No other turn kind may reuse or discover forge review scope.
+    """
+    if auth_context is None:
+        return False
+    trigger = getattr(auth_context, "trigger", None)
+    ingress = getattr(auth_context, "event_ingress", None)
+    is_service = getattr(auth_context, "is_service", False)
+    principal = getattr(auth_context, "canonical_principal", None)
+    roles = getattr(auth_context, "roles", ())
+    trusted_service = get_trusted_service_from_auth_context(auth_context)
+
+    operator_user = (
+        trigger == "user_message"
+        and not is_service
+        and ingress is None
+        and bool(principal)
+        and "admin" in roles
+    )
+    poller_service = (
+        trigger == "poller"
+        and trusted_service is not None
+        and trusted_service.has_capability("pr_metadata")
+    )
+    scheduled_service = (
+        trigger == "scheduled_tick"
+        and trusted_service is not None
+        and trusted_service.authority_profile in _PR_REVIEW_SCOPE_AUTHORITY_PROFILES
+    )
+
+    if stage == "stored":
+        return operator_user or poller_service or scheduled_service
+    if stage == "fetch":
+        return operator_user or poller_service
+    if stage == "accept":
+        return operator_user or (
+            poller_service
+            and bool(self_login)
+            and pr_author == self_login
+        )
+    raise ValueError(f"unknown forge review-scope resolution stage: {stage!r}")
+
+
 def get_trusted_service_from_auth_context(
     auth_context: Any,
 ) -> ServicePrincipal | None:

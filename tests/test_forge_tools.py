@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import ast
+import inspect
 import json
+import textwrap
 from dataclasses import dataclass, replace
 from types import SimpleNamespace
 
@@ -84,6 +87,60 @@ def _scope(
         observed_head_sha=head_sha,
         base_ref="main",
         observed_base_sha="b" * 40,
+    )
+
+
+def _production_auth_context(tmp_path, turn_kind: str) -> AuthContext:
+    """Build real caller shapes through the event forms production dispatches."""
+    state = tmp_path / "state"
+    state.mkdir(exist_ok=True)
+    (state / "identities.yaml").write_text(
+        "people:\n"
+        "  - canonical: operator\n"
+        "    aliases: [chat-operator]\n"
+        "    access: {roles: [admin]}\n",
+        encoding="utf-8",
+    )
+    resolver = IdentityResolver(tmp_path)
+    resolver.reload()
+    if turn_kind == "operator_user":
+        event = AgentEvent(
+            trigger="user_message", channel_id="operator", author="chat-operator",
+        )
+    elif turn_kind == "poller_service":
+        authority = access_control.build_trigger_service_principal(
+            canonical="poller:github-activity",
+            trigger="poller",
+            profile="github",
+            tier=access_control.CapabilityTier.CODE_EXECUTION,
+            capabilities=("pr_metadata",),
+            creation_path="mimir.pollers.run_poller",
+        )
+        event = AgentEvent(
+            trigger="poller",
+            channel_id="poller:github-activity",
+            service_principal=authority.canonical,
+            service_authority=authority,
+        )
+    elif turn_kind == "scheduled_tick":
+        authority = access_control.build_trigger_service_principal(
+            canonical="heartbeat",
+            trigger="scheduled_tick",
+            profile="heartbeat",
+            tier=access_control.CapabilityTier.UNBOUNDED,
+            capabilities=("pr_metadata",),
+            creation_path="mimir.scheduler.Scheduler._fire:heartbeat",
+        )
+        event = AgentEvent(
+            trigger="scheduled_tick",
+            channel_id="scheduler:test",
+            service_principal=authority.canonical,
+            service_authority=authority,
+        )
+    else:
+        raise ValueError(f"unknown production turn kind: {turn_kind!r}")
+    return access_control.create_auth_context(
+        event, resolver, enforce=True, ifc_labels=InformationFlowLabels(),
     )
 
 
@@ -364,11 +421,17 @@ def test_empty_service_scope_keeps_live_discovery_refusal(
     )
 
 
-def _autonomous_context(store: ServerDiscoveredPRScopeStore) -> AuthContext:
-    return AuthContext(
-        principal="agent", canonical_principal="agent", roles=(),
-        event_ingress=None, trigger="scheduled_tick", channel_id="scheduler:test",
-        interactivity=None, server_discovered_pr_scope_store=store,
+def _autonomous_context(tmp_path, store: ServerDiscoveredPRScopeStore) -> AuthContext:
+    return replace(
+        _production_auth_context(tmp_path, "scheduled_tick"),
+        server_discovered_pr_scope_store=store,
+    )
+
+
+def _poller_context(tmp_path, store: ServerDiscoveredPRScopeStore | None = None) -> AuthContext:
+    return replace(
+        _production_auth_context(tmp_path, "poller_service"),
+        server_discovered_pr_scope_store=store,
     )
 
 
@@ -388,20 +451,20 @@ def _configure_live_review(
 
 
 def test_server_discovered_scope_is_reused_on_later_autonomous_turn(
+    tmp_path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     client = FakeForge()
     _configure_live_review(monkeypatch, client)
     store = ServerDiscoveredPRScopeStore()
-    operator = AuthContext(
-        principal="operator", canonical_principal="operator", roles=("admin",),
-        event_ingress=None, trigger="user_message", channel_id="operator",
-        interactivity=None, server_discovered_pr_scope_store=store,
+    operator = replace(
+        _production_auth_context(tmp_path, "operator_user"),
+        server_discovered_pr_scope_store=store,
     )
 
     handed = resolve_review_state_for_context(operator, "owner/repo", 1291)
     reused = resolve_review_state_for_context(
-        _autonomous_context(store), "OWNER/REPO", 1291,
+        _autonomous_context(tmp_path, store), "OWNER/REPO", 1291,
     )
 
     assert handed.action_scope.provenance == "server_discovered"
@@ -412,7 +475,32 @@ def test_server_discovered_scope_is_reused_on_later_autonomous_turn(
     ]
 
 
+def test_server_discovered_scope_is_reused_on_later_production_poller_turn(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = FakeForge()
+    _configure_live_review(monkeypatch, client)
+    store = ServerDiscoveredPRScopeStore()
+    operator = replace(
+        _production_auth_context(tmp_path, "operator_user"),
+        server_discovered_pr_scope_store=store,
+    )
+
+    handed = resolve_review_state_for_context(operator, "owner/repo", 1291)
+    reused = resolve_review_state_for_context(
+        _poller_context(tmp_path, store), "OWNER/REPO", 1291,
+    )
+
+    assert reused.action_scope is handed.action_scope
+    assert client.calls == [
+        ("snapshot", "owner/repo", 1291),
+        ("snapshot", "owner/repo", 1291),
+    ]
+
+
 def test_autonomous_turn_cannot_resolve_model_named_unhanded_pr(
+    tmp_path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     client = FakeForge()
@@ -420,7 +508,7 @@ def test_autonomous_turn_cannot_resolve_model_named_unhanded_pr(
 
     with pytest.raises(ToolException) as refused:
         resolve_review_state_for_context(
-            _autonomous_context(ServerDiscoveredPRScopeStore()),
+            _autonomous_context(tmp_path, ServerDiscoveredPRScopeStore()),
             "owner/repo", 1291,
         )
 
@@ -441,19 +529,19 @@ def test_only_server_discovered_scope_can_enter_later_turn_store() -> None:
 
 
 def test_advanced_head_invalidates_reuse_and_is_not_rechecked_this_turn(
+    tmp_path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     client = FakeForge()
     client.snapshot_heads = ["c" * 40, "d" * 40]
     _configure_live_review(monkeypatch, client)
     store = ServerDiscoveredPRScopeStore()
-    operator = AuthContext(
-        principal="operator", canonical_principal="operator", roles=("admin",),
-        event_ingress=None, trigger="user_message", channel_id="operator",
-        interactivity=None, server_discovered_pr_scope_store=store,
+    operator = replace(
+        _production_auth_context(tmp_path, "operator_user"),
+        server_discovered_pr_scope_store=store,
     )
     resolve_review_state_for_context(operator, "owner/repo", 1291)
-    autonomous = _autonomous_context(store)
+    autonomous = _autonomous_context(tmp_path, store)
 
     for _ in range(2):
         with pytest.raises(ToolException) as refused:
@@ -470,21 +558,19 @@ def test_advanced_head_invalidates_reuse_and_is_not_rechecked_this_turn(
 
 @pytest.mark.asyncio
 async def test_scope_handed_to_first_turn_authorizes_tool_on_second_autonomous_turn(
+    tmp_path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     client = FakeForge()
     _configure_live_review(monkeypatch, client)
     store = ServerDiscoveredPRScopeStore()
-    operator = AuthContext(
-        principal="operator", canonical_principal="operator", roles=("admin",),
-        event_ingress=None, trigger="user_message", channel_id="operator",
-        interactivity=None, enforcement_enabled=True,
-        ifc_labels=InformationFlowLabels(),
+    operator = replace(
+        _production_auth_context(tmp_path, "operator_user"),
         server_discovered_pr_scope_store=store,
     )
     resolve_review_state_for_context(operator, "owner/repo", 1291)
     autonomous = replace(
-        _autonomous_context(store),
+        _autonomous_context(tmp_path, store),
         enforcement_enabled=True,
         ifc_labels=InformationFlowLabels(),
     )
@@ -539,6 +625,7 @@ def test_scope_miss_keeps_malformed_selector_refusal(
 
 
 def test_operator_registry_miss_still_discovers_live_scope(
+    tmp_path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     client = FakeForge()
@@ -553,10 +640,9 @@ def test_operator_registry_miss_still_discovers_live_scope(
         ),
     )
     state = RepoReviewState(_scope(RepoPRAction.INSPECT, number=1))
-    context = AuthContext(
-        principal="operator", canonical_principal="operator", roles=("admin",),
-        event_ingress=None, trigger="user_message", channel_id="operator",
-        interactivity=None, repo_pr_scope_registry=RepoPRScopeRegistry((state,)),
+    context = replace(
+        _production_auth_context(tmp_path, "operator_user"),
+        repo_pr_scope_registry=RepoPRScopeRegistry((state,)),
     )
 
     resolved = resolve_review_state_for_context(context, "owner/repo", 2)
@@ -565,15 +651,96 @@ def test_operator_registry_miss_still_discovers_live_scope(
     assert client.calls == [("snapshot", "owner/repo", 2)]
 
 
-def _poller_operator_context() -> AuthContext:
-    return AuthContext(
-        principal="operator", canonical_principal="operator", roles=("admin",),
-        event_ingress=None, trigger="poller", channel_id="poller:forge",
-        interactivity=None,
+def _poller_operator_context(tmp_path) -> AuthContext:
+    return _poller_context(tmp_path)
+
+
+@pytest.mark.parametrize(
+    ("turn_kind", "expected"),
+    [
+        pytest.param(
+            "operator_user", (True, True, True, True), id="operator-user-turn",
+        ),
+        pytest.param(
+            "poller_service", (True, True, True, False), id="poller-service-turn",
+        ),
+        pytest.param(
+            "scheduled_tick", (True, False, False, False), id="scheduled-tick",
+        ),
+    ],
+)
+def test_real_turn_kind_forge_review_scope_policy(
+    tmp_path, turn_kind: str, expected: tuple[bool, bool, bool, bool],
+) -> None:
+    context = _production_auth_context(tmp_path, turn_kind)
+
+    actual = (
+        access_control.can_resolve_forge_review_scope(context, stage="stored"),
+        access_control.can_resolve_forge_review_scope(context, stage="fetch"),
+        access_control.can_resolve_forge_review_scope(
+            context, stage="accept", pr_author="reviewer", self_login="reviewer",
+        ),
+        access_control.can_resolve_forge_review_scope(
+            context, stage="accept", pr_author="third-party", self_login="reviewer",
+        ),
+    )
+
+    assert actual == expected
+
+
+def test_production_poller_context_uses_declared_service_authority(tmp_path) -> None:
+    context = _production_auth_context(tmp_path, "poller_service")
+
+    assert context.trigger == "poller"
+    assert context.is_service is True
+    assert context.event_ingress is None
+    assert context.roles == ()
+    assert context.canonical_principal == "poller:github-activity"
+    assert context.service_authority is not None
+    assert context.service_authority.authority_profile == "github"
+    assert context.service_authority.has_capability("pr_metadata")
+
+
+def test_poller_without_review_capability_cannot_resolve_forge_scope(tmp_path) -> None:
+    context = _production_auth_context(tmp_path, "poller_service")
+    unprivileged = replace(
+        context,
+        service_authority=access_control.build_trigger_service_principal(
+            canonical="poller:github-activity",
+            trigger="poller",
+            profile="github",
+            tier=access_control.CapabilityTier.CODE_EXECUTION,
+            capabilities=(),
+            creation_path="mimir.pollers.run_poller",
+        ),
+    )
+
+    assert not access_control.can_resolve_forge_review_scope(
+        unprivileged, stage="stored",
+    )
+    assert not access_control.can_resolve_forge_review_scope(
+        unprivileged, stage="fetch",
     )
 
 
+def test_forge_review_scope_path_has_no_raw_authorization_field_reads() -> None:
+    tree = ast.parse(textwrap.dedent(inspect.getsource(resolve_review_state_for_context)))
+    raw_reads = {
+        node.attr
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Attribute)
+        and isinstance(node.value, ast.Name)
+        and node.value.id == "context"
+        and node.attr in {
+            "canonical_principal", "is_service", "event_ingress", "trigger", "roles",
+        }
+    }
+
+    assert raw_reads == set()
+
+
 def test_poller_turn_discovers_live_scope_for_own_open_pr(
+    tmp_path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     client = FakeForge()
@@ -581,7 +748,7 @@ def test_poller_turn_discovers_live_scope_for_own_open_pr(
     _configure_live_review(monkeypatch, client)
 
     resolved = resolve_review_state_for_context(
-        _poller_operator_context(), "owner/repo", 1291,
+        _poller_operator_context(tmp_path), "owner/repo", 1291,
     )
 
     assert resolved.pr_number == 1291
@@ -600,6 +767,7 @@ def test_poller_turn_discovers_live_scope_for_own_open_pr(
     ],
 )
 def test_poller_turn_refuses_live_scope_for_unowned_open_pr(
+    tmp_path,
     monkeypatch: pytest.MonkeyPatch,
     self_login: str | None,
     snapshot_author: str,
@@ -614,7 +782,7 @@ def test_poller_turn_refuses_live_scope_for_unowned_open_pr(
 
     with pytest.raises(ToolException) as refused:
         resolve_review_state_for_context(
-            _poller_operator_context(), "owner/repo", 1291,
+            _poller_operator_context(tmp_path), "owner/repo", 1291,
         )
 
     assert str(refused.value) == (
@@ -625,6 +793,7 @@ def test_poller_turn_refuses_live_scope_for_unowned_open_pr(
 
 
 def test_poller_turn_own_merged_pr_yields_terminal_state(
+    tmp_path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     client = FakeForge()
@@ -634,7 +803,7 @@ def test_poller_turn_own_merged_pr_yields_terminal_state(
 
     with pytest.raises(ToolException) as refused:
         resolve_review_state_for_context(
-            _poller_operator_context(), "owner/repo", 1291,
+            _poller_operator_context(tmp_path), "owner/repo", 1291,
         )
 
     assert str(refused.value) == (
@@ -644,15 +813,12 @@ def test_poller_turn_own_merged_pr_yields_terminal_state(
 
 
 def test_user_message_turn_still_discovers_third_party_open_pr(
+    tmp_path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     client = FakeForge()
     _configure_live_review(monkeypatch, client)
-    context = AuthContext(
-        principal="operator", canonical_principal="operator", roles=("admin",),
-        event_ingress=None, trigger="user_message", channel_id="operator",
-        interactivity=None,
-    )
+    context = _production_auth_context(tmp_path, "operator_user")
 
     resolved = resolve_review_state_for_context(context, "owner/repo", 1291)
 
@@ -838,6 +1004,7 @@ class _TestResult:
 
 @pytest.mark.asyncio
 async def test_operator_turn_discovers_live_review_scope_and_reaches_repo_test(
+    tmp_path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     client = FakeForge()
@@ -856,10 +1023,7 @@ async def test_operator_turn_discovers_live_review_scope_and_reaches_repo_test(
             return _TestResult("ok")
 
     monkeypatch.setattr("mimir.tools.repo.RepoProjectTests", lambda state: Tests())
-    context = AuthContext(
-        principal="operator", canonical_principal="operator", roles=("admin",),
-        event_ingress=None, trigger="user_message", channel_id="operator", interactivity=None,
-    )
+    context = _production_auth_context(tmp_path, "operator_user")
     runtime = ToolRuntime(
         state={}, context=context, config={}, stream_writer=lambda _: None,
         tool_call_id="operator-review", store=None,
@@ -883,6 +1047,7 @@ async def test_operator_turn_discovers_live_review_scope_and_reaches_repo_test(
 
 
 def test_server_discovered_changes_requested_review_reaches_repo_write_authority(
+    tmp_path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     client = FakeForge()
@@ -902,11 +1067,7 @@ def test_server_discovered_changes_requested_review_reaches_repo_write_authority
             ("/server/configured/repo",), 1,
         ),
     )
-    context = AuthContext(
-        principal="operator", canonical_principal="operator", roles=("admin",),
-        event_ingress=None, trigger="user_message", channel_id="operator", interactivity=None,
-        enforcement_enabled=True, ifc_labels=InformationFlowLabels(),
-    )
+    context = _production_auth_context(tmp_path, "operator_user")
 
     from mimir.tools.forge import resolve_review_state_for_context
 
@@ -929,15 +1090,13 @@ def test_server_discovered_changes_requested_review_reaches_repo_write_authority
 
 
 def test_standing_review_refuses_unconfigured_repo_before_live_fetch(
+    tmp_path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     client = FakeForge()
     set_forge_client(client)
     monkeypatch.setenv("GITHUB_REPOS", "owner/repo")
-    context = AuthContext(
-        principal="operator", canonical_principal="operator", roles=("admin",),
-        event_ingress=None, trigger="user_message", channel_id="operator", interactivity=None,
-    )
+    context = _production_auth_context(tmp_path, "operator_user")
     runtime = ToolRuntime(
         state={}, context=context, config={}, stream_writer=lambda _: None,
         tool_call_id="operator-review", store=None,
@@ -952,6 +1111,7 @@ def test_standing_review_refuses_unconfigured_repo_before_live_fetch(
 
 @pytest.mark.asyncio
 async def test_enforced_middleware_resolves_standing_review_before_authorization(
+    tmp_path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     client = FakeForge()
@@ -966,11 +1126,7 @@ async def test_enforced_middleware_resolves_standing_review_before_authorization
             ("/server/configured/repo",), 1,
         ),
     )
-    context = AuthContext(
-        principal="operator", canonical_principal="operator", roles=("admin",),
-        event_ingress=None, trigger="user_message", channel_id="operator", interactivity=None,
-        enforcement_enabled=True, ifc_labels=InformationFlowLabels(),
-    )
+    context = _production_auth_context(tmp_path, "operator_user")
     request = ToolCallRequest(
         tool_call={
             "name": "repo_test",
@@ -1423,6 +1579,7 @@ def test_standing_review_resolution_ignores_non_mapping_arguments(arguments) -> 
     [(0, "zero roots matched"), (2, "ambiguous: 2 roots matched")],
 )
 def test_standing_review_distinguishes_repo_binding_failures(
+    tmp_path,
     monkeypatch: pytest.MonkeyPatch,
     match_count: int,
     mode: str,
@@ -1438,10 +1595,7 @@ def test_standing_review_distinguishes_repo_binding_failures(
             None, ("/configured/root-a", "/configured/root-b"), match_count,
         ),
     )
-    context = AuthContext(
-        principal="operator", canonical_principal="operator", roles=("admin",),
-        event_ingress=None, trigger="user_message", channel_id="operator", interactivity=None,
-    )
+    context = _production_auth_context(tmp_path, "operator_user")
     runtime = ToolRuntime(
         state={}, context=context, config={}, stream_writer=lambda _: None,
         tool_call_id="binding-refusal", store=None,
@@ -1503,6 +1657,7 @@ def test_pr_state_failures_keep_existing_reason(
 
 @pytest.mark.asyncio
 async def test_pr_refusal_event_identifies_repository_and_number(
+    tmp_path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     client = FakeForge()
@@ -1519,12 +1674,7 @@ async def test_pr_refusal_event_identifies_repository_and_number(
         "mimir.tools.budget_gate._emit_event_sync",
         lambda kind, **fields: events.append((kind, fields)),
     )
-    context = AuthContext(
-        principal="operator", canonical_principal="operator", roles=("admin",),
-        event_ingress=None, trigger="user_message", channel_id="operator",
-        interactivity=None, enforcement_enabled=True,
-        ifc_labels=InformationFlowLabels(),
-    )
+    context = _production_auth_context(tmp_path, "operator_user")
     request = ToolCallRequest(
         tool_call={
             "name": "pr_reviews",
