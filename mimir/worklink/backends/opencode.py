@@ -229,6 +229,7 @@ class OpenCodeBackend:
             local_argv=_local_argv(
                 self.bin, args, order.checkout, prompt, fd_anchored=enabled
             ),
+            output_root=order.transcript_root,
         )
 
     async def invoke_with_startup_retry(
@@ -296,6 +297,8 @@ class OpenCodeBackend:
                 stderr=result.stderr,
                 timed_out=False,
                 output_overflow=False,
+                stdout_path=result.stdout_path,
+                stderr_path=result.stderr_path,
             )
             return RawResult(-1, transcript_file, "backend_error", result.launch_error)
 
@@ -328,6 +331,8 @@ class OpenCodeBackend:
             stderr=result.stderr,
             timed_out=result.timed_out,
             output_overflow=result.output_overflow,
+            stdout_path=result.stdout_path,
+            stderr_path=result.stderr_path,
         )
         return RawResult(
             result.exit_code,
@@ -516,6 +521,8 @@ def write_transcript(
     stderr: str,
     timed_out: bool,
     output_overflow: bool,
+    stdout_path: Path | None = None,
+    stderr_path: Path | None = None,
 ) -> None:
     payload = {
         "backend": "opencode",
@@ -526,6 +533,8 @@ def write_transcript(
         "stderr": _bounded_transcript_tail(stderr, TRANSCRIPT_STREAM_MAX_BYTES),
         "timed_out": timed_out,
         "output_overflow": output_overflow,
+        "stdout_path": str(stdout_path) if stdout_path is not None else None,
+        "stderr_path": str(stderr_path) if stderr_path is not None else None,
         "recorded_at": datetime.now(UTC).isoformat(),
     }
     encoded = json.dumps(payload, indent=2, sort_keys=True).encode("utf-8")
@@ -538,7 +547,26 @@ def write_transcript(
         reverse=True,
     )
     for stale in siblings[TRANSCRIPTS_PER_ISSUE:]:
+        _remove_transcript_outputs(stale)
         stale.unlink(missing_ok=True)
+
+
+def _remove_transcript_outputs(path: Path) -> None:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return
+    for field in ("stdout_path", "stderr_path"):
+        value = payload.get(field) if isinstance(payload, dict) else None
+        if not isinstance(value, str):
+            continue
+        output = Path(value)
+        if (
+            output.parent == path.parent
+            and output.name.endswith((".stdout.log", ".stderr.log"))
+        ):
+            output.unlink(missing_ok=True)
+
 
 def _status_from_output(exit_code: int, stdout: str, stderr: str) -> str:
     combined = f"{stdout}\n{stderr}".lower()

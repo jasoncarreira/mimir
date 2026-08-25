@@ -8,6 +8,8 @@ import os
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from .output_capture import OutputSink, open_output_pair
+
 if TYPE_CHECKING:
     from .worklink.worker_client import CheckoutCapability, WorkerProjection
 
@@ -198,39 +200,6 @@ class SensitiveMaterialScrubber:
         return bytes(value)
 
 
-async def _drain(
-    stream: asyncio.StreamReader | None,
-    limit: int,
-    overflow: Any,
-    scrubber: Any = None,
-) -> tuple[bytes, int]:
-    if stream is None:
-        return b"", 0
-    # Hold ``lookahead`` bytes beyond the cap so a secret straddling the cut is
-    # buffered whole and can be recognised; without it the cut leaves a fragment
-    # that whole-value scrubbing does not match and emits verbatim.
-    lookahead = scrubber.lookahead_bytes() if scrubber is not None else 0
-    ceiling = limit + lookahead
-    retained = bytearray()
-    total = 0
-    overflowed = False
-    while chunk := await stream.read(64 * 1024):
-        total += len(chunk)
-        room = max(0, ceiling - len(retained))
-        if room:
-            retained.extend(chunk[:room])
-        if total > limit and not overflowed:
-            overflowed = True
-            overflow()
-    if total <= limit:
-        return bytes(retained), 0
-    keep = (
-        limit if scrubber is None else scrubber.safe_truncation_length(retained, limit)
-    )
-    del retained[keep:]
-    return bytes(retained), total - keep
-
-
 def _worker_classes() -> tuple[Any, Any]:
     global WorkerClient
     from .worklink.worker_client import (
@@ -254,6 +223,10 @@ async def execute_contained(
     stdout_limit: int,
     stderr_limit: int,
     scrubber: Any = None,
+    stdout_sink: OutputSink | None = None,
+    stderr_sink: OutputSink | None = None,
+    stdout_path: Path | None = None,
+    stderr_path: Path | None = None,
 ) -> CollectedExecutionResult:
     if stdout_limit <= 0 or stderr_limit <= 0:
         raise ValueError("worker output limits must be positive")
@@ -277,50 +250,92 @@ async def execute_contained(
     ) != len(checked_projections):
         raise ValueError("worker projections must use at most two unique destinations")
 
+    opened_here = stdout_sink is None and stderr_sink is None
+    if (stdout_sink is None) != (stderr_sink is None):
+        raise ValueError("contained worker output sinks must be supplied together")
+    if stdout_sink is None or stderr_sink is None:
+        stdout_sink, stderr_sink = open_output_pair(
+            stdout_path, stdout_limit, stderr_path, stderr_limit
+        )
     client = (
         getattr(directory, "_contained_worker_client", None) or client_class(directory)
     )
-    process = await client.launch(
-        local_checkout=directory.path,
-        argv=tuple(argv),
-        env=dict(worker_env),
-        projections=checked_projections,
-        identifier=identifier,
-        timeout_s=timeout_s,
+    launch_task = asyncio.create_task(
+        client.launch(
+            local_checkout=directory.path,
+            argv=tuple(argv),
+            env=dict(worker_env),
+            projections=checked_projections,
+            identifier=identifier,
+            timeout_s=timeout_s,
+            stdout_sink=stdout_sink,
+            stderr_sink=stderr_sink,
+        )
     )
+    try:
+        process = await asyncio.shield(launch_task)
+    except asyncio.CancelledError:
+        # Do not abandon a launch after its request has crossed the socket.  Let
+        # the identity-bound handshake settle, then cancel and reap that exact
+        # worker before propagating cancellation to the caller.
+        try:
+            process = await asyncio.shield(launch_task)
+        except BaseException:
+            if opened_here:
+                stdout_sink.close()
+                stderr_sink.close()
+            raise
+        try:
+            await asyncio.shield(client.cancel(identifier))
+            await asyncio.shield(process.wait())
+        finally:
+            if opened_here:
+                stdout_sink.close()
+                stderr_sink.close()
+        raise
+    except BaseException:
+        if opened_here:
+            stdout_sink.close()
+            stderr_sink.close()
+        raise
     started = getattr(directory, "_contained_started", None)
     if started is not None:
         started(process)
     output_overflow = False
     cancel_task: asyncio.Task[None] | None = None
 
-    def overflow() -> None:
-        nonlocal output_overflow, cancel_task
-        if output_overflow:
-            return
-        output_overflow = True
-        cancel_task = asyncio.create_task(client.cancel(identifier))
-
-    async def collect() -> tuple[int | None, bytes, int, bytes, int]:
-        stdout_task = asyncio.create_task(
-            _drain(process.stdout, stdout_limit, overflow, scrubber)
-        )
-        stderr_task = asyncio.create_task(
-            _drain(process.stderr, stderr_limit, overflow, scrubber)
-        )
+    async def cancel_for_overflow() -> None:
         try:
-            exit_code = await process.wait()
-        finally:
-            (stdout, stdout_dropped), (stderr, stderr_dropped) = await asyncio.gather(
-                stdout_task, stderr_task
-            )
-        return exit_code, stdout, stdout_dropped, stderr, stderr_dropped
+            await client.cancel(identifier)
+        except RuntimeError:
+            # The executor independently enforces the same cap and may have
+            # already reaped the worker before this advisory cancellation lands.
+            pass
 
+    async def monitor_output() -> None:
+        nonlocal output_overflow, cancel_task
+        while True:
+            overflow = await asyncio.to_thread(
+                lambda: stdout_sink.overflowed() or stderr_sink.overflowed()
+            )
+            if overflow and not output_overflow:
+                output_overflow = True
+                cancel_task = asyncio.create_task(cancel_for_overflow())
+            if overflow:
+                lookahead = scrubber.lookahead_bytes() if scrubber is not None else 0
+                stdout_sink.truncate_to_limit(lookahead)
+                stderr_sink.truncate_to_limit(lookahead)
+            await asyncio.sleep(0.01)
+
+    async def collect() -> int | None:
+        return await process.wait()
+
+    monitor_task = asyncio.create_task(monitor_output())
     collect_task = asyncio.create_task(collect())
     timed_out = False
     try:
         try:
-            values = await asyncio.wait_for(asyncio.shield(collect_task), timeout_s)
+            exit_code = await asyncio.wait_for(asyncio.shield(collect_task), timeout_s)
         except TimeoutError:
             timed_out = True
             try:
@@ -328,17 +343,30 @@ async def execute_contained(
             except Exception:
                 pass
             finally:
-                values = await collect_task
+                exit_code = await collect_task
     except asyncio.CancelledError:
         await asyncio.shield(client.cancel(identifier))
         try:
             await asyncio.shield(collect_task)
         finally:
             raise
+    monitor_task.cancel()
+    await asyncio.gather(monitor_task, return_exceptions=True)
     if cancel_task is not None:
         await cancel_task
-    exit_code, stdout, stdout_dropped, stderr, stderr_dropped = values
-    return CollectedExecutionResult(
+    stdout, stdout_dropped = stdout_sink.read_bounded(scrubber=scrubber)
+    stderr, stderr_dropped = stderr_sink.read_bounded(scrubber=scrubber)
+    observed_overflow = (
+        stdout_sink.did_overflow
+        or stderr_sink.did_overflow
+        or getattr(process, "output_overflow", False)
+    )
+    if observed_overflow and not output_overflow:
+        output_overflow = True
+        await cancel_for_overflow()
+    stdout_sink.truncate_to_limit()
+    stderr_sink.truncate_to_limit()
+    result = CollectedExecutionResult(
         exit_code=exit_code,
         stdout=stdout,
         stderr=stderr,
@@ -347,3 +375,7 @@ async def execute_contained(
         stdout_dropped_bytes=stdout_dropped,
         stderr_dropped_bytes=stderr_dropped,
     )
+    if opened_here:
+        stdout_sink.close()
+        stderr_sink.close()
+    return result

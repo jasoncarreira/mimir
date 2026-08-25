@@ -13,6 +13,7 @@ import socket
 import stat
 import struct
 import subprocess
+import sys
 import threading
 import time
 from typing import Any
@@ -36,7 +37,7 @@ REPO_TEST_UV_CACHE = Path("/opt/mimir-worklink/uv-cache")
 MAX_FDS = 3
 # Deliberately not imported from worker_client: this value must describe the
 # immutable executor installed in the root-owned image, not mutable controller code.
-EXECUTOR_PROTOCOL_IDENTITY = "worklink-executor-v3-repo-uv-cache"
+EXECUTOR_PROTOCOL_IDENTITY = "worklink-executor-v5-bounded-output-fds"
 _STALE_EXECUTOR_DIAGNOSTIC = (
     "stale root executor image: controller and mimir.worklink.worker_exec protocol "
     "identities do not match; rebuild the image and restart the container"
@@ -55,13 +56,15 @@ _LINUX_CAPABILITY_VERSION_3 = 0x20080522
 _LINUX_CAPABILITY_U32S_3 = 2
 _LAUNCH_FIELDS = frozenset({
     "version", "op", "id", "issue", "attempt", "device", "inode",
-    "argv", "env", "projections", "timeout_s", "executor_identity",
+    "argv", "env", "projections", "timeout_s", "stdout_limit", "stderr_limit",
+    "executor_identity",
 })
 _CANCEL_FIELDS = frozenset({"version", "op", "id", "executor_identity"})
 _IDENTITY_FIELDS = frozenset({"version", "op", "executor_identity"})
 _jobs: dict[str, subprocess.Popen[bytes]] = {}
 _launching: set[str] = set()
 _jobs_lock = threading.Lock()
+_OUTPUT_LIMIT_POLL_S = 0.01
 
 
 class _CapHeader(ctypes.Structure):
@@ -99,6 +102,24 @@ def _last_capability() -> int:
         return int(Path("/proc/sys/kernel/cap_last_cap").read_text().strip())
     except (OSError, ValueError):
         return 63
+
+
+def _arm_parent_death_signal(expected_parent_pid: int) -> None:
+    """Arm Linux's parent-death signal, with a documented portable fallback.
+
+    Non-Linux kernels do not provide ``prctl(PR_SET_PDEATHSIG)``. On those
+    platforms normal controller cancellation and reaping still apply, but a
+    sudden controller death may orphan the worker.
+    """
+    if not sys.platform.startswith("linux"):
+        return
+    libc = ctypes.CDLL(None, use_errno=True)
+    if libc.prctl(1, signal.SIGKILL, 0, 0, 0) != 0:  # PR_SET_PDEATHSIG
+        error = ctypes.get_errno()
+        raise OSError(error, os.strerror(error))
+    # The parent can die before prctl runs; close that race explicitly.
+    if os.getppid() != expected_parent_pid:
+        os._exit(128 + signal.SIGKILL)
 
 
 def _drop_worker(checkout_fd: int) -> None:
@@ -469,6 +490,38 @@ def _handle_cancel(connection: socket.socket, request: dict[str, Any], fds: list
     _send(connection, {"id": identifier, "status": "cancelled"})
 
 
+def _wait_with_output_limits(
+    proc: subprocess.Popen[bytes],
+    timeout_s: float,
+    stdout_fd: int,
+    stdout_limit: int,
+    stderr_fd: int,
+    stderr_limit: int,
+) -> tuple[int, bool, bool]:
+    """Reap *proc* while enforcing output caps inside the durable executor.
+
+    This monitor is deliberately executor-owned: controller loss must not turn
+    direct-to-file capture into an unbounded root-mediated write.  Truncation
+    happens before process-group termination so the durable files never retain
+    more than the configured cap.
+    """
+    deadline = time.monotonic() + timeout_s + _CONTROLLER_CANCELLATION_GRACE_S
+    while True:
+        for fd, limit in ((stdout_fd, stdout_limit), (stderr_fd, stderr_limit)):
+            if os.fstat(fd).st_size > limit:
+                os.ftruncate(fd, limit)
+                _terminate_process_group(proc)
+                return proc.returncode if proc.returncode is not None else -signal.SIGKILL, False, True
+        exit_code = proc.poll()
+        if exit_code is not None:
+            _terminate_process_group(proc, 0)
+            return exit_code, False, False
+        if time.monotonic() >= deadline:
+            _terminate_process_group(proc)
+            return proc.returncode if proc.returncode is not None else -signal.SIGKILL, True, False
+        time.sleep(_OUTPUT_LIMIT_POLL_S)
+
+
 def _handle_launch(connection: socket.socket, request: dict[str, Any], fds: list[int]) -> None:
     if set(request) != _LAUNCH_FIELDS or len(fds) != MAX_FDS:
         raise RuntimeError("launch request must carry the exact contract and three FDs")
@@ -478,6 +531,10 @@ def _handle_launch(connection: socket.socket, request: dict[str, Any], fds: list
         raise RuntimeError("invalid worker id")
     _validate_identifier(identifier)
     checkout_root = _validate_checkout(fds[0], request)
+    for fd in fds[1:]:
+        metadata = os.fstat(fd)
+        if not stat.S_ISREG(metadata.st_mode):
+            raise RuntimeError("worker output FD must be a regular file")
     command = _validate_command(request)
     environment = _validate_environment(request["env"])
     timeout_s = request["timeout_s"]
@@ -488,6 +545,8 @@ def _handle_launch(connection: socket.socket, request: dict[str, Any], fds: list
         or timeout_s <= 0
     ):
         raise RuntimeError("worker timeout must be a positive finite number")
+    stdout_limit = _positive_integer(request, "stdout_limit")
+    stderr_limit = _positive_integer(request, "stderr_limit")
     with _jobs_lock:
         if identifier in _jobs or identifier in _launching:
             raise RuntimeError("worker id is already active")
@@ -533,19 +592,15 @@ def _handle_launch(connection: socket.socket, request: dict[str, Any], fds: list
         with _jobs_lock:
             _jobs[identifier] = proc
             _launching.remove(identifier)
-        os.close(fds[1])
-        fds[1] = -1
-        os.close(fds[2])
-        fds[2] = -1
         _send(connection, {"id": identifier, "status": "started", "pid": proc.pid})
-        timed_out = False
-        try:
-            exit_code = proc.wait(timeout=timeout_s + _CONTROLLER_CANCELLATION_GRACE_S)
-            _terminate_process_group(proc, 0)
-        except subprocess.TimeoutExpired:
-            timed_out = True
-            _terminate_process_group(proc)
-            exit_code = proc.returncode
+        exit_code, timed_out, output_overflow = _wait_with_output_limits(
+            proc,
+            timeout_s,
+            fds[1],
+            stdout_limit,
+            fds[2],
+            stderr_limit,
+        )
         with _jobs_lock:
             _jobs.pop(identifier, None)
         _cleanup_home(home)
@@ -555,6 +610,7 @@ def _handle_launch(connection: socket.socket, request: dict[str, Any], fds: list
             "status": "terminal",
             "exit_code": exit_code,
             "timed_out": timed_out,
+            "output_overflow": output_overflow,
         })
     finally:
         with _jobs_lock:

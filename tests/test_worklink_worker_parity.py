@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 import signal
 import socket
+import stat
 import struct
 import subprocess
 import sys
@@ -98,6 +99,8 @@ class WorkerClient:
             if self.outputs is not None
             else (self.stdout, self.stderr)
         )
+        kwargs["stdout_sink"].file.write(stdout)
+        kwargs["stderr_sink"].file.write(stderr)
         process = WorkerProcess(
             kwargs["identifier"],
             4000 + len(self.launched),
@@ -138,6 +141,7 @@ def spec(
         backend_config=config or {},
         local_checkout=Path("/authorized"),
         local_argv=("python", "-c", "print('ok')"),
+        output_root=Path.cwd() / ".pytest-worklink-output",
     )
 
 
@@ -153,6 +157,7 @@ async def test_operator_issued_opencode_uses_fd_anchored_dir_but_direct_keeps_ab
     monkeypatch.setattr("mimir.worklink.checkout.coding_enabled", lambda: True)
     monkeypatch.setattr("mimir.worklink.run_state.process_start_ticks", lambda pid: pid)
     work = spec()
+    object.__setattr__(work, "output_root", tmp_path / "output")
     object.__setattr__(work, "local_checkout", checkout)
     object.__setattr__(
         work,
@@ -219,6 +224,42 @@ async def launch_worker(
         worker_client=client,
     )
     return backend, await backend.launch(spec())
+
+
+@pytest.mark.asyncio
+async def test_enabled_launch_cancellation_waits_for_handshake_then_cancels(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class SuspendedClient(WorkerClient):
+        def __init__(self) -> None:
+            super().__init__(immediate=False)
+            self.entered = asyncio.Event()
+            self.resume = asyncio.Event()
+
+        async def launch(self, **kwargs: Any) -> WorkerProcess:
+            self.entered.set()
+            await self.resume.wait()
+            return await super().launch(**kwargs)
+
+    client = SuspendedClient()
+    monkeypatch.setattr("mimir.worklink.checkout.coding_enabled", lambda: True)
+    monkeypatch.setattr("mimir.worklink.run_state.process_start_ticks", lambda pid: pid)
+    backend = LocalSubprocessComputeBackend.for_authorized_checkout(
+        Authorization(), worker_client=client
+    )
+    launch = asyncio.create_task(backend.launch(spec()))
+    await client.entered.wait()
+    launch.cancel()
+    client.resume.set()
+
+    with pytest.raises(asyncio.CancelledError):
+        await launch
+
+    assert len(client.cancelled) == 1
+    identifier = client.cancelled[0]
+    assert client.processes[identifier].returncode == -15
+    assert backend._jobs == {}
+    assert backend._handles == {}
 
 
 @pytest.mark.asyncio
@@ -371,6 +412,50 @@ async def run_direct(
     result = await backend.wait(handle, timeout)
     await backend.cleanup(handle)
     return result
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("termination", ["sigterm", "timeout"])
+async def test_direct_terminated_output_is_durable_while_running(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, termination: str
+) -> None:
+    monkeypatch.setattr("mimir.worklink.checkout.coding_enabled", lambda: False)
+    backend = LocalSubprocessComputeBackend()
+    work = direct_spec(
+        "import sys,time; "
+        "sys.stdout.write('before termination\\n'); "
+        "sys.stderr.write('diagnostic stderr\\n'); "
+        "sys.stdout.flush(); sys.stderr.flush(); time.sleep(30)"
+    )
+    output_root = tmp_path / "state" / "worklink" / "transcripts"
+    object.__setattr__(work, "output_root", output_root)
+    handle = await backend.launch(work)
+
+    stdout_files: list[Path] = []
+    for _ in range(200):
+        stdout_files = list(output_root.glob("*.stdout.log"))
+        if stdout_files and stdout_files[0].read_bytes() == b"before termination\n":
+            break
+        await asyncio.sleep(0.01)
+    assert len(stdout_files) == 1
+    assert stdout_files[0].read_bytes() == b"before termination\n"
+    assert stat.S_ISREG(stdout_files[0].stat().st_mode)
+
+    if termination == "sigterm":
+        await backend.cancel(handle)
+        result = await backend.wait(handle, 2)
+        assert result.timed_out is False
+    else:
+        result = await backend.wait(handle, 0.01)
+        assert result.timed_out is True
+    await backend.cleanup(handle)
+
+    assert result.stdout_path == stdout_files[0]
+    assert result.stdout_path.read_text() == "before termination\n"
+    assert result.stderr_path is not None
+    assert result.stderr_path.read_text() == "diagnostic stderr\n"
+    assert result.stdout_path.stat().st_mode & 0o777 == 0o600
+    assert result.stderr_path.stat().st_mode & 0o777 == 0o600
 
 
 @pytest.mark.asyncio

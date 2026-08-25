@@ -2069,6 +2069,8 @@ class WorklinkRunner:
                 ),
                 timed_out=False if result is None else result.timed_out,
                 output_overflow=False if result is None else result.output_overflow,
+                stdout_path=None if result is None else result.stdout_path,
+                stderr_path=None if result is None else result.stderr_path,
             )
             factory_record = replace(factory_record, transcript=str(path))
             save_factory_record(self.home, factory_record)

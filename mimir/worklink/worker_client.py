@@ -12,6 +12,8 @@ import struct
 from typing import Mapping, Protocol, Sequence
 import uuid
 
+from ..output_capture import OutputSink, open_output_pair
+
 DEFAULT_EXECUTOR_SOCKET = Path("/run/mimir-worklink/socket/worklink-execd.sock")
 ENABLED_CHECKOUT_ROOT = Path("/var/lib/mimir-worklink/checkouts")
 MAX_REQUEST_BYTES = 256 * 1024
@@ -19,7 +21,7 @@ MAX_PROJECTION_BYTES = 1024 * 1024
 CANCEL_SOCKET_TIMEOUT_S = 20.0
 # Keep this literal independent from worker_exec. The executor runs its image-owned
 # copy, so changing either side of the launch contract requires an image rebuild.
-EXECUTOR_PROTOCOL_IDENTITY = "worklink-executor-v3-repo-uv-cache"
+EXECUTOR_PROTOCOL_IDENTITY = "worklink-executor-v5-bounded-output-fds"
 STALE_EXECUTOR_DIAGNOSTIC = (
     "stale root executor image: controller and mimir.worklink.worker_exec protocol "
     "identities do not match; rebuild the image and restart the container"
@@ -66,11 +68,10 @@ class WorkerProjection:
 class WorkerProcess:
     identifier: str
     pid: int
-    stdout: asyncio.StreamReader
-    stderr: asyncio.StreamReader
     _socket: socket.socket
     returncode: int | None = None
     timed_out: bool = False
+    output_overflow: bool = False
 
     async def wait(self) -> int:
         if self.returncode is None:
@@ -83,6 +84,7 @@ class WorkerProcess:
                 raise RuntimeError("worker executor returned an invalid terminal result")
             self.returncode = int(response["exit_code"])
             self.timed_out = response.get("timed_out") is True
+            self.output_overflow = response.get("output_overflow") is True
             self._socket.close()
         return self.returncode
 
@@ -127,6 +129,8 @@ class WorkerClient:
         projections: Sequence[WorkerProjection] = (),
         identifier: str,
         timeout_s: float,
+        stdout_sink: OutputSink | None = None,
+        stderr_sink: OutputSink | None = None,
     ) -> WorkerProcess:
         self.checkout.verify(local_checkout)
         _validate_identifier(identifier)
@@ -171,16 +175,21 @@ class WorkerClient:
                 for item in projections
             ],
             "timeout_s": timeout_s,
+            "stdout_limit": stdout_sink.limit if stdout_sink is not None else 1,
+            "stderr_limit": stderr_sink.limit if stderr_sink is not None else 1,
         }
         payload = json.dumps(request, separators=(",", ":")).encode()
         if len(payload) > MAX_REQUEST_BYTES:
             raise ValueError("worker request exceeds size limit")
-        sock = await asyncio.to_thread(self._connect)
-        read_out, write_out = os.pipe()
-        read_err, write_err = os.pipe()
+        opened_here = stdout_sink is None and stderr_sink is None
+        if (stdout_sink is None) != (stderr_sink is None):
+            raise ValueError("worker output sinks must be supplied together")
+        if stdout_sink is None or stderr_sink is None:
+            stdout_sink, stderr_sink = open_output_pair(None, 1, None, 1)
         checkout_fd = self.checkout.duplicate_fd()
+        sock = await asyncio.to_thread(self._connect)
         try:
-            rights = array.array("i", [checkout_fd, write_out, write_err])
+            rights = array.array("i", [checkout_fd, stdout_sink.fd, stderr_sink.fd])
             sock.sendmsg([payload], [(socket.SOL_SOCKET, socket.SCM_RIGHTS, rights)])
             response = json.loads(await asyncio.to_thread(sock.recv, 4096))
             if "error" in response:
@@ -194,27 +203,15 @@ class WorkerClient:
                 raise RuntimeError("worker executor response identity mismatch")
             if response.get("status") != "started":
                 raise RuntimeError("worker executor returned an invalid launch response")
-            stdout = asyncio.StreamReader()
-            stderr = asyncio.StreamReader()
-            loop = asyncio.get_running_loop()
-            await loop.connect_read_pipe(
-                lambda: asyncio.StreamReaderProtocol(stdout),
-                os.fdopen(read_out, "rb", buffering=0),
-            )
-            read_out = -1
-            await loop.connect_read_pipe(
-                lambda: asyncio.StreamReaderProtocol(stderr),
-                os.fdopen(read_err, "rb", buffering=0),
-            )
-            read_err = -1
-            return WorkerProcess(identifier, int(response["pid"]), stdout, stderr, sock)
+            return WorkerProcess(identifier, int(response["pid"]), sock)
         except Exception:
             sock.close()
             raise
         finally:
-            for fd in (checkout_fd, write_out, write_err, read_out, read_err):
-                if fd >= 0:
-                    os.close(fd)
+            os.close(checkout_fd)
+            if opened_here:
+                stdout_sink.close()
+                stderr_sink.close()
 
     async def cancel(self, identifier: str) -> None:
         _validate_identifier(identifier)

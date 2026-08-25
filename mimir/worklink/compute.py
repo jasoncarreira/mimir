@@ -17,9 +17,11 @@ import os
 import posixpath
 import re
 from pathlib import Path
+import sys
 import uuid
 from typing import Any, Callable, Mapping, Protocol, Sequence
 
+from ..output_capture import OutputSink, open_output_pair
 from ..contained_execution import (
     CollectedExecutionResult,
     base_worker_environment,
@@ -64,6 +66,7 @@ class WorkSpec:
     backend_config: Mapping[str, Any] = field(default_factory=dict)
     local_checkout: Path | None = None
     local_argv: Sequence[str] | None = None
+    output_root: Path | None = None
 
 
 def with_worker_environment(
@@ -113,6 +116,8 @@ class ComputeResult:
     launch_error: str | None = None
     handle: LaunchHandle | None = None
     command: tuple[str, ...] = ()
+    stdout_path: Path | None = None
+    stderr_path: Path | None = None
 
 
 class ComputeLaunchError(RuntimeError):
@@ -178,7 +183,7 @@ def _output_limit(env_name: str, default: int) -> int:
         value = int(raw)
     except ValueError:
         return default
-    return value if value > 0 else default
+    return min(value, default) if value > 0 else default
 
 
 def _worklink_output_limits() -> tuple[int, int]:
@@ -188,25 +193,27 @@ def _worklink_output_limits() -> tuple[int, int]:
     )
 
 
-async def _drain_capped(
-    stream: asyncio.StreamReader | None,
-    limit: int,
-    on_overflow: Callable[[], None],
-    retained: bytearray | None = None,
-) -> bytes:
-    """Retain at most ``limit`` bytes while always draining the pipe."""
-    if stream is None:
-        return b""
-    retained = retained if retained is not None else bytearray()
-    overflowed = False
-    while chunk := await stream.read(64 * 1024):
-        remaining = limit - len(retained)
-        if remaining > 0:
-            retained.extend(chunk[:remaining])
-        if len(chunk) > remaining and not overflowed:
-            overflowed = True
-            on_overflow()
-    return bytes(retained)
+_OUTPUT_COMPONENT = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}\Z")
+
+
+def _output_paths(spec: WorkSpec, identifier: str) -> tuple[Path | None, Path | None]:
+    root = spec.output_root
+    if root is None:
+        return None, None
+    if _OUTPUT_COMPONENT.fullmatch(spec.backend) is None or spec.backend in {".", ".."}:
+        raise ComputeLaunchError("backend name is not a safe output path component")
+    stem = f"{spec.backend}-{spec.issue_id}-a{spec.attempt}-{identifier}-{uuid.uuid4()}"
+    return root / f"{stem}.stdout.log", root / f"{stem}.stderr.log"
+
+
+@dataclass
+class _DirectCapture:
+    stdout_sink: OutputSink
+    stderr_sink: OutputSink
+    collect_task: asyncio.Task[None] | None = None
+    monitor_task: asyncio.Task[None] | None = None
+    kill_task: asyncio.Task[None] | None = None
+    output_overflow: bool = False
 
 
 def _local_child_env() -> dict[str, str]:
@@ -395,6 +402,8 @@ class LocalSubprocessComputeBackend:
         self._jobs: dict[str, tuple[object, WorkSpec, tuple[str, ...]]] = {}
         self._handles: dict[str, LaunchHandle] = {}
         self._worker_clients: dict[str, object] = {}
+        self._output_files: dict[str, tuple[Path | None, Path | None]] = {}
+        self._direct_captures: dict[str, _DirectCapture] = {}
 
     def capabilities(self) -> ComputeCaps:
         return ComputeCaps(
@@ -428,17 +437,48 @@ class LocalSubprocessComputeBackend:
         # orchestrator's per-run vars, e.g. MIMIR_HOME) wins over the passthrough.
         env = _local_child_env()
         env.update(spec.env)
+        output_identifier = str(uuid.uuid4())
+        stdout_path, stderr_path = _output_paths(spec, output_identifier)
+        stdout_limit, stderr_limit = _worklink_output_limits()
         try:
+            stdout_sink, stderr_sink = open_output_pair(
+                stdout_path,
+                stdout_limit,
+                stderr_path,
+                stderr_limit,
+            )
+        except OSError as exc:
+            raise ComputeLaunchError(str(exc)) from exc
+        try:
+            from .worker_exec import _arm_parent_death_signal
+
+            launch_options: dict[str, Any] = {}
+            if sys.platform.startswith("linux"):
+                parent_pid = os.getpid()
+                launch_options["preexec_fn"] = (
+                    lambda: _arm_parent_death_signal(parent_pid)
+                )
             proc = await asyncio.create_subprocess_exec(
                 *command,
                 stdin=asyncio.subprocess.DEVNULL,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
+                stdout=stdout_sink.file,
+                stderr=stderr_sink.file,
                 cwd=str(spec.local_checkout),
                 env=env,
                 start_new_session=True,
+                **launch_options,
             )
-        except OSError as exc:
+        except BaseException as exc:
+            stdout_sink.close()
+            stderr_sink.close()
+            for path in (stdout_path, stderr_path):
+                if path is not None:
+                    try:
+                        path.unlink()
+                    except FileNotFoundError:
+                        pass
+            if isinstance(exc, asyncio.CancelledError):
+                raise
             raise ComputeLaunchError(str(exc)) from exc
         pid = getattr(proc, "pid", None)
         start_ticks = None
@@ -449,6 +489,28 @@ class LocalSubprocessComputeBackend:
         handle = LaunchHandle(self.name, str(pid if pid is not None else "unknown"), start_ticks)
         self._jobs[handle.identifier] = (proc, spec, command)
         self._handles[handle.identifier] = handle
+        self._output_files[handle.identifier] = (stdout_path, stderr_path)
+        capture = _DirectCapture(stdout_sink, stderr_sink)
+
+        async def monitor_output() -> None:
+            while True:
+                overflow = await asyncio.to_thread(
+                    lambda: stdout_sink.overflowed() or stderr_sink.overflowed()
+                )
+                if overflow and not capture.output_overflow:
+                    capture.output_overflow = True
+                    capture.kill_task = asyncio.create_task(self.cancel(handle))
+                if overflow:
+                    stdout_sink.truncate_to_limit()
+                    stderr_sink.truncate_to_limit()
+                await asyncio.sleep(0.01)
+
+        async def collect() -> None:
+            await getattr(proc, "wait")()
+
+        capture.collect_task = asyncio.create_task(collect())
+        capture.monitor_task = asyncio.create_task(monitor_output())
+        self._direct_captures[handle.identifier] = capture
         return handle
 
     async def _launch_enabled(self, spec: WorkSpec, command: tuple[str, ...]) -> LaunchHandle:
@@ -478,6 +540,16 @@ class LocalSubprocessComputeBackend:
         started: asyncio.Future[object] = asyncio.get_running_loop().create_future()
         capability = _ClientBoundCapability(authorization, client, started)
         stdout_limit, stderr_limit = _worklink_output_limits()
+        stdout_path, stderr_path = _output_paths(spec, identifier)
+        try:
+            stdout_sink, stderr_sink = open_output_pair(
+                stdout_path,
+                stdout_limit,
+                stderr_path,
+                stderr_limit,
+            )
+        except OSError as exc:
+            raise ComputeLaunchError(str(exc)) from exc
 
         async def collect_contained() -> CollectedExecutionResult:
             try:
@@ -494,20 +566,30 @@ class LocalSubprocessComputeBackend:
                     timeout_s=spec.timeout_s,
                     stdout_limit=stdout_limit,
                     stderr_limit=stderr_limit,
+                    stdout_sink=stdout_sink,
+                    stderr_sink=stderr_sink,
                 )
+            except asyncio.CancelledError:
+                if not started.done():
+                    started.cancel()
+                raise
             except BaseException as exc:
                 if not started.done():
                     started.set_exception(exc)
                 raise
+            finally:
+                stdout_sink.close()
+                stderr_sink.close()
 
         task = asyncio.create_task(collect_contained())
         try:
-            process = await started
+            process = await asyncio.shield(started)
+        except asyncio.CancelledError:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+            raise
         except (OSError, RuntimeError, ValueError) as exc:
-            try:
-                await task
-            except (OSError, RuntimeError, ValueError):
-                pass
+            await asyncio.gather(task, return_exceptions=True)
             raise ComputeLaunchError(str(exc)) from exc
         pid = getattr(process, "pid", None)
         ticks = None
@@ -524,10 +606,12 @@ class LocalSubprocessComputeBackend:
         self._jobs[identifier] = (task, spec, command)
         self._handles[identifier] = handle
         self._worker_clients[identifier] = client
+        self._output_files[identifier] = (stdout_path, stderr_path)
         return handle
 
     async def wait(self, handle: LaunchHandle, timeout_s: int) -> ComputeResult:
         job, _spec, command = self._job(handle)
+        stdout_path, stderr_path = self._output_files.get(handle.identifier, (None, None))
         if isinstance(job, asyncio.Task):
             timed_out = False
             try:
@@ -557,67 +641,54 @@ class LocalSubprocessComputeBackend:
                 output_overflow=collected.output_overflow,
                 handle=handle,
                 command=command,
+                stdout_path=stdout_path,
+                stderr_path=stderr_path,
             )
 
         proc = job
         timed_out = False
-        output_overflow = False
-        kill_task: asyncio.Task[None] | None = None
-        stdout_limit, stderr_limit = _worklink_output_limits()
-        stdout_retained = bytearray()
-        stderr_retained = bytearray()
+        capture = self._direct_captures[handle.identifier]
+        collect_task = capture.collect_task
+        if collect_task is None:
+            raise RuntimeError("direct output capture did not start")
 
-        def overflow() -> None:
-            nonlocal output_overflow, kill_task
-            if output_overflow:
-                return
-            output_overflow = True
-            kill_task = asyncio.create_task(self.cancel(handle))
-
-        async def collect() -> tuple[bytes, bytes]:
-            stdout_task = asyncio.create_task(
-                _drain_capped(
-                    getattr(proc, "stdout", None), stdout_limit, overflow, stdout_retained
-                )
-            )
-            stderr_task = asyncio.create_task(
-                _drain_capped(
-                    getattr(proc, "stderr", None), stderr_limit, overflow, stderr_retained
-                )
-            )
+        async def collect_after_termination() -> None:
             try:
-                await getattr(proc, "wait")()
-                return await asyncio.gather(stdout_task, stderr_task)
-            except asyncio.CancelledError:
-                stdout_task.cancel()
-                stderr_task.cancel()
-                await asyncio.gather(stdout_task, stderr_task, return_exceptions=True)
-                raise
-
-        async def collect_after_termination() -> tuple[bytes, bytes]:
-            try:
-                return await asyncio.wait_for(
+                await asyncio.wait_for(
                     asyncio.shield(collect_task), _TERMINATED_DRAIN_TIMEOUT_S
                 )
             except TimeoutError:
                 collect_task.cancel()
                 await asyncio.gather(collect_task, return_exceptions=True)
-                return bytes(stdout_retained), bytes(stderr_retained)
 
-        collect_task = asyncio.create_task(collect())
         try:
-            stdout_b, stderr_b = await asyncio.wait_for(
-                asyncio.shield(collect_task), timeout=timeout_s
-            )
+            await asyncio.wait_for(asyncio.shield(collect_task), timeout=timeout_s)
         except TimeoutError:
             timed_out = True
             await self.cancel(handle)
-            stdout_b, stderr_b = await collect_after_termination()
-        if kill_task is not None:
-            await kill_task
+            await collect_after_termination()
+        if capture.kill_task is not None:
+            await capture.kill_task
             if not collect_task.done():
-                stdout_b, stderr_b = await collect_after_termination()
+                await collect_after_termination()
+        if capture.monitor_task is not None:
+            capture.monitor_task.cancel()
+            await asyncio.gather(capture.monitor_task, return_exceptions=True)
 
+        if capture.stdout_sink.overflowed() or capture.stderr_sink.overflowed():
+            capture.output_overflow = True
+            if getattr(proc, "returncode", None) is None:
+                await self.cancel(handle)
+                await collect_after_termination()
+        stdout_b, _stdout_dropped = capture.stdout_sink.read_bounded()
+        stderr_b, _stderr_dropped = capture.stderr_sink.read_bounded()
+        capture.output_overflow = (
+            capture.output_overflow
+            or capture.stdout_sink.did_overflow
+            or capture.stderr_sink.did_overflow
+        )
+        capture.stdout_sink.truncate_to_limit()
+        capture.stderr_sink.truncate_to_limit()
         stdout = stdout_b.decode(errors="replace")
         stderr = stderr_b.decode(errors="replace")
         exit_code = getattr(proc, "returncode", None)
@@ -626,9 +697,11 @@ class LocalSubprocessComputeBackend:
             stdout=stdout,
             stderr=stderr,
             timed_out=timed_out,
-            output_overflow=output_overflow,
+            output_overflow=capture.output_overflow,
             handle=handle,
             command=command,
+            stdout_path=stdout_path,
+            stderr_path=stderr_path,
         )
 
     async def logs(self, handle: LaunchHandle) -> str:
@@ -671,6 +744,11 @@ class LocalSubprocessComputeBackend:
         self._jobs.pop(handle.identifier, None)
         self._handles.pop(handle.identifier)
         self._worker_clients.pop(handle.identifier, None)
+        self._output_files.pop(handle.identifier, None)
+        capture = self._direct_captures.pop(handle.identifier, None)
+        if capture is not None:
+            capture.stdout_sink.close()
+            capture.stderr_sink.close()
 
     def _job(self, handle: LaunchHandle) -> tuple[object, WorkSpec, tuple[str, ...]]:
         if (
