@@ -20,6 +20,7 @@ from langgraph.runtime import Runtime
 from mimir.access_control import (
     _FILE_INTEGRITY_EXCLUDED_SUBTREES,
     _SELF_AUTHORED_FILE_ROOTS,
+    _configured_pr_checkout_lease_root,
     _filesystem_result_integrity,
     _persisted_file_integrity,
     CapabilityTier,
@@ -1399,24 +1400,51 @@ def test_non_self_authored_active_lease_is_untrusted_active_ingest(
     )
 
 
-@pytest.mark.parametrize("configured_root", ["relative", "missing", "symlink"])
-def test_invalid_configured_lease_root_never_establishes_trust(
+def test_active_lease_does_not_trust_sibling_path_within_lease_root(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
-    configured_root: str,
 ) -> None:
     home = tmp_path / "home"
     lease_root = tmp_path / "pr-checkout-leases"
     checkout = lease_root / "lease-7"
-    checkout.mkdir(parents=True)
-    home.mkdir()
-    target = checkout / "trusted.py"
-    target.write_text("self-authored bytes", encoding="utf-8")
+    sibling_checkout = lease_root / "unbound-checkout"
+    for root in (home, checkout, sibling_checkout):
+        root.mkdir(parents=True)
+    leased_target = checkout / "contribution.py"
+    leased_target.write_text("bytes inside the attached lease", encoding="utf-8")
+    sibling_target = sibling_checkout / "contribution.py"
+    sibling_target.write_text("bytes outside the attached lease", encoding="utf-8")
     monkeypatch.setenv("MIMIR_HOME", str(home))
     monkeypatch.setenv("MIMIR_GITHUB_SELF_LOGIN", "mimir-bot")
+    monkeypatch.setenv("MIMIR_PR_CHECKOUT_LEASE_ROOT", str(lease_root))
     auth = _lease_read_auth(
         lease_root, checkout, pull_request_author="mimir-bot",
     )
+
+    sources = [
+        protected_result_source(
+            auth, principal="filesystem", domain="filesystem",
+            resource_id=str(target), bridge_instance="filesystem",
+        )
+        for target in (leased_target, sibling_target)
+    ]
+
+    assert [
+        (source.integrity, source.integrity_effect) for source in sources
+    ] == [
+        ("trusted", "informational"),
+        ("untrusted", "active_ingest"),
+    ]
+
+
+@pytest.mark.parametrize("configured_root", ["relative", "missing", "symlink"])
+def test_invalid_configured_lease_root_is_rejected(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    configured_root: str,
+) -> None:
+    lease_root = tmp_path / "pr-checkout-leases"
+    lease_root.mkdir()
     if configured_root == "relative":
         monkeypatch.chdir(tmp_path)
         value = lease_root.name
@@ -1428,17 +1456,10 @@ def test_invalid_configured_lease_root_never_establishes_trust(
         value = str(alias)
     monkeypatch.setenv("MIMIR_PR_CHECKOUT_LEASE_ROOT", value)
 
-    source = protected_result_source(
-        auth, principal="filesystem", domain="filesystem",
-        resource_id=str(target), bridge_instance="filesystem",
-    )
-
-    assert (source.integrity, source.integrity_effect) == (
-        "untrusted", "active_ingest",
-    )
+    assert _configured_pr_checkout_lease_root() is None
 
 
-def test_untrusted_model_write_cannot_launder_through_configured_lease_root(
+def test_untrusted_model_write_is_recorded_and_taints_later_trusted_lease_read(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1455,6 +1476,7 @@ def test_untrusted_model_write_cannot_launder_through_configured_lease_root(
     auth = _lease_read_auth(
         lease_root, checkout, pull_request_author="mimir-bot",
     )
+    assert _configured_pr_checkout_lease_root() == lease_root
     assert protected_result_source(
         auth, principal="filesystem", domain="filesystem",
         resource_id=str(target), bridge_instance="filesystem",
