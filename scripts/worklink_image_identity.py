@@ -336,7 +336,7 @@ def main() -> None:
         if not any(uid == "0" and "mimir.worklink.worker_exec" in cmd for _, uid, cmd in rows):
             raise RuntimeError(f"live worker executor is not root\n{process_table}")
 
-        setup = """
+        setup = r"""
             set -eu
             install -d -o mimir -g mimir -m 0755 /workspace
             /command/s6-setuidgid mimir sh -ceu 'printf controller-writable > /home/mimir/worklink-canary; printf controller-reset > /home/mimir/worklink-canary'
