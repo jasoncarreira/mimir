@@ -261,9 +261,7 @@ def _validated_selectors(root: Path, selectors: tuple[str, ...]) -> tuple[str, .
             or len(item) > _MAX_SELECTOR_LENGTH
             or not item.isascii()
             or _SELECTOR_PATTERN.fullmatch(item) is None
-            or item.startswith(("-", "/", "@"))
-            or candidate.is_absolute()
-            or any(part in {"", ".", ".."} for part in candidate.parts)
+            or item.startswith(("-", "@"))
             or "\\" in path_text
         ):
             raise ProjectTestRefusal(
@@ -271,19 +269,47 @@ def _validated_selectors(root: Path, selectors: tuple[str, ...]) -> tuple[str, .
                 "test selector is not a relative path or node id",
                 execution_started=False,
             )
-        try:
-            unresolved = root / path_text
-            if any(
-                (root.joinpath(*candidate.parts[:index])).is_symlink()
-                for index in range(1, len(candidate.parts) + 1)
-            ):
-                raise ValueError("selector contains a symlink")
-            resolved = unresolved.resolve(strict=True)
-            canonical = resolved.relative_to(root).as_posix()
-        except (OSError, RuntimeError, ValueError) as exc:
+        if candidate.is_absolute() or ".." in candidate.parts:
             raise ProjectTestRefusal(
                 "test_selector_outside_checkout",
                 "test selector does not resolve inside the authorized checkout",
+                execution_started=False,
+            )
+        if any(part in {"", "."} for part in candidate.parts):
+            raise ProjectTestRefusal(
+                "test_selector_invalid",
+                "test selector is not a relative path or node id",
+                execution_started=False,
+            )
+        unresolved = root / path_text
+        if any(
+            (root.joinpath(*candidate.parts[:index])).is_symlink()
+            for index in range(1, len(candidate.parts) + 1)
+        ):
+            raise ProjectTestRefusal(
+                "test_selector_symlink",
+                "test selector traverses a symlink in the authorized checkout",
+                execution_started=False,
+            )
+        try:
+            resolved = unresolved.resolve(strict=True)
+            canonical = resolved.relative_to(root).as_posix()
+        except FileNotFoundError as exc:
+            raise ProjectTestRefusal(
+                "test_selector_not_found",
+                f"test selector was not found in checkout: {item}",
+                execution_started=False,
+            ) from exc
+        except ValueError as exc:
+            raise ProjectTestRefusal(
+                "test_selector_outside_checkout",
+                "test selector does not resolve inside the authorized checkout",
+                execution_started=False,
+            ) from exc
+        except (OSError, RuntimeError) as exc:
+            raise ProjectTestRefusal(
+                "test_selector_unresolvable",
+                "test selector could not be resolved in the authorized checkout",
                 execution_started=False,
             ) from exc
         validated.append(f"{canonical}::{node_id}" if separator else canonical)
