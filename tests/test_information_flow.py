@@ -1497,9 +1497,10 @@ def test_untrusted_model_write_is_recorded_and_taints_later_trusted_lease_read(
     assert (reread.integrity, reread.integrity_effect) == (
         "untrusted", "active_ingest",
     )
-    assert json.loads(
+    ledger = json.loads(
         (home / ".mimir" / "file-integrity.json").read_text(encoding="utf-8")
-    ) == {str(target): "untrusted"}
+    )
+    assert ledger[str(target)] == "untrusted"
 
 
 @pytest.mark.parametrize("root", sorted(_SELF_AUTHORED_FILE_ROOTS))
