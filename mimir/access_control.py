@@ -30,6 +30,7 @@ import shlex
 import subprocess
 import sys
 import threading
+import time
 from collections.abc import Callable, Iterable
 from contextvars import ContextVar, Token
 from dataclasses import dataclass, field, replace
@@ -8269,6 +8270,7 @@ _SELF_AUTHORED_FILE_ROOTS = frozenset({
 _FILE_INTEGRITY_RECORDED_ROOTS = _SELF_AUTHORED_FILE_ROOTS | {"skills"}
 _FILE_INTEGRITY_EXCLUDED_SUBTREES = frozenset({("state", "pollers")})
 _FILE_INTEGRITY_DECLASSIFICATIONS_KEY = "__declassifications__"
+_FILE_INTEGRITY_EPOCH_KEY = "__ledger_epoch_ns__"
 
 
 @dataclass(frozen=True)
@@ -8408,16 +8410,13 @@ def _filesystem_result_integrity(
         return "untrusted", "active_ingest"
 
     if relative.parts and relative.parts[0] in _SELF_AUTHORED_FILE_ROOTS:
-        # These roots are scaffolded by ``mimir setup`` and thereafter written
-        # only by the operator or by the agent through the protected tool
-        # boundary -- so the path itself is evidence of self-authorship, which
-        # is what earns the trusted default. ``docs`` and ``prompts`` qualify on
-        # the same footing as builtin skills: seeded reference material, not
-        # ingest. Operator- or agent-authored files under ``skills`` do not
-        # receive this default merely because of their location.
-        # Trust still comes from ``_persisted_file_integrity`` below, so a
-        # tainted model write into any of them is downgraded rather than
-        # laundered.
+        # These roots are scaffolded by ``mimir setup`` and contain first-party
+        # reference material. Operator- or agent-authored files under ``skills``
+        # do not receive this default merely because of their location; only
+        # shipped ``.mimir_builtin_skills`` are first-party reference material.
+        # Trust still comes from persisted provenance below: explicit writer
+        # records win, while the ledger epoch distinguishes pre-existing files
+        # from later writes that bypassed the protected tool boundary.
         #
         # Poller subprocesses write this tree directly, outside the protected
         # tool boundary, and may persist attacker-derived cursor/event fields.
@@ -8470,10 +8469,58 @@ def _persisted_file_integrity(home: Path, relative: Path) -> str:
     if not isinstance(payload, dict):
         return "untrusted"
     key = relative.as_posix()
-    if key not in payload:
+    if key in payload:
+        value = payload[key]
+        return "trusted" if value == "trusted" else "untrusted"
+    epoch_ns = payload.get(_FILE_INTEGRITY_EPOCH_KEY)
+    # A ledger without an epoch predates this migration. Preserve its missing-key
+    # default until runtime initialization records the migration boundary.
+    if _FILE_INTEGRITY_EPOCH_KEY not in payload:
         return "trusted"
-    value = payload[key]
-    return "trusted" if value == "trusted" else "untrusted"
+    if not isinstance(epoch_ns, int) or isinstance(epoch_ns, bool) or epoch_ns <= 0:
+        return "untrusted"
+    try:
+        file_ctime_ns = (home / relative).stat().st_ctime_ns
+    except OSError:
+        return "untrusted"
+    return "trusted" if file_ctime_ns <= epoch_ns else "untrusted"
+
+
+def initialize_file_integrity_ledger(home: Path) -> bool:
+    """Record the boundary after which unrecorded self-authored files are tainted.
+
+    Existing files remain trusted through their inode change time. Existing ledger
+    entries are retained verbatim, including untrusted marks.
+    """
+    metadata_path = home.resolve(strict=False) / ".mimir" / "file-integrity.json"
+    with _persisted_file_integrity_lock:
+        try:
+            payload = (
+                json.loads(metadata_path.read_text(encoding="utf-8"))
+                if metadata_path.exists()
+                else {}
+            )
+            if not isinstance(payload, dict):
+                return False
+            if _FILE_INTEGRITY_EPOCH_KEY in payload:
+                epoch_ns = payload[_FILE_INTEGRITY_EPOCH_KEY]
+                return (
+                    isinstance(epoch_ns, int)
+                    and not isinstance(epoch_ns, bool)
+                    and epoch_ns > 0
+                )
+            payload[_FILE_INTEGRITY_EPOCH_KEY] = time.time_ns()
+            metadata_path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = metadata_path.with_suffix(".tmp")
+            tmp.write_text(
+                json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n",
+                encoding="utf-8",
+            )
+            tmp.replace(metadata_path)
+            return True
+        except (OSError, json.JSONDecodeError):
+            log.exception("failed to initialize file integrity ledger at %s", metadata_path)
+            return False
 
 
 def record_file_write_integrity(
@@ -8520,6 +8567,16 @@ def record_file_write_integrity(
             )
             if not isinstance(payload, dict):
                 return False
+            if _FILE_INTEGRITY_EPOCH_KEY not in payload:
+                payload[_FILE_INTEGRITY_EPOCH_KEY] = time.time_ns()
+            else:
+                epoch_ns = payload[_FILE_INTEGRITY_EPOCH_KEY]
+                if (
+                    not isinstance(epoch_ns, int)
+                    or isinstance(epoch_ns, bool)
+                    or epoch_ns <= 0
+                ):
+                    return False
             key = relative.as_posix()
             existing = payload.get(key)
             # This hook runs before the file mutation. A clean turn therefore

@@ -1532,7 +1532,10 @@ def _run_synthetic_pytest(tmp_path: Path, test_source: str) -> subprocess.Comple
         cwd=tmp_path,
         capture_output=True,
         check=False,
-        timeout=10,
+        # Nested pytest startup can be heavily delayed while the full suite is
+        # contending for CPU; keep this outer guard well above the intentional
+        # three-second sleep that the assertion exercises.
+        timeout=30,
     )
 
 

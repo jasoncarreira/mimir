@@ -150,6 +150,10 @@ async def create_agent_runtime(
     adapters: RuntimeAdapters,
 ) -> AgentRuntimeBundle:
     _validate_adapters(adapters)
+    from .access_control import initialize_file_integrity_ledger
+
+    if not initialize_file_integrity_ledger(config.home):
+        raise RuntimeError("file integrity ledger could not be initialized")
     runtime_background_tasks: set[asyncio.Task[Any]] = set()
     owned_closers: list[tuple[str, Callable[[], Awaitable[None]]]] = []
     sessions: SessionManager | None = None
