@@ -297,14 +297,42 @@ asyncio.run(main())
 """
 
 
+def source_ref() -> str:
+    """Return the exact remote ref expected to contain this checkout's HEAD."""
+    explicit = os.environ.get("MIMIR_GIT_REF") or os.environ.get("GITHUB_REF")
+    if explicit:
+        return explicit
+    try:
+        branch = run(["git", "symbolic-ref", "--quiet", "--short", "HEAD"]).stdout.strip()
+        tracked_ref = run(["git", "config", "--get", f"branch.{branch}.merge"]).stdout.strip()
+    except RuntimeError as exc:
+        raise RuntimeError(
+            "set MIMIR_GIT_REF to the fully qualified remote branch, tag, or pull ref "
+            "that contains this commit"
+        ) from exc
+    if not tracked_ref.startswith("refs/"):
+        raise RuntimeError(f"tracked Git ref is not fully qualified: {tracked_ref!r}")
+    return tracked_ref
+
+
 def main() -> None:
     run(["docker", "info"], timeout=30)
+    source_commit = run(["git", "rev-parse", "HEAD"]).stdout.strip()
+    git_ref = source_ref()
+    if run(["git", "status", "--porcelain=v1"]).stdout.strip():
+        raise RuntimeError("live image proof requires a clean source checkout")
     service = (ROOT / "deploy/s6-overlay/s6-rc.d/mimir/run").read_text()
     expected = 'exec s6-setuidgid mimir mimir run --home "${MIMIR_HOME:-/home/mimir/agent}"'
     if expected not in service:
         raise RuntimeError("controller s6 service no longer drops to mimir")
     try:
-        run(["docker", "build", "--tag", IMAGE, "."], timeout=1200)
+        run([
+            "docker", "build",
+            "--build-arg", f"MIMIR_GIT_REF={git_ref}",
+            "--build-arg", f"MIMIR_CONTROLLER_COMMIT={source_commit}",
+            "--build-arg", f"MIMIR_EXECUTOR_COMMIT={source_commit}",
+            "--tag", IMAGE, ".",
+        ], timeout=1200)
         run(["docker", "run", "--detach", "--env", "HOME=/home/mimir", "--name", CONTAINER, IMAGE])
         wait_for_runtime()
         docker_exec("/bin/sh", "-ceu", """
@@ -315,8 +343,9 @@ def main() -> None:
             test "$(stat -c %U:%G /opt/mimir-worklink/venv/bin/python)" = root:root
             test "$(stat -c %U:%G /opt/mimir-worklink/uv-cache)" = root:root
             test "$(stat -c %a /opt/mimir-worklink/uv-cache)" = 755
+            test "$(cat /opt/mimir-worklink/executor-source-commit)" = "SOURCE_COMMIT"
             test "$(stat -c %a:%u:%g /var/lib/mimir-worklink/homes)" = 710:0:1002
-        """)
+        """.replace("SOURCE_COMMIT", source_commit))
         # Read the live uids from /proc INSIDE the container.
         #
         # ``docker top`` is unusable for this. It runs ps on the HOST, so its

@@ -39,9 +39,10 @@ MAX_FDS = 3
 # Deliberately not imported from worker_client: this value must describe the
 # immutable executor installed in the root-owned image, not mutable controller code.
 EXECUTOR_PROTOCOL_IDENTITY = "worklink-executor-v6-bounded-output-path-checkout"
+EXECUTOR_SOURCE_COMMIT_PATH = Path("/opt/mimir-worklink/executor-source-commit")
 _STALE_EXECUTOR_DIAGNOSTIC = (
     "stale root executor image: controller and mimir.worklink.worker_exec protocol "
-    "identities do not match; rebuild the image and restart the container"
+    "or source identities do not match; rebuild the image and restart the container"
 )
 _CONTROLLER_CANCELLATION_GRACE_S = 10.0
 _PROCESS_GROUP_KILL_TIMEOUT_S = 5.0
@@ -510,6 +511,16 @@ def _validate_executor_identity(request: dict[str, Any]) -> None:
         raise RuntimeError(_STALE_EXECUTOR_DIAGNOSTIC)
 
 
+def _executor_source_commit() -> str:
+    try:
+        commit = EXECUTOR_SOURCE_COMMIT_PATH.read_text(encoding="ascii").strip()
+    except OSError as exc:
+        raise RuntimeError("root executor image has no recorded source commit") from exc
+    if re.fullmatch(r"[0-9a-f]{40}", commit) is None:
+        raise RuntimeError("root executor image has an invalid recorded source commit")
+    return commit
+
+
 def _handle_identity(connection: socket.socket, request: dict[str, Any], fds: list[int]) -> None:
     if fds or set(request) != _IDENTITY_FIELDS:
         raise RuntimeError("invalid executor identity request")
@@ -517,6 +528,7 @@ def _handle_identity(connection: socket.socket, request: dict[str, Any], fds: li
     _send(connection, {
         "status": "identity",
         "executor_identity": EXECUTOR_PROTOCOL_IDENTITY,
+        "source_commit": _executor_source_commit(),
     })
 
 

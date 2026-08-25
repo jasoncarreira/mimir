@@ -24,7 +24,30 @@
 #        -e ANTHROPIC_MODEL=claude-haiku-4-5  (or gateway-equivalent name)
 # ─────────────────────────────────────────────────────────────────────
 
-FROM python:3.11-slim AS base
+FROM python:3.11-slim AS provenance-validation
+
+# Every canonical image must identify one remote ref and the exact commit it is
+# expected to resolve. Keep this validation in its own early stage so an
+# argument-less build fails quickly and with an actionable diagnostic.
+ARG MIMIR_GIT_REF
+ARG MIMIR_CONTROLLER_COMMIT
+ARG MIMIR_EXECUTOR_COMMIT
+RUN set -eu; \
+    if [ -z "$MIMIR_GIT_REF" ]; then echo >&2 "MIMIR_GIT_REF is required"; exit 2; fi; \
+    case "$MIMIR_GIT_REF" in refs/*) ;; *) \
+        echo >&2 "MIMIR_GIT_REF must be a fully qualified refs/* name"; exit 2;; \
+    esac; \
+    if ! printf '%s\n' "$MIMIR_CONTROLLER_COMMIT" | grep -Eq '^[0-9a-f]{40}$'; then \
+        echo >&2 "MIMIR_CONTROLLER_COMMIT must be a full lowercase Git SHA"; exit 2; \
+    fi; \
+    if ! printf '%s\n' "$MIMIR_EXECUTOR_COMMIT" | grep -Eq '^[0-9a-f]{40}$'; then \
+        echo >&2 "MIMIR_EXECUTOR_COMMIT must be a full lowercase Git SHA"; exit 2; \
+    fi; \
+    if ! test "$MIMIR_EXECUTOR_COMMIT" = "$MIMIR_CONTROLLER_COMMIT"; then \
+        echo >&2 "MIMIR_EXECUTOR_COMMIT must equal MIMIR_CONTROLLER_COMMIT"; exit 2; \
+    fi
+
+FROM provenance-validation AS base
 
 # OS deps:
 #   - ca-certificates curl gnupg: prereqs for adding NodeSource +
@@ -121,7 +144,11 @@ ENV PATH="$VIRTUAL_ENV/bin:$PATH"
 # multi-bridge deployment (Anthropic API, Discord, Slack, MCP).
 # Override at build time:
 #
-#   docker build --build-arg MIMIR_EXTRAS=anthropic,discord .
+#   docker build \
+#     --build-arg MIMIR_GIT_REF="$MIMIR_GIT_REF" \
+#     --build-arg MIMIR_CONTROLLER_COMMIT="$MIMIR_COMMIT" \
+#     --build-arg MIMIR_EXECUTOR_COMMIT="$MIMIR_COMMIT" \
+#     --build-arg MIMIR_EXTRAS=anthropic,discord .
 #
 # Available extras (see pyproject.toml):
 #   anthropic, claude-code, openai, codex-plus  (model providers)
@@ -133,15 +160,27 @@ RUN pip install --no-cache-dir --upgrade pip \
     && pip install --no-cache-dir "mimir-agent[${MIMIR_EXTRAS}]"
 
 USER root
-RUN python3 -m venv /opt/mimir-worklink/venv \
+ARG MIMIR_GIT_URL=https://github.com/jasoncarreira/mimir.git
+LABEL org.opencontainers.image.revision="${MIMIR_EXECUTOR_COMMIT}"
+# The root executor may run unreleased code, but only from an immutable full SHA.
+# Fetching the caller-named ref makes GitHub's synthetic refs/pull/*/merge commit
+# reachable without broadening the clone or trusting the mutable ref as identity.
+# The full executor SHA remains authoritative and must match FETCH_HEAD exactly.
+RUN git check-ref-format "$MIMIR_GIT_REF" \
+    && git init /opt/mimir-worklink/source \
+    && git -C /opt/mimir-worklink/source remote add origin "$MIMIR_GIT_URL" \
+    && git -C /opt/mimir-worklink/source fetch --no-tags --depth=1 origin "$MIMIR_GIT_REF" \
+    && test "$(git -C /opt/mimir-worklink/source rev-parse FETCH_HEAD)" = "$MIMIR_EXECUTOR_COMMIT" \
+    && git -C /opt/mimir-worklink/source checkout --detach FETCH_HEAD \
+    && test "$(git -C /opt/mimir-worklink/source rev-parse HEAD)" = "$MIMIR_EXECUTOR_COMMIT" \
+    && test -z "$(git -C /opt/mimir-worklink/source status --porcelain=v1)" \
+    && printf '%s\n' "$MIMIR_EXECUTOR_COMMIT" > /opt/mimir-worklink/executor-source-commit \
+    && rm -rf /opt/mimir-worklink/source/.git \
+    && python3 -m venv /opt/mimir-worklink/venv \
     && /opt/mimir-worklink/venv/bin/pip install --no-cache-dir --upgrade pip \
     && /opt/mimir-worklink/venv/bin/pip install --no-cache-dir "mimir-agent[${MIMIR_EXTRAS}]"
-COPY --chown=root:root pyproject.toml uv.lock README.md LICENSE .env.example /opt/mimir-worklink/source/
-COPY --chown=root:root benchmarks/saga/pyproject.toml /opt/mimir-worklink/source/benchmarks/saga/pyproject.toml
-COPY --chown=root:root docs/ /opt/mimir-worklink/source/docs/
-COPY --chown=root:root mimir/ /opt/mimir-worklink/source/mimir/
 # The published package above supplies the worker venv's dependency set, while
-# the no-deps source overlay keeps the image proof on this checkout's code. A
+# the no-deps source overlay keeps the image proof on the pinned commit's code. A
 # newly introduced runtime dependency is not in the previously published wheel,
 # so install it explicitly before importing the overlay during this PR's proof.
 RUN /opt/mimir-worklink/venv/bin/pip install --no-cache-dir "pypdf>=6.16" \

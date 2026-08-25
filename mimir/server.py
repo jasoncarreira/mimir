@@ -811,12 +811,16 @@ class _MaskApiKeyInAccessLog(logging.Filter):
 async def _handle_health(request: web.Request) -> web.Response:
     from .worklink.worker_client import DEFAULT_EXECUTOR_SOCKET, verify_executor_identity
 
+    executor_source_commit = None
     if request.app.get("check_worker_executor_health") and DEFAULT_EXECUTOR_SOCKET.exists():
         try:
-            await verify_executor_identity()
+            executor_source_commit = await verify_executor_identity()
         except (OSError, RuntimeError, ValueError) as exc:
             return web.json_response({"ok": False, "error": str(exc)}, status=503)
-    return web.json_response({"ok": True})
+    response: dict[str, object] = {"ok": True}
+    if executor_source_commit is not None:
+        response["worklink_executor_source_commit"] = executor_source_commit
+    return web.json_response(response)
 
 
 async def _handle_root(request: web.Request) -> web.Response:

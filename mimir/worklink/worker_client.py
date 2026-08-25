@@ -25,7 +25,7 @@ CANCEL_SOCKET_TIMEOUT_S = 20.0
 EXECUTOR_PROTOCOL_IDENTITY = "worklink-executor-v6-bounded-output-path-checkout"
 STALE_EXECUTOR_DIAGNOSTIC = (
     "stale root executor image: controller and mimir.worklink.worker_exec protocol "
-    "identities do not match; rebuild the image and restart the container"
+    "or source identities do not match; rebuild the image and restart the container"
 )
 _PROJECTION_PATHS = frozenset({
     ".config/opencode/opencode.json",
@@ -308,7 +308,7 @@ class WorkerClient:
 
 async def verify_executor_identity(
     socket_path: Path = DEFAULT_EXECUTOR_SOCKET,
-) -> None:
+) -> str:
     """Verify the image-owned executor before a launch contract is needed."""
     client = object.__new__(WorkerClient)
     client.socket_path = socket_path
@@ -327,8 +327,12 @@ async def verify_executor_identity(
         if (
             response.get("status") != "identity"
             or response.get("executor_identity") != EXECUTOR_PROTOCOL_IDENTITY
+            or not isinstance(response.get("source_commit"), str)
+            or len(response["source_commit"]) != 40
+            or any(character not in "0123456789abcdef" for character in response["source_commit"])
         ):
             raise StaleWorkerExecutorError(STALE_EXECUTOR_DIAGNOSTIC)
+        return response["source_commit"]
     finally:
         sock.close()
 

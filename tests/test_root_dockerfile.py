@@ -57,12 +57,54 @@ def test_apt_install_layer_includes_ripgrep() -> None:
 
 
 @pytest.mark.skipif(shutil.which("docker") is None, reason="Docker is unavailable")
+def test_build_without_provenance_args_fails_with_named_error() -> None:
+    """The canonical root image must never build without pinned provenance."""
+    result = subprocess.run(
+        ["docker", "build", "--progress=plain", "."],
+        cwd=ROOT,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        check=False,
+        timeout=300,
+    )
+    assert result.returncode != 0
+    assert "MIMIR_GIT_REF is required" in result.stdout
+
+
+@pytest.mark.skipif(shutil.which("docker") is None, reason="Docker is unavailable")
 def test_built_image_provides_process_tools() -> None:
     """The shipped artifact must provide the process tools used by runbooks."""
     image = f"mimir-process-tools-test:{os.getpid()}"
     try:
+        source_commit = subprocess.run(
+            ["git", "rev-parse", "HEAD"], cwd=ROOT, text=True,
+            stdout=subprocess.PIPE, check=True,
+        ).stdout.strip()
+        source_ref = os.environ.get("MIMIR_GIT_REF") or os.environ.get("GITHUB_REF")
+        if not source_ref:
+            branch = subprocess.run(
+                ["git", "symbolic-ref", "--quiet", "--short", "HEAD"], cwd=ROOT,
+                text=True, stdout=subprocess.PIPE, check=True,
+            ).stdout.strip()
+            source_ref = subprocess.run(
+                ["git", "config", "--get", f"branch.{branch}.merge"], cwd=ROOT,
+                text=True, stdout=subprocess.PIPE, check=True,
+            ).stdout.strip()
+        remote_commit = subprocess.run(
+            ["git", "ls-remote", "--exit-code", "origin", source_ref], cwd=ROOT,
+            text=True, stdout=subprocess.PIPE, check=True, timeout=60,
+        ).stdout.split()[0]
+        if remote_commit != source_commit:
+            pytest.skip(f"HEAD is not published at {source_ref}")
         subprocess.run(
-            ["docker", "build", "--tag", image, "."],
+            [
+                "docker", "build",
+                "--build-arg", f"MIMIR_GIT_REF={source_ref}",
+                "--build-arg", f"MIMIR_CONTROLLER_COMMIT={source_commit}",
+                "--build-arg", f"MIMIR_EXECUTOR_COMMIT={source_commit}",
+                "--tag", image, ".",
+            ],
             cwd=ROOT,
             check=True,
             timeout=1200,
