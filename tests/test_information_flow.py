@@ -2475,6 +2475,56 @@ def test_undomained_ingesting_native_result_taints_active_turn(tool_name: str) -
     assert labels.has_untrusted_active_ingest is True
 
 
+def test_unresolved_native_source_sentinel_names_its_producer() -> None:
+    labels = classify_protected_result(
+        "shell_exec",
+        {"command": "inspect generated output"},
+        _auth(),
+        ToolAuthorization(
+            tool_name="shell_exec",
+            decision=OperationDecision.OPEN,
+            allowed=True,
+            flow_direction=ToolFlowDirection.BOTH,
+        ),
+        result="model-visible output",
+    )
+
+    assert labels is not None
+    [source] = labels.sources
+    assert source.resource_id == "<unresolved-resource:protected_tool:shell_exec>"
+    assert source.resource_id != "unknown"
+
+
+def test_acp_refusal_path_uses_channel_instead_of_query_prose() -> None:
+    refusal_text = (
+        "ACP tainted turn cannot send response send_message same channel "
+        "untrusted file ifc_label_blocked originating ACP channel"
+    )
+    auth = replace(
+        _auth(channel="acp:session", roles=("admin",)),
+        resource_id="acp:session",
+        bridge_instance="acp-stdio",
+    )
+
+    labels = classify_protected_result(
+        "grep",
+        {"query": refusal_text},
+        auth,
+        ToolAuthorization(
+            tool_name="grep",
+            decision=OperationDecision.RESOURCE_SCOPED,
+            allowed=True,
+            flow_direction=ToolFlowDirection.SOURCE,
+        ),
+        failed=True,
+    )
+
+    assert labels is not None
+    [source] = labels.sources
+    assert source.resource_id == "acp:session"
+    assert source.resource_id != refusal_text
+
+
 @pytest.mark.parametrize("tool_name", ["fetch_url", "bash_async"])
 def test_metadata_only_result_does_not_taint_inline_result(tool_name: str) -> None:
     authorization = ToolAuthorization(
