@@ -40,6 +40,7 @@ from mimir.project_tests import (
     ProjectTestRefusal,
     RepoProjectTests,
     _safe_stderr_output,
+    _validated_selectors,
 )
 from mimir.repo_tools import (
     GitCommit,
@@ -1654,9 +1655,21 @@ async def test_builtin_hang_diagnostic_configuration_leaves_fast_test_quiet(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("selector", ["--flag", "../outside", "tracked.txt;id", "/tmp/test"])
+@pytest.mark.parametrize(
+    ("selector", "reason"),
+    [
+        ("--flag", "test_selector_invalid"),
+        ("../outside", "test_selector_outside_checkout"),
+        ("tracked.txt;id", "test_selector_invalid"),
+        ("/tmp/test", "test_selector_outside_checkout"),
+    ],
+)
 async def test_project_test_selector_injection_is_refused(
-    repo_tools, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, selector: str,
+    repo_tools,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    selector: str,
+    reason: str,
 ) -> None:
     state = repo_tools[-2]
     home = tmp_path / "home"
@@ -1664,7 +1677,76 @@ async def test_project_test_selector_injection_is_refused(
     monkeypatch.setenv("MIMIR_HOME", str(home))
     with pytest.raises(ProjectTestRefusal) as refusal:
         await RepoProjectTests(state).execute((selector,))
-    assert refusal.value.code in {"test_selector_invalid", "test_selector_outside_checkout"}
+    assert refusal.value.code == reason
+
+
+def test_project_test_missing_selector_has_named_non_disclosing_refusal(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "checkout"
+    root.mkdir()
+    selector = "missing/test_file.py::test_named_case"
+
+    with pytest.raises(ProjectTestRefusal) as refusal:
+        _validated_selectors(root, (selector,))
+
+    assert refusal.value.code == "test_selector_not_found"
+    assert str(refusal.value) == f"test selector was not found in checkout: {selector}"
+    assert str(root) not in str(refusal.value)
+
+
+def test_project_test_symlink_selector_is_refused_before_resolution(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "checkout"
+    root.mkdir()
+    (root / "linked").symlink_to(tmp_path / "missing-target", target_is_directory=True)
+
+    def unexpected_resolve(*_args, **_kwargs):
+        raise AssertionError("symlink selector must be refused before resolution")
+
+    monkeypatch.setattr(Path, "resolve", unexpected_resolve)
+    with pytest.raises(ProjectTestRefusal) as refusal:
+        _validated_selectors(root, ("linked/test_file.py",))
+
+    assert refusal.value.code == "test_selector_symlink"
+    assert "symlink" in str(refusal.value)
+
+
+@pytest.mark.parametrize("selector", ["../absent-outside.py", "/absent-outside.py"])
+def test_project_test_absent_escape_is_not_reclassified_as_not_found(
+    tmp_path: Path, selector: str,
+) -> None:
+    root = tmp_path / "checkout"
+    root.mkdir()
+
+    with pytest.raises(ProjectTestRefusal) as refusal:
+        _validated_selectors(root, (selector,))
+
+    assert refusal.value.code == "test_selector_outside_checkout"
+    assert str(refusal.value) == (
+        "test selector does not resolve inside the authorized checkout"
+    )
+
+
+def test_project_test_unreadable_parent_has_resolution_refusal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "checkout"
+    unreadable = root / "unreadable"
+    unreadable.mkdir(parents=True)
+    original_resolve = Path.resolve
+
+    def permission_denied(path: Path, *args, **kwargs):
+        if path == unreadable / "test_file.py":
+            raise PermissionError(13, "Permission denied", str(unreadable))
+        return original_resolve(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "resolve", permission_denied)
+    with pytest.raises(ProjectTestRefusal) as refusal:
+        _validated_selectors(root, ("unreadable/test_file.py",))
+
+    assert refusal.value.code == "test_selector_unresolvable"
 
 
 @pytest.mark.asyncio
