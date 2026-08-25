@@ -12,6 +12,7 @@ Issue description:
 Rules:
 - Implement only this leaf issue's acceptance criteria.
 - Keep changes scoped and reviewable.
+- For every security-relevant guard whose permissive alternative changes behaviour, mutation-check its fail-closed branch: as applicable, change a deny `return False` to `return True`, change an integrity default to trusted, or delete an `and <equality>` clause from a boundary condition, and confirm a test fails. Restore the guard before running the gate command below. No mutation test is required when the branch is provably unreachable or semantically equivalent to its alternative; explain why the mutation cannot discriminate instead of inventing a fixture.
 - You are NOT done until the gate command below passes when YOU run it. Run it yourself before finishing and fix everything it surfaces — even failures in code you did not write. If it fails when the orchestrator re-runs it, the attempt fails and nothing is pushed:
   {test_command}
 - The issue description may include a `Suggested test command` from the planner. Treat it as advisory only; do not assume the orchestrator will execute it.
