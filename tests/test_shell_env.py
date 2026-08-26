@@ -115,13 +115,15 @@ def test_direct_exec_env_uv_run_uses_project_virtualenv(
     venv_python = venv_bin / "python"
     venv_python.symlink_to(base_executable)
     monkeypatch.setattr(_shell_env, "_TRUSTED_PATH", str(Path(uv).parent))
+    env = direct_exec_env([uv, "run", "python"])
+    env["UV_CACHE_DIR"] = str(tmp_path / "uv-cache")
 
     completed = subprocess.run(
         [uv, "run", "python", "-c", "import sys; print(sys.prefix)"],
         capture_output=True,
         check=True,
         cwd=project,
-        env=direct_exec_env([uv, "run", "python"]),
+        env=env,
         text=True,
     )
 

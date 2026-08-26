@@ -1331,6 +1331,9 @@ async def test_run_turn_http_event_ingress_reaches_turn_context_before_admin_too
 
     fake_agent = _HttpEventAdminProbeAgent()
     agent = _build_agent(tmp_path, fake_agent=fake_agent, fake_saga=_FakeSaga())
+    assert agent._config.oauth_credentials_path == (
+        tmp_path / "home" / ".claude" / ".credentials.json"
+    )
     agent._identity_resolver = _resolver(
         tmp_path,
         """
