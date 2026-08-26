@@ -32,7 +32,23 @@ def test_root_executor_is_immutable_and_installed_outside_user_homes() -> None:
     assert 'ARG MIMIR_EXECUTOR_COMMIT' in text
     assert "grep -Eq '^[0-9a-f]{40}$'" in text
     assert 'git check-ref-format "$MIMIR_GIT_REF"' in text
-    assert 'git -C /opt/mimir-worklink/source fetch --no-tags --depth=1 origin "$MIMIR_GIT_REF"' in text
+    # The pinned commit must be fetched BEFORE the caller's ref. Fetching only the
+    # ref races every merge: it moves between build start and fetch, FETCH_HEAD
+    # resolves to a newer commit, and the SHA guard below fails a build whose own
+    # checks were green. Asserted on whitespace-normalised text so the Dockerfile
+    # may wrap these lines, and by ORDER so reintroducing the race fails here.
+    # Join shell line-continuations first, then collapse whitespace, so a wrapped
+    # command reads as the single command the shell actually executes.
+    flat = " ".join(text.replace("\\\n", " ").split())
+    sha_fetch = 'fetch --no-tags --depth=1 origin "$MIMIR_EXECUTOR_COMMIT"'
+    ref_fetch = 'fetch --no-tags --depth=1 origin "$MIMIR_GIT_REF"'
+    assert sha_fetch in flat, "executor source must be fetched by immutable commit"
+    assert ref_fetch in flat, "ref fetch must remain as the reachability fallback"
+    assert flat.index(sha_fetch) < flat.index(ref_fetch), (
+        "the immutable commit must be fetched first; fetching the moving ref first "
+        "reintroduces the merge race that reddened main on 19d7c517"
+    )
+    # The SHA stays authoritative whichever fetch succeeded.
     assert 'rev-parse FETCH_HEAD' in text
     assert 'git -C /opt/mimir-worklink/source checkout --detach FETCH_HEAD' in text
     assert 'git -C /opt/mimir-worklink/source status --porcelain=v1' in text
