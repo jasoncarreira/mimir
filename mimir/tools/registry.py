@@ -2125,6 +2125,7 @@ async def _spawn_open_code_impl(
         return json.dumps({
             "run_id": run_id,
             "status": terminal.status,
+            "reason_code": terminal.reason_code,
             "exit_code": None,
             "stdout": "",
             "result": "",
@@ -2453,6 +2454,7 @@ async def _spawn_open_code_impl(
     return json.dumps({
         "run_id": run_id,
         "status": terminal.status,
+        "reason_code": terminal.reason_code,
         "exit_code": terminal.exit_code,
         "stdout": safe_stdout,
         "result": safe_stdout,
