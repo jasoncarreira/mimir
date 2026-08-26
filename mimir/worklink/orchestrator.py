@@ -2996,6 +2996,7 @@ def run_worklink(
         )
     elif result.status == "completed":
         _record_run_success(home, issue_id)
+    _trigger_ready_scan_after_terminal(home, result, autonomous=autonomous)
     # Parked outcomes do not resolve or replace prior failure attention. Leaving
     # it active keeps the issue backed off without inflating its consecutive count.
     return result
@@ -3044,6 +3045,21 @@ def _record_run_success(home: Path, issue_id: int) -> None:
         pass
 
 
+def _trigger_ready_scan_after_terminal(
+    home: Path, result: WorklinkRunResult, *, autonomous: bool
+) -> None:
+    """Signal only runs that consumed a slot and reached a requested terminal state."""
+    if (
+        not autonomous
+        or result.attempt is None
+        or result.status not in {"completed", "failed", "review_ready"}
+    ):
+        return
+    from ..poller_triggers import notify_poller
+
+    notify_poller(home, "worklink-ready-queue", reason=f"worklink_{result.status}")
+
+
 def run_worklink_reattach(*, home: Path, repo: Path, issue_id: int) -> WorklinkRunResult:
     """Resume one in-flight run after a controller restart (#561)."""
     return asyncio.run(WorklinkRunner(home=home, repo=repo).reattach(issue_id))
@@ -3084,6 +3100,7 @@ def run_worklink_epic(
         )
     elif result.status in {"completed", "review_ready"}:
         _record_run_success(home, issue_id)
+    _trigger_ready_scan_after_terminal(home, result, autonomous=autonomous)
     return result
 
 

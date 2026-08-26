@@ -4592,6 +4592,145 @@ async def test_fire_poller_suppressed_skips_subprocess_and_emits(
 
 
 @pytest.mark.asyncio
+async def test_triggered_poller_is_arbiter_gated_and_observable(tmp_path: Path, monkeypatch):
+    from mimir.event_logger import init_logger
+
+    events_path = tmp_path / "events.jsonl"
+    init_logger(events_path, session_id="test-triggered-poller")
+
+    async def noop(_event):
+        return True
+
+    arbiter = _StubArbiter(
+        fire=False,
+        severity_name="TIGHT",
+        reason="quota_off_pace:triggered",
+    )
+    sched = Scheduler(
+        scheduler_yaml=tmp_path / "s.yaml", enqueue=noop, arbiter=arbiter
+    )
+    skills = tmp_path / "skills"
+    _drop_priority_poller(skills, "p1", priority="normal")
+    sched.add_poller_jobs(skills)
+    ran: list[str] = []
+
+    async def fake_run_poller(poller, enqueue, home=None, timeout=None):
+        ran.append(poller.name)
+
+    monkeypatch.setattr("mimir.scheduler.run_poller", fake_run_poller)
+    await sched._run_triggered_poller(
+        "p1", reason="remediation_queue_drained"
+    )
+
+    assert ran == []
+    assert arbiter.consulted_priorities == ["normal"]
+    events = _read_event_types(events_path)
+    [started] = [event for event in events if event["type"] == "poller_fire_started"]
+    assert started["source"] == "triggered"
+    assert started["trigger_reason"] == "remediation_queue_drained"
+    assert any(event["type"] == "poller_fire_suppressed" for event in events)
+
+
+@pytest.mark.asyncio
+async def test_triggered_empty_scan_does_not_trigger_itself(tmp_path: Path, monkeypatch):
+    """Termination guard: without another signal one triggered pass is the bound."""
+
+    async def noop(_event):
+        return True
+
+    sched = Scheduler(scheduler_yaml=tmp_path / "s.yaml", enqueue=noop)
+    skills = tmp_path / "skills"
+    _drop_pollers_skill(skills, "worklink-ready-queue")
+    sched.add_poller_jobs(skills)
+    calls = 0
+
+    async def empty_scan(poller, enqueue, home=None, timeout=None):
+        nonlocal calls
+        calls += 1
+
+    monkeypatch.setattr("mimir.scheduler.run_poller", empty_scan)
+    await asyncio.wait_for(
+        sched._run_triggered_poller("worklink-ready-queue", reason="worklink_completed"),
+        timeout=1,
+    )
+
+    assert calls == 1
+
+
+@pytest.mark.asyncio
+async def test_missed_completion_trigger_recovers_on_timed_fire(tmp_path: Path, monkeypatch):
+    from mimir.poller_triggers import notify_poller
+
+    async def noop(_event):
+        return True
+
+    home = tmp_path / "home"
+    sched = Scheduler(
+        scheduler_yaml=tmp_path / "s.yaml", enqueue=noop, home=home
+    )
+    skills = tmp_path / "skills"
+    _drop_pollers_skill(skills, "worklink-ready-queue")
+    sched.add_poller_jobs(skills)
+    ran: list[str] = []
+
+    async def fake_run_poller(poller, enqueue, home=None, timeout=None):
+        ran.append(poller.name)
+
+    monkeypatch.setattr("mimir.scheduler.run_poller", fake_run_poller)
+    assert notify_poller(home, "worklink-ready-queue", reason="worklink_completed") is False
+
+    await sched._fire_poller(poller_name="worklink-ready-queue")
+
+    assert ran == ["worklink-ready-queue"]
+    events = _read_event_types(tmp_path / "logs" / "events.jsonl")
+    assert any(
+        event["type"] == "poller_fire_started" and event["source"] == "timed"
+        for event in events
+    )
+
+
+@pytest.mark.asyncio
+async def test_completion_fifo_reaches_triggered_poller(tmp_path: Path, monkeypatch):
+    from mimir.event_logger import init_logger
+    from mimir.poller_triggers import notify_poller
+
+    async def noop(_event):
+        return True
+
+    home = tmp_path / "home"
+    init_logger(home / "logs" / "events.jsonl", session_id="test-completion-fifo")
+    sched = Scheduler(
+        scheduler_yaml=tmp_path / "s.yaml", enqueue=noop, home=home
+    )
+    skills = tmp_path / "skills"
+    _drop_pollers_skill(skills, "worklink-ready-queue")
+    sched.add_poller_jobs(skills)
+    ran = asyncio.Event()
+
+    async def fake_run_poller(poller, enqueue, home=None, timeout=None):
+        ran.set()
+
+    monkeypatch.setattr("mimir.scheduler.run_poller", fake_run_poller)
+    sched._start_poller_trigger_listener()
+    try:
+        assert notify_poller(
+            home, "worklink-ready-queue", reason="worklink_failed"
+        ) is True
+        await asyncio.wait_for(ran.wait(), timeout=1)
+        await asyncio.sleep(0)
+    finally:
+        await sched.stop()
+
+    events = _read_event_types(home / "logs" / "events.jsonl")
+    assert any(
+        event["type"] == "poller_fire_started"
+        and event["source"] == "triggered"
+        and event["trigger_reason"] == "worklink_failed"
+        for event in events
+    )
+
+
+@pytest.mark.asyncio
 async def test_fire_poller_budget_suppressed_skips_subprocess_and_emits(
     tmp_path: Path, monkeypatch,
 ):

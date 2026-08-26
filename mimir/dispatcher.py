@@ -41,6 +41,7 @@ InjectCallback = Callable[[AgentEvent], Awaitable[None]]
 EventObserver = Callable[[AgentEvent], Awaitable[None]]
 PairingObserver = Callable[[AgentEvent, AccessDecision], Awaitable[None]]
 ChannelIdleCallback = Callable[[str], None]
+ChannelDrainedCallback = Callable[[str], None]
 # Inbound user-message admission is fail-closed for bridge/external sources.
 # Only sources that are already authenticated/trusted by the server path bypass
 # the identity allowlist gate. ``web`` is covered by the API-key middleware on
@@ -107,6 +108,7 @@ class Dispatcher:
         self._on_event: EventObserver | None = None
         self._on_pairing_required: PairingObserver | None = None
         self._on_channel_idle: ChannelIdleCallback | None = None
+        self._on_channel_drained: ChannelDrainedCallback | None = None
         self._bg_tasks: set[asyncio.Task] = set()
         self._queues: dict[str, asyncio.Queue[AgentEvent]] = {}
         self._workers: dict[str, asyncio.Task] = {}
@@ -171,6 +173,12 @@ class Dispatcher:
     ) -> None:
         """Late-bind cleanup for state keyed by retired channel IDs."""
         self._on_channel_idle = on_channel_idle
+
+    def set_on_channel_drained(
+        self, on_channel_drained: ChannelDrainedCallback | None
+    ) -> None:
+        """Late-bind an observer called after a channel's final queued turn."""
+        self._on_channel_drained = on_channel_drained
 
     def _injection_enabled(self, channel_id: str) -> bool:
         """True iff ``channel_id`` opts into mid-turn message injection
@@ -588,6 +596,11 @@ class Dispatcher:
                             self._in_flight.discard(channel_id)
                 finally:
                     queue.task_done()
+                    if queue.qsize() == 0 and self._on_channel_drained is not None:
+                        try:
+                            self._on_channel_drained(channel_id)
+                        except Exception:
+                            log.exception("channel drained callback failed for %s", channel_id)
         except asyncio.CancelledError:
             await log_event("worker_cancelled", channel_id=channel_id)
             raise

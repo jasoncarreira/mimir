@@ -25,8 +25,10 @@ from __future__ import annotations
 
 import asyncio
 import dataclasses
+import json
 import logging
 import os
+import stat
 import time
 import traceback as tb
 from dataclasses import dataclass
@@ -74,6 +76,7 @@ from .pollers import (
     run_poller,
 )
 from .poller_budget import aggregate_poller_turn_usage
+from .poller_triggers import trigger_fifo_path
 from .saga_client import SagaClient, SagaError
 
 log = logging.getLogger(__name__)
@@ -914,6 +917,14 @@ class Scheduler:
         cap = max(1, cap)  # 0 / negative → 1 (degenerate single-fire)
         self._poller_semaphore = asyncio.Semaphore(cap)
         self._poller_concurrency_cap = cap
+        # Direct completion triggers share the timed path and serialize with it
+        # per poller. Signals arriving during a triggered pass coalesce into one
+        # pending follow-up instead of creating unbounded tasks.
+        self._poller_fire_locks: dict[str, asyncio.Lock] = {}
+        self._poller_trigger_tasks: dict[str, asyncio.Task[Any]] = {}
+        self._poller_trigger_dirty: set[str] = set()
+        self._poller_trigger_fd: int | None = None
+        self._poller_trigger_buffer = b""
         # Strong references to fire-and-forget background tasks (chainlink #118).
         # asyncio.create_task() returns a weakly-referenced Task — if no strong
         # ref is held, the GC can collect it before it runs to completion.
@@ -2308,7 +2319,25 @@ class Scheduler:
         """Return the persisted-usage suppression payload for ``poller``."""
         return self._poller_budget_status(poller, now=now)[0]
 
-    async def _fire_poller(self, *, poller_name: str) -> None:
+    async def _fire_poller(
+        self,
+        *,
+        poller_name: str,
+        source: str = "timed",
+        trigger_reason: str | None = None,
+    ) -> None:
+        """Serialize timed and completion-triggered fires for one poller."""
+        lock = self._poller_fire_locks.setdefault(poller_name, asyncio.Lock())
+        async with lock:
+            await log_event(
+                "poller_fire_started",
+                poller=poller_name,
+                source=source,
+                **({"trigger_reason": trigger_reason} if trigger_reason else {}),
+            )
+            await self._fire_poller_once(poller_name=poller_name)
+
+    async def _fire_poller_once(self, *, poller_name: str) -> None:
         """APScheduler-side cron callback. Looks up the live PollerConfig
         (re-fetched on each fire to reflect any reloads) and runs it
         under the global concurrency semaphore.
@@ -2449,6 +2478,95 @@ class Scheduler:
             )
         finally:
             self._poller_semaphore.release()
+
+    def trigger_poller(self, poller_name: str, *, reason: str) -> bool:
+        """Request a coalesced fire through the same gates as the cron path."""
+        task = self._poller_trigger_tasks.get(poller_name)
+        coalesced = task is not None and not task.done()
+        if coalesced:
+            self._poller_trigger_dirty.add(poller_name)
+        else:
+            task = self._spawn(
+                self._run_triggered_poller(poller_name, reason=reason),
+                name=f"poller-trigger-{poller_name}",
+            )
+            self._poller_trigger_tasks[poller_name] = task
+            task.add_done_callback(
+                lambda completed, name=poller_name: self._poller_trigger_tasks.pop(name, None)
+                if self._poller_trigger_tasks.get(name) is completed
+                else None
+            )
+        self._spawn(
+            log_event(
+                "poller_fire_trigger_requested",
+                poller=poller_name,
+                reason=reason,
+                coalesced=coalesced,
+            ),
+            name=f"poller-trigger-observed-{poller_name}",
+        )
+        return not coalesced
+
+    async def _run_triggered_poller(self, poller_name: str, *, reason: str) -> None:
+        while True:
+            self._poller_trigger_dirty.discard(poller_name)
+            await self._fire_poller(
+                poller_name=poller_name,
+                source="triggered",
+                trigger_reason=reason,
+            )
+            # A pass never schedules itself. Only a signal received while it ran
+            # sets this flag and earns one coalesced follow-up pass.
+            if poller_name not in self._poller_trigger_dirty:
+                return
+
+    def _start_poller_trigger_listener(self) -> None:
+        if self._home is None or self._poller_trigger_fd is not None:
+            return
+        path = trigger_fifo_path(self._home)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            mode = path.lstat().st_mode
+            if not stat.S_ISFIFO(mode):
+                path.unlink()
+        except FileNotFoundError:
+            pass
+        try:
+            os.mkfifo(path, 0o600)
+        except FileExistsError:
+            pass
+        self._poller_trigger_fd = os.open(
+            path, os.O_RDWR | os.O_NONBLOCK | getattr(os, "O_NOFOLLOW", 0)
+        )
+        os.fchmod(self._poller_trigger_fd, 0o600)
+        asyncio.get_running_loop().add_reader(
+            self._poller_trigger_fd, self._read_poller_trigger_signals
+        )
+
+    def _read_poller_trigger_signals(self) -> None:
+        if self._poller_trigger_fd is None:
+            return
+        try:
+            chunk = os.read(self._poller_trigger_fd, 65536)
+        except BlockingIOError:
+            return
+        self._poller_trigger_buffer += chunk
+        lines = self._poller_trigger_buffer.split(b"\n")
+        self._poller_trigger_buffer = lines.pop()
+        for line in lines:
+            try:
+                payload = json.loads(line)
+                poller_name = payload["poller"]
+                reason = payload["reason"]
+                if not isinstance(poller_name, str) or not isinstance(reason, str):
+                    raise ValueError("trigger fields must be strings")
+            except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+                self._spawn(
+                    log_event("poller_fire_trigger_invalid"),
+                    name="poller-trigger-invalid",
+                )
+                continue
+            self.trigger_poller(poller_name, reason=reason)
 
     def _poller_cadence_seconds(self, poller: PollerConfig) -> float | None:
         """Lower bound on the gap between two of this poller's fires.
@@ -3572,6 +3690,7 @@ class Scheduler:
         if not self._started:
             self._scheduler.start()
             self._started = True
+            self._start_poller_trigger_listener()
             self._start_loop_lag_monitor()
             # Re-arm a quota-recovery wake if we restarted mid-pause
             # (the in-memory wake is lost on restart; the pause file
@@ -3696,6 +3815,12 @@ class Scheduler:
             )
 
     async def stop(self) -> None:
+        if self._poller_trigger_fd is not None:
+            asyncio.get_running_loop().remove_reader(self._poller_trigger_fd)
+            os.close(self._poller_trigger_fd)
+            self._poller_trigger_fd = None
+            if self._home is not None:
+                trigger_fifo_path(self._home).unlink(missing_ok=True)
         if self._loop_lag_task is not None:
             self._loop_lag_task.cancel()
             self._loop_lag_task = None

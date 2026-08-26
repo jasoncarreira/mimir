@@ -650,6 +650,54 @@ def test_postclaim_failure_emits_same_failure_event(
     _reset_logger_for_tests()
 
 
+@pytest.mark.parametrize("status", ["completed", "failed"])
+def test_autonomous_terminal_build_triggers_ready_scan(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, status: str
+) -> None:
+    import mimir.poller_triggers as poller_triggers
+    import mimir.worklink.orchestrator as orchestrator
+
+    async def terminal_run(self: WorklinkRunner, issue_id: int, **_: object):
+        return orchestrator.WorklinkRunResult(issue_id, 2, status, reason="boom")
+
+    signals: list[tuple[Path, str, str]] = []
+    monkeypatch.setattr(WorklinkRunner, "run", terminal_run)
+    monkeypatch.setattr(
+        poller_triggers,
+        "notify_poller",
+        lambda home, poller, *, reason: signals.append((home, poller, reason)) or True,
+    )
+
+    result = run_worklink(home=tmp_path, repo=tmp_path, issue_id=441, autonomous=True)
+
+    assert result.status == status
+    assert signals == [(tmp_path, "worklink-ready-queue", f"worklink_{status}")]
+
+
+def test_preclaim_failure_does_not_trigger_ready_scan(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Termination guard: a no-slot preclaim failure must not redispatch itself."""
+    import mimir.poller_triggers as poller_triggers
+    import mimir.worklink.orchestrator as orchestrator
+
+    async def preclaim_failure(self: WorklinkRunner, issue_id: int, **_: object):
+        return orchestrator.WorklinkRunResult(issue_id, None, "failed", reason="bad config")
+
+    signals: list[str] = []
+    monkeypatch.setattr(WorklinkRunner, "run", preclaim_failure)
+    monkeypatch.setattr(
+        poller_triggers,
+        "notify_poller",
+        lambda home, poller, *, reason: signals.append(reason) or True,
+    )
+
+    result = run_worklink(home=tmp_path, repo=tmp_path, issue_id=441, autonomous=True)
+
+    assert result.status == "failed"
+    assert signals == []
+
+
 def test_non_autonomous_failure_does_not_persist_dispatch_failure(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
