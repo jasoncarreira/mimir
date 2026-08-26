@@ -57,7 +57,7 @@ class ControllerGitPublication:
         repo_slug: str | None,
         user_name: str | None,
         user_email: str | None,
-        credential_helpers: tuple[str, ...],
+        credential_settings: tuple[tuple[str, str], ...],
     ) -> None:
         self._checkout_fd = checkout_fd
         self._git_fd = git_fd
@@ -74,7 +74,7 @@ class ControllerGitPublication:
         self.repo_slug = repo_slug
         self.user_name = user_name
         self.user_email = user_email
-        self.credential_helpers = credential_helpers
+        self.credential_settings = credential_settings
         self._git_path = metadata_path / "git"
         self._index_path = metadata_path / "index"
         self._closed = False
@@ -105,7 +105,7 @@ class ControllerGitPublication:
             repo_slug = _repo_slug(push_url)
             user_name = _git_config_value(trusted, "user.name")
             user_email = _git_config_value(trusted, "user.email")
-            helpers = tuple(_git_config_values(trusted, "credential.helper"))
+            credential_settings = _git_credential_settings(trusted)
             root = Path(metadata_root)
             root.mkdir(mode=0o700, parents=True, exist_ok=True)
             root_value = root.stat()
@@ -125,7 +125,7 @@ class ControllerGitPublication:
                 object_fd=object_fd,
                 user_name=user_name,
                 user_email=user_email,
-                credential_helpers=helpers,
+                credential_settings=credential_settings,
                 pass_fds=(retained_checkout_fd, git_fd, object_fd),
             )
             return cls(
@@ -144,7 +144,7 @@ class ControllerGitPublication:
                 repo_slug=repo_slug,
                 user_name=user_name,
                 user_email=user_email,
-                credential_helpers=helpers,
+                credential_settings=credential_settings,
             )
         except BaseException:
             if metadata_path is not None:
@@ -267,7 +267,7 @@ def _initialize_metadata(
     object_fd: int,
     user_name: str | None,
     user_email: str | None,
-    credential_helpers: tuple[str, ...],
+    credential_settings: tuple[tuple[str, str], ...],
     pass_fds: tuple[int, ...],
 ) -> None:
     git_path = metadata_path / "git"
@@ -279,21 +279,21 @@ def _initialize_metadata(
     ref_path.write_text(f"{initial_head}\n")
     (git_path / "objects" / "info" / "alternates").write_text(f"{_fd_path(object_fd)}\n")
     config_path = git_path / "config"
-    for key, values in (
-        ("user.name", (() if user_name is None else (user_name,))),
-        ("user.email", (() if user_email is None else (user_email,))),
-        ("credential.helper", credential_helpers),
-    ):
-        for value in values:
-            result = subprocess.run(
-                ["git", "config", "--file", str(config_path), "--add", key, value],
-                capture_output=True,
-                check=False,
-                env=_capture_environment(),
-                text=True,
-            )
-            if result.returncode != 0:
-                raise SafeGitError(f"could not create private Git setting {key}")
+    identity: list[tuple[str, str]] = []
+    if user_name is not None:
+        identity.append(("user.name", user_name))
+    if user_email is not None:
+        identity.append(("user.email", user_email))
+    for key, value in (*identity, *credential_settings):
+        result = subprocess.run(
+            ["git", "config", "--file", str(config_path), "--add", key, value],
+            capture_output=True,
+            check=False,
+            env=_capture_environment(),
+            text=True,
+        )
+        if result.returncode != 0:
+            raise SafeGitError(f"could not create private Git setting {key}")
     result = subprocess.run(
         ["git", f"--git-dir={git_path}", "read-tree", initial_head],
         capture_output=True,
@@ -385,6 +385,45 @@ def _git_config_values(repo: Path, key: str) -> list[str]:
     return result.stdout.splitlines()
 
 
+def _git_credential_settings(repo: Path) -> tuple[tuple[str, str], ...]:
+    """Capture the trusted repository's credential helper settings verbatim.
+
+    ``gh auth setup-git`` — and every other per-host credential setup — writes the
+    helper under the URL-scoped ``credential.<url>.helper`` key rather than the plain
+    ``credential.helper``. Reading only the unscoped key therefore captured nothing on
+    a normally configured host, and the publication pushed with no credentials at all.
+
+    Keys are copied with their scoping intact rather than resolved here, so Git applies
+    its own URL matching against the push URL when the push runs. That keeps a helper
+    scoped to one host from being offered to another, and preserves a multi-helper
+    chain and its reset entries in configured order — neither of which survives
+    ``--get-urlmatch``, which collapses a chain to its last value.
+
+    The pattern is POSIX: ``git config`` does not honour ``\\s``, so a class written
+    as ``[^\\s]`` silently excludes every key containing a literal ``s`` — which is
+    every ``https://`` scoped key this exists to read.
+    """
+    result = subprocess.run(
+        ["git", "-C", str(repo), "config", "--get-regexp", r"^credential\.(.+\.)?helper$"],
+        capture_output=True,
+        check=False,
+        env=_capture_environment(),
+        text=True,
+    )
+    if result.returncode == 1:
+        return ()
+    if result.returncode != 0:
+        raise SafeGitError("could not capture trusted Git setting credential.helper")
+    settings: list[tuple[str, str]] = []
+    for line in result.stdout.splitlines():
+        if not line:
+            continue
+        key, _, value = line.partition(" ")
+        if key:
+            settings.append((key, value))
+    return tuple(settings)
+
+
 def _repo_slug(url: str) -> str | None:
     value = url.rstrip("/")
     if value.startswith("git@github.com:"):
@@ -415,8 +454,12 @@ def _publication_environment(index_path: Path) -> dict[str, str]:
             "GIT_TERMINAL_PROMPT": "0",
             "GIT_PAGER": "cat",
             "PAGER": "cat",
-            "GIT_ASKPASS": os.devnull,
-            "SSH_ASKPASS": os.devnull,
+            # Empty, not os.devnull: Git execs the askpass value, and /dev/null is not
+            # executable, so naming it reports "cannot exec '/dev/null'" and buries the
+            # real cause. Empty disables the helper outright, and GIT_TERMINAL_PROMPT=0
+            # above is what actually keeps a missing credential from blocking on a prompt.
+            "GIT_ASKPASS": "",
+            "SSH_ASKPASS": "",
             "GIT_INDEX_FILE": str(index_path),
         }
     )
