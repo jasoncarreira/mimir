@@ -152,9 +152,11 @@ def repo_review_git_root(tmp_path):
 _HOST_ONLY_ENV = frozenset(
     {
         "MIMIR_API_KEY",
+        "MIMIR_CLAUDE_OAUTH_CREDENTIALS",
         "MIMIR_HOME",
         "MIMIR_CODING_ENABLED",
         "MIMIR_FACTORY_PUBLISHING_IDENTITY",
+        "MIMIR_FILE_TOOL_ROOTS",
         "OPENCODE_CONFIG",
         "PYTEST_ADDOPTS",
     }
@@ -180,9 +182,14 @@ def _clear_host_mimir_environment():
     Tests that want to exercise the auth-on path should monkeypatch
     the env var explicitly inside the test body.
 
-    ``MIMIR_HOME`` is also host-specific. Leaving it set makes the live
-    ``repositories.yaml`` override temporary ``GITHUB_REPOS`` and writable-root
-    settings in authorization tests.
+    ``MIMIR_HOME`` and ``MIMIR_FILE_TOOL_ROOTS`` are also host-specific. Leaving
+    them set makes the live ``repositories.yaml`` override temporary
+    ``GITHUB_REPOS`` and writable-root settings in authorization tests.
+
+    ``MIMIR_CLAUDE_OAUTH_CREDENTIALS`` explicitly overrides the credentials path
+    derived from a test's temporary ``MIMIR_HOME``. Inheriting it makes Config
+    inspect the controller's real credentials, which correctly fails when the
+    suite runs across the Worklink worker uid boundary.
 
     ``OPENCODE_CONFIG`` must not pin tests that replace ``HOME`` to the live
     agent's model configuration. ``PYTEST_ADDOPTS`` has already been consumed by
