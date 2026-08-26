@@ -1056,11 +1056,19 @@ class WorklinkRunner:
         )
         evidence_path = _write_evidence(self.home, validation.evidence)
         if validation.review_ready:
-            _commit_checkout_changes(lease.path, issue, runner=runner, publication=publication)
             try:
+                _commit_checkout_changes(
+                    lease.path, issue, runner=runner, publication=publication
+                )
                 _ensure_clean_checkout(lease.path, runner=runner, publication=publication)
-            except WorklinkError as exc:
-                validation = _failed_validation(validation, str(exc))
+            except Exception as exc:
+                validation = _publication_failed_validation(
+                    validation,
+                    step="commit",
+                    error=exc,
+                    issue_id=issue.issue_id,
+                    attempt=attempt,
+                )
             else:
                 validation = await observe_evidence(
                     issue=issue.issue_id,
@@ -1095,7 +1103,6 @@ class WorklinkRunner:
                     runner=runner,
                     root_dirty_before=root_dirty_before,
                 )
-                validation = _with_head_sha(validation, lease.path, runner=runner, publication=publication)
             evidence_path = _write_evidence(self.home, validation.evidence)
         if validation.review_ready:
             # chainlink #518: push from the checkout that OWNS the attempt
@@ -1105,17 +1112,41 @@ class WorklinkRunner:
             # remote); pushing from ``self.repo`` fails with
             # "src refspec <branch> does not match any". This is also correct
             # for the legacy worktree shape, which shares the parent's refs.
-            _git_push(lease.path, lease.branch, runner=runner, publication=publication)
-            pr_url = _open_pr(
-                self.repo,
-                issue,
-                lease.branch,
-                validation.evidence,
-                pr_body_section=pr_body_section,
-                base=lease.base_ref,
-                runner=runner,
-            )
-            validation = _with_pr_url(validation, pr_url)
+            try:
+                _git_push(lease.path, lease.branch, runner=runner, publication=publication)
+            except Exception as exc:
+                validation = _publication_failed_validation(
+                    validation,
+                    step="push",
+                    error=exc,
+                    issue_id=issue.issue_id,
+                    attempt=attempt,
+                )
+            else:
+                validation = _with_head_sha(
+                    validation, lease.path, runner=runner, publication=publication
+                )
+                try:
+                    pr_url = _open_pr(
+                        self.repo,
+                        issue,
+                        lease.branch,
+                        validation.evidence,
+                        pr_body_section=pr_body_section,
+                        base=lease.base_ref,
+                        runner=runner,
+                    )
+                except Exception as exc:
+                    validation = _publication_failed_validation(
+                        validation,
+                        step="pull request",
+                        error=exc,
+                        issue_id=issue.issue_id,
+                        attempt=attempt,
+                    )
+                else:
+                    validation = _with_pr_url(validation, pr_url)
+            evidence_path = _write_evidence(self.home, validation.evidence)
         post_publication_errors: list[str] = []
 
         def run_bookkeeping(name: str, action: Callable[[], Any]) -> Any | None:
@@ -1238,7 +1269,9 @@ class WorklinkRunner:
                 if post_publication_errors
                 else f"post-transition cleanup failed: {cleanup_error}"
                 if cleanup_error
-                else validation.evidence.failure_reason if raw.exit_code != 0 else None
+                else validation.evidence.failure_reason if raw.exit_code != 0
+                else validation.evidence.blocked_reason if validation.status == "blocked"
+                else None
             ),
         )
 
@@ -3706,9 +3739,9 @@ def _with_head_sha(
     publication: ControllerGitPublication | None = None,
 ) -> EvidenceValidation:
     result = (
-        publication.run("rev-parse", "HEAD")
+        publication.run("rev-parse", "--verify", "HEAD^{commit}")
         if publication is not None
-        else runner(["git", "-C", str(checkout), "rev-parse", "HEAD"])
+        else runner(["git", "-C", str(checkout), "rev-parse", "--verify", "HEAD^{commit}"])
     )
     head_sha = result.stdout.strip() if result.returncode == 0 else ""
     if not head_sha:
@@ -3738,6 +3771,38 @@ def _failed_validation(validation: EvidenceValidation, reason: str) -> EvidenceV
     return replace(
         validation,
         status="failed",
+        review_ready=False,
+        reasons=(*validation.reasons, reason),
+        evidence=evidence,
+    )
+
+
+def _publication_failed_validation(
+    validation: EvidenceValidation,
+    *,
+    step: str,
+    error: Exception,
+    issue_id: int,
+    attempt: int,
+) -> EvidenceValidation:
+    detail = str(error).strip() or error.__class__.__name__
+    reason = f"publication {step} failed: {detail}"
+    _log_event(
+        "worklink_publication_failed",
+        issue_id=issue_id,
+        attempt=attempt,
+        step=step,
+        error=detail,
+    )
+    evidence = replace(
+        validation.evidence,
+        status="blocked",
+        blocked_reason=reason,
+        head_sha=None,
+    )
+    return replace(
+        validation,
+        status="blocked",
         review_ready=False,
         reasons=(*validation.reasons, reason),
         evidence=evidence,

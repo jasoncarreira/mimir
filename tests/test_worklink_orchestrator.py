@@ -1074,6 +1074,58 @@ def test_worklink_runner_happy_path_fake_backend(tmp_path: Path) -> None:
     _reset_logger_for_tests()
 
 
+def test_push_failure_blocks_build_and_reports_publication_step(tmp_path: Path) -> None:
+    _reset_logger_for_tests()
+    events = tmp_path / "logs" / "events.jsonl"
+    init_logger(events, session_id="test-worklink-push-failure")
+    repo = tmp_path / "repo"
+    worktree = repo.parent / ".worklink" / repo.name / "441-1"
+    calls, base_runner = _orchestrator_runner(repo, worktree)
+
+    def runner(
+        args: Sequence[str] | str,
+        *,
+        cwd: Path | None = None,
+        text: bool = True,
+    ) -> subprocess.CompletedProcess:
+        if (
+            isinstance(args, list)
+            and args[:4] == ["git", "-C", str(worktree), "push"]
+        ):
+            calls.append(args)
+            return cp(args, returncode=128, stderr="remote rejected publication\n")
+        return base_runner(args, cwd=cwd, text=text)
+
+    registry = BackendRegistry(WorklinkConfig())
+    registry.register(FakeBackend())
+
+    result = asyncio.run(
+        WorklinkRunner(home=tmp_path, repo=repo, runner=runner, registry=registry).run(
+            441, backend_name="fake", test_command="echo ok"
+        )
+    )
+
+    assert result.status == "blocked"
+    assert result.review_ready is False
+    assert result.pr_url is None
+    assert result.reason == "publication push failed: remote rejected publication"
+    evidence = json.loads(
+        (tmp_path / "state" / "worklink" / "evidence" / "441-1.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert evidence["status"] == "blocked"
+    assert evidence["blocked_reason"] == result.reason
+    assert evidence["head_sha"] is None
+    assert ["chainlink", "issue", "label", "441", "worklink:blocked"] in calls
+    assert ["chainlink", "issue", "label", "441", "worklink:ready"] not in calls
+    records = [json.loads(line) for line in events.read_text(encoding="utf-8").splitlines()]
+    failure = next(record for record in records if record["type"] == "worklink_publication_failed")
+    assert failure["step"] == "push"
+    assert failure["error"] == "remote rejected publication"
+    _reset_logger_for_tests()
+
+
 def test_post_pr_comment_failure_does_not_demote_completed_run(tmp_path: Path) -> None:
     repo = tmp_path / "repo"
     worktree = repo.parent / ".worklink" / repo.name / "441-1"
@@ -2091,15 +2143,16 @@ def test_worklink_runner_dirty_after_commit_fails_before_push(tmp_path: Path) ->
         )
     )
 
-    assert result.status == "failed"
-    assert result.reason is None
+    assert result.status == "blocked"
+    assert result.reason == "publication commit failed: checkout still dirty after Worklink commit"
     assert not any(
         isinstance(call, list)
         and call[:3] == ["git", "-C", str(repo)]
         and call[3] == "push"
         for call in calls
     )
-    assert ["chainlink", "issue", "label", "441", "worklink:ready"] in calls
+    assert ["chainlink", "issue", "label", "441", "worklink:blocked"] in calls
+    assert ["chainlink", "issue", "label", "441", "worklink:ready"] not in calls
 
 STRICT_ISSUE_JSON = '''{
   "id": 443,
@@ -5947,7 +6000,7 @@ def test_authorized_publication_helpers_never_use_checkout_runner(tmp_path: Path
                 return cp(args, stdout=b"changed.txt\0")
             if args[:2] == ("cat-file", "blob"):
                 return cp(args, stdout=b"clean content\n")
-            if args == ("rev-parse", "HEAD"):
+            if args == ("rev-parse", "--verify", "HEAD^{commit}"):
                 return cp(args, stdout="a" * 40 + "\n")
             return cp(args)
 
@@ -6283,7 +6336,7 @@ def test_authorized_runner_closes_real_attempt_capabilities(
                     return cp(args, returncode=1, stderr="commit failed")
                 self.commit_seen = True
                 return cp(args)
-            if args == ("rev-parse", "HEAD"):
+            if args == ("rev-parse", "--verify", "HEAD^{commit}"):
                 return cp(args, stdout="a" * 40 + "\n")
             if (
                 args[:2] == ("update-ref", "-d")
@@ -6463,8 +6516,14 @@ def test_authorized_runner_closes_real_attempt_capabilities(
     assert authorization.closed == 0
     authorization.close()
     expected_published = scenario in {"success", "branch_cleanup_exception"}
+    expected_blocked = scenario in {
+        "blocked",
+        "commit_exception",
+        "push_exception",
+        "pr_exception",
+    }
     assert result.status == (
-        "completed" if expected_published else ("blocked" if scenario == "blocked" else "failed")
+        "completed" if expected_published else ("blocked" if expected_blocked else "failed")
     )
     assert checkout.exists() is (not expected_published)
     assert sibling_marker.read_text() == "keep me\n"
