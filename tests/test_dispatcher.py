@@ -300,6 +300,29 @@ async def test_is_channel_busy_tracks_in_flight_and_queued(tmp_path: Path):
 
 
 @pytest.mark.asyncio
+async def test_channel_drained_callback_fires_after_final_turn(tmp_path: Path):
+    cfg = _make_config(tmp_path)
+    first_started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def runner(event: AgentEvent) -> None:
+        first_started.set()
+        await release.wait()
+
+    disp = Dispatcher(cfg, runner)
+    drained: list[str] = []
+    disp.set_on_channel_drained(drained.append)
+    assert await disp.enqueue(AgentEvent(trigger="poller", channel_id="c1", content="1"))
+    await first_started.wait()
+    assert await disp.enqueue(AgentEvent(trigger="poller", channel_id="c1", content="2"))
+
+    release.set()
+    await disp.drain()
+
+    assert drained == ["c1"]
+
+
+@pytest.mark.asyncio
 async def test_queue_full_returns_false(tmp_path: Path):
     cfg = _make_config(tmp_path, max_channel_queue=1)
     started = asyncio.Event()

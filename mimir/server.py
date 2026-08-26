@@ -1209,6 +1209,15 @@ def build_app(config: Config) -> web.Application:
         home=config.home,
         scheduler_tz=config.scheduler_tz,
     )
+    set_on_channel_drained = getattr(dispatcher, "set_on_channel_drained", None)
+    if set_on_channel_drained is not None:
+        set_on_channel_drained(
+            lambda channel_id: scheduler.trigger_poller(
+                "github-activity", reason="remediation_queue_drained"
+            )
+            if channel_id == "poller:github-activity"
+            else None
+        )
     # WebChatBridge needs the dispatcher (for inbound) — built after dispatcher
     # exists, registered before channels.connect_all() runs at startup.
     web_chat = WebChatBridge(
