@@ -101,7 +101,7 @@ from .access_control import (
     build_trigger_service_principal,
     parse_declared_shell_commands,
 )
-from .event_logger import log_event, get_events_path
+from .event_logger import log_event, get_events_path, get_logger
 from .models import AgentEvent, InformationFlowLabels, SourceLabel
 from .redaction import redact_text
 from . import poller_recovery
@@ -2014,6 +2014,7 @@ async def _drain_capped(
     stream: "asyncio.StreamReader | None",
     limit: int,
     on_overflow: Callable[[], None],
+    on_line: Callable[[bytes], Awaitable[None]] | None = None,
 ) -> bytes:
     """Read from *stream* up to *limit* bytes, then stop accumulating.
 
@@ -2026,19 +2027,29 @@ async def _drain_capped(
     if stream is None:
         return b""
     buf = bytearray()
+    line_buf = bytearray()
     overflowed = False
     while True:
         chunk = await stream.read(65536)
         if not chunk:
             break
         if not overflowed:
+            accepted = chunk[: max(0, limit - len(buf))]
             buf.extend(chunk)
             if len(buf) > limit:
                 del buf[limit:]
                 overflowed = True
                 on_overflow()
+            if on_line is not None:
+                line_buf.extend(accepted)
+                while b"\n" in line_buf:
+                    line, _, remainder = line_buf.partition(b"\n")
+                    line_buf = bytearray(remainder)
+                    await on_line(bytes(line))
         # Past the cap: keep reading to EOF (the kill closes the pipe
         # shortly) but discard — never grow `buf` beyond `limit`.
+    if on_line is not None and line_buf and not overflowed:
+        await on_line(bytes(line_buf))
     return bytes(buf)
 
 
@@ -2319,6 +2330,63 @@ async def run_poller(
             )
             return 0
 
+    delivery_barriers_accepted: set[str] = set()
+
+    async def _accept_delivery_barrier(line: bytes) -> None:
+        """Accept barrier signals while the poller is still running.
+
+        A barrier receipt is the poller's permission to begin later destructive
+        or detached work. All other output retains the normal process-exit
+        transaction boundary.
+        """
+        try:
+            parsed = json.loads(line.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            return
+        if not isinstance(parsed, dict) or parsed.get("delivery_barrier") is not True:
+            return
+        signal_name = parsed.get("signal")
+        delivery_key = parsed.get("delivery_key")
+        if (
+            not isinstance(signal_name, str)
+            or not signal_name.strip()
+            or not isinstance(delivery_key, str)
+            or not delivery_key
+            or len(delivery_key) > 512
+            or delivery_key in delivery_barriers_accepted
+        ):
+            return
+        payload = {
+            k: _redact_poller_env_values(v, env, explicit_env_redact_keys)
+            if isinstance(v, str) else v
+            for k, v in parsed.items()
+            if k not in (
+                "signal", "poller", "prompt", "event_type", "delivery_barrier",
+            )
+        }
+        try:
+            # The receipt is the child's permission to begin detached dispatch, so
+            # the alert it acknowledges must be durable FIRST. log_event() is
+            # best-effort: not fsynced, and EventLogger.log() swallows write
+            # failures internally, so a receipt could outlive an alert that was
+            # never written -- reopening the permanent-loss window this barrier
+            # exists to close. log_durable_sync() fsyncs and propagates failure.
+            await asyncio.to_thread(
+                get_logger().log_durable_sync,
+                signal_name.strip(),
+                poller=poller.name,
+                **payload,
+            )
+            await asyncio.to_thread(_write_delivery_receipt, persist_dir, delivery_key)
+        except Exception as exc:  # noqa: BLE001
+            log.warning(
+                "poller %r: delivery barrier emit failed (%s); record not acknowledged",
+                poller.name,
+                exc,
+            )
+            return
+        delivery_barriers_accepted.add(delivery_key)
+
     proc: asyncio.subprocess.Process | None = None
     stdout_bytes = b""
     stderr_bytes = b""
@@ -2348,7 +2416,10 @@ async def run_poller(
 
             stdout_task = asyncio.create_task(
                 _drain_capped(
-                    proc.stdout, MAX_POLLER_STDOUT_BYTES, _on_overflow,
+                    proc.stdout,
+                    MAX_POLLER_STDOUT_BYTES,
+                    _on_overflow,
+                    _accept_delivery_barrier,
                 ),
             )
             stderr_task = asyncio.create_task(
@@ -2506,7 +2577,7 @@ async def run_poller(
         )
     else:
         per_item_cap = None
-    signals_emitted = 0
+    signals_emitted = len(delivery_barriers_accepted)
     for line in stdout_text.splitlines():
         line = line.strip()
         if not line:
@@ -2526,6 +2597,12 @@ async def run_poller(
             continue
 
         if not isinstance(parsed, dict):
+            continue
+
+        if (
+            parsed.get("delivery_barrier") is True
+            and parsed.get("delivery_key") in delivery_barriers_accepted
+        ):
             continue
 
         # Signal-shaped record? Route to events.jsonl via log_event
@@ -2575,10 +2652,16 @@ async def run_poller(
                     k: _redact_poller_env_values(v, env, explicit_env_redact_keys)
                     if isinstance(v, str) else v
                     for k, v in parsed.items()
-                    if k not in ("signal", "poller", "prompt", "event_type")
+                    if k not in (
+                        "signal", "poller", "prompt", "event_type", "delivery_barrier",
+                    )
                 }
             try:
-                await log_event(
+                # Same ordering rule as the mid-run barrier: the receipt durably
+                # acknowledges this signal, so the signal must be durable first.
+                # log_event() is best-effort and swallows write failures.
+                await asyncio.to_thread(
+                    get_logger().log_durable_sync,
                     signal_name,
                     poller=poller.name,
                     **payload,
