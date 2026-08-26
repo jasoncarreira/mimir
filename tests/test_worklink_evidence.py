@@ -622,3 +622,33 @@ async def test_live_gate_durable_handle_targets_exact_cancellation(
     assert cancelled == [handle]
     assert load_run_state(tmp_path, 1410) is None
     assert checkout.is_dir()
+
+
+def test_gate_report_directory_is_writable_by_the_gate_identity(tmp_path):
+    """The worker path must not hand the gate a controller-only directory.
+
+    Regression for the defect where `tempfile.TemporaryDirectory` produced 0700
+    owned by the controller, so pytest raised PermissionError from
+    pytest_sessionfinish while writing --junitxml -- after every test had passed.
+    The gate then exited 1 on a green run and reported no structured counts.
+    """
+    from mimir.worklink.evidence import _gate_report_directory
+
+    checkout = tmp_path / "checkout"
+    checkout.mkdir()
+
+    # Controller path keeps the private temp directory.
+    with _gate_report_directory(checkout, False) as controller_dir:
+        assert controller_dir.is_dir()
+        assert checkout not in controller_dir.parents
+
+    # Worker path places the report inside the checkout, whose setgid group the
+    # worker shares, and makes it group-usable rather than owner-only.
+    with _gate_report_directory(checkout, True) as worker_dir:
+        assert worker_dir.is_dir()
+        assert checkout in worker_dir.parents
+        assert worker_dir.stat().st_mode & 0o070 == 0o070, (
+            "gate report directory must be group-accessible; the worker reaches it "
+            "by group, not by ownership"
+        )
+    assert not worker_dir.exists(), "report directory must be cleaned up"
