@@ -127,6 +127,77 @@ def test_image_proof_passes_the_github_remote_ref(monkeypatch) -> None:
     assert 'f"MIMIR_GIT_REF={git_ref}"' in (ROOT / "scripts/worklink_image_identity.py").read_text()
 
 
+def _worker_uid_job() -> dict:
+    """Return the parsed ``pytest-worker-uid`` job.
+
+    Parsed rather than substring-matched against the raw file: every property
+    asserted below is also *described* in that job's comments, so a raw-text
+    assertion would still pass after the step it describes was deleted. YAML
+    parsing drops comments, so these assertions can only be satisfied by the
+    executable steps.
+    """
+    import yaml
+
+    workflow = yaml.safe_load(
+        (ROOT / ".github/workflows/tests.yml").read_text(encoding="utf-8")
+    )
+    job = workflow["jobs"].get("pytest-worker-uid")
+    assert job is not None, "the non-owning-uid CI leg is gone"
+    return job
+
+
+def test_ci_runs_the_suite_as_a_uid_that_owns_neither_checkout_nor_home() -> None:
+    """The leg must actually run the suite as a non-owning uid.
+
+    Reduced to a plain `pytest` invocation it becomes a fourth identical
+    owner-uid run: green, expensive, and blind to the class it exists for.
+    """
+    job = _worker_uid_job()
+    runs = " ".join(step.get("run", "") for step in job["steps"])
+
+    assert "sudo -u worklink env" in runs
+    assert "HOME=/nonexistent" in runs
+    assert ".venv/bin/python -m pytest" in runs
+    # `uv run` would derive its cache from HOME, which is deliberately unwritable.
+    assert "uv run pytest" not in runs
+
+    # The worker must be able to read the tree and must NOT be able to write it.
+    assert "chmod -R g+rX ." in runs
+    assert "g+w" not in runs
+    assert "sudo -u worklink test -r" in runs
+    assert "sudo -u worklink test -w" in runs
+
+
+def test_ci_worker_uid_leg_seeds_the_state_that_makes_it_discriminating() -> None:
+    """Pin the seeding, which is what makes this leg catch anything.
+
+    These failures need the controller's state to EXIST and be unreadable, not
+    to be absent: Config handles a missing credentials file gracefully, and an
+    unset MIMIR_FILE_TOOL_ROOTS reproduces nothing. Deleting either seed leaves
+    the leg green against currently-fixed code while silently reducing it to a
+    vacuous owner-independent run, and the job cannot detect that about itself.
+
+    Reverting PR #1760 took this leg from 0 to 42 failures while every other leg
+    stayed green; that margin is what these assertions protect.
+    """
+    job = _worker_uid_job()
+    runs = " ".join(step.get("run", "") for step in job["steps"])
+
+    # The credentials file must exist, and be unreadable to the worker uid --
+    # mode 600 inside a mode 700 directory owned by the runner.
+    assert ".claude/.credentials.json" in runs
+    assert 'chmod 700 "$HOME/.claude"' in runs
+    assert 'chmod 600 "$HOME/.claude/.credentials.json"' in runs
+
+    # Both ambient-state surfaces must reach the pytest process itself.
+    assert "MIMIR_CLAUDE_OAUTH_CREDENTIALS=" in runs
+    assert "MIMIR_FILE_TOOL_ROOTS=" in runs
+
+    # MIMIR_FILE_TOOL_ROOTS must be set to a real value, not left empty.
+    env = job["steps"][-1].get("env") or {}
+    assert env.get("MIMIR_FILE_TOOL_ROOTS")
+
+
 def test_ci_runs_the_committed_live_image_proof() -> None:
     workflow = (ROOT / ".github/workflows/tests.yml").read_text(encoding="utf-8")
     proof = (ROOT / "scripts/worklink_image_identity.py").read_text(encoding="utf-8")
