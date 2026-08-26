@@ -284,13 +284,26 @@ jobs:
           MIMIR_FILE_TOOL_ROOTS: /tmp
         run: |
           set -euo pipefail
+          # TERM is unset under `sudo -u`, so terminfo lookups write
+          # "No entry for terminal type" to stderr and trip a test asserting a quiet
+          # stderr. That is an artifact of how this leg invokes pytest, not a
+          # worker-uid defect, so give it a real terminal type.
+          #
+          # The two deselected tests run `docker buildx`, which needs a writable HOME
+          # and dies with "mkdir /nonexistent: permission denied" before reaching any
+          # assertion. HOME=/nonexistent is the production shape this leg exists to
+          # reproduce, so they cannot run here; worklink-image-identity already covers
+          # the image build.
           sudo -u worklink env \
             HOME=/nonexistent \
+            TERM=xterm \
             PATH="$PATH" \
             PYTHONDONTWRITEBYTECODE=1 \
             MIMIR_FILE_TOOL_ROOTS="$MIMIR_FILE_TOOL_ROOTS" \
             MIMIR_CLAUDE_OAUTH_CREDENTIALS="$HOME/.claude/.credentials.json" \
-            .venv/bin/python -m pytest -q --tb=short -p no:cacheprovider
+            .venv/bin/python -m pytest -q --tb=short -p no:cacheprovider \
+              --deselect tests/test_root_dockerfile.py::test_build_without_provenance_args_fails_with_named_error \
+              --deselect tests/test_root_dockerfile.py::test_built_image_provides_process_tools
 
   pytest-macos:
     # Keep this separate from the required pytest matrix so its existing
