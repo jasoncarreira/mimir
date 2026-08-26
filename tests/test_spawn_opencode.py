@@ -623,6 +623,7 @@ async def test_generated_payload_containment_and_unsafe_negative_control(
         ("credentials", "seed_credentials_refused", None, "seed_credentials", "spawn_open_code_provisioning_refused", False),
         ("invalid_seed", "seed_refused", None, "invalid_seed", "spawn_open_code_provisioning_refused", False),
         ("unsafe_seed", "seed_refused", None, "unsafe_seed_entry", "spawn_open_code_provisioning_refused", False),
+        ("embedded_seed", "seed_refused", None, "embedded_seed_repository", "spawn_open_code_provisioning_refused", False),
         ("seed_changed", "seed_refused", None, "seed_changed", "spawn_open_code_provisioning_refused", False),
         ("provisioning", "provisioning_unavailable", None, "provisioning_unavailable", "spawn_open_code_provisioning_refused", False),
         ("containment", "containment_unavailable", None, "containment_unavailable", "spawn_open_code_containment_refused", False),
@@ -645,7 +646,8 @@ async def test_terminal_state_contract(
 ):
     from mimir import event_logger, opencode_config, opencode_proposal
     from mimir.contained_snapshot import (
-        SnapshotCredentialsRefused, SnapshotSourceChanged, SnapshotUnsafeEntry,
+        SnapshotCredentialsRefused, SnapshotEmbeddedRepository,
+        SnapshotSourceChanged, SnapshotUnsafeEntry,
     )
     from mimir.opencode_config import OpenCodeAuthError, OpenCodeConfigError
     from mimir.opencode_proposal import OpenCodeProposal, ProposalBuildResult
@@ -682,11 +684,12 @@ async def test_terminal_state_contract(
             "opencode_config_path": config_source,
         })
         prompt = str(config_source)
-    elif case in {"credentials", "invalid_seed", "unsafe_seed", "seed_changed", "provisioning"}:
+    elif case in {"credentials", "invalid_seed", "unsafe_seed", "embedded_seed", "seed_changed", "provisioning"}:
         error = {
             "credentials": SnapshotCredentialsRefused(),
             "invalid_seed": ValueError("bad seed"),
             "unsafe_seed": SnapshotUnsafeEntry("unsafe"),
+            "embedded_seed": SnapshotEmbeddedRepository(),
             "seed_changed": SnapshotSourceChanged("changed"),
             "provisioning": OSError("disk"),
         }[case]
@@ -736,6 +739,7 @@ async def test_terminal_state_contract(
         seed, tmp_path, record, prompt=prompt, runner=runner, factory=factory
     )
     assert payload["status"] == status
+    assert payload["reason_code"] == reason
     assert payload["exit_code"] == exit_code
     assert (payload["proposal"] is not None) is proposal_file
     assert events == [(event_type, {
@@ -756,6 +760,35 @@ async def test_terminal_state_contract(
         assert b"refresh-secret" not in artifact_bytes
         assert str(home).encode() not in artifact_bytes
     assert "<redacted>" in (artifact / "prompt.md").read_text()
+
+
+@pytest.mark.asyncio
+async def test_seed_refusal_payload_reports_each_distinct_cause(
+    spawn_tree, tmp_path
+):
+    from mimir.contained_snapshot import (
+        SnapshotEmbeddedRepository, SnapshotSourceChanged, SnapshotUnsafeEntry,
+    )
+
+    _home, seed = spawn_tree
+    refusal_errors = {
+        "invalid_seed": ValueError("malformed secret-seed-path"),
+        "unsafe_seed_entry": SnapshotUnsafeEntry("unsafe secret-seed-path"),
+        "embedded_seed_repository": SnapshotEmbeddedRepository(),
+        "seed_changed": SnapshotSourceChanged("changed secret-seed-path"),
+    }
+    reported = {}
+
+    for expected_reason, error in refusal_errors.items():
+        def refuse_seed(*args, error=error, **kwargs):
+            raise error
+
+        payload = await invoke(seed, tmp_path, {}, factory=refuse_seed)
+        assert payload["status"] == "seed_refused"
+        assert "secret-seed-path" not in json.dumps(payload)
+        reported[expected_reason] = payload["reason_code"]
+
+    assert reported == {reason: reason for reason in refusal_errors}
 
 
 @pytest.mark.asyncio
