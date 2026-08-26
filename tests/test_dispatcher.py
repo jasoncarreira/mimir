@@ -317,9 +317,40 @@ async def test_channel_drained_callback_fires_after_final_turn(tmp_path: Path):
     assert await disp.enqueue(AgentEvent(trigger="poller", channel_id="c1", content="2"))
 
     release.set()
+    for _ in range(100):
+        if drained:
+            break
+        await asyncio.sleep(0.01)
+    assert drained == ["c1"]
     await disp.drain()
 
-    assert drained == ["c1"]
+
+@pytest.mark.asyncio
+async def test_channel_drained_callback_is_suppressed_during_shutdown(tmp_path: Path):
+    """A final draining turn must not launch work against a closed dispatcher."""
+    cfg = _make_config(tmp_path)
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def runner(event: AgentEvent) -> None:
+        started.set()
+        await release.wait()
+
+    disp = Dispatcher(cfg, runner)
+    drained: list[str] = []
+    disp.set_on_channel_drained(drained.append)
+    assert await disp.enqueue(
+        AgentEvent(trigger="poller", channel_id="poller:github-activity", content="1")
+    )
+    await started.wait()
+
+    drain_task = asyncio.create_task(disp.drain())
+    await asyncio.sleep(0)
+    assert disp._closed is True
+    release.set()
+    await drain_task
+
+    assert drained == []
 
 
 @pytest.mark.asyncio

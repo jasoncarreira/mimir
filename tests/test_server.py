@@ -484,11 +484,15 @@ def _controlled_server_app(
             self._on_inject = None
             self._on_event = None
             self._on_pairing_required = None
+            self._on_channel_drained = None
             control.dispatcher = self
 
         def set_run_turn(self, run_turn: Any) -> None:
             self._run_turn = run_turn
             control.events.append("dispatcher:bound" if run_turn is not None else "dispatcher:unbound")
+
+        def set_on_channel_drained(self, callback: Any) -> None:
+            self._on_channel_drained = callback
 
         async def enqueue(self, event: Any) -> bool:
             control.events.append(f"enqueue:{self._run_turn is not None}")
@@ -535,6 +539,10 @@ def _controlled_server_app(
             self._started = False
             self._scheduler.running = False
             control.hit("scheduler:stop")
+
+        def trigger_poller(self, poller_name: str, *, reason: str) -> bool:
+            control.events.append(f"scheduler:trigger:{poller_name}:{reason}")
+            return self._started
 
         def set_arbiter(self, arbiter: Any) -> None:
             self._arbiter = arbiter
@@ -1530,9 +1538,9 @@ async def test_server_startup_and_cleanup_resource_order(
         "liveness:clean",
         "claims:release",
         "log:shutdown",
+        "scheduler:stop",
         "dispatcher:drain",
         "cancel:server cleanup",
-        "scheduler:stop",
         "bundle:close",
         "panel:stop",
         "pairing:close",
@@ -1541,6 +1549,31 @@ async def test_server_startup_and_cleanup_resource_order(
     ]
     positions = [control.events.index(name) for name in ordered]
     assert positions == sorted(positions)
+
+
+@pytest.mark.asyncio
+async def test_server_cleanup_stops_scheduler_before_final_channel_drain(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    app, control = _controlled_server_app(tmp_path, monkeypatch)
+    await _run_startup(app)
+    control.events.clear()
+
+    async def drain(*, timeout: float) -> None:
+        callback = control.dispatcher._on_channel_drained
+        assert callback is not None
+        callback("poller:github-activity")
+        control.hit("dispatcher:drain")
+
+    control.dispatcher.drain = drain
+    await _run_cleanup(app)
+
+    assert control.events.index("scheduler:stop") < control.events.index(
+        "dispatcher:drain"
+    )
+    assert "scheduler:trigger:github-activity:remediation_queue_drained" in control.events
+    assert control.scheduler._started is False
 
 
 @pytest.mark.asyncio

@@ -924,6 +924,7 @@ class Scheduler:
         self._poller_trigger_tasks: dict[str, asyncio.Task[Any]] = {}
         self._poller_trigger_dirty: set[str] = set()
         self._poller_trigger_fd: int | None = None
+        self._stopping = False
         self._poller_trigger_buffer = b""
         # Strong references to fire-and-forget background tasks (chainlink #118).
         # asyncio.create_task() returns a weakly-referenced Task — if no strong
@@ -2481,6 +2482,8 @@ class Scheduler:
 
     def trigger_poller(self, poller_name: str, *, reason: str) -> bool:
         """Request a coalesced fire through the same gates as the cron path."""
+        if self._stopping:
+            return False
         task = self._poller_trigger_tasks.get(poller_name)
         coalesced = task is not None and not task.done()
         if coalesced:
@@ -3815,6 +3818,7 @@ class Scheduler:
             )
 
     async def stop(self) -> None:
+        self._stopping = True
         if self._poller_trigger_fd is not None:
             asyncio.get_running_loop().remove_reader(self._poller_trigger_fd)
             os.close(self._poller_trigger_fd)

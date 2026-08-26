@@ -4632,6 +4632,62 @@ async def test_triggered_poller_is_arbiter_gated_and_observable(tmp_path: Path, 
 
 
 @pytest.mark.asyncio
+async def test_trigger_poller_is_rejected_after_scheduler_stop_begins(
+    tmp_path: Path, monkeypatch
+):
+    async def noop(_event):
+        return True
+
+    sched = Scheduler(scheduler_yaml=tmp_path / "s.yaml", enqueue=noop)
+    ran: list[str] = []
+
+    async def fake_run_poller(poller, enqueue, home=None, timeout=None):
+        ran.append(poller.name)
+
+    monkeypatch.setattr("mimir.scheduler.run_poller", fake_run_poller)
+    await sched.stop()
+
+    assert sched.trigger_poller("github-activity", reason="remediation_queue_drained") is False
+    await asyncio.sleep(0)
+    assert ran == []
+
+
+@pytest.mark.asyncio
+async def test_stop_cancels_trigger_accepted_immediately_before_shutdown(
+    tmp_path: Path, monkeypatch
+):
+    async def noop(_event):
+        return True
+
+    sched = Scheduler(scheduler_yaml=tmp_path / "s.yaml", enqueue=noop, home=tmp_path)
+    started = asyncio.Event()
+    cancelled = asyncio.Event()
+
+    async def blocked_scan(*, poller_name, source="timed", trigger_reason=None):
+        assert poller_name == "github-activity"
+        assert source == "triggered"
+        started.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            cancelled.set()
+
+    monkeypatch.setattr(sched, "_fire_poller", blocked_scan)
+
+    assert sched.trigger_poller(
+        "github-activity", reason="remediation_queue_drained"
+    ) is True
+    await asyncio.wait_for(started.wait(), timeout=1)
+    await sched.stop()
+
+    assert cancelled.is_set()
+    assert sched._poller_trigger_tasks == {}
+    assert sched.trigger_poller(
+        "github-activity", reason="remediation_queue_drained"
+    ) is False
+
+
+@pytest.mark.asyncio
 async def test_triggered_empty_scan_does_not_trigger_itself(tmp_path: Path, monkeypatch):
     """Termination guard: without another signal one triggered pass is the bound."""
 

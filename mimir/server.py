@@ -2318,6 +2318,11 @@ def build_app(config: Config) -> web.Application:
                     )
                 )
             await attempt(lambda: log_event("shutdown", reason="cleanup"))
+            # Quiesce poller/scheduler producers before closing dispatcher
+            # admission. Otherwise a channel-drained callback can queue an
+            # edge-trigger scan just before ``drain()`` and that scan can advance
+            # its cursor while every emitted event is rejected.
+            await attempt(scheduler.stop)
             drain_timeout = config.drain_timeout_seconds
             if drain_timeout > 0:
                 drain_timeout = max(
@@ -2334,7 +2339,6 @@ def build_app(config: Config) -> web.Application:
                 errors.append(_cleanup_exception(exc))
             else:
                 errors.extend(_cleanup_exception(error) for error in task_errors)
-            await attempt(scheduler.stop)
             if startup_state.bundle is not None:
                 await attempt(startup_state.bundle.aclose)
             if startup_state.activity_panel is not None:
