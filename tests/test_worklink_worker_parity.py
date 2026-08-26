@@ -141,7 +141,7 @@ def spec(
         backend_config=config or {},
         local_checkout=Path("/authorized"),
         local_argv=("python", "-c", "print('ok')"),
-        output_root=Path.cwd() / ".pytest-worklink-output",
+        output_root=None,
     )
 
 
@@ -248,7 +248,14 @@ async def test_enabled_launch_cancellation_waits_for_handshake_then_cancels(
         Authorization(), worker_client=client
     )
     launch = asyncio.create_task(backend.launch(spec()))
-    await client.entered.wait()
+    try:
+        await asyncio.wait_for(client.entered.wait(), timeout=1)
+    except TimeoutError:
+        if launch.done():
+            await launch
+        launch.cancel()
+        await asyncio.gather(launch, return_exceptions=True)
+        pytest.fail("enabled worker launch did not enter the client handshake within 1s")
     launch.cancel()
     client.resume.set()
 
