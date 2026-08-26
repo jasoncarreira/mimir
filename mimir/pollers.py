@@ -101,7 +101,7 @@ from .access_control import (
     build_trigger_service_principal,
     parse_declared_shell_commands,
 )
-from .event_logger import log_event, get_events_path
+from .event_logger import log_event, get_events_path, get_logger
 from .models import AgentEvent, InformationFlowLabels, SourceLabel
 from .redaction import redact_text
 from . import poller_recovery
@@ -2365,7 +2365,18 @@ async def run_poller(
             )
         }
         try:
-            await log_event(signal_name.strip(), poller=poller.name, **payload)
+            # The receipt is the child's permission to begin detached dispatch, so
+            # the alert it acknowledges must be durable FIRST. log_event() is
+            # best-effort: not fsynced, and EventLogger.log() swallows write
+            # failures internally, so a receipt could outlive an alert that was
+            # never written -- reopening the permanent-loss window this barrier
+            # exists to close. log_durable_sync() fsyncs and propagates failure.
+            await asyncio.to_thread(
+                get_logger().log_durable_sync,
+                signal_name.strip(),
+                poller=poller.name,
+                **payload,
+            )
             await asyncio.to_thread(_write_delivery_receipt, persist_dir, delivery_key)
         except Exception as exc:  # noqa: BLE001
             log.warning(
@@ -2646,7 +2657,11 @@ async def run_poller(
                     )
                 }
             try:
-                await log_event(
+                # Same ordering rule as the mid-run barrier: the receipt durably
+                # acknowledges this signal, so the signal must be durable first.
+                # log_event() is best-effort and swallows write failures.
+                await asyncio.to_thread(
+                    get_logger().log_durable_sync,
                     signal_name,
                     poller=poller.name,
                     **payload,
