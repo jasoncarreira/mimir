@@ -3314,6 +3314,64 @@ print(json.dumps({"poller": "x", "prompt": "repair", "delivery_key": "ci:key"}))
 
 
 @pytest.mark.asyncio
+async def test_delivery_barrier_is_acked_before_dispatch_phase_timeout(
+    tmp_path: Path,
+    home: Path,
+) -> None:
+    """A hard kill after the barrier cannot lose the accepted failure alert."""
+    skill_dir = tmp_path / "skill"
+    persist_dir = tmp_path / "state"
+    dispatch_started = tmp_path / "dispatch-started"
+    _install_script(skill_dir, "poller.py", f"""
+import hashlib
+import json
+import os
+import time
+from pathlib import Path
+
+delivery_key = "worklink-failure:201:occurrence"
+print(json.dumps({{
+    "poller": "x",
+    "signal": "worklink_run_failure_escalated",
+    "issue_id": 201,
+    "delivery_key": delivery_key,
+    "delivery_barrier": True,
+}}), flush=True)
+receipt = Path(os.environ["STATE_DIR"]) / ".delivery-receipts" / hashlib.sha256(delivery_key.encode()).hexdigest()
+deadline = time.monotonic() + 2
+while not receipt.exists() and time.monotonic() < deadline:
+    time.sleep(0.01)
+if receipt.exists():
+    Path({str(dispatch_started)!r}).write_text("started", encoding="utf-8")
+    time.sleep(10)
+""")
+    cfg = PollerConfig(
+        name="x",
+        command=f"{sys.executable} poller.py",
+        cron="* * * * *",
+        env={},
+        skill_dir=skill_dir,
+        persist_dir=persist_dir,
+    )
+
+    await run_poller(
+        cfg,
+        enqueue=_CapturingEnqueue(),
+        timeout=0.5,
+        home=home,
+    )
+
+    assert dispatch_started.read_text(encoding="utf-8") == "started"
+    assert len(list((persist_dir / ".delivery-receipts").glob("*"))) == 1
+    alerts = [
+        event
+        for event in _read_events(home)
+        if event["type"] == "worklink_run_failure_escalated"
+    ]
+    assert len(alerts) == 1
+
+
+@pytest.mark.asyncio
 async def test_run_poller_emits_rejection_events_for_back_pressure(
     tmp_path: Path, home: Path,
 ) -> None:

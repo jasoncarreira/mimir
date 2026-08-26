@@ -1281,12 +1281,24 @@ def _run_poller(tmp: Path, env_extra: dict[str, str]) -> list[dict]:
         "MIMIR_CODING_ENABLED", "MIMIR_FACTORY_EPICS_ENABLED",
     }}
     env.update(env_extra)
-    proc = subprocess.run(
+    proc = subprocess.Popen(
         [sys.executable, str(POLLER)], cwd=str(tmp), env=env,
-        capture_output=True, text=True, timeout=30,
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
     )
-    assert proc.returncode == 0, proc.stderr
-    events = [json.loads(line) for line in proc.stdout.splitlines() if line.strip()]
+    assert proc.stdout is not None
+    events = []
+    for line in proc.stdout:
+        if not line.strip():
+            continue
+        event = json.loads(line)
+        events.append(event)
+        if event.get("delivery_barrier") is True:
+            _write_delivery_receipt(
+                dispatch_failure_state_dir(Path(env["MIMIR_HOME"])),
+                event.get("delivery_key"),
+            )
+    _, stderr = proc.communicate(timeout=30)
+    assert proc.returncode == 0, stderr
     expected_fake_runs = sum(1 for event in events if event.get("signal") == "worklink_dispatched")
     _wait_for_fake_run_bin_exit(tmp, expected_fake_runs)
     return events
@@ -1504,7 +1516,7 @@ def test_poller_failure_escalation_dedupes_by_signature_and_recovers(
     failed = subprocess.run(
         [sys.executable, str(failed_tick)],
         cwd=tmp_path,
-        env={**os.environ, **env},
+        env={**os.environ, **env, "POLLER_TIMEOUT_SECONDS": "10.1"},
         capture_output=True,
         text=True,
         check=False,
@@ -1527,7 +1539,9 @@ def test_poller_failure_escalation_dedupes_by_signature_and_recovers(
     retried = [e for e in second if e.get("signal") == "worklink_run_failure_escalated"]
     assert len(retried) == 1
     assert retried[0]["delivery_key"] == alerts[0]["delivery_key"]
-    assert load_failure_state(state_dir)["issues"]["201"]["notified_signatures"] == []
+    assert load_failure_state(state_dir)["issues"]["201"]["notified_signatures"] == [
+        retried[0]["error_signature"]
+    ]
 
     _write_delivery_receipt(state_dir, alerts[0]["delivery_key"])
     delivered = _run_poller(tmp_path, env)
@@ -1555,6 +1569,138 @@ def test_poller_failure_escalation_dedupes_by_signature_and_recovers(
     save_failure_state(state_dir, state)
     recovered = _run_poller(tmp_path, env)
     assert [e["issue_id"] for e in recovered if e.get("signal") == "worklink_dispatched"] == [201]
+
+
+def test_poller_dispatches_only_after_failure_alert_is_durably_acked(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Dispatch-before-ack reintroduces #1361 and must fail this named test."""
+    home = tmp_path / "home"
+    home.mkdir()
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    monkeypatch.setenv("WORKLINK_REPO", str(repo))
+    poller = _load_poller_module()
+    alert = {
+        "signal": "worklink_run_failure_escalated",
+        "issue_id": 201,
+        "error_signature": "failed-201",
+        "failure_occurrence_id": "occurrence-201",
+    }
+    order: list[str] = []
+    receipt = False
+
+    monkeypatch.setattr(poller, "BackendRegistry", lambda _config: None)
+    monkeypatch.setattr(poller.WorklinkConfig, "load", lambda _path: object())
+    monkeypatch.setattr(poller, "pending_failure_alerts", lambda _state: ({201}, [alert]))
+
+    def emit(event: dict) -> None:
+        nonlocal receipt
+        if event.get("signal") == "worklink_run_failure_escalated":
+            order.append("alert-emitted")
+            assert event["delivery_barrier"] is True
+            receipt = True
+
+    monkeypatch.setattr(poller, "_emit", emit)
+    monkeypatch.setattr(
+        poller, "delivery_receipt_exists", lambda _state, _key: receipt
+    )
+    monkeypatch.setattr(
+        poller,
+        "mark_failure_notified",
+        lambda *_args: order.append("alert-durably-acked"),
+    )
+    monkeypatch.setattr(poller, "consume_worklink_budget_continuations", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(
+        poller,
+        "_active_lock_issue_ids",
+        lambda _home: order.append("ready-scan") or set(),
+    )
+    monkeypatch.setattr(
+        poller,
+        "_worklink_dispatch_plan",
+        lambda *_args, **_kwargs: (
+            [poller.DispatchItem(201, "leaf"), poller.DispatchItem(202, "leaf")],
+            2,
+            0,
+            0,
+            set(),
+        ),
+    )
+    monkeypatch.setattr(poller, "_configured_cap", lambda _home: 2)
+    monkeypatch.setattr(poller, "factory_max_concurrent", lambda: 1)
+    monkeypatch.setattr(
+        poller,
+        "_dispatch",
+        lambda **kwargs: order.append(f"dispatch-{kwargs['item'].issue_id}") or True,
+    )
+
+    assert poller.main() == 0
+    assert order == [
+        "alert-emitted",
+        "alert-durably-acked",
+        "ready-scan",
+        "dispatch-202",
+    ]
+
+
+def test_poller_reports_scan_when_alert_delivery_leaves_insufficient_budget(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    poller = _load_poller_module()
+    alert = {
+        "signal": "worklink_run_failure_escalated",
+        "issue_id": 201,
+        "error_signature": "failed-201",
+        "failure_occurrence_id": "occurrence-201",
+    }
+    events: list[dict] = []
+    receipt = False
+
+    class SpentAfterDelivery:
+        def hard_exhausted(self) -> bool:
+            return False
+
+        def hard_remaining(self) -> float:
+            return 1.0
+
+        def affords_ready_scan(self) -> bool:
+            return False
+
+    monkeypatch.setattr(poller, "TickBudget", SpentAfterDelivery)
+    monkeypatch.setattr(poller, "BackendRegistry", lambda _config: None)
+    monkeypatch.setattr(poller.WorklinkConfig, "load", lambda _path: object())
+    monkeypatch.setattr(poller, "pending_failure_alerts", lambda _state: ({201}, [alert]))
+
+    def emit(event: dict) -> None:
+        nonlocal receipt
+        events.append(event.copy())
+        if event.get("signal") == "worklink_run_failure_escalated":
+            receipt = True
+
+    monkeypatch.setattr(poller, "_emit", emit)
+    monkeypatch.setattr(poller, "delivery_receipt_exists", lambda _state, _key: receipt)
+    monkeypatch.setattr(poller, "mark_failure_notified", lambda *_args: None)
+    monkeypatch.setattr(poller, "consume_worklink_budget_continuations", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(
+        poller,
+        "_active_lock_issue_ids",
+        lambda _home: pytest.fail("ready scan started without enough budget"),
+    )
+
+    assert poller.main() == 0
+    assert [event["signal"] for event in events] == [
+        "worklink_run_failure_escalated",
+        "worklink_ready_scan",
+    ]
+    assert events[-1]["dispatched"] == 0
+    assert "insufficient tick budget" in events[-1]["reason"]
 
 
 def test_epic_dispatch_backoff_prevents_attempt_each_poll_cycle(tmp_path: Path) -> None:
@@ -1642,8 +1788,10 @@ def test_poller_stops_after_emitting_when_later_failure_ack_errors(
     assert [event["signal"] for event in emitted] == [
         "worklink_run_failure_escalated",
         "worklink_dispatch_failure_state_error",
+        "worklink_ready_scan",
     ]
     assert emitted[0]["delivery_key"].endswith("first-signature:first-occurrence")
+    assert "not acknowledged" in emitted[-1]["reason"]
     assert continuation_called is False
 
 

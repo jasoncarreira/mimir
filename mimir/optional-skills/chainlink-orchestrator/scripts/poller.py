@@ -7,6 +7,7 @@ import re
 import shlex
 import subprocess
 import sys
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -57,6 +58,40 @@ READY_LABEL = "worklink:ready"
 EPIC_LABEL = WORKLINK_EPIC_LABEL
 BLOCKED_LABEL = "worklink:blocked"
 _CHAINLINK_READ_TIMEOUT_SECONDS = 5
+_READY_SCAN_CALLS = 5
+
+
+def _env_float(name: str, default: float) -> float:
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        value = float(raw)
+    except ValueError:
+        return default
+    return value if value > 0 else default
+
+
+POLLER_CAP_SECONDS = _env_float("POLLER_TIMEOUT_SECONDS", 60.0)
+TICK_SAVE_RESERVE_SECONDS = 10.0
+TICK_HARD_DEADLINE_SECONDS = max(5.0, POLLER_CAP_SECONDS - TICK_SAVE_RESERVE_SECONDS)
+_PROCESS_START = time.monotonic()
+
+
+class TickBudget:
+    def __init__(self, *, started_at: float = _PROCESS_START) -> None:
+        self._deadline = started_at + TICK_HARD_DEADLINE_SECONDS
+
+    def hard_remaining(self) -> float:
+        return self._deadline - time.monotonic()
+
+    def hard_exhausted(self) -> bool:
+        return self.hard_remaining() <= 0.0
+
+    def affords_ready_scan(self) -> bool:
+        return self.hard_remaining() >= (
+            _READY_SCAN_CALLS * _CHAINLINK_READ_TIMEOUT_SECONDS
+        )
 
 
 @dataclass(frozen=True)
@@ -360,7 +395,50 @@ def _dispatch(
     return True
 
 
+def _deliver_failure_alerts(
+    state_dir: Path,
+    alerts: list[dict[str, object]],
+    tick_budget: TickBudget,
+) -> bool:
+    """Emit alerts and wait for the framework's durable delivery barriers."""
+    pending: dict[str, dict[str, object]] = {}
+    for alert in alerts:
+        delivery_key = (
+            f"worklink-run-failure:{alert['issue_id']}:"
+            f"{alert['error_signature']}:{alert['failure_occurrence_id']}"
+        )
+        if delivery_receipt_exists(state_dir, delivery_key):
+            mark_failure_notified(
+                state_dir,
+                int(alert["issue_id"]),
+                str(alert["error_signature"]),
+                str(alert["failure_occurrence_id"]),
+            )
+            continue
+        alert["delivery_key"] = delivery_key
+        alert["delivery_barrier"] = True
+        _emit(alert)
+        pending[delivery_key] = alert
+
+    while pending and not tick_budget.hard_exhausted():
+        acknowledged = [
+            key for key in pending if delivery_receipt_exists(state_dir, key)
+        ]
+        for key in acknowledged:
+            alert = pending.pop(key)
+            mark_failure_notified(
+                state_dir,
+                int(alert["issue_id"]),
+                str(alert["error_signature"]),
+                str(alert["failure_occurrence_id"]),
+            )
+        if pending:
+            time.sleep(min(0.05, max(0.0, tick_budget.hard_remaining())))
+    return not pending
+
+
 def main() -> int:
+    tick_budget = TickBudget()
     home_env = os.environ.get("MIMIR_HOME")
     if not home_env:
         _emit({"signal": "worklink_poller_misconfigured", "reason": "MIMIR_HOME unset"})
@@ -381,29 +459,21 @@ def main() -> int:
     # Detached workers and this reader must resolve the ledger from the same trusted home.
     state_dir = dispatch_failure_state_dir(home)
     state_dir.mkdir(parents=True, exist_ok=True)
-    emitted_delivery = False
     try:
         backed_off_ids, alerts = pending_failure_alerts(state_dir)
-        for alert in alerts:
-            delivery_key = (
-                f"worklink-run-failure:{alert['issue_id']}:"
-                f"{alert['error_signature']}:{alert['failure_occurrence_id']}"
-            )
-            if delivery_receipt_exists(state_dir, delivery_key):
-                mark_failure_notified(
-                    state_dir,
-                    int(alert["issue_id"]),
-                    str(alert["error_signature"]),
-                    str(alert["failure_occurrence_id"]),
-                )
-                continue
-            alert["delivery_key"] = delivery_key
-            _emit(alert)
-            emitted_delivery = True
+        alerts_acknowledged = _deliver_failure_alerts(state_dir, alerts, tick_budget)
     except OSError as exc:
         backed_off_ids = set()
+        alerts_acknowledged = False
         _emit({"signal": "worklink_dispatch_failure_state_error", "reason": str(exc)})
-    if emitted_delivery:
+    if not alerts_acknowledged:
+        _emit(
+            {
+                "signal": "worklink_ready_scan",
+                "reason": "failure alert delivery was not acknowledged before the tick deadline; skipping dispatch",
+                "dispatched": 0,
+            }
+        )
         return 0
     try:
         continuation_actions = consume_worklink_budget_continuations(
@@ -430,6 +500,15 @@ def main() -> int:
             return 0
     except Exception as exc:
         _emit({"signal": "worklink_continuation_consumer_error", "reason": str(exc)})
+    if not tick_budget.affords_ready_scan():
+        _emit(
+            {
+                "signal": "worklink_ready_scan",
+                "reason": "insufficient tick budget remains for the ready scan; skipping dispatch",
+                "dispatched": 0,
+            }
+        )
+        return 0
     active_lock_ids = _active_lock_issue_ids(home)
     ready_result = (
         None
@@ -485,8 +564,13 @@ def main() -> int:
         )
         return 0
     run_bin = shlex.split(os.environ.get("WORKLINK_RUN_BIN") or "mimir")
-    dispatched = sum(
-        _dispatch(
+    dispatched = 0
+    budget_skipped = 0
+    for index, item in enumerate(selected):
+        if tick_budget.hard_exhausted():
+            budget_skipped = len(selected) - index
+            break
+        dispatched += _dispatch(
             item=item,
             home=home,
             repo=repo,
@@ -496,8 +580,6 @@ def main() -> int:
             leaf_cap=leaf_cap,
             factory_cap=factory_cap,
         )
-        for item in selected
-    )
     _emit(
         {
             "signal": "worklink_ready_scan",
@@ -511,6 +593,11 @@ def main() -> int:
             "factory_active": factory_active,
             "factory_cap": factory_cap,
             "dispatched": dispatched,
+            "reason": (
+                "tick budget exhausted during dispatch; remaining work deferred"
+                if budget_skipped else None
+            ),
+            "budget_skipped": budget_skipped,
             "backed_off": len(ready) - len(dispatch_ready),
         }
     )
