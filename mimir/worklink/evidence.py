@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 import json
@@ -11,7 +12,7 @@ from pathlib import Path
 import shlex
 import subprocess
 import tempfile
-from typing import Callable, Protocol, Sequence
+from typing import Callable, Iterator, Protocol, Sequence
 import xml.etree.ElementTree as ET
 
 from ..redaction import redact_text
@@ -256,6 +257,35 @@ async def observe_evidence(
     )
 
 
+@contextlib.contextmanager
+def _gate_report_directory(checkout: Path, worker_uid_drop: bool) -> Iterator[Path]:
+    """Yield a report directory the process that runs the gate can write.
+
+    ``tempfile.TemporaryDirectory`` creates 0700 owned by the CONTROLLER. When the
+    gate is dropped to the worker uid that directory is unwritable, and pytest
+    raises ``PermissionError`` from ``pytest_sessionfinish`` while writing
+    ``--junitxml`` -- AFTER every test has already passed. The gate then exits 1 on
+    a green run, and ``read_pytest_result`` finds no junit.xml, so the failure is
+    reported as ``exit 1, structured counts unavailable`` and names nothing.
+
+    On the worker path the directory is created inside the attempt checkout, which
+    is group-owned by the worker and setgid (2770), so the new directory inherits
+    that group and both identities can use it: the worker writes the report, the
+    controller reads it back. This is narrower than widening a temp directory to
+    0777, and needs no shared group membership between the two identities.
+    """
+    if not worker_uid_drop:
+        with tempfile.TemporaryDirectory(prefix="worklink-gate-") as text:
+            yield Path(text)
+        return
+    checkout.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix=".worklink-gate-", dir=checkout) as text:
+        report_dir = Path(text)
+        # setgid on the checkout supplies the group; make it group-usable.
+        report_dir.chmod(0o770)
+        yield report_dir
+
+
 async def _observe_evidence_from_ref(
     *,
     issue: int,
@@ -339,8 +369,7 @@ async def _observe_evidence_from_ref(
         if checkout_result is not None and checkout_result.returncode != 0:
             tests = TestResult(test_command, None, "checkout failed before test", observed=False)
         else:
-            with tempfile.TemporaryDirectory(prefix="worklink-gate-") as report_dir_text:
-                report_dir = Path(report_dir_text)
+            with _gate_report_directory(checkout, worker_uid_drop) as report_dir:
                 if worker_uid_drop:
                     if compute is None:
                         raise ValueError("enabled worker evidence requires a compute backend")
