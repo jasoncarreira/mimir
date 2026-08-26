@@ -166,10 +166,21 @@ LABEL org.opencontainers.image.revision="${MIMIR_EXECUTOR_COMMIT}"
 # Fetching the caller-named ref makes GitHub's synthetic refs/pull/*/merge commit
 # reachable without broadening the clone or trusting the mutable ref as identity.
 # The full executor SHA remains authoritative and must match FETCH_HEAD exactly.
+# Fetch the immutable SHA FIRST. Fetching only the caller's ref races every merge: the
+# ref moves between build start and fetch, FETCH_HEAD resolves to a newer commit, and the
+# assertion below fails on a commit whose own checks were green (run 33010517969 -- main
+# went red on 19d7c517 because cab16d11 landed ~1 minute later). The ref remains as a
+# fallback for commits a bare-SHA fetch cannot reach, and the SHA assertion below is
+# unchanged either way, so provenance is identical: a mismatch still fails the build.
 RUN git check-ref-format "$MIMIR_GIT_REF" \
     && git init /opt/mimir-worklink/source \
     && git -C /opt/mimir-worklink/source remote add origin "$MIMIR_GIT_URL" \
-    && git -C /opt/mimir-worklink/source fetch --no-tags --depth=1 origin "$MIMIR_GIT_REF" \
+    && { \
+        git -C /opt/mimir-worklink/source fetch --no-tags --depth=1 \
+            origin "$MIMIR_EXECUTOR_COMMIT" \
+        || git -C /opt/mimir-worklink/source fetch --no-tags --depth=1 \
+            origin "$MIMIR_GIT_REF"; \
+    } \
     && test "$(git -C /opt/mimir-worklink/source rev-parse FETCH_HEAD)" = "$MIMIR_EXECUTOR_COMMIT" \
     && git -C /opt/mimir-worklink/source checkout --detach FETCH_HEAD \
     && test "$(git -C /opt/mimir-worklink/source rev-parse HEAD)" = "$MIMIR_EXECUTOR_COMMIT" \
