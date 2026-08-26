@@ -155,6 +155,8 @@ _HOST_ONLY_ENV = frozenset(
         "MIMIR_HOME",
         "MIMIR_CODING_ENABLED",
         "MIMIR_FACTORY_PUBLISHING_IDENTITY",
+        "OPENCODE_CONFIG",
+        "PYTEST_ADDOPTS",
     }
 )
 
@@ -182,7 +184,10 @@ def _clear_host_mimir_environment():
     ``repositories.yaml`` override temporary ``GITHUB_REPOS`` and writable-root
     settings in authorization tests.
 
-    ``MIMIR_FACTORY_PUBLISHING_IDENTITY`` is host-only for the same reason and
+    ``OPENCODE_CONFIG`` must not pin tests that replace ``HOME`` to the live
+    agent's model configuration. ``PYTEST_ADDOPTS`` has already been consumed by
+    the parent pytest process and must not leak its report paths into child pytest
+    runs. ``MIMIR_FACTORY_PUBLISHING_IDENTITY`` is host-only for the same reason and
     was missed when #1624 introduced it. It overrides the ``publishing_identity``
     a checkout declares in ``.factory.json``, so a deployment that sets it makes
     every test asserting on the declared identity read the deployment's value

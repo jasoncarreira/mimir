@@ -497,7 +497,8 @@ async def test_generated_payload_containment_and_unsafe_negative_control(
     from mimir.contained_execution import execute_contained
 
     _home, seed = spawn_tree
-    controller_home = Path(pwd.getpwuid(os.getuid()).pw_dir)
+    controller_home = tmp_path / "controller-home"
+    controller_home.mkdir()
     canary_name = f".mimir-spawn-canary-{uuid.uuid4().hex}"
     canary = controller_home / canary_name
     worker_home = tmp_path / "worker-home"
@@ -560,8 +561,13 @@ async def test_generated_payload_containment_and_unsafe_negative_control(
 
     async def unsafe_runner(argv, directory, worker_env, projections=(), **kwargs):
         attack = materialize(argv[-1], directory.path)
+        wrapper = (
+            "import pwd,runpy,sys,types;"
+            f"pwd.getpwuid=lambda uid:types.SimpleNamespace(pw_dir={str(controller_home)!r});"
+            "runpy.run_path(sys.argv[1],run_name='__main__')"
+        )
         completed = subprocess.run(
-            [sys.executable, str(attack)],
+            [sys.executable, "-c", wrapper, str(attack)],
             cwd=directory.path,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
