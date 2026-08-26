@@ -187,10 +187,98 @@ def test_publication_uses_only_captured_ordered_helpers(tmp_path: Path) -> None:
     finally:
         _close(publication, checkout_fd)
 
-    assert publication.credential_helpers[-2:] == (first, second)
+    assert publication.credential_settings[-2:] == (
+        ("credential.helper", first),
+        ("credential.helper", second),
+    )
     assert "username=trusted" in result.stdout
     assert "password=trusted-secret" in result.stdout
     assert "hostile" not in result.stdout
+
+
+def test_publication_uses_a_url_scoped_credential_helper(tmp_path: Path) -> None:
+    """A helper written under ``credential.<url>.helper`` must reach the push.
+
+    ``gh auth setup-git`` writes exactly this shape, so reading only the unscoped
+    ``credential.helper`` captured nothing on a normally configured host and every
+    publication pushed unauthenticated.
+    """
+    repo, _, branch = _repository(tmp_path)
+    helper = "!f() { echo username=scoped; echo password=scoped-secret; }; f"
+    _git(repo, "config", "--add", "credential.https://example.test.helper", helper)
+    publication, checkout_fd = _capture(repo, branch, tmp_path)
+    try:
+        result = publication.run(
+            "credential",
+            "fill",
+            input="protocol=https\nhost=example.test\n\n",
+            check=True,
+        )
+    finally:
+        _close(publication, checkout_fd)
+
+    assert ("credential.https://example.test.helper", helper) in publication.credential_settings
+    assert "username=scoped" in result.stdout
+    assert "password=scoped-secret" in result.stdout
+
+
+def test_publication_keeps_a_scoped_helper_off_other_hosts(tmp_path: Path) -> None:
+    """Scoping is preserved, so one host's helper is never offered to another."""
+    repo, _, branch = _repository(tmp_path)
+    helper = "!f() { echo username=elsewhere; echo password=elsewhere-secret; }; f"
+    _git(repo, "config", "--add", "credential.https://elsewhere.test.helper", helper)
+    publication, checkout_fd = _capture(repo, branch, tmp_path)
+    try:
+        # No helper claims example.test, so the fill cannot complete — that failure is
+        # the point. check=False because refusing to supply another host's credential
+        # is the correct outcome, not an error in the test.
+        result = publication.run(
+            "credential",
+            "fill",
+            input="protocol=https\nhost=example.test\n\n",
+            check=False,
+        )
+    finally:
+        _close(publication, checkout_fd)
+
+    assert ("credential.https://elsewhere.test.helper", helper) in publication.credential_settings
+    assert "elsewhere-secret" not in result.stdout
+    assert result.returncode != 0
+    # The failure must name the real cause, not a bogus askpass exec.
+    assert "cannot exec" not in result.stderr
+
+
+def test_publication_askpass_never_names_an_unexecutable_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Git execs the askpass value, so it must not name a non-executable file.
+
+    Pointing it at /dev/null made a missing credential surface as
+    "cannot exec '/dev/null': Permission denied", which named the wrong cause.
+    """
+    repo, _, branch = _repository(tmp_path)
+    publication, checkout_fd = _capture(repo, branch, tmp_path)
+    captured: dict[str, object] = {}
+
+    def run(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        captured["environment"] = kwargs["env"]
+        return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+
+    monkeypatch.setenv("GIT_ASKPASS", "/tmp/worker-askpass")
+    monkeypatch.setenv("SSH_ASKPASS", "/tmp/worker-ssh-askpass")
+    monkeypatch.setattr(safe_git_module.subprocess, "run", run)
+    try:
+        publication.run("status", check=True)
+    finally:
+        monkeypatch.undo()
+        _close(publication, checkout_fd)
+
+    environment = captured["environment"]
+    # The worker's value must not survive, and what replaces it must not be a path
+    # Git would try to exec.
+    assert environment["GIT_ASKPASS"] == ""
+    assert environment["SSH_ASKPASS"] == ""
+    assert environment["GIT_TERMINAL_PROMPT"] == "0"
 
 
 def test_push_uses_captured_literal_url_and_exact_branch_ref(
@@ -271,7 +359,7 @@ def test_publication_scrubs_git_prompt_and_config_environment(
     assert "credential.helper=" not in command
     assert "GIT_CONFIG_PARAMETERS" not in environment
     assert environment["GIT_CONFIG_GLOBAL"] == os.devnull
-    assert environment["GIT_ASKPASS"] == os.devnull
+    assert environment["GIT_ASKPASS"] == ""
     assert "SSH_AUTH_SOCK" not in environment
 
 
