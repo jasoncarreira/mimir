@@ -48,6 +48,18 @@ def test_root_executor_is_immutable_and_installed_outside_user_homes() -> None:
         "the immutable commit must be fetched first; fetching the moving ref first "
         "reintroduces the merge race that reddened main on 19d7c517"
     )
+    # Ordering alone is not the invariant. If the `||` became `&&` -- or the ref
+    # fetch simply ran afterwards unconditionally -- the moving ref would overwrite
+    # FETCH_HEAD and restore the race while presence and ordering both still held.
+    # Pin the operator, so the contract distinguishes a FALLBACK from a later
+    # unconditional fetch.
+    between = flat[flat.index(sha_fetch) + len(sha_fetch):flat.index(ref_fetch)]
+    assert between.lstrip().startswith("||"), (
+        "the ref fetch must be a FALLBACK (`||`) for the immutable-SHA fetch, not an "
+        "unconditional fetch after it. Anything that runs the moving-ref fetch when "
+        "the SHA fetch already succeeded overwrites FETCH_HEAD and restores the race; "
+        f"found {between.strip()[:40]!r} between them"
+    )
     # The SHA stays authoritative whichever fetch succeeded.
     assert 'rev-parse FETCH_HEAD' in text
     assert 'git -C /opt/mimir-worklink/source checkout --detach FETCH_HEAD' in text
