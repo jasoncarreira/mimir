@@ -728,7 +728,7 @@ class WorklinkRunner:
                 )
                 return WorklinkRunResult(
                     issue.issue_id,
-                    None,
+                    record.attempt,
                     "blocked",
                     reason=(
                         f"{selected_name} must run in an isolated checkout (own .git), "
@@ -943,6 +943,7 @@ class WorklinkRunner:
                     home=self.home,
                     issue_id=issue.issue_id,
                     attempt=record.attempt,
+                    trigger_ready_scan=autonomous,
                 )
 
     async def _finalize(
@@ -1878,7 +1879,13 @@ class WorklinkRunner:
                 reason=str(exc),
             )
         finally:
-            claims.release_issue(issue_id)
+            _release_issue_and_clear_run_state(
+                claims,
+                home=self.home,
+                issue_id=issue_id,
+                attempt=claim_record.attempt,
+                trigger_ready_scan=autonomous,
+            )
 
     async def _recover_factory_070(
         self,
@@ -2825,8 +2832,9 @@ def _release_issue_and_clear_run_state(
     home: Path,
     issue_id: int,
     attempt: int,
+    trigger_ready_scan: bool = False,
 ) -> bool:
-    """Release a claim and clear local state only after confirmed release."""
+    """Release a claim, clear local state, then notify waiting autonomous work."""
     try:
         released = claims.release_issue(issue_id)
     except BaseException as exc:
@@ -2847,7 +2855,11 @@ def _release_issue_and_clear_run_state(
             error="Chainlink did not confirm lock release",
         )
         return False
-    clear_run_state(home, issue_id)
+    try:
+        clear_run_state(home, issue_id)
+    finally:
+        if trigger_ready_scan:
+            _trigger_ready_scan_after_release(home)
     return True
 
 
@@ -2996,7 +3008,6 @@ def run_worklink(
         )
     elif result.status == "completed":
         _record_run_success(home, issue_id)
-    _trigger_ready_scan_after_terminal(home, result, autonomous=autonomous)
     # Parked outcomes do not resolve or replace prior failure attention. Leaving
     # it active keeps the issue backed off without inflating its consecutive count.
     return result
@@ -3045,22 +3056,16 @@ def _record_run_success(home: Path, issue_id: int) -> None:
         pass
 
 
-def _trigger_ready_scan_after_terminal(
-    home: Path, result: WorklinkRunResult, *, autonomous: bool
-) -> None:
-    """Signal only runs that consumed a slot and reached a requested terminal state."""
-    if (
-        not autonomous
-        or result.attempt is None
-        or result.status not in {"completed", "failed", "review_ready"}
-    ):
-        return
+def _trigger_ready_scan_after_release(home: Path) -> None:
+    """Signal the ready queue only after Chainlink confirmed a slot release."""
     from ..poller_triggers import notify_poller
 
-    notify_poller(home, "worklink-ready-queue", reason=f"worklink_{result.status}")
+    notify_poller(home, "worklink-ready-queue", reason="worklink_slot_released")
 
 
-def run_worklink_reattach(*, home: Path, repo: Path, issue_id: int) -> WorklinkRunResult:
+def run_worklink_reattach(
+    *, home: Path, repo: Path, issue_id: int
+) -> WorklinkRunResult:
     """Resume one in-flight run after a controller restart (#561)."""
     return asyncio.run(WorklinkRunner(home=home, repo=repo).reattach(issue_id))
 
@@ -3100,7 +3105,6 @@ def run_worklink_epic(
         )
     elif result.status in {"completed", "review_ready"}:
         _record_run_success(home, issue_id)
-    _trigger_ready_scan_after_terminal(home, result, autonomous=autonomous)
     return result
 
 

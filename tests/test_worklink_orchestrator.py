@@ -650,30 +650,6 @@ def test_postclaim_failure_emits_same_failure_event(
     _reset_logger_for_tests()
 
 
-@pytest.mark.parametrize("status", ["completed", "failed"])
-def test_autonomous_terminal_build_triggers_ready_scan(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, status: str
-) -> None:
-    import mimir.poller_triggers as poller_triggers
-    import mimir.worklink.orchestrator as orchestrator
-
-    async def terminal_run(self: WorklinkRunner, issue_id: int, **_: object):
-        return orchestrator.WorklinkRunResult(issue_id, 2, status, reason="boom")
-
-    signals: list[tuple[Path, str, str]] = []
-    monkeypatch.setattr(WorklinkRunner, "run", terminal_run)
-    monkeypatch.setattr(
-        poller_triggers,
-        "notify_poller",
-        lambda home, poller, *, reason: signals.append((home, poller, reason)) or True,
-    )
-
-    result = run_worklink(home=tmp_path, repo=tmp_path, issue_id=441, autonomous=True)
-
-    assert result.status == status
-    assert signals == [(tmp_path, "worklink-ready-queue", f"worklink_{status}")]
-
-
 def test_preclaim_failure_does_not_trigger_ready_scan(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1291,6 +1267,151 @@ def test_failed_lock_release_is_logged_and_retains_run_state(tmp_path: Path) -> 
     assert failure["attempt"] == 1
     assert failure["error"] == "Chainlink did not confirm lock release"
     _reset_logger_for_tests()
+
+
+def test_confirmed_autonomous_release_triggers_ready_scan(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import mimir.poller_triggers as poller_triggers
+
+    repo = tmp_path / "repo"
+    worktree = repo.parent / ".worklink" / repo.name / "441-1"
+    (tmp_path / "worklink.yaml").write_text(
+        "defaults:\n  allow_autonomous_local_subprocess: true\n",
+        encoding="utf-8",
+    )
+    _, runner = _orchestrator_runner(repo, worktree)
+    signals: list[tuple[Path, str, str]] = []
+    monkeypatch.setattr(
+        poller_triggers,
+        "notify_poller",
+        lambda home, poller, *, reason: signals.append((home, poller, reason)) or True,
+    )
+    registry = BackendRegistry(WorklinkConfig())
+    registry.register(FakeBackend())
+
+    result = asyncio.run(
+        WorklinkRunner(home=tmp_path, repo=repo, runner=runner, registry=registry).run(
+            441, backend_name="fake", test_command="echo ok", autonomous=True
+        )
+    )
+
+    assert result.status == "completed"
+    assert signals == [
+        (tmp_path, "worklink-ready-queue", "worklink_slot_released")
+    ]
+
+
+def test_unconfirmed_autonomous_release_does_not_trigger_ready_scan(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import mimir.poller_triggers as poller_triggers
+
+    repo = tmp_path / "repo"
+    worktree = repo.parent / ".worklink" / repo.name / "441-1"
+    (tmp_path / "worklink.yaml").write_text(
+        "defaults:\n  allow_autonomous_local_subprocess: true\n",
+        encoding="utf-8",
+    )
+    _, runner = _orchestrator_runner(repo, worktree, release_returncode=1)
+    signals: list[str] = []
+    monkeypatch.setattr(
+        poller_triggers,
+        "notify_poller",
+        lambda home, poller, *, reason: signals.append(reason) or True,
+    )
+    registry = BackendRegistry(WorklinkConfig())
+    registry.register(FakeBackend())
+
+    result = asyncio.run(
+        WorklinkRunner(home=tmp_path, repo=repo, runner=runner, registry=registry).run(
+            441, backend_name="fake", test_command="echo ok", autonomous=True
+        )
+    )
+
+    assert result.status == "completed"
+    assert signals == []
+
+
+def test_claimed_blocked_leaf_releases_slot_and_triggers_ready_scan(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import mimir.poller_triggers as poller_triggers
+    import mimir.worklink.orchestrator as orchestrator
+
+    repo = tmp_path / "repo"
+    checkout = tmp_path / "unsafe-worktree"
+    (tmp_path / "worklink.yaml").write_text(
+        "defaults:\n  allow_autonomous_local_subprocess: true\n",
+        encoding="utf-8",
+    )
+    calls, runner = _orchestrator_runner(repo, checkout)
+    monkeypatch.setattr(
+        orchestrator,
+        "_create_backend_checkout",
+        lambda *args, **kwargs: CheckoutLease(
+            issue_id=441,
+            attempt=1,
+            repo=repo,
+            path=checkout,
+            branch="issue/441-a1",
+            base_ref="main",
+            isolated_checkout=False,
+        ),
+    )
+    signals: list[str] = []
+    monkeypatch.setattr(
+        poller_triggers,
+        "notify_poller",
+        lambda home, poller, *, reason: signals.append(reason) or True,
+    )
+    registry = BackendRegistry(WorklinkConfig())
+    registry.register(FakeBackend())
+
+    result = asyncio.run(
+        WorklinkRunner(home=tmp_path, repo=repo, runner=runner, registry=registry).run(
+            441, backend_name="fake", test_command="echo ok", autonomous=True
+        )
+    )
+
+    assert result.status == "blocked"
+    assert result.attempt == 1
+    assert ["chainlink", "locks", "release", "441"] in calls
+    assert signals == ["worklink_slot_released"]
+
+
+def test_release_notification_follows_state_clear_and_survives_clear_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import mimir.poller_triggers as poller_triggers
+    import mimir.worklink.orchestrator as orchestrator
+
+    events: list[str] = []
+    monkeypatch.setattr(
+        poller_triggers,
+        "notify_poller",
+        lambda home, poller, *, reason: events.append(reason) or True,
+    )
+    monkeypatch.setattr(
+        orchestrator,
+        "clear_run_state",
+        lambda home, issue_id: (
+            events.append("clear_run_state"),
+            (_ for _ in ()).throw(OSError("state clear failed")),
+        )[-1],
+    )
+
+    class Claims:
+        def release_issue(self, issue_id: int) -> bool:
+            events.append("release_issue")
+            return True
+
+    with pytest.raises(OSError, match="state clear failed"):
+        orchestrator._release_issue_and_clear_run_state(
+            Claims(), home=tmp_path, issue_id=441, attempt=1, trigger_ready_scan=True
+        )
+
+    assert events == ["release_issue", "clear_run_state", "worklink_slot_released"]
 
 
 def test_worklink_pr_body_includes_build_section_and_intact_evidence(tmp_path: Path) -> None:
@@ -3265,10 +3386,18 @@ def _run_factory_preflight_case(
     publishing_identity: object = "factory-owner",
     publishing_identity_override: str | None = None,
     verify: Any = None,
+    autonomous: bool = False,
+    outcome: str | None = None,
+    release_signals: list[str] | None = None,
 ) -> tuple[object, list[WorkSpec], list[str], list[list[str]]]:
     import mimir.worklink.orchestrator as orchestrator
 
     _configure_opencode_oauth(tmp_path, monkeypatch)
+    if autonomous:
+        (tmp_path / "worklink.yaml").write_text(
+            "defaults:\n  allow_autonomous_local_subprocess: true\n",
+            encoding="utf-8",
+        )
     repo = tmp_path / "repo"
     repo.mkdir()
     checkout = tmp_path / "factory-checkout"
@@ -3320,7 +3449,9 @@ def _run_factory_preflight_case(
 
     async def launch(self: object, spec: WorkSpec) -> LaunchHandle:
         launched.append(spec)
-        raise RuntimeError("launch reached")
+        if outcome is None:
+            raise RuntimeError("launch reached")
+        return LaunchHandle("local_subprocess", "123", 456)
 
     verified_tokens: list[str] = []
 
@@ -3351,15 +3482,53 @@ def _run_factory_preflight_case(
         orchestrator.ChainlinkClaims, "transition_issue", lambda *args, **kwargs: None
     )
     monkeypatch.setattr(
-        orchestrator.ChainlinkClaims, "release_issue", lambda *args, **kwargs: None
+        orchestrator.ChainlinkClaims,
+        "release_issue",
+        lambda *args, **kwargs: outcome is not None,
     )
     monkeypatch.setattr(orchestrator, "_create_backend_checkout", lambda *args, **kwargs: lease)
     monkeypatch.setattr(orchestrator, "GitHubForgeClient", Client)
     monkeypatch.setattr(orchestrator.LocalSubprocessComputeBackend, "launch", launch)
+    if outcome is not None:
+        async def supervise(*args: object, **kwargs: object) -> object:
+            return orchestrator.WorklinkRunResult(700, 1, outcome)
+
+        monkeypatch.setattr(WorklinkRunner, "_supervise_factory_070", supervise)
+        import mimir.poller_triggers as poller_triggers
+
+        monkeypatch.setattr(
+            poller_triggers,
+            "notify_poller",
+            lambda home, poller, *, reason: (
+                release_signals.append(reason) if release_signals is not None else None
+            )
+            or True,
+        )
     result = asyncio.run(
-        WorklinkRunner(home=tmp_path, repo=repo, runner=runner, agent_id="agent").run_epic(700)
+        WorklinkRunner(home=tmp_path, repo=repo, runner=runner, agent_id="agent").run_epic(
+            700, autonomous=autonomous
+        )
     )
     return result, launched, verified_tokens, commands
+
+
+@pytest.mark.parametrize("outcome", ["partial", "needs-human"])
+def test_autonomous_epic_slot_release_triggers_ready_scan(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, outcome: str
+) -> None:
+    signals: list[str] = []
+
+    result, _, _, _ = _run_factory_preflight_case(
+        tmp_path,
+        monkeypatch,
+        credentials={"GITHUB_TOKEN": "github-token"},
+        autonomous=True,
+        outcome=outcome,
+        release_signals=signals,
+    )
+
+    assert result.status == outcome
+    assert signals == ["worklink_slot_released"]
 
 
 @pytest.mark.parametrize(
@@ -3733,7 +3902,7 @@ def test_factory_new_run_uses_resolved_base_for_single_checkout_placement(
         orchestrator.ChainlinkClaims, "transition_issue", lambda *args, **kwargs: None
     )
     monkeypatch.setattr(
-        orchestrator.ChainlinkClaims, "release_issue", lambda *args, **kwargs: None
+        orchestrator.ChainlinkClaims, "release_issue", lambda *args, **kwargs: True
     )
     monkeypatch.setattr(orchestrator, "_create_backend_checkout", place)
     monkeypatch.setattr(orchestrator, "_read_checkout_git_identity", read_git_identity)

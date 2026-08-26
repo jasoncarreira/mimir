@@ -596,7 +596,15 @@ class Dispatcher:
                             self._in_flight.discard(channel_id)
                 finally:
                     queue.task_done()
-                    if queue.qsize() == 0 and self._on_channel_drained is not None:
+                    # ``drain()`` closes the dispatcher before waiting for queued
+                    # turns. Do not start completion-triggered scans during that
+                    # window: their emitted events would be rejected while an
+                    # edge-trigger poller could still advance its cursor.
+                    if (
+                        not self._closed
+                        and queue.qsize() == 0
+                        and self._on_channel_drained is not None
+                    ):
                         try:
                             self._on_channel_drained(channel_id)
                         except Exception:
