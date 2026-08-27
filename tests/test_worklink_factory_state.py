@@ -1,17 +1,22 @@
 from __future__ import annotations
 
 from dataclasses import replace
+from datetime import UTC, datetime, timedelta
 import json
 from pathlib import Path
+import subprocess
 
 import pytest
 
 from mimir.worklink.backends.feature_factory import parse_factory_status
 from mimir.worklink.compute import LaunchHandle
 from mimir.worklink.factory_state import (
+    FACTORY_RECORD_RETENTION,
     FactoryRecordError,
     FactoryRunRecord,
+    age_out_factory_records,
     archive_factory_record,
+    factory_manifest_candidates,
     load_factory_records_for_issue,
     list_factory_records,
     load_factory_record,
@@ -124,6 +129,135 @@ def test_archive_factory_record_restores_active_record_when_event_persistence_fa
     assert load_factory_record(tmp_path, "1551") == expected
     assert source.is_file()
     assert not list(source.parent.joinpath("archive").glob("*.json"))
+
+
+def _retained_record(home: Path, repository: Path, *, sandbox_exists: bool = True) -> FactoryRunRecord:
+    sandbox = repository / ".factory-sandboxes" / "1551"
+    if sandbox_exists:
+        sandbox.mkdir(parents=True)
+    expected = replace(
+        record(home),
+        sandbox=str(sandbox),
+        status=None,
+        observed_at="2026-08-01T00:00:00+00:00",
+        controller_phase="failed",
+    )
+    save_factory_record(home, expected)
+    return expected
+
+
+def test_factory_record_retention_default_is_seven_days(tmp_path: Path) -> None:
+    repository = tmp_path / "repo"
+    expected = _retained_record(tmp_path, repository)
+    calls: list[list[str]] = []
+
+    archived = age_out_factory_records(
+        tmp_path,
+        now=datetime(2026, 8, 7, 23, 59, 59, tzinfo=UTC),
+        runner=lambda args: calls.append(list(args))
+        or subprocess.CompletedProcess(args, 0, stdout="", stderr=""),
+        event_logger=lambda *args, **kwargs: None,
+    )
+
+    assert FACTORY_RECORD_RETENTION == timedelta(days=7)
+    assert archived == []
+    assert load_factory_record(tmp_path, expected.run_id) == expected
+    assert calls == []
+
+
+def test_factory_age_out_pushes_before_removing_both_manifest_candidates(
+    tmp_path: Path,
+) -> None:
+    repository = tmp_path / "repo"
+    expected = _retained_record(tmp_path, repository)
+    root_manifest, sandbox_manifest = factory_manifest_candidates(expected)
+    assert root_manifest == repository / ".factory" / "1551"
+    assert sandbox_manifest == repository / ".factory-sandboxes" / "1551" / ".factory" / "1551"
+    root_manifest.mkdir(parents=True)
+    sandbox_manifest.mkdir(parents=True)
+    calls: list[list[str]] = []
+
+    def run(args):
+        calls.append(list(args))
+        if "push" in args:
+            assert root_manifest.exists()
+            assert sandbox_manifest.exists()
+            assert Path(expected.sandbox).exists()
+            return subprocess.CompletedProcess(args, 0, stdout="pushed\n", stderr="")
+        return subprocess.CompletedProcess(args, 0, stdout="refs/heads/slice-one\n", stderr="")
+
+    archived = age_out_factory_records(
+        tmp_path,
+        now=datetime(2026, 8, 8, tzinfo=UTC),
+        runner=run,
+        event_logger=lambda *args, **kwargs: None,
+    )
+
+    assert [call[3] for call in calls] == ["for-each-ref", "push"]
+    assert len(archived) == 1
+    assert not root_manifest.exists()
+    assert not sandbox_manifest.exists()
+    assert not Path(expected.sandbox).exists()
+    assert load_factory_record(tmp_path, expected.run_id) is None
+
+
+def test_factory_age_out_push_failure_retains_sandbox_and_reports_event(
+    tmp_path: Path,
+) -> None:
+    repository = tmp_path / "repo"
+    expected = _retained_record(tmp_path, repository)
+    root_manifest, sandbox_manifest = factory_manifest_candidates(expected)
+    root_manifest.mkdir(parents=True)
+    sandbox_manifest.mkdir(parents=True)
+    events: list[tuple[str, dict[str, object]]] = []
+
+    def run(args):
+        if "push" in args:
+            return subprocess.CompletedProcess(args, 1, stdout="", stderr="remote rejected")
+        return subprocess.CompletedProcess(args, 0, stdout="refs/heads/unpushed\n", stderr="")
+
+    archived = age_out_factory_records(
+        tmp_path,
+        now=datetime(2026, 8, 8, tzinfo=UTC),
+        runner=run,
+        event_logger=lambda event, **payload: events.append((event, payload)),
+    )
+
+    assert archived == []
+    assert root_manifest.is_dir()
+    assert sandbox_manifest.is_dir()
+    assert Path(expected.sandbox).is_dir()
+    assert load_factory_record(tmp_path, expected.run_id) == expected
+    assert events == [
+        (
+            "worklink_factory_record_age_out_failed",
+            {
+                "issue_id": 1551,
+                "run_id": "1551",
+                "attempt": 1,
+                "phase": "failed",
+                "error": "cannot push retained factory branches: remote rejected",
+            },
+        )
+    ]
+
+
+def test_factory_age_out_archives_record_when_sandbox_is_already_gone(tmp_path: Path) -> None:
+    repository = tmp_path / "repo"
+    expected = _retained_record(tmp_path, repository, sandbox_exists=False)
+    root_manifest, _ = factory_manifest_candidates(expected)
+    root_manifest.mkdir(parents=True)
+
+    archived = age_out_factory_records(
+        tmp_path,
+        now=datetime(2026, 8, 8, tzinfo=UTC),
+        runner=lambda args: pytest.fail("git must not run for a missing sandbox"),
+        event_logger=lambda *args, **kwargs: None,
+    )
+
+    assert len(archived) == 1
+    assert not root_manifest.exists()
+    assert load_factory_record(tmp_path, expected.run_id) is None
 
 
 def test_factory_record_rejects_identity_and_sandbox_mismatch(tmp_path: Path) -> None:
