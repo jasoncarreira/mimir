@@ -207,6 +207,104 @@ jobs:
           fi
           echo "ran optional-skills tests for $ran skill(s)"
 
+  pytest-worker-uid:
+    # Runs the suite as a uid that owns neither the checkout nor $HOME. That is the
+    # shape a Worklink gate runs in: the controller (`mimir`) owns the tree and its
+    # home, and the gate runs as `worklink` with HOME=/nonexistent. Every other leg
+    # here runs as the checkout's owner, so a test that reads ambient controller
+    # state passes in CI and fails only inside a build. Three such defects shipped
+    # undetected in ~18 hours on 2026-08-25/26 (PRs #1759, #1760, #1761).
+    #
+    # THE SEEDING BELOW IS LOAD-BEARING. These failures need the controller's state
+    # to EXIST and be unreadable, not to be absent: Config handles a missing
+    # credentials file gracefully, and an unset MIMIR_FILE_TOOL_ROOTS reproduces
+    # nothing. A version of this job that only switches user passes immediately and
+    # proves nothing.
+    needs: skill-conformance
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+        with:
+          version: "0.11.12"
+          enable-cache: true
+          cache-dependency-glob: "uv.lock"
+
+      - name: Set up Python
+        run: uv python install 3.12
+
+      - name: Sync dependencies (with dev and bench extras)
+        run: uv sync --extra dev --extra bench
+
+      - name: Seed controller-owned state the worker must not be able to read
+        # Mode 600 inside a mode 700 directory, owned by the runner. The worker uid
+        # can neither read the file nor traverse into the directory, which is what
+        # made Config raise PermissionError rather than fall back.
+        run: |
+          set -euo pipefail
+          mkdir -p "$HOME/.claude"
+          printf '{}\n' > "$HOME/.claude/.credentials.json"
+          chmod 700 "$HOME/.claude"
+          chmod 600 "$HOME/.claude/.credentials.json"
+          ls -ld "$HOME/.claude" "$HOME/.claude/.credentials.json"
+
+      - name: Create the non-owning worker uid and make the tree readable to it
+        # Matches the production account: no home directory, HOME=/nonexistent,
+        # nologin shell. The tree is group-READABLE only -- deliberately not
+        # group-writable. A writable tree stops reproducing the production shape and
+        # would mask the next defect of this class.
+        run: |
+          set -euo pipefail
+          sudo useradd --no-create-home --home-dir /nonexistent \
+            --shell /usr/sbin/nologin worklink
+          sudo chgrp -R worklink .
+          chmod -R g+rX .
+          chmod g+s .
+          # The worker must be able to traverse down to the checkout.
+          sudo chmod o+x "$HOME" "$(dirname "$PWD")" "$(dirname "$(dirname "$PWD")")"
+          sudo -u worklink test -r pyproject.toml \
+            || { echo "::error::worker uid cannot read the checkout"; exit 1; }
+          sudo -u worklink test -w pyproject.toml \
+            && { echo "::error::worker uid can WRITE the checkout; that is not the production shape"; exit 1; }
+          sudo -u worklink test -x .venv/bin/python \
+            || { echo "::error::worker uid cannot execute the venv interpreter"; exit 1; }
+          echo "worker uid can read and not write the checkout"
+
+      - name: Run mimir test suite as the non-owning worker uid
+        # `.venv/bin/python -m pytest`, not `uv run`: uv derives its cache from HOME,
+        # and this HOME is deliberately unwritable -- the gate invokes pytest directly
+        # for the same reason. Bytecode and cache writes are disabled because the tree
+        # is read-only to this uid, so leaving them on would fail during collection
+        # instead of naming a failing test.
+        env:
+          MIMIR_FILE_TOOL_ROOTS: /tmp
+        run: |
+          set -euo pipefail
+          # TERM is unset under `sudo -u`, so terminfo lookups write
+          # "No entry for terminal type" to stderr and trip a test asserting a quiet
+          # stderr. That is an artifact of how this leg invokes pytest, not a
+          # worker-uid defect, so give it a real terminal type.
+          #
+          # The two deselected tests run `docker buildx`, which needs a writable HOME
+          # and dies with "mkdir /nonexistent: permission denied" before reaching any
+          # assertion. HOME=/nonexistent is the production shape this leg exists to
+          # reproduce, so they cannot run here; worklink-image-identity already covers
+          # the image build.
+          sudo -u worklink env \
+            HOME=/nonexistent \
+            TERM=xterm \
+            PATH="$PATH" \
+            PYTHONDONTWRITEBYTECODE=1 \
+            MIMIR_FILE_TOOL_ROOTS="$MIMIR_FILE_TOOL_ROOTS" \
+            MIMIR_CLAUDE_OAUTH_CREDENTIALS="$HOME/.claude/.credentials.json" \
+            .venv/bin/python -m pytest -q --tb=short -p no:cacheprovider \
+              --deselect tests/test_root_dockerfile.py::test_build_without_provenance_args_fails_with_named_error \
+              --deselect tests/test_root_dockerfile.py::test_built_image_provides_process_tools
+
   pytest-macos:
     # Keep this separate from the required pytest matrix so its existing
     # ``pytest (3.11)`` and ``pytest (3.12)`` check names remain unchanged.
