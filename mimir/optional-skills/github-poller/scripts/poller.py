@@ -83,11 +83,10 @@ def _ensure_mimir_import_path() -> None:
 
     Optional poller commands run as subprocesses from the installed skill dir, so
     ``sys.path[0]`` is the skill directory rather than the mimir source checkout.
-    Prefer an explicit ``MIMIR_SOURCE_DIR`` supplied by the runtime; fall back to
-    the common editable-source layout where the interpreter lives in
-    ``<source>/.venv/bin``; finally accept mimirbot's container source path.
-    Pip-installed deployments do not need this repair because ``mimir`` is already
-    in site-packages.
+    Prefer an explicit ``MIMIR_SOURCE_DIR`` supplied by the runtime, then fall
+    back to the common editable-source layout where the interpreter lives in
+    ``<source>/.venv/bin``. Package installs do not need this repair because
+    ``mimir`` is already in site-packages.
 
     This duplicates ``chainlink-orchestrator/scripts/poller.py``'s copy deliberately: the
     repair has to run *before* ``mimir`` is importable, so it cannot itself live in
@@ -97,7 +96,9 @@ def _ensure_mimir_import_path() -> None:
     than by comparing the two copies textually.
     """
 
-    exe = Path(sys.executable).resolve()
+    # Keep the lexical venv path: bin/python is commonly a symlink to the base
+    # interpreter, and resolving it would erase the venv identity.
+    exe = Path(sys.executable)
     venv_root = exe.parent.parent
     # When running directly from a source checkout, keep the script and imported
     # package on that same revision even if MIMIR_SOURCE_DIR points at another
@@ -108,10 +109,6 @@ def _ensure_mimir_import_path() -> None:
         candidates.append(Path(source_dir))
     if venv_root.name in {".venv", "venv"}:
         candidates.append(venv_root.parent)
-    # Mimirbot-specific editable-source fallback: the deployed optional skill is
-    # under /mimir-home/skills, while the source checkout is mounted here.
-    candidates.append(Path("/workspace/mimir"))
-
     for candidate in candidates:
         if (candidate / "mimir" / "__init__.py").is_file():
             # Source checkout first, so ``import mimir`` resolves to the checked-out

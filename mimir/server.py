@@ -1541,22 +1541,21 @@ def build_app(config: Config) -> web.Application:
                     error=str(exc)[:500],
                 )
 
-        # Install pre-push staleness-gate hook to source repo.
+        # Install the pre-push staleness-gate hook to the repo branches are
+        # pushed from. This is deliberately distinct from MIMIR_SOURCE_DIR,
+        # which identifies an editable checkout containing the running code.
         # Independent of git_tracking_enabled — protects pushes from
         # any heartbeat, not just state commits. Non-fatal if missing.
         # See: chainlink #249, mimir/skills/github/SKILL.md §"Pre-push staleness gate"
-        # Source-repo path for the pre-push staleness gate. Configurable via
-        # MIMIR_SOURCE_REPO; defaults to the container checkout for back-compat.
-        # Gated on is_dir() so PyPI / non-Docker installs (no source checkout)
-        # silently skip it instead of erroring. Resolved BEFORE the try so the
-        # non-fatal except handler can always reference it (an import failure
-        # must not turn this into an UnboundLocalError that fails startup).
-        _src = os.environ.get("MIMIR_SOURCE_REPO", "/workspace/mimir")
+        # Gated on is_dir() so deployments without a configured push workspace
+        # silently skip it. Resolved BEFORE the try so the non-fatal except
+        # handler can always reference it.
+        _src = os.environ.get("MIMIR_SOURCE_REPO", "").strip()
         try:
             from pathlib import Path as _Path
             from .git_bootstrap import ensure_workspace_hooks as _ensure_ws_hooks
             _source_repo = _Path(_src)
-            if _source_repo.is_dir():
+            if _src and _source_repo.is_dir():
                 await asyncio.to_thread(_ensure_ws_hooks, _source_repo)
         except Exception as exc:  # noqa: BLE001
             log.warning("pre-push hook install failed for %s: %s", _src, exc)

@@ -211,7 +211,8 @@ All channel-list flags take a comma-separated prefix allow-list (e.g.
 | `MIMIR_AGENT_ID` | str | `mimir` | Logical agent name tagged on every turn/event (multi-agent disambiguation). |
 | `MIMIR_GIT_TRACKING_ENABLED` | bool | `true` | Post-turn git commit + debounced push of the home. Disable for CI/transient containers. |
 | `MIMIR_STATE_REPO` | str | unset | Remote repo URL for home git bootstrap. Paired with `GITHUB_TOKEN`. |
-| `MIMIR_SOURCE_REPO` | path | `/workspace/mimir` | Source checkout for the pre-push staleness gate; skipped if not a dir. |
+| `MIMIR_SOURCE_REPO` | path | unset | Repository branches are pushed from, where the pre-push staleness hook is installed. Distinct from `MIMIR_SOURCE_DIR`; skipped if not a dir. |
+| `MIMIR_REACT_APP_DIST` | path | packaged `mimir/react_app/dist` | Live Vite build output to serve instead of the frontend packaged beside `web_ui.py`. |
 | `MIMIR_PYPI_PACKAGE_NAME` | str | `mimir-agent` | Distribution name for update-on-start + daily version check (forks/pre-release). |
 | `MIMIR_DEFAULTS_UPGRADE_AUTO_SUBMIT_CLEAN` | bool | `false` | Auto-submit a conflict-free defaults-upgrade proposal PR immediately. |
 | `MIMIR_PROMPTS_DIR` | path | unset | Operator prompt-override directory. |

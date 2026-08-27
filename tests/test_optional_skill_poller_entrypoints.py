@@ -35,6 +35,7 @@ the source-checkout shortcut, so the deployment locators are the only way throug
 from __future__ import annotations
 
 import json
+import os
 import shlex
 import shutil
 import subprocess
@@ -45,6 +46,10 @@ import pytest
 
 _ROOT = Path(__file__).resolve().parent.parent
 _SKILL_ROOT = _ROOT / "mimir" / "optional-skills"
+_IMPORT_REPAIR_POLLERS = (
+    _SKILL_ROOT / "chainlink-orchestrator" / "scripts" / "poller.py",
+    _SKILL_ROOT / "github-poller" / "scripts" / "poller.py",
+)
 
 
 def _entrypoints() -> list[tuple[Path, Path]]:
@@ -109,6 +114,39 @@ def _manifest_pass_env(skill: Path) -> set[str]:
     return names
 
 
+@pytest.mark.parametrize("poller", _IMPORT_REPAIR_POLLERS, ids=lambda path: path.parents[1].name)
+def test_import_repair_detects_symlinked_editable_venv(
+    poller: Path, tmp_path: Path,
+) -> None:
+    """The lexical venv executable must survive a symlink to the base Python."""
+    source = tmp_path / "non-default-source"
+    (source / "mimir").mkdir(parents=True)
+    (source / "mimir" / "__init__.py").write_text("", encoding="utf-8")
+    executable = source / ".venv" / "bin" / "python"
+    executable.parent.mkdir(parents=True)
+    executable.symlink_to(sys.executable)
+
+    prelude = poller.read_text(encoding="utf-8").split(
+        "\n_ensure_mimir_import_path()\n", 1,
+    )[0]
+    script = (
+        prelude
+        + f"\nsys.executable = {str(executable)!r}\n"
+        + "_ensure_mimir_import_path()\nprint(sys.path[0])\n"
+    )
+    proc = subprocess.run(
+        [sys.executable, "-S", "-c", script],
+        cwd=tmp_path,
+        env={"PATH": os.environ.get("PATH", "")},
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout.strip() == str(source)
+
+
 @pytest.mark.parametrize(
     ("skill", "entrypoint"),
     _ENTRYPOINTS,
@@ -134,9 +172,9 @@ def test_installed_poller_entrypoint_can_resolve_mimir(
         "resolve and this test would go back to proving nothing"
     )
 
-    # Only manifest-declared env, exactly as the runner passes it. MIMIR_SOURCE_DIR
-    # reaches the subprocess only if the skill's own pollers.json declares it — which
-    # is the portability half of this check.
+    # Only manifest-declared env, exactly as the runner passes it. Editable
+    # deployments need MIMIR_SOURCE_DIR to reach an installed skill launched by a
+    # different interpreter; package deployments already import from site-packages.
     env = {
         "PATH": "/usr/bin:/bin",
         "HOME": str(tmp_path),
@@ -161,6 +199,6 @@ def test_installed_poller_entrypoint_can_resolve_mimir(
         f"{skill.name}: an INSTALLED copy cannot resolve `mimir` using only the env "
         f"its own pollers.json declares. A poller importing mimir at module scope "
         f"needs _ensure_mimir_import_path(), AND its manifest must pass "
-        f"MIMIR_SOURCE_DIR so the helper can locate the checkout outside the "
-        f"mimirbot-specific /workspace/mimir layout.\n{proc.stderr[-900:]}"
+        f"MIMIR_SOURCE_DIR so the helper can locate an editable checkout.\n"
+        f"{proc.stderr[-900:]}"
     )
