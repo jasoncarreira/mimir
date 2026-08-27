@@ -6782,3 +6782,53 @@ def test_authorized_runner_closes_real_attempt_capabilities(
         assert ["chainlink", "issue", "label", "1410", "worklink:review"] in calls
         assert ["chainlink", "issue", "label", "1410", "worklink:failed"] not in calls
         assert ["chainlink", "issue", "label", "1410", "worklink:ready"] not in calls
+
+
+def test_executor_report_dir_is_writable_by_the_worker_group(monkeypatch, tmp_path) -> None:
+    """The executor runs as the worker uid, so its report directory must reach it.
+
+    ``mkdtemp`` creates 0700 owned by the controller. That path is injected into the
+    executor's ``PYTEST_ADDOPTS`` as ``--junitxml``, so every pytest the executor ran
+    raised ``PermissionError`` from ``pytest_sessionfinish`` AFTER a green suite and
+    the build blocked reporting nothing useful (chainlink #1481).
+    """
+    from mimir.worklink import orchestrator as orch
+    from mimir.worklink.identities import WorklinkIdentities
+
+    # A gid this process is actually a member of, so the chown is permitted here for
+    # the same reason it is permitted in production: the owner may set the group to
+    # one it belongs to.
+    own_gid = os.getgid()
+    monkeypatch.setattr(
+        orch,
+        "get_identities",
+        lambda: WorklinkIdentities(mimir_uid=os.getuid(), worklink_uid=os.getuid() + 1, worklink_gid=own_gid),
+    )
+    monkeypatch.setattr(orch.tempfile, "mkdtemp", lambda **kw: str(tmp_path / "executor-report"))
+    (tmp_path / "executor-report").mkdir()
+
+    path = orch._make_executor_report_dir(1481, 1)
+    mode = path.stat().st_mode & 0o777
+
+    assert mode & 0o070 == 0o070, f"worker group cannot use the report dir (mode {mode:o})"
+    assert path.stat().st_gid == own_gid
+    # Narrow, not widened: no world access.
+    assert mode & 0o007 == 0
+
+
+def test_executor_report_dir_survives_a_deployment_without_the_worklink_account(
+    monkeypatch, tmp_path
+) -> None:
+    """No worker account means no worker uid to accommodate — still return a directory."""
+    from mimir.worklink import orchestrator as orch
+
+    def _absent() -> None:
+        raise RuntimeError("required account 'worklink' is missing")
+
+    monkeypatch.setattr(orch, "get_identities", _absent)
+    monkeypatch.setattr(orch.tempfile, "mkdtemp", lambda **kw: str(tmp_path / "solo-report"))
+    (tmp_path / "solo-report").mkdir()
+
+    path = orch._make_executor_report_dir(1481, 2)
+
+    assert path.is_dir()

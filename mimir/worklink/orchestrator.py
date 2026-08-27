@@ -3242,7 +3242,44 @@ def _template_path(home: Path) -> Path:
 
 
 def _make_executor_report_dir(issue: int, attempt: int) -> Path:
-    return Path(tempfile.mkdtemp(prefix=f"worklink-{issue}-{attempt}-executor-"))
+    """Create the executor's pytest report directory, writable by the worker uid.
+
+    The path this returns is injected into the executor's ``PYTEST_ADDOPTS`` as
+    ``--junitxml`` and ``cache_dir``. The executor runs as the WORKER uid, while
+    ``mkdtemp`` creates 0700 owned by the CONTROLLER -- so every pytest the executor
+    ran raised ``PermissionError`` from ``pytest_sessionfinish`` AFTER the suite had
+    already passed, and the build blocked on a green run:
+
+        PermissionError: [Errno 13] Permission denied:
+            '/tmp/worklink-1475-3-executor-4m8dxhzg/junit.xml'
+
+    Hand the directory to the worker group at 0770 rather than widening it to 0777:
+    the controller still owns it, and only the worklink group gains access. The
+    controller keeps full access either way, so this is applied unconditionally
+    rather than inferred from a capability flag that may not have propagated to
+    this process.
+
+    A deployment without the worklink account keeps the 0700 directory: there is no
+    worker uid to accommodate, so the executor runs as the controller and can write.
+    """
+    path = Path(tempfile.mkdtemp(prefix=f"worklink-{issue}-{attempt}-executor-"))
+    try:
+        worklink_gid = get_identities().worklink_gid
+    except RuntimeError:
+        return path
+    try:
+        # Permitted for the owner because ``mimir`` is a member of ``worklink``.
+        os.chown(path, -1, worklink_gid)
+        os.chmod(path, 0o770)
+    except OSError as exc:  # noqa: BLE001 - fall back to the controller-only directory
+        _log_event(
+            "worklink_executor_report_dir_not_shared",
+            issue_id=issue,
+            attempt=attempt,
+            path=str(path),
+            error=str(exc),
+        )
+    return path
 
 
 def _format_work_order(order: WorkOrder, *, backend: str) -> str:
