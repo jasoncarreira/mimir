@@ -77,6 +77,7 @@ from __future__ import annotations
 import asyncio
 import dataclasses
 import hashlib
+import inspect
 import json
 import logging
 import os
@@ -618,7 +619,7 @@ def _github_framework_trigger_is_trusted(
 def _github_recovery_relevance_check(
     token: str,
 ) -> poller_recovery.RelevanceFn:
-    """Build a per-reconcile, per-PR-cached actionability predicate.
+    """Build a per-poll-cycle, per-PR-cached actionability predicate.
 
     A mixed batch is stale only when every item is an authoritatively closed PR.
     Non-PR items and API uncertainty keep the batch actionable (fail open).
@@ -693,6 +694,31 @@ def _github_recovery_relevance_check(
         return False
 
     return check
+
+
+async def _enqueue_with_relevance(
+    enqueue: Callable[..., Awaitable[bool]],
+    event: AgentEvent,
+    relevance_check: poller_recovery.RelevanceFn | None,
+) -> bool:
+    """Forward delivery metadata when the enqueue boundary supports it."""
+    if relevance_check is None:
+        return await enqueue(event)
+    try:
+        parameters = inspect.signature(enqueue).parameters.values()
+    except (TypeError, ValueError):
+        return await enqueue(event)
+    supports_relevance = any(
+        parameter.kind == inspect.Parameter.VAR_KEYWORD
+        or (
+            parameter.name == "relevance_check"
+            and parameter.kind != inspect.Parameter.POSITIONAL_ONLY
+        )
+        for parameter in parameters
+    )
+    if not supports_relevance:
+        return await enqueue(event)
+    return await enqueue(event, relevance_check=relevance_check)
 
 
 # Pollers manifest schema version history:
@@ -2110,6 +2136,18 @@ async def run_poller(
     # --- End circuit-breaker guard ----------------------------------------
 
     persist_dir = poller.resolved_persist_dir()
+    relevance_check = (
+        _github_recovery_relevance_check(
+            poller.env.get("GITHUB_TOKEN", "")
+            or os.environ.get("GITHUB_TOKEN", "")
+        )
+        if poller.name == "github-activity"
+        else None
+    )
+
+    async def enqueue_for_delivery(event: AgentEvent) -> bool:
+        return await _enqueue_with_relevance(enqueue, event, relevance_check)
+
     # Lazy-create the persist dir on first use. Skill authors who
     # write a cursor file to STATE_DIR can rely on the dir existing.
     try:
@@ -2142,18 +2180,11 @@ async def run_poller(
                 channel_id=poller.channel_id(),
                 persist_dir=persist_dir,
                 events_path=_events_path,
-                enqueue=enqueue,
+                enqueue=enqueue_for_delivery,
                 service_principal=authority.canonical,
                 service_authority=authority,
                 recover_failed_turns=poller.recover_failed_turns,
-                relevance_check=(
-                    _github_recovery_relevance_check(
-                        poller.env.get("GITHUB_TOKEN", "")
-                        or os.environ.get("GITHUB_TOKEN", "")
-                    )
-                    if poller.name == "github-activity"
-                    else None
-                ),
+                relevance_check=relevance_check,
             )
             if _rec["state_unreadable"]:
                 await log_event(
@@ -2869,7 +2900,7 @@ async def run_poller(
         )
         enqueued_at = datetime.now(tz=timezone.utc).isoformat()
         try:
-            accepted = await enqueue(event)
+            accepted = await enqueue_for_delivery(event)
         except Exception as exc:  # noqa: BLE001
             await log_event(
                 "poller_enqueue_error",

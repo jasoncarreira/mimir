@@ -73,6 +73,7 @@ from .pollers import (
     PollerConfig,
     discover_pollers,
     forget_circuit_breakers_except,
+    _enqueue_with_relevance,
     run_poller,
 )
 from .poller_budget import aggregate_poller_turn_usage
@@ -2451,7 +2452,11 @@ class Scheduler:
             accepted_this_fire = 0
             headroom_logged = False
 
-            async def enqueue_with_turn_budget(event: AgentEvent) -> bool:
+            async def enqueue_with_turn_budget(
+                event: AgentEvent,
+                *,
+                relevance_check=None,
+            ) -> bool:
                 nonlocal accepted_this_fire, headroom_logged
                 if turn_headroom is not None and accepted_this_fire >= turn_headroom:
                     if not headroom_logged:
@@ -2466,7 +2471,9 @@ class Scheduler:
                             reason="poller_budget_exceeded:agent_turns:per_fire_headroom",
                         )
                     return False
-                accepted = await self._enqueue(event)
+                accepted = await _enqueue_with_relevance(
+                    self._enqueue, event, relevance_check,
+                )
                 if accepted:
                     accepted_this_fire += 1
                 return accepted
