@@ -643,6 +643,7 @@ _SHELL_PROFILE_BY_AUTHORITY_PROFILE = {
     "heartbeat": "maintenance",
     "session-boundary": "session_boundary",
 }
+OPERATOR_SHELL_PROFILE = "scheduler_read_only"
 _FETCH_URL_POLICY_BY_AUTHORITY_PROFILE = {
     "heartbeat": ("approved_urls", "MIMIR_HEARTBEAT_APPROVED_URLS"),
     "github": ("github_pr_api", "GITHUB_REPOS"),
@@ -4257,6 +4258,7 @@ def parse_service_shell_argv_with_diagnostics(
     service: "ServicePrincipal | None" = None,
     auth_context: "AuthContext | None" = None,
     read_cwd: str | Path | None = None,
+    allow_project_test: bool = True,
 ) -> tuple[list[str] | None, str, ServiceShellBindingRule | None]:
     """Return the admitted argv, refusal reason, and stable rejecting rule.
 
@@ -4310,15 +4312,16 @@ def parse_service_shell_argv_with_diagnostics(
     if argv[0] == "/usr/local/bin/chainlink":
         argv[0] = "chainlink"
 
-    test_argv, test_reason, test_matched = _project_test_execution_argv(argv)
-    if test_matched:
-        if test_argv is None:
-            return (
-                None,
-                f"configured project test refused: {test_reason}",
-                ServiceShellBindingRule.PROJECT_TEST_POLICY,
-            )
-        return test_argv, "", None
+    if allow_project_test:
+        test_argv, test_reason, test_matched = _project_test_execution_argv(argv)
+        if test_matched:
+            if test_argv is None:
+                return (
+                    None,
+                    f"configured project test refused: {test_reason}",
+                    ServiceShellBindingRule.PROJECT_TEST_POLICY,
+                )
+            return test_argv, "", None
 
     # Consulted BEFORE the profile dispatch, not after it. Several branches
     # (repo_review, and the per-profile ``git`` handlers) return on mismatch, so
@@ -4440,11 +4443,13 @@ def parse_service_shell_argv_with_reason(
     service: "ServicePrincipal | None" = None,
     auth_context: "AuthContext | None" = None,
     read_cwd: str | Path | None = None,
+    allow_project_test: bool = True,
 ) -> tuple[list[str] | None, str]:
     """Compatibility view returning only the admitted argv and refusal prose."""
     argv, reason, _rule = parse_service_shell_argv_with_diagnostics(
         target, destination, review_state=review_state, declared=declared,
         service=service, auth_context=auth_context, read_cwd=read_cwd,
+        allow_project_test=allow_project_test,
     )
     return argv, reason
 
@@ -4455,11 +4460,13 @@ def parse_service_shell_argv(
     service: "ServicePrincipal | None" = None,
     auth_context: "AuthContext | None" = None,
     read_cwd: str | Path | None = None,
+    allow_project_test: bool = True,
 ) -> list[str] | None:
     """Argv-only view of :func:`parse_service_shell_argv_with_reason`."""
     return parse_service_shell_argv_with_reason(
         target, destination, review_state=review_state, declared=declared,
         service=service, auth_context=auth_context, read_cwd=read_cwd,
+        allow_project_test=allow_project_test,
     )[0]
 
 

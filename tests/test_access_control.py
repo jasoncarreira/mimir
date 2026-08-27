@@ -8854,6 +8854,181 @@ def test_project_test_command_is_configuration_driven_across_profiles(
     assert access_control.configured_project_test_cwd(argv) == str(repo.resolve())
 
 
+@pytest.mark.parametrize(
+    ("command", "expected_rule"),
+    [
+        ("echo safe; echo unsafe", ServiceShellBindingRule.SHELL_CONTROL_CHARACTERS),
+        ("echo 'unbalanced", ServiceShellBindingRule.ARGV_UNBALANCED_QUOTING),
+        ("", ServiceShellBindingRule.ARGV_EMPTY),
+        ("ls ~/notes", ServiceShellBindingRule.SHELL_HOME_EXPANSION),
+        ("curl https://example.invalid", ServiceShellBindingRule.PROFILE_ALLOWLIST),
+    ],
+    ids=["shell-control", "quoting", "empty", "home-expansion", "profile-miss"],
+)
+def test_operator_arm2_preprofile_branch_matrix(
+    command: str,
+    expected_rule: ServiceShellBindingRule,
+) -> None:
+    argv, reason, rule = access_control.parse_service_shell_argv_with_diagnostics(
+        command,
+        access_control.OPERATOR_SHELL_PROFILE,
+        allow_project_test=False,
+    )
+
+    assert argv is None
+    assert reason
+    assert rule is expected_rule
+
+
+def test_operator_arm2_preprofile_chainlink_normalization(
+    maintenance_pinned_executables: dict[str, Path],
+) -> None:
+    argv, reason, rule = access_control.parse_service_shell_argv_with_diagnostics(
+        "/usr/local/bin/chainlink issue show 1337 --json",
+        access_control.OPERATOR_SHELL_PROFILE,
+        allow_project_test=False,
+    )
+
+    assert argv == [
+        str(maintenance_pinned_executables["chainlink"]),
+        "issue", "show", "1337", "--json",
+    ]
+    assert reason == ""
+    assert rule is None
+
+
+def test_operator_arm2_excludes_configured_project_tests_without_changing_service_profiles(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    maintenance_pinned_executables: dict[str, Path],
+) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    executable = maintenance_pinned_executables["uv"]
+    _configure_project_test(
+        monkeypatch,
+        executable=executable,
+        repo=repo,
+        fixed_arguments=["run", "pytest", "-q"],
+    )
+    command = shlex.join([str(executable), "run", "pytest", "-q", "tests/test_auth.py"])
+
+    service_argv, service_reason, service_rule = (
+        access_control.parse_service_shell_argv_with_diagnostics(
+            command, access_control.OPERATOR_SHELL_PROFILE,
+        )
+    )
+    operator_argv, operator_reason, operator_rule = (
+        access_control.parse_service_shell_argv_with_diagnostics(
+            command,
+            access_control.OPERATOR_SHELL_PROFILE,
+            allow_project_test=False,
+        )
+    )
+
+    assert service_argv == [
+        str(executable), "run", "pytest", "-q", "tests/test_auth.py",
+    ]
+    assert service_reason == ""
+    assert service_rule is None
+    assert operator_argv is None
+    assert operator_reason
+    assert operator_rule is ServiceShellBindingRule.PROFILE_ALLOWLIST
+    assert parse_service_shell_argv_with_reason(
+        command,
+        access_control.OPERATOR_SHELL_PROFILE,
+        allow_project_test=False,
+    )[0] is None
+    assert parse_service_shell_argv(
+        command,
+        access_control.OPERATOR_SHELL_PROFILE,
+        allow_project_test=False,
+    ) is None
+
+
+def test_operator_arm2_never_uses_service_declared_commands(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    seen: list[tuple[access_control.DeclaredShellCommand, ...]] = []
+
+    def capture_declared(
+        _argv: list[str],
+        declared: tuple[access_control.DeclaredShellCommand, ...],
+    ) -> None:
+        seen.append(declared)
+        return None
+
+    monkeypatch.setattr(
+        access_control, "_declared_command_execution_argv", capture_declared,
+    )
+
+    argv, _reason, rule = access_control.parse_service_shell_argv_with_diagnostics(
+        "gog gmail search newer_than:24h",
+        access_control.OPERATOR_SHELL_PROFILE,
+        allow_project_test=False,
+    )
+
+    assert seen == [()]
+    assert argv is None
+    assert rule is ServiceShellBindingRule.PROFILE_ALLOWLIST
+
+
+def test_operator_arm2_reader_policy_does_not_require_or_create_service_authority(
+    monkeypatch: pytest.MonkeyPatch,
+    maintenance_pinned_executables: dict[str, Path],
+) -> None:
+    monkeypatch.setattr(
+        access_control,
+        "_service_shell_read_operand_refusal",
+        lambda *_args, **_kwargs: pytest.fail("operator parser used service read policy"),
+    )
+
+    argv = parse_service_shell_argv(
+        "ls -la",
+        access_control.OPERATOR_SHELL_PROFILE,
+        allow_project_test=False,
+    )
+
+    assert argv == [str(maintenance_pinned_executables["ls"]), "-la"]
+
+
+@pytest.mark.parametrize(
+    ("command", "command_key"),
+    [
+        ("chainlink issue show 1337 --json", "chainlink"),
+        ("pwd -P", "pwd"),
+        ("ls -la", "ls"),
+        ("wc -l sample.txt", "wc"),
+        ("grep -n needle sample.txt", "grep"),
+        ("jq -r .name sample.json", "jq"),
+        ("rg --no-config -n needle .", "rg"),
+        ("git status --short", "git"),
+        ("git diff --no-ext-diff --no-textconv --stat", "git"),
+        ("git log --no-ext-diff --no-textconv --oneline", "git"),
+        ("git show --no-ext-diff --no-textconv --stat HEAD", "git"),
+    ],
+    ids=[
+        "chainlink", "pwd", "ls", "wc", "grep", "jq", "rg",
+        "git-status", "git-diff", "git-log", "git-show",
+    ],
+)
+def test_operator_arm2_scheduler_family_matrix(
+    command: str,
+    command_key: str,
+    maintenance_pinned_executables: dict[str, Path],
+) -> None:
+    argv, reason, rule = access_control.parse_service_shell_argv_with_diagnostics(
+        command,
+        access_control.OPERATOR_SHELL_PROFILE,
+        allow_project_test=False,
+    )
+
+    assert argv is not None, reason
+    assert argv[0] == str(maintenance_pinned_executables[command_key])
+    assert reason == ""
+    assert rule is None
+
+
 def test_no_project_test_configuration_preserves_existing_refusal(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
