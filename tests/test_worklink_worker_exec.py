@@ -555,17 +555,24 @@ def test_uv_execution_copy_normalizes_for_runner_without_relaxing_source(
     executable.chmod(0o700)
     external.chmod(0o600)
 
-    runner_uid = os.getuid() + 1
+    # The execution copy is owned by the RUNNER, so the runner is this process --
+    # an unprivileged test cannot chown to any other uid. The CONTROLLER is the
+    # foreign identity here, which is the inverse of the pre-ownership-change model.
+    runner_uid = os.getuid()
     runner_gid = os.getgid()
+    controller_uid = os.getuid() + 1
+    # An identity that shares only the group, used to prove normalization still
+    # widens group access rather than relying on ownership alone.
+    group_only_uid = os.getuid() + 1
     source_before = {
         path.relative_to(source): stat.S_IMODE(path.stat(follow_symlinks=False).st_mode)
         for path in (source, *source.rglob("*"))
     }
-    # This is the measured pre-fix copy: copytree preserves the 0700 boundary mode,
-    # so an identity represented only by its group cannot traverse it.
+    # This is the measured pre-normalization copy: copytree preserves the 0700
+    # boundary mode, so an identity represented only by its group cannot traverse it.
     unnormalized = tmp_path / "unnormalized"
     shutil.copytree(source, unnormalized, symlinks=True)
-    assert not _identity_can_access(unnormalized, runner_uid, runner_gid, 0o5)
+    assert not _identity_can_access(unnormalized, group_only_uid, runner_gid, 0o5)
 
     home = tmp_path / "home"
     home.mkdir()
@@ -573,7 +580,7 @@ def test_uv_execution_copy_normalizes_for_runner_without_relaxing_source(
         worker_exec,
         "get_identities",
         lambda: SimpleNamespace(
-            mimir_uid=os.getuid(), worklink_uid=runner_uid, worklink_gid=runner_gid
+            mimir_uid=controller_uid, worklink_uid=runner_uid, worklink_gid=runner_gid
         ),
     )
     source_fd = os.open(source, os.O_RDONLY | os.O_DIRECTORY)
@@ -587,9 +594,15 @@ def test_uv_execution_copy_normalizes_for_runner_without_relaxing_source(
     copied_readable = project / "nested" / "readable.txt"
     copied_executable = project / "run"
     copied_link = project / "link"
+    # The runner OWNS the copy: that is what lets a repository's own provisioning
+    # chmod a tracked file, which group-write alone can never confer.
+    assert project.stat().st_uid == runner_uid
     assert _identity_can_access(project, runner_uid, runner_gid, 0o5)
     assert _identity_can_access(project / "nested", runner_uid, runner_gid, 0o5)
     assert _identity_can_access(copied_readable, runner_uid, runner_gid, 0o4)
+    # Normalization still widens group access, not just owner access.
+    assert _identity_can_access(project, group_only_uid, runner_gid, 0o5)
+    assert _identity_can_access(copied_readable, group_only_uid, runner_gid, 0o4)
     assert copied_readable.read_text(encoding="utf-8") == "runner input"
     assert stat.S_IMODE(copied_readable.stat().st_mode) == 0o660
     assert stat.S_IMODE(copied_executable.stat().st_mode) == 0o770
@@ -606,7 +619,7 @@ def test_uv_execution_copy_normalizes_for_runner_without_relaxing_source(
         for path in (source, *source.rglob("*"))
     } == source_before
     assert stat.S_IMODE(source.stat().st_mode) == 0o700
-    assert not _identity_can_access(source, runner_uid, runner_gid, 0o5)
+    assert not _identity_can_access(source, group_only_uid, runner_gid, 0o5)
 
     worker_exec._cleanup_home(home)
     assert not home.exists()
