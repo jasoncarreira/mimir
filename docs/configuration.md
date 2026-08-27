@@ -316,7 +316,7 @@ repository files and model-generated values never add permission entries.
 | `MIMIR_SCRATCH_JANITOR_ROOTS` | list | `scratch` | Comma-separated home-relative roots to sweep (nested paths allowed, e.g. `state/worklink/transcripts`); absolute or `..` entries are rejected. |
 | `MIMIR_CHAINLINK_AUTOINIT` | bool | `1` (on) | Auto-run `chainlink init` on boot if `.chainlink` absent and the CLI is present. |
 | `MIMIR_FACTORY_EPICS_ENABLED` | bool | off | Feature-factory epic dispatch in the chainlink-orchestrator poller (`worklink:epic`). |
-| `MIMIR_FACTORY_ENTRYPOINT` | absolute path | `/opt/mimir-opencode/lib/node_modules/feature-factory/bin/factory.js` | Package-bound feature-factory 0.7.2 launcher. Worklink rejects relative, missing, unpinned, or adapter-version-mismatched entrypoints. |
+| `MIMIR_FACTORY_ENTRYPOINT` | absolute path | `/opt/mimir-opencode/lib/node_modules/feature-factory/bin/factory.js` | Package-bound feature-factory 0.7.3 launcher. Worklink rejects relative, missing, unpinned, or adapter-version-mismatched entrypoints. |
 | `MIMIR_FACTORY_MAX_CONCURRENT` | positive int | `1` | Factory-only concurrent Chainlink claim cap. The ordinary leaf cap remains `defaults.max_concurrent` with default `2`. |
 | `MIMIR_FACTORY_MAX_RETRIES` | ASCII decimal integer | `5` | Factory `/feature` retry budget. Accepts exactly ASCII `[0-9]+` valued from `1` through `9007199254740991`; absent or invalid values fall back to `5`. |
 | `MIMIR_FACTORY_RUN_TIMEOUT_S` | float | `43200` (12h) | OpenCode process liveness backstop. Expiry cancels only the verified process group. |
@@ -329,7 +329,7 @@ repository files and model-generated values never add permission entries.
 The factory launch ends with `--command feature " --autonomous --max-retries 5
 <issue>"`. `MIMIR_FACTORY_MAX_RETRIES` defaults to `5`, accepts exactly ASCII
 `[0-9]+` in range `1..9007199254740991`, and falls back to `5` for absent or
-invalid values. feature-factory 0.7.2 stages the workflow inside the run
+invalid values. feature-factory 0.7.3 stages the workflow inside the run
 directory; exact token `--auto` is never passed. Worklink's base selects the
 checkout start point and PR target; it is not factory `--base`, which is never
 passed.
@@ -432,14 +432,14 @@ whether it came from `repository` or `deployment` configuration.
 | `defaults.max_concurrent` | positive int | `2` | Caps claims across autonomous poller/tool dispatch; the operator CLI is uncapped. | `max_concurrent: 4` |
 | `defaults.reaper_ttl_s` | positive int | `86400` | Age in seconds after which the reaper may recover a claim or retained checkout with no heartbeat. Set existing configs to at least twice the greater of `timeout_s` and `MIMIR_FACTORY_RUN_TIMEOUT_S` (normally `86400`); lower legacy values warn and are raised to that floor at load. | `reaper_ttl_s: 86400` |
 | `defaults.allow_autonomous_local_subprocess` | bool | `false` | Allows autonomous use of `local_subprocess`, which has shared filesystem access and no network isolation. This accepts that blast radius; the operator CLI is unaffected. | `allow_autonomous_local_subprocess: true` |
-| `defaults.epic_branch_prefix` | str | `epic/` | Compatibility-only field retained after integrated epic execution was removed; no 0.7.2 runtime consumes it. | `epic_branch_prefix: "epic/"` |
-| `defaults.max_review_retries` | positive int | `3` | Compatibility-only parsed field; no 0.7.2 runtime consumes it. | `max_review_retries: 3` |
-| `defaults.max_claim_attempts` | positive int | `3` | Compatibility-only parsed field; no 0.7.2 runtime consumes it. | `max_claim_attempts: 5` |
-| `defaults.reviewer_backend` | backend name | value of `defaults.backend` | Compatibility-only parsed field from integrated epic review; no 0.7.2 runtime consumes it. | `reviewer_backend: opencode` |
+| `defaults.epic_branch_prefix` | str | `epic/` | Compatibility-only field retained after integrated epic execution was removed; no 0.7.3 runtime consumes it. | `epic_branch_prefix: "epic/"` |
+| `defaults.max_review_retries` | positive int | `3` | Compatibility-only parsed field; no 0.7.3 runtime consumes it. | `max_review_retries: 3` |
+| `defaults.max_claim_attempts` | positive int | `3` | Compatibility-only parsed field; no 0.7.3 runtime consumes it. | `max_claim_attempts: 5` |
+| `defaults.reviewer_backend` | backend name | value of `defaults.backend` | Compatibility-only parsed field from integrated epic review; no 0.7.3 runtime consumes it. | `reviewer_backend: opencode` |
 | `defaults.tiered_review` | mapping | framework defaults | Compatibility-only parsed review classifier; its child keys are described below. | `tiered_review: {multi_vote_reviewer_count: 5}` |
 
 `defaults.trusted_test_retries` is **retired**, not an operator setting in
-0.7.2. It belonged to the removed distributed trusted-test runner. A value in
+0.7.3. It belonged to the removed distributed trusted-test runner. A value in
 YAML has no effect and must not be used as a retry guarantee; for example,
 remove `trusted_test_retries: 1` from an older deployment file.
 
@@ -491,7 +491,7 @@ routes:
 ### Backend blocks
 
 `backends` defaults to `{}`. Only `opencode` and `feature_factory` ship in
-0.7.2. An unknown referenced backend fails configuration loading; stale settings
+0.7.3. An unknown referenced backend fails configuration loading; stale settings
 for an unreferenced backend are warned and dropped.
 
 | Key | Type | Default | Effect | Example |
@@ -501,7 +501,7 @@ for an unreferenced backend are warned and dropped.
 | `backends.opencode.bash_allowlist` | list[str] | `["git *", "uv *"]` | Replaces the deny-first shell command grants sent through `OPENCODE_PERMISSION`. Empty denies all shell commands; catch-all `*` is rejected. This is not a process sandbox. | `bash_allowlist: ["git *", "npm test*"]` |
 | `backends.feature_factory.entrypoint` | absolute path | `MIMIR_FACTORY_ENTRYPOINT` or the fixed image path | Exact `feature-factory/bin/factory.js` used by every `node` control command and retained recovery record. | `entrypoint: /opt/mimir-opencode/lib/node_modules/feature-factory/bin/factory.js` |
 
-The retired `backends.feature_factory.bin`, `args`, `ready`, and `reviewer` keys are rejected with migration guidance. The image installs `feature-factory@0.7.2` and `opencode-feature-factory@0.7.2` under one npm prefix and registers only the OpenCode adapter. Runtime controls are `status`, `resume`, `heartbeat`, and run-ID-first `lock` actions; cancellation uses `mimir worklink stop` and never invokes a factory cancel transition.
+The retired `backends.feature_factory.bin`, `args`, `ready`, and `reviewer` keys are rejected with migration guidance. The image installs `feature-factory@0.7.3` and `opencode-feature-factory@0.7.3` under one npm prefix and registers only the OpenCode adapter. Runtime controls are `status`, `resume`, `heartbeat`, and run-ID-first `lock` actions; cancellation uses `mimir worklink stop` and never invokes a factory cancel transition.
 
 `compute_backends` defaults to `{}`. The sole shipping block is
 `compute_backends.local_subprocess` (hyphenated `local-subprocess` is normalized

@@ -74,11 +74,7 @@ class FactoryRunRecord:
         if self.session is not None and (not self.session.strip() or "\x00" in self.session):
             raise FactoryRecordError("factory record session is invalid")
         if self.status is not None:
-            if (
-                self.status.run_id != self.run_id
-                or self.status.issue_key is None
-                or self.status.issue_key != self.run_id
-            ):
+            if self.status.run_id != self.run_id:
                 raise FactoryRecordError("factory record status identity mismatch")
             if self.status.sandbox_path != self.sandbox:
                 raise FactoryRecordError("factory record status sandbox mismatch")

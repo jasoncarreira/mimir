@@ -18,7 +18,7 @@ FACTORY_DOCS = (
 
 
 def test_current_factory_documentation_matches_runtime_version() -> None:
-    assert FACTORY_VERSION == "0.7.2"
+    assert FACTORY_VERSION == "0.7.3"
     for relative_path in FACTORY_DOCS:
         text = (ROOT / relative_path).read_text(encoding="utf-8")
         assert text.count(f"`feature-factory@{FACTORY_VERSION}`") == 1, relative_path
@@ -112,7 +112,7 @@ def test_internal_factory_status_contract_matches_runtime_binding() -> None:
         in worklink
     )
     assert "`validator` and `terminal_result` are object-or-null" in worklink
-    assert "requires a non-null matching issue key" in worklink
+    assert "uses the run ID as identity; the issue key is optional display enrichment" in worklink
     assert "A null PR base is\n  allowed during recovery" in worklink
     assert "a populated base must always match the record" in worklink
     assert (
