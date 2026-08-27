@@ -5,6 +5,7 @@ import asyncio
 import json
 import shlex
 import subprocess
+import sys
 import pytest
 from pathlib import Path
 from typing import Sequence
@@ -245,6 +246,7 @@ async def test_gate_records_counts_from_pytest_generated_junit(tmp_path: Path) -
         tmp_path,
         "def test_one():\n    assert True\n\ndef test_two():\n    assert True\n",
     )
+    test_command = f"{shlex.quote(sys.executable)} -m pytest -q test_gate_sample.py"
 
     result = await observe_evidence(
         issue=1482,
@@ -255,7 +257,7 @@ async def test_gate_records_counts_from_pytest_generated_junit(tmp_path: Path) -
         started_at=datetime.now(UTC),
         base_ref="main",
         backend_status="completed",
-        test_command="pytest -q test_gate_sample.py",
+        test_command=test_command,
     )
 
     assert result.review_ready is True
@@ -272,6 +274,7 @@ async def test_gate_records_failed_node_ids_from_pytest_cache(tmp_path: Path) ->
         tmp_path,
         "def test_passes():\n    assert True\n\ndef test_fails():\n    assert False\n",
     )
+    test_command = f"{shlex.quote(sys.executable)} -m pytest -q test_gate_sample.py"
 
     result = await observe_evidence(
         issue=1482,
@@ -282,7 +285,7 @@ async def test_gate_records_failed_node_ids_from_pytest_cache(tmp_path: Path) ->
         started_at=datetime.now(UTC),
         base_ref="main",
         backend_status="completed",
-        test_command="pytest -q test_gate_sample.py",
+        test_command=test_command,
     )
 
     assert result.status == "failed"
