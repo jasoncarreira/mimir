@@ -1238,13 +1238,79 @@ def test_report_cleanup_failure_cannot_skip_lock_release_or_state_clear(
     assert load_run_state(tmp_path, 441) is None
 
 
+def test_bounded_timeout_releases_lock_before_failure_routing(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    worktree = repo.parent / ".worklink" / repo.name / "441-1"
+    (tmp_path / "worklink.yaml").write_text(
+        "defaults:\n  timeout_s: 1\n  reaper_ttl_s: 2\n",
+        encoding="utf-8",
+    )
+    calls, base_runner = _orchestrator_runner(repo, worktree)
+    held_locks: set[int] = set()
+
+    def runner(
+        args: Sequence[str] | str,
+        *,
+        cwd: Path | None = None,
+        text: bool = True,
+    ) -> subprocess.CompletedProcess:
+        if isinstance(args, list) and args[:3] == ["chainlink", "locks", "claim"]:
+            calls.append(args)
+            held_locks.add(int(args[3]))
+            return cp(args)
+        if isinstance(args, list) and args[:3] == ["chainlink", "locks", "release"]:
+            calls.append(args)
+            held_locks.discard(int(args[3]))
+            return cp(args)
+        if args == ["chainlink", "locks", "list", "--json"]:
+            return cp(args, stdout=json.dumps({"locks": sorted(held_locks)}))
+        return base_runner(args, cwd=cwd, text=text)
+
+    class TimeoutCompute(FakeCompute):
+        async def wait(self, handle: LaunchHandle, timeout_s: int) -> ComputeResult:
+            await asyncio.sleep(timeout_s)
+            return ComputeResult(
+                exit_code=-9,
+                stdout="",
+                stderr="build timed out",
+                timed_out=True,
+            )
+
+    class TimeoutBackend(FakeBackend):
+        async def interpret(self, order: WorkOrder, result: object) -> RawResult:
+            assert isinstance(result, ComputeResult)
+            assert result.timed_out is True
+            return RawResult(-9, order.transcript_root / "timeout.json", "timeout", "build timed out")
+
+    compute = TimeoutCompute(shared_filesystem=True)
+    registry = BackendRegistry(
+        WorklinkConfig(defaults=WorklinkDefaults(compute_backend="fake_compute"))
+    )
+    registry.register(TimeoutBackend())
+    registry.register_compute(compute)
+
+    result = asyncio.run(
+        WorklinkRunner(home=tmp_path, repo=repo, runner=runner, registry=registry).run(
+            441, backend_name="fake", test_command="echo ok"
+        )
+    )
+
+    assert result.status == "failed"
+    claims = ChainlinkClaims(agent_id="test", runner=lambda args: runner(args))
+    assert claims.active_worklink_lock_count() == 0
+    release = ["chainlink", "locks", "release", "441"]
+    route = ["chainlink", "issue", "unlabel", "441", "worklink:in-progress"]
+    assert calls.index(release) < calls.index(route)
+    assert load_run_state(tmp_path, 441) is None
+
+
 def test_failed_lock_release_is_logged_and_retains_run_state(tmp_path: Path) -> None:
     _reset_logger_for_tests()
     events = tmp_path / "logs" / "events.jsonl"
     init_logger(events, session_id="test-worklink")
     repo = tmp_path / "repo"
     worktree = repo.parent / ".worklink" / repo.name / "441-1"
-    _, runner = _orchestrator_runner(repo, worktree, release_returncode=1)
+    calls, runner = _orchestrator_runner(repo, worktree, release_returncode=1)
     registry = BackendRegistry(WorklinkConfig())
     registry.register(FakeBackend())
 
@@ -1254,8 +1320,10 @@ def test_failed_lock_release_is_logged_and_retains_run_state(tmp_path: Path) -> 
         )
     )
 
-    assert result.status == "completed"
+    assert result.status == "failed"
+    assert result.reason == "terminal recovery incomplete: Chainlink lock release failed"
     assert load_run_state(tmp_path, 441) is not None
+    assert ["chainlink", "issue", "unlabel", "441", "worklink:in-progress"] not in calls
     records = [json.loads(line) for line in events.read_text(encoding="utf-8").splitlines()]
     failure = next(
         record
@@ -1266,6 +1334,12 @@ def test_failed_lock_release_is_logged_and_retains_run_state(tmp_path: Path) -> 
     assert failure["issue_id"] == 441
     assert failure["attempt"] == 1
     assert failure["error"] == "Chainlink did not confirm lock release"
+    recovery = next(
+        record for record in records if record["type"] == "worklink_terminal_recovery_failed"
+    )
+    assert recovery["lock_released"] is False
+    assert recovery["label_transition_applied"] is False
+    assert recovery["state_retained"] is True
     _reset_logger_for_tests()
 
 
@@ -1329,7 +1403,8 @@ def test_unconfirmed_autonomous_release_does_not_trigger_ready_scan(
         )
     )
 
-    assert result.status == "completed"
+    assert result.status == "failed"
+    assert result.reason == "terminal recovery incomplete: Chainlink lock release failed"
     assert signals == []
 
 
