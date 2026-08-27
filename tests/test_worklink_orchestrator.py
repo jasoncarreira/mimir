@@ -6708,7 +6708,7 @@ def test_authorized_runner_closes_real_attempt_capabilities(
     monkeypatch.setattr(
         orchestrator,
         "get_identities",
-        lambda: SimpleNamespace(worklink_uid=worker_uid),
+        lambda: SimpleNamespace(worklink_uid=worker_uid, worklink_gid=os.getgid()),
     )
     monkeypatch.setattr(orchestrator, "OpenCodeBackend", WorkerBackend)
     monkeypatch.setattr(orchestrator, "create_isolated_checkout", create_checkout)
@@ -6784,13 +6784,21 @@ def test_authorized_runner_closes_real_attempt_capabilities(
         assert ["chainlink", "issue", "label", "1410", "worklink:ready"] not in calls
 
 
-def test_executor_report_dir_is_writable_by_the_worker_group(monkeypatch, tmp_path) -> None:
-    """The executor runs as the worker uid, so its report directory must reach it.
+def _identity_stub(gid: int):
+    from mimir.worklink.identities import WorklinkIdentities
+
+    return lambda: WorklinkIdentities(
+        mimir_uid=os.getuid(), worklink_uid=os.getuid() + 1, worklink_gid=gid
+    )
+
+
+def test_executor_report_dir_is_shared_with_the_worker_group(monkeypatch, tmp_path) -> None:
+    """Worker mode must hand the report directory to the worklink group.
 
     ``mkdtemp`` creates 0700 owned by the controller. That path is injected into the
     executor's ``PYTEST_ADDOPTS`` as ``--junitxml``, so every pytest the executor ran
-    raised ``PermissionError`` from ``pytest_sessionfinish`` AFTER a green suite, and
-    the build blocked reporting nothing useful (chainlink #1481).
+    raised ``PermissionError`` from ``pytest_sessionfinish`` AFTER a green suite
+    (chainlink #1481).
 
     The group is asserted through the recorded ``chown`` rather than the resulting
     ``st_gid``: a new directory already carries the creating process's gid, so
@@ -6798,50 +6806,74 @@ def test_executor_report_dir_is_writable_by_the_worker_group(monkeypatch, tmp_pa
     deleted entirely.
     """
     from mimir.worklink import orchestrator as orch
-    from mimir.worklink.identities import WorklinkIdentities
 
     worker_gid = os.getgid() + 4242  # deliberately NOT the gid mkdtemp would produce
-    monkeypatch.setattr(
-        orch,
-        "get_identities",
-        lambda: WorklinkIdentities(
-            mimir_uid=os.getuid(), worklink_uid=os.getuid() + 1, worklink_gid=worker_gid
-        ),
-    )
+    monkeypatch.setattr(orch, "get_identities", _identity_stub(worker_gid))
     chowns: list[tuple[str, int, int]] = []
+    monkeypatch.setattr(
+        orch.os, "chown", lambda t, u, g: chowns.append((str(t), u, g))
+    )
+    monkeypatch.setattr(orch.tempfile, "mkdtemp", lambda **kw: str(tmp_path / "report"))
+    (tmp_path / "report").mkdir()
 
-    def record_chown(target, uid, gid):
-        chowns.append((str(target), uid, gid))
-
-    monkeypatch.setattr(orch.os, "chown", record_chown)
-    monkeypatch.setattr(orch.tempfile, "mkdtemp", lambda **kw: str(tmp_path / "executor-report"))
-    (tmp_path / "executor-report").mkdir()
-
-    path = orch._make_executor_report_dir(1481, 1)
+    path = orch._make_executor_report_dir(1481, 1, worker_uid_drop=True)
     mode = path.stat().st_mode & 0o777
 
-    # The worker's group is the one granted access.
     assert [gid for _, _, gid in chowns] == [worker_gid]
     assert [uid for _, uid, _ in chowns] == [-1], "ownership must stay with the controller"
-    # And the mode actually lets that group use it.
     assert mode & 0o070 == 0o070, f"worker group cannot use the report dir (mode {mode:o})"
-    # Narrow, not widened: no world access.
-    assert mode & 0o007 == 0
+    assert mode & 0o007 == 0, "must not be widened to world access"
 
 
-def test_executor_report_dir_survives_a_deployment_without_the_worklink_account(
-    monkeypatch, tmp_path
-) -> None:
-    """No worker account means no worker uid to accommodate — still return a directory."""
+def test_controller_mode_report_dir_stays_private(monkeypatch, tmp_path) -> None:
+    """Controller mode needs no sharing, so no group is granted and 0700 stands.
+
+    There is no worker uid to accommodate: granting the worklink group here would
+    widen access for no reason.
+    """
     from mimir.worklink import orchestrator as orch
 
-    def _absent() -> None:
-        raise RuntimeError("required account 'worklink' is missing")
+    def _unexpected(*_args, **_kwargs):
+        raise AssertionError("controller mode must not share the report directory")
 
-    monkeypatch.setattr(orch, "get_identities", _absent)
-    monkeypatch.setattr(orch.tempfile, "mkdtemp", lambda **kw: str(tmp_path / "solo-report"))
-    (tmp_path / "solo-report").mkdir()
+    monkeypatch.setattr(orch, "get_identities", _unexpected)
+    monkeypatch.setattr(orch.os, "chown", _unexpected)
+    monkeypatch.setattr(orch.tempfile, "mkdtemp", lambda **kw: str(tmp_path / "solo"))
+    (tmp_path / "solo").mkdir(mode=0o700)
 
-    path = orch._make_executor_report_dir(1481, 2)
+    path = orch._make_executor_report_dir(1481, 2, worker_uid_drop=False)
 
     assert path.is_dir()
+    assert path.stat().st_mode & 0o077 == 0, "controller-mode report must stay private"
+
+
+@pytest.mark.parametrize("failing", ["chown", "chmod"])
+def test_worker_report_dir_failure_aborts_before_the_backend_launches(
+    monkeypatch, tmp_path, failing
+) -> None:
+    """A worker run must fail HERE, not later inside pytest_sessionfinish.
+
+    Returning the unshared directory would reproduce the very PermissionError this
+    exists to remove -- after the suite has run, with worse diagnostics. The
+    half-made directory must not be left behind.
+    """
+    from mimir.worklink import orchestrator as orch
+
+    monkeypatch.setattr(orch, "get_identities", _identity_stub(os.getgid() + 4242))
+    report = tmp_path / "report"
+    report.mkdir()
+    monkeypatch.setattr(orch.tempfile, "mkdtemp", lambda **kw: str(report))
+
+    def _boom(*_args, **_kwargs):
+        raise PermissionError(13, "Operation not permitted")
+
+    if failing == "chown":
+        monkeypatch.setattr(orch.os, "chown", _boom)
+    else:
+        monkeypatch.setattr(orch.os, "chown", lambda *a, **k: None)
+        monkeypatch.setattr(orch.os, "chmod", _boom)
+
+    with pytest.raises(orch.WorklinkError, match="worklink group"):
+        orch._make_executor_report_dir(1481, 3, worker_uid_drop=True)
+
+    assert not report.exists(), "the unusable report directory must be cleaned up"

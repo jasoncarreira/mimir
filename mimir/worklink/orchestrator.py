@@ -761,7 +761,9 @@ class WorklinkRunner:
                 branch=lease.branch,
                 test_command=test_cmd,
             )
-            executor_report_dir = _make_executor_report_dir(issue.issue_id, record.attempt)
+            executor_report_dir = _make_executor_report_dir(
+                issue.issue_id, record.attempt, worker_uid_drop=worker_uid_drop
+            )
             report_env = pytest_report_environment(
                 test_cmd,
                 executor_report_dir,
@@ -3241,43 +3243,41 @@ def _template_path(home: Path) -> Path:
     return Path(__file__).resolve().parents[1] / "prompt_templates" / "worklink-order.md"
 
 
-def _make_executor_report_dir(issue: int, attempt: int) -> Path:
-    """Create the executor's pytest report directory, writable by the worker uid.
+def _make_executor_report_dir(issue: int, attempt: int, *, worker_uid_drop: bool) -> Path:
+    """Create the executor's pytest report directory.
 
     The path this returns is injected into the executor's ``PYTEST_ADDOPTS`` as
-    ``--junitxml`` and ``cache_dir``. The executor runs as the WORKER uid, while
-    ``mkdtemp`` creates 0700 owned by the CONTROLLER -- so every pytest the executor
-    ran raised ``PermissionError`` from ``pytest_sessionfinish`` AFTER the suite had
-    already passed, and the build blocked on a green run:
+    ``--junitxml`` and ``cache_dir``. ``mkdtemp`` creates 0700 owned by the
+    CONTROLLER, so when the executor is dropped to the WORKER uid every pytest it
+    runs raises ``PermissionError`` from ``pytest_sessionfinish`` -- AFTER the suite
+    has already passed:
 
         PermissionError: [Errno 13] Permission denied:
             '/tmp/worklink-1475-3-executor-4m8dxhzg/junit.xml'
 
-    Hand the directory to the worker group at 0770 rather than widening it to 0777:
-    the controller still owns it, and only the worklink group gains access. The
-    controller keeps full access either way, so this is applied unconditionally
-    rather than inferred from a capability flag that may not have propagated to
-    this process.
+    On the worker path, sharing the directory with the worklink group is a
+    PRECONDITION, not a best effort: if it cannot be arranged the launch must fail
+    here, loudly and before the backend starts, rather than proceed to the same
+    post-suite PermissionError with worse diagnostics. The half-made directory is
+    removed so a failed launch leaves nothing behind.
 
-    A deployment without the worklink account keeps the 0700 directory: there is no
-    worker uid to accommodate, so the executor runs as the controller and can write.
+    On the controller path the directory stays 0700 and private. There is no worker
+    uid to accommodate, so no group is granted.
     """
     path = Path(tempfile.mkdtemp(prefix=f"worklink-{issue}-{attempt}-executor-"))
+    if not worker_uid_drop:
+        return path
     try:
         # Permitted for the owner because ``mimir`` is a member of ``worklink``.
         os.chown(path, -1, get_identities().worklink_gid)
         os.chmod(path, 0o770)
-    except Exception as exc:  # noqa: BLE001 - best effort; never fail a build over this
-        # Falling back leaves the 0700 directory this has always created, so a
-        # deployment with no worklink account (or an unwritable group) is no worse
-        # off than before. Granting the group is an improvement, not a precondition.
-        _log_event(
-            "worklink_executor_report_dir_not_shared",
-            issue_id=issue,
-            attempt=attempt,
-            path=str(path),
-            error=str(exc),
-        )
+    except Exception as exc:
+        rmtree_missing_ok(path)
+        raise WorklinkError(
+            "cannot share the executor report directory with the worklink group; "
+            "the worker would fail writing junit.xml after the suite runs "
+            f"({type(exc).__name__}: {exc})"
+        ) from exc
     return path
 
 
