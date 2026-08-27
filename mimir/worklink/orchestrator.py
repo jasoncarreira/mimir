@@ -2540,10 +2540,6 @@ def _require_factory_status(
         raise WorklinkError("factory status is invalid")
     if status.run_id != record.run_id:
         raise WorklinkError("factory status run id mismatch")
-    if status.issue_key is None:
-        raise WorklinkError("factory status issue key is missing")
-    if status.issue_key != record.run_id:
-        raise WorklinkError("factory status issue key mismatch")
     if status.sandbox_path != record.sandbox:
         raise WorklinkError("factory status sandbox mismatch")
     if status.status is None:

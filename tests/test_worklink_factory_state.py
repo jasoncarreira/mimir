@@ -146,7 +146,7 @@ def test_factory_record_rejects_sandbox_path_for_another_run(tmp_path: Path) -> 
         replace(expected, sandbox=str(tmp_path / "chainlink-1552"))
 
 
-def test_factory_record_binds_nullable_status_to_durable_identity(tmp_path: Path) -> None:
+def test_factory_record_binds_status_run_id_to_durable_identity(tmp_path: Path) -> None:
     expected = record(tmp_path)
     status = expected.status
     assert status is not None
@@ -162,10 +162,10 @@ def test_factory_record_binds_nullable_status_to_durable_identity(tmp_path: Path
     )
     assert FactoryRunRecord.from_json(nullable_base.to_json()) == nullable_base
 
+    assert replace(expected, status=replace(status, issue_key=None)).status is not None
+    assert replace(expected, status=replace(status, issue_key="display-only")).status is not None
     with pytest.raises(FactoryRecordError, match="identity mismatch"):
-        replace(expected, status=replace(status, issue_key=None))
-    with pytest.raises(FactoryRecordError, match="identity mismatch"):
-        replace(expected, status=replace(status, issue_key="1552"))
+        replace(expected, status=replace(status, run_id="1552"))
     with pytest.raises(FactoryRecordError, match="base mismatch"):
         replace(expected, status=replace(status, pr_base="develop"))
 

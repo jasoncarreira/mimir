@@ -4632,10 +4632,82 @@ def test_factory_status_binding_rejects_populated_base_mismatch(tmp_path: Path) 
         orchestrator._require_factory_status(status, record)
 
 
+def test_epic_factory_status_binds_by_run_id_with_null_issue_key(tmp_path: Path) -> None:
+    import mimir.worklink.orchestrator as orchestrator
+
+    sandbox = tmp_path / "chainlink-1337"
+    sandbox.mkdir()
+    record = replace(
+        _factory_lifecycle_record(sandbox, LaunchHandle("local_subprocess", "123", 456)),
+        run_id="chainlink-1337",
+        issue_id=1337,
+        branch="feature/chainlink-1337",
+    )
+    status = replace(
+        _factory_lifecycle_status(sandbox, status="running"),
+        run_id="chainlink-1337",
+        issue_key=None,
+        branch="feature/chainlink-1337",
+    )
+
+    orchestrator._require_factory_status(status, record)
+    observed = record.observed(status, datetime.now(UTC).isoformat())
+
+    assert observed.status is not None
+    # Never derive 1337: using it as display data can make the factory emit Closes #1337.
+    assert observed.status.issue_key is None
+
+
+def test_issue_sourced_factory_status_binds_by_run_id_with_null_issue_key(
+    tmp_path: Path,
+) -> None:
+    import mimir.worklink.orchestrator as orchestrator
+
+    sandbox = tmp_path / "sandbox"
+    sandbox.mkdir()
+    record = replace(
+        _factory_lifecycle_record(sandbox, LaunchHandle("local_subprocess", "123", 456)),
+        run_id="1606",
+        issue_id=1606,
+        branch="epic/1606",
+    )
+    # Factory run 1606 completed after its driver dropped an unsupported --issue-key flag.
+    status = replace(
+        _factory_lifecycle_status(sandbox, status="running"),
+        run_id="1606",
+        issue_key=None,
+        branch="epic/1606",
+    )
+
+    orchestrator._require_factory_status(status, record)
+    assert record.observed(status, datetime.now(UTC).isoformat()).status == status
+
+
+@pytest.mark.parametrize("issue_key", [None, "display-only-700", "701"])
+def test_factory_status_issue_key_is_display_only(
+    tmp_path: Path,
+    issue_key: str | None,
+) -> None:
+    import mimir.worklink.orchestrator as orchestrator
+
+    sandbox = tmp_path / "sandbox"
+    sandbox.mkdir()
+    record = _factory_lifecycle_record(
+        sandbox,
+        LaunchHandle("local_subprocess", "123", 456),
+    )
+    status = replace(
+        _factory_lifecycle_status(sandbox, status="running"),
+        issue_key=issue_key,
+    )
+
+    orchestrator._require_factory_status(status, record)
+    assert record.observed(status, datetime.now(UTC).isoformat()).status == status
+
+
 @pytest.mark.parametrize(
     ("field", "reason"),
     [
-        ("issue_key", "issue key is missing"),
         ("status", "missing lifecycle status"),
         ("mode", "mode is missing"),
         ("branch", "branch is missing"),
@@ -5205,7 +5277,6 @@ def _completion_runner(
         "status",
         "valid",
         "run",
-        "issue",
         "sandbox",
         "mode",
         "branch",
@@ -5268,8 +5339,6 @@ def test_factory_completion_rejection_matrix_persists_failed_evidence(
         status_overrides["valid"] = False
     elif case == "run":
         status_overrides["run_id"] = "701"
-    elif case == "issue":
-        status_overrides["issue_key"] = "701"
     elif case == "sandbox":
         status_overrides["sandbox_path"] = str(tmp_path / "other")
     elif case == "mode":

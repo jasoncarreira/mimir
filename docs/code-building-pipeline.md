@@ -89,7 +89,7 @@ running agent can instead activate a newly installed poller through its
 
 Factory epics use the same repository declaration and isolated-checkout allocator,
 but have separate admission and concurrency. The image installs
-`feature-factory@0.7.2` and `opencode-feature-factory@0.7.2` under
+`feature-factory@0.7.3` and `opencode-feature-factory@0.7.3` under
 `/opt/mimir-opencode`; `MIMIR_FACTORY_ENTRYPOINT` names the absolute
 `feature-factory/bin/factory.js`. Set `MIMIR_FACTORY_EPICS_ENABLED=1` to let the
 poller dispatch `worklink:epic` issues. `MIMIR_FACTORY_MAX_CONCURRENT` defaults
@@ -98,7 +98,7 @@ to `1`, independently of the leaf default `2`.
 The launch ends with `--command feature " --autonomous --max-retries 5
 <issue>"`. `MIMIR_FACTORY_MAX_RETRIES` defaults to `5`, accepts exactly ASCII
 `[0-9]+` in range `1..9007199254740991`, and falls back to `5` for absent or
-invalid values. feature-factory 0.7.2 stages the workflow inside the run
+invalid values. feature-factory 0.7.3 stages the workflow inside the run
 directory; exact token `--auto` is never passed. Worklink's base selects the
 checkout start point and PR target; it is not factory `--base`, which is never
 passed.

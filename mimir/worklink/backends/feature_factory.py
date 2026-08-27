@@ -19,7 +19,7 @@ from .base import Caps, CheckoutShape, RawResult, WorkOrder
 from .opencode import resolve_worklink_opencode_invocation
 
 
-FACTORY_VERSION = "0.7.2"
+FACTORY_VERSION = "0.7.3"
 DEFAULT_FACTORY_ENTRYPOINT = "/opt/mimir-opencode/lib/node_modules/feature-factory/bin/factory.js"
 FACTORY_COMMANDS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("init", ("init",)),
@@ -622,7 +622,7 @@ class FeatureFactoryBackend:
         if _RUN_ID.fullmatch(run_id) is None:
             raise FactoryContractError("factory launch run_id has an invalid shape")
         retries = _factory_max_retries()
-        # feature-factory 0.7.2 stages the workflow inside the run directory, so
+        # feature-factory 0.7.3 stages the workflow inside the run directory, so
         # OpenCode --auto must not bypass it.
         return (
             "opencode",
