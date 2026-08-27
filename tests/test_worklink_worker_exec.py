@@ -555,17 +555,24 @@ def test_uv_execution_copy_normalizes_for_runner_without_relaxing_source(
     executable.chmod(0o700)
     external.chmod(0o600)
 
-    runner_uid = os.getuid() + 1
+    # The execution copy is owned by the RUNNER, so the runner is this process --
+    # an unprivileged test cannot chown to any other uid. The CONTROLLER is the
+    # foreign identity here, which is the inverse of the pre-ownership-change model.
+    runner_uid = os.getuid()
     runner_gid = os.getgid()
+    controller_uid = os.getuid() + 1
+    # An identity that shares only the group, used to prove normalization still
+    # widens group access rather than relying on ownership alone.
+    group_only_uid = os.getuid() + 1
     source_before = {
         path.relative_to(source): stat.S_IMODE(path.stat(follow_symlinks=False).st_mode)
         for path in (source, *source.rglob("*"))
     }
-    # This is the measured pre-fix copy: copytree preserves the 0700 boundary mode,
-    # so an identity represented only by its group cannot traverse it.
+    # This is the measured pre-normalization copy: copytree preserves the 0700
+    # boundary mode, so an identity represented only by its group cannot traverse it.
     unnormalized = tmp_path / "unnormalized"
     shutil.copytree(source, unnormalized, symlinks=True)
-    assert not _identity_can_access(unnormalized, runner_uid, runner_gid, 0o5)
+    assert not _identity_can_access(unnormalized, group_only_uid, runner_gid, 0o5)
 
     home = tmp_path / "home"
     home.mkdir()
@@ -573,7 +580,7 @@ def test_uv_execution_copy_normalizes_for_runner_without_relaxing_source(
         worker_exec,
         "get_identities",
         lambda: SimpleNamespace(
-            mimir_uid=os.getuid(), worklink_uid=runner_uid, worklink_gid=runner_gid
+            mimir_uid=controller_uid, worklink_uid=runner_uid, worklink_gid=runner_gid
         ),
     )
     source_fd = os.open(source, os.O_RDONLY | os.O_DIRECTORY)
@@ -587,9 +594,15 @@ def test_uv_execution_copy_normalizes_for_runner_without_relaxing_source(
     copied_readable = project / "nested" / "readable.txt"
     copied_executable = project / "run"
     copied_link = project / "link"
+    # The runner OWNS the copy: that is what lets a repository's own provisioning
+    # chmod a tracked file, which group-write alone can never confer.
+    assert project.stat().st_uid == runner_uid
     assert _identity_can_access(project, runner_uid, runner_gid, 0o5)
     assert _identity_can_access(project / "nested", runner_uid, runner_gid, 0o5)
     assert _identity_can_access(copied_readable, runner_uid, runner_gid, 0o4)
+    # Normalization still widens group access, not just owner access.
+    assert _identity_can_access(project, group_only_uid, runner_gid, 0o5)
+    assert _identity_can_access(copied_readable, group_only_uid, runner_gid, 0o4)
     assert copied_readable.read_text(encoding="utf-8") == "runner input"
     assert stat.S_IMODE(copied_readable.stat().st_mode) == 0o660
     assert stat.S_IMODE(copied_executable.stat().st_mode) == 0o770
@@ -606,7 +619,7 @@ def test_uv_execution_copy_normalizes_for_runner_without_relaxing_source(
         for path in (source, *source.rglob("*"))
     } == source_before
     assert stat.S_IMODE(source.stat().st_mode) == 0o700
-    assert not _identity_can_access(source, runner_uid, runner_gid, 0o5)
+    assert not _identity_can_access(source, group_only_uid, runner_gid, 0o5)
 
     worker_exec._cleanup_home(home)
     assert not home.exists()
@@ -665,6 +678,55 @@ def test_repo_test_local_runner_selects_fd_sourced_execution_copy(
     assert result == 29
     assert copied == [("/proc/self/fd/17", tmp_path / "home" / "project", True)]
     assert normalized == [29]
+
+
+@pytest.mark.parametrize(
+    ("command", "surface"),
+    [
+        (["npm", "run", "test:ci"], "repo_test"),
+        (["uv", "run", "pytest", "-q"], "worklink"),
+    ],
+)
+def test_execution_copy_is_owned_by_the_runner_not_the_controller(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    synthetic_worklink_identities,
+    command: list[str],
+    surface: str,
+) -> None:
+    """The ephemeral execution tree must be chowned to the uid that runs in it.
+
+    ``chmod`` is owner-only, so a controller-owned copy cannot complete any
+    provisioning step that sets a mode on a file the runner did not create --
+    ``npm ci`` marking a workspace ``bin`` executable is the case that surfaced
+    this. Nothing reads this copy back, so runner ownership costs no reach.
+    """
+    identities = synthetic_worklink_identities
+    assert identities.worklink_uid != identities.mimir_uid
+    owners: list[tuple[int, int]] = []
+    monkeypatch.setattr(
+        worker_exec.shutil,
+        "copytree",
+        lambda source, destination, *, symlinks: None,
+    )
+    monkeypatch.setattr(worker_exec.os, "open", lambda *_args, **_kwargs: 29)
+    monkeypatch.setattr(
+        worker_exec,
+        "_normalize_checkout_fd",
+        lambda _fd, *, owner_uid, group_gid: owners.append((owner_uid, group_gid)),
+    )
+
+    checkout_root = (
+        worker_exec.REPO_TEST_CHECKOUT_ROOT
+        if surface == "repo_test"
+        else worker_exec.WORKLINK_CHECKOUT_ROOT
+    )
+    result = worker_exec._execution_checkout_fd(
+        command, 17, tmp_path / "home", checkout_root=checkout_root
+    )
+
+    assert result == 29
+    assert owners == [(identities.worklink_uid, identities.worklink_gid)]
 
 
 @pytest.mark.skipif(not Path("/proc").is_dir(), reason="requires procfs")
