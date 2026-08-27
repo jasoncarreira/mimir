@@ -56,8 +56,8 @@ The in-mimir integrated-epic runner — brief → `work-decomposer` → `decompo
 `integration-validator` → one final draft PR — **was removed in #830** after the
 epic #783 arc concluded (every failure was distribution tax in that layer).
 
-Epics are built by `feature-factory@0.7.4` through the lockstep
-`opencode-feature-factory@0.7.4` adapter. OpenCode's `/feature` workflow owns
+Epics are built by `feature-factory@0.7.5` through the lockstep
+`opencode-feature-factory@0.7.5` adapter. OpenCode's `/feature` workflow owns
 factory transitions. Worklink owns the outer Chainlink claim, isolated attempt
 checkout, OpenCode process, restart record, status observation, repository tests,
 and final PR identity verification.
@@ -76,7 +76,7 @@ and final PR identity verification.
   stop`; feature-factory has no cancel transition.
 - **Retry and staging**: `MIMIR_FACTORY_MAX_RETRIES` defaults to `5`, accepts
   exactly ASCII `[0-9]+` in range `1..9007199254740991`, and falls back to `5`
-  for absent or invalid values. feature-factory 0.7.4 stages the workflow inside
+  for absent or invalid values. feature-factory 0.7.5 stages the workflow inside
   the run directory; exact token `--auto` is never passed. Worklink's base
   selects the checkout start point and PR target; it is not factory `--base`,
   which is never passed.
@@ -100,7 +100,7 @@ and final PR identity verification.
   rather than one being preferred, and a missing `GITHUB_TOKEN` fails naming that
   variable - in both cases without disclosing values.
 - **Controls**: Every control is `node <absolute feature-factory/bin/factory.js>`.
-  Worklink admits the launcher only after package/adapter 0.7.4 verification and
+  Worklink admits the launcher only after package/adapter 0.7.5 verification and
   all 16 nonmutating structural command probes. Status is read with `status
   <run-id> --repo <sandbox> --json`; resume and heartbeat reuse the retained
   session; lock actions use `lock <run-id> <claim|steal|release> --session
@@ -513,7 +513,7 @@ require touching the orchestrator.
 | Adapter | Invocation sketch | Notes |
 |---|---|---|
 | `opencode` | `opencode run --dir <checkout> -- <prompt>` | Sole coding backend for leaf issues; provider and model are selected by opencode configuration/arguments. |
-| `feature_factory` | `opencode run ... --command feature " --autonomous --max-retries 5 <issue>"` | Epic adapter with Worklink-supervised OpenCode and absolute 0.7.4 controls. |
+| `feature_factory` | `opencode run ... --command feature " --autonomous --max-retries 5 <issue>"` | Epic adapter with Worklink-supervised OpenCode and absolute 0.7.5 controls. |
 
 Selection is config, not code (§7): per repo / label / issue-type, with
 a per-category default. The executor consults `Caps` rather than

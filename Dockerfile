@@ -76,8 +76,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && if [ "$MIMIR_ENABLE_OPENCODE" = "1" ]; then \
         npm install --global --prefix /opt/mimir-opencode \
             opencode-ai@1.18.21 \
-            feature-factory@0.7.4 \
-            opencode-feature-factory@0.7.4 \
+            feature-factory@0.7.5 \
+            opencode-feature-factory@0.7.5 \
             opencode-project-memory@0.1.0 \
             opencode-openai-codex-auth@4.4.0 \
             opencode-anthropic-auth@0.0.13 ; \

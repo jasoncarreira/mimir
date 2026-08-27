@@ -245,7 +245,7 @@ def test_status_rejects_invalid_utf8_nul_and_oversize(payload: bytes) -> None:
 
 def test_resolve_entrypoint_is_absolute_package_bound_and_lockstep(tmp_path: Path) -> None:
     entrypoint = package_entrypoint(tmp_path)
-    assert FACTORY_VERSION == "0.7.4"
+    assert FACTORY_VERSION == "0.7.5"
     assert resolve_factory_entrypoint(entrypoint) == entrypoint.resolve()
     with pytest.raises(FactoryContractError, match="absolute"):
         resolve_factory_entrypoint(Path("feature-factory/bin/factory.js"))
@@ -750,3 +750,34 @@ def test_migrated_factory_consumers_have_finite_legacy_free_inventory() -> None:
     for relative in consumers:
         source = (root / relative).read_text(encoding="utf-8")
         assert all(token not in source for token in forbidden), relative
+
+
+def test_control_environment_forwards_the_factory_publishing_identity(monkeypatch) -> None:
+    """The factory child must actually receive FACTORY_PUBLISHING_IDENTITY.
+
+    feature-factory 0.7.5 lets a nonempty inherited value replace `.factory.json`'s
+    `publishing_identity` as the declared identity the driver checks against
+    `gh api /user`. The mimir repository publishes from two accounts -- a
+    maintainer's checkout as ``jasoncarreira``, mimirbot as ``mimir-carreira`` --
+    so the deployment, not the tracked file, has to select it.
+
+    Without the allowlist entry the deployment exports the variable and the driver
+    never sees it. The symptom is a Gate 1 park naming the FILE's identity, which
+    reads as a misconfiguration rather than a stripped variable -- so assert the
+    forwarding rather than trusting that exporting it is enough.
+    """
+    from mimir.worklink.backends.feature_factory import _control_environment
+
+    monkeypatch.setenv("FACTORY_PUBLISHING_IDENTITY", "mimir-carreira")
+    assert _control_environment().get("FACTORY_PUBLISHING_IDENTITY") == "mimir-carreira"
+
+
+def test_control_environment_still_drops_unlisted_variables(monkeypatch) -> None:
+    """The allowlist stays an allowlist -- adding one name must not open it up."""
+    from mimir.worklink.backends.feature_factory import _control_environment
+
+    monkeypatch.setenv("FACTORY_PUBLISHING_IDENTITY", "mimir-carreira")
+    monkeypatch.setenv("SOME_UNRELATED_SECRET", "must-not-leak")
+    env = _control_environment()
+    assert "SOME_UNRELATED_SECRET" not in env
+    assert "FACTORY_PUBLISHING_IDENTITY" in env
