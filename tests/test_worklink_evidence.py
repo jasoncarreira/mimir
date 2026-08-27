@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import UTC, datetime
 import asyncio
 import json
+import shlex
 import subprocess
 import pytest
 from pathlib import Path
@@ -196,6 +197,101 @@ def test_structured_pytest_failures_are_scrubbed_before_evidence(tmp_path: Path)
     assert result is not None
     assert "top-secret" not in result.failed_tests[0]
     assert "[REDACTED]" in result.failed_tests[0]
+
+
+@pytest.mark.parametrize(
+    ("contents", "max_bytes", "expected"),
+    [
+        (None, None, "junit_missing"),
+        ("not xml", None, "junit_parse_error"),
+        ('<testsuite tests="1" />', 1, "junit_oversize"),
+    ],
+)
+def test_pytest_report_read_failures_are_distinguishable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    contents: str | None,
+    max_bytes: int | None,
+    expected: str,
+) -> None:
+    if contents is not None:
+        (tmp_path / "junit.xml").write_text(contents, encoding="utf-8")
+    if max_bytes is not None:
+        monkeypatch.setattr("mimir.worklink.evidence._PYTEST_REPORT_MAX_BYTES", max_bytes)
+
+    result = read_pytest_result("pytest -q", tmp_path)
+
+    assert result is not None
+    assert result.counts is None
+    assert result.report_error == expected
+
+
+def _init_gate_repo(tmp_path: Path, test_source: str) -> Path:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q", "-b", "main"], cwd=repo, check=True)
+    subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=repo, check=True)
+    subprocess.run(["git", "config", "user.name", "test"], cwd=repo, check=True)
+    (repo / "seed.txt").write_text("seed\n", encoding="utf-8")
+    subprocess.run(["git", "add", "seed.txt"], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "-q", "-m", "seed"], cwd=repo, check=True)
+    (repo / "test_gate_sample.py").write_text(test_source, encoding="utf-8")
+    return repo
+
+
+@pytest.mark.asyncio
+async def test_gate_records_counts_from_pytest_generated_junit(tmp_path: Path) -> None:
+    repo = _init_gate_repo(
+        tmp_path,
+        "def test_one():\n    assert True\n\ndef test_two():\n    assert True\n",
+    )
+
+    result = await observe_evidence(
+        issue=1482,
+        attempt=1,
+        backend="codex",
+        branch="issue/1482-a1",
+        checkout=repo,
+        started_at=datetime.now(UTC),
+        base_ref="main",
+        backend_status="completed",
+        test_command="pytest -q test_gate_sample.py",
+    )
+
+    assert result.review_ready is True
+    assert result.evidence.tests is not None
+    assert result.evidence.tests.report_error is None
+    assert result.evidence.tests.counts is not None
+    assert result.evidence.tests.counts.total == 2
+    assert result.evidence.tests.counts.passed == 2
+
+
+@pytest.mark.asyncio
+async def test_gate_records_failed_node_ids_from_pytest_cache(tmp_path: Path) -> None:
+    repo = _init_gate_repo(
+        tmp_path,
+        "def test_passes():\n    assert True\n\ndef test_fails():\n    assert False\n",
+    )
+
+    result = await observe_evidence(
+        issue=1482,
+        attempt=1,
+        backend="codex",
+        branch="issue/1482-a1",
+        checkout=repo,
+        started_at=datetime.now(UTC),
+        base_ref="main",
+        backend_status="completed",
+        test_command="pytest -q test_gate_sample.py",
+    )
+
+    assert result.status == "failed"
+    assert result.evidence.tests is not None
+    assert result.evidence.tests.counts is not None
+    assert result.evidence.tests.counts.failed == 1
+    assert result.evidence.tests.failed_tests == (
+        "test_gate_sample.py::test_fails",
+    )
 
 
 def test_evidence_test_command_uses_bare_command_without_model_spec(
@@ -466,8 +562,17 @@ async def test_enabled_opencode_gate_uses_authorized_compute(monkeypatch, tmp_pa
     assert result.review_ready is True
     assert compute.specs[0].local_argv == ("/bin/sh", "-c", "pytest -q")
     assert "PYTEST_ADDOPTS" in compute.specs[0].env
+    report_option = next(
+        option.split("=", 1)[1]
+        for option in shlex.split(compute.specs[0].env["PYTEST_ADDOPTS"])
+        if option.startswith("--junitxml=")
+    )
+    assert not Path(report_option).is_absolute()
+    assert report_option.startswith(".worklink-gate-")
     assert compute.specs[0].backend_config["pass_env"] == ("PYTEST_ADDOPTS",)
     assert compute.cleaned == [LaunchHandle("local_subprocess", "job")]
+    assert result.evidence.tests is not None
+    assert result.evidence.tests.report_error == "junit_missing"
 
 
 @pytest.mark.asyncio

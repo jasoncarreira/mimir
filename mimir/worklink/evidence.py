@@ -54,6 +54,7 @@ class TestResult:
     observed: bool = True
     counts: TestCounts | None = None
     failed_tests: tuple[str, ...] = ()
+    report_error: str | None = None
 
 
 @dataclass(frozen=True)
@@ -444,12 +445,20 @@ async def _run_compute_gate(
         local_argv=("/bin/sh", "-c", command),
     )
     if report_dir is not None:
+        report_option_dir = report_dir
+        try:
+            # Contained workers enter the checkout through an authorized fd and
+            # may not be able to traverse the controller's absolute parent path.
+            report_option_dir = report_dir.relative_to(checkout)
+        except ValueError:
+            pass
         gate_spec = with_worker_environment(
             gate_spec,
             pytest_report_environment(
                 command,
-                report_dir,
+                report_option_dir,
                 existing=gate_spec.env.get("PYTEST_ADDOPTS"),
+                create_directory=False,
             ),
         )
     handle = await compute.launch(gate_spec)
@@ -477,7 +486,7 @@ def _common_status(status: str) -> str:
     return "failed"
 
 
-_PYTEST_REPORT_MAX_BYTES = 2_000_000
+_PYTEST_REPORT_MAX_BYTES = 20_000_000
 
 
 def pytest_report_environment(
@@ -485,11 +494,13 @@ def pytest_report_environment(
     report_dir: Path,
     *,
     existing: str | None = None,
+    create_directory: bool = True,
 ) -> dict[str, str]:
     """Configure pytest's machine reports without changing the retained output."""
     if not _is_pytest_command(command):
         return {}
-    report_dir.mkdir(parents=True, exist_ok=True)
+    if create_directory:
+        report_dir.mkdir(parents=True, exist_ok=True)
     options = (
         f"--junitxml={shlex.quote(str(report_dir / 'junit.xml'))} "
         f"-o cache_dir={shlex.quote(str(report_dir / 'cache'))}"
@@ -499,19 +510,27 @@ def pytest_report_environment(
 
 def read_pytest_result(command: str, report_dir: Path) -> TestResult | None:
     """Read counts and exact failed node IDs from pytest-owned machine files."""
+    if not _is_pytest_command(command):
+        return None
     junit_path = report_dir / "junit.xml"
     lastfailed_path = report_dir / "cache" / "v" / "cache" / "lastfailed"
     try:
         if junit_path.stat().st_size > _PYTEST_REPORT_MAX_BYTES:
-            return None
+            return TestResult(command, report_error="junit_oversize")
         root = ET.parse(junit_path).getroot()
         suites = [root] if root.tag == "testsuite" else list(root.findall("testsuite"))
         total = sum(_xml_count(suite, "tests") for suite in suites)
         failed = sum(_xml_count(suite, "failures") for suite in suites)
         errors = sum(_xml_count(suite, "errors") for suite in suites)
         skipped = sum(_xml_count(suite, "skipped") for suite in suites)
-    except (OSError, ET.ParseError, ValueError):
-        return None
+    except FileNotFoundError:
+        return TestResult(command, report_error="junit_missing")
+    except ET.ParseError:
+        return TestResult(command, report_error="junit_parse_error")
+    except ValueError:
+        return TestResult(command, report_error="junit_invalid_counts")
+    except OSError:
+        return TestResult(command, report_error="junit_read_error")
 
     failed_tests: tuple[str, ...] = ()
     try:
@@ -565,6 +584,7 @@ def _gate_failure_reason(tests: TestResult) -> str:
     if counts is None:
         return terminal_error(
             f"test gate failed (exit {tests.exit_code}); structured counts unavailable"
+            + (f" ({tests.report_error})" if tests.report_error else "")
         )
     count_text = (
         f"{counts.failed} failed, {counts.errors} errors, {counts.passed} passed, "
@@ -584,10 +604,12 @@ def _gate_results_diverge(
         executor.exit_code,
         executor.counts,
         executor.failed_tests,
+        executor.report_error,
     ) != (
         measured.exit_code,
         measured.counts,
         measured.failed_tests,
+        measured.report_error,
     )
 
 
