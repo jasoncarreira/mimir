@@ -34,6 +34,7 @@ if TYPE_CHECKING:
 log = logging.getLogger(__name__)
 
 TurnRunner = Callable[[AgentEvent], Awaitable[object]]
+RelevanceCheck = Callable[[AgentEvent], Awaitable[bool | None]]
 InjectCallback = Callable[[AgentEvent], Awaitable[None]]
 # Best-effort observer fired (fire-and-forget) for each enqueued inbound
 # event — used for first-contact DM-channel capture (server.py). Must not
@@ -111,6 +112,9 @@ class Dispatcher:
         self._on_channel_drained: ChannelDrainedCallback | None = None
         self._bg_tasks: set[asyncio.Task] = set()
         self._queues: dict[str, asyncio.Queue[AgentEvent]] = {}
+        # Predicates are keyed by the queued object rather than source_id so
+        # duplicate deliveries cannot consume each other's check.
+        self._delivery_relevance: dict[int, RelevanceCheck] = {}
         self._workers: dict[str, asyncio.Task] = {}
         self._semaphore = asyncio.Semaphore(config.max_concurrent_turns)
         # S2-3 fix: cross-job mutex for scheduler-triggered turns. The
@@ -192,7 +196,12 @@ class Dispatcher:
             return True
         return any(channel_id.startswith(p) for p in prefixes)
 
-    async def enqueue(self, event: AgentEvent) -> bool:
+    async def enqueue(
+        self,
+        event: AgentEvent,
+        *,
+        relevance_check: RelevanceCheck | None = None,
+    ) -> bool:
         """Returns True if accepted, False if the per-channel queue is full."""
         if self._closed:
             return False
@@ -258,6 +267,8 @@ class Dispatcher:
             return False
 
         await queue.put(event)
+        if relevance_check is not None:
+            self._delivery_relevance[id(event)] = relevance_check
         depth = queue.qsize()
         if depth > 10 and not self._high_water_logged[channel_id]:
             await log_event("event_queue_high_water", channel_id=channel_id, depth=depth)
@@ -563,6 +574,25 @@ class Dispatcher:
                 # ``finally`` here so neither propagation path skips it.
                 try:
                     async with self._semaphore:
+                        relevance_check = self._delivery_relevance.pop(id(event), None)
+                        if relevance_check is not None:
+                            try:
+                                relevant = await relevance_check(event)
+                            except Exception as exc:  # noqa: BLE001 - must fail open
+                                log.warning(
+                                    "poller delivery relevance check failed open for %s: %s",
+                                    event.source_id,
+                                    exc,
+                                )
+                                relevant = None
+                            if relevant is False:
+                                await log_event(
+                                    "poller_delivery_stale_dropped",
+                                    poller=event.extra.get("poller_name"),
+                                    channel_id=channel_id,
+                                    source_id=event.source_id,
+                                )
+                                continue
                         if self._run_turn is None:
                             await log_event(
                                 "error",
@@ -595,6 +625,7 @@ class Dispatcher:
                         finally:
                             self._in_flight.discard(channel_id)
                 finally:
+                    self._delivery_relevance.pop(id(event), None)
                     queue.task_done()
                     # ``drain()`` closes the dispatcher before waiting for queued
                     # turns. Do not start completion-triggered scans during that

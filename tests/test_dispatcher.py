@@ -89,6 +89,100 @@ async def test_within_channel_events_run_in_order(tmp_path: Path):
     assert seen == ["0", "1", "2", "3", "4"]
 
 
+def _poller_event(source_id: str) -> AgentEvent:
+    return AgentEvent(
+        trigger="poller",
+        channel_id="poller:github-activity",
+        content="review pull request",
+        source="poller",
+        source_id=source_id,
+        extra={"poller_name": "github-activity", "items": []},
+    )
+
+
+@pytest.mark.asyncio
+async def test_poller_delivery_relevance_actionable_subject_runs(tmp_path: Path):
+    delivered: list[str | None] = []
+    checks: list[str | None] = []
+
+    async def relevance(event: AgentEvent) -> bool:
+        checks.append(event.source_id)
+        return True
+
+    async def runner(event: AgentEvent) -> None:
+        delivered.append(event.source_id)
+
+    disp = Dispatcher(_make_config(tmp_path), runner)
+    assert await disp.enqueue(_poller_event("actionable"), relevance_check=relevance)
+    await disp.drain()
+
+    assert checks == ["actionable"]
+    assert delivered == ["actionable"]
+
+
+@pytest.mark.asyncio
+async def test_poller_delivery_relevance_non_actionable_subject_is_dropped(
+    tmp_path: Path,
+):
+    delivered: list[str | None] = []
+
+    async def runner(event: AgentEvent) -> None:
+        delivered.append(event.source_id)
+
+    async def stale(event: AgentEvent) -> bool:
+        return False
+
+    disp = Dispatcher(_make_config(tmp_path), runner)
+    assert await disp.enqueue(_poller_event("merged"), relevance_check=stale)
+    await disp.drain()
+
+    records = [
+        json.loads(line)
+        for line in (tmp_path / "logs" / "events.jsonl").read_text().splitlines()
+    ]
+    drops = [row for row in records if row["type"] == "poller_delivery_stale_dropped"]
+    assert delivered == []
+    assert len(drops) == 1
+    assert drops[0]["poller"] == "github-activity"
+    assert drops[0]["channel_id"] == "poller:github-activity"
+    assert drops[0]["source_id"] == "merged"
+    assert not any(row["type"] == "poller_turn_gave_up" for row in records)
+
+
+@pytest.mark.asyncio
+async def test_poller_delivery_relevance_indeterminate_fails_open(tmp_path: Path):
+    """This guards the branch where fail-closed behavior would lose real work."""
+    delivered: list[str | None] = []
+
+    async def indeterminate(event: AgentEvent) -> None:
+        return None
+
+    async def runner(event: AgentEvent) -> None:
+        delivered.append(event.source_id)
+
+    disp = Dispatcher(_make_config(tmp_path), runner)
+    assert await disp.enqueue(
+        _poller_event("unknown"), relevance_check=indeterminate,
+    )
+    await disp.drain()
+
+    assert delivered == ["unknown"]
+
+
+@pytest.mark.asyncio
+async def test_poller_delivery_without_relevance_predicate_is_unchanged(tmp_path: Path):
+    delivered: list[str | None] = []
+
+    async def runner(event: AgentEvent) -> None:
+        delivered.append(event.source_id)
+
+    disp = Dispatcher(_make_config(tmp_path), runner)
+    assert await disp.enqueue(_poller_event("no-predicate"))
+    await disp.drain()
+
+    assert delivered == ["no-predicate"]
+
+
 @pytest.mark.asyncio
 async def test_separate_channels_run_concurrently(tmp_path: Path):
     cfg = _make_config(tmp_path)
