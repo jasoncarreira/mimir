@@ -60,6 +60,7 @@ _TIMEOUT_SECONDS = 1800.0
 _CAPTURE_BYTES = 64 * 1024
 _RETURN_STDOUT_CHARS = 8_000
 _RETURN_STDERR_CHARS = 4_000
+_LIVE_OUTPUT_ROOT = Path("state/worklink/transcripts")
 _MAX_SELECTORS = 32
 _MAX_SELECTOR_LENGTH = 256
 _MAX_SELECTOR_BYTES = 4_096
@@ -115,6 +116,8 @@ class ProjectTestResult:
     stdout_dropped_bytes: int = 0
     stderr_dropped_bytes: int = 0
     git_context: str = ""
+    stdout_path: str = ""
+    stderr_path: str = ""
 
 
 ContainedRunner = Callable[..., Awaitable[CollectedExecutionResult]]
@@ -351,6 +354,29 @@ def _safe_stderr_output(
     return scrubbed[-limit:] if keep_tail else scrubbed[:limit]
 
 
+def _live_output_paths(home: str, identifier: str) -> tuple[Path, Path, str, str]:
+    root = Path(home).resolve() / _LIVE_OUTPUT_ROOT
+    stem = f"repo-test-{identifier}"
+    stdout_relative = (_LIVE_OUTPUT_ROOT / f"{stem}.stdout.log").as_posix()
+    stderr_relative = (_LIVE_OUTPUT_ROOT / f"{stem}.stderr.log").as_posix()
+    return (
+        root / f"{stem}.stdout.log",
+        root / f"{stem}.stderr.log",
+        stdout_relative,
+        stderr_relative,
+    )
+
+
+def _remove_live_output(*paths: Path) -> None:
+    for path in paths:
+        try:
+            path.unlink()
+        except OSError:
+            # Checkpoint cleanup must not change a completed suite's verdict.
+            # The transcript janitor removes any file that survives this attempt.
+            pass
+
+
 def _worker_can_search(metadata: os.stat_result) -> bool:
     identities = get_identities()
     mode = metadata.st_mode
@@ -516,6 +542,9 @@ class RepoProjectTests:
             ) from exc
 
         identifier = str(uuid.uuid4())
+        stdout_path, stderr_path, stdout_relative, stderr_relative = _live_output_paths(
+            os.environ["MIMIR_HOME"], identifier
+        )
         scrubber.add_path(checkout.path)
         command = _remap_command(root, command)
         environment = base_worker_environment(identifier)
@@ -555,6 +584,7 @@ class RepoProjectTests:
                 "project test command or environment contains a controller path",
                 execution_started=True,
             )
+        result: CollectedExecutionResult | None = None
         try:
             try:
                 result = await self._runner(
@@ -567,6 +597,8 @@ class RepoProjectTests:
                     stdout_limit=self._output_limit,
                     stderr_limit=self._output_limit,
                     scrubber=scrubber,
+                    stdout_path=stdout_path,
+                    stderr_path=stderr_path,
                 )
             except StaleWorkerExecutorError as exc:
                 await safe_log_event(
@@ -636,6 +668,11 @@ class RepoProjectTests:
                     "project test snapshot cleanup failed",
                     execution_started=True,
                 ) from exc
+            finally:
+                if result is None or not result.timed_out:
+                    _remove_live_output(stdout_path, stderr_path)
+
+        assert result is not None
 
         stdout = _safe_output(
             result.stdout,
@@ -659,6 +696,8 @@ class RepoProjectTests:
                 False, "test_timeout", None, stdout, stderr,
                 command, command_source, **truncation,
                 git_context=_git_execution_context(),
+                stdout_path=stdout_relative,
+                stderr_path=stderr_relative,
             )
         if result.exit_code != 0 or result.output_overflow:
             return ProjectTestResult(

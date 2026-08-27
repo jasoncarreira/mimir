@@ -1619,7 +1619,10 @@ async def test_project_test_timeout_returns_captured_hang_diagnostic(
         + b"\nTimeout (0:05:00)!\nThread dump\n  File test_hang.py, line 7\n"
     )
 
-    async def runner(*_args, **_kwargs):
+    async def runner(*_args, **kwargs):
+        kwargs["stdout_path"].parent.mkdir(parents=True, exist_ok=True)
+        kwargs["stdout_path"].write_bytes(b"partial stdout")
+        kwargs["stderr_path"].write_bytes(stderr)
         return CollectedExecutionResult(None, b"partial stdout", stderr, True, False, 0, 0)
 
     result = await RepoProjectTests(
@@ -1630,6 +1633,91 @@ async def test_project_test_timeout_returns_captured_hang_diagnostic(
     assert result.stdout == "partial stdout"
     assert result.stderr.startswith("Timeout (0:05:00)!")
     assert "test_hang.py" in result.stderr
+    assert result.stdout_path.startswith("state/worklink/transcripts/repo-test-")
+    assert result.stderr_path.startswith("state/worklink/transcripts/repo-test-")
+    assert (home / result.stdout_path).read_bytes() == b"partial stdout"
+    assert b"test_hang.py" in (home / result.stderr_path).read_bytes()
+
+
+@pytest.mark.asyncio
+async def test_project_test_hang_is_observable_before_runner_completes(
+    repo_tools, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state = repo_tools[-2]
+    home = tmp_path / "home"
+    _configure_worklink_test(home)
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    output_written = asyncio.Event()
+    release_runner = asyncio.Event()
+    observed: dict[str, object] = {}
+    dump = (
+        b"Timeout (0:05:00)!\n"
+        b'Thread 0x1 (most recent call first):\n  File "test_never_finishes.py", line 9\n'
+    )
+
+    async def runner(*_args, **kwargs):
+        observed.update(kwargs)
+        stdout_path = kwargs["stdout_path"]
+        stderr_path = kwargs["stderr_path"]
+        stdout_path.parent.mkdir(parents=True, exist_ok=True)
+        stdout_path.write_bytes(b"tests/test_never_finishes.py::test_hangs ")
+        stderr_path.write_bytes(dump)
+        output_written.set()
+        await release_runner.wait()
+        return CollectedExecutionResult(
+            None, stdout_path.read_bytes(), stderr_path.read_bytes(), True, False, 0, 0,
+        )
+
+    task = asyncio.create_task(RepoProjectTests(
+        state, runner=runner, checkout_factory=_test_checkout_factory,
+    ).execute(("tracked.txt",)))
+    await asyncio.wait_for(output_written.wait(), 1)
+
+    stdout_path = observed["stdout_path"]
+    stderr_path = observed["stderr_path"]
+    assert isinstance(stdout_path, Path)
+    assert isinstance(stderr_path, Path)
+    assert task.done() is False
+    assert b"test_never_finishes.py::test_hangs" in stdout_path.read_bytes()
+    assert b"test_never_finishes.py" in stderr_path.read_bytes()
+    assert observed["stdout_limit"] == observed["stderr_limit"] == 64 * 1024
+    assert stdout_path.stat().st_size <= 64 * 1024
+    assert stderr_path.stat().st_size <= 64 * 1024
+
+    release_runner.set()
+    result = await task
+    assert result.code == "test_timeout"
+    assert home / result.stdout_path == stdout_path
+    assert home / result.stderr_path == stderr_path
+
+
+@pytest.mark.asyncio
+async def test_project_test_fast_run_removes_live_output_files(
+    repo_tools, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state = repo_tools[-2]
+    home = tmp_path / "home"
+    _configure_worklink_test(home)
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    written: list[Path] = []
+
+    async def runner(*_args, **kwargs):
+        stdout_path = kwargs["stdout_path"]
+        stderr_path = kwargs["stderr_path"]
+        stdout_path.parent.mkdir(parents=True, exist_ok=True)
+        stdout_path.write_bytes(b"one passed")
+        stderr_path.write_bytes(b"")
+        written.extend((stdout_path, stderr_path))
+        return CollectedExecutionResult(0, b"one passed", b"", False, False, 0, 0)
+
+    result = await RepoProjectTests(
+        state, runner=runner, checkout_factory=_test_checkout_factory,
+    ).execute(("tracked.txt",))
+
+    assert result.ok is True
+    assert result.stdout == "one passed"
+    assert result.stdout_path == result.stderr_path == ""
+    assert written and all(not path.exists() for path in written)
 
 
 @pytest.mark.asyncio
