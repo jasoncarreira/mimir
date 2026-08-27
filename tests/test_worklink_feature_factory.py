@@ -245,7 +245,7 @@ def test_status_rejects_invalid_utf8_nul_and_oversize(payload: bytes) -> None:
 
 def test_resolve_entrypoint_is_absolute_package_bound_and_lockstep(tmp_path: Path) -> None:
     entrypoint = package_entrypoint(tmp_path)
-    assert FACTORY_VERSION == "0.7.3"
+    assert FACTORY_VERSION == "0.7.4"
     assert resolve_factory_entrypoint(entrypoint) == entrypoint.resolve()
     with pytest.raises(FactoryContractError, match="absolute"):
         resolve_factory_entrypoint(Path("feature-factory/bin/factory.js"))
