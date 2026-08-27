@@ -84,7 +84,10 @@ class FactoryRunRecord:
             if self.status.sandbox_path != self.sandbox:
                 raise FactoryRecordError("factory record status sandbox mismatch")
             if self.status.pr_base is not None and self.status.pr_base != self.base_ref:
-                raise FactoryRecordError("factory record status base mismatch")
+                raise FactoryRecordError(
+                    "factory record status base mismatch: "
+                    f"observed {self.status.pr_base!r}, expected {self.base_ref!r}"
+                )
         if self.run_id.startswith("chainlink-") and Path(self.sandbox).name != self.run_id:
             raise FactoryRecordError("factory record sandbox does not match run id")
         if self.controller_error is not None and len(self.controller_error.encode("utf-8")) > 65536:

@@ -300,7 +300,10 @@ def test_factory_record_binds_status_run_id_to_durable_identity(tmp_path: Path) 
     assert replace(expected, status=replace(status, issue_key="display-only")).status is not None
     with pytest.raises(FactoryRecordError, match="identity mismatch"):
         replace(expected, status=replace(status, run_id="1552"))
-    with pytest.raises(FactoryRecordError, match="base mismatch"):
+    with pytest.raises(
+        FactoryRecordError,
+        match="observed 'develop', expected 'main'",
+    ):
         replace(expected, status=replace(status, pr_base="develop"))
 
 
