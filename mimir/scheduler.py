@@ -73,7 +73,6 @@ from .pollers import (
     PollerConfig,
     discover_pollers,
     forget_circuit_breakers_except,
-    _enqueue_with_relevance,
     run_poller,
 )
 from .poller_budget import aggregate_poller_turn_usage
@@ -2471,9 +2470,12 @@ class Scheduler:
                             reason="poller_budget_exceeded:agent_turns:per_fire_headroom",
                         )
                     return False
-                accepted = await _enqueue_with_relevance(
-                    self._enqueue, event, relevance_check,
-                )
+                if relevance_check is None:
+                    accepted = await self._enqueue(event)
+                else:
+                    accepted = await self._enqueue(
+                        event, relevance_check=relevance_check,
+                    )
                 if accepted:
                     accepted_this_fire += 1
                 return accepted

@@ -77,7 +77,6 @@ from __future__ import annotations
 import asyncio
 import dataclasses
 import hashlib
-import inspect
 import json
 import logging
 import os
@@ -694,31 +693,6 @@ def _github_recovery_relevance_check(
         return False
 
     return check
-
-
-async def _enqueue_with_relevance(
-    enqueue: Callable[..., Awaitable[bool]],
-    event: AgentEvent,
-    relevance_check: poller_recovery.RelevanceFn | None,
-) -> bool:
-    """Forward delivery metadata when the enqueue boundary supports it."""
-    if relevance_check is None:
-        return await enqueue(event)
-    try:
-        parameters = inspect.signature(enqueue).parameters.values()
-    except (TypeError, ValueError):
-        return await enqueue(event)
-    supports_relevance = any(
-        parameter.kind == inspect.Parameter.VAR_KEYWORD
-        or (
-            parameter.name == "relevance_check"
-            and parameter.kind != inspect.Parameter.POSITIONAL_ONLY
-        )
-        for parameter in parameters
-    )
-    if not supports_relevance:
-        return await enqueue(event)
-    return await enqueue(event, relevance_check=relevance_check)
 
 
 # Pollers manifest schema version history:
@@ -2082,7 +2056,7 @@ async def _drain_capped(
 async def run_poller(
     poller: PollerConfig,
     *,
-    enqueue: Callable[[AgentEvent], Awaitable[bool]],
+    enqueue: Callable[..., Awaitable[bool]],
     timeout: float = POLLER_TIMEOUT_SECONDS,
     home: Path | None = None,
 ) -> int:
@@ -2146,7 +2120,9 @@ async def run_poller(
     )
 
     async def enqueue_for_delivery(event: AgentEvent) -> bool:
-        return await _enqueue_with_relevance(enqueue, event, relevance_check)
+        if relevance_check is None:
+            return await enqueue(event)
+        return await enqueue(event, relevance_check=relevance_check)
 
     # Lazy-create the persist dir on first use. Skill authors who
     # write a cursor file to STATE_DIR can rely on the dir existing.
