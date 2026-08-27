@@ -1213,7 +1213,7 @@ def test_report_cleanup_failure_cannot_skip_lock_release_or_state_clear(
     report_dir.mkdir()
     monkeypatch.setattr(
         "mimir.worklink.orchestrator._make_executor_report_dir",
-        lambda issue_id, attempt: report_dir,
+        lambda issue_id, attempt, *, worker_uid_drop=False: report_dir,
     )
 
     def deny_report_removal(path: Path) -> None:
@@ -1630,7 +1630,9 @@ def test_zero_exit_executor_and_failed_gate_record_structured_reason_and_diverge
     calls, base_runner = _orchestrator_runner(repo, worktree)
     executor_report_dir = tmp_path / "executor-report"
 
-    def make_executor_report_dir(issue: int, attempt: int) -> Path:
+    def make_executor_report_dir(
+        issue: int, attempt: int, *, worker_uid_drop: bool = False
+    ) -> Path:
         executor_report_dir.mkdir()
         return executor_report_dir
 
