@@ -2733,7 +2733,9 @@ def test_registered_backends_use_isolated_checkout_by_default(
     ]
 
 
-def test_factory_checkout_has_three_way_target_branch_agreement(tmp_path: Path) -> None:
+def test_factory_checkout_has_three_way_target_branch_agreement_without_detached_head(
+    tmp_path: Path,
+) -> None:
     import mimir.worklink.orchestrator as orchestrator
 
     origin = tmp_path / "origin.git"
@@ -2804,7 +2806,7 @@ def test_factory_checkout_has_three_way_target_branch_agreement(tmp_path: Path) 
         controller_phase="running",
     )
 
-    assert symbolic.returncode == 0
+    assert symbolic.returncode == 0, "factory placement must never leave a detached HEAD"
     assert status.pr_base == symbolic.stdout.strip() == record.base_ref
     assert lease.branch == record.base_ref
     orchestrator._require_factory_status(status, record)
