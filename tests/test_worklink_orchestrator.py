@@ -6789,29 +6789,42 @@ def test_executor_report_dir_is_writable_by_the_worker_group(monkeypatch, tmp_pa
 
     ``mkdtemp`` creates 0700 owned by the controller. That path is injected into the
     executor's ``PYTEST_ADDOPTS`` as ``--junitxml``, so every pytest the executor ran
-    raised ``PermissionError`` from ``pytest_sessionfinish`` AFTER a green suite and
+    raised ``PermissionError`` from ``pytest_sessionfinish`` AFTER a green suite, and
     the build blocked reporting nothing useful (chainlink #1481).
+
+    The group is asserted through the recorded ``chown`` rather than the resulting
+    ``st_gid``: a new directory already carries the creating process's gid, so
+    comparing ``st_gid`` to this process's own group passes even when the grant is
+    deleted entirely.
     """
     from mimir.worklink import orchestrator as orch
     from mimir.worklink.identities import WorklinkIdentities
 
-    # A gid this process is actually a member of, so the chown is permitted here for
-    # the same reason it is permitted in production: the owner may set the group to
-    # one it belongs to.
-    own_gid = os.getgid()
+    worker_gid = os.getgid() + 4242  # deliberately NOT the gid mkdtemp would produce
     monkeypatch.setattr(
         orch,
         "get_identities",
-        lambda: WorklinkIdentities(mimir_uid=os.getuid(), worklink_uid=os.getuid() + 1, worklink_gid=own_gid),
+        lambda: WorklinkIdentities(
+            mimir_uid=os.getuid(), worklink_uid=os.getuid() + 1, worklink_gid=worker_gid
+        ),
     )
+    chowns: list[tuple[str, int, int]] = []
+
+    def record_chown(target, uid, gid):
+        chowns.append((str(target), uid, gid))
+
+    monkeypatch.setattr(orch.os, "chown", record_chown)
     monkeypatch.setattr(orch.tempfile, "mkdtemp", lambda **kw: str(tmp_path / "executor-report"))
     (tmp_path / "executor-report").mkdir()
 
     path = orch._make_executor_report_dir(1481, 1)
     mode = path.stat().st_mode & 0o777
 
+    # The worker's group is the one granted access.
+    assert [gid for _, _, gid in chowns] == [worker_gid]
+    assert [uid for _, uid, _ in chowns] == [-1], "ownership must stay with the controller"
+    # And the mode actually lets that group use it.
     assert mode & 0o070 == 0o070, f"worker group cannot use the report dir (mode {mode:o})"
-    assert path.stat().st_gid == own_gid
     # Narrow, not widened: no world access.
     assert mode & 0o007 == 0
 
