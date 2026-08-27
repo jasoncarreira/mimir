@@ -551,7 +551,58 @@ def test_factory_launch_binding_rejects_argv_controller_disagreement(tmp_path: P
     )
 
     with pytest.raises(WorklinkError, match="does not match the supervised run_id"):
-        orchestrator._require_factory_launch_binding(spec, "chainlink-700")
+        orchestrator._require_factory_launch_binding(spec, "chainlink-700", "mimir-carreira")
+
+
+def test_factory_launch_binding_requires_the_resolved_publishing_identity(
+    tmp_path: Path,
+) -> None:
+    """A launch that lost the publishing identity must refuse, not publish.
+
+    The factory child compares its declared identity against ``gh api /user`` at
+    Gate 1. If the variable is dropped between the controller and the child, the
+    driver silently falls back to the sandbox's ``.factory.json`` and parks naming
+    the FILE's identity -- which reads as a misconfiguration rather than a stripped
+    variable, and sent one investigation the wrong way already.
+    """
+    import mimir.worklink.orchestrator as orchestrator
+    from mimir.worklink.backends.feature_factory import FACTORY_PUBLISHING_IDENTITY_ENV
+
+    def _spec(env: dict[str, str]) -> WorkSpec:
+        return WorkSpec(
+            issue_id=700,
+            attempt=1,
+            repo_url="https://github.com/owner/repo.git",
+            base_ref="main",
+            branch="feature/chainlink-700",
+            prompt="",
+            rules=None,
+            test_command="pytest",
+            backend="feature_factory",
+            timeout_s=30,
+            env=env,
+            backend_config={"run_id": "chainlink-700"},
+            local_checkout=tmp_path,
+            local_argv=("opencode", "run", " --autonomous chainlink-700"),
+        )
+
+    with pytest.raises(WorklinkError, match="publishing identity"):
+        orchestrator._require_factory_launch_binding(_spec({}), "chainlink-700", "mimir-carreira")
+
+    # A stale or mismatched value is refused too -- publishing as the wrong account
+    # is the failure this guard exists to prevent.
+    with pytest.raises(WorklinkError, match="publishing identity"):
+        orchestrator._require_factory_launch_binding(
+            _spec({FACTORY_PUBLISHING_IDENTITY_ENV: "jasoncarreira"}),
+            "chainlink-700",
+            "mimir-carreira",
+        )
+
+    orchestrator._require_factory_launch_binding(
+        _spec({FACTORY_PUBLISHING_IDENTITY_ENV: "mimir-carreira"}),
+        "chainlink-700",
+        "mimir-carreira",
+    )
 
 
 def test_preclaim_registry_crash_emits_scrubbed_failure_event(
@@ -4019,6 +4070,8 @@ def test_factory_new_run_uses_resolved_base_for_single_checkout_placement(
             "GIT_AUTHOR_EMAIL": "factory@example.com",
             "GIT_COMMITTER_NAME": "Factory Author",
             "GIT_COMMITTER_EMAIL": "factory@example.com",
+            # Forwarded under the FACTORY child's name, resolved controller-side.
+            "FACTORY_PUBLISHING_IDENTITY": "factory-owner",
         }
         raise RuntimeError("stop after placement")
 

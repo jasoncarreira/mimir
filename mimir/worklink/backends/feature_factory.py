@@ -730,6 +730,12 @@ class FeatureFactoryBackend:
         return RawResult(0, None, "interrupted", None)
 
 
+# feature-factory 0.7.5's own variable, read by the factory CHILD. Distinct from
+# mimir's operator-facing ``MIMIR_FACTORY_PUBLISHING_IDENTITY``, which selects the
+# identity on the controller side; the resolved value is forwarded under this name.
+FACTORY_PUBLISHING_IDENTITY_ENV = "FACTORY_PUBLISHING_IDENTITY"
+
+
 def _control_environment() -> dict[str, str]:
     allowed = {
         "PATH",
@@ -762,7 +768,7 @@ def _control_environment() -> dict[str, str]:
         # disabling the guard. The value must never be derived from ``gh``, the token,
         # or any command result: an expectation read from the credential being checked
         # always matches, and the guard stops guarding.
-        "FACTORY_PUBLISHING_IDENTITY",
+        FACTORY_PUBLISHING_IDENTITY_ENV,
     }
     return {
         key: value

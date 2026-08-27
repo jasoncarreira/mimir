@@ -71,7 +71,12 @@ from ..redaction import redact_text
 from ..repository_config import RepositoryInventory
 from ..secret_scan import secret_matches
 from .safe_git import ControllerGitPublication
-from .backends.feature_factory import FactoryStatus, FeatureFactoryBackend, epic_run_id
+from .backends.feature_factory import (
+    FACTORY_PUBLISHING_IDENTITY_ENV,
+    FactoryStatus,
+    FeatureFactoryBackend,
+    epic_run_id,
+)
 from .backends.registry import factory_run_timeout_s
 from .backends.opencode import transcript_path, write_transcript
 from .factory_state import (
@@ -407,7 +412,9 @@ def _validate_epic_work_item(payload: str, issue_id: int) -> str:
     return run_id
 
 
-def _require_factory_launch_binding(spec: WorkSpec, run_id: str) -> None:
+def _require_factory_launch_binding(
+    spec: WorkSpec, run_id: str, publishing_identity: str
+) -> None:
     argv = spec.local_argv
     if (
         spec.backend_config.get("run_id") != run_id
@@ -417,6 +424,14 @@ def _require_factory_launch_binding(spec: WorkSpec, run_id: str) -> None:
         or argv[-1].split()[-1] != run_id
     ):
         raise WorklinkError("factory launch request run_id does not match the supervised run_id")
+    # Fail closed on a launch that would publish as some other account. Losing the
+    # variable between here and the child is silent otherwise: the driver falls back
+    # to the sandbox's .factory.json and parks at Gate 1 naming the FILE's identity,
+    # which reads as a misconfiguration rather than a dropped variable.
+    if spec.env.get(FACTORY_PUBLISHING_IDENTITY_ENV) != publishing_identity:
+        raise WorklinkError(
+            "factory launch environment does not carry the resolved publishing identity"
+        )
 
 
 def read_work_item(
@@ -1843,6 +1858,18 @@ class WorklinkRunner:
                     "GIT_AUTHOR_EMAIL": git_email,
                     "GIT_COMMITTER_NAME": git_name,
                     "GIT_COMMITTER_EMAIL": git_email,
+                    # The factory child does the publishing, and 0.7.5 compares this
+                    # declared identity against ``gh api /user`` at Gate 1.
+                    #
+                    # Two DIFFERENT names are in play: the operator selects the identity
+                    # with MIMIR_FACTORY_PUBLISHING_IDENTITY, the child reads the
+                    # factory's own FACTORY_PUBLISHING_IDENTITY. Forward the value the
+                    # controller already resolved and verified above, under the child's
+                    # name -- inheritance alone would carry nothing in the local case,
+                    # where the identity comes from .factory.json and no variable is
+                    # exported at all. This also keeps the controller authoritative over
+                    # whatever .factory.json the sandbox happens to hold.
+                    FACTORY_PUBLISHING_IDENTITY_ENV: publishing_identity,
                 },
                 transcript_root=self.home / "state" / "worklink" / "transcripts",
             )
@@ -1854,7 +1881,7 @@ class WorklinkRunner:
                 branch=f"feature/{run_id}",
                 test_command=test_cmd,
             )
-            _require_factory_launch_binding(spec, run_id)
+            _require_factory_launch_binding(spec, run_id, publishing_identity)
             factory_record = FactoryRunRecord(
                 run_id=run_id,
                 issue_id=issue_id,
