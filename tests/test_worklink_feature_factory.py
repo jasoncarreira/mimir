@@ -804,6 +804,27 @@ class _FakeLaunchProcess:
         self.killed = True
 
 
+def _own_opencode_resolution(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Pin the inputs ``work_spec`` resolves the opencode invocation from.
+
+    Without this the model/auth resolution reads whatever the developer's machine
+    happens to have. A real ``~/.local/share/opencode/auth.json`` makes these tests
+    pass locally and fail everywhere else with
+    ``feature_factory_opencode_resolution_failed`` -- which is exactly what happened.
+    """
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
+    monkeypatch.delenv("XDG_DATA_HOME", raising=False)
+    monkeypatch.setenv("MIMIR_MODEL_SPEC", "codex-plus:gpt-5.6-luna")
+    monkeypatch.delenv("MIMIR_FACTORY_MAX_RETRIES", raising=False)
+    auth = tmp_path / ".local" / "share" / "opencode" / "auth.json"
+    auth.parent.mkdir(parents=True, exist_ok=True)
+    auth.write_text(
+        json.dumps({"openai": {"type": "oauth", "refresh": "subscription"}}),
+        encoding="utf-8",
+    )
+
+
 def _factory_order(tmp_path: Path, identity: str) -> WorkOrder:
     return WorkOrder(
         issue_id=1551,
@@ -822,7 +843,7 @@ def _factory_order(tmp_path: Path, identity: str) -> WorkOrder:
 
 
 def test_work_spec_carries_the_publishing_identity_into_the_launch_spec(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """The launch spec, not just the control env, must carry the identity.
 
@@ -831,6 +852,7 @@ def test_work_spec_carries_the_publishing_identity_into_the_launch_spec(
     only serves ``status``/``resume``/``heartbeat``/``lock``, so asserting there
     exercises the wrong process boundary.
     """
+    _own_opencode_resolution(tmp_path, monkeypatch)
     spec = FeatureFactoryBackend(entrypoint="/absolute/factory.js").work_spec(
         _factory_order(tmp_path, "mimir-carreira"),
         attempt=1,
@@ -853,6 +875,7 @@ async def test_launch_child_environment_carries_the_publishing_identity(
     exact name, so this passes only because ``WorkSpec.env`` is merged over it. Stub
     the allowlist to empty so the assertion cannot be satisfied by inheritance.
     """
+    _own_opencode_resolution(tmp_path, monkeypatch)
     import asyncio as _asyncio
 
     from mimir.worklink.compute import LocalSubprocessComputeBackend
