@@ -2516,6 +2516,80 @@ async def test_run_github_poller_logs_stale_recovery_drop(
 
 
 @pytest.mark.asyncio
+async def test_run_github_poller_replay_and_delivery_share_relevance_cache(
+    tmp_path: Path, home: Path, monkeypatch,
+) -> None:
+    """One poll cycle resolves each distinct PR once across both paths."""
+    skill_dir = tmp_path / "github-poller"
+    persist_dir = tmp_path / "persist" / "github-activity"
+    _install_script(skill_dir, "poller.py", """
+import json
+print(json.dumps({
+    "poller": "github-activity",
+    "prompt": "handle fresh event",
+    "event_type": "pr_opened",
+    "repo": "owner/repo",
+    "number": 42,
+    "subject_type": "pull_request",
+}))
+""")
+    cfg = PollerConfig(
+        name="github-activity",
+        command=f"{sys.executable} poller.py",
+        cron="* * * * *",
+        env={},
+        skill_dir=skill_dir,
+        persist_dir=persist_dir,
+        recover_failed_turns=True,
+    )
+    prior = AgentEvent(
+        trigger="poller",
+        channel_id="poller:github-activity",
+        content="retry event",
+        source="poller",
+        source_id="poller:github-activity:prior",
+        extra={"poller_name": "github-activity", "items": [{
+            "event_type": "pr_opened",
+            "repo": "owner/repo",
+            "number": 42,
+            "subject_type": "pull_request",
+        }]},
+    )
+    await poller_recovery.stash_enqueued_event(
+        persist_dir, prior, enqueued_at="2026-06-04T07:59:00+00:00",
+    )
+    with (home / "logs" / "events.jsonl").open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps({
+            "type": "turn_failed",
+            "timestamp": "2026-06-04T08:00:00+00:00",
+            "channel_id": "poller:github-activity",
+            "source_id": prior.source_id,
+        }) + "\n")
+
+    api_calls: list[str] = []
+
+    def attest(endpoint, token):
+        api_calls.append(endpoint)
+        return 200, {"state": "open"}
+
+    monkeypatch.setattr("mimir.pollers._github_api_attestation", attest)
+
+    delivered: list[AgentEvent] = []
+
+    async def enqueue(event, *, relevance_check=None):
+        if relevance_check is not None:
+            assert await relevance_check(event) is True
+        delivered.append(event)
+        return True
+
+    emitted = await run_poller(cfg, enqueue=enqueue)
+
+    assert emitted == 1
+    assert len(delivered) == 2
+    assert api_calls == ["repos/owner/repo/pulls/42"]
+
+
+@pytest.mark.asyncio
 async def test_run_poller_recovery_expiration_logs_loss(
     tmp_path: Path, home: Path,
 ) -> None:
