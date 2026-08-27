@@ -371,8 +371,8 @@ Per-issue flow (one `run`):
 2. **Claim** (`claims.py`). Lock + claim comment (agent id, ts,
    attempt N).
 3. **Checkout.** Create a self-contained sibling checkout with `git clone
-   --local`, then check out `issue/<issue>-a<attempt>` from the **configured
-   base branch**
+    --local`, then check out `issue/<issue>-a<attempt>` from the **configured
+    base branch** in the dedicated repository named by `WORKLINK_REPO`
    (`defaults.base_branch` in `worklink.yaml`, default `main`; a `mimir
    worklink run --base <branch>` flag overrides per run). The same base is the
    diff floor (`base...head`) and the PR target (`gh pr create --base
@@ -388,8 +388,9 @@ Per-issue flow (one `run`):
    collide with the first attempt's kept checkout AND its branch, and
    `attempts < 3` could never actually run more than once. Each retry
    gets a fresh path + branch; autopsy artifacts from prior attempts
-   stay untouched until the reaper prunes them. Never a long-lived
-   per-worker branch. Immediately before fetching and branching, Worklink runs
+    stay untouched until the reaper prunes them. Never a long-lived
+    per-worker branch. `WORKLINK_REPO` is never inferred from the process cwd,
+    installed package, or module location. Immediately before fetching and branching, Worklink runs
    one porcelain status check as the account that owns the base repository and
    refuses a dirty index or working tree. The refusal event and error name
    bounded samples of staged, unstaged, and non-ignored untracked paths; ignored
@@ -606,14 +607,29 @@ work, but it does not prevent reads or writes elsewhere in `/workspace`
 or `/mimir-home` if the backend agent/tool chooses to do them. Treat
 checkout isolation as an audit/review boundary, not a security boundary.
 
-The configured base repository currently has two coupled roles: it is both the
-source from which every attempt branches and the running controller's own source
-tree (`WORKLINK_REPO=/workspace/mimir` in the production layout). A backend write
-outside its checkout can therefore contaminate future builds and alter files
-beneath the live process. The pre-branch cleanliness check is a liveness guard as
-well as an input-integrity check, and fails closed if the controller is not
-running as the base directory's owner. Separating these roles is a deployment
-change outside Worklink's checkout lifecycle.
+The configured base repository has one role: it is the independently provisioned
+source from which attempts branch. It must not be the running controller's source
+checkout. Checkout creation compares `WORKLINK_REPO` with the explicitly declared
+`MIMIR_SOURCE_DIR` and refuses equal, ancestor, or descendant paths. This check does
+not inspect `__file__`, the installed package root, or the process cwd. An editable
+deployment must therefore set `MIMIR_SOURCE_DIR` to its controller checkout; omitting
+that declaration makes separation conventional rather than enforced. A PyPI install
+has no controller source checkout and leaves `MIMIR_SOURCE_DIR` unset, but it still
+must configure a separately fetched or operator-provisioned `WORKLINK_REPO`.
+
+The dedicated base remains mutable only by controller Git maintenance. Immediately
+before every build Worklink refuses a dirty index/worktree, fetches the configured
+base branch from `origin`, verifies the fetched tip, and branches from that tip.
+Thus deployment upgrades do not move build inputs; the intended project and branch
+relationship is expressed by `repositories.yaml` (`slug`, exact `origin`, and
+`base_branch`) plus `worklink.yaml.repository`, and startup/fetch checks enforce it.
+Updating the base through its origin does not alter installed controller code.
+
+Local clone hardlinks remain available between this dedicated base and ordinary
+attempt checkouts, so their object sharing cannot reach the controller source.
+Worker-eligible uid-dropped checkouts already use `--no-hardlinks`, costing the
+measured 179 MB per Mimir clone instead of approximately 0 MB. Foreign-owner
+detection and hardlink-failure fallback remain unchanged.
 
 This is acceptable for **operator-invoked** slice-1 runs on bounded issues
 because the output still lands as a review PR and the executor observes
@@ -751,9 +767,11 @@ leaf issues with explicit acceptance criteria and review criteria.
 
 ### Prerequisites
 
-- Run from the target git repository (`/workspace/mimir` for mimir source
-  work) and point `--home` at the agent home that owns Chainlink and Worklink
-  state (`/mimir-home` in production).
+- Provision a dedicated clone for `WORKLINK_REPO`; do not use the checkout from
+  which an editable Mimir controller runs. `mimir worklink run` requires either
+  `WORKLINK_REPO` or an explicit `--repo` and never falls back to cwd. Point
+  `--home` at the agent home that owns Chainlink and Worklink state
+  (`/mimir-home` in production).
 - The Chainlink tracker must have an agent identity for the executor. If lock
   claims fail with a missing-agent/identity error, initialize it once from the
   Chainlink repo: `cd /mimir-home && chainlink agent init mimir-worklink`.
@@ -798,8 +816,7 @@ Before a first real run on a new issue shape, render the work order without
 claiming or spawning the backend:
 
 ```bash
-cd /workspace/mimir
-uv run mimir worklink run <issue-id> --home /mimir-home --dry-run
+mimir worklink run <issue-id> --home /mimir-home --dry-run
 ```
 
 A dry run is a prompt/config validation step only. It does not create a claim,
@@ -808,8 +825,7 @@ checkout, evidence bundle, branch, or PR.
 ### Real run
 
 ```bash
-cd /workspace/mimir
-uv run mimir worklink run <issue-id> \
+mimir worklink run <issue-id> \
   --home /mimir-home \
   --test-command 'uv run pytest -q <focused-tests> --tb=short'
 ```
@@ -849,6 +865,19 @@ Do not treat a backend's prose as evidence when these fields disagree. Empty
 diff with a nominal backend success is demoted to failure.
 
 ### Recovery and cleanup
+
+For the current mimirbot migration, first stop new dispatch and let in-flight
+claims finish (or stop them through the normal verified Worklink stop path). Clone
+the configured Mimir origin as the controller account into a persistent path such
+as `/var/lib/mimir-worklink/base/mimir`, configure that path as the inventory root,
+set `WORKLINK_REPO` to it, and keep `MIMIR_SOURCE_DIR=/workspace/mimir` while the
+controller remains an editable checkout. Restart only after startup validates the
+new root and origin. Existing attempt checkouts retain their own Git directories
+and recorded base path; do not move them mid-claim. Retained completed/failed
+checkouts may be pruned after the switch by the old-path cleanup procedure. A host
+that has never had a base must be provisioned with this clone before startup;
+Worklink does not guess a checkout or clone destination on first use and fails
+closed when `WORKLINK_REPO` is absent.
 
 Current slice-1 recovery is manual:
 

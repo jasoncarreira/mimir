@@ -67,7 +67,10 @@ def add_argparse(
         help="Agent home (overrides MIMIR_HOME; default: cwd).",
     )
     run_p.add_argument(
-        "--repo", type=Path, default=None, help="Git repo to work in (default: cwd)."
+        "--repo",
+        type=Path,
+        default=None,
+        help="Dedicated Worklink base repository (default: WORKLINK_REPO).",
     )
     run_p.add_argument(
         "--test-command", default=None, help="Override the configured evidence test command."
@@ -112,7 +115,10 @@ def add_argparse(
         help="Agent home (overrides MIMIR_HOME; default: cwd).",
     )
     run_epic_p.add_argument(
-        "--repo", type=Path, default=None, help="Git repo to work in (default: cwd)."
+        "--repo",
+        type=Path,
+        default=None,
+        help="Dedicated Worklink base repository (default: WORKLINK_REPO).",
     )
     run_epic_p.add_argument(
         "--autonomous",
@@ -151,7 +157,11 @@ def dispatch(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
         return 1
 
     home = (args.home or Path(os.environ.get("MIMIR_HOME") or Path.cwd())).resolve()
-    repo = (args.repo or Path.cwd()).resolve()
+    try:
+        repo = _resolve_worklink_repo(args.repo)
+    except RuntimeError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
     os.environ["MIMIR_HOME"] = str(home)
     try:
         from ..event_logger import init_logger
@@ -290,7 +300,11 @@ def _format_elapsed(seconds: float) -> str:
 def _run_epic(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
     """Handle the run-epic command for worklink:epic issues via feature-factory."""
     home = (args.home or Path(os.environ.get("MIMIR_HOME") or Path.cwd())).resolve()
-    repo = (args.repo or Path.cwd()).resolve()
+    try:
+        repo = _resolve_worklink_repo(args.repo)
+    except RuntimeError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
     os.environ["MIMIR_HOME"] = str(home)
     try:
         from ..event_logger import init_logger
@@ -324,3 +338,14 @@ def _run_epic(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
     if result.evidence_path:
         print(f"evidence: {result.evidence_path}")
     return 0 if result.status in {"completed", "review_ready", "blocked"} else 1
+
+
+def _resolve_worklink_repo(explicit: Path | None) -> Path:
+    if explicit is not None:
+        return explicit.resolve()
+    configured = os.environ.get("WORKLINK_REPO") or os.environ.get("MIMIR_WORKLINK_REPO")
+    if not configured:
+        raise RuntimeError(
+            "WORKLINK_REPO is required; provision a dedicated Worklink base repository or pass --repo"
+        )
+    return Path(configured).resolve()

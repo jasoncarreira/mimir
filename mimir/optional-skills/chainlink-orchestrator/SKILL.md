@@ -4,8 +4,8 @@ description: "The two model-touching halves of Worklink, shipped as one opt-in s
 env:
   required:
     - name: WORKLINK_REPO
-      description: "Absolute path to the git repo the backend works in (e.g. /path/to/your/repo). The ready-queue poller skips dispatch until this is set; the planner half does not need it."
-      example: "/path/to/your/repo"
+      description: "Absolute path to a dedicated base clone from which Worklink creates attempt checkouts. It must not be the running Mimir source checkout. The ready-queue poller skips dispatch until this is set; the planner half does not need it."
+      example: "/var/lib/mimir-worklink/base/project"
   optional:
     - name: WORKLINK_RUN_BIN
       description: "Command (shlex-split) the poller invokes for dispatch. Default `mimir`; set to `uv run mimir` or an absolute venv path if bare `mimir` isn't on PATH."

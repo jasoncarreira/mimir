@@ -246,6 +246,34 @@ def test_clean_base_is_accepted_without_an_event(tmp_path: Path) -> None:
     assert events == []
 
 
+def test_controller_source_overlap_guard_refuses_same_tree(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = _repo_with_main(tmp_path)
+    monkeypatch.setenv("MIMIR_SOURCE_DIR", str(repo))
+
+    with pytest.raises(RuntimeError, match="overlaps the running controller source"):
+        create_isolated_checkout(repo, issue_id=1465, attempt=1)
+
+
+def test_dirty_worklink_base_cannot_contaminate_controller_source(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    controller_root = tmp_path / "controller-tree"
+    controller_root.mkdir()
+    controller = _repo_with_main(controller_root)
+    base = tmp_path / "worklink-base"
+    subprocess.run(["git", "clone", "-q", _git(controller, "remote", "get-url", "origin"), str(base)], check=True)
+    monkeypatch.setenv("MIMIR_SOURCE_DIR", str(controller))
+    (base / "foreign.txt").write_text("build contamination\n", encoding="utf-8")
+
+    with pytest.raises(RuntimeError, match=r"base repo refused \(dirty\)"):
+        create_isolated_checkout(base, issue_id=1465, attempt=2)
+
+    assert _git(controller, "status", "--porcelain") == ""
+    assert not (controller / "foreign.txt").exists()
+
+
 def test_staged_addition_refuses_base_and_names_path(tmp_path: Path) -> None:
     repo = _repo_with_main(tmp_path)
     (repo / "staged.txt").write_text("foreign\n", encoding="utf-8")
