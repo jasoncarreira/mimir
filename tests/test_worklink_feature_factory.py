@@ -13,6 +13,7 @@ import pytest
 from mimir.worklink.backends.base import WorkOrder
 from mimir.worklink.backends.feature_factory import (
     FACTORY_COMMANDS,
+    FACTORY_PUBLISHING_IDENTITY_ENV,
     FACTORY_VERSION,
     FactoryContractError,
     FeatureFactoryBackend,
@@ -245,7 +246,7 @@ def test_status_rejects_invalid_utf8_nul_and_oversize(payload: bytes) -> None:
 
 def test_resolve_entrypoint_is_absolute_package_bound_and_lockstep(tmp_path: Path) -> None:
     entrypoint = package_entrypoint(tmp_path)
-    assert FACTORY_VERSION == "0.7.4"
+    assert FACTORY_VERSION == "0.7.5"
     assert resolve_factory_entrypoint(entrypoint) == entrypoint.resolve()
     with pytest.raises(FactoryContractError, match="absolute"):
         resolve_factory_entrypoint(Path("feature-factory/bin/factory.js"))
@@ -750,3 +751,154 @@ def test_migrated_factory_consumers_have_finite_legacy_free_inventory() -> None:
     for relative in consumers:
         source = (root / relative).read_text(encoding="utf-8")
         assert all(token not in source for token in forbidden), relative
+
+
+def test_control_environment_forwards_the_factory_publishing_identity(monkeypatch) -> None:
+    """Factory CONTROL commands (status/resume/heartbeat/lock) receive the variable.
+
+    This is the ``_control`` path only. The launch that publishes builds its
+    environment from ``WorkSpec.env`` instead -- see
+    ``test_launch_child_environment_carries_the_publishing_identity``.
+
+    feature-factory 0.7.5 lets a nonempty inherited value replace `.factory.json`'s
+    `publishing_identity` as the declared identity the driver checks against
+    `gh api /user`. The mimir repository publishes from two accounts -- a
+    maintainer's checkout as ``jasoncarreira``, mimirbot as ``mimir-carreira`` --
+    so the deployment, not the tracked file, has to select it.
+
+    Without the allowlist entry the deployment exports the variable and the driver
+    never sees it. The symptom is a Gate 1 park naming the FILE's identity, which
+    reads as a misconfiguration rather than a stripped variable -- so assert the
+    forwarding rather than trusting that exporting it is enough.
+    """
+    from mimir.worklink.backends.feature_factory import _control_environment
+
+    monkeypatch.setenv("FACTORY_PUBLISHING_IDENTITY", "mimir-carreira")
+    assert _control_environment().get("FACTORY_PUBLISHING_IDENTITY") == "mimir-carreira"
+
+
+def test_control_environment_still_drops_unlisted_variables(monkeypatch) -> None:
+    """The allowlist stays an allowlist -- adding one name must not open it up."""
+    from mimir.worklink.backends.feature_factory import _control_environment
+
+    monkeypatch.setenv("FACTORY_PUBLISHING_IDENTITY", "mimir-carreira")
+    monkeypatch.setenv("SOME_UNRELATED_SECRET", "must-not-leak")
+    env = _control_environment()
+    assert "SOME_UNRELATED_SECRET" not in env
+    assert "FACTORY_PUBLISHING_IDENTITY" in env
+
+
+class _FakeLaunchProcess:
+    """Minimal asyncio process stand-in for capturing a launch environment."""
+
+    def __init__(self) -> None:
+        self.returncode = 0
+        self.killed = False
+        self.stdout = None
+        self.stderr = None
+
+    async def wait(self) -> int:
+        return self.returncode
+
+    def kill(self) -> None:
+        self.killed = True
+
+
+def _own_opencode_resolution(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Pin the inputs ``work_spec`` resolves the opencode invocation from.
+
+    Without this the model/auth resolution reads whatever the developer's machine
+    happens to have. A real ``~/.local/share/opencode/auth.json`` makes these tests
+    pass locally and fail everywhere else with
+    ``feature_factory_opencode_resolution_failed`` -- which is exactly what happened.
+    """
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
+    monkeypatch.delenv("XDG_DATA_HOME", raising=False)
+    monkeypatch.setenv("MIMIR_MODEL_SPEC", "codex-plus:gpt-5.6-luna")
+    monkeypatch.delenv("MIMIR_FACTORY_MAX_RETRIES", raising=False)
+    auth = tmp_path / ".local" / "share" / "opencode" / "auth.json"
+    auth.parent.mkdir(parents=True, exist_ok=True)
+    auth.write_text(
+        json.dumps({"openai": {"type": "oauth", "refresh": "subscription"}}),
+        encoding="utf-8",
+    )
+
+
+def _factory_order(tmp_path: Path, identity: str) -> WorkOrder:
+    return WorkOrder(
+        issue_id=1551,
+        checkout=tmp_path,
+        prompt="ignored by the host feature workflow",
+        rules=None,
+        timeout_s=43200,
+        env={
+            "MIMIR_WORK_ITEM_JSON": json.dumps(
+                {"run_id": "chainlink-1551", "title": "epic", "body": "build"}
+            ),
+            FACTORY_PUBLISHING_IDENTITY_ENV: identity,
+        },
+        transcript_root=tmp_path,
+    )
+
+
+def test_work_spec_carries_the_publishing_identity_into_the_launch_spec(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The launch spec, not just the control env, must carry the identity.
+
+    The factory child publishes at Gate 1 and compares its declared identity against
+    ``gh api /user``. It is launched from ``WorkSpec.env``; ``_control_environment``
+    only serves ``status``/``resume``/``heartbeat``/``lock``, so asserting there
+    exercises the wrong process boundary.
+    """
+    _own_opencode_resolution(tmp_path, monkeypatch)
+    spec = FeatureFactoryBackend(entrypoint="/absolute/factory.js").work_spec(
+        _factory_order(tmp_path, "mimir-carreira"),
+        attempt=1,
+        repo_url="https://github.com/owner/repo.git",
+        base_ref="main",
+        branch="epic/1551",
+        test_command="uv run pytest -q",
+    )
+
+    assert spec.env[FACTORY_PUBLISHING_IDENTITY_ENV] == "mimir-carreira"
+
+
+@pytest.mark.asyncio
+async def test_launch_child_environment_carries_the_publishing_identity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """End of the chain: the value reaches the actual child process environment.
+
+    ``_local_child_env()`` is an allowlist that admits neither ``FACTORY_`` nor the
+    exact name, so this passes only because ``WorkSpec.env`` is merged over it. Stub
+    the allowlist to empty so the assertion cannot be satisfied by inheritance.
+    """
+    _own_opencode_resolution(tmp_path, monkeypatch)
+    import asyncio as _asyncio
+
+    from mimir.worklink.compute import LocalSubprocessComputeBackend
+
+    captured: dict[str, dict[str, str]] = {}
+
+    async def fake_exec(*_args: str, **kwargs: Any) -> _FakeLaunchProcess:
+        captured["env"] = kwargs["env"]
+        return _FakeLaunchProcess()
+
+    monkeypatch.setattr(_asyncio, "create_subprocess_exec", fake_exec)
+    monkeypatch.setattr("mimir.worklink.compute._local_child_env", dict)
+
+    spec = FeatureFactoryBackend(entrypoint="/absolute/factory.js").work_spec(
+        _factory_order(tmp_path, "mimir-carreira"),
+        attempt=1,
+        repo_url="https://github.com/owner/repo.git",
+        base_ref="main",
+        branch="epic/1551",
+        test_command="uv run pytest -q",
+    )
+    handle = await LocalSubprocessComputeBackend().launch(spec)
+    try:
+        assert captured["env"][FACTORY_PUBLISHING_IDENTITY_ENV] == "mimir-carreira"
+    finally:
+        await LocalSubprocessComputeBackend().cleanup(handle)
