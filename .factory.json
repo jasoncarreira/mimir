@@ -3,7 +3,7 @@
   "verify": "uv run pytest -q --tb=short",
   "verify_timeout_ms": 1800000,
   "publish": "gh pr create --base \"$PR_BASE\" --head \"$FEATURE_BRANCH\" --title \"$PR_TITLE\" --body-file \"$PR_BODY_FILE\"",
-  "publishing_identity": "jasoncarreira",
+  "publishing_identity": "mimir-carreira",
   "bootstrap": "uv sync --locked --extra dev --extra bench",
   "pr_draft": false
 }
