@@ -2559,9 +2559,15 @@ def _require_factory_status(
     if status.dead_lock is None:
         raise WorklinkError("factory status dead-lock state is missing")
     if status.pr_base is not None and status.pr_base != record.base_ref:
-        raise WorklinkError("factory status base mismatch")
+        raise WorklinkError(
+            "factory status base mismatch: "
+            f"observed {status.pr_base!r}, expected {record.base_ref!r}"
+        )
     if require_pr_base and status.pr_base is None:
-        raise WorklinkError("factory status base mismatch")
+        raise WorklinkError(
+            "factory status base mismatch: "
+            f"observed {status.pr_base!r}, expected {record.base_ref!r}"
+        )
 
 
 def _fixed_command(
@@ -2675,6 +2681,8 @@ async def _verify_factory_completion(
         if status.status != "completed" or not status.is_terminal:
             raise WorklinkError("factory completion status is not authoritative")
         _require_factory_status(status, record, require_pr_base=True)
+        if status.slices is None or not any(":merged(" in item for item in status.slices):
+            raise WorklinkError("factory completion has no merged slice")
         if status.pr_draft:
             raise WorklinkError("factory completed with a draft PR")
         if status.pr_url is None:
@@ -3552,6 +3560,7 @@ def _create_backend_checkout(
         issue_id=issue_id,
         attempt=attempt,
         base=base,
+        checkout_branch=base if isinstance(backend, FeatureFactoryBackend) else None,
         base_fetch=base_fetch,
         event_logger=event_logger,
         runner=runner,

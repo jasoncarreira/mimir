@@ -2723,6 +2723,7 @@ def test_registered_backends_use_isolated_checkout_by_default(
                 "issue_id": 517,
                 "attempt": 2,
                 "base": "main",
+                "checkout_branch": "main" if backend_name == "feature_factory" else None,
                 "base_fetch": True,
                 "event_logger": None,
                 "runner": runner,
@@ -2730,6 +2731,85 @@ def test_registered_backends_use_isolated_checkout_by_default(
             },
         )
     ]
+
+
+def test_factory_checkout_has_three_way_target_branch_agreement_without_detached_head(
+    tmp_path: Path,
+) -> None:
+    import mimir.worklink.orchestrator as orchestrator
+
+    origin = tmp_path / "origin.git"
+    subprocess.run(["git", "init", "-q", "--bare", str(origin)], check=True)
+    repo = tmp_path / "repo"
+    subprocess.run(["git", "clone", "-q", str(origin), str(repo)], check=True)
+    subprocess.run(["git", "-C", str(repo), "config", "user.email", "t@example.com"], check=True)
+    subprocess.run(["git", "-C", str(repo), "config", "user.name", "Test"], check=True)
+    (repo / "seed.txt").write_text("seed\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(repo), "add", "seed.txt"], check=True)
+    subprocess.run(["git", "-C", str(repo), "commit", "-q", "-m", "seed"], check=True)
+    subprocess.run(["git", "-C", str(repo), "push", "-q", "origin", "HEAD:main"], check=True)
+    subprocess.run(
+        ["git", "-C", str(repo), "checkout", "-q", "-b", "feature/acp"], check=True
+    )
+    subprocess.run(
+        ["git", "-C", str(repo), "commit", "-q", "--allow-empty", "-m", "feature"],
+        check=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(repo), "push", "-q", "origin", "feature/acp"], check=True
+    )
+
+    lease = orchestrator._create_backend_checkout(
+        repo,
+        issue_id=1483,
+        attempt=1,
+        base="feature/acp",
+        backend=FeatureFactoryBackend(),
+        runner=lambda args: subprocess.run(
+            args, capture_output=True, text=True, check=False
+        ),
+    )
+    symbolic = subprocess.run(
+        ["git", "-C", str(lease.path), "symbolic-ref", "--quiet", "--short", "HEAD"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    sandbox = lease.path / ".factory-sandboxes" / "chainlink-1483"
+    status = parse_factory_status(
+        {
+            "run_id": "chainlink-1483",
+            "valid": True,
+            "sandbox_path": str(sandbox),
+            "status": "running",
+            "mode": "autonomous",
+            "branch": "feature/chainlink-1483",
+            "pr_base": symbolic.stdout.strip(),
+            "pr_draft": False,
+            "lock": "fresh",
+            "dead_lock": False,
+        }
+    )
+    record = FactoryRunRecord(
+        run_id="chainlink-1483",
+        issue_id=1483,
+        attempt=1,
+        repository="owner/repo",
+        base_ref="feature/acp",
+        branch="feature/chainlink-1483",
+        launcher="/opt/factory/bin/factory.js",
+        sandbox=str(sandbox),
+        session=None,
+        handle=None,
+        status=None,
+        observed_at=None,
+        controller_phase="running",
+    )
+
+    assert symbolic.returncode == 0, "factory placement must never leave a detached HEAD"
+    assert status.pr_base == symbolic.stdout.strip() == record.base_ref
+    assert lease.branch == record.base_ref
+    orchestrator._require_factory_status(status, record)
 
 
 def test_concurrent_opencode_checkouts_do_not_share_parent_git_project(tmp_path: Path) -> None:
@@ -4628,7 +4708,10 @@ def test_factory_status_binding_rejects_populated_base_mismatch(tmp_path: Path) 
     )
     status = _factory_lifecycle_status(sandbox, status="running", pr_base="develop")
 
-    with pytest.raises(orchestrator.WorklinkError, match="base mismatch"):
+    with pytest.raises(
+        orchestrator.WorklinkError,
+        match="observed 'develop', expected 'main'",
+    ):
         orchestrator._require_factory_status(status, record)
 
 
@@ -5134,6 +5217,7 @@ def _completion_record(sandbox: Path) -> FactoryRunRecord:
             **_factory_lifecycle_status(sandbox, status="completed").to_json(),
             "lock": "absent",
             "lock_session": None,
+            "slices": ["implementation:merged(feature/700)"],
             "pr_url": "https://github.com/owner/repo/pull/42",
         }
     )
@@ -5281,6 +5365,7 @@ def _completion_runner(
         "mode",
         "branch",
         "base",
+        "merged_slice",
         "draft",
         "url_missing",
         "url_noncanonical",
@@ -5347,6 +5432,8 @@ def test_factory_completion_rejection_matrix_persists_failed_evidence(
         status_overrides["branch"] = "wrong"
     elif case == "base":
         status_overrides["pr_base"] = "develop"
+    elif case == "merged_slice":
+        status_overrides["slices"] = ["implementation:ready"]
     elif case == "draft":
         status_overrides["pr_draft"] = True
     elif case == "url_missing":

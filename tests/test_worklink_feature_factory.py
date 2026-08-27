@@ -537,6 +537,7 @@ def test_opencode_launch_argv_has_exact_staged_factory_payload(
     assert "--autonomous" in payload.split()
     assert "--auto" not in payload.split()
     assert "--base" not in payload.split()
+    assert "--pr-base" not in payload.split()
     assert spec.backend_config["model"] == "openai/gpt-5.6-luna"
     assert spec.backend_config["model_diverged"] is False
     assert spec.backend_config["run_id"] == "chainlink-1551"

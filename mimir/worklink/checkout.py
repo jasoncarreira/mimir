@@ -458,6 +458,7 @@ def create_isolated_checkout(
     issue_id: int,
     attempt: int,
     base: str = "main",
+    checkout_branch: str | None = None,
     worklink_dir: str = ".worklink",
     base_fetch: bool = True,
     event_logger: EventLogger | None = None,
@@ -484,7 +485,7 @@ def create_isolated_checkout(
     path = _isolated_checkout_path(
         repo, worklink_dir, issue_id, attempt, worker_authorized=False
     )
-    branch = f"issue/{issue_id}-a{attempt}"
+    branch = checkout_branch or f"issue/{issue_id}-a{attempt}"
     path.parent.mkdir(parents=True, exist_ok=True)
     if path.exists():
         raise RuntimeError(f"attempt checkout already exists: {path}")
@@ -1233,12 +1234,16 @@ def cleanup_checkout(
             rmtree_missing_ok(lease.path.parent)
             return True
         rmtree_missing_ok(lease.path)
-        delete = runner(["git", "-C", str(lease.repo), "branch", "-D", lease.branch])
-        # Isolated-checkout branches usually exist only inside the clone that was
-        # just removed; deleting the same name from the parent repo is a tolerated
-        # legacy no-op if an older attempt shape happened to create it there.
-        if delete.returncode not in (0, 1):
-            raise RuntimeError((delete.stderr or delete.stdout).strip() or "git branch delete failed")
+        attempt_branch = f"issue/{lease.issue_id}-a{lease.attempt}"
+        if lease.branch == attempt_branch:
+            delete = runner(["git", "-C", str(lease.repo), "branch", "-D", lease.branch])
+            # Isolated-checkout attempt branches usually exist only inside the clone
+            # that was just removed. A factory checkout instead uses the target
+            # branch, which must never be deleted from the parent repository.
+            if delete.returncode not in (0, 1):
+                raise RuntimeError(
+                    (delete.stderr or delete.stdout).strip() or "git branch delete failed"
+                )
         return True
     result = runner(["git", "-C", str(lease.repo), "worktree", "remove", "--force", str(lease.path)])
     if result.returncode != 0:
