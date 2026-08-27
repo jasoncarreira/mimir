@@ -948,7 +948,11 @@ def reattach_inflight_worklink_runs(
 
     from .event_logger import log_event_sync
     from .worklink.control import reconcile_run_states
-    from .worklink.factory_state import factory_process_is_verified_dead, list_factory_records
+    from .worklink.factory_state import (
+        age_out_factory_records,
+        factory_process_is_verified_dead,
+        list_factory_records,
+    )
     from .worklink.run_state import reattach_dispatch_argv
 
     spawn = popen or subprocess.Popen
@@ -965,11 +969,12 @@ def reattach_inflight_worklink_runs(
     # event and never abort startup.
     states = reconcile_run_states(home, event_logger=emit)
     try:
+        age_out_factory_records(home, event_logger=emit)
         factory_records = [
             record
             for record in list_factory_records(home)
             if factory_process_is_verified_dead(record)
-            and record.controller_phase not in {"parked", "terminal", "stopped"}
+            and record.controller_phase not in {"failed", "parked", "terminal", "stopped"}
             and (record.status is None or not record.status.is_terminal)
         ]
     except Exception as exc:

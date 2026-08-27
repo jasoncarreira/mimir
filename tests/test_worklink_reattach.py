@@ -764,7 +764,13 @@ def test_reattach_inflight_noop_without_repo(tmp_path: Path, monkeypatch) -> Non
     assert spawned == []
 
 
-def _factory_restart_record(home: Path, *, status: str, ticks: int | None) -> FactoryRunRecord:
+def _factory_restart_record(
+    home: Path,
+    *,
+    status: str,
+    ticks: int | None,
+    controller_phase: str | None = None,
+) -> FactoryRunRecord:
     sandbox = home / "sandbox"
     sandbox.mkdir(exist_ok=True)
     factory_status = parse_factory_status(
@@ -802,7 +808,11 @@ def _factory_restart_record(home: Path, *, status: str, ticks: int | None) -> Fa
         handle=LaunchHandle("local_subprocess", "999999999", ticks),
         status=factory_status,
         observed_at="2026-08-18T12:00:00+00:00",
-        controller_phase="parked" if status == "needs-human" else "running",
+        controller_phase=(
+            controller_phase
+            if controller_phase is not None
+            else "parked" if status == "needs-human" else "running"
+        ),
     )
     save_factory_record(home, record)
     return record
@@ -852,6 +862,31 @@ def test_factory_startup_recovery_routes_only_verified_dead_runs_through_run_epi
         ]]
     else:
         assert spawned == []
+
+
+def test_factory_startup_recovery_does_not_spawn_run_epic_for_failed_record(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from mimir import server
+
+    _factory_restart_record(
+        tmp_path,
+        status="running",
+        ticks=1,
+        controller_phase="failed",
+    )
+    monkeypatch.setenv("WORKLINK_REPO", "/workspace/mimir")
+    spawned: list[list[str]] = []
+
+    dispatched = server.reattach_inflight_worklink_runs(
+        tmp_path,
+        popen=lambda argv, **kwargs: spawned.append(list(argv)) or object(),
+        event_logger=lambda *args, **kwargs: None,
+    )
+
+    assert dispatched == []
+    assert spawned == []
 
 
 def test_part_b_startup_recovery_emits_for_all_five_outcomes(

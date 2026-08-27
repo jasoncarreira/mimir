@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, replace
+from datetime import UTC, datetime, timedelta
 import json
 import os
 from pathlib import Path
+import shutil
 import stat
-from typing import Any, Callable
+import subprocess
+from typing import Any, Callable, Sequence
 
 from .._atomic import atomic_write_json
 from .backends.feature_factory import FactoryStatus, epic_run_id, parse_factory_status
@@ -14,7 +17,9 @@ from .run_state import process_is_zombie, process_start_ticks
 
 
 FACTORY_RECORD_VERSION = 2
+FACTORY_RECORD_RETENTION = timedelta(days=7)
 _MAX_RECORD_BYTES = 2 * 1024 * 1024
+_RETAINED_CONTROLLER_PHASES = frozenset({"failed", "parked", "stopped", "terminal"})
 
 
 def _valid_record_run_id(run_id: str) -> bool:
@@ -371,6 +376,127 @@ def list_factory_records(home: Path) -> list[FactoryRunRecord]:
             continue
         records.append(load_factory_record(home, path.stem))
     return [record for record in records if record is not None]
+
+
+def factory_manifest_candidates(record: FactoryRunRecord) -> tuple[Path, Path]:
+    """Return the root-checkout and sandbox manifests that block factory init."""
+    sandbox = Path(record.sandbox)
+    if sandbox.parent.name != ".factory-sandboxes" or sandbox.name != record.run_id:
+        raise FactoryRecordError("factory sandbox is outside the retained-run layout")
+    repository = sandbox.parent.parent
+    return repository / ".factory" / record.run_id, sandbox / ".factory" / record.run_id
+
+
+def _record_observed_at(home: Path, record: FactoryRunRecord) -> datetime:
+    if record.observed_at is not None:
+        try:
+            observed = datetime.fromisoformat(record.observed_at.replace("Z", "+00:00"))
+            return observed.replace(tzinfo=UTC) if observed.tzinfo is None else observed.astimezone(UTC)
+        except ValueError:
+            pass
+    try:
+        modified = factory_record_path(home, record.run_id).stat().st_mtime
+    except OSError as exc:
+        raise FactoryRecordError("factory record age cannot be determined") from exc
+    return datetime.fromtimestamp(modified, UTC)
+
+
+def _remove_retained_path(path: Path) -> None:
+    try:
+        value = path.lstat()
+    except FileNotFoundError:
+        return
+    except OSError as exc:
+        raise FactoryRecordError(f"retained factory path is unavailable: {path}") from exc
+    try:
+        if stat.S_ISDIR(value.st_mode) and not stat.S_ISLNK(value.st_mode):
+            shutil.rmtree(path)
+        else:
+            path.unlink()
+    except OSError as exc:
+        raise FactoryRecordError(f"retained factory path cannot be removed: {path}") from exc
+
+
+def age_out_factory_records(
+    home: Path,
+    *,
+    now: datetime | None = None,
+    retention: timedelta = FACTORY_RECORD_RETENTION,
+    runner: Callable[[Sequence[str]], subprocess.CompletedProcess[str]] | None = None,
+    event_logger: Callable[..., None] | None = None,
+) -> list[Path]:
+    """Push and remove inactive retained factory runs after ``retention``.
+
+    The sandbox and both manifest candidates remain untouched unless every
+    local branch can first be pushed to ``origin``. Failures are emitted to the
+    Worklink event stream and left for a later retry.
+    """
+    if retention < timedelta(0):
+        raise ValueError("factory record retention cannot be negative")
+    current = (now or datetime.now(UTC)).astimezone(UTC)
+    if runner is None:
+        def run(args: Sequence[str]) -> subprocess.CompletedProcess[str]:
+            return subprocess.run(
+                list(args), capture_output=True, text=True, check=False, timeout=120
+            )
+    else:
+        run = runner
+    if event_logger is None:
+        from ..event_logger import log_event_sync
+
+        event_logger = log_event_sync
+
+    archived: list[Path] = []
+    for record in list_factory_records(home):
+        if record.controller_phase not in _RETAINED_CONTROLLER_PHASES:
+            continue
+        try:
+            if current - _record_observed_at(home, record) < retention:
+                continue
+            root_manifest, sandbox_manifest = factory_manifest_candidates(record)
+            sandbox = Path(record.sandbox)
+            if sandbox.exists():
+                if sandbox.is_symlink() or not sandbox.is_dir():
+                    raise FactoryRecordError("retained factory sandbox is not a directory")
+                branches = run(
+                    ["git", "-C", str(sandbox), "for-each-ref", "--format=%(refname)", "refs/heads"]
+                )
+                if branches.returncode != 0:
+                    detail = (branches.stderr or branches.stdout).strip()
+                    raise FactoryRecordError(
+                        f"cannot inspect retained factory branches: {detail[:500]}"
+                    )
+                if branches.stdout.strip():
+                    pushed = run(["git", "-C", str(sandbox), "push", "--all", "origin"])
+                    if pushed.returncode != 0:
+                        detail = (pushed.stderr or pushed.stdout).strip()
+                        raise FactoryRecordError(
+                            f"cannot push retained factory branches: {detail[:500]}"
+                        )
+            # Check and clear both contract candidates explicitly. The second is
+            # inside the sandbox, so it must be handled before the sandbox itself.
+            _remove_retained_path(root_manifest)
+            _remove_retained_path(sandbox_manifest)
+            _remove_retained_path(sandbox)
+            archived.append(
+                archive_factory_record(
+                    home,
+                    record,
+                    event_logger=event_logger,
+                    source_kind="retention_reaper",
+                    reason="retained factory record exceeded retention",
+                )
+            )
+        except Exception as exc:  # noqa: BLE001 - one retained run cannot block the sweep
+            event_logger(
+                "worklink_factory_record_age_out_failed",
+                issue_id=record.issue_id,
+                run_id=record.run_id,
+                attempt=record.attempt,
+                phase=record.controller_phase,
+                error=str(exc)[:500],
+            )
+    return archived
 
 
 def factory_process_is_alive(record: FactoryRunRecord) -> bool:
