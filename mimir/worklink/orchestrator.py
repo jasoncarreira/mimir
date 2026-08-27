@@ -171,6 +171,39 @@ class WorklinkRunResult:
     reason: str | None = None
 
 
+@dataclass
+class _TerminalClaimRelease:
+    claims: ChainlinkClaims
+    home: Path
+    issue_id: int
+    attempt: int
+    trigger_ready_scan: bool = False
+    attempted: bool = False
+    confirmed: bool = False
+
+    def __call__(self) -> bool:
+        if self.attempted:
+            return self.confirmed
+        self.attempted = True
+        try:
+            self.confirmed = _release_issue_and_clear_run_state(
+                self.claims,
+                home=self.home,
+                issue_id=self.issue_id,
+                attempt=self.attempt,
+                trigger_ready_scan=self.trigger_ready_scan,
+            )
+        except Exception:
+            self.confirmed = False
+        if not self.confirmed:
+            _log_terminal_recovery_failed(
+                issue_id=self.issue_id,
+                attempt=self.attempt,
+                outcome="terminal",
+            )
+        return self.confirmed
+
+
 class WorklinkError(RuntimeError):
     """Base error for operator-facing Worklink failures."""
 
@@ -673,6 +706,13 @@ class WorklinkRunner:
                 issue.issue_id, None, "failed", reason=claim.reason or "claim_failed"
             )
         record = claim.record
+        terminal_release = _TerminalClaimRelease(
+            claims,
+            home=self.home,
+            issue_id=issue.issue_id,
+            attempt=record.attempt,
+            trigger_ready_scan=autonomous,
+        )
         _log_event(
             "worklink_claimed",
             issue_id=issue.issue_id,
@@ -859,6 +899,7 @@ class WorklinkRunner:
                 runner=runner,
                 publication=publication,
                 executor_report_dir=executor_report_dir,
+                terminal_release=terminal_release,
             )
             delete_authorized_checkout = bool(
                 worker_uid_drop and result.review_ready and result.pr_url
@@ -886,17 +927,20 @@ class WorklinkRunner:
         except Exception as exc:
             transition_applied = False
             transition_error = None
-            try:
-                claims.transition_issue(
-                    issue.issue_id,
-                    status="failed",
-                    review_ready=False,
-                    attempt=record.budget_attempt or record.attempt,
-                    reason=str(exc),
-                )
-                transition_applied = True
-            except Exception as transition_exc:
-                transition_error = str(transition_exc)
+            if terminal_release():
+                try:
+                    claims.transition_issue(
+                        issue.issue_id,
+                        status="failed",
+                        review_ready=False,
+                        attempt=record.budget_attempt or record.attempt,
+                        reason=str(exc),
+                    )
+                    transition_applied = True
+                except Exception as transition_exc:
+                    transition_error = str(transition_exc)
+            else:
+                transition_error = "Chainlink did not confirm lock release"
             _log_event(
                 "worklink_transition",
                 issue_id=issue.issue_id,
@@ -940,13 +984,7 @@ class WorklinkRunner:
                         attempt=record.attempt,
                     )
             finally:
-                _release_issue_and_clear_run_state(
-                    claims,
-                    home=self.home,
-                    issue_id=issue.issue_id,
-                    attempt=record.attempt,
-                    trigger_ready_scan=autonomous,
-                )
+                terminal_release()
 
     async def _finalize(
         self,
@@ -968,6 +1006,7 @@ class WorklinkRunner:
         runner: Runner,
         publication: ControllerGitPublication | None = None,
         executor_report_dir: Path | None = None,
+        terminal_release: Callable[[], bool],
     ) -> WorklinkRunResult:
         """Post-launch pipeline: interpret the worker result, observe evidence,
         open the PR on a passing gate, then transition + clean up.
@@ -1210,6 +1249,19 @@ class WorklinkRunner:
         transition_applied = False
         transition_error = None
 
+        if not terminal_release():
+            return WorklinkRunResult(
+                issue.issue_id,
+                attempt,
+                "failed",
+                review_ready=validation.review_ready,
+                pr_url=pr_url,
+                evidence_path=evidence_path,
+                checkout=lease.path,
+                branch=lease.branch,
+                reason="terminal recovery incomplete: Chainlink lock release failed",
+            )
+
         def transition_issue() -> None:
             nonlocal transition_applied, transition_error
             try:
@@ -1304,6 +1356,12 @@ class WorklinkRunner:
             event_logger=_log_event,
             max_attempts=config.defaults.max_claim_attempts,
         )
+        terminal_release = _TerminalClaimRelease(
+            claims,
+            home=self.home,
+            issue_id=issue_id,
+            attempt=state.attempt,
+        )
         if state.shim_pid is not None:
             handle = LaunchHandle(
                 state.handle_substrate,
@@ -1319,20 +1377,13 @@ class WorklinkRunner:
                     await LocalSubprocessComputeBackend().cancel(handle)
             except (KeyError, RuntimeError, OSError, ValueError) as exc:
                 reason = f"reattach: worker cleanup failed: {exc}"
-            try:
+            if terminal_release():
                 claims.transition_issue(
                     issue_id,
                     status="failed",
                     review_ready=False,
                     attempt=state.attempt,
                     reason=reason,
-                )
-            finally:
-                _release_issue_and_clear_run_state(
-                    claims,
-                    home=self.home,
-                    issue_id=issue_id,
-                    attempt=state.attempt,
                 )
             _log_event(
                 "worklink_reattach_cleanup",
@@ -1369,14 +1420,24 @@ class WorklinkRunner:
                             if not expected_head
                             else "remote_head_mismatch"
                         ),
-                    )
+                )
                 restored_review = pr_state == "OPEN"
-                if restored_review:
+                if restored_review and terminal_release():
                     claims.transition_issue(
                         issue_id,
                         status="completed",
                         review_ready=True,
                         attempt=state.attempt,
+                    )
+                elif restored_review:
+                    return WorklinkRunResult(
+                        issue_id,
+                        state.attempt,
+                        "failed",
+                        pr_url=pr_url,
+                        evidence_path=review_ready.path,
+                        branch=state.branch,
+                        reason="terminal recovery incomplete: Chainlink lock release failed",
                     )
                 _log_event(
                     "worklink_reattach_reconciled",
@@ -1398,12 +1459,7 @@ class WorklinkRunner:
                     reason="reattach: reconciled completed evidence",
                 )
             finally:
-                _release_issue_and_clear_run_state(
-                    claims,
-                    home=self.home,
-                    issue_id=issue_id,
-                    attempt=state.attempt,
-                )
+                terminal_release()
         # Only resume a leaf still in-progress. If the reaper already recovered it
         # (or a prior run transitioned it) the work is no longer ours to finish —
         # drop the stale state and stop. ``_issue_has_label`` fails open (assume
@@ -1411,12 +1467,7 @@ class WorklinkRunner:
         # doesn't strand the worker.
         if not claims._issue_has_label(issue_id, "worklink:in-progress"):  # noqa: SLF001
             _log_event("worklink_reattach_skipped", issue_id=issue_id, reason="not_in_progress")
-            _release_issue_and_clear_run_state(
-                claims,
-                home=self.home,
-                issue_id=issue_id,
-                attempt=state.attempt,
-            )
+            terminal_release()
             return WorklinkRunResult(
                 issue_id, state.attempt, "failed", reason="reattach: leaf no longer in-progress"
             )
@@ -1511,13 +1562,14 @@ class WorklinkRunner:
                     attempt=state.attempt,
                     error=(compute_result.launch_error or "")[:300],
                 )
-                claims.transition_issue(
-                    issue_id,
-                    status="failed",
-                    review_ready=False,
-                    attempt=state.attempt,
-                    reason="reattach: worker lost after controller restart",
-                )
+                if terminal_release():
+                    claims.transition_issue(
+                        issue_id,
+                        status="failed",
+                        review_ready=False,
+                        attempt=state.attempt,
+                        reason="reattach: worker lost after controller restart",
+                    )
                 return WorklinkRunResult(
                     issue_id, state.attempt, "failed", reason="reattach: worker lost"
                 )
@@ -1537,18 +1589,20 @@ class WorklinkRunner:
                 test_cmd=test_cmd,
                 root_dirty_before=(),
                 runner=runner,
+                terminal_release=terminal_release,
             )
         except Exception as exc:
-            try:
-                claims.transition_issue(
-                    issue_id,
-                    status="failed",
-                    review_ready=False,
-                    attempt=state.attempt,
-                    reason=f"reattach failed: {exc}",
-                )
-            except Exception:
-                pass
+            if terminal_release():
+                try:
+                    claims.transition_issue(
+                        issue_id,
+                        status="failed",
+                        review_ready=False,
+                        attempt=state.attempt,
+                        reason=f"reattach failed: {exc}",
+                    )
+                except Exception:
+                    pass
             _log_event(
                 "worklink_reattach_failed", issue_id=issue_id, attempt=state.attempt, error=str(exc)
             )
@@ -1569,12 +1623,7 @@ class WorklinkRunner:
                             error=str(exc),
                         )
             finally:
-                _release_issue_and_clear_run_state(
-                    claims,
-                    home=self.home,
-                    issue_id=issue_id,
-                    attempt=state.attempt,
-                )
+                terminal_release()
 
     async def run_epic(
         self,
@@ -2863,6 +2912,19 @@ def _release_issue_and_clear_run_state(
         if trigger_ready_scan:
             _trigger_ready_scan_after_release(home)
     return True
+
+
+def _log_terminal_recovery_failed(*, issue_id: int, attempt: int, outcome: str) -> None:
+    _log_event(
+        "worklink_terminal_recovery_failed",
+        issue_id=issue_id,
+        attempt=attempt,
+        outcome=outcome,
+        lock_released=False,
+        label_transition_applied=False,
+        state_retained=True,
+        error="Chainlink did not confirm lock release",
+    )
 
 
 def _remove_executor_report_dir_best_effort(
