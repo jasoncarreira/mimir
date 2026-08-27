@@ -308,7 +308,7 @@ repository files and model-generated values never add permission entries.
 | Flag | Type | Default | Description |
 |---|---|---|---|
 | `GITHUB_REPOS` | csv `owner/repository` | unset | Legacy projection of `repositories.yaml` `repositories[].slug`. When the repository inventory is declared, an omitted value is derived and a disagreeing value is a startup error. Without the inventory, it retains the legacy repository allowlist behavior. |
-| `MIMIR_WORKLINK_REPO` | str | unset | Repo autonomous Worklink dispatch works in (back-compat alias of `WORKLINK_REPO`, which wins). |
+| `MIMIR_WORKLINK_REPO` | str | unset | Dedicated base repository Worklink branches from (back-compat alias of `WORKLINK_REPO`, which wins). Never inferred from cwd or the Mimir installation. |
 | `MIMIR_WORKLINK_AGENT_ID` | str | process-generated | Internal process-scoped owner inherited by detached Worklink controllers; the server sets this automatically. |
 | `MIMIR_WORKLINK_REAPER_CRON` | cron | `""` (off) | Stale-claim TTL reaper cron; empty registers no job (non-Worklink homes). |
 | `MIMIR_SCRATCH_JANITOR_CRON` | cron | `13 4 * * *` (on) | Daily scratch-retention sweep of the home's ephemeral roots; empty disables. |
@@ -322,7 +322,7 @@ repository files and model-generated values never add permission entries.
 | `MIMIR_FACTORY_RUN_TIMEOUT_S` | float | `43200` (12h) | OpenCode process liveness backstop. Expiry cancels only the verified process group. |
 | `MIMIR_FACTORY_STALE_HEARTBEAT_S` | float | `900` (15m) | Diagnostic threshold for stale factory lock observations. It never authorizes dispatch, lock stealing, cancellation, or deletion. |
 | `MIMIR_WORK_ITEM_JSON` | JSON object | unset | Internal factory-dispatch payload set by Worklink for a claimed Chainlink epic. The repository resolver emits it unchanged and skips GitHub issue lookup; operators should not set it for direct local runs. |
-| `MIMIR_SOURCE_DIR` | path | unset | Override for locating the source checkout in the chainlink-orchestrator poller. |
+| `MIMIR_SOURCE_DIR` | path | unset | Editable controller source checkout, used by pollers and by Worklink's base-overlap refusal. Leave unset for a PyPI install with no source checkout. |
 | `MIMIR_WORKLINK_MAX_STDOUT_BYTES` | positive int | `67108864` (64 MiB) | Maximum stdout retained from a Worklink backend subprocess. Invalid or non-positive values use the default; exceeding the cap terminates the subprocess. |
 | `MIMIR_WORKLINK_MAX_STDERR_BYTES` | positive int | `16777216` (16 MiB) | Maximum stderr retained from a Worklink backend subprocess. Invalid or non-positive values use the default; exceeding the cap terminates the subprocess. |
 

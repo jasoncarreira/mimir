@@ -12,7 +12,7 @@ Create `<MIMIR_HOME>/repositories.yaml`:
 ```yaml
 repositories:
   - slug: owner/service
-    root: /workspace/service
+    root: /var/lib/mimir-worklink/base/service
     mode: rw
     origin: https://github.com/owner/service.git
     base_branch: main
@@ -24,7 +24,7 @@ All six repository fields are significant:
 | Key | Meaning |
 |---|---|
 | `slug` | Lower-cased `owner/repository` identity. It must name the same GitHub repository as `origin`. |
-| `root` | Absolute path to the existing checkout. It must be the checkout's top level. |
+| `root` | Absolute path to the dedicated Worklink base clone. It must be the checkout's top level and must not be the running controller source. |
 | `mode` | `rw` includes the root in the inventory's writable-root projection; `ro` excludes it. Use `rw` for a code-building target. |
 | `origin` | Exact `remote.origin.url` expected in the checkout; HTTPS and GitHub SSH URL forms are accepted. |
 | `base_branch` | Branch from which Worklink creates attempt checkouts and against which it opens leaf PRs. |
@@ -62,6 +62,11 @@ backends:
 target that is not in the inventory. Repository-level `base_branch` and
 `test_command` take precedence over `defaults.base_branch` and
 `defaults.test_command` for that target.
+
+Mimir never derives this path from its installation. Provision the clone before
+startup, including for PyPI installs, and set `MIMIR_SOURCE_DIR` when the controller
+runs from an editable checkout so Worklink can enforce non-overlap. A host with no
+base fails closed rather than cloning into an inferred location.
 
 `local_subprocess` is the shipping compute backend and has shared filesystem
 access. Autonomous dispatch refuses it unless

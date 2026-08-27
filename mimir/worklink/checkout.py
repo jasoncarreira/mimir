@@ -34,6 +34,20 @@ def _default_runner(args: Sequence[str]) -> subprocess.CompletedProcess[str]:
     return subprocess.run(args, capture_output=True, text=True, check=False)
 
 
+def _assert_base_separate_from_controller(repo: Path) -> None:
+    """Refuse a build base that overlaps an explicitly declared source checkout."""
+    source_raw = os.environ.get("MIMIR_SOURCE_DIR", "").strip()
+    if not source_raw:
+        return
+    base = repo.resolve()
+    source = Path(source_raw).resolve()
+    if base == source or base.is_relative_to(source) or source.is_relative_to(base):
+        raise RuntimeError(
+            "Worklink base repository overlaps the running controller source: "
+            f"WORKLINK_REPO={base}, MIMIR_SOURCE_DIR={source}; provision a dedicated base clone"
+        )
+
+
 @dataclass(frozen=True)
 class CheckoutLease:
     issue_id: int
@@ -68,6 +82,7 @@ def create_worktree(
     runner: Runner = _default_runner,
 ) -> CheckoutLease:
     """Create an attempt-scoped branch/worktree from a fresh base ref."""
+    _assert_base_separate_from_controller(repo)
     path = repo / worklink_dir / f"{issue_id}-{attempt}"
     branch = f"issue/{issue_id}-a{attempt}"
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -461,6 +476,8 @@ def create_isolated_checkout(
     alternates; the post-clone assertion enforces that no factory checkout can
     depend on an object directory under the scratch janitor's swept roots.
     """
+
+    _assert_base_separate_from_controller(repo)
 
     worker_accessible = coding_enabled() and worker_eligible
     identities = get_identities() if worker_accessible else None

@@ -72,6 +72,19 @@ def test_worklink_run_cli_dispatches_operator_vertical(
     assert "worklink #441 attempt 1: completed review-ready" in capsys.readouterr().out
 
 
+def test_worklink_run_cli_requires_explicit_base_instead_of_using_cwd(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.delenv("WORKLINK_REPO", raising=False)
+    monkeypatch.delenv("MIMIR_WORKLINK_REPO", raising=False)
+
+    with pytest.raises(SystemExit) as exc:
+        main(["worklink", "run", "441"])
+
+    assert exc.value.code == 1
+    assert "WORKLINK_REPO is required" in capsys.readouterr().err
+
+
 def test_worklink_emit_work_item_has_wire_clean_stdout(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
