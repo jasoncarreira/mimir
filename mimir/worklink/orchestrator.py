@@ -3264,14 +3264,13 @@ def _make_executor_report_dir(issue: int, attempt: int) -> Path:
     """
     path = Path(tempfile.mkdtemp(prefix=f"worklink-{issue}-{attempt}-executor-"))
     try:
-        worklink_gid = get_identities().worklink_gid
-    except RuntimeError:
-        return path
-    try:
         # Permitted for the owner because ``mimir`` is a member of ``worklink``.
-        os.chown(path, -1, worklink_gid)
+        os.chown(path, -1, get_identities().worklink_gid)
         os.chmod(path, 0o770)
-    except OSError as exc:  # noqa: BLE001 - fall back to the controller-only directory
+    except Exception as exc:  # noqa: BLE001 - best effort; never fail a build over this
+        # Falling back leaves the 0700 directory this has always created, so a
+        # deployment with no worklink account (or an unwritable group) is no worse
+        # off than before. Granting the group is an improvement, not a precondition.
         _log_event(
             "worklink_executor_report_dir_not_shared",
             issue_id=issue,
