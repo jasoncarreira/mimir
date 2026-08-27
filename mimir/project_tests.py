@@ -436,7 +436,10 @@ def _git_execution_context() -> str:
     return (
         "contained Git context: runner=worklink "
         f"uid={identities.worklink_uid} gid={identities.worklink_gid}; "
-        f"checkout_owner=mimir uid={identities.mimir_uid} "
+        # The repo-test checkout is owned by the RUNNER, not the controller, so a
+        # repository's own provisioning can set modes on tracked files. Naming the
+        # wrong owner here sends a reader after a permission problem they do not have.
+        f"checkout_owner=worklink uid={identities.worklink_uid} "
         f"gid={identities.worklink_gid}; global_config=/dev/null; "
         "system_config=disabled; safe.directory=*"
     )

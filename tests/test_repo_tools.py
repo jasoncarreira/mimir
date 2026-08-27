@@ -1458,7 +1458,7 @@ async def test_project_tests_use_snapshot_collected_result_and_worker_environmen
     assert kwargs["timeout_s"] == _TIMEOUT_SECONDS
     assert result.git_context == (
         "contained Git context: runner=worklink uid=42002 gid=42003; "
-        "checkout_owner=mimir uid=42001 gid=42003; global_config=/dev/null; "
+        "checkout_owner=worklink uid=42002 gid=42003; global_config=/dev/null; "
         "system_config=disabled; safe.directory=*"
     )
 

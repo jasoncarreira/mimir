@@ -667,6 +667,55 @@ def test_repo_test_local_runner_selects_fd_sourced_execution_copy(
     assert normalized == [29]
 
 
+@pytest.mark.parametrize(
+    ("command", "surface"),
+    [
+        (["npm", "run", "test:ci"], "repo_test"),
+        (["uv", "run", "pytest", "-q"], "worklink"),
+    ],
+)
+def test_execution_copy_is_owned_by_the_runner_not_the_controller(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    synthetic_worklink_identities,
+    command: list[str],
+    surface: str,
+) -> None:
+    """The ephemeral execution tree must be chowned to the uid that runs in it.
+
+    ``chmod`` is owner-only, so a controller-owned copy cannot complete any
+    provisioning step that sets a mode on a file the runner did not create --
+    ``npm ci`` marking a workspace ``bin`` executable is the case that surfaced
+    this. Nothing reads this copy back, so runner ownership costs no reach.
+    """
+    identities = synthetic_worklink_identities
+    assert identities.worklink_uid != identities.mimir_uid
+    owners: list[tuple[int, int]] = []
+    monkeypatch.setattr(
+        worker_exec.shutil,
+        "copytree",
+        lambda source, destination, *, symlinks: None,
+    )
+    monkeypatch.setattr(worker_exec.os, "open", lambda *_args, **_kwargs: 29)
+    monkeypatch.setattr(
+        worker_exec,
+        "_normalize_checkout_fd",
+        lambda _fd, *, owner_uid, group_gid: owners.append((owner_uid, group_gid)),
+    )
+
+    checkout_root = (
+        worker_exec.REPO_TEST_CHECKOUT_ROOT
+        if surface == "repo_test"
+        else worker_exec.WORKLINK_CHECKOUT_ROOT
+    )
+    result = worker_exec._execution_checkout_fd(
+        command, 17, tmp_path / "home", checkout_root=checkout_root
+    )
+
+    assert result == 29
+    assert owners == [(identities.worklink_uid, identities.worklink_gid)]
+
+
 @pytest.mark.skipif(not Path("/proc").is_dir(), reason="requires procfs")
 def test_repo_test_execution_copy_is_fd_sourced_for_checkout_local_runner(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch

@@ -307,8 +307,25 @@ def _execution_checkout_fd(
         os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0),
     )
     try:
+        # The execution copy is owned by the RUNNER, not the controller.
+        #
+        # ``chmod`` is owner-only: the shared ``worklink`` group carries write access
+        # but never the right to set a mode. A controller-owned tree therefore fails
+        # any provisioning step that chmods a file it did not create, however the
+        # group bits are set. npm does exactly that for a workspace package declaring
+        # a ``bin``: ``node_modules/<pkg>`` symlinks back into tracked source and npm
+        # sets the executable bit on it, so ``npm ci`` dies with EPERM. A ``chmod +x``
+        # of a tracked file in a Makefile or setup script fails identically.
+        #
+        # Nothing reads this tree back. It is a private copy inside the worker's own
+        # HOME, it is never the issued checkout (which stays controller-owned), the
+        # command runs in it after the uid drop, and ``_cleanup_home`` destroys it.
+        # Runner ownership adds no reach: the runner could already write every path
+        # here through the group bits.
         _normalize_checkout_fd(
-            project_fd, owner_uid=get_identities().mimir_uid, group_gid=get_identities().worklink_gid
+            project_fd,
+            owner_uid=get_identities().worklink_uid,
+            group_gid=get_identities().worklink_gid,
         )
     except Exception:
         os.close(project_fd)
