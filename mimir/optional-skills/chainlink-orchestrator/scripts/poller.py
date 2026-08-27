@@ -13,7 +13,7 @@ from pathlib import Path
 
 
 def _ensure_mimir_import_path() -> None:
-    exe = Path(sys.executable).resolve()
+    exe = Path(sys.executable)
     venv_root = exe.parent.parent
     script_path = globals().get("__file__")
     candidates = [Path(script_path).resolve().parents[4]] if script_path else []
@@ -21,7 +21,6 @@ def _ensure_mimir_import_path() -> None:
         candidates.append(Path(source_dir))
     if venv_root.name in {".venv", "venv"}:
         candidates.append(venv_root.parent)
-    candidates.append(Path("/workspace/mimir"))
     for candidate in candidates:
         if not (candidate / "mimir" / "__init__.py").is_file():
             continue

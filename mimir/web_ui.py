@@ -911,8 +911,10 @@ def register_routes(
     subscription provider (e.g. ``"codex_plus"``); None shows every provider
     that has quota data.
 
-    ``react_app_dist`` points at the Vite build output. When omitted it defaults
-    to the packaged ``mimir/react_app/dist`` directory.
+    ``react_app_dist`` points at the Vite build output. It takes precedence over
+    ``MIMIR_REACT_APP_DIST``, which deployments rebuilding the frontend in place
+    can point at their live build directory. With neither set, the default is the
+    packaged ``mimir/react_app/dist`` directory beside this module.
 
     ``dashboard_extensions`` is the trusted first-party dashboard registry.
     Enabled manifests drive optional backend namespace hook registration; this
@@ -923,7 +925,12 @@ def register_routes(
     ensure_web_ui_config(home)
 
     existing = {(r.method, r.resource.canonical) for r in app.router.routes()}
-    _react_app_dist = react_app_dist or (Path(__file__).parent / "react_app" / "dist")
+    configured_react_dist = os.environ.get("MIMIR_REACT_APP_DIST", "").strip()
+    _react_app_dist = (
+        react_app_dist
+        or (Path(configured_react_dist) if configured_react_dist else None)
+        or (Path(__file__).parent / "react_app" / "dist")
+    )
     _dashboard_extensions = dashboard_extensions or first_party_dashboard_extensions()
     failed_state_reads: set[Path] = set()
 

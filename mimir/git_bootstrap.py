@@ -533,8 +533,7 @@ def _ensure_hook(home: Path, result: BootstrapResult) -> None:
 
 
 def ensure_workspace_hooks(workspace: Path) -> bool:
-    """Install the pre-push staleness-gate hook to a source-code workspace
-    repo (e.g., ``/workspace/mimir``).
+    """Install the pre-push staleness-gate hook to a pushed-from workspace repo.
 
     Idempotent — overwrites the existing hook so a template update
     propagates on the next server startup. Distinct from
@@ -546,9 +545,9 @@ def ensure_workspace_hooks(workspace: Path) -> bool:
     (missing template, no ``.git/hooks`` dir). Callers should treat False
     as advisory — the workspace is still usable.
 
-    Called unconditionally from ``server._on_startup`` for
-    ``/workspace/mimir`` when that path exists; gate is independent of
-    ``git_tracking_enabled`` since it protects pushes, not state commits.
+    Called from ``server._on_startup`` when ``MIMIR_SOURCE_REPO`` names an
+    existing directory; the gate is independent of ``git_tracking_enabled``
+    since it protects pushes, not state commits.
     """
     hook_dir = workspace / ".git" / "hooks"
     if not hook_dir.is_dir():

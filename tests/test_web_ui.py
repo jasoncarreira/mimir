@@ -1756,6 +1756,30 @@ async def test_react_app_serves_built_index_and_assets(tmp_path: Path):
 
 
 @pytest.mark.asyncio
+async def test_react_app_dist_can_use_live_deployment_build(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    live_dist = tmp_path / "checkout" / "react_app" / "dist"
+    live_dist.mkdir(parents=True)
+    (live_dist / "index.html").write_text("live-checkout-build", encoding="utf-8")
+    monkeypatch.setenv("MIMIR_REACT_APP_DIST", str(live_dist))
+
+    app = web.Application()
+    web_ui.register_routes(
+        app,
+        turns_log=tmp_path / "t.jsonl",
+        events_log=tmp_path / "e.jsonl",
+    )
+
+    async with TestClient(TestServer(app)) as client:
+        response = await client.get("/app")
+        body = await response.text()
+
+    assert response.status == 200
+    assert body == "live-checkout-build"
+
+
+@pytest.mark.asyncio
 async def test_web_bootstrap_is_no_store_and_secret_free(tmp_path: Path):
     class _Config:
         web_host = "0.0.0.0"

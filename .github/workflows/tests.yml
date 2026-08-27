@@ -401,6 +401,8 @@ jobs:
   worklink-image-identity:
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    env:
+      WORKLINK_REPO: /workspace/worklink-base
     steps:
       - name: Checkout
         uses: actions/checkout@v5

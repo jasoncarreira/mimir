@@ -3,6 +3,8 @@ from __future__ import annotations
 import runpy
 from pathlib import Path
 
+import yaml
+
 
 ROOT = Path(__file__).resolve().parents[1]
 DOCKERFILE = ROOT / "Dockerfile"
@@ -207,7 +209,14 @@ def test_ci_runs_the_committed_live_image_proof() -> None:
     assert 'stat -c %a /opt/mimir-worklink/uv-cache' in proof
     assert "sibling-access negative control did not detect a cross-write" in proof
     assert "intentionally shared sibling checkout" in proof
-    assert "printf attacked > /workspace/mimir/tracked" in proof
+    parsed = yaml.safe_load(workflow)
+    configured_repo = parsed["jobs"]["worklink-image-identity"]["env"]["WORKLINK_REPO"]
+    assert configured_repo == "/workspace/worklink-base"
+    assert 'REPO = Path(os.environ["WORKLINK_REPO"])' in proof
+    assert 'SEED = Path(os.environ["WORKLINK_REPO"])' in proof
+    assert 'repo = Path(Path("/tmp/worklink-proof-repo").read_text())' in proof
+    assert 'shlex.quote(str(repo / \'tracked\'))' in proof
+    assert "/workspace/mimir" not in proof
     assert "worklink-publication-attack" in proof
     assert 'remote", "set-url", "--push"' in proof
     assert "ControllerGitPublication.capture" in proof

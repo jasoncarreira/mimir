@@ -831,6 +831,26 @@ async def _run_cleanup(app: web.Application) -> None:
     await hooks[0](app)
 
 
+@pytest.mark.asyncio
+async def test_source_repo_hook_uses_pushed_from_repo_not_running_source(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pushed_from = tmp_path / "pushed-from"
+    running_source = tmp_path / "running-source"
+    (pushed_from / ".git" / "hooks").mkdir(parents=True)
+    (running_source / ".git" / "hooks").mkdir(parents=True)
+    monkeypatch.setenv("MIMIR_SOURCE_DIR", str(running_source))
+    app, _ = _controlled_server_app(tmp_path, monkeypatch)
+    monkeypatch.setenv("MIMIR_SOURCE_REPO", str(pushed_from))
+
+    try:
+        await _run_startup(app)
+        assert (pushed_from / ".git" / "hooks" / "pre-push").is_file()
+        assert not (running_source / ".git" / "hooks" / "pre-push").exists()
+    finally:
+        await _run_cleanup(app)
+
+
 def test_build_app_remains_synchronous_with_unchanged_signature_and_bootstrap(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

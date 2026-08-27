@@ -62,7 +62,7 @@ from mimir.worklink.compute import LocalSubprocessComputeBackend
 from mimir.worklink.evidence import observe_evidence
 from mimir.worklink.safe_git import ControllerGitPublication
 
-REPO = Path("/workspace/mimir")
+REPO = Path(os.environ["WORKLINK_REPO"])
 METADATA = Path("/home/mimir/worklink-publication")
 CONFIG = Path("/home/mimir/worklink-opencode/opencode.json")
 DATA = Path("/home/mimir/worklink-opencode/data")
@@ -200,7 +200,7 @@ import uuid
 
 from mimir.tools.registry import set_spawn_config, spawn_open_code
 
-SEED = Path("/workspace/mimir")
+SEED = Path(os.environ["WORKLINK_REPO"])
 ARTIFACTS = Path("/home/mimir/worklink-spawn-artifacts")
 CONFIG = Path("/home/mimir/worklink-opencode/opencode.json")
 AUTH = Path("/home/mimir/worklink-opencode/data/opencode/auth.json")
@@ -316,6 +316,9 @@ def source_ref() -> str:
 
 
 def main() -> None:
+    repo = os.environ.get("WORKLINK_REPO", "").strip()
+    if not repo or not Path(repo).is_absolute():
+        raise RuntimeError("WORKLINK_REPO must name the absolute in-container proof repository")
     run(["docker", "info"], timeout=30)
     source_commit = run(["git", "rev-parse", "HEAD"]).stdout.strip()
     git_ref = source_ref()
@@ -333,7 +336,10 @@ def main() -> None:
             "--build-arg", f"MIMIR_EXECUTOR_COMMIT={source_commit}",
             "--tag", IMAGE, ".",
         ], timeout=1200)
-        run(["docker", "run", "--detach", "--env", "HOME=/home/mimir", "--name", CONTAINER, IMAGE])
+        run([
+            "docker", "run", "--detach", "--env", "HOME=/home/mimir",
+            "--env", f"WORKLINK_REPO={repo}", "--name", CONTAINER, IMAGE,
+        ])
         wait_for_runtime()
         docker_exec("/bin/sh", "-ceu", """
             test "$(id -u mimir)" = 1001
@@ -380,11 +386,11 @@ def main() -> None:
             /command/s6-setuidgid mimir sh -ceu 'printf controller-writable > /home/mimir/worklink-canary; printf controller-reset > /home/mimir/worklink-canary'
             test "$(cat /home/mimir/worklink-canary)" = controller-reset
             /command/s6-setuidgid mimir sh -ceu '
-              rm -rf /workspace/mimir /workspace/.worklink /home/mimir/worklink-remote.git /home/mimir/worklink-opencode /home/mimir/worklink-publication
+              rm -rf "$WORKLINK_REPO" /workspace/.worklink /home/mimir/worklink-remote.git /home/mimir/worklink-opencode /home/mimir/worklink-publication
               mkdir -p /workspace
               git init --bare -q /home/mimir/worklink-remote.git
-              git init -q /workspace/mimir
-              cd /workspace/mimir
+              git init -q "$WORKLINK_REPO"
+              cd "$WORKLINK_REPO"
               git remote add origin /home/mimir/worklink-remote.git
               printf base > tracked
               printf remove > deleted
@@ -407,12 +413,15 @@ JSON
 JSON
             chown mimir:mimir /home/mimir/worklink-opencode/opencode.json /home/mimir/worklink-opencode/data/opencode/auth.json
             chmod 0600 /home/mimir/worklink-opencode/opencode.json /home/mimir/worklink-opencode/data/opencode/auth.json
+            printf '%s' "$WORKLINK_REPO" > /tmp/worklink-proof-repo
+            chmod 0444 /tmp/worklink-proof-repo
             install -d -o worklink -g worklink -m 0770 /tmp/worklink-negative-control/a /tmp/worklink-negative-control/b
             cat > /tmp/opencode-proof <<'PY'
 #!/opt/mimir-worklink/venv/bin/python
 import json
 import os
 from pathlib import Path
+import shlex
 import subprocess
 import sys
 
@@ -446,6 +455,7 @@ sibling = checkout.parent / "1411-1" / "sibling-canary"
 if sibling.read_text() != "sibling-original":
     raise SystemExit("worker could not reach the intentionally shared sibling checkout")
 parent = home.parent
+repo = Path(Path("/tmp/worklink-proof-repo").read_text())
 checks = [
     ["ls", str(parent)],
     ["touch", str(parent / "parent-write")],
@@ -454,7 +464,7 @@ checks = [
     ["rmdir", str(home)],
     ["cat", "/home/mimir/worklink-canary"],
     ["sh", "-c", "printf attacked > /home/mimir/worklink-canary"],
-    ["sh", "-c", "printf attacked > /workspace/mimir/tracked"],
+    ["sh", "-c", f"printf attacked > {shlex.quote(str(repo / 'tracked'))}"],
 ]
 for command in checks:
     if subprocess.run(command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0:
