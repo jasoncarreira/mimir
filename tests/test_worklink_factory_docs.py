@@ -18,7 +18,7 @@ FACTORY_DOCS = (
 
 
 def test_current_factory_documentation_matches_runtime_version() -> None:
-    assert FACTORY_VERSION == "0.7.5"
+    assert FACTORY_VERSION == "0.8.0"
     for relative_path in FACTORY_DOCS:
         text = (ROOT / relative_path).read_text(encoding="utf-8")
         assert text.count(f"`feature-factory@{FACTORY_VERSION}`") == 1, relative_path
@@ -57,7 +57,7 @@ def test_factory_launch_contract_is_identical_in_bounded_documentation() -> None
         f"and falls back to `{_DEFAULT_FACTORY_MAX_RETRIES}` for absent or invalid values."
     )
     staging = (
-        f"feature-factory {FACTORY_VERSION} stages the workflow inside the run directory; "
+        "feature-factory 0.7.5 stages the workflow inside the run directory; "
         "exact token `--auto` is never passed."
     )
     base = (

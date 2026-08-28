@@ -93,7 +93,7 @@ def test_worklink_docs_describe_current_tool_pin_inventory() -> None:
     assert 'package: "@openai/codex"' not in tool_pins_example
 
 
-def test_default_tool_pin_inventory_matches_shipped_install_literals() -> None:
+def test_default_tool_pin_inventory_matches_shipped_installs() -> None:
     pins = {pin.name: pin for pin in default_tool_pins()}
     root = Path(__file__).resolve().parents[1]
     install_paths = (
@@ -114,10 +114,14 @@ def test_default_tool_pin_inventory_matches_shipped_install_literals() -> None:
     assert f"github.com/steipete/gogcli/cmd/gog@{pins['gogcli'].pin}" in install_text
     assert pins["osv-scanner"].pin in install_text
     assert f"opencode-ai@{pins['opencode'].pin}" in install_text
-    for relpath in ("Dockerfile", "mimir/scaffold_docker.py"):
-        source = install_sources[relpath]
-        assert f"feature-factory@{pins['feature-factory'].pin}" in source
-        assert f"opencode-feature-factory@{pins['opencode-feature-factory'].pin}" in source
+    assert pins["feature-factory"].pin == pins["opencode-feature-factory"].pin
+    dockerfile = install_sources["Dockerfile"]
+    assert f"ARG FACTORY_VERSION={pins['feature-factory'].pin}" in dockerfile
+    assert "feature-factory@${FACTORY_VERSION}" in dockerfile
+    assert "opencode-feature-factory@${FACTORY_VERSION}" in dockerfile
+    scaffold = install_sources["mimir/scaffold_docker.py"]
+    assert "feature-factory@{FACTORY_VERSION}" in scaffold
+    assert "opencode-feature-factory@{FACTORY_VERSION}" in scaffold
     assert f"opencode-project-memory@{pins['opencode-project-memory'].pin}" in install_text
     assert f"opencode-openai-codex-auth@{pins['opencode-openai-codex-auth'].pin}" in install_text
     assert f"opencode-anthropic-auth@{pins['opencode-anthropic-auth'].pin}" in install_text

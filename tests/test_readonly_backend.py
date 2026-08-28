@@ -12,6 +12,7 @@ from __future__ import annotations
 import inspect
 import json
 import os
+import tempfile
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -2215,7 +2216,7 @@ class TestBuildFileToolRoutes:
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         if home_location == "tmp":
-            route_root = Path("/tmp") / f"mimir-home-collection-{tmp_path.name}"
+            route_root = Path(tempfile.mkdtemp(prefix="mimir-home-collection-", dir="/tmp"))
         else:
             route_root = tmp_path / "route"
         home = route_root / "home"
@@ -2269,7 +2270,7 @@ class TestBuildFileToolRoutes:
             if home_location == "tmp":
                 import shutil
 
-                shutil.rmtree(home, ignore_errors=True)
+                shutil.rmtree(route_root, ignore_errors=True)
 
         assert grep_paths == {
             "/home/memory/hidden.txt",

@@ -167,10 +167,11 @@ def test_opencode_build_arg_installs_pinned_runtime() -> None:
     """One root-image switch should install OpenCode runtime with pinned plugins."""
     text = _text()
     assert "ARG MIMIR_ENABLE_OPENCODE=0" in text
+    assert f"ARG FACTORY_VERSION={FACTORY_VERSION}" in text
     assert "npm install --global --prefix /opt/mimir-opencode" in text
     assert f"opencode-ai@{OPENCODE_VERSION}" in text
-    assert f"            feature-factory@{FACTORY_VERSION} \\" in text
-    assert f"            opencode-feature-factory@{FACTORY_VERSION} \\" in text
+    assert "            feature-factory@${FACTORY_VERSION} \\" in text
+    assert "            opencode-feature-factory@${FACTORY_VERSION} \\" in text
     assert "opencode-project-memory@0.1.0" in text
     assert "opencode-openai-codex-auth@4.4.0" in text
     assert "opencode-anthropic-auth@0.0.13" in text

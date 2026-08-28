@@ -56,8 +56,8 @@ The in-mimir integrated-epic runner — brief → `work-decomposer` → `decompo
 `integration-validator` → one final draft PR — **was removed in #830** after the
 epic #783 arc concluded (every failure was distribution tax in that layer).
 
-Epics are built by `feature-factory@0.7.5` through the lockstep
-`opencode-feature-factory@0.7.5` adapter. OpenCode's `/feature` workflow owns
+Epics are built by `feature-factory@0.8.0` through the lockstep
+`opencode-feature-factory@0.8.0` adapter. OpenCode's `/feature` workflow owns
 factory transitions. Worklink owns the outer Chainlink claim, isolated attempt
 checkout, OpenCode process, restart record, status observation, repository tests,
 and final PR identity verification.
@@ -100,7 +100,7 @@ and final PR identity verification.
   rather than one being preferred, and a missing `GITHUB_TOKEN` fails naming that
   variable - in both cases without disclosing values.
 - **Controls**: Every control is `node <absolute feature-factory/bin/factory.js>`.
-  Worklink admits the launcher only after package/adapter 0.7.5 verification and
+  Worklink admits the launcher only after package/adapter 0.8.0 verification and
   all 16 nonmutating structural command probes. Status is read with `status
   <run-id> --repo <sandbox> --json`; resume and heartbeat reuse the retained
   session; lock actions use `lock <run-id> <claim|steal|release> --session
@@ -513,7 +513,7 @@ require touching the orchestrator.
 | Adapter | Invocation sketch | Notes |
 |---|---|---|
 | `opencode` | `opencode run --dir <checkout> -- <prompt>` | Sole coding backend for leaf issues; provider and model are selected by opencode configuration/arguments. |
-| `feature_factory` | `opencode run ... --command feature " --autonomous --max-retries 5 <issue>"` | Epic adapter with Worklink-supervised OpenCode and absolute 0.7.5 controls. |
+| `feature_factory` | `opencode run ... --command feature " --autonomous --max-retries 5 <issue>"` | Epic adapter with Worklink-supervised OpenCode and absolute 0.8.0 controls. |
 
 Selection is config, not code (§7): per repo / label / issue-type, with
 a per-category default. The executor consults `Caps` rather than

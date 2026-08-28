@@ -1858,7 +1858,7 @@ class WorklinkRunner:
                     "GIT_AUTHOR_EMAIL": git_email,
                     "GIT_COMMITTER_NAME": git_name,
                     "GIT_COMMITTER_EMAIL": git_email,
-                    # The factory child does the publishing, and 0.7.5 compares this
+                    # The factory child does the publishing, and 0.8.0 compares this
                     # declared identity against ``gh api /user`` at Gate 1.
                     #
                     # Two DIFFERENT names are in play: the operator selects the identity
