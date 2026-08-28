@@ -51,6 +51,7 @@ _FACTORY_MAX_RETRIES_ENV = "MIMIR_FACTORY_MAX_RETRIES"
 _ASCII_DECIMAL = re.compile(r"[0-9]+")
 _RUN_ID = re.compile(r"[a-z0-9](?:[a-z0-9._-]*[a-z0-9])?")
 _UNKNOWN_STRUCTURE = re.compile(r"(?im)\b(?:unknown|unrecognized)\b[^\n]*\bcommand\b")
+_VALIDATOR_VERDICTS = frozenset({"GO", "GO-WITH-NITS", "NO-GO"})
 
 Runner = Callable[..., subprocess.CompletedProcess[Any]]
 
@@ -92,7 +93,7 @@ class FactoryStatus:
     gates: dict[str, Any] | None = None
     steps: tuple[str, ...] | None = None
     slices: tuple[str, ...] | None = None
-    validator: dict[str, Any] | None = None
+    validator: str | dict[str, Any] | None = None
     pr_url: str | None = None
     terminal_result: dict[str, Any] | None = None
     next: str | None = None
@@ -189,6 +190,17 @@ def _opaque_dict(value: object, name: str, *, nullable: bool = False) -> dict[st
     return dict(value)
 
 
+def _validator_verdict(value: object) -> str | dict[str, Any] | None:
+    if value is None:
+        return None
+    if isinstance(value, str):
+        if value not in _VALIDATOR_VERDICTS:
+            raise FactoryContractError("factory status validator has an unknown verdict")
+        return value
+    # Older status projections exposed the validator report inline as an object.
+    return _opaque_dict(value, "validator")
+
+
 def _compact_strings(
     value: object, name: str, *, nullable: bool = False
 ) -> tuple[str, ...] | None:
@@ -281,7 +293,7 @@ def parse_factory_status(payload: bytes | str | Mapping[str, Any]) -> FactorySta
         gates=_opaque_dict(decoded.get("gates"), "gates", nullable=True),
         steps=_compact_strings(decoded.get("steps"), "steps", nullable=True),
         slices=_compact_strings(decoded.get("slices"), "slices", nullable=True),
-        validator=_opaque_dict(decoded.get("validator"), "validator", nullable=True),
+        validator=_validator_verdict(decoded.get("validator")),
         pr_url=_bounded_text(decoded.get("pr_url"), "pr_url", nullable=True),
         terminal_result=_opaque_dict(
             decoded.get("terminal_result"), "terminal_result", nullable=True

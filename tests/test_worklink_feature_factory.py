@@ -105,6 +105,65 @@ def test_status_contract_preserves_nullable_fields_and_opaque_objects() -> None:
     assert parse_factory_status(status.to_json()) == status
 
 
+def test_status_parses_recorded_gate_pre_pr_validator_verdict() -> None:
+    payload = json.dumps(
+        {
+            "run_id": "chainlink-1337",
+            "issue_key": "1337",
+            "valid": True,
+            "sandbox_path": "/tmp/feature-factory/chainlink-1337",
+            "status": "running",
+            "mode": "autonomous",
+            "branch": "epic/chainlink-1337",
+            "pr_base": "main",
+            "pr_draft": False,
+            "lock": "fresh",
+            "dead_lock": False,
+            "lock_session": "attempt-9",
+            "gates": {
+                "story": "approved",
+                "brief": "approved",
+                "pre_pr": "pending",
+            },
+            "steps": ["story", "brief", "slices", "validator"],
+            "slices": [
+                "slice-1",
+                "slice-2",
+                "slice-3",
+                "slice-4",
+                "slice-5",
+                "slice-6",
+                "slice-7",
+            ],
+            "validator": "GO",
+            "pr_url": None,
+            "terminal_result": None,
+            "next": "gate:pre_pr",
+        }
+    )
+
+    status = parse_factory_status(payload)
+
+    assert status.validator == "GO"
+    assert status.next == "gate:pre_pr"
+    assert len(status.slices or ()) == 7
+    assert parse_factory_status(status.to_json()) == status
+
+
+@pytest.mark.parametrize("verdict", ["GO", "GO-WITH-NITS", "NO-GO"])
+def test_status_accepts_documented_validator_verdicts(verdict: str) -> None:
+    assert parse_factory_status(status_payload(validator=verdict)).validator == verdict
+
+
+def test_status_accepts_null_validator_before_validation() -> None:
+    assert parse_factory_status(status_payload(validator=None)).validator is None
+
+
+def test_status_rejects_unknown_validator_verdict() -> None:
+    with pytest.raises(FactoryContractError, match="validator has an unknown verdict"):
+        parse_factory_status(status_payload(validator="APPROVED"))
+
+
 @pytest.mark.parametrize("terminal", ["completed", "blocked", "partial"])
 def test_top_level_terminal_statuses(terminal: str) -> None:
     assert parse_factory_status(status_payload(status=terminal)).is_terminal
@@ -129,11 +188,16 @@ def test_status_rejects_wrong_field_types(field: str, value: object) -> None:
         parse_factory_status(status_payload(**{field: value}))
 
 
-@pytest.mark.parametrize("field", ["validator", "terminal_result"])
 @pytest.mark.parametrize("value", ["value", [], True, 1])
-def test_status_rejects_non_object_opaque_fields(field: str, value: object) -> None:
-    with pytest.raises(FactoryContractError, match=f"{field} must be an object"):
-        parse_factory_status(status_payload(**{field: value}))
+def test_status_rejects_non_object_terminal_result(value: object) -> None:
+    with pytest.raises(FactoryContractError, match="terminal_result must be an object"):
+        parse_factory_status(status_payload(terminal_result=value))
+
+
+@pytest.mark.parametrize("value", [[], True, 1])
+def test_status_rejects_invalid_validator_types(value: object) -> None:
+    with pytest.raises(FactoryContractError, match="validator must be an object"):
+        parse_factory_status(status_payload(validator=value))
 
 
 def test_status_accepts_additive_top_level_fields_after_payload_validation() -> None:
