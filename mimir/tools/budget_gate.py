@@ -824,6 +824,44 @@ def _operator_shell_chainlink_mutation_refusal(
     )
 
 
+def _operator_shell_soft_live_refusal(
+    request: ToolCallRequest,
+    preparation: _OperatorShellPreparation | None,
+    auth_context: AuthContext | None,
+    *,
+    started: float,
+) -> ToolMessage | None:
+    if (
+        preparation is None
+        or preparation.outcome is not OperatorShellPreparationOutcome.SOFT_UNBOUND
+        or _live_untrusted_active_ingest(
+            auth_context, _current_ifc_labels(auth_context),
+        ) is False
+    ):
+        return None
+    audit = _operator_shell_audit_summary(preparation)
+    assert audit is not None
+    _record_tool_outcome(
+        "shell_exec",
+        refused_reason=_OPERATOR_SHELL_LIVE_TAINT_REFUSAL,
+        operator_shell_audit=audit,
+    )
+    _emit_tool_call_sync(
+        "shell_exec",
+        ok=False,
+        duration_ms=(time.monotonic() - started) * 1000.0,
+        error=_OPERATOR_SHELL_LIVE_TAINT_REFUSAL,
+        denied=True,
+        operator_shell_audit=audit,
+    )
+    return ToolMessage(
+        content=_OPERATOR_SHELL_LIVE_TAINT_REFUSAL,
+        tool_call_id=_tool_call_id(request),
+        name="shell_exec",
+        status="error",
+    )
+
+
 def _operator_shell_execution_binding_matches(
     request: ToolCallRequest,
     auth_context: AuthContext | None,
@@ -2457,6 +2495,14 @@ class BudgetGateMiddleware(AgentMiddleware):
             if review_claim is not None and review_claim.duplicate:
                 result = _duplicate_review_result(request, review_claim)
             else:
+                soft_live_refusal = _operator_shell_soft_live_refusal(
+                    request,
+                    operator_shell_preparation,
+                    auth_context,
+                    started=started,
+                )
+                if soft_live_refusal is not None:
+                    return soft_live_refusal
                 result = handler(execution_request)
         except ToolException as exc:
             if capture_token is not None:
@@ -2903,6 +2949,14 @@ class BudgetGateMiddleware(AgentMiddleware):
             if review_claim is not None and review_claim.duplicate:
                 result = _duplicate_review_result(request, review_claim)
             else:
+                soft_live_refusal = _operator_shell_soft_live_refusal(
+                    request,
+                    operator_shell_preparation,
+                    auth_context,
+                    started=started,
+                )
+                if soft_live_refusal is not None:
+                    return soft_live_refusal
                 result = await handler(execution_request)
         except ToolException as exc:
             if capture_token is not None:
