@@ -1,6 +1,11 @@
 # Turn capability: which turns may run several bounded steps
 
-Status: **proposed**.
+Status: **accepted for Arm 2 implementation**.
+
+Sections 1-3 retain the history that ruled out producer-side relabelling and
+command-text inference. Sections 4-8 are the design of record for the selected
+Arm 2 implementation. Earlier coverage questions and the possible removal of an
+existing carve-out are resolved below; they are no longer open design choices.
 
 A turn that has ingested untrusted content cannot run a further shell command. The
 mechanism that prevents this already exists and works, but it is keyed on an
@@ -106,14 +111,14 @@ outcome §8's regression exists to forbid.
 The property that matters is therefore not the trustworthiness of the *producer*.
 It is the boundedness of the *consumer*.
 
-## 4. Proposal
+## 4. Selected Arm 2 design
 
 **Make the active-ingest restriction conditional on the requested sink's
-boundedness, rather than absolute.**
+server-authored boundedness, rather than absolute.**
 
-Today an untrusted active ingest refuses every subsequent shell sink. The proposal
-is that it refuse only the **unbounded** ones. After untrusted output has entered
-the turn:
+Before Arm 2, an untrusted active ingest refuses every subsequent shell sink. The
+selected rule is that it refuse only the **unbounded** ones. After untrusted output
+has entered the turn:
 
 - a further **server-bound** command remains admissible, because ingested content
   cannot steer a command whose argv the server authored;
@@ -141,19 +146,114 @@ An operator turn has both paths available. That asymmetry, not the turn kind, is
 why copying the classification there is unsafe — and why the fix belongs at the
 sink rather than at the label.
 
-Under this proposal the carve-out becomes a special case of the general rule and
-is expected to be removable. That remains an equivalence this document does not
-claim without proof.
+The existing service/Chainlink carve-out is retained. The selected profile admits
+both Chainlink query and mutation forms, while the service branch provides the
+narrower query/mutation distinction. Removing it would widen service behavior and
+is not required to implement Arm 2.
 
-### What is not proposed
+### Selected profile and conditional coverage
+
+Arm 2 uses the existing `scheduler_read_only` profile. It does not use
+`repo_review`: repository-sensitive commands in that profile depend on immutable
+`RepoReviewState`, authority an ordinary operator turn does not have. No profile
+allowlist changes as part of this design.
+
+The historical sample has a syntax ceiling of approximately **60/293** commands:
+31 `chainlink issue show ...` queries and 29 `git status --short` calls. This is a
+ceiling, not guaranteed runtime coverage. Chainlink binding also requires tracker
+cwd resolution. Git binding requires an authorized configured Git root and a
+successful hardening pass. The sample contains no cwd or deployment-configuration
+evidence, so actual coverage may be lower.
+
+Profile matching is necessary but not sufficient. Arm 2 disables the parser's
+configured-project-test branch and applies family-specific confinement before it
+issues a binding. `jq` and `rg -L` remain unbound because their filter/module or
+symlink-following surfaces are not proven filesystem-bounded. These exclusions,
+and the Git intersection below, narrow the selected profile without changing its
+allowlist for existing callers.
+
+### Preparation outcomes
+
+Every qualifying operator `shell_exec` request has one exhaustive preparation
+outcome:
+
+- **`BOUND`**: parsing, executable pinning, cwd resolution, family confinement,
+  and hardening succeeded. Authorization and execution consume the same immutable,
+  request-scoped exact-argv binding.
+- **`SOFT_UNBOUND`**: the command may retain the existing pre-ingest `bash -lc`
+  behavior, but only if an execution-time live provenance read is exactly
+  untainted. Profile misses, shell syntax, configured project tests, `jq`,
+  `rg -L`, and scheduler-admitted Git forms outside the hardener intersection are
+  soft-unbound.
+- **`HARD_REFUSED`**: no process starts in shadow or enforced mode. Invalid
+  command shape, executable-pin failure, cwd or root violation, reader confinement
+  failure, hardener infrastructure failure, and binding mismatch or reuse are hard
+  refusals.
+
+A bound nonmutation or query may execute exact argv whether live ingestion is
+false, true, or indeterminate, subject to unrelated existing gates. Chainlink
+mutations have the stricter always-on rule below.
+
+Only `SOFT_UNBOUND` can fall back to the login shell. Immediately before that
+fallback, execution rechecks live IFC state. `true`, missing, exceptional,
+non-boolean, or otherwise indeterminate state fails closed; only exact `False`
+permits `bash -lc`. This closes a taint arrival between authorization and
+execution and applies in both shadow and enforced modes.
+
+### Binding, cwd, readers, and Git
+
+The binding is issued by server code after model-supplied internal carriers have
+been stripped. It seals the selected profile, exact final argv, tool and call,
+request and authorization identities, requested and resolved cwd, and Chainlink
+mutation classification. It cannot be selected, forged, copied across a request,
+or reconstructed from command text. Any mismatch is a hard refusal, and cleanup
+removes the request-scoped carrier on every completion path.
+
+Omitted cwd resolves the process cwd, never sticky interactive `cd`. Explicit cwd
+must be absolute, free of NUL and lexical traversal, resolve to a directory, and
+remain under the applicable configured root after symlink resolution. Git is
+confined to configured maintenance Git roots; readers are confined to configured
+non-admin read roots. Implicit `/tmp` is not a Git root.
+
+Reader operands are parsed once, checked as a complete set, and rewritten to
+canonical absolute paths. Root escape, unsafe symlinks, missing or unreadable
+targets, protected or credential-bearing content, mixed unsafe operands, and
+recursive preflight limits hard-refuse the call. Recursive `grep` and `rg` retain
+bounded entry, byte, hidden-file, and protected-content checks.
+
+Git binding is the intersection of unchanged `scheduler_read_only` matching and
+the existing maintenance Git hardener. The hardener pins cwd and neutralizes
+hooks, fsmonitor, external diff, textconv, filters, protocols, credentials, pager,
+and optional locks. Hardened non-verbose `status` is bound. Hardened `diff`, `log`,
+and `show` are bound only without a literal `--`; verbose status and those forms
+with `--` are soft-unbound.
+
+### Always-on Chainlink and audit boundaries
+
+A bound Chainlink query may execute after active ingestion. A bound Chainlink
+mutation is stopped when live ingestion is active or indeterminate, regardless of
+shadow or enforced mode. The middleware enforces this immediately before process
+execution as well as preserving the existing authorization decision and
+`chainlink_mutation_blocked_by_untrusted_ingest` refusal. Profile admission never
+overrides the mutation policy.
+
+Arm 2 audit records use a fixed, value-free summary containing only
+`shell_profile`, `preparation_outcome`, `command_family`, and `binding_rule`.
+Tool-call and tool-error records omit command and cwd; hard-boundary records use a
+null target and fixed reason; shadow decisions use the fixed `shell_process`
+target. No command, cwd, argv, operand, traversed child, credential, or
+model-derived refusal text is emitted. Non-Arm-2 audit shapes are unchanged.
+
+### Unchanged constraints
 
 - No change to what output is labelled `untrusted`. Bounded output is untrusted.
 - No change to the `active_ingest` effect for bounded output. It stays an ingest.
 - No relaxation of the predicate itself. It keeps refusing unbounded sinks after
   ingestion, which is its whole purpose.
-- No change to arbitrary shell before ingestion, which remains admitted.
+- No general change to arbitrary shell before ingestion: soft-unbound commands
+  retain that behavior, while the hard failures above start no process.
 
-## 5. What is actually admissible today
+## 5. Historical sample and the selected ceiling
 
 The earlier revision claimed the observed operator commands were covered by
 existing profiles. Run through the real matchers, that is false:
@@ -174,36 +274,38 @@ existing profile and about 99 are not**. The 1,667/1,765 coverage figure in the
 earlier revision was derived from the allowlist's shape rather than from running
 the commands through it, and is withdrawn.
 
-That reframes the coverage question usefully. It is no longer "should operators
-lose pipes" — arbitrary shell is untouched — but **which commands are worth
-admitting to a bounded path.** `git log --all` and `gh run view` are read-only and
-plausible additions; each is its own small review with its own argv validation.
-`python - <<PY` is arbitrary code and must stay on the unbounded path, which is
-the case §3 exists for.
+That comparison used either existing profile and therefore did not answer which
+profile an ordinary operator could safely use. The selected implementation uses
+only `scheduler_read_only`, reducing the sample's syntax ceiling to the 60/293
+commands recorded in §4. `git log --all`, `gh run view`, and other possible
+allowlist additions are not part of this decision. `python - <<PY` remains
+arbitrary code on the unbounded path, which is the case §3 exists for.
 
 ## 6. Scope
 
-The proposal serves any turn whose commands are profile-admissible, which is a
-property of the command rather than of the principal. No total is claimed: the
-event counts in §1 describe the problem, and how many of them convert depends on
-which commands are admitted to the bounded path — a decision this document
-deliberately leaves open.
+The selected implementation serves existing trusted, non-service operator
+`user_message` turns invoking `shell_exec`. It does not grant operator authority
+to `bash_async` or extend authority to another principal, channel, tool, or
+operation. Admission requires both existing operator authority and the genuine
+`scheduler_read_only` binding described in §4.
 
-Explicitly out of scope: widening any profile's allowlist, which belongs in
-separate reviews; the unscoped poller populations' *authority* to run repository
-work at all, which is a different question from whether their steps deadlock; and
-the provenance model.
+Explicitly unchanged: every profile allowlist; Arm 1 and service attribution;
+unscoped poller authority; trust derivation; the provenance model; and repository
+review authorization and result classification. The existing service/Arm 1
+Chainlink query/mutation branch remains in place because deleting it would admit
+mutations that it currently refuses. The `repo_review_state` informational branch
+also remains in place; Arm 2 operator results do not use it.
 
 ## 7. Dependency on the provenance model
 
 The dependency is the **opposite** of what an earlier revision of this document
 claimed, and getting it backwards is what made that revision unsafe.
 
-This proposal requires that **untrusted active-ingest provenance survive a bounded
+This design requires that **untrusted active-ingest provenance survive a bounded
 read.** A bounded command's output must continue to be recorded as `untrusted`
 with an `active_ingest` effect. The sink gate can only narrow what an ingest
 forbids if the ingest is still recorded; a provenance layer that relabelled
-bounded output as `informational` would clear the state this proposal reasons
+bounded output as `informational` would clear the state this design reasons
 about, and a later arbitrary `bash -lc` would be admitted. That is the hole §3
 and §4 exist to close.
 
@@ -215,23 +317,25 @@ mechanism.
 
 **On the existing carve-out:** the `repo_review_state` branch in
 `classify_protected_result` does emit `integrity_effect="informational"` today.
-That is **current behaviour, not an invariant of this proposal** — and it is the
+That is **current behaviour, not an invariant of the Arm 2 rule** — and it is the
 producer-side relabelling this document argues against. It is safe in place only
 because every command on a review turn is bounded, so nothing unbounded remains to
-be admitted by the cleared state. Under this proposal that branch becomes a
-special case of the general rule and is expected to be removable, which §4 records
-as an equivalence not claimed without proof.
+be admitted by the cleared state. The selected implementation leaves that branch
+unchanged. Removing or relabelling it requires a separate review and is not a
+prerequisite for Arm 2.
 
-Neither change needs to land first. They are coupled only through the requirement
-that provenance keep telling the truth about ingestion.
+Arm 2 ordinary shell results stay on generic classification: `untrusted` with
+`integrity_effect="active_ingest"`. Repeated bounded reads monotonically retain
+that state. Authorization narrows only the prospective shell sink; it does not
+clear or reinterpret provenance.
 
 ## 8. Reversibility, and the required negative regressions
 
 The change is a condition in sink authorization plus an additional execution path.
-Backing it out restores the absolute active-ingest refusal and routes everything
-through `bash -lc`. No persisted state, no migration, and no relabelled data to
-unwind — which is a consequence of the proposal touching authorization rather than
-classification.
+Backing it out restores the absolute active-ingest refusal and routes soft-unbound
+pre-ingest commands through `bash -lc`. No persisted state, no migration, and no
+relabelled data need unwinding because the design touches authorization and
+request-scoped execution rather than classification.
 
 Three properties must be pinned, and the second and third are new to this
 revision:
