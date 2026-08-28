@@ -39,6 +39,9 @@ from langgraph.runtime import Runtime
 from mimir._context import get_current_turn, reset_current_turn, set_current_turn
 from mimir.access_control import (
     OperationDecision,
+    OPERATOR_SHELL_PROFILE,
+    OperatorShellBinding,
+    ServiceShellBindingRule,
     SinkGate,
     ToolAuthorization,
     ToolRegistry,
@@ -60,8 +63,10 @@ from mimir.models import (
 from mimir.identities import IdentityResolver
 from mimir.tools.budget_gate import (
     BudgetGateMiddleware,
+    OperatorShellPreparationOutcome,
     _check_and_increment_or_deny,
     _emit_tool_call_sync,
+    _prepare_operator_shell_execution,
     _result_labels_for_call,
 )
 from tests.auth_helpers import attach_middleware_auth_context
@@ -3452,6 +3457,9 @@ def test_non_shell_server_args_are_stripped_before_nested_shell_exec(
                     "subagent_type": "general-purpose",
                     "mimir_direct_argv": ["/bin/sh", "-c", "planted"],
                     "mimir_shell_refusal": "model-authored refusal",
+                    "mimir_operator_shell_binding": "forged-binding",
+                    "mimir_operator_shell_profile": "forged-profile",
+                    "mimir_operator_shell_request_identity": "forged-identity",
                 },
             ),
             run_task,
@@ -3461,6 +3469,11 @@ def test_non_shell_server_args_are_stripped_before_nested_shell_exec(
 
     assert "mimir_direct_argv" not in outer_args
     assert "mimir_shell_refusal" not in outer_args
+    assert not {
+        "mimir_operator_shell_binding",
+        "mimir_operator_shell_profile",
+        "mimir_operator_shell_request_identity",
+    }.intersection(outer_args)
     assert executed == [["bash", "-lc", login_shell_command("git status --short")]]
 
 
@@ -3512,6 +3525,9 @@ async def test_non_shell_server_args_are_stripped_before_nested_bash_async(
                     "subagent_type": "general-purpose",
                     "mimir_direct_argv": ["/bin/sh", "-c", "planted"],
                     "mimir_shell_refusal": "model-authored refusal",
+                    "mimir_operator_shell_binding": "forged-binding",
+                    "mimir_operator_shell_profile": "forged-profile",
+                    "mimir_operator_shell_request_identity": "forged-identity",
                 },
             ),
             run_task,
@@ -3522,6 +3538,11 @@ async def test_non_shell_server_args_are_stripped_before_nested_bash_async(
 
     assert "mimir_direct_argv" not in outer_args
     assert "mimir_shell_refusal" not in outer_args
+    assert not {
+        "mimir_operator_shell_binding",
+        "mimir_operator_shell_profile",
+        "mimir_operator_shell_request_identity",
+    }.intersection(outer_args)
     assert spawned == [["bash", "-lc", login_shell_command("git status --short")]]
 
 
@@ -3567,6 +3588,168 @@ async def test_non_shell_execution_never_binds_direct_argv(
         reset_current_turn(token)
 
     assert observed == [None, None]
+
+
+@pytest.mark.asyncio
+async def test_middleware_preparation_order_and_reserved_claim_stripping(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from mimir.tools import budget_gate
+
+    claims = {
+        "mimir_direct_argv": ["forged"],
+        "mimir_shell_refusal": "forged",
+        "mimir_operator_shell_binding": "forged",
+        "mimir_operator_shell_profile": "forged",
+        "mimir_operator_shell_request_identity": "forged",
+    }
+    expected = {"command": "printf safe"}
+
+    def install(order: list[str]) -> None:
+        def validate(request: ToolCallRequest) -> dict[str, Any]:
+            order.append("validation")
+            assert request.tool_call["args"] == expected
+            return expected
+
+        def review(*_args: Any) -> None:
+            order.append("standing_review")
+            return None
+
+        def prepare(*_args: Any) -> None:
+            order.append("preparation")
+            return None
+
+        def authorize(*_args: Any, **_kwargs: Any) -> tuple[ToolAuthorization, None]:
+            order.append("authorization")
+            return ToolAuthorization(
+                tool_name="shell_exec",
+                decision=OperationDecision.OPEN,
+                allowed=True,
+            ), None
+
+        monkeypatch.setattr(budget_gate, "_validated_arguments", validate)
+        monkeypatch.setattr(budget_gate, "_resolve_standing_review", review)
+        monkeypatch.setattr(budget_gate, "_prepare_operator_shell_execution", prepare)
+        monkeypatch.setattr(budget_gate, "_authorize_tool_call", authorize)
+
+    sync_order: list[str] = []
+    install(sync_order)
+
+    def sync_handler(request: ToolCallRequest) -> ToolMessage:
+        assert request.tool_call["args"] == expected
+        return ToolMessage(content="ok", tool_call_id=request.tool_call["id"])
+
+    sync_result = BudgetGateMiddleware().wrap_tool_call(
+        _make_request("shell_exec", "sync-order", args={**expected, **claims}),
+        sync_handler,
+    )
+
+    async_order: list[str] = []
+    install(async_order)
+
+    async def async_handler(request: ToolCallRequest) -> ToolMessage:
+        assert request.tool_call["args"] == expected
+        return ToolMessage(content="ok", tool_call_id=request.tool_call["id"])
+
+    async_result = await BudgetGateMiddleware().awrap_tool_call(
+        _make_request("shell_exec", "async-order", args={**expected, **claims}),
+        async_handler,
+    )
+
+    assert sync_result.content == "ok"
+    assert async_result.content == "ok"
+    assert sync_order[:4] == [
+        "validation", "standing_review", "preparation", "authorization",
+    ]
+    assert async_order[:4] == sync_order[:4]
+
+
+def test_operator_shell_preparation_classifies_bound_soft_and_hard(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from mimir.tools import budget_gate
+
+    monkeypatch.setattr(budget_gate, "_operator_can_invoke_admin_shell", lambda *_: True)
+    request = _make_request(
+        "shell_exec", "operator-preparation", args={"command": "pwd", "cwd": str(tmp_path)},
+    )
+
+    monkeypatch.setattr(
+        budget_gate,
+        "parse_service_shell_argv_with_diagnostics",
+        lambda *args, **kwargs: (
+            None,
+            "the command is outside the fixed profile",
+            ServiceShellBindingRule.PROFILE_ALLOWLIST,
+        ),
+    )
+    soft = _prepare_operator_shell_execution(request, "shell_exec", None, None)
+
+    def parser_failure(*_args: Any, **_kwargs: Any) -> Any:
+        raise RuntimeError("parser unavailable")
+
+    monkeypatch.setattr(
+        budget_gate, "parse_service_shell_argv_with_diagnostics", parser_failure,
+    )
+    hard = _prepare_operator_shell_execution(request, "shell_exec", None, None)
+
+    parser_calls: list[dict[str, Any]] = []
+
+    def parse_bound(*_args: Any, **kwargs: Any) -> tuple[list[str], str, None]:
+        parser_calls.append(kwargs)
+        return ["/usr/bin/pwd"], "", None
+
+    binding = OperatorShellBinding(
+        profile=OPERATOR_SHELL_PROFILE,
+        tool_name="shell_exec",
+        tool_call_id="operator-preparation",
+        command="pwd",
+        requested_cwd=str(tmp_path),
+        resolved_cwd=str(tmp_path),
+        argv=("/usr/bin/pwd",),
+        chainlink_mutation=False,
+        _request_identity=request,
+        _auth_context_identity=object(),
+        _issuer=object(),
+    )
+    monkeypatch.setattr(
+        budget_gate, "parse_service_shell_argv_with_diagnostics", parse_bound,
+    )
+    monkeypatch.setattr(
+        budget_gate, "_resolve_operator_bounded_cwd", lambda *_args, **_kwargs: tmp_path,
+    )
+    monkeypatch.setattr(
+        budget_gate, "_validated_operator_shell_argv_artifact", lambda *_args, **_kwargs: object(),
+    )
+    monkeypatch.setattr(
+        budget_gate, "_issue_operator_shell_binding", lambda **_kwargs: binding,
+    )
+    bound = _prepare_operator_shell_execution(request, "shell_exec", None, None)
+
+    assert soft is not None and soft.outcome is OperatorShellPreparationOutcome.SOFT_UNBOUND
+    assert soft.binding is None
+    assert hard is not None and hard.outcome is OperatorShellPreparationOutcome.HARD_REFUSED
+    assert hard.binding is None
+    assert bound is not None and bound.outcome is OperatorShellPreparationOutcome.BOUND
+    assert bound.binding is binding
+    assert parser_calls == [{
+        "declared": (),
+        "service": None,
+        "auth_context": None,
+        "review_state": None,
+        "allow_project_test": False,
+    }]
+
+
+def test_operator_bash_async_has_no_preparation() -> None:
+    auth = _untainted_ifc_auth()
+    assert _prepare_operator_shell_execution(
+        _make_request("bash_async", auth_context=auth, args={"command": "pwd"}),
+        "bash_async",
+        auth,
+        auth.ifc_labels,
+    ) is None
 
 
 # ─── get_turn alias (unchanged from prior file) ───────────────────
