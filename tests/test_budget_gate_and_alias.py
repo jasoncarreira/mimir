@@ -4064,6 +4064,187 @@ async def test_operator_bash_async_active_ingest_remains_refused() -> None:
     assert handler_calls == 0
 
 
+def _hard_operator_shell_preparation(refusal: str) -> _OperatorShellPreparation:
+    return _OperatorShellPreparation(
+        outcome=OperatorShellPreparationOutcome.HARD_REFUSED,
+        binding=None,
+        refusal=refusal,
+        binding_rule=ServiceShellBindingRule.OPERATOR_READ_OPERAND_POLICY,
+        command_family="grep",
+    )
+
+
+def test_arm2_tool_events_use_complete_fixed_summary_and_withhold_values(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from mimir.tools import budget_gate
+
+    command = "command-sentinel-7b984"
+    cwd = "/cwd-sentinel-42d1"
+    refusal = "model-refusal-sentinel-a091"
+    audit = budget_gate._operator_shell_audit_summary(
+        _hard_operator_shell_preparation(refusal),
+    )
+    captured: list[tuple[str, dict[str, Any]]] = []
+    monkeypatch.setattr(
+        budget_gate,
+        "_emit_event_sync",
+        lambda kind, **fields: captured.append((kind, fields)),
+    )
+
+    _emit_tool_call_sync(
+        "shell_exec",
+        ok=False,
+        error=refusal,
+        denied=True,
+        arguments={"command": command, "cwd": cwd},
+        operator_shell_audit=audit,
+    )
+
+    assert [kind for kind, _fields in captured] == ["tool_call", "tool_error"]
+    assert audit is not None
+    for _kind, fields in captured:
+        assert all(fields[key] == value for key, value in audit.items())
+        assert fields["error"] == "operator_shell_tool_error"
+        assert "arguments" not in fields
+        rendered = json.dumps(fields)
+        assert command not in rendered
+        assert cwd not in rendered
+        assert refusal not in rendered
+
+
+def test_non_arm2_tool_event_shape_is_unchanged(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from mimir.tools import budget_gate
+
+    captured: list[tuple[str, dict[str, Any]]] = []
+    monkeypatch.setattr(
+        budget_gate,
+        "_emit_event_sync",
+        lambda kind, **fields: captured.append((kind, fields)),
+    )
+
+    _emit_tool_call_sync(
+        "shell_exec",
+        ok=False,
+        error="ordinary error",
+        arguments={"command": "printf ordinary", "cwd": "/ordinary"},
+    )
+
+    assert captured[0][1]["arguments"] == {
+        "command": "printf ordinary",
+    }
+    assert captured[0][1]["error"] == "ordinary error"
+    assert captured[1][1]["arguments"] == {
+        "command": "printf ordinary",
+    }
+    assert captured[1][1]["error"] == "ordinary error"
+
+
+def test_arm2_hard_refusal_uses_null_target_and_fixed_values(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from mimir.tools import budget_gate
+
+    refusal = "full-refusal-prose-sentinel-f375"
+    command = "command-sentinel-c649"
+    cwd = "/cwd-sentinel-d25f"
+    preparation = _hard_operator_shell_preparation(refusal)
+    captured: list[tuple[str, dict[str, Any]]] = []
+    monkeypatch.setattr(
+        budget_gate,
+        "_emit_event_sync",
+        lambda kind, **fields: captured.append((kind, fields)),
+    )
+
+    result = budget_gate._operator_shell_hard_refusal(
+        _make_request(
+            "shell_exec",
+            "hard-audit",
+            _untainted_ifc_auth(),
+            {"command": command, "cwd": cwd},
+        ),
+        preparation,
+        _untainted_ifc_auth(),
+    )
+
+    assert result is not None and result.status == "error"
+    assert refusal not in str(result.content)
+    hard = next(fields for kind, fields in captured if kind == "hard_boundary_denied")
+    assert hard["target"] is None
+    assert hard["boundary"] == "operator_shell_preparation"
+    assert hard["reason"] == "operator_shell_hard_refused"
+    rendered = json.dumps(captured)
+    for sentinel in (refusal, command, cwd):
+        assert sentinel not in rendered
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("middleware_path", ["sync", "async"])
+@pytest.mark.parametrize("enforcement_enabled", [False, True])
+async def test_pre_activation_hard_refusal_never_invokes_handler(
+    middleware_path: str,
+    enforcement_enabled: bool,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from dataclasses import replace
+
+    from mimir.tools import budget_gate
+
+    preparation = _hard_operator_shell_preparation("private refusal sentinel")
+    auth = replace(
+        _untainted_ifc_auth(),
+        enforcement_enabled=enforcement_enabled,
+    )
+    handler_calls = 0
+
+    def authorize(*_args: Any, **kwargs: Any) -> tuple[ToolAuthorization, None]:
+        assert kwargs["operator_shell_audit"] == {
+            "shell_profile": OPERATOR_SHELL_PROFILE,
+            "preparation_outcome": "hard_refused",
+            "command_family": "grep",
+            "binding_rule": ServiceShellBindingRule.OPERATOR_READ_OPERAND_POLICY.value,
+        }
+        return ToolAuthorization(
+            tool_name="shell_exec",
+            decision=OperationDecision.ADMIN_REQUIRED,
+            allowed=True,
+        ), None
+
+    monkeypatch.setattr(
+        budget_gate,
+        "_prepare_operator_shell_execution",
+        lambda *_args: preparation,
+    )
+    monkeypatch.setattr(budget_gate, "_authorize_tool_call", authorize)
+
+    def sync_handler(_request: ToolCallRequest) -> ToolMessage:
+        nonlocal handler_calls
+        handler_calls += 1
+        return ToolMessage(content="ran", tool_call_id="hard-stop")
+
+    async def async_handler(_request: ToolCallRequest) -> ToolMessage:
+        nonlocal handler_calls
+        handler_calls += 1
+        return ToolMessage(content="ran", tool_call_id="hard-stop")
+
+    request = _make_request(
+        "shell_exec",
+        "hard-stop",
+        auth,
+        {"command": "never-run-sentinel", "cwd": "/never-run"},
+    )
+    middleware = BudgetGateMiddleware()
+    if middleware_path == "sync":
+        result = middleware.wrap_tool_call(request, sync_handler)
+    else:
+        result = await middleware.awrap_tool_call(request, async_handler)
+
+    assert result.status == "error"
+    assert handler_calls == 0
+
+
 # ─── get_turn alias (unchanged from prior file) ───────────────────
 
 
