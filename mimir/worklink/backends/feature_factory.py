@@ -93,7 +93,7 @@ class FactoryStatus:
     gates: dict[str, Any] | None = None
     steps: tuple[str, ...] | None = None
     slices: tuple[str, ...] | None = None
-    validator: str | dict[str, Any] | None = None
+    validator: str | None = None
     pr_url: str | None = None
     terminal_result: dict[str, Any] | None = None
     next: str | None = None
@@ -190,15 +190,14 @@ def _opaque_dict(value: object, name: str, *, nullable: bool = False) -> dict[st
     return dict(value)
 
 
-def _validator_verdict(value: object) -> str | dict[str, Any] | None:
+def _validator_verdict(value: object) -> str | None:
     if value is None:
         return None
-    if isinstance(value, str):
-        if value not in _VALIDATOR_VERDICTS:
-            raise FactoryContractError("factory status validator has an unknown verdict")
-        return value
-    # Older status projections exposed the validator report inline as an object.
-    return _opaque_dict(value, "validator")
+    if not isinstance(value, str):
+        raise FactoryContractError("factory status validator must be a documented verdict")
+    if value not in _VALIDATOR_VERDICTS:
+        raise FactoryContractError("factory status validator has an unknown verdict")
+    return value
 
 
 def _compact_strings(

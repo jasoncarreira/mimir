@@ -45,7 +45,7 @@ def status_payload(**overrides: Any) -> dict[str, Any]:
         "gates": {"brief": "approved"},
         "steps": ["brief", "implementation"],
         "slices": ["factory-070-migration"],
-        "validator": {"status": "pending"},
+        "validator": None,
         "pr_url": None,
         "terminal_result": None,
         "next": "implementation",
@@ -86,13 +86,13 @@ def test_status_contract_preserves_optional_next_and_opaque_terminal_result() ->
         status.require_recovery_next()
 
 
-def test_status_contract_preserves_nullable_fields_and_opaque_objects() -> None:
+def test_status_contract_preserves_nullable_fields_and_opaque_terminal_result() -> None:
     status = parse_factory_status(
         status_payload(
             issue_key=None,
             pr_base=None,
             lock_session=None,
-            validator={"status": "pending", "score": 0.5},
+            validator=None,
             terminal_result={"reason": "opaque"},
         )
     )
@@ -100,7 +100,7 @@ def test_status_contract_preserves_nullable_fields_and_opaque_objects() -> None:
     assert status.pr_base is None
     assert status.lock_session is None
     assert status.pr_url is None
-    assert status.validator == {"status": "pending", "score": 0.5}
+    assert status.validator is None
     assert status.terminal_result == {"reason": "opaque"}
     assert parse_factory_status(status.to_json()) == status
 
@@ -194,9 +194,9 @@ def test_status_rejects_non_object_terminal_result(value: object) -> None:
         parse_factory_status(status_payload(terminal_result=value))
 
 
-@pytest.mark.parametrize("value", [[], True, 1])
+@pytest.mark.parametrize("value", [{}, [], True, 1])
 def test_status_rejects_invalid_validator_types(value: object) -> None:
-    with pytest.raises(FactoryContractError, match="validator must be an object"):
+    with pytest.raises(FactoryContractError, match="validator must be a documented verdict"):
         parse_factory_status(status_payload(validator=value))
 
 
