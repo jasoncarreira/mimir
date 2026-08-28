@@ -3593,11 +3593,18 @@ async def test_non_shell_execution_never_binds_direct_argv(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("middleware_path", ["sync", "async"])
+@pytest.mark.parametrize("preparation_kind", ["soft_unbound", "bound"])
 async def test_middleware_preparation_plumbing_remains_inactive_and_refused(
     middleware_path: str,
+    preparation_kind: str,
+    tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    maintenance_pinned_executables: dict[str, Path],
 ) -> None:
+    from dataclasses import replace
+
     from mimir.tools import budget_gate
+    from mimir.models import TurnInteractivity
 
     claims = {
         "mimir_direct_argv": ["forged"],
@@ -3606,18 +3613,65 @@ async def test_middleware_preparation_plumbing_remains_inactive_and_refused(
         "mimir_operator_shell_profile": "forged",
         "mimir_operator_shell_request_identity": "forged",
     }
-    expected = {"command": "printf safe"}
-    auth = _ifc_auth()
+    root = tmp_path / "operator-root"
+    home = tmp_path / "home"
+    root.mkdir()
+    (home / "state").mkdir(parents=True)
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    monkeypatch.setenv("MIMIR_FILE_TOOL_ROOTS", f"{root}:ro")
+    monkeypatch.setattr(
+        "mimir.read_policy.configured_non_admin_read_roots", lambda: (root,),
+    )
+    expected = (
+        {"command": "pwd -P", "cwd": str(root)}
+        if preparation_kind == "bound"
+        else {"command": "printf safe"}
+    )
+    trusted_ingress = SourceLabel(
+        principal="user-1",
+        domain="channel",
+        resource_id="ch-1",
+        bridge_instance="test",
+        sensitivity="private",
+        authorized_principals=frozenset({"user-1"}),
+        source_kind="channel",
+        integrity="trusted",
+        integrity_effect="active_ingest",
+    )
+    untrusted_ingest = SourceLabel(
+        principal="external-source",
+        domain="web",
+        resource_id="active-ingest",
+        bridge_instance="test",
+        sensitivity="private",
+        authorized_principals=frozenset({"user-1"}),
+        source_kind="protected_tool",
+        integrity="untrusted",
+        integrity_effect="active_ingest",
+    )
+    labels = InformationFlowLabels(
+        labels=frozenset({"private"}),
+        source_channels=frozenset({"ch-1"}),
+        sources=(trusted_ingress, untrusted_ingest),
+    )
+    auth = replace(
+        _ifc_auth(),
+        interactivity=TurnInteractivity.INTERACTIVE,
+        ifc_labels=labels,
+        ifc_state=InformationFlowState(labels=labels),
+    )
     order: list[str] = []
     authorization_calls: list[tuple[ToolCallRequest, dict[str, Any]]] = []
     handler_calls = 0
-    preparation = _OperatorShellPreparation(
+    soft_preparation = _OperatorShellPreparation(
         outcome=OperatorShellPreparationOutcome.SOFT_UNBOUND,
         binding=None,
         refusal="fixed pre-activation refusal",
         binding_rule=ServiceShellBindingRule.PROFILE_ALLOWLIST,
         command_family="profile_miss",
     )
+    preparations: list[_OperatorShellPreparation] = []
+    original_prepare = budget_gate._prepare_operator_shell_execution
     original_authorize = budget_gate._authorize_tool_call
 
     def validate(request: ToolCallRequest) -> dict[str, Any]:
@@ -3630,11 +3684,18 @@ async def test_middleware_preparation_plumbing_remains_inactive_and_refused(
         return None
 
     def prepare(
-        request: ToolCallRequest, *_args: Any,
+        request: ToolCallRequest, *args: Any,
     ) -> _OperatorShellPreparation:
         order.append("preparation")
         assert request.tool_call["args"] == expected
-        return preparation
+        prepared = (
+            original_prepare(request, *args)
+            if preparation_kind == "bound"
+            else soft_preparation
+        )
+        assert prepared is not None
+        preparations.append(prepared)
+        return prepared
 
     def authorize(*args: Any, **kwargs: Any) -> tuple[ToolAuthorization, str | None]:
         order.append("authorization")
@@ -3674,18 +3735,33 @@ async def test_middleware_preparation_plumbing_remains_inactive_and_refused(
         "validation", "standing_review", "preparation", "authorization",
     ]
     assert len(authorization_calls) == 1
+    assert len(preparations) == 1
+    preparation = preparations[0]
     sanitized_request, forwarded = authorization_calls[0]
     assert sanitized_request is not request
     assert forwarded["operator_shell_binding"] is None
     assert forwarded["operator_shell_refusal"] == preparation.refusal
     assert forwarded["operator_shell_request_identity"] is sanitized_request
     assert forwarded["tool_call_id"] == call_id
+    if preparation_kind == "bound":
+        assert preparation.outcome is OperatorShellPreparationOutcome.BOUND
+        assert preparation.binding is not None
+        assert preparation.binding.argv == (
+            str(maintenance_pinned_executables["pwd"]), "-P",
+        )
+        assert preparation.binding._request_identity is sanitized_request
+        assert forwarded["operator_shell_refusal"] is None
+    else:
+        assert preparation is soft_preparation
+        assert forwarded["operator_shell_refusal"] == soft_preparation.refusal
 
 
 @pytest.mark.parametrize(
     ("scenario", "expected_outcome", "expected_rule", "expected_family"),
     [
-        ("invalid-command", OperatorShellPreparationOutcome.HARD_REFUSED, ServiceShellBindingRule.PROFILE_ALLOWLIST, "invalid_command"),
+        ("missing-command", OperatorShellPreparationOutcome.HARD_REFUSED, ServiceShellBindingRule.PROFILE_ALLOWLIST, "invalid_command"),
+        ("non-string-command", OperatorShellPreparationOutcome.HARD_REFUSED, ServiceShellBindingRule.PROFILE_ALLOWLIST, "invalid_command"),
+        ("non-dict-arguments", OperatorShellPreparationOutcome.HARD_REFUSED, ServiceShellBindingRule.PROFILE_ALLOWLIST, "invalid_command"),
         ("shell-control", OperatorShellPreparationOutcome.SOFT_UNBOUND, ServiceShellBindingRule.SHELL_CONTROL_CHARACTERS, "profile_miss"),
         ("unbalanced", OperatorShellPreparationOutcome.SOFT_UNBOUND, ServiceShellBindingRule.ARGV_UNBALANCED_QUOTING, "profile_miss"),
         ("empty", OperatorShellPreparationOutcome.SOFT_UNBOUND, ServiceShellBindingRule.ARGV_EMPTY, "profile_miss"),
@@ -3696,6 +3772,9 @@ async def test_middleware_preparation_plumbing_remains_inactive_and_refused(
         ("service-read-unreachable", OperatorShellPreparationOutcome.HARD_REFUSED, ServiceShellBindingRule.READ_OPERAND_POLICY, "profile_miss"),
         ("pin-failure", OperatorShellPreparationOutcome.HARD_REFUSED, ServiceShellBindingRule.EXECUTABLE_PIN, "profile_miss"),
         ("parser-failure", OperatorShellPreparationOutcome.HARD_REFUSED, ServiceShellBindingRule.UNKNOWN_PROFILE, "parser"),
+        ("parser-refusal-without-rule", OperatorShellPreparationOutcome.HARD_REFUSED, ServiceShellBindingRule.UNKNOWN_PROFILE, "parser"),
+        ("empty-admitted-argv", OperatorShellPreparationOutcome.HARD_REFUSED, ServiceShellBindingRule.UNKNOWN_PROFILE, "parser"),
+        ("unsupported-admitted-family", OperatorShellPreparationOutcome.HARD_REFUSED, ServiceShellBindingRule.UNKNOWN_PROFILE, "parser"),
         ("chainlink-query", OperatorShellPreparationOutcome.BOUND, None, "chainlink"),
         ("chainlink-mutation", OperatorShellPreparationOutcome.BOUND, None, "chainlink"),
         ("pwd", OperatorShellPreparationOutcome.BOUND, None, "pwd"),
@@ -3733,13 +3812,23 @@ def test_operator_shell_preparation_exhaustive_outcome_matrix(
     from mimir.tools import budget_gate
 
     monkeypatch.setattr(budget_gate, "_operator_can_invoke_admin_shell", lambda *_: True)
-    command: object = "candidate"
-    if scenario == "invalid-command":
-        command = None
-    request = _make_request(
-        "shell_exec",
-        f"operator-{scenario}",
-        args={"command": command, "cwd": str(tmp_path)},
+    arguments: Any = {"command": "candidate", "cwd": str(tmp_path)}
+    if scenario == "missing-command":
+        arguments = {"cwd": str(tmp_path)}
+    elif scenario == "non-string-command":
+        arguments = {"command": 17, "cwd": str(tmp_path)}
+    elif scenario == "non-dict-arguments":
+        arguments = ["candidate"]
+    request = ToolCallRequest(
+        tool_call={
+            "name": "shell_exec",
+            "args": arguments,
+            "id": f"operator-{scenario}",
+            "type": "tool_call",
+        },
+        tool=None,
+        state=None,
+        runtime=Runtime(context=None),
     )
     parser_rules = {
         "shell-control": ServiceShellBindingRule.SHELL_CONTROL_CHARACTERS,
@@ -3778,6 +3867,15 @@ def test_operator_shell_preparation_exhaustive_outcome_matrix(
     if scenario == "parser-failure":
         def parser(*_args: Any, **_kwargs: Any) -> Any:
             raise RuntimeError("parser unavailable")
+    elif scenario == "parser-refusal-without-rule":
+        def parser(*_args: Any, **_kwargs: Any) -> tuple[None, str, None]:
+            return None, "fixed parser refusal", None
+    elif scenario == "empty-admitted-argv":
+        def parser(*_args: Any, **_kwargs: Any) -> tuple[list[str], str, None]:
+            return [], "", None
+    elif scenario == "unsupported-admitted-family":
+        def parser(*_args: Any, **_kwargs: Any) -> tuple[list[str], str, None]:
+            return ["/pins/curl"], "", None
     elif scenario in parser_rules:
         def parser(*_args: Any, **_kwargs: Any) -> tuple[None, str, ServiceShellBindingRule]:
             return None, "fixed parser refusal", parser_rules[scenario]
