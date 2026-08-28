@@ -26,6 +26,7 @@ from mimir.access_control import (
     OperationCatalog,
     OperationDecision,
     ServicePrincipal,
+    ServiceShellBindingRule,
     ServiceSinkPolicy,
     SinkGate,
     ToolRegistry,
@@ -38,6 +39,7 @@ from mimir.access_control import (
     get_service_principal,
     parse_service_shell_argv,
     parse_service_shell_argv_with_reason,
+    protected_result_source,
 )
 from mimir.identities import IdentityResolver
 from mimir.models import (
@@ -234,6 +236,7 @@ def _review_state(repo: str, number: int, branch: str, root: str) -> RepoReviewS
         observed_head_sha="a" * 40,
         base_ref="main",
         observed_base_sha="b" * 40,
+        pull_request_author="mimir-bot",
     ))
 
 
@@ -507,7 +510,6 @@ def test_secret_content_in_own_turn_scratch_remains_unreadable(
     ("relative", "content"),
     [
         ("state/deployment.json", "state-ok\n"),
-        (".mimir/last-booted-version", "0.7.0\n"),
         ("CHANGELOG.md", "# Changes\n"),
     ],
 )
@@ -546,6 +548,89 @@ def test_service_turns_read_admitted_home_surfaces_under_enforcement(
         ] == content
     finally:
         reset_current_turn(token)
+
+
+def test_service_read_roots_do_not_consume_protected_names(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / "home"
+    state_file = home / "state" / "deployment.json"
+    skill_file = home / "skills" / "demo" / "SKILL.md"
+    for target in (state_file, skill_file):
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text("ordinary data\n", encoding="utf-8")
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    service = get_service_principal("scheduled_tick")
+    assert service is not None
+
+    roots = access_control.service_filesystem_read_roots(service)
+    collisions = {
+        (root, name)
+        for root in roots
+        for name in access_control._TRIGGER_SERVICE_PROTECTED_READ_NAMES
+        if name in {part.lower() for part in root.parts}
+    }
+
+    assert collisions == set()
+    assert home / "state" in roots
+    assert home / "skills" in roots
+    assert home / ".mimir" not in roots
+    for target in (state_file, skill_file):
+        assert access_control._trigger_service_read_target_is_allowed(
+            service, "read_file", {"file_path": str(target)},
+        ) is True
+
+
+def test_service_protected_predicates_agree_when_matched_root_is_protected(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / "home"
+    target = home / ".mimir" / "saga.db"
+    target.parent.mkdir(parents=True)
+    target.touch()
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    service = get_service_principal("scheduled_tick")
+    assert service is not None
+
+    protected = access_control._is_trigger_service_protected_read_path(
+        target.relative_to(home),
+    )
+    service_protected = access_control._is_service_protected_read_path(
+        service, home / ".mimir", Path("saga.db"),
+    )
+
+    assert protected is True
+    assert service_protected is protected
+
+
+@pytest.mark.parametrize(
+    "tool_name", ["read_file", "aread", "ls", "glob", "grep", "file_search"],
+)
+@pytest.mark.parametrize("name", ["saga.db", "index.db", "file-integrity.json"])
+def test_service_typed_reads_refuse_protected_mimir_runtime_files(
+    tool_name: str,
+    name: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / "home"
+    target = home / ".mimir" / name
+    target.parent.mkdir(parents=True)
+    target.write_text("runtime data\n", encoding="utf-8")
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    base = get_service_principal("scheduled_tick")
+    assert base is not None
+    service = replace(base, saga_full_corpus_read=False)
+    arguments = (
+        {"file_path": str(target)}
+        if tool_name in {"read_file", "aread"}
+        else {"path": str(target)}
+    )
+
+    assert service.saga_full_corpus_read is False
+    assert access_control._trigger_service_read_target_is_allowed(
+        service, tool_name, arguments,
+    ) is False
 
 
 def test_upgrade_service_read_scope_includes_docs_only_as_a_read_root(
@@ -1363,6 +1448,7 @@ def test_closing_principals_reach_bounded_tracker_operations_when_enforced(
     "command",
     [
         "gh pr view 7 --repo acme/widget --json number,title",
+        "gh pr view 7 -R acme/widget --json number,title",
         "gh issue view 9 --repo acme/widget --json number,title --comments",
     ],
 )
@@ -1417,6 +1503,86 @@ def test_session_boundary_github_reads_refuse_unconfigured_repository(
     )
 
     assert decision.allowed is False, decision.reason
+
+
+@pytest.mark.parametrize(
+    ("repository_option", "repository", "admitted"),
+    [
+        ("--repo {}", "acme/widget", True),
+        ("-R {}", "acme/widget", True),
+        ("--repo={}", "acme/widget", True),
+        ("-R{}", "acme/widget", True),
+        ("--repo {}", "other/repo", False),
+        ("-R {}", "other/repo", False),
+        ("--repo={}", "other/repo", False),
+        ("-R{}", "other/repo", False),
+    ],
+)
+@pytest.mark.parametrize(
+    "command_template",
+    [
+        "gh pr view 7 {} --json number,title",
+        "gh issue view 7 {} --json number,title",
+    ],
+)
+def test_session_boundary_github_repository_aliases_share_the_configured_bound(
+    command_template: str,
+    repository_option: str,
+    repository: str,
+    admitted: bool,
+    monkeypatch: pytest.MonkeyPatch,
+    maintenance_pinned_executables: dict[str, Path],
+) -> None:
+    """Every gh spelling accepted by syntax must reach the same repository guard."""
+    monkeypatch.setenv("GITHUB_REPOS", "acme/widget")
+    command = command_template.format(repository_option.format(repository))
+
+    argv = parse_service_shell_argv(command, "session_boundary")
+
+    assert (argv is not None) is admitted
+
+
+def test_session_boundary_github_repository_refusal_is_flag_independent(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    maintenance_pinned_executables: dict[str, Path],
+) -> None:
+    monkeypatch.setenv("GITHUB_REPOS", "acme/widget")
+    monkeypatch.delenv("MIMIR_ACCESS_CONTROL_ENFORCED", raising=False)
+    service = access_control.builtin_trigger_service_principal(
+        "session-boundary", tmp_path,
+    )
+    auth = _trusted_service_auth(service, channel_id="channel-a")
+    command = "gh pr view 7 -Rother/repo --json number,title"
+
+    assert parse_service_shell_argv(command, "session_boundary") is None
+    decision = ToolRegistry().authorize_tool(
+        "shell_exec", auth, enforce=True, target_channel=command,
+        arguments={"command": command},
+    )
+
+    assert decision.allowed is False
+
+
+def test_gh_repository_allowlist_and_guard_use_the_same_option_table(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("GITHUB_REPOS", "acme/widget")
+
+    assert access_control._GH_REPOSITORY_EXACT_OPTIONS == {
+        option for option, _prefix in access_control._GH_REPOSITORY_OPTION_FORMS
+    }
+    assert access_control._GH_REPOSITORY_OPTION_PREFIXES == tuple(
+        prefix for _option, prefix in access_control._GH_REPOSITORY_OPTION_FORMS
+    )
+    for rendered in (
+        ["--repo", "other/repo"],
+        ["-R", "other/repo"],
+        ["--repo=other/repo"],
+        ["-Rother/repo"],
+    ):
+        assert access_control._gh_repository_operand(rendered) is not None
+        assert access_control._gh_repo_operands_are_configured(rendered) is False
 
 
 def test_session_boundary_github_read_refuses_repo_flag_without_value(
@@ -1870,6 +2036,47 @@ def test_deepagents_synthetic_inventory_uses_dispatchable_mimir_tools() -> None:
         "execute",
         "task",
     )
+
+
+def test_maximal_model_tool_inventory_has_total_protected_result_partition(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from mimir.tools import forge, mcp
+    from mimir.tools.registry import all_mimir_tools
+
+    monkeypatch.setenv("TAVILY_API_KEY", "tvly-test")
+    monkeypatch.delenv("MIMIR_FETCH_URL_DISABLED", raising=False)
+    monkeypatch.setattr(forge, "_github_identity_degraded", False)
+    monkeypatch.setattr(mcp, "get_mcp_tools", lambda: [])
+    names = {
+        *(tool.name for tool in all_mimir_tools(
+            model_spec="openai:test",
+            coding_enabled=True,
+            require_coding_available=False,
+        )),
+        *access_control._deepagents_builtin_tool_names(),
+    }
+    mapped = names & access_control._PROTECTED_RESULT_DOMAINS.keys()
+    exempted = names & access_control._NON_INGESTING_RESULT_TOOLS
+
+    assert mapped.isdisjoint(exempted)
+    assert mapped | exempted == names
+
+
+def test_inventory_assertion_rejects_tool_without_result_classification(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        access_control,
+        "_deepagents_builtin_tool_names",
+        lambda: ("harness_auto_deliver",),
+    )
+
+    with pytest.raises(
+        access_control.CapabilityMatrixError,
+        match="without explicit protected-result classification: harness_auto_deliver",
+    ):
+        access_control.assert_model_tool_inventory_cataloged(model_spec="openai:test")
 
 
 def test_inventory_assertion_rejects_uncataloged_registered_mcp_tool() -> None:
@@ -4576,6 +4783,15 @@ def _tainted_admin_operator_write_auth() -> AuthContext:
             False,
         ),
         (
+            "admin_scheduled_tick",
+            lambda: replace(
+                _write_auth(admin=True),
+                trigger="scheduled_tick",
+                interactivity=TurnInteractivity.NON_INTERACTIVE,
+            ),
+            False,
+        ),
+        (
             "non_admin_operator",
             _trusted_operator_write_auth,
             False,
@@ -4604,23 +4820,49 @@ def _tainted_admin_operator_write_auth() -> AuthContext:
     "relative",
     ["pollers.json", "SKILL.md", "scripts/fetch-news.ts"],
 )
+@pytest.mark.parametrize("spelling", ["physical", "relative", "virtual"])
 def test_skill_writes_require_an_untainted_admin_operator_turn(
     case: str,
     auth_factory,
     allowed: bool,
     relative: str,
+    spelling: str,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     home = tmp_path / "home"
-    target = home / "skills" / "ai-news" / relative
-    target.parent.mkdir(parents=True)
+    physical_target = home / "skills" / "ai-news" / relative
+    physical_target.parent.mkdir(parents=True)
     monkeypatch.setenv("MIMIR_HOME", str(home))
+    target = {
+        "physical": str(physical_target),
+        "relative": str(Path("skills") / "ai-news" / relative),
+        "virtual": str(Path("/skills") / "ai-news" / relative),
+    }[spelling]
 
     auth = auth_factory()
     assert auth is not None, case
+    boundary = access_control.WriteResourceAdapter.authorize_skill_write(
+        "edit_file", target, auth, auth.ifc_labels, enforce=True,
+    )
+    assert boundary is not None, (case, spelling)
+    assert boundary.allowed is allowed, (case, spelling)
+    assert boundary.reason == (
+        None if allowed else "skill_write_requires_admin_operator"
+    ), (case, spelling)
+    assert boundary.is_shadow_decision is False, (case, spelling)
+    assert boundary.would_block is not allowed, (case, spelling)
+    if case == "admin_scheduled_tick":
+        direct_operation = access_control.WriteResourceAdapter.authorize_operation(
+            "edit_file", target, auth, enforce=True, service_allowed=False,
+            ifc_labels=auth.ifc_labels,
+        )
+        assert direct_operation.allowed is False, spelling
+        assert direct_operation.reason == "skill_write_requires_admin_operator"
+        assert direct_operation.would_block is True
+
     decision = ToolRegistry().authorize_tool(
-        "edit_file", auth, enforce=True, target_channel=str(target),
+        "edit_file", auth, enforce=True, target_channel=target,
     )
 
     assert decision.allowed is allowed, case
@@ -4629,12 +4871,28 @@ def test_skill_writes_require_an_untainted_admin_operator_turn(
         None if allowed else "writes under skills/ require an untainted admin operator turn"
     )
     compatibility_decision = ToolRegistry().authorize_tool(
-        "edit_file", auth, enforce=False, target_channel=str(target),
+        "edit_file", auth, enforce=False, target_channel=target,
     )
     assert compatibility_decision.allowed is allowed, case
     assert compatibility_decision.reason == (
         None if allowed else "skill_write_requires_admin_operator"
     )
+    assert compatibility_decision.is_shadow_decision is False
+    assert compatibility_decision.would_block is not allowed
+
+
+def test_skill_write_boundary_has_no_opinion_on_non_skill_target(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / "home"
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    auth = _write_auth()
+
+    assert access_control.WriteResourceAdapter.authorize_skill_write(
+        "write_file", str(home / "state" / "note.md"), auth, auth.ifc_labels,
+        enforce=True,
+    ) is None
 
 
 @pytest.mark.parametrize("tool_name", ["write_file", "edit_file"])
@@ -4794,6 +5052,12 @@ def test_non_admin_human_write_is_confined_to_unprotected_state(
         enforce=True,
         target_channel="state/notes/result.md",
     )
+    virtual_state = registry.authorize_tool(
+        tool_name,
+        _write_auth(),
+        enforce=True,
+        target_channel="/state/notes/result.md",
+    )
     denied = (
         home / "root.txt",
         repo / "source.py",
@@ -4809,6 +5073,7 @@ def test_non_admin_human_write_is_confined_to_unprotected_state(
 
     assert allowed.allowed is True
     assert relative_state.allowed is True
+    assert virtual_state.allowed is True
     assert allowed.decision == OperationDecision.RESOURCE_SCOPED
     assert registry.authorize_tool(
         tool_name,
@@ -6003,6 +6268,8 @@ def test_static_service_write_allows_home_when_file_tool_roots_unset(
         home / "memory" / "issues" / "970.md",
         Path("state/journal/relative.md"),
         Path("memory/issues/relative.md"),
+        Path("/state/journal/virtual.md"),
+        Path("/memory/issues/virtual.md"),
     ):
         decision = registry.authorize_tool(
             "write_file", auth, enforce=True, target_channel=str(target),
@@ -6010,7 +6277,7 @@ def test_static_service_write_allows_home_when_file_tool_roots_unset(
         assert decision.allowed is True, target
 
 
-def test_autonomous_write_uses_trigger_state_and_explicit_repo_rw_roots(
+def test_poller_write_uses_only_its_declared_root(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -6038,13 +6305,10 @@ def test_autonomous_write_uses_trigger_state_and_explicit_repo_rw_roots(
     registry = ToolRegistry()
 
     for target in (
-        repo / "src" / "x.py",
         trigger_state / "cursor.json",
-        home / "state" / "reports" / "x.md",
-        home / "memory" / "issues" / "x.md",
-        home / "memory" / "channels" / "C1" / "notes.md",
-        repo / ".gitignore",
-        repo / ".gitattributes",
+        trigger_state / ".gitignore",
+        trigger_state / ".gitattributes",
+        Path("/state/triggers/poller/virtual.json"),
     ):
         assert registry.authorize_tool(
             "write_file", auth, enforce=True, target_channel=str(target),
@@ -6052,6 +6316,10 @@ def test_autonomous_write_uses_trigger_state_and_explicit_repo_rw_roots(
     for target in (
         home,
         home / "root.txt",
+        repo / "src" / "x.py",
+        home / "state" / "reports" / "x.md",
+        home / "memory" / "issues" / "x.md",
+        home / "memory" / "channels" / "C1" / "notes.md",
         readonly / "data.txt",
         outside / "data.txt",
         Path("/tmp/unscoped.txt"),
@@ -6187,9 +6455,9 @@ def test_dynamic_trigger_write_denies_symlinked_protected_paths(
 @pytest.mark.parametrize(
     "command",
     [
-        "gh pr view 979 --json number,title,headRefOid",
-        "gh pr diff 979 --patch",
-        "gh pr checks 979 --required",
+        "gh pr view 979 --repo owner/repo --json number,title,headRefOid",
+        "gh pr diff 979 --repo owner/repo --patch",
+        "gh pr checks 979 --repo owner/repo --required",
         "git status --short",
         "git log --oneline --max-count=10",
         "git diff --stat HEAD~1",
@@ -6287,9 +6555,9 @@ def test_repo_review_commands_agree_for_host_and_contained_git_identity(
         "owner/repo", 1279, "worklink/1279", str(repo_review_git_root),
     )
     commands = (
-        "gh pr view 979 --json number,title,headRefOid",
-        "gh pr diff 979 --patch",
-        "gh pr checks 979 --required",
+        "gh pr view 979 --repo owner/repo --json number,title,headRefOid",
+        "gh pr diff 979 --repo owner/repo --patch",
+        "gh pr checks 979 --repo owner/repo --required",
         "git status --short",
         "git log --oneline --max-count=10",
         "git diff --stat HEAD~1",
@@ -6466,14 +6734,166 @@ def test_repo_review_git_inspection_suppresses_hostile_repository_helpers(
 def test_repo_review_shell_profile_admits_pr_view_repo_alias(
     maintenance_pinned_executables: dict[str, Path],
 ) -> None:
+    state = _review_state("jasoncarreira/mimir", 1220, "worklink/1220", "/tmp")
     argv = parse_service_shell_argv(
         "gh pr view 1220 -R jasoncarreira/mimir --json "
         "number,title,state,isDraft,author,headRefOid,reviews,comments,body,files",
-        "repo_review",
+        "repo_review", review_state=state,
     )
 
     assert argv is not None
     assert argv[0] == str(maintenance_pinned_executables["gh"])
+
+
+@pytest.mark.parametrize(
+    "command_template",
+    [
+        "gh pr view 5 {} --json body",
+        "gh pr diff 5 {}",
+        "gh pr checks 5 {}",
+        "gh issue view 5 {} --json body",
+    ],
+)
+@pytest.mark.parametrize(
+    ("repository_option", "repository", "admitted"),
+    [
+        ("--repo {}", "acme/widget", True),
+        ("-R {}", "acme/widget", True),
+        ("--repo={}", "acme/widget", True),
+        ("-R{}", "acme/widget", True),
+        ("--repo {}", "victim/private", False),
+        ("-R {}", "victim/private", False),
+        ("--repo={}", "victim/private", False),
+        ("-R{}", "victim/private", False),
+    ],
+)
+def test_repo_review_github_reads_bind_every_repository_alias_to_scope(
+    command_template: str,
+    repository_option: str,
+    repository: str,
+    admitted: bool,
+    maintenance_pinned_executables: dict[str, Path],
+) -> None:
+    state = _review_state("acme/widget", 5, "worklink/5", "/tmp")
+    command = command_template.format(repository_option.format(repository))
+
+    argv = parse_service_shell_argv(
+        command, "repo_review", review_state=state,
+    )
+
+    assert (argv is not None) is admitted, command
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "gh pr view 5 --json body",
+        "gh pr diff 5",
+        "gh pr checks 5",
+        "gh issue view 5 --json body",
+    ],
+)
+def test_repo_review_github_reads_require_explicit_repository(
+    command: str,
+    maintenance_pinned_executables: dict[str, Path],
+) -> None:
+    state = _review_state("acme/widget", 5, "worklink/5", "/tmp")
+
+    argv = parse_service_shell_argv(
+        command, "repo_review", review_state=state,
+    )
+
+    assert argv is None, command
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "gh pr view 5 --repo acme/widget --json body",
+        "gh pr diff 5 --repo acme/widget",
+        "gh pr checks 5 --repo acme/widget",
+        "gh issue view 5 --repo acme/widget --json body",
+    ],
+)
+def test_repo_review_github_reads_refuse_absent_review_state(
+    command: str,
+    maintenance_pinned_executables: dict[str, Path],
+) -> None:
+    argv = parse_service_shell_argv(command, "repo_review")
+
+    assert argv is None, command
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        ["-R=acme/widget"],
+        ["-R", "=acme/widget"],
+    ],
+)
+def test_gh_repository_operand_rejects_equals_prefixed_short_option_value(
+    arguments: list[str],
+) -> None:
+    assert access_control._gh_repository_operand(arguments) is None
+
+
+@pytest.mark.parametrize(
+    ("path", "admitted"),
+    [
+        ("repos/acme/widget/contents/README.md", True),
+        ("repos/acme/widget/pulls/5/reviews", True),
+        ("repos/victim/private/contents/README.md", False),
+        ("user/repos", False),
+        ("orgs/secret-org/members", False),
+    ],
+)
+def test_repo_review_gh_api_is_bounded_to_scope_repository(
+    path: str,
+    admitted: bool,
+    maintenance_pinned_executables: dict[str, Path],
+) -> None:
+    state = _review_state("acme/widget", 5, "worklink/5", "/tmp")
+
+    argv = parse_service_shell_argv(
+        f"gh api {path} --paginate", "repo_review", review_state=state,
+    )
+
+    assert (argv is not None) is admitted
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "gh pr view 5 --repo victim/private --json body",
+        "gh pr diff 5 --repo victim/private",
+        "gh pr checks 5 --repo victim/private",
+        "gh issue view 5 --repo victim/private",
+        "gh api repos/victim/private/contents/README.md",
+        "gh api user/repos --paginate",
+        "gh api orgs/secret-org/members",
+    ],
+)
+def test_repo_review_sink_gate_refuses_reads_outside_bound_repository(
+    command: str,
+    maintenance_pinned_executables: dict[str, Path],
+) -> None:
+    state = _review_state("acme/widget", 5, "worklink/5", "/tmp")
+    service = build_trigger_service_principal(
+        canonical="poller:github-activity", trigger="poller", profile="github",
+        tier=CapabilityTier.CODE_EXECUTION,
+        capabilities=("shell_exec", "bash_jobs_list", "bash_job_output"),
+        creation_path="test",
+    )
+    auth = _service_auth(
+        service, InformationFlowLabels(), repo_review_state=state,
+    )
+
+    decision = ToolRegistry().authorize_tool(
+        "shell_exec", auth, enforce=True, target_channel=command,
+        arguments={"command": command},
+    )
+
+    assert decision.allowed is False, command
 
 
 @pytest.mark.parametrize(
@@ -6520,7 +6940,6 @@ def test_repo_review_profile_admits_bounded_review_and_remediation_surface(
     worktree = root / "review-worktree"
     admitted = (
         "gh api repos/o/r/pulls/1243/reviews --paginate",
-        "gh api user -X GET",
         "gh issue view 1028 --repo o/r --json number,title --comments",
         "gh auth status",
         "git log --oneline -5 -- mimir/access_control.py",
@@ -6544,6 +6963,15 @@ def test_repo_review_profile_admits_bounded_review_and_remediation_surface(
             "shell_exec", auth, enforce=True, target_channel=command,
         )
         assert decision.allowed is True, (command, decision.refusal_detail)
+
+    for command in (
+        "gh api user/repos --paginate",
+        "gh api orgs/secret-org/members",
+    ):
+        decision = registry.authorize_tool(
+            "shell_exec", auth, enforce=True, target_channel=command,
+        )
+        assert decision.allowed is False, command
 
     commit_argv = parse_service_shell_argv(
         "git commit -m safe", "repo_review", review_state=state,
@@ -6901,8 +7329,19 @@ def test_repo_review_push_is_still_gated_by_untrusted_active_ingest(
 
 def test_repo_test_admits_self_trigger_only_and_refuses_monotonic_taint(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    home = tmp_path / "home"
+    lease_root = tmp_path / "server-leases"
+    home.mkdir()
+    lease_root.mkdir()
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    monkeypatch.setenv("MIMIR_GITHUB_SELF_LOGIN", "mimir-bot")
+    monkeypatch.setenv("MIMIR_PR_CHECKOUT_LEASE_ROOT", str(lease_root))
     state = _review_state("o/r", 7, "worklink/7", str(tmp_path))
+    checkout = _attach_test_checkout_lease(state, lease_root, "lease-7")
+    lease_file = checkout / "lease-7.json"
+    lease_file.write_text('{"lease":"7"}', encoding="utf-8")
     service = build_trigger_service_principal(
         canonical="poller:github-activity", trigger="poller", profile="github",
         tier=CapabilityTier.CODE_EXECUTION, capabilities=("repo_test",),
@@ -6943,6 +7382,14 @@ def test_repo_test_admits_self_trigger_only_and_refuses_monotonic_taint(
         "poller:github-activity",
     ).with_source(untrusted_page)
     mixed = clean.with_source(untrusted_page)
+    lease_auth = replace(
+        _service_auth(service, clean), repo_review_state=state,
+    )
+    lease_source = protected_result_source(
+        lease_auth, principal="filesystem", domain="filesystem",
+        resource_id=str(lease_file), bridge_instance="filesystem",
+    )
+    after_lease_read = clean.with_source(lease_source)
     target = (
         f"{state.action_scope.canonical_repo}#pull/{state.action_scope.pr_number}"
         f"@{state.action_scope.observed_head_sha}:{state.action_scope.scope_id}"
@@ -6962,6 +7409,11 @@ def test_repo_test_admits_self_trigger_only_and_refuses_monotonic_taint(
 
     clean_decision = decision(clean)
     assert clean_decision.allowed is True, clean_decision.reason
+    assert (lease_source.integrity, lease_source.integrity_effect) == (
+        "trusted", "informational",
+    )
+    lease_decision = decision(after_lease_read)
+    assert lease_decision.allowed is True, lease_decision.reason
     for labels in (untrusted_only, mixed):
         blocked = decision(labels)
         assert blocked.allowed is False
@@ -7099,6 +7551,36 @@ def test_github_poller_binds_review_scope_from_server_event_and_origin(
         }]},
     )
     assert create_auth_context(steered, enforce=True).repo_review_state is None
+
+
+def test_replayed_github_poller_payload_cannot_mint_repo_pr_scope(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _root, authority, item = _github_scope_test_setup(tmp_path, monkeypatch)
+    live = AgentEvent(
+        trigger="poller", channel_id="poller:github-activity",
+        service_principal=authority.canonical, service_authority=authority,
+        extra={"poller_name": "github-activity", "items": [item]},
+    )
+    replayed = replace(
+        live,
+        extra={
+            **live.extra,
+            access_control.POLLER_RECOVERY_REPLAY_EXTRA_KEY: True,
+        },
+    )
+
+    live_scope = create_auth_context(live, enforce=True).repo_pr_action_scope
+    replayed_scope = create_auth_context(replayed, enforce=True).repo_pr_action_scope
+
+    assert live_scope is not None
+    assert {
+        access_control.RepoPRAction.WRITE.value,
+        access_control.RepoPRAction.COMMIT.value,
+        access_control.RepoPRAction.PUSH.value,
+    } <= live_scope.allowed_operations
+    assert replayed_scope is None
 
 
 def _github_scope_test_setup(
@@ -8095,7 +8577,7 @@ def test_every_service_shell_profile_returns_absolute_executables(
         "repo_review": (
             "pwd -P", "ls -la", "wc -l sample.txt", "grep -n needle sample.txt",
             "jq -r .name sample.json", "rg --no-config -n needle .",
-            "git status --short", "gh pr view 979 --json title",
+            "git status --short", "gh pr view 979 --repo owner/repo --json title",
             "npm ci --ignore-scripts",
         ),
         "maintenance": (
@@ -8370,6 +8852,1203 @@ def test_project_test_command_is_configuration_driven_across_profiles(
     assert argv == [str(executable), *fixed_arguments, *selectors]
     assert reason == ""
     assert access_control.configured_project_test_cwd(argv) == str(repo.resolve())
+
+
+@pytest.mark.parametrize(
+    ("command", "expected_rule"),
+    [
+        ("echo safe; echo unsafe", ServiceShellBindingRule.SHELL_CONTROL_CHARACTERS),
+        ("echo 'unbalanced", ServiceShellBindingRule.ARGV_UNBALANCED_QUOTING),
+        ("", ServiceShellBindingRule.ARGV_EMPTY),
+        ("ls ~/notes", ServiceShellBindingRule.SHELL_HOME_EXPANSION),
+        ("curl https://example.invalid", ServiceShellBindingRule.PROFILE_ALLOWLIST),
+    ],
+    ids=["shell-control", "quoting", "empty", "home-expansion", "profile-miss"],
+)
+def test_operator_arm2_preprofile_branch_matrix(
+    command: str,
+    expected_rule: ServiceShellBindingRule,
+) -> None:
+    argv, reason, rule = access_control.parse_service_shell_argv_with_diagnostics(
+        command,
+        access_control.OPERATOR_SHELL_PROFILE,
+        allow_project_test=False,
+    )
+
+    assert argv is None
+    assert reason
+    assert rule is expected_rule
+
+
+def test_operator_arm2_preprofile_chainlink_normalization(
+    maintenance_pinned_executables: dict[str, Path],
+) -> None:
+    argv, reason, rule = access_control.parse_service_shell_argv_with_diagnostics(
+        "/usr/local/bin/chainlink issue show 1337 --json",
+        access_control.OPERATOR_SHELL_PROFILE,
+        allow_project_test=False,
+    )
+
+    assert argv == [
+        str(maintenance_pinned_executables["chainlink"]),
+        "issue", "show", "1337", "--json",
+    ]
+    assert reason == ""
+    assert rule is None
+
+
+def test_operator_arm2_profile_selection_and_coverage_are_documented() -> None:
+    design = (
+        Path(__file__).parents[1] / "docs" / "security" / "turn-capability.md"
+    ).read_text(encoding="utf-8")
+
+    assert access_control.OPERATOR_SHELL_PROFILE == "scheduler_read_only"
+    assert "approximately **60/293** commands" in design
+    assert "31 `chainlink issue show ...` queries and 29 `git status --short` calls" in design
+    assert "ceiling, not guaranteed runtime coverage" in design
+
+
+def test_operator_arm2_excludes_configured_project_tests_without_changing_service_profiles(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    maintenance_pinned_executables: dict[str, Path],
+) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    executable = maintenance_pinned_executables["uv"]
+    _configure_project_test(
+        monkeypatch,
+        executable=executable,
+        repo=repo,
+        fixed_arguments=["run", "pytest", "-q"],
+    )
+    command = shlex.join([str(executable), "run", "pytest", "-q", "tests/test_auth.py"])
+
+    service_argv, service_reason, service_rule = (
+        access_control.parse_service_shell_argv_with_diagnostics(
+            command, access_control.OPERATOR_SHELL_PROFILE,
+        )
+    )
+    operator_argv, operator_reason, operator_rule = (
+        access_control.parse_service_shell_argv_with_diagnostics(
+            command,
+            access_control.OPERATOR_SHELL_PROFILE,
+            allow_project_test=False,
+        )
+    )
+
+    assert service_argv == [
+        str(executable), "run", "pytest", "-q", "tests/test_auth.py",
+    ]
+    assert service_reason == ""
+    assert service_rule is None
+    assert operator_argv is None
+    assert operator_reason
+    assert operator_rule is ServiceShellBindingRule.PROFILE_ALLOWLIST
+    assert parse_service_shell_argv_with_reason(
+        command,
+        access_control.OPERATOR_SHELL_PROFILE,
+        allow_project_test=False,
+    )[0] is None
+    assert parse_service_shell_argv(
+        command,
+        access_control.OPERATOR_SHELL_PROFILE,
+        allow_project_test=False,
+    ) is None
+
+
+def test_operator_arm2_never_uses_service_declared_commands(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    seen: list[tuple[access_control.DeclaredShellCommand, ...]] = []
+
+    def capture_declared(
+        _argv: list[str],
+        declared: tuple[access_control.DeclaredShellCommand, ...],
+    ) -> None:
+        seen.append(declared)
+        return None
+
+    monkeypatch.setattr(
+        access_control, "_declared_command_execution_argv", capture_declared,
+    )
+
+    argv, _reason, rule = access_control.parse_service_shell_argv_with_diagnostics(
+        "gog gmail search newer_than:24h",
+        access_control.OPERATOR_SHELL_PROFILE,
+        allow_project_test=False,
+    )
+
+    assert seen == [()]
+    assert argv is None
+    assert rule is ServiceShellBindingRule.PROFILE_ALLOWLIST
+
+
+def test_operator_arm2_reader_policy_does_not_require_or_create_service_authority(
+    monkeypatch: pytest.MonkeyPatch,
+    maintenance_pinned_executables: dict[str, Path],
+) -> None:
+    monkeypatch.setattr(
+        access_control,
+        "_service_shell_read_operand_refusal",
+        lambda *_args, **_kwargs: pytest.fail("operator parser used service read policy"),
+    )
+
+    argv = parse_service_shell_argv(
+        "ls -la",
+        access_control.OPERATOR_SHELL_PROFILE,
+        allow_project_test=False,
+    )
+
+    assert argv == [str(maintenance_pinned_executables["ls"]), "-la"]
+
+
+@pytest.mark.parametrize(
+    ("command", "command_key"),
+    [
+        ("chainlink issue show 1337 --json", "chainlink"),
+        ("pwd -P", "pwd"),
+        ("ls -la", "ls"),
+        ("wc -l sample.txt", "wc"),
+        ("grep -n needle sample.txt", "grep"),
+        ("jq -r .name sample.json", "jq"),
+        ("rg --no-config -n needle .", "rg"),
+        ("git status --short", "git"),
+        ("git diff --no-ext-diff --no-textconv --stat", "git"),
+        ("git log --no-ext-diff --no-textconv --oneline", "git"),
+        ("git show --no-ext-diff --no-textconv --stat HEAD", "git"),
+    ],
+    ids=[
+        "chainlink", "pwd", "ls", "wc", "grep", "jq", "rg",
+        "git-status", "git-diff", "git-log", "git-show",
+    ],
+)
+def test_operator_arm2_scheduler_family_matrix(
+    command: str,
+    command_key: str,
+    maintenance_pinned_executables: dict[str, Path],
+) -> None:
+    argv, reason, rule = access_control.parse_service_shell_argv_with_diagnostics(
+        command,
+        access_control.OPERATOR_SHELL_PROFILE,
+        allow_project_test=False,
+    )
+
+    assert argv is not None, reason
+    assert argv[0] == str(maintenance_pinned_executables[command_key])
+    assert reason == ""
+    assert rule is None
+
+
+def _operator_confinement_tree(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> tuple[Path, Path, Path]:
+    home = tmp_path / "home"
+    root = tmp_path / "repo"
+    outside = tmp_path / "outside"
+    (home / "state").mkdir(parents=True)
+    root.mkdir()
+    outside.mkdir()
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    monkeypatch.setenv("MIMIR_FILE_TOOL_ROOTS", f"{root}:ro")
+    monkeypatch.setattr(
+        "mimir.read_policy.configured_non_admin_read_roots", lambda: (root,),
+    )
+    return home, root, outside
+
+
+def test_operator_arm2_pin_failure_never_issues_binding(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    maintenance_pinned_executables: dict[str, Path],
+) -> None:
+    _home, root, _outside = _operator_confinement_tree(tmp_path, monkeypatch)
+    artifact = access_control._OperatorShellArgvArtifact(
+        (str(maintenance_pinned_executables["ls"]), str(root)),
+        "ls",
+        str(root),
+        object(),
+    )
+    binding = access_control._issue_operator_shell_binding(
+        request_identity=object(),
+        auth_context_identity=object(),
+        tool_call_id="call-1",
+        command="ls",
+        requested_cwd=str(root),
+        resolved_cwd=str(root),
+        argv_artifact=artifact,
+    )
+
+    assert binding is None
+
+
+def test_operator_arm2_pwd_requires_authorized_cwd(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _home, root, outside = _operator_confinement_tree(tmp_path, monkeypatch)
+    inside = root / "inside"
+    inside.mkdir()
+    linked = root / "linked"
+    linked.symlink_to(inside, target_is_directory=True)
+
+    assert access_control._resolve_operator_bounded_cwd(str(root), git=False) == root
+    assert access_control._resolve_operator_bounded_cwd(str(linked), git=False) == inside
+    assert access_control._resolve_operator_bounded_cwd(str(outside), git=False) is None
+    assert access_control._resolve_operator_bounded_cwd(str(root / ".." / "outside"), git=False) is None
+    monkeypatch.chdir(root)
+    assert access_control._resolve_operator_bounded_cwd(None, git=False) == root
+
+
+def test_operator_arm2_git_and_non_git_cwd_forms(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _home, root, outside = _operator_confinement_tree(tmp_path, monkeypatch)
+    monkeypatch.setattr(
+        access_control, "_configured_maintenance_git_roots", lambda: [root],
+    )
+    linked = root / "linked"
+    nested = root / "nested"
+    nested.mkdir()
+    linked.symlink_to(nested, target_is_directory=True)
+
+    monkeypatch.chdir(root)
+    for git in (False, True):
+        assert access_control._resolve_operator_bounded_cwd(None, git=git) == root
+        assert access_control._resolve_operator_bounded_cwd(str(root), git=git) == root
+        assert access_control._resolve_operator_bounded_cwd(str(linked), git=git) == nested
+        assert access_control._resolve_operator_bounded_cwd(str(outside), git=git) is None
+        assert access_control._resolve_operator_bounded_cwd("", git=git) is None
+        assert access_control._resolve_operator_bounded_cwd("relative", git=git) is None
+        assert access_control._resolve_operator_bounded_cwd(
+            str(root / ".." / "outside"), git=git,
+        ) is None
+
+
+@pytest.mark.parametrize(
+    ("command", "expected_tail"),
+    [
+        ("ls -la sample.txt", "sample.txt"),
+        ("wc -l sample.txt", "sample.txt"),
+        ("grep -n needle sample.txt", "sample.txt"),
+        ("rg --no-config needle sample.txt", "sample.txt"),
+        ("rg --no-config --files .", "repo"),
+    ],
+)
+def test_operator_arm2_reader_rewrites_safe_operands_to_canonical_paths(
+    command: str,
+    expected_tail: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    maintenance_pinned_executables: dict[str, Path],
+) -> None:
+    _home, root, _outside = _operator_confinement_tree(tmp_path, monkeypatch)
+    sample = root / "sample.txt"
+    sample.write_text("needle\n", encoding="utf-8")
+    parsed = shlex.split(command)
+    parsed[0] = str(maintenance_pinned_executables[parsed[0]])
+
+    argv, reason, rule = access_control._operator_read_execution_argv_with_diagnostics(
+        parsed, resolved_cwd=root,
+    )
+
+    assert argv is not None, reason
+    assert rule is None
+    assert Path(argv[-1]).is_absolute()
+    assert Path(argv[-1]).name == expected_tail
+
+
+@pytest.mark.parametrize("command", ["ls -- {path}", "wc -- {path}", "grep needle -- {path}", "rg --no-config needle -- {path}"])
+def test_operator_arm2_reader_operand_confinement_matrix(
+    command: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    maintenance_pinned_executables: dict[str, Path],
+) -> None:
+    _home, root, outside = _operator_confinement_tree(tmp_path, monkeypatch)
+    safe = root / "safe.txt"
+    safe.write_text("ordinary\n", encoding="utf-8")
+    protected = root / "secrets.json"
+    protected.write_text("{}\n", encoding="utf-8")
+    escaped = outside / "outside.txt"
+    escaped.write_text("ordinary\n", encoding="utf-8")
+    (root / "escape").symlink_to(outside, target_is_directory=True)
+    inside_link = root / "inside-link.txt"
+    inside_link.symlink_to(safe)
+
+    executable = command.split()[0]
+    for value, allowed in (
+        ("safe.txt", True),
+        (str(safe), True),
+        (str(inside_link), True),
+        ("../outside/outside.txt", False),
+        (str(escaped), False),
+        ("escape/outside.txt", False),
+        ("secrets.json", False),
+    ):
+        parsed = shlex.split(command.format(path=value))
+        parsed[0] = str(maintenance_pinned_executables[executable])
+        argv, reason, rule = access_control._operator_read_execution_argv_with_diagnostics(
+            parsed, resolved_cwd=root,
+        )
+        assert (argv is not None) is allowed
+        if not allowed:
+            assert rule is ServiceShellBindingRule.OPERATOR_READ_OPERAND_POLICY
+            assert value not in reason
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        ["wc"],
+        ["grep", "needle"],
+        ["rg", "--no-config", "needle"],
+    ],
+)
+def test_operator_arm2_reader_refuses_mixed_and_credential_operands_value_free(
+    command: list[str],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    maintenance_pinned_executables: dict[str, Path],
+) -> None:
+    _home, root, _outside = _operator_confinement_tree(tmp_path, monkeypatch)
+    safe = root / "safe.txt"
+    safe.write_text("ordinary\n", encoding="utf-8")
+    secret = root / "private-value.txt"
+    credential = "ghp_" + "x" * 36
+    secret.write_text(credential, encoding="utf-8")
+
+    argv, reason, rule = access_control._operator_read_execution_argv_with_diagnostics(
+        [str(maintenance_pinned_executables[command[0]]), *command[1:], str(safe), str(secret)],
+        resolved_cwd=root,
+    )
+
+    assert argv is None
+    assert rule is ServiceShellBindingRule.OPERATOR_READ_OPERAND_POLICY
+    assert str(safe) not in reason
+    assert str(secret) not in reason
+    assert credential not in reason
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        ["ls"],
+        ["wc"],
+        ["grep", "needle"],
+        ["rg", "--no-config", "needle"],
+        ["rg", "--no-config", "--files"],
+    ],
+)
+def test_operator_arm2_every_reader_refuses_credential_file(
+    command: list[str],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    maintenance_pinned_executables: dict[str, Path],
+) -> None:
+    _home, root, _outside = _operator_confinement_tree(tmp_path, monkeypatch)
+    credential = "ghp_" + "z" * 36
+    target = root / "ordinary-name.txt"
+    target.write_text(credential, encoding="utf-8")
+    argv = [
+        str(maintenance_pinned_executables[command[0]]),
+        *command[1:],
+        str(target),
+    ]
+
+    hardened, reason, rule = access_control._operator_read_execution_argv_with_diagnostics(
+        argv, resolved_cwd=root,
+    )
+
+    assert hardened is None
+    assert reason == access_control._OPERATOR_READ_REFUSAL
+    assert rule is ServiceShellBindingRule.OPERATOR_READ_OPERAND_POLICY
+    assert credential not in reason
+    assert str(target) not in reason
+
+
+@pytest.mark.parametrize(
+    ("command", "omitted_allowed", "omitted_adds_cwd", "root_allowed"),
+    [
+        (["ls"], True, True, True),
+        # `wc` and a non-recursive `grep` bind no operand, so an omitted path
+        # leaves the argv verbatim and the program reads inherited stdin. Refused.
+        (["wc"], False, False, False),
+        (["grep", "needle"], False, False, False),
+        (["rg", "--no-config", "needle"], True, True, True),
+        (["rg", "--no-config", "--files"], True, True, True),
+    ],
+)
+def test_operator_arm2_reader_defaults_multiple_missing_and_root(
+    command: list[str],
+    omitted_allowed: bool,
+    omitted_adds_cwd: bool,
+    root_allowed: bool,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    maintenance_pinned_executables: dict[str, Path],
+) -> None:
+    _home, root, _outside = _operator_confinement_tree(tmp_path, monkeypatch)
+    first = root / "first.txt"
+    second = root / "second.txt"
+    first.write_text("needle\n", encoding="utf-8")
+    second.write_text("needle\n", encoding="utf-8")
+    base = [str(maintenance_pinned_executables[command[0]]), *command[1:]]
+
+    omitted, omitted_reason, omitted_rule = access_control._operator_read_execution_argv_with_diagnostics(
+        base, resolved_cwd=root,
+    )
+    assert (omitted is not None) is omitted_allowed, omitted_reason
+    if omitted_allowed:
+        assert (omitted[-1] == str(root)) is omitted_adds_cwd
+    else:
+        # Refused rather than executed verbatim against inherited stdin.
+        assert omitted_reason == access_control._OPERATOR_READ_REFUSAL
+        assert omitted_rule is ServiceShellBindingRule.OPERATOR_READ_OPERAND_POLICY
+
+    multiple, multiple_reason, _rule = access_control._operator_read_execution_argv_with_diagnostics(
+        [*base, str(first), str(second)], resolved_cwd=root,
+    )
+    assert multiple is not None, multiple_reason
+    assert multiple[-2:] == [str(first), str(second)]
+
+    missing, reason, rule = access_control._operator_read_execution_argv_with_diagnostics(
+        [*base, str(root / "missing.txt")], resolved_cwd=root,
+    )
+    assert missing is None
+    assert reason == access_control._OPERATOR_READ_REFUSAL
+    assert rule is ServiceShellBindingRule.OPERATOR_READ_OPERAND_POLICY
+
+    rooted, _reason, _rule = access_control._operator_read_execution_argv_with_diagnostics(
+        [*base, str(root)], resolved_cwd=root,
+    )
+    assert (rooted is not None) is root_allowed
+
+
+def test_operator_arm2_direct_execution_binds_stdin_away_from_the_agent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``shell_exec`` must bind the child's stdin, not inherit the agent's.
+
+    The binding layer refuses an operandless reader, but that is one rule about
+    two programs. This pins the execution boundary itself: whatever argv reaches
+    the subprocess, its stdin is the server's choice rather than whatever
+    descriptor the agent process holds. Without it, any direct argv that reads
+    stdin regains an unbound input surface after active ingest, and hangs until
+    the shell timeout when nothing is piped.
+
+    Asserted at ``shell_exec``'s own call site. An earlier version of this test
+    invoked ``subprocess.run`` directly and passed with the fix reverted -- it
+    was exercising the standard library, not this code path.
+    """
+    import subprocess as _subprocess
+
+    from mimir.tools import extra as tools_extra
+
+    recorded: list[dict[str, object]] = []
+
+    class _Completed:
+        returncode = 0
+        stdout = b""
+        stderr = b""
+
+    def recording_run(argv, **kwargs):  # type: ignore[no-untyped-def]
+        recorded.append({"argv": list(argv), **kwargs})
+        return _Completed()
+
+    monkeypatch.setattr(tools_extra.subprocess, "run", recording_run)
+    runner = getattr(tools_extra.shell_exec, "func", tools_extra.shell_exec)
+    runner("echo bound", cwd=str(tmp_path))
+
+    assert recorded, "shell_exec did not reach its subprocess call site"
+    assert recorded[-1].get("stdin") is _subprocess.DEVNULL
+
+
+def test_operator_arm2_recursive_reader_preflight_is_bounded_and_value_free(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    maintenance_pinned_executables: dict[str, Path],
+) -> None:
+    _home, root, _outside = _operator_confinement_tree(tmp_path, monkeypatch)
+    for index in range(access_control._SHELL_RECURSIVE_READ_ENTRY_LIMIT + 1):
+        (root / f"sentinel-{index}.txt").write_text("needle\n", encoding="utf-8")
+
+    argv, reason, rule = access_control._operator_read_execution_argv_with_diagnostics(
+        [str(maintenance_pinned_executables["grep"]), "-r", "needle", "."],
+        resolved_cwd=root,
+    )
+
+    assert argv is None
+    assert rule is ServiceShellBindingRule.OPERATOR_READ_OPERAND_POLICY
+    assert "sentinel" not in reason
+    assert str(root) not in reason
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        ["grep", "-r", "needle", "."],
+        ["rg", "--no-config", "needle", "."],
+    ],
+)
+@pytest.mark.parametrize("limit_kind", ["entry", "byte"])
+def test_operator_arm2_recursive_grep_and_rg_entry_and_byte_limits(
+    command: list[str],
+    limit_kind: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    maintenance_pinned_executables: dict[str, Path],
+) -> None:
+    _home, root, _outside = _operator_confinement_tree(tmp_path, monkeypatch)
+    (root / "first.txt").write_text("needle\n", encoding="utf-8")
+    (root / "second.txt").write_text("needle\n", encoding="utf-8")
+    if limit_kind == "entry":
+        monkeypatch.setattr(access_control, "_SHELL_RECURSIVE_READ_ENTRY_LIMIT", 1)
+    else:
+        monkeypatch.setattr(access_control, "_SHELL_RECURSIVE_READ_BYTE_LIMIT", 1)
+    argv = [str(maintenance_pinned_executables[command[0]]), *command[1:]]
+
+    hardened, reason, rule = access_control._operator_read_execution_argv_with_diagnostics(
+        argv, resolved_cwd=root,
+    )
+
+    assert hardened is None
+    assert reason == access_control._OPERATOR_READ_REFUSAL
+    assert rule is ServiceShellBindingRule.OPERATOR_READ_OPERAND_POLICY
+    assert str(root) not in reason
+
+
+@pytest.mark.parametrize(
+    ("command", "hidden_refused"),
+    [
+        (["grep", "-r", "needle", "."], True),
+        (["rg", "--no-config", "needle", "."], False),
+        (["rg", "--no-config", "--hidden", "needle", "."], True),
+    ],
+)
+def test_operator_arm2_recursive_hidden_and_protected_children(
+    command: list[str],
+    hidden_refused: bool,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    maintenance_pinned_executables: dict[str, Path],
+) -> None:
+    _home, root, _outside = _operator_confinement_tree(tmp_path, monkeypatch)
+    hidden = root / ".env"
+    hidden.write_text("ordinary\n", encoding="utf-8")
+    argv = [str(maintenance_pinned_executables[command[0]]), *command[1:]]
+
+    hardened, _reason, _rule = access_control._operator_read_execution_argv_with_diagnostics(
+        argv, resolved_cwd=root,
+    )
+    assert (hardened is None) is hidden_refused
+
+    hidden.unlink()
+    protected = root / "secrets.json"
+    protected.write_text("{}\n", encoding="utf-8")
+    hardened, reason, rule = access_control._operator_read_execution_argv_with_diagnostics(
+        argv, resolved_cwd=root,
+    )
+    assert hardened is None
+    assert reason == access_control._OPERATOR_READ_REFUSAL
+    assert rule is ServiceShellBindingRule.OPERATOR_READ_OPERAND_POLICY
+    assert str(protected) not in reason
+
+
+def test_operator_arm2_rg_files_bounds_every_credential_scan_and_withholds_values(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    maintenance_pinned_executables: dict[str, Path],
+) -> None:
+    _home, root, _outside = _operator_confinement_tree(tmp_path, monkeypatch)
+    argv = [str(maintenance_pinned_executables["rg"]), "--no-config", "--files", "."]
+    oversized = root / "oversized-sentinel.txt"
+    oversized.write_text("ordinary-content\n", encoding="utf-8")
+    monkeypatch.setattr(access_control, "_SHELL_RECURSIVE_READ_BYTE_LIMIT", 1)
+
+    hardened, reason, rule = access_control._operator_read_execution_argv_with_diagnostics(
+        argv, resolved_cwd=root,
+    )
+
+    assert hardened is None
+    assert reason == access_control._OPERATOR_READ_REFUSAL
+    assert rule is ServiceShellBindingRule.OPERATOR_READ_OPERAND_POLICY
+    assert str(oversized) not in reason
+    assert "oversized-sentinel" not in reason
+
+    monkeypatch.setattr(access_control, "_SHELL_RECURSIVE_READ_BYTE_LIMIT", 1024)
+    oversized.unlink()
+    credential = root / "ordinary-name.txt"
+    secret_value = "ghp_" + "q" * 36
+    credential.write_text(secret_value, encoding="utf-8")
+    hardened, reason, rule = access_control._operator_read_execution_argv_with_diagnostics(
+        argv, resolved_cwd=root,
+    )
+    assert hardened is None
+    assert reason == access_control._OPERATOR_READ_REFUSAL
+    assert rule is ServiceShellBindingRule.OPERATOR_READ_OPERAND_POLICY
+    assert secret_value not in reason
+    assert str(credential) not in reason
+
+    credential.unlink()
+    protected = root / "secrets.json"
+    protected.write_text("{}\n", encoding="utf-8")
+    hardened, reason, rule = access_control._operator_read_execution_argv_with_diagnostics(
+        argv, resolved_cwd=root,
+    )
+    assert hardened is None
+    assert reason == access_control._OPERATOR_READ_REFUSAL
+    assert rule is ServiceShellBindingRule.OPERATOR_READ_OPERAND_POLICY
+    assert str(protected) not in reason
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["jq", "-r", ".name", "sample.json"],
+        ["rg", "--no-config", "-L", "needle", "."],
+    ],
+)
+def test_operator_arm2_jq_and_rg_symlink_following_are_soft_exclusions(
+    argv: list[str],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    maintenance_pinned_executables: dict[str, Path],
+) -> None:
+    _home, root, _outside = _operator_confinement_tree(tmp_path, monkeypatch)
+    argv[0] = str(maintenance_pinned_executables[argv[0]])
+
+    hardened, reason, rule = access_control._operator_read_execution_argv_with_diagnostics(
+        argv, resolved_cwd=root,
+    )
+
+    assert hardened is None
+    assert reason == access_control._OPERATOR_READER_EXCLUDED_REFUSAL
+    assert rule is ServiceShellBindingRule.OPERATOR_READER_EXCLUDED
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        ["status", "--short"],
+        ["diff", "--no-ext-diff", "--no-textconv", "--stat"],
+        ["log", "--no-ext-diff", "--no-textconv", "--oneline"],
+        ["show", "--no-ext-diff", "--no-textconv", "--stat", "HEAD"],
+    ],
+)
+def test_operator_arm2_every_git_family_uses_maintenance_hardening(
+    arguments: list[str],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    maintenance_pinned_executables: dict[str, Path],
+) -> None:
+    home, root, _outside = _operator_confinement_tree(tmp_path, monkeypatch)
+    subprocess.run(["git", "init", "-q", str(root)], check=True)
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    argv = [str(maintenance_pinned_executables["git"]), *arguments]
+
+    hardened, reason, rule = access_control._operator_git_execution_argv_with_diagnostics(
+        argv, resolved_cwd=root,
+    )
+
+    assert hardened is not None, reason
+    assert rule is None
+    joined = " ".join(hardened)
+    for setting in ("core.fsmonitor=", "core.hooksPath=/dev/null", "diff.external=", "credential.helper="):
+        assert setting in joined
+    if arguments[0] in {"diff", "log", "show"}:
+        assert hardened[-2:] == ["--no-ext-diff", "--no-textconv"]
+
+
+def test_operator_arm2_git_hardening_suppresses_all_repository_helpers(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q", str(repo)], check=True)
+    source = repo / "sample.txt"
+    source.write_text("before\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(repo), "add", "sample.txt"], check=True)
+    subprocess.run(
+        [
+            "git", "-C", str(repo), "-c", "user.name=test",
+            "-c", "user.email=test@example.com", "commit", "-qm", "initial",
+        ],
+        check=True,
+    )
+    source.write_text("after\n", encoding="utf-8")
+    marker = tmp_path / "helper-fired"
+    helper = tmp_path / "helper.sh"
+    helper.write_text(
+        f"#!/bin/sh\nprintf fired >> {marker}\ncat\n",
+        encoding="utf-8",
+    )
+    helper.chmod(0o755)
+    hooks = repo / "hooks"
+    hooks.mkdir()
+    (hooks / "post-index-change").symlink_to(helper)
+    for key in (
+        "core.fsmonitor", "diff.external", "diff.owned.textconv",
+        "filter.owned.clean", "filter.owned.smudge", "filter.owned.process",
+    ):
+        subprocess.run(
+            ["git", "-C", str(repo), "config", key, str(helper)], check=True,
+        )
+    subprocess.run(
+        ["git", "-C", str(repo), "config", "core.hooksPath", str(hooks)], check=True,
+    )
+    (repo / ".gitattributes").write_text(
+        "sample.txt diff=owned filter=owned\n", encoding="utf-8",
+    )
+    monkeypatch.setenv("MIMIR_HOME", str(repo))
+    monkeypatch.delenv("MIMIR_FILE_TOOL_ROOTS", raising=False)
+
+    commands = (
+        ["git", "status", "--short"],
+        ["git", "diff", "--no-ext-diff", "--no-textconv"],
+        ["git", "log", "--no-ext-diff", "--no-textconv", "-p", "--max-count=1"],
+        ["git", "show", "--no-ext-diff", "--no-textconv", "--stat", "HEAD"],
+    )
+    for command in commands:
+        parsed = parse_service_shell_argv(
+            shlex.join(command), access_control.OPERATOR_SHELL_PROFILE,
+            allow_project_test=False,
+        )
+        assert parsed is not None
+        hardened, reason, rule = access_control._operator_git_execution_argv_with_diagnostics(
+            parsed, resolved_cwd=repo,
+        )
+        assert hardened is not None, reason
+        assert rule is None
+        for name in ("clean", "smudge", "process"):
+            assert f"filter.owned.{name}=" in hardened
+        subprocess.run(
+            hardened,
+            check=True,
+            cwd=tmp_path,
+            env={**os.environ, "GIT_PAGER": "cat"},
+            capture_output=True,
+            text=True,
+        )
+
+    assert marker.exists() is False
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        ["status", "--verbose"],
+        ["diff", "--no-ext-diff", "--no-textconv", "--", "sample.txt"],
+        ["log", "--no-ext-diff", "--no-textconv", "--", "sample.txt"],
+        ["show", "--no-ext-diff", "--no-textconv", "--", "sample.txt"],
+    ],
+)
+def test_operator_arm2_scheduler_git_forms_outside_hardener_remain_unbounded(
+    arguments: list[str],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    maintenance_pinned_executables: dict[str, Path],
+) -> None:
+    _home, root, _outside = _operator_confinement_tree(tmp_path, monkeypatch)
+
+    argv, reason, rule = access_control._operator_git_execution_argv_with_diagnostics(
+        [str(maintenance_pinned_executables["git"]), *arguments], resolved_cwd=root,
+    )
+
+    assert argv is None
+    assert reason == access_control._OPERATOR_GIT_EXCLUDED_REFUSAL
+    assert rule is ServiceShellBindingRule.OPERATOR_GIT_HARDENING
+
+
+@pytest.mark.parametrize("failure", ["pin", "root", "filter", "infrastructure"])
+def test_operator_arm2_git_hard_failures_never_produce_artifact(
+    failure: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    maintenance_pinned_executables: dict[str, Path],
+) -> None:
+    _home, root, outside = _operator_confinement_tree(tmp_path, monkeypatch)
+    subprocess.run(["git", "init", "-q", str(root)], check=True)
+    subprocess.run(["git", "init", "-q", str(outside)], check=True)
+    argv = [str(maintenance_pinned_executables["git"]), "status", "--short"]
+    cwd = root
+    if failure == "pin":
+        monkeypatch.setattr(access_control, "_maintenance_resolved_pin", lambda _name: None)
+    elif failure == "root":
+        cwd = outside
+    elif failure == "filter":
+        monkeypatch.setattr(access_control, "_maintenance_git_filter_overrides", lambda *_args: None)
+    else:
+        monkeypatch.setattr(
+            access_control.subprocess,
+            "run",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("unavailable")),
+        )
+
+    hardened, reason, rule = access_control._operator_git_execution_argv_with_diagnostics(
+        argv, resolved_cwd=cwd,
+    )
+
+    assert hardened is None
+    assert reason == access_control._OPERATOR_GIT_REFUSAL
+    assert rule is ServiceShellBindingRule.OPERATOR_GIT_HARDENING
+
+
+def test_operator_binding_issuance_is_immutable_and_withholds_identity_values(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    maintenance_pinned_executables: dict[str, Path],
+) -> None:
+    _home, root, _outside = _operator_confinement_tree(tmp_path, monkeypatch)
+    request = object()
+    auth = object()
+    original = [
+        str(maintenance_pinned_executables["chainlink"]),
+        "issue", "close", "1337",
+    ]
+    artifact = access_control._validated_operator_shell_argv_artifact(
+        original, original, resolved_cwd=root,
+    )
+    assert artifact is not None
+    binding = access_control._issue_operator_shell_binding(
+        request_identity=request,
+        auth_context_identity=auth,
+        tool_call_id="call-1",
+        command="chainlink issue close 1337",
+        requested_cwd=str(root),
+        resolved_cwd=str(root),
+        argv_artifact=artifact,
+    )
+    original.append("changed")
+
+    assert binding is not None
+    assert binding.chainlink_mutation is True
+    assert binding.argv[-1] == "1337"
+    assert binding._request_identity is request
+    assert binding._auth_context_identity is auth
+    with pytest.raises(FrozenInstanceError):
+        binding.profile = "other"
+
+
+def test_operator_binding_artifact_rejects_unhardened_and_unconfined_argv(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    maintenance_pinned_executables: dict[str, Path],
+) -> None:
+    _home, root, outside = _operator_confinement_tree(tmp_path, monkeypatch)
+    subprocess.run(["git", "init", "-q", str(root)], check=True)
+    safe = root / "safe.txt"
+    safe.write_text("ordinary\n", encoding="utf-8")
+    escaped = outside / "escaped.txt"
+    escaped.write_text("ordinary\n", encoding="utf-8")
+    git_argv = parse_service_shell_argv(
+        "git status --short", access_control.OPERATOR_SHELL_PROFILE,
+        allow_project_test=False,
+    )
+    reader_argv = parse_service_shell_argv(
+        "wc safe.txt", access_control.OPERATOR_SHELL_PROFILE,
+        allow_project_test=False,
+    )
+    outside_argv = parse_service_shell_argv(
+        shlex.join(["wc", str(escaped)]), access_control.OPERATOR_SHELL_PROFILE,
+        allow_project_test=False,
+    )
+    assert git_argv is not None
+    assert reader_argv is not None
+    assert outside_argv is not None
+
+    assert access_control._validated_operator_shell_argv_artifact(
+        git_argv, git_argv, resolved_cwd=root,
+    ) is None
+    assert access_control._validated_operator_shell_argv_artifact(
+        reader_argv, reader_argv, resolved_cwd=root,
+    ) is None
+    assert access_control._validated_operator_shell_argv_artifact(
+        outside_argv, outside_argv, resolved_cwd=root,
+    ) is None
+    unsupported = [str(maintenance_pinned_executables["gh"]), "pr", "list"]
+    assert access_control._validated_operator_shell_argv_artifact(
+        unsupported, unsupported, resolved_cwd=root,
+    ) is None
+    forged_git = access_control._OperatorShellArgvArtifact(
+        tuple(git_argv), "git", str(root), access_control._OPERATOR_SHELL_ARGV_ISSUER,
+    )
+    assert access_control._issue_operator_shell_binding(
+        request_identity=object(),
+        auth_context_identity=object(),
+        tool_call_id="call-1",
+        command="git status --short",
+        requested_cwd=str(root),
+        resolved_cwd=str(root),
+        argv_artifact=forged_git,
+    ) is None
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"request_identity": None},
+        {"auth_context_identity": None},
+        {"tool_call_id": ""},
+        {"command": ""},
+        {"requested_cwd": "relative"},
+        {"resolved_cwd": "/not-the-artifact-cwd"},
+        {"tool_name": "bash_async"},
+        {"profile": "maintenance"},
+    ],
+)
+def test_operator_binding_issuance_rejects_malformed_metadata(
+    changes: dict[str, object],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _home, root, _outside = _operator_confinement_tree(tmp_path, monkeypatch)
+    parsed = parse_service_shell_argv(
+        "pwd -P", access_control.OPERATOR_SHELL_PROFILE,
+        allow_project_test=False,
+    )
+    assert parsed is not None
+    artifact = access_control._validated_operator_shell_argv_artifact(
+        parsed, parsed, resolved_cwd=root,
+    )
+    assert artifact is not None
+    values: dict[str, object] = {
+        "request_identity": object(),
+        "auth_context_identity": object(),
+        "tool_call_id": "call-1",
+        "command": "pwd -P",
+        "requested_cwd": str(root),
+        "resolved_cwd": str(root),
+        "argv_artifact": artifact,
+        "tool_name": "shell_exec",
+        "profile": access_control.OPERATOR_SHELL_PROFILE,
+    }
+    values.update(changes)
+
+    assert access_control._issue_operator_shell_binding(**values) is None
+
+
+def _operator_chainlink_binding(
+    command: str,
+    *,
+    request: object,
+    auth: AuthContext,
+    root: Path,
+) -> access_control.OperatorShellBinding:
+    parsed = parse_service_shell_argv(
+        command, access_control.OPERATOR_SHELL_PROFILE, allow_project_test=False,
+    )
+    assert parsed is not None
+    artifact = access_control._validated_operator_shell_argv_artifact(
+        parsed, parsed, resolved_cwd=root,
+    )
+    assert artifact is not None
+    binding = access_control._issue_operator_shell_binding(
+        request_identity=request,
+        auth_context_identity=auth,
+        tool_call_id="call-arm2",
+        command=command,
+        requested_cwd=str(root),
+        resolved_cwd=str(root),
+        argv_artifact=artifact,
+    )
+    assert binding is not None
+    return binding
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        "issuer", "profile", "request", "auth", "tool", "call_id", "command",
+        "cwd", "argv", "reuse",
+    ],
+)
+def test_operator_binding_requires_every_exact_current_field(
+    field: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    maintenance_pinned_executables: dict[str, Path],
+) -> None:
+    _home, root, _outside = _operator_confinement_tree(tmp_path, monkeypatch)
+    request = object()
+    auth = _tainted_admin_operator_write_auth()
+    command = "chainlink issue show 1337 --json"
+    binding = _operator_chainlink_binding(
+        command, request=request, auth=auth, root=root,
+    )
+    values: dict[str, object] = {
+        "binding": binding,
+        "request_identity": request,
+        "auth_context_identity": auth,
+        "tool_name": "shell_exec",
+        "tool_call_id": "call-arm2",
+        "command": command,
+        "requested_cwd": str(root),
+        "final_argv": binding.argv,
+    }
+    if field == "issuer":
+        values["binding"] = replace(binding, _issuer=object())
+    elif field == "profile":
+        values["binding"] = replace(binding, profile="maintenance")
+    elif field in {"request", "reuse"}:
+        values["request_identity"] = object()
+    elif field == "auth":
+        values["auth_context_identity"] = replace(auth)
+    elif field == "tool":
+        values["tool_name"] = "bash_async"
+    elif field == "call_id":
+        values["tool_call_id"] = "other-call"
+    elif field == "command":
+        values["command"] = "chainlink issue show 1338 --json"
+    elif field == "cwd":
+        values["requested_cwd"] = str(root.parent)
+    else:
+        values["final_argv"] = (*binding.argv, "--quiet")
+
+    assert access_control._operator_shell_binding_matches(**values) is False
+
+
+def test_operator_binding_genuine_match_and_sink_is_shell_only(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    maintenance_pinned_executables: dict[str, Path],
+) -> None:
+    _home, root, _outside = _operator_confinement_tree(tmp_path, monkeypatch)
+    request = object()
+    auth = _tainted_admin_operator_write_auth()
+    command = "chainlink issue show 1337 --json"
+    binding = _operator_chainlink_binding(
+        command, request=request, auth=auth, root=root,
+    )
+    common = {
+        "operator_shell_binding": binding,
+        "operator_shell_request_identity": request,
+        "tool_call_id": "call-arm2",
+    }
+
+    assert access_control._operator_shell_binding_matches(
+        binding,
+        request_identity=request,
+        auth_context_identity=auth,
+        tool_name="shell_exec",
+        tool_call_id="call-arm2",
+        command=command,
+        requested_cwd=str(root),
+        final_argv=binding.argv,
+    ) is True
+    shell = SinkGate.check_sink_flow(
+        "shell_exec", command, auth.ifc_labels, auth, enforce=True,
+        requested_cwd=str(root), **common,
+    )
+    file = SinkGate.check_sink_flow(
+        "write_file", str(root / "out.txt"), auth.ifc_labels, auth, enforce=True,
+        requested_cwd=str(root), **common,
+    )
+
+    assert shell.allowed is True
+    assert shell.reason == "ifc_allowed"
+    assert file.allowed is False
+    assert file.reason == "ifc_label_blocked:file"
+
+
+@pytest.mark.parametrize(
+    ("command", "allowed", "reason"),
+    [
+        ("chainlink issue show 1337 --json", True, None),
+        (
+            "chainlink issue close 1337",
+            False,
+            "chainlink_mutation_blocked_by_untrusted_ingest",
+        ),
+    ],
+)
+def test_tainted_operator_bound_chainlink_query_and_mutation(
+    command: str,
+    allowed: bool,
+    reason: str | None,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    maintenance_pinned_executables: dict[str, Path],
+) -> None:
+    _home, root, _outside = _operator_confinement_tree(tmp_path, monkeypatch)
+    request = object()
+    auth = _tainted_admin_operator_write_auth()
+    binding = _operator_chainlink_binding(
+        command, request=request, auth=auth, root=root,
+    )
+
+    decision = ToolRegistry().authorize_tool(
+        "shell_exec",
+        auth,
+        enforce=True,
+        target_channel=command,
+        ifc_labels=auth.ifc_labels,
+        arguments={"cwd": str(root)},
+        operator_shell_binding=binding,
+        operator_shell_request_identity=request,
+        tool_call_id="call-arm2",
+    )
+
+    assert decision.allowed is allowed
+    assert decision.reason == reason
+    if not allowed:
+        assert decision.refusal_detail == access_control._CHAINLINK_TAINT_REFUSAL
+
+
+def test_operator_bash_async_authority_is_unchanged() -> None:
+    auth = _tainted_admin_operator_write_auth()
+
+    decision = ToolRegistry().authorize_tool(
+        "bash_async", auth, enforce=True, target_channel="pwd",
+        ifc_labels=auth.ifc_labels,
+    )
+
+    assert decision.allowed is False
+    assert decision.reason == "ifc_label_blocked:shell_process"
+
+
+@pytest.mark.asyncio
+async def test_arm2_shadow_event_uses_fixed_value_free_shell_summary() -> None:
+    registry = ToolRegistry()
+    registry.enable_shadow_logging()
+    captured: list[tuple[str, dict[str, object]]] = []
+    secret = "ghp_" + "z" * 36
+
+    async def capture(kind: str, **fields: object) -> None:
+        captured.append((kind, fields))
+
+    authorization = access_control.ToolAuthorization(
+        tool_name="shell_exec",
+        decision=OperationDecision.ADMIN_REQUIRED,
+        allowed=True,
+        reason="ifc_label_blocked:shell_process",
+        is_shadow_decision=True,
+        would_block=True,
+    )
+    audit = {
+        "shell_profile": access_control.OPERATOR_SHELL_PROFILE,
+        "preparation_outcome": "soft_unbound",
+        "command_family": "reader",
+        "binding_rule": ServiceShellBindingRule.OPERATOR_LIVE_TAINT.value,
+    }
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        monkeypatch.setattr("mimir.event_logger.log_event", capture)
+        registry._emit_shadow_decision(
+            authorization,
+            target=f"grep {secret} /private/operand",
+            requested_target=f"cwd=/private/cwd command={secret}",
+            operator_shell_audit=audit,
+        )
+        await asyncio.sleep(0)
+
+    assert len(captured) == 1
+    fields = captured[0][1]
+    assert fields["target"] == "shell_process"
+    assert fields["requested_target"] is None
+    assert all(fields[key] == value for key, value in audit.items())
+    rendered = json.dumps(fields)
+    for value in (secret, "/private/operand", "/private/cwd", "grep"):
+        assert value not in rendered
 
 
 def test_no_project_test_configuration_preserves_existing_refusal(
@@ -8892,11 +10571,11 @@ def test_repo_review_shell_profile_denies_destructive_or_unbounded_commands(
         ("gh issue list --state open --label security", "gh"),
         ("gh issue view 922 --comments", "gh"),
         ("ls -la", "ls"),
-        ("grep -n needle sample.txt", "grep"),
-        ("wc -l sample.txt", "wc"),
+        ("grep -n needle state/sample.txt", "grep"),
+        ("wc -l state/sample.txt", "wc"),
         ("pwd -P", "pwd"),
-        ("jq -r .name sample.json", "jq"),
-        ("rg --no-config -n needle .", "rg"),
+        ("jq -r .name state/sample.json", "jq"),
+        ("rg --no-config -n needle state", "rg"),
         (
             "/usr/local/bin/chainlink issue list --status all "
             "--label worklink:ready --json",
@@ -8921,6 +10600,9 @@ def test_maintenance_shell_profile_admits_prompt_inspection_commands(
 
     home = tmp_path / "home"
     home.mkdir()
+    (home / "state").mkdir()
+    (home / "state" / "sample.txt").write_text("needle\n", encoding="utf-8")
+    (home / "state" / "sample.json").write_text('{"name": "sample"}\n', encoding="utf-8")
     subprocess.run(["git", "init", "-q", str(home)], check=True)
     monkeypatch.setenv("MIMIR_HOME", str(home))
     assert maintenance_pinned_executables[command_key].exists()
@@ -8941,6 +10623,415 @@ def test_maintenance_shell_profile_admits_prompt_inspection_commands(
         "bash_async", "shell_profile", "maintenance",
     )
     assert decision.allowed is True, decision.reason
+
+
+@pytest.mark.parametrize(
+    ("repository_option", "repository", "admitted"),
+    [
+        ("--repo {}", "acme/widget", True),
+        ("-R {}", "acme/widget", True),
+        ("--repo={}", "acme/widget", True),
+        ("-R{}", "acme/widget", True),
+        ("--repo {}", "other/repo", False),
+        ("-R {}", "other/repo", False),
+        ("--repo={}", "other/repo", False),
+        ("-R{}", "other/repo", False),
+    ],
+)
+def test_maintenance_github_repository_operands_are_configured(
+    repository_option: str,
+    repository: str,
+    admitted: bool,
+    monkeypatch: pytest.MonkeyPatch,
+    maintenance_pinned_executables: dict[str, Path],
+) -> None:
+    """The shared gh operand guard also closes the other built-in read profile."""
+    monkeypatch.setenv("GITHUB_REPOS", "acme/widget")
+    command = f"gh pr view 7 {repository_option.format(repository)} --json number"
+
+    argv = parse_service_shell_argv(command, "maintenance")
+
+    assert (argv is not None) is admitted
+
+
+@pytest.mark.parametrize(
+    ("profile", "canonical", "trigger", "authority_profile"),
+    [
+        ("scheduler_read_only", "scheduler:test", "scheduled_tick", "custom"),
+        ("maintenance", "heartbeat", "scheduled_tick", "heartbeat"),
+        ("repo_review", "poller:github-activity", "poller", "github"),
+    ],
+)
+def test_service_shell_profiles_refuse_credential_file_operands(
+    profile: str,
+    canonical: str,
+    trigger: str,
+    authority_profile: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / "home"
+    root = tmp_path / "checkout"
+    home.mkdir()
+    root.mkdir()
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    credential = root / ".env"
+    credential.write_text("GITHUB_TOKEN=ghp_" + "a" * 36 + "\n", encoding="utf-8")
+    service = replace(
+        build_trigger_service_principal(
+            canonical=canonical,
+            trigger=trigger,
+            profile=authority_profile,
+            tier=CapabilityTier.CODE_EXECUTION,
+            capabilities=("shell_exec", "bash_jobs_list", "bash_job_output"),
+            creation_path="test",
+        ),
+        filesystem_read_roots=(str(root.resolve()),),
+    )
+    review_state = (
+        _review_state("o/r", 1352, "worklink/1352", str(root.resolve()))
+        if profile == "repo_review"
+        else None
+    )
+    auth = _service_auth(
+        service, InformationFlowLabels(), repo_review_state=review_state,
+    )
+
+    from mimir.tools import budget_gate
+
+    decision = ToolRegistry().authorize_tool(
+        "shell_exec",
+        auth,
+        enforce=True,
+        target_channel=f"grep -n TOKEN -- {credential}",
+    )
+    bound = budget_gate._request_for_authorized_execution(
+        _tool_request(
+            auth,
+            args={"command": f"grep -n TOKEN -- {credential}"},
+        ),
+        "shell_exec",
+        auth,
+    )
+
+    assert service.sink_policy_for("shell_exec") == ServiceSinkPolicy(
+        "shell_exec", "shell_profile", profile,
+    )
+    # Shape authorization is cheap; the execution binder performs the one
+    # authoritative path/content check after resolving cwd.
+    assert decision.allowed is True
+    assert "outside the read roots or withheld" in bound.tool_call["args"][
+        "mimir_shell_refusal"
+    ]
+
+
+def test_service_shell_refuses_whole_argv_when_any_read_operand_is_unsafe(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / "home"
+    root = tmp_path / "read-root"
+    home.mkdir()
+    root.mkdir()
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    safe = root / "notes.txt"
+    secret = root / "ordinary-name.txt"
+    safe.write_text("ordinary text\n", encoding="utf-8")
+    secret.write_text("AKIA" + "A" * 16 + "\n", encoding="utf-8")
+    service = replace(
+        build_trigger_service_principal(
+            canonical="scheduler:test",
+            trigger="scheduled_tick",
+            profile="custom",
+            tier=CapabilityTier.CODE_EXECUTION,
+            capabilities=("shell_exec", "bash_jobs_list", "bash_job_output"),
+            creation_path="test",
+        ),
+        filesystem_read_roots=(str(root.resolve()),),
+    )
+
+    from mimir.tools import budget_gate
+
+    auth = _service_auth(service, InformationFlowLabels())
+    decision = ToolRegistry().authorize_tool(
+        "shell_exec",
+        auth,
+        enforce=True,
+        target_channel=f"wc -l -- {safe} {secret}",
+    )
+    bound = budget_gate._request_for_authorized_execution(
+        _tool_request(auth, args={"command": f"wc -l -- {safe} {secret}"}),
+        "shell_exec",
+        auth,
+    )
+
+    assert decision.allowed is True
+    assert "mimir_shell_refusal" in bound.tool_call["args"]
+
+
+def test_service_shell_refuses_read_operand_outside_principal_roots(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / "home"
+    root = tmp_path / "read-root"
+    home.mkdir()
+    root.mkdir()
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    outside = tmp_path / "outside.txt"
+    outside.write_text("ordinary text\n", encoding="utf-8")
+    service = replace(
+        build_trigger_service_principal(
+            canonical="scheduler:test",
+            trigger="scheduled_tick",
+            profile="custom",
+            tier=CapabilityTier.CODE_EXECUTION,
+            capabilities=("shell_exec", "bash_jobs_list", "bash_job_output"),
+            creation_path="test",
+        ),
+        filesystem_read_roots=(str(root.resolve()),),
+    )
+
+    from mimir.tools import budget_gate
+
+    auth = _service_auth(service, InformationFlowLabels())
+    decision = ToolRegistry().authorize_tool(
+        "shell_exec",
+        auth,
+        enforce=True,
+        target_channel=f"wc -l -- {outside}",
+    )
+    bound = budget_gate._request_for_authorized_execution(
+        _tool_request(auth, args={"command": f"wc -l -- {outside}"}),
+        "shell_exec",
+        auth,
+    )
+
+    assert decision.allowed is True
+    assert "mimir_shell_refusal" in bound.tool_call["args"]
+
+
+@pytest.mark.parametrize(
+    ("command", "expected"),
+    [
+        ("head -n 5 -- notes.txt", ("notes.txt",)),
+        ("head -n5 notes.txt", ("notes.txt",)),
+        ("stat -c %n -- notes.txt", ("notes.txt",)),
+        ("grep --include=*.py -- -needle src", ("src",)),
+        ("rg --no-config -g *.py needle -- src", ("src",)),
+        ("rg --no-config --glob=*.py needle src", ("src",)),
+    ],
+)
+def test_service_shell_read_operand_parser_distinguishes_option_values(
+    command: str, expected: tuple[str, ...],
+) -> None:
+    assert access_control._shell_read_path_operands(shlex.split(command)) == expected
+
+
+def test_service_shell_operandless_ls_keeps_explicit_operand_compatibility(
+    maintenance_pinned_executables: dict[str, Path],
+) -> None:
+    slots = access_control._shell_read_operand_slots(["ls", "-la"])
+
+    assert slots is not None
+    assert slots.explicit_paths == ()
+    assert slots.effective_paths == (".",)
+    assert access_control._shell_read_path_operands(["ls", "-la"]) == ()
+    assert parse_service_shell_argv("ls -la", "scheduler_read_only") == [
+        str(maintenance_pinned_executables["ls"]), "-la",
+    ]
+
+
+@pytest.mark.parametrize(
+    ("authority_profile", "command"),
+    [
+        ("custom", "grep -n needle -- {path}"),
+        ("heartbeat", "head -n 1 -- {path}"),
+        ("github", "rg --no-config -g '*.txt' needle -- {path}"),
+    ],
+)
+def test_service_shell_profiles_keep_legitimate_scoped_reads(
+    authority_profile: str,
+    command: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / "home"
+    root = tmp_path / "checkout"
+    home.mkdir()
+    root.mkdir()
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    sample = root / "notes.txt"
+    sample.write_text("needle\n", encoding="utf-8")
+    canonical = "poller:github-activity" if authority_profile == "github" else "scheduler:test"
+    service = replace(
+        build_trigger_service_principal(
+            canonical=canonical,
+            trigger="poller" if authority_profile == "github" else "scheduled_tick",
+            profile=authority_profile,
+            tier=CapabilityTier.CODE_EXECUTION,
+            capabilities=("shell_exec", "bash_jobs_list", "bash_job_output"),
+            creation_path="test",
+        ),
+        filesystem_read_roots=(str(root.resolve()),),
+    )
+    review_state = (
+        _review_state("o/r", 1352, "worklink/1352", str(root.resolve()))
+        if authority_profile == "github"
+        else None
+    )
+
+    decision = ToolRegistry().authorize_tool(
+        "shell_exec",
+        _service_auth(
+            service, InformationFlowLabels(), repo_review_state=review_state,
+        ),
+        enforce=True,
+        target_channel=command.format(path=sample),
+    )
+
+    assert decision.allowed is True, decision.refusal_detail
+
+
+def test_service_shell_execution_binds_relative_read_operand_to_authoritative_cwd(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from mimir.tools import budget_gate
+
+    home = tmp_path / "home"
+    checkout = tmp_path / "checkout"
+    home.mkdir()
+    checkout.mkdir()
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    (checkout / "notes.txt").write_text("needle\n", encoding="utf-8")
+    service = replace(
+        build_trigger_service_principal(
+            canonical="scheduler:test",
+            trigger="scheduled_tick",
+            profile="custom",
+            tier=CapabilityTier.CODE_EXECUTION,
+            capabilities=("shell_exec", "bash_jobs_list", "bash_job_output"),
+            creation_path="test",
+        ),
+        filesystem_read_roots=(str(checkout.resolve()),),
+    )
+    auth = _service_auth(service, InformationFlowLabels())
+    # This regression is about the principal's declared checkout root, not the
+    # platform's ambient temporary-directory spelling (/tmp vs $TMPDIR).
+    monkeypatch.setattr(
+        "mimir.read_policy.configured_non_admin_read_roots", lambda: (),
+    )
+
+    bound = budget_gate._request_for_authorized_execution(
+        _tool_request(
+            auth,
+            args={
+                "command": "grep -n needle notes.txt",
+                "cwd": str(checkout),
+            },
+        ),
+        "shell_exec",
+        auth,
+    )
+
+    assert "mimir_shell_refusal" not in bound.tool_call["args"]
+    assert bound.tool_call["args"]["cwd"] == str(checkout.resolve())
+    assert bound.tool_call["args"]["mimir_direct_argv"][-1] == "notes.txt"
+
+
+def test_service_shell_recursive_preflight_runs_once_and_is_bounded(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from mimir.tools import budget_gate
+
+    home = tmp_path / "home"
+    root = tmp_path / "read-root"
+    home.mkdir()
+    root.mkdir()
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    for index in range(access_control._SHELL_RECURSIVE_READ_ENTRY_LIMIT + 1):
+        (root / f"file-{index}.txt").write_text("needle\n", encoding="utf-8")
+    service = replace(
+        build_trigger_service_principal(
+            canonical="scheduler:test",
+            trigger="scheduled_tick",
+            profile="custom",
+            tier=CapabilityTier.CODE_EXECUTION,
+            capabilities=("shell_exec", "bash_jobs_list", "bash_job_output"),
+            creation_path="test",
+        ),
+        filesystem_read_roots=(str(root.resolve()),),
+    )
+    auth = _service_auth(service, InformationFlowLabels())
+    # Keep cwd admission owned by this fixture so only the once-and-bounded
+    # recursive preflight behavior can make the test fail.
+    monkeypatch.setattr(
+        "mimir.read_policy.configured_non_admin_read_roots", lambda: (),
+    )
+    original = access_control._service_shell_read_operand_refusal
+    calls = 0
+
+    def counted(*args: object, **kwargs: object) -> str | None:
+        nonlocal calls
+        calls += 1
+        return original(*args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(access_control, "_service_shell_read_operand_refusal", counted)
+
+    bound = budget_gate._request_for_authorized_execution(
+        _tool_request(
+            auth,
+            args={"command": "grep -r needle .", "cwd": str(root)},
+        ),
+        "shell_exec",
+        auth,
+    )
+
+    refusal = bound.tool_call["args"]["mimir_shell_refusal"]
+    assert calls == 1
+    assert (
+        f"exceeded the {access_control._SHELL_RECURSIVE_READ_ENTRY_LIMIT}-entry limit"
+        in refusal
+    )
+    assert str(root) in refusal
+
+
+def test_service_shell_recursive_preflight_names_unreadable_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / "home"
+    root = tmp_path / "read-root"
+    home.mkdir()
+    root.mkdir()
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    service = replace(
+        build_trigger_service_principal(
+            canonical="scheduler:test",
+            trigger="scheduled_tick",
+            profile="custom",
+            tier=CapabilityTier.CODE_EXECUTION,
+            capabilities=("shell_exec", "bash_jobs_list", "bash_job_output"),
+            creation_path="test",
+        ),
+        filesystem_read_roots=(str(root.resolve()),),
+    )
+    original_scandir = os.scandir
+
+    def refused_scandir(path: str | os.PathLike[str]) -> os.ScandirIterator[str]:
+        if Path(path) == root:
+            raise PermissionError("synthetic unreadable directory")
+        return original_scandir(path)
+
+    monkeypatch.setattr(access_control.os, "scandir", refused_scandir)
+
+    _argv, reason, rule = access_control.parse_service_shell_argv_with_diagnostics(
+        "grep -r needle .",
+        "scheduler_read_only",
+        service=service,
+        auth_context=_service_auth(service, InformationFlowLabels()),
+        read_cwd=root,
+    )
+
+    assert rule == ServiceShellBindingRule.READ_OPERAND_POLICY
+    assert f"could not inspect directory {root}" in reason
 
 
 @pytest.mark.parametrize(
@@ -10114,7 +12205,7 @@ def test_review_skill_only_demonstrates_commands_the_poller_can_run() -> None:
 
     # Shapes the trusted-service shell profile can never admit, and the reason.
     forbidden = (
-        ("gh api", "`gh api` is not in the repo_review allow-list"),
+        ("gh api", "review instructions use bounded gh subcommands, not raw API paths"),
         ("--jq", "--jq is a credential read (jq env/$ENV) and is admitted nowhere"),
         ("<<", "a heredoc cannot survive single-argv exec with shell=False"),
         ("$(", "command substitution cannot survive single-argv exec"),
@@ -10479,7 +12570,12 @@ def test_hands_shell_missing_command_fails_before_prohibited_provider_check(
         "hands_shell", SimpleNamespace(tool_call={"args": {}}),
     )
 
-    assert denial == "hands_shell command is malformed"
+    # main generalised this refusal to every shell tool with a message naming why
+    # it cannot be screened. The property this test guards is unchanged: a
+    # hands_shell call with no command is refused BEFORE the prohibited-prefix
+    # screen runs, which `called is False` pins.
+    assert denial is not None
+    assert "cannot be screened" in denial
     assert called is False
 
 

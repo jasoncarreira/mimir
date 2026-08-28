@@ -145,6 +145,66 @@ async def test_client_reports_executor_peer_uid_refusal(tmp_path: Path, monkeypa
 
 
 @pytest.mark.asyncio
+async def test_path_client_requests_worker_uid_and_projects_provider_documents(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    checkout = tmp_path / ".worklink" / "repo" / "41-2"
+    checkout.mkdir(parents=True)
+    requests: list[dict[str, object]] = []
+    fd_counts: list[int] = []
+
+    class Peer:
+        def connect(self, _path: str) -> None:
+            pass
+
+        def getsockopt(self, *args: object) -> bytes:
+            return struct.pack("3i", 123, 0, 0)
+
+        def sendmsg(self, buffers: list[bytes], ancillary: list[tuple[int, int, bytes]]) -> None:
+            requests.append(json.loads(buffers[0]))
+            rights = ancillary[0][2]
+            fd_counts.append(len(rights))
+
+        def recv(self, _size: int) -> bytes:
+            return json.dumps({
+                "id": requests[0]["id"],
+                "status": "started",
+                "pid": 123,
+            }).encode()
+
+        def close(self) -> None:
+            pass
+
+    monkeypatch.setattr(socket, "SO_PEERCRED", getattr(socket, "SO_PEERCRED", 17), raising=False)
+    monkeypatch.setattr(socket, "socket", lambda *args: Peer())
+    client = WorkerClient.for_path_checkout(
+        checkout, issue_id=41, attempt=2, run_uid=1002
+    )
+    process = await client.launch(
+        local_checkout=checkout,
+        argv=["opencode", "run", "--dir", "."],
+        env={"OPENCODE_PERMISSION": "{}"},
+        projections=[
+            WorkerProjection(".config/opencode/opencode.json", b'{"model":"provider/model"}'),
+            WorkerProjection(".local/share/opencode/auth.json", b'{"provider":{"token":"x"}}'),
+        ],
+        identifier=str(uuid.uuid4()),
+        timeout_s=30,
+    )
+    process._socket.close()
+
+    request = requests[0]
+    assert request["op"] == "launch_path"
+    assert request["path"] == str(checkout)
+    assert request["run_uid"] == 1002
+    assert fd_counts == [2]
+    assert [item["path"] for item in request["projections"]] == [
+        ".config/opencode/opencode.json",
+        ".local/share/opencode/auth.json",
+    ]
+
+
+@pytest.mark.asyncio
 async def test_identity_probe_accepts_matching_image_executor(monkeypatch) -> None:
     sent: list[dict[str, object]] = []
 
@@ -162,6 +222,7 @@ async def test_identity_probe_accepts_matching_image_executor(monkeypatch) -> No
             return json.dumps({
                 "status": "identity",
                 "executor_identity": EXECUTOR_PROTOCOL_IDENTITY,
+                "source_commit": "a" * 40,
             }).encode()
 
         def close(self) -> None:
@@ -170,13 +231,56 @@ async def test_identity_probe_accepts_matching_image_executor(monkeypatch) -> No
     monkeypatch.setattr(socket, "SO_PEERCRED", getattr(socket, "SO_PEERCRED", 17), raising=False)
     monkeypatch.setattr(socket, "socket", lambda *args: Peer())
 
-    await verify_executor_identity(Path("/executor.sock"))
+    assert await verify_executor_identity(Path("/executor.sock")) == "a" * 40
 
     assert sent == [{
         "version": 1,
         "op": "identity",
         "executor_identity": EXECUTOR_PROTOCOL_IDENTITY,
     }]
+
+
+@pytest.mark.asyncio
+async def test_identity_probe_refuses_missing_or_malformed_source_commit(monkeypatch) -> None:
+    class Peer:
+        def connect(self, _path: str) -> None:
+            pass
+
+        def getsockopt(self, *args: object) -> bytes:
+            return struct.pack("3i", 123, 0, 0)
+
+        def send(self, _payload: bytes) -> None:
+            pass
+
+        def recv(self, _size: int) -> bytes:
+            return json.dumps({
+                "status": "identity",
+                "executor_identity": EXECUTOR_PROTOCOL_IDENTITY,
+                "source_commit": "dirty-or-unpinned",
+            }).encode()
+
+        def close(self) -> None:
+            pass
+
+    monkeypatch.setattr(socket, "SO_PEERCRED", getattr(socket, "SO_PEERCRED", 17), raising=False)
+    monkeypatch.setattr(socket, "socket", lambda *args: Peer())
+
+    with pytest.raises(StaleWorkerExecutorError, match="stale root executor image"):
+        await verify_executor_identity(Path("/executor.sock"))
+
+
+def test_executor_identity_reports_image_recorded_source_commit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source_commit = tmp_path / "executor-source-commit"
+    source_commit.write_text("b" * 40 + "\n", encoding="ascii")
+    monkeypatch.setattr(worker_exec, "EXECUTOR_SOURCE_COMMIT_PATH", source_commit)
+
+    assert worker_exec._executor_source_commit() == "b" * 40
+
+    source_commit.write_text("dirty\n", encoding="ascii")
+    with pytest.raises(RuntimeError, match="invalid recorded source commit"):
+        worker_exec._executor_source_commit()
 
 
 @pytest.mark.asyncio
@@ -221,8 +325,57 @@ async def test_client_names_stale_old_launch_contract_with_timeout(
         "version", "op", "id", "issue", "attempt", "device", "inode",
         "argv", "env", "projections",
     }
-    assert set(requests[0]) == old_launch_fields | {"timeout_s", "executor_identity"}
+    assert set(requests[0]) == old_launch_fields | {
+        "timeout_s",
+        "stdout_limit",
+        "stderr_limit",
+        "executor_identity",
+    }
     assert requests[0]["timeout_s"] == 30
+    assert requests[0]["stdout_limit"] == 1
+    assert requests[0]["stderr_limit"] == 1
+
+
+@pytest.mark.asyncio
+async def test_path_client_names_unsupported_operation_as_stale_executor(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    checkout = tmp_path / ".worklink" / "repo" / "41-2"
+    checkout.mkdir(parents=True)
+
+    class Peer:
+        def connect(self, _path: str) -> None:
+            pass
+
+        def getsockopt(self, *args: object) -> bytes:
+            return struct.pack("3i", 123, 0, 0)
+
+        def sendmsg(self, _buffers: list[bytes], _ancillary: object) -> None:
+            pass
+
+        def recv(self, _size: int) -> bytes:
+            return json.dumps({
+                "id": None,
+                "error": "unsupported worker operation",
+            }).encode()
+
+        def close(self) -> None:
+            pass
+
+    monkeypatch.setattr(socket, "SO_PEERCRED", getattr(socket, "SO_PEERCRED", 17), raising=False)
+    monkeypatch.setattr(socket, "socket", lambda *args: Peer())
+    client = WorkerClient.for_path_checkout(
+        checkout, issue_id=41, attempt=2, run_uid=1002
+    )
+
+    with pytest.raises(StaleWorkerExecutorError, match="rebuild the image and restart"):
+        await client.launch(
+            local_checkout=checkout,
+            argv=["true"],
+            env={},
+            identifier=str(uuid.uuid4()),
+            timeout_s=30,
+        )
 
 
 @pytest.mark.asyncio
@@ -236,7 +389,7 @@ async def test_worker_process_requires_identity_bound_terminal_result(monkeypatc
         def close(self) -> None:
             pass
 
-    process = WorkerProcess(identifier, 12, asyncio.StreamReader(), asyncio.StreamReader(), Peer())
+    process = WorkerProcess(identifier, 12, Peer())
     with pytest.raises(RuntimeError, match="invalid terminal"):
         await process.wait()
 
@@ -285,6 +438,38 @@ def test_validate_checkout_refuses_arbitrary_and_replaced_fds(tmp_path: Path, mo
     try:
         with pytest.raises(RuntimeError, match="isolation boundary"):
             worker_exec._validate_checkout(fd, request(fd))
+    finally:
+        os.close(fd)
+
+
+def test_path_checkout_accepts_group_checkout_without_0700_boundary(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / ".worklink"
+    checkout = root / "repo" / "41-2"
+    checkout.mkdir(parents=True)
+    checkout.chmod(0o2770)
+    checkout.parent.chmod(0o755)
+    monkeypatch.setattr(worker_exec, "WORKLINK_CHECKOUT_ROOT", root)
+    monkeypatch.setattr(
+        worker_exec,
+        "get_identities",
+        lambda: SimpleNamespace(
+            mimir_uid=os.getuid(), worklink_uid=1002, worklink_gid=os.getgid()
+        ),
+    )
+
+    fd = worker_exec._open_path_checkout({
+        "path": str(checkout),
+        "issue": 41,
+        "attempt": 2,
+        "run_uid": 1002,
+    })
+    try:
+        observed = os.fstat(fd)
+        expected = os.stat(checkout)
+        assert (observed.st_dev, observed.st_ino) == (expected.st_dev, expected.st_ino)
+        assert stat.S_IMODE(checkout.parent.stat().st_mode) == 0o755
     finally:
         os.close(fd)
 
@@ -370,17 +555,24 @@ def test_uv_execution_copy_normalizes_for_runner_without_relaxing_source(
     executable.chmod(0o700)
     external.chmod(0o600)
 
-    runner_uid = os.getuid() + 1
+    # The execution copy is owned by the RUNNER, so the runner is this process --
+    # an unprivileged test cannot chown to any other uid. The CONTROLLER is the
+    # foreign identity here, which is the inverse of the pre-ownership-change model.
+    runner_uid = os.getuid()
     runner_gid = os.getgid()
+    controller_uid = os.getuid() + 1
+    # An identity that shares only the group, used to prove normalization still
+    # widens group access rather than relying on ownership alone.
+    group_only_uid = os.getuid() + 1
     source_before = {
         path.relative_to(source): stat.S_IMODE(path.stat(follow_symlinks=False).st_mode)
         for path in (source, *source.rglob("*"))
     }
-    # This is the measured pre-fix copy: copytree preserves the 0700 boundary mode,
-    # so an identity represented only by its group cannot traverse it.
+    # This is the measured pre-normalization copy: copytree preserves the 0700
+    # boundary mode, so an identity represented only by its group cannot traverse it.
     unnormalized = tmp_path / "unnormalized"
     shutil.copytree(source, unnormalized, symlinks=True)
-    assert not _identity_can_access(unnormalized, runner_uid, runner_gid, 0o5)
+    assert not _identity_can_access(unnormalized, group_only_uid, runner_gid, 0o5)
 
     home = tmp_path / "home"
     home.mkdir()
@@ -388,7 +580,7 @@ def test_uv_execution_copy_normalizes_for_runner_without_relaxing_source(
         worker_exec,
         "get_identities",
         lambda: SimpleNamespace(
-            mimir_uid=os.getuid(), worklink_uid=runner_uid, worklink_gid=runner_gid
+            mimir_uid=controller_uid, worklink_uid=runner_uid, worklink_gid=runner_gid
         ),
     )
     source_fd = os.open(source, os.O_RDONLY | os.O_DIRECTORY)
@@ -402,9 +594,15 @@ def test_uv_execution_copy_normalizes_for_runner_without_relaxing_source(
     copied_readable = project / "nested" / "readable.txt"
     copied_executable = project / "run"
     copied_link = project / "link"
+    # The runner OWNS the copy: that is what lets a repository's own provisioning
+    # chmod a tracked file, which group-write alone can never confer.
+    assert project.stat().st_uid == runner_uid
     assert _identity_can_access(project, runner_uid, runner_gid, 0o5)
     assert _identity_can_access(project / "nested", runner_uid, runner_gid, 0o5)
     assert _identity_can_access(copied_readable, runner_uid, runner_gid, 0o4)
+    # Normalization still widens group access, not just owner access.
+    assert _identity_can_access(project, group_only_uid, runner_gid, 0o5)
+    assert _identity_can_access(copied_readable, group_only_uid, runner_gid, 0o4)
     assert copied_readable.read_text(encoding="utf-8") == "runner input"
     assert stat.S_IMODE(copied_readable.stat().st_mode) == 0o660
     assert stat.S_IMODE(copied_executable.stat().st_mode) == 0o770
@@ -421,7 +619,7 @@ def test_uv_execution_copy_normalizes_for_runner_without_relaxing_source(
         for path in (source, *source.rglob("*"))
     } == source_before
     assert stat.S_IMODE(source.stat().st_mode) == 0o700
-    assert not _identity_can_access(source, runner_uid, runner_gid, 0o5)
+    assert not _identity_can_access(source, group_only_uid, runner_gid, 0o5)
 
     worker_exec._cleanup_home(home)
     assert not home.exists()
@@ -480,6 +678,55 @@ def test_repo_test_local_runner_selects_fd_sourced_execution_copy(
     assert result == 29
     assert copied == [("/proc/self/fd/17", tmp_path / "home" / "project", True)]
     assert normalized == [29]
+
+
+@pytest.mark.parametrize(
+    ("command", "surface"),
+    [
+        (["npm", "run", "test:ci"], "repo_test"),
+        (["uv", "run", "pytest", "-q"], "worklink"),
+    ],
+)
+def test_execution_copy_is_owned_by_the_runner_not_the_controller(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    synthetic_worklink_identities,
+    command: list[str],
+    surface: str,
+) -> None:
+    """The ephemeral execution tree must be chowned to the uid that runs in it.
+
+    ``chmod`` is owner-only, so a controller-owned copy cannot complete any
+    provisioning step that sets a mode on a file the runner did not create --
+    ``npm ci`` marking a workspace ``bin`` executable is the case that surfaced
+    this. Nothing reads this copy back, so runner ownership costs no reach.
+    """
+    identities = synthetic_worklink_identities
+    assert identities.worklink_uid != identities.mimir_uid
+    owners: list[tuple[int, int]] = []
+    monkeypatch.setattr(
+        worker_exec.shutil,
+        "copytree",
+        lambda source, destination, *, symlinks: None,
+    )
+    monkeypatch.setattr(worker_exec.os, "open", lambda *_args, **_kwargs: 29)
+    monkeypatch.setattr(
+        worker_exec,
+        "_normalize_checkout_fd",
+        lambda _fd, *, owner_uid, group_gid: owners.append((owner_uid, group_gid)),
+    )
+
+    checkout_root = (
+        worker_exec.REPO_TEST_CHECKOUT_ROOT
+        if surface == "repo_test"
+        else worker_exec.WORKLINK_CHECKOUT_ROOT
+    )
+    result = worker_exec._execution_checkout_fd(
+        command, 17, tmp_path / "home", checkout_root=checkout_root
+    )
+
+    assert result == 29
+    assert owners == [(identities.worklink_uid, identities.worklink_gid)]
 
 
 @pytest.mark.skipif(not Path("/proc").is_dir(), reason="requires procfs")
@@ -555,10 +802,38 @@ def test_executor_rejects_mismatched_launch_protocol_identity() -> None:
         "env": {},
         "projections": [],
         "timeout_s": 30,
+        "stdout_limit": 100,
+        "stderr_limit": 100,
     }
 
     with pytest.raises(RuntimeError, match=worker_exec._STALE_EXECUTOR_DIAGNOSTIC):
         worker_exec._handle_launch(object(), request, [-1, -1, -1])
+
+
+def test_executor_dispatches_path_launch_through_the_connection_handler(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    identifier = str(uuid.uuid4())
+    request = {"version": 1, "op": "launch_path", "id": identifier}
+    dispatched: list[tuple[dict[str, object], list[int]]] = []
+
+    class Connection:
+        def recvmsg(self, *args: object) -> tuple[bytes, list[object], int, None]:
+            return json.dumps(request).encode(), [], 0, None
+
+        def send(self, _data: bytes) -> None:
+            raise AssertionError("dispatch must not return an error")
+
+        def close(self) -> None:
+            pass
+
+    def handle(_connection: object, observed: dict[str, object], fds: list[int]) -> None:
+        dispatched.append((observed, fds))
+
+    monkeypatch.setattr(worker_exec, "_handle_launch", handle)
+    worker_exec.handle_connection(Connection())
+
+    assert dispatched == [(request, [])]
 
 
 def test_executor_rejects_fd_count_and_extra_request_fields() -> None:
@@ -726,6 +1001,8 @@ def test_duplicate_worker_id_is_refused_before_popen_without_touching_live_job(
         "env": {},
         "projections": [],
         "timeout_s": 1,
+        "stdout_limit": 100,
+        "stderr_limit": 100,
     }
     monkeypatch.setattr(worker_exec, "_validate_checkout", lambda *args: None)
     monkeypatch.setattr(
@@ -749,8 +1026,10 @@ def test_terminal_waits_for_in_group_writers_before_cleanup(tmp_path: Path, monk
     checkout = tmp_path / "checkout"
     checkout.mkdir()
     checkout_fd = os.open(checkout, os.O_RDONLY | os.O_DIRECTORY)
-    stdout_read, stdout_write = os.pipe()
-    stderr_read, stderr_write = os.pipe()
+    stdout_path = tmp_path / "stdout.log"
+    stderr_path = tmp_path / "stderr.log"
+    stdout_write = os.open(stdout_path, os.O_RDWR | os.O_CREAT | os.O_EXCL, 0o600)
+    stderr_write = os.open(stderr_path, os.O_RDWR | os.O_CREAT | os.O_EXCL, 0o600)
     identifier = str(uuid.uuid4())
     responses: list[dict[str, object]] = []
     events: list[str] = []
@@ -776,13 +1055,7 @@ def test_terminal_waits_for_in_group_writers_before_cleanup(tmp_path: Path, monk
     def observed_cleanup(home: Path) -> None:
         pid = int(responses[0]["pid"])
         assert not worker_exec._process_group_has_live_members(pid)
-        output = bytearray()
-        while True:
-            chunk = os.read(stdout_read, 4096)
-            if not chunk:
-                break
-            output.extend(chunk)
-        assert bytes(output) == b"ready"
+        assert stdout_path.read_bytes() == b"ready"
         events.append("cleanup")
         cleanup_home(home)
 
@@ -804,6 +1077,8 @@ def test_terminal_waits_for_in_group_writers_before_cleanup(tmp_path: Path, monk
         "env": {"PATH": "/usr/bin:/bin"},
         "projections": [],
         "timeout_s": 5,
+        "stdout_limit": 100,
+        "stderr_limit": 100,
     }
     fds = [checkout_fd, stdout_write, stderr_write]
     try:
@@ -811,9 +1086,9 @@ def test_terminal_waits_for_in_group_writers_before_cleanup(tmp_path: Path, monk
         assert events == ["started", "cleanup", "terminal"]
         assert responses[-1]["exit_code"] == 0
         assert not (tmp_path / "homes" / identifier).exists()
-        assert os.read(stderr_read, 4096) == b""
+        assert stderr_path.read_bytes() == b""
     finally:
-        for fd in (*fds, stdout_read, stderr_read):
+        for fd in fds:
             if fd >= 0:
                 try:
                     os.close(fd)
@@ -825,8 +1100,8 @@ def test_executor_enforces_worker_deadline(tmp_path: Path, monkeypatch) -> None:
     checkout = tmp_path / "checkout"
     checkout.mkdir()
     checkout_fd = os.open(checkout, os.O_RDONLY | os.O_DIRECTORY)
-    stdout_read, stdout_write = os.pipe()
-    stderr_read, stderr_write = os.pipe()
+    stdout_write = os.open(tmp_path / "stdout.log", os.O_RDWR | os.O_CREAT | os.O_EXCL, 0o600)
+    stderr_write = os.open(tmp_path / "stderr.log", os.O_RDWR | os.O_CREAT | os.O_EXCL, 0o600)
     identifier = str(uuid.uuid4())
     responses: list[dict[str, object]] = []
     waits: list[float | None] = []
@@ -869,6 +1144,8 @@ def test_executor_enforces_worker_deadline(tmp_path: Path, monkeypatch) -> None:
         process.wait()
 
     monkeypatch.setattr(worker_exec, "_terminate_process_group", terminate)
+    times = iter((0.0, 100.0))
+    monkeypatch.setattr(worker_exec.time, "monotonic", lambda: next(times))
     request = {
         "version": 1,
         "op": "launch",
@@ -882,24 +1159,127 @@ def test_executor_enforces_worker_deadline(tmp_path: Path, monkeypatch) -> None:
         "env": {},
         "projections": [],
         "timeout_s": 0.25,
+        "stdout_limit": 100,
+        "stderr_limit": 100,
     }
     fds = [checkout_fd, stdout_write, stderr_write]
     try:
         worker_exec._handle_launch(Connection(), request, fds)
-        assert waits[0] == 0.25 + worker_exec._CONTROLLER_CANCELLATION_GRACE_S
+        assert waits == [None]
         assert responses[-1] == {
             "id": identifier,
             "status": "terminal",
             "exit_code": -signal.SIGKILL,
             "timed_out": True,
+            "output_overflow": False,
         }
     finally:
-        for fd in (*fds, stdout_read, stderr_read):
+        for fd in fds:
             if fd >= 0:
                 try:
                     os.close(fd)
                 except OSError:
                     pass
+
+
+def test_executor_truncates_and_terminates_on_output_overflow(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    stdout_path = tmp_path / "stdout.log"
+    stderr_path = tmp_path / "stderr.log"
+    stdout_fd = os.open(stdout_path, os.O_RDWR | os.O_CREAT | os.O_EXCL, 0o600)
+    stderr_fd = os.open(stderr_path, os.O_RDWR | os.O_CREAT | os.O_EXCL, 0o600)
+    os.write(stdout_fd, b"overflow")
+
+    class Process:
+        pid = 4321
+        returncode: int | None = None
+
+        def poll(self) -> int | None:
+            return self.returncode
+
+    process = Process()
+
+    def terminate(observed: Process, timeout_s: float = 5.0) -> None:
+        assert observed is process
+        process.returncode = -signal.SIGKILL
+
+    monkeypatch.setattr(worker_exec, "_terminate_process_group", terminate)
+    try:
+        assert worker_exec._wait_with_output_limits(
+            process, 30, stdout_fd, 4, stderr_fd, 4
+        ) == (-signal.SIGKILL, False, True)
+        assert stdout_path.read_bytes() == b"over"
+    finally:
+        os.close(stdout_fd)
+        os.close(stderr_fd)
+
+
+
+def test_arm_parent_death_signal_closes_pre_prctl_race(monkeypatch) -> None:
+    calls: list[tuple[int, int, int, int, int]] = []
+
+    class Libc:
+        def prctl(self, *args: int) -> int:
+            calls.append(args)
+            return 0
+
+    monkeypatch.setattr(worker_exec.ctypes, "CDLL", lambda *args, **kwargs: Libc())
+    monkeypatch.setattr(worker_exec.os, "getppid", lambda: 99)
+    exits: list[int] = []
+    monkeypatch.setattr(worker_exec.os, "_exit", lambda code: exits.append(code))
+
+    worker_exec._arm_parent_death_signal(100)
+
+    if sys.platform.startswith("linux"):
+        assert calls == [(1, signal.SIGKILL, 0, 0, 0)]
+        assert exits == [128 + signal.SIGKILL]
+    else:
+        # No portable PDEATHSIG equivalent exists. Launch remains available, with
+        # controller cancellation/reaping but no sudden-parent-death guarantee.
+        assert calls == []
+        assert exits == []
+
+
+def test_arm_parent_death_signal_is_noop_off_linux(monkeypatch) -> None:
+    monkeypatch.setattr(worker_exec, "sys", SimpleNamespace(platform="darwin"))
+    monkeypatch.setattr(
+        worker_exec.ctypes,
+        "CDLL",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("non-Linux fallback must not load libc prctl")
+        ),
+    )
+
+    worker_exec._arm_parent_death_signal(100)
+
+
+def test_process_group_cancellation_reports_unreapable_member(monkeypatch) -> None:
+    waits: list[tuple[int, float]] = []
+    signals: list[int] = []
+
+    monkeypatch.setattr(
+        worker_exec,
+        "_wait_process_group",
+        lambda process_group, deadline: (
+            waits.append((process_group, deadline)) or False
+        ),
+    )
+    monkeypatch.setattr(
+        worker_exec, "_process_group_has_live_members", lambda _process_group: True
+    )
+    monkeypatch.setattr(
+        worker_exec.os,
+        "killpg",
+        lambda _process_group, sent_signal: signals.append(sent_signal),
+    )
+
+    with pytest.raises(RuntimeError, match="still has live members after SIGKILL"):
+        worker_exec._terminate_process_group_pid(4321, timeout_s=0)
+
+    assert signals == [signal.SIGTERM, signal.SIGKILL]
+    assert len(waits) == 2
+    assert all(deadline is not None for _process_group, deadline in waits)
 
 
 def test_worker_payload_cannot_reach_controller_canary_and_detector_is_live() -> None:
@@ -935,26 +1315,39 @@ def test_worker_payload_cannot_reach_controller_canary_and_detector_is_live() ->
         detector_live = canary.read_text() == "control"
         canary.write_text("original")
         with _authorization(checkout) as authorization:
-            process = await WorkerClient(authorization, socket_path=socket_path).launch(
-                local_checkout=checkout,
-                argv=["/bin/sh", "-c", (
-                    'cd "$HOME" || exit 60; printf "home-ok\n"; cd /; '
-                    'parent=${HOME%/*}; '
-                    'if ls "$parent" >/dev/null 2>&1; then exit 61; fi; '
-                    'if touch "$parent/sibling" 2>/dev/null; then exit 62; fi; '
-                    'if mkdir "$parent/sibling-dir" 2>/dev/null; then exit 63; fi; '
-                    'if mv "$HOME" "$parent/renamed" 2>/dev/null; then exit 64; fi; '
-                    'if rmdir "$HOME" 2>/dev/null; then exit 65; fi; '
-                    'if cat "$CANARY" >/dev/null 2>&1; then exit 66; fi; '
-                    'if printf attack > "$CANARY" 2>/dev/null; then exit 67; fi; '
-                    'exit 23'
-                )],
-                env={"PATH": "/usr/bin:/bin", "CANARY": str(canary)},
-                identifier=str(uuid.uuid4()),
-                timeout_s=5,
-            )
-            stdout, stderr = await asyncio.gather(process.stdout.read(), process.stderr.read())
-            returncode = await process.wait()
+            stdout_path = boundary / "worker.stdout"
+            stderr_path = boundary / "worker.stderr"
+            stdout_fd = os.open(stdout_path, os.O_RDWR | os.O_CREAT | os.O_EXCL, 0o600)
+            stderr_fd = os.open(stderr_path, os.O_RDWR | os.O_CREAT | os.O_EXCL, 0o600)
+            from mimir.output_capture import OutputSink
+
+            try:
+                process = await WorkerClient(authorization, socket_path=socket_path).launch(
+                    local_checkout=checkout,
+                    argv=["/bin/sh", "-c", (
+                        'cd "$HOME" || exit 60; printf "home-ok\n"; cd /; '
+                        'parent=${HOME%/*}; '
+                        'if ls "$parent" >/dev/null 2>&1; then exit 61; fi; '
+                        'if touch "$parent/sibling" 2>/dev/null; then exit 62; fi; '
+                        'if mkdir "$parent/sibling-dir" 2>/dev/null; then exit 63; fi; '
+                        'if mv "$HOME" "$parent/renamed" 2>/dev/null; then exit 64; fi; '
+                        'if rmdir "$HOME" 2>/dev/null; then exit 65; fi; '
+                        'if cat "$CANARY" >/dev/null 2>&1; then exit 66; fi; '
+                        'if printf attack > "$CANARY" 2>/dev/null; then exit 67; fi; '
+                        'exit 23'
+                    )],
+                    env={"PATH": "/usr/bin:/bin", "CANARY": str(canary)},
+                    identifier=str(uuid.uuid4()),
+                    timeout_s=5,
+                    stdout_sink=OutputSink(stdout_fd, 4096, stdout_path),
+                    stderr_sink=OutputSink(stderr_fd, 4096, stderr_path),
+                )
+                returncode = await process.wait()
+                stdout = stdout_path.read_bytes()
+                stderr = stderr_path.read_bytes()
+            finally:
+                os.close(stdout_fd)
+                os.close(stderr_fd)
         return {
             "detector_live": detector_live,
             "returncode": returncode,

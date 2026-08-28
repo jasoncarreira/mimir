@@ -20,6 +20,11 @@ import time
 from typing import Any, Callable, Iterable, Sequence
 
 CLAIM_PREFIX = "WORKLINK_CLAIM "
+WORKLINK_EPIC_LABEL = "worklink:epic"
+
+# Standalone callers without a Worklink config get the same finite safety
+# budget as a missing or malformed defaults.max_claim_attempts setting.
+DEFAULT_MAX_CLAIM_ATTEMPTS = 3
 
 #: Operator marker that forgives the attempts consumed before it. The attempt
 #: budget is derived from claim comments, so an infrastructure fault that fails
@@ -43,6 +48,7 @@ SHUTDOWN_ABORT_PREFIX = "WORKLINK_SHUTDOWN_ABORT "
 # restarts must not turn max_attempts into an infinite-retry loophole.
 MAX_SHUTDOWN_ABORT_FORGIVENESS = 2
 REAPER_PREFIX = "WORKLINK_REAPER "
+REAPER_SKIP_SAMPLE_LIMIT = 20
 
 # Retrying remains useful even with Mimir's mutex: another Chainlink caller may
 # not participate in it. Five total attempts (including the first call) sleep for
@@ -65,6 +71,23 @@ Runner = Callable[[Sequence[str]], subprocess.CompletedProcess[str]]
 EventLogger = Callable[..., None]
 
 log = logging.getLogger(__name__)
+
+
+def scope_active_worklink_lock_ids(
+    active_ids: Iterable[int],
+    *,
+    label_ids: Iterable[int] | None = None,
+    exclude_ids: Iterable[int] | None = None,
+) -> set[int]:
+    """Apply the label scope shared by every Worklink concurrency consumer."""
+    if label_ids is not None and exclude_ids is not None:
+        raise ValueError("active lock scope accepts label ids or excluded ids, not both")
+    scoped = set(active_ids)
+    if label_ids is not None:
+        return scoped & set(label_ids)
+    if exclude_ids is not None:
+        return scoped - set(exclude_ids)
+    return scoped
 
 
 def _default_runner(args: Sequence[str]) -> subprocess.CompletedProcess[str]:
@@ -164,6 +187,20 @@ class ClaimResult:
     record: ClaimRecord | None = None
     attempts_exhausted: bool = False
     reason: str | None = None
+
+
+@dataclass(frozen=True)
+class ReapResult:
+    reaped: list[ClaimRecord]
+    examined: int
+    skipped: dict[str, int]
+    skipped_issue_ids: dict[str, list[int]]
+
+
+@dataclass(frozen=True)
+class ShutdownClaimFailure:
+    issue_id: int | None
+    reason: str
 
 
 @dataclass(frozen=True)
@@ -290,7 +327,7 @@ class ChainlinkClaims:
         agent_id: str,
         runner: Runner = _default_runner,
         clock: Callable[[], datetime] | None = None,
-        max_attempts: int = 3,
+        max_attempts: int = DEFAULT_MAX_CLAIM_ATTEMPTS,
         duplicate_freshness_s: float = 600.0,
         home_path: str | Path | None = None,
         event_logger: EventLogger | None = None,
@@ -348,6 +385,14 @@ class ChainlinkClaims:
 
         review_ready = self.review_ready_evidence(issue_id, home_path=home_path)
         if review_ready is not None:
+            # Completed PR evidence is the publication authority. Repair labels
+            # before refusing a duplicate run so ready and undispatchable cannot
+            # persist together after transient post-publication bookkeeping fails.
+            self.transition_issue(
+                issue_id,
+                status="completed",
+                review_ready=True,
+            )
             log.info(
                 "Worklink claim refused: issue_id=%s reason=review_ready_evidence_exists "
                 "evidence_path=%s pr_url=%s",
@@ -378,10 +423,17 @@ class ChainlinkClaims:
             # caller's parse — a caller-side key mismatch here means stealing a
             # LIVE run's lock (exactly how the guard's first live test failed).
             guard_comments = list(comments) or []
+            guard_outcome = "claim_record_missing"
             try:
                 guard_comments = self._issue_comments(issue_id) or guard_comments
-            except Exception:
-                pass
+            except Exception as exc:
+                guard_outcome = "degraded"
+                if self.event_logger is not None:
+                    self.event_logger(
+                        "worklink_claim_guard_degraded",
+                        issue_id=issue_id,
+                        error=f"{type(exc).__name__}: {exc}"[:500],
+                    )
             for existing in claim_records_from_comments(guard_comments):
                 if existing.issue_id != issue_id:
                     continue
@@ -392,7 +444,16 @@ class ChainlinkClaims:
                 age_s = (self.clock() - anchor).total_seconds()
                 if age_s < self.duplicate_freshness_s:
                     return ClaimResult(False, reason="duplicate_run_live")
-            self._run("locks", "steal", str(issue_id), check=False)
+                if guard_outcome != "degraded":
+                    guard_outcome = "stale_heartbeat"
+            steal = self._run("locks", "steal", str(issue_id), check=False)
+            self._emit_claim_stolen(
+                issue_id=issue_id,
+                prior=latest,
+                now=self.clock(),
+                guard_outcome=guard_outcome,
+                result=steal,
+            )
 
         # chainlink #825: exhaustion is judged AFTER the duplicate-liveness
         # guard — a duplicate bouncing off a LIVE final-attempt run must yield
@@ -408,20 +469,27 @@ class ChainlinkClaims:
 
         if max_active_locks is not None:
             try:
-                active = self.active_worklink_lock_count(
+                active_ids = self._active_worklink_lock_ids_for_scope(
                     label=active_label,
                     exclude_label=exclude_active_label,
                 )
+                active = len(active_ids)
             except Exception:
                 self.release_issue(issue_id)
                 raise
             if active > max_active_locks:
                 self.release_issue(issue_id)
+                consuming_ids = sorted(
+                    lock_id
+                    for lock_id in active_ids
+                    if lock_id > 0 and lock_id != issue_id
+                )
+                ids_suffix = f"; active issue ids: {consuming_ids}" if consuming_ids else ""
                 return ClaimResult(
                     False,
                     reason=(
                         f"concurrency cap reached ({active - 1}/{max_active_locks} active "
-                        "claims before this reservation)"
+                        f"claims before this reservation{ids_suffix})"
                     ),
                 )
 
@@ -508,6 +576,32 @@ class ChainlinkClaims:
             outcome=outcome,
         )
 
+    def _emit_claim_stolen(
+        self,
+        *,
+        issue_id: int,
+        prior: ClaimRecord | None,
+        now: datetime,
+        guard_outcome: str,
+        result: subprocess.CompletedProcess[str],
+    ) -> None:
+        if self.event_logger is None:
+            return
+        anchor = (prior.heartbeat_at or prior.claimed_at) if prior is not None else None
+        self.event_logger(
+            "worklink_claim_stolen",
+            issue_id=issue_id,
+            prior_agent_id=prior.agent_id if prior is not None else None,
+            heartbeat_age_s=(now - anchor).total_seconds() if anchor is not None else None,
+            guard_outcome=guard_outcome,
+            steal_succeeded=result.returncode == 0,
+            error=(
+                None
+                if result.returncode == 0
+                else ((result.stderr or result.stdout).strip() or "lock_steal_failed")[:500]
+            ),
+        )
+
     def review_ready_evidence(
         self,
         issue_id: int,
@@ -533,11 +627,14 @@ class ChainlinkClaims:
             return None
         return ReviewReadyEvidence(path=path, payload=payload)
 
-    def release_issue(self, issue_id: int) -> None:
-        """Release the Chainlink lock for ``issue_id`` best-effort."""
-        self._run("locks", "release", str(issue_id), check=False)
+    def release_issue(self, issue_id: int) -> bool:
+        """Attempt to release ``issue_id`` and report whether Chainlink confirmed it."""
+        result = self._run("locks", "release", str(issue_id), check=False)
+        return result.returncode == 0
 
-    def release_owned_claims_for_shutdown(self) -> list[ClaimRecord]:
+    def release_owned_claims_for_shutdown(
+        self,
+    ) -> tuple[list[ClaimRecord], list[ShutdownClaimFailure]]:
         """Return this process's in-flight claims to ready, best-effort.
 
         Ownership is taken only from the latest structured claim comment. A
@@ -545,13 +642,16 @@ class ChainlinkClaims:
         the same underlying Chainlink tracker identity.
         """
         released: list[ClaimRecord] = []
+        failed: list[ShutdownClaimFailure] = []
         try:
             issue_ids = self._list_issue_ids("worklink:in-progress")
         except Exception as exc:  # noqa: BLE001 - shutdown must continue
             log.warning("Worklink shutdown claim discovery failed: %s", exc)
-            return released
+            failed.append(ShutdownClaimFailure(issue_id=None, reason=f"discovery_failed: {exc}"))
+            self._emit_shutdown_release_failures(released, failed)
+            return released, failed
 
-        for issue_id in issue_ids:
+        for index, issue_id in enumerate(issue_ids):
             try:
                 latest: ClaimRecord | None = None
                 for record in claim_records_from_comments(self._issue_comments(issue_id)):
@@ -587,9 +687,42 @@ class ChainlinkClaims:
                     issue_id,
                     exc,
                 )
+                failed.append(
+                    ShutdownClaimFailure(
+                        issue_id=issue_id,
+                        reason=f"{type(exc).__name__}: {exc}"[:500],
+                    )
+                )
                 if isinstance(exc, subprocess.TimeoutExpired):
+                    failed.extend(
+                        ShutdownClaimFailure(
+                            issue_id=remaining_issue_id,
+                            reason="abandoned_after_timeout",
+                        )
+                        for remaining_issue_id in issue_ids[index + 1 :]
+                    )
                     break
-        return released
+        self._emit_shutdown_release_failures(released, failed)
+        return released, failed
+
+    def _emit_shutdown_release_failures(
+        self,
+        released: list[ClaimRecord],
+        failed: list[ShutdownClaimFailure],
+    ) -> None:
+        if self.event_logger is None or not failed:
+            return
+        try:
+            self.event_logger(
+                "worklink_shutdown_claim_release_failed",
+                released_issue_ids=[record.issue_id for record in released],
+                failed=[
+                    {"issue_id": failure.issue_id, "reason": failure.reason}
+                    for failure in failed
+                ],
+            )
+        except Exception:  # noqa: BLE001 - telemetry cannot block shutdown
+            pass
 
     def heartbeat_issue(self, record: ClaimRecord) -> ClaimRecord:
         """Append a refreshed claim record so the TTL reaper sees liveness."""
@@ -677,7 +810,12 @@ class ChainlinkClaims:
         }
         return len(active_claims - forgiven)
 
-    def reap_stale_claims(self, records: Iterable[ClaimRecord], *, ttl: timedelta) -> list[ClaimRecord]:
+    def reap_stale_claims(
+        self,
+        records: Iterable[ClaimRecord],
+        *,
+        ttl: timedelta,
+    ) -> ReapResult:
         """Release stale claims and move the issue back to ready or blocked.
 
         ``chainlink locks steal`` is forceful in the verified Chainlink version,
@@ -686,16 +824,42 @@ class ChainlinkClaims:
         """
         now = self.clock()
         reaped: list[ClaimRecord] = []
+        examined = 0
+        skipped: dict[str, int] = {}
+        skipped_issue_ids: dict[str, list[int]] = {}
+
+        def record_skip(reason: str, issue_id: int) -> None:
+            skipped[reason] = skipped.get(reason, 0) + 1
+            sample = skipped_issue_ids.setdefault(reason, [])
+            if len(sample) < REAPER_SKIP_SAMPLE_LIMIT:
+                sample.append(issue_id)
+
         for record in records:
             if not record.is_stale(now, ttl):
                 continue
-            if not self._lock_still_held_by(record):
+            examined += 1
+            try:
+                lock_held = self._lock_still_held_by(record)
+            except RuntimeError:
+                record_skip("lock_query_failed", record.issue_id)
+                continue
+            if not lock_held:
+                record_skip("lock_not_held", record.issue_id)
                 continue
             steal = self._run("locks", "steal", str(record.issue_id), check=False)
+            self._emit_claim_stolen(
+                issue_id=record.issue_id,
+                prior=record,
+                now=now,
+                guard_outcome="stale_lock_confirmed",
+                result=steal,
+            )
             if steal.returncode != 0:
+                record_skip("lock_steal_failed", record.issue_id)
                 continue
             if not self._issue_has_label(record.issue_id, "worklink:in-progress"):
                 self._run("locks", "release", str(record.issue_id), check=False)
+                record_skip("in_progress_label_missing", record.issue_id)
                 continue
             self._run("locks", "release", str(record.issue_id), check=False)
             self._run("issue", "unlabel", str(record.issue_id), "worklink:in-progress", check=False)
@@ -731,7 +895,20 @@ class ChainlinkClaims:
                     resulting_label=payload["resulting_label"],
                 )
             reaped.append(record)
-        return reaped
+        if self.event_logger is not None and skipped:
+            self.event_logger(
+                "worklink_claim_reap_skipped",
+                examined=examined,
+                skipped=skipped,
+                skipped_issue_ids=skipped_issue_ids,
+                sample_limit=REAPER_SKIP_SAMPLE_LIMIT,
+            )
+        return ReapResult(
+            reaped=reaped,
+            examined=examined,
+            skipped=skipped,
+            skipped_issue_ids=skipped_issue_ids,
+        )
 
     def _issue_labels(self, issue_id: int) -> set[str]:
         """Return current labels when Chainlink exposes them, otherwise empty."""
@@ -756,25 +933,35 @@ class ChainlinkClaims:
             labels.update(str(name) for name in raw_labels)
         return labels
 
-    def _issue_has_label(self, issue_id: int, label: str) -> bool:
+    def _issue_has_label(
+        self,
+        issue_id: int,
+        label: str,
+        *,
+        default_on_unavailable: bool | None = True,
+    ) -> bool | None:
         """Best-effort current-label check for reaper race avoidance.
 
         Reaper discovery is necessarily two-step (list in-progress, then inspect
         comments). A worker can transition the issue to review/blocked between
         discovery and ``locks steal``. When ``issue show --json`` exposes labels,
         refuse to relabel anything no longer in-progress. If the label shape is
-        unavailable, preserve the prior behavior rather than disabling reaping.
+        unavailable, callers choose the safe result for their operation. The
+        in-progress race guards preserve prior behavior with the default ``True``;
+        the epic exclusion passes ``None`` so it can fail closed *and* record that
+        the label read was unavailable instead of silently treating every issue
+        as an epic.
         """
         result = self._run("issue", "show", str(issue_id), "--json", check=False)
         if result.returncode != 0:
-            return True
+            return default_on_unavailable
         try:
             data = json.loads(result.stdout or "{}")
         except json.JSONDecodeError:
-            return True
+            return default_on_unavailable
         raw_labels = data.get("labels")
         if raw_labels is None:
-            return True
+            return default_on_unavailable
         labels: set[str] = set()
         if isinstance(raw_labels, list):
             for item in raw_labels:
@@ -801,11 +988,14 @@ class ChainlinkClaims:
         """
         result = self._run("locks", "list", "--json", check=False)
         if result.returncode != 0:
-            return False
+            raise RuntimeError(
+                (result.stderr or result.stdout).strip()
+                or f"chainlink locks list failed (rc={result.returncode})"
+            )
         try:
             data = json.loads(result.stdout or "{}")
-        except json.JSONDecodeError:
-            return False
+        except json.JSONDecodeError as exc:
+            raise RuntimeError("chainlink locks list returned invalid JSON") from exc
         locks = data.get("locks", data if isinstance(data, list) else {})
         lock: Any | None = None
         if isinstance(locks, dict):
@@ -903,18 +1093,31 @@ class ChainlinkClaims:
         them avoids the label-based check-then-act window where a worker has
         been admitted but has not yet applied ``worklink:in-progress``.
         """
+        return len(
+            self._active_worklink_lock_ids_for_scope(
+                label=label,
+                exclude_label=exclude_label,
+            )
+        )
+
+    def _active_worklink_lock_ids_for_scope(
+        self,
+        *,
+        label: str | None = None,
+        exclude_label: str | None = None,
+    ) -> set[int]:
         if label is not None and exclude_label is not None:
             raise ValueError("active lock scope accepts label or exclude_label, not both")
         active_ids = self._active_worklink_lock_ids(
             require_identity=label is not None or exclude_label is not None
         )
-        if label is not None:
-            scoped_ids = set(self._list_issue_ids(label))
-            return len(active_ids & scoped_ids)
-        if exclude_label is not None:
-            excluded_ids = set(self._list_issue_ids(exclude_label))
-            return len(active_ids - excluded_ids)
-        return len(active_ids)
+        label_ids = self._list_issue_ids(label) if label is not None else None
+        exclude_ids = self._list_issue_ids(exclude_label) if exclude_label is not None else None
+        return scope_active_worklink_lock_ids(
+            active_ids,
+            label_ids=label_ids,
+            exclude_ids=exclude_ids,
+        )
 
     def _active_worklink_lock_ids(self, *, require_identity: bool) -> set[int]:
         result = self._run("locks", "list", "--json", check=False)
@@ -965,7 +1168,7 @@ class ChainlinkClaims:
                     out.append(str(text))
         return out
 
-    def reap_home(self, *, ttl: timedelta) -> list[ClaimRecord]:
+    def reap_home(self, *, ttl: timedelta) -> ReapResult:
         """Discover ``worklink:in-progress`` issues, gather the latest claim
         record per issue from their comments, and reap any stale ones.
 
@@ -974,14 +1177,50 @@ class ChainlinkClaims:
         records-in transform that's trivial to unit-test.
         """
         latest: dict[int, ClaimRecord] = {}
-        for issue_id in self.issue_ids_with_label("worklink:in-progress"):
-            if self._issue_has_label(issue_id, "worklink:epic"):
+        discovery_skipped: dict[str, int] = {}
+        try:
+            issue_ids = set(self._list_issue_ids("worklink:in-progress"))
+        except RuntimeError as exc:
+            log.warning("Worklink reaper issue discovery failed: %s", exc)
+            issue_ids = set()
+            discovery_skipped["issue_discovery_failed"] = 1
+        try:
+            # Locks are the authoritative reservation surface. Including them
+            # recovers terminal-phase leaks after transition removed in-progress;
+            # freshness and holder checks below still prevent stealing live runs.
+            issue_ids.update(self._active_worklink_lock_ids(require_identity=True))
+        except RuntimeError as exc:
+            log.warning("Worklink reaper lock discovery failed: %s", exc)
+            discovery_skipped["lock_discovery_failed"] = 1
+        for issue_id in sorted(issue_ids):
+            # Factory claims have a longer runtime than leaves. If labels cannot
+            # be read, fail closed and skip the issue rather than applying the
+            # leaf TTL to a factory lock whose epic marker could not be observed.
+            epic_status = self._issue_has_label(
+                issue_id,
+                WORKLINK_EPIC_LABEL,
+                default_on_unavailable=None,
+            )
+            if epic_status is None:
+                discovery_skipped["epic_label_unavailable"] = (
+                    discovery_skipped.get("epic_label_unavailable", 0) + 1
+                )
+                continue
+            if epic_status:
                 continue
             for record in claim_records_from_comments(self._issue_comments(issue_id)):
                 current = latest.get(record.issue_id)
                 if current is None or _claim_is_newer(record, current):
                     latest[record.issue_id] = record
-        return self.reap_stale_claims(latest.values(), ttl=ttl)
+        result = self.reap_stale_claims(latest.values(), ttl=ttl)
+        if not discovery_skipped:
+            return result
+        return ReapResult(
+            reaped=result.reaped,
+            examined=result.examined,
+            skipped={**discovery_skipped, **result.skipped},
+            skipped_issue_ids=result.skipped_issue_ids,
+        )
 
     def _attempts_exhausted(self, issue_id: int, attempts: int) -> None:
         self._run("issue", "unlabel", str(issue_id), "worklink:ready", check=False)

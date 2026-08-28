@@ -221,3 +221,70 @@ def test_old_red_head_is_baselined_without_later_retry(monkeypatch, captured_emi
     )
     assert count == 0
     assert captured_emits == []
+
+
+# --- chainlink #1433: per-tick reconciliation bound -------------------------
+
+
+def _pr_n(number: int, *, author: str = "mimir-bot") -> dict:
+    pr = _pr(author=author, head=f"{number:040d}")
+    pr["number"] = number
+    pr["html_url"] = f"https://github.com/o/r/pull/{number}"
+    pr["head"]["ref"] = f"worklink/{number}"
+    return pr
+
+
+def _multi_api(prs: list[dict], checks: list[dict]):
+    by_number = {p["number"]: p for p in prs}
+
+    def fake(endpoint: str, _token: str):
+        if endpoint.startswith("repos/o/r/pulls?state=open"):
+            return prs
+        if "/check-runs" in endpoint:
+            return {"check_runs": checks}
+        if endpoint.startswith("repos/o/r/pulls/"):
+            return by_number[int(endpoint.rsplit("/", 1)[1])]
+        raise AssertionError(endpoint)
+
+    return fake
+
+
+def test_truncated_ci_pass_holds_the_window_so_nothing_is_lost(
+    monkeypatch, captured_emits,
+):
+    """Truncation must go through the same no-advance path as an API failure:
+    an incomplete collection keeps ``_last_checked`` at ``window_since``, so the
+    PRs this tick skipped are re-examined next tick instead of being dropped."""
+    numbers = [41, 42, 43, 44, 45]
+    monkeypatch.setattr(poller, "_gh_api", _multi_api([_pr_n(n) for n in numbers], [_check()]))
+
+    spent = poller.TickBudget(deadline_seconds=0.0)
+    count, cursor = poller._check_pr_ci_failures(
+        "o/r", SINCE, "token", "mimir-bot", {}, tick_budget=spent,
+    )
+    assert count == poller.PR_RECONCILE_MIN_PER_PASS
+    assert spent.truncated == {
+        "ci_failures": len(numbers) - poller.PR_RECONCILE_MIN_PER_PASS,
+    }
+    assert cursor["_last_checked"] == SINCE  # window pinned, not advanced
+
+    # A later tick with budget left picks up exactly the skipped PRs; the two
+    # already delivered stay deduped by their cursor entries.
+    count2, _ = poller._check_pr_ci_failures(
+        "o/r", SINCE, "token", "mimir-bot", cursor,
+        tick_budget=poller.TickBudget(deadline_seconds=600.0),
+    )
+    assert count2 == len(numbers) - poller.PR_RECONCILE_MIN_PER_PASS
+    assert sorted(e["number"] for e in captured_emits) == numbers
+
+
+def test_unbudgeted_ci_pass_reconciles_every_pr(monkeypatch, captured_emits):
+    numbers = [41, 42, 43]
+    monkeypatch.setattr(poller, "_gh_api", _multi_api([_pr_n(n) for n in numbers], [_check()]))
+    fresh = poller.TickBudget(deadline_seconds=600.0)
+    count, cursor = poller._check_pr_ci_failures(
+        "o/r", SINCE, "token", "mimir-bot", {}, tick_budget=fresh,
+    )
+    assert count == len(numbers)
+    assert fresh.truncated == {}
+    assert cursor["_last_checked"] != SINCE  # complete collection advances

@@ -734,7 +734,8 @@ def test_merge_adds_new_default_tick() -> None:
     )
     assert added == ["memory-hygiene"]
     assert new_text is not None
-    jobs = load_jobs_from_text(new_text)
+    jobs, rejections = load_jobs_from_text(new_text)
+    assert rejections == []
     assert [j.name for j in jobs] == ["heartbeat", "memory-hygiene"]
     mh = jobs[1]
     assert mh.prompt_file == "memory-hygiene.md"
@@ -751,7 +752,9 @@ def test_merge_preserves_operator_customized_job() -> None:
         base_text=base, their_text=theirs, home_text=home, version="0.6.7"
     )
     assert added == ["memory-hygiene"]
-    by = {j.name: j for j in load_jobs_from_text(new_text)}
+    jobs, rejections = load_jobs_from_text(new_text)
+    assert rejections == []
+    by = {j.name: j for j in jobs}
     assert by["reflect"].cron == "30 5 * * 0"  # untouched
     assert by["reflect"].priority == "high"
     assert "memory-hygiene" in by
@@ -765,7 +768,9 @@ def test_merge_preserves_operator_custom_job() -> None:
         base_text=base, their_text=theirs, home_text=home, version="0.6.7"
     )
     assert added == ["memory-hygiene"]
-    names = [j.name for j in load_jobs_from_text(new_text)]
+    jobs, rejections = load_jobs_from_text(new_text)
+    assert rejections == []
+    names = [j.name for j in jobs]
     assert "daily-journal" in names  # custom job preserved
     assert "memory-hygiene" in names
 
@@ -836,7 +841,10 @@ def test_scheduler_reconcile_proposes_new_default_tick(
     wt = result.proposal.worktree
     staged = _git("diff", "--cached", "--name-only", cwd=wt).stdout.splitlines()
     assert "scheduler.yaml" in staged
-    jobs = load_jobs_from_text((wt / "scheduler.yaml").read_text(encoding="utf-8"))
+    jobs, rejections = load_jobs_from_text(
+        (wt / "scheduler.yaml").read_text(encoding="utf-8")
+    )
+    assert rejections == []
     assert [j.name for j in jobs] == ["heartbeat", "memory-hygiene"]
     # Live home stays operator-owned until the proposal PR merges.
     assert "memory-hygiene" not in (home / "scheduler.yaml").read_text(encoding="utf-8")

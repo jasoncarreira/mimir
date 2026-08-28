@@ -25,8 +25,10 @@ from __future__ import annotations
 
 import asyncio
 import dataclasses
+import json
 import logging
 import os
+import stat
 import time
 import traceback as tb
 from dataclasses import dataclass
@@ -38,7 +40,7 @@ if TYPE_CHECKING:
     from .commitments.store import CommitmentsStore
 
 import yaml
-from apscheduler.events import EVENT_JOB_MISSED, JobExecutionEvent
+from apscheduler.events import EVENT_JOB_ERROR, EVENT_JOB_MISSED, JobExecutionEvent
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.date import DateTrigger
@@ -49,13 +51,14 @@ from .billing import normalize_priority
 from .background_tasks import cancel_background_tasks, spawn_background
 from .access_control import (
     SCHEDULER_AUTHORITY_PROFILES,
+    DeclaredShellCommandError,
     agent_writable_roots,
     build_scheduled_tick_service_principal,
     builtin_trigger_service_principal,
     parse_declared_shell_commands,
 )
 from .core_blocks import read_text_lossy
-from .event_logger import get_events_path, log_event
+from .event_logger import get_events_path, log_event, log_event_sync, safe_log_event
 from ._context import active_pr_checkout_lease_paths, active_turn_snapshots
 from .loop_watchdog import (
     LoopStallWatchdog,
@@ -66,17 +69,27 @@ from .quota_windows import provider_store_keys
 from .models import AgentEvent
 from .pollers import (
     POLLER_CHANNEL_PREFIX,
+    POLLER_TIMEOUT_SECONDS,
     PollerConfig,
     discover_pollers,
     forget_circuit_breakers_except,
     run_poller,
 )
 from .poller_budget import aggregate_poller_turn_usage
+from .poller_triggers import trigger_fifo_path
 from .saga_client import SagaClient, SagaError
 
 log = logging.getLogger(__name__)
 
 UTC = timezone.utc
+
+#: Headroom between a poller's subprocess timeout and its own fire interval.
+#: Jobs register with ``max_instances=1``, so a run that spans the next fire
+#: makes APScheduler skip it. Keeping the timeout strictly under the cadence
+#: means a slow run degrades into a late result rather than a lost tick.
+POLLER_CADENCE_MARGIN_SECONDS = 10.0
+#: Smallest gap a 5-field cron can express.
+CRON_MIN_GRANULARITY_SECONDS = 60.0
 
 
 def _loop_stall_alert_threshold() -> float:
@@ -365,22 +378,60 @@ class SchedulerJob:
         )
 
 
-def load_jobs_from_text(text: str) -> list[SchedulerJob]:
-    """Parse scheduler.yaml *content*. Returns [] for empty/invalid text —
-    one bad job shouldn't take the whole list down."""
+def load_jobs_from_text(
+    text: str,
+    *,
+    source: Path | str = "scheduler.yaml",
+    writable_roots: tuple[Path, ...] = (),
+) -> tuple[list[SchedulerJob], list[dict[str, Any]]]:
+    """Parse scheduler.yaml content without letting one bad job abort siblings."""
+    rejections: list[dict[str, Any]] = []
     try:
         raw = yaml.safe_load(text)
     except yaml.YAMLError as exc:
         log.warning("scheduler.yaml parse failed: %s", exc)
-        return []
+        return [], [{
+            "path": str(source),
+            "job": "<document>",
+            "reason": f"{type(exc).__name__}: {exc}",
+        }]
+    if raw is None:
+        return [], []
     if not isinstance(raw, list):
-        return []
+        return [], [{
+            "path": str(source),
+            "job": "<document>",
+            "reason": "scheduler document must be a list",
+        }]
     out: list[SchedulerJob] = []
-    for entry in raw:
+    for index, entry in enumerate(raw):
+        entry_name = f"entry[{index}]"
         if not isinstance(entry, dict):
+            rejections.append({
+                "path": str(source),
+                "job": entry_name,
+                "reason": "entry must be a mapping",
+            })
             continue
+        raw_name = entry.get("name")
+        if isinstance(raw_name, str) and raw_name.strip():
+            entry_name = raw_name.strip()
         try:
             job = SchedulerJob.from_yaml_entry(entry)
+            if job.shell_commands is not None:
+                try:
+                    parse_declared_shell_commands(
+                        job.shell_commands,
+                        writable_roots=writable_roots,
+                    )
+                except DeclaredShellCommandError as exc:
+                    if not exc.environment_dependent:
+                        raise
+                    rejections.append({
+                        "path": str(source),
+                        "job": entry_name,
+                        "reason": str(exc),
+                    })
             if job.name == "heartbeat" and job.authority_profile is None:
                 log.warning(
                     "scheduler job 'heartbeat' declares no authority_profile; "
@@ -390,15 +441,27 @@ def load_jobs_from_text(text: str) -> list[SchedulerJob]:
             out.append(job)
         except ValueError as exc:
             log.warning("invalid scheduler job: %s", exc)
-    return out
+            rejections.append({
+                "path": str(source),
+                "job": entry_name,
+                "reason": str(exc),
+            })
+    return out, rejections
 
 
-def load_jobs(path: Path) -> list[SchedulerJob]:
-    """Read scheduler.yaml. Returns [] for missing/empty/invalid files —
-    one bad job shouldn't take the whole list down."""
+def load_jobs(
+    path: Path,
+    *,
+    writable_roots: tuple[Path, ...] = (),
+) -> tuple[list[SchedulerJob], list[dict[str, Any]]]:
+    """Read scheduler.yaml, returning accepted jobs and named rejections."""
     if not path.is_file():
-        return []
-    return load_jobs_from_text(path.read_text(encoding="utf-8"))
+        return [], []
+    return load_jobs_from_text(
+        path.read_text(encoding="utf-8"),
+        source=path,
+        writable_roots=writable_roots,
+    )
 
 
 _BUNDLED_TEMPLATE = Path(__file__).parent / "scheduler_template.yaml"
@@ -531,6 +594,75 @@ def _expand_standard_dow_numeric_part(part: str) -> str:
             names.append(name)
             seen.add(name)
     return ",".join(names)
+
+
+def _expand_cron_field(spec: str, lo: int, hi: int) -> set[int] | None:
+    """Values a single cron field admits, or None if it cannot be parsed.
+
+    Handles ``*``, ``a``, ``a-b``, ``*/step``, ``a-b/step`` and ``a/step``. A
+    bare value with a step is read as "from a, every step" (standard cron), which
+    yields more values and therefore a tighter gap — the safe direction for a
+    lower bound.
+    """
+    values: set[int] = set()
+    for raw in spec.split(","):
+        part = raw.strip()
+        if not part:
+            return None
+        step = 1
+        if "/" in part:
+            part, _, step_text = part.partition("/")
+            if not step_text.isdigit() or int(step_text) < 1:
+                return None
+            step = int(step_text)
+        part = part.strip()
+        if part in ("*", "?"):
+            start, end = lo, hi
+        elif "-" in part:
+            low_text, _, high_text = part.partition("-")
+            if not (low_text.isdigit() and high_text.isdigit()):
+                return None
+            start, end = int(low_text), int(high_text)
+        elif part.isdigit():
+            start = int(part)
+            end = hi if step > 1 else start
+        else:
+            return None
+        if start < lo or end > hi or start > end:
+            return None
+        values.update(range(start, end + 1, step))
+    return values or None
+
+
+def _min_circular_gap(values: set[int], modulus: int) -> int:
+    """Smallest distance between two members, wrapping at ``modulus``."""
+    ordered = sorted(values)
+    if len(ordered) < 2:
+        return modulus
+    gaps = [b - a for a, b in zip(ordered, ordered[1:])]
+    gaps.append(ordered[0] + modulus - ordered[-1])
+    return min(gaps)
+
+
+def _cron_min_gap_seconds(cron: str) -> float | None:
+    """Lower bound, in seconds, on the gap between two fires of ``cron``.
+
+    Two or more admitted minutes bound the gap by the closest pair of them; with
+    a single minute the hour field bounds it; with a single hour there is at most
+    one fire per day. None means the expression could not be parsed.
+    """
+    fields = cron.split()
+    if len(fields) < 2:
+        return None
+    minutes = _expand_cron_field(fields[0], 0, 59)
+    hours = _expand_cron_field(fields[1], 0, 23)
+    if minutes is None or hours is None:
+        return None
+    if len(minutes) >= 2:
+        return 60.0 * _min_circular_gap(minutes, 60)
+    if len(hours) >= 2:
+        return 3600.0 * _min_circular_gap(hours, 24)
+    return 86400.0
 
 
 def _cron_with_standard_dow(cron: str) -> str:
@@ -726,6 +858,10 @@ class Scheduler:
         # clock terms instead of mentally subtracting hours twice a
         # year for DST.
         self._tz = _resolve_tz(scheduler_tz)
+        #: (name, cron) -> (shortest gap or None). See
+        #: ``_poller_cadence_seconds``; keyed on the cron string so a manifest
+        #: edit that changes the schedule recomputes rather than serving stale.
+        self._poller_cadence_cache: dict[tuple[str, str], tuple[float | None]] = {}
         self._scheduler = AsyncIOScheduler(timezone=self._tz)
         self._yaml_path = scheduler_yaml
         self._enqueue = enqueue
@@ -781,6 +917,15 @@ class Scheduler:
         cap = max(1, cap)  # 0 / negative → 1 (degenerate single-fire)
         self._poller_semaphore = asyncio.Semaphore(cap)
         self._poller_concurrency_cap = cap
+        # Direct completion triggers share the timed path and serialize with it
+        # per poller. Signals arriving during a triggered pass coalesce into one
+        # pending follow-up instead of creating unbounded tasks.
+        self._poller_fire_locks: dict[str, asyncio.Lock] = {}
+        self._poller_trigger_tasks: dict[str, asyncio.Task[Any]] = {}
+        self._poller_trigger_dirty: set[str] = set()
+        self._poller_trigger_fd: int | None = None
+        self._stopping = False
+        self._poller_trigger_buffer = b""
         # Strong references to fire-and-forget background tasks (chainlink #118).
         # asyncio.create_task() returns a weakly-referenced Task — if no strong
         # ref is held, the GC can collect it before it runs to completion.
@@ -801,6 +946,9 @@ class Scheduler:
         # event reliable rather than rare.
         self._scheduler.add_listener(
             self._on_job_missed, EVENT_JOB_MISSED,
+        )
+        self._scheduler.add_listener(
+            self._on_job_error, EVENT_JOB_ERROR,
         )
 
     def set_arbiter(self, arbiter: Any | None) -> None:
@@ -840,6 +988,26 @@ class Scheduler:
             ),
         )
 
+    def _on_job_error(self, event: JobExecutionEvent) -> None:
+        """Record every APScheduler job exception without changing its result."""
+        # Import lazily: importing ``mimir.tools`` while this module is still
+        # initializing reaches the tool registry, which imports ``SchedulerJob``.
+        from .tools.budget_gate import _bounded_tool_event_error
+
+        payload = {
+            "job_id": event.job_id,
+            "exception": _bounded_tool_event_error(repr(event.exception)),
+        }
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            log_event_sync("scheduled_job_error", **payload)
+            return
+        self._spawn(
+            log_event("scheduled_job_error", **payload),
+            name="scheduler-log-job-error",
+        )
+
     def _spawn(self, coro: Awaitable[Any], *, name: str | None = None) -> asyncio.Task[Any]:
         """Schedule *coro* as a background task and hold a strong reference.
 
@@ -858,14 +1026,21 @@ class Scheduler:
         yaml so runtime cron overrides take effect on the next tick.
         Returns ``{registered, invalid}`` counts. Caller logs.
 
-        ``registered`` and ``invalid`` only count prompt-style entries.
-        Callable entries are tracked separately via the registry.
+        ``registered`` counts prompt-style entries. ``invalid`` counts every
+        scheduler.yaml entry rejected during loading or installation.
 
         Sync convenience (loads the yaml, then applies). Async callers on
         the event loop should use ``_reload_async`` instead so the
         APScheduler mutations run on the loop thread (chainlink #259
         item 16)."""
-        return self._apply_reload(load_jobs(self._yaml_path))
+        if self._home is None:
+            yaml_jobs, rejections = load_jobs(self._yaml_path)
+        else:
+            yaml_jobs, rejections = load_jobs(
+                self._yaml_path,
+                writable_roots=agent_writable_roots(self._home),
+            )
+        return self._apply_reload(yaml_jobs, rejections)
 
     async def _reload_async(self) -> dict[str, int]:
         """``reload`` with the yaml read off the loop (``to_thread``) and
@@ -874,19 +1049,64 @@ class Scheduler:
         whole reload via ``asyncio.to_thread`` (the prior behavior) raced
         the scheduler's own on-loop job dispatch (chainlink #259 item 16).
         """
-        yaml_jobs = await asyncio.to_thread(load_jobs, self._yaml_path)
-        return self._apply_reload(yaml_jobs)
+        if self._home is None:
+            yaml_jobs, rejections = await asyncio.to_thread(
+                load_jobs, self._yaml_path,
+            )
+        else:
+            yaml_jobs, rejections = await asyncio.to_thread(
+                load_jobs,
+                self._yaml_path,
+                writable_roots=agent_writable_roots(self._home),
+            )
+        return self._apply_reload(yaml_jobs, rejections)
 
-    def _apply_reload(self, yaml_jobs: list[SchedulerJob]) -> dict[str, int]:
+    def _apply_reload(
+        self,
+        yaml_jobs: list[SchedulerJob],
+        rejections: list[dict[str, Any]] | None = None,
+    ) -> dict[str, int]:
         """Apply pre-loaded jobs and mutate APScheduler on the loop thread.
 
         Async callers load the workload-sized YAML off-loop before entering
         this method. The synchronous ``reload`` convenience does that read on
         its caller's thread.
         """
-        # Drop existing scheduler:* jobs; leave non-prefixed (e.g. saga-consolidate).
+        # Validate prompt-style entries before removing anything so a malformed
+        # operator edit cannot knock the last-known-good job offline.
+        valid_prompt_jobs: list[tuple[SchedulerJob, CronTrigger]] = []
+        rejection_events = list(rejections or [])
+        invalid_prompt_names = {
+            str(item["job"])
+            for item in rejection_events
+            if not str(item.get("job", "")).startswith("<")
+            and not str(item.get("job", "")).startswith("entry[")
+        }
+        invalid = len(rejection_events)
+        for job in yaml_jobs:
+            if job.callable_name is not None:
+                continue
+            try:
+                trigger = _build_trigger(job, self._tz)
+            except ValueError as exc:
+                invalid += 1
+                invalid_prompt_names.add(job.name)
+                rejection_events.append({
+                    "path": str(self._yaml_path),
+                    "job": job.name,
+                    "reason": str(exc),
+                })
+                continue
+            valid_prompt_jobs.append((job, trigger))
+
+        # Drop existing scheduler:* jobs except entries whose replacement did
+        # not validate; those continue running with their prior trigger.
         for job in list(self._scheduler.get_jobs()):
-            if job.id.startswith(SCHEDULER_CHANNEL_PREFIX):
+            if (
+                job.id.startswith(SCHEDULER_CHANNEL_PREFIX)
+                and job.id[len(SCHEDULER_CHANNEL_PREFIX):]
+                not in invalid_prompt_names
+            ):
                 self._scheduler.remove_job(job.id)
 
         # Re-resolve registered callables against the new yaml. A yaml
@@ -900,6 +1120,24 @@ class Scheduler:
                     "reload: callable %r install failed: %s",
                     cdef.name, exc,
                 )
+                self._dispatch_reload_events(
+                    "scheduler_invalid_cron",
+                    [{"job": cdef.name, "error": str(exc)}],
+                )
+                matching_job = next(
+                    (
+                        job for job in yaml_jobs
+                        if job.callable_name == cdef.name and job.cron
+                    ),
+                    None,
+                )
+                if matching_job is not None:
+                    invalid += 1
+                    rejection_events.append({
+                        "path": str(self._yaml_path),
+                        "job": matching_job.name,
+                        "reason": str(exc),
+                    })
 
         # Warn-skip yaml entries naming an unregistered callable.
         # Don't crash startup — could be a stale yaml after a refactor
@@ -907,22 +1145,23 @@ class Scheduler:
         registered_names = set(self._callables.keys())
 
         registered = 0
-        invalid = 0
         for job in yaml_jobs:
-            # Skip callable-typed entries — they're handled above.
-            if job.callable_name is not None:
-                if job.callable_name not in registered_names:
-                    log.warning(
-                        "scheduler.yaml entry %r references unregistered "
-                        "callable %r; skipping",
-                        job.name, job.callable_name,
-                    )
-                continue
-            try:
-                trigger = _build_trigger(job, self._tz)
-            except ValueError:
+            if (
+                job.callable_name is not None
+                and job.callable_name not in registered_names
+            ):
+                log.warning(
+                    "scheduler.yaml entry %r references unregistered "
+                    "callable %r; skipping",
+                    job.name, job.callable_name,
+                )
                 invalid += 1
-                continue
+                rejection_events.append({
+                    "path": str(self._yaml_path),
+                    "job": job.name,
+                    "reason": f"unregistered callable {job.callable_name!r}",
+                })
+        for job, trigger in valid_prompt_jobs:
             self._scheduler.add_job(
                 self._fire,
                 trigger=trigger,
@@ -938,6 +1177,7 @@ class Scheduler:
                 misfire_grace_time=job.misfire_grace_time,
             )
             registered += 1
+        self._dispatch_reload_events("scheduler_job_rejected", rejection_events)
         return {"registered": registered, "invalid": invalid}
 
     async def _consult_arbiter(self, *, priority: str) -> Any | None:
@@ -969,6 +1209,10 @@ class Scheduler:
     #      which skill the agent should run.
     # loop_id: 4.1
     async def _fire(self, *, job: SchedulerJob) -> None:
+        # Import lazily for the same scheduler/tool-registry cycle avoided by
+        # ``_on_job_error`` above.
+        from .tools.budget_gate import _bounded_tool_event_error
+
         # Resolve the cron's prompt body. Precedence:
         #   1. ``prompt_file`` (relative to ``<home>/prompts/`` — escapes
         #      via ``..`` are rejected so an agent can't reference an
@@ -1011,6 +1255,12 @@ class Scheduler:
                     "scheduler %r: no scheduled_tick authority to extend; job not fired",
                     job.name,
                 )
+                await safe_log_event(
+                    "scheduled_tick_dropped",
+                    schedule_name=job.name,
+                    channel_id=_scheduler_channel_id(job.name, job.channel_id),
+                    reason="scheduled_tick_authority_unavailable",
+                )
                 return
         else:
             try:
@@ -1021,6 +1271,14 @@ class Scheduler:
                 )
             except ValueError as exc:
                 log.error("scheduler %r: %s; job not fired", job.name, exc)
+                await safe_log_event(
+                    "scheduled_tick_dropped",
+                    schedule_name=job.name,
+                    channel_id=_scheduler_channel_id(job.name, job.channel_id),
+                    reason=_bounded_tool_event_error(
+                        f"authority_profile_rejected: {exc}"
+                    ),
+                )
                 return
         service_principal = authority.canonical
 
@@ -1048,12 +1306,23 @@ class Scheduler:
                     "scheduler %r: shell_commands rejected — %s; job not fired",
                     job.name, exc,
                 )
+                await safe_log_event(
+                    "scheduled_tick_dropped",
+                    schedule_name=job.name,
+                    channel_id=_scheduler_channel_id(job.name, job.channel_id),
+                    reason=_bounded_tool_event_error(
+                        f"shell_commands_rejected: {exc}"
+                    ),
+                )
                 return
             if declared:
                 authority = dataclasses.replace(
                     authority, declared_shell_commands=declared,
                 )
                 service_principal = authority.canonical
+        authority = dataclasses.replace(
+            authority, configured_delivery_channel=job.deliver,
+        )
         event = AgentEvent(
             trigger="scheduled_tick",
             channel_id=_scheduler_channel_id(job.name, job.channel_id),
@@ -1179,6 +1448,24 @@ class Scheduler:
         except Exception:  # noqa: BLE001 — already gone / never armed
             pass
 
+    async def _configured_heartbeat_job(self) -> SchedulerJob | None:
+        """Resolve the operator-configured heartbeat, or ``None`` if disabled.
+
+        ``load_jobs`` returns a list today, while the writable-root validation
+        work in PR #1704 changes it to ``(jobs, rejections)``. Accept both
+        shapes so either PR can merge first without breaking quota recovery.
+        """
+        loaded = await asyncio.to_thread(load_jobs, self._yaml_path)
+        jobs = loaded[0] if isinstance(loaded, tuple) else loaded
+        return next((job for job in jobs if job.name == "heartbeat"), None)
+
+    async def _fire_configured_heartbeat(self) -> None:
+        job = await self._configured_heartbeat_job()
+        if job is None:
+            log.info("quota recovery heartbeat skipped: not configured")
+            return
+        await self._fire(job=job)
+
     async def _recheck_quota_pause(self) -> None:
         """Interval-probe body. Three outcomes:
 
@@ -1287,7 +1574,8 @@ class Scheduler:
         if not fresh_below_wall:
             return
 
-        tracker.clear()
+        if not tracker.clear():
+            return
         await log_event(
             "quota_recovered",
             reset_at=status.reset_at.isoformat() if status.reset_at else None,
@@ -1303,11 +1591,7 @@ class Scheduler:
         # Catch-up heartbeat now — through the normal arbiter gate, so
         # a still-degraded environment (e.g. cost-rate TIGHT) can
         # still veto the actual turn.
-        await self._fire(job=SchedulerJob(
-            name="heartbeat",
-            prompt_file="heartbeat.md",
-            authority_profile="heartbeat",
-        ))
+        await self._fire_configured_heartbeat()
 
     async def _fire_quota_recovery(self) -> None:
         """One-shot wake body: re-run the heartbeat through the normal
@@ -1315,15 +1599,7 @@ class Scheduler:
         (emitting ``quota_recovered``) and fires if utilization allows —
         so this both clears the pause and resumes maintenance work."""
         await log_event("quota_recovery_wake_fired")
-        # Synthetic heartbeat job: reuses the heartbeat channel + prompt
-        # (prompt_file falls back to the default heartbeat prompt if the
-        # operator hasn't customized prompts/heartbeat.md).
-        job = SchedulerJob(
-            name="heartbeat",
-            prompt_file="heartbeat.md",
-            authority_profile="heartbeat",
-        )
-        await self._fire(job=job)
+        await self._fire_configured_heartbeat()
 
     def rearm_quota_recovery_on_start(self) -> None:
         """If a pause is recorded on disk, (re)arm the recovery wake.
@@ -1369,7 +1645,9 @@ class Scheduler:
         else:
             _build_trigger(job, self._tz)  # validate up front
         async with self._mutate_lock:
-            current = await asyncio.to_thread(load_jobs, self._yaml_path)
+            current, _rejections = await asyncio.to_thread(
+                load_jobs, self._yaml_path,
+            )
             current = [j for j in current if j.name != job.name]
             current.append(job)
             await asyncio.to_thread(write_jobs, self._yaml_path, current)
@@ -1378,7 +1656,9 @@ class Scheduler:
 
     async def remove_job(self, name: str) -> bool:
         async with self._mutate_lock:
-            current = await asyncio.to_thread(load_jobs, self._yaml_path)
+            current, _rejections = await asyncio.to_thread(
+                load_jobs, self._yaml_path,
+            )
             kept = [j for j in current if j.name != name]
             if len(kept) == len(current):
                 return False
@@ -1387,7 +1667,8 @@ class Scheduler:
         return True
 
     async def list_jobs(self) -> list[SchedulerJob]:
-        return await asyncio.to_thread(load_jobs, self._yaml_path)
+        jobs, _rejections = await asyncio.to_thread(load_jobs, self._yaml_path)
+        return jobs
 
     # ---- Named-callable registry -------------------------------------
 
@@ -1446,17 +1727,9 @@ class Scheduler:
     ) -> bool:
         """Resolve the effective cron for ``cdef`` and (re-)add the
         APScheduler job. Returns True if a job was installed."""
-        # Drop any existing APScheduler job under this id. This makes
-        # reload() idempotent — it can re-register without leaking
-        # the prior job.
-        try:
-            self._scheduler.remove_job(cdef.job_id)
-        except Exception:  # noqa: BLE001 — JobLookupError or other; both fine
-            pass
-
         if yaml_jobs is None:
             try:
-                yaml_jobs = load_jobs(self._yaml_path)
+                yaml_jobs, _rejections = load_jobs(self._yaml_path)
             except Exception:  # noqa: BLE001 — already logged inside load_jobs
                 yaml_jobs = []
 
@@ -1464,6 +1737,10 @@ class Scheduler:
             yaml_jobs, cdef.name, cdef.default_cron,
         )
         if not effective_cron:
+            try:
+                self._scheduler.remove_job(cdef.job_id)
+            except Exception:  # noqa: BLE001 — JobLookupError or other; both fine
+                pass
             log.info(
                 "callable %r: no effective cron (source=%s); "
                 "not installing",
@@ -1481,6 +1758,12 @@ class Scheduler:
                 f"callable {cdef.name!r} (source={source}): {exc}"
             ) from exc
 
+        # APScheduler keeps duplicate pending jobs before start(), so explicit
+        # replacement remains necessary. It must happen after trigger parsing.
+        try:
+            self._scheduler.remove_job(cdef.job_id)
+        except Exception:  # noqa: BLE001 — JobLookupError or other; both fine
+            pass
         self._scheduler.add_job(
             cdef.fn,
             trigger=trigger,
@@ -1528,7 +1811,7 @@ class Scheduler:
         ``_on_job_missed``.
         """
         self._pollers_dir = skills_dir
-        installed, invalid_events, invalid_cron_events = (
+        installed, invalid_events, invalid_entry_events, invalid_cron_events = (
             self._reinstall_pollers()
         )
         # Snapshot for the MCP reply (PR #141 review item #1+2).
@@ -1538,10 +1821,13 @@ class Scheduler:
         # ``reload_pollers`` (below) overrides with the live total
         # to handle the preserved case correctly.
         self._last_invalid_manifest_events = list(invalid_events)
-        self._dispatch_poller_reload_events(
+        self._dispatch_reload_events(
             "poller_reload_invalid_manifest", invalid_events,
         )
-        self._dispatch_poller_reload_events(
+        self._dispatch_reload_events(
+            "poller_reload_invalid_entry", invalid_entry_events,
+        )
+        self._dispatch_reload_events(
             "poller_reload_invalid_cron", invalid_cron_events,
         )
         return installed
@@ -1576,7 +1862,12 @@ class Scheduler:
             self._last_invalid_manifest_events = []
             return {"registered": 0, "replaced": 0, "removed": 0, "total": 0}
         async with self._mutate_lock:
-            _installed_fresh, invalid_events, invalid_cron_events = (
+            (
+                _installed_fresh,
+                invalid_events,
+                invalid_entry_events,
+                invalid_cron_events,
+            ) = (
                 await self._reinstall_pollers_async()
             )
             # PR #141 review item #2: ``_reinstall_pollers`` returns
@@ -1614,6 +1905,8 @@ class Scheduler:
         # concurrent reloads is intentionally non-deterministic.
         for payload in invalid_events:
             await log_event("poller_reload_invalid_manifest", **payload)
+        for payload in invalid_entry_events:
+            await log_event("poller_reload_invalid_entry", **payload)
         # chainlink #419: cron-invalid entries surface algedonically
         # too — same emission point + caveats as the manifest events.
         for payload in invalid_cron_events:
@@ -1627,19 +1920,29 @@ class Scheduler:
 
     def _reinstall_pollers(
         self,
-    ) -> tuple[int, list[dict[str, Any]], list[dict[str, Any]]]:
+    ) -> tuple[
+        int,
+        list[dict[str, Any]],
+        list[dict[str, Any]],
+        list[dict[str, Any]],
+    ]:
         """Wipe + re-discover + re-register (sync): discovery IO then
         apply. Used by the on-loop sync bootstrap ``add_poller_jobs``.
         Async callers use ``_reinstall_pollers_async`` so the scheduler
         mutations stay on the loop thread (chainlink #259 item 16)."""
         if self._pollers_dir is None:
-            return 0, [], []
-        discovered, invalid_manifests = self._discover_pollers_io()
-        return self._apply_reinstall(discovered, invalid_manifests)
+            return 0, [], [], []
+        discovered, invalid_manifests, invalid_entries = self._discover_pollers_io()
+        return self._apply_reinstall(discovered, invalid_manifests, invalid_entries)
 
     async def _reinstall_pollers_async(
         self,
-    ) -> tuple[int, list[dict[str, Any]], list[dict[str, Any]]]:
+    ) -> tuple[
+        int,
+        list[dict[str, Any]],
+        list[dict[str, Any]],
+        list[dict[str, Any]],
+    ]:
         """``_reinstall_pollers`` with filesystem discovery off the loop
         (``to_thread``) and the APScheduler / ``self._pollers`` mutations
         on the loop thread. AsyncIOScheduler's jobstore is only safe to
@@ -1647,15 +1950,19 @@ class Scheduler:
         ``asyncio.to_thread`` raced the scheduler's own on-loop job
         dispatch (chainlink #259 item 16)."""
         if self._pollers_dir is None:
-            return 0, [], []
-        discovered, invalid_manifests = await asyncio.to_thread(
+            return 0, [], [], []
+        discovered, invalid_manifests, invalid_entries = await asyncio.to_thread(
             self._discover_pollers_io,
         )
-        return self._apply_reinstall(discovered, invalid_manifests)
+        return self._apply_reinstall(discovered, invalid_manifests, invalid_entries)
 
     def _discover_pollers_io(
         self,
-    ) -> tuple[list[PollerConfig], list[tuple[Path, str]]]:
+    ) -> tuple[
+        list[PollerConfig],
+        list[tuple[Path, str]],
+        list[tuple[Path, str, str]],
+    ]:
         """Phase 1: filesystem discovery only. No APScheduler or
         ``self._pollers`` mutation, so it is safe to run in a worker
         thread. ``list(...)`` materializes the iterator so the caller
@@ -1670,11 +1977,13 @@ class Scheduler:
             if self._home is not None else None
         )
         invalid_manifests: list[tuple[Path, str]] = []
+        invalid_entries: list[tuple[Path, str, str]] = []
         discovered = list(
             discover_pollers(
                 self._pollers_dir,
                 state_root=state_root,
                 invalid_manifests=invalid_manifests,
+                invalid_entries=invalid_entries,
                 # Operator tuning surface (<home>/pollers-overrides.yaml):
                 # cron/priority/batch_size/... overrides that skill updates
                 # can never clobber. None when no home (tests/bench).
@@ -1684,27 +1993,33 @@ class Scheduler:
                 ),
             )
         )
-        return discovered, invalid_manifests
+        return discovered, invalid_manifests, invalid_entries
 
     def _apply_reinstall(
         self,
         discovered: list[PollerConfig],
         invalid_manifests: list[tuple[Path, str]],
-    ) -> tuple[int, list[dict[str, Any]]]:
+        invalid_entries: list[tuple[Path, str, str]],
+    ) -> tuple[
+        int,
+        list[dict[str, Any]],
+        list[dict[str, Any]],
+        list[dict[str, Any]],
+    ]:
         """Phases 2-3: drop stale jobs + register discovered pollers.
         Mutates APScheduler and ``self._pollers``, so it MUST run on the
         loop thread. ``discovered`` / ``invalid_manifests`` come from
         ``_discover_pollers_io`` (the only IO).
 
         Returns ``(installed_count, invalid_manifest_events,
-        invalid_cron_events)``. The second element is a list of event
+        invalid_entry_events, invalid_cron_events)``. The second element is a list of event
         payloads (one per ``pollers.json`` whose JSON parse failed this
         reload); the third one payload per entry whose cron failed to
         validate (chainlink #419). Callers in async contexts emit each
         as a ``poller_reload_invalid_manifest`` /
         ``poller_reload_invalid_cron`` algedonic event;
         ``add_poller_jobs`` (sync) routes through
-        ``_dispatch_poller_reload_events``.
+        ``_dispatch_reload_events``.
 
         **Per-entry pre-population, not end-of-loop swap (PR #107
         review fix).** A previous version of this function built a
@@ -1891,16 +2206,24 @@ class Scheduler:
                     preserved_names_by_path.get(path, []),
                 ),
             })
-        return installed, invalid_events, invalid_cron_events
+        invalid_entry_events = [
+            {
+                "manifest_path": str(path),
+                "poller": poller_name,
+                "reason": reason,
+            }
+            for path, poller_name, reason in invalid_entries
+        ]
+        return installed, invalid_events, invalid_entry_events, invalid_cron_events
 
-    def _dispatch_poller_reload_events(
+    def _dispatch_reload_events(
         self,
         event_type: str,
         events: list[dict[str, Any]],
     ) -> None:
-        """Emit ``poller_reload_invalid_manifest`` /
-        ``poller_reload_invalid_cron`` events from a sync context
-        (``add_poller_jobs``). When a running event loop is available
+        """Emit scheduler reload events from a synchronous mutation path.
+
+        When a running event loop is available
         (server.py startup is awaited init), schedule the async
         ``log_event`` via ``create_task``. Otherwise fall back to
         ``log.warning`` so the event isn't silently lost. Mirrors the
@@ -1921,21 +2244,22 @@ class Scheduler:
         for payload in events:
             self._spawn(
                 log_event(event_type, **payload),
-                name="scheduler-poller-reload-event",
+                name="scheduler-reload-event",
             )
 
 
-    def _poller_budget_exceeded(
+    def _poller_budget_status(
         self, poller: PollerConfig, *, now: datetime | None = None,
-    ) -> dict[str, Any] | None:
-        """Return suppression payload when ``poller`` is over budget.
+    ) -> tuple[dict[str, Any] | None, int | None]:
+        """Return suppression payload and remaining per-fire turn headroom.
 
         Budget checks are fail-open: missing home, missing logs, unknown windows,
         or unavailable cost samples do not suppress. Caps are inclusive: a poller
-        at its configured limit is suppressed before it can exceed it.
+        at its configured limit is suppressed before it can exceed it. Headroom
+        reserves accepted events within this fire before their turn records exist.
         """
         if poller.budget is None or self._home is None:
-            return None
+            return None, None
         try:
             usage = aggregate_poller_turn_usage(
                 self._home / "logs" / "turns.jsonl",
@@ -1945,9 +2269,7 @@ class Scheduler:
             ).get(poller.name)
         except Exception as exc:  # noqa: BLE001 - fail-open on accounting issues
             log.warning("poller budget check failed for %s: %s", poller.name, exc)
-            return None
-        if usage is None:
-            return None
+            return None, None
 
         cap_fields = (
             ("max_agent_turns", "agent_turns"),
@@ -1956,8 +2278,17 @@ class Scheduler:
             ("max_api_bytes", "api_bytes"),
             ("max_external_usd", "estimated_external_cost_usd"),
         )
+        turn_headroom: int | None = None
         for window_label, budget_window in sorted(poller.budget.windows.items()):
-            usage_window = usage.windows.get(window_label)
+            usage_window = usage.windows.get(window_label) if usage is not None else None
+            turn_limit = budget_window.max_agent_turns
+            if turn_limit is not None:
+                turns_used = usage_window.agent_turns if usage_window is not None else 0
+                remaining = max(0, turn_limit - turns_used)
+                turn_headroom = (
+                    remaining if turn_headroom is None
+                    else min(turn_headroom, remaining)
+                )
             if usage_window is None:
                 continue
             for cap_field, usage_field in cap_fields:
@@ -1980,10 +2311,34 @@ class Scheduler:
                         "used": round(float(used), 6),
                         "limit": limit,
                         "reason": reason,
-                    }
-        return None
+                    }, turn_headroom
+        return None, turn_headroom
 
-    async def _fire_poller(self, *, poller_name: str) -> None:
+    def _poller_budget_exceeded(
+        self, poller: PollerConfig, *, now: datetime | None = None,
+    ) -> dict[str, Any] | None:
+        """Return the persisted-usage suppression payload for ``poller``."""
+        return self._poller_budget_status(poller, now=now)[0]
+
+    async def _fire_poller(
+        self,
+        *,
+        poller_name: str,
+        source: str = "timed",
+        trigger_reason: str | None = None,
+    ) -> None:
+        """Serialize timed and completion-triggered fires for one poller."""
+        lock = self._poller_fire_locks.setdefault(poller_name, asyncio.Lock())
+        async with lock:
+            await log_event(
+                "poller_fire_started",
+                poller=poller_name,
+                source=source,
+                **({"trigger_reason": trigger_reason} if trigger_reason else {}),
+            )
+            await self._fire_poller_once(poller_name=poller_name)
+
+    async def _fire_poller_once(self, *, poller_name: str) -> None:
         """APScheduler-side cron callback. Looks up the live PollerConfig
         (re-fetched on each fire to reflect any reloads) and runs it
         under the global concurrency semaphore.
@@ -2086,16 +2441,201 @@ class Scheduler:
                     ),
                 )
                 return
-            budget_exceeded = await asyncio.to_thread(
-                self._poller_budget_exceeded, poller,
+            budget_exceeded, turn_headroom = await asyncio.to_thread(
+                self._poller_budget_status, poller,
             )
             if budget_exceeded is not None:
                 budget_exceeded["stage"] = "post_acquire"
                 await log_event("poller_budget_suppressed", **budget_exceeded)
                 return
-            await run_poller(poller, enqueue=self._enqueue, home=self._home)
+            accepted_this_fire = 0
+            headroom_logged = False
+
+            async def enqueue_with_turn_budget(
+                event: AgentEvent,
+                *,
+                relevance_check=None,
+            ) -> bool:
+                nonlocal accepted_this_fire, headroom_logged
+                if turn_headroom is not None and accepted_this_fire >= turn_headroom:
+                    if not headroom_logged:
+                        headroom_logged = True
+                        await log_event(
+                            "poller_budget_suppressed",
+                            poller=poller.name,
+                            metric="agent_turns",
+                            used_in_fire=accepted_this_fire,
+                            remaining_at_fire=turn_headroom,
+                            stage="event_enqueue",
+                            reason="poller_budget_exceeded:agent_turns:per_fire_headroom",
+                        )
+                    return False
+                if relevance_check is None:
+                    accepted = await self._enqueue(event)
+                else:
+                    accepted = await self._enqueue(
+                        event, relevance_check=relevance_check,
+                    )
+                if accepted:
+                    accepted_this_fire += 1
+                return accepted
+
+            await run_poller(
+                poller,
+                enqueue=enqueue_with_turn_budget,
+                home=self._home,
+                timeout=await self._effective_poller_timeout(poller),
+            )
         finally:
             self._poller_semaphore.release()
+
+    def trigger_poller(self, poller_name: str, *, reason: str) -> bool:
+        """Request a coalesced fire through the same gates as the cron path."""
+        if self._stopping:
+            return False
+        task = self._poller_trigger_tasks.get(poller_name)
+        coalesced = task is not None and not task.done()
+        if coalesced:
+            self._poller_trigger_dirty.add(poller_name)
+        else:
+            task = self._spawn(
+                self._run_triggered_poller(poller_name, reason=reason),
+                name=f"poller-trigger-{poller_name}",
+            )
+            self._poller_trigger_tasks[poller_name] = task
+            task.add_done_callback(
+                lambda completed, name=poller_name: self._poller_trigger_tasks.pop(name, None)
+                if self._poller_trigger_tasks.get(name) is completed
+                else None
+            )
+        self._spawn(
+            log_event(
+                "poller_fire_trigger_requested",
+                poller=poller_name,
+                reason=reason,
+                coalesced=coalesced,
+            ),
+            name=f"poller-trigger-observed-{poller_name}",
+        )
+        return not coalesced
+
+    async def _run_triggered_poller(self, poller_name: str, *, reason: str) -> None:
+        while True:
+            self._poller_trigger_dirty.discard(poller_name)
+            await self._fire_poller(
+                poller_name=poller_name,
+                source="triggered",
+                trigger_reason=reason,
+            )
+            # A pass never schedules itself. Only a signal received while it ran
+            # sets this flag and earns one coalesced follow-up pass.
+            if poller_name not in self._poller_trigger_dirty:
+                return
+
+    def _start_poller_trigger_listener(self) -> None:
+        if self._home is None or self._poller_trigger_fd is not None:
+            return
+        path = trigger_fifo_path(self._home)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            mode = path.lstat().st_mode
+            if not stat.S_ISFIFO(mode):
+                path.unlink()
+        except FileNotFoundError:
+            pass
+        try:
+            os.mkfifo(path, 0o600)
+        except FileExistsError:
+            pass
+        self._poller_trigger_fd = os.open(
+            path, os.O_RDWR | os.O_NONBLOCK | getattr(os, "O_NOFOLLOW", 0)
+        )
+        os.fchmod(self._poller_trigger_fd, 0o600)
+        asyncio.get_running_loop().add_reader(
+            self._poller_trigger_fd, self._read_poller_trigger_signals
+        )
+
+    def _read_poller_trigger_signals(self) -> None:
+        if self._poller_trigger_fd is None:
+            return
+        try:
+            chunk = os.read(self._poller_trigger_fd, 65536)
+        except BlockingIOError:
+            return
+        self._poller_trigger_buffer += chunk
+        lines = self._poller_trigger_buffer.split(b"\n")
+        self._poller_trigger_buffer = lines.pop()
+        for line in lines:
+            try:
+                payload = json.loads(line)
+                poller_name = payload["poller"]
+                reason = payload["reason"]
+                if not isinstance(poller_name, str) or not isinstance(reason, str):
+                    raise ValueError("trigger fields must be strings")
+            except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+                self._spawn(
+                    log_event("poller_fire_trigger_invalid"),
+                    name="poller-trigger-invalid",
+                )
+                continue
+            self.trigger_poller(poller_name, reason=reason)
+
+    def _poller_cadence_seconds(self, poller: PollerConfig) -> float | None:
+        """Lower bound on the gap between two of this poller's fires.
+
+        Derived from the cron *fields*, not by simulating fires. Simulation
+        cannot establish this bound: Gregorian recurrence is unbounded, so a
+        leap-day expression like ``0,2 0 29 2 *`` has its next pair of fires
+        years away, and any finite horizon that ends first yields no information
+        at all — which previously degraded to the full cap, exactly the unsafe
+        direction.
+
+        Reads the effective cron (post ``pollers-overrides.yaml``), so locally
+        installed and overridden pollers are covered.
+
+        The bound may be tighter than the true minimum when day/month fields
+        restrict which hours actually recur — e.g. ``0,59 0 * * *`` reports 60s
+        though its real gap is 59 minutes. That direction is safe: it clamps a
+        little harder than strictly necessary and never the reverse.
+
+        Returns None only when the expression cannot be parsed.
+        """
+        cache_key = (poller.name, poller.cron)
+        cached = self._poller_cadence_cache.get(cache_key)
+        if cached is not None:
+            return cached[0]
+        bound = _cron_min_gap_seconds(poller.cron)
+        self._poller_cadence_cache[cache_key] = (bound,)
+        return bound
+
+    async def _effective_poller_timeout(self, poller: PollerConfig) -> float:
+        """The framework cap, clamped below this poller's own fire interval.
+
+        Enforces the constraint at registration-time rather than trusting a test
+        over bundled manifests: ``max_instances=1`` means a run longer than the
+        cadence swallows the next fire, and the cadence is only knowable from the
+        effective config.
+        """
+        cadence = await asyncio.to_thread(self._poller_cadence_seconds, poller)
+        cap = float(POLLER_TIMEOUT_SECONDS)
+        if cadence is None:
+            # Unparseable cron: such a poller cannot register a trigger anyway,
+            # but if it somehow fires, assume the tightest schedule cron can
+            # express rather than handing it the full cap. An unknown cadence
+            # must degrade toward safety, not away from it.
+            return max(1.0, CRON_MIN_GRANULARITY_SECONDS - POLLER_CADENCE_MARGIN_SECONDS)
+        allowed = max(1.0, cadence - POLLER_CADENCE_MARGIN_SECONDS)
+        if allowed >= cap:
+            return cap
+        await log_event(
+            "poller_timeout_clamped_to_cadence",
+            poller=poller.name,
+            cron=poller.cron,
+            cadence_seconds=round(cadence, 3),
+            framework_cap_seconds=cap,
+            effective_timeout_seconds=round(allowed, 3),
+        )
+        return allowed
 
     def registered_pollers(self) -> list[str]:
         """Names of all currently-registered pollers. Used by the
@@ -2449,21 +2989,33 @@ class Scheduler:
             close_merged_chainlinks_for_home,
             prune_stale_attempt_checkouts_for_home,
             reap_stale_claims_for_home,
+            report_foreign_owned_git_objects_for_home,
         )
+        from .worklink.claims import ReapResult
+        from .worklink.identities import get_identities
 
         async def _fire() -> None:
-            def _reap() -> tuple[list[object], list[Path], list[object]]:
+            def _reap() -> tuple[ReapResult, list[Path], list[Path], list[object]]:
                 return (
                     reap_stale_claims_for_home(home),
+                    report_foreign_owned_git_objects_for_home(
+                        home, expected_uid=get_identities().mimir_uid
+                    )
+                    if os.environ.get("WORKLINK_REPO")
+                    or os.environ.get("MIMIR_WORKLINK_REPO")
+                    else [],
                     prune_stale_attempt_checkouts_for_home(home),
                     close_merged_chainlinks_for_home(home),
                 )
 
-            reaped, pruned_paths, closed_chainlinks = await asyncio.to_thread(_reap)
+            reap_result, _, pruned_paths, closed_chainlinks = await asyncio.to_thread(_reap)
             await log_event(
                 "worklink_claims_reaped",
-                count=len(reaped),
-                issue_ids=[record.issue_id for record in reaped],
+                count=len(reap_result.reaped),
+                issue_ids=[record.issue_id for record in reap_result.reaped],
+                examined=reap_result.examined,
+                skipped=reap_result.skipped,
+                skipped_issue_ids=reap_result.skipped_issue_ids,
             )
             if pruned_paths:
                 await log_event(
@@ -2734,17 +3286,17 @@ class Scheduler:
                     snooze_pileup_threshold=snooze_pileup_threshold,
                 )
                 # Rollup event — single line per sweep, not per record.
-                # Only emit when SOMETHING happened (due / expired /
-                # pileup) to keep events.jsonl from accruing one no-op
-                # record per poll tick.
-                if (result.due_emitted or result.expired_emitted
-                        or result.snooze_pileup_emitted):
+                # A non-empty sweep is observable even when every attempted
+                # lifecycle transition failed. Empty-store ticks stay silent.
+                if result.scanned > 0 or result.corrupt_lines > 0:
                     await log_event(
                         "commitments_due_check_ok",
                         due_emitted=result.due_emitted,
                         expired_emitted=result.expired_emitted,
                         snooze_pileup_emitted=result.snooze_pileup_emitted,
                         scanned=result.scanned,
+                        failed=result.failed,
+                        corrupt_lines=result.corrupt_lines,
                     )
             except Exception as exc:  # noqa: BLE001
                 await log_event(
@@ -3150,6 +3702,7 @@ class Scheduler:
         if not self._started:
             self._scheduler.start()
             self._started = True
+            self._start_poller_trigger_listener()
             self._start_loop_lag_monitor()
             # Re-arm a quota-recovery wake if we restarted mid-pause
             # (the in-memory wake is lost on restart; the pause file
@@ -3274,6 +3827,13 @@ class Scheduler:
             )
 
     async def stop(self) -> None:
+        self._stopping = True
+        if self._poller_trigger_fd is not None:
+            asyncio.get_running_loop().remove_reader(self._poller_trigger_fd)
+            os.close(self._poller_trigger_fd)
+            self._poller_trigger_fd = None
+            if self._home is not None:
+                trigger_fifo_path(self._home).unlink(missing_ok=True)
         if self._loop_lag_task is not None:
             self._loop_lag_task.cancel()
             self._loop_lag_task = None

@@ -6,11 +6,36 @@ in-process workspace dep (v0.5 §2), so there's no sidecar to supervise.
 ## Build
 
 ```sh
-docker build -t mimir:latest .
+# Set this to the fully qualified remote branch, tag, or pull ref that contains HEAD.
+MIMIR_GIT_REF=refs/heads/main
+MIMIR_COMMIT=$(git rev-parse HEAD)
+test -z "$(git status --porcelain=v1)"
+test "$(git ls-remote origin "$MIMIR_GIT_REF" | awk 'NR == 1 {print $1}')" = "$MIMIR_COMMIT"
+docker build \
+  --build-arg MIMIR_GIT_REF="$MIMIR_GIT_REF" \
+  --build-arg MIMIR_CONTROLLER_COMMIT="$MIMIR_COMMIT" \
+  --build-arg MIMIR_EXECUTOR_COMMIT="$MIMIR_COMMIT" \
+  -t mimir:latest .
 ```
 
 The root-owned Worklink executor is installed into the image under
 `/opt/mimir-worklink`; it is not updated by a bind-mounted controller checkout.
+Its source is cloned from `MIMIR_GIT_URL` (the upstream repository by default)
+and fetched from the required, fully qualified `MIMIR_GIT_REF`. The build requires
+the fetched commit to equal the full `MIMIR_EXECUTOR_COMMIT` SHA, so the ref makes
+GitHub pull-request merge commits reachable without becoming the source identity.
+This supports commits on unreleased branches without accepting mutable
+working-directory contents. `MIMIR_CONTROLLER_COMMIT` must be the same full SHA;
+an argument-less build or any mismatch fails with a named diagnostic. The SHA is retained in the OCI revision label and in
+`/opt/mimir-worklink/executor-source-commit`; `/health` reports it as
+`worklink_executor_source_commit`.
+
+Deployment wrappers must derive the controller SHA from the immutable source
+they deploy, not accept an operator's unverified description of a mutable
+checkout. In particular, do not use a local directory as a BuildKit additional
+context for `/opt/mimir-worklink`. Pin a Git context by full SHA and pass that
+same resolved SHA as both commit arguments. A dirty-tree executor build is not
+supported.
 After any change to `mimir/worklink/worker_exec.py` or its protocol, rebuild the
 image and recreate/restart the container. The `/health` endpoint reports a stale
 executor identity until the rebuilt image and root executor are running.

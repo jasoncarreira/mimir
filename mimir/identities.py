@@ -186,6 +186,9 @@ class IdentityResolver:
         self._channel_alias_map: dict[str, str] = {}  # alias → canonical
         self._channel_display_names: dict[str, str] = {}
         self._channels: dict[str, Channel] = {}
+        # Credential loss or an unreadable credential source must not restore
+        # the unauthenticated first-run mode.
+        self._web_gate_latched = False
 
     @staticmethod
     def _parse_access(raw: object, canonical: str) -> AccessMetadata:
@@ -253,23 +256,24 @@ class IdentityResolver:
     def reload(self) -> int:
         """Re-read the YAML file. Returns the number of aliases loaded.
 
-        Missing file → resolver is empty (not an error). Unparseable YAML
-        → logs a warning and leaves the existing state in place (better to
-        keep working with a stale-but-valid map than to nuke it).
+        A missing, unreadable, or unparseable file logs a warning and leaves
+        existing state in place (better to keep working with a stale-but-valid
+        map than to nuke it). A missing file on the initial load remains an
+        empty resolver for first-run deployments.
         """
         if not self._yaml_path.is_file():
-            self._alias_map = {}
-            self._display_names = {}
-            self._identities = {}
-            self._channel_alias_map = {}
-            self._channel_display_names = {}
-            self._channels = {}
-            return 0
+            if self._alias_map or self._identities or self._channels:
+                log.warning(
+                    "identities.yaml is missing — keeping prior state to prevent "
+                    "the web auth gate from opening"
+                )
+            return len(self._alias_map)
 
         try:
             text = self._yaml_path.read_text(encoding="utf-8")
         except OSError as exc:
             log.warning("identities.yaml read failed: %s — keeping prior state", exc)
+            self._web_gate_latched = True
             return len(self._alias_map)
 
         try:
@@ -278,6 +282,7 @@ class IdentityResolver:
             log.warning(
                 "identities.yaml parse failed: %s — keeping prior state", exc
             )
+            self._web_gate_latched = True
             return len(self._alias_map)
 
         people = doc.get("people") if isinstance(doc, dict) else None
@@ -511,12 +516,22 @@ class IdentityResolver:
         # refactor for a race that hasn't bitten yet. Recording the
         # known residual risk here so the next reviewer doesn't
         # re-derive it from scratch.
+        previously_had_web_keys = self.has_web_keys()
         self._alias_map = alias_map
         self._display_names = display_names
         self._identities = identities
         self._channel_alias_map = channel_alias_map
         self._channel_display_names = channel_display_names
         self._channels = channels
+        has_web_keys = any(
+            alias.startswith(WEB_KEY_ALIAS_PREFIX) for alias in alias_map
+        )
+        if previously_had_web_keys and not has_web_keys:
+            log.warning(
+                "identities.yaml reload removed every web key — keeping the web "
+                "auth gate closed"
+            )
+        self._web_gate_latched = self._web_gate_latched or has_web_keys
         return len(self._alias_map)
 
     def resolve(self, author: str | None) -> str | None:
@@ -563,6 +578,10 @@ class IdentityResolver:
         master key is unset — so adding users can't leave the server
         unintentionally wide open."""
         return any(alias.startswith(WEB_KEY_ALIAS_PREFIX) for alias in self._alias_map)
+
+    def web_gate_latched(self) -> bool:
+        """Whether credential state requires the web gate to remain closed."""
+        return self._web_gate_latched
 
     def resolve_web_key(self, raw_key: str | None) -> Identity | None:
         """Resolve a raw web API key to its identity record, or ``None``.

@@ -276,7 +276,7 @@ obtain this reduction.
 | **Operator / user turn** | full (subject to admin tier) | operator's typed input is trusted; untrusted content read mid-turn is tainted → can't drive Unbounded sinks without one-use approval |
 | **GitHub poller** | `worklink_run` (isolated checkout + reviewed PR), scoped file/edit, read-only shell, `send_message` | **known contributor** (collaborator / org member) → trusted → full code-work; **unknown author, or any comment by a non-contributor** → untrusted → **notify the operator only**, no autonomous action (operator then directs the agent) |
 | **Research / RSS poller** | write memory (create atom + feedback/credit), scoped state file, scoped wiki, `send_message` — **no `fetch_url`, no `spawn`** | ingested web content is untrusted, but the capability set contains **no Unbounded sink**, so it is safe regardless — no per-author gating needed |
-| **Heartbeat** | near-full incl. `fetch_url` from an **approved exact-URL set** and `web_search` through its fixed service | internally triggered → trusted. Destination-safe egress is taint-independent, but fetched content is always untrusted active ingest. Non-approved destinations are blocked; redirects are re-checked per hop; allowlist = exact URLs, not host wildcards (§5.4). |
+| **Heartbeat** | near-full incl. `fetch_url` from an **approved URL set** and `web_search` through its fixed service | internally triggered → trusted. Exact/fixed destination egress is taint-independent, but fetched content is always untrusted active ingest. Scope-only fetches require a clean turn; non-approved destinations are blocked; redirects are re-checked per hop (§5.4). |
 | **Session-boundary turn** | session-boundary writes | internal → trusted |
 | **(future) JIRA poller** | write chainlinks, update docs (scoped), write memory | **trusted** — we trust the pointed-at JIRA instance's admins to gate content (operator decision); declared like any other trigger |
 
@@ -543,12 +543,21 @@ some request field looks like a payload:
 - **Destination-safe egress is taint-independent.** `fetch_url` carries no
   model-controlled data out: the destination must match an exact approved URL,
   the request is GET-only, there is no model-supplied body or arbitrary header,
-  and every redirect hop is re-checked against the same allowlist. `web_search`
-  reaches one fixed, operator-pre-approved search service; approving that tool
-  includes accepting that its query is visible to that trusted provider. These
-  tools remain usable after untrusted active ingest. The choice/order/timing of
+  and every redirect hop is re-checked against the same allowlist. `web_search` is
+  a deliberate, distinct exception: its model-composed query is an accepted
+  outbound channel because it reaches only one operator-fixed trusted service.
+  Its results remain untrusted active ingest, which taints its own turn; gating
+  the query would therefore cap every research turn at one search, so gating is
+  not an available option. The `fetch_url` trailing-`/*` mitigation does not
+  transfer: search has no model-chosen destination to narrow to an exact URL,
+  only a model-chosen query to the fixed endpoint. This acceptance, like the
+  trusted-operator `shell_exec` allowance in `access_control.py`, is limited to
+  the current single-operator posture. It is unsafe under untrusted multi-user
+  chat, where an attacker could induce a tainted turn to encode data into a
+  query. Search result labelling is unchanged: trusting the service transport
+  does not trust the third-party content it returns. The choice/order/timing of
   approved fetches is a low-bandwidth invocation-pattern channel that this
-  single-operator threat model explicitly accepts.
+  single-operator threat model also explicitly accepts.
 - **Audience-bearing egress stays behind the turn-taint gate.** `webhook` and
   `http_request` can send a free-form model body to an approved URL that may be
   a human or multi-party audience, so exact destination approval is necessary
@@ -561,8 +570,9 @@ reads trusted and untrusted content together and emits new strings. For the
 remaining audience-bearing sinks, conservatively use the turn's integrity
 state: a model-composed body/args is allowed only before any untrusted
 active-ingest source, otherwise blocked or one-use declassified. This does not
-apply to `fetch_url` or `web_search`; their destination controls are the
-security boundary.
+apply to exact/session-approved `fetch_url` destinations. It also does not apply
+to `web_search` under the explicit fixed-service, single-operator decision above;
+that exception accepts the query channel rather than claiming it does not exist.
 
 #### Operator-owned MCP trust posture
 
@@ -618,23 +628,24 @@ The taint continues to gate *code/shell/action* sinks in all cases. By trigger:
 - **GitHub / research pollers:** no `fetch_url` capability at all (they fetch via
   their own subprocess; the capability is simply not in their set).
 - **Heartbeat:** `fetch_url` allowed against an **operator-approved allowlist**.
-  The exact URL is both reachability authorization and the operator's trust signal
+  An exact URL is both reachability authorization and the operator's trust signal
   for the response bytes. The framework-written cache sidecar binds a subsequent
   file read to that URL; content without this evidence stays untrusted active
-  ingest. The heartbeat fetches its approved URLs freely.
-  - **The allowlist must be exact URLs / fixed templates, not host wildcards.**
-    Otherwise untrusted fetched content could steer the agent to a *new*
-    data-carrying URL on an approved host (`https://approved/?leak=<secret>`) and
-    exfil via that host's logs/reflection — "approved to fetch from" ≠ "safe to
-    send arbitrary data to." Exact URLs make taint-independent egress
-    unconditionally safe; a genuinely-needed wildcard host would additionally
-    require the request to carry no turn-derived data.
+  ingest. The heartbeat fetches exact approved URLs freely; scope-only URLs require
+  a clean turn.
+  - **Only exact URLs / fixed templates are taint-independent.** A trailing `/*`
+    scope grants reachability on clean turns, but falls through to the turn-taint
+    gate after untrusted active ingest. Otherwise fetched content could steer the
+    agent to a new data-carrying path or query on an approved host
+    (`https://approved/leak/<secret>` or `https://approved/?leak=<secret>`) and
+    exfil via that host's logs/reflection — "approved to fetch from" != "safe to
+    send arbitrary data to."
 - **User / operator turns:** **ask-on-first-use per exact URL** — the agent asks
   the first time it wants a destination, the operator approves it (adding that
   **exact URL** to the session allowlist), then it's remembered for that scope. A
-  later different path/query on the same host is a fresh ask. Exact-URL throughout
-  (fetch, redirects, ask-on-first-use) — **no host wildcards anywhere**; not a
-  blanket standing grant, and not an ask on every call.
+  later different path/query on the same host is a fresh ask. Session approvals
+  remain exact; operator-configured `/*` scopes are standing reachability grants
+  only while the turn carries no untrusted active ingest.
 
 **Two layers, split by scope** (mimir finding + re-review). `fetch_url` is not the
 only way data leaves the box — **spawned agents and poller subprocesses have their
@@ -750,9 +761,9 @@ and keep it descriptive, not pleading. Useful content:
   ingested this turn (trigger content plus live tool reads/fetches) gates code
   execution, unbounded/audience egress, and model-emitted egress payloads;
   auto-recall is informational and never gates.*
-- `fetch_url` and `web_search` are destination-safe and taint-independent (exact
-  approved URL / fixed pre-approved search service), so they remain usable
-  regardless of turn taint and do not need to be sequenced before untrusted ingest.
+- Exact/session-approved `fetch_url` destinations and `web_search`'s fixed service
+  are destination-safe and remain usable regardless of turn taint. A `fetch_url`
+  destination admitted only by a trailing `/*` scope requires a clean turn.
 - `webhook`, `http_request`, and external-MCP arguments are turn-taint gated.
   Prefer config/server-derived payloads; if a model-emitted payload is needed,
   send it before ingesting untrusted content this turn. MCP posture is per tool:
@@ -808,9 +819,10 @@ generic gate; there is no `send_message`-specific exception.
   is adopted: the confused-deputy case is closed **now**, single-operator
   included.
 - **Network egress → §5.4**: the line is **destination reachability**.
-  `fetch_url` (exact-URL allowlist + per-hop redirect re-check) and `web_search`
-  (fixed pre-approved provider) are taint-independent; the low-bandwidth fetch
-  invocation-pattern channel and search-provider query logs are accepted residuals.
+  `fetch_url` exact/session approvals and fixed templates (plus per-hop redirect
+  re-check) and `web_search`'s fixed provider are taint-independent; scope-only
+  fetch destinations require a clean turn. The low-bandwidth fetch invocation-
+  pattern channel and search-provider query logs are accepted residuals.
   Audience-bearing `webhook` / `http_request` bodies remain turn-taint gated, and
   external MCP stays fail-closed pending per-server/tool trust posture. User turns
   **ask-on-first-use per exact fetch URL** (no host wildcards). Child-process /
@@ -1033,10 +1045,11 @@ The remaining chainlinks are also **closed**:
 4. **Provenance schema + informational recall** (§5.3): `integrity`/`origin_trigger`/
    `origin_ref` immutable columns; render provenance on recall (grouped by trust)
    **without** tainting; enforcement taint from active ingests only.
-5. **Application network-egress boundary** (§5.4): destination allowlist of
-   **exact URLs** (no host wildcards anywhere — fetch, redirects, ask); `fetch_url`
-   is taint-independent with **per-hop redirect checks**; `web_search` is likewise
-   taint-independent through its fixed pre-approved service. Audience-bearing
+5. **Application network-egress boundary** (§5.4): destination allowlist of exact
+   URLs plus explicit trailing `/*` scopes. `fetch_url` is taint-independent only
+   for exact/session-approved destinations and fixed templates, with **per-hop
+   redirect checks**; scope-only destinations require a clean turn. `web_search`
+   is taint-independent through its fixed pre-approved service. Audience-bearing
    `webhook` / `http_request` payloads remain integrity-gated; external MCP remains
    fail-closed pending per-tool posture. User fetches **ask-on-first-use per exact
    URL**. Child-process / task-level network confinement is **deferred** with the

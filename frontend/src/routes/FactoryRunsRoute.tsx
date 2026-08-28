@@ -169,8 +169,8 @@ export function RunDetail({ runId }: { runId: string }) {
 
       <Panel title="Validator">
         {run.validator
-          ? <OpaqueContext value={run.validator} />
-          : <p className="app-copy">No validator context reported.</p>}
+          ? <Badge tone={run.validator === "NO-GO" ? "danger" : run.validator === "GO-WITH-NITS" ? "warning" : "success"}>{run.validator}</Badge>
+          : <p className="app-copy">No validator verdict reported.</p>}
       </Panel>
 
       <Panel title="Terminal context">

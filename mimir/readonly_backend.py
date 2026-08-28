@@ -1009,10 +1009,12 @@ class _BoundedFilesystemBackend(FilesystemBackend):
             if non_admin_read_filter_enabled() and not is_mimir_home_root(search_path):
                 reason = protected_read_result_reason(search_path)
                 if reason is not None:
-                    from .read_policy import emit_hard_read_denial
+                    from .read_policy import emit_hard_read_denial, record_read_policy_refusal
 
                     emit_hard_read_denial("glob", str(search_path), reason)
-                    return GlobResult(error=_read_denied_message(reason), matches=[])
+                    message = _read_denied_message(reason)
+                    record_read_policy_refusal(message)
+                    return GlobResult(error=message, matches=[])
             if not search_path.exists():
                 return GlobResult(matches=[])
         except (OSError, RuntimeError) as e:
@@ -1150,15 +1152,19 @@ class _BoundedFilesystemBackend(FilesystemBackend):
                     else protected_read_result_reason(requested)
                 )
             except (OSError, RuntimeError, ValueError):
-                from .read_policy import emit_hard_read_denial
+                from .read_policy import emit_hard_read_denial, record_read_policy_refusal
 
                 emit_hard_read_denial("ls", path, "unresolved_read_target")
-                return LsResult(error="Read denied: unresolved path")
+                message = "Read denied: unresolved path"
+                record_read_policy_refusal(message)
+                return LsResult(error=message)
             if reason is not None:
-                from .read_policy import emit_hard_read_denial
+                from .read_policy import emit_hard_read_denial, record_read_policy_refusal
 
                 emit_hard_read_denial("ls", str(requested), reason)
-                return LsResult(error=_read_denied_message(reason))
+                message = _read_denied_message(reason)
+                record_read_policy_refusal(message)
+                return LsResult(error=message)
 
         result = super().ls(path)
         entries = result.entries or []
@@ -1271,15 +1277,19 @@ class _RootAwareFilesystemBackend(_BoundedFilesystemBackend):
                 resolved = self._resolve_path(file_path)
                 reason = protected_read_result_reason(resolved)
                 if reason is not None:
-                    from .read_policy import emit_hard_read_denial
+                    from .read_policy import emit_hard_read_denial, record_read_policy_refusal
 
                     emit_hard_read_denial("read_file", str(resolved), reason)
-                    return ReadResult(error=self._read_denied_message(reason))
+                    message = self._read_denied_message(reason)
+                    record_read_policy_refusal(message)
+                    return ReadResult(error=message)
             except (OSError, RuntimeError, ValueError):
-                from .read_policy import emit_hard_read_denial
+                from .read_policy import emit_hard_read_denial, record_read_policy_refusal
 
                 emit_hard_read_denial("read_file", file_path, "unresolved_read_target")
-                return ReadResult(error="Read denied: unresolved path")
+                message = "Read denied: unresolved path"
+                record_read_policy_refusal(message)
+                return ReadResult(error=message)
         try:
             result = super().read(file_path, offset, limit)
         except ValueError as e:
@@ -1298,15 +1308,19 @@ class _RootAwareFilesystemBackend(_BoundedFilesystemBackend):
                 resolved = self._resolve_path(file_path)
                 reason = protected_read_result_reason(resolved)
                 if reason is not None:
-                    from .read_policy import emit_hard_read_denial
+                    from .read_policy import emit_hard_read_denial, record_read_policy_refusal
 
                     emit_hard_read_denial("read_file", str(resolved), reason)
-                    return ReadResult(error=self._read_denied_message(reason))
+                    message = self._read_denied_message(reason)
+                    record_read_policy_refusal(message)
+                    return ReadResult(error=message)
             except (OSError, RuntimeError, ValueError):
-                from .read_policy import emit_hard_read_denial
+                from .read_policy import emit_hard_read_denial, record_read_policy_refusal
 
                 emit_hard_read_denial("read_file", file_path, "unresolved_read_target")
-                return ReadResult(error="Read denied: unresolved path")
+                message = "Read denied: unresolved path"
+                record_read_policy_refusal(message)
+                return ReadResult(error=message)
         result = await super().aread(file_path, offset, limit)
         if result.error is None:
             self._publish_read_provenance(file_path)
@@ -1319,7 +1333,11 @@ class _RootAwareFilesystemBackend(_BoundedFilesystemBackend):
     def _publish_read_paths(self, file_paths: list[str]) -> None:
         """Publish every exact resource in a successful backend collection result."""
         from ._context import get_current_turn
-        from .access_control import protected_result_source, publish_protected_result
+        from .access_control import (
+            invalidate_protected_result_capture,
+            protected_result_source,
+            publish_protected_result,
+        )
 
         turn = get_current_turn()
         auth_context = getattr(turn, "auth_context", None)
@@ -1328,6 +1346,7 @@ class _RootAwareFilesystemBackend(_BoundedFilesystemBackend):
             try:
                 resolved_paths.append(str(self._resolve_path(file_path).resolve(strict=True)))
             except (OSError, RuntimeError, ValueError):
+                invalidate_protected_result_capture()
                 return
         publish_protected_result(tuple(
             protected_result_source(

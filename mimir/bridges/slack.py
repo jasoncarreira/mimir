@@ -420,6 +420,10 @@ class SlackBridge(Bridge):
                     "SlackBridge supervisor: handler.start_async() "
                     "returned cleanly; exiting"
                 )
+                await _safe_log_event(
+                    "slack_bridge_exited",
+                    reason="handler.start_async() returned cleanly",
+                )
                 return
             except asyncio.CancelledError:
                 raise

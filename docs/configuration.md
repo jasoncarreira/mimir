@@ -213,7 +213,8 @@ All channel-list flags take a comma-separated prefix allow-list (e.g.
 | `MIMIR_AGENT_ID` | str | `mimir` | Logical agent name tagged on every turn/event (multi-agent disambiguation). |
 | `MIMIR_GIT_TRACKING_ENABLED` | bool | `true` | Post-turn git commit + debounced push of the home. Disable for CI/transient containers. |
 | `MIMIR_STATE_REPO` | str | unset | Remote repo URL for home git bootstrap. Paired with `GITHUB_TOKEN`. |
-| `MIMIR_SOURCE_REPO` | path | `/workspace/mimir` | Source checkout for the pre-push staleness gate; skipped if not a dir. |
+| `MIMIR_SOURCE_REPO` | path | unset | Repository branches are pushed from, where the pre-push staleness hook is installed. Distinct from `MIMIR_SOURCE_DIR`; skipped if not a dir. |
+| `MIMIR_REACT_APP_DIST` | path | packaged `mimir/react_app/dist` | Live Vite build output to serve instead of the frontend packaged beside `web_ui.py`. |
 | `MIMIR_PYPI_PACKAGE_NAME` | str | `mimir-agent` | Distribution name for update-on-start + daily version check (forks/pre-release). |
 | `MIMIR_DEFAULTS_UPGRADE_AUTO_SUBMIT_CLEAN` | bool | `false` | Auto-submit a conflict-free defaults-upgrade proposal PR immediately. |
 | `MIMIR_PROMPTS_DIR` | path | unset | Operator prompt-override directory. |
@@ -241,7 +242,7 @@ authenticate transport only; they do not create a named requester.
 | Flag | Type | Default | Description |
 |---|---|---|---|
 | `MIMIR_ACCESS_CONTROL_ENFORCED` | bool | `false` | Enforce the allow/deny policy (reject unknown/non-allowlisted authors); also gates the admin-sensitive tool path. Compatible with the default `MIMIR_MODEL_SPEC`. Claude Code subprocess hooks receive the exact per-invocation authorization context through a server-owned carrier, so `claude-code:*` is also enforcement-compatible. |
-| `MIMIR_EGRESS_APPROVED_URLS` | URL or JSON array | `""` | URLs approved for application network egress. A URL without a wildcard is exact. Use an explicit trailing `/*` to approve a host (`https://arxiv.org/*`) or a path prefix (`https://arxiv.org/abs/*`). Scheme and host are matched exactly and path prefixes match only at the `/` segment boundary. Configure multiple entries as a JSON array, for example `["https://hooks.example/a", "https://arxiv.org/abs/*"]`; comma-separated URL lists are not supported. |
+| `MIMIR_EGRESS_APPROVED_URLS` | URL or JSON array | `""` | URLs approved for application network egress. A URL without a wildcard is exact. Use an explicit trailing `/*` to approve a path prefix such as `https://arxiv.org/abs/*`; scheme and host are matched exactly and path prefixes match only at the `/` segment boundary. Exact/session-approved `fetch_url` destinations remain available after untrusted active ingest, while scope-only destinations are turn-taint gated because their path and query suffixes are model-selected. Configure multiple entries as a JSON array, for example `["https://hooks.example/a", "https://arxiv.org/abs/*"]`; comma-separated URL lists are not supported. |
 | `MIMIR_HEARTBEAT_APPROVED_URLS` | URL or JSON array | `""` | URLs the heartbeat service may fetch, using the same exact URL and explicit trailing `/*` scope forms as `MIMIR_EGRESS_APPROVED_URLS`. Configure multiple entries as a JSON array; comma-separated URL lists are not supported. |
 | `MIMIR_PROJECT_TEST_COMMAND` | JSON object | unset | Operator-owned project test invocation for trusted-service turns: `{"argv":["/absolute/root-owned/test-runner","fixed","arguments"],"cwd":"/configured/project/root"}`. The executable must be an absolute, executable, non-symlink file outside service-writable roots; `cwd` must be within `MIMIR_FILE_TOOL_ROOTS`. The model may append only bounded relative test paths/selectors, never options or a different command. Interpreter commands are rejected. Unset preserves the ordinary shell-profile refusals. |
 | `MIMIR_CROSS_PLATFORM_PULL` | bool | `true` | Cross-platform recent-context pull. `false` stops canonical cross-platform history matching, but does not isolate authorization roles: aliases still share their canonical identity's access metadata. |
@@ -310,7 +311,7 @@ repository files and model-generated values never add permission entries.
 | Flag | Type | Default | Description |
 |---|---|---|---|
 | `GITHUB_REPOS` | csv `owner/repository` | unset | Legacy projection of `repositories.yaml` `repositories[].slug`. When the repository inventory is declared, an omitted value is derived and a disagreeing value is a startup error. Without the inventory, it retains the legacy repository allowlist behavior. |
-| `MIMIR_WORKLINK_REPO` | str | unset | Repo autonomous Worklink dispatch works in (back-compat alias of `WORKLINK_REPO`, which wins). |
+| `MIMIR_WORKLINK_REPO` | str | unset | Dedicated base repository Worklink branches from (back-compat alias of `WORKLINK_REPO`, which wins). Never inferred from cwd or the Mimir installation. |
 | `MIMIR_WORKLINK_AGENT_ID` | str | process-generated | Internal process-scoped owner inherited by detached Worklink controllers; the server sets this automatically. |
 | `MIMIR_WORKLINK_REAPER_CRON` | cron | `""` (off) | Stale-claim TTL reaper cron; empty registers no job (non-Worklink homes). |
 | `MIMIR_SCRATCH_JANITOR_CRON` | cron | `13 4 * * *` (on) | Daily scratch-retention sweep of the home's ephemeral roots; empty disables. |
@@ -318,19 +319,20 @@ repository files and model-generated values never add permission entries.
 | `MIMIR_SCRATCH_JANITOR_ROOTS` | list | `scratch` | Comma-separated home-relative roots to sweep (nested paths allowed, e.g. `state/worklink/transcripts`); absolute or `..` entries are rejected. |
 | `MIMIR_CHAINLINK_AUTOINIT` | bool | `1` (on) | Auto-run `chainlink init` on boot if `.chainlink` absent and the CLI is present. |
 | `MIMIR_FACTORY_EPICS_ENABLED` | bool | off | Feature-factory epic dispatch in the chainlink-orchestrator poller (`worklink:epic`). |
-| `MIMIR_FACTORY_ENTRYPOINT` | absolute path | `/opt/mimir-opencode/lib/node_modules/feature-factory/bin/factory.js` | Package-bound feature-factory 0.7.2 launcher. Worklink rejects relative, missing, unpinned, or adapter-version-mismatched entrypoints. |
+| `MIMIR_FACTORY_ENTRYPOINT` | absolute path | `/opt/mimir-opencode/lib/node_modules/feature-factory/bin/factory.js` | Package-bound feature-factory 0.8.0 launcher. Worklink rejects relative, missing, unpinned, or adapter-version-mismatched entrypoints. |
 | `MIMIR_FACTORY_MAX_CONCURRENT` | positive int | `1` | Factory-only concurrent Chainlink claim cap. The ordinary leaf cap remains `defaults.max_concurrent` with default `2`. |
 | `MIMIR_FACTORY_MAX_RETRIES` | ASCII decimal integer | `5` | Factory `/feature` retry budget. Accepts exactly ASCII `[0-9]+` valued from `1` through `9007199254740991`; absent or invalid values fall back to `5`. |
 | `MIMIR_FACTORY_RUN_TIMEOUT_S` | float | `43200` (12h) | OpenCode process liveness backstop. Expiry cancels only the verified process group. |
 | `MIMIR_FACTORY_STALE_HEARTBEAT_S` | float | `900` (15m) | Diagnostic threshold for stale factory lock observations. It never authorizes dispatch, lock stealing, cancellation, or deletion. |
-| `MIMIR_SOURCE_DIR` | path | unset | Override for locating the source checkout in the chainlink-orchestrator poller. |
+| `MIMIR_WORK_ITEM_JSON` | JSON object | unset | Internal factory-dispatch payload set by Worklink for a claimed Chainlink epic. The repository resolver emits it unchanged and skips GitHub issue lookup; operators should not set it for direct local runs. |
+| `MIMIR_SOURCE_DIR` | path | unset | Editable controller source checkout, used by pollers and by Worklink's base-overlap refusal. Leave unset for a PyPI install with no source checkout. |
 | `MIMIR_WORKLINK_MAX_STDOUT_BYTES` | positive int | `67108864` (64 MiB) | Maximum stdout retained from a Worklink backend subprocess. Invalid or non-positive values use the default; exceeding the cap terminates the subprocess. |
 | `MIMIR_WORKLINK_MAX_STDERR_BYTES` | positive int | `16777216` (16 MiB) | Maximum stderr retained from a Worklink backend subprocess. Invalid or non-positive values use the default; exceeding the cap terminates the subprocess. |
 
 The factory launch ends with `--command feature " --autonomous --max-retries 5
 <issue>"`. `MIMIR_FACTORY_MAX_RETRIES` defaults to `5`, accepts exactly ASCII
 `[0-9]+` in range `1..9007199254740991`, and falls back to `5` for absent or
-invalid values. feature-factory 0.7.2 stages the workflow inside the run
+invalid values. feature-factory 0.7.5 stages the workflow inside the run
 directory; exact token `--auto` is never passed. Worklink's base selects the
 checkout start point and PR target; it is not factory `--base`, which is never
 passed.
@@ -341,17 +343,28 @@ launch, Worklink reads the effective checkout `git config --get user.name` and
 `GIT_AUTHOR_NAME`, `GIT_AUTHOR_EMAIL`, `GIT_COMMITTER_NAME`, and
 `GIT_COMMITTER_EMAIL`; Worklink never writes sandbox Git identity configuration.
 
-Worklink reads the nonblank `publishing_identity` only from the trusted
-controller checkout's `.factory.json`. For GitHub publication Worklink
+Worklink reads the nonblank `publishing_identity` from
+`MIMIR_FACTORY_PUBLISHING_IDENTITY` when that variable is set, otherwise from
+the trusted controller checkout's `.factory.json`. A set but blank or non-string
+override fails instead of falling back. For GitHub publication Worklink
 verifies the credential this process is already bound to, `GITHUB_TOKEN`, rather
 than selecting among candidates: `GH_TOKEN` is a child-only alias for `gh`, and
 verifying a second credential in a process that already verified one is refused
 by the forge identity memo before `/user` is ever reached. That token's owner is
-compared against the declared identity before dispatch, then both child aliases
+compared against the selected identity before dispatch, then both child aliases
 are normalized to it. `GH_TOKEN` and `GITHUB_TOKEN` set to different values fail
 dispatch as an operator ambiguity rather than one being preferred, and a missing
 `GITHUB_TOKEN` fails naming that variable - in both cases without disclosing
 values.
+
+`MIMIR_FACTORY_PUBLISHING_IDENTITY` and `FACTORY_PUBLISHING_IDENTITY` are two
+different variables with two different consumers, and a mimirbot-shaped deployment
+needs both. The first is read by the CONTROLLER for its pre-dispatch verification.
+  The second is inherited by the FACTORY CHILD (feature-factory 0.8.0+) and is what
+the driver compares against `gh api /user`. Setting only the controller variable
+lets the pre-flight pass and the run then park at Gate 1 naming the file's
+identity, which reads as a misconfiguration rather than a variable the child never
+received.
 
 ## Worklink YAML
 
@@ -366,7 +379,7 @@ above configures the Mimir process. Omitted keys use the defaults below.
 | `routes` | list[mapping] | `[]` | Selects tool/compute backends using first-match-wins rules. | `routes: [{label: worklink:epic, backend: feature_factory}]` |
 | `backends` | mapping | `{}` | Configures the shipping tool-backend adapters. | `backends: {opencode: {bin: opencode}}` |
 | `compute_backends` | mapping | `{}` | Configures compute substrates; the sole shipping substrate accepts an empty block only. | `compute_backends: {local_subprocess: {}}` |
-| `tool_pins` | list[mapping] | `[]` | Records operator-owned external-tool pins for drift and bump issue generation. | `tool_pins: [{name: opencode, category: coding-cli, pin: "1.18.9", smoke: "opencode --version"}]` |
+| `tool_pins` | list[mapping] | `[]` | Records operator-owned external-tool pins for drift and bump issue generation. | `tool_pins: [{name: opencode, category: coding-cli, pin: "1.18.21", smoke: "opencode --version"}]` |
 
 ### Repository Inventory
 
@@ -429,16 +442,16 @@ whether it came from `repository` or `deployment` configuration.
 | `defaults.base_branch` | str | `main` | Branch attempt checkouts are based on and leaf PRs target. | `base_branch: release/0.7` |
 | `defaults.base_fetch` | bool | `true` | Refreshes `origin/<base_branch>` before creating an attempt checkout without moving the source checkout. | `base_fetch: false` |
 | `defaults.max_concurrent` | positive int | `2` | Caps claims across autonomous poller/tool dispatch; the operator CLI is uncapped. | `max_concurrent: 4` |
-| `defaults.reaper_ttl_s` | positive int | `7200` | Age in seconds after which the reaper may recover a claim or retained checkout with no heartbeat. Keep it above twice `timeout_s`. | `reaper_ttl_s: 10800` |
+| `defaults.reaper_ttl_s` | positive int | `86400` | Age in seconds after which the reaper may recover a claim or retained checkout with no heartbeat. Set existing configs to at least twice the greater of `timeout_s` and `MIMIR_FACTORY_RUN_TIMEOUT_S` (normally `86400`); lower legacy values warn and are raised to that floor at load. | `reaper_ttl_s: 86400` |
 | `defaults.allow_autonomous_local_subprocess` | bool | `false` | Allows autonomous use of `local_subprocess`, which has shared filesystem access and no network isolation. This accepts that blast radius; the operator CLI is unaffected. | `allow_autonomous_local_subprocess: true` |
-| `defaults.epic_branch_prefix` | str | `epic/` | Compatibility-only field retained after integrated epic execution was removed; no 0.7.2 runtime consumes it. | `epic_branch_prefix: "epic/"` |
-| `defaults.max_review_retries` | positive int | `3` | Compatibility-only parsed field; no 0.7.2 runtime consumes it. | `max_review_retries: 3` |
-| `defaults.max_claim_attempts` | positive int | `3` | Compatibility-only parsed field; no 0.7.2 runtime consumes it. | `max_claim_attempts: 5` |
-| `defaults.reviewer_backend` | backend name | value of `defaults.backend` | Compatibility-only parsed field from integrated epic review; no 0.7.2 runtime consumes it. | `reviewer_backend: opencode` |
+| `defaults.epic_branch_prefix` | str | `epic/` | Compatibility-only field retained after integrated epic execution was removed; no 0.8.0 runtime consumes it. | `epic_branch_prefix: "epic/"` |
+| `defaults.max_review_retries` | positive int | `3` | Compatibility-only parsed field; no 0.8.0 runtime consumes it. | `max_review_retries: 3` |
+| `defaults.max_claim_attempts` | positive int | `3` | Compatibility-only parsed field; no 0.8.0 runtime consumes it. | `max_claim_attempts: 5` |
+| `defaults.reviewer_backend` | backend name | value of `defaults.backend` | Compatibility-only parsed field from integrated epic review; no 0.8.0 runtime consumes it. | `reviewer_backend: opencode` |
 | `defaults.tiered_review` | mapping | framework defaults | Compatibility-only parsed review classifier; its child keys are described below. | `tiered_review: {multi_vote_reviewer_count: 5}` |
 
 `defaults.trusted_test_retries` is **retired**, not an operator setting in
-0.7.2. It belonged to the removed distributed trusted-test runner. A value in
+0.8.0. It belonged to the removed distributed trusted-test runner. A value in
 YAML has no effect and must not be used as a retry guarantee; for example,
 remove `trusted_test_retries: 1` from an older deployment file.
 
@@ -490,7 +503,7 @@ routes:
 ### Backend blocks
 
 `backends` defaults to `{}`. Only `opencode` and `feature_factory` ship in
-0.7.2. An unknown referenced backend fails configuration loading; stale settings
+0.8.0. An unknown referenced backend fails configuration loading; stale settings
 for an unreferenced backend are warned and dropped.
 
 | Key | Type | Default | Effect | Example |
@@ -500,7 +513,7 @@ for an unreferenced backend are warned and dropped.
 | `backends.opencode.bash_allowlist` | list[str] | `["git *", "uv *"]` | Replaces the deny-first shell command grants sent through `OPENCODE_PERMISSION`. Empty denies all shell commands; catch-all `*` is rejected. This is not a process sandbox. | `bash_allowlist: ["git *", "npm test*"]` |
 | `backends.feature_factory.entrypoint` | absolute path | `MIMIR_FACTORY_ENTRYPOINT` or the fixed image path | Exact `feature-factory/bin/factory.js` used by every `node` control command and retained recovery record. | `entrypoint: /opt/mimir-opencode/lib/node_modules/feature-factory/bin/factory.js` |
 
-The retired `backends.feature_factory.bin`, `args`, `ready`, and `reviewer` keys are rejected with migration guidance. The image installs `feature-factory@0.7.2` and `opencode-feature-factory@0.7.2` under one npm prefix and registers only the OpenCode adapter. Runtime controls are `status`, `resume`, `heartbeat`, and run-ID-first `lock` actions; cancellation uses `mimir worklink stop` and never invokes a factory cancel transition.
+The retired `backends.feature_factory.bin`, `args`, `ready`, and `reviewer` keys are rejected with migration guidance. The image installs `feature-factory@0.8.0` and `opencode-feature-factory@0.8.0` under one npm prefix and registers only the OpenCode adapter. Runtime controls are `status`, `resume`, `heartbeat`, and run-ID-first `lock` actions; cancellation uses `mimir worklink stop` and never invokes a factory cancel transition.
 
 `compute_backends` defaults to `{}`. The sole shipping block is
 `compute_backends.local_subprocess` (hyphenated `local-subprocess` is normalized
@@ -517,7 +530,7 @@ remaining fields are optional and default to unset.
 |---|---|---|---|---|
 | `tool_pins[].name` | str | required | Stable local tool name. | `name: opencode` |
 | `tool_pins[].category` | str | required | Tool class used in maintenance output. | `category: coding-cli` |
-| `tool_pins[].pin` | str | required | Expected version, tag, or SHA. | `pin: "1.18.9"` |
+| `tool_pins[].pin` | str | required | Expected version, tag, or SHA. | `pin: "1.18.21"` |
 | `tool_pins[].smoke` | str | required | Command recorded as bump evidence; issue rendering does not execute it. | `smoke: "opencode --version"` |
 | `tool_pins[].source` | str | unset | Upstream lookup strategy. | `source: npm` |
 | `tool_pins[].package` | str | unset | Upstream package identifier. | `package: opencode-ai` |
@@ -563,6 +576,8 @@ once the corresponding skill is installed.
 | `CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS` | str | unset | Passed through to the Claude Code CLI to disable its experimental beta headers. |
 | `OPENAI_API_KEY` | str | unset | Used for SAGA embeddings + consolidation; without it SAGA falls back to local fastembed. |
 | `GH_TOKEN` / `GITHUB_TOKEN` | str | unset | GitHub credentials. `GITHUB_TOKEN` is the process credential: it supports home git push and GitHub-backed tools/pollers, is paired with `MIMIR_STATE_REPO`, and is the credential factory dispatch verifies against `.factory.json` `publishing_identity`. `GH_TOKEN` is a child-only alias for `gh` and is never preferred over it; both set to different values fails dispatch as an ambiguity, and a missing `GITHUB_TOKEN` fails naming that variable. Worklink sets both child aliases to the verified value. |
+| `MIMIR_FACTORY_PUBLISHING_IDENTITY` | str | unset | Overrides `.factory.json` `publishing_identity` for factory publication. If set, it must be nonblank; invalid values fail closed rather than falling back. The selected identity is still verified against the `GITHUB_TOKEN` owner before dispatch. |
+| `FACTORY_PUBLISHING_IDENTITY` | str | unset | Passed THROUGH to the factory child (feature-factory 0.8.0+), where it supplies the declared identity the driver compares against `gh api /user`. Set per deployment: `jasoncarreira` for a maintainer's local run, `mimir-carreira` inside mimirbot. An empty explicit value is treated as absent, so an inherited nonempty environment value remains effective. Must never be derived from `gh`, the token, or any command result: an expectation read from the credential being checked always matches. Allow-listed in `_control_environment()`; without that entry the deployment can export it and the driver never sees it. |
 | `MINIMAX_API_KEY` | str | unset | Enables the Minimax usage poller (with `MIMIR_MINIMAX_USAGE_POLL_CRON`). |
 
 ## Tool & skill integration keys

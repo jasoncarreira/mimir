@@ -34,6 +34,7 @@ if TYPE_CHECKING:
 log = logging.getLogger(__name__)
 
 TurnRunner = Callable[[AgentEvent], Awaitable[object]]
+RelevanceCheck = Callable[[AgentEvent], Awaitable[bool | None]]
 InjectCallback = Callable[[AgentEvent], Awaitable[None]]
 # Best-effort observer fired (fire-and-forget) for each enqueued inbound
 # event — used for first-contact DM-channel capture (server.py). Must not
@@ -41,6 +42,7 @@ InjectCallback = Callable[[AgentEvent], Awaitable[None]]
 EventObserver = Callable[[AgentEvent], Awaitable[None]]
 PairingObserver = Callable[[AgentEvent, AccessDecision], Awaitable[None]]
 ChannelIdleCallback = Callable[[str], None]
+ChannelDrainedCallback = Callable[[str], None]
 # Inbound user-message admission is fail-closed for bridge/external sources.
 # Only sources that are already authenticated/trusted by the server path bypass
 # the identity allowlist gate. ``web`` is covered by the API-key middleware on
@@ -107,8 +109,12 @@ class Dispatcher:
         self._on_event: EventObserver | None = None
         self._on_pairing_required: PairingObserver | None = None
         self._on_channel_idle: ChannelIdleCallback | None = None
+        self._on_channel_drained: ChannelDrainedCallback | None = None
         self._bg_tasks: set[asyncio.Task] = set()
         self._queues: dict[str, asyncio.Queue[AgentEvent]] = {}
+        # Predicates are keyed by the queued object rather than source_id so
+        # duplicate deliveries cannot consume each other's check.
+        self._delivery_relevance: dict[int, RelevanceCheck] = {}
         self._workers: dict[str, asyncio.Task] = {}
         self._semaphore = asyncio.Semaphore(config.max_concurrent_turns)
         # S2-3 fix: cross-job mutex for scheduler-triggered turns. The
@@ -172,6 +178,12 @@ class Dispatcher:
         """Late-bind cleanup for state keyed by retired channel IDs."""
         self._on_channel_idle = on_channel_idle
 
+    def set_on_channel_drained(
+        self, on_channel_drained: ChannelDrainedCallback | None
+    ) -> None:
+        """Late-bind an observer called after a channel's final queued turn."""
+        self._on_channel_drained = on_channel_drained
+
     def _injection_enabled(self, channel_id: str) -> bool:
         """True iff ``channel_id`` opts into mid-turn message injection
         (chainlink #376). Prefix allow-list from
@@ -184,7 +196,12 @@ class Dispatcher:
             return True
         return any(channel_id.startswith(p) for p in prefixes)
 
-    async def enqueue(self, event: AgentEvent) -> bool:
+    async def enqueue(
+        self,
+        event: AgentEvent,
+        *,
+        relevance_check: RelevanceCheck | None = None,
+    ) -> bool:
         """Returns True if accepted, False if the per-channel queue is full."""
         if self._closed:
             return False
@@ -250,6 +267,8 @@ class Dispatcher:
             return False
 
         await queue.put(event)
+        if relevance_check is not None:
+            self._delivery_relevance[id(event)] = relevance_check
         depth = queue.qsize()
         if depth > 10 and not self._high_water_logged[channel_id]:
             await log_event("event_queue_high_water", channel_id=channel_id, depth=depth)
@@ -555,6 +574,25 @@ class Dispatcher:
                 # ``finally`` here so neither propagation path skips it.
                 try:
                     async with self._semaphore:
+                        relevance_check = self._delivery_relevance.pop(id(event), None)
+                        if relevance_check is not None:
+                            try:
+                                relevant = await relevance_check(event)
+                            except Exception as exc:  # noqa: BLE001 - must fail open
+                                log.warning(
+                                    "poller delivery relevance check failed open for %s: %s",
+                                    event.source_id,
+                                    exc,
+                                )
+                                relevant = None
+                            if relevant is False:
+                                await log_event(
+                                    "poller_delivery_stale_dropped",
+                                    poller=event.extra.get("poller_name"),
+                                    channel_id=channel_id,
+                                    source_id=event.source_id,
+                                )
+                                continue
                         if self._run_turn is None:
                             await log_event(
                                 "error",
@@ -587,7 +625,21 @@ class Dispatcher:
                         finally:
                             self._in_flight.discard(channel_id)
                 finally:
+                    self._delivery_relevance.pop(id(event), None)
                     queue.task_done()
+                    # ``drain()`` closes the dispatcher before waiting for queued
+                    # turns. Do not start completion-triggered scans during that
+                    # window: their emitted events would be rejected while an
+                    # edge-trigger poller could still advance its cursor.
+                    if (
+                        not self._closed
+                        and queue.qsize() == 0
+                        and self._on_channel_drained is not None
+                    ):
+                        try:
+                            self._on_channel_drained(channel_id)
+                        except Exception:
+                            log.exception("channel drained callback failed for %s", channel_id)
         except asyncio.CancelledError:
             await log_event("worker_cancelled", channel_id=channel_id)
             raise

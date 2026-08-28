@@ -31,7 +31,7 @@ from datetime import datetime, timezone
 from typing import Callable, Iterator
 
 
-CURRENT_SCHEMA_VERSION: int = 10
+CURRENT_SCHEMA_VERSION: int = 11
 
 # Registry of post-greenfield schema changes. Keys are version
 # numbers (must be > 1, must be contiguous, must equal
@@ -415,15 +415,20 @@ WHERE a.source_type = 'session_boundary'
             last_evidence_at TEXT,
             consolidated_at TEXT NOT NULL,
             consolidation_session TEXT,
+            -- V6_PRESERVE_OBSERVATIONS_OWNERSHIP_DEFINITION
             FOREIGN KEY (atom_id) REFERENCES atoms(id) ON DELETE CASCADE
         );
         INSERT INTO new_observations_metadata
-            (atom_id, evidence_count, trend, last_evidence_at, consolidated_at, consolidation_session)
+            (atom_id, evidence_count, trend, last_evidence_at, consolidated_at, consolidation_session
+             -- V6_PRESERVE_OBSERVATIONS_OWNERSHIP_COLUMNS
+            )
             SELECT atom_id, evidence_count, trend, last_evidence_at, consolidated_at, consolidation_session
+                   -- V6_PRESERVE_OBSERVATIONS_OWNERSHIP_VALUES
             FROM observations_metadata;
         DROP TABLE observations_metadata;
         ALTER TABLE new_observations_metadata
             RENAME TO observations_metadata;
+        -- V6_RESTORE_OBSERVATIONS_OWNERSHIP_INDEXES
 
         -- ── atom_topics ────────────────────────────────────────────
         CREATE TABLE new_atom_topics (
@@ -478,15 +483,20 @@ WHERE a.source_type = 'session_boundary'
             tombstoned INTEGER DEFAULT 0,
             created_at TEXT NOT NULL,
             metadata TEXT DEFAULT '{}',
+            -- V6_PRESERVE_TRIPLES_OWNERSHIP_DEFINITION
             FOREIGN KEY (source_atom_id) REFERENCES atoms(id)
                 ON DELETE SET NULL
         );
         INSERT INTO new_triples
-            (id, subject, predicate, object, source_atom_id, confidence, valid_from, valid_until, embedding, embedding_dim, tombstoned, created_at, metadata)
+            (id, subject, predicate, object, source_atom_id, confidence, valid_from, valid_until, embedding, embedding_dim, tombstoned, created_at, metadata
+             -- V6_PRESERVE_TRIPLES_OWNERSHIP_COLUMNS
+            )
             SELECT id, subject, predicate, object, source_atom_id, confidence, valid_from, valid_until, embedding, embedding_dim, tombstoned, created_at, metadata
+                   -- V6_PRESERVE_TRIPLES_OWNERSHIP_VALUES
             FROM triples;
         DROP TABLE triples;
         ALTER TABLE new_triples RENAME TO triples;
+        -- V6_RESTORE_TRIPLES_OWNERSHIP_INDEXES
         CREATE INDEX IF NOT EXISTS idx_triples_spo
             ON triples(subject, predicate, object);
         CREATE INDEX IF NOT EXISTS idx_triples_subject
@@ -607,6 +617,31 @@ WHERE a.source_type = 'session_boundary'
         -- v9: exact-content dedup is owner-scoped (chainlink #895).
         -- The old index made a different owner's equal content conflict even
         -- though the read-side dedup lookup correctly excluded that row.
+        --
+        -- Pre-migration stores did not enforce exact-content uniqueness. Keep
+        -- the lexicographically smallest stable atom id in each owner-scoped
+        -- group and retract every other row. The id is durable logical data,
+        -- unlike rowid or insertion order, so replicas of the same store choose
+        -- the same survivor. Legacy schemas may lack the lifecycle detail
+        -- columns used by ordinary tombstones.
+        ALTER TABLE atoms ADD COLUMN tombstoned_at TEXT;
+        ALTER TABLE atoms ADD COLUMN tombstoned_reason TEXT;
+
+        UPDATE atoms AS duplicate
+        SET tombstoned = 1,
+            tombstoned_at = strftime('%Y-%m-%dT%H:%M:%f+00:00', 'now'),
+            tombstoned_reason = COALESCE(duplicate.tombstoned_reason, 'merged')
+        WHERE duplicate.tombstoned = 0
+          AND EXISTS (
+              SELECT 1
+              FROM atoms AS survivor
+              WHERE survivor.tombstoned = 0
+                AND survivor.content_hash = duplicate.content_hash
+                AND survivor.agent_id = duplicate.agent_id
+                AND survivor.owner_principal = duplicate.owner_principal
+                AND survivor.id < duplicate.id
+          );
+
         DROP INDEX IF EXISTS idx_atoms_dedup;
         CREATE UNIQUE INDEX idx_atoms_dedup
             ON atoms(content_hash, agent_id, owner_principal)
@@ -619,6 +654,16 @@ WHERE a.source_type = 'session_boundary'
             CHECK(integrity IN ('trusted', 'untrusted'));
         ALTER TABLE atoms ADD COLUMN origin_trigger TEXT;
         ALTER TABLE atoms ADD COLUMN origin_ref TEXT;
+    """,
+    11: """
+        -- v11: Bound triple candidate reads and index session recency ordering.
+        CREATE INDEX IF NOT EXISTS idx_triples_embedding_recency
+            ON triples(created_at DESC, id ASC)
+            WHERE tombstoned = 0 AND embedding IS NOT NULL;
+        CREATE INDEX IF NOT EXISTS idx_sessions_recency
+            ON sessions(COALESCE(ended_at, reflected_at) DESC, id ASC);
+        CREATE INDEX IF NOT EXISTS idx_sessions_channel_recency
+            ON sessions(channel_id, COALESCE(ended_at, reflected_at) DESC, id ASC);
     """,
 }
 
@@ -662,6 +707,24 @@ def detect_schema_version(conn: sqlite3.Connection) -> int:
     so this is robust to bare-bones DBs (like the in-memory
     fixtures used by unit tests).
     """
+    # v11 marker: bounded triple candidate ordering (chainlink #1373).
+    try:
+        triple_indexes = {
+            row[1] for row in conn.execute("PRAGMA index_list(triples)").fetchall()
+        }
+        session_indexes = {
+            row[1] for row in conn.execute("PRAGMA index_list(sessions)").fetchall()
+        }
+    except sqlite3.OperationalError:
+        triple_indexes = set()
+        session_indexes = set()
+    if (
+        "idx_triples_embedding_recency" in triple_indexes
+        and "idx_sessions_recency" in session_indexes
+        and "idx_sessions_channel_recency" in session_indexes
+    ):
+        return 11
+
     # v10 marker: recallable-write integrity provenance (chainlink #948).
     try:
         atoms_cols = {
@@ -669,32 +732,6 @@ def detect_schema_version(conn: sqlite3.Connection) -> int:
         }
     except sqlite3.OperationalError:
         atoms_cols = set()
-
-    # Migration 2 includes a data backfill, so schema shape alone cannot prove
-    # it ran. Force replay from v1 whenever its postcondition is false; later
-    # ADD COLUMN migrations tolerate replay and v5 then cleans up only after
-    # every boundary has a durable sessions row.
-    if {"source_type", "session_id"} <= atoms_cols:
-        has_sessions = conn.execute(
-            "SELECT 1 FROM sqlite_master "
-            "WHERE type='table' AND name='sessions'"
-        ).fetchone() is not None
-        if not has_sessions:
-            return 1
-        sessions_cols = {
-            row[1] for row in conn.execute("PRAGMA table_info(sessions)").fetchall()
-        }
-        if "id" not in sessions_cols:
-            return 1
-        missing_backfill = conn.execute(
-            "SELECT 1 FROM atoms a "
-            "WHERE a.source_type = 'session_boundary' "
-            "AND (a.session_id IS NULL OR NOT EXISTS ("
-            "SELECT 1 FROM sessions s WHERE s.id = a.session_id)) "
-            "LIMIT 1"
-        ).fetchone()
-        if missing_backfill is not None:
-            return 1
 
     if {"integrity", "origin_trigger", "origin_ref"} <= atoms_cols:
         return 10
@@ -842,6 +879,34 @@ def _execute_migration_script(conn: sqlite3.Connection, ddl: str) -> None:
     for statement in _iter_sql_statements(ddl):
         try:
             conn.execute(statement)
+        except sqlite3.IntegrityError as exc:
+            message = str(exc)
+            dedup_constraint = (
+                "UNIQUE constraint failed: atoms.content_hash, "
+                "atoms.agent_id, atoms.owner_principal"
+            )
+            if dedup_constraint.casefold() in message.casefold():
+                collision = conn.execute(
+                    "SELECT content_hash, agent_id, owner_principal "
+                    "FROM atoms WHERE tombstoned = 0 "
+                    "GROUP BY content_hash, agent_id, owner_principal "
+                    "HAVING COUNT(*) > 1 LIMIT 1"
+                ).fetchone()
+                if collision is not None:
+                    key = (
+                        f"content_hash={collision[0]!r}, agent_id={collision[1]!r}, "
+                        f"owner_principal={collision[2]!r}"
+                    )
+                else:
+                    key = "colliding key could not be read"
+                raise sqlite3.IntegrityError(
+                    "migration could not create unique constraint "
+                    "idx_atoms_dedup(content_hash, agent_id, owner_principal); "
+                    f"at least one live collision remains: {key}"
+                ) from exc
+            raise sqlite3.IntegrityError(
+                f"migration integrity constraint failed: {message}"
+            ) from exc
         except sqlite3.OperationalError as exc:
             if _is_duplicate_add_column(conn, statement, exc):
                 continue
@@ -864,6 +929,107 @@ _OWNERSHIP_COLUMNS = {
 }
 
 _ATOM_PROVENANCE_COLUMNS = {"integrity", "origin_trigger", "origin_ref"}
+
+
+def _render_v6_rebuild(conn: sqlite3.Connection, ddl: str) -> str:
+    """Expand v6's rebuild copy only for complete post-v7 ACL schemas."""
+    replacements: dict[str, str] = {}
+    for table, marker in (
+        ("observations_metadata", "OBSERVATIONS"),
+        ("triples", "TRIPLES"),
+    ):
+        columns = {
+            str(row[1])
+            for row in conn.execute(f"PRAGMA table_info({table!r})").fetchall()
+        }
+        ownership_columns = columns & _OWNERSHIP_COLUMNS
+        if ownership_columns and ownership_columns != _OWNERSHIP_COLUMNS:
+            missing = ", ".join(sorted(_OWNERSHIP_COLUMNS - ownership_columns))
+            raise RuntimeError(
+                f"migration v6 refused to rebuild {table}: "
+                f"ownership columns are incomplete (missing {missing})"
+            )
+
+        if not ownership_columns:
+            definition = copy_columns = copy_values = indexes = ""
+        else:
+            definition = (
+                "owner_principal TEXT NOT NULL DEFAULT 'legacy_admin',\n"
+                "            origin_channel TEXT,\n"
+                "            origin_domain TEXT,\n"
+                "            visibility TEXT NOT NULL DEFAULT 'legacy_admin'\n"
+                "                CHECK(visibility IN "
+                "('public', 'private', 'service', 'legacy_admin')),\n"
+                "            provenance TEXT NOT NULL DEFAULT '{}',"
+            )
+            copy_columns = (
+                ", owner_principal, origin_channel, origin_domain, "
+                "visibility, provenance"
+            )
+            copy_values = copy_columns
+            index_prefix = "obs_metadata" if table == "observations_metadata" else table
+            indexes = (
+                f"CREATE INDEX IF NOT EXISTS idx_{index_prefix}_visibility "
+                f"ON {table}(visibility);\n"
+                f"        CREATE INDEX IF NOT EXISTS idx_{index_prefix}_owner "
+                f"ON {table}(owner_principal);"
+            )
+
+        replacements[f"-- V6_PRESERVE_{marker}_OWNERSHIP_DEFINITION"] = definition
+        replacements[f"-- V6_PRESERVE_{marker}_OWNERSHIP_COLUMNS"] = copy_columns
+        replacements[f"-- V6_PRESERVE_{marker}_OWNERSHIP_VALUES"] = copy_values
+        replacements[f"-- V6_RESTORE_{marker}_OWNERSHIP_INDEXES"] = indexes
+
+    for marker, replacement in replacements.items():
+        ddl = ddl.replace(marker, replacement)
+    return ddl
+
+
+def _session_backfill_needed(conn: sqlite3.Connection) -> bool:
+    atom_columns = {
+        str(row[1]) for row in conn.execute("PRAGMA table_info(atoms)").fetchall()
+    }
+    session_columns = {
+        str(row[1]) for row in conn.execute("PRAGMA table_info(sessions)").fetchall()
+    }
+    if not {"source_type", "session_id"} <= atom_columns or "id" not in session_columns:
+        return False
+    return conn.execute(
+        "SELECT 1 FROM atoms a "
+        "WHERE a.source_type = 'session_boundary' "
+        "AND a.session_id IS NOT NULL "
+        "AND NOT EXISTS (SELECT 1 FROM sessions s WHERE s.id = a.session_id) "
+        "LIMIT 1"
+    ).fetchone() is not None
+
+
+def _repair_session_backfill(
+    conn: sqlite3.Connection,
+    migrations: dict[int, str],
+    *,
+    cleanup_boundary: bool,
+) -> None:
+    """Replay the v2 data backfill, then v5 cleanup when it already ran."""
+    required_versions = (2, 5) if cleanup_boundary else (2,)
+    missing = [version for version in required_versions if version not in migrations]
+    if missing:
+        raise RuntimeError(
+            "session boundary repair requires migration scripts: "
+            + ", ".join(str(version) for version in missing)
+        )
+
+    conn.commit()
+    conn.execute("PRAGMA foreign_keys=OFF")
+    try:
+        conn.execute("BEGIN")
+        for version in required_versions:
+            _execute_migration_script(conn, migrations[version])
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.execute("PRAGMA foreign_keys=ON")
 
 
 def _validate_ownership_schema(
@@ -999,6 +1165,16 @@ def apply_pending_migrations(
         # will apply versions max(applied)+1 .. target_version.
 
     stamped_version = max(applied)
+    # v2's session backfill is a data postcondition, not a schema marker.
+    # Repair only that migration (and v5's ordered cleanup if it previously
+    # ran) without lowering the structural version or replaying later DDL.
+    if _session_backfill_needed(conn):
+        _repair_session_backfill(
+            conn,
+            migrations,
+            cleanup_boundary=stamped_version >= 5,
+        )
+
     if stamped_version >= target_version:
         # A stamp from another lineage or a manually edited/restored DB is
         # not proof that the security-sensitive ownership schema exists.
@@ -1042,7 +1218,10 @@ def apply_pending_migrations(
                     "(version, applied_at) VALUES (?, ?)",
                     [(v, now) for v in sorted(inferred_baselines)],
                 )
-            _execute_migration_script(conn, ddl)
+            migration_ddl = ddl
+            if version == 6 and ddl == MIGRATIONS[6]:
+                migration_ddl = _render_v6_rebuild(conn, ddl)
+            _execute_migration_script(conn, migration_ddl)
             conn.execute(
                 "INSERT INTO schema_version (version, applied_at) "
                 "VALUES (?, ?)",

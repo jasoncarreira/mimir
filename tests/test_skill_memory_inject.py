@@ -3,7 +3,7 @@
 The middleware appends a skill's recorded learnings to a ``read_file`` of
 its ``<skill>/SKILL.md`` so the model sees them inline when it loads a
 skill on a non-poller turn. Coverage:
-  - _skill_from_path parsing (valid / bare / non-skill / trailing / win)
+  - _skill_from_path accepts only skills under registered source roots
   - augments a SKILL.md read for a skill WITH learnings (heading + nudge)
   - no-op: skill with no learnings, non-SKILL.md read, non-read_file tool,
     error-status result, no SagaStore installed
@@ -38,23 +38,31 @@ from mimir.tools.skill_memory_inject import (
 
 
 class TestSkillFromPath:
-    def test_valid(self):
-        assert _skill_from_path("/home/x/skills/memory/SKILL.md") == "memory"
+    def test_registered_skill(self, tmp_path):
+        root = (tmp_path / "skills").resolve()
+        assert _skill_from_path(
+            str(root / "memory" / "SKILL.md"), (root,)
+        ) == "memory"
 
-    def test_bare_filename_is_none(self):
-        assert _skill_from_path("SKILL.md") is None
+    def test_bare_filename_is_none(self, tmp_path):
+        assert _skill_from_path("SKILL.md", (tmp_path.resolve(),)) is None
 
-    def test_non_skill_file_is_none(self):
-        assert _skill_from_path("/home/x/skills/memory/README.md") is None
+    def test_non_skill_file_is_none(self, tmp_path):
+        root = tmp_path.resolve()
+        assert _skill_from_path(str(root / "memory" / "README.md"), (root,)) is None
 
-    def test_trailing_slash_tolerated(self):
-        assert _skill_from_path("/a/github-poller/SKILL.md/") == "github-poller"
+    def test_unregistered_same_named_directory_is_none(self, tmp_path):
+        root = (tmp_path / "registered").resolve()
+        outside = tmp_path / "model-created" / "memory" / "SKILL.md"
+        assert _skill_from_path(str(outside), (root,)) is None
 
-    def test_windows_separators(self):
-        assert _skill_from_path(r"C:\skills\alerts\SKILL.md") == "alerts"
+    def test_nested_path_is_not_a_catalog_entry(self, tmp_path):
+        root = tmp_path.resolve()
+        nested = root / "model-created" / "memory" / "SKILL.md"
+        assert _skill_from_path(str(nested), (root,)) is None
 
     def test_empty(self):
-        assert _skill_from_path("") is None
+        assert _skill_from_path("", ()) is None
 
 
 # ── fixtures: real SagaStore via stub provider ───────────────────────
@@ -117,6 +125,24 @@ def store(tmp_path, monkeypatch):
     _MEMORY_STATE["client"] = prev
 
 
+@pytest.fixture
+def skill_source(tmp_path):
+    root = tmp_path / "skills"
+    for skill in ("memory", "alerts", "never-used"):
+        skill_dir = root / skill
+        skill_dir.mkdir(parents=True, exist_ok=True)
+        (skill_dir / "SKILL.md").write_text(f"# {skill}\n", encoding="utf-8")
+    return root.resolve()
+
+
+def _middleware(skill_source):
+    return SkillMemoryInjectionMiddleware([str(skill_source)])
+
+
+def _skill_path(skill_source, skill: str) -> str:
+    return str(skill_source / skill / "SKILL.md")
+
+
 async def _add_learning(store, skill, kind, content):
     return await store.store(
         content, source_type=SKILL_LEARNING_SOURCE_TYPE,
@@ -163,16 +189,16 @@ def _make_handler(result: ToolMessage):
 
 class TestAsyncInjection:
     @pytest.mark.asyncio
-    async def test_augments_skill_md_with_learnings(self, store):
+    async def test_augments_skill_md_with_learnings(self, store, skill_source):
         await _add_learning(store, "memory", "failure-mode", "trips on empty input")
         token = set_current_turn(_turn_context())
         try:
-            mw = SkillMemoryInjectionMiddleware()
+            mw = _middleware(skill_source)
             _, ahandler, calls = _make_handler(
                 _read_result("1\tORIGINAL SKILL BODY")
             )
             out = await mw.awrap_tool_call(
-                _read_request("/home/x/skills/memory/SKILL.md"), ahandler,
+                _read_request(_skill_path(skill_source, "memory")), ahandler,
             )
         finally:
             reset_current_turn(token)
@@ -183,56 +209,69 @@ class TestAsyncInjection:
         assert "saga_record_skill_learning" in out.content  # write nudge
 
     @pytest.mark.asyncio
-    async def test_no_learnings_leaves_content_unchanged(self, store):
-        mw = SkillMemoryInjectionMiddleware()
+    async def test_no_learnings_leaves_content_unchanged(self, store, skill_source):
+        mw = _middleware(skill_source)
         _, ahandler, _ = _make_handler(_read_result("BODY"))
         out = await mw.awrap_tool_call(
-            _read_request("/x/skills/never-used/SKILL.md"), ahandler,
+            _read_request(_skill_path(skill_source, "never-used")), ahandler,
         )
         assert out.content == "BODY"
 
     @pytest.mark.asyncio
-    async def test_non_skill_md_read_unchanged(self, store):
+    async def test_non_skill_md_read_unchanged(self, store, skill_source):
         await _add_learning(store, "memory", "tip", "x")
-        mw = SkillMemoryInjectionMiddleware()
+        mw = _middleware(skill_source)
         _, ahandler, _ = _make_handler(_read_result("SOME OTHER FILE"))
         out = await mw.awrap_tool_call(
-            _read_request("/x/skills/memory/README.md"), ahandler,
+            _read_request(str(skill_source / "memory" / "README.md")), ahandler,
         )
         assert out.content == "SOME OTHER FILE"
 
     @pytest.mark.asyncio
-    async def test_non_read_file_tool_unchanged(self, store):
+    async def test_unregistered_same_named_skill_does_not_inject(
+        self, store, skill_source, tmp_path,
+    ):
+        await _add_learning(store, "memory", "tip", "registered learning")
+        mw = _middleware(skill_source)
+        _, ahandler, _ = _make_handler(_read_result("MODEL-CREATED BODY"))
+        unregistered = tmp_path / "model-created" / "memory" / "SKILL.md"
+
+        out = await mw.awrap_tool_call(_read_request(str(unregistered)), ahandler)
+
+        assert out.content == "MODEL-CREATED BODY"
+
+    @pytest.mark.asyncio
+    async def test_non_read_file_tool_unchanged(self, store, skill_source):
         await _add_learning(store, "memory", "tip", "x")
-        mw = SkillMemoryInjectionMiddleware()
+        mw = _middleware(skill_source)
         _, ahandler, _ = _make_handler(_read_result("WHATEVER"))
         out = await mw.awrap_tool_call(
-            _read_request("/x/skills/memory/SKILL.md", tool_name="write_file"),
+            _read_request(_skill_path(skill_source, "memory"), tool_name="write_file"),
             ahandler,
         )
         assert out.content == "WHATEVER"
 
     @pytest.mark.asyncio
-    async def test_error_status_unchanged(self, store):
+    async def test_error_status_unchanged(self, store, skill_source):
         await _add_learning(store, "memory", "tip", "x")
-        mw = SkillMemoryInjectionMiddleware()
+        mw = _middleware(skill_source)
         _, ahandler, _ = _make_handler(
             _read_result("Error: not found", status="error")
         )
         out = await mw.awrap_tool_call(
-            _read_request("/x/skills/memory/SKILL.md"), ahandler,
+            _read_request(_skill_path(skill_source, "memory")), ahandler,
         )
         assert out.content == "Error: not found"
 
     @pytest.mark.asyncio
-    async def test_no_client_best_effort_unchanged(self, monkeypatch):
+    async def test_no_client_best_effort_unchanged(self, monkeypatch, skill_source):
         prev = _MEMORY_STATE.get("client")
         _MEMORY_STATE["client"] = None
         try:
-            mw = SkillMemoryInjectionMiddleware()
+            mw = _middleware(skill_source)
             _, ahandler, _ = _make_handler(_read_result("BODY"))
             out = await mw.awrap_tool_call(
-                _read_request("/x/skills/memory/SKILL.md"), ahandler,
+                _read_request(_skill_path(skill_source, "memory")), ahandler,
             )
             assert out.content == "BODY"
         finally:
@@ -244,15 +283,15 @@ class TestAsyncInjection:
 
 class TestSyncInjection:
     @pytest.mark.asyncio
-    async def test_sync_augments_with_learnings(self, store):
+    async def test_sync_augments_with_learnings(self, store, skill_source):
         # store() is async; populate, then exercise the sync wrap path.
         await _add_learning(store, "alerts", "tip", "batch the pages")
         token = set_current_turn(_turn_context())
         try:
-            mw = SkillMemoryInjectionMiddleware()
+            mw = _middleware(skill_source)
             handler, _, calls = _make_handler(_read_result("ALERTS BODY"))
             out = mw.wrap_tool_call(
-                _read_request("/x/skills/alerts/SKILL.md"), handler,
+                _read_request(_skill_path(skill_source, "alerts")), handler,
             )
         finally:
             reset_current_turn(token)
@@ -262,12 +301,12 @@ class TestSyncInjection:
         assert "saga_record_skill_learning" in out.content
 
     @pytest.mark.asyncio
-    async def test_sync_non_read_file_unchanged(self, store):
+    async def test_sync_non_read_file_unchanged(self, store, skill_source):
         await _add_learning(store, "alerts", "tip", "x")
-        mw = SkillMemoryInjectionMiddleware()
+        mw = _middleware(skill_source)
         handler, _, _ = _make_handler(_read_result("BODY"))
         out = mw.wrap_tool_call(
-            _read_request("/x/skills/alerts/SKILL.md", tool_name="glob"),
+            _read_request(_skill_path(skill_source, "alerts"), tool_name="glob"),
             handler,
         )
         assert out.content == "BODY"
@@ -278,7 +317,7 @@ class TestSyncInjection:
 
 class TestInjectedIdCapture:
     @pytest.mark.asyncio
-    async def test_records_injected_ids_onto_turn_context(self, store):
+    async def test_records_injected_ids_onto_turn_context(self, store, skill_source):
         """After augmenting a SKILL.md read, the injected learning atom IDs
         must be recorded on the active turn's injected_skill_atom_ids so
         run_turn folds them into the TurnRecord for synthesis voting."""
@@ -286,10 +325,10 @@ class TestInjectedIdCapture:
         ctx = _turn_context()
         tok = set_current_turn(ctx)
         try:
-            mw = SkillMemoryInjectionMiddleware()
+            mw = _middleware(skill_source)
             _, ahandler, _ = _make_handler(_read_result("BODY"))
             out = await mw.awrap_tool_call(
-                _read_request("/x/skills/memory/SKILL.md"), ahandler,
+                _read_request(_skill_path(skill_source, "memory")), ahandler,
             )
             assert "a useful tip" in out.content  # augmentation happened
             assert ctx.injected_skill_atom_ids == [sl["atom_id"]]
@@ -311,7 +350,7 @@ class TestInjectedIdCapture:
             reset_current_turn(tok)
 
     @pytest.mark.asyncio
-    async def test_no_ids_recorded_when_no_learnings(self, store):
+    async def test_no_ids_recorded_when_no_learnings(self, store, skill_source):
         import time as _time
         from mimir._context import set_current_turn, reset_current_turn
         from mimir.models import TurnContext
@@ -322,10 +361,10 @@ class TestInjectedIdCapture:
         )
         tok = set_current_turn(ctx)
         try:
-            mw = SkillMemoryInjectionMiddleware()
+            mw = _middleware(skill_source)
             _, ahandler, _ = _make_handler(_read_result("BODY"))
             await mw.awrap_tool_call(
-                _read_request("/x/skills/never-used/SKILL.md"), ahandler,
+                _read_request(_skill_path(skill_source, "never-used")), ahandler,
             )
             assert ctx.injected_skill_atom_ids == []
             assert ctx.ifc_labels is None

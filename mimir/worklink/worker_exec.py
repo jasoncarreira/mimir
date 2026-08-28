@@ -13,6 +13,7 @@ import socket
 import stat
 import struct
 import subprocess
+import sys
 import threading
 import time
 from typing import Any
@@ -27,6 +28,7 @@ from .worker_client import (
     MAX_REQUEST_BYTES,
     _PROJECTION_PATHS,
     _validate_identifier,
+    WORKLINK_CHECKOUT_ROOT,
 )
 
 HOME_ROOT = Path("/var/lib/mimir-worklink/homes")
@@ -36,12 +38,15 @@ REPO_TEST_UV_CACHE = Path("/opt/mimir-worklink/uv-cache")
 MAX_FDS = 3
 # Deliberately not imported from worker_client: this value must describe the
 # immutable executor installed in the root-owned image, not mutable controller code.
-EXECUTOR_PROTOCOL_IDENTITY = "worklink-executor-v3-repo-uv-cache"
+EXECUTOR_PROTOCOL_IDENTITY = "worklink-executor-v6-bounded-output-path-checkout"
+EXECUTOR_SOURCE_COMMIT_PATH = Path("/opt/mimir-worklink/executor-source-commit")
 _STALE_EXECUTOR_DIAGNOSTIC = (
     "stale root executor image: controller and mimir.worklink.worker_exec protocol "
-    "identities do not match; rebuild the image and restart the container"
+    "or source identities do not match; rebuild the image and restart the container"
 )
 _CONTROLLER_CANCELLATION_GRACE_S = 10.0
+_PROCESS_GROUP_KILL_TIMEOUT_S = 5.0
+_PROCESS_REAP_TIMEOUT_S = 5.0
 _PR_SET_NO_NEW_PRIVS = 38
 _PR_CAPBSET_DROP = 24
 _PR_CAP_AMBIENT = 47
@@ -53,13 +58,20 @@ _LINUX_CAPABILITY_VERSION_3 = 0x20080522
 _LINUX_CAPABILITY_U32S_3 = 2
 _LAUNCH_FIELDS = frozenset({
     "version", "op", "id", "issue", "attempt", "device", "inode",
-    "argv", "env", "projections", "timeout_s", "executor_identity",
+    "argv", "env", "projections", "timeout_s", "stdout_limit", "stderr_limit",
+    "executor_identity",
+})
+_PATH_LAUNCH_FIELDS = frozenset({
+    "version", "op", "id", "issue", "attempt", "path", "run_uid",
+    "argv", "env", "projections", "timeout_s", "stdout_limit", "stderr_limit",
+    "executor_identity",
 })
 _CANCEL_FIELDS = frozenset({"version", "op", "id", "executor_identity"})
 _IDENTITY_FIELDS = frozenset({"version", "op", "executor_identity"})
 _jobs: dict[str, subprocess.Popen[bytes]] = {}
 _launching: set[str] = set()
 _jobs_lock = threading.Lock()
+_OUTPUT_LIMIT_POLL_S = 0.01
 
 
 class _CapHeader(ctypes.Structure):
@@ -97,6 +109,24 @@ def _last_capability() -> int:
         return int(Path("/proc/sys/kernel/cap_last_cap").read_text().strip())
     except (OSError, ValueError):
         return 63
+
+
+def _arm_parent_death_signal(expected_parent_pid: int) -> None:
+    """Arm Linux's parent-death signal, with a documented portable fallback.
+
+    Non-Linux kernels do not provide ``prctl(PR_SET_PDEATHSIG)``. On those
+    platforms normal controller cancellation and reaping still apply, but a
+    sudden controller death may orphan the worker.
+    """
+    if not sys.platform.startswith("linux"):
+        return
+    libc = ctypes.CDLL(None, use_errno=True)
+    if libc.prctl(1, signal.SIGKILL, 0, 0, 0) != 0:  # PR_SET_PDEATHSIG
+        error = ctypes.get_errno()
+        raise OSError(error, os.strerror(error))
+    # The parent can die before prctl runs; close that race explicitly.
+    if os.getppid() != expected_parent_pid:
+        os._exit(128 + signal.SIGKILL)
 
 
 def _drop_worker(checkout_fd: int) -> None:
@@ -218,6 +248,42 @@ def _validate_checkout(fd: int, request: dict[str, Any]) -> Path:
     return root
 
 
+def _open_path_checkout(request: dict[str, Any]) -> int:
+    issue = _positive_integer(request, "issue")
+    attempt = _positive_integer(request, "attempt")
+    path_value = request.get("path")
+    if not isinstance(path_value, str) or not path_value.startswith("/") or "\x00" in path_value:
+        raise RuntimeError("path-addressed checkout path is invalid")
+    if request.get("run_uid") != get_identities().worklink_uid:
+        raise RuntimeError("path-addressed checkout requested an invalid worker uid")
+    try:
+        root = WORKLINK_CHECKOUT_ROOT.resolve(strict=True)
+        requested = Path(path_value)
+        resolved = requested.resolve(strict=True)
+        relative = resolved.relative_to(root)
+    except (OSError, ValueError):
+        raise RuntimeError("path-addressed checkout is outside the Worklink root") from None
+    if (
+        requested != resolved
+        or len(relative.parts) != 2
+        or re.fullmatch(r"[A-Za-z0-9._-]+", relative.parts[0]) is None
+        or relative.parts[1] != f"{issue}-{attempt}"
+    ):
+        raise RuntimeError("path-addressed checkout shape is invalid")
+    observed = resolved.stat(follow_symlinks=False)
+    if (
+        not stat.S_ISDIR(observed.st_mode)
+        or observed.st_uid != get_identities().mimir_uid
+        or observed.st_gid != get_identities().worklink_gid
+        or stat.S_IMODE(observed.st_mode) != 0o2770
+    ):
+        raise RuntimeError("path-addressed checkout ownership or mode is invalid")
+    return os.open(
+        resolved,
+        os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0),
+    )
+
+
 def _validate_command(request: dict[str, Any]) -> list[str]:
     argv = request.get("argv")
     if (
@@ -241,8 +307,25 @@ def _execution_checkout_fd(
         os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0),
     )
     try:
+        # The execution copy is owned by the RUNNER, not the controller.
+        #
+        # ``chmod`` is owner-only: the shared ``worklink`` group carries write access
+        # but never the right to set a mode. A controller-owned tree therefore fails
+        # any provisioning step that chmods a file it did not create, however the
+        # group bits are set. npm does exactly that for a workspace package declaring
+        # a ``bin``: ``node_modules/<pkg>`` symlinks back into tracked source and npm
+        # sets the executable bit on it, so ``npm ci`` dies with EPERM. A ``chmod +x``
+        # of a tracked file in a Makefile or setup script fails identically.
+        #
+        # Nothing reads this tree back. It is a private copy inside the worker's own
+        # HOME, it is never the issued checkout (which stays controller-owned), the
+        # command runs in it after the uid drop, and ``_cleanup_home`` destroys it.
+        # Runner ownership adds no reach: the runner could already write every path
+        # here through the group bits.
         _normalize_checkout_fd(
-            project_fd, owner_uid=get_identities().mimir_uid, group_gid=get_identities().worklink_gid
+            project_fd,
+            owner_uid=get_identities().worklink_uid,
+            group_gid=get_identities().worklink_gid,
         )
     except Exception:
         os.close(project_fd)
@@ -391,11 +474,12 @@ def _process_group_has_live_members(process_group: int) -> bool:
     return True
 
 
-def _wait_process_group(process_group: int, deadline: float | None) -> None:
+def _wait_process_group(process_group: int, deadline: float) -> bool:
     while _process_group_has_live_members(process_group):
-        if deadline is not None and time.monotonic() >= deadline:
-            return
+        if time.monotonic() >= deadline:
+            return False
         time.sleep(0.01)
+    return True
 
 
 def _terminate_process_group_pid(process_group: int, timeout_s: float = 5.0) -> None:
@@ -409,12 +493,22 @@ def _terminate_process_group_pid(process_group: int, timeout_s: float = 5.0) -> 
             os.killpg(process_group, signal.SIGKILL)
         except ProcessLookupError:
             pass
-        _wait_process_group(process_group, None)
+        if not _wait_process_group(
+            process_group, time.monotonic() + _PROCESS_GROUP_KILL_TIMEOUT_S
+        ):
+            raise RuntimeError(
+                f"process group {process_group} still has live members after SIGKILL"
+            )
 
 
 def _terminate_process_group(proc: subprocess.Popen[bytes], timeout_s: float = 5.0) -> None:
     _terminate_process_group_pid(proc.pid, timeout_s)
-    proc.wait()
+    try:
+        proc.wait(timeout=_PROCESS_REAP_TIMEOUT_S)
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError(
+            f"process group {proc.pid} leader was not reaped after SIGKILL"
+        ) from exc
 
 
 def _cancel(identifier: str) -> None:
@@ -434,6 +528,16 @@ def _validate_executor_identity(request: dict[str, Any]) -> None:
         raise RuntimeError(_STALE_EXECUTOR_DIAGNOSTIC)
 
 
+def _executor_source_commit() -> str:
+    try:
+        commit = EXECUTOR_SOURCE_COMMIT_PATH.read_text(encoding="ascii").strip()
+    except OSError as exc:
+        raise RuntimeError("root executor image has no recorded source commit") from exc
+    if re.fullmatch(r"[0-9a-f]{40}", commit) is None:
+        raise RuntimeError("root executor image has an invalid recorded source commit")
+    return commit
+
+
 def _handle_identity(connection: socket.socket, request: dict[str, Any], fds: list[int]) -> None:
     if fds or set(request) != _IDENTITY_FIELDS:
         raise RuntimeError("invalid executor identity request")
@@ -441,6 +545,7 @@ def _handle_identity(connection: socket.socket, request: dict[str, Any], fds: li
     _send(connection, {
         "status": "identity",
         "executor_identity": EXECUTOR_PROTOCOL_IDENTITY,
+        "source_commit": _executor_source_commit(),
     })
 
 
@@ -456,15 +561,61 @@ def _handle_cancel(connection: socket.socket, request: dict[str, Any], fds: list
     _send(connection, {"id": identifier, "status": "cancelled"})
 
 
+def _wait_with_output_limits(
+    proc: subprocess.Popen[bytes],
+    timeout_s: float,
+    stdout_fd: int,
+    stdout_limit: int,
+    stderr_fd: int,
+    stderr_limit: int,
+) -> tuple[int, bool, bool]:
+    """Reap *proc* while enforcing output caps inside the durable executor.
+
+    This monitor is deliberately executor-owned: controller loss must not turn
+    direct-to-file capture into an unbounded root-mediated write.  Truncation
+    happens before process-group termination so the durable files never retain
+    more than the configured cap.
+    """
+    deadline = time.monotonic() + timeout_s + _CONTROLLER_CANCELLATION_GRACE_S
+    while True:
+        for fd, limit in ((stdout_fd, stdout_limit), (stderr_fd, stderr_limit)):
+            if os.fstat(fd).st_size > limit:
+                os.ftruncate(fd, limit)
+                _terminate_process_group(proc)
+                return proc.returncode if proc.returncode is not None else -signal.SIGKILL, False, True
+        exit_code = proc.poll()
+        if exit_code is not None:
+            _terminate_process_group(proc, 0)
+            return exit_code, False, False
+        if time.monotonic() >= deadline:
+            _terminate_process_group(proc)
+            return proc.returncode if proc.returncode is not None else -signal.SIGKILL, True, False
+        time.sleep(_OUTPUT_LIMIT_POLL_S)
+
+
 def _handle_launch(connection: socket.socket, request: dict[str, Any], fds: list[int]) -> None:
-    if set(request) != _LAUNCH_FIELDS or len(fds) != MAX_FDS:
-        raise RuntimeError("launch request must carry the exact contract and three FDs")
+    path_addressed = request.get("op") == "launch_path"
+    expected_fields = _PATH_LAUNCH_FIELDS if path_addressed else _LAUNCH_FIELDS
+    expected_fds = 2 if path_addressed else MAX_FDS
+    if set(request) != expected_fields or len(fds) != expected_fds:
+        raise RuntimeError(
+            "launch request must carry the exact contract and "
+            f"{'two' if path_addressed else 'three'} FDs"
+        )
     _validate_executor_identity(request)
     identifier = request.get("id")
     if not isinstance(identifier, str):
         raise RuntimeError("invalid worker id")
     _validate_identifier(identifier)
-    checkout_root = _validate_checkout(fds[0], request)
+    if path_addressed:
+        fds.insert(0, _open_path_checkout(request))
+        checkout_root = None
+    else:
+        checkout_root = _validate_checkout(fds[0], request)
+    for fd in fds[1:]:
+        metadata = os.fstat(fd)
+        if not stat.S_ISREG(metadata.st_mode):
+            raise RuntimeError("worker output FD must be a regular file")
     command = _validate_command(request)
     environment = _validate_environment(request["env"])
     timeout_s = request["timeout_s"]
@@ -475,6 +626,8 @@ def _handle_launch(connection: socket.socket, request: dict[str, Any], fds: list
         or timeout_s <= 0
     ):
         raise RuntimeError("worker timeout must be a positive finite number")
+    stdout_limit = _positive_integer(request, "stdout_limit")
+    stderr_limit = _positive_integer(request, "stderr_limit")
     with _jobs_lock:
         if identifier in _jobs or identifier in _launching:
             raise RuntimeError("worker id is already active")
@@ -520,19 +673,15 @@ def _handle_launch(connection: socket.socket, request: dict[str, Any], fds: list
         with _jobs_lock:
             _jobs[identifier] = proc
             _launching.remove(identifier)
-        os.close(fds[1])
-        fds[1] = -1
-        os.close(fds[2])
-        fds[2] = -1
         _send(connection, {"id": identifier, "status": "started", "pid": proc.pid})
-        timed_out = False
-        try:
-            exit_code = proc.wait(timeout=timeout_s + _CONTROLLER_CANCELLATION_GRACE_S)
-            _terminate_process_group(proc, 0)
-        except subprocess.TimeoutExpired:
-            timed_out = True
-            _terminate_process_group(proc)
-            exit_code = proc.returncode
+        exit_code, timed_out, output_overflow = _wait_with_output_limits(
+            proc,
+            timeout_s,
+            fds[1],
+            stdout_limit,
+            fds[2],
+            stderr_limit,
+        )
         with _jobs_lock:
             _jobs.pop(identifier, None)
         _cleanup_home(home)
@@ -542,6 +691,7 @@ def _handle_launch(connection: socket.socket, request: dict[str, Any], fds: list
             "status": "terminal",
             "exit_code": exit_code,
             "timed_out": timed_out,
+            "output_overflow": output_overflow,
         })
     finally:
         with _jobs_lock:
@@ -569,7 +719,7 @@ def handle_connection(connection: socket.socket) -> None:
             raise RuntimeError("unsupported worker request")
         raw_identifier = request.get("id")
         identifier = raw_identifier if isinstance(raw_identifier, str) else None
-        if request.get("op") == "launch":
+        if request.get("op") in {"launch", "launch_path"}:
             _handle_launch(connection, request, fds)
         elif request.get("op") == "cancel":
             _handle_cancel(connection, request, fds)

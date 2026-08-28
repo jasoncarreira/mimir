@@ -4,11 +4,19 @@ from __future__ import annotations
 
 import os
 import re
+from contextvars import ContextVar, Token
 from functools import lru_cache
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from .secret_scan import contains_secret
+
+if TYPE_CHECKING:
+    from .tools.refusals import ToolPolicyRefusal
+
+_read_policy_refusal_capture: ContextVar[list[ToolPolicyRefusal] | None] = ContextVar(
+    "read_policy_refusal_capture", default=None,
+)
 
 _PEM_PRIVATE_KEY_PATTERN = re.compile(
     r"-----BEGIN [^-\r\n]*PRIVATE KEY-----", re.IGNORECASE,
@@ -149,6 +157,29 @@ def emit_hard_read_denial(tool: str, target: Any, reason: str) -> None:
         auth_context=getattr(turn_context, "auth_context", None),
         turn_context=turn_context,
     )
+
+
+def begin_read_policy_refusal_capture() -> Token[list[ToolPolicyRefusal] | None]:
+    """Capture typed pre-execution read refusals for one tool call."""
+    return _read_policy_refusal_capture.set([])
+
+
+def record_read_policy_refusal(message: str) -> None:
+    """Publish a typed refusal without changing the backend result contract."""
+    from .tools.refusals import ToolPolicyRefusal
+
+    capture = _read_policy_refusal_capture.get()
+    if capture is not None:
+        capture.append(ToolPolicyRefusal(message))
+
+
+def end_read_policy_refusal_capture(
+    token: Token[list[ToolPolicyRefusal] | None],
+) -> ToolPolicyRefusal | None:
+    """Return the captured refusal and restore any enclosing capture."""
+    captured = _read_policy_refusal_capture.get()
+    _read_policy_refusal_capture.reset(token)
+    return captured[-1] if captured else None
 
 _PROTECTED_BASENAMES = frozenset({
     ".env",
@@ -371,9 +402,13 @@ def protected_read_denial_reason(path: Path) -> str | None:
         is_memory_read_path(path)
         and not is_memory_read_path_allowed(path, auth_context)
     )
-    general_protected = not service_scoped and is_protected_read_path(path)
     service_name_protected = is_current_service_protected_read_path(path)
     protected_name = _has_protected_read_name(path)
+    general_protected = is_protected_read_path(path)
+    # A service root may widen the general home boundary, but it must not erase
+    # a protected component consumed by that root.
+    if service_scoped and not (service_name_protected or protected_name):
+        general_protected = False
     if not (
         memory_scope_denied
         or general_protected

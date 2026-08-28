@@ -72,6 +72,45 @@ class VectorIndex:
         self._next_pos = 0
         self._lock = threading.Lock()
         self._built = False
+        # Number rejected for a declared or encoded dimension mismatch since
+        # the most recent bulk build, including subsequent incremental adds.
+        self.dimension_mismatch_count = 0
+        # Search degradation is reported once per reason/observed dimension for
+        # each uninterrupted degraded streak. A valid vector clears the set so
+        # a later recurrence remains observable without logging every query.
+        self._reported_search_degradations: set[tuple[str, int | None]] = set()
+
+    def _report_search_degradation(
+        self,
+        reason: str,
+        *,
+        observed_dimension: int | None = None,
+        emit_event: bool = False,
+    ) -> None:
+        """Report a semantic-search failure without breaking FTS fallback."""
+        key = (reason, observed_dimension)
+        with self._lock:
+            if key in self._reported_search_degradations:
+                return
+            self._reported_search_degradations.add(key)
+
+        logger.warning(
+            "VectorIndex semantic search degraded to FTS5: reason=%s "
+            "expected_dim=%d observed_dim=%s",
+            reason,
+            self.dimension,
+            observed_dimension,
+        )
+        if not emit_event:
+            return
+        from .ownership import _emit_saga_event
+
+        _emit_saga_event(
+            "saga_vector_search_degraded",
+            reason=reason,
+            expected_dimension=self.dimension,
+            observed_dimension=observed_dimension,
+        )
 
     @property
     def total_vectors(self) -> int:
@@ -112,15 +151,17 @@ class VectorIndex:
 
         ids: list[str] = []
         vecs: list[np.ndarray] = []
+        dimension_mismatches = 0
         for atom_id, blob, dim in rows:
             if blob is None or dim is None or dim != self.dimension:
-                # Mismatched dim — likely a provider switch mid-stream.
-                # Skip; a re-embedding pass would re-add these.
+                dimension_mismatches += 1
                 continue
-            if len(blob) < self.dimension * 4:
+            if len(blob) != self.dimension * 4:
+                dimension_mismatches += 1
                 continue
             vec = np.frombuffer(blob, dtype=np.float32).copy()
             if vec.shape[0] != self.dimension:
+                dimension_mismatches += 1
                 continue
             ids.append(atom_id)
             vecs.append(vec)
@@ -133,6 +174,14 @@ class VectorIndex:
                 self._removed.clear()
                 self._next_pos = 0
                 self._built = True
+                self.dimension_mismatch_count = dimension_mismatches
+            if dimension_mismatches:
+                logger.warning(
+                    "VectorIndex dropped %d atom vectors with dimension mismatch "
+                    "(expected dim=%d)",
+                    dimension_mismatches,
+                    self.dimension,
+                )
             return
 
         matrix = np.vstack(vecs).astype(np.float32)
@@ -162,6 +211,15 @@ class VectorIndex:
             self._next_pos = n
             self._removed.clear()
             self._built = True
+            self.dimension_mismatch_count = dimension_mismatches
+
+        if dimension_mismatches:
+            logger.warning(
+                "VectorIndex dropped %d atom vectors with dimension mismatch "
+                "(expected dim=%d)",
+                dimension_mismatches,
+                self.dimension,
+            )
 
         logger.info(
             "VectorIndex built: %d vectors, dim=%d, type=%s",
@@ -188,13 +246,17 @@ class VectorIndex:
 
         ids: list[str] = []
         vecs: list[np.ndarray] = []
+        dimension_mismatches = 0
         for sess_id, blob, dim in rows:
             if blob is None or dim is None or dim != self.dimension:
+                dimension_mismatches += 1
                 continue
-            if len(blob) < self.dimension * 4:
+            if len(blob) != self.dimension * 4:
+                dimension_mismatches += 1
                 continue
             vec = np.frombuffer(blob, dtype=np.float32).copy()
             if vec.shape[0] != self.dimension:
+                dimension_mismatches += 1
                 continue
             ids.append(sess_id)
             vecs.append(vec)
@@ -207,6 +269,14 @@ class VectorIndex:
                 self._removed.clear()
                 self._next_pos = 0
                 self._built = True
+                self.dimension_mismatch_count = dimension_mismatches
+            if dimension_mismatches:
+                logger.warning(
+                    "Sessions VectorIndex dropped %d vectors with dimension "
+                    "mismatch (expected dim=%d)",
+                    dimension_mismatches,
+                    self.dimension,
+                )
             return
 
         matrix = np.vstack(vecs).astype(np.float32)
@@ -225,6 +295,15 @@ class VectorIndex:
             self._next_pos = n
             self._removed.clear()
             self._built = True
+            self.dimension_mismatch_count = dimension_mismatches
+
+        if dimension_mismatches:
+            logger.warning(
+                "Sessions VectorIndex dropped %d vectors with dimension mismatch "
+                "(expected dim=%d)",
+                dimension_mismatches,
+                self.dimension,
+            )
 
         logger.info(
             "Sessions VectorIndex built: %d vectors, dim=%d", n, self.dimension,
@@ -239,10 +318,33 @@ class VectorIndex:
         """
         if not FAISS_AVAILABLE:
             return
-        if len(vec_bytes) < self.dimension * 4:
+        if len(vec_bytes) != self.dimension * 4:
+            with self._lock:
+                self.dimension_mismatch_count += 1
+                mismatch_count = self.dimension_mismatch_count
+            logger.warning(
+                "VectorIndex dropped incremental vector %s with %d bytes; "
+                "expected %d bytes for dim=%d (dimension mismatch count=%d)",
+                atom_id,
+                len(vec_bytes),
+                self.dimension * 4,
+                self.dimension,
+                mismatch_count,
+            )
             return
         vec = np.frombuffer(vec_bytes, dtype=np.float32).copy().reshape(1, -1)
         if vec.shape[1] != self.dimension:
+            with self._lock:
+                self.dimension_mismatch_count += 1
+                mismatch_count = self.dimension_mismatch_count
+            logger.warning(
+                "VectorIndex dropped incremental vector %s with dim=%d; "
+                "expected dim=%d (dimension mismatch count=%d)",
+                atom_id,
+                vec.shape[1],
+                self.dimension,
+                mismatch_count,
+            )
             return
         faiss.normalize_L2(vec)
 
@@ -281,14 +383,43 @@ class VectorIndex:
     def search(self, query_vec, top_k: int = 20) -> list[tuple[str, float]]:
         """Return up to ``top_k`` ``(atom_id, cosine_similarity)`` matches.
 
-        Empty list if the index is missing, empty, or FAISS unavailable —
-        callers must be tolerant (recall.py treats empty FAISS results
-        as "no semantic candidates" and falls back to FTS5).
+        Empty list if the query vector is malformed, the index is missing or
+        empty, or FAISS is unavailable — callers must be tolerant (recall.py
+        treats empty FAISS results as "no semantic candidates" and falls back
+        to FTS5). A missing/empty vector is an expected provider degradation
+        and is warning-logged. Conversion failures and dimension mismatches are
+        anomalous and additionally emit a durable event.
         """
         if not FAISS_AVAILABLE:
             return []
 
-        q = np.array(query_vec, dtype=np.float32).reshape(1, -1)
+        if query_vec is None:
+            self._report_search_degradation("missing_query_vector")
+            return []
+        try:
+            q = np.asarray(query_vec, dtype=np.float32).reshape(-1)
+        except (TypeError, ValueError):
+            self._report_search_degradation(
+                "malformed_query_vector",
+                emit_event=True,
+            )
+            return []
+        if q.size == 0:
+            self._report_search_degradation(
+                "empty_query_vector",
+                observed_dimension=0,
+            )
+            return []
+        if q.size != self.dimension:
+            self._report_search_degradation(
+                "query_dimension_mismatch",
+                observed_dimension=int(q.size),
+                emit_event=True,
+            )
+            return []
+        with self._lock:
+            self._reported_search_degradations.clear()
+        q = q.reshape(1, -1)
         faiss.normalize_L2(q)
 
         # chainlink #319: hold the lock for the WHOLE read. The emptiness

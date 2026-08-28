@@ -34,6 +34,8 @@ def test_create_worktree_uses_attempt_scoped_branch_and_path(tmp_path: Path) -> 
 
     def runner(args: Sequence[str]) -> subprocess.CompletedProcess[str]:
         calls.append(list(args))
+        if args[-2:] == ["--verify", "origin/main"]:
+            return subprocess.CompletedProcess(list(args), 0, stdout="main123\n", stderr="")
         if args[-1] == "refs/remotes/origin/main":
             return completed(args, returncode=1)
         return completed(args)
@@ -45,7 +47,12 @@ def test_create_worktree_uses_attempt_scoped_branch_and_path(tmp_path: Path) -> 
     assert lease.base_ref == "main"
     assert lease.local_base == "main"
     assert calls == [
+        [
+            "git", "-C", str(tmp_path), "status", "--porcelain=v1", "-z",
+            "--untracked-files=all", "--ignored=no",
+        ],
         ["git", "-C", str(tmp_path), "fetch", "origin", "main"],
+        ["git", "-C", str(tmp_path), "rev-parse", "--verify", "origin/main"],
         [
             "git",
             "-C",
@@ -56,7 +63,7 @@ def test_create_worktree_uses_attempt_scoped_branch_and_path(tmp_path: Path) -> 
             "refs/remotes/origin/main",
         ],
         ["git", "-C", str(tmp_path), "rev-parse", "--verify", "--quiet", "refs/heads/main"],
-        ["git", "-C", str(tmp_path), "merge-base", "--is-ancestor", "FETCH_HEAD", "main"],
+        ["git", "-C", str(tmp_path), "merge-base", "--is-ancestor", "main123", "main"],
         [
             "git",
             "-C",
@@ -211,6 +218,181 @@ def _repo_with_main(tmp_path: Path) -> Path:
     return repo
 
 
+def _base_refusal(repo: Path) -> tuple[str, dict[str, object]]:
+    events: list[tuple[str, dict[str, object]]] = []
+    with pytest.raises(RuntimeError) as raised:
+        create_worktree(
+            repo,
+            issue_id=1459,
+            attempt=1,
+            event_logger=lambda name, **payload: events.append((name, payload)),
+        )
+    assert len(events) == 1
+    return str(raised.value), events[0]
+
+
+def test_clean_base_is_accepted_without_an_event(tmp_path: Path) -> None:
+    repo = _repo_with_main(tmp_path)
+    events: list[tuple[str, dict[str, object]]] = []
+
+    lease = create_worktree(
+        repo,
+        issue_id=1459,
+        attempt=1,
+        event_logger=lambda name, **payload: events.append((name, payload)),
+    )
+
+    assert lease.path.exists()
+    assert events == []
+
+
+def test_controller_source_overlap_guard_refuses_same_tree(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = _repo_with_main(tmp_path)
+    monkeypatch.setenv("MIMIR_SOURCE_DIR", str(repo))
+
+    with pytest.raises(RuntimeError, match="overlaps the running controller source"):
+        create_isolated_checkout(repo, issue_id=1465, attempt=1)
+
+
+def test_dirty_worklink_base_cannot_contaminate_controller_source(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    controller_root = tmp_path / "controller-tree"
+    controller_root.mkdir()
+    controller = _repo_with_main(controller_root)
+    base = tmp_path / "worklink-base"
+    subprocess.run(["git", "clone", "-q", _git(controller, "remote", "get-url", "origin"), str(base)], check=True)
+    monkeypatch.setenv("MIMIR_SOURCE_DIR", str(controller))
+    (base / "foreign.txt").write_text("build contamination\n", encoding="utf-8")
+
+    with pytest.raises(RuntimeError, match=r"base repo refused \(dirty\)"):
+        create_isolated_checkout(base, issue_id=1465, attempt=2)
+
+    assert _git(controller, "status", "--porcelain") == ""
+    assert not (controller / "foreign.txt").exists()
+
+
+def test_staged_addition_refuses_base_and_names_path(tmp_path: Path) -> None:
+    repo = _repo_with_main(tmp_path)
+    (repo / "staged.txt").write_text("foreign\n", encoding="utf-8")
+    _git(repo, "add", "staged.txt")
+
+    message, event = _base_refusal(repo)
+
+    assert "staged (1): 'staged.txt'" in message
+    assert event == (
+        "worklink_base_repo_refused",
+        {
+            "repo": str(repo),
+            "reason": "dirty",
+            "detail": "1 dirty path(s); staged (1): 'staged.txt'",
+            "dirty_count": 1,
+            "staged_count": 1,
+            "staged_paths": ["staged.txt"],
+            "unstaged_count": 0,
+            "unstaged_paths": [],
+            "untracked_count": 0,
+            "untracked_paths": [],
+            "sample_limit": 20,
+        },
+    )
+
+
+def test_unstaged_modification_refuses_base_and_names_path(tmp_path: Path) -> None:
+    repo = _repo_with_main(tmp_path)
+    (repo / "shared.txt").write_text("foreign\n", encoding="utf-8")
+
+    message, event = _base_refusal(repo)
+
+    assert "unstaged (1): 'shared.txt'" in message
+    assert event[1]["unstaged_paths"] == ["shared.txt"]
+
+
+def test_ignored_only_untracked_content_is_accepted(tmp_path: Path) -> None:
+    repo = _repo_with_main(tmp_path)
+    (repo / ".gitignore").write_text(".venv/\n.worktrees/\n", encoding="utf-8")
+    _git(repo, "add", ".gitignore")
+    _git(repo, "commit", "-q", "-m", "ignore local directories")
+    (repo / ".venv").mkdir()
+    (repo / ".venv" / "python").write_text("ignored\n", encoding="utf-8")
+    (repo / ".worktrees").mkdir()
+    (repo / ".worktrees" / "attempt").write_text("ignored\n", encoding="utf-8")
+    events: list[tuple[str, dict[str, object]]] = []
+
+    lease = create_worktree(
+        repo,
+        issue_id=1459,
+        attempt=1,
+        event_logger=lambda name, **payload: events.append((name, payload)),
+    )
+
+    assert lease.path.exists()
+    assert events == []
+
+
+def test_base_repo_owner_mismatch_refuses_before_git_runs(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A base repo owned by another account is refused without consulting git.
+
+    Running ``git status`` as a non-owner yields "dubious ownership" and an EMPTY
+    porcelain result, which reads as clean. The sibling test covers that reactive
+    path; this one covers the proactive uid comparison that avoids it entirely.
+    """
+    events: list[tuple[str, dict[str, object]]] = []
+    owner_uid = tmp_path.stat().st_uid
+
+    def runner(args: Sequence[str]) -> subprocess.CompletedProcess[str]:
+        raise AssertionError(f"git must not run when the base owner differs: {list(args)}")
+
+    monkeypatch.setattr(checkout_module.os, "geteuid", lambda: owner_uid + 1)
+
+    with pytest.raises(RuntimeError, match="owner_mismatch.*status account uid"):
+        create_worktree(
+            tmp_path,
+            issue_id=1459,
+            attempt=1,
+            runner=runner,
+            event_logger=lambda name, **payload: events.append((name, payload)),
+        )
+
+    assert events[0][0] == "worklink_base_repo_refused"
+    payload = events[0][1]
+    assert payload["reason"] == "owner_mismatch"
+    assert payload["owner_uid"] == owner_uid
+    assert payload["effective_uid"] == owner_uid + 1
+
+
+def test_git_status_ownership_failure_refuses_instead_of_reading_empty_stdout(
+    tmp_path: Path,
+) -> None:
+    events: list[tuple[str, dict[str, object]]] = []
+
+    def runner(args: Sequence[str]) -> subprocess.CompletedProcess[str]:
+        assert args[3] == "status"
+        return subprocess.CompletedProcess(
+            list(args),
+            128,
+            stdout="",
+            stderr="fatal: detected dubious ownership in repository\n",
+        )
+
+    with pytest.raises(RuntimeError, match="status_failed.*dubious ownership"):
+        create_worktree(
+            tmp_path,
+            issue_id=1459,
+            attempt=1,
+            runner=runner,
+            event_logger=lambda name, **payload: events.append((name, payload)),
+        )
+
+    assert events[0][0] == "worklink_base_repo_refused"
+    assert events[0][1]["reason"] == "status_failed"
+
+
 def test_default_factory_entrypoint_resolves_outside_allocated_checkout(
     tmp_path: Path,
 ) -> None:
@@ -303,6 +485,10 @@ def test_base_fetch_failure_gates_build_and_logs_real_reason(tmp_path: Path) -> 
     # attempts). Here the probe finds nothing, so the fetch must NOT be retried —
     # a genuine network failure should fail closed immediately, not double up.
     assert calls == [
+        [
+            "git", "-C", str(tmp_path), "status", "--porcelain=v1", "-z",
+            "--untracked-files=all", "--ignored=no",
+        ],
         ["git", "-C", str(tmp_path), "fetch", "origin", "main"],
         ["git", "-C", str(tmp_path), "for-each-ref", "--format=%(refname) %(objectname)"],
     ]
@@ -493,28 +679,76 @@ def test_alternate_repair_refuses_objects_available_only_from_alternate(tmp_path
     assert refused["retained_refs"] == [f"refs/heads/rescue-alternate@{unique_sha}"]
 
 
-def test_stale_remote_tracking_base_fails_with_shas_and_behind_count(tmp_path: Path) -> None:
+def test_requested_base_ignores_first_fetch_head_entry_when_current(tmp_path: Path) -> None:
+    fetch_head = tmp_path / ".git" / "FETCH_HEAD"
+    fetch_head.parent.mkdir()
+    fetch_head.write_text(
+        "main123\t\tbranch 'main' of example.invalid/repo\n"
+        "feature123\t\tbranch 'feature/acp' of example.invalid/repo\n",
+        encoding="utf-8",
+    )
     calls: list[list[str]] = []
 
     def runner(args: Sequence[str]) -> subprocess.CompletedProcess[str]:
         calls.append(list(args))
-        if args[-3:] == ["--is-ancestor", "FETCH_HEAD", "origin/main"]:
+        if args[-2:] == ["--verify", "origin/feature/acp"]:
+            return subprocess.CompletedProcess(list(args), 0, stdout="feature123\n", stderr="")
+        return completed(args)
+
+    lease = create_worktree(
+        tmp_path,
+        issue_id=1458,
+        attempt=1,
+        base="feature/acp",
+        runner=runner,
+    )
+
+    assert lease.local_base == "origin/feature/acp"
+    assert [
+        "git", "-C", str(tmp_path), "merge-base", "--is-ancestor",
+        "feature123", "origin/feature/acp",
+    ] in calls
+    assert not any("FETCH_HEAD" in call for call in calls)
+
+
+@pytest.mark.parametrize("base,first_base", [("main", "feature/acp"), ("feature/acp", "main")])
+def test_stale_remote_tracking_base_fails_with_named_ref_and_behind_count(
+    tmp_path: Path,
+    base: str,
+    first_base: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    remote_ref = f"origin/{base}"
+    fetch_head = tmp_path / ".git" / "FETCH_HEAD"
+    fetch_head.parent.mkdir()
+    fetch_head.write_text(
+        f"other456\t\tbranch '{first_base}' of example.invalid/repo\n"
+        f"origin456\t\tbranch '{base}' of example.invalid/repo\n",
+        encoding="utf-8",
+    )
+    calls: list[list[str]] = []
+    monkeypatch.setattr(checkout_module, "_resolve_local_base", lambda *_args, **_kwargs: base)
+
+    def runner(args: Sequence[str]) -> subprocess.CompletedProcess[str]:
+        calls.append(list(args))
+        if args[-3:] == ["--is-ancestor", "origin456", base]:
             return completed(args, returncode=1)
-        if args[-2:] == ["--verify", "origin/main"]:
-            return subprocess.CompletedProcess(list(args), 0, stdout="local123\n", stderr="")
-        if args[-2:] == ["--verify", "FETCH_HEAD"]:
+        if args[-2:] == ["--verify", remote_ref]:
             return subprocess.CompletedProcess(list(args), 0, stdout="origin456\n", stderr="")
-        if args[-2:] == ["--count", "origin/main..FETCH_HEAD"]:
+        if args[-2:] == ["--verify", base]:
+            return subprocess.CompletedProcess(list(args), 0, stdout="local123\n", stderr="")
+        if args[-2:] == ["--count", f"{base}..origin456"]:
             return subprocess.CompletedProcess(list(args), 0, stdout="3\n", stderr="")
         return completed(args)
 
     with pytest.raises(
         RuntimeError,
-        match="stale base local123, origin origin456, 3 commits behind",
+        match=rf"stale base local123, {remote_ref} origin456, 3 commits behind",
     ):
-        create_worktree(tmp_path, issue_id=967, attempt=2, runner=runner)
+        create_worktree(tmp_path, issue_id=967, attempt=2, base=base, runner=runner)
 
     assert not any(call[3:5] == ["worktree", "add"] for call in calls)
+    assert not any("FETCH_HEAD" in call for call in calls)
 
 
 def test_create_worktree_real_git_feature_acp_remote_base(tmp_path: Path) -> None:
@@ -919,6 +1153,79 @@ def test_clone_raises_when_the_object_copy_also_fails() -> None:
         )
 
 
+def test_foreign_owned_git_objects_are_reported_with_path_uid_and_mode(
+    tmp_path: Path,
+) -> None:
+    repo = tmp_path / "repo"
+    object_path = repo / ".git" / "objects" / "aa" / "object"
+    object_path.parent.mkdir(parents=True)
+    object_path.write_bytes(b"object")
+    object_path.chmod(0o444)
+    events: list[tuple[str, dict]] = []
+
+    foreign = checkout_module.report_foreign_owned_git_objects(
+        repo,
+        expected_uid=object_path.stat().st_uid + 1,
+        event_logger=lambda name, **fields: events.append((name, fields)),
+    )
+
+    assert foreign == [object_path]
+    assert events == [
+        (
+            "worklink_foreign_owned_git_object",
+            {
+                "repo": str(repo),
+                "object_path": str(object_path),
+                "owner_uid": object_path.stat().st_uid,
+                "expected_owner_uid": object_path.stat().st_uid + 1,
+                "mode": "0o444",
+            },
+        )
+    ]
+
+
+def test_git_object_ownership_check_stays_quiet_when_every_object_matches(
+    tmp_path: Path,
+) -> None:
+    repo = tmp_path / "repo"
+    object_path = repo / ".git" / "objects" / "bb" / "object"
+    object_path.parent.mkdir(parents=True)
+    object_path.write_bytes(b"object")
+    events: list[tuple[str, dict]] = []
+
+    foreign = checkout_module.report_foreign_owned_git_objects(
+        repo,
+        expected_uid=object_path.stat().st_uid,
+        event_logger=lambda name, **fields: events.append((name, fields)),
+    )
+
+    assert foreign == []
+    assert events == []
+
+
+def test_git_object_ownership_check_is_not_reachable_from_clone_path(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scanner_name = checkout_module.report_foreign_owned_git_objects.__name__
+
+    monkeypatch.setattr(
+        checkout_module,
+        scanner_name,
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("ownership check reached from clone path")
+        ),
+    )
+    checkout_module._clone_attempt_checkout(
+        Path("/repo"),
+        Path("/checkout"),
+        runner=lambda args: completed(args),
+        event_logger=None,
+    )
+
+    assert scanner_name not in inspect.getsource(checkout_module._clone_attempt_checkout)
+    assert scanner_name not in inspect.getsource(checkout_module.create_isolated_checkout)
+
+
 @pytest.mark.parametrize("value", [None, "", "0", "false", "off"])
 def test_disabled_coding_keeps_legacy_checkout_path(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, value: str | None
@@ -1042,14 +1349,14 @@ def test_fd_normalization_rejects_special_files(
         os.close(checkout_fd)
 
 
-def test_enabled_eligible_checkout_retains_exact_authorization_and_shared_modes(
+def test_enabled_eligible_checkout_uses_normal_path_and_shared_modes_without_authorization(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     repo = _repo_with_main(tmp_path)
-    enabled_root = tmp_path / "enabled"
     calls: list[list[str]] = []
     monkeypatch.setenv("MIMIR_CODING_ENABLED", "true")
-    monkeypatch.setattr(checkout_module, "_ENABLED_CHECKOUT_ROOT", enabled_root)
+    forbidden_root = tmp_path / "enabled"
+    monkeypatch.setattr(checkout_module, "_ENABLED_CHECKOUT_ROOT", forbidden_root)
     monkeypatch.setattr(
         checkout_module,
         "get_identities",
@@ -1060,6 +1367,7 @@ def test_enabled_eligible_checkout_retains_exact_authorization_and_shared_modes(
         calls.append(list(args))
         return subprocess.run(list(args), capture_output=True, text=True, check=False)
 
+    source_before = repo.stat()
     lease = create_isolated_checkout(
         repo,
         issue_id=1410,
@@ -1068,24 +1376,21 @@ def test_enabled_eligible_checkout_retains_exact_authorization_and_shared_modes(
         worker_eligible=True,
     )
     try:
-        assert lease.worker_authorized is True
-        assert lease.authorization is not None
-        assert lease.path.parent.parent.parent == enabled_root
-        assert stat.S_IMODE(lease.path.parent.stat().st_mode) == 0o700
-        lease.authorization.verify(lease.path)
-        retained = lease.authorization.duplicate_fd()
-        try:
-            observed = os.fstat(retained)
-            assert (observed.st_dev, observed.st_ino) == (
-                lease.authorization.device,
-                lease.authorization.inode,
-            )
-        finally:
-            os.close(retained)
+        assert lease.path == tmp_path / ".worklink" / repo.name / "1410-1"
+        assert lease.worker_authorized is False
+        assert lease.authorization is None
+        assert not forbidden_root.exists()
         assert stat.S_IMODE(lease.path.stat().st_mode) == 0o2770
+        assert lease.path.stat().st_gid == os.getgid()
         assert stat.S_IMODE((lease.path / ".git").stat().st_mode) == 0o2770
         clone = next(call for call in calls if call[:3] == ["git", "clone", "--local"])
         assert "--no-hardlinks" in clone
+        source_after = repo.stat()
+        assert (source_after.st_uid, source_after.st_gid, source_after.st_mode) == (
+            source_before.st_uid,
+            source_before.st_gid,
+            source_before.st_mode,
+        )
     finally:
         if lease.authorization is not None:
             lease.authorization.close()

@@ -11,14 +11,16 @@ import os
 from pathlib import Path
 import re
 import time
-from typing import Awaitable, Callable, Sequence
+from typing import Awaitable, Callable, Mapping, Sequence
 
 from ...config import model_spec_at_call_time
 from ...opencode_config import (
+    OpenCodeInvocation,
     opencode_model_from_agent_spec,
     opencode_worker_documents,
     resolve_opencode_invocation,
 )
+from ...redaction import redact_text
 from ..compute import ComputeResult, WorkSpec
 from .base import (
     Caps,
@@ -53,6 +55,11 @@ STARTUP_CONTENTION_INITIAL_BACKOFF_S = 0.1
 STARTUP_CONTENTION_WINDOW_S = 5.0
 STARTUP_CONTENTION_RESOURCE = "opencode_sqlite_session_store"
 STARTUP_CONTENTION_EXHAUSTED_REASON = "opencode_startup_sqlite_contention_exhausted"
+TRANSCRIPT_STREAM_MAX_BYTES = 1024 * 1024
+TRANSCRIPT_MAX_BYTES = 16 * 1024 * 1024
+TRANSCRIPTS_PER_ISSUE = 10
+_TRANSCRIPT_COMMAND_MAX_BYTES = 256 * 1024
+_TRANSCRIPT_TRUNCATED = "[earlier output omitted by Worklink]\n"
 _SQLITE_CONTENTION_PATTERNS = (
     re.compile(r"\bdatabase(?: table)? is locked\b", re.IGNORECASE),
     re.compile(r"\bdatabase is busy\b", re.IGNORECASE),
@@ -81,6 +88,40 @@ class WorkerProjection:
             raise ValueError("worker projection exceeds size limit")
         if not isinstance(json.loads(self.document), dict):
             raise ValueError("worker projection must be a JSON object")
+
+
+@dataclass(frozen=True)
+class WorklinkOpenCodeResolution:
+    invocation: OpenCodeInvocation
+    configured_model: str
+    model_diverged: bool
+    env: Mapping[str, str] = field(repr=False)
+
+
+def resolve_worklink_opencode_invocation(
+    env: Mapping[str, str],
+) -> WorklinkOpenCodeResolution:
+    """Resolve an OpenCode invocation consistently for every Worklink path."""
+    model_home = Path(env["MIMIR_HOME"]) if env.get("MIMIR_HOME") else None
+    dotenv_model_spec = model_spec_at_call_time(model_home)
+    configured_model_spec = env.get("MIMIR_MODEL_SPEC", dotenv_model_spec)
+    resolution_env = {**os.environ, **env}
+    resolution_env.setdefault("MIMIR_MODEL_SPEC", configured_model_spec)
+    invocation = resolve_opencode_invocation(env=resolution_env)
+    configured_model = opencode_model_from_agent_spec(configured_model_spec)
+    model_diverged = invocation.model != configured_model
+    if model_diverged:
+        log.warning(
+            "Worklink OpenCode model %s differs from configured agent model %s",
+            invocation.model,
+            configured_model,
+        )
+    return WorklinkOpenCodeResolution(
+        invocation=invocation,
+        configured_model=configured_model,
+        model_diverged=model_diverged,
+        env=resolution_env,
+    )
 
 
 @dataclass(frozen=True)
@@ -124,21 +165,10 @@ class OpenCodeBackend:
         prompt = _prompt_for_order(order)
         args = list(self.extra_args)
         env = dict(order.env)
-        model_home = Path(env["MIMIR_HOME"]) if env.get("MIMIR_HOME") else None
-        dotenv_model_spec = model_spec_at_call_time(model_home)
-        configured_model_spec = env.get("MIMIR_MODEL_SPEC", dotenv_model_spec)
-        resolution_env = {**os.environ, **env}
-        resolution_env.setdefault("MIMIR_MODEL_SPEC", configured_model_spec)
-        invocation = resolve_opencode_invocation(env=resolution_env)
+        resolution = resolve_worklink_opencode_invocation(env)
+        invocation = resolution.invocation
+        resolution_env = resolution.env
         args.extend(("-m", invocation.model))
-        configured_model = opencode_model_from_agent_spec(configured_model_spec)
-        model_diverged = invocation.model != configured_model
-        if model_diverged:
-            log.warning(
-                "Worklink OpenCode model %s differs from configured agent model %s",
-                invocation.model,
-                configured_model,
-            )
         if invocation.config_path.exists() or "OPENCODE_CONFIG" in env:
             env["OPENCODE_CONFIG"] = str(invocation.config_path)
         for key in invocation.pass_env:
@@ -159,8 +189,8 @@ class OpenCodeBackend:
             "args": args,
             "bash_allowlist": list(self.bash_allowlist),
             "model": invocation.model,
-            "configured_model": configured_model,
-            "model_diverged": model_diverged,
+            "configured_model": resolution.configured_model,
+            "model_diverged": resolution.model_diverged,
             "model_source": invocation.model_source,
         }
         enabled = _coding_enabled()
@@ -199,6 +229,7 @@ class OpenCodeBackend:
             local_argv=_local_argv(
                 self.bin, args, order.checkout, prompt, fd_anchored=enabled
             ),
+            output_root=order.transcript_root,
         )
 
     async def invoke_with_startup_retry(
@@ -255,10 +286,10 @@ class OpenCodeBackend:
     async def interpret(self, order: WorkOrder, result: object) -> RawResult:
         if not isinstance(result, ComputeResult):
             raise TypeError("OpenCodeBackend.interpret expects ComputeResult")
-        transcript_path = _transcript_path(order.transcript_root, order.issue_id)
+        transcript_file = transcript_path(order.transcript_root, order.issue_id)
         if result.launch_error:
-            _write_transcript(
-                transcript_path,
+            write_transcript(
+                transcript_file,
                 command=list(result.command),
                 exit_code=None,
                 status="backend_error",
@@ -266,8 +297,10 @@ class OpenCodeBackend:
                 stderr=result.stderr,
                 timed_out=False,
                 output_overflow=False,
+                stdout_path=result.stdout_path,
+                stderr_path=result.stderr_path,
             )
-            return RawResult(-1, transcript_path, "backend_error", result.launch_error)
+            return RawResult(-1, transcript_file, "backend_error", result.launch_error)
 
         blocked_reason = blocked_reason_from_output(result.stdout, result.stderr)
         permission_refusal = _permission_refusal_reason(
@@ -289,8 +322,8 @@ class OpenCodeBackend:
                 status, result.stdout, result.stderr, result.command
             )
         )
-        _write_transcript(
-            transcript_path,
+        write_transcript(
+            transcript_file,
             command=list(result.command),
             exit_code=result.exit_code,
             status=status,
@@ -298,10 +331,12 @@ class OpenCodeBackend:
             stderr=result.stderr,
             timed_out=result.timed_out,
             output_overflow=result.output_overflow,
+            stdout_path=result.stdout_path,
+            stderr_path=result.stderr_path,
         )
         return RawResult(
             result.exit_code,
-            transcript_path,
+            transcript_file,
             status,
             error,
             blocked_reason,
@@ -312,12 +347,7 @@ class OpenCodeBackend:
 def _coding_enabled() -> bool:
     from .. import checkout
 
-    resolver = getattr(checkout, "coding_enabled", None)
-    if resolver is not None:
-        return bool(resolver())
-    return os.environ.get("MIMIR_CODING_ENABLED", "").strip().lower() in {
-        "1", "true", "yes", "on"
-    }
+    return checkout.coding_enabled()
 
 
 def _is_sqlite_contention(result: ComputeResult) -> bool:
@@ -441,8 +471,8 @@ def _permission_refusal_reason(
     )
 
 
-def _transcript_path(transcript_root: Path | None, issue_id: int) -> Path:
-    stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
+def transcript_path(transcript_root: Path | None, issue_id: int) -> Path:
+    stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%S%fZ")
     directory = transcript_root or _default_transcript_root()
     directory.mkdir(parents=True, exist_ok=True)
     return directory / f"opencode-{issue_id}-{stamp}.json"
@@ -455,7 +485,33 @@ def _default_transcript_root() -> Path:
     return home / "state" / "worklink" / "transcripts"
 
 
-def _write_transcript(
+def _bounded_transcript_tail(value: str, limit: int) -> str:
+    scrubbed = redact_text(value)
+    encoded = scrubbed.encode("utf-8")
+    if len(encoded) <= limit:
+        return scrubbed
+    marker = _TRANSCRIPT_TRUNCATED.encode("utf-8")
+    if limit <= len(marker):
+        return encoded[-limit:].decode("utf-8", errors="ignore")
+    return _TRANSCRIPT_TRUNCATED + encoded[-(limit - len(marker)):].decode(
+        "utf-8", errors="ignore"
+    )
+
+
+def _bounded_transcript_command(command: Sequence[str]) -> list[str]:
+    retained: list[str] = []
+    remaining = _TRANSCRIPT_COMMAND_MAX_BYTES
+    for arg in command:
+        if remaining <= 0:
+            retained.append("[remaining command omitted by Worklink]")
+            break
+        bounded = _bounded_transcript_tail(str(arg), remaining)
+        retained.append(bounded)
+        remaining -= len(bounded.encode("utf-8"))
+    return retained
+
+
+def write_transcript(
     path: Path,
     *,
     command: Sequence[str],
@@ -465,19 +521,51 @@ def _write_transcript(
     stderr: str,
     timed_out: bool,
     output_overflow: bool,
+    stdout_path: Path | None = None,
+    stderr_path: Path | None = None,
 ) -> None:
     payload = {
         "backend": "opencode",
-        "command": list(command),
+        "command": _bounded_transcript_command(command),
         "exit_code": exit_code,
         "status": status,
-        "stdout": stdout,
-        "stderr": stderr,
+        "stdout": _bounded_transcript_tail(stdout, TRANSCRIPT_STREAM_MAX_BYTES),
+        "stderr": _bounded_transcript_tail(stderr, TRANSCRIPT_STREAM_MAX_BYTES),
         "timed_out": timed_out,
         "output_overflow": output_overflow,
+        "stdout_path": str(stdout_path) if stdout_path is not None else None,
+        "stderr_path": str(stderr_path) if stderr_path is not None else None,
         "recorded_at": datetime.now(UTC).isoformat(),
     }
-    path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+    encoded = json.dumps(payload, indent=2, sort_keys=True).encode("utf-8")
+    if len(encoded) > TRANSCRIPT_MAX_BYTES:
+        raise ValueError("OpenCode transcript exceeds size limit")
+    path.write_bytes(encoded)
+    siblings = sorted(
+        path.parent.glob(f"opencode-{path.name.split('-', 2)[1]}-*.json"),
+        key=lambda candidate: (candidate.stat().st_mtime_ns, candidate.name),
+        reverse=True,
+    )
+    for stale in siblings[TRANSCRIPTS_PER_ISSUE:]:
+        _remove_transcript_outputs(stale)
+        stale.unlink(missing_ok=True)
+
+
+def _remove_transcript_outputs(path: Path) -> None:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return
+    for field in ("stdout_path", "stderr_path"):
+        value = payload.get(field) if isinstance(payload, dict) else None
+        if not isinstance(value, str):
+            continue
+        output = Path(value)
+        if (
+            output.parent == path.parent
+            and output.name.endswith((".stdout.log", ".stderr.log"))
+        ):
+            output.unlink(missing_ok=True)
 
 
 def _status_from_output(exit_code: int, stdout: str, stderr: str) -> str:

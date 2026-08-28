@@ -4,8 +4,8 @@ description: "The two model-touching halves of Worklink, shipped as one opt-in s
 env:
   required:
     - name: WORKLINK_REPO
-      description: "Absolute path to the git repo the backend works in (e.g. /path/to/your/repo). The ready-queue poller skips dispatch until this is set; the planner half does not need it."
-      example: "/path/to/your/repo"
+      description: "Absolute path to a dedicated base clone from which Worklink creates attempt checkouts. It must not be the running Mimir source checkout. The ready-queue poller skips dispatch until this is set; the planner half does not need it."
+      example: "/var/lib/mimir-worklink/base/project"
   optional:
     - name: WORKLINK_RUN_BIN
       description: "Command (shlex-split) the poller invokes for dispatch. Default `mimir`; set to `uv run mimir` or an absolute venv path if bare `mimir` isn't on PATH."
@@ -123,10 +123,13 @@ silently with an unlabeled executable leaf.
 Once installed and configured (see frontmatter env), the scheduler runs the
 `worklink-ready-queue` poller on its cron (default every 10 min). Each fire:
 
-1. Lists open `worklink:ready` leaves, intersects them with `chainlink issue ready`
-   actionability, and counts active Chainlink locks. A pre-labeled leaf blocked by
-   open dependencies stays untouched until Chainlink reports it ready; once its
-   blocker closes it is eligible on the next poller fire.
+1. Lists open `worklink:ready` issues, excludes `worklink:blocked`, intersects the
+   remainder with `chainlink issue ready` actionability, and counts active
+   Chainlink locks. A pre-labeled leaf blocked by open dependencies stays
+   untouched until Chainlink reports it ready; once its blocker closes it is
+   eligible on the next poller fire. With `MIMIR_FACTORY_EPICS_ENABLED`, an epic
+   must carry both `worklink:ready` and `worklink:epic`; removing
+   `worklink:ready` parks either dispatch path.
 2. Computes free slots from `worklink.yaml` `defaults.max_concurrent` minus active claims. Default cap is 2; `WORKLINK_MAX_CONCURRENT` is only a legacy fallback when the YAML key is absent.
 3. Launches `mimir worklink run <id>` **detached** for up to that many actionable leaves,
    then returns immediately (a run can take minutes; the poller's own 60s budget
@@ -134,7 +137,8 @@ Once installed and configured (see frontmatter env), the scheduler runs the
    in the deterministic core executor.
 
 The detached run inherits the **poller's** env, so `pass_env` must carry anything
-the run needs — notably **`GITHUB_TOKEN`**: the core executor's `_open_pr`
+the run needs - notably **`GITHUB_TOKEN`** and
+**`MIMIR_FACTORY_PUBLISHING_IDENTITY`**: the core executor's `_open_pr`
 (`gh pr create`) runs on the controller side in this subprocess (not in the
 worker), so without the token `gh` can't authenticate and review-ready runs fail
 at PR creation → thrash to `worklink:blocked`. (Manual `bash -lc` dispatch hides
@@ -152,6 +156,9 @@ Safety properties (do not bypass these in the poller):
 - **Stale recovery**: a worker that dies leaves a claim; the core TTL reaper
   (`MIMIR_WORKLINK_REAPER_CRON`) steals it back to `worklink:ready` (or
   `worklink:blocked` once attempts are spent).
+- **Attempt exhaustion**: the executor remains the authoritative budget check.
+  Its first exhausted refusal adds `worklink:blocked`, which excludes the issue
+  from later poller cycles even if a stale `worklink:ready` label remains.
 
 The poller never decides *what* is implementable — only the planner half (and
 the `worklink:ready` label it applies) does. The poller dispatches only the

@@ -402,6 +402,7 @@ async def test_pairing_notifier_aclose_is_idempotent_and_clears_tasks(
 @dataclass
 class _ServerControl:
     events: list[str] = field(default_factory=list)
+    event_payloads: list[tuple[str, dict[str, Any]]] = field(default_factory=list)
     failures: dict[str, BaseException] = field(default_factory=dict)
     runtime_failure: BaseException | None = None
     mcp_enabled: bool = False
@@ -491,11 +492,15 @@ def _controlled_server_app(
             self._on_inject = None
             self._on_event = None
             self._on_pairing_required = None
+            self._on_channel_drained = None
             control.dispatcher = self
 
         def set_run_turn(self, run_turn: Any) -> None:
             self._run_turn = run_turn
             control.events.append("dispatcher:bound" if run_turn is not None else "dispatcher:unbound")
+
+        def set_on_channel_drained(self, callback: Any) -> None:
+            self._on_channel_drained = callback
 
         async def enqueue(self, event: Any) -> bool:
             control.events.append(f"enqueue:{self._run_turn is not None}")
@@ -542,6 +547,10 @@ def _controlled_server_app(
             self._started = False
             self._scheduler.running = False
             control.hit("scheduler:stop")
+
+        def trigger_poller(self, poller_name: str, *, reason: str) -> bool:
+            control.events.append(f"scheduler:trigger:{poller_name}:{reason}")
+            return self._started
 
         def set_arbiter(self, arbiter: Any) -> None:
             self._arbiter = arbiter
@@ -699,6 +708,7 @@ def _controlled_server_app(
         return None, []
 
     async def event(kind: str, **fields: Any) -> None:
+        control.event_payloads.append((kind, fields))
         control.hit(f"log:{kind}")
 
     def register_routes(app: web.Application, **kwargs: Any) -> None:
@@ -732,6 +742,13 @@ def _controlled_server_app(
     monkeypatch.setattr("mimir.server.BenchBridge", BenchBridge)
     monkeypatch.setattr("mimir.server.WebChatBridge", WebChatBridge)
     monkeypatch.setattr("mimir.server.log_event", event)
+    monkeypatch.setattr(
+        "mimir.server.log_durable_event_sync",
+        lambda kind, **fields: (
+            control.event_payloads.append((kind, fields)),
+            control.hit(f"log:{kind}"),
+        ),
+    )
     monkeypatch.setattr("mimir.server.repo_binding_startup_alerts", lambda: [])
     monkeypatch.setattr("mimir.server.reattach_inflight_worklink_runs", lambda home: [])
     monkeypatch.setattr("mimir.server.cancel_background_tasks", cancel_tasks)
@@ -754,17 +771,17 @@ def _controlled_server_app(
     monkeypatch.setattr(
         mimir.liveness,
         "mark_session_running",
-        lambda *args, **kwargs: control.hit("liveness:running"),
+        lambda *args, **kwargs: (control.hit("liveness:running"), True)[1],
     )
     monkeypatch.setattr(
         mimir.liveness,
         "mark_clean_shutdown",
-        lambda home: control.hit("liveness:clean"),
+        lambda home: (control.hit("liveness:clean"), True)[1],
     )
     monkeypatch.setattr(
         mimir.worklink.autonomy,
         "release_claims_for_graceful_shutdown",
-        lambda *args, **kwargs: control.hit("claims:release") or [],
+        lambda *args, **kwargs: control.hit("claims:release") or ([], []),
     )
     monkeypatch.setattr(mimir.mcp_client, "MCPManager", MCPManager)
     monkeypatch.setattr(mimir.mcp_client, "MCPPolicyStore", MCPPolicyStore)
@@ -831,6 +848,26 @@ async def _run_cleanup(app: web.Application) -> None:
     ]
     assert len(hooks) == 1
     await hooks[0](app)
+
+
+@pytest.mark.asyncio
+async def test_source_repo_hook_uses_pushed_from_repo_not_running_source(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pushed_from = tmp_path / "pushed-from"
+    running_source = tmp_path / "running-source"
+    (pushed_from / ".git" / "hooks").mkdir(parents=True)
+    (running_source / ".git" / "hooks").mkdir(parents=True)
+    monkeypatch.setenv("MIMIR_SOURCE_DIR", str(running_source))
+    app, _ = _controlled_server_app(tmp_path, monkeypatch)
+    monkeypatch.setenv("MIMIR_SOURCE_REPO", str(pushed_from))
+
+    try:
+        await _run_startup(app)
+        assert (pushed_from / ".git" / "hooks" / "pre-push").is_file()
+        assert not (running_source / ".git" / "hooks" / "pre-push").exists()
+    finally:
+        await _run_cleanup(app)
 
 
 def test_build_app_remains_synchronous_with_unchanged_signature_and_bootstrap(
@@ -939,7 +976,7 @@ async def test_startup_constructs_runtime_first_and_publishes_atomically(
     await _run_startup(app)
     await asyncio.sleep(0)
 
-    assert control.events[0] == "runtime"
+    assert control.events.index("liveness:running") < control.events.index("runtime")
     assert "bridges:bound:True" in control.events
     assert app["agent"] is control.bundle.agent
     assert app["agent_runtime"] is control.bundle
@@ -963,6 +1000,7 @@ async def test_operational_startup_order_and_mcp_bundle_publication(
     await asyncio.sleep(0)
 
     ordered = [
+        "liveness:running",
         "runtime",
         "panel:construct",
         "panel:start",
@@ -972,7 +1010,6 @@ async def test_operational_startup_order_and_mcp_bundle_publication(
         "mcp:start",
         "bundle:mcp",
         "scheduler:start",
-        "liveness:running",
     ]
     positions = [control.events.index(name) for name in ordered]
     assert positions == sorted(positions)
@@ -1103,25 +1140,299 @@ async def test_failed_factory_cancels_resistant_app_tasks_and_preserves_original
 
 
 @pytest.mark.asyncio
-async def test_liveness_write_then_raise_is_compensated_and_clears_state(
+async def test_early_runtime_failure_marks_boot_unclean_and_logs_failure(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    original = RuntimeError("liveness write failed")
-    control = _ServerControl()
-    control.failures["liveness:running"] = original
+    from mimir.event_logger import EventLogger
+    import mimir.liveness
+
+    detect_unclean_restart = mimir.liveness.detect_unclean_restart
+    mark_session_running = mimir.liveness.mark_session_running
+    original = RuntimeError("agent runtime failed")
+    control = _ServerControl(runtime_failure=original)
     app, control = _controlled_server_app(tmp_path, monkeypatch, control)
+    events_path = app["config"].events_log
+    event_logger = EventLogger(events_path, "failed-startup-test")
+    monkeypatch.setattr(
+        "mimir.server.log_durable_event_sync",
+        event_logger.log_durable_sync,
+    )
+    monkeypatch.setattr(mimir.liveness, "detect_unclean_restart", detect_unclean_restart)
+    monkeypatch.setattr(mimir.liveness, "mark_session_running", mark_session_running)
 
     with pytest.raises(RuntimeError) as caught:
         await _run_startup(app)
 
     assert caught.value is original
-    assert "liveness:clean" in control.events
-    assert "bundle:close" in control.events
+    records = [
+        json.loads(line)
+        for line in events_path.read_text(encoding="utf-8").splitlines()
+    ]
+    failures = [record for record in records if record["type"] == "startup_failed"]
+    assert len(failures) == 1
+    assert failures[0]["phase"] == "agent_runtime"
+    assert failures[0]["exception"] == repr(original)
+    marker = mimir.liveness.read_session_marker(tmp_path)
+    assert marker is not None and marker["clean"] is False
+    assert mimir.liveness.detect_unclean_restart(tmp_path) == marker
+    assert "liveness:clean" not in control.events
+    assert "runtime" in control.events
+    assert "bundle:close" not in control.events
     assert "pairing:close" in control.events
     assert app["agent"] is None
     assert app["runtime_slot"].bundle is None
     assert app["startup_state"].compensated is True
+
+
+@pytest.mark.asyncio
+async def test_marker_persistence_failure_aborts_before_runtime(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    control = _ServerControl()
+    app, control = _controlled_server_app(tmp_path, monkeypatch, control)
+    monkeypatch.setattr("mimir.liveness.mark_session_running", lambda *args, **kwargs: False)
+
+    with pytest.raises(RuntimeError, match="failed to persist unclean startup marker"):
+        await _run_startup(app)
+
+    failure = next(
+        fields for kind, fields in control.event_payloads if kind == "startup_failed"
+    )
+    assert failure["phase"] == "liveness_marker"
+    assert "runtime" not in control.events
+    assert app["startup_state"].compensated is True
+
+
+@pytest.mark.asyncio
+async def test_startup_preserves_original_when_durable_and_fallback_logging_fail(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    original = RuntimeError("agent runtime failed")
+    control = _ServerControl(runtime_failure=original)
+    app, control = _controlled_server_app(tmp_path, monkeypatch, control)
+
+    def fail_durable(*args: Any, **kwargs: Any) -> None:
+        raise OSError("events disk unavailable")
+
+    def fail_fallback(*args: Any, **kwargs: Any) -> None:
+        raise RuntimeError("logging handler failed")
+
+    monkeypatch.setattr("mimir.server.log_durable_event_sync", fail_durable)
+    monkeypatch.setattr("mimir.server.log.exception", fail_fallback)
+
+    with pytest.raises(RuntimeError) as caught:
+        await _run_startup(app)
+
+    assert caught.value is original
+    assert "pairing:close" in control.events
+    assert app["startup_state"].compensated is True
+
+
+@pytest.mark.asyncio
+async def test_next_start_reports_early_aborted_startup_as_unclean_restart(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import mimir.liveness
+
+    detect_unclean_restart = mimir.liveness.detect_unclean_restart
+    mark_session_running = mimir.liveness.mark_session_running
+    assert mimir.liveness.read_session_marker(tmp_path) is None
+    original = RuntimeError("agent runtime failed")
+    first_control = _ServerControl(runtime_failure=original)
+    first_app, _ = _controlled_server_app(tmp_path, monkeypatch, first_control)
+    monkeypatch.setattr(mimir.liveness, "detect_unclean_restart", detect_unclean_restart)
+    monkeypatch.setattr(mimir.liveness, "mark_session_running", mark_session_running)
+
+    with pytest.raises(RuntimeError):
+        await _run_startup(first_app)
+
+    prior = mimir.liveness.detect_unclean_restart(tmp_path)
+    assert prior is not None and prior["clean"] is False
+
+    second_app, control = _controlled_server_app(tmp_path, monkeypatch)
+    notified: list[dict[str, Any]] = []
+
+    async def notify(home: Path, *, prior: dict[str, Any]) -> None:
+        notified.append(prior)
+
+    monkeypatch.setattr(mimir.liveness, "detect_unclean_restart", detect_unclean_restart)
+    monkeypatch.setattr(mimir.liveness, "mark_session_running", mark_session_running)
+    monkeypatch.setattr(mimir.liveness, "notify_unclean_restart", notify)
+
+    await _run_startup(second_app)
+    await asyncio.sleep(0)
+
+    assert "log:liveness_unclean_restart" in control.events
+    assert notified == [prior]
+    marker = mimir.liveness.read_session_marker(tmp_path)
+    assert marker is not None
+    assert isinstance(marker.get("last_unclean_notify_ts"), float)
+    await _run_cleanup(second_app)
+
+
+@pytest.mark.asyncio
+async def test_recovery_boot_failure_does_not_suppress_next_unclean_restart_alert(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import mimir.liveness
+
+    detect_unclean_restart = mimir.liveness.detect_unclean_restart
+    mark_session_running = mimir.liveness.mark_session_running
+    mark_session_running(tmp_path, started_at=1000.0)
+    first_prior = detect_unclean_restart(tmp_path)
+    assert first_prior is not None
+
+    failed_recovery = RuntimeError("recovery runtime failed")
+    second_app, _ = _controlled_server_app(
+        tmp_path,
+        monkeypatch,
+        _ServerControl(runtime_failure=failed_recovery),
+    )
+    monkeypatch.setattr(mimir.liveness, "detect_unclean_restart", detect_unclean_restart)
+    monkeypatch.setattr(mimir.liveness, "mark_session_running", mark_session_running)
+
+    with pytest.raises(RuntimeError, match="recovery runtime failed"):
+        await _run_startup(second_app)
+
+    pending = detect_unclean_restart(tmp_path)
+    assert pending is not None
+    assert pending.get("last_unclean_notify_ts") is None
+
+    third_app, control = _controlled_server_app(tmp_path, monkeypatch)
+    notified: list[dict[str, Any]] = []
+
+    async def notify(home: Path, *, prior: dict[str, Any]) -> None:
+        notified.append(prior)
+
+    monkeypatch.setattr(mimir.liveness, "detect_unclean_restart", detect_unclean_restart)
+    monkeypatch.setattr(mimir.liveness, "mark_session_running", mark_session_running)
+    monkeypatch.setattr(mimir.liveness, "notify_unclean_restart", notify)
+
+    await _run_startup(third_app)
+    await asyncio.sleep(0)
+
+    assert "log:liveness_unclean_restart" in control.events
+    assert notified == [pending]
+    marker = mimir.liveness.read_session_marker(tmp_path)
+    assert marker is not None
+    assert isinstance(marker.get("last_unclean_notify_ts"), float)
+    await _run_cleanup(third_app)
+
+
+@pytest.mark.asyncio
+async def test_notify_task_creation_failure_does_not_suppress_next_boot(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import mimir.liveness
+
+    detect_unclean_restart = mimir.liveness.detect_unclean_restart
+    mark_session_running = mimir.liveness.mark_session_running
+    assert mark_session_running(tmp_path, started_at=1000.0)
+    prior = detect_unclean_restart(tmp_path)
+    assert prior is not None
+
+    recovery_app, _ = _controlled_server_app(tmp_path, monkeypatch)
+    real_spawn = __import__("mimir.server", fromlist=["spawn_background"]).spawn_background
+
+    def fail_notify_spawn(tasks: set[asyncio.Task[Any]], coro: Any, *, name: str | None = None):
+        if name == "mimir-unclean-restart-notify":
+            coro.close()
+            raise RuntimeError("notify task creation failed")
+        return real_spawn(tasks, coro, name=name)
+
+    monkeypatch.setattr(mimir.liveness, "detect_unclean_restart", detect_unclean_restart)
+    monkeypatch.setattr(mimir.liveness, "mark_session_running", mark_session_running)
+    monkeypatch.setattr("mimir.server.spawn_background", fail_notify_spawn)
+
+    with pytest.raises(RuntimeError, match="notify task creation failed"):
+        await _run_startup(recovery_app)
+
+    pending = detect_unclean_restart(tmp_path)
+    assert pending is not None
+    assert pending.get("last_unclean_notify_ts") is None
+
+
+@pytest.mark.asyncio
+async def test_notification_finishing_during_cleanup_preserves_clean_marker(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import mimir.liveness
+
+    real_detect = mimir.liveness.detect_unclean_restart
+    real_mark = mimir.liveness.mark_session_running
+    real_mark_clean = mimir.liveness.mark_clean_shutdown
+    assert real_mark(tmp_path, started_at=1000.0)
+    app, _ = _controlled_server_app(tmp_path, monkeypatch)
+    notify_started = asyncio.Event()
+    handoff_write_attempted = asyncio.Event()
+    real_write = mimir.liveness.write_session_marker
+
+    async def notify(home: Path, *, prior: dict[str, Any]) -> None:
+        notify_started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            # Model a notification transport that completed at the same moment
+            # cleanup cancelled its wrapper task. The wrapper must re-read the
+            # now-clean marker rather than resurrecting stale unclean state.
+            return
+
+    def write_session_marker(home: Path, marker: dict[str, Any]) -> bool:
+        handoff_write_attempted.set()
+        return real_write(home, marker)
+
+    monkeypatch.setattr(mimir.liveness, "detect_unclean_restart", real_detect)
+    monkeypatch.setattr(mimir.liveness, "mark_session_running", real_mark)
+    monkeypatch.setattr(mimir.liveness, "mark_clean_shutdown", real_mark_clean)
+    monkeypatch.setattr(mimir.liveness, "notify_unclean_restart", notify)
+    monkeypatch.setattr(mimir.liveness, "write_session_marker", write_session_marker)
+
+    await _run_startup(app)
+    await asyncio.wait_for(notify_started.wait(), timeout=1.0)
+    await _run_cleanup(app)
+
+    marker = mimir.liveness.read_session_marker(tmp_path)
+    assert marker is not None and marker["clean"] is True
+    assert handoff_write_attempted.is_set()
+    assert isinstance(marker.get("last_unclean_notify_ts"), float)
+
+
+@pytest.mark.asyncio
+async def test_notify_handoff_marker_failure_stays_retryable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import mimir.liveness
+
+    real_detect = mimir.liveness.detect_unclean_restart
+    real_mark = mimir.liveness.mark_session_running
+    app, control = _controlled_server_app(tmp_path, monkeypatch)
+    assert real_mark(tmp_path, started_at=1000.0)
+
+    monkeypatch.setattr(mimir.liveness, "detect_unclean_restart", real_detect)
+    monkeypatch.setattr(mimir.liveness, "mark_session_running", real_mark)
+    monkeypatch.setattr(mimir.liveness, "notify_unclean_restart", AsyncMock())
+    monkeypatch.setattr(mimir.liveness, "write_session_marker", lambda *args, **kwargs: False)
+
+    await _run_startup(app)
+    await asyncio.sleep(0)
+
+    marker = mimir.liveness.read_session_marker(tmp_path)
+    assert marker is not None and marker["clean"] is False
+    assert marker.get("last_unclean_notify_ts") is None
+    await _run_cleanup(app)
+    assert any(
+        kind == "liveness_unclean_restart_handoff_persist_failed"
+        and fields["prior_started_iso"] == "1970-01-01T00:16:40+00:00"
+        for kind, fields in control.event_payloads
+    )
 
 
 @pytest.mark.asyncio
@@ -1234,7 +1545,7 @@ async def test_startup_compensation_continues_after_errors_and_reraises_original
     control = _ServerControl(panel_enabled=True, mcp_enabled=True)
     control.failures.update(
         {
-            "liveness:running": original,
+            "log:api_started": original,
             "scheduler:stop": RuntimeError("scheduler cleanup"),
             "mcp:shutdown": RuntimeError("mcp cleanup"),
             "bridges:disconnect": RuntimeError("bridge cleanup"),
@@ -1272,6 +1583,8 @@ async def test_server_startup_and_cleanup_resource_order(
     app, control = _controlled_server_app(tmp_path, monkeypatch, control)
     await _run_startup(app)
     await asyncio.sleep(0)
+    assert "log:app_started" in control.events
+    assert "log:api_started" in control.events
     control.events.clear()
 
     await _run_cleanup(app)
@@ -1280,9 +1593,9 @@ async def test_server_startup_and_cleanup_resource_order(
         "liveness:clean",
         "claims:release",
         "log:shutdown",
+        "scheduler:stop",
         "dispatcher:drain",
         "cancel:server cleanup",
-        "scheduler:stop",
         "bundle:close",
         "panel:stop",
         "pairing:close",
@@ -1291,6 +1604,101 @@ async def test_server_startup_and_cleanup_resource_order(
     ]
     positions = [control.events.index(name) for name in ordered]
     assert positions == sorted(positions)
+
+
+@pytest.mark.asyncio
+async def test_server_cleanup_stops_scheduler_before_final_channel_drain(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    app, control = _controlled_server_app(tmp_path, monkeypatch)
+    await _run_startup(app)
+    control.events.clear()
+
+    async def drain(*, timeout: float) -> None:
+        callback = control.dispatcher._on_channel_drained
+        assert callback is not None
+        callback("poller:github-activity")
+        control.hit("dispatcher:drain")
+
+    control.dispatcher.drain = drain
+    await _run_cleanup(app)
+
+    assert control.events.index("scheduler:stop") < control.events.index(
+        "dispatcher:drain"
+    )
+    assert "scheduler:trigger:github-activity:remediation_queue_drained" in control.events
+    assert control.scheduler._started is False
+
+
+@pytest.mark.asyncio
+async def test_part_b_startup_summary_emits_when_nothing_dispatched(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    app, control = _controlled_server_app(tmp_path, monkeypatch)
+
+    await _run_startup(app)
+
+    assert (
+        "worklink_reattach_dispatched",
+        {"issues": []},
+    ) in control.event_payloads
+    await _run_cleanup(app)
+
+
+@pytest.mark.asyncio
+async def test_part_c_server_shutdown_summary_includes_released_and_failed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import mimir.worklink.autonomy
+    from mimir.worklink.claims import ShutdownClaimFailure
+
+    app, control = _controlled_server_app(tmp_path, monkeypatch)
+    await _run_startup(app)
+    monkeypatch.setattr(
+        mimir.worklink.autonomy,
+        "release_claims_for_graceful_shutdown",
+        lambda *args, **kwargs: (
+            [SimpleNamespace(issue_id=1400)],
+            [ShutdownClaimFailure(issue_id=1401, reason="release denied")],
+        ),
+    )
+
+    await _run_cleanup(app)
+
+    assert (
+        "worklink_shutdown_claims_released",
+        {
+            "issue_ids": [1400],
+            "failed": [{"issue_id": 1401, "reason": "release denied"}],
+        },
+    ) in control.event_payloads
+
+
+@pytest.mark.asyncio
+async def test_clean_marker_persistence_failure_is_reported_during_cleanup(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import mimir.liveness
+
+    app, control = _controlled_server_app(tmp_path, monkeypatch)
+    await _run_startup(app)
+    monkeypatch.setattr(mimir.liveness, "mark_clean_shutdown", lambda home: False)
+
+    with pytest.raises(ExceptionGroup, match="server cleanup failed") as caught:
+        await _run_cleanup(app)
+
+    assert any(
+        isinstance(error, RuntimeError)
+        and "failed to persist clean-shutdown marker" in str(error)
+        for error in caught.value.exceptions
+    )
+    assert "scheduler:stop" in control.events
+    assert "bundle:close" in control.events
+    assert app["agent"] is None
 
 
 @pytest.mark.asyncio
@@ -1772,6 +2180,32 @@ class TestHandleHealth:
         assert "stale root executor image" in body["error"]
         assert "rebuild the image and restart the container" in body["error"]
 
+    @pytest.mark.asyncio
+    async def test_health_reports_root_executor_source_commit(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from mimir.worklink import worker_client
+
+        socket_path = tmp_path / "executor.sock"
+        socket_path.touch()
+        monkeypatch.setattr(worker_client, "DEFAULT_EXECUTOR_SOCKET", socket_path)
+
+        async def identity(_socket_path: Path = socket_path) -> str:
+            return "c" * 40
+
+        monkeypatch.setattr(worker_client, "verify_executor_identity", identity)
+        app = _health_app()
+        app["check_worker_executor_health"] = True
+        async with TestClient(TestServer(app)) as client:
+            resp = await client.get("/health")
+            body = await resp.json()
+
+        assert resp.status == 200
+        assert body == {
+            "ok": True,
+            "worklink_executor_source_commit": "c" * 40,
+        }
+
 
 # ──────────────────────────────────────────────────────────────────────────────
 # _make_auth_middleware
@@ -2196,6 +2630,56 @@ class TestHandleEvent:
         )
         assert durable_acl.visibility == "private"
 
+    async def test_event_strips_client_asserted_saga_session_id(self) -> None:
+        from mimir.worklink.continuation import (
+            HTTP_EVENT_INGRESS_EXTRA_KEY,
+            HTTP_EVENT_INGRESS_EXTRA_VALUE,
+        )
+
+        app, stub = _event_app()
+        async with TestClient(TestServer(app)) as client:
+            resp = await client.post(
+                "/event",
+                json={
+                    "channel_id": "c",
+                    "extra": {
+                        "saga_session_id": "saga-foreign-123-abc",
+                        "keep": "me",
+                    },
+                },
+            )
+
+        assert resp.status == 200
+        event = stub.enqueue.call_args.args[0]
+        assert event.extra == {
+            HTTP_EVENT_INGRESS_EXTRA_KEY: HTTP_EVENT_INGRESS_EXTRA_VALUE,
+            "keep": "me",
+        }
+
+    async def test_event_strips_client_asserted_delivery_channel(self) -> None:
+        from mimir.worklink.continuation import (
+            HTTP_EVENT_INGRESS_EXTRA_KEY,
+            HTTP_EVENT_INGRESS_EXTRA_VALUE,
+        )
+
+        app, stub = _event_app()
+        async with TestClient(TestServer(app)) as client:
+            resp = await client.post(
+                "/event",
+                json={
+                    "channel_id": "c",
+                    "content": "summarize my recent messages",
+                    "extra": {"deliver": "slack-C0PRIVATE", "keep": "me"},
+                },
+            )
+
+        assert resp.status == 200
+        event = stub.enqueue.call_args.args[0]
+        assert event.extra == {
+            HTTP_EVENT_INGRESS_EXTRA_KEY: HTTP_EVENT_INGRESS_EXTRA_VALUE,
+            "keep": "me",
+        }
+
     async def test_event_strips_forged_worklink_hint_extra(self) -> None:
         from mimir.worklink.continuation import (
             HTTP_EVENT_INGRESS_EXTRA_KEY,
@@ -2433,15 +2917,72 @@ class TestHandleEvent:
         assert event.trigger == "user_message"
 
     @pytest.mark.asyncio
-    async def test_explicit_trigger_forwarded(self) -> None:
-        app, stub = _event_app()
+    async def test_non_admin_arbitrary_trigger_is_rejected(self) -> None:
+        from types import SimpleNamespace
+
+        from mimir.web_channels import web_channel_for_identity
+
+        bob = SimpleNamespace(canonical="bob", display_name="Bob")
+        app, stub = _event_app_authed(bob, is_admin=False)
         async with TestClient(TestServer(app)) as client:
-            await client.post(
+            resp = await client.post(
                 "/event",
-                json={"channel_id": "ch", "trigger": "scheduled_tick"},
+                json={
+                    "channel_id": web_channel_for_identity("bob"),
+                    "trigger": "arbitrary_internal_wake",
+                },
             )
+            body = await resp.json()
+
+        assert resp.status == 403
+        assert body == {
+            "error": "trigger not permitted for non-admin HTTP callers",
+            "allowed_triggers": ["user_message"],
+        }
+        stub.enqueue.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_non_admin_privileged_trigger_is_rejected(self) -> None:
+        from types import SimpleNamespace
+
+        from mimir.web_channels import web_channel_for_identity
+
+        bob = SimpleNamespace(canonical="bob", display_name="Bob")
+        app, stub = _event_app_authed(bob, is_admin=False)
+        async with TestClient(TestServer(app)) as client:
+            resp = await client.post(
+                "/event",
+                json={
+                    "channel_id": web_channel_for_identity("bob"),
+                    "trigger": "saga_session_end",
+                },
+            )
+
+        assert resp.status == 403
+        stub.enqueue.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_admin_explicit_trigger_is_forwarded_without_session_selector(
+        self,
+    ) -> None:
+        from types import SimpleNamespace
+
+        admin = SimpleNamespace(canonical="op", display_name="Op")
+        app, stub = _event_app_authed(admin, is_admin=True)
+        async with TestClient(TestServer(app)) as client:
+            resp = await client.post(
+                "/event",
+                json={
+                    "channel_id": "ch",
+                    "trigger": "scheduled_tick",
+                    "extra": {"saga_session_id": "saga-foreign-123-abc"},
+                },
+            )
+
+        assert resp.status == 200
         event = stub.enqueue.call_args.args[0]
         assert event.trigger == "scheduled_tick"
+        assert "saga_session_id" not in event.extra
 
     @pytest.mark.asyncio
     async def test_content_forwarded(self) -> None:
@@ -2498,7 +3039,7 @@ class TestHandleEvent:
                     "channel_id": web_channel_for_identity("alice"),
                     "author": "operator",
                     "author_id": "operator",
-                    "trigger": "scheduled_tick",
+                    "trigger": "user_message",
                     "source": "api",
                     "service_principal": "scheduler",
                 },

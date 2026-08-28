@@ -8,7 +8,7 @@ from pathlib import Path
 import pytest
 
 from mimir.redaction import redact_text
-from mimir.secret_scan import contains_secret, secret_matches
+from mimir.secret_scan import _SECRET_PATTERNS, contains_secret, secret_matches
 
 
 CREDENTIAL_CORPUS = [
@@ -21,6 +21,13 @@ CREDENTIAL_CORPUS = [
     pytest.param("sk-ant-" + "A1b2" * 6, id="anthropic"),
     pytest.param("sk-proj-" + "B" * 24, id="openai-project"),
     pytest.param("sk-" + "C" * 24, id="openai-classic"),
+    pytest.param(
+        "OPENROUTER_API_KEY=sk-or-v1-" + "R" * 24,
+        id="openrouter-versioned",
+    ),
+    pytest.param("TAVILY_API_KEY=tvly-dev-" + "T" * 24, id="tavily"),
+    pytest.param("VOYAGE_API_KEY=pa-" + "V" * 24, id="voyage"),
+    pytest.param("GOOGLE_API_KEY=AIza" + "G" * 35, id="google"),
     pytest.param("Authorization: Bearer " + "z" * 30, id="bearer"),
     pytest.param("AKIA" + "A" * 16, id="aws-access-key"),
     pytest.param("ASIA" + "0" * 16, id="aws-sts-access-key"),
@@ -45,6 +52,11 @@ CREDENTIAL_CORPUS = [
     pytest.param("xoxa-" + "C" * 24, id="slack-app"),
     pytest.param("xoxs-" + "D" * 24, id="slack-config"),
     pytest.param("xoxr-" + "E" * 24, id="slack-refresh"),
+    pytest.param("SLACK_APP_TOKEN=xapp-1-" + "A" * 24, id="slack-app-level"),
+    pytest.param(
+        "MINIMAX_API_KEY=" + "H" * 36 + "." + "p" * 12 + "." + "s" * 32,
+        id="minimax-jwt",
+    ),
     pytest.param("M" * 24 + "." + "n" * 6 + "." + "o" * 27, id="discord-bot"),
 ]
 
@@ -85,6 +97,24 @@ CREDENTIAL_CORPUS = [
     pytest.param("xoxr-" + "E" * 24, id="slack-refresh"),
     pytest.param("M" * 24 + "." + "n" * 6 + "." + "o" * 27, id="discord-bot"),
 ]
+
+def test_module_and_pre_commit_pattern_lists_stay_in_step() -> None:
+    hook = Path(__file__).parents[1] / "mimir" / "templates" / "git" / "pre-commit"
+    hook_patterns: list[str] = []
+    in_patterns = False
+    for line in hook.read_text(encoding="utf-8").splitlines():
+        if line == "PATTERNS=(":
+            in_patterns = True
+        elif in_patterns and line == ")":
+            break
+        elif in_patterns:
+            hook_patterns.append(line.split("'", 2)[1])
+
+    module_patterns = [
+        pattern.pattern.replace(r"\s", "[[:space:]]").replace(r"\b", "")
+        for pattern in _SECRET_PATTERNS
+    ]
+    assert module_patterns == hook_patterns
 
 
 @pytest.mark.parametrize(

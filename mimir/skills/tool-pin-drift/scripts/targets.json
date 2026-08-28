@@ -3,19 +3,19 @@
     "name": "opencode",
     "source": "npm",
     "package": "opencode-ai",
-    "pinned_version": "1.18.9"
+    "pinned_version": "1.18.21"
   },
   {
     "name": "feature-factory",
     "source": "npm",
     "package": "feature-factory",
-    "pinned_version": "0.7.2"
+    "pinned_version": "0.8.0"
   },
   {
     "name": "opencode-feature-factory",
     "source": "npm",
     "package": "opencode-feature-factory",
-    "pinned_version": "0.7.2"
+    "pinned_version": "0.8.0"
   },
   {
     "name": "opencode-project-memory",

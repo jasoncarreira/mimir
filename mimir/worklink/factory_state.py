@@ -1,20 +1,38 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, replace
+from datetime import UTC, datetime, timedelta
 import json
 import os
 from pathlib import Path
+import shutil
 import stat
-from typing import Any
+import subprocess
+from typing import Any, Callable, Sequence
 
 from .._atomic import atomic_write_json
-from .backends.feature_factory import FactoryStatus, parse_factory_status
+from .backends.feature_factory import FactoryStatus, epic_run_id, parse_factory_status
 from .compute import LaunchHandle
 from .run_state import process_is_zombie, process_start_ticks
 
 
-FACTORY_RECORD_VERSION = 1
+FACTORY_RECORD_VERSION = 2
+FACTORY_RECORD_RETENTION = timedelta(days=7)
 _MAX_RECORD_BYTES = 2 * 1024 * 1024
+_RETAINED_CONTROLLER_PHASES = frozenset({"failed", "parked", "stopped", "terminal"})
+
+
+def _valid_record_run_id(run_id: str) -> bool:
+    if run_id.isascii() and run_id.isdecimal():
+        return bool(run_id.strip("0"))
+    prefix = "chainlink-"
+    issue_id = run_id.removeprefix(prefix)
+    return (
+        run_id.startswith(prefix)
+        and issue_id.isascii()
+        and issue_id.isdecimal()
+        and issue_id[0] != "0"
+    )
 
 
 class FactoryRecordError(RuntimeError):
@@ -37,14 +55,16 @@ class FactoryRunRecord:
     observed_at: str | None
     controller_phase: str
     controller_error: str | None = None
+    transcript: str | None = None
     version: int = FACTORY_RECORD_VERSION
 
     def __post_init__(self) -> None:
         if self.version != FACTORY_RECORD_VERSION:
             raise FactoryRecordError("unsupported factory record version")
-        if not self.run_id.isascii() or not self.run_id.isdecimal() or int(self.run_id) <= 0:
-            raise FactoryRecordError("factory run id must be a positive decimal string")
-        if self.issue_id != int(self.run_id) or self.issue_id <= 0 or self.attempt <= 0:
+        if not _valid_record_run_id(self.run_id):
+            raise FactoryRecordError("factory run id is invalid")
+        expected_run_ids = set(factory_record_run_ids(self.issue_id))
+        if self.run_id not in expected_run_ids or self.issue_id <= 0 or self.attempt <= 0:
             raise FactoryRecordError("factory record identity is invalid")
         if not Path(self.launcher).is_absolute() or not Path(self.sandbox).is_absolute():
             raise FactoryRecordError("factory launcher and sandbox must be absolute")
@@ -59,18 +79,23 @@ class FactoryRunRecord:
         if self.session is not None and (not self.session.strip() or "\x00" in self.session):
             raise FactoryRecordError("factory record session is invalid")
         if self.status is not None:
-            if (
-                self.status.run_id != self.run_id
-                or self.status.issue_key is None
-                or self.status.issue_key != str(self.issue_id)
-            ):
+            if self.status.run_id != self.run_id:
                 raise FactoryRecordError("factory record status identity mismatch")
             if self.status.sandbox_path != self.sandbox:
                 raise FactoryRecordError("factory record status sandbox mismatch")
             if self.status.pr_base is not None and self.status.pr_base != self.base_ref:
-                raise FactoryRecordError("factory record status base mismatch")
+                raise FactoryRecordError(
+                    "factory record status base mismatch: "
+                    f"observed {self.status.pr_base!r}, expected {self.base_ref!r}"
+                )
+        if self.run_id.startswith("chainlink-") and Path(self.sandbox).name != self.run_id:
+            raise FactoryRecordError("factory record sandbox does not match run id")
         if self.controller_error is not None and len(self.controller_error.encode("utf-8")) > 65536:
             raise FactoryRecordError("factory record error exceeds size limit")
+        if self.transcript is not None and (
+            not Path(self.transcript).is_absolute() or "\x00" in self.transcript
+        ):
+            raise FactoryRecordError("factory record transcript path is invalid")
 
     def to_json(self) -> dict[str, Any]:
         return {
@@ -89,6 +114,7 @@ class FactoryRunRecord:
             "observed_at": self.observed_at,
             "controller_phase": self.controller_phase,
             "controller_error": self.controller_error,
+            "transcript": self.transcript,
         }
 
     @classmethod
@@ -111,8 +137,15 @@ class FactoryRunRecord:
             "observed_at",
             "controller_phase",
             "controller_error",
+            "transcript",
         }
-        if set(data) != expected:
+        version = data.get("version")
+        legacy = version == 1 and set(data) == expected - {"transcript"}
+        if version not in {1, FACTORY_RECORD_VERSION}:
+            raise FactoryRecordError("unsupported factory record version")
+        if (version == 1 and not legacy) or (
+            version == FACTORY_RECORD_VERSION and set(data) != expected
+        ):
             raise FactoryRecordError("factory record fields are invalid")
         handle_data = data["handle"]
         if handle_data is None:
@@ -146,8 +179,11 @@ class FactoryRunRecord:
             raise FactoryRecordError("factory record observation time is invalid")
         if controller_error is not None and not isinstance(controller_error, str):
             raise FactoryRecordError("factory record controller error is invalid")
+        transcript = None if legacy else data["transcript"]
+        if transcript is not None and not isinstance(transcript, str):
+            raise FactoryRecordError("factory record transcript path is invalid")
         return cls(
-            version=int(data["version"]),
+            version=FACTORY_RECORD_VERSION,
             run_id=str(data["run_id"]),
             issue_id=int(data["issue_id"]),
             attempt=int(data["attempt"]),
@@ -162,6 +198,7 @@ class FactoryRunRecord:
             observed_at=observed_at,
             controller_phase=str(data["controller_phase"]),
             controller_error=controller_error,
+            transcript=transcript,
         )
 
     def observed(self, status: FactoryStatus, observed_at: str) -> FactoryRunRecord:
@@ -178,10 +215,19 @@ def factory_records_dir(home: Path) -> Path:
     return home / "state" / "worklink" / "factory-runs"
 
 
+def factory_record_run_ids(issue_id: int) -> tuple[str, str]:
+    """Return canonical and legacy record keys for an epic issue."""
+    return epic_run_id(issue_id), str(issue_id)
+
+
 def factory_record_path(home: Path, run_id: str) -> Path:
-    if not run_id.isascii() or not run_id.isdecimal() or int(run_id) <= 0:
-        raise FactoryRecordError("factory run id must be a positive decimal string")
+    if not _valid_record_run_id(run_id):
+        raise FactoryRecordError("factory run id is invalid")
     return factory_records_dir(home) / f"{run_id}.json"
+
+
+def factory_record_archive_dir(home: Path) -> Path:
+    return factory_records_dir(home) / "archive"
 
 
 def _require_safe_directory(path: Path, *, create: bool) -> bool:
@@ -253,29 +299,207 @@ def load_factory_record(home: Path, run_id: str) -> FactoryRunRecord | None:
     return FactoryRunRecord.from_json(data)
 
 
+def load_factory_records_for_issue(home: Path, issue_id: int) -> list[FactoryRunRecord]:
+    """Load both live-store key shapes, newest attempt first and canonical on ties."""
+    canonical, legacy = factory_record_run_ids(issue_id)
+    # Canonical-first construction is deliberate: it is a stable-sort fallback for
+    # the explicit canonical tie-break below, not an interchangeable iteration order.
+    records = [
+        record
+        for run_id in (canonical, legacy)
+        if (record := load_factory_record(home, run_id)) is not None
+    ]
+    records.sort(
+        key=lambda record: (record.attempt, record.run_id == canonical),
+        reverse=True,
+    )
+    return records
+
+
+def archive_factory_record(
+    home: Path,
+    record: FactoryRunRecord,
+    *,
+    event_logger: Callable[..., None] | None = None,
+    source_kind: str | None = None,
+    reason: str | None = None,
+) -> Path:
+    source = factory_record_path(home, record.run_id)
+    loaded = load_factory_record(home, record.run_id)
+    if loaded != record:
+        raise FactoryRecordError("factory record changed before archival")
+    directory = factory_record_archive_dir(home)
+    _require_safe_directory(directory, create=True)
+    stem = f"{record.run_id}-attempt-{record.attempt}"
+    destination = directory / f"{stem}.json"
+    suffix = 1
+    while destination.exists() or destination.is_symlink():
+        destination = directory / f"{stem}-{suffix}.json"
+        suffix += 1
+    try:
+        os.replace(source, destination)
+    except OSError as exc:
+        raise FactoryRecordError("factory record cannot be archived") from exc
+    if event_logger is not None:
+        if not source_kind or not reason:
+            os.replace(destination, source)
+            raise FactoryRecordError("factory archive event context is incomplete")
+        try:
+            # Shared with the silent-path inventory in Chainlink #1395: that work
+            # should reuse this event rather than introduce a second archive name.
+            event_logger(
+                "worklink_factory_record_archived",
+                source=source_kind,
+                issue_id=record.issue_id,
+                run_id=record.run_id,
+                attempt=record.attempt,
+                session=record.session,
+                phase=record.controller_phase,
+                reason=reason,
+                archive_path=str(destination),
+            )
+        except Exception as exc:
+            try:
+                os.replace(destination, source)
+            except OSError as rollback_exc:
+                raise FactoryRecordError(
+                    "factory archive event failed and the record could not be restored"
+                ) from rollback_exc
+            raise FactoryRecordError("factory archive event could not be persisted") from exc
+    return destination
+
+
 def list_factory_records(home: Path) -> list[FactoryRunRecord]:
     directory = factory_records_dir(home)
     if not _require_safe_directory(directory, create=False):
         return []
     records: list[FactoryRunRecord] = []
     for path in sorted(directory.iterdir(), key=lambda item: item.name):
-        if not path.name.endswith(".json") or not path.stem.isdecimal():
+        if not path.name.endswith(".json") or not _valid_record_run_id(path.stem):
             continue
         records.append(load_factory_record(home, path.stem))
     return [record for record in records if record is not None]
 
 
-def clear_factory_record(home: Path, run_id: str) -> None:
-    if not _require_safe_directory(factory_records_dir(home), create=False):
-        return
-    path = factory_record_path(home, run_id)
+def factory_manifest_candidates(record: FactoryRunRecord) -> tuple[Path, Path]:
+    """Return the root-checkout and sandbox manifests that block factory init."""
+    sandbox = Path(record.sandbox)
+    if sandbox.parent.name != ".factory-sandboxes" or sandbox.name != record.run_id:
+        raise FactoryRecordError("factory sandbox is outside the retained-run layout")
+    repository = sandbox.parent.parent
+    return repository / ".factory" / record.run_id, sandbox / ".factory" / record.run_id
+
+
+def _record_observed_at(home: Path, record: FactoryRunRecord) -> datetime:
+    if record.observed_at is not None:
+        try:
+            observed = datetime.fromisoformat(record.observed_at.replace("Z", "+00:00"))
+            return observed.replace(tzinfo=UTC) if observed.tzinfo is None else observed.astimezone(UTC)
+        except ValueError:
+            pass
+    try:
+        modified = factory_record_path(home, record.run_id).stat().st_mtime
+    except OSError as exc:
+        raise FactoryRecordError("factory record age cannot be determined") from exc
+    return datetime.fromtimestamp(modified, UTC)
+
+
+def _remove_retained_path(path: Path) -> None:
     try:
         value = path.lstat()
     except FileNotFoundError:
         return
-    if stat.S_ISLNK(value.st_mode) or not stat.S_ISREG(value.st_mode):
-        raise FactoryRecordError("refusing to remove non-regular factory record")
-    path.unlink()
+    except OSError as exc:
+        raise FactoryRecordError(f"retained factory path is unavailable: {path}") from exc
+    try:
+        if stat.S_ISDIR(value.st_mode) and not stat.S_ISLNK(value.st_mode):
+            shutil.rmtree(path)
+        else:
+            path.unlink()
+    except OSError as exc:
+        raise FactoryRecordError(f"retained factory path cannot be removed: {path}") from exc
+
+
+def age_out_factory_records(
+    home: Path,
+    *,
+    now: datetime | None = None,
+    retention: timedelta = FACTORY_RECORD_RETENTION,
+    runner: Callable[[Sequence[str]], subprocess.CompletedProcess[str]] | None = None,
+    event_logger: Callable[..., None] | None = None,
+) -> list[Path]:
+    """Push and remove inactive retained factory runs after ``retention``.
+
+    The sandbox and both manifest candidates remain untouched unless every
+    local branch can first be pushed to ``origin``. Failures are emitted to the
+    Worklink event stream and left for a later retry.
+    """
+    if retention < timedelta(0):
+        raise ValueError("factory record retention cannot be negative")
+    current = (now or datetime.now(UTC)).astimezone(UTC)
+    if runner is None:
+        def run(args: Sequence[str]) -> subprocess.CompletedProcess[str]:
+            return subprocess.run(
+                list(args), capture_output=True, text=True, check=False, timeout=120
+            )
+    else:
+        run = runner
+    if event_logger is None:
+        from ..event_logger import log_event_sync
+
+        event_logger = log_event_sync
+
+    archived: list[Path] = []
+    for record in list_factory_records(home):
+        if record.controller_phase not in _RETAINED_CONTROLLER_PHASES:
+            continue
+        try:
+            if current - _record_observed_at(home, record) < retention:
+                continue
+            root_manifest, sandbox_manifest = factory_manifest_candidates(record)
+            sandbox = Path(record.sandbox)
+            if sandbox.exists():
+                if sandbox.is_symlink() or not sandbox.is_dir():
+                    raise FactoryRecordError("retained factory sandbox is not a directory")
+                branches = run(
+                    ["git", "-C", str(sandbox), "for-each-ref", "--format=%(refname)", "refs/heads"]
+                )
+                if branches.returncode != 0:
+                    detail = (branches.stderr or branches.stdout).strip()
+                    raise FactoryRecordError(
+                        f"cannot inspect retained factory branches: {detail[:500]}"
+                    )
+                if branches.stdout.strip():
+                    pushed = run(["git", "-C", str(sandbox), "push", "--all", "origin"])
+                    if pushed.returncode != 0:
+                        detail = (pushed.stderr or pushed.stdout).strip()
+                        raise FactoryRecordError(
+                            f"cannot push retained factory branches: {detail[:500]}"
+                        )
+            # Check and clear both contract candidates explicitly. The second is
+            # inside the sandbox, so it must be handled before the sandbox itself.
+            _remove_retained_path(root_manifest)
+            _remove_retained_path(sandbox_manifest)
+            _remove_retained_path(sandbox)
+            archived.append(
+                archive_factory_record(
+                    home,
+                    record,
+                    event_logger=event_logger,
+                    source_kind="retention_reaper",
+                    reason="retained factory record exceeded retention",
+                )
+            )
+        except Exception as exc:  # noqa: BLE001 - one retained run cannot block the sweep
+            event_logger(
+                "worklink_factory_record_age_out_failed",
+                issue_id=record.issue_id,
+                run_id=record.run_id,
+                attempt=record.attempt,
+                phase=record.controller_phase,
+                error=str(exc)[:500],
+            )
+    return archived
 
 
 def factory_process_is_alive(record: FactoryRunRecord) -> bool:

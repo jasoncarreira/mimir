@@ -235,6 +235,7 @@ def resolve_review_state_for_context(
             "must be a positive integer; for example, repository='owner/repo', pull_request=17"
         )
     from ..access_control import (
+        can_resolve_forge_review_scope,
         create_server_discovered_review_scope,
         is_configured_github_repo,
         resolve_server_discovered_review_scope,
@@ -253,7 +254,7 @@ def resolve_review_state_for_context(
     stored_scope = store.resolve(repository, pull_request) if (
         isinstance(store, ServerDiscoveredPRScopeStore)
         and context is not None
-        and context.event_ingress is None
+        and can_resolve_forge_review_scope(context, stage="stored")
     ) else None
     if stored_scope is not None:
         client = _client_for_repository(repository)
@@ -284,14 +285,9 @@ def resolve_review_state_for_context(
         )
         if isinstance(cache, ServerDiscoveredPRStates):
             cache.remember_refusal(repository, pull_request, stale_refusal)
-        raise ToolPolicyRefusal(stale_refusal)
+        raise ToolException(stale_refusal)
     if (
-        context is None
-        or context.trigger != "user_message"
-        or context.is_service
-        or context.event_ingress is not None
-        or not context.canonical_principal
-        or "admin" not in context.roles
+        not can_resolve_forge_review_scope(context, stage="fetch")
     ):
         scope_refusal = _scope_miss_refusal(
             cache, registry, repository, pull_request,
@@ -318,10 +314,25 @@ def resolve_review_state_for_context(
         snapshot = client.get_pull_request_snapshot(repository.lower(), pull_request)
     except ForgeError as exc:
         raise ToolException(f"pull-request operation rejected: {exc}") from exc
+    self_login = os.environ.get("MIMIR_GITHUB_SELF_LOGIN", "").strip()
+    if (
+        not can_resolve_forge_review_scope(
+            context,
+            stage="accept",
+            pr_author=snapshot.author,
+            self_login=self_login,
+        )
+    ):
+        scope_refusal = (
+            "pull-request operation rejected: requested "
+            f"repository={json.dumps(repository)}, pull_request={pull_request}; "
+            "live scope discovery requires an authenticated operator user turn"
+        )
+        if isinstance(cache, ServerDiscoveredPRStates):
+            cache.remember_refusal(repository, pull_request, scope_refusal)
+        raise ToolPolicyRefusal(scope_refusal)
     review_state = None
-    if snapshot.state == "open" and snapshot.author == os.environ.get(
-        "MIMIR_GITHUB_SELF_LOGIN", ""
-    ).strip():
+    if snapshot.state == "open" and snapshot.author == self_login:
         discovery_scope = create_server_discovered_review_scope(repository, snapshot)
         if discovery_scope is not None:
             try:
@@ -344,7 +355,7 @@ def resolve_review_state_for_context(
         or scope.canonical_repo != repository.lower()
         or scope.pr_number != pull_request
     ):
-        raise ToolPolicyRefusal(resolution.refusal_reason or (
+        raise ToolException(resolution.refusal_reason or (
             "pull-request operation rejected: live pull request is closed or invalid"
         ))
     state = RepoReviewState(scope)
@@ -376,7 +387,7 @@ def revalidate_review_head_for_context(
         or snapshot.state != "open"
         or snapshot.head_sha.lower() != scope.observed_head_sha
     ):
-        raise ToolPolicyRefusal(
+        raise ToolException(
             "pull-request operation rejected: pull request head advanced after scope issuance"
         )
 
@@ -539,7 +550,7 @@ def _call(operation: Any) -> Any:
 
         if isinstance(exc, GitHubIdentityVerificationError):
             _latch_github_identity_degraded(exc)
-            raise ToolPolicyRefusal(
+            raise ToolException(
                 f"coding capability disabled: GitHub identity verification failed: {exc}"
             ) from exc
         # The adapter may have contacted the forge before failing, so this is a

@@ -298,13 +298,16 @@ class _FakeSaga:
     async def query(
         self, content: str, *, top_k: int = 12,
         session_id: str | None = None,
+        min_confidence_tier: str | None = None,
         context: list[dict[str, str]] | None = None,
         **_ignored: object,
     ):
         self.query_calls.append(
             {
                 "content": content, "top_k": top_k,
-                "session_id": session_id, "context": context,
+                "session_id": session_id,
+                "min_confidence_tier": min_confidence_tier,
+                "context": context,
             },
         )
         return {"atoms": self._hits, "triples": self._triples}
@@ -903,7 +906,10 @@ def test_agent_wires_resolved_provider_into_budget_arbiter(
     assert agent._arbiter.active_quota_providers == ("openai",)
 
 
-async def test_run_turn_writes_record_with_extracted_events(tmp_path: Path):
+async def test_run_turn_writes_record_with_extracted_events(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setenv("MIMIR_SAGA_PRE_MSG_MIN_TIER", "medium")
     fake_agent = _FakeAgent(response_messages=[
         AIMessage(
             content="Stored.",
@@ -937,6 +943,7 @@ async def test_run_turn_writes_record_with_extracted_events(tmp_path: Path):
     # SAGA was queried with the user content
     assert len(fake_saga.query_calls) == 1
     assert fake_saga.query_calls[0]["content"] == "store my favorite color"
+    assert fake_saga.query_calls[0]["min_confidence_tier"] == "medium"
 
     # The pre-message memory block landed in the prompt to the agent
     invocation = fake_agent.invocations[0]
@@ -1452,6 +1459,9 @@ async def test_run_turn_http_event_ingress_reaches_turn_context_before_admin_too
 
     fake_agent = _HttpEventAdminProbeAgent()
     agent = _build_agent(tmp_path, fake_agent=fake_agent, fake_saga=_FakeSaga())
+    assert agent._config.oauth_credentials_path == (
+        tmp_path / "home" / ".claude" / ".credentials.json"
+    )
     agent._identity_resolver = _resolver(
         tmp_path,
         """
@@ -1672,6 +1682,43 @@ async def test_budget_exhaustion_creates_worklink_continuation_sidecar(
         ev.get("type") == "worklink_continuation_created"
         for ev in _read_events(tmp_path)
     )
+
+
+async def test_budget_exhaustion_passes_run_identity_to_continuation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    repo = _init_continuation_repo(tmp_path)
+    monkeypatch.chdir(repo)
+    agent = _build_agent(
+        tmp_path,
+        fake_agent=_BudgetExhaustingAgent(
+            response_messages=[AIMessage(content="continuing worklink recovery")],
+        ),
+        fake_saga=None,
+    )
+    captured: dict[str, object] = {}
+
+    def _capture_continuation(**kwargs):
+        captured.update(kwargs)
+        return None
+
+    monkeypatch.setattr(
+        "mimir.agent.maybe_create_worklink_budget_continuation",
+        _capture_continuation,
+    )
+
+    await agent.run_turn(
+        AgentEvent(
+            trigger="scheduled_tick",
+            channel_id="ops",
+            content="generic worklink follow-up",
+            source_id="budget-run-id",
+            extra={"run_id": "chainlink-700"},
+        )
+    )
+
+    assert captured["run_id"] == "chainlink-700"
 
 
 async def test_continuation_written_even_without_assistant_output(

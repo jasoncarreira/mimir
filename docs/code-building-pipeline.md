@@ -12,7 +12,7 @@ Create `<MIMIR_HOME>/repositories.yaml`:
 ```yaml
 repositories:
   - slug: owner/service
-    root: /workspace/service
+    root: /var/lib/mimir-worklink/base/service
     mode: rw
     origin: https://github.com/owner/service.git
     base_branch: main
@@ -24,7 +24,7 @@ All six repository fields are significant:
 | Key | Meaning |
 |---|---|
 | `slug` | Lower-cased `owner/repository` identity. It must name the same GitHub repository as `origin`. |
-| `root` | Absolute path to the existing checkout. It must be the checkout's top level. |
+| `root` | Absolute path to the dedicated Worklink base clone. It must be the checkout's top level and must not be the running controller source. |
 | `mode` | `rw` includes the root in the inventory's writable-root projection; `ro` excludes it. Use `rw` for a code-building target. |
 | `origin` | Exact `remote.origin.url` expected in the checkout; HTTPS and GitHub SSH URL forms are accepted. |
 | `base_branch` | Branch from which Worklink creates attempt checkouts and against which it opens leaf PRs. |
@@ -48,7 +48,7 @@ defaults:
   timeout_s: 1800
   test_command: uv run pytest -q
   max_concurrent: 2
-  reaper_ttl_s: 7200
+  reaper_ttl_s: 86400
   allow_autonomous_local_subprocess: true
 backends:
   opencode:
@@ -62,6 +62,11 @@ backends:
 target that is not in the inventory. Repository-level `base_branch` and
 `test_command` take precedence over `defaults.base_branch` and
 `defaults.test_command` for that target.
+
+Mimir never derives this path from its installation. Provision the clone before
+startup, including for PyPI installs, and set `MIMIR_SOURCE_DIR` when the controller
+runs from an editable checkout so Worklink can enforce non-overlap. A host with no
+base fails closed rather than cloning into an inferred location.
 
 `local_subprocess` is the shipping compute backend and has shared filesystem
 access. Autonomous dispatch refuses it unless
@@ -84,7 +89,7 @@ running agent can instead activate a newly installed poller through its
 
 Factory epics use the same repository declaration and isolated-checkout allocator,
 but have separate admission and concurrency. The image installs
-`feature-factory@0.7.2` and `opencode-feature-factory@0.7.2` under
+`feature-factory@0.8.0` and `opencode-feature-factory@0.8.0` under
 `/opt/mimir-opencode`; `MIMIR_FACTORY_ENTRYPOINT` names the absolute
 `feature-factory/bin/factory.js`. Set `MIMIR_FACTORY_EPICS_ENABLED=1` to let the
 poller dispatch `worklink:epic` issues. `MIMIR_FACTORY_MAX_CONCURRENT` defaults
@@ -93,7 +98,7 @@ to `1`, independently of the leaf default `2`.
 The launch ends with `--command feature " --autonomous --max-retries 5
 <issue>"`. `MIMIR_FACTORY_MAX_RETRIES` defaults to `5`, accepts exactly ASCII
 `[0-9]+` in range `1..9007199254740991`, and falls back to `5` for absent or
-invalid values. feature-factory 0.7.2 stages the workflow inside the run
+invalid values. feature-factory 0.7.5 stages the workflow inside the run
 directory; exact token `--auto` is never passed. Worklink's base selects the
 checkout start point and PR target; it is not factory `--base`, which is never
 passed.
@@ -104,13 +109,15 @@ launch, Worklink reads the effective checkout `git config --get user.name` and
 `GIT_AUTHOR_NAME`, `GIT_AUTHOR_EMAIL`, `GIT_COMMITTER_NAME`, and
 `GIT_COMMITTER_EMAIL`; Worklink never writes sandbox Git identity configuration.
 
-Worklink reads the nonblank `publishing_identity` only from the trusted
-controller checkout's `.factory.json`. For GitHub publication Worklink
+Worklink reads the nonblank `publishing_identity` from
+`MIMIR_FACTORY_PUBLISHING_IDENTITY` when that variable is set, otherwise from
+the trusted controller checkout's `.factory.json`. A set but blank or non-string
+override fails instead of falling back. For GitHub publication Worklink
 verifies the credential this process is already bound to, `GITHUB_TOKEN`, rather
 than selecting among candidates: `GH_TOKEN` is a child-only alias for `gh`, and
 verifying a second credential in a process that already verified one is refused
 by the forge identity memo before `/user` is ever reached. That token's owner is
-compared against the declared identity before dispatch, then both child aliases
+compared against the selected identity before dispatch, then both child aliases
 are normalized to it. `GH_TOKEN` and `GITHUB_TOKEN` set to different values fail
 dispatch as an operator ambiguity rather than one being preferred, and a missing
 `GITHUB_TOKEN` fails naming that variable - in both cases without disclosing
@@ -250,9 +257,13 @@ The detached executor, not the poller, owns the claim protocol:
 5. It releases the lock after the terminal label transition.
 
 The stale-claim reaper is enabled by setting a schedule for
-`MIMIR_WORKLINK_REAPER_CRON`. It uses `defaults.reaper_ttl_s` (default 7200)
+`MIMIR_WORKLINK_REAPER_CRON`. It uses `defaults.reaper_ttl_s` (default 86400)
 against the latest claim/heartbeat timestamp, steals only stale locks, and
 returns the leaf to `worklink:ready` unless its attempt budget is exhausted.
+Existing deployments must set this value to at least twice the greater of
+`defaults.timeout_s` and `MIMIR_FACTORY_RUN_TIMEOUT_S` (86400 with the shipped
+12-hour factory timeout). During migration, lower configured values are raised
+to that floor with a warning rather than disabling Worklink at startup.
 
 The leaf claim budget is three charged attempts in the current runtime. The
 parsed `defaults.max_claim_attempts` key is compatibility-only and does not

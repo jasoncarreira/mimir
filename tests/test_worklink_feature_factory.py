@@ -13,6 +13,7 @@ import pytest
 from mimir.worklink.backends.base import WorkOrder
 from mimir.worklink.backends.feature_factory import (
     FACTORY_COMMANDS,
+    FACTORY_PUBLISHING_IDENTITY_ENV,
     FACTORY_VERSION,
     FactoryContractError,
     FeatureFactoryBackend,
@@ -44,7 +45,7 @@ def status_payload(**overrides: Any) -> dict[str, Any]:
         "gates": {"brief": "approved"},
         "steps": ["brief", "implementation"],
         "slices": ["factory-070-migration"],
-        "validator": {"status": "pending"},
+        "validator": None,
         "pr_url": None,
         "terminal_result": None,
         "next": "implementation",
@@ -85,13 +86,13 @@ def test_status_contract_preserves_optional_next_and_opaque_terminal_result() ->
         status.require_recovery_next()
 
 
-def test_status_contract_preserves_nullable_fields_and_opaque_objects() -> None:
+def test_status_contract_preserves_nullable_fields_and_opaque_terminal_result() -> None:
     status = parse_factory_status(
         status_payload(
             issue_key=None,
             pr_base=None,
             lock_session=None,
-            validator={"status": "pending", "score": 0.5},
+            validator=None,
             terminal_result={"reason": "opaque"},
         )
     )
@@ -99,9 +100,68 @@ def test_status_contract_preserves_nullable_fields_and_opaque_objects() -> None:
     assert status.pr_base is None
     assert status.lock_session is None
     assert status.pr_url is None
-    assert status.validator == {"status": "pending", "score": 0.5}
+    assert status.validator is None
     assert status.terminal_result == {"reason": "opaque"}
     assert parse_factory_status(status.to_json()) == status
+
+
+def test_status_parses_recorded_gate_pre_pr_validator_verdict() -> None:
+    payload = json.dumps(
+        {
+            "run_id": "chainlink-1337",
+            "issue_key": "1337",
+            "valid": True,
+            "sandbox_path": "/tmp/feature-factory/chainlink-1337",
+            "status": "running",
+            "mode": "autonomous",
+            "branch": "epic/chainlink-1337",
+            "pr_base": "main",
+            "pr_draft": False,
+            "lock": "fresh",
+            "dead_lock": False,
+            "lock_session": "attempt-9",
+            "gates": {
+                "story": "approved",
+                "brief": "approved",
+                "pre_pr": "pending",
+            },
+            "steps": ["story", "brief", "slices", "validator"],
+            "slices": [
+                "slice-1",
+                "slice-2",
+                "slice-3",
+                "slice-4",
+                "slice-5",
+                "slice-6",
+                "slice-7",
+            ],
+            "validator": "GO",
+            "pr_url": None,
+            "terminal_result": None,
+            "next": "gate:pre_pr",
+        }
+    )
+
+    status = parse_factory_status(payload)
+
+    assert status.validator == "GO"
+    assert status.next == "gate:pre_pr"
+    assert len(status.slices or ()) == 7
+    assert parse_factory_status(status.to_json()) == status
+
+
+@pytest.mark.parametrize("verdict", ["GO", "GO-WITH-NITS", "NO-GO"])
+def test_status_accepts_documented_validator_verdicts(verdict: str) -> None:
+    assert parse_factory_status(status_payload(validator=verdict)).validator == verdict
+
+
+def test_status_accepts_null_validator_before_validation() -> None:
+    assert parse_factory_status(status_payload(validator=None)).validator is None
+
+
+def test_status_rejects_unknown_validator_verdict() -> None:
+    with pytest.raises(FactoryContractError, match="validator has an unknown verdict"):
+        parse_factory_status(status_payload(validator="APPROVED"))
 
 
 @pytest.mark.parametrize("terminal", ["completed", "blocked", "partial"])
@@ -128,11 +188,16 @@ def test_status_rejects_wrong_field_types(field: str, value: object) -> None:
         parse_factory_status(status_payload(**{field: value}))
 
 
-@pytest.mark.parametrize("field", ["validator", "terminal_result"])
 @pytest.mark.parametrize("value", ["value", [], True, 1])
-def test_status_rejects_non_object_opaque_fields(field: str, value: object) -> None:
-    with pytest.raises(FactoryContractError, match=f"{field} must be an object"):
-        parse_factory_status(status_payload(**{field: value}))
+def test_status_rejects_non_object_terminal_result(value: object) -> None:
+    with pytest.raises(FactoryContractError, match="terminal_result must be an object"):
+        parse_factory_status(status_payload(terminal_result=value))
+
+
+@pytest.mark.parametrize("value", [{}, [], True, 1])
+def test_status_rejects_invalid_validator_types(value: object) -> None:
+    with pytest.raises(FactoryContractError, match="validator must be a documented verdict"):
+        parse_factory_status(status_payload(validator=value))
 
 
 def test_status_accepts_additive_top_level_fields_after_payload_validation() -> None:
@@ -151,11 +216,60 @@ def test_status_accepts_additive_top_level_fields_after_payload_validation() -> 
         )
 
 
-def test_status_rejects_missing_known_fields_trailing_json_and_nul() -> None:
+@pytest.mark.parametrize("field", ["run_id", "valid", "sandbox_path"])
+def test_status_rejects_missing_guaranteed_fields(field: str) -> None:
     missing = status_payload()
-    missing.pop("mode")
-    with pytest.raises(FactoryContractError, match="missing field"):
+    missing.pop(field)
+    with pytest.raises(FactoryContractError, match=f"missing field: {field}"):
         parse_factory_status(missing)
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        "issue_key",
+        "status",
+        "mode",
+        "branch",
+        "pr_base",
+        "pr_draft",
+        "lock",
+        "dead_lock",
+        "lock_session",
+        "gates",
+        "steps",
+        "slices",
+        "validator",
+        "pr_url",
+        "terminal_result",
+        "next",
+    ],
+)
+def test_status_accepts_each_lifecycle_projection_omitted(field: str) -> None:
+    payload = status_payload()
+    payload.pop(field)
+
+    status = parse_factory_status(payload)
+
+    assert getattr(status, field, None) is None
+
+
+def test_status_parses_072_pre_manifest_diagnostic_shape() -> None:
+    status = parse_factory_status(
+        {
+            "run_id": "1551",
+            "valid": False,
+            "sandbox_path": "/tmp/operator",
+            "error": "run.json does not exist",
+        }
+    )
+
+    assert status.valid is False
+    assert status.branch is None
+    assert status.status is None
+
+
+def test_status_rejects_trailing_json_and_nul() -> None:
     with pytest.raises(FactoryContractError, match="one JSON object"):
         parse_factory_status(json.dumps(status_payload()) + "\n{}")
     with pytest.raises(FactoryContractError, match="bounds"):
@@ -196,7 +310,7 @@ def test_status_rejects_invalid_utf8_nul_and_oversize(payload: bytes) -> None:
 
 def test_resolve_entrypoint_is_absolute_package_bound_and_lockstep(tmp_path: Path) -> None:
     entrypoint = package_entrypoint(tmp_path)
-    assert FACTORY_VERSION == "0.7.2"
+    assert FACTORY_VERSION == "0.8.0"
     assert resolve_factory_entrypoint(entrypoint) == entrypoint.resolve()
     with pytest.raises(FactoryContractError, match="absolute"):
         resolve_factory_entrypoint(Path("feature-factory/bin/factory.js"))
@@ -434,6 +548,16 @@ def test_opencode_launch_argv_has_exact_staged_factory_payload(
     configured: str | None,
     expected: int,
 ) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
+    monkeypatch.delenv("XDG_DATA_HOME", raising=False)
+    monkeypatch.setenv("MIMIR_MODEL_SPEC", "codex-plus:gpt-5.6-luna")
+    auth = tmp_path / ".local" / "share" / "opencode" / "auth.json"
+    auth.parent.mkdir(parents=True)
+    auth.write_text(
+        json.dumps({"openai": {"type": "oauth", "refresh": "subscription"}}),
+        encoding="utf-8",
+    )
     if configured is None:
         monkeypatch.delenv("MIMIR_FACTORY_MAX_RETRIES", raising=False)
     else:
@@ -444,6 +568,11 @@ def test_opencode_launch_argv_has_exact_staged_factory_payload(
         prompt="ignored by the host feature workflow",
         rules=None,
         timeout_s=43200,
+        env={
+            "MIMIR_WORK_ITEM_JSON": json.dumps(
+                {"run_id": "chainlink-1551", "title": "epic", "body": "build"}
+            )
+        },
         transcript_root=tmp_path,
     )
     spec = FeatureFactoryBackend(entrypoint="/absolute/factory.js").work_spec(
@@ -460,28 +589,101 @@ def test_opencode_launch_argv_has_exact_staged_factory_payload(
         "--log-level",
         "DEBUG",
         "--print-logs",
+        "-m",
+        "openai/gpt-5.6-luna",
         "--dir",
         str(tmp_path),
         "--command",
         "feature",
-        f" --autonomous --max-retries {expected} 1551",
+        f" --autonomous --max-retries {expected} chainlink-1551",
     )
     payload = (spec.local_argv or ())[-1]
     assert payload.startswith(" ") and not payload.startswith("  ")
     assert "--autonomous" in payload.split()
     assert "--auto" not in payload.split()
     assert "--base" not in payload.split()
-    assert epic_run_id(1551) == "1551"
+    assert "--pr-base" not in payload.split()
+    assert spec.backend_config["model"] == "openai/gpt-5.6-luna"
+    assert spec.backend_config["model_diverged"] is False
+    assert spec.backend_config["run_id"] == "chainlink-1551"
+    assert epic_run_id(1551) == "chainlink-1551"
+
+
+def test_factory_launch_rejects_work_item_run_id_disagreement(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
+    monkeypatch.delenv("XDG_DATA_HOME", raising=False)
+    auth = tmp_path / ".local" / "share" / "opencode" / "auth.json"
+    auth.parent.mkdir(parents=True)
+    auth.write_text(
+        json.dumps({"openai": {"type": "oauth", "refresh": "subscription"}}),
+        encoding="utf-8",
+    )
+    order = WorkOrder(
+        issue_id=1551,
+        checkout=tmp_path,
+        prompt="ignored",
+        rules=None,
+        timeout_s=43200,
+        env={
+            "MIMIR_MODEL_SPEC": "codex-plus:gpt-5.6-luna",
+            "MIMIR_WORK_ITEM_JSON": '{"run_id":"chainlink-1552"}',
+        },
+    )
+
+    with pytest.raises(FactoryContractError, match="work item run_id does not match"):
+        FeatureFactoryBackend(entrypoint="/absolute/factory.js").work_spec(
+            order,
+            attempt=1,
+            repo_url="https://github.com/owner/repo.git",
+            base_ref="main",
+            branch="feature/chainlink-1551",
+            test_command="uv run pytest -q",
+        )
+
+
+@pytest.mark.parametrize("issue_id", [0, -1, True])
+def test_epic_run_id_rejects_ids_without_a_valid_canonical_shape(issue_id: int) -> None:
+    with pytest.raises(ValueError, match="positive"):
+        epic_run_id(issue_id)
+
+
+def test_opencode_launch_refuses_unresolvable_model_before_launch(
+    tmp_path: Path,
+) -> None:
+    order = WorkOrder(
+        issue_id=1551,
+        checkout=tmp_path,
+        prompt="ignored",
+        rules=None,
+        timeout_s=43200,
+        env={"MIMIR_MODEL_SPEC": ""},
+    )
+
+    with pytest.raises(
+        FactoryContractError,
+        match="^feature_factory_opencode_resolution_failed:config_provider_selection$",
+    ):
+        FeatureFactoryBackend(entrypoint="/absolute/factory.js").work_spec(
+            order,
+            attempt=1,
+            repo_url="https://github.com/owner/repo.git",
+            base_ref="main",
+            branch="epic/1551",
+            test_command="uv run pytest -q",
+        )
 
 
 def test_controls_are_absolute_run_id_first_and_resume_reads_status(tmp_path: Path) -> None:
     entrypoint = package_entrypoint(tmp_path)
     sandbox = tmp_path / "operator"
     sandbox.mkdir()
-    calls: list[tuple[str, ...]] = []
+    calls: list[tuple[tuple[str, ...], dict[str, Any]]] = []
 
     def runner(args: list[str], **kwargs: Any) -> subprocess.CompletedProcess[bytes]:
-        calls.append(tuple(args))
+        calls.append((tuple(args), kwargs))
         if args[2] == "status":
             return subprocess.CompletedProcess(
                 args,
@@ -511,13 +713,56 @@ def test_controls_are_absolute_run_id_first_and_resume_reads_status(tmp_path: Pa
         launcher=entrypoint,
     )
     assert status.status == "running"
-    assert [call[2:] for call in calls] == [
+    assert [args[2:] for args, _ in calls] == [
         ("resume", "1551", "--session", "session-1", "--repo", str(sandbox)),
         ("status", "1551", "--repo", str(sandbox), "--json"),
         ("heartbeat", "1551", "--session", "session-1", "--repo", str(sandbox)),
         ("lock", "1551", "steal", "--session", "session-1", "--repo", str(sandbox)),
     ]
-    assert all(call[:2] == ("node", str(entrypoint.resolve())) for call in calls)
+    assert all(args[:2] == ("node", str(entrypoint.resolve())) for args, _ in calls)
+    assert all("cwd" not in kwargs for _, kwargs in calls)
+
+
+def test_status_before_sandbox_creation_returns_not_ready(tmp_path: Path) -> None:
+    entrypoint = package_entrypoint(tmp_path)
+    sandbox = tmp_path / "not-created"
+
+    def runner(args: list[str], **kwargs: Any) -> subprocess.CompletedProcess[bytes]:
+        assert not sandbox.exists()
+        assert "cwd" not in kwargs
+        assert args[2:] == ["status", "1551", "--repo", str(sandbox), "--json"]
+        return subprocess.CompletedProcess(
+            args,
+            0,
+            stdout=json.dumps(
+                {
+                    "run_id": "1551",
+                    "valid": False,
+                    "sandbox_path": str(sandbox),
+                    "error": "run.json does not exist",
+                }
+            ).encode(),
+            stderr=b"",
+        )
+
+    status = FeatureFactoryBackend(
+        entrypoint=str(entrypoint), runner=runner
+    ).status("1551", sandbox=sandbox, launcher=entrypoint)
+
+    assert status.valid is False
+    assert status.sandbox_path == str(sandbox)
+
+
+def test_status_spawn_failure_remains_infrastructure_error(tmp_path: Path) -> None:
+    entrypoint = package_entrypoint(tmp_path)
+    sandbox = tmp_path / "not-created"
+
+    def runner(args: list[str], **kwargs: Any) -> subprocess.CompletedProcess[bytes]:
+        raise FileNotFoundError("node executable is unavailable")
+
+    backend = FeatureFactoryBackend(entrypoint=str(entrypoint), runner=runner)
+    with pytest.raises(FileNotFoundError, match="node executable is unavailable"):
+        backend.status("1551", sandbox=sandbox, launcher=entrypoint)
 
 
 def test_status_control_rejects_malformed_trailing_and_nonfinite_output(tmp_path: Path) -> None:
@@ -570,3 +815,154 @@ def test_migrated_factory_consumers_have_finite_legacy_free_inventory() -> None:
     for relative in consumers:
         source = (root / relative).read_text(encoding="utf-8")
         assert all(token not in source for token in forbidden), relative
+
+
+def test_control_environment_forwards_the_factory_publishing_identity(monkeypatch) -> None:
+    """Factory CONTROL commands (status/resume/heartbeat/lock) receive the variable.
+
+    This is the ``_control`` path only. The launch that publishes builds its
+    environment from ``WorkSpec.env`` instead -- see
+    ``test_launch_child_environment_carries_the_publishing_identity``.
+
+    feature-factory 0.8.0 reads the declared identity from the inherited
+    `FACTORY_PUBLISHING_IDENTITY` value and checks it against `gh api /user`.
+    The mimir repository publishes from two accounts -- a
+    maintainer's checkout as ``jasoncarreira``, mimirbot as ``mimir-carreira`` --
+    so the deployment, not the tracked file, has to select it.
+
+    Without the allowlist entry the deployment exports the variable and the driver
+    never sees it. The symptom is a Gate 1 park naming the FILE's identity, which
+    reads as a misconfiguration rather than a stripped variable -- so assert the
+    forwarding rather than trusting that exporting it is enough.
+    """
+    from mimir.worklink.backends.feature_factory import _control_environment
+
+    monkeypatch.setenv("FACTORY_PUBLISHING_IDENTITY", "mimir-carreira")
+    assert _control_environment().get("FACTORY_PUBLISHING_IDENTITY") == "mimir-carreira"
+
+
+def test_control_environment_still_drops_unlisted_variables(monkeypatch) -> None:
+    """The allowlist stays an allowlist -- adding one name must not open it up."""
+    from mimir.worklink.backends.feature_factory import _control_environment
+
+    monkeypatch.setenv("FACTORY_PUBLISHING_IDENTITY", "mimir-carreira")
+    monkeypatch.setenv("SOME_UNRELATED_SECRET", "must-not-leak")
+    env = _control_environment()
+    assert "SOME_UNRELATED_SECRET" not in env
+    assert "FACTORY_PUBLISHING_IDENTITY" in env
+
+
+class _FakeLaunchProcess:
+    """Minimal asyncio process stand-in for capturing a launch environment."""
+
+    def __init__(self) -> None:
+        self.returncode = 0
+        self.killed = False
+        self.stdout = None
+        self.stderr = None
+
+    async def wait(self) -> int:
+        return self.returncode
+
+    def kill(self) -> None:
+        self.killed = True
+
+
+def _own_opencode_resolution(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Pin the inputs ``work_spec`` resolves the opencode invocation from.
+
+    Without this the model/auth resolution reads whatever the developer's machine
+    happens to have. A real ``~/.local/share/opencode/auth.json`` makes these tests
+    pass locally and fail everywhere else with
+    ``feature_factory_opencode_resolution_failed`` -- which is exactly what happened.
+    """
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
+    monkeypatch.delenv("XDG_DATA_HOME", raising=False)
+    monkeypatch.setenv("MIMIR_MODEL_SPEC", "codex-plus:gpt-5.6-luna")
+    monkeypatch.delenv("MIMIR_FACTORY_MAX_RETRIES", raising=False)
+    auth = tmp_path / ".local" / "share" / "opencode" / "auth.json"
+    auth.parent.mkdir(parents=True, exist_ok=True)
+    auth.write_text(
+        json.dumps({"openai": {"type": "oauth", "refresh": "subscription"}}),
+        encoding="utf-8",
+    )
+
+
+def _factory_order(tmp_path: Path, identity: str) -> WorkOrder:
+    return WorkOrder(
+        issue_id=1551,
+        checkout=tmp_path,
+        prompt="ignored by the host feature workflow",
+        rules=None,
+        timeout_s=43200,
+        env={
+            "MIMIR_WORK_ITEM_JSON": json.dumps(
+                {"run_id": "chainlink-1551", "title": "epic", "body": "build"}
+            ),
+            FACTORY_PUBLISHING_IDENTITY_ENV: identity,
+        },
+        transcript_root=tmp_path,
+    )
+
+
+def test_work_spec_carries_the_publishing_identity_into_the_launch_spec(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The launch spec, not just the control env, must carry the identity.
+
+    The factory child publishes at Gate 1 and compares its declared identity against
+    ``gh api /user``. It is launched from ``WorkSpec.env``; ``_control_environment``
+    only serves ``status``/``resume``/``heartbeat``/``lock``, so asserting there
+    exercises the wrong process boundary.
+    """
+    _own_opencode_resolution(tmp_path, monkeypatch)
+    spec = FeatureFactoryBackend(entrypoint="/absolute/factory.js").work_spec(
+        _factory_order(tmp_path, "mimir-carreira"),
+        attempt=1,
+        repo_url="https://github.com/owner/repo.git",
+        base_ref="main",
+        branch="epic/1551",
+        test_command="uv run pytest -q",
+    )
+
+    assert spec.env[FACTORY_PUBLISHING_IDENTITY_ENV] == "mimir-carreira"
+
+
+@pytest.mark.asyncio
+async def test_launch_child_environment_carries_the_publishing_identity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """End of the chain: the value reaches the actual child process environment.
+
+    ``_local_child_env()`` is an allowlist that admits neither ``FACTORY_`` nor the
+    exact name, so this passes only because ``WorkSpec.env`` is merged over it. Stub
+    the allowlist to empty so the assertion cannot be satisfied by inheritance.
+    """
+    _own_opencode_resolution(tmp_path, monkeypatch)
+    import asyncio as _asyncio
+
+    from mimir.worklink.compute import LocalSubprocessComputeBackend
+
+    captured: dict[str, dict[str, str]] = {}
+
+    async def fake_exec(*_args: str, **kwargs: Any) -> _FakeLaunchProcess:
+        captured["env"] = kwargs["env"]
+        return _FakeLaunchProcess()
+
+    monkeypatch.setattr(_asyncio, "create_subprocess_exec", fake_exec)
+    monkeypatch.setattr("mimir.worklink.compute._local_child_env", dict)
+
+    spec = FeatureFactoryBackend(entrypoint="/absolute/factory.js").work_spec(
+        _factory_order(tmp_path, "mimir-carreira"),
+        attempt=1,
+        repo_url="https://github.com/owner/repo.git",
+        base_ref="main",
+        branch="epic/1551",
+        test_command="uv run pytest -q",
+    )
+    handle = await LocalSubprocessComputeBackend().launch(spec)
+    try:
+        assert captured["env"][FACTORY_PUBLISHING_IDENTITY_ENV] == "mimir-carreira"
+    finally:
+        await LocalSubprocessComputeBackend().cleanup(handle)

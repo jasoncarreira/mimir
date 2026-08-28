@@ -22,6 +22,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 from langchain.tools import ToolRuntime
+from langchain_core.tools import ToolException
 import pytest
 
 import mimir.tools.registry as registry
@@ -1046,7 +1047,13 @@ class TestSetPollerOverrides:
         out = await set_poller_overrides.ainvoke(
             {
                 "poller_name": "gmail-inbox",
-                "overrides": {"pass_env": ["GOG_ACCOUNT"], "batch_size": 3},
+                "overrides": {
+                    "cron": "*/10 * * * *",
+                    "priority": "high",
+                    "batch_size": 3,
+                    "env": {"MIMIR_GMAIL_MAX_FETCH": "20"},
+                    "pass_env": ["GOG_ACCOUNT"],
+                },
             },
         )
         assert "set_poller_overrides ok: updated gmail-inbox" in out
@@ -1054,6 +1061,39 @@ class TestSetPollerOverrides:
         assert "gmail-inbox:" in body
         assert "pass_env:" in body
         assert "GOG_ACCOUNT" in body
+        assert "priority: high" in body
+        assert "batch_size: 3" in body
+
+    @pytest.mark.asyncio
+    async def test_rejects_process_environment_hijack_without_changing_file(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        path = tmp_path / "pollers-overrides.yaml"
+        original = "github-poller:\n  priority: high\n"
+        path.write_text(original, encoding="utf-8")
+        _STATE["scheduler"] = _StubScheduler(home=tmp_path)
+
+        out = await set_poller_overrides.ainvoke(
+            {
+                "poller_name": "github-poller",
+                "overrides": {
+                    "env": {
+                        "PATH": "/tmp/evil:/usr/bin",
+                        "BASH_ENV": "/tmp/evil/rc",
+                        "GIT_SSH_COMMAND": "evil",
+                        "HTTPS_PROXY": "https://evil.invalid",
+                        "NODE_OPTIONS": "--require=/tmp/evil.js",
+                        "SSL_CERT_FILE": "/tmp/evil.pem",
+                        "LD_PRELOAD": "/tmp/e.so",
+                    },
+                },
+            },
+        )
+
+        assert "set_poller_overrides failed:" in out
+        assert "poller_overrides_disallowed_env" in out
+        assert path.read_text(encoding="utf-8") == original
 
     @pytest.mark.asyncio
     async def test_rejects_unknown_override_field_without_writing(
@@ -1906,6 +1946,75 @@ class TestSendMessageSkiplistGuard:
         )
         tok = set_current_turn(ctx)
         return ctx, tok, reset_current_turn
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "trigger",
+        [
+            "poller",
+            "github-poller:github-activity",
+            "custom-poller:arxiv-agent-memory",
+            "research-poller:pypi-deps-watch",
+            "scheduled_tick",
+            "shell_job_complete",
+            "saga_session_end",
+            "upgrade",
+        ],
+    )
+    async def test_skiplist_guard_arms_for_autonomous_trigger_families(
+        self, tmp_path, trigger: str,
+    ) -> None:
+        from mimir.event_logger import init_logger
+
+        init_logger(tmp_path / "events.jsonl", session_id="test-session")
+        bridge = _StubBridge()
+        set_channel_registry(_StubRegistry(bridge, channel_id="operator"))
+        _ctx, tok, reset = self._turn_ctx(trigger)
+        try:
+            with pytest.raises(ToolException, match="send_message rejected"):
+                assert send_message.coroutine is not None
+                await send_message.coroutine(
+                    text="end silent",
+                    channel_id="operator",
+                )
+        finally:
+            reset(tok)
+
+        assert bridge.send_calls == []
+        events = [
+            json.loads(line)
+            for line in (tmp_path / "events.jsonl").read_text().splitlines()
+        ]
+        [ev] = [e for e in events if e["type"] == "send_message_blocked_skiplist"]
+        assert ev["trigger"] == trigger
+        assert ev["matched_phrase"] == "end silent"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "trigger",
+        [
+            "user_message",
+            "github-poller-event:github-activity",
+            "worker:poller",
+            "poller-adjacent",
+        ],
+    )
+    async def test_skiplist_guard_does_not_arm_for_unrelated_triggers(
+        self, trigger: str,
+    ) -> None:
+        bridge = _StubBridge()
+        set_channel_registry(_StubRegistry(bridge, channel_id="operator"))
+        _ctx, tok, reset = self._turn_ctx(trigger)
+        try:
+            out = await send_message.ainvoke({
+                "text": "end silent",
+                "channel_id": "operator",
+            })
+        finally:
+            reset(tok)
+
+        assert "send_message ok" in out
+        assert bridge.send_calls == [{"cid": "operator", "text": "end silent"}]
 
     @pytest.mark.asyncio
     async def test_poller_skiplist_narration_is_rejected_and_logged(

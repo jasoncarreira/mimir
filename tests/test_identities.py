@@ -164,6 +164,78 @@ def test_unparseable_yaml_keeps_prior_state(tmp_path: Path):
     assert r.resolve("slack-U123") == "alice"  # unchanged
 
 
+def test_missing_yaml_keeps_prior_state_and_warns(tmp_path: Path, caplog):
+    r = _write_identities(
+        tmp_path,
+        """\
+        people:
+          - canonical: alice
+            aliases: [slack-U123, webkey:abc]
+        """,
+    )
+    (tmp_path / "state" / "identities.yaml").unlink()
+
+    with caplog.at_level("WARNING", logger="mimir.identities"):
+        loaded = r.reload()
+
+    assert loaded == 2
+    assert r.resolve("slack-U123") == "alice"
+    assert r.has_web_keys() is True
+    assert "missing" in caplog.text
+    assert "web auth gate" in caplog.text
+
+
+def test_unreadable_yaml_keeps_prior_state(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog,
+):
+    r = _write_identities(
+        tmp_path,
+        """\
+        people:
+          - canonical: alice
+            aliases: [slack-U123, webkey:abc]
+        """,
+    )
+    yaml_path = tmp_path / "state" / "identities.yaml"
+    original_read_text = Path.read_text
+
+    def unreadable(path: Path, *args, **kwargs):
+        if path == yaml_path:
+            raise PermissionError("permission denied")
+        return original_read_text(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", unreadable)
+    with caplog.at_level("WARNING", logger="mimir.identities"):
+        loaded = r.reload()
+
+    assert loaded == 2
+    assert r.resolve("slack-U123") == "alice"
+    assert r.has_web_keys() is True
+    assert "read failed" in caplog.text
+    assert "keeping prior state" in caplog.text
+
+
+def test_initial_unreadable_yaml_latches_web_gate_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    state = tmp_path / "state"
+    state.mkdir()
+    yaml_path = state / "identities.yaml"
+    yaml_path.write_text("people: []\n", encoding="utf-8")
+    original_read_text = Path.read_text
+
+    def unreadable(path: Path, *args, **kwargs):
+        if path == yaml_path:
+            raise PermissionError("permission denied")
+        return original_read_text(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", unreadable)
+    resolver = IdentityResolver(tmp_path)
+
+    assert resolver.reload() == 0
+    assert resolver.web_gate_latched() is True
+
+
 def test_duplicate_alias_last_wins(tmp_path: Path):
     """Two canonicals claiming the same alias — last wins, but a warning
     fires (verified out-of-band; here we just confirm the behavior is
@@ -627,9 +699,8 @@ def test_reload_picks_up_channel_changes(tmp_path: Path):
     assert r.channel("ch-2") is not None
 
 
-def test_missing_file_clears_channel_state(tmp_path: Path):
-    """If the file disappears, both registries clear (matches existing
-    people-side behavior — missing file = empty resolver)."""
+def test_missing_file_keeps_channel_state(tmp_path: Path):
+    """A transient missing file retains both identity registries."""
     state = tmp_path / "state"
     state.mkdir()
     yaml_path = state / "identities.yaml"
@@ -648,5 +719,5 @@ def test_missing_file_clears_channel_state(tmp_path: Path):
 
     yaml_path.unlink()
     r.reload()
-    assert r.channel_count() == 0
-    assert r.channel("ch-1") is None
+    assert r.channel_count() == 1
+    assert r.channel("ch-1") is not None

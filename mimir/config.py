@@ -23,6 +23,9 @@ from dotenv import load_dotenv
 
 from .access_control import resolve_access_control_enforcement
 from .billing import BillingMode, detect_billing_mode
+from .coding import coding_enabled
+from .env import _ENV_BOOL_FALSY, _ENV_BOOL_TRUTHY, env_bool
+
 # Single source of the shipped default. ``mimir setup`` writes this same
 # spec via ``detect_route(None)``, so a setup-created home and a home that
 # never ran setup select the same model. model_registry imports only
@@ -242,16 +245,6 @@ def _env_float(name: str, default: float) -> float:
         return default
 
 
-# chainlink #238: canonical env-bool truthy/falsy alphabets.
-# Used by every Config bool field; pre-fix the file carried three
-# different parsers with subtly-different truthy semantics
-# (e.g. ``allow_unauthenticated`` rejected ``on`` while ``_env_bool``
-# accepted it). Garbage values now warn instead of silently coercing
-# to True (the prior inline pattern) or False (``allow_unauthenticated``).
-_ENV_BOOL_TRUTHY = frozenset({"1", "true", "yes", "on", "y"})
-_ENV_BOOL_FALSY = frozenset({"0", "false", "no", "off", "n"})
-
-
 def _env_bool(name: str, default: bool) -> bool:
     """Parse an env-var value as boolean.
 
@@ -260,23 +253,7 @@ def _env_bool(name: str, default: bool) -> bool:
     returns *default*. Anything else emits ``log.warning`` and returns
     *default* so a typo doesn't silently flip a flag.
     """
-    raw = os.environ.get(name)
-    if raw is None or raw == "":
-        return default
-    norm = raw.strip().lower()
-    if norm in _ENV_BOOL_TRUTHY:
-        return True
-    if norm in _ENV_BOOL_FALSY:
-        return False
-    log.warning(
-        "%s=%r is not a recognised boolean (truthy=%s, falsy=%s); using default %r",
-        name,
-        raw,
-        sorted(_ENV_BOOL_TRUTHY),
-        sorted(_ENV_BOOL_FALSY),
-        default,
-    )
-    return default
+    return env_bool(name, default, logger=log)
 
 
 def _load_mcp_servers_from_env() -> list:
@@ -1202,13 +1179,13 @@ class Config:
         prompts_override = _env("MIMIR_PROMPTS_DIR")
         archive_dir = _env("MIMIR_TURNS_ARCHIVE_DIR")
         model_spec = _env("MIMIR_MODEL_SPEC", DEFAULT_MODEL_SPEC)
-        coding_enabled = _env_bool("MIMIR_CODING_ENABLED", False)
+        coding_enabled_value = coding_enabled()
         from .opencode_config import opencode_config_path
 
         resolved_opencode_config = opencode_config_path()
         log.info(
             "coding assistant capability: %s",
-            "enabled" if coding_enabled else "disabled",
+            "enabled" if coding_enabled_value else "disabled",
         )
         # Resolve once — used by both ``billing_mode`` (to detect QUOTA
         # vs API_KEY billing) and ``oauth_credentials_path`` (the field
@@ -1316,7 +1293,7 @@ class Config:
             access_control_enforced=resolve_access_control_enforcement(
                 _env_bool("MIMIR_ACCESS_CONTROL_ENFORCED", False),
                 model_spec=model_spec,
-                coding_enabled=coding_enabled,
+                coding_enabled=coding_enabled_value,
             ),
 
             operator_alert_channel=_env("MIMIR_OPERATOR_ALERT_CHANNEL"),
@@ -1355,7 +1332,7 @@ class Config:
             chat_skill_allowlist=_parse_chat_skill_allowlist(
                 _env("MIMIR_CHAT_SKILL_ALLOWLIST", "")
             ),
-            coding_enabled=coding_enabled,
+            coding_enabled=coding_enabled_value,
             opencode_config_path=resolved_opencode_config,
             api_key=_env("MIMIR_API_KEY"),
             web_host=_env("MIMIR_WEB_HOST", "127.0.0.1"),

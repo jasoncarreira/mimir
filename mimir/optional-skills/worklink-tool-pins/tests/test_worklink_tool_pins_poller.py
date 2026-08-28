@@ -151,9 +151,13 @@ def test_reuses_existing_issue_by_dedupe_key(fresh_poller, monkeypatch, capsys):
                 json.dumps(
                     [
                         {
+                            "id": "invalid",
+                            "description": "Dedupe-Key: worklink-tool-pin:coding-cli:codex:0.139.0->0.140.0",
+                        },
+                        {
                             "id": 901,
                             "description": "Dedupe-Key: worklink-tool-pin:coding-cli:codex:0.139.0->0.140.0",
-                        }
+                        },
                     ]
                 ),
                 "",
@@ -166,6 +170,146 @@ def test_reuses_existing_issue_by_dedupe_key(fresh_poller, monkeypatch, capsys):
     assert fresh_poller.main() == 0
     assert len(calls) == 1
     assert _events(capsys)[0]["issue_id"] == 901
+
+
+@pytest.mark.parametrize(
+    ("returncode", "stdout", "stderr", "reason"),
+    [
+        (1, "", "index.lock exists", "chainlink issue search failed: index.lock exists"),
+        (0, "not JSON", "", "chainlink issue search returned invalid JSON"),
+        (0, "{}", "", "chainlink issue search JSON was not a list"),
+    ],
+)
+def test_unavailable_dedupe_search_skips_create_and_emits_durable_signal(
+    fresh_poller, monkeypatch, capsys, returncode, stdout, stderr, reason,
+):
+    home = Path(sys.modules["os"].environ["MIMIR_HOME"])
+    _write_config(
+        home,
+        """
+        tool_pins:
+          - name: codex
+            category: coding-cli
+            pin: "0.139.0"
+            smoke: "codex --version"
+            source: npm
+        """,
+    )
+    monkeypatch.setattr(fresh_poller, "_resolvers", lambda: {"npm": FakeNpmResolver("0.140.0", fresh_poller)})
+    calls: list[list[str]] = []
+
+    def runner(cwd):
+        def run(args, **kwargs):
+            calls.append(args)
+            return subprocess.CompletedProcess(args, returncode, stdout, stderr)
+
+        return run
+
+    monkeypatch.setattr(fresh_poller, "_chainlink_runner", runner)
+
+    assert fresh_poller.main() == 0
+    assert len(calls) == 1
+    event = _events(capsys)[0]
+    assert event["signal"] == "worklink_tool_pin_dedupe_check_failed"
+    assert event["dedupe_key"] == "worklink-tool-pin:coding-cli:codex:0.139.0->0.140.0"
+    assert event["reason"] == reason
+
+
+@pytest.mark.parametrize(
+    "issue_id",
+    [
+        pytest.param("invalid", id="malformed-string"),
+        pytest.param("901", id="numeric-string"),
+        pytest.param(True, id="boolean"),
+        pytest.param(1.5, id="float"),
+        pytest.param(0, id="zero"),
+        pytest.param(-1, id="negative"),
+        pytest.param(None, id="missing"),
+    ],
+)
+def test_sole_exact_match_without_valid_id_skips_create_and_emits_durable_signal(
+    fresh_poller, monkeypatch, capsys, issue_id,
+):
+    home = Path(sys.modules["os"].environ["MIMIR_HOME"])
+    _write_config(
+        home,
+        """
+        tool_pins:
+          - name: codex
+            category: coding-cli
+            pin: "0.139.0"
+            smoke: "codex --version"
+            source: npm
+        """,
+    )
+    monkeypatch.setattr(fresh_poller, "_resolvers", lambda: {"npm": FakeNpmResolver("0.140.0", fresh_poller)})
+    calls: list[list[str]] = []
+
+    def runner(cwd):
+        def run(args, **kwargs):
+            calls.append(args)
+            issue = {
+                "description": "Dedupe-Key: worklink-tool-pin:coding-cli:codex:0.139.0->0.140.0",
+            }
+            if issue_id is not None:
+                issue["id"] = issue_id
+            return subprocess.CompletedProcess(args, 0, json.dumps([issue]), "")
+
+        return run
+
+    monkeypatch.setattr(fresh_poller, "_chainlink_runner", runner)
+
+    assert fresh_poller.main() == 0
+    assert len(calls) == 1
+    event = _events(capsys)[0]
+    assert event["signal"] == "worklink_tool_pin_dedupe_check_failed"
+    assert event["dedupe_key"] == "worklink-tool-pin:coding-cli:codex:0.139.0->0.140.0"
+    assert event["reason"] == (
+        "chainlink issue search returned an exact dedupe-key match "
+        "without a strict positive-integer issue id"
+    )
+
+
+def test_valid_number_is_reused_when_id_field_is_malformed(
+    fresh_poller, monkeypatch, capsys,
+):
+    home = Path(sys.modules["os"].environ["MIMIR_HOME"])
+    _write_config(
+        home,
+        """
+        tool_pins:
+          - name: codex
+            category: coding-cli
+            pin: "0.139.0"
+            smoke: "codex --version"
+            source: npm
+        """,
+    )
+    monkeypatch.setattr(
+        fresh_poller,
+        "_resolvers",
+        lambda: {"npm": FakeNpmResolver("0.140.0", fresh_poller)},
+    )
+    calls: list[list[str]] = []
+
+    def runner(cwd):
+        def run(args, **kwargs):
+            calls.append(args)
+            issue = {
+                "id": "malformed",
+                "number": 902,
+                "description": "Dedupe-Key: worklink-tool-pin:coding-cli:codex:0.139.0->0.140.0",
+            }
+            return subprocess.CompletedProcess(args, 0, json.dumps([issue]), "")
+
+        return run
+
+    monkeypatch.setattr(fresh_poller, "_chainlink_runner", runner)
+
+    assert fresh_poller.main() == 0
+    assert len(calls) == 1
+    event = _events(capsys)[0]
+    assert event["issue_id"] == 902
 
 
 def test_lookup_failure_is_diagnostic_not_emit_or_nonzero(fresh_poller, monkeypatch, capsys):

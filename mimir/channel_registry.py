@@ -16,6 +16,7 @@ from typing import Iterable
 
 from .bridges.base import Bridge, SendResult
 from .models import TurnInteractivity
+from .redaction import redact_text
 
 log = logging.getLogger(__name__)
 
@@ -117,7 +118,9 @@ async def post_job_failure_notice(
         return
     try:
         await channels.send(
-            deliver_channel, f"⚠️ {label} failed: {error}", final=True,
+            deliver_channel,
+            redact_text(f"⚠️ {label} failed: {error}"),
+            final=True,
         )
     except Exception as exc:  # noqa: BLE001 — a failure notice must not cascade
         log.debug("post_job_failure_notice send to %s failed: %s", deliver_channel, exc)

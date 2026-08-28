@@ -1111,6 +1111,9 @@ def test_message_buffer_consumer_inventory_is_closed() -> None:
         tree = ast.parse(path.read_text(encoding="utf-8"))
         Visitor(str(path.relative_to(root.parent))).visit(tree)
     assert observed == {
+        # Added on main while this branch was diverged; the inventory is closed,
+        # so a new consumer has to be declared here rather than merely appearing.
+        ("mimir/commitments/store.py", "CommitmentsStore.current_state", "self.replay"),
         ("mimir/agent.py", "_rewrite_context_from_buffer", "buffer.recent_for_channel"),
         ("mimir/agent.py", "Agent._append_inbound_to_buffer", "self._buffer.append"),
         ("mimir/agent.py", "Agent._append_inbound_to_buffer", "self._buffer.make_message"),

@@ -160,7 +160,16 @@ class TestDetectSchemaVersion:
         )
         assert m.detect_schema_version(conn) == 10
 
-    def test_missing_session_backfill_forces_v2_replay_through_real_open(
+    def test_query_indexes_return_v11(self) -> None:
+        conn = sqlite3.connect(":memory:")
+        conn.executescript(
+            "CREATE TABLE triples (id TEXT, created_at TEXT, tombstoned INTEGER, embedding BLOB);"
+            "CREATE TABLE sessions (id TEXT, channel_id TEXT, ended_at TEXT, reflected_at TEXT);"
+            + m.MIGRATIONS[11]
+        )
+        assert m.detect_schema_version(conn) == 11
+
+    def test_missing_session_backfill_targets_data_repair_through_real_open(
         self, tmp_path: Path
     ) -> None:
         from mimir.saga.client import SagaStore
@@ -187,9 +196,44 @@ class TestDetectSchemaVersion:
             "VALUES ('b1', 'stub', 'stub-1d', 1, x'01020304', "
             "'2026-08-15T00:00:00+00:00')"
         )
+        conn.execute(
+            "INSERT INTO atoms "
+            "(id, content, content_hash, source_type, created_at, "
+            "owner_principal, origin_channel, origin_domain, visibility, provenance) "
+            "VALUES ('o1', 'private observation', 'observation-hash', "
+            "'observation', '2026-08-15T00:00:00+00:00', "
+            "'U_jason', 'slack:C1', 'workspace:T1', 'private', '{\"k\":1}')"
+        )
+        conn.execute(
+            "INSERT INTO observations_metadata "
+            "(atom_id, evidence_count, consolidated_at, owner_principal, "
+            "origin_channel, origin_domain, visibility, provenance) "
+            "VALUES ('o1', 1, '2026-08-15T00:00:00+00:00', "
+            "'U_jason', 'slack:C1', 'workspace:T1', 'private', '{\"k\":1}')"
+        )
+        conn.execute(
+            "INSERT INTO triples "
+            "(id, subject, predicate, object, source_atom_id, created_at, "
+            "owner_principal, origin_channel, origin_domain, visibility, provenance) "
+            "VALUES ('t1', 'Jason', 'uses', 'ACP', 'o1', "
+            "'2026-08-15T00:00:00+00:00', 'U_jason', 'slack:C1', "
+            "'workspace:T1', 'private', '{\"k\":1}')"
+        )
         conn.commit()
 
-        assert m.detect_schema_version(conn) == 1
+        ownership_sql = (
+            "owner_principal, origin_channel, origin_domain, visibility, provenance"
+        )
+        expected_ownership = (
+            "U_jason", "slack:C1", "workspace:T1", "private", '{"k":1}'
+        )
+        assert m.detect_schema_version(conn) == m.CURRENT_SCHEMA_VERSION
+        assert conn.execute(
+            f"SELECT {ownership_sql} FROM observations_metadata WHERE atom_id = 'o1'"
+        ).fetchone() == expected_ownership
+        assert conn.execute(
+            f"SELECT {ownership_sql} FROM triples WHERE id = 't1'"
+        ).fetchone() == expected_ownership
         conn.close()
 
         migrated = SagaStore(db_path=db_path)._ensure_conn()
@@ -209,6 +253,16 @@ class TestDetectSchemaVersion:
         assert {
             row[0] for row in migrated.execute("SELECT version FROM schema_version")
         } == set(range(1, m.CURRENT_SCHEMA_VERSION + 1))
+        atom_ownership = migrated.execute(
+            f"SELECT {ownership_sql} FROM atoms WHERE id = 'o1'"
+        ).fetchone()
+        assert migrated.execute(
+            f"SELECT {ownership_sql} FROM observations_metadata WHERE atom_id = 'o1'"
+        ).fetchone() == expected_ownership
+        assert migrated.execute(
+            f"SELECT {ownership_sql} FROM triples WHERE id = 't1'"
+        ).fetchone() == expected_ownership
+        assert atom_ownership == expected_ownership
 
 
 class TestApplyPendingMigrations:
@@ -411,9 +465,15 @@ class TestApplyPendingMigrations:
                 id TEXT PRIMARY KEY, content_hash TEXT, agent_id TEXT,
                 tombstoned INTEGER DEFAULT 0, {ownership}
             );
-            CREATE TABLE sessions (id TEXT PRIMARY KEY, {ownership});
+            CREATE TABLE sessions (
+                id TEXT PRIMARY KEY, channel_id TEXT, ended_at TEXT,
+                reflected_at TEXT, {ownership}
+            );
             CREATE TABLE observations_metadata (id TEXT PRIMARY KEY, {ownership});
-            CREATE TABLE triples (id TEXT PRIMARY KEY, {ownership});
+            CREATE TABLE triples (
+                id TEXT PRIMARY KEY, created_at TEXT,
+                tombstoned INTEGER DEFAULT 0, embedding BLOB, {ownership}
+            );
             CREATE TABLE world_state (
                 id TEXT PRIMARY KEY, owner_principal TEXT,
                 origin_channel TEXT, visibility TEXT
@@ -476,6 +536,13 @@ class TestSagaStoreInitialization:
         assert conn.execute(
             "SELECT MAX(version) FROM schema_version"
         ).fetchone() == (m.CURRENT_SCHEMA_VERSION,)
+        assert [
+            row[2]
+            for row in conn.execute("PRAGMA index_info(idx_atoms_dedup)")
+        ] == ["content_hash", "agent_id", "owner_principal"]
+        assert conn.execute(
+            "SELECT COUNT(*) FROM atoms WHERE tombstoned != 0"
+        ).fetchone() == (0,)
 
     def test_partial_schema_does_not_commit_inferred_version_rows(
         self, tmp_path: Path
@@ -507,52 +574,111 @@ class TestSagaStoreInitialization:
 
 
 class TestV5BoundaryCleanup:
-    def test_v5_refuses_if_backfill_postcondition_changes_after_detection(
-        self, tmp_path: Path
-    ) -> None:
-        from mimir.saga.client import SagaStore
-
+    def test_v5_refuses_without_session_backfill(self, tmp_path: Path) -> None:
         db_path = tmp_path / "v5-guard.db"
         _create_unstamped_v4_db(db_path)
-        setup = sqlite3.connect(db_path)
-        setup.execute(
-            "INSERT INTO sessions (id, started_at) VALUES "
-            "('sess-1', '2026-08-15T00:00:00+00:00')"
-        )
-        setup.execute(
+        conn = sqlite3.connect(db_path)
+        conn.execute(
             "INSERT INTO atoms "
             "(id, content, content_hash, source_type, session_id, created_at) "
             "VALUES ('b1', 'boundary', 'hash', 'session_boundary', 'sess-1', "
             "'2026-08-15T00:00:00+00:00')"
         )
-        setup.commit()
-        setup.close()
+        conn.commit()
 
-        store = SagaStore(db_path=db_path)
-
-        def detect_then_invalidate(conn: sqlite3.Connection) -> int:
-            detected = m.detect_schema_version(conn)
-            assert detected == 4
-            conn.execute("DELETE FROM sessions WHERE id = 'sess-1'")
-            conn.commit()
-            return detected
-
-        store._detect_schema_version = detect_then_invalidate  # type: ignore[method-assign]
         with pytest.raises(
             sqlite3.IntegrityError,
             match="session_boundary atom has no matching sessions row",
         ):
-            store._ensure_conn()
+            m._execute_migration_script(conn, m.MIGRATIONS[5])
+        conn.rollback()
+        conn.close()
 
         check = sqlite3.connect(db_path)
         assert check.execute("SELECT id FROM atoms WHERE id = 'b1'").fetchone() == (
             "b1",
         )
-        assert check.execute("SELECT version FROM schema_version").fetchall() == []
         check.close()
 
 
 class TestV6RebuildDataPreservation:
+    def test_v6_replay_preserves_complete_ownership_columns(self) -> None:
+        conn = sqlite3.connect(":memory:")
+        conn.executescript(Path("mimir/saga/schema.sql").read_text())
+        conn.execute(
+            "INSERT INTO schema_version VALUES "
+            "(5, '2000-01-01T00:00:00+00:00')"
+        )
+        conn.execute(
+            "INSERT INTO atoms "
+            "(id, content, content_hash, created_at, owner_principal, "
+            "origin_channel, origin_domain, visibility, provenance) "
+            "VALUES ('o1', 'private observation', 'hash', '2024-01-01', "
+            "'U_jason', 'slack:C1', 'workspace:T1', 'private', '{\"k\":1}')"
+        )
+        conn.execute(
+            "INSERT INTO observations_metadata "
+            "(atom_id, consolidated_at, owner_principal, origin_channel, "
+            "origin_domain, visibility, provenance) VALUES "
+            "('o1', '2024-01-01', 'U_jason', 'slack:C1', 'workspace:T1', "
+            "'private', '{\"k\":1}')"
+        )
+        conn.execute(
+            "INSERT INTO triples "
+            "(id, subject, predicate, object, source_atom_id, created_at, "
+            "owner_principal, origin_channel, origin_domain, visibility, provenance) "
+            "VALUES ('t1', 's', 'p', 'o', 'o1', '2024-01-01', "
+            "'U_jason', 'slack:C1', 'workspace:T1', 'private', '{\"k\":1}')"
+        )
+        ownership_sql = (
+            "owner_principal, origin_channel, origin_domain, visibility, provenance"
+        )
+        expected = ("U_jason", "slack:C1", "workspace:T1", "private", '{"k":1}')
+
+        m.apply_pending_migrations(
+            conn,
+            fresh=False,
+            target_version=6,
+            migrations={6: m.MIGRATIONS[6]},
+        )
+
+        assert conn.execute(
+            f"SELECT {ownership_sql} FROM observations_metadata"
+        ).fetchone() == expected
+        assert conn.execute(
+            f"SELECT {ownership_sql} FROM triples"
+        ).fetchone() == expected
+        assert conn.execute(
+            f"SELECT {ownership_sql} FROM atoms WHERE id = 'o1'"
+        ).fetchone() == expected
+
+    def test_v6_replay_refuses_partial_ownership_schema(self) -> None:
+        conn = sqlite3.connect(":memory:")
+        conn.executescript(
+            "CREATE TABLE schema_version (version INTEGER PRIMARY KEY, "
+            "applied_at TEXT NOT NULL);"
+            "INSERT INTO schema_version VALUES "
+            "(5, '2000-01-01T00:00:00+00:00');"
+            "CREATE TABLE observations_metadata ("
+            "atom_id TEXT PRIMARY KEY, owner_principal TEXT);"
+            "CREATE TABLE triples (id TEXT PRIMARY KEY);"
+        )
+
+        with pytest.raises(
+            RuntimeError,
+            match=r"migration v6 refused.*observations_metadata.*incomplete",
+        ):
+            m.apply_pending_migrations(
+                conn,
+                fresh=False,
+                target_version=6,
+                migrations={6: m.MIGRATIONS[6]},
+            )
+
+        assert conn.execute(
+            "PRAGMA table_info(observations_metadata)"
+        ).fetchall()[-1][1] == "owner_principal"
+
     def test_v6_rebuild_preserves_populated_rows_exactly(self) -> None:
         """Protect the CREATE/COPY/DROP/RENAME path from SELECT-* drift.
 
@@ -1339,6 +1465,9 @@ class TestV7OwnershipMigration:
             );
             CREATE TABLE triples (
                 id TEXT PRIMARY KEY,
+                created_at TEXT,
+                tombstoned INTEGER DEFAULT 0,
+                embedding BLOB,
                 owner_principal TEXT NOT NULL DEFAULT 'legacy_admin',
                 origin_channel TEXT,
                 origin_domain TEXT,
@@ -1373,7 +1502,7 @@ class TestV7OwnershipMigration:
                 "WHERE type = 'index' AND tbl_name = 'world_state'"
             )
         }
-        assert max(versions) == m.CURRENT_SCHEMA_VERSION == 10
+        assert max(versions) == m.CURRENT_SCHEMA_VERSION == 11
         assert {
             "owner_principal",
             "origin_channel",
@@ -1396,6 +1525,138 @@ class TestV7OwnershipMigration:
         } <= indexes
 
 
+class TestV9OwnerScopedDedupMigration:
+    @pytest.mark.parametrize("reverse_insert", [False, True])
+    def test_legacy_collision_is_deterministically_tombstoned(
+        self, tmp_path: Path, reverse_insert: bool
+    ) -> None:
+        from mimir.saga.client import SagaStore
+        from mimir.saga.forget import forget
+
+        db_path = tmp_path / f"v9-collision-{reverse_insert}.db"
+        _create_unstamped_v4_db(db_path)
+        rows = [
+            (
+                "a-survivor",
+                "same logical content",
+                "H",
+                "default",
+                "2024-01-01T00:00:00+00:00",
+            ),
+            (
+                "z-loser",
+                "same logical content",
+                "H",
+                "default",
+                "2024-01-01T00:00:00+00:00",
+            ),
+        ]
+        if reverse_insert:
+            rows.reverse()
+        seed = sqlite3.connect(db_path)
+        seed.executemany(
+            "INSERT INTO atoms "
+            "(id, content, content_hash, agent_id, created_at) "
+            "VALUES (?, ?, ?, ?, ?)",
+            rows,
+        )
+        seed.commit()
+        seed.close()
+
+        migrated = SagaStore(db_path=db_path)._ensure_conn()
+
+        assert migrated.execute(
+            "SELECT id FROM atoms WHERE content_hash = 'H' AND agent_id = 'default' "
+            "AND owner_principal = 'legacy_admin' AND tombstoned = 0"
+        ).fetchall() == [("a-survivor",)]
+        tombstoned, tombstoned_at, tombstoned_reason = migrated.execute(
+            "SELECT tombstoned, tombstoned_at, tombstoned_reason "
+            "FROM atoms WHERE id = 'z-loser'"
+        ).fetchone()
+        assert tombstoned == 1
+        assert tombstoned_at is not None
+        assert tombstoned_at.endswith("+00:00")
+        assert tombstoned_reason == "merged"
+        assert migrated.execute(
+            "SELECT version FROM schema_version ORDER BY version"
+        ).fetchall() == [
+            (version,) for version in range(1, m.CURRENT_SCHEMA_VERSION + 1)
+        ]
+        assert [
+            row[2]
+            for row in migrated.execute("PRAGMA index_info(idx_atoms_dedup)")
+        ] == ["content_hash", "agent_id", "owner_principal"]
+
+        # Runtime exact-dedup sees only the survivor, and ordinary forget is
+        # idempotent for the migration-created tombstone.
+        assert migrated.execute(
+            "SELECT id FROM atoms WHERE content_hash = 'H' AND agent_id = 'default' "
+            "AND owner_principal = 'legacy_admin' AND tombstoned = 0"
+        ).fetchone() == ("a-survivor",)
+        assert forget(migrated, ["z-loser"]).tombstoned_count == 0
+        migrated.close()
+
+        reopened = SagaStore(db_path=db_path)._ensure_conn()
+        assert reopened.execute(
+            "SELECT id, tombstoned FROM atoms ORDER BY id"
+        ).fetchall() == [("a-survivor", 0), ("z-loser", 1)]
+        reopened.close()
+
+    def test_unresolvable_collision_reports_same_key_on_every_open(
+        self, tmp_path: Path
+    ) -> None:
+        db_path = tmp_path / "v9-unresolvable.db"
+        seed = sqlite3.connect(db_path)
+        seed.executescript(
+            "CREATE TABLE atoms ("
+            "id TEXT PRIMARY KEY, content_hash TEXT NOT NULL, "
+            "agent_id TEXT, owner_principal TEXT NOT NULL, "
+            "tombstoned INTEGER DEFAULT 0, created_at TEXT NOT NULL);"
+            "CREATE TABLE schema_version ("
+            "version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL);"
+        )
+        seed.executemany(
+            "INSERT INTO schema_version VALUES (?, '2000-01-01T00:00:00+00:00')",
+            [(version,) for version in range(1, 9)],
+        )
+        # SQLite permits NULL in a non-INTEGER PRIMARY KEY. With neither a
+        # stable id nor another durable difference, v9 must refuse to guess.
+        seed.executemany(
+            "INSERT INTO atoms VALUES (NULL, 'H', 'agent', 'owner', 0, '2024-01-01')",
+            [(), ()],
+        )
+        seed.commit()
+        seed.close()
+
+        messages = []
+        for _ in range(2):
+            conn = sqlite3.connect(db_path)
+            with pytest.raises(sqlite3.IntegrityError) as raised:
+                m.apply_pending_migrations(
+                    conn,
+                    fresh=False,
+                    target_version=9,
+                    migrations={9: m.MIGRATIONS[9]},
+                )
+            messages.append(str(raised.value))
+            assert conn.execute(
+                "SELECT version FROM schema_version ORDER BY version"
+            ).fetchall() == [(version,) for version in range(1, 9)]
+            assert {
+                row[1] for row in conn.execute("PRAGMA table_info(atoms)")
+            }.isdisjoint({"tombstoned_at", "tombstoned_reason"})
+            conn.close()
+
+        assert messages[0] == messages[1]
+        assert (
+            "idx_atoms_dedup(content_hash, agent_id, owner_principal)" in messages[0]
+        )
+        assert (
+            "content_hash='H', agent_id='agent', owner_principal='owner'"
+            in messages[0]
+        )
+
+
 def test_current_schema_has_owner_dedup_and_recall_provenance() -> None:
     conn = sqlite3.connect(":memory:")
     try:
@@ -1414,7 +1675,7 @@ def test_current_schema_has_owner_dedup_and_recall_provenance() -> None:
         assert {"integrity", "origin_trigger", "origin_ref"} <= atom_columns.keys()
         assert atom_columns["integrity"][3] == 1
         assert atom_columns["integrity"][4] == "'untrusted'"
-        assert m.detect_schema_version(conn) == 10
+        assert m.detect_schema_version(conn) == 11
     finally:
         conn.close()
 
@@ -1434,3 +1695,33 @@ def test_v10_migration_backfills_legacy_atoms_fail_closed() -> None:
         m._execute_migration_script(conn, m.MIGRATIONS[10])
     finally:
         conn.close()
+
+
+def test_v11_fresh_and_migrated_indexes_have_identical_pragma_output() -> None:
+    schema = Path("mimir/saga/schema.sql").read_text()
+    fresh = sqlite3.connect(":memory:")
+    migrated = sqlite3.connect(":memory:")
+    try:
+        fresh.executescript(schema)
+        migrated.executescript(schema)
+        for name in (
+            "idx_triples_embedding_recency",
+            "idx_sessions_recency",
+            "idx_sessions_channel_recency",
+        ):
+            migrated.execute(f"DROP INDEX {name}")
+        assert m.detect_schema_version(migrated) == 10
+        m._execute_migration_script(migrated, m.MIGRATIONS[11])
+        assert m.detect_schema_version(migrated) == 11
+
+        for name in (
+            "idx_triples_embedding_recency",
+            "idx_sessions_recency",
+            "idx_sessions_channel_recency",
+        ):
+            fresh_pragma = fresh.execute(f"PRAGMA index_xinfo({name})").fetchall()
+            migrated_pragma = migrated.execute(f"PRAGMA index_xinfo({name})").fetchall()
+            assert migrated_pragma == fresh_pragma
+    finally:
+        fresh.close()
+        migrated.close()

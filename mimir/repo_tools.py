@@ -90,11 +90,22 @@ _BASE_CONFIG = (
 
 
 class GitRefusal(RuntimeError):
-    """A named policy refusal, distinct from a Git command failure."""
+    """A named policy refusal, distinct from a Git command failure.
 
-    def __init__(self, code: str, message: str) -> None:
+    Omitted phase information deliberately fails closed to the post-execution
+    verdict; known pre-execution sites pass ``execution_started=False``.
+    """
+
+    def __init__(
+        self,
+        code: str,
+        message: str,
+        *,
+        execution_started: bool = True,
+    ) -> None:
         super().__init__(message)
         self.code = code
+        self.execution_started = execution_started
 
 
 def _redact_git_output(text: str) -> str:
@@ -350,6 +361,7 @@ class RepoGitTools:
         self._output_limit = output_limit
         self._enforce = enforce
         self._env = _sanitized_git_env()
+        self._execution_started = False
         self._root = self._validate_lease()
         self._validate_scope()
         self._expected_head = (
@@ -360,6 +372,11 @@ class RepoGitTools:
     def environment(self) -> dict[str, str]:
         """Expose a copy for audit/tests; mutations cannot affect execution."""
         return self._env.copy()
+
+    @property
+    def execution_started(self) -> bool:
+        """Return whether this instance attempted a Git subprocess."""
+        return self._execution_started
 
     def _validate_scope(self) -> None:
         if not _SHA_RE.fullmatch(self._scope.observed_head_sha):
@@ -445,6 +462,7 @@ class RepoGitTools:
             child_env = self._env.copy()
             if env:
                 child_env.update(env)
+            self._execution_started = True
             result = self._runner(
                 argv, env=child_env, timeout=self._timeout,
                 output_limit=self._output_limit,
@@ -461,7 +479,11 @@ class RepoGitTools:
                 stderr=_redact_git_output(result.stderr),
             )
         except (OSError, subprocess.SubprocessError) as exc:
-            raise GitRefusal("git_failed", "pinned Git execution failed") from exc
+            raise GitRefusal(
+                "git_failed",
+                "pinned Git execution failed",
+                execution_started=True,
+            ) from exc
 
     def _checked(
         self,
@@ -924,8 +946,8 @@ class RepoGitTools:
                     or records[0][0].lower() != self._scope.observed_head_sha.lower()
                     or records[0][1] != self._scope.destination_ref
                 ):
-                    return GitOperationResult(
-                        False, "stale_scope", stderr=self._stranded_work_message(),
+                    raise GitRefusal(
+                        "stale_scope", self._stranded_work_message(),
                     )
                 push_args = ["push", "--porcelain"]
                 if rewritten_history:

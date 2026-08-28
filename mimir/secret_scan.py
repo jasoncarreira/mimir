@@ -21,7 +21,11 @@ _SECRET_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(r"Bearer [A-Za-z0-9_\-]{20,}"),
     re.compile(r"sk-ant-[A-Za-z0-9_\-]{20,}"),
     re.compile(r"sk-proj[-_][A-Za-z0-9_\-]{20,}"),
+    re.compile(r"sk-[A-Za-z0-9]+-v[0-9]+-[A-Za-z0-9_\-]{20,}"),
     re.compile(r"sk-[A-Za-z0-9]{20,}"),           # OpenAI classic (base62, no hyphens)
+    re.compile(r"tvly-[A-Za-z0-9_\-]{20,}"),     # Tavily API key
+    re.compile(r"pa-[A-Za-z0-9_\-]{20,}"),       # Voyage API key
+    re.compile(r"AIza[A-Za-z0-9_\-]{35}"),       # Google API key (39 chars total)
     re.compile(r"ghp_[A-Za-z0-9]{30,}"),          # GitHub PAT (classic)
     re.compile(r"gho_[A-Za-z0-9]{30,}"),          # GitHub OAuth
     re.compile(r"gh[usr]_[A-Za-z0-9]{30,}"),      # GitHub user/server/app tokens
@@ -33,6 +37,8 @@ _SECRET_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(r'"access_token"\s*:\s*"[^"]{20,}"'),
     re.compile(r'"client_secret"\s*:\s*"[^"]{20,}"'),
     re.compile(r"xox[bpasr]-[0-9A-Za-z-]{20,}"),  # Slack credential tokens
+    re.compile(r"xapp-[0-9A-Za-z-]{20,}"),        # Slack app-level token
+    re.compile(r"\b[A-Za-z0-9_-]{25,}\.[A-Za-z0-9_-]{6,}\.[A-Za-z0-9_-]{27,}\b"),
     re.compile(r"\b[A-Za-z0-9_-]{24}\.[A-Za-z0-9_-]{6}\.[A-Za-z0-9_-]{27,}\b"),
 )
 

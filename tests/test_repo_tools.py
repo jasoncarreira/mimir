@@ -17,13 +17,17 @@ import struct
 import sys
 from types import SimpleNamespace
 import subprocess
+import tomllib
 import traceback
 import uuid
 
 import pytest
 from langchain_core.tools import ToolException
 
-from mimir.contained_execution import CollectedExecutionResult
+from mimir.contained_execution import (
+    CollectedExecutionResult,
+    SensitiveMaterialScrubber,
+)
 from mimir.contained_snapshot import SnapshotCredentialsRefused, create_git_snapshot
 from mimir.models import RepoPRAction, RepoPRActionScope, RepoReviewState
 from mimir.pr_checkout_lease import (
@@ -35,6 +39,8 @@ from mimir.project_tests import (
     _TIMEOUT_SECONDS,
     ProjectTestRefusal,
     RepoProjectTests,
+    _safe_stderr_output,
+    _validated_selectors,
 )
 from mimir.repo_tools import (
     GitCommit,
@@ -568,7 +574,7 @@ def test_revert_conflict_has_separately_authorized_abort(repo_tools) -> None:
     assert _git(lease.path, "status", "--porcelain") == ""
 
 
-def test_stale_remote_head_returns_named_refusal_and_never_pushes(repo_tools) -> None:
+def test_stale_remote_head_raises_named_refusal_and_never_pushes(repo_tools) -> None:
     origin, source, _scope, state, _tools = repo_tools
     _git(source, "checkout", "-q", "worklink/7")
     (source / "remote.txt").write_text("advanced\n", encoding="utf-8")
@@ -583,10 +589,11 @@ def test_stale_remote_head_returns_named_refusal_and_never_pushes(repo_tools) ->
             argv, env=env, timeout=timeout, output_limit=output_limit,
         )
 
-    result = RepoGitTools(state, runner=recording_runner).execute(GitPush())
+    with pytest.raises(GitRefusal) as refusal:
+        RepoGitTools(state, runner=recording_runner).execute(GitPush())
 
-    assert result.ok is False
-    assert result.code == "stale_scope"
+    assert refusal.value.code == "stale_scope"
+    assert str(refusal.value) == "the checkout lease was preserved for retry"
     assert any("ls-remote" in argv for argv in calls)
     assert not any("push" in argv for argv in calls)
     assert _git(origin, "rev-parse", "refs/heads/worklink/7") != state.checkout_lease.head_sha
@@ -741,10 +748,10 @@ def test_mergeability_rebase_stale_lease_refuses_concurrent_push(tmp_path: Path)
     concurrent_head = _git(source, "rev-parse", "HEAD")
     _git(source, "push", "-q", "origin", "HEAD:worklink/7")
 
-    result = RepoGitTools(state).execute(GitPush())
+    with pytest.raises(GitRefusal) as refusal:
+        RepoGitTools(state).execute(GitPush())
 
-    assert result.ok is False
-    assert result.code == "stale_scope"
+    assert refusal.value.code == "stale_scope"
     assert _git(origin, "rev-parse", scope.destination_ref) == concurrent_head
 
 
@@ -768,10 +775,10 @@ def test_changes_requested_rebase_stale_lease_refuses_concurrent_push(
             argv, env=env, timeout=timeout, output_limit=output_limit,
         )
 
-    result = RepoGitTools(state, runner=recording_runner).execute(GitPush())
+    with pytest.raises(GitRefusal) as refusal:
+        RepoGitTools(state, runner=recording_runner).execute(GitPush())
 
-    assert result.ok is False
-    assert result.code == "stale_scope"
+    assert refusal.value.code == "stale_scope"
     assert any("ls-remote" in argv for argv in calls)
     assert not any("push" in argv for argv in calls)
     assert _git(origin, "rev-parse", scope.destination_ref) == concurrent_head
@@ -1451,7 +1458,7 @@ async def test_project_tests_use_snapshot_collected_result_and_worker_environmen
     assert kwargs["timeout_s"] == _TIMEOUT_SECONDS
     assert result.git_context == (
         "contained Git context: runner=worklink uid=42002 gid=42003; "
-        "checkout_owner=mimir uid=42001 gid=42003; global_config=/dev/null; "
+        "checkout_owner=worklink uid=42002 gid=42003; global_config=/dev/null; "
         "system_config=disabled; safe.directory=*"
     )
 
@@ -1507,10 +1514,250 @@ async def test_project_tests_scrub_checkout_home_and_sensitive_output(
     assert secret not in result.stdout + result.stderr
 
 
+def _run_synthetic_pytest(tmp_path: Path, test_source: str) -> subprocess.CompletedProcess[bytes]:
+    test_path = tmp_path / "test_synthetic_hang.py"
+    test_path.write_text(test_source, encoding="utf-8")
+    return subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "pytest",
+            "-q",
+            "-s",
+            str(test_path),
+            "-o",
+            "faulthandler_timeout=0.1",
+            "-o",
+            "faulthandler_exit_on_timeout=false",
+        ],
+        cwd=tmp_path,
+        capture_output=True,
+        check=False,
+        # Nested pytest startup can be heavily delayed while the full suite is
+        # contending for CPU; keep this outer guard well above the intentional
+        # three-second sleep that the assertion exercises.
+        timeout=30,
+    )
+
+
 @pytest.mark.asyncio
-@pytest.mark.parametrize("selector", ["--flag", "../outside", "tracked.txt;id", "/tmp/test"])
+async def test_project_test_retains_builtin_hang_dump_after_stderr_truncation(
+    repo_tools, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    completed = await asyncio.to_thread(
+        _run_synthetic_pytest,
+        tmp_path,
+        "import os\n"
+        "import threading\n"
+        "import time\n"
+        "\n"
+        "def blocked_worker(gate):\n"
+        "    gate.wait()\n"
+        "\n"
+        "def test_synthetic_hang():\n"
+        "    credential = 'credential-value-must-not-appear'\n"
+        "    gate = threading.Event()\n"
+        "    threading.Thread(target=blocked_worker, args=(gate,), daemon=True).start()\n"
+        "    os.write(2, b'x' * 5000)\n"
+        # 0.1s faulthandler threshold against a 3s hang: a 30x margin, because a
+        # contended CI runner can otherwise finish a 0.2s sleep before the dump
+        # is written. Observed failing twice on pytest-macos (3.11) at that margin
+        # while passing locally and on every Linux job.
+        "    time.sleep(3.0)\n"
+        "    assert credential\n",
+    )
+    assert completed.returncode == 0
+    assert len(completed.stderr) > 4_000
+    assert b"Timeout (0:00:00.100000)!" in completed.stderr
+    assert b"in blocked_worker" in completed.stderr
+    assert b"in test_synthetic_hang" in completed.stderr
+    # Python's faulthandler emits stack locations, not frame local values.
+    assert b"credential-value-must-not-appear" not in completed.stderr
+
+    state = repo_tools[-2]
+    home = tmp_path / "home"
+    _configure_worklink_test(home)
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+
+    async def runner(*_args, **_kwargs):
+        return CollectedExecutionResult(
+            completed.returncode, b"", completed.stderr, False, False, 0, 0,
+        )
+
+    result = await RepoProjectTests(
+        state, runner=runner, checkout_factory=_test_checkout_factory,
+    ).execute(("tracked.txt",))
+    assert result.ok
+    assert len(result.stderr) <= 4_000
+    assert result.stderr.startswith("Timeout (0:00:00.100000)!")
+    assert "in blocked_worker" in result.stderr
+    assert "in test_synthetic_hang" in result.stderr
+    assert "credential-value-must-not-appear" not in result.stderr
+
+
+def test_stderr_without_hang_dump_keeps_existing_positional_policy() -> None:
+    scrubber = SensitiveMaterialScrubber(home=None)
+    stderr = b"head-context\n" + b"x" * 5_000 + b"\ntail-context"
+
+    assert _safe_stderr_output(stderr, scrubber, 100).startswith("head-context")
+    assert _safe_stderr_output(stderr, scrubber, 100, keep_tail=True).endswith(
+        "tail-context"
+    )
+
+
+@pytest.mark.asyncio
+async def test_project_test_timeout_returns_captured_hang_diagnostic(
+    repo_tools, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state = repo_tools[-2]
+    home = tmp_path / "home"
+    _configure_worklink_test(home)
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    stderr = (
+        b"noise\n"
+        + b"x" * 5_000
+        + b"\nTimeout (0:05:00)!\nThread dump\n  File test_hang.py, line 7\n"
+    )
+
+    async def runner(*_args, **kwargs):
+        kwargs["stdout_path"].parent.mkdir(parents=True, exist_ok=True)
+        kwargs["stdout_path"].write_bytes(b"partial stdout")
+        kwargs["stderr_path"].write_bytes(stderr)
+        return CollectedExecutionResult(None, b"partial stdout", stderr, True, False, 0, 0)
+
+    result = await RepoProjectTests(
+        state, runner=runner, checkout_factory=_test_checkout_factory,
+    ).execute(("tracked.txt",))
+
+    assert result.code == "test_timeout"
+    assert result.stdout == "partial stdout"
+    assert result.stderr.startswith("Timeout (0:05:00)!")
+    assert "test_hang.py" in result.stderr
+    assert result.stdout_path.startswith("state/worklink/transcripts/repo-test-")
+    assert result.stderr_path.startswith("state/worklink/transcripts/repo-test-")
+    assert (home / result.stdout_path).read_bytes() == b"partial stdout"
+    assert b"test_hang.py" in (home / result.stderr_path).read_bytes()
+
+
+@pytest.mark.asyncio
+async def test_project_test_hang_is_observable_before_runner_completes(
+    repo_tools, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state = repo_tools[-2]
+    home = tmp_path / "home"
+    _configure_worklink_test(home)
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    output_written = asyncio.Event()
+    release_runner = asyncio.Event()
+    observed: dict[str, object] = {}
+    dump = (
+        b"Timeout (0:05:00)!\n"
+        b'Thread 0x1 (most recent call first):\n  File "test_never_finishes.py", line 9\n'
+    )
+
+    async def runner(*_args, **kwargs):
+        observed.update(kwargs)
+        stdout_path = kwargs["stdout_path"]
+        stderr_path = kwargs["stderr_path"]
+        stdout_path.parent.mkdir(parents=True, exist_ok=True)
+        stdout_path.write_bytes(b"tests/test_never_finishes.py::test_hangs ")
+        stderr_path.write_bytes(dump)
+        output_written.set()
+        await release_runner.wait()
+        return CollectedExecutionResult(
+            None, stdout_path.read_bytes(), stderr_path.read_bytes(), True, False, 0, 0,
+        )
+
+    task = asyncio.create_task(RepoProjectTests(
+        state, runner=runner, checkout_factory=_test_checkout_factory,
+    ).execute(("tracked.txt",)))
+    await asyncio.wait_for(output_written.wait(), 1)
+
+    stdout_path = observed["stdout_path"]
+    stderr_path = observed["stderr_path"]
+    assert isinstance(stdout_path, Path)
+    assert isinstance(stderr_path, Path)
+    assert task.done() is False
+    assert b"test_never_finishes.py::test_hangs" in stdout_path.read_bytes()
+    assert b"test_never_finishes.py" in stderr_path.read_bytes()
+    assert observed["stdout_limit"] == observed["stderr_limit"] == 64 * 1024
+    assert stdout_path.stat().st_size <= 64 * 1024
+    assert stderr_path.stat().st_size <= 64 * 1024
+
+    release_runner.set()
+    result = await task
+    assert result.code == "test_timeout"
+    assert home / result.stdout_path == stdout_path
+    assert home / result.stderr_path == stderr_path
+
+
+@pytest.mark.asyncio
+async def test_project_test_fast_run_removes_live_output_files(
+    repo_tools, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state = repo_tools[-2]
+    home = tmp_path / "home"
+    _configure_worklink_test(home)
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    written: list[Path] = []
+
+    async def runner(*_args, **kwargs):
+        stdout_path = kwargs["stdout_path"]
+        stderr_path = kwargs["stderr_path"]
+        stdout_path.parent.mkdir(parents=True, exist_ok=True)
+        stdout_path.write_bytes(b"one passed")
+        stderr_path.write_bytes(b"")
+        written.extend((stdout_path, stderr_path))
+        return CollectedExecutionResult(0, b"one passed", b"", False, False, 0, 0)
+
+    result = await RepoProjectTests(
+        state, runner=runner, checkout_factory=_test_checkout_factory,
+    ).execute(("tracked.txt",))
+
+    assert result.ok is True
+    assert result.stdout == "one passed"
+    assert result.stdout_path == result.stderr_path == ""
+    assert written and all(not path.exists() for path in written)
+
+
+@pytest.mark.asyncio
+async def test_builtin_hang_diagnostic_configuration_leaves_fast_test_quiet(
+    tmp_path: Path,
+) -> None:
+    config = tomllib.loads(
+        (Path(__file__).parent.parent / "pyproject.toml").read_text(encoding="utf-8")
+    )["tool"]["pytest"]["ini_options"]
+    assert config["faulthandler_timeout"] == 300
+    assert config["faulthandler_timeout"] < _TIMEOUT_SECONDS / 2
+    assert config["faulthandler_exit_on_timeout"] is False
+
+    completed = await asyncio.to_thread(
+        _run_synthetic_pytest,
+        tmp_path,
+        "def test_fast():\n"
+        "    pass\n",
+    )
+    assert completed.returncode == 0
+    assert completed.stderr == b""
+    assert b"Timeout" not in completed.stdout
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("selector", "reason"),
+    [
+        ("--flag", "test_selector_invalid"),
+        ("../outside", "test_selector_outside_checkout"),
+        ("tracked.txt;id", "test_selector_invalid"),
+        ("/tmp/test", "test_selector_outside_checkout"),
+    ],
+)
 async def test_project_test_selector_injection_is_refused(
-    repo_tools, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, selector: str,
+    repo_tools,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    selector: str,
+    reason: str,
 ) -> None:
     state = repo_tools[-2]
     home = tmp_path / "home"
@@ -1518,7 +1765,76 @@ async def test_project_test_selector_injection_is_refused(
     monkeypatch.setenv("MIMIR_HOME", str(home))
     with pytest.raises(ProjectTestRefusal) as refusal:
         await RepoProjectTests(state).execute((selector,))
-    assert refusal.value.code in {"test_selector_invalid", "test_selector_outside_checkout"}
+    assert refusal.value.code == reason
+
+
+def test_project_test_missing_selector_has_named_non_disclosing_refusal(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "checkout"
+    root.mkdir()
+    selector = "missing/test_file.py::test_named_case"
+
+    with pytest.raises(ProjectTestRefusal) as refusal:
+        _validated_selectors(root, (selector,))
+
+    assert refusal.value.code == "test_selector_not_found"
+    assert str(refusal.value) == f"test selector was not found in checkout: {selector}"
+    assert str(root) not in str(refusal.value)
+
+
+def test_project_test_symlink_selector_is_refused_before_resolution(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "checkout"
+    root.mkdir()
+    (root / "linked").symlink_to(tmp_path / "missing-target", target_is_directory=True)
+
+    def unexpected_resolve(*_args, **_kwargs):
+        raise AssertionError("symlink selector must be refused before resolution")
+
+    monkeypatch.setattr(Path, "resolve", unexpected_resolve)
+    with pytest.raises(ProjectTestRefusal) as refusal:
+        _validated_selectors(root, ("linked/test_file.py",))
+
+    assert refusal.value.code == "test_selector_symlink"
+    assert "symlink" in str(refusal.value)
+
+
+@pytest.mark.parametrize("selector", ["../absent-outside.py", "/absent-outside.py"])
+def test_project_test_absent_escape_is_not_reclassified_as_not_found(
+    tmp_path: Path, selector: str,
+) -> None:
+    root = tmp_path / "checkout"
+    root.mkdir()
+
+    with pytest.raises(ProjectTestRefusal) as refusal:
+        _validated_selectors(root, (selector,))
+
+    assert refusal.value.code == "test_selector_outside_checkout"
+    assert str(refusal.value) == (
+        "test selector does not resolve inside the authorized checkout"
+    )
+
+
+def test_project_test_unreadable_parent_has_resolution_refusal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "checkout"
+    unreadable = root / "unreadable"
+    unreadable.mkdir(parents=True)
+    original_resolve = Path.resolve
+
+    def permission_denied(path: Path, *args, **kwargs):
+        if path == unreadable / "test_file.py":
+            raise PermissionError(13, "Permission denied", str(unreadable))
+        return original_resolve(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "resolve", permission_denied)
+    with pytest.raises(ProjectTestRefusal) as refusal:
+        _validated_selectors(root, ("unreadable/test_file.py",))
+
+    assert refusal.value.code == "test_selector_unresolvable"
 
 
 @pytest.mark.asyncio
@@ -1558,7 +1874,7 @@ async def test_project_test_snapshot_credentials_are_named_refusal(
 
 
 @pytest.mark.asyncio
-async def test_public_repo_test_credential_refusal_persists_no_sensitive_material(
+async def test_public_repo_test_credential_fault_persists_no_sensitive_material(
     repo_tools,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1594,7 +1910,7 @@ async def test_public_repo_test_credential_refusal_persists_no_sensitive_materia
     )
     assert repo_module.repo_test.coroutine is not None
     try:
-        with pytest.raises(ToolPolicyRefusal) as refusal:
+        with pytest.raises(ToolException) as refusal:
             await repo_module.repo_test.coroutine(
                 repository="owner/repo",
                 pull_request=7,
@@ -1604,6 +1920,7 @@ async def test_public_repo_test_credential_refusal_persists_no_sensitive_materia
     finally:
         event_logger._logger = previous_logger
 
+    assert not isinstance(refusal.value, ToolPolicyRefusal)
     persisted_events = event_path.read_bytes()
     event_records = [json.loads(line) for line in persisted_events.splitlines()]
     assert [(record["type"], record["reason_code"]) for record in event_records] == [
@@ -2358,7 +2675,16 @@ def test_git_execution_os_failure_is_a_named_refusal(repo_tools) -> None:
     ("failure", "expected_code", "exception_type"),
     [
         (ToolPolicyRefusal("scope action denied"), "repository_authorization_refused", ToolPolicyRefusal),
-        (GitRefusal("inactive_checkout", "lease binding missing"), "repository_binding_invalid", ToolPolicyRefusal),
+        (
+            GitRefusal("inactive_checkout", "lease binding missing", execution_started=False),
+            "repository_binding_invalid",
+            ToolPolicyRefusal,
+        ),
+        (
+            GitRefusal("stale_scope", "local commit remains unpushed in preserved checkout"),
+            "repository_git_failed",
+            ToolException,
+        ),
         (RuntimeError("plain Git invocation failed"), "repository_git_failed", ToolException),
     ],
 )
@@ -2380,6 +2706,7 @@ def test_repo_wrapper_failure_classes_have_distinct_stable_codes(
         class FailingRepoGitTools:
             def __init__(self, review_state, *, enforce=True):
                 self.review_state = review_state
+                self.execution_started = False
 
             def execute(self, operation):
                 raise failure
@@ -2391,6 +2718,8 @@ def test_repo_wrapper_failure_classes_have_distinct_stable_codes(
 
     assert f"repository operation rejected ({expected_code})" in str(refusal.value)
     assert "repository_operation_failed" not in str(refusal.value)
+    if isinstance(failure, GitRefusal) and failure.code == "stale_scope":
+        assert "local commit remains unpushed in preserved checkout" in str(refusal.value)
 
 
 def test_repo_wrapper_git_stderr_redacts_embedded_remote_credential(
@@ -2403,9 +2732,14 @@ def test_repo_wrapper_git_stderr_redacts_embedded_remote_credential(
     class FailingRepoGitTools:
         def __init__(self, review_state, *, enforce=True):
             self.review_state = review_state
+            self.execution_started = False
 
         def execute(self, operation):
-            raise GitRefusal("git_failed", f"fatal: unable to access {secret_url}")
+            raise GitRefusal(
+                "git_failed",
+                f"fatal: unable to access {secret_url}",
+                execution_started=True,
+            )
 
     monkeypatch.setattr(repo_module, "_state", lambda *_args: repo_tools[-2])
     monkeypatch.setattr(repo_module, "RepoGitTools", FailingRepoGitTools)

@@ -1,12 +1,16 @@
 from __future__ import annotations
 
 import asyncio
+import errno
+import os
 from pathlib import Path
+import stat
 from typing import Any
 
 import pytest
 
 import mimir.contained_execution as contained
+import mimir.output_capture as output_capture
 from mimir.contained_execution import (
     SensitiveMaterialScrubber,
     base_worker_environment,
@@ -54,6 +58,10 @@ class Client:
 
     async def launch(self, **kwargs: Any) -> Process:
         self.launched.append(kwargs)
+        kwargs["stdout_sink"].file.write(bytes(self.process.stdout._buffer))
+        kwargs["stdout_sink"].file.flush()
+        kwargs["stderr_sink"].file.write(bytes(self.process.stderr._buffer))
+        kwargs["stderr_sink"].file.flush()
         return self.process
 
     async def cancel(self, identifier: str) -> None:
@@ -68,11 +76,13 @@ def install_client(monkeypatch: pytest.MonkeyPatch, client: Client) -> None:
 
 @pytest.mark.asyncio
 async def test_execute_contained_returns_only_a_capped_collected_value(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     client = Client(b"abcdef", b"12345")
     install_client(monkeypatch, client)
 
+    stdout_path = tmp_path / "run.stdout.log"
+    stderr_path = tmp_path / "run.stderr.log"
     result = await execute_contained(
         ("tool", "arg"),
         Capability(),
@@ -81,6 +91,8 @@ async def test_execute_contained_returns_only_a_capped_collected_value(
         timeout_s=1,
         stdout_limit=4,
         stderr_limit=3,
+        stdout_path=stdout_path,
+        stderr_path=stderr_path,
     )
 
     assert result.exit_code == 0
@@ -92,6 +104,10 @@ async def test_execute_contained_returns_only_a_capped_collected_value(
     assert client.cancelled == ["aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"]
     assert client.launched[0]["local_checkout"] == Capability.path
     assert client.launched[0]["timeout_s"] == 1
+    assert stdout_path.read_bytes() == b"abcd"
+    assert stderr_path.read_bytes() == b"123"
+    assert stdout_path.stat().st_mode & 0o777 == 0o600
+    assert stderr_path.stat().st_mode & 0o777 == 0o600
 
 
 @pytest.mark.asyncio
@@ -364,3 +380,92 @@ def test_safe_truncation_length_without_materials_is_the_limit() -> None:
 
     assert scrubber.lookahead_bytes() == 0
     assert scrubber.safe_truncation_length(b"plain output", 5) == 5
+
+
+def test_output_sink_creation_uses_exclusive_nofollow_private_flags(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "private" / "transcripts" / "stdout.log"
+    real_open = os.open
+    output_open: tuple[int, int] | None = None
+
+    def observed_open(
+        target: str | bytes | os.PathLike[str] | os.PathLike[bytes],
+        flags: int,
+        mode: int = 0o777,
+        *,
+        dir_fd: int | None = None,
+    ) -> int:
+        nonlocal output_open
+        if target == path.name and dir_fd is not None:
+            output_open = (flags, mode)
+        return real_open(target, flags, mode, dir_fd=dir_fd)
+
+    monkeypatch.setattr(output_capture.os, "open", observed_open)
+    sink = output_capture.open_output_sink(path, 100)
+    sink.close()
+
+    assert output_open is not None
+    flags, mode = output_open
+    assert flags & os.O_EXCL
+    assert flags & getattr(os, "O_NOFOLLOW", 0) == getattr(os, "O_NOFOLLOW", 0)
+    assert mode == 0o600
+
+
+def test_output_sink_exclusive_create_symlink_refusal_and_private_modes(tmp_path: Path) -> None:
+    root = tmp_path / "private" / "transcripts"
+    path = root / "stdout.log"
+    sink = output_capture.open_output_sink(path, 100)
+    try:
+        assert stat.S_IMODE(root.stat().st_mode) == 0o700
+        assert stat.S_IMODE(path.stat().st_mode) == 0o600
+    finally:
+        sink.close()
+
+    with pytest.raises(FileExistsError):
+        output_capture.open_output_sink(path, 100)
+
+    link = root / "stderr.log"
+    link.symlink_to(path)
+    with pytest.raises(OSError) as raised:
+        output_capture.open_output_sink(link, 100)
+    assert raised.value.errno in {errno.EEXIST, errno.ELOOP}
+
+
+def test_output_sink_refuses_unsafe_parent_and_relative_root(tmp_path: Path) -> None:
+    unsafe = tmp_path / "unsafe"
+    unsafe.mkdir(mode=0o777)
+    unsafe.chmod(0o777)
+    with pytest.raises(PermissionError, match="unsafe writable"):
+        output_capture.open_output_sink(unsafe / "run" / "stdout.log", 100)
+    with pytest.raises(ValueError, match="absolute"):
+        output_capture.open_output_sink(Path("relative/stdout.log"), 100)
+
+
+@pytest.mark.parametrize("written", [0, -1, 2])
+def test_output_writer_refuses_zero_negative_and_short_writes(
+    monkeypatch: pytest.MonkeyPatch, written: int
+) -> None:
+    sink = output_capture.open_output_sink(None, 100)
+    real_write = os.write
+    calls = 0
+
+    def faulty_write(fd: int, value: bytes | memoryview) -> int:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            if written > 0:
+                real_write(fd, bytes(value)[:written])
+            return written
+        return real_write(fd, value)
+
+    monkeypatch.setattr(output_capture.os, "write", faulty_write)
+    try:
+        if written <= 0:
+            with pytest.raises(OSError, match="incomplete Worklink output write"):
+                sink.file.write(b"abcd")
+        else:
+            assert sink.file.write(b"abcd") == 4
+            assert sink.read_bounded()[0] == b"abcd"
+    finally:
+        sink.close()

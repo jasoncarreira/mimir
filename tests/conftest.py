@@ -148,6 +148,29 @@ def repo_review_git_root(tmp_path):
     return root.resolve()
 
 
+# Host-only Mimir settings: set by an operator or a deployment, never by a test.
+_HOST_ONLY_ENV = frozenset(
+    {
+        "MIMIR_API_KEY",
+        "MIMIR_CLAUDE_OAUTH_CREDENTIALS",
+        "MIMIR_HOME",
+        "MIMIR_CODING_ENABLED",
+        "MIMIR_FACTORY_PUBLISHING_IDENTITY",
+        "MIMIR_FILE_TOOL_ROOTS",
+        "OPENCODE_CONFIG",
+        "PYTEST_ADDOPTS",
+    }
+)
+
+# The poller framework injects these into a poller's child process
+# (``mimir/pollers.py`` sets them; ``_POLLER_INJECTED_ENV_KEYS`` is the source of
+# truth, and ``test_env_isolation`` asserts this set stays in step with it).
+# Inheriting them is not merely noisy -- ``STATE_DIR`` is where
+# ``_record_run_failure`` writes dispatch failures, so a test running under an
+# inherited value writes into the live poller store.
+_POLLER_INJECTED_ENV = frozenset({"STATE_DIR", "POLLER_NAME", "MIMIR_HOME"})
+
+
 @pytest.fixture(autouse=True, scope="session")
 def _clear_host_mimir_environment():
     """Pop host-only Mimir settings from os.environ for the test session.
@@ -159,9 +182,34 @@ def _clear_host_mimir_environment():
     Tests that want to exercise the auth-on path should monkeypatch
     the env var explicitly inside the test body.
 
-    ``MIMIR_HOME`` is also host-specific. Leaving it set makes the live
-    ``repositories.yaml`` override temporary ``GITHUB_REPOS`` and writable-root
-    settings in authorization tests.
+    ``MIMIR_HOME`` and ``MIMIR_FILE_TOOL_ROOTS`` are also host-specific. Leaving
+    them set makes the live ``repositories.yaml`` override temporary
+    ``GITHUB_REPOS`` and writable-root settings in authorization tests.
+
+    ``MIMIR_CLAUDE_OAUTH_CREDENTIALS`` explicitly overrides the credentials path
+    derived from a test's temporary ``MIMIR_HOME``. Inheriting it makes Config
+    inspect the controller's real credentials, which correctly fails when the
+    suite runs across the Worklink worker uid boundary.
+
+    ``OPENCODE_CONFIG`` must not pin tests that replace ``HOME`` to the live
+    agent's model configuration. ``PYTEST_ADDOPTS`` has already been consumed by
+    the parent pytest process and must not leak its report paths into child pytest
+    runs. ``MIMIR_FACTORY_PUBLISHING_IDENTITY`` is host-only for the same reason and
+    was missed when #1624 introduced it. It overrides the ``publishing_identity``
+    a checkout declares in ``.factory.json``, so a deployment that sets it makes
+    every test asserting on the declared identity read the deployment's value
+    instead. That is not hypothetical: it ran green in CI, where the variable is
+    unset, and failed inside mimirbot, where ``compose.env`` sets it -- taking
+    the worklink test gate down, and with it ``review_ready``, the commit step
+    and publication for every build. Tests that exercise the override set it
+    explicitly in the test body.
+
+    ``MIMIR_CODING_ENABLED`` is likewise a deployment capability switch. Tests
+    that exercise enabled coding already opt in explicitly through the function
+    argument or ``monkeypatch.setenv``; allowing the host value to leak instead
+    changes disabled-default assertions and routes Worklink tests through the
+    enabled worker path. A Worklink test gate must therefore be invariant to the
+    controller's configured coding state.
 
     Same shape as the SAGA_CONFIG cleanup proposed in chainlink #129's
     PR #75 precedent. Session-scoped so we don't churn os.environ on
@@ -169,7 +217,7 @@ def _clear_host_mimir_environment():
     """
     saved = {
         name: os.environ.pop(name)
-        for name in ("MIMIR_API_KEY", "MIMIR_HOME")
+        for name in _HOST_ONLY_ENV | _POLLER_INJECTED_ENV
         if name in os.environ
     }
     yield

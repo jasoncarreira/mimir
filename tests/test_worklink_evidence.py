@@ -2,12 +2,21 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 import asyncio
+import json
+import shlex
 import subprocess
+import sys
 import pytest
 from pathlib import Path
 from typing import Sequence
 
-from mimir.worklink.evidence import TestResult, WorklinkEvidence, observe_evidence, validate_evidence
+from mimir.worklink.evidence import (
+    TestResult,
+    WorklinkEvidence,
+    observe_evidence,
+    read_pytest_result,
+    validate_evidence,
+)
 
 
 def base_evidence(**overrides: object) -> WorklinkEvidence:
@@ -171,6 +180,123 @@ def test_gate_test_summary_keeps_output_tail_not_head() -> None:
     assert len(summary) <= 6000
 
 
+def test_structured_pytest_failures_are_scrubbed_before_evidence(tmp_path: Path) -> None:
+    (tmp_path / "junit.xml").write_text(
+        '<testsuites><testsuite tests="1" failures="1" errors="0" skipped="0" />'
+        "</testsuites>",
+        encoding="utf-8",
+    )
+    cache = tmp_path / "cache" / "v" / "cache"
+    cache.mkdir(parents=True)
+    (cache / "lastfailed").write_text(
+        json.dumps({"tests/test_api.py::test_token[token=top-secret]": True}),
+        encoding="utf-8",
+    )
+
+    result = read_pytest_result("pytest -q", tmp_path)
+
+    assert result is not None
+    assert "top-secret" not in result.failed_tests[0]
+    assert "[REDACTED]" in result.failed_tests[0]
+
+
+@pytest.mark.parametrize(
+    ("contents", "max_bytes", "expected"),
+    [
+        (None, None, "junit_missing"),
+        ("not xml", None, "junit_parse_error"),
+        ('<testsuite tests="1" />', 1, "junit_oversize"),
+    ],
+)
+def test_pytest_report_read_failures_are_distinguishable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    contents: str | None,
+    max_bytes: int | None,
+    expected: str,
+) -> None:
+    if contents is not None:
+        (tmp_path / "junit.xml").write_text(contents, encoding="utf-8")
+    if max_bytes is not None:
+        monkeypatch.setattr("mimir.worklink.evidence._PYTEST_REPORT_MAX_BYTES", max_bytes)
+
+    result = read_pytest_result("pytest -q", tmp_path)
+
+    assert result is not None
+    assert result.counts is None
+    assert result.report_error == expected
+
+
+def _init_gate_repo(tmp_path: Path, test_source: str) -> Path:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q", "-b", "main"], cwd=repo, check=True)
+    subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=repo, check=True)
+    subprocess.run(["git", "config", "user.name", "test"], cwd=repo, check=True)
+    (repo / "seed.txt").write_text("seed\n", encoding="utf-8")
+    subprocess.run(["git", "add", "seed.txt"], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "-q", "-m", "seed"], cwd=repo, check=True)
+    (repo / "test_gate_sample.py").write_text(test_source, encoding="utf-8")
+    return repo
+
+
+@pytest.mark.asyncio
+async def test_gate_records_counts_from_pytest_generated_junit(tmp_path: Path) -> None:
+    repo = _init_gate_repo(
+        tmp_path,
+        "def test_one():\n    assert True\n\ndef test_two():\n    assert True\n",
+    )
+    test_command = f"{shlex.quote(sys.executable)} -m pytest -q test_gate_sample.py"
+
+    result = await observe_evidence(
+        issue=1482,
+        attempt=1,
+        backend="codex",
+        branch="issue/1482-a1",
+        checkout=repo,
+        started_at=datetime.now(UTC),
+        base_ref="main",
+        backend_status="completed",
+        test_command=test_command,
+    )
+
+    assert result.review_ready is True
+    assert result.evidence.tests is not None
+    assert result.evidence.tests.report_error is None
+    assert result.evidence.tests.counts is not None
+    assert result.evidence.tests.counts.total == 2
+    assert result.evidence.tests.counts.passed == 2
+
+
+@pytest.mark.asyncio
+async def test_gate_records_failed_node_ids_from_pytest_cache(tmp_path: Path) -> None:
+    repo = _init_gate_repo(
+        tmp_path,
+        "def test_passes():\n    assert True\n\ndef test_fails():\n    assert False\n",
+    )
+    test_command = f"{shlex.quote(sys.executable)} -m pytest -q test_gate_sample.py"
+
+    result = await observe_evidence(
+        issue=1482,
+        attempt=1,
+        backend="codex",
+        branch="issue/1482-a1",
+        checkout=repo,
+        started_at=datetime.now(UTC),
+        base_ref="main",
+        backend_status="completed",
+        test_command=test_command,
+    )
+
+    assert result.status == "failed"
+    assert result.evidence.tests is not None
+    assert result.evidence.tests.counts is not None
+    assert result.evidence.tests.counts.failed == 1
+    assert result.evidence.tests.failed_tests == (
+        "test_gate_sample.py::test_fails",
+    )
+
+
 def test_evidence_test_command_uses_bare_command_without_model_spec(
     monkeypatch,
 ) -> None:
@@ -202,6 +328,7 @@ def test_gate_command_not_found_is_not_tests_failed() -> None:
     assert result.review_ready is False
     assert "gate_command_not_found" in result.reasons
     assert "tests_failed" not in result.reasons
+    assert result.evidence.failure_reason == "test gate command was not found (exit 127)"
 
 
 def test_completed_requires_tests_or_skipped_reason() -> None:
@@ -360,7 +487,12 @@ async def test_observe_evidence_sees_committed_backend_work(tmp_path: Path) -> N
 
 @pytest.mark.asyncio
 async def test_enabled_opencode_gate_uses_authorized_compute(monkeypatch, tmp_path: Path) -> None:
-    from mimir.worklink.compute import ComputeResult, LaunchHandle, WorkSpec
+    from mimir.worklink.compute import (
+        ComputeResult,
+        LaunchHandle,
+        WorkSpec,
+        _enabled_child_env,
+    )
 
     class Compute:
         def __init__(self) -> None:
@@ -368,6 +500,7 @@ async def test_enabled_opencode_gate_uses_authorized_compute(monkeypatch, tmp_pa
             self.cleaned = []
 
         async def launch(self, spec):
+            _enabled_child_env(spec, "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
             self.specs.append(spec)
             return LaunchHandle("local_subprocess", "job")
 
@@ -386,7 +519,22 @@ async def test_enabled_opencode_gate_uses_authorized_compute(monkeypatch, tmp_pa
     subprocess.run(["git", "add", "a.txt"], cwd=repo, check=True)
     subprocess.run(["git", "commit", "-q", "-m", "seed"], cwd=repo, check=True)
     (repo / "a.txt").write_text("new\n")
-    spec = WorkSpec(1, 1, "url", "main", "branch", "prompt", None, "", "opencode", 30, local_checkout=repo, local_argv=("opencode",))
+    spec = WorkSpec(
+        1,
+        1,
+        "url",
+        "main",
+        "branch",
+        "prompt",
+        None,
+        "",
+        "opencode",
+        30,
+        env={"OPENCODE_PERMISSION": '{"edit":"allow"}'},
+        backend_config={"pass_env": ()},
+        local_checkout=repo,
+        local_argv=("opencode",),
+    )
     compute = Compute()
     monkeypatch.setenv("MIMIR_CODING_ENABLED", "true")
 
@@ -416,27 +564,47 @@ async def test_enabled_opencode_gate_uses_authorized_compute(monkeypatch, tmp_pa
 
     assert result.review_ready is True
     assert compute.specs[0].local_argv == ("/bin/sh", "-c", "pytest -q")
+    assert "PYTEST_ADDOPTS" in compute.specs[0].env
+    report_option = next(
+        option.split("=", 1)[1]
+        for option in shlex.split(compute.specs[0].env["PYTEST_ADDOPTS"])
+        if option.startswith("--junitxml=")
+    )
+    assert not Path(report_option).is_absolute()
+    assert report_option.startswith(".worklink-gate-")
+    assert compute.specs[0].backend_config["pass_env"] == ("PYTEST_ADDOPTS",)
     assert compute.cleaned == [LaunchHandle("local_subprocess", "job")]
+    assert result.evidence.tests is not None
+    assert result.evidence.tests.report_error == "junit_missing"
 
 
 @pytest.mark.asyncio
-async def test_enabled_opencode_evidence_refuses_controller_git_fallback(
+async def test_enabled_opencode_evidence_uses_controller_git_without_fd_publication(
     monkeypatch, tmp_path: Path
 ) -> None:
     monkeypatch.setenv("MIMIR_CODING_ENABLED", "true")
+    calls: list[object] = []
 
-    with pytest.raises(ValueError, match="requires controller Git publication"):
-        await observe_evidence(
-            issue=1,
-            attempt=1,
-            backend="opencode",
-            branch="branch",
-            checkout=tmp_path,
-            started_at=datetime.now(UTC),
-            base_ref="main",
-            backend_status="failed",
-            test_command=None,
-        )
+    def runner(args, **_kwargs):
+        calls.append(args)
+        return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+
+    result = await observe_evidence(
+        issue=1,
+        attempt=1,
+        backend="opencode",
+        branch="branch",
+        checkout=tmp_path,
+        started_at=datetime.now(UTC),
+        base_ref="main",
+        backend_status="failed",
+        test_command=None,
+        runner=runner,
+    )
+
+    assert result.review_ready is False
+    assert calls
+    assert all(call[:3] == ["git", "-C", str(tmp_path)] for call in calls)
 
 
 @pytest.mark.asyncio
@@ -562,3 +730,33 @@ async def test_live_gate_durable_handle_targets_exact_cancellation(
     assert cancelled == [handle]
     assert load_run_state(tmp_path, 1410) is None
     assert checkout.is_dir()
+
+
+def test_gate_report_directory_is_writable_by_the_gate_identity(tmp_path):
+    """The worker path must not hand the gate a controller-only directory.
+
+    Regression for the defect where `tempfile.TemporaryDirectory` produced 0700
+    owned by the controller, so pytest raised PermissionError from
+    pytest_sessionfinish while writing --junitxml -- after every test had passed.
+    The gate then exited 1 on a green run and reported no structured counts.
+    """
+    from mimir.worklink.evidence import _gate_report_directory
+
+    checkout = tmp_path / "checkout"
+    checkout.mkdir()
+
+    # Controller path keeps the private temp directory.
+    with _gate_report_directory(checkout, False) as controller_dir:
+        assert controller_dir.is_dir()
+        assert checkout not in controller_dir.parents
+
+    # Worker path places the report inside the checkout, whose setgid group the
+    # worker shares, and makes it group-usable rather than owner-only.
+    with _gate_report_directory(checkout, True) as worker_dir:
+        assert worker_dir.is_dir()
+        assert checkout in worker_dir.parents
+        assert worker_dir.stat().st_mode & 0o070 == 0o070, (
+            "gate report directory must be group-accessible; the worker reaches it "
+            "by group, not by ownership"
+        )
+    assert not worker_dir.exists(), "report directory must be cleaned up"
