@@ -7,7 +7,7 @@ Testing splits into two layers that catch different things:
 
 | layer | what it is | catches | cost |
 |---|---|---|---|
-| **Automated suite** | 323 tests across 20 files, in the normal `pytest` run | protocol shape, state machines, refusal paths, packaging | seconds, every CI run |
+| **Automated suite** | 472 tests across 21 files, in the normal `pytest` run | protocol shape, state machines, refusal paths, packaging | seconds, every CI run |
 | **Live harness** | 4 scripts driving a real daemon socket | interop, delivery, trust boundaries, provider paths | manual, needs a running agent |
 
 The split matters because **every ACP defect found by measurement so far was invisible
@@ -22,26 +22,29 @@ Runs in the normal `uv run pytest -q`. No daemon, no socket, no network.
 
 | file | tests | covers |
 |---|---:|---|
-| `test_acp_sessions.py` | 50 | session lifecycle, replay, cancellation |
-| `test_acp_sdk_contract.py` | 50 | the contract against the vendored SDK shape |
-| `test_acp_daemon.py` | 39 | socket ownership/mode, accept loop, shutdown |
-| `test_acp_profiles.py` | 20 | profile add/list/remove, local and SSH |
-| `test_acp_journal.py` | 19 | journal records and redaction |
+| `test_acp_sdk_contract.py` | 83 | the contract against the vendored SDK shape |
+| `test_acp_sessions.py` | 61 | session lifecycle, replay, cancellation |
+| `test_acp_daemon.py` | 47 | socket ownership/mode, accept loop, shutdown |
+| `test_acp_profiles.py` | 33 | profile add/list/remove, local and SSH |
+| `test_acp_bootstrap.py` | 30 | enablement gating on `MIMIR_ACP_ENABLED` |
+| `test_acp_agent.py` | 27 | agent-side method dispatch |
+| `test_acp_journal.py` | 25 | journal records and redaction |
+| `test_acp_updates.py` | 24 | `sessionUpdate` emission |
+| `test_client_provider.py` | 21 | the client-provider `tools/call` contract for all three Hands tools |
 | `test_acp_registry.py` | 17 | registry manifest and eligibility |
-| `test_acp_agent.py` | 16 | agent-side method dispatch |
-| `test_acp_updates.py` | 15 | `sessionUpdate` emission |
-| `test_acp_bootstrap.py` | 13 | enablement gating on `MIMIR_ACP_ENABLED` |
-| `test_acp_shutdown.py` | 12 | drain and teardown ordering |
+| `test_acp_transport.py` | 15 | framing and transport errors |
+| `test_acp_credentials.py` | 15 | credential add/replace/remove |
+| `test_acp_shutdown.py` | 13 | drain and teardown ordering |
+| `test_acp_dependency_closure.py` | 13 | the import closure stays inside the declared extra |
 | `test_acp_ssh.py` | 12 | SSH transport construction |
-| `test_acp_transport.py` | 11 | framing and transport errors |
-| `test_acp_credentials.py` | 10 | credential add/replace/remove |
-| `test_acp_proxy.py` | 8 | the stdio proxy, including `_write_frame` key injection |
-| `test_acp_dependency_closure.py` | 7 | the import closure stays inside the declared extra |
+| `test_acp_proxy.py` | 12 | the stdio proxy, including `_write_frame` key injection |
 | `test_acp_packaging.py` | 7 | packaging metadata |
 | `test_acp_bridge.py` | 6 | bridge wiring |
 | `test_acp_relay.py` | 5 | the credential-blind relay |
 | `test_assert_installed_acp.py` | 4 | the CI installed-artifact probe itself |
 | `test_acp_stdio.py` | 2 | stdio plumbing |
+
+Counts measured with `--collect-only` at the head of this branch.
 
 ### What CI additionally enforces
 
@@ -148,12 +151,19 @@ exists specifically to demonstrate finding **A** below — it is the whole exper
 
 Measured against a fully compliant client-side provider — correct `mcp/connect`, exact tool
 schemas, valid responses. These are the findings that justified the Hands redesign
-(`ACP_HANDS_REPL_DESIGN.md`, still open as PR #1746 and not yet on this branch):
+(`ACP_HANDS_REPL_DESIGN.md`, alongside this file on this branch):
 
-**A. `tools/call` accepts only a bare structured object.** The MCP-spec `CallToolResult`
-shape is rejected as `hands_read returned a malformed result`, even though `tools/list`
-advertises `outputSchema` — which in MCP *means* return `structuredContent`. A
-spec-compliant editor fails every call. This is what `HANDS_BARE` toggles.
+**A. `tools/call` accepted only a bare structured object — FIXED, and now inverted.**
+When measured, the MCP-spec `CallToolResult` shape was rejected as `hands_read returned a
+malformed result`, even though `tools/list` advertises `outputSchema`, which in MCP *means*
+return `structuredContent`. A spec-compliant editor failed every call.
+
+That is no longer current behaviour and this section previously read as though it were.
+On this branch `mimir/acp/agent.py` **requires** `structuredContent` and raises
+`Client provider result is missing structuredContent` without it — so the spec shape is
+what is accepted and the bare object is what is rejected, the reverse of the finding.
+`tests/test_client_provider.py` pins that contract for all three Hands tools. `HANDS_BARE`
+toggles between the two shapes so the harness can still exercise the rejected one.
 
 **B. `hands_edit` and `hands_shell` are refused before reaching the client**
 (`ifc_label_blocked:shell_process`). `session/request_permission` count across every run:
@@ -162,8 +172,10 @@ spec-compliant editor fails every call. This is what `HANDS_BARE` toggles.
 **C. Declaring the provider breaks plain `shell_exec` in the same session** — verified with
 a same-session discriminating pair.
 
-None of these are visible to the automated suite. Each required a real client, a real
-socket, and a real prompt.
+**B and C** are not visible to the automated suite — each required a real client, a real
+socket and a real prompt. **A is now covered** by `tests/test_client_provider.py`, which is
+why it is listed in Layer 1 above; the live harness is what found it, and the automated
+suite is what keeps it fixed.
 
 ---
 

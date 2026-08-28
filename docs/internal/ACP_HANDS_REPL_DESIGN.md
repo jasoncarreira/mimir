@@ -125,7 +125,7 @@ must still be labelled untrusted active ingest, exactly like any other external 
 mimir's job and it does not move to the client.
 
 Which means **this design does not bypass #1592, and is blocked by it.** Today an untrusted read
-produces a deliberately incomplete `SourceLabel` (`access_control.py:8295` → `_incomplete_protected_result`:
+produces a deliberately incomplete `SourceLabel` (`access_control.py:9444` → `_incomplete_protected_result`:
 `principal=None`, `bridge_instance=None`, empty ACL) that fails `is_complete` on the first line of
 `_source_is_triggering_channel_compatible`, so the turn cannot reply at all. A Hands REPL that
 reads the user's worktree hits that on every call.
