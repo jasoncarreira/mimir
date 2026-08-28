@@ -433,6 +433,7 @@ def _check_and_increment_or_deny(
             count=count,
             budget=budget,
             turn_id=getattr(ctx, "turn_id", None),
+            **(operator_shell_audit or {}),
         )
         _emit_hard_boundary_denied(
             tool=tool_name,
@@ -462,6 +463,7 @@ def _check_and_increment_or_deny(
             budget=budget,
             soft_threshold=soft,
             turn_id=getattr(ctx, "turn_id", None),
+            **(operator_shell_audit or {}),
         )
     return None
 
