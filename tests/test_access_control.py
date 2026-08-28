@@ -8897,6 +8897,17 @@ def test_operator_arm2_preprofile_chainlink_normalization(
     assert rule is None
 
 
+def test_operator_arm2_profile_selection_and_coverage_are_documented() -> None:
+    design = (
+        Path(__file__).parents[1] / "docs" / "security" / "turn-capability.md"
+    ).read_text(encoding="utf-8")
+
+    assert access_control.OPERATOR_SHELL_PROFILE == "scheduler_read_only"
+    assert "approximately **60/293** commands" in design
+    assert "31 `chainlink issue show ...` queries and 29 `git status --short` calls" in design
+    assert "ceiling, not guaranteed runtime coverage" in design
+
+
 def test_operator_arm2_excludes_configured_project_tests_without_changing_service_profiles(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
