@@ -7,12 +7,13 @@ import re
 import shlex
 import subprocess
 import sys
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
 
 def _ensure_mimir_import_path() -> None:
-    exe = Path(sys.executable).resolve()
+    exe = Path(sys.executable)
     venv_root = exe.parent.parent
     script_path = globals().get("__file__")
     candidates = [Path(script_path).resolve().parents[4]] if script_path else []
@@ -20,7 +21,6 @@ def _ensure_mimir_import_path() -> None:
         candidates.append(Path(source_dir))
     if venv_root.name in {".venv", "venv"}:
         candidates.append(venv_root.parent)
-    candidates.append(Path("/workspace/mimir"))
     for candidate in candidates:
         if not (candidate / "mimir" / "__init__.py").is_file():
             continue
@@ -39,15 +39,58 @@ def _ensure_mimir_import_path() -> None:
 
 _ensure_mimir_import_path()
 
+from mimir.coding import coding_enabled
 from mimir.worklink.autonomy import factory_max_concurrent
 from mimir.worklink.backends.registry import BackendRegistry, WorklinkConfig, WorklinkDefaults
+from mimir.worklink.claims import WORKLINK_EPIC_LABEL, scope_active_worklink_lock_ids
 from mimir.worklink.continuation import consume_worklink_budget_continuations
-from mimir.worklink.dispatch_failures import mark_failure_notified, pending_failure_alerts
+from mimir.worklink.dispatch_failures import (
+    POLLER_NAME,
+    delivery_receipt_exists,
+    dispatch_failure_state_dir,
+    mark_failure_notified,
+    pending_failure_alerts,
+)
 
 
-POLLER_NAME = os.environ.get("POLLER_NAME", "worklink-ready-queue")
 READY_LABEL = "worklink:ready"
-EPIC_LABEL = "worklink:epic"
+EPIC_LABEL = WORKLINK_EPIC_LABEL
+BLOCKED_LABEL = "worklink:blocked"
+_CHAINLINK_READ_TIMEOUT_SECONDS = 5
+_READY_SCAN_CALLS = 5
+
+
+def _env_float(name: str, default: float) -> float:
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        value = float(raw)
+    except ValueError:
+        return default
+    return value if value > 0 else default
+
+
+POLLER_CAP_SECONDS = _env_float("POLLER_TIMEOUT_SECONDS", 60.0)
+TICK_SAVE_RESERVE_SECONDS = 10.0
+TICK_HARD_DEADLINE_SECONDS = max(5.0, POLLER_CAP_SECONDS - TICK_SAVE_RESERVE_SECONDS)
+_PROCESS_START = time.monotonic()
+
+
+class TickBudget:
+    def __init__(self, *, started_at: float = _PROCESS_START) -> None:
+        self._deadline = started_at + TICK_HARD_DEADLINE_SECONDS
+
+    def hard_remaining(self) -> float:
+        return self._deadline - time.monotonic()
+
+    def hard_exhausted(self) -> bool:
+        return self.hard_remaining() <= 0.0
+
+    def affords_ready_scan(self) -> bool:
+        return self.hard_remaining() >= (
+            _READY_SCAN_CALLS * _CHAINLINK_READ_TIMEOUT_SECONDS
+        )
 
 
 @dataclass(frozen=True)
@@ -93,7 +136,7 @@ def _active_lock_issue_ids(home: Path) -> set[int] | None:
             capture_output=True,
             text=True,
             check=False,
-            timeout=30,
+            timeout=_CHAINLINK_READ_TIMEOUT_SECONDS,
         )
     except (OSError, subprocess.SubprocessError):
         return None
@@ -143,7 +186,7 @@ def _issue_records_with_label(home: Path, label: str) -> list[IssueRecord] | Non
             capture_output=True,
             text=True,
             check=False,
-            timeout=30,
+            timeout=_CHAINLINK_READ_TIMEOUT_SECONDS,
         )
     except (OSError, subprocess.SubprocessError):
         return None
@@ -202,7 +245,7 @@ def _actionable_issue_ids(home: Path) -> list[int] | None:
             capture_output=True,
             text=True,
             check=False,
-            timeout=30,
+            timeout=_CHAINLINK_READ_TIMEOUT_SECONDS,
         )
     except (OSError, subprocess.SubprocessError):
         return None
@@ -217,14 +260,21 @@ def _actionable_issue_ids(home: Path) -> list[int] | None:
 
 def _worklink_dispatch_plan(
     home: Path, *, active_lock_ids: set[int]
-) -> tuple[list[DispatchItem], int, int, int] | None:
+) -> tuple[list[DispatchItem], int, int, int, set[int]] | None:
     ready_records = _issue_records_with_label(home, READY_LABEL)
     epic_records = _issue_records_with_label(home, EPIC_LABEL)
+    blocked_records = _issue_records_with_label(home, BLOCKED_LABEL)
     actionable_ids = _actionable_issue_ids(home)
-    if ready_records is None or epic_records is None or actionable_ids is None:
+    if (
+        ready_records is None
+        or epic_records is None
+        or blocked_records is None
+        or actionable_ids is None
+    ):
         return None
     labeled = {record.issue_id for record in ready_records}
     epics = {record.issue_id for record in epic_records}
+    blocked = {record.issue_id for record in blocked_records}
     actionable = set(actionable_ids)
     # An issue holding an active lock is not a dispatch candidate. Slots are reduced by the
     # active count, so leaving it in the sorted candidates lets a low id consume the slot its
@@ -237,17 +287,21 @@ def _worklink_dispatch_plan(
         if record.issue_id in actionable
         and record.issue_id not in epics
         and record.parent_id not in epics
+        and record.issue_id not in blocked
         and record.issue_id not in active_lock_ids
     )
     factory_epics = sorted(
         record.issue_id
         for record in epic_records
-        if record.issue_id in actionable and record.issue_id not in active_lock_ids
+        if record.issue_id in labeled
+        and record.issue_id in actionable
+        and record.issue_id not in blocked
+        and record.issue_id not in active_lock_ids
     )
     plan = [DispatchItem(issue_id, "leaf") for issue_id in leaves]
     if _factory_epics_enabled():
         plan.extend(DispatchItem(issue_id, "epic") for issue_id in factory_epics)
-    return plan, len(labeled), len(labeled - actionable), len(epics)
+    return plan, len(labeled), len(labeled - actionable), len(labeled & blocked), epics
 
 
 def _configured_cap(home: Path) -> int:
@@ -278,6 +332,7 @@ def _dispatch(
     leaf_cap: int,
     factory_cap: int,
 ) -> bool:
+    effective_coding_enabled = coding_enabled()
     argv = [
         *run_bin,
         "worklink",
@@ -314,6 +369,7 @@ def _dispatch(
                 "signal": "worklink_dispatch_failed",
                 "issue_id": item.issue_id,
                 "reason": str(exc),
+                "coding_enabled": effective_coding_enabled,
             }
         )
         return False
@@ -332,12 +388,56 @@ def _dispatch(
             "active_before": active,
             "cap": leaf_cap,
             "factory_cap": factory_cap,
+            "coding_enabled": effective_coding_enabled,
         }
     )
     return True
 
 
+def _deliver_failure_alerts(
+    state_dir: Path,
+    alerts: list[dict[str, object]],
+    tick_budget: TickBudget,
+) -> bool:
+    """Emit alerts and wait for the framework's durable delivery barriers."""
+    pending: dict[str, dict[str, object]] = {}
+    for alert in alerts:
+        delivery_key = (
+            f"worklink-run-failure:{alert['issue_id']}:"
+            f"{alert['error_signature']}:{alert['failure_occurrence_id']}"
+        )
+        if delivery_receipt_exists(state_dir, delivery_key):
+            mark_failure_notified(
+                state_dir,
+                int(alert["issue_id"]),
+                str(alert["error_signature"]),
+                str(alert["failure_occurrence_id"]),
+            )
+            continue
+        alert["delivery_key"] = delivery_key
+        alert["delivery_barrier"] = True
+        _emit(alert)
+        pending[delivery_key] = alert
+
+    while pending and not tick_budget.hard_exhausted():
+        acknowledged = [
+            key for key in pending if delivery_receipt_exists(state_dir, key)
+        ]
+        for key in acknowledged:
+            alert = pending.pop(key)
+            mark_failure_notified(
+                state_dir,
+                int(alert["issue_id"]),
+                str(alert["error_signature"]),
+                str(alert["failure_occurrence_id"]),
+            )
+        if pending:
+            time.sleep(min(0.05, max(0.0, tick_budget.hard_remaining())))
+    return not pending
+
+
 def main() -> int:
+    tick_budget = TickBudget()
     home_env = os.environ.get("MIMIR_HOME")
     if not home_env:
         _emit({"signal": "worklink_poller_misconfigured", "reason": "MIMIR_HOME unset"})
@@ -355,28 +455,35 @@ def main() -> int:
         )
         return 0
     repo = os.environ.get("WORKLINK_REPO")
-    state_dir = Path(
-        os.environ.get("STATE_DIR") or home / "state" / "pollers" / POLLER_NAME
-    )
+    # Detached workers and this reader must resolve the ledger from the same trusted home.
+    state_dir = dispatch_failure_state_dir(home)
     state_dir.mkdir(parents=True, exist_ok=True)
     try:
         backed_off_ids, alerts = pending_failure_alerts(state_dir)
-        for alert in alerts:
-            _emit(alert)
-            mark_failure_notified(
-                state_dir,
-                int(alert["issue_id"]),
-                str(alert["error_signature"]),
-                str(alert["failure_occurrence_id"]),
-            )
+        alerts_acknowledged = _deliver_failure_alerts(state_dir, alerts, tick_budget)
     except OSError as exc:
         backed_off_ids = set()
+        alerts_acknowledged = False
         _emit({"signal": "worklink_dispatch_failure_state_error", "reason": str(exc)})
+    if not alerts_acknowledged:
+        _emit(
+            {
+                "signal": "worklink_ready_scan",
+                "reason": "failure alert delivery was not acknowledged before the tick deadline; skipping dispatch",
+                "dispatched": 0,
+            }
+        )
+        return 0
     try:
-        for action in consume_worklink_budget_continuations(home):
+        continuation_actions = consume_worklink_budget_continuations(
+            home,
+            delivery_receipt_exists=lambda key: delivery_receipt_exists(state_dir, key),
+        )
+        for action in continuation_actions:
             _emit(
                 {
                     "signal": "worklink_continuation",
+                    "delivery_key": action.delivery_key,
                     "source_id": f"continuation:{action.idempotency_key}",
                     "issue_id": action.issue_id,
                     "pr_url": action.pr_url,
@@ -388,16 +495,26 @@ def main() -> int:
                     ),
                 }
             )
+        if continuation_actions:
+            return 0
     except Exception as exc:
         _emit({"signal": "worklink_continuation_consumer_error", "reason": str(exc)})
+    if not tick_budget.affords_ready_scan():
+        _emit(
+            {
+                "signal": "worklink_ready_scan",
+                "reason": "insufficient tick budget remains for the ready scan; skipping dispatch",
+                "dispatched": 0,
+            }
+        )
+        return 0
     active_lock_ids = _active_lock_issue_ids(home)
     ready_result = (
         None
         if active_lock_ids is None
         else _worklink_dispatch_plan(home, active_lock_ids=active_lock_ids)
     )
-    epic_records = _issue_records_with_label(home, EPIC_LABEL)
-    if ready_result is None or active_lock_ids is None or epic_records is None:
+    if ready_result is None or active_lock_ids is None:
         _emit(
             {
                 "signal": "worklink_poller_degraded",
@@ -405,13 +522,21 @@ def main() -> int:
             }
         )
         return 0
-    ready, labeled_ready_count, blocked_ready_count, actionable_epic_count = ready_result
+    (
+        ready,
+        labeled_ready_count,
+        blocked_ready_count,
+        label_blocked_ready_count,
+        epic_ids,
+    ) = ready_result
+    actionable_epic_count = len(epic_ids)
     dispatch_ready = [item for item in ready if item.issue_id not in backed_off_ids]
-    epic_ids = {record.issue_id for record in epic_records}
     leaf_cap = _configured_cap(home)
     factory_cap = factory_max_concurrent()
-    active = len(active_lock_ids - epic_ids)
-    factory_active = len(active_lock_ids & epic_ids)
+    active = len(scope_active_worklink_lock_ids(active_lock_ids, exclude_ids=epic_ids))
+    factory_active = len(
+        scope_active_worklink_lock_ids(active_lock_ids, label_ids=epic_ids)
+    )
     leaf_slots = max(0, leaf_cap - active)
     factory_slots = max(0, factory_cap - factory_active)
     leaves = [item for item in dispatch_ready if item.mode == "leaf"][:leaf_slots]
@@ -425,6 +550,7 @@ def main() -> int:
                 "ready_count": len(ready),
                 "labeled_ready_count": labeled_ready_count,
                 "blocked_ready_count": blocked_ready_count,
+                "label_blocked_ready_count": label_blocked_ready_count,
                 "actionable_epic_count": actionable_epic_count,
                 "active": active,
                 "cap": leaf_cap,
@@ -437,8 +563,13 @@ def main() -> int:
         )
         return 0
     run_bin = shlex.split(os.environ.get("WORKLINK_RUN_BIN") or "mimir")
-    dispatched = sum(
-        _dispatch(
+    dispatched = 0
+    budget_skipped = 0
+    for index, item in enumerate(selected):
+        if tick_budget.hard_exhausted():
+            budget_skipped = len(selected) - index
+            break
+        dispatched += _dispatch(
             item=item,
             home=home,
             repo=repo,
@@ -448,20 +579,24 @@ def main() -> int:
             leaf_cap=leaf_cap,
             factory_cap=factory_cap,
         )
-        for item in selected
-    )
     _emit(
         {
             "signal": "worklink_ready_scan",
             "ready_count": len(ready),
             "labeled_ready_count": labeled_ready_count,
             "blocked_ready_count": blocked_ready_count,
+            "label_blocked_ready_count": label_blocked_ready_count,
             "actionable_epic_count": actionable_epic_count,
             "active": active,
             "cap": leaf_cap,
             "factory_active": factory_active,
             "factory_cap": factory_cap,
             "dispatched": dispatched,
+            "reason": (
+                "tick budget exhausted during dispatch; remaining work deferred"
+                if budget_skipped else None
+            ),
+            "budget_skipped": budget_skipped,
             "backed_off": len(ready) - len(dispatch_ready),
         }
     )

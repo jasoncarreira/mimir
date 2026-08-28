@@ -56,6 +56,10 @@ from typing import Any, Awaitable, Callable
 
 from ._atomic import atomic_write_json
 from ._jsonl_tail import tail_jsonl_records
+from .access_control import (
+    HTTP_EVENT_INGRESS_EXTRA_KEY,
+    POLLER_RECOVERY_REPLAY_EXTRA_KEY,
+)
 from .event_logger import log_event
 from .models import AgentEvent, InformationFlowLabels, SourceLabel
 
@@ -89,6 +93,9 @@ _OUTCOME_SCAN_GRACE_SECONDS = 5.0
 
 # Re-enqueue callback shape, matching ``run_poller``'s ``enqueue`` param.
 EnqueueFn = Callable[[AgentEvent], Awaitable[bool]]
+# ``None`` means the source could not determine relevance. Recovery must fail
+# open in that case so transient source/API failures cannot discard real work.
+RelevanceFn = Callable[[AgentEvent], Awaitable[bool | None]]
 
 
 def _utc_now() -> datetime:
@@ -115,26 +122,59 @@ def _state_path(persist_dir: Path) -> Path:
 def _load_state(persist_dir: Path) -> dict:
     """Load ``{last_reconciled: iso, inflight: {source_id: {...}}}``.
 
-    Tolerant of a missing / corrupt / hand-edited file — always returns a
-    well-shaped dict so callers never have to guard the structure.
+    A missing file returns an empty state. An unreadable or corrupt file also
+    returns a well-shaped state, but marks it read-only so callers can report
+    the failure without overwriting the original ledger.
     """
     p = _state_path(persist_dir)
-    if p.exists():
-        try:
-            data = json.loads(p.read_text(encoding="utf-8"))
-            if isinstance(data, dict):
-                last = data.get("last_reconciled")
-                inflight = data.get("inflight")
-                return {
-                    "last_reconciled": last if isinstance(last, str) else "",
-                    "inflight": inflight if isinstance(inflight, dict) else {},
-                }
-        except (json.JSONDecodeError, OSError):
-            pass
-    return {"last_reconciled": "", "inflight": {}}
+    try:
+        raw = p.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return {"last_reconciled": "", "inflight": {}}
+    except OSError as exc:
+        log.warning("poller recovery: state unreadable at %s: %s", p, exc)
+        return {
+            "last_reconciled": "", "inflight": {},
+            "_unreadable_path": str(p),
+        }
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        log.warning("poller recovery: state corrupt at %s: %s", p, exc)
+        return {
+            "last_reconciled": "", "inflight": {},
+            "_unreadable_path": str(p),
+        }
+    if isinstance(data, dict):
+        last = data.get("last_reconciled")
+        inflight = data.get("inflight")
+        if "inflight" in data and not isinstance(inflight, dict):
+            log.warning("poller recovery: inflight has invalid shape at %s", p)
+            return {
+                "last_reconciled": "", "inflight": {},
+                "_unreadable_path": str(p),
+            }
+        return {
+            # An invalid watermark is conservative: widening the next scan
+            # cannot discard stashed events, unlike coercing malformed inflight.
+            "last_reconciled": last if isinstance(last, str) else "",
+            "inflight": inflight if isinstance(inflight, dict) else {},
+        }
+    log.warning("poller recovery: state has invalid shape at %s", p)
+    return {
+        "last_reconciled": "", "inflight": {},
+        "_unreadable_path": str(p),
+    }
 
 
 def _save_state(persist_dir: Path, state: dict) -> None:
+    unreadable_path = state.get("_unreadable_path")
+    if unreadable_path:
+        log.warning(
+            "poller recovery: refusing to overwrite unreadable state at %s",
+            unreadable_path,
+        )
+        return
     try:
         persist_dir.mkdir(parents=True, exist_ok=True)
         # Atomic write (#329): a crash mid-write must not corrupt
@@ -271,16 +311,20 @@ def _event_from_stash(d: Any) -> AgentEvent | None:
         return None
 
 
-def _gc_expired_inflight(inflight: dict, ttl_hours: float, now_dt: datetime) -> int:
+def _gc_expired_inflight(
+    inflight: dict, ttl_hours: float, now_dt: datetime,
+) -> tuple[int, int]:
     """Drop in-flight entries with no terminal outcome within ``ttl_hours``
     — turns that vanished (mid-turn crash/restart) without logging
     turn_failed/turn_completed, so ``.recovery.json`` can't grow unbounded
-    (#310). Returns the number dropped.
+    (#310). Returns ``(expired, dropped)``; malformed entries are schema drops,
+    not TTL expirations.
 
     Backfills a missing/garbled ``stashed_at`` to now rather than GC-ing the
     entry on sight, so entries stashed by a pre-#310 mimir get a fresh TTL.
     """
     cutoff_secs = ttl_hours * 3600.0
+    expired = 0
     dropped = 0
     for source_id in list(inflight.keys()):
         entry = inflight.get(source_id)
@@ -294,8 +338,8 @@ def _gc_expired_inflight(inflight: dict, ttl_hours: float, now_dt: datetime) -> 
             continue
         if (now_dt - dt).total_seconds() > cutoff_secs:
             del inflight[source_id]
-            dropped += 1
-    return dropped
+            expired += 1
+    return expired, dropped
 
 
 def _read_outcomes_since(
@@ -396,8 +440,14 @@ def _restore_event(
     event.channel_id = channel_id
     event.trigger = "poller"
     event.source = "poller"
+    event.author = None
+    event.author_display = None
+    event.author_id = None
     event.service_principal = service_principal
     event.service_authority = service_authority
+    event.repo_pr_action_scope = None
+    event.continuation_auth_context = None
+    event.source_session_acl = None
     if service_authority is not None and service_principal:
         source_principal = f"service:{service_principal}"
         event.ifc_labels = InformationFlowLabels().with_channel(
@@ -412,7 +462,11 @@ def _restore_event(
             source_kind="service",
         ))
     if isinstance(event.extra, dict):
+        event.extra.pop(HTTP_EVENT_INGRESS_EXTRA_KEY, None)
+        event.extra.pop("channel_visibility", None)
+        event.extra.pop("bridge_instance", None)
         event.extra["poller_name"] = poller_name
+        event.extra[POLLER_RECOVERY_REPLAY_EXTRA_KEY] = True
     return event
 
 
@@ -440,6 +494,21 @@ async def _emit_gave_up(poller_name: str, channel_id: str, entry: dict, source_i
     )
 
 
+async def _is_stale(event: AgentEvent, relevance_check: RelevanceFn | None) -> bool:
+    """Return true only when the source authoritatively rejects the subject."""
+    if relevance_check is None:
+        return False
+    try:
+        return await relevance_check(event) is False
+    except Exception as exc:  # noqa: BLE001 - relevance failures must fail open
+        log.warning(
+            "poller recovery: relevance check failed open for %s: %s",
+            event.source_id,
+            exc,
+        )
+        return False
+
+
 async def reconcile_failed_turns(
     *,
     poller_name: str,
@@ -450,6 +519,7 @@ async def reconcile_failed_turns(
     service_principal: str | None = None,
     service_authority: Any = None,
     recover_failed_turns: bool = True,
+    relevance_check: RelevanceFn | None = None,
     max_attempts: int = DEFAULT_MAX_RECOVERY_ATTEMPTS,
     stash_ttl_hours: float = DEFAULT_STASH_TTL_HOURS,
 ) -> dict:
@@ -478,22 +548,31 @@ async def reconcile_failed_turns(
     outcome's own timestamp — never wall-now — so an outcome written
     between this read and the state save is picked up next cycle.
 
-    Returns a ``{reenqueued, completed, gave_up, deferred, expired}``
-    summary (for the ``poller_recovery`` log event + tests). Best-effort
-    throughout — any I/O hiccup is logged and the poll cycle continues.
+    Before either replay path, an optional source-owned ``relevance_check`` can
+    reject a subject that is no longer actionable. ``False`` drops it as stale;
+    ``True`` or ``None`` preserves normal recovery. Exceptions also fail open.
+
+    Returns a ``{reenqueued, completed, gave_up, deferred, expired, dropped,
+    stale_dropped}`` summary (for the ``poller_recovery`` log event + tests).
+    Best-effort throughout — any I/O hiccup is logged and the poll cycle continues.
     """
     summary = {
         "reenqueued": 0, "completed": 0, "gave_up": 0,
-        "deferred": 0, "expired": 0, "unclean_reenqueued": 0,
+        "deferred": 0, "expired": 0, "dropped": 0,
+        "stale_dropped": 0,
+        "unclean_reenqueued": 0,
     }
     state = await asyncio.to_thread(_load_state, persist_dir)
+    summary["state_unreadable"] = state.get("_unreadable_path", "")
     inflight: dict = state["inflight"]
     now_dt = _utc_now()
     now_iso = now_dt.isoformat()
 
     # GC abandoned entries first so a vanished turn can't pin the stash
     # forever (#310).
-    summary["expired"] = _gc_expired_inflight(inflight, stash_ttl_hours, now_dt)
+    summary["expired"], summary["dropped"] = _gc_expired_inflight(
+        inflight, stash_ttl_hours, now_dt,
+    )
 
     # Fast path: nothing stashed → nothing to reconcile. Advance the
     # watermark so the first real reconcile after events accrue doesn't
@@ -596,6 +675,19 @@ async def reconcile_failed_turns(
                         watermark = max(watermark, ts)
                     continue
                 attempts = int(entry.get("attempts", 0)) + 1
+                event = _restore_event(
+                    entry,
+                    poller_name=poller_name,
+                    channel_id=channel_id,
+                    service_principal=service_principal,
+                    service_authority=service_authority,
+                )
+                if event is not None and await _is_stale(event, relevance_check):
+                    del inflight[source_id]
+                    summary["stale_dropped"] += 1
+                    if isinstance(ts, str):
+                        watermark = max(watermark, ts)
+                    continue
                 if attempts > max_attempts:
                     # Wedge guard hit. Emit best-effort (#318): a log
                     # failure must not strand the entry — we still give up.
@@ -609,17 +701,11 @@ async def reconcile_failed_turns(
                     del inflight[source_id]
                     summary["gave_up"] += 1
                 else:
-                    event = _restore_event(
-                        entry,
-                        poller_name=poller_name,
-                        channel_id=channel_id,
-                        service_principal=service_principal,
-                        service_authority=service_authority,
-                    )
                     if event is None:
                         # Unreconstructable stash (older schema) — drop so we
                         # don't loop on it forever.
                         del inflight[source_id]
+                        summary["dropped"] += 1
                     else:
                         try:
                             accepted = await enqueue(event)
@@ -677,6 +763,17 @@ async def reconcile_failed_turns(
             ):
                 continue
             attempts = int(entry.get("attempts", 0)) + 1
+            event = _restore_event(
+                entry,
+                poller_name=poller_name,
+                channel_id=channel_id,
+                service_principal=service_principal,
+                service_authority=service_authority,
+            )
+            if event is not None and await _is_stale(event, relevance_check):
+                del inflight[source_id]
+                summary["stale_dropped"] += 1
+                continue
             if attempts > max_attempts:
                 try:
                     await _emit_gave_up(poller_name, channel_id, entry, source_id)
@@ -688,15 +785,9 @@ async def reconcile_failed_turns(
                 del inflight[source_id]
                 summary["gave_up"] += 1
                 continue
-            event = _restore_event(
-                entry,
-                poller_name=poller_name,
-                channel_id=channel_id,
-                service_principal=service_principal,
-                service_authority=service_authority,
-            )
             if event is None:
                 del inflight[source_id]
+                summary["dropped"] += 1
                 continue
             try:
                 accepted = await enqueue(event)

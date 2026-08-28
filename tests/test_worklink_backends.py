@@ -5,6 +5,7 @@ import json
 import subprocess
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -28,6 +29,7 @@ from mimir.worklink.backends.base import blocked_reason_from_output
 from mimir.worklink.backends.registry import SHIPPING_BACKENDS, SHIPPING_COMPUTE_BACKENDS
 from mimir.worklink.compute import ComputeCaps, ComputeLaunchError, LaunchHandle, WorkSpec
 import mimir.worklink.compute as compute_module
+import mimir.worklink.backends.opencode as opencode_module
 
 
 class FakeProcess:
@@ -151,12 +153,14 @@ def test_worklink_config_malformed_autonomy_ints_fall_back(tmp_path: Path) -> No
 defaults:
   max_concurrent: definitely-not-an-int
   reaper_ttl_s: -5
+  max_claim_attempts: unlimited
 """,
         encoding="utf-8",
     )
     defaults = WorklinkConfig.load(config_path).defaults
     assert defaults.max_concurrent == 2
-    assert defaults.reaper_ttl_s == 7200
+    assert defaults.reaper_ttl_s == 86400
+    assert defaults.max_claim_attempts == 3
 
 
 def test_worklink_config_epic_defaults_and_merged_label_constant(tmp_path: Path) -> None:
@@ -185,6 +189,20 @@ defaults:
     assert all("mimir/" not in pattern for pattern in defaults.tiered_review.high_risk_scope_patterns)
     assert WorklinkDefaults(backend="opencode").reviewer_backend == "opencode"
     assert WORKLINK_MERGED_LABEL == "worklink:merged"
+
+
+def test_reaper_ttl_floor_is_dimensioned_by_leaf_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("MIMIR_FACTORY_RUN_TIMEOUT_S", "5000.5")
+
+    with pytest.raises(ValueError) as excinfo:
+        WorklinkDefaults(timeout_s=1800, reaper_ttl_s=3599)
+
+    assert excinfo.value.configured_value == 3599
+    assert excinfo.value.required_value == 3600
+    assert "configured 3599; required 3600" in str(excinfo.value)
+    assert WorklinkDefaults(timeout_s=1800, reaper_ttl_s=3600).reaper_ttl_s == 3600
 
 
 def test_worklink_config_epic_overrides_and_tiered_review_parse(tmp_path: Path) -> None:
@@ -504,6 +522,7 @@ async def test_local_subprocess_compute_backend_preserves_subprocess_shape(
 
     async def fake_exec(*args: str, **kwargs: Any) -> FakeProcess:
         calls.append({"args": args, "kwargs": kwargs})
+        kwargs["stdout"].write(b"ok")
         return FakeProcess(returncode=0, stdout=b"ok", stderr=b"")
 
     monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
@@ -525,6 +544,7 @@ async def test_local_subprocess_compute_backend_preserves_subprocess_shape(
         backend_config={"bin": "other", "args": ["ignored"]},
         local_checkout=tmp_path,
         local_argv=("tool", "arg", "--cd", str(tmp_path), "prompt"),
+        output_root=tmp_path / "transcripts",
     )
     handle = await backend.launch(spec)
     result = await backend.wait(handle, 5)
@@ -542,20 +562,63 @@ async def test_local_subprocess_compute_backend_preserves_subprocess_shape(
         stderr="",
         handle=result.handle,
         command=("tool", "arg", "--cd", str(tmp_path), "prompt"),
+        stdout_path=result.stdout_path,
+        stderr_path=result.stderr_path,
     )
+    expected_kwargs = {
+        "stdin": asyncio.subprocess.DEVNULL,
+        "stdout": calls[0]["kwargs"]["stdout"],
+        "stderr": calls[0]["kwargs"]["stderr"],
+        "cwd": str(tmp_path),
+        "env": {"PATH": "/custom/bin", "X": "1"},
+        "start_new_session": True,
+    }
+    if compute_module.sys.platform.startswith("linux"):
+        expected_kwargs["preexec_fn"] = calls[0]["kwargs"]["preexec_fn"]
     assert calls == [
         {
             "args": ("tool", "arg", "--cd", str(tmp_path), "prompt"),
-                "kwargs": {
-                    "stdin": asyncio.subprocess.DEVNULL,
-                    "stdout": asyncio.subprocess.PIPE,
-                "stderr": asyncio.subprocess.PIPE,
-                "cwd": str(tmp_path),
-                "env": {"PATH": "/custom/bin", "X": "1"},
-                "start_new_session": True,
-            },
+            "kwargs": expected_kwargs,
         }
     ]
+
+
+@pytest.mark.asyncio
+async def test_local_subprocess_compute_omits_parent_death_hook_off_linux(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    calls: list[dict[str, Any]] = []
+
+    async def fake_exec(*args: str, **kwargs: Any) -> FakeProcess:
+        calls.append({"args": args, "kwargs": kwargs})
+        return FakeProcess(returncode=0)
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+    monkeypatch.setattr("mimir.worklink.compute._local_child_env", dict)
+    monkeypatch.setattr(compute_module, "sys", SimpleNamespace(platform="darwin"))
+    backend = LocalSubprocessComputeBackend()
+    spec = WorkSpec(
+        issue_id=1,
+        attempt=1,
+        repo_url="repo",
+        base_ref="main",
+        branch="issue/1-a1",
+        prompt="prompt",
+        rules=None,
+        test_command="echo ok",
+        backend="other_tool",
+        timeout_s=5,
+        local_checkout=tmp_path,
+        local_argv=("tool", "arg"),
+        output_root=tmp_path / "transcripts",
+    )
+
+    handle = await backend.launch(spec)
+    await backend.wait(handle, 5)
+    await backend.cleanup(handle)
+
+    assert len(calls) == 1
+    assert "preexec_fn" not in calls[0]["kwargs"]
 
 
 @pytest.mark.asyncio
@@ -565,6 +628,8 @@ async def test_local_subprocess_compute_caps_output_and_kills_on_overflow(
     process = FakeProcess(returncode=None, stdout=b"abcdefgh", stderr=b"err")
 
     async def fake_exec(*args: str, **kwargs: Any) -> FakeProcess:
+        kwargs["stdout"].write(b"abcdefgh")
+        kwargs["stderr"].write(b"err")
         return process
 
     monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
@@ -584,6 +649,7 @@ async def test_local_subprocess_compute_caps_output_and_kills_on_overflow(
         timeout_s=5,
         local_checkout=tmp_path,
         local_argv=("opencode", "run"),
+        output_root=tmp_path / "transcripts",
     )
 
     handle = await backend.launch(spec)
@@ -593,6 +659,10 @@ async def test_local_subprocess_compute_caps_output_and_kills_on_overflow(
     assert result.stdout == "abcd"
     assert result.stderr == "err"
     assert result.output_overflow is True
+    assert result.stdout_path is not None
+    assert result.stderr_path is not None
+    assert result.stdout_path.read_bytes() == b"abcd"
+    assert result.stderr_path.read_bytes() == b"err"
 
     order = WorkOrder(
         issue_id=1,
@@ -610,6 +680,77 @@ async def test_local_subprocess_compute_caps_output_and_kills_on_overflow(
     transcript = json.loads(raw.transcript_path.read_text(encoding="utf-8"))
     assert transcript["stdout"] == "abcd"
     assert transcript["output_overflow"] is True
+    assert transcript["stdout_path"] == str(result.stdout_path)
+    assert transcript["stderr_path"] == str(result.stderr_path)
+
+
+def test_output_paths_require_explicit_run_owned_root(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("MIMIR_HOME", str(tmp_path / "ambient-home"))
+    spec = WorkSpec(
+        issue_id=1,
+        attempt=1,
+        repo_url="repo",
+        base_ref="main",
+        branch="issue/1-a1",
+        prompt="prompt",
+        rules=None,
+        test_command="true",
+        backend="opencode",
+        timeout_s=5,
+    )
+
+    assert compute_module._output_paths(spec, "run") == (None, None)
+    assert not (tmp_path / "ambient-home").exists()
+
+
+def test_output_paths_reject_backend_path_components(tmp_path: Path) -> None:
+    for backend in ("../escape", "nested/tool", ".", "bad name"):
+        spec = WorkSpec(
+            issue_id=1,
+            attempt=1,
+            repo_url="repo",
+            base_ref="main",
+            branch="issue/1-a1",
+            prompt="prompt",
+            rules=None,
+            test_command="true",
+            backend=backend,
+            timeout_s=5,
+            output_root=tmp_path,
+        )
+        with pytest.raises(ComputeLaunchError, match="safe output path component"):
+            compute_module._output_paths(spec, "run")
+
+
+@pytest.mark.asyncio
+async def test_anonymous_launch_failure_does_not_unlink_none_paths(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    async def fail_exec(*_args: str, **_kwargs: Any) -> FakeProcess:
+        raise OSError("spawn failed")
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fail_exec)
+    monkeypatch.setattr("mimir.worklink.compute._local_child_env", dict)
+    backend = LocalSubprocessComputeBackend()
+    spec = WorkSpec(
+        issue_id=1,
+        attempt=1,
+        repo_url="repo",
+        base_ref="main",
+        branch="issue/1-a1",
+        prompt="prompt",
+        rules=None,
+        test_command="true",
+        backend="opencode",
+        timeout_s=5,
+        local_checkout=tmp_path,
+        local_argv=("opencode", "run"),
+    )
+
+    with pytest.raises(ComputeLaunchError, match="spawn failed"):
+        await backend.launch(spec)
 
 
 def test_worklink_output_limits_use_safe_defaults_and_env_overrides(
@@ -625,6 +766,10 @@ def test_worklink_output_limits_use_safe_defaults_and_env_overrides(
 
     monkeypatch.setenv("MIMIR_WORKLINK_MAX_STDOUT_BYTES", "invalid")
     monkeypatch.setenv("MIMIR_WORKLINK_MAX_STDERR_BYTES", "0")
+    assert compute_module._worklink_output_limits() == (64 * 1024 * 1024, 16 * 1024 * 1024)
+
+    monkeypatch.setenv("MIMIR_WORKLINK_MAX_STDOUT_BYTES", str(128 * 1024 * 1024))
+    monkeypatch.setenv("MIMIR_WORKLINK_MAX_STDERR_BYTES", str(32 * 1024 * 1024))
     assert compute_module._worklink_output_limits() == (64 * 1024 * 1024, 16 * 1024 * 1024)
 
 
@@ -874,13 +1019,28 @@ async def test_feature_factory_launch_remains_shell_free_argv(
     monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
     monkeypatch.setattr("mimir.worklink.compute._local_child_env", dict)
     monkeypatch.delenv("MIMIR_FACTORY_MAX_RETRIES", raising=False)
+    monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
+    monkeypatch.delenv("XDG_DATA_HOME", raising=False)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("MIMIR_MODEL_SPEC", "codex-plus:gpt-5.6-luna")
+    auth = tmp_path / ".local" / "share" / "opencode" / "auth.json"
+    auth.parent.mkdir(parents=True)
+    auth.write_text(
+        json.dumps({"openai": {"type": "oauth", "refresh": "subscription"}}),
+        encoding="utf-8",
+    )
     order = WorkOrder(
         issue_id=1606,
         checkout=tmp_path,
         prompt="factory owns the prompt",
         rules=None,
         timeout_s=30,
-        env={"MIMIR_HOME": str(tmp_path)},
+        env={
+            "MIMIR_HOME": str(tmp_path),
+            "MIMIR_WORK_ITEM_JSON": json.dumps(
+                {"run_id": "chainlink-1606", "title": "epic", "body": "build"}
+            ),
+        },
     )
     spec = FeatureFactoryBackend(entrypoint="/absolute/factory.js").work_spec(
         order,
@@ -901,11 +1061,13 @@ async def test_feature_factory_launch_remains_shell_free_argv(
         "--log-level",
         "DEBUG",
         "--print-logs",
+        "-m",
+        "openai/gpt-5.6-luna",
         "--dir",
         str(tmp_path),
         "--command",
         "feature",
-        " --autonomous --max-retries 5 1606",
+        " --autonomous --max-retries 5 chainlink-1606",
     )
     assert "shell" not in calls[0]["kwargs"]
     assert calls[0]["kwargs"]["cwd"] == str(tmp_path)
@@ -925,6 +1087,7 @@ async def test_opencode_backend_invokes_run_dir_with_prompt_guard(
 
     monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
     monkeypatch.setattr("mimir.worklink.compute._local_child_env", dict)
+    monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
     monkeypatch.delenv("XDG_DATA_HOME", raising=False)
     monkeypatch.setenv("HOME", str(tmp_path))
     monkeypatch.setenv("MIMIR_MODEL_SPEC", "codex-plus:gpt-5.6-luna")
@@ -1128,6 +1291,47 @@ async def test_opencode_backend_transcript_filename_contract(
     assert str(issue_id) in filename, f"expected issue id {issue_id} in filename, got {filename}"
     transcript = json.loads(result.transcript_path.read_text())
     assert transcript["backend"] == "opencode"
+
+
+def test_shared_transcript_writer_scrubs_bounds_tail_and_count(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(opencode_module, "TRANSCRIPT_STREAM_MAX_BYTES", 80)
+    monkeypatch.setattr(opencode_module, "TRANSCRIPTS_PER_ISSUE", 3)
+    paths: list[Path] = []
+    output_paths: list[tuple[Path, Path]] = []
+    for index in range(5):
+        path = opencode_module.transcript_path(tmp_path, 1344)
+        stdout_path = tmp_path / f"opencode-1344-a1-{index}.stdout.log"
+        stderr_path = tmp_path / f"opencode-1344-a1-{index}.stderr.log"
+        stdout_path.write_text(f"raw stdout {index}")
+        stderr_path.write_text(f"raw stderr {index}")
+        opencode_module.write_transcript(
+            path,
+            command=("opencode", "run"),
+            exit_code=index,
+            status="failed",
+            stdout="x" * 100 + f" stdout-tail-{index}",
+            stderr="api_key=super-secret-value\n" + f"stderr-tail-{index}",
+            timed_out=False,
+            output_overflow=False,
+            stdout_path=stdout_path,
+            stderr_path=stderr_path,
+        )
+        paths.append(path)
+        output_paths.append((stdout_path, stderr_path))
+
+    retained = sorted(tmp_path.glob("opencode-1344-*.json"))
+    assert len(retained) == 3
+    assert not paths[0].exists()
+    assert all(not output.exists() for pair in output_paths[:2] for output in pair)
+    assert all(output.exists() for pair in output_paths[2:] for output in pair)
+    newest = json.loads(paths[-1].read_text(encoding="utf-8"))
+    assert newest["stdout"].startswith("[earlier output omitted by Worklink]")
+    assert newest["stdout"].endswith("stdout-tail-4")
+    assert newest["stderr"].endswith("stderr-tail-4")
+    assert "super-secret-value" not in newest["stderr"]
+    assert paths[-1].stat().st_size <= opencode_module.TRANSCRIPT_MAX_BYTES
 
 
 def test_registry_builds_opencode_backend_with_settings() -> None:

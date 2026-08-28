@@ -1,16 +1,23 @@
 from __future__ import annotations
 
 from dataclasses import replace
+from datetime import UTC, datetime, timedelta
+import json
 from pathlib import Path
+import subprocess
 
 import pytest
 
 from mimir.worklink.backends.feature_factory import parse_factory_status
 from mimir.worklink.compute import LaunchHandle
 from mimir.worklink.factory_state import (
+    FACTORY_RECORD_RETENTION,
     FactoryRecordError,
     FactoryRunRecord,
-    clear_factory_record,
+    age_out_factory_records,
+    archive_factory_record,
+    factory_manifest_candidates,
+    load_factory_records_for_issue,
     list_factory_records,
     load_factory_record,
     save_factory_record,
@@ -70,6 +77,189 @@ def test_factory_record_round_trip_is_atomic_and_has_no_cost_fields(tmp_path: Pa
     assert not list(path.parent.glob("*.tmp"))
 
 
+def test_issue_lookup_reads_both_keys_without_legacy_shadowing_canonical(
+    tmp_path: Path,
+) -> None:
+    legacy = record(tmp_path)
+    canonical = replace(
+        legacy,
+        run_id="chainlink-1551",
+        attempt=legacy.attempt,
+        branch="feature/chainlink-1551",
+        sandbox=str(tmp_path / "chainlink-1551"),
+        status=None,
+    )
+    save_factory_record(tmp_path, legacy)
+    save_factory_record(tmp_path, canonical)
+
+    assert load_factory_records_for_issue(tmp_path, 1551) == [canonical, legacy]
+
+
+def test_archive_factory_record_preserves_evidence_and_vacates_active_slot(
+    tmp_path: Path,
+) -> None:
+    expected = replace(record(tmp_path), controller_phase="failed", session=None)
+    source = save_factory_record(tmp_path, expected)
+
+    archived = archive_factory_record(tmp_path, expected)
+
+    assert archived == source.parent / "archive" / "1551-attempt-1.json"
+    assert FactoryRunRecord.from_json(json.loads(archived.read_text(encoding="utf-8"))) == expected
+    assert load_factory_record(tmp_path, "1551") is None
+
+
+def test_archive_factory_record_restores_active_record_when_event_persistence_fails(
+    tmp_path: Path,
+) -> None:
+    expected = replace(record(tmp_path), controller_phase="failed", session=None)
+    source = save_factory_record(tmp_path, expected)
+
+    def fail_event(*args: object, **kwargs: object) -> None:
+        raise OSError("event sink unavailable")
+
+    with pytest.raises(FactoryRecordError, match="event could not be persisted"):
+        archive_factory_record(
+            tmp_path,
+            expected,
+            event_logger=fail_event,
+            source_kind="dispatch_abandonment",
+            reason="retained factory session is missing",
+        )
+
+    assert load_factory_record(tmp_path, "1551") == expected
+    assert source.is_file()
+    assert not list(source.parent.joinpath("archive").glob("*.json"))
+
+
+def _retained_record(home: Path, repository: Path, *, sandbox_exists: bool = True) -> FactoryRunRecord:
+    sandbox = repository / ".factory-sandboxes" / "1551"
+    if sandbox_exists:
+        sandbox.mkdir(parents=True)
+    expected = replace(
+        record(home),
+        sandbox=str(sandbox),
+        status=None,
+        observed_at="2026-08-01T00:00:00+00:00",
+        controller_phase="failed",
+    )
+    save_factory_record(home, expected)
+    return expected
+
+
+def test_factory_record_retention_default_is_seven_days(tmp_path: Path) -> None:
+    repository = tmp_path / "repo"
+    expected = _retained_record(tmp_path, repository)
+    calls: list[list[str]] = []
+
+    archived = age_out_factory_records(
+        tmp_path,
+        now=datetime(2026, 8, 7, 23, 59, 59, tzinfo=UTC),
+        runner=lambda args: calls.append(list(args))
+        or subprocess.CompletedProcess(args, 0, stdout="", stderr=""),
+        event_logger=lambda *args, **kwargs: None,
+    )
+
+    assert FACTORY_RECORD_RETENTION == timedelta(days=7)
+    assert archived == []
+    assert load_factory_record(tmp_path, expected.run_id) == expected
+    assert calls == []
+
+
+def test_factory_age_out_pushes_before_removing_both_manifest_candidates(
+    tmp_path: Path,
+) -> None:
+    repository = tmp_path / "repo"
+    expected = _retained_record(tmp_path, repository)
+    root_manifest, sandbox_manifest = factory_manifest_candidates(expected)
+    assert root_manifest == repository / ".factory" / "1551"
+    assert sandbox_manifest == repository / ".factory-sandboxes" / "1551" / ".factory" / "1551"
+    root_manifest.mkdir(parents=True)
+    sandbox_manifest.mkdir(parents=True)
+    calls: list[list[str]] = []
+
+    def run(args):
+        calls.append(list(args))
+        if "push" in args:
+            assert root_manifest.exists()
+            assert sandbox_manifest.exists()
+            assert Path(expected.sandbox).exists()
+            return subprocess.CompletedProcess(args, 0, stdout="pushed\n", stderr="")
+        return subprocess.CompletedProcess(args, 0, stdout="refs/heads/slice-one\n", stderr="")
+
+    archived = age_out_factory_records(
+        tmp_path,
+        now=datetime(2026, 8, 8, tzinfo=UTC),
+        runner=run,
+        event_logger=lambda *args, **kwargs: None,
+    )
+
+    assert [call[3] for call in calls] == ["for-each-ref", "push"]
+    assert len(archived) == 1
+    assert not root_manifest.exists()
+    assert not sandbox_manifest.exists()
+    assert not Path(expected.sandbox).exists()
+    assert load_factory_record(tmp_path, expected.run_id) is None
+
+
+def test_factory_age_out_push_failure_retains_sandbox_and_reports_event(
+    tmp_path: Path,
+) -> None:
+    repository = tmp_path / "repo"
+    expected = _retained_record(tmp_path, repository)
+    root_manifest, sandbox_manifest = factory_manifest_candidates(expected)
+    root_manifest.mkdir(parents=True)
+    sandbox_manifest.mkdir(parents=True)
+    events: list[tuple[str, dict[str, object]]] = []
+
+    def run(args):
+        if "push" in args:
+            return subprocess.CompletedProcess(args, 1, stdout="", stderr="remote rejected")
+        return subprocess.CompletedProcess(args, 0, stdout="refs/heads/unpushed\n", stderr="")
+
+    archived = age_out_factory_records(
+        tmp_path,
+        now=datetime(2026, 8, 8, tzinfo=UTC),
+        runner=run,
+        event_logger=lambda event, **payload: events.append((event, payload)),
+    )
+
+    assert archived == []
+    assert root_manifest.is_dir()
+    assert sandbox_manifest.is_dir()
+    assert Path(expected.sandbox).is_dir()
+    assert load_factory_record(tmp_path, expected.run_id) == expected
+    assert events == [
+        (
+            "worklink_factory_record_age_out_failed",
+            {
+                "issue_id": 1551,
+                "run_id": "1551",
+                "attempt": 1,
+                "phase": "failed",
+                "error": "cannot push retained factory branches: remote rejected",
+            },
+        )
+    ]
+
+
+def test_factory_age_out_archives_record_when_sandbox_is_already_gone(tmp_path: Path) -> None:
+    repository = tmp_path / "repo"
+    expected = _retained_record(tmp_path, repository, sandbox_exists=False)
+    root_manifest, _ = factory_manifest_candidates(expected)
+    root_manifest.mkdir(parents=True)
+
+    archived = age_out_factory_records(
+        tmp_path,
+        now=datetime(2026, 8, 8, tzinfo=UTC),
+        runner=lambda args: pytest.fail("git must not run for a missing sandbox"),
+        event_logger=lambda *args, **kwargs: None,
+    )
+
+    assert len(archived) == 1
+    assert not root_manifest.exists()
+    assert load_factory_record(tmp_path, expected.run_id) is None
+
+
 def test_factory_record_rejects_identity_and_sandbox_mismatch(tmp_path: Path) -> None:
     expected = record(tmp_path)
     with pytest.raises(FactoryRecordError, match="identity"):
@@ -78,7 +268,19 @@ def test_factory_record_rejects_identity_and_sandbox_mismatch(tmp_path: Path) ->
         replace(expected, sandbox=str(tmp_path / "different"))
 
 
-def test_factory_record_binds_nullable_status_to_durable_identity(tmp_path: Path) -> None:
+def test_factory_record_rejects_sandbox_path_for_another_run(tmp_path: Path) -> None:
+    expected = replace(
+        record(tmp_path),
+        run_id="chainlink-1551",
+        sandbox=str(tmp_path / "chainlink-1551"),
+        status=None,
+    )
+
+    with pytest.raises(FactoryRecordError, match="sandbox does not match run id"):
+        replace(expected, sandbox=str(tmp_path / "chainlink-1552"))
+
+
+def test_factory_record_binds_status_run_id_to_durable_identity(tmp_path: Path) -> None:
     expected = record(tmp_path)
     status = expected.status
     assert status is not None
@@ -88,17 +290,20 @@ def test_factory_record_binds_nullable_status_to_durable_identity(tmp_path: Path
         status=replace(
             status,
             pr_base=None,
-            validator={"status": "approved"},
+            validator="GO",
             terminal_result={"reason": "opaque"},
         ),
     )
     assert FactoryRunRecord.from_json(nullable_base.to_json()) == nullable_base
 
+    assert replace(expected, status=replace(status, issue_key=None)).status is not None
+    assert replace(expected, status=replace(status, issue_key="display-only")).status is not None
     with pytest.raises(FactoryRecordError, match="identity mismatch"):
-        replace(expected, status=replace(status, issue_key=None))
-    with pytest.raises(FactoryRecordError, match="identity mismatch"):
-        replace(expected, status=replace(status, issue_key="1552"))
-    with pytest.raises(FactoryRecordError, match="base mismatch"):
+        replace(expected, status=replace(status, run_id="1552"))
+    with pytest.raises(
+        FactoryRecordError,
+        match="observed 'develop', expected 'main'",
+    ):
         replace(expected, status=replace(status, pr_base="develop"))
 
 
@@ -109,7 +314,18 @@ def test_factory_record_schema_remains_exact(tmp_path: Path) -> None:
         FactoryRunRecord.from_json(payload)
 
 
-def test_factory_record_rejects_symlink_and_non_numeric_names(tmp_path: Path) -> None:
+def test_factory_record_upgrades_legacy_record_without_transcript(tmp_path: Path) -> None:
+    payload = record(tmp_path).to_json()
+    payload["version"] = 1
+    del payload["transcript"]
+
+    upgraded = FactoryRunRecord.from_json(payload)
+
+    assert upgraded.version == 2
+    assert upgraded.transcript is None
+
+
+def test_factory_record_rejects_symlink_and_unbound_run_ids(tmp_path: Path) -> None:
     expected = record(tmp_path)
     path = save_factory_record(tmp_path, expected)
     path.unlink()
@@ -118,23 +334,11 @@ def test_factory_record_rejects_symlink_and_non_numeric_names(tmp_path: Path) ->
     path.symlink_to(outside)
     with pytest.raises(FactoryRecordError, match="regular"):
         load_factory_record(tmp_path, "1551")
-    with pytest.raises(FactoryRecordError, match="positive decimal"):
-        load_factory_record(tmp_path, "chainlink-1551")
+    with pytest.raises(FactoryRecordError, match="run id"):
+        load_factory_record(tmp_path, "not/a/run-id")
 
 
-def test_clear_factory_record_refuses_symlink(tmp_path: Path) -> None:
-    expected = record(tmp_path)
-    path = save_factory_record(tmp_path, expected)
-    path.unlink()
-    target = tmp_path / "target"
-    target.write_text("keep", encoding="utf-8")
-    path.symlink_to(target)
-    with pytest.raises(FactoryRecordError, match="non-regular"):
-        clear_factory_record(tmp_path, "1551")
-    assert target.read_text(encoding="utf-8") == "keep"
-
-
-@pytest.mark.parametrize("operation", ["load", "list", "save", "clear"])
+@pytest.mark.parametrize("operation", ["load", "list", "save"])
 def test_factory_record_rejects_symlink_in_complete_parent_chain(
     tmp_path: Path, operation: str
 ) -> None:
@@ -151,5 +355,3 @@ def test_factory_record_rejects_symlink_in_complete_parent_chain(
             list_factory_records(home)
         elif operation == "save":
             save_factory_record(home, replace(record(tmp_path), sandbox=str(tmp_path / "sandbox")))
-        else:
-            clear_factory_record(home, "1551")

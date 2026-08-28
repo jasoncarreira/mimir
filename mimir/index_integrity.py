@@ -315,6 +315,8 @@ def check_saga(home: Path) -> list[IntegrityCheck]:
         _check_foreign_keys(db_path, "saga"),
         _check_fts5_integrity(db_path, "saga", "atoms_fts"),
         _check_fts5_row_count_match(db_path, "saga", "atoms", "atoms_fts"),
+        _check_embedding_dim_uniform(db_path, "saga", "embeddings", "vec"),
+        _check_embedding_dim_uniform(db_path, "saga", "sessions", "embedding"),
     ]
 
 

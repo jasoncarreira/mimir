@@ -20,9 +20,9 @@ class _Config:
     web_host = "127.0.0.1"
 
 
-def _app(home: Path) -> web.Application:
-    app = web.Application(middlewares=[_make_auth_middleware(MASTER)])
-    app["api_key"] = MASTER
+def _app(home: Path, master_key: str = MASTER) -> web.Application:
+    app = web.Application(middlewares=[_make_auth_middleware(master_key)])
+    app["api_key"] = master_key
     app["config"] = _Config()
     resolver = IdentityResolver(home)
     resolver.reload()
@@ -120,6 +120,23 @@ async def test_revoke_key_blocks_auth(tmp_path: Path) -> None:
         assert _data(await r.json())["revoked"] is True
         # key is dead immediately (resolver reloaded)
         assert (await c.get("/api/v1/whoami", headers={"X-API-Key": key})).status == 401
+
+
+async def test_revoke_last_web_key_without_master_is_refused(tmp_path: Path) -> None:
+    key = issue_web_key(tmp_path, "ops", roles=["admin"])
+    async with TestClient(TestServer(_app(tmp_path, master_key=""))) as c:
+        response = await c.post(
+            "/api/v1/admin/users/revoke",
+            headers={"X-API-Key": key},
+            json={"canonical": "ops"},
+        )
+        assert response.status == 409
+        body = await response.json()
+        assert body["error"]["code"] == "last_web_key"
+        assert "MIMIR_API_KEY is unset" in body["error"]["message"]
+
+        # The rejected mutation never reaches disk or the live resolver.
+        assert (await c.get("/api/v1/admin/users", headers={"X-API-Key": key})).status == 200
 
 
 async def test_issue_key_bad_role_400(tmp_path: Path) -> None:

@@ -76,7 +76,16 @@ _current_turn_interactive_var: contextvars.ContextVar[bool | None] = contextvars
 )
 
 SEND_MESSAGE_SKIPLIST_TRIGGERS: frozenset[str] = frozenset(
-    {"poller", "scheduled_tick"}
+    {
+        "poller",
+        "scheduled_tick",
+        # Shell wake-ups use interactive send defaults, but often correctly end silent.
+        "shell_job_complete",
+        # Session synthesis is internal housekeeping, not a direct user reply.
+        "saga_session_end",
+        # Upgrade maintenance is framework-originated with no awaiting user.
+        "upgrade",
+    }
 )
 
 # Tunable list of phrases that indicate the model is narrating a
@@ -211,6 +220,19 @@ def _matched_send_message_skiplist_phrase(text: str) -> str | None:
             if text_word_count <= SEND_MESSAGE_SKIPLIST_SHORT_MAX_WORDS or phrase_is_tail:
                 return phrase
     return None
+
+
+def _send_message_skiplist_guard_armed(trigger: str) -> bool:
+    if trigger in SEND_MESSAGE_SKIPLIST_TRIGGERS:
+        return True
+
+    namespace, separator, name = trigger.partition(":")
+    return bool(
+        separator
+        and name
+        and namespace.endswith("-poller")
+        and namespace != "-poller"
+    )
 
 
 def _channel_from_config_or_state(
@@ -644,7 +666,7 @@ async def send_message(
     trigger = (getattr(ctx, "trigger", "") if ctx is not None else "").strip()
     matched_skiplist_phrase = (
         _matched_send_message_skiplist_phrase(text)
-        if trigger in SEND_MESSAGE_SKIPLIST_TRIGGERS
+        if _send_message_skiplist_guard_armed(trigger)
         else None
     )
     if matched_skiplist_phrase is not None:
@@ -1466,7 +1488,8 @@ async def set_poller_overrides(poller_name: str, overrides: dict[str, Any]) -> s
 
     Writes ``<home>/pollers-overrides.yaml`` through a narrow validated path.
     ``overrides`` may contain only poller override keys such as ``cron``,
-    ``priority``, ``batch_size``, ``env``, ``pass_env``, and ``budget``. Passing an empty
+    ``priority``, ``batch_size``, ``env``, ``pass_env``, and ``budget``. Environment
+    names are restricted to non-secret poller tuning variables. Passing an empty
     dict removes that poller's override entry. Call ``reload_pollers`` after a
     successful write to apply the new values to the running scheduler.
     """
@@ -1500,6 +1523,10 @@ async def set_poller_overrides(poller_name: str, overrides: dict[str, Any]) -> s
             sort_keys=True,
         )
         validate_poller_overrides_text(body, path=path)
+        # Unlike file-tool content, this scheduler config is never returned as a
+        # trusted filesystem result. Its mutation is audited as the dedicated
+        # set_poller_overrides scheduler sink, so file-read integrity metadata
+        # would not be consumed and is intentionally not recorded here.
         _atomic_write_text(path, body)
     except PollerOverridesValidationError as exc:
         return f"set_poller_overrides failed: {exc}"
@@ -2107,6 +2134,7 @@ async def _spawn_open_code_impl(
         return json.dumps({
             "run_id": run_id,
             "status": terminal.status,
+            "reason_code": terminal.reason_code,
             "exit_code": None,
             "stdout": "",
             "result": "",
@@ -2435,6 +2463,7 @@ async def _spawn_open_code_impl(
     return json.dumps({
         "run_id": run_id,
         "status": terminal.status,
+        "reason_code": terminal.reason_code,
         "exit_code": terminal.exit_code,
         "stdout": safe_stdout,
         "result": safe_stdout,

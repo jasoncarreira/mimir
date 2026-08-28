@@ -440,3 +440,59 @@ def test_real_main_general_and_critic_construction_uses_artifacts_root(
         for middleware in created_middleware
     )
     assert all("history_path_prefix" not in kwargs for kwargs in factory_calls)
+
+
+@pytest.mark.parametrize("is_async", [False, True])
+def test_offload_wrappers_forward_upstream_signature_changes(is_async: bool) -> None:
+    """The wrappers must not restate upstream's parameter list.
+
+    Their only job is to substitute ``backend`` with a logging proxy; everything
+    after it belongs to deepagents and has to pass through untouched.
+
+    deepagents 0.7.10 added a ``session_id`` argument to `_offload_to_backend` and
+    `_aoffload_to_backend`. Wrappers hardcoded to ``(self, backend, messages)`` then
+    raised `TypeError: ... takes 3 positional arguments but 4 were given` on every
+    turn that offloaded, and the pin is `>=0.7.1,<0.8`, so a signature change inside
+    that range is expected rather than exceptional -- which is why this asserts
+    forwarding rather than any particular arity.
+
+    Both arities are exercised: the `_offload_to_backend` pair take four arguments
+    on 0.7.10 while the `_inline_media` pair still take three.
+    """
+    import asyncio
+
+    from mimir._deepagents_summarization import (
+        _wrap_async_offload,
+        _wrap_sync_offload,
+    )
+
+    seen: dict[str, object] = {}
+
+    if is_async:
+        async def original(_self, backend, *args, **kwargs):  # type: ignore[no-untyped-def]
+            seen.update(backend=backend, args=args, kwargs=kwargs)
+            return "ok"
+
+        wrapped = _wrap_async_offload(original, logging.getLogger(__name__))
+        assert asyncio.run(wrapped(None, "raw-backend", ["m"], "session-1")) == "ok"
+    else:
+        def original(_self, backend, *args, **kwargs):  # type: ignore[no-untyped-def]
+            seen.update(backend=backend, args=args, kwargs=kwargs)
+            return "ok"
+
+        wrapped = _wrap_sync_offload(original, logging.getLogger(__name__))
+        assert wrapped(None, "raw-backend", ["m"], "session-1") == "ok"
+
+    # Everything after ``backend`` arrives unchanged, including the argument that
+    # upstream added.
+    assert seen["args"] == (["m"], "session-1")
+    assert seen["kwargs"] == {}
+    # ``backend`` itself is the one argument the wrapper is allowed to replace.
+    assert seen["backend"] != "raw-backend"
+
+    # The three-argument shape the inline-media siblings still use keeps working.
+    seen.clear()
+    if not is_async:
+        three = _wrap_sync_offload(original, logging.getLogger(__name__))
+        assert three(None, "raw-backend", ["m"]) == "ok"
+        assert seen["args"] == (["m"],)

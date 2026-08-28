@@ -130,15 +130,14 @@ def _alternate_referenced_paths(home: Path) -> frozenset[Path]:
     attempts across three leaves failed and were auto-demoted before anyone traced
     it. So the janitor now declines to reclaim what a repository is standing on.
 
-    Bounded on purpose: the candidate repositories are the configured source
-    checkout, the container source path, the operator-configured external file-tool
-    roots, and the home itself. This is a safety interlock, not a filesystem
-    search — an unlisted repository is no worse off than before this existed.
+    Bounded on purpose: the candidate repositories are the configured running
+    source checkout, the operator-configured external file-tool roots, and the
+    home itself. This is a safety interlock, not a filesystem search — an unlisted
+    repository is no worse off than before this existed.
     """
     candidates: list[Path] = []
     if source_dir := os.environ.get("MIMIR_SOURCE_DIR", "").strip():
         candidates.append(Path(source_dir))
-    candidates.append(Path("/workspace/mimir"))
     for item in os.environ.get("MIMIR_FILE_TOOL_ROOTS", "").split(","):
         # Entries may carry a ``:ro`` / ``:rw`` access suffix.
         raw = item.split(":")[0].strip()

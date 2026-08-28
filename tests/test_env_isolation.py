@@ -7,6 +7,12 @@ Two invariants live here, both prerequisites for running the suite with
    that loaded it (``tests/conftest.py::_isolate_process_env``).
 2. No test may be skipped *because* enforcement is on — otherwise the enforced
    CI job stays green while the paths it exists to cover quietly stop running.
+3. A host-only setting that overrides a value the suite asserts on must be
+   cleared for the session (``tests/conftest.py::_clear_host_mimir_environment``),
+   so the suite's result does not depend on the deployment it runs inside.
+4. The env the poller framework injects into a child process must be cleared too.
+   ``STATE_DIR`` is a write target, so inheriting it makes the suite mutate the
+   live poller store rather than merely read the wrong value.
 """
 
 from __future__ import annotations
@@ -180,3 +186,130 @@ def test_longmemeval_memory_smoke_cases_are_collected():
         f"missing: {sorted(_LONGMEMEVAL_NODE_IDS - collected)}\n"
         f"unexpected: {sorted(collected - _LONGMEMEVAL_NODE_IDS)}"
     )
+
+
+# ── 3. host-only overrides must not change the suite's result ─────────
+
+_PUBLISHING_IDENTITY = "MIMIR_FACTORY_PUBLISHING_IDENTITY"
+_DECLARED_IDENTITY_TESTS = (
+    "tests/test_worklink_orchestrator.py"
+    "::test_factory_new_run_uses_resolved_base_for_single_checkout_placement"
+)
+_CODING_ENABLED = "MIMIR_CODING_ENABLED"
+_CODING_STATE_TESTS = (
+    "tests/test_tool_registry.py",
+    "tests/test_worklink_backends.py",
+    "tests/test_worklink_evidence.py",
+    "tests/test_runtime.py",
+    "tests/test_bench_runner.py",
+)
+
+
+def test_declared_publishing_identity_tests_ignore_the_host_override() -> None:
+    """The suite must pass with the deployment's publishing identity exported.
+
+    ``MIMIR_FACTORY_PUBLISHING_IDENTITY`` overrides the ``publishing_identity``
+    a checkout declares in ``.factory.json``. The tests that assert on the
+    declared value therefore read the deployment's value instead whenever it is
+    set, which is why this ran green in CI -- where it is unset -- and failed
+    inside mimirbot, where ``compose.env`` sets it. The worklink test gate went
+    red on every build, so ``review_ready`` stayed false and no build reached
+    the commit step or published a PR.
+
+    Asserting the variable is absent would only restate the fixture. Running the
+    affected tests in a child process with it *present* is the property that
+    actually matters, and it fails if the name is dropped from
+    ``_clear_host_mimir_environment``.
+    """
+    env = dict(os.environ)
+    env[_PUBLISHING_IDENTITY] = "deployment-owner"
+    completed = subprocess.run(
+        [sys.executable, "-m", "pytest", "-q", "-p", "no:randomly", _DECLARED_IDENTITY_TESTS],
+        capture_output=True,
+        cwd=Path(__file__).resolve().parent.parent,
+        env=env,
+    )
+    assert completed.returncode == 0, (
+        f"{_PUBLISHING_IDENTITY} leaked into the suite:\n"
+        f"{completed.stdout.decode(errors='replace')[-2000:]}"
+    )
+
+
+def test_coding_state_tests_ignore_the_host_override() -> None:
+    """The Worklink gate must pass with deployment coding enabled.
+
+    The chainlink-orchestrator deliberately passes ``MIMIR_CODING_ENABLED`` to
+    every Worklink build. Without the session fixture clearing that host value,
+    disabled-default tool-registry tests and backend/evidence tests silently run
+    against the enabled worker path. Running the affected files in a child
+    process makes the ambient-enabled deployment condition executable evidence.
+    """
+    env = dict(os.environ)
+    env[_CODING_ENABLED] = "true"
+    completed = subprocess.run(
+        [sys.executable, "-m", "pytest", "-q", "-p", "no:randomly", *_CODING_STATE_TESTS],
+        capture_output=True,
+        cwd=Path(__file__).resolve().parent.parent,
+        env=env,
+    )
+    assert completed.returncode == 0, (
+        f"{_CODING_ENABLED} leaked into the suite:\n"
+        f"{completed.stdout.decode(errors='replace')[-4000:]}\n"
+        f"{completed.stderr.decode(errors='replace')[-2000:]}"
+    )
+
+
+# ── 4. poller-injected env must not reach the suite ───────────────────
+
+_POSTCLAIM_FAILURE_TEST = (
+    "tests/test_worklink_orchestrator.py::test_postclaim_failure_emits_same_failure_event"
+)
+
+
+def test_conftest_clears_every_poller_injected_env_key() -> None:
+    """``conftest._POLLER_INJECTED_ENV`` must stay in step with its source of truth.
+
+    ``mimir.pollers._POLLER_INJECTED_ENV_KEYS`` is the authoritative set of names
+    the poller framework injects into a poller's child process. A name added
+    there and not here would silently start leaking into the suite, so this fails
+    the moment the two drift.
+    """
+    from mimir.pollers import _POLLER_INJECTED_ENV_KEYS
+
+    from tests.conftest import _POLLER_INJECTED_ENV
+
+    assert _POLLER_INJECTED_ENV_KEYS <= _POLLER_INJECTED_ENV, (
+        "poller-injected env keys missing from the clearing fixture: "
+        f"{sorted(_POLLER_INJECTED_ENV_KEYS - _POLLER_INJECTED_ENV)}"
+    )
+
+
+def test_suite_does_not_write_dispatch_failures_into_an_inherited_state_dir(
+    tmp_path: Path,
+) -> None:
+    """A test must not write into the poller store it happens to inherit.
+
+    ``_record_run_failure`` formerly took its destination from
+    ``os.environ["STATE_DIR"]`` rather than from the ``home`` it was passed, and
+    ``test_postclaim_failure_emits_same_failure_event`` drives it with
+    ``autonomous=True``. Inside mimirbot the worklink gate runs this suite as a
+    child of a poller, so that test wrote a fabricated failure record --
+    ``issue 441``, ``attempt 2``, ``"backend exploded api_key=[REDACTED]"`` -- into
+    the live ``worklink-ready-queue`` store, against an issue that is closed.
+
+    The test passes either way, which is why nothing surfaced it. The property
+    worth asserting is that the store stays untouched.
+    """
+    probe = tmp_path / "state"
+    probe.mkdir()
+    env = dict(os.environ)
+    env["STATE_DIR"] = str(probe)
+    completed = subprocess.run(
+        [sys.executable, "-m", "pytest", "-q", "-p", "no:randomly", _POSTCLAIM_FAILURE_TEST],
+        capture_output=True,
+        cwd=Path(__file__).resolve().parent.parent,
+        env=env,
+    )
+    assert completed.returncode == 0, completed.stdout.decode(errors="replace")[-2000:]
+    written = sorted(child.name for child in probe.iterdir())
+    assert written == [], f"suite wrote into an inherited STATE_DIR: {written}"

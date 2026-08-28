@@ -8,10 +8,16 @@ import os
 from pathlib import Path
 import sys
 
-from ..worklink.control import stop_worklink, worklink_status
+from ..event_logger import log_durable_event_sync
+from ..worklink.control import (
+    archive_worklink_factory_records,
+    stop_worklink,
+    worklink_status,
+)
 from ..worklink.orchestrator import (
     LeafValidationError,
     WorklinkError,
+    read_work_item,
     run_worklink,
     run_worklink_epic,
     run_worklink_reattach,
@@ -37,6 +43,18 @@ def add_argparse(
     stop_p = worklink_sub.add_parser("stop", help="Safely stop one live leaf Worklink run.")
     stop_p.add_argument("issue_id", type=int, help="Chainlink issue id to stop.")
     stop_p.add_argument("--home", type=Path, default=None, help="Agent home.")
+
+    archive_p = worklink_sub.add_parser(
+        "archive-factory-run", help="Archive retained factory state for one epic."
+    )
+    archive_p.add_argument("issue_id", type=int, help="Chainlink epic issue id to clear.")
+    archive_p.add_argument("--home", type=Path, default=None, help="Agent home.")
+
+    emit_p = worklink_sub.add_parser(
+        "emit-work-item",
+        help="Emit one Chainlink issue as deterministic factory JSON.",
+    )
+    emit_p.add_argument("issue_id", type=int, help="Chainlink issue id to emit.")
     run_p.add_argument(
         "--dry-run",
         action="store_true",
@@ -49,7 +67,10 @@ def add_argparse(
         help="Agent home (overrides MIMIR_HOME; default: cwd).",
     )
     run_p.add_argument(
-        "--repo", type=Path, default=None, help="Git repo to work in (default: cwd)."
+        "--repo",
+        type=Path,
+        default=None,
+        help="Dedicated Worklink base repository (default: WORKLINK_REPO).",
     )
     run_p.add_argument(
         "--test-command", default=None, help="Override the configured evidence test command."
@@ -94,7 +115,10 @@ def add_argparse(
         help="Agent home (overrides MIMIR_HOME; default: cwd).",
     )
     run_epic_p.add_argument(
-        "--repo", type=Path, default=None, help="Git repo to work in (default: cwd)."
+        "--repo",
+        type=Path,
+        default=None,
+        help="Dedicated Worklink base repository (default: WORKLINK_REPO).",
     )
     run_epic_p.add_argument(
         "--autonomous",
@@ -122,12 +146,22 @@ def dispatch(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
     if args.worklink_action == "stop":
         return _stop(args)
 
+    if args.worklink_action == "archive-factory-run":
+        return _archive_factory_run(args)
+
+    if args.worklink_action == "emit-work-item":
+        return _emit_work_item(args)
+
     if args.worklink_action != "run":
         parser.print_help()
         return 1
 
     home = (args.home or Path(os.environ.get("MIMIR_HOME") or Path.cwd())).resolve()
-    repo = (args.repo or Path.cwd()).resolve()
+    try:
+        repo = _resolve_worklink_repo(args.repo)
+    except RuntimeError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
     os.environ["MIMIR_HOME"] = str(home)
     try:
         from ..event_logger import init_logger
@@ -211,6 +245,16 @@ def _status(args: argparse.Namespace) -> int:
     return 0
 
 
+def _emit_work_item(args: argparse.Namespace) -> int:
+    try:
+        payload = read_work_item(args.issue_id)
+    except WorklinkError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    sys.stdout.write(payload)
+    return 0
+
+
 def _stop(args: argparse.Namespace) -> int:
     home = (args.home or Path(os.environ.get("MIMIR_HOME") or Path.cwd())).resolve()
     result = stop_worklink(home, args.issue_id)
@@ -226,6 +270,26 @@ def _stop(args: argparse.Namespace) -> int:
     return 0
 
 
+def _archive_factory_run(args: argparse.Namespace) -> int:
+    home = (args.home or Path(os.environ.get("MIMIR_HOME") or Path.cwd())).resolve()
+    from ..event_logger import init_logger
+
+    init_logger(
+        home / "logs" / "events.jsonl",
+        session_id=f"worklink-archive-factory-{args.issue_id}",
+    )
+    archived = archive_worklink_factory_records(
+        home,
+        args.issue_id,
+        event_logger=log_durable_event_sync,
+    )
+    if not archived:
+        print(f"worklink:epic #{args.issue_id}: no retained factory record")
+        return 1
+    print(f"worklink:epic #{args.issue_id}: archived {len(archived)} factory record(s)")
+    return 0
+
+
 def _format_elapsed(seconds: float) -> str:
     total = max(0, int(seconds))
     hours, remainder = divmod(total, 3600)
@@ -236,7 +300,11 @@ def _format_elapsed(seconds: float) -> str:
 def _run_epic(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
     """Handle the run-epic command for worklink:epic issues via feature-factory."""
     home = (args.home or Path(os.environ.get("MIMIR_HOME") or Path.cwd())).resolve()
-    repo = (args.repo or Path.cwd()).resolve()
+    try:
+        repo = _resolve_worklink_repo(args.repo)
+    except RuntimeError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
     os.environ["MIMIR_HOME"] = str(home)
     try:
         from ..event_logger import init_logger
@@ -270,3 +338,14 @@ def _run_epic(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
     if result.evidence_path:
         print(f"evidence: {result.evidence_path}")
     return 0 if result.status in {"completed", "review_ready", "blocked"} else 1
+
+
+def _resolve_worklink_repo(explicit: Path | None) -> Path:
+    if explicit is not None:
+        return explicit.resolve()
+    configured = os.environ.get("WORKLINK_REPO") or os.environ.get("MIMIR_WORKLINK_REPO")
+    if not configured:
+        raise RuntimeError(
+            "WORKLINK_REPO is required; provision a dedicated Worklink base repository or pass --repo"
+        )
+    return Path(configured).resolve()

@@ -15,14 +15,21 @@ from .._atomic import atomic_write_json
 from ..redaction import redact_text
 
 STATE_FILE = "dispatch_failures.json"
+POLLER_NAME = "worklink-ready-queue"
 INITIAL_BACKOFF_MINUTES = 15
 MAX_BACKOFF_MINUTES = 240
 MAX_NOTIFIED_SIGNATURES = 32
+_DELIVERY_RECEIPTS_DIR = ".delivery-receipts"
 _TRANSIENT_CONTENTION_MARKERS = (
     ("unable to create", "index.lock"),
     ("cannot lock ref",),
     ("could not write new index file",),
 )
+
+
+def dispatch_failure_state_dir(home: Path) -> Path:
+    """Return the durable failure ledger owned by a Worklink home."""
+    return home / "state" / "pollers" / POLLER_NAME
 
 
 def terminal_error(value: BaseException | str) -> str:
@@ -51,6 +58,12 @@ def load_failure_state(state_dir: Path) -> dict[str, Any]:
 
 def save_failure_state(state_dir: Path, state: dict[str, Any]) -> None:
     atomic_write_json(state_dir / STATE_FILE, state)
+
+
+def delivery_receipt_exists(state_dir: Path, delivery_key: str) -> bool:
+    """Return whether the framework durably accepted a poller record."""
+    digest = hashlib.sha256(delivery_key.encode()).hexdigest()
+    return (state_dir / _DELIVERY_RECEIPTS_DIR / digest).is_file()
 
 
 @contextmanager
@@ -87,6 +100,8 @@ def record_failure(
     exit_status: int,
     error: BaseException | str,
     log_path: str | None,
+    preserved_ref: str | None = None,
+    preservation_error: str | None = None,
     now: datetime | None = None,
 ) -> dict[str, Any]:
     now = now or datetime.now(UTC)
@@ -106,6 +121,8 @@ def record_failure(
             "failed_at": now.isoformat(),
             "retry_after": None,
             "log_path": redact_text(log_path or ""),
+            "preserved_ref": redact_text(preserved_ref or "")[:1000] or None,
+            "preservation_error": redact_text(preservation_error or "")[:1000] or None,
             "notified_signatures": [],
         }
     with failure_state_transaction(state_dir) as state:
@@ -134,6 +151,8 @@ def record_failure(
             "failed_at": now.isoformat(),
             "retry_after": (now + timedelta(minutes=delay)).isoformat(),
             "log_path": redact_text(log_path or ""),
+            "preserved_ref": redact_text(preserved_ref or "")[:1000] or None,
+            "preservation_error": redact_text(preservation_error or "")[:1000] or None,
             "notified_signatures": list(prior.get("notified_signatures") or [])[
                 -MAX_NOTIFIED_SIGNATURES:
             ],
@@ -175,10 +194,13 @@ def pending_failure_alerts(
                     "error_signature": signature,
                     "failure_occurrence_id": entry.get("occurrence_id"),
                     "log": entry.get("log_path"),
+                    "preserved_ref": entry.get("preserved_ref"),
+                    "preservation_error": entry.get("preservation_error"),
                     "retry_after": entry.get("retry_after"),
                     "routing_instructions": (
                         "Notify the operator that a detached Worklink run failed. "
-                        "Include the run-log path and terminal error."
+                        "Include the run-log path, terminal error, and any preserved "
+                        "ref or preservation error."
                     ),
                 })
     return backed_off, alerts

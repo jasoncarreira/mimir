@@ -18,7 +18,7 @@ FACTORY_DOCS = (
 
 
 def test_current_factory_documentation_matches_runtime_version() -> None:
-    assert FACTORY_VERSION == "0.7.2"
+    assert FACTORY_VERSION == "0.8.0"
     for relative_path in FACTORY_DOCS:
         text = (ROOT / relative_path).read_text(encoding="utf-8")
         assert text.count(f"`feature-factory@{FACTORY_VERSION}`") == 1, relative_path
@@ -57,7 +57,7 @@ def test_factory_launch_contract_is_identical_in_bounded_documentation() -> None
         f"and falls back to `{_DEFAULT_FACTORY_MAX_RETRIES}` for absent or invalid values."
     )
     staging = (
-        f"feature-factory {FACTORY_VERSION} stages the workflow inside the run directory; "
+        "feature-factory 0.7.5 stages the workflow inside the run directory; "
         "exact token `--auto` is never passed."
     )
     base = (
@@ -83,13 +83,15 @@ def test_factory_identity_preflight_contract_is_identical_in_bounded_documentati
         "writes sandbox Git identity configuration."
     )
     publication = (
-        "Worklink reads the nonblank `publishing_identity` only from the trusted controller "
-        "checkout's `.factory.json`. For GitHub publication Worklink verifies the credential "
+        "Worklink reads the nonblank `publishing_identity` from "
+        "`MIMIR_FACTORY_PUBLISHING_IDENTITY` when that variable is set, otherwise from the "
+        "trusted controller checkout's `.factory.json`. A set but blank or non-string "
+        "override fails instead of falling back. For GitHub publication Worklink verifies the credential "
         "this process is already bound to, `GITHUB_TOKEN`, rather than selecting among "
         "candidates: `GH_TOKEN` is a child-only alias for `gh`, and verifying a second "
         "credential in a process that already verified one is refused by the forge identity "
         "memo before `/user` is ever reached. That token's owner is compared against the "
-        "declared identity before dispatch, then both child aliases are normalized to it. "
+        "selected identity before dispatch, then both child aliases are normalized to it. "
         "`GH_TOKEN` and `GITHUB_TOKEN` set to different values fail dispatch as an operator "
         "ambiguity rather than one being preferred, and a missing `GITHUB_TOKEN` fails naming "
         "that variable - in both cases without disclosing values."
@@ -110,7 +112,7 @@ def test_internal_factory_status_contract_matches_runtime_binding() -> None:
         in worklink
     )
     assert "`validator` and `terminal_result` are object-or-null" in worklink
-    assert "requires a non-null matching issue key" in worklink
+    assert "uses the run ID as identity; the issue key is optional display enrichment" in worklink
     assert "A null PR base is\n  allowed during recovery" in worklink
     assert "a populated base must always match the record" in worklink
     assert (

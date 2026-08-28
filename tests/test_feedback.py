@@ -1071,6 +1071,12 @@ def test_turn_errors_surface_when_chain_signals_fill_negative_bucket(tmp_path: P
 # ---- gave_up suffix convention (chainlink #299) -------------------------
 
 
+def test_scheduled_tick_dropped_is_negative_feedback():
+    from mimir.feedback import classify
+
+    assert classify("scheduled_tick_dropped") == ("negative", "tick_dropped")
+
+
 def test_classify_gave_up_suffix_is_negative():
     """Any ``*_gave_up`` event type classifies as a negative ``gave_up``
     signal via the suffix convention — even without an explicit
@@ -1099,6 +1105,29 @@ def test_classify_gave_up_suffix_is_negative():
     assert classify("") is None
     assert classify(None) is None
     assert classify(123) is None
+
+
+def test_worklink_run_orphaned_is_negative_and_names_recovery_route():
+    from mimir.feedback import classify
+    from mimir.feedback.renderers import _render_event_line
+
+    assert classify("worklink_run_orphaned") == (
+        "negative",
+        "worklink_run_orphaned",
+    )
+    line = _render_event_line(
+        "worklink_run_orphaned",
+        {
+            "issue_id": 1454,
+            "branch": "issue/1454-a1",
+            "unpublished_commits": True,
+            "resulting_label": "worklink:blocked",
+        },
+    )
+    assert "#1454" in line
+    assert "issue/1454-a1" in line
+    assert "worklink:blocked" in line
+    assert "recover the checkout" in line
 
 
 def test_non_utf8_home_file_is_negative_and_renders_actionably():
@@ -1412,6 +1441,76 @@ def test_worklink_continuation_created_surfaces_as_negative_feedback(tmp_path: P
     assert "worklink_continuation" in block
 
 
+def test_worklink_tool_pin_dedupe_failure_is_registered_and_rendered():
+    from mimir.feedback import (
+        _EVENT_RULES,
+        classify,
+    )
+    from mimir.feedback.renderers import _render_event_line
+
+    event_type = "worklink_tool_pin_dedupe_check_failed"
+    expected_rule = ("negative", event_type)
+
+    # Pin the canonical declaration, rather than only exercising classify(), so
+    # this cannot pass through a fallback classification convention.
+    assert _EVENT_RULES[event_type] == expected_rule
+    assert classify(event_type) == expected_rule
+
+    line = _render_event_line(
+        event_type,
+        {
+            "tool_name": "codex",
+            "dedupe_key": "worklink-tool-pin:coding-cli:codex:0.139.0->0.140.0",
+            "reason": "chainlink issue search returned invalid JSON",
+        },
+    )
+
+    assert "codex" in line
+    assert "worklink-tool-pin:coding-cli:codex:0.139.0->0.140.0" in line
+    assert "chainlink issue search returned invalid JSON" in line
+    assert "issue creation skipped" in line
+
+
+def test_worklink_tool_pin_dedupe_failure_surfaces_with_cap_and_content_dedup(
+    tmp_path: Path,
+):
+    event_type = "worklink_tool_pin_dedupe_check_failed"
+    log = _make_log(
+        tmp_path,
+        events=[
+            {
+                "timestamp": _ts(0.2),
+                "type": event_type,
+                "tool_name": "codex",
+                "dedupe_key": "worklink-tool-pin:coding-cli:codex:0.139.0->0.140.0",
+                "reason": "latest failure",
+            },
+            {
+                "timestamp": _ts(0.1),
+                "type": event_type,
+                "tool_name": "codex",
+                "dedupe_key": "worklink-tool-pin:coding-cli:codex:0.139.0->0.140.0",
+                "reason": "latest failure",
+            },
+        ],
+    )
+
+    negatives, positives = log.recent(limit_per_polarity=1)
+
+    assert positives == []
+    assert len(negatives) == 1
+    assert negatives[0].kind == event_type
+    assert negatives[0].count == 2
+    assert "codex" in negatives[0].content
+    assert "latest failure" in negatives[0].content
+
+    block = log.recent_block(limit_per_polarity=1)
+    assert block is not None
+    assert "Negative (last 24h):" in block
+    assert "Worklink tool-pin dedupe check failed for codex" in block
+    assert "×2 in 24h" in block
+
+
 def test_background_task_failed_surfaces_as_negative(tmp_path: Path):
     from mimir.feedback import classify
 
@@ -1432,6 +1531,42 @@ def test_background_task_failed_surfaces_as_negative(tmp_path: Path):
 
     assert block is not None
     assert "background task 'boom-task' failed: RuntimeError: boom" in block
+
+
+def test_liveness_startup_failures_surface_as_negative_feedback(tmp_path: Path):
+    from mimir.feedback import classify
+
+    expected = {
+        "liveness_unclean_restart_handoff_persist_failed": (
+            "negative", "liveness_unclean_restart_handoff_persist_failed",
+        ),
+        "startup_failed": ("negative", "startup_failed"),
+    }
+    for event_type, rule in expected.items():
+        assert classify(event_type) == rule
+
+    log = _make_log(
+        tmp_path,
+        events=[
+            {
+                "timestamp": _ts(0.1),
+                "type": "liveness_unclean_restart_handoff_persist_failed",
+                "prior_pid": 123,
+            },
+            {
+                "timestamp": _ts(0.2),
+                "type": "startup_failed",
+                "phase": "liveness_marker",
+                "exception": "RuntimeError('boom')",
+            },
+        ],
+    )
+
+    block = log.recent_block()
+
+    assert block is not None
+    assert "liveness_unclean_restart_handoff_persist_failed" in block
+    assert "startup_failed" in block
 
 
 def test_pr_review_request_gave_up_surfaces_as_negative(tmp_path: Path):
@@ -2022,6 +2157,38 @@ def test_escalation_rows_collapse_by_escalated_kind(tmp_path: Path):
     assert "(×2 in 24h)" in lines[0]
 
 
+def test_bridge_clean_exits_classify_and_render_negative(tmp_path: Path):
+    """A clean bridge-supervisor return must be operator-visible, not merely
+    an events.jsonl record indistinguishable from a quiet channel."""
+    from mimir.feedback import classify
+
+    assert classify("discord_bridge_exited") == (
+        "negative", "discord_bridge_exited",
+    )
+    assert classify("slack_bridge_exited") == (
+        "negative", "slack_bridge_exited",
+    )
+
+    log = _make_log(tmp_path, events=[
+        {
+            "timestamp": _ts(0.1),
+            "type": "discord_bridge_exited",
+            "reason": "client.start() returned cleanly",
+        },
+        {
+            "timestamp": _ts(0.2),
+            "type": "slack_bridge_exited",
+            "reason": "handler.start_async() returned cleanly",
+        },
+    ])
+    block = log.recent_block()
+    assert block is not None
+    assert "Discord bridge supervisor exited" in block
+    assert "Discord traffic is down until restart" in block
+    assert "Slack bridge supervisor exited" in block
+    assert "Slack traffic is down until restart" in block
+
+
 def test_poller_reload_invalid_cron_classified_negative():
     """chainlink #419: the invalid-cron reload event must be in
     _EVENT_RULES so the operator sees a broken poller schedule
@@ -2605,6 +2772,28 @@ def test_chain_consumed_kinds_not_duplicated(tmp_path: Path):
     # Individual kinds not present.
     assert not any(s.kind == "git_push_ok" for s in all_signals)
     assert not any(s.kind == "git_push_failed" for s in all_signals)
+
+
+def test_saga_vector_search_degradation_surfaces_to_next_turn(tmp_path: Path):
+    log = _make_log(
+        tmp_path,
+        events=[
+            {
+                "type": "saga_vector_search_degraded",
+                "timestamp": _ts(0.1),
+                "reason": "query_dimension_mismatch",
+                "expected_dimension": 1024,
+                "observed_dimension": 384,
+            }
+        ],
+    )
+
+    block = log.recent_block()
+
+    assert block is not None
+    assert "SAGA semantic search degraded to FTS5" in block
+    assert "query_dimension_mismatch" in block
+    assert "expected dim=1024, observed dim=384" in block
 
 
 def test_non_grouped_kind_unaffected(tmp_path: Path):

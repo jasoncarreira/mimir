@@ -21,7 +21,13 @@ The **planner/decomposer contract** (the leaf template in §2.5) is enforced: a
 leaf missing the required sections is auto-demoted to `worklink:blocked` with a
 `WORKLINK_BLOCKED` reason before dispatch (re-plan → re-add `worklink:ready`).
 Execution uses self-contained per-leaf attempt checkouts via the configured
-compute backend (§5). **The only Worklink compute substrate is
+compute backend (§5). Poller-dispatched OpenCode builds run as the distinct
+`worklink` uid in the existing `/workspace/.worklink` checkout. The checkout is
+group-writable and setgid, but there is deliberately no per-run pathname barrier:
+this protects the source repository checkout from build writes, not one build
+from another. It is also **not credential isolation** because the deployment's
+virtiofs home mount ignores guest ownership; that separate prerequisite is
+tracked in #1435. **The only Worklink compute substrate is
 `local_subprocess`** (chainlink
 #832 — `docker_sibling` and `ecs_runtask` were retired); autonomous dispatch
 needs `defaults.allow_autonomous_local_subprocess: true` in `worklink.yaml` to
@@ -50,8 +56,8 @@ The in-mimir integrated-epic runner — brief → `work-decomposer` → `decompo
 `integration-validator` → one final draft PR — **was removed in #830** after the
 epic #783 arc concluded (every failure was distribution tax in that layer).
 
-Epics are built by `feature-factory@0.7.2` through the lockstep
-`opencode-feature-factory@0.7.2` adapter. OpenCode's `/feature` workflow owns
+Epics are built by `feature-factory@0.8.0` through the lockstep
+`opencode-feature-factory@0.8.0` adapter. OpenCode's `/feature` workflow owns
 factory transitions. Worklink owns the outer Chainlink claim, isolated attempt
 checkout, OpenCode process, restart record, status observation, repository tests,
 and final PR identity verification.
@@ -70,7 +76,7 @@ and final PR identity verification.
   stop`; feature-factory has no cancel transition.
 - **Retry and staging**: `MIMIR_FACTORY_MAX_RETRIES` defaults to `5`, accepts
   exactly ASCII `[0-9]+` in range `1..9007199254740991`, and falls back to `5`
-  for absent or invalid values. feature-factory 0.7.2 stages the workflow inside
+  for absent or invalid values. feature-factory 0.7.5 stages the workflow inside
   the run directory; exact token `--auto` is never passed. Worklink's base
   selects the checkout start point and PR target; it is not factory `--base`,
   which is never passed.
@@ -81,18 +87,20 @@ and final PR identity verification.
   `GIT_COMMITTER_NAME`, and `GIT_COMMITTER_EMAIL`; Worklink never writes sandbox
   Git identity configuration.
 - **Publication credential**: Worklink reads the nonblank `publishing_identity`
-  only from the trusted controller checkout's `.factory.json`. For GitHub
+  from `MIMIR_FACTORY_PUBLISHING_IDENTITY` when that variable is set, otherwise
+  from the trusted controller checkout's `.factory.json`. A set but blank or
+  non-string override fails instead of falling back. For GitHub
   publication Worklink verifies the credential this process is already bound to,
   `GITHUB_TOKEN`, rather than selecting among candidates: `GH_TOKEN` is a
   child-only alias for `gh`, and verifying a second credential in a process that
   already verified one is refused by the forge identity memo before `/user` is
-  ever reached. That token's owner is compared against the declared identity
+  ever reached. That token's owner is compared against the selected identity
   before dispatch, then both child aliases are normalized to it. `GH_TOKEN` and
   `GITHUB_TOKEN` set to different values fail dispatch as an operator ambiguity
   rather than one being preferred, and a missing `GITHUB_TOKEN` fails naming that
   variable - in both cases without disclosing values.
 - **Controls**: Every control is `node <absolute feature-factory/bin/factory.js>`.
-  Worklink admits the launcher only after package/adapter 0.7.2 verification and
+  Worklink admits the launcher only after package/adapter 0.8.0 verification and
   all 16 nonmutating structural command probes. Status is read with `status
   <run-id> --repo <sandbox> --json`; resume and heartbeat reuse the retained
   session; lock actions use `lock <run-id> <claim|steal|release> --session
@@ -101,7 +109,7 @@ and final PR identity verification.
   with required, typed known fields; additive top-level fields are ignored.
   `issue_key`, `pr_base`, `lock_session`, and `pr_url` are string-or-null, while
   `validator` and `terminal_result` are object-or-null. Binding a status to a
-  Worklink record requires a non-null matching issue key. A null PR base is
+  Worklink record uses the run ID as identity; the issue key is optional display enrichment. A null PR base is
   allowed during recovery and ordinary running, parked, blocked, or partial
   observation, but a populated base must always match the record. Completed
   publication verification requires a non-null matching PR base before evidence
@@ -221,7 +229,25 @@ calling `steal`; it must not trust `steal` to reject live claims.
 
 ### State machine
 
-Labels on the leaf issue (chainlink `status` stays open/closed):
+The ready-queue poller treats the Worklink label vocabulary as follows. Removing
+`worklink:ready` is the common way to park either a leaf or an epic; no other
+label admits dispatch.
+
+| Label | Leaf dispatch | Factory-epic dispatch |
+|---|---|---|
+| `worklink:ready` | Required | Required, together with `worklink:epic` |
+| `worklink:epic` | Excludes the issue and children whose parent carries it | Required to select the `run-epic` path |
+| `worklink:in-progress` | Not consulted directly; the active claim lock excludes redispatch and consumes a leaf slot | Not consulted directly; the active claim lock excludes redispatch and consumes a factory slot |
+| `worklink:review` | Not consulted; normal transitions remove `worklink:ready`, so review work is parked | Not consulted; normal transitions remove `worklink:ready`, so review work is parked |
+| `worklink:blocked` | Always excludes dispatch, even if stale `worklink:ready` remains | Always excludes dispatch, even if stale `worklink:ready` and `worklink:epic` remain |
+
+Dependency actionability remains a separate, additional requirement from
+`chainlink issue ready`. Attempt-budget exhaustion is enforced authoritatively
+by the executor after its race-safe claim checks. That first refusal adds
+`worklink:blocked`; the poller then excludes the issue, so exhaustion is
+reported once rather than launching another refusal every poll cycle.
+
+Labels on the issue (chainlink `status` stays open/closed):
 
 ```
 needs-decomposition ──planner──▶ worklink:ready
@@ -308,6 +334,25 @@ no) and an auto-registering poller via `skill_install.py` without model-mediatin
 the deterministic core. The slice-3 `worklink_run` *tool* stays core regardless
 (tools have no skill-contributed mechanism).
 
+**Root executor provenance (decided 2026-08-25).** Deployment builds must never
+install the root-owned executor from a local directory or named context backed
+by a checkout. The executor source is an immutable released distribution or a
+Git reference pinned by full SHA. The SHA path is the supported way to deploy an
+unreleased branch commit: the build resolves and checks out that commit, refuses
+unless it exactly matches the controller commit, and records it in the image's
+OCI revision label and `/opt/mimir-worklink/executor-source-commit`. The executor
+identity operation exposes the recorded SHA and `/health` reports it as
+`worklink_executor_source_commit`. Dirty-tree executor builds are unsupported;
+working-directory edits cannot enter this root-owned artifact. Deployment
+compose files must pass a fully qualified `MIMIR_GIT_REF` plus the same resolved
+full SHA for `MIMIR_CONTROLLER_COMMIT` and `MIMIR_EXECUTOR_COMMIT`. The build
+fetches exactly that ref and refuses unless `FETCH_HEAD` equals the pinned SHA.
+This permits CI to name `refs/pull/<number>/merge` while keeping the SHA
+authoritative; “point it at whichever checkout you want” is not a valid
+deployment contract. All three provenance arguments are required, so plain
+`docker build .` intentionally fails. Deploying a new executor requires rebuilding
+and recreating the image; pulling a controller checkout is insufficient.
+
 Entry points:
 
 1. `mimir worklink run <issue-id> [--backend X] [--dry-run]` — CLI,
@@ -326,8 +371,8 @@ Per-issue flow (one `run`):
 2. **Claim** (`claims.py`). Lock + claim comment (agent id, ts,
    attempt N).
 3. **Checkout.** Create a self-contained sibling checkout with `git clone
-   --local`, then check out `issue/<issue>-a<attempt>` from the **configured
-   base branch**
+    --local`, then check out `issue/<issue>-a<attempt>` from the **configured
+    base branch** in the dedicated repository named by `WORKLINK_REPO`
    (`defaults.base_branch` in `worklink.yaml`, default `main`; a `mimir
    worklink run --base <branch>` flag overrides per run). The same base is the
    diff floor (`base...head`) and the PR target (`gh pr create --base
@@ -343,8 +388,14 @@ Per-issue flow (one `run`):
    collide with the first attempt's kept checkout AND its branch, and
    `attempts < 3` could never actually run more than once. Each retry
    gets a fresh path + branch; autopsy artifacts from prior attempts
-   stay untouched until the reaper prunes them. Never a long-lived
-   per-worker branch.
+    stay untouched until the reaper prunes them. Never a long-lived
+    per-worker branch. `WORKLINK_REPO` is never inferred from the process cwd,
+    installed package, or module location. Immediately before fetching and branching, Worklink runs
+   one porcelain status check as the account that owns the base repository and
+   refuses a dirty index or working tree. The refusal event and error name
+   bounded samples of staged, unstaged, and non-ignored untracked paths; ignored
+   local directories such as `.venv/` and `.worktrees/` do not count. Worklink
+   never resets or cleans the shared base automatically.
 4. **Render the prompt** from issue fields: description, acceptance
    criteria, review criteria, parent context, repo conventions pointer.
    Template lives at `mimir/prompt_templates/worklink-order.md` (operator-tunable). The
@@ -462,7 +513,7 @@ require touching the orchestrator.
 | Adapter | Invocation sketch | Notes |
 |---|---|---|
 | `opencode` | `opencode run --dir <checkout> -- <prompt>` | Sole coding backend for leaf issues; provider and model are selected by opencode configuration/arguments. |
-| `feature_factory` | `opencode run ... --command feature " --autonomous --max-retries 5 <issue>"` | Epic adapter with Worklink-supervised OpenCode and absolute 0.7.2 controls. |
+| `feature_factory` | `opencode run ... --command feature " --autonomous --max-retries 5 <issue>"` | Epic adapter with Worklink-supervised OpenCode and absolute 0.8.0 controls. |
 
 Selection is config, not code (§7): per repo / label / issue-type, with
 a per-category default. The executor consults `Caps` rather than
@@ -556,6 +607,30 @@ work, but it does not prevent reads or writes elsewhere in `/workspace`
 or `/mimir-home` if the backend agent/tool chooses to do them. Treat
 checkout isolation as an audit/review boundary, not a security boundary.
 
+The configured base repository has one role: it is the independently provisioned
+source from which attempts branch. It must not be the running controller's source
+checkout. Checkout creation compares `WORKLINK_REPO` with the explicitly declared
+`MIMIR_SOURCE_DIR` and refuses equal, ancestor, or descendant paths. This check does
+not inspect `__file__`, the installed package root, or the process cwd. An editable
+deployment must therefore set `MIMIR_SOURCE_DIR` to its controller checkout; omitting
+that declaration makes separation conventional rather than enforced. A PyPI install
+has no controller source checkout and leaves `MIMIR_SOURCE_DIR` unset, but it still
+must configure a separately fetched or operator-provisioned `WORKLINK_REPO`.
+
+The dedicated base remains mutable only by controller Git maintenance. Immediately
+before every build Worklink refuses a dirty index/worktree, fetches the configured
+base branch from `origin`, verifies the fetched tip, and branches from that tip.
+Thus deployment upgrades do not move build inputs; the intended project and branch
+relationship is expressed by `repositories.yaml` (`slug`, exact `origin`, and
+`base_branch`) plus `worklink.yaml.repository`, and startup/fetch checks enforce it.
+Updating the base through its origin does not alter installed controller code.
+
+Local clone hardlinks remain available between this dedicated base and ordinary
+attempt checkouts, so their object sharing cannot reach the controller source.
+Worker-eligible uid-dropped checkouts already use `--no-hardlinks`, costing the
+measured 179 MB per Mimir clone instead of approximately 0 MB. Foreign-owner
+detection and hardlink-failure fallback remain unchanged.
+
 This is acceptable for **operator-invoked** slice-1 runs on bounded issues
 because the output still lands as a review PR and the executor observes
 diff/tests itself. It is not acceptable as a silent autonomous-dispatch
@@ -610,10 +685,19 @@ content verbatim into acceptance criteria.
   default `normal`, configurable — so worker launches shed under TIGHT
   with everything else. Operator-invoked `mimir worklink run` always
   proceeds.
-- **Events.** `worklink_claimed`, `worklink_evidence`,
-  `worklink_transition`, `worklink_attempts_exhausted` land in
-  events.jsonl with feedback rules (attempts-exhausted negative), so
-  the agent sees its delegated work's health in the algedonic block.
+- **Events.** Leaf and epic runs share `worklink_autonomous_refused`,
+  `worklink_attempts_exhausted`, `worklink_claim_failed`, `worklink_claimed`,
+  `worklink_transition`, and `worklink_run_failed`. Epic-only admission failures
+  (a non-epic issue or an unavailable base branch) use
+  `worklink_epic_refused`. Leaf runs additionally emit `worklink_evidence` after
+  their controller evidence pass; epic runs deliberately do not duplicate that
+  event because feature-factory owns its staged evidence lifecycle and the epic
+  controller emits the terminal transition after completion verification. All
+  transition events carry `status`, `review_ready`, and `pr_url`. These events
+  land in events.jsonl with feedback rules (attempts-exhausted negative), so the
+  agent sees its delegated work's health in the algedonic block. Existing event
+  consumers match event names and read only their required fields; the optional
+  `reason` added to epic refusal and transition records is additive.
 - **Tool-pin inventory (external-toolchain drift).** `worklink.yaml`
   may carry deployment-specific `tool_pins:`, but the source-controlled
   seed inventory lives in `mimir.worklink.tool_pins.DEFAULT_TOOL_PINS`.
@@ -649,11 +733,13 @@ substrate cleanup the only Worklink compute substrate is `local_subprocess`
 added without an orchestrator change). Both registered tool backends run on
 local subprocess compute; a route matches first, otherwise the defaults apply.
 
-`local_subprocess` runs the backend **unsandboxed**, with full
-container-filesystem access. That is an **explicit accept-the-risk fallback**, not the
-recommended autonomous path. With no built-in isolated substrate to fall back
-to after #832, the only escape from the autonomous refusal is the
-`allow_autonomous_local_subprocess: true` opt-in.
+`local_subprocess` is still **not a sandbox**. Poller-dispatched OpenCode is
+uid-dropped to `worklink`, which prevents writes to the agent-owned source
+checkout, but shared Worklink checkouts and the virtiofs-mounted credential home
+remain reachable. Feature-factory retains the agent uid. This is therefore still
+an **explicit accept-the-risk fallback** rather than an isolated substrate. With
+no built-in isolated substrate to fall back to after #832, the only escape from
+the autonomous refusal is the `allow_autonomous_local_subprocess: true` opt-in.
 
 **Policy (enforced in the core executor, `WorklinkConfig.autonomous_compute_allowed`):**
 
@@ -667,10 +753,11 @@ to after #832, the only escape from the autonomous refusal is the
   substrate" alternative is no longer available — there is no built-in
   isolated substrate to route to).
 - **Operator-invoked `mimir worklink run`** (no `--autonomous`) is **never
-  gated** — it always proceeds. The blast radius is real: on `local_subprocess`
-  the backend can read/write the whole container filesystem, so reserve manual
-  unsandboxed runs for issues you've scoped and trust. The gate lives in core
-  Python ahead of the claim, so no model-facing caller can bypass it.
+  gated** — it always proceeds. Enabled OpenCode receives the same repo-checkout
+  uid protection, but not credential or cross-run isolation; other backends keep
+  the agent uid. Reserve manual runs for issues you've scoped and trust. The gate
+  lives in core Python ahead of the claim, so no model-facing caller can bypass
+  it.
 
 ## 7. Operator runbook
 
@@ -680,9 +767,11 @@ leaf issues with explicit acceptance criteria and review criteria.
 
 ### Prerequisites
 
-- Run from the target git repository (`/workspace/mimir` for mimir source
-  work) and point `--home` at the agent home that owns Chainlink and Worklink
-  state (`/mimir-home` in production).
+- Provision a dedicated clone for `WORKLINK_REPO`; do not use the checkout from
+  which an editable Mimir controller runs. `mimir worklink run` requires either
+  `WORKLINK_REPO` or an explicit `--repo` and never falls back to cwd. Point
+  `--home` at the agent home that owns Chainlink and Worklink state
+  (`/mimir-home` in production).
 - The Chainlink tracker must have an agent identity for the executor. If lock
   claims fail with a missing-agent/identity error, initialize it once from the
   Chainlink repo: `cd /mimir-home && chainlink agent init mimir-worklink`.
@@ -727,8 +816,7 @@ Before a first real run on a new issue shape, render the work order without
 claiming or spawning the backend:
 
 ```bash
-cd /workspace/mimir
-uv run mimir worklink run <issue-id> --home /mimir-home --dry-run
+mimir worklink run <issue-id> --home /mimir-home --dry-run
 ```
 
 A dry run is a prompt/config validation step only. It does not create a claim,
@@ -737,8 +825,7 @@ checkout, evidence bundle, branch, or PR.
 ### Real run
 
 ```bash
-cd /workspace/mimir
-uv run mimir worklink run <issue-id> \
+mimir worklink run <issue-id> \
   --home /mimir-home \
   --test-command 'uv run pytest -q <focused-tests> --tb=short'
 ```
@@ -779,17 +866,45 @@ diff with a nominal backend success is demoted to failure.
 
 ### Recovery and cleanup
 
+For the current mimirbot migration, first stop new dispatch and let in-flight
+claims finish (or stop them through the normal verified Worklink stop path). Clone
+the configured Mimir origin as the controller account into a persistent path such
+as `/var/lib/mimir-worklink/base/mimir`, configure that path as the inventory root,
+set `WORKLINK_REPO` to it, and keep `MIMIR_SOURCE_DIR=/workspace/mimir` while the
+controller remains an editable checkout. Restart only after startup validates the
+new root and origin. Existing attempt checkouts retain their own Git directories
+and recorded base path; do not move them mid-claim. Retained completed/failed
+checkouts may be pruned after the switch by the old-path cleanup procedure. A host
+that has never had a base must be provisioned with this clone before startup;
+Worklink does not guess a checkout or clone destination on first use and fails
+closed when `WORKLINK_REPO` is absent.
+
 Current slice-1 recovery is manual:
 
 - **Backend/sandbox failure before useful diff:** read the transcript path in
   the evidence bundle or `<home>/state/worklink/transcripts/`, adjust
   `<home>/worklink.yaml`, and rerun only if the Chainlink comments/attempt
   state indicate the next attempt will use a fresh attempt number.
-- **Claim lock left behind:** inspect with `cd /mimir-home && chainlink locks
-  check <issue-id>` and release the executor's own known-stale lock with
-  `chainlink locks release <issue-id>`. Use `locks steal` only after independent
-  TTL/heartbeat evidence; Chainlink can report a fresh lock as stale when no
-  heartbeat has been written yet.
+- **Claim lock left behind:** list capacity-consuming ids with `cd /mimir-home &&
+  chainlink locks list --json`, inspect one with `chainlink locks check
+  <issue-id>`, and release the executor's own known-stale lock with `chainlink
+  locks release <issue-id>`. The Worklink TTL reaper also discovers lock-only
+  claims and releases them after their structured claim heartbeat is stale. Use
+  `locks steal` manually only after independent TTL/heartbeat evidence;
+  Chainlink can report a fresh lock as stale when no heartbeat has been written
+  yet.
+- **Claims leaked before the lifecycle telemetry fix:** inspect
+  `<home>/logs/events.jsonl` for `worklink_reattach_dispatch_failed`,
+  `worklink_shutdown_claim_release_failed`, and `worklink_claim_reap_skipped`.
+  Compare their issue ids with `chainlink locks list --json` and current
+  `worklink:in-progress` issues. A `worklink_claims_reaped` event with
+  `examined=0` means no stale claim was found; nonzero `skipped` counts identify
+  why stale candidates remained among records discovered in that pass. Skip
+  issue ids are bounded samples, so use the lock table as the complete inventory
+  before manually releasing anything.
+- **Concurrency-cap refusal:** the current refusal reports only active and cap,
+  not the blocking lock ids. It should include a bounded id sample in a separate
+  observability change; this fix leaves cap behavior and payloads unchanged.
 - **Retained failed checkout/branch:** failed or blocked attempts are retained
   for autopsy under `.worklink/<issue>-<attempt>` with branch
   `issue/<issue>-a<attempt>`. Remove them only after evidence has been copied
@@ -845,7 +960,7 @@ defaults:
   timeout_s: 1800
   priority: normal          # arbiter priority for autonomous dispatch (low|normal|high)
   max_concurrent: 2         # cap on concurrent autonomous claims (poller + tool); CLI uncapped
-  reaper_ttl_s: 7200        # claim age (no heartbeat) before the TTL reaper steals it back
+  reaper_ttl_s: 86400       # >= 2 * max(timeout_s, factory timeout); lower legacy values warn + clamp
   allow_autonomous_local_subprocess: false  # autonomy policy (#460, #832): autonomous dispatch
                             # refuses the unsandboxed local_subprocess substrate unless this
                             # is true. The operator CLI is never gated. See §6.5.
@@ -958,7 +1073,7 @@ even if another signal is absent.
 tool_pins:
   - name: opencode               # required: stable local tool name
     category: coding-cli         # required: coding-cli | renderer | tracker | helper
-    pin: "1.18.9"               # required: version, tag, or SHA currently expected
+    pin: "1.18.21"              # required: version, tag, or SHA currently expected
     smoke: "opencode --version"   # required: command used as bump evidence
     source: npm                  # optional lookup strategy for drift checks
     package: "opencode-ai"       # optional upstream package/repo identifier

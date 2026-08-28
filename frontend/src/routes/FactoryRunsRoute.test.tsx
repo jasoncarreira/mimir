@@ -131,7 +131,7 @@ const factoryRunDetailFixture: ApiSuccessEnvelope<FactoryRunDetail> = {
     gates: { story: "approved", brief: "approved" },
     steps: ["spec-writer:accepted", "work-decomposer:running"],
     slices: ["s1:merged", "s2:building"],
-    validator: { status: "pending" },
+    validator: "GO-WITH-NITS",
     terminal_result: null
   }
 };
@@ -187,6 +187,7 @@ describe("FactoryRunsRoute", () => {
     renderRoute(<RunDetail runId="834" />);
 
     expect(await screen.findByText("Active")).toBeTruthy();
+    expect(screen.getByText("GO-WITH-NITS")).toBeTruthy();
     expect(screen.queryByText("Terminal")).toBeNull();
     expect(screen.getByText("observe")).toBeTruthy();
     expect(screen.getByText(/resume-from-terminal/)).toBeTruthy();

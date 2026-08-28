@@ -9,6 +9,8 @@ ready-queue poller's discovery/dispatch (cap-respecting, detached).
 
 from __future__ import annotations
 
+import ast
+import importlib.util
 import json
 import os
 import signal
@@ -22,10 +24,12 @@ from typing import Sequence
 
 import pytest
 
-from mimir.worklink import autonomy
-from mimir.worklink.claims import CLAIM_RESET_PREFIX, ChainlinkClaims, ClaimRecord
-from mimir.worklink.backends.registry import WorklinkDefaults
+from mimir.worklink import autonomy, orchestrator
+from mimir.worklink.autonomy import check_concurrency
+from mimir.worklink.claims import CLAIM_RESET_PREFIX, ChainlinkClaims, ClaimRecord, ReapResult
+from mimir.worklink.backends.registry import WorklinkConfig, WorklinkDefaults
 from mimir.worklink.dispatch_failures import (
+    dispatch_failure_state_dir,
     failure_state_transaction,
     load_failure_state,
     mark_failure_notified,
@@ -34,6 +38,7 @@ from mimir.worklink.dispatch_failures import (
     record_success,
     save_failure_state,
 )
+from mimir.pollers import _write_delivery_receipt
 
 
 def cp(returncode: int = 0, stdout: str = "", stderr: str = "") -> subprocess.CompletedProcess[str]:
@@ -70,7 +75,15 @@ class FakeChainlink:
         tail = args[1:]
         if tail[:2] == ["issue", "list"]:
             label = tail[tail.index("--label") + 1] if "--label" in tail else ""
-            ids = self.in_progress if label == "worklink:in-progress" else self.ready if label == "worklink:ready" else []
+            ids = (
+                self.in_progress
+                if label == "worklink:in-progress"
+                else self.ready
+                if label == "worklink:ready"
+                else sorted(self.epic_ids)
+                if label == "worklink:epic"
+                else []
+            )
             return cp(stdout=json.dumps([{"id": i} for i in ids]))
         if tail[:2] == ["issue", "show"]:
             issue_id = int(tail[2])
@@ -129,6 +142,74 @@ def test_active_worklink_lock_count_reads_locks_json() -> None:
     assert claims.issue_ids_with_label("worklink:ready") == []
 
 
+def test_configured_attempt_budget_reaches_every_blocking_boundary(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    (tmp_path / "worklink.yaml").write_text(
+        "defaults:\n  max_claim_attempts: 4\n",
+        encoding="utf-8",
+    )
+    fake = FakeChainlink(in_progress=[62, 63], active_locks=[62, 63])
+    monkeypatch.setattr(autonomy, "_home_runner", lambda home: fake)
+    monkeypatch.setattr(autonomy, "log_event_sync", lambda *args, **kwargs: None)
+    claims = autonomy.make_claims(tmp_path)
+    now = datetime.now(UTC)
+
+    def history(issue_id: int, count: int) -> list[str]:
+        return [
+            ClaimRecord(issue_id, attempt, "old", now - timedelta(days=attempt)).to_comment()
+            for attempt in range(1, count + 1)
+        ]
+
+    # Claim acquisition admits work below the configured budget and blocks at it.
+    assert claims.claim_issue(60, history(60, 3)).claimed is True
+    exhausted = claims.claim_issue(61, history(61, 4))
+    assert exhausted.attempts_exhausted is True
+
+    # The TTL reaper applies that same boundary to stale attempts.
+    claims.reap_stale_claims(
+        [
+            ClaimRecord(62, 3, "stale", now - timedelta(hours=3)),
+            ClaimRecord(63, 4, "stale", now - timedelta(hours=3)),
+        ],
+        ttl=timedelta(hours=2),
+    )
+
+    # The attempts-exhausted transition also blocks at, but not below, the budget.
+    claims.transition_issue(64, status="failed", review_ready=False, attempt=3)
+    claims.transition_issue(65, status="failed", review_ready=False, attempt=4)
+
+    labels = {
+        (int(call[3]), call[4])
+        for call in fake.calls
+        if call[1:3] == ["issue", "label"]
+    }
+    assert claims.max_attempts == 4
+    assert (61, "worklink:blocked") in labels
+    assert (62, "worklink:ready") in labels
+    assert (63, "worklink:blocked") in labels
+    assert (64, "worklink:ready") in labels
+    assert (65, "worklink:blocked") in labels
+
+
+def test_production_claim_constructors_pass_configured_attempt_budget() -> None:
+    missing: list[str] = []
+    construction_sites = 0
+    for module in (autonomy, orchestrator):
+        tree = ast.parse(Path(module.__file__).read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Name):
+                continue
+            if node.func.id != "ChainlinkClaims":
+                continue
+            construction_sites += 1
+            if not any(keyword.arg == "max_attempts" for keyword in node.keywords):
+                missing.append(f"{Path(module.__file__).name}:{node.lineno}")
+
+    assert construction_sites > 0
+    assert missing == []
+
+
 def test_shutdown_release_timeout_is_fail_soft(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
@@ -139,13 +220,14 @@ def test_shutdown_release_timeout_is_fail_soft(
     )
 
     with caplog.at_level("WARNING", logger="mimir.worklink.claims"):
-        released = autonomy.release_claims_for_graceful_shutdown(
+        released, failed = autonomy.release_claims_for_graceful_shutdown(
             tmp_path,
             agent_id="mimir-worklink:process-a",
             timeout_s=0.01,
         )
 
     assert released == []
+    assert failed[0].issue_id is None
     assert "shutdown claim discovery failed" in caplog.text
 
 
@@ -184,7 +266,58 @@ def test_reap_home_reads_content_keyed_comment_dicts() -> None:
     fake = FakeChainlink(in_progress=[49], comments={49: [comment]})  # type: ignore[list-item]
     claims = ChainlinkClaims(agent_id="t", runner=fake)
     reaped = claims.reap_home(ttl=timedelta(hours=2))
-    assert [r.issue_id for r in reaped] == [49]
+    assert [r.issue_id for r in reaped.reaped] == [49]
+
+
+def test_reap_home_skips_stale_claim_when_leaf_vs_factory_is_unknown() -> None:
+    comment = _claim_comment(1416, attempt=1, age=timedelta(hours=3))
+    fake = FakeChainlink(in_progress=[1416], comments={1416: [comment]})
+
+    def runner(args: Sequence[str]) -> subprocess.CompletedProcess[str]:
+        result = fake(args)
+        if list(args)[1:3] == ["issue", "show"]:
+            payload = json.loads(result.stdout)
+            payload.pop("labels")
+            return cp(stdout=json.dumps(payload))
+        return result
+
+    reaped = ChainlinkClaims(agent_id="t", runner=runner).reap_home(
+        ttl=timedelta(hours=2)
+    )
+
+    # The leaf TTL is intentionally shorter than the factory runtime. Without
+    # labels the reaper cannot prove this is a leaf, so it must fail closed and
+    # expose why the issue was skipped instead of silently stalling the sweep.
+    assert reaped.reaped == []
+    assert reaped.skipped == {"epic_label_unavailable": 1}
+    assert not any(call[1:3] == ["locks", "steal"] for call in fake.calls)
+
+
+@pytest.mark.parametrize(
+    "unavailable_result",
+    [
+        cp(returncode=1, stderr="tracker unavailable"),
+        cp(stdout="not json"),
+        cp(stdout=json.dumps({"comments": []})),
+    ],
+)
+def test_reap_home_reports_each_unreadable_epic_label_shape(
+    unavailable_result: subprocess.CompletedProcess[str],
+) -> None:
+    comment = _claim_comment(1417, attempt=1, age=timedelta(hours=3))
+    fake = FakeChainlink(in_progress=[1417], comments={1417: [comment]})
+
+    def runner(args: Sequence[str]) -> subprocess.CompletedProcess[str]:
+        if list(args)[1:3] == ["issue", "show"]:
+            return unavailable_result
+        return fake(args)
+
+    reaped = ChainlinkClaims(agent_id="t", runner=runner).reap_home(
+        ttl=timedelta(hours=2)
+    )
+
+    assert reaped.reaped == []
+    assert reaped.skipped == {"epic_label_unavailable": 1}
 
 
 def test_reap_home_does_not_reap_a_heartbeating_claim_made_after_a_reset() -> None:
@@ -210,7 +343,7 @@ def test_reap_home_does_not_reap_a_heartbeating_claim_made_after_a_reset() -> No
     fake = FakeChainlink(in_progress=[1019], comments={1019: comments})
     claims = ChainlinkClaims(agent_id="t", runner=fake)
 
-    assert claims.reap_home(ttl=timedelta(hours=2)) == []
+    assert claims.reap_home(ttl=timedelta(hours=2)).reaped == []
 
 
 def test_reap_home_still_reaps_a_genuinely_stale_post_reset_claim() -> None:
@@ -228,17 +361,22 @@ def test_reap_home_still_reaps_a_genuinely_stale_post_reset_claim() -> None:
 
     reaped = claims.reap_home(ttl=timedelta(hours=2))
 
-    assert [(r.issue_id, r.attempt, r.generation) for r in reaped] == [(1019, 1, 1)]
+    assert [(r.issue_id, r.attempt, r.generation) for r in reaped.reaped] == [(1019, 1, 1)]
 
 
 def test_reap_home_fail_soft_when_in_progress_list_errors() -> None:
     def runner(args: Sequence[str]) -> subprocess.CompletedProcess[str]:
-        if list(args)[1:3] == ["issue", "list"]:
+        if list(args)[1:3] in (["issue", "list"], ["locks", "list"]):
             return cp(returncode=1, stderr="list failed")
-        raise AssertionError(f"unexpected call after list failure: {args}")
+        raise AssertionError(f"unexpected call after discovery failure: {args}")
 
     claims = ChainlinkClaims(agent_id="t", runner=runner)
-    assert claims.reap_home(ttl=timedelta(hours=2)) == []
+    result = claims.reap_home(ttl=timedelta(hours=2))
+    assert result.reaped == []
+    assert result.skipped == {
+        "issue_discovery_failed": 1,
+        "lock_discovery_failed": 1,
+    }
 
 
 def test_reap_home_recovers_stale_claim_to_ready() -> None:
@@ -248,7 +386,7 @@ def test_reap_home_recovers_stale_claim_to_ready() -> None:
     )
     claims = ChainlinkClaims(agent_id="t", runner=fake, max_attempts=3)
     reaped = claims.reap_home(ttl=timedelta(hours=2))
-    assert [r.issue_id for r in reaped] == [50]
+    assert [r.issue_id for r in reaped.reaped] == [50]
     names = fake.names()
     assert "locks steal 50" in names
     assert "locks release 50" in names
@@ -265,7 +403,7 @@ def test_reap_home_blocks_when_attempts_exhausted() -> None:
     )
     claims = ChainlinkClaims(agent_id="t", runner=fake, max_attempts=3)
     reaped = claims.reap_home(ttl=timedelta(hours=2))
-    assert [r.issue_id for r in reaped] == [51]
+    assert [r.issue_id for r in reaped.reaped] == [51]
     assert any(c[1:] == ["issue", "label", "51", "worklink:blocked"] for c in fake.calls)
 
 
@@ -276,7 +414,7 @@ def test_reap_home_skips_when_lock_was_already_released() -> None:
         comments={54: [_claim_comment(54, attempt=1, age=timedelta(hours=3))]},
     )
     claims = ChainlinkClaims(agent_id="t", runner=fake)
-    assert claims.reap_home(ttl=timedelta(hours=2)) == []
+    assert claims.reap_home(ttl=timedelta(hours=2)).reaped == []
     assert "locks steal 54" not in fake.names()
 
 
@@ -290,8 +428,35 @@ def test_reap_home_skips_when_issue_already_transitioned() -> None:
     assert claims.reap_stale_claims(
         [ClaimRecord(56, 1, "mimir-worklink", datetime.now(UTC) - timedelta(hours=3))],
         ttl=timedelta(hours=2),
-    ) == []
+    ).reaped == []
     assert not any(c[1:] == ["issue", "label", "56", "worklink:ready"] for c in fake.calls)
+
+
+def test_reap_home_releases_stale_lock_after_issue_transition() -> None:
+    fake = FakeChainlink(
+        in_progress=[],
+        active_locks=[56],
+        comments={56: [_claim_comment(56, attempt=1, age=timedelta(hours=3))]},
+    )
+    claims = ChainlinkClaims(agent_id="t", runner=fake)
+
+    claims.reap_home(ttl=timedelta(hours=2))
+
+    assert "locks steal 56" in fake.names()
+    assert "locks release 56" in fake.names()
+    assert not any(c[1:] == ["issue", "label", "56", "worklink:ready"] for c in fake.calls)
+
+
+def test_reap_home_does_not_steal_fresh_lock_after_label_transition() -> None:
+    fake = FakeChainlink(
+        in_progress=[],
+        active_locks=[59],
+        comments={59: [_claim_comment(59, attempt=1, age=timedelta(minutes=5))]},
+    )
+    claims = ChainlinkClaims(agent_id="t", runner=fake)
+
+    assert claims.reap_home(ttl=timedelta(hours=2)).reaped == []
+    assert "locks steal 59" not in fake.names()
 
 
 def test_reap_home_reclaims_lock_with_distinct_chainlink_tracker_owner() -> None:
@@ -320,7 +485,7 @@ def test_reap_home_reclaims_lock_with_distinct_chainlink_tracker_owner() -> None
     claims = ChainlinkClaims(agent_id="t", runner=fake)
     reaped = claims.reap_home(ttl=timedelta(hours=2))
 
-    assert [record.issue_id for record in reaped] == [55]
+    assert [record.issue_id for record in reaped.reaped] == [55]
     assert "locks steal 55" in fake.names()
     assert "locks release 55" in fake.names()
 
@@ -331,7 +496,7 @@ def test_reap_home_leaves_fresh_claim_untouched() -> None:
         comments={52: [_claim_comment(52, attempt=1, age=timedelta(minutes=5))]},
     )
     claims = ChainlinkClaims(agent_id="t", runner=fake)
-    assert claims.reap_home(ttl=timedelta(hours=2)) == []
+    assert claims.reap_home(ttl=timedelta(hours=2)).reaped == []
     assert "locks steal 52" not in fake.names()
 
 
@@ -354,7 +519,7 @@ def test_reap_home_leaves_finalizing_claim_with_fresh_heartbeat_untouched() -> N
     )
     claims = ChainlinkClaims(agent_id="t", runner=fake)
 
-    assert claims.reap_home(ttl=timedelta(seconds=1860)) == []
+    assert claims.reap_home(ttl=timedelta(seconds=1860)).reaped == []
     assert "locks steal 57" not in fake.names()
 
 
@@ -374,7 +539,7 @@ def test_reap_home_leaves_old_claim_with_current_heartbeat_untouched() -> None:
     )
     claims = ChainlinkClaims(agent_id="t", runner=fake)
 
-    assert claims.reap_home(ttl=timedelta(hours=2)) == []
+    assert claims.reap_home(ttl=timedelta(hours=2)).reaped == []
     assert "locks steal 58" not in fake.names()
 
 
@@ -389,7 +554,7 @@ def test_reap_home_uses_latest_record_per_issue() -> None:
         ]},
     )
     claims = ChainlinkClaims(agent_id="t", runner=fake)
-    assert claims.reap_home(ttl=timedelta(hours=2)) == []
+    assert claims.reap_home(ttl=timedelta(hours=2)).reaped == []
 
 
 # ── claims.py: per-issue exclusivity (lock fail → not claimed) ──────
@@ -415,7 +580,7 @@ def _write_worklink_yaml(
     max_concurrent: int = 2,
     priority: str = "normal",
     timeout_s: int = 1800,
-    reaper_ttl_s: int = 7200,
+    reaper_ttl_s: int = 86400,
 ) -> None:
     home.mkdir(parents=True, exist_ok=True)
     (home / "worklink.yaml").write_text(
@@ -466,6 +631,7 @@ def test_worklink_priority_from_config(tmp_path: Path) -> None:
 def test_prune_stale_attempt_checkouts_for_home_uses_worklink_repo_env(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    monkeypatch.setenv("MIMIR_FACTORY_RUN_TIMEOUT_S", "600")
     _write_worklink_yaml(tmp_path, timeout_s=600, reaper_ttl_s=3600)
     repo = tmp_path / "repo"
     repo.mkdir()
@@ -528,24 +694,45 @@ def _seed_factory_run(child: Path, issue_id: int, status: str) -> None:
     )
 
 
-def test_attempt_is_active_true_for_nonterminal_run(
+def test_attempt_is_active_true_for_nested_nonterminal_run(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     child = tmp_path / ".worklink" / "840-1"
     child.mkdir(parents=True)
     record = SimpleNamespace(
-        sandbox=str(child),
+        sandbox=str(child / ".factory-sandboxes" / "chainlink-840"),
         status=SimpleNamespace(is_terminal=False, is_parked=False),
     )
     monkeypatch.setattr(autonomy, "factory_process_is_alive", lambda candidate: candidate is record)
     assert autonomy._attempt_is_active(child, [record]) is True
 
 
+def test_prune_keeps_old_attempt_with_live_nested_factory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _write_worklink_yaml(tmp_path)
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    child = tmp_path / ".worklink" / repo.name / "840-1"
+    sandbox = child / ".factory-sandboxes" / "chainlink-840"
+    sandbox.mkdir(parents=True)
+    os.utime(child, (0, 0))
+    record = SimpleNamespace(
+        sandbox=str(sandbox),
+        status=SimpleNamespace(is_terminal=False, is_parked=False),
+    )
+    monkeypatch.setattr(autonomy, "list_factory_records", lambda home: [record])
+    monkeypatch.setattr(autonomy, "factory_process_is_alive", lambda candidate: candidate is record)
+
+    assert autonomy.prune_stale_attempt_checkouts_for_home(tmp_path, repo=repo) == []
+    assert child.exists()
+
+
 def test_attempt_is_active_false_for_terminal_or_absent(tmp_path: Path) -> None:
     done = tmp_path / ".worklink" / "841-1"
     done.mkdir(parents=True)
     record = SimpleNamespace(
-        sandbox=str(done),
+        sandbox=str(done / ".factory-sandboxes" / "chainlink-841"),
         status=SimpleNamespace(is_terminal=True, is_parked=False),
     )
     assert autonomy._attempt_is_active(done, [record]) is False
@@ -555,8 +742,11 @@ def test_attempt_is_active_false_for_terminal_or_absent(tmp_path: Path) -> None:
     assert autonomy._attempt_is_active(bare) is False
 
 
-def test_reap_for_home_uses_config_ttl(tmp_path: Path) -> None:
+def test_reap_for_home_uses_config_ttl(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     # reaper_ttl_s = 1h; a 3h-old claim is stale and gets reaped.
+    monkeypatch.setenv("MIMIR_FACTORY_RUN_TIMEOUT_S", "600")
     _write_worklink_yaml(tmp_path, timeout_s=600, reaper_ttl_s=3600)
     fake = FakeChainlink(
         in_progress=[60],
@@ -564,21 +754,92 @@ def test_reap_for_home_uses_config_ttl(tmp_path: Path) -> None:
     )
     claims = ChainlinkClaims(agent_id="t", runner=fake)
     reaped = autonomy.reap_stale_claims_for_home(tmp_path, claims=claims)
-    assert [r.issue_id for r in reaped] == [60]
+    assert [r.issue_id for r in reaped.reaped] == [60]
 
 
-def test_reap_for_home_refuses_ttl_not_greater_than_timeout(tmp_path: Path) -> None:
-    _write_worklink_yaml(tmp_path, timeout_s=7200, reaper_ttl_s=7200)
-    claims = ChainlinkClaims(agent_id="t", runner=FakeChainlink(in_progress=[60]))
-    with pytest.raises(RuntimeError, match="reaper_ttl_s must be greater"):
-        autonomy.reap_stale_claims_for_home(tmp_path, claims=claims)
+@pytest.mark.parametrize(
+    ("configured_ttl_s", "expected_ttl_s", "emits_violation"),
+    [
+        (3599, 3600, False),
+        (3600, 3600, False),
+        (3601, 3601, False),
+    ],
+)
+def test_reap_for_home_enforces_ttl_floor_boundary(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    configured_ttl_s: int,
+    expected_ttl_s: int,
+    emits_violation: bool,
+) -> None:
+    monkeypatch.setenv("MIMIR_FACTORY_RUN_TIMEOUT_S", "1800")
+    _write_worklink_yaml(
+        tmp_path, timeout_s=1800, reaper_ttl_s=configured_ttl_s
+    )
+    seen_ttls: list[timedelta] = []
+    events: list[tuple[str, dict[str, object]]] = []
+    claims = SimpleNamespace(
+        reap_home=lambda *, ttl: seen_ttls.append(ttl)
+        or ReapResult(reaped=[], examined=0, skipped={}, skipped_issue_ids={}),
+    )
+    monkeypatch.setattr(
+        autonomy,
+        "log_event_sync",
+        lambda event_type, **payload: events.append((event_type, payload)),
+    )
+
+    assert autonomy.reap_stale_claims_for_home(tmp_path, claims=claims).reaped == []
+    assert seen_ttls == [timedelta(seconds=expected_ttl_s)]
+    assert bool(events) is emits_violation
 
 
-def test_reap_for_home_refuses_ttl_inside_finalize_window(tmp_path: Path) -> None:
-    _write_worklink_yaml(tmp_path, timeout_s=1800, reaper_ttl_s=1860)
-    claims = ChainlinkClaims(agent_id="t", runner=FakeChainlink(in_progress=[60]))
-    with pytest.raises(RuntimeError, match=r"2 \* timeout_s"):
-        autonomy.reap_stale_claims_for_home(tmp_path, claims=claims)
+def test_config_load_does_not_raise_leaf_ttl_to_factory_timeout(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    monkeypatch.delenv("MIMIR_FACTORY_RUN_TIMEOUT_S", raising=False)
+    _write_worklink_yaml(tmp_path, timeout_s=3600, reaper_ttl_s=7800)
+
+    with caplog.at_level("WARNING", logger="mimir.worklink.backends.registry"):
+        config = WorklinkConfig.load(tmp_path / "worklink.yaml")
+
+    assert config.defaults.reaper_ttl_s == 7800
+    assert "below the safe floor" not in caplog.text
+
+
+def test_reaper_ttl_constraint_is_stated_once() -> None:
+    import inspect
+
+    from mimir.worklink.backends.registry import minimum_reaper_ttl_s
+
+    floor_source = inspect.getsource(minimum_reaper_ttl_s)
+    validation_source = inspect.getsource(WorklinkDefaults.validate)
+    reaper_source = inspect.getsource(autonomy.reap_stale_claims_for_home)
+    assert (floor_source + validation_source + reaper_source).count(
+        "return 2 * timeout_s"
+    ) == 1
+
+
+def test_config_load_validates_the_complete_defaults_object(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("MIMIR_FACTORY_RUN_TIMEOUT_S", "1800")
+    _write_worklink_yaml(tmp_path, max_concurrent=7, timeout_s=1800, reaper_ttl_s=3600)
+    validated: list[WorklinkDefaults] = []
+    original_validate = WorklinkDefaults.validate
+
+    def capture(defaults: WorklinkDefaults) -> None:
+        validated.append(defaults)
+        original_validate(defaults)
+
+    monkeypatch.setattr(WorklinkDefaults, "validate", capture)
+    config = WorklinkConfig.load(tmp_path / "worklink.yaml")
+
+    assert config.defaults in validated
+    assert config.defaults.max_concurrent == 7
+    assert config.defaults.timeout_s == 1800
+    assert config.defaults.reaper_ttl_s == 3600
 
 
 # ── worklink_run tool: arbiter shed (TIGHT) + cap + dispatch ────────
@@ -747,6 +1008,30 @@ async def test_worklink_run_skips_at_cap(_tool_env, monkeypatch: pytest.MonkeyPa
 
 
 @pytest.mark.asyncio
+async def test_worklink_run_leaf_cap_excludes_epic_locks(
+    _tool_env, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    registry, dispatched, _repo = _tool_env
+    registry.set_arbiter(_FakeArbiter(fire=True))
+    fake = FakeChainlink(active_locks=[100, 200], epic_ids={100})
+    claims = ChainlinkClaims(agent_id="t", runner=fake)
+    monkeypatch.setattr(
+        autonomy,
+        "check_concurrency",
+        lambda home, **_: check_concurrency(home, claims=claims),
+    )
+
+    allowed = await registry.worklink_run.ainvoke({"issue_id": 443})
+    assert "completed" in allowed
+    assert [item["issue_id"] for item in dispatched] == [443]
+
+    fake.active_locks = [100, 200, 201]
+    blocked = await registry.worklink_run.ainvoke({"issue_id": 444})
+    assert "concurrency cap reached (2/2 active claims)" in blocked
+    assert [item["issue_id"] for item in dispatched] == [443]
+
+
+@pytest.mark.asyncio
 async def test_worklink_run_fails_closed_when_cap_unreadable(_tool_env, monkeypatch: pytest.MonkeyPatch) -> None:
     registry, dispatched, _repo = _tool_env
     registry.set_arbiter(_FakeArbiter(fire=True))
@@ -783,7 +1068,7 @@ def _fake_chainlink_script(
     *,
     ready: list[int],
     epics: list[int] | None = None,
-    blocked_epics: list[int] | None = None,
+    blocked: list[int] | None = None,
     review_epics: list[int] | None = None,
     parents: dict[int, int] | None = None,
     in_progress: list[int] | None = None,
@@ -798,7 +1083,7 @@ def _fake_chainlink_script(
         "a = sys.argv[1:]\n"
         f"ready = {ready!r}\n"
         f"epics = {(epics or [])!r}\n"
-        f"blocked_epics = {(blocked_epics or [])!r}\n"
+        f"blocked = {(blocked or [])!r}\n"
         f"review_epics = {(review_epics or [])!r}\n"
         f"parents = {(parents or {})!r}\n"
         f"actionable = {(ready if actionable is None else actionable)!r}\n"
@@ -812,7 +1097,7 @@ def _fake_chainlink_script(
         "    sys.exit(0)\n"
         "if a[:2] == ['issue','list']:\n"
         "    label = a[a.index('--label')+1] if '--label' in a else ''\n"
-        "    ids = epics if label=='worklink:epic' else blocked_epics if label=='worklink:blocked' else review_epics if label=='worklink:review' else inprog if label=='worklink:in-progress' else ready if label=='worklink:ready' else []\n"
+        "    ids = epics if label=='worklink:epic' else blocked if label=='worklink:blocked' else review_epics if label=='worklink:review' else inprog if label=='worklink:in-progress' else ready if label=='worklink:ready' else []\n"
         "    print(json.dumps([{'id': i, 'parent_id': parents.get(i)} for i in ids]))\n"
         "sys.exit(0)\n",
         encoding="utf-8",
@@ -897,6 +1182,7 @@ def _fake_run_bin(tmp: Path) -> Path:
         "finally:\n"
         "    os.close(devnull)\n"
         f"open({str(pids)!r}, 'a', encoding='utf-8').write(str(os.getpid()) + '\\n')\n"
+        f"open({str(tmp / 'coding-enabled.txt')!r}, 'a', encoding='utf-8').write(os.environ.get('MIMIR_CODING_ENABLED', '<unset>') + '\\n')\n"
         f"open({str(record)!r}, 'a', encoding='utf-8').write(' '.join(sys.argv[1:]) + '\\n')\n",
         encoding="utf-8",
     )
@@ -976,18 +1262,43 @@ def _live_pids(pids: list[int]) -> list[int]:
     return live
 
 
+def _load_poller_module():
+    spec = importlib.util.spec_from_file_location("chainlink_orchestrator_poller_under_test", POLLER)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    try:
+        spec.loader.exec_module(module)
+    except Exception:
+        sys.modules.pop(spec.name, None)
+        raise
+    return module
+
+
 def _run_poller(tmp: Path, env_extra: dict[str, str]) -> list[dict]:
     env = {k: v for k, v in os.environ.items() if k not in {
         "WORKLINK_REPO", "WORKLINK_RUN_BIN", "WORKLINK_MAX_CONCURRENT", "CHAINLINK_BIN",
-        "MIMIR_FACTORY_EPICS_ENABLED",
+        "MIMIR_CODING_ENABLED", "MIMIR_FACTORY_EPICS_ENABLED",
     }}
     env.update(env_extra)
-    proc = subprocess.run(
+    proc = subprocess.Popen(
         [sys.executable, str(POLLER)], cwd=str(tmp), env=env,
-        capture_output=True, text=True, timeout=30,
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
     )
-    assert proc.returncode == 0, proc.stderr
-    events = [json.loads(line) for line in proc.stdout.splitlines() if line.strip()]
+    assert proc.stdout is not None
+    events = []
+    for line in proc.stdout:
+        if not line.strip():
+            continue
+        event = json.loads(line)
+        events.append(event)
+        if event.get("delivery_barrier") is True:
+            _write_delivery_receipt(
+                dispatch_failure_state_dir(Path(env["MIMIR_HOME"])),
+                event.get("delivery_key"),
+            )
+    _, stderr = proc.communicate(timeout=30)
+    assert proc.returncode == 0, stderr
     expected_fake_runs = sum(1 for event in events if event.get("signal") == "worklink_dispatched")
     _wait_for_fake_run_bin_exit(tmp, expected_fake_runs)
     return events
@@ -1129,14 +1440,45 @@ def test_poller_dispatches_up_to_free_slots(tmp_path: Path) -> None:
     assert scan["ready_count"] == 3 and scan["active"] == 1 and scan["dispatched"] == 1
 
 
+@pytest.mark.parametrize(
+    ("configured", "effective"),
+    [("true", True), ("false", False), (None, False)],
+)
+def test_poller_dispatch_reports_and_propagates_coding_state(
+    tmp_path: Path, configured: str | None, effective: bool
+) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    env = {
+        "MIMIR_HOME": str(home),
+        "CHAINLINK_BIN": str(_fake_chainlink_script(tmp_path, ready=[201], active_locks=[])),
+        "WORKLINK_RUN_BIN": sys.executable + " " + str(_fake_run_bin(tmp_path)),
+        "WORKLINK_REPO": str(home),
+        "WORKLINK_MAX_CONCURRENT": "1",
+        "STATE_DIR": str(tmp_path / "state"),
+    }
+    if configured is not None:
+        env["MIMIR_CODING_ENABLED"] = configured
+
+    events = _run_poller(tmp_path, env)
+
+    dispatched = [event for event in events if event.get("signal") == "worklink_dispatched"]
+    assert len(dispatched) == 1
+    assert dispatched[0]["coding_enabled"] is effective
+    inherited = (tmp_path / "coding-enabled.txt").read_text(encoding="utf-8").splitlines()
+    assert inherited == [configured if configured is not None else "<unset>"]
+
+
 def test_poller_failure_escalation_dedupes_by_signature_and_recovers(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     home = tmp_path / "home"
     home.mkdir()
     repo = tmp_path / "repo"
     repo.mkdir()
-    state_dir = tmp_path / "state"
+    state_dir = dispatch_failure_state_dir(home)
+    ambient_state_dir = tmp_path / "injected-state" / "different-poller"
     log_path = state_dir / "run-201.log"
     chainlink = _fake_chainlink_script(tmp_path, ready=[201], active_locks=[])
     runbin = _fake_run_bin(tmp_path)
@@ -1146,37 +1488,73 @@ def test_poller_failure_escalation_dedupes_by_signature_and_recovers(
         "WORKLINK_RUN_BIN": sys.executable + " " + str(runbin),
         "WORKLINK_REPO": str(repo),
         "WORKLINK_MAX_CONCURRENT": "1",
-        "STATE_DIR": str(state_dir),
+        "STATE_DIR": str(ambient_state_dir),
+        "POLLER_NAME": "different-poller",
     }
-    record_failure(
-        state_dir,
+    monkeypatch.setenv("STATE_DIR", str(ambient_state_dir))
+    monkeypatch.setenv("POLLER_NAME", "different-poller")
+    monkeypatch.setenv("WORKLINK_RUN_LOG", str(log_path))
+    orchestrator._record_run_failure(
+        home=home,
         issue_id=201,
         attempt=None,
         exit_status=1,
         error="ValueError: bad config token=top-secret",
-        log_path=str(log_path),
+        autonomous=True,
     )
 
-    first = _run_poller(tmp_path, env)
+    failed_tick = tmp_path / "failed-poller-tick.py"
+    failed_tick.write_text(
+        "import runpy\n"
+        "try:\n"
+        f"    runpy.run_path({str(POLLER)!r}, run_name='__main__')\n"
+        "except SystemExit:\n"
+        "    pass\n"
+        "raise SystemExit(1)\n",
+        encoding="utf-8",
+    )
+    failed = subprocess.run(
+        [sys.executable, str(failed_tick)],
+        cwd=tmp_path,
+        env={**os.environ, **env, "POLLER_TIMEOUT_SECONDS": "10.1"},
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=30,
+    )
+    assert failed.returncode == 1
+    first = [json.loads(line) for line in failed.stdout.splitlines() if line.strip()]
     alerts = [e for e in first if e.get("signal") == "worklink_run_failure_escalated"]
     assert len(alerts) == 1
     assert alerts[0]["issue_id"] == 201
     assert alerts[0]["log"] == str(log_path)
     assert alerts[0]["terminal_error"] == "ValueError: bad config token=[REDACTED]"
     assert alerts[0]["source_id"].endswith(alerts[0]["error_signature"])
+    assert alerts[0]["poller"] == "worklink-ready-queue"
     assert not [e for e in first if e.get("signal") == "worklink_dispatched"]
+    assert not ambient_state_dir.exists()
+    assert load_failure_state(state_dir)["issues"]["201"]["notified_signatures"] == []
 
     second = _run_poller(tmp_path, env)
-    assert not [e for e in second if e.get("signal") == "worklink_run_failure_escalated"]
+    retried = [e for e in second if e.get("signal") == "worklink_run_failure_escalated"]
+    assert len(retried) == 1
+    assert retried[0]["delivery_key"] == alerts[0]["delivery_key"]
+    assert load_failure_state(state_dir)["issues"]["201"]["notified_signatures"] == [
+        retried[0]["error_signature"]
+    ]
+
+    _write_delivery_receipt(state_dir, alerts[0]["delivery_key"])
+    delivered = _run_poller(tmp_path, env)
+    assert not [e for e in delivered if e.get("signal") == "worklink_run_failure_escalated"]
     assert not [e for e in second if e.get("signal") == "worklink_dispatched"]
 
-    record_failure(
-        state_dir,
+    orchestrator._record_run_failure(
+        home=home,
         issue_id=201,
         attempt=None,
         exit_status=1,
         error="RuntimeError: a distinct failure",
-        log_path=str(log_path),
+        autonomous=True,
     )
     distinct = _run_poller(tmp_path, env)
     distinct_alerts = [
@@ -1184,12 +1562,237 @@ def test_poller_failure_escalation_dedupes_by_signature_and_recovers(
     ]
     assert len(distinct_alerts) == 1
     assert distinct_alerts[0]["terminal_error"] == "RuntimeError: a distinct failure"
+    _write_delivery_receipt(state_dir, distinct_alerts[0]["delivery_key"])
 
     state = load_failure_state(state_dir)
     state["issues"]["201"]["retry_after"] = (datetime.now(UTC) - timedelta(seconds=1)).isoformat()
     save_failure_state(state_dir, state)
     recovered = _run_poller(tmp_path, env)
     assert [e["issue_id"] for e in recovered if e.get("signal") == "worklink_dispatched"] == [201]
+
+
+def test_poller_dispatches_only_after_failure_alert_is_durably_acked(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Dispatch-before-ack reintroduces #1361 and must fail this named test."""
+    home = tmp_path / "home"
+    home.mkdir()
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    monkeypatch.setenv("WORKLINK_REPO", str(repo))
+    poller = _load_poller_module()
+    alert = {
+        "signal": "worklink_run_failure_escalated",
+        "issue_id": 201,
+        "error_signature": "failed-201",
+        "failure_occurrence_id": "occurrence-201",
+    }
+    order: list[str] = []
+    receipt = False
+
+    monkeypatch.setattr(poller, "BackendRegistry", lambda _config: None)
+    monkeypatch.setattr(poller.WorklinkConfig, "load", lambda _path: object())
+    monkeypatch.setattr(poller, "pending_failure_alerts", lambda _state: ({201}, [alert]))
+
+    def emit(event: dict) -> None:
+        nonlocal receipt
+        if event.get("signal") == "worklink_run_failure_escalated":
+            order.append("alert-emitted")
+            assert event["delivery_barrier"] is True
+            receipt = True
+
+    monkeypatch.setattr(poller, "_emit", emit)
+    monkeypatch.setattr(
+        poller, "delivery_receipt_exists", lambda _state, _key: receipt
+    )
+    monkeypatch.setattr(
+        poller,
+        "mark_failure_notified",
+        lambda *_args: order.append("alert-durably-acked"),
+    )
+    monkeypatch.setattr(poller, "consume_worklink_budget_continuations", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(
+        poller,
+        "_active_lock_issue_ids",
+        lambda _home: order.append("ready-scan") or set(),
+    )
+    monkeypatch.setattr(
+        poller,
+        "_worklink_dispatch_plan",
+        lambda *_args, **_kwargs: (
+            [poller.DispatchItem(201, "leaf"), poller.DispatchItem(202, "leaf")],
+            2,
+            0,
+            0,
+            set(),
+        ),
+    )
+    monkeypatch.setattr(poller, "_configured_cap", lambda _home: 2)
+    monkeypatch.setattr(poller, "factory_max_concurrent", lambda: 1)
+    monkeypatch.setattr(
+        poller,
+        "_dispatch",
+        lambda **kwargs: order.append(f"dispatch-{kwargs['item'].issue_id}") or True,
+    )
+
+    assert poller.main() == 0
+    assert order == [
+        "alert-emitted",
+        "alert-durably-acked",
+        "ready-scan",
+        "dispatch-202",
+    ]
+
+
+def test_poller_reports_scan_when_alert_delivery_leaves_insufficient_budget(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    poller = _load_poller_module()
+    alert = {
+        "signal": "worklink_run_failure_escalated",
+        "issue_id": 201,
+        "error_signature": "failed-201",
+        "failure_occurrence_id": "occurrence-201",
+    }
+    events: list[dict] = []
+    receipt = False
+
+    class SpentAfterDelivery:
+        def hard_exhausted(self) -> bool:
+            return False
+
+        def hard_remaining(self) -> float:
+            return 1.0
+
+        def affords_ready_scan(self) -> bool:
+            return False
+
+    monkeypatch.setattr(poller, "TickBudget", SpentAfterDelivery)
+    monkeypatch.setattr(poller, "BackendRegistry", lambda _config: None)
+    monkeypatch.setattr(poller.WorklinkConfig, "load", lambda _path: object())
+    monkeypatch.setattr(poller, "pending_failure_alerts", lambda _state: ({201}, [alert]))
+
+    def emit(event: dict) -> None:
+        nonlocal receipt
+        events.append(event.copy())
+        if event.get("signal") == "worklink_run_failure_escalated":
+            receipt = True
+
+    monkeypatch.setattr(poller, "_emit", emit)
+    monkeypatch.setattr(poller, "delivery_receipt_exists", lambda _state, _key: receipt)
+    monkeypatch.setattr(poller, "mark_failure_notified", lambda *_args: None)
+    monkeypatch.setattr(poller, "consume_worklink_budget_continuations", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(
+        poller,
+        "_active_lock_issue_ids",
+        lambda _home: pytest.fail("ready scan started without enough budget"),
+    )
+
+    assert poller.main() == 0
+    assert [event["signal"] for event in events] == [
+        "worklink_run_failure_escalated",
+        "worklink_ready_scan",
+    ]
+    assert events[-1]["dispatched"] == 0
+    assert "insufficient tick budget" in events[-1]["reason"]
+
+
+def test_epic_dispatch_backoff_prevents_attempt_each_poll_cycle(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    state_dir = dispatch_failure_state_dir(home)
+    record_failure(
+        state_dir,
+        issue_id=100,
+        attempt=1,
+        exit_status=1,
+        error="deterministic epic failure",
+        log_path=None,
+    )
+    env = {
+        "MIMIR_HOME": str(home),
+        "CHAINLINK_BIN": str(
+            _fake_chainlink_script(
+                tmp_path,
+                ready=[100],
+                epics=[100],
+                actionable=[100],
+                active_locks=[],
+            )
+        ),
+        "WORKLINK_RUN_BIN": sys.executable + " " + str(_fake_run_bin(tmp_path)),
+        "WORKLINK_REPO": str(repo),
+        "MIMIR_FACTORY_EPICS_ENABLED": "true",
+    }
+
+    first = _run_poller(tmp_path, env)
+    second = _run_poller(tmp_path, env)
+
+    assert not [event for event in first if event.get("signal") == "worklink_dispatched"]
+    assert not [event for event in second if event.get("signal") == "worklink_dispatched"]
+    assert not (tmp_path / "dispatched.txt").exists()
+
+
+def test_poller_stops_after_emitting_when_later_failure_ack_errors(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    poller = _load_poller_module()
+    first = {
+        "signal": "worklink_run_failure_escalated",
+        "issue_id": 201,
+        "error_signature": "first-signature",
+        "failure_occurrence_id": "first-occurrence",
+    }
+    second = {
+        "signal": "worklink_run_failure_escalated",
+        "issue_id": 202,
+        "error_signature": "second-signature",
+        "failure_occurrence_id": "second-occurrence",
+    }
+    emitted: list[dict] = []
+    continuation_called = False
+
+    monkeypatch.setattr(poller, "pending_failure_alerts", lambda _state_dir: ({201, 202}, [first, second]))
+    monkeypatch.setattr(
+        poller,
+        "delivery_receipt_exists",
+        lambda _state_dir, key: key.endswith("second-signature:second-occurrence"),
+    )
+    monkeypatch.setattr(
+        poller,
+        "mark_failure_notified",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("ack failed")),
+    )
+    monkeypatch.setattr(poller, "_emit", lambda event: emitted.append(event.copy()))
+
+    def consume(*_args, **_kwargs):
+        nonlocal continuation_called
+        continuation_called = True
+        return []
+
+    monkeypatch.setattr(poller, "consume_worklink_budget_continuations", consume)
+
+    assert poller.main() == 0
+    assert [event["signal"] for event in emitted] == [
+        "worklink_run_failure_escalated",
+        "worklink_dispatch_failure_state_error",
+        "worklink_ready_scan",
+    ]
+    assert emitted[0]["delivery_key"].endswith("first-signature:first-occurrence")
+    assert "not acknowledged" in emitted[-1]["reason"]
+    assert continuation_called is False
 
 
 def test_failure_alert_is_not_deduped_until_delivery_is_recorded(tmp_path: Path) -> None:
@@ -1333,9 +1936,8 @@ def test_poller_does_not_dispatch_worklink_epic_issues(tmp_path: Path) -> None:
 
 
 @pytest.mark.skipif(not POLLER.exists(), reason="poller not present")
-def test_poller_dispatches_epic_when_factory_epics_enabled(tmp_path: Path) -> None:
-    """chainlink #833: with MIMIR_FACTORY_EPICS_ENABLED set, an actionable epic is
-    dispatched to the feature-factory via run-epic (mode='epic'), not as a leaf."""
+def test_poller_dispatches_only_ready_epic_when_factory_epics_enabled(tmp_path: Path) -> None:
+    """The ready label arms epic dispatch just as it arms leaf dispatch."""
     home = tmp_path / "home"
     home.mkdir()
     repo = tmp_path / "repo"
@@ -1343,8 +1945,8 @@ def test_poller_dispatches_epic_when_factory_epics_enabled(tmp_path: Path) -> No
     chainlink = _fake_chainlink_script(
         tmp_path,
         ready=[100],
-        epics=[100],
-        actionable=[100],
+        epics=[100, 101],
+        actionable=[100, 101],
         active_locks=[],
     )
     runbin = _fake_run_bin(tmp_path)
@@ -1363,6 +1965,47 @@ def test_poller_dispatches_epic_when_factory_epics_enabled(tmp_path: Path) -> No
     assert len(dispatched) == 1
     assert dispatched[0]["issue_id"] == 100
     assert dispatched[0]["mode"] == "epic"
+    assert 101 not in [event.get("issue_id") for event in dispatched]
+
+
+@pytest.mark.skipif(not POLLER.exists(), reason="poller not present")
+def test_poller_excludes_worklink_blocked_from_leaf_and_epic_dispatch(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    chainlink = _fake_chainlink_script(
+        tmp_path,
+        ready=[100, 101, 200, 201],
+        epics=[100, 101],
+        blocked=[100, 200],
+        actionable=[100, 101, 200, 201],
+        active_locks=[],
+    )
+    runbin = _fake_run_bin(tmp_path)
+
+    events = _run_poller(tmp_path, {
+        "MIMIR_HOME": str(home),
+        "CHAINLINK_BIN": str(chainlink),
+        "WORKLINK_RUN_BIN": sys.executable + " " + str(runbin),
+        "WORKLINK_REPO": str(repo),
+        "WORKLINK_MAX_CONCURRENT": "3",
+        "STATE_DIR": str(tmp_path / "state"),
+        "MIMIR_FACTORY_EPICS_ENABLED": "true",
+    })
+
+    dispatched = [
+        (event["mode"], event["issue_id"])
+        for event in events
+        if event.get("signal") == "worklink_dispatched"
+    ]
+    assert dispatched == [("leaf", 201), ("epic", 101)]
+    scan = [
+        event for event in events if event.get("signal") == "worklink_ready_scan"
+    ][-1]
+    assert scan["labeled_ready_count"] == 4
+    assert scan["blocked_ready_count"] == 0
+    assert scan["label_blocked_ready_count"] == 2
 
 
 def test_poller_keeps_bare_ready_leaf_on_per_leaf_run(tmp_path: Path) -> None:

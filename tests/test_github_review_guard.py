@@ -11,6 +11,7 @@ from types import SimpleNamespace
 import pytest
 from langchain.agents.middleware import ToolCallRequest
 from langchain_core.messages import ToolMessage
+from langchain_core.tools import ToolException
 from langgraph.runtime import Runtime
 
 from mimir.tools import github_review_guard as guard
@@ -211,9 +212,32 @@ async def test_unparseable_review_is_refused_by_sync_and_async_middleware(
     is_async: bool,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    from mimir._context import reset_current_turn, set_current_turn
     from mimir.tools import budget_gate
 
+    tool_calls: list[dict[str, object]] = []
+    outcomes: list[tuple[str, str]] = []
+    label_merges: list[object] = []
+    original_record_outcome = budget_gate._record_tool_outcome
     monkeypatch.setattr(budget_gate, "_emit_event_sync", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        budget_gate,
+        "_emit_tool_call_sync",
+        lambda _tool, **fields: tool_calls.append(fields),
+    )
+    monkeypatch.setattr(
+        budget_gate,
+        "_record_tool_outcome",
+        lambda tool, *, refused_reason="": (
+            outcomes.append((tool, refused_reason)),
+            original_record_outcome(tool, refused_reason=refused_reason),
+        )[-1],
+    )
+    monkeypatch.setattr(
+        budget_gate,
+        "_merge_result_labels",
+        lambda _auth, labels: label_merges.append(labels),
+    )
     monkeypatch.setattr(
         budget_gate, "_request_for_authorized_execution", lambda request, *_: request,
     )
@@ -221,18 +245,49 @@ async def test_unparseable_review_is_refused_by_sync_and_async_middleware(
         "gh pr review 152 --approve --unknown value",
         tool_call_id="unparseable",
     )
-
-    with pytest.raises(ToolPolicyRefusal, match="unrecognised option --unknown"):
+    turn = SimpleNamespace(
+        turn_id=f"unparseable-{'async' if is_async else 'sync'}",
+        session_id=None,
+        channel_id=None,
+        auth_context=request.runtime.context,
+        hard_boundary_denials=[],
+        remediation_effects=[],
+    )
+    token = set_current_turn(turn)
+    try:
         if is_async:
             async def async_handler(_request: ToolCallRequest) -> ToolMessage:
                 pytest.fail("refused handler was executed")
 
-            await budget_gate.BudgetGateMiddleware().awrap_tool_call(request, async_handler)
+            result = await budget_gate.BudgetGateMiddleware().awrap_tool_call(
+                request, async_handler,
+            )
         else:
-            budget_gate.BudgetGateMiddleware().wrap_tool_call(
+            result = budget_gate.BudgetGateMiddleware().wrap_tool_call(
                 request,
                 lambda _request: pytest.fail("refused handler was executed"),
             )
+    finally:
+        reset_current_turn(token)
+
+    assert result.status == "error"
+    assert "unrecognised option --unknown" in str(result.content)
+    assert outcomes == [("shell_exec", str(result.content))]
+    assert len(tool_calls) == 1
+    assert tool_calls[0]["denied"] is True
+    assert tool_calls[0]["ok"] is False
+    assert len(label_merges) == 1
+    assert turn.hard_boundary_denials == [{
+        "tool": "shell_exec",
+        "boundary": "tool_policy",
+        "reason": str(result.content),
+    }]
+    attempt_disposition = (
+        "exempt_hard_refusal"
+        if turn.hard_boundary_denials and not turn.remediation_effects
+        else "charge"
+    )
+    assert attempt_disposition == "exempt_hard_refusal"
 
 
 @pytest.mark.parametrize(
@@ -292,6 +347,40 @@ def test_direct_argv_remains_authoritative_for_compound_command() -> None:
     assert spec == guard.ReviewSubmission(
         "/usr/bin/gh", "o/r", 152, "APPROVED", None,
     )
+
+
+def test_guard_probe_uses_server_gh_and_direct_exec_environment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runs: list[tuple[list[str], dict[str, object]]] = []
+    env = {"PATH": "/usr/bin", "GH_CONFIG_DIR": "/isolated"}
+    monkeypatch.setattr(
+        guard,
+        "direct_exec_env",
+        lambda argv: env if argv == ["gh"] else pytest.fail(str(argv)),
+    )
+    monkeypatch.setattr(
+        guard.subprocess,
+        "run",
+        lambda argv, **kwargs: (
+            runs.append((argv, kwargs))
+            or SimpleNamespace(returncode=0, stdout="ok")
+        ),
+    )
+    spec = guard.ReviewSubmission(
+        "/tmp/model-controlled/gh", "o/r", 152, "APPROVED", "/repo",
+    )
+
+    guard._run(spec, ["api", "user"])
+
+    assert runs == [(["gh", "api", "user"], {
+        "capture_output": True,
+        "text": True,
+        "timeout": 15,
+        "cwd": "/repo",
+        "env": env,
+        "stdin": guard.subprocess.DEVNULL,
+    })]
 
 
 def test_non_review_direct_argv_is_not_refused() -> None:
@@ -499,7 +588,7 @@ def test_review_claim_lock_timeout_refuses_instead_of_proceeding(
     monkeypatch.setattr(guard, "_LOCK_ACQUIRE_TIMEOUT_SECONDS", 0.01)
 
     try:
-        with pytest.raises(ToolPolicyRefusal, match="timed out waiting"):
+        with pytest.raises(ToolException, match="timed out waiting"):
             guard.claim_review_submission(
                 guard.ReviewSubmission("gh", "o/r", 152, "APPROVED", None),
             )
@@ -616,7 +705,7 @@ async def test_async_wrap_releases_review_claim_when_cancelled_in_prologue(
             handler,
         )
 
-    assert len(releases) == 1
+    assert releases == [None]
 
 
 def test_multi_target_result_labels_use_operative_authorization(
@@ -698,6 +787,61 @@ def test_wrap_tool_call_duplicate_release_remains_idempotent(
     assert called is False
     assert result.status == "success"
     assert lock.releases == 1
+
+
+@pytest.mark.parametrize("is_async", [False, True])
+@pytest.mark.asyncio
+async def test_duplicate_review_uses_common_audit_and_label_tail(
+    is_async: bool,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from mimir.tools import budget_gate
+
+    claim = guard.ReviewClaim(
+        "o/r", 152, "head-1", "mimir-carreira", "APPROVED", True,
+    )
+    tool_calls: list[dict[str, object]] = []
+    outcomes: list[str] = []
+    label_merges: list[object] = []
+    monkeypatch.setattr(guard, "claim_review_submission", lambda spec: claim)
+    monkeypatch.setattr(budget_gate, "_emit_event_sync", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        budget_gate,
+        "_emit_tool_call_sync",
+        lambda _tool, **fields: tool_calls.append(fields),
+    )
+    monkeypatch.setattr(
+        budget_gate,
+        "_record_tool_outcome",
+        lambda tool, **_kwargs: outcomes.append(tool),
+    )
+    monkeypatch.setattr(
+        budget_gate,
+        "_merge_result_labels",
+        lambda _auth, labels: label_merges.append(labels),
+    )
+    request = _tool_request(
+        "gh pr review 152 --repo o/r --approve", tool_call_id="duplicate-tail",
+    )
+
+    if is_async:
+        async def async_handler(_request: ToolCallRequest) -> ToolMessage:
+            pytest.fail("duplicate handler was executed")
+
+        result = await budget_gate.BudgetGateMiddleware().awrap_tool_call(
+            request, async_handler,
+        )
+    else:
+        result = budget_gate.BudgetGateMiddleware().wrap_tool_call(
+            request,
+            lambda _request: pytest.fail("duplicate handler was executed"),
+        )
+
+    assert result.status == "success"
+    assert outcomes == ["shell_exec"]
+    assert len(label_merges) == 1
+    assert len(tool_calls) == 1
+    assert tool_calls[0]["ok"] is True
 
 
 def test_wrap_tool_call_serves_service_refusal_before_review_detection(

@@ -17,6 +17,7 @@ import sys
 from typing import Any, Callable, Sequence
 
 from .._rmtree import rmtree_missing_ok
+from ..coding import coding_enabled
 from .identities import get_identities
 
 Runner = Callable[[Sequence[str]], subprocess.CompletedProcess[str]]
@@ -25,16 +26,26 @@ EventLogger = Callable[..., None]
 _ENABLED_CHECKOUT_ROOT = Path("/var/lib/mimir-worklink/checkouts")
 _REPO_TEST_CHECKOUT_ROOT = Path("/var/lib/mimir-worklink/repo-test-checkouts")
 _OPENCODE_CHECKOUT_ROOT = Path("/var/lib/mimir-worklink/opencode-checkouts")
-_ENABLED_VALUES = frozenset({"1", "true", "yes", "on"})
 _AUTHORIZATION_FACTORY = object()
-
-
-def coding_enabled() -> bool:
-    return os.environ.get("MIMIR_CODING_ENABLED", "").strip().lower() in _ENABLED_VALUES
+_DIRTY_PATH_SAMPLE_LIMIT = 20
 
 
 def _default_runner(args: Sequence[str]) -> subprocess.CompletedProcess[str]:
     return subprocess.run(args, capture_output=True, text=True, check=False)
+
+
+def _assert_base_separate_from_controller(repo: Path) -> None:
+    """Refuse a build base that overlaps an explicitly declared source checkout."""
+    source_raw = os.environ.get("MIMIR_SOURCE_DIR", "").strip()
+    if not source_raw:
+        return
+    base = repo.resolve()
+    source = Path(source_raw).resolve()
+    if base == source or base.is_relative_to(source) or source.is_relative_to(base):
+        raise RuntimeError(
+            "Worklink base repository overlaps the running controller source: "
+            f"WORKLINK_REPO={base}, MIMIR_SOURCE_DIR={source}; provision a dedicated base clone"
+        )
 
 
 @dataclass(frozen=True)
@@ -71,6 +82,7 @@ def create_worktree(
     runner: Runner = _default_runner,
 ) -> CheckoutLease:
     """Create an attempt-scoped branch/worktree from a fresh base ref."""
+    _assert_base_separate_from_controller(repo)
     path = repo / worklink_dir / f"{issue_id}-{attempt}"
     branch = f"issue/{issue_id}-a{attempt}"
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -446,6 +458,7 @@ def create_isolated_checkout(
     issue_id: int,
     attempt: int,
     base: str = "main",
+    checkout_branch: str | None = None,
     worklink_dir: str = ".worklink",
     base_fetch: bool = True,
     event_logger: EventLogger | None = None,
@@ -465,19 +478,15 @@ def create_isolated_checkout(
     depend on an object directory under the scratch janitor's swept roots.
     """
 
-    enabled = coding_enabled() and worker_eligible
-    identities = get_identities() if enabled else None
+    _assert_base_separate_from_controller(repo)
+
+    worker_accessible = coding_enabled() and worker_eligible
+    identities = get_identities() if worker_accessible else None
     path = _isolated_checkout_path(
-        repo, worklink_dir, issue_id, attempt, worker_authorized=enabled
+        repo, worklink_dir, issue_id, attempt, worker_authorized=False
     )
-    branch = f"issue/{issue_id}-a{attempt}"
+    branch = checkout_branch or f"issue/{issue_id}-a{attempt}"
     path.parent.mkdir(parents=True, exist_ok=True)
-    if identities is not None:
-        repo_parent = path.parent.parent
-        os.chown(repo_parent, identities.mimir_uid, identities.worklink_gid)
-        os.chmod(repo_parent, 0o710)
-        os.chown(path.parent, identities.mimir_uid, identities.worklink_gid)
-        os.chmod(path.parent, 0o700)
     if path.exists():
         raise RuntimeError(f"attempt checkout already exists: {path}")
 
@@ -501,10 +510,10 @@ def create_isolated_checkout(
         )
     wanted_push_target = parent_push.stdout.strip()
 
-    previous_umask = os.umask(0o007) if enabled else None
+    previous_umask = os.umask(0o007) if worker_accessible else None
     try:
         _clone_attempt_checkout(
-            repo, path, runner=runner, event_logger=event_logger, no_hardlinks=enabled
+            repo, path, runner=runner, event_logger=event_logger, no_hardlinks=worker_accessible
         )
     finally:
         if previous_umask is not None:
@@ -546,9 +555,11 @@ def create_isolated_checkout(
     authorization = None
     try:
         _assert_self_contained_checkout(path, runner=runner)
-        if enabled:
-            relative_path = path.relative_to(_ENABLED_CHECKOUT_ROOT)
-            checkout_fd = _open_worklink_checkout(relative_path)
+        if worker_accessible:
+            checkout_fd = os.open(
+                path,
+                os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0),
+            )
             try:
                 assert identities is not None
                 _normalize_checkout_fd(
@@ -556,11 +567,8 @@ def create_isolated_checkout(
                     owner_uid=identities.mimir_uid,
                     group_gid=identities.worklink_gid,
                 )
-                authorization = _mint_checkout_authorization(path, issue_id, attempt, checkout_fd)
-                checkout_fd = -1
             finally:
-                if checkout_fd >= 0:
-                    os.close(checkout_fd)
+                os.close(checkout_fd)
     except (OSError, RuntimeError):
         shutil.rmtree(path, ignore_errors=True)
         raise
@@ -574,7 +582,7 @@ def create_isolated_checkout(
         base_ref=base,
         local_base=local_base,
         isolated_checkout=True,
-        worker_authorized=enabled,
+        worker_authorized=False,
         authorization=authorization,
     )
 
@@ -636,26 +644,147 @@ def _prepare_fresh_base(
     """Return a fetched, locally resolvable base that contains origin's fetched tip."""
     if not base_fetch:
         raise RuntimeError("base repo fetch is disabled; refusing to build on an unverified base")
+    _assert_base_repo_clean(repo, runner=runner, event_logger=event_logger)
     _repair_base_alternates(repo, base=base, runner=runner, event_logger=event_logger)
     if not _fetch_base_from_origin(repo, base, runner=runner, event_logger=event_logger):
         raise RuntimeError(f"base repo fetch failed for origin/{base.removeprefix('origin/')}")
 
-    start_point = _resolve_local_base(repo, base.removeprefix("origin/"), prefer_origin=True, runner=runner)
+    remote_base = base.removeprefix("origin/")
+    fetched_ref = f"origin/{remote_base}"
+    fetched = runner(["git", "-C", str(repo), "rev-parse", "--verify", fetched_ref])
+    if fetched.returncode != 0 or not fetched.stdout.strip():
+        raise RuntimeError(f"fetched base tip is not resolvable as {fetched_ref}")
+    fetched_tip = fetched.stdout.strip()
+    start_point = _resolve_local_base(repo, remote_base, prefer_origin=True, runner=runner)
     fresh = runner(
-        ["git", "-C", str(repo), "merge-base", "--is-ancestor", "FETCH_HEAD", start_point]
+        ["git", "-C", str(repo), "merge-base", "--is-ancestor", fetched_tip, start_point]
     )
     if fresh.returncode == 0:
         return start_point
 
     local_sha = _rev_parse_for_error(repo, start_point, runner=runner)
-    origin_sha = _rev_parse_for_error(repo, "FETCH_HEAD", runner=runner)
     behind = runner(
-        ["git", "-C", str(repo), "rev-list", "--count", f"{start_point}..FETCH_HEAD"]
+        ["git", "-C", str(repo), "rev-list", "--count", f"{start_point}..{fetched_tip}"]
     )
     count = behind.stdout.strip() if behind.returncode == 0 and behind.stdout.strip() else "unknown"
     raise RuntimeError(
-        f"stale base {local_sha}, origin {origin_sha}, {count} commits behind"
+        f"stale base {local_sha}, {fetched_ref} {fetched_tip}, {count} commits behind"
     )
+
+
+def _assert_base_repo_clean(
+    repo: Path,
+    *,
+    runner: Runner,
+    event_logger: EventLogger | None,
+) -> None:
+    """Refuse a base with foreign content, without changing any of it."""
+    try:
+        owner_uid = repo.stat().st_uid
+    except OSError as exc:
+        _refuse_base_repo(repo, event_logger, reason="owner_check_failed", detail=str(exc))
+    effective_uid = os.geteuid()
+    if effective_uid != owner_uid:
+        _refuse_base_repo(
+            repo,
+            event_logger,
+            reason="owner_mismatch",
+            detail=f"base owner uid {owner_uid}, status account uid {effective_uid}",
+            owner_uid=owner_uid,
+            effective_uid=effective_uid,
+        )
+
+    status = runner([
+        "git", "-C", str(repo), "status", "--porcelain=v1", "-z",
+        "--untracked-files=all", "--ignored=no",
+    ])
+    if status.returncode != 0:
+        detail = (status.stderr or status.stdout).strip() or "git status failed"
+        _refuse_base_repo(
+            repo,
+            event_logger,
+            reason="status_failed",
+            detail=detail,
+            returncode=status.returncode,
+        )
+
+    staged: list[str] = []
+    unstaged: list[str] = []
+    untracked: list[str] = []
+    records = (status.stdout or "").split("\0")
+    index = 0
+    while index < len(records):
+        record = records[index]
+        index += 1
+        if not record:
+            continue
+        if len(record) < 4 or record[2] != " ":
+            _refuse_base_repo(
+                repo,
+                event_logger,
+                reason="status_malformed",
+                detail="git status returned malformed porcelain output",
+            )
+        index_state, worktree_state = record[0], record[1]
+        path = record[3:]
+        if index_state == "?" and worktree_state == "?":
+            untracked.append(path)
+        else:
+            if index_state != " ":
+                staged.append(path)
+            if worktree_state != " ":
+                unstaged.append(path)
+        if index_state in {"R", "C"}:
+            index += 1  # porcelain -z follows a renamed/copied path with its source path
+
+    if not (staged or unstaged or untracked):
+        return
+    dirty_count = len(set(staged) | set(unstaged) | set(untracked))
+    payload = {
+        "dirty_count": dirty_count,
+        "staged_count": len(staged),
+        "staged_paths": staged[:_DIRTY_PATH_SAMPLE_LIMIT],
+        "unstaged_count": len(unstaged),
+        "unstaged_paths": unstaged[:_DIRTY_PATH_SAMPLE_LIMIT],
+        "untracked_count": len(untracked),
+        "untracked_paths": untracked[:_DIRTY_PATH_SAMPLE_LIMIT],
+        "sample_limit": _DIRTY_PATH_SAMPLE_LIMIT,
+    }
+    detail = "; ".join(
+        f"{label} ({len(paths)}): {', '.join(repr(path) for path in paths[:_DIRTY_PATH_SAMPLE_LIMIT])}"
+        for label, paths in (
+            ("staged", staged),
+            ("unstaged", unstaged),
+            ("untracked-and-not-ignored", untracked),
+        )
+        if paths
+    )
+    _refuse_base_repo(
+        repo,
+        event_logger,
+        reason="dirty",
+        detail=f"{dirty_count} dirty path(s); {detail}",
+        **payload,
+    )
+
+
+def _refuse_base_repo(
+    repo: Path,
+    event_logger: EventLogger | None,
+    *,
+    reason: str,
+    detail: str,
+    **payload: Any,
+) -> None:
+    if event_logger is not None:
+        event_logger(
+            "worklink_base_repo_refused",
+            repo=str(repo),
+            reason=reason,
+            detail=detail[:1000],
+            **payload,
+        )
+    raise RuntimeError(f"base repo refused ({reason}): {detail}")
 
 
 def _rev_parse_for_error(repo: Path, ref: str, *, runner: Runner) -> str:
@@ -680,6 +809,37 @@ def _git_objects_dir(repo: Path) -> Path | None:
     if (repo / "objects").is_dir():
         return repo / "objects"
     return None
+
+
+def report_foreign_owned_git_objects(
+    repo: Path,
+    *,
+    expected_uid: int,
+    event_logger: EventLogger,
+) -> list[Path]:
+    """Report regular files in ``repo``'s object store owned by another uid."""
+    objects = _git_objects_dir(repo)
+    if objects is None:
+        return []
+
+    foreign: list[Path] = []
+    for object_path in sorted(objects.rglob("*")):
+        try:
+            metadata = object_path.stat(follow_symlinks=False)
+        except OSError:
+            continue
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_uid == expected_uid:
+            continue
+        foreign.append(object_path)
+        event_logger(
+            "worklink_foreign_owned_git_object",
+            repo=str(repo),
+            object_path=str(object_path),
+            owner_uid=metadata.st_uid,
+            expected_owner_uid=expected_uid,
+            mode=oct(stat.S_IMODE(metadata.st_mode)),
+        )
+    return foreign
 
 
 def _alternate_entries(repo: Path) -> tuple[Path | None, list[tuple[str, Path]]]:
@@ -1074,12 +1234,16 @@ def cleanup_checkout(
             rmtree_missing_ok(lease.path.parent)
             return True
         rmtree_missing_ok(lease.path)
-        delete = runner(["git", "-C", str(lease.repo), "branch", "-D", lease.branch])
-        # Isolated-checkout branches usually exist only inside the clone that was
-        # just removed; deleting the same name from the parent repo is a tolerated
-        # legacy no-op if an older attempt shape happened to create it there.
-        if delete.returncode not in (0, 1):
-            raise RuntimeError((delete.stderr or delete.stdout).strip() or "git branch delete failed")
+        attempt_branch = f"issue/{lease.issue_id}-a{lease.attempt}"
+        if lease.branch == attempt_branch:
+            delete = runner(["git", "-C", str(lease.repo), "branch", "-D", lease.branch])
+            # Isolated-checkout attempt branches usually exist only inside the clone
+            # that was just removed. A factory checkout instead uses the target
+            # branch, which must never be deleted from the parent repository.
+            if delete.returncode not in (0, 1):
+                raise RuntimeError(
+                    (delete.stderr or delete.stdout).strip() or "git branch delete failed"
+                )
         return True
     result = runner(["git", "-C", str(lease.repo), "worktree", "remove", "--force", str(lease.path)])
     if result.returncode != 0:

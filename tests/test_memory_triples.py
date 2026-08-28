@@ -4,17 +4,21 @@ from __future__ import annotations
 import json
 import sqlite3
 import struct
+from itertools import permutations
 from pathlib import Path
 
 import pytest
 
 from mimir.models import AuthContext
 from mimir.saga.triples import (
+    TRIPLE_CANDIDATE_LIMIT,
+    _update_world_state,
     detect_contradictions,
     get_current_value,
     get_history,
     make_triple_id,
     parse_triples,
+    rank_triple_candidates,
     repair_world_state_dual_current,
     resolve_contradictions_to_supersedes,
     retrieve_by_entity,
@@ -469,6 +473,149 @@ def test_world_state_same_valid_from_value_change_keeps_new_current(conn):
     assert [row.is_current for row in history] == [False, True]
 
 
+def test_world_state_late_colliding_assertion_preserves_coherent_history(conn):
+    """The reproduced collision keeps every value and a coherent interval chain."""
+    for value, valid_from, now in (
+        ("Boston", "2024-01-01", "2024-06-01"),
+        ("Austin", "2025-01-01", "2025-06-01"),
+        ("Denver", "2024-01-01", "2026-01-01"),
+    ):
+        _update_world_state(
+            conn,
+            subject="Jason",
+            predicate="lives_in",
+            value=value,
+            valid_from=valid_from,
+            valid_until=None,
+            source_triple_id=value.lower(),
+            now=now,
+        )
+
+    history = get_history(conn, "Jason", "lives_in", auth_context=ADMIN_SCOPE)
+
+    assert [row.value for row in history] == ["Boston", "Austin", "Denver"]
+    assert [row.valid_from for row in history] == [
+        "2024-01-01", "2025-01-01", "2026-01-01",
+    ]
+    assert [row.valid_until for row in history] == [
+        "2025-01-01", "2026-01-01", None,
+    ]
+    assert [row.is_current for row in history] == [False, False, True]
+
+
+def test_world_state_rejects_history_collision_without_deleting_rows(conn):
+    conn.executemany(
+        "INSERT INTO world_state "
+        "(subject, predicate, value, valid_from, valid_until, is_current, "
+        " source_triple_id, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        [
+            ("Jason", "lives_in", "Austin", "2025-01-01", None, 0,
+             "austin", "2025-06-01"),
+            ("Jason", "lives_in", "Denver", None, None, 1,
+             "denver", "2026-06-01"),
+        ],
+    )
+
+    with pytest.raises(ValueError, match="collides with existing history"):
+        _update_world_state(
+            conn,
+            subject="Jason",
+            predicate="lives_in",
+            value="Paris",
+            valid_from="2025-01-01",
+            valid_until=None,
+            source_triple_id="paris",
+            now="2027-01-01",
+        )
+
+    rows = conn.execute(
+        "SELECT value, valid_from, valid_until, is_current FROM world_state "
+        "WHERE subject = 'Jason' AND predicate = 'lives_in' "
+        "ORDER BY is_current",
+    ).fetchall()
+    assert rows == [
+        ("Austin", "2025-01-01", None, 0),
+        ("Denver", None, None, 1),
+    ]
+
+
+def test_world_state_rejects_stale_assertion_when_now_is_not_after_current(conn):
+    _update_world_state(
+        conn,
+        subject="Jason",
+        predicate="lives_in",
+        value="Austin",
+        valid_from="2025-01-01",
+        valid_until=None,
+        source_triple_id="austin",
+        now="2025-01-01",
+    )
+
+    with pytest.raises(ValueError, match="cannot be normalized"):
+        _update_world_state(
+            conn,
+            subject="Jason",
+            predicate="lives_in",
+            value="Boston",
+            valid_from="2024-01-01",
+            valid_until=None,
+            source_triple_id="boston",
+            now="2025-01-01",
+        )
+
+
+def test_world_state_supersedes_current_row_with_null_valid_from(conn):
+    conn.execute(
+        "INSERT INTO world_state "
+        "(subject, predicate, value, valid_from, valid_until, is_current, "
+        " source_triple_id, updated_at) "
+        "VALUES ('Alice', 'status', 'unknown', NULL, NULL, 1, NULL, ?)",
+        ("2024-01-01T00:00:00Z",),
+    )
+    _seed_atom(conn, "obs1", "obs")
+
+    store_triples(conn, [
+        {"subject": "Alice", "predicate": "status", "object": "active",
+         "valid_from": "2025-01-01"},
+    ], source_atom_id="obs1")
+
+    rows = conn.execute(
+        "SELECT value, valid_from, valid_until, is_current FROM world_state "
+        "WHERE subject = 'Alice' AND predicate = 'status' ORDER BY is_current",
+    ).fetchall()
+    assert rows == [
+        ("unknown", None, "2025-01-01", 0),
+        ("active", "2025-01-01", None, 1),
+    ]
+
+
+@pytest.mark.parametrize("assertion_order", list(permutations((
+    ("Boston", "2024-01-01"),
+    ("Austin", "2025-01-01"),
+    ("Denver", "2026-01-01"),
+))))
+def test_world_state_has_one_current_row_after_arbitrary_assertion_order(
+    conn, assertion_order,
+):
+    conn.execute(
+        "INSERT INTO world_state "
+        "(subject, predicate, value, valid_from, valid_until, is_current, "
+        " source_triple_id, updated_at) "
+        "VALUES ('Jason', 'lives_in', 'Unknown', NULL, NULL, 1, NULL, ?)",
+        ("2023-01-01T00:00:00Z",),
+    )
+    _seed_atom(conn, "obs1", "obs")
+    for value, valid_from in assertion_order:
+        store_triples(conn, [
+            {"subject": "Jason", "predicate": "lives_in", "object": value,
+             "valid_from": valid_from},
+        ], source_atom_id="obs1")
+        assert conn.execute(
+            "SELECT COUNT(*) FROM world_state "
+            "WHERE subject = 'Jason' AND predicate = 'lives_in' AND is_current = 1",
+        ).fetchone()[0] == 1
+
+
 def test_get_current_value_is_deterministic_with_dual_current_rows(conn):
     """chainlink #397: if structural drift leaves two current rows for one
     (subject, predicate), get_current_value should choose deterministically rather
@@ -668,6 +815,96 @@ def test_triple_augment_search_includes_future_valid_until(conn):
     results = triple_augment_search(conn, [1.0, 0.0, 0.0, 0.0], top_k=5,
                                     reference_date=ref, auth_context=ADMIN_SCOPE)
     assert results  # not expired
+
+
+def test_rank_triple_candidates_uses_configured_recent_window_and_warns(
+    conn, monkeypatch, caplog,
+):
+    from mimir.saga import _config_io
+
+    monkeypatch.setattr(
+        _config_io,
+        "get_config",
+        lambda: lambda section, key, default=None: (
+            2 if (section, key) == ("storage", "triple_candidate_limit") else default
+        ),
+    )
+    _seed_atom(conn, "obs1", "source")
+    exact = struct.pack("4f", 1.0, 0.0, 0.0, 0.0)
+    orthogonal = struct.pack("4f", 0.0, 1.0, 0.0, 0.0)
+    rows = [
+        ("oldest", "oldest", "prefers", "value", "obs1", exact, 4, "2026-01-01"),
+        ("middle", "middle", "prefers", "value", "obs1", orthogonal, 4, "2026-01-02"),
+        ("newest", "newest", "prefers", "value", "obs1", orthogonal, 4, "2026-01-03"),
+    ]
+    conn.executemany(
+        "INSERT INTO triples "
+        "(id, subject, predicate, object, source_atom_id, embedding, embedding_dim, created_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        rows,
+    )
+
+    ranked = rank_triple_candidates(
+        conn, [1.0, 0.0, 0.0, 0.0], dim=4, auth_context=ADMIN_SCOPE,
+    )
+
+    assert len(ranked) == 2
+    assert "oldest" not in {item["id"] for item in ranked}
+    assert "triple_candidate_pool_truncated" in caplog.text
+    assert "newest 2 eligible triples" in caplog.text
+
+    conn.execute("DELETE FROM triples WHERE id = 'oldest'")
+    caplog.clear()
+    rank_triple_candidates(
+        conn, [1.0, 0.0, 0.0, 0.0], dim=4, auth_context=ADMIN_SCOPE,
+    )
+    assert "triple_candidate_pool_truncated" not in caplog.text
+
+
+def test_rank_triple_candidates_filters_dimension_before_window_limit(conn):
+    _seed_atom(conn, "obs1", "source")
+    matching = struct.pack("4f", 1.0, 0.0, 0.0, 0.0)
+    stale = struct.pack("2f", 1.0, 0.0)
+    rows = [
+        ("matching", "matching", matching, 4, "2025-01-01"),
+        *[
+            (f"stale-{index:04d}", f"stale-{index}", stale, 2, f"2026-{index:04d}")
+            for index in range(TRIPLE_CANDIDATE_LIMIT)
+        ],
+    ]
+    conn.executemany(
+        "INSERT INTO triples "
+        "(id, subject, predicate, object, source_atom_id, embedding, embedding_dim, created_at) "
+        "VALUES (?, ?, 'prefers', 'value', 'obs1', ?, ?, ?)",
+        rows,
+    )
+
+    ranked = rank_triple_candidates(
+        conn, [1.0, 0.0, 0.0, 0.0], dim=4, auth_context=ADMIN_SCOPE,
+    )
+
+    assert [item["id"] for item in ranked] == ["matching"]
+
+
+def test_triple_candidate_query_uses_recency_index_without_temp_sort(conn):
+    plan = conn.execute(
+        "EXPLAIN QUERY PLAN "
+        "SELECT t.id, t.embedding FROM triples t "
+        "INDEXED BY idx_triples_embedding_recency "
+        "JOIN atoms a ON t.source_atom_id = a.id "
+        "WHERE t.tombstoned = 0 AND a.tombstoned = 0 "
+        "AND t.embedding IS NOT NULL "
+        "AND (? IS NULL OR t.embedding_dim IS NULL OR t.embedding_dim = ?) "
+        "AND (t.valid_until IS NULL OR t.valid_until > ?) "
+        "AND (a.visibility = ? OR a.owner_principal = ?) "
+        "AND (t.visibility = ? OR t.owner_principal = ?) "
+        "ORDER BY t.created_at DESC, t.id ASC LIMIT ?",
+        (4, 4, "2026-01-01", "public", "alice", "public", "alice",
+         TRIPLE_CANDIDATE_LIMIT),
+    ).fetchall()
+    detail = " ".join(row[3] for row in plan)
+    assert "idx_triples_embedding_recency" in detail
+    assert "TEMP B-TREE" not in detail
 
 
 # ─── retrieve_by_entity ──────────────────────────────────────────────

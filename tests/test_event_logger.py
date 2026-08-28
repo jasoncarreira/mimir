@@ -3,7 +3,12 @@
 from __future__ import annotations
 
 import asyncio
+import fcntl
 import json
+import multiprocessing
+import os
+import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -14,6 +19,17 @@ from mimir.event_logger import (
     init_logger,
     safe_log_event,
 )
+
+
+def _append_from_process(
+    path: Path,
+    started: multiprocessing.synchronize.Event,
+    finished: multiprocessing.synchronize.Event,
+) -> None:
+    logger = EventLogger(path, session_id="detached")
+    started.set()
+    logger.log_sync("detached_event", source="worklink")
+    finished.set()
 
 
 @pytest.mark.asyncio
@@ -31,6 +47,50 @@ async def test_log_appends_record_with_session_and_type(tmp_path: Path):
     assert lines[0]["home"] == "/h"
     assert "timestamp" in lines[0]
     assert lines[1]["tool"] == "echo"
+
+
+def test_durable_log_fsyncs_new_file_and_parent_directory(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    logger = EventLogger(tmp_path / "events.jsonl", session_id="proc-1")
+    fsynced: list[int] = []
+    monkeypatch.setattr("mimir.event_logger.os.fsync", lambda fd: fsynced.append(fd))
+
+    logger.log_durable_sync("startup_failed", phase="agent_runtime")
+
+    expected = 2 if hasattr(os, "O_DIRECTORY") else 1
+    assert len(fsynced) == expected
+
+
+def test_durable_log_after_nondurable_creation_fsyncs_file_and_directory(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "events.jsonl"
+    logger = EventLogger(path, session_id="proc-1")
+    logger.log_sync("startup_progress", phase="agent_runtime")
+    fsynced: list[int] = []
+    monkeypatch.setattr("mimir.event_logger.os.fsync", lambda fd: fsynced.append(fd))
+
+    logger.log_durable_sync("startup_failed", phase="scheduler_start")
+
+    expected = 2 if hasattr(os, "O_DIRECTORY") else 1
+    assert len(fsynced) == expected
+
+
+def test_durable_log_propagates_fsync_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    logger = EventLogger(tmp_path / "events.jsonl", session_id="proc-1")
+
+    def fail_fsync(fd: int) -> None:
+        raise OSError("fsync failed")
+
+    monkeypatch.setattr("mimir.event_logger.os.fsync", fail_fsync)
+    with pytest.raises(OSError, match="fsync failed"):
+        logger.log_durable_sync("startup_failed", phase="scheduler_start")
 
 
 @pytest.mark.asyncio
@@ -231,6 +291,24 @@ async def test_feedback_v1_metadata_survives_redaction_and_jsonl_round_trip(
     ]
     assert secret not in path.read_text()
 
+async def test_part_a_log_payload_failures_never_reach_caller(tmp_path: Path):
+    class RaisingRepr:
+        def __str__(self) -> str:
+            raise ValueError("cannot stringify")
+
+        def __repr__(self) -> str:
+            raise ValueError("cannot represent")
+
+    path = tmp_path / "events.jsonl"
+    logger = EventLogger(path, session_id="proc-bad-payload")
+    cyclic: dict[str, object] = {}
+    cyclic["self"] = cyclic
+
+    await logger.log("bad_repr", value=RaisingRepr())
+    await logger.log("cyclic", value=cyclic)
+
+    assert not path.exists()
+
 
 @pytest.mark.asyncio
 async def test_event_logger_redacts_yaml_block_scalars_without_erasing_context(
@@ -304,3 +382,100 @@ def test_log_sync_holds_io_lock(tmp_path):
 
     assert done.wait(timeout=2.0), "log_sync did not proceed after lock release"
     assert '"type": "evt_x"' in (tmp_path / "events.jsonl").read_text()
+
+
+def test_process_append_survives_trim_rename_window(tmp_path, monkeypatch):
+    """A detached writer waits for trim's rename and lands on the new inode."""
+    path = tmp_path / "events.jsonl"
+    logger = EventLogger(path, session_id="server", max_events=4)
+    for i in range(3):
+        logger.log_sync("server_event", i=i)
+
+    rename_reached = threading.Event()
+    allow_rename = threading.Event()
+    trim_finished = threading.Event()
+    original_rename = Path.rename
+
+    def paused_rename(source, target):
+        rename_reached.set()
+        assert allow_rename.wait(timeout=5.0), "test did not release trim rename"
+        return original_rename(source, target)
+
+    monkeypatch.setattr(Path, "rename", paused_rename)
+
+    def trim():
+        logger._trim_sync()
+        trim_finished.set()
+
+    trim_thread = threading.Thread(target=trim, daemon=True)
+    trim_thread.start()
+    assert rename_reached.wait(timeout=2.0), "trim did not reach rename window"
+
+    ctx = multiprocessing.get_context("spawn")
+    append_started = ctx.Event()
+    append_finished = ctx.Event()
+    process = ctx.Process(
+        target=_append_from_process,
+        args=(path, append_started, append_finished),
+    )
+    process.start()
+    try:
+        assert append_started.wait(timeout=5.0), "detached writer did not start"
+        assert not append_finished.wait(timeout=0.2), (
+            "detached append was not serialized with trim"
+        )
+    finally:
+        allow_rename.set()
+        process.join(timeout=5.0)
+        if process.is_alive():
+            process.terminate()
+            process.join(timeout=2.0)
+
+    trim_thread.join(timeout=2.0)
+    assert trim_finished.is_set(), "trim did not finish"
+    assert process.exitcode == 0
+    records = [json.loads(line) for line in path.read_text().splitlines()]
+    assert any(record["type"] == "detached_event" for record in records)
+    assert len(records) <= logger._max_events
+
+
+def test_process_lock_timeout_degrades_to_append(tmp_path, monkeypatch, caplog):
+    """A stuck process lock cannot block an ordinary event indefinitely."""
+    import mimir.event_logger as event_logger
+
+    path = tmp_path / "events.jsonl"
+    logger = EventLogger(path, session_id="server")
+    monkeypatch.setattr(event_logger, "PROCESS_LOCK_TIMEOUT_SECONDS", 0.05)
+    logger._process_lock_path.touch()
+
+    with logger._process_lock_path.open("a", encoding="utf-8") as holder:
+        fcntl.flock(holder.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        started = time.monotonic()
+        logger.log_sync("lock_degraded")
+        elapsed = time.monotonic() - started
+
+    assert elapsed < 0.5
+    assert json.loads(path.read_text())["type"] == "lock_degraded"
+    assert "process lock timed out" in caplog.text
+    assert "continuing with an unlocked append" in caplog.text
+
+
+def test_durable_process_lock_timeout_fails_instead_of_claiming_success(
+    tmp_path, monkeypatch, caplog,
+):
+    """A durable append must not race trim's rename by writing unlocked."""
+    import mimir.event_logger as event_logger
+
+    path = tmp_path / "events.jsonl"
+    logger = EventLogger(path, session_id="server")
+    monkeypatch.setattr(event_logger, "PROCESS_LOCK_TIMEOUT_SECONDS", 0.05)
+    logger._process_lock_path.touch()
+
+    with logger._process_lock_path.open("a", encoding="utf-8") as holder:
+        fcntl.flock(holder.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        with pytest.raises(TimeoutError, match="durable append"):
+            logger.log_durable_sync("startup_failed", phase="agent_runtime")
+
+    assert not path.exists()
+    assert "process lock timed out" in caplog.text
+    assert "failing durable append" in caplog.text

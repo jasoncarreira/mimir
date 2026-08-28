@@ -22,7 +22,11 @@ PATTERNS=(
   'Bearer [A-Za-z0-9_\-]{20,}'
   'sk-ant-[A-Za-z0-9_\-]{20,}'
   'sk-proj[-_][A-Za-z0-9_\-]{20,}'      # OpenAI project keys (sk-proj- or sk-proj_; body may contain -/_)
+  'sk-[A-Za-z0-9]+-v[0-9]+-[A-Za-z0-9_\-]{20,}' # Versioned provider keys (for example, OpenRouter sk-or-v1-)
   'sk-[A-Za-z0-9]{20,}'                 # OpenAI classic keys (base62 body — no hyphens; keeps wiki slugs like sk-foo-bar from matching)
+  'tvly-[A-Za-z0-9_\-]{20,}'           # Tavily API key
+  'pa-[A-Za-z0-9_\-]{20,}'             # Voyage API key
+  'AIza[A-Za-z0-9_\-]{35}'             # Google API key (39 chars total)
   'ghp_[A-Za-z0-9]{30,}'               # GitHub PAT (classic)
   'gho_[A-Za-z0-9]{30,}'               # GitHub OAuth
   'gh[usr]_[A-Za-z0-9]{30,}'           # GitHub user-to-server, app-installation, and refresh tokens
@@ -34,6 +38,8 @@ PATTERNS=(
   '"access_token"[[:space:]]*:[[:space:]]*"[^"]{20,}"'
   '"client_secret"[[:space:]]*:[[:space:]]*"[^"]{20,}"'
   'xox[bpasr]-[0-9A-Za-z-]{20,}'       # Slack bot, user, app, refresh, and config tokens
+  'xapp-[0-9A-Za-z-]{20,}'             # Slack app-level token
+  '[A-Za-z0-9_-]{25,}\.[A-Za-z0-9_-]{6,}\.[A-Za-z0-9_-]{27,}' # JWT-shaped keys with a non-Discord header
   '[A-Za-z0-9_-]{24}\.[A-Za-z0-9_-]{6}\.[A-Za-z0-9_-]{27,}' # Discord bot token
 )
 

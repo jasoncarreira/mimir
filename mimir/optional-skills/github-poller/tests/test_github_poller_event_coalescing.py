@@ -103,6 +103,7 @@ def test_open_pr_comment_still_emits_when_it_is_the_only_signal(
 
     assert count == 1
     assert [event["event_type"] for event in captured_emits] == ["issue_comment"]
+    assert captured_emits[0]["subject_type"] == "pull_request"
     assert captured_emits[0]["number"] == "42"
 
 
@@ -332,7 +333,9 @@ def test_current_head_review_suppresses_new_pr_pass(
         raise AssertionError(endpoint)
 
     monkeypatch.setattr(poller, "_gh_api", fake_api)
-    monkeypatch.setattr(poller, "_pr_author_is_trusted", lambda *args: True)
+    monkeypatch.setattr(
+        poller, "_pr_author_is_trusted", lambda *args, **kwargs: True,
+    )
 
     count = poller._check_prs("o/r", SINCE, "t", "mimir-carreira")
 

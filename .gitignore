@@ -95,3 +95,12 @@ evals/**/pilot_output/
 # mid-run dirties the worktree, which the factory refuses to observe -- that is how
 # run 1396 wedged. They stay on disk; they simply are not version-controlled.
 .opencode/memory/
+
+# Belt-and-braces: the parity suite writes child output here if anything
+# reintroduces a repo-relative root (see tests/test_worklink_worker_parity.py).
+.pytest-worklink-output/
+
+# Agent and factory worktrees are created here at runtime. They are legitimate
+# untracked state, not contamination, and the base-repo cleanliness guard added by
+# chainlink #1459 (PR #1750) refuses a build when they are untracked-and-not-ignored.
+.worktrees/

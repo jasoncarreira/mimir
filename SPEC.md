@@ -1282,6 +1282,23 @@ open http://localhost:<host_port>/turns
 
 Single-process build. SAGA runs in-process (workspace dependency, not a sidecar), so there's one Python process rather than supervisord managing two. The Claude Code CLI remains an operator-provided dependency for the optional Max/OAuth model provider.
 
+The checked-in root `Dockerfile` is the canonical deployment image. Its root-owned
+Worklink executor makes provenance arguments mandatory; a complete build must name
+the remote ref and its exact controller/executor commit:
+
+```sh
+MIMIR_GIT_REF=refs/heads/main
+MIMIR_COMMIT=$(git rev-parse HEAD)
+docker build \
+  --build-arg MIMIR_GIT_REF="$MIMIR_GIT_REF" \
+  --build-arg MIMIR_CONTROLLER_COMMIT="$MIMIR_COMMIT" \
+  --build-arg MIMIR_EXECUTOR_COMMIT="$MIMIR_COMMIT" \
+  --build-arg MIMIR_EXTRAS=claude-code,anthropic,discord .
+```
+
+The abbreviated PyPI-only layout below explains the non-root controller layers;
+it is not the canonical root-executor build contract:
+
 ```dockerfile
 FROM python:3.11-slim AS base
 
@@ -1312,8 +1329,8 @@ ENV VIRTUAL_ENV=/home/mimir/venv
 RUN python3 -m venv "$VIRTUAL_ENV"
 ENV PATH="$VIRTUAL_ENV/bin:$PATH"
 
-# Install mimir-agent from PyPI. Override extras at build time:
-#   docker build --build-arg MIMIR_EXTRAS=claude-code,anthropic,discord .
+# Install mimir-agent from PyPI. MIMIR_EXTRAS is declared here; use the
+# complete provenance-aware build command above for the canonical root image.
 ARG MIMIR_EXTRAS="anthropic,discord,slack,mcp"
 RUN pip install --no-cache-dir --upgrade pip \
     && pip install --no-cache-dir "mimir-agent[${MIMIR_EXTRAS}]"

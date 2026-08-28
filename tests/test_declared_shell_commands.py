@@ -328,7 +328,7 @@ class TestSchedulerWiring:
     def test_job_carries_declarations_from_yaml(self) -> None:
         from mimir.scheduler import load_jobs_from_text
 
-        jobs = load_jobs_from_text(
+        jobs, rejections = load_jobs_from_text(
             "- name: morning-briefing\n"
             "  prompt_file: morning-briefing.md\n"
             "  cron: 0 8 * * *\n"
@@ -337,6 +337,7 @@ class TestSchedulerWiring:
             "      path: /bin/echo\n"
             "      subcommands: [[gmail, search]]\n"
         )
+        assert rejections == []
         assert jobs[0].shell_commands == [
             {"exec": "gog", "path": "/bin/echo", "subcommands": [["gmail", "search"]]},
         ]
@@ -344,7 +345,10 @@ class TestSchedulerWiring:
     def test_a_job_without_declarations_is_unchanged(self) -> None:
         from mimir.scheduler import load_jobs_from_text
 
-        jobs = load_jobs_from_text("- name: reflect\n  prompt_file: r.md\n  cron: 0 6 * * 0\n")
+        jobs, rejections = load_jobs_from_text(
+            "- name: reflect\n  prompt_file: r.md\n  cron: 0 6 * * 0\n"
+        )
+        assert rejections == []
         assert jobs[0].shell_commands is None
 
 
@@ -515,8 +519,10 @@ class TestReviewFindings:
             "      path: /bin/echo\n"
             "      subcommands: [[gmail, search]]\n"
         )
-        job = load_jobs_from_text(text)[0]
-        round_tripped = load_jobs_from_text(yaml.safe_dump([job.to_yaml_entry()]))[0]
+        job = load_jobs_from_text(text)[0][0]
+        round_tripped = load_jobs_from_text(
+            yaml.safe_dump([job.to_yaml_entry()])
+        )[0][0]
         assert round_tripped.shell_commands == job.shell_commands
 
     @pytest.mark.parametrize(

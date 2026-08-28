@@ -19,10 +19,24 @@ from pathlib import Path
 
 import pytest
 
+from mimir.models import AuthContext
 from mimir.saga.forget import ForgetResult, forget, forget_by_criteria
 from mimir.saga.mark_access import AccessEvent, mark_access
 from mimir.saga.recall import recall
 from mimir.saga.store import store
+from mimir.saga.synthesize import build_vocab_block
+from mimir.saga.triples import get_current_value, store_triples, triple_augment_search
+
+
+ADMIN_SCOPE = AuthContext(
+    principal="admin",
+    canonical_principal="admin",
+    roles=("admin",),
+    event_ingress=None,
+    trigger="test",
+    channel_id=None,
+    interactivity=None,
+)
 
 
 @pytest.fixture
@@ -61,6 +75,64 @@ def test_forget_marks_atom_tombstoned(conn):
     ).fetchone()
     assert row[0] == 1
     assert row[1] == "test"
+
+
+def test_forget_retracts_derived_triple_and_world_state(conn):
+    atom_id = store(conn, "Acme employs Dana", embed_fn=_fake_embed).atom_id
+    triple = {"subject": "Dana", "predicate": "works_at", "object": "Acme"}
+    triple_id = store_triples(
+        conn,
+        [triple],
+        source_atom_id=atom_id,
+        evidence_ids=[atom_id],
+        embed_fn=_fake_embed,
+    )[0]
+    conn.commit()
+
+    assert get_current_value(
+        conn, "Dana", "works_at", auth_context=ADMIN_SCOPE,
+    ) is not None
+    assert triple_augment_search(
+        conn, _qf("Dana works at Acme"), dim=4, auth_context=ADMIN_SCOPE,
+    )
+    assert "Dana" in build_vocab_block(conn, owner_principal="legacy_admin")
+
+    forget(conn, [atom_id], reason="erase")
+
+    assert conn.execute(
+        "SELECT tombstoned FROM triples WHERE id = ?", (triple_id,),
+    ).fetchone() == (1,)
+    world_state = conn.execute(
+        "SELECT is_current, valid_until FROM world_state "
+        "WHERE source_triple_id = ?",
+        (triple_id,),
+    ).fetchone()
+    assert world_state[0] == 0
+    assert world_state[1] is not None
+    assert get_current_value(
+        conn, "Dana", "works_at", auth_context=ADMIN_SCOPE,
+    ) is None
+    assert triple_augment_search(
+        conn, _qf("Dana works at Acme"), dim=4, auth_context=ADMIN_SCOPE,
+    ) == []
+    assert "Dana" not in build_vocab_block(conn, owner_principal="legacy_admin")
+
+
+def test_derived_reads_ignore_legacy_rows_with_tombstoned_source(conn):
+    atom_id = store(conn, "Globex employs Casey", embed_fn=_fake_embed).atom_id
+    store_triples(
+        conn,
+        [{"subject": "Casey", "predicate": "works_at", "object": "Globex"}],
+        source_atom_id=atom_id,
+        evidence_ids=[atom_id],
+    )
+    conn.execute("UPDATE atoms SET tombstoned = 1 WHERE id = ?", (atom_id,))
+    conn.commit()
+
+    assert get_current_value(
+        conn, "Casey", "works_at", auth_context=ADMIN_SCOPE,
+    ) is None
+    assert "Casey" not in build_vocab_block(conn, owner_principal="legacy_admin")
 
 
 def test_forget_is_idempotent(conn):
@@ -222,6 +294,63 @@ def test_forget_by_criteria_min_age_days(conn):
     result = forget_by_criteria(conn, min_age_days=30, dry_run=True)
     assert old in result.tombstoned_ids
     assert young not in result.tombstoned_ids
+
+
+@pytest.mark.parametrize("origin_domains", [None, ("session",)])
+def test_forget_by_criteria_domains_cannot_widen_owner_scope(conn, origin_domains):
+    owned = store(
+        conn,
+        "scheduler atom",
+        embed_fn=_fake_embed,
+        owner_principal="service:scheduler",
+        origin_domain="schedule_metadata",
+    ).atom_id
+    foreign = store(
+        conn,
+        "Jason private atom",
+        embed_fn=_fake_embed,
+        owner_principal="U_jason",
+        origin_domain="session",
+        visibility="private",
+    ).atom_id
+    old_ts = (datetime.now(timezone.utc) - timedelta(days=60)).isoformat()
+    conn.execute("UPDATE atoms SET created_at = ?", (old_ts,))
+    conn.commit()
+
+    result = forget_by_criteria(
+        conn,
+        owner_principal="service:scheduler",
+        origin_domains=origin_domains,
+        min_age_days=30,
+        dry_run=False,
+    )
+
+    assert result.tombstoned_ids == [owned]
+    assert conn.execute(
+        "SELECT tombstoned FROM atoms WHERE id = ?", (foreign,)
+    ).fetchone()[0] == 0
+
+
+def test_forget_by_criteria_domains_without_owner_do_not_authorize(conn):
+    atom_id = store(
+        conn,
+        "private session atom",
+        embed_fn=_fake_embed,
+        owner_principal="U_jason",
+        origin_domain="session",
+        visibility="private",
+    ).atom_id
+
+    result = forget_by_criteria(
+        conn,
+        origin_domains=("session",),
+        dry_run=False,
+    )
+
+    assert result.tombstoned_ids == []
+    assert conn.execute(
+        "SELECT tombstoned FROM atoms WHERE id = ?", (atom_id,)
+    ).fetchone()[0] == 0
 
 
 def test_forget_by_criteria_max_atoms_caps_result(conn):

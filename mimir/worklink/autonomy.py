@@ -26,6 +26,7 @@ import dataclasses
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 import json
+import logging
 import os
 from pathlib import Path
 import re
@@ -35,9 +36,15 @@ from typing import Callable, Sequence
 
 from ..event_logger import log_event_sync
 from .backends import WorklinkConfig
-from .backends.registry import WorklinkDefaults
-from .claims import ChainlinkClaims, ClaimRecord
-from .checkout import prune_attempt_checkouts
+from .backends.registry import WorklinkDefaults, WorklinkDefaultsValidationError
+from .claims import (
+    ChainlinkClaims,
+    ClaimRecord,
+    ReapResult,
+    ShutdownClaimFailure,
+    WORKLINK_EPIC_LABEL,
+)
+from .checkout import prune_attempt_checkouts, report_foreign_owned_git_objects
 from .factory_state import factory_process_is_alive, list_factory_records
 
 #: Chainlink agent identity the executor + reaper claim under. Mirrors
@@ -45,6 +52,8 @@ from .factory_state import factory_process_is_alive, list_factory_records
 DEFAULT_AGENT_ID = "mimir-worklink"
 WORKLINK_AGENT_ID_ENV = "MIMIR_WORKLINK_AGENT_ID"
 FACTORY_MAX_CONCURRENT_DEFAULT = 1
+
+log = logging.getLogger(__name__)
 
 
 def chainlink_bin() -> str:
@@ -104,12 +113,14 @@ def current_agent_id() -> str:
 
 
 def make_claims(home: Path, *, agent_id: str | None = None) -> ChainlinkClaims:
+    defaults = worklink_defaults(home)
     return ChainlinkClaims(
         chainlink_bin=chainlink_bin(),
         agent_id=agent_id or current_agent_id(),
         runner=_home_runner(home),
         home_path=home,
         event_logger=log_event_sync,
+        max_attempts=defaults.max_claim_attempts,
     )
 
 
@@ -118,10 +129,10 @@ def release_claims_for_graceful_shutdown(
     *,
     agent_id: str,
     timeout_s: float,
-) -> list[ClaimRecord]:
+) -> tuple[list[ClaimRecord], list[ShutdownClaimFailure]]:
     """Release only ``agent_id`` claims within one wall-clock deadline."""
     if timeout_s <= 0:
-        return []
+        return [], []
     deadline = time.monotonic() + timeout_s
 
     def bounded_runner(args: Sequence[str]) -> subprocess.CompletedProcess[str]:
@@ -142,6 +153,8 @@ def release_claims_for_graceful_shutdown(
         agent_id=agent_id,
         runner=bounded_runner,
         home_path=home,
+        event_logger=log_event_sync,
+        max_attempts=worklink_defaults(home).max_claim_attempts,
     )
     return claims.release_owned_claims_for_shutdown()
 
@@ -167,16 +180,16 @@ def check_concurrency(
 ) -> ConcurrencyCheck:
     """Whether autonomous dispatch may start one more leaf right now.
 
-    ``allowed`` is ``active < cap`` where ``active`` is the active Chainlink
-    lock count. Per-issue exclusivity and the final hard-cap reservation are
-    both enforced by ``chainlink locks claim`` inside
+    ``allowed`` is ``active < cap`` where ``active`` is the active non-epic
+    Chainlink lock count. Per-issue exclusivity and the final hard-cap reservation
+    are both enforced by ``chainlink locks claim`` inside
     :meth:`ChainlinkClaims.claim_issue`; this preflight is advisory/fail-closed
     so callers can skip work before entering the executor when the cap is
     already full.
     """
     cap = worklink_defaults(home).max_concurrent
     cl = claims or make_claims(home, agent_id=agent_id)
-    active = cl.active_worklink_lock_count()
+    active = cl.active_worklink_lock_count(exclude_label=WORKLINK_EPIC_LABEL)
     return ConcurrencyCheck(allowed=active < cap, active=active, cap=cap)
 
 
@@ -185,7 +198,10 @@ def _attempt_is_active(child: Path, records: Sequence[object] = ()) -> bool:
     resolved = child.resolve()
     for candidate in records:
         sandbox = getattr(candidate, "sandbox", None)
-        if not isinstance(sandbox, str) or Path(sandbox).resolve() != resolved:
+        if not isinstance(sandbox, str):
+            continue
+        resolved_sandbox = Path(sandbox).resolve()
+        if resolved_sandbox != resolved and resolved not in resolved_sandbox.parents:
             continue
         status = getattr(candidate, "status", None)
         if status is not None and (status.is_terminal or status.is_parked):
@@ -222,26 +238,53 @@ def prune_stale_attempt_checkouts_for_home(home: Path, *, repo: Path | str | Non
     )
 
 
+def report_foreign_owned_git_objects_for_home(
+    home: Path,
+    *,
+    expected_uid: int,
+    repo: Path | str | None = None,
+) -> list[Path]:
+    """Run the base-repository ownership check from periodic maintenance."""
+    del home
+    repo_raw = repo or os.environ.get("WORKLINK_REPO") or os.environ.get("MIMIR_WORKLINK_REPO")
+    if not repo_raw:
+        return []
+    return report_foreign_owned_git_objects(
+        Path(repo_raw),
+        expected_uid=expected_uid,
+        event_logger=log_event_sync,
+    )
+
+
 def reap_stale_claims_for_home(
     home: Path,
     *,
     agent_id: str | None = None,
     claims: ChainlinkClaims | None = None,
-) -> list[ClaimRecord]:
+) -> ReapResult:
     """TTL-reaper entry point: recover claims whose worker died.
 
     Reads ``reaper_ttl_s`` from worklink.yaml and delegates discovery +
-    staleness to :meth:`ChainlinkClaims.reap_home`.
+    staleness to :meth:`ChainlinkClaims.reap_home`. If a live config edit puts
+    the TTL below its safe floor, emit an operator-visible event and use the
+    floor for this pass; startup config loading rejects the same violation.
     """
-    defaults = worklink_defaults(home)
-    min_reaper_ttl_s = defaults.timeout_s * 2
-    if defaults.reaper_ttl_s <= min_reaper_ttl_s:
-        raise RuntimeError(
-            "worklink reaper_ttl_s must be greater than 2 * timeout_s so the TTL "
-            "reaper cannot steal a worker that is still finalizing its remote "
-            "test job"
-        )
-    ttl = timedelta(seconds=defaults.reaper_ttl_s)
+    try:
+        ttl_s = worklink_defaults(home).reaper_ttl_s
+    except WorklinkDefaultsValidationError as exc:
+        if exc.field != "reaper_ttl_s":
+            raise
+        try:
+            log_event_sync(
+                "worklink_reaper_misconfigured",
+                configured_reaper_ttl_s=exc.configured_value,
+                required_reaper_ttl_s=exc.required_value,
+                action="using_required_ttl",
+            )
+        except Exception as log_exc:  # noqa: BLE001
+            log.warning("could not emit worklink reaper config event: %s", log_exc)
+        ttl_s = exc.required_value
+    ttl = timedelta(seconds=ttl_s)
     cl = claims or make_claims(home, agent_id=agent_id)
     return cl.reap_home(ttl=ttl)
 

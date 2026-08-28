@@ -61,21 +61,46 @@ async def test_current_state_read_runs_off_event_loop(tmp_path: Path):
 
     loop_thread = threading.get_ident()
     observed_threads: list[int] = []
-    real_current_state = store.current_state
+    real_replay = store.replay
 
-    def wrapped_current_state():
+    def wrapped_replay():
         observed_threads.append(threading.get_ident())
-        return real_current_state()
+        return real_replay()
 
-    store.current_state = wrapped_current_state  # type: ignore[method-assign]
+    store.replay = wrapped_replay  # type: ignore[method-assign]
 
     result = await check_due_and_expired(store)
 
     assert result.scanned == 1
-    assert observed_threads, "current_state was not called"
+    assert observed_threads, "store replay was not called"
     assert all(thread_id != loop_thread for thread_id in observed_threads), (
         "commitments current_state replay ran on the event-loop thread"
     )
+
+
+@pytest.mark.asyncio
+async def test_corrupt_count_is_bound_to_the_replay_that_produced_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    path = tmp_path / "c.jsonl"
+    path.write_text("{bad\n{also bad\n", encoding="utf-8")
+    store = CommitmentsStore(path=path)
+    real_to_thread = asyncio.to_thread
+
+    async def replay_then_interleave(func, /, *args, **kwargs):
+        replay = await real_to_thread(func, *args, **kwargs)
+        # Simulate another caller replaying a now-healthy store after the due
+        # check's worker has finished but before its coroutine resumes.
+        path.write_text("", encoding="utf-8")
+        assert await real_to_thread(store.current_state) == {}
+        return replay
+
+    monkeypatch.setattr(asyncio, "to_thread", replay_then_interleave)
+
+    result = await check_due_and_expired(store)
+
+    assert result.scanned == 0
+    assert result.corrupt_lines == 2
 
 
 @pytest.mark.asyncio
@@ -673,3 +698,32 @@ async def test_pileup_alarm_failure_skips_log_event(tmp_path: Path, home: Path):
         "an algedonic row without a cooldown marker)."
     )
     assert result.snooze_pileup_emitted == 0
+
+
+@pytest.mark.asyncio
+async def test_part_c_delivery_failure_is_counted_and_emitted(
+    tmp_path: Path, home: Path,
+):
+    store = CommitmentsStore(path=tmp_path / "c.jsonl")
+    now = time.time()
+    rec = await store.add(CommitmentRecord(
+        id=make_commitment_id(), channel_id="c1", text="must surface",
+        due_window_start_unix=now - 60,
+        due_window_end_unix=now + 3600,
+    ))
+
+    async def fail_deliver(*args, **kwargs):
+        raise OSError("commitments disk full")
+
+    store.deliver = fail_deliver  # type: ignore[method-assign]
+    result = await check_due_and_expired(store, now_unix=now)
+
+    assert result.scanned == 1
+    assert result.failed == 1
+    assert result.due_emitted == 0
+    failures = [
+        e for e in _events(home) if e.get("type") == "commitment_deliver_failed"
+    ]
+    assert len(failures) == 1
+    assert failures[0]["commitment_id"] == rec.id
+    assert "OSError" in failures[0]["error"]

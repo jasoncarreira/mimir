@@ -150,6 +150,10 @@ async def create_agent_runtime(
     adapters: RuntimeAdapters,
 ) -> AgentRuntimeBundle:
     _validate_adapters(adapters)
+    from .access_control import initialize_file_integrity_ledger
+
+    if not initialize_file_integrity_ledger(config.home):
+        raise RuntimeError("file integrity ledger could not be initialized")
     runtime_background_tasks: set[asyncio.Task[Any]] = set()
     owned_closers: list[tuple[str, Callable[[], Awaitable[None]]]] = []
     sessions: SessionManager | None = None
@@ -526,7 +530,8 @@ async def create_agent_runtime(
     identity_retry_lock = asyncio.Lock()
 
     async def run_turn_with_identity_preflight(event: Any) -> Any:
-        nonlocal next_identity_retry_at
+        nonlocal degradation_recorded, degradation_alert_scheduled
+        nonlocal transient_failures, next_identity_retry_at
         if (
             getattr(config, "coding_enabled", False)
             and github_identity_recovery_pending()
@@ -543,9 +548,13 @@ async def create_agent_runtime(
                     if recovered:
                         from .event_logger import log_event
 
+                        recovery_attempts = transient_failures
+                        degradation_recorded = False
+                        degradation_alert_scheduled = False
+                        transient_failures = 0
                         await log_event(
                             "github_identity_recovered",
-                            attempts=transient_failures,
+                            attempts=recovery_attempts,
                         )
         return await agent.run_turn(event)
 

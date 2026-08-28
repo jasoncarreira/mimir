@@ -1233,6 +1233,21 @@ async def test_replay_skips_malformed_v(tmp_path: Path, caplog):
     )
 
 
+def test_part_c_current_state_reports_corrupt_line_count(tmp_path: Path, caplog):
+    import logging
+
+    path = tmp_path / "c.jsonl"
+    path.write_text("{bad\n{also bad\n", encoding="utf-8")
+    store = CommitmentsStore(path=path)
+
+    with caplog.at_level(logging.WARNING, logger="mimir.commitments.store"):
+        replay = store.replay()
+
+    assert replay.records == {}
+    assert replay.corrupt_line_count == 2
+    assert any("skipped 2 corrupt jsonl line(s)" in r.getMessage() for r in caplog.records)
+
+
 @pytest.mark.asyncio
 async def test_replay_skips_non_positive_v(tmp_path: Path, caplog):
     """PR #137 review: ``v: 0`` / ``v: -1`` parse as int but aren't

@@ -15,6 +15,7 @@ import pytest
 from langgraph.runtime import Runtime
 
 from mimir._context import _active_turns, reset_current_turn, set_current_turn
+from mimir.access_control import SHELL_PROCESS_TOOL_NAMES
 from mimir._langchain_claude_code_patches import (
     _pre_tool_use_hook,
     _tool_events_var,
@@ -181,6 +182,20 @@ class TestComposeEnvGuard:
 
 
 class TestIsBashTool:
+    @pytest.mark.parametrize(
+        ("tool_name", "expected"),
+        [
+            *[(name, True) for name in sorted(SHELL_PROCESS_TOOL_NAMES)],
+            ("Shell", True),
+            ("mcp__x__shell", True),
+            ("mcp_x_shell", True),
+            ("unrelated_shell", False),
+            ("send_message", False),
+        ],
+    )
+    def test_shell_tool_name_table(self, tool_name: str, expected: bool) -> None:
+        assert is_bash_tool(tool_name) is expected
+
     def test_shell_exec_is_bash(self) -> None:
         assert is_bash_tool("shell_exec") is True
 
@@ -283,6 +298,42 @@ class TestMiddlewareBlocksProhibited:
         result = await middleware.awrap_tool_call(request, handler)
 
         assert isinstance(result, ToolMessage)
+        assert result.status == "error"
+        assert _BLOCK_PREFIX in result.content
+        handler.assert_not_called()
+
+    @pytest.mark.parametrize(
+        "args",
+        [{}, {"command": None}, {"command": []}, {"cmd": ""}],
+    )
+    def test_middleware_refuses_shell_call_without_screenable_command(
+        self, args: dict[str, Any],
+    ) -> None:
+        middleware = BudgetGateMiddleware()
+        request = _make_request("shell", "unused")
+        request.tool_call["args"] = args
+        handler = MagicMock()
+
+        result = middleware.wrap_tool_call(request, handler)
+
+        assert result.status == "error"
+        assert _BLOCK_PREFIX in result.content
+        assert "cannot be screened" in result.content
+        handler.assert_not_called()
+
+    @pytest.mark.parametrize("argument_name", ["command", "cmd", "script"])
+    def test_middleware_screens_recognized_shell_command_arguments(
+        self, argument_name: str,
+    ) -> None:
+        middleware = BudgetGateMiddleware()
+        request = _make_request("shell", "unused")
+        request.tool_call["args"] = {
+            argument_name: "git push --force origin main",
+        }
+        handler = MagicMock()
+
+        result = middleware.wrap_tool_call(request, handler)
+
         assert result.status == "error"
         assert _BLOCK_PREFIX in result.content
         handler.assert_not_called()

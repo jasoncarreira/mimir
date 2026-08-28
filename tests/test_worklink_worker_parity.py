@@ -6,11 +6,13 @@ import os
 from pathlib import Path
 import signal
 import socket
+import stat
 import struct
 import subprocess
 import sys
 import threading
 from typing import Any
+import uuid
 
 import pytest
 
@@ -97,6 +99,8 @@ class WorkerClient:
             if self.outputs is not None
             else (self.stdout, self.stderr)
         )
+        kwargs["stdout_sink"].file.write(stdout)
+        kwargs["stderr_sink"].file.write(stderr)
         process = WorkerProcess(
             kwargs["identifier"],
             4000 + len(self.launched),
@@ -137,6 +141,7 @@ def spec(
         backend_config=config or {},
         local_checkout=Path("/authorized"),
         local_argv=("python", "-c", "print('ok')"),
+        output_root=None,
     )
 
 
@@ -152,6 +157,7 @@ async def test_operator_issued_opencode_uses_fd_anchored_dir_but_direct_keeps_ab
     monkeypatch.setattr("mimir.worklink.checkout.coding_enabled", lambda: True)
     monkeypatch.setattr("mimir.worklink.run_state.process_start_ticks", lambda pid: pid)
     work = spec()
+    object.__setattr__(work, "output_root", tmp_path / "output")
     object.__setattr__(work, "local_checkout", checkout)
     object.__setattr__(
         work,
@@ -221,6 +227,49 @@ async def launch_worker(
 
 
 @pytest.mark.asyncio
+async def test_enabled_launch_cancellation_waits_for_handshake_then_cancels(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class SuspendedClient(WorkerClient):
+        def __init__(self) -> None:
+            super().__init__(immediate=False)
+            self.entered = asyncio.Event()
+            self.resume = asyncio.Event()
+
+        async def launch(self, **kwargs: Any) -> WorkerProcess:
+            self.entered.set()
+            await self.resume.wait()
+            return await super().launch(**kwargs)
+
+    client = SuspendedClient()
+    monkeypatch.setattr("mimir.worklink.checkout.coding_enabled", lambda: True)
+    monkeypatch.setattr("mimir.worklink.run_state.process_start_ticks", lambda pid: pid)
+    backend = LocalSubprocessComputeBackend.for_authorized_checkout(
+        Authorization(), worker_client=client
+    )
+    launch = asyncio.create_task(backend.launch(spec()))
+    try:
+        await asyncio.wait_for(client.entered.wait(), timeout=1)
+    except TimeoutError:
+        if launch.done():
+            await launch
+        launch.cancel()
+        await asyncio.gather(launch, return_exceptions=True)
+        pytest.fail("enabled worker launch did not enter the client handshake within 1s")
+    launch.cancel()
+    client.resume.set()
+
+    with pytest.raises(asyncio.CancelledError):
+        await launch
+
+    assert len(client.cancelled) == 1
+    identifier = client.cancelled[0]
+    assert client.processes[identifier].returncode == -15
+    assert backend._jobs == {}
+    assert backend._handles == {}
+
+
+@pytest.mark.asyncio
 async def test_enabled_launch_failure_after_suspension_is_a_launch_error(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -266,6 +315,105 @@ async def test_job_alive_tracks_contained_task_and_direct_process(
     await direct.cleanup(direct_handle)
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stuck_layer", ["cancel", "collection"])
+async def test_contained_timeout_bounds_cancel_and_collection_independently(
+    monkeypatch: pytest.MonkeyPatch, stuck_layer: str
+) -> None:
+    job = asyncio.create_task(asyncio.Event().wait())
+    handle = LaunchHandle("local_subprocess", str(uuid.uuid4()))
+
+    class Client:
+        async def cancel(self, _identifier: str) -> None:
+            if stuck_layer == "cancel":
+                await asyncio.Event().wait()
+
+    backend = LocalSubprocessComputeBackend()
+    backend._jobs[handle.identifier] = (job, spec(), ("worker",))
+    backend._handles[handle.identifier] = handle
+    backend._worker_clients[handle.identifier] = Client()
+    monkeypatch.setattr(compute, "_WORKER_CANCEL_TIMEOUT_S", 0.01)
+    monkeypatch.setattr(compute, "_WORKER_COLLECTION_TIMEOUT_S", 0.01)
+
+    message = (
+        "worker cancellation exceeded"
+        if stuck_layer == "cancel"
+        else "worker did not report a terminal result"
+    )
+    # The property under test is the RuntimeError and its message: the internal
+    # bounds above (0.01s each) must fire and name which layer was stuck. The
+    # outer wait_for is only a hang guard so a broken bound fails the test
+    # instead of blocking the suite -- it is not an assertion about latency.
+    #
+    # It was 0.2s, which is a wall-clock budget on a shared runner rather than a
+    # hang guard: under CI load the event loop can take longer than that to
+    # schedule the timeout path, and wait_for then raises TimeoutError before the
+    # RuntimeError propagates. That is a false failure about the runner, not the
+    # code. Widened to 10s, which still catches a genuinely unbounded wait
+    # promptly while leaving three orders of magnitude of scheduling headroom.
+    with pytest.raises(RuntimeError, match=message):
+        await asyncio.wait_for(backend.wait(handle, 0.001), timeout=10)
+
+    if stuck_layer == "collection":
+        assert job.done()
+        assert job.cancelled()
+    else:
+        job.cancel()
+        await asyncio.gather(job, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_worker_cancel_socket_receive_has_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import mimir.worklink.worker_client as worker_client
+
+    observed_timeouts: list[float] = []
+
+    class TimeoutSocket:
+        def settimeout(self, timeout_s: float) -> None:
+            observed_timeouts.append(timeout_s)
+
+        def connect(self, _path: str) -> None:
+            pass
+
+        def getsockopt(self, *_args: Any) -> bytes:
+            return struct.pack("3i", 4321, 0, 4321)
+
+        def send(self, _payload: bytes) -> None:
+            pass
+
+        def recv(self, _size: int) -> bytes:
+            raise socket.timeout("cancel acknowledgement timed out")
+
+        def close(self) -> None:
+            pass
+
+    monkeypatch.setattr(worker_client.socket, "socket", lambda *_args: TimeoutSocket())
+    monkeypatch.setattr(worker_client.socket, "SO_PEERCRED", 17, raising=False)
+
+    with pytest.raises(socket.timeout, match="acknowledgement timed out"):
+        await worker_client.WorkerClient(Authorization()).cancel(str(uuid.uuid4()))
+
+    assert observed_timeouts == [worker_client.CANCEL_SOCKET_TIMEOUT_S]
+
+
+@pytest.mark.asyncio
+async def test_direct_process_reap_is_bounded(monkeypatch: pytest.MonkeyPatch) -> None:
+    class Process:
+        pid = 4321
+
+        async def wait(self) -> None:
+            await asyncio.Event().wait()
+
+    monkeypatch.setattr(compute.os, "getpgid", lambda _pid: 4321)
+    monkeypatch.setattr(worker_exec, "_terminate_process_group_pid", lambda _pgid: None)
+    monkeypatch.setattr(compute, "_DIRECT_PROCESS_WAIT_TIMEOUT_S", 0.01)
+
+    with pytest.raises(RuntimeError, match="leader was not reaped after SIGKILL"):
+        await asyncio.wait_for(compute._kill_process_group(Process()), timeout=0.2)
+
+
 def direct_spec(source: str) -> WorkSpec:
     work = spec()
     object.__setattr__(work, "local_checkout", Path.cwd())
@@ -282,6 +430,50 @@ async def run_direct(
     result = await backend.wait(handle, timeout)
     await backend.cleanup(handle)
     return result
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("termination", ["sigterm", "timeout"])
+async def test_direct_terminated_output_is_durable_while_running(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, termination: str
+) -> None:
+    monkeypatch.setattr("mimir.worklink.checkout.coding_enabled", lambda: False)
+    backend = LocalSubprocessComputeBackend()
+    work = direct_spec(
+        "import sys,time; "
+        "sys.stdout.write('before termination\\n'); "
+        "sys.stderr.write('diagnostic stderr\\n'); "
+        "sys.stdout.flush(); sys.stderr.flush(); time.sleep(30)"
+    )
+    output_root = tmp_path / "state" / "worklink" / "transcripts"
+    object.__setattr__(work, "output_root", output_root)
+    handle = await backend.launch(work)
+
+    stdout_files: list[Path] = []
+    for _ in range(200):
+        stdout_files = list(output_root.glob("*.stdout.log"))
+        if stdout_files and stdout_files[0].read_bytes() == b"before termination\n":
+            break
+        await asyncio.sleep(0.01)
+    assert len(stdout_files) == 1
+    assert stdout_files[0].read_bytes() == b"before termination\n"
+    assert stat.S_ISREG(stdout_files[0].stat().st_mode)
+
+    if termination == "sigterm":
+        await backend.cancel(handle)
+        result = await backend.wait(handle, 2)
+        assert result.timed_out is False
+    else:
+        result = await backend.wait(handle, 0.01)
+        assert result.timed_out is True
+    await backend.cleanup(handle)
+
+    assert result.stdout_path == stdout_files[0]
+    assert result.stdout_path.read_text() == "before termination\n"
+    assert result.stderr_path is not None
+    assert result.stderr_path.read_text() == "diagnostic stderr\n"
+    assert result.stdout_path.stat().st_mode & 0o777 == 0o600
+    assert result.stderr_path.stat().st_mode & 0o777 == 0o600
 
 
 @pytest.mark.asyncio
@@ -307,10 +499,14 @@ async def test_direct_termination_kills_pipe_holding_grandchild(
         monkeypatch.setenv("MIMIR_WORKLINK_MAX_STDOUT_BYTES", "1")
     output = "overflow" if trigger == "overflow" else "ready"
     source = (
-        "import subprocess,sys,time; "
-        "subprocess.Popen([sys.executable,'-c',"
-        "'import signal,time; signal.signal(signal.SIGTERM,signal.SIG_IGN); time.sleep(30)']); "
-        "time.sleep(.1); "
+        "import os,subprocess,sys,time; "
+        "ready_r,ready_w=os.pipe(); "
+        "child_source=f\"import os,signal,time; "
+        "signal.signal(signal.SIGTERM,signal.SIG_IGN); "
+        "os.write({ready_w},b'1'); os.close({ready_w}); time.sleep(30)\"; "
+        "subprocess.Popen([sys.executable,'-c',child_source],pass_fds=(ready_w,)); "
+        "os.close(ready_w); "
+        "assert os.read(ready_r,1)==b'1'; os.close(ready_r); "
         f"print({output!r},flush=True); "
         "time.sleep(30)"
     )
@@ -318,8 +514,8 @@ async def test_direct_termination_kills_pipe_holding_grandchild(
     handle = await backend.launch(direct_spec(source))
 
     result = await asyncio.wait_for(
-        # Let the source pass its 100ms startup delay so the grandchild owns
-        # the SIGTERM-ignore state this assertion is intended to exercise.
+        # The source prints only after the grandchild has installed its
+        # SIGTERM-ignore handler, so timeout termination is deterministic.
         backend.wait(handle, 0.2 if trigger == "timeout" else 2), timeout=3
     )
     await backend.cleanup(handle)
@@ -479,6 +675,10 @@ async def test_closed_worker_direct_parity_inventory(
                 assert path == str(worker_client.DEFAULT_EXECUTOR_SOCKET)
                 socket_events.append("connect")
 
+            def settimeout(self, timeout_s: float) -> None:
+                assert timeout_s == worker_client.CANCEL_SOCKET_TIMEOUT_S
+                socket_events.append("timeout")
+
             def getsockopt(self, *_args: Any) -> bytes:
                 socket_events.append("peer-credentials")
                 return struct.pack("3i", 4321, 0, 4321)
@@ -534,6 +734,7 @@ async def test_closed_worker_direct_parity_inventory(
         ]
         assert socket_events == [
             "socket",
+            "timeout",
             "connect",
             "peer-credentials",
             "cancel-request",

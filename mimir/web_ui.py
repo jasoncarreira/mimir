@@ -45,7 +45,7 @@ from typing import Any, Callable
 from aiohttp import web
 
 from . import __version__
-from ._jsonl_tail import _tail_lines, count_lines_chunked, tail_jsonl_records
+from ._jsonl_tail import JsonlReadStatus, count_lines_chunked, tail_jsonl_records
 from .admin_config import build_admin_config_payload
 from .admin_users import build_users_payload, roles_for_request
 from .dashboard_extensions import (
@@ -54,10 +54,12 @@ from .dashboard_extensions import (
     add_backend_namespace_routes,
     first_party_dashboard_extensions,
 )
+from .event_logger import safe_log_event
 from .chainlink_board import (
     build_chainlink_board_payload,
     resolve_worklink_artifact,
 )
+from .worklink.backends.feature_factory import _RUN_ID as _FACTORY_RUN_ID_RE
 from .worklink.factory_state import (
     FactoryRunRecord,
     FactoryRecordError,
@@ -103,8 +105,6 @@ from .wiki_backlinks import (
 )
 
 log = logging.getLogger(__name__)
-
-_SAFE_FACTORY_RUN_ID_RE = re.compile(r"[1-9][0-9]{0,18}")
 
 _TURN_VIEWER_HTML: str | None = None
 _WEB_AUTH_JS: str | None = None
@@ -573,7 +573,12 @@ def _legacy_frontend_headers() -> dict[str, str]:
     }
 
 
-def _read_jsonl(path: Path, *, max_records: int = 5000) -> list[dict[str, Any]]:
+def _read_jsonl(
+    path: Path,
+    *,
+    max_records: int = 5000,
+    read_status: JsonlReadStatus | None = None,
+) -> list[dict[str, Any]]:
     """Read up to ``max_records`` records from the tail of ``path``.
 
     Pre-2026-05-10 this forward-read the entire file synchronously per
@@ -590,7 +595,11 @@ def _read_jsonl(path: Path, *, max_records: int = 5000) -> list[dict[str, Any]]:
 
     Returns [] for missing or unreadable files.
     """
-    return _read_jsonl_matching(path, max_records=max_records)
+    return _read_jsonl_matching(
+        path,
+        max_records=max_records,
+        read_status=read_status,
+    )
 
 
 def _read_jsonl_matching(
@@ -599,6 +608,7 @@ def _read_jsonl_matching(
     max_records: int | None = 5000,
     include: Callable[[dict[str, Any]], bool] | None = None,
     stop_when: Callable[[list[dict[str, Any]]], bool] | None = None,
+    read_status: JsonlReadStatus | None = None,
 ) -> list[dict[str, Any]]:
     """Read tail JSONL records until ``max_records`` scanned or ``stop_when``.
 
@@ -608,26 +618,17 @@ def _read_jsonl_matching(
     state events even when those events are older than the generic dashboard
     window. Output remains chronological.
     """
-    if not path.is_file():
-        return []
     out_newest_first: list[dict[str, Any]] = []
-    scanned = 0
-    try:
-        for line in _tail_lines(path):
-            scanned += 1
-            if max_records is not None and scanned > max_records:
-                break
-            try:
-                record = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if include is not None and not include(record):
-                continue
-            out_newest_first.append(record)
-            if stop_when is not None and stop_when(out_newest_first):
-                break
-    except OSError:
-        return []
+    for record in tail_jsonl_records(
+        path,
+        max_lines=max_records,
+        read_status=read_status,
+    ):
+        if include is not None and not include(record):
+            continue
+        out_newest_first.append(record)
+        if stop_when is not None and stop_when(out_newest_first):
+            break
     return list(reversed(out_newest_first))
 
 
@@ -637,11 +638,14 @@ def web_gate_active(api_key: str | None, resolver: Any) -> bool:
     Single source of truth shared by the auth middleware (server.py) AND
     /web/bootstrap, so the auth state the browser is told never drifts from
     what the middleware actually enforces. The gate is on when a master key is
-    set OR per-user web keys exist (the fail-safe: configuring users can't
-    leave the server open even if MIMIR_API_KEY is unset)."""
+    set, per-user web keys exist, or the resolver latched closed after prior
+    credentials or a load failure."""
     if api_key:
         return True
-    return resolver is not None and resolver.has_web_keys()
+    return resolver is not None and (
+        resolver.has_web_keys()
+        or bool(getattr(resolver, "web_gate_latched", lambda: False)())
+    )
 
 
 def _whoami_payload(identity: Any, is_master: bool) -> dict[str, Any]:
@@ -767,20 +771,22 @@ def _turns_tail_page(
     *,
     limit: int,
     channel: str | None = None,
+    read_status: JsonlReadStatus | None = None,
 ) -> list[dict[str, Any]]:
     if limit <= 0:
         return []
     limit = min(limit, _TURNS_MAX_PAGE_RECORDS)
     out: list[dict[str, Any]] = []
-    try:
-        for record in tail_jsonl_records(path, max_records=_TURNS_MAX_SCAN_RECORDS):
-            if not isinstance(record, dict) or not _record_matches_channel(record, channel):
-                continue
-            out.append(record)
-            if len(out) >= limit:
-                break
-    except OSError:
-        return []
+    for record in tail_jsonl_records(
+        path,
+        max_records=_TURNS_MAX_SCAN_RECORDS,
+        read_status=read_status,
+    ):
+        if not isinstance(record, dict) or not _record_matches_channel(record, channel):
+            continue
+        out.append(record)
+        if len(out) >= limit:
+            break
     out.reverse()
     return out
 
@@ -790,20 +796,22 @@ def _turns_after_page(
     *,
     after: str,
     channel: str | None = None,
+    read_status: JsonlReadStatus | None = None,
 ) -> tuple[list[dict[str, Any]], bool]:
     if not after:
         return [], False
     newest_first: list[dict[str, Any]] = []
-    try:
-        for record in tail_jsonl_records(path, max_records=_TURNS_MAX_SCAN_RECORDS):
-            if not isinstance(record, dict) or not _record_matches_channel(record, channel):
-                continue
-            if record.get("turn_id") == after:
-                newest_first.reverse()
-                return newest_first, True
-            newest_first.append(record)
-    except OSError:
-        return [], False
+    for record in tail_jsonl_records(
+        path,
+        max_records=_TURNS_MAX_SCAN_RECORDS,
+        read_status=read_status,
+    ):
+        if not isinstance(record, dict) or not _record_matches_channel(record, channel):
+            continue
+        if record.get("turn_id") == after:
+            newest_first.reverse()
+            return newest_first, True
+        newest_first.append(record)
     return [], False
 
 
@@ -813,6 +821,7 @@ def _turns_before_page(
     before: str,
     limit: int,
     channel: str | None = None,
+    read_status: JsonlReadStatus | None = None,
 ) -> tuple[list[dict[str, Any]], bool, bool]:
     if not before or limit <= 0:
         return [], False, False
@@ -821,21 +830,22 @@ def _turns_before_page(
     found = False
     has_more = False
     scanned = 0
-    try:
-        for record in tail_jsonl_records(path, max_records=_TURNS_MAX_SCAN_RECORDS):
-            scanned += 1
-            if not isinstance(record, dict) or not _record_matches_channel(record, channel):
-                continue
-            if not found:
-                found = record.get("turn_id") == before
-                continue
-            if len(out) < limit:
-                out.append(record)
-            else:
-                has_more = True
-                break
-    except OSError:
-        return [], False, False
+    for record in tail_jsonl_records(
+        path,
+        max_records=_TURNS_MAX_SCAN_RECORDS,
+        read_status=read_status,
+    ):
+        scanned += 1
+        if not isinstance(record, dict) or not _record_matches_channel(record, channel):
+            continue
+        if not found:
+            found = record.get("turn_id") == before
+            continue
+        if len(out) < limit:
+            out.append(record)
+        else:
+            has_more = True
+            break
     if not found:
         return [], False, False
     out.reverse()
@@ -900,8 +910,10 @@ def register_routes(
     subscription provider (e.g. ``"codex_plus"``); None shows every provider
     that has quota data.
 
-    ``react_app_dist`` points at the Vite build output. When omitted it defaults
-    to the packaged ``mimir/react_app/dist`` directory.
+    ``react_app_dist`` points at the Vite build output. It takes precedence over
+    ``MIMIR_REACT_APP_DIST``, which deployments rebuilding the frontend in place
+    can point at their live build directory. With neither set, the default is the
+    packaged ``mimir/react_app/dist`` directory beside this module.
 
     ``dashboard_extensions`` is the trusted first-party dashboard registry.
     Enabled manifests drive optional backend namespace hook registration; this
@@ -912,8 +924,31 @@ def register_routes(
     ensure_web_ui_config(home)
 
     existing = {(r.method, r.resource.canonical) for r in app.router.routes()}
-    _react_app_dist = react_app_dist or (Path(__file__).parent / "react_app" / "dist")
+    configured_react_dist = os.environ.get("MIMIR_REACT_APP_DIST", "").strip()
+    _react_app_dist = (
+        react_app_dist
+        or (Path(configured_react_dist) if configured_react_dist else None)
+        or (Path(__file__).parent / "react_app" / "dist")
+    )
     _dashboard_extensions = dashboard_extensions or first_party_dashboard_extensions()
+    failed_state_reads: set[Path] = set()
+
+    async def _report_state_read(path: Path, status: JsonlReadStatus) -> bool:
+        """Emit once per failed-read transition and clear state on recovery."""
+        if not status.degraded:
+            failed_state_reads.discard(path)
+            return False
+        if path not in failed_state_reads:
+            failed_state_reads.add(path)
+            error = status.error
+            error_text = f"{type(error).__name__}: {error}"
+            log.warning("state read failed for %s: %s", path, error_text)
+            await safe_log_event(
+                "state_read_failed",
+                path=str(path),
+                error=error_text,
+            )
+        return True
 
     async def turns_page(_request: web.Request) -> web.Response:
         return web.Response(
@@ -926,7 +961,7 @@ def register_routes(
         request: web.Request,
         *,
         channel: str | None = None,
-    ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    ) -> tuple[list[dict[str, Any]], dict[str, Any], JsonlReadStatus]:
         # Pagination params (progressive loading — the viewers must not pull
         # the whole — now hundreds-of-MB — turns.jsonl up front):
         #   ?after=<turn_id>           — turns strictly newer than turn_id (live poll)
@@ -946,49 +981,87 @@ def register_routes(
         except ValueError:
             limit = 0
         limit = max(0, min(limit, _TURNS_MAX_PAGE_RECORDS))
+        read_status = JsonlReadStatus()
 
         if after:
-            window, found = _turns_after_page(turns_log, after=after, channel=channel)
+            window, found = _turns_after_page(
+                turns_log,
+                after=after,
+                channel=channel,
+                read_status=read_status,
+            )
+            if read_status.degraded:
+                return window, list_meta(limit=limit or None), read_status
             if not found:
                 raise _TurnCursorNotFound(after)
             cursor = str(window[-1].get("turn_id")) if window and window[-1].get("turn_id") else None
-            return window, list_meta(cursor=cursor, limit=limit or None, total=None, truncated=False)
+            return (
+                window,
+                list_meta(cursor=cursor, limit=limit or None, total=None, truncated=False),
+                read_status,
+            )
 
         if before:
             window, has_more, found = _turns_before_page(
-                turns_log, before=before, limit=limit, channel=channel
+                turns_log,
+                before=before,
+                limit=limit,
+                channel=channel,
+                read_status=read_status,
             )
+            if read_status.degraded:
+                return window, list_meta(limit=limit or None), read_status
             if not found:
                 raise _TurnCursorNotFound(before)
             cursor = str(window[0].get("turn_id")) if window and window[0].get("turn_id") else None
-            return window, list_meta(
-                cursor=cursor,
-                limit=limit or None,
-                total=None,
-                truncated=has_more,
+            return (
+                window,
+                list_meta(
+                    cursor=cursor,
+                    limit=limit or None,
+                    total=None,
+                    truncated=has_more,
+                ),
+                read_status,
             )
 
         if limit > 0:
-            window = _turns_tail_page(turns_log, limit=limit, channel=channel)
-            cursor = str(window[-1].get("turn_id")) if window and window[-1].get("turn_id") else None
-            return window, list_meta(
-                cursor=cursor,
+            window = _turns_tail_page(
+                turns_log,
                 limit=limit,
-                total=None,
-                truncated=len(window) >= limit,
+                channel=channel,
+                read_status=read_status,
+            )
+            cursor = str(window[-1].get("turn_id")) if window and window[-1].get("turn_id") else None
+            return (
+                window,
+                list_meta(
+                    cursor=cursor,
+                    limit=limit,
+                    total=None,
+                    truncated=len(window) >= limit,
+                ),
+                read_status,
             )
 
         # Back-compat endpoint behavior for ad-hoc callers that omit a limit.
         # This remains bounded by _read_jsonl's retained-record cap, but UI
         # callers use explicit cursor/limit params and avoid this path.
-        records = _filter_records_by_channel(_read_jsonl(turns_log), channel)
+        records = _filter_records_by_channel(
+            _read_jsonl(turns_log, read_status=read_status),
+            channel,
+        )
         total = len(records)
         cursor = str(records[-1].get("turn_id")) if records and records[-1].get("turn_id") else None
-        return records, list_meta(cursor=cursor, limit=None, total=total, truncated=False)
+        return (
+            records,
+            list_meta(cursor=cursor, limit=None, total=total, truncated=False),
+            read_status,
+        )
 
     async def turns_data(request: web.Request) -> web.Response:
         try:
-            records, _meta = await asyncio.to_thread(
+            records, _meta, read_status = await asyncio.to_thread(
                 _turns_response,
                 request,
                 channel=_request_user_web_channel(request),
@@ -1006,14 +1079,21 @@ def register_routes(
                 },
                 status=409,
             )
-        return web.json_response({"turns": records})
+        payload: dict[str, Any] = {"turns": records}
+        if await _report_state_read(turns_log, read_status):
+            payload["degraded"] = True
+        return web.json_response(payload)
 
     async def turns_data_v1(request: web.Request) -> web.Response:
         channel, error = _scoped_channel_from_query(request)
         if error is not None:
             return error
         try:
-            turns, meta = await asyncio.to_thread(_turns_response, request, channel=channel)
+            turns, meta, read_status = await asyncio.to_thread(
+                _turns_response,
+                request,
+                channel=channel,
+            )
         except _TurnCursorNotFound as exc:
             return json_error(
                 "cursor_not_found",
@@ -1021,7 +1101,10 @@ def register_routes(
                 status=409,
                 details={"cursor": exc.cursor, "scan_limit": _TURNS_MAX_SCAN_RECORDS},
             )
-        return json_success({"turns": turns}, meta=meta)
+        data: dict[str, Any] = {"turns": turns}
+        if await _report_state_read(turns_log, read_status):
+            data["degraded"] = True
+        return json_success(data, meta=meta)
 
     async def sessions_data_v1(request: web.Request) -> web.Response:
         channel, error = _scoped_channel_from_query(request)
@@ -1085,8 +1168,12 @@ def register_routes(
         type_filter: set[str],
         limit: int,
         channel: str | None,
-    ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-        records = _filter_event_records_by_channel(_read_jsonl(events_log), channel)
+    ) -> tuple[list[dict[str, Any]], dict[str, Any], JsonlReadStatus]:
+        read_status = JsonlReadStatus()
+        records = _filter_event_records_by_channel(
+            _read_jsonl(events_log, read_status=read_status),
+            channel,
+        )
 
         out = records
         if since:
@@ -1097,34 +1184,44 @@ def register_routes(
         if limit > 0:
             out = out[-limit:]
         cursor = str(out[-1].get("timestamp")) if out and out[-1].get("timestamp") else None
-        return out, list_meta(
-            cursor=cursor,
-            limit=limit or None,
-            total=total,
-            truncated=bool(limit > 0 and total > limit),
+        return (
+            out,
+            list_meta(
+                cursor=cursor,
+                limit=limit or None,
+                total=total,
+                truncated=bool(limit > 0 and total > limit),
+            ),
+            read_status,
         )
 
     async def events_data(request: web.Request) -> web.Response:
         since, type_filter, limit, channel = _parse_events_query(request)
-        out, _meta = await asyncio.to_thread(
+        out, _meta, read_status = await asyncio.to_thread(
             _events_window,
             since=since,
             type_filter=type_filter,
             limit=limit,
             channel=channel,
         )
-        return web.json_response({"events": out})
+        payload: dict[str, Any] = {"events": out}
+        if await _report_state_read(events_log, read_status):
+            payload["degraded"] = True
+        return web.json_response(payload)
 
     async def events_data_v1(request: web.Request) -> web.Response:
         since, type_filter, limit, channel = _parse_events_query(request)
-        events, meta = await asyncio.to_thread(
+        events, meta, read_status = await asyncio.to_thread(
             _events_window,
             since=since,
             type_filter=type_filter,
             limit=limit,
             channel=channel,
         )
-        return json_success({"events": events}, meta=meta)
+        data: dict[str, Any] = {"events": events}
+        if await _report_state_read(events_log, read_status):
+            data["degraded"] = True
+        return json_success(data, meta=meta)
 
     live_events_active = 0
     live_events_lock = asyncio.Lock()
@@ -1147,11 +1244,12 @@ def register_routes(
         since: str | None,
         *,
         channel: str | None = None,
-    ) -> tuple[list[dict[str, Any]], str | None]:
+    ) -> tuple[list[dict[str, Any]], str | None, JsonlReadStatus]:
         try:
             limit = int(request.query.get("limit") or 0)
         except ValueError:
             limit = 0
+        read_status = JsonlReadStatus()
         items = await asyncio.to_thread(
             read_live_event_items_since,
             turns_log,
@@ -1160,6 +1258,7 @@ def register_routes(
             # caller could receive an empty page whenever other channels have
             # newer events than their own.
             limit=None if channel is not None else limit or None,
+            read_status=read_status,
         )
         scanned_cursor = items[-1].cursor if items else since
         out = [item.as_dict() for item in items]
@@ -1167,7 +1266,7 @@ def register_routes(
             out = [item for item in out if _live_event_item_channel(item) == channel]
             if limit > 0:
                 out = out[-limit:]
-        return out, scanned_cursor
+        return out, scanned_cursor, read_status
 
     async def live_events_stream(request: web.Request) -> web.StreamResponse:
         """Fetch-authenticated SSE stream for React live dashboards.
@@ -1197,12 +1296,19 @@ def register_routes(
 
         delivered = request.query.get("since", "").strip() or None
         idle_for = 0.0
+        stream_degraded = False
         try:
             await resp.prepare(request)
             while True:
-                items, scanned_cursor = await _live_event_items(
+                items, scanned_cursor, read_status = await _live_event_items(
                     request, delivered, channel=channel
                 )
+                degraded = await _report_state_read(turns_log, read_status)
+                if degraded and not stream_degraded:
+                    await resp.write(
+                        b'event: state-degraded\ndata: {"degraded": true}\n\n'
+                    )
+                stream_degraded = degraded
                 for item in items:
                     block = (
                         f"id: {item['cursor']}\n"
@@ -1333,11 +1439,18 @@ def register_routes(
     async def web_bootstrap(request: web.Request) -> web.Response:
         api_key = str(request.app.get("api_key") or "")
         gate = web_gate_active(api_key, request.app.get("identity_resolver"))
+        public_payload = {"version": __version__, "auth": {"required": gate}}
+        if gate and not (
+            request.get("auth_is_master")
+            or request.get("auth_identity") is not None
+        ):
+            return web.json_response(public_payload, headers=_no_store_headers())
         config = request.app.get("config")
         web_host = str(getattr(config, "web_host", "") or "")
         public_bind = web_host not in ("", "127.0.0.1", "::1", "localhost")
         return web.json_response(
             {
+                "version": __version__,
                 "auth": {
                     "required": gate,
                     "scheme": "x-api-key",
@@ -1361,6 +1474,12 @@ def register_routes(
     async def web_bootstrap_v1(request: web.Request) -> web.Response:
         api_key = str(request.app.get("api_key") or "")
         gate = web_gate_active(api_key, request.app.get("identity_resolver"))
+        public_payload = {"version": __version__, "auth": {"required": gate}}
+        if gate and not (
+            request.get("auth_is_master")
+            or request.get("auth_identity") is not None
+        ):
+            return json_success(public_payload, headers=_no_store_headers())
         config = request.app.get("config")
         web_host = str(getattr(config, "web_host", "") or "")
         public_bind = web_host not in ("", "127.0.0.1", "::1", "localhost")
@@ -1482,9 +1601,9 @@ def register_routes(
     def _serialize_factory_run_detail(record: FactoryRunRecord) -> dict[str, Any]:
         result = _serialize_factory_run_summary(record)
         state = record.status
-        result["gates"] = state.gates if state is not None else {}
-        result["steps"] = list(state.steps) if state is not None else []
-        result["slices"] = list(state.slices) if state is not None else []
+        result["gates"] = state.gates if state is not None and state.gates is not None else {}
+        result["steps"] = list(state.steps) if state is not None and state.steps is not None else []
+        result["slices"] = list(state.slices) if state is not None and state.slices is not None else []
         result["validator"] = state.validator if state is not None else None
         result["terminal_result"] = (
             state.terminal_result if state is not None else None
@@ -1504,7 +1623,7 @@ def register_routes(
         run_id = request.match_info.get("run_id", "").strip()
         if not run_id:
             return json_error("missing_run_id", "run_id is required", status=400)
-        if not _SAFE_FACTORY_RUN_ID_RE.fullmatch(run_id) or ".." in run_id:
+        if not _FACTORY_RUN_ID_RE.fullmatch(run_id) or ".." in run_id:
             return json_error("invalid_run_id", "run_id is invalid", status=400)
 
         if home is None:
@@ -1681,9 +1800,17 @@ def register_routes(
         canonical = str((body or {}).get("canonical") or "").strip()
         if not canonical:
             return json_error("bad_request", "canonical required", status=400)
-        from .identities_populator import revoke_web_key
+        from .identities_populator import LastWebKeyError, revoke_web_key
 
-        revoked = await asyncio.to_thread(revoke_web_key, home, canonical)
+        try:
+            revoked = await asyncio.to_thread(
+                revoke_web_key,
+                home,
+                canonical,
+                allow_last=bool(request.app.get("api_key")),
+            )
+        except LastWebKeyError as exc:
+            return json_error("last_web_key", str(exc), status=409)
         resolver = request.app.get("identity_resolver")
         if resolver is not None:
             await asyncio.to_thread(resolver.reload)
@@ -1702,6 +1829,8 @@ def register_routes(
         return MCPPolicyStore(home / "state" / "mcp-policy.json")
 
     def _mcp_payload() -> dict[str, Any]:
+        from .admin_config import _redact_config_value
+
         store = _mcp_store()
         tools = store.load()
         servers = []
@@ -1710,23 +1839,13 @@ def register_routes(
                 dict(tool) for tool in tools.values()
                 if tool.get("server_config_id") == server_id
             ]
-            env = {
-                str(key): (
-                    str(value)
-                    if "${" in str(value) or not any(
-                        marker in str(key).lower()
-                        for marker in ("token", "secret", "password", "key", "auth", "credential")
-                    )
-                    else "[REDACTED]"
-                )
-                for key, value in dict(record.get("env", {})).items()
-            }
+            env = _redact_config_value(dict(record.get("env", {})))
             servers.append({
                 "server_config_id": server_id,
                 "name": str(record.get("name", "")),
                 "transport": "stdio",
-                "command": str(record.get("command", "")),
-                "args": list(record.get("args", [])),
+                "command": _redact_config_value(str(record.get("command", ""))),
+                "args": _redact_config_value(list(record.get("args", []))),
                 "env": env,
                 "policy_version": str(record.get("policy_version", "")),
                 "tools": sorted(server_tools, key=lambda item: str(item.get("original_tool_name", ""))),
@@ -1770,6 +1889,27 @@ def register_routes(
                 "direction": "neither",
             }],
         }
+
+    def _restore_redacted_values(value: Any, prior: Any) -> Any:
+        from .admin_config import _redact_config_value
+
+        if value == "[REDACTED]":
+            return prior if prior is not None else value
+        if value == _redact_config_value(prior):
+            return prior
+        if isinstance(value, dict) and isinstance(prior, dict):
+            return {
+                key: _restore_redacted_values(item, prior.get(key))
+                for key, item in value.items()
+            }
+        if isinstance(value, list) and isinstance(prior, list):
+            return [
+                _restore_redacted_values(
+                    item, prior[index] if index < len(prior) else None,
+                )
+                for index, item in enumerate(value)
+            ]
+        return value
 
     async def _discover_mcp_server(record: dict[str, Any]) -> None:
         from .mcp_client import MCPManager, MCPServerConfig, get_tool_provenance, _provenance_record
@@ -1826,11 +1966,9 @@ def register_routes(
             if path_id and path_id not in existing_servers:
                 return json_error("not_found", "MCP server not found", status=404)
             if path_id:
-                prior_env = dict(existing_servers[path_id].get("env", {}))
-                record["env"] = {
-                    key: prior_env.get(key, value) if value == "[REDACTED]" else value
-                    for key, value in record["env"].items()
-                }
+                record = _restore_redacted_values(
+                    record, existing_servers[path_id],
+                )
             await _discover_mcp_server(record)
             store.upsert_server(record)
             payload = _mcp_payload()
@@ -2172,7 +2310,7 @@ def register_routes(
     def factory_runs_backend_routes() -> list[DashboardBackendRoute]:
         return [
             DashboardBackendRoute("GET", "/api/v1/factory-runs", factory_runs_list_v1),
-            DashboardBackendRoute("GET", "/api/v1/factory-runs/{run_id:.+}", factory_runs_detail_v1),
+            DashboardBackendRoute("GET", "/api/v1/factory-runs/{run_id:.*}", factory_runs_detail_v1),
         ]
 
     def scheduler_backend_routes() -> list[DashboardBackendRoute]:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 import json
 import os
@@ -14,7 +15,9 @@ import pytest
 from mimir.cli import main
 from mimir.worklink.orchestrator import WorklinkRunResult
 from mimir.worklink.control import reconcile_run_states, stop_worklink, worklink_status
+from mimir.worklink.autonomy import check_concurrency
 from mimir.worklink.backends.feature_factory import parse_factory_status
+from mimir.worklink.claims import ChainlinkClaims
 from mimir.worklink.compute import LaunchHandle
 from mimir.worklink.factory_state import FactoryRunRecord, load_factory_record, save_factory_record
 from mimir.worklink.run_state import WorklinkRunState, load_run_state, process_start_ticks, save_run_state
@@ -67,6 +70,56 @@ def test_worklink_run_cli_dispatches_operator_vertical(
         }
     ]
     assert "worklink #441 attempt 1: completed review-ready" in capsys.readouterr().out
+
+
+def test_worklink_run_cli_requires_explicit_base_instead_of_using_cwd(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.delenv("WORKLINK_REPO", raising=False)
+    monkeypatch.delenv("MIMIR_WORKLINK_REPO", raising=False)
+
+    with pytest.raises(SystemExit) as exc:
+        main(["worklink", "run", "441"])
+
+    assert exc.value.code == 1
+    assert "WORKLINK_REPO is required" in capsys.readouterr().err
+
+
+def test_worklink_emit_work_item_has_wire_clean_stdout(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    import mimir.commands.worklink as worklink_cmd
+
+    payload = '{"body":"path\\\\to\\\\file","run_id":"chainlink-441","title":"Title"}'
+    monkeypatch.setattr(worklink_cmd, "read_work_item", lambda issue_id: payload)
+
+    with pytest.raises(SystemExit) as exc:
+        main(["worklink", "emit-work-item", "441"])
+
+    assert exc.value.code == 0
+    captured = capsys.readouterr()
+    assert captured.out == payload
+    assert captured.err == ""
+
+
+def test_worklink_emit_work_item_failure_has_no_stdout(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    import mimir.commands.worklink as worklink_cmd
+    from mimir.worklink.orchestrator import WorklinkError
+
+    def missing(_issue_id: int) -> str:
+        raise WorklinkError("issue not found")
+
+    monkeypatch.setattr(worklink_cmd, "read_work_item", missing)
+
+    with pytest.raises(SystemExit) as exc:
+        main(["worklink", "emit-work-item", "999"])
+
+    assert exc.value.code == 1
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == "error: issue not found\n"
 
 
 def test_worklink_run_cli_forwards_base_flag(
@@ -209,6 +262,75 @@ def test_worklink_cli_has_no_factory_cancel_transition() -> None:
 
     with pytest.raises(SystemExit):
         parser.parse_args(["worklink", "factory-cancel", "700"])
+
+
+def test_worklink_archive_factory_run_cli_archives_canonical_and_legacy_records(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    canonical = FactoryRunRecord(
+        run_id="chainlink-700",
+        issue_id=700,
+        attempt=2,
+        repository="owner/repo",
+        base_ref="main",
+        branch="feature/chainlink-700",
+        launcher="/opt/factory/bin/factory.js",
+        sandbox=str(tmp_path / "chainlink-700"),
+        session="session-2",
+        handle=None,
+        status=None,
+        observed_at=None,
+        controller_phase="stopped",
+    )
+    legacy = replace(
+        canonical,
+        run_id="700",
+        attempt=1,
+        branch="epic/700",
+        sandbox=str(tmp_path / "legacy"),
+        session="session-1",
+    )
+    save_factory_record(tmp_path, canonical)
+    save_factory_record(tmp_path, legacy)
+    events: list[tuple[str, dict[str, object]]] = []
+    import mimir.commands.worklink as worklink_cmd
+
+    monkeypatch.setattr(
+        worklink_cmd,
+        "log_durable_event_sync",
+        lambda event, **payload: events.append((event, payload)),
+    )
+    import mimir.event_logger as event_logger
+
+    monkeypatch.setattr(event_logger, "init_logger", lambda *args, **kwargs: None)
+
+    with pytest.raises(SystemExit) as exc:
+        main(["worklink", "archive-factory-run", "700", "--home", str(tmp_path)])
+
+    assert exc.value.code == 0
+    assert load_factory_record(tmp_path, "chainlink-700") is None
+    assert load_factory_record(tmp_path, "700") is None
+    archives = sorted((tmp_path / "state/worklink/factory-runs/archive").glob("*.json"))
+    assert len(archives) == 2
+    assert [(event, payload["source"], payload["reason"]) for event, payload in events] == [
+        (
+            "worklink_factory_record_archived",
+            "operator_command",
+            "operator requested archival",
+        ),
+        (
+            "worklink_factory_record_archived",
+            "operator_command",
+            "operator requested archival",
+        ),
+    ]
+    assert {(payload["run_id"], payload["phase"]) for _, payload in events} == {
+        ("chainlink-700", "stopped"),
+        ("700", "stopped"),
+    }
+    assert "archived 2 factory record(s)" in capsys.readouterr().out
 
 
 def test_worklink_cli_rejects_unknown_subcommand(
@@ -496,7 +618,9 @@ def test_stop_clears_state_for_reused_pid_without_signalling(tmp_path: Path) -> 
     assert load_run_state(tmp_path, 9) is None
 
 
-def test_reconcile_reaps_orphan_and_leaves_live_state(tmp_path: Path) -> None:
+def test_reconcile_releases_orphan_slot_routes_label_and_leaves_live_lock(
+    tmp_path: Path,
+) -> None:
     now = datetime.now(UTC)
     _state(
         tmp_path,
@@ -505,61 +629,175 @@ def test_reconcile_reaps_orphan_and_leaves_live_state(tmp_path: Path) -> None:
         ticks=process_start_ticks(os.getpid()),
         started_at=now,
     )
-    _state(tmp_path, 11, 999_999_999, ticks=1, started_at=now - timedelta(seconds=90))
-    shim_state = WorklinkRunState(
-        **{
-            **_state(
-                tmp_path,
-                12,
-                999_999_998,
-                ticks=1,
-                started_at=now - timedelta(seconds=60),
-            ).to_json(),
-            "handle_identifier": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
-            "shim_pid": 999_999_998,
-        }
+    dead = _state(
+        tmp_path, 11, 999_999_999, ticks=1, started_at=now - timedelta(seconds=90)
     )
-    save_run_state(tmp_path, shim_state)
+    checkout = tmp_path / "checkout-11"
+    checkout.mkdir()
+    dead = replace(dead, checkout=str(checkout), local_base="base-sha")
+    save_run_state(tmp_path, dead)
     events: list[tuple[str, dict[str, object]]] = []
+    locks = {10, 11}
+    labels = {10: {"worklink:in-progress"}, 11: {"worklink:in-progress"}}
+    calls: list[list[str]] = []
+
+    def runner(args: list[str]) -> subprocess.CompletedProcess[str]:
+        calls.append(list(args))
+        if args[1:3] == ["locks", "release"]:
+            locks.discard(int(args[3]))
+        elif args[1:3] == ["locks", "list"]:
+            return subprocess.CompletedProcess(
+                args,
+                0,
+                stdout=json.dumps(
+                    {"locks": [{"issue_id": issue} for issue in locks]}
+                ),
+                stderr="",
+            )
+        elif args[1:3] == ["issue", "unlabel"]:
+            labels[int(args[3])].discard(args[4])
+        elif args[1:3] == ["issue", "label"]:
+            labels[int(args[3])].add(args[4])
+        elif args[1:3] == ["issue", "show"]:
+            issue_id = int(args[3])
+            return subprocess.CompletedProcess(
+                args,
+                0,
+                stdout=json.dumps(
+                    {"id": issue_id, "labels": sorted(labels[issue_id])}
+                ),
+                stderr="",
+            )
+        elif args[1:3] == ["issue", "list"]:
+            return subprocess.CompletedProcess(args, 0, stdout="[]", stderr="")
+        return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+
+    def git_runner(args: list[str]) -> subprocess.CompletedProcess[str]:
+        if args[3:5] == ["rev-parse", "HEAD"]:
+            stdout = "local-head\n"
+        elif args[3:5] == ["rev-list", "--count"]:
+            stdout = "4\n"
+        elif args[3:5] == ["ls-remote", "--heads"]:
+            stdout = "remote-head\trefs/heads/issue/11-a2\n"
+        else:
+            raise AssertionError(args)
+        return subprocess.CompletedProcess(args, 0, stdout=stdout, stderr="")
 
     alive = reconcile_run_states(
         tmp_path,
         event_logger=lambda event, **payload: events.append((event, payload)),
+        runner=runner,
+        git_runner=git_runner,
         now=now,
     )
 
     assert [state.issue_id for state in alive] == [10]
     assert load_run_state(tmp_path, 10) is not None
     assert load_run_state(tmp_path, 11) is None
+    assert locks == {10}
+    assert labels[10] == {"worklink:in-progress"}
+    assert labels[11] == {"worklink:blocked"}
+    assert [call for call in calls if call[1:3] == ["locks", "release"]] == [
+        ["chainlink", "locks", "release", "11"]
+    ]
+    event, payload = events[0]
+    assert event == "worklink_run_orphaned"
+    assert payload["unpublished_commits"] is True
+    assert payload["resulting_label"] == "worklink:blocked"
+    assert payload["lock_released"] is True
+
+    # The authoritative lock count, not merely a mocked call, proves that the
+    # dead run returned its slot. Status also has no unrecorded disagreement.
+    claims = ChainlinkClaims(agent_id="test", runner=runner)
+    assert claims.active_worklink_lock_count() == 1
+    concurrency = check_concurrency(tmp_path, claims=claims)
+    assert (concurrency.active, concurrency.cap, concurrency.allowed) == (1, 2, True)
+    rows = worklink_status(tmp_path, issue_ids=[11], runner=runner)
+    assert rows[0].classification == "clean"
+    assert rows[0].disagreement is None
+
+
+def test_reconcile_empty_orphan_returns_ready(tmp_path: Path) -> None:
+    now = datetime.now(UTC)
+    state = _state(tmp_path, 12, 999_999_998, ticks=1, started_at=now)
+    checkout = tmp_path / "checkout-12"
+    checkout.mkdir()
+    save_run_state(tmp_path, replace(state, checkout=str(checkout), local_base="base-sha"))
+    calls: list[list[str]] = []
+
+    reconcile_run_states(
+        tmp_path,
+        runner=lambda args: calls.append(list(args))
+        or subprocess.CompletedProcess(args, 0, stdout="", stderr=""),
+        git_runner=lambda args: subprocess.CompletedProcess(
+            args,
+            0,
+            stdout="head\n" if args[3] == "rev-parse" else "0\n",
+            stderr="",
+        ),
+        now=now,
+    )
+
+    assert ["chainlink", "issue", "label", "12", "worklink:ready"] in calls
     assert load_run_state(tmp_path, 12) is None
+
+
+def test_reconcile_lock_release_failure_retains_state_and_emits_actionable_event(
+    tmp_path: Path,
+) -> None:
+    now = datetime.now(UTC)
+    state = _state(tmp_path, 13, 999_999_997, ticks=1, started_at=now)
+    checkout = tmp_path / "checkout-13"
+    checkout.mkdir()
+    save_run_state(tmp_path, replace(state, checkout=str(checkout), local_base="base-sha"))
+    events: list[tuple[str, dict[str, object]]] = []
+    calls: list[list[str]] = []
+
+    reconcile_run_states(
+        tmp_path,
+        runner=lambda args: calls.append(list(args))
+        or subprocess.CompletedProcess(args, 1, stdout="", stderr="lock owner mismatch"),
+        git_runner=lambda args: subprocess.CompletedProcess(
+            args, 0, stdout="head\n" if args[3] == "rev-parse" else "0\n", stderr=""
+        ),
+        event_logger=lambda event, **payload: events.append((event, payload)),
+        now=now,
+    )
+
+    assert calls == [["chainlink", "locks", "release", "13"]]
+    assert load_run_state(tmp_path, 13) is not None
     assert events == [
         (
-            "worklink_run_orphaned",
-            {"issue_id": 11, "attempt": 2, "elapsed_s": 90.0, "reaped": True},
-        ),
-        (
-            "worklink_run_orphaned",
-            {"issue_id": 12, "attempt": 2, "elapsed_s": 60.0, "reaped": True},
-        ),
+            "worklink_run_orphan_reconcile_failed",
+            {
+                "issue_id": 13,
+                "attempt": 2,
+                "branch": "issue/13-a2",
+                "checkout": str(checkout),
+                "reason": "lock_release_failed",
+                "error": "lock owner mismatch",
+                "state_retained": True,
+            },
+        )
     ]
 
 
-def test_factory_stop_cancels_verified_handle_without_factory_transition(
+def test_factory_stop_finds_production_record_and_cancels_verified_handle(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     import mimir.worklink.control as control
 
-    sandbox = tmp_path / "sandbox"
+    sandbox = tmp_path / "chainlink-700"
     sandbox.mkdir()
     status = parse_factory_status(
         {
-            "run_id": "700",
-            "issue_key": "700",
+            "run_id": "chainlink-700",
+            "issue_key": "chainlink-700",
             "valid": True,
             "sandbox_path": str(sandbox),
             "status": "running",
             "mode": "autonomous",
-            "branch": "epic/700",
+            "branch": "feature/chainlink-700",
             "pr_base": "main",
             "pr_draft": False,
             "lock": "fresh",
@@ -578,12 +816,12 @@ def test_factory_stop_cancels_verified_handle_without_factory_transition(
     save_factory_record(
         tmp_path,
         FactoryRunRecord(
-            run_id="700",
+            run_id="chainlink-700",
             issue_id=700,
             attempt=1,
             repository="owner/repo",
             base_ref="main",
-            branch="epic/700",
+            branch="feature/chainlink-700",
             launcher="/opt/factory/bin/factory.js",
             sandbox=str(sandbox),
             session="session-1",
@@ -610,7 +848,13 @@ def test_factory_stop_cancels_verified_handle_without_factory_transition(
 
     assert result.stopped
     assert cancelled == [handle]
-    assert load_factory_record(tmp_path, "700").controller_phase == "stopped"
+    stopped = load_factory_record(tmp_path, "chainlink-700")
+    assert stopped is not None
+    assert stopped.controller_phase == "stopped"
+    assert commands == [
+        ["chainlink", "locks", "release", "700"],
+        ["chainlink", "issue", "unlabel", "700", "worklink:in-progress"],
+    ]
     assert all("factory" not in command for command in commands)
 
 
@@ -620,7 +864,7 @@ def test_factory_stop_refuses_unverified_or_reused_process_identity(
     import mimir.worklink.control as control
 
     monkeypatch.setattr(control, "load_run_state", lambda home, issue_id: None)
-    monkeypatch.setattr(control, "load_factory_record", lambda home, run_id: object())
+    monkeypatch.setattr(control, "load_factory_records_for_issue", lambda home, issue_id: [object()])
     monkeypatch.setattr(control, "factory_process_is_alive", lambda record: False)
     monkeypatch.setattr(
         control.LocalSubprocessComputeBackend,

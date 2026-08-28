@@ -461,8 +461,11 @@ def shell_exec(
     syntax works: ``cd``-chains, pipes, redirects, ``&&`` / ``||``, globs,
     and environment expansion. Under a trusted-service profile, the command
     must instead be one argv with no shell syntax; the exact authorized argv
-    is executed with ``shell=False``. Use ``cwd`` rather than a leading
-    ``cd DIR &&``. Use ``bash_async`` for jobs that may exceed the sync timeout.
+    is executed with ``shell=False``. Recursive content reads are refused when
+    their preflight exceeds 256 entries or 8 MiB, including inside declared
+    read roots; use the typed ``grep`` tool for broad tree searches. Use ``cwd``
+    rather than a leading ``cd DIR &&``. Use ``bash_async`` for jobs that may
+    exceed the sync timeout.
 
     Args:
         command: The full shell command line (run via ``bash -lc`` for user/admin calls).
@@ -510,6 +513,7 @@ def shell_exec(
         else:
             proc = subprocess.run(  # noqa: S603 — argv is either the trusted shell wrapper or server-authorized direct argv
                 argv,
+                stdin=subprocess.DEVNULL,
                 capture_output=True,
                 timeout=_SHELL_STATE["timeout_s"],
                 cwd=effective_cwd,

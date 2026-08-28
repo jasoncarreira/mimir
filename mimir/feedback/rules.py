@@ -31,6 +31,10 @@ _EVENT_RULES: dict[str, tuple[Polarity, str]] = {
     "tool_call_denied": ("negative", "tool_denied"),
     "tool_error": ("negative", "tool_error"),
     "background_task_failed": ("negative", "background_task_failed"),
+    "liveness_unclean_restart_handoff_persist_failed": (
+        "negative", "liveness_unclean_restart_handoff_persist_failed",
+    ),
+    "startup_failed": ("negative", "startup_failed"),
     "loop_stall_watchdog_fired": ("negative", "loop_stall_watchdog_fired"),
     "scheduler_loop_lag": ("negative", "scheduler_loop_lag"),
     # chainlink #682: ``scheduler_loop_lag_host`` (the loop was woken late while
@@ -44,6 +48,13 @@ _EVENT_RULES: dict[str, tuple[Polarity, str]] = {
     "worklink_transition": ("positive", "worklink_transition"),
     "worklink_continuation_created": ("negative", "worklink_continuation"),
     "worklink_attempts_exhausted": ("negative", "worklink_attempts_exhausted"),
+    "worklink_run_orphaned": ("negative", "worklink_run_orphaned"),
+    "worklink_run_orphan_reconcile_failed": (
+        "negative", "worklink_run_orphan_reconcile_failed",
+    ),
+    "worklink_tool_pin_dedupe_check_failed": (
+        "negative", "worklink_tool_pin_dedupe_check_failed",
+    ),
     "tool_call_budget_warning": ("negative", "tool_budget"),
     # Gap 4 fix: budget_gate.py emits these two names, not the legacy
     # "tool_call_budget_warning". All three are aliased to the same
@@ -59,6 +70,7 @@ _EVENT_RULES: dict[str, tuple[Polarity, str]] = {
     # detects a flood that persisted across multiple turns.
     "cross_turn_send_duplicate": ("negative", "cross_turn_loop"),
     "saga_query_error": ("negative", "saga_query_error"),
+    "saga_vector_search_degraded": ("negative", "saga_vector_search_degraded"),
     "saga_feedback_error": ("negative", "saga_feedback_error"),
     "saga_consolidate_error": ("negative", "saga_consolidate_error"),
     "saga_decay_error": ("negative", "saga_decay_error"),
@@ -344,12 +356,14 @@ _EVENT_RULES: dict[str, tuple[Polarity, str]] = {
     "discord_bridge_retry": ("negative", "discord_bridge_retry"),
     "discord_bridge_login_failure": ("negative", "discord_bridge_login_failure"),
     "discord_bridge_intents_failure": ("negative", "discord_bridge_intents_failure"),
+    "discord_bridge_exited": ("negative", "discord_bridge_exited"),
     # Slack bridge supervisor — same shape as Discord. Retry fires on
     # sustained transient outages; auth/scope failures are
     # operator-actionable and surface immediately.
     "slack_bridge_retry": ("negative", "slack_bridge_retry"),
     "slack_bridge_auth_failure": ("negative", "slack_bridge_auth_failure"),
     "slack_bridge_scope_failure": ("negative", "slack_bridge_scope_failure"),
+    "slack_bridge_exited": ("negative", "slack_bridge_exited"),
     # Positive — agent's own contribution-credit pass to SAGA is the
     # one signal currently emitted regardless of bridge reaction wiring.
     "saga_feedback_sent": ("positive", "saga_feedback"),
@@ -569,6 +583,10 @@ _FIRST_OCCURRENCE_ONLY_KINDS: set[str] = {
     # drained on next boot). Re-emitting on subsequent turns confuses the
     # operator — the digest is the one-shot "what changed on upgrade" signal.
     "mimir_update_digest",
+    # Startup may reconcile several stale records in one pass. Keep the latest
+    # per kind within the bounded negative bucket instead of crowding it out.
+    "worklink_run_orphaned",
+    "worklink_run_orphan_reconcile_failed",
 }
 
 # CR2 (memory & retrieval) invariant: polarity-dynamic kinds (their
@@ -723,11 +741,13 @@ def _build_valence_groups() -> dict[str, ValenceGroup]:
                 "discord_bridge_retry",
                 "discord_bridge_login_failure",
                 "discord_bridge_intents_failure",
+                "discord_bridge_exited",
             }),
             verb_map={
                 "discord_bridge_retry": "retrying",
                 "discord_bridge_login_failure": "login-failed",
                 "discord_bridge_intents_failure": "intents-failed",
+                "discord_bridge_exited": "exited",
             },
         ),
         "slack_bridge": ValenceGroup(
@@ -737,11 +757,13 @@ def _build_valence_groups() -> dict[str, ValenceGroup]:
                 "slack_bridge_retry",
                 "slack_bridge_auth_failure",
                 "slack_bridge_scope_failure",
+                "slack_bridge_exited",
             }),
             verb_map={
                 "slack_bridge_retry": "retrying",
                 "slack_bridge_auth_failure": "auth-failed",
                 "slack_bridge_scope_failure": "scope-failed",
+                "slack_bridge_exited": "exited",
             },
         ),
         "oauth": ValenceGroup(

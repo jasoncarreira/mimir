@@ -329,3 +329,74 @@ async def test_min_confidence_tier_filter_drops_weak_atoms(monkeypatch, tmp_path
     filtered_ids = {a["id"] for a in filtered["raws"] + filtered["observations"]}
     assert r_strong["atom_id"] in filtered_ids
     assert r_weak["atom_id"] not in filtered_ids
+
+
+@pytest.mark.asyncio
+async def test_low_floor_keeps_orthogonal_fts_only_atom(monkeypatch, tmp_path):
+    """An exact FTS hit gets the low-tier baseline even when its stored
+    embedding is orthogonal and the semantic pathway returns no candidates."""
+    class _OrthogonalProvider:
+        def embed(self, text, *, input_type="passage"):
+            if input_type == "query":
+                return [0.0, 1.0, 0.0, 0.0]
+            return [1.0, 0.0, 0.0, 0.0]
+
+        def dimensions(self):
+            return 4
+
+    retrieval_config = {
+        ("embedding", "max_input_chars"): 2000,
+        ("embedding", "provider"): "stub",
+        ("embedding", "model"): "stub-4d",
+        ("retrieval", "enable_confidence_gating"): True,
+        ("retrieval", "default_min_confidence_tier"): "low",
+    }
+    monkeypatch.setattr(
+        "mimir.saga.embeddings.get_provider", lambda: _OrthogonalProvider(),
+    )
+    monkeypatch.setattr(
+        "mimir.saga._config_io.get_config",
+        lambda: lambda section, key, default=None: retrieval_config.get(
+            (section, key), default,
+        ),
+    )
+
+    from mimir.saga.client import SagaStore
+
+    client = SagaStore(db_path=tmp_path / "mimir.saga.db", embedding_dim=4)
+    stored = await client.store("quartz falcon exact phrase")
+    # Force candidate generation through FTS only. The stored/query vectors
+    # remain orthogonal as an additional guard against semantic confidence.
+    client._index_built = True
+    client._index = None
+
+    deferred = await client.query(
+        "quartz falcon exact phrase", top_k=5, auth_context=ADMIN_SCOPE,
+    )
+    explicit_low = await client.query(
+        "quartz falcon exact phrase", top_k=5, min_confidence_tier="low",
+        auth_context=ADMIN_SCOPE,
+    )
+
+    atom_id = stored["atom_id"]
+    for result in (deferred, explicit_low):
+        atoms = result["raws"] + result["observations"]
+        atom = next(a for a in atoms if a["id"] == atom_id)
+        assert atom["_similarity"] == pytest.approx(0.0)
+        assert atom["_confidence_tier"] == "low"
+
+    retrieval_config[("retrieval", "default_min_confidence_tier")] = "high"
+    default_high = await client.query(
+        "quartz falcon exact phrase", top_k=5, auth_context=ADMIN_SCOPE,
+    )
+    assert not (default_high["raws"] + default_high["observations"])
+
+    retrieval_config[("retrieval", "enable_confidence_gating")] = False
+    gating_disabled = await client.query(
+        "quartz falcon exact phrase", top_k=5, auth_context=ADMIN_SCOPE,
+    )
+    disabled_ids = {
+        atom["id"]
+        for atom in gating_disabled["raws"] + gating_disabled["observations"]
+    }
+    assert atom_id in disabled_ids

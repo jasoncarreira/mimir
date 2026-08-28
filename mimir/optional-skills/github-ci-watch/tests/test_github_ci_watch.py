@@ -7,6 +7,8 @@ returned for the seen-set (regardless of whether it emitted).
 """
 from __future__ import annotations
 
+import json
+
 import pytest
 
 from github_ci_test_support import poller
@@ -100,3 +102,23 @@ def test_seeds_state_gitignore(tmp_path, monkeypatch):
     gi.write_text("operator-custom\n")
     poller._seed_state_gitignore()
     assert gi.read_text() == "operator-custom\n"
+
+
+def test_save_seen_atomically_preserves_previous_state_on_interrupted_replace(
+    tmp_path, monkeypatch,
+):
+    """Part B: a failed write cannot expose a truncated final seen-set."""
+    seen_file = tmp_path / "seen_run_ids.json"
+    seen_file.write_text(json.dumps({"ids": [41]}), encoding="utf-8")
+    monkeypatch.setattr(poller, "STATE_DIR", tmp_path)
+    monkeypatch.setattr(poller, "SEEN_FILE", seen_file)
+
+    def fail_replace(_source, _destination):
+        raise OSError("simulated interruption before atomic replace")
+
+    monkeypatch.setattr(poller.os, "replace", fail_replace)
+    with pytest.raises(OSError, match="simulated interruption"):
+        poller._save_seen({41, 42})
+
+    assert poller._load_seen() == {41}
+    assert not list(tmp_path.glob("*.tmp"))

@@ -60,6 +60,7 @@ _TIMEOUT_SECONDS = 1800.0
 _CAPTURE_BYTES = 64 * 1024
 _RETURN_STDOUT_CHARS = 8_000
 _RETURN_STDERR_CHARS = 4_000
+_LIVE_OUTPUT_ROOT = Path("state/worklink/transcripts")
 _MAX_SELECTORS = 32
 _MAX_SELECTOR_LENGTH = 256
 _MAX_SELECTOR_BYTES = 4_096
@@ -73,11 +74,22 @@ _PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 
 
 class ProjectTestRefusal(RuntimeError):
-    """A named policy refusal, distinct from a red test suite."""
+    """A named policy refusal, distinct from a red test suite.
 
-    def __init__(self, code: str, message: str) -> None:
+    Omitted phase information deliberately fails closed to the post-execution
+    verdict; genuinely pre-execution sites must opt out explicitly.
+    """
+
+    def __init__(
+        self,
+        code: str,
+        message: str,
+        *,
+        execution_started: bool = True,
+    ) -> None:
         super().__init__(message)
         self.code = code
+        self.execution_started = execution_started
 
 
 @dataclass(frozen=True)
@@ -104,6 +116,8 @@ class ProjectTestResult:
     stdout_dropped_bytes: int = 0
     stderr_dropped_bytes: int = 0
     git_context: str = ""
+    stdout_path: str = ""
+    stderr_path: str = ""
 
 
 ContainedRunner = Callable[..., Awaitable[CollectedExecutionResult]]
@@ -114,7 +128,11 @@ def _configured_command(repo_slug: str) -> tuple[tuple[str, ...], dict[str, str]
     """Resolve Worklink's deployment command into one shell-free fixed argv."""
     home = os.environ.get("MIMIR_HOME", "").strip()
     if not home:
-        raise ProjectTestRefusal("test_not_configured", "MIMIR_HOME is not configured")
+        raise ProjectTestRefusal(
+            "test_not_configured",
+            "MIMIR_HOME is not configured",
+            execution_started=False,
+        )
     try:
         config = WorklinkConfig.load(Path(home) / "worklink.yaml")
         inventory = RepositoryInventory.load(Path(home) / "repositories.yaml")
@@ -127,11 +145,16 @@ def _configured_command(repo_slug: str) -> tuple[tuple[str, ...], dict[str, str]
             source = "deployment"
         words = shlex.split(command, posix=True)
     except (OSError, RuntimeError, ValueError) as exc:
-        raise ProjectTestRefusal("test_config_invalid", "project test command is invalid") from exc
+        raise ProjectTestRefusal(
+            "test_config_invalid",
+            "project test command is invalid",
+            execution_started=False,
+        ) from exc
     if not words:
         raise ProjectTestRefusal(
             "test_command_unresolvable",
             f"project test command from {source} configuration is empty",
+            execution_started=False,
         )
 
     env = {
@@ -157,12 +180,18 @@ def _configured_command(repo_slug: str) -> tuple[tuple[str, ...], dict[str, str]
         index = 1
         while index < len(words) and words[index] in {"-u", "--unset"}:
             if index + 1 >= len(words) or not words[index + 1].isidentifier():
-                raise ProjectTestRefusal("test_config_invalid", "invalid env unset directive")
+                raise ProjectTestRefusal(
+                    "test_config_invalid",
+                    "invalid env unset directive",
+                    execution_started=False,
+                )
             env.pop(words[index + 1], None)
             index += 2
         words = words[index:]
         if not words:
-            raise ProjectTestRefusal("test_config_invalid", "test runner is missing")
+            raise ProjectTestRefusal(
+                "test_config_invalid", "test runner is missing", execution_started=False
+            )
 
     executable = Path(words[0])
     try:
@@ -172,28 +201,60 @@ def _configured_command(repo_slug: str) -> tuple[tuple[str, ...], dict[str, str]
             else shutil.which(words[0], path=_PATH)
         )
     except OSError as exc:
-        raise ProjectTestRefusal("test_command_unresolvable", "configured test runner is unavailable") from exc
+        raise ProjectTestRefusal(
+            "test_command_unresolvable",
+            "configured test runner is unavailable",
+            execution_started=False,
+        ) from exc
     if not resolved_text:
-        raise ProjectTestRefusal("test_command_unresolvable", "configured test runner is unavailable")
+        raise ProjectTestRefusal(
+            "test_command_unresolvable",
+            "configured test runner is unavailable",
+            execution_started=False,
+        )
     resolved = Path(resolved_text)
     try:
         resolved = resolved.resolve(strict=True)
     except OSError as exc:
-        raise ProjectTestRefusal("test_command_unresolvable", "configured test runner is unavailable") from exc
+        raise ProjectTestRefusal(
+            "test_command_unresolvable",
+            "configured test runner is unavailable",
+            execution_started=False,
+        ) from exc
     if not resolved.is_file() or not os.access(resolved, os.X_OK):
-        raise ProjectTestRefusal("test_command_unresolvable", "configured test runner is unavailable")
+        raise ProjectTestRefusal(
+            "test_command_unresolvable",
+            "configured test runner is unavailable",
+            execution_started=False,
+        )
     return (str(resolved), *words[1:]), env, source
 
 
 def _validated_selectors(root: Path, selectors: tuple[str, ...]) -> tuple[str, ...]:
     if not isinstance(selectors, tuple):
-        raise ProjectTestRefusal("test_selector_invalid", "test selectors must be a tuple")
+        raise ProjectTestRefusal(
+            "test_selector_invalid",
+            "test selectors must be a tuple",
+            execution_started=False,
+        )
     if len(selectors) > _MAX_SELECTORS:
-        raise ProjectTestRefusal("test_selector_count_exceeded", "too many test selectors")
+        raise ProjectTestRefusal(
+            "test_selector_count_exceeded",
+            "too many test selectors",
+            execution_started=False,
+        )
     if any(not isinstance(item, str) for item in selectors):
-        raise ProjectTestRefusal("test_selector_invalid", "test selectors must be strings")
+        raise ProjectTestRefusal(
+            "test_selector_invalid",
+            "test selectors must be strings",
+            execution_started=False,
+        )
     if sum(len(item.encode("utf-8")) for item in selectors) > _MAX_SELECTOR_BYTES:
-        raise ProjectTestRefusal("test_selectors_too_large", "test selectors are too large")
+        raise ProjectTestRefusal(
+            "test_selectors_too_large",
+            "test selectors are too large",
+            execution_started=False,
+        )
     validated: list[str] = []
     for item in selectors:
         path_text, separator, node_id = item.partition("::")
@@ -203,25 +264,56 @@ def _validated_selectors(root: Path, selectors: tuple[str, ...]) -> tuple[str, .
             or len(item) > _MAX_SELECTOR_LENGTH
             or not item.isascii()
             or _SELECTOR_PATTERN.fullmatch(item) is None
-            or item.startswith(("-", "/", "@"))
-            or candidate.is_absolute()
-            or any(part in {"", ".", ".."} for part in candidate.parts)
+            or item.startswith(("-", "@"))
             or "\\" in path_text
         ):
-            raise ProjectTestRefusal("test_selector_invalid", "test selector is not a relative path or node id")
-        try:
-            unresolved = root / path_text
-            if any(
-                (root.joinpath(*candidate.parts[:index])).is_symlink()
-                for index in range(1, len(candidate.parts) + 1)
-            ):
-                raise ValueError("selector contains a symlink")
-            resolved = unresolved.resolve(strict=True)
-            canonical = resolved.relative_to(root).as_posix()
-        except (OSError, RuntimeError, ValueError) as exc:
+            raise ProjectTestRefusal(
+                "test_selector_invalid",
+                "test selector is not a relative path or node id",
+                execution_started=False,
+            )
+        if candidate.is_absolute() or ".." in candidate.parts:
             raise ProjectTestRefusal(
                 "test_selector_outside_checkout",
                 "test selector does not resolve inside the authorized checkout",
+                execution_started=False,
+            )
+        if any(part in {"", "."} for part in candidate.parts):
+            raise ProjectTestRefusal(
+                "test_selector_invalid",
+                "test selector is not a relative path or node id",
+                execution_started=False,
+            )
+        unresolved = root / path_text
+        if any(
+            (root.joinpath(*candidate.parts[:index])).is_symlink()
+            for index in range(1, len(candidate.parts) + 1)
+        ):
+            raise ProjectTestRefusal(
+                "test_selector_symlink",
+                "test selector traverses a symlink in the authorized checkout",
+                execution_started=False,
+            )
+        try:
+            resolved = unresolved.resolve(strict=True)
+            canonical = resolved.relative_to(root).as_posix()
+        except FileNotFoundError as exc:
+            raise ProjectTestRefusal(
+                "test_selector_not_found",
+                f"test selector was not found in checkout: {item}",
+                execution_started=False,
+            ) from exc
+        except ValueError as exc:
+            raise ProjectTestRefusal(
+                "test_selector_outside_checkout",
+                "test selector does not resolve inside the authorized checkout",
+                execution_started=False,
+            ) from exc
+        except (OSError, RuntimeError) as exc:
+            raise ProjectTestRefusal(
+                "test_selector_unresolvable",
+                "test selector could not be resolved in the authorized checkout",
+                execution_started=False,
             ) from exc
         validated.append(f"{canonical}::{node_id}" if separator else canonical)
     return tuple(validated)
@@ -245,6 +337,44 @@ def _safe_output(
 ) -> str:
     scrubbed = redact_text(scrubber.scrub_text(value))
     return scrubbed[-limit:] if keep_tail else scrubbed[:limit]
+
+
+def _safe_stderr_output(
+    value: bytes,
+    scrubber: SensitiveMaterialScrubber,
+    limit: int,
+    *,
+    keep_tail: bool = False,
+) -> str:
+    """Prefer a pytest faulthandler dump over positional stderr context."""
+    scrubbed = redact_text(scrubber.scrub_text(value))
+    marker = re.search(r"Timeout \([^\r\n]+\)!", scrubbed)
+    if marker is not None and len(scrubbed) > limit:
+        return scrubbed[marker.start():marker.start() + limit]
+    return scrubbed[-limit:] if keep_tail else scrubbed[:limit]
+
+
+def _live_output_paths(home: str, identifier: str) -> tuple[Path, Path, str, str]:
+    root = Path(home).resolve() / _LIVE_OUTPUT_ROOT
+    stem = f"repo-test-{identifier}"
+    stdout_relative = (_LIVE_OUTPUT_ROOT / f"{stem}.stdout.log").as_posix()
+    stderr_relative = (_LIVE_OUTPUT_ROOT / f"{stem}.stderr.log").as_posix()
+    return (
+        root / f"{stem}.stdout.log",
+        root / f"{stem}.stderr.log",
+        stdout_relative,
+        stderr_relative,
+    )
+
+
+def _remove_live_output(*paths: Path) -> None:
+    for path in paths:
+        try:
+            path.unlink()
+        except OSError:
+            # Checkpoint cleanup must not change a completed suite's verdict.
+            # The transcript janitor removes any file that survives this attempt.
+            pass
 
 
 def _worker_can_search(metadata: os.stat_result) -> bool:
@@ -306,7 +436,10 @@ def _git_execution_context() -> str:
     return (
         "contained Git context: runner=worklink "
         f"uid={identities.worklink_uid} gid={identities.worklink_gid}; "
-        f"checkout_owner=mimir uid={identities.mimir_uid} "
+        # The repo-test checkout is owned by the RUNNER, not the controller, so a
+        # repository's own provisioning can set modes on tracked files. Naming the
+        # wrong owner here sends a reader after a permission problem they do not have.
+        f"checkout_owner=worklink uid={identities.worklink_uid} "
         f"gid={identities.worklink_gid}; global_config=/dev/null; "
         "system_config=disabled; safe.directory=*"
     )
@@ -335,13 +468,30 @@ class RepoProjectTests:
     async def execute(self, selectors: tuple[str, ...] = ()) -> ProjectTestResult:
         scope = self._state.action_scope
         if RepoPRAction.TEST.value not in scope.allowed_operations:
-            raise ProjectTestRefusal("scope_action_denied", "scope does not grant repo.test")
+            raise ProjectTestRefusal("scope_action_denied", "scope does not grant repo.test", execution_started=False)
+        git_tools: RepoGitTools | None = None
         try:
-            root = RepoGitTools(self._state).validated_checkout_root()
+            git_tools = RepoGitTools(self._state)
+            root = git_tools.validated_checkout_root()
         except GitRefusal as exc:
-            raise ProjectTestRefusal(exc.code, str(exc)) from exc
-        command, configured_env, command_source = _configured_command(scope.canonical_repo)
-        selected = _validated_selectors(root, selectors)
+            raise ProjectTestRefusal(
+                exc.code,
+                str(exc),
+                execution_started=bool(
+                    git_tools is not None and git_tools.execution_started
+                ),
+            ) from exc
+        try:
+            command, configured_env, command_source = _configured_command(
+                scope.canonical_repo
+            )
+            selected = _validated_selectors(root, selectors)
+        except ProjectTestRefusal as exc:
+            raise ProjectTestRefusal(
+                exc.code,
+                str(exc),
+                execution_started=True,
+            ) from exc
         scrubber = SensitiveMaterialScrubber(
             checkout=root,
             source_paths=(os.environ.get("MIMIR_HOME", ""),),
@@ -363,6 +513,7 @@ class RepoProjectTests:
             raise ProjectTestRefusal(
                 "test_snapshot_credentials_refused",
                 "project test snapshot contains credential-like material",
+                execution_started=True,
             ) from exc
         except SnapshotEmbeddedRepository as exc:
             # Distinct from the generic branch below on purpose: this one is an
@@ -378,6 +529,7 @@ class RepoProjectTests:
             raise ProjectTestRefusal(
                 "test_snapshot_embedded_repository",
                 "project test snapshot source contains an embedded Git repository",
+                execution_started=True,
             ) from exc
         except (ContainedSnapshotError, OSError, RuntimeError, ValueError) as exc:
             await safe_log_event(
@@ -387,10 +539,15 @@ class RepoProjectTests:
                 pull_request=scope.pr_number,
             )
             raise ProjectTestRefusal(
-                "test_snapshot_unavailable", "project test snapshot is unavailable"
+                "test_snapshot_unavailable",
+                "project test snapshot is unavailable",
+                execution_started=True,
             ) from exc
 
         identifier = str(uuid.uuid4())
+        stdout_path, stderr_path, stdout_relative, stderr_relative = _live_output_paths(
+            os.environ["MIMIR_HOME"], identifier
+        )
         scrubber.add_path(checkout.path)
         command = _remap_command(root, command)
         environment = base_worker_environment(identifier)
@@ -423,11 +580,14 @@ class RepoProjectTests:
                 raise ProjectTestRefusal(
                     "test_snapshot_cleanup_failed",
                     "project test snapshot cleanup failed",
+                    execution_started=True,
                 ) from exc
             raise ProjectTestRefusal(
                 "test_config_invalid",
                 "project test command or environment contains a controller path",
+                execution_started=True,
             )
+        result: CollectedExecutionResult | None = None
         try:
             try:
                 result = await self._runner(
@@ -440,6 +600,8 @@ class RepoProjectTests:
                     stdout_limit=self._output_limit,
                     stderr_limit=self._output_limit,
                     scrubber=scrubber,
+                    stdout_path=stdout_path,
+                    stderr_path=stderr_path,
                 )
             except StaleWorkerExecutorError as exc:
                 await safe_log_event(
@@ -451,6 +613,7 @@ class RepoProjectTests:
                 raise ProjectTestRefusal(
                     "test_stale_root_executor",
                     str(exc),
+                    execution_started=True,
                 ) from exc
             except (OSError, RuntimeError, ValueError) as exc:
                 diagnostic = _permission_diagnostic_from_error(exc)
@@ -465,6 +628,7 @@ class RepoProjectTests:
                     raise ProjectTestRefusal(
                         "test_path_permission_denied",
                         _permission_refusal_message(diagnostic),
+                        execution_started=True,
                     ) from exc
                 await safe_log_event(
                     "repo_test_containment_refused",
@@ -475,6 +639,7 @@ class RepoProjectTests:
                 raise ProjectTestRefusal(
                     "test_containment_unavailable",
                     "contained project test execution is unavailable",
+                    execution_started=True,
                 ) from exc
             if result.exit_code not in {None, 0}:
                 diagnostic = _permission_diagnostic_from_error(result.stderr)
@@ -489,6 +654,7 @@ class RepoProjectTests:
                     raise ProjectTestRefusal(
                         "test_path_permission_denied",
                         _permission_refusal_message(diagnostic),
+                        execution_started=True,
                     )
         finally:
             try:
@@ -503,21 +669,21 @@ class RepoProjectTests:
                 raise ProjectTestRefusal(
                     "test_snapshot_cleanup_failed",
                     "project test snapshot cleanup failed",
+                    execution_started=True,
                 ) from exc
+            finally:
+                if result is None or not result.timed_out:
+                    _remove_live_output(stdout_path, stderr_path)
 
-        if result.timed_out:
-            return ProjectTestResult(
-                False, "test_timeout", None,
-                command=command, command_source=command_source,
-                git_context=_git_execution_context(),
-            )
+        assert result is not None
+
         stdout = _safe_output(
             result.stdout,
             scrubber,
             _RETURN_STDOUT_CHARS,
             keep_tail=result.stdout_dropped_bytes > 0,
         )
-        stderr = _safe_output(
+        stderr = _safe_stderr_output(
             result.stderr,
             scrubber,
             _RETURN_STDERR_CHARS,
@@ -528,6 +694,14 @@ class RepoProjectTests:
             "stdout_dropped_bytes": result.stdout_dropped_bytes,
             "stderr_dropped_bytes": result.stderr_dropped_bytes,
         }
+        if result.timed_out:
+            return ProjectTestResult(
+                False, "test_timeout", None, stdout, stderr,
+                command, command_source, **truncation,
+                git_context=_git_execution_context(),
+                stdout_path=stdout_relative,
+                stderr_path=stderr_relative,
+            )
         if result.exit_code != 0 or result.output_overflow:
             return ProjectTestResult(
                 False, "tests_failed", result.exit_code, stdout, stderr,
@@ -537,7 +711,11 @@ class RepoProjectTests:
         if not selectors:
             head = self._state.git_expected_head
             if head is None:
-                raise ProjectTestRefusal("inactive_checkout", "the checkout has no current HEAD")
+                raise ProjectTestRefusal(
+                    "inactive_checkout",
+                    "the checkout has no current HEAD",
+                    execution_started=True,
+                )
             self._state.record_full_test(scope.scope_id, head)
         return ProjectTestResult(
             True, "tests_passed", 0, stdout, stderr, command, command_source,

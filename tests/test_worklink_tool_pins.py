@@ -11,6 +11,7 @@ from mimir.worklink.backends import ToolPin
 from mimir.worklink.backends.feature_factory import FACTORY_VERSION
 from mimir.worklink.tool_pins import (
     ChainlinkBumpFiler,
+    OPENCODE_VERSION,
     ToolPinDrift,
     UpstreamVersion,
     default_tool_pins,
@@ -51,6 +52,7 @@ def test_default_tool_pin_inventory_covers_distinct_executable_risk_surfaces() -
     assert pins["gogcli"].category == "integration-cli"
     assert pins["osv-scanner"].category == "security-scanner"
     assert pins["opencode"].category == "coding-cli"
+    assert pins["opencode"].pin == OPENCODE_VERSION
     assert pins["feature-factory"].pin == FACTORY_VERSION
     assert pins["opencode-feature-factory"].pin == FACTORY_VERSION
     assert pins["opencode-feature-factory"].category == "coding-plugin"
@@ -91,7 +93,7 @@ def test_worklink_docs_describe_current_tool_pin_inventory() -> None:
     assert 'package: "@openai/codex"' not in tool_pins_example
 
 
-def test_default_tool_pin_inventory_matches_shipped_install_literals() -> None:
+def test_default_tool_pin_inventory_matches_shipped_installs() -> None:
     pins = {pin.name: pin for pin in default_tool_pins()}
     root = Path(__file__).resolve().parents[1]
     install_paths = (
@@ -112,10 +114,14 @@ def test_default_tool_pin_inventory_matches_shipped_install_literals() -> None:
     assert f"github.com/steipete/gogcli/cmd/gog@{pins['gogcli'].pin}" in install_text
     assert pins["osv-scanner"].pin in install_text
     assert f"opencode-ai@{pins['opencode'].pin}" in install_text
-    for relpath in ("Dockerfile", "mimir/scaffold_docker.py"):
-        source = install_sources[relpath]
-        assert f"feature-factory@{pins['feature-factory'].pin}" in source
-        assert f"opencode-feature-factory@{pins['opencode-feature-factory'].pin}" in source
+    assert pins["feature-factory"].pin == pins["opencode-feature-factory"].pin
+    dockerfile = install_sources["Dockerfile"]
+    assert f"ARG FACTORY_VERSION={pins['feature-factory'].pin}" in dockerfile
+    assert "feature-factory@${FACTORY_VERSION}" in dockerfile
+    assert "opencode-feature-factory@${FACTORY_VERSION}" in dockerfile
+    scaffold = install_sources["mimir/scaffold_docker.py"]
+    assert "feature-factory@{FACTORY_VERSION}" in scaffold
+    assert "opencode-feature-factory@{FACTORY_VERSION}" in scaffold
     assert f"opencode-project-memory@{pins['opencode-project-memory'].pin}" in install_text
     assert f"opencode-openai-codex-auth@{pins['opencode-openai-codex-auth'].pin}" in install_text
     assert f"opencode-anthropic-auth@{pins['opencode-anthropic-auth'].pin}" in install_text
@@ -233,6 +239,112 @@ def test_chainlink_bump_filer_creates_low_priority_issue_when_no_duplicate() -> 
     assert "low" in calls[1]
     assert "--label" in calls[1]
     assert "tool-pin" in calls[1]
+
+
+@pytest.mark.parametrize(
+    ("returncode", "stdout", "stderr", "reason"),
+    [
+        (1, "", "index.lock exists", "chainlink issue search failed: index.lock exists"),
+        (0, "not JSON", "", "chainlink issue search returned invalid JSON"),
+        (0, "{}", "", "chainlink issue search JSON was not a list"),
+    ],
+)
+def test_chainlink_bump_filer_does_not_create_when_dedupe_check_is_unavailable(
+    returncode: int, stdout: str, stderr: str, reason: str,
+) -> None:
+    calls: list[list[str]] = []
+
+    def runner(args: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        calls.append(args)
+        return subprocess.CompletedProcess(args, returncode, stdout, stderr)
+
+    drift = ToolPinDrift(
+        pin=ToolPin("codex", "coding-cli", "0.139.0", "codex --version", source="npm"),
+        current="0.140.0",
+    )
+    filer = ChainlinkBumpFiler(runner=runner)
+
+    assert filer.file(drift) is None
+    assert filer.last_skip_reason == reason
+    assert calls == [["chainlink", "issue", "search", drift.dedupe_key, "--json"]]
+
+
+def test_chainlink_bump_filer_skips_malformed_match_and_reuses_later_duplicate() -> None:
+    calls: list[list[str]] = []
+    drift = ToolPinDrift(
+        pin=ToolPin("codex", "coding-cli", "0.139.0", "codex --version", source="npm"),
+        current="0.140.0",
+    )
+
+    def runner(args: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        calls.append(args)
+        issues = [
+            {"id": "invalid", "description": f"Dedupe-Key: {drift.dedupe_key}"},
+            {"id": 779, "description": f"Dedupe-Key: {drift.dedupe_key}"},
+            {"id": 780, "description": f"Dedupe-Key: {drift.dedupe_key}"},
+        ]
+        return subprocess.CompletedProcess(args, 0, json.dumps(issues), "")
+
+    assert ChainlinkBumpFiler(runner=runner).file(drift) == 779
+    assert calls == [["chainlink", "issue", "search", drift.dedupe_key, "--json"]]
+
+
+@pytest.mark.parametrize(
+    "issue_id",
+    [
+        pytest.param("invalid", id="malformed-string"),
+        pytest.param("901", id="numeric-string"),
+        pytest.param(True, id="boolean"),
+        pytest.param(1.5, id="float"),
+        pytest.param(0, id="zero"),
+        pytest.param(-1, id="negative"),
+        pytest.param(None, id="missing"),
+    ],
+)
+def test_chainlink_bump_filer_refuses_create_for_sole_exact_match_without_valid_id(
+    issue_id: object,
+) -> None:
+    calls: list[list[str]] = []
+    drift = ToolPinDrift(
+        pin=ToolPin("codex", "coding-cli", "0.139.0", "codex --version", source="npm"),
+        current="0.140.0",
+    )
+
+    def runner(args: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        calls.append(args)
+        issue = {"description": f"Dedupe-Key: {drift.dedupe_key}"}
+        if issue_id is not None:
+            issue["id"] = issue_id
+        return subprocess.CompletedProcess(args, 0, json.dumps([issue]), "")
+
+    filer = ChainlinkBumpFiler(runner=runner)
+
+    assert filer.file(drift) is None
+    assert filer.last_skip_reason == (
+        "chainlink issue search returned an exact dedupe-key match "
+        "without a strict positive-integer issue id"
+    )
+    assert calls == [["chainlink", "issue", "search", drift.dedupe_key, "--json"]]
+
+
+def test_chainlink_bump_filer_uses_valid_number_when_id_field_is_malformed() -> None:
+    calls: list[list[str]] = []
+    drift = ToolPinDrift(
+        pin=ToolPin("codex", "coding-cli", "0.139.0", "codex --version", source="npm"),
+        current="0.140.0",
+    )
+
+    def runner(args: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        calls.append(args)
+        issue = {
+            "id": "malformed",
+            "number": 902,
+            "description": f"Dedupe-Key: {drift.dedupe_key}",
+        }
+        return subprocess.CompletedProcess(args, 0, json.dumps([issue]), "")
+
+    assert ChainlinkBumpFiler(runner=runner).file(drift) == 902
+    assert calls == [["chainlink", "issue", "search", drift.dedupe_key, "--json"]]
 
 
 def test_chainlink_bump_filer_raises_on_create_failure() -> None:

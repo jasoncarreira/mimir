@@ -323,6 +323,95 @@ async def test_reconcile_reenqueues_failed(tmp_path: Path):
     assert st["inflight"]["sid-1"]["attempts"] == 1
 
 
+async def test_reconcile_drops_stale_subject_without_giving_up(tmp_path: Path):
+    events = tmp_path / "events.jsonl"
+    event_logger._reset_logger_for_tests()
+    event_logger.init_logger(events, session_id="test")
+    try:
+        await poller_recovery.stash_enqueued_event(tmp_path, _make_event("sid-stale"))
+        _write_outcome(
+            events, type_="turn_failed", channel_id="poller:gmail",
+            source_id="sid-stale", ts=_ts(5),
+        )
+
+        summary = await poller_recovery.reconcile_failed_turns(
+            poller_name="gmail",
+            channel_id="poller:gmail",
+            persist_dir=tmp_path,
+            events_path=events,
+            enqueue=_FakeEnqueue(),
+            relevance_check=lambda event: _async_result(False),
+            max_attempts=0,
+        )
+
+        assert summary["stale_dropped"] == 1
+        assert summary["gave_up"] == 0
+        assert summary["completed"] == 0
+        assert summary["expired"] == 0
+        assert poller_recovery._load_state(tmp_path)["inflight"] == {}
+        records = [json.loads(line) for line in events.read_text().splitlines()]
+        assert not any(record.get("type") == "poller_turn_gave_up" for record in records)
+    finally:
+        event_logger._reset_logger_for_tests()
+
+
+async def _async_result(value):
+    return value
+
+
+async def test_reconcile_relevance_open_and_indeterminate_fail_open(tmp_path: Path):
+    events = tmp_path / "events.jsonl"
+    for source_id in ("sid-open", "sid-unknown"):
+        await poller_recovery.stash_enqueued_event(tmp_path, _make_event(source_id))
+        _write_outcome(
+            events, type_="turn_failed", channel_id="poller:gmail",
+            source_id=source_id, ts=_ts(5),
+        )
+    verdicts = {"sid-open": True, "sid-unknown": None}
+
+    async def relevance(event):
+        return verdicts[event.source_id]
+
+    enqueue = _FakeEnqueue()
+    summary = await poller_recovery.reconcile_failed_turns(
+        poller_name="gmail",
+        channel_id="poller:gmail",
+        persist_dir=tmp_path,
+        events_path=events,
+        enqueue=enqueue,
+        relevance_check=relevance,
+    )
+
+    assert summary["reenqueued"] == 2
+    assert summary["stale_dropped"] == 0
+    assert {event.source_id for event in enqueue.calls} == {"sid-open", "sid-unknown"}
+
+
+async def test_reconcile_relevance_exception_fails_open(tmp_path: Path):
+    events = tmp_path / "events.jsonl"
+    await poller_recovery.stash_enqueued_event(tmp_path, _make_event("sid-error"))
+    _write_outcome(
+        events, type_="turn_failed", channel_id="poller:gmail",
+        source_id="sid-error", ts=_ts(5),
+    )
+
+    async def relevance(event):
+        raise RuntimeError("source unavailable")
+
+    enqueue = _FakeEnqueue()
+    summary = await poller_recovery.reconcile_failed_turns(
+        poller_name="gmail",
+        channel_id="poller:gmail",
+        persist_dir=tmp_path,
+        events_path=events,
+        enqueue=enqueue,
+        relevance_check=relevance,
+    )
+
+    assert summary["reenqueued"] == 1
+    assert [event.source_id for event in enqueue.calls] == ["sid-error"]
+
+
 async def test_reconcile_counts_failure_when_reenqueue_is_disabled(tmp_path: Path):
     events = tmp_path / "events.jsonl"
     await poller_recovery.stash_enqueued_event(tmp_path, _make_event("sid-1"))
@@ -473,6 +562,37 @@ async def test_unclean_restart_reenqueues_no_outcome_exactly_once(tmp_path: Path
     entry = poller_recovery._load_state(tmp_path)["inflight"]["sid-lost"]
     assert entry["attempts"] == 1
     assert entry["unclean_replayed_at"] != ""
+
+
+async def test_unclean_restart_drops_stale_subject_before_attempt_cap(tmp_path: Path):
+    events = tmp_path / "events.jsonl"
+    event_logger._reset_logger_for_tests()
+    event_logger.init_logger(events, session_id="test")
+    try:
+        await poller_recovery.stash_enqueued_event(
+            tmp_path, _make_event("sid-stale-restart"),
+        )
+        _set_enqueued_at(tmp_path, "sid-stale-restart", _ts(20))
+        _write_unclean_restart(events, ts=_ts(10))
+
+        summary = await poller_recovery.reconcile_failed_turns(
+            poller_name="gmail",
+            channel_id="poller:gmail",
+            persist_dir=tmp_path,
+            events_path=events,
+            enqueue=_FakeEnqueue(),
+            relevance_check=lambda event: _async_result(False),
+            max_attempts=0,
+        )
+
+        assert summary["stale_dropped"] == 1
+        assert summary["gave_up"] == 0
+        assert summary["unclean_reenqueued"] == 0
+        assert poller_recovery._load_state(tmp_path)["inflight"] == {}
+        records = [json.loads(line) for line in events.read_text().splitlines()]
+        assert not any(record.get("type") == "poller_turn_gave_up" for record in records)
+    finally:
+        event_logger._reset_logger_for_tests()
 
 
 async def test_unclean_restart_completed_outcome_is_not_reenqueued(tmp_path: Path):
@@ -627,6 +747,45 @@ async def test_reconcile_no_inflight_fast_path(tmp_path: Path):
     assert poller_recovery._load_state(tmp_path)["last_reconciled"] != ""
 
 
+async def test_reconcile_no_inflight_does_not_call_relevance_check(tmp_path: Path):
+    async def relevance(event):
+        raise AssertionError("empty recovery must not consult source state")
+
+    summary = await poller_recovery.reconcile_failed_turns(
+        poller_name="gmail",
+        channel_id="poller:gmail",
+        persist_dir=tmp_path,
+        events_path=tmp_path / "events.jsonl",
+        enqueue=_FakeEnqueue(),
+        relevance_check=relevance,
+    )
+
+    assert summary["stale_dropped"] == 0
+
+
+async def test_reconcile_without_relevance_check_preserves_existing_behavior(
+    tmp_path: Path,
+):
+    events = tmp_path / "events.jsonl"
+    await poller_recovery.stash_enqueued_event(tmp_path, _make_event("sid-no-check"))
+    _write_outcome(
+        events, type_="turn_failed", channel_id="poller:gmail",
+        source_id="sid-no-check", ts=_ts(5),
+    )
+    enqueue = _FakeEnqueue()
+
+    summary = await poller_recovery.reconcile_failed_turns(
+        poller_name="gmail",
+        channel_id="poller:gmail",
+        persist_dir=tmp_path,
+        events_path=events,
+        enqueue=enqueue,
+    )
+
+    assert summary["reenqueued"] == 1
+    assert [event.source_id for event in enqueue.calls] == ["sid-no-check"]
+
+
 async def test_reconcile_watermark_prevents_reprocessing(tmp_path: Path):
     """An outcome processed in one reconcile is older than the advanced
     watermark on the next, so it isn't acted on twice."""
@@ -658,6 +817,15 @@ async def test_reconcile_reenqueue_restamps_forged_stash_fields(tmp_path: Path):
     forged.channel_id = "discord:operator-dm"
     forged.trigger = "user_message"
     forged.source = "discord"
+    forged.author = "discord-operator"
+    forged.author_display = "Operator"
+    forged.author_id = "operator"
+    forged.repo_pr_action_scope = {"forged": True}
+    forged.continuation_auth_context = {"forged": True}
+    forged.source_session_acl = {"forged": True}
+    forged.extra["_mimir_event_ingress"] = "http"
+    forged.extra["channel_visibility"] = "private"
+    forged.extra["bridge_instance"] = "discord"
     forged.extra["poller_name"] = "not-gmail"
     await poller_recovery.stash_enqueued_event(tmp_path, forged)
     _write_outcome(events, type_="turn_failed", channel_id="poller:gmail",
@@ -672,7 +840,17 @@ async def test_reconcile_reenqueue_restamps_forged_stash_fields(tmp_path: Path):
     assert ev.channel_id == "poller:gmail"
     assert ev.trigger == "poller"
     assert ev.source == "poller"
+    assert ev.author is None
+    assert ev.author_display is None
+    assert ev.author_id is None
+    assert ev.repo_pr_action_scope is None
+    assert ev.continuation_auth_context is None
+    assert ev.source_session_acl is None
+    assert "_mimir_event_ingress" not in ev.extra
+    assert "channel_visibility" not in ev.extra
+    assert "bridge_instance" not in ev.extra
     assert ev.extra["poller_name"] == "gmail"
+    assert ev.extra[poller_recovery.POLLER_RECOVERY_REPLAY_EXTRA_KEY] is True
     # The correlation key is preserved — it's how the retry's own
     # outcome is matched back to this entry.
     assert ev.source_id == "sid-1"

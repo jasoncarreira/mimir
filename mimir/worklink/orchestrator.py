@@ -19,12 +19,13 @@ import re
 import shutil
 import stat
 import subprocess
+import tempfile
 import unicodedata
 import warnings
 from typing import Any, Callable, Iterable, Mapping, Sequence
 
 from .._rmtree import rmtree_missing_ok
-from ..forge.github import GitHubForgeClient
+from ..forge.github import GitHubForgeClient, GitHubIdentityVerificationError
 from .backends import (
     BackendRegistry,
     CheckoutShape,
@@ -34,13 +35,23 @@ from .backends import (
     WorklinkConfig,
     checkout_shape_for_backend,
 )
-from .compute import ComputeLaunchError, ComputeResult, LaunchHandle, LocalSubprocessComputeBackend
-from .claims import ChainlinkClaims, ClaimRecord
+from .compute import (
+    ComputeLaunchError,
+    ComputeResult,
+    LaunchHandle,
+    LocalSubprocessComputeBackend,
+    with_worker_environment,
+)
+from .claims import ChainlinkClaims, ClaimRecord, WORKLINK_EPIC_LABEL
 from .evidence import (
     EvidenceValidation,
+    TestResult,
     WorklinkEvidence,
     observe_evidence,
+    pytest_report_environment,
+    read_pytest_result,
 )
+from .identities import get_identities
 from .planning import (
     missing_leaf_template_parts,
     render_decompose_prompt,
@@ -60,12 +71,21 @@ from ..redaction import redact_text
 from ..repository_config import RepositoryInventory
 from ..secret_scan import secret_matches
 from .safe_git import ControllerGitPublication
-from .backends.feature_factory import FactoryStatus, FeatureFactoryBackend
+from .backends.feature_factory import (
+    FACTORY_PUBLISHING_IDENTITY_ENV,
+    FactoryStatus,
+    FeatureFactoryBackend,
+    epic_run_id,
+)
+from .backends.registry import factory_run_timeout_s
+from .backends.opencode import transcript_path, write_transcript
 from .factory_state import (
     FactoryRunRecord,
+    archive_factory_record,
     factory_process_is_alive,
     factory_process_is_verified_dead,
-    load_factory_record,
+    factory_record_run_ids,
+    load_factory_records_for_issue,
     save_factory_record,
 )
 
@@ -74,16 +94,34 @@ _CLAIM_HEARTBEAT_INTERVAL_S = 60.0
 _PR_BODY_SECTION_FILE = ".worklink-pr-body.md"
 _PR_BODY_SECTION_MAX_BYTES = 4000
 _PR_BODY_SECTION_TRUNCATED = "\n\n[Build summary truncated by Worklink.]"
+_FACTORY_CONTROLLER_ERROR_MAX_BYTES = 4000
+_RECOVERABLE_FACTORY_PHASES = {"running", "parked", "failed", "terminal"}
 _EVIDENCE_HEADING_RE = re.compile(r"(?im)^Worklink evidence:\s*$")
-_FACTORY_STARTUP_STATUS_TIMEOUT_S = 30.0
+# GitHub's documented closing-keyword set:
+# https://docs.github.com/en/issues/tracking-your-work-with-issues/using-issues/linking-a-pull-request-to-an-issue
+_GITHUB_CLOSING_KEYWORDS = (
+    "close",
+    "closes",
+    "closed",
+    "fix",
+    "fixes",
+    "fixed",
+    "resolve",
+    "resolves",
+    "resolved",
+)
+_GITHUB_BARE_CLOSING_REFERENCE_RE = re.compile(
+    rf"(?P<keyword>\b(?:{'|'.join(_GITHUB_CLOSING_KEYWORDS)}))"
+    r"(?P<separator>\s*:\s*|\s+)#(?P<number>[0-9]+)\b",
+    re.IGNORECASE,
+)
+_FACTORY_STARTUP_STATUS_TIMEOUT_S = 120.0
+_FACTORY_PUBLISHING_IDENTITY_ENV = "MIMIR_FACTORY_PUBLISHING_IDENTITY"
+_WORK_ITEM_RUN_ID_RE = re.compile(r"^[a-z0-9](?:[a-z0-9._-]*[a-z0-9])?$")
 
 
 def _epic_run_timeout_s() -> float:
-    try:
-        value = float(os.environ.get("MIMIR_FACTORY_RUN_TIMEOUT_S", "43200"))
-        return value if value > 0 else 43200.0
-    except ValueError:
-        return 43200.0
+    return factory_run_timeout_s()
 
 
 def _epic_stale_heartbeat_s() -> float:
@@ -96,9 +134,21 @@ def _epic_stale_heartbeat_s() -> float:
 
 def _epic_prompt(issue: "IssueContext") -> str:
     header = f"Build chainlink #{issue.issue_id}: {issue.title}".strip()
-    body = issue.description.strip()
+    body = _render_chainlink_text(issue.description.strip())
     base = f"{header}\n\n{body}".strip() if body else header
     return base
+
+
+def _render_chainlink_text(text: str) -> str:
+    """Give ambiguous bare closing references their originating namespace.
+
+    A bare ``#N`` cannot say whether its author meant Chainlink or GitHub. Text
+    rendered from a Chainlink work item defaults to Chainlink; an intentional
+    GitHub reference remains expressible as GitHub's explicit ``owner/repo#N``.
+    """
+    return _GITHUB_BARE_CLOSING_REFERENCE_RE.sub(
+        r"\g<keyword>\g<separator>chainlink #\g<number>", text
+    )
 
 
 @dataclass(frozen=True)
@@ -124,6 +174,41 @@ class WorklinkRunResult:
     branch: str | None = None
     dry_run: bool = False
     reason: str | None = None
+    preserved_ref: str | None = None
+    preservation_error: str | None = None
+
+
+@dataclass
+class _TerminalClaimRelease:
+    claims: ChainlinkClaims
+    home: Path
+    issue_id: int
+    attempt: int
+    trigger_ready_scan: bool = False
+    attempted: bool = False
+    confirmed: bool = False
+
+    def __call__(self) -> bool:
+        if self.attempted:
+            return self.confirmed
+        self.attempted = True
+        try:
+            self.confirmed = _release_issue_and_clear_run_state(
+                self.claims,
+                home=self.home,
+                issue_id=self.issue_id,
+                attempt=self.attempt,
+                trigger_ready_scan=self.trigger_ready_scan,
+            )
+        except Exception:
+            self.confirmed = False
+        if not self.confirmed:
+            _log_terminal_recovery_failed(
+                issue_id=self.issue_id,
+                attempt=self.attempt,
+                outcome="terminal",
+            )
+        return self.confirmed
 
 
 class WorklinkError(RuntimeError):
@@ -134,7 +219,19 @@ class LeafValidationError(WorklinkError):
     """Issue is not structured enough to hand to a backend."""
 
 
-def _read_factory_publishing_identity(repo: Path) -> str:
+def _read_factory_publishing_identity(
+    repo: Path, environ: Mapping[str, object] = os.environ
+) -> tuple[str, str]:
+    if _FACTORY_PUBLISHING_IDENTITY_ENV in environ:
+        identity = environ[_FACTORY_PUBLISHING_IDENTITY_ENV]
+        if not isinstance(identity, str):
+            raise WorklinkError(
+                f"{_FACTORY_PUBLISHING_IDENTITY_ENV} must be a string when set"
+            )
+        if not identity.strip():
+            raise WorklinkError(f"{_FACTORY_PUBLISHING_IDENTITY_ENV} is set but blank")
+        return identity.strip(), f"environment variable {_FACTORY_PUBLISHING_IDENTITY_ENV}"
+
     declaration = repo / ".factory.json"
     try:
         payload = json.loads(declaration.read_text(encoding="utf-8"))
@@ -147,7 +244,7 @@ def _read_factory_publishing_identity(repo: Path) -> str:
     identity = payload.get("publishing_identity")
     if not isinstance(identity, str) or not identity.strip():
         raise WorklinkError("factory publishing identity is missing")
-    return identity.strip()
+    return identity.strip(), ".factory.json"
 
 
 def _read_checkout_git_identity(checkout: Path, runner: Runner) -> tuple[str, str]:
@@ -226,9 +323,11 @@ async def _heartbeat_while(
     *,
     claims: ChainlinkClaims,
     record: ClaimRecord,
-    interval_s: float = _CLAIM_HEARTBEAT_INTERVAL_S,
+    interval_s: float | None = None,
 ) -> Any:
     """Keep the Chainlink claim fresh while a long compute await is active."""
+    if interval_s is None:
+        interval_s = _CLAIM_HEARTBEAT_INTERVAL_S
 
     async def beat_loop() -> None:
         _heartbeat_claim_best_effort(claims, record)
@@ -276,13 +375,91 @@ class ChainlinkIssueReader:
         )
 
 
+def render_work_item(issue: IssueContext) -> str:
+    """Render a Chainlink issue as the factory's deterministic JSON input."""
+    if issue.issue_id <= 0:
+        raise WorklinkError("chainlink issue id must be a positive integer")
+    if not issue.title.strip():
+        raise WorklinkError(f"chainlink issue {issue.issue_id} has an empty title")
+
+    run_id = epic_run_id(issue.issue_id)
+    if _WORK_ITEM_RUN_ID_RE.fullmatch(run_id) is None:
+        raise WorklinkError(f"chainlink issue {issue.issue_id} produced an invalid run_id")
+    return json.dumps(
+        {"run_id": run_id, "title": issue.title, "body": issue.description},
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+
+
+def _validate_epic_work_item(payload: str, issue_id: int) -> str:
+    """Validate the rendered factory payload and return its declared run ID."""
+    try:
+        work_item = json.loads(payload)
+    except json.JSONDecodeError as exc:
+        raise WorklinkError("rendered factory work item is malformed") from exc
+    if not isinstance(work_item, dict):
+        raise WorklinkError("rendered factory work item must be a JSON object")
+    run_id = work_item.get("run_id")
+    if not isinstance(run_id, str) or _WORK_ITEM_RUN_ID_RE.fullmatch(run_id) is None:
+        raise WorklinkError("rendered factory work item has an invalid run_id")
+    if run_id != epic_run_id(issue_id):
+        raise WorklinkError("rendered factory work item run_id does not match the issue")
+    title = work_item.get("title")
+    if not isinstance(title, str) or not title.strip():
+        raise WorklinkError("rendered factory work item has an invalid title")
+    if not isinstance(work_item.get("body"), str):
+        raise WorklinkError("rendered factory work item has an invalid body")
+    return run_id
+
+
+def _require_factory_launch_binding(
+    spec: WorkSpec, run_id: str, publishing_identity: str
+) -> None:
+    argv = spec.local_argv
+    if (
+        spec.backend_config.get("run_id") != run_id
+        or argv is None
+        or not argv
+        or not argv[-1].split()
+        or argv[-1].split()[-1] != run_id
+    ):
+        raise WorklinkError("factory launch request run_id does not match the supervised run_id")
+    # Fail closed on a launch that would publish as some other account. Losing the
+    # variable between here and the child is silent otherwise: the driver falls back
+    # to the sandbox's .factory.json and parks at Gate 1 naming the FILE's identity,
+    # which reads as a misconfiguration rather than a dropped variable.
+    if spec.env.get(FACTORY_PUBLISHING_IDENTITY_ENV) != publishing_identity:
+        raise WorklinkError(
+            "factory launch environment does not carry the resolved publishing identity"
+        )
+
+
+def read_work_item(
+    issue_id: int,
+    *,
+    chainlink_bin: str = "chainlink",
+    runner: Runner | None = None,
+) -> str:
+    """Read one local Chainlink issue and return its factory work-item JSON."""
+    if issue_id <= 0:
+        raise WorklinkError("chainlink issue id must be a positive integer")
+    issue = ChainlinkIssueReader(chainlink_bin=chainlink_bin, runner=runner).read(issue_id)
+    if issue.issue_id != issue_id:
+        raise WorklinkError(
+            f"chainlink issue show {issue_id} returned mismatched issue {issue.issue_id}"
+        )
+    return render_work_item(issue)
+
+
 def validate_leaf(issue: IssueContext) -> None:
-    if "worklink:epic" in issue.labels:
-        return
     try:
         target_branch_from_description(issue.description)
     except ValueError as exc:
         raise LeafValidationError(str(exc)) from exc
+    if "worklink:epic" in issue.labels:
+        return
     missing = missing_leaf_template_parts(issue.description)
     if not missing:
         return
@@ -362,7 +539,7 @@ def render_work_order(
     return template.format(
         issue_id=issue.issue_id,
         title=issue.title,
-        description=issue.description.strip(),
+        description=_render_chainlink_text(issue.description.strip()),
         labels=", ".join(sorted(issue.labels)) or "(none)",
         parent_id=issue.parent_id if issue.parent_id is not None else "(none)",
         backend=backend_name,
@@ -417,7 +594,7 @@ class WorklinkRunner:
         )
         compute = registry.select_compute(labels=issue.labels, repo=repo_slug)
         selected_name = backend.name
-        worker_required = (
+        worker_uid_drop = (
             coding_enabled()
             and isinstance(backend, OpenCodeBackend)
             and compute.name == "local_subprocess"
@@ -481,6 +658,7 @@ class WorklinkRunner:
             runner=_list_runner(runner),
             home_path=self.home,
             event_logger=_log_event,
+            max_attempts=config.defaults.max_claim_attempts,
         )
         # Re-read immediately before claiming so retries in a long-lived caller do
         # not use stale comments and collide with prior attempt-scoped branches.
@@ -521,7 +699,7 @@ class WorklinkRunner:
                 issue.comments,
                 labels=issue.labels,
                 max_active_locks=config.defaults.max_concurrent if autonomous else None,
-                exclude_active_label="worklink:epic",
+                exclude_active_label=WORKLINK_EPIC_LABEL,
                 before_claim=record_claiming,
             )
         except Exception:
@@ -545,6 +723,13 @@ class WorklinkRunner:
                 issue.issue_id, None, "failed", reason=claim.reason or "claim_failed"
             )
         record = claim.record
+        terminal_release = _TerminalClaimRelease(
+            claims,
+            home=self.home,
+            issue_id=issue.issue_id,
+            attempt=record.attempt,
+            trigger_ready_scan=autonomous,
+        )
         _log_event(
             "worklink_claimed",
             issue_id=issue.issue_id,
@@ -555,6 +740,7 @@ class WorklinkRunner:
         lease: CheckoutLease | None = None
         publication: ControllerGitPublication | None = None
         delete_authorized_checkout = False
+        executor_report_dir: Path | None = None
         try:
             lease = _create_backend_checkout(
                 self.repo,
@@ -565,15 +751,21 @@ class WorklinkRunner:
                 base_fetch=config.defaults.base_fetch,
                 event_logger=_log_event,
                 runner=_list_runner(runner),
-                worker_eligible=worker_required,
+                worker_eligible=worker_uid_drop,
             )
-            if worker_required:
-                if lease.authorization is None:
-                    raise WorklinkError("worker checkout did not provide authorization")
+            if worker_uid_drop:
                 if not isinstance(compute, LocalSubprocessComputeBackend):
-                    raise WorklinkError("worker checkout requires local subprocess compute")
-                compute = LocalSubprocessComputeBackend.for_authorized_checkout(lease.authorization)
-                checkout_fd = lease.authorization.duplicate_fd()
+                    raise WorklinkError("worker uid drop requires local subprocess compute")
+                compute = LocalSubprocessComputeBackend.for_path_checkout(
+                    get_identities().worklink_uid
+                )
+                checkout_fd = os.open(
+                    lease.path,
+                    os.O_RDONLY
+                    | os.O_DIRECTORY
+                    | os.O_CLOEXEC
+                    | getattr(os, "O_NOFOLLOW", 0),
+                )
                 try:
                     publication = ControllerGitPublication.capture(
                         checkout_fd,
@@ -593,7 +785,7 @@ class WorklinkRunner:
                 )
                 return WorklinkRunResult(
                     issue.issue_id,
-                    None,
+                    record.attempt,
                     "blocked",
                     reason=(
                         f"{selected_name} must run in an isolated checkout (own .git), "
@@ -626,6 +818,16 @@ class WorklinkRunner:
                 branch=lease.branch,
                 test_command=test_cmd,
             )
+            executor_report_dir = _make_executor_report_dir(
+                issue.issue_id, record.attempt, worker_uid_drop=worker_uid_drop
+            )
+            report_env = pytest_report_environment(
+                test_cmd,
+                executor_report_dir,
+                existing=spec.env.get("PYTEST_ADDOPTS"),
+            )
+            if report_env:
+                spec = with_worker_environment(spec, report_env)
             invocation_model = spec.backend_config.get("model")
             _log_event(
                 "worklink_backend_invocation",
@@ -713,30 +915,59 @@ class WorklinkRunner:
                 root_dirty_before=root_dirty_before,
                 runner=runner,
                 publication=publication,
+                executor_report_dir=executor_report_dir,
+                terminal_release=terminal_release,
             )
             delete_authorized_checkout = bool(
-                worker_required and result.review_ready and result.pr_url
+                worker_uid_drop and result.review_ready and result.pr_url
             )
             if delete_authorized_checkout and publication is not None:
-                publication.run("update-ref", "-d", f"refs/heads/{lease.branch}", check=True)
+                cleanup_errors: list[str] = []
+                _run_post_publication_bookkeeping(
+                    "authorized branch cleanup",
+                    lambda: publication.run(
+                        "update-ref", "-d", f"refs/heads/{lease.branch}", check=True
+                    ),
+                    issue_id=issue.issue_id,
+                    attempt=record.attempt,
+                    pr_url=result.pr_url,
+                    errors=cleanup_errors,
+                )
+                if cleanup_errors:
+                    result = replace(
+                        result,
+                        reason=_append_post_publication_error(
+                            result.reason, "; ".join(cleanup_errors)
+                        ),
+                    )
             return result
         except Exception as exc:
-            try:
-                claims.transition_issue(
-                    issue.issue_id,
-                    status="failed",
-                    review_ready=False,
-                    attempt=record.budget_attempt or record.attempt,
-                    reason=str(exc),
-                )
-            except Exception:
-                pass
+            transition_applied = False
+            transition_error = None
+            if terminal_release():
+                try:
+                    claims.transition_issue(
+                        issue.issue_id,
+                        status="failed",
+                        review_ready=False,
+                        attempt=record.budget_attempt or record.attempt,
+                        reason=str(exc),
+                    )
+                    transition_applied = True
+                except Exception as transition_exc:
+                    transition_error = str(transition_exc)
+            else:
+                transition_error = "Chainlink did not confirm lock release"
             _log_event(
                 "worklink_transition",
                 issue_id=issue.issue_id,
                 attempt=record.attempt,
                 status="failed",
+                review_ready=False,
+                pr_url=None,
                 reason=str(exc),
+                transition_applied=transition_applied,
+                error=transition_error,
             )
             return WorklinkRunResult(
                 issue.issue_id,
@@ -748,15 +979,29 @@ class WorklinkRunner:
             )
         finally:
             try:
-                _close_attempt_capabilities(
-                    publication,
-                    lease.authorization if lease is not None else None,
-                    lease.path if lease is not None else None,
-                    delete_checkout=delete_authorized_checkout,
-                )
+                try:
+                    _close_attempt_capabilities(
+                        publication,
+                        lease.authorization if lease is not None else None,
+                        lease.path if lease is not None else None,
+                        delete_checkout=delete_authorized_checkout,
+                    )
+                except Exception as exc:  # noqa: BLE001 - teardown must continue
+                    _log_event(
+                        "worklink_cleanup_failed",
+                        issue_id=issue.issue_id,
+                        attempt=record.attempt,
+                        cleanup="attempt_capabilities",
+                        error=str(exc),
+                    )
+                if executor_report_dir is not None:
+                    _remove_executor_report_dir_best_effort(
+                        executor_report_dir,
+                        issue_id=issue.issue_id,
+                        attempt=record.attempt,
+                    )
             finally:
-                claims.release_issue(issue.issue_id)
-                clear_run_state(self.home, issue.issue_id)
+                terminal_release()
 
     async def _finalize(
         self,
@@ -777,6 +1022,8 @@ class WorklinkRunner:
         root_dirty_before: Sequence[str],
         runner: Runner,
         publication: ControllerGitPublication | None = None,
+        executor_report_dir: Path | None = None,
+        terminal_release: Callable[[], bool],
     ) -> WorklinkRunResult:
         """Post-launch pipeline: interpret the worker result, observe evidence,
         open the PR on a passing gate, then transition + clean up.
@@ -787,6 +1034,14 @@ class WorklinkRunner:
         persisted handle)."""
         selected_name = backend.name
         raw = await backend.interpret(order, compute_result)
+        executor_tests: TestResult | None = None
+        if executor_report_dir is not None:
+            executor_tests = read_pytest_result(test_cmd or "", executor_report_dir)
+            _remove_executor_report_dir_best_effort(
+                executor_report_dir,
+                issue_id=issue.issue_id,
+                attempt=attempt,
+            )
         pr_body_section = _read_pr_body_section(lease.path)
         invocation_model = spec.backend_config.get("model")
         executor_failed = raw.exit_code != 0
@@ -841,6 +1096,7 @@ class WorklinkRunner:
             blocked_reason=raw.blocked_reason,
             model=invocation_model,
             failure_reason=raw.error if (executor_failed or backend_reported_failure) else None,
+            executor_tests=executor_tests,
             skip_test_reason="executor exited nonzero before the test gate" if executor_failed else None,
             runner=runner,
             safe_git=publication,
@@ -859,11 +1115,19 @@ class WorklinkRunner:
         )
         evidence_path = _write_evidence(self.home, validation.evidence)
         if validation.review_ready:
-            _commit_checkout_changes(lease.path, issue, runner=runner, publication=publication)
             try:
+                _commit_checkout_changes(
+                    lease.path, issue, runner=runner, publication=publication
+                )
                 _ensure_clean_checkout(lease.path, runner=runner, publication=publication)
-            except WorklinkError as exc:
-                validation = _failed_validation(validation, str(exc))
+            except Exception as exc:
+                validation = _publication_failed_validation(
+                    validation,
+                    step="commit",
+                    error=exc,
+                    issue_id=issue.issue_id,
+                    attempt=attempt,
+                )
             else:
                 validation = await observe_evidence(
                     issue=issue.issue_id,
@@ -879,6 +1143,7 @@ class WorklinkRunner:
                     blocked_reason=raw.blocked_reason,
                     model=invocation_model,
                     failure_reason=raw.error if (executor_failed or backend_reported_failure) else None,
+                    executor_tests=executor_tests,
                     skip_test_reason=(
                         "executor exited nonzero before the test gate" if executor_failed else None
                     ),
@@ -897,7 +1162,6 @@ class WorklinkRunner:
                     runner=runner,
                     root_dirty_before=root_dirty_before,
                 )
-                validation = _with_head_sha(validation, lease.path, runner=runner, publication=publication)
             evidence_path = _write_evidence(self.home, validation.evidence)
         if validation.review_ready:
             # chainlink #518: push from the checkout that OWNS the attempt
@@ -907,37 +1171,90 @@ class WorklinkRunner:
             # remote); pushing from ``self.repo`` fails with
             # "src refspec <branch> does not match any". This is also correct
             # for the legacy worktree shape, which shares the parent's refs.
-            _git_push(lease.path, lease.branch, runner=runner, publication=publication)
-            pr_url = _open_pr(
-                self.repo,
-                issue,
-                lease.branch,
-                validation.evidence,
-                pr_body_section=pr_body_section,
-                base=lease.base_ref,
-                runner=runner,
-            )
-            validation = _with_pr_url(validation, pr_url)
+            try:
+                _git_push(lease.path, lease.branch, runner=runner, publication=publication)
+            except Exception as exc:
+                validation = _publication_failed_validation(
+                    validation,
+                    step="push",
+                    error=exc,
+                    issue_id=issue.issue_id,
+                    attempt=attempt,
+                )
+            else:
+                validation = _with_head_sha(
+                    validation, lease.path, runner=runner, publication=publication
+                )
+                try:
+                    pr_url = _open_pr(
+                        self.repo,
+                        issue,
+                        lease.branch,
+                        validation.evidence,
+                        pr_body_section=pr_body_section,
+                        base=lease.base_ref,
+                        runner=runner,
+                    )
+                except Exception as exc:
+                    validation = _publication_failed_validation(
+                        validation,
+                        step="pull request",
+                        error=exc,
+                        issue_id=issue.issue_id,
+                        attempt=attempt,
+                    )
+                else:
+                    validation = _with_pr_url(validation, pr_url)
             evidence_path = _write_evidence(self.home, validation.evidence)
-        _comment_evidence(
-            claims,
-            validation.evidence,
-            validation,
-            evidence_path,
-            gate_test_tail=(
-                None if validation.review_ready else _local_gate_failure_tail(validation)
-            ),
-        )
-        _log_event(
-            "worklink_evidence",
-            issue_id=issue.issue_id,
-            attempt=attempt,
-            status=validation.status,
-            review_ready=validation.review_ready,
-            reasons=list(validation.reasons),
-            model=validation.evidence.model,
-            failure_reason=validation.evidence.failure_reason,
-        )
+        post_publication_errors: list[str] = []
+
+        def run_bookkeeping(name: str, action: Callable[[], Any]) -> Any | None:
+            return _run_post_publication_bookkeeping(
+                name,
+                action,
+                issue_id=issue.issue_id,
+                attempt=attempt,
+                pr_url=pr_url,
+                errors=post_publication_errors,
+            )
+
+        if pr_url:
+            written_path = run_bookkeeping(
+                "completed evidence write",
+                lambda: _write_evidence(self.home, validation.evidence),
+            )
+            if isinstance(written_path, Path):
+                evidence_path = written_path
+
+        def comment_evidence() -> None:
+            _comment_evidence(
+                claims,
+                validation.evidence,
+                validation,
+                evidence_path,
+                gate_test_tail=(
+                    None if validation.review_ready else _local_gate_failure_tail(validation)
+                ),
+            )
+
+        def log_evidence() -> None:
+            _log_event(
+                "worklink_evidence",
+                issue_id=issue.issue_id,
+                attempt=attempt,
+                status=validation.status,
+                review_ready=validation.review_ready,
+                reasons=list(validation.reasons),
+                model=validation.evidence.model,
+                failure_reason=validation.evidence.failure_reason,
+            )
+
+        if pr_url:
+            run_bookkeeping("evidence comment", comment_evidence)
+            run_bookkeeping("evidence event", log_evidence)
+        else:
+            comment_evidence()
+            log_evidence()
         transition_status = "blocked" if raw.output_overflow else validation.status
         transition_reason = (
             validation.evidence.failure_reason
@@ -946,21 +1263,59 @@ class WorklinkRunner:
             if validation.status == "blocked"
             else (", ".join(validation.reasons) if validation.reasons else None)
         )
-        claims.transition_issue(
-            issue.issue_id,
-            status=transition_status,
-            review_ready=validation.review_ready,
-            attempt=claim_record.budget_attempt or attempt,
-            reason=transition_reason,
-        )
-        _log_event(
-            "worklink_transition",
-            issue_id=issue.issue_id,
-            attempt=attempt,
-            status=transition_status,
-            review_ready=validation.review_ready,
-            pr_url=pr_url,
-        )
+        transition_applied = False
+        transition_error = None
+
+        if not terminal_release():
+            return WorklinkRunResult(
+                issue.issue_id,
+                attempt,
+                "failed",
+                review_ready=validation.review_ready,
+                pr_url=pr_url,
+                evidence_path=evidence_path,
+                checkout=lease.path,
+                branch=lease.branch,
+                reason="terminal recovery incomplete: Chainlink lock release failed",
+            )
+
+        def transition_issue() -> None:
+            nonlocal transition_applied, transition_error
+            try:
+                claims.transition_issue(
+                    issue.issue_id,
+                    status=transition_status,
+                    review_ready=validation.review_ready,
+                    attempt=claim_record.budget_attempt or attempt,
+                    reason=transition_reason,
+                )
+            except Exception as exc:
+                transition_error = str(exc)
+                raise
+            transition_applied = True
+
+        def log_transition() -> None:
+            _log_event(
+                "worklink_transition",
+                issue_id=issue.issue_id,
+                attempt=attempt,
+                status=transition_status,
+                review_ready=validation.review_ready,
+                pr_url=pr_url,
+                transition_applied=transition_applied,
+                error=transition_error,
+            )
+
+        if pr_url:
+            run_bookkeeping("issue transition", transition_issue)
+            run_bookkeeping("transition event", log_transition)
+        else:
+            try:
+                transition_issue()
+            finally:
+                # The transition event is the observable record of this failure;
+                # emit it without turning a failed mutation into a successful run.
+                log_transition()
         cleanup_error = None
         if publication is None:
             cleanup_error = _cleanup_checkout_after_transition(
@@ -970,6 +1325,8 @@ class WorklinkRunner:
                 issue_id=issue.issue_id,
                 attempt=attempt,
             )
+            if cleanup_error and pr_url:
+                post_publication_errors.append(f"checkout cleanup: {cleanup_error}")
         return WorklinkRunResult(
             issue.issue_id,
             attempt,
@@ -980,9 +1337,13 @@ class WorklinkRunner:
             checkout=lease.path,
             branch=lease.branch,
             reason=(
-                f"post-transition cleanup failed: {cleanup_error}"
+                _append_post_publication_error(None, "; ".join(post_publication_errors))
+                if post_publication_errors
+                else f"post-transition cleanup failed: {cleanup_error}"
                 if cleanup_error
-                else validation.evidence.failure_reason if raw.exit_code != 0 else None
+                else validation.evidence.failure_reason if raw.exit_code != 0
+                else validation.evidence.blocked_reason if validation.status == "blocked"
+                else None
             ),
         )
 
@@ -1003,12 +1364,20 @@ class WorklinkRunner:
             return WorklinkRunResult(issue_id, None, "failed", reason="reattach: no run state")
 
         runner = self.runner or _runner_for_home(self.home, self.chainlink_bin)
+        config = WorklinkConfig.load(self.home / "worklink.yaml")
         claims = ChainlinkClaims(
             chainlink_bin=self.chainlink_bin,
             agent_id=self.agent_id,
             runner=_list_runner(runner),
             home_path=self.home,
             event_logger=_log_event,
+            max_attempts=config.defaults.max_claim_attempts,
+        )
+        terminal_release = _TerminalClaimRelease(
+            claims,
+            home=self.home,
+            issue_id=issue_id,
+            attempt=state.attempt,
         )
         if state.shim_pid is not None:
             handle = LaunchHandle(
@@ -1025,7 +1394,7 @@ class WorklinkRunner:
                     await LocalSubprocessComputeBackend().cancel(handle)
             except (KeyError, RuntimeError, OSError, ValueError) as exc:
                 reason = f"reattach: worker cleanup failed: {exc}"
-            try:
+            if terminal_release():
                 claims.transition_issue(
                     issue_id,
                     status="failed",
@@ -1033,9 +1402,6 @@ class WorklinkRunner:
                     attempt=state.attempt,
                     reason=reason,
                 )
-            finally:
-                claims.release_issue(issue_id)
-                clear_run_state(self.home, issue_id)
             _log_event(
                 "worklink_reattach_cleanup",
                 issue_id=issue_id,
@@ -1071,14 +1437,24 @@ class WorklinkRunner:
                             if not expected_head
                             else "remote_head_mismatch"
                         ),
-                    )
+                )
                 restored_review = pr_state == "OPEN"
-                if restored_review:
+                if restored_review and terminal_release():
                     claims.transition_issue(
                         issue_id,
                         status="completed",
                         review_ready=True,
                         attempt=state.attempt,
+                    )
+                elif restored_review:
+                    return WorklinkRunResult(
+                        issue_id,
+                        state.attempt,
+                        "failed",
+                        pr_url=pr_url,
+                        evidence_path=review_ready.path,
+                        branch=state.branch,
+                        reason="terminal recovery incomplete: Chainlink lock release failed",
                     )
                 _log_event(
                     "worklink_reattach_reconciled",
@@ -1100,8 +1476,7 @@ class WorklinkRunner:
                     reason="reattach: reconciled completed evidence",
                 )
             finally:
-                claims.release_issue(issue_id)
-                clear_run_state(self.home, issue_id)
+                terminal_release()
         # Only resume a leaf still in-progress. If the reaper already recovered it
         # (or a prior run transitioned it) the work is no longer ours to finish —
         # drop the stale state and stop. ``_issue_has_label`` fails open (assume
@@ -1109,12 +1484,11 @@ class WorklinkRunner:
         # doesn't strand the worker.
         if not claims._issue_has_label(issue_id, "worklink:in-progress"):  # noqa: SLF001
             _log_event("worklink_reattach_skipped", issue_id=issue_id, reason="not_in_progress")
-            clear_run_state(self.home, issue_id)
+            terminal_release()
             return WorklinkRunResult(
                 issue_id, state.attempt, "failed", reason="reattach: leaf no longer in-progress"
             )
 
-        config = WorklinkConfig.load(self.home / "worklink.yaml")
         registry = self.registry or BackendRegistry(config)
         try:
             backend = registry.get(state.backend)
@@ -1205,13 +1579,14 @@ class WorklinkRunner:
                     attempt=state.attempt,
                     error=(compute_result.launch_error or "")[:300],
                 )
-                claims.transition_issue(
-                    issue_id,
-                    status="failed",
-                    review_ready=False,
-                    attempt=state.attempt,
-                    reason="reattach: worker lost after controller restart",
-                )
+                if terminal_release():
+                    claims.transition_issue(
+                        issue_id,
+                        status="failed",
+                        review_ready=False,
+                        attempt=state.attempt,
+                        reason="reattach: worker lost after controller restart",
+                    )
                 return WorklinkRunResult(
                     issue_id, state.attempt, "failed", reason="reattach: worker lost"
                 )
@@ -1231,18 +1606,20 @@ class WorklinkRunner:
                 test_cmd=test_cmd,
                 root_dirty_before=(),
                 runner=runner,
+                terminal_release=terminal_release,
             )
         except Exception as exc:
-            try:
-                claims.transition_issue(
-                    issue_id,
-                    status="failed",
-                    review_ready=False,
-                    attempt=state.attempt,
-                    reason=f"reattach failed: {exc}",
-                )
-            except Exception:
-                pass
+            if terminal_release():
+                try:
+                    claims.transition_issue(
+                        issue_id,
+                        status="failed",
+                        review_ready=False,
+                        attempt=state.attempt,
+                        reason=f"reattach failed: {exc}",
+                    )
+                except Exception:
+                    pass
             _log_event(
                 "worklink_reattach_failed", issue_id=issue_id, attempt=state.attempt, error=str(exc)
             )
@@ -1250,10 +1627,20 @@ class WorklinkRunner:
                 issue_id, state.attempt, "failed", reason=f"reattach failed: {exc}"
             )
         finally:
-            if lease is not None:
-                _remove_observation_worktree(self.repo, lease, runner=_list_runner(runner))
-            claims.release_issue(issue_id)
-            clear_run_state(self.home, issue_id)
+            try:
+                if lease is not None:
+                    try:
+                        _remove_observation_worktree(self.repo, lease, runner=_list_runner(runner))
+                    except Exception as exc:  # noqa: BLE001 - teardown must continue
+                        _log_event(
+                            "worklink_cleanup_failed",
+                            issue_id=issue_id,
+                            attempt=state.attempt,
+                            cleanup="reattach_observation_worktree",
+                            error=str(exc),
+                        )
+            finally:
+                terminal_release()
 
     async def run_epic(
         self,
@@ -1275,7 +1662,13 @@ class WorklinkRunner:
         issue_reader = ChainlinkIssueReader(chainlink_bin=self.chainlink_bin, runner=runner)
         issue = issue_reader.read(issue_id)
         if "worklink:epic" not in issue.labels:
+            _log_event(
+                "worklink_epic_refused",
+                issue_id=issue_id,
+                reason="not an epic issue",
+            )
             return WorklinkRunResult(issue_id, None, "failed", reason="not an epic issue")
+        validate_leaf(issue)
         config = WorklinkConfig.load(self.home / "worklink.yaml")
         registry = self.registry or BackendRegistry(config)
         selected = registry.get("feature_factory")
@@ -1293,15 +1686,52 @@ class WorklinkRunner:
                 compute.name, compute.capabilities()
             )
             if not allowed:
+                _log_event(
+                    "worklink_autonomous_refused",
+                    issue_id=issue_id,
+                    compute_backend=compute.name,
+                    reason=reason,
+                )
                 return WorklinkRunResult(issue_id, None, "refused", reason=reason)
         launcher = selected.admit()
         inventory = RepositoryInventory.load(self.home / "repositories.yaml")
         repository_config = inventory.repository(repo_slug) if inventory.declared else None
         base = (
-            repository_config.base_branch
-            if repository_config is not None
-            else config.defaults.base_branch
+            target_branch_from_description(issue.description)
+            or (repository_config.base_branch if repository_config is not None else None)
+            or config.defaults.base_branch
         )
+        base_check = runner(
+            [
+                "git",
+                "-C",
+                str(self.repo),
+                "ls-remote",
+                "--exit-code",
+                "origin",
+                f"refs/heads/{base.removeprefix('origin/')}",
+            ]
+        )
+        if base_check.returncode != 0:
+            reason = (
+                f"base branch does not exist in origin: {base}"
+                if base_check.returncode == 2
+                else (
+                    "base branch lookup failed for origin: "
+                    f"{base} (git ls-remote exit code {base_check.returncode})"
+                )
+            )
+            _log_event(
+                "worklink_epic_refused",
+                issue_id=issue_id,
+                reason=reason,
+            )
+            return WorklinkRunResult(
+                issue_id,
+                None,
+                "refused",
+                reason=reason,
+            )
         test_cmd = (
             repository_config.test_command
             if repository_config is not None and repository_config.test_command is not None
@@ -1313,23 +1743,71 @@ class WorklinkRunner:
             runner=_list_runner(runner),
             home_path=self.home,
             event_logger=_log_event,
+            max_attempts=config.defaults.max_claim_attempts,
         )
         issue = issue_reader.read(issue_id)
+        work_item_json = render_work_item(issue)
+        run_id = _validate_epic_work_item(work_item_json, issue.issue_id)
+        retained: FactoryRunRecord | None = None
+
+        def prepare_factory_claim() -> None:
+            nonlocal retained
+            candidates = load_factory_records_for_issue(self.home, issue_id)
+            for candidate in candidates:
+                try:
+                    _verify_factory_recovery_target(
+                        runner=self,
+                        issue=issue,
+                        retained=candidate,
+                        launcher=launcher,
+                        repo_slug=repo_slug,
+                        base=base,
+                        command_runner=runner,
+                    )
+                except WorklinkError as exc:
+                    archive_factory_record(
+                        self.home,
+                        candidate,
+                        event_logger=_log_durable_event,
+                        source_kind="dispatch_abandonment",
+                        reason=str(exc),
+                    )
+                    continue
+                if retained is None:
+                    retained = candidate
+
         claim = claims.claim_issue(
             issue_id,
             issue.comments,
             labels=issue.labels,
             max_active_locks=factory_max_concurrent(),
-            active_label="worklink:epic",
+            active_label=WORKLINK_EPIC_LABEL,
+            before_claim=prepare_factory_claim,
         )
         if claim.attempts_exhausted:
+            _log_event(
+                "worklink_attempts_exhausted",
+                issue_id=issue_id,
+                reason="attempts_exhausted",
+            )
             return WorklinkRunResult(issue_id, None, "blocked", reason="attempts_exhausted")
         if not claim.claimed or claim.record is None:
+            reason = claim.reason or "claim_failed"
+            _log_event(
+                "worklink_claim_failed",
+                issue_id=issue_id,
+                reason=reason,
+            )
             return WorklinkRunResult(
-                issue_id, None, "failed", reason=claim.reason or "claim_failed"
+                issue_id, None, "failed", reason=reason
             )
         claim_record = claim.record
-        retained = load_factory_record(self.home, str(issue_id))
+        _log_event(
+            "worklink_claimed",
+            issue_id=issue_id,
+            attempt=claim_record.attempt,
+            backend=selected.name,
+        )
         lease: CheckoutLease | None = None
         try:
             if retained is not None:
@@ -1357,9 +1835,17 @@ class WorklinkRunner:
                 runner=_list_runner(runner),
             )
             git_name, git_email = _read_checkout_git_identity(lease.path, runner)
-            publishing_identity = _read_factory_publishing_identity(self.repo)
+            publishing_identity, publishing_identity_source = (
+                _read_factory_publishing_identity(self.repo)
+            )
             github_token, github_env = _resolve_factory_github_credential(os.environ)
-            GitHubForgeClient(token=github_token).verify_identity(publishing_identity)
+            try:
+                GitHubForgeClient(token=github_token).verify_identity(publishing_identity)
+            except GitHubIdentityVerificationError as exc:
+                raise WorklinkError(
+                    f"{exc}; selected identity {publishing_identity} "
+                    f"from {publishing_identity_source}"
+                ) from exc
             order = WorkOrder(
                 issue_id=issue_id,
                 checkout=lease.path,
@@ -1368,11 +1854,24 @@ class WorklinkRunner:
                 timeout_s=int(_epic_run_timeout_s()),
                 env={
                     "MIMIR_HOME": str(self.home),
+                    "MIMIR_WORK_ITEM_JSON": work_item_json,
                     **github_env,
                     "GIT_AUTHOR_NAME": git_name,
                     "GIT_AUTHOR_EMAIL": git_email,
                     "GIT_COMMITTER_NAME": git_name,
                     "GIT_COMMITTER_EMAIL": git_email,
+                    # The factory child does the publishing, and 0.8.0 compares this
+                    # declared identity against ``gh api /user`` at Gate 1.
+                    #
+                    # Two DIFFERENT names are in play: the operator selects the identity
+                    # with MIMIR_FACTORY_PUBLISHING_IDENTITY, the child reads the
+                    # factory's own FACTORY_PUBLISHING_IDENTITY. Forward the value the
+                    # controller already resolved and verified above, under the child's
+                    # name -- inheritance alone would carry nothing in the local case,
+                    # where the identity comes from .factory.json and no variable is
+                    # exported at all. This also keeps the controller authoritative over
+                    # whatever .factory.json the sandbox happens to hold.
+                    FACTORY_PUBLISHING_IDENTITY_ENV: publishing_identity,
                 },
                 transcript_root=self.home / "state" / "worklink" / "transcripts",
             )
@@ -1381,25 +1880,29 @@ class WorklinkRunner:
                 attempt=claim_record.attempt,
                 repo_url=repo_url,
                 base_ref=lease.base_ref,
-                branch=lease.branch,
+                branch=f"feature/{run_id}",
                 test_command=test_cmd,
             )
-            handle = await compute.launch(spec)
+            _require_factory_launch_binding(spec, run_id, publishing_identity)
             factory_record = FactoryRunRecord(
-                run_id=str(issue_id),
+                run_id=run_id,
                 issue_id=issue_id,
                 attempt=claim_record.attempt,
                 repository=repo_slug,
                 base_ref=base,
-                branch=lease.branch,
+                branch=f"feature/{run_id}",
                 launcher=str(launcher),
-                sandbox=str(lease.path),
+                sandbox=str(lease.path / ".factory-sandboxes" / run_id),
                 session=None,
-                handle=handle,
+                handle=None,
                 status=None,
                 observed_at=None,
                 controller_phase="running",
+                transcript=None,
             )
+            _create_factory_sandbox(factory_record, lease)
+            handle = await compute.launch(spec)
+            factory_record = replace(factory_record, handle=handle)
             try:
                 save_factory_record(self.home, factory_record)
             except BaseException:
@@ -1417,17 +1920,29 @@ class WorklinkRunner:
                 started_at=datetime.now(UTC),
             )
         except Exception as exc:
+            original_reason = str(exc)
             try:
-                current = load_factory_record(self.home, str(issue_id))
+                records = load_factory_records_for_issue(self.home, issue_id)
+                current = records[0] if records else None
             except Exception:
                 current = None
+            preserved_ref, preservation_error = _preserve_failed_factory_run(
+                home=self.home,
+                trusted_repo=self.repo,
+                record=current,
+            )
+            reason = original_reason
+            if preserved_ref is not None:
+                reason += f"; completed work preserved at {preserved_ref}"
+            elif preservation_error is not None:
+                reason += f"; completed work preservation failed: {preservation_error}"
             if current is not None:
                 save_factory_record(
                     self.home,
                     replace(
                         current,
                         controller_phase="failed",
-                        controller_error=str(exc),
+                        controller_error=_factory_controller_error(reason),
                     ),
                 )
             claims.transition_issue(
@@ -1435,7 +1950,24 @@ class WorklinkRunner:
                 status="failed",
                 review_ready=False,
                 attempt=claim_record.budget_attempt or claim_record.attempt,
-                reason=str(exc),
+                reason=reason,
+            )
+            _log_event(
+                "worklink_transition",
+                issue_id=issue_id,
+                attempt=claim_record.attempt,
+                status="failed",
+                review_ready=False,
+                pr_url=None,
+                reason=reason,
+                **(
+                    {
+                        "preserved_ref": preserved_ref,
+                        "preservation_error": preservation_error,
+                    }
+                    if preserved_ref is not None or preservation_error is not None
+                    else {}
+                ),
             )
             return WorklinkRunResult(
                 issue_id,
@@ -1443,10 +1975,18 @@ class WorklinkRunner:
                 "failed",
                 checkout=Path(current.sandbox) if current is not None else None,
                 branch=current.branch if current is not None else None,
-                reason=str(exc),
+                reason=reason,
+                preserved_ref=preserved_ref,
+                preservation_error=preservation_error,
             )
         finally:
-            claims.release_issue(issue_id)
+            _release_issue_and_clear_run_state(
+                claims,
+                home=self.home,
+                issue_id=issue_id,
+                attempt=claim_record.attempt,
+                trigger_ready_scan=autonomous,
+            )
 
     async def _recover_factory_070(
         self,
@@ -1597,6 +2137,7 @@ class WorklinkRunner:
             retained.observed(resumed, datetime.now(UTC).isoformat()),
             handle=handle,
             controller_phase="running",
+            transcript=None,
         )
         try:
             save_factory_record(self.home, relaunched)
@@ -1653,6 +2194,34 @@ class WorklinkRunner:
         status = initial_status
         failed = True
         cancel_attempted = False
+        wait_result: ComputeResult | None = None
+
+        def retain_result(result: ComputeResult | None, outcome: str) -> None:
+            nonlocal factory_record
+            if factory_record.transcript is not None:
+                return
+            path = transcript_path(
+                self.home / "state" / "worklink" / "transcripts",
+                issue.issue_id,
+            )
+            write_transcript(
+                path,
+                command=() if result is None else result.command,
+                exit_code=None if result is None else result.exit_code,
+                status=outcome,
+                stdout="" if result is None else result.stdout,
+                stderr=(
+                    "OpenCode supervision result was not drainable"
+                    if result is None
+                    else result.stderr
+                ),
+                timed_out=False if result is None else result.timed_out,
+                output_overflow=False if result is None else result.output_overflow,
+                stdout_path=None if result is None else result.stdout_path,
+                stderr_path=None if result is None else result.stderr_path,
+            )
+            factory_record = replace(factory_record, transcript=str(path))
+            save_factory_record(self.home, factory_record)
 
         async def cancel_once() -> None:
             nonlocal cancel_attempted
@@ -1667,7 +2236,7 @@ class WorklinkRunner:
                     remaining = startup_deadline - loop.time() if last_status is None else deadline - loop.time()
                     if remaining <= 0:
                         if last_status is None:
-                            raise WorklinkError("factory startup status handshake timed out")
+                            raise WorklinkError("factory never initialised before startup deadline")
                         raise WorklinkError(f"factory exceeded run timeout ({run_timeout:.0f}s)")
                     try:
                         status = await asyncio.wait_for(
@@ -1681,60 +2250,80 @@ class WorklinkRunner:
                         )
                     except TimeoutError as exc:
                         if last_status is None:
-                            raise WorklinkError("factory startup status handshake timed out") from exc
+                            raise WorklinkError(
+                                "factory never initialised before startup deadline"
+                            ) from exc
                         raise WorklinkError(f"factory exceeded run timeout ({run_timeout:.0f}s)") from exc
-                _require_factory_status(status, factory_record)
-                if status != last_status:
-                    last_status = status
-                    last_change = loop.time()
-                if factory_record.session is not None and status.lock_session not in {
-                    None,
-                    factory_record.session,
-                }:
-                    raise WorklinkError("factory lock owner changed")
-                factory_record = factory_record.observed(status, datetime.now(UTC).isoformat())
-                phase = "parked" if status.is_parked else "terminal" if status.is_terminal else "running"
-                factory_record = replace(factory_record, controller_phase=phase)
-                save_factory_record(self.home, factory_record)
-                if status.lock == "fresh" and factory_record.session == status.lock_session:
-                    await asyncio.to_thread(
-                        backend.heartbeat,
-                        factory_record.run_id,
-                        session=factory_record.session,
-                        sandbox=Path(factory_record.sandbox),
-                        launcher=factory_record.launcher,
+                pre_manifest = last_status is None and status == FactoryStatus(
+                    run_id=factory_record.run_id,
+                    valid=False,
+                    sandbox_path=factory_record.sandbox,
+                )
+                if pre_manifest:
+                    if loop.time() >= startup_deadline:
+                        raise WorklinkError("factory never initialised before startup deadline")
+                else:
+                    _require_factory_status(status, factory_record)
+                    if status != last_status:
+                        last_status = status
+                        last_change = loop.time()
+                    if factory_record.session is not None and status.lock_session not in {
+                        None,
+                        factory_record.session,
+                    }:
+                        raise WorklinkError("factory lock owner changed")
+                    factory_record = factory_record.observed(status, datetime.now(UTC).isoformat())
+                    phase = (
+                        "parked"
+                        if status.is_parked
+                        else "terminal" if status.is_terminal else "running"
                     )
-                if loop.time() - last_change >= stale_after:
-                    _log_event(
-                        "worklink_factory_stale_status",
-                        issue_id=issue.issue_id,
-                        diagnostic_after_s=stale_after,
-                        lock=status.lock,
-                        process_alive=compute.job_alive(handle),
-                    )
-                if status.is_terminal or status.is_parked:
-                    if not wait_task.done():
-                        await cancel_once()
-                        await _finish_factory_wait_task(wait_task)
-                    failed = False
-                    return await self._finish_factory_070(
-                        issue=issue,
-                        claim_record=claim_record,
-                        claims=claims,
-                        backend=backend,
-                        compute=compute,
-                        factory_record=factory_record,
-                        test_cmd=test_cmd,
-                        runner=runner,
-                        started_at=started_at,
-                    )
+                    factory_record = replace(factory_record, controller_phase=phase)
+                    save_factory_record(self.home, factory_record)
+                    if status.lock == "fresh" and factory_record.session == status.lock_session:
+                        await asyncio.to_thread(
+                            backend.heartbeat,
+                            factory_record.run_id,
+                            session=factory_record.session,
+                            sandbox=Path(factory_record.sandbox),
+                            launcher=factory_record.launcher,
+                        )
+                    if loop.time() - last_change >= stale_after:
+                        _log_event(
+                            "worklink_factory_stale_status",
+                            issue_id=issue.issue_id,
+                            diagnostic_after_s=stale_after,
+                            lock=status.lock,
+                            process_alive=compute.job_alive(handle),
+                        )
+                    if status.is_terminal or status.is_parked:
+                        if not wait_task.done():
+                            await cancel_once()
+                            wait_result = await _finish_factory_wait_task(wait_task)
+                        else:
+                            wait_result = await wait_task
+                        retain_result(wait_result, status.status or phase)
+                        failed = False
+                        return await self._finish_factory_070(
+                            issue=issue,
+                            claim_record=claim_record,
+                            claims=claims,
+                            backend=backend,
+                            compute=compute,
+                            factory_record=factory_record,
+                            test_cmd=test_cmd,
+                            runner=runner,
+                            started_at=started_at,
+                        )
                 if wait_task.done() or not compute.job_alive(handle):
                     try:
                         result = await asyncio.wait_for(asyncio.shield(wait_task), timeout=5)
+                        wait_result = result
                     except TimeoutError as exc:
                         raise WorklinkError(
                             "OpenCode process stopped without a drainable supervision result"
                         ) from exc
+                    retain_result(result, "failed")
                     detail = result.stderr.strip() or result.stdout.strip()
                     suffix = f": {detail[:300]}" if detail else ""
                     raise WorklinkError(
@@ -1743,17 +2332,26 @@ class WorklinkRunner:
                 if loop.time() >= deadline:
                     raise WorklinkError(f"factory exceeded run timeout ({run_timeout:.0f}s)")
                 _heartbeat_claim_best_effort(claims, claim_record)
-                await asyncio.sleep(max(0.01, float(backend.poll_interval_s)))
+                poll_delay = max(0.01, float(backend.poll_interval_s))
+                if pre_manifest:
+                    poll_delay = min(poll_delay, max(0, startup_deadline - loop.time()))
+                await asyncio.sleep(poll_delay)
                 status = None
         finally:
-            if failed and not wait_task.done():
-                try:
-                    await cancel_once()
-                finally:
-                    await _finish_factory_wait_task(wait_task)
-            elif wait_task.done():
-                await asyncio.gather(wait_task, return_exceptions=True)
-            await compute.cleanup(handle)
+            try:
+                if failed and not wait_task.done():
+                    try:
+                        await cancel_once()
+                    finally:
+                        wait_result = await _finish_factory_wait_task(wait_task)
+                        retain_result(wait_result, "refused")
+                elif wait_task.done():
+                    drained = await asyncio.gather(wait_task, return_exceptions=True)
+                    if wait_result is None and drained and isinstance(drained[0], ComputeResult):
+                        wait_result = drained[0]
+                    retain_result(wait_result, "refused" if failed else "completed")
+            finally:
+                await compute.cleanup(handle)
 
     async def _finish_factory_070(
         self,
@@ -1772,7 +2370,14 @@ class WorklinkRunner:
         if status is None:
             raise WorklinkError("factory terminal projection is missing")
         if status.is_parked:
-            return WorklinkRunResult(
+            claims.transition_issue(
+                issue.issue_id,
+                status="blocked",
+                review_ready=False,
+                attempt=claim_record.budget_attempt or claim_record.attempt,
+                reason="factory run is parked",
+            )
+            result = WorklinkRunResult(
                 issue.issue_id,
                 factory_record.attempt,
                 "needs-human",
@@ -1780,6 +2385,16 @@ class WorklinkRunner:
                 branch=factory_record.branch,
                 reason="factory run is parked",
             )
+            _log_event(
+                "worklink_transition",
+                issue_id=issue.issue_id,
+                attempt=factory_record.attempt,
+                status=result.status,
+                review_ready=result.review_ready,
+                pr_url=result.pr_url,
+                reason=result.reason,
+            )
+            return result
         if status.status in {"blocked", "partial"}:
             claims.transition_issue(
                 issue.issue_id,
@@ -1788,15 +2403,25 @@ class WorklinkRunner:
                 attempt=claim_record.budget_attempt or claim_record.attempt,
                 reason=f"factory status: {status.status}",
             )
-            return WorklinkRunResult(
+            result = WorklinkRunResult(
                 issue.issue_id,
                 factory_record.attempt,
-                "blocked",
+                status.status,
                 pr_url=status.pr_url,
                 checkout=Path(factory_record.sandbox),
                 branch=factory_record.branch,
                 reason=f"factory status: {status.status}",
             )
+            _log_event(
+                "worklink_transition",
+                issue_id=issue.issue_id,
+                attempt=factory_record.attempt,
+                status=result.status,
+                review_ready=result.review_ready,
+                pr_url=result.pr_url,
+                reason=result.reason,
+            )
+            return result
         evidence_path, pr_url = await _verify_factory_completion(
             home=self.home,
             issue=issue,
@@ -1811,7 +2436,7 @@ class WorklinkRunner:
             review_ready=True,
             attempt=claim_record.budget_attempt or claim_record.attempt,
         )
-        return WorklinkRunResult(
+        result = WorklinkRunResult(
             issue.issue_id,
             factory_record.attempt,
             "review_ready",
@@ -1821,13 +2446,75 @@ class WorklinkRunner:
             checkout=Path(factory_record.sandbox),
             branch=factory_record.branch,
         )
+        _log_event(
+            "worklink_transition",
+            issue_id=issue.issue_id,
+            attempt=factory_record.attempt,
+            status=result.status,
+            review_ready=result.review_ready,
+            pr_url=result.pr_url,
+        )
+        return result
 
-async def _finish_factory_wait_task(task: asyncio.Task[ComputeResult]) -> None:
+async def _finish_factory_wait_task(
+    task: asyncio.Task[ComputeResult],
+) -> ComputeResult | None:
     try:
-        await asyncio.wait_for(asyncio.shield(task), timeout=5)
+        return await asyncio.wait_for(asyncio.shield(task), timeout=5)
     except TimeoutError:
         task.cancel()
         await asyncio.gather(task, return_exceptions=True)
+        return None
+
+
+def _factory_controller_error(error: BaseException | str) -> str:
+    encoded = redact_text(str(error)).encode("utf-8")
+    if len(encoded) <= _FACTORY_CONTROLLER_ERROR_MAX_BYTES:
+        return encoded.decode("utf-8")
+    marker = b"[controller error truncated; see transcript]"
+    prefix = encoded[: _FACTORY_CONTROLLER_ERROR_MAX_BYTES - len(marker)].decode(
+        "utf-8", errors="ignore"
+    )
+    return prefix.rstrip() + marker.decode("ascii")
+
+
+def _preserve_failed_factory_run(
+    *,
+    home: Path,
+    trusted_repo: Path,
+    record: FactoryRunRecord | None,
+) -> tuple[str | None, str | None]:
+    """Best-effort publication for post-merge failures before terminal release."""
+    if (
+        record is None
+        or record.status is None
+        or record.status.pr_url is not None
+        or record.status.slices is None
+        or not any(":merged(" in item for item in record.status.slices)
+    ):
+        return None, None
+    try:
+        checkout_fd = os.open(
+            Path(record.sandbox),
+            os.O_RDONLY
+            | os.O_DIRECTORY
+            | os.O_CLOEXEC
+            | getattr(os, "O_NOFOLLOW", 0),
+        )
+        try:
+            publication = ControllerGitPublication.capture(
+                checkout_fd,
+                trusted_repo,
+                record.branch,
+                home / "state" / "worklink" / "publication",
+            )
+        finally:
+            os.close(checkout_fd)
+        with publication:
+            publication.push(check=True)
+        return f"origin/{record.branch}", None
+    except Exception as exc:  # noqa: BLE001 - preservation must not replace the refusal
+        return None, _factory_controller_error(exc)
 
 
 async def _cancel_and_cleanup_factory_handle(compute: Any, handle: LaunchHandle) -> None:
@@ -1858,7 +2545,37 @@ def _verify_factory_recovery_binding(
     base: str,
     command_runner: Runner,
 ) -> Path:
-    if retained.issue_id != issue.issue_id or retained.run_id != str(issue.issue_id):
+    sandbox = _verify_factory_recovery_target(
+        runner=runner,
+        issue=issue,
+        retained=retained,
+        launcher=launcher,
+        repo_slug=repo_slug,
+        base=base,
+        command_runner=command_runner,
+    )
+    if claim_record.issue_id != issue.issue_id:
+        raise WorklinkError("factory recovery claim issue does not match")
+    if claim_record.agent_id != claims.agent_id or claims.agent_id != runner.agent_id:
+        raise WorklinkError("factory recovery claim owner does not match")
+    if not getattr(claims, "_lock_still_held_by")(claim_record):
+        raise WorklinkError("factory recovery claim is not retained")
+    return sandbox
+
+
+def _verify_factory_recovery_target(
+    *,
+    runner: WorklinkRunner,
+    issue: IssueContext,
+    retained: FactoryRunRecord,
+    launcher: Path,
+    repo_slug: str,
+    base: str,
+    command_runner: Runner,
+) -> Path:
+    if retained.issue_id != issue.issue_id or retained.run_id not in factory_record_run_ids(
+        issue.issue_id
+    ):
         raise WorklinkError("retained factory issue identity does not match recovery request")
     if retained.repository.lower() != repo_slug.lower():
         raise WorklinkError("retained factory repository does not match recovery request")
@@ -1871,16 +2588,10 @@ def _verify_factory_recovery_binding(
         raise WorklinkError("retained factory base does not match recovery request")
     if retained.launcher != str(launcher):
         raise WorklinkError("retained factory launcher does not match recovery request")
-    if retained.controller_phase not in {"running", "parked", "failed", "terminal"}:
+    if retained.controller_phase not in _RECOVERABLE_FACTORY_PHASES:
         raise WorklinkError("retained factory lifecycle is not recoverable")
     if not retained.session:
         raise WorklinkError("retained factory session is missing")
-    if claim_record.issue_id != issue.issue_id:
-        raise WorklinkError("factory recovery claim issue does not match")
-    if claim_record.agent_id != claims.agent_id or claims.agent_id != runner.agent_id:
-        raise WorklinkError("factory recovery claim owner does not match")
-    if not getattr(claims, "_lock_still_held_by")(claim_record):
-        raise WorklinkError("factory recovery claim is not retained")
     sandbox = Path(retained.sandbox)
     if not sandbox.is_absolute() or not sandbox.is_dir() or sandbox.is_symlink():
         raise WorklinkError("retained factory sandbox is unavailable")
@@ -1894,6 +2605,20 @@ def _verify_factory_recovery_binding(
     return sandbox
 
 
+def _create_factory_sandbox(record: FactoryRunRecord, lease: CheckoutLease) -> Path:
+    """Create the parent for a validated sandbox that the factory will create."""
+    sandbox = Path(record.sandbox)
+    root = lease.path / ".factory-sandboxes"
+    if sandbox != root / record.run_id:
+        raise WorklinkError("factory sandbox does not match the validated run identity")
+    if lease.path.is_symlink() or root.is_symlink() or sandbox.is_symlink():
+        raise WorklinkError("factory sandbox path may not be a symlink")
+    root.mkdir(mode=0o700, exist_ok=True)
+    if sandbox.exists():
+        raise WorklinkError(f"factory sandbox already exists: {sandbox}")
+    return sandbox
+
+
 def _require_factory_status(
     status: FactoryStatus,
     record: FactoryRunRecord,
@@ -1904,18 +2629,34 @@ def _require_factory_status(
         raise WorklinkError("factory status is invalid")
     if status.run_id != record.run_id:
         raise WorklinkError("factory status run id mismatch")
-    if status.issue_key != str(record.issue_id):
-        raise WorklinkError("factory status issue key mismatch")
     if status.sandbox_path != record.sandbox:
         raise WorklinkError("factory status sandbox mismatch")
+    if status.status is None:
+        raise WorklinkError("factory status is missing lifecycle status")
+    if status.mode is None:
+        raise WorklinkError("factory status mode is missing")
     if status.mode != "autonomous":
         raise WorklinkError("factory status mode mismatch")
+    if status.branch is None:
+        raise WorklinkError("factory status branch is missing")
     if status.branch != record.branch:
         raise WorklinkError("factory status branch mismatch")
+    if status.pr_draft is None:
+        raise WorklinkError("factory status PR draft state is missing")
+    if status.lock is None:
+        raise WorklinkError("factory status lock state is missing")
+    if status.dead_lock is None:
+        raise WorklinkError("factory status dead-lock state is missing")
     if status.pr_base is not None and status.pr_base != record.base_ref:
-        raise WorklinkError("factory status base mismatch")
+        raise WorklinkError(
+            "factory status base mismatch: "
+            f"observed {status.pr_base!r}, expected {record.base_ref!r}"
+        )
     if require_pr_base and status.pr_base is None:
-        raise WorklinkError("factory status base mismatch")
+        raise WorklinkError(
+            "factory status base mismatch: "
+            f"observed {status.pr_base!r}, expected {record.base_ref!r}"
+        )
 
 
 def _fixed_command(
@@ -2029,6 +2770,8 @@ async def _verify_factory_completion(
         if status.status != "completed" or not status.is_terminal:
             raise WorklinkError("factory completion status is not authoritative")
         _require_factory_status(status, record, require_pr_base=True)
+        if status.slices is None or not any(":merged(" in item for item in status.slices):
+            raise WorklinkError("factory completion has no merged slice")
         if status.pr_draft:
             raise WorklinkError("factory completed with a draft PR")
         if status.pr_url is None:
@@ -2222,7 +2965,79 @@ def _close_attempt_capabilities(
                 authorization.close()
         finally:
             if delete_checkout and checkout is not None:
-                rmtree_missing_ok(checkout.parent)
+                # Path-addressed attempts are siblings under one repository root.
+                # Delete only this attempt; removing the parent destroys concurrent runs.
+                rmtree_missing_ok(checkout)
+
+
+def _release_issue_and_clear_run_state(
+    claims: ChainlinkClaims,
+    *,
+    home: Path,
+    issue_id: int,
+    attempt: int,
+    trigger_ready_scan: bool = False,
+) -> bool:
+    """Release a claim, clear local state, then notify waiting autonomous work."""
+    try:
+        released = claims.release_issue(issue_id)
+    except BaseException as exc:
+        _log_event(
+            "worklink_cleanup_failed",
+            issue_id=issue_id,
+            attempt=attempt,
+            cleanup="lock_release",
+            error=str(exc),
+        )
+        raise
+    if not released:
+        _log_event(
+            "worklink_cleanup_failed",
+            issue_id=issue_id,
+            attempt=attempt,
+            cleanup="lock_release",
+            error="Chainlink did not confirm lock release",
+        )
+        return False
+    try:
+        clear_run_state(home, issue_id)
+    finally:
+        if trigger_ready_scan:
+            _trigger_ready_scan_after_release(home)
+    return True
+
+
+def _log_terminal_recovery_failed(*, issue_id: int, attempt: int, outcome: str) -> None:
+    _log_event(
+        "worklink_terminal_recovery_failed",
+        issue_id=issue_id,
+        attempt=attempt,
+        outcome=outcome,
+        lock_released=False,
+        label_transition_applied=False,
+        state_retained=True,
+        error="Chainlink did not confirm lock release",
+    )
+
+
+def _remove_executor_report_dir_best_effort(
+    report_dir: Path,
+    *,
+    issue_id: int,
+    attempt: int,
+) -> None:
+    """Remove executor-owned report data without interrupting teardown."""
+    try:
+        rmtree_missing_ok(report_dir)
+    except Exception as exc:  # noqa: BLE001 - executor-owned paths are disposable
+        _log_event(
+            "worklink_cleanup_failed",
+            issue_id=issue_id,
+            attempt=attempt,
+            cleanup="executor_report_dir",
+            path=str(report_dir),
+            error=str(exc),
+        )
 
 
 def _cleanup_checkout_after_transition(
@@ -2257,6 +3072,56 @@ def _cleanup_checkout_after_transition(
     return None
 
 
+def _run_post_publication_bookkeeping(
+    name: str,
+    action: Callable[[], Any],
+    *,
+    issue_id: int,
+    attempt: int,
+    pr_url: str | None,
+    errors: list[str],
+) -> Any | None:
+    """Run secondary publication work without reopening the failure path."""
+    try:
+        return action()
+    except Exception as exc:
+        error = f"{name}: {exc}"
+        errors.append(error)
+        _record_post_publication_error(
+            error,
+            issue_id=issue_id,
+            attempt=attempt,
+            pr_url=pr_url,
+        )
+        return None
+
+
+def _append_post_publication_error(reason: str | None, error: str) -> str:
+    detail = f"post-publication bookkeeping failed: {error}"
+    return f"{reason}; {detail}" if reason else detail
+
+
+def _record_post_publication_error(
+    error: str,
+    *,
+    issue_id: int,
+    attempt: int,
+    pr_url: str | None,
+) -> None:
+    """Report secondary publication work without reopening the failure path."""
+    try:
+        _log_event(
+            "worklink_post_publication_failed",
+            level="warning",
+            issue_id=issue_id,
+            attempt=attempt,
+            pr_url=pr_url,
+            error=error,
+        )
+    except Exception:
+        pass
+
+
 def run_worklink(
     *,
     home: Path,
@@ -2281,6 +3146,7 @@ def run_worklink(
         )
     except Exception as exc:
         _record_run_failure(
+            home=home,
             issue_id=issue_id,
             attempt=None,
             error=exc,
@@ -2290,26 +3156,34 @@ def run_worklink(
         raise
     if result.status == "failed":
         _record_run_failure(
+            home=home,
             issue_id=issue_id,
             attempt=result.attempt,
             error=result.reason or "Worklink run failed",
             exit_status=1,
             autonomous=autonomous,
+            preserved_ref=result.preserved_ref,
+            preservation_error=result.preservation_error,
         )
-    elif result.status in {"completed", "blocked"}:
-        _record_run_success(issue_id)
+    elif result.status == "completed":
+        _record_run_success(home, issue_id)
+    # Parked outcomes do not resolve or replace prior failure attention. Leaving
+    # it active keeps the issue backed off without inflating its consecutive count.
     return result
 
 
 def _record_run_failure(
     *,
+    home: Path,
     issue_id: int,
     attempt: int | None,
     error: BaseException | str,
     exit_status: int,
     autonomous: bool,
+    preserved_ref: str | None = None,
+    preservation_error: str | None = None,
 ) -> None:
-    from .dispatch_failures import record_failure, terminal_error
+    from .dispatch_failures import dispatch_failure_state_dir, record_failure, terminal_error
 
     safe_error = terminal_error(error)
     _log_event(
@@ -2319,34 +3193,44 @@ def _record_run_failure(
         attempt_consumed=attempt is not None,
         exit_status=exit_status,
         terminal_error=safe_error,
+        preserved_ref=preserved_ref,
+        preservation_error=preservation_error,
     )
-    state_dir = os.environ.get("STATE_DIR")
-    if autonomous and state_dir:
+    if autonomous:
         try:
             record_failure(
-                Path(state_dir),
+                dispatch_failure_state_dir(home),
                 issue_id=issue_id,
                 attempt=attempt,
                 exit_status=exit_status,
                 error=error,
                 log_path=os.environ.get("WORKLINK_RUN_LOG"),
+                preserved_ref=preserved_ref,
+                preservation_error=preservation_error,
             )
         except OSError:
             pass
 
 
-def _record_run_success(issue_id: int) -> None:
-    from .dispatch_failures import record_success
+def _record_run_success(home: Path, issue_id: int) -> None:
+    from .dispatch_failures import dispatch_failure_state_dir, record_success
 
-    state_dir = os.environ.get("STATE_DIR")
-    if state_dir:
-        try:
-            record_success(Path(state_dir), issue_id)
-        except OSError:
-            pass
+    try:
+        record_success(dispatch_failure_state_dir(home), issue_id)
+    except OSError:
+        pass
 
 
-def run_worklink_reattach(*, home: Path, repo: Path, issue_id: int) -> WorklinkRunResult:
+def _trigger_ready_scan_after_release(home: Path) -> None:
+    """Signal the ready queue only after Chainlink confirmed a slot release."""
+    from ..poller_triggers import notify_poller
+
+    notify_poller(home, "worklink-ready-queue", reason="worklink_slot_released")
+
+
+def run_worklink_reattach(
+    *, home: Path, repo: Path, issue_id: int
+) -> WorklinkRunResult:
     """Resume one in-flight run after a controller restart (#561)."""
     return asyncio.run(WorklinkRunner(home=home, repo=repo).reattach(issue_id))
 
@@ -2358,12 +3242,37 @@ def run_worklink_epic(
     issue_id: int,
     autonomous: bool = False,
 ) -> WorklinkRunResult:
-    return asyncio.run(
-        WorklinkRunner(home=home, repo=repo).run_epic(
-            issue_id,
+    try:
+        result = asyncio.run(
+            WorklinkRunner(home=home, repo=repo).run_epic(
+                issue_id,
+                autonomous=autonomous,
+            )
+        )
+    except Exception as exc:
+        _record_run_failure(
+            home=home,
+            issue_id=issue_id,
+            attempt=None,
+            error=exc,
+            exit_status=1,
             autonomous=autonomous,
         )
-    )
+        raise
+    if result.status == "failed":
+        _record_run_failure(
+            home=home,
+            issue_id=issue_id,
+            attempt=result.attempt,
+            error=result.reason or "Worklink epic run failed",
+            exit_status=1,
+            autonomous=autonomous,
+            preserved_ref=result.preserved_ref,
+            preservation_error=result.preservation_error,
+        )
+    elif result.status in {"completed", "review_ready"}:
+        _record_run_success(home, issue_id)
+    return result
 
 
 def _persist_run_state(
@@ -2497,6 +3406,44 @@ def _template_path(home: Path) -> Path:
     if custom.exists():
         return custom
     return Path(__file__).resolve().parents[1] / "prompt_templates" / "worklink-order.md"
+
+
+def _make_executor_report_dir(issue: int, attempt: int, *, worker_uid_drop: bool) -> Path:
+    """Create the executor's pytest report directory.
+
+    The path this returns is injected into the executor's ``PYTEST_ADDOPTS`` as
+    ``--junitxml`` and ``cache_dir``. ``mkdtemp`` creates 0700 owned by the
+    CONTROLLER, so when the executor is dropped to the WORKER uid every pytest it
+    runs raises ``PermissionError`` from ``pytest_sessionfinish`` -- AFTER the suite
+    has already passed:
+
+        PermissionError: [Errno 13] Permission denied:
+            '/tmp/worklink-1475-3-executor-4m8dxhzg/junit.xml'
+
+    On the worker path, sharing the directory with the worklink group is a
+    PRECONDITION, not a best effort: if it cannot be arranged the launch must fail
+    here, loudly and before the backend starts, rather than proceed to the same
+    post-suite PermissionError with worse diagnostics. The half-made directory is
+    removed so a failed launch leaves nothing behind.
+
+    On the controller path the directory stays 0700 and private. There is no worker
+    uid to accommodate, so no group is granted.
+    """
+    path = Path(tempfile.mkdtemp(prefix=f"worklink-{issue}-{attempt}-executor-"))
+    if not worker_uid_drop:
+        return path
+    try:
+        # Permitted for the owner because ``mimir`` is a member of ``worklink``.
+        os.chown(path, -1, get_identities().worklink_gid)
+        os.chmod(path, 0o770)
+    except Exception as exc:
+        rmtree_missing_ok(path)
+        raise WorklinkError(
+            "cannot share the executor report directory with the worklink group; "
+            "the worker would fail writing junit.xml after the suite runs "
+            f"({type(exc).__name__}: {exc})"
+        ) from exc
+    return path
 
 
 def _format_work_order(order: WorkOrder, *, backend: str) -> str:
@@ -2712,6 +3659,7 @@ def _create_backend_checkout(
         issue_id=issue_id,
         attempt=attempt,
         base=base,
+        checkout_branch=base if isinstance(backend, FeatureFactoryBackend) else None,
         base_fetch=base_fetch,
         event_logger=event_logger,
         runner=runner,
@@ -2967,6 +3915,7 @@ def _read_pr_body_section(checkout: Path) -> str | None:
     text = redact_text(text).strip()
     # A build-authored lookalike must not precede the canonical parser anchor.
     text = _EVIDENCE_HEADING_RE.sub("[Build-authored evidence heading removed]", text)
+    text = _render_chainlink_text(text)
     encoded = text.encode("utf-8")
     truncated = len(raw) > _PR_BODY_SECTION_MAX_BYTES or len(encoded) > _PR_BODY_SECTION_MAX_BYTES
     if truncated:
@@ -3013,9 +3962,9 @@ def _with_head_sha(
     publication: ControllerGitPublication | None = None,
 ) -> EvidenceValidation:
     result = (
-        publication.run("rev-parse", "HEAD")
+        publication.run("rev-parse", "--verify", "HEAD^{commit}")
         if publication is not None
-        else runner(["git", "-C", str(checkout), "rev-parse", "HEAD"])
+        else runner(["git", "-C", str(checkout), "rev-parse", "--verify", "HEAD^{commit}"])
     )
     head_sha = result.stdout.strip() if result.returncode == 0 else ""
     if not head_sha:
@@ -3045,6 +3994,38 @@ def _failed_validation(validation: EvidenceValidation, reason: str) -> EvidenceV
     return replace(
         validation,
         status="failed",
+        review_ready=False,
+        reasons=(*validation.reasons, reason),
+        evidence=evidence,
+    )
+
+
+def _publication_failed_validation(
+    validation: EvidenceValidation,
+    *,
+    step: str,
+    error: Exception,
+    issue_id: int,
+    attempt: int,
+) -> EvidenceValidation:
+    detail = str(error).strip() or error.__class__.__name__
+    reason = f"publication {step} failed: {detail}"
+    _log_event(
+        "worklink_publication_failed",
+        issue_id=issue_id,
+        attempt=attempt,
+        step=step,
+        error=detail,
+    )
+    evidence = replace(
+        validation.evidence,
+        status="blocked",
+        blocked_reason=reason,
+        head_sha=None,
+    )
+    return replace(
+        validation,
+        status="blocked",
         review_ready=False,
         reasons=(*validation.reasons, reason),
         evidence=evidence,
@@ -3126,3 +4107,10 @@ def _log_event(event_type: str, **payload: Any) -> None:
         log_event_sync(event_type, **payload)
     except RuntimeError:
         pass
+
+
+def _log_durable_event(event_type: str, **payload: Any) -> None:
+    """Persist a load-bearing Worklink state transition before continuing."""
+    from ..event_logger import log_durable_event_sync
+
+    log_durable_event_sync(event_type, **payload)

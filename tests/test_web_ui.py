@@ -13,6 +13,7 @@ from pathlib import Path
 import pytest
 from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
+from yarl import URL
 
 from mimir.config import Config
 from mimir.dashboard_extensions import (
@@ -34,7 +35,7 @@ from mimir.web_contracts import (
     validate_live_event,
     validate_list_meta,
 )
-from mimir.worklink.backends.feature_factory import parse_factory_status
+from mimir.worklink.backends.feature_factory import epic_run_id, parse_factory_status
 from mimir.worklink.factory_state import FactoryRunRecord, save_factory_record
 
 
@@ -142,6 +143,65 @@ async def test_admin_mcp_api_lists_updates_bound_policy_and_removes(tmp_path: Pa
         removed = await client.delete("/api/v1/admin/mcp/servers/server-1")
         assert removed.status == 200
         assert store.load()["tool-1"]["is_tombstoned"] is True
+
+
+@pytest.mark.asyncio
+async def test_admin_mcp_listing_redacts_all_config_values_and_round_trips(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from unittest.mock import AsyncMock
+
+    from mimir.mcp_client import MCPManager, MCPPolicyStore
+
+    store = MCPPolicyStore(tmp_path / "state" / "mcp-policy.json")
+    original = {
+        "server_config_id": "server-1",
+        "name": "private",
+        "command": "runner token=command-secret",
+        "args": ["--api-key=argument-secret", "--safe", "value"],
+        "env": {
+            "GITHUB_PAT": "opaque-pat",
+            "BEARER": "opaque-bearer",
+            "TOKEN_REF": "${MCP_TOKEN}",
+            "TOKEN_MIXED": "${MCP_TOKEN}:literal-secret",
+        },
+        "policy_version": "ui-v1",
+        "adapters": [{
+            "name": "mimir-ui-server-1", "version": "1",
+            "policy_version": "ui-v1", "direction": "neither",
+        }],
+    }
+    store.upsert_server(original)
+    monkeypatch.setattr(
+        MCPManager, "start_servers", AsyncMock(return_value=[]),
+    )
+    app = web.Application()
+    web_ui.register_routes(
+        app, turns_log=tmp_path / "turns", events_log=tmp_path / "events",
+        home=tmp_path,
+    )
+
+    async with TestClient(TestServer(app)) as client:
+        listed = await client.get("/api/v1/admin/mcp/servers")
+        projected = (await listed.json())["data"]["servers"][0]
+        updated = await client.put(
+            "/api/v1/admin/mcp/servers/server-1", json=projected,
+        )
+
+    assert listed.status == 200
+    assert projected["command"] == "runner token=[REDACTED]"
+    assert projected["args"] == ["--api-key=[REDACTED]", "--safe", "value"]
+    assert projected["env"] == {
+        "GITHUB_PAT": "[REDACTED]",
+        "BEARER": "[REDACTED]",
+        "TOKEN_REF": "${MCP_TOKEN}",
+        "TOKEN_MIXED": "${MCP_TOKEN}[REDACTED]",
+    }
+    assert updated.status == 200
+    persisted = store.load_server_records()["server-1"]
+    assert persisted["command"] == original["command"]
+    assert persisted["args"] == original["args"]
+    assert persisted["env"] == original["env"]
 
 
 @pytest.mark.asyncio
@@ -430,7 +490,7 @@ async def test_factory_runs_detail(tmp_path: Path, monkeypatch: pytest.MonkeyPat
         "gates": {"story": "approved", "brief": "approved"},
         "steps": ["spec-writer:accepted", "work-decomposer:completed"],
         "slices": ["s1:merged"],
-        "validator": {"verdict": "GO"},
+        "validator": "GO",
         "terminal_result": {
             "status": "completed",
             "summary": "Successfully completed",
@@ -456,27 +516,70 @@ async def test_factory_runs_detail(tmp_path: Path, monkeypatch: pytest.MonkeyPat
         assert run["run_id"] == "834"
         assert run["status"] == "completed"
         assert run["pr_url"] == "https://github.com/owner/repo/pull/42"
-        assert run["validator"]["verdict"] == "GO"
+        assert run["validator"] == "GO"
         assert len(run["steps"]) == 2
         assert len(run["slices"]) == 1
         assert run["terminal_result"]["status"] == "completed"
 
 
 @pytest.mark.asyncio
-async def test_factory_runs_detail_rejects_traversal_to_existing_run_json(
+async def test_factory_runs_detail_loads_record_with_minted_run_id(
+    tmp_path: Path,
+):
+    home = tmp_path / "home"
+    home.mkdir()
+    run_id = epic_run_id(1337)
+    sandbox = tmp_path / run_id
+    save_factory_record(home, FactoryRunRecord(
+        run_id=run_id, issue_id=1337, attempt=1, repository="owner/repo",
+        base_ref="main", branch="worklink/1337", launcher="/opt/factory/bin/factory.js",
+        sandbox=str(sandbox), session="session-1", handle=None, status=None,
+        observed_at="2026-08-28T10:00:00Z", controller_phase="running",
+    ))
+
+    app = web.Application()
+    web_ui.register_routes(
+        app,
+        turns_log=tmp_path / "turns",
+        events_log=tmp_path / "events",
+        home=home,
+    )
+
+    client = TestClient(TestServer(app))
+    async with client as cli:
+        resp = await cli.get(f"/api/v1/factory-runs/{run_id}")
+        assert resp.status == 200
+        data = await resp.json()
+        assert data["data"]["run_id"] == run_id
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("unsafe_path", "error_code"),
+    [
+        ("valid..child", "invalid_run_id"),
+        ("valid%2Fchild", "invalid_run_id"),
+        ("valid%5Cchild", "invalid_run_id"),
+        (".hidden", "invalid_run_id"),
+        ("%2Fetc%2Fpasswd", "invalid_run_id"),
+        ("", "missing_run_id"),
+    ],
+    ids=["dot-dot", "slash", "backslash", "leading-dot", "absolute", "empty"],
+)
+async def test_factory_runs_detail_rejects_unsafe_run_ids(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    unsafe_path: str,
+    error_code: str,
 ):
     monkeypatch.setenv("WORKLINK_REPO", str(tmp_path))
     home = tmp_path / "home"
     home.mkdir()
     monkeypatch.setenv("MIMIR_HOME", str(home))
-
-    outside_dir = tmp_path / ".opencode" / "outside"
-    outside_dir.mkdir(parents=True)
-    (outside_dir / "run.json").write_text(
-        json.dumps({"run_id": "outside", "status": "completed"}),
-        encoding="utf-8",
+    monkeypatch.setattr(
+        web_ui,
+        "load_factory_record",
+        lambda *_args: pytest.fail("unsafe run id reached load_factory_record"),
     )
 
     app = web.Application()
@@ -489,11 +592,11 @@ async def test_factory_runs_detail_rejects_traversal_to_existing_run_json(
 
     client = TestClient(TestServer(app))
     async with client as cli:
-        resp = await cli.get("/api/v1/factory-runs/%2E%2E%2Foutside")
+        resp = await cli.get(URL(f"/api/v1/factory-runs/{unsafe_path}", encoded=True))
         assert resp.status == 400
         data = await resp.json()
         assert data["ok"] is False
-        assert data["error"]["code"] == "invalid_run_id"
+        assert data["error"]["code"] == error_code
 
 
 @pytest.mark.asyncio
@@ -1006,6 +1109,86 @@ async def test_api_turns_handles_missing_file(app):
         resp = await client.get("/api/turns")
         body = await resp.json()
     assert body == {"turns": []}
+
+
+@pytest.mark.asyncio
+async def test_log_read_failure_is_degraded_and_emits_once_per_path(
+    app,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from mimir import _jsonl_tail
+
+    a, turns_log, events_log = app
+    turns_log.write_text("", encoding="utf-8")
+    events_log.write_text("", encoding="utf-8")
+    emitted: list[tuple[str, dict[str, str]]] = []
+
+    def unreadable(_path: Path):
+        raise PermissionError("permission denied")
+
+    async def record_event(event_type: str, **payload: str) -> None:
+        emitted.append((event_type, payload))
+
+    monkeypatch.setattr(_jsonl_tail, "_tail_lines", unreadable)
+    monkeypatch.setattr(web_ui, "safe_log_event", record_event)
+
+    async with TestClient(TestServer(a)) as client:
+        legacy_turns = await client.get("/api/turns?limit=2")
+        repeated_turns = await client.get("/api/v1/turns?limit=2")
+        legacy_events = await client.get("/api/events")
+        repeated_events = await client.get("/api/v1/events")
+        live_events = await client.get("/api/v1/live-events?once=1")
+
+        assert await legacy_turns.json() == {"turns": [], "degraded": True}
+        assert (await repeated_turns.json())["data"] == {
+            "turns": [],
+            "degraded": True,
+        }
+        assert await legacy_events.json() == {"events": [], "degraded": True}
+        assert (await repeated_events.json())["data"] == {
+            "events": [],
+            "degraded": True,
+        }
+        assert 'event: state-degraded\ndata: {"degraded": true}' in await live_events.text()
+
+    assert [event_type for event_type, _payload in emitted] == [
+        "state_read_failed",
+        "state_read_failed",
+    ]
+    assert {payload["path"] for _event_type, payload in emitted} == {
+        str(turns_log),
+        str(events_log),
+    }
+    assert all("PermissionError: permission denied" in payload["error"] for _, payload in emitted)
+
+
+@pytest.mark.asyncio
+async def test_empty_logs_are_healthy_empty_without_event(
+    app,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    a, turns_log, events_log = app
+    turns_log.write_text("", encoding="utf-8")
+    events_log.write_text("", encoding="utf-8")
+    emitted: list[str] = []
+
+    async def record_event(event_type: str, **_payload: str) -> None:
+        emitted.append(event_type)
+
+    monkeypatch.setattr(web_ui, "safe_log_event", record_event)
+
+    async with TestClient(TestServer(a)) as client:
+        turns = await client.get("/api/turns?limit=2")
+        events = await client.get("/api/events")
+        live_events = await client.get("/api/v1/live-events?once=1")
+
+        assert turns.status == 200
+        assert await turns.json() == {"turns": []}
+        assert events.status == 200
+        assert await events.json() == {"events": []}
+        assert "degraded" not in await live_events.text()
+
+    assert emitted == []
 
 
 @pytest.mark.asyncio
@@ -1617,6 +1800,30 @@ async def test_react_app_serves_built_index_and_assets(tmp_path: Path):
 
 
 @pytest.mark.asyncio
+async def test_react_app_dist_can_use_live_deployment_build(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    live_dist = tmp_path / "checkout" / "react_app" / "dist"
+    live_dist.mkdir(parents=True)
+    (live_dist / "index.html").write_text("live-checkout-build", encoding="utf-8")
+    monkeypatch.setenv("MIMIR_REACT_APP_DIST", str(live_dist))
+
+    app = web.Application()
+    web_ui.register_routes(
+        app,
+        turns_log=tmp_path / "t.jsonl",
+        events_log=tmp_path / "e.jsonl",
+    )
+
+    async with TestClient(TestServer(app)) as client:
+        response = await client.get("/app")
+        body = await response.text()
+
+    assert response.status == 200
+    assert body == "live-checkout-build"
+
+
+@pytest.mark.asyncio
 async def test_web_bootstrap_is_no_store_and_secret_free(tmp_path: Path):
     class _Config:
         web_host = "0.0.0.0"
@@ -1639,10 +1846,8 @@ async def test_web_bootstrap_is_no_store_and_secret_free(tmp_path: Path):
     assert resp.status == 200
     assert resp.headers["Cache-Control"].startswith("no-store")
     assert "super-secret" not in body_text
-    assert body["auth"]["required"] is True
-    assert body["server"]["public_bind"] is True
-    assert body["stream_auth"]["shape"] == "fetch-event-stream"
-    assert body["stream_auth"]["native_eventsource_supported_when_auth_required"] is False
+    assert set(body) == {"version", "auth"}
+    assert body["auth"] == {"required": True}
 
 
 @pytest.mark.asyncio
@@ -1652,7 +1857,9 @@ async def test_web_bootstrap_reports_resolved_empty_host_as_loopback(
     monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
     monkeypatch.setenv("MIMIR_WEB_HOST", "")
     config = Config.from_env()
-    a = web.Application()
+    from mimir.server import _make_auth_middleware
+
+    a = web.Application(middlewares=[_make_auth_middleware("super-secret")])
     a["api_key"] = "super-secret"
     a["config"] = config
     web_ui.register_routes(
@@ -1663,7 +1870,9 @@ async def test_web_bootstrap_reports_resolved_empty_host_as_loopback(
     )
 
     async with TestClient(TestServer(a)) as client:
-        resp = await client.get("/api/web/bootstrap")
+        resp = await client.get(
+            "/api/web/bootstrap", headers={"X-API-Key": "super-secret"},
+        )
         body = await resp.json()
 
     assert body["server"] == {
@@ -1675,11 +1884,13 @@ async def test_web_bootstrap_reports_resolved_empty_host_as_loopback(
 
 @pytest.mark.asyncio
 async def test_api_v1_web_bootstrap_is_enveloped_no_store_and_secret_free(tmp_path: Path):
+    from mimir.server import _make_auth_middleware
+
     class _Config:
         web_host = "0.0.0.0"
         model_spec = "codex_plus:gpt-5.5"
 
-    a = web.Application()
+    a = web.Application(middlewares=[_make_auth_middleware("super-secret")])
     a["api_key"] = "super-secret"
     a["config"] = _Config()
     web_ui.register_routes(
@@ -1690,7 +1901,9 @@ async def test_api_v1_web_bootstrap_is_enveloped_no_store_and_secret_free(tmp_pa
     )
 
     async with TestClient(TestServer(a)) as client:
-        resp = await client.get("/api/v1/web/bootstrap")
+        resp = await client.get(
+            "/api/v1/web/bootstrap", headers={"X-API-Key": "super-secret"},
+        )
         body_text = await resp.text()
         body = json.loads(body_text)
 
@@ -2358,11 +2571,20 @@ async def test_api_v1_wiki_filesystem_reads_are_off_thread(
 
 
 @pytest.mark.asyncio
-async def test_api_v1_web_bootstrap_auth_exempt_with_middleware(tmp_path: Path):
+async def test_both_web_bootstraps_limit_unauthenticated_operator_data(
+    tmp_path: Path,
+):
     from mimir.server import _make_auth_middleware
 
     class _Config:
         web_host = "0.0.0.0"
+        model_spec = "provider:private-model"
+
+    state = tmp_path / "state"
+    state.mkdir()
+    (state / "web_ui.json").write_text(json.dumps({
+        "agent_name": "Private Agent Name", "skin": "neon-terminal",
+    }))
 
     a = web.Application(middlewares=[_make_auth_middleware("super-secret")])
     a["api_key"] = "super-secret"
@@ -2371,16 +2593,30 @@ async def test_api_v1_web_bootstrap_auth_exempt_with_middleware(tmp_path: Path):
         a,
         turns_log=tmp_path / "t.jsonl",
         events_log=tmp_path / "e.jsonl",
+        home=tmp_path,
         react_app_dist=tmp_path / "missing-dist",
     )
 
     async with TestClient(TestServer(a)) as client:
-        resp = await client.get("/api/v1/web/bootstrap")
-        body = await resp.json()
+        public_v0 = await (await client.get("/api/web/bootstrap")).json()
+        public_v1 = await (await client.get("/api/v1/web/bootstrap")).json()
+        full_v0 = await (await client.get(
+            "/api/web/bootstrap", headers={"X-API-Key": "super-secret"},
+        )).json()
+        full_v1 = await (await client.get(
+            "/api/v1/web/bootstrap", headers={"X-API-Key": "super-secret"},
+        )).json()
 
-    assert resp.status == 200
-    validate_api_envelope(body, expect_ok=True)
-    assert body["data"]["auth"]["required"] is True
+    assert set(public_v0) == {"version", "auth"}
+    assert public_v0["auth"] == {"required": True}
+    validate_api_envelope(public_v1, expect_ok=True)
+    assert set(public_v1["data"]) == {"version", "auth"}
+    assert public_v1["data"]["auth"] == {"required": True}
+    assert "Private Agent Name" not in json.dumps(public_v0)
+    assert "Private Agent Name" not in json.dumps(public_v1)
+    assert full_v0["server"]["public_bind"] is True
+    assert full_v1["data"]["ui"]["agent_name"] == "Private Agent Name"
+    assert full_v1["data"]["model"] == "private-model"
 
 
 @pytest.mark.asyncio

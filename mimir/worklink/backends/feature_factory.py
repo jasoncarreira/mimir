@@ -13,11 +13,13 @@ import tempfile
 import threading
 from typing import Any, Callable, ClassVar, Mapping, Sequence
 
+from ...opencode_config import OpenCodeConfigError
 from ..compute import ComputeResult, WorkSpec
 from .base import Caps, CheckoutShape, RawResult, WorkOrder
+from .opencode import resolve_worklink_opencode_invocation
 
 
-FACTORY_VERSION = "0.7.2"
+FACTORY_VERSION = "0.8.0"
 DEFAULT_FACTORY_ENTRYPOINT = "/opt/mimir-opencode/lib/node_modules/feature-factory/bin/factory.js"
 FACTORY_COMMANDS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("init", ("init",)),
@@ -47,7 +49,9 @@ _DEFAULT_FACTORY_MAX_RETRIES = 5
 _MAX_FACTORY_MAX_RETRIES = 9_007_199_254_740_991
 _FACTORY_MAX_RETRIES_ENV = "MIMIR_FACTORY_MAX_RETRIES"
 _ASCII_DECIMAL = re.compile(r"[0-9]+")
+_RUN_ID = re.compile(r"[a-z0-9](?:[a-z0-9._-]*[a-z0-9])?")
 _UNKNOWN_STRUCTURE = re.compile(r"(?im)\b(?:unknown|unrecognized)\b[^\n]*\bcommand\b")
+_VALIDATOR_VERDICTS = frozenset({"GO", "GO-WITH-NITS", "NO-GO"})
 
 Runner = Callable[..., subprocess.CompletedProcess[Any]]
 
@@ -75,23 +79,23 @@ class FactoryContractError(RuntimeError):
 @dataclass(frozen=True)
 class FactoryStatus:
     run_id: str
-    issue_key: str | None
     valid: bool
     sandbox_path: str
-    status: str
-    mode: str
-    branch: str
-    pr_base: str | None
-    pr_draft: bool
-    lock: str
-    dead_lock: bool
-    lock_session: str | None
-    gates: dict[str, Any]
-    steps: tuple[str, ...]
-    slices: tuple[str, ...]
-    validator: dict[str, Any] | None
-    pr_url: str | None
-    terminal_result: dict[str, Any] | None
+    issue_key: str | None = None
+    status: str | None = None
+    mode: str | None = None
+    branch: str | None = None
+    pr_base: str | None = None
+    pr_draft: bool | None = None
+    lock: str | None = None
+    dead_lock: bool | None = None
+    lock_session: str | None = None
+    gates: dict[str, Any] | None = None
+    steps: tuple[str, ...] | None = None
+    slices: tuple[str, ...] | None = None
+    validator: str | None = None
+    pr_url: str | None = None
+    terminal_result: dict[str, Any] | None = None
     next: str | None = None
     next_present: bool = False
 
@@ -127,8 +131,8 @@ class FactoryStatus:
             "dead_lock": self.dead_lock,
             "lock_session": self.lock_session,
             "gates": self.gates,
-            "steps": list(self.steps),
-            "slices": list(self.slices),
+            "steps": list(self.steps) if self.steps is not None else None,
+            "slices": list(self.slices) if self.slices is not None else None,
             "validator": self.validator,
             "pr_url": self.pr_url,
             "terminal_result": self.terminal_result,
@@ -141,23 +145,8 @@ class FactoryStatus:
 _REQUIRED_STATUS_FIELDS = frozenset(
     {
         "run_id",
-        "issue_key",
         "valid",
         "sandbox_path",
-        "status",
-        "mode",
-        "branch",
-        "pr_base",
-        "pr_draft",
-        "lock",
-        "dead_lock",
-        "lock_session",
-        "gates",
-        "steps",
-        "slices",
-        "validator",
-        "pr_url",
-        "terminal_result",
     }
 )
 
@@ -173,7 +162,9 @@ def _bounded_text(value: object, name: str, *, nullable: bool = False) -> str | 
     return text
 
 
-def _bool(value: object, name: str) -> bool:
+def _bool(value: object, name: str, *, nullable: bool = False) -> bool | None:
+    if value is None and nullable:
+        return None
     if not isinstance(value, bool):
         raise FactoryContractError(f"factory status {name} must be a boolean")
     return value
@@ -199,7 +190,21 @@ def _opaque_dict(value: object, name: str, *, nullable: bool = False) -> dict[st
     return dict(value)
 
 
-def _compact_strings(value: object, name: str) -> tuple[str, ...]:
+def _validator_verdict(value: object) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise FactoryContractError("factory status validator must be a documented verdict")
+    if value not in _VALIDATOR_VERDICTS:
+        raise FactoryContractError("factory status validator has an unknown verdict")
+    return value
+
+
+def _compact_strings(
+    value: object, name: str, *, nullable: bool = False
+) -> tuple[str, ...] | None:
+    if value is None and nullable:
+        return None
     if not isinstance(value, list) or len(value) > _MAX_LIST_ITEMS:
         raise FactoryContractError(f"factory status {name} must be a bounded string list")
     result: list[str] = []
@@ -266,31 +271,31 @@ def parse_factory_status(payload: bytes | str | Mapping[str, Any]) -> FactorySta
     missing = _REQUIRED_STATUS_FIELDS - keys
     if missing:
         raise FactoryContractError(f"factory status missing field: {sorted(missing)[0]}")
-    lock = _bounded_text(decoded["lock"], "lock")
-    if lock not in {"fresh", "stale", "absent"}:
+    lock = _bounded_text(decoded.get("lock"), "lock", nullable=True)
+    if lock is not None and lock not in {"fresh", "stale", "absent"}:
         raise FactoryContractError("factory status lock must be fresh, stale, or absent")
     next_present = "next" in decoded
     next_value = _bounded_text(decoded.get("next"), "next", nullable=True) if next_present else None
     return FactoryStatus(
         run_id=_bounded_text(decoded["run_id"], "run_id") or "",
-        issue_key=_bounded_text(decoded["issue_key"], "issue_key", nullable=True),
         valid=_bool(decoded["valid"], "valid"),
         sandbox_path=_bounded_text(decoded["sandbox_path"], "sandbox_path") or "",
-        status=_bounded_text(decoded["status"], "status") or "",
-        mode=_bounded_text(decoded["mode"], "mode") or "",
-        branch=_bounded_text(decoded["branch"], "branch") or "",
-        pr_base=_bounded_text(decoded["pr_base"], "pr_base", nullable=True),
-        pr_draft=_bool(decoded["pr_draft"], "pr_draft"),
+        issue_key=_bounded_text(decoded.get("issue_key"), "issue_key", nullable=True),
+        status=_bounded_text(decoded.get("status"), "status", nullable=True),
+        mode=_bounded_text(decoded.get("mode"), "mode", nullable=True),
+        branch=_bounded_text(decoded.get("branch"), "branch", nullable=True),
+        pr_base=_bounded_text(decoded.get("pr_base"), "pr_base", nullable=True),
+        pr_draft=_bool(decoded.get("pr_draft"), "pr_draft", nullable=True),
         lock=lock,
-        dead_lock=_bool(decoded["dead_lock"], "dead_lock"),
-        lock_session=_bounded_text(decoded["lock_session"], "lock_session", nullable=True),
-        gates=_opaque_dict(decoded["gates"], "gates") or {},
-        steps=_compact_strings(decoded["steps"], "steps"),
-        slices=_compact_strings(decoded["slices"], "slices"),
-        validator=_opaque_dict(decoded["validator"], "validator", nullable=True),
-        pr_url=_bounded_text(decoded["pr_url"], "pr_url", nullable=True),
+        dead_lock=_bool(decoded.get("dead_lock"), "dead_lock", nullable=True),
+        lock_session=_bounded_text(decoded.get("lock_session"), "lock_session", nullable=True),
+        gates=_opaque_dict(decoded.get("gates"), "gates", nullable=True),
+        steps=_compact_strings(decoded.get("steps"), "steps", nullable=True),
+        slices=_compact_strings(decoded.get("slices"), "slices", nullable=True),
+        validator=_validator_verdict(decoded.get("validator")),
+        pr_url=_bounded_text(decoded.get("pr_url"), "pr_url", nullable=True),
         terminal_result=_opaque_dict(
-            decoded["terminal_result"], "terminal_result", nullable=True
+            decoded.get("terminal_result"), "terminal_result", nullable=True
         ),
         next=next_value,
         next_present=next_present,
@@ -385,7 +390,7 @@ def _terminate_bounded_process(process: subprocess.Popen[bytes]) -> None:
 def _run_bounded(
     args: Sequence[str],
     *,
-    cwd: Path,
+    cwd: Path | None,
     env: Mapping[str, str],
     timeout: float,
     output_limit: int,
@@ -457,7 +462,7 @@ def _invoke_bounded_or_injected(
     runner: Runner,
     args: Sequence[str],
     *,
-    cwd: Path,
+    cwd: Path | None = None,
     env: Mapping[str, str],
     timeout: float,
     output_limit: int,
@@ -470,17 +475,21 @@ def _invoke_bounded_or_injected(
             timeout=timeout,
             output_limit=output_limit,
         )
+    kwargs: dict[str, Any] = {
+        "env": dict(env),
+        "stdin": subprocess.DEVNULL,
+        "stdout": subprocess.PIPE,
+        "stderr": subprocess.PIPE,
+        "timeout": timeout,
+        "check": False,
+        "shell": False,
+        "start_new_session": True,
+    }
+    if cwd is not None:
+        kwargs["cwd"] = cwd
     return runner(
         list(args),
-        cwd=cwd,
-        env=dict(env),
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        timeout=timeout,
-        check=False,
-        shell=False,
-        start_new_session=True,
+        **kwargs,
     )
 
 
@@ -575,7 +584,23 @@ class FeatureFactoryBackend:
         branch: str,
         test_command: str,
     ) -> WorkSpec:
-        command = self.opencode_argv(order.checkout, order.issue_id)
+        try:
+            resolution = resolve_worklink_opencode_invocation(order.env)
+        except OpenCodeConfigError as exc:
+            raise FactoryContractError(
+                f"feature_factory_opencode_resolution_failed:{exc.reason_code}"
+            ) from exc
+        invocation = resolution.invocation
+        run_id = epic_run_id(order.issue_id)
+        work_item_json = order.env.get("MIMIR_WORK_ITEM_JSON")
+        if work_item_json is not None:
+            try:
+                work_item = json.loads(work_item_json)
+            except json.JSONDecodeError as exc:
+                raise FactoryContractError("factory work item JSON is malformed") from exc
+            if not isinstance(work_item, dict) or work_item.get("run_id") != run_id:
+                raise FactoryContractError("factory work item run_id does not match the launch run_id")
+        command = self.opencode_argv(order.checkout, run_id, invocation.model)
         return WorkSpec(
             issue_id=order.issue_id,
             attempt=attempt,
@@ -588,15 +613,27 @@ class FeatureFactoryBackend:
             backend=self.name,
             timeout_s=order.timeout_s,
             env=order.env,
-            backend_config={"entrypoint": str(self.entrypoint)},
+            backend_config={
+                "entrypoint": str(self.entrypoint),
+                "run_id": run_id,
+                "model": invocation.model,
+                "configured_model": resolution.configured_model,
+                "model_diverged": resolution.model_diverged,
+                "model_source": invocation.model_source,
+            },
             local_checkout=order.checkout,
             local_argv=command,
+            output_root=order.transcript_root,
         )
 
     @staticmethod
-    def opencode_argv(operator_checkout: Path, issue_number: int) -> tuple[str, ...]:
+    def opencode_argv(
+        operator_checkout: Path, run_id: str, model: str
+    ) -> tuple[str, ...]:
+        if _RUN_ID.fullmatch(run_id) is None:
+            raise FactoryContractError("factory launch run_id has an invalid shape")
         retries = _factory_max_retries()
-        # feature-factory 0.7.2 stages the workflow inside the run directory, so
+        # feature-factory 0.7.5 stages the workflow inside the run directory, so
         # OpenCode --auto must not bypass it.
         return (
             "opencode",
@@ -604,11 +641,13 @@ class FeatureFactoryBackend:
             "--log-level",
             "DEBUG",
             "--print-logs",
+            "-m",
+            model,
             "--dir",
             str(operator_checkout),
             "--command",
             "feature",
-            f" --autonomous --max-retries {retries} {issue_number}",
+            f" --autonomous --max-retries {retries} {run_id}",
         )
 
     def _control(
@@ -623,7 +662,6 @@ class FeatureFactoryBackend:
             result = _invoke_bounded_or_injected(
                 self.runner,
                 ["node", str(entrypoint), *args],
-                cwd=sandbox,
                 env=_control_environment(),
                 timeout=30,
                 output_limit=_MAX_STATUS_BYTES,
@@ -703,6 +741,12 @@ class FeatureFactoryBackend:
         return RawResult(0, None, "interrupted", None)
 
 
+# feature-factory 0.8.0's own variable, read by the factory CHILD. Distinct from
+# mimir's operator-facing ``MIMIR_FACTORY_PUBLISHING_IDENTITY``, which selects the
+# identity on the controller side; the resolved value is forwarded under this name.
+FACTORY_PUBLISHING_IDENTITY_ENV = "FACTORY_PUBLISHING_IDENTITY"
+
+
 def _control_environment() -> dict[str, str]:
     allowed = {
         "PATH",
@@ -719,6 +763,20 @@ def _control_environment() -> dict[str, str]:
         "NODE_EXTRA_CA_CERTS",
         "SSL_CERT_FILE",
         "SSL_CERT_DIR",
+        # feature-factory 0.8.0 reads the declared publishing identity from this
+        # inherited variable and compares it against ``gh api /user``. The mimir
+        # repository is published from two accounts -- ``jasoncarreira`` from a
+        # maintainer's checkout and ``mimir-carreira`` from mimirbot -- so the
+        # deployment must select the identity.
+        #
+        # It MUST be allow-listed here or the deployment can export it and the driver
+        # never sees it. The symptom of the omission is a Gate 1 park that reads as a
+        # deployment misconfiguration rather than a stripped variable.
+        #
+        # The value must never be derived from ``gh``, the token, or any command
+        # result: an expectation read from the credential being checked always
+        # matches, and the guard stops guarding.
+        FACTORY_PUBLISHING_IDENTITY_ENV,
     }
     return {
         key: value
@@ -730,4 +788,7 @@ def _control_environment() -> dict[str, str]:
 def epic_run_id(issue_id: int) -> str:
     if isinstance(issue_id, bool) or issue_id <= 0:
         raise ValueError("factory issue id must be positive")
-    return str(issue_id)
+    run_id = f"chainlink-{issue_id}"
+    if _RUN_ID.fullmatch(run_id) is None:
+        raise ValueError("factory issue id does not produce a valid run id")
+    return run_id

@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+from mimir.worklink import checkout as checkout_module
 from mimir.worklink.backends.base import WorkOrder
 from mimir.worklink.backends.opencode import OpenCodeBackend
 
@@ -32,7 +33,8 @@ def test_enabled_opencode_spec_contains_worker_local_selected_projections(
     monkeypatch, tmp_path: Path
 ) -> None:
     _write_native_files(tmp_path)
-    monkeypatch.setenv("MIMIR_CODING_ENABLED", "true")
+    # ``y`` used to be accepted by Config but rejected by Worklink's copy.
+    monkeypatch.setenv("MIMIR_CODING_ENABLED", "y")
     monkeypatch.setenv("HOME", str(tmp_path))
     # Redirecting HOME alone does not seal config resolution: opencode_config
     # prefers XDG_CONFIG_HOME and only falls back to HOME/.config. Left set,
@@ -44,9 +46,12 @@ def test_enabled_opencode_spec_contains_worker_local_selected_projections(
     monkeypatch.delenv("OPENCODE_CONFIG", raising=False)
     monkeypatch.delenv("MIMIR_MODEL_SPEC", raising=False)
     monkeypatch.setenv("PROXY_TOKEN", "referenced")
+    enabled_root = tmp_path / "enabled"
+    monkeypatch.setattr(checkout_module, "_ENABLED_CHECKOUT_ROOT", enabled_root)
+    checkout = checkout_module._isolated_checkout_path(tmp_path / "repo", ".worklink", 1410, 1)
     order = WorkOrder(
         issue_id=1410,
-        checkout=tmp_path / "checkout",
+        checkout=checkout,
         prompt="build",
         rules=None,
         timeout_s=30,
@@ -63,6 +68,7 @@ def test_enabled_opencode_spec_contains_worker_local_selected_projections(
     )
 
     projections = spec.backend_config["worker_projections"]
+    assert spec.local_checkout.is_relative_to(enabled_root)
     assert [projection.path for projection in projections] == [
         ".config/opencode/opencode.json",
         ".local/share/opencode/auth.json",
@@ -95,9 +101,10 @@ def test_disabled_opencode_spec_preserves_direct_environment(
     monkeypatch.delenv("XDG_DATA_HOME", raising=False)
     monkeypatch.delenv("OPENCODE_CONFIG", raising=False)
     monkeypatch.delenv("MIMIR_MODEL_SPEC", raising=False)
+    checkout = checkout_module._isolated_checkout_path(tmp_path / "repo", ".worklink", 1410, 1)
     order = WorkOrder(
         issue_id=1410,
-        checkout=tmp_path / "checkout",
+        checkout=checkout,
         prompt="build",
         rules=None,
         timeout_s=30,
@@ -114,6 +121,7 @@ def test_disabled_opencode_spec_preserves_direct_environment(
     )
 
     assert "worker_projections" not in spec.backend_config
+    assert spec.local_checkout == tmp_path / ".worklink" / "repo" / "1410-1"
     assert spec.env["PROXY_TOKEN"] == "direct"
     assert spec.env["MIMIR_HOME"] == str(tmp_path)
     assert spec.local_argv is not None
