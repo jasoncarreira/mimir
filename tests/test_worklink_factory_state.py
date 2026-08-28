@@ -290,7 +290,7 @@ def test_factory_record_binds_status_run_id_to_durable_identity(tmp_path: Path) 
         status=replace(
             status,
             pr_base=None,
-            validator={"status": "approved"},
+            validator="GO",
             terminal_result={"reason": "opaque"},
         ),
     )
