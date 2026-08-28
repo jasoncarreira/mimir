@@ -2637,6 +2637,7 @@ def test_chainlink_orchestrator_passes_controller_environment_overrides() -> Non
 
     pass_env = manifest["pollers"][0]["pass_env"]
     assert "MIMIR_FACTORY_PUBLISHING_IDENTITY" in pass_env
+    assert "FACTORY_PUBLISHING_IDENTITY" in pass_env
     # The flag selects the worker uid without selecting the declined contained
     # checkout barrier (#1434). This protects the source repo, not credentials
     # (virtiofs ownership remains tracked in #1435) or sibling runs.

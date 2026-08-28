@@ -37,6 +37,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal
 
+from .worklink.backends.feature_factory import FACTORY_VERSION
 from .worklink.tool_pins import OPENCODE_VERSION
 
 
@@ -483,8 +484,8 @@ def _opencode_install_block(install_opencode: bool) -> str:
         return "# (OpenCode runtime not installed — MIMIR_ENABLE_OPENCODE not set)"
     return (
         "# OpenCode runtime — opt-in via MIMIR_ENABLE_OPENCODE=1.\n"
-        f"# Pins: opencode-ai@{OPENCODE_VERSION}, feature-factory@0.7.5,\n"
-        "# opencode-feature-factory@0.7.5,\n"
+        f"# Pins: opencode-ai@{OPENCODE_VERSION}, feature-factory@{FACTORY_VERSION},\n"
+        f"# opencode-feature-factory@{FACTORY_VERSION},\n"
         "# opencode-project-memory@0.1.0, opencode-openai-codex-auth@4.4.0,\n"
         "# opencode-anthropic-auth@0.0.13.\n"
         "ENV MIMIR_FACTORY_ENTRYPOINT=/opt/mimir-opencode/lib/node_modules/feature-factory/bin/factory.js\n"
@@ -493,8 +494,8 @@ def _opencode_install_block(install_opencode: bool) -> str:
         "RUN if [ \"$MIMIR_ENABLE_OPENCODE\" = \"1\" ]; then \\\n"
         "        npm install --global --prefix /opt/mimir-opencode \\\n"
         f"            opencode-ai@{OPENCODE_VERSION} \\\n"
-        "            feature-factory@0.7.5 \\\n"
-        "            opencode-feature-factory@0.7.5 \\\n"
+        f"            feature-factory@{FACTORY_VERSION} \\\n"
+        f"            opencode-feature-factory@{FACTORY_VERSION} \\\n"
         "            opencode-project-memory@0.1.0 \\\n"
         "            opencode-openai-codex-auth@4.4.0 \\\n"
         "            opencode-anthropic-auth@0.0.13 ; \\\n"

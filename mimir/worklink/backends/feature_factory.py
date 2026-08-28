@@ -19,7 +19,7 @@ from .base import Caps, CheckoutShape, RawResult, WorkOrder
 from .opencode import resolve_worklink_opencode_invocation
 
 
-FACTORY_VERSION = "0.7.5"
+FACTORY_VERSION = "0.8.0"
 DEFAULT_FACTORY_ENTRYPOINT = "/opt/mimir-opencode/lib/node_modules/feature-factory/bin/factory.js"
 FACTORY_COMMANDS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("init", ("init",)),
@@ -730,7 +730,7 @@ class FeatureFactoryBackend:
         return RawResult(0, None, "interrupted", None)
 
 
-# feature-factory 0.7.5's own variable, read by the factory CHILD. Distinct from
+# feature-factory 0.8.0's own variable, read by the factory CHILD. Distinct from
 # mimir's operator-facing ``MIMIR_FACTORY_PUBLISHING_IDENTITY``, which selects the
 # identity on the controller side; the resolved value is forwarded under this name.
 FACTORY_PUBLISHING_IDENTITY_ENV = "FACTORY_PUBLISHING_IDENTITY"
@@ -752,22 +752,19 @@ def _control_environment() -> dict[str, str]:
         "NODE_EXTRA_CA_CERTS",
         "SSL_CERT_FILE",
         "SSL_CERT_DIR",
-        # feature-factory 0.7.5: a NONEMPTY inherited value replaces
-        # ``.factory.json``'s ``publishing_identity`` as the declared identity the
-        # driver compares against ``gh api /user``. The mimir repository is published
-        # from two accounts -- ``jasoncarreira`` from a maintainer's checkout,
-        # ``mimir-carreira`` from mimirbot -- while the tracked file holds one value,
-        # so whichever is committed the other environment parks at Gate 1.
+        # feature-factory 0.8.0 reads the declared publishing identity from this
+        # inherited variable and compares it against ``gh api /user``. The mimir
+        # repository is published from two accounts -- ``jasoncarreira`` from a
+        # maintainer's checkout and ``mimir-carreira`` from mimirbot -- so the
+        # deployment must select the identity.
         #
         # It MUST be allow-listed here or the deployment can export it and the driver
-        # never sees it. The symptom of the omission is a Gate 1 park naming the FILE's
-        # identity, which reads as a misconfiguration rather than a stripped variable.
+        # never sees it. The symptom of the omission is a Gate 1 park that reads as a
+        # deployment misconfiguration rather than a stripped variable.
         #
-        # An absent or zero-length value leaves the file's value in force -- it never
-        # means "no declaration", so exporting it empty falls back rather than
-        # disabling the guard. The value must never be derived from ``gh``, the token,
-        # or any command result: an expectation read from the credential being checked
-        # always matches, and the guard stops guarding.
+        # The value must never be derived from ``gh``, the token, or any command
+        # result: an expectation read from the credential being checked always
+        # matches, and the guard stops guarding.
         FACTORY_PUBLISHING_IDENTITY_ENV,
     }
     return {

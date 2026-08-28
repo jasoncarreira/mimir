@@ -116,8 +116,7 @@ def test_declaration_is_valid_json_with_exactly_the_expected_keys() -> None:
     # this repository opted in to feature-factory #248, so a sandbox installs its dependencies
     # before any gate instead of discovering they are absent.
     assert set(data) == {
-        "resolve", "verify", "verify_timeout_ms", "publish", "publishing_identity",
-        "bootstrap", "pr_draft",
+        "resolve", "verify", "verify_timeout_ms", "publish", "bootstrap", "pr_draft",
     }
     # `verify_timeout_ms` is declared because the factory default of 900000 (15 min) is
     # shorter than this suite. A canonical run reached ~79% of 8937 tests before the
@@ -135,17 +134,6 @@ def test_declaration_is_valid_json_with_exactly_the_expected_keys() -> None:
     # contradiction the next reader has to resolve, and whoever wires `publish` up would inherit it.
     assert "--draft" not in data["publish"]
     assert data["publish"].startswith("gh pr create ")
-    # The value, not merely the key. This repository publishes from two environments and the
-    # tracked file can hold one value, so it holds the one for the environment that cannot
-    # react: mimirbot builds unattended and spends one of ten attempts on every park, while a
-    # maintainer running the factory by hand sees the park immediately. feature-factory 0.7.5
-    # documents an inherited FACTORY_PUBLISHING_IDENTITY override for the other environment,
-    # but the name appears in no .js file in that package -- only README.md and WORKFLOW.md --
-    # so honoring it is driver behavior, and chainlink #1337 attempt 8 parked at Gate 1 with
-    # `declared "jasoncarreira", observed "mimir-carreira"` after probing no environment at all.
-    # Reverting this value is therefore invisible until a build parks. Change it here and in
-    # `.factory.json` together, deliberately.
-    assert data["publishing_identity"] == "mimir-carreira"
     # The declaration must not carry a credential; it may only reference the
     # environment the factory already inherits.
     blob = DECLARATION.read_text()

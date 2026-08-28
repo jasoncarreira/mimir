@@ -68,6 +68,7 @@ ENV NODE_VERSION=22
 ENV MIMIR_FACTORY_ENTRYPOINT=/opt/mimir-opencode/lib/node_modules/feature-factory/bin/factory.js
 ENV PATH="/opt/mimir-opencode/bin:${PATH}"
 ARG MIMIR_ENABLE_OPENCODE=0
+ARG FACTORY_VERSION=0.8.0
 RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates curl gnupg git jq procps ripgrep xz-utils \
         poppler-utils tesseract-ocr tesseract-ocr-eng \
@@ -76,8 +77,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && if [ "$MIMIR_ENABLE_OPENCODE" = "1" ]; then \
         npm install --global --prefix /opt/mimir-opencode \
             opencode-ai@1.18.21 \
-            feature-factory@0.7.5 \
-            opencode-feature-factory@0.7.5 \
+            feature-factory@${FACTORY_VERSION} \
+            opencode-feature-factory@${FACTORY_VERSION} \
             opencode-project-memory@0.1.0 \
             opencode-openai-codex-auth@4.4.0 \
             opencode-anthropic-auth@0.0.13 ; \
