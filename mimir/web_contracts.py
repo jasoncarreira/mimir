@@ -1116,7 +1116,7 @@ export interface FactoryRunDetail extends FactoryRunSummary {
   gates: Record<string, unknown>;
   steps: string[];
   slices: string[];
-  validator: Record<string, unknown> | null;
+  validator: string | null;
   terminal_result: Record<string, unknown> | null;
 }
 

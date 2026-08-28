@@ -489,7 +489,7 @@ async def test_factory_runs_detail(tmp_path: Path, monkeypatch: pytest.MonkeyPat
         "gates": {"story": "approved", "brief": "approved"},
         "steps": ["spec-writer:accepted", "work-decomposer:completed"],
         "slices": ["s1:merged"],
-        "validator": {"verdict": "GO"},
+        "validator": "GO",
         "terminal_result": {
             "status": "completed",
             "summary": "Successfully completed",
@@ -515,7 +515,7 @@ async def test_factory_runs_detail(tmp_path: Path, monkeypatch: pytest.MonkeyPat
         assert run["run_id"] == "834"
         assert run["status"] == "completed"
         assert run["pr_url"] == "https://github.com/owner/repo/pull/42"
-        assert run["validator"]["verdict"] == "GO"
+        assert run["validator"] == "GO"
         assert len(run["steps"]) == 2
         assert len(run["slices"]) == 1
         assert run["terminal_result"]["status"] == "completed"
