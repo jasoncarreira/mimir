@@ -74,7 +74,9 @@ from ..access_control import (
     resolve_repository_review_state,
     ServicePrincipal,
     ServiceShellBindingRule,
+    _OPERATOR_SHELL_BINDING_ISSUER,
     _issue_operator_shell_binding,
+    _live_untrusted_active_ingest,
     _operator_can_invoke_admin_shell,
     _operator_git_execution_argv_with_diagnostics,
     _operator_read_execution_argv_with_diagnostics,
@@ -704,6 +706,13 @@ _OPERATOR_BINDING_FAILURE_REFUSAL = "operator shell binding failed closed"
 _OPERATOR_SHELL_HARD_REFUSAL = (
     "shell_exec was refused before execution: operator shell preparation failed closed"
 )
+_OPERATOR_SHELL_BINDING_REFUSAL = (
+    "shell_exec was refused before execution: operator shell binding failed closed"
+)
+_OPERATOR_SHELL_LIVE_TAINT_REFUSAL = (
+    "shell_exec was refused before execution (ifc_label_blocked:shell_process): "
+    "operator shell fallback requires exactly untainted live IFC"
+)
 
 
 def _operator_shell_unbound(
@@ -770,6 +779,108 @@ def _operator_shell_hard_refusal(
         tool_call_id=_tool_call_id(request),
         name="shell_exec",
         status="error",
+    )
+
+
+def _operator_shell_chainlink_mutation_refusal(
+    request: ToolCallRequest,
+    preparation: _OperatorShellPreparation | None,
+    auth_context: AuthContext | None,
+) -> ToolMessage | None:
+    if (
+        preparation is None
+        or preparation.outcome is not OperatorShellPreparationOutcome.BOUND
+        or preparation.binding is None
+        or not preparation.binding.chainlink_mutation
+        or _live_untrusted_active_ingest(
+            auth_context, _current_ifc_labels(auth_context),
+        ) is False
+    ):
+        return None
+    from ..access_control import _CHAINLINK_TAINT_REFUSAL
+
+    audit = _operator_shell_audit_summary(preparation)
+    assert audit is not None
+    _emit_hard_boundary_denied(
+        tool="shell_exec",
+        boundary="operator_shell_chainlink_mutation",
+        reason="chainlink_mutation_blocked_by_untrusted_ingest",
+        target=None,
+        auth_context=auth_context,
+        event_fields=audit,
+    )
+    _emit_tool_call_sync(
+        "shell_exec",
+        ok=False,
+        error=_CHAINLINK_TAINT_REFUSAL,
+        denied=True,
+        operator_shell_audit=audit,
+    )
+    return ToolMessage(
+        content=_CHAINLINK_TAINT_REFUSAL,
+        tool_call_id=_tool_call_id(request),
+        name="shell_exec",
+        status="error",
+    )
+
+
+def _operator_shell_soft_live_refusal(
+    request: ToolCallRequest,
+    preparation: _OperatorShellPreparation | None,
+    auth_context: AuthContext | None,
+    *,
+    started: float,
+) -> ToolMessage | None:
+    if (
+        preparation is None
+        or preparation.outcome is not OperatorShellPreparationOutcome.SOFT_UNBOUND
+        or _live_untrusted_active_ingest(
+            auth_context, _current_ifc_labels(auth_context),
+        ) is False
+    ):
+        return None
+    audit = _operator_shell_audit_summary(preparation)
+    assert audit is not None
+    _record_tool_outcome(
+        "shell_exec",
+        refused_reason=_OPERATOR_SHELL_LIVE_TAINT_REFUSAL,
+        operator_shell_audit=audit,
+    )
+    _emit_tool_call_sync(
+        "shell_exec",
+        ok=False,
+        duration_ms=(time.monotonic() - started) * 1000.0,
+        error=_OPERATOR_SHELL_LIVE_TAINT_REFUSAL,
+        denied=True,
+        operator_shell_audit=audit,
+    )
+    return ToolMessage(
+        content=_OPERATOR_SHELL_LIVE_TAINT_REFUSAL,
+        tool_call_id=_tool_call_id(request),
+        name="shell_exec",
+        status="error",
+    )
+
+
+def _operator_shell_execution_binding_matches(
+    request: ToolCallRequest,
+    auth_context: AuthContext | None,
+    binding: OperatorShellBinding,
+) -> bool:
+    arguments = (getattr(request, "tool_call", None) or {}).get("args")
+    return (
+        isinstance(arguments, dict)
+        and binding._issuer is _OPERATOR_SHELL_BINDING_ISSUER
+        and binding.profile == OPERATOR_SHELL_PROFILE
+        and binding.tool_name == "shell_exec"
+        and binding._request_identity is request
+        and binding._auth_context_identity is auth_context
+        and binding.tool_call_id == _tool_call_id(request)
+        and binding.command == arguments.get("command")
+        and binding.requested_cwd == arguments.get("cwd")
+        and isinstance(binding.resolved_cwd, str)
+        and bool(binding.resolved_cwd)
+        and bool(binding.argv)
     )
 
 
@@ -1102,6 +1213,8 @@ def _request_for_authorized_execution(
     request: ToolCallRequest,
     tool_name: str,
     auth_context: AuthContext | None,
+    *,
+    operator_shell_preparation: _OperatorShellPreparation | None = None,
 ) -> ToolCallRequest:
     """Bind trusted-service shell execution to the argv authorization checked.
 
@@ -1121,6 +1234,38 @@ def _request_for_authorized_execution(
         if had_model_override
         else request
     )
+    if operator_shell_preparation is not None:
+        preparation = operator_shell_preparation
+        if preparation.outcome is OperatorShellPreparationOutcome.SOFT_UNBOUND:
+            if _live_untrusted_active_ingest(
+                auth_context, _current_ifc_labels(auth_context),
+            ) is False:
+                return sanitized_request
+            args["mimir_shell_refusal"] = _OPERATOR_SHELL_LIVE_TAINT_REFUSAL
+            return sanitized_request.override(
+                tool_call={**sanitized_request.tool_call, "args": args},
+            )
+        binding = preparation.binding
+        if (
+            preparation.outcome is not OperatorShellPreparationOutcome.BOUND
+            or binding is None
+            or tool_name != "shell_exec"
+            or not _operator_shell_execution_binding_matches(
+                request, auth_context, binding,
+            )
+        ):
+            args["mimir_shell_refusal"] = _OPERATOR_SHELL_BINDING_REFUSAL
+            args["mimir_direct_argv"] = [
+                "/usr/bin/false", "operator shell binding failed closed",
+            ]
+            return sanitized_request.override(
+                tool_call={**sanitized_request.tool_call, "args": args},
+            )
+        args["cwd"] = binding.resolved_cwd
+        args["mimir_direct_argv"] = list(binding.argv)
+        return sanitized_request.override(
+            tool_call={**sanitized_request.tool_call, "args": args},
+        )
     if tool_name not in {"shell_exec", "bash_async"}:
         return sanitized_request
     service = get_trusted_service_from_auth_context(auth_context)
@@ -1451,19 +1596,30 @@ def _get_current_turn_context() -> Any:
 
 def _current_ifc_labels(auth_context: AuthContext | None) -> Any:
     """Read live labels from this exact request, including fork-visible updates."""
+    if auth_context is None:
+        return None
+    state = getattr(auth_context, "ifc_state", None)
+    current = getattr(state, "current", None)
+    if not callable(current):
+        return None
     active_ctx = _get_current_turn_context()
     if (
         active_ctx is not None
-        and auth_context is not None
         and getattr(active_ctx, "auth_context", None) is not None
-        and active_ctx.auth_context.ifc_state is auth_context.ifc_state
+        and getattr(active_ctx.auth_context, "ifc_state", None) is state
     ):
         labels = getattr(active_ctx, "ifc_labels", None)
         if labels is not None:
-            return auth_context.ifc_state.current(labels)
-    if auth_context is None:
+            try:
+                return current(labels)
+            except Exception:
+                log.exception("ifc_current_state_evaluation_failed")
+                return None
+    try:
+        return current(auth_context.ifc_labels)
+    except Exception:
+        log.exception("ifc_current_state_evaluation_failed")
         return None
-    return auth_context.ifc_state.current(auth_context.ifc_labels)
 
 
 def _merge_result_labels(auth_context: AuthContext | None, added: Any) -> None:
@@ -2069,7 +2225,11 @@ class BudgetGateMiddleware(AgentMiddleware):
                 ifc_labels,
                 getattr(request, "tool", None),
                 validated_arguments,
-                operator_shell_binding=None,
+                operator_shell_binding=(
+                    operator_shell_preparation.binding
+                    if operator_shell_preparation is not None
+                    else None
+                ),
                 operator_shell_refusal=(
                     operator_shell_preparation.refusal
                     if operator_shell_preparation is not None
@@ -2096,6 +2256,11 @@ class BudgetGateMiddleware(AgentMiddleware):
         )
         if hard_refusal is not None:
             return hard_refusal
+        mutation_refusal = _operator_shell_chainlink_mutation_refusal(
+            request, operator_shell_preparation, auth_context,
+        )
+        if mutation_refusal is not None:
+            return mutation_refusal
         if admin_denial is not None:
             _emit_tool_call_sync(
                 tool_name, ok=False, error=admin_denial, denied=True,
@@ -2217,8 +2382,15 @@ class BudgetGateMiddleware(AgentMiddleware):
             )
             _merge_result_labels(auth_context, propagated)
         started = time.monotonic()
-        execution_request = _request_for_authorized_execution(
-            request, tool_name, auth_context,
+        execution_request = (
+            _request_for_authorized_execution(
+                request,
+                tool_name,
+                auth_context,
+                operator_shell_preparation=operator_shell_preparation,
+            )
+            if operator_shell_preparation is not None
+            else _request_for_authorized_execution(request, tool_name, auth_context)
         )
         # A profile refusal is served as the tool result. Nothing is executed,
         # so the caller reads why instead of an unexplained exit 1.
@@ -2270,6 +2442,11 @@ class BudgetGateMiddleware(AgentMiddleware):
         policy_refusal = None
         fetch_token = None
         try:
+            mutation_refusal = _operator_shell_chainlink_mutation_refusal(
+                request, operator_shell_preparation, auth_context,
+            )
+            if mutation_refusal is not None:
+                return mutation_refusal
             from .github_review_guard import (
                 claim_review_submission,
                 review_submission_from_request,
@@ -2281,7 +2458,18 @@ class BudgetGateMiddleware(AgentMiddleware):
                 if review_spec is not None
                 else None
             )
-            if (
+            operator_direct_argv = (
+                list(operator_shell_preparation.binding.argv)
+                if operator_shell_preparation is not None
+                and operator_shell_preparation.outcome is OperatorShellPreparationOutcome.BOUND
+                and operator_shell_preparation.binding is not None
+                else None
+            )
+            if operator_direct_argv is not None:
+                from ._shell_env import bind_direct_exec_argv
+
+                direct_argv_token = bind_direct_exec_argv(operator_direct_argv)
+            elif (
                 tool_name in {"shell_exec", "bash_async"}
                 and isinstance(direct_argv, list)
             ):
@@ -2307,6 +2495,14 @@ class BudgetGateMiddleware(AgentMiddleware):
             if review_claim is not None and review_claim.duplicate:
                 result = _duplicate_review_result(request, review_claim)
             else:
+                soft_live_refusal = _operator_shell_soft_live_refusal(
+                    request,
+                    operator_shell_preparation,
+                    auth_context,
+                    started=started,
+                )
+                if soft_live_refusal is not None:
+                    return soft_live_refusal
                 result = handler(execution_request)
         except ToolException as exc:
             if capture_token is not None:
@@ -2479,7 +2675,11 @@ class BudgetGateMiddleware(AgentMiddleware):
                 ifc_labels,
                 getattr(request, "tool", None),
                 validated_arguments,
-                operator_shell_binding=None,
+                operator_shell_binding=(
+                    operator_shell_preparation.binding
+                    if operator_shell_preparation is not None
+                    else None
+                ),
                 operator_shell_refusal=(
                     operator_shell_preparation.refusal
                     if operator_shell_preparation is not None
@@ -2506,6 +2706,11 @@ class BudgetGateMiddleware(AgentMiddleware):
         )
         if hard_refusal is not None:
             return hard_refusal
+        mutation_refusal = _operator_shell_chainlink_mutation_refusal(
+            request, operator_shell_preparation, auth_context,
+        )
+        if mutation_refusal is not None:
+            return mutation_refusal
         if admin_denial is not None:
             _emit_tool_call_sync(
                 tool_name, ok=False, error=admin_denial, denied=True,
@@ -2627,8 +2832,15 @@ class BudgetGateMiddleware(AgentMiddleware):
             )
             _merge_result_labels(auth_context, propagated)
         started = time.monotonic()
-        execution_request = _request_for_authorized_execution(
-            request, tool_name, auth_context,
+        execution_request = (
+            _request_for_authorized_execution(
+                request,
+                tool_name,
+                auth_context,
+                operator_shell_preparation=operator_shell_preparation,
+            )
+            if operator_shell_preparation is not None
+            else _request_for_authorized_execution(request, tool_name, auth_context)
         )
         # A profile refusal is served as the tool result. Nothing is executed,
         # so the caller reads why instead of an unexplained exit 1.
@@ -2682,6 +2894,11 @@ class BudgetGateMiddleware(AgentMiddleware):
         policy_refusal = None
         fetch_token = None
         try:
+            mutation_refusal = _operator_shell_chainlink_mutation_refusal(
+                request, operator_shell_preparation, auth_context,
+            )
+            if mutation_refusal is not None:
+                return mutation_refusal
             from .github_review_guard import (
                 claim_review_submission,
                 review_submission_from_request,
@@ -2695,7 +2912,18 @@ class BudgetGateMiddleware(AgentMiddleware):
                 if review_spec is not None
                 else None
             )
-            if (
+            operator_direct_argv = (
+                list(operator_shell_preparation.binding.argv)
+                if operator_shell_preparation is not None
+                and operator_shell_preparation.outcome is OperatorShellPreparationOutcome.BOUND
+                and operator_shell_preparation.binding is not None
+                else None
+            )
+            if operator_direct_argv is not None:
+                from ._shell_env import bind_direct_exec_argv
+
+                direct_argv_token = bind_direct_exec_argv(operator_direct_argv)
+            elif (
                 tool_name in {"shell_exec", "bash_async"}
                 and isinstance(direct_argv, list)
             ):
@@ -2721,6 +2949,14 @@ class BudgetGateMiddleware(AgentMiddleware):
             if review_claim is not None and review_claim.duplicate:
                 result = _duplicate_review_result(request, review_claim)
             else:
+                soft_live_refusal = _operator_shell_soft_live_refusal(
+                    request,
+                    operator_shell_preparation,
+                    auth_context,
+                    started=started,
+                )
+                if soft_live_refusal is not None:
+                    return soft_live_refusal
                 result = await handler(execution_request)
         except ToolException as exc:
             if capture_token is not None:
