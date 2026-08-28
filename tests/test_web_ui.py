@@ -13,6 +13,7 @@ from pathlib import Path
 import pytest
 from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
+from yarl import URL
 
 from mimir.config import Config
 from mimir.dashboard_extensions import (
@@ -34,7 +35,7 @@ from mimir.web_contracts import (
     validate_live_event,
     validate_list_meta,
 )
-from mimir.worklink.backends.feature_factory import parse_factory_status
+from mimir.worklink.backends.feature_factory import epic_run_id, parse_factory_status
 from mimir.worklink.factory_state import FactoryRunRecord, save_factory_record
 
 
@@ -522,20 +523,63 @@ async def test_factory_runs_detail(tmp_path: Path, monkeypatch: pytest.MonkeyPat
 
 
 @pytest.mark.asyncio
-async def test_factory_runs_detail_rejects_traversal_to_existing_run_json(
+async def test_factory_runs_detail_loads_record_with_minted_run_id(
+    tmp_path: Path,
+):
+    home = tmp_path / "home"
+    home.mkdir()
+    run_id = epic_run_id(1337)
+    sandbox = tmp_path / run_id
+    save_factory_record(home, FactoryRunRecord(
+        run_id=run_id, issue_id=1337, attempt=1, repository="owner/repo",
+        base_ref="main", branch="worklink/1337", launcher="/opt/factory/bin/factory.js",
+        sandbox=str(sandbox), session="session-1", handle=None, status=None,
+        observed_at="2026-08-28T10:00:00Z", controller_phase="running",
+    ))
+
+    app = web.Application()
+    web_ui.register_routes(
+        app,
+        turns_log=tmp_path / "turns",
+        events_log=tmp_path / "events",
+        home=home,
+    )
+
+    client = TestClient(TestServer(app))
+    async with client as cli:
+        resp = await cli.get(f"/api/v1/factory-runs/{run_id}")
+        assert resp.status == 200
+        data = await resp.json()
+        assert data["data"]["run_id"] == run_id
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("unsafe_path", "error_code"),
+    [
+        ("valid..child", "invalid_run_id"),
+        ("valid%2Fchild", "invalid_run_id"),
+        ("valid%5Cchild", "invalid_run_id"),
+        (".hidden", "invalid_run_id"),
+        ("%2Fetc%2Fpasswd", "invalid_run_id"),
+        ("", "missing_run_id"),
+    ],
+    ids=["dot-dot", "slash", "backslash", "leading-dot", "absolute", "empty"],
+)
+async def test_factory_runs_detail_rejects_unsafe_run_ids(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    unsafe_path: str,
+    error_code: str,
 ):
     monkeypatch.setenv("WORKLINK_REPO", str(tmp_path))
     home = tmp_path / "home"
     home.mkdir()
     monkeypatch.setenv("MIMIR_HOME", str(home))
-
-    outside_dir = tmp_path / ".opencode" / "outside"
-    outside_dir.mkdir(parents=True)
-    (outside_dir / "run.json").write_text(
-        json.dumps({"run_id": "outside", "status": "completed"}),
-        encoding="utf-8",
+    monkeypatch.setattr(
+        web_ui,
+        "load_factory_record",
+        lambda *_args: pytest.fail("unsafe run id reached load_factory_record"),
     )
 
     app = web.Application()
@@ -548,11 +592,11 @@ async def test_factory_runs_detail_rejects_traversal_to_existing_run_json(
 
     client = TestClient(TestServer(app))
     async with client as cli:
-        resp = await cli.get("/api/v1/factory-runs/%2E%2E%2Foutside")
+        resp = await cli.get(URL(f"/api/v1/factory-runs/{unsafe_path}", encoded=True))
         assert resp.status == 400
         data = await resp.json()
         assert data["ok"] is False
-        assert data["error"]["code"] == "invalid_run_id"
+        assert data["error"]["code"] == error_code
 
 
 @pytest.mark.asyncio
