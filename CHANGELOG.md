@@ -6,6 +6,85 @@ All notable changes will land here. Format loosely follows
 
 ## [Unreleased]
 
+## [0.8.7] — 2026-08-28
+
+One hundred and seventy-nine pull requests since 0.8.6. The through-line is the
+autonomous build pipeline: it could write code but not deliver it, and every
+layer between "the build finished" and "the pull request exists" turned out to be
+broken in a different way.
+
+**Operator action is required.** A version bump alone satisfies none of these:
+
+- **feature-factory moves to 0.8.0**, and the pin lives in an image layer. A
+  source deployment needs its image rebuilt, not only a pull and a restart. The
+  version-drift check fails closed against a 0.7.x image, so a missed rebuild is
+  loud rather than silent.
+- **`.factory.json` no longer declares `publishing_identity`.** 0.8.0 rejects the
+  key outright, and the identity now comes from the environment. Set
+  `MIMIR_FACTORY_PUBLISHING_IDENTITY` in the deployment that runs builds; without
+  it the resolver refuses and every epic dispatch fails closed. A maintainer
+  running the factory by hand sets it to their own account.
+- **Bundled skills changed** — `chainlink-orchestrator`, `github-poller`,
+  `github-ci-watch`, `gmail-poller` and `dependency-advisory-watch`. Skills are
+  installed INTO the agent home, so a pull and a restart leave the deployed copies
+  stale. Run `mimir skills update <name> --apply`; without `--apply` the command is
+  read-only and prints the diff first. The `chainlink-orchestrator` change is
+  load-bearing: its `pass_env` list is what carries the publishing identity to a
+  dispatched build.
+
+### Publication, end to end
+
+Builds had been completing and publishing nothing since 2026-08-10, recorded as
+`completed` the whole time. Four separate defects, each sufficient on its own:
+
+- Publication ran unauthenticated — the credential-helper capture used a regex
+  whose character class excluded every key containing the letter `s`, which is
+  every `https://` key.
+- The executor report directory was created unshared, so the uid-dropped worker
+  could not write it. Sharing is now a precondition that raises before launch
+  rather than a best-effort chown.
+- The gate reported `counts: None` on a passing suite, so evidence carried no
+  totals and no failed-test names.
+- The factory-dispatch checkout was not placed on the target ref, so `pr_base`
+  disagreed with the record.
+
+A failed publication is now loud instead of being recorded as success.
+
+### The build pipeline stops discarding finished work
+
+A status refusal at the terminal gate used to archive the run record and let the
+checkout be swept, destroying everything the build had produced. Chainlink #1337
+lost seven hours and twenty-two commits that way, one step from publication,
+because `parse_factory_status` demanded an object for a `validator` field that
+feature-factory's own contract defines as a verdict string (`GO` /
+`GO-WITH-NITS` / `NO-GO`).
+
+Both halves are fixed: the parser accepts the documented shape and refuses an
+unknown verdict, and a post-merge failure now pushes the built branch before the
+record is archived, recording the ref in the escalated signal and the archived
+record. Preservation failure never replaces the underlying refusal.
+
+### Turn capability, operator arm
+
+The untrusted-active-ingest refusal is now conditional on the requested sink's
+boundedness for server-authored argv, so a turn that ingested untrusted content
+can still run a server-bound command while an unbounded `bash -lc` stays refused.
+A bounded reader that binds no operand is refused rather than executed verbatim,
+and `shell_exec` binds its child's stdin so a direct execution cannot consume the
+agent's.
+
+### Also
+
+- Ten observability changes, including terminal-outcome events on the epic path,
+  which previously emitted nothing on failure while the leaf path recorded all of it.
+- Ten authorization changes on the enforcement-enablement path.
+- A blocking macOS CI leg alongside the Ubuntu 3.11/3.12 matrix, and a
+  `pytest-worker-uid` leg that runs the suite as the non-owning worker uid.
+- The web Factory Runs detail view loads again; it had rejected every run by
+  validating run ids against a digits-only pattern the system never mints.
+
+`MIMIR_ACCESS_CONTROL_ENFORCED` remains unset.
+
 ## [0.8.6] — 2026-08-20
 
 Twenty-four pull requests since 0.8.5. The through-line is the agent's ability
