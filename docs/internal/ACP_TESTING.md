@@ -189,8 +189,12 @@ Known and worth stating rather than discovering again:
   will drift. It also hardcodes `/tmp/acp-h`.
 - **The key parser is fragile** — it regexes a box-drawn CLI panel. A cosmetic change to
   that output breaks every scenario with a confusing failure.
-- **No automated interop test.** Findings A/B/C were all found by hand; nothing would catch
-  a regression in any of them.
+- **No automated interop test for B and C.** All three findings were made by hand. A is now
+  covered — `tests/test_client_provider.py` pins the `structuredContent` contract, so a
+  regression in the response shape fails the normal suite. B and C are not: both depend on a
+  real client driving a real session, and nothing in the automated suite reaches them. A
+  full end-to-end interop test, exercising A against an actual client rather than the
+  contract in isolation, also does not exist.
 - **Registry eligibility is blocked** for a separate reason: the candidate advertises no
   `authMethods`, so `registry/mimir/agent.json` is a schema-valid rehearsal, not a
   submittable entry. See `docs/acp.md`.

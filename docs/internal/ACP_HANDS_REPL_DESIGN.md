@@ -18,10 +18,14 @@ collapse the tool surface to a single persistent Python REPL.
 Measured on a live daemon with a fully compliant client-side provider (correct `mcp/connect`,
 exact tool schemas, valid responses):
 
-- **A.** `tools/call` accepts only a *bare* structured object. The MCP-spec `CallToolResult`
-  (`content` + `structuredContent`) is rejected as `hands_read returned a malformed result`,
-  even though `tools/list` advertises `outputSchema`, which in MCP *means* return
-  `structuredContent`. A spec-compliant editor fails every call.
+- **A. (FIXED — since inverted.)** When measured, `tools/call` accepted only a *bare*
+  structured object and rejected the MCP-spec `CallToolResult` (`content` +
+  `structuredContent`) as `hands_read returned a malformed result`, even though
+  `tools/list` advertises `outputSchema`, which in MCP *means* return `structuredContent`.
+  A spec-compliant editor failed every call. Current code requires `structuredContent` and
+  rejects the bare object — the reverse — and `tests/test_client_provider.py` pins that
+  contract for all three Hands tools. Retained because it is what motivated parts 1 and 2,
+  not because it still reproduces.
 - **B.** `hands_edit` and `hands_shell` are refused before reaching the client
   (`ifc_label_blocked:shell_process` / "permission was rejected before execution").
   `session/request_permission` count across every run: **0**.
@@ -176,8 +180,9 @@ reads the user's worktree hits that on every call.
 
 1. **#1592 first.** Without it, Hands returns bytes that silence the turn. Smallest change,
    load-bearing for everything else.
-2. **Finding A** — resolvable independently, and cheap; may become moot under part 1, so decide
-   part 1 first or accept the throwaway.
+2. **Finding A** — already resolved; the contract is `structuredContent` and the suite pins
+   it. Nothing to sequence here. What remains unbuilt is an end-to-end interop test that
+   exercises the shape against a real client rather than in isolation.
 3. **This design**, parts 1 and 2 together.
 4. Only then consider collapsing to one tool.
 
