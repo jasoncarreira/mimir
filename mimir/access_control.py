@@ -4103,25 +4103,24 @@ def _operator_read_target(
 
 
 def _operator_recursive_read_preflight(
-    roots: tuple[Path, ...], *, reads_content: bool, include_hidden: bool,
+    roots: tuple[Path, ...], *, include_hidden: bool,
 ) -> bool:
     entry_count = 0
     content_bytes = 0
-    if reads_content:
-        for root in roots:
-            if root.is_dir():
-                continue
-            try:
-                content_bytes += root.stat().st_size
-            except OSError:
-                return False
-            if (
-                content_bytes > _SHELL_RECURSIVE_READ_BYTE_LIMIT
-                or _operator_read_target(
-                    str(root), resolved_cwd=root.parent, scan_file=True,
-                ) is None
-            ):
-                return False
+    for root in roots:
+        if root.is_dir():
+            continue
+        try:
+            content_bytes += root.stat().st_size
+        except OSError:
+            return False
+        if (
+            content_bytes > _SHELL_RECURSIVE_READ_BYTE_LIMIT
+            or _operator_read_target(
+                str(root), resolved_cwd=root.parent, scan_file=True,
+            ) is None
+        ):
+            return False
     pending = [root for root in roots if root.is_dir()]
     while pending:
         directory = pending.pop()
@@ -4149,17 +4148,16 @@ def _operator_recursive_read_preflight(
                     if is_directory:
                         pending.append(admitted)
                         continue
+                    try:
+                        content_bytes += entry.stat(follow_symlinks=False).st_size
+                    except OSError:
+                        return False
+                    if content_bytes > _SHELL_RECURSIVE_READ_BYTE_LIMIT:
+                        return False
                     if _operator_read_target(
                         str(child), resolved_cwd=directory, scan_file=True,
                     ) is None:
                         return False
-                    if reads_content:
-                        try:
-                            content_bytes += entry.stat(follow_symlinks=False).st_size
-                        except OSError:
-                            return False
-                        if content_bytes > _SHELL_RECURSIVE_READ_BYTE_LIMIT:
-                            return False
         except OSError:
             return False
     return True
@@ -4204,7 +4202,7 @@ def _operator_read_execution_argv_with_diagnostics(
             return None, _OPERATOR_READ_REFUSAL, ServiceShellBindingRule.OPERATOR_READ_OPERAND_POLICY
         if target.is_dir() and reads_content and not recursive:
             return None, _OPERATOR_READ_REFUSAL, ServiceShellBindingRule.OPERATOR_READ_OPERAND_POLICY
-        if target.is_file() and _operator_read_target(
+        if target.is_file() and not recursive and _operator_read_target(
             str(target), resolved_cwd=cwd, scan_file=True,
         ) is None:
             return None, _OPERATOR_READ_REFUSAL, ServiceShellBindingRule.OPERATOR_READ_OPERAND_POLICY
@@ -4220,7 +4218,7 @@ def _operator_read_execution_argv_with_diagnostics(
             )
         )
         if not _operator_recursive_read_preflight(
-            tuple(canonical), reads_content=reads_content, include_hidden=include_hidden,
+            tuple(canonical), include_hidden=include_hidden,
         ):
             return None, _OPERATOR_READ_REFUSAL, ServiceShellBindingRule.OPERATOR_READ_OPERAND_POLICY
 

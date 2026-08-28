@@ -9396,6 +9396,53 @@ def test_operator_arm2_recursive_hidden_and_protected_children(
     assert str(protected) not in reason
 
 
+def test_operator_arm2_rg_files_bounds_every_credential_scan_and_withholds_values(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    maintenance_pinned_executables: dict[str, Path],
+) -> None:
+    _home, root, _outside = _operator_confinement_tree(tmp_path, monkeypatch)
+    argv = [str(maintenance_pinned_executables["rg"]), "--no-config", "--files", "."]
+    oversized = root / "oversized-sentinel.txt"
+    oversized.write_text("ordinary-content\n", encoding="utf-8")
+    monkeypatch.setattr(access_control, "_SHELL_RECURSIVE_READ_BYTE_LIMIT", 1)
+
+    hardened, reason, rule = access_control._operator_read_execution_argv_with_diagnostics(
+        argv, resolved_cwd=root,
+    )
+
+    assert hardened is None
+    assert reason == access_control._OPERATOR_READ_REFUSAL
+    assert rule is ServiceShellBindingRule.OPERATOR_READ_OPERAND_POLICY
+    assert str(oversized) not in reason
+    assert "oversized-sentinel" not in reason
+
+    monkeypatch.setattr(access_control, "_SHELL_RECURSIVE_READ_BYTE_LIMIT", 1024)
+    oversized.unlink()
+    credential = root / "ordinary-name.txt"
+    secret_value = "ghp_" + "q" * 36
+    credential.write_text(secret_value, encoding="utf-8")
+    hardened, reason, rule = access_control._operator_read_execution_argv_with_diagnostics(
+        argv, resolved_cwd=root,
+    )
+    assert hardened is None
+    assert reason == access_control._OPERATOR_READ_REFUSAL
+    assert rule is ServiceShellBindingRule.OPERATOR_READ_OPERAND_POLICY
+    assert secret_value not in reason
+    assert str(credential) not in reason
+
+    credential.unlink()
+    protected = root / "secrets.json"
+    protected.write_text("{}\n", encoding="utf-8")
+    hardened, reason, rule = access_control._operator_read_execution_argv_with_diagnostics(
+        argv, resolved_cwd=root,
+    )
+    assert hardened is None
+    assert reason == access_control._OPERATOR_READ_REFUSAL
+    assert rule is ServiceShellBindingRule.OPERATOR_READ_OPERAND_POLICY
+    assert str(protected) not in reason
+
+
 @pytest.mark.parametrize(
     "argv",
     [
