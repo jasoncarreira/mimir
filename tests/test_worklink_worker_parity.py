@@ -340,8 +340,19 @@ async def test_contained_timeout_bounds_cancel_and_collection_independently(
         if stuck_layer == "cancel"
         else "worker did not report a terminal result"
     )
+    # The property under test is the RuntimeError and its message: the internal
+    # bounds above (0.01s each) must fire and name which layer was stuck. The
+    # outer wait_for is only a hang guard so a broken bound fails the test
+    # instead of blocking the suite -- it is not an assertion about latency.
+    #
+    # It was 0.2s, which is a wall-clock budget on a shared runner rather than a
+    # hang guard: under CI load the event loop can take longer than that to
+    # schedule the timeout path, and wait_for then raises TimeoutError before the
+    # RuntimeError propagates. That is a false failure about the runner, not the
+    # code. Widened to 10s, which still catches a genuinely unbounded wait
+    # promptly while leaving three orders of magnitude of scheduling headroom.
     with pytest.raises(RuntimeError, match=message):
-        await asyncio.wait_for(backend.wait(handle, 0.001), timeout=0.2)
+        await asyncio.wait_for(backend.wait(handle, 0.001), timeout=10)
 
     if stuck_layer == "collection":
         assert job.done()
