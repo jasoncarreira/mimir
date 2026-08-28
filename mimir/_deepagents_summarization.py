@@ -103,8 +103,15 @@ class _LoggingBackendProxy:
 
 def _wrap_sync_offload(original: Any, logger: Any) -> Any:
     @wraps(original)
-    def wrapped(self: Any, backend: Any, messages: list[Any]) -> Any:
-        return original(self, _LoggingBackendProxy(backend, logger), messages)
+    def wrapped(self: Any, backend: Any, *args: Any, **kwargs: Any) -> Any:
+        # Forward everything after ``backend`` untouched. The wrapper exists only to
+        # substitute the backend with a logging proxy, so it must not restate
+        # upstream's parameter list: deepagents 0.7.10 added ``session_id`` to
+        # ``_offload_to_backend``/``_aoffload_to_backend`` and a wrapper hardcoded to
+        # ``(self, backend, messages)`` then raises "takes 3 positional arguments but
+        # 4 were given" on every turn that offloads. The pin is ``>=0.7.1,<0.8``, so a
+        # signature change inside that range is expected rather than exceptional.
+        return original(self, _LoggingBackendProxy(backend, logger), *args, **kwargs)
 
     setattr(wrapped, _OFFLOAD_LOGGING_PATCH_MARKER, True)
     return wrapped
@@ -112,8 +119,12 @@ def _wrap_sync_offload(original: Any, logger: Any) -> Any:
 
 def _wrap_async_offload(original: Any, logger: Any) -> Any:
     @wraps(original)
-    async def wrapped(self: Any, backend: Any, messages: list[Any]) -> Any:
-        return await original(self, _LoggingBackendProxy(backend, logger), messages)
+    async def wrapped(self: Any, backend: Any, *args: Any, **kwargs: Any) -> Any:
+        # See _wrap_sync_offload: forward past ``backend`` without restating upstream's
+        # signature.
+        return await original(
+            self, _LoggingBackendProxy(backend, logger), *args, **kwargs
+        )
 
     setattr(wrapped, _OFFLOAD_LOGGING_PATCH_MARKER, True)
     return wrapped

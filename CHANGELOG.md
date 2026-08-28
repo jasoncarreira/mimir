@@ -6,6 +6,31 @@ All notable changes will land here. Format loosely follows
 
 ## [Unreleased]
 
+## [0.8.8] — 2026-08-28
+
+A same-day upstream release broke live turns; this restores them.
+
+deepagents 0.7.10 added a `session_id` argument to `_offload_to_backend` and
+`_aoffload_to_backend`. mimir's monkeypatch wrappers restated upstream's parameter
+list, so every turn that offloaded raised
+
+    TypeError: _DeepAgentsSummarizationMiddleware._aoffload_to_backend()
+    takes 3 positional arguments but 4 were given
+
+before reaching upstream. Nothing in mimir changed — the pin is
+`deepagents>=0.7.1,<0.8` and a rebuild resolved the new release.
+
+The wrappers now forward `*args, **kwargs` untouched. They exist to substitute the
+backend with a logging proxy; everything after it belongs to deepagents. A wrapper
+that restates a signature it does not own breaks again on the next change inside
+the pinned range, so the regression test asserts forwarding rather than arity.
+
+**Operator note, not fixed here.** `uv.lock` pins deepagents 0.7.1, but a source
+deployment whose startup builds a wheel and pip-installs it resolves dependencies
+fresh and can take any release inside the range. That is how 0.7.10 reached
+production without a change on our side. Deployments that want the locked set must
+install from the lock.
+
 ## [0.8.7] — 2026-08-28
 
 One hundred and seventy-nine pull requests since 0.8.6. The through-line is the
