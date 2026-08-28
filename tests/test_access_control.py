@@ -9267,17 +9267,20 @@ def test_operator_arm2_every_reader_refuses_credential_file(
 
 
 @pytest.mark.parametrize(
-    ("command", "omitted_adds_cwd", "root_allowed"),
+    ("command", "omitted_allowed", "omitted_adds_cwd", "root_allowed"),
     [
-        (["ls"], True, True),
-        (["wc"], False, False),
-        (["grep", "needle"], False, False),
-        (["rg", "--no-config", "needle"], True, True),
-        (["rg", "--no-config", "--files"], True, True),
+        (["ls"], True, True, True),
+        # `wc` and a non-recursive `grep` bind no operand, so an omitted path
+        # leaves the argv verbatim and the program reads inherited stdin. Refused.
+        (["wc"], False, False, False),
+        (["grep", "needle"], False, False, False),
+        (["rg", "--no-config", "needle"], True, True, True),
+        (["rg", "--no-config", "--files"], True, True, True),
     ],
 )
 def test_operator_arm2_reader_defaults_multiple_missing_and_root(
     command: list[str],
+    omitted_allowed: bool,
     omitted_adds_cwd: bool,
     root_allowed: bool,
     tmp_path: Path,
@@ -9291,11 +9294,16 @@ def test_operator_arm2_reader_defaults_multiple_missing_and_root(
     second.write_text("needle\n", encoding="utf-8")
     base = [str(maintenance_pinned_executables[command[0]]), *command[1:]]
 
-    omitted, omitted_reason, _rule = access_control._operator_read_execution_argv_with_diagnostics(
+    omitted, omitted_reason, omitted_rule = access_control._operator_read_execution_argv_with_diagnostics(
         base, resolved_cwd=root,
     )
-    assert omitted is not None, omitted_reason
-    assert (omitted[-1] == str(root)) is omitted_adds_cwd
+    assert (omitted is not None) is omitted_allowed, omitted_reason
+    if omitted_allowed:
+        assert (omitted[-1] == str(root)) is omitted_adds_cwd
+    else:
+        # Refused rather than executed verbatim against inherited stdin.
+        assert omitted_reason == access_control._OPERATOR_READ_REFUSAL
+        assert omitted_rule is ServiceShellBindingRule.OPERATOR_READ_OPERAND_POLICY
 
     multiple, multiple_reason, _rule = access_control._operator_read_execution_argv_with_diagnostics(
         [*base, str(first), str(second)], resolved_cwd=root,
@@ -9314,6 +9322,45 @@ def test_operator_arm2_reader_defaults_multiple_missing_and_root(
         [*base, str(root)], resolved_cwd=root,
     )
     assert (rooted is not None) is root_allowed
+
+
+def test_operator_arm2_direct_execution_binds_stdin_away_from_the_agent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``shell_exec`` must bind the child's stdin, not inherit the agent's.
+
+    The binding layer refuses an operandless reader, but that is one rule about
+    two programs. This pins the execution boundary itself: whatever argv reaches
+    the subprocess, its stdin is the server's choice rather than whatever
+    descriptor the agent process holds. Without it, any direct argv that reads
+    stdin regains an unbound input surface after active ingest, and hangs until
+    the shell timeout when nothing is piped.
+
+    Asserted at ``shell_exec``'s own call site. An earlier version of this test
+    invoked ``subprocess.run`` directly and passed with the fix reverted -- it
+    was exercising the standard library, not this code path.
+    """
+    import subprocess as _subprocess
+
+    from mimir.tools import extra as tools_extra
+
+    recorded: list[dict[str, object]] = []
+
+    class _Completed:
+        returncode = 0
+        stdout = b""
+        stderr = b""
+
+    def recording_run(argv, **kwargs):  # type: ignore[no-untyped-def]
+        recorded.append({"argv": list(argv), **kwargs})
+        return _Completed()
+
+    monkeypatch.setattr(tools_extra.subprocess, "run", recording_run)
+    runner = getattr(tools_extra.shell_exec, "func", tools_extra.shell_exec)
+    runner("echo bound", cwd=str(tmp_path))
+
+    assert recorded, "shell_exec did not reach its subprocess call site"
+    assert recorded[-1].get("stdin") is _subprocess.DEVNULL
 
 
 def test_operator_arm2_recursive_reader_preflight_is_bounded_and_value_free(

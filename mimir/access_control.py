@@ -4271,6 +4271,17 @@ def _operator_read_execution_argv_with_diagnostics(
             return None, _OPERATOR_READ_REFUSAL, ServiceShellBindingRule.OPERATOR_READ_OPERAND_POLICY
         canonical.append(target)
 
+    # A content reader with no operand reads inherited stdin, not a bound path.
+    # ``effective_paths`` empty means the argv executes verbatim, so ``wc`` or a
+    # non-recursive ``grep`` consumes whatever stdin the agent process holds: an
+    # unbound input surface after active ingest, and a hang until the shell
+    # timeout when nothing is piped. The server issues these argvs, and a
+    # server-issued read always names what it reads. ``ls`` and ``rg --files``
+    # are unaffected -- they do not read content, and their operand defaults to
+    # the resolved cwd below.
+    if reads_content and not canonical:
+        return None, _OPERATOR_READ_REFUSAL, ServiceShellBindingRule.OPERATOR_READ_OPERAND_POLICY
+
     if recursive:
         include_hidden = command != "rg" or (
             "--hidden" in argv[1:]
