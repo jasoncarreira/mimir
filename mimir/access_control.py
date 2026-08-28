@@ -31,7 +31,7 @@ import subprocess
 import sys
 import threading
 import time
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Mapping
 from contextvars import ContextVar, Token
 from dataclasses import dataclass, field, replace
 from enum import StrEnum
@@ -4048,6 +4048,69 @@ def _issue_operator_shell_binding(
     )
 
 
+def _operator_shell_binding_matches(
+    binding: OperatorShellBinding | None,
+    *,
+    request_identity: Any,
+    auth_context_identity: Any,
+    tool_name: str,
+    tool_call_id: str | None,
+    command: str | None,
+    requested_cwd: object,
+    final_argv: Iterable[str] | None = None,
+) -> bool:
+    if (
+        not isinstance(binding, OperatorShellBinding)
+        or binding._issuer is not _OPERATOR_SHELL_BINDING_ISSUER
+        or binding.profile != OPERATOR_SHELL_PROFILE
+        or binding.tool_name != "shell_exec"
+        or tool_name != "shell_exec"
+        or request_identity is None
+        or binding._request_identity is not request_identity
+        or auth_context_identity is None
+        or binding._auth_context_identity is not auth_context_identity
+        or not isinstance(tool_call_id, str)
+        or not tool_call_id
+        or binding.tool_call_id != tool_call_id
+        or not isinstance(command, str)
+        or not command
+        or "\x00" in command
+        or binding.command != command
+        or requested_cwd != binding.requested_cwd
+        or not isinstance(binding.resolved_cwd, str)
+        or not binding.resolved_cwd
+        or not binding.argv
+        or not _operator_argv_has_current_pin(binding.argv)
+    ):
+        return False
+    if requested_cwd is not None and (
+        not isinstance(requested_cwd, str)
+        or not requested_cwd
+        or "\x00" in requested_cwd
+        or not Path(requested_cwd).is_absolute()
+        or ".." in Path(requested_cwd).parts
+    ):
+        return False
+    if final_argv is not None:
+        try:
+            if tuple(final_argv) != binding.argv:
+                return False
+        except TypeError:
+            return False
+    artifact = _OperatorShellArgvArtifact(
+        binding.argv,
+        Path(binding.argv[0]).name,
+        binding.resolved_cwd,
+        _OPERATOR_SHELL_ARGV_ISSUER,
+    )
+    if not _operator_final_argv_matches_family(artifact):
+        return False
+    resolved = _resolve_operator_bounded_cwd(
+        binding.requested_cwd, git=artifact.family == "git",
+    )
+    return resolved is not None and str(resolved) == binding.resolved_cwd
+
+
 _OPERATOR_CWD_REFUSAL = "operator shell cwd confinement failed"
 _OPERATOR_READ_REFUSAL = "operator shell reader confinement failed"
 _OPERATOR_READER_EXCLUDED_REFUSAL = "operator shell reader is not eligible for binding"
@@ -6001,6 +6064,11 @@ class SinkGate:
         repo_review_state: Any = None,
         repo_review_state_refusal: str | None = None,
         repo_pr_action_scope: Any = None,
+        operator_shell_binding: OperatorShellBinding | None = None,
+        operator_shell_refusal: str | None = None,
+        operator_shell_request_identity: Any = None,
+        tool_call_id: str | None = None,
+        requested_cwd: object = None,
     ) -> "ToolAuthorization":
         """Check if IFC labels permit flow to the given sink.
 
@@ -6115,6 +6183,35 @@ class SinkGate:
         has_untrusted_active_ingest = _has_untrusted_active_ingest(
             auth_context, ifc_labels,
         )
+        operator_binding_matches = _operator_shell_binding_matches(
+            operator_shell_binding,
+            request_identity=operator_shell_request_identity,
+            auth_context_identity=auth_context,
+            tool_name=tool_name,
+            tool_call_id=tool_call_id,
+            command=target,
+            requested_cwd=requested_cwd,
+        )
+        if (
+            has_untrusted_active_ingest
+            and cls._is_trusted_operator_turn(ifc_labels, auth_context)
+            and sink_category is SinkCategory.SHELL_PROCESS
+            and operator_binding_matches
+            and operator_shell_binding is not None
+            and operator_shell_binding.chainlink_mutation
+        ):
+            return ToolAuthorization(
+                tool_name=tool_name,
+                decision=OperationDecision.ADMIN_REQUIRED,
+                allowed=not enforce,
+                reason="chainlink_mutation_blocked_by_untrusted_ingest",
+                required_tier=AccessTier.ADMIN,
+                enforcement_enabled=enforce,
+                is_shadow_decision=not enforce,
+                would_block=True,
+                resolved_sink_target=resolved_target,
+                refusal_detail=_CHAINLINK_TAINT_REFUSAL,
+            )
         if (
             is_application_egress
             and egress_target_requires_taint_gate
@@ -6427,6 +6524,10 @@ class SinkGate:
             ifc_labels=ifc_labels,
             service_policy=service_policy,
             target=target,
+            operator_shell_binding=operator_shell_binding,
+            operator_shell_request_identity=operator_shell_request_identity,
+            tool_call_id=tool_call_id,
+            requested_cwd=requested_cwd,
         )
         effective_target = (
             ChannelResourceAdapter._resolve_channel(target)
@@ -6483,6 +6584,12 @@ class SinkGate:
                 is_shadow_decision=is_shadow,
                 would_block=True,
                 resolved_sink_target=resolved_target,
+                refusal_detail=(
+                    operator_shell_refusal
+                    if sink_category is SinkCategory.SHELL_PROCESS
+                    and isinstance(operator_shell_refusal, str)
+                    else None
+                ),
             )
 
         return ToolAuthorization(
@@ -6505,6 +6612,10 @@ class SinkGate:
         ifc_labels: Any,
         service_policy: ServiceSinkPolicy | None = None,
         target: str | None = None,
+        operator_shell_binding: OperatorShellBinding | None = None,
+        operator_shell_request_identity: Any = None,
+        tool_call_id: str | None = None,
+        requested_cwd: object = None,
     ) -> frozenset[str]:
         """Return concrete destinations compatible with every current label.
 
@@ -6562,6 +6673,22 @@ class SinkGate:
             and not has_untrusted_active_ingest
             and target is not None
             and category in {SinkCategory.SHELL_PROCESS, SinkCategory.FILE}
+        ):
+            return frozenset({target})
+        if (
+            trusted_operator_turn
+            and has_untrusted_active_ingest
+            and category is SinkCategory.SHELL_PROCESS
+            and target is not None
+            and _operator_shell_binding_matches(
+                operator_shell_binding,
+                request_identity=operator_shell_request_identity,
+                auth_context_identity=auth_context,
+                tool_name=tool_name,
+                tool_call_id=tool_call_id,
+                command=target,
+                requested_cwd=requested_cwd,
+            )
         ):
             return frozenset({target})
         if (
@@ -8000,6 +8127,7 @@ class ToolRegistry:
         arguments: dict[str, Any] | None = None,
         ifc_labels: Any = None,
         sink_category: SinkCategory | None = None,
+        operator_shell_audit: Mapping[str, str] | None = None,
     ) -> None:
         """Emit a would-block shadow-decision audit log (when enabled)."""
         if not self._shadow_logging_enabled or not auth.would_block:
@@ -8044,6 +8172,18 @@ class ToolRegistry:
                 redacted_resolved_target = str(redacted_resolved_target)[
                     :_MAX_REQUESTED_TARGET_LENGTH
                 ]
+
+            if operator_shell_audit is not None:
+                redacted_requested_target = None
+                redacted_resolved_target = SinkCategory.SHELL_PROCESS.value
+                fields.update({
+                    key: operator_shell_audit[key]
+                    for key in (
+                        "shell_profile", "preparation_outcome", "command_family",
+                        "binding_rule",
+                    )
+                    if key in operator_shell_audit
+                })
 
             if auth.reason and auth.reason.startswith("ifc_label_blocked:"):
                 try:
@@ -8103,6 +8243,11 @@ class ToolRegistry:
         ifc_labels: Any = None,
         mcp_tool: Any = None,
         arguments: dict[str, Any] | None = None,
+        operator_shell_binding: OperatorShellBinding | None = None,
+        operator_shell_refusal: str | None = None,
+        operator_shell_request_identity: Any = None,
+        operator_shell_audit: Mapping[str, str] | None = None,
+        tool_call_id: str | None = None,
     ) -> ToolAuthorization:
         """Authorize a tool call using the operation catalog.
 
@@ -8323,6 +8468,11 @@ class ToolRegistry:
                 repo_review_state=repo_review_state,
                 repo_review_state_refusal=repo_review_state_refusal,
                 repo_pr_action_scope=repo_pr_action_scope,
+                operator_shell_binding=operator_shell_binding,
+                operator_shell_refusal=operator_shell_refusal,
+                operator_shell_request_identity=operator_shell_request_identity,
+                tool_call_id=tool_call_id,
+                requested_cwd=(arguments or {}).get("cwd"),
             )
             sink_check.repo_pr_action_scope = repo_pr_action_scope
             if not sink_check.allowed and enforce and not preliminary_admin_denied:
@@ -8333,6 +8483,7 @@ class ToolRegistry:
                     requested_target=target_channel,
                     ifc_labels=ifc_labels,
                     sink_category=sink_category,
+                    operator_shell_audit=operator_shell_audit,
                 )
 
         decision = preliminary_decision
