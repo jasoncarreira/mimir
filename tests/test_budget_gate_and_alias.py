@@ -39,6 +39,9 @@ from langgraph.runtime import Runtime
 from mimir._context import get_current_turn, reset_current_turn, set_current_turn
 from mimir.access_control import (
     OperationDecision,
+    OPERATOR_SHELL_PROFILE,
+    OperatorShellBinding,
+    ServiceShellBindingRule,
     SinkGate,
     ToolAuthorization,
     ToolRegistry,
@@ -60,8 +63,11 @@ from mimir.models import (
 from mimir.identities import IdentityResolver
 from mimir.tools.budget_gate import (
     BudgetGateMiddleware,
+    OperatorShellPreparationOutcome,
+    _OperatorShellPreparation,
     _check_and_increment_or_deny,
     _emit_tool_call_sync,
+    _prepare_operator_shell_execution,
     _result_labels_for_call,
 )
 from tests.auth_helpers import attach_middleware_auth_context
@@ -3452,6 +3458,9 @@ def test_non_shell_server_args_are_stripped_before_nested_shell_exec(
                     "subagent_type": "general-purpose",
                     "mimir_direct_argv": ["/bin/sh", "-c", "planted"],
                     "mimir_shell_refusal": "model-authored refusal",
+                    "mimir_operator_shell_binding": "forged-binding",
+                    "mimir_operator_shell_profile": "forged-profile",
+                    "mimir_operator_shell_request_identity": "forged-identity",
                 },
             ),
             run_task,
@@ -3461,6 +3470,11 @@ def test_non_shell_server_args_are_stripped_before_nested_shell_exec(
 
     assert "mimir_direct_argv" not in outer_args
     assert "mimir_shell_refusal" not in outer_args
+    assert not {
+        "mimir_operator_shell_binding",
+        "mimir_operator_shell_profile",
+        "mimir_operator_shell_request_identity",
+    }.intersection(outer_args)
     assert executed == [["bash", "-lc", login_shell_command("git status --short")]]
 
 
@@ -3512,6 +3526,9 @@ async def test_non_shell_server_args_are_stripped_before_nested_bash_async(
                     "subagent_type": "general-purpose",
                     "mimir_direct_argv": ["/bin/sh", "-c", "planted"],
                     "mimir_shell_refusal": "model-authored refusal",
+                    "mimir_operator_shell_binding": "forged-binding",
+                    "mimir_operator_shell_profile": "forged-profile",
+                    "mimir_operator_shell_request_identity": "forged-identity",
                 },
             ),
             run_task,
@@ -3522,6 +3539,11 @@ async def test_non_shell_server_args_are_stripped_before_nested_bash_async(
 
     assert "mimir_direct_argv" not in outer_args
     assert "mimir_shell_refusal" not in outer_args
+    assert not {
+        "mimir_operator_shell_binding",
+        "mimir_operator_shell_profile",
+        "mimir_operator_shell_request_identity",
+    }.intersection(outer_args)
     assert spawned == [["bash", "-lc", login_shell_command("git status --short")]]
 
 
@@ -3567,6 +3589,479 @@ async def test_non_shell_execution_never_binds_direct_argv(
         reset_current_turn(token)
 
     assert observed == [None, None]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("middleware_path", ["sync", "async"])
+@pytest.mark.parametrize("preparation_kind", ["soft_unbound", "bound"])
+async def test_middleware_preparation_plumbing_remains_inactive_and_refused(
+    middleware_path: str,
+    preparation_kind: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    maintenance_pinned_executables: dict[str, Path],
+) -> None:
+    from dataclasses import replace
+
+    from mimir.tools import budget_gate
+    from mimir.models import TurnInteractivity
+
+    claims = {
+        "mimir_direct_argv": ["forged"],
+        "mimir_shell_refusal": "forged",
+        "mimir_operator_shell_binding": "forged",
+        "mimir_operator_shell_profile": "forged",
+        "mimir_operator_shell_request_identity": "forged",
+    }
+    root = tmp_path / "operator-root"
+    home = tmp_path / "home"
+    root.mkdir()
+    (home / "state").mkdir(parents=True)
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    monkeypatch.setenv("MIMIR_FILE_TOOL_ROOTS", f"{root}:ro")
+    monkeypatch.setattr(
+        "mimir.read_policy.configured_non_admin_read_roots", lambda: (root,),
+    )
+    expected = (
+        {"command": "pwd -P", "cwd": str(root)}
+        if preparation_kind == "bound"
+        else {"command": "printf safe"}
+    )
+    trusted_ingress = SourceLabel(
+        principal="user-1",
+        domain="channel",
+        resource_id="ch-1",
+        bridge_instance="test",
+        sensitivity="private",
+        authorized_principals=frozenset({"user-1"}),
+        source_kind="channel",
+        integrity="trusted",
+        integrity_effect="active_ingest",
+    )
+    untrusted_ingest = SourceLabel(
+        principal="external-source",
+        domain="web",
+        resource_id="active-ingest",
+        bridge_instance="test",
+        sensitivity="private",
+        authorized_principals=frozenset({"user-1"}),
+        source_kind="protected_tool",
+        integrity="untrusted",
+        integrity_effect="active_ingest",
+    )
+    labels = InformationFlowLabels(
+        labels=frozenset({"private"}),
+        source_channels=frozenset({"ch-1"}),
+        sources=(trusted_ingress, untrusted_ingest),
+    )
+    auth = replace(
+        _ifc_auth(),
+        interactivity=TurnInteractivity.INTERACTIVE,
+        ifc_labels=labels,
+        ifc_state=InformationFlowState(labels=labels),
+    )
+    order: list[str] = []
+    authorization_calls: list[tuple[ToolCallRequest, dict[str, Any]]] = []
+    handler_calls = 0
+    soft_preparation = _OperatorShellPreparation(
+        outcome=OperatorShellPreparationOutcome.SOFT_UNBOUND,
+        binding=None,
+        refusal="fixed pre-activation refusal",
+        binding_rule=ServiceShellBindingRule.PROFILE_ALLOWLIST,
+        command_family="profile_miss",
+    )
+    preparations: list[_OperatorShellPreparation] = []
+    original_prepare = budget_gate._prepare_operator_shell_execution
+    original_authorize = budget_gate._authorize_tool_call
+
+    def validate(request: ToolCallRequest) -> dict[str, Any]:
+        order.append("validation")
+        assert request.tool_call["args"] == expected
+        return expected
+
+    def review(*_args: Any) -> None:
+        order.append("standing_review")
+        return None
+
+    def prepare(
+        request: ToolCallRequest, *args: Any,
+    ) -> _OperatorShellPreparation:
+        order.append("preparation")
+        assert request.tool_call["args"] == expected
+        prepared = (
+            original_prepare(request, *args)
+            if preparation_kind == "bound"
+            else soft_preparation
+        )
+        assert prepared is not None
+        preparations.append(prepared)
+        return prepared
+
+    def authorize(*args: Any, **kwargs: Any) -> tuple[ToolAuthorization, str | None]:
+        order.append("authorization")
+        request_identity = kwargs["operator_shell_request_identity"]
+        authorization_calls.append((request_identity, kwargs))
+        assert request_identity.tool_call["args"] == expected
+        return original_authorize(*args, **kwargs)
+
+    monkeypatch.setattr(budget_gate, "_validated_arguments", validate)
+    monkeypatch.setattr(budget_gate, "_resolve_standing_review", review)
+    monkeypatch.setattr(budget_gate, "_prepare_operator_shell_execution", prepare)
+    monkeypatch.setattr(budget_gate, "_authorize_tool_call", authorize)
+
+    def sync_handler(_request: ToolCallRequest) -> ToolMessage:
+        nonlocal handler_calls
+        handler_calls += 1
+        return ToolMessage(content="unsafe", tool_call_id="sync-preparation")
+
+    async def async_handler(_request: ToolCallRequest) -> ToolMessage:
+        nonlocal handler_calls
+        handler_calls += 1
+        return ToolMessage(content="unsafe", tool_call_id="async-preparation")
+
+    call_id = f"{middleware_path}-preparation"
+    request = _make_request(
+        "shell_exec", call_id, auth, {**expected, **claims},
+    )
+    if middleware_path == "sync":
+        result = BudgetGateMiddleware().wrap_tool_call(request, sync_handler)
+    else:
+        result = await BudgetGateMiddleware().awrap_tool_call(request, async_handler)
+
+    assert result.status == "error"
+    assert "ifc_label_blocked:shell_process" in str(result.content)
+    assert handler_calls == 0
+    assert order == [
+        "validation", "standing_review", "preparation", "authorization",
+    ]
+    assert len(authorization_calls) == 1
+    assert len(preparations) == 1
+    preparation = preparations[0]
+    sanitized_request, forwarded = authorization_calls[0]
+    assert sanitized_request is not request
+    assert forwarded["operator_shell_binding"] is None
+    assert forwarded["operator_shell_refusal"] == preparation.refusal
+    assert forwarded["operator_shell_request_identity"] is sanitized_request
+    assert forwarded["tool_call_id"] == call_id
+    if preparation_kind == "bound":
+        assert preparation.outcome is OperatorShellPreparationOutcome.BOUND
+        assert preparation.binding is not None
+        assert preparation.binding.argv == (
+            str(maintenance_pinned_executables["pwd"]), "-P",
+        )
+        assert preparation.binding._request_identity is sanitized_request
+        assert forwarded["operator_shell_refusal"] is None
+    else:
+        assert preparation is soft_preparation
+        assert forwarded["operator_shell_refusal"] == soft_preparation.refusal
+
+
+@pytest.mark.parametrize(
+    ("scenario", "expected_outcome", "expected_rule", "expected_family"),
+    [
+        ("missing-command", OperatorShellPreparationOutcome.HARD_REFUSED, ServiceShellBindingRule.PROFILE_ALLOWLIST, "invalid_command"),
+        ("non-string-command", OperatorShellPreparationOutcome.HARD_REFUSED, ServiceShellBindingRule.PROFILE_ALLOWLIST, "invalid_command"),
+        ("non-dict-arguments", OperatorShellPreparationOutcome.HARD_REFUSED, ServiceShellBindingRule.PROFILE_ALLOWLIST, "invalid_command"),
+        ("shell-control", OperatorShellPreparationOutcome.SOFT_UNBOUND, ServiceShellBindingRule.SHELL_CONTROL_CHARACTERS, "profile_miss"),
+        ("unbalanced", OperatorShellPreparationOutcome.SOFT_UNBOUND, ServiceShellBindingRule.ARGV_UNBALANCED_QUOTING, "profile_miss"),
+        ("empty", OperatorShellPreparationOutcome.SOFT_UNBOUND, ServiceShellBindingRule.ARGV_EMPTY, "profile_miss"),
+        ("tilde", OperatorShellPreparationOutcome.SOFT_UNBOUND, ServiceShellBindingRule.SHELL_HOME_EXPANSION, "profile_miss"),
+        ("project-test", OperatorShellPreparationOutcome.SOFT_UNBOUND, ServiceShellBindingRule.OPERATOR_PROJECT_TEST_EXCLUDED, "project_test"),
+        ("profile-miss", OperatorShellPreparationOutcome.SOFT_UNBOUND, ServiceShellBindingRule.PROFILE_ALLOWLIST, "profile_miss"),
+        ("declared-unreachable", OperatorShellPreparationOutcome.HARD_REFUSED, ServiceShellBindingRule.DECLARED_COMMAND_MISMATCH, "profile_miss"),
+        ("service-read-unreachable", OperatorShellPreparationOutcome.HARD_REFUSED, ServiceShellBindingRule.READ_OPERAND_POLICY, "profile_miss"),
+        ("pin-failure", OperatorShellPreparationOutcome.HARD_REFUSED, ServiceShellBindingRule.EXECUTABLE_PIN, "profile_miss"),
+        ("parser-failure", OperatorShellPreparationOutcome.HARD_REFUSED, ServiceShellBindingRule.UNKNOWN_PROFILE, "parser"),
+        ("parser-refusal-without-rule", OperatorShellPreparationOutcome.HARD_REFUSED, ServiceShellBindingRule.UNKNOWN_PROFILE, "parser"),
+        ("empty-admitted-argv", OperatorShellPreparationOutcome.HARD_REFUSED, ServiceShellBindingRule.UNKNOWN_PROFILE, "parser"),
+        ("unsupported-admitted-family", OperatorShellPreparationOutcome.HARD_REFUSED, ServiceShellBindingRule.UNKNOWN_PROFILE, "parser"),
+        ("chainlink-query", OperatorShellPreparationOutcome.BOUND, None, "chainlink"),
+        ("chainlink-mutation", OperatorShellPreparationOutcome.BOUND, None, "chainlink"),
+        ("pwd", OperatorShellPreparationOutcome.BOUND, None, "pwd"),
+        ("ls", OperatorShellPreparationOutcome.BOUND, None, "ls"),
+        ("wc", OperatorShellPreparationOutcome.BOUND, None, "wc"),
+        ("grep", OperatorShellPreparationOutcome.BOUND, None, "grep"),
+        ("recursive-grep", OperatorShellPreparationOutcome.BOUND, None, "grep"),
+        ("jq-excluded", OperatorShellPreparationOutcome.SOFT_UNBOUND, ServiceShellBindingRule.OPERATOR_READER_EXCLUDED, "jq"),
+        ("rg", OperatorShellPreparationOutcome.BOUND, None, "rg"),
+        ("rg-files", OperatorShellPreparationOutcome.BOUND, None, "rg"),
+        ("rg-link-excluded", OperatorShellPreparationOutcome.SOFT_UNBOUND, ServiceShellBindingRule.OPERATOR_READER_EXCLUDED, "rg"),
+        ("git-status", OperatorShellPreparationOutcome.BOUND, None, "git"),
+        ("git-diff", OperatorShellPreparationOutcome.BOUND, None, "git"),
+        ("git-log", OperatorShellPreparationOutcome.BOUND, None, "git"),
+        ("git-show", OperatorShellPreparationOutcome.BOUND, None, "git"),
+        ("git-verbose-excluded", OperatorShellPreparationOutcome.SOFT_UNBOUND, ServiceShellBindingRule.OPERATOR_GIT_HARDENING, "git"),
+        ("git-separator-excluded", OperatorShellPreparationOutcome.SOFT_UNBOUND, ServiceShellBindingRule.OPERATOR_GIT_HARDENING, "git"),
+        ("cwd-failure", OperatorShellPreparationOutcome.HARD_REFUSED, ServiceShellBindingRule.OPERATOR_CWD_POLICY, "pwd"),
+        ("git-cwd-failure", OperatorShellPreparationOutcome.HARD_REFUSED, ServiceShellBindingRule.OPERATOR_CWD_POLICY, "git"),
+        ("reader-confinement", OperatorShellPreparationOutcome.HARD_REFUSED, ServiceShellBindingRule.OPERATOR_READ_OPERAND_POLICY, "wc"),
+        ("recursive-preflight", OperatorShellPreparationOutcome.HARD_REFUSED, ServiceShellBindingRule.OPERATOR_READ_OPERAND_POLICY, "grep"),
+        ("git-hardener-failure", OperatorShellPreparationOutcome.HARD_REFUSED, ServiceShellBindingRule.OPERATOR_GIT_HARDENING, "git"),
+        ("artifact-failure", OperatorShellPreparationOutcome.HARD_REFUSED, ServiceShellBindingRule.OPERATOR_BINDING_MISMATCH, "pwd"),
+        ("issuance-failure", OperatorShellPreparationOutcome.HARD_REFUSED, ServiceShellBindingRule.OPERATOR_BINDING_MISMATCH, "pwd"),
+    ],
+)
+def test_operator_shell_preparation_exhaustive_outcome_matrix(
+    scenario: str,
+    expected_outcome: OperatorShellPreparationOutcome,
+    expected_rule: ServiceShellBindingRule | None,
+    expected_family: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from mimir.tools import budget_gate
+
+    monkeypatch.setattr(budget_gate, "_operator_can_invoke_admin_shell", lambda *_: True)
+    arguments: Any = {"command": "candidate", "cwd": str(tmp_path)}
+    if scenario == "missing-command":
+        arguments = {"cwd": str(tmp_path)}
+    elif scenario == "non-string-command":
+        arguments = {"command": 17, "cwd": str(tmp_path)}
+    elif scenario == "non-dict-arguments":
+        arguments = ["candidate"]
+    request = ToolCallRequest(
+        tool_call={
+            "name": "shell_exec",
+            "args": arguments,
+            "id": f"operator-{scenario}",
+            "type": "tool_call",
+        },
+        tool=None,
+        state=None,
+        runtime=Runtime(context=None),
+    )
+    parser_rules = {
+        "shell-control": ServiceShellBindingRule.SHELL_CONTROL_CHARACTERS,
+        "unbalanced": ServiceShellBindingRule.ARGV_UNBALANCED_QUOTING,
+        "empty": ServiceShellBindingRule.ARGV_EMPTY,
+        "tilde": ServiceShellBindingRule.SHELL_HOME_EXPANSION,
+        "project-test": ServiceShellBindingRule.PROFILE_ALLOWLIST,
+        "profile-miss": ServiceShellBindingRule.PROFILE_ALLOWLIST,
+        "declared-unreachable": ServiceShellBindingRule.DECLARED_COMMAND_MISMATCH,
+        "service-read-unreachable": ServiceShellBindingRule.READ_OPERAND_POLICY,
+        "pin-failure": ServiceShellBindingRule.EXECUTABLE_PIN,
+    }
+    family_by_scenario = {
+        "chainlink-query": "chainlink",
+        "chainlink-mutation": "chainlink",
+        "recursive-grep": "grep",
+        "jq-excluded": "jq",
+        "rg-files": "rg",
+        "rg-link-excluded": "rg",
+        "git-status": "git",
+        "git-diff": "git",
+        "git-log": "git",
+        "git-show": "git",
+        "git-verbose-excluded": "git",
+        "git-separator-excluded": "git",
+        "cwd-failure": "pwd",
+        "git-cwd-failure": "git",
+        "reader-confinement": "wc",
+        "recursive-preflight": "grep",
+        "git-hardener-failure": "git",
+        "artifact-failure": "pwd",
+        "issuance-failure": "pwd",
+    }
+    family = family_by_scenario.get(scenario, scenario)
+
+    if scenario == "parser-failure":
+        def parser(*_args: Any, **_kwargs: Any) -> Any:
+            raise RuntimeError("parser unavailable")
+    elif scenario == "parser-refusal-without-rule":
+        def parser(*_args: Any, **_kwargs: Any) -> tuple[None, str, None]:
+            return None, "fixed parser refusal", None
+    elif scenario == "empty-admitted-argv":
+        def parser(*_args: Any, **_kwargs: Any) -> tuple[list[str], str, None]:
+            return [], "", None
+    elif scenario == "unsupported-admitted-family":
+        def parser(*_args: Any, **_kwargs: Any) -> tuple[list[str], str, None]:
+            return ["/pins/curl"], "", None
+    elif scenario in parser_rules:
+        def parser(*_args: Any, **_kwargs: Any) -> tuple[None, str, ServiceShellBindingRule]:
+            return None, "fixed parser refusal", parser_rules[scenario]
+    else:
+        def parser(*_args: Any, **_kwargs: Any) -> tuple[list[str], str, None]:
+            return [f"/pins/{family}", scenario], "", None
+    monkeypatch.setattr(budget_gate, "parse_service_shell_argv_with_diagnostics", parser)
+    monkeypatch.setattr(
+        budget_gate,
+        "_project_test_execution_argv",
+        lambda _argv: (None, "excluded", scenario == "project-test"),
+    )
+    monkeypatch.setattr(
+        budget_gate,
+        "_resolve_operator_bounded_cwd",
+        lambda *_args, **_kwargs: (
+            None if scenario in {"cwd-failure", "git-cwd-failure"} else tmp_path
+        ),
+    )
+
+    def reader_hardener(
+        argv: list[str], **_kwargs: Any,
+    ) -> tuple[list[str] | None, str, ServiceShellBindingRule | None]:
+        if scenario in {"jq-excluded", "rg-link-excluded"}:
+            return None, "fixed reader exclusion", ServiceShellBindingRule.OPERATOR_READER_EXCLUDED
+        if scenario in {"reader-confinement", "recursive-preflight"}:
+            return None, "fixed reader refusal", ServiceShellBindingRule.OPERATOR_READ_OPERAND_POLICY
+        return argv, "", None
+
+    def git_hardener(
+        argv: list[str], **_kwargs: Any,
+    ) -> tuple[list[str] | None, str, ServiceShellBindingRule | None]:
+        if scenario in {"git-verbose-excluded", "git-separator-excluded"}:
+            return None, "operator shell Git form is not eligible for binding", ServiceShellBindingRule.OPERATOR_GIT_HARDENING
+        if scenario == "git-hardener-failure":
+            return None, "fixed Git hardener refusal", ServiceShellBindingRule.OPERATOR_GIT_HARDENING
+        return argv, "", None
+
+    monkeypatch.setattr(budget_gate, "_operator_read_execution_argv_with_diagnostics", reader_hardener)
+    monkeypatch.setattr(budget_gate, "_operator_git_execution_argv_with_diagnostics", git_hardener)
+    monkeypatch.setattr(
+        budget_gate,
+        "_validated_operator_shell_argv_artifact",
+        lambda *_args, **_kwargs: None if scenario == "artifact-failure" else object(),
+    )
+
+    def issue(**kwargs: Any) -> OperatorShellBinding | None:
+        if scenario == "issuance-failure":
+            return None
+        return OperatorShellBinding(
+            profile=OPERATOR_SHELL_PROFILE,
+            tool_name="shell_exec",
+            tool_call_id=f"operator-{scenario}",
+            command="candidate",
+            requested_cwd=str(tmp_path),
+            resolved_cwd=str(tmp_path),
+            argv=(f"/pins/{family}", scenario),
+            chainlink_mutation=scenario == "chainlink-mutation",
+            _request_identity=request,
+            _auth_context_identity=object(),
+            _issuer=object(),
+        )
+
+    monkeypatch.setattr(budget_gate, "_issue_operator_shell_binding", issue)
+    preparation = _prepare_operator_shell_execution(request, "shell_exec", None, None)
+
+    assert preparation is not None
+    assert preparation.outcome is expected_outcome
+    assert preparation.binding_rule is expected_rule
+    assert preparation.command_family == expected_family
+    assert (preparation.binding is not None) is (
+        expected_outcome is OperatorShellPreparationOutcome.BOUND
+    )
+    assert (preparation.refusal is None) is (
+        expected_outcome is OperatorShellPreparationOutcome.BOUND
+    )
+
+
+@pytest.mark.parametrize(
+    ("command", "executable", "tail"),
+    [
+        ("pwd -P", "pwd", ("-P",)),
+        (
+            "/usr/local/bin/chainlink issue show 1337",
+            "chainlink",
+            ("issue", "show", "1337"),
+        ),
+    ],
+)
+def test_operator_shell_preparation_issues_genuine_scheduler_binding(
+    command: str,
+    executable: str,
+    tail: tuple[str, ...],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    maintenance_pinned_executables: dict[str, Path],
+) -> None:
+    from mimir.tools import budget_gate
+
+    home = tmp_path / "home"
+    root = tmp_path / "root"
+    (home / "state").mkdir(parents=True)
+    root.mkdir()
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    monkeypatch.setenv("MIMIR_FILE_TOOL_ROOTS", f"{root}:ro")
+    monkeypatch.setattr(
+        "mimir.read_policy.configured_non_admin_read_roots", lambda: (root,),
+    )
+    monkeypatch.setattr(budget_gate, "_operator_can_invoke_admin_shell", lambda *_: True)
+    parser_calls: list[tuple[tuple[Any, ...], dict[str, Any]]] = []
+    original_parser = budget_gate.parse_service_shell_argv_with_diagnostics
+
+    def parser(*args: Any, **kwargs: Any) -> Any:
+        parser_calls.append((args, kwargs))
+        return original_parser(*args, **kwargs)
+
+    monkeypatch.setattr(budget_gate, "parse_service_shell_argv_with_diagnostics", parser)
+    auth = _untainted_ifc_auth()
+    request = _make_request(
+        "shell_exec", "genuine-binding", auth,
+        {"command": command, "cwd": str(root)},
+    )
+    preparation = _prepare_operator_shell_execution(
+        request, "shell_exec", auth, auth.ifc_labels,
+    )
+
+    assert preparation is not None
+    assert preparation.outcome is OperatorShellPreparationOutcome.BOUND
+    assert preparation.binding is not None
+    assert preparation.binding.argv == (
+        str(maintenance_pinned_executables[executable]), *tail,
+    )
+    assert preparation.binding._request_identity is request
+    assert preparation.binding._auth_context_identity is auth
+    assert parser_calls == [((command, OPERATOR_SHELL_PROFILE), {
+        "declared": (),
+        "service": None,
+        "auth_context": None,
+        "review_state": None,
+        "allow_project_test": False,
+    })]
+
+
+def test_operator_bash_async_and_service_shell_have_no_arm2_preparation(
+    tmp_path: Path,
+) -> None:
+    auth = _untainted_ifc_auth()
+    assert _prepare_operator_shell_execution(
+        _make_request("bash_async", auth_context=auth, args={"command": "pwd"}),
+        "bash_async",
+        auth,
+        auth.ifc_labels,
+    ) is None
+    service_turn = _service_turn(tmp_path, "service-channel")
+    assert _prepare_operator_shell_execution(
+        _make_request(
+            "shell_exec",
+            auth_context=service_turn.auth_context,
+            args={"command": "pwd"},
+        ),
+        "shell_exec",
+        service_turn.auth_context,
+        service_turn.auth_context.ifc_labels,
+    ) is None
+
+
+@pytest.mark.asyncio
+async def test_operator_bash_async_active_ingest_remains_refused() -> None:
+    auth = _ifc_auth()
+    handler_calls = 0
+
+    async def handler(request: ToolCallRequest) -> ToolMessage:
+        nonlocal handler_calls
+        handler_calls += 1
+        return ToolMessage(content="unsafe", tool_call_id=request.tool_call["id"])
+
+    result = await BudgetGateMiddleware().awrap_tool_call(
+        _make_request(
+            "bash_async", "operator-async-refused", auth, {"command": "pwd"},
+        ),
+        handler,
+    )
+
+    assert result.status == "error"
+    assert "ifc_label_blocked:shell_process" in str(result.content)
+    assert handler_calls == 0
 
 
 # ─── get_turn alias (unchanged from prior file) ───────────────────

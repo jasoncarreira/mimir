@@ -42,6 +42,8 @@ import os
 import re
 import time
 from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
+from enum import StrEnum
 from pathlib import Path
 from types import UnionType
 from typing import Annotated, Any, Awaitable, Callable, Union, get_args, get_origin
@@ -56,6 +58,8 @@ from .refusals import ToolPolicyRefusal
 from ..worklink.continuation import HTTP_EVENT_INGRESS_EXTRA_VALUE
 from ..access_control import (
     OperationDecision,
+    OPERATOR_SHELL_PROFILE,
+    OperatorShellBinding,
     SinkCategory,
     ToolAuthorization,
     approve_live_declassification,
@@ -70,6 +74,13 @@ from ..access_control import (
     resolve_repository_review_state,
     ServicePrincipal,
     ServiceShellBindingRule,
+    _issue_operator_shell_binding,
+    _operator_can_invoke_admin_shell,
+    _operator_git_execution_argv_with_diagnostics,
+    _operator_read_execution_argv_with_diagnostics,
+    _project_test_execution_argv,
+    _resolve_operator_bounded_cwd,
+    _validated_operator_shell_argv_artifact,
     service_filesystem_read_roots,
     service_shell_argv_for_log,
 )
@@ -586,7 +597,274 @@ _extract_channel_from_args = _extract_sink_target
 # is stripped before authorization: ``mimir_direct_argv`` would choose what runs,
 # and ``mimir_shell_refusal`` would let a model author text that reads as a
 # server authorization verdict.
-_SERVER_ONLY_SHELL_ARGS = frozenset({"mimir_direct_argv", "mimir_shell_refusal"})
+_SERVER_ONLY_SHELL_ARGS = frozenset({
+    "mimir_direct_argv",
+    "mimir_shell_refusal",
+    "mimir_operator_shell_binding",
+    "mimir_operator_shell_profile",
+    "mimir_operator_shell_request_identity",
+})
+
+
+def _strip_server_only_shell_args(request: ToolCallRequest) -> ToolCallRequest:
+    tool_call = getattr(request, "tool_call", None) or {}
+    arguments = tool_call.get("args")
+    if not isinstance(arguments, dict) or not (_SERVER_ONLY_SHELL_ARGS & arguments.keys()):
+        return request
+    sanitized = dict(arguments)
+    for name in _SERVER_ONLY_SHELL_ARGS:
+        sanitized.pop(name, None)
+    return request.override(tool_call={**tool_call, "args": sanitized})
+
+
+class OperatorShellPreparationOutcome(StrEnum):
+    BOUND = "bound"
+    SOFT_UNBOUND = "soft_unbound"
+    HARD_REFUSED = "hard_refused"
+
+
+_OPERATOR_SHELL_COMMAND_FAMILIES = frozenset({
+    "invalid_command",
+    "parser",
+    "project_test",
+    "profile_miss",
+    "chainlink",
+    "pwd",
+    "ls",
+    "wc",
+    "grep",
+    "jq",
+    "rg",
+    "git",
+})
+
+
+@dataclass(frozen=True)
+class _OperatorShellPreparation:
+    outcome: OperatorShellPreparationOutcome
+    binding: OperatorShellBinding | None
+    refusal: str | None
+    binding_rule: ServiceShellBindingRule | None
+    command_family: str
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.outcome, OperatorShellPreparationOutcome):
+            raise ValueError("unknown operator shell preparation outcome")
+        if self.command_family not in _OPERATOR_SHELL_COMMAND_FAMILIES:
+            raise ValueError("unknown operator shell command family")
+        if self.outcome is OperatorShellPreparationOutcome.BOUND:
+            if (
+                not isinstance(self.binding, OperatorShellBinding)
+                or self.binding.profile != OPERATOR_SHELL_PROFILE
+                or self.binding.tool_name != "shell_exec"
+                or not self.binding.argv
+                or Path(self.binding.argv[0]).name != self.command_family
+                or self.refusal is not None
+                or self.binding_rule is not None
+            ):
+                raise ValueError("bound operator shell preparation requires one valid binding")
+        elif self.outcome not in {
+            OperatorShellPreparationOutcome.SOFT_UNBOUND,
+            OperatorShellPreparationOutcome.HARD_REFUSED,
+        } or (
+            self.binding is not None
+            or not isinstance(self.refusal, str)
+            or not self.refusal
+            or not isinstance(self.binding_rule, ServiceShellBindingRule)
+        ):
+            raise ValueError("unbound operator shell preparation requires a fixed refusal")
+
+
+_OPERATOR_INVALID_COMMAND_REFUSAL = "operator shell command is invalid"
+_OPERATOR_PARSER_FAILURE_REFUSAL = "operator shell parser failed closed"
+_OPERATOR_CWD_FAILURE_REFUSAL = "operator shell cwd confinement failed"
+_OPERATOR_BINDING_FAILURE_REFUSAL = "operator shell binding failed closed"
+
+
+def _operator_shell_unbound(
+    outcome: OperatorShellPreparationOutcome,
+    refusal: str,
+    binding_rule: ServiceShellBindingRule,
+    command_family: str,
+) -> _OperatorShellPreparation:
+    return _OperatorShellPreparation(
+        outcome=outcome,
+        binding=None,
+        refusal=refusal,
+        binding_rule=binding_rule,
+        command_family=command_family,
+    )
+
+
+def _prepare_operator_shell_execution(
+    request: ToolCallRequest,
+    tool_name: str,
+    auth_context: AuthContext | None,
+    ifc_labels: Any,
+) -> _OperatorShellPreparation | None:
+    if not _operator_can_invoke_admin_shell(tool_name, ifc_labels, auth_context):
+        return None
+    arguments = (getattr(request, "tool_call", None) or {}).get("args")
+    if not isinstance(arguments, dict):
+        return _operator_shell_unbound(
+            OperatorShellPreparationOutcome.HARD_REFUSED,
+            _OPERATOR_INVALID_COMMAND_REFUSAL,
+            ServiceShellBindingRule.PROFILE_ALLOWLIST,
+            "invalid_command",
+        )
+    command = arguments.get("command")
+    if not isinstance(command, str):
+        return _operator_shell_unbound(
+            OperatorShellPreparationOutcome.HARD_REFUSED,
+            _OPERATOR_INVALID_COMMAND_REFUSAL,
+            ServiceShellBindingRule.PROFILE_ALLOWLIST,
+            "invalid_command",
+        )
+    try:
+        parsed_argv, refusal, binding_rule = parse_service_shell_argv_with_diagnostics(
+            command,
+            OPERATOR_SHELL_PROFILE,
+            declared=(),
+            service=None,
+            auth_context=None,
+            review_state=None,
+            allow_project_test=False,
+        )
+    except Exception:
+        return _operator_shell_unbound(
+            OperatorShellPreparationOutcome.HARD_REFUSED,
+            _OPERATOR_PARSER_FAILURE_REFUSAL,
+            ServiceShellBindingRule.UNKNOWN_PROFILE,
+            "parser",
+        )
+    if parsed_argv is None:
+        if binding_rule is None:
+            return _operator_shell_unbound(
+                OperatorShellPreparationOutcome.HARD_REFUSED,
+                _OPERATOR_PARSER_FAILURE_REFUSAL,
+                ServiceShellBindingRule.UNKNOWN_PROFILE,
+                "parser",
+            )
+        command_family = "profile_miss"
+        if binding_rule is ServiceShellBindingRule.PROFILE_ALLOWLIST:
+            try:
+                import shlex
+
+                candidate = shlex.split(command)
+                _test_argv, _test_reason, project_test_matched = (
+                    _project_test_execution_argv(candidate)
+                )
+            except (OSError, RuntimeError, ValueError):
+                project_test_matched = False
+            if project_test_matched:
+                return _operator_shell_unbound(
+                    OperatorShellPreparationOutcome.SOFT_UNBOUND,
+                    "operator project test is not eligible for binding",
+                    ServiceShellBindingRule.OPERATOR_PROJECT_TEST_EXCLUDED,
+                    "project_test",
+                )
+        soft_rules = {
+            ServiceShellBindingRule.SHELL_CONTROL_CHARACTERS,
+            ServiceShellBindingRule.ARGV_UNBALANCED_QUOTING,
+            ServiceShellBindingRule.ARGV_EMPTY,
+            ServiceShellBindingRule.SHELL_HOME_EXPANSION,
+            ServiceShellBindingRule.PROFILE_ALLOWLIST,
+        }
+        return _operator_shell_unbound(
+            (
+                OperatorShellPreparationOutcome.SOFT_UNBOUND
+                if binding_rule in soft_rules
+                else OperatorShellPreparationOutcome.HARD_REFUSED
+            ),
+            refusal or _OPERATOR_PARSER_FAILURE_REFUSAL,
+            binding_rule,
+            command_family,
+        )
+
+    family = Path(parsed_argv[0]).name if parsed_argv else "parser"
+    if family not in _OPERATOR_SHELL_COMMAND_FAMILIES or family in {
+        "invalid_command", "parser", "project_test", "profile_miss",
+    }:
+        return _operator_shell_unbound(
+            OperatorShellPreparationOutcome.HARD_REFUSED,
+            _OPERATOR_PARSER_FAILURE_REFUSAL,
+            ServiceShellBindingRule.UNKNOWN_PROFILE,
+            "parser",
+        )
+    requested_cwd = arguments.get("cwd")
+    resolved_cwd = _resolve_operator_bounded_cwd(requested_cwd, git=family == "git")
+    if resolved_cwd is None:
+        return _operator_shell_unbound(
+            OperatorShellPreparationOutcome.HARD_REFUSED,
+            _OPERATOR_CWD_FAILURE_REFUSAL,
+            ServiceShellBindingRule.OPERATOR_CWD_POLICY,
+            family,
+        )
+    final_argv = parsed_argv
+    if family in {"ls", "wc", "grep", "jq", "rg"}:
+        final_argv, refusal, binding_rule = _operator_read_execution_argv_with_diagnostics(
+            parsed_argv, resolved_cwd=resolved_cwd,
+        )
+        if final_argv is None:
+            return _operator_shell_unbound(
+                (
+                    OperatorShellPreparationOutcome.SOFT_UNBOUND
+                    if binding_rule is ServiceShellBindingRule.OPERATOR_READER_EXCLUDED
+                    else OperatorShellPreparationOutcome.HARD_REFUSED
+                ),
+                refusal or _OPERATOR_BINDING_FAILURE_REFUSAL,
+                binding_rule or ServiceShellBindingRule.OPERATOR_READ_OPERAND_POLICY,
+                family,
+            )
+    elif family == "git":
+        final_argv, refusal, binding_rule = _operator_git_execution_argv_with_diagnostics(
+            parsed_argv, resolved_cwd=resolved_cwd,
+        )
+        if final_argv is None:
+            soft = refusal == "operator shell Git form is not eligible for binding"
+            return _operator_shell_unbound(
+                (
+                    OperatorShellPreparationOutcome.SOFT_UNBOUND
+                    if soft
+                    else OperatorShellPreparationOutcome.HARD_REFUSED
+                ),
+                refusal or _OPERATOR_BINDING_FAILURE_REFUSAL,
+                binding_rule or ServiceShellBindingRule.OPERATOR_GIT_HARDENING,
+                family,
+            )
+    artifact = _validated_operator_shell_argv_artifact(
+        parsed_argv, final_argv, resolved_cwd=resolved_cwd,
+    )
+    if artifact is None:
+        return _operator_shell_unbound(
+            OperatorShellPreparationOutcome.HARD_REFUSED,
+            _OPERATOR_BINDING_FAILURE_REFUSAL,
+            ServiceShellBindingRule.OPERATOR_BINDING_MISMATCH,
+            family,
+        )
+    binding = _issue_operator_shell_binding(
+        request_identity=request,
+        auth_context_identity=auth_context,
+        tool_call_id=_tool_call_id(request),
+        command=command,
+        requested_cwd=requested_cwd,
+        resolved_cwd=str(resolved_cwd),
+        argv_artifact=artifact,
+    )
+    if binding is None:
+        return _operator_shell_unbound(
+            OperatorShellPreparationOutcome.HARD_REFUSED,
+            _OPERATOR_BINDING_FAILURE_REFUSAL,
+            ServiceShellBindingRule.OPERATOR_BINDING_MISMATCH,
+            family,
+        )
+    return _OperatorShellPreparation(
+        outcome=OperatorShellPreparationOutcome.BOUND,
+        binding=binding,
+        refusal=None,
+        binding_rule=None,
+        command_family=family,
+    )
 
 
 def _service_shell_refusal(request: ToolCallRequest) -> str | None:
@@ -1289,6 +1567,11 @@ def _check_admin_authorized(
     ifc_labels: Any = None,
     mcp_tool: Any = None,
     arguments: dict[str, Any] | None = None,
+    *,
+    operator_shell_binding: OperatorShellBinding | None = None,
+    operator_shell_refusal: str | None = None,
+    operator_shell_request_identity: Any = None,
+    tool_call_id: str | None = None,
 ) -> str | None:
     _, denial = _authorize_tool_call(
         tool_name,
@@ -1297,6 +1580,10 @@ def _check_admin_authorized(
         ifc_labels,
         mcp_tool,
         arguments,
+        operator_shell_binding=operator_shell_binding,
+        operator_shell_refusal=operator_shell_refusal,
+        operator_shell_request_identity=operator_shell_request_identity,
+        tool_call_id=tool_call_id,
     )
     return denial
 
@@ -1308,6 +1595,11 @@ def _authorize_tool_call(
     ifc_labels: Any = None,
     mcp_tool: Any = None,
     arguments: dict[str, Any] | None = None,
+    *,
+    operator_shell_binding: OperatorShellBinding | None = None,
+    operator_shell_refusal: str | None = None,
+    operator_shell_request_identity: Any = None,
+    tool_call_id: str | None = None,
 ) -> tuple[ToolAuthorization, str | None]:
     """Return the exact authorization and any middleware denial text."""
     enforce = (
@@ -1315,6 +1607,14 @@ def _authorize_tool_call(
         if ctx is not None
         else _env_access_control_enforced()
     )
+    operator_parameters = {}
+    if operator_shell_request_identity is not None:
+        operator_parameters = {
+            "operator_shell_binding": operator_shell_binding,
+            "operator_shell_refusal": operator_shell_refusal,
+            "operator_shell_request_identity": operator_shell_request_identity,
+            "tool_call_id": tool_call_id,
+        }
     auth = get_tool_registry().authorize_tool(
         tool_name,
         ctx,
@@ -1323,6 +1623,7 @@ def _authorize_tool_call(
         ifc_labels=ifc_labels,
         mcp_tool=mcp_tool,
         arguments=arguments,
+        **operator_parameters,
     )
     # Generic HTTP credentials authenticate transport only.  Check operation
     # class before compatibility-mode shadow allowances: resource-scoped and
@@ -1625,6 +1926,7 @@ class BudgetGateMiddleware(AgentMiddleware):
     ) -> ToolMessage | Command:
         tool_name = _tool_name_from_request(request)
         auth_context = _auth_context_from_request(request)
+        request = _strip_server_only_shell_args(request)
         request = _request_with_resolved_service_write_path(
             request, tool_name, auth_context,
         )
@@ -1655,6 +1957,9 @@ class BudgetGateMiddleware(AgentMiddleware):
             )
         target_channels = _extract_sink_targets(request, auth_context)
         ifc_labels = _current_ifc_labels(auth_context)
+        operator_shell_preparation = _prepare_operator_shell_execution(
+            request, tool_name, auth_context, ifc_labels,
+        )
 
         authorization = None
         for target_channel in target_channels:
@@ -1665,6 +1970,20 @@ class BudgetGateMiddleware(AgentMiddleware):
                 ifc_labels,
                 getattr(request, "tool", None),
                 validated_arguments,
+                operator_shell_binding=None,
+                operator_shell_refusal=(
+                    operator_shell_preparation.refusal
+                    if operator_shell_preparation is not None
+                    else None
+                ),
+                operator_shell_request_identity=(
+                    request if operator_shell_preparation is not None else None
+                ),
+                tool_call_id=(
+                    _tool_call_id(request)
+                    if operator_shell_preparation is not None
+                    else None
+                ),
             )
             if authorization is None:
                 # The first target is the operation target; later targets are
@@ -1966,6 +2285,7 @@ class BudgetGateMiddleware(AgentMiddleware):
     ) -> ToolMessage | Command:
         tool_name = _tool_name_from_request(request)
         auth_context = _auth_context_from_request(request)
+        request = _strip_server_only_shell_args(request)
         request = _request_with_resolved_service_write_path(
             request, tool_name, auth_context,
         )
@@ -1996,6 +2316,9 @@ class BudgetGateMiddleware(AgentMiddleware):
             )
         target_channels = _extract_sink_targets(request, auth_context)
         ifc_labels = _current_ifc_labels(auth_context)
+        operator_shell_preparation = _prepare_operator_shell_execution(
+            request, tool_name, auth_context, ifc_labels,
+        )
 
         authorization = None
         for target_channel in target_channels:
@@ -2006,6 +2329,20 @@ class BudgetGateMiddleware(AgentMiddleware):
                 ifc_labels,
                 getattr(request, "tool", None),
                 validated_arguments,
+                operator_shell_binding=None,
+                operator_shell_refusal=(
+                    operator_shell_preparation.refusal
+                    if operator_shell_preparation is not None
+                    else None
+                ),
+                operator_shell_request_identity=(
+                    request if operator_shell_preparation is not None else None
+                ),
+                tool_call_id=(
+                    _tool_call_id(request)
+                    if operator_shell_preparation is not None
+                    else None
+                ),
             )
             if authorization is None:
                 # The first target is the operation target; later targets are
