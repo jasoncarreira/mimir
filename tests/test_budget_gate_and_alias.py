@@ -4064,6 +4064,363 @@ async def test_operator_bash_async_active_ingest_remains_refused() -> None:
     assert handler_calls == 0
 
 
+def _hard_operator_shell_preparation(refusal: str) -> _OperatorShellPreparation:
+    return _OperatorShellPreparation(
+        outcome=OperatorShellPreparationOutcome.HARD_REFUSED,
+        binding=None,
+        refusal=refusal,
+        binding_rule=ServiceShellBindingRule.OPERATOR_READ_OPERAND_POLICY,
+        command_family="grep",
+    )
+
+
+_ARM2_AUDIT_KEYS = frozenset({
+    "shell_profile",
+    "preparation_outcome",
+    "command_family",
+    "binding_rule",
+})
+
+
+def _arm2_audit_sentinels() -> dict[str, str]:
+    return {
+        "command": "command-sentinel-7b984",
+        "cwd": "/cwd-sentinel-42d1",
+        "raw_operand": "raw-operand-sentinel-116c",
+        "canonical_operand": "/canonical-operand-sentinel-2ac8",
+        "argv": "argv-sentinel-c826",
+        "recursive_child": "/recursive-child-sentinel-38ef",
+        "credential": "ghp_credential-sentinel-8156",
+        "refusal": "full-refusal-prose-sentinel-a091",
+    }
+
+
+def _assert_arm2_audit_summary(
+    fields: dict[str, Any],
+    audit: dict[str, str],
+) -> None:
+    assert frozenset(audit) == _ARM2_AUDIT_KEYS
+    assert {key: fields[key] for key in _ARM2_AUDIT_KEYS} == audit
+
+
+def _assert_arm2_values_withheld(value: Any, sentinels: dict[str, str]) -> None:
+    rendered = json.dumps(value)
+    for sentinel in sentinels.values():
+        assert sentinel not in rendered
+
+
+def test_arm2_tool_events_use_complete_fixed_summary_and_withhold_values(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from mimir.tools import budget_gate
+
+    sentinels = _arm2_audit_sentinels()
+    secret_blob = " ".join(sentinels.values())
+    audit = budget_gate._operator_shell_audit_summary(
+        _hard_operator_shell_preparation(secret_blob),
+    )
+    captured: list[tuple[str, dict[str, Any]]] = []
+    monkeypatch.setattr(
+        budget_gate,
+        "_emit_event_sync",
+        lambda kind, **fields: captured.append((kind, fields)),
+    )
+
+    _emit_tool_call_sync(
+        "shell_exec",
+        ok=False,
+        error=secret_blob,
+        denied=True,
+        arguments={
+            "command": secret_blob,
+            "cwd": sentinels["cwd"],
+            "path": sentinels["raw_operand"],
+        },
+        operator_shell_audit=audit,
+    )
+
+    assert [kind for kind, _fields in captured] == ["tool_call", "tool_error"]
+    assert audit is not None
+    for _kind, fields in captured:
+        _assert_arm2_audit_summary(fields, audit)
+        assert fields["error"] == "operator_shell_tool_error"
+        assert "arguments" not in fields
+        _assert_arm2_values_withheld(fields, sentinels)
+
+
+def test_non_arm2_tool_event_shape_is_unchanged(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from mimir.tools import budget_gate
+
+    captured: list[tuple[str, dict[str, Any]]] = []
+    monkeypatch.setattr(
+        budget_gate,
+        "_emit_event_sync",
+        lambda kind, **fields: captured.append((kind, fields)),
+    )
+
+    _emit_tool_call_sync(
+        "shell_exec",
+        ok=False,
+        error="ordinary error",
+        arguments={"command": "printf ordinary", "cwd": "/ordinary"},
+    )
+
+    assert captured[0][1]["arguments"] == {
+        "command": "printf ordinary",
+    }
+    assert captured[0][1]["error"] == "ordinary error"
+    assert captured[1][1]["arguments"] == {
+        "command": "printf ordinary",
+    }
+    assert captured[1][1]["error"] == "ordinary error"
+
+
+def test_arm2_hard_refusal_uses_null_target_and_fixed_values(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from mimir.tools import budget_gate
+
+    sentinels = _arm2_audit_sentinels()
+    secret_blob = " ".join(sentinels.values())
+    preparation = _hard_operator_shell_preparation(secret_blob)
+    audit = budget_gate._operator_shell_audit_summary(preparation)
+    assert audit is not None
+    captured: list[tuple[str, dict[str, Any]]] = []
+    monkeypatch.setattr(
+        budget_gate,
+        "_emit_event_sync",
+        lambda kind, **fields: captured.append((kind, fields)),
+    )
+
+    result = budget_gate._operator_shell_hard_refusal(
+        _make_request(
+            "shell_exec",
+            "hard-audit",
+            _untainted_ifc_auth(),
+            {"command": secret_blob, "cwd": sentinels["cwd"]},
+        ),
+        preparation,
+        _untainted_ifc_auth(),
+    )
+
+    assert result is not None and result.status == "error"
+    _assert_arm2_values_withheld(result.content, sentinels)
+    hard = next(fields for kind, fields in captured if kind == "hard_boundary_denied")
+    _assert_arm2_audit_summary(hard, audit)
+    assert hard["target"] is None
+    assert hard["boundary"] == "operator_shell_preparation"
+    assert hard["reason"] == "operator_shell_hard_refused"
+    for kind, fields in captured:
+        if kind in {"tool_call", "tool_error"}:
+            _assert_arm2_audit_summary(fields, audit)
+    _assert_arm2_values_withheld(captured, sentinels)
+
+
+def test_arm2_record_tool_outcome_uses_fixed_value_free_hard_boundary(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from mimir.tools import budget_gate
+
+    sentinels = _arm2_audit_sentinels()
+    preparation = _hard_operator_shell_preparation(" ".join(sentinels.values()))
+    audit = budget_gate._operator_shell_audit_summary(preparation)
+    assert audit is not None
+    captured: list[tuple[str, dict[str, Any]]] = []
+    monkeypatch.setattr(
+        budget_gate,
+        "_emit_event_sync",
+        lambda kind, **fields: captured.append((kind, fields)),
+    )
+
+    budget_gate._record_tool_outcome(
+        "shell_exec",
+        refused_reason=" ".join(sentinels.values()),
+        operator_shell_audit=audit,
+    )
+
+    assert [kind for kind, _fields in captured] == ["hard_boundary_denied"]
+    hard = captured[0][1]
+    _assert_arm2_audit_summary(hard, audit)
+    assert hard["target"] is None
+    assert hard["boundary"] == "operator_shell_policy"
+    assert hard["reason"] == "operator_shell_tool_refused"
+    _assert_arm2_values_withheld(hard, sentinels)
+
+
+def test_arm2_budget_denial_uses_fixed_value_free_hard_boundary(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from mimir.tools import budget_gate
+
+    sentinels = _arm2_audit_sentinels()
+    preparation = _hard_operator_shell_preparation(" ".join(sentinels.values()))
+    audit = budget_gate._operator_shell_audit_summary(preparation)
+    assert audit is not None
+    captured: list[tuple[str, dict[str, Any]]] = []
+    monkeypatch.setattr(
+        budget_gate,
+        "_emit_event_sync",
+        lambda kind, **fields: captured.append((kind, fields)),
+    )
+    ctx = _make_ctx(budget=1)
+    ctx.tool_call_count = 1
+
+    denial = _check_and_increment_or_deny(
+        "shell_exec",
+        ctx,
+        target=" ".join(sentinels.values()),
+        auth_context=ctx.auth_context,
+        operator_shell_audit=audit,
+    )
+
+    assert denial is not None
+    denied = next(fields for kind, fields in captured if kind == "tool_call_budget_denied")
+    _assert_arm2_audit_summary(denied, audit)
+    hard = next(fields for kind, fields in captured if kind == "hard_boundary_denied")
+    _assert_arm2_audit_summary(hard, audit)
+    assert hard["target"] is None
+    assert hard["boundary"] == "tool_call_budget"
+    assert hard["reason"] == "tool_call_budget_exhausted"
+    _assert_arm2_values_withheld(captured, sentinels)
+
+
+def test_arm2_prohibited_action_uses_fixed_value_free_audit_events(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from mimir.tools import budget_gate
+
+    sentinels = _arm2_audit_sentinels()
+    secret_blob = " ".join(sentinels.values())
+    preparation = _OperatorShellPreparation(
+        outcome=OperatorShellPreparationOutcome.SOFT_UNBOUND,
+        binding=None,
+        refusal=secret_blob,
+        binding_rule=ServiceShellBindingRule.PROFILE_ALLOWLIST,
+        command_family="profile_miss",
+    )
+    audit = budget_gate._operator_shell_audit_summary(preparation)
+    assert audit is not None
+    captured: list[tuple[str, dict[str, Any]]] = []
+    handler_calls = 0
+
+    def authorize(*_args: Any, **_kwargs: Any) -> tuple[ToolAuthorization, None]:
+        return ToolAuthorization(
+            tool_name="shell_exec",
+            decision=OperationDecision.ADMIN_REQUIRED,
+            allowed=True,
+        ), None
+
+    def handler(_request: ToolCallRequest) -> ToolMessage:
+        nonlocal handler_calls
+        handler_calls += 1
+        return ToolMessage(content="ran", tool_call_id="prohibited-audit")
+
+    monkeypatch.setattr(
+        budget_gate,
+        "_prepare_operator_shell_execution",
+        lambda *_args: preparation,
+    )
+    monkeypatch.setattr(budget_gate, "_authorize_tool_call", authorize)
+    monkeypatch.setattr(budget_gate, "_check_prohibited", lambda *_args: secret_blob)
+    monkeypatch.setattr(
+        budget_gate,
+        "_emit_event_sync",
+        lambda kind, **fields: captured.append((kind, fields)),
+    )
+
+    result = BudgetGateMiddleware().wrap_tool_call(
+        _make_request(
+            "shell_exec",
+            "prohibited-audit",
+            _untainted_ifc_auth(),
+            {"command": secret_blob, "cwd": sentinels["cwd"]},
+        ),
+        handler,
+    )
+
+    assert result.status == "error"
+    assert handler_calls == 0
+    blocked = next(fields for kind, fields in captured if kind == "prohibited_action_blocked")
+    _assert_arm2_audit_summary(blocked, audit)
+    assert blocked["reason"] == "prohibited_action"
+    hard = next(fields for kind, fields in captured if kind == "hard_boundary_denied")
+    _assert_arm2_audit_summary(hard, audit)
+    assert hard["target"] is None
+    assert hard["boundary"] == "prohibited_action_guard"
+    assert hard["reason"] == "prohibited_action"
+    for kind, fields in captured:
+        if kind in {"tool_call", "tool_error"}:
+            _assert_arm2_audit_summary(fields, audit)
+    _assert_arm2_values_withheld(captured, sentinels)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("middleware_path", ["sync", "async"])
+@pytest.mark.parametrize("enforcement_enabled", [False, True])
+async def test_pre_activation_hard_refusal_never_invokes_handler(
+    middleware_path: str,
+    enforcement_enabled: bool,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from dataclasses import replace
+
+    from mimir.tools import budget_gate
+
+    preparation = _hard_operator_shell_preparation("private refusal sentinel")
+    auth = replace(
+        _untainted_ifc_auth(),
+        enforcement_enabled=enforcement_enabled,
+    )
+    handler_calls = 0
+
+    def authorize(*_args: Any, **kwargs: Any) -> tuple[ToolAuthorization, None]:
+        assert kwargs["operator_shell_audit"] == {
+            "shell_profile": OPERATOR_SHELL_PROFILE,
+            "preparation_outcome": "hard_refused",
+            "command_family": "grep",
+            "binding_rule": ServiceShellBindingRule.OPERATOR_READ_OPERAND_POLICY.value,
+        }
+        return ToolAuthorization(
+            tool_name="shell_exec",
+            decision=OperationDecision.ADMIN_REQUIRED,
+            allowed=True,
+        ), None
+
+    monkeypatch.setattr(
+        budget_gate,
+        "_prepare_operator_shell_execution",
+        lambda *_args: preparation,
+    )
+    monkeypatch.setattr(budget_gate, "_authorize_tool_call", authorize)
+
+    def sync_handler(_request: ToolCallRequest) -> ToolMessage:
+        nonlocal handler_calls
+        handler_calls += 1
+        return ToolMessage(content="ran", tool_call_id="hard-stop")
+
+    async def async_handler(_request: ToolCallRequest) -> ToolMessage:
+        nonlocal handler_calls
+        handler_calls += 1
+        return ToolMessage(content="ran", tool_call_id="hard-stop")
+
+    request = _make_request(
+        "shell_exec",
+        "hard-stop",
+        auth,
+        {"command": "never-run-sentinel", "cwd": "/never-run"},
+    )
+    middleware = BudgetGateMiddleware()
+    if middleware_path == "sync":
+        result = middleware.wrap_tool_call(request, sync_handler)
+    else:
+        result = await middleware.awrap_tool_call(request, async_handler)
+
+    assert result.status == "error"
+    assert handler_calls == 0
+
+
 # ─── get_turn alias (unchanged from prior file) ───────────────────
 
 

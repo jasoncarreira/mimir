@@ -339,9 +339,23 @@ def _emit_hard_boundary_denied(
     )
 
 
-def _record_tool_outcome(tool_name: str, *, refused_reason: str = "") -> None:
+def _record_tool_outcome(
+    tool_name: str,
+    *,
+    refused_reason: str = "",
+    operator_shell_audit: Mapping[str, str] | None = None,
+) -> None:
     """Attach server-observed remediation evidence to the active turn."""
     if refused_reason:
+        if operator_shell_audit is not None:
+            _emit_hard_boundary_denied(
+                tool=tool_name,
+                boundary="operator_shell_policy",
+                reason="operator_shell_tool_refused",
+                target=None,
+                event_fields=dict(operator_shell_audit),
+            )
+            return
         _emit_hard_boundary_denied(
             tool=tool_name,
             boundary="tool_policy",
@@ -396,6 +410,7 @@ def _check_and_increment_or_deny(
     *,
     target: Any = None,
     auth_context: AuthContext | None = None,
+    operator_shell_audit: Mapping[str, str] | None = None,
 ) -> str | None:
     """Returns a denial message (str) if the call should be refused,
     or ``None`` if the call should proceed. Shared between the sync
@@ -418,14 +433,20 @@ def _check_and_increment_or_deny(
             count=count,
             budget=budget,
             turn_id=getattr(ctx, "turn_id", None),
+            **(operator_shell_audit or {}),
         )
         _emit_hard_boundary_denied(
             tool=tool_name,
             boundary="tool_call_budget",
             reason="tool_call_budget_exhausted",
-            target=target,
+            target=None if operator_shell_audit is not None else target,
             auth_context=auth_context,
             turn_context=ctx,
+            event_fields=(
+                dict(operator_shell_audit)
+                if operator_shell_audit is not None
+                else None
+            ),
         )
         return _budget_denied_message(tool_name, count, budget)
     new_count = count + 1
@@ -442,6 +463,7 @@ def _check_and_increment_or_deny(
             budget=budget,
             soft_threshold=soft,
             turn_id=getattr(ctx, "turn_id", None),
+            **(operator_shell_audit or {}),
         )
     return None
 
@@ -679,6 +701,9 @@ _OPERATOR_INVALID_COMMAND_REFUSAL = "operator shell command is invalid"
 _OPERATOR_PARSER_FAILURE_REFUSAL = "operator shell parser failed closed"
 _OPERATOR_CWD_FAILURE_REFUSAL = "operator shell cwd confinement failed"
 _OPERATOR_BINDING_FAILURE_REFUSAL = "operator shell binding failed closed"
+_OPERATOR_SHELL_HARD_REFUSAL = (
+    "shell_exec was refused before execution: operator shell preparation failed closed"
+)
 
 
 def _operator_shell_unbound(
@@ -693,6 +718,58 @@ def _operator_shell_unbound(
         refusal=refusal,
         binding_rule=binding_rule,
         command_family=command_family,
+    )
+
+
+def _operator_shell_audit_summary(
+    preparation: _OperatorShellPreparation | None,
+) -> dict[str, str] | None:
+    if preparation is None:
+        return None
+    return {
+        "shell_profile": OPERATOR_SHELL_PROFILE,
+        "preparation_outcome": preparation.outcome.value,
+        "command_family": preparation.command_family,
+        "binding_rule": (
+            preparation.binding_rule.value
+            if preparation.binding_rule is not None
+            else "exact_argv_binding"
+        ),
+    }
+
+
+def _operator_shell_hard_refusal(
+    request: ToolCallRequest,
+    preparation: _OperatorShellPreparation | None,
+    auth_context: AuthContext | None,
+) -> ToolMessage | None:
+    if (
+        preparation is None
+        or preparation.outcome is not OperatorShellPreparationOutcome.HARD_REFUSED
+    ):
+        return None
+    audit = _operator_shell_audit_summary(preparation)
+    assert audit is not None
+    _emit_hard_boundary_denied(
+        tool="shell_exec",
+        boundary="operator_shell_preparation",
+        reason="operator_shell_hard_refused",
+        target=None,
+        auth_context=auth_context,
+        event_fields=audit,
+    )
+    _emit_tool_call_sync(
+        "shell_exec",
+        ok=False,
+        error=_OPERATOR_SHELL_HARD_REFUSAL,
+        denied=True,
+        operator_shell_audit=audit,
+    )
+    return ToolMessage(
+        content=_OPERATOR_SHELL_HARD_REFUSAL,
+        tool_call_id=_tool_call_id(request),
+        name="shell_exec",
+        status="error",
     )
 
 
@@ -1571,6 +1648,7 @@ def _check_admin_authorized(
     operator_shell_binding: OperatorShellBinding | None = None,
     operator_shell_refusal: str | None = None,
     operator_shell_request_identity: Any = None,
+    operator_shell_audit: Mapping[str, str] | None = None,
     tool_call_id: str | None = None,
 ) -> str | None:
     _, denial = _authorize_tool_call(
@@ -1583,6 +1661,7 @@ def _check_admin_authorized(
         operator_shell_binding=operator_shell_binding,
         operator_shell_refusal=operator_shell_refusal,
         operator_shell_request_identity=operator_shell_request_identity,
+        operator_shell_audit=operator_shell_audit,
         tool_call_id=tool_call_id,
     )
     return denial
@@ -1599,6 +1678,7 @@ def _authorize_tool_call(
     operator_shell_binding: OperatorShellBinding | None = None,
     operator_shell_refusal: str | None = None,
     operator_shell_request_identity: Any = None,
+    operator_shell_audit: Mapping[str, str] | None = None,
     tool_call_id: str | None = None,
 ) -> tuple[ToolAuthorization, str | None]:
     """Return the exact authorization and any middleware denial text."""
@@ -1613,6 +1693,7 @@ def _authorize_tool_call(
             "operator_shell_binding": operator_shell_binding,
             "operator_shell_refusal": operator_shell_refusal,
             "operator_shell_request_identity": operator_shell_request_identity,
+            "operator_shell_audit": operator_shell_audit,
             "tool_call_id": tool_call_id,
         }
     auth = get_tool_registry().authorize_tool(
@@ -1699,9 +1780,14 @@ def _emit_tool_call_sync(
     error: str | None = None,
     denied: bool = False,
     arguments: dict[str, Any] | None = None,
+    operator_shell_audit: Mapping[str, str] | None = None,
 ) -> None:
     payload = {"tool": tool_name, "ok": ok}
-    argument_summary = _tool_event_arguments(arguments)
+    argument_summary = (
+        {} if operator_shell_audit is not None else _tool_event_arguments(arguments)
+    )
+    if operator_shell_audit is not None:
+        payload.update(operator_shell_audit)
     if argument_summary:
         payload["arguments"] = argument_summary
     if tool_name in _PULL_REQUEST_TOOLS and arguments is not None:
@@ -1710,19 +1796,29 @@ def _emit_tool_call_sync(
     if duration_ms is not None:
         payload["duration_ms"] = round(duration_ms, 3)
     if error:
-        payload["error"] = _bounded_tool_event_error(error)
+        payload["error"] = (
+            "operator_shell_tool_error"
+            if operator_shell_audit is not None
+            else _bounded_tool_event_error(error)
+        )
     if denied:
         payload["denied"] = True
     _emit_event_sync("tool_call", **payload)
     if not ok:
         error_payload = {"tool": tool_name}
+        if operator_shell_audit is not None:
+            error_payload.update(operator_shell_audit)
         if argument_summary:
             error_payload["arguments"] = argument_summary
         if tool_name in _PULL_REQUEST_TOOLS and arguments is not None:
             error_payload["repository"] = arguments.get("repository")
             error_payload["pull_request"] = arguments.get("pull_request")
         if error:
-            error_payload["error"] = _bounded_tool_event_error(error)
+            error_payload["error"] = (
+                "operator_shell_tool_error"
+                if operator_shell_audit is not None
+                else _bounded_tool_event_error(error)
+            )
         if denied:
             error_payload["denied"] = True
         # The companion ``tool_call(ok=false)`` event owns the dashboard's
@@ -1960,6 +2056,9 @@ class BudgetGateMiddleware(AgentMiddleware):
         operator_shell_preparation = _prepare_operator_shell_execution(
             request, tool_name, auth_context, ifc_labels,
         )
+        operator_shell_audit = _operator_shell_audit_summary(
+            operator_shell_preparation,
+        )
 
         authorization = None
         for target_channel in target_channels:
@@ -1979,6 +2078,7 @@ class BudgetGateMiddleware(AgentMiddleware):
                 operator_shell_request_identity=(
                     request if operator_shell_preparation is not None else None
                 ),
+                operator_shell_audit=operator_shell_audit,
                 tool_call_id=(
                     _tool_call_id(request)
                     if operator_shell_preparation is not None
@@ -1991,10 +2091,16 @@ class BudgetGateMiddleware(AgentMiddleware):
                 authorization = target_authorization
             if admin_denial is not None:
                 break
+        hard_refusal = _operator_shell_hard_refusal(
+            request, operator_shell_preparation, auth_context,
+        )
+        if hard_refusal is not None:
+            return hard_refusal
         if admin_denial is not None:
             _emit_tool_call_sync(
                 tool_name, ok=False, error=admin_denial, denied=True,
                 arguments=validated_arguments,
+                operator_shell_audit=operator_shell_audit,
             )
             return ToolMessage(
                 content=admin_denial,
@@ -2007,6 +2113,7 @@ class BudgetGateMiddleware(AgentMiddleware):
             _record_tool_outcome(tool_name, refused_reason=refusal)
             _emit_tool_call_sync(
                 tool_name, ok=False, error=refusal, denied=True, arguments=None,
+                operator_shell_audit=operator_shell_audit,
             )
             return ToolMessage(
                 content=refusal, tool_call_id=_tool_call_id(request),
@@ -2039,18 +2146,36 @@ class BudgetGateMiddleware(AgentMiddleware):
         # mistake, doesn't claim to stop a determined caller.
         prohibition = _check_prohibited(tool_name, request)
         if prohibition is not None:
-            _emit_event_sync("prohibited_action_blocked", tool=tool_name,
-                             reason=prohibition[:200])
+            _emit_event_sync(
+                "prohibited_action_blocked",
+                tool=tool_name,
+                reason=(
+                    "prohibited_action"
+                    if operator_shell_audit is not None
+                    else prohibition[:200]
+                ),
+                **(operator_shell_audit or {}),
+            )
             _emit_hard_boundary_denied(
                 tool=tool_name,
                 boundary="prohibited_action_guard",
                 reason="prohibited_action",
-                target=_extract_sink_target(request, auth_context),
+                target=(
+                    None
+                    if operator_shell_audit is not None
+                    else _extract_sink_target(request, auth_context)
+                ),
                 auth_context=auth_context,
+                event_fields=(
+                    dict(operator_shell_audit)
+                    if operator_shell_audit is not None
+                    else None
+                ),
             )
             _emit_tool_call_sync(
                 tool_name, ok=False, error=prohibition, denied=True,
                 arguments=validated_arguments,
+                operator_shell_audit=operator_shell_audit,
             )
             return ToolMessage(
                 content=prohibition,
@@ -2063,11 +2188,13 @@ class BudgetGateMiddleware(AgentMiddleware):
             tool_name,
             target=_extract_sink_target(request, auth_context),
             auth_context=auth_context,
+            operator_shell_audit=operator_shell_audit,
         )
         if denial is not None:
             _emit_tool_call_sync(
                 tool_name, ok=False, error=denial, denied=True,
                 arguments=validated_arguments,
+                operator_shell_audit=operator_shell_audit,
             )
             return ToolMessage(
                 content=denial,
@@ -2097,10 +2224,19 @@ class BudgetGateMiddleware(AgentMiddleware):
         # so the caller reads why instead of an unexplained exit 1.
         service_shell_refusal = _service_shell_refusal(execution_request)
         if service_shell_refusal is not None:
-            _record_tool_outcome(tool_name, refused_reason=service_shell_refusal)
+            _record_tool_outcome(
+                tool_name,
+                refused_reason=service_shell_refusal,
+                **(
+                    {"operator_shell_audit": operator_shell_audit}
+                    if operator_shell_audit is not None
+                    else {}
+                ),
+            )
             _emit_tool_call_sync(
                 tool_name, ok=False, error=service_shell_refusal, denied=True,
                 arguments=validated_arguments,
+                operator_shell_audit=operator_shell_audit,
             )
             return ToolMessage(
                 content=service_shell_refusal,
@@ -2185,7 +2321,15 @@ class BudgetGateMiddleware(AgentMiddleware):
                 execution_request, auth_context, failed=True,
             )
             if isinstance(exc, ToolPolicyRefusal):
-                _record_tool_outcome(tool_name, refused_reason=str(exc))
+                _record_tool_outcome(
+                    tool_name,
+                    refused_reason=str(exc),
+                    **(
+                        {"operator_shell_audit": operator_shell_audit}
+                        if operator_shell_audit is not None
+                        else {}
+                    ),
+                )
                 # A server-authored refusal adds no result provenance, but it
                 # still traverses the common label-accounting boundary.
                 _merge_result_labels(auth_context, None)
@@ -2206,6 +2350,7 @@ class BudgetGateMiddleware(AgentMiddleware):
                 error=str(exc),
                 denied=True,
                 arguments=validated_arguments,
+                operator_shell_audit=operator_shell_audit,
             )
             return _tool_refusal_message(request, tool_name, exc)
         except Exception as exc:
@@ -2232,6 +2377,7 @@ class BudgetGateMiddleware(AgentMiddleware):
                 duration_ms=(time.monotonic() - started) * 1000.0,
                 error=str(exc),
                 arguments=validated_arguments,
+                operator_shell_audit=operator_shell_audit,
             )
             raise
         finally:
@@ -2275,6 +2421,7 @@ class BudgetGateMiddleware(AgentMiddleware):
             duration_ms=duration_ms,
             error=_result_error_text(result) if is_error else None,
             arguments=validated_arguments,
+            operator_shell_audit=operator_shell_audit,
         )
         return result
 
@@ -2319,6 +2466,9 @@ class BudgetGateMiddleware(AgentMiddleware):
         operator_shell_preparation = _prepare_operator_shell_execution(
             request, tool_name, auth_context, ifc_labels,
         )
+        operator_shell_audit = _operator_shell_audit_summary(
+            operator_shell_preparation,
+        )
 
         authorization = None
         for target_channel in target_channels:
@@ -2338,6 +2488,7 @@ class BudgetGateMiddleware(AgentMiddleware):
                 operator_shell_request_identity=(
                     request if operator_shell_preparation is not None else None
                 ),
+                operator_shell_audit=operator_shell_audit,
                 tool_call_id=(
                     _tool_call_id(request)
                     if operator_shell_preparation is not None
@@ -2350,10 +2501,16 @@ class BudgetGateMiddleware(AgentMiddleware):
                 authorization = target_authorization
             if admin_denial is not None:
                 break
+        hard_refusal = _operator_shell_hard_refusal(
+            request, operator_shell_preparation, auth_context,
+        )
+        if hard_refusal is not None:
+            return hard_refusal
         if admin_denial is not None:
             _emit_tool_call_sync(
                 tool_name, ok=False, error=admin_denial, denied=True,
                 arguments=validated_arguments,
+                operator_shell_audit=operator_shell_audit,
             )
             return ToolMessage(
                 content=admin_denial,
@@ -2366,6 +2523,7 @@ class BudgetGateMiddleware(AgentMiddleware):
             _record_tool_outcome(tool_name, refused_reason=refusal)
             _emit_tool_call_sync(
                 tool_name, ok=False, error=refusal, denied=True, arguments=None,
+                operator_shell_audit=operator_shell_audit,
             )
             return ToolMessage(
                 content=refusal, tool_call_id=_tool_call_id(request),
@@ -2398,18 +2556,36 @@ class BudgetGateMiddleware(AgentMiddleware):
         # mistake, doesn't claim to stop a determined caller.
         prohibition = _check_prohibited(tool_name, request)
         if prohibition is not None:
-            _emit_event_sync("prohibited_action_blocked", tool=tool_name,
-                             reason=prohibition[:200])
+            _emit_event_sync(
+                "prohibited_action_blocked",
+                tool=tool_name,
+                reason=(
+                    "prohibited_action"
+                    if operator_shell_audit is not None
+                    else prohibition[:200]
+                ),
+                **(operator_shell_audit or {}),
+            )
             _emit_hard_boundary_denied(
                 tool=tool_name,
                 boundary="prohibited_action_guard",
                 reason="prohibited_action",
-                target=_extract_sink_target(request, auth_context),
+                target=(
+                    None
+                    if operator_shell_audit is not None
+                    else _extract_sink_target(request, auth_context)
+                ),
                 auth_context=auth_context,
+                event_fields=(
+                    dict(operator_shell_audit)
+                    if operator_shell_audit is not None
+                    else None
+                ),
             )
             _emit_tool_call_sync(
                 tool_name, ok=False, error=prohibition, denied=True,
                 arguments=validated_arguments,
+                operator_shell_audit=operator_shell_audit,
             )
             return ToolMessage(
                 content=prohibition,
@@ -2422,11 +2598,13 @@ class BudgetGateMiddleware(AgentMiddleware):
             tool_name,
             target=_extract_sink_target(request, auth_context),
             auth_context=auth_context,
+            operator_shell_audit=operator_shell_audit,
         )
         if denial is not None:
             _emit_tool_call_sync(
                 tool_name, ok=False, error=denial, denied=True,
                 arguments=validated_arguments,
+                operator_shell_audit=operator_shell_audit,
             )
             return ToolMessage(
                 content=denial,
@@ -2456,10 +2634,19 @@ class BudgetGateMiddleware(AgentMiddleware):
         # so the caller reads why instead of an unexplained exit 1.
         service_shell_refusal = _service_shell_refusal(execution_request)
         if service_shell_refusal is not None:
-            _record_tool_outcome(tool_name, refused_reason=service_shell_refusal)
+            _record_tool_outcome(
+                tool_name,
+                refused_reason=service_shell_refusal,
+                **(
+                    {"operator_shell_audit": operator_shell_audit}
+                    if operator_shell_audit is not None
+                    else {}
+                ),
+            )
             _emit_tool_call_sync(
                 tool_name, ok=False, error=service_shell_refusal, denied=True,
                 arguments=validated_arguments,
+                operator_shell_audit=operator_shell_audit,
             )
             return ToolMessage(
                 content=service_shell_refusal,
@@ -2548,7 +2735,15 @@ class BudgetGateMiddleware(AgentMiddleware):
                 execution_request, auth_context, failed=True,
             )
             if isinstance(exc, ToolPolicyRefusal):
-                _record_tool_outcome(tool_name, refused_reason=str(exc))
+                _record_tool_outcome(
+                    tool_name,
+                    refused_reason=str(exc),
+                    **(
+                        {"operator_shell_audit": operator_shell_audit}
+                        if operator_shell_audit is not None
+                        else {}
+                    ),
+                )
                 # A server-authored refusal adds no result provenance, but it
                 # still traverses the common label-accounting boundary.
                 _merge_result_labels(auth_context, None)
@@ -2569,6 +2764,7 @@ class BudgetGateMiddleware(AgentMiddleware):
                 error=str(exc),
                 denied=True,
                 arguments=validated_arguments,
+                operator_shell_audit=operator_shell_audit,
             )
             return _tool_refusal_message(request, tool_name, exc)
         except Exception as exc:
@@ -2595,6 +2791,7 @@ class BudgetGateMiddleware(AgentMiddleware):
                 duration_ms=(time.monotonic() - started) * 1000.0,
                 error=str(exc),
                 arguments=validated_arguments,
+                operator_shell_audit=operator_shell_audit,
             )
             raise
         finally:
@@ -2638,5 +2835,6 @@ class BudgetGateMiddleware(AgentMiddleware):
             duration_ms=duration_ms,
             error=_result_error_text(result) if is_error else None,
             arguments=validated_arguments,
+            operator_shell_audit=operator_shell_audit,
         )
         return result
