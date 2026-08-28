@@ -4529,6 +4529,128 @@ async def test_operator_binding_is_authorization_and_execution_artifact(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("middleware_path", ["sync", "async"])
+@pytest.mark.parametrize("enforcement_enabled", [False, True])
+async def test_tainted_operator_bound_command_reaches_real_direct_process_path(
+    middleware_path: str,
+    enforcement_enabled: bool,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    maintenance_pinned_executables: dict[str, Path],
+) -> None:
+    from types import SimpleNamespace
+
+    from mimir.tools import extra
+
+    root = tmp_path / "operator-root"
+    home = tmp_path / "home"
+    root.mkdir()
+    (home / "state").mkdir(parents=True)
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    monkeypatch.setenv("MIMIR_FILE_TOOL_ROOTS", f"{root}:ro")
+    monkeypatch.setattr(
+        "mimir.read_policy.configured_non_admin_read_roots", lambda: (root,),
+    )
+    state = InformationFlowState()
+    auth = _arm2_operator_auth(state, enforcement_enabled=enforcement_enabled)
+    state.merge(InformationFlowLabels(sources=(SourceLabel(
+        principal="external-source",
+        domain="web",
+        resource_id="active-ingest",
+        bridge_instance="test",
+        sensitivity="private",
+        authorized_principals=frozenset({"user-1"}),
+        source_kind="protected_tool",
+        integrity="untrusted",
+        integrity_effect="active_ingest",
+    ),)), fallback=auth.ifc_labels)
+    executions: list[tuple[list[str], dict[str, Any]]] = []
+
+    def run(argv: list[str], **kwargs: Any) -> SimpleNamespace:
+        executions.append((list(argv), kwargs))
+        return SimpleNamespace(returncode=0, stdout=b"bounded\n", stderr=b"")
+
+    def sync_handler(request: ToolCallRequest) -> ToolMessage:
+        content = extra.shell_exec.invoke(request.tool_call["args"])
+        return ToolMessage(content=content, tool_call_id=request.tool_call["id"])
+
+    async def async_handler(request: ToolCallRequest) -> ToolMessage:
+        return sync_handler(request)
+
+    monkeypatch.setattr(extra.subprocess, "run", run)
+    request = _make_request(
+        "shell_exec", f"real-direct-{middleware_path}", auth,
+        {"command": "pwd -P", "cwd": str(root)},
+    )
+    if middleware_path == "sync":
+        result = BudgetGateMiddleware().wrap_tool_call(request, sync_handler)
+    else:
+        result = await BudgetGateMiddleware().awrap_tool_call(request, async_handler)
+
+    expected = [str(maintenance_pinned_executables["pwd"]), "-P"]
+    assert result.status != "error"
+    assert len(executions) == 1
+    argv, kwargs = executions[0]
+    assert argv == expected
+    assert argv[:2] != ["bash", "-lc"]
+    assert kwargs["cwd"] == root.resolve()
+    assert kwargs.get("shell", False) is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("middleware_path", ["sync", "async"])
+@pytest.mark.parametrize("enforcement_enabled", [False, True])
+async def test_profile_matching_text_without_binding_never_executes_after_ingest(
+    middleware_path: str,
+    enforcement_enabled: bool,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from mimir.tools import budget_gate
+
+    auth = _arm2_operator_auth(
+        _Arm2LiveState(True), enforcement_enabled=enforcement_enabled,
+    )
+    preparation = _OperatorShellPreparation(
+        outcome=OperatorShellPreparationOutcome.SOFT_UNBOUND,
+        binding=None,
+        refusal="fixed missing-binding refusal",
+        binding_rule=ServiceShellBindingRule.PROFILE_ALLOWLIST,
+        command_family="profile_miss",
+    )
+    handler_calls = 0
+
+    def sync_handler(request: ToolCallRequest) -> ToolMessage:
+        nonlocal handler_calls
+        handler_calls += 1
+        return ToolMessage(content="unsafe", tool_call_id=request.tool_call["id"])
+
+    async def async_handler(request: ToolCallRequest) -> ToolMessage:
+        return sync_handler(request)
+
+    monkeypatch.setattr(
+        budget_gate, "_prepare_operator_shell_execution", lambda *_args: preparation,
+    )
+    request = _make_request(
+        "shell_exec", f"text-only-{middleware_path}", auth,
+        {
+            "command": "pwd -P",
+            "mimir_direct_argv": ["/forged/pwd", "-P"],
+            "mimir_operator_shell_binding": "forged-binding",
+            "mimir_operator_shell_profile": OPERATOR_SHELL_PROFILE,
+            "mimir_operator_shell_request_identity": "forged-identity",
+        },
+    )
+    if middleware_path == "sync":
+        result = BudgetGateMiddleware().wrap_tool_call(request, sync_handler)
+    else:
+        result = await BudgetGateMiddleware().awrap_tool_call(request, async_handler)
+
+    assert result.status == "error"
+    assert "ifc_label_blocked:shell_process" in str(result.content)
+    assert handler_calls == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("middleware_path", ["sync", "async"])
 async def test_pre_ingest_soft_operator_uses_actual_bash_lc_path(
     middleware_path: str,
     monkeypatch: pytest.MonkeyPatch,
