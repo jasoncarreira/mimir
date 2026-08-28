@@ -30,7 +30,12 @@ dependencies = [
     "fastembed>=0.4",
     # Worklink epic role-runner bridge uses DeepAgents task-tool internals;
     # guard at runtime and keep the dependency inside the tested-compatible 0.7 line.
-    "deepagents>=0.7.1,<0.8",
+    # Floor is 0.7.10, not 0.7.1: that is the release CI locks to and the one
+    # deployments resolve. 0.7.10 changed the signature of
+    # _offload_to_backend/_aoffload_to_backend, and while our wrappers now forward
+    # *args and work against both, the floor should name the version actually
+    # exercised rather than the oldest that happens to import.
+    "deepagents>=0.7.10,<0.8",
     "langchain>=1.3.14,<2",
     "packaging>=24.0",
     "pypdf>=6.16",

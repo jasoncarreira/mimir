@@ -40,7 +40,11 @@ def _middleware(
 ) -> SummarizationMiddleware:
     offload_patch.install_offload_traceback_logging_patch()
     middleware = object.__new__(SummarizationMiddleware)
-    middleware._get_history_path = MethodType(lambda _self: path, middleware)
+    # deepagents 0.7.10 passes session_id to _get_history_path; the stub ignores it
+    # and keeps returning the fixture path.
+    middleware._get_history_path = MethodType(
+        lambda _self, _session_id=None: path, middleware
+    )
     middleware._history_path_prefix = str(Path(path).parent)
     middleware._media_prefix = media_prefix
     return middleware
@@ -78,11 +82,11 @@ def test_sync_history_offload_creates_and_appends_raw_xml(tmp_path: Path) -> Non
 
     first = middleware._offload_to_backend(
         backend,
-        [HumanMessage(content="first <tag>"), previous_summary],
+        [HumanMessage(content="first <tag>"), previous_summary], "session-offload",
     )
     second = middleware._offload_to_backend(
         backend,
-        [AIMessage(content="second")],
+        [AIMessage(content="second")], "session-offload",
     )
 
     assert first == second == _HISTORY_PATH
@@ -102,11 +106,11 @@ async def test_async_history_offload_creates_and_appends_raw_xml(
 
     first = await middleware._aoffload_to_backend(
         backend,
-        [HumanMessage(content="first"), previous_summary],
+        [HumanMessage(content="first"), previous_summary], "session-offload",
     )
     second = await middleware._aoffload_to_backend(
         backend,
-        [AIMessage(content="second")],
+        [AIMessage(content="second")], "session-offload",
     )
 
     assert first == second == _HISTORY_PATH
@@ -145,8 +149,8 @@ def test_production_backend_offloads_and_preserves_read_boundary(
 
     token = set_current_turn(SimpleNamespace(turn_id="offload", auth_context=auth))
     try:
-        first = middleware._offload_to_backend(backend, [HumanMessage(content="first")])
-        second = middleware._offload_to_backend(backend, [HumanMessage(content="second")])
+        first = middleware._offload_to_backend(backend, [HumanMessage(content="first")], "session-offload")
+        second = middleware._offload_to_backend(backend, [HumanMessage(content="second")], "session-offload")
         direct_read = backend.read(_HISTORY_PATH)
     finally:
         reset_current_turn(token)
@@ -270,7 +274,7 @@ def test_sync_backend_exceptions_log_traceback_and_remain_nonfatal(
             expected_path = f"/conversation_history/media/{_MEDIA_HASH}.png"
         else:
             result = middleware._offload_to_backend(
-                backend, [HumanMessage(content="history")]
+                backend, [HumanMessage(content="history")], "session-offload"
             )
             expected_path = _HISTORY_PATH
 
@@ -353,7 +357,7 @@ async def test_async_backend_exceptions_log_traceback_and_remain_nonfatal(
             expected_path = f"/conversation_history/media/{_MEDIA_HASH}.png"
         else:
             result = await middleware._aoffload_to_backend(
-                backend, [HumanMessage(content="history")]
+                backend, [HumanMessage(content="history")], "session-offload"
             )
             expected_path = _HISTORY_PATH
 
@@ -487,6 +491,20 @@ def test_offload_wrappers_forward_upstream_signature_changes(is_async: bool) -> 
     # upstream added.
     assert seen["args"] == (["m"], "session-1")
     assert seen["kwargs"] == {}
+
+    # And by keyword, not only positionally. Review of #1791 caught that asserting
+    # an empty kwargs dict does not exercise ``**kwargs`` forwarding at all: a
+    # wrapper narrowed to ``*args`` alone still passes every assertion above, and
+    # then raises the moment upstream passes anything by keyword.
+    seen.clear()
+    if is_async:
+        assert asyncio.run(
+            wrapped(None, "raw-backend", ["m"], session_id="session-kw")
+        ) == "ok"
+    else:
+        assert wrapped(None, "raw-backend", ["m"], session_id="session-kw") == "ok"
+    assert seen["args"] == (["m"],)
+    assert seen["kwargs"] == {"session_id": "session-kw"}
     # ``backend`` itself is the one argument the wrapper is allowed to replace.
     assert seen["backend"] != "raw-backend"
 
