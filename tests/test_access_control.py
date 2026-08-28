@@ -9770,6 +9770,229 @@ def test_operator_binding_issuance_rejects_malformed_metadata(
     assert access_control._issue_operator_shell_binding(**values) is None
 
 
+def _operator_chainlink_binding(
+    command: str,
+    *,
+    request: object,
+    auth: AuthContext,
+    root: Path,
+) -> access_control.OperatorShellBinding:
+    parsed = parse_service_shell_argv(
+        command, access_control.OPERATOR_SHELL_PROFILE, allow_project_test=False,
+    )
+    assert parsed is not None
+    artifact = access_control._validated_operator_shell_argv_artifact(
+        parsed, parsed, resolved_cwd=root,
+    )
+    assert artifact is not None
+    binding = access_control._issue_operator_shell_binding(
+        request_identity=request,
+        auth_context_identity=auth,
+        tool_call_id="call-arm2",
+        command=command,
+        requested_cwd=str(root),
+        resolved_cwd=str(root),
+        argv_artifact=artifact,
+    )
+    assert binding is not None
+    return binding
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        "issuer", "profile", "request", "auth", "tool", "call_id", "command",
+        "cwd", "argv", "reuse",
+    ],
+)
+def test_operator_binding_requires_every_exact_current_field(
+    field: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    maintenance_pinned_executables: dict[str, Path],
+) -> None:
+    _home, root, _outside = _operator_confinement_tree(tmp_path, monkeypatch)
+    request = object()
+    auth = _tainted_admin_operator_write_auth()
+    command = "chainlink issue show 1337 --json"
+    binding = _operator_chainlink_binding(
+        command, request=request, auth=auth, root=root,
+    )
+    values: dict[str, object] = {
+        "binding": binding,
+        "request_identity": request,
+        "auth_context_identity": auth,
+        "tool_name": "shell_exec",
+        "tool_call_id": "call-arm2",
+        "command": command,
+        "requested_cwd": str(root),
+        "final_argv": binding.argv,
+    }
+    if field == "issuer":
+        values["binding"] = replace(binding, _issuer=object())
+    elif field == "profile":
+        values["binding"] = replace(binding, profile="maintenance")
+    elif field in {"request", "reuse"}:
+        values["request_identity"] = object()
+    elif field == "auth":
+        values["auth_context_identity"] = replace(auth)
+    elif field == "tool":
+        values["tool_name"] = "bash_async"
+    elif field == "call_id":
+        values["tool_call_id"] = "other-call"
+    elif field == "command":
+        values["command"] = "chainlink issue show 1338 --json"
+    elif field == "cwd":
+        values["requested_cwd"] = str(root.parent)
+    else:
+        values["final_argv"] = (*binding.argv, "--quiet")
+
+    assert access_control._operator_shell_binding_matches(**values) is False
+
+
+def test_operator_binding_genuine_match_and_sink_is_shell_only(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    maintenance_pinned_executables: dict[str, Path],
+) -> None:
+    _home, root, _outside = _operator_confinement_tree(tmp_path, monkeypatch)
+    request = object()
+    auth = _tainted_admin_operator_write_auth()
+    command = "chainlink issue show 1337 --json"
+    binding = _operator_chainlink_binding(
+        command, request=request, auth=auth, root=root,
+    )
+    common = {
+        "operator_shell_binding": binding,
+        "operator_shell_request_identity": request,
+        "tool_call_id": "call-arm2",
+    }
+
+    assert access_control._operator_shell_binding_matches(
+        binding,
+        request_identity=request,
+        auth_context_identity=auth,
+        tool_name="shell_exec",
+        tool_call_id="call-arm2",
+        command=command,
+        requested_cwd=str(root),
+        final_argv=binding.argv,
+    ) is True
+    shell = SinkGate.check_sink_flow(
+        "shell_exec", command, auth.ifc_labels, auth, enforce=True,
+        requested_cwd=str(root), **common,
+    )
+    file = SinkGate.check_sink_flow(
+        "write_file", str(root / "out.txt"), auth.ifc_labels, auth, enforce=True,
+        requested_cwd=str(root), **common,
+    )
+
+    assert shell.allowed is True
+    assert shell.reason == "ifc_allowed"
+    assert file.allowed is False
+    assert file.reason == "ifc_label_blocked:file"
+
+
+@pytest.mark.parametrize(
+    ("command", "allowed", "reason"),
+    [
+        ("chainlink issue show 1337 --json", True, None),
+        (
+            "chainlink issue close 1337",
+            False,
+            "chainlink_mutation_blocked_by_untrusted_ingest",
+        ),
+    ],
+)
+def test_tainted_operator_bound_chainlink_query_and_mutation(
+    command: str,
+    allowed: bool,
+    reason: str | None,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    maintenance_pinned_executables: dict[str, Path],
+) -> None:
+    _home, root, _outside = _operator_confinement_tree(tmp_path, monkeypatch)
+    request = object()
+    auth = _tainted_admin_operator_write_auth()
+    binding = _operator_chainlink_binding(
+        command, request=request, auth=auth, root=root,
+    )
+
+    decision = ToolRegistry().authorize_tool(
+        "shell_exec",
+        auth,
+        enforce=True,
+        target_channel=command,
+        ifc_labels=auth.ifc_labels,
+        arguments={"cwd": str(root)},
+        operator_shell_binding=binding,
+        operator_shell_request_identity=request,
+        tool_call_id="call-arm2",
+    )
+
+    assert decision.allowed is allowed
+    assert decision.reason == reason
+    if not allowed:
+        assert decision.refusal_detail == access_control._CHAINLINK_TAINT_REFUSAL
+
+
+def test_operator_bash_async_authority_is_unchanged() -> None:
+    auth = _tainted_admin_operator_write_auth()
+
+    decision = ToolRegistry().authorize_tool(
+        "bash_async", auth, enforce=True, target_channel="pwd",
+        ifc_labels=auth.ifc_labels,
+    )
+
+    assert decision.allowed is False
+    assert decision.reason == "ifc_label_blocked:shell_process"
+
+
+@pytest.mark.asyncio
+async def test_arm2_shadow_event_uses_fixed_value_free_shell_summary() -> None:
+    registry = ToolRegistry()
+    registry.enable_shadow_logging()
+    captured: list[tuple[str, dict[str, object]]] = []
+    secret = "ghp_" + "z" * 36
+
+    async def capture(kind: str, **fields: object) -> None:
+        captured.append((kind, fields))
+
+    authorization = access_control.ToolAuthorization(
+        tool_name="shell_exec",
+        decision=OperationDecision.ADMIN_REQUIRED,
+        allowed=True,
+        reason="ifc_label_blocked:shell_process",
+        is_shadow_decision=True,
+        would_block=True,
+    )
+    audit = {
+        "shell_profile": access_control.OPERATOR_SHELL_PROFILE,
+        "preparation_outcome": "soft_unbound",
+        "command_family": "reader",
+        "binding_rule": ServiceShellBindingRule.OPERATOR_LIVE_TAINT.value,
+    }
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        monkeypatch.setattr("mimir.event_logger.log_event", capture)
+        registry._emit_shadow_decision(
+            authorization,
+            target=f"grep {secret} /private/operand",
+            requested_target=f"cwd=/private/cwd command={secret}",
+            operator_shell_audit=audit,
+        )
+        await asyncio.sleep(0)
+
+    assert len(captured) == 1
+    fields = captured[0][1]
+    assert fields["target"] == "shell_process"
+    assert fields["requested_target"] is None
+    assert all(fields[key] == value for key, value in audit.items())
+    rendered = json.dumps(fields)
+    for value in (secret, "/private/operand", "/private/cwd", "grep"):
+        assert value not in rendered
+
+
 def test_no_project_test_configuration_preserves_existing_refusal(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
