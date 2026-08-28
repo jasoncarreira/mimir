@@ -174,6 +174,8 @@ class WorklinkRunResult:
     branch: str | None = None
     dry_run: bool = False
     reason: str | None = None
+    preserved_ref: str | None = None
+    preservation_error: str | None = None
 
 
 @dataclass
@@ -1918,18 +1920,29 @@ class WorklinkRunner:
                 started_at=datetime.now(UTC),
             )
         except Exception as exc:
+            original_reason = str(exc)
             try:
                 records = load_factory_records_for_issue(self.home, issue_id)
                 current = records[0] if records else None
             except Exception:
                 current = None
+            preserved_ref, preservation_error = _preserve_failed_factory_run(
+                home=self.home,
+                trusted_repo=self.repo,
+                record=current,
+            )
+            reason = original_reason
+            if preserved_ref is not None:
+                reason += f"; completed work preserved at {preserved_ref}"
+            elif preservation_error is not None:
+                reason += f"; completed work preservation failed: {preservation_error}"
             if current is not None:
                 save_factory_record(
                     self.home,
                     replace(
                         current,
                         controller_phase="failed",
-                        controller_error=_factory_controller_error(exc),
+                        controller_error=_factory_controller_error(reason),
                     ),
                 )
             claims.transition_issue(
@@ -1937,7 +1950,7 @@ class WorklinkRunner:
                 status="failed",
                 review_ready=False,
                 attempt=claim_record.budget_attempt or claim_record.attempt,
-                reason=str(exc),
+                reason=reason,
             )
             _log_event(
                 "worklink_transition",
@@ -1946,7 +1959,15 @@ class WorklinkRunner:
                 status="failed",
                 review_ready=False,
                 pr_url=None,
-                reason=str(exc),
+                reason=reason,
+                **(
+                    {
+                        "preserved_ref": preserved_ref,
+                        "preservation_error": preservation_error,
+                    }
+                    if preserved_ref is not None or preservation_error is not None
+                    else {}
+                ),
             )
             return WorklinkRunResult(
                 issue_id,
@@ -1954,7 +1975,9 @@ class WorklinkRunner:
                 "failed",
                 checkout=Path(current.sandbox) if current is not None else None,
                 branch=current.branch if current is not None else None,
-                reason=str(exc),
+                reason=reason,
+                preserved_ref=preserved_ref,
+                preservation_error=preservation_error,
             )
         finally:
             _release_issue_and_clear_run_state(
@@ -2444,7 +2467,7 @@ async def _finish_factory_wait_task(
         return None
 
 
-def _factory_controller_error(error: BaseException) -> str:
+def _factory_controller_error(error: BaseException | str) -> str:
     encoded = redact_text(str(error)).encode("utf-8")
     if len(encoded) <= _FACTORY_CONTROLLER_ERROR_MAX_BYTES:
         return encoded.decode("utf-8")
@@ -2453,6 +2476,45 @@ def _factory_controller_error(error: BaseException) -> str:
         "utf-8", errors="ignore"
     )
     return prefix.rstrip() + marker.decode("ascii")
+
+
+def _preserve_failed_factory_run(
+    *,
+    home: Path,
+    trusted_repo: Path,
+    record: FactoryRunRecord | None,
+) -> tuple[str | None, str | None]:
+    """Best-effort publication for post-merge failures before terminal release."""
+    if (
+        record is None
+        or record.status is None
+        or record.status.pr_url is not None
+        or record.status.slices is None
+        or not any(":merged(" in item for item in record.status.slices)
+    ):
+        return None, None
+    try:
+        checkout_fd = os.open(
+            Path(record.sandbox),
+            os.O_RDONLY
+            | os.O_DIRECTORY
+            | os.O_CLOEXEC
+            | getattr(os, "O_NOFOLLOW", 0),
+        )
+        try:
+            publication = ControllerGitPublication.capture(
+                checkout_fd,
+                trusted_repo,
+                record.branch,
+                home / "state" / "worklink" / "publication",
+            )
+        finally:
+            os.close(checkout_fd)
+        with publication:
+            publication.push(check=True)
+        return f"origin/{record.branch}", None
+    except Exception as exc:  # noqa: BLE001 - preservation must not replace the refusal
+        return None, _factory_controller_error(exc)
 
 
 async def _cancel_and_cleanup_factory_handle(compute: Any, handle: LaunchHandle) -> None:
@@ -3100,6 +3162,8 @@ def run_worklink(
             error=result.reason or "Worklink run failed",
             exit_status=1,
             autonomous=autonomous,
+            preserved_ref=result.preserved_ref,
+            preservation_error=result.preservation_error,
         )
     elif result.status == "completed":
         _record_run_success(home, issue_id)
@@ -3116,6 +3180,8 @@ def _record_run_failure(
     error: BaseException | str,
     exit_status: int,
     autonomous: bool,
+    preserved_ref: str | None = None,
+    preservation_error: str | None = None,
 ) -> None:
     from .dispatch_failures import dispatch_failure_state_dir, record_failure, terminal_error
 
@@ -3127,6 +3193,8 @@ def _record_run_failure(
         attempt_consumed=attempt is not None,
         exit_status=exit_status,
         terminal_error=safe_error,
+        preserved_ref=preserved_ref,
+        preservation_error=preservation_error,
     )
     if autonomous:
         try:
@@ -3137,6 +3205,8 @@ def _record_run_failure(
                 exit_status=exit_status,
                 error=error,
                 log_path=os.environ.get("WORKLINK_RUN_LOG"),
+                preserved_ref=preserved_ref,
+                preservation_error=preservation_error,
             )
         except OSError:
             pass
@@ -3197,6 +3267,8 @@ def run_worklink_epic(
             error=result.reason or "Worklink epic run failed",
             exit_status=1,
             autonomous=autonomous,
+            preserved_ref=result.preserved_ref,
+            preservation_error=result.preservation_error,
         )
     elif result.status in {"completed", "review_ready"}:
         _record_run_success(home, issue_id)
