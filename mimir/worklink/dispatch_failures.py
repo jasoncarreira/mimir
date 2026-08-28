@@ -100,6 +100,8 @@ def record_failure(
     exit_status: int,
     error: BaseException | str,
     log_path: str | None,
+    preserved_ref: str | None = None,
+    preservation_error: str | None = None,
     now: datetime | None = None,
 ) -> dict[str, Any]:
     now = now or datetime.now(UTC)
@@ -119,6 +121,8 @@ def record_failure(
             "failed_at": now.isoformat(),
             "retry_after": None,
             "log_path": redact_text(log_path or ""),
+            "preserved_ref": redact_text(preserved_ref or "")[:1000] or None,
+            "preservation_error": redact_text(preservation_error or "")[:1000] or None,
             "notified_signatures": [],
         }
     with failure_state_transaction(state_dir) as state:
@@ -147,6 +151,8 @@ def record_failure(
             "failed_at": now.isoformat(),
             "retry_after": (now + timedelta(minutes=delay)).isoformat(),
             "log_path": redact_text(log_path or ""),
+            "preserved_ref": redact_text(preserved_ref or "")[:1000] or None,
+            "preservation_error": redact_text(preservation_error or "")[:1000] or None,
             "notified_signatures": list(prior.get("notified_signatures") or [])[
                 -MAX_NOTIFIED_SIGNATURES:
             ],
@@ -188,10 +194,13 @@ def pending_failure_alerts(
                     "error_signature": signature,
                     "failure_occurrence_id": entry.get("occurrence_id"),
                     "log": entry.get("log_path"),
+                    "preserved_ref": entry.get("preserved_ref"),
+                    "preservation_error": entry.get("preservation_error"),
                     "retry_after": entry.get("retry_after"),
                     "routing_instructions": (
                         "Notify the operator that a detached Worklink run failed. "
-                        "Include the run-log path and terminal error."
+                        "Include the run-log path, terminal error, and any preserved "
+                        "ref or preservation error."
                     ),
                 })
     return backed_off, alerts

@@ -31,7 +31,12 @@ from mimir.worklink.claims import ChainlinkClaims, ClaimRecord, ClaimResult, cla
 from mimir.worklink.compute import LaunchHandle, WorkSpec
 from mimir.worklink.checkout import CheckoutLease
 from mimir.worklink.backends.feature_factory import FeatureFactoryBackend, parse_factory_status
-from mimir.worklink.factory_state import FactoryRunRecord, load_factory_record, save_factory_record
+from mimir.worklink.factory_state import (
+    FactoryRunRecord,
+    archive_factory_record,
+    load_factory_record,
+    save_factory_record,
+)
 from mimir.worklink.run_state import load_run_state
 from mimir.worklink.orchestrator import (
     IssueContext,
@@ -681,7 +686,11 @@ def test_postclaim_failure_emits_same_failure_event(
 
     async def failed_after_claim(self: WorklinkRunner, issue_id: int, **_: object):
         return orchestrator.WorklinkRunResult(
-            issue_id, 2, "failed", reason="backend exploded api_key=super-secret"
+            issue_id,
+            2,
+            "failed",
+            reason="backend exploded api_key=super-secret",
+            preserved_ref="origin/feature/chainlink-441",
         )
 
     monkeypatch.setattr(WorklinkRunner, "run", failed_after_claim)
@@ -697,6 +706,11 @@ def test_postclaim_failure_emits_same_failure_event(
     entry = load_failure_state(state_dir)["issues"]["441"]
     assert entry["attempt"] == 2
     assert entry["terminal_error"] == "backend exploded api_key=[REDACTED]"
+    assert entry["preserved_ref"] == "origin/feature/chainlink-441"
+    from mimir.worklink.dispatch_failures import pending_failure_alerts
+
+    _, alerts = pending_failure_alerts(state_dir)
+    assert alerts[0]["preserved_ref"] == "origin/feature/chainlink-441"
     assert not ambient_state_dir.exists()
     _reset_logger_for_tests()
 
@@ -3700,6 +3714,42 @@ def _run_factory_preflight_case(
     monkeypatch.setattr(orchestrator.LocalSubprocessComputeBackend, "launch", launch)
     if outcome is not None:
         async def supervise(*args: object, **kwargs: object) -> object:
+            if outcome == "post_merge_refusal":
+                current = kwargs["factory_record"]
+                assert isinstance(current, FactoryRunRecord)
+                sandbox = Path(current.sandbox)
+                sandbox.mkdir(parents=True)
+                status = parse_factory_status({
+                    "run_id": current.run_id,
+                    "issue_key": str(current.issue_id),
+                    "valid": True,
+                    "sandbox_path": current.sandbox,
+                    "status": "running",
+                    "mode": "autonomous",
+                    "branch": current.branch,
+                    "pr_base": current.base_ref,
+                    "pr_draft": False,
+                    "lock": "fresh",
+                    "dead_lock": False,
+                    "lock_session": "session-1",
+                    "gates": {"pre_pr": "running"},
+                    "steps": ["implementation"],
+                    "slices": [f"implementation:merged({current.branch})"],
+                    "validator": None,
+                    "pr_url": None,
+                    "terminal_result": None,
+                    "next": "gate:pre_pr",
+                })
+                save_factory_record(
+                    tmp_path,
+                    replace(
+                        current,
+                        status=status,
+                        session="session-1",
+                        controller_phase="terminal",
+                    ),
+                )
+                raise WorklinkError("factory status field validator is malformed")
             return orchestrator.WorklinkRunResult(700, 1, outcome)
 
         monkeypatch.setattr(WorklinkRunner, "_supervise_factory_070", supervise)
@@ -3719,6 +3769,132 @@ def _run_factory_preflight_case(
         )
     )
     return result, launched, verified_tokens, commands
+
+
+def test_post_merge_factory_failure_pushes_branch_before_record_becomes_failed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import mimir.worklink.orchestrator as orchestrator
+
+    pushed: list[str] = []
+
+    class Publication:
+        def __enter__(self) -> Publication:
+            return self
+
+        def __exit__(self, *args: object) -> None:
+            return None
+
+        def push(self, *, check: bool = False) -> subprocess.CompletedProcess[str]:
+            current = load_factory_record(tmp_path, "chainlink-700")
+            assert current is not None
+            assert current.controller_phase == "terminal"
+            assert check is True
+            pushed.append(current.branch)
+            return cp([])
+
+    def capture(
+        checkout_fd: int,
+        trusted_repo: Path,
+        branch: str,
+        metadata_root: Path,
+    ) -> Publication:
+        assert checkout_fd >= 0
+        assert trusted_repo == tmp_path / "repo"
+        assert branch == "feature/chainlink-700"
+        assert metadata_root == tmp_path / "state" / "worklink" / "publication"
+        return Publication()
+
+    monkeypatch.setattr(orchestrator.ControllerGitPublication, "capture", capture)
+    result, _, _, _ = _run_factory_preflight_case(
+        tmp_path,
+        monkeypatch,
+        credentials={"GITHUB_TOKEN": "github-token"},
+        outcome="post_merge_refusal",
+    )
+
+    assert pushed == ["feature/chainlink-700"]
+    assert result.status == "failed"
+    assert result.preserved_ref == "origin/feature/chainlink-700"
+    assert result.preservation_error is None
+    assert result.reason == (
+        "factory status field validator is malformed; completed work preserved at "
+        "origin/feature/chainlink-700"
+    )
+    failed = load_factory_record(tmp_path, "chainlink-700")
+    assert failed is not None
+    assert failed.controller_phase == "failed"
+    assert failed.controller_error == result.reason
+    archived = archive_factory_record(tmp_path, failed)
+    archived_record = FactoryRunRecord.from_json(
+        json.loads(archived.read_text(encoding="utf-8"))
+    )
+    assert archived_record.controller_error == result.reason
+
+
+def test_post_merge_factory_preservation_failure_keeps_original_refusal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import mimir.worklink.orchestrator as orchestrator
+
+    def refuse_capture(*args: object, **kwargs: object) -> object:
+        raise OSError("credential helper unavailable")
+
+    monkeypatch.setattr(orchestrator.ControllerGitPublication, "capture", refuse_capture)
+    result, _, _, _ = _run_factory_preflight_case(
+        tmp_path,
+        monkeypatch,
+        credentials={"GITHUB_TOKEN": "github-token"},
+        outcome="post_merge_refusal",
+    )
+
+    assert result.status == "failed"
+    assert result.preserved_ref is None
+    assert result.preservation_error == "credential helper unavailable"
+    assert result.reason == (
+        "factory status field validator is malformed; completed work preservation failed: "
+        "credential helper unavailable"
+    )
+    failed = load_factory_record(tmp_path, "chainlink-700")
+    assert failed is not None
+    assert failed.controller_error == result.reason
+
+
+@pytest.mark.parametrize("already_published", [False, True])
+def test_factory_failure_preservation_skips_runs_without_unpublished_merged_work(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    already_published: bool,
+) -> None:
+    import mimir.worklink.orchestrator as orchestrator
+
+    sandbox = tmp_path / "sandbox"
+    sandbox.mkdir()
+    record = _completion_record(sandbox)
+    assert record.status is not None
+    status = replace(
+        record.status,
+        pr_url=(
+            "https://github.com/owner/repo/pull/42" if already_published else None
+        ),
+        slices=(
+            record.status.slices
+            if already_published
+            else ("implementation:ready",)
+        ),
+    )
+    record = replace(record, status=status)
+
+    def unexpected(*args: object, **kwargs: object) -> object:
+        raise AssertionError("publication capture must not run")
+
+    monkeypatch.setattr(orchestrator.ControllerGitPublication, "capture", unexpected)
+
+    assert orchestrator._preserve_failed_factory_run(
+        home=tmp_path,
+        trusted_repo=tmp_path,
+        record=record,
+    ) == (None, None)
 
 
 @pytest.mark.parametrize("outcome", ["partial", "needs-human"])
