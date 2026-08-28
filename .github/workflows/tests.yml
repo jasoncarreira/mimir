@@ -357,6 +357,44 @@ jobs:
           fi
           echo "ran optional-skills tests for $ran skill(s)"
 
+  # Resolves dependencies FRESH instead of from uv.lock, so an upstream release
+  # inside a permitted range is exercised here before it reaches a deployment.
+  #
+  # This job exists because deepagents 0.7.10 shipped a signature change on
+  # 2026-08-28 and broke live turns the same day. CI could not have caught it: CI
+  # installs from uv.lock (then 0.7.1) while a source deployment's startup builds a
+  # wheel and pip-installs it, resolving fresh. The suite was green against a
+  # version nobody ran.
+  #
+  # continue-on-error: a new upstream release breaking us is information, not a
+  # reason to block a PR that did not cause it. Read this job when it is red and
+  # decide deliberately; it is a canary, not a gate.
+  pytest-fresh-resolve:
+    needs: skill-conformance
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+        with:
+          version: "0.11.12"
+
+      - name: Set up Python 3.12
+        run: uv python install 3.12
+
+      - name: Resolve dependencies at their newest permitted versions
+        run: uv sync --extra dev --extra bench --upgrade
+
+      - name: Report what resolved
+        run: uv pip list
+
+      - name: Run mimir test suite against the fresh resolution
+        run: uv run pytest -q --tb=short
+
   pytest-enforced:
     # The same suite with MIMIR_ACCESS_CONTROL_ENFORCED=1.
     #
