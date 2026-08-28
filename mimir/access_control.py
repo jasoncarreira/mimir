@@ -31,7 +31,7 @@ import subprocess
 import sys
 import threading
 import time
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Mapping
 from contextvars import ContextVar, Token
 from dataclasses import dataclass, field, replace
 from enum import StrEnum
@@ -643,6 +643,7 @@ _SHELL_PROFILE_BY_AUTHORITY_PROFILE = {
     "heartbeat": "maintenance",
     "session-boundary": "session_boundary",
 }
+OPERATOR_SHELL_PROFILE = "scheduler_read_only"
 _FETCH_URL_POLICY_BY_AUTHORITY_PROFILE = {
     "heartbeat": ("approved_urls", "MIMIR_HEARTBEAT_APPROVED_URLS"),
     "github": ("github_pr_api", "GITHUB_REPOS"),
@@ -2308,21 +2309,33 @@ _SHELL_READ_COMMAND_SPECS = {
 _READ_ONLY_SHELL_READ_COMMANDS = frozenset({"ls", "wc", "grep", "jq", "rg"})
 
 
-def _shell_read_path_operands(argv: list[str]) -> tuple[str, ...] | None:
-    """Validate one filesystem reader and return only its path operands."""
+@dataclass(frozen=True)
+class _ShellReadOperandSlots:
+    path_token_indexes: tuple[int, ...]
+    explicit_paths: tuple[str, ...]
+    effective_paths: tuple[str, ...]
+
+
+def _shell_read_operand_slots(argv: list[str]) -> _ShellReadOperandSlots | None:
     if not argv:
         return None
     command = argv[0]
+    if command not in _SHELL_READ_COMMAND_SPECS:
+        if not Path(command).is_absolute() or not _operator_argv_has_current_pin(tuple(argv)):
+            return None
+        command = Path(command).name
     spec = _SHELL_READ_COMMAND_SPECS.get(command)
     if spec is None:
         return None
+    argument_offset = 1
     arguments = argv[1:]
     if command == "rg":
         if not arguments or arguments[0] != "--no-config":
             return None
+        argument_offset += 1
         arguments = arguments[1:]
 
-    positional: list[str] = []
+    positional: list[tuple[int, str]] = []
     options_ended = False
     index = 0
     while index < len(arguments):
@@ -2341,22 +2354,35 @@ def _shell_read_path_operands(argv: list[str]) -> tuple[str, ...] | None:
                 index += 1
                 continue
             return None
-        positional.append(argument)
+        positional.append((argument_offset + index, argument))
         index += 1
 
     skipped = 0 if command == "rg" and "--files" in arguments else spec.positional_values_before_paths
     if len(positional) < skipped:
         return None
     paths = positional[skipped:]
+    effective_paths = tuple(value for _index, value in paths)
     if (
         command == "grep"
-        and not paths
+        and not effective_paths
         and any(option in arguments for option in ("-r", "--recursive"))
     ):
-        paths = ["."]
-    if not paths and spec.default_path is not None:
-        paths = [spec.default_path]
-    return tuple(paths)
+        effective_paths = (".",)
+    if not effective_paths and spec.default_path is not None:
+        effective_paths = (spec.default_path,)
+    if not effective_paths and command == "ls":
+        effective_paths = (".",)
+    return _ShellReadOperandSlots(
+        tuple(index for index, _value in paths),
+        tuple(value for _index, value in paths),
+        effective_paths,
+    )
+
+
+def _shell_read_path_operands(argv: list[str]) -> tuple[str, ...] | None:
+    """Validate one filesystem reader and return only its path operands."""
+    slots = _shell_read_operand_slots(argv)
+    return slots.explicit_paths if slots is not None else None
 
 
 def _target_matches_read_only_shell_command(argv: list[str]) -> bool:
@@ -3904,6 +3930,488 @@ class ServiceShellBindingRule(StrEnum):
     UNKNOWN_PROFILE = "unknown_profile"
     DECLARED_COMMAND_MISMATCH = "declared_command_mismatch"
     READ_OPERAND_POLICY = "read_operand_policy"
+    OPERATOR_PROJECT_TEST_EXCLUDED = "operator_project_test_excluded"
+    OPERATOR_READER_EXCLUDED = "operator_reader_excluded"
+    OPERATOR_READ_OPERAND_POLICY = "operator_read_operand_policy"
+    OPERATOR_CWD_POLICY = "operator_cwd_policy"
+    OPERATOR_GIT_HARDENING = "operator_git_hardening"
+    OPERATOR_BINDING_MISMATCH = "operator_binding_mismatch"
+    OPERATOR_LIVE_TAINT = "operator_live_taint"
+
+
+_OPERATOR_SHELL_BINDING_ISSUER = object()
+_OPERATOR_SHELL_ARGV_ISSUER = object()
+
+
+@dataclass(frozen=True)
+class _OperatorShellArgvArtifact:
+    argv: tuple[str, ...]
+    family: str
+    resolved_cwd: str
+    _issuer: Any = field(repr=False, compare=False)
+
+
+@dataclass(frozen=True)
+class OperatorShellBinding:
+    profile: str
+    tool_name: str
+    tool_call_id: str
+    command: str
+    requested_cwd: str | None
+    resolved_cwd: str | None
+    argv: tuple[str, ...]
+    chainlink_mutation: bool
+    _request_identity: Any = field(repr=False, compare=False)
+    _auth_context_identity: Any = field(repr=False, compare=False)
+    _issuer: Any = field(repr=False, compare=False)
+
+
+def _operator_argv_has_current_pin(argv: tuple[str, ...]) -> bool:
+    if not argv:
+        return False
+    executable = Path(argv[0])
+    expected = _MAINTENANCE_PINNED_EXECUTABLES.get(executable.name)
+    if expected is None:
+        return False
+    try:
+        return (
+            executable.is_absolute()
+            and executable.resolve(strict=True) == executable
+            and expected.resolve(strict=True) == executable
+            and executable.is_file()
+            and os.access(executable, os.X_OK)
+            and not _maintenance_pin_is_service_writable(executable)
+        )
+    except (OSError, RuntimeError):
+        return False
+
+
+def _issue_operator_shell_binding(
+    *,
+    request_identity: Any,
+    auth_context_identity: Any,
+    tool_call_id: str,
+    command: str,
+    requested_cwd: str | None,
+    resolved_cwd: str | None,
+    argv_artifact: _OperatorShellArgvArtifact,
+    tool_name: str = "shell_exec",
+    profile: str = OPERATOR_SHELL_PROFILE,
+) -> OperatorShellBinding | None:
+    if (
+        profile != OPERATOR_SHELL_PROFILE
+        or tool_name != "shell_exec"
+        or not isinstance(tool_call_id, str)
+        or not tool_call_id
+        or not isinstance(command, str)
+        or not command
+        or "\x00" in command
+        or requested_cwd is not None and not isinstance(requested_cwd, str)
+        or not isinstance(resolved_cwd, str)
+        or not resolved_cwd
+        or request_identity is None
+        or auth_context_identity is None
+        or not isinstance(argv_artifact, _OperatorShellArgvArtifact)
+        or argv_artifact._issuer is not _OPERATOR_SHELL_ARGV_ISSUER
+        or argv_artifact.resolved_cwd != resolved_cwd
+        or not _operator_argv_has_current_pin(argv_artifact.argv)
+        or not _operator_final_argv_matches_family(argv_artifact)
+    ):
+        return None
+    if requested_cwd is not None and (
+        not requested_cwd
+        or "\x00" in requested_cwd
+        or not Path(requested_cwd).is_absolute()
+        or ".." in Path(requested_cwd).parts
+    ):
+        return None
+    cwd = _resolve_operator_bounded_cwd(
+        requested_cwd, git=argv_artifact.family == "git",
+    )
+    if cwd is None or str(cwd) != resolved_cwd:
+        return None
+    classifier_argv = list(argv_artifact.argv)
+    if Path(classifier_argv[0]).name == "chainlink":
+        classifier_argv[0] = "chainlink"
+    return OperatorShellBinding(
+        profile=profile,
+        tool_name=tool_name,
+        tool_call_id=tool_call_id,
+        command=command,
+        requested_cwd=requested_cwd,
+        resolved_cwd=resolved_cwd,
+        argv=argv_artifact.argv,
+        chainlink_mutation=_chainlink_command_is_mutation(classifier_argv),
+        _request_identity=request_identity,
+        _auth_context_identity=auth_context_identity,
+        _issuer=_OPERATOR_SHELL_BINDING_ISSUER,
+    )
+
+
+def _operator_shell_binding_matches(
+    binding: OperatorShellBinding | None,
+    *,
+    request_identity: Any,
+    auth_context_identity: Any,
+    tool_name: str,
+    tool_call_id: str | None,
+    command: str | None,
+    requested_cwd: object,
+    final_argv: Iterable[str] | None = None,
+) -> bool:
+    if (
+        not isinstance(binding, OperatorShellBinding)
+        or binding._issuer is not _OPERATOR_SHELL_BINDING_ISSUER
+        or binding.profile != OPERATOR_SHELL_PROFILE
+        or binding.tool_name != "shell_exec"
+        or tool_name != "shell_exec"
+        or request_identity is None
+        or binding._request_identity is not request_identity
+        or auth_context_identity is None
+        or binding._auth_context_identity is not auth_context_identity
+        or not isinstance(tool_call_id, str)
+        or not tool_call_id
+        or binding.tool_call_id != tool_call_id
+        or not isinstance(command, str)
+        or not command
+        or "\x00" in command
+        or binding.command != command
+        or requested_cwd != binding.requested_cwd
+        or not isinstance(binding.resolved_cwd, str)
+        or not binding.resolved_cwd
+        or not binding.argv
+        or not _operator_argv_has_current_pin(binding.argv)
+    ):
+        return False
+    if requested_cwd is not None and (
+        not isinstance(requested_cwd, str)
+        or not requested_cwd
+        or "\x00" in requested_cwd
+        or not Path(requested_cwd).is_absolute()
+        or ".." in Path(requested_cwd).parts
+    ):
+        return False
+    if final_argv is not None:
+        try:
+            if tuple(final_argv) != binding.argv:
+                return False
+        except TypeError:
+            return False
+    artifact = _OperatorShellArgvArtifact(
+        binding.argv,
+        Path(binding.argv[0]).name,
+        binding.resolved_cwd,
+        _OPERATOR_SHELL_ARGV_ISSUER,
+    )
+    if not _operator_final_argv_matches_family(artifact):
+        return False
+    resolved = _resolve_operator_bounded_cwd(
+        binding.requested_cwd, git=artifact.family == "git",
+    )
+    return resolved is not None and str(resolved) == binding.resolved_cwd
+
+
+_OPERATOR_CWD_REFUSAL = "operator shell cwd confinement failed"
+_OPERATOR_READ_REFUSAL = "operator shell reader confinement failed"
+_OPERATOR_READER_EXCLUDED_REFUSAL = "operator shell reader is not eligible for binding"
+_OPERATOR_GIT_REFUSAL = "operator shell Git hardening failed"
+_OPERATOR_GIT_EXCLUDED_REFUSAL = "operator shell Git form is not eligible for binding"
+
+
+def _resolve_operator_bounded_cwd(raw_cwd: object, *, git: bool) -> Path | None:
+    if raw_cwd is None:
+        candidate = Path.cwd()
+    elif (
+        not isinstance(raw_cwd, str)
+        or not raw_cwd
+        or "\x00" in raw_cwd
+        or not Path(raw_cwd).is_absolute()
+        or ".." in Path(raw_cwd).parts
+    ):
+        return None
+    else:
+        candidate = Path(raw_cwd)
+    try:
+        resolved = candidate.resolve(strict=True)
+        if not resolved.is_dir():
+            return None
+        if git:
+            roots = tuple(root.resolve(strict=True) for root in _configured_maintenance_git_roots())
+            if not any(resolved == root or resolved.is_relative_to(root) for root in roots):
+                return None
+            return resolved
+        from .read_policy import resolve_non_admin_read_target
+
+        admitted = resolve_non_admin_read_target(
+            str(candidate), allow_home_root=True,
+        )
+        return resolved if admitted == resolved else None
+    except (OSError, RuntimeError, ValueError):
+        return None
+
+
+def _operator_read_target(
+    raw: str, *, resolved_cwd: Path, scan_file: bool,
+) -> Path | None:
+    candidate = Path(raw)
+    if "\x00" in raw or ".." in candidate.parts:
+        return None
+    if not candidate.is_absolute():
+        candidate = resolved_cwd / candidate
+    from .read_policy import resolve_non_admin_read_target
+
+    return resolve_non_admin_read_target(
+        str(candidate), scan_file=scan_file, allow_home_root=not scan_file,
+    )
+
+
+def _operator_recursive_read_preflight(
+    roots: tuple[Path, ...], *, include_hidden: bool,
+) -> bool:
+    entry_count = 0
+    content_bytes = 0
+    for root in roots:
+        if root.is_dir():
+            continue
+        try:
+            content_bytes += root.stat().st_size
+        except OSError:
+            return False
+        if (
+            content_bytes > _SHELL_RECURSIVE_READ_BYTE_LIMIT
+            or _operator_read_target(
+                str(root), resolved_cwd=root.parent, scan_file=True,
+            ) is None
+        ):
+            return False
+    pending = [root for root in roots if root.is_dir()]
+    while pending:
+        directory = pending.pop()
+        try:
+            with os.scandir(directory) as entries:
+                for entry in entries:
+                    if not include_hidden and entry.name.startswith("."):
+                        continue
+                    entry_count += 1
+                    if entry_count > _SHELL_RECURSIVE_READ_ENTRY_LIMIT:
+                        return False
+                    child = Path(entry.path)
+                    admitted = _operator_read_target(
+                        str(child), resolved_cwd=directory, scan_file=False,
+                    )
+                    if admitted is None:
+                        return False
+                    try:
+                        is_symlink = entry.is_symlink()
+                        is_directory = entry.is_dir(follow_symlinks=False)
+                    except OSError:
+                        return False
+                    if is_symlink:
+                        continue
+                    if is_directory:
+                        pending.append(admitted)
+                        continue
+                    try:
+                        content_bytes += entry.stat(follow_symlinks=False).st_size
+                    except OSError:
+                        return False
+                    if content_bytes > _SHELL_RECURSIVE_READ_BYTE_LIMIT:
+                        return False
+                    if _operator_read_target(
+                        str(child), resolved_cwd=directory, scan_file=True,
+                    ) is None:
+                        return False
+        except OSError:
+            return False
+    return True
+
+
+def _operator_read_execution_argv_with_diagnostics(
+    argv: list[str], *, resolved_cwd: str | Path,
+) -> tuple[list[str] | None, str, ServiceShellBindingRule | None]:
+    if not argv:
+        return None, _OPERATOR_READ_REFUSAL, ServiceShellBindingRule.OPERATOR_READ_OPERAND_POLICY
+    command = Path(argv[0]).name
+    if not _operator_argv_has_current_pin(tuple(argv)):
+        return None, _OPERATOR_READ_REFUSAL, ServiceShellBindingRule.EXECUTABLE_PIN
+    if command == "jq" or command == "rg" and "-L" in argv[1:]:
+        return (
+            None,
+            _OPERATOR_READER_EXCLUDED_REFUSAL,
+            ServiceShellBindingRule.OPERATOR_READER_EXCLUDED,
+        )
+    slots = _shell_read_operand_slots(argv)
+    if command not in {"ls", "wc", "grep", "rg"} or slots is None:
+        return None, _OPERATOR_READ_REFUSAL, ServiceShellBindingRule.OPERATOR_READ_OPERAND_POLICY
+    try:
+        cwd = Path(resolved_cwd).resolve(strict=True)
+        if not cwd.is_dir():
+            raise OSError
+    except (OSError, RuntimeError, ValueError):
+        return None, _OPERATOR_READ_REFUSAL, ServiceShellBindingRule.OPERATOR_READ_OPERAND_POLICY
+
+    recursive = command == "rg" or any(value in argv[1:] for value in ("-r", "--recursive"))
+    reads_content = command not in {"ls"} and not (
+        command == "rg" and "--files" in argv[1:]
+    )
+    canonical: list[Path] = []
+    for raw in slots.effective_paths:
+        target = _operator_read_target(
+            raw,
+            resolved_cwd=cwd,
+            scan_file=reads_content and not recursive,
+        )
+        if target is None:
+            return None, _OPERATOR_READ_REFUSAL, ServiceShellBindingRule.OPERATOR_READ_OPERAND_POLICY
+        if target.is_dir() and reads_content and not recursive:
+            return None, _OPERATOR_READ_REFUSAL, ServiceShellBindingRule.OPERATOR_READ_OPERAND_POLICY
+        if target.is_file() and not recursive and _operator_read_target(
+            str(target), resolved_cwd=cwd, scan_file=True,
+        ) is None:
+            return None, _OPERATOR_READ_REFUSAL, ServiceShellBindingRule.OPERATOR_READ_OPERAND_POLICY
+        canonical.append(target)
+
+    # A content reader with no operand reads inherited stdin, not a bound path.
+    # ``effective_paths`` empty means the argv executes verbatim, so ``wc`` or a
+    # non-recursive ``grep`` consumes whatever stdin the agent process holds: an
+    # unbound input surface after active ingest, and a hang until the shell
+    # timeout when nothing is piped. The server issues these argvs, and a
+    # server-issued read always names what it reads. ``ls`` and ``rg --files``
+    # are unaffected -- they do not read content, and their operand defaults to
+    # the resolved cwd below.
+    if reads_content and not canonical:
+        return None, _OPERATOR_READ_REFUSAL, ServiceShellBindingRule.OPERATOR_READ_OPERAND_POLICY
+
+    if recursive:
+        include_hidden = command != "rg" or (
+            "--hidden" in argv[1:]
+            or argv[1:].count("-u") >= 2
+            or any(
+                value in {"-g", "--glob"} or value.startswith("--glob=")
+                for value in argv[1:]
+            )
+        )
+        if not _operator_recursive_read_preflight(
+            tuple(canonical), include_hidden=include_hidden,
+        ):
+            return None, _OPERATOR_READ_REFUSAL, ServiceShellBindingRule.OPERATOR_READ_OPERAND_POLICY
+
+    execution = list(argv)
+    if slots.path_token_indexes:
+        for index, target in zip(slots.path_token_indexes, canonical):
+            execution[index] = str(target)
+    elif command in {"ls", "rg"} or command == "grep" and recursive:
+        execution.append(str(canonical[0]))
+    return execution, "", None
+
+
+def _operator_git_execution_argv_with_diagnostics(
+    argv: list[str], *, resolved_cwd: str | Path,
+) -> tuple[list[str] | None, str, ServiceShellBindingRule | None]:
+    if (
+        not argv
+        or Path(argv[0]).name != "git"
+        or len(argv) < 2
+        or not _operator_argv_has_current_pin(tuple(argv))
+    ):
+        return None, _OPERATOR_GIT_REFUSAL, ServiceShellBindingRule.OPERATOR_GIT_HARDENING
+    subcommand = argv[1]
+    arguments = argv[2:]
+    if (
+        subcommand == "status"
+        and any(value == "--verbose" or value.startswith("-v") for value in arguments)
+        or subcommand in {"diff", "log", "show"} and "--" in arguments
+    ):
+        return (
+            None,
+            _OPERATOR_GIT_EXCLUDED_REFUSAL,
+            ServiceShellBindingRule.OPERATOR_GIT_HARDENING,
+        )
+    hardened = _maintenance_git_execution_argv(
+        ["git", "-C", str(resolved_cwd), *argv[1:]],
+    )
+    if hardened is None or subcommand not in {"status", "diff", "log", "show"}:
+        return None, _OPERATOR_GIT_REFUSAL, ServiceShellBindingRule.OPERATOR_GIT_HARDENING
+    return hardened, "", None
+
+
+def _validated_operator_shell_argv_artifact(
+    parsed_argv: list[str],
+    final_argv: list[str],
+    *,
+    resolved_cwd: str | Path,
+) -> _OperatorShellArgvArtifact | None:
+    if (
+        not parsed_argv
+        or not final_argv
+        or not _operator_argv_has_current_pin(tuple(parsed_argv))
+        or not _operator_argv_has_current_pin(tuple(final_argv))
+    ):
+        return None
+    try:
+        cwd = Path(resolved_cwd).resolve(strict=True)
+        if not cwd.is_dir() or str(cwd) != str(resolved_cwd):
+            return None
+    except (OSError, RuntimeError, ValueError):
+        return None
+    family = Path(parsed_argv[0]).name
+    expected: list[str] | None
+    if family in {"ls", "wc", "grep", "rg", "jq"}:
+        expected, _reason, _rule = _operator_read_execution_argv_with_diagnostics(
+            parsed_argv, resolved_cwd=cwd,
+        )
+    elif family == "git":
+        expected, _reason, _rule = _operator_git_execution_argv_with_diagnostics(
+            parsed_argv, resolved_cwd=cwd,
+        )
+    elif family == "pwd":
+        bare = ["pwd", *parsed_argv[1:]]
+        expected = parsed_argv if _target_matches_read_only_shell_command(bare) else None
+    elif family == "chainlink":
+        bare = ["chainlink", *parsed_argv[1:]]
+        expected = parsed_argv if _target_matches_chainlink_command(bare) else None
+    else:
+        return None
+    if expected is None or expected != final_argv:
+        return None
+    return _OperatorShellArgvArtifact(
+        tuple(final_argv), family, str(cwd), _OPERATOR_SHELL_ARGV_ISSUER,
+    )
+
+
+def _operator_final_argv_matches_family(
+    artifact: _OperatorShellArgvArtifact,
+) -> bool:
+    argv = list(artifact.argv)
+    family = artifact.family
+    if not argv or Path(argv[0]).name != family:
+        return False
+    if family in {"ls", "wc", "grep", "rg"}:
+        expected, _reason, _rule = _operator_read_execution_argv_with_diagnostics(
+            argv, resolved_cwd=artifact.resolved_cwd,
+        )
+        return expected == argv
+    if family == "pwd":
+        return _target_matches_read_only_shell_command(["pwd", *argv[1:]])
+    if family == "chainlink":
+        return _target_matches_chainlink_command(["chainlink", *argv[1:]])
+    if family != "git":
+        return False
+    try:
+        marker = argv.index("--no-optional-locks")
+    except ValueError:
+        return False
+    if marker + 1 >= len(argv) or argv[1:3] != ["-C", artifact.resolved_cwd]:
+        return False
+    arguments = argv[marker + 1:]
+    if arguments[0] in {"diff", "log", "show"}:
+        if arguments[-2:] != ["--no-ext-diff", "--no-textconv"]:
+            return False
+        arguments = arguments[:-2]
+    expected = _maintenance_git_execution_argv(
+        ["git", "-C", artifact.resolved_cwd, *arguments],
+    )
+    return expected == argv
 
 
 def service_shell_argv_for_log(target: str) -> tuple[list[str], bool]:
@@ -4257,6 +4765,7 @@ def parse_service_shell_argv_with_diagnostics(
     service: "ServicePrincipal | None" = None,
     auth_context: "AuthContext | None" = None,
     read_cwd: str | Path | None = None,
+    allow_project_test: bool = True,
 ) -> tuple[list[str] | None, str, ServiceShellBindingRule | None]:
     """Return the admitted argv, refusal reason, and stable rejecting rule.
 
@@ -4310,15 +4819,16 @@ def parse_service_shell_argv_with_diagnostics(
     if argv[0] == "/usr/local/bin/chainlink":
         argv[0] = "chainlink"
 
-    test_argv, test_reason, test_matched = _project_test_execution_argv(argv)
-    if test_matched:
-        if test_argv is None:
-            return (
-                None,
-                f"configured project test refused: {test_reason}",
-                ServiceShellBindingRule.PROJECT_TEST_POLICY,
-            )
-        return test_argv, "", None
+    if allow_project_test:
+        test_argv, test_reason, test_matched = _project_test_execution_argv(argv)
+        if test_matched:
+            if test_argv is None:
+                return (
+                    None,
+                    f"configured project test refused: {test_reason}",
+                    ServiceShellBindingRule.PROJECT_TEST_POLICY,
+                )
+            return test_argv, "", None
 
     # Consulted BEFORE the profile dispatch, not after it. Several branches
     # (repo_review, and the per-profile ``git`` handlers) return on mismatch, so
@@ -4440,11 +4950,13 @@ def parse_service_shell_argv_with_reason(
     service: "ServicePrincipal | None" = None,
     auth_context: "AuthContext | None" = None,
     read_cwd: str | Path | None = None,
+    allow_project_test: bool = True,
 ) -> tuple[list[str] | None, str]:
     """Compatibility view returning only the admitted argv and refusal prose."""
     argv, reason, _rule = parse_service_shell_argv_with_diagnostics(
         target, destination, review_state=review_state, declared=declared,
         service=service, auth_context=auth_context, read_cwd=read_cwd,
+        allow_project_test=allow_project_test,
     )
     return argv, reason
 
@@ -4455,11 +4967,13 @@ def parse_service_shell_argv(
     service: "ServicePrincipal | None" = None,
     auth_context: "AuthContext | None" = None,
     read_cwd: str | Path | None = None,
+    allow_project_test: bool = True,
 ) -> list[str] | None:
     """Argv-only view of :func:`parse_service_shell_argv_with_reason`."""
     return parse_service_shell_argv_with_reason(
         target, destination, review_state=review_state, declared=declared,
         service=service, auth_context=auth_context, read_cwd=read_cwd,
+        allow_project_test=allow_project_test,
     )[0]
 
 
@@ -5561,6 +6075,11 @@ class SinkGate:
         repo_review_state: Any = None,
         repo_review_state_refusal: str | None = None,
         repo_pr_action_scope: Any = None,
+        operator_shell_binding: OperatorShellBinding | None = None,
+        operator_shell_refusal: str | None = None,
+        operator_shell_request_identity: Any = None,
+        tool_call_id: str | None = None,
+        requested_cwd: object = None,
     ) -> "ToolAuthorization":
         """Check if IFC labels permit flow to the given sink.
 
@@ -5675,6 +6194,35 @@ class SinkGate:
         has_untrusted_active_ingest = _has_untrusted_active_ingest(
             auth_context, ifc_labels,
         )
+        operator_binding_matches = _operator_shell_binding_matches(
+            operator_shell_binding,
+            request_identity=operator_shell_request_identity,
+            auth_context_identity=auth_context,
+            tool_name=tool_name,
+            tool_call_id=tool_call_id,
+            command=target,
+            requested_cwd=requested_cwd,
+        )
+        if (
+            has_untrusted_active_ingest
+            and cls._is_trusted_operator_turn(ifc_labels, auth_context)
+            and sink_category is SinkCategory.SHELL_PROCESS
+            and operator_binding_matches
+            and operator_shell_binding is not None
+            and operator_shell_binding.chainlink_mutation
+        ):
+            return ToolAuthorization(
+                tool_name=tool_name,
+                decision=OperationDecision.ADMIN_REQUIRED,
+                allowed=not enforce,
+                reason="chainlink_mutation_blocked_by_untrusted_ingest",
+                required_tier=AccessTier.ADMIN,
+                enforcement_enabled=enforce,
+                is_shadow_decision=not enforce,
+                would_block=True,
+                resolved_sink_target=resolved_target,
+                refusal_detail=_CHAINLINK_TAINT_REFUSAL,
+            )
         if (
             is_application_egress
             and egress_target_requires_taint_gate
@@ -5987,6 +6535,10 @@ class SinkGate:
             ifc_labels=ifc_labels,
             service_policy=service_policy,
             target=target,
+            operator_shell_binding=operator_shell_binding,
+            operator_shell_request_identity=operator_shell_request_identity,
+            tool_call_id=tool_call_id,
+            requested_cwd=requested_cwd,
         )
         effective_target = (
             ChannelResourceAdapter._resolve_channel(target)
@@ -6043,6 +6595,12 @@ class SinkGate:
                 is_shadow_decision=is_shadow,
                 would_block=True,
                 resolved_sink_target=resolved_target,
+                refusal_detail=(
+                    operator_shell_refusal
+                    if sink_category is SinkCategory.SHELL_PROCESS
+                    and isinstance(operator_shell_refusal, str)
+                    else None
+                ),
             )
 
         return ToolAuthorization(
@@ -6065,6 +6623,10 @@ class SinkGate:
         ifc_labels: Any,
         service_policy: ServiceSinkPolicy | None = None,
         target: str | None = None,
+        operator_shell_binding: OperatorShellBinding | None = None,
+        operator_shell_request_identity: Any = None,
+        tool_call_id: str | None = None,
+        requested_cwd: object = None,
     ) -> frozenset[str]:
         """Return concrete destinations compatible with every current label.
 
@@ -6122,6 +6684,22 @@ class SinkGate:
             and not has_untrusted_active_ingest
             and target is not None
             and category in {SinkCategory.SHELL_PROCESS, SinkCategory.FILE}
+        ):
+            return frozenset({target})
+        if (
+            trusted_operator_turn
+            and has_untrusted_active_ingest
+            and category is SinkCategory.SHELL_PROCESS
+            and target is not None
+            and _operator_shell_binding_matches(
+                operator_shell_binding,
+                request_identity=operator_shell_request_identity,
+                auth_context_identity=auth_context,
+                tool_name=tool_name,
+                tool_call_id=tool_call_id,
+                command=target,
+                requested_cwd=requested_cwd,
+            )
         ):
             return frozenset({target})
         if (
@@ -7560,6 +8138,7 @@ class ToolRegistry:
         arguments: dict[str, Any] | None = None,
         ifc_labels: Any = None,
         sink_category: SinkCategory | None = None,
+        operator_shell_audit: Mapping[str, str] | None = None,
     ) -> None:
         """Emit a would-block shadow-decision audit log (when enabled)."""
         if not self._shadow_logging_enabled or not auth.would_block:
@@ -7604,6 +8183,18 @@ class ToolRegistry:
                 redacted_resolved_target = str(redacted_resolved_target)[
                     :_MAX_REQUESTED_TARGET_LENGTH
                 ]
+
+            if operator_shell_audit is not None:
+                redacted_requested_target = None
+                redacted_resolved_target = SinkCategory.SHELL_PROCESS.value
+                fields.update({
+                    key: operator_shell_audit[key]
+                    for key in (
+                        "shell_profile", "preparation_outcome", "command_family",
+                        "binding_rule",
+                    )
+                    if key in operator_shell_audit
+                })
 
             if auth.reason and auth.reason.startswith("ifc_label_blocked:"):
                 try:
@@ -7663,6 +8254,11 @@ class ToolRegistry:
         ifc_labels: Any = None,
         mcp_tool: Any = None,
         arguments: dict[str, Any] | None = None,
+        operator_shell_binding: OperatorShellBinding | None = None,
+        operator_shell_refusal: str | None = None,
+        operator_shell_request_identity: Any = None,
+        operator_shell_audit: Mapping[str, str] | None = None,
+        tool_call_id: str | None = None,
     ) -> ToolAuthorization:
         """Authorize a tool call using the operation catalog.
 
@@ -7883,6 +8479,11 @@ class ToolRegistry:
                 repo_review_state=repo_review_state,
                 repo_review_state_refusal=repo_review_state_refusal,
                 repo_pr_action_scope=repo_pr_action_scope,
+                operator_shell_binding=operator_shell_binding,
+                operator_shell_refusal=operator_shell_refusal,
+                operator_shell_request_identity=operator_shell_request_identity,
+                tool_call_id=tool_call_id,
+                requested_cwd=(arguments or {}).get("cwd"),
             )
             sink_check.repo_pr_action_scope = repo_pr_action_scope
             if not sink_check.allowed and enforce and not preliminary_admin_denied:
@@ -7893,6 +8494,7 @@ class ToolRegistry:
                     requested_target=target_channel,
                     ifc_labels=ifc_labels,
                     sink_category=sink_category,
+                    operator_shell_audit=operator_shell_audit,
                 )
 
         decision = preliminary_decision

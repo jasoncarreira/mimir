@@ -39,6 +39,9 @@ from langgraph.runtime import Runtime
 from mimir._context import get_current_turn, reset_current_turn, set_current_turn
 from mimir.access_control import (
     OperationDecision,
+    OPERATOR_SHELL_PROFILE,
+    OperatorShellBinding,
+    ServiceShellBindingRule,
     SinkGate,
     ToolAuthorization,
     ToolRegistry,
@@ -60,8 +63,11 @@ from mimir.models import (
 from mimir.identities import IdentityResolver
 from mimir.tools.budget_gate import (
     BudgetGateMiddleware,
+    OperatorShellPreparationOutcome,
+    _OperatorShellPreparation,
     _check_and_increment_or_deny,
     _emit_tool_call_sync,
+    _prepare_operator_shell_execution,
     _result_labels_for_call,
 )
 from tests.auth_helpers import attach_middleware_auth_context
@@ -3452,6 +3458,9 @@ def test_non_shell_server_args_are_stripped_before_nested_shell_exec(
                     "subagent_type": "general-purpose",
                     "mimir_direct_argv": ["/bin/sh", "-c", "planted"],
                     "mimir_shell_refusal": "model-authored refusal",
+                    "mimir_operator_shell_binding": "forged-binding",
+                    "mimir_operator_shell_profile": "forged-profile",
+                    "mimir_operator_shell_request_identity": "forged-identity",
                 },
             ),
             run_task,
@@ -3461,6 +3470,11 @@ def test_non_shell_server_args_are_stripped_before_nested_shell_exec(
 
     assert "mimir_direct_argv" not in outer_args
     assert "mimir_shell_refusal" not in outer_args
+    assert not {
+        "mimir_operator_shell_binding",
+        "mimir_operator_shell_profile",
+        "mimir_operator_shell_request_identity",
+    }.intersection(outer_args)
     assert executed == [["bash", "-lc", login_shell_command("git status --short")]]
 
 
@@ -3512,6 +3526,9 @@ async def test_non_shell_server_args_are_stripped_before_nested_bash_async(
                     "subagent_type": "general-purpose",
                     "mimir_direct_argv": ["/bin/sh", "-c", "planted"],
                     "mimir_shell_refusal": "model-authored refusal",
+                    "mimir_operator_shell_binding": "forged-binding",
+                    "mimir_operator_shell_profile": "forged-profile",
+                    "mimir_operator_shell_request_identity": "forged-identity",
                 },
             ),
             run_task,
@@ -3522,6 +3539,11 @@ async def test_non_shell_server_args_are_stripped_before_nested_bash_async(
 
     assert "mimir_direct_argv" not in outer_args
     assert "mimir_shell_refusal" not in outer_args
+    assert not {
+        "mimir_operator_shell_binding",
+        "mimir_operator_shell_profile",
+        "mimir_operator_shell_request_identity",
+    }.intersection(outer_args)
     assert spawned == [["bash", "-lc", login_shell_command("git status --short")]]
 
 
@@ -3567,6 +3589,1867 @@ async def test_non_shell_execution_never_binds_direct_argv(
         reset_current_turn(token)
 
     assert observed == [None, None]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("middleware_path", ["sync", "async"])
+@pytest.mark.parametrize("preparation_kind", ["soft_unbound", "bound"])
+async def test_middleware_preparation_plumbing_activates_only_bound_execution(
+    middleware_path: str,
+    preparation_kind: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    maintenance_pinned_executables: dict[str, Path],
+) -> None:
+    from dataclasses import replace
+
+    from mimir.tools import budget_gate
+    from mimir.models import TurnInteractivity
+
+    claims = {
+        "mimir_direct_argv": ["forged"],
+        "mimir_shell_refusal": "forged",
+        "mimir_operator_shell_binding": "forged",
+        "mimir_operator_shell_profile": "forged",
+        "mimir_operator_shell_request_identity": "forged",
+    }
+    root = tmp_path / "operator-root"
+    home = tmp_path / "home"
+    root.mkdir()
+    (home / "state").mkdir(parents=True)
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    monkeypatch.setenv("MIMIR_FILE_TOOL_ROOTS", f"{root}:ro")
+    monkeypatch.setattr(
+        "mimir.read_policy.configured_non_admin_read_roots", lambda: (root,),
+    )
+    expected = (
+        {"command": "pwd -P", "cwd": str(root)}
+        if preparation_kind == "bound"
+        else {"command": "printf safe"}
+    )
+    trusted_ingress = SourceLabel(
+        principal="user-1",
+        domain="channel",
+        resource_id="ch-1",
+        bridge_instance="test",
+        sensitivity="private",
+        authorized_principals=frozenset({"user-1"}),
+        source_kind="channel",
+        integrity="trusted",
+        integrity_effect="active_ingest",
+    )
+    untrusted_ingest = SourceLabel(
+        principal="external-source",
+        domain="web",
+        resource_id="active-ingest",
+        bridge_instance="test",
+        sensitivity="private",
+        authorized_principals=frozenset({"user-1"}),
+        source_kind="protected_tool",
+        integrity="untrusted",
+        integrity_effect="active_ingest",
+    )
+    labels = InformationFlowLabels(
+        labels=frozenset({"private"}),
+        source_channels=frozenset({"ch-1"}),
+        sources=(trusted_ingress, untrusted_ingest),
+    )
+    auth = replace(
+        _ifc_auth(),
+        interactivity=TurnInteractivity.INTERACTIVE,
+        ifc_labels=labels,
+        ifc_state=InformationFlowState(labels=labels),
+    )
+    order: list[str] = []
+    authorization_calls: list[tuple[ToolCallRequest, dict[str, Any]]] = []
+    handler_calls = 0
+    soft_preparation = _OperatorShellPreparation(
+        outcome=OperatorShellPreparationOutcome.SOFT_UNBOUND,
+        binding=None,
+        refusal="fixed pre-activation refusal",
+        binding_rule=ServiceShellBindingRule.PROFILE_ALLOWLIST,
+        command_family="profile_miss",
+    )
+    preparations: list[_OperatorShellPreparation] = []
+    original_prepare = budget_gate._prepare_operator_shell_execution
+    original_authorize = budget_gate._authorize_tool_call
+
+    def validate(request: ToolCallRequest) -> dict[str, Any]:
+        order.append("validation")
+        assert request.tool_call["args"] == expected
+        return expected
+
+    def review(*_args: Any) -> None:
+        order.append("standing_review")
+        return None
+
+    def prepare(
+        request: ToolCallRequest, *args: Any,
+    ) -> _OperatorShellPreparation:
+        order.append("preparation")
+        assert request.tool_call["args"] == expected
+        prepared = (
+            original_prepare(request, *args)
+            if preparation_kind == "bound"
+            else soft_preparation
+        )
+        assert prepared is not None
+        preparations.append(prepared)
+        return prepared
+
+    def authorize(*args: Any, **kwargs: Any) -> tuple[ToolAuthorization, str | None]:
+        order.append("authorization")
+        request_identity = kwargs["operator_shell_request_identity"]
+        authorization_calls.append((request_identity, kwargs))
+        assert request_identity.tool_call["args"] == expected
+        return original_authorize(*args, **kwargs)
+
+    monkeypatch.setattr(budget_gate, "_validated_arguments", validate)
+    monkeypatch.setattr(budget_gate, "_resolve_standing_review", review)
+    monkeypatch.setattr(budget_gate, "_prepare_operator_shell_execution", prepare)
+    monkeypatch.setattr(budget_gate, "_authorize_tool_call", authorize)
+
+    def sync_handler(_request: ToolCallRequest) -> ToolMessage:
+        nonlocal handler_calls
+        handler_calls += 1
+        return ToolMessage(content="unsafe", tool_call_id="sync-preparation")
+
+    async def async_handler(_request: ToolCallRequest) -> ToolMessage:
+        nonlocal handler_calls
+        handler_calls += 1
+        return ToolMessage(content="unsafe", tool_call_id="async-preparation")
+
+    call_id = f"{middleware_path}-preparation"
+    request = _make_request(
+        "shell_exec", call_id, auth, {**expected, **claims},
+    )
+    if middleware_path == "sync":
+        result = BudgetGateMiddleware().wrap_tool_call(request, sync_handler)
+    else:
+        result = await BudgetGateMiddleware().awrap_tool_call(request, async_handler)
+
+    if preparation_kind == "bound":
+        assert result.status != "error"
+        assert handler_calls == 1
+    else:
+        assert result.status == "error"
+        assert "ifc_label_blocked:shell_process" in str(result.content)
+        assert handler_calls == 0
+    assert order[:4] == [
+        "validation", "standing_review", "preparation", "authorization",
+    ]
+    assert len(authorization_calls) == 1
+    assert len(preparations) == 1
+    preparation = preparations[0]
+    sanitized_request, forwarded = authorization_calls[0]
+    assert sanitized_request is not request
+    assert forwarded["operator_shell_binding"] is preparation.binding
+    assert forwarded["operator_shell_refusal"] == preparation.refusal
+    assert forwarded["operator_shell_request_identity"] is sanitized_request
+    assert forwarded["tool_call_id"] == call_id
+    if preparation_kind == "bound":
+        assert preparation.outcome is OperatorShellPreparationOutcome.BOUND
+        assert preparation.binding is not None
+        assert preparation.binding.argv == (
+            str(maintenance_pinned_executables["pwd"]), "-P",
+        )
+        assert preparation.binding._request_identity is sanitized_request
+        assert forwarded["operator_shell_refusal"] is None
+    else:
+        assert preparation is soft_preparation
+        assert forwarded["operator_shell_refusal"] == soft_preparation.refusal
+
+
+@pytest.mark.parametrize(
+    ("scenario", "expected_outcome", "expected_rule", "expected_family"),
+    [
+        ("missing-command", OperatorShellPreparationOutcome.HARD_REFUSED, ServiceShellBindingRule.PROFILE_ALLOWLIST, "invalid_command"),
+        ("non-string-command", OperatorShellPreparationOutcome.HARD_REFUSED, ServiceShellBindingRule.PROFILE_ALLOWLIST, "invalid_command"),
+        ("non-dict-arguments", OperatorShellPreparationOutcome.HARD_REFUSED, ServiceShellBindingRule.PROFILE_ALLOWLIST, "invalid_command"),
+        ("shell-control", OperatorShellPreparationOutcome.SOFT_UNBOUND, ServiceShellBindingRule.SHELL_CONTROL_CHARACTERS, "profile_miss"),
+        ("unbalanced", OperatorShellPreparationOutcome.SOFT_UNBOUND, ServiceShellBindingRule.ARGV_UNBALANCED_QUOTING, "profile_miss"),
+        ("empty", OperatorShellPreparationOutcome.SOFT_UNBOUND, ServiceShellBindingRule.ARGV_EMPTY, "profile_miss"),
+        ("tilde", OperatorShellPreparationOutcome.SOFT_UNBOUND, ServiceShellBindingRule.SHELL_HOME_EXPANSION, "profile_miss"),
+        ("project-test", OperatorShellPreparationOutcome.SOFT_UNBOUND, ServiceShellBindingRule.OPERATOR_PROJECT_TEST_EXCLUDED, "project_test"),
+        ("profile-miss", OperatorShellPreparationOutcome.SOFT_UNBOUND, ServiceShellBindingRule.PROFILE_ALLOWLIST, "profile_miss"),
+        ("declared-unreachable", OperatorShellPreparationOutcome.HARD_REFUSED, ServiceShellBindingRule.DECLARED_COMMAND_MISMATCH, "profile_miss"),
+        ("service-read-unreachable", OperatorShellPreparationOutcome.HARD_REFUSED, ServiceShellBindingRule.READ_OPERAND_POLICY, "profile_miss"),
+        ("pin-failure", OperatorShellPreparationOutcome.HARD_REFUSED, ServiceShellBindingRule.EXECUTABLE_PIN, "profile_miss"),
+        ("parser-failure", OperatorShellPreparationOutcome.HARD_REFUSED, ServiceShellBindingRule.UNKNOWN_PROFILE, "parser"),
+        ("parser-refusal-without-rule", OperatorShellPreparationOutcome.HARD_REFUSED, ServiceShellBindingRule.UNKNOWN_PROFILE, "parser"),
+        ("empty-admitted-argv", OperatorShellPreparationOutcome.HARD_REFUSED, ServiceShellBindingRule.UNKNOWN_PROFILE, "parser"),
+        ("unsupported-admitted-family", OperatorShellPreparationOutcome.HARD_REFUSED, ServiceShellBindingRule.UNKNOWN_PROFILE, "parser"),
+        ("chainlink-query", OperatorShellPreparationOutcome.BOUND, None, "chainlink"),
+        ("chainlink-mutation", OperatorShellPreparationOutcome.BOUND, None, "chainlink"),
+        ("pwd", OperatorShellPreparationOutcome.BOUND, None, "pwd"),
+        ("ls", OperatorShellPreparationOutcome.BOUND, None, "ls"),
+        ("wc", OperatorShellPreparationOutcome.BOUND, None, "wc"),
+        ("grep", OperatorShellPreparationOutcome.BOUND, None, "grep"),
+        ("recursive-grep", OperatorShellPreparationOutcome.BOUND, None, "grep"),
+        ("jq-excluded", OperatorShellPreparationOutcome.SOFT_UNBOUND, ServiceShellBindingRule.OPERATOR_READER_EXCLUDED, "jq"),
+        ("rg", OperatorShellPreparationOutcome.BOUND, None, "rg"),
+        ("rg-files", OperatorShellPreparationOutcome.BOUND, None, "rg"),
+        ("rg-link-excluded", OperatorShellPreparationOutcome.SOFT_UNBOUND, ServiceShellBindingRule.OPERATOR_READER_EXCLUDED, "rg"),
+        ("git-status", OperatorShellPreparationOutcome.BOUND, None, "git"),
+        ("git-diff", OperatorShellPreparationOutcome.BOUND, None, "git"),
+        ("git-log", OperatorShellPreparationOutcome.BOUND, None, "git"),
+        ("git-show", OperatorShellPreparationOutcome.BOUND, None, "git"),
+        ("git-verbose-excluded", OperatorShellPreparationOutcome.SOFT_UNBOUND, ServiceShellBindingRule.OPERATOR_GIT_HARDENING, "git"),
+        ("git-separator-excluded", OperatorShellPreparationOutcome.SOFT_UNBOUND, ServiceShellBindingRule.OPERATOR_GIT_HARDENING, "git"),
+        ("cwd-failure", OperatorShellPreparationOutcome.HARD_REFUSED, ServiceShellBindingRule.OPERATOR_CWD_POLICY, "pwd"),
+        ("git-cwd-failure", OperatorShellPreparationOutcome.HARD_REFUSED, ServiceShellBindingRule.OPERATOR_CWD_POLICY, "git"),
+        ("reader-confinement", OperatorShellPreparationOutcome.HARD_REFUSED, ServiceShellBindingRule.OPERATOR_READ_OPERAND_POLICY, "wc"),
+        ("recursive-preflight", OperatorShellPreparationOutcome.HARD_REFUSED, ServiceShellBindingRule.OPERATOR_READ_OPERAND_POLICY, "grep"),
+        ("git-hardener-failure", OperatorShellPreparationOutcome.HARD_REFUSED, ServiceShellBindingRule.OPERATOR_GIT_HARDENING, "git"),
+        ("artifact-failure", OperatorShellPreparationOutcome.HARD_REFUSED, ServiceShellBindingRule.OPERATOR_BINDING_MISMATCH, "pwd"),
+        ("issuance-failure", OperatorShellPreparationOutcome.HARD_REFUSED, ServiceShellBindingRule.OPERATOR_BINDING_MISMATCH, "pwd"),
+    ],
+)
+def test_operator_shell_preparation_exhaustive_outcome_matrix(
+    scenario: str,
+    expected_outcome: OperatorShellPreparationOutcome,
+    expected_rule: ServiceShellBindingRule | None,
+    expected_family: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from mimir.tools import budget_gate
+
+    monkeypatch.setattr(budget_gate, "_operator_can_invoke_admin_shell", lambda *_: True)
+    arguments: Any = {"command": "candidate", "cwd": str(tmp_path)}
+    if scenario == "missing-command":
+        arguments = {"cwd": str(tmp_path)}
+    elif scenario == "non-string-command":
+        arguments = {"command": 17, "cwd": str(tmp_path)}
+    elif scenario == "non-dict-arguments":
+        arguments = ["candidate"]
+    request = ToolCallRequest(
+        tool_call={
+            "name": "shell_exec",
+            "args": arguments,
+            "id": f"operator-{scenario}",
+            "type": "tool_call",
+        },
+        tool=None,
+        state=None,
+        runtime=Runtime(context=None),
+    )
+    parser_rules = {
+        "shell-control": ServiceShellBindingRule.SHELL_CONTROL_CHARACTERS,
+        "unbalanced": ServiceShellBindingRule.ARGV_UNBALANCED_QUOTING,
+        "empty": ServiceShellBindingRule.ARGV_EMPTY,
+        "tilde": ServiceShellBindingRule.SHELL_HOME_EXPANSION,
+        "project-test": ServiceShellBindingRule.PROFILE_ALLOWLIST,
+        "profile-miss": ServiceShellBindingRule.PROFILE_ALLOWLIST,
+        "declared-unreachable": ServiceShellBindingRule.DECLARED_COMMAND_MISMATCH,
+        "service-read-unreachable": ServiceShellBindingRule.READ_OPERAND_POLICY,
+        "pin-failure": ServiceShellBindingRule.EXECUTABLE_PIN,
+    }
+    family_by_scenario = {
+        "chainlink-query": "chainlink",
+        "chainlink-mutation": "chainlink",
+        "recursive-grep": "grep",
+        "jq-excluded": "jq",
+        "rg-files": "rg",
+        "rg-link-excluded": "rg",
+        "git-status": "git",
+        "git-diff": "git",
+        "git-log": "git",
+        "git-show": "git",
+        "git-verbose-excluded": "git",
+        "git-separator-excluded": "git",
+        "cwd-failure": "pwd",
+        "git-cwd-failure": "git",
+        "reader-confinement": "wc",
+        "recursive-preflight": "grep",
+        "git-hardener-failure": "git",
+        "artifact-failure": "pwd",
+        "issuance-failure": "pwd",
+    }
+    family = family_by_scenario.get(scenario, scenario)
+
+    if scenario == "parser-failure":
+        def parser(*_args: Any, **_kwargs: Any) -> Any:
+            raise RuntimeError("parser unavailable")
+    elif scenario == "parser-refusal-without-rule":
+        def parser(*_args: Any, **_kwargs: Any) -> tuple[None, str, None]:
+            return None, "fixed parser refusal", None
+    elif scenario == "empty-admitted-argv":
+        def parser(*_args: Any, **_kwargs: Any) -> tuple[list[str], str, None]:
+            return [], "", None
+    elif scenario == "unsupported-admitted-family":
+        def parser(*_args: Any, **_kwargs: Any) -> tuple[list[str], str, None]:
+            return ["/pins/curl"], "", None
+    elif scenario in parser_rules:
+        def parser(*_args: Any, **_kwargs: Any) -> tuple[None, str, ServiceShellBindingRule]:
+            return None, "fixed parser refusal", parser_rules[scenario]
+    else:
+        def parser(*_args: Any, **_kwargs: Any) -> tuple[list[str], str, None]:
+            return [f"/pins/{family}", scenario], "", None
+    monkeypatch.setattr(budget_gate, "parse_service_shell_argv_with_diagnostics", parser)
+    monkeypatch.setattr(
+        budget_gate,
+        "_project_test_execution_argv",
+        lambda _argv: (None, "excluded", scenario == "project-test"),
+    )
+    monkeypatch.setattr(
+        budget_gate,
+        "_resolve_operator_bounded_cwd",
+        lambda *_args, **_kwargs: (
+            None if scenario in {"cwd-failure", "git-cwd-failure"} else tmp_path
+        ),
+    )
+
+    def reader_hardener(
+        argv: list[str], **_kwargs: Any,
+    ) -> tuple[list[str] | None, str, ServiceShellBindingRule | None]:
+        if scenario in {"jq-excluded", "rg-link-excluded"}:
+            return None, "fixed reader exclusion", ServiceShellBindingRule.OPERATOR_READER_EXCLUDED
+        if scenario in {"reader-confinement", "recursive-preflight"}:
+            return None, "fixed reader refusal", ServiceShellBindingRule.OPERATOR_READ_OPERAND_POLICY
+        return argv, "", None
+
+    def git_hardener(
+        argv: list[str], **_kwargs: Any,
+    ) -> tuple[list[str] | None, str, ServiceShellBindingRule | None]:
+        if scenario in {"git-verbose-excluded", "git-separator-excluded"}:
+            return None, "operator shell Git form is not eligible for binding", ServiceShellBindingRule.OPERATOR_GIT_HARDENING
+        if scenario == "git-hardener-failure":
+            return None, "fixed Git hardener refusal", ServiceShellBindingRule.OPERATOR_GIT_HARDENING
+        return argv, "", None
+
+    monkeypatch.setattr(budget_gate, "_operator_read_execution_argv_with_diagnostics", reader_hardener)
+    monkeypatch.setattr(budget_gate, "_operator_git_execution_argv_with_diagnostics", git_hardener)
+    monkeypatch.setattr(
+        budget_gate,
+        "_validated_operator_shell_argv_artifact",
+        lambda *_args, **_kwargs: None if scenario == "artifact-failure" else object(),
+    )
+
+    def issue(**kwargs: Any) -> OperatorShellBinding | None:
+        if scenario == "issuance-failure":
+            return None
+        return OperatorShellBinding(
+            profile=OPERATOR_SHELL_PROFILE,
+            tool_name="shell_exec",
+            tool_call_id=f"operator-{scenario}",
+            command="candidate",
+            requested_cwd=str(tmp_path),
+            resolved_cwd=str(tmp_path),
+            argv=(f"/pins/{family}", scenario),
+            chainlink_mutation=scenario == "chainlink-mutation",
+            _request_identity=request,
+            _auth_context_identity=object(),
+            _issuer=object(),
+        )
+
+    monkeypatch.setattr(budget_gate, "_issue_operator_shell_binding", issue)
+    preparation = _prepare_operator_shell_execution(request, "shell_exec", None, None)
+
+    assert preparation is not None
+    assert preparation.outcome is expected_outcome
+    assert preparation.binding_rule is expected_rule
+    assert preparation.command_family == expected_family
+    assert (preparation.binding is not None) is (
+        expected_outcome is OperatorShellPreparationOutcome.BOUND
+    )
+    assert (preparation.refusal is None) is (
+        expected_outcome is OperatorShellPreparationOutcome.BOUND
+    )
+
+
+@pytest.mark.parametrize(
+    ("command", "executable", "tail"),
+    [
+        ("pwd -P", "pwd", ("-P",)),
+        (
+            "/usr/local/bin/chainlink issue show 1337",
+            "chainlink",
+            ("issue", "show", "1337"),
+        ),
+    ],
+)
+def test_operator_shell_preparation_issues_genuine_scheduler_binding(
+    command: str,
+    executable: str,
+    tail: tuple[str, ...],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    maintenance_pinned_executables: dict[str, Path],
+) -> None:
+    from mimir.tools import budget_gate
+
+    home = tmp_path / "home"
+    root = tmp_path / "root"
+    (home / "state").mkdir(parents=True)
+    root.mkdir()
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    monkeypatch.setenv("MIMIR_FILE_TOOL_ROOTS", f"{root}:ro")
+    monkeypatch.setattr(
+        "mimir.read_policy.configured_non_admin_read_roots", lambda: (root,),
+    )
+    monkeypatch.setattr(budget_gate, "_operator_can_invoke_admin_shell", lambda *_: True)
+    parser_calls: list[tuple[tuple[Any, ...], dict[str, Any]]] = []
+    original_parser = budget_gate.parse_service_shell_argv_with_diagnostics
+
+    def parser(*args: Any, **kwargs: Any) -> Any:
+        parser_calls.append((args, kwargs))
+        return original_parser(*args, **kwargs)
+
+    monkeypatch.setattr(budget_gate, "parse_service_shell_argv_with_diagnostics", parser)
+    auth = _untainted_ifc_auth()
+    request = _make_request(
+        "shell_exec", "genuine-binding", auth,
+        {"command": command, "cwd": str(root)},
+    )
+    preparation = _prepare_operator_shell_execution(
+        request, "shell_exec", auth, auth.ifc_labels,
+    )
+
+    assert preparation is not None
+    assert preparation.outcome is OperatorShellPreparationOutcome.BOUND
+    assert preparation.binding is not None
+    assert preparation.binding.argv == (
+        str(maintenance_pinned_executables[executable]), *tail,
+    )
+    assert preparation.binding._request_identity is request
+    assert preparation.binding._auth_context_identity is auth
+    assert parser_calls == [((command, OPERATOR_SHELL_PROFILE), {
+        "declared": (),
+        "service": None,
+        "auth_context": None,
+        "review_state": None,
+        "allow_project_test": False,
+    })]
+
+
+def test_operator_bash_async_and_service_shell_have_no_arm2_preparation(
+    tmp_path: Path,
+) -> None:
+    auth = _untainted_ifc_auth()
+    assert _prepare_operator_shell_execution(
+        _make_request("bash_async", auth_context=auth, args={"command": "pwd"}),
+        "bash_async",
+        auth,
+        auth.ifc_labels,
+    ) is None
+    service_turn = _service_turn(tmp_path, "service-channel")
+    assert _prepare_operator_shell_execution(
+        _make_request(
+            "shell_exec",
+            auth_context=service_turn.auth_context,
+            args={"command": "pwd"},
+        ),
+        "shell_exec",
+        service_turn.auth_context,
+        service_turn.auth_context.ifc_labels,
+    ) is None
+
+
+@pytest.mark.asyncio
+async def test_operator_bash_async_active_ingest_remains_refused() -> None:
+    auth = _ifc_auth()
+    handler_calls = 0
+
+    async def handler(request: ToolCallRequest) -> ToolMessage:
+        nonlocal handler_calls
+        handler_calls += 1
+        return ToolMessage(content="unsafe", tool_call_id=request.tool_call["id"])
+
+    result = await BudgetGateMiddleware().awrap_tool_call(
+        _make_request(
+            "bash_async", "operator-async-refused", auth, {"command": "pwd"},
+        ),
+        handler,
+    )
+
+    assert result.status == "error"
+    assert "ifc_label_blocked:shell_process" in str(result.content)
+    assert handler_calls == 0
+
+
+def _hard_operator_shell_preparation(refusal: str) -> _OperatorShellPreparation:
+    return _OperatorShellPreparation(
+        outcome=OperatorShellPreparationOutcome.HARD_REFUSED,
+        binding=None,
+        refusal=refusal,
+        binding_rule=ServiceShellBindingRule.OPERATOR_READ_OPERAND_POLICY,
+        command_family="grep",
+    )
+
+
+_ARM2_AUDIT_KEYS = frozenset({
+    "shell_profile",
+    "preparation_outcome",
+    "command_family",
+    "binding_rule",
+})
+
+
+def _arm2_audit_sentinels() -> dict[str, str]:
+    return {
+        "command": "command-sentinel-7b984",
+        "cwd": "/cwd-sentinel-42d1",
+        "raw_operand": "raw-operand-sentinel-116c",
+        "canonical_operand": "/canonical-operand-sentinel-2ac8",
+        "argv": "argv-sentinel-c826",
+        "recursive_child": "/recursive-child-sentinel-38ef",
+        "credential": "ghp_credential-sentinel-8156",
+        "refusal": "full-refusal-prose-sentinel-a091",
+    }
+
+
+def _assert_arm2_audit_summary(
+    fields: dict[str, Any],
+    audit: dict[str, str],
+) -> None:
+    assert frozenset(audit) == _ARM2_AUDIT_KEYS
+    assert {key: fields[key] for key in _ARM2_AUDIT_KEYS} == audit
+
+
+def _assert_arm2_values_withheld(value: Any, sentinels: dict[str, str]) -> None:
+    rendered = json.dumps(value)
+    for sentinel in sentinels.values():
+        assert sentinel not in rendered
+
+
+def test_arm2_tool_events_use_complete_fixed_summary_and_withhold_values(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from mimir.tools import budget_gate
+
+    sentinels = _arm2_audit_sentinels()
+    secret_blob = " ".join(sentinels.values())
+    audit = budget_gate._operator_shell_audit_summary(
+        _hard_operator_shell_preparation(secret_blob),
+    )
+    captured: list[tuple[str, dict[str, Any]]] = []
+    monkeypatch.setattr(
+        budget_gate,
+        "_emit_event_sync",
+        lambda kind, **fields: captured.append((kind, fields)),
+    )
+
+    _emit_tool_call_sync(
+        "shell_exec",
+        ok=False,
+        error=secret_blob,
+        denied=True,
+        arguments={
+            "command": secret_blob,
+            "cwd": sentinels["cwd"],
+            "path": sentinels["raw_operand"],
+        },
+        operator_shell_audit=audit,
+    )
+
+    assert [kind for kind, _fields in captured] == ["tool_call", "tool_error"]
+    assert audit is not None
+    for _kind, fields in captured:
+        _assert_arm2_audit_summary(fields, audit)
+        assert fields["error"] == "operator_shell_tool_error"
+        assert "arguments" not in fields
+        _assert_arm2_values_withheld(fields, sentinels)
+
+
+def test_non_arm2_tool_event_shape_is_unchanged(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from mimir.tools import budget_gate
+
+    captured: list[tuple[str, dict[str, Any]]] = []
+    monkeypatch.setattr(
+        budget_gate,
+        "_emit_event_sync",
+        lambda kind, **fields: captured.append((kind, fields)),
+    )
+
+    _emit_tool_call_sync(
+        "shell_exec",
+        ok=False,
+        error="ordinary error",
+        arguments={"command": "printf ordinary", "cwd": "/ordinary"},
+    )
+
+    assert captured[0][1]["arguments"] == {
+        "command": "printf ordinary",
+    }
+    assert captured[0][1]["error"] == "ordinary error"
+    assert captured[1][1]["arguments"] == {
+        "command": "printf ordinary",
+    }
+    assert captured[1][1]["error"] == "ordinary error"
+
+
+def test_arm2_hard_refusal_uses_null_target_and_fixed_values(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from mimir.tools import budget_gate
+
+    sentinels = _arm2_audit_sentinels()
+    secret_blob = " ".join(sentinels.values())
+    preparation = _hard_operator_shell_preparation(secret_blob)
+    audit = budget_gate._operator_shell_audit_summary(preparation)
+    assert audit is not None
+    captured: list[tuple[str, dict[str, Any]]] = []
+    monkeypatch.setattr(
+        budget_gate,
+        "_emit_event_sync",
+        lambda kind, **fields: captured.append((kind, fields)),
+    )
+
+    result = budget_gate._operator_shell_hard_refusal(
+        _make_request(
+            "shell_exec",
+            "hard-audit",
+            _untainted_ifc_auth(),
+            {"command": secret_blob, "cwd": sentinels["cwd"]},
+        ),
+        preparation,
+        _untainted_ifc_auth(),
+    )
+
+    assert result is not None and result.status == "error"
+    _assert_arm2_values_withheld(result.content, sentinels)
+    hard = next(fields for kind, fields in captured if kind == "hard_boundary_denied")
+    _assert_arm2_audit_summary(hard, audit)
+    assert hard["target"] is None
+    assert hard["boundary"] == "operator_shell_preparation"
+    assert hard["reason"] == "operator_shell_hard_refused"
+    for kind, fields in captured:
+        if kind in {"tool_call", "tool_error"}:
+            _assert_arm2_audit_summary(fields, audit)
+    _assert_arm2_values_withheld(captured, sentinels)
+
+
+def test_arm2_record_tool_outcome_uses_fixed_value_free_hard_boundary(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from mimir.tools import budget_gate
+
+    sentinels = _arm2_audit_sentinels()
+    preparation = _hard_operator_shell_preparation(" ".join(sentinels.values()))
+    audit = budget_gate._operator_shell_audit_summary(preparation)
+    assert audit is not None
+    captured: list[tuple[str, dict[str, Any]]] = []
+    monkeypatch.setattr(
+        budget_gate,
+        "_emit_event_sync",
+        lambda kind, **fields: captured.append((kind, fields)),
+    )
+
+    budget_gate._record_tool_outcome(
+        "shell_exec",
+        refused_reason=" ".join(sentinels.values()),
+        operator_shell_audit=audit,
+    )
+
+    assert [kind for kind, _fields in captured] == ["hard_boundary_denied"]
+    hard = captured[0][1]
+    _assert_arm2_audit_summary(hard, audit)
+    assert hard["target"] is None
+    assert hard["boundary"] == "operator_shell_policy"
+    assert hard["reason"] == "operator_shell_tool_refused"
+    _assert_arm2_values_withheld(hard, sentinels)
+
+
+def test_arm2_budget_denial_uses_fixed_value_free_hard_boundary(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from mimir.tools import budget_gate
+
+    sentinels = _arm2_audit_sentinels()
+    preparation = _hard_operator_shell_preparation(" ".join(sentinels.values()))
+    audit = budget_gate._operator_shell_audit_summary(preparation)
+    assert audit is not None
+    captured: list[tuple[str, dict[str, Any]]] = []
+    monkeypatch.setattr(
+        budget_gate,
+        "_emit_event_sync",
+        lambda kind, **fields: captured.append((kind, fields)),
+    )
+    ctx = _make_ctx(budget=1)
+    ctx.tool_call_count = 1
+
+    denial = _check_and_increment_or_deny(
+        "shell_exec",
+        ctx,
+        target=" ".join(sentinels.values()),
+        auth_context=ctx.auth_context,
+        operator_shell_audit=audit,
+    )
+
+    assert denial is not None
+    denied = next(fields for kind, fields in captured if kind == "tool_call_budget_denied")
+    _assert_arm2_audit_summary(denied, audit)
+    hard = next(fields for kind, fields in captured if kind == "hard_boundary_denied")
+    _assert_arm2_audit_summary(hard, audit)
+    assert hard["target"] is None
+    assert hard["boundary"] == "tool_call_budget"
+    assert hard["reason"] == "tool_call_budget_exhausted"
+    _assert_arm2_values_withheld(captured, sentinels)
+
+
+def test_arm2_prohibited_action_uses_fixed_value_free_audit_events(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from mimir.tools import budget_gate
+
+    sentinels = _arm2_audit_sentinels()
+    secret_blob = " ".join(sentinels.values())
+    preparation = _OperatorShellPreparation(
+        outcome=OperatorShellPreparationOutcome.SOFT_UNBOUND,
+        binding=None,
+        refusal=secret_blob,
+        binding_rule=ServiceShellBindingRule.PROFILE_ALLOWLIST,
+        command_family="profile_miss",
+    )
+    audit = budget_gate._operator_shell_audit_summary(preparation)
+    assert audit is not None
+    captured: list[tuple[str, dict[str, Any]]] = []
+    handler_calls = 0
+
+    def authorize(*_args: Any, **_kwargs: Any) -> tuple[ToolAuthorization, None]:
+        return ToolAuthorization(
+            tool_name="shell_exec",
+            decision=OperationDecision.ADMIN_REQUIRED,
+            allowed=True,
+        ), None
+
+    def handler(_request: ToolCallRequest) -> ToolMessage:
+        nonlocal handler_calls
+        handler_calls += 1
+        return ToolMessage(content="ran", tool_call_id="prohibited-audit")
+
+    monkeypatch.setattr(
+        budget_gate,
+        "_prepare_operator_shell_execution",
+        lambda *_args: preparation,
+    )
+    monkeypatch.setattr(budget_gate, "_authorize_tool_call", authorize)
+    monkeypatch.setattr(budget_gate, "_check_prohibited", lambda *_args: secret_blob)
+    monkeypatch.setattr(
+        budget_gate,
+        "_emit_event_sync",
+        lambda kind, **fields: captured.append((kind, fields)),
+    )
+
+    result = BudgetGateMiddleware().wrap_tool_call(
+        _make_request(
+            "shell_exec",
+            "prohibited-audit",
+            _untainted_ifc_auth(),
+            {"command": secret_blob, "cwd": sentinels["cwd"]},
+        ),
+        handler,
+    )
+
+    assert result.status == "error"
+    assert handler_calls == 0
+    blocked = next(fields for kind, fields in captured if kind == "prohibited_action_blocked")
+    _assert_arm2_audit_summary(blocked, audit)
+    assert blocked["reason"] == "prohibited_action"
+    hard = next(fields for kind, fields in captured if kind == "hard_boundary_denied")
+    _assert_arm2_audit_summary(hard, audit)
+    assert hard["target"] is None
+    assert hard["boundary"] == "prohibited_action_guard"
+    assert hard["reason"] == "prohibited_action"
+    for kind, fields in captured:
+        if kind in {"tool_call", "tool_error"}:
+            _assert_arm2_audit_summary(fields, audit)
+    _assert_arm2_values_withheld(captured, sentinels)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("middleware_path", ["sync", "async"])
+@pytest.mark.parametrize("enforcement_enabled", [False, True])
+async def test_pre_activation_hard_refusal_never_invokes_handler(
+    middleware_path: str,
+    enforcement_enabled: bool,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from dataclasses import replace
+
+    from mimir.tools import budget_gate
+
+    preparation = _hard_operator_shell_preparation("private refusal sentinel")
+    auth = replace(
+        _untainted_ifc_auth(),
+        enforcement_enabled=enforcement_enabled,
+    )
+    handler_calls = 0
+
+    def authorize(*_args: Any, **kwargs: Any) -> tuple[ToolAuthorization, None]:
+        assert kwargs["operator_shell_audit"] == {
+            "shell_profile": OPERATOR_SHELL_PROFILE,
+            "preparation_outcome": "hard_refused",
+            "command_family": "grep",
+            "binding_rule": ServiceShellBindingRule.OPERATOR_READ_OPERAND_POLICY.value,
+        }
+        return ToolAuthorization(
+            tool_name="shell_exec",
+            decision=OperationDecision.ADMIN_REQUIRED,
+            allowed=True,
+        ), None
+
+    monkeypatch.setattr(
+        budget_gate,
+        "_prepare_operator_shell_execution",
+        lambda *_args: preparation,
+    )
+    monkeypatch.setattr(budget_gate, "_authorize_tool_call", authorize)
+
+    def sync_handler(_request: ToolCallRequest) -> ToolMessage:
+        nonlocal handler_calls
+        handler_calls += 1
+        return ToolMessage(content="ran", tool_call_id="hard-stop")
+
+    async def async_handler(_request: ToolCallRequest) -> ToolMessage:
+        nonlocal handler_calls
+        handler_calls += 1
+        return ToolMessage(content="ran", tool_call_id="hard-stop")
+
+    request = _make_request(
+        "shell_exec",
+        "hard-stop",
+        auth,
+        {"command": "never-run-sentinel", "cwd": "/never-run"},
+    )
+    middleware = BudgetGateMiddleware()
+    if middleware_path == "sync":
+        result = middleware.wrap_tool_call(request, sync_handler)
+    else:
+        result = await middleware.awrap_tool_call(request, async_handler)
+
+    assert result.status == "error"
+    assert handler_calls == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("middleware_path", ["sync", "async"])
+async def test_operator_binding_is_authorization_and_execution_artifact(
+    middleware_path: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    maintenance_pinned_executables: dict[str, Path],
+) -> None:
+    from dataclasses import replace
+
+    from mimir.models import TurnInteractivity
+    from mimir.tools import budget_gate
+    from mimir.tools._shell_env import bound_direct_exec_argv
+
+    root = tmp_path / "operator-root"
+    home = tmp_path / "home"
+    root.mkdir()
+    (home / "state").mkdir(parents=True)
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    monkeypatch.setenv("MIMIR_FILE_TOOL_ROOTS", f"{root}:ro")
+    monkeypatch.setattr(
+        "mimir.read_policy.configured_non_admin_read_roots", lambda: (root,),
+    )
+    trusted = SourceLabel(
+        principal="user-1",
+        domain="channel",
+        resource_id="ch-1",
+        bridge_instance="test",
+        sensitivity="private",
+        authorized_principals=frozenset({"user-1"}),
+        source_kind="channel",
+        integrity="trusted",
+        integrity_effect="active_ingest",
+    )
+    labels = InformationFlowLabels(sources=(trusted,))
+    auth = replace(
+        _untainted_ifc_auth(),
+        interactivity=TurnInteractivity.INTERACTIVE,
+        ifc_labels=labels,
+        ifc_state=InformationFlowState(labels=labels),
+    )
+    parser_calls = 0
+    authorized_bindings: list[OperatorShellBinding] = []
+    original_parser = budget_gate.parse_service_shell_argv_with_diagnostics
+    original_authorize = budget_gate._authorize_tool_call
+    original_cwd_resolver = budget_gate._resolve_operator_bounded_cwd
+    cwd_resolution_calls = 0
+    cwd_calls_at_authorization: list[int] = []
+
+    def parser(*args: Any, **kwargs: Any) -> Any:
+        nonlocal parser_calls
+        parser_calls += 1
+        return original_parser(*args, **kwargs)
+
+    def authorize(*args: Any, **kwargs: Any) -> tuple[ToolAuthorization, str | None]:
+        authorized_bindings.append(kwargs["operator_shell_binding"])
+        result = original_authorize(*args, **kwargs)
+        cwd_calls_at_authorization.append(cwd_resolution_calls)
+        return result
+
+    def resolve_cwd(*args: Any, **kwargs: Any) -> Any:
+        nonlocal cwd_resolution_calls
+        cwd_resolution_calls += 1
+        return original_cwd_resolver(*args, **kwargs)
+
+    observed: list[tuple[list[str] | None, list[str], str]] = []
+
+    def handler(request: ToolCallRequest) -> ToolMessage:
+        compatibility_argv = request.tool_call["args"]["mimir_direct_argv"]
+        request.tool_call["args"]["mimir_direct_argv"] = ["/forged"]
+        observed.append((
+            bound_direct_exec_argv(),
+            compatibility_argv,
+            request.tool_call["args"]["cwd"],
+        ))
+        assert cwd_resolution_calls == cwd_calls_at_authorization[0]
+        return ToolMessage(content="ran", tool_call_id=request.tool_call["id"])
+
+    async def async_handler(request: ToolCallRequest) -> ToolMessage:
+        return handler(request)
+
+    monkeypatch.setattr(budget_gate, "parse_service_shell_argv_with_diagnostics", parser)
+    monkeypatch.setattr(budget_gate, "_authorize_tool_call", authorize)
+    monkeypatch.setattr(budget_gate, "_resolve_operator_bounded_cwd", resolve_cwd)
+    request = _make_request(
+        "shell_exec", f"exact-artifact-{middleware_path}", auth,
+        {"command": "pwd -P", "cwd": str(root)},
+    )
+    if middleware_path == "sync":
+        result = BudgetGateMiddleware().wrap_tool_call(request, handler)
+    else:
+        result = await BudgetGateMiddleware().awrap_tool_call(request, async_handler)
+
+    expected = [str(maintenance_pinned_executables["pwd"]), "-P"]
+    assert result.status != "error"
+    assert parser_calls == 1
+    assert len(authorized_bindings) == 1
+    assert list(authorized_bindings[0].argv) == expected
+    assert observed == [(expected, expected, str(root.resolve()))]
+    assert bound_direct_exec_argv() is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("middleware_path", ["sync", "async"])
+@pytest.mark.parametrize("enforcement_enabled", [False, True])
+async def test_tainted_operator_bound_command_reaches_real_direct_process_path(
+    middleware_path: str,
+    enforcement_enabled: bool,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    maintenance_pinned_executables: dict[str, Path],
+) -> None:
+    from types import SimpleNamespace
+
+    from mimir.tools import extra
+
+    root = tmp_path / "operator-root"
+    home = tmp_path / "home"
+    root.mkdir()
+    (home / "state").mkdir(parents=True)
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    monkeypatch.setenv("MIMIR_FILE_TOOL_ROOTS", f"{root}:ro")
+    monkeypatch.setattr(
+        "mimir.read_policy.configured_non_admin_read_roots", lambda: (root,),
+    )
+    state = InformationFlowState()
+    auth = _arm2_operator_auth(state, enforcement_enabled=enforcement_enabled)
+    state.merge(InformationFlowLabels(sources=(SourceLabel(
+        principal="external-source",
+        domain="web",
+        resource_id="active-ingest",
+        bridge_instance="test",
+        sensitivity="private",
+        authorized_principals=frozenset({"user-1"}),
+        source_kind="protected_tool",
+        integrity="untrusted",
+        integrity_effect="active_ingest",
+    ),)), fallback=auth.ifc_labels)
+    executions: list[tuple[list[str], dict[str, Any]]] = []
+
+    def run(argv: list[str], **kwargs: Any) -> SimpleNamespace:
+        executions.append((list(argv), kwargs))
+        return SimpleNamespace(returncode=0, stdout=b"bounded\n", stderr=b"")
+
+    def sync_handler(request: ToolCallRequest) -> ToolMessage:
+        content = extra.shell_exec.invoke(request.tool_call["args"])
+        return ToolMessage(content=content, tool_call_id=request.tool_call["id"])
+
+    async def async_handler(request: ToolCallRequest) -> ToolMessage:
+        return sync_handler(request)
+
+    monkeypatch.setattr(extra.subprocess, "run", run)
+    request = _make_request(
+        "shell_exec", f"real-direct-{middleware_path}", auth,
+        {"command": "pwd -P", "cwd": str(root)},
+    )
+    if middleware_path == "sync":
+        result = BudgetGateMiddleware().wrap_tool_call(request, sync_handler)
+    else:
+        result = await BudgetGateMiddleware().awrap_tool_call(request, async_handler)
+
+    expected = [str(maintenance_pinned_executables["pwd"]), "-P"]
+    assert result.status != "error"
+    assert len(executions) == 1
+    argv, kwargs = executions[0]
+    assert argv == expected
+    assert argv[:2] != ["bash", "-lc"]
+    assert kwargs["cwd"] == root.resolve()
+    assert kwargs.get("shell", False) is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("middleware_path", ["sync", "async"])
+@pytest.mark.parametrize("enforcement_enabled", [False, True])
+async def test_profile_matching_text_without_binding_never_executes_after_ingest(
+    middleware_path: str,
+    enforcement_enabled: bool,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from mimir.tools import budget_gate
+
+    auth = _arm2_operator_auth(
+        _Arm2LiveState(True), enforcement_enabled=enforcement_enabled,
+    )
+    preparation = _OperatorShellPreparation(
+        outcome=OperatorShellPreparationOutcome.SOFT_UNBOUND,
+        binding=None,
+        refusal="fixed missing-binding refusal",
+        binding_rule=ServiceShellBindingRule.PROFILE_ALLOWLIST,
+        command_family="profile_miss",
+    )
+    handler_calls = 0
+
+    def sync_handler(request: ToolCallRequest) -> ToolMessage:
+        nonlocal handler_calls
+        handler_calls += 1
+        return ToolMessage(content="unsafe", tool_call_id=request.tool_call["id"])
+
+    async def async_handler(request: ToolCallRequest) -> ToolMessage:
+        return sync_handler(request)
+
+    monkeypatch.setattr(
+        budget_gate, "_prepare_operator_shell_execution", lambda *_args: preparation,
+    )
+    request = _make_request(
+        "shell_exec", f"text-only-{middleware_path}", auth,
+        {
+            "command": "pwd -P",
+            "mimir_direct_argv": ["/forged/pwd", "-P"],
+            "mimir_operator_shell_binding": "forged-binding",
+            "mimir_operator_shell_profile": OPERATOR_SHELL_PROFILE,
+            "mimir_operator_shell_request_identity": "forged-identity",
+        },
+    )
+    if middleware_path == "sync":
+        result = BudgetGateMiddleware().wrap_tool_call(request, sync_handler)
+    else:
+        result = await BudgetGateMiddleware().awrap_tool_call(request, async_handler)
+
+    assert result.status == "error"
+    assert "ifc_label_blocked:shell_process" in str(result.content)
+    assert handler_calls == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("middleware_path", ["sync", "async"])
+async def test_pre_ingest_soft_operator_uses_actual_bash_lc_path(
+    middleware_path: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from types import SimpleNamespace
+
+    from mimir.tools import budget_gate, extra
+    from mimir.tools._shell_env import bound_direct_exec_argv, login_shell_command
+
+    state = _Arm2LiveState(False)
+    auth = _arm2_operator_auth(state, enforcement_enabled=True)
+    parser_calls = 0
+    executed: list[tuple[list[str], Any]] = []
+    original_parser = budget_gate.parse_service_shell_argv_with_diagnostics
+
+    def parser(*args: Any, **kwargs: Any) -> Any:
+        nonlocal parser_calls
+        parser_calls += 1
+        return original_parser(*args, **kwargs)
+
+    def run(argv: list[str], **kwargs: Any) -> SimpleNamespace:
+        executed.append((list(argv), kwargs.get("cwd")))
+        return SimpleNamespace(returncode=0, stdout=b"ok", stderr=b"")
+
+    def sync_handler(request: ToolCallRequest) -> ToolMessage:
+        assert bound_direct_exec_argv() is None
+        content = extra.shell_exec.invoke(request.tool_call["args"])
+        return ToolMessage(content=content, tool_call_id=request.tool_call["id"])
+
+    async def async_handler(request: ToolCallRequest) -> ToolMessage:
+        return sync_handler(request)
+
+    monkeypatch.setattr(budget_gate, "parse_service_shell_argv_with_diagnostics", parser)
+    monkeypatch.setattr(extra.subprocess, "run", run)
+    command = "printf pre-ingest-soft"
+    request = _make_request(
+        "shell_exec", f"soft-bash-{middleware_path}", auth, {"command": command},
+    )
+    if middleware_path == "sync":
+        result = BudgetGateMiddleware().wrap_tool_call(request, sync_handler)
+    else:
+        result = await BudgetGateMiddleware().awrap_tool_call(request, async_handler)
+
+    assert result.status != "error"
+    assert parser_calls == 1
+    assert executed == [(["bash", "-lc", login_shell_command(command)], None)]
+    assert bound_direct_exec_argv() is None
+
+
+class _Arm2LiveState:
+    def __init__(self, outcome: object) -> None:
+        self.outcome = outcome
+        self.state = InformationFlowState()
+
+    def current(self, fallback: Any = None) -> Any:
+        return self.state.current(fallback)
+
+    def merge(self, added: Any, fallback: Any = None) -> Any:
+        return self.state.merge(added, fallback=fallback)
+
+    def has_untrusted_active_ingest(self, _fallback: Any = None) -> object:
+        if self.outcome == "error":
+            raise RuntimeError("live IFC unavailable")
+        return self.outcome
+
+
+def _arm2_operator_auth(
+    state: Any,
+    *,
+    enforcement_enabled: bool,
+) -> AuthContext:
+    from dataclasses import replace
+
+    from mimir.models import TurnInteractivity
+
+    trusted = SourceLabel(
+        principal="user-1",
+        domain="channel",
+        resource_id="ch-1",
+        bridge_instance="test",
+        sensitivity="private",
+        authorized_principals=frozenset({"user-1"}),
+        source_kind="channel",
+        integrity="trusted",
+        integrity_effect="active_ingest",
+    )
+    labels = InformationFlowLabels(sources=(trusted,))
+    return replace(
+        _untainted_ifc_auth(),
+        interactivity=TurnInteractivity.INTERACTIVE,
+        enforcement_enabled=enforcement_enabled,
+        ifc_labels=labels,
+        ifc_state=state,
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("middleware_path", "outcome"),
+    [
+        ("sync", "success"),
+        ("sync", "refusal"),
+        ("sync", "exception"),
+        ("sync", "timeout"),
+        ("async", "success"),
+        ("async", "refusal"),
+        ("async", "exception"),
+        ("async", "timeout"),
+        ("async", "cancellation"),
+    ],
+)
+async def test_operator_direct_context_restores_owned_value_on_every_completion(
+    middleware_path: str,
+    outcome: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from mimir import access_control
+    from mimir.tools import budget_gate
+    from mimir.tools._shell_env import (
+        bind_direct_exec_argv,
+        bound_direct_exec_argv,
+        reset_direct_exec_argv,
+    )
+
+    state = _Arm2LiveState(False)
+    auth = _arm2_operator_auth(state, enforcement_enabled=True)
+    request = _make_request(
+        "shell_exec", f"owned-{middleware_path}-{outcome}", auth,
+        {"command": "chainlink issue show 1"},
+    )
+    argv = ("/pins/chainlink", "issue", "show", "1")
+    binding = OperatorShellBinding(
+        profile=OPERATOR_SHELL_PROFILE,
+        tool_name="shell_exec",
+        tool_call_id=request.tool_call["id"],
+        command=request.tool_call["args"]["command"],
+        requested_cwd=None,
+        resolved_cwd="/bounded",
+        argv=argv,
+        chainlink_mutation=False,
+        _request_identity=request,
+        _auth_context_identity=auth,
+        _issuer=access_control._OPERATOR_SHELL_BINDING_ISSUER,
+    )
+    preparation = _OperatorShellPreparation(
+        outcome=OperatorShellPreparationOutcome.BOUND,
+        binding=binding,
+        refusal=None,
+        binding_rule=None,
+        command_family="chainlink",
+    )
+
+    def authorize(*_args: Any, **_kwargs: Any) -> tuple[ToolAuthorization, None]:
+        return ToolAuthorization(
+            tool_name="shell_exec",
+            decision=OperationDecision.ADMIN_REQUIRED,
+            allowed=True,
+        ), None
+
+    def execute(request: ToolCallRequest) -> ToolMessage:
+        assert bound_direct_exec_argv() == list(argv)
+        if outcome == "refusal":
+            raise ToolException("fixed refusal")
+        if outcome == "exception":
+            raise RuntimeError("handler failed")
+        if outcome == "cancellation":
+            raise asyncio.CancelledError
+        content = "shell_exec timed out after 900s" if outcome == "timeout" else "ran"
+        return ToolMessage(content=content, tool_call_id=request.tool_call["id"])
+
+    async def async_handler(request: ToolCallRequest) -> ToolMessage:
+        return execute(request)
+
+    monkeypatch.setattr(
+        budget_gate, "_prepare_operator_shell_execution", lambda *_args: preparation,
+    )
+    monkeypatch.setattr(budget_gate, "_authorize_tool_call", authorize)
+    owned_token = bind_direct_exec_argv(["prior-owned"])
+    try:
+        if outcome == "exception":
+            with pytest.raises(RuntimeError, match="handler failed"):
+                if middleware_path == "sync":
+                    BudgetGateMiddleware().wrap_tool_call(request, execute)
+                else:
+                    await BudgetGateMiddleware().awrap_tool_call(request, async_handler)
+        elif outcome == "cancellation":
+            with pytest.raises(asyncio.CancelledError):
+                await BudgetGateMiddleware().awrap_tool_call(request, async_handler)
+        elif middleware_path == "sync":
+            BudgetGateMiddleware().wrap_tool_call(request, execute)
+        else:
+            await BudgetGateMiddleware().awrap_tool_call(request, async_handler)
+        assert bound_direct_exec_argv() == ["prior-owned"]
+    finally:
+        reset_direct_exec_argv(owned_token)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("middleware_path", ["sync", "async"])
+@pytest.mark.parametrize(
+    ("rule", "family"),
+    [
+        (ServiceShellBindingRule.PROFILE_ALLOWLIST, "invalid_command"),
+        (ServiceShellBindingRule.UNKNOWN_PROFILE, "parser"),
+        (ServiceShellBindingRule.OPERATOR_CWD_POLICY, "pwd"),
+        (ServiceShellBindingRule.OPERATOR_READ_OPERAND_POLICY, "grep"),
+        (ServiceShellBindingRule.OPERATOR_GIT_HARDENING, "git"),
+        (ServiceShellBindingRule.OPERATOR_BINDING_MISMATCH, "pwd"),
+    ],
+)
+async def test_every_operator_hard_class_stops_before_handler(
+    middleware_path: str,
+    rule: ServiceShellBindingRule,
+    family: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from mimir.tools import budget_gate
+
+    auth = _arm2_operator_auth(_Arm2LiveState(False), enforcement_enabled=False)
+    preparation = _OperatorShellPreparation(
+        outcome=OperatorShellPreparationOutcome.HARD_REFUSED,
+        binding=None,
+        refusal="fixed hard refusal",
+        binding_rule=rule,
+        command_family=family,
+    )
+    calls = 0
+
+    def authorize(*_args: Any, **_kwargs: Any) -> tuple[ToolAuthorization, None]:
+        return ToolAuthorization(
+            tool_name="shell_exec",
+            decision=OperationDecision.ADMIN_REQUIRED,
+            allowed=True,
+        ), None
+
+    def sync_handler(request: ToolCallRequest) -> ToolMessage:
+        nonlocal calls
+        calls += 1
+        return ToolMessage(content="unsafe", tool_call_id=request.tool_call["id"])
+
+    async def async_handler(request: ToolCallRequest) -> ToolMessage:
+        return sync_handler(request)
+
+    monkeypatch.setattr(
+        budget_gate, "_prepare_operator_shell_execution", lambda *_args: preparation,
+    )
+    monkeypatch.setattr(budget_gate, "_authorize_tool_call", authorize)
+    request = _make_request(
+        "shell_exec", f"hard-{family}-{middleware_path}", auth,
+        {"command": "never execute"},
+    )
+    if middleware_path == "sync":
+        result = BudgetGateMiddleware().wrap_tool_call(request, sync_handler)
+    else:
+        result = await BudgetGateMiddleware().awrap_tool_call(request, async_handler)
+
+    assert result.status == "error"
+    assert calls == 0
+
+
+@pytest.mark.parametrize("enforcement_enabled", [False, True])
+@pytest.mark.parametrize(
+    ("command", "family"),
+    [
+        ("pwd | pwd", "profile_miss"),
+        ("pwd '", "profile_miss"),
+        ("", "profile_miss"),
+        ("ls ~", "profile_miss"),
+        ("uv run pytest -q tests/test_sample.py", "profile_miss"),
+        ("printf profile-miss", "profile_miss"),
+        ("jq .", "jq"),
+        ("rg -L needle", "profile_miss"),
+        ("git status --short --verbose", "git"),
+        ("git diff -- --", "profile_miss"),
+    ],
+)
+def test_every_real_soft_family_stops_after_active_ingest(
+    enforcement_enabled: bool,
+    command: str,
+    family: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    maintenance_pinned_executables: dict[str, Path],
+) -> None:
+    root = tmp_path / "operator-root"
+    home = tmp_path / "home"
+    root.mkdir()
+    (home / "state").mkdir(parents=True)
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    monkeypatch.setenv("MIMIR_FILE_TOOL_ROOTS", f"{root}:ro")
+    monkeypatch.setenv(
+        "MIMIR_PROJECT_TEST_COMMAND",
+        json.dumps({
+            "argv": [
+                str(maintenance_pinned_executables["uv"]),
+                "run",
+                "pytest",
+                "-q",
+            ],
+            "cwd": str(root),
+        }),
+    )
+    monkeypatch.setattr(
+        "mimir.read_policy.configured_non_admin_read_roots", lambda: (root,),
+    )
+    state = InformationFlowState()
+    auth = _arm2_operator_auth(state, enforcement_enabled=enforcement_enabled)
+    state.merge(InformationFlowLabels(sources=(SourceLabel(
+        principal="external-source",
+        domain="web",
+        resource_id="active-ingest",
+        bridge_instance="test",
+        sensitivity="private",
+        authorized_principals=frozenset({"user-1"}),
+        source_kind="protected_tool",
+        integrity="untrusted",
+        integrity_effect="active_ingest",
+    ),)), fallback=auth.ifc_labels)
+    request = _make_request(
+        "shell_exec", f"soft-{family}-{enforcement_enabled}", auth,
+        {"command": command, "cwd": str(root)},
+    )
+    preparation = _prepare_operator_shell_execution(
+        request, "shell_exec", auth, auth.ifc_state.current(auth.ifc_labels),
+    )
+    calls = 0
+
+    def handler(execution_request: ToolCallRequest) -> ToolMessage:
+        nonlocal calls
+        calls += 1
+        return ToolMessage(content="unsafe", tool_call_id=execution_request.tool_call["id"])
+
+    assert preparation is not None
+    assert preparation.outcome is OperatorShellPreparationOutcome.SOFT_UNBOUND
+    assert preparation.command_family == family
+    result = BudgetGateMiddleware().wrap_tool_call(request, handler)
+    assert result.status == "error"
+    assert calls == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("middleware_path", ["sync", "async"])
+@pytest.mark.parametrize(
+    "mismatch",
+    ["issuer", "request", "auth", "call_id", "command", "cwd", "cross_request"],
+)
+async def test_operator_binding_mismatch_and_reuse_never_falls_back(
+    middleware_path: str,
+    mismatch: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from dataclasses import replace
+
+    from mimir import access_control
+    from mimir.tools import budget_gate
+
+    auth = _arm2_operator_auth(_Arm2LiveState(False), enforcement_enabled=False)
+    request = _make_request(
+        "shell_exec", f"mismatch-{mismatch}-{middleware_path}", auth,
+        {"command": "chainlink issue show 1", "cwd": "/bounded"},
+    )
+    binding = OperatorShellBinding(
+        profile=OPERATOR_SHELL_PROFILE,
+        tool_name="shell_exec",
+        tool_call_id=request.tool_call["id"],
+        command=request.tool_call["args"]["command"],
+        requested_cwd=request.tool_call["args"]["cwd"],
+        resolved_cwd="/bounded",
+        argv=("/pins/chainlink", "issue", "show", "1"),
+        chainlink_mutation=False,
+        _request_identity=request,
+        _auth_context_identity=auth,
+        _issuer=access_control._OPERATOR_SHELL_BINDING_ISSUER,
+    )
+    if mismatch == "issuer":
+        binding = replace(binding, _issuer=object())
+    elif mismatch in {"request", "cross_request"}:
+        binding = replace(binding, _request_identity=object())
+    elif mismatch == "auth":
+        binding = replace(binding, _auth_context_identity=object())
+    elif mismatch == "call_id":
+        binding = replace(binding, tool_call_id="different-call")
+    elif mismatch == "command":
+        binding = replace(binding, command="chainlink issue show 2")
+    elif mismatch == "cwd":
+        binding = replace(binding, requested_cwd="/different")
+    preparation = _OperatorShellPreparation(
+        outcome=OperatorShellPreparationOutcome.BOUND,
+        binding=binding,
+        refusal=None,
+        binding_rule=None,
+        command_family="chainlink",
+    )
+    calls = 0
+
+    def authorize(*_args: Any, **_kwargs: Any) -> tuple[ToolAuthorization, None]:
+        return ToolAuthorization(
+            tool_name="shell_exec",
+            decision=OperationDecision.ADMIN_REQUIRED,
+            allowed=True,
+        ), None
+
+    def sync_handler(execution_request: ToolCallRequest) -> ToolMessage:
+        nonlocal calls
+        calls += 1
+        return ToolMessage(content="unsafe", tool_call_id=execution_request.tool_call["id"])
+
+    async def async_handler(execution_request: ToolCallRequest) -> ToolMessage:
+        return sync_handler(execution_request)
+
+    monkeypatch.setattr(
+        budget_gate, "_prepare_operator_shell_execution", lambda *_args: preparation,
+    )
+    monkeypatch.setattr(budget_gate, "_authorize_tool_call", authorize)
+    if middleware_path == "sync":
+        result = BudgetGateMiddleware().wrap_tool_call(request, sync_handler)
+    else:
+        result = await BudgetGateMiddleware().awrap_tool_call(request, async_handler)
+
+    assert result.status == "error"
+    assert "binding failed closed" in str(result.content)
+    assert calls == 0
+
+
+@pytest.mark.parametrize("bounded_count", [1, 5], ids=["bounded-after-unbounded", "many-bounded"])
+def test_bounded_iteration_preserves_ingest_and_later_unbounded_refusal(
+    bounded_count: int,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "operator-root"
+    home = tmp_path / "home"
+    root.mkdir()
+    (home / "state").mkdir(parents=True)
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    monkeypatch.setenv("MIMIR_FILE_TOOL_ROOTS", f"{root}:ro")
+    monkeypatch.setattr(
+        "mimir.read_policy.configured_non_admin_read_roots", lambda: (root,),
+    )
+    trusted = SourceLabel(
+        principal="user-1",
+        domain="channel",
+        resource_id="ch-1",
+        bridge_instance="test",
+        sensitivity="private",
+        authorized_principals=frozenset({"user-1"}),
+        source_kind="channel",
+        integrity="trusted",
+        integrity_effect="active_ingest",
+    )
+    labels = InformationFlowLabels(sources=(trusted,))
+    auth = _arm2_operator_auth(
+        InformationFlowState(labels=labels), enforcement_enabled=True,
+    )
+    calls: list[str] = []
+
+    def handler(request: ToolCallRequest) -> ToolMessage:
+        calls.append(request.tool_call["id"])
+        return ToolMessage(content="untrusted output", tool_call_id=request.tool_call["id"])
+
+    middleware = BudgetGateMiddleware()
+    first = middleware.wrap_tool_call(
+        _make_request(
+            "shell_exec", "initial-unbounded", auth,
+            {"command": "printf initial", "cwd": str(root)},
+        ),
+        handler,
+    )
+    bounded = [
+        middleware.wrap_tool_call(
+            _make_request(
+                "shell_exec", f"bounded-{index}", auth,
+                {"command": "pwd -P", "cwd": str(root)},
+            ),
+            handler,
+        )
+        for index in range(bounded_count)
+    ]
+    final = middleware.wrap_tool_call(
+        _make_request(
+            "shell_exec", "later-unbounded", auth,
+            {"command": "printf later", "cwd": str(root)},
+        ),
+        handler,
+    )
+
+    current = auth.ifc_state.current(auth.ifc_labels)
+    assert first.status != "error"
+    assert all(result.status != "error" for result in bounded)
+    assert current.has_untrusted_active_ingest is True
+    assert final.status == "error"
+    assert "ifc_label_blocked:shell_process" in str(final.content)
+    assert calls == ["initial-unbounded", *(f"bounded-{index}" for index in range(bounded_count))]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("middleware_path", ["sync", "async"])
+@pytest.mark.parametrize("enforcement_enabled", [False, True])
+@pytest.mark.parametrize(
+    ("command", "executes"),
+    [
+        ("chainlink issue show 1051 --json", True),
+        ("chainlink issue update 1051 --title updated", False),
+    ],
+    ids=["query", "mutation"],
+)
+async def test_real_operator_authorization_activates_query_not_mutation(
+    middleware_path: str,
+    enforcement_enabled: bool,
+    command: str,
+    executes: bool,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "operator-root"
+    home = tmp_path / "home"
+    root.mkdir()
+    (home / "state").mkdir(parents=True)
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    monkeypatch.setenv("MIMIR_FILE_TOOL_ROOTS", f"{root}:ro")
+    monkeypatch.setattr(
+        "mimir.read_policy.configured_non_admin_read_roots", lambda: (root,),
+    )
+    state = InformationFlowState()
+    auth = _arm2_operator_auth(state, enforcement_enabled=enforcement_enabled)
+    state.merge(InformationFlowLabels(sources=(SourceLabel(
+        principal="external-source",
+        domain="web",
+        resource_id="active-ingest",
+        bridge_instance="test",
+        sensitivity="private",
+        authorized_principals=frozenset({"user-1"}),
+        source_kind="protected_tool",
+        integrity="untrusted",
+        integrity_effect="active_ingest",
+    ),)), fallback=auth.ifc_labels)
+    calls = 0
+
+    def sync_handler(request: ToolCallRequest) -> ToolMessage:
+        nonlocal calls
+        calls += 1
+        return ToolMessage(content="chainlink output", tool_call_id=request.tool_call["id"])
+
+    async def async_handler(request: ToolCallRequest) -> ToolMessage:
+        return sync_handler(request)
+
+    request = _make_request(
+        "shell_exec", f"real-chainlink-{middleware_path}", auth,
+        {"command": command, "cwd": str(root)},
+    )
+    if middleware_path == "sync":
+        result = BudgetGateMiddleware().wrap_tool_call(request, sync_handler)
+    else:
+        result = await BudgetGateMiddleware().awrap_tool_call(request, async_handler)
+
+    assert (result.status != "error") is executes
+    assert calls == int(executes)
+    if not executes:
+        assert "untrusted active ingest" in str(result.content)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("middleware_path", ["sync", "async"])
+@pytest.mark.parametrize("enforcement_enabled", [False, True])
+@pytest.mark.parametrize("transition_point", ["authorization", "review_claim"])
+@pytest.mark.parametrize("final_outcome", [True, None, "error", 1])
+async def test_operator_soft_fallback_rechecks_transitions_after_blocking_steps(
+    middleware_path: str,
+    enforcement_enabled: bool,
+    transition_point: str,
+    final_outcome: object,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from mimir.tools import budget_gate
+    from mimir.tools.github_review_guard import ReviewClaim, ReviewSubmission
+
+    state = _Arm2LiveState(False)
+    auth = _arm2_operator_auth(state, enforcement_enabled=enforcement_enabled)
+    handler_calls = 0
+    authorization_calls = 0
+    claim_calls = 0
+    original_authorize = ToolRegistry.authorize_tool
+
+    def authorize(self: ToolRegistry, *args: Any, **kwargs: Any) -> ToolAuthorization:
+        nonlocal authorization_calls
+        result = original_authorize(self, *args, **kwargs)
+        authorization_calls += 1
+        if transition_point == "authorization":
+            state.outcome = final_outcome
+        return result
+
+    def submission(_request: ToolCallRequest) -> ReviewSubmission:
+        return ReviewSubmission(
+            executable="gh",
+            repo="owner/repo",
+            number=1,
+            state="APPROVED",
+            cwd=None,
+        )
+
+    def claim(_submission: ReviewSubmission) -> ReviewClaim:
+        nonlocal claim_calls
+        claim_calls += 1
+        if transition_point == "review_claim":
+            state.outcome = final_outcome
+        return ReviewClaim(
+            repo="owner/repo",
+            number=1,
+            head="a" * 40,
+            reviewer="operator",
+            state="APPROVED",
+            duplicate=False,
+        )
+
+    def sync_handler(request: ToolCallRequest) -> ToolMessage:
+        nonlocal handler_calls
+        handler_calls += 1
+        return ToolMessage(content="unsafe", tool_call_id=request.tool_call["id"])
+
+    async def async_handler(request: ToolCallRequest) -> ToolMessage:
+        return sync_handler(request)
+
+    monkeypatch.setattr(ToolRegistry, "authorize_tool", authorize)
+    monkeypatch.setattr(
+        "mimir.tools.github_review_guard.review_submission_from_request", submission,
+    )
+    monkeypatch.setattr(
+        "mimir.tools.github_review_guard.claim_review_submission", claim,
+    )
+    request = _make_request(
+        "shell_exec",
+        f"late-{transition_point}-{middleware_path}",
+        auth,
+        {"command": "gh pr review --approve 1 --repo owner/repo"},
+    )
+    if middleware_path == "sync":
+        result = BudgetGateMiddleware().wrap_tool_call(request, sync_handler)
+    else:
+        result = await BudgetGateMiddleware().awrap_tool_call(request, async_handler)
+
+    assert result.status == "error"
+    assert "ifc_label_blocked:shell_process" in str(result.content)
+    assert authorization_calls == 1
+    assert claim_calls == int(transition_point == "review_claim")
+    assert handler_calls == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("middleware_path", ["sync", "async"])
+@pytest.mark.parametrize("enforcement_enabled", [False, True])
+@pytest.mark.parametrize(
+    ("live_outcome", "executes"),
+    [(False, True), (True, False), (None, False), ("error", False), (1, False)],
+)
+async def test_operator_soft_fallback_uses_only_exact_false_live_ifc(
+    middleware_path: str,
+    enforcement_enabled: bool,
+    live_outcome: object,
+    executes: bool,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from dataclasses import replace
+
+    from mimir.tools import budget_gate
+
+    auth = replace(
+        _untainted_ifc_auth(),
+        enforcement_enabled=enforcement_enabled,
+        ifc_state=_Arm2LiveState(live_outcome),
+    )
+    preparation = _OperatorShellPreparation(
+        outcome=OperatorShellPreparationOutcome.SOFT_UNBOUND,
+        binding=None,
+        refusal="fixed profile miss",
+        binding_rule=ServiceShellBindingRule.PROFILE_ALLOWLIST,
+        command_family="profile_miss",
+    )
+    calls = 0
+
+    def authorize(*_args: Any, **_kwargs: Any) -> tuple[ToolAuthorization, None]:
+        return ToolAuthorization(
+            tool_name="shell_exec",
+            decision=OperationDecision.ADMIN_REQUIRED,
+            allowed=True,
+        ), None
+
+    def sync_handler(request: ToolCallRequest) -> ToolMessage:
+        nonlocal calls
+        calls += 1
+        assert "mimir_direct_argv" not in request.tool_call["args"]
+        return ToolMessage(content="ran", tool_call_id=request.tool_call["id"])
+
+    async def async_handler(request: ToolCallRequest) -> ToolMessage:
+        return sync_handler(request)
+
+    monkeypatch.setattr(
+        budget_gate, "_prepare_operator_shell_execution", lambda *_args: preparation,
+    )
+    monkeypatch.setattr(budget_gate, "_authorize_tool_call", authorize)
+    request = _make_request(
+        "shell_exec", f"fallback-{middleware_path}", auth,
+        {"command": "printf pre-ingest"},
+    )
+    if middleware_path == "sync":
+        result = BudgetGateMiddleware().wrap_tool_call(request, sync_handler)
+    else:
+        result = await BudgetGateMiddleware().awrap_tool_call(request, async_handler)
+
+    assert (result.status != "error") is executes
+    assert calls == int(executes)
+    if not executes:
+        assert "ifc_label_blocked:shell_process" in str(result.content)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("middleware_path", ["sync", "async"])
+@pytest.mark.parametrize("enforcement_enabled", [False, True])
+@pytest.mark.parametrize("mutation", [False, True], ids=["query", "mutation"])
+@pytest.mark.parametrize(
+    "live_outcome", [False, True, None, "error", 1],
+)
+async def test_bound_chainlink_live_matrix_never_shadow_executes_mutation(
+    middleware_path: str,
+    enforcement_enabled: bool,
+    mutation: bool,
+    live_outcome: object,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from dataclasses import replace
+
+    from mimir import access_control
+    from mimir.tools import budget_gate
+    from mimir.tools._shell_env import bound_direct_exec_argv
+
+    auth = replace(
+        _untainted_ifc_auth(),
+        enforcement_enabled=enforcement_enabled,
+        ifc_state=_Arm2LiveState(live_outcome),
+    )
+    request = _make_request(
+        "shell_exec", f"chainlink-{middleware_path}", auth,
+        {"command": "chainlink issue update 1" if mutation else "chainlink issue show 1"},
+    )
+    argv = ("/pins/chainlink", "issue", "update" if mutation else "show", "1")
+    binding = OperatorShellBinding(
+        profile=OPERATOR_SHELL_PROFILE,
+        tool_name="shell_exec",
+        tool_call_id=request.tool_call["id"],
+        command=request.tool_call["args"]["command"],
+        requested_cwd=None,
+        resolved_cwd="/bounded",
+        argv=argv,
+        chainlink_mutation=mutation,
+        _request_identity=request,
+        _auth_context_identity=auth,
+        _issuer=access_control._OPERATOR_SHELL_BINDING_ISSUER,
+    )
+    preparation = _OperatorShellPreparation(
+        outcome=OperatorShellPreparationOutcome.BOUND,
+        binding=binding,
+        refusal=None,
+        binding_rule=None,
+        command_family="chainlink",
+    )
+    calls = 0
+
+    def authorize(*_args: Any, **kwargs: Any) -> tuple[ToolAuthorization, None]:
+        assert kwargs["operator_shell_binding"] is binding
+        return ToolAuthorization(
+            tool_name="shell_exec",
+            decision=OperationDecision.ADMIN_REQUIRED,
+            allowed=True,
+        ), None
+
+    def sync_handler(execution_request: ToolCallRequest) -> ToolMessage:
+        nonlocal calls
+        calls += 1
+        assert bound_direct_exec_argv() == list(argv)
+        assert execution_request.tool_call["args"]["cwd"] == "/bounded"
+        return ToolMessage(content="ran", tool_call_id=execution_request.tool_call["id"])
+
+    async def async_handler(execution_request: ToolCallRequest) -> ToolMessage:
+        return sync_handler(execution_request)
+
+    monkeypatch.setattr(
+        budget_gate, "_prepare_operator_shell_execution", lambda *_args: preparation,
+    )
+    monkeypatch.setattr(budget_gate, "_authorize_tool_call", authorize)
+    if middleware_path == "sync":
+        result = BudgetGateMiddleware().wrap_tool_call(request, sync_handler)
+    else:
+        result = await BudgetGateMiddleware().awrap_tool_call(request, async_handler)
+
+    executes = not mutation or live_outcome is False
+    assert (result.status != "error") is executes
+    assert calls == int(executes)
+    assert bound_direct_exec_argv() is None
+    if not executes:
+        assert "untrusted active ingest" in str(result.content)
 
 
 # ─── get_turn alias (unchanged from prior file) ───────────────────

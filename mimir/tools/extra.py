@@ -513,6 +513,7 @@ def shell_exec(
         else:
             proc = subprocess.run(  # noqa: S603 — argv is either the trusted shell wrapper or server-authorized direct argv
                 argv,
+                stdin=subprocess.DEVNULL,
                 capture_output=True,
                 timeout=_SHELL_STATE["timeout_s"],
                 cwd=effective_cwd,

@@ -3416,6 +3416,83 @@ def test_undomained_ingest_with_authoritative_empty_provenance_does_not_taint() 
     ) is None
 
 
+def test_operator_bounded_shell_result_remains_untrusted_active_ingest() -> None:
+    authorization = ToolAuthorization(
+        tool_name="shell_exec",
+        decision=OperationDecision.ADMIN_REQUIRED,
+        allowed=True,
+        flow_direction=ToolFlowDirection.BOTH,
+    )
+
+    labels = classify_protected_result(
+        "shell_exec",
+        {"command": "chainlink issue show 1337 --json"},
+        _auth(roles=("user", "admin")),
+        authorization,
+        result="bounded output",
+    )
+
+    assert labels is not None
+    source = next(iter(labels.sources))
+    assert (source.integrity, source.integrity_effect) == (
+        "untrusted", "active_ingest",
+    )
+    assert labels.has_untrusted_active_ingest is True
+
+
+def test_operator_bounded_shell_results_merge_monotonically() -> None:
+    auth = _auth(roles=("user", "admin"))
+    authorization = ToolAuthorization(
+        tool_name="shell_exec",
+        decision=OperationDecision.ADMIN_REQUIRED,
+        allowed=True,
+        flow_direction=ToolFlowDirection.BOTH,
+    )
+    first = classify_protected_result(
+        "shell_exec", {"command": "pwd -P"}, auth, authorization,
+        result="first bounded output",
+    )
+    second = classify_protected_result(
+        "shell_exec", {"command": "ls -la"}, auth, authorization,
+        result="second bounded output",
+    )
+    assert first is not None and second is not None
+
+    merged = _merge_ifc_labels(_labels(), first)
+    merged_twice = _merge_ifc_labels(merged, first)
+    grown = _merge_ifc_labels(merged_twice, second)
+
+    assert merged_twice.sources == merged.sources
+    assert set(merged.sources) <= set(grown.sources)
+    assert grown.has_untrusted_active_ingest is True
+
+
+def test_repo_review_shell_result_remains_informational() -> None:
+    auth = replace(
+        _auth(),
+        repo_review_state=SimpleNamespace(action_scope=object()),
+    )
+    authorization = ToolAuthorization(
+        tool_name="shell_exec",
+        decision=OperationDecision.ADMIN_REQUIRED,
+        allowed=True,
+        flow_direction=ToolFlowDirection.BOTH,
+    )
+
+    labels = classify_protected_result(
+        "shell_exec", {"command": "git status --short"}, auth, authorization,
+        result="review output",
+    )
+
+    assert labels is not None
+    source = next(iter(labels.sources))
+    assert source.resource_id == "repo_review"
+    assert (source.integrity, source.integrity_effect) == (
+        "untrusted", "informational",
+    )
+    assert labels.has_untrusted_active_ingest is False
+
+
 @pytest.mark.parametrize("root", sorted(_SELF_AUTHORED_FILE_ROOTS))
 def test_operator_seeded_file_without_provenance_is_trusted_informational(
     tmp_path: Path,
