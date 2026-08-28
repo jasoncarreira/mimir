@@ -59,6 +59,7 @@ from .chainlink_board import (
     build_chainlink_board_payload,
     resolve_worklink_artifact,
 )
+from .worklink.backends.feature_factory import _RUN_ID as _FACTORY_RUN_ID_RE
 from .worklink.factory_state import (
     FactoryRunRecord,
     FactoryRecordError,
@@ -104,8 +105,6 @@ from .wiki_backlinks import (
 )
 
 log = logging.getLogger(__name__)
-
-_SAFE_FACTORY_RUN_ID_RE = re.compile(r"[1-9][0-9]{0,18}")
 
 _TURN_VIEWER_HTML: str | None = None
 _WEB_AUTH_JS: str | None = None
@@ -1624,7 +1623,7 @@ def register_routes(
         run_id = request.match_info.get("run_id", "").strip()
         if not run_id:
             return json_error("missing_run_id", "run_id is required", status=400)
-        if not _SAFE_FACTORY_RUN_ID_RE.fullmatch(run_id) or ".." in run_id:
+        if not _FACTORY_RUN_ID_RE.fullmatch(run_id) or ".." in run_id:
             return json_error("invalid_run_id", "run_id is invalid", status=400)
 
         if home is None:
@@ -2311,7 +2310,7 @@ def register_routes(
     def factory_runs_backend_routes() -> list[DashboardBackendRoute]:
         return [
             DashboardBackendRoute("GET", "/api/v1/factory-runs", factory_runs_list_v1),
-            DashboardBackendRoute("GET", "/api/v1/factory-runs/{run_id:.+}", factory_runs_detail_v1),
+            DashboardBackendRoute("GET", "/api/v1/factory-runs/{run_id:.*}", factory_runs_detail_v1),
         ]
 
     def scheduler_backend_routes() -> list[DashboardBackendRoute]:
