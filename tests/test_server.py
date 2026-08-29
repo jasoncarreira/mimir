@@ -3196,15 +3196,17 @@ async def test_real_acp_failure_leaves_exact_bundle_and_unrelated_channel_turn_h
         ):
             writer.write(json.dumps(request, separators=(",", ":")).encode() + b"\n")
         await writer.drain()
+        # This timeout is a hang guard, not a latency budget.
         responses = [
-            json.loads(await asyncio.wait_for(reader.readline(), 1.0))
+            json.loads(await asyncio.wait_for(reader.readline(), 10.0))
             for _ in range(2)
         ]
         assert [response["id"] for response in responses] == [1, 2]
         assert all("error" not in response for response in responses)
 
         writer.transport.abort()
-        for _ in range(100):
+        # This poll is a ten-second hang guard, not a latency budget.
+        for _ in range(1000):
             if not daemon._peers and not daemon._connection_runners:
                 break
             await asyncio.sleep(0.01)
