@@ -34,7 +34,7 @@ import tempfile
 import time
 import uuid
 from collections import deque
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field, fields, replace
 from datetime import datetime, timezone
 from functools import partial
 from pathlib import Path
@@ -57,7 +57,7 @@ from ..pollers import (
     PollerOverridesValidationError,
     validate_poller_overrides_text,
 )
-from ..models import AuthContext, TurnInteractivity
+from ..models import AuthContext, Integrity, IntegrityEffect, TurnInteractivity
 from ..scheduler import SchedulerJob
 
 # Per-task ContextVar for channel_id — isolated across concurrent asyncio
@@ -455,6 +455,94 @@ def _render_approval_metadata(value: object) -> str:
     return json.dumps(value, ensure_ascii=True)
 
 
+_MAX_APPROVAL_SOURCE_GROUPS = 20
+_APPROVAL_SOURCE_GROUP_FIELDS = (
+    "domain",
+    "sensitivity",
+    "authorized_principals",
+    "source_kind",
+    "integrity",
+    "integrity_effect",
+)
+
+
+def _render_approval_source(source: Any, *, include_resource_id: bool) -> str:
+    render = _render_approval_metadata
+    values = [
+        f"principal={render(source.principal or '(unknown)')}",
+        f"domain={render(source.domain or '(unknown)')}",
+    ]
+    if include_resource_id:
+        values.append(f"resource_id={render(source.resource_id or '(unknown)')}")
+    values.extend((
+        f"bridge_instance={render(source.bridge_instance or '(unknown)')}",
+        f"sensitivity={render(source.sensitivity)}",
+        f"authorized_principals={render(sorted(source.authorized_principals))}",
+        f"source_kind={render(source.source_kind)}",
+        f"integrity={render(source.integrity)}",
+        f"integrity_effect={render(source.integrity_effect)}",
+    ))
+    return "; ".join(values)
+
+
+def _render_approval_source_summary(sources: tuple[Any, ...]) -> str:
+    render = _render_approval_metadata
+    entries: list[str] = []
+    grouped: dict[tuple[Any, ...], list[Any]] = {}
+    for source in sources:
+        if (
+            source.integrity == Integrity.UNTRUSTED
+            and source.integrity_effect == IntegrityEffect.ACTIVE_INGEST
+        ):
+            entries.append(f"- {_render_approval_source(source, include_resource_id=True)}")
+            continue
+        key = (
+            source.domain,
+            source.sensitivity,
+            tuple(sorted(source.authorized_principals)),
+            source.source_kind,
+            source.integrity,
+            source.integrity_effect,
+        )
+        grouped.setdefault(key, []).append(source)
+
+    known_fields = {
+        "principal", "resource_id", "bridge_instance", *_APPROVAL_SOURCE_GROUP_FIELDS,
+    }
+    extra_fields = tuple(
+        source_field.name
+        for source_field in fields(type(sources[0]))
+        if source_field.name not in known_fields
+    ) if sources else ()
+    for key, group in grouped.items():
+        domain, sensitivity, authorized, source_kind, integrity, integrity_effect = key
+        principals = sorted({source.principal or "(unknown)" for source in group})
+        bridges = sorted({source.bridge_instance or "(unknown)" for source in group})
+        values = [
+            f"count={render(len(group))}",
+            f"principals={render(principals)}",
+            f"domain={render(domain or '(unknown)')}",
+            f"bridge_instances={render(bridges)}",
+            f"sensitivity={render(sensitivity)}",
+            f"authorized_principals={render(list(authorized))}",
+            f"source_kind={render(source_kind)}",
+            f"integrity={render(integrity)}",
+            f"integrity_effect={render(integrity_effect)}",
+        ]
+        for field_name in extra_fields:
+            field_values = sorted({str(getattr(source, field_name)) for source in group})
+            values.append(f"{field_name}={render(field_values)}")
+        entries.append(f"- {'; '.join(values)}")
+
+    if not entries:
+        return "- (none)"
+    shown = entries[:_MAX_APPROVAL_SOURCE_GROUPS]
+    omitted = len(entries) - len(shown)
+    if omitted:
+        shown.append(f"- {render(omitted)} additional source groups not shown")
+    return "\n".join(shown)
+
+
 @tool
 async def request_operator_approval(
     tool_name: str,
@@ -503,6 +591,7 @@ async def request_operator_approval(
         return "request_operator_approval refused: sink_category is required"
 
     category = None
+    parsed_category = None
     request_carrier = None
     request_ordinal = None
     if sink_category is not None:
@@ -562,19 +651,38 @@ async def request_operator_approval(
             f"Target: {render(normalized_target)}\n"
         )
     else:
-        rendered_sources = "\n".join(
-            "- "
-            f"principal={render(source.principal or '(unknown)')}; "
-            f"domain={render(source.domain or '(unknown)')}; "
-            f"resource_id={render(source.resource_id or '(unknown)')}; "
-            f"bridge_instance={render(source.bridge_instance or '(unknown)')}; "
-            f"sensitivity={render(source.sensitivity)}; "
-            f"authorized_principals={render(sorted(source.authorized_principals))}; "
-            f"source_kind={render(source.source_kind)}; "
-            f"integrity={render(source.integrity)}; "
-            f"integrity_effect={render(source.integrity_effect)}"
-            for source in request_carrier.sources
-        ) or "- (none)"
+        from ..access_control import _ifc_blocking_source
+
+        blocking_source = None
+        blocking_scope = "unknown"
+        try:
+            blocking_source, blocking_scope = _ifc_blocking_source(
+                request_carrier,
+                auth,
+                parsed_category,
+            )
+        except Exception as exc:
+            blocking_scope = "classification_failed"
+            log.warning("IFC approval source classification failed: %s", exc)
+
+        if blocking_scope == "causing_source" and blocking_source is not None:
+            blocking_details = (
+                "Blocking source (cause):\n"
+                f"- {_render_approval_source(blocking_source, include_resource_id=True)}\n"
+            )
+        elif blocking_scope == "representative_source" and blocking_source is not None:
+            blocking_details = (
+                "Blocking source (representative, not confirmed as the cause):\n"
+                f"- {_render_approval_source(blocking_source, include_resource_id=True)}\n"
+            )
+        elif blocking_scope == "no_sources":
+            blocking_details = "Blocking source: no sources were available to classify.\n"
+        elif blocking_scope == "classification_failed":
+            blocking_details = "Blocking source: classification failed; the cause is unknown.\n"
+        else:
+            blocking_details = "Blocking source: unknown; no source could be classified.\n"
+
+        rendered_sources = _render_approval_source_summary(request_carrier.sources)
         request_details = (
             f"Sink category: {render(category)}\n"
             f"Turn: {render(ctx.turn_id)}\n"
@@ -583,7 +691,6 @@ async def request_operator_approval(
             "in this sink category for the remainder of this turn.\n"
             f"Requested tool (non-binding context only): {render(normalized_tool)}\n"
             f"Requested target (non-binding context only): {render(normalized_target)}\n"
-            f"Sources:\n{rendered_sources}\n"
         )
     alert = (
         "Operator approval requested\n"
@@ -591,6 +698,8 @@ async def request_operator_approval(
         f"Reason: {render(normalized_reason or '(none provided)')}\n"
         "Reply APPROVE or DECLINE in this channel. The request expires in 5 minutes."
     )
+    if category is not None:
+        alert += f"\n{blocking_details}Source summary:\n{rendered_sources}"
     try:
         result = await channels.send(channel_id, alert, final=False)
     except Exception:
