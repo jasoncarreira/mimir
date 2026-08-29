@@ -239,9 +239,9 @@ async def test_close_deadline_before_and_after_witnesses(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("release_delay,before", [(0.02, True), (0.06, False)])
+@pytest.mark.parametrize("release_delay,before", [(0.02, True), (None, False)])
 async def test_abort_wait_deadline_before_and_after_witnesses(
-    release_delay: float,
+    release_delay: float | None,
     before: bool,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -249,18 +249,25 @@ async def test_abort_wait_deadline_before_and_after_witnesses(
     monkeypatch.setattr("mimir.acp.transport.WRITER_ABORT_TIMEOUT", 0.03)
     gate = asyncio.Event()
     writer = StagedWriter(close_gate=gate)
-    release = asyncio.create_task(_release_after(gate, release_delay))
+    release = (
+        asyncio.create_task(_release_after(gate, release_delay))
+        if release_delay is not None
+        else None
+    )
     await close_writer(writer)
     assert writer.aborted
     assert gate.is_set() is before
     assert writer.wait_calls == 2
-    await release
+    if release is not None:
+        await release
+    else:
+        gate.set()
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("release_delay,before", [(0.005, True), (0.04, False)])
+@pytest.mark.parametrize("release_delay,before", [(0.005, True), (None, False)])
 async def test_force_close_deadline_before_and_after_witnesses(
-    release_delay: float,
+    release_delay: float | None,
     before: bool,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -280,9 +287,16 @@ async def test_force_close_deadline_before_and_after_witnesses(
     right.feed_eof()
     left_writer = ClosingGateWriter()
     right_writer = ClosingGateWriter()
-    release = asyncio.create_task(_release_after(gate, release_delay))
+    release = (
+        asyncio.create_task(_release_after(gate, release_delay))
+        if release_delay is not None
+        else None
+    )
     await pump_bidirectional(left, left_writer, right, right_writer)
     assert gate.is_set() is before
     if before:
         assert left_writer.closed and right_writer.closed
-    await release
+    if release is not None:
+        await release
+    else:
+        gate.set()
