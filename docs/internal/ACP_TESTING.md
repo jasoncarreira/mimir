@@ -111,15 +111,20 @@ hands-tools.json     tool manifest the fake provider advertises
    | `acp_scenario7.py` | the `session/new` working directory |
    | `acp_hands.py` | the default prompt's target path |
 
-3. **Do not reissue the saved key by following the harness README as written.** The
-   saved `acp-key.out` from 2026-08-21 carries principal `acp-tester`, while the README's
-   issuance flow uses principal `acptest`. Following that flow invalidates the saved key
-   that the other scenarios expect, and the resulting failure appears later as an
-   unrelated authentication error. Use the existing output with its `acp-tester` key, or
-   deliberately issue and consistently use a replacement without relying on the saved
-   file. The scripts parse the key from the issuance output with
-   `re.search(r"│\s+(\S{24,})", ...)` — i.e. they read the box-drawn "COPY NOW" panel
-   directly — and take that output file as `argv[1]`.
+3. **Do not reuse the saved key or follow the harness README's issuance flow as
+   written.** The saved `acp-key.out` from 2026-08-21 carries principal `acp-tester`, but
+   its key belongs to the retired host-side `/tmp/acp-h` rig and does not match any
+   identity in this `mimir-acptest` container. The README instead issues for principal
+   `acptest`; silently switching between those names makes later authentication failures
+   especially confusing.
+
+   Issue a replacement key for a principal configured in **this container**, save its
+   one-time output, and use that principal and output consistently for every scenario.
+   At this snapshot, newly issued keys are not accepted by an already-running ACP daemon
+   until the process restarts (chainlink #1494). After issuance, restart it with
+   `s6-svc -r /run/service/mimir` before running the harness. The scripts parse the key
+   from the issuance output with `re.search(r"│\s+(\S{24,})", ...)` — i.e. they read the
+   box-drawn "COPY NOW" panel directly — and take that output file as `argv[1]`.
 
 ```
 python acp_scenario5.py acp-key.out
@@ -209,9 +214,16 @@ what is accepted and the bare object is what is rejected, the reverse of the fin
 `tests/test_client_provider.py` pins that contract for all three Hands tools. `HANDS_BARE`
 toggles between the two shapes so the harness can still exercise the rejected one.
 
-**B. `hands_edit` and `hands_shell` are refused before reaching the client**
-(`ifc_label_blocked:shell_process`). `session/request_permission` count across every run:
-**0**. The permission machinery exists and is dormant.
+**B. `hands_edit` and `hands_shell` are refused before reaching the client.** At this
+snapshot the observable marker depends on which gate refuses the call:
+
+- post-eligibility: `hands_edit permission was rejected before execution`
+- eligibility: `shell_exec permission eligibility refused: capability-context wiring failed
+  (profile_policy)`
+
+The older `ifc_label_blocked:shell_process` marker is stale. In every case,
+`session/request_permission` count across the run is **0**: the permission machinery exists
+but the request never reaches the client.
 
 **C. Declaring the provider breaks plain `shell_exec` in the same session** — verified with
 a same-session discriminating pair.
