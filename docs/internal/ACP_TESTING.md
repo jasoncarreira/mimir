@@ -68,6 +68,11 @@ This is the layer that catches "works in the repo, broken in the wheel".
 
 Location: `~/projects/odin/acp-test-harness` (a scratch directory, **not** in the repo).
 
+This section records the harness on disk and the `mimir-acptest` container running
+`feature/acp` at commit `02c71c57` (observed 2026-08-21). Treat the paths and
+principal names below as a dated snapshot: check them again if either the harness or
+container has changed.
+
 ```
 acp_client.py        minimal stock-ACP client over the daemon socket
 acp_scenario5.py     tool vs no-tool message delivery
@@ -80,12 +85,46 @@ hands-tools.json     tool manifest the fake provider advertises
 
 1. A running `mimir run` with `MIMIR_ACP_ENABLED=true`. The proxy never starts the agent;
    if the daemon is absent you get the deliberately generic `error: connection-failed`.
-2. The daemon socket at `$MIMIR_HOME/.mimir/acp/daemon.sock` — the harness hardcodes
-   `/tmp/acp-h/.mimir/acp/daemon.sock`, so either run the agent with `MIMIR_HOME=/tmp/acp-h`
-   or edit `SOCK` in `acp_client.py` and `acp_hands.py`.
-3. A web key, issued once and shown once. The scripts parse it out of the issuance output
-   with `re.search(r"│\s+(\S{24,})", ...)` — i.e. they read the box-drawn "COPY NOW" panel
-   directly, so save that output to a file and pass the path as `argv[1]`.
+2. A route into the container. In this snapshot the agent runs inside `mimir-acptest`
+   with `MIMIR_HOME=/mimir-home`, so its daemon socket is
+   `/mimir-home/.mimir/acp/daemon.sock` inside that container. The documented host path
+   `/tmp/acp-h/.mimir/acp/daemon.sock` does not exist. On macOS, bind-mounting or naming
+   that path cannot make the old route work: an AF_UNIX socket cannot cross the Docker
+   Desktop VM boundary.
+
+   Use one of the routes that does cross the boundary:
+
+   - copy the harness into `mimir-acptest` and run it there, pointing it at the daemon
+     socket and paths under `/mimir-home`; or
+   - connect through the SSH relay exposed at `127.0.0.1:2222`. The working relay pattern
+     is already implemented by `acp-test-home/acp_smoke.py` and documented in that
+     directory's README; use that transport rather than trying to expose the Unix socket
+     to the host.
+
+   Copying the harness into the container requires accounting for all four
+   `/tmp/acp-h` hardcodes, not only the socket:
+
+   | file | hardcode |
+   |---|---|
+   | `acp_client.py` | `SOCK`, the daemon socket path |
+   | `acp_scenario5.py` | the `session/new` working directory |
+   | `acp_scenario7.py` | the `session/new` working directory |
+   | `acp_hands.py` | the default prompt's target path |
+
+3. **Do not reuse the saved key or follow the harness README's issuance flow as
+   written.** The saved `acp-key.out` from 2026-08-21 carries principal `acp-tester`, but
+   its key belongs to the retired host-side `/tmp/acp-h` rig and does not match any
+   identity in this `mimir-acptest` container. The README instead issues for principal
+   `acptest`; silently switching between those names makes later authentication failures
+   especially confusing.
+
+   Issue a replacement key for a principal configured in **this container**, save its
+   one-time output, and use that principal and output consistently for every scenario.
+   At this snapshot, newly issued keys are not accepted by an already-running ACP daemon
+   until the process restarts (chainlink #1494). After issuance, restart it with
+   `s6-svc -r /run/service/mimir` before running the harness. The scripts parse the key
+   from the issuance output with `re.search(r"│\s+(\S{24,})", ...)` — i.e. they read the
+   box-drawn "COPY NOW" panel directly — and take that output file as `argv[1]`.
 
 ```
 python acp_scenario5.py acp-key.out
@@ -122,9 +161,15 @@ Reads three paths in one session and reports what was delivered:
 
 | path | expectation |
 |---|---|
-| `docs/trust-probe.md` | newly trusted by #1591 |
+| `docs/trust-probe.md` | intended newly trusted probe; missing in this container snapshot |
 | `memory/core/00-identity.md` | already trusted |
 | `saga.toml` (home root) | untrusted |
+
+A usable `docs/trust-probe.md` must contain a distinctive, harmless line that the prompt
+can request and the client can recognize in the reply. Before running the scenario,
+either supply that fixture under `/mimir-home/docs/` or substitute another existing
+target covered by the same docs trust rule and update the expected text. The other two
+targets were present in `mimir-acptest` at the snapshot above.
 
 A read that succeeds but delivers nothing is the interesting outcome — that is the
 information-flow gate blocking the *reply* rather than the *read*, which looks identical
@@ -153,6 +198,10 @@ Measured against a fully compliant client-side provider — correct `mcp/connect
 schemas, valid responses. These are the findings that justified the Hands redesign
 (`ACP_HANDS_REPL_DESIGN.md`, alongside this file on this branch):
 
+Status in this subsection is also as of commit `02c71c57` in `mimir-acptest`: A is a
+historical finding followed by its current, fixed behaviour; B and C remained current at
+that snapshot.
+
 **A. `tools/call` accepted only a bare structured object — FIXED, and now inverted.**
 When measured, the MCP-spec `CallToolResult` shape was rejected as `hands_read returned a
 malformed result`, even though `tools/list` advertises `outputSchema`, which in MCP *means*
@@ -165,9 +214,16 @@ what is accepted and the bare object is what is rejected, the reverse of the fin
 `tests/test_client_provider.py` pins that contract for all three Hands tools. `HANDS_BARE`
 toggles between the two shapes so the harness can still exercise the rejected one.
 
-**B. `hands_edit` and `hands_shell` are refused before reaching the client**
-(`ifc_label_blocked:shell_process`). `session/request_permission` count across every run:
-**0**. The permission machinery exists and is dormant.
+**B. `hands_edit` and `hands_shell` are refused before reaching the client.** At this
+snapshot the observable marker depends on which gate refuses the call:
+
+- post-eligibility: `hands_edit permission was rejected before execution`
+- eligibility: `shell_exec permission eligibility refused: capability-context wiring failed
+  (profile_policy)`
+
+The older `ifc_label_blocked:shell_process` marker is stale. In every case,
+`session/request_permission` count across the run is **0**: the permission machinery exists
+but the request never reaches the client.
 
 **C. Declaring the provider breaks plain `shell_exec` in the same session** — verified with
 a same-session discriminating pair.
@@ -186,7 +242,13 @@ Known and worth stating rather than discovering again:
 - **Denial paths are unexercised.** Both clients auto-approve permission requests. Nothing
   currently drives a `cancelled` outcome or a rejected option.
 - **The harness lives outside the repo**, so it is not versioned with the code it tests and
-  will drift. It also hardcodes `/tmp/acp-h`.
+  will drift. At the `02c71c57` snapshot it had four separate `/tmp/acp-h` assumptions:
+  `acp_client.py`'s `SOCK`, the `session/new` working directories in
+  `acp_scenario5.py` and `acp_scenario7.py`, and `acp_hands.py`'s default prompt path.
+- **Scenario 7's newly trusted fixture is absent.** `mimir-acptest` did not contain
+  `/mimir-home/docs/trust-probe.md` at the snapshot, so the scenario needs the recognizable
+  probe file supplied or an equivalent trusted docs target substituted before its three-way
+  comparison is meaningful.
 - **The key parser is fragile** — it regexes a box-drawn CLI panel. A cosmetic change to
   that output breaks every scenario with a confusing failure.
 - **No automated interop test for B and C.** All three findings were made by hand. A is now
