@@ -26,6 +26,29 @@ RUN_STATE_VERSION = 2
 
 
 @dataclass(frozen=True)
+class OrphanBlockRecord:
+    """Provenance for a block owned by one orphaned attempt checkout."""
+
+    issue_id: int
+    attempt: int
+    checkout: str
+    publication_outcome: str
+    comment: str
+
+    @classmethod
+    def from_json(cls, data: Any) -> "OrphanBlockRecord":
+        if not isinstance(data, dict):
+            raise TypeError("orphan block record must be a JSON object")
+        return cls(
+            issue_id=int(data["issue_id"]),
+            attempt=int(data["attempt"]),
+            checkout=str(data["checkout"]),
+            publication_outcome=str(data["publication_outcome"]),
+            comment=str(data["comment"]),
+        )
+
+
+@dataclass(frozen=True)
 class WorklinkRunState:
     """Everything a fresh controller needs to reattach to an in-flight run."""
 
@@ -121,6 +144,7 @@ def save_run_state(home: Path, state: WorklinkRunState) -> Path:
     tmp = path.with_name(path.name + ".tmp")
     tmp.write_text(json.dumps(state.to_json(), indent=2, sort_keys=True), encoding="utf-8")
     tmp.replace(path)
+    clear_orphan_block_record(home, state.issue_id)
     return path
 
 
@@ -165,6 +189,50 @@ def list_run_states(home: Path) -> list[WorklinkRunState]:
         except (KeyError, TypeError, ValueError):
             continue
     return states
+
+
+def orphan_blocks_dir(home: Path) -> Path:
+    return home / "state" / "worklink" / "orphan-blocks"
+
+
+def orphan_block_path(home: Path, issue_id: int) -> Path:
+    return orphan_blocks_dir(home) / f"{issue_id}.json"
+
+
+def save_orphan_block_record(home: Path, record: OrphanBlockRecord) -> Path:
+    path = orphan_block_path(home, record.issue_id)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(json.dumps(asdict(record), indent=2, sort_keys=True), encoding="utf-8")
+    tmp.replace(path)
+    return path
+
+
+def load_orphan_block_record(home: Path, issue_id: int) -> OrphanBlockRecord | None:
+    try:
+        data = json.loads(orphan_block_path(home, issue_id).read_text(encoding="utf-8"))
+        return OrphanBlockRecord.from_json(data)
+    except (KeyError, TypeError, ValueError, OSError, json.JSONDecodeError):
+        return None
+
+
+def list_orphan_block_records(home: Path) -> list[OrphanBlockRecord]:
+    directory = orphan_blocks_dir(home)
+    if not directory.exists():
+        return []
+    records: list[OrphanBlockRecord] = []
+    for path in sorted(directory.glob("*.json")):
+        record = load_orphan_block_record(home, int(path.stem)) if path.stem.isdigit() else None
+        if record is not None:
+            records.append(record)
+    return records
+
+
+def clear_orphan_block_record(home: Path, issue_id: int) -> None:
+    try:
+        orphan_block_path(home, issue_id).unlink()
+    except OSError:
+        return
 
 
 def _process_stat(pid: int) -> tuple[str, int] | None:

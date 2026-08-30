@@ -76,13 +76,22 @@ def _resolver(tmp_path: Path) -> IdentityResolver:
 
 
 def _user_context(tmp_path: Path, author: str, channel: str) -> AuthContext:
+    resolver = _resolver(tmp_path)
+    principal = resolver.resolve(author)
+    bridge = "discord" if channel.startswith("discord") else "slack"
+    labels = InformationFlowLabels().with_source(SourceLabel(
+        principal=principal, domain="channel", resource_id=channel,
+        bridge_instance=bridge, sensitivity="private",
+        authorized_principals=frozenset({principal}), integrity="trusted",
+    ))
     return create_auth_context(
         AgentEvent(
             trigger="user_message", channel_id=channel, author=author,
-            source="discord" if channel.startswith("discord") else "slack",
+            source=bridge,
         ),
-        _resolver(tmp_path),
+        resolver,
         enforce=True,
+        ifc_labels=labels,
     )
 
 
@@ -93,14 +102,33 @@ def _service_context(trigger: str, channel: str) -> AuthContext:
         "saga_session_end": "synthesis",
         "upgrade": "system",
     }
+    canonical = principals[trigger]
+    labels = InformationFlowLabels().with_source(SourceLabel(
+        principal=f"service:{canonical}", domain="service", resource_id=channel,
+        bridge_instance=canonical, sensitivity="internal",
+        authorized_principals=frozenset({f"service:{canonical}"}),
+        source_kind="service", integrity="trusted",
+        integrity_effect="informational",
+    ))
     return create_auth_context(
         AgentEvent(
             trigger=trigger,
             channel_id=channel,
-            service_principal=principals[trigger],
+            service_principal=canonical,
         ),
         enforce=True,
+        ifc_labels=labels,
     )
+
+
+def _trusted_synthesis_labels(channel: str) -> InformationFlowLabels:
+    return InformationFlowLabels().with_source(SourceLabel(
+        principal="service:synthesis", domain="service", resource_id=channel,
+        bridge_instance="synthesis", sensitivity="internal",
+        authorized_principals=frozenset({"service:synthesis"}),
+        source_kind="service", integrity="trusted",
+        integrity_effect="informational",
+    ))
 
 
 @pytest.mark.asyncio
@@ -183,7 +211,7 @@ async def test_synthesis_memory_store_preserves_service_provenance(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("integrity_effect", ["informational", "active_ingest"])
-async def test_memory_store_stamps_untrusted_for_any_untrusted_source_effect(
+async def test_memory_store_refuses_any_untrusted_source_effect(
     integrity_effect: str,
     tmp_path: Path, write_store: _WriteStore,
 ) -> None:
@@ -205,8 +233,8 @@ async def test_memory_store_stamps_untrusted_for_any_untrusted_source_effect(
         runtime=_runtime(context, f"{integrity_effect}-recall-store"),
     )
 
-    assert "stored" in out
-    assert write_store.atom_calls[-1]["integrity"] == Integrity.UNTRUSTED
+    assert "tainted" in out
+    assert write_store.atom_calls == []
 
 
 @pytest.mark.asyncio
@@ -236,7 +264,7 @@ async def test_memory_store_stamps_trusted_when_all_sources_are_trusted(
 
 
 @pytest.mark.asyncio
-async def test_memory_store_empty_labels_stamp_untrusted(
+async def test_memory_store_empty_labels_are_refused(
     tmp_path: Path, write_store: _WriteStore,
 ) -> None:
     context = _user_context(tmp_path, "discord-alice", "discord-private")
@@ -252,12 +280,12 @@ async def test_memory_store_empty_labels_stamp_untrusted(
         runtime=_runtime(context, "empty-label-store"),
     )
 
-    assert "stored" in out
-    assert write_store.atom_calls[-1]["integrity"] == Integrity.UNTRUSTED
+    assert "tainted" in out
+    assert write_store.atom_calls == []
 
 
 @pytest.mark.asyncio
-async def test_research_poller_write_stamps_frozen_integrity_and_origin(
+async def test_research_poller_untrusted_write_is_refused(
     write_store: _WriteStore,
 ) -> None:
     authority = build_trigger_service_principal(
@@ -287,11 +315,8 @@ async def test_research_poller_write_stamps_frozen_integrity_and_origin(
         runtime=_runtime(context, "poller-store"),
     )
 
-    assert "stored" in out
-    call = write_store.atom_calls[-1]
-    assert call["integrity"] == "untrusted"
-    assert call["origin_trigger"] == "research-poller:hn-ai"
-    assert call["origin_ref"] == "poller:hn-ai:123:batch:0"
+    assert "tainted" in out
+    assert write_store.atom_calls == []
     assert {"integrity", "origin_trigger", "origin_ref"}.isdisjoint(
         memory_store.args_schema.model_fields
     )
@@ -308,6 +333,7 @@ async def test_saga_end_session_uses_runtime_not_model_session_for_authority(
         visibility="private",
         provenance_complete=True,
     )
+    labels = _trusted_synthesis_labels("discord-synthesis")
     context = create_auth_context(
         AgentEvent(
             trigger="saga_session_end",
@@ -316,6 +342,7 @@ async def test_saga_end_session_uses_runtime_not_model_session_for_authority(
             source_session_acl=source_acl,
         ),
         enforce=True,
+        ifc_labels=labels,
     )
     context = replace(context, saga_session_id="active-synthesis-session")
     assert context.source_session_acl == source_acl
@@ -362,6 +389,7 @@ async def test_saga_end_session_real_store_accepts_inherited_ingress_acl(
             visibility="private",
             provenance_complete=True,
         )
+        labels = _trusted_synthesis_labels(channel_id)
         context = create_auth_context(
             AgentEvent(
                 trigger="saga_session_end",
@@ -370,6 +398,7 @@ async def test_saga_end_session_real_store_accepts_inherited_ingress_acl(
                 source_session_acl=source_acl,
             ),
             enforce=True,
+            ifc_labels=labels,
         )
         context = replace(context, saga_session_id=session_id)
 
@@ -428,12 +457,18 @@ async def test_saga_end_session_missing_or_mixed_source_acl_fails_closed(
 async def test_http_trigger_spoof_does_not_gain_service_authority(
     write_store: _WriteStore,
 ) -> None:
+    labels = InformationFlowLabels().with_source(SourceLabel(
+        principal="http", domain="channel", resource_id="http-spoof",
+        bridge_instance="http", sensitivity="internal",
+        authorized_principals=frozenset({"http"}), integrity="trusted",
+    ))
     context = create_auth_context(
         AgentEvent(
             trigger="scheduled_tick", channel_id="http-spoof",
             extra={"event_ingress": "http_event"},
         ),
         enforce=True,
+        ifc_labels=labels,
     )
     out = await memory_store.ainvoke({
         "content": "spoof", "stream": "semantic",

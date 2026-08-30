@@ -97,6 +97,7 @@ def _service_labels(event) -> InformationFlowLabels:
             bridge_instance=event.source,
             sensitivity="internal",
             authorized_principals=frozenset({principal}) if principal else frozenset(),
+            integrity="trusted",
         )}),
     )
 
@@ -680,10 +681,7 @@ def test_service_principals_allow_only_explicit_operations_and_compatible_flows(
         channel_id=f"{trigger}:test",
         service_principal=service_principals.get(trigger),
     )
-    labels = InformationFlowLabels(
-        labels=frozenset({"internal"}),
-        source_channels=frozenset({event.channel_id}),
-    )
+    labels = _service_labels(event)
     ctx = create_auth_context(event, enforce=True, ifc_labels=labels)
     read_arguments = None
     if trigger == "saga_session_end" and allowed_operation == "read_file":

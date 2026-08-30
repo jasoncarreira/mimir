@@ -45,7 +45,15 @@ from .claims import (
     WORKLINK_EPIC_LABEL,
 )
 from .checkout import prune_attempt_checkouts, report_foreign_owned_git_objects
+from .control import _claim_mutex
 from .factory_state import factory_process_is_alive, list_factory_records
+from .run_state import (
+    OrphanBlockRecord,
+    clear_orphan_block_record,
+    list_run_states,
+    load_orphan_block_record,
+    list_orphan_block_records,
+)
 
 #: Chainlink agent identity the executor + reaper claim under. Mirrors
 #: ``WorklinkRunner.agent_id`` so reaped/dispatched records line up.
@@ -210,7 +218,12 @@ def _attempt_is_active(child: Path, records: Sequence[object] = ()) -> bool:
     return False
 
 
-def prune_stale_attempt_checkouts_for_home(home: Path, *, repo: Path | str | None = None) -> list[Path]:
+def prune_stale_attempt_checkouts_for_home(
+    home: Path,
+    *,
+    repo: Path | str | None = None,
+    runner: Callable[[Sequence[str]], subprocess.CompletedProcess[str]] | None = None,
+) -> list[Path]:
     """Prune retained Worklink attempt checkouts past the reaper TTL (#613).
 
     The claim reaper recovers Chainlink labels/locks, but failed or blocked
@@ -230,12 +243,93 @@ def prune_stale_attempt_checkouts_for_home(home: Path, *, repo: Path | str | Non
         factory_records = list_factory_records(home)
     except Exception:
         return []
-    return prune_attempt_checkouts(
-        Path(repo_raw),
-        older_than=timedelta(seconds=defaults.reaper_ttl_s),
-        now=datetime.now(timezone.utc),
-        is_active=lambda child: _attempt_is_active(child, factory_records),
+    retained_run_paths = {
+        Path(state.checkout).resolve() for state in list_run_states(home) if state.checkout
+    }
+    run = runner or _home_runner(home)
+    with _claim_mutex(home):
+        records = {Path(record.checkout).resolve(): record for record in list_orphan_block_records(home)}
+        pruned = prune_attempt_checkouts(
+            Path(repo_raw),
+            older_than=timedelta(seconds=defaults.reaper_ttl_s),
+            now=datetime.now(timezone.utc),
+            is_active=lambda child: (
+                child.resolve() in retained_run_paths
+                or _attempt_is_active(child, factory_records)
+            ),
+            can_prune=lambda child: (
+                (record := records.get(child.resolve())) is None
+                or record.publication_outcome != "determined-unpublished"
+            ),
+        )
+        for child in pruned:
+            record = records.get(child.resolve())
+            if record is not None and record.publication_outcome == "undetermined":
+                _clear_pruned_orphan_block(home, record, run=run)
+        return pruned
+
+
+def _clear_pruned_orphan_block(
+    home: Path,
+    record: OrphanBlockRecord,
+    *,
+    run: Callable[[Sequence[str]], subprocess.CompletedProcess[str]],
+) -> bool:
+    """Clear only the block whose latest block comment belongs to this attempt."""
+    current = load_orphan_block_record(home, record.issue_id)
+    if current != record:
+        return False
+    shown = run([chainlink_bin(), "issue", "show", str(record.issue_id), "--json"])
+    if shown.returncode != 0:
+        return False
+    try:
+        payload = json.loads(shown.stdout or "{}")
+    except json.JSONDecodeError:
+        return False
+    labels = {
+        str(label.get("name")) if isinstance(label, dict) else str(label)
+        for label in payload.get("labels") or ()
+    }
+    comments: list[str] = []
+    for item in payload.get("comments") or ():
+        if isinstance(item, str):
+            comments.append(item)
+        elif isinstance(item, dict):
+            text = item.get("content") or item.get("text") or item.get("body")
+            if text:
+                comments.append(str(text))
+    latest_block = next(
+        (comment for comment in reversed(comments) if comment.startswith("WORKLINK_BLOCKED")),
+        None,
     )
+    if "worklink:blocked" not in labels:
+        clear_orphan_block_record(home, record.issue_id)
+        return True
+    if latest_block != record.comment:
+        return False
+    unlabel = run(
+        [chainlink_bin(), "issue", "unlabel", str(record.issue_id), "worklink:blocked"]
+    )
+    if unlabel.returncode != 0:
+        return False
+    ready = run([chainlink_bin(), "issue", "label", str(record.issue_id), "worklink:ready"])
+    if ready.returncode != 0:
+        run([chainlink_bin(), "issue", "label", str(record.issue_id), "worklink:blocked"])
+        return False
+    clear_orphan_block_record(home, record.issue_id)
+    try:
+        log_event_sync(
+            "worklink_orphan_block_cleared",
+            issue_id=record.issue_id,
+            attempt=record.attempt,
+            checkout=record.checkout,
+            reason="undetermined checkout pruned",
+            resulting_label="worklink:ready",
+        )
+    except RuntimeError:
+        # Direct maintenance invocations can run before the process event logger.
+        pass
+    return True
 
 
 def report_foreign_owned_git_objects_for_home(

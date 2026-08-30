@@ -25,13 +25,17 @@ time so monkeypatched values are honored.
 
 from __future__ import annotations
 
+import logging
 import sqlite3
 import re
 from datetime import datetime, timezone
 from typing import Callable, Iterator
 
 
-CURRENT_SCHEMA_VERSION: int = 11
+log = logging.getLogger(__name__)
+
+
+CURRENT_SCHEMA_VERSION: int = 12
 
 # Registry of post-greenfield schema changes. Keys are version
 # numbers (must be > 1, must be contiguous, must equal
@@ -665,6 +669,22 @@ WHERE a.source_type = 'session_boundary'
         CREATE INDEX IF NOT EXISTS idx_sessions_channel_recency
             ON sessions(channel_id, COALESCE(ended_at, reflected_at) DESC, id ASC);
     """,
+    12: """
+        -- v12: v10's untrusted default was not an integrity finding for rows
+        -- that existed before v10 introduced the column. Parse both timestamps
+        -- as instants because schema_version.applied_at has historical formats.
+        CREATE INDEX IF NOT EXISTS idx_atoms_integrity_created_at
+            ON atoms(integrity, created_at);
+
+        UPDATE atoms
+        SET integrity = 'trusted'
+        WHERE integrity = 'untrusted'
+          AND julianday(created_at) < (
+              SELECT julianday(applied_at)
+              FROM schema_version
+              WHERE version = 10
+          );
+    """,
 }
 
 
@@ -679,6 +699,9 @@ def detect_schema_version(conn: sqlite3.Connection) -> int:
 
     Detection markers, highest version first:
 
+    - **v12**: ``atoms`` has the ``idx_atoms_integrity_created_at`` index used
+      by the boundary correction. Atom contents cannot reliably mark this
+      data migration because an applied no-op is indistinguishable from pending.
     - **v8**: ``world_state`` has ``visibility`` column. The v8 migration
       added ownership columns (owner_principal, origin_channel, origin_domain,
       visibility, provenance) to world_state for ACL inheritance from
@@ -707,6 +730,24 @@ def detect_schema_version(conn: sqlite3.Connection) -> int:
     so this is robust to bare-bones DBs (like the in-memory
     fixtures used by unit tests).
     """
+    # v12 marker: index supporting the integrity/boundary correction. Also
+    # accept its durable stamp because operators may remove non-constraint
+    # indexes without rolling the data correction back.
+    try:
+        v12_applied = conn.execute(
+            "SELECT 1 FROM schema_version WHERE version = 12"
+        ).fetchone()
+    except sqlite3.OperationalError:
+        v12_applied = None
+    try:
+        atom_indexes = {
+            row[1] for row in conn.execute("PRAGMA index_list(atoms)").fetchall()
+        }
+    except sqlite3.OperationalError:
+        atom_indexes = set()
+    if v12_applied is not None or "idx_atoms_integrity_created_at" in atom_indexes:
+        return 12
+
     # v11 marker: bounded triple candidate ordering (chainlink #1373).
     try:
         triple_indexes = {
@@ -875,10 +916,13 @@ def _is_duplicate_add_column(
     return _column_exists(conn, table, column)
 
 
-def _execute_migration_script(conn: sqlite3.Connection, ddl: str) -> None:
+def _execute_migration_script(conn: sqlite3.Connection, ddl: str) -> int:
+    rows_changed = 0
     for statement in _iter_sql_statements(ddl):
         try:
-            conn.execute(statement)
+            cursor = conn.execute(statement)
+            if cursor.rowcount > 0:
+                rows_changed += cursor.rowcount
         except sqlite3.IntegrityError as exc:
             message = str(exc)
             dedup_constraint = (
@@ -918,6 +962,7 @@ def _execute_migration_script(conn: sqlite3.Connection, ddl: str) -> None:
                     f"required table {table!r} does not exist"
                 ) from exc
             raise
+    return rows_changed
 
 
 _OWNERSHIP_COLUMNS = {
@@ -1221,13 +1266,14 @@ def apply_pending_migrations(
             migration_ddl = ddl
             if version == 6 and ddl == MIGRATIONS[6]:
                 migration_ddl = _render_v6_rebuild(conn, ddl)
-            _execute_migration_script(conn, migration_ddl)
+            rows_changed = _execute_migration_script(conn, migration_ddl)
             conn.execute(
                 "INSERT INTO schema_version (version, applied_at) "
                 "VALUES (?, ?)",
                 (version, datetime.now(tz=timezone.utc).isoformat()),
             )
             conn.commit()
+            log.info("Applied SAGA migration v%s: %s rows changed", version, rows_changed)
             applied.add(version)
             inferred_baselines.clear()
         except Exception:

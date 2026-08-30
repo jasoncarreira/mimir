@@ -97,6 +97,7 @@ def _make_record(output: str, *, trigger: str = "saga_session_end") -> TurnRecor
         output=output,
         duration_ms=0,
         error=None,
+        integrity="trusted",
     )
 
 
@@ -154,6 +155,42 @@ async def test_empty_output_skips_extraction(
     record = _make_record("", trigger="saga_session_end")
     await _fire_extraction(agent, ctx, event, record)
     assert called == []
+
+
+@pytest.mark.asyncio
+async def test_tainted_synthesis_turn_skips_commitment_writes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    agent = _make_agent(tmp_path)
+    called: list[Any] = []
+    events: list[tuple[str, dict]] = []
+
+    monkeypatch.setattr(
+        "mimir.commitments.extractor.extract_commitments",
+        lambda *args, **kwargs: called.append((args, kwargs)) or [],
+    )
+
+    async def capture(kind: str, **payload: Any) -> None:
+        events.append((kind, payload))
+
+    monkeypatch.setattr("mimir.turn_hooks.log_event", capture)
+    event = AgentEvent(trigger="saga_session_end", channel_id="ch-1")
+    ctx = _make_ctx(event, saga_session_id="sess-1")
+    record = _make_record("tainted output " * 100)
+    record.integrity = "untrusted"
+
+    await _fire_extraction(agent, ctx, event, record)
+
+    assert called == []
+    assert events == [(
+        "commitments_extraction_no_op",
+        {
+            "reason": "tainted_turn",
+            "channel_id": "ch-1",
+            "saga_session_id": "sess-1",
+            "source_turn_id": "turn-extract-test",
+        },
+    )]
 
 
 # ─── The four outcome events ───────────────────────────────────────

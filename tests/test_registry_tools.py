@@ -35,7 +35,15 @@ from mimir.commitments.models import (
     make_commitment_id,
 )
 from mimir.commitments.store import CommitmentsStore
-from mimir.models import AuthContext, TurnContext, TurnInteractivity
+from mimir.models import (
+    AuthContext,
+    InformationFlowLabels,
+    InformationFlowState,
+    Integrity,
+    SourceLabel,
+    TurnContext,
+    TurnInteractivity,
+)
 from mimir.scheduler import SchedulerJob
 from mimir.tools.registry import (
     _STATE,
@@ -84,6 +92,15 @@ def _auth_runtime(
     is_service: bool = False,
     service_authority: Any = None,
 ) -> ToolRuntime[AuthContext]:
+    labels = InformationFlowLabels(sources=(SourceLabel(
+        principal=principal,
+        domain="channel",
+        resource_id="chan-1",
+        bridge_instance="discord",
+        sensitivity="private",
+        authorized_principals=frozenset({principal}),
+        integrity=Integrity.TRUSTED,
+    ),))
     context = AuthContext(
         principal=principal,
         canonical_principal=principal,
@@ -95,6 +112,8 @@ def _auth_runtime(
         is_service=is_service,
         service_authority=service_authority,
         enforcement_enabled=True,
+        ifc_labels=labels,
+        ifc_state=InformationFlowState(labels=labels),
     )
     return ToolRuntime(
         state={}, context=context, config={}, stream_writer=lambda _: None,

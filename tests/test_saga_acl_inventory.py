@@ -8,7 +8,13 @@ import pytest
 from langchain.tools import ToolRuntime
 
 from mimir.access_control import create_auth_context
-from mimir.models import AgentEvent, AuthContext
+from mimir.models import (
+    AgentEvent,
+    AuthContext,
+    InformationFlowLabels,
+    InformationFlowState,
+    SourceLabel,
+)
 from mimir.saga.acl_inventory import inventory_acl, inventory_path
 from mimir.saga.client import SagaStore
 from mimir.saga.consolidate import consolidate
@@ -53,17 +59,33 @@ async def test_inventory_classifies_atoms_seeded_through_real_write_entries(
     previous = _MEMORY_STATE.get("client")
     _MEMORY_STATE["client"] = saga
     try:
+        user_labels = InformationFlowLabels(sources=(SourceLabel(
+            principal="jason", domain="channel", resource_id="discord:private",
+            bridge_instance="discord", sensitivity="private",
+            authorized_principals=frozenset({"jason"}), integrity="trusted",
+        ),))
         user = AuthContext(
             principal="jason", canonical_principal="jason", roles=("admin",),
             trigger="user_message", channel_id="discord:private",
             event_ingress="discord", interactivity=None,
+            ifc_labels=user_labels,
+            ifc_state=InformationFlowState(labels=user_labels),
         )
+        service_labels = InformationFlowLabels(sources=(SourceLabel(
+            principal="service:synthesis", domain="service",
+            resource_id="saga:synthesis", bridge_instance="synthesis",
+            sensitivity="internal",
+            authorized_principals=frozenset({"service:synthesis"}),
+            source_kind="service", integrity="trusted",
+            integrity_effect="informational",
+        ),))
         service = create_auth_context(
             AgentEvent(
                 trigger="saga_session_end", channel_id="saga:synthesis",
                 service_principal="synthesis",
             ),
             enforce=True,
+            ifc_labels=service_labels,
         )
         assert "stored" in await memory_store.ainvoke({
             "content": "owned user atom", "stream": "semantic",

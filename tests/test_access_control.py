@@ -2211,6 +2211,12 @@ def test_admin_action_follows_canonical_aliases_across_slack_discord(
 def test_admin_turn_can_use_routine_cataloged_tools_when_enforced(
     tool_name: str,
 ) -> None:
+    labels = InformationFlowLabels(sources=(SourceLabel(
+        principal="root", domain="channel", resource_id="slack-C1",
+        bridge_instance="slack", sensitivity="private",
+        authorized_principals=frozenset({"root"}),
+        integrity=Integrity.TRUSTED,
+    ),))
     auth = AuthContext(
         principal="slack-UADMIN",
         canonical_principal="root",
@@ -2223,13 +2229,15 @@ def test_admin_turn_can_use_routine_cataloged_tools_when_enforced(
         domain="channel",
         resource_id="slack-C1",
         bridge_instance="slack",
+        ifc_labels=labels,
+        ifc_state=InformationFlowState(labels=labels),
     )
 
     result = ToolRegistry().authorize_tool(
         tool_name,
         auth,
         enforce=True,
-        ifc_labels=InformationFlowLabels(),
+        ifc_labels=labels,
     )
 
     assert result.allowed is True
@@ -5141,7 +5149,15 @@ async def test_service_capability_allowed_admin_operation_emits_no_shadow_decisi
     async def capture(kind: str, **fields: object) -> None:
         captured.append((kind, fields))
 
-    auth = _service_auth(service, InformationFlowLabels())
+    labels = InformationFlowLabels(sources=(SourceLabel(
+        principal="service:synthesis", domain="service",
+        resource_id="poller:test", bridge_instance="synthesis",
+        sensitivity="internal",
+        authorized_principals=frozenset({"service:synthesis"}),
+        source_kind="service", integrity=Integrity.TRUSTED,
+        integrity_effect=IntegrityEffect.INFORMATIONAL,
+    ),))
+    auth = _service_auth(service, labels)
     with pytest.MonkeyPatch.context() as monkeypatch:
         monkeypatch.setattr("mimir.event_logger.log_event", capture)
         decision = registry.authorize_tool("saga_feedback", auth, enforce=False)

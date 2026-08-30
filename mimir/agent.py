@@ -358,13 +358,7 @@ def _merge_ifc_labels(
 
 
 def _persisted_integrity(ifc_labels: InformationFlowLabels) -> Integrity:
-    return (
-        Integrity.TRUSTED
-        if ifc_labels.sources and all(
-            source.integrity == Integrity.TRUSTED for source in ifc_labels.sources
-        )
-        else Integrity.UNTRUSTED
-    )
+    return ifc_labels.persisted_integrity
 
 
 def _initialize_ifc_labels(
@@ -649,7 +643,11 @@ def _filter_session_turns(
                 rec.get("saga_session_id") == saga_session_id
                 and rec.get("channel_id") == channel_id
             ):
-                out.append(rec)
+                # Old records have no integrity field and therefore cannot be
+                # proven clean. Excluding them is the fail-closed compatibility
+                # behavior; ordinary readers still accept either schema.
+                if rec.get("integrity") == Integrity.TRUSTED:
+                    out.append(rec)
                 if rec_ts is not None and (
                     newest_match_ts is None or rec_ts > newest_match_ts
                 ):
@@ -3249,6 +3247,25 @@ class Agent:
             }
             for c in ctx.saga_calls
         ]
+        final_labels = ctx.auth_context.ifc_state.current(ctx.ifc_labels)
+        if not isinstance(final_labels, InformationFlowLabels):
+            final_labels = InformationFlowLabels()
+        max_integrity_sources = 32
+        ordered_integrity_sources = sorted(
+            final_labels.sources,
+            key=lambda source: source.integrity == Integrity.TRUSTED,
+        )
+        integrity_sources = [
+            {
+                "principal": source.principal,
+                "domain": source.domain,
+                "resource_id": source.resource_id,
+                "source_kind": source.source_kind,
+                "integrity": source.integrity,
+                "integrity_effect": source.integrity_effect,
+            }
+            for source in ordered_integrity_sources[:max_integrity_sources]
+        ]
         record = TurnRecord(
             ts=_utc_now(),
             turn_id=turn_id,
@@ -3286,6 +3303,12 @@ class Agent:
             saga_calls=saga_calls,
             interactivity=getattr(ctx, "interactivity", None),
             tool_call_count=ctx.tool_call_count,
+            integrity=final_labels.persisted_integrity,
+            integrity_effect=final_labels.persisted_integrity_effect,
+            integrity_sources=integrity_sources,
+            integrity_sources_omitted=max(
+                0, len(final_labels.sources) - max_integrity_sources,
+            ),
             **result_fields,
         )
         await self._turn_logger.write(record)
