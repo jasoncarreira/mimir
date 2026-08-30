@@ -1259,6 +1259,7 @@ def prune_attempt_checkouts(
     worklink_dir: str = ".worklink",
     runner: Runner = _default_runner,
     is_active: Callable[[Path], bool] | None = None,
+    can_prune: Callable[[Path], bool] | None = None,
 ) -> list[Path]:
     """Prune retained attempt checkouts older than ``older_than``.
 
@@ -1272,6 +1273,9 @@ def prune_attempt_checkouts(
 
     ``is_active`` (optional) is consulted for each over-TTL attempt; when it
     returns True the attempt is skipped and never reaped.
+
+    ``can_prune`` is a second fail-closed policy hook for retained data whose
+    publication status is known outside this filesystem-only helper.
     """
     pruned: list[Path] = []
     for root, isolated in _attempt_roots(repo, worklink_dir):
@@ -1284,6 +1288,8 @@ def prune_attempt_checkouts(
             if now - mtime <= older_than:
                 continue
             if is_active is not None and is_active(child):
+                continue
+            if can_prune is not None and not can_prune(child):
                 continue
             if isolated:
                 shutil.rmtree(child, ignore_errors=True)
