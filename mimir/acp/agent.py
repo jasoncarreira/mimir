@@ -148,6 +148,7 @@ class ActivePrompt:
     exact_event_forwarder: asyncio.Task[Any]
     dispatcher: UpdateDispatcher
     journal_lease: JournalLease
+    permission_owner_loop: asyncio.AbstractEventLoop
     permission_tasks: set[asyncio.Task[Any]] = field(default_factory=set)
     permission_handles: list[AcpRequestHandle] = field(default_factory=list)
     mcp_request_ids: set[Any] = field(default_factory=set)
@@ -588,7 +589,17 @@ class MimirAcpAgent:
         bridge_publisher = _OrderedTurnPublisher(
             publisher, queue, forwarder, dispatcher
         )
-        active = ActivePrompt(state, state.generation, epoch, asyncio.current_task(), None, forwarder, dispatcher, lease)
+        active = ActivePrompt(
+            state,
+            state.generation,
+            epoch,
+            asyncio.current_task(),
+            None,
+            forwarder,
+            dispatcher,
+            lease,
+            asyncio.get_running_loop(),
+        )
         state.active_prompt = active
         self._active_prompts[record.session_id] = active
         self._dispatchers.add(dispatcher)
