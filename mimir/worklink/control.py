@@ -21,7 +21,9 @@ from .factory_state import (
     save_factory_record,
 )
 from .run_state import (
+    OrphanBlockRecord,
     WorklinkRunState,
+    clear_orphan_block_record,
     clear_run_state,
     elapsed_seconds,
     list_run_states,
@@ -29,6 +31,7 @@ from .run_state import (
     process_identity_verified,
     process_is_alive,
     runs_dir,
+    save_orphan_block_record,
 )
 
 Runner = Callable[[Sequence[str]], subprocess.CompletedProcess[str]]
@@ -362,9 +365,12 @@ def reconcile_run_states(
     A dead run with no unpublished commits is returned to ``worklink:ready``.
     A checkout with commits absent from its remote branch is instead parked at
     ``worklink:blocked`` so autonomous dispatch cannot redo or overwrite finished
-    work. In both cases the checkout is preserved. The Chainlink lock is released
-    before labels or local state are changed; if release fails, the state remains
-    as an actionable pointer and a failure event records the partial recovery.
+    work and is excluded from TTL pruning. An existing checkout whose publication
+    status cannot be determined is blocked only until that checkout is pruned; a
+    missing checkout returns directly to ready because no recovery pointer remains.
+    The Chainlink lock is released before labels or local state are changed; if
+    release fails, the state remains as an actionable pointer and a failure event
+    records the partial recovery.
     """
     alive: list[WorklinkRunState] = []
     run = runner or _runner(home, chainlink_bin)
@@ -384,10 +390,10 @@ def reconcile_run_states(
         if state.compute_name != "local_subprocess" or process_is_alive(state):
             alive.append(state)
             continue
-        unpublished, publication_reason = _checkout_has_unpublished_commits(
-            state, run_git
-        )
         with _claim_mutex(home):
+            publication_outcome, publication_reason = _checkout_has_unpublished_commits(
+                state, run_git
+            )
             release = run([chainlink_bin, "locks", "release", str(state.issue_id)])
             if release.returncode != 0:
                 _emit_orphan_reconcile_failed(
@@ -395,7 +401,47 @@ def reconcile_run_states(
                 )
                 continue
 
-            target = "worklink:blocked" if unpublished else "worklink:ready"
+            checkout_exists = bool(state.checkout and Path(state.checkout).is_dir())
+            target = (
+                "worklink:blocked"
+                if publication_outcome == "determined-unpublished"
+                or (publication_outcome == "undetermined" and checkout_exists)
+                else "worklink:ready"
+            )
+            comment_text = _orphan_reconcile_comment(
+                state,
+                publication_outcome=publication_outcome,
+                publication_reason=publication_reason,
+                target=target,
+            )
+            comment = run(
+                [chainlink_bin, "issue", "comment", str(state.issue_id), comment_text]
+            )
+            if comment.returncode != 0:
+                _emit_orphan_reconcile_failed(
+                    event_logger, state, "orphan_comment_failed", comment
+                )
+                continue
+            if target == "worklink:blocked":
+                save_orphan_block_record(
+                    home,
+                    OrphanBlockRecord(
+                        issue_id=state.issue_id,
+                        attempt=state.attempt,
+                        checkout=state.checkout,
+                        publication_outcome=publication_outcome,
+                        comment=comment_text,
+                    ),
+                )
+            label = run(
+                [chainlink_bin, "issue", "label", str(state.issue_id), target]
+            )
+            if label.returncode != 0:
+                clear_orphan_block_record(home, state.issue_id)
+                _emit_orphan_reconcile_failed(
+                    event_logger, state, f"{target}_label_failed", label
+                )
+                continue
             unlabel = run(
                 [
                     chainlink_bin,
@@ -410,14 +456,6 @@ def reconcile_run_states(
                     event_logger, state, "in_progress_unlabel_failed", unlabel
                 )
                 continue
-            label = run(
-                [chainlink_bin, "issue", "label", str(state.issue_id), target]
-            )
-            if label.returncode != 0:
-                _emit_orphan_reconcile_failed(
-                    event_logger, state, f"{target}_label_failed", label
-                )
-                continue
 
             clear_run_state(home, state.issue_id)
             _emit_reconcile_event(
@@ -428,7 +466,12 @@ def reconcile_run_states(
                 branch=state.branch,
                 checkout=state.checkout,
                 elapsed_s=round(elapsed_seconds(state, now=now), 3),
-                unpublished_commits=unpublished,
+                publication_outcome=publication_outcome,
+                unpublished_commits=(
+                    publication_outcome == "determined-unpublished"
+                    if publication_outcome != "undetermined"
+                    else None
+                ),
                 publication_reason=publication_reason,
                 resulting_label=target,
                 lock_released=True,
@@ -456,26 +499,26 @@ def _git_runner(home: Path) -> Runner:
 
 def _checkout_has_unpublished_commits(
     state: WorklinkRunState, run: Runner
-) -> tuple[bool, str]:
-    """Conservatively identify commits not published on this attempt's branch."""
+) -> tuple[str, str]:
+    """Determine whether commits are absent from this attempt's remote branch."""
     checkout = Path(state.checkout)
     if not state.checkout or not checkout.is_dir():
-        return True, "checkout unavailable"
+        return "undetermined", "checkout unavailable"
     head = run(["git", "-C", str(checkout), "rev-parse", "HEAD"])
     if head.returncode != 0 or not head.stdout.strip():
-        return True, "checkout HEAD unavailable"
+        return "undetermined", "checkout HEAD unavailable"
     head_sha = head.stdout.strip().lower()
     ahead = run(
         ["git", "-C", str(checkout), "rev-list", "--count", f"{state.local_base}..HEAD"]
     )
     if ahead.returncode != 0:
-        return True, "checkout base comparison failed"
+        return "undetermined", "checkout base comparison failed"
     try:
         ahead_count = int(ahead.stdout.strip())
     except ValueError:
-        return True, "checkout base comparison invalid"
+        return "undetermined", "checkout base comparison invalid"
     if ahead_count == 0:
-        return False, "checkout has no commits beyond its base"
+        return "determined-clean", "checkout has no commits beyond its base"
     remote = run(
         [
             "git",
@@ -488,11 +531,44 @@ def _checkout_has_unpublished_commits(
         ]
     )
     if remote.returncode != 0:
-        return True, "remote branch lookup failed"
+        return "undetermined", "remote branch lookup failed"
     remote_sha = (remote.stdout.strip().split() or [""])[0].lower()
     if remote_sha == head_sha:
-        return False, "checkout HEAD is published on its remote branch"
-    return True, "checkout HEAD is absent from its remote branch"
+        return "determined-clean", "checkout HEAD is published on its remote branch"
+    return "determined-unpublished", "checkout HEAD is absent from its remote branch"
+
+
+def _orphan_reconcile_comment(
+    state: WorklinkRunState,
+    *,
+    publication_outcome: str,
+    publication_reason: str,
+    target: str,
+) -> str:
+    identity = f"issue={state.issue_id} attempt={state.attempt} checkout={state.checkout}"
+    if publication_outcome == "determined-unpublished":
+        return (
+            f"WORKLINK_BLOCKED orphaned run {identity}: unpublished commits were verified "
+            f"({publication_reason}). This checkout is excluded from automatic pruning; "
+            "recover and publish its work before manually re-queuing the issue."
+        )
+    if target == "worklink:blocked":
+        return (
+            f"WORKLINK_BLOCKED orphaned run {identity}: publication status is undetermined "
+            f"({publication_reason}). Dispatch remains blocked until the attempt-checkout "
+            "pruner removes this checkout, then it restores worklink:ready."
+        )
+    if publication_outcome == "determined-clean":
+        return (
+            f"WORKLINK_ORPHAN_RECOVERED orphaned run {identity}: the checkout was "
+            f"verified clean ({publication_reason}); the issue was returned to "
+            "worklink:ready."
+        )
+    return (
+        f"WORKLINK_ORPHAN_RECOVERED orphaned run {identity}: publication status is "
+        f"undetermined ({publication_reason}), but no checkout remains to preserve; "
+        "the issue was returned to worklink:ready."
+    )
 
 
 def _emit_orphan_reconcile_failed(

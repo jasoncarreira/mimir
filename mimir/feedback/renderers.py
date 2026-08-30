@@ -75,10 +75,17 @@ def _render_event_line(rule_kind: str, ev: dict) -> str:
         issue = _sanitize_field(ev.get("issue_id") or "?")
         label = _sanitize_field(ev.get("resulting_label") or "?")
         branch = _sanitize_field(ev.get("branch") or "?")
-        if ev.get("unpublished_commits"):
+        if ev.get("publication_outcome") == "determined-unpublished" or ev.get(
+            "unpublished_commits"
+        ):
             return (
                 f"Worklink run #{issue} died; lock released and {label} applied "
                 f"because branch {branch} has unpublished commits — recover the checkout"
+            )
+        if ev.get("publication_outcome") == "undetermined":
+            return (
+                f"Worklink run #{issue} died; publication status was undetermined and "
+                f"the issue moved to {label}"
             )
         return f"Worklink run #{issue} died; lock released and issue returned to {label}"
     if rule_kind == "worklink_run_orphan_reconcile_failed":
