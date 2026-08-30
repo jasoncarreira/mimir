@@ -16,6 +16,7 @@ from mimir.acp import sdk
 from mimir.acp.agent import MimirAcpAgent
 from mimir.acp.stdio import _DrainProtocol, _ReservedFrameTransport
 from mimir.identities import IdentityResolver, hash_web_key
+from mimir.identities_populator import issue_web_key, revoke_web_key
 
 
 def _resolver(
@@ -213,6 +214,65 @@ async def test_authenticate_uses_resolved_identity_and_factory(
     assert agent._auth_context.is_service is False
     assert raw_key not in repr(agent.__dict__)
     assert raw_key not in (tmp_path / "state" / "identities.yaml").read_text()
+
+
+async def test_authenticate_accepts_key_issued_after_agent_construction(
+    tmp_path: Path,
+) -> None:
+    state = tmp_path / "state"
+    state.mkdir()
+    (state / "identities.yaml").write_text("people: []\n", encoding="utf-8")
+    resolver = IdentityResolver(tmp_path)
+    resolver.reload()
+    agent = _agent(resolver)
+
+    raw_key = issue_web_key(tmp_path, "operator", roles=["admin"])
+
+    response = await agent.authenticate(
+        "mimir-web-key", **{"mimir.webKey": raw_key}
+    )
+    assert response is not None
+    assert agent._auth_context is not None
+    assert agent._auth_context.canonical_principal == "operator"
+
+
+async def test_authenticate_rejects_key_revoked_after_agent_construction(
+    tmp_path: Path,
+) -> None:
+    resolver = _resolver(tmp_path)
+    agent = _agent(resolver)
+    await agent.authenticate(
+        "mimir-web-key", **{"mimir.webKey": "admin-secret"}
+    )
+
+    assert revoke_web_key(tmp_path, "operator") is True
+
+    with pytest.raises(sdk.RequestError) as raised:
+        await agent.authenticate(
+            "mimir-web-key", **{"mimir.webKey": "admin-secret"}
+        )
+    assert _error(raised.value) == _error(sdk.auth_required_error())
+    assert agent._auth_context is None
+
+
+async def test_authenticate_fails_closed_once_for_corrupt_identity_reload(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    resolver = _resolver(tmp_path)
+    agent = _agent(resolver)
+    identities_path = tmp_path / "state" / "identities.yaml"
+    identities_path.write_text("people:\n  - canonical: 'broken\n", encoding="utf-8")
+
+    with caplog.at_level("WARNING", logger="mimir.identities"):
+        for _ in range(2):
+            with pytest.raises(sdk.RequestError) as raised:
+                await agent.authenticate(
+                    "mimir-web-key", **{"mimir.webKey": "admin-secret"}
+                )
+            assert _error(raised.value) == _error(sdk.auth_required_error())
+
+    assert sum("parse failed" in record.message for record in caplog.records) == 1
 
 
 @pytest.mark.parametrize(

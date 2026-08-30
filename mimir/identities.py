@@ -72,6 +72,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import threading
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -178,6 +179,7 @@ class IdentityResolver:
 
     def __init__(self, home: Path) -> None:
         self._yaml_path = home / "state" / "identities.yaml"
+        self._lock = threading.RLock()
         self._alias_map: dict[str, str] = {}
         self._display_names: dict[str, str] = {}  # canonical → display_name
         self._identities: dict[str, Identity] = {}  # canonical → Identity
@@ -189,6 +191,15 @@ class IdentityResolver:
         # Credential loss or an unreadable credential source must not restore
         # the unauthenticated first-run mode.
         self._web_gate_latched = False
+        self._web_key_source_valid = True
+        self._identities_signature = self._source_signature()
+
+    def _source_signature(self) -> object:
+        try:
+            info = self._yaml_path.lstat()
+        except OSError:
+            return None
+        return (info.st_mtime_ns, info.st_size, info.st_mode, info.st_uid)
 
     @staticmethod
     def _parse_access(raw: object, canonical: str) -> AccessMetadata:
@@ -261,6 +272,13 @@ class IdentityResolver:
         map than to nuke it). A missing file on the initial load remains an
         empty resolver for first-run deployments.
         """
+        with self._lock:
+            loaded = self._reload_unlocked()
+            self._identities_signature = self._source_signature()
+            return loaded
+
+    def _reload_unlocked(self) -> int:
+        self._web_key_source_valid = False
         if not self._yaml_path.is_file():
             if self._alias_map or self._identities or self._channels:
                 log.warning(
@@ -532,7 +550,22 @@ class IdentityResolver:
                 "auth gate closed"
             )
         self._web_gate_latched = self._web_gate_latched or has_web_keys
+        self._web_key_source_valid = True
         return len(self._alias_map)
+
+    def reload_if_changed(self) -> bool:
+        """Reload when the identities source signature changes.
+
+        Returns whether the current source loaded successfully. Failed reloads
+        retain prior identity data for non-authentication consumers, while web
+        key resolution uses the result to fail closed.
+        """
+        with self._lock:
+            signature = self._source_signature()
+            if signature != self._identities_signature:
+                self._reload_unlocked()
+                self._identities_signature = signature
+            return self._web_key_source_valid
 
     def resolve(self, author: str | None) -> str | None:
         """Map ``author`` (a platform-prefixed id) to canonical. Unknown
@@ -594,10 +627,13 @@ class IdentityResolver:
         with no roles is still unauthorized (see ``access.is_authorized``)."""
         if not raw_key:
             return None
-        canonical = self._alias_map.get(hash_web_key(raw_key))
-        if canonical is None:
-            return None
-        return self._identities.get(canonical)
+        with self._lock:
+            if not self.reload_if_changed():
+                return None
+            canonical = self._alias_map.get(hash_web_key(raw_key))
+            if canonical is None:
+                return None
+            return self._identities.get(canonical)
 
     def identity(self, author: str | None) -> Identity | None:
         """Return ``author``'s canonical identity record, if known.

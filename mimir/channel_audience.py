@@ -34,26 +34,11 @@ class ServerChannelAudienceProvider:
     ] = field(
         default_factory=dict, init=False, repr=False, compare=False
     )
-    _identities_signature: object = field(
-        default=None, init=False, repr=False, compare=False
-    )
-
     def __post_init__(self) -> None:
         if self.identity_resolver is None:
             resolver = IdentityResolver(self.home)
             resolver.reload()
             object.__setattr__(self, "identity_resolver", resolver)
-        try:
-            info = (self.home / "state" / "identities.yaml").lstat()
-            signature: object = (
-                info.st_mtime_ns,
-                info.st_size,
-                info.st_mode,
-                info.st_uid,
-            )
-        except OSError:
-            signature = None
-        object.__setattr__(self, "_identities_signature", signature)
 
     def audience_for(
         self,
@@ -91,20 +76,7 @@ class ServerChannelAudienceProvider:
                     audience = None
                 self._session_audiences[key] = (signatures, audience)
                 return audience
-            identities_path = self.home / "state" / "identities.yaml"
-            try:
-                info = identities_path.lstat()
-                signature = (
-                    info.st_mtime_ns,
-                    info.st_size,
-                    info.st_mode,
-                    info.st_uid,
-                )
-            except OSError:
-                signature = None
-            if signature != self._identities_signature:
-                self.identity_resolver.reload()
-                object.__setattr__(self, "_identities_signature", signature)
+            self.identity_resolver.reload_if_changed()
             identity = self.identity_resolver.identity(principal)
             if identity is None or channel_id not in identity.dm_channels.values():
                 return None
