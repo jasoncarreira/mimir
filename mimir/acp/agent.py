@@ -653,10 +653,20 @@ class MimirAcpAgent:
         if failed is not None:
             raise internal_error() from None
         if active.final_text_delivery_failure is not None:
-            raise RequestError(
-                -32603,
-                "Final response delivery refused: "
-                f"{active.final_text_delivery_failure}",
+            reason = active.final_text_delivery_failure
+            sink_category = (
+                reason.removeprefix("ifc_label_blocked:")
+                if reason.startswith("ifc_label_blocked:")
+                else "acp_delivery"
+            )
+            return PromptResponse(
+                stopReason="refusal",
+                _meta={
+                    "mimir.refusal": {
+                        "reason": reason,
+                        "sinkCategory": sink_category,
+                    }
+                },
             )
         return response
 
@@ -1019,9 +1029,17 @@ class MimirAcpAgent:
         if context is None:
             return None
         thread_id = state.record.thread_id
-        if getattr(context, "channel_id", None) == thread_id:
+        if (
+            getattr(context, "channel_id", None) == thread_id
+            and context.origin_trigger == "acp_session"
+        ):
             return context
-        return replace(context, channel_id=thread_id, resource_id=thread_id)
+        return replace(
+            context,
+            channel_id=thread_id,
+            resource_id=thread_id,
+            origin_trigger="acp_session",
+        )
 
     def _display_name_for(self, state: SessionState) -> str | None:
         connection = self._connections.get(state.generation)

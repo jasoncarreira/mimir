@@ -1784,6 +1784,7 @@ def test_channel_bearing_source_inventory_is_closed() -> None:
         ("direct_block", "mimir/feedback/__init__.py", "FeedbackLog.recent_prompt_block", "PromptBlock"): 1,
         ("feedback_loader", "mimir/agent.py", "Agent._build_turn_prompt", "self._feedback.recent_prompt_block"): 1,
         ("feedback_stream", "mimir/feedback/__init__.py", "FeedbackLog._select_prompt_recent", "admit"): 2,
+        ("producer", "mimir/access_control.py", "_acp_failed_tool_error_result", "SourceLabel"): 1,
         ("producer", "mimir/access_control.py", "_incomplete_protected_result", "SourceLabel"): 1,
         ("producer", "mimir/access_control.py", "classify_protected_result", "SourceLabel"): 5,
         ("producer", "mimir/access_control.py", "protected_result_source", "SourceLabel"): 1,
