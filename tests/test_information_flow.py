@@ -75,6 +75,7 @@ from mimir.models import (
 )
 from mimir.pr_checkout_lease import PRCheckoutLease
 from mimir.prompt_sources import prompt_source_label
+from mimir.skill_install import install
 from mimir.turn_event_bus import TurnEventBus, TurnEventEmitter
 from mimir.worklink.continuation import (
     HTTP_EVENT_INGRESS_EXTRA_KEY,
@@ -3493,7 +3494,7 @@ def test_repo_review_shell_result_remains_informational() -> None:
     assert labels.has_untrusted_active_ingest is False
 
 
-@pytest.mark.parametrize("root", sorted(_SELF_AUTHORED_FILE_ROOTS))
+@pytest.mark.parametrize("root", sorted(_SELF_AUTHORED_FILE_ROOTS - {"skills"}))
 def test_operator_seeded_file_without_provenance_is_trusted_informational(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -3521,6 +3522,67 @@ def test_operator_seeded_file_without_provenance_is_trusted_informational(
     assert (source.integrity, source.integrity_effect) == (
         "trusted", "informational",
     )
+
+
+def test_admin_installed_skill_read_does_not_block_turn_sinks(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / "home"
+    source_root = tmp_path / "optional-skills"
+    source = source_root / "github"
+    source.mkdir(parents=True)
+    (source / "SKILL.md").write_text("trusted admin instructions", encoding="utf-8")
+    home.mkdir()
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    assert initialize_file_integrity_ledger(home) is True
+    installed = install("github", home, optional_skills_root=source_root)
+
+    event = AgentEvent(
+        trigger="user_message", channel_id="slack-C1", author="user-1",
+        source="slack", content="use the github skill",
+    )
+    labels = _initialize_ifc_labels(event)
+    state = InformationFlowState(labels=labels)
+    auth = replace(
+        create_auth_context(event, enforce=True, ifc_labels=labels),
+        roles=("admin",),
+        interactivity=TurnInteractivity.NON_INTERACTIVE,
+        ifc_state=state,
+    )
+    read_labels = classify_protected_result(
+        "read_file", {"file_path": str(installed.dest / "SKILL.md")}, auth,
+        ToolAuthorization(
+            tool_name="read_file",
+            decision=OperationDecision.RESOURCE_SCOPED,
+            allowed=True,
+        ),
+    )
+    assert read_labels is not None
+    labels = state.merge(read_labels)
+
+    assert labels.has_untrusted_active_ingest is False
+    assert SinkGate.check_sink_flow(
+        "send_message", event.channel_id, labels, auth, enforce=True,
+    ).allowed is True
+
+    dropped = home / "skills" / "dropped" / "SKILL.md"
+    dropped.parent.mkdir()
+    dropped.write_text("untrusted instructions", encoding="utf-8")
+    untrusted_read = classify_protected_result(
+        "read_file", {"file_path": str(dropped)}, auth,
+        ToolAuthorization(
+            tool_name="read_file",
+            decision=OperationDecision.RESOURCE_SCOPED,
+            allowed=True,
+        ),
+    )
+    assert untrusted_read is not None
+    blocked = SinkGate.check_sink_flow(
+        "send_message", event.channel_id, untrusted_read, auth, enforce=True,
+    )
+    assert blocked.allowed is False
+    assert blocked.reason == "ifc_label_blocked:same_channel"
 
 
 @pytest.mark.parametrize("location", ["outside", "memory-scratch", "attachments"])

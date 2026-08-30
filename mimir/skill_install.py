@@ -49,6 +49,7 @@ from pathlib import Path
 
 from mimir._atomic import atomic_write_json
 from mimir._rmtree import rmtree_missing_ok
+from mimir.access_control import record_admin_installed_skill_integrity
 from mimir.commands.setup import _write_env_text
 from mimir.redaction import redact_text
 from mimir.skill_defs import (
@@ -306,6 +307,8 @@ def install(
         if dest.exists():
             rmtree_missing_ok(dest)
         tmp.rename(dest)
+        if not record_admin_installed_skill_integrity(home, dest):
+            raise OSError(f"failed to record trusted skill integrity for {dest}")
     except BaseException:
         shutil.rmtree(tmp, ignore_errors=True)
         raise
