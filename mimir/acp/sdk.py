@@ -75,6 +75,7 @@ OUTPUT_DRAIN_TIMEOUT = 30.0
 DISPATCHER_STOP_TIMEOUT = 30.0
 DISPATCHER_CANCEL_TIMEOUT = 2.0
 MAX_ACTIVE_INBOUND_RUNNERS = 64
+MAX_CONSECUTIVE_PARSE_ERRORS = 3
 
 
 class AcpProtocolError(RuntimeError):
@@ -192,18 +193,29 @@ class StrictNdjsonTransport:
         self._writer = writer
         self._buffer = bytearray()
         self._frame_bytes: int | None = None
+        self._consecutive_parse_errors = 0
 
     async def receive(self) -> dict[str, Any] | None:
-        frame = await self._read_frame()
-        if frame is None:
-            return None
-        self._frame_bytes = len(frame)
-        try:
-            message = json.loads(frame)
-        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-            raise AcpProtocolError("Malformed JSON-RPC frame") from exc
-        validate_jsonrpc_envelope(message)
-        return message
+        while True:
+            frame = await self._read_frame()
+            if frame is None:
+                return None
+            self._frame_bytes = len(frame)
+            try:
+                message = json.loads(frame)
+            except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                self._consecutive_parse_errors += 1
+                await self.send({
+                    "jsonrpc": "2.0",
+                    "id": None,
+                    "error": {"code": -32700, "message": "Parse error"},
+                })
+                if self._consecutive_parse_errors >= MAX_CONSECUTIVE_PARSE_ERRORS:
+                    raise AcpProtocolError("Too many malformed JSON-RPC frames") from exc
+                continue
+            self._consecutive_parse_errors = 0
+            validate_jsonrpc_envelope(message)
+            return message
 
     async def _read_frame(self) -> bytes | None:
         while True:

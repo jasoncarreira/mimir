@@ -12509,7 +12509,7 @@ async def test_acp_permission_broker_failures_are_ordinary_denials(
     assert len(broker.calls) == 1
 
 
-def test_acp_model_surface_omits_send_message_and_non_acp_preserves_identity() -> None:
+def test_acp_model_surface_matches_declared_provider() -> None:
     from langchain_core.messages import SystemMessage
     from mimir.tools.budget_gate import _ACP_DELIVERY_INSTRUCTION, _request_for_acp_model
     from mimir.tools.client_provider import (
@@ -12520,7 +12520,11 @@ def test_acp_model_surface_omits_send_message_and_non_acp_preserves_identity() -
 
     class Request:
         def __init__(self) -> None:
-            self.tools = [SimpleNamespace(name="send_message"), SimpleNamespace(name="hands_read")]
+            self.tools = [
+                SimpleNamespace(name="send_message"),
+                SimpleNamespace(name="hands_read"),
+                SimpleNamespace(name="memory_query"),
+            ]
             self.system_message = SystemMessage(content="base")
 
         def override(self, **changes: object) -> object:
@@ -12539,8 +12543,31 @@ def test_acp_model_surface_omits_send_message_and_non_acp_preserves_identity() -
         reset_turn_capability_context(token)
 
     assert overridden is not request
-    assert [tool.name for tool in overridden.tools] == ["hands_read"]
+    assert [tool.name for tool in overridden.tools] == ["hands_read", "memory_query"]
     assert overridden.system_message.content == f"base\n\n{_ACP_DELIVERY_INSTRUCTION}"
+
+    token = set_turn_capability_context(
+        _permission_test_context(broker, profile_policy=None)
+    )
+    try:
+        providerless = _request_for_acp_model(request)
+    finally:
+        reset_turn_capability_context(token)
+
+    assert [tool.name for tool in providerless.tools] == ["memory_query"]
+
+
+def test_admin_hands_refusal_names_actual_non_identity_reason() -> None:
+    from mimir.tools.budget_gate import _admin_denial_message
+
+    message = _admin_denial_message(
+        "hands_read", "client_file_scope_denied", principal_is_admin=True,
+    )
+
+    assert message == (
+        "hands_read was refused before execution (client_file_scope_denied)."
+    )
+    assert "requires an admin identity" not in message
 
 
 def test_acp_tool_hook_blocks_forged_send_message_before_handler() -> None:

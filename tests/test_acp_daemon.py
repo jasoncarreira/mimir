@@ -285,6 +285,42 @@ async def test_single_peer_cap_refuses_second_with_actionable_error(
 
 
 @pytest.mark.asyncio
+async def test_clean_close_allows_immediate_reconnect(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = _short_home()
+    daemon = AcpDaemon(_bundle(home))
+    monkeypatch.setattr("mimir.acp.daemon._peer_uid", lambda sock: os.getuid())
+
+    async def run_until_eof(
+        reader: asyncio.StreamReader, writer: asyncio.StreamWriter,
+    ) -> None:
+        await reader.read()
+        writer.close()
+        await writer.wait_closed()
+
+    monkeypatch.setattr(daemon, "_run_peer", run_until_eof)
+    await daemon.start()
+    first_reader, first_writer = await asyncio.open_unix_connection(
+        str(daemon.socket_path)
+    )
+    del first_reader
+    first_writer.close()
+    await first_writer.wait_closed()
+
+    second_reader, second_writer = await asyncio.open_unix_connection(
+        str(daemon.socket_path)
+    )
+    with pytest.raises(TimeoutError):
+        await asyncio.wait_for(second_reader.readline(), 0.05)
+
+    second_writer.close()
+    await second_writer.wait_closed()
+    await daemon.stop()
+    shutil.rmtree(home)
+
+
+@pytest.mark.asyncio
 async def test_startup_failure_rolls_back_owned_socket(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

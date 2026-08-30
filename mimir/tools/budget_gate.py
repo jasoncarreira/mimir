@@ -1715,7 +1715,11 @@ def _is_admin_sensitive_tool(
 
 
 def _admin_denial_message(
-    tool_name: str, reason: str | None, detail: str | None = None,
+    tool_name: str,
+    reason: str | None,
+    detail: str | None = None,
+    *,
+    principal_is_admin: bool = False,
 ) -> str:
     # A shell-profile refusal is a command-shape problem, not a privilege
     # problem: no identity can run the command as written. Leading with
@@ -1728,6 +1732,8 @@ def _admin_denial_message(
     reason_text = f" ({reason})" if reason else ""
     if detail:
         return f"{tool_name} was refused before execution{reason_text}: {detail}"
+    if principal_is_admin and reason == "client_file_scope_denied":
+        return f"{tool_name} was refused before execution{reason_text}."
     return (
         f"{tool_name} requires an admin identity{reason_text}. "
         "The tool call was refused before execution."
@@ -1799,7 +1805,9 @@ def _deny_admin_tool(
         )
     # ``reason`` stays the machine key on both events; the prose detail is for
     # the caller's tool result only, so the audit stream keeps grouping cleanly.
-    return _admin_denial_message(tool_name, reason, detail)
+    return _admin_denial_message(
+        tool_name, reason, detail, principal_is_admin="admin" in roles,
+    )
 
 
 def _check_admin_authorized(
@@ -2175,9 +2183,12 @@ def _request_for_acp_model(request: Any) -> Any:
     context = get_turn_capability_context()
     if context is None or context.acp_delivery is not True:
         return request
+    excluded = {"send_message"}
+    if context.profile_policy is not MIMIR_HANDS_V1:
+        excluded.update({"hands_read", "hands_edit", "hands_shell"})
     tools = [
         tool for tool in (getattr(request, "tools", None) or [])
-        if _tool_surface_name(tool) != "send_message"
+        if _tool_surface_name(tool) not in excluded
     ]
     system_message = getattr(request, "system_message", None)
     if system_message is None:

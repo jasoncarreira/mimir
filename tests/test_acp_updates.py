@@ -54,6 +54,28 @@ async def test_complete_suppression_tool_and_redaction_mapping() -> None:
 
 
 @pytest.mark.asyncio
+async def test_tool_input_and_output_use_the_same_client_redaction_policy() -> None:
+    publisher = Publisher()
+    dispatcher = UpdateDispatcher(publisher)
+    dispatcher.enqueue({
+        "type": "tool_call", "phase": "end", "id": "1", "tool_name": "hands_read",
+        "args": {"path": "/workspace/private.txt", "token": "input-secret"},
+    })
+    dispatcher.enqueue({
+        "type": "tool_result", "phase": "end", "id": "1", "tool_name": "hands_read",
+        "status": "ok",
+        "content": {"path": "/workspace/private.txt", "token": "output-secret"},
+    })
+
+    await dispatcher.drain()
+
+    progress = [item for item in publisher.updates if item.status != "pending"]
+    assert progress[0].raw_input == {"path": "[path]", "token": "[redacted]"}
+    assert progress[1].raw_output == {"path": "[path]", "token": "[redacted]"}
+    await finish(dispatcher)
+
+
+@pytest.mark.asyncio
 async def test_orphan_ends_synthesize_pending_in_order() -> None:
     publisher = Publisher()
     dispatcher = UpdateDispatcher(publisher)
