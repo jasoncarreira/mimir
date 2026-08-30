@@ -65,7 +65,11 @@ class StockMcpPeer:
 
 def _stock_provider(response: Mapping[str, Any]) -> Any:
     owner = SimpleNamespace(_boundary_lock=asyncio.Lock())
-    state = SimpleNamespace(active_prompt=None, provider=None)
+    state = SimpleNamespace(
+        active_prompt=None,
+        provider=None,
+        record=SimpleNamespace(session_id="provider-contract-test"),
+    )
     provider = agent_module._AcpProviderConnection(
         owner, StockMcpPeer(response), "hands-connection", state
     )

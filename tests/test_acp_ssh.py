@@ -261,10 +261,15 @@ while True: time.sleep(1)
         profile, "secret", output, _ssh_path=ssh,
         _environment={"PATH": os.environ.get("PATH", ""), "MARKER": str(marker)},
     ))
+    marker_data = None
     for _ in range(200):
-        if marker.exists(): break
-        await asyncio.sleep(0.01)
-    pid = json.loads(marker.read_text())["pid"]
+        try:
+            marker_data = json.loads(marker.read_text())
+            break
+        except (OSError, json.JSONDecodeError):
+            await asyncio.sleep(0.01)
+    assert marker_data is not None
+    pid = marker_data["pid"]
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
         await asyncio.wait_for(task, 10)

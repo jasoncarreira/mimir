@@ -18,6 +18,7 @@ from mimir.access_control import create_auth_context
 from mimir.channel_audience import ServerChannelAudienceProvider
 from mimir.models import AgentEvent
 from mimir.tools.client_provider import (
+    ClientProviderResultError,
     MIMIR_HANDS_V1,
     PermissionDecision as ToolPermissionDecision,
     PermissionEligibility,
@@ -322,7 +323,14 @@ class _AcpProviderConnection:
         if not isinstance(result, Mapping):
             raise RuntimeError("Malformed client provider result")
         if "structuredContent" not in result:
-            raise RuntimeError("Client provider result is missing structuredContent")
+            session_id = self.session.record.session_id
+            _LOGGER.error(
+                "Client provider result rejected: missing structuredContent",
+                extra={"tool_name": name, "session_id": session_id},
+            )
+            raise ClientProviderResultError(
+                f"Client provider tool {name!r} result is missing structuredContent"
+            )
         if result.get("isError") is True:
             raise RuntimeError("Client provider tool returned isError")
         structured_content = result["structuredContent"]
