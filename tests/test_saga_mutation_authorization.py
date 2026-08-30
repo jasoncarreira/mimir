@@ -15,13 +15,20 @@ from mimir.access_control import (
     get_provenance_from_auth_context,
     get_service_principal,
 )
-from mimir.models import AuthContext, InformationFlowLabels
+from mimir.models import (
+    AuthContext,
+    InformationFlowLabels,
+    InformationFlowState,
+    Integrity,
+    SourceLabel,
+)
 from mimir.saga.client import SagaStore
 from mimir.saga.ownership import AuthorizationScope
 from mimir.saga.triples import retrieve_by_entity, store_triples
 
 
 def _auth(principal: str, *, admin: bool = False) -> AuthContext:
+    labels = _trusted_labels(principal)
     return AuthContext(
         principal=principal,
         canonical_principal=principal,
@@ -30,7 +37,21 @@ def _auth(principal: str, *, admin: bool = False) -> AuthContext:
         trigger="user_message",
         channel_id="test-channel",
         interactivity=None,
+        ifc_labels=labels,
+        ifc_state=InformationFlowState(labels=labels),
     )
+
+
+def _trusted_labels(principal: str) -> InformationFlowLabels:
+    return InformationFlowLabels(sources=(SourceLabel(
+        principal=principal,
+        domain="channel",
+        resource_id="test-channel",
+        bridge_instance="test",
+        sensitivity="private",
+        authorized_principals=frozenset({principal}),
+        integrity=Integrity.TRUSTED,
+    ),))
 
 
 def _service_auth(
@@ -40,6 +61,7 @@ def _service_auth(
     channel_id: str | None = None,
     saga_session_id: str | None = None,
 ) -> AuthContext:
+    labels = _trusted_labels(f"service:{canonical}")
     return AuthContext(
         principal=canonical,
         canonical_principal=canonical,
@@ -50,6 +72,8 @@ def _service_auth(
         interactivity=None,
         is_service=True,
         saga_session_id=saga_session_id,
+        ifc_labels=labels,
+        ifc_state=InformationFlowState(labels=labels),
     )
 
 
@@ -95,7 +119,7 @@ def test_saga_mutation_service_capability_matrix_matches_at_both_guards(
         operation,
         auth_context,
         enforce=True,
-        ifc_labels=InformationFlowLabels(),
+        ifc_labels=auth_context.ifc_labels,
     )
 
     assert middleware.allowed is expected

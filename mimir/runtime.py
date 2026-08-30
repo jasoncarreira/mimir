@@ -33,6 +33,58 @@ GITHUB_IDENTITY_RETRY_INTERVAL_SECONDS = 60.0
 GITHUB_IDENTITY_TRANSIENT_ALERT_ATTEMPTS = 3
 
 
+async def dispatch_session_synthesis(
+    session: Any,
+    *,
+    config: Any,
+    dispatcher: Any,
+    log_event_fn: Callable[..., Awaitable[None]],
+) -> bool:
+    """Enqueue synthesis only when the session has at least one trusted turn."""
+    from .access_control import builtin_trigger_service_principal
+    from .agent import _filter_session_turns
+    from .models import AgentEvent
+
+    trusted_turns = await asyncio.to_thread(
+        _filter_session_turns,
+        config.turns_log,
+        session.saga_session_id,
+        channel_id=session.channel_id,
+        idle_minutes=config.saga_session_idle_minutes,
+    )
+    if not trusted_turns:
+        await log_event_fn(
+            "saga_synthesis_empty_window",
+            saga_session_id=session.saga_session_id,
+            channel_id=session.channel_id,
+            reason="no trusted turns in session window",
+        )
+        return False
+
+    authority = builtin_trigger_service_principal("session-boundary", Path("."))
+    synth_event = AgentEvent(
+        trigger="saga_session_end",
+        channel_id=session.channel_id,
+        service_principal="synthesis",
+        service_authority=authority,
+        content="",
+        extra={"saga_session_id": session.saga_session_id},
+        source_session_acl=session.source_acl,
+        # Synthesis reads trusted content directly from turns.jsonl. Session IFC
+        # state must not propagate one turn's taint into this new turn.
+        ifc_labels=None,
+    )
+    accepted = await dispatcher.enqueue(synth_event)
+    if not accepted:
+        await log_event_fn(
+            "saga_synthesis_dispatch_failed",
+            channel_id=session.channel_id,
+            saga_session_id=session.saga_session_id,
+            reason="dispatcher_rejected",
+        )
+    return accepted
+
+
 @dataclass(frozen=True, slots=True)
 class CoreServices:
     identity_resolver: IdentityResolver
@@ -480,29 +532,14 @@ async def create_agent_runtime(
                 log.debug("dm-pairing request failed", exc_info=True)
 
         async def on_session_idle(session: Any) -> None:
-            from .access_control import builtin_trigger_service_principal
             from .event_logger import log_event
-            from .models import AgentEvent
 
-            authority = builtin_trigger_service_principal("session-boundary", Path("."))
-            synth_event = AgentEvent(
-                trigger="saga_session_end",
-                channel_id=session.channel_id,
-                service_principal="synthesis",
-                service_authority=authority,
-                content="",
-                extra={"saga_session_id": session.saga_session_id},
-                source_session_acl=session.source_acl,
-                ifc_labels=session.ifc_state.current(),
+            await dispatch_session_synthesis(
+                session,
+                config=config,
+                dispatcher=adapters.dispatcher,
+                log_event_fn=log_event,
             )
-            accepted = await adapters.dispatcher.enqueue(synth_event)
-            if not accepted:
-                await log_event(
-                    "saga_synthesis_dispatch_failed",
-                    channel_id=session.channel_id,
-                    saga_session_id=session.saga_session_id,
-                    reason="dispatcher_rejected",
-                )
 
         on_injected = agent.on_message_injected
         is_busy = adapters.dispatcher.is_channel_busy

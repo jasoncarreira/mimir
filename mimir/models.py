@@ -437,6 +437,29 @@ class InformationFlowLabels:
             for source in self.sources
         )
 
+    @property
+    def persisted_integrity(self) -> Integrity:
+        """Derive trust for durable content from every contributing source."""
+        return (
+            Integrity.TRUSTED
+            if self.sources
+            and all(source.integrity == Integrity.TRUSTED for source in self.sources)
+            else Integrity.UNTRUSTED
+        )
+
+    @property
+    def persisted_integrity_effect(self) -> IntegrityEffect:
+        """Summarize whether an untrusted source actively tainted this turn."""
+        return (
+            IntegrityEffect.ACTIVE_INGEST
+            if any(
+                source.integrity == Integrity.UNTRUSTED
+                and source.integrity_effect == IntegrityEffect.ACTIVE_INGEST
+                for source in self.sources
+            )
+            else IntegrityEffect.INFORMATIONAL
+        )
+
     def can_flow_to(self, sink: str, allowed_sinks: frozenset[str]) -> bool:
         """Check if labels permit flow to the given sink.
 
@@ -1683,6 +1706,12 @@ class TurnRecord:
     # Server-owned turn classification carried into the durable turn log.
     # Optional for backward compatibility and fail-closed downstream guards.
     interactivity: TurnInteractivity | None = None
+    # Derived from the final live IFC carrier. Optional defaults preserve
+    # compatibility with records written before turn integrity was persisted.
+    integrity: Integrity | None = None
+    integrity_effect: IntegrityEffect | None = None
+    integrity_sources: list[dict[str, Any]] = field(default_factory=list)
+    integrity_sources_omitted: int = 0
 
 
 def make_turn_id() -> str:

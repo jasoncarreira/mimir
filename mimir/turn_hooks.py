@@ -192,6 +192,15 @@ class CommitmentExtractionHook(TurnHook):
             return
         if self._store is None:
             return
+        if getattr(record, "integrity", None) != "trusted":
+            await log_event(
+                "commitments_extraction_no_op",
+                reason="tainted_turn",
+                channel_id=ctx.channel_id,
+                saga_session_id=getattr(ctx, "saga_session_id", None),
+                source_turn_id=ctx.turn_id,
+            )
+            return
         output = getattr(record, "output", "") or ""
         if not output:
             return

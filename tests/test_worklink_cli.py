@@ -15,12 +15,20 @@ import pytest
 from mimir.cli import main
 from mimir.worklink.orchestrator import WorklinkRunResult
 from mimir.worklink.control import reconcile_run_states, stop_worklink, worklink_status
+from mimir.worklink import autonomy
 from mimir.worklink.autonomy import check_concurrency
 from mimir.worklink.backends.feature_factory import parse_factory_status
 from mimir.worklink.claims import ChainlinkClaims
 from mimir.worklink.compute import LaunchHandle
 from mimir.worklink.factory_state import FactoryRunRecord, load_factory_record, save_factory_record
-from mimir.worklink.run_state import WorklinkRunState, load_run_state, process_start_ticks, save_run_state
+from mimir.worklink.run_state import (
+    OrphanBlockRecord,
+    WorklinkRunState,
+    load_orphan_block_record,
+    load_run_state,
+    process_start_ticks,
+    save_run_state,
+)
 
 
 def test_worklink_run_cli_dispatches_operator_vertical(
@@ -702,6 +710,7 @@ def test_reconcile_releases_orphan_slot_routes_label_and_leaves_live_lock(
     ]
     event, payload = events[0]
     assert event == "worklink_run_orphaned"
+    assert payload["publication_outcome"] == "determined-unpublished"
     assert payload["unpublished_commits"] is True
     assert payload["resulting_label"] == "worklink:blocked"
     assert payload["lock_released"] is True
@@ -740,6 +749,207 @@ def test_reconcile_empty_orphan_returns_ready(tmp_path: Path) -> None:
 
     assert ["chainlink", "issue", "label", "12", "worklink:ready"] in calls
     assert load_run_state(tmp_path, 12) is None
+
+
+def test_reconcile_undetermined_records_outcome_and_explains_temporary_block(
+    tmp_path: Path,
+) -> None:
+    now = datetime.now(UTC)
+    state = _state(tmp_path, 14, 999_999_996, ticks=1, started_at=now)
+    checkout = tmp_path / "checkout-14"
+    checkout.mkdir()
+    save_run_state(tmp_path, replace(state, checkout=str(checkout), local_base="base-sha"))
+    events: list[tuple[str, dict[str, object]]] = []
+    calls: list[list[str]] = []
+
+    reconcile_run_states(
+        tmp_path,
+        runner=lambda args: calls.append(list(args))
+        or subprocess.CompletedProcess(args, 0, stdout="", stderr=""),
+        git_runner=lambda args: subprocess.CompletedProcess(
+            args,
+            1 if args[3] == "rev-list" else 0,
+            stdout="head\n" if args[3] == "rev-parse" else "",
+            stderr="comparison failed" if args[3] == "rev-list" else "",
+        ),
+        event_logger=lambda event, **payload: events.append((event, payload)),
+        now=now,
+    )
+
+    event, payload = events[0]
+    assert event == "worklink_run_orphaned"
+    assert payload["publication_outcome"] == "undetermined"
+    assert payload["unpublished_commits"] is None
+    assert payload["resulting_label"] == "worklink:blocked"
+    [comment] = [call[-1] for call in calls if call[1:3] == ["issue", "comment"]]
+    assert "publication status is undetermined" in comment
+    assert "pruner removes this checkout" in comment
+    record = load_orphan_block_record(tmp_path, 14)
+    assert record is not None and record.checkout == str(checkout)
+
+
+def test_reconcile_missing_checkout_records_undetermined_and_returns_ready(
+    tmp_path: Path,
+) -> None:
+    now = datetime.now(UTC)
+    state = _state(tmp_path, 15, 999_999_995, ticks=1, started_at=now)
+    missing = tmp_path / "already-pruned-15"
+    save_run_state(tmp_path, replace(state, checkout=str(missing), local_base="base-sha"))
+    calls: list[list[str]] = []
+    events: list[tuple[str, dict[str, object]]] = []
+
+    reconcile_run_states(
+        tmp_path,
+        runner=lambda args: calls.append(list(args))
+        or subprocess.CompletedProcess(args, 0, stdout="", stderr=""),
+        event_logger=lambda event, **payload: events.append((event, payload)),
+        now=now,
+    )
+
+    assert events[0][1]["publication_outcome"] == "undetermined"
+    assert events[0][1]["resulting_label"] == "worklink:ready"
+    assert ["chainlink", "issue", "label", "15", "worklink:ready"] in calls
+    assert load_orphan_block_record(tmp_path, 15) is None
+
+
+def test_reconcile_then_prune_clears_only_checkout_owned_block(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    now = datetime.now(UTC)
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    checkout = tmp_path / ".worklink" / repo.name / "16-2"
+    checkout.mkdir(parents=True)
+    os.utime(checkout, (0, 0))
+    state = _state(tmp_path, 16, 999_999_994, ticks=1, started_at=now)
+    save_run_state(tmp_path, replace(state, checkout=str(checkout), local_base="base-sha"))
+    labels = {"worklink:in-progress"}
+    comments: list[str] = []
+
+    def runner(args: list[str]) -> subprocess.CompletedProcess[str]:
+        if args[1:3] == ["issue", "unlabel"]:
+            labels.discard(args[4])
+        elif args[1:3] == ["issue", "label"]:
+            labels.add(args[4])
+        elif args[1:3] == ["issue", "comment"]:
+            comments.append(args[4])
+        elif args[1:3] == ["issue", "show"]:
+            return subprocess.CompletedProcess(
+                args, 0, stdout=json.dumps({"labels": sorted(labels), "comments": comments}), stderr=""
+            )
+        return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+
+    reconcile_run_states(
+        tmp_path,
+        runner=runner,
+        git_runner=lambda args: subprocess.CompletedProcess(
+            args,
+            1 if args[3] == "rev-list" else 0,
+            stdout="head\n" if args[3] == "rev-parse" else "",
+            stderr="failed" if args[3] == "rev-list" else "",
+        ),
+        now=now,
+    )
+    assert labels == {"worklink:blocked"}
+    monkeypatch.setattr(autonomy, "worklink_defaults", lambda home: type("D", (), {"reaper_ttl_s": 0})())
+
+    pruned = autonomy.prune_stale_attempt_checkouts_for_home(tmp_path, repo=repo, runner=runner)
+
+    assert pruned == [checkout]
+    assert not checkout.exists()
+    assert labels == {"worklink:ready"}
+    assert load_orphan_block_record(tmp_path, 16) is None
+
+
+def test_pruner_preserves_unpublished_checkout_and_different_block_reason(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    now = datetime.now(UTC)
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    checkout = tmp_path / ".worklink" / repo.name / "17-2"
+    checkout.mkdir(parents=True)
+    os.utime(checkout, (0, 0))
+    state = _state(tmp_path, 17, 999_999_993, ticks=1, started_at=now)
+    save_run_state(tmp_path, replace(state, checkout=str(checkout), local_base="base-sha"))
+    labels = {"worklink:in-progress"}
+    comments: list[str] = []
+
+    def runner(args: list[str]) -> subprocess.CompletedProcess[str]:
+        if args[1:3] == ["issue", "unlabel"]:
+            labels.discard(args[4])
+        elif args[1:3] == ["issue", "label"]:
+            labels.add(args[4])
+        elif args[1:3] == ["issue", "comment"]:
+            comments.append(args[4])
+        elif args[1:3] == ["issue", "show"]:
+            return subprocess.CompletedProcess(
+                args, 0, stdout=json.dumps({"labels": sorted(labels), "comments": comments}), stderr=""
+            )
+        return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+
+    reconcile_run_states(
+        tmp_path,
+        runner=runner,
+        git_runner=lambda args: subprocess.CompletedProcess(
+            args,
+            0,
+            stdout=(
+                "head\n"
+                if args[3] == "rev-parse"
+                else "1\n"
+                if args[3] == "rev-list"
+                else "other\trefs/heads/issue/17-a2\n"
+            ),
+            stderr="",
+        ),
+        now=now,
+    )
+    monkeypatch.setattr(autonomy, "worklink_defaults", lambda home: type("D", (), {"reaper_ttl_s": 0})())
+    assert autonomy.prune_stale_attempt_checkouts_for_home(tmp_path, repo=repo, runner=runner) == []
+    assert checkout.exists()
+
+    record = load_orphan_block_record(tmp_path, 17)
+    assert record is not None
+    from mimir.worklink.run_state import save_orphan_block_record
+
+    save_orphan_block_record(tmp_path, replace(record, publication_outcome="undetermined"))
+    comments.append(
+        "WORKLINK_BLOCKED leaf template validation failed before dispatch; re-plan this issue."
+    )
+    assert autonomy.prune_stale_attempt_checkouts_for_home(tmp_path, repo=repo, runner=runner) == [checkout]
+    assert labels == {"worklink:blocked"}
+
+
+def test_old_prune_cannot_clear_new_attempt_block(tmp_path: Path) -> None:
+    from mimir.worklink.run_state import save_orphan_block_record
+
+    old = OrphanBlockRecord(
+        issue_id=18,
+        attempt=1,
+        checkout=str(tmp_path / "18-1"),
+        publication_outcome="undetermined",
+        comment="WORKLINK_BLOCKED orphaned run issue=18 attempt=1",
+    )
+    new = replace(
+        old,
+        attempt=2,
+        checkout=str(tmp_path / "18-2"),
+        comment="WORKLINK_BLOCKED orphaned run issue=18 attempt=2",
+    )
+    save_orphan_block_record(tmp_path, new)
+    calls: list[list[str]] = []
+
+    cleared = autonomy._clear_pruned_orphan_block(
+        tmp_path,
+        old,
+        run=lambda args: calls.append(list(args))
+        or subprocess.CompletedProcess(args, 0, stdout="{}", stderr=""),
+    )
+
+    assert cleared is False
+    assert calls == []
+    assert load_orphan_block_record(tmp_path, 18) == new
 
 
 def test_reconcile_lock_release_failure_retains_state_and_emits_actionable_event(

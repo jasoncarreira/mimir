@@ -14,16 +14,32 @@ persist a per-skill learning. Coverage:
 from __future__ import annotations
 
 import time
+from dataclasses import replace
 
 import pytest
 
 from langchain.tools import ToolRuntime
 
 from mimir._context import reset_current_turn, set_current_turn
-from mimir.models import AuthContext, TurnContext
+from mimir.models import (
+    AuthContext,
+    InformationFlowLabels,
+    InformationFlowState,
+    Integrity,
+    SourceLabel,
+    TurnContext,
+)
 from mimir.skill_memory import SKILL_LEARNING_SOURCE_TYPE
 from mimir.tools.memory import _MEMORY_STATE
 from mimir.tools.saga_ops import saga_record_skill_learning
+
+
+TRUSTED_LABELS = InformationFlowLabels().with_source(SourceLabel(
+    principal="test-admin", domain="channel", resource_id="test-channel",
+    bridge_instance="test", sensitivity="private",
+    authorized_principals=frozenset({"test-admin"}),
+    integrity=Integrity.TRUSTED,
+))
 
 
 ADMIN_AUTH = AuthContext(
@@ -34,6 +50,8 @@ ADMIN_AUTH = AuthContext(
     trigger="user_message",
     channel_id="test-channel",
     interactivity=None,
+    ifc_labels=TRUSTED_LABELS,
+    ifc_state=InformationFlowState(labels=TRUSTED_LABELS),
 )
 
 
@@ -53,6 +71,7 @@ class _StubStore:
             "content": content, "stream": stream,
             "source_type": source_type, "metadata": metadata,
             "session_id": session_id,
+            **kwargs,
         })
         return {"stored": self._stored, "atom_id": "atom-xyz"}
 
@@ -112,6 +131,66 @@ async def test_records_learning_with_validated_metadata(store, turn_with_session
     assert call["content"] == "circuit-breaker trips on empty input"  # stripped
     assert call["stream"] == "procedural"
     assert call["session_id"] == "sess-abc"  # resolved from ctx
+
+
+@pytest.mark.asyncio
+async def test_trusted_turn_records_trusted_learning_with_origin(
+    store, turn_with_session,
+):
+    labels = InformationFlowLabels().with_source(SourceLabel(
+        principal="test-admin", domain="channel", resource_id="message:1",
+        bridge_instance="test", sensitivity="private",
+        authorized_principals=frozenset({"test-admin"}),
+        integrity=Integrity.TRUSTED,
+    ))
+    auth = replace(
+        turn_with_session.auth_context,
+        origin_trigger="poller:skill-review",
+        origin_ref="event:123",
+        ifc_labels=labels,
+        ifc_state=InformationFlowState(labels=labels),
+    )
+    turn = replace(turn_with_session, auth_context=auth, ifc_labels=labels)
+
+    await _call(turn, skill="memory", kind="tip", content="trusted learning")
+
+    call = store.calls[0]
+    assert call["integrity"] == Integrity.TRUSTED
+    assert call["origin_trigger"] == "poller:skill-review"
+    assert call["origin_ref"] == "event:123"
+
+
+@pytest.mark.asyncio
+async def test_turn_with_any_untrusted_source_refuses_learning_as_tainted(
+    store, turn_with_session,
+):
+    labels = InformationFlowLabels(sources=(
+        SourceLabel(
+            principal="test-admin", domain="channel", resource_id="message:1",
+            bridge_instance="test", sensitivity="private",
+            authorized_principals=frozenset({"test-admin"}),
+            integrity=Integrity.TRUSTED,
+        ),
+        SourceLabel(
+            principal="web", domain="internet", resource_id="https://example.com",
+            bridge_instance="fetch", sensitivity="public",
+            authorized_principals=frozenset({"test-admin"}),
+            integrity=Integrity.UNTRUSTED,
+        ),
+    ))
+    auth = replace(
+        turn_with_session.auth_context,
+        ifc_labels=labels,
+        ifc_state=InformationFlowState(labels=labels),
+    )
+    turn = replace(turn_with_session, auth_context=auth, ifc_labels=labels)
+
+    result = await _call(
+        turn, skill="memory", kind="tip", content="tainted learning",
+    )
+
+    assert "tainted" in result
+    assert store.calls == []
 
 
 @pytest.mark.asyncio

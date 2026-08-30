@@ -1320,7 +1320,15 @@ async def test_server_session_idle_event_reaches_live_synthesis_middleware(
 
     event = _session_synthesis_event(session)
     assert event.service_principal == "synthesis"
-    assert event.ifc_labels == session_labels
+    assert event.ifc_labels is None
+    agent._config.turns_log.write_text(json.dumps({
+        "turn_id": "trusted-session-turn",
+        "ts": "2026-08-30T10:00:00+00:00",
+        "saga_session_id": session.saga_session_id,
+        "channel_id": session.channel_id,
+        "integrity": "trusted",
+        "output": "trusted session content",
+    }))
     record = await agent.run_turn(event)
 
     assert record.error is None
@@ -1619,6 +1627,17 @@ async def test_run_turn_records_folded_mid_turn_inputs(tmp_path: Path):
     turns = (tmp_path / "home" / "logs" / "turns.jsonl").read_text().splitlines()
     row = json.loads(turns[-1])
     assert row["injected_inputs"] == record.injected_inputs
+    assert row["integrity"] == "untrusted"
+    assert row["integrity_effect"] == "active_ingest"
+    assert row["integrity_sources"]
+    assert set(row["integrity_sources"][0]) == {
+        "principal",
+        "domain",
+        "resource_id",
+        "source_kind",
+        "integrity",
+        "integrity_effect",
+    }
 
 
 async def test_run_turn_no_injected_inputs_when_nothing_folded(tmp_path: Path):
@@ -1628,10 +1647,67 @@ async def test_run_turn_no_injected_inputs_when_nothing_folded(tmp_path: Path):
     fake_agent = _FakeAgent(response_messages=[AIMessage(content="ok")])
     agent = _build_agent(tmp_path, fake_agent=fake_agent, fake_saga=None)
     record = await agent.run_turn(
-        AgentEvent(trigger="user_message", channel_id="ch-1", content="hi")
+        AgentEvent(
+            trigger="user_message",
+            channel_id="ch-1",
+            content="hi",
+            author="alice",
+            source="discord",
+        )
     )
     assert record.injected_inputs == []
+    assert record.integrity == "trusted"
     assert agent._buffer.channel_count("ch-1") == 1
+
+
+async def test_turn_integrity_sources_are_bounded_and_keep_taint_cause(
+    tmp_path: Path,
+):
+    from mimir.models import InformationFlowLabels, SourceLabel
+
+    sources = tuple(
+        SourceLabel(
+            principal="alice",
+            domain="protected_tool",
+            resource_id=f"trusted:{index}",
+            bridge_instance="test",
+            sensitivity="private",
+            authorized_principals=frozenset({"alice"}),
+            source_kind="protected_tool",
+            integrity="trusted",
+        )
+        for index in range(40)
+    ) + (SourceLabel(
+        principal="web",
+        domain="internet",
+        resource_id="taint:cause",
+        bridge_instance="fetch",
+        sensitivity="public",
+        authorized_principals=frozenset({"alice"}),
+        source_kind="protected_tool",
+        integrity="untrusted",
+        integrity_effect="informational",
+    ),)
+    labels = InformationFlowLabels(sources=sources)
+    agent = _build_agent(
+        tmp_path,
+        fake_agent=_FakeAgent(response_messages=[AIMessage(content="ok")]),
+        fake_saga=None,
+    )
+
+    record = await agent.run_turn(AgentEvent(
+        trigger="user_message",
+        channel_id="ch-1",
+        content="hi",
+        author="alice",
+        source="discord",
+        ifc_labels=labels,
+    ))
+
+    assert record.integrity == "untrusted"
+    assert len(record.integrity_sources) == 32
+    assert record.integrity_sources_omitted == 11
+    assert record.integrity_sources[0]["resource_id"] == "taint:cause"
 
 
 async def test_budget_exhaustion_creates_worklink_continuation_sidecar(

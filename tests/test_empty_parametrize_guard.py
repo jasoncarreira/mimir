@@ -32,6 +32,9 @@ def _run_fixture_test(
             "-m",
             "pytest",
             "-q",
+            # The probe inspects a collection error that xdist does not relay.
+            "-n",
+            "0",
             "-c",
             str(ROOT / "pyproject.toml"),
             "-p",
@@ -87,6 +90,9 @@ def test_intentionally_empty_parametrize_can_opt_out(tmp_path: Path) -> None:
             "-m",
             "pytest",
             "-q",
+            # Keep every collection-policy probe on the same serial path.
+            "-n",
+            "0",
             "-c",
             str(ROOT / "pyproject.toml"),
             "-p",

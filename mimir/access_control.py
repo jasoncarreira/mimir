@@ -5799,6 +5799,38 @@ _CHAINLINK_TAINT_REFUSAL = (
     "issue cascade, issue next, issue tree, and session status."
 )
 
+SAGA_TAINT_REFUSAL = (
+    "durable memory mutation refused because this turn is tainted: durable "
+    "memory requires a non-empty source set whose sources are all trusted"
+)
+
+
+def saga_mutation_taint_refusal(
+    auth_context: Any, fallback: Any = None,
+) -> str | None:
+    """Return a clear refusal unless the live turn sources are all trusted."""
+    from .models import InformationFlowLabels, Integrity
+
+    if auth_context is None:
+        return SAGA_TAINT_REFUSAL
+    state = getattr(auth_context, "ifc_state", None)
+    get_current = getattr(state, "current", None)
+    if not callable(get_current):
+        return SAGA_TAINT_REFUSAL
+    try:
+        labels = get_current(
+            fallback if fallback is not None else getattr(auth_context, "ifc_labels", None)
+        )
+    except Exception:
+        log.exception("saga_mutation_integrity_evaluation_failed")
+        return SAGA_TAINT_REFUSAL
+    if (
+        not isinstance(labels, InformationFlowLabels)
+        or labels.persisted_integrity is not Integrity.TRUSTED
+    ):
+        return SAGA_TAINT_REFUSAL
+    return None
+
 
 def _live_untrusted_active_ingest(
     auth_context: Any, fallback: Any,
@@ -6343,6 +6375,22 @@ class SinkGate:
                 is_shadow_decision=not enforce,
                 would_block=True,
             )
+
+        if sink_category is SinkCategory.SAGA:
+            taint_refusal = saga_mutation_taint_refusal(auth_context, ifc_labels)
+            if taint_refusal is not None:
+                return ToolAuthorization(
+                    tool_name=tool_name,
+                    decision=OperationDecision.ADMIN_REQUIRED,
+                    allowed=not enforce,
+                    reason="saga_mutation_blocked_by_tainted_turn",
+                    service_principal=service,
+                    required_tier=AccessTier.ADMIN,
+                    enforcement_enabled=enforce,
+                    is_shadow_decision=not enforce,
+                    would_block=True,
+                    refusal_detail=taint_refusal,
+                )
 
         if not target:
             return ToolAuthorization(
@@ -9155,9 +9203,10 @@ _SELF_AUTHORED_FILE_ROOTS = frozenset({
     "docs",
     "memory",
     "prompts",
+    "skills",
     "state",
 })
-_FILE_INTEGRITY_RECORDED_ROOTS = _SELF_AUTHORED_FILE_ROOTS | {"skills"}
+_FILE_INTEGRITY_RECORDED_ROOTS = _SELF_AUTHORED_FILE_ROOTS
 _FILE_INTEGRITY_EXCLUDED_SUBTREES = frozenset({("state", "pollers")})
 _FILE_INTEGRITY_DECLASSIFICATIONS_KEY = "__declassifications__"
 _FILE_INTEGRITY_EPOCH_KEY = "__ledger_epoch_ns__"
@@ -9309,20 +9358,21 @@ def _filesystem_result_integrity(
         and relative.parts
         and relative.parts[0] in _SELF_AUTHORED_FILE_ROOTS
     ):
-        # These roots are scaffolded by ``mimir setup`` and contain first-party
-        # reference material. Operator- or agent-authored files under ``skills``
-        # do not receive this default merely because of their location; only
-        # shipped ``.mimir_builtin_skills`` are first-party reference material.
-        # Trust still comes from persisted provenance below: explicit writer
-        # records win, while the ledger epoch distinguishes pre-existing files
-        # from later writes that bypassed the protected tool boundary.
+        # These roots contain framework or operator-authored reference material.
+        # Admin-installed files under ``skills`` are trusted only when the install
+        # path explicitly records them; unlike scaffolded roots, their location
+        # never supplies a trusted default. For the other roots, explicit writer
+        # records win and the ledger epoch distinguishes pre-existing files from
+        # later writes that bypassed the protected tool boundary.
         #
         # Poller subprocesses write this tree directly, outside the protected
         # tool boundary, and may persist attacker-derived cursor/event fields.
         # A path under state/pollers is therefore not proof of self-authorship.
         if relative.parts[0:2] in _FILE_INTEGRITY_EXCLUDED_SUBTREES:
             return "untrusted", "active_ingest"
-        persisted = _persisted_file_integrity(home, relative)
+        persisted = _persisted_file_integrity(
+            home, relative, require_recorded=relative.parts[0] == "skills",
+        )
         return persisted, (
             "informational" if persisted == "trusted" else "active_ingest"
         )
@@ -9518,6 +9568,72 @@ def initialize_file_integrity_ledger(home: Path) -> bool:
             return True
         except (OSError, json.JSONDecodeError):
             log.exception("failed to initialize file integrity ledger at %s", metadata_path)
+            return False
+
+
+def record_admin_installed_skill_integrity(home: Path, skill_root: Path) -> bool:
+    """Atomically trust every file in one completed admin-installed skill."""
+    try:
+        home = home.resolve(strict=True)
+        skill_root = skill_root.resolve(strict=True)
+        skill_relative = skill_root.relative_to(home)
+    except (OSError, RuntimeError, ValueError):
+        return False
+    if (
+        len(skill_relative.parts) != 2
+        or skill_relative.parts[0] != "skills"
+        or not skill_root.is_dir()
+    ):
+        return False
+
+    keys: set[str] = set()
+    try:
+        for candidate in skill_root.rglob("*"):
+            if not candidate.is_file():
+                continue
+            resolved = candidate.resolve(strict=True)
+            resolved.relative_to(skill_root)
+            keys.add(resolved.relative_to(home).as_posix())
+    except (OSError, RuntimeError, ValueError):
+        return False
+
+    metadata_path = home / ".mimir" / "file-integrity.json"
+    prefix = f"{skill_relative.as_posix()}/"
+    with _persisted_file_integrity_lock:
+        try:
+            payload = (
+                json.loads(metadata_path.read_text(encoding="utf-8"))
+                if metadata_path.exists()
+                else {}
+            )
+            if not isinstance(payload, dict):
+                return False
+            if _FILE_INTEGRITY_EPOCH_KEY not in payload:
+                payload[_FILE_INTEGRITY_EPOCH_KEY] = time.time_ns()
+            else:
+                epoch_ns = payload[_FILE_INTEGRITY_EPOCH_KEY]
+                if (
+                    not isinstance(epoch_ns, int)
+                    or isinstance(epoch_ns, bool)
+                    or epoch_ns <= 0
+                ):
+                    return False
+            for key in tuple(payload):
+                if isinstance(key, str) and key.startswith(prefix):
+                    del payload[key]
+            payload.update(dict.fromkeys(sorted(keys), "trusted"))
+            metadata_path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = metadata_path.with_suffix(".tmp")
+            tmp.write_text(
+                json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n",
+                encoding="utf-8",
+            )
+            tmp.replace(metadata_path)
+            return True
+        except (OSError, json.JSONDecodeError):
+            log.exception(
+                "failed to persist admin-installed skill integrity for %s", skill_root,
+            )
             return False
 
 
@@ -10768,6 +10884,8 @@ def service_can_invoke_operation(
 def can_write_saga(auth_context: Any, operation: str) -> bool:
     """Authorize one canonical SAGA mutation for an admin or service."""
     if operation not in _SAGA_MUTATION_OPERATIONS:
+        return False
+    if saga_mutation_taint_refusal(auth_context) is not None:
         return False
     if is_admin(auth_context):
         return True

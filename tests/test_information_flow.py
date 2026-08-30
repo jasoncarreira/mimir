@@ -70,6 +70,7 @@ from mimir.models import (
     AuthContext,
     InformationFlowLabels,
     InformationFlowState,
+    Integrity,
     IntegrityEffect,
     RepoPRActionScope,
     RepoReviewState,
@@ -78,6 +79,7 @@ from mimir.models import (
 )
 from mimir.pr_checkout_lease import PRCheckoutLease
 from mimir.prompt_sources import prompt_source_label
+from mimir.skill_install import install
 from mimir.turn_event_bus import TurnEventBus, TurnEventEmitter
 from mimir.worklink.continuation import (
     HTTP_EVENT_INGRESS_EXTRA_KEY,
@@ -3654,7 +3656,7 @@ def test_repo_review_shell_result_remains_informational() -> None:
     assert labels.has_untrusted_active_ingest is False
 
 
-@pytest.mark.parametrize("root", sorted(_SELF_AUTHORED_FILE_ROOTS))
+@pytest.mark.parametrize("root", sorted(_SELF_AUTHORED_FILE_ROOTS - {"skills"}))
 def test_operator_seeded_file_without_provenance_is_trusted_informational(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -3682,6 +3684,67 @@ def test_operator_seeded_file_without_provenance_is_trusted_informational(
     assert (source.integrity, source.integrity_effect) == (
         "trusted", "informational",
     )
+
+
+def test_admin_installed_skill_read_does_not_block_turn_sinks(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / "home"
+    source_root = tmp_path / "optional-skills"
+    source = source_root / "github"
+    source.mkdir(parents=True)
+    (source / "SKILL.md").write_text("trusted admin instructions", encoding="utf-8")
+    home.mkdir()
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    assert initialize_file_integrity_ledger(home) is True
+    installed = install("github", home, optional_skills_root=source_root)
+
+    event = AgentEvent(
+        trigger="user_message", channel_id="slack-C1", author="user-1",
+        source="slack", content="use the github skill",
+    )
+    labels = _initialize_ifc_labels(event)
+    state = InformationFlowState(labels=labels)
+    auth = replace(
+        create_auth_context(event, enforce=True, ifc_labels=labels),
+        roles=("admin",),
+        interactivity=TurnInteractivity.NON_INTERACTIVE,
+        ifc_state=state,
+    )
+    read_labels = classify_protected_result(
+        "read_file", {"file_path": str(installed.dest / "SKILL.md")}, auth,
+        ToolAuthorization(
+            tool_name="read_file",
+            decision=OperationDecision.RESOURCE_SCOPED,
+            allowed=True,
+        ),
+    )
+    assert read_labels is not None
+    labels = state.merge(read_labels)
+
+    assert labels.has_untrusted_active_ingest is False
+    assert SinkGate.check_sink_flow(
+        "send_message", event.channel_id, labels, auth, enforce=True,
+    ).allowed is True
+
+    dropped = home / "skills" / "dropped" / "SKILL.md"
+    dropped.parent.mkdir()
+    dropped.write_text("untrusted instructions", encoding="utf-8")
+    untrusted_read = classify_protected_result(
+        "read_file", {"file_path": str(dropped)}, auth,
+        ToolAuthorization(
+            tool_name="read_file",
+            decision=OperationDecision.RESOURCE_SCOPED,
+            allowed=True,
+        ),
+    )
+    assert untrusted_read is not None
+    blocked = SinkGate.check_sink_flow(
+        "send_message", event.channel_id, untrusted_read, auth, enforce=True,
+    )
+    assert blocked.allowed is False
+    assert blocked.reason == "ifc_label_blocked:same_channel"
 
 
 @pytest.mark.parametrize("location", ["outside", "memory-scratch", "attachments"])
@@ -3990,7 +4053,8 @@ def test_trigger_sink_must_be_exact_declared_capability() -> None:
         "memory_store", "saga", labels, auth, enforce=True,
     )
 
-    assert declared.allowed is True
+    assert declared.allowed is False
+    assert declared.reason == "saga_mutation_blocked_by_tainted_turn"
     assert undeclared.allowed is False
 
 
@@ -4441,7 +4505,11 @@ def test_persistent_writes_are_ifc_gated_not_merely_admin_gated(
     )
 
     assert decision.allowed is False
-    assert decision.reason == f"ifc_label_blocked:{sink_category.value}"
+    assert decision.reason == (
+        "saga_mutation_blocked_by_tainted_turn"
+        if sink_category is SinkCategory.SAGA
+        else f"ifc_label_blocked:{sink_category.value}"
+    )
 
 
 @pytest.mark.parametrize(
@@ -4472,7 +4540,11 @@ def test_inventory_omission_mutations_are_explicit_ifc_sinks(
     )
 
     assert decision.allowed is False
-    assert decision.reason == f"ifc_label_blocked:{sink_category.value}"
+    assert decision.reason == (
+        "saga_mutation_blocked_by_tainted_turn"
+        if sink_category is SinkCategory.SAGA
+        else f"ifc_label_blocked:{sink_category.value}"
+    )
 
 
 @pytest.mark.asyncio
@@ -4557,11 +4629,64 @@ def test_same_scope_synthesis_write_remains_allowed():
         "memory_store",
         synthesis,
         enforce=True,
-        ifc_labels=_labels(channel, sources=frozenset({channel})),
+        ifc_labels=InformationFlowLabels(sources=(SourceLabel(
+            principal="service:synthesis",
+            domain="service",
+            resource_id=channel,
+            bridge_instance="synthesis",
+            sensitivity="internal",
+            authorized_principals=frozenset({"service:synthesis"}),
+            source_kind="service",
+            integrity=Integrity.TRUSTED,
+            integrity_effect=IntegrityEffect.INFORMATIONAL,
+        ),)),
     )
 
     assert decision.allowed is True
     assert decision.reason is None
+
+
+def test_tainted_saga_mutation_refusal_names_taint() -> None:
+    labels = _labels()
+    auth = replace(
+        _auth(roles=("admin",)),
+        ifc_labels=labels,
+        ifc_state=InformationFlowState(labels=labels),
+    )
+
+    decision = ToolRegistry().authorize_tool(
+        "saga_forget", auth, enforce=True, ifc_labels=labels,
+    )
+
+    assert decision.allowed is False
+    assert decision.reason == "saga_mutation_blocked_by_tainted_turn"
+    assert decision.refusal_detail is not None
+    assert "tainted" in decision.refusal_detail
+
+
+def test_saga_mutation_refuses_indeterminate_live_label_state() -> None:
+    labels = InformationFlowLabels(sources=(SourceLabel(
+        principal="root", domain="channel", resource_id="slack-C1",
+        bridge_instance="slack", sensitivity="private",
+        authorized_principals=frozenset({"root"}),
+        integrity=Integrity.TRUSTED,
+    ),))
+
+    def fail(_fallback):
+        raise RuntimeError("label state unavailable")
+
+    auth = replace(
+        _auth(roles=("admin",)),
+        ifc_labels=labels,
+        ifc_state=SimpleNamespace(current=fail),
+    )
+
+    decision = ToolRegistry().authorize_tool(
+        "memory_store", auth, enforce=True, ifc_labels=labels,
+    )
+
+    assert decision.allowed is False
+    assert decision.reason == "saga_mutation_blocked_by_tainted_turn"
 
 
 def test_untrusted_session_synthesis_can_write_memory_but_not_cross_channel(

@@ -113,7 +113,7 @@ async def saga_feedback(
         signal: One of ``useful``, ``incorrect``, ``stale``.
         session_id: Optional override; defaults to the active turn's.
     """
-    from ..access_control import can_write_saga
+    from ..access_control import can_write_saga, saga_mutation_taint_refusal
 
     client = _MEMORY_STATE["client"]
     if client is None:
@@ -132,6 +132,9 @@ async def saga_feedback(
         if runtime is not None and isinstance(runtime.context, AuthContext)
         else None
     )
+    taint_refusal = saga_mutation_taint_refusal(auth_context)
+    if taint_refusal is not None:
+        return f"saga_feedback failed: {taint_refusal}"
     if not can_write_saga(auth_context, "saga_feedback"):
         return (
             "saga_feedback failed: write access denied. "
@@ -169,7 +172,7 @@ async def saga_mark_contributions(
         response_text: The response body the atoms contributed to.
         session_id: Optional override; defaults to the active turn's.
     """
-    from ..access_control import can_write_saga
+    from ..access_control import can_write_saga, saga_mutation_taint_refusal
 
     client = _MEMORY_STATE["client"]
     if client is None:
@@ -184,6 +187,9 @@ async def saga_mark_contributions(
         if runtime is not None and isinstance(runtime.context, AuthContext)
         else None
     )
+    taint_refusal = saga_mutation_taint_refusal(auth_context)
+    if taint_refusal is not None:
+        return f"saga_mark_contributions failed: {taint_refusal}"
     if not can_write_saga(auth_context, "saga_mark_contributions"):
         return (
             "saga_mark_contributions failed: write access denied. "
@@ -232,6 +238,7 @@ async def saga_end_session(
     from ..access_control import (
         can_write_saga,
         get_provenance_from_auth_context,
+        saga_mutation_taint_refusal,
     )
 
     client = _MEMORY_STATE["client"]
@@ -255,6 +262,9 @@ async def saga_end_session(
         if runtime is not None and isinstance(runtime.context, AuthContext)
         else None
     )
+    taint_refusal = saga_mutation_taint_refusal(auth_context)
+    if taint_refusal is not None:
+        return f"saga_end_session failed: {taint_refusal}"
     if not can_write_saga(auth_context, "saga_end_session"):
         return (
             "saga_end_session failed: write access denied. "
@@ -330,7 +340,7 @@ async def saga_forget(
     state`` reports pending forget candidates; a successful non-dry-
     run call clears that line until the next decay cycle.
     """
-    from ..access_control import can_write_saga
+    from ..access_control import can_write_saga, saga_mutation_taint_refusal
 
     client = _MEMORY_STATE["client"]
     if client is None:
@@ -341,6 +351,9 @@ async def saga_forget(
         if runtime is not None and isinstance(runtime.context, AuthContext)
         else None
     )
+    taint_refusal = saga_mutation_taint_refusal(auth_context)
+    if taint_refusal is not None:
+        return f"saga_forget failed: {taint_refusal}"
     if not can_write_saga(auth_context, "saga_forget"):
         return (
             "saga_forget failed: write access denied. "
@@ -405,6 +418,7 @@ async def saga_record_skill_learning(
         can_write_saga,
         get_provenance_from_auth_context,
         is_trusted_service,
+        saga_mutation_taint_refusal,
     )
 
     client = _MEMORY_STATE["client"]
@@ -416,6 +430,9 @@ async def saga_record_skill_learning(
         if runtime is not None and isinstance(runtime.context, AuthContext)
         else None
     )
+    taint_refusal = saga_mutation_taint_refusal(auth_context)
+    if taint_refusal is not None:
+        return f"saga_record_skill_learning failed: {taint_refusal}"
     if not can_write_saga(auth_context, "saga_record_skill_learning"):
         return (
             "saga_record_skill_learning failed: write access denied. "
@@ -435,6 +452,8 @@ async def saga_record_skill_learning(
     owner_principal = provenance["created_by"]
     origin_channel = auth_context.channel_id
     visibility = "service" if is_trusted_service(auth_context) else "private"
+    labels = auth_context.ifc_state.current(auth_context.ifc_labels)
+    integrity = labels.persisted_integrity
 
     try:
         result = await client.store(
@@ -445,6 +464,9 @@ async def saga_record_skill_learning(
             session_id=_resolve_session_id(session_id),
             owner_principal=owner_principal,
             origin_channel=origin_channel,
+            integrity=integrity,
+            origin_trigger=auth_context.origin_trigger or auth_context.trigger,
+            origin_ref=auth_context.origin_ref,
             origin_domain=None,
             visibility=visibility,
             provenance=provenance,

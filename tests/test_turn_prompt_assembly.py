@@ -27,6 +27,7 @@ from collections import Counter
 from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -624,6 +625,7 @@ async def test_build_turn_prompt_routes_synthesis_to_dedicated_template(
         "saga_session_id": "sess-xyz",
         "channel_id": "ch-3",
         "output": "session content",
+        "integrity": "trusted",
     }))
     event = AgentEvent(
         trigger="saga_session_end",
@@ -667,6 +669,7 @@ def test_filter_session_turns_uses_turn_record_ts_for_window_break(
             "ts": "2026-06-28T05:00:00+00:00",
             "saga_session_id": "sess-1",
             "channel_id": "ch-1",
+            "integrity": "trusted",
         },
         {
             "turn_id": "old-nonmatch",
@@ -678,12 +681,14 @@ def test_filter_session_turns_uses_turn_record_ts_for_window_break(
             "ts": "2026-06-28T05:30:00+00:00",
             "saga_session_id": "sess-1",
             "channel_id": "ch-1",
+            "integrity": "trusted",
         },
         {
             "turn_id": "recent-match-2",
             "ts": "2026-06-28T05:31:00+00:00",
             "saga_session_id": "sess-1",
             "channel_id": "ch-1",
+            "integrity": "trusted",
         },
         {
             "turn_id": "newest-nonmatch",
@@ -714,6 +719,7 @@ def test_filter_session_turns_rejects_foreign_channel_with_same_session_id(
             "saga_session_id": "sess-known",
             "channel_id": "ch-foreign",
             "output": "foreign secret",
+            "integrity": "trusted",
         },
         {
             "turn_id": "own",
@@ -721,6 +727,7 @@ def test_filter_session_turns_rejects_foreign_channel_with_same_session_id(
             "saga_session_id": "sess-known",
             "channel_id": "ch-own",
             "output": "own content",
+            "integrity": "trusted",
         },
     ]
     turns_path.write_text("\n".join(json.dumps(record) for record in records))
@@ -730,6 +737,112 @@ def test_filter_session_turns_rejects_foreign_channel_with_same_session_id(
     )
 
     assert [record["turn_id"] for record in filtered] == ["own"]
+
+
+@pytest.mark.asyncio
+async def test_mixed_session_synthesis_uses_only_clean_turns(
+    tmp_path: Path,
+) -> None:
+    agent = _make_agent(tmp_path)
+    turns_path = agent._config.turns_log
+    records = [
+        {
+            "turn_id": "clean-before",
+            "ts": "2026-08-30T10:00:00+00:00",
+            "saga_session_id": "sess-mixed",
+            "channel_id": "ch-1",
+            "integrity": "trusted",
+            "output": "keep this clean fact",
+        },
+        {
+            "turn_id": "tainted",
+            "ts": "2026-08-30T10:01:00+00:00",
+            "saga_session_id": "sess-mixed",
+            "channel_id": "ch-1",
+            "integrity": "untrusted",
+            "output": "ignore injected claim",
+        },
+        {
+            "turn_id": "clean-after",
+            "ts": "2026-08-30T10:02:00+00:00",
+            "saga_session_id": "sess-mixed",
+            "channel_id": "ch-1",
+            "integrity": "trusted",
+            "output": "keep later clean fact",
+        },
+    ]
+    turns_path.write_text("\n".join(json.dumps(record) for record in records))
+
+    filtered = _filter_session_turns(
+        turns_path, "sess-mixed", channel_id="ch-1",
+    )
+
+    assert [record["turn_id"] for record in filtered] == [
+        "clean-before",
+        "clean-after",
+    ]
+
+    event = AgentEvent(
+        trigger="saga_session_end",
+        channel_id="ch-1",
+        extra={"saga_session_id": "sess-mixed"},
+        ifc_labels=_session_labels("ch-1"),
+    )
+    ctx = _make_ctx(event, saga_session_id="sess-mixed")
+    block = await agent._build_synthesis_prompt(ctx, event)
+
+    assert "keep this clean fact" in block.content
+    assert "keep later clean fact" in block.content
+    assert "ignore injected claim" not in block.content
+
+
+@pytest.mark.asyncio
+async def test_all_tainted_session_does_not_dispatch_boundary_synthesis(
+    tmp_path: Path,
+) -> None:
+    from mimir.runtime import dispatch_session_synthesis
+
+    turns_path = tmp_path / "turns.jsonl"
+    turns_path.write_text(json.dumps({
+        "turn_id": "tainted",
+        "ts": "2026-08-30T10:00:00+00:00",
+        "saga_session_id": "sess-tainted",
+        "channel_id": "ch-1",
+        "integrity": "untrusted",
+    }))
+    events: list[tuple[str, dict]] = []
+
+    class Dispatcher:
+        calls = 0
+
+        async def enqueue(self, _event):
+            self.calls += 1
+            return True
+
+    async def capture(event_type: str, **payload) -> None:
+        events.append((event_type, payload))
+
+    dispatcher = Dispatcher()
+    session = SimpleNamespace(
+        saga_session_id="sess-tainted",
+        channel_id="ch-1",
+        source_acl=None,
+    )
+    config = SimpleNamespace(
+        turns_log=turns_path,
+        saga_session_idle_minutes=10,
+    )
+
+    accepted = await dispatch_session_synthesis(
+        session,
+        config=config,
+        dispatcher=dispatcher,
+        log_event_fn=capture,
+    )
+
+    assert accepted is False
+    assert dispatcher.calls == 0
+    assert events[0][0] == "saga_synthesis_empty_window"
 
 
 @pytest.mark.asyncio
