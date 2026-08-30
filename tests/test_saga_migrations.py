@@ -169,6 +169,14 @@ class TestDetectSchemaVersion:
         )
         assert m.detect_schema_version(conn) == 11
 
+    def test_v12_schema_version_stamp_returns_v12(self) -> None:
+        conn = sqlite3.connect(":memory:")
+        conn.executescript(
+            "CREATE TABLE schema_version (version INTEGER PRIMARY KEY, applied_at TEXT);"
+            "INSERT INTO schema_version VALUES (12, '2026-08-30T00:00:00+00:00');"
+        )
+        assert m.detect_schema_version(conn) == 12
+
     def test_missing_session_backfill_targets_data_repair_through_real_open(
         self, tmp_path: Path
     ) -> None:
@@ -463,7 +471,7 @@ class TestApplyPendingMigrations:
             );
             CREATE TABLE atoms (
                 id TEXT PRIMARY KEY, content_hash TEXT, agent_id TEXT,
-                tombstoned INTEGER DEFAULT 0, {ownership}
+                tombstoned INTEGER DEFAULT 0, created_at TEXT, {ownership}
             );
             CREATE TABLE sessions (
                 id TEXT PRIMARY KEY, channel_id TEXT, ended_at TEXT,
@@ -1422,6 +1430,7 @@ class TestV7OwnershipMigration:
                 content_hash TEXT NOT NULL,
                 agent_id TEXT DEFAULT 'default',
                 tombstoned INTEGER DEFAULT 0,
+                created_at TEXT,
                 owner_principal TEXT NOT NULL DEFAULT 'legacy_admin',
                 origin_channel TEXT,
                 origin_domain TEXT,
@@ -1502,7 +1511,7 @@ class TestV7OwnershipMigration:
                 "WHERE type = 'index' AND tbl_name = 'world_state'"
             )
         }
-        assert max(versions) == m.CURRENT_SCHEMA_VERSION == 11
+        assert max(versions) == m.CURRENT_SCHEMA_VERSION == 12
         assert {
             "owner_principal",
             "origin_channel",
@@ -1675,7 +1684,7 @@ def test_current_schema_has_owner_dedup_and_recall_provenance() -> None:
         assert {"integrity", "origin_trigger", "origin_ref"} <= atom_columns.keys()
         assert atom_columns["integrity"][3] == 1
         assert atom_columns["integrity"][4] == "'untrusted'"
-        assert m.detect_schema_version(conn) == 11
+        assert m.detect_schema_version(conn) == m.CURRENT_SCHEMA_VERSION
     finally:
         conn.close()
 
@@ -1710,6 +1719,7 @@ def test_v11_fresh_and_migrated_indexes_have_identical_pragma_output() -> None:
             "idx_sessions_channel_recency",
         ):
             migrated.execute(f"DROP INDEX {name}")
+        migrated.execute("DROP INDEX idx_atoms_integrity_created_at")
         assert m.detect_schema_version(migrated) == 10
         m._execute_migration_script(migrated, m.MIGRATIONS[11])
         assert m.detect_schema_version(migrated) == 11
@@ -1725,3 +1735,70 @@ def test_v11_fresh_and_migrated_indexes_have_identical_pragma_output() -> None:
     finally:
         fresh.close()
         migrated.close()
+
+
+class TestV12LegacyIntegrityMigration:
+    @staticmethod
+    def _database(*, include_v10: bool = True) -> sqlite3.Connection:
+        conn = sqlite3.connect(":memory:")
+        conn.executescript(Path("mimir/saga/schema.sql").read_text())
+        versions = [(version, "2000-01-01T00:00:00+00:00") for version in range(1, 12)]
+        if include_v10:
+            versions[9] = (10, "2026-07-20 20:15:00")
+        else:
+            versions.pop(9)
+        conn.executemany(
+            "INSERT INTO schema_version (version, applied_at) VALUES (?, ?)", versions
+        )
+        conn.executemany(
+            "INSERT INTO atoms "
+            "(id, content, content_hash, created_at, integrity, origin_trigger) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            [
+                ("legacy", "legacy", "h1", "2026-07-20T20:14:59+00:00", "untrusted", None),
+                ("boundary", "boundary", "h2", "2026-07-20T20:15:00+00:00", "untrusted", None),
+                ("post-null", "post null", "h3", "2026-07-20T20:15:01+00:00", "untrusted", None),
+                ("post-origin", "post origin", "h4", "2026-07-20T20:15:02+00:00", "untrusted", "turn"),
+                ("already-trusted", "trusted", "h5", "2026-07-20T20:14:58+00:00", "trusted", None),
+            ],
+        )
+        conn.commit()
+        return conn
+
+    def test_only_pre_v10_untrusted_atoms_become_trusted(self, caplog) -> None:
+        conn = self._database()
+
+        with caplog.at_level("INFO", logger=m.__name__):
+            m.apply_pending_migrations(conn, fresh=False)
+
+        assert conn.execute(
+            "SELECT id, integrity FROM atoms ORDER BY id"
+        ).fetchall() == [
+            ("already-trusted", "trusted"),
+            ("boundary", "untrusted"),
+            ("legacy", "trusted"),
+            ("post-null", "untrusted"),
+            ("post-origin", "untrusted"),
+        ]
+        assert "Applied SAGA migration v12: 1 rows changed" in caplog.text
+
+    def test_migration_is_idempotent(self) -> None:
+        conn = self._database()
+
+        assert m._execute_migration_script(conn, m.MIGRATIONS[12]) == 1
+        assert m._execute_migration_script(conn, m.MIGRATIONS[12]) == 0
+
+    def test_missing_v10_boundary_is_safe_no_op(self) -> None:
+        conn = self._database(include_v10=False)
+        before = conn.execute(
+            "SELECT id, integrity FROM atoms ORDER BY id"
+        ).fetchall()
+
+        m.apply_pending_migrations(conn, fresh=False)
+
+        assert conn.execute(
+            "SELECT id, integrity FROM atoms ORDER BY id"
+        ).fetchall() == before
+        assert conn.execute(
+            "SELECT version FROM schema_version WHERE version = 12"
+        ).fetchone() == (12,)
