@@ -67,6 +67,7 @@ from mimir.models import (
     AuthContext,
     InformationFlowLabels,
     InformationFlowState,
+    Integrity,
     IntegrityEffect,
     RepoPRActionScope,
     RepoReviewState,
@@ -3891,7 +3892,8 @@ def test_trigger_sink_must_be_exact_declared_capability() -> None:
         "memory_store", "saga", labels, auth, enforce=True,
     )
 
-    assert declared.allowed is True
+    assert declared.allowed is False
+    assert declared.reason == "saga_mutation_blocked_by_tainted_turn"
     assert undeclared.allowed is False
 
 
@@ -4202,7 +4204,11 @@ def test_persistent_writes_are_ifc_gated_not_merely_admin_gated(
     )
 
     assert decision.allowed is False
-    assert decision.reason == f"ifc_label_blocked:{sink_category.value}"
+    assert decision.reason == (
+        "saga_mutation_blocked_by_tainted_turn"
+        if sink_category is SinkCategory.SAGA
+        else f"ifc_label_blocked:{sink_category.value}"
+    )
 
 
 @pytest.mark.parametrize(
@@ -4233,7 +4239,11 @@ def test_inventory_omission_mutations_are_explicit_ifc_sinks(
     )
 
     assert decision.allowed is False
-    assert decision.reason == f"ifc_label_blocked:{sink_category.value}"
+    assert decision.reason == (
+        "saga_mutation_blocked_by_tainted_turn"
+        if sink_category is SinkCategory.SAGA
+        else f"ifc_label_blocked:{sink_category.value}"
+    )
 
 
 @pytest.mark.asyncio
@@ -4318,11 +4328,64 @@ def test_same_scope_synthesis_write_remains_allowed():
         "memory_store",
         synthesis,
         enforce=True,
-        ifc_labels=_labels(channel, sources=frozenset({channel})),
+        ifc_labels=InformationFlowLabels(sources=(SourceLabel(
+            principal="service:synthesis",
+            domain="service",
+            resource_id=channel,
+            bridge_instance="synthesis",
+            sensitivity="internal",
+            authorized_principals=frozenset({"service:synthesis"}),
+            source_kind="service",
+            integrity=Integrity.TRUSTED,
+            integrity_effect=IntegrityEffect.INFORMATIONAL,
+        ),)),
     )
 
     assert decision.allowed is True
     assert decision.reason is None
+
+
+def test_tainted_saga_mutation_refusal_names_taint() -> None:
+    labels = _labels()
+    auth = replace(
+        _auth(roles=("admin",)),
+        ifc_labels=labels,
+        ifc_state=InformationFlowState(labels=labels),
+    )
+
+    decision = ToolRegistry().authorize_tool(
+        "saga_forget", auth, enforce=True, ifc_labels=labels,
+    )
+
+    assert decision.allowed is False
+    assert decision.reason == "saga_mutation_blocked_by_tainted_turn"
+    assert decision.refusal_detail is not None
+    assert "tainted" in decision.refusal_detail
+
+
+def test_saga_mutation_refuses_indeterminate_live_label_state() -> None:
+    labels = InformationFlowLabels(sources=(SourceLabel(
+        principal="root", domain="channel", resource_id="slack-C1",
+        bridge_instance="slack", sensitivity="private",
+        authorized_principals=frozenset({"root"}),
+        integrity=Integrity.TRUSTED,
+    ),))
+
+    def fail(_fallback):
+        raise RuntimeError("label state unavailable")
+
+    auth = replace(
+        _auth(roles=("admin",)),
+        ifc_labels=labels,
+        ifc_state=SimpleNamespace(current=fail),
+    )
+
+    decision = ToolRegistry().authorize_tool(
+        "memory_store", auth, enforce=True, ifc_labels=labels,
+    )
+
+    assert decision.allowed is False
+    assert decision.reason == "saga_mutation_blocked_by_tainted_turn"
 
 
 def test_untrusted_session_synthesis_can_write_memory_but_not_cross_channel(

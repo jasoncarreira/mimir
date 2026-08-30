@@ -34,6 +34,14 @@ from mimir.tools.memory import _MEMORY_STATE
 from mimir.tools.saga_ops import saga_record_skill_learning
 
 
+TRUSTED_LABELS = InformationFlowLabels().with_source(SourceLabel(
+    principal="test-admin", domain="channel", resource_id="test-channel",
+    bridge_instance="test", sensitivity="private",
+    authorized_principals=frozenset({"test-admin"}),
+    integrity=Integrity.TRUSTED,
+))
+
+
 ADMIN_AUTH = AuthContext(
     principal="test-admin",
     canonical_principal="test-admin",
@@ -42,6 +50,8 @@ ADMIN_AUTH = AuthContext(
     trigger="user_message",
     channel_id="test-channel",
     interactivity=None,
+    ifc_labels=TRUSTED_LABELS,
+    ifc_state=InformationFlowState(labels=TRUSTED_LABELS),
 )
 
 
@@ -151,7 +161,7 @@ async def test_trusted_turn_records_trusted_learning_with_origin(
 
 
 @pytest.mark.asyncio
-async def test_turn_with_any_untrusted_source_records_untrusted_learning(
+async def test_turn_with_any_untrusted_source_refuses_learning_as_tainted(
     store, turn_with_session,
 ):
     labels = InformationFlowLabels(sources=(
@@ -175,9 +185,12 @@ async def test_turn_with_any_untrusted_source_records_untrusted_learning(
     )
     turn = replace(turn_with_session, auth_context=auth, ifc_labels=labels)
 
-    await _call(turn, skill="memory", kind="tip", content="tainted learning")
+    result = await _call(
+        turn, skill="memory", kind="tip", content="tainted learning",
+    )
 
-    assert store.calls[0]["integrity"] == Integrity.UNTRUSTED
+    assert "tainted" in result
+    assert store.calls == []
 
 
 @pytest.mark.asyncio

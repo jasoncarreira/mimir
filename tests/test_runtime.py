@@ -3,6 +3,7 @@ from __future__ import annotations
 import ast
 import asyncio
 import inspect
+import json
 import os
 import subprocess
 import sys
@@ -627,7 +628,8 @@ async def test_agent_collaborator_parity_and_final_commit(
     adapters = _adapters(events)
     core = _core(tmp_path)
 
-    bundle = await runtime.create_agent_runtime(_config(tmp_path), core, adapters)
+    config = _config(tmp_path)
+    bundle = await runtime.create_agent_runtime(config, core, adapters)
 
     assert bundle.replayed_messages == 7
     assert bundle.migrated_commitments == 3
@@ -972,7 +974,8 @@ async def test_dispatcher_and_session_callback_parity_and_order(
         pairing_notifier=notifier,
         spawn_background_task=lambda coroutine, name: asyncio.create_task(coroutine, name=name),
     )
-    bundle = await runtime.create_agent_runtime(_config(tmp_path), core, adapters)
+    config = _config(tmp_path)
+    bundle = await runtime.create_agent_runtime(config, core, adapters)
 
     bindings = [
         kind
@@ -1030,13 +1033,21 @@ async def test_dispatcher_and_session_callback_parity_and_order(
         source_acl={"operator"},
         ifc_state=SimpleNamespace(current=lambda: frozenset({"private"})),
     )
+    config.turns_log.parent.mkdir(parents=True, exist_ok=True)
+    config.turns_log.write_text(json.dumps({
+        "turn_id": "trusted-session-turn",
+        "ts": "2026-08-30T10:00:00+00:00",
+        "saga_session_id": "saga-session",
+        "channel_id": "session-channel",
+        "integrity": "trusted",
+    }))
     await bundle.sessions.on_idle(session)
     queued = [value for kind, value in events if kind == "enqueue"][-1]
     assert queued.trigger == "saga_session_end"
     assert queued.channel_id == "session-channel"
     assert queued.extra == {"saga_session_id": "saga-session"}
     assert queued.source_session_acl == {"operator"}
-    assert queued.ifc_labels == frozenset({"private"})
+    assert queued.ifc_labels is None
     assert bundle.sessions.is_busy("busy") is True
     assert bundle.sessions.is_busy("idle") is False
 

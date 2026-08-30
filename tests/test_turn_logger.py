@@ -1017,6 +1017,16 @@ async def test_turn_logger_redacts_token_shaped_secrets(tmp_path: Path):
         }],
         total_cost_usd=0.0123,
         duration_ms=42,
+        integrity="untrusted",
+        integrity_effect="active_ingest",
+        integrity_sources=[{
+            "principal": "web",
+            "domain": "internet",
+            "resource_id": f"token={secret}",
+            "source_kind": "protected_tool",
+            "integrity": "untrusted",
+            "integrity_effect": "active_ingest",
+        }],
     )
     await log.write(record)
     line = path.read_text().splitlines()[0]
@@ -1046,6 +1056,16 @@ async def test_turn_logger_redacts_token_shaped_secrets(tmp_path: Path):
     assert rec["events"][0]["type"] == "tool_result"
     assert rec["total_cost_usd"] == 0.0123
     assert rec["seq"] == 1
+    assert rec["integrity"] == "untrusted"
+    assert rec["integrity_effect"] == "active_ingest"
+    assert rec["integrity_sources"] == [{
+        "principal": "web",
+        "domain": "internet",
+        "resource_id": "token=[REDACTED]",
+        "source_kind": "protected_tool",
+        "integrity": "untrusted",
+        "integrity_effect": "active_ingest",
+    }]
 
 
 async def test_turn_logger_redacts_yaml_block_scalars_without_erasing_context(
