@@ -28,8 +28,9 @@ from ..access_control import (
     can_write_saga,
     get_provenance_from_auth_context,
     is_trusted_service,
+    saga_mutation_taint_refusal,
 )
-from ..models import AuthContext, InformationFlowLabels, Integrity
+from ..models import AuthContext
 from .memory import _MEMORY_STATE
 
 
@@ -83,6 +84,9 @@ async def memory_store(
         if runtime is not None and isinstance(runtime.context, AuthContext)
         else None
     )
+    taint_refusal = saga_mutation_taint_refusal(auth_context)
+    if taint_refusal is not None:
+        return f"memory_store failed: {taint_refusal}"
     if not can_write_saga(auth_context, "memory_store"):
         return (
             "memory_store failed: write access denied. "
@@ -97,13 +101,7 @@ async def memory_store(
     origin_channel = auth_context.channel_id
     visibility = "service" if is_trusted_service(auth_context) else "private"
     labels = auth_context.ifc_state.current(auth_context.ifc_labels)
-    integrity = (
-        Integrity.TRUSTED
-        if isinstance(labels, InformationFlowLabels)
-        and labels.sources
-        and all(source.integrity == Integrity.TRUSTED for source in labels.sources)
-        else Integrity.UNTRUSTED
-    )
+    integrity = labels.persisted_integrity
 
     try:
         result = await client.store(

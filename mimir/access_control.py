@@ -5725,6 +5725,38 @@ _CHAINLINK_TAINT_REFUSAL = (
     "issue cascade, issue next, issue tree, and session status."
 )
 
+SAGA_TAINT_REFUSAL = (
+    "durable memory mutation refused because this turn is tainted: durable "
+    "memory requires a non-empty source set whose sources are all trusted"
+)
+
+
+def saga_mutation_taint_refusal(
+    auth_context: Any, fallback: Any = None,
+) -> str | None:
+    """Return a clear refusal unless the live turn sources are all trusted."""
+    from .models import InformationFlowLabels, Integrity
+
+    if auth_context is None:
+        return SAGA_TAINT_REFUSAL
+    state = getattr(auth_context, "ifc_state", None)
+    get_current = getattr(state, "current", None)
+    if not callable(get_current):
+        return SAGA_TAINT_REFUSAL
+    try:
+        labels = get_current(
+            fallback if fallback is not None else getattr(auth_context, "ifc_labels", None)
+        )
+    except Exception:
+        log.exception("saga_mutation_integrity_evaluation_failed")
+        return SAGA_TAINT_REFUSAL
+    if (
+        not isinstance(labels, InformationFlowLabels)
+        or labels.persisted_integrity is not Integrity.TRUSTED
+    ):
+        return SAGA_TAINT_REFUSAL
+    return None
+
 
 def _live_untrusted_active_ingest(
     auth_context: Any, fallback: Any,
@@ -6125,6 +6157,22 @@ class SinkGate:
                 is_shadow_decision=not enforce,
                 would_block=True,
             )
+
+        if sink_category is SinkCategory.SAGA:
+            taint_refusal = saga_mutation_taint_refusal(auth_context, ifc_labels)
+            if taint_refusal is not None:
+                return ToolAuthorization(
+                    tool_name=tool_name,
+                    decision=OperationDecision.ADMIN_REQUIRED,
+                    allowed=not enforce,
+                    reason="saga_mutation_blocked_by_tainted_turn",
+                    service_principal=service,
+                    required_tier=AccessTier.ADMIN,
+                    enforcement_enabled=enforce,
+                    is_shadow_decision=not enforce,
+                    would_block=True,
+                    refusal_detail=taint_refusal,
+                )
 
         if not target:
             return ToolAuthorization(
@@ -10507,6 +10555,8 @@ def service_can_invoke_operation(
 def can_write_saga(auth_context: Any, operation: str) -> bool:
     """Authorize one canonical SAGA mutation for an admin or service."""
     if operation not in _SAGA_MUTATION_OPERATIONS:
+        return False
+    if saga_mutation_taint_refusal(auth_context) is not None:
         return False
     if is_admin(auth_context):
         return True

@@ -438,7 +438,9 @@ def _session_synthesis_event(session: ChannelSession) -> AgentEvent:
         content="",
         extra={"saga_session_id": session.saga_session_id},
         source_session_acl=session.source_acl,
-        ifc_labels=session.ifc_state.current(),
+        # The synthesis turn reads its trusted window directly from turns.jsonl.
+        # Carrying session IFC state here would propagate turn-scoped taint.
+        ifc_labels=None,
     )
 
 

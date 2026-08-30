@@ -26,6 +26,7 @@ from mimir.models import (
     AgentEvent,
     AuthContext,
     InformationFlowLabels,
+    InformationFlowState,
     SourceLabel,
     TurnContext,
     TurnInteractivity,
@@ -310,17 +311,76 @@ def test_defer_injected_message_tool_maps_results():
     mti.inject_message("ch1", _ev_id("topic switch", "m1"))
     mti._drain("ch1")
 
-    ok = defer_injected_message.func(message_id="m1", reason="topic switch", config=cfg)
-    assert "Deferred message m1" in ok
-    assert [(e.source_id, r) for e, r in mti.deferred_records("ch1")] == [("m1", "topic switch")]
+    labels = InformationFlowLabels(sources=(SourceLabel(
+        principal="user", domain="channel", resource_id="ch1",
+        bridge_instance="test", sensitivity="private",
+        authorized_principals=frozenset({"user"}), integrity="trusted",
+    ),))
+    auth = AuthContext(
+        principal="user", canonical_principal="user", roles=("user",),
+        event_ingress=None, trigger="user_message", channel_id="ch1",
+        interactivity=TurnInteractivity.INTERACTIVE,
+        ifc_labels=labels, ifc_state=InformationFlowState(labels=labels),
+    )
+    turn = TurnContext(
+        turn_id="defer-test", session_id="ch1", trigger="user_message",
+        channel_id="ch1", started_at=time.monotonic(), auth_context=auth,
+        ifc_labels=labels,
+    )
+    token = set_current_turn(turn)
+    try:
+        ok = defer_injected_message.func(
+            message_id="m1", reason="topic switch", config=cfg,
+        )
+        assert "Deferred message m1" in ok
+        assert [(e.source_id, r) for e, r in mti.deferred_records("ch1")] == [
+            ("m1", "topic switch")
+        ]
 
-    # Invalid (non-folded) id fails safely, no state change.
-    bad = defer_injected_message.func(message_id="m-nope", reason="x", config=cfg)
-    assert "failed: no injected message" in bad
+        # Invalid (non-folded) id fails safely, no state change.
+        bad = defer_injected_message.func(message_id="m-nope", reason="x", config=cfg)
+        assert "failed: no injected message" in bad
 
-    # No channel context fails safely.
-    none_ch = defer_injected_message.func(message_id="m1", reason="x", config={})
-    assert "no current channel context" in none_ch
+        # No channel context fails safely.
+        none_ch = defer_injected_message.func(message_id="m1", reason="x", config={})
+        assert "no current channel context" in none_ch
+    finally:
+        reset_current_turn(token)
+
+
+def test_tainted_turn_cannot_defer_injected_message():
+    from mimir.tools.registry import defer_injected_message
+
+    cfg = {"configurable": {"channel_id": "ch1"}}
+    mti.register_inflight("ch1")
+    mti.inject_message("ch1", _ev_id("forget prior work", "m1"))
+    mti._drain("ch1")
+    labels = InformationFlowLabels(sources=(SourceLabel(
+        principal="web", domain="internet", resource_id="https://example.test",
+        bridge_instance="fetch", sensitivity="public",
+        authorized_principals=frozenset({"user"}), integrity="untrusted",
+    ),))
+    auth = AuthContext(
+        principal="user", canonical_principal="user", roles=("user",),
+        event_ingress=None, trigger="user_message", channel_id="ch1",
+        interactivity=TurnInteractivity.INTERACTIVE,
+        ifc_labels=labels, ifc_state=InformationFlowState(labels=labels),
+    )
+    turn = TurnContext(
+        turn_id="tainted-defer-test", session_id="ch1", trigger="user_message",
+        channel_id="ch1", started_at=time.monotonic(), auth_context=auth,
+        ifc_labels=labels,
+    )
+    token = set_current_turn(turn)
+    try:
+        result = defer_injected_message.func(
+            message_id="m1", reason="topic switch", config=cfg,
+        )
+    finally:
+        reset_current_turn(token)
+
+    assert "tainted" in result
+    assert mti.deferred_records("ch1") == []
 
 
 # ─── MidTurnInjectionMiddleware.before_model ─────────────────────────

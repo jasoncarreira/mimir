@@ -1269,6 +1269,16 @@ def defer_injected_message(
             "[mid-turn message from <author>, msg_id: <id>]".
         reason: Short why (e.g. "topic switch", "unrelated new work").
     """
+    from .._context import get_current_turn
+    from ..access_control import saga_mutation_taint_refusal
+
+    turn = get_current_turn()
+    refusal = saga_mutation_taint_refusal(
+        getattr(turn, "auth_context", None),
+        getattr(turn, "ifc_labels", None),
+    )
+    if refusal is not None:
+        return f"defer_injected_message failed: {refusal}"
     cid = _channel_from_config_or_state(None, config)
     if not cid:
         return "defer_injected_message failed: no current channel context"
@@ -1687,6 +1697,20 @@ def _commitment_actor(
     return principal, "admin" in context.roles, context.is_service
 
 
+def _commitment_taint_refusal(
+    runtime: ToolRuntime[AuthContext] | None, operation: str,
+) -> str | None:
+    from ..access_control import saga_mutation_taint_refusal
+
+    context = runtime.context if runtime is not None else None
+    if not isinstance(context, AuthContext):
+        return "authorization context unavailable"
+    refusal = saga_mutation_taint_refusal(context)
+    if refusal is not None:
+        return refusal
+    return None
+
+
 @tool
 async def commitment_complete(
     commitment_id: str,
@@ -1702,6 +1726,9 @@ async def commitment_complete(
     store = _STATE["commitments_store"]
     if store is None:
         return "commitment_complete failed: no commitments store"
+    refusal = _commitment_taint_refusal(runtime, "commitment_complete")
+    if refusal is not None:
+        return f"commitment_complete failed: {refusal}"
     actor = _commitment_actor(runtime)
     if actor is None:
         return "commitment_complete failed: authorization context unavailable"
@@ -1737,6 +1764,9 @@ async def commitment_snooze(
     store = _STATE["commitments_store"]
     if store is None:
         return "commitment_snooze failed: no commitments store"
+    refusal = _commitment_taint_refusal(runtime, "commitment_snooze")
+    if refusal is not None:
+        return f"commitment_snooze failed: {refusal}"
     actor = _commitment_actor(runtime)
     if actor is None:
         return "commitment_snooze failed: authorization context unavailable"
@@ -1779,6 +1809,9 @@ async def commitment_dismiss(
     store = _STATE["commitments_store"]
     if store is None:
         return "commitment_dismiss failed: no commitments store"
+    refusal = _commitment_taint_refusal(runtime, "commitment_dismiss")
+    if refusal is not None:
+        return f"commitment_dismiss failed: {refusal}"
     actor = _commitment_actor(runtime)
     if actor is None:
         return "commitment_dismiss failed: authorization context unavailable"

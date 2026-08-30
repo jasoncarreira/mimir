@@ -28,7 +28,14 @@ import pytest
 from mimir._context import reset_current_turn, set_current_turn
 from langchain.tools import ToolRuntime
 
-from mimir.models import AuthContext, TurnContext
+from mimir.models import (
+    AuthContext,
+    InformationFlowLabels,
+    InformationFlowState,
+    Integrity,
+    SourceLabel,
+    TurnContext,
+)
 from mimir.tools import saga_ops
 from mimir.tools.memory import _MEMORY_STATE
 
@@ -169,6 +176,12 @@ def store() -> _StubStore:
 def turn_with_session() -> TurnContext:
     """Register a TurnContext so ``session_id`` defaults to the turn's
     ``saga_session_id``."""
+    labels = InformationFlowLabels(sources=(SourceLabel(
+        principal="test-user", domain="channel", resource_id="ch-1",
+        bridge_instance="test", sensitivity="private",
+        authorized_principals=frozenset({"test-user"}),
+        integrity=Integrity.TRUSTED,
+    ),))
     auth_ctx = AuthContext(
         principal="test-user",
         canonical_principal="test-user",
@@ -178,6 +191,8 @@ def turn_with_session() -> TurnContext:
         channel_id="ch-1",
         interactivity=None,
         policy_version=None,
+        ifc_labels=labels,
+        ifc_state=InformationFlowState(labels=labels),
         is_service=False,
         enforcement_enabled=False,
         saga_session_id="sess-abc",
@@ -190,6 +205,7 @@ def turn_with_session() -> TurnContext:
         started_at=time.monotonic(),
         saga_session_id="sess-abc",
         auth_context=auth_ctx,
+        ifc_labels=labels,
     )
     token = set_current_turn(ctx)
     yield ctx

@@ -19,7 +19,14 @@ from mimir._context import reset_current_turn, set_current_turn
 from mimir import _context
 from langchain.tools import ToolRuntime
 
-from mimir.models import AuthContext, TurnContext
+from mimir.models import (
+    AuthContext,
+    InformationFlowLabels,
+    InformationFlowState,
+    Integrity,
+    SourceLabel,
+    TurnContext,
+)
 from mimir.tools import saga_ops
 from mimir.tools.memory import _MEMORY_STATE
 from mimir.tools.saga_ops import _resolve_session_id
@@ -166,6 +173,15 @@ def store() -> _StubStore:
 
 @pytest.fixture
 def turn_with_session() -> TurnContext:
+    labels = InformationFlowLabels(sources=(SourceLabel(
+        principal="test-user",
+        domain="channel",
+        resource_id="ch-1",
+        bridge_instance="test",
+        sensitivity="private",
+        authorized_principals=frozenset({"test-user"}),
+        integrity=Integrity.TRUSTED,
+    ),))
     auth_ctx = AuthContext(
         principal="test-user",
         canonical_principal="test-user",
@@ -178,6 +194,8 @@ def turn_with_session() -> TurnContext:
         is_service=False,
         enforcement_enabled=False,
         saga_session_id="sess-abc",
+        ifc_labels=labels,
+        ifc_state=InformationFlowState(labels=labels),
     )
     ctx = TurnContext(
         turn_id="t-1",
@@ -187,6 +205,7 @@ def turn_with_session() -> TurnContext:
         started_at=time.monotonic(),
         saga_session_id="sess-abc",
         auth_context=auth_ctx,
+        ifc_labels=labels,
     )
     token = set_current_turn(ctx)
     yield ctx
@@ -357,7 +376,7 @@ async def test_end_session_without_server_runtime_fails_closed(
     out = await saga_ops.saga_end_session.ainvoke(
         {"session_id": "sess-xyz", "summary": "wrapping up"}
     )
-    assert "write access denied" in out
+    assert "tainted" in out
     assert store.end_session_calls == []
 
 
@@ -373,7 +392,7 @@ async def test_end_session_does_not_consult_active_registry(
         )
     finally:
         _context._current_turn.reset(token)
-    assert "write access denied" in out
+    assert "tainted" in out
     assert store.end_session_calls == []
 
 
@@ -555,7 +574,7 @@ async def test_record_skill_learning_without_runtime_fails_closed(
     out = await saga_ops.saga_record_skill_learning.ainvoke(
         {"skill": "test-skill", "kind": "tip", "content": "Test learning"}
     )
-    assert "write access denied" in out
+    assert "tainted" in out
     assert store.store_calls == []
 
 
@@ -564,6 +583,15 @@ async def test_record_skill_learning_non_admin_non_service_denied(
     store: _StubStore,
 ) -> None:
     """A regular user without admin or trusted-service role must be denied."""
+    labels = InformationFlowLabels(sources=(SourceLabel(
+        principal="regular-user",
+        domain="channel",
+        resource_id="test-channel",
+        bridge_instance="test",
+        sensitivity="private",
+        authorized_principals=frozenset({"regular-user"}),
+        integrity=Integrity.TRUSTED,
+    ),))
     user_auth = AuthContext(
         principal="regular-user",
         canonical_principal="regular-user",
@@ -572,6 +600,8 @@ async def test_record_skill_learning_non_admin_non_service_denied(
         trigger="user_message",
         channel_id="test-channel",
         interactivity=None,
+        ifc_labels=labels,
+        ifc_state=InformationFlowState(labels=labels),
     )
     user_ctx = TurnContext(
         turn_id="turn-1",
@@ -582,7 +612,7 @@ async def test_record_skill_learning_non_admin_non_service_denied(
         agent_id="agent-1",
         saga_session_id="sess-1",
         auth_context=user_auth,
-        ifc_labels=None,
+        ifc_labels=labels,
     )
     token = set_current_turn(user_ctx)
     try:
