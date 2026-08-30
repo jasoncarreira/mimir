@@ -432,6 +432,20 @@ async def run_direct(
     return result
 
 
+async def wait_for_child_ready(read_fd: int) -> None:
+    reader = asyncio.StreamReader()
+    transport, _ = await asyncio.get_running_loop().connect_read_pipe(
+        lambda: asyncio.StreamReaderProtocol(reader),
+        os.fdopen(read_fd, "rb", buffering=0),
+    )
+    try:
+        # This bound is only a hang guard for a child that fails before signalling
+        # readiness, not an assertion about interpreter-startup latency.
+        assert await asyncio.wait_for(reader.readexactly(1), timeout=10) == b"1"
+    finally:
+        transport.close()
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("termination", ["sigterm", "timeout"])
 async def test_direct_terminated_output_is_durable_while_running(
@@ -482,8 +496,10 @@ async def test_direct_termination_kills_pipe_holding_grandchild(
     monkeypatch: pytest.MonkeyPatch, trigger: str
 ) -> None:
     original_terminate = worker_exec._terminate_process_group_pid
+    original_create = asyncio.create_subprocess_exec
     signals: list[int] = []
     original_killpg = os.killpg
+    test_ready_r, test_ready_w = os.pipe()
 
     def expedited_terminate(process_group: int, timeout_s: float = 5.0) -> None:
         original_terminate(process_group, 0.05)
@@ -492,8 +508,13 @@ async def test_direct_termination_kills_pipe_holding_grandchild(
         signals.append(sig)
         original_killpg(process_group, sig)
 
+    async def create_with_readiness(*args: Any, **kwargs: Any) -> Any:
+        kwargs["pass_fds"] = (test_ready_w,)
+        return await original_create(*args, **kwargs)
+
     monkeypatch.setattr(worker_exec, "_terminate_process_group_pid", expedited_terminate)
     monkeypatch.setattr(worker_exec.os, "killpg", observed_killpg)
+    monkeypatch.setattr(compute.asyncio, "create_subprocess_exec", create_with_readiness)
     monkeypatch.setattr("mimir.worklink.checkout.coding_enabled", lambda: False)
     if trigger == "overflow":
         monkeypatch.setenv("MIMIR_WORKLINK_MAX_STDOUT_BYTES", "1")
@@ -508,15 +529,19 @@ async def test_direct_termination_kills_pipe_holding_grandchild(
         "os.close(ready_w); "
         "assert os.read(ready_r,1)==b'1'; os.close(ready_r); "
         f"print({output!r},flush=True); "
+        f"os.write({test_ready_w},b'1'); os.close({test_ready_w}); "
         "time.sleep(30)"
     )
     backend = LocalSubprocessComputeBackend()
     handle = await backend.launch(direct_spec(source))
+    os.close(test_ready_w)
+    await wait_for_child_ready(test_ready_r)
 
     result = await asyncio.wait_for(
-        # The source prints only after the grandchild has installed its
-        # SIGTERM-ignore handler, so timeout termination is deterministic.
-        backend.wait(handle, 0.2 if trigger == "timeout" else 2), timeout=3
+        backend.wait(handle, 0.2 if trigger == "timeout" else 2),
+        # This bound is only a hang guard for broken termination, not a latency
+        # assertion about signal delivery or output-pipe draining.
+        timeout=10,
     )
     await backend.cleanup(handle)
 
@@ -643,14 +668,21 @@ async def test_closed_worker_direct_parity_inventory(
         socket_events: list[str] = []
         sent: list[dict[str, Any]] = []
         executor_events: list[str] = []
+        executor_ready_r, executor_ready_w = os.pipe()
         executor_process = subprocess.Popen(
             [
-                "/bin/sh",
+                sys.executable,
                 "-c",
-                "trap '' TERM; while :; do sleep 1; done",
+                "import os,signal,time; "
+                "signal.signal(signal.SIGTERM,signal.SIG_IGN); "
+                f"os.write({executor_ready_w},b'1'); os.close({executor_ready_w}); "
+                "time.sleep(30)",
             ],
             start_new_session=True,
+            pass_fds=(executor_ready_w,),
         )
+        os.close(executor_ready_w)
+        await wait_for_child_ready(executor_ready_r)
         original_executor_terminate = worker_exec._terminate_process_group
         original_executor_killpg = worker_exec.os.killpg
 
@@ -716,7 +748,6 @@ async def test_closed_worker_direct_parity_inventory(
         auth_client = AuthenticatedClient()
         backend, handle = await launch_worker(monkeypatch, auth_client)
         worker_exec._jobs[handle.identifier] = executor_process
-        await asyncio.sleep(0.1)
         await backend.cancel(handle)
         worker = await backend.wait(handle, 2)
         executor_events.append("terminal")
@@ -747,6 +778,7 @@ async def test_closed_worker_direct_parity_inventory(
         direct_events: list[str] = []
         original_create = asyncio.create_subprocess_exec
         original_killpg = os.killpg
+        direct_ready_r, direct_ready_w = os.pipe()
 
         class ObservedProcess:
             def __init__(self, process: asyncio.subprocess.Process) -> None:
@@ -768,6 +800,7 @@ async def test_closed_worker_direct_parity_inventory(
                 return result
 
         async def observed_create(*args: Any, **kwargs: Any) -> ObservedProcess:
+            kwargs["pass_fds"] = (direct_ready_w,)
             return ObservedProcess(await original_create(*args, **kwargs))
 
         def observed_killpg(pgid: int, sig: int) -> None:
@@ -782,9 +815,13 @@ async def test_closed_worker_direct_parity_inventory(
             direct_spec(
                 "import os,signal,time; "
                 "signal.signal(signal.SIGTERM, lambda *_: os.write(1,b'term\\n')); "
-                "os.write(1,b'ready\\n'); time.sleep(30)"
+                "os.write(1,b'ready\\n'); "
+                f"os.write({direct_ready_w},b'1'); os.close({direct_ready_w}); "
+                "time.sleep(30)"
             )
         )
+        os.close(direct_ready_w)
+        await wait_for_child_ready(direct_ready_r)
         direct = await direct_backend.wait(direct_handle, 0.2)
         direct_events.append("terminal")
         await direct_backend.cleanup(direct_handle)
