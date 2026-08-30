@@ -24,6 +24,10 @@ class ProviderPolicyError(RuntimeError):
     pass
 
 
+class ClientProviderResultError(ToolException, RuntimeError):
+    """A rejected client result that must be returned to the model as a tool error."""
+
+
 class PermissionDecision(StrEnum):
     ALLOW_ONCE = "allow_once"
     REJECT_ONCE = "reject_once"

@@ -1998,7 +1998,7 @@ async def test_cancel_boundary_prevents_permission_and_mcp_registration(tmp_path
 
 @pytest.mark.asyncio
 async def test_integrated_hands_edit_permission_wire_and_provider_result(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture,
 ) -> None:
     """Exercise once-only permission and terminal updates over the public wire."""
     from langchain.agents.middleware import ToolCallRequest
@@ -2120,6 +2120,7 @@ async def test_integrated_hands_edit_permission_wire_and_provider_result(
             [("edit-1", "notes-1.txt", "old-1", "new-1")],
             [("edit-2", "notes-2.txt", "old-2", "new-2")],
             [("edit-3", "notes-3.txt", "old-3", "new-3")],
+            [("edit-4", "notes-4.txt", "old-4", "new-4")],
         ])
 
         async def integrated_turn(event: Any, **kwargs: Any) -> None:
@@ -2205,6 +2206,12 @@ async def test_integrated_hands_edit_permission_wire_and_provider_result(
                 })
                 await queue.join()
                 await active.dispatcher.drain()
+                if result.status == "error" and "structuredContent" in str(result.content):
+                    delivered = await bundle.adapters.channels.send(
+                        event.channel_id,
+                        f"Tool {tool_id} failed: {result.content}",
+                    )
+                    assert delivered.sent
 
         monkeypatch.setattr(core, "run_turn", integrated_turn)
 
@@ -2411,6 +2418,52 @@ async def test_integrated_hands_edit_permission_wire_and_provider_result(
         # A reject consumed only its permission outer ID: there is no tools/call
         # frame, and no stale allow_once decision was retained from either call.
         assert transport.outgoing.empty()
+
+        bare_result = asyncio.create_task(
+            agent.prompt(session_id, [sdk.TextContentBlock(type="text", text="bare result")])
+        )
+        owned_tasks.append(bare_result)
+        assert (await next_outgoing())["params"]["update"]["sessionUpdate"] == "user_message_chunk"
+        bare_start = (await next_outgoing())["params"]["update"]
+        assert bare_start["toolCallId"] == "edit-4"
+        assert bare_start["status"] == "pending"
+        assert await next_outgoing() == permission_request(
+            8, "edit-4", "notes-4.txt", "old-4", "new-4"
+        )
+        await transport.incoming.put({
+            "jsonrpc": "2.0", "id": 8,
+            "result": {"outcome": {"outcome": "selected", "optionId": "allow_once"}},
+        })
+        bare_provider_frame = await next_outgoing()
+        bare_token = bare_provider_frame["params"]["params"]["_meta"]["progressToken"]
+        assert bare_provider_frame == provider_request(
+            9, "notes-4.txt", "old-4", "new-4", bare_token
+        )
+        await transport.incoming.put({
+            "jsonrpc": "2.0", "id": 9,
+            "result": {"changed": "provider payload must not be echoed"},
+        })
+        bare_progress = (await next_outgoing())["params"]["update"]
+        assert bare_progress["toolCallId"] == "edit-4"
+        assert bare_progress["status"] == "in_progress"
+        bare_terminal = (await next_outgoing())["params"]["update"]
+        assert bare_terminal["toolCallId"] == "edit-4"
+        assert bare_terminal["status"] == "failed"
+        assert "missing structuredContent" in bare_terminal["rawOutput"]["error"]
+        assert "provider payload" not in bare_terminal["rawOutput"]["error"]
+        reaction = (await next_outgoing())["params"]["update"]
+        assert reaction["sessionUpdate"] == "agent_message_chunk"
+        assert "edit-4" in reaction["content"]["text"]
+        assert "missing structuredContent" in reaction["content"]["text"]
+        assert (await asyncio.wait_for(bare_result, 3)).stop_reason == "end_turn"
+        assert transport.outgoing.empty()
+        rejection_log = next(
+            record for record in caplog.records
+            if record.getMessage() == "Client provider result rejected: missing structuredContent"
+        )
+        assert rejection_log.tool_name == "edit"
+        assert rejection_log.session_id == session_id
+        assert "provider payload" not in rejection_log.getMessage()
 
     finally:
         await transport.incoming.put(None)
