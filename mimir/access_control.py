@@ -9868,6 +9868,44 @@ def _incomplete_protected_result(
     ))
 
 
+def _acp_failed_tool_error_result(
+    result: Any,
+    auth_context: "AuthContext | None",
+    provenance: ProtectedResultProvenance | None,
+) -> "InformationFlowLabels | None":
+    """Label an error-only ACP result as informational session-channel input."""
+    from langchain_core.messages import ToolMessage
+
+    from .models import InformationFlowLabels, SourceLabel
+
+    if (
+        provenance is not None
+        or not isinstance(result, ToolMessage)
+        or getattr(result, "status", None) != "error"
+        or getattr(auth_context, "origin_trigger", None) != "acp_session"
+    ):
+        return None
+    principal = getattr(auth_context, "canonical_principal", None)
+    channel = getattr(auth_context, "channel_id", None)
+    bridge = getattr(auth_context, "bridge_instance", None)
+    domain = getattr(auth_context, "domain", None)
+    if not all(isinstance(value, str) and value for value in (
+        principal, channel, bridge, domain,
+    )):
+        return None
+    return InformationFlowLabels().with_source(SourceLabel(
+        principal=principal,
+        domain=domain,
+        resource_id=channel,
+        bridge_instance=bridge,
+        sensitivity="private",
+        authorized_principals=frozenset({principal}),
+        source_kind="channel",
+        integrity="untrusted",
+        integrity_effect="informational",
+    ))
+
+
 def _result_matches_policy_refusal(result: Any, refusal: "ToolPolicyRefusal") -> bool:
     """Return whether the model-visible result contains only this typed refusal."""
     from langchain_core.messages import ToolMessage
@@ -9910,6 +9948,11 @@ def classify_protected_result(
         and _result_matches_policy_refusal(result, policy_refusal)
     ):
         return None
+    acp_error_labels = _acp_failed_tool_error_result(
+        result, auth_context, provenance,
+    )
+    if failed and acp_error_labels is not None:
+        return acp_error_labels
 
     args = arguments or {}
     if tool_name in _REPOSITORY_RESULT_TOOLS:

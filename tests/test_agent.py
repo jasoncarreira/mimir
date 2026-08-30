@@ -564,6 +564,105 @@ class _AcpHandsReadProbeAgent(_FakeAgent):
             yield chunk
 
 
+class _AcpFailedReadProbeAgent(_FakeAgent):
+    """Return a failed native read result before producing final ACP text."""
+
+    def __init__(self) -> None:
+        super().__init__([AIMessage(content="FAILURE EXPLAINED")])
+        self.result: ToolMessage | None = None
+
+    async def astream(
+        self,
+        state: dict[str, Any],
+        *,
+        config: dict[str, Any],
+        context=None,
+        stream_mode: str = "values",
+    ):
+        async def _handler(req: ToolCallRequest) -> ToolMessage:
+            return ToolMessage(
+                content="read_file failed: /outside/root is outside the file-tool root",
+                tool_call_id=req.tool_call["id"],
+                status="error",
+            )
+
+        self.result = await BudgetGateMiddleware().awrap_tool_call(
+            ToolCallRequest(
+                tool_call={
+                    "name": "read_file",
+                    "args": {"file_path": "/outside/root"},
+                    "id": "tc-acp-failed-read",
+                    "type": "tool_call",
+                },
+                tool=None,
+                state=None,
+                runtime=Runtime(context=context),
+            ),
+            _handler,
+        )
+        async for chunk in super().astream(
+            state, config=config, context=context, stream_mode=stream_mode,
+        ):
+            yield chunk
+
+
+class _AcpCrossChannelProbeAgent(_FakeAgent):
+    """Return a failed tool result that captured foreign-channel provenance."""
+
+    def __init__(self) -> None:
+        super().__init__([AIMessage(content="MUST NOT DELIVER")])
+        self.result: ToolMessage | None = None
+
+    async def astream(
+        self,
+        state: dict[str, Any],
+        *,
+        config: dict[str, Any],
+        context=None,
+        stream_mode: str = "values",
+    ):
+        foreign = InformationFlowLabels().with_source(SourceLabel(
+            principal="another-user",
+            domain="channel:private",
+            resource_id="acp:another-session",
+            bridge_instance="acp-stdio",
+            sensitivity="private",
+            authorized_principals=frozenset({"another-user"}),
+            source_kind="channel",
+            integrity="untrusted",
+            integrity_effect="active_ingest",
+        )).sources
+
+        async def _handler(req: ToolCallRequest) -> ToolMessage:
+            from mimir.access_control import publish_protected_result
+
+            publish_protected_result(foreign)
+            return ToolMessage(
+                content="read_file failed after reading a foreign resource",
+                tool_call_id=req.tool_call["id"],
+                status="error",
+            )
+
+        self.result = await BudgetGateMiddleware().awrap_tool_call(
+            ToolCallRequest(
+                tool_call={
+                    "name": "read_file",
+                    "args": {"file_path": "/foreign/resource"},
+                    "id": "tc-acp-cross-channel-read",
+                    "type": "tool_call",
+                },
+                tool=None,
+                state=None,
+                runtime=Runtime(context=context),
+            ),
+            _handler,
+        )
+        async for chunk in super().astream(
+            state, config=config, context=context, stream_mode=stream_mode,
+        ):
+            yield chunk
+
+
 class _HttpEventAdminProbeAgent(_FakeAgent):
     """Probe the TurnContext Agent installs before admin-tool auth runs."""
 
@@ -5729,7 +5828,7 @@ async def _refusal_test_acp(
 
 
 @pytest.mark.parametrize("refusal_kind", ["sink_gate", "bridge"])
-async def test_acp_refused_final_text_surfaces_scrubbed_error(
+async def test_acp_refused_final_text_surfaces_turn_level_outcome(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     refusal_kind: str,
@@ -5760,23 +5859,25 @@ async def test_acp_refused_final_text_surfaces_scrubbed_error(
         monkeypatch.setattr(acp._bridge, "send", refuse_send)
         expected_reason = "unbound ACP channel"
 
-    with pytest.raises(acp_sdk.RequestError) as raised:
-        await acp.prompt(
-            session_id,
-            [acp_sdk.TextContentBlock(type="text", text="answer")],
-        )
+    response = await acp.prompt(
+        session_id,
+        [acp_sdk.TextContentBlock(type="text", text="answer")],
+    )
 
-    error = raised.value.to_error_obj()
-    assert error == {
-        "code": -32603,
-        "message": f"Final response delivery refused: {expected_reason}",
-        "data": None,
+    assert response.stop_reason == "refusal"
+    assert response.field_meta == {
+        "mimir.refusal": {
+            "reason": expected_reason,
+            "sinkCategory": (
+                "same_channel" if refusal_kind == "sink_gate" else "acp_delivery"
+            ),
+        }
     }
     assert all(
         update.session_update != "agent_message_chunk"
         for update in client.updates
     )
-    serialized = json.dumps(error)
+    serialized = response.model_dump_json(by_alias=True, exclude_none=True)
     assert "super-secret" not in serialized
     assert "/absolute/controller" not in serialized
     assert "api.provider.example" not in serialized
@@ -5829,6 +5930,55 @@ async def test_acp_hands_read_result_allows_final_response_delivery(
         "agent_message_chunk",
     ]
     assert client.updates[1].content.text == "NOTES ANSWER"
+
+
+async def test_acp_failed_tool_result_allows_final_response_delivery(
+    tmp_path: Path,
+) -> None:
+    probe = _AcpFailedReadProbeAgent()
+    acp, session_id, client = await _refusal_test_acp(
+        tmp_path, "unused", fake_agent=probe,
+    )
+
+    response = await acp.prompt(
+        session_id,
+        [acp_sdk.TextContentBlock(type="text", text="read outside root")],
+    )
+
+    assert response.stop_reason == "end_turn"
+    assert probe.result is not None and probe.result.status == "error"
+    assert [update.session_update for update in client.updates] == [
+        "user_message_chunk",
+        "agent_message_chunk",
+    ]
+    assert client.updates[1].content.text == "FAILURE EXPLAINED"
+
+
+async def test_acp_cross_channel_taint_is_still_refused(
+    tmp_path: Path,
+) -> None:
+    probe = _AcpCrossChannelProbeAgent()
+    acp, session_id, client = await _refusal_test_acp(
+        tmp_path, "unused", fake_agent=probe,
+    )
+
+    response = await acp.prompt(
+        session_id,
+        [acp_sdk.TextContentBlock(type="text", text="foreign content")],
+    )
+
+    assert response.stop_reason == "refusal"
+    assert probe.result is not None and probe.result.status == "error"
+    assert response.field_meta == {
+        "mimir.refusal": {
+            "reason": "ifc_label_blocked:same_channel",
+            "sinkCategory": "same_channel",
+        }
+    }
+    assert all(
+        update.session_update != "agent_message_chunk"
+        for update in client.updates
+    )
 
 
 async def test_acp_empty_final_text_remains_normal_silent_end_turn(
