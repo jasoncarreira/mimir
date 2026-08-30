@@ -543,8 +543,22 @@ async def test_prompt_auth_context_is_scoped_to_the_session_channel(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("permission_decision", "expected_denial"),
+    [
+        ("allow_once", None),
+        (
+            "reject_once",
+            "hands_shell permission was rejected by the operator before execution",
+        ),
+        ("timeout", "hands_shell permission request timed out; execution denied"),
+    ],
+)
 async def test_authenticated_acp_hands_shell_reaches_execution_after_permission(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    permission_decision: str,
+    expected_denial: str | None,
 ) -> None:
     """The authenticated ACP carrier survives every gate before hands execution.
 
@@ -570,7 +584,9 @@ async def test_authenticated_acp_hands_shell_reaches_execution_after_permission(
 
         async def request_tool_permission(self, session_id: str, snapshot: Any) -> Any:
             self.permission_snapshots.append(snapshot)
-            return sdk.PermissionCompletion("allow_once")
+            if permission_decision == "timeout":
+                await asyncio.Event().wait()
+            return sdk.PermissionCompletion(permission_decision)
 
         async def message_mcp(
             self, connection_id: str, method: str, params: Any = None,
@@ -587,6 +603,10 @@ async def test_authenticated_acp_hands_shell_reaches_execution_after_permission(
             return await super().message_mcp(connection_id, method, params)
 
     client = PermissionClient()
+    if permission_decision == "timeout":
+        monkeypatch.setattr(
+            "mimir.tools.budget_gate._PERMISSION_TIMEOUT_SECONDS", 0.01,
+        )
     agent.on_connect(client)
     await agent.authenticate("mimir-web-key", **{"mimir.webKey": "secret"})
     session_id = (await agent.new_session("/one", mcp_servers=_hands("server"))).session_id
@@ -623,17 +643,27 @@ async def test_authenticated_acp_hands_shell_reaches_execution_after_permission(
             tool=None, state=None, runtime=Runtime(context=auth),
         )
 
-        async def handler(call: ToolCallRequest) -> ToolMessage:
-            result = await hands_shell.ainvoke(call.tool_call["args"])
+        owner_loop = asyncio.get_running_loop()
+
+        def sync_handler(call: ToolCallRequest) -> ToolMessage:
+            result = asyncio.run_coroutine_threadsafe(
+                hands_shell.ainvoke(call.tool_call["args"]), owner_loop,
+            ).result(timeout=1)
             return ToolMessage(
                 content=json.dumps(result), tool_call_id="shell-1", name="hands_shell",
             )
 
-        result = await BudgetGateMiddleware().awrap_tool_call(request, handler)
-        assert result.status != "error", result.content
-        assert json.loads(str(result.content)) == {
-            "stdout": "ok", "stderr": "", "exitCode": 0,
-        }
+        result = await asyncio.to_thread(
+            BudgetGateMiddleware().wrap_tool_call, request, sync_handler,
+        )
+        if expected_denial is None:
+            assert result.status != "error", result.content
+            assert json.loads(str(result.content)) == {
+                "stdout": "ok", "stderr": "", "exitCode": 0,
+            }
+        else:
+            assert result.status == "error"
+            assert result.content == expected_denial
 
     core.run_turn = integrated_turn
     prompt = asyncio.create_task(
@@ -652,7 +682,9 @@ async def test_authenticated_acp_hands_shell_reaches_execution_after_permission(
     assert snapshot.tool_call_id == "shell-1"
     assert snapshot.title == "hands_shell"
     assert snapshot.raw_input == {"command": "printf ok"}
-    assert any(method == "tools/call" for _connection, method, _params in client.messages)
+    assert any(
+        method == "tools/call" for _connection, method, _params in client.messages
+    ) is (expected_denial is None)
 
 
 async def test_cancelled_bound_turn_terminalizes_open_tools(tmp_path: Path) -> None:
@@ -1385,7 +1417,10 @@ async def test_active_prompt_permission_uses_admitted_snapshot_and_is_once_scope
     owner = SimpleNamespace(_boundary_lock=asyncio.Lock())
     session = SimpleNamespace(provider=SimpleNamespace(peer=peer, agent=owner), generation=1, prompt_epoch=1, record=SimpleNamespace(session_id="session-1"), active_prompt=None)
     forwarder = asyncio.create_task(asyncio.sleep(3600))
-    active = ActivePrompt(session, 1, 1, None, None, forwarder, dispatcher, lease)
+    active = ActivePrompt(
+        session, 1, 1, None, None, forwarder, dispatcher, lease,
+        asyncio.get_running_loop(),
+    )
     session.active_prompt = active
 
     decision = await active.request_permission(PermissionEligibility("tool-1", "ignored", "ignored", {"path": "a", "token": "secret"}))
@@ -1605,7 +1640,10 @@ async def test_cancel_timeout_dirties_execution_and_requires_fresh_load(
     lease = JournalLease("00000000-0000-4000-8000-000000000002", state.generation, 1)
     publisher = SimpleNamespace(_journal=SimpleNamespace(lock=asyncio.Lock()))
     dispatcher = UpdateDispatcher(publisher, lease, 1)
-    active = ActivePrompt(state, state.generation, 1, handler, model, forwarder, dispatcher, lease)
+    active = ActivePrompt(
+        state, state.generation, 1, handler, model, forwarder, dispatcher, lease,
+        asyncio.get_running_loop(),
+    )
     state.active_prompt = active
     agent._active_prompts[session_id] = active
     monkeypatch.setattr(agent_module, "ACP_PROMPT_CANCEL_GRACE_SECONDS", 0.01)

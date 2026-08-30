@@ -36,6 +36,7 @@ that need uncapped exploration).
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import inspect
 import json
 import logging
@@ -2412,10 +2413,21 @@ def _discard_permission_awaitable(awaitable: Any) -> None:
 
 
 def _permission_denial_message(tool_name: str) -> str:
-    return f"{tool_name} permission was rejected before execution"
+    return f"{tool_name} permission was rejected by the operator before execution"
+
+
+def _permission_failure_message(tool_name: str, failure: str) -> str:
+    return f"{tool_name} permission request {failure}; execution denied"
 
 
 def _owner_loop_for_permission_broker(broker: Any) -> asyncio.AbstractEventLoop | None:
+    loop = getattr(broker, "permission_owner_loop", None)
+    if (
+        isinstance(loop, asyncio.AbstractEventLoop)
+        and loop.is_running()
+        and not loop.is_closed()
+    ):
+        return loop
     for attribute in ("prompt_handler", "model_task", "exact_event_forwarder"):
         task = getattr(broker, attribute, None)
         if isinstance(task, asyncio.Task) and not task.done():
@@ -2440,10 +2452,10 @@ def _request_permission_sync(
     broker, eligibility, snapshot = eligible
     loop = _owner_loop_for_permission_broker(broker)
     if loop is None:
-        return _permission_denial_message(tool_name)
+        return _permission_failure_message(tool_name, "has no live owner loop")
     try:
         if asyncio.get_running_loop() is loop:
-            return _permission_denial_message(tool_name)
+            return _permission_failure_message(tool_name, "would block its owner loop")
     except RuntimeError:
         pass
     coroutine: Any = None
@@ -2451,16 +2463,22 @@ def _request_permission_sync(
     try:
         coroutine = broker.request_permission(eligibility)
         if not inspect.iscoroutine(coroutine):
-            return _permission_denial_message(tool_name)
+            return _permission_failure_message(tool_name, "returned a non-coroutine")
         future = asyncio.run_coroutine_threadsafe(coroutine, loop)
         decision = future.result(timeout=_PERMISSION_TIMEOUT_SECONDS)
         if decision is PermissionDecision.ALLOW_ONCE:
             if _permission_context_is_current(snapshot):
                 return None
             return _permission_snapshot_refusal(tool_name)
-        return _permission_denial_message(tool_name)
+        if decision is PermissionDecision.REJECT_ONCE:
+            return _permission_denial_message(tool_name)
+        if decision is PermissionDecision.CANCELLED:
+            return _permission_failure_message(tool_name, "was cancelled")
+        return _permission_failure_message(tool_name, "returned an invalid decision")
+    except concurrent.futures.TimeoutError:
+        return _permission_failure_message(tool_name, "timed out")
     except (Exception, asyncio.CancelledError):
-        return _permission_denial_message(tool_name)
+        return _permission_failure_message(tool_name, "failed")
     finally:
         if future is None:
             _discard_permission_awaitable(coroutine)
@@ -2488,21 +2506,27 @@ async def _request_permission_async(
     try:
         awaitable = broker.request_permission(eligibility)
         if not inspect.iscoroutine(awaitable):
-            return _permission_denial_message(tool_name)
+            return _permission_failure_message(tool_name, "returned a non-coroutine")
         task = asyncio.create_task(awaitable)
         decision = await asyncio.wait_for(task, timeout=_PERMISSION_TIMEOUT_SECONDS)
         if decision is PermissionDecision.ALLOW_ONCE:
             if _permission_context_is_current(snapshot):
                 return None
             return _permission_snapshot_refusal(tool_name)
-        return _permission_denial_message(tool_name)
+        if decision is PermissionDecision.REJECT_ONCE:
+            return _permission_denial_message(tool_name)
+        if decision is PermissionDecision.CANCELLED:
+            return _permission_failure_message(tool_name, "was cancelled")
+        return _permission_failure_message(tool_name, "returned an invalid decision")
     except asyncio.CancelledError:
         current = asyncio.current_task()
         propagate_cancellation = current is not None and current.cancelling() > 0
         if not propagate_cancellation:
-            return _permission_denial_message(tool_name)
+            return _permission_failure_message(tool_name, "was cancelled")
+    except TimeoutError:
+        return _permission_failure_message(tool_name, "timed out")
     except Exception:
-        return _permission_denial_message(tool_name)
+        return _permission_failure_message(tool_name, "failed")
     finally:
         if task is None:
             _discard_permission_awaitable(awaitable)
@@ -2515,7 +2539,7 @@ async def _request_permission_async(
         awaitable = None
     if propagate_cancellation:
         raise asyncio.CancelledError
-    return _permission_denial_message(tool_name)
+    return _permission_failure_message(tool_name, "was cancelled")
 
 
 class BudgetGateMiddleware(AgentMiddleware):
