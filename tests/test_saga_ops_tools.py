@@ -131,6 +131,9 @@ class _StubStore:
         origin_domain=None,
         visibility=None,
         provenance=None,
+        integrity=None,
+        origin_trigger=None,
+        origin_ref=None,
     ):
         if self.raise_on == "store":
             raise RuntimeError("store boom")
@@ -144,6 +147,9 @@ class _StubStore:
                 "owner_principal": owner_principal,
                 "origin_channel": origin_channel,
                 "visibility": visibility,
+                "integrity": integrity,
+                "origin_trigger": origin_trigger,
+                "origin_ref": origin_ref,
             }
         )
         return {"stored": True, "atom_id": "test-atom-id"}

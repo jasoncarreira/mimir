@@ -31,7 +31,7 @@ from typing import Any, Optional
 from langchain.tools import ToolRuntime
 from langchain_core.tools import tool
 
-from ..models import AuthContext
+from ..models import AuthContext, InformationFlowLabels, Integrity
 from .memory import _MEMORY_STATE
 
 log = logging.getLogger(__name__)
@@ -435,6 +435,14 @@ async def saga_record_skill_learning(
     owner_principal = provenance["created_by"]
     origin_channel = auth_context.channel_id
     visibility = "service" if is_trusted_service(auth_context) else "private"
+    labels = auth_context.ifc_state.current(auth_context.ifc_labels)
+    integrity = (
+        Integrity.TRUSTED
+        if isinstance(labels, InformationFlowLabels)
+        and labels.sources
+        and all(source.integrity == Integrity.TRUSTED for source in labels.sources)
+        else Integrity.UNTRUSTED
+    )
 
     try:
         result = await client.store(
@@ -445,6 +453,9 @@ async def saga_record_skill_learning(
             session_id=_resolve_session_id(session_id),
             owner_principal=owner_principal,
             origin_channel=origin_channel,
+            integrity=integrity,
+            origin_trigger=auth_context.origin_trigger or auth_context.trigger,
+            origin_ref=auth_context.origin_ref,
             origin_domain=None,
             visibility=visibility,
             provenance=provenance,
