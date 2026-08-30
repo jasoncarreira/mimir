@@ -138,6 +138,63 @@ def test_install_copies_directory(fake_optional_root: Path, fake_home: Path):
     assert result.pollers_registered_hint is True
 
 
+def test_install_records_post_epoch_skill_as_trusted_informational(
+    fake_optional_root: Path,
+    fake_home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("MIMIR_HOME", str(fake_home))
+    assert access_control.initialize_file_integrity_ledger(fake_home) is True
+
+    result = install(
+        "fake-skill", fake_home, optional_skills_root=fake_optional_root,
+    )
+
+    assert access_control._filesystem_result_integrity(
+        None, str(result.dest / "SKILL.md"),
+    ) == ("trusted", "informational")
+
+
+@pytest.mark.parametrize("created_before_epoch", [False, True])
+def test_unrecorded_skill_file_remains_untrusted(
+    fake_home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    created_before_epoch: bool,
+) -> None:
+    monkeypatch.setenv("MIMIR_HOME", str(fake_home))
+    dropped = fake_home / "skills" / "poller-drop" / "SKILL.md"
+    dropped.parent.mkdir(parents=True)
+    if created_before_epoch:
+        dropped.write_text("hostile instructions", encoding="utf-8")
+    assert access_control.initialize_file_integrity_ledger(fake_home) is True
+    if not created_before_epoch:
+        dropped.write_text("hostile instructions", encoding="utf-8")
+
+    assert access_control._filesystem_result_integrity(None, str(dropped)) == (
+        "untrusted", "active_ingest",
+    )
+
+
+def test_install_fails_closed_when_integrity_ledger_is_corrupt(
+    fake_optional_root: Path,
+    fake_home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("MIMIR_HOME", str(fake_home))
+    metadata = fake_home / ".mimir" / "file-integrity.json"
+    metadata.parent.mkdir()
+    metadata.write_text("not json", encoding="utf-8")
+
+    with pytest.raises(OSError, match="failed to record trusted skill integrity"):
+        install("fake-skill", fake_home, optional_skills_root=fake_optional_root)
+
+    installed = fake_home / "skills" / "fake-skill" / "SKILL.md"
+    assert installed.is_file()
+    assert access_control._filesystem_result_integrity(None, str(installed)) == (
+        "untrusted", "active_ingest",
+    )
+
+
 def test_install_cleans_up_partial_copy_on_failure(
     fake_optional_root: Path, fake_home: Path, monkeypatch: pytest.MonkeyPatch,
 ):

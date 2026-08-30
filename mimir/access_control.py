@@ -8883,9 +8883,10 @@ _SELF_AUTHORED_FILE_ROOTS = frozenset({
     "docs",
     "memory",
     "prompts",
+    "skills",
     "state",
 })
-_FILE_INTEGRITY_RECORDED_ROOTS = _SELF_AUTHORED_FILE_ROOTS | {"skills"}
+_FILE_INTEGRITY_RECORDED_ROOTS = _SELF_AUTHORED_FILE_ROOTS
 _FILE_INTEGRITY_EXCLUDED_SUBTREES = frozenset({("state", "pollers")})
 _FILE_INTEGRITY_DECLASSIFICATIONS_KEY = "__declassifications__"
 _FILE_INTEGRITY_EPOCH_KEY = "__ledger_epoch_ns__"
@@ -9037,20 +9038,21 @@ def _filesystem_result_integrity(
         and relative.parts
         and relative.parts[0] in _SELF_AUTHORED_FILE_ROOTS
     ):
-        # These roots are scaffolded by ``mimir setup`` and contain first-party
-        # reference material. Operator- or agent-authored files under ``skills``
-        # do not receive this default merely because of their location; only
-        # shipped ``.mimir_builtin_skills`` are first-party reference material.
-        # Trust still comes from persisted provenance below: explicit writer
-        # records win, while the ledger epoch distinguishes pre-existing files
-        # from later writes that bypassed the protected tool boundary.
+        # These roots contain framework or operator-authored reference material.
+        # Admin-installed files under ``skills`` are trusted only when the install
+        # path explicitly records them; unlike scaffolded roots, their location
+        # never supplies a trusted default. For the other roots, explicit writer
+        # records win and the ledger epoch distinguishes pre-existing files from
+        # later writes that bypassed the protected tool boundary.
         #
         # Poller subprocesses write this tree directly, outside the protected
         # tool boundary, and may persist attacker-derived cursor/event fields.
         # A path under state/pollers is therefore not proof of self-authorship.
         if relative.parts[0:2] in _FILE_INTEGRITY_EXCLUDED_SUBTREES:
             return "untrusted", "active_ingest"
-        persisted = _persisted_file_integrity(home, relative)
+        persisted = _persisted_file_integrity(
+            home, relative, require_recorded=relative.parts[0] == "skills",
+        )
         return persisted, (
             "informational" if persisted == "trusted" else "active_ingest"
         )
@@ -9246,6 +9248,72 @@ def initialize_file_integrity_ledger(home: Path) -> bool:
             return True
         except (OSError, json.JSONDecodeError):
             log.exception("failed to initialize file integrity ledger at %s", metadata_path)
+            return False
+
+
+def record_admin_installed_skill_integrity(home: Path, skill_root: Path) -> bool:
+    """Atomically trust every file in one completed admin-installed skill."""
+    try:
+        home = home.resolve(strict=True)
+        skill_root = skill_root.resolve(strict=True)
+        skill_relative = skill_root.relative_to(home)
+    except (OSError, RuntimeError, ValueError):
+        return False
+    if (
+        len(skill_relative.parts) != 2
+        or skill_relative.parts[0] != "skills"
+        or not skill_root.is_dir()
+    ):
+        return False
+
+    keys: set[str] = set()
+    try:
+        for candidate in skill_root.rglob("*"):
+            if not candidate.is_file():
+                continue
+            resolved = candidate.resolve(strict=True)
+            resolved.relative_to(skill_root)
+            keys.add(resolved.relative_to(home).as_posix())
+    except (OSError, RuntimeError, ValueError):
+        return False
+
+    metadata_path = home / ".mimir" / "file-integrity.json"
+    prefix = f"{skill_relative.as_posix()}/"
+    with _persisted_file_integrity_lock:
+        try:
+            payload = (
+                json.loads(metadata_path.read_text(encoding="utf-8"))
+                if metadata_path.exists()
+                else {}
+            )
+            if not isinstance(payload, dict):
+                return False
+            if _FILE_INTEGRITY_EPOCH_KEY not in payload:
+                payload[_FILE_INTEGRITY_EPOCH_KEY] = time.time_ns()
+            else:
+                epoch_ns = payload[_FILE_INTEGRITY_EPOCH_KEY]
+                if (
+                    not isinstance(epoch_ns, int)
+                    or isinstance(epoch_ns, bool)
+                    or epoch_ns <= 0
+                ):
+                    return False
+            for key in tuple(payload):
+                if isinstance(key, str) and key.startswith(prefix):
+                    del payload[key]
+            payload.update(dict.fromkeys(sorted(keys), "trusted"))
+            metadata_path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = metadata_path.with_suffix(".tmp")
+            tmp.write_text(
+                json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n",
+                encoding="utf-8",
+            )
+            tmp.replace(metadata_path)
+            return True
+        except (OSError, json.JSONDecodeError):
+            log.exception(
+                "failed to persist admin-installed skill integrity for %s", skill_root,
+            )
             return False
 
 
