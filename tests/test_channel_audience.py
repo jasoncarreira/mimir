@@ -150,6 +150,9 @@ def test_group_slack_and_guild_channels_are_unknown_without_visibility_reads(
         def reload(self):
             return None
 
+        def reload_if_changed(self):
+            return True
+
         def identity(self, principal):
             return VisibilityTrapIdentity() if principal == "alice" else None
 
@@ -238,6 +241,9 @@ def test_eligibility_paths_never_call_identity_resolver_resolve(
 
         def reload(self):
             return None
+
+        def reload_if_changed(self):
+            return True
 
         def identity(self, author):
             self.identity_calls.append(author)
