@@ -180,21 +180,18 @@ async def test_error_records_and_reraises(ctx_for_test):
 
 
 @pytest.mark.asyncio
-async def test_records_t_ms_relative_to_ctx_started_at():
+async def test_records_t_ms_relative_to_ctx_started_at(monkeypatch: pytest.MonkeyPatch):
     """``t_ms`` captures the wall-clock offset (ms) from
     ``ctx.started_at`` to the moment the saga call STARTED, so the
     turn viewer can interleave saga calls with model events on one
-    chronological timeline. Uses a real monotonic clock — the assertion
-    bounds the value rather than pinning an exact number."""
-    import time
+    chronological timeline."""
+    monkeypatch.setattr("time.monotonic", lambda: 100.25)
     ctx = TurnContext(
         turn_id=make_turn_id(),
         session_id="ch-test",
         trigger="user_message",
         channel_id="ch-test",
-        # Pin started_at to "100ms ago" so the captured t_ms must be
-        # >= ~100 (the call fires now, started_at was 100ms in the past).
-        started_at=time.monotonic() - 0.100,
+        started_at=100.0,
     )
     tok = set_current_turn(ctx)
     try:
@@ -202,10 +199,7 @@ async def test_records_t_ms_relative_to_ctx_started_at():
         wrapped = RecordingSagaClient(inner)
         await wrapped.query("hello")
         rec = ctx.saga_calls[0]
-        assert rec.t_ms is not None
-        # Lower bound: at least 100ms since ctx.started_at. Upper bound:
-        # generous — test infra latency shouldn't push past 5s.
-        assert 100.0 <= rec.t_ms < 5000.0, f"t_ms={rec.t_ms}"
+        assert rec.t_ms == 250.0
     finally:
         reset_current_turn(tok)
 

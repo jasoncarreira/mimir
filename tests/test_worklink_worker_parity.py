@@ -410,8 +410,10 @@ async def test_direct_process_reap_is_bounded(monkeypatch: pytest.MonkeyPatch) -
     monkeypatch.setattr(worker_exec, "_terminate_process_group_pid", lambda _pgid: None)
     monkeypatch.setattr(compute, "_DIRECT_PROCESS_WAIT_TIMEOUT_S", 0.01)
 
+    # The RuntimeError witnesses the internal timeout. This generous outer
+    # bound is only a hang guard, not a latency assertion.
     with pytest.raises(RuntimeError, match="leader was not reaped after SIGKILL"):
-        await asyncio.wait_for(compute._kill_process_group(Process()), timeout=0.2)
+        await asyncio.wait_for(compute._kill_process_group(Process()), timeout=10)
 
 
 def direct_spec(source: str) -> WorkSpec:

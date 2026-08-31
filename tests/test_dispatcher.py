@@ -1519,13 +1519,13 @@ async def test_drain_timeout_cancels_slow_inflight_turn(tmp_path: Path):
     await disp.enqueue(AgentEvent(trigger="x", channel_id="c1", content="slow"))
     await asyncio.wait_for(started.wait(), timeout=2)  # ensure it's in-flight
 
-    loop = asyncio.get_running_loop()
-    t0 = loop.time()
-    await disp.drain(timeout=0.2)
-    elapsed = loop.time() - t0
+    # This outer bound is a hang guard, not a latency assertion. Cancellation
+    # state below witnesses that the dispatcher's 0.2s timeout fired.
+    await asyncio.wait_for(disp.drain(timeout=0.2), timeout=30)
 
-    assert elapsed < 5, elapsed          # bounded by the 0.2s timeout, not 10s
-    assert finished == []                # the slow turn was cancelled
+    assert finished == []
+    assert not disp._in_flight
+    assert all(worker.done() for worker in disp._workers.values())
 
 
 @pytest.mark.asyncio

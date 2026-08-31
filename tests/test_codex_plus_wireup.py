@@ -381,21 +381,24 @@ async def test_callback_on_running_loop_returns_before_sync_io(
     scheduler dispatch.
     """
     calls: list[tuple[object, object]] = []
-    continue_sync = threading.Event()
+    callback_returned = threading.Event()
     sync_started = threading.Event()
+    sync_finished = threading.Event()
+    callback_returned_before_sync_finished: list[bool] = []
 
     def _blocking_reconcile_sync(updates: object, *, owned_keys: object) -> None:
         calls.append((updates, owned_keys))
         sync_started.set()
-        deadline = time.monotonic() + 1.0
-        while not continue_sync.is_set() and time.monotonic() < deadline:
-            time.sleep(0.01)
+        # This is a hang guard, not a latency assertion. The recorded boolean
+        # below witnesses whether the callback returned while sync I/O blocked.
+        returned = callback_returned.wait(timeout=10.0)
+        callback_returned_before_sync_finished.append(returned)
+        sync_finished.set()
 
     store = RateLimitStore(path=tmp_path / "rl.json")
     monkeypatch.setattr(store, "reconcile_sync", _blocking_reconcile_sync)
     callback = make_codex_plus_rate_limit_callback(store)
 
-    start = time.monotonic()
     callback(_FakeRateLimits(
         primary=_FakeQuotaWindow(
             used_percent=25.0,
@@ -403,14 +406,12 @@ async def test_callback_on_running_loop_returns_before_sync_io(
             reset_at=int(time.time() + 3600),
         ),
     ))
-    elapsed = time.monotonic() - start
+    callback_returned.set()
 
-    assert elapsed < 0.1
-    await asyncio.wait_for(asyncio.to_thread(sync_started.wait, 1.0), timeout=1.0)
-    continue_sync.set()
-    deadline = time.monotonic() + 1.0
-    while not calls and time.monotonic() < deadline:
-        await asyncio.sleep(0.01)
+    # These outer bounds only prevent a broken background task wedging the suite.
+    await asyncio.wait_for(asyncio.to_thread(sync_started.wait), timeout=10.0)
+    await asyncio.wait_for(asyncio.to_thread(sync_finished.wait), timeout=10.0)
+    assert callback_returned_before_sync_finished == [True]
     assert calls and "openai_five_hour" in calls[0][0]
 
 
