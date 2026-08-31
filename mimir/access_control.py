@@ -9877,11 +9877,17 @@ def _acp_failed_tool_error_result(
     from langchain_core.messages import ToolMessage
 
     from .models import InformationFlowLabels, SourceLabel
+    from .tools.client_provider import ClientProviderResultError
 
     if (
         provenance is not None
-        or not isinstance(result, ToolMessage)
-        or getattr(result, "status", None) != "error"
+        or not (
+            isinstance(result, ClientProviderResultError)
+            or (
+                isinstance(result, ToolMessage)
+                and getattr(result, "status", None) == "error"
+            )
+        )
         or getattr(auth_context, "origin_trigger", None) != "acp_session"
     ):
         return None

@@ -606,6 +606,99 @@ class _AcpFailedReadProbeAgent(_FakeAgent):
             yield chunk
 
 
+class _AcpFailedProviderProbeAgent(_FakeAgent):
+    """Fail hands_read with the typed ACP provider-result contract error."""
+
+    def __init__(self, *, foreign_provenance: bool = False) -> None:
+        super().__init__([AIMessage(content="PROVIDER FAILURE EXPLAINED")])
+        self.foreign_provenance = foreign_provenance
+        self.result: ToolMessage | None = None
+        self.provider_calls: list[tuple[str, dict[str, Any]]] = []
+
+    async def astream(
+        self,
+        state: dict[str, Any],
+        *,
+        config: dict[str, Any],
+        context=None,
+        stream_mode: str = "values",
+    ):
+        from mimir._context import get_current_turn
+        from mimir.access_control import publish_protected_result
+        from mimir.tools.client_provider import (
+            ClientProviderResultError,
+            MIMIR_HANDS_V1,
+            get_turn_capability_context,
+            hands_read,
+            reset_turn_capability_context,
+            set_turn_capability_context,
+        )
+
+        probe = self
+
+        class Provider:
+            async def call_tool(
+                self, name: str, arguments: dict[str, Any]
+            ) -> dict[str, str]:
+                probe.provider_calls.append((name, arguments))
+                if probe.foreign_provenance:
+                    publish_protected_result(InformationFlowLabels().with_source(
+                        SourceLabel(
+                            principal="another-user",
+                            domain="channel:private",
+                            resource_id="acp:another-session",
+                            bridge_instance="acp-stdio",
+                            sensitivity="private",
+                            authorized_principals=frozenset({"another-user"}),
+                            source_kind="channel",
+                            integrity="untrusted",
+                            integrity_effect="active_ingest",
+                        )
+                    ).sources)
+                raise ClientProviderResultError(
+                    "Client provider tool 'read' result is missing structuredContent"
+                )
+
+        turn = get_current_turn()
+        capability = get_turn_capability_context()
+        assert turn is not None
+        assert capability is not None
+        token = set_turn_capability_context(replace(
+            capability,
+            provider=Provider(),
+            profile_policy=MIMIR_HANDS_V1,
+        ))
+        try:
+            async def _handler(req: ToolCallRequest) -> ToolMessage:
+                payload = await hands_read.ainvoke(req.tool_call["args"])
+                return ToolMessage(
+                    content=payload["content"],
+                    tool_call_id=req.tool_call["id"],
+                )
+
+            self.result = await BudgetGateMiddleware().awrap_tool_call(
+                ToolCallRequest(
+                    tool_call={
+                        "name": "hands_read",
+                        "args": {"path": "./notes.txt"},
+                        "id": "tc-acp-failed-provider-read",
+                        "type": "tool_call",
+                    },
+                    tool=None,
+                    state=None,
+                    runtime=Runtime(context=turn.auth_context),
+                ),
+                _handler,
+            )
+        finally:
+            reset_turn_capability_context(token)
+
+        async for chunk in super().astream(
+            state, config=config, context=context, stream_mode=stream_mode,
+        ):
+            yield chunk
+
+
 class _AcpCrossChannelProbeAgent(_FakeAgent):
     """Return a failed tool result that captured foreign-channel provenance."""
 
@@ -5952,6 +6045,56 @@ async def test_acp_failed_tool_result_allows_final_response_delivery(
         "agent_message_chunk",
     ]
     assert client.updates[1].content.text == "FAILURE EXPLAINED"
+
+
+async def test_acp_failed_provider_result_allows_final_response_delivery(
+    tmp_path: Path,
+) -> None:
+    probe = _AcpFailedProviderProbeAgent()
+    acp, session_id, client = await _refusal_test_acp(
+        tmp_path, "unused", fake_agent=probe,
+    )
+
+    response = await acp.prompt(
+        session_id,
+        [acp_sdk.TextContentBlock(type="text", text="read malformed provider result")],
+    )
+
+    assert response.stop_reason == "end_turn"
+    assert probe.result is not None and probe.result.status == "error"
+    assert probe.provider_calls == [("read", {"path": "./notes.txt"})]
+    assert [update.session_update for update in client.updates] == [
+        "user_message_chunk",
+        "agent_message_chunk",
+    ]
+    assert client.updates[1].content.text == "PROVIDER FAILURE EXPLAINED"
+
+
+async def test_acp_failed_provider_result_with_cross_channel_taint_is_refused(
+    tmp_path: Path,
+) -> None:
+    probe = _AcpFailedProviderProbeAgent(foreign_provenance=True)
+    acp, session_id, client = await _refusal_test_acp(
+        tmp_path, "unused", fake_agent=probe,
+    )
+
+    response = await acp.prompt(
+        session_id,
+        [acp_sdk.TextContentBlock(type="text", text="foreign provider content")],
+    )
+
+    assert response.stop_reason == "refusal"
+    assert probe.result is not None and probe.result.status == "error"
+    assert response.field_meta == {
+        "mimir.refusal": {
+            "reason": "ifc_label_blocked:same_channel",
+            "sinkCategory": "same_channel",
+        }
+    }
+    assert all(
+        update.session_update != "agent_message_chunk"
+        for update in client.updates
+    )
 
 
 async def test_acp_cross_channel_taint_is_still_refused(
