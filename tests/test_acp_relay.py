@@ -82,6 +82,50 @@ async def test_relay_round_trip_and_cleanup(monkeypatch: pytest.MonkeyPatch, tmp
 
 
 @pytest.mark.asyncio
+async def test_dead_relay_client_promptly_closes_daemon_connection(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    client_reader = asyncio.StreamReader()
+    daemon_reader = asyncio.StreamReader()
+    daemon_closed = asyncio.Event()
+    stdout_read_fd, stdout_write_fd = os.pipe()
+    stdout = os.fdopen(stdout_write_fd, "wb", buffering=0)
+    client_writer = await _output_writer(stdout)
+
+    class DaemonWriter(_Output):
+        def write_eof(self) -> None:
+            pass
+
+        def close(self) -> None:
+            super().close()
+            daemon_closed.set()
+
+    daemon_writer = DaemonWriter(io.BytesIO())
+    stdin_transport = type("Transport", (), {"close": lambda self: None})()
+
+    async def open_daemon(path: str) -> tuple[asyncio.StreamReader, DaemonWriter]:
+        return daemon_reader, daemon_writer
+
+    async def stdio(target: object) -> tuple[object, object, object]:
+        return client_reader, client_writer, stdin_transport
+
+    monkeypatch.setattr("mimir.acp.relay._socket", lambda home: tmp_path / "socket")
+    monkeypatch.setattr("mimir.acp.relay.asyncio.open_unix_connection", open_daemon)
+    monkeypatch.setattr("mimir.acp.relay._stdio", stdio)
+
+    relay = asyncio.create_task(run_relay(tmp_path, io.BytesIO()))
+    await asyncio.sleep(0.02)
+    assert not daemon_closed.is_set(), "a quiet live relay client was evicted"
+
+    os.close(stdout_read_fd)
+    await asyncio.sleep(0.02)
+    assert client_writer.is_closing()
+    client_reader.feed_eof()
+    await asyncio.wait_for(daemon_closed.wait(), 0.1)
+    await asyncio.wait_for(relay, 0.1)
+
+
+@pytest.mark.asyncio
 async def test_relay_connect_is_bounded(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     monkeypatch.setattr("mimir.acp.relay._socket", lambda home: tmp_path / "socket")
     async def blocked(path: str) -> None:

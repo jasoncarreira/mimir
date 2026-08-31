@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Callable
 from typing import Any
 
 WRITER_DRAIN_TIMEOUT = 2.0
@@ -56,18 +57,26 @@ async def pump_bidirectional(
     left_writer: Any,
     right_reader: Any,
     right_writer: Any,
+    *,
+    close_on_left_exit: bool | Callable[[], bool] = False,
 ) -> None:
-    tasks = {
-        asyncio.create_task(pump_stream(left_reader, right_writer)),
-        asyncio.create_task(pump_stream(right_reader, left_writer)),
-    }
+    left_task = asyncio.create_task(pump_stream(left_reader, right_writer))
+    tasks = {left_task, asyncio.create_task(pump_stream(right_reader, left_writer))}
     try:
         done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
         await asyncio.gather(*done)
         if pending:
-            _, pending = await asyncio.wait(
-                pending, timeout=PEER_EOF_GRACE_TIMEOUT
+            close_now = (
+                close_on_left_exit()
+                if callable(close_on_left_exit)
+                else close_on_left_exit
             )
+            if close_now and left_task in done:
+                pass
+            else:
+                _, pending = await asyncio.wait(
+                    pending, timeout=PEER_EOF_GRACE_TIMEOUT
+                )
             for task in pending:
                 task.cancel()
             await asyncio.gather(*pending, return_exceptions=True)
