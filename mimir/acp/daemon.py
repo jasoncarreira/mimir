@@ -128,11 +128,13 @@ class _ConnectionAgent:
     def __init__(self, agent: MimirAcpAgent) -> None:
         self._agent = agent
         self.authenticated = asyncio.Event()
+        self.peer: Any | None = None
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self._agent, name)
 
     def on_connect(self, peer: Any) -> int:
+        self.peer = peer
         return self._agent.on_connect(peer)
 
     async def authenticate(self, *args: Any, **kwargs: Any) -> Any:
@@ -365,7 +367,9 @@ class AcpDaemon:
             if runner in done:
                 await runner
             else:
-                watchdog = asyncio.create_task(self._watch_peer(writer))
+                watchdog = asyncio.create_task(
+                    self._watch_peer(writer, connection_agent.peer)
+                )
                 done, _ = await asyncio.wait(
                     {runner, watchdog}, return_when=asyncio.FIRST_COMPLETED
                 )
@@ -387,13 +391,38 @@ class AcpDaemon:
             except (TimeoutError, OSError):
                 writer.transport.abort()
 
-    async def _watch_peer(self, writer: asyncio.StreamWriter) -> None:
+    async def _watch_peer(
+        self, writer: asyncio.StreamWriter, peer: Any | None = None
+    ) -> None:
         while True:
             await asyncio.sleep(ACP_PEER_WATCHDOG_INTERVAL)
+            if peer is None:
+                try:
+                    await asyncio.wait_for(writer.drain(), ACP_PEER_DRAIN_TIMEOUT)
+                except TimeoutError as exc:
+                    raise AcpDaemonError(
+                        "authenticated ACP peer stopped draining"
+                    ) from exc
+                continue
+            drain = asyncio.create_task(writer.drain())
+            transport_dead = asyncio.create_task(peer.wait_transport_dead())
             try:
-                await asyncio.wait_for(writer.drain(), ACP_PEER_DRAIN_TIMEOUT)
-            except TimeoutError as exc:
-                raise AcpDaemonError("authenticated ACP peer stopped draining") from exc
+                done, _ = await asyncio.wait(
+                    {drain, transport_dead},
+                    timeout=ACP_PEER_DRAIN_TIMEOUT,
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                if peer.closed:
+                    return
+                if drain in done:
+                    await drain
+                    continue
+                raise AcpDaemonError("authenticated ACP peer stopped draining")
+            finally:
+                for task in (drain, transport_dead):
+                    if not task.done():
+                        task.cancel()
+                await asyncio.gather(drain, transport_dead, return_exceptions=True)
 
     def _record_abandoned_close(self, task: asyncio.Task[None]) -> None:
         """Note a generation whose close outlived its runner.
