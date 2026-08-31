@@ -16,6 +16,7 @@ import mimir
 
 from mimir.access_control import create_auth_context
 from mimir.channel_audience import ServerChannelAudienceProvider
+from mimir.event_logger import safe_log_event
 from mimir.models import AgentEvent
 from mimir.tools.client_provider import (
     ClientProviderResultError,
@@ -171,16 +172,20 @@ class ActivePrompt:
     ) -> ToolPermissionDecision:
         agent = self.session.provider.agent if self.session.provider is not None else None
         if agent is None:
-            return ToolPermissionDecision.REJECT_ONCE
+            return await self._deny_before_peer(
+                "provider_agent_missing", eligibility.tool_call_id
+            )
         async with agent._boundary_lock:
             if not self._is_current():
-                return ToolPermissionDecision.REJECT_ONCE
+                return await self._deny_before_peer(
+                    "prompt_not_current", eligibility.tool_call_id
+                )
             task = asyncio.create_task(self._request_permission(eligibility))
             self.permission_tasks.add(task)
         try:
             return await task
         except asyncio.CancelledError:
-            return ToolPermissionDecision.REJECT_ONCE
+            return ToolPermissionDecision.CANCELLED
         finally:
             self.permission_tasks.discard(task)
 
@@ -193,31 +198,53 @@ class ActivePrompt:
             and self.session.prompt_epoch == self.epoch
         )
 
+    async def _deny_before_peer(
+        self, reason: str, tool_call_id: str
+    ) -> ToolPermissionDecision:
+        await safe_log_event(
+            f"acp_permission_guard_{reason}",
+            session_id=self.session.record.session_id,
+            tool_call_id=tool_call_id,
+        )
+        return ToolPermissionDecision.NOT_REQUESTED
+
     async def _request_permission(
         self, eligibility: PermissionEligibility
     ) -> ToolPermissionDecision:
         await self.dispatcher.drain()
         snapshot = self.dispatcher.permission_snapshot(eligibility.tool_call_id)
         expected = _strict_arguments(eligibility.arguments)
-        if snapshot is None or _thaw(snapshot.raw_input) != expected:
-            return ToolPermissionDecision.REJECT_ONCE
+        if snapshot is None:
+            return await self._deny_before_peer(
+                "snapshot_missing", eligibility.tool_call_id
+            )
+        if _thaw(snapshot.raw_input) != expected:
+            return await self._deny_before_peer(
+                "snapshot_mismatch", eligibility.tool_call_id
+            )
         provider = self.session.provider
         peer = provider.peer if provider is not None else None
         if peer is None:
-            return ToolPermissionDecision.REJECT_ONCE
+            return await self._deny_before_peer("peer_missing", eligibility.tool_call_id)
         handle: AcpRequestHandle | None = None
         agent = provider.agent
         try:
             async with agent._boundary_lock:
-                if not self._is_current() or self.session.provider is not provider:
-                    return ToolPermissionDecision.REJECT_ONCE
+                if not self._is_current():
+                    return await self._deny_before_peer(
+                        "boundary_not_current", eligibility.tool_call_id
+                    )
+                if self.session.provider is not provider:
+                    return await self._deny_before_peer(
+                        "provider_changed", eligibility.tool_call_id
+                    )
                 if isinstance(peer, AcpPeer) and peer.supports_owned_requests:
                     handle = await peer.start_tool_permission(
                         self.session.record.session_id, snapshot
                     )
                     if not self._is_current():
                         handle.abandon()
-                        return ToolPermissionDecision.REJECT_ONCE
+                        return ToolPermissionDecision.CANCELLED
                     self.permission_handles.append(handle)
                     completion_task = handle.task
                 else:
@@ -228,17 +255,19 @@ class ActivePrompt:
         except asyncio.CancelledError:
             if handle is not None:
                 handle.abandon()
-            return ToolPermissionDecision.REJECT_ONCE
+            return ToolPermissionDecision.CANCELLED
         finally:
             if handle is not None and handle in self.permission_handles:
                 self.permission_handles.remove(handle)
         if not self._is_current() or completion.error is not None:
-            return ToolPermissionDecision.REJECT_ONCE
+            return ToolPermissionDecision.CANCELLED
         if completion.decision == "allow_once":
             return ToolPermissionDecision.ALLOW_ONCE
+        if completion.decision == "reject_once":
+            return ToolPermissionDecision.REJECT_ONCE
         if completion.decision == "cancelled":
             return ToolPermissionDecision.CANCELLED
-        return ToolPermissionDecision.REJECT_ONCE
+        return ToolPermissionDecision.CANCELLED
 
 
 

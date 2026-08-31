@@ -1392,7 +1392,9 @@ async def test_transport_teardown_is_generation_scoped_and_requires_load(tmp_pat
     assert session_id not in agent._environments
 
 
-async def test_active_prompt_permission_uses_admitted_snapshot_and_is_once_scoped() -> None:
+async def test_active_prompt_permission_uses_admitted_snapshot_and_is_once_scoped(
+    tmp_path: Path, middleware_event_logger: None,
+) -> None:
     class Publisher:
         def __init__(self) -> None:
             self.updates: list[Any] = []
@@ -1423,12 +1425,25 @@ async def test_active_prompt_permission_uses_admitted_snapshot_and_is_once_scope
     )
     session.active_prompt = active
 
+    missing = await active.request_permission(PermissionEligibility("missing", "ignored", "ignored", {"path": "a"}))
+    mismatch = await active.request_permission(PermissionEligibility("tool-1", "ignored", "ignored", {"path": "changed", "token": "secret"}))
     decision = await active.request_permission(PermissionEligibility("tool-1", "ignored", "ignored", {"path": "a", "token": "secret"}))
     lease.close()
     stale = await active.request_permission(PermissionEligibility("tool-1", "ignored", "ignored", {"path": "a", "token": "secret"}))
 
+    assert missing is PermissionDecision.NOT_REQUESTED
+    assert mismatch is PermissionDecision.NOT_REQUESTED
     assert decision is PermissionDecision.ALLOW_ONCE
-    assert stale is PermissionDecision.REJECT_ONCE
+    assert stale is PermissionDecision.NOT_REQUESTED
+    events = [
+        json.loads(line)["type"]
+        for line in (tmp_path / "middleware-events.jsonl").read_text().splitlines()
+    ]
+    assert events == [
+        "acp_permission_guard_snapshot_missing",
+        "acp_permission_guard_snapshot_mismatch",
+        "acp_permission_guard_prompt_not_current",
+    ]
     assert peer.snapshots[0][1].title == "hands_edit"
     assert peer.snapshots[0][1].raw_input == {"path": "a", "token": "[redacted]"}
     forwarder.cancel()
@@ -2026,7 +2041,7 @@ async def test_cancel_boundary_prevents_permission_and_mcp_registration(tmp_path
     agent._boundary_lock.release()
 
     await cancelling
-    assert await permission is PermissionDecision.REJECT_ONCE
+    assert await permission is PermissionDecision.NOT_REQUESTED
     with pytest.raises(RuntimeError, match="closed"):
         await mcp
     assert (await prompt).stop_reason == "cancelled"
@@ -2040,11 +2055,12 @@ async def test_integrated_hands_edit_permission_wire_and_provider_result(
 ) -> None:
     """Exercise once-only permission and terminal updates over the public wire."""
     from langchain.agents.middleware import ToolCallRequest
-    from langchain_core.messages import ToolMessage
+    from langchain_core.messages import AIMessage, ToolMessage
     from langgraph.runtime import Runtime
 
     from mimir.tools.budget_gate import BudgetGateMiddleware
     from mimir.tools.client_provider import hands_edit
+    from mimir.turn_event_bus import TurnEventEmitter
 
     class WireTransport:
         def __init__(self) -> None:
@@ -2198,15 +2214,15 @@ async def test_integrated_hands_edit_permission_wire_and_provider_result(
             turn_id = kwargs["turn_id"]
             active = agent._active_prompts[session_id]
             queue = bundle.turn_event_bus._exact_turn_subscribers[turn_id]
-            seq = 0
+            emitter = TurnEventEmitter(
+                bundle.turn_event_bus, turn_id=turn_id, channel_id=event.channel_id
+            )
             for tool_id, path, old_text, new_text in next(turns):
                 arguments = {"path": path, "old_text": old_text, "new_text": new_text}
-                seq += 1
-                bundle.turn_event_bus.publish({
-                    "turn_id": turn_id, "channel_id": event.channel_id, "seq": seq,
-                    "ts": "now", "type": "tool_call", "phase": "start",
-                    "id": tool_id, "tool_name": "hands_edit", "args": arguments,
-                })
+                messages: list[Any] = [AIMessage(content="", tool_calls=[{
+                    "id": tool_id, "name": "hands_edit", "args": arguments,
+                }])]
+                emitter.blocks_from_messages(messages)
                 await queue.join()
                 await active.dispatcher.drain()
                 request = ToolCallRequest(
@@ -2225,23 +2241,10 @@ async def test_integrated_hands_edit_permission_wire_and_provider_result(
                     )
 
                 result = await BudgetGateMiddleware().awrap_tool_call(request, handler)
-                seq += 1
                 # Publish the actual middleware/handler ToolMessage through the
                 # same exact-turn event path used by the real core.
-                bundle.turn_event_bus.publish({
-                    "turn_id": turn_id, "channel_id": event.channel_id, "seq": seq,
-                    "ts": "now", "type": "tool_call", "phase": "end",
-                    "id": tool_id, "tool_name": "hands_edit", "args": arguments,
-                })
-                seq += 1
-                bundle.turn_event_bus.publish({
-                    "turn_id": turn_id, "channel_id": event.channel_id, "seq": seq,
-                    "ts": "now", "type": "tool_result", "phase": "end",
-                    "id": result.tool_call_id, "tool_name": result.name or "hands_edit",
-                    "content": json.loads(str(result.content)) if result.status == "success"
-                    else {"error": str(result.content)},
-                    "status": result.status, "is_error": result.status == "error",
-                })
+                messages.append(result)
+                emitter.blocks_from_messages(messages)
                 await queue.join()
                 await active.dispatcher.drain()
                 if result.status == "error" and "structuredContent" in str(result.content):
@@ -2300,6 +2303,14 @@ async def test_integrated_hands_edit_permission_wire_and_provider_result(
             "title": "hands_edit", "kind": "other", "status": "pending",
             "rawInput": {"path": "notes-1.txt", "old_text": "old-1", "new_text": "new-1"},
         }
+        progress_1 = await next_outgoing()
+        progress_1_update = progress_1["params"]["update"]
+        assert progress_1_update["_meta"] == {"mimir.sequence": 2}
+        assert {key: value for key, value in progress_1_update.items() if key != "_meta"} == {
+            "sessionUpdate": "tool_call_update", "toolCallId": "edit-1",
+            "status": "in_progress",
+            "rawInput": {"path": "notes-1.txt", "old_text": "old-1", "new_text": "new-1"},
+        }
         assert await next_outgoing() == permission_request(
             3, "edit-1", "notes-1.txt", "old-1", "new-1"
         )
@@ -2339,7 +2350,6 @@ async def test_integrated_hands_edit_permission_wire_and_provider_result(
                 "structuredContent": {"changed": True},
             },
         })
-        progress_1 = await next_outgoing()
         await transport.incoming.put({
             "jsonrpc": "2.0", "method": "mcp/message", "params": {
                 "connectionId": "opaque-1", "method": "notifications/progress",
@@ -2351,19 +2361,12 @@ async def test_integrated_hands_edit_permission_wire_and_provider_result(
                 break
             await asyncio.sleep(0.01)
         assert agent._audit_events[-1]["status"] == "ignored"
-        progress_1_update = progress_1["params"]["update"]
-        assert progress_1_update["_meta"] == {"mimir.sequence": 2}
-        assert {key: value for key, value in progress_1_update.items() if key != "_meta"} == {
-            "sessionUpdate": "tool_call_update", "toolCallId": "edit-1",
-            "status": "in_progress",
-            "rawInput": {"path": "notes-1.txt", "old_text": "old-1", "new_text": "new-1"},
-        }
         terminal_1 = await next_outgoing()
         terminal_1_update = terminal_1["params"]["update"]
         assert terminal_1_update["_meta"] == {"mimir.sequence": 3}
         assert {key: value for key, value in terminal_1_update.items() if key != "_meta"} == {
             "sessionUpdate": "tool_call_update", "toolCallId": "edit-1",
-            "status": "completed", "rawOutput": {"changed": True},
+            "status": "completed", "rawOutput": '{"changed": true}',
         }
         assert (await asyncio.wait_for(prompting, 3)).stop_reason == "end_turn"
 
@@ -2378,6 +2381,14 @@ async def test_integrated_hands_edit_permission_wire_and_provider_result(
         assert {key: value for key, value in start_2_update.items() if key != "_meta"} == {
             "sessionUpdate": "tool_call", "toolCallId": "edit-2",
             "title": "hands_edit", "kind": "other", "status": "pending",
+            "rawInput": {"path": "notes-2.txt", "old_text": "old-2", "new_text": "new-2"},
+        }
+        progress_2 = await next_outgoing()
+        progress_2_update = progress_2["params"]["update"]
+        assert progress_2_update["_meta"] == {"mimir.sequence": 6}
+        assert {key: value for key, value in progress_2_update.items() if key != "_meta"} == {
+            "sessionUpdate": "tool_call_update", "toolCallId": "edit-2",
+            "status": "in_progress",
             "rawInput": {"path": "notes-2.txt", "old_text": "old-2", "new_text": "new-2"},
         }
         assert await next_outgoing() == permission_request(
@@ -2399,20 +2410,12 @@ async def test_integrated_hands_edit_permission_wire_and_provider_result(
                 "structuredContent": {"changed": True},
             },
         })
-        progress_2 = await next_outgoing()
-        progress_2_update = progress_2["params"]["update"]
-        assert progress_2_update["_meta"] == {"mimir.sequence": 6}
-        assert {key: value for key, value in progress_2_update.items() if key != "_meta"} == {
-            "sessionUpdate": "tool_call_update", "toolCallId": "edit-2",
-            "status": "in_progress",
-            "rawInput": {"path": "notes-2.txt", "old_text": "old-2", "new_text": "new-2"},
-        }
         terminal_2 = await next_outgoing()
         terminal_2_update = terminal_2["params"]["update"]
         assert terminal_2_update["_meta"] == {"mimir.sequence": 7}
         assert {key: value for key, value in terminal_2_update.items() if key != "_meta"} == {
             "sessionUpdate": "tool_call_update", "toolCallId": "edit-2",
-            "status": "completed", "rawOutput": {"changed": True},
+            "status": "completed", "rawOutput": '{"changed": true}',
         }
         assert (await asyncio.wait_for(prompting_2, 3)).stop_reason == "end_turn"
 
@@ -2428,13 +2431,6 @@ async def test_integrated_hands_edit_permission_wire_and_provider_result(
             "title": "hands_edit", "kind": "other", "status": "pending",
             "rawInput": {"path": "notes-3.txt", "old_text": "old-3", "new_text": "new-3"},
         }
-        assert await next_outgoing() == permission_request(
-            7, "edit-3", "notes-3.txt", "old-3", "new-3"
-        )
-        await transport.incoming.put({
-            "jsonrpc": "2.0", "id": 7,
-            "result": {"outcome": {"outcome": "selected", "optionId": "reject_once"}},
-        })
         rejected_progress = (await next_outgoing())["params"]["update"]
         assert rejected_progress["_meta"] == {"mimir.sequence": 10}
         assert {key: value for key, value in rejected_progress.items() if key != "_meta"} == {
@@ -2442,6 +2438,13 @@ async def test_integrated_hands_edit_permission_wire_and_provider_result(
             "status": "in_progress",
             "rawInput": {"path": "notes-3.txt", "old_text": "old-3", "new_text": "new-3"},
         }
+        assert await next_outgoing() == permission_request(
+            7, "edit-3", "notes-3.txt", "old-3", "new-3"
+        )
+        await transport.incoming.put({
+            "jsonrpc": "2.0", "id": 7,
+            "result": {"outcome": {"outcome": "selected", "optionId": "reject_once"}},
+        })
         rejected_terminal = await next_outgoing()
         rejected_update = rejected_terminal["params"]["update"]
         assert rejected_update["_meta"] == {"mimir.sequence": 11}
@@ -2451,7 +2454,9 @@ async def test_integrated_hands_edit_permission_wire_and_provider_result(
         assert rejected_body["sessionUpdate"] == "tool_call_update"
         assert rejected_body["toolCallId"] == "edit-3"
         assert rejected_body["status"] == "failed"
-        assert "error" in rejected_body["rawOutput"]
+        assert rejected_body["rawOutput"] == (
+            "hands_edit permission was rejected by the operator before execution"
+        )
         assert (await asyncio.wait_for(rejecting, 3)).stop_reason == "end_turn"
         # A reject consumed only its permission outer ID: there is no tools/call
         # frame, and no stale allow_once decision was retained from either call.
@@ -2465,6 +2470,9 @@ async def test_integrated_hands_edit_permission_wire_and_provider_result(
         bare_start = (await next_outgoing())["params"]["update"]
         assert bare_start["toolCallId"] == "edit-4"
         assert bare_start["status"] == "pending"
+        bare_progress = (await next_outgoing())["params"]["update"]
+        assert bare_progress["toolCallId"] == "edit-4"
+        assert bare_progress["status"] == "in_progress"
         assert await next_outgoing() == permission_request(
             8, "edit-4", "notes-4.txt", "old-4", "new-4"
         )
@@ -2481,14 +2489,11 @@ async def test_integrated_hands_edit_permission_wire_and_provider_result(
             "jsonrpc": "2.0", "id": 9,
             "result": {"changed": "provider payload must not be echoed"},
         })
-        bare_progress = (await next_outgoing())["params"]["update"]
-        assert bare_progress["toolCallId"] == "edit-4"
-        assert bare_progress["status"] == "in_progress"
         bare_terminal = (await next_outgoing())["params"]["update"]
         assert bare_terminal["toolCallId"] == "edit-4"
         assert bare_terminal["status"] == "failed"
-        assert "missing structuredContent" in bare_terminal["rawOutput"]["error"]
-        assert "provider payload" not in bare_terminal["rawOutput"]["error"]
+        assert "missing structuredContent" in bare_terminal["rawOutput"]
+        assert "provider payload" not in bare_terminal["rawOutput"]
         reaction = (await next_outgoing())["params"]["update"]
         assert reaction["sessionUpdate"] == "agent_message_chunk"
         assert "edit-4" in reaction["content"]["text"]
