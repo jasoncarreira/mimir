@@ -416,6 +416,70 @@ async def test_tcp_reset_retires_inflight_peer_and_allows_prompt_reconnect(
 
 
 @pytest.mark.asyncio
+async def test_eof_retires_write_only_inflight_peer_before_dispatcher_drain(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = _short_home()
+    daemon = AcpDaemon(_bundle(home))
+    update_sent = asyncio.Event()
+    transport_dead = asyncio.Event()
+
+    class Agent:
+        peer: sdk.AcpPeer
+
+        def on_connect(self, peer: sdk.AcpPeer) -> int:
+            self.peer = peer
+            return 1
+
+        async def authenticate(self, method_id: str, **kwargs: object) -> sdk.AuthenticateResponse:
+            return sdk.AuthenticateResponse()
+
+        async def ext_method(self, method: str, params: dict[str, object]) -> object:
+            assert method == "hold"
+            update = sdk.AgentMessageChunk(
+                content=sdk.TextContentBlock(type="text", text="working"),
+                sessionUpdate="agent_message_chunk",
+            )
+            await self.peer.session_update("session-1", update)
+            update_sent.set()
+            await asyncio.Event().wait()
+
+        async def on_transport_closed(self, generation: int) -> None:
+            assert generation == 1
+            assert self.peer.closed is True
+            transport_dead.set()
+
+    daemon._agent = Agent()
+    monkeypatch.setattr("mimir.acp.daemon._peer_uid", lambda sock: os.getuid())
+    # This is only a failure bound: the fixed path must beat it rather than wait
+    # for dispatcher drain, while the production 30 second window stays intact.
+    monkeypatch.setattr(sdk, "DISPATCHER_STOP_TIMEOUT", 0.2)
+    server = await asyncio.start_server(daemon._admit_peer, "127.0.0.1", 0)
+    address = server.sockets[0].getsockname()
+    reader, writer = await asyncio.open_connection(*address)
+    writer.write(
+        b'{"jsonrpc":"2.0","id":1,"method":"authenticate",'
+        b'"params":{"methodId":"mimir-web-key"}}\n'
+    )
+    await writer.drain()
+    assert json.loads(await asyncio.wait_for(reader.readline(), 0.5))["result"] == {}
+    writer.write(b'{"jsonrpc":"2.0","id":2,"method":"_hold","params":{}}\n')
+    await writer.drain()
+    await asyncio.wait_for(update_sent.wait(), 0.5)
+    update = json.loads(await asyncio.wait_for(reader.readline(), 0.5))
+    assert update["method"] == "session/update"
+
+    writer.close()
+    await writer.wait_closed()
+    await asyncio.wait_for(transport_dead.wait(), 0.05)
+
+    server.close()
+    await server.wait_closed()
+    await daemon._stop_peers()
+    shutil.rmtree(home)
+
+
+@pytest.mark.asyncio
 async def test_startup_failure_rolls_back_owned_socket(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
