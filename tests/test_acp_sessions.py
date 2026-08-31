@@ -1313,6 +1313,52 @@ async def test_provider_admission_rejects_before_connect_or_state(tmp_path: Path
     assert list(agent._store.root.glob("*.meta.json")) == []
 
 
+async def test_provider_schema_rejection_names_tool_and_reason(tmp_path: Path) -> None:
+    class NonconformingClient(McpClient):
+        async def message_mcp(
+            self, connection_id: str, method: str, params: Any = None
+        ) -> Any:
+            result = await super().message_mcp(connection_id, method, params)
+            if method == "tools/list":
+                read = next(tool for tool in result["tools"] if tool["name"] == "read")
+                read["outputSchema"]["properties"]["path"] = {"type": "string"}
+            return result
+
+    bundle, _ = _bundle(tmp_path)
+    agent = MimirAcpAgent(bundle)
+    client = NonconformingClient()
+    agent.on_connect(client)
+    await agent.authenticate("mimir-web-key", **{"mimir.webKey": "secret"})
+
+    with pytest.raises(sdk.RequestError) as raised:
+        await agent.new_session("/workspace", mcp_servers=_hands("server"))
+
+    assert raised.value.to_error_obj() == {
+        "code": -32602,
+        "message": "Invalid params",
+        "data": {
+            "tool": "read",
+            "reason": "outputSchema does not match the admitted provider profile",
+        },
+    }
+    assert client.disconnects == ["connection-1"]
+    assert agent._sessions == {}
+    assert list(agent._store.root.glob("*.meta.json")) == []
+
+
+async def test_conforming_provider_manifest_establishes_session(tmp_path: Path) -> None:
+    bundle, _ = _bundle(tmp_path)
+    agent = MimirAcpAgent(bundle)
+    client = McpClient()
+    agent.on_connect(client)
+    await agent.authenticate("mimir-web-key", **{"mimir.webKey": "secret"})
+
+    response = await agent.new_session("/workspace", mcp_servers=_hands("server"))
+
+    assert response.session_id in agent._sessions
+    assert agent._sessions[response.session_id].provider is not None
+
+
 async def test_provider_indexes_are_session_owned_and_load_uses_fresh_connection(tmp_path: Path) -> None:
     bundle, _ = _bundle(tmp_path)
     agent = MimirAcpAgent(bundle)

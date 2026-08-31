@@ -26,6 +26,7 @@ from mimir.tools.client_provider import (
     ProviderConnection,
     ProviderDeclaration,
     ProviderProfile,
+    ProviderSchemaError,
     TurnCapabilityContext,
     reset_turn_capability_context,
     set_turn_capability_context,
@@ -539,7 +540,7 @@ class MimirAcpAgent:
             record = self._store.create_owned_session(owner)
             self._journals.open(record, client)
             state = SessionState(record, SessionEnvironment(cwd, copy.deepcopy(mcp_servers)), self._generation, declaration, MIMIR_HANDS_V1 if declaration else None)
-            await self._admit_provider(state)
+            await self._admit_provider(state, include_schema_diagnostics=True)
         except RequestError:
             if state is not None:
                 await self._discard_candidate(state)
@@ -1121,7 +1122,9 @@ class MimirAcpAgent:
             raise invalid_params_error()
         return ProviderDeclaration(value.name, value.server_id, cwd)
 
-    async def _admit_provider(self, state: SessionState) -> None:
+    async def _admit_provider(
+        self, state: SessionState, *, include_schema_diagnostics: bool = False
+    ) -> None:
         if state.declaration is None:
             return
         connection = self._require_connection()
@@ -1142,7 +1145,7 @@ class MimirAcpAgent:
             connection.connection_sessions[connection_id] = state
             await self._initialize_provider(state)
             await self._validate_tools(state)
-        except BaseException:
+        except BaseException as error:
             if connection.server_sessions.get(state.declaration.server_id) is state:
                 if previous_server is None:
                     connection.server_sessions.pop(state.declaration.server_id, None)
@@ -1156,6 +1159,10 @@ class MimirAcpAgent:
                 temporary = _AcpProviderConnection(self, peer, connection_id, state)
                 temporary.closed = True
                 await self._disconnect_provider(temporary, connection)
+            if include_schema_diagnostics and isinstance(error, ProviderSchemaError):
+                raise RequestError.invalid_params(
+                    {"tool": error.tool_name, "reason": error.reason}
+                ) from None
             raise invalid_params_error() from None
 
     async def _initialize_provider(self, state: SessionState) -> None:
@@ -1193,10 +1200,16 @@ class MimirAcpAgent:
                 policy is None
                 or name in seen
                 or tool.get("description") != policy.description
-                or tool.get("inputSchema") != _thaw(policy.input_schema)
-                or tool.get("outputSchema") != _thaw(policy.result_schema)
             ):
                 raise AcpProtocolError("MCP tool profile mismatch")
+            if tool.get("inputSchema") != _thaw(policy.input_schema):
+                raise ProviderSchemaError(
+                    name, "inputSchema does not match the admitted provider profile"
+                )
+            if tool.get("outputSchema") != _thaw(policy.result_schema):
+                raise ProviderSchemaError(
+                    name, "outputSchema does not match the admitted provider profile"
+                )
             seen.add(name)
         if seen != set(expected):
             raise AcpProtocolError("MCP tool profile mismatch")

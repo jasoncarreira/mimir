@@ -24,6 +24,13 @@ class ProviderPolicyError(RuntimeError):
     pass
 
 
+class ProviderSchemaError(RuntimeError):
+    def __init__(self, tool_name: str, reason: str) -> None:
+        super().__init__(reason)
+        self.tool_name = tool_name
+        self.reason = reason
+
+
 class ClientProviderResultError(ToolException, RuntimeError):
     """A rejected client result that must be returned to the model as a tool error."""
 
