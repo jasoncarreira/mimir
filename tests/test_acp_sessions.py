@@ -1024,6 +1024,97 @@ async def test_transport_death_releases_prompt_blocked_on_update_delivery(
     assert agent._bundle.turn_event_bus._exact_turn_subscribers == {}
 
 
+async def test_transport_death_terminalizes_provider_call_in_persisted_session(
+    tmp_path: Path,
+) -> None:
+    bundle, core = _bundle(tmp_path)
+    agent = MimirAcpAgent(bundle)
+
+    class DroppedProviderClient(McpClient):
+        def __init__(self) -> None:
+            super().__init__()
+            self.tool_entered = asyncio.Event()
+            self.dropped = False
+
+        async def session_update(self, session_id: str, update: Any) -> None:
+            if self.dropped:
+                raise ConnectionError("client disconnected")
+            await super().session_update(session_id, update)
+
+        async def message_mcp(
+            self, connection_id: str, method: str, params: Any = None,
+        ) -> Any:
+            if method == "tools/call":
+                self.tool_entered.set()
+                await asyncio.Event().wait()
+            return await super().message_mcp(connection_id, method, params)
+
+    client = DroppedProviderClient()
+    generation = agent.on_connect(client)
+    await agent.authenticate("mimir-web-key", **{"mimir.webKey": "secret"})
+    session_id = (
+        await agent.new_session("/one", mcp_servers=_hands("server"))
+    ).session_id
+
+    async def provider_turn(event: Any, **kwargs: Any) -> None:
+        turn_id = kwargs["turn_id"]
+        common = {
+            "turn_id": turn_id,
+            "channel_id": event.channel_id,
+            "seq": 1,
+            "ts": "now",
+            "type": "tool_call",
+            "id": "abandoned-read",
+            "tool_name": "hands_read",
+        }
+        bundle.turn_event_bus.publish({**common, "phase": "start"})
+        bundle.turn_event_bus.publish(
+            {**common, "phase": "end", "args": {"path": "a"}}
+        )
+        active = agent._active_prompts[session_id]
+        await bundle.turn_event_bus._exact_turn_subscribers[turn_id].join()
+        await active.dispatcher.drain()
+        context = get_turn_capability_context()
+        assert context is not None
+        await context.provider.call_tool("read", {"path": "a"})
+
+    core.run_turn = provider_turn
+    prompting = asyncio.create_task(
+        agent.prompt(
+            session_id, [sdk.TextContentBlock(type="text", text="read a")]
+        )
+    )
+    await client.tool_entered.wait()
+    assert [
+        update.status
+        for update in client.updates
+        if getattr(update, "tool_call_id", None) == "abandoned-read"
+    ] == ["pending", "in_progress"]
+
+    client.dropped = True
+    await agent.on_transport_closed(generation)
+    with pytest.raises(sdk.RequestError):
+        await prompting
+
+    reloaded, replay_client, _ = await _ready(tmp_path)
+    await reloaded.load_session("/two", session_id)
+    replayed = [
+        update
+        for update in replay_client.updates
+        if getattr(update, "tool_call_id", None) == "abandoned-read"
+    ]
+    assert [update.status for update in replayed] == [
+        "pending",
+        "in_progress",
+        "failed",
+    ]
+    assert replayed[0].title == "hands_read"
+    assert replayed[1].title is None
+    assert replayed[-1].raw_output == {
+        "error": "Client disconnected during tool execution"
+    }
+
+
 @pytest.mark.parametrize("reason", ["expired", "deleted", "io_failed"])
 async def test_unavailable_load_reasons_have_no_prefix(tmp_path: Path, reason: str) -> None:
     agent, client, _ = await _ready(tmp_path)
