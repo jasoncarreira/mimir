@@ -113,18 +113,49 @@ class SessionJournal:
                 )
             return published
 
+    async def close_abandoned_turn(
+        self,
+        lease: JournalLease,
+        terminal_updates: list[Any],
+    ) -> list[Any]:
+        async with self.lock:
+            lease.close()
+            if lease._terminalized:
+                return []
+            lease._terminalized = True
+            return [
+                self._prepare_locked(update, lease.turn_id)[0]
+                for update in terminal_updates
+            ]
+
     async def _publish_locked(self, update: Any, client: Any, turn_id: str | None) -> Any:
         if self._fatal or client is None:
+            raise RequestError(-32603, "Internal error")
+        update, sequence = self._prepare_locked(update, turn_id)
+        sent = _line({"kind": "sent", "sequence": sequence})
+        await client.session_update(self.record.session_id, update)
+        if self.journal_enabled:
+            try:
+                self._append_durable(sent)
+            except BaseException:
+                self.journal_enabled = False
+                self._fatal = True
+                self.store.try_mark(self.record.session_id, self.record.owner_principal, "io_failed")
+                self._report_once("ACP journal write failed after delivery; replay disabled")
+        return update
+
+    def _prepare_locked(self, update: Any, turn_id: str | None) -> tuple[Any, int]:
+        if self._fatal:
             raise RequestError(-32603, "Internal error")
         sequence = self.next_sequence
         self.next_sequence += 1
         update = _with_sequence(update, sequence)
         prepared = _line({"kind": "prepared", "sequence": sequence, "turn_id": turn_id or str(__import__("uuid").uuid4()), "update": update.model_dump(mode="json", by_alias=True, exclude_none=True)})
-        sent = _line({"kind": "sent", "sequence": sequence})
+        sent_size = len(_line({"kind": "sent", "sequence": sequence}))
         if self.journal_enabled:
             try:
                 current_size = self.record.journal_path.stat().st_size
-                if current_size + len(prepared) + len(sent) > MAX_JOURNAL_BYTES:
+                if current_size + len(prepared) + sent_size > MAX_JOURNAL_BYTES:
                     self.store.mark(self.record.session_id, self.record.owner_principal, "overflowed")
                     self.journal_enabled = False
                     self._report_once("ACP journal capacity exceeded; replay disabled")
@@ -136,16 +167,7 @@ class SessionJournal:
                 self.store.try_mark(self.record.session_id, self.record.owner_principal, "io_failed")
                 self._report_once("ACP journal write failed; replay disabled")
                 raise RequestError(-32603, "Internal error") from exc
-        await client.session_update(self.record.session_id, update)
-        if self.journal_enabled:
-            try:
-                self._append_durable(sent)
-            except BaseException:
-                self.journal_enabled = False
-                self._fatal = True
-                self.store.try_mark(self.record.session_id, self.record.owner_principal, "io_failed")
-                self._report_once("ACP journal write failed after delivery; replay disabled")
-        return update
+        return update, sequence
 
     async def send_replay(self, client: Any | None = None) -> None:
         async with self.lock:
