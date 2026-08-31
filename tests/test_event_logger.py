@@ -446,15 +446,16 @@ def test_process_lock_timeout_degrades_to_append(tmp_path, monkeypatch, caplog):
     path = tmp_path / "events.jsonl"
     logger = EventLogger(path, session_id="server")
     monkeypatch.setattr(event_logger, "PROCESS_LOCK_TIMEOUT_SECONDS", 0.05)
+    clock = iter((100.0, 100.05))
+    monkeypatch.setattr(
+        event_logger.time, "monotonic", lambda: next(clock, 100.05),
+    )
     logger._process_lock_path.touch()
 
     with logger._process_lock_path.open("a", encoding="utf-8") as holder:
         fcntl.flock(holder.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-        started = time.monotonic()
         logger.log_sync("lock_degraded")
-        elapsed = time.monotonic() - started
 
-    assert elapsed < 0.5
     assert json.loads(path.read_text())["type"] == "lock_degraded"
     assert "process lock timed out" in caplog.text
     assert "continuing with an unlocked append" in caplog.text
