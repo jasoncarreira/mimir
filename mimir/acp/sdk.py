@@ -864,6 +864,10 @@ class BoundedMessageDispatcher(DefaultMessageDispatcher):
         self._runner_slots = asyncio.BoundedSemaphore(max_active)
         self._runner_tasks: set[asyncio.Task[Any]] = set()
         self._authentication_fence: asyncio.Task[Any] | None = None
+        self._transport_dead = False
+
+    def mark_transport_dead(self) -> None:
+        self._transport_dead = True
 
     async def _dispatch_request(self, message: dict[str, Any]) -> None:
         method = message.get("method", "")
@@ -991,13 +995,16 @@ class BoundedMessageDispatcher(DefaultMessageDispatcher):
             raise asyncio.CancelledError
 
     async def _shutdown(self, task: asyncio.Task[Any]) -> None:
-        drain = asyncio.create_task(self._drain(task))
-        done, _ = await asyncio.wait((drain,), timeout=DISPATCHER_STOP_TIMEOUT)
-        if done:
-            drain.result()
-            return
-        drain.cancel()
-        drain.add_done_callback(_observe_task_exception)
+        if not self._transport_dead:
+            drain = asyncio.create_task(self._drain(task))
+            done, _ = await asyncio.wait((drain,), timeout=DISPATCHER_STOP_TIMEOUT)
+            if done:
+                drain.result()
+                return
+            drain.cancel()
+            drain.add_done_callback(_observe_task_exception)
+        else:
+            self._queue.close_nowait()
         task.cancel()
         runners = tuple(self._runner_tasks)
         for runner in runners:
@@ -1117,13 +1124,20 @@ async def run_stdio_agent(
     transport = StrictNdjsonTransport(request_reader, response_writer)
     state_store = StrictMessageStateStore()
     message_queue = BoundedMessageQueue(transport.take_frame_bytes)
+    dispatcher_holder: dict[str, BoundedMessageDispatcher] = {}
+
+    def make_dispatcher(*args: Any, **kwargs: Any) -> BoundedMessageDispatcher:
+        dispatcher = BoundedMessageDispatcher(*args, **kwargs)
+        dispatcher_holder["dispatcher"] = dispatcher
+        return dispatcher
+
     connection = Connection(
         route,
         transport,
         listening=False,
         state_store=state_store,
         queue=message_queue,
-        dispatcher_factory=BoundedMessageDispatcher,
+        dispatcher_factory=make_dispatcher,
     )
     peer = AcpPeer(connection, agent, state_store)
     holder["peer"] = peer
@@ -1139,6 +1153,23 @@ async def run_stdio_agent(
     except BaseException as exc:
         primary = exc
         traceback = exc.__traceback__
+    transport_retired = False
+    if primary is not None:
+        # A failed receive cannot deliver any more handler output. Retire the
+        # generation before Connection.close() waits for those handlers, so an
+        # in-flight prompt takes its transport-dead cancellation path instead
+        # of waiting on a peer that has already gone away.
+        peer.mark_transport_dead()
+        dispatcher = dispatcher_holder.get("dispatcher")
+        if dispatcher is not None:
+            dispatcher.mark_transport_dead()
+        transport_retired = True
+        try:
+            on_closed = getattr(agent, "on_transport_closed", None)
+            if on_closed is not None:
+                await on_closed(peer.peer_generation)
+        except BaseException as exc:
+            primary.add_note(f"on_transport_closed also failed: {exc!r}")
     close_failure: BaseException | None = None
     close_task: asyncio.Task[None] | None = None
     try:
@@ -1175,17 +1206,18 @@ async def run_stdio_agent(
         if close_task is not None and on_close_abandoned is not None:
             if not _close_retired_cleanly(close_task):
                 on_close_abandoned(close_task)
-    peer.mark_transport_dead()
-    try:
-        on_closed = getattr(agent, "on_transport_closed", None)
-        if on_closed is not None:
-            await on_closed(peer.peer_generation)
-    except BaseException as exc:
-        if primary is None:
-            primary = exc
-            traceback = exc.__traceback__
-        else:
-            primary.add_note(f"on_transport_closed also failed: {exc!r}")
+    if not transport_retired:
+        peer.mark_transport_dead()
+        try:
+            on_closed = getattr(agent, "on_transport_closed", None)
+            if on_closed is not None:
+                await on_closed(peer.peer_generation)
+        except BaseException as exc:
+            if primary is None:
+                primary = exc
+                traceback = exc.__traceback__
+            else:
+                primary.add_note(f"on_transport_closed also failed: {exc!r}")
     if close_failure is not None:
         if primary is None:
             primary = close_failure

@@ -13,6 +13,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from mimir.acp import sdk
 from mimir.acp.daemon import (
     ACP_MAX_PEERS,
     AcpDaemon,
@@ -317,6 +318,100 @@ async def test_clean_close_allows_immediate_reconnect(
     second_writer.close()
     await second_writer.wait_closed()
     await daemon.stop()
+    shutil.rmtree(home)
+
+
+@pytest.mark.asyncio
+async def test_tcp_reset_retires_inflight_peer_and_allows_prompt_reconnect(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = _short_home()
+    daemon = AcpDaemon(_bundle(home))
+    handler_started = asyncio.Event()
+    transport_dead = asyncio.Event()
+
+    class Agent:
+        def on_connect(self, peer: object) -> int:
+            return 1
+
+        async def authenticate(self, method_id: str, **kwargs: object) -> sdk.AuthenticateResponse:
+            return sdk.AuthenticateResponse()
+
+        async def ext_method(self, method: str, params: dict[str, object]) -> object:
+            assert method == "hold"
+            handler_started.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                # A normal handler cancellation may still flush state. A dead
+                # transport must be declared first so that work is abandoned.
+                await transport_dead.wait()
+                raise
+
+        async def on_transport_closed(self, generation: int) -> None:
+            transport_dead.set()
+
+    daemon._agent = Agent()
+    monkeypatch.setattr("mimir.acp.daemon._peer_uid", lambda sock: os.getuid())
+    server = await asyncio.start_server(daemon._admit_peer, "127.0.0.1", 0)
+    address = server.sockets[0].getsockname()
+
+    async def connect() -> tuple[asyncio.StreamReader, asyncio.StreamWriter]:
+        return await asyncio.open_connection(*address)
+
+    first_reader, first_writer = await connect()
+    first_writer.write(
+        b'{"jsonrpc":"2.0","id":1,"method":"authenticate",'
+        b'"params":{"methodId":"mimir-web-key"}}\n'
+    )
+    await first_writer.drain()
+    assert json.loads(await asyncio.wait_for(first_reader.readline(), 0.5))["result"] == {}
+    first_writer.write(
+        b'{"jsonrpc":"2.0","id":2,"method":"_hold","params":{}}\n'
+    )
+    await first_writer.drain()
+    await asyncio.wait_for(handler_started.wait(), 0.5)
+    first_peer_task = next(iter(daemon._peers)).task
+
+    concurrent_reader, concurrent_writer = await connect()
+    concurrent_writer.write(
+        b'{"jsonrpc":"2.0","id":9,"method":"initialize","params":{}}\n'
+    )
+    await concurrent_writer.drain()
+    refusal = json.loads(await asyncio.wait_for(concurrent_reader.readline(), 1.5))
+    assert refusal["error"]["code"] == -32001
+    assert refusal["id"] is None
+    assert "result" not in refusal
+
+    first_socket = first_writer.get_extra_info("socket")
+    first_socket.setsockopt(
+        socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0)
+    )
+    first_writer.transport.abort()
+
+    await asyncio.wait_for(transport_dead.wait(), 0.5)
+    _, pending = await asyncio.wait({first_peer_task}, timeout=2.0)
+    assert not pending, "reset peer did not retire promptly"
+
+    replacement_reader, replacement_writer = await connect()
+    replacement_writer.write(
+        b'{"jsonrpc":"2.0","id":3,"method":"authenticate",'
+        b'"params":{"methodId":"mimir-web-key"}}\n'
+    )
+    await replacement_writer.drain()
+    replacement = json.loads(
+        await asyncio.wait_for(replacement_reader.readline(), 2.0)
+    )
+    assert replacement == {"jsonrpc": "2.0", "id": 3, "result": {}}
+    assert transport_dead.is_set()
+
+    replacement_writer.close()
+    await replacement_writer.wait_closed()
+    concurrent_writer.close()
+    await concurrent_writer.wait_closed()
+    server.close()
+    await server.wait_closed()
+    await daemon._stop_peers()
     shutil.rmtree(home)
 
 
