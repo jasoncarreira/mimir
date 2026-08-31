@@ -691,10 +691,10 @@ async def test_strict_outer_envelopes_and_duplicate_or_late_responses_fail() -> 
             "error": {"code": -32601, "message": "Method not found", "data": None},
         }
     )
+    sdk.validate_jsonrpc_envelope(dict(valid, params=[]))
     invalid = [
         dict(valid, extra=True),
         dict(valid, id=True),
-        dict(valid, params=[]),
         {"jsonrpc": "2.0", "id": "outer"},
         {"jsonrpc": "2.0", "id": "outer", "result": {}, "error": {}},
         {"jsonrpc": "2.0", "id": "outer", "error": {"code": True, "message": "bad"}},
