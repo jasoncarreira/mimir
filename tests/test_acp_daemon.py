@@ -618,6 +618,61 @@ async def test_postauth_watchdog_terminates_non_draining_peer(
 
 
 @pytest.mark.asyncio
+async def test_transport_dead_peer_skips_watchdog_drain_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = _short_home()
+    daemon = AcpDaemon(_bundle(home))
+    peer = sdk.AcpPeer(object(), object())
+    drain_started = asyncio.Event()
+
+    class BlockedWriter(_Writer):
+        async def drain(self) -> None:
+            drain_started.set()
+            await asyncio.Event().wait()
+
+    monkeypatch.setattr("mimir.acp.daemon.ACP_PEER_WATCHDOG_INTERVAL", 0.0)
+    monkeypatch.setattr("mimir.acp.daemon.ACP_PEER_DRAIN_TIMEOUT", 1.0)
+    watchdog = asyncio.create_task(daemon._watch_peer(BlockedWriter(), peer))
+    await asyncio.wait_for(drain_started.wait(), 0.1)
+    peer.mark_transport_dead()
+    await asyncio.wait_for(watchdog, 0.1)
+    shutil.rmtree(home)
+
+
+@pytest.mark.asyncio
+async def test_live_peer_watchdog_keeps_full_drain_window(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = _short_home()
+    daemon = AcpDaemon(_bundle(home))
+    peer = sdk.AcpPeer(object(), object())
+    observed_timeouts: list[float | None] = []
+
+    class BlockedWriter(_Writer):
+        async def drain(self) -> None:
+            await asyncio.Event().wait()
+
+    async def fake_wait(
+        tasks: set[asyncio.Task[None]],
+        *,
+        timeout: float | None = None,
+        return_when: str = asyncio.ALL_COMPLETED,
+    ) -> tuple[set[asyncio.Task[None]], set[asyncio.Task[None]]]:
+        del return_when
+        observed_timeouts.append(timeout)
+        return set(), tasks
+
+    monkeypatch.setattr("mimir.acp.daemon.ACP_PEER_WATCHDOG_INTERVAL", 0.0)
+    monkeypatch.setattr("mimir.acp.daemon.asyncio.wait", fake_wait)
+    with pytest.raises(AcpDaemonError, match="stopped draining"):
+        await daemon._watch_peer(BlockedWriter(), peer)
+    assert observed_timeouts == [30.0]
+    assert peer.closed is False
+    shutil.rmtree(home)
+
+
+@pytest.mark.asyncio
 async def test_transport_death_retires_only_that_peer(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

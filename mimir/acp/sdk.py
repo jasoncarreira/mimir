@@ -518,23 +518,26 @@ class AcpPeer:
         self._active_connections: set[str] = set()
         self._used_connections: set[str] = set()
         self.peer_generation = 0
-        self._transport_dead = False
+        self._transport_dead = asyncio.Event()
 
     def mark_transport_dead(self) -> None:
-        if self._transport_dead:
+        if self._transport_dead.is_set():
             return
-        self._transport_dead = True
+        self._transport_dead.set()
         self._active_connections.clear()
         if self._state_store is not None:
             self._state_store.reject_all_outgoing(ConnectionError("Connection closed"))
 
+    async def wait_transport_dead(self) -> None:
+        await self._transport_dead.wait()
+
     def _require_live(self) -> None:
-        if self._transport_dead:
+        if self._transport_dead.is_set():
             raise ConnectionError("Connection closed")
 
     @property
     def closed(self) -> bool:
-        return self._transport_dead
+        return self._transport_dead.is_set()
 
     @property
     def supports_owned_requests(self) -> bool:
