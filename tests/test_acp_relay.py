@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from mimir.acp.relay import _Output, RelayError, _socket, run_relay
+from mimir.acp.relay import _Output, _output_writer, RelayError, _socket, run_relay
 
 
 def test_relay_requires_absolute_home() -> None:
@@ -24,6 +24,22 @@ def test_relay_output_retries_partial_writes() -> None:
     stream = Partial()
     _Output(stream).write(b"complete")
     assert stream.getvalue() == b"complete"
+
+
+@pytest.mark.asyncio
+async def test_relay_pipe_output_uses_nonblocking_event_loop_transport() -> None:
+    read_fd, write_fd = os.pipe()
+    output = os.fdopen(write_fd, "wb", buffering=0)
+    writer = await _output_writer(output)
+    try:
+        assert isinstance(writer, asyncio.StreamWriter)
+        writer.write(b"nonblocking")
+        await writer.drain()
+        assert os.read(read_fd, 11) == b"nonblocking"
+    finally:
+        writer.close()
+        await asyncio.sleep(0)
+        os.close(read_fd)
 
 
 def test_relay_is_blind_to_protocol_profiles_credentials_and_runtime() -> None:

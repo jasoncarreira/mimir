@@ -1395,19 +1395,24 @@ async def test_runner_closes_and_generation_teardown_is_exception_safe(
             await sdk.run_stdio_agent(agent, request_reader=reader, response_writer=writer)
         assert str(exc_info.value) == expected_primary
     generation = 0 if failure in {"connect", "connect_close"} else 37
-    assert events == [("connect", None), ("close", None), ("transport_closed", generation)]
+    if failure in {"connect", "connect_close"}:
+        assert events == [("connect", None), ("transport_closed", generation), ("close", None)]
+    else:
+        assert events == [("connect", None), ("close", None), ("transport_closed", generation)]
     assert instances[0].closed is True
     assert agent.closed_generations == [generation]
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("main_loop_error", [None, RuntimeError("receive failed")])
-async def test_runner_drains_queued_handlers_before_marking_peer_dead(
+async def test_runner_retires_failed_transport_before_cancelling_handlers(
     monkeypatch: pytest.MonkeyPatch, main_loop_error: RuntimeError | None
 ) -> None:
     instances: list[Any] = []
     handler_tasks: list[asyncio.Task[Any]] = []
+    handler_started = asyncio.Event()
     handled = asyncio.Event()
+    transport_dead = asyncio.Event()
     callback_done = asyncio.Event()
 
     class OwnedConnection:
@@ -1427,13 +1432,16 @@ async def test_runner_drains_queued_handlers_before_marking_peer_dead(
                     self.queue.task_done()
 
             handler_tasks.append(asyncio.create_task(handle()))
-            await asyncio.sleep(0)
+            await handler_started.wait()
             if main_loop_error is not None:
                 raise main_loop_error
+            await asyncio.gather(*handler_tasks)
 
         async def close(self) -> None:
             self.closed = True
-            await asyncio.gather(*handler_tasks)
+            for task in handler_tasks:
+                task.cancel()
+            await asyncio.gather(*handler_tasks, return_exceptions=True)
 
     class OwnedAgent:
         peer: sdk.AcpPeer
@@ -1445,7 +1453,7 @@ async def test_runner_drains_queued_handlers_before_marking_peer_dead(
         async def on_transport_closed(self, generation: int) -> None:
             assert generation == 41
             assert self.peer.closed is True
-            assert handled.is_set()
+            transport_dead.set()
             callback_done.set()
 
     agent = OwnedAgent()
@@ -1453,7 +1461,16 @@ async def test_runner_drains_queued_handlers_before_marking_peer_dead(
     async def route(method: str, params: Any, is_notification: bool) -> Any:
         assert method == "queued/request"
         assert agent.peer.closed is False
-        handled.set()
+        handler_started.set()
+        if main_loop_error is None:
+            handled.set()
+            return None
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            await transport_dead.wait()
+            handled.set()
+            raise
         return None
 
     monkeypatch.setattr(sdk, "Connection", OwnedConnection)
@@ -1477,7 +1494,11 @@ async def test_runner_drains_queued_handlers_before_marking_peer_dead(
     assert handled.is_set()
     assert callback_done.is_set()
     assert instances[0].closed is True
-    assert handler_tasks and all(task.done() and not task.cancelled() for task in handler_tasks)
+    assert handler_tasks and all(task.done() for task in handler_tasks)
+    if main_loop_error is None:
+        assert all(not task.cancelled() for task in handler_tasks)
+    else:
+        assert all(task.cancelled() for task in handler_tasks)
 
 
 def test_permission_meta_matrix_is_independent_and_cancelled_inner_meta_is_illegal() -> None:
