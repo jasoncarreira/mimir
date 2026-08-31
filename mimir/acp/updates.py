@@ -7,6 +7,7 @@ from typing import Any
 
 from mimir.acp.journal import JournalLease
 from mimir.acp.sdk import AgentPlanUpdate, PermissionSnapshot, PlanEntry, RequestError, ToolCallProgress, ToolCallStart
+from mimir.turn_event_redaction import scrub_value
 
 _SENSITIVE = {"authorization", "cookie", "password", "passwd", "secret", "token", "api_key", "apikey", "access_key", "private_key"}
 _VALID_TODO_STATUS = {"pending", "in_progress", "completed"}
@@ -209,7 +210,7 @@ class UpdateDispatcher:
                 if tool_id in self._open_tools:
                     return []
                 self._open_tools[tool_id] = name
-                raw_input = _strict_json(event.get("args")) if "args" in event else {}
+                raw_input = _client_json(event.get("args")) if "args" in event else {}
                 self._tool_args[tool_id] = raw_input
                 self._snapshots[tool_id] = PermissionSnapshot(
                     tool_call_id=tool_id,
@@ -223,7 +224,7 @@ class UpdateDispatcher:
                 if tool_id not in self._open_tools:
                     self._open_tools[tool_id] = name
                     output.append(ToolCallStart(sessionUpdate="tool_call", toolCallId=tool_id, title=name, kind="other", status="pending"))
-                args = _strict_json(event.get("args"))
+                args = _client_json(event.get("args"))
                 self._tool_args[tool_id] = args
                 output.append(ToolCallProgress(sessionUpdate="tool_call_update", toolCallId=tool_id, status="in_progress", rawInput=args))
                 return output
@@ -238,7 +239,7 @@ class UpdateDispatcher:
                 self._open_tools[tool_id] = name
                 output.append(ToolCallStart(sessionUpdate="tool_call", toolCallId=tool_id, title=name, kind="other", status="pending"))
             failed = event.get("status") not in {None, "ok", "completed", "success"} or bool(event.get("is_error"))
-            content = _strict_json(event.get("content"))
+            content = _client_json(event.get("content"))
             output.append(ToolCallProgress(sessionUpdate="tool_call_update", toolCallId=tool_id, status="failed" if failed else "completed", rawOutput=content))
             self._open_tools.pop(tool_id, None)
             self._snapshots.pop(tool_id, None)
@@ -273,6 +274,10 @@ def _strict_json(value: Any, key: str = "") -> Any:
     if isinstance(value, (list, tuple)):
         return [_strict_json(item) for item in value]
     return "[redacted]"
+
+
+def _client_json(value: Any) -> Any:
+    return scrub_value(_strict_json(value))
 
 
 def _freeze_json(value: Any) -> Any:

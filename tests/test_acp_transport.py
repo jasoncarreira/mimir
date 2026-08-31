@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+import json
 
 import pytest
 
+from mimir.acp.sdk import AcpProtocolError, MAX_CONSECUTIVE_PARSE_ERRORS, StrictNdjsonTransport
 from mimir.acp.transport import close_writer, pump_bidirectional, pump_stream
 
 
@@ -31,6 +33,42 @@ class Writer:
 
     def abort(self) -> None:
         self.closed = True
+
+
+@pytest.mark.asyncio
+async def test_parse_error_response_preserves_connection_for_next_request() -> None:
+    reader = asyncio.StreamReader()
+    reader.feed_data(
+        b'this is not json\n'
+        b'{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}\n'
+    )
+    writer = Writer()
+    transport = StrictNdjsonTransport(reader, writer)
+
+    message = await transport.receive()
+
+    assert message == {
+        "jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {},
+    }
+    assert json.loads(writer.data) == {
+        "jsonrpc": "2.0",
+        "id": None,
+        "error": {"code": -32700, "message": "Parse error"},
+    }
+
+
+@pytest.mark.asyncio
+async def test_repeated_parse_errors_hit_connection_limit() -> None:
+    reader = asyncio.StreamReader()
+    reader.feed_data(b"garbage\n" * MAX_CONSECUTIVE_PARSE_ERRORS)
+    reader.feed_eof()
+    writer = Writer()
+    transport = StrictNdjsonTransport(reader, writer)
+
+    with pytest.raises(AcpProtocolError, match="Too many malformed"):
+        await transport.receive()
+
+    assert len(writer.data.splitlines()) == MAX_CONSECUTIVE_PARSE_ERRORS
 
 
 @pytest.mark.asyncio

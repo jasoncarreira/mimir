@@ -22,6 +22,7 @@ ACP_PEER_DRAIN_TIMEOUT = 30.0
 ACP_PEER_GRACE_TIMEOUT = 5.0
 ACP_PEER_CANCEL_TIMEOUT = 2.0
 ACP_PEER_ABORT_TIMEOUT = 1.0
+ACP_PEER_RETIRE_TIMEOUT = 1.0
 ACP_SHUTDOWN_TIMEOUT = 20.0
 ACP_MAX_PEERS = 1
 ACP_CLOSE_CONCURRENCY = 4
@@ -283,6 +284,11 @@ class AcpDaemon:
                 writer.transport.abort()
             return
         if self._admitted + self._unretired_generations() >= ACP_MAX_PEERS:
+            retiring = {peer.task for peer in self._peers if not peer.task.done()}
+            if retiring:
+                await asyncio.wait(retiring, timeout=ACP_PEER_RETIRE_TIMEOUT)
+            self._prune_finished_peers()
+        if self._admitted + self._unretired_generations() >= ACP_MAX_PEERS:
             payload = {
                 "jsonrpc": "2.0",
                 "id": None,
@@ -307,10 +313,17 @@ class AcpDaemon:
         self._peers.add(peer)
 
         def finished(_: asyncio.Task[None]) -> None:
-            self._peers.discard(peer)
-            self._admitted -= 1
+            if peer in self._peers:
+                self._peers.discard(peer)
+                self._admitted -= 1
 
         task.add_done_callback(finished)
+
+    def _prune_finished_peers(self) -> None:
+        for peer in tuple(self._peers):
+            if peer.task.done():
+                self._peers.discard(peer)
+                self._admitted -= 1
 
     async def _run_peer(
         self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
@@ -541,6 +554,7 @@ __all__ = [
     "ACP_AUTH_TIMEOUT",
     "ACP_MAX_PEERS",
     "ACP_PEER_ABORT_TIMEOUT",
+    "ACP_PEER_RETIRE_TIMEOUT",
     "AcpDaemon",
     "AcpDaemonError",
     "acp_enabled_from_env",
