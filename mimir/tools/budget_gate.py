@@ -2431,6 +2431,10 @@ def _permission_failure_message(tool_name: str, failure: str) -> str:
     return f"{tool_name} permission request {failure}; execution denied"
 
 
+def _permission_not_requested_message(tool_name: str) -> str:
+    return f"{tool_name} permission request never reached an operator; execution denied"
+
+
 def _owner_loop_for_permission_broker(broker: Any) -> asyncio.AbstractEventLoop | None:
     loop = getattr(broker, "permission_owner_loop", None)
     if (
@@ -2483,6 +2487,8 @@ def _request_permission_sync(
             return _permission_snapshot_refusal(tool_name)
         if decision is PermissionDecision.REJECT_ONCE:
             return _permission_denial_message(tool_name)
+        if decision is PermissionDecision.NOT_REQUESTED:
+            return _permission_not_requested_message(tool_name)
         if decision is PermissionDecision.CANCELLED:
             return _permission_failure_message(tool_name, "was cancelled")
         return _permission_failure_message(tool_name, "returned an invalid decision")
@@ -2526,6 +2532,8 @@ async def _request_permission_async(
             return _permission_snapshot_refusal(tool_name)
         if decision is PermissionDecision.REJECT_ONCE:
             return _permission_denial_message(tool_name)
+        if decision is PermissionDecision.NOT_REQUESTED:
+            return _permission_not_requested_message(tool_name)
         if decision is PermissionDecision.CANCELLED:
             return _permission_failure_message(tool_name, "was cancelled")
         return _permission_failure_message(tool_name, "returned an invalid decision")

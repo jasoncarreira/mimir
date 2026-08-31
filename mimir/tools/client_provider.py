@@ -32,6 +32,7 @@ class PermissionDecision(StrEnum):
     ALLOW_ONCE = "allow_once"
     REJECT_ONCE = "reject_once"
     CANCELLED = "cancelled"
+    NOT_REQUESTED = "not_requested"
 
 
 @dataclass(frozen=True)

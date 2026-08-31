@@ -12632,6 +12632,10 @@ def test_hands_shell_missing_command_fails_before_prohibited_provider_check(
             "reject_once",
             "hands_edit permission was rejected by the operator before execution",
         ),
+        (
+            "not_requested",
+            "hands_edit permission request never reached an operator; execution denied",
+        ),
         ("cancelled", "hands_edit permission request was cancelled; execution denied"),
         (object(), "hands_edit permission request returned an invalid decision; execution denied"),
     ],

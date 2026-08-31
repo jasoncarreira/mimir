@@ -388,7 +388,9 @@ class TurnEventEmitter:
                 self._emit("tool_call", "end", id=span_id, tool_name=name, args=args)
             else:
                 self._block_emitted_ids.add(span_id)
-                self._emit("tool_call", "start", id=span_id, tool_name=name)
+                self._emit(
+                    "tool_call", "start", id=span_id, tool_name=name, args=args
+                )
                 if args is not None:
                     self._emit("tool_call", "chunk", id=span_id, args_delta=args)
                 self._emit("tool_call", "end", id=span_id, tool_name=name, args=args)
