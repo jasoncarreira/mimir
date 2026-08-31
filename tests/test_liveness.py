@@ -73,14 +73,13 @@ def _home(tmp_path: Path) -> Path:
 
 def test_write_and_read_beat(tmp_path: Path) -> None:
     home = _home(tmp_path)
-    assert write_beat(home, started_at=1000.0) is True
+    assert write_beat(home, started_at=1000.0, ts=2000.0) is True
     beat = read_beat(home)
     assert isinstance(beat, dict)
     assert isinstance(beat["ts"], (int, float))
     assert beat["pid"] > 0
     assert beat["started_at"] == 1000.0
-    age = beat_age_seconds(home)
-    assert age is not None and 0 <= age < 5
+    assert beat_age_seconds(home, now=2003.0) == 3.0
 
 
 @pytest.mark.asyncio
