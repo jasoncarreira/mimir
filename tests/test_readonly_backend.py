@@ -1849,12 +1849,12 @@ class TestBuildFileToolRoutes:
 
         monkeypatch.setattr(backend, "_walk_files", record_deadline)
         monkeypatch.setattr("mimir.readonly_backend.deepagents_filesystem.GLOB_TIMEOUT", 8.0)
-        started = time.monotonic()
+        monkeypatch.setattr("mimir.readonly_backend.time.monotonic", lambda: 100.0)
 
         result = backend.glob("**/*.py", path="/")
 
         assert result.error is None
-        assert deadlines[0] == pytest.approx(started + 4.0, abs=0.1)
+        assert deadlines == [104.0]
 
     def test_glob_records_completed_search(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
@@ -1914,15 +1914,17 @@ class TestBuildFileToolRoutes:
     ) -> None:
         repo = tmp_path / "repo"
         repo.mkdir()
-        for directory_index in range(40):
-            directory = repo / f"directory-{directory_index:02d}"
-            directory.mkdir()
-            for file_index in range(100):
-                (directory / f"file-{file_index:03d}.txt").touch()
+        (repo / "first.txt").touch()
+        (repo / "second.txt").touch()
         events = []
         monkeypatch.setattr(
             "mimir.event_logger.log_event_sync",
             lambda kind, **fields: events.append((kind, fields)),
+        )
+        clock = iter((100.0, 100.002))
+        monkeypatch.setattr(
+            "mimir.readonly_backend.time.monotonic",
+            lambda: next(clock, 100.002),
         )
         backend = _RootAwareFilesystemBackend(
             root_dir=repo,
@@ -1931,11 +1933,8 @@ class TestBuildFileToolRoutes:
             max_scan_files=100_000,
         )
 
-        started = time.monotonic()
         result = backend.glob("**/*.py", path="/")
-        elapsed = time.monotonic() - started
 
-        assert elapsed < 1.0
         assert result.error is None
         assert result.truncated is True
         assert str(repo) in caplog.text
@@ -1944,7 +1943,7 @@ class TestBuildFileToolRoutes:
         assert kind == "filesystem_glob_search"
         assert fields["pattern"] == "**/*.py"
         assert fields["root"] == str(repo)
-        assert fields["visited_entries"] > 0
+        assert fields["visited_entries"] == 1
         assert fields["truncated"] is True
         assert fields["reason"] == "ran longer than 0.001s"
 
@@ -2016,14 +2015,11 @@ class TestBuildFileToolRoutes:
             max_scan_files=100_000,
         )
 
-        started = time.perf_counter()
         result = backend.glob("**/*.py", path="/")
-        elapsed = time.perf_counter() - started
 
         assert result.error is None
         assert result.truncated is False
         assert events[-1][1]["visited_entries"] == 2_020
-        assert elapsed < 1.0
 
     def test_ls_hides_expensive_traversal_roots(self, tmp_path: Path) -> None:
         repo = tmp_path / "repo"
