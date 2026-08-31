@@ -99,7 +99,6 @@ async def _run_requests(
     reader = asyncio.StreamReader()
     for request in requests:
         reader.feed_data((json.dumps(request) + "\n").encode())
-    reader.feed_eof()
     output = io.BytesIO()
     protocol = _DrainProtocol()
     transport = _ReservedFrameTransport(output, protocol)
@@ -109,7 +108,15 @@ async def _run_requests(
         None,
         asyncio.get_running_loop(),
     )
-    await sdk.run_stdio_agent(agent, request_reader=reader, response_writer=writer)
+    runner = asyncio.create_task(
+        sdk.run_stdio_agent(agent, request_reader=reader, response_writer=writer)
+    )
+    expected_responses = sum("id" in request for request in requests)
+    async with asyncio.timeout(1):
+        while len(output.getvalue().splitlines()) < expected_responses:
+            await asyncio.sleep(0)
+    reader.feed_eof()
+    await runner
     return [json.loads(line) for line in output.getvalue().splitlines()]
 
 

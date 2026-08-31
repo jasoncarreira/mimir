@@ -1156,22 +1156,22 @@ async def run_stdio_agent(
     except BaseException as exc:
         primary = exc
         traceback = exc.__traceback__
-    transport_retired = False
-    if primary is not None:
-        # A failed receive cannot deliver any more handler output. Retire the
-        # generation before Connection.close() waits for those handlers, so an
-        # in-flight prompt takes its transport-dead cancellation path instead
-        # of waiting on a peer that has already gone away.
-        peer.mark_transport_dead()
-        dispatcher = dispatcher_holder.get("dispatcher")
-        if dispatcher is not None:
-            dispatcher.mark_transport_dead()
-        transport_retired = True
-        try:
-            on_closed = getattr(agent, "on_transport_closed", None)
-            if on_closed is not None:
-                await on_closed(peer.peer_generation)
-        except BaseException as exc:
+    # main_loop returning means receive reached EOF just as surely as an
+    # exception means the transport failed. Retire either form of disconnect
+    # before close drains handlers that can no longer deliver their output.
+    peer.mark_transport_dead()
+    dispatcher = dispatcher_holder.get("dispatcher")
+    if dispatcher is not None:
+        dispatcher.mark_transport_dead()
+    try:
+        on_closed = getattr(agent, "on_transport_closed", None)
+        if on_closed is not None:
+            await on_closed(peer.peer_generation)
+    except BaseException as exc:
+        if primary is None:
+            primary = exc
+            traceback = exc.__traceback__
+        else:
             primary.add_note(f"on_transport_closed also failed: {exc!r}")
     close_failure: BaseException | None = None
     close_task: asyncio.Task[None] | None = None
@@ -1209,18 +1209,6 @@ async def run_stdio_agent(
         if close_task is not None and on_close_abandoned is not None:
             if not _close_retired_cleanly(close_task):
                 on_close_abandoned(close_task)
-    if not transport_retired:
-        peer.mark_transport_dead()
-        try:
-            on_closed = getattr(agent, "on_transport_closed", None)
-            if on_closed is not None:
-                await on_closed(peer.peer_generation)
-        except BaseException as exc:
-            if primary is None:
-                primary = exc
-                traceback = exc.__traceback__
-            else:
-                primary.add_note(f"on_transport_closed also failed: {exc!r}")
     if close_failure is not None:
         if primary is None:
             primary = close_failure

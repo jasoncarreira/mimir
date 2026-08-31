@@ -617,13 +617,19 @@ async def test_actual_runner_preserves_agent_router_and_generic_outer_ids() -> N
     reader = asyncio.StreamReader()
     for request in requests:
         reader.feed_data((json.dumps(request) + "\n").encode())
-    reader.feed_eof()
     output = io.BytesIO()
     protocol = _DrainProtocol()
     transport = _ReservedFrameTransport(output, protocol)
     writer = asyncio.StreamWriter(transport, protocol, None, asyncio.get_running_loop())
     agent = ContractAgent()
-    await sdk.run_stdio_agent(agent, request_reader=reader, response_writer=writer)
+    runner = asyncio.create_task(
+        sdk.run_stdio_agent(agent, request_reader=reader, response_writer=writer)
+    )
+    async with asyncio.timeout(1):
+        while len(output.getvalue().splitlines()) < 3:
+            await asyncio.sleep(0)
+    reader.feed_eof()
+    await runner
     responses = [json.loads(line) for line in output.getvalue().splitlines()]
     assert responses == [
         {"jsonrpc": "2.0", "id": "auth-id", "result": {}},
@@ -1395,10 +1401,7 @@ async def test_runner_closes_and_generation_teardown_is_exception_safe(
             await sdk.run_stdio_agent(agent, request_reader=reader, response_writer=writer)
         assert str(exc_info.value) == expected_primary
     generation = 0 if failure in {"connect", "connect_close"} else 37
-    if failure in {"connect", "connect_close"}:
-        assert events == [("connect", None), ("transport_closed", generation), ("close", None)]
-    else:
-        assert events == [("connect", None), ("close", None), ("transport_closed", generation)]
+    assert events == [("connect", None), ("transport_closed", generation), ("close", None)]
     assert instances[0].closed is True
     assert agent.closed_generations == [generation]
 
