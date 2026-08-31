@@ -680,7 +680,8 @@ class MimirAcpAgent:
             self._bridge.unbind(record.thread_id, bridge_publisher)
             self._dispatchers.discard(dispatcher)
             try:
-                await dispatcher.close()
+                async with active.cleanup_lock:
+                    await dispatcher.close()
             except BaseException as exc:
                 failed = failed or exc
             if state.active_prompt is active:
@@ -783,7 +784,16 @@ class MimirAcpAgent:
                 active.model_task.cancel()
             if transport and active.prompt_handler is not None and active.prompt_handler is not asyncio.current_task():
                 active.prompt_handler.cancel()
-        if transport or active.prompt_handler is asyncio.current_task():
+        if transport:
+            try:
+                async with active.cleanup_lock:
+                    await active.dispatcher.terminalize_abandoned()
+            except BaseException:
+                # The peer is already dead. The journal writes each prepared
+                # update before delivery, so replay still sees the terminal state.
+                pass
+            return True
+        if active.prompt_handler is asyncio.current_task():
             return True
         try:
             await asyncio.wait_for(active.completed.wait(), ACP_PROMPT_CANCEL_GRACE_SECONDS)
@@ -1323,6 +1333,9 @@ class _TurnPublisher:
 
     async def close_turn(self, terminal_updates: list[Any]) -> list[Any]:
         return await self._journal.close_turn(self._lease, terminal_updates, self._client)
+
+    async def close_abandoned_turn(self, terminal_updates: list[Any]) -> list[Any]:
+        return await self._journal.close_abandoned_turn(self._lease, terminal_updates)
 
 
 class _OrderedTurnPublisher:

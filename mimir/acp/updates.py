@@ -121,6 +121,30 @@ class UpdateDispatcher:
             for update in updates:
                 await self.publisher.publish_live(update)
 
+    async def terminalize_abandoned(self) -> None:
+        # A transport can disappear while the worker is blocked delivering an
+        # update. Bound that write before appending terminal records directly.
+        await self.close()
+        updates = [
+            ToolCallProgress(
+                sessionUpdate="tool_call_update",
+                toolCallId=tool_id,
+                status="failed",
+                rawOutput={"error": "Client disconnected during tool execution"},
+            )
+            for tool_id in self._open_tools
+        ]
+        self._open_tools.clear()
+        self._tool_args.clear()
+        self._snapshots.clear()
+        if hasattr(self.publisher, "close_abandoned_turn"):
+            await self.publisher.close_abandoned_turn(updates)
+        elif hasattr(self.publisher, "close_turn"):
+            await self.publisher.close_turn(updates)
+        elif updates:
+            for update in updates:
+                await self.publisher.publish_live(update)
+
     async def close(self) -> None:
         if self._worker is None:
             return
