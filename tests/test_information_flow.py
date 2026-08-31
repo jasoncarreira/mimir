@@ -3420,6 +3420,110 @@ def test_hands_read_result_uses_authorization_provenance() -> None:
     assert labels.has_untrusted_active_ingest is True
 
 
+def test_acp_failed_provider_contract_result_is_untrusted_informational() -> None:
+    from mimir.tools.client_provider import ClientProviderResultError
+
+    auth = replace(
+        _auth(channel="acp:session", roles=("admin",)),
+        principal="operator",
+        canonical_principal="operator",
+        domain="channel",
+        resource_id="acp:session",
+        bridge_instance="acp-stdio",
+        origin_trigger="acp_session",
+    )
+    authorization = ToolAuthorization(
+        tool_name="hands_read",
+        decision=OperationDecision.RESOURCE_SCOPED,
+        allowed=True,
+        protected_source_resources=("client-file:%2Fworkspace%2Fnotes.txt",),
+        flow_direction=ToolFlowDirection.SOURCE,
+        result_integrity="untrusted",
+    )
+
+    labels = classify_protected_result(
+        "hands_read",
+        {"path": "/workspace/notes.txt"},
+        auth,
+        authorization,
+        result=ClientProviderResultError("missing structuredContent"),
+        failed=True,
+    )
+
+    assert labels is not None
+    [source] = labels.sources
+    assert source.resource_id == "acp:session"
+    assert source.source_kind == "channel"
+    assert (source.integrity, source.integrity_effect) == (
+        "untrusted", "informational",
+    )
+    assert labels.has_untrusted_active_ingest is False
+
+
+def test_acp_successful_provider_result_keeps_active_provider_labels() -> None:
+    auth = replace(
+        _auth(channel="acp:session", roles=("admin",)),
+        principal="operator",
+        canonical_principal="operator",
+        domain="channel",
+        resource_id="acp:session",
+        bridge_instance="acp-stdio",
+        origin_trigger="acp_session",
+    )
+    authorization = ToolAuthorization(
+        tool_name="hands_read",
+        decision=OperationDecision.RESOURCE_SCOPED,
+        allowed=True,
+        protected_source_resources=("client-file:%2Fworkspace%2Fnotes.txt",),
+        flow_direction=ToolFlowDirection.SOURCE,
+        result_integrity="untrusted",
+    )
+
+    labels = classify_protected_result(
+        "hands_read",
+        {"path": "/workspace/notes.txt"},
+        auth,
+        authorization,
+        result={"content": "client input"},
+    )
+
+    assert labels is not None
+    [source] = labels.sources
+    assert source.domain == "client_provider"
+    assert (source.integrity, source.integrity_effect) == (
+        "untrusted", "active_ingest",
+    )
+
+
+def test_failed_provider_contract_result_outside_acp_keeps_provider_labels() -> None:
+    from mimir.tools.client_provider import ClientProviderResultError
+
+    authorization = ToolAuthorization(
+        tool_name="hands_read",
+        decision=OperationDecision.RESOURCE_SCOPED,
+        allowed=True,
+        protected_source_resources=("client-file:%2Fworkspace%2Fnotes.txt",),
+        flow_direction=ToolFlowDirection.SOURCE,
+        result_integrity="untrusted",
+    )
+
+    labels = classify_protected_result(
+        "hands_read",
+        {"path": "/workspace/notes.txt"},
+        _auth(),
+        authorization,
+        result=ClientProviderResultError("missing structuredContent"),
+        failed=True,
+    )
+
+    assert labels is not None
+    [source] = labels.sources
+    assert source.domain == "client_provider"
+    assert (source.integrity, source.integrity_effect) == (
+        "untrusted", "active_ingest",
+    )
+
+
 @pytest.mark.parametrize(
     "tool_name",
     ["bash", "Bash", "shell", "http_request"],

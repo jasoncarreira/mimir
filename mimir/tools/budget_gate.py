@@ -1658,7 +1658,7 @@ def _result_labels_for_call(
     auth_context: AuthContext | None,
     authorization: ToolAuthorization,
     *,
-    result: ToolMessage | Command | None = None,
+    result: Any = None,
     provenance: Any = None,
     policy_refusal: ToolPolicyRefusal | None = None,
     failed: bool = False,
@@ -2974,6 +2974,7 @@ class BudgetGateMiddleware(AgentMiddleware):
                     request,
                     auth_context,
                     authorization,
+                    result=exc,
                     provenance=provenance,
                     failed=True,
                 )
@@ -3452,6 +3453,7 @@ class BudgetGateMiddleware(AgentMiddleware):
                     request,
                     auth_context,
                     authorization,
+                    result=exc,
                     provenance=provenance,
                     failed=True,
                 )
