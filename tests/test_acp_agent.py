@@ -624,6 +624,58 @@ async def test_actual_router_uses_only_meta_key_and_emits_no_notification_respon
     assert agent._auth_context is None
 
 
+async def test_wrong_typed_params_return_errors_and_connection_survives(
+    tmp_path: Path,
+) -> None:
+    agent = _agent(_resolver(tmp_path))
+    invalid_requests = [
+        {"jsonrpc": "2.0", "id": 1, "method": "session/prompt", "params": "bad"},
+        {"jsonrpc": "2.0", "id": 2, "method": "session/new", "params": []},
+        {"jsonrpc": "2.0", "id": 3, "method": "session/load", "params": 1},
+        {"jsonrpc": "2.0", "id": 4, "method": "session/prompt", "params": None},
+    ]
+
+    responses = await _run_requests(
+        agent,
+        [
+            *invalid_requests,
+            {
+                "jsonrpc": "2.0",
+                "method": "session/cancel",
+                "params": "bad-notification",
+            },
+            {
+                "jsonrpc": "2.0",
+                "id": 5,
+                "method": "session/prompt",
+                "params": {"sessionId": "missing-prompt"},
+            },
+            {
+                "jsonrpc": "2.0",
+                "id": 6,
+                "method": "initialize",
+                "params": {
+                    "protocolVersion": 1,
+                    "clientCapabilities": {},
+                    "clientInfo": {"name": "test", "version": "1"},
+                },
+            },
+        ],
+    )
+
+    by_id = {response["id"]: response for response in responses}
+    for request in invalid_requests:
+        error = by_id[request["id"]]["error"]
+        assert error["code"] == -32602
+        assert error["message"] == "Invalid params"
+        assert error["data"]["errors"][0]["loc"] == []
+        assert "valid dictionary" in error["data"]["errors"][0]["msg"]
+    missing_error = by_id[5]["error"]
+    assert missing_error["code"] == -32602
+    assert missing_error["data"]["errors"][0]["loc"] == ["prompt"]
+    assert by_id[6]["result"]["protocolVersion"] == 1
+
+
 def test_agent_exposes_no_out_of_scope_handlers(tmp_path: Path) -> None:
     agent = _agent(_resolver(tmp_path))
     forbidden = {

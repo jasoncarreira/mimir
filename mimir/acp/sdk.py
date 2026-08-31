@@ -261,9 +261,6 @@ def validate_jsonrpc_envelope(message: Any) -> None:
             raise AcpProtocolError("Malformed JSON-RPC request")
         if "id" in message and not _valid_outer_id(message["id"]):
             raise AcpProtocolError("Malformed JSON-RPC request ID")
-        params = message.get("params")
-        if "params" in message and params is not None and not isinstance(params, dict):
-            raise AcpProtocolError("Malformed JSON-RPC params")
         return
     allowed = {"jsonrpc", "id", "result", "error"}
     if set(message) - allowed or not _valid_outer_id(message.get("id")):
