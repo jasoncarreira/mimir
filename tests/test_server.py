@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import ast
 import asyncio
+import builtins
 import inspect
 import json
 import logging
@@ -419,6 +420,7 @@ class _ServerControl:
     channels: Any | None = None
     web_chat: Any | None = None
     mcp_manager: Any | None = None
+    mcp_policy_store: Any | None = None
     panel: Any | None = None
     identity_resolver: Any | None = None
     real_dispatcher: bool = False
@@ -695,6 +697,8 @@ def _controlled_server_app(
     class MCPPolicyStore:
         def __init__(self, path: Path) -> None:
             self.path = path
+            control.mcp_policy_store = self
+            control.hit("mcp:policy-store")
 
         def load_server_configs(self) -> list[Any]:
             return []
@@ -850,6 +854,30 @@ async def _run_cleanup(app: web.Application) -> None:
     await hooks[0](app)
 
 
+def _fail_mcp_client_import(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    missing_name: str,
+) -> None:
+    original_import = builtins.__import__
+
+    def guarded_import(
+        name: str,
+        globals: dict[str, Any] | None = None,
+        locals: dict[str, Any] | None = None,
+        fromlist: tuple[str, ...] = (),
+        level: int = 0,
+    ) -> Any:
+        if name == "mcp_client" and level == 1 and "MCPManager" in fromlist:
+            raise ModuleNotFoundError(
+                f"No module named {missing_name!r}",
+                name=missing_name,
+            )
+        return original_import(name, globals, locals, fromlist, level)
+
+    monkeypatch.setattr(builtins, "__import__", guarded_import)
+
+
 @pytest.mark.asyncio
 async def test_source_repo_hook_uses_pushed_from_repo_not_running_source(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
@@ -988,6 +1016,62 @@ async def test_startup_constructs_runtime_first_and_publishes_atomically(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("configured", "warning_text"),
+    [
+        (False, "MCP bridging is disabled"),
+        (True, "skipping 1 configured MCP server(s)"),
+    ],
+)
+async def test_missing_mcp_extra_still_serves_health(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    configured: bool,
+    warning_text: str,
+) -> None:
+    control = _ServerControl(mcp_enabled=configured)
+    app, control = _controlled_server_app(tmp_path, monkeypatch, control)
+    app["check_worker_executor_health"] = False
+    _fail_mcp_client_import(monkeypatch, missing_name="mcp")
+    caplog.set_level(logging.WARNING, logger="mimir.server")
+
+    async with TestClient(TestServer(app)) as client:
+        response = await client.get("/health")
+
+        assert response.status == 200
+        assert await response.json() == {"ok": True}
+        assert app["startup_state"].mcp_manager is None
+        assert app["startup_state"].phase != "mcp_start"
+        assert "scheduler:start" in control.events
+        assert "mcp:construct" not in control.events
+
+    mcp_warnings = [
+        record.getMessage()
+        for record in caplog.records
+        if "Optional extra `mcp` is not installed" in record.getMessage()
+    ]
+    assert len(mcp_warnings) == 1
+    assert warning_text in mcp_warnings[0]
+
+
+@pytest.mark.asyncio
+async def test_mcp_client_import_bug_remains_fatal(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    app, _ = _controlled_server_app(tmp_path, monkeypatch)
+    _fail_mcp_client_import(monkeypatch, missing_name="mcp.client.broken")
+
+    with pytest.raises(ModuleNotFoundError) as caught:
+        await _run_startup(app)
+
+    assert caught.value.name == "mcp.client.broken"
+    assert app["startup_state"].compensated is True
+    await _run_cleanup(app)
+
+
+@pytest.mark.asyncio
 async def test_operational_startup_order_and_mcp_bundle_publication(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1006,6 +1090,7 @@ async def test_operational_startup_order_and_mcp_bundle_publication(
         "panel:start",
         "indexer:start",
         "bridges:connect",
+        "mcp:policy-store",
         "mcp:construct",
         "mcp:start",
         "bundle:mcp",
@@ -1014,6 +1099,8 @@ async def test_operational_startup_order_and_mcp_bundle_publication(
     positions = [control.events.index(name) for name in ordered]
     assert positions == sorted(positions)
     assert app["mcp_manager"] is control.mcp_manager
+    assert control.mcp_policy_store is not None
+    assert control.mcp_manager is not None
     assert control.bundle.installed_tools == ["mcp-tool"]
     assert app["activity_panel"] is control.panel
 
