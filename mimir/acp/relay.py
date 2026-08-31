@@ -70,5 +70,13 @@ async def run_relay(home: Path | str, output: BinaryIO) -> None:
     except BaseException:
         await close_writer(upstream_writer)
         raise
-    try: await pump_bidirectional(reader, writer, upstream_reader, upstream_writer)
+    try:
+        # SSH teardown closes both pipes; stdin EOF alone may be a clean half-close.
+        await pump_bidirectional(
+            reader,
+            writer,
+            upstream_reader,
+            upstream_writer,
+            close_on_left_exit=writer.is_closing,
+        )
     finally: transport.close()
