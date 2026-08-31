@@ -1580,30 +1580,46 @@ def build_app(config: Config) -> web.Application:
         # logged + skipped — the agent still boots with native tools.
         # Lifecycle owner stored on app so _on_cleanup can shut it down.
         startup_state.phase = "mcp_start"
-        from .mcp_client import MCPManager, MCPPolicyStore
-
         try:
-            stored_mcp_configs = MCPPolicyStore(
-                config.home / "state" / "mcp-policy.json"
-            ).load_server_configs()
-        except ValueError as exc:
-            log.warning("UI-managed MCP configuration ignored: %s", exc)
-            stored_mcp_configs = []
-        mcp_configs = [*config.mcp_servers, *stored_mcp_configs]
-        if mcp_configs:
-            startup_state.mcp_start_attempted = True
-            mcp_manager = MCPManager(
-                policy_store_path=config.home / "state" / "mcp-policy.json"
-            )
-            startup_state.mcp_manager = mcp_manager
-            mcp_manager, mcp_tools = await _start_mcp_servers(
-                mcp_manager,
-                mcp_configs,
-                home=config.home,
-            )
-            startup_state.mcp_manager = mcp_manager
-            app["mcp_manager"] = mcp_manager
-            bundle.install_mcp_tools(mcp_tools)
+            from .mcp_client import MCPManager, MCPPolicyStore
+        except ModuleNotFoundError as exc:
+            if exc.name != "mcp":
+                raise
+            if config.mcp_servers:
+                log.warning(
+                    "Optional extra `mcp` is not installed; skipping %d configured "
+                    "MCP server(s) and disabling MCP bridging. Install "
+                    "`mimir-agent[mcp]` to enable it.",
+                    len(config.mcp_servers),
+                )
+            else:
+                log.warning(
+                    "Optional extra `mcp` is not installed; MCP bridging is disabled. "
+                    "Install `mimir-agent[mcp]` to enable it."
+                )
+        else:
+            try:
+                stored_mcp_configs = MCPPolicyStore(
+                    config.home / "state" / "mcp-policy.json"
+                ).load_server_configs()
+            except ValueError as exc:
+                log.warning("UI-managed MCP configuration ignored: %s", exc)
+                stored_mcp_configs = []
+            mcp_configs = [*config.mcp_servers, *stored_mcp_configs]
+            if mcp_configs:
+                startup_state.mcp_start_attempted = True
+                mcp_manager = MCPManager(
+                    policy_store_path=config.home / "state" / "mcp-policy.json"
+                )
+                startup_state.mcp_manager = mcp_manager
+                mcp_manager, mcp_tools = await _start_mcp_servers(
+                    mcp_manager,
+                    mcp_configs,
+                    home=config.home,
+                )
+                startup_state.mcp_manager = mcp_manager
+                app["mcp_manager"] = mcp_manager
+                bundle.install_mcp_tools(mcp_tools)
 
         startup_state.phase = "scheduler_registration"
         # Register SAGA weekly consolidation. Bad cron logs and continues.
