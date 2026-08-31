@@ -221,7 +221,8 @@ async def test_actual_subprocess_cancellation_terminates_child(monkeypatch: pyte
     ssh = _fake_ssh(tmp_path, """
 import os,signal,sys,time
 def stop(*args):
- open(os.environ['MARKER'],'w').write('terminated'); raise SystemExit(0)
+ with open(os.environ['MARKER'],'w') as stream: stream.write('terminated')
+ raise SystemExit(0)
 signal.signal(signal.SIGTERM,stop)
 for line in sys.stdin.buffer: time.sleep(10)
 """)
@@ -245,7 +246,8 @@ async def test_stubborn_child_is_killed_and_reaped(monkeypatch: pytest.MonkeyPat
     ssh = _fake_ssh(tmp_path, """
 import json,os,signal,sys,time
 def ignore(*args):
- data=json.load(open(os.environ['MARKER'])); data['terminated']=True
+ with open(os.environ['MARKER']) as stream: data=json.load(stream)
+ data['terminated']=True
  with open(os.environ['MARKER'],'w') as stream: json.dump(data,stream)
 signal.signal(signal.SIGTERM,ignore)
 with open(os.environ['MARKER'],'w') as stream: json.dump({'pid':os.getpid(),'terminated':False},stream)
@@ -284,7 +286,7 @@ async def test_unread_stdout_backpressure_cleanup_reaps_child(monkeypatch: pytes
     marker = tmp_path / "pid"
     ssh = _fake_ssh(tmp_path, """
 import os,sys
-open(os.environ['MARKER'],'w').write(str(os.getpid()))
+with open(os.environ['MARKER'],'w') as stream: stream.write(str(os.getpid()))
 chunk=b'x' * 65536
 while True:
  sys.stdout.buffer.write(chunk); sys.stdout.buffer.flush()
@@ -305,10 +307,14 @@ while True:
         profile, "secret", output, _ssh_path=ssh,
         _environment={"PATH": os.environ.get("PATH", ""), "MARKER": str(marker)},
     ))
+    pid = None
     for _ in range(200):
-        if marker.exists(): break
-        await asyncio.sleep(0.01)
-    pid = int(marker.read_text())
+        try:
+            pid = int(marker.read_text())
+            break
+        except (OSError, ValueError):
+            await asyncio.sleep(0.01)
+    assert pid is not None
     await asyncio.sleep(0.05)
     assert not task.done()
     task.cancel()
