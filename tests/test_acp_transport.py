@@ -1,0 +1,340 @@
+from __future__ import annotations
+
+import asyncio
+import json
+
+import pytest
+
+from mimir.acp.sdk import AcpProtocolError, MAX_CONSECUTIVE_PARSE_ERRORS, StrictNdjsonTransport
+from mimir.acp.transport import close_writer, pump_bidirectional, pump_stream
+
+
+class Writer:
+    def __init__(self) -> None:
+        self.data = bytearray()
+        self.eof = False
+        self.closed = False
+        self.transport = self
+
+    def write(self, data: bytes) -> None:
+        self.data.extend(data)
+
+    async def drain(self) -> None:
+        await asyncio.sleep(0)
+
+    def write_eof(self) -> None:
+        self.eof = True
+
+    def close(self) -> None:
+        self.closed = True
+
+    async def wait_closed(self) -> None:
+        pass
+
+    def abort(self) -> None:
+        self.closed = True
+
+
+@pytest.mark.asyncio
+async def test_parse_error_response_preserves_connection_for_next_request() -> None:
+    reader = asyncio.StreamReader()
+    reader.feed_data(
+        b'this is not json\n'
+        b'{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}\n'
+    )
+    writer = Writer()
+    transport = StrictNdjsonTransport(reader, writer)
+
+    message = await transport.receive()
+
+    assert message == {
+        "jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {},
+    }
+    assert json.loads(writer.data) == {
+        "jsonrpc": "2.0",
+        "id": None,
+        "error": {"code": -32700, "message": "Parse error"},
+    }
+
+
+@pytest.mark.asyncio
+async def test_repeated_parse_errors_hit_connection_limit() -> None:
+    reader = asyncio.StreamReader()
+    reader.feed_data(b"garbage\n" * MAX_CONSECUTIVE_PARSE_ERRORS)
+    reader.feed_eof()
+    writer = Writer()
+    transport = StrictNdjsonTransport(reader, writer)
+
+    with pytest.raises(AcpProtocolError, match="Too many malformed"):
+        await transport.receive()
+
+    assert len(writer.data.splitlines()) == MAX_CONSECUTIVE_PARSE_ERRORS
+
+
+@pytest.mark.asyncio
+async def test_pump_stream_copies_bytes_and_half_closes() -> None:
+    reader = asyncio.StreamReader()
+    reader.feed_data(b"raw\x00bytes")
+    reader.feed_eof()
+    writer = Writer()
+    await pump_stream(reader, writer)
+    assert bytes(writer.data) == b"raw\x00bytes"
+    assert writer.eof is True
+
+
+@pytest.mark.asyncio
+async def test_bidirectional_pump_awaits_both_directions() -> None:
+    left = asyncio.StreamReader()
+    right = asyncio.StreamReader()
+    left.feed_data(b"left")
+    left.feed_eof()
+    right.feed_data(b"right")
+    right.feed_eof()
+    left_writer = Writer()
+    right_writer = Writer()
+    await pump_bidirectional(left, left_writer, right, right_writer)
+    assert bytes(right_writer.data) == b"left"
+    assert bytes(left_writer.data) == b"right"
+    assert left_writer.closed and right_writer.closed
+
+
+class StagedWriter(Writer):
+    def __init__(
+        self,
+        *,
+        drain_gate: asyncio.Event | None = None,
+        close_gate: asyncio.Event | None = None,
+    ) -> None:
+        super().__init__()
+        self.drain_gate = drain_gate
+        self.close_gate = close_gate
+        self.aborted = False
+        self.drain_calls = 0
+        self.wait_calls = 0
+
+    async def drain(self) -> None:
+        self.drain_calls += 1
+        if self.drain_gate is not None:
+            await self.drain_gate.wait()
+
+    async def wait_closed(self) -> None:
+        self.wait_calls += 1
+        if self.close_gate is not None:
+            await self.close_gate.wait()
+
+    def abort(self) -> None:
+        self.aborted = True
+        self.closed = True
+
+
+@pytest.mark.asyncio
+async def test_close_writer_drain_timeout_escalates_to_close(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("mimir.acp.transport.WRITER_DRAIN_TIMEOUT", 0.01)
+    writer = StagedWriter(drain_gate=asyncio.Event())
+    await close_writer(writer)
+    assert writer.closed
+    assert not writer.aborted
+    assert writer.drain_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_close_writer_close_timeout_escalates_to_abort(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("mimir.acp.transport.WRITER_CLOSE_TIMEOUT", 0.01)
+    monkeypatch.setattr("mimir.acp.transport.WRITER_ABORT_TIMEOUT", 0.01)
+    writer = StagedWriter(close_gate=asyncio.Event())
+    await asyncio.wait_for(close_writer(writer), 0.1)
+    assert writer.closed
+    assert writer.aborted
+    assert writer.wait_calls == 2
+
+
+@pytest.mark.asyncio
+async def test_pump_allows_slow_reader_until_peer_eof(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("mimir.acp.transport.WRITER_DRAIN_TIMEOUT", 0.01)
+    gate = asyncio.Event()
+    left = asyncio.StreamReader()
+    right = asyncio.StreamReader()
+    left.feed_data(b"blocked")
+    left_writer = Writer()
+    right_writer = StagedWriter(drain_gate=gate)
+    pumping = asyncio.create_task(
+        pump_bidirectional(left, left_writer, right, right_writer)
+    )
+    await asyncio.sleep(0.03)
+    assert not pumping.done()
+    gate.set()
+    left.feed_eof()
+    right.feed_eof()
+    await pumping
+    assert left_writer.closed
+    assert right_writer.closed
+
+
+@pytest.mark.asyncio
+async def test_peer_eof_cancels_blocked_opposite_pump(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("mimir.acp.transport.WRITER_DRAIN_TIMEOUT", 0.01)
+    monkeypatch.setattr("mimir.acp.transport.PEER_EOF_GRACE_TIMEOUT", 0.01)
+    left = asyncio.StreamReader()
+    right = asyncio.StreamReader()
+    left.feed_data(b"blocked")
+    right.feed_eof()
+    left_writer = Writer()
+    right_writer = StagedWriter(drain_gate=asyncio.Event())
+    await asyncio.wait_for(
+        pump_bidirectional(left, left_writer, right, right_writer), 0.1
+    )
+    assert left_writer.closed and right_writer.closed
+
+
+@pytest.mark.asyncio
+async def test_force_close_deadline_bounds_writer_cleanup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("mimir.acp.transport.FORCE_CLOSE_TIMEOUT", 0.01)
+    monkeypatch.setattr("mimir.acp.transport.WRITER_DRAIN_TIMEOUT", 10.0)
+    left = asyncio.StreamReader()
+    right = asyncio.StreamReader()
+    left.feed_eof()
+    right.feed_eof()
+    class BlocksOnCloseDrain(StagedWriter):
+        async def drain(self) -> None:
+            self.drain_calls += 1
+            if self.drain_calls > 1:
+                await asyncio.Event().wait()
+
+    left_writer = BlocksOnCloseDrain()
+    right_writer = BlocksOnCloseDrain()
+    await asyncio.wait_for(
+        pump_bidirectional(left, left_writer, right, right_writer), 0.1
+    )
+
+
+async def _release_after(event: asyncio.Event, delay: float) -> None:
+    await asyncio.sleep(delay)
+    event.set()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("release_delay,before", [(0.005, True), (None, False)])
+async def test_drain_deadline_before_and_after_witnesses(
+    release_delay: float | None,
+    before: bool,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Witness a drain that beat its deadline, and one that did not.
+
+    The "did not" case releases nothing rather than releasing late. It used to
+    schedule the gate for 0.03 against a 0.02 deadline -- a 10ms margin -- and
+    asserted the gate was still unset afterwards. On a loaded runner
+    ``close_writer`` can itself take longer than 30ms, the release lands first,
+    and the witness inverts: it failed twice on macOS 3.11 while the 3.12 leg
+    passed the same commits. Scheduling no release makes the assertion
+    deterministic without a long wait, and still witnesses exactly what the case
+    is about -- the deadline expiring with the drain incomplete.
+    """
+    monkeypatch.setattr("mimir.acp.transport.WRITER_DRAIN_TIMEOUT", 0.02)
+    gate = asyncio.Event()
+    writer = StagedWriter(drain_gate=gate)
+    release = (
+        asyncio.create_task(_release_after(gate, release_delay))
+        if release_delay is not None
+        else None
+    )
+    await close_writer(writer)
+    assert writer.closed
+    assert writer.aborted is False
+    assert gate.is_set() is before
+    if release is not None:
+        await release
+    else:
+        gate.set()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("release_delay,before", [(0.005, True), (0.03, False)])
+async def test_close_deadline_before_and_after_witnesses(
+    release_delay: float,
+    before: bool,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("mimir.acp.transport.WRITER_CLOSE_TIMEOUT", 0.02)
+    monkeypatch.setattr("mimir.acp.transport.WRITER_ABORT_TIMEOUT", 0.05)
+    gate = asyncio.Event()
+    writer = StagedWriter(close_gate=gate)
+    release = asyncio.create_task(_release_after(gate, release_delay))
+    await close_writer(writer)
+    assert writer.aborted is not before
+    assert writer.wait_calls == (1 if before else 2)
+    await release
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("release_delay,before", [(0.02, True), (None, False)])
+async def test_abort_wait_deadline_before_and_after_witnesses(
+    release_delay: float | None,
+    before: bool,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("mimir.acp.transport.WRITER_CLOSE_TIMEOUT", 0.01)
+    monkeypatch.setattr("mimir.acp.transport.WRITER_ABORT_TIMEOUT", 0.03)
+    gate = asyncio.Event()
+    writer = StagedWriter(close_gate=gate)
+    release = (
+        asyncio.create_task(_release_after(gate, release_delay))
+        if release_delay is not None
+        else None
+    )
+    await close_writer(writer)
+    assert writer.aborted
+    assert gate.is_set() is before
+    assert writer.wait_calls == 2
+    if release is not None:
+        await release
+    else:
+        gate.set()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("release_delay,before", [(0.005, True), (None, False)])
+async def test_force_close_deadline_before_and_after_witnesses(
+    release_delay: float | None,
+    before: bool,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("mimir.acp.transport.FORCE_CLOSE_TIMEOUT", 0.02)
+    monkeypatch.setattr("mimir.acp.transport.WRITER_DRAIN_TIMEOUT", 1.0)
+
+    class ClosingGateWriter(StagedWriter):
+        async def drain(self) -> None:
+            self.drain_calls += 1
+            if self.drain_calls > 1:
+                await gate.wait()
+
+    gate = asyncio.Event()
+    left = asyncio.StreamReader()
+    right = asyncio.StreamReader()
+    left.feed_eof()
+    right.feed_eof()
+    left_writer = ClosingGateWriter()
+    right_writer = ClosingGateWriter()
+    release = (
+        asyncio.create_task(_release_after(gate, release_delay))
+        if release_delay is not None
+        else None
+    )
+    await pump_bidirectional(left, left_writer, right, right_writer)
+    assert gate.is_set() is before
+    if before:
+        assert left_writer.closed and right_writer.closed
+    if release is not None:
+        await release
+    else:
+        gate.set()

@@ -15,13 +15,14 @@ import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, TextIO
+from typing import Any, Final, TextIO
 
 from ._jsonl_tail import _tail_lines, count_lines_chunked
 from .redaction import redact_payload
 
 log = logging.getLogger(__name__)
 
+FEEDBACK_EVENT_VERSION: Final[str] = "v1"
 PROCESS_LOCK_TIMEOUT_SECONDS = 1.0
 PROCESS_LOCK_POLL_SECONDS = 0.01
 

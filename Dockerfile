@@ -154,7 +154,7 @@ ENV PATH="$VIRTUAL_ENV/bin:$PATH"
 # Available extras (see pyproject.toml):
 #   anthropic, claude-code, openai, codex-plus  (model providers)
 #   discord, slack                              (bridges)
-#   mcp                                         (Model Context Protocol)
+#   mcp, acp                                    (Model Context Protocol)
 #
 ARG MIMIR_EXTRAS="anthropic,discord,slack,mcp"
 RUN pip install --no-cache-dir --upgrade pip \

@@ -17,7 +17,7 @@ import json
 import sys
 
 from mimir.config import Config
-from mimir.models import AuthContext, TurnInteractivity
+from mimir.access_control import create_local_operator_auth_context
 from mimir.saga_client import make_saga_client
 
 
@@ -53,14 +53,10 @@ def add_argparse(p: argparse.ArgumentParser) -> None:
 async def run(args: argparse.Namespace) -> int:
     cfg = Config.from_env()
     client = make_saga_client(db_path=cfg.home / ".mimir" / "saga.db")
-    auth_context = AuthContext(
+    auth_context = create_local_operator_auth_context(
         principal="operator",
-        canonical_principal="operator",
-        roles=("admin",),
-        event_ingress=None,
         trigger="reflection_cli",
         channel_id=None,
-        interactivity=TurnInteractivity.NON_INTERACTIVE,
     )
     try:
         atoms = await client.most_retrieved_atoms(

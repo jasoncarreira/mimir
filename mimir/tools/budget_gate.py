@@ -36,6 +36,8 @@ that need uncapped exploration).
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
+import inspect
 import json
 import logging
 import os
@@ -54,9 +56,11 @@ from langchain_core.tools import ToolException
 from langgraph.types import Command
 
 from ..models import AuthContext
+from ..redaction import redact_text
 from .refusals import ToolPolicyRefusal
 from ..worklink.continuation import HTTP_EVENT_INGRESS_EXTRA_VALUE
 from ..access_control import (
+    AccessTier,
     OperationDecision,
     OPERATOR_SHELL_PROFILE,
     OperatorShellBinding,
@@ -85,6 +89,12 @@ from ..access_control import (
     _validated_operator_shell_argv_artifact,
     service_filesystem_read_roots,
     service_shell_argv_for_log,
+)
+from .client_provider import (
+    MIMIR_HANDS_V1,
+    PermissionDecision,
+    PermissionEligibility,
+    get_turn_capability_context,
 )
 from .prohibited_action_guard import check_prohibited_bash, is_bash_tool
 from .web_search_destination import web_search_url
@@ -1648,7 +1658,7 @@ def _result_labels_for_call(
     auth_context: AuthContext | None,
     authorization: ToolAuthorization,
     *,
-    result: ToolMessage | Command | None = None,
+    result: Any = None,
     provenance: Any = None,
     policy_refusal: ToolPolicyRefusal | None = None,
     failed: bool = False,
@@ -1706,7 +1716,11 @@ def _is_admin_sensitive_tool(
 
 
 def _admin_denial_message(
-    tool_name: str, reason: str | None, detail: str | None = None,
+    tool_name: str,
+    reason: str | None,
+    detail: str | None = None,
+    *,
+    principal_is_admin: bool = False,
 ) -> str:
     # A shell-profile refusal is a command-shape problem, not a privilege
     # problem: no identity can run the command as written. Leading with
@@ -1719,6 +1733,8 @@ def _admin_denial_message(
     reason_text = f" ({reason})" if reason else ""
     if detail:
         return f"{tool_name} was refused before execution{reason_text}: {detail}"
+    if principal_is_admin and reason == "client_file_scope_denied":
+        return f"{tool_name} was refused before execution{reason_text}."
     return (
         f"{tool_name} requires an admin identity{reason_text}. "
         "The tool call was refused before execution."
@@ -1790,7 +1806,9 @@ def _deny_admin_tool(
         )
     # ``reason`` stays the machine key on both events; the prose detail is for
     # the caller's tool result only, so the audit stream keeps grouping cleanly.
-    return _admin_denial_message(tool_name, reason, detail)
+    return _admin_denial_message(
+        tool_name, reason, detail, principal_is_admin="admin" in roles,
+    )
 
 
 def _check_admin_authorized(
@@ -2140,6 +2158,409 @@ def _check_prohibited(tool_name: str, request: "ToolCallRequest") -> str | None:
     return check_prohibited_bash(command)
 
 
+_ACP_DELIVERY_INSTRUCTION = (
+    "Return the final answer through the ACP prompt response/update bridge; "
+    "send_message is unavailable on ACP turns."
+)
+_ACP_SEND_MESSAGE_REFUSAL = (
+    "send_message is unavailable on ACP turns; use the ACP bridge"
+)
+_PERMISSION_TIMEOUT_SECONDS = 30.0
+_PERMISSION_REASON_KEY_RE = re.compile(r"[A-Za-z0-9_.:-]{1,200}\Z")
+
+
+def _tool_surface_name(tool: Any) -> str | None:
+    if isinstance(tool, dict):
+        name = tool.get("name")
+        if not isinstance(name, str):
+            function = tool.get("function")
+            name = function.get("name") if isinstance(function, dict) else None
+        return name if isinstance(name, str) else None
+    name = getattr(tool, "name", None)
+    return name if isinstance(name, str) else None
+
+
+def _request_for_acp_model(request: Any) -> Any:
+    context = get_turn_capability_context()
+    if context is None or context.acp_delivery is not True:
+        return request
+    excluded = {"send_message"}
+    if context.profile_policy is not MIMIR_HANDS_V1:
+        excluded.update({"hands_read", "hands_edit", "hands_shell"})
+    tools = [
+        tool for tool in (getattr(request, "tools", None) or [])
+        if _tool_surface_name(tool) not in excluded
+    ]
+    system_message = getattr(request, "system_message", None)
+    if system_message is None:
+        from langchain_core.messages import SystemMessage
+
+        system_message = SystemMessage(content=_ACP_DELIVERY_INSTRUCTION)
+    else:
+        content = getattr(system_message, "content", "")
+        if isinstance(content, str):
+            content = f"{content}\n\n{_ACP_DELIVERY_INSTRUCTION}" if content else _ACP_DELIVERY_INSTRUCTION
+        elif isinstance(content, list):
+            content = [*content, {"type": "text", "text": _ACP_DELIVERY_INSTRUCTION}]
+        else:
+            from langchain_core.messages import SystemMessage
+
+            system_message = SystemMessage(content=_ACP_DELIVERY_INSTRUCTION)
+            content = None
+        if content is not None:
+            system_message = system_message.model_copy(update={"content": content})
+    return request.override(tools=tools, system_message=system_message)
+
+
+def _malformed_arguments_refusal(
+    request: ToolCallRequest, tool_name: str,
+) -> ToolMessage:
+    message = f"{tool_name} arguments are malformed"
+    _emit_tool_call_sync(tool_name, ok=False, error=message, denied=True)
+    return ToolMessage(
+        content=message,
+        tool_call_id=_tool_call_id(request),
+        name=tool_name,
+        status="error",
+    )
+
+
+def _acp_send_message_refusal(
+    request: ToolCallRequest, tool_name: str,
+) -> ToolMessage | None:
+    context = get_turn_capability_context()
+    if (
+        tool_name != "send_message"
+        or context is None
+        or context.acp_delivery is not True
+    ):
+        return None
+    _emit_tool_call_sync(
+        tool_name, ok=False, error=_ACP_SEND_MESSAGE_REFUSAL, denied=True,
+        arguments=_validated_arguments(request),
+    )
+    return ToolMessage(
+        content=_ACP_SEND_MESSAGE_REFUSAL,
+        tool_call_id=_tool_call_id(request),
+        name=tool_name,
+        status="error",
+    )
+
+
+def _permission_eligibility(
+    request: ToolCallRequest,
+    tool_name: str,
+    authorization: ToolAuthorization,
+    arguments: dict[str, Any] | None,
+) -> tuple[Any, PermissionEligibility, tuple[Any, ...]] | None:
+    context = get_turn_capability_context()
+    if context is None:
+        return None
+    requires_admin = (
+        authorization.required_tier is AccessTier.ADMIN
+        or tool_name in {"hands_edit", "hands_shell"}
+    )
+    if not requires_admin:
+        return None
+    lease = context.lease
+    checks = (
+        ("authorization verdict", (
+            ("enforcement_enabled", authorization.enforcement_enabled is True),
+            ("allowed", authorization.allowed is True),
+            ("is_shadow_decision", authorization.is_shadow_decision is False),
+            ("would_block", authorization.would_block is False),
+            ("decision", authorization.decision is OperationDecision.ADMIN_REQUIRED),
+            ("required_tier", authorization.required_tier is AccessTier.ADMIN),
+        )),
+        ("capability-context wiring", (
+            ("acp_delivery", context.acp_delivery is True),
+            ("profile_policy", context.profile_policy is MIMIR_HANDS_V1),
+            ("provider_present", context.provider is not None),
+            ("provider_open", getattr(context.provider, "closed", False) is False),
+            ("permission_broker_present", context.permission_broker is not None),
+            ("request_permission_callable", callable(
+                getattr(context.permission_broker, "request_permission", None)
+            )),
+        )),
+        ("lease currency", (
+            ("lease_present", lease is not None),
+            ("lease_open", getattr(lease, "closed", True) is False),
+            ("lease_generation", getattr(lease, "generation", None) == context.connection_generation),
+            ("lease_epoch", getattr(lease, "epoch", None) == context.prompt_epoch),
+        )),
+        ("argument shape", (
+            ("arguments_dict", isinstance(arguments, dict)),
+        )),
+    )
+    failures = [
+        f"{group} failed ({', '.join(name for name, passed in group_checks if not passed)})"
+        for group, group_checks in checks
+        if not all(passed for _, passed in group_checks)
+    ]
+    if failures:
+        if any(group == "authorization verdict" and not all(
+            passed for _, passed in group_checks
+        ) for group, group_checks in checks):
+            failures.append(_permission_authorization_diagnostic(authorization))
+        raise ToolException(
+            f"{tool_name} permission eligibility refused: {'; '.join(failures)}"
+        )
+    provider = context.provider
+    peer = getattr(provider, "peer", None)
+    transport = getattr(peer, "transport", None) if peer is not None else None
+    snapshot = (
+        context,
+        context.profile_policy,
+        provider,
+        context.permission_broker,
+        lease,
+        context.connection_generation,
+        context.prompt_epoch,
+        peer,
+        transport,
+    )
+    if not _permission_context_is_current(snapshot):
+        raise ToolException(_permission_snapshot_refusal(tool_name))
+    return context.permission_broker, PermissionEligibility(
+        tool_call_id=_tool_call_id(request),
+        title=tool_name,
+        kind="other",
+        arguments=arguments,
+    ), snapshot
+
+
+def _permission_authorization_diagnostic(authorization: ToolAuthorization) -> str:
+    decision = authorization.decision
+    decision_value = decision.value if isinstance(decision, OperationDecision) else "[INVALID]"
+    reason = authorization.reason
+    if reason is None:
+        reason_value = "none"
+    elif isinstance(reason, str):
+        reason_value = redact_text(reason)
+        if not _PERMISSION_REASON_KEY_RE.fullmatch(reason_value):
+            reason_value = "[REDACTED]"
+    else:
+        reason_value = "[INVALID]"
+
+    def verdict(value: Any) -> str:
+        return str(value).lower() if isinstance(value, bool) else "[INVALID]"
+
+    return (
+        "authorization "
+        f"decision={decision_value} reason={reason_value} "
+        f"allowed={verdict(authorization.allowed)} "
+        f"would_block={verdict(authorization.would_block)}"
+    )
+
+
+def _permission_snapshot_refusal(tool_name: str) -> str:
+    return f"{tool_name} permission context snapshot was stale"
+
+
+def _permission_context_is_current(snapshot: tuple[Any, ...]) -> bool:
+    context, profile, provider, broker, lease, generation, epoch, peer, transport = snapshot
+    current = get_turn_capability_context()
+    current_peer = getattr(provider, "peer", None)
+    current_transport = getattr(current_peer, "transport", None) if current_peer is not None else None
+    if (
+        current is not context
+        or current.profile_policy is not profile
+        or current.provider is not provider
+        or current.permission_broker is not broker
+        or current.lease is not lease
+        or current.connection_generation != generation
+        or current.prompt_epoch != epoch
+        or current.acp_delivery is not True
+        or getattr(lease, "closed", True) is not False
+        or getattr(lease, "generation", None) != generation
+        or getattr(lease, "epoch", None) != epoch
+        or getattr(provider, "closed", False) is not False
+        or current_peer is not peer
+        or current_transport is not transport
+    ):
+        return False
+    for candidate in (peer, transport):
+        if candidate is not None and getattr(candidate, "closed", False) is not False:
+            return False
+        is_closing = getattr(candidate, "is_closing", None)
+        if callable(is_closing):
+            try:
+                if is_closing():
+                    return False
+            except Exception:
+                return False
+    is_current = getattr(broker, "_is_current", None)
+    if callable(is_current):
+        try:
+            if not is_current():
+                return False
+        except Exception:
+            return False
+    return True
+
+
+def _discard_permission_awaitable(awaitable: Any) -> None:
+    if isinstance(awaitable, asyncio.Future):
+        if awaitable.done():
+            return
+        loop = awaitable.get_loop()
+        try:
+            running_loop = asyncio.get_running_loop()
+        except RuntimeError:
+            running_loop = None
+        if running_loop is loop:
+            awaitable.cancel()
+        elif loop.is_running() and not loop.is_closed():
+            loop.call_soon_threadsafe(awaitable.cancel)
+        elif not loop.is_closed():
+            awaitable.cancel()
+        return
+    close = getattr(awaitable, "close", None)
+    if callable(close):
+        close()
+    cancel = getattr(awaitable, "cancel", None)
+    if callable(cancel):
+        cancel()
+
+
+def _permission_denial_message(tool_name: str) -> str:
+    return f"{tool_name} permission was rejected by the operator before execution"
+
+
+def _permission_failure_message(tool_name: str, failure: str) -> str:
+    return f"{tool_name} permission request {failure}; execution denied"
+
+
+def _permission_not_requested_message(tool_name: str) -> str:
+    return f"{tool_name} permission request never reached an operator; execution denied"
+
+
+def _owner_loop_for_permission_broker(broker: Any) -> asyncio.AbstractEventLoop | None:
+    loop = getattr(broker, "permission_owner_loop", None)
+    if (
+        isinstance(loop, asyncio.AbstractEventLoop)
+        and loop.is_running()
+        and not loop.is_closed()
+    ):
+        return loop
+    for attribute in ("prompt_handler", "model_task", "exact_event_forwarder"):
+        task = getattr(broker, attribute, None)
+        if isinstance(task, asyncio.Task) and not task.done():
+            loop = task.get_loop()
+            if loop.is_running() and not loop.is_closed():
+                return loop
+    return None
+
+
+def _request_permission_sync(
+    request: ToolCallRequest,
+    tool_name: str,
+    authorization: ToolAuthorization,
+    arguments: dict[str, Any] | None,
+) -> str | None:
+    try:
+        eligible = _permission_eligibility(request, tool_name, authorization, arguments)
+    except ToolException as exc:
+        return str(exc)
+    if eligible is None:
+        return None
+    broker, eligibility, snapshot = eligible
+    loop = _owner_loop_for_permission_broker(broker)
+    if loop is None:
+        return _permission_failure_message(tool_name, "has no live owner loop")
+    try:
+        if asyncio.get_running_loop() is loop:
+            return _permission_failure_message(tool_name, "would block its owner loop")
+    except RuntimeError:
+        pass
+    coroutine: Any = None
+    future: Any = None
+    try:
+        coroutine = broker.request_permission(eligibility)
+        if not inspect.iscoroutine(coroutine):
+            return _permission_failure_message(tool_name, "returned a non-coroutine")
+        future = asyncio.run_coroutine_threadsafe(coroutine, loop)
+        decision = future.result(timeout=_PERMISSION_TIMEOUT_SECONDS)
+        if decision is PermissionDecision.ALLOW_ONCE:
+            if _permission_context_is_current(snapshot):
+                return None
+            return _permission_snapshot_refusal(tool_name)
+        if decision is PermissionDecision.REJECT_ONCE:
+            return _permission_denial_message(tool_name)
+        if decision is PermissionDecision.NOT_REQUESTED:
+            return _permission_not_requested_message(tool_name)
+        if decision is PermissionDecision.CANCELLED:
+            return _permission_failure_message(tool_name, "was cancelled")
+        return _permission_failure_message(tool_name, "returned an invalid decision")
+    except concurrent.futures.TimeoutError:
+        return _permission_failure_message(tool_name, "timed out")
+    except (Exception, asyncio.CancelledError):
+        return _permission_failure_message(tool_name, "failed")
+    finally:
+        if future is None:
+            _discard_permission_awaitable(coroutine)
+        else:
+            future.cancel()
+        coroutine = None
+
+
+async def _request_permission_async(
+    request: ToolCallRequest,
+    tool_name: str,
+    authorization: ToolAuthorization,
+    arguments: dict[str, Any] | None,
+) -> str | None:
+    try:
+        eligible = _permission_eligibility(request, tool_name, authorization, arguments)
+    except ToolException as exc:
+        return str(exc)
+    if eligible is None:
+        return None
+    broker, eligibility, snapshot = eligible
+    awaitable: Any = None
+    task: asyncio.Task[Any] | None = None
+    propagate_cancellation = False
+    try:
+        awaitable = broker.request_permission(eligibility)
+        if not inspect.iscoroutine(awaitable):
+            return _permission_failure_message(tool_name, "returned a non-coroutine")
+        task = asyncio.create_task(awaitable)
+        decision = await asyncio.wait_for(task, timeout=_PERMISSION_TIMEOUT_SECONDS)
+        if decision is PermissionDecision.ALLOW_ONCE:
+            if _permission_context_is_current(snapshot):
+                return None
+            return _permission_snapshot_refusal(tool_name)
+        if decision is PermissionDecision.REJECT_ONCE:
+            return _permission_denial_message(tool_name)
+        if decision is PermissionDecision.NOT_REQUESTED:
+            return _permission_not_requested_message(tool_name)
+        if decision is PermissionDecision.CANCELLED:
+            return _permission_failure_message(tool_name, "was cancelled")
+        return _permission_failure_message(tool_name, "returned an invalid decision")
+    except asyncio.CancelledError:
+        current = asyncio.current_task()
+        propagate_cancellation = current is not None and current.cancelling() > 0
+        if not propagate_cancellation:
+            return _permission_failure_message(tool_name, "was cancelled")
+    except TimeoutError:
+        return _permission_failure_message(tool_name, "timed out")
+    except Exception:
+        return _permission_failure_message(tool_name, "failed")
+    finally:
+        if task is None:
+            _discard_permission_awaitable(awaitable)
+        else:
+            task.cancel()
+            try:
+                await task
+            except (Exception, asyncio.CancelledError):
+                pass
+        awaitable = None
+    if propagate_cancellation:
+        raise asyncio.CancelledError
+    return _permission_failure_message(tool_name, "was cancelled")
+
+
 class BudgetGateMiddleware(AgentMiddleware):
     """Intercept model and tool calls at their exact LangGraph boundaries.
 
@@ -2159,6 +2580,7 @@ class BudgetGateMiddleware(AgentMiddleware):
         Authorization decisions do not consult this observational inventory, so
         replacing the snapshot cannot widen or narrow the current call's access.
         """
+        request = _request_for_acp_model(request)
         get_tool_registry().register_runtime_tools(getattr(request, "tools", ()))
         return handler(request)
 
@@ -2168,6 +2590,7 @@ class BudgetGateMiddleware(AgentMiddleware):
         handler: Callable[[Any], Awaitable[Any]],
     ) -> Any:
         """Async counterpart to :meth:`wrap_model_call`."""
+        request = _request_for_acp_model(request)
         get_tool_registry().register_runtime_tools(getattr(request, "tools", ()))
         return await handler(request)
 
@@ -2177,6 +2600,9 @@ class BudgetGateMiddleware(AgentMiddleware):
         handler: Callable[[ToolCallRequest], ToolMessage | Command],
     ) -> ToolMessage | Command:
         tool_name = _tool_name_from_request(request)
+        send_message_refusal = _acp_send_message_refusal(request, tool_name)
+        if send_message_refusal is not None:
+            return send_message_refusal
         auth_context = _auth_context_from_request(request)
         request = _strip_server_only_shell_args(request)
         request = _request_with_resolved_service_write_path(
@@ -2184,6 +2610,11 @@ class BudgetGateMiddleware(AgentMiddleware):
         )
         request = _request_with_resolved_spawn_paths(request, tool_name, auth_context)
         validated_arguments = _validated_arguments(request)
+        raw_arguments = (getattr(request, "tool_call", None) or {}).get("args", {})
+        if validated_arguments is None and (
+            not isinstance(raw_arguments, dict) or tool_name.startswith("hands_")
+        ):
+            return _malformed_arguments_refusal(request, tool_name)
         review_denial = _resolve_standing_review(
             tool_name, auth_context, validated_arguments,
         )
@@ -2495,6 +2926,22 @@ class BudgetGateMiddleware(AgentMiddleware):
             if review_claim is not None and review_claim.duplicate:
                 result = _duplicate_review_result(request, review_claim)
             else:
+                permission_denial = _request_permission_sync(
+                    request, tool_name, authorization, validated_arguments,
+                )
+                if permission_denial is not None:
+                    if review_claim is not None:
+                        review_claim.release()
+                    _emit_tool_call_sync(
+                        tool_name, ok=False, error=permission_denial, denied=True,
+                        arguments=validated_arguments,
+                    )
+                    return ToolMessage(
+                        content=permission_denial,
+                        tool_call_id=_tool_call_id(request),
+                        name=tool_name,
+                        status="error",
+                    )
                 soft_live_refusal = _operator_shell_soft_live_refusal(
                     request,
                     operator_shell_preparation,
@@ -2535,6 +2982,7 @@ class BudgetGateMiddleware(AgentMiddleware):
                     request,
                     auth_context,
                     authorization,
+                    result=exc,
                     provenance=provenance,
                     failed=True,
                 )
@@ -2627,6 +3075,9 @@ class BudgetGateMiddleware(AgentMiddleware):
         handler: Callable[[ToolCallRequest], Awaitable[ToolMessage | Command]],
     ) -> ToolMessage | Command:
         tool_name = _tool_name_from_request(request)
+        send_message_refusal = _acp_send_message_refusal(request, tool_name)
+        if send_message_refusal is not None:
+            return send_message_refusal
         auth_context = _auth_context_from_request(request)
         request = _strip_server_only_shell_args(request)
         request = _request_with_resolved_service_write_path(
@@ -2634,6 +3085,11 @@ class BudgetGateMiddleware(AgentMiddleware):
         )
         request = _request_with_resolved_spawn_paths(request, tool_name, auth_context)
         validated_arguments = _validated_arguments(request)
+        raw_arguments = (getattr(request, "tool_call", None) or {}).get("args", {})
+        if validated_arguments is None and (
+            not isinstance(raw_arguments, dict) or tool_name.startswith("hands_")
+        ):
+            return _malformed_arguments_refusal(request, tool_name)
         review_denial = await asyncio.to_thread(
             _resolve_standing_review, tool_name, auth_context, validated_arguments,
         )
@@ -2949,6 +3405,22 @@ class BudgetGateMiddleware(AgentMiddleware):
             if review_claim is not None and review_claim.duplicate:
                 result = _duplicate_review_result(request, review_claim)
             else:
+                permission_denial = await _request_permission_async(
+                    request, tool_name, authorization, validated_arguments,
+                )
+                if permission_denial is not None:
+                    if review_claim is not None:
+                        review_claim.release()
+                    _emit_tool_call_sync(
+                        tool_name, ok=False, error=permission_denial, denied=True,
+                        arguments=validated_arguments,
+                    )
+                    return ToolMessage(
+                        content=permission_denial,
+                        tool_call_id=_tool_call_id(request),
+                        name=tool_name,
+                        status="error",
+                    )
                 soft_live_refusal = _operator_shell_soft_live_refusal(
                     request,
                     operator_shell_preparation,
@@ -2989,6 +3461,7 @@ class BudgetGateMiddleware(AgentMiddleware):
                     request,
                     auth_context,
                     authorization,
+                    result=exc,
                     provenance=provenance,
                     failed=True,
                 )

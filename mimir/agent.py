@@ -58,6 +58,7 @@ from .channel_registry import (
     post_job_failure_notice,
     resolve_deliver_channel,
 )
+from .channel_audience import ServerChannelAudienceProvider, attest_owner
 from .chat_skills import CHAT_SKILL_EXTRA_KEY, ChatSkillRegistry
 from .config import Config
 from .model_registry import DEFAULT_MODEL_SPEC
@@ -72,7 +73,7 @@ from . import health
 from . import mid_turn_injection
 from . import _deepagents_patches
 from .history import Message, MessageBuffer
-from .harness_egress import harness_sink_allowed
+from .harness_egress import harness_sink_allowed, record_harness_shadow_block
 from .index import IndexGenerator
 from . import _langchain_claude_code_patches as _lcc_patches
 from ._deepagents_summarization import install_offload_traceback_logging_patch
@@ -88,12 +89,15 @@ from .models import (
     Integrity,
     IntegrityEffect,
     PromptBlock,
+    OwnerAttestation,
     SourceLabel,
     ServerDiscoveredPRScopeStore,
     TurnInteractivity,
     TurnRecord,
 )
 from .access_control import (
+    ChannelResourceAdapter,
+    _source_is_triggering_channel_compatible,
     create_auth_context,
     get_event_service_principal,
     get_trusted_service_from_auth_context,
@@ -238,6 +242,7 @@ def _prompt_source_labels(
     authorized_principals: frozenset[str] | None = None,
     source_kind: str = "protected_prompt",
     self_authored: bool,
+    owner_attestation: OwnerAttestation | None = None,
 ) -> InformationFlowLabels:
     """Create one complete, server-authoritative protected prompt source."""
     requester = auth_context.canonical_principal or auth_context.principal
@@ -249,6 +254,8 @@ def _prompt_source_labels(
     acl = authorized_principals
     if acl is None:
         acl = frozenset({effective_requester}) if effective_requester else frozenset()
+    if self_authored and source_kind == "protected_prompt":
+        source_kind = "agent_self"
     return InformationFlowLabels().with_source(prompt_sources.prompt_source_label(
         auth_context,
         principal=owner,
@@ -259,6 +266,7 @@ def _prompt_source_labels(
         authorized_principals=acl,
         source_kind=source_kind,
         self_authored=self_authored,
+        owner_attestation=owner_attestation,
     ))
 
 
@@ -524,6 +532,8 @@ def _create_turn_auth_context(
     policy_version: str | None,
     enforce: bool,
     ifc_labels: InformationFlowLabels,
+    audience_provider: Any = None,
+    cross_platform_pull: bool = True,
     server_discovered_pr_scope_store: ServerDiscoveredPRScopeStore | None = None,
 ) -> AuthContext:
     inherited = _shell_continuation_auth_context(event)
@@ -534,6 +544,8 @@ def _create_turn_auth_context(
             policy_version=policy_version,
             enforce=enforce,
             ifc_labels=ifc_labels,
+            audience_provider=audience_provider,
+            cross_platform_pull=cross_platform_pull,
         )
     else:
         context = replace(
@@ -660,6 +672,29 @@ _PROVIDER_EXTRAS: dict[str, str] = {
     "openai": "openai",
     "codex-plus": "codex-plus",
 }
+
+
+def _is_acp_delivery_turn() -> bool:
+    """True when this turn delivers through the ACP bridge.
+
+    On ACP turns ``send_message`` is removed from the tool surface
+    (``_request_for_acp_model``) and refused if called anyway
+    (``_acp_send_message_refusal``), so harness auto-delivery is not an opt-in
+    recovery for a tool-shy model — it is the only path the reply can take.
+    Read through the same capability context those two sites use, so all three
+    agree on what an ACP turn is.
+
+    Module-level rather than a method: the resend-nudge path is exercised with
+    a SimpleNamespace stub for ``self``, so an attribute lookup there would
+    raise instead of answering the question.
+    """
+    try:
+        from .tools.client_provider import get_turn_capability_context
+
+        context = get_turn_capability_context()
+    except Exception:  # noqa: BLE001 — delivery must not break on import.
+        return False
+    return getattr(context, "acp_delivery", None) is True
 
 
 def _supports_responses_api() -> bool:
@@ -1203,6 +1238,10 @@ class Agent:
         self._turn_logger = turn_logger
         self._buffer = message_buffer
         self._identity_resolver = getattr(message_buffer, "resolver", None)
+        self._audience_provider = ServerChannelAudienceProvider(
+            config.home,
+            identity_resolver=self._identity_resolver,
+        )
         self._indexes = index_generator
         self._indexer = indexer
         self._saga = saga_client
@@ -1275,6 +1314,8 @@ class Agent:
             events_snapshot=self._events_snapshot,
             turns_snapshot=self._turns_snapshot,
             resolved_incidents_path=config.home / "resolved-incidents.jsonl",
+            identity_resolver=self._identity_resolver,
+            cross_platform_pull=config.cross_platform_pull,
         )
         # Plan-window rate-limit state — real RateLimitStore (replaces
         # the deprecated _RateLimitStub). The oauth_usage_poller writes
@@ -1456,7 +1497,7 @@ class Agent:
         ifc_labels: InformationFlowLabels,
     ) -> None:
         """Append an inbound event to the ``MessageBuffer`` so future
-        ``assemble_recent_activity`` calls see it. Skip rules match
+        ``assemble_recent_activity_candidates`` calls see it. Skip rules match
         pre-#181's ``_record_inbound``: drop empty-content events
         and internal-wake triggers (``saga_session_end``,
         ``shell_job_complete``); log everything else.
@@ -1769,9 +1810,17 @@ class Agent:
             self._cached_coding_enabled = coding_enabled
             return self._agent
 
-    async def run_turn(self, event: AgentEvent) -> TurnRecord:
+    async def run_turn(
+        self,
+        event: AgentEvent,
+        *,
+        turn_id: str | None = None,
+        session_id: str | None = None,
+        saga_session_id: str | None = None,
+    ) -> TurnRecord:
         """Run one agent turn — preserves the SDK Agent.run_turn contract."""
-        turn_id = make_turn_id()
+        turn_id = turn_id or make_turn_id()
+        explicit_session_binding = session_id is not None and saga_session_id is not None
         t_total_start = time.monotonic()
         # chainlink #583 slice 1: bracket the whole turn on the live event bus
         # (no-op when unwired). turn_started here pairs with turn_ended in the
@@ -1781,14 +1830,27 @@ class Agent:
             event.attachment_names,
             resolver=getattr(self, "_identity_resolver", None),
         )
-        initial_auth_context = _create_turn_auth_context(
-            event,
-            getattr(self, "_identity_resolver", None),
-            policy_version=getattr(self._config, "policy_version", None),
-            enforce=self._config.access_control_enforced,
-            ifc_labels=initial_ifc_labels,
-            server_discovered_pr_scope_store=self._server_discovered_pr_scope_store,
-        )
+        if explicit_session_binding:
+            bound_auth_context = _require_auth_context(event.continuation_auth_context)
+            if not bound_auth_context.enforcement_enabled:
+                raise ValueError("bound turns require enforced authorization")
+            initial_auth_context = replace(
+                bound_auth_context,
+                ifc_labels=initial_ifc_labels,
+                ifc_state=InformationFlowState(labels=initial_ifc_labels),
+                saga_session_id=saga_session_id,
+            )
+        else:
+            initial_auth_context = _create_turn_auth_context(
+                event,
+                getattr(self, "_identity_resolver", None),
+                policy_version=getattr(self._config, "policy_version", None),
+                enforce=self._config.access_control_enforced,
+                ifc_labels=initial_ifc_labels,
+                audience_provider=self._audience_provider,
+                cross_platform_pull=self._config.cross_platform_pull,
+                server_discovered_pr_scope_store=self._server_discovered_pr_scope_store,
+            )
         emitter = TurnEventEmitter(
             self._turn_event_bus,
             turn_id=turn_id,
@@ -1840,12 +1902,14 @@ class Agent:
                     pass
 
             # Session attach — same as the SDK path.
-            session_id = event.channel_id or "default"
-            saga_session_id: str | None = None
+            session_id = (
+                session_id if explicit_session_binding else event.channel_id or "default"
+            )
+            saga_session_id = saga_session_id if explicit_session_binding else None
             session_egress_state = initial_auth_context.egress_state
-            if event.trigger == "saga_session_end":
+            if not explicit_session_binding and event.trigger == "saga_session_end":
                 saga_session_id = (event.extra or {}).get("saga_session_id")
-            elif self._sessions is not None:
+            elif not explicit_session_binding and self._sessions is not None:
                 channel_visibility = (
                     event.extra.get("channel_visibility", "private")
                     if isinstance(event.extra, Mapping)
@@ -1919,6 +1983,8 @@ class Agent:
                     enforce=self._config.access_control_enforced,
                     event_ingress=event_ingress,
                     ifc_labels=initial_ifc_labels,
+                    audience_provider=self._audience_provider,
+                    cross_platform_pull=self._config.cross_platform_pull,
                 )
             # Update auth_ctx with the actual interactivity classification
             if auth_ctx is not None:
@@ -2028,6 +2094,9 @@ class Agent:
                 t_total_start, emitter, initial_auth_context,
             )
             return _turn_record
+        except asyncio.CancelledError as exc:
+            _turn_exc = exc
+            raise
         except Exception as exc:
             _turn_exc = exc
             # chainlink #306 (+ #415): _run_turn_body's model-loop try/except emits
@@ -2303,7 +2372,13 @@ class Agent:
                 log.debug("hard-stop delivery bookkeeping failed", exc_info=True)
 
     @staticmethod
-    def _harness_sink_allowed(ctx: Any, target: str | None, sink_name: str) -> bool:
+    def _harness_sink_allowed(
+        ctx: Any,
+        target: str | None,
+        sink_name: str,
+        *,
+        on_refusal: Callable[[str], None] | None = None,
+    ) -> bool:
         """Apply IFC to a harness-owned final egress boundary."""
         auth_context = getattr(ctx, "auth_context", None)
         ifc_labels = getattr(ctx, "ifc_labels", None)
@@ -2312,7 +2387,39 @@ class Agent:
             target,
             ifc_labels,
             auth_context,
+            on_refusal=on_refusal,
         )
+
+    @staticmethod
+    def _report_acp_final_text_delivery_failure(reason: str) -> None:
+        """Report a scrubbed ACP delivery refusal without risking the turn."""
+        try:
+            from .tools.client_provider import get_turn_capability_context
+            from .turn_event_redaction import scrub_detail
+
+            raw_reason = str(reason).strip()
+            safe_reason = scrub_detail(raw_reason) or "delivery_refused"
+            safe_phrases = {
+                "ACP bridge is disconnected",
+                "ACP delivery failed",
+                "invalid ACP channel",
+                "rich ACP messages are unsupported",
+                "unbound ACP channel",
+            }
+            if raw_reason not in safe_phrases:
+                # Sink reasons are stable machine tokens. Keep that token but
+                # never forward an appended provider/transport diagnostic.
+                safe_reason = safe_reason.split(maxsplit=1)[0]
+            capability = get_turn_capability_context()
+            reporter = getattr(
+                getattr(capability, "permission_broker", None),
+                "report_final_text_delivery_failure",
+                None,
+            )
+            if reporter is not None:
+                reporter(safe_reason)
+        except Exception:  # noqa: BLE001 - reporting failure must not fail the turn
+            log.debug("ACP final-text refusal reporting failed", exc_info=True)
 
     async def _maybe_resend_nudge(
         self,
@@ -2355,7 +2462,11 @@ class Agent:
         delivered = getattr(ctx, "delivered_channel_ids", None) or set()
         if event.channel_id in delivered:
             return messages, events, output
-        if channel_prefix_enabled(
+        # Same reasoning as the auto-deliver gate: on an ACP turn auto-delivery
+        # always runs, so the nudge is redundant — and worse than redundant,
+        # since it spends an extra model call asking for a send_message the ACP
+        # tool surface does not offer.
+        if _is_acp_delivery_turn() or channel_prefix_enabled(
             event.channel_id,
             getattr(self._config, "auto_deliver_final_text_channels", ()),
         ):
@@ -2436,26 +2547,54 @@ class Agent:
 
         parsed = parse_directives(output or "")
         clean_text = self._substantive_final_text(parsed.clean_text)
+        acp_delivery = _is_acp_delivery_turn()
+
+        def refuse(reason: str) -> None:
+            if acp_delivery and clean_text:
+                self._report_acp_final_text_delivery_failure(reason)
+
+        if clean_text is None and acp_delivery:
+            # The substantiveness floor (>= 20 chars, >= 3 words) exists to
+            # judge whether output is worth auto-shipping as *recovery* on a
+            # channel where the model could have called send_message. On an ACP
+            # turn this is the only delivery path, so the floor would silently
+            # drop exactly the answers ACP clients ask for — "Paris", "42",
+            # "yes". Any non-empty final text ships.
+            clean_text = (parsed.clean_text or "").strip() or None
         if clean_text is None and not parsed.directives:
             return
         if event.trigger != "user_message" or not turn_is_interactive:
+            refuse("turn_not_deliverable")
             return
         delivered = getattr(ctx, "delivered_channel_ids", None) or set()
         if event.channel_id in delivered:
             return
-        if not channel_prefix_enabled(
+        # ACP turns are always eligible: the opt-in list exists to choose which
+        # channels get recovery when send_message was available and unused, but
+        # on ACP the tool does not exist, so gating here would drop every reply.
+        if not acp_delivery and not channel_prefix_enabled(
             event.channel_id,
             getattr(self._config, "auto_deliver_final_text_channels", ()),
         ):
             return
         if self._channels is None or not event.channel_id:
+            refuse("channel_unavailable")
             return
         bridge = self._channels.find(event.channel_id)
         if bridge is None:
+            refuse("bridge_unavailable")
             return
+        refusal_reason: str | None = None
+
+        def capture_refusal(reason: str) -> None:
+            nonlocal refusal_reason
+            refusal_reason = reason
+
         if not self._harness_sink_allowed(
             ctx, event.channel_id, "harness_auto_deliver",
+            on_refusal=capture_refusal,
         ):
+            refuse(refusal_reason or "delivery_refused")
             return
 
         result = None
@@ -2464,8 +2603,11 @@ class Agent:
                 result = await self._channels.send(event.channel_id, clean_text, final=False)
             except Exception:  # noqa: BLE001 — auto-recovery must not fail the turn
                 log.exception("auto-deliver final text send failed")
+                refuse("delivery_failed")
                 return
             if not getattr(result, "sent", True):
+                refusal = str(getattr(result, "error", None) or "").strip()
+                refuse(refusal or "delivery_refused")
                 try:
                     await safe_log_event(
                         "send_message_failed",
@@ -2541,7 +2683,7 @@ class Agent:
     ) -> TurnRecord:
 
         # Persist the inbound event to the chat-history buffer + JSONL
-        # BEFORE any other turn work so ``assemble_recent_activity``
+        # BEFORE any other turn work so ``assemble_recent_activity_candidates``
         # in ``_build_turn_prompt`` sees this turn's own trigger as
         # context. No-op for triggers that don't represent conversation
         # (scheduled_tick / saga_session_end / shell_job_complete).
@@ -4085,6 +4227,92 @@ class Agent:
             labels,
         )
 
+    def _select_recent_activity(
+        self,
+        event: AgentEvent,
+        auth_context: AuthContext,
+    ) -> tuple[list[Message], tuple[PromptBlock, ...]]:
+        candidates = self._buffer.assemble_recent_activity_candidates(
+            channel_id=event.channel_id or "",
+            author=event.author,
+            recent_per_channel=self._config.recent_per_channel,
+            recent_author_cross=self._config.recent_author_cross,
+            cross_hours=self._config.recent_cross_hours,
+            source_allowlist=self._config.recent_sources,
+        )
+        effective_principal = (
+            auth_context.canonical_principal or auth_context.principal
+        )
+        if auth_context.is_service and effective_principal:
+            effective_principal = f"service:{effective_principal}"
+        if not effective_principal:
+            return [], ()
+        resolved_triggering = ChannelResourceAdapter._resolve_channel(
+            event.channel_id,
+        )
+
+        admitted: list[Message] = []
+        blocks: list[PromptBlock] = []
+        for message in candidates:
+            same_channel = (
+                ChannelResourceAdapter._resolve_channel(message.channel_id)
+                == resolved_triggering
+            )
+            owner_attestation = None
+            source_kind = (
+                "recent_activity_assistant"
+                if message.kind == "assistant_message" or not message.author
+                else "recent_activity_user"
+            )
+            principal = effective_principal
+            acl = frozenset({effective_principal})
+            if not same_channel and source_kind == "recent_activity_user":
+                owner_attestation = attest_owner(
+                    self._identity_resolver,
+                    message.author,
+                    message.channel_id,
+                )
+                if owner_attestation is None:
+                    continue
+                principal = owner_attestation.canonical_principal
+                acl = frozenset({principal})
+            labels = _prompt_source_labels(
+                auth_context,
+                domain="recent_activity",
+                resource=f"message:{message.msg_id}",
+                channel_id=message.channel_id,
+                principal=principal,
+                bridge=message.source,
+                authorized_principals=acl,
+                source_kind=source_kind,
+                self_authored=_recent_message_is_self_authored(message),
+                owner_attestation=owner_attestation,
+            )
+            source = labels.sources[0]
+            compatible = _source_is_triggering_channel_compatible(
+                source,
+                effective_principal=effective_principal,
+                triggering_principal=auth_context.principal,
+                resolved_triggering=resolved_triggering,
+                audience_provider=auth_context.audience_provider,
+                cross_platform_pull=auth_context.cross_platform_pull,
+            )
+            if not compatible:
+                if auth_context.enforcement_enabled:
+                    continue
+                # Preserve compatibility-mode prompt assembly while recording
+                # the exact predicate that enforcement would use to omit it.
+                # Re-checking the eventual sink gate would undercount failures
+                # that only this recent-activity compatibility predicate sees.
+                record_harness_shadow_block(
+                    "harness_auto_deliver",
+                    event.channel_id,
+                    "ifc_label_blocked:same_channel",
+                )
+            admitted.append(message)
+            blocks.append(PromptBlock(message.content, labels))
+        return admitted, tuple(blocks)
+
     async def _build_turn_prompt(
         self,
         ctx: Any,
@@ -4139,14 +4367,8 @@ class Agent:
             )
 
         auth_context = _require_auth_context(initial_auth_context or ctx.auth_context)
-        recent = self._buffer.assemble_recent_activity(
-            channel_id=event.channel_id or "",
-            author=event.author,
-            recent_per_channel=self._config.recent_per_channel,
-            recent_author_cross=self._config.recent_author_cross,
-            cross_hours=self._config.recent_cross_hours,
-            source_allowlist=self._config.recent_sources,
-        )
+        recent, recent_blocks = self._select_recent_activity(event, auth_context)
+        source_blocks.extend(recent_blocks)
         # Channel memory injection (chainlink #187): load per-channel fact
         # files (operator name, preferences, patterns) from
         # ``memory/channels/<channel_id>/``. Returns None for synthetic
@@ -4335,7 +4557,13 @@ class Agent:
             for author in [event.author, *(message.author for message in recent)]:
                 if not author:
                     continue
-                canonical = resolver.resolve(author)
+                identity_lookup = getattr(resolver, "identity", None)
+                identity = identity_lookup(author) if callable(identity_lookup) else None
+                if identity is not None:
+                    canonical = identity.canonical
+                else:
+                    resolve = getattr(resolver, "resolve", None)
+                    canonical = resolve(author) if callable(resolve) else author
                 if canonical and canonical != author:
                     identity_principals.add(canonical)
         if identity_principals:
@@ -4356,22 +4584,6 @@ class Agent:
                     ),
                 )
             source_blocks.append(PromptBlock("known identities", identity_labels))
-        for message in recent:
-            message_principal = message.author
-            if resolver is not None and message_principal:
-                message_principal = resolver.resolve(message_principal)
-            source_blocks.append(PromptBlock(
-                message.content,
-                _prompt_source_labels(
-                    auth_context,
-                    domain="recent_activity",
-                    resource=f"message:{message.msg_id}",
-                    channel_id=message.channel_id,
-                    principal=message_principal,
-                    bridge=message.source,
-                    self_authored=_recent_message_is_self_authored(message),
-                ),
-            ))
         if saga_block:
             source_blocks.append(PromptBlock(
                 saga_block,

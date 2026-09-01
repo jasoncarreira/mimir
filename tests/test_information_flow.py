@@ -10,14 +10,17 @@ from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 from unittest.mock import patch
 
 import pytest
 from langchain.agents.middleware import ToolCallRequest
+from langchain.tools import ToolRuntime
 from langchain_core.messages import ToolMessage
 from langgraph.runtime import Runtime
 
 from mimir.access_control import (
+    _same_channel_authority,
     _FILE_INTEGRITY_EXCLUDED_SUBTREES,
     _SELF_AUTHORED_FILE_ROOTS,
     _configured_pr_checkout_lease_root,
@@ -56,7 +59,7 @@ from mimir.agent import (
     _propagate_ifc_labels,
     _recent_message_is_self_authored,
 )
-from mimir.history import Message
+from mimir.history import Message, MessageBuffer
 from mimir.bridges._activity_panel import ActivityPanel
 from mimir.bridges.base import Bridge, MessageUpdate, SendResult
 from mimir.channel_registry import ChannelRegistry
@@ -161,7 +164,27 @@ def test_two_principals_in_shared_channel_fail_closed():
     assert decision.allowed is False
 
 
-def test_same_textual_channel_on_different_bridge_instance_fails_closed():
+def test_same_normalized_channel_does_not_query_cross_channel_authority():
+    decision = SinkGate.check_sink_flow(
+        "harness_auto_deliver",
+        "slack-C1",
+        _labels(bridge_instance="slack"),
+        _auth(),
+        enforce=True,
+    )
+    assert decision.allowed is True
+    assert decision.reason == "ifc_allowed"
+
+
+def test_same_normalized_channel_from_other_bridge_authority_is_not_admitted():
+    """A channel id is unique only within its own bridge authority.
+
+    Two independently scoped workspaces can each hold a channel that
+    normalizes to the same string, so the same-channel shortcut -- which
+    admits with no audience lookup, on the reasoning that the channel's own
+    audience has already seen the content -- must not fire across bridge
+    instances.
+    """
     decision = SinkGate.check_sink_flow(
         "harness_auto_deliver",
         "slack-C1",
@@ -170,6 +193,53 @@ def test_same_textual_channel_on_different_bridge_instance_fails_closed():
         enforce=True,
     )
     assert decision.allowed is False
+    assert decision.reason == "ifc_label_blocked:same_channel"
+
+
+def test_absent_triggering_bridge_does_not_take_the_same_channel_shortcut():
+    """Unknown authority is not proof of the same authority.
+
+    The same-channel shortcut skips the audience lookup entirely, so it fires
+    only on a proven authority match.
+    """
+    decision = SinkGate.check_sink_flow(
+        "harness_auto_deliver",
+        "slack-C1",
+        _labels(bridge_instance="slack"),
+        replace(_auth(), bridge_instance=None),
+        enforce=True,
+    )
+
+    assert decision.allowed is False
+    assert decision.reason == "ifc_label_blocked:same_channel"
+
+
+@pytest.mark.parametrize(
+    ("source_bridge", "triggering_bridge"),
+    [("", "slack"), ("slack", None), ("", None)],
+)
+def test_same_channel_authority_declines_on_absent_bridge(
+    source_bridge: str,
+    triggering_bridge: str | None,
+):
+    """Both missing sides decline, asserted against the predicate itself.
+
+    A source with no bridge cannot reach this predicate through the sink gate:
+    an empty bridge_instance makes the label incomplete, and incomplete
+    provenance already fails closed upstream. Driving the predicate directly
+    keeps that branch covered rather than asserting an outcome the
+    incomplete-provenance path would produce anyway.
+    """
+    source = SourceLabel(
+        principal="user-1",
+        domain="channel",
+        resource_id="slack-C1",
+        bridge_instance=source_bridge,
+        sensitivity="private",
+        authorized_principals=frozenset({"user-1"}),
+    )
+
+    assert _same_channel_authority(source, triggering_bridge) is False
 
 
 def test_labels_without_source_provenance_fail_closed():
@@ -759,7 +829,7 @@ def test_untrusted_ingest_recloses_operator_action_sinks_but_not_reply(
     assert reply.allowed is True
     assert cross_channel.allowed is False
     assert declassification.allowed is True
-    assert incompatible_reply.allowed is True
+    assert incompatible_reply.allowed is False
     assert harness.allowed is True
     assert harness.reason == "harness_metadata_display"
 
@@ -887,13 +957,8 @@ def test_cross_channel_recent_activity_requires_trust_for_same_channel_sinks():
             tool, event.channel_id, untrusted_labels, untrusted_auth, enforce=True,
         )
         assert trusted.allowed is True, (tool, trusted.reason)
-        if tool == "send_message":
-            # Authenticated interactive ingress retains its explicit-reply
-            # carveout; harness delivery and other same-channel sinks do not.
-            assert untrusted.allowed is True, (tool, untrusted.reason)
-        else:
-            assert untrusted.allowed is False, (tool, untrusted.reason)
-            assert untrusted.reason == "ifc_label_blocked:same_channel"
+        assert untrusted.allowed is False, (tool, untrusted.reason)
+        assert untrusted.reason == "ifc_label_blocked:same_channel"
 
 
 def test_prompt_source_labels_preserve_full_trusted_label():
@@ -903,11 +968,11 @@ def test_prompt_source_labels_preserve_full_trusted_label():
     assert source == SourceLabel(
         principal="user-1",
         domain="saga",
-        resource_id="slack-C1",
+        resource_id="auto-recall",
         bridge_instance="slack",
         sensitivity="private",
         authorized_principals=frozenset({"user-1"}),
-        source_kind="protected_prompt",
+        source_kind="agent_self",
         integrity="trusted",
         integrity_effect="informational",
     )
@@ -2472,7 +2537,7 @@ def test_complete_forged_label_cannot_egress_from_service_turn(
         resource_id="scheduler:heartbeat",
         bridge_instance="service:scheduler",
         sensitivity="internal",
-        authorized_principals=frozenset({"service:scheduler"}),
+        authorized_principals=frozenset({source_principal}),
         integrity="trusted",
     ))
     auth = create_auth_context(event, enforce=True, ifc_labels=forged)
@@ -3315,6 +3380,150 @@ def test_failed_trusted_mcp_result_remains_untrusted() -> None:
     assert next(iter(labels.sources)).integrity == "untrusted"
 
 
+def test_hands_read_result_uses_authorization_provenance() -> None:
+    auth = replace(
+        _auth(channel="acp:session", roles=("admin",)),
+        principal="operator",
+        canonical_principal="operator",
+        domain="channel",
+        resource_id="acp:session",
+        bridge_instance="acp-stdio",
+    )
+    resource = "client-file:%2Fworkspace%2Fnotes.txt"
+    authorization = ToolAuthorization(
+        tool_name="hands_read",
+        decision=OperationDecision.RESOURCE_SCOPED,
+        allowed=True,
+        protected_source_resources=(resource,),
+        flow_direction=ToolFlowDirection.SOURCE,
+        result_integrity="untrusted",
+    )
+
+    labels = classify_protected_result(
+        "hands_read",
+        {"path": "spoofed.txt", "result_integrity": "trusted"},
+        auth,
+        authorization,
+        result={"content": "client input", "result_integrity": "trusted"},
+    )
+
+    assert labels is not None
+    [source] = labels.sources
+    assert source.is_complete is True
+    assert source.domain == "client_provider"
+    assert source.resource_id == resource
+    assert source.principal == "operator"
+    assert source.bridge_instance == "acp-stdio"
+    assert source.authorized_principals == frozenset({"operator"})
+    assert source.integrity == "untrusted"
+    assert source.integrity_effect == "active_ingest"
+    assert labels.has_untrusted_active_ingest is True
+
+
+def test_acp_failed_provider_contract_result_is_untrusted_informational() -> None:
+    from mimir.tools.client_provider import ClientProviderResultError
+
+    auth = replace(
+        _auth(channel="acp:session", roles=("admin",)),
+        principal="operator",
+        canonical_principal="operator",
+        domain="channel",
+        resource_id="acp:session",
+        bridge_instance="acp-stdio",
+        origin_trigger="acp_session",
+    )
+    authorization = ToolAuthorization(
+        tool_name="hands_read",
+        decision=OperationDecision.RESOURCE_SCOPED,
+        allowed=True,
+        protected_source_resources=("client-file:%2Fworkspace%2Fnotes.txt",),
+        flow_direction=ToolFlowDirection.SOURCE,
+        result_integrity="untrusted",
+    )
+
+    labels = classify_protected_result(
+        "hands_read",
+        {"path": "/workspace/notes.txt"},
+        auth,
+        authorization,
+        result=ClientProviderResultError("missing structuredContent"),
+        failed=True,
+    )
+
+    assert labels is not None
+    [source] = labels.sources
+    assert source.resource_id == "acp:session"
+    assert source.source_kind == "channel"
+    assert (source.integrity, source.integrity_effect) == (
+        "untrusted", "informational",
+    )
+    assert labels.has_untrusted_active_ingest is False
+
+
+def test_acp_successful_provider_result_keeps_active_provider_labels() -> None:
+    auth = replace(
+        _auth(channel="acp:session", roles=("admin",)),
+        principal="operator",
+        canonical_principal="operator",
+        domain="channel",
+        resource_id="acp:session",
+        bridge_instance="acp-stdio",
+        origin_trigger="acp_session",
+    )
+    authorization = ToolAuthorization(
+        tool_name="hands_read",
+        decision=OperationDecision.RESOURCE_SCOPED,
+        allowed=True,
+        protected_source_resources=("client-file:%2Fworkspace%2Fnotes.txt",),
+        flow_direction=ToolFlowDirection.SOURCE,
+        result_integrity="untrusted",
+    )
+
+    labels = classify_protected_result(
+        "hands_read",
+        {"path": "/workspace/notes.txt"},
+        auth,
+        authorization,
+        result={"content": "client input"},
+    )
+
+    assert labels is not None
+    [source] = labels.sources
+    assert source.domain == "client_provider"
+    assert (source.integrity, source.integrity_effect) == (
+        "untrusted", "active_ingest",
+    )
+
+
+def test_failed_provider_contract_result_outside_acp_keeps_provider_labels() -> None:
+    from mimir.tools.client_provider import ClientProviderResultError
+
+    authorization = ToolAuthorization(
+        tool_name="hands_read",
+        decision=OperationDecision.RESOURCE_SCOPED,
+        allowed=True,
+        protected_source_resources=("client-file:%2Fworkspace%2Fnotes.txt",),
+        flow_direction=ToolFlowDirection.SOURCE,
+        result_integrity="untrusted",
+    )
+
+    labels = classify_protected_result(
+        "hands_read",
+        {"path": "/workspace/notes.txt"},
+        _auth(),
+        authorization,
+        result=ClientProviderResultError("missing structuredContent"),
+        failed=True,
+    )
+
+    assert labels is not None
+    [source] = labels.sources
+    assert source.domain == "client_provider"
+    assert (source.integrity, source.integrity_effect) == (
+        "untrusted", "active_ingest",
+    )
+
+
 @pytest.mark.parametrize(
     "tool_name",
     ["bash", "Bash", "shell", "http_request"],
@@ -3339,6 +3548,56 @@ def test_undomained_ingesting_native_result_taints_active_turn(tool_name: str) -
     assert labels.has_untrusted_active_ingest is True
 
 
+def test_unresolved_native_source_sentinel_names_its_producer() -> None:
+    labels = classify_protected_result(
+        "shell_exec",
+        {"command": "inspect generated output"},
+        _auth(),
+        ToolAuthorization(
+            tool_name="shell_exec",
+            decision=OperationDecision.OPEN,
+            allowed=True,
+            flow_direction=ToolFlowDirection.BOTH,
+        ),
+        result="model-visible output",
+    )
+
+    assert labels is not None
+    [source] = labels.sources
+    assert source.resource_id == "<unresolved-resource:protected_tool:shell_exec>"
+    assert source.resource_id != "unknown"
+
+
+def test_acp_refusal_path_uses_channel_instead_of_query_prose() -> None:
+    refusal_text = (
+        "ACP tainted turn cannot send response send_message same channel "
+        "untrusted file ifc_label_blocked originating ACP channel"
+    )
+    auth = replace(
+        _auth(channel="acp:session", roles=("admin",)),
+        resource_id="acp:session",
+        bridge_instance="acp-stdio",
+    )
+
+    labels = classify_protected_result(
+        "grep",
+        {"query": refusal_text},
+        auth,
+        ToolAuthorization(
+            tool_name="grep",
+            decision=OperationDecision.RESOURCE_SCOPED,
+            allowed=True,
+            flow_direction=ToolFlowDirection.SOURCE,
+        ),
+        failed=True,
+    )
+
+    assert labels is not None
+    [source] = labels.sources
+    assert source.resource_id == "acp:session"
+    assert source.resource_id != refusal_text
+
+
 def test_failed_newly_mapped_web_search_has_attributable_source() -> None:
     authorization = ToolAuthorization(
         tool_name="web_search",
@@ -3359,7 +3618,13 @@ def test_failed_newly_mapped_web_search_has_attributable_source() -> None:
     assert labels is not None
     source = next(iter(labels.sources))
     assert source.domain == "web"
-    assert source.resource_id == "chainlink taint refusals"
+    # feature/acp stopped using query prose as a resource_id and substitutes a
+    # sentinel naming the producer instead -- see
+    # test_unresolved_native_source_sentinel_names_its_producer and
+    # test_acp_refusal_path_uses_channel_instead_of_query_prose. This test's
+    # intent is that a FAILED call still yields an attributable source, which the
+    # sentinel satisfies; only the spelling of the attribution changed.
+    assert source.resource_id == "<unresolved-resource:protected_tool:web_search>"
     assert source.integrity == "untrusted"
     assert source.integrity_effect == "active_ingest"
 
@@ -3961,8 +4226,143 @@ def test_acl_authorized_untrusted_protected_prompt_is_channel_bound():
 
 
 @pytest.mark.parametrize(
+    ("source_kind", "domain", "source_acl", "integrity", "integrity_effect"),
+    [
+        (
+            "auto_recall", "saga", frozenset({"user-1", "user-2"}),
+            "untrusted", "informational",
+        ),
+        (
+            "mcp", "mcp", frozenset({"user-1"}),
+            "trusted", "active_ingest",
+        ),
+    ],
+)
+def test_auto_recall_and_mcp_require_destination_audience_within_source_acl(
+    source_kind: str,
+    domain: str,
+    source_acl: frozenset[str],
+    integrity: str,
+    integrity_effect: str,
+):
+    class AudienceProvider:
+        def __init__(self, audience: frozenset[str]):
+            self.audience = audience
+
+        def audience_for(self, channel_id, *, principal):
+            assert (channel_id, principal) == ("slack-C1", "user-1")
+            return self.audience
+
+    source = SourceLabel(
+        principal="user-2" if source_kind == "auto_recall" else "user-1",
+        domain=domain,
+        resource_id=f"{domain}-private-record",
+        bridge_instance=domain,
+        sensitivity="private",
+        authorized_principals=source_acl,
+        source_kind=source_kind,
+        integrity=integrity,
+        integrity_effect=integrity_effect,
+    )
+    labels = InformationFlowLabels(
+        labels=frozenset({"private"}), sources=(source,),
+    )
+
+    within_source_acl = SinkGate.check_sink_flow(
+        "harness_auto_deliver", "slack-C1", labels,
+        replace(
+            _auth(),
+            audience_provider=AudienceProvider(frozenset({"user-1"})),
+        ),
+        enforce=True,
+    )
+    wider_than_source_acl = SinkGate.check_sink_flow(
+        "harness_auto_deliver", "slack-C1", labels,
+        replace(
+            _auth(),
+            audience_provider=AudienceProvider(source_acl | {"user-3"}),
+        ),
+        enforce=True,
+    )
+
+    assert "user-1" in source.authorized_principals
+    assert within_source_acl.allowed is True
+    assert within_source_acl.reason == "ifc_allowed"
+    assert wider_than_source_acl.allowed is False
+    assert wider_than_source_acl.reason == "ifc_label_blocked:same_channel"
+
+
+class ExplodingAudienceProvider:
+    def audience_for(self, channel_id, *, principal):
+        raise AssertionError("audience lookup must not fail open")
+
+
+@pytest.mark.parametrize(
+    "audience_provider",
+    [None, ExplodingAudienceProvider()],
+    ids=["missing", "raises"],
+)
+def test_auto_recall_fails_closed_when_destination_audience_is_unavailable(
+    audience_provider,
+):
+    source = SourceLabel(
+        principal="user-2",
+        domain="saga",
+        resource_id="saga-private-record",
+        bridge_instance="saga",
+        sensitivity="private",
+        authorized_principals=frozenset({"user-1", "user-2"}),
+        source_kind="auto_recall",
+        integrity="untrusted",
+        integrity_effect="informational",
+    )
+    labels = InformationFlowLabels(
+        labels=frozenset({"private"}), sources=(source,),
+    )
+
+    decision = SinkGate.check_sink_flow(
+        "harness_auto_deliver", "slack-C1", labels,
+        replace(_auth(), audience_provider=audience_provider),
+        enforce=True,
+    )
+
+    assert "user-1" in source.authorized_principals
+    assert decision.allowed is False
+    assert decision.reason == "ifc_label_blocked:same_channel"
+
+
+def test_protected_tool_same_channel_compatibility_remains_audience_independent():
+    source = SourceLabel(
+        principal="protected-reader",
+        domain="filesystem",
+        resource_id="private-record",
+        bridge_instance="filesystem",
+        sensitivity="private",
+        authorized_principals=frozenset({"user-1"}),
+        source_kind="protected_tool",
+        integrity="trusted",
+        integrity_effect="informational",
+    )
+    labels = InformationFlowLabels(
+        labels=frozenset({"private"}), sources=(source,),
+    )
+
+    decision = SinkGate.check_sink_flow(
+        "harness_auto_deliver", "slack-C1", labels,
+        replace(_auth(), audience_provider=ExplodingAudienceProvider()),
+        enforce=True,
+    )
+
+    assert decision.allowed is True
+    assert decision.reason == "ifc_allowed"
+
+
+@pytest.mark.parametrize(
     "source_kind",
-    ["channel", "service", "protected_prompt", "protected_tool"],
+    [
+        "channel", "service", "protected_prompt", "protected_tool",
+        "auto_recall", "mcp",
+    ],
 )
 def test_incomplete_source_kind_still_blocks_triggering_channel(source_kind: str):
     source = SourceLabel(
@@ -4073,8 +4473,13 @@ def test_channel_source_still_requires_exact_triggering_provenance(mismatch: str
     )
 
     assert matching.allowed is True
-    assert blocked.allowed is False
-    assert blocked.reason == "ifc_label_blocked:same_channel"
+    # bridge_instance scopes the channel namespace: the same channel id in a
+    # different bridge authority is a different channel, not the same one.
+    expected_allowed = mismatch not in {"resource_id", "bridge_instance"}
+    assert blocked.allowed is expected_allowed
+    assert blocked.reason == (
+        "ifc_allowed" if expected_allowed else "ifc_label_blocked:same_channel"
+    )
 
 
 @pytest.mark.parametrize(
@@ -5261,22 +5666,47 @@ def test_ifc_sources_is_append_only_deduped_tuple():
         InformationFlowLabels(sources=("not-a-source-label",))
 
 
-def _service_turn_auth_context() -> AuthContext:
+def _service_turn_auth_context(tmp_path: Path) -> AuthContext:
+    from mimir.channel_audience import ServerChannelAudienceProvider, attest_owner
+    from mimir.identities import Identity
+    from mimir.acp.session_store import SessionStore
+
+    home = tmp_path / "authority-secret-home"
+    destination = SessionStore(home).create_owned_session(
+        "attested-secret-principal",
+    )
+
+    class Resolver:
+        def identity(self, author):
+            return Identity(canonical="attested-secret-principal")
+
+    attestation = attest_owner(
+        Resolver(), "raw-secret-author", "attested-secret-channel",
+    )
     src = SourceLabel(
-        principal="service:github", domain="channel",
-        resource_id="poller:github-activity", bridge_instance=None,
+        principal="attested-secret-principal", domain="channel",
+        resource_id="attested-secret-channel", bridge_instance="acp",
         sensitivity="internal",
+        authorized_principals=frozenset({"attested-secret-principal"}),
+        source_kind="recent_activity_user",
+        owner_attestation=attestation,
     )
     return AuthContext(
-        principal="service:github", canonical_principal="service:github", roles=(),
-        event_ingress=None, trigger="saga_session_end",
-        channel_id="poller:github-activity",
-        interactivity=TurnInteractivity.NON_INTERACTIVE, is_service=True,
+        principal="attested-secret-principal",
+        canonical_principal="attested-secret-principal",
+        roles=("user",),
+        event_ingress=None, trigger="user_message",
+        channel_id=destination.thread_id,
+        interactivity=TurnInteractivity.INTERACTIVE,
         ifc_labels=InformationFlowLabels().with_source(src),
+        domain="channel",
+        resource_id=destination.thread_id,
+        bridge_instance="acp",
+        audience_provider=ServerChannelAudienceProvider(home),
     )
 
 
-def test_tool_parse_input_survives_pregel_runtime_in_config():
+def test_tool_parse_input_survives_pregel_runtime_in_config(tmp_path: Path):
     """Regression for the exact #971 turn-crash carrier (verified on the live box).
 
     mimir tools use postponed annotations, so ``_injected_args_keys`` is empty
@@ -5292,12 +5722,11 @@ def test_tool_parse_input_survives_pregel_runtime_in_config():
     the same runtime with an empty config parses fine.) Storing ``sources`` as a
     tuple fixes the data itself, so the duck-typed path is safe too.
     """
-    from langchain.tools import ToolRuntime
     from langgraph.runtime import Runtime
 
     from mimir.tools.store import memory_store
 
-    ctx = _service_turn_auth_context()
+    ctx = _service_turn_auth_context(tmp_path)
 
     def _parse(auth_context: AuthContext) -> dict:
         runtime = ToolRuntime(
@@ -5329,7 +5758,139 @@ def test_tool_parse_input_survives_pregel_runtime_in_config():
         _parse(replace(ctx, ifc_labels=bad))
 
 
-async def test_agent_graph_tool_call_survives_populated_auth_context():
+async def test_real_graph_tool_runtime_preserves_but_does_not_serialize_audience_authority(
+    tmp_path: Path,
+):
+    import hashlib
+
+    from deepagents import create_deep_agent
+    from langchain.tools import ToolRuntime
+    from langchain_core.language_models.fake_chat_models import GenericFakeChatModel
+    from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
+    from langchain_core.tools import tool
+    from pydantic import TypeAdapter
+
+    captured: dict[str, object] = {}
+
+    @tool
+    def inspect_audience_authority(runtime: ToolRuntime[AuthContext]) -> str:
+        """Inspect server-provided audience authority."""
+        from mimir.access_control import (
+            ChannelResourceAdapter,
+            _source_is_triggering_channel_compatible,
+        )
+
+        context = runtime.context
+        source = context.ifc_labels.sources[0]
+        captured["context"] = context
+        captured["provider"] = context.audience_provider
+        captured["attestation"] = source.owner_attestation
+        captured["resource_authority"] = context.resource_id
+        captured["provider_result"] = context.audience_provider.audience_for(
+            context.channel_id,
+            principal=context.canonical_principal,
+        )
+        captured["predicate_result"] = _source_is_triggering_channel_compatible(
+            source,
+            effective_principal=context.canonical_principal,
+            triggering_principal=context.principal,
+            resolved_triggering=ChannelResourceAdapter._resolve_channel(
+                context.channel_id,
+            ),
+            audience_provider=context.audience_provider,
+            cross_platform_pull=context.cross_platform_pull,
+        )
+        captured["duck_dump"] = TypeAdapter(dict[str, Any]).dump_python(
+            runtime.config,
+        )
+        return "authority inspected"
+
+    class ToolCallingModel(GenericFakeChatModel):
+        def bind_tools(self, tools, **kwargs):
+            return self
+
+    model = ToolCallingModel(messages=iter([
+        AIMessage(content="", tool_calls=[{
+            "name": "inspect_audience_authority",
+            "args": {},
+            "id": "authority-call",
+            "type": "tool_call",
+        }]),
+        AIMessage(content="done"),
+    ]))
+    graph = create_deep_agent(
+        model=model,
+        tools=[inspect_audience_authority],
+        system_prompt="test",
+        context_schema=AuthContext,
+    )
+    context = _service_turn_auth_context(tmp_path)
+    authority_path = str(context.audience_provider.home)
+    destination_channel = context.channel_id
+    resource_authority = context.resource_id
+    principal_fingerprint = hashlib.sha256(
+        repr((context.principal, context.canonical_principal)).encode("utf-8"),
+    ).hexdigest()
+    assert "_principal_fingerprint" not in AuthContext.__dataclass_fields__
+    typed_source = TypeAdapter(SourceLabel).dump_python(
+        context.ifc_labels.sources[0],
+    )
+    typed_context = TypeAdapter(AuthContext).dump_python(context)
+    assert typed_source["owner_attestation"] is None
+    assert typed_context["audience_provider"] is None
+    typed_serialized = repr((typed_source, typed_context))
+    for secret in (
+        authority_path,
+        "attested-secret-principal",
+        "raw-secret-author",
+        "attested-secret-channel",
+        destination_channel,
+        resource_authority,
+        principal_fingerprint,
+    ):
+        assert secret not in typed_serialized
+    assert "_principal_fingerprint" not in typed_serialized
+    final_state: dict[str, Any] = {}
+    async for item in graph.astream(
+        {"messages": [HumanMessage(content="inspect")]},
+        context=context,
+        stream_mode=["values"],
+    ):
+        if isinstance(item, tuple) and len(item) == 2 and item[0] == "values":
+            final_state = item[1]
+        elif isinstance(item, dict):
+            final_state = item
+
+    assert captured["context"] is context
+    assert captured["provider"] is context.audience_provider
+    assert captured["attestation"] is context.ifc_labels.sources[0].owner_attestation
+    assert captured["resource_authority"] == context.channel_id
+    assert captured["provider_result"] == frozenset({"attested-secret-principal"})
+    assert captured["predicate_result"] is True
+    serialized = repr(captured["duck_dump"])
+    for secret in (
+        authority_path,
+        "attested-secret-principal",
+        "raw-secret-author",
+        "attested-secret-channel",
+        destination_channel,
+        resource_authority,
+        principal_fingerprint,
+    ):
+        assert secret not in serialized
+    assert "_principal_fingerprint" not in serialized
+    assert "owner_attestation" not in serialized
+    assert "audience_provider" not in serialized
+    assert any(
+        isinstance(message, ToolMessage)
+        and "authority inspected" in str(message.content)
+        for message in final_state.get("messages", [])
+    )
+
+
+async def test_agent_graph_tool_call_survives_populated_auth_context(
+    tmp_path: Path,
+):
     """End-to-end #971 regression through the production assembly.
 
     Builds the real ``create_deep_agent`` graph with a production mimir tool and
@@ -5369,7 +5930,7 @@ async def test_agent_graph_tool_call_survives_populated_auth_context():
     final_state: dict = {}
     async for item in agent.astream(
         {"messages": [HumanMessage(content="go")]},
-        context=_service_turn_auth_context(),
+        context=_service_turn_auth_context(tmp_path),
         stream_mode=["values"],
     ):
         if isinstance(item, tuple) and len(item) == 2 and item[0] == "values":
@@ -5420,6 +5981,381 @@ def test_non_admin_operator_turn_is_denied_cross_channel_at_the_sink_gate() -> N
         target_channel=event.channel_id, ifc_labels=labels,
     )
     assert reply.allowed is True
+
+
+def test_admin_operator_cross_channel_send_succeeds_through_real_sink() -> None:
+    event = AgentEvent(
+        trigger="user_message",
+        channel_id="slack-origin",
+        author="operator",
+        source="slack",
+        content="send the requested update",
+    )
+    auth, labels = _runtime_operator_context(event)
+    decision = ToolRegistry().authorize_tool(
+        "send_message",
+        auth,
+        enforce=True,
+        target_channel="slack-destination",
+        ifc_labels=labels,
+    )
+    assert decision.allowed is True
+
+
+def test_real_sink_only_bypasses_audience_for_complete_authorized_agent_self() -> None:
+    """Exercise the ordered compatibility arms through the actual sink gate."""
+    class ExplodingProvider:
+        def audience_for(self, channel_id, *, principal):
+            raise AssertionError("this source must not reach audience lookup")
+
+    auth = AuthContext(
+        principal="alice-raw",
+        canonical_principal="alice",
+        roles=("user",),
+        event_ingress=None,
+        trigger="user_message",
+        channel_id="destination-sentinel",
+        interactivity=TurnInteractivity.INTERACTIVE,
+        enforcement_enabled=True,
+        domain="channel",
+        resource_id="destination-sentinel",
+        bridge_instance="acp",
+        audience_provider=ExplodingProvider(),
+    )
+
+    def decision_for(source: SourceLabel):
+        labels = InformationFlowLabels().with_source(source)
+        return SinkGate.check_sink_flow(
+            "harness_auto_deliver",
+            "destination-sentinel",
+            labels,
+            replace(auth, ifc_state=InformationFlowState(labels=labels)),
+            enforce=True,
+        )
+
+    agent_self = SourceLabel(
+        principal="alice",
+        domain="feedback",
+        resource_id="events:channel-less-self-sentinel",
+        bridge_instance="mimir",
+        sensitivity="private",
+        authorized_principals=frozenset({"alice"}),
+        source_kind="agent_self",
+        integrity="trusted",
+        integrity_effect="informational",
+    )
+    assert decision_for(agent_self).allowed is True
+
+    incomplete = replace(agent_self, bridge_instance=None)
+    assert decision_for(incomplete).allowed is False
+
+    unauthorized = replace(agent_self, authorized_principals=frozenset({"bob"}))
+    assert decision_for(unauthorized).allowed is False
+
+    trusted_non_agent = replace(
+        agent_self,
+        resource_id="trusted-non-agent-sentinel",
+        source_kind="protected_prompt",
+    )
+    assert decision_for(trusted_non_agent).allowed is False
+
+
+def test_real_sink_requires_minted_recent_owner_attestation() -> None:
+    from mimir.channel_audience import attest_owner
+    from mimir.identities import Identity
+
+    class Resolver:
+        def identity(self, author):
+            return Identity(canonical="alice") if author == "alice-raw" else None
+
+    class SingletonAudience:
+        def audience_for(self, channel_id, *, principal):
+            assert (channel_id, principal) == ("destination-attested", "alice")
+            return frozenset({"alice"})
+
+    class HandBuiltAttestation:
+        canonical_principal = "alice"
+        raw_author = "alice-raw"
+        source_channel = "attested-source-sentinel"
+
+        __hash__ = object.__hash__
+
+    auth = AuthContext(
+        principal="alice-raw",
+        canonical_principal="alice",
+        roles=("user",),
+        event_ingress=None,
+        trigger="user_message",
+        channel_id="destination-attested",
+        interactivity=TurnInteractivity.INTERACTIVE,
+        enforcement_enabled=True,
+        domain="channel",
+        resource_id="destination-attested",
+        bridge_instance="acp",
+        audience_provider=SingletonAudience(),
+    )
+    minted = attest_owner(Resolver(), "alice-raw", "attested-source-sentinel")
+    assert minted is not None
+
+    def decision_for(attestation: object) -> bool:
+        labels = InformationFlowLabels().with_source(SourceLabel(
+            principal="alice",
+            domain="recent_activity",
+            resource_id="attested-source-sentinel",
+            bridge_instance="discord",
+            sensitivity="private",
+            authorized_principals=frozenset({"alice"}),
+            source_kind="recent_activity_user",
+            owner_attestation=attestation,
+        ))
+        return SinkGate.check_sink_flow(
+            "harness_auto_deliver",
+            "destination-attested",
+            labels,
+            replace(auth, ifc_state=InformationFlowState(labels=labels)),
+            enforce=True,
+        ).allowed
+
+    assert decision_for(minted) is True
+    assert decision_for(HandBuiltAttestation()) is False
+
+
+def test_real_sink_applies_destination_audience_subset_in_the_safe_direction() -> None:
+    class AudienceProvider:
+        def audience_for(self, channel_id, *, principal):
+            audiences = {
+                "destination-audience-sentinel": frozenset({"alice", "bob"}),
+                "source-wide-sentinel": frozenset({"alice", "bob", "carol"}),
+                "source-narrow-sentinel": frozenset({"alice"}),
+            }
+            return audiences.get(channel_id)
+
+    auth = AuthContext(
+        principal="alice-raw",
+        canonical_principal="alice",
+        roles=("user",),
+        event_ingress=None,
+        trigger="user_message",
+        channel_id="destination-audience-sentinel",
+        interactivity=TurnInteractivity.INTERACTIVE,
+        enforcement_enabled=True,
+        domain="channel",
+        resource_id="destination-audience-sentinel",
+        bridge_instance="acp",
+        audience_provider=AudienceProvider(),
+    )
+
+    def decision_for(resource_id: str) -> bool:
+        labels = InformationFlowLabels().with_source(SourceLabel(
+            principal="alice",
+            domain="feedback",
+            resource_id=resource_id,
+            bridge_instance="discord",
+            sensitivity="private",
+            authorized_principals=frozenset({"alice"}),
+            source_kind="protected_prompt",
+            integrity_effect="informational",
+        ))
+        return SinkGate.check_sink_flow(
+            "harness_auto_deliver",
+            "destination-audience-sentinel",
+            labels,
+            replace(auth, ifc_state=InformationFlowState(labels=labels)),
+            enforce=True,
+        ).allowed
+
+    assert decision_for("source-wide-sentinel") is True
+    assert decision_for("source-narrow-sentinel") is False
+
+
+def test_unknown_canonical_looking_recent_author_is_omitted_without_silencing_reply(
+    tmp_path: Path,
+) -> None:
+    class StrictResolver:
+        def identity(self, author):
+            return None
+
+        def resolve(self, author):
+            raise AssertionError("protected selection must not call resolve")
+
+    class ExplodingProvider:
+        def audience_for(self, channel_id, *, principal):
+            raise AssertionError("unknown authors must fail before audience lookup")
+
+    resolver = StrictResolver()
+    buffer = MessageBuffer(
+        history_path=tmp_path / "chat_history.jsonl",
+        resolver=resolver,
+    )
+    buffer._append_in_memory(buffer.make_message(
+        channel_id="foreign-unknown-author-sentinel",
+        kind="user_message",
+        content="UNKNOWN-CANONICAL-LOOKING-SECRET",
+        author="canonical-looking-alice",
+        source="discord",
+    ))
+    agent = object.__new__(Agent)
+    agent._buffer = buffer
+    agent._identity_resolver = resolver
+    agent._config = SimpleNamespace(
+        recent_per_channel=10,
+        recent_author_cross=10,
+        recent_cross_hours=24,
+        recent_sources=None,
+    )
+    event = AgentEvent(
+        trigger="user_message",
+        channel_id="reply-destination-sentinel",
+        author="canonical-looking-alice",
+        source="acp",
+    )
+    ingress_labels = InformationFlowLabels().with_source(SourceLabel(
+        principal="alice",
+        domain="channel",
+        resource_id="reply-destination-sentinel",
+        bridge_instance="acp",
+        sensitivity="private",
+        authorized_principals=frozenset({"alice"}),
+    ))
+    auth = AuthContext(
+        principal="canonical-looking-alice",
+        canonical_principal="alice",
+        roles=("user",),
+        event_ingress=None,
+        trigger="user_message",
+        channel_id="reply-destination-sentinel",
+        interactivity=TurnInteractivity.INTERACTIVE,
+        enforcement_enabled=True,
+        domain="channel",
+        resource_id="reply-destination-sentinel",
+        bridge_instance="acp",
+        audience_provider=ExplodingProvider(),
+        ifc_state=InformationFlowState(labels=ingress_labels),
+    )
+
+    selected, blocks = agent._select_recent_activity(event, auth)
+    assert selected == []
+    assert blocks == ()
+    reply = SinkGate.check_sink_flow(
+        "harness_auto_deliver",
+        "reply-destination-sentinel",
+        ingress_labels,
+        auth,
+        enforce=True,
+    )
+    assert reply.allowed is True
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        "non_admin",
+        "shell_job_complete",
+        "indeterminate_ifc",
+        "incomplete_source",
+        "unauthorized_source",
+    ],
+)
+def test_cross_channel_sink_refusal_matrix(case: str) -> None:
+    event = AgentEvent(
+        trigger="user_message",
+        channel_id="slack-origin",
+        author="operator",
+        source="slack",
+        content="send the requested update",
+    )
+    auth, labels = _runtime_operator_context(event)
+    if case == "non_admin":
+        auth = replace(auth, roles=("user",))
+    elif case == "shell_job_complete":
+        auth = replace(auth, trigger="shell_job_complete")
+    elif case == "indeterminate_ifc":
+        auth = replace(auth, ifc_state=SimpleNamespace(
+            has_untrusted_active_ingest=lambda _: None,
+            consume_sink_approval=lambda **_: False,
+        ))
+    elif case == "incomplete_source":
+        labels = labels.with_source(SourceLabel(
+            principal="operator",
+            domain="channel",
+            resource_id="slack-origin",
+            bridge_instance=None,
+            sensitivity="private",
+            authorized_principals=frozenset({"operator"}),
+        ))
+        auth = replace(auth, ifc_state=InformationFlowState(labels=labels))
+    else:
+        labels = labels.with_source(SourceLabel(
+            principal="foreign",
+            domain="channel",
+            resource_id="slack-origin",
+            bridge_instance="slack",
+            sensitivity="private",
+            authorized_principals=frozenset({"foreign"}),
+        ))
+        auth = replace(auth, ifc_state=InformationFlowState(labels=labels))
+
+    decision = ToolRegistry().authorize_tool(
+        "send_message",
+        auth,
+        enforce=True,
+        target_channel="slack-destination",
+        ifc_labels=labels,
+    )
+    assert decision.allowed is False
+    assert decision.reason == "ifc_label_blocked:same_channel"
+
+
+def test_noninteractive_delivery_only_allows_configured_operator_alert(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    operator_channel = "slack-operator-alert"
+    monkeypatch.setenv("MIMIR_OPERATOR_ALERT_CHANNEL", operator_channel)
+    event = AgentEvent(
+        trigger="scheduled_tick",
+        channel_id="scheduler:heartbeat",
+        author="operator",
+        source="scheduler",
+    )
+    labels = InformationFlowLabels().with_source(SourceLabel(
+        principal="operator",
+        domain="channel",
+        resource_id="foreign-channel",
+        bridge_instance=None,
+        sensitivity="private",
+        authorized_principals=frozenset(),
+    ))
+    auth = AuthContext(
+        principal="operator",
+        canonical_principal="operator",
+        roles=("admin",),
+        event_ingress=None,
+        trigger="scheduled_tick",
+        channel_id="scheduler:heartbeat",
+        interactivity=TurnInteractivity.NON_INTERACTIVE,
+        enforcement_enabled=True,
+        domain="channel",
+        resource_id="scheduler:heartbeat",
+        bridge_instance="scheduler",
+        ifc_labels=labels,
+        ifc_state=InformationFlowState(labels=labels),
+    )
+    configured = ToolRegistry().authorize_tool(
+        "send_message",
+        auth,
+        enforce=True,
+        target_channel=operator_channel,
+        ifc_labels=labels,
+    )
+    arbitrary = ToolRegistry().authorize_tool(
+        "send_message",
+        auth,
+        enforce=True,
+        target_channel="slack-arbitrary",
+        ifc_labels=labels,
+    )
+    assert configured.allowed is True
+    assert arbitrary.allowed is False
 
 
 def _approval_reply_source() -> SourceLabel:

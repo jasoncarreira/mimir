@@ -200,6 +200,8 @@ _SINK_CATEGORY_MAP: dict[str, SinkCategory] = {
     "execute": SinkCategory.SHELL_PROCESS,
     "aexecute": SinkCategory.SHELL_PROCESS,
     "shell": SinkCategory.SHELL_PROCESS,
+    "hands_edit": SinkCategory.EXTERNAL_MCP,
+    "hands_shell": SinkCategory.SHELL_PROCESS,
     "spawn_open_code": SinkCategory.SPAWN,
     "worklink_run": SinkCategory.SPAWN,
     "ntfy_send": SinkCategory.NOTIFICATION,
@@ -331,6 +333,9 @@ _TOOL_FLOW_MAP: dict[str, ToolFlowDirection] = {
     "execute": ToolFlowDirection.BOTH,
     "aexecute": ToolFlowDirection.BOTH,
     "shell": ToolFlowDirection.BOTH,
+    "hands_read": ToolFlowDirection.SOURCE,
+    "hands_edit": ToolFlowDirection.BOTH,
+    "hands_shell": ToolFlowDirection.BOTH,
     "Write": ToolFlowDirection.SINK,
     "Edit": ToolFlowDirection.SINK,
     "Read": ToolFlowDirection.SOURCE,
@@ -396,6 +401,75 @@ class ResourceScope:
     domain: str
     capabilities: frozenset[str] = frozenset()
     sink_destinations: frozenset[str] = frozenset()
+
+
+CLIENT_FILE_RESOURCE_NAMESPACE = "client-file"
+_CLIENT_FILE_UNRESERVED = frozenset(
+    b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~"
+)
+
+
+def canonical_client_file_resource(path: object) -> str | None:
+    if not isinstance(path, str) or not path or "\x00" in path:
+        return None
+    try:
+        encoded = path.encode("utf-8")
+    except UnicodeEncodeError:
+        return None
+    identity = "".join(
+        chr(value) if value in _CLIENT_FILE_UNRESERVED else f"%{value:02X}"
+        for value in encoded
+    )
+    return f"{CLIENT_FILE_RESOURCE_NAMESPACE}:{identity}"
+
+
+def client_file_resource_is_canonical(resource: object) -> bool:
+    prefix = f"{CLIENT_FILE_RESOURCE_NAMESPACE}:"
+    if not isinstance(resource, str) or not resource.startswith(prefix):
+        return False
+    encoded_identity = resource[len(prefix):]
+    if not encoded_identity:
+        return False
+    decoded = bytearray()
+    index = 0
+    while index < len(encoded_identity):
+        value = encoded_identity[index]
+        if ord(value) in _CLIENT_FILE_UNRESERVED:
+            decoded.append(ord(value))
+            index += 1
+            continue
+        if (
+            value != "%"
+            or index + 2 >= len(encoded_identity)
+            or not re.fullmatch(r"[0-9A-F]{2}", encoded_identity[index + 1:index + 3])
+        ):
+            return False
+        decoded.append(int(encoded_identity[index + 1:index + 3], 16))
+        index += 3
+    try:
+        path = bytes(decoded).decode("utf-8")
+    except UnicodeDecodeError:
+        return False
+    return canonical_client_file_resource(path) == resource
+
+
+@dataclass(frozen=True)
+class ClientFileResourcePolicy:
+    namespace: str
+    grant: str
+
+    def allows(self, resource: object) -> bool:
+        return (
+            self.namespace == CLIENT_FILE_RESOURCE_NAMESPACE
+            and self.grant == f"{CLIENT_FILE_RESOURCE_NAMESPACE}:*"
+            and client_file_resource_is_canonical(resource)
+        )
+
+
+CLIENT_FILE_RESOURCE_POLICY = ClientFileResourcePolicy(
+    namespace=CLIENT_FILE_RESOURCE_NAMESPACE,
+    grant=f"{CLIENT_FILE_RESOURCE_NAMESPACE}:*",
+)
 
 
 @dataclass(frozen=True)
@@ -5787,50 +5861,190 @@ def _has_untrusted_active_ingest(
     )
 
 
+def _same_channel_authority(
+    source: Any,
+    triggering_bridge_instance: str | None,
+) -> bool:
+    """Whether a source's channel id is scoped to the triggering authority.
+
+    A normalized channel id is unique within a bridge instance, not globally:
+    two independently scoped workspaces can each hold a channel that
+    normalizes to the same string. The same-channel shortcut admits with no
+    audience lookup, on the reasoning that the channel's own audience has
+    already seen the content -- which holds only if it is the same channel.
+
+    A mismatch declines the shortcut only. The flow stays eligible for the
+    audience arms below, which compare real audiences rather than strings.
+    """
+    source_domain = getattr(source, "domain", "") or ""
+    if not (source_domain == "channel" or source_domain.startswith("channel:")):
+        # Not a bridge-scoped channel source (e.g. a protected tool result
+        # carrying a "channel_metadata" domain); the shortcut is unaffected.
+        return True
+    source_bridge = getattr(source, "bridge_instance", None)
+    if not source_bridge or not triggering_bridge_instance:
+        # Unknown authority is not proof of the same authority. Treating it as
+        # compatible would let a channel-scoped source with no recorded bridge
+        # take the fast path and skip the audience lookup entirely.
+        return False
+    return source_bridge == triggering_bridge_instance
+
+
 def _source_is_triggering_channel_compatible(
     source: Any,
     *,
     effective_principal: str,
-    domain: str,
-    bridge_instance: str,
-    resolved_triggering: str,
+    triggering_principal: str | None,
+    resolved_triggering: str | None,
+    audience_provider: Any,
+    cross_platform_pull: bool,
+    admin_operator_cross_channel: bool = False,
+    triggering_bridge_instance: str | None = None,
 ) -> bool:
-    """Return whether one IFC source may flow to the triggering channel."""
+    """Return whether one IFC source may flow to the triggering channel.
+
+    After completeness and requester-ACL checks, ``agent_self`` permits trusted
+    informational data, while ``auto_recall`` and ``mcp`` require the destination
+    audience to be within their source ACL. All remaining kinds may use the
+    same-channel shortcut. Otherwise, ``recent_activity_user`` requires an owner
+    attestation and the requester-only destination audience;
+    ``owner_attested_feedback`` requires an attestation and the requester-only
+    canonical human audience; ``protected_prompt`` and
+    ``recent_activity_assistant`` require the destination audience to be within
+    the source channel audience; non-channel ``service`` data and
+    ``protected_tool`` retain their explicit allowances. ``channel``,
+    ``channel_scoped_feedback``, ``channel_bound_unowned_feedback``, and
+    ``feedback_chain`` have no further allowance. Unknown kinds likewise fail
+    closed after the shortcut. The admin-operator cross-channel path remains an
+    explicit bypass for every complete, requester-authorized kind.
+    """
     if not getattr(source, "is_complete", False):
         return False
-    # Fresh protected-result sources include the authenticated reader by
-    # construction; inherited or externally supplied labels do not, so keep
-    # this check as the fail-closed guard for those paths.
-    if effective_principal not in source.authorized_principals:
+    if not effective_principal:
         return False
+    if effective_principal not in getattr(source, "authorized_principals", ()):
+        return False
+    if admin_operator_cross_channel:
+        return True
     source_kind = getattr(source, "source_kind", "channel")
-    if source_kind == "channel":
-        return (
-            source.principal == effective_principal
-            and source.domain == domain
-            and source.bridge_instance == bridge_instance
-            and ChannelResourceAdapter._resolve_channel(source.resource_id)
-            == resolved_triggering
+    if (
+        source_kind == "agent_self"
+        and source.integrity == "trusted"
+        and source.integrity_effect == "informational"
+    ):
+        return True
+    if source_kind in {"auto_recall", "mcp"}:
+        if audience_provider is None or not resolved_triggering:
+            return False
+        try:
+            destination_audience = audience_provider.audience_for(
+                resolved_triggering, principal=effective_principal,
+            )
+        except Exception:
+            return False
+        # Membership above only proves that the requester may read the source.
+        # Both producers mint ACLs containing the requester, so it cannot prove
+        # that every other member of the destination audience may read it.
+        return bool(
+            destination_audience
+            and destination_audience <= source.authorized_principals
+        )
+    source_channel = ChannelResourceAdapter._resolve_channel(source.resource_id)
+    if (
+        source_channel
+        and resolved_triggering
+        and source_channel == resolved_triggering
+        and _same_channel_authority(source, triggering_bridge_instance)
+    ):
+        return True
+    if source_kind in {"recent_activity_user", "owner_attested_feedback"}:
+        from .models import OwnerAttestation
+
+        attestation = getattr(source, "owner_attestation", None)
+        if not isinstance(attestation, OwnerAttestation):
+            return False
+        if (
+            attestation.source_channel != source.resource_id
+            or attestation.canonical_principal != source.principal
+            or source.principal != effective_principal
+        ):
+            return False
+        if not cross_platform_pull and attestation.raw_author != triggering_principal:
+            return False
+        if audience_provider is None or not resolved_triggering:
+            return False
+        try:
+            destination_audience = audience_provider.audience_for(
+                resolved_triggering, principal=effective_principal,
+            )
+        except Exception:
+            return False
+        if source_kind == "recent_activity_user":
+            return destination_audience == frozenset({effective_principal})
+        try:
+            resolver = getattr(audience_provider, "identity_resolver", None)
+            identity = getattr(resolver, "identity", None)
+        except Exception:
+            return False
+        if (
+            not callable(identity)
+            or not isinstance(destination_audience, frozenset)
+            or not destination_audience
+        ):
+            return False
+        human_audience: set[str] = set()
+        for value in destination_audience:
+            if not isinstance(value, str) or not value.strip():
+                return False
+            if value.startswith("service:"):
+                continue
+            try:
+                resolved = identity(value)
+                canonical = getattr(resolved, "canonical", None)
+                is_service = getattr(
+                    getattr(resolved, "access", None),
+                    "is_service",
+                    False,
+                )
+            except Exception:
+                return False
+            if resolved is None:
+                return False
+            if not isinstance(canonical, str) or not canonical:
+                return False
+            if is_service:
+                continue
+            if canonical.startswith("service:"):
+                continue
+            human_audience.add(canonical)
+        return frozenset(human_audience) == frozenset({effective_principal})
+    if source_kind in {
+        "channel_scoped_feedback",
+        "channel_bound_unowned_feedback",
+    }:
+        return False
+    if source_kind in {"protected_prompt", "recent_activity_assistant"}:
+        if audience_provider is None or not source_channel or not resolved_triggering:
+            return False
+        try:
+            destination_audience = audience_provider.audience_for(
+                resolved_triggering, principal=effective_principal,
+            )
+            source_audience = audience_provider.audience_for(
+                source_channel, principal=source.principal,
+            )
+        except Exception:
+            return False
+        return bool(
+            destination_audience
+            and source_audience
+            and destination_audience <= source_audience
         )
     if source_kind == "service":
-        # Trusted service/derived data retains its input ACL. It may return only
-        # to the triggering channel when its channel provenance matches.
-        return not source.domain.startswith("channel") or (
-            source.bridge_instance == bridge_instance
-            and ChannelResourceAdapter._resolve_channel(source.resource_id)
-            == resolved_triggering
-        )
-    if source_kind == "protected_prompt":
-        # Trusted framework-written records may be surfaced across channels.
-        # Untrusted prompt records remain bound to their originating channel
-        # even when upstream authorization added the current requester to the
-        # ACL; the ACL alone must not declassify foreign-channel content.
-        return (
-            source.integrity == "trusted"
-            or ChannelResourceAdapter._resolve_channel(source.resource_id)
-            == resolved_triggering
-        )
-    return source_kind == "protected_tool"
+        return not source.domain.startswith("channel")
+    if source_kind == "protected_tool":
+        return True
+    return False
 
 
 def _ifc_blocking_source(
@@ -5863,16 +6077,20 @@ def _ifc_blocking_source(
             if service is not None
             else getattr(auth_context, "canonical_principal", None)
         )
-        domain = getattr(auth_context, "domain", None)
-        bridge_instance = getattr(auth_context, "bridge_instance", None)
-        if all((effective_principal, domain, bridge_instance, resolved_triggering)):
+        if effective_principal and resolved_triggering:
             for source in current.sources:
                 if not _source_is_triggering_channel_compatible(
                     source,
                     effective_principal=effective_principal,
-                    domain=domain,
-                    bridge_instance=bridge_instance,
+                    triggering_principal=getattr(auth_context, "principal", None),
                     resolved_triggering=resolved_triggering,
+                    audience_provider=getattr(auth_context, "audience_provider", None),
+                    cross_platform_pull=getattr(
+                        auth_context, "cross_platform_pull", True,
+                    ),
+                    triggering_bridge_instance=getattr(
+                        auth_context, "bridge_instance", None,
+                    ),
                 ):
                     return source, "causing_source"
 
@@ -6717,12 +6935,22 @@ class SinkGate:
             and target is not None
             and isinstance(sources, tuple)
             and bool(sources)
-            and all(
-                source.is_complete
-                and getattr(auth_context, "canonical_principal", None)
-                in source.authorized_principals
-                for source in sources
-            )
+            and all(_source_is_triggering_channel_compatible(
+                source,
+                effective_principal=getattr(
+                    auth_context, "canonical_principal", None,
+                ) or "",
+                triggering_principal=getattr(auth_context, "principal", None),
+                resolved_triggering=ChannelResourceAdapter._resolve_channel(
+                    triggering_channel,
+                ),
+                audience_provider=getattr(auth_context, "audience_provider", None),
+                cross_platform_pull=getattr(auth_context, "cross_platform_pull", True),
+                admin_operator_cross_channel=True,
+                triggering_bridge_instance=getattr(
+                    auth_context, "bridge_instance", None,
+                ),
+            ) for source in sources)
         ):
             return frozenset({resolved_target_channel})
         # As with web_search query egress, this trusted-operator allowance is a
@@ -6823,48 +7051,16 @@ class SinkGate:
                 resolved_target_channel or "", "MIMIR_OPERATOR_ALERT_CHANNEL",
             ):
                 return frozenset({resolved_target_channel})
-            from .models import TurnInteractivity
-
-            resolved_resource = ChannelResourceAdapter._resolve_channel(
-                getattr(auth_context, "resource_id", None),
-            )
-            canonical_principal = getattr(auth_context, "canonical_principal", None)
-            domain = getattr(auth_context, "domain", None)
-            bridge_instance = getattr(auth_context, "bridge_instance", None)
-            sources = getattr(ifc_labels, "sources", ())
-            has_authenticated_ingress = any(
-                source.source_kind == "channel"
-                and source.principal == canonical_principal
-                and source.domain == domain
-                and ChannelResourceAdapter._resolve_channel(source.resource_id)
-                == resolved_resource
-                and source.bridge_instance == bridge_instance
-                and canonical_principal in source.authorized_principals
-                and source.integrity == "trusted"
-                and source.integrity_effect == "active_ingest"
-                for source in sources
-            )
-            if (
-                getattr(auth_context, "trigger", None) == "user_message"
-                and getattr(auth_context, "interactivity", None)
-                is TurnInteractivity.INTERACTIVE
-                and getattr(auth_context, "event_ingress", None) is None
-                and has_authenticated_ingress
-                and resolved_resource == resolved_triggering == resolved_target_channel
-            ):
-                return frozenset({resolved_target_channel})
 
         canonical_principal = getattr(auth_context, "canonical_principal", None)
         service = get_trusted_service_from_auth_context(auth_context)
         service_source_principal = (
             f"service:{service.canonical}" if service is not None else None
         )
-        domain = getattr(auth_context, "domain", None)
         resource_id = getattr(auth_context, "resource_id", None)
-        bridge_instance = getattr(auth_context, "bridge_instance", None)
         sources = getattr(ifc_labels, "sources", None)
         effective_principal = service_source_principal or canonical_principal
-        if not all((effective_principal, domain, resource_id, bridge_instance)):
+        if not all((effective_principal, resource_id)):
             return frozenset()
         if not isinstance(sources, tuple) or not sources:
             return frozenset()
@@ -6873,9 +7069,13 @@ class SinkGate:
             if not _source_is_triggering_channel_compatible(
                 source,
                 effective_principal=effective_principal,
-                domain=domain,
-                bridge_instance=bridge_instance,
+                triggering_principal=getattr(auth_context, "principal", None),
                 resolved_triggering=resolved_triggering,
+                audience_provider=getattr(auth_context, "audience_provider", None),
+                cross_platform_pull=getattr(auth_context, "cross_platform_pull", True),
+                triggering_bridge_instance=getattr(
+                    auth_context, "bridge_instance", None,
+                ),
             ):
                 return frozenset()
         if ChannelResourceAdapter._resolve_channel(resource_id) != resolved_triggering:
@@ -7405,6 +7605,7 @@ class OperationCatalog:
         READ_RESOURCE_OPERATIONS
         | WriteResourceAdapter._RESOURCE_OPERATIONS
         | frozenset(_TYPED_REPO_PR_TOOL_ACTIONS)
+        | frozenset({"hands_read"})
     )
 
     _ADMIN_REQUIRED_OPERATIONS: frozenset[str] = frozenset({
@@ -7437,6 +7638,8 @@ class OperationCatalog:
         "download_files",
         "adownload_files",
         "rebuild_index",
+        "hands_edit",
+        "hands_shell",
     })
 
     # Global rows from these operations contain protected identities,
@@ -7984,8 +8187,8 @@ class ToolAuthorization:
     protected_source_resources: tuple[str, ...] | None = None
     protected_sink_resources: tuple[str, ...] | None = None
     flow_direction: ToolFlowDirection = ToolFlowDirection.UNKNOWN
-    # Resolved once from immutable MCP provenance. Non-MCP and error paths use
-    # the fail-closed posture and never perform a mutable policy lookup.
+    # Resolved once from immutable authorization provenance. MCP tools and
+    # hands_read consume it without performing a mutable policy lookup.
     result_integrity: str = "untrusted"
     argument_egress: str = "taint_gated"
     repo_pr_action_scope: Any = field(default=None, repr=False)
@@ -8069,7 +8272,11 @@ def _operator_can_invoke_admin_shell(
     ifc_labels: Any,
     auth_context: "AuthContext | None",
 ) -> bool:
-    """Admit shell only for an authenticated human on their live bridge turn."""
+    """Widen ``shell_exec`` to authenticated users on their live bridge turn.
+
+    Admin-only tools, including ``hands_shell``, use the ordinary admin-role
+    authorization path instead of this user-level shell exception.
+    """
     roles = (getattr(auth_context, "roles", ()) or ()) if auth_context else ()
     return (
         tool_name == "shell_exec"
@@ -8584,6 +8791,63 @@ class ToolRegistry:
                 is_shadow = True
                 would_block = True
         elif decision == OperationDecision.RESOURCE_SCOPED:
+            if tool_name == "hands_read":
+                from .tools.client_provider import (
+                    MIMIR_HANDS_V1,
+                    get_turn_capability_context,
+                )
+
+                capability_context = get_turn_capability_context()
+                profile = getattr(capability_context, "profile_policy", None)
+                resource_policy = getattr(profile, "resource_policy", None)
+                resource = canonical_client_file_resource(
+                    (arguments or {}).get("path")
+                )
+                authenticated_admin = (
+                    auth_context is not None
+                    and isinstance(getattr(auth_context, "principal", None), str)
+                    and bool(auth_context.principal)
+                    and isinstance(
+                        getattr(auth_context, "canonical_principal", None), str
+                    )
+                    and bool(auth_context.canonical_principal)
+                    and "admin" in (getattr(auth_context, "roles", ()) or ())
+                )
+                admitted = (
+                    capability_context is not None
+                    and capability_context.acp_delivery is True
+                    and profile is MIMIR_HANDS_V1
+                    and resource_policy is CLIENT_FILE_RESOURCE_POLICY
+                    and resource_policy.namespace == CLIENT_FILE_RESOURCE_NAMESPACE
+                    and resource_policy.grant
+                    == f"{CLIENT_FILE_RESOURCE_NAMESPACE}:*"
+                    and resource is not None
+                    and resource_policy.allows(resource)
+                    and getattr(capability_context, "lease", None) is not None
+                    and not getattr(capability_context.lease, "closed", False)
+                )
+                in_scope = authenticated_admin and admitted
+                hands_auth = ToolAuthorization(
+                    tool_name=tool_name,
+                    decision=OperationDecision.RESOURCE_SCOPED,
+                    allowed=in_scope or not enforce,
+                    reason=None if in_scope else "client_file_scope_denied",
+                    required_tier=AccessTier.USER if in_scope else AccessTier.ADMIN,
+                    enforcement_enabled=enforce,
+                    is_shadow_decision=not enforce and not in_scope,
+                    would_block=not in_scope,
+                    protected_source_resources=(resource,) if in_scope else (),
+                    flow_direction=flow_direction,
+                    result_integrity="untrusted",
+                )
+                if hands_auth.is_shadow_decision:
+                    self._emit_shadow_decision(
+                        hands_auth,
+                        auth_context=auth_context,
+                        target=resource,
+                        requested_target=(arguments or {}).get("path"),
+                    )
+                return hands_auth
             if tool_name in _TYPED_REPO_PR_TOOL_ACTIONS:
                 forge_auth = authorize_repo_pr_tool(
                     tool_name,
@@ -8816,6 +9080,13 @@ _PROTECTED_RESULT_DOMAINS: dict[str, str] = {
     "repo_test": "repository",
     "repo_diff": "repository",
     "repo_unmerged": "repository",
+    "hands_read": "client_provider",
+    # Bytes returned from the client host are content the agent did not author,
+    # so every Hands result is a protected result in the client_provider domain --
+    # not only the read. main's inventory-completeness check (added while this
+    # branch was diverged) is what surfaces the omission.
+    "hands_edit": "client_provider",
+    "hands_shell": "client_provider",
     "pr_submit_review": "repository",
     "pr_inline_review_comment": "repository",
     "pr_comment": "repository",
@@ -8924,6 +9195,7 @@ _READ_BACKEND_RESULT_TOOLS = frozenset({
     "repo_test",
     "repo_diff",
     "repo_unmerged",
+    "hands_read",
 })
 
 _SELF_AUTHORED_FILE_ROOTS = frozenset({
@@ -9560,17 +9832,29 @@ def repair_file_write_integrity(
 def _incomplete_protected_result(
     domain: str,
     arguments: dict[str, Any],
+    *,
+    tool_name: str,
+    auth_context: "AuthContext | None",
 ) -> "InformationFlowLabels":
     from .models import InformationFlowLabels, SourceLabel
 
     resource = next(
         (
             arguments.get(key)
-            for key in ("path", "file_path", "query", "turn_id", "atom_id", "job_id")
+            for key in ("path", "file_path", "turn_id", "atom_id", "job_id")
             if isinstance(arguments.get(key), str) and arguments.get(key)
         ),
-        "unknown",
+        None,
     )
+    channel = getattr(auth_context, "channel_id", None)
+    bridge = getattr(auth_context, "bridge_instance", None)
+    if resource is None and (
+        bridge == "acp-stdio"
+        or isinstance(channel, str) and channel.startswith("acp:")
+    ):
+        resource = channel
+    if resource is None:
+        resource = f"<unresolved-resource:protected_tool:{tool_name}>"
     return InformationFlowLabels().with_source(SourceLabel(
         principal=None,
         domain=domain,
@@ -9581,6 +9865,50 @@ def _incomplete_protected_result(
         source_kind="protected_tool",
         integrity="untrusted",
         integrity_effect="active_ingest",
+    ))
+
+
+def _acp_failed_tool_error_result(
+    result: Any,
+    auth_context: "AuthContext | None",
+    provenance: ProtectedResultProvenance | None,
+) -> "InformationFlowLabels | None":
+    """Label an error-only ACP result as informational session-channel input."""
+    from langchain_core.messages import ToolMessage
+
+    from .models import InformationFlowLabels, SourceLabel
+    from .tools.client_provider import ClientProviderResultError
+
+    if (
+        provenance is not None
+        or not (
+            isinstance(result, ClientProviderResultError)
+            or (
+                isinstance(result, ToolMessage)
+                and getattr(result, "status", None) == "error"
+            )
+        )
+        or getattr(auth_context, "origin_trigger", None) != "acp_session"
+    ):
+        return None
+    principal = getattr(auth_context, "canonical_principal", None)
+    channel = getattr(auth_context, "channel_id", None)
+    bridge = getattr(auth_context, "bridge_instance", None)
+    domain = getattr(auth_context, "domain", None)
+    if not all(isinstance(value, str) and value for value in (
+        principal, channel, bridge, domain,
+    )):
+        return None
+    return InformationFlowLabels().with_source(SourceLabel(
+        principal=principal,
+        domain=domain,
+        resource_id=channel,
+        bridge_instance=bridge,
+        sensitivity="private",
+        authorized_principals=frozenset({principal}),
+        source_kind="channel",
+        integrity="untrusted",
+        integrity_effect="informational",
     ))
 
 
@@ -9626,12 +9954,19 @@ def classify_protected_result(
         and _result_matches_policy_refusal(result, policy_refusal)
     ):
         return None
+    acp_error_labels = _acp_failed_tool_error_result(
+        result, auth_context, provenance,
+    )
+    if failed and acp_error_labels is not None:
+        return acp_error_labels
 
     args = arguments or {}
     if tool_name in _REPOSITORY_RESULT_TOOLS:
         scope = authorization.repo_pr_action_scope
         if scope is None:
-            return _incomplete_protected_result("repository", args)
+            return _incomplete_protected_result(
+                "repository", args, tool_name=tool_name, auth_context=auth_context,
+            )
         principal = getattr(auth_context, "canonical_principal", None)
         if getattr(auth_context, "is_service", False) and principal:
             principal = f"service:{principal}"
@@ -9680,6 +10015,41 @@ def classify_protected_result(
         )
         return InformationFlowLabels().with_source(source)
 
+    if tool_name == "hands_read":
+        resources = authorization.protected_source_resources
+        if resources == ():
+            return None
+        if resources is None or failed:
+            return _incomplete_protected_result(
+                "client_provider", args,
+                tool_name=tool_name,
+                auth_context=auth_context,
+            )
+        principal = getattr(auth_context, "canonical_principal", None)
+        bridge_instance = getattr(auth_context, "bridge_instance", None)
+        integrity = (
+            "trusted" if authorization.result_integrity == "trusted" else "untrusted"
+        )
+        labels = InformationFlowLabels()
+        for resource in resources:
+            # protected_tool intentionally skips destination-audience checks here:
+            # hands_read is an explicit read by the principal in this channel,
+            # unlike automatic auto_recall or requester-scoped MCP provenance.
+            labels = labels.with_source(SourceLabel(
+                principal=principal,
+                domain="client_provider",
+                resource_id=resource,
+                bridge_instance=bridge_instance,
+                sensitivity="internal",
+                authorized_principals=(
+                    frozenset({principal}) if principal else frozenset()
+                ),
+                source_kind="protected_tool",
+                integrity=integrity,
+                integrity_effect="active_ingest",
+            ))
+        return labels
+
     if tool_name.startswith(MCPResourceAdapter._MCP_TOOL_PREFIX):
         resources = authorization.protected_source_resources
         if resources == ():
@@ -9691,7 +10061,8 @@ def classify_protected_result(
             if not failed and authorization.result_integrity == "trusted"
             else "untrusted"
         )
-        for resource in resources or ("unknown",):
+        unresolved = f"<unresolved-resource:mcp:{tool_name}>"
+        for resource in resources or (unresolved,):
             labels = labels.with_source(SourceLabel(
                 principal=principal if resources is not None else None,
                 domain="mcp",
@@ -9759,7 +10130,9 @@ def classify_protected_result(
         domain = "unknown"
 
     if failed:
-        return _incomplete_protected_result(domain, args)
+        return _incomplete_protected_result(
+            domain, args, tool_name=tool_name, auth_context=auth_context,
+        )
 
     if provenance is not None:
         if not provenance.sources:
@@ -9789,7 +10162,9 @@ def classify_protected_result(
             if source.integrity == "trusted":
                 return InformationFlowLabels().with_source(source)
 
-    return _incomplete_protected_result(domain, args)
+    return _incomplete_protected_result(
+        domain, args, tool_name=tool_name, auth_context=auth_context,
+    )
 
 
 _global_tool_registry = ToolRegistry()
@@ -9984,6 +10359,7 @@ _OPERATION_READABLE_DOMAIN: dict[str, str] = {
     "mimir_get_turn": "turn_history",
     "memory_query": "saga",
     "memory_get": "saga",
+    "hands_read": "client_provider",
     **{
         operation: "repository"
         for operation, direction in _TOOL_FLOW_MAP.items()
@@ -10036,6 +10412,8 @@ _OPERATION_SINK_DESTINATION: dict[str, str] = {
     "execute": "shell_process",
     "aexecute": "shell_process",
     "shell": "shell_process",
+    "hands_edit": "client_provider",
+    "hands_shell": "shell_process",
     "Write": "filesystem",
     "Edit": "filesystem",
     "harness_auto_deliver": "message",
@@ -10733,6 +11111,8 @@ def create_auth_context(
     enforce: bool = False,
     event_ingress: str | None = None,
     ifc_labels: "InformationFlowLabels | None" = None,
+    audience_provider: Any = None,
+    cross_platform_pull: bool = True,
 ) -> "AuthContext":
     """Create a frozen AuthContext from an inbound event (chainlink #864).
 
@@ -10862,4 +11242,43 @@ def create_auth_context(
             else event.trigger
         ),
         origin_ref=event.source_id,
+        audience_provider=audience_provider,
+        cross_platform_pull=cross_platform_pull,
+    )
+
+
+@dataclass(frozen=True)
+class _LocalOperatorResolver:
+    principal: str
+
+    def resolve(self, author: str | None) -> str | None:
+        return author
+
+    def access_metadata(self, author: str | None) -> AccessMetadata:
+        if author == self.principal:
+            return AccessMetadata(roles=("admin",))
+        return AccessMetadata()
+
+    def resolve_channel(self, channel_id: str | None) -> str | None:
+        return channel_id
+
+
+def create_local_operator_auth_context(
+    *,
+    principal: str,
+    trigger: str,
+    channel_id: str | None,
+    enforce: bool = False,
+) -> "AuthContext":
+    from .models import AgentEvent
+
+    event = AgentEvent(
+        trigger=trigger,
+        channel_id=channel_id,
+        author=principal,
+    )
+    return create_auth_context(
+        event,
+        _LocalOperatorResolver(principal),
+        enforce=enforce,
     )

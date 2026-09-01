@@ -13,7 +13,12 @@ from pathlib import Path
 
 import pytest
 
-from mimir.event_logger import EventLogger, safe_log_event, init_logger
+from mimir.event_logger import (
+    FEEDBACK_EVENT_VERSION,
+    EventLogger,
+    init_logger,
+    safe_log_event,
+)
 
 
 def _append_from_process(
@@ -257,6 +262,35 @@ async def test_log_redacts_token_shaped_values_recursively(tmp_path: Path):
 
 
 @pytest.mark.asyncio
+async def test_feedback_v1_metadata_survives_redaction_and_jsonl_round_trip(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "events.jsonl"
+    logger = EventLogger(path, session_id="proc-feedback")
+    secret = "github_pat_11ABCDEFG_xyz0123"
+
+    await logger.log(
+        "react_received",
+        event_version=FEEDBACK_EVENT_VERSION,
+        owner_principal="alice",
+        detail=f"token={secret}",
+    )
+    logger.log_sync(
+        "react_received",
+        event_version=FEEDBACK_EVENT_VERSION,
+        owner_principal=None,
+        detail=f"token={secret}",
+    )
+
+    records = [json.loads(line) for line in path.read_text().splitlines()]
+    assert [record["event_version"] for record in records] == ["v1", "v1"]
+    assert [record["owner_principal"] for record in records] == ["alice", None]
+    assert [record["detail"] for record in records] == [
+        "token=[REDACTED]",
+        "token=[REDACTED]",
+    ]
+    assert secret not in path.read_text()
+
 async def test_part_a_log_payload_failures_never_reach_caller(tmp_path: Path):
     class RaisingRepr:
         def __str__(self) -> str:

@@ -729,6 +729,13 @@ def main(argv: Sequence[str] | None = None) -> None:
         # Defer import — server pulls in aiohttp/SDK; keep `mimir setup`
         # snappy and importable in environments where the runtime isn't
         # fully wired up yet.
+        from .acp.daemon import AcpDaemonError, acp_enabled_from_env
+
+        try:
+            acp_enabled_from_env()
+        except AcpDaemonError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            sys.exit(1)
         from .server import main as run_server
 
         run_server()

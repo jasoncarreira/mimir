@@ -49,7 +49,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Awaitable, Callable
@@ -187,7 +187,7 @@ def _save_state(persist_dir: Path, state: dict) -> None:
 
 def _event_to_stash(event: AgentEvent) -> dict[str, Any]:
     """Return a JSON-native event payload without stringifying IFC sets."""
-    payload = asdict(event)
+    payload = asdict(replace(event, continuation_auth_context=None))
     # Authority is never persisted in the poller-writable recovery file. The
     # live scheduler reattaches its immutable manifest grant on re-enqueue.
     payload.pop("service_authority", None)
@@ -274,6 +274,9 @@ def _event_from_stash(d: Any) -> AgentEvent | None:
         return None
     try:
         payload = dict(d)
+        payload.pop("audience_provider", None)
+        payload.pop("owner_attestation", None)
+        payload["continuation_auth_context"] = None
         raw_labels = payload.get("ifc_labels")
         if isinstance(raw_labels, dict):
             raw_sources = raw_labels.get("sources") or ()

@@ -7,7 +7,7 @@ from textwrap import dedent
 
 import pytest
 
-from mimir.identities import AccessMetadata, IdentityResolver
+from mimir.identities import AccessMetadata, IdentityResolver, hash_web_key
 
 
 def _write_identities(tmp_path: Path, body: str) -> IdentityResolver:
@@ -283,6 +283,35 @@ def test_reload_picks_up_changes(tmp_path: Path):
     )
     r.reload()
     assert r.resolve("discord-456") == "alice"
+
+
+def test_web_key_resolution_does_not_reread_unchanged_source(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    r = _write_identities(
+        tmp_path,
+        f"""\
+        people:
+          - canonical: alice
+            aliases: [{hash_web_key("secret")}]
+        """,
+    )
+    identities_path = tmp_path / "state" / "identities.yaml"
+    original_read_text = Path.read_text
+    reads = 0
+
+    def counted_read_text(path: Path, *args, **kwargs):
+        nonlocal reads
+        if path == identities_path:
+            reads += 1
+        return original_read_text(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", counted_read_text)
+
+    for key in ("secret", "unknown", "secret"):
+        r.resolve_web_key(key)
+    assert reads == 0
 
 
 def test_top_level_not_a_dict_treated_empty(tmp_path: Path):

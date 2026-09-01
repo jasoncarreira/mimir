@@ -22,6 +22,7 @@ from mimir.commitments import (
     make_commitment_id,
     make_dedupe_key,
 )
+from mimir.commitments.models import CommitmentOwnershipProvenance
 
 
 # ─── make_dedupe_key ────────────────────────────────────────────────
@@ -105,6 +106,89 @@ async def test_add_and_replay_round_trips(tmp_path: Path):
     assert out.kind == CommitmentKind.AGENT_PROMISE.value
     assert out.dedupe_key  # auto-filled
     assert out.created_at_unix > 0  # auto-filled
+
+
+@pytest.mark.asyncio
+async def test_ownership_provenance_round_trips_as_typed_enum(tmp_path: Path):
+    store = CommitmentsStore(path=tmp_path / "commitments.jsonl")
+    rec = await store.add(CommitmentRecord(
+        id=make_commitment_id(),
+        channel_id="chan-1",
+        text="Review PR #111",
+        owner_principal="user:alice",
+        ownership_provenance=CommitmentOwnershipProvenance.EXTRACTION_ACL,
+    ))
+
+    added_event = json.loads(store.path.read_text().splitlines()[0])
+    assert added_event["record"]["ownership_provenance"] == "extraction_acl"
+    replayed = store.current_state()[rec.id]
+    assert (
+        replayed.ownership_provenance
+        is CommitmentOwnershipProvenance.EXTRACTION_ACL
+    )
+
+
+@pytest.mark.parametrize("persisted_value", ["missing", "unknown"])
+def test_historical_ownership_provenance_defaults_to_none_without_rewrite(
+    tmp_path: Path, persisted_value: str,
+):
+    path = tmp_path / f"{persisted_value}.jsonl"
+    record = CommitmentRecord(
+        id=f"c-{persisted_value}", channel_id="ch-1", text="Historical",
+    ).to_dict()
+    if persisted_value == "missing":
+        record.pop("ownership_provenance")
+    else:
+        record["ownership_provenance"] = "copied_owner"
+    path.write_text(json.dumps({
+        "type": "commitment_added",
+        "id": record["id"],
+        "record": record,
+    }) + "\n")
+    before = path.read_bytes()
+
+    replayed = CommitmentsStore(path=path).current_state()[record["id"]]
+
+    assert replayed.ownership_provenance is None
+    assert path.read_bytes() == before
+
+
+def test_lifecycle_replay_cannot_set_clear_or_replace_ownership_provenance():
+    lifecycle_events = {
+        "commitment_pileup_alarmed": {"at_unix": 1.0},
+        "commitment_delivered": {"at_unix": 1.0},
+        "commitment_completed": {"at_unix": 1.0, "message_id": "m-1"},
+        "commitment_snoozed": {"until_unix": 2.0, "reason": "later"},
+        "commitment_dismissed": {"at_unix": 1.0, "reason": "done"},
+        "commitment_expired": {"at_unix": 1.0},
+    }
+    provenance_cases = (
+        (CommitmentOwnershipProvenance.EXTRACTION_ACL, None),
+        (None, CommitmentOwnershipProvenance.EXTRACTION_ACL.value),
+        (CommitmentOwnershipProvenance.EXTRACTION_ACL, "unknown"),
+    )
+
+    for event_type, payload in lifecycle_events.items():
+        for initial, attempted in provenance_cases:
+            record = CommitmentRecord(
+                id=f"c-{event_type}",
+                channel_id="ch-1",
+                text="X",
+                ownership_provenance=initial,
+            )
+            records = {record.id: record}
+            CommitmentsStore._apply_event(records, {
+                "type": event_type,
+                "id": record.id,
+                "ownership_provenance": attempted,
+                **payload,
+            })
+
+            assert records[record.id].ownership_provenance is initial
+            if event_type == "commitment_pileup_alarmed":
+                assert records[record.id].pileup_alarmed_at_unix == 1.0
+            else:
+                assert records[record.id].status != CommitmentStatus.PENDING.value
 
 
 def test_ownerless_migration_uses_only_authoritative_session_acl(tmp_path: Path):
@@ -722,6 +806,7 @@ async def test_replay_duplicate_add_keeps_first(tmp_path: Path):
     cid = make_commitment_id()
     rec = await store.add(CommitmentRecord(
         id=cid, channel_id="c1", text="original",
+        ownership_provenance=CommitmentOwnershipProvenance.EXTRACTION_ACL,
     ))
     await store.deliver(rec.id)
     await store.deliver(rec.id)
@@ -734,6 +819,10 @@ async def test_replay_duplicate_add_keeps_first(tmp_path: Path):
     assert state[cid].text == "original"
     assert state[cid].status == CommitmentStatus.DELIVERED.value
     assert state[cid].attempts == 2
+    assert (
+        state[cid].ownership_provenance
+        is CommitmentOwnershipProvenance.EXTRACTION_ACL
+    )
 
 
 # ─── Snooze due-window bumping (review #3) ───────────────────────────

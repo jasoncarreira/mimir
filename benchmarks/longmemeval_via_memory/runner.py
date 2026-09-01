@@ -45,7 +45,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from mimir.models import AuthContext, TurnInteractivity
+from mimir.access_control import create_local_operator_auth_context
+from mimir.models import AuthContext
 
 
 # ─── Bench knobs ─────────────────────────────────────────────────────
@@ -79,15 +80,11 @@ def _benchmark_auth_context() -> AuthContext:
     in both compatibility and enforced modes.  Constructing this once per
     question prevents generated-boundary writes and retrieval from drifting.
     """
-    return AuthContext(
+    return create_local_operator_auth_context(
         principal="benchmark-operator",
-        canonical_principal="benchmark-operator",
-        roles=("admin",),
-        event_ingress=None,
         trigger="longmemeval",
         channel_id="longmemeval",
-        interactivity=TurnInteractivity.NON_INTERACTIVE,
-        enforcement_enabled=_access_control_enforced(),
+        enforce=_access_control_enforced(),
     )
 
 

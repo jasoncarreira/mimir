@@ -123,7 +123,12 @@ def is_bash_tool(tool_name: str) -> bool:
     # ``mcp__mimir__shell_exec`` and ``mcp_mimir_shell_exec`` have both
     # appeared. Match the final component so a normalized MCP shell alias
     # still gets screened before execution.
-    suffix_match = any(
+    # Restricted to MCP-prefixed aliases, which is what the comment above
+    # describes and what the mcp_shell_match below already enforces for bare
+    # "shell". Without the prefix requirement an unrelated application tool such
+    # as ``client_hands_shell`` matches ``_hands_shell`` and is screened as a
+    # shell tool.
+    suffix_match = normalized.startswith("mcp") and any(
         normalized.endswith(f"__{name}") or normalized.endswith(f"_{name}")
         for name in _NORMALIZED_SHELL_PROCESS_TOOL_NAMES - {"shell"}
     )

@@ -99,6 +99,15 @@ def _env_int(name: str, default: int) -> int:
         return default
 
 
+def _env_positive_decimal(name: str, default: int) -> int:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    if re.fullmatch(r"[0-9]+", raw) is None or int(raw) <= 0:
+        raise ValueError(f"{name} must be a positive decimal integer")
+    return int(raw)
+
+
 # Hard ceilings on the JSONL log caps. The reflection skill filters to the
 # last 7 days, the algedonic prompt block bounds itself by hours+limit, and
 # tail-streamed reads keep prompt-assembly cost O(window) regardless of
@@ -1140,6 +1149,7 @@ class Config:
     # read/edit, as ``(abs_path, "ro"|"rw")`` pairs (chainlink #650). Empty =
     # home-only (today's behavior). ``MIMIR_FILE_TOOL_ROOTS``.
     file_tool_roots: tuple[tuple[str, str], ...] = ()
+    acp_journal_ttl_days: int = 7
     # Per-process cap for concurrent web-chat SSE subscribers.
     chat_stream_max_subscribers: int = 8
 
@@ -1217,9 +1227,10 @@ class Config:
             recent_author_cross=_env_int("MIMIR_RECENT_AUTHOR_CROSS", 10),
             recent_cross_hours=_env_int("MIMIR_RECENT_CROSS_HOURS", 24),
             recent_sources=_parse_sources(
-                _env_allow_empty(
-                    "MIMIR_RECENT_SOURCES", "slack,discord,bluesky,web,stdin"
-                )
+                    _env_allow_empty(
+                        "MIMIR_RECENT_SOURCES",
+                        "slack,discord,bluesky,web,stdin,acp",
+                    )
             ),
             recent_message_chars=_env_int("MIMIR_RECENT_MESSAGE_CHARS", 4096),
 
@@ -1411,6 +1422,9 @@ class Config:
             max_turns_kept=_turns_cap(),
             max_events_kept=_events_cap(),
             turns_archive_dir=Path(archive_dir).resolve() if archive_dir else None,
+            acp_journal_ttl_days=_env_positive_decimal(
+                "MIMIR_ACP_JOURNAL_TTL_DAYS", 7
+            ),
         )
 
     @property

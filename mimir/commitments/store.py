@@ -33,6 +33,7 @@ from .models import (
     DEFAULT_SNOOZE_WINDOW_SECS,
     EVENT_TO_TARGET_STATUS,
     VALID_TRANSITIONS,
+    CommitmentOwnershipProvenance,
     CommitmentRecord,
     CommitmentStatus,
     CommitmentVisibility,
@@ -659,6 +660,15 @@ class CommitmentsStore:
                 )
                 return
             rec_data = event.get("record") or {}
+            if isinstance(rec_data, dict):
+                rec_data = dict(rec_data)
+                raw_provenance = rec_data.get("ownership_provenance")
+                rec_data["ownership_provenance"] = (
+                    CommitmentOwnershipProvenance.EXTRACTION_ACL
+                    if raw_provenance
+                    == CommitmentOwnershipProvenance.EXTRACTION_ACL.value
+                    else None
+                )
             try:
                 records[rid] = CommitmentRecord(**rec_data)
             except TypeError as exc:

@@ -61,6 +61,43 @@ CREDENTIAL_CORPUS = [
 ]
 
 
+CREDENTIAL_CORPUS = [
+    pytest.param("ghp_" + "a" * 36, id="github-classic-pat"),
+    pytest.param("gho_" + "b" * 36, id="github-oauth"),
+    pytest.param("ghu_" + "c" * 36, id="github-user-to-server"),
+    pytest.param("ghs_" + "d" * 36, id="github-app-installation"),
+    pytest.param("ghr_" + "e" * 36, id="github-refresh"),
+    pytest.param("github_pat_" + "A" * 60, id="github-fine-grained-pat"),
+    pytest.param("sk-ant-" + "A1b2" * 6, id="anthropic"),
+    pytest.param("sk-proj-" + "B" * 24, id="openai-project"),
+    pytest.param("sk-" + "C" * 24, id="openai-classic"),
+    pytest.param("Authorization: Bearer " + "z" * 30, id="bearer"),
+    pytest.param("AKIA" + "A" * 16, id="aws-access-key"),
+    pytest.param("ASIA" + "0" * 16, id="aws-sts-access-key"),
+    pytest.param(
+        "AWS_SECRET_ACCESS_KEY=" + "aB0/" * 10,
+        id="aws-secret-access-key-assignment",
+    ),
+    pytest.param(
+        'config = {"refresh_token": "' + "x" * 30 + '"}',
+        id="oauth-refresh-json",
+    ),
+    pytest.param(
+        'config = {"access_token": "' + "y" * 30 + '"}',
+        id="oauth-access-json",
+    ),
+    pytest.param(
+        'config = {"client_secret": "' + "z" * 30 + '"}',
+        id="oauth-client-secret-json",
+    ),
+    pytest.param("xoxb-" + "A" * 24, id="slack-bot"),
+    pytest.param("xoxp-" + "B" * 24, id="slack-user"),
+    pytest.param("xoxa-" + "C" * 24, id="slack-app"),
+    pytest.param("xoxs-" + "D" * 24, id="slack-config"),
+    pytest.param("xoxr-" + "E" * 24, id="slack-refresh"),
+    pytest.param("M" * 24 + "." + "n" * 6 + "." + "o" * 27, id="discord-bot"),
+]
+
 def test_module_and_pre_commit_pattern_lists_stay_in_step() -> None:
     hook = Path(__file__).parents[1] / "mimir" / "templates" / "git" / "pre-commit"
     hook_patterns: list[str] = []

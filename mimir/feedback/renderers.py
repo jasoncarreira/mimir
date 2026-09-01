@@ -17,6 +17,13 @@ from ..prompt_safety import (
 
 log = logging.getLogger(__name__)
 
+CHANNEL_SCOPED_FREE_TEXT_KINDS = frozenset({
+    "commitment_due",
+    "commitment_expired",
+    "commitment_snooze_pileup",
+    "react",
+})
+
 # Render hooks: per-kind one-liner builders. Defaults to a generic
 # "<kind>: <event-type-specific note>" if no specialized renderer fits.
 def _render_skill_details(items: object, *, limit: int = 4) -> str:

@@ -60,6 +60,12 @@ jobs:
           --sdist-wheel dist/*.whl
           --direct-wheel dist/direct/*.whl
 
+      - name: Smoke installed direct wheel
+        run: python .github/assert_installed_acp.py dist/direct/*.whl
+
+      - name: Smoke installed source sdist
+        run: python .github/assert_installed_acp.py dist/*.tar.gz
+
   skill-conformance:
     # Fast gate (<1s of pytest work). Surfaces a single status check
     # SKILL-authors can grep for on a PR. Closes the body-vs-declared

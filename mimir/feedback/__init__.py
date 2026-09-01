@@ -28,7 +28,7 @@ from __future__ import annotations
 import json
 import logging
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Literal
@@ -43,6 +43,11 @@ from ..models import (
     AuthContext,
     InformationFlowLabels,
     PromptBlock,
+)
+from ..channel_audience import attest_owner
+from ..access_control import (
+    ChannelResourceAdapter,
+    _source_is_triggering_channel_compatible,
 )
 from .. import prompt_sources
 
@@ -77,6 +82,7 @@ from .runs import (  # noqa: F401
     _synthesize_chain_signals,
 )
 from .renderers import (  # noqa: F401
+    CHANNEL_SCOPED_FREE_TEXT_KINDS,
     _FIELD_MAX_LEN,
     _CONTROL_CHARS_RE,
     _sanitize_field,
@@ -108,11 +114,73 @@ _AGENT_SELF_EVENT_KINDS = frozenset({
     "wiki_backlinks_unhealthy",
 })
 _AGENT_SELF_EVENT_PREFIXES = ("claude_code_spawn_",)
+_VALENCE_CHAIN_INPUT_KINDS = frozenset(
+    kind
+    for group in _VALENCE_GROUPS.values()
+    for kind in (*group.positive_kinds, *group.negative_kinds)
+)
 _AGENT_SELF_CHANNEL_CARRIERS = frozenset({
     "cross_turn_send_duplicate",
     "send_message_loop_hard_stop",
     "send_message_loop_warning",
 })
+_OWNER_ATTESTED_COMMITMENT_KINDS = frozenset({
+    "commitment_due",
+    "commitment_expired",
+    "commitment_snooze_pileup",
+})
+_DISCORD_REACTION_AUTHOR_RE = re.compile(r"discord-[0-9]+")
+_SLACK_REACTION_AUTHOR_RE = re.compile(r"slack-[UW][A-Z0-9]+")
+
+
+def _nonempty_string(value: object) -> bool:
+    return isinstance(value, str) and bool(value.strip())
+
+
+def _reaction_author(record: dict) -> str | None:
+    bridge = record.get("bridge")
+    author = record.get("author")
+    if not isinstance(author, str):
+        return None
+    if bridge == "discord" and _DISCORD_REACTION_AUTHOR_RE.fullmatch(author):
+        return author
+    if bridge == "slack" and _SLACK_REACTION_AUTHOR_RE.fullmatch(author):
+        return author
+    return None
+
+
+def _owner_attested_feedback_evidence(
+    record: dict,
+    stream: str,
+) -> tuple[bool, str | None]:
+    kind = record.get("type")
+    if stream != "events":
+        return False, None
+    if kind == "react_received":
+        if "event_version" not in record:
+            if "owner_principal" in record:
+                return True, None
+            author = _reaction_author(record)
+            return True, author
+        if record.get("event_version") != "v1":
+            return True, None
+        if not _nonempty_string(record.get("owner_principal")):
+            return True, None
+        author = _reaction_author(record)
+        return True, author
+    if kind not in _OWNER_ATTESTED_COMMITMENT_KINDS:
+        return False, None
+    if "event_version" not in record:
+        return False, None
+    if record.get("event_version") != "v1":
+        return True, None
+    if (
+        not _nonempty_string(record.get("owner_principal"))
+        or record.get("ownership_provenance") != "extraction_acl"
+        or record.get("author") not in (None, "")
+    ):
+        return True, None
+    return True, record["owner_principal"]
 
 
 def _is_agent_self_record(record: dict) -> bool:
@@ -253,6 +321,13 @@ def _collapse_feedback_signals(signals: list[FeedbackSignal]) -> list[FeedbackSi
     )
 
 
+@dataclass(frozen=True)
+class _FeedbackSelection:
+    negatives: list[FeedbackSignal]
+    positives: list[FeedbackSignal]
+    labels: InformationFlowLabels
+
+
 @dataclass
 class FeedbackLog:
     """Tails events.jsonl + turns.jsonl, surfaces recent feedback signals.
@@ -286,6 +361,8 @@ class FeedbackLog:
     # from _emit_new_escalations writing to events.jsonl). Same propagation
     # semantics as ``arousal_thresholds``.
     resolved_incidents_path: Path | None = None
+    identity_resolver: object | None = None
+    cross_platform_pull: bool = True
     # Path to ``resolved-incidents.jsonl`` (chainlink #197). Events matching
     # an entry there are filtered from the feedback block until the rolling
     # window naturally clears them. None → no filtering (default for tests /
@@ -302,26 +379,6 @@ class FeedbackLog:
         """Return (negative, positive), each reverse-chronological and
         capped at ``limit_per_polarity``. Records older than
         ``window_hours`` are dropped."""
-        negatives, positives, _ = self._recent(
-            window_hours=window_hours,
-            limit_per_polarity=limit_per_polarity,
-            auth_context=auth_context,
-            collect_labels=False,
-        )
-        return negatives, positives
-
-    def _recent(
-        self,
-        *,
-        window_hours: int | None,
-        limit_per_polarity: int | None,
-        auth_context: AuthContext | None,
-        collect_labels: bool,
-    ) -> tuple[
-        list[FeedbackSignal],
-        list[FeedbackSignal],
-        InformationFlowLabels,
-    ]:
         if auth_context is not None and not isinstance(auth_context, AuthContext):
             raise TypeError("feedback authorization requires the exact AuthContext")
         event_snapshot = self.events_snapshot
@@ -415,7 +472,6 @@ class FeedbackLog:
 
         negatives: list[FeedbackSignal] = []
         positives: list[FeedbackSignal] = []
-        labels = InformationFlowLabels()
         # Kinds whose first occurrence (most recent, since we walk
         # tail-first) we've already added — subsequent occurrences are
         # skipped. Stops weekly cron events from re-appearing on every
@@ -518,10 +574,6 @@ class FeedbackLog:
                     count=kind_counts.get(kind, 1),
                 )
             )
-            if collect_labels:
-                labels = self._with_record_source(
-                    labels, ev, "events", auth_context,
-                )
             # Early exit when both sides full.
             if len(negatives) >= limit and len(positives) >= limit:
                 break
@@ -595,17 +647,9 @@ class FeedbackLog:
                         content=content,
                     )
                 )
-                if collect_labels:
-                    labels = self._with_record_source(
-                        labels, rec, "turns", auth_context,
-                    )
                 bounded_negative_count += 1
 
-        return (
-            _collapse_feedback_signals(negatives),
-            _collapse_feedback_signals(positives),
-            labels,
-        )
+        return _collapse_feedback_signals(negatives), _collapse_feedback_signals(positives)
 
     @staticmethod
     def _record_authorized(record: dict, auth_context: AuthContext) -> bool:
@@ -661,51 +705,6 @@ class FeedbackLog:
             window_records=stream_filtered if saturated else None,
         )
 
-    @staticmethod
-    def _with_record_source(
-        labels: InformationFlowLabels,
-        record: dict,
-        resource: Literal["events", "turns"],
-        auth_context: AuthContext | None,
-    ) -> InformationFlowLabels:
-        if auth_context is None:
-            raise TypeError("feedback label collection requires AuthContext")
-        requester = auth_context.canonical_principal or auth_context.principal
-        service = (
-            f"service:{requester}"
-            if auth_context.is_service and requester
-            else None
-        )
-        record_owner = _record_source_principal(record, auth_context)
-        principal = record_owner or service or requester
-        bridge = record.get("bridge") or record.get("source")
-        # The label ACL reflects the upstream authorization decision; trust
-        # remains independently derived from agent-self provenance.
-        acl_principals = {record_owner} if record_owner else set()
-        effective_requester = service or requester
-        if effective_requester and (
-            (_is_privileged(auth_context) and bool(record_owner))
-            or not record_owner
-        ):
-            acl_principals.add(effective_requester)
-        return labels.with_source(prompt_sources.prompt_source_label(
-            auth_context,
-            principal=principal,
-            domain="feedback",
-            resource=f"{resource}:{record.get('id') or record.get('turn_id') or record.get('timestamp') or record.get('ts')}",
-            channel_id=record.get("channel_id"),
-            bridge_instance=(
-                bridge
-                if isinstance(bridge, str) and bridge
-                else auth_context.bridge_instance
-            ),
-            authorized_principals=frozenset(acl_principals),
-            source_kind="protected_prompt",
-            # Trust requires positive agent-self provenance, not merely absent
-            # ownership. User-owned legacy records may be principal-less.
-            self_authored=not record_owner and _is_agent_self_record(record),
-        ))
-
     def recent_block(
         self,
         *,
@@ -734,20 +733,283 @@ class FeedbackLog:
         """Load authorized feedback and return content with record provenance."""
         if not isinstance(auth_context, AuthContext):
             raise TypeError("feedback prompt loading requires the exact AuthContext")
-        negatives, positives, labels = self._recent(
-            window_hours=None,
-            limit_per_polarity=None,
-            auth_context=auth_context,
-            collect_labels=True,
-        )
+        selection = self._select_prompt_recent(auth_context)
         content = render_feedback_block(
-            negatives,
-            positives,
+            selection.negatives,
+            selection.positives,
             window_hours=self.default_window_hours,
         )
         if not content:
             return None
-        return PromptBlock(content=content, labels=labels)
+        return PromptBlock(content=content, labels=selection.labels)
+
+    def _select_prompt_recent(
+        self,
+        auth_context: AuthContext,
+    ) -> _FeedbackSelection:
+        cutoff = datetime.now(tz=timezone.utc) - timedelta(
+            hours=self.default_window_hours,
+        )
+        cutoff_iso = cutoff.isoformat()
+        labels = InformationFlowLabels()
+        requester = auth_context.canonical_principal or auth_context.principal
+        effective_requester = (
+            f"service:{auth_context.canonical_principal or auth_context.principal}"
+            if auth_context.is_service
+            and (auth_context.canonical_principal or auth_context.principal)
+            else requester
+        )
+        if not effective_requester:
+            return _FeedbackSelection([], [], labels)
+
+        admitted_events: list[dict] = []
+        admitted_turns: list[dict] = []
+        chain_inputs: list[tuple[dict, str]] = []
+        # Admission decides eligibility, not contribution. The arousal filter
+        # suppresses a whole kind whose occurrences stay below its threshold,
+        # and a suppressed kind contributes no line and no count to anything
+        # rendered -- so labelling it lets a record the model never saw veto a
+        # delivery every visible source is cleared for.
+        #
+        # Granularity is the signal kind, deliberately. A record dropped by the
+        # per-polarity cap, or collapsed into a duplicate run, still feeds the
+        # "(xN in 24h)" count on a rendered line of its own kind, so it did
+        # contribute and its provenance is retained.
+        sources_by_kind: dict[str, list[SourceLabel]] = {}
+
+        def admit(record: dict, stream: str) -> dict | None:
+            nonlocal labels
+            raw_owner = _record_principal(record)
+            channel = record.get("channel_id")
+            if not isinstance(channel, str) or not channel:
+                channel = None
+            classified = classify(record.get("type"))
+            agent_self = raw_owner is None and _is_agent_self_record(record)
+            same_channel = bool(
+                channel
+                and auth_context.channel_id
+                and channel == auth_context.channel_id
+            )
+            source_kind = "protected_prompt"
+            principal = effective_requester
+            acl = frozenset({effective_requester})
+            sanitized = record
+            owner_attested_shape, owner_evidence = (
+                _owner_attested_feedback_evidence(record, stream)
+            )
+
+            if agent_self:
+                source_kind = "agent_self"
+                sanitized = _sanitize_agent_self_record(record)
+            elif owner_attested_shape:
+                if owner_evidence is None or channel is None:
+                    return None
+                try:
+                    owner_attestation = attest_owner(
+                        self.identity_resolver,
+                        owner_evidence,
+                        channel,
+                    )
+                except Exception:
+                    return None
+                if owner_attestation is None:
+                    return None
+                principal = owner_attestation.canonical_principal
+                acl = frozenset({principal})
+                source_kind = "owner_attested_feedback"
+            elif raw_owner is not None:
+                identity = getattr(self.identity_resolver, "identity", None)
+                try:
+                    resolved_owner = identity(raw_owner) if callable(identity) else None
+                except Exception:
+                    return None
+                if resolved_owner is None:
+                    if (
+                        not same_channel
+                        or self.identity_resolver is not None
+                        or raw_owner not in {auth_context.principal, requester}
+                    ):
+                        return None
+                    canonical_owner = requester
+                else:
+                    canonical_owner = resolved_owner.canonical
+                if (
+                    not same_channel
+                    and not (
+                        self.cross_platform_pull
+                        and auth_context.cross_platform_pull
+                    )
+                    and raw_owner != auth_context.principal
+                ):
+                    return None
+                principal = canonical_owner
+                acl_values = {canonical_owner}
+                if _is_privileged(auth_context):
+                    acl_values.add(effective_requester)
+                acl = frozenset(acl_values)
+                if classified and classified[1] in CHANNEL_SCOPED_FREE_TEXT_KINDS:
+                    source_kind = "channel_scoped_feedback"
+            else:
+                if not (_is_privileged(auth_context) and same_channel):
+                    return None
+                source_kind = "channel_bound_unowned_feedback"
+
+            bridge = record.get("bridge") or record.get("source")
+            resource_key = (
+                record.get("id")
+                or record.get("turn_id")
+                or record.get("timestamp")
+                or record.get("ts")
+            )
+            source = prompt_sources.prompt_source_label(
+                auth_context,
+                principal=principal,
+                domain="feedback",
+                resource=f"{stream}:{resource_key}",
+                channel_id=channel,
+                bridge_instance=(
+                    bridge
+                    if isinstance(bridge, str) and bridge
+                    else auth_context.bridge_instance or "mimir"
+                ),
+                authorized_principals=acl,
+                source_kind=source_kind,
+                self_authored=agent_self,
+                owner_attestation=(
+                    owner_attestation
+                    if source_kind == "owner_attested_feedback"
+                    else None
+                ),
+            )
+            if not _source_is_triggering_channel_compatible(
+                source,
+                effective_principal=effective_requester,
+                triggering_principal=auth_context.principal,
+                resolved_triggering=ChannelResourceAdapter._resolve_channel(
+                    auth_context.channel_id,
+                ),
+                audience_provider=auth_context.audience_provider,
+                cross_platform_pull=auth_context.cross_platform_pull,
+            ):
+                return None
+            signal_kind = (
+                "turn_error" if stream == "turns"
+                else classified[1] if classified
+                else None
+            )
+            if signal_kind is None:
+                # Admitted without a feedback classification: the loop-detection
+                # carriers (send_message_sent, cross_turn_send_duplicate) feed
+                # synthesized content rather than a signal of their own, so they
+                # keep contributing provenance.
+                labels = labels.with_source(source)
+            else:
+                sources_by_kind.setdefault(signal_kind, []).append(source)
+            return sanitized
+
+        for record in iter_window_records(self.events_snapshot, self.events_path):
+            timestamp = record.get("timestamp")
+            if not isinstance(timestamp, str) or timestamp < cutoff_iso:
+                if isinstance(timestamp, str):
+                    break
+                continue
+            event_type = record.get("type")
+            if classify(event_type) is None and event_type not in {
+                "send_message_sent",
+                "cross_turn_send_duplicate",
+            }:
+                continue
+            classified = classify(event_type)
+            if (
+                _record_principal(record) is None
+                and not record.get("channel_id")
+                and not _is_agent_self_record(record)
+                and classified is not None
+                and classified[1] in _VALENCE_CHAIN_INPUT_KINDS
+            ):
+                chain_inputs.append(({
+                    "timestamp": timestamp,
+                    "type": event_type,
+                }, f"events:{timestamp}"))
+                continue
+            selected = admit(record, "events")
+            if selected is not None:
+                admitted_events.append(selected)
+
+        for record in iter_window_records(self.turns_snapshot, self.turns_path):
+            timestamp = record.get("ts")
+            if not isinstance(timestamp, str) or timestamp < cutoff_iso:
+                if isinstance(timestamp, str):
+                    break
+                continue
+            if not (record.get("error") or record.get("result_is_error")):
+                continue
+            selected = admit(record, "turns")
+            if selected is not None:
+                admitted_turns.append(selected)
+
+        selected_log = replace(
+            self,
+            events_snapshot=_RecordSnapshot(admitted_events),
+            turns_snapshot=_RecordSnapshot(admitted_turns),
+        )
+        negatives, positives = selected_log.recent(auth_context=None)
+        rendered_kinds = {signal.kind for signal in (*negatives, *positives)}
+        for kind, kind_sources in sources_by_kind.items():
+            if kind not in rendered_kinds:
+                continue
+            for source in kind_sources:
+                labels = labels.with_source(source)
+        if chain_inputs:
+            chain_snapshot = _RecordSnapshot([record for record, _ in chain_inputs])
+            group_runs = _compute_group_runs(
+                chain_snapshot, self.events_path, cutoff_iso, _VALENCE_GROUPS,
+            )
+            chain_signals, _ = _synthesize_chain_signals(
+                group_runs, _VALENCE_GROUPS,
+            )
+            for signal in chain_signals:
+                group_key = signal.kind.removesuffix("_chain")
+                group = _VALENCE_GROUPS[group_key]
+                group_kinds = group.positive_kinds | group.negative_kinds
+                sources = InformationFlowLabels()
+                for record, resource_key in chain_inputs:
+                    classified = classify(record.get("type"))
+                    if classified is None or classified[1] not in group_kinds:
+                        continue
+                    source = prompt_sources.prompt_source_label(
+                        auth_context,
+                        principal=effective_requester,
+                        domain="feedback",
+                        resource=resource_key,
+                        channel_id=auth_context.channel_id,
+                        bridge_instance=f"mimir-chain:{resource_key}",
+                        authorized_principals=frozenset({effective_requester}),
+                        source_kind="feedback_chain",
+                        self_authored=False,
+                    )
+                    if not _source_is_triggering_channel_compatible(
+                        source,
+                        effective_principal=effective_requester,
+                        triggering_principal=auth_context.principal,
+                        resolved_triggering=ChannelResourceAdapter._resolve_channel(
+                            auth_context.channel_id,
+                        ),
+                        audience_provider=auth_context.audience_provider,
+                        cross_platform_pull=auth_context.cross_platform_pull,
+                    ):
+                        sources = InformationFlowLabels()
+                        break
+                    sources = sources.with_source(source)
+                if not sources.sources:
+                    continue
+                for source in sources.sources:
+                    labels = labels.with_source(source)
+                target = negatives if signal.polarity == "negative" else positives
+                target.append(signal)
+            negatives.sort(key=lambda signal: signal.ts, reverse=True)
+            positives.sort(key=lambda signal: signal.ts, reverse=True)
+        return _FeedbackSelection(negatives, positives, labels)
 
 
 # VSM: algedonic — bypass channel for self-feedback signals; surfaces

@@ -18,12 +18,16 @@ from mimir.commitments.extractor import (
     _coerce_to_record,
     _parse_extraction_json,
     _strip_code_fence,
+    assign_extraction_acl,
     extract_commitments,
 )
 from mimir.commitments.models import (
     CommitmentKind,
+    CommitmentOwnershipProvenance,
+    CommitmentRecord,
     CommitmentSensitivity,
 )
+from mimir.models import SessionACL
 
 
 def _install_fake_call_llm(
@@ -137,6 +141,49 @@ def test_coerce_sensitivity_default_is_routine():
     )
     assert rec is not None
     assert rec.sensitivity == CommitmentSensitivity.ROUTINE
+
+
+def test_assign_extraction_acl_mints_typed_ownership_provenance_only_when_complete():
+    complete = CommitmentRecord(id="c-complete", channel_id="ch-1", text="X")
+    assign_extraction_acl(
+        complete,
+        SessionACL(
+            owner_principal="user:alice",
+            origin_channel="ch-1",
+            origin_domain="discord",
+            visibility="private",
+            provenance_complete=True,
+        ),
+        service_name="synthesis",
+    )
+
+    assert complete.owner_principal == "user:alice"
+    assert (
+        complete.ownership_provenance
+        is CommitmentOwnershipProvenance.EXTRACTION_ACL
+    )
+
+    incomplete = SessionACL(
+        owner_principal="user:alice",
+        origin_channel="ch-1",
+        origin_domain="discord",
+        visibility="private",
+        provenance_complete=False,
+    )
+    for source_acl in (incomplete, None):
+        unattested = CommitmentRecord(
+            id="c-unattested",
+            channel_id="ch-1",
+            text="X",
+            owner_principal="user:copied",
+            ownership_provenance=CommitmentOwnershipProvenance.EXTRACTION_ACL,
+        )
+        assign_extraction_acl(
+            unattested, source_acl, service_name="synthesis",
+        )
+
+        assert unattested.owner_principal == "legacy_admin"
+        assert unattested.ownership_provenance is None
 
 
 # ── chainlink #97: ISO datetime hint → due_window_start_unix ────────

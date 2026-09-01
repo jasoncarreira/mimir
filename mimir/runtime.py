@@ -595,6 +595,7 @@ async def create_agent_runtime(
                         )
         return await agent.run_turn(event)
 
+    run_turn_with_identity_preflight.__wrapped__ = agent.run_turn  # type: ignore[attr-defined]
     adapters.dispatcher.set_run_turn(run_turn_with_identity_preflight)
     return bundle
 
