@@ -74,6 +74,41 @@ The forced command fixes one remote home. It is optional defense in depth, not r
 
 The client account and proxy, the relay/daemon UID, and root are trusted with ACP plaintext. Socket modes do not isolate ACP data from another process running as one of those identities.
 
+### Containerized servers: the sshd add-on
+
+Mimir ships no SSH server. A containerized deployment therefore has no transport an ACP client can reach, and three constraints rule out the alternatives:
+
+- A container has no native OS keystore. `keyring` resolves to `backends.fail.Keyring`, and `mimir acp credential add` refuses any non-native backend, so the proxy must run on the client host, not in the container.
+- A Unix socket does not cross a Docker Desktop bind mount on macOS. The daemon socket is simply absent on the host side of the mount, so `profile add-local` has nothing to connect to.
+- `mimir acp relay` speaks ACP JSONL on stdin and stdout, which is exactly what an SSH forced command supplies.
+
+Add sshd as an opt-in layer over the built image rather than in the image itself; putting it in the base would widen every deployment for a need only ACP clients have. Layer it in a separate Dockerfile and enable it with a compose overlay, so deploying without the overlay drops sshd again:
+
+```text
+ARG BASE=<your-image>:latest
+FROM ${BASE}
+USER root
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends openssh-server \
+ && rm -rf /var/lib/apt/lists/* \
+ && mkdir -p /run/sshd /home/mimir/.ssh \
+ && chown mimir:mimir /home/mimir/.ssh && chmod 700 /home/mimir/.ssh
+```
+
+Disable every source of pre-relay output in a drop-in `sshd_config.d` file — `PrintMotd no`, `PrintLastLog no`, `Banner none` — alongside `PasswordAuthentication no` and `AllowUsers <agent-user>`. Banner or rc output ahead of the relay corrupts JSONL framing.
+
+Register sshd as a supervised service rather than overriding the container entrypoint. Under s6, add a longrun whose `run` script ends in `exec /usr/sbin/sshd -D -e`. A compose `command:` override displaces the init that delivers SIGTERM to the agent, which loses the graceful drain.
+
+Publish the port on loopback only (`127.0.0.1:2222:22`), mount `authorized_keys` read-only so the agent cannot append a key granting itself a shell, and pin the key with `restrict,command=` as above. SSH then grants transport and nothing else: the daemon still requires an admin web key over the protocol, and the forced command means a stolen key cannot open a shell. Verify both after deploying — an arbitrary `ssh … 'id'` must produce relay output rather than command output, and a PTY request must be refused.
+
+The client profile then targets the published loopback port:
+
+```text
+mimir acp profile add-ssh PROFILE --home /absolute/server/mimir-home \
+  --ssh-host 127.0.0.1 --ssh-user <agent-user> --ssh-port 2222 \
+  --identity-file ~/.ssh/<dedicated-key> --known-hosts-file <owner-controlled-path>
+```
+
 ## Stock clients (macOS and Linux)
 
 These configurations support macOS and Linux proxy/client hosts. Windows client support is deferred. Each editor contains only a non-secret profile selector; no raw key or remote SSH command belongs in editor configuration.
