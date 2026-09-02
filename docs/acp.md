@@ -95,7 +95,9 @@ RUN apt-get update \
  && chown mimir:mimir /home/mimir/.ssh && chmod 700 /home/mimir/.ssh
 ```
 
-Disable every source of pre-relay output in a drop-in `sshd_config.d` file — `PrintMotd no`, `PrintLastLog no`, `Banner none` — alongside `PasswordAuthentication no` and `AllowUsers <agent-user>`. Banner or rc output ahead of the relay corrupts JSONL framing.
+Disable every source of pre-relay output in a drop-in `sshd_config.d` file — `PrintMotd no`, `PrintLastLog no`, `Banner none`, `PermitUserRC no` — alongside `PasswordAuthentication no` and `AllowUsers <agent-user>`. Banner or rc output ahead of the relay corrupts JSONL framing.
+
+`PermitUserRC no` matters even though the `restrict` keyword below already disables `~/.ssh/rc`: the agent account owns its home directory and can create that file, so a key authorized with a bare `command=` and no `restrict` would execute it before the relay. Enforce it server-side so the guarantee does not rest on one keyword in `authorized_keys`.
 
 Register sshd as a supervised service rather than overriding the container entrypoint. Under s6, add a longrun whose `run` script ends in `exec /usr/sbin/sshd -D -e`. A compose `command:` override displaces the init that delivers SIGTERM to the agent, which loses the graceful drain.
 
