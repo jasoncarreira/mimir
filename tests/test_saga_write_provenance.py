@@ -210,9 +210,12 @@ async def test_synthesis_memory_store_preserves_service_provenance(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("integrity_effect", ["informational", "active_ingest"])
-async def test_memory_store_refuses_any_untrusted_source_effect(
-    integrity_effect: str,
+@pytest.mark.parametrize(
+    ("integrity_effect", "stored"),
+    [("informational", True), ("active_ingest", False)],
+)
+async def test_memory_store_uses_active_ingest_only_integrity_boundary(
+    integrity_effect: str, stored: bool,
     tmp_path: Path, write_store: _WriteStore,
 ) -> None:
     context = _user_context(tmp_path, "discord-alice", "discord-private")
@@ -233,8 +236,12 @@ async def test_memory_store_refuses_any_untrusted_source_effect(
         runtime=_runtime(context, f"{integrity_effect}-recall-store"),
     )
 
-    assert "tainted" in out
-    assert write_store.atom_calls == []
+    assert ("stored" in out) is stored
+    assert bool(write_store.atom_calls) is stored
+    if stored:
+        assert write_store.atom_calls[-1]["integrity"] is Integrity.TRUSTED
+    else:
+        assert "tainted" in out
 
 
 @pytest.mark.asyncio

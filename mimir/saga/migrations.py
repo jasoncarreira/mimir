@@ -35,7 +35,7 @@ from typing import Callable, Iterator
 log = logging.getLogger(__name__)
 
 
-CURRENT_SCHEMA_VERSION: int = 12
+CURRENT_SCHEMA_VERSION: int = 13
 
 # Registry of post-greenfield schema changes. Keys are version
 # numbers (must be > 1, must be contiguous, must equal
@@ -685,6 +685,16 @@ WHERE a.source_type = 'session_boundary'
               WHERE version = 10
           );
     """,
+    13: """
+        -- v13: The saga write gate is the single integrity boundary. Rows
+        -- written before that boundary existed are accepted as trusted.
+        CREATE INDEX IF NOT EXISTS idx_atoms_trusted_boundary_v13
+            ON atoms(integrity);
+
+        UPDATE atoms
+        SET integrity = 'trusted'
+        WHERE integrity = 'untrusted';
+    """,
 }
 
 
@@ -699,6 +709,8 @@ def detect_schema_version(conn: sqlite3.Connection) -> int:
 
     Detection markers, highest version first:
 
+    - **v13**: ``atoms`` has the ``idx_atoms_trusted_boundary_v13`` marker
+      created with the unconditional legacy-integrity correction.
     - **v12**: ``atoms`` has the ``idx_atoms_integrity_created_at`` index used
       by the boundary correction. Atom contents cannot reliably mark this
       data migration because an applied no-op is indistinguishable from pending.
@@ -730,6 +742,15 @@ def detect_schema_version(conn: sqlite3.Connection) -> int:
     so this is robust to bare-bones DBs (like the in-memory
     fixtures used by unit tests).
     """
+    try:
+        atom_indexes = {
+            row[1] for row in conn.execute("PRAGMA index_list(atoms)").fetchall()
+        }
+    except sqlite3.OperationalError:
+        atom_indexes = set()
+    if "idx_atoms_trusted_boundary_v13" in atom_indexes:
+        return 13
+
     # v12 marker: index supporting the integrity/boundary correction. Also
     # accept its durable stamp because operators may remove non-constraint
     # indexes without rolling the data correction back.
@@ -739,12 +760,6 @@ def detect_schema_version(conn: sqlite3.Connection) -> int:
         ).fetchone()
     except sqlite3.OperationalError:
         v12_applied = None
-    try:
-        atom_indexes = {
-            row[1] for row in conn.execute("PRAGMA index_list(atoms)").fetchall()
-        }
-    except sqlite3.OperationalError:
-        atom_indexes = set()
     if v12_applied is not None or "idx_atoms_integrity_created_at" in atom_indexes:
         return 12
 

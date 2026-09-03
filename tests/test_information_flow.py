@@ -49,6 +49,7 @@ from mimir.access_control import (
     protected_result_source,
     record_file_write_integrity,
     repair_file_write_integrity,
+    saga_mutation_taint_refusal,
 )
 from mimir.agent import (
     Agent,
@@ -2214,6 +2215,75 @@ def test_auto_recalled_untrusted_atom_is_visible_but_never_active_ingest():
     assert source.integrity == "untrusted"
     assert source.integrity_effect == "informational"
     assert labels.has_untrusted_active_ingest is False
+
+
+def test_saga_gate_and_stamp_discriminate_informational_from_active_ingest():
+    channel = SourceLabel(
+        principal="user-1", domain="channel", resource_id="slack-C1",
+        bridge_instance="slack", sensitivity="private",
+        authorized_principals=frozenset({"user-1"}), integrity="trusted",
+        integrity_effect="active_ingest",
+    )
+    recall = SourceLabel(
+        principal="memory", domain="saga", resource_id="atom:a1",
+        bridge_instance="saga", sensitivity="private",
+        authorized_principals=frozenset({"user-1"}), source_kind="auto_recall",
+        integrity="untrusted", integrity_effect="informational",
+    )
+    clean = InformationFlowLabels(sources=(channel, recall))
+    clean_auth = replace(_auth(), ifc_state=InformationFlowState(labels=clean))
+
+    assert saga_mutation_taint_refusal(clean_auth) is None
+    assert clean.persisted_integrity is Integrity.TRUSTED
+
+    filesystem = replace(
+        recall, principal="filesystem", domain="filesystem",
+        resource_id="/tmp/input.txt", bridge_instance="filesystem",
+        source_kind="protected_tool", integrity_effect="active_ingest",
+    )
+    tainted = clean.with_source(filesystem)
+    tainted_auth = replace(_auth(), ifc_state=InformationFlowState(labels=tainted))
+
+    assert saga_mutation_taint_refusal(tainted_auth) is not None
+    assert tainted.persisted_integrity is Integrity.UNTRUSTED
+
+    empty = InformationFlowLabels()
+    empty_auth = replace(_auth(), ifc_state=InformationFlowState(labels=empty))
+    assert saga_mutation_taint_refusal(empty_auth) is not None
+
+
+def test_untrusted_prior_assistant_reply_does_not_taint_next_saga_write():
+    channel = SourceLabel(
+        principal="user-1", domain="channel", resource_id="slack-C1",
+        bridge_instance="slack", sensitivity="private",
+        authorized_principals=frozenset({"user-1"}), integrity="trusted",
+        integrity_effect="active_ingest",
+    )
+    prior_reply = prompt_source_label(
+        _auth(), principal="service:mimir", domain="recent_activity",
+        resource="message:tainted-reply", channel_id="slack-C1",
+        bridge_instance="slack", authorized_principals=frozenset({"user-1"}),
+        source_kind="recent_activity_assistant", self_authored=False,
+    )
+    labels = InformationFlowLabels(sources=(channel, prior_reply))
+    auth = replace(_auth(), ifc_state=InformationFlowState(labels=labels))
+
+    assert prior_reply.integrity is Integrity.UNTRUSTED
+    assert prior_reply.integrity_effect is IntegrityEffect.INFORMATIONAL
+    assert saga_mutation_taint_refusal(auth) is None
+    assert labels.persisted_integrity is Integrity.TRUSTED
+
+
+def test_v13_trusted_auto_recall_payload_stays_informational():
+    labels = _auto_recall_source_labels(_auth(), {"_ifc_sources": [{
+        "resource_id": "atom:migrated", "owner_principal": "user-1",
+        "integrity": "trusted", "origin_trigger": "github-poller:github-activity",
+    }]})
+
+    [source] = labels.sources
+    assert source.source_kind == "auto_recall"
+    assert source.integrity == Integrity.TRUSTED
+    assert source.integrity_effect == IntegrityEffect.INFORMATIONAL
 
 
 def test_delegation_wires_service_derived_acl_intersection_into_carrier():
@@ -4766,6 +4836,64 @@ def test_tainted_saga_mutation_refusal_names_taint() -> None:
     assert decision.reason == "saga_mutation_blocked_by_tainted_turn"
     assert decision.refusal_detail is not None
     assert "tainted" in decision.refusal_detail
+
+
+def test_saga_forget_uses_active_ingest_only_taint_boundary() -> None:
+    trusted = SourceLabel(
+        principal="user-1", domain="channel", resource_id="slack-C1",
+        bridge_instance="slack", sensitivity="private",
+        authorized_principals=frozenset({"user-1"}), integrity="trusted",
+        integrity_effect="active_ingest",
+    )
+    informational = SourceLabel(
+        principal="memory", domain="saga", resource_id="atom:old",
+        bridge_instance="saga", sensitivity="private",
+        authorized_principals=frozenset({"user-1"}), source_kind="auto_recall",
+        integrity="untrusted", integrity_effect="informational",
+    )
+    active = replace(
+        informational, domain="filesystem", resource_id="/tmp/input.txt",
+        bridge_instance="filesystem", source_kind="protected_tool",
+        integrity_effect="active_ingest",
+    )
+
+    for source, allowed in ((informational, True), (active, False)):
+        labels = InformationFlowLabels(sources=(trusted, source))
+        auth = replace(
+            _auth(roles=("admin",)), ifc_labels=labels,
+            ifc_state=InformationFlowState(labels=labels),
+        )
+        decision = ToolRegistry().authorize_tool(
+            "saga_forget", auth, enforce=True, ifc_labels=labels,
+        )
+        assert decision.allowed is allowed
+        assert decision.reason is (
+            None if allowed else "saga_mutation_blocked_by_tainted_turn"
+        )
+
+
+@pytest.mark.parametrize(
+    ("tool_name", "target", "reason"),
+    [
+        ("write_file", "memory/core/tainted.md", "ifc_label_blocked:file"),
+        ("shell_exec", "printf tainted", "ifc_label_blocked:shell_process"),
+    ],
+)
+def test_file_and_shell_sinks_still_refuse_untrusted_active_ingest(
+    tool_name: str, target: str, reason: str,
+) -> None:
+    labels = _labels()
+    auth = replace(
+        _auth(roles=("admin",)), ifc_labels=labels,
+        ifc_state=InformationFlowState(labels=labels),
+    )
+
+    decision = ToolRegistry().authorize_tool(
+        tool_name, auth, enforce=True, ifc_labels=labels, target_channel=target,
+    )
+
+    assert decision.allowed is False
+    assert decision.reason == reason
 
 
 def test_saga_mutation_refuses_indeterminate_live_label_state() -> None:

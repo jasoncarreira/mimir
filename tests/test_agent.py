@@ -1878,7 +1878,7 @@ async def test_turn_integrity_sources_are_bounded_and_keep_taint_cause(
         authorized_principals=frozenset({"alice"}),
         source_kind="protected_tool",
         integrity="untrusted",
-        integrity_effect="informational",
+        integrity_effect="active_ingest",
     ),)
     labels = InformationFlowLabels(sources=sources)
     agent = _build_agent(

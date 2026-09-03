@@ -5801,15 +5801,15 @@ _CHAINLINK_TAINT_REFUSAL = (
 
 SAGA_TAINT_REFUSAL = (
     "durable memory mutation refused because this turn is tainted: durable "
-    "memory requires a non-empty source set whose sources are all trusted"
+    "memory requires a non-empty source set with no untrusted active ingest"
 )
 
 
 def saga_mutation_taint_refusal(
     auth_context: Any, fallback: Any = None,
 ) -> str | None:
-    """Return a clear refusal unless the live turn sources are all trusted."""
-    from .models import InformationFlowLabels, Integrity
+    """Refuse mutation for missing provenance or untrusted active ingest."""
+    from .models import InformationFlowLabels
 
     if auth_context is None:
         return SAGA_TAINT_REFUSAL
@@ -5826,7 +5826,8 @@ def saga_mutation_taint_refusal(
         return SAGA_TAINT_REFUSAL
     if (
         not isinstance(labels, InformationFlowLabels)
-        or labels.persisted_integrity is not Integrity.TRUSTED
+        or not labels.sources
+        or labels.has_untrusted_active_ingest
     ):
         return SAGA_TAINT_REFUSAL
     return None

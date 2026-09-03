@@ -177,6 +177,13 @@ class TestDetectSchemaVersion:
         )
         assert m.detect_schema_version(conn) == 12
 
+    def test_v13_marker_returns_v13(self) -> None:
+        conn = sqlite3.connect(":memory:")
+        conn.executescript(
+            "CREATE TABLE atoms (integrity TEXT);" + m.MIGRATIONS[13]
+        )
+        assert m.detect_schema_version(conn) == 13
+
     def test_missing_session_backfill_targets_data_repair_through_real_open(
         self, tmp_path: Path
     ) -> None:
@@ -1511,7 +1518,7 @@ class TestV7OwnershipMigration:
                 "WHERE type = 'index' AND tbl_name = 'world_state'"
             )
         }
-        assert max(versions) == m.CURRENT_SCHEMA_VERSION == 12
+        assert max(versions) == m.CURRENT_SCHEMA_VERSION == 13
         assert {
             "owner_principal",
             "origin_channel",
@@ -1719,6 +1726,7 @@ def test_v11_fresh_and_migrated_indexes_have_identical_pragma_output() -> None:
             "idx_sessions_channel_recency",
         ):
             migrated.execute(f"DROP INDEX {name}")
+        migrated.execute("DROP INDEX idx_atoms_trusted_boundary_v13")
         migrated.execute("DROP INDEX idx_atoms_integrity_created_at")
         assert m.detect_schema_version(migrated) == 10
         m._execute_migration_script(migrated, m.MIGRATIONS[11])
@@ -1769,7 +1777,7 @@ class TestV12LegacyIntegrityMigration:
         conn = self._database()
 
         with caplog.at_level("INFO", logger=m.__name__):
-            m.apply_pending_migrations(conn, fresh=False)
+            m.apply_pending_migrations(conn, fresh=False, target_version=12)
 
         assert conn.execute(
             "SELECT id, integrity FROM atoms ORDER BY id"
@@ -1794,7 +1802,7 @@ class TestV12LegacyIntegrityMigration:
             "SELECT id, integrity FROM atoms ORDER BY id"
         ).fetchall()
 
-        m.apply_pending_migrations(conn, fresh=False)
+        m.apply_pending_migrations(conn, fresh=False, target_version=12)
 
         assert conn.execute(
             "SELECT id, integrity FROM atoms ORDER BY id"
@@ -1802,3 +1810,67 @@ class TestV12LegacyIntegrityMigration:
         assert conn.execute(
             "SELECT version FROM schema_version WHERE version = 12"
         ).fetchone() == (12,)
+
+
+class TestV13TrustedBoundaryMigration:
+    def test_all_untrusted_atoms_are_flipped_without_other_changes(self, caplog) -> None:
+        conn = sqlite3.connect(":memory:")
+        conn.executescript(Path("mimir/saga/schema.sql").read_text())
+        conn.execute("DROP INDEX idx_atoms_trusted_boundary_v13")
+        conn.executemany(
+            "INSERT INTO schema_version (version, applied_at) VALUES (?, ?)",
+            [(version, "2000-01-01T00:00:00+00:00") for version in range(1, 13)],
+        )
+        rows = [
+            (
+                "trusted", "already trusted", "h1", "2026-08-29T00:00:00+00:00",
+                "trusted", "user_message", "message:1", '{"kept":1}',
+            ),
+            (
+                "poller", "external ingest residue", "h2",
+                "2026-08-30T00:00:00+00:00", "untrusted",
+                "github-poller:github-activity", "github:event:2", '{"kept":2}',
+            ),
+            (
+                "legacy", "other residue", "h3", "2024-01-01T00:00:00+00:00",
+                "untrusted", None, None, '{"kept":3}',
+            ),
+        ]
+        conn.executemany(
+            "INSERT INTO atoms "
+            "(id, content, content_hash, created_at, integrity, origin_trigger, "
+            "origin_ref, metadata) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            rows,
+        )
+        conn.commit()
+        before = conn.execute("SELECT * FROM atoms ORDER BY id").fetchall()
+        integrity_index = next(
+            row[0] for row in conn.execute("PRAGMA table_info(atoms)")
+            if row[1] == "integrity"
+        )
+
+        assert m.detect_schema_version(conn) == 12
+        with caplog.at_level("INFO", logger=m.__name__):
+            m.apply_pending_migrations(conn, fresh=False)
+
+        assert m.detect_schema_version(conn) == 13
+        assert conn.execute(
+            "SELECT COUNT(*) FROM atoms WHERE integrity = 'untrusted'"
+        ).fetchone() == (0,)
+        after = conn.execute("SELECT * FROM atoms ORDER BY id").fetchall()
+        assert [row[:integrity_index] + row[integrity_index + 1:] for row in after] == [
+            row[:integrity_index] + row[integrity_index + 1:] for row in before
+        ]
+        assert conn.execute(
+            "SELECT version FROM schema_version WHERE version = 13"
+        ).fetchone() == (13,)
+        assert "Applied SAGA migration v13: 2 rows changed" in caplog.text
+
+        versions = conn.execute(
+            "SELECT version, applied_at FROM schema_version ORDER BY version"
+        ).fetchall()
+        m.apply_pending_migrations(conn, fresh=False)
+        assert conn.execute(
+            "SELECT version, applied_at FROM schema_version ORDER BY version"
+        ).fetchall() == versions
+        assert m._execute_migration_script(conn, m.MIGRATIONS[13]) == 0

@@ -65,6 +65,8 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_atoms_dedup
 CREATE INDEX IF NOT EXISTS idx_atoms_created ON atoms(created_at);
 CREATE INDEX IF NOT EXISTS idx_atoms_integrity_created_at
     ON atoms(integrity, created_at);
+CREATE INDEX IF NOT EXISTS idx_atoms_trusted_boundary_v13
+    ON atoms(integrity);
 CREATE INDEX IF NOT EXISTS idx_atoms_tombstoned ON atoms(tombstoned);
 -- session_id index: reflect._session_atoms + recall's recent-session
 -- lookup both filter on this. Partial index (skips NULL session_id

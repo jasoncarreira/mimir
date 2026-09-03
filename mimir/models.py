@@ -439,11 +439,15 @@ class InformationFlowLabels:
 
     @property
     def persisted_integrity(self) -> Integrity:
-        """Derive trust for durable content from every contributing source."""
+        """Derive durable trust from active-ingest sources only."""
         return (
             Integrity.TRUSTED
             if self.sources
-            and all(source.integrity == Integrity.TRUSTED for source in self.sources)
+            and all(
+                source.integrity == Integrity.TRUSTED
+                for source in self.sources
+                if source.integrity_effect == IntegrityEffect.ACTIVE_INGEST
+            )
             else Integrity.UNTRUSTED
         )
 
