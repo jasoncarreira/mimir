@@ -6437,39 +6437,11 @@ class SinkGate:
         resolved_target = resolve_sink_target(
             tool_name, sink_category, target, service,
         )
-        hands_result_sources = tuple(
-            source
-            for source in ifc_labels.sources
-            if source.source_kind == _ACP_HANDS_RESULT_SOURCE_KIND
-        )
-        if hands_result_sources:
-            origin_channels = ifc_labels.source_channels
-            auth_channel = ChannelResourceAdapter._resolve_channel(
-                getattr(auth_context, "channel_id", None)
-            )
-            origin_channel = (
-                ChannelResourceAdapter._resolve_channel(next(iter(origin_channels)))
-                if len(origin_channels) == 1
-                else None
-            )
-            if not (
-                sink_category is SinkCategory.SAME_CHANNEL
-                and origin_channel
-                and normalized_target == origin_channel
-                and auth_channel == origin_channel
-            ):
-                return ToolAuthorization(
-                    tool_name=tool_name,
-                    decision=OperationDecision.ADMIN_REQUIRED,
-                    allowed=not enforce,
-                    reason=f"ifc_label_blocked:{sink_category.value}",
-                    service_principal=service,
-                    required_tier=AccessTier.ADMIN,
-                    enforcement_enabled=enforce,
-                    is_shadow_decision=not enforce,
-                    would_block=True,
-                    resolved_sink_target=resolved_target,
-                )
+        # Hands results carry complete, untrusted, active-ingest labels scoped to the
+        # originating ACP channel (see classify_protected_result). The general
+        # untrusted-active-ingest veto and the channel-compatibility predicate already
+        # refuse every sink except a same-channel reply to that origin; a dedicated
+        # branch here was unobservable (mutation-tested) and is deliberately omitted.
         egress_target_requires_taint_gate = _egress_target_requires_taint_gate(
             tool_name, target, auth_context,
         )
