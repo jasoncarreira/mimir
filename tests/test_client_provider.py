@@ -11,6 +11,7 @@ import pytest
 from langchain_core.tools import ToolException
 
 from mimir.acp import agent as agent_module
+from mimir.acp.hands_contract import HANDS_PROVIDER_TO_WRAPPER, hands_v1_wire_descriptors
 from mimir.access_control import (
     CLIENT_FILE_RESOURCE_POLICY,
     ClientFileResourcePolicy,
@@ -246,6 +247,23 @@ def test_profile_has_exact_provider_schemas_and_server_metadata() -> None:
     assert {policy.classification for policy in MIMIR_HANDS_V1.tools} == {
         "resource_scoped", "admin_required"
     }
+
+
+def test_mimir_hands_profile_projects_shared_contract_exactly() -> None:
+    projected = [
+        {
+            "name": policy.provider_name,
+            "description": policy.description,
+            "inputSchema": _thaw(policy.input_schema),
+            "outputSchema": _thaw(policy.result_schema),
+        }
+        for policy in MIMIR_HANDS_V1.tools
+    ]
+
+    assert projected == hands_v1_wire_descriptors()
+    assert {
+        policy.provider_name: policy.wrapper_name for policy in MIMIR_HANDS_V1.tools
+    } == HANDS_PROVIDER_TO_WRAPPER
 
 
 def test_client_file_identity_is_opaque_canonical_utf8() -> None:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import dataclasses
 import json
 import time
@@ -1404,15 +1405,47 @@ async def test_provider_admission_rejects_before_connect_or_state(tmp_path: Path
     assert list(agent._store.root.glob("*.meta.json")) == []
 
 
-async def test_provider_schema_rejection_names_tool_and_reason(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    "dimension",
+    [
+        "duplicate",
+        "missing",
+        "extra",
+        "name",
+        "description",
+        "inputSchema",
+        "outputSchema",
+    ],
+)
+async def test_admission_rejects_every_mismatch_with_exact_top_level_message(
+    tmp_path: Path, dimension: str
+) -> None:
     class NonconformingClient(McpClient):
         async def message_mcp(
             self, connection_id: str, method: str, params: Any = None
         ) -> Any:
             result = await super().message_mcp(connection_id, method, params)
             if method == "tools/list":
-                read = next(tool for tool in result["tools"] if tool["name"] == "read")
-                read["outputSchema"]["properties"]["path"] = {"type": "string"}
+                tools = result["tools"]
+                if dimension == "duplicate":
+                    tools.append(copy.deepcopy(tools[0]))
+                elif dimension == "missing":
+                    tools.pop()
+                elif dimension == "extra":
+                    tools.append({
+                        "name": "foreign",
+                        "description": "untrusted-extra-description",
+                        "inputSchema": {"untrusted": "input"},
+                        "outputSchema": {"untrusted": "output"},
+                    })
+                elif dimension == "name":
+                    tools[0]["name"] = "foreign"
+                elif dimension == "description":
+                    tools[0]["description"] = "untrusted-description"
+                elif dimension == "inputSchema":
+                    tools[0]["inputSchema"] = {"untrusted": "input"}
+                else:
+                    tools[0]["outputSchema"] = {"untrusted": "output"}
             return result
 
     bundle, _ = _bundle(tmp_path)
@@ -1426,12 +1459,17 @@ async def test_provider_schema_rejection_names_tool_and_reason(tmp_path: Path) -
 
     assert raised.value.to_error_obj() == {
         "code": -32602,
-        "message": "Invalid params",
+        "message": "MCP tool profile mismatch",
         "data": {
-            "tool": "read",
-            "reason": "outputSchema does not match the admitted provider profile",
+            "kind": "mcp_tool_profile_mismatch",
+            "dimension": dimension,
         },
     }
+    serialized = json.dumps(raised.value.to_error_obj())
+    assert "untrusted-description" not in serialized
+    assert "untrusted-extra-description" not in serialized
+    assert '"untrusted": "input"' not in serialized
+    assert '"untrusted": "output"' not in serialized
     assert client.disconnects == ["connection-1"]
     assert agent._sessions == {}
     assert list(agent._store.root.glob("*.meta.json")) == []
