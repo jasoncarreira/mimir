@@ -28,6 +28,7 @@ from mimir.access_control import (
     ServicePrincipal,
     ServiceShellBindingRule,
     ServiceSinkPolicy,
+    SinkCategory,
     SinkGate,
     ToolRegistry,
     authorize_action,
@@ -7887,6 +7888,92 @@ def _repository_result_labels(repo: str, pr: int, head: str) -> InformationFlowL
         integrity="untrusted",
         integrity_effect="informational",
     ))
+
+
+@pytest.mark.parametrize(
+    ("tool_name", "arguments", "resources"),
+    [
+        (
+            "hands_read",
+            {"path": "/workspace/notes.txt"},
+            ("client-file:%2Fworkspace%2Fnotes.txt",),
+        ),
+        (
+            "hands_edit",
+            {"path": "/workspace/notes.txt", "old_text": "old", "new_text": "new"},
+            None,
+        ),
+        ("hands_shell", {"command": "pwd"}, None),
+    ],
+)
+def test_existing_hands_results_are_complete_untrusted_active_and_origin_channel_only(
+    tool_name: str,
+    arguments: dict[str, str],
+    resources: tuple[str, ...] | None,
+) -> None:
+    from mimir.access_control import ToolAuthorization
+
+    channel = "acp:session-1"
+    auth = AuthContext(
+        principal="operator",
+        canonical_principal="operator",
+        roles=("admin",),
+        event_ingress=None,
+        trigger="user_message",
+        channel_id=channel,
+        interactivity=TurnInteractivity.INTERACTIVE,
+        domain="channel",
+        resource_id=channel,
+        bridge_instance="acp-stdio",
+        origin_trigger="acp_session",
+        enforcement_enabled=True,
+    )
+    authorization = ToolAuthorization(
+        tool_name=tool_name,
+        decision=(
+            OperationDecision.RESOURCE_SCOPED
+            if tool_name == "hands_read"
+            else OperationDecision.ADMIN_REQUIRED
+        ),
+        allowed=True,
+        protected_source_resources=resources,
+        result_integrity="trusted",
+    )
+
+    labels = classify_protected_result(
+        tool_name, arguments, auth, authorization, result={"successful": True},
+    )
+
+    assert labels is not None
+    assert labels.source_channels == frozenset({channel})
+    assert labels.has_untrusted_active_ingest is True
+    assert labels.sources
+    assert all(source.is_complete for source in labels.sources)
+    assert {source.principal for source in labels.sources} == {"operator"}
+    assert {source.authorized_principals for source in labels.sources} == {
+        frozenset({"operator"})
+    }
+    assert {source.bridge_instance for source in labels.sources} == {"acp-stdio"}
+    assert {source.integrity for source in labels.sources} == {"untrusted"}
+    assert {source.integrity_effect for source in labels.sources} == {"active_ingest"}
+
+    reply = SinkGate.check_sink_flow(
+        "send_message", channel, labels, auth, enforce=True,
+    )
+    assert reply.allowed is True, reply.reason
+
+    for sink_name, target, category in (
+        ("send_message", "acp:session-2", SinkCategory.SAME_CHANNEL),
+        ("post_message", "acp:session-2", SinkCategory.CROSS_CHANNEL),
+        ("write_file", "/tmp/result.txt", SinkCategory.FILE),
+        ("hands_edit", "client-file:other", SinkCategory.EXTERNAL_MCP),
+        ("hands_shell", "pwd", SinkCategory.SHELL_PROCESS),
+    ):
+        denied = SinkGate.check_sink_flow(
+            sink_name, target, labels, auth, enforce=True, sink_category=category,
+        )
+        assert denied.allowed is False, (sink_name, denied.reason)
+        assert denied.reason == f"ifc_label_blocked:{category.value}"
 
 
 def test_forge_repository_result_from_different_repository_is_refused() -> None:
