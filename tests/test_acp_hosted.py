@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import asyncio
 import os
+import shlex
 import stat
+import sys
 from pathlib import Path
 
 import pytest
@@ -10,8 +12,6 @@ import pytest
 import mimir.acp.hosted as hosted
 from mimir.acp.hands_contract import hands_v1_wire_descriptors
 from mimir.acp.hosted import (
-    OUTPUT_LIMIT_BYTES,
-    READ_LIMIT_BYTES,
     SHELL_TIMEOUT_SECONDS,
     HostedHandsProvider,
     HostedMcpError,
@@ -104,7 +104,7 @@ async def test_relative_absolute_symlink_encoding_size_and_frame_contract(
         )
         assert result["structuredContent"] == {"content": "a�b"}
 
-    target.write_bytes(b"x" * (READ_LIMIT_BYTES + 1))
+    target.write_bytes(b"x" * 1_048_577)
     with pytest.raises(HostedMcpError) as too_large:
         await provider.request(
             connection,
@@ -113,10 +113,10 @@ async def test_relative_absolute_symlink_encoding_size_and_frame_contract(
         )
     assert too_large.value.as_error() == {
         "code": -32000,
-        "message": f"file too large ({READ_LIMIT_BYTES + 1} bytes)",
+        "message": "file too large (1048577 bytes)",
     }
 
-    target.write_bytes(b"x" * READ_LIMIT_BYTES)
+    target.write_bytes(b"x" * 1_048_576)
     with pytest.raises(HostedMcpError, match="frame limit") as frame:
         await provider.request(
             connection,
@@ -194,10 +194,25 @@ async def test_shell_uses_bin_sh_cwd_environment_and_bounded_streams(
 ) -> None:
     monkeypatch.setenv("MIMIR_HOSTED_SENTINEL", "present")
     provider, connection = await _connected(tmp_path)
+    environment = await provider.request(
+        connection,
+        "tools/call",
+        {
+            "name": "shell",
+            "arguments": {
+                "command": "printf '%s\\n%s' \"$PWD\" \"$MIMIR_HOSTED_SENTINEL\""
+            },
+        },
+    )
+    assert environment["structuredContent"] == {
+        "stdout": f"{tmp_path}\npresent",
+        "stderr": "",
+        "exitCode": 0,
+    }
     command = (
-        "pwd; printf \"$MIMIR_HOSTED_SENTINEL\"; "
-        f"python -c 'import os; os.write(1, b\"x\"*{OUTPUT_LIMIT_BYTES + 7}); "
-        f"os.write(2, b\"y\"*{OUTPUT_LIMIT_BYTES + 9})'"
+        f"{shlex.quote(sys.executable)} -c 'import os; "
+        "os.write(1, b\"\\xff\" + b\"x\"*262150); "
+        "os.write(2, b\"\\xfe\" + b\"y\"*262152)'"
     )
     result = await provider.request(
         connection,
@@ -205,52 +220,112 @@ async def test_shell_uses_bin_sh_cwd_environment_and_bounded_streams(
         {"name": "shell", "arguments": {"command": command}},
     )
     structured = result["structuredContent"]
-    assert structured["stdout"].startswith(f"{tmp_path}\npresent")
-    prefix = f"{tmp_path}\npresent"
-    assert structured["stdout"].endswith(
-        f"\n…[truncated {len(prefix.encode()) + 7} bytes]"
+    assert structured["stdout"] == (
+        "�" + "x" * 262143 + "\n…[truncated 7 bytes]"
     )
-    assert structured["stderr"].endswith("\n…[truncated 9 bytes]")
+    assert structured["stderr"] == (
+        "�" + "y" * 262143 + "\n…[truncated 9 bytes]"
+    )
     assert structured["exitCode"] == 0
     assert SHELL_TIMEOUT_SECONDS == 60
 
 
 @pytest.mark.asyncio
-async def test_shell_timeout_and_cancel_cleanup_process_group(
+async def _child_identity(path: Path) -> tuple[int, int]:
+    deadline = asyncio.get_running_loop().time() + 5
+    while asyncio.get_running_loop().time() < deadline:
+        try:
+            pid, pgid = path.read_text().split()
+            return int(pid), int(pgid)
+        except (FileNotFoundError, ValueError):
+            await asyncio.sleep(0.01)
+    raise AssertionError("owned grandchild did not start")
+
+
+async def _assert_process_stopped(pid: int) -> None:
+    deadline = asyncio.get_running_loop().time() + 5
+    while asyncio.get_running_loop().time() < deadline:
+        try:
+            state = (Path("/proc") / str(pid) / "stat").read_text().split()[2]
+        except (FileNotFoundError, IndexError):
+            return
+        if state == "Z":
+            return
+        await asyncio.sleep(0.01)
+    raise AssertionError(f"owned process {pid} is still running")
+
+
+def _pipe_holding_grandchild_command(identity: Path) -> str:
+    source = (
+        "import os,time; "
+        f"open({str(identity)!r},'w').write(f'{{os.getpid()}} {{os.getpgrp()}}'); "
+        "print('held',flush=True); time.sleep(30)"
+    )
+    return f"{shlex.quote(sys.executable)} -c {shlex.quote(source)} &"
+
+
+@pytest.mark.asyncio
+async def test_shell_deadline_kills_pipe_holding_owned_grandchild(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     provider, connection = await _connected(tmp_path)
     monkeypatch.setattr(hosted, "SHELL_TIMEOUT_SECONDS", 1)
+    identity = tmp_path / "timeout-child"
     result = await provider.request(
         connection,
         "tools/call",
-        {"name": "shell", "arguments": {"command": "sleep 30"}},
+        {
+            "name": "shell",
+            "arguments": {"command": _pipe_holding_grandchild_command(identity)},
+        },
     )
+    pid, pgid = await _child_identity(identity)
     assert result["structuredContent"] == {
-        "stdout": "",
+        "stdout": "held\n",
         "stderr": "\n[timed out after 1 s]",
         "exitCode": -1,
     }
+    assert pgid != os.getpgrp()
+    await _assert_process_stopped(pid)
     assert not provider._processes
 
-    monkeypatch.setattr(hosted, "SHELL_TIMEOUT_SECONDS", 60)
+
+@pytest.mark.parametrize("action", ["cancel", "close"])
+@pytest.mark.asyncio
+async def test_shell_cancel_and_close_kill_pipe_holding_owned_grandchild(
+    tmp_path: Path, action: str
+) -> None:
+    provider, connection = await _connected(tmp_path)
+    identity = tmp_path / f"{action}-child"
     call = asyncio.create_task(
         provider.request(
             connection,
             "tools/call",
-            {"name": "shell", "arguments": {"command": "sleep 30"}},
+            {
+                "name": "shell",
+                "arguments": {
+                    "command": _pipe_holding_grandchild_command(identity)
+                },
+            },
             request_id="cancel-me",
         )
     )
-    while not provider._processes:
+    pid, pgid = await _child_identity(identity)
+    while any(process.returncode is None for process in provider._processes):
         await asyncio.sleep(0)
-    await provider.notification(
-        connection, "notifications/cancelled", {"requestId": "cancel-me"}
-    )
+    if action == "cancel":
+        await provider.notification(
+            connection, "notifications/cancelled", {"requestId": "cancel-me"}
+        )
+    else:
+        await provider.close()
     with pytest.raises(HostedMcpError, match="Request cancelled") as cancelled:
         await call
     assert cancelled.value.code == -32800
+    assert pgid != os.getpgrp()
+    await _assert_process_stopped(pid)
     assert not provider._processes
+    await provider.close()
 
 
 @pytest.mark.asyncio
@@ -276,3 +351,45 @@ async def test_call_arguments_metadata_and_results_are_strict(tmp_path: Path) ->
     assert missing.value.code == -32601
     await provider.close()
     await provider.close()
+
+
+@pytest.mark.parametrize(
+    ("name", "result"),
+    [
+        ("read", {}),
+        ("read", {"content": "value", "extra": True}),
+        ("read", {"content": 1}),
+        ("edit", {}),
+        ("edit", {"changed": True, "extra": True}),
+        ("edit", {"changed": 1}),
+        ("shell", {"stdout": "", "stderr": ""}),
+        ("shell", {"stdout": "", "stderr": "", "exitCode": 0, "extra": True}),
+        ("shell", {"stdout": "", "stderr": "", "exitCode": False}),
+    ],
+)
+@pytest.mark.asyncio
+async def test_malformed_operation_results_are_internal_errors_without_content(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    name: str,
+    result: dict[str, object],
+) -> None:
+    provider, connection = await _connected(tmp_path)
+
+    async def malformed_result(*args: object) -> dict[str, object]:
+        return result
+
+    monkeypatch.setattr(provider, "_call", malformed_result)
+    arguments = {
+        "read": {"path": "value"},
+        "edit": {"path": "value", "oldText": "old", "newText": "new"},
+        "shell": {"command": "true"},
+    }
+    with pytest.raises(HostedMcpError) as failure:
+        await provider.request(
+            connection,
+            "tools/call",
+            {"name": name, "arguments": arguments[name]},
+        )
+    assert failure.value.as_error() == {"code": -32603, "message": "Internal error"}
+    assert "structuredContent" not in failure.value.as_error()

@@ -51,6 +51,12 @@ class _Connection:
     calls: dict[tuple[type[Any], Any], asyncio.Task[Any]] = field(default_factory=dict)
 
 
+@dataclass(slots=True)
+class _OutputCapture:
+    retained: bytearray = field(default_factory=bytearray)
+    total: int = 0
+
+
 def _request_key(value: Any) -> tuple[type[Any], Any]:
     if isinstance(value, bool) or not isinstance(value, (str, int)):
         raise HostedMcpError(-32602, "Invalid params")
@@ -76,7 +82,7 @@ class HostedHandsProvider:
         self._sessions: dict[str, HostedSession] = {}
         self._connections: dict[str, _Connection] = {}
         self._used_connection_ids: set[str] = set()
-        self._processes: set[asyncio.subprocess.Process] = set()
+        self._processes: dict[asyncio.subprocess.Process, int] = {}
         self._provider_cancelled: set[asyncio.Task[Any]] = set()
         self._closed = False
 
@@ -133,7 +139,10 @@ class HostedHandsProvider:
         self._connections.clear()
         await asyncio.gather(*(self._cancel_calls(item) for item in connections))
         await asyncio.gather(
-            *(self._terminate_process(process) for process in tuple(self._processes))
+            *(
+                self._terminate_process(process, pgid)
+                for process, pgid in tuple(self._processes.items())
+            )
         )
 
     async def request(
@@ -349,66 +358,83 @@ class HostedHandsProvider:
             raise HostedMcpError(
                 -32000, f"hands_shell unavailable: {exc}"
             ) from None
-        self._processes.add(process)
-        stdout_task = asyncio.create_task(self._drain_output(process.stdout))
-        stderr_task = asyncio.create_task(self._drain_output(process.stderr))
+        pgid = process.pid
+        self._processes[process] = pgid
+        stdout_capture = _OutputCapture()
+        stderr_capture = _OutputCapture()
+        stdout_task = asyncio.create_task(
+            self._drain_output(process.stdout, stdout_capture)
+        )
+        stderr_task = asyncio.create_task(
+            self._drain_output(process.stderr, stderr_capture)
+        )
+        readers = (stdout_task, stderr_task)
+        deadline = asyncio.get_running_loop().time() + timeout
         timed_out = False
         try:
             try:
-                await asyncio.wait_for(process.wait(), timeout)
+                async with asyncio.timeout_at(deadline):
+                    await process.wait()
+                    await asyncio.gather(*readers)
             except TimeoutError:
                 timed_out = True
-                await self._terminate_process(process)
-            stdout, stdout_omitted = await stdout_task
-            stderr, stderr_omitted = await stderr_task
+                await self._terminate_process(process, pgid)
+                await self._finish_readers(readers)
         except BaseException:
-            stdout_task.cancel()
-            stderr_task.cancel()
-            await self._terminate_process(process)
-            await asyncio.gather(stdout_task, stderr_task, return_exceptions=True)
+            await self._terminate_process(process, pgid)
+            await self._finish_readers(readers)
             raise
         finally:
-            self._processes.discard(process)
-        stderr_text = self._format_output(stderr, stderr_omitted)
+            self._processes.pop(process, None)
+        stderr_text = self._format_output(stderr_capture)
         if timed_out:
             stderr_text += f"\n[timed out after {timeout} s]"
         return {
-            "stdout": self._format_output(stdout, stdout_omitted),
+            "stdout": self._format_output(stdout_capture),
             "stderr": stderr_text,
             "exitCode": -1 if timed_out else process.returncode,
         }
 
     async def _drain_output(
-        self, stream: asyncio.StreamReader
-    ) -> tuple[bytes, int]:
-        retained = bytearray()
-        total = 0
+        self, stream: asyncio.StreamReader, capture: _OutputCapture
+    ) -> None:
         while True:
             chunk = await stream.read(64 * 1024)
             if not chunk:
                 break
-            total += len(chunk)
-            if len(retained) < OUTPUT_LIMIT_BYTES:
-                retained.extend(chunk[: OUTPUT_LIMIT_BYTES - len(retained)])
-        return bytes(retained), total - len(retained)
+            capture.total += len(chunk)
+            if len(capture.retained) < OUTPUT_LIMIT_BYTES:
+                capture.retained.extend(
+                    chunk[: OUTPUT_LIMIT_BYTES - len(capture.retained)]
+                )
 
-    def _format_output(self, retained: bytes, omitted: int) -> str:
-        result = retained.decode("utf-8", errors="replace")
+    def _format_output(self, capture: _OutputCapture) -> str:
+        result = capture.retained.decode("utf-8", errors="replace")
+        omitted = capture.total - len(capture.retained)
         if omitted:
             result += f"\n…[truncated {omitted} bytes]"
         return result
 
-    async def _terminate_process(self, process: asyncio.subprocess.Process) -> None:
-        if process.returncode is None:
-            try:
-                os.killpg(process.pid, 9)
-            except ProcessLookupError:
-                pass
+    async def _finish_readers(
+        self, readers: tuple[asyncio.Task[None], asyncio.Task[None]]
+    ) -> None:
+        for reader in readers:
+            if not reader.done():
+                reader.cancel()
+        await asyncio.gather(*readers, return_exceptions=True)
+
+    async def _terminate_process(
+        self, process: asyncio.subprocess.Process, pgid: int
+    ) -> None:
+        try:
+            os.killpg(pgid, 9)
+        except ProcessLookupError:
+            pass
         try:
             await process.wait()
         except ProcessLookupError:
             pass
-        self._processes.discard(process)
+        self._processes.pop(process, None)
 
     async def _cancel_calls(self, connection: _Connection) -> None:
         tasks = tuple(connection.calls.values())
