@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+import re
 import subprocess
 from typing import Any
 
@@ -116,7 +117,9 @@ def test_default_tool_pin_inventory_matches_shipped_installs() -> None:
     assert f"opencode-ai@{pins['opencode'].pin}" in install_text
     assert pins["feature-factory"].pin == pins["opencode-feature-factory"].pin
     dockerfile = install_sources["Dockerfile"]
-    assert f"ARG FACTORY_VERSION={pins['feature-factory'].pin}" in dockerfile
+    factory_arg = re.search(r"(?m)^ARG FACTORY_VERSION=([^\s]+)$", dockerfile)
+    assert factory_arg is not None
+    assert FACTORY_VERSION == pins["feature-factory"].pin == factory_arg.group(1)
     assert "feature-factory@${FACTORY_VERSION}" in dockerfile
     assert "opencode-feature-factory@${FACTORY_VERSION}" in dockerfile
     scaffold = install_sources["mimir/scaffold_docker.py"]
