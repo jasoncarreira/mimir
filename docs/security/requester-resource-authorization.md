@@ -152,6 +152,7 @@ Ownership uses canonical principal ids, not display names or platform aliases. A
 - Regular-user query/get operations must apply scope in the storage query, not fetch globally and filter formatted output afterward.
 - Atom ids and model-provided `session_id` are selectors, not authority.
 - Stores, feedback, contribution marking, session closure, skill-learning writes, and forgetting mutate shared memory integrity and are admin/service-only until SAGA supports principal-partitioned write policy.
+- The SAGA write gate is the single integrity boundary: a turn is tainted only when it carries untrusted active ingest. SAGA reads, recalled atoms, and recent-activity messages are informational and never taint a turn. Every SAGA write or removal, including forgetting, is refused on a tainted turn; an untainted turn with non-empty provenance writes trusted records.
 - Legacy atoms/sessions without ownership metadata fail closed for regular users. They remain visible to admin/trusted autonomous maintenance under explicit policy.
 - Cross-principal synthesis and consolidation may run only as a trusted autonomous capability and must not make private source content visible to a different principal.
 

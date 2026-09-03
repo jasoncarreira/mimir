@@ -307,9 +307,8 @@ def _auto_recall_source_labels(
             ),
             source_kind="auto_recall",
             integrity=integrity,
-            # Accepted residual (#948): untrusted recall remains informational
-            # so it does not handcuff a user turn at sink gates. Persisted
-            # derivatives still inherit untrusted integrity in memory_store.
+            # Recall is retained for audit but does not participate in the
+            # durable-write trust boundary.
             integrity_effect=IntegrityEffect.INFORMATIONAL,
         ))
     return labels
