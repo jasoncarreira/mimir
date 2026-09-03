@@ -4424,7 +4424,7 @@ def test_factory_identity_preflight_is_not_repeated_for_retained_run(
 
 
 @pytest.mark.parametrize("refusal", ["sandbox", "launcher", "base", "session", "lifecycle"])
-def test_unbindable_factory_record_is_archived_before_claim_and_fresh_run(
+def test_unbindable_factory_record_blocks_before_claim_and_is_preserved(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, refusal: str
 ) -> None:
     import mimir.worklink.orchestrator as orchestrator
@@ -4571,17 +4571,18 @@ def test_unbindable_factory_record_is_archived_before_claim_and_fresh_run(
         WorklinkRunner(home=tmp_path, repo=repo, runner=runner, agent_id="agent").run_epic(700)
     )
 
-    assert result.status == "needs-human"
-    assert claimed_after_archive == [True]
-    assert transitions == []
-    assert load_factory_record(tmp_path, "chainlink-700").attempt == 2
+    assert result.status == "blocked"
+    assert result.checkout == old_sandbox
+    assert claimed_after_archive == []
+    assert len(transitions) == 1
+    assert transitions[0]["status"] == "blocked"
+    assert str(old_sandbox) in str(transitions[0]["reason"])
+    assert load_factory_record(tmp_path, "700") == retained
+    assert load_factory_record(tmp_path, "chainlink-700") is None
     archives = list(
         (tmp_path / "state" / "worklink" / "factory-runs" / "archive").glob("*.json")
     )
-    assert len(archives) == 1
-    assert FactoryRunRecord.from_json(
-        json.loads(archives[0].read_text(encoding="utf-8"))
-    ) == retained
+    assert archives == []
     expected_reasons = {
         "sandbox": "retained factory sandbox is unavailable",
         "launcher": "retained factory launcher does not match recovery request",
@@ -4589,21 +4590,8 @@ def test_unbindable_factory_record_is_archived_before_claim_and_fresh_run(
         "session": "retained factory session is missing",
         "lifecycle": "retained factory lifecycle is not recoverable",
     }
-    assert archive_events == [
-        (
-            "worklink_factory_record_archived",
-            {
-                "source": "dispatch_abandonment",
-                "issue_id": 700,
-                "run_id": "700",
-                "attempt": 1,
-                "session": retained.session,
-                "phase": retained.controller_phase,
-                "reason": expected_reasons[refusal],
-                "archive_path": str(archives[0]),
-            },
-        )
-    ]
+    assert expected_reasons[refusal] in str(transitions[0]["reason"])
+    assert archive_events == []
     assert old_sandbox.is_dir() is (refusal != "sandbox")
 
 
@@ -4835,6 +4823,11 @@ def test_factory_terminal_outcomes_emit_transition_payload(
                 "status": expected_status,
                 "review_ready": review_ready,
                 "pr_url": pr_url,
+                **(
+                    {"sandbox": str(sandbox)}
+                    if factory_status == "needs-human"
+                    else {}
+                ),
                 **(
                     {"reason": result.reason}
                     if result.reason is not None
@@ -5959,6 +5952,10 @@ def test_factory_recovery_uses_run_id_first_lock_resume_and_authoritative_status
 
         async def launch(self, spec: WorkSpec) -> LaunchHandle:
             self.launches += 1
+            assert spec.local_argv is not None
+            session_index = tuple(spec.local_argv).index("--session")
+            assert spec.local_argv[session_index + 1] == "session-1"
+            assert spec.local_argv[-1].split()[-1] == "700"
             return self.handle
 
         async def wait(self, handle: LaunchHandle, timeout_s: int) -> ComputeResult:
@@ -6339,6 +6336,139 @@ def test_factory_recovery_binding_rejects_every_precontrol_mismatch(
             base="main",
             command_runner=runner,
         )
+
+
+@pytest.mark.parametrize(
+    ("lease_origin", "sandbox_push", "expected"),
+    [
+        ("git@github.com:owner/repo.git", None, "owner/repo"),
+        ("git@github.com:other/repo.git", None, None),
+        (None, "https://github.com/owner/repo.git", "owner/repo"),
+    ],
+)
+def test_factory_checkout_repository_resolves_local_lease_or_push_url(
+    tmp_path: Path,
+    lease_origin: str | None,
+    sandbox_push: str | None,
+    expected: str | None,
+) -> None:
+    import mimir.worklink.orchestrator as orchestrator
+
+    sandbox = tmp_path / "sandbox"
+    lease = tmp_path / "lease"
+    sandbox.mkdir()
+    lease.mkdir()
+
+    def runner(args: Sequence[str]) -> subprocess.CompletedProcess[str]:
+        checkout = Path(args[2])
+        key = args[-1]
+        if key == "remote.origin.url":
+            value = str(lease) if checkout == sandbox else lease_origin
+        elif key == "remote.origin.pushurl":
+            value = sandbox_push if checkout == sandbox else None
+        else:
+            raise AssertionError(args)
+        return cp(args, returncode=0 if value else 1, stdout=f"{value}\n" if value else "")
+
+    resolved = orchestrator._factory_checkout_repository(sandbox, runner)
+
+    def checkout_runner(args: Sequence[str]) -> subprocess.CompletedProcess[str]:
+        if args[-1] in {"remote.origin.url", "remote.origin.pushurl"}:
+            return runner(args)
+        return cp(
+            args,
+            stdout=(
+                f"{sandbox}\n"
+                if args[-1] == "--show-toplevel"
+                else f"{sandbox / '.git'}\n"
+                if args[-1] == "--absolute-git-dir"
+                else "feature/chainlink-700\n"
+                if args[-1] == "--show-current"
+                else "a" * 40 + "\n"
+            ),
+        )
+
+    if expected is None:
+        assert resolved == "other/repo"
+        with pytest.raises(WorklinkError, match="factory checkout repository mismatch"):
+            orchestrator._verify_factory_checkout(
+                sandbox,
+                "feature/chainlink-700",
+                "main",
+                checkout_runner,
+                repository="owner/repo",
+            )
+    else:
+        assert resolved == expected
+        orchestrator._verify_factory_checkout(
+            sandbox,
+            "feature/chainlink-700",
+            "main",
+            checkout_runner,
+            repository="owner/repo",
+        )
+
+
+def test_factory_lock_refusal_exit_parks_without_terminal_failure(tmp_path: Path) -> None:
+    sandbox = tmp_path / "sandbox"
+    sandbox.mkdir()
+    handle = LaunchHandle("local_subprocess", "123", 456)
+    transitions: list[dict[str, object]] = []
+    git_calls: list[list[str]] = []
+
+    class Compute:
+        async def wait(self, selected: LaunchHandle, timeout_s: int) -> ComputeResult:
+            return ComputeResult(
+                0,
+                "A different live session holds the fresh lock, so this invocation "
+                "did not acquire the lock or mutate the run.",
+                "",
+                handle=selected,
+            )
+
+        def job_alive(self, selected: LaunchHandle) -> bool:
+            return False
+
+        async def cancel(self, selected: LaunchHandle) -> None:
+            raise AssertionError("an exited lock-refusal driver must not be cancelled")
+
+        async def cleanup(self, selected: LaunchHandle) -> None:
+            return None
+
+    class Backend:
+        poll_interval_s = 0
+
+        def status(self, *args: object, **kwargs: object) -> Any:
+            return _factory_lifecycle_status(sandbox, status="running")
+
+        def heartbeat(self, *args: object, **kwargs: object) -> None:
+            return None
+
+    class Claims:
+        def transition_issue(self, *args: object, **kwargs: object) -> None:
+            transitions.append(kwargs)
+
+    result = asyncio.run(
+        WorklinkRunner(home=tmp_path, repo=tmp_path)._supervise_factory_070(
+            issue=IssueContext(700, "epic", "build", {"worklink:epic"}),
+            claim_record=ClaimRecord(700, 2, "agent", datetime.now(UTC)),
+            claims=Claims(),
+            backend=Backend(),
+            compute=Compute(),
+            factory_record=_factory_lifecycle_record(sandbox, handle),
+            test_cmd="pytest -q",
+            runner=lambda args: git_calls.append(list(args)) or cp(args),
+            started_at=datetime.now(UTC),
+        )
+    )
+
+    retained = load_factory_record(tmp_path, "700")
+    assert result.status == "needs-human"
+    assert result.checkout == sandbox
+    assert sandbox.is_dir()
+    assert retained is not None and retained.controller_phase == "parked"
+    assert transitions[0]["status"] == "blocked"
+    assert not any("push" in call for call in git_calls)
 
 
 def _commit_runner(

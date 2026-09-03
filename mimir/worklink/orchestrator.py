@@ -81,7 +81,6 @@ from .backends.registry import factory_run_timeout_s
 from .backends.opencode import transcript_path, write_transcript
 from .factory_state import (
     FactoryRunRecord,
-    archive_factory_record,
     factory_process_is_alive,
     factory_process_is_verified_dead,
     factory_record_run_ids,
@@ -1750,40 +1749,68 @@ class WorklinkRunner:
         run_id = _validate_epic_work_item(work_item_json, issue.issue_id)
         retained: FactoryRunRecord | None = None
 
+        class FactoryRecoveryBlocked(WorklinkError):
+            def __init__(self, record: FactoryRunRecord, reason: str) -> None:
+                super().__init__(reason)
+                self.record = record
+
         def prepare_factory_claim() -> None:
             nonlocal retained
             candidates = load_factory_records_for_issue(self.home, issue_id)
-            for candidate in candidates:
-                try:
-                    _verify_factory_recovery_target(
-                        runner=self,
-                        issue=issue,
-                        retained=candidate,
-                        launcher=launcher,
-                        repo_slug=repo_slug,
-                        base=base,
-                        command_runner=runner,
-                    )
-                except WorklinkError as exc:
-                    archive_factory_record(
-                        self.home,
-                        candidate,
-                        event_logger=_log_durable_event,
-                        source_kind="dispatch_abandonment",
-                        reason=str(exc),
-                    )
-                    continue
-                if retained is None:
-                    retained = candidate
+            if not candidates:
+                return
+            candidate = candidates[0]
+            try:
+                _verify_factory_recovery_target(
+                    runner=self,
+                    issue=issue,
+                    retained=candidate,
+                    launcher=launcher,
+                    repo_slug=repo_slug,
+                    base=base,
+                    command_runner=runner,
+                )
+            except WorklinkError as exc:
+                raise FactoryRecoveryBlocked(candidate, str(exc)) from exc
+            retained = candidate
 
-        claim = claims.claim_issue(
-            issue_id,
-            issue.comments,
-            labels=issue.labels,
-            max_active_locks=factory_max_concurrent(),
-            active_label=WORKLINK_EPIC_LABEL,
-            before_claim=prepare_factory_claim,
-        )
+        try:
+            claim = claims.claim_issue(
+                issue_id,
+                issue.comments,
+                labels=issue.labels,
+                max_active_locks=factory_max_concurrent(),
+                active_label=WORKLINK_EPIC_LABEL,
+                before_claim=prepare_factory_claim,
+            )
+        except FactoryRecoveryBlocked as exc:
+            reason = f"retained factory sandbox {exc.record.sandbox}: {exc}"
+            _log_event(
+                "worklink_factory_recovery_blocked",
+                issue_id=issue_id,
+                attempt=exc.record.attempt,
+                sandbox=exc.record.sandbox,
+                reason=str(exc),
+            )
+            current_issue = issue_reader.read(issue_id)
+            if "worklink:in-progress" not in current_issue.labels:
+                claims.transition_issue(
+                    issue_id,
+                    status="blocked",
+                    review_ready=False,
+                    attempt=exc.record.attempt,
+                    reason=reason,
+                )
+            else:
+                reason += "; current in-progress owner was left unchanged"
+            return WorklinkRunResult(
+                issue_id,
+                exc.record.attempt,
+                "blocked",
+                checkout=Path(exc.record.sandbox),
+                branch=exc.record.branch,
+                reason=reason,
+            )
         if claim.attempts_exhausted:
             _log_event(
                 "worklink_attempts_exhausted",
@@ -2122,7 +2149,9 @@ class WorklinkRunner:
             transcript_root=self.home / "state" / "worklink" / "transcripts",
         )
         recovery_repo_url = _repo_remote_url(sandbox, runner=runner)
-        if (_repo_slug_from_url(recovery_repo_url) or "").lower() != retained.repository.lower():
+        if (
+            _factory_checkout_repository(sandbox, runner) or ""
+        ).lower() != retained.repository.lower():
             raise WorklinkError("factory recovery sandbox repository changed before launch")
         spec = backend.work_spec(
             order,
@@ -2131,6 +2160,8 @@ class WorklinkRunner:
             base_ref=retained.base_ref,
             branch=retained.branch,
             test_command=test_cmd,
+            session=session,
+            run_id=retained.run_id,
         )
         handle = await compute.launch(spec)
         relaunched = replace(
@@ -2325,6 +2356,37 @@ class WorklinkRunner:
                         ) from exc
                     retain_result(result, "failed")
                     detail = result.stderr.strip() or result.stdout.strip()
+                    if _factory_lock_refusal(result):
+                        reason = "factory driver did not acquire the retained run lock"
+                        factory_record = replace(
+                            factory_record,
+                            controller_phase="parked",
+                            controller_error=_factory_controller_error(reason),
+                        )
+                        save_factory_record(self.home, factory_record)
+                        claims.transition_issue(
+                            issue.issue_id,
+                            status="blocked",
+                            review_ready=False,
+                            attempt=claim_record.budget_attempt or claim_record.attempt,
+                            reason=f"{reason}; retained sandbox: {factory_record.sandbox}",
+                        )
+                        _log_event(
+                            "worklink_factory_lock_refused",
+                            issue_id=issue.issue_id,
+                            attempt=factory_record.attempt,
+                            sandbox=factory_record.sandbox,
+                            reason=detail[:300] or reason,
+                        )
+                        failed = False
+                        return WorklinkRunResult(
+                            issue.issue_id,
+                            factory_record.attempt,
+                            "needs-human",
+                            checkout=Path(factory_record.sandbox),
+                            branch=factory_record.branch,
+                            reason=reason,
+                        )
                     suffix = f": {detail[:300]}" if detail else ""
                     raise WorklinkError(
                         f"OpenCode process exited while factory status was running{suffix}"
@@ -2393,6 +2455,7 @@ class WorklinkRunner:
                 review_ready=result.review_ready,
                 pr_url=result.pr_url,
                 reason=result.reason,
+                sandbox=factory_record.sandbox,
             )
             return result
         if status.status in {"blocked", "partial"}:
@@ -2701,12 +2764,7 @@ def _verify_factory_checkout(
     except OSError as exc:
         raise WorklinkError("factory checkout git directory is unavailable") from exc
     if repository is not None:
-        remote = _fixed_command(
-            runner,
-            ["git", "-C", str(sandbox), "config", "--get", "remote.origin.url"],
-            error="cannot read factory checkout repository",
-        ).stdout.strip()
-        if (_repo_slug_from_url(remote) or "").lower() != repository.lower():
+        if (_factory_checkout_repository(sandbox, runner) != repository.lower()):
             raise WorklinkError("factory checkout repository mismatch")
     observed_branch = _fixed_command(
         runner,
@@ -2730,6 +2788,71 @@ def _verify_factory_checkout(
     if not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", head):
         raise WorklinkError("factory checkout HEAD is invalid")
     return head
+
+
+def _factory_checkout_repository(checkout: Path, runner: Runner) -> str | None:
+    """Resolve a factory clone through its local lease without changing remotes."""
+    current = checkout
+    visited: set[Path] = set()
+    for _ in range(4):
+        try:
+            resolved = current.resolve(strict=True)
+        except OSError:
+            return None
+        if resolved in visited or not resolved.is_dir():
+            return None
+        visited.add(resolved)
+        remote_result = runner(
+            ["git", "-C", str(resolved), "config", "--get", "remote.origin.url"]
+        )
+        if remote_result.returncode != 0:
+            return None
+        remote = remote_result.stdout.strip()
+        slug = _repo_slug_from_url(remote)
+        if slug is not None:
+            return slug.lower()
+        push_result = runner(
+            ["git", "-C", str(resolved), "config", "--get", "remote.origin.pushurl"]
+        )
+        push_slug = _repo_slug_from_url(
+            push_result.stdout.strip() if push_result.returncode == 0 else None
+        )
+        if push_slug is not None:
+            return push_slug.lower()
+        if remote.startswith("file://"):
+            remote = remote.removeprefix("file://")
+        elif "://" in remote or not remote:
+            return None
+        candidate = Path(remote).expanduser()
+        current = candidate if candidate.is_absolute() else resolved / candidate
+    return None
+
+
+def _factory_lock_refusal(result: ComputeResult) -> bool:
+    if (
+        result.exit_code != 0
+        or result.timed_out
+        or result.output_overflow
+        or result.launch_error is not None
+    ):
+        return False
+    lines = [
+        line.strip().lower()
+        for line in f"{result.stdout}\n{result.stderr}".splitlines()
+        if line.strip()
+    ]
+    if not lines:
+        return False
+    report = lines[-1]
+    return any(
+        marker in report
+        for marker in (
+            "did not acquire the lock",
+            "did not acquire lock",
+            "another live session holds",
+            "different live session holds",
+        )
+    )
 
 
 _CANONICAL_PR_URL = re.compile(

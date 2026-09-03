@@ -734,10 +734,15 @@ def test_reconcile_empty_orphan_returns_ready(tmp_path: Path) -> None:
     save_run_state(tmp_path, replace(state, checkout=str(checkout), local_base="base-sha"))
     calls: list[list[str]] = []
 
+    def runner(args: list[str]) -> subprocess.CompletedProcess[str]:
+        calls.append(list(args))
+        if args[1:3] == ["issue", "show"]:
+            return subprocess.CompletedProcess(args, 0, stdout='{"labels":[]}', stderr="")
+        return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+
     reconcile_run_states(
         tmp_path,
-        runner=lambda args: calls.append(list(args))
-        or subprocess.CompletedProcess(args, 0, stdout="", stderr=""),
+        runner=runner,
         git_runner=lambda args: subprocess.CompletedProcess(
             args,
             0,
@@ -749,6 +754,73 @@ def test_reconcile_empty_orphan_returns_ready(tmp_path: Path) -> None:
 
     assert ["chainlink", "issue", "label", "12", "worklink:ready"] in calls
     assert load_run_state(tmp_path, 12) is None
+
+
+def test_reconcile_clean_epic_orphan_does_not_rearm_ready(tmp_path: Path) -> None:
+    now = datetime.now(UTC)
+    state = _state(tmp_path, 1521, 999_999_998, ticks=1, started_at=now)
+    checkout = tmp_path / "checkout-1521"
+    checkout.mkdir()
+    save_run_state(tmp_path, replace(state, checkout=str(checkout), local_base="base-sha"))
+    calls: list[list[str]] = []
+
+    def runner(args: list[str]) -> subprocess.CompletedProcess[str]:
+        calls.append(list(args))
+        if args[1:3] == ["issue", "show"]:
+            return subprocess.CompletedProcess(
+                args,
+                0,
+                stdout=json.dumps({"labels": ["worklink:epic", "worklink:in-progress"]}),
+                stderr="",
+            )
+        return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+
+    reconcile_run_states(
+        tmp_path,
+        runner=runner,
+        git_runner=lambda args: subprocess.CompletedProcess(
+            args,
+            0,
+            stdout="head\n" if args[3] == "rev-parse" else "0\n",
+            stderr="",
+        ),
+        now=now,
+    )
+
+    assert ["chainlink", "issue", "label", "1521", "worklink:ready"] not in calls
+    assert ["chainlink", "issue", "label", "1521", "worklink:blocked"] in calls
+    comment = next(call[-1] for call in calls if call[1:3] == ["issue", "comment"])
+    assert "armed by an operator only" in comment
+
+
+def test_reconcile_label_lookup_failure_does_not_apply_ready(tmp_path: Path) -> None:
+    now = datetime.now(UTC)
+    state = _state(tmp_path, 1522, 999_999_997, ticks=1, started_at=now)
+    checkout = tmp_path / "checkout-1522"
+    checkout.mkdir()
+    save_run_state(tmp_path, replace(state, checkout=str(checkout), local_base="base-sha"))
+    calls: list[list[str]] = []
+
+    def runner(args: list[str]) -> subprocess.CompletedProcess[str]:
+        calls.append(list(args))
+        if args[1:3] == ["issue", "show"]:
+            return subprocess.CompletedProcess(args, 1, stdout="", stderr="unavailable")
+        return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+
+    reconcile_run_states(
+        tmp_path,
+        runner=runner,
+        git_runner=lambda args: subprocess.CompletedProcess(
+            args,
+            0,
+            stdout="head\n" if args[3] == "rev-parse" else "0\n",
+            stderr="",
+        ),
+        now=now,
+    )
+
+    assert ["chainlink", "issue", "label", "1522", "worklink:ready"] not in calls
+    assert ["chainlink", "issue", "label", "1522", "worklink:blocked"] in calls
 
 
 def test_reconcile_undetermined_records_outcome_and_explains_temporary_block(
@@ -798,10 +870,15 @@ def test_reconcile_missing_checkout_records_undetermined_and_returns_ready(
     calls: list[list[str]] = []
     events: list[tuple[str, dict[str, object]]] = []
 
+    def runner(args: list[str]) -> subprocess.CompletedProcess[str]:
+        calls.append(list(args))
+        if args[1:3] == ["issue", "show"]:
+            return subprocess.CompletedProcess(args, 0, stdout='{"labels":[]}', stderr="")
+        return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+
     reconcile_run_states(
         tmp_path,
-        runner=lambda args: calls.append(list(args))
-        or subprocess.CompletedProcess(args, 0, stdout="", stderr=""),
+        runner=runner,
         event_logger=lambda event, **payload: events.append((event, payload)),
         now=now,
     )

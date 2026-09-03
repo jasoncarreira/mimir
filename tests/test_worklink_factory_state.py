@@ -165,7 +165,7 @@ def test_factory_record_retention_default_is_seven_days(tmp_path: Path) -> None:
     assert calls == []
 
 
-def test_factory_age_out_pushes_before_removing_both_manifest_candidates(
+def test_factory_age_out_reports_and_preserves_control_plane(
     tmp_path: Path,
 ) -> None:
     repository = tmp_path / "repo"
@@ -175,33 +175,25 @@ def test_factory_age_out_pushes_before_removing_both_manifest_candidates(
     assert sandbox_manifest == repository / ".factory-sandboxes" / "1551" / ".factory" / "1551"
     root_manifest.mkdir(parents=True)
     sandbox_manifest.mkdir(parents=True)
-    calls: list[list[str]] = []
-
-    def run(args):
-        calls.append(list(args))
-        if "push" in args:
-            assert root_manifest.exists()
-            assert sandbox_manifest.exists()
-            assert Path(expected.sandbox).exists()
-            return subprocess.CompletedProcess(args, 0, stdout="pushed\n", stderr="")
-        return subprocess.CompletedProcess(args, 0, stdout="refs/heads/slice-one\n", stderr="")
+    events: list[tuple[str, dict[str, object]]] = []
 
     archived = age_out_factory_records(
         tmp_path,
         now=datetime(2026, 8, 8, tzinfo=UTC),
-        runner=run,
-        event_logger=lambda *args, **kwargs: None,
+        runner=lambda args: pytest.fail("automatic retention must not run git"),
+        event_logger=lambda event, **payload: events.append((event, payload)),
     )
 
-    assert [call[3] for call in calls] == ["for-each-ref", "push"]
-    assert len(archived) == 1
-    assert not root_manifest.exists()
-    assert not sandbox_manifest.exists()
-    assert not Path(expected.sandbox).exists()
-    assert load_factory_record(tmp_path, expected.run_id) is None
+    assert archived == []
+    assert root_manifest.exists()
+    assert sandbox_manifest.exists()
+    assert Path(expected.sandbox).exists()
+    assert load_factory_record(tmp_path, expected.run_id) == expected
+    assert events[0][0] == "worklink_factory_run_retained"
+    assert events[0][1]["sandbox"] == expected.sandbox
 
 
-def test_factory_age_out_push_failure_retains_sandbox_and_reports_event(
+def test_factory_age_out_never_touches_unresumed_sandbox(
     tmp_path: Path,
 ) -> None:
     repository = tmp_path / "repo"
@@ -209,18 +201,11 @@ def test_factory_age_out_push_failure_retains_sandbox_and_reports_event(
     root_manifest, sandbox_manifest = factory_manifest_candidates(expected)
     root_manifest.mkdir(parents=True)
     sandbox_manifest.mkdir(parents=True)
-    events: list[tuple[str, dict[str, object]]] = []
-
-    def run(args):
-        if "push" in args:
-            return subprocess.CompletedProcess(args, 1, stdout="", stderr="remote rejected")
-        return subprocess.CompletedProcess(args, 0, stdout="refs/heads/unpushed\n", stderr="")
-
     archived = age_out_factory_records(
         tmp_path,
         now=datetime(2026, 8, 8, tzinfo=UTC),
-        runner=run,
-        event_logger=lambda event, **payload: events.append((event, payload)),
+        runner=lambda args: pytest.fail("automatic retention must not run git"),
+        event_logger=lambda *args, **kwargs: None,
     )
 
     assert archived == []
@@ -228,21 +213,9 @@ def test_factory_age_out_push_failure_retains_sandbox_and_reports_event(
     assert sandbox_manifest.is_dir()
     assert Path(expected.sandbox).is_dir()
     assert load_factory_record(tmp_path, expected.run_id) == expected
-    assert events == [
-        (
-            "worklink_factory_record_age_out_failed",
-            {
-                "issue_id": 1551,
-                "run_id": "1551",
-                "attempt": 1,
-                "phase": "failed",
-                "error": "cannot push retained factory branches: remote rejected",
-            },
-        )
-    ]
 
 
-def test_factory_age_out_archives_record_when_sandbox_is_already_gone(tmp_path: Path) -> None:
+def test_factory_age_out_retains_record_when_sandbox_is_already_gone(tmp_path: Path) -> None:
     repository = tmp_path / "repo"
     expected = _retained_record(tmp_path, repository, sandbox_exists=False)
     root_manifest, _ = factory_manifest_candidates(expected)
@@ -255,9 +228,9 @@ def test_factory_age_out_archives_record_when_sandbox_is_already_gone(tmp_path: 
         event_logger=lambda *args, **kwargs: None,
     )
 
-    assert len(archived) == 1
-    assert not root_manifest.exists()
-    assert load_factory_record(tmp_path, expected.run_id) is None
+    assert archived == []
+    assert root_manifest.exists()
+    assert load_factory_record(tmp_path, expected.run_id) == expected
 
 
 def test_factory_record_rejects_identity_and_sandbox_mismatch(tmp_path: Path) -> None:

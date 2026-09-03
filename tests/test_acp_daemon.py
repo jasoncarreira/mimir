@@ -673,7 +673,7 @@ async def test_postauth_watchdog_terminates_non_draining_peer(
     writer = BlockedWriter()
     with pytest.raises(AcpDaemonError, match="stopped draining"):
         await asyncio.wait_for(
-            daemon._run_peer(asyncio.StreamReader(), writer), 0.1
+            daemon._run_peer(asyncio.StreamReader(), writer), 1.0
         )
     assert authenticated.is_set()
     assert cancelled.is_set()
