@@ -6,6 +6,10 @@ All notable changes will land here. Format loosely follows
 
 ## [Unreleased]
 
+- Upgrade `feature-factory` and `opencode-feature-factory` to 0.8.1, which moves
+  repository resolver intake before run initialization so rendered work-item
+  context is available before a run ID is allocated.
+
 ## [0.8.8] — 2026-08-28
 
 A same-day upstream release broke live turns; this restores them.

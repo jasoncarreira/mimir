@@ -19,7 +19,7 @@ from .base import Caps, CheckoutShape, RawResult, WorkOrder
 from .opencode import resolve_worklink_opencode_invocation
 
 
-FACTORY_VERSION = "0.8.0"
+FACTORY_VERSION = "0.8.1"
 DEFAULT_FACTORY_ENTRYPOINT = "/opt/mimir-opencode/lib/node_modules/feature-factory/bin/factory.js"
 FACTORY_COMMANDS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("init", ("init",)),
@@ -741,7 +741,7 @@ class FeatureFactoryBackend:
         return RawResult(0, None, "interrupted", None)
 
 
-# feature-factory 0.8.0's own variable, read by the factory CHILD. Distinct from
+# feature-factory 0.8.0+'s own variable, read by the factory CHILD. Distinct from
 # mimir's operator-facing ``MIMIR_FACTORY_PUBLISHING_IDENTITY``, which selects the
 # identity on the controller side; the resolved value is forwarded under this name.
 FACTORY_PUBLISHING_IDENTITY_ENV = "FACTORY_PUBLISHING_IDENTITY"
@@ -763,7 +763,7 @@ def _control_environment() -> dict[str, str]:
         "NODE_EXTRA_CA_CERTS",
         "SSL_CERT_FILE",
         "SSL_CERT_DIR",
-        # feature-factory 0.8.0 reads the declared publishing identity from this
+        # feature-factory 0.8.0+ reads the declared publishing identity from this
         # inherited variable and compares it against ``gh api /user``. The mimir
         # repository is published from two accounts -- ``jasoncarreira`` from a
         # maintainer's checkout and ``mimir-carreira`` from mimirbot -- so the

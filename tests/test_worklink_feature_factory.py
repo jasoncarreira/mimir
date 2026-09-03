@@ -310,7 +310,7 @@ def test_status_rejects_invalid_utf8_nul_and_oversize(payload: bytes) -> None:
 
 def test_resolve_entrypoint_is_absolute_package_bound_and_lockstep(tmp_path: Path) -> None:
     entrypoint = package_entrypoint(tmp_path)
-    assert FACTORY_VERSION == "0.8.0"
+    assert FACTORY_VERSION == "0.8.1"
     assert resolve_factory_entrypoint(entrypoint) == entrypoint.resolve()
     with pytest.raises(FactoryContractError, match="absolute"):
         resolve_factory_entrypoint(Path("feature-factory/bin/factory.js"))
@@ -336,7 +336,7 @@ def test_admit_rejects_either_package_version_mismatch(
     entrypoint = package_entrypoint(tmp_path)
     manifest = entrypoint.parents[2] / package / "package.json"
     manifest.write_text(
-        json.dumps({"name": expected_name, "version": "0.7.1"}),
+        json.dumps({"name": expected_name, "version": "0.8.0"}),
         encoding="utf-8",
     )
     calls: list[tuple[str, ...]] = []
@@ -824,7 +824,7 @@ def test_control_environment_forwards_the_factory_publishing_identity(monkeypatc
     environment from ``WorkSpec.env`` instead -- see
     ``test_launch_child_environment_carries_the_publishing_identity``.
 
-    feature-factory 0.8.0 reads the declared identity from the inherited
+    feature-factory 0.8.0+ reads the declared identity from the inherited
     `FACTORY_PUBLISHING_IDENTITY` value and checks it against `gh api /user`.
     The mimir repository publishes from two accounts -- a
     maintainer's checkout as ``jasoncarreira``, mimirbot as ``mimir-carreira`` --
