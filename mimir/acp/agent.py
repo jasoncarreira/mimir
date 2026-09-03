@@ -540,7 +540,7 @@ class MimirAcpAgent:
             record = self._store.create_owned_session(owner)
             self._journals.open(record, client)
             state = SessionState(record, SessionEnvironment(cwd, copy.deepcopy(mcp_servers)), self._generation, declaration, MIMIR_HANDS_V1 if declaration else None)
-            await self._admit_provider(state, include_schema_diagnostics=True)
+            await self._admit_provider(state)
         except RequestError:
             if state is not None:
                 await self._discard_candidate(state)
@@ -1132,9 +1132,7 @@ class MimirAcpAgent:
             raise invalid_params_error()
         return ProviderDeclaration(value.name, value.server_id, cwd)
 
-    async def _admit_provider(
-        self, state: SessionState, *, include_schema_diagnostics: bool = False
-    ) -> None:
+    async def _admit_provider(self, state: SessionState) -> None:
         if state.declaration is None:
             return
         connection = self._require_connection()
@@ -1169,9 +1167,14 @@ class MimirAcpAgent:
                 temporary = _AcpProviderConnection(self, peer, connection_id, state)
                 temporary.closed = True
                 await self._disconnect_provider(temporary, connection)
-            if include_schema_diagnostics and isinstance(error, ProviderSchemaError):
-                raise RequestError.invalid_params(
-                    {"tool": error.tool_name, "reason": error.reason}
+            if isinstance(error, ProviderSchemaError):
+                raise RequestError(
+                    -32602,
+                    "MCP tool profile mismatch",
+                    {
+                        "kind": "mcp_tool_profile_mismatch",
+                        "dimension": error.dimension,
+                    },
                 ) from None
             raise invalid_params_error() from None
 
@@ -1198,31 +1201,38 @@ class MimirAcpAgent:
         if not isinstance(listed, Mapping) or set(listed) - {"tools", "nextCursor"} or listed.get("nextCursor") not in {None, ""} or not isinstance(listed.get("tools"), list):
             raise AcpProtocolError("Malformed MCP tool list")
         expected = {tool.provider_name: tool for tool in MIMIR_HANDS_V1.tools}
-        if len(listed["tools"]) != len(expected):
-            raise AcpProtocolError("MCP tool profile mismatch")
-        seen: set[str] = set()
-        for tool in listed["tools"]:
-            if not isinstance(tool, Mapping) or set(tool) - {"name", "description", "inputSchema", "outputSchema", "annotations", "_meta"}:
-                raise AcpProtocolError("MCP tool profile mismatch")
-            name = tool.get("name")
-            policy = expected.get(name)
-            if (
-                policy is None
-                or name in seen
-                or tool.get("description") != policy.description
-            ):
-                raise AcpProtocolError("MCP tool profile mismatch")
-            if tool.get("inputSchema") != _thaw(policy.input_schema):
-                raise ProviderSchemaError(
-                    name, "inputSchema does not match the admitted provider profile"
-                )
-            if tool.get("outputSchema") != _thaw(policy.result_schema):
-                raise ProviderSchemaError(
-                    name, "outputSchema does not match the admitted provider profile"
-                )
-            seen.add(name)
-        if seen != set(expected):
-            raise AcpProtocolError("MCP tool profile mismatch")
+        tools = listed["tools"]
+        names = [tool.get("name") if isinstance(tool, Mapping) else None for tool in tools]
+        string_names = [name for name in names if isinstance(name, str)]
+        if len(set(string_names)) != len(string_names):
+            raise ProviderSchemaError("duplicate")
+        if len(tools) < len(expected):
+            raise ProviderSchemaError("missing")
+        if len(tools) > len(expected):
+            raise ProviderSchemaError("extra")
+        if set(string_names) != set(expected) or len(string_names) != len(names):
+            raise ProviderSchemaError("name")
+        by_name = {tool["name"]: tool for tool in tools}
+        allowed_keys = {
+            "name",
+            "description",
+            "inputSchema",
+            "outputSchema",
+            "annotations",
+            "_meta",
+        }
+        if any(set(tool) - allowed_keys for tool in tools):
+            raise ProviderSchemaError("name")
+        for name, policy in expected.items():
+            tool = by_name[name]
+            if tool.get("description") != policy.description:
+                raise ProviderSchemaError("description")
+        for name, policy in expected.items():
+            if by_name[name].get("inputSchema") != _thaw(policy.input_schema):
+                raise ProviderSchemaError("inputSchema")
+        for name, policy in expected.items():
+            if by_name[name].get("outputSchema") != _thaw(policy.result_schema):
+                raise ProviderSchemaError("outputSchema")
 
     async def _discard_candidate(self, state: SessionState) -> None:
         connection = self._connections.get(state.generation)

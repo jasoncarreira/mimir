@@ -13,6 +13,13 @@ from typing import Any, Awaitable, Mapping, Protocol, runtime_checkable
 from langchain_core.tools import ToolException, tool
 from pydantic import BaseModel, ConfigDict
 
+from ..acp.hands_contract import (
+    HANDS_PROVIDER_TO_WRAPPER,
+    HANDS_V1_WIRE_TOOLS,
+    HANDS_WRAPPER_TO_PROVIDER,
+    HandsContractError,
+    validate_tool_result,
+)
 from ..access_control import (
     CLIENT_FILE_RESOURCE_POLICY,
     ClientFileResourcePolicy,
@@ -25,10 +32,9 @@ class ProviderPolicyError(RuntimeError):
 
 
 class ProviderSchemaError(RuntimeError):
-    def __init__(self, tool_name: str, reason: str) -> None:
-        super().__init__(reason)
-        self.tool_name = tool_name
-        self.reason = reason
+    def __init__(self, dimension: str) -> None:
+        super().__init__("MCP tool profile mismatch")
+        self.dimension = dimension
 
 
 class ClientProviderResultError(ToolException, RuntimeError):
@@ -138,17 +144,6 @@ def get_turn_capability_context() -> TurnCapabilityContext | None:
     return _TURN_CAPABILITY_CONTEXT.get()
 
 
-def _immutable_schema(value: dict[str, Any]) -> Mapping[str, Any]:
-    def freeze(item: Any) -> Any:
-        if isinstance(item, dict):
-            return MappingProxyType({key: freeze(child) for key, child in item.items()})
-        if isinstance(item, list):
-            return tuple(freeze(child) for child in item)
-        return item
-
-    return freeze(value)
-
-
 def _schema_digest(schema: Mapping[str, Any]) -> str:
     def thaw(item: Any) -> Any:
         if isinstance(item, Mapping):
@@ -159,17 +154,6 @@ def _schema_digest(schema: Mapping[str, Any]) -> str:
 
     encoded = json.dumps(thaw(schema), sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
-
-
-def _object_schema(
-    properties: dict[str, dict[str, Any]], required: tuple[str, ...]
-) -> Mapping[str, Any]:
-    return _immutable_schema({
-        "type": "object",
-        "properties": properties,
-        "required": list(required),
-        "additionalProperties": False,
-    })
 
 
 def _tool_policy(
@@ -199,23 +183,27 @@ def _tool_policy(
     )
 
 
-_STRING = {"type": "string"}
-_READ_INPUT = _object_schema({"path": _STRING}, ("path",))
-_READ_RESULT = _object_schema({"content": _STRING}, ("content",))
-_EDIT_INPUT = _object_schema(
-    {"path": _STRING, "oldText": _STRING, "newText": _STRING},
-    ("path", "oldText", "newText"),
-)
-_EDIT_RESULT = _object_schema({"changed": {"type": "boolean"}}, ("changed",))
-_SHELL_INPUT = _object_schema({"command": _STRING}, ("command",))
-_SHELL_RESULT = _object_schema(
-    {
-        "stdout": _STRING,
-        "stderr": _STRING,
-        "exitCode": {"type": "integer"},
-    },
-    ("stdout", "stderr", "exitCode"),
-)
+_WIRE_TO_POLICY = {
+    "read": ("resource_scoped", "source", None, "client-file"),
+    "edit": ("admin_required", "both", "external_mcp", "client-file"),
+    "shell": ("admin_required", "both", "shell_process", None),
+}
+
+
+def _hands_policy_from_wire(descriptor: Mapping[str, Any]) -> ProviderToolPolicy:
+    provider_name = descriptor["name"]
+    classification, flow, sink, namespace = _WIRE_TO_POLICY[provider_name]
+    return _tool_policy(
+        wrapper_name=HANDS_PROVIDER_TO_WRAPPER[provider_name],
+        provider_name=provider_name,
+        classification=classification,
+        flow=flow,
+        sink=sink,
+        resource_namespace=namespace,
+        input_schema=descriptor["inputSchema"],
+        result_schema=descriptor["outputSchema"],
+        description=descriptor["description"],
+    )
 
 MIMIR_HANDS_V1 = ProviderProfile(
     profile_id="mimir.hands.v1",
@@ -223,41 +211,7 @@ MIMIR_HANDS_V1 = ProviderProfile(
     provenance="mimir.server.provider-policy",
     adapter="acp-mcp",
     resource_policy=CLIENT_FILE_RESOURCE_POLICY,
-    tools=(
-        _tool_policy(
-            wrapper_name="hands_read",
-            provider_name="read",
-            classification="resource_scoped",
-            flow="source",
-            sink=None,
-            resource_namespace="client-file",
-            input_schema=_READ_INPUT,
-            result_schema=_READ_RESULT,
-            description="Read a file from the admitted client-hosted hands provider.",
-        ),
-        _tool_policy(
-            wrapper_name="hands_edit",
-            provider_name="edit",
-            classification="admin_required",
-            flow="both",
-            sink="external_mcp",
-            resource_namespace="client-file",
-            input_schema=_EDIT_INPUT,
-            result_schema=_EDIT_RESULT,
-            description="Replace exact text through the admitted client-hosted hands provider.",
-        ),
-        _tool_policy(
-            wrapper_name="hands_shell",
-            provider_name="shell",
-            classification="admin_required",
-            flow="both",
-            sink="shell_process",
-            resource_namespace=None,
-            input_schema=_SHELL_INPUT,
-            result_schema=_SHELL_RESULT,
-            description="Run a command through the admitted client-hosted hands provider.",
-        ),
-    ),
+    tools=tuple(_hands_policy_from_wire(descriptor) for descriptor in HANDS_V1_WIRE_TOOLS),
 )
 
 class ProviderRegistry:
@@ -309,18 +263,12 @@ def _active_policy(wrapper_name: str) -> tuple[TurnCapabilityContext, ProviderTo
     return context, policy
 
 
-def _validate_result(
-    result: Mapping[str, Any], expected: Mapping[str, type], wrapper_name: str
-) -> dict[str, Any]:
-    if not isinstance(result, Mapping) or set(result) != set(expected):
+def _validate_result(result: Mapping[str, Any], wrapper_name: str) -> dict[str, Any]:
+    provider_name = HANDS_WRAPPER_TO_PROVIDER[wrapper_name]
+    try:
+        return validate_tool_result(provider_name, result)
+    except HandsContractError:
         raise ToolException(f"{wrapper_name} returned a malformed result")
-    for key, expected_type in expected.items():
-        value = result[key]
-        if expected_type is int and (not isinstance(value, int) or isinstance(value, bool)):
-            raise ToolException(f"{wrapper_name} returned a malformed result")
-        if expected_type is not int and not isinstance(value, expected_type):
-            raise ToolException(f"{wrapper_name} returned a malformed result")
-    return dict(result)
 
 
 class _ReadArgs(BaseModel):
@@ -348,7 +296,7 @@ async def hands_read(path: str) -> dict[str, str]:
     if resource is None or not context.profile_policy.resource_policy.allows(resource):
         raise ToolException("hands_read path is not authorized")
     result = await context.provider.call_tool(policy.provider_name, {"path": path})
-    return _validate_result(result, {"content": str}, "hands_read")
+    return _validate_result(result, "hands_read")
 
 
 @tool("hands_edit", args_schema=_EditArgs)
@@ -362,7 +310,7 @@ async def hands_edit(path: str, old_text: str, new_text: str) -> dict[str, bool]
         policy.provider_name,
         {"path": path, "oldText": old_text, "newText": new_text},
     )
-    return _validate_result(result, {"changed": bool}, "hands_edit")
+    return _validate_result(result, "hands_edit")
 
 
 @tool("hands_shell", args_schema=_ShellArgs)
@@ -372,11 +320,7 @@ async def hands_shell(command: str) -> dict[str, str | int]:
     if not isinstance(command, str):
         raise ToolException("hands_shell command is malformed")
     result = await context.provider.call_tool(policy.provider_name, {"command": command})
-    return _validate_result(
-        result,
-        {"stdout": str, "stderr": str, "exitCode": int},
-        "hands_shell",
-    )
+    return _validate_result(result, "hands_shell")
 
 
 HANDS_TOOLS = (hands_read, hands_edit, hands_shell)
