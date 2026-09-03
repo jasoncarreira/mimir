@@ -27,6 +27,15 @@ def test_hands_contract_is_stdlib_only_and_in_client_closure() -> None:
     assert analysis.external_imports <= module.sys.stdlib_module_names
 
 
+def test_hosted_hands_closure_is_stdlib_only_and_runtime_blind() -> None:
+    paths = module.module_paths(ROOT / "mimir")
+    reached, analyses = module.closure(paths, {"mimir.acp.hosted"})
+
+    assert reached == {"mimir.acp.hosted", "mimir.acp.hands_contract"}
+    for analysis in analyses.values():
+        assert analysis.external_imports <= module.sys.stdlib_module_names
+
+
 @pytest.mark.parametrize("source", [
     "from mimir.runtime import create_core_services\ncreate_core_services()\n",
     "import mimir.runtime as r\nbuild = r.create_agent_runtime\nbuild()\n",
