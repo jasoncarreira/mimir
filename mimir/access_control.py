@@ -6045,6 +6045,8 @@ def _source_is_triggering_channel_compatible(
         return not source.domain.startswith("channel")
     if source_kind == "protected_tool":
         return True
+    if source_kind == _ACP_HANDS_RESULT_SOURCE_KIND:
+        return True
     return False
 
 
@@ -6436,6 +6438,11 @@ class SinkGate:
         resolved_target = resolve_sink_target(
             tool_name, sink_category, target, service,
         )
+        # Hands results carry complete, untrusted, active-ingest labels scoped to the
+        # originating ACP channel (see classify_protected_result). The general
+        # untrusted-active-ingest veto and the channel-compatibility predicate already
+        # refuse every sink except a same-channel reply to that origin; a dedicated
+        # branch here was unobservable (mutation-tested) and is deliberately omitted.
         egress_target_requires_taint_gate = _egress_target_requires_taint_gate(
             tool_name, target, auth_context,
         )
@@ -9102,6 +9109,9 @@ _PROTECTED_RESULT_DOMAINS: dict[str, str] = {
     "repo_push": "repository",
 }
 
+_ACP_HANDS_RESULT_SOURCE_KIND = "acp_hands_result"
+_ACP_HANDS_RESULT_TOOLS = frozenset({"hands_read", "hands_edit", "hands_shell"})
+
 # Every model-bound tool that does not ingest model-visible content is listed
 # explicitly. This makes exemption a reviewed semantic claim rather than an
 # inference from flow direction.
@@ -10016,37 +10026,52 @@ def classify_protected_result(
         )
         return InformationFlowLabels().with_source(source)
 
-    if tool_name == "hands_read":
-        resources = authorization.protected_source_resources
-        if resources == ():
-            return None
-        if resources is None or failed:
+    if tool_name in _ACP_HANDS_RESULT_TOOLS:
+        if failed:
             return _incomplete_protected_result(
                 "client_provider", args,
                 tool_name=tool_name,
                 auth_context=auth_context,
             )
         principal = getattr(auth_context, "canonical_principal", None)
-        bridge_instance = getattr(auth_context, "bridge_instance", None)
-        integrity = (
-            "trusted" if authorization.result_integrity == "trusted" else "untrusted"
-        )
-        labels = InformationFlowLabels()
+        authenticated_principal = getattr(auth_context, "principal", None)
+        channel = getattr(auth_context, "channel_id", None)
+        resource_id = getattr(auth_context, "resource_id", None)
+        bridge = getattr(auth_context, "bridge_instance", None)
+        resources = authorization.protected_source_resources
+        if tool_name == "hands_edit":
+            edit_resource = canonical_client_file_resource(args.get("path"))
+            resources = (edit_resource,) if edit_resource is not None else None
+        elif tool_name == "hands_shell":
+            resources = (channel,) if isinstance(channel, str) else None
+        if not (
+            authorization.allowed
+            and isinstance(principal, str)
+            and bool(principal)
+            and isinstance(authenticated_principal, str)
+            and bool(authenticated_principal)
+            and isinstance(channel, str)
+            and channel.startswith("acp:")
+            and resource_id == channel
+            and bridge == "acp-stdio"
+            and resources
+        ):
+            return _incomplete_protected_result(
+                "client_provider", args,
+                tool_name=tool_name,
+                auth_context=auth_context,
+            )
+        labels = InformationFlowLabels().with_channel(channel)
         for resource in resources:
-            # protected_tool intentionally skips destination-audience checks here:
-            # hands_read is an explicit read by the principal in this channel,
-            # unlike automatic auto_recall or requester-scoped MCP provenance.
             labels = labels.with_source(SourceLabel(
                 principal=principal,
                 domain="client_provider",
                 resource_id=resource,
-                bridge_instance=bridge_instance,
+                bridge_instance=bridge,
                 sensitivity="internal",
-                authorized_principals=(
-                    frozenset({principal}) if principal else frozenset()
-                ),
-                source_kind="protected_tool",
-                integrity=integrity,
+                authorized_principals=frozenset({principal}),
+                source_kind=_ACP_HANDS_RESULT_SOURCE_KIND,
+                integrity="untrusted",
                 integrity_effect="active_ingest",
             ))
         return labels

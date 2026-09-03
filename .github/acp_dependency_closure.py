@@ -12,6 +12,8 @@ POLICY = {
     "mimir.acp.__main__": {"mimir.acp.bootstrap"},
     "mimir.acp.bootstrap": {"mimir.acp.profiles", "mimir.acp.credentials", "mimir.acp.proxy", "mimir.acp.ssh", "mimir.acp.relay"},
     "mimir.acp.host": {"mimir.acp.transport"},
+    "mimir.acp.hands_contract": set(),
+    "mimir.acp.hosted": {"mimir.acp.hands_contract"},
     "mimir.acp.profiles": set(),
     "mimir.acp.credentials": set(),
     "mimir.acp.transport": set(),
@@ -23,7 +25,7 @@ ROOTS = {
     "local": {"mimir.acp.proxy"},
     "remote": {"mimir.acp.ssh"},
     "relay": {"mimir.acp.relay"},
-    "client": {"mimir.acp.__main__", "mimir.acp.bootstrap", "mimir.acp.host"},
+    "client": {"mimir.acp.__main__", "mimir.acp.bootstrap", "mimir.acp.host", "mimir.acp.hands_contract", "mimir.acp.hosted"},
 }
 EXPECTED = {
     "local": {"mimir.acp.proxy", "mimir.acp.profiles", "mimir.acp.credentials", "mimir.acp.transport"},
