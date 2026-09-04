@@ -14180,7 +14180,9 @@ async def test_only_admitted_acp_admin_hands_get_client_authorized_operation(
     assert allowed.content == "ok"
 
 
-def test_non_hands_native_sink_inventory_keeps_untrusted_ingest_veto() -> None:
+def test_non_hands_native_sink_inventory_keeps_untrusted_ingest_veto(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     expected = {
         SinkCategory.SAME_CHANNEL: {"send_message", "react", "harness_auto_deliver", "harness_resend_nudge"},
         SinkCategory.CROSS_CHANNEL: {"post_message"},
@@ -14207,6 +14209,78 @@ def test_non_hands_native_sink_inventory_keeps_untrusted_ingest_veto() -> None:
     assert actual == expected
     assert set(access_control._SINK_CATEGORY_MAP) - {"hands_edit", "hands_shell"} == set().union(*expected.values())
     assert not any("*" in name for names in actual.values() for name in names)
+    capability_eligible = {
+        SinkCategory.SAME_CHANNEL,
+        SinkCategory.CROSS_CHANNEL,
+        SinkCategory.PUBLIC,
+        SinkCategory.SHELL_PROCESS,
+        SinkCategory.SPAWN,
+        SinkCategory.NOTIFICATION,
+        SinkCategory.FILE,
+        SinkCategory.DIRECT_MESSAGE,
+        SinkCategory.SAGA,
+        SinkCategory.SCHEDULER,
+        SinkCategory.PROPOSAL,
+        SinkCategory.FORGE,
+    }
+    capability_excluded = {
+        SinkCategory.NETWORK,
+        SinkCategory.HTTP_WEBHOOK,
+        SinkCategory.EXTERNAL_MCP,
+        SinkCategory.HARNESS_DISPLAY,
+        SinkCategory.UNKNOWN,
+    }
+    assert access_control._SINK_CATEGORY_CAPABILITY_ELIGIBLE == capability_eligible
+    assert capability_eligible.isdisjoint(capability_excluded)
+    assert capability_eligible | capability_excluded == set(SinkCategory)
+
+    from mimir.models import InformationFlowState
+    from mimir.tools import client_provider
+
+    monkeypatch.setattr(
+        client_provider,
+        "client_authorized_host_execution_matches",
+        lambda *_args, **_kwargs: pytest.fail("client-authorized marker consulted"),
+    )
+    auth = _tainted_admin_operator_write_auth()
+    auth = replace(auth, ifc_state=InformationFlowState(labels=auth.ifc_labels))
+    saga_tools = {
+        "memory_store", "saga_record_skill_learning", "saga_feedback",
+        "saga_mark_contributions", "saga_forget", "saga_end_session",
+        "commitment_complete", "commitment_snooze", "commitment_dismiss",
+        "defer_injected_message",
+    }
+    destination_tools = {"fetch_url", "web_search"}
+    display_tools = {"activity_panel_post", "activity_panel_edit"}
+    expected_verdicts = {
+        name: (
+            (True, "harness_metadata_display")
+            if name in display_tools
+            else (False, "saga_mutation_blocked_by_tainted_turn")
+            if name in saga_tools
+            else (False, "egress_destination_not_approved")
+            if name in destination_tools
+            else (False, f"ifc_label_blocked:{category.value}")
+        )
+        for category, names in expected.items()
+        for name in names
+    }
+    observed_verdicts = {}
+    for name in sorted(expected_verdicts):
+        category = access_control._SINK_CATEGORY_MAP[name]
+        decision = SinkGate.check_sink_flow(
+            name,
+            "native-target",
+            auth.ifc_labels,
+            auth,
+            enforce=True,
+            sink_category=category,
+            client_authorized_host_execution=None,
+            request_identity=None,
+        )
+        observed_verdicts[name] = (decision.allowed, decision.reason)
+
+    assert observed_verdicts == expected_verdicts
 
 
 def test_non_acp_execution_decisions_are_unchanged() -> None:
@@ -14223,6 +14297,22 @@ def test_non_acp_execution_decisions_are_unchanged() -> None:
         OperationDecision.RESOURCE_SCOPED: {"send_message", "react", "fetch_channel_history", "read_file", "aread", "ls", "als", "glob", "aglob", "grep", "agrep", "file_search", "get_turn", "mimir_get_turn", "write_file", "edit_file", "worklink_run", "pr_metadata", "pr_files", "pr_diff", "pr_checks", "pr_reviews", "pr_comments", "pr_review_requests", "pr_submit_review", "pr_inline_review_comment", "pr_comment", "pr_rerequest_review", "unsupported_operation", "repo_checkout", "repo_cleanup", "repo_fetch", "repo_status", "repo_test", "repo_diff", "repo_unmerged", "repo_stage", "repo_commit", "repo_merge", "repo_merge_abort", "repo_rebase", "repo_rebase_abort", "repo_revert", "repo_revert_abort", "repo_push"},
         OperationDecision.ADMIN_REQUIRED: {"issue_comment", "operator_alert", "approve_declassification", "list_channels", "list_schedules", "add_schedule", "set_schedule_priority", "remove_schedule", "reload_pollers", "open_proposal", "submit_proposal", "abandon_proposal", "request_mimir_update", "shell_exec", "bash_async", "bash_jobs_list", "bash_job_output", "spawn_open_code", "task", "memory_store", "saga_feedback", "saga_mark_contributions", "saga_end_session", "saga_record_skill_learning", "saga_forget", "set_poller_overrides", "download_files", "adownload_files", "rebuild_index", "Bash", "bash", "bash_exec", "execute", "aexecute", "shell", "Write", "Edit", "Read", "Glob", "Grep"},
         OperationDecision.UNKNOWN: {"post_message", "webhook", "http_request", "ntfy_send", "harness_auto_deliver", "harness_resend_nudge", "activity_panel_post", "activity_panel_edit"},
+    }
+    admin_catalog = {
+        "issue_comment", "operator_alert", "approve_declassification",
+        "list_channels", "list_schedules", "add_schedule",
+        "set_schedule_priority", "remove_schedule", "reload_pollers",
+        "open_proposal", "submit_proposal", "abandon_proposal",
+        "request_mimir_update", "shell_exec", "bash_async",
+        "bash_jobs_list", "bash_job_output", "spawn_open_code", "task",
+        "memory_store", "saga_feedback", "saga_mark_contributions",
+        "saga_end_session", "saga_record_skill_learning", "saga_forget",
+        "set_poller_overrides", "download_files", "adownload_files",
+        "rebuild_index", "hands_edit", "hands_shell",
+    }
+    protected_builtins = {
+        "Bash", "bash", "bash_exec", "execute", "aexecute", "shell",
+        "Write", "Edit", "Read", "Glob", "Grep", "download_files",
     }
     readable = {
         "list_channels": "channel_metadata", "list_schedules": "schedule_metadata", "bash_jobs_list": "shell_jobs", "bash_job_output": "shell_jobs", "read_file": "filesystem", "aread": "filesystem", "ls": "filesystem", "als": "filesystem", "glob": "filesystem", "aglob": "filesystem", "grep": "filesystem", "agrep": "filesystem", "file_search": "filesystem", "get_turn": "turn_history", "mimir_get_turn": "turn_history", "memory_query": "saga", "memory_get": "saga", "pr_metadata": "repository", "pr_files": "repository", "pr_diff": "repository", "pr_checks": "repository", "pr_reviews": "repository", "pr_comments": "repository", "pr_review_requests": "repository", "repo_checkout": "repository", "repo_fetch": "repository", "repo_status": "repository", "repo_test": "repository", "repo_diff": "repository", "repo_unmerged": "repository",
@@ -14262,6 +14352,19 @@ def test_non_acp_execution_decisions_are_unchanged() -> None:
         decision: {name for names in decisions.values() for name in names if catalog.get_decision(name, _write_auth(admin=True)) is decision}
         for decision in decisions
     } == decisions
+    assert access_control.OperationCatalog._OPEN_OPERATIONS == decisions[OperationDecision.OPEN]
+    assert access_control.OperationCatalog._RESOURCE_SCOPED_OPERATIONS == (
+        decisions[OperationDecision.RESOURCE_SCOPED]
+        - {"send_message", "react", "fetch_channel_history"}
+        | {"hands_read"}
+    )
+    assert access_control.OperationCatalog._ADMIN_REQUIRED_OPERATIONS == admin_catalog
+    assert access_control.OperationCatalog._ADMIN_BUILTIN_TOOL_NAMES == protected_builtins
+    finite_surface = set().union(*flows.values(), hands)
+    assert {
+        name for name in finite_surface
+        if catalog.get_decision(name, _write_auth(admin=True)) is OperationDecision.UNKNOWN
+    } == decisions[OperationDecision.UNKNOWN]
     assert {name: value for name, value in access_control._OPERATION_READABLE_DOMAIN.items() if name not in hands} == readable
     assert {name: value for name, value in access_control._OPERATION_SINK_DESTINATION.items() if name not in hands} == destinations
     assert {name: value for name, value in access_control._PROTECTED_RESULT_DOMAINS.items() if name not in hands} == protected
