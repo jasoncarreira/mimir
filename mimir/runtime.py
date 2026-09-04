@@ -53,8 +53,13 @@ async def dispatch_session_synthesis(
         idle_minutes=config.saga_session_idle_minutes,
     )
     if not trusted_turns:
+        event_type = (
+            "saga_synthesis_skipped_no_turns"
+            if session.channel_id.startswith(("scheduler:", "poller:"))
+            else "saga_synthesis_empty_window"
+        )
         await log_event_fn(
-            "saga_synthesis_empty_window",
+            event_type,
             saga_session_id=session.saga_session_id,
             channel_id=session.channel_id,
             reason="no trusted turns in session window",
