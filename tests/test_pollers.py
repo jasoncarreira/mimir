@@ -3367,6 +3367,7 @@ print(json.dumps({"poller": "x", "prompt": "second"}))
 @pytest.mark.parametrize("accepted", [True, False])
 async def test_delivery_receipt_is_written_only_after_accepted_enqueue(
     tmp_path: Path,
+    home: Path,
     accepted: bool,
 ) -> None:
     skill_dir = tmp_path / "skill"
