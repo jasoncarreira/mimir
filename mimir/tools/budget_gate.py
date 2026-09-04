@@ -92,9 +92,12 @@ from ..access_control import (
 )
 from .client_provider import (
     MIMIR_HANDS_V1,
+    ClientAuthorizedHostExecution,
     PermissionDecision,
     PermissionEligibility,
+    client_authorized_host_execution_matches,
     get_turn_capability_context,
+    issue_client_authorized_host_execution,
 )
 from .prohibited_action_guard import check_prohibited_bash, is_bash_tool
 from .web_search_destination import web_search_url
@@ -1854,6 +1857,8 @@ def _authorize_tool_call(
     operator_shell_request_identity: Any = None,
     operator_shell_audit: Mapping[str, str] | None = None,
     tool_call_id: str | None = None,
+    client_authorized_host_execution: ClientAuthorizedHostExecution | None = None,
+    request_identity: Any = None,
 ) -> tuple[ToolAuthorization, str | None]:
     """Return the exact authorization and any middleware denial text."""
     enforce = (
@@ -1870,6 +1875,12 @@ def _authorize_tool_call(
             "operator_shell_audit": operator_shell_audit,
             "tool_call_id": tool_call_id,
         }
+    client_parameters = {}
+    if client_authorized_host_execution is not None:
+        client_parameters = {
+            "client_authorized_host_execution": client_authorized_host_execution,
+            "request_identity": request_identity,
+        }
     auth = get_tool_registry().authorize_tool(
         tool_name,
         ctx,
@@ -1878,6 +1889,7 @@ def _authorize_tool_call(
         ifc_labels=ifc_labels,
         mcp_tool=mcp_tool,
         arguments=arguments,
+        **client_parameters,
         **operator_parameters,
     )
     # Generic HTTP credentials authenticate transport only.  Check operation
@@ -2247,11 +2259,51 @@ def _acp_send_message_refusal(
     )
 
 
+def _admitted_admin_hands_candidate(
+    request: ToolCallRequest,
+    tool_name: str,
+    auth_context: AuthContext | None,
+    arguments: dict[str, Any] | None,
+) -> bool:
+    context = get_turn_capability_context()
+    policy = context.profile_policy.tool(tool_name) if context is not None and context.profile_policy is MIMIR_HANDS_V1 else None
+    lease = getattr(context, "lease", None)
+    return (
+        tool_name in {"hands_edit", "hands_shell"}
+        and isinstance(arguments, dict)
+        and auth_context is not None
+        and auth_context.enforcement_enabled is True
+        and not auth_context.is_service
+        and isinstance(auth_context.principal, str)
+        and bool(auth_context.principal)
+        and isinstance(auth_context.canonical_principal, str)
+        and bool(auth_context.canonical_principal)
+        and "admin" in (auth_context.roles or ())
+        and context is not None
+        and context.acp_delivery is True
+        and policy is not None
+        and policy.operation == "client_authorized_host_execution"
+        and policy.classification == "admin_required"
+        and policy.flow == "both"
+        and policy.sink in {"external_mcp", "shell_process"}
+        and context.provider is not None
+        and getattr(context.provider, "closed", False) is False
+        and context.permission_broker is not None
+        and callable(getattr(context.permission_broker, "request_permission", None))
+        and lease is not None
+        and getattr(lease, "closed", True) is False
+        and getattr(lease, "generation", None) == context.connection_generation
+        and getattr(lease, "epoch", None) == context.prompt_epoch
+        and bool(_tool_call_id(request))
+    )
+
+
 def _permission_eligibility(
     request: ToolCallRequest,
     tool_name: str,
     authorization: ToolAuthorization,
     arguments: dict[str, Any] | None,
+    host_execution: ClientAuthorizedHostExecution | None = None,
 ) -> tuple[Any, PermissionEligibility, tuple[Any, ...]] | None:
     context = get_turn_capability_context()
     if context is None:
@@ -2305,6 +2357,15 @@ def _permission_eligibility(
         raise ToolException(
             f"{tool_name} permission eligibility refused: {'; '.join(failures)}"
         )
+    if host_execution is not None and not client_authorized_host_execution_matches(
+        host_execution,
+        request_identity=request,
+        auth_context_identity=_auth_context_from_request(request),
+        wrapper_name=tool_name,
+    ):
+        raise ToolException(
+            f"{tool_name} permission eligibility refused: trusted host execution missing or stale"
+        )
     provider = context.provider
     peer = getattr(provider, "peer", None)
     transport = getattr(peer, "transport", None) if peer is not None else None
@@ -2326,6 +2387,7 @@ def _permission_eligibility(
         title=tool_name,
         kind="other",
         arguments=arguments,
+        host_execution=host_execution,
     ), snapshot
 
 
@@ -2457,9 +2519,12 @@ def _request_permission_sync(
     tool_name: str,
     authorization: ToolAuthorization,
     arguments: dict[str, Any] | None,
+    host_execution: ClientAuthorizedHostExecution | None = None,
 ) -> str | None:
     try:
-        eligible = _permission_eligibility(request, tool_name, authorization, arguments)
+        eligible = _permission_eligibility(
+            request, tool_name, authorization, arguments, host_execution,
+        )
     except ToolException as exc:
         return str(exc)
     if eligible is None:
@@ -2481,7 +2546,7 @@ def _request_permission_sync(
             return _permission_failure_message(tool_name, "returned a non-coroutine")
         future = asyncio.run_coroutine_threadsafe(coroutine, loop)
         decision = future.result(timeout=_PERMISSION_TIMEOUT_SECONDS)
-        if decision is PermissionDecision.ALLOW_ONCE:
+        if decision in {PermissionDecision.ALLOW_ONCE, PermissionDecision.ALLOW_SESSION}:
             if _permission_context_is_current(snapshot):
                 return None
             return _permission_snapshot_refusal(tool_name)
@@ -2509,9 +2574,12 @@ async def _request_permission_async(
     tool_name: str,
     authorization: ToolAuthorization,
     arguments: dict[str, Any] | None,
+    host_execution: ClientAuthorizedHostExecution | None = None,
 ) -> str | None:
     try:
-        eligible = _permission_eligibility(request, tool_name, authorization, arguments)
+        eligible = _permission_eligibility(
+            request, tool_name, authorization, arguments, host_execution,
+        )
     except ToolException as exc:
         return str(exc)
     if eligible is None:
@@ -2526,7 +2594,7 @@ async def _request_permission_async(
             return _permission_failure_message(tool_name, "returned a non-coroutine")
         task = asyncio.create_task(awaitable)
         decision = await asyncio.wait_for(task, timeout=_PERMISSION_TIMEOUT_SECONDS)
-        if decision is PermissionDecision.ALLOW_ONCE:
+        if decision in {PermissionDecision.ALLOW_ONCE, PermissionDecision.ALLOW_SESSION}:
             if _permission_context_is_current(snapshot):
                 return None
             return _permission_snapshot_refusal(tool_name)
@@ -2639,6 +2707,9 @@ class BudgetGateMiddleware(AgentMiddleware):
                 name=tool_name, status="error",
             )
         target_channels = _extract_sink_targets(request, auth_context)
+        hands_candidate = _admitted_admin_hands_candidate(
+            request, tool_name, auth_context, validated_arguments,
+        )
         ifc_labels = _current_ifc_labels(auth_context)
         operator_shell_preparation = _prepare_operator_shell_execution(
             request, tool_name, auth_context, ifc_labels,
@@ -2648,7 +2719,8 @@ class BudgetGateMiddleware(AgentMiddleware):
         )
 
         authorization = None
-        for target_channel in target_channels:
+        admin_denial = None
+        for target_channel in (() if hands_candidate else target_channels):
             target_authorization, admin_denial = _authorize_tool_call(
                 tool_name,
                 auth_context,
@@ -2731,10 +2803,6 @@ class BudgetGateMiddleware(AgentMiddleware):
             return _execute_declassification_action(
                 request, auth_context, validated_arguments,
             )
-        result_labels = _result_labels_for_call(
-            tool_name, request, auth_context, authorization,
-        )
-
         # Destructive-action guardrail (chainlink #259): an accident
         # deterrent against force-push-to-main/master, NOT a security
         # boundary — the regex screens the command arg and is bypassable
@@ -2779,6 +2847,44 @@ class BudgetGateMiddleware(AgentMiddleware):
                 name=tool_name,
                 status="error",
             )
+
+        host_execution = None
+        if hands_candidate:
+            host_execution = issue_client_authorized_host_execution(
+                request_identity=request,
+                auth_context_identity=auth_context,
+                wrapper_name=tool_name,
+                tainted=_live_untrusted_active_ingest(auth_context, ifc_labels) is True,
+            )
+            for target_channel in target_channels:
+                target_authorization, admin_denial = _authorize_tool_call(
+                    tool_name,
+                    auth_context,
+                    target_channel,
+                    ifc_labels,
+                    getattr(request, "tool", None),
+                    validated_arguments,
+                    client_authorized_host_execution=host_execution,
+                    request_identity=request,
+                )
+                if authorization is None:
+                    authorization = target_authorization
+                if admin_denial is not None:
+                    break
+            if admin_denial is not None:
+                _emit_tool_call_sync(
+                    tool_name, ok=False, error=admin_denial, denied=True,
+                    arguments=validated_arguments,
+                )
+                return ToolMessage(
+                    content=admin_denial,
+                    tool_call_id=_tool_call_id(request),
+                    name=tool_name,
+                    status="error",
+                )
+        result_labels = _result_labels_for_call(
+            tool_name, request, auth_context, authorization,
+        )
 
         denial = _check_and_increment_or_deny(
             tool_name,
@@ -2928,6 +3034,7 @@ class BudgetGateMiddleware(AgentMiddleware):
             else:
                 permission_denial = _request_permission_sync(
                     request, tool_name, authorization, validated_arguments,
+                    host_execution,
                 )
                 if permission_denial is not None:
                     if review_claim is not None:
@@ -3114,6 +3221,9 @@ class BudgetGateMiddleware(AgentMiddleware):
                 name=tool_name, status="error",
             )
         target_channels = _extract_sink_targets(request, auth_context)
+        hands_candidate = _admitted_admin_hands_candidate(
+            request, tool_name, auth_context, validated_arguments,
+        )
         ifc_labels = _current_ifc_labels(auth_context)
         operator_shell_preparation = _prepare_operator_shell_execution(
             request, tool_name, auth_context, ifc_labels,
@@ -3123,7 +3233,8 @@ class BudgetGateMiddleware(AgentMiddleware):
         )
 
         authorization = None
-        for target_channel in target_channels:
+        admin_denial = None
+        for target_channel in (() if hands_candidate else target_channels):
             target_authorization, admin_denial = _authorize_tool_call(
                 tool_name,
                 auth_context,
@@ -3206,10 +3317,6 @@ class BudgetGateMiddleware(AgentMiddleware):
             return _execute_declassification_action(
                 request, auth_context, validated_arguments,
             )
-        result_labels = _result_labels_for_call(
-            tool_name, request, auth_context, authorization,
-        )
-
         # Destructive-action guardrail (chainlink #259): an accident
         # deterrent against force-push-to-main/master, NOT a security
         # boundary — the regex screens the command arg and is bypassable
@@ -3254,6 +3361,44 @@ class BudgetGateMiddleware(AgentMiddleware):
                 name=tool_name,
                 status="error",
             )
+
+        host_execution = None
+        if hands_candidate:
+            host_execution = issue_client_authorized_host_execution(
+                request_identity=request,
+                auth_context_identity=auth_context,
+                wrapper_name=tool_name,
+                tainted=_live_untrusted_active_ingest(auth_context, ifc_labels) is True,
+            )
+            for target_channel in target_channels:
+                target_authorization, admin_denial = _authorize_tool_call(
+                    tool_name,
+                    auth_context,
+                    target_channel,
+                    ifc_labels,
+                    getattr(request, "tool", None),
+                    validated_arguments,
+                    client_authorized_host_execution=host_execution,
+                    request_identity=request,
+                )
+                if authorization is None:
+                    authorization = target_authorization
+                if admin_denial is not None:
+                    break
+            if admin_denial is not None:
+                _emit_tool_call_sync(
+                    tool_name, ok=False, error=admin_denial, denied=True,
+                    arguments=validated_arguments,
+                )
+                return ToolMessage(
+                    content=admin_denial,
+                    tool_call_id=_tool_call_id(request),
+                    name=tool_name,
+                    status="error",
+                )
+        result_labels = _result_labels_for_call(
+            tool_name, request, auth_context, authorization,
+        )
 
         denial = _check_and_increment_or_deny(
             tool_name,
@@ -3407,6 +3552,7 @@ class BudgetGateMiddleware(AgentMiddleware):
             else:
                 permission_denial = await _request_permission_async(
                     request, tool_name, authorization, validated_arguments,
+                    host_execution,
                 )
                 if permission_denial is not None:
                     if review_claim is not None:

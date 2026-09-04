@@ -28,6 +28,7 @@ from mimir.tools.client_provider import (
     ProviderProfile,
     ProviderSchemaError,
     TurnCapabilityContext,
+    client_authorized_host_execution_metadata,
     reset_turn_capability_context,
     set_turn_capability_context,
 )
@@ -223,6 +224,18 @@ class ActivePrompt:
             return await self._deny_before_peer(
                 "snapshot_mismatch", eligibility.tool_call_id
             )
+        host_execution = eligibility.host_execution
+        if host_execution is not None:
+            trusted_metadata = client_authorized_host_execution_metadata(host_execution)
+            if trusted_metadata is None or trusted_metadata[0] != eligibility.title:
+                return await self._deny_before_peer(
+                    "host_execution_missing", eligibility.tool_call_id
+                )
+            snapshot = replace(
+                snapshot,
+                wrapper_name=trusted_metadata[0],
+                tainted=trusted_metadata[1],
+            )
         provider = self.session.provider
         peer = provider.peer if provider is not None else None
         if peer is None:
@@ -264,6 +277,8 @@ class ActivePrompt:
             return ToolPermissionDecision.CANCELLED
         if completion.decision == "allow_once":
             return ToolPermissionDecision.ALLOW_ONCE
+        if completion.decision == "allow_session":
+            return ToolPermissionDecision.ALLOW_SESSION
         if completion.decision == "reject_once":
             return ToolPermissionDecision.REJECT_ONCE
         if completion.decision == "cancelled":

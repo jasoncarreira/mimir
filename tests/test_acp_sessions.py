@@ -555,7 +555,7 @@ async def test_prompt_auth_context_is_scoped_to_the_session_channel(
         ("timeout", "hands_shell permission request timed out; execution denied"),
     ],
 )
-async def test_authenticated_acp_hands_shell_reaches_execution_after_permission(
+async def test_permission_denial_executes_nothing_and_returns_explainable_failure(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     permission_decision: str,
@@ -2225,7 +2225,7 @@ async def test_cancel_boundary_prevents_permission_and_mcp_registration(tmp_path
 
 
 @pytest.mark.asyncio
-async def test_integrated_hands_edit_permission_wire_and_provider_result(
+async def test_admin_hands_permissions_precede_execution_and_preserve_raw_arguments(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture,
 ) -> None:
     """Exercise once-only permission and terminal updates over the public wire."""
@@ -2435,9 +2435,10 @@ async def test_integrated_hands_edit_permission_wire_and_provider_result(
             return {
                 "jsonrpc": "2.0", "id": outer_id,
                 "method": "session/request_permission",
-                "params": {
-                    "sessionId": session_id,
-                    "toolCall": {
+                    "params": {
+                        "sessionId": session_id,
+                        "_meta": {"mimir.wrapper": "hands_edit"},
+                        "toolCall": {
                         "toolCallId": tool_id, "title": "hands_edit", "kind": "other",
                         "status": "pending", "rawInput": {
                             "path": path, "old_text": old, "new_text": new,
@@ -2445,6 +2446,7 @@ async def test_integrated_hands_edit_permission_wire_and_provider_result(
                     },
                     "options": [
                         {"optionId": "allow_once", "name": "Allow once", "kind": "allow_once"},
+                        {"optionId": "allow_session", "name": "Allow for this session", "kind": "allow_always"},
                         {"optionId": "reject_once", "name": "Reject once", "kind": "reject_once"},
                     ],
                 },
@@ -2689,3 +2691,30 @@ async def test_integrated_hands_edit_permission_wire_and_provider_result(
         await agent.on_transport_closed(peer.peer_generation)
         await connection.close()
         await asyncio.gather(*owned_tasks, return_exceptions=True)
+
+
+def test_daemon_emits_permission_for_every_call_and_stores_no_grant() -> None:
+    first = sdk.PermissionCompletion("allow_session")
+    second = sdk.PermissionCompletion("allow_session")
+
+    assert first.executable is True
+    assert second.executable is True
+    assert not hasattr(first, "grant")
+    assert not hasattr(second, "grant")
+
+
+def test_permission_metadata_uses_live_ifc_taint() -> None:
+    untainted = sdk.permission_request_params(
+        "session",
+        sdk.PermissionSnapshot("one", "hands_edit", "other", {}, "hands_edit"),
+    )
+    tainted = sdk.permission_request_params(
+        "session",
+        sdk.PermissionSnapshot("two", "hands_shell", "other", {}, "hands_shell", True),
+    )
+
+    assert untainted["_meta"] == {"mimir.wrapper": "hands_edit"}
+    assert tainted["_meta"] == {
+        "mimir.wrapper": "hands_shell",
+        "mimir.tainted": True,
+    }

@@ -7894,11 +7894,6 @@ def _repository_result_labels(repo: str, pr: int, head: str) -> InformationFlowL
     ("tool_name", "arguments", "resources"),
     [
         (
-            "hands_read",
-            {"path": "/workspace/notes.txt"},
-            ("client-file:%2Fworkspace%2Fnotes.txt",),
-        ),
-        (
             "hands_edit",
             {"path": "/workspace/notes.txt", "old_text": "old", "new_text": "new"},
             None,
@@ -7906,7 +7901,7 @@ def _repository_result_labels(repo: str, pr: int, head: str) -> InformationFlowL
         ("hands_shell", {"command": "pwd"}, None),
     ],
 )
-def test_existing_hands_results_are_complete_untrusted_active_and_origin_channel_only(
+def test_authorized_tainted_edit_and_shell_results_reply_only_to_originating_acp_channel(
     tool_name: str,
     arguments: dict[str, str],
     resources: tuple[str, ...] | None,
@@ -12496,12 +12491,13 @@ def _permission_test_context(broker: object, **changes: object) -> object:
     ("outcome", "allowed"),
     [
         ("allow_once", False),
+        ("allow_session", False),
         ("reject_once", False),
         ("cancelled", False),
         (object(), False),
     ],
 )
-async def test_acp_permission_accepts_only_exact_allow_once(
+async def test_acp_permission_accepts_only_exact_current_call_approvals(
     outcome: object, allowed: bool,
 ) -> None:
     from mimir.tools.budget_gate import _request_permission_async
@@ -12511,7 +12507,7 @@ async def test_acp_permission_accepts_only_exact_allow_once(
         set_turn_capability_context,
     )
 
-    actual = PermissionDecision.ALLOW_ONCE if outcome == "allow_once" else outcome
+    actual = PermissionDecision(outcome) if isinstance(outcome, str) else outcome
     broker = _PermissionTestBroker(actual)
     token = set_turn_capability_context(_permission_test_context(broker))
     request = SimpleNamespace(tool_call={"id": "call-1"})
@@ -12522,7 +12518,7 @@ async def test_acp_permission_accepts_only_exact_allow_once(
     finally:
         reset_turn_capability_context(token)
 
-    assert (denial is None) is (outcome == "allow_once")
+    assert (denial is None) is (outcome in {"allow_once", "allow_session"})
     assert len(broker.calls) == 1
     eligibility = broker.calls[0]
     assert eligibility.tool_call_id == "call-1"
@@ -12719,6 +12715,7 @@ def test_hands_shell_missing_command_fails_before_prohibited_provider_check(
     ("outcome", "expected_denial"),
     [
         ("allow_once", None),
+        ("allow_session", None),
         (
             "reject_once",
             "hands_edit permission was rejected by the operator before execution",
@@ -13756,7 +13753,7 @@ async def test_public_hands_shell_prohibition_gate_order(
         reset_turn_capability_context(token)
 
     assert result.status == "error"
-    assert order == ["review", "authorize", "prohibited"]
+    assert order == ["review", "prohibited"]
     assert broker.calls == []
 
 
@@ -14077,3 +14074,130 @@ async def test_public_sync_permission_result_is_audited(
     assert any(event.get("ok") is (outcome == "allow") for event in events)
     if outcome == "deny":
         assert any(event.get("denied") is True and event.get("error") == result.content for event in events)
+
+
+@pytest.mark.asyncio
+async def test_tainted_turn_refuses_shell_exec_but_reaches_hands_shell_permission() -> None:
+    from langchain_core.messages import ToolMessage
+    from mimir.models import InformationFlowState
+    from mimir.tools.budget_gate import BudgetGateMiddleware
+    from mimir.tools.client_provider import PermissionDecision, reset_turn_capability_context, set_turn_capability_context
+
+    auth = _tainted_admin_operator_write_auth()
+    auth = replace(auth, ifc_state=InformationFlowState(labels=auth.ifc_labels))
+    broker = _ImmediatePermissionBroker(PermissionDecision.ALLOW_ONCE)
+    token = set_turn_capability_context(_capability_for_broker(broker))
+    middleware = BudgetGateMiddleware()
+    try:
+        native = _tool_request(auth, tool_name="shell_exec", args={"command": "printf native"})
+        native_result = await middleware.awrap_tool_call(
+            native, lambda _request: pytest.fail("native shell executed"),
+        )
+        hands = _tool_request(auth, tool_name="hands_shell", args={"command": "printf hands"})
+        hands.tool_call["args"] = {"command": "printf hands"}
+        hands_result = await middleware.awrap_tool_call(
+            hands,
+            lambda request: asyncio.sleep(
+                0, result=ToolMessage(content="hands", tool_call_id=request.tool_call["id"]),
+            ),
+        )
+    finally:
+        reset_turn_capability_context(token)
+
+    assert native_result.status == "error"
+    assert str(native_result.content).startswith(
+        "shell_exec was refused before execution (ifc_label_blocked:shell_process)"
+    )
+    assert hands_result.content == "hands"
+    assert len(broker.calls) == 1
+    assert broker.calls[0].host_execution.operation == "client_authorized_host_execution"
+    assert broker.calls[0].host_execution.tainted is True
+
+
+@pytest.mark.asyncio
+async def test_only_admitted_acp_admin_hands_get_client_authorized_operation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from langchain_core.messages import ToolMessage
+    from mimir.tools import budget_gate
+    from mimir.tools.client_provider import PermissionDecision, reset_turn_capability_context, set_turn_capability_context
+
+    issued: list[str] = []
+    original = budget_gate.issue_client_authorized_host_execution
+
+    def issue(**kwargs: object):
+        issued.append(str(kwargs["wrapper_name"]))
+        return original(**kwargs)
+
+    monkeypatch.setattr(budget_gate, "issue_client_authorized_host_execution", issue)
+    broker = _ImmediatePermissionBroker(PermissionDecision.ALLOW_ONCE)
+    token = set_turn_capability_context(_capability_for_broker(broker))
+    try:
+        denied = await budget_gate.BudgetGateMiddleware().awrap_tool_call(
+            _live_permission_request(tool_name="hands_shell", args={"command": "git push --force origin main"}),
+            lambda _request: pytest.fail("prohibited shell executed"),
+        )
+        allowed = await budget_gate.BudgetGateMiddleware().awrap_tool_call(
+            _live_permission_request(),
+            lambda request: asyncio.sleep(
+                0, result=ToolMessage(content="ok", tool_call_id=request.tool_call["id"]),
+            ),
+        )
+    finally:
+        reset_turn_capability_context(token)
+
+    assert denied.status == "error"
+    assert issued == ["hands_edit"]
+    assert allowed.content == "ok"
+
+
+def test_non_hands_native_sink_inventory_keeps_untrusted_ingest_veto() -> None:
+    expected = {
+        SinkCategory.SAME_CHANNEL: {"send_message", "react", "harness_auto_deliver", "harness_resend_nudge"},
+        SinkCategory.CROSS_CHANNEL: {"post_message"},
+        SinkCategory.HTTP_WEBHOOK: {"webhook", "http_request"},
+        SinkCategory.NETWORK: {"fetch_url", "web_search"},
+        SinkCategory.SHELL_PROCESS: {"shell_exec", "bash_async", "Bash", "bash", "bash_exec", "execute", "aexecute", "shell"},
+        SinkCategory.SPAWN: {"spawn_open_code", "worklink_run"},
+        SinkCategory.NOTIFICATION: {"operator_alert", "ntfy_send"},
+        SinkCategory.FILE: {"write_file", "edit_file", "Write", "Edit", "download_files", "adownload_files", "rebuild_index", "request_mimir_update"},
+        SinkCategory.SAGA: {"memory_store", "saga_record_skill_learning", "saga_feedback", "saga_mark_contributions", "saga_forget", "saga_end_session", "commitment_complete", "commitment_snooze", "commitment_dismiss", "defer_injected_message"},
+        SinkCategory.SCHEDULER: {"add_schedule", "set_schedule_priority", "remove_schedule", "set_poller_overrides", "reload_pollers"},
+        SinkCategory.PROPOSAL: {"open_proposal", "submit_proposal", "abandon_proposal"},
+        SinkCategory.HARNESS_DISPLAY: {"activity_panel_post", "activity_panel_edit"},
+        SinkCategory.FORGE: {"pr_submit_review", "pr_inline_review_comment", "pr_comment", "issue_comment", "pr_rerequest_review", "unsupported_operation", "repo_checkout", "repo_cleanup", "repo_fetch", "repo_test", "repo_stage", "repo_commit", "repo_merge", "repo_merge_abort", "repo_rebase", "repo_rebase_abort", "repo_revert", "repo_revert_abort", "repo_push"},
+    }
+    actual = {
+        category: {
+            name for name, observed in access_control._SINK_CATEGORY_MAP.items()
+            if observed is category and not name.startswith("hands_")
+        }
+        for category in expected
+    }
+
+    assert actual == expected
+    assert not any("*" in name for names in actual.values() for name in names)
+
+
+def test_non_acp_execution_decisions_are_unchanged() -> None:
+    catalog = access_control.OperationCatalog()
+    hands = {"hands_read", "hands_edit", "hands_shell"}
+
+    assert {name for name in access_control._TOOL_FLOW_MAP if name.startswith("hands_")} == hands
+    assert catalog.get_decision("hands_read") is OperationDecision.RESOURCE_SCOPED
+    assert catalog.get_decision("hands_edit") is OperationDecision.ADMIN_REQUIRED
+    assert catalog.get_decision("hands_shell") is OperationDecision.ADMIN_REQUIRED
+    assert catalog.get_decision("client_authorized_host_execution") is OperationDecision.UNKNOWN
+
+
+def test_shell_exec_policy_and_execution_are_unchanged() -> None:
+    shell_names = {"shell_exec", "bash_async", "Bash", "bash", "bash_exec", "execute", "aexecute", "shell"}
+
+    assert access_control.SHELL_PROCESS_TOOL_NAMES - {"hands_shell"} == shell_names
+    assert {name: access_control._TOOL_FLOW_MAP[name] for name in shell_names} == {
+        name: access_control.ToolFlowDirection.BOTH for name in shell_names
+    }
+    assert {name: access_control._OPERATION_SINK_DESTINATION[name] for name in shell_names} == {
+        name: "shell_process" for name in shell_names
+    }
+    assert access_control.OperationCatalog().get_decision("shell_exec") is OperationDecision.ADMIN_REQUIRED

@@ -247,6 +247,11 @@ def test_profile_has_exact_provider_schemas_and_server_metadata() -> None:
     assert {policy.classification for policy in MIMIR_HANDS_V1.tools} == {
         "resource_scoped", "admin_required"
     }
+    assert {policy.wrapper_name: policy.operation for policy in MIMIR_HANDS_V1.tools} == {
+        "hands_read": None,
+        "hands_edit": "client_authorized_host_execution",
+        "hands_shell": "client_authorized_host_execution",
+    }
 
 
 def test_mimir_hands_profile_projects_shared_contract_exactly() -> None:

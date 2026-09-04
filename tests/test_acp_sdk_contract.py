@@ -431,7 +431,7 @@ async def test_mcp_response_validation_reuse_and_routing_fail_closed() -> None:
     ]
 
 
-def test_permission_request_is_exact_lifecycle_snapshot() -> None:
+def test_admin_permission_options_are_exact_and_ordered() -> None:
     snapshot = sdk.PermissionSnapshot(
         tool_call_id="tool-7",
         title="Edit local file",
@@ -449,6 +449,7 @@ def test_permission_request_is_exact_lifecycle_snapshot() -> None:
         },
         "options": [
             {"optionId": "allow_once", "name": "Allow once", "kind": "allow_once"},
+            {"optionId": "allow_session", "name": "Allow for this session", "kind": "allow_always"},
             {"optionId": "reject_once", "name": "Reject once", "kind": "reject_once"},
         ],
     }
@@ -458,6 +459,7 @@ def test_permission_request_is_exact_lifecycle_snapshot() -> None:
     "payload,decision",
     [
         ({"outcome": {"outcome": "selected", "optionId": "allow_once"}}, "allow_once"),
+        ({"outcome": {"outcome": "selected", "optionId": "allow_session"}}, "allow_session"),
         (
             {
                 "outcome": {
@@ -474,6 +476,15 @@ def test_permission_request_is_exact_lifecycle_snapshot() -> None:
 )
 def test_permission_response_accepted_shapes(payload: Any, decision: str) -> None:
     assert sdk.validate_permission_response(payload) == decision
+
+
+def test_allow_session_validates_as_current_call_approval() -> None:
+    decision = sdk.validate_permission_response(
+        {"outcome": {"outcome": "selected", "optionId": "allow_session"}}
+    )
+
+    assert decision == "allow_session"
+    assert sdk.PermissionCompletion(decision).executable is True
 
 
 @pytest.mark.parametrize(
@@ -575,10 +586,11 @@ async def test_public_connection_permission_completion_correlates_exact_wire_out
                 "status": "pending",
                 "rawInput": {"command": "true"},
             },
-            "options": [
-                {"optionId": "allow_once", "name": "Allow once", "kind": "allow_once"},
-                {"optionId": "reject_once", "name": "Reject once", "kind": "reject_once"},
-            ],
+                "options": [
+                    {"optionId": "allow_once", "name": "Allow once", "kind": "allow_once"},
+                    {"optionId": "allow_session", "name": "Allow for this session", "kind": "allow_always"},
+                    {"optionId": "reject_once", "name": "Reject once", "kind": "reject_once"},
+                ],
         },
     }
     await transport.incoming.put({"jsonrpc": "2.0", "id": emitted["id"], **response})
