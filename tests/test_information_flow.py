@@ -78,7 +78,7 @@ from mimir.models import (
     SourceLabel,
     TurnInteractivity,
 )
-from mimir.pr_checkout_lease import PRCheckoutLease
+from mimir.pr_checkout_lease import PRCheckoutLease, _metadata
 from mimir.prompt_sources import prompt_source_label
 from mimir.skill_install import install
 from mimir.turn_event_bus import TurnEventBus, TurnEventEmitter
@@ -1376,7 +1376,7 @@ def _lease_read_auth(
     )
     state = RepoReviewState(scope)
     now = datetime.now(UTC)
-    state.attach_checkout_lease(PRCheckoutLease(
+    lease = PRCheckoutLease(
         canonical_repo=scope.canonical_repo,
         canonical_origin=scope.canonical_origin,
         source_root=Path(scope.canonical_root),
@@ -1392,7 +1392,13 @@ def _lease_read_auth(
         expires_at=now + timedelta(hours=1),
         recovery_id="lease-7",
         pr_number=scope.pr_number,
-    ))
+    )
+    state.attach_checkout_lease(lease)
+    metadata_path = checkout / ".git" / "mimir-pr-checkout-lease.json"
+    metadata_path.parent.mkdir()
+    metadata_path.write_text(
+        json.dumps(_metadata(lease), sort_keys=True) + "\n", encoding="utf-8",
+    )
     return replace(_auth(), repo_review_state=state, repo_pr_action_scope=scope)
 
 
@@ -1463,6 +1469,7 @@ def test_non_self_authored_active_lease_is_untrusted_active_ingest(
         resource_id=str(target), bridge_instance="filesystem",
     )
 
+    assert source.domain == "filesystem"
     assert (source.integrity, source.integrity_effect) == (
         "untrusted", "active_ingest",
     )
@@ -1527,7 +1534,7 @@ def test_invalid_configured_lease_root_is_rejected(
     assert _configured_pr_checkout_lease_root() is None
 
 
-def test_untrusted_model_write_is_recorded_and_taints_later_trusted_lease_read(
+def test_active_lease_record_supersedes_generic_file_integrity_ledger(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1562,8 +1569,9 @@ def test_untrusted_model_write_is_recorded_and_taints_later_trusted_lease_read(
         resource_id=str(target), bridge_instance="filesystem",
     )
 
+    assert reread.domain == "repository"
     assert (reread.integrity, reread.integrity_effect) == (
-        "untrusted", "active_ingest",
+        "trusted", "informational",
     )
     ledger = json.loads(
         (home / ".mimir" / "file-integrity.json").read_text(encoding="utf-8")

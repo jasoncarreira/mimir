@@ -59,7 +59,7 @@ from mimir.models import (
     TurnContext,
     TurnInteractivity,
 )
-from mimir.pr_checkout_lease import PRCheckoutLease
+from mimir.pr_checkout_lease import PRCheckoutLease, _metadata
 
 
 @pytest.fixture(autouse=True)
@@ -8028,8 +8028,12 @@ def _attach_test_checkout_lease(
         created_at=now,
         expires_at=now + timedelta(hours=1),
         recovery_id=name,
+        pr_number=state.action_scope.pr_number,
     )
     state.attach_checkout_lease(lease)
+    (checkout / ".git" / "mimir-pr-checkout-lease.json").write_text(
+        json.dumps(_metadata(lease), sort_keys=True) + "\n", encoding="utf-8",
+    )
     return checkout
 
 

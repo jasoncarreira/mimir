@@ -9323,15 +9323,49 @@ def protected_result_source(
     requester = getattr(auth_context, "canonical_principal", None)
     if getattr(auth_context, "is_service", False) and requester:
         requester = f"service:{requester}"
-    acl = {principal} if principal else set()
-    if requester:
-        acl.add(requester)
     integrity = "untrusted"
     integrity_effect = "active_ingest"
     if domain == "filesystem" and isinstance(resource_id, str):
-        integrity, integrity_effect = _filesystem_result_integrity(
-            auth_context, resource_id,
+        from .pr_checkout_lease import active_pr_checkout_lease_for_path
+
+        lease = active_pr_checkout_lease_for_path(resource_id)
+        registry = getattr(auth_context, "repo_pr_scope_registry", None)
+        if registry is not None:
+            review_state = registry.resolve_checkout_path(resource_id)
+            scope = getattr(review_state, "action_scope", None)
+        else:
+            scope = getattr(auth_context, "repo_pr_action_scope", None)
+            if scope is None:
+                review_state = getattr(auth_context, "repo_review_state", None)
+                scope = getattr(review_state, "action_scope", None)
+        self_login = os.environ.get("MIMIR_GITHUB_SELF_LOGIN", "").strip()
+        trusted_lease = (
+            lease is not None
+            and bool(self_login)
+            and getattr(scope, "pull_request_author", None) == self_login
+            and getattr(scope, "scope_id", None) == lease.scope_id
+            and getattr(scope, "canonical_repo", "").lower()
+            == lease.canonical_repo.lower()
+            and getattr(scope, "pr_number", None) == lease.pr_number
+            and getattr(scope, "observed_head_sha", "").lower()
+            == lease.head_sha.lower()
         )
+        if trusted_lease:
+            principal = requester
+            domain = "repository"
+            resource_id = (
+                f"{lease.canonical_repo}#pull/{lease.pr_number}@{lease.head_sha}"
+            )
+            bridge_instance = "forge"
+            integrity = "trusted"
+            integrity_effect = "informational"
+        else:
+            integrity, integrity_effect = _filesystem_result_integrity(
+                auth_context, resource_id,
+            )
+    acl = {principal} if principal else set()
+    if requester:
+        acl.add(requester)
     return SourceLabel(
         principal=principal,
         domain=domain,
@@ -9388,38 +9422,6 @@ def _filesystem_result_integrity(
             "informational" if persisted == "trusted" else "active_ingest"
         )
 
-    # A checkout root is only an access boundary. Trust comes from the immutable
-    # PR scope attached to this turn, so relaxing PR discovery to permit an
-    # outside author's branch cannot silently make that checkout informational.
-    lease_root = _configured_pr_checkout_lease_root()
-    if lease_root is not None:
-        try:
-            resource.relative_to(lease_root)
-        except ValueError:
-            pass
-        else:
-            review_state = getattr(auth_context, "repo_review_state", None)
-            registry = getattr(auth_context, "repo_pr_scope_registry", None)
-            if registry is not None:
-                review_state = registry.resolve_checkout_path(resource)
-            scope = getattr(review_state, "action_scope", None)
-            lease = getattr(review_state, "checkout_lease", None)
-            self_login = os.environ.get("MIMIR_GITHUB_SELF_LOGIN", "").strip()
-            if not (
-                self_login
-                and getattr(scope, "principal", None) == self_login
-                and getattr(scope, "pull_request_author", None) == self_login
-                and getattr(lease, "is_active", False)
-                and getattr(lease, "scope_id", None) == getattr(scope, "scope_id", None)
-                and _resolved_path_equals(getattr(lease, "lease_root", None), lease_root)
-                and _resolved_path_contains(getattr(lease, "path", None), resource)
-            ):
-                return "untrusted", "active_ingest"
-            persisted = _persisted_file_integrity(home, resource)
-            return persisted, (
-                "informational" if persisted == "trusted" else "active_ingest"
-            )
-
     integrity_key = _configured_external_file_integrity_key(home, resource)
     if integrity_key is not None:
         # A configured root is an access boundary, not evidence that its existing
@@ -9471,15 +9473,6 @@ def _configured_pr_checkout_lease_root() -> Path | None:
     except (OSError, RuntimeError):
         return None
     return resolved if resolved.is_dir() else None
-
-
-def _resolved_path_equals(candidate: object, expected: Path) -> bool:
-    if not isinstance(candidate, (str, Path)):
-        return False
-    try:
-        return Path(candidate).resolve(strict=True) == expected
-    except (OSError, RuntimeError):
-        return False
 
 
 def _resolved_path_contains(root: object, resource: Path) -> bool:

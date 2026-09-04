@@ -249,6 +249,15 @@ results still add `protected_tool` repository provenance as untrusted
 `pr_submit_review` audits, but do not taint the turn; cross-PR/head repository
 provenance and execution-fault active ingest remain blocked.
 
+Filesystem results from inside an active PR checkout lease use that lease's
+`repository` provenance only when both the controller-written record and the turn's
+PR scope bind the path to the same scope, repository, pull request, and head, and the
+PR author matches `MIMIR_GITHUB_SELF_LOGIN`. The path is strictly resolved before
+containment is checked. A foreign-authored PR, cross-scope read, or missing, expired,
+malformed, symlinked, or path/root-mismatched record fails closed as untrusted
+filesystem `active_ingest`; trusted repository provenance can flow only to a forge
+sink for the same canonical repository, PR, and head.
+
 #### 2026-07-29 interactive shadow re-baseline (#1054)
 
 The local `MIMIR_HOME/logs/events.jsonl` audit contained 699
