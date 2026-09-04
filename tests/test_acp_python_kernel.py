@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ast
 import asyncio
+import builtins
 import os
 import socket
 import stat
@@ -115,6 +116,57 @@ def test_text_bound_never_splits_multibyte_or_invalid_codepoints() -> None:
     invalid = kernel._bounded_text("a" * 16_383 + "\udcff", kernel.TEXT_LIMIT_BYTES)
     assert invalid == "a" * 16_383 + "?"
     assert len(invalid.encode("utf-8")) == kernel.TEXT_LIMIT_BYTES
+
+
+def test_traceback_format_exc_runs_inside_active_handler(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    original = kernel.traceback.format_exc
+    observed = False
+
+    def format_exc() -> str:
+        nonlocal observed
+        observed = True
+        assert sys.exception() is not None
+        return original()
+
+    monkeypatch.setattr(kernel.traceback, "format_exc", format_exc)
+    ok, value, exception = kernel._execute(
+        "raise RuntimeError('boom')",
+        {"__name__": "__main__", "__builtins__": builtins},
+    )
+    assert observed is True
+    assert ok is False
+    assert value == ""
+    assert exception.endswith("RuntimeError: boom\n")
+
+
+@pytest.mark.asyncio
+async def test_exception_utf8_bound_and_omitted_byte_count_are_exact(
+    tmp_path: Path,
+) -> None:
+    manager = PythonKernelManager()
+    try:
+        baseline = await manager.execute("baseline", tmp_path, "raise RuntimeError('')")
+        result = await manager.execute(
+            "large", tmp_path, "raise RuntimeError('界' * 6000)"
+        )
+        retained, marker = result["exception"].rsplit("\n…[truncated ", 1)
+        omitted = int(marker.removesuffix(" bytes]"))
+        baseline_bytes = baseline["exception"].encode("utf-8")
+        expected_total = (
+            len(baseline_bytes)
+            - len("RuntimeError\n".encode("utf-8"))
+            + len("RuntimeError: \n".encode("utf-8"))
+            + len(("界" * 6000).encode("utf-8"))
+        )
+        assert len(retained.encode("utf-8")) <= kernel.TEXT_LIMIT_BYTES
+        assert "�" not in retained
+        assert len(retained.encode("utf-8")) + omitted == expected_total
+        assert result["ok"] is False
+        assert result["kernel"] == "fresh"
+    finally:
+        await manager.close()
 
 
 @pytest.mark.asyncio
@@ -389,6 +441,35 @@ async def test_registered_waiter_wins_idle_retirement_race(
 
 
 @pytest.mark.asyncio
+async def test_real_waiter_registered_at_idle_expiry_keeps_worker(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(kernel, "IDLE_SECONDS", 0.1)
+    manager = PythonKernelManager()
+    try:
+        await manager.execute("one", tmp_path, "value = 9")
+        state = manager._sessions["one"]
+        worker = state.worker
+        await state.lock.acquire()
+        waiter = asyncio.create_task(manager.execute("one", tmp_path, "value"))
+        while state.waiters != 1:
+            await asyncio.sleep(0)
+        await asyncio.sleep(0.15)
+        assert state.worker is worker
+        assert worker is not None and worker.process.returncode is None
+        state.lock.release()
+        result = await waiter
+        assert result["kernel"] == "reused"
+        assert result["value"] == "9"
+    finally:
+        if manager._sessions.get("one", None) is not None:
+            state = manager._sessions["one"]
+            if state.lock.locked():
+                state.lock.release()
+        await manager.close()
+
+
+@pytest.mark.asyncio
 async def test_late_background_output_is_discarded_between_calls(tmp_path: Path) -> None:
     manager = PythonKernelManager()
     try:
@@ -494,6 +575,106 @@ async def test_output_setup_and_protocol_failures_discard_worker(
         await manager.execute("one", tmp_path, "1")
     assert manager._processes == {}
     await manager.close()
+
+
+@pytest.mark.asyncio
+async def test_deadline_expires_during_spawn_handshake_and_output_setup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    timeout_result = {
+        "ok": False,
+        "stdout": "",
+        "stderr": "",
+        "value": "",
+        "exception": "execution timed out after 0.01 seconds; namespace state lost",
+        "timedOut": True,
+        "kernel": "timed_out",
+    }
+    spawn_manager = PythonKernelManager()
+
+    async def blocked_spawn(*args: object, **kwargs: object) -> None:
+        del args, kwargs
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", blocked_spawn)
+    assert await spawn_manager.execute("spawn", tmp_path, "1", 0.01) == timeout_result
+    assert spawn_manager._processes == {}
+    await spawn_manager.close()
+    monkeypatch.undo()
+
+    handshake_manager = PythonKernelManager()
+
+    async def blocked_handshake(channel: socket.socket) -> dict[str, object]:
+        del channel
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(handshake_manager, "_receive", blocked_handshake)
+    handshake = await handshake_manager.execute("handshake", tmp_path, "1", 1)
+    assert handshake == {
+        **timeout_result,
+        "exception": "execution timed out after 1 seconds; namespace state lost",
+    }
+    assert handshake_manager._processes == {}
+    await handshake_manager.close()
+
+    setup_manager = PythonKernelManager()
+    assert (await setup_manager.execute("setup", tmp_path, "1"))["ok"] is True
+    real_output = setup_manager._output_path
+
+    def delayed_output() -> Path:
+        time.sleep(0.03)
+        return real_output()
+
+    monkeypatch.setattr(setup_manager, "_output_path", delayed_output)
+    assert await setup_manager.execute("setup", tmp_path, "2", 0.01) == timeout_result
+    assert setup_manager._processes == {}
+    await setup_manager.close()
+
+
+@pytest.mark.asyncio
+async def test_bounded_wait_retains_ownership_until_eventual_direct_reap(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    del tmp_path
+    process = await asyncio.create_subprocess_exec(
+        sys.executable,
+        "-c",
+        "import time; time.sleep(30)",
+        start_new_session=True,
+        stdout=asyncio.subprocess.DEVNULL,
+        stderr=asyncio.subprocess.DEVNULL,
+    )
+    release = asyncio.Event()
+
+    class DelayedProcess:
+        pid = process.pid
+
+        @property
+        def returncode(self) -> int | None:
+            return process.returncode
+
+        async def wait(self) -> int:
+            await release.wait()
+            return await process.wait()
+
+    delayed = DelayedProcess()
+    manager = PythonKernelManager()
+    parent, child = socket.socketpair()
+    child.close()
+    worker = kernel._Worker(delayed, process.pid, parent)
+    manager._processes[delayed] = process.pid
+    monkeypatch.setattr(kernel, "_REAP_TIMEOUT_SECONDS", 0.01)
+
+    started = time.monotonic()
+    await manager._terminate(worker)
+    assert time.monotonic() - started < 0.2
+    assert delayed in manager._processes
+    assert manager._reapers
+    release.set()
+    await manager.close()
+    assert process.returncode is not None
+    assert delayed not in manager._processes
+    assert manager._reapers == set()
 
 
 def test_worker_is_plain_exec_subprocess_without_ipykernel_or_zmq() -> None:

@@ -155,6 +155,7 @@ class _Worker:
     pgid: int
     channel: socket.socket
     usable: bool = False
+    reaper: asyncio.Task[None] | None = None
 
 
 @dataclass(slots=True)
@@ -170,6 +171,7 @@ class PythonKernelManager:
     def __init__(self) -> None:
         self._sessions: dict[str, _Session] = {}
         self._processes: dict[asyncio.subprocess.Process, int] = {}
+        self._reapers: set[asyncio.Task[None]] = set()
         self._directory: Path | None = None
         self._closed = False
 
@@ -314,6 +316,10 @@ class PythonKernelManager:
             return
         self._closed = True
         await asyncio.gather(*(self.retire(key) for key in tuple(self._sessions)))
+        if self._reapers:
+            reapers = tuple(self._reapers)
+            await asyncio.gather(*reapers)
+            self._reapers.difference_update(reapers)
         if self._directory is not None:
             await asyncio.to_thread(shutil.rmtree, self._directory, True)
             self._directory = None
@@ -500,13 +506,26 @@ class PythonKernelManager:
             os.killpg(worker_state.pgid, 9)
         except ProcessLookupError:
             pass
+        reaper = worker_state.reaper
+        if reaper is None:
+            reaper = asyncio.create_task(self._reap(worker_state.process))
+            worker_state.reaper = reaper
+            self._reapers.add(reaper)
+            reaper.add_done_callback(self._reapers.discard)
         try:
             await asyncio.wait_for(
-                worker_state.process.wait(), timeout=_REAP_TIMEOUT_SECONDS
+                asyncio.shield(reaper), timeout=_REAP_TIMEOUT_SECONDS
             )
         except (ProcessLookupError, TimeoutError):
             pass
-        self._processes.pop(worker_state.process, None)
+
+    async def _reap(self, process: asyncio.subprocess.Process) -> None:
+        try:
+            await process.wait()
+        except ProcessLookupError:
+            pass
+        finally:
+            self._processes.pop(process, None)
 
     def _cancel_idle(self, state: _Session) -> None:
         if state.idle_task is not None:
