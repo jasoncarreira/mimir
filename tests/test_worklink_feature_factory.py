@@ -63,11 +63,11 @@ def package_entrypoint(tmp_path: Path) -> Path:
     entrypoint = feature / "bin" / "factory.js"
     entrypoint.write_text("", encoding="utf-8")
     (feature / "package.json").write_text(
-        json.dumps({"name": "feature-factory", "version": FACTORY_VERSION}),
+        json.dumps({"name": "feature-factory", "version": "0.8.2"}),
         encoding="utf-8",
     )
     (adapter / "package.json").write_text(
-        json.dumps({"name": "opencode-feature-factory", "version": FACTORY_VERSION}),
+        json.dumps({"name": "opencode-feature-factory", "version": "0.8.2"}),
         encoding="utf-8",
     )
     return entrypoint
@@ -310,8 +310,8 @@ def test_status_rejects_invalid_utf8_nul_and_oversize(payload: bytes) -> None:
 
 def test_resolve_entrypoint_is_absolute_package_bound_and_lockstep(tmp_path: Path) -> None:
     entrypoint = package_entrypoint(tmp_path)
-    assert FACTORY_VERSION == "0.8.1"
     assert resolve_factory_entrypoint(entrypoint) == entrypoint.resolve()
+    assert FACTORY_VERSION == "0.8.2"
     with pytest.raises(FactoryContractError, match="absolute"):
         resolve_factory_entrypoint(Path("feature-factory/bin/factory.js"))
 
@@ -336,7 +336,7 @@ def test_admit_rejects_either_package_version_mismatch(
     entrypoint = package_entrypoint(tmp_path)
     manifest = entrypoint.parents[2] / package / "package.json"
     manifest.write_text(
-        json.dumps({"name": expected_name, "version": "0.8.0"}),
+        json.dumps({"name": expected_name, "version": "0.8.1"}),
         encoding="utf-8",
     )
     calls: list[tuple[str, ...]] = []

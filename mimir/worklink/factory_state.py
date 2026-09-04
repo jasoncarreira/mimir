@@ -380,7 +380,11 @@ def list_factory_records(home: Path) -> list[FactoryRunRecord]:
 def factory_manifest_candidates(record: FactoryRunRecord) -> tuple[Path, Path]:
     """Return the root-checkout and sandbox manifests that block factory init."""
     sandbox = Path(record.sandbox)
-    if sandbox.parent.name != ".factory-sandboxes" or sandbox.name != record.run_id:
+    if (
+        not _valid_record_run_id(record.run_id)
+        or sandbox.parent.name != ".factory-sandboxes"
+        or sandbox.name != record.run_id
+    ):
         raise FactoryRecordError("factory sandbox is outside the retained-run layout")
     repository = sandbox.parent.parent
     return repository / ".factory" / record.run_id, sandbox / ".factory" / record.run_id

@@ -18,7 +18,7 @@ FACTORY_DOCS = (
 
 
 def test_current_factory_documentation_matches_runtime_version() -> None:
-    assert FACTORY_VERSION == "0.8.1"
+    assert FACTORY_VERSION == "0.8.2"
     for relative_path in FACTORY_DOCS:
         text = (ROOT / relative_path).read_text(encoding="utf-8")
         assert text.count(f"`feature-factory@{FACTORY_VERSION}`") == 1, relative_path
