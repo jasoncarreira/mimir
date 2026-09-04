@@ -3,6 +3,8 @@ from __future__ import annotations
 from dataclasses import replace
 import json
 from pathlib import Path
+from types import SimpleNamespace
+from typing import cast
 
 import pytest
 
@@ -167,6 +169,20 @@ def test_report_retained_factory_records_preserves_control_plane(
     assert load_factory_record(tmp_path, expected.run_id) == expected
     assert events[0][0] == "worklink_factory_run_retained"
     assert events[0][1]["sandbox"] == expected.sandbox
+
+
+@pytest.mark.parametrize("reserved", [".parked", ".staging-1551", ".prior-1551"])
+def test_factory_manifest_candidates_reject_reserved_control_plane_names(
+    tmp_path: Path, reserved: str
+) -> None:
+    sandbox = tmp_path / "repo" / ".factory-sandboxes" / reserved
+    forged = cast(
+        FactoryRunRecord,
+        SimpleNamespace(run_id=reserved, sandbox=str(sandbox)),
+    )
+
+    with pytest.raises(FactoryRecordError, match="retained-run layout"):
+        factory_manifest_candidates(forged)
 
 
 def test_report_retained_factory_records_never_touches_unresumed_sandbox(

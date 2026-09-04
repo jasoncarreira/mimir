@@ -56,8 +56,8 @@ The in-mimir integrated-epic runner — brief → `work-decomposer` → `decompo
 `integration-validator` → one final draft PR — **was removed in #830** after the
 epic #783 arc concluded (every failure was distribution tax in that layer).
 
-Epics are built by `feature-factory@0.8.1` through the lockstep
-`opencode-feature-factory@0.8.1` adapter. OpenCode's `/feature` workflow owns
+Epics are built by `feature-factory@0.8.2` through the lockstep
+`opencode-feature-factory@0.8.2` adapter. OpenCode's `/feature` workflow owns
 factory transitions. Worklink owns the outer Chainlink claim, isolated attempt
 checkout, OpenCode process, restart record, status observation, repository tests,
 and final PR identity verification.
@@ -100,7 +100,7 @@ and final PR identity verification.
   rather than one being preferred, and a missing `GITHUB_TOKEN` fails naming that
   variable - in both cases without disclosing values.
 - **Controls**: Every control is `node <absolute feature-factory/bin/factory.js>`.
-  Worklink admits the launcher only after package/adapter 0.8.1 verification and
+  Worklink admits the launcher only after package/adapter 0.8.2 verification and
   all 16 nonmutating structural command probes. Status is read with `status
   <run-id> --repo <sandbox> --json`; resume and heartbeat reuse the retained
   session; lock actions use `lock <run-id> <claim|steal|release> --session
@@ -142,7 +142,10 @@ and final PR identity verification.
   default/fallback `1`; leaf concurrency remains `2`. The 12-hour timeout is a
   process liveness backstop. The 900-second stale threshold emits diagnostics
   only and never dispatches, steals, cancels, or deletes work.
-- **Recovery**: A parked or interrupted run retains its sandbox. Recovery binds
+- **Recovery**: A parked or interrupted run retains its sandbox. A parked run also
+  leaves a diagnostic control-plane snapshot at `<operator root>/.factory/.parked/<run-id>`;
+  Worklink never removes it. The snapshot is not resumable: recovery uses the
+  retained sandbox manifest. Recovery binds
   the retained identities, including resolving a factory clone through its local
   lease checkout, reads status, obtains a run-ID-first lock only when justified,
   rereads owner/history, and resumes and relaunches OpenCode with one session
@@ -514,7 +517,7 @@ require touching the orchestrator.
 | Adapter | Invocation sketch | Notes |
 |---|---|---|
 | `opencode` | `opencode run --dir <checkout> -- <prompt>` | Sole coding backend for leaf issues; provider and model are selected by opencode configuration/arguments. |
-| `feature_factory` | `opencode run ... --command feature " --autonomous --max-retries 5 <issue>"` | Epic adapter with Worklink-supervised OpenCode and absolute 0.8.1 controls. |
+| `feature_factory` | `opencode run ... --command feature " --autonomous --max-retries 5 <issue>"` | Epic adapter with Worklink-supervised OpenCode and absolute 0.8.2 controls. |
 
 Selection is config, not code (§7): per repo / label / issue-type, with
 a per-category default. The executor consults `Caps` rather than
