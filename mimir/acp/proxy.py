@@ -296,10 +296,16 @@ def _permission_response_decision(message: dict[str, Any]) -> str | None:
 
 
 class ProxyRouter:
-    def __init__(self, client_writer: Any, daemon_writer: Any, credential: str) -> None:
+    def __init__(
+        self,
+        client_writer: Any,
+        daemon_writer: Any,
+        credential: str,
+        timeout_seconds: int = 60,
+    ) -> None:
         self._client = FrameWriter(client_writer, credential, inject_credential=False)
         self._daemon = FrameWriter(daemon_writer, credential)
-        self._provider = HostedHandsProvider()
+        self._provider = HostedHandsProvider(timeout_seconds)
         self._generation = object()
         self._grants = PermissionGrantStore()
         self._active_sessions: set[str] = set()
@@ -808,9 +814,10 @@ async def run_router(
     daemon_writer: Any,
     credential: str,
     *,
+    timeout_seconds: int = 60,
     close_on_daemon_exit: bool = False,
 ) -> None:
-    router = ProxyRouter(client_writer, daemon_writer, credential)
+    router = ProxyRouter(client_writer, daemon_writer, credential, timeout_seconds)
     client_task = asyncio.create_task(_route_stream(client_reader, router.route_client))
     daemon_task = asyncio.create_task(_route_stream(daemon_reader, router.route_daemon))
     failure_task = asyncio.create_task(router.wait_failed())
@@ -897,7 +904,12 @@ async def run_local_proxy(profile: Profile, credential: str, output: BinaryIO) -
         raise
     try:
         await run_router(
-            stdin_reader, stdout_writer, upstream_reader, upstream_writer, credential
+            stdin_reader,
+            stdout_writer,
+            upstream_reader,
+            upstream_writer,
+            credential,
+            timeout_seconds=profile.timeout_seconds,
         )
     finally:
         stdin_transport.close()

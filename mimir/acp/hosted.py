@@ -43,6 +43,7 @@ class HostedMcpError(RuntimeError):
 class HostedSession:
     session_id: str
     cwd: Path
+    timeout_seconds: int = SHELL_TIMEOUT_SECONDS
 
 
 @dataclass(slots=True)
@@ -79,7 +80,14 @@ def _resolved_path(session: HostedSession, value: str) -> Path:
 
 
 class HostedHandsProvider:
-    def __init__(self) -> None:
+    def __init__(self, timeout_seconds: int = SHELL_TIMEOUT_SECONDS) -> None:
+        if (
+            isinstance(timeout_seconds, bool)
+            or not isinstance(timeout_seconds, int)
+            or not 1 <= timeout_seconds <= 600
+        ):
+            raise ValueError("timeout_seconds must be an integer from 1 through 600")
+        self._timeout_seconds = timeout_seconds
         self._sessions: dict[str, HostedSession] = {}
         self._connections: dict[str, _Connection] = {}
         self._used_connection_ids: set[str] = set()
@@ -91,7 +99,9 @@ class HostedHandsProvider:
     def bind_session(self, session_id: str, cwd: str | os.PathLike[str]) -> None:
         if not isinstance(session_id, str) or not session_id:
             raise ValueError("session_id must be a non-empty string")
-        self._sessions[session_id] = HostedSession(session_id, Path(os.path.abspath(cwd)))
+        self._sessions[session_id] = HostedSession(
+            session_id, Path(os.path.abspath(cwd)), self._timeout_seconds
+        )
 
     def revoke_session(self, session_id: str) -> None:
         self._sessions.pop(session_id, None)
@@ -138,11 +148,10 @@ class HostedHandsProvider:
         self,
         session: HostedSession,
         code: str,
-        timeout: int | float = SHELL_TIMEOUT_SECONDS,
     ) -> dict[str, Any]:
         try:
             return await self._python_kernels.execute(
-                session.session_id, session.cwd, code, timeout
+                session.session_id, session.cwd, code, session.timeout_seconds
             )
         except PythonKernelUnavailable as exc:
             raise HostedMcpError(
@@ -363,7 +372,7 @@ class HostedHandsProvider:
                     pass
 
     async def _shell(self, session: HostedSession, command: str) -> dict[str, Any]:
-        timeout = SHELL_TIMEOUT_SECONDS
+        timeout = session.timeout_seconds
         try:
             process = await asyncio.create_subprocess_exec(
                 "/bin/sh",

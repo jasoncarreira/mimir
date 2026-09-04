@@ -266,10 +266,21 @@ def _pipe_holding_grandchild_command(identity: Path) -> str:
 
 @pytest.mark.asyncio
 async def test_shell_deadline_kills_pipe_holding_owned_grandchild(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path,
 ) -> None:
-    provider, connection = await _connected(tmp_path)
-    monkeypatch.setattr(hosted, "SHELL_TIMEOUT_SECONDS", 1)
+    provider = HostedHandsProvider(1)
+    provider.bind_session("session", tmp_path)
+    connection = provider.connect("session")
+    await provider.request(
+        connection,
+        "initialize",
+        {
+            "protocolVersion": "2025-03-26",
+            "capabilities": {},
+            "clientInfo": {"name": "test", "version": "1"},
+        },
+    )
+    await provider.notification(connection, "notifications/initialized")
     identity = tmp_path / "timeout-child"
     result = await provider.request(
         connection,
@@ -288,6 +299,97 @@ async def test_shell_deadline_kills_pipe_holding_owned_grandchild(
     assert pgid != os.getpgrp()
     await _assert_process_stopped(pid)
     assert not provider._processes
+
+
+@pytest.mark.asyncio
+async def test_shell_and_python_default_timeout_is_60_seconds(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider, connection = await _connected(tmp_path)
+    observed: list[int | float] = []
+
+    async def execute(
+        session_id: str, cwd: Path, code: str, timeout: int | float,
+    ) -> dict[str, object]:
+        observed.append(timeout)
+        return {
+            "ok": True, "stdout": "", "stderr": "", "value": "",
+            "exception": "", "timedOut": False, "kernel": "fresh",
+        }
+
+    real_timeout_at = asyncio.timeout_at
+    started = asyncio.get_running_loop().time()
+
+    def timeout_at(deadline: float) -> object:
+        observed.append(deadline - started)
+        return real_timeout_at(deadline)
+
+    monkeypatch.setattr(provider._python_kernels, "execute", execute)
+    monkeypatch.setattr(hosted.asyncio, "timeout_at", timeout_at)
+    await provider.request(
+        connection, "tools/call", {"name": "shell", "arguments": {"command": "true"}}
+    )
+    await provider.request(
+        connection, "tools/call", {"name": "python", "arguments": {"code": "pass"}}
+    )
+    assert provider._sessions["session"].timeout_seconds == 60
+    assert observed[-1] == 60
+    assert observed[0] == pytest.approx(60, abs=1)
+    await provider.close()
+
+
+@pytest.mark.asyncio
+async def test_timeout_comes_only_from_selected_profile(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("MIMIR_ACP_TIMEOUT", "1")
+    provider = HostedHandsProvider(7)
+    provider.bind_session("selected", tmp_path)
+    connection = provider.connect("selected")
+    await provider.request(
+        connection,
+        "initialize",
+        {
+            "protocolVersion": "2025-03-26", "capabilities": {},
+            "clientInfo": {"name": "test", "version": "1"},
+        },
+    )
+    await provider.notification(connection, "notifications/initialized")
+    observed: list[int | float] = []
+
+    async def execute(
+        session_id: str, cwd: Path, code: str, timeout: int | float,
+    ) -> dict[str, object]:
+        observed.append(timeout)
+        return {
+            "ok": True, "stdout": "", "stderr": "", "value": "",
+            "exception": "", "timedOut": False, "kernel": "fresh",
+        }
+
+    real_timeout_at = asyncio.timeout_at
+    started = asyncio.get_running_loop().time()
+
+    def timeout_at(deadline: float) -> object:
+        observed.append(deadline - started)
+        return real_timeout_at(deadline)
+
+    monkeypatch.setattr(provider._python_kernels, "execute", execute)
+    monkeypatch.setattr(hosted.asyncio, "timeout_at", timeout_at)
+    await provider.request(
+        connection, "tools/call", {"name": "shell", "arguments": {"command": "true"}}
+    )
+    await provider.request(
+        connection, "tools/call", {"name": "python", "arguments": {"code": "pass"}}
+    )
+    assert observed[-1] == 7
+    assert observed[0] == pytest.approx(7, abs=1)
+    with pytest.raises(HostedMcpError, match="Invalid params"):
+        await provider.request(
+            connection,
+            "tools/call",
+            {"name": "python", "arguments": {"code": "pass", "timeout": 1}},
+        )
+    await provider.close()
 
 
 @pytest.mark.parametrize("action", ["cancel", "close"])

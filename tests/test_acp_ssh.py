@@ -44,6 +44,7 @@ def test_exact_argv_is_injection_safe_and_secret_free(tmp_path: Path) -> None:
         "-p", "2222", "--", "user@example.com", "mimir-agent acp relay --home '/remote path'",
     )
     assert "SECRET" not in str(argv)
+    assert "--timeout" not in argv[-1]
 
 
 def test_effective_ssh_configuration_disables_forwarding_and_local_commands(tmp_path: Path) -> None:
@@ -244,6 +245,58 @@ for line in sys.stdin.buffer:
     assert captured["argv"][-1] == "mimir-agent acp relay --home '/remote path'"
     assert "PYTHONPATH" not in captured["env"] and "MIMIR_ACP_PROFILE" not in captured["env"]
     assert "sentinel" not in json.dumps(captured)
+
+
+@pytest.mark.asyncio
+async def test_ssh_proxy_propagates_only_selected_local_profile_timeout(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    base, _ = remote_profile(tmp_path)
+    profile = Profile(base.name, base.home, base.remote, timeout_seconds=23)
+    ssh = _fake_ssh(tmp_path, "raise SystemExit(0)\n")
+    reader = asyncio.StreamReader()
+    output = io.BytesIO()
+    transport = type("Transport", (), {"close": lambda self: None})()
+    observed: list[int] = []
+
+    async def route(
+        client_reader: object,
+        client_writer: object,
+        daemon_reader: object,
+        daemon_writer: object,
+        credential: str,
+        *,
+        timeout_seconds: int,
+        close_on_daemon_exit: bool,
+    ) -> None:
+        router = ProxyRouter(client_writer, daemon_writer, credential, timeout_seconds)
+        await router.route_client({
+            "jsonrpc": "2.0", "id": "new", "method": "session/new",
+            "params": {
+                "cwd": str(tmp_path),
+                "timeoutSeconds": 1,
+            },
+        })
+        hosted_session = next(iter(router._provider._sessions.values()))
+        observed.append(hosted_session.timeout_seconds)
+        await router.close()
+
+    monkeypatch.setattr(
+        "mimir.acp.ssh.open_stdio",
+        lambda target: asyncio.sleep(0, result=(reader, Output(target), transport)),
+    )
+    monkeypatch.setattr("mimir.acp.ssh.run_router", route)
+    await run_ssh_proxy(
+        profile,
+        "secret",
+        output,
+        _ssh_path=ssh,
+        _environment={
+            "PATH": os.environ.get("PATH", ""),
+            "MIMIR_ACP_TIMEOUT": "1",
+        },
+    )
+    assert observed == [23]
 
 
 @pytest.mark.asyncio

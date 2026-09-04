@@ -117,7 +117,7 @@ def test_list_is_sorted_names_only_canonical_json(tmp_path: Path) -> None:
     s.set(Profile("z", Path("/z")))
     s.set(Profile("A", Path("/a")))
     assert [profile.name for profile in s.list()] == ["A", "z"]
-    assert s.path.read_bytes() == b'{"profiles":{"A":{"home":"/a","remote":null},"z":{"home":"/z","remote":null}},"version":1}\n'
+    assert s.path.read_bytes() == b'{"profiles":{"A":{"home":"/a","remote":null,"timeoutSeconds":60},"z":{"home":"/z","remote":null,"timeoutSeconds":60}},"version":1}\n'
     assert s.path.stat().st_mode & 0o777 == 0o600
     assert s.path.parent.stat().st_mode & 0o777 == 0o700
 
@@ -252,3 +252,65 @@ def test_selection_precedence() -> None:
     assert selected_profile("explicit", {"MIMIR_ACP_PROFILE": "env"}) == "explicit"
     assert selected_profile(None, {"MIMIR_ACP_PROFILE": " env "}) == "env"
     assert selected_profile(None, {"MIMIR_ACP_PROFILE": "  "}) == "default"
+
+
+def test_timeout_field_is_backward_compatible_and_strict(tmp_path: Path) -> None:
+    s = store(tmp_path)
+    prepare(s, '{"profiles":{"legacy":{"home":"/legacy","remote":null}},"version":1}\n')
+    assert s.get("legacy") == Profile("legacy", Path("/legacy"), timeout_seconds=60)
+
+    s.set_timeout("legacy", 600)
+    saved = json.loads(s.path.read_text())
+    assert saved == {
+        "profiles": {
+            "legacy": {
+                "home": "/legacy",
+                "remote": None,
+                "timeoutSeconds": 600,
+            }
+        },
+        "version": 1,
+    }
+    assert s.get("legacy") == Profile("legacy", Path("/legacy"), timeout_seconds=600)
+
+    invalid_values: tuple[object, ...] = (None, True, False, 0, 601, 1.0, "60")
+    for value in invalid_values:
+        payload = json.dumps({
+            "profiles": {
+                "p": {"home": "/p", "remote": None, "timeoutSeconds": value}
+            },
+            "version": 1,
+        })
+        s.path.write_text(payload)
+        os.chmod(s.path, 0o600)
+        before = s.path.read_bytes()
+        with pytest.raises(ProfileError, match="invalid-profile-store"):
+            s.list()
+        assert s.path.read_bytes() == before
+
+    s.path.write_text(
+        '{"profiles":{"p":{"home":"/p","remote":null,"timeoutSeconds":60,"extra":1}},"version":1}'
+    )
+    os.chmod(s.path, 0o600)
+    unknown = s.path.read_bytes()
+    with pytest.raises(ProfileError, match="invalid-profile-store"):
+        s.list()
+    assert s.path.read_bytes() == unknown
+
+    oversized = (
+        '{"profiles":{"p":{"home":"/p","remote":null,"timeoutSeconds":'
+        + "9" * 5000
+        + '}},"version":1}'
+    )
+    s.path.write_text(oversized)
+    os.chmod(s.path, 0o600)
+    before = s.path.read_bytes()
+    with pytest.raises(ProfileError, match="invalid-profile-store"):
+        s.list()
+    assert s.path.read_bytes() == before
+
+    s.path.write_text('{"profiles":{},"version":1}\n')
+    with pytest.raises(ProfileError, match="profile-not-found"):
+        s.set_timeout("missing", 60)
+    with pytest.raises(ProfileError, match="invalid-profile"):
+        Profile("p", Path("/p"), timeout_seconds=0)
