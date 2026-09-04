@@ -402,9 +402,22 @@ def reconcile_run_states(
                 continue
 
             checkout_exists = bool(state.checkout and Path(state.checkout).is_dir())
+            would_rearm = publication_outcome != "determined-unpublished" and not (
+                publication_outcome == "undetermined" and checkout_exists
+            )
+            labels_unknown = False
+            is_epic = False
+            if would_rearm:
+                labels_by_issue, label_errors = _worklink_issue_labels(
+                    run, chainlink_bin, {state.issue_id}
+                )
+                labels_unknown = state.issue_id in label_errors
+                is_epic = "worklink:epic" in labels_by_issue.get(state.issue_id, set())
             target = (
                 "worklink:blocked"
-                if publication_outcome == "determined-unpublished"
+                if is_epic
+                or labels_unknown
+                or publication_outcome == "determined-unpublished"
                 or (publication_outcome == "undetermined" and checkout_exists)
                 else "worklink:ready"
             )
@@ -413,6 +426,8 @@ def reconcile_run_states(
                 publication_outcome=publication_outcome,
                 publication_reason=publication_reason,
                 target=target,
+                is_epic=is_epic,
+                labels_unknown=labels_unknown,
             )
             comment = run(
                 [chainlink_bin, "issue", "comment", str(state.issue_id), comment_text]
@@ -544,8 +559,22 @@ def _orphan_reconcile_comment(
     publication_outcome: str,
     publication_reason: str,
     target: str,
+    is_epic: bool = False,
+    labels_unknown: bool = False,
 ) -> str:
     identity = f"issue={state.issue_id} attempt={state.attempt} checkout={state.checkout}"
+    if is_epic:
+        return (
+            f"WORKLINK_BLOCKED orphaned epic run {identity}: {publication_reason}. "
+            "worklink:epic issues are armed by an operator only, so orphan "
+            "reconciliation did not apply worklink:ready."
+        )
+    if labels_unknown:
+        return (
+            f"WORKLINK_BLOCKED orphaned run {identity}: issue labels could not be "
+            "verified, so reconciliation failed closed and did not apply "
+            "worklink:ready."
+        )
     if publication_outcome == "determined-unpublished":
         return (
             f"WORKLINK_BLOCKED orphaned run {identity}: unpublished commits were verified "

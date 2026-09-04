@@ -956,9 +956,9 @@ def reattach_inflight_worklink_runs(
     from .event_logger import log_event_sync
     from .worklink.control import reconcile_run_states
     from .worklink.factory_state import (
-        age_out_factory_records,
         factory_process_is_verified_dead,
         list_factory_records,
+        report_retained_factory_records,
     )
     from .worklink.run_state import reattach_dispatch_argv
 
@@ -976,7 +976,7 @@ def reattach_inflight_worklink_runs(
     # event and never abort startup.
     states = reconcile_run_states(home, event_logger=emit)
     try:
-        age_out_factory_records(home, event_logger=emit)
+        report_retained_factory_records(home, event_logger=emit)
         factory_records = [
             record
             for record in list_factory_records(home)

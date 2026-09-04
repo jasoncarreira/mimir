@@ -583,6 +583,8 @@ class FeatureFactoryBackend:
         base_ref: str,
         branch: str,
         test_command: str,
+        session: str | None = None,
+        run_id: str | None = None,
     ) -> WorkSpec:
         try:
             resolution = resolve_worklink_opencode_invocation(order.env)
@@ -591,7 +593,9 @@ class FeatureFactoryBackend:
                 f"feature_factory_opencode_resolution_failed:{exc.reason_code}"
             ) from exc
         invocation = resolution.invocation
-        run_id = epic_run_id(order.issue_id)
+        run_id = run_id or epic_run_id(order.issue_id)
+        if _RUN_ID.fullmatch(run_id) is None:
+            raise FactoryContractError("factory launch run_id has an invalid shape")
         work_item_json = order.env.get("MIMIR_WORK_ITEM_JSON")
         if work_item_json is not None:
             try:
@@ -600,7 +604,12 @@ class FeatureFactoryBackend:
                 raise FactoryContractError("factory work item JSON is malformed") from exc
             if not isinstance(work_item, dict) or work_item.get("run_id") != run_id:
                 raise FactoryContractError("factory work item run_id does not match the launch run_id")
-        command = self.opencode_argv(order.checkout, run_id, invocation.model)
+        command = self.opencode_argv(
+            order.checkout,
+            run_id,
+            invocation.model,
+            session=session,
+        )
         return WorkSpec(
             issue_id=order.issue_id,
             attempt=attempt,
@@ -628,19 +637,27 @@ class FeatureFactoryBackend:
 
     @staticmethod
     def opencode_argv(
-        operator_checkout: Path, run_id: str, model: str
+        operator_checkout: Path,
+        run_id: str,
+        model: str,
+        *,
+        session: str | None = None,
     ) -> tuple[str, ...]:
         if _RUN_ID.fullmatch(run_id) is None:
             raise FactoryContractError("factory launch run_id has an invalid shape")
+        if session is not None and (not session.strip() or "\x00" in session):
+            raise FactoryContractError("factory launch session is invalid")
         retries = _factory_max_retries()
         # feature-factory 0.7.5 stages the workflow inside the run directory, so
         # OpenCode --auto must not bypass it.
+        session_args = ("--session", session) if session is not None else ()
         return (
             "opencode",
             "run",
             "--log-level",
             "DEBUG",
             "--print-logs",
+            *session_args,
             "-m",
             model,
             "--dir",

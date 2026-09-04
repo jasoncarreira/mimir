@@ -143,11 +143,12 @@ and final PR identity verification.
   process liveness backstop. The 900-second stale threshold emits diagnostics
   only and never dispatches, steals, cancels, or deletes work.
 - **Recovery**: A parked or interrupted run retains its sandbox. Recovery binds
-  the retained identities, reads status, obtains a run-ID-first lock only when
-  justified, rereads owner/history, resumes, rereads a running status with a real
-  `next`, reconciles the checkout and claim, then relaunches the exact OpenCode
-  command. `terminal_result` is opaque context; its `reason` never selects an
-  action. `needs-human` is parked and resumable, not terminal.
+  the retained identities, including resolving a factory clone through its local
+  lease checkout, reads status, obtains a run-ID-first lock only when justified,
+  rereads owner/history, and resumes and relaunches OpenCode with one session
+  identity. `terminal_result` is opaque context; its `reason` never selects an
+  action. `needs-human` and lock-refusal exits are parked and resumable, not
+  terminal. A relaunch never archives, replaces, or removes a retained run.
 - **Completion**: `completed`, `blocked`, and `partial` are terminal, but only
   `completed` can ship. Before `worklink:review`, Worklink runs the configured
   repository test command, requires observed non-skipped exit-zero evidence and
@@ -880,6 +881,19 @@ Worklink does not guess a checkout or clone destination on first use and fails
 closed when `WORKLINK_REPO` is absent.
 
 Current slice-1 recovery is manual:
+
+- **Parked factory epic:** when factory ownership is the cause, run the factory's
+  `amend-paths` recovery first, then relaunch the epic normally. Worklink verifies
+  the retained sandbox and resumes it in place with the retained session. A
+  verification mismatch applies `worklink:blocked` and reports the sandbox; it
+  does not claim a fresh attempt. Discarding the record requires the explicit
+  `mimir worklink archive-factory-run <issue-id>` operator action.
+- **Factory sandbox cleanup:** treat `.factory/<run-id>`, its plan, artifacts, and
+  reviews like unpublished commits. Worklink does not sweep a parked, completed,
+  failed, or unresumed factory sandbox. Removal is permitted only after the
+  factory's own handoff terminalizes the run, fetches permitted local refs,
+  archives and verifies the control plane outside the sandbox, and removes the
+  guarded sandbox. If any handoff phase fails, leave the sandbox in place.
 
 - **Backend/sandbox failure before useful diff:** read the transcript path in
   the evidence bundle or `<home>/state/worklink/transcripts/`, adjust

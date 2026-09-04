@@ -723,6 +723,67 @@ def test_controls_are_absolute_run_id_first_and_resume_reads_status(tmp_path: Pa
     assert all("cwd" not in kwargs for _, kwargs in calls)
 
 
+def test_recovery_launch_binds_opencode_to_factory_session(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.delenv("XDG_DATA_HOME", raising=False)
+    auth = tmp_path / ".local" / "share" / "opencode" / "auth.json"
+    auth.parent.mkdir(parents=True)
+    auth.write_text(
+        json.dumps({"openai": {"type": "oauth", "refresh": "subscription"}}),
+        encoding="utf-8",
+    )
+    order = WorkOrder(
+        issue_id=1551,
+        checkout=tmp_path,
+        prompt="resume",
+        rules=None,
+        timeout_s=43200,
+        env={},
+    )
+
+    spec = FeatureFactoryBackend(entrypoint="/absolute/factory.js").work_spec(
+        order,
+        attempt=1,
+        repo_url=str(tmp_path),
+        base_ref="main",
+        branch="feature/chainlink-1551",
+        test_command="pytest -q",
+        session="session-1",
+    )
+
+    argv = tuple(spec.local_argv or ())
+    assert argv[argv.index("--session") + 1] == "session-1"
+
+
+def test_recovery_launch_uses_retained_legacy_run_id(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.delenv("XDG_DATA_HOME", raising=False)
+    auth = tmp_path / ".local" / "share" / "opencode" / "auth.json"
+    auth.parent.mkdir(parents=True)
+    auth.write_text(
+        json.dumps({"openai": {"type": "oauth", "refresh": "subscription"}}),
+        encoding="utf-8",
+    )
+    order = WorkOrder(1551, tmp_path, "resume", None, 43200, env={})
+
+    spec = FeatureFactoryBackend(entrypoint="/absolute/factory.js").work_spec(
+        order,
+        attempt=1,
+        repo_url=str(tmp_path),
+        base_ref="main",
+        branch="epic/1551",
+        test_command="pytest -q",
+        session="session-1",
+        run_id="1551",
+    )
+
+    assert (spec.local_argv or ())[-1].split()[-1] == "1551"
+
+
 def test_status_before_sandbox_creation_returns_not_ready(tmp_path: Path) -> None:
     entrypoint = package_entrypoint(tmp_path)
     sandbox = tmp_path / "not-created"
