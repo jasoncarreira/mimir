@@ -22,6 +22,7 @@ TEXT_LIMIT_BYTES = 16_384
 IDLE_SECONDS = 1_800
 _FRAME_LIMIT_BYTES = 16 * 1024 * 1024
 _FILENAME = "<mimir-hands-python>"
+_REAP_TIMEOUT_SECONDS = 5
 
 
 class PythonKernelUnavailable(RuntimeError):
@@ -29,9 +30,16 @@ class PythonKernelUnavailable(RuntimeError):
 
 
 def _bounded_text(value: str, limit: int) -> str:
-    encoded = value.encode("utf-8")
+    encoded = value.encode("utf-8", errors="replace")
     retained = encoded[:limit]
-    result = retained.decode("utf-8", errors="replace")
+    while retained:
+        try:
+            result = retained.decode("utf-8")
+            break
+        except UnicodeDecodeError as exc:
+            retained = retained[: exc.start]
+    else:
+        result = ""
     omitted = len(encoded) - len(retained)
     if omitted:
         result += f"\n…[truncated {omitted} bytes]"
@@ -99,6 +107,14 @@ def _execute(code: str, namespace: dict[str, Any]) -> tuple[bool, str, str]:
 
 def worker(control_fd: int) -> None:
     channel = socket.socket(fileno=control_fd)
+    baseline = os.open(os.devnull, os.O_WRONLY)
+    os.dup2(baseline, 1)
+    os.dup2(baseline, 2)
+    os.close(baseline)
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is not None:
+            reconfigure(write_through=True)
     namespace: dict[str, Any] = {"__name__": "__main__", "__builtins__": builtins}
     _write_frame(channel, {"ready": True})
     while True:
@@ -189,8 +205,12 @@ class PythonKernelManager:
                 kernel_state = "reused"
             else:
                 state.worker = await self._spawn(cwd, deadline)
-            stdout_path = self._output_path()
-            stderr_path = self._output_path()
+            try:
+                stdout_path = self._output_path()
+                stderr_path = self._output_path()
+            except OSError as exc:
+                await self._discard(state, state.worker)
+                raise PythonKernelUnavailable(str(exc)) from None
             request = {
                 "code": code,
                 "stdout": str(stdout_path),
@@ -200,16 +220,20 @@ class PythonKernelManager:
                 await self._send(state.worker.channel, request, deadline)
                 response = await self._response(state.worker, deadline)
             except TimeoutError:
-                result = self._timeout_result(timeout, stdout_path, stderr_path)
                 await self._discard(state, state.worker)
+                result = self._timeout_result(timeout, stdout_path, stderr_path)
                 state.last_activity = loop.time()
                 return result
             except asyncio.CancelledError:
                 await self._discard(state, state.worker)
                 raise
-            except _ProcessExited:
+            except _ProcessExited as exc:
                 result = await self._crashed(
-                    state, state.worker, stdout_path, stderr_path
+                    state,
+                    state.worker,
+                    stdout_path,
+                    stderr_path,
+                    returncode=exc.returncode,
                 )
                 state.last_activity = loop.time()
                 return result
@@ -250,11 +274,15 @@ class PythonKernelManager:
             state.last_activity = loop.time()
             return result
         except TimeoutError:
-            result = self._timeout_result(timeout, stdout_path, stderr_path)
             if state.worker is not None:
                 await self._discard(state, state.worker)
+            result = self._timeout_result(timeout, stdout_path, stderr_path)
             state.last_activity = loop.time()
             return result
+        except OSError as exc:
+            if state.worker is not None:
+                await self._discard(state, state.worker)
+            raise PythonKernelUnavailable(str(exc)) from None
         except asyncio.CancelledError:
             if state.worker is not None:
                 await self._discard(state, state.worker)
@@ -306,6 +334,8 @@ class PythonKernelManager:
                     cwd=cwd,
                     env=None,
                     start_new_session=True,
+                    stdout=asyncio.subprocess.DEVNULL,
+                    stderr=asyncio.subprocess.DEVNULL,
                 ),
             )
         except (TimeoutError, asyncio.CancelledError):
@@ -333,9 +363,14 @@ class PythonKernelManager:
             raise PythonKernelUnavailable(
                 f"kernel process exited with code {exc.returncode}"
             ) from None
-        except BaseException:
+        except asyncio.CancelledError:
             await self._terminate(worker_state)
             raise
+        except Exception as exc:
+            await self._terminate(worker_state)
+            if isinstance(exc, PythonKernelUnavailable):
+                raise
+            raise PythonKernelUnavailable(str(exc)) from None
 
     async def _response(
         self, worker_state: _Worker, deadline: float, *, handshake: bool = False
@@ -432,10 +467,14 @@ class PythonKernelManager:
         worker_state: _Worker,
         stdout_path: Path | None,
         stderr_path: Path | None,
+        *,
+        returncode: int | None = None,
     ) -> dict[str, Any]:
-        await worker_state.process.wait()
-        returncode = worker_state.process.returncode
         await self._discard(state, worker_state)
+        if returncode is None:
+            returncode = worker_state.process.returncode
+        if returncode is None:
+            returncode = -9
         return {
             "ok": False,
             "stdout": _bounded_file(stdout_path, STREAM_LIMIT_BYTES)
@@ -457,14 +496,15 @@ class PythonKernelManager:
 
     async def _terminate(self, worker_state: _Worker) -> None:
         worker_state.channel.close()
-        if worker_state.process.returncode is None:
-            try:
-                os.killpg(worker_state.pgid, 9)
-            except ProcessLookupError:
-                pass
         try:
-            await worker_state.process.wait()
+            os.killpg(worker_state.pgid, 9)
         except ProcessLookupError:
+            pass
+        try:
+            await asyncio.wait_for(
+                worker_state.process.wait(), timeout=_REAP_TIMEOUT_SECONDS
+            )
+        except (ProcessLookupError, TimeoutError):
             pass
         self._processes.pop(worker_state.process, None)
 
@@ -496,7 +536,8 @@ class PythonKernelManager:
             ):
                 async with state.lock:
                     if (
-                        state.worker is worker_state
+                        self._sessions.get(session_id) is state
+                        and state.worker is worker_state
                         and state.waiters == 0
                         and asyncio.get_running_loop().time() >= deadline
                     ):
