@@ -460,7 +460,7 @@ async def test_framing_and_generation_failures_revoke_grants(
     daemon_reader = asyncio.StreamReader()
     monkeypatch.setattr(
         "mimir.acp.proxy.ProxyRouter",
-        lambda client_writer, daemon_writer, credential: framing_router,
+        lambda client_writer, daemon_writer, credential, timeout_seconds=60: framing_router,
     )
     with pytest.raises(ProxyError, match="invalid frame"):
         await run_router(

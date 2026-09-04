@@ -31,6 +31,19 @@ class _Parser(argparse.ArgumentParser):
     def exit(self, status: int = 0, message: str | None = None) -> None:
         if message: self._print_message(message, sys.stderr if status else None)
         raise SystemExit(status)
+    def error(self, message: str) -> None:
+        if message == "argument seconds: must be an ASCII integer from 1 through 600":
+            self.exit(2, message + "\n")
+        super().error(message)
+
+
+def _timeout_seconds(value: str) -> int:
+    if not value or any(character < "0" or character > "9" for character in value):
+        raise argparse.ArgumentTypeError("must be an ASCII integer from 1 through 600")
+    parsed = int(value)
+    if not 1 <= parsed <= 600:
+        raise argparse.ArgumentTypeError("must be an ASCII integer from 1 through 600")
+    return parsed
 
 
 def _reserve_stdout() -> BinaryIO:
@@ -53,6 +66,8 @@ def _parser(output: BinaryIO) -> argparse.ArgumentParser:
     ssh.add_argument("--identity-file", required=True); ssh.add_argument("--known-hosts-file", required=True)
     profile_commands.add_parser("list")
     remove = profile_commands.add_parser("remove"); remove.add_argument("name")
+    timeout = profile_commands.add_parser("set-timeout")
+    timeout.add_argument("name"); timeout.add_argument("seconds", type=_timeout_seconds)
     credentials = commands.add_parser("credential")
     credential_commands = credentials.add_subparsers(dest="credential_command", required=True)
     for name in ("add", "replace", "remove"):
@@ -80,6 +95,12 @@ def _profile_command(args: argparse.Namespace, output: BinaryIO) -> int:
             _json(output, {"version": 1, "profiles": [profile.name for profile in store.list()]}); return 0
         if args.profile_command == "remove":
             store.delete(args.name); _status("removed"); return 0
+        if args.profile_command == "set-timeout":
+            if store.get(args.name) is None:
+                _status(f"profile '{args.name}' does not exist"); return 2
+            store.set_timeout(args.name, args.seconds)
+            _status(f"Set timeout for profile '{args.name}' to {args.seconds} seconds.")
+            return 0
         if store.get(args.name) is not None:
             return _error("profile-already-exists")
         remote = None

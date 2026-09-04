@@ -110,6 +110,7 @@ async def run_ssh_proxy(
             process.stdout,
             process.stdin,
             credential,
+            timeout_seconds=profile.timeout_seconds,
             close_on_daemon_exit=True,
         )
     )
