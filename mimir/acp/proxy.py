@@ -23,8 +23,48 @@ MAX_GENERATION_SERVER_IDS = 1024
 MAX_GENERATION_CONNECTION_IDS = 4096
 MAX_LIVE_CONNECTIONS = 1024
 
+PERMISSION_METHOD = "session/request_permission"
+PERMISSION_OPTIONS = [
+    {"optionId": "allow_once", "name": "Allow once", "kind": "allow_once"},
+    {
+        "optionId": "allow_session",
+        "name": "Allow for this session",
+        "kind": "allow_always",
+    },
+    {"optionId": "reject_once", "name": "Reject once", "kind": "reject_once"},
+]
+HANDS_PERMISSION_ARGUMENTS = {
+    "hands_edit": (
+        frozenset({"path", "old_text", "new_text"}),
+        frozenset({"path", "oldText", "newText"}),
+    ),
+    "hands_shell": (frozenset({"command"}),),
+}
+
 class ProxyError(RuntimeError):
     pass
+
+
+class PermissionGrantStore:
+    def __init__(self) -> None:
+        self._grants: set[tuple[str, str]] = set()
+
+    def add(self, session_id: str, wrapper_name: str) -> None:
+        self._grants.add((session_id, wrapper_name))
+
+    def allows(self, session_id: str, wrapper_name: str) -> bool:
+        return (session_id, wrapper_name) in self._grants
+
+    def revoke_session(self, session_id: str) -> None:
+        self._grants = {
+            grant for grant in self._grants if grant[0] != session_id
+        }
+
+    def clear(self) -> None:
+        self._grants.clear()
+
+    def __len__(self) -> int:
+        return len(self._grants)
 
 class FrameWriter:
     def __init__(self, writer: Any, credential: str, *, inject_credential: bool = True) -> None:
@@ -133,13 +173,98 @@ class _PendingSession:
     session_id: str | None
 
 
+@dataclass(frozen=True, slots=True)
+class _PendingPermission:
+    session_id: str
+    wrapper_name: str
+    generation: object
+
+
+def _permission_candidate(message: dict[str, Any]) -> tuple[str, str, bool] | None:
+    if message.get("method") != PERMISSION_METHOD:
+        return None
+    params = message.get("params")
+    if not isinstance(params, dict):
+        return None
+    tool_call = params.get("toolCall")
+    metadata = params.get("_meta")
+    if metadata is None and "_meta" not in params:
+        return None
+    if metadata is None:
+        return None
+    if not isinstance(metadata, dict):
+        raise ProxyError("invalid reserved permission metadata")
+    reserved = {
+        key for key in metadata if key == "mimir" or key.startswith("mimir.")
+    }
+    if not reserved:
+        return None
+    if not reserved.issubset({"mimir.wrapper", "mimir.tainted"}):
+        raise ProxyError("invalid reserved permission metadata")
+    wrapper_name = metadata.get("mimir.wrapper")
+    if wrapper_name not in HANDS_PERMISSION_ARGUMENTS:
+        raise ProxyError("invalid reserved permission metadata")
+    if "mimir.tainted" in metadata and metadata["mimir.tainted"] is not True:
+        raise ProxyError("invalid reserved permission metadata")
+    if set(metadata) != reserved:
+        raise ProxyError("invalid reserved permission metadata")
+    if set(params) != {"sessionId", "toolCall", "options", "_meta"}:
+        raise ProxyError("invalid reserved permission request")
+    session_id = params.get("sessionId")
+    if not isinstance(session_id, str) or not session_id or not isinstance(tool_call, dict):
+        raise ProxyError("invalid reserved permission request")
+    if params.get("options") != PERMISSION_OPTIONS:
+        raise ProxyError("invalid reserved permission request")
+    if set(tool_call) != {
+        "toolCallId", "title", "kind", "status", "rawInput",
+    }:
+        raise ProxyError("invalid reserved permission request")
+    raw_input = tool_call.get("rawInput")
+    argument_keys = frozenset(raw_input) if isinstance(raw_input, dict) else None
+    if (
+        not isinstance(tool_call.get("toolCallId"), str)
+        or not tool_call["toolCallId"]
+        or tool_call.get("title") != wrapper_name
+        or tool_call.get("kind") != "other"
+        or tool_call.get("status") != "pending"
+        or not isinstance(raw_input, dict)
+        or argument_keys not in HANDS_PERMISSION_ARGUMENTS[wrapper_name]
+        or any(not isinstance(value, str) for value in raw_input.values())
+    ):
+        raise ProxyError("invalid reserved permission request")
+    return session_id, wrapper_name, "mimir.tainted" in metadata
+
+
+def _is_allow_session_response(message: dict[str, Any]) -> bool:
+    result = message.get("result")
+    if not isinstance(result, dict) or set(result) - {"outcome", "_meta"}:
+        return False
+    if "_meta" in result and result["_meta"] is not None and not isinstance(
+        result["_meta"], dict
+    ):
+        return False
+    outcome = result.get("outcome")
+    if not isinstance(outcome, dict) or set(outcome) - {"outcome", "optionId", "_meta"}:
+        return False
+    if "_meta" in outcome and outcome["_meta"] is not None and not isinstance(
+        outcome["_meta"], dict
+    ):
+        return False
+    return outcome.get("outcome") == "selected" and outcome.get("optionId") == "allow_session"
+
+
 class ProxyRouter:
     def __init__(self, client_writer: Any, daemon_writer: Any, credential: str) -> None:
         self._client = FrameWriter(client_writer, credential, inject_credential=False)
         self._daemon = FrameWriter(daemon_writer, credential)
         self._provider = HostedHandsProvider()
+        self._generation = object()
+        self._grants = PermissionGrantStore()
+        self._active_sessions: set[str] = set()
         self._client_requests: dict[tuple[type[Any], Any], _PendingSession | None] = {}
-        self._daemon_requests: dict[tuple[type[Any], Any], None] = {}
+        self._daemon_requests: dict[
+            tuple[type[Any], Any], _PendingPermission | None
+        ] = {}
         self._local_requests: dict[tuple[type[Any], Any], asyncio.Task[None] | None] = {}
         self._local_sessions: dict[tuple[type[Any], Any], str] = {}
         self._daemon_tombstones: set[tuple[type[Any], Any]] = set()
@@ -164,8 +289,17 @@ class ProxyRouter:
                 return
             if key not in self._daemon_requests:
                 raise ProxyError("unsolicited response")
-            self._daemon_requests.pop(key)
+            pending_permission = self._daemon_requests.pop(key)
             await self._write_daemon(message, raw)
+            if (
+                pending_permission is not None
+                and pending_permission.generation is self._generation
+                and pending_permission.session_id in self._active_sessions
+                and _is_allow_session_response(message)
+            ):
+                self._grants.add(
+                    pending_permission.session_id, pending_permission.wrapper_name
+                )
             return
         if kind == "notification":
             await self._client_notification(message)
@@ -198,7 +332,31 @@ class ProxyRouter:
                 return
         if kind == "request":
             key = _request_key(message["id"])
+            candidate = _permission_candidate(message)
             self._register_daemon(key)
+            if candidate is not None:
+                session_id, wrapper_name, tainted = candidate
+                if session_id not in self._active_sessions:
+                    self._daemon_requests.pop(key, None)
+                    self._grants.revoke_session(session_id)
+                    raise ProxyError("stale reserved permission request")
+                pending_permission = _PendingPermission(
+                    session_id, wrapper_name, self._generation
+                )
+                if self._grants.allows(session_id, wrapper_name) and not tainted:
+                    self._daemon_requests.pop(key)
+                    await self._write_daemon({
+                        "jsonrpc": "2.0",
+                        "id": message["id"],
+                        "result": {
+                            "outcome": {
+                                "outcome": "selected",
+                                "optionId": "allow_once",
+                            }
+                        },
+                    })
+                    return
+                self._daemon_requests[key] = pending_permission
         await self._write_client(message, raw)
 
     async def wait_failed(self) -> BaseException:
@@ -212,6 +370,8 @@ class ProxyRouter:
         if self._closed:
             return
         self._closed = True
+        self._grants.clear()
+        self._active_sessions.clear()
         tasks = tuple(task for task in self._local_requests.values() if task is not None)
         for task in tasks:
             task.cancel()
@@ -229,7 +389,7 @@ class ProxyRouter:
 
     def _register(
         self,
-        requests: dict[tuple[type[Any], Any], _PendingSession | None],
+        requests: dict[tuple[type[Any], Any], Any],
         key: tuple[type[Any], Any],
     ) -> None:
         if key in requests or len(requests) >= MAX_OUTSTANDING_REQUESTS:
@@ -287,14 +447,14 @@ class ProxyRouter:
     async def _finish_session(
         self, pending: _PendingSession, response: dict[str, Any]
     ) -> None:
-        if pending.server_id is None:
-            return
         if "error" in response:
-            await self._retire_session(pending.server_id)
+            if pending.server_id is not None:
+                await self._retire_session(pending.server_id)
             return
         result = response.get("result")
         if not isinstance(result, dict):
-            await self._retire_session(pending.server_id)
+            if pending.server_id is not None:
+                await self._retire_session(pending.server_id)
             raise ProxyError("invalid frame")
         if pending.method == "session/new":
             session_id = result.get("sessionId")
@@ -306,12 +466,21 @@ class ProxyRouter:
             session_id = pending.session_id
             if session_id is None:
                 raise ProxyError("invalid frame")
+        self._active_sessions.add(session_id)
+        if pending.server_id is None:
+            return
         self._server_sessions[pending.server_id] = session_id
         for connection_id, owner in tuple(self._connection_sessions.items()):
             if owner == pending.server_id:
                 self._connection_sessions[connection_id] = session_id
 
     async def _retire_session(self, session_id: str) -> None:
+        self._active_sessions.discard(session_id)
+        self._grants.revoke_session(session_id)
+        for key, permission in tuple(self._daemon_requests.items()):
+            if permission is not None and permission.session_id == session_id:
+                self._daemon_requests.pop(key, None)
+                self._tombstone(key)
         self._cancel_local_requests(session_id=session_id)
         for connection_id, owner in tuple(self._connection_sessions.items()):
             if owner == session_id:
@@ -388,6 +557,8 @@ class ProxyRouter:
                 raise ProxyError("invalid frame")
             key = _request_key(message["id"])
             self._register_local(key)
+            session_id = self._connection_sessions[connection_id]
+            self._grants.revoke_session(session_id)
             try:
                 self._cancel_local_requests(connection_id=connection_id)
                 result = await self._provider.disconnect(connection_id)
@@ -516,6 +687,8 @@ class ProxyRouter:
         return result
 
     def _fail_generation(self, error: BaseException) -> None:
+        self._grants.clear()
+        self._active_sessions.clear()
         if not self._failure.done():
             self._failure.set_result(error)
 

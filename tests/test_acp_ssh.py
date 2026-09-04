@@ -286,6 +286,64 @@ sys.stdout.buffer.flush()
 
 
 @pytest.mark.asyncio
+async def test_ssh_proxy_uses_local_session_grants(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    profile, _ = remote_profile(tmp_path)
+    ssh = _fake_ssh(tmp_path, """
+import json,sys
+session=json.loads(sys.stdin.buffer.readline())
+sys.stdout.buffer.write(b'{"jsonrpc":"2.0","id":"new","result":{"sessionId":"s"}}\\n');sys.stdout.buffer.flush()
+options=[
+ {'optionId':'allow_once','name':'Allow once','kind':'allow_once'},
+ {'optionId':'allow_session','name':'Allow for this session','kind':'allow_always'},
+ {'optionId':'reject_once','name':'Reject once','kind':'reject_once'},
+]
+def permission(request_id):
+ return {'jsonrpc':'2.0','id':request_id,'method':'session/request_permission','params':{
+  'sessionId':'s','toolCall':{'toolCallId':f'call-{request_id}','title':'hands_shell','kind':'other','status':'pending','rawInput':{'command':'true'}},
+  'options':options,'_meta':{'mimir.wrapper':'hands_shell'}}}
+sys.stdout.buffer.write(json.dumps(permission(7),separators=(',',':')).encode()+b'\\n');sys.stdout.buffer.flush()
+first=json.loads(sys.stdin.buffer.readline())
+assert first['id']==7 and first['result']['outcome']['optionId']=='allow_session'
+sys.stdout.buffer.write(json.dumps(permission('eight'),separators=(',',':')).encode()+b'\\n');sys.stdout.buffer.flush()
+second=json.loads(sys.stdin.buffer.readline())
+assert second['id']=='eight' and second['result']['outcome']['optionId']=='allow_once'
+""")
+    reader = asyncio.StreamReader()
+    reader.feed_data(json.dumps({
+        "jsonrpc": "2.0", "id": "new", "method": "session/new",
+        "params": {"cwd": str(tmp_path), "mcpServers": [{"type": "acp", "name": "other", "serverId": "foreign"}]},
+    }, separators=(",", ":")).encode() + b"\n")
+    output = io.BytesIO()
+
+    class PermissionOutput(Output):
+        def write(self, data: bytes) -> None:
+            super().write(data)
+            message = json.loads(data)
+            if message.get("method") == "session/request_permission":
+                reader.feed_data(json.dumps({
+                    "jsonrpc": "2.0", "id": message["id"],
+                    "result": {"outcome": {"outcome": "selected", "optionId": "allow_session"}},
+                }, separators=(",", ":")).encode() + b"\n")
+
+    transport = type("Transport", (), {"close": lambda self: None})()
+    monkeypatch.setattr(
+        "mimir.acp.ssh.open_stdio",
+        lambda target: asyncio.sleep(0, result=(reader, PermissionOutput(target), transport)),
+    )
+    await run_ssh_proxy(
+        profile, "secret", output, _ssh_path=ssh,
+        _environment={"PATH": os.environ.get("PATH", "")},
+    )
+    permission_frames = [
+        json.loads(line) for line in output.getvalue().splitlines()
+        if json.loads(line).get("method") == "session/request_permission"
+    ]
+    assert [message["id"] for message in permission_frames] == [7]
+
+
+@pytest.mark.asyncio
 async def test_actual_subprocess_failure_is_sanitized_and_reaped(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     profile, _ = remote_profile(tmp_path)
     ssh = _fake_ssh(tmp_path, "import sys; sys.stderr.write('private-sentinel'); raise SystemExit(23)\n")
