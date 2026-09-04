@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Mapping
 
 POLICY = {
-    "mimir.acp.proxy": {"mimir.acp.profiles", "mimir.acp.credentials", "mimir.acp.transport"},
+    "mimir.acp.proxy": {"mimir.acp.profiles", "mimir.acp.credentials", "mimir.acp.transport", "mimir.acp.hosted"},
     "mimir.acp.ssh": {"mimir.acp.proxy", "mimir.acp.profiles", "mimir.acp.credentials", "mimir.acp.transport"},
     "mimir.acp.relay": {"mimir.acp.transport"},
     "mimir.acp.__main__": {"mimir.acp.bootstrap"},
@@ -28,8 +28,8 @@ ROOTS = {
     "client": {"mimir.acp.__main__", "mimir.acp.bootstrap", "mimir.acp.host", "mimir.acp.hands_contract", "mimir.acp.hosted"},
 }
 EXPECTED = {
-    "local": {"mimir.acp.proxy", "mimir.acp.profiles", "mimir.acp.credentials", "mimir.acp.transport"},
-    "remote": {"mimir.acp.ssh", "mimir.acp.proxy", "mimir.acp.profiles", "mimir.acp.credentials", "mimir.acp.transport"},
+    "local": {"mimir.acp.proxy", "mimir.acp.profiles", "mimir.acp.credentials", "mimir.acp.transport", "mimir.acp.hosted", "mimir.acp.hands_contract"},
+    "remote": {"mimir.acp.ssh", "mimir.acp.proxy", "mimir.acp.profiles", "mimir.acp.credentials", "mimir.acp.transport", "mimir.acp.hosted", "mimir.acp.hands_contract"},
     "relay": {"mimir.acp.relay", "mimir.acp.transport"},
     "client": set(POLICY),
 }

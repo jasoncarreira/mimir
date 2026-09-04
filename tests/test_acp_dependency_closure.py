@@ -67,7 +67,7 @@ def test_transitive_sink_is_detected(tmp_path: Path) -> None:
 
 
 @pytest.mark.parametrize(("member", "source"), [
-    ("mimir.acp.proxy", "import requests\nfrom . import profiles, credentials, transport\n"),
+    ("mimir.acp.proxy", "import requests\nfrom . import profiles, credentials, transport, hosted\n"),
     ("mimir.acp.relay", "from cryptography import x509\nfrom . import transport\n"),
     ("mimir.acp.credentials", "import keyring\nimport requests\n"),
 ])

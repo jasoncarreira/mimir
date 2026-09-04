@@ -11,6 +11,7 @@ from pathlib import Path
 import pytest
 
 from mimir.acp.profiles import Profile, RemoteProfile
+from mimir.acp.proxy import ProxyRouter
 from mimir.acp.ssh import SSH_PATH, SshError, build_ssh_argv, child_environment, run_ssh_proxy, stop_child
 
 
@@ -156,6 +157,65 @@ def _fake_ssh(tmp_path: Path, body: str) -> Path:
     executable.write_text(f"#!{sys.executable}\n" + body)
     executable.chmod(0o755)
     return executable
+
+
+@pytest.mark.asyncio
+async def test_hosted_shell_inherits_local_proxy_environment_without_web_key(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("ROUTER_LOCAL_VALUE", "local")
+    monkeypatch.delenv("MIMIR_WEB_KEY", raising=False)
+    client_stream = io.BytesIO()
+    daemon_stream = io.BytesIO()
+    router = ProxyRouter(Output(client_stream), Output(daemon_stream), "raw-web-key")
+
+    def sent() -> list[dict[str, object]]:
+        return [json.loads(line) for line in daemon_stream.getvalue().splitlines()]
+
+    try:
+        await router.route_client({
+            "jsonrpc": "2.0", "id": "new", "method": "session/new",
+            "params": {"cwd": str(tmp_path)},
+        })
+        server_id = sent()[-1]["params"]["mcpServers"][0]["serverId"]
+        await router.route_daemon({
+            "jsonrpc": "2.0", "id": 1, "method": "mcp/connect",
+            "params": {"serverId": server_id},
+        })
+        connection_id = sent()[-1]["result"]["connectionId"]
+        await router.route_daemon({
+            "jsonrpc": "2.0", "id": 2, "method": "mcp/message", "params": {
+                "connectionId": connection_id, "method": "initialize", "params": {
+                    "protocolVersion": "2025-03-26", "capabilities": {},
+                    "clientInfo": {"name": "client", "version": "1"},
+                },
+            },
+        })
+        await asyncio.sleep(0)
+        await router.route_daemon({
+            "jsonrpc": "2.0", "method": "mcp/message", "params": {
+                "connectionId": connection_id,
+                "method": "notifications/initialized",
+                "params": {},
+            },
+        })
+        await router.route_daemon({"jsonrpc": "2.0", "id": "new", "result": {"sessionId": "s"}})
+        await router.route_daemon({
+            "jsonrpc": "2.0", "id": 3, "method": "mcp/message", "params": {
+                "connectionId": connection_id, "method": "tools/call", "params": {
+                    "name": "shell",
+                    "arguments": {"command": "printf '%s:%s' \"$ROUTER_LOCAL_VALUE\" \"${MIMIR_WEB_KEY-unset}\""},
+                },
+            },
+        })
+        for _ in range(100):
+            await asyncio.sleep(0.01)
+            if sent()[-1].get("id") == 3:
+                break
+        assert sent()[-1]["result"]["structuredContent"]["stdout"] == "local:unset"
+        assert b"raw-web-key" not in daemon_stream.getvalue()
+    finally:
+        await router.close()
 
 
 @pytest.mark.asyncio

@@ -15,7 +15,7 @@ import yaml
 
 from mimir.acp.daemon import AcpDaemon
 from mimir.acp.profiles import Profile, ProfileStore
-from mimir.acp.proxy import MAX_FRAME_BYTES, FrameWriter, ProxyError, run_local_proxy
+from mimir.acp.proxy import MAX_FRAME_BYTES, FrameWriter, ProxyError, ProxyRouter, run_local_proxy
 from mimir.channel_registry import ChannelRegistry
 from mimir.identities import IdentityResolver, hash_web_key
 from mimir.tools.client_provider import MIMIR_HANDS_V1, PermissionDecision, PermissionEligibility, get_turn_capability_context
@@ -37,6 +37,58 @@ class Writer:
 
 def frame(value: object) -> bytes:
     return json.dumps(value, separators=(",", ":")).encode() + b"\n"
+
+
+def messages(writer: Writer) -> list[dict[str, Any]]:
+    return [json.loads(line) for line in bytes(writer.data).splitlines()]
+
+
+async def hosted_router(tmp_path: Path) -> tuple[ProxyRouter, Writer, Writer, str, str]:
+    client = Writer()
+    daemon = Writer()
+    router = ProxyRouter(client, daemon, "secret")
+    await router.route_client({
+        "jsonrpc": "2.0",
+        "id": "new",
+        "method": "session/new",
+        "params": {"cwd": str(tmp_path)},
+    })
+    server_id = messages(daemon)[-1]["params"]["mcpServers"][0]["serverId"]
+    await router.route_daemon({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "mcp/connect",
+        "params": {"serverId": server_id},
+    })
+    connection_id = messages(daemon)[-1]["result"]["connectionId"]
+    await router.route_daemon({
+        "jsonrpc": "2.0",
+        "id": 2,
+        "method": "mcp/message",
+        "params": {
+            "connectionId": connection_id,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-03-26",
+                "capabilities": {},
+                "clientInfo": {"name": "client", "version": "1"},
+            },
+        },
+    })
+    await asyncio.sleep(0)
+    await router.route_daemon({
+        "jsonrpc": "2.0",
+        "method": "mcp/message",
+        "params": {
+            "connectionId": connection_id,
+            "method": "notifications/initialized",
+            "params": {},
+        },
+    })
+    await router.route_daemon({
+        "jsonrpc": "2.0", "id": "new", "result": {"sessionId": "session"}
+    })
+    return router, client, daemon, server_id, connection_id
 
 
 @pytest.mark.asyncio
@@ -73,6 +125,151 @@ def test_malformed_frames_fail_without_echoing_bytes() -> None:
     with pytest.raises(ProxyError, match="invalid frame"):
         FrameWriter(writer, "SECRET").write(b"SENTINEL-not-json\n")
     assert bytes(writer.data) == b""
+
+
+def test_complete_frame_over_one_mebibyte_fails_closed() -> None:
+    writer = Writer()
+    transformer = FrameWriter(writer, "secret")
+    with pytest.raises(ProxyError, match="invalid frame"):
+        transformer.write(frame({"jsonrpc": "2.0", "method": "x", "params": "x" * MAX_FRAME_BYTES}))
+    assert bytes(writer.data) == b""
+
+
+@pytest.mark.asyncio
+async def test_new_and_load_inject_exactly_one_provider_when_absent_or_empty(tmp_path: Path) -> None:
+    client = Writer()
+    daemon = Writer()
+    router = ProxyRouter(client, daemon, "secret")
+    try:
+        await router.route_client({
+            "jsonrpc": "2.0", "id": 1, "method": "session/new", "params": {"cwd": str(tmp_path)}
+        })
+        await router.route_client({
+            "jsonrpc": "2.0", "id": 2, "method": "session/load",
+            "params": {"cwd": str(tmp_path), "sessionId": "old", "mcpServers": []},
+        })
+        declarations = [item["params"]["mcpServers"] for item in messages(daemon)]
+        assert all(len(value) == 1 for value in declarations)
+        assert all(value[0]["type"] == "acp" and value[0]["name"] == "mimir-hands" for value in declarations)
+    finally:
+        await router.close()
+
+
+@pytest.mark.asyncio
+async def test_explicit_hands_declaration_is_preserved_verbatim(tmp_path: Path) -> None:
+    client = Writer()
+    daemon = Writer()
+    router = ProxyRouter(client, daemon, "secret")
+    declaration = [{"serverId": "foreign", "name": "mimir-hands", "type": "acp", "extra": {"x": 1}}]
+    try:
+        await router.route_client({
+            "jsonrpc": "2.0", "id": 1, "method": "session/new",
+            "params": {"cwd": str(tmp_path), "mcpServers": declaration},
+        })
+        assert messages(daemon)[0]["params"]["mcpServers"] == declaration
+    finally:
+        await router.close()
+
+
+@pytest.mark.asyncio
+async def test_hosted_server_id_uses_random_required_format(tmp_path: Path) -> None:
+    client = Writer()
+    daemon = Writer()
+    router = ProxyRouter(client, daemon, "secret")
+    try:
+        for request_id in range(8):
+            await router.route_client({
+                "jsonrpc": "2.0", "id": request_id, "method": "session/new",
+                "params": {"cwd": str(tmp_path)},
+            })
+        server_ids = [item["params"]["mcpServers"][0]["serverId"] for item in messages(daemon)]
+        assert len(set(server_ids)) == 8
+        assert all(len(value.removeprefix("mimir-hosted:")) == 24 for value in server_ids)
+        assert all(value.removeprefix("mimir-hosted:").replace("_", "a").replace("-", "a").isalnum() for value in server_ids)
+    finally:
+        await router.close()
+
+
+@pytest.mark.asyncio
+async def test_plain_client_without_mcp_capability_can_call_hosted_hands(tmp_path: Path) -> None:
+    (tmp_path / "note").write_text("hello")
+    router, _, daemon, _, connection_id = await hosted_router(tmp_path)
+    try:
+        await router.route_daemon({
+            "jsonrpc": "2.0", "id": 3, "method": "mcp/message",
+            "params": {"connectionId": connection_id, "method": "tools/call", "params": {
+                "name": "read", "arguments": {"path": "note"},
+            }},
+        })
+        await asyncio.sleep(0.05)
+        assert messages(daemon)[-1]["result"]["structuredContent"] == {"content": "hello"}
+    finally:
+        await router.close()
+
+
+@pytest.mark.asyncio
+async def test_router_intercepts_only_ids_minted_by_current_generation(tmp_path: Path) -> None:
+    router, client, _, server_id, _ = await hosted_router(tmp_path)
+    try:
+        await router.route_daemon({
+            "jsonrpc": "2.0", "id": 8, "method": "mcp/connect",
+            "params": {"serverId": server_id + "-lookalike"},
+        })
+        assert messages(client)[-1]["params"]["serverId"] == server_id + "-lookalike"
+    finally:
+        await router.close()
+
+
+@pytest.mark.asyncio
+async def test_session_new_captures_cwd_for_hosted_operations(tmp_path: Path) -> None:
+    (tmp_path / "cwd.txt").write_text("captured")
+    router, _, daemon, _, connection_id = await hosted_router(tmp_path)
+    try:
+        await router.route_daemon({
+            "jsonrpc": "2.0", "id": 4, "method": "mcp/message",
+            "params": {"connectionId": connection_id, "method": "tools/call", "params": {
+                "name": "read", "arguments": {"path": "cwd.txt"},
+            }},
+        })
+        await asyncio.sleep(0.05)
+        assert messages(daemon)[-1]["result"]["structuredContent"]["content"] == "captured"
+    finally:
+        await router.close()
+
+
+@pytest.mark.asyncio
+async def test_duplicate_outstanding_typed_request_id_fails_closed() -> None:
+    router = ProxyRouter(Writer(), Writer(), "secret")
+    try:
+        request = {"jsonrpc": "2.0", "id": 1, "method": "foreign", "params": {}}
+        await router.route_daemon(request)
+        with pytest.raises(ProxyError, match="duplicate outstanding"):
+            await router.route_daemon(request)
+        await router.route_client({"jsonrpc": "2.0", "id": "1", "method": "other", "params": {}})
+    finally:
+        await router.close()
+
+
+@pytest.mark.asyncio
+async def test_unsolicited_non_tombstoned_response_fails_closed() -> None:
+    router = ProxyRouter(Writer(), Writer(), "secret")
+    try:
+        with pytest.raises(ProxyError, match="unsolicited response"):
+            await router.route_daemon({"jsonrpc": "2.0", "id": 1, "result": {}})
+    finally:
+        await router.close()
+
+
+@pytest.mark.asyncio
+async def test_tombstoned_late_response_is_consumed_without_id_reuse() -> None:
+    router = ProxyRouter(Writer(), Writer(), "secret")
+    try:
+        router._tombstone((int, 7))
+        await router.route_client({"jsonrpc": "2.0", "id": 7, "result": {}})
+        with pytest.raises(ProxyError, match="duplicate outstanding"):
+            await router.route_daemon({"jsonrpc": "2.0", "id": 7, "method": "foreign"})
+    finally:
+        await router.close()
 
 
 @pytest.mark.asyncio
