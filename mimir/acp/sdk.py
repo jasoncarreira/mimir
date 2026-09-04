@@ -429,6 +429,7 @@ def permission_request_params(
         or not isinstance(snapshot.title, str)
         or not isinstance(snapshot.kind, str)
         or not isinstance(snapshot.raw_input, Mapping)
+        or not isinstance(snapshot.tainted, bool)
     ):
         raise AcpProtocolError("Malformed permission lifecycle snapshot")
     result = {

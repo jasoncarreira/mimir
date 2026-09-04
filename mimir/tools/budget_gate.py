@@ -95,9 +95,11 @@ from .client_provider import (
     ClientAuthorizedHostExecution,
     PermissionDecision,
     PermissionEligibility,
+    client_authorized_host_execution_metadata,
     client_authorized_host_execution_matches,
     get_turn_capability_context,
     issue_client_authorized_host_execution,
+    validate_hands_wrapper_arguments,
 )
 from .prohibited_action_guard import check_prohibited_bash, is_bash_tool
 from .web_search_destination import web_search_url
@@ -652,6 +654,17 @@ def _strip_server_only_shell_args(request: ToolCallRequest) -> ToolCallRequest:
     for name in _SERVER_ONLY_SHELL_ARGS:
         sanitized.pop(name, None)
     return request.override(tool_call={**tool_call, "args": sanitized})
+
+
+def _hands_has_caller_reserved_arguments(
+    request: ToolCallRequest, tool_name: str,
+) -> bool:
+    arguments = (getattr(request, "tool_call", None) or {}).get("args")
+    return (
+        tool_name in {"hands_edit", "hands_shell"}
+        and isinstance(arguments, dict)
+        and bool(_SERVER_ONLY_SHELL_ARGS & arguments.keys())
+    )
 
 
 class OperatorShellPreparationOutcome(StrEnum):
@@ -1532,6 +1545,9 @@ def _validated_arguments(request: ToolCallRequest) -> dict[str, Any] | None:
     arguments = tool_call.get("args", {})
     if not isinstance(arguments, dict):
         return None
+    tool_name = _tool_name_from_request(request)
+    if tool_name in {"hands_read", "hands_edit", "hands_shell"}:
+        return validate_hands_wrapper_arguments(tool_name, arguments)
     tool = getattr(request, "tool", None)
     schema = getattr(tool, "tool_call_schema", None)
     if schema is None:
@@ -2366,6 +2382,13 @@ def _permission_eligibility(
         raise ToolException(
             f"{tool_name} permission eligibility refused: trusted host execution missing or stale"
         )
+    if (
+        host_execution is not None
+        and client_authorized_host_execution_metadata(host_execution) is None
+    ):
+        raise ToolException(
+            f"{tool_name} permission eligibility refused: live IFC state is indeterminate"
+        )
     provider = context.provider
     peer = getattr(provider, "peer", None)
     transport = getattr(peer, "transport", None) if peer is not None else None
@@ -2671,6 +2694,8 @@ class BudgetGateMiddleware(AgentMiddleware):
         send_message_refusal = _acp_send_message_refusal(request, tool_name)
         if send_message_refusal is not None:
             return send_message_refusal
+        if _hands_has_caller_reserved_arguments(request, tool_name):
+            return _malformed_arguments_refusal(request, tool_name)
         auth_context = _auth_context_from_request(request)
         request = _strip_server_only_shell_args(request)
         request = _request_with_resolved_service_write_path(
@@ -3185,6 +3210,8 @@ class BudgetGateMiddleware(AgentMiddleware):
         send_message_refusal = _acp_send_message_refusal(request, tool_name)
         if send_message_refusal is not None:
             return send_message_refusal
+        if _hands_has_caller_reserved_arguments(request, tool_name):
+            return _malformed_arguments_refusal(request, tool_name)
         auth_context = _auth_context_from_request(request)
         request = _strip_server_only_shell_args(request)
         request = _request_with_resolved_service_write_path(

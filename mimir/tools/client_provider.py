@@ -416,6 +416,38 @@ def _validate_result(result: Mapping[str, Any], wrapper_name: str) -> dict[str, 
         raise ToolException(f"{wrapper_name} returned a malformed result")
 
 
+_HANDS_WRAPPER_ARGUMENTS = MappingProxyType({
+    "hands_read": MappingProxyType({"path": "path"}),
+    "hands_edit": MappingProxyType({
+        "path": "path",
+        "old_text": "oldText",
+        "new_text": "newText",
+    }),
+    "hands_shell": MappingProxyType({"command": "command"}),
+})
+
+
+def validate_hands_wrapper_arguments(
+    wrapper_name: str, arguments: Any,
+) -> dict[str, str] | None:
+    names = _HANDS_WRAPPER_ARGUMENTS.get(wrapper_name)
+    policy = MIMIR_HANDS_V1.tool(wrapper_name)
+    if names is None or policy is None or not isinstance(arguments, dict):
+        return None
+    required = policy.input_schema.get("required")
+    properties = policy.input_schema.get("properties")
+    if (
+        set(arguments) != set(names)
+        or set(names.values()) != set(required or ())
+        or not isinstance(properties, Mapping)
+        or set(properties) != set(names.values())
+        or any(properties[provider_name].get("type") != "string" for provider_name in names.values())
+        or any(not isinstance(arguments[wrapper_name], str) for wrapper_name in names)
+    ):
+        return None
+    return dict(arguments)
+
+
 class _ReadArgs(BaseModel):
     model_config = ConfigDict(extra="forbid")
     path: str

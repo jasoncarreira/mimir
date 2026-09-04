@@ -22,7 +22,7 @@ from mimir.acp.agent import ActivePrompt, MimirAcpAgent
 from mimir.agent import _initialize_ifc_labels
 from mimir.acp.journal import JournalLease
 from mimir.acp.updates import UpdateDispatcher
-from mimir.models import InformationFlowState, TurnContext, TurnInteractivity
+from mimir.models import InformationFlowLabels, InformationFlowState, SourceLabel, TurnContext, TurnInteractivity
 from mimir.tools.registry import send_message
 from mimir.tools.client_provider import MIMIR_HANDS_V1, PermissionDecision, PermissionEligibility, get_turn_capability_context, hands_edit, hands_shell
 from mimir.channel_registry import ChannelRegistry
@@ -1568,7 +1568,9 @@ async def test_transport_teardown_is_generation_scoped_and_requires_load(tmp_pat
 
 
 async def test_active_prompt_permission_uses_admitted_snapshot_and_is_once_scoped(
-    tmp_path: Path, middleware_event_logger: None,
+    tmp_path: Path,
+    middleware_event_logger: None,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     class Publisher:
         def __init__(self) -> None:
@@ -1602,12 +1604,20 @@ async def test_active_prompt_permission_uses_admitted_snapshot_and_is_once_scope
 
     missing = await active.request_permission(PermissionEligibility("missing", "ignored", "ignored", {"path": "a"}))
     mismatch = await active.request_permission(PermissionEligibility("tool-1", "ignored", "ignored", {"path": "changed", "token": "secret"}))
+    monkeypatch.setattr(
+        agent_module, "client_authorized_host_execution_metadata", lambda _: None,
+    )
+    indeterminate = await active.request_permission(PermissionEligibility(
+        "tool-1", "hands_edit", "other", {"path": "a", "token": "secret"},
+        object(),
+    ))
     decision = await active.request_permission(PermissionEligibility("tool-1", "ignored", "ignored", {"path": "a", "token": "secret"}))
     lease.close()
     stale = await active.request_permission(PermissionEligibility("tool-1", "ignored", "ignored", {"path": "a", "token": "secret"}))
 
     assert missing is PermissionDecision.NOT_REQUESTED
     assert mismatch is PermissionDecision.NOT_REQUESTED
+    assert indeterminate is PermissionDecision.NOT_REQUESTED
     assert decision is PermissionDecision.ALLOW_ONCE
     assert stale is PermissionDecision.NOT_REQUESTED
     events = [
@@ -1617,6 +1627,7 @@ async def test_active_prompt_permission_uses_admitted_snapshot_and_is_once_scope
     assert events == [
         "acp_permission_guard_snapshot_missing",
         "acp_permission_guard_snapshot_mismatch",
+        "acp_permission_guard_host_execution_missing",
         "acp_permission_guard_prompt_not_current",
     ]
     assert peer.snapshots[0][1].title == "hands_edit"
@@ -2394,6 +2405,21 @@ async def test_admin_hands_permissions_precede_execution_and_preserve_raw_argume
             )
             for tool_id, path, old_text, new_text in next(turns):
                 arguments = {"path": path, "old_text": old_text, "new_text": new_text}
+                if tool_id == "edit-2":
+                    auth.ifc_state.merge(
+                        InformationFlowLabels().with_source(SourceLabel(
+                            principal="external",
+                            domain="client_provider",
+                            resource_id="client-file:taint",
+                            bridge_instance="acp-stdio",
+                            sensitivity="internal",
+                            authorized_principals=frozenset({"operator"}),
+                            source_kind="protected_tool",
+                            integrity="untrusted",
+                            integrity_effect="active_ingest",
+                        )),
+                        fallback=labels,
+                    )
                 messages: list[Any] = [AIMessage(content="", tool_calls=[{
                     "id": tool_id, "name": "hands_edit", "args": arguments,
                 }])]
@@ -2431,13 +2457,16 @@ async def test_admin_hands_permissions_precede_execution_and_preserve_raw_argume
 
         monkeypatch.setattr(core, "run_turn", integrated_turn)
 
-        def permission_request(outer_id: int, tool_id: str, path: str, old: str, new: str) -> dict[str, Any]:
+        def permission_request(outer_id: int, tool_id: str, path: str, old: str, new: str, *, tainted: bool = False) -> dict[str, Any]:
+            metadata: dict[str, Any] = {"mimir.wrapper": "hands_edit"}
+            if tainted:
+                metadata["mimir.tainted"] = True
             return {
                 "jsonrpc": "2.0", "id": outer_id,
                 "method": "session/request_permission",
                     "params": {
                         "sessionId": session_id,
-                        "_meta": {"mimir.wrapper": "hands_edit"},
+                    "_meta": metadata,
                         "toolCall": {
                         "toolCallId": tool_id, "title": "hands_edit", "kind": "other",
                         "status": "pending", "rawInput": {
@@ -2493,7 +2522,7 @@ async def test_admin_hands_permissions_precede_execution_and_preserve_raw_argume
         )
         await transport.incoming.put({
             "jsonrpc": "2.0", "id": 3,
-            "result": {"outcome": {"outcome": "selected", "optionId": "allow_once"}},
+            "result": {"outcome": {"outcome": "selected", "optionId": "allow_session"}},
         })
         provider_frame = await next_outgoing()
         progress_token = provider_frame["params"]["params"]["_meta"]["progressToken"]
@@ -2546,6 +2575,11 @@ async def test_admin_hands_permissions_precede_execution_and_preserve_raw_argume
             "status": "completed", "rawOutput": '{"changed": true}',
         }
         assert (await asyncio.wait_for(prompting, 3)).stop_reason == "end_turn"
+        state = agent._sessions[session_id]
+        assert not hasattr(agent, "_permission_grants")
+        assert not hasattr(state, "permission_grants")
+        assert not hasattr(state.record, "permission_grants")
+        assert not hasattr(state.profile_policy, "permission_grants")
 
         prompting_2 = asyncio.create_task(
             agent.prompt(session_id, [sdk.TextContentBlock(type="text", text="edit again")])
@@ -2569,7 +2603,7 @@ async def test_admin_hands_permissions_precede_execution_and_preserve_raw_argume
             "rawInput": {"path": "notes-2.txt", "old_text": "old-2", "new_text": "new-2"},
         }
         assert await next_outgoing() == permission_request(
-            5, "edit-2", "notes-2.txt", "old-2", "new-2"
+            5, "edit-2", "notes-2.txt", "old-2", "new-2", tainted=True,
         )
         await transport.incoming.put({
             "jsonrpc": "2.0", "id": 5,
@@ -2693,28 +2727,11 @@ async def test_admin_hands_permissions_precede_execution_and_preserve_raw_argume
         await asyncio.gather(*owned_tasks, return_exceptions=True)
 
 
-def test_daemon_emits_permission_for_every_call_and_stores_no_grant() -> None:
-    first = sdk.PermissionCompletion("allow_session")
-    second = sdk.PermissionCompletion("allow_session")
-
-    assert first.executable is True
-    assert second.executable is True
-    assert not hasattr(first, "grant")
-    assert not hasattr(second, "grant")
+test_daemon_emits_permission_for_every_call_and_stores_no_grant = (
+    test_admin_hands_permissions_precede_execution_and_preserve_raw_arguments
+)
 
 
-def test_permission_metadata_uses_live_ifc_taint() -> None:
-    untainted = sdk.permission_request_params(
-        "session",
-        sdk.PermissionSnapshot("one", "hands_edit", "other", {}, "hands_edit"),
-    )
-    tainted = sdk.permission_request_params(
-        "session",
-        sdk.PermissionSnapshot("two", "hands_shell", "other", {}, "hands_shell", True),
-    )
-
-    assert untainted["_meta"] == {"mimir.wrapper": "hands_edit"}
-    assert tainted["_meta"] == {
-        "mimir.wrapper": "hands_shell",
-        "mimir.tainted": True,
-    }
+test_permission_metadata_uses_live_ifc_taint = (
+    test_admin_hands_permissions_precede_execution_and_preserve_raw_arguments
+)
