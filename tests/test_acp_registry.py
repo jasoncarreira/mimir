@@ -29,6 +29,7 @@ PROFILE_COMMANDS = [
     "mimir acp profile add-ssh PROFILE --home /absolute/server/mimir-home \\",
     "  --ssh-host host.example --ssh-user mimir --ssh-port 22 \\",
     "  --identity-file /absolute/id_ed25519 --known-hosts-file /absolute/known_hosts",
+    "mimir acp profile set-timeout PROFILE 60",
     "mimir acp profile list",
     "mimir acp profile remove PROFILE",
     "mimir acp credential add PROFILE",
@@ -260,20 +261,25 @@ def test_connection_session_replay_and_cancellation() -> None:
 def test_hands_and_filesystem_contract() -> None:
     text = section("## Providers, permissions, and filesystems", "## Troubleshooting")
     for value in [
-        "providerless by default",
-        "one MCP-over-ACP declaration named `mimir-hands`",
-        "profile `mimir.hands.v1`",
-        "`read`, `edit`, and `shell`",
+        "`mcpServers` is missing or empty",
+        "locally hosted MCP-over-ACP provider named `mimir-hands`",
+        "`mimir.hands.v1` profile",
+        "`read`, `edit`, `shell`, and `python`",
         "session new, session load, and provider-list change",
-        "one-shot `allow_once` or `reject_once`",
-        "Arbitrary or multiple providers are rejected",
-        "integrated MCP server is not Mimir Hands",
+        "`allow_session` creates only an in-memory proxy grant",
+        "tainted call always prompts again",
+        "revoked on load, disconnect, generation replacement, or proxy exit",
         "Native Mimir tools operate on the daemon host",
-        "Mimir Hands operates on the client host",
+        "Mimir Hands operates with the local client's user authority",
         "opaque `client-file:` resources",
         "`cwd` is context, not filesystem confinement or a path sandbox",
         "`fs` and `terminal` capabilities but never calls them",
         "`additionalDirectories`",
+        "does not provide containment",
+        "one lazy subprocess and in-memory namespace per ACP session",
+        "Session load restores the daemon transcript but retires the old worker first",
+        "1,800 seconds of idle time",
+        "killed and reaped during cleanup",
     ]:
         assert value in text
 

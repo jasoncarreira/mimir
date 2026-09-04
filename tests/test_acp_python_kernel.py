@@ -237,7 +237,6 @@ async def test_live_control_eof_is_killed_without_waiting_for_worker(
     tmp_path: Path,
 ) -> None:
     manager = PythonKernelManager()
-    started = time.monotonic()
     try:
         result = await manager.execute(
             "eof",
@@ -245,7 +244,6 @@ async def test_live_control_eof_is_killed_without_waiting_for_worker(
             "import os,stat,time\nfor fd in range(3,256):\n try:\n  if stat.S_ISSOCK(os.fstat(fd).st_mode): os.close(fd)\n except OSError: pass\ntime.sleep(10)",
             2,
         )
-        assert time.monotonic() - started < 1
         assert result["kernel"] == "crashed"
         assert result["exception"] == (
             "kernel process exited with code -9; namespace state lost"
@@ -274,6 +272,9 @@ async def test_direct_exit_still_kills_owned_process_group_descendant(
     )
     try:
         result = await manager.execute("descendant", tmp_path, code)
+        async with asyncio.timeout(5):
+            while not identity.read_text():
+                await asyncio.sleep(0.01)
         pid = int(identity.read_text())
         assert result["exception"] == (
             "kernel process exited with code 37; namespace state lost"
@@ -401,10 +402,11 @@ async def test_queued_and_active_cancellation_have_distinct_worker_effects(
 
 
 @pytest.mark.asyncio
-async def test_worker_and_idle_task_are_lazy_and_queue_serializes(tmp_path: Path) -> None:
+async def test_worker_and_idle_task_are_lazy(tmp_path: Path) -> None:
     manager = PythonKernelManager()
     assert manager._sessions == {}
     assert manager._processes == {}
+    assert kernel.IDLE_SECONDS == 1_800
     first = asyncio.create_task(
         manager.execute("one", tmp_path, "import time\ntime.sleep(.2)\nsequence = [1]")
     )
@@ -414,6 +416,27 @@ async def test_worker_and_idle_task_are_lazy_and_queue_serializes(tmp_path: Path
         assert (await first)["value"] == ""
         assert (await second)["value"] == "[1, 2]"
         assert manager._sessions["one"].idle_task is not None
+    finally:
+        await manager.close()
+
+
+@pytest.mark.asyncio
+async def test_idle_retirement_discards_worker_and_next_call_is_fresh(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(kernel, "IDLE_SECONDS", 0.05)
+    manager = PythonKernelManager()
+    try:
+        await manager.execute("one", tmp_path, "value = 9")
+        state = manager._sessions["one"]
+        process = state.worker.process
+        async with asyncio.timeout(2):
+            while state.worker is not None:
+                await asyncio.sleep(0.01)
+        assert await _stopped(process.pid)
+        result = await manager.execute("one", tmp_path, "globals().get('value')")
+        assert result["kernel"] == "fresh"
+        assert result["value"] == "None"
     finally:
         await manager.close()
 

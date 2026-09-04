@@ -132,6 +132,7 @@ class HostedHandsProvider:
         if connection is None:
             raise HostedMcpError(-32602, "Unknown MCP connection")
         await self._cancel_calls(connection)
+        await self._python_kernels.retire(connection.session.session_id)
         return {}
 
     async def cancel_session(self, session_id: str) -> None:
@@ -172,6 +173,25 @@ class HostedHandsProvider:
             )
         )
         await self._python_kernels.close()
+
+    def terminate_owned_children(self) -> None:
+        processes = tuple(self._processes.items())
+        self.kill_owned_process_groups()
+        for process, _ in processes:
+            try:
+                os.waitpid(process.pid, 0)
+            except (ChildProcessError, ProcessLookupError):
+                pass
+            self._processes.pop(process, None)
+        self._python_kernels.terminate_owned_children()
+
+    def kill_owned_process_groups(self) -> None:
+        for _, pgid in tuple(self._processes.items()):
+            try:
+                os.killpg(pgid, 9)
+            except ProcessLookupError:
+                pass
+        self._python_kernels.kill_owned_process_groups()
 
     async def request(
         self,

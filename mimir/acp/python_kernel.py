@@ -324,6 +324,24 @@ class PythonKernelManager:
             await asyncio.to_thread(shutil.rmtree, self._directory, True)
             self._directory = None
 
+    def terminate_owned_children(self) -> None:
+        processes = tuple(self._processes.items())
+        self.kill_owned_process_groups()
+        for process, _ in processes:
+            try:
+                os.waitpid(process.pid, 0)
+            except (ChildProcessError, ProcessLookupError):
+                pass
+            self._processes.pop(process, None)
+
+    def kill_owned_process_groups(self) -> None:
+        processes = tuple(self._processes.items())
+        for process, pgid in processes:
+            try:
+                os.killpg(pgid, 9)
+            except ProcessLookupError:
+                pass
+
     async def _spawn(self, cwd: str | os.PathLike[str], deadline: float) -> _Worker:
         parent, child = socket.socketpair()
         parent.setblocking(False)

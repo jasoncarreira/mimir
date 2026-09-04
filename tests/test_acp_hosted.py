@@ -41,6 +41,38 @@ async def _connected(tmp_path: Path) -> tuple[HostedHandsProvider, str]:
 
 
 @pytest.mark.asyncio
+async def test_shell_and_python_cleanup_kill_owned_process_groups(
+    tmp_path: Path,
+) -> None:
+    provider, connection = await _connected(tmp_path)
+    await provider.request(
+        connection,
+        "tools/call",
+        {"name": "python", "arguments": {"code": "value = 1"}},
+        request_id="python",
+    )
+    python_process = next(iter(provider._python_kernels._processes))
+    shell_call = asyncio.create_task(
+        provider.request(
+            connection,
+            "tools/call",
+            {"name": "shell", "arguments": {"command": "sleep 30"}},
+            request_id="shell",
+        )
+    )
+    async with asyncio.timeout(2):
+        while not provider._processes:
+            await asyncio.sleep(0.01)
+    shell_process = next(iter(provider._processes))
+    await provider.close()
+    await asyncio.gather(shell_call, return_exceptions=True)
+    assert shell_process.returncode is not None
+    assert python_process.returncode is not None
+    assert provider._processes == {}
+    assert provider._python_kernels._processes == {}
+
+
+@pytest.mark.asyncio
 async def test_hosted_provider_serves_connection_initialize_list_call_and_disconnect(
     tmp_path: Path,
 ) -> None:

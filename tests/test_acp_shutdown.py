@@ -2,13 +2,14 @@ from __future__ import annotations
 
 import asyncio
 import io
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
 from mimir.acp.agent import ConnectionState, MimirAcpAgent
 from mimir.acp.host import _FrameDelivery, close_protocol_writer
-from mimir.acp.proxy import _OutputWriter
+from mimir.acp.proxy import ProxyRouter, _OutputWriter
 from mimir.acp.transport import close_writer, pump_stream
 
 
@@ -230,3 +231,32 @@ async def test_candidate_connection_does_not_retire_active_generation() -> None:
     assert generation == 2
     assert agent._connection is old
     assert not retired.is_set()
+
+
+@pytest.mark.asyncio
+async def test_proxy_generation_teardown_retires_hosted_ids_grants_calls_and_workers(
+    tmp_path: Path,
+) -> None:
+    class Writer:
+        def write(self, data: bytes) -> None:
+            del data
+
+        async def drain(self) -> None:
+            return None
+
+    router = ProxyRouter(Writer(), Writer(), "secret")
+    router._active_sessions.add("session")
+    router._grants.add("session", "hands_python")
+    router._server_sessions["server"] = "session"
+    router._connection_sessions["connection"] = "session"
+    router._provider.bind_session("session", tmp_path)
+    await router._provider._python_kernels.execute("session", tmp_path, "value = 1")
+    router._fail_generation(ConnectionError("generation retired"))
+    assert router._active_sessions == set()
+    assert len(router._grants) == 0
+    assert router._server_sessions == {}
+    assert router._connection_sessions == {}
+    await router.close()
+    assert router._local_requests == {}
+    assert router._daemon_requests == {}
+    assert router._provider._python_kernels._processes == {}
