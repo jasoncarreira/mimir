@@ -27,6 +27,7 @@ mimir acp profile add-local PROFILE --home /absolute/server/mimir-home
 mimir acp profile add-ssh PROFILE --home /absolute/server/mimir-home \
   --ssh-host host.example --ssh-user mimir --ssh-port 22 \
   --identity-file /absolute/id_ed25519 --known-hosts-file /absolute/known_hosts
+mimir acp profile set-timeout PROFILE 60
 mimir acp profile list
 mimir acp profile remove PROFILE
 mimir acp credential add PROFILE
@@ -36,7 +37,7 @@ mimir acp credential list
 mimir acp --profile PROFILE
 ```
 
-Profiles contain only non-secret target, home, socket, and SSH identity data. They are stored in `${XDG_CONFIG_HOME:-~/.config}/mimir/acp/profiles.json`. `MIMIR_ACP_PROFILE` may select a non-secret profile name only; it must never contain a key.
+Profiles contain only non-secret target, home, socket, SSH identity, and execution-timeout data. The timeout is an integer from 1 through 600 seconds and defaults to 60. It applies to locally hosted shell and Python execution in both local and SSH modes. They are stored in `${XDG_CONFIG_HOME:-~/.config}/mimir/acp/profiles.json`. `MIMIR_ACP_PROFILE` may select a non-secret profile name only; it must never contain a key.
 
 On the server, issue the existing named admin web credential:
 
@@ -161,9 +162,11 @@ Transport death cancels and quarantines only that ACP generation. The daemon, we
 
 ## Providers, permissions, and filesystems
 
-Sessions are providerless by default. The sole optional client-hosted provider is one MCP-over-ACP declaration named `mimir-hands` with profile `mimir.hands.v1` and exactly the `read`, `edit`, and `shell` tools. It is validated afresh on session new, session load, and provider-list change. Permission decisions are one-shot `allow_once` or `reject_once`. Arbitrary or multiple providers are rejected; an IDE's integrated MCP server is not Mimir Hands.
+When `mcpServers` is missing or empty, the local proxy injects one locally hosted MCP-over-ACP provider named `mimir-hands`. An explicit nonempty provider collection is preserved. The `mimir.hands.v1` profile contains exactly `read`, `edit`, `shell`, and `python`; it is validated afresh on session new, session load, and provider-list change. Read is prompt-free. Edit, shell, and Python require exact-call operator permission immediately before execution. `allow_session` creates only an in-memory proxy grant for that session and tool, and a tainted call always prompts again. Grants never create daemon authority and are revoked on load, disconnect, generation replacement, or proxy exit.
 
-Native Mimir tools operate on the daemon host. Mimir Hands operates on the client host and returns opaque `client-file:` resources. Its `cwd` is context, not filesystem confinement or a path sandbox. Mimir tolerates advertised ACP client `fs` and `terminal` capabilities but never calls them. `additionalDirectories` and arbitrary provider profiles are rejected.
+Native Mimir tools operate on the daemon host. Mimir Hands operates with the local client's user authority and returns opaque `client-file:` resources. Its `cwd` is context, not filesystem confinement or a path sandbox. Consent authorizes execution; it does not provide containment, declassify results, or remove their originating-channel taint. Mimir tolerates advertised ACP client `fs` and `terminal` capabilities but never calls them. `additionalDirectories` and arbitrary provider profiles are rejected.
+
+Python keeps one lazy subprocess and in-memory namespace per ACP session. Session load restores the daemon transcript but retires the old worker first, so Python state is never stored in a session or journal and the next call is fresh. Workers retire on load, hosted disconnect, cancellation, daemon-generation replacement, proxy exit, `SIGTERM`, `SIGINT`, `SIGHUP`, or 1,800 seconds of idle time. Shells and Python workers run in owned process groups that are killed and reaped during cleanup. Variables, functions, imports, and loaded data persist only while that worker remains live.
 
 ## Troubleshooting
 

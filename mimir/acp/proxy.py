@@ -1,12 +1,15 @@
 from __future__ import annotations
 
+import atexit
 import asyncio
 import io
 import json
 import os
 import secrets
+import signal
 import stat
 import sys
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, BinaryIO
@@ -326,7 +329,9 @@ class ProxyRouter:
         self._client_lock = asyncio.Lock()
         self._daemon_lock = asyncio.Lock()
         self._failure: asyncio.Future[BaseException] = asyncio.get_running_loop().create_future()
+        self._generation_cleanup_task: asyncio.Task[None] | None = None
         self._closed = False
+        self._generation_failed = False
 
     async def route_client(self, message: dict[str, Any], raw: bytes | None = None) -> None:
         self._require_open()
@@ -417,11 +422,16 @@ class ProxyRouter:
         return await self._failure
 
     def _require_open(self) -> None:
-        if self._closed:
+        if self._closed or self._generation_failed:
             raise ProxyError("proxy generation is closed")
 
     async def close(self) -> None:
         if self._closed:
+            if (
+                self._generation_cleanup_task is not None
+                and self._generation_cleanup_task is not asyncio.current_task()
+            ):
+                await asyncio.shield(self._generation_cleanup_task)
             return
         self._closed = True
         self._grants.clear()
@@ -433,13 +443,20 @@ class ProxyRouter:
         self._local_requests.clear()
         self._local_sessions.clear()
         self._local_connections.clear()
-        await self._provider.close()
+        if self._generation_cleanup_task is None:
+            await self._provider.close()
+        elif self._generation_cleanup_task is not asyncio.current_task():
+            await asyncio.shield(self._generation_cleanup_task)
         self._client_requests.clear()
         self._daemon_requests.clear()
         self._server_sessions.clear()
         self._server_provider_sessions.clear()
         self._connection_sessions.clear()
         self._connection_provider_sessions.clear()
+
+    def terminate_owned_children(self) -> None:
+        self._grants.clear()
+        self._provider.terminate_owned_children()
 
     def _register(
         self,
@@ -614,7 +631,7 @@ class ProxyRouter:
             session_id = self._connection_sessions[connection_id]
             self._grants.revoke_session(session_id)
             try:
-                self._cancel_local_requests(connection_id=connection_id)
+                self._cancel_local_requests(session_id=session_id)
                 result = await self._provider.disconnect(connection_id)
                 self._connection_sessions.pop(connection_id, None)
                 self._connection_provider_sessions.pop(connection_id, None)
@@ -695,7 +712,7 @@ class ProxyRouter:
         self._local_requests.pop(key, None)
         self._local_sessions.pop(key, None)
         self._local_connections.pop(key, None)
-        if key not in self._daemon_tombstones:
+        if not self._generation_failed and key not in self._daemon_tombstones:
             await self._write_daemon({"jsonrpc": "2.0", "id": key[1], "result": result})
 
     async def _fail_local(
@@ -704,7 +721,7 @@ class ProxyRouter:
         self._local_requests.pop(key, None)
         self._local_sessions.pop(key, None)
         self._local_connections.pop(key, None)
-        if key not in self._daemon_tombstones:
+        if not self._generation_failed and key not in self._daemon_tombstones:
             await self._write_daemon({"jsonrpc": "2.0", "id": key[1], "error": error.as_error()})
 
     def _tombstone(self, key: tuple[type[Any], Any]) -> None:
@@ -741,8 +758,34 @@ class ProxyRouter:
         return result
 
     def _fail_generation(self, error: BaseException) -> None:
+        if self._failure.done() or self._generation_cleanup_task is not None:
+            return
+        self._generation_failed = True
         self._grants.clear()
         self._active_sessions.clear()
+        for task in tuple(self._local_requests.values()):
+            if task is not None:
+                task.cancel()
+        self._local_requests.clear()
+        self._local_sessions.clear()
+        self._local_connections.clear()
+        self._client_requests.clear()
+        self._daemon_requests.clear()
+        self._server_sessions.clear()
+        self._server_provider_sessions.clear()
+        self._connection_sessions.clear()
+        self._connection_provider_sessions.clear()
+        self._generation_cleanup_task = asyncio.create_task(
+            self._complete_generation_failure(error)
+        )
+
+    async def _complete_generation_failure(self, error: BaseException) -> None:
+        try:
+            await self._provider.close()
+        except BaseException as cleanup_error:
+            if not self._failure.done():
+                self._failure.set_result(cleanup_error)
+            return
         if not self._failure.done():
             self._failure.set_result(error)
 
@@ -807,6 +850,41 @@ async def _raise_completed(
             raise result
 
 
+class _ShutdownHooks:
+    def __init__(self, router: ProxyRouter) -> None:
+        self._router = router
+        self._signals: dict[int, Any] = {}
+        self._handler = self._handle_signal
+        self._installed = False
+
+    def install(self) -> None:
+        atexit.register(self._cleanup)
+        if threading.current_thread() is threading.main_thread():
+            for signum in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+                self._signals[signum] = signal.getsignal(signum)
+                signal.signal(signum, self._handler)
+        self._installed = True
+
+    def close(self) -> None:
+        if not self._installed:
+            return
+        self._installed = False
+        atexit.unregister(self._cleanup)
+        if threading.current_thread() is threading.main_thread():
+            for signum, previous in self._signals.items():
+                if signal.getsignal(signum) is self._handler:
+                    signal.signal(signum, previous)
+        self._signals.clear()
+
+    def _cleanup(self) -> None:
+        self._router.terminate_owned_children()
+
+    def _handle_signal(self, signum: int, frame: Any) -> None:
+        del frame
+        self._cleanup()
+        raise SystemExit(128 + signum)
+
+
 async def run_router(
     client_reader: Any,
     client_writer: Any,
@@ -818,6 +896,8 @@ async def run_router(
     close_on_daemon_exit: bool = False,
 ) -> None:
     router = ProxyRouter(client_writer, daemon_writer, credential, timeout_seconds)
+    hooks = _ShutdownHooks(router)
+    hooks.install()
     client_task = asyncio.create_task(_route_stream(client_reader, router.route_client))
     daemon_task = asyncio.create_task(_route_stream(daemon_reader, router.route_daemon))
     failure_task = asyncio.create_task(router.wait_failed())
@@ -843,7 +923,10 @@ async def run_router(
         await asyncio.gather(*tasks, return_exceptions=True)
         raise
     finally:
-        await router.close()
+        try:
+            await router.close()
+        finally:
+            hooks.close()
         closing = asyncio.gather(
             close_writer(client_writer), close_writer(daemon_writer), return_exceptions=True
         )

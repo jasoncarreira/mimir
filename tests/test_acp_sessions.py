@@ -151,6 +151,31 @@ def test_daemon_session_state_contains_no_kernel_namespace() -> None:
     assert names.isdisjoint({"kernel", "namespace", "worker", "python_kernel"})
 
 
+async def test_session_load_restores_transcript_without_kernel_state(
+    tmp_path: Path,
+) -> None:
+    agent, client, _ = await _ready(tmp_path)
+    session_id = (await agent.new_session("/workspace")).session_id
+    await agent.prompt(session_id, [sdk.TextContentBlock(type="text", text="hello")])
+    original = [
+        update.model_dump(mode="json", by_alias=True, exclude_none=True)
+        for update in client.updates
+    ]
+    client.updates.clear()
+    await agent.load_session("/replacement", session_id)
+    replayed = [
+        update.model_dump(mode="json", by_alias=True, exclude_none=True)
+        for update in client.updates
+    ]
+    assert replayed == original
+    assert {item.name for item in dataclasses.fields(SessionState)}.isdisjoint(
+        {"kernel", "namespace", "worker", "python_kernel"}
+    )
+    persisted = "".join(path.read_text() for path in agent._store.root.iterdir())
+    assert "python_kernel" not in persisted
+    assert "namespace" not in persisted
+
+
 async def test_new_prompt_runs_bound_core_and_preserves_update_order(tmp_path: Path) -> None:
     agent, client, core = await _ready(tmp_path)
     created = await agent.new_session("/workspace")

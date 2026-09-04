@@ -4,6 +4,7 @@ import asyncio
 import io
 import json
 import os
+import signal
 import sys
 import tempfile
 from pathlib import Path
@@ -90,6 +91,73 @@ async def hosted_router(tmp_path: Path) -> tuple[ProxyRouter, Writer, Writer, st
         "jsonrpc": "2.0", "id": "new", "result": {"sessionId": "session"}
     })
     return router, client, daemon, server_id, connection_id
+
+
+async def call_hosted_python(
+    router: ProxyRouter,
+    daemon: Writer,
+    connection_id: str,
+    request_id: str | int,
+    code: str,
+) -> dict[str, Any]:
+    await router.route_daemon({
+        "jsonrpc": "2.0",
+        "id": request_id,
+        "method": "mcp/message",
+        "params": {
+            "connectionId": connection_id,
+            "method": "tools/call",
+            "params": {"name": "python", "arguments": {"code": code}},
+        },
+    })
+    async with asyncio.timeout(5):
+        while True:
+            for message in messages(daemon):
+                if message.get("id") == request_id and "result" in message:
+                    return message["result"]["structuredContent"]
+            await asyncio.sleep(0.01)
+
+
+async def connect_hosted(
+    router: ProxyRouter, daemon: Writer, server_id: str, request_id: int
+) -> str:
+    await router.route_daemon({
+        "jsonrpc": "2.0", "id": request_id, "method": "mcp/connect",
+        "params": {"serverId": server_id},
+    })
+    connection_id = messages(daemon)[-1]["result"]["connectionId"]
+    await router.route_daemon({
+        "jsonrpc": "2.0", "id": request_id + 1, "method": "mcp/message",
+        "params": {
+            "connectionId": connection_id,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-03-26",
+                "capabilities": {},
+                "clientInfo": {"name": "client", "version": "1"},
+            },
+        },
+    })
+    await asyncio.sleep(0)
+    await router.route_daemon({
+        "jsonrpc": "2.0", "method": "mcp/message",
+        "params": {
+            "connectionId": connection_id,
+            "method": "notifications/initialized",
+            "params": {},
+        },
+    })
+    return connection_id
+
+
+async def owned_process_reaped(pid: int) -> bool:
+    async with asyncio.timeout(5):
+        while True:
+            try:
+                (Path("/proc") / str(pid) / "stat").read_text()
+            except FileNotFoundError:
+                return True
+            await asyncio.sleep(0.01)
 
 
 def permission_request(
@@ -771,6 +839,185 @@ async def test_load_always_retires_hosted_state_and_failed_provisional_state(tmp
         assert messages(client)[-1]["error"]["message"] == "failed"
     finally:
         await router.close()
+
+
+@pytest.mark.asyncio
+async def test_load_reaps_kernel_before_response_and_next_python_is_fresh(
+    tmp_path: Path,
+) -> None:
+    router, _, daemon, _, connection_id = await hosted_router(tmp_path)
+    try:
+        first = await call_hosted_python(router, daemon, connection_id, 100, "value = 41")
+        assert first["kernel"] == "fresh"
+        worker = next(iter(router._provider._python_kernels._processes))
+        await router.route_client({
+            "jsonrpc": "2.0", "id": "load-python", "method": "session/load",
+            "params": {"cwd": str(tmp_path), "sessionId": "session", "mcpServers": []},
+        })
+        assert worker.returncode is not None
+        assert router._provider._python_kernels._processes == {}
+        load_request = messages(daemon)[-1]
+        server_id = load_request["params"]["mcpServers"][0]["serverId"]
+        await router.route_daemon({
+            "jsonrpc": "2.0", "id": "load-python", "result": {}
+        })
+        replacement = await connect_hosted(router, daemon, server_id, 101)
+        result = await call_hosted_python(
+            router, daemon, replacement, 103, "globals().get('value')"
+        )
+        assert result["kernel"] == "fresh"
+        assert result["value"] == "None"
+    finally:
+        await router.close()
+
+
+@pytest.mark.asyncio
+async def test_kernel_retires_at_each_required_lifecycle_boundary(
+    tmp_path: Path,
+) -> None:
+    router, _, daemon, server_id, connection_id = await hosted_router(tmp_path)
+    try:
+        await call_hosted_python(router, daemon, connection_id, 110, "value = 1")
+        second_connection = await connect_hosted(router, daemon, server_id, 111)
+        await router.route_daemon({
+            "jsonrpc": "2.0", "id": 113, "method": "mcp/message",
+            "params": {
+                "connectionId": second_connection,
+                "method": "tools/call",
+                "params": {
+                    "name": "python",
+                    "arguments": {
+                        "code": "import pathlib,time\npathlib.Path('disconnect-entered').write_text('yes')\ntime.sleep(30)"
+                    },
+                },
+            },
+        })
+        async with asyncio.timeout(5):
+            while not (tmp_path / "disconnect-entered").exists():
+                await asyncio.sleep(0.01)
+        worker = next(iter(router._provider._python_kernels._processes))
+        await router.route_daemon({
+            "jsonrpc": "2.0", "id": 119, "method": "mcp/message",
+            "params": {
+                "connectionId": connection_id,
+                "method": "tools/call",
+                "params": {
+                    "name": "python",
+                    "arguments": {
+                        "code": "import pathlib\npathlib.Path('queued-ran').write_text('bad')"
+                    },
+                },
+            },
+        })
+        await asyncio.sleep(0)
+        await asyncio.wait_for(router.route_daemon({
+            "jsonrpc": "2.0", "id": 120, "method": "mcp/disconnect",
+            "params": {"connectionId": connection_id},
+        }), 2)
+        assert router._provider._python_kernels._processes == {}
+        assert await owned_process_reaped(worker.pid)
+        assert not any(
+            item.get("id") in {113, 119} and ("result" in item or "error" in item)
+            for item in messages(daemon)
+        )
+        assert not (tmp_path / "queued-ran").exists()
+        fresh_after_disconnect = await call_hosted_python(
+            router, daemon, second_connection, 114, "globals().get('value')"
+        )
+        assert fresh_after_disconnect["kernel"] == "fresh"
+        assert fresh_after_disconnect["value"] == "None"
+
+        await router.route_daemon({
+            "jsonrpc": "2.0", "id": 115, "method": "mcp/message",
+            "params": {
+                "connectionId": second_connection,
+                "method": "tools/call",
+                "params": {
+                    "name": "python",
+                    "arguments": {
+                        "code": "import pathlib,time\npathlib.Path('cancel-entered').write_text('yes')\ntime.sleep(30)"
+                    },
+                },
+            },
+        })
+        async with asyncio.timeout(5):
+            while not (tmp_path / "cancel-entered").exists():
+                await asyncio.sleep(0.01)
+        await router.route_daemon({
+            "jsonrpc": "2.0", "method": "mcp/message",
+            "params": {
+                "connectionId": second_connection,
+                "method": "notifications/cancelled",
+                "params": {"requestId": 115},
+            },
+        })
+        async with asyncio.timeout(5):
+            while router._provider._python_kernels._processes:
+                await asyncio.sleep(0.01)
+        fresh = await call_hosted_python(router, daemon, second_connection, 116, "1")
+        assert fresh["kernel"] == "fresh"
+        await router.route_client({
+            "jsonrpc": "2.0", "method": "session/cancel",
+            "params": {"sessionId": "session"},
+        })
+        assert router._provider._python_kernels._processes == {}
+    finally:
+        await router.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "shutdown_signal",
+    [None, signal.SIGTERM, signal.SIGINT, signal.SIGHUP],
+    ids=["atexit", "sigterm", "sigint", "sighup"],
+)
+async def test_owned_child_cleans_on_atexit_and_each_supported_signal(
+    shutdown_signal: signal.Signals | None,
+) -> None:
+    source = """
+import asyncio, json, os, sys
+from mimir.acp.proxy import ProxyRouter, _ShutdownHooks
+class Writer:
+ def write(self, data): pass
+ async def drain(self): pass
+async def setup():
+ router=ProxyRouter(Writer(),Writer(),'secret')
+ router._provider.bind_session('session',os.getcwd())
+ await router._provider._python_kernels.execute('session',os.getcwd(),'value=1')
+ worker=next(iter(router._provider._python_kernels._processes))
+ hooks=_ShutdownHooks(router);hooks.install()
+ session=router._provider._sessions['session']
+ shell=asyncio.create_task(router._provider._shell(session,'sleep 30'))
+ while not router._provider._processes: await asyncio.sleep(0)
+ shell_process=next(iter(router._provider._processes))
+ pids=[worker.pid,shell_process.pid]
+ print(json.dumps({'pids':pids,'pgids':[os.getpgid(pid) for pid in pids]}),flush=True)
+loop=asyncio.new_event_loop();asyncio.set_event_loop(loop)
+loop.run_until_complete(setup())
+if sys.argv[1]=='wait': loop.run_forever()
+"""
+    process = await asyncio.create_subprocess_exec(
+        sys.executable,
+        "-c",
+        source,
+        "exit" if shutdown_signal is None else "wait",
+        cwd=Path(__file__).resolve().parents[1],
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    assert process.stdout is not None
+    ownership = json.loads(
+        (await asyncio.wait_for(process.stdout.readline(), 10)).decode()
+    )
+    assert ownership["pgids"] == ownership["pids"]
+    if shutdown_signal is not None:
+        process.send_signal(shutdown_signal)
+    await asyncio.wait_for(process.wait(), 10)
+    assert all(
+        await asyncio.gather(
+            *(owned_process_reaped(pid) for pid in ownership["pids"])
+        )
+    )
 
 
 @pytest.mark.asyncio

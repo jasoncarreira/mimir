@@ -2,13 +2,14 @@ from __future__ import annotations
 
 import asyncio
 import io
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
 from mimir.acp.agent import ConnectionState, MimirAcpAgent
 from mimir.acp.host import _FrameDelivery, close_protocol_writer
-from mimir.acp.proxy import _OutputWriter
+from mimir.acp.proxy import ProxyRouter, _OutputWriter
 from mimir.acp.transport import close_writer, pump_stream
 
 
@@ -230,3 +231,64 @@ async def test_candidate_connection_does_not_retire_active_generation() -> None:
     assert generation == 2
     assert agent._connection is old
     assert not retired.is_set()
+
+
+@pytest.mark.asyncio
+async def test_proxy_generation_teardown_retires_hosted_ids_grants_calls_and_workers(
+    tmp_path: Path,
+) -> None:
+    class Writer:
+        def write(self, data: bytes) -> None:
+            del data
+
+        async def drain(self) -> None:
+            return None
+
+    router = ProxyRouter(Writer(), Writer(), "secret")
+    router._active_sessions.add("session")
+    router._grants.add("session", "hands_python")
+    router._server_sessions["server"] = "session"
+    router._connection_sessions["connection"] = "session"
+    router._provider.bind_session("session", tmp_path)
+    connection_id = router._provider.connect("session")
+    await router._provider.request(
+        connection_id,
+        "initialize",
+        {
+            "protocolVersion": "2025-03-26",
+            "capabilities": {},
+            "clientInfo": {"name": "test", "version": "1"},
+        },
+    )
+    await router._provider.notification(connection_id, "notifications/initialized")
+    await router._provider._python_kernels.execute("session", tmp_path, "value = 1")
+    worker = next(iter(router._provider._python_kernels._processes))
+    shell_call = asyncio.create_task(
+        router._provider.request(
+            connection_id,
+            "tools/call",
+            {"name": "shell", "arguments": {"command": "sleep 30"}},
+            request_id="shell",
+        )
+    )
+    async with asyncio.timeout(5):
+        while not router._provider._processes:
+            await asyncio.sleep(0.01)
+    shell = next(iter(router._provider._processes))
+    router._fail_generation(ConnectionError("generation retired"))
+    failure = await router.wait_failed()
+    assert str(failure) == "generation retired"
+    assert router._active_sessions == set()
+    assert len(router._grants) == 0
+    assert router._server_sessions == {}
+    assert router._connection_sessions == {}
+    assert router._local_requests == {}
+    assert router._daemon_requests == {}
+    assert router._provider._connections == {}
+    assert router._provider._processes == {}
+    assert router._provider._python_kernels._processes == {}
+    assert shell.returncode is not None
+    assert worker.returncode is not None
+    assert shell_call.done()
+    await asyncio.gather(shell_call, return_exceptions=True)
+    await router.close()
