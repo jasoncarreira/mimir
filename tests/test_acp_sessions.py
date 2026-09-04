@@ -18,7 +18,7 @@ import mimir.tools.registry as tool_registry
 from mimir._context import reset_current_turn, set_current_turn
 from mimir.access_control import SinkGate
 from mimir.acp import sdk
-from mimir.acp.agent import ActivePrompt, MimirAcpAgent
+from mimir.acp.agent import ActivePrompt, MimirAcpAgent, SessionState
 from mimir.agent import _initialize_ifc_labels
 from mimir.acp.journal import JournalLease
 from mimir.acp.updates import UpdateDispatcher
@@ -144,6 +144,11 @@ async def _ready(home: Path) -> tuple[MimirAcpAgent, Client, CoreAgent]:
 
 def _types(client: Client) -> list[str]:
     return [item.session_update for item in client.updates]
+
+
+def test_daemon_session_state_contains_no_kernel_namespace() -> None:
+    names = {item.name for item in dataclasses.fields(SessionState)}
+    assert names.isdisjoint({"kernel", "namespace", "worker", "python_kernel"})
 
 
 async def test_new_prompt_runs_bound_core_and_preserves_update_order(tmp_path: Path) -> None:

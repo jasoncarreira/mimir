@@ -353,6 +353,25 @@ async def test_call_arguments_metadata_and_results_are_strict(tmp_path: Path) ->
     await provider.close()
 
 
+@pytest.mark.asyncio
+async def test_hosted_provider_owns_internal_session_kernels(tmp_path: Path) -> None:
+    provider = HostedHandsProvider()
+    provider.bind_session("one", tmp_path)
+    provider.bind_session("two", tmp_path)
+    first = await provider.execute_python(provider._sessions["one"], "value = 7\nvalue")
+    reused = await provider.execute_python(provider._sessions["one"], "value")
+    isolated = await provider.execute_python(
+        provider._sessions["two"], "globals().get('value')"
+    )
+    assert first["kernel"] == "fresh"
+    assert reused["kernel"] == "reused"
+    assert reused["value"] == "7"
+    assert isolated["value"] == "None"
+    assert set(provider._python_kernels._sessions) == {"one", "two"}
+    await provider.close()
+    assert provider._python_kernels._processes == {}
+
+
 @pytest.mark.parametrize(
     ("name", "result"),
     [

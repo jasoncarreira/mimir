@@ -16,6 +16,7 @@ from .hands_contract import (
     validate_tool_arguments,
     validate_tool_result,
 )
+from .python_kernel import PythonKernelManager, PythonKernelUnavailable
 
 
 READ_LIMIT_BYTES = 1024 * 1024
@@ -84,6 +85,7 @@ class HostedHandsProvider:
         self._used_connection_ids: set[str] = set()
         self._processes: dict[asyncio.subprocess.Process, int] = {}
         self._provider_cancelled: set[asyncio.Task[Any]] = set()
+        self._python_kernels = PythonKernelManager()
         self._closed = False
 
     def bind_session(self, session_id: str, cwd: str | os.PathLike[str]) -> None:
@@ -130,6 +132,22 @@ class HostedHandsProvider:
                 if connection.session.session_id == session_id
             )
         )
+        await self._python_kernels.retire(session_id)
+
+    async def execute_python(
+        self,
+        session: HostedSession,
+        code: str,
+        timeout: int | float = SHELL_TIMEOUT_SECONDS,
+    ) -> dict[str, Any]:
+        try:
+            return await self._python_kernels.execute(
+                session.session_id, session.cwd, code, timeout
+            )
+        except PythonKernelUnavailable as exc:
+            raise HostedMcpError(
+                -32000, f"hands_python kernel unavailable: {exc}"
+            ) from None
 
     async def close(self) -> None:
         if self._closed:
@@ -144,6 +162,7 @@ class HostedHandsProvider:
                 for process, pgid in tuple(self._processes.items())
             )
         )
+        await self._python_kernels.close()
 
     async def request(
         self,

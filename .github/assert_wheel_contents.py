@@ -21,6 +21,7 @@ REQUIRED_MEMBERS = (
     "mimir/acp/hands_contract.py",
     "mimir/acp/hosted.py",
     "mimir/acp/profiles.py",
+    "mimir/acp/python_kernel.py",
     "mimir/acp/proxy.py",
     "mimir/acp/relay.py",
     "mimir/acp/ssh.py",
