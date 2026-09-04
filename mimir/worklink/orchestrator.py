@@ -2836,14 +2836,10 @@ def _factory_lock_refusal(result: ComputeResult) -> bool:
         or result.launch_error is not None
     ):
         return False
-    lines = [
-        line.strip().lower()
-        for line in f"{result.stdout}\n{result.stderr}".splitlines()
-        if line.strip()
-    ]
-    if not lines:
+    stdout_lines = [line.strip().lower() for line in result.stdout.splitlines() if line.strip()]
+    if not stdout_lines:
         return False
-    report = lines[-1]
+    report = stdout_lines[-1]
     return any(
         marker in report
         for marker in (

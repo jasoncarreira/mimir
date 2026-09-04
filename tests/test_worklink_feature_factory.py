@@ -727,6 +727,7 @@ def test_recovery_launch_binds_opencode_to_factory_session(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.delenv("XDG_DATA_HOME", raising=False)
     auth = tmp_path / ".local" / "share" / "opencode" / "auth.json"
     auth.parent.mkdir(parents=True)
     auth.write_text(
@@ -760,6 +761,7 @@ def test_recovery_launch_uses_retained_legacy_run_id(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.delenv("XDG_DATA_HOME", raising=False)
     auth = tmp_path / ".local" / "share" / "opencode" / "auth.json"
     auth.parent.mkdir(parents=True)
     auth.write_text(

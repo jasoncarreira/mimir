@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, replace
-from datetime import timedelta
 import json
 import os
 from pathlib import Path
@@ -15,7 +14,6 @@ from .run_state import process_is_zombie, process_start_ticks
 
 
 FACTORY_RECORD_VERSION = 2
-FACTORY_RECORD_RETENTION = timedelta(days=7)
 _MAX_RECORD_BYTES = 2 * 1024 * 1024
 _RETAINED_CONTROLLER_PHASES = frozenset({"failed", "parked", "stopped", "terminal"})
 
@@ -388,17 +386,12 @@ def factory_manifest_candidates(record: FactoryRunRecord) -> tuple[Path, Path]:
     return repository / ".factory" / record.run_id, sandbox / ".factory" / record.run_id
 
 
-def age_out_factory_records(
+def report_retained_factory_records(
     home: Path,
     *,
-    now: object | None = None,
-    retention: timedelta = FACTORY_RECORD_RETENTION,
-    runner: Callable[..., object] | None = None,
     event_logger: Callable[..., None] | None = None,
-) -> list[Path]:
-    """Report retained factory runs; only the factory handoff may remove them."""
-    if retention < timedelta(0):
-        raise ValueError("factory record retention cannot be negative")
+) -> None:
+    """Report factory runs whose control plane remains retained for recovery."""
     if event_logger is None:
         from ..event_logger import log_event_sync
 
@@ -415,7 +408,6 @@ def age_out_factory_records(
             sandbox=record.sandbox,
             reason="factory handoff has not archived and verified the control plane",
         )
-    return []
 
 
 def factory_process_is_alive(record: FactoryRunRecord) -> bool:

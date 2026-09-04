@@ -6422,7 +6422,7 @@ def test_factory_lock_refusal_exit_parks_without_terminal_failure(tmp_path: Path
                 0,
                 "A different live session holds the fresh lock, so this invocation "
                 "did not acquire the lock or mutate the run.",
-                "",
+                'timestamp=2026-09-03T21:26:16.044Z level=INFO message="disposing instance"',
                 handle=selected,
             )
 
@@ -6469,6 +6469,18 @@ def test_factory_lock_refusal_exit_parks_without_terminal_failure(tmp_path: Path
     assert retained is not None and retained.controller_phase == "parked"
     assert transitions[0]["status"] == "blocked"
     assert not any("push" in call for call in git_calls)
+
+
+def test_factory_lock_refusal_ignores_marker_in_stderr_log() -> None:
+    import mimir.worklink.orchestrator as orchestrator
+
+    result = ComputeResult(
+        0,
+        "Factory driver exited without acquiring work.",
+        "level=INFO message='another live session holds a cache lock'",
+    )
+
+    assert orchestrator._factory_lock_refusal(result) is False
 
 
 def _commit_runner(

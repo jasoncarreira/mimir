@@ -1,25 +1,22 @@
 from __future__ import annotations
 
 from dataclasses import replace
-from datetime import UTC, datetime, timedelta
 import json
 from pathlib import Path
-import subprocess
 
 import pytest
 
 from mimir.worklink.backends.feature_factory import parse_factory_status
 from mimir.worklink.compute import LaunchHandle
 from mimir.worklink.factory_state import (
-    FACTORY_RECORD_RETENTION,
     FactoryRecordError,
     FactoryRunRecord,
-    age_out_factory_records,
     archive_factory_record,
     factory_manifest_candidates,
     load_factory_records_for_issue,
     list_factory_records,
     load_factory_record,
+    report_retained_factory_records,
     save_factory_record,
 )
 
@@ -146,26 +143,7 @@ def _retained_record(home: Path, repository: Path, *, sandbox_exists: bool = Tru
     return expected
 
 
-def test_factory_record_retention_default_is_seven_days(tmp_path: Path) -> None:
-    repository = tmp_path / "repo"
-    expected = _retained_record(tmp_path, repository)
-    calls: list[list[str]] = []
-
-    archived = age_out_factory_records(
-        tmp_path,
-        now=datetime(2026, 8, 7, 23, 59, 59, tzinfo=UTC),
-        runner=lambda args: calls.append(list(args))
-        or subprocess.CompletedProcess(args, 0, stdout="", stderr=""),
-        event_logger=lambda *args, **kwargs: None,
-    )
-
-    assert FACTORY_RECORD_RETENTION == timedelta(days=7)
-    assert archived == []
-    assert load_factory_record(tmp_path, expected.run_id) == expected
-    assert calls == []
-
-
-def test_factory_age_out_reports_and_preserves_control_plane(
+def test_report_retained_factory_records_preserves_control_plane(
     tmp_path: Path,
 ) -> None:
     repository = tmp_path / "repo"
@@ -177,14 +155,12 @@ def test_factory_age_out_reports_and_preserves_control_plane(
     sandbox_manifest.mkdir(parents=True)
     events: list[tuple[str, dict[str, object]]] = []
 
-    archived = age_out_factory_records(
+    result = report_retained_factory_records(
         tmp_path,
-        now=datetime(2026, 8, 8, tzinfo=UTC),
-        runner=lambda args: pytest.fail("automatic retention must not run git"),
         event_logger=lambda event, **payload: events.append((event, payload)),
     )
 
-    assert archived == []
+    assert result is None
     assert root_manifest.exists()
     assert sandbox_manifest.exists()
     assert Path(expected.sandbox).exists()
@@ -193,7 +169,7 @@ def test_factory_age_out_reports_and_preserves_control_plane(
     assert events[0][1]["sandbox"] == expected.sandbox
 
 
-def test_factory_age_out_never_touches_unresumed_sandbox(
+def test_report_retained_factory_records_never_touches_unresumed_sandbox(
     tmp_path: Path,
 ) -> None:
     repository = tmp_path / "repo"
@@ -201,34 +177,30 @@ def test_factory_age_out_never_touches_unresumed_sandbox(
     root_manifest, sandbox_manifest = factory_manifest_candidates(expected)
     root_manifest.mkdir(parents=True)
     sandbox_manifest.mkdir(parents=True)
-    archived = age_out_factory_records(
+    result = report_retained_factory_records(
         tmp_path,
-        now=datetime(2026, 8, 8, tzinfo=UTC),
-        runner=lambda args: pytest.fail("automatic retention must not run git"),
         event_logger=lambda *args, **kwargs: None,
     )
 
-    assert archived == []
+    assert result is None
     assert root_manifest.is_dir()
     assert sandbox_manifest.is_dir()
     assert Path(expected.sandbox).is_dir()
     assert load_factory_record(tmp_path, expected.run_id) == expected
 
 
-def test_factory_age_out_retains_record_when_sandbox_is_already_gone(tmp_path: Path) -> None:
+def test_report_retained_factory_records_keeps_missing_sandbox_record(tmp_path: Path) -> None:
     repository = tmp_path / "repo"
     expected = _retained_record(tmp_path, repository, sandbox_exists=False)
     root_manifest, _ = factory_manifest_candidates(expected)
     root_manifest.mkdir(parents=True)
 
-    archived = age_out_factory_records(
+    result = report_retained_factory_records(
         tmp_path,
-        now=datetime(2026, 8, 8, tzinfo=UTC),
-        runner=lambda args: pytest.fail("git must not run for a missing sandbox"),
         event_logger=lambda *args, **kwargs: None,
     )
 
-    assert archived == []
+    assert result is None
     assert root_manifest.exists()
     assert load_factory_record(tmp_path, expected.run_id) == expected
 

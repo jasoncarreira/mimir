@@ -211,6 +211,9 @@ def _attempt_is_active(child: Path, records: Sequence[object] = ()) -> bool:
         resolved_sandbox = Path(sandbox).resolve()
         if resolved_sandbox != resolved and resolved not in resolved_sandbox.parents:
             continue
+        phase = getattr(candidate, "controller_phase", None)
+        if phase is not None:
+            return True
         status = getattr(candidate, "status", None)
         if status is not None and (status.is_terminal or status.is_parked):
             return status.is_parked
@@ -232,8 +235,8 @@ def prune_stale_attempt_checkouts_for_home(
     without bound.  If no Worklink repo is configured, return silently; homes can
     opt into claim reaping before they opt into autonomous dispatch.
 
-    Worklink factory records and verified process handles keep active retained
-    sandboxes out of the TTL prune path.
+    Any durable factory record in a retained controller phase keeps its sandbox
+    out of the TTL prune path until the factory handoff archives it.
     """
     defaults = worklink_defaults(home)
     repo_raw = repo or os.environ.get("WORKLINK_REPO") or os.environ.get("MIMIR_WORKLINK_REPO")

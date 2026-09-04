@@ -728,6 +728,30 @@ def test_prune_keeps_old_attempt_with_live_nested_factory(
     assert child.exists()
 
 
+def test_prune_keeps_old_attempt_with_failed_unresumed_factory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _write_worklink_yaml(tmp_path, reaper_ttl_s=3600)
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    child = tmp_path / ".worklink" / repo.name / "841-1"
+    sandbox = child / ".factory-sandboxes" / "chainlink-841"
+    manifest = sandbox / ".factory" / "chainlink-841" / "run.json"
+    manifest.parent.mkdir(parents=True)
+    manifest.write_text("{}", encoding="utf-8")
+    os.utime(child, (0, 0))
+    record = SimpleNamespace(
+        sandbox=str(sandbox),
+        controller_phase="failed",
+        status=SimpleNamespace(is_terminal=False, is_parked=False),
+    )
+    monkeypatch.setattr(autonomy, "list_factory_records", lambda home: [record])
+    monkeypatch.setattr(autonomy, "factory_process_is_alive", lambda candidate: False)
+
+    assert autonomy.prune_stale_attempt_checkouts_for_home(tmp_path, repo=repo) == []
+    assert manifest.is_file()
+
+
 def test_attempt_is_active_false_for_terminal_or_absent(tmp_path: Path) -> None:
     done = tmp_path / ".worklink" / "841-1"
     done.mkdir(parents=True)
