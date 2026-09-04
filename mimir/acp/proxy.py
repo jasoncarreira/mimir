@@ -19,6 +19,9 @@ from .transport import FORCE_CLOSE_TIMEOUT, PEER_EOF_GRACE_TIMEOUT, close_writer
 CONNECT_TIMEOUT = 5.0
 MAX_FRAME_BYTES = 1024 * 1024
 MAX_OUTSTANDING_REQUESTS = 1024
+MAX_GENERATION_SERVER_IDS = 1024
+MAX_GENERATION_CONNECTION_IDS = 4096
+MAX_LIVE_CONNECTIONS = 1024
 
 class ProxyError(RuntimeError):
     pass
@@ -75,6 +78,11 @@ class FrameWriter:
             raise ProxyError("invalid frame")
         self._writer.write(encoded)
 
+    def write_raw(self, frame: bytes) -> None:
+        if len(frame) > MAX_FRAME_BYTES or not frame.endswith(b"\n"):
+            raise ProxyError("invalid frame")
+        self._writer.write(frame)
+
     async def drain(self) -> None: await self._writer.drain()
     def write_eof(self) -> None:
         if self._buffer: raise ProxyError("invalid frame")
@@ -101,7 +109,11 @@ def _message_kind(message: dict[str, Any]) -> str:
     if message.get("jsonrpc") != "2.0":
         raise ProxyError("invalid frame")
     if "method" in message:
-        if not isinstance(message["method"], str):
+        if (
+            not isinstance(message["method"], str)
+            or "result" in message
+            or "error" in message
+        ):
             raise ProxyError("invalid frame")
         if "id" in message:
             _request_key(message["id"])
@@ -117,7 +129,7 @@ def _message_kind(message: dict[str, Any]) -> str:
 class _PendingSession:
     method: str
     cwd: str
-    server_id: str
+    server_id: str | None
     session_id: str | None
 
 
@@ -134,11 +146,15 @@ class ProxyRouter:
         self._server_sessions: dict[str, str] = {}
         self._connection_sessions: dict[str, str] = {}
         self._used_server_ids: set[str] = set()
+        self._used_connection_ids: set[str] = set()
+        self._local_connections: dict[tuple[type[Any], Any], str] = {}
         self._client_lock = asyncio.Lock()
         self._daemon_lock = asyncio.Lock()
+        self._failure: asyncio.Future[BaseException] = asyncio.get_running_loop().create_future()
         self._closed = False
 
-    async def route_client(self, message: dict[str, Any]) -> None:
+    async def route_client(self, message: dict[str, Any], raw: bytes | None = None) -> None:
+        self._require_open()
         kind = _message_kind(message)
         if kind == "response":
             key = _request_key(message["id"])
@@ -147,19 +163,21 @@ class ProxyRouter:
             if key not in self._daemon_requests:
                 raise ProxyError("unsolicited response")
             self._daemon_requests.pop(key)
-            await self._write_daemon(message)
+            await self._write_daemon(message, raw)
             return
         if kind == "notification":
             await self._client_notification(message)
-            await self._write_daemon(message)
+            await self._write_daemon(message, raw)
             return
         key = _request_key(message["id"])
         self._register(self._client_requests, key)
-        pending = await self._prepare_session(message)
+        pending, transformed = await self._prepare_session(message)
         self._client_requests[key] = pending
-        await self._write_daemon(message)
+        authenticate = message["method"] == "authenticate"
+        await self._write_daemon(message, None if transformed or authenticate else raw)
 
-    async def route_daemon(self, message: dict[str, Any]) -> None:
+    async def route_daemon(self, message: dict[str, Any], raw: bytes | None = None) -> None:
+        self._require_open()
         kind = _message_kind(message)
         if kind == "response":
             key = _request_key(message["id"])
@@ -168,7 +186,7 @@ class ProxyRouter:
             pending = self._client_requests.pop(key)
             if pending is not None:
                 await self._finish_session(pending, message)
-            await self._write_client(message)
+            await self._write_client(message, raw)
             return
         method = message["method"]
         params = message.get("params")
@@ -179,7 +197,14 @@ class ProxyRouter:
         if kind == "request":
             key = _request_key(message["id"])
             self._register_daemon(key)
-        await self._write_client(message)
+        await self._write_client(message, raw)
+
+    async def wait_failed(self) -> BaseException:
+        return await self._failure
+
+    def _require_open(self) -> None:
+        if self._closed:
+            raise ProxyError("proxy generation is closed")
 
     async def close(self) -> None:
         if self._closed:
@@ -191,6 +216,7 @@ class ProxyRouter:
         await asyncio.gather(*tasks, return_exceptions=True)
         self._local_requests.clear()
         self._local_sessions.clear()
+        self._local_connections.clear()
         await self._provider.close()
         self._client_requests.clear()
         self._daemon_requests.clear()
@@ -216,63 +242,74 @@ class ProxyRouter:
             raise ProxyError("duplicate outstanding request ID")
         self._daemon_requests[key] = None
 
-    async def _prepare_session(self, message: dict[str, Any]) -> _PendingSession | None:
+    async def _prepare_session(
+        self, message: dict[str, Any]
+    ) -> tuple[_PendingSession | None, bool]:
         method = message["method"]
         if method not in {"session/new", "session/load"}:
-            return None
+            return None, False
         params = message.get("params")
         if not isinstance(params, dict) or not isinstance(params.get("cwd"), str):
             raise ProxyError("invalid frame")
+        session_id = params.get("sessionId") if method == "session/load" else None
+        if method == "session/load":
+            if not isinstance(session_id, str) or not session_id:
+                raise ProxyError("invalid frame")
+            await self._retire_session(session_id)
         servers = params.get("mcpServers")
         if "mcpServers" in params and servers != []:
-            return None
+            return _PendingSession(method, params["cwd"], None, session_id), False
         server_id = self._new_server_id()
         params["mcpServers"] = [{
             "type": "acp",
             "name": "mimir-hands",
             "serverId": server_id,
         }]
-        session_id = params.get("sessionId") if method == "session/load" else None
-        if method == "session/load":
-            if not isinstance(session_id, str) or not session_id:
-                raise ProxyError("invalid frame")
-            await self._retire_session(session_id)
         self._provider.bind_session(server_id, params["cwd"])
         self._server_sessions[server_id] = server_id
-        return _PendingSession(method, params["cwd"], server_id, session_id)
+        return _PendingSession(method, params["cwd"], server_id, session_id), True
 
     def _new_server_id(self) -> str:
+        if len(self._used_server_ids) >= MAX_GENERATION_SERVER_IDS:
+            raise ProxyError("too many hosted server IDs")
         while True:
             token = secrets.token_urlsafe(18)
-            if len(token) == 24 and token not in self._used_server_ids:
-                self._used_server_ids.add(token)
-                return f"mimir-hosted:{token}"
+            server_id = f"mimir-hosted:{token}"
+            if len(token) == 24 and server_id not in self._used_server_ids:
+                self._used_server_ids.add(server_id)
+                return server_id
 
     async def _finish_session(
         self, pending: _PendingSession, response: dict[str, Any]
     ) -> None:
+        if pending.server_id is None:
+            return
         if "error" in response:
             await self._retire_session(pending.server_id)
             return
         result = response.get("result")
         if not isinstance(result, dict):
+            await self._retire_session(pending.server_id)
             raise ProxyError("invalid frame")
         if pending.method == "session/new":
             session_id = result.get("sessionId")
             if not isinstance(session_id, str) or not session_id:
+                await self._retire_session(pending.server_id)
                 raise ProxyError("invalid frame")
             await self._retire_session(session_id)
         else:
             session_id = pending.session_id
             if session_id is None:
                 raise ProxyError("invalid frame")
+        self._provider.bind_session(session_id, pending.cwd)
+        self._provider.revoke_session(pending.server_id)
         self._server_sessions[pending.server_id] = session_id
         for connection_id, owner in tuple(self._connection_sessions.items()):
             if owner == pending.server_id:
                 self._connection_sessions[connection_id] = session_id
-        self._provider.revoke_session(pending.server_id)
 
     async def _retire_session(self, session_id: str) -> None:
+        self._cancel_local_requests(session_id=session_id)
         for connection_id, owner in tuple(self._connection_sessions.items()):
             if owner == session_id:
                 try:
@@ -293,12 +330,7 @@ class ProxyRouter:
         if not isinstance(params, dict) or not isinstance(params.get("sessionId"), str):
             raise ProxyError("invalid frame")
         session_id = params["sessionId"]
-        for key, owner in tuple(self._local_sessions.items()):
-            if owner == session_id:
-                task = self._local_requests.get(key)
-                if task is not None:
-                    self._tombstone(key)
-                    task.cancel()
+        self._cancel_local_requests(session_id=session_id)
         await self._provider.cancel_session(session_id)
 
     async def _route_hosted(
@@ -309,16 +341,26 @@ class ProxyRouter:
         if method == "mcp/connect":
             server_id = params.get("serverId")
             if server_id not in self._server_sessions:
+                if isinstance(server_id, str) and server_id in self._used_server_ids:
+                    raise ProxyError("stale hosted server ID")
                 return False
             if set(params) != {"serverId"}:
                 raise ProxyError("invalid frame")
             if kind != "request":
                 raise ProxyError("invalid frame")
+            if (
+                len(self._connection_sessions) >= MAX_LIVE_CONNECTIONS
+                or len(self._used_connection_ids) >= MAX_GENERATION_CONNECTION_IDS
+            ):
+                raise ProxyError("too many hosted connections")
             key = _request_key(message["id"])
             self._register_local(key)
             session_id = self._server_sessions[server_id]
             try:
                 connection_id = self._provider.connect(session_id)
+                if connection_id in self._used_connection_ids:
+                    raise ProxyError("reused hosted connection ID")
+                self._used_connection_ids.add(connection_id)
                 self._connection_sessions[connection_id] = session_id
                 await self._complete_local(key, {"connectionId": connection_id})
             except HostedMcpError as exc:
@@ -326,6 +368,8 @@ class ProxyRouter:
             return True
         connection_id = params.get("connectionId")
         if connection_id not in self._connection_sessions:
+            if isinstance(connection_id, str) and connection_id in self._used_connection_ids:
+                raise ProxyError("stale hosted connection ID")
             return False
         if method == "mcp/disconnect":
             if set(params) != {"connectionId"}:
@@ -335,6 +379,7 @@ class ProxyRouter:
             key = _request_key(message["id"])
             self._register_local(key)
             try:
+                self._cancel_local_requests(connection_id=connection_id)
                 result = await self._provider.disconnect(connection_id)
                 self._connection_sessions.pop(connection_id, None)
                 await self._complete_local(key, result)
@@ -348,6 +393,15 @@ class ProxyRouter:
             raise ProxyError("invalid frame")
         nested_params = params.get("params")
         if kind == "notification":
+            if nested_method == "notifications/cancelled":
+                if not isinstance(nested_params, dict) or set(nested_params) != {"requestId"}:
+                    raise ProxyError("invalid frame")
+                cancelled_key = _request_key(nested_params["requestId"])
+                if self._local_connections.get(cancelled_key) == connection_id:
+                    task = self._local_requests.get(cancelled_key)
+                    self._tombstone(cancelled_key)
+                    if task is not None:
+                        task.cancel()
             try:
                 await self._provider.notification(connection_id, nested_method, nested_params)
             except HostedMcpError as exc:
@@ -361,6 +415,7 @@ class ProxyRouter:
         )
         self._local_requests[key] = task
         self._local_sessions[key] = session_id
+        self._local_connections[key] = connection_id
         return True
 
     def _register_local(self, key: tuple[type[Any], Any]) -> None:
@@ -391,13 +446,17 @@ class ProxyRouter:
         except asyncio.CancelledError:
             if key not in self._daemon_tombstones:
                 raise
+        except BaseException as exc:
+            self._fail_generation(exc)
         finally:
             self._local_requests.pop(key, None)
             self._local_sessions.pop(key, None)
+            self._local_connections.pop(key, None)
 
     async def _complete_local(self, key: tuple[type[Any], Any], result: Any) -> None:
         self._local_requests.pop(key, None)
         self._local_sessions.pop(key, None)
+        self._local_connections.pop(key, None)
         if key not in self._daemon_tombstones:
             await self._write_daemon({"jsonrpc": "2.0", "id": key[1], "result": result})
 
@@ -406,22 +465,52 @@ class ProxyRouter:
     ) -> None:
         self._local_requests.pop(key, None)
         self._local_sessions.pop(key, None)
+        self._local_connections.pop(key, None)
         if key not in self._daemon_tombstones:
             await self._write_daemon({"jsonrpc": "2.0", "id": key[1], "error": error.as_error()})
 
     def _tombstone(self, key: tuple[type[Any], Any]) -> None:
+        if key in self._daemon_tombstones:
+            return
         if len(self._daemon_tombstones) >= MAX_OUTSTANDING_REQUESTS:
             raise ProxyError("too many cancelled requests")
         self._daemon_tombstones.add(key)
 
-    async def _write_client(self, message: dict[str, Any]) -> None:
+    def _cancel_local_requests(
+        self, *, session_id: str | None = None, connection_id: str | None = None
+    ) -> None:
+        for key, task in tuple(self._local_requests.items()):
+            if task is None:
+                continue
+            if session_id is not None and self._local_sessions.get(key) != session_id:
+                continue
+            if connection_id is not None and self._local_connections.get(key) != connection_id:
+                continue
+            self._tombstone(key)
+            task.cancel()
+
+    def _fail_generation(self, error: BaseException) -> None:
+        if not self._failure.done():
+            self._failure.set_result(error)
+
+    async def _write_client(
+        self, message: dict[str, Any], raw: bytes | None = None
+    ) -> None:
         async with self._client_lock:
-            self._client.write_message(message)
+            if raw is None:
+                self._client.write_message(message)
+            else:
+                self._client.write_raw(raw)
             await self._client.drain()
 
-    async def _write_daemon(self, message: dict[str, Any]) -> None:
+    async def _write_daemon(
+        self, message: dict[str, Any], raw: bytes | None = None
+    ) -> None:
         async with self._daemon_lock:
-            self._daemon.write_message(message)
+            if raw is None:
+                self._daemon.write_message(message)
+            else:
+                self._daemon.write_raw(raw)
             await self._daemon.drain()
 
 
@@ -450,7 +539,7 @@ async def _route_stream(reader: Any, route: Any) -> None:
                 raise ProxyError("invalid frame") from exc
             if not isinstance(message, dict):
                 raise ProxyError("invalid frame")
-            await route(message)
+            await route(message, raw + b"\n")
 
 
 async def run_router(
@@ -465,12 +554,22 @@ async def run_router(
     router = ProxyRouter(client_writer, daemon_writer, credential)
     client_task = asyncio.create_task(_route_stream(client_reader, router.route_client))
     daemon_task = asyncio.create_task(_route_stream(daemon_reader, router.route_daemon))
-    tasks = {client_task, daemon_task}
+    failure_task = asyncio.create_task(router.wait_failed())
+    tasks = {client_task, daemon_task, failure_task}
     try:
         done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+        if failure_task in done:
+            raise failure_task.result()
         await asyncio.gather(*done)
-        if pending and not (close_on_daemon_exit and daemon_task in done):
-            _, pending = await asyncio.wait(pending, timeout=PEER_EOF_GRACE_TIMEOUT)
+        stream_pending = pending - {failure_task}
+        if stream_pending and not (close_on_daemon_exit and daemon_task in done):
+            completed, stream_pending = await asyncio.wait(
+                stream_pending | {failure_task}, timeout=PEER_EOF_GRACE_TIMEOUT,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if failure_task in completed:
+                raise failure_task.result()
+        pending = stream_pending | ({failure_task} if not failure_task.done() else set())
         for task in pending:
             task.cancel()
         await asyncio.gather(*pending, return_exceptions=True)

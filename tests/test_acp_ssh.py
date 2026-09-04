@@ -247,6 +247,45 @@ for line in sys.stdin.buffer:
 
 
 @pytest.mark.asyncio
+async def test_real_ssh_proxy_uses_local_router_and_preserves_foreign_daemon_bytes(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    profile, _ = remote_profile(tmp_path)
+    ssh = _fake_ssh(tmp_path, """
+import json,sys
+auth=json.loads(sys.stdin.buffer.readline())
+assert auth['params']['_meta']=={'mimir.webKey':'secret'}
+session=json.loads(sys.stdin.buffer.readline())
+provider=session['params']['mcpServers']
+assert len(provider)==1 and provider[0]['name']=='mimir-hands'
+connect={'jsonrpc':'2.0','id':'connect','method':'mcp/connect','params':{'serverId':provider[0]['serverId']}}
+sys.stdout.buffer.write(json.dumps(connect,separators=(',',':')).encode()+b'\\n');sys.stdout.buffer.flush()
+connected=json.loads(sys.stdin.buffer.readline())
+assert connected['id']=='connect' and connected['result']['connectionId'].startswith('mimir-hosted-connection:')
+sys.stdout.buffer.write(b'{ "jsonrpc" : "2.0", "id" : 1, "result" : {"ok":true} }\\n')
+sys.stdout.buffer.write(b'{ "jsonrpc" : "2.0", "id" : 2, "result" : {"sessionId":"s"} }\\n')
+sys.stdout.buffer.flush()
+""")
+    reader = asyncio.StreamReader()
+    reader.feed_data(b'{"jsonrpc":"2.0","id":1,"method":"authenticate","params":{"methodId":"mimir-web-key"}}\n')
+    reader.feed_data(json.dumps({
+        "jsonrpc": "2.0", "id": 2, "method": "session/new", "params": {"cwd": str(tmp_path)}
+    }, separators=(",", ":")).encode() + b"\n")
+    reader.feed_eof()
+    output = io.BytesIO()
+    transport = type("Transport", (), {"close": lambda self: None})()
+    monkeypatch.setattr("mimir.acp.ssh.open_stdio", lambda target: asyncio.sleep(0, result=(reader, Output(target), transport)))
+    await run_ssh_proxy(
+        profile, "secret", output, _ssh_path=ssh,
+        _environment={"PATH": os.environ.get("PATH", "")},
+    )
+    assert output.getvalue() == (
+        b'{ "jsonrpc" : "2.0", "id" : 1, "result" : {"ok":true} }\n'
+        b'{ "jsonrpc" : "2.0", "id" : 2, "result" : {"sessionId":"s"} }\n'
+    )
+
+
+@pytest.mark.asyncio
 async def test_actual_subprocess_failure_is_sanitized_and_reaped(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     profile, _ = remote_profile(tmp_path)
     ssh = _fake_ssh(tmp_path, "import sys; sys.stderr.write('private-sentinel'); raise SystemExit(23)\n")
