@@ -286,9 +286,41 @@ async def test_malformed_reserved_permission_metadata_fails_closed() -> None:
         del missing_wrapper["params"]["_meta"]["mimir.wrapper"]
         missing_wrapper["params"]["_meta"]["mimir.tainted"] = True
         invalid.append(missing_wrapper)
+        for request_id, metadata in enumerate((None, {}, {"other": True}, []), 6):
+            missing_metadata = permission_request(request_id, "session")
+            missing_metadata["params"]["_meta"] = metadata
+            invalid.append(missing_metadata)
+        absent_metadata = permission_request(10, "session")
+        del absent_metadata["params"]["_meta"]
+        invalid.append(absent_metadata)
+        camel_payload = permission_request(11, "session")
+        camel_payload["params"]["toolCall"]["rawInput"] = {
+            "path": "note", "oldText": "old", "newText": "new",
+        }
+        invalid.append(camel_payload)
+        wrong_identity = permission_request(12, "session")
+        wrong_identity["params"]["toolCall"]["title"] = "hands_shell"
+        invalid.append(wrong_identity)
+        extra_envelope = permission_request(13, "session")
+        extra_envelope["extra"] = True
+        invalid.append(extra_envelope)
+        extra_params = permission_request(14, "session")
+        extra_params["params"]["extra"] = True
+        invalid.append(extra_params)
+        extra_tool_call = permission_request(15, "session")
+        extra_tool_call["params"]["toolCall"]["extra"] = True
+        invalid.append(extra_tool_call)
         for request in invalid:
             with pytest.raises(ProxyError, match="invalid reserved permission"):
                 await router.route_daemon(request)
+        unknown_reserved = permission_request(16, "session")
+        unknown_reserved["params"]["_meta"]["mimir.unknown"] = True
+        with pytest.raises(ProxyError, match="invalid reserved permission"):
+            await router.route_daemon(unknown_reserved)
+        notification = permission_request(17, "session")
+        del notification["id"]
+        with pytest.raises(ProxyError, match="invalid reserved permission"):
+            await router.route_daemon(notification)
         assert bytes(client.data) == bytes(daemon.data) == b""
         assert len(router._grants) == 0
     finally:
@@ -319,6 +351,96 @@ async def test_non_hands_permission_frames_remain_transparent() -> None:
         assert len(router._grants) == 0
     finally:
         await router.close()
+
+
+@pytest.mark.asyncio
+async def test_malformed_correlated_permission_responses_fail_closed() -> None:
+    router, client, daemon = await active_router()
+    invalid_results = [
+        {"outcome": {"outcome": "selected", "optionId": "allow_session"}, "extra": True},
+        {"outcome": {"outcome": "selected", "optionId": "allow_session", "extra": True}},
+        {"outcome": {"outcome": "selected", "optionId": "allow_always"}},
+        {"outcome": {"outcome": "cancelled", "_meta": {}}},
+        {"outcome": {"outcome": "selected", "optionId": "allow_session"}, "_meta": []},
+        {},
+    ]
+    try:
+        for request_id, result in enumerate(invalid_results, 20):
+            await router.route_daemon(permission_request(request_id, "session"))
+            before = bytes(daemon.data)
+            with pytest.raises(ProxyError, match="invalid reserved permission response"):
+                await router.route_client({
+                    "jsonrpc": "2.0", "id": request_id, "result": result,
+                })
+            assert bytes(daemon.data) == before
+        await router.route_daemon(permission_request(30, "session"))
+        before = bytes(daemon.data)
+        with pytest.raises(ProxyError, match="invalid reserved permission response"):
+            await router.route_client({
+                "jsonrpc": "2.0", "id": 30,
+                "result": {"outcome": {"outcome": "selected", "optionId": "allow_session"}},
+                "extra": True,
+            })
+        assert bytes(daemon.data) == before
+        await router.route_daemon(permission_request(31, "session"))
+        router._active_sessions.clear()
+        with pytest.raises(ProxyError, match="stale reserved permission response"):
+            await router.route_client({
+                "jsonrpc": "2.0", "id": 31,
+                "result": {"outcome": {"outcome": "selected", "optionId": "allow_session"}},
+            })
+        with pytest.raises(ProxyError, match="unsolicited response"):
+            await router.route_client({
+                "jsonrpc": "2.0", "id": "uncorrelated",
+                "result": {"outcome": {"outcome": "selected", "optionId": "allow_session"}},
+            })
+        assert len(router._grants) == 0
+    finally:
+        await router.close()
+
+
+@pytest.mark.asyncio
+async def test_hosted_disconnect_revokes_session_grants(tmp_path: Path) -> None:
+    router, _, daemon, _, connection_id = await hosted_router(tmp_path)
+    try:
+        await grant_session(router, 80, "session")
+        assert router._grants.allows("session", "hands_edit")
+        await router.route_daemon({
+            "jsonrpc": "2.0", "id": 81, "method": "mcp/disconnect",
+            "params": {"connectionId": connection_id},
+        })
+        assert len(router._grants) == 0
+        assert messages(daemon)[-1]["id"] == 81
+    finally:
+        await router.close()
+
+
+@pytest.mark.asyncio
+async def test_framing_and_generation_failures_revoke_grants(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    router, _, _ = await active_router()
+    await grant_session(router, 90, "session")
+    router._fail_generation(ConnectionError("daemon failed"))
+    assert len(router._grants) == 0
+    await router.close()
+
+    framing_router, _, _ = await active_router()
+    await grant_session(framing_router, 91, "session")
+    client_reader = asyncio.StreamReader()
+    client_reader.feed_data(b"malformed\n")
+    client_reader.feed_eof()
+    daemon_reader = asyncio.StreamReader()
+    monkeypatch.setattr(
+        "mimir.acp.proxy.ProxyRouter",
+        lambda client_writer, daemon_writer, credential: framing_router,
+    )
+    with pytest.raises(ProxyError, match="invalid frame"):
+        await run_router(
+            client_reader, Writer(), daemon_reader, Writer(), "secret",
+            close_on_daemon_exit=True,
+        )
+    assert len(framing_router._grants) == 0
 
 
 def test_permission_grant_store_keys_exact_session_and_wrapper() -> None:
@@ -891,7 +1013,7 @@ class IntegratedCore:
         context = get_turn_capability_context()
         assert context is not None
         turn_id = kwargs["turn_id"]
-        arguments = {"path": "note", "oldText": "old", "newText": "new"}
+        arguments = {"path": "note", "old_text": "old", "new_text": "new"}
         self.bus.publish({
             "turn_id": turn_id,
             "channel_id": event.channel_id,
@@ -900,11 +1022,11 @@ class IntegratedCore:
             "type": "tool_call",
             "phase": "start",
             "id": "edit-1",
-            "tool_name": "hands_edit",
+            "tool_name": "legacy_edit",
             "args": arguments,
         })
         decision = await context.permission_broker.request_permission(
-            PermissionEligibility("edit-1", "hands_edit", "other", arguments)
+            PermissionEligibility("edit-1", "legacy_edit", "other", arguments)
         )
         assert decision is PermissionDecision.ALLOW_ONCE
         result = await self.channels.send(event.channel_id, "done")

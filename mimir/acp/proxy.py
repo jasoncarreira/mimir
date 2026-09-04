@@ -34,10 +34,7 @@ PERMISSION_OPTIONS = [
     {"optionId": "reject_once", "name": "Reject once", "kind": "reject_once"},
 ]
 HANDS_PERMISSION_ARGUMENTS = {
-    "hands_edit": (
-        frozenset({"path", "old_text", "new_text"}),
-        frozenset({"path", "oldText", "newText"}),
-    ),
+    "hands_edit": (frozenset({"path", "old_text", "new_text"}),),
     "hands_shell": (frozenset({"command"}),),
 }
 
@@ -180,25 +177,41 @@ class _PendingPermission:
     generation: object
 
 
-def _permission_candidate(message: dict[str, Any]) -> tuple[str, str, bool] | None:
+def _related_permission(message: dict[str, Any]) -> bool:
     if message.get("method") != PERMISSION_METHOD:
-        return None
+        return False
     params = message.get("params")
     if not isinstance(params, dict):
-        return None
+        return False
     tool_call = params.get("toolCall")
     metadata = params.get("_meta")
-    if metadata is None and "_meta" not in params:
+    hands_identity = (
+        isinstance(tool_call, dict)
+        and tool_call.get("title") in HANDS_PERMISSION_ARGUMENTS
+    )
+    reserved_metadata = isinstance(metadata, dict) and any(
+        key == "mimir" or key.startswith("mimir.") for key in metadata
+    )
+    return hands_identity or reserved_metadata
+
+
+def _permission_candidate(
+    message: dict[str, Any], kind: str
+) -> tuple[str, str, bool] | None:
+    if not _related_permission(message):
         return None
-    if metadata is None:
-        return None
+    if kind != "request" or set(message) != {"jsonrpc", "id", "method", "params"}:
+        raise ProxyError("invalid reserved permission request")
+    params = message["params"]
+    if not isinstance(params, dict):
+        raise ProxyError("invalid reserved permission request")
+    tool_call = params.get("toolCall")
+    metadata = params.get("_meta")
     if not isinstance(metadata, dict):
         raise ProxyError("invalid reserved permission metadata")
     reserved = {
         key for key in metadata if key == "mimir" or key.startswith("mimir.")
     }
-    if not reserved:
-        return None
     if not reserved.issubset({"mimir.wrapper", "mimir.tainted"}):
         raise ProxyError("invalid reserved permission metadata")
     wrapper_name = metadata.get("mimir.wrapper")
@@ -235,22 +248,50 @@ def _permission_candidate(message: dict[str, Any]) -> tuple[str, str, bool] | No
     return session_id, wrapper_name, "mimir.tainted" in metadata
 
 
-def _is_allow_session_response(message: dict[str, Any]) -> bool:
-    result = message.get("result")
-    if not isinstance(result, dict) or set(result) - {"outcome", "_meta"}:
-        return False
+def _permission_response_decision(message: dict[str, Any]) -> str | None:
+    if set(message) == {"jsonrpc", "id", "error"}:
+        error = message["error"]
+        if (
+            isinstance(error, dict)
+            and {"code", "message"}.issubset(error)
+            and set(error).issubset({"code", "message", "data"})
+            and isinstance(error["code"], int)
+            and not isinstance(error["code"], bool)
+            and isinstance(error["message"], str)
+        ):
+            return None
+        raise ProxyError("invalid reserved permission response")
+    if set(message) != {"jsonrpc", "id", "result"}:
+        raise ProxyError("invalid reserved permission response")
+    result = message["result"]
+    if not isinstance(result, dict) or not set(result).issubset({"outcome", "_meta"}):
+        raise ProxyError("invalid reserved permission response")
+    if "outcome" not in result:
+        raise ProxyError("invalid reserved permission response")
     if "_meta" in result and result["_meta"] is not None and not isinstance(
         result["_meta"], dict
     ):
-        return False
+        raise ProxyError("invalid reserved permission response")
     outcome = result.get("outcome")
-    if not isinstance(outcome, dict) or set(outcome) - {"outcome", "optionId", "_meta"}:
-        return False
+    if not isinstance(outcome, dict):
+        raise ProxyError("invalid reserved permission response")
+    if outcome.get("outcome") == "cancelled":
+        if set(outcome) != {"outcome"}:
+            raise ProxyError("invalid reserved permission response")
+        return "cancelled"
+    if set(outcome) - {"outcome", "optionId", "_meta"} or not {
+        "outcome", "optionId"
+    }.issubset(outcome):
+        raise ProxyError("invalid reserved permission response")
     if "_meta" in outcome and outcome["_meta"] is not None and not isinstance(
         outcome["_meta"], dict
     ):
-        return False
-    return outcome.get("outcome") == "selected" and outcome.get("optionId") == "allow_session"
+        raise ProxyError("invalid reserved permission response")
+    if outcome.get("outcome") != "selected" or outcome.get("optionId") not in {
+        "allow_once", "allow_session", "reject_once",
+    }:
+        raise ProxyError("invalid reserved permission response")
+    return outcome["optionId"]
 
 
 class ProxyRouter:
@@ -290,12 +331,18 @@ class ProxyRouter:
             if key not in self._daemon_requests:
                 raise ProxyError("unsolicited response")
             pending_permission = self._daemon_requests.pop(key)
+            decision = None
+            if pending_permission is not None:
+                if (
+                    pending_permission.generation is not self._generation
+                    or pending_permission.session_id not in self._active_sessions
+                ):
+                    raise ProxyError("stale reserved permission response")
+                decision = _permission_response_decision(message)
             await self._write_daemon(message, raw)
             if (
                 pending_permission is not None
-                and pending_permission.generation is self._generation
-                and pending_permission.session_id in self._active_sessions
-                and _is_allow_session_response(message)
+                and decision == "allow_session"
             ):
                 self._grants.add(
                     pending_permission.session_id, pending_permission.wrapper_name
@@ -315,6 +362,7 @@ class ProxyRouter:
     async def route_daemon(self, message: dict[str, Any], raw: bytes | None = None) -> None:
         self._require_open()
         kind = _message_kind(message)
+        candidate = _permission_candidate(message, kind)
         if kind == "response":
             key = _request_key(message["id"])
             if key not in self._client_requests:
@@ -332,7 +380,6 @@ class ProxyRouter:
                 return
         if kind == "request":
             key = _request_key(message["id"])
-            candidate = _permission_candidate(message)
             self._register_daemon(key)
             if candidate is not None:
                 session_id, wrapper_name, tainted = candidate
