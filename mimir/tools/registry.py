@@ -492,26 +492,71 @@ def _render_approval_source(source: Any, *, include_resource_id: bool) -> str:
     return "; ".join(values)
 
 
+def _approval_source_group_key(source: Any) -> tuple[Any, ...]:
+    return (
+        source.domain,
+        source.sensitivity,
+        tuple(sorted(source.authorized_principals)),
+        source.source_kind,
+        source.integrity,
+        source.integrity_effect,
+    )
+
+
+def _render_active_ingest_source_group(group: list[Any]) -> list[str]:
+    if len(group) <= 3:
+        return [
+            f"- {_render_approval_source(source, include_resource_id=True)}"
+            for source in group
+        ]
+
+    render = _render_approval_metadata
+    source = group[0]
+    values = [
+        f"count={render(len(group))}",
+        f"principal={render(source.principal or '(unknown)')}",
+        f"domain={render(source.domain or '(unknown)')}",
+        f"bridge_instance={render(source.bridge_instance or '(unknown)')}",
+        f"sensitivity={render(source.sensitivity)}",
+        f"authorized_principals={render(sorted(source.authorized_principals))}",
+        f"source_kind={render(source.source_kind)}",
+        f"integrity={render(source.integrity)}",
+        f"integrity_effect={render(source.integrity_effect)}",
+    ]
+    resource_ids = [source.resource_id or "(unknown)" for source in group]
+    if source.domain == "filesystem":
+        try:
+            common_prefix = os.path.commonpath(resource_ids)
+        except ValueError:
+            common_prefix = ""
+        if common_prefix:
+            values.append(f"common_path_prefix={render(common_prefix)}")
+        values.append(f"example_resource_ids={render(resource_ids[:3])}")
+    return [f"- {'; '.join(values)}"]
+
+
 def _render_approval_source_summary(sources: tuple[Any, ...]) -> str:
     render = _render_approval_metadata
-    entries: list[str] = []
+    rendered_groups: list[tuple[list[str], int]] = []
+    active_ingest_grouped: dict[tuple[Any, ...], list[Any]] = {}
     grouped: dict[tuple[Any, ...], list[Any]] = {}
     for source in sources:
         if (
             source.integrity == Integrity.UNTRUSTED
             and source.integrity_effect == IntegrityEffect.ACTIVE_INGEST
         ):
-            entries.append(f"- {_render_approval_source(source, include_resource_id=True)}")
+            key = (
+                *_approval_source_group_key(source),
+                source.principal,
+                source.bridge_instance,
+            )
+            active_ingest_grouped.setdefault(key, []).append(source)
             continue
-        key = (
-            source.domain,
-            source.sensitivity,
-            tuple(sorted(source.authorized_principals)),
-            source.source_kind,
-            source.integrity,
-            source.integrity_effect,
-        )
+        key = _approval_source_group_key(source)
         grouped.setdefault(key, []).append(source)
+
+    for group in active_ingest_grouped.values():
+        rendered_groups.append((_render_active_ingest_source_group(group), len(group)))
 
     known_fields = {
         "principal", "resource_id", "bridge_instance", *_APPROVAL_SOURCE_GROUP_FIELDS,
@@ -539,14 +584,25 @@ def _render_approval_source_summary(sources: tuple[Any, ...]) -> str:
         for field_name in extra_fields:
             field_values = sorted({str(getattr(source, field_name)) for source in group})
             values.append(f"{field_name}={render(field_values)}")
-        entries.append(f"- {'; '.join(values)}")
+        rendered_groups.append(([f"- {'; '.join(values)}"], len(group)))
 
-    if not entries:
+    if not rendered_groups:
         return "- (none)"
-    shown = entries[:_MAX_APPROVAL_SOURCE_GROUPS]
-    omitted = len(entries) - len(shown)
-    if omitted:
-        shown.append(f"- {render(omitted)} additional source groups not shown")
+    shown: list[str] = []
+    omitted_groups = 0
+    omitted_sources = 0
+    for index, (group_lines, _source_count) in enumerate(rendered_groups):
+        if len(shown) + len(group_lines) > _MAX_APPROVAL_SOURCE_GROUPS:
+            omitted = rendered_groups[index:]
+            omitted_groups = len(omitted)
+            omitted_sources = sum(count for _lines, count in omitted)
+            break
+        shown.extend(group_lines)
+    if omitted_groups:
+        shown.append(
+            f"- {render(omitted_groups)} additional source groups "
+            f"({render(omitted_sources)} sources) not shown"
+        )
     return "\n".join(shown)
 
 

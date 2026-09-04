@@ -1693,7 +1693,109 @@ async def test_category_prompt_bounds_distinct_source_groups(tmp_path, monkeypat
 
     summary_lines = channels.alerts[0].split("Source summary:\n", 1)[1].splitlines()
     assert len(summary_lines) == tool_registry._MAX_APPROVAL_SOURCE_GROUPS + 1
-    assert summary_lines[-1] == "- 5 additional source groups not shown"
+    assert summary_lines[-1] == "- 5 additional source groups (5 sources) not shown"
+
+
+def test_approval_source_summary_aggregates_large_filesystem_origin():
+    sources = tuple(
+        _source(
+            "worklink:lease",
+            f"/var/lib/mimir/leases/pr-1831/checkout/file-{index}.txt",
+            domain="filesystem",
+            bridge_instance="worklink",
+            source_kind="file",
+        )
+        for index in range(356)
+    )
+
+    summary = tool_registry._render_approval_source_summary(sources)
+
+    assert len(summary.splitlines()) == 1
+    assert 'count=356; principal="worklink:lease"; domain="filesystem"' in summary
+    assert 'bridge_instance="worklink"' in summary
+    assert 'common_path_prefix="/var/lib/mimir/leases/pr-1831/checkout"' in summary
+    assert (
+        'example_resource_ids=["/var/lib/mimir/leases/pr-1831/checkout/file-0.txt", '
+        '"/var/lib/mimir/leases/pr-1831/checkout/file-1.txt", '
+        '"/var/lib/mimir/leases/pr-1831/checkout/file-2.txt"]'
+    ) in summary
+
+
+@pytest.mark.parametrize("different_field", ["principal", "bridge_instance"])
+def test_approval_source_summary_separates_active_ingest_origins(different_field):
+    common = {
+        "domain": "filesystem",
+        "source_kind": "file",
+        "authorized_principals": frozenset({"operator"}),
+    }
+    sources = []
+    for origin in ("one", "two"):
+        for index in range(4):
+            sources.append(_source(
+                origin if different_field == "principal" else "worklink:lease",
+                f"/leases/{origin}/file-{index}",
+                bridge_instance=origin if different_field == "bridge_instance" else "worklink",
+                **common,
+            ))
+
+    summary_lines = tool_registry._render_approval_source_summary(tuple(sources)).splitlines()
+
+    assert len(summary_lines) == 2
+    assert all("count=4" in line for line in summary_lines)
+    for origin in ("one", "two"):
+        origin_line = next(
+            line for line in summary_lines
+            if f'common_path_prefix="/leases/{origin}"' in line
+        )
+        expected_label = (
+            f'principal="{origin}"'
+            if different_field == "principal"
+            else f'bridge_instance="{origin}"'
+        )
+        assert expected_label in origin_line
+
+
+def test_approval_source_summary_itemizes_small_active_ingest_group():
+    sources = tuple(
+        _source("user", f"slack-C1:{index}")
+        for index in range(3)
+    )
+
+    summary_lines = tool_registry._render_approval_source_summary(sources).splitlines()
+
+    assert len(summary_lines) == 3
+    assert [f'resource_id="slack-C1:{index}"' in summary_lines[index]
+            for index in range(3)] == [True, True, True]
+
+
+def test_approval_source_summary_trailer_counts_omitted_group_sources():
+    sources = [
+        _source(
+            f"origin-{index}",
+            f"/leases/origin-{index}/file",
+            domain="filesystem",
+            bridge_instance="worklink",
+            authorized_principals=frozenset({"operator"}),
+            source_kind="file",
+        )
+        for index in range(tool_registry._MAX_APPROVAL_SOURCE_GROUPS)
+    ]
+    sources.extend(
+        _source(
+            "worklink:lease",
+            f"/leases/omitted/file-{index}",
+            domain="filesystem",
+            bridge_instance="worklink",
+            authorized_principals=frozenset({"operator"}),
+            source_kind="file",
+        )
+        for index in range(12)
+    )
+
+    summary_lines = tool_registry._render_approval_source_summary(tuple(sources)).splitlines()
+
+    assert len(summary_lines) == tool_registry._MAX_APPROVAL_SOURCE_GROUPS + 1
+    assert summary_lines[-1] == "- 1 additional source groups (12 sources) not shown"
 
 
 @pytest.mark.asyncio
