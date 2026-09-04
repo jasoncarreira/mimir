@@ -128,11 +128,18 @@ class HostedHandsProvider:
         return connection_id
 
     async def disconnect(self, connection_id: str) -> dict[str, Any]:
-        connection = self._connections.pop(connection_id, None)
+        connection = self._connections.get(connection_id)
         if connection is None:
             raise HostedMcpError(-32602, "Unknown MCP connection")
-        await self._cancel_calls(connection)
-        await self._python_kernels.retire(connection.session.session_id)
+        session_id = connection.session.session_id
+        session_connections = tuple(
+            item
+            for item in self._connections.values()
+            if item.session.session_id == session_id
+        )
+        await asyncio.gather(*(self._cancel_calls(item) for item in session_connections))
+        await self._python_kernels.retire(session_id)
+        self._connections.pop(connection_id, None)
         return {}
 
     async def cancel_session(self, session_id: str) -> None:

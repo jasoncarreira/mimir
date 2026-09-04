@@ -329,6 +329,7 @@ class ProxyRouter:
         self._client_lock = asyncio.Lock()
         self._daemon_lock = asyncio.Lock()
         self._failure: asyncio.Future[BaseException] = asyncio.get_running_loop().create_future()
+        self._generation_cleanup_task: asyncio.Task[None] | None = None
         self._closed = False
         self._generation_failed = False
 
@@ -426,6 +427,11 @@ class ProxyRouter:
 
     async def close(self) -> None:
         if self._closed:
+            if (
+                self._generation_cleanup_task is not None
+                and self._generation_cleanup_task is not asyncio.current_task()
+            ):
+                await asyncio.shield(self._generation_cleanup_task)
             return
         self._closed = True
         self._grants.clear()
@@ -437,7 +443,10 @@ class ProxyRouter:
         self._local_requests.clear()
         self._local_sessions.clear()
         self._local_connections.clear()
-        await self._provider.close()
+        if self._generation_cleanup_task is None:
+            await self._provider.close()
+        elif self._generation_cleanup_task is not asyncio.current_task():
+            await asyncio.shield(self._generation_cleanup_task)
         self._client_requests.clear()
         self._daemon_requests.clear()
         self._server_sessions.clear()
@@ -622,7 +631,7 @@ class ProxyRouter:
             session_id = self._connection_sessions[connection_id]
             self._grants.revoke_session(session_id)
             try:
-                self._cancel_local_requests(connection_id=connection_id)
+                self._cancel_local_requests(session_id=session_id)
                 result = await self._provider.disconnect(connection_id)
                 self._connection_sessions.pop(connection_id, None)
                 self._connection_provider_sessions.pop(connection_id, None)
@@ -703,7 +712,7 @@ class ProxyRouter:
         self._local_requests.pop(key, None)
         self._local_sessions.pop(key, None)
         self._local_connections.pop(key, None)
-        if key not in self._daemon_tombstones:
+        if not self._generation_failed and key not in self._daemon_tombstones:
             await self._write_daemon({"jsonrpc": "2.0", "id": key[1], "result": result})
 
     async def _fail_local(
@@ -712,7 +721,7 @@ class ProxyRouter:
         self._local_requests.pop(key, None)
         self._local_sessions.pop(key, None)
         self._local_connections.pop(key, None)
-        if key not in self._daemon_tombstones:
+        if not self._generation_failed and key not in self._daemon_tombstones:
             await self._write_daemon({"jsonrpc": "2.0", "id": key[1], "error": error.as_error()})
 
     def _tombstone(self, key: tuple[type[Any], Any]) -> None:
@@ -749,7 +758,7 @@ class ProxyRouter:
         return result
 
     def _fail_generation(self, error: BaseException) -> None:
-        if self._failure.done():
+        if self._failure.done() or self._generation_cleanup_task is not None:
             return
         self._generation_failed = True
         self._grants.clear()
@@ -766,8 +775,19 @@ class ProxyRouter:
         self._server_provider_sessions.clear()
         self._connection_sessions.clear()
         self._connection_provider_sessions.clear()
-        self._provider.kill_owned_process_groups()
-        self._failure.set_result(error)
+        self._generation_cleanup_task = asyncio.create_task(
+            self._complete_generation_failure(error)
+        )
+
+    async def _complete_generation_failure(self, error: BaseException) -> None:
+        try:
+            await self._provider.close()
+        except BaseException as cleanup_error:
+            if not self._failure.done():
+                self._failure.set_result(cleanup_error)
+            return
+        if not self._failure.done():
+            self._failure.set_result(error)
 
     async def _write_client(
         self, message: dict[str, Any], raw: bytes | None = None
