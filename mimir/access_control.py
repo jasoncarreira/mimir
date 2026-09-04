@@ -9064,7 +9064,6 @@ _PROTECTED_RESULT_DOMAINS: dict[str, str] = {
     "Glob": "filesystem",
     "Grep": "filesystem",
     "file_search": "filesystem",
-    "edit_file": "filesystem",
     "get_turn": "turn_history",
     "mimir_get_turn": "turn_history",
     "memory_query": "saga",
@@ -9157,6 +9156,7 @@ _NON_INGESTING_RESULT_TOOLS = frozenset({
     # DeepAgents state/write tools return acknowledgements or remain in-carrier.
     "write_todos",
     "write_file",
+    "edit_file",
     "task",
 })
 
@@ -9329,7 +9329,28 @@ def protected_result_source(
         from .pr_checkout_lease import active_pr_checkout_lease_for_path
 
         lease = active_pr_checkout_lease_for_path(resource_id)
-        if lease is not None:
+        registry = getattr(auth_context, "repo_pr_scope_registry", None)
+        if registry is not None:
+            review_state = registry.resolve_checkout_path(resource_id)
+            scope = getattr(review_state, "action_scope", None)
+        else:
+            scope = getattr(auth_context, "repo_pr_action_scope", None)
+            if scope is None:
+                review_state = getattr(auth_context, "repo_review_state", None)
+                scope = getattr(review_state, "action_scope", None)
+        self_login = os.environ.get("MIMIR_GITHUB_SELF_LOGIN", "").strip()
+        trusted_lease = (
+            lease is not None
+            and bool(self_login)
+            and getattr(scope, "pull_request_author", None) == self_login
+            and getattr(scope, "scope_id", None) == lease.scope_id
+            and getattr(scope, "canonical_repo", "").lower()
+            == lease.canonical_repo.lower()
+            and getattr(scope, "pr_number", None) == lease.pr_number
+            and getattr(scope, "observed_head_sha", "").lower()
+            == lease.head_sha.lower()
+        )
+        if trusted_lease:
             principal = requester
             domain = "repository"
             resource_id = (
@@ -9452,15 +9473,6 @@ def _configured_pr_checkout_lease_root() -> Path | None:
     except (OSError, RuntimeError):
         return None
     return resolved if resolved.is_dir() else None
-
-
-def _resolved_path_equals(candidate: object, expected: Path) -> bool:
-    if not isinstance(candidate, (str, Path)):
-        return False
-    try:
-        return Path(candidate).resolve(strict=True) == expected
-    except (OSError, RuntimeError):
-        return False
 
 
 def _resolved_path_contains(root: object, resource: Path) -> bool:

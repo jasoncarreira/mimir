@@ -1446,7 +1446,7 @@ def test_self_authored_active_lease_is_trusted_but_arbitrary_root_is_not(
     ]
 
 
-def test_active_lease_record_not_pr_authorship_determines_repository_source(
+def test_non_self_authored_active_lease_is_untrusted_active_ingest(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1469,9 +1469,9 @@ def test_active_lease_record_not_pr_authorship_determines_repository_source(
         resource_id=str(target), bridge_instance="filesystem",
     )
 
-    assert source.domain == "repository"
+    assert source.domain == "filesystem"
     assert (source.integrity, source.integrity_effect) == (
-        "trusted", "informational",
+        "untrusted", "active_ingest",
     )
 
 

@@ -24,6 +24,11 @@ from mimir.models import (
 from mimir.pr_checkout_lease import active_pr_checkout_lease_for_path
 
 
+@pytest.fixture(autouse=True)
+def _self_login(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("MIMIR_GITHUB_SELF_LOGIN", "mimir-bot")
+
+
 def _recorded_lease(
     root: Path,
     *,
@@ -47,7 +52,7 @@ def _recorded_lease(
         "head_sha": "a" * 40,
         "destination_ref": "refs/heads/worklink/7",
         "owner": "mimir-bot",
-        "scope_id": "scope-id",
+        "scope_id": _scope(repository).scope_id,
         "path": str(checkout),
         "lease_root": str(root),
         "created_at": now.isoformat(),
@@ -61,7 +66,11 @@ def _recorded_lease(
     return checkout, target, record
 
 
-def _scope(repository: str = "owner/repo") -> RepoPRActionScope:
+def _scope(
+    repository: str = "owner/repo",
+    *,
+    pr_number: int = 7,
+) -> RepoPRActionScope:
     return RepoPRActionScope(
         provenance="server_discovered",
         canonical_repo=repository,
@@ -70,13 +79,14 @@ def _scope(repository: str = "owner/repo") -> RepoPRActionScope:
         principal="mimir-bot",
         event_type="pr_review",
         allowed_operations=frozenset({"repo.push"}),
-        pr_number=7,
+        pr_number=pr_number,
         head_repo=repository,
         head_remote="origin",
         destination_ref="refs/heads/worklink/7",
         observed_head_sha="a" * 40,
         base_ref="main",
         observed_base_sha="b" * 40,
+        pull_request_author="mimir-bot",
     )
 
 
@@ -84,6 +94,7 @@ def _auth(
     labels: InformationFlowLabels | None = None,
     *,
     repository: str = "owner/repo",
+    pr_number: int = 7,
 ) -> AuthContext:
     current = labels or InformationFlowLabels()
     return AuthContext(
@@ -97,11 +108,11 @@ def _auth(
         enforcement_enabled=True,
         ifc_labels=current,
         ifc_state=InformationFlowState(labels=current),
-        repo_pr_action_scope=_scope(repository),
+        repo_pr_action_scope=_scope(repository, pr_number=pr_number),
     )
 
 
-@pytest.mark.parametrize("tool_name", ["read_file", "grep", "edit_file"])
+@pytest.mark.parametrize("tool_name", ["read_file", "grep"])
 def test_active_lease_file_results_use_repository_source_labels(
     tool_name: str,
     tmp_path: Path,
@@ -134,6 +145,51 @@ def test_active_lease_file_results_use_repository_source_labels(
     assert source.bridge_instance == "forge"
     assert source.integrity == "trusted"
     assert source.integrity_effect == "informational"
+
+
+def test_cross_pr_scope_keeps_lease_read_untrusted_filesystem_ingest(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    lease_root = tmp_path / "leases"
+    lease_root.mkdir()
+    _checkout, target, _record = _recorded_lease(lease_root)
+    monkeypatch.setenv("MIMIR_PR_CHECKOUT_LEASE_ROOT", str(lease_root))
+    monkeypatch.setenv("MIMIR_GITHUB_SELF_LOGIN", "mimir-bot")
+
+    source = protected_result_source(
+        _auth(pr_number=8), principal="filesystem", domain="filesystem",
+        resource_id=str(target), bridge_instance="filesystem",
+    )
+
+    assert source.domain == "filesystem"
+    assert (source.integrity, source.integrity_effect) == (
+        "untrusted", "active_ingest",
+    )
+
+
+def test_edit_file_acknowledgement_does_not_ingest_a_source(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    lease_root = tmp_path / "leases"
+    lease_root.mkdir()
+    _checkout, target, _record = _recorded_lease(lease_root)
+    monkeypatch.setenv("MIMIR_PR_CHECKOUT_LEASE_ROOT", str(lease_root))
+
+    labels = classify_protected_result(
+        "edit_file",
+        {"file_path": str(target)},
+        _auth(),
+        ToolAuthorization(
+            tool_name="edit_file",
+            decision=OperationDecision.RESOURCE_SCOPED,
+            allowed=True,
+        ),
+        result="Successfully replaced 1 instance(s)",
+    )
+
+    assert labels is None
 
 
 @pytest.mark.parametrize("record_state", ["missing", "expired", "malformed"])
