@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 import fcntl
 import json
@@ -932,6 +932,195 @@ def _retained_candidate_head(
     return head
 
 
+def _patches_match_published_head(
+    lease: PRCheckoutLease,
+    *,
+    head: str,
+    base_ref: str,
+    runner: Runner,
+) -> bool:
+    """Compare the PR-side patches on divergent published and retained histories."""
+    base_name = base_ref.removeprefix("refs/heads/")
+    if runner(["git", "check-ref-format", "--branch", base_name]).returncode != 0:
+        raise RuntimeError("PR checkout lease tracked base ref is invalid")
+    tracked_base = _run(
+        runner,
+        [
+            "git", "-C", str(lease.path), "rev-parse", "--verify",
+            f"refs/remotes/origin/{base_name}^{{commit}}",
+        ],
+        "PR checkout lease tracked base is unavailable",
+    ).lower()
+
+    def unique_base(revision: str) -> str:
+        bases = _run(
+            runner,
+            ["git", "-C", str(lease.path), "merge-base", "--all", revision, tracked_base],
+            "PR checkout lease candidate has no verifiable tracked base",
+        ).splitlines()
+        if len(bases) != 1:
+            raise RuntimeError("PR checkout lease candidate has no unique tracked base")
+        return bases[0].lower()
+
+    def only_equivalent(upstream: str, revision: str, limit: str) -> bool:
+        result = runner([
+            "git", "-C", str(lease.path), "cherry", upstream, revision, limit,
+        ])
+        if result.returncode != 0:
+            raise RuntimeError(
+                (result.stderr or result.stdout).strip()
+                or "PR checkout lease patch comparison failed"
+            )
+        records = [line for line in result.stdout.splitlines() if line]
+        return all(
+            len(line) == 42
+            and line.startswith("- ")
+            and all(character in "0123456789abcdef" for character in line[2:].lower())
+            for line in records
+        )
+
+    published = lease.head_sha.lower()
+    return (
+        only_equivalent(published, head, unique_base(head))
+        and only_equivalent(head, published, unique_base(published))
+    )
+
+
+def _foreign_candidate_head(
+    lease: PRCheckoutLease,
+    scope: RepoPRActionScope,
+    *,
+    owner: str,
+    runner: Runner,
+) -> tuple[str, bool]:
+    """Classify same-PR work from another turn without trusting its scope id."""
+    head = _run(
+        runner,
+        ["git", "-C", str(lease.path), "rev-parse", "--verify", "HEAD"],
+        "retained PR checkout has no HEAD",
+    ).lower()
+    expected_source = Path(scope.canonical_root).resolve(strict=True)
+    if (
+        lease.canonical_repo != scope.canonical_repo
+        or lease.canonical_origin != scope.canonical_origin
+        or lease.source_root.resolve(strict=True) != expected_source
+        or lease.owner != owner
+        or lease.pr_number != scope.pr_number
+        or lease.destination_ref != scope.destination_ref
+        or lease.head_sha.lower() != scope.observed_head_sha.lower()
+    ):
+        return head, False
+    origin = _run(
+        runner,
+        ["git", "-C", str(lease.path), "config", "--get", "remote.origin.url"],
+        "retained PR checkout has no origin",
+    )
+    branch = _run(
+        runner,
+        ["git", "-C", str(lease.path), "symbolic-ref", "--quiet", "--short", "HEAD"],
+        "retained PR checkout is detached",
+    )
+    if origin != scope.canonical_origin or branch != scope.head_ref:
+        return head, False
+    _assert_self_contained_checkout(lease.path, runner=runner)
+    ancestor = runner([
+        "git", "-C", str(lease.path), "merge-base", "--is-ancestor",
+        scope.observed_head_sha.lower(), head,
+    ])
+    if ancestor.returncode == 0:
+        return head, True
+    if ancestor.returncode != 1:
+        raise RuntimeError(
+            (ancestor.stderr or ancestor.stdout).strip()
+            or "PR checkout lease candidate ancestry inspection failed"
+        )
+    try:
+        equivalent = _patches_match_published_head(
+            lease, head=head, base_ref=scope.base_ref, runner=runner,
+        )
+    except RuntimeError:
+        equivalent = False
+    return head, equivalent
+
+
+def _rebind_foreign_candidate(
+    lease: PRCheckoutLease,
+    scope: RepoPRActionScope,
+    *,
+    head: str,
+    ttl: timedelta,
+    review_state: RepoReviewState | None,
+    runner: Runner,
+) -> PRCheckoutLease:
+    """Move a proven same-PR lease onto the current immutable turn scope."""
+    _run(
+        runner,
+        [
+            "git", "-C", str(lease.path), "fetch", "--no-tags", "origin",
+            scope.checkout_ref or scope.destination_ref,
+        ],
+        "PR head fetch failed during lease recovery",
+    )
+    remote_head = _run(
+        runner,
+        ["git", "-C", str(lease.path), "rev-parse", "--verify", "FETCH_HEAD^{commit}"],
+        "fetched PR head is missing during lease recovery",
+    ).lower()
+    if remote_head != scope.observed_head_sha.lower():
+        raise RuntimeError(
+            f"PR head advanced: scoped head {scope.observed_head_sha.lower()} is stale; "
+            f"fetched head is {remote_head}"
+        )
+    _run(
+        runner,
+        ["git", "-C", str(lease.path), "fetch", "--no-tags", "origin", scope.base_ref],
+        "PR base fetch failed during lease recovery",
+    )
+    actual_base = _run(
+        runner,
+        ["git", "-C", str(lease.path), "rev-parse", "--verify", "FETCH_HEAD^{commit}"],
+        "fetched PR base is missing during lease recovery",
+    ).lower()
+    base_ancestry = runner([
+        "git", "-C", str(lease.path), "merge-base", "--is-ancestor",
+        scope.observed_base_sha.lower(), actual_base,
+    ])
+    if base_ancestry.returncode != 0:
+        raise RuntimeError(
+            (base_ancestry.stderr or base_ancestry.stdout).strip()
+            or "PR checkout lease current base ancestry check failed"
+        )
+    if _run(
+        runner,
+        ["git", "-C", str(lease.path), "rev-parse", "--verify", "HEAD"],
+        "retained PR checkout has no HEAD",
+    ).lower() != head:
+        raise RuntimeError("retained PR checkout HEAD changed during lease recovery")
+
+    rebound = replace(
+        lease,
+        scope_base_sha=scope.observed_base_sha.lower(),
+        base_sha=actual_base,
+        scope_id=scope.scope_id,
+        expires_at=datetime.now(UTC) + ttl,
+        recovered=True,
+        pr_number=scope.pr_number,
+    )
+    metadata_path = lease.path / _METADATA
+    staging = metadata_path.with_name(f".{metadata_path.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        staging.write_text(
+            json.dumps(_metadata(rebound), sort_keys=True) + "\n", encoding="utf-8",
+        )
+        os.replace(staging, metadata_path)
+    finally:
+        staging.unlink(missing_ok=True)
+    if review_state is not None:
+        review_state.attach_checkout_lease(rebound)
+        review_state.record_git_head(scope.scope_id, head)
+    return rebound
+
+
 def acquire_pr_checkout_lease(
     scope: RepoPRActionScope,
     *,
@@ -995,11 +1184,8 @@ def acquire_pr_checkout_lease(
             ))
             for path in paths
         ]
-        unpublished = [
-            (path, head) for path, head in candidates
-            if head != scope.observed_head_sha.lower()
-        ]
         foreign_candidates: list[tuple[Path, str]] = []
+        rebound_candidates: dict[Path, PRCheckoutLease] = {}
         if foreign_leases:
             try:
                 observed_head = _observe_current_pr_head(scope)
@@ -1066,13 +1252,19 @@ def acquire_pr_checkout_lease(
                 _report_superseded_lease(scope, lease, observed_head)
             foreign_leases = [lease for lease in foreign_leases if lease not in stale]
             for lease in foreign_leases:
-                head = _run(
-                    runner,
-                    ["git", "-C", str(lease.path), "rev-parse", "--verify", "HEAD"],
-                    "retained PR checkout has no HEAD",
-                ).lower()
-                foreign_candidates.append((lease.path, head))
+                head, reusable = _foreign_candidate_head(
+                    lease, scope, owner=owner, runner=runner,
+                )
+                if reusable and observed_head == scope.observed_head_sha.lower():
+                    candidates.append((lease.path, head))
+                    rebound_candidates[lease.path] = lease
+                else:
+                    foreign_candidates.append((lease.path, head))
 
+        unpublished = [
+            (path, head) for path, head in candidates
+            if head != scope.observed_head_sha.lower()
+        ]
         if foreign_candidates:
             _report_retained_candidates(
                 "pr_checkout_lease_scope_conflict",
@@ -1098,17 +1290,27 @@ def acquire_pr_checkout_lease(
                 f"refusing implicit selection: {named}"
             )
         if candidates:
-            chosen_path, _head = unpublished[0] if unpublished else candidates[0]
-            lease = recover_pr_checkout_lease(
-                chosen_path,
-                scope,
-                owner=owner,
-                lease_root=root,
-                renew_expired=True,
-                ttl=ttl,
-                review_state=review_state,
-                runner=runner,
-            )
+            chosen_path, chosen_head = unpublished[0] if unpublished else candidates[0]
+            if chosen_path in rebound_candidates:
+                lease = _rebind_foreign_candidate(
+                    rebound_candidates[chosen_path],
+                    scope,
+                    head=chosen_head,
+                    ttl=ttl,
+                    review_state=review_state,
+                    runner=runner,
+                )
+            else:
+                lease = recover_pr_checkout_lease(
+                    chosen_path,
+                    scope,
+                    owner=owner,
+                    lease_root=root,
+                    renew_expired=True,
+                    ttl=ttl,
+                    review_state=review_state,
+                    runner=runner,
+                )
             if unpublished:
                 _report_retained_candidates(
                     "pr_checkout_lease_resumed", scope, unpublished,

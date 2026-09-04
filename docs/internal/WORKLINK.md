@@ -882,6 +882,17 @@ closed when `WORKLINK_REPO` is absent.
 
 Current slice-1 recovery is manual:
 
+- **PR remediation checkout lease:** never rebase inside a lease whose destination
+  publication policy does not permit a force-with-lease push. Use `repo_merge` to
+  merge `main` into the PR branch instead; this preserves a fast-forward push and
+  lets a later turn reacquire committed or uncommitted lease work. Force-push
+  approval remains turn-scoped, so any permitted rewritten push must be approved
+  and published by the same turn that holds the lease.
+- **Stranded rebased PR lease:** do not reset or delete the checkout. Preserve its
+  HEAD as a verified Git bundle under the lease root's `.recovery/` directory
+  (and archive dirty worktree files), then have the operator inspect and publish
+  the recovered commits with an explicit force-with-lease operation. Remove the
+  stranded checkout only after publication is independently verified.
 - **Parked factory epic:** when factory ownership is the cause, run the factory's
   `amend-paths` recovery first, then relaunch the epic normally. Worklink verifies
   the retained sandbox and resumes it in place with the retained session. A

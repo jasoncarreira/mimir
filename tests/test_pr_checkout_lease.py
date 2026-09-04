@@ -160,6 +160,103 @@ def test_second_attempt_resumes_unpushed_commit(
     )
 
 
+@pytest.mark.parametrize("work_kind", ["uncommitted", "committed"])
+def test_later_turn_reuses_same_pr_fast_forward_candidate(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    work_kind: str,
+) -> None:
+    _repo, scope = _repo_and_scope(tmp_path)
+    lease_root = tmp_path / "leases"
+    lease_root.mkdir()
+    earlier_scope = replace(scope, event_type="pr_review_requested")
+    earlier = create_pr_checkout_lease(
+        earlier_scope, owner=earlier_scope.principal, lease_root=lease_root,
+    )
+    (earlier.path / "fix.txt").write_text("same PR fix\n", encoding="utf-8")
+    if work_kind == "committed":
+        _git(earlier.path, "add", "fix.txt")
+        _git(earlier.path, "commit", "-q", "-m", "same PR fix")
+    candidate_head = _git(earlier.path, "rev-parse", "HEAD")
+    state = RepoReviewState(scope)
+    monkeypatch.setattr(
+        "mimir.pr_checkout_lease._observe_current_pr_head",
+        lambda _scope: scope.observed_head_sha,
+    )
+
+    resumed, candidates = acquire_pr_checkout_lease(
+        scope, owner=scope.principal, lease_root=lease_root, review_state=state,
+    )
+
+    assert resumed.path == earlier.path
+    assert resumed.scope_id == scope.scope_id
+    assert resumed.recovered is True
+    assert candidates == ((candidate_head,) if work_kind == "committed" else ())
+    assert state.checkout_lease is resumed
+    assert state.git_expected_head == candidate_head
+    assert (resumed.path / "fix.txt").read_text(encoding="utf-8") == "same PR fix\n"
+
+
+def test_later_turn_reuses_patch_identical_rebased_candidate(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repo, scope = _repo_and_scope(tmp_path)
+    lease_root = tmp_path / "leases"
+    lease_root.mkdir()
+    earlier_scope = replace(scope, event_type="pr_review_requested")
+    earlier = create_pr_checkout_lease(
+        earlier_scope, owner=earlier_scope.principal, lease_root=lease_root,
+    )
+    _git(repo, "checkout", "-q", "main")
+    (repo / "base-update.txt").write_text("new base\n", encoding="utf-8")
+    _git(repo, "add", "base-update.txt")
+    _git(repo, "commit", "-q", "-m", "advance base")
+    advanced_base = _git(repo, "rev-parse", "HEAD")
+    _git(repo, "push", "-q", "origin", "HEAD:main")
+    _git(earlier.path, "fetch", "-q", "origin", "main")
+    _git(earlier.path, "rebase", "origin/main")
+    rebased_head = _git(earlier.path, "rev-parse", "HEAD")
+    current_scope = replace(scope, observed_base_sha=advanced_base)
+    monkeypatch.setattr(
+        "mimir.pr_checkout_lease._observe_current_pr_head",
+        lambda _scope: current_scope.observed_head_sha,
+    )
+
+    resumed, candidates = acquire_pr_checkout_lease(
+        current_scope, owner=current_scope.principal, lease_root=lease_root,
+    )
+
+    assert resumed.path == earlier.path
+    assert resumed.scope_id == current_scope.scope_id
+    assert candidates == (rebased_head,)
+
+
+def test_later_turn_refuses_genuinely_divergent_same_pr_candidate(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _repo, scope = _repo_and_scope(tmp_path)
+    lease_root = tmp_path / "leases"
+    lease_root.mkdir()
+    earlier_scope = replace(scope, event_type="pr_review_requested")
+    earlier = create_pr_checkout_lease(
+        earlier_scope, owner=earlier_scope.principal, lease_root=lease_root,
+    )
+    _git(earlier.path, "reset", "--hard", "refs/remotes/origin/main")
+    monkeypatch.setattr(
+        "mimir.pr_checkout_lease._observe_current_pr_head",
+        lambda _scope: scope.observed_head_sha,
+    )
+
+    with pytest.raises(RuntimeError, match="include another scope"):
+        acquire_pr_checkout_lease(
+            scope, owner=scope.principal, lease_root=lease_root,
+        )
+
+    assert earlier.path.is_dir()
+
+
 def test_fresh_acquisition_records_actual_checkout_head(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -516,11 +613,18 @@ def test_acquire_refuses_and_reports_foreign_scope_candidate(
     assert not foreign.path.name.startswith(scope.scope_id[:16])
 
     candidates = []
-    for lease, name in ((current, "current"), (foreign, "foreign")):
+    for lease, name in ((current, "current"),):
         (lease.path / f"{name}.txt").write_text(f"{name} fix\n", encoding="utf-8")
         _git(lease.path, "add", f"{name}.txt")
         _git(lease.path, "commit", "-q", "-m", f"{name} fix")
         candidates.append(_git(lease.path, "rev-parse", "HEAD"))
+    _git(foreign.path, "checkout", "-q", "--orphan", "foreign-history")
+    _git(foreign.path, "rm", "-q", "-rf", ".")
+    (foreign.path / "foreign.txt").write_text("foreign fix\n", encoding="utf-8")
+    _git(foreign.path, "add", "foreign.txt")
+    _git(foreign.path, "commit", "-q", "-m", "foreign fix")
+    _git(foreign.path, "branch", "-M", scope.head_ref)
+    candidates.append(_git(foreign.path, "rev-parse", "HEAD"))
 
     events: list[tuple[str, dict[str, object]]] = []
     monkeypatch.setattr(
@@ -776,7 +880,7 @@ def test_acquire_refuses_rebased_lease_when_tracked_base_is_unrelated(
     assert old_lease.path.is_dir()
 
 
-def test_acquire_refuses_second_live_scope_for_same_target(
+def test_acquire_reuses_second_live_scope_for_same_target(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -792,10 +896,13 @@ def test_acquire_refuses_second_live_scope_for_same_target(
         lambda _scope: scope.observed_head_sha,
     )
 
-    with pytest.raises(RuntimeError, match="include another scope"):
-        acquire_pr_checkout_lease(scope, owner=scope.principal, lease_root=lease_root)
+    resumed, candidates = acquire_pr_checkout_lease(
+        scope, owner=scope.principal, lease_root=lease_root,
+    )
 
-    assert first.path.is_dir()
+    assert resumed.path == first.path
+    assert candidates == ()
+    assert resumed.scope_id == scope.scope_id
     assert len([path for path in lease_root.iterdir() if path.is_dir()]) == 1
 
 

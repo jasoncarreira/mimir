@@ -414,6 +414,44 @@ def test_stage_and_commit_failures_report_named_redacted_git_condition(
     assert "https://[REDACTED]@example.invalid/owner/repo.git" in detail
 
 
+def test_rebase_is_refused_when_lease_cannot_publish_rewritten_history(
+    tmp_path: Path,
+) -> None:
+    _origin, source, scope, old_state = _repo_scope_and_state(tmp_path)
+    _git(source, "checkout", "-q", "main")
+    (source / "base-update.txt").write_text("advanced base\n", encoding="utf-8")
+    _git(source, "add", "base-update.txt")
+    _git(source, "commit", "-q", "-m", "advance base")
+    advanced_base = _git(source, "rev-parse", "HEAD")
+    _git(source, "push", "-q", "origin", "HEAD:main")
+    restricted_scope = replace(
+        scope,
+        event_type="pr_review_requested",
+        observed_base_sha=advanced_base,
+    )
+    state = RepoReviewState(restricted_scope)
+    lease = create_pr_checkout_lease(
+        restricted_scope,
+        owner=restricted_scope.principal,
+        lease_root=old_state.checkout_lease.lease_root,
+        review_state=state,
+    )
+    metadata_path = lease.path / ".git" / "mimir-pr-checkout-lease.json"
+    original_head = _git(lease.path, "rev-parse", "HEAD")
+    original_status = _git(lease.path, "status", "--porcelain=v1", "--untracked-files=all")
+    original_metadata = metadata_path.read_bytes()
+
+    with pytest.raises(GitRefusal) as refusal:
+        RepoGitTools(state).execute(GitRebase())
+
+    assert refusal.value.code == "rebase_in_lease_refused"
+    assert "use repo_merge to merge main instead" in str(refusal.value)
+    assert _git(lease.path, "rev-parse", "HEAD") == original_head
+    assert _git(lease.path, "status", "--porcelain=v1", "--untracked-files=all") == original_status
+    assert metadata_path.read_bytes() == original_metadata
+    assert not (lease.path / ".git" / "rebase-merge").exists()
+
+
 def test_rebase_conflict_has_separately_modeled_working_abort(tmp_path: Path) -> None:
     origin, source, scope, _old_state = _repo_scope_and_state(tmp_path)
     _git(source, "checkout", "-q", "main")
@@ -1043,6 +1081,7 @@ def test_unrelated_event_force_push_refuses_before_any_network_call(
     with pytest.raises(GitRefusal) as refusal:
         tools.execute(GitPush())
     assert refusal.value.code == "force_push_refused"
+    assert "same turn holding this checkout lease" in str(refusal.value)
     assert network_seen is False
 
 
