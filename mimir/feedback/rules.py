@@ -76,6 +76,8 @@ _EVENT_RULES: dict[str, tuple[Polarity, str]] = {
     "saga_decay_error": ("negative", "saga_decay_error"),
     "saga_forget_error": ("negative", "saga_forget_error"),
     "saga_synthesis_dispatch_failed": ("negative", "synth_dispatch_fail"),
+    # Interactive empty windows and turns.jsonl rotation anomalies are negative.
+    # Service no-ops emit saga_synthesis_skipped_no_turns, intentionally unscored.
     "saga_synthesis_empty_window": ("negative", "synth_empty_window"),
     # CR#19: synthesis-turn post-check; agent ran the synthesis turn
     # but skipped step 3 (saga_end_session). Without the sessions row

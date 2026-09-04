@@ -17,6 +17,7 @@ silently shipping an empty-block prompt to the model.
 from __future__ import annotations
 
 import ast
+import asyncio
 import json
 import inspect
 import os
@@ -797,9 +798,33 @@ async def test_mixed_session_synthesis_uses_only_clean_turns(
 
 
 @pytest.mark.asyncio
-async def test_all_tainted_session_does_not_dispatch_boundary_synthesis(
+@pytest.mark.parametrize(
+    ("channel_id", "expected_event", "expected_classification"),
+    [
+        (
+            "scheduler:heartbeat",
+            "saga_synthesis_skipped_no_turns",
+            None,
+        ),
+        (
+            "poller:github-activity",
+            "saga_synthesis_skipped_no_turns",
+            None,
+        ),
+        (
+            "discord-1",
+            "saga_synthesis_empty_window",
+            ("negative", "synth_empty_window"),
+        ),
+    ],
+)
+async def test_empty_trusted_session_does_not_dispatch_boundary_synthesis(
     tmp_path: Path,
+    channel_id: str,
+    expected_event: str,
+    expected_classification: tuple[str, str] | None,
 ) -> None:
+    from mimir.feedback import classify
     from mimir.runtime import dispatch_session_synthesis
 
     turns_path = tmp_path / "turns.jsonl"
@@ -807,7 +832,7 @@ async def test_all_tainted_session_does_not_dispatch_boundary_synthesis(
         "turn_id": "tainted",
         "ts": "2026-08-30T10:00:00+00:00",
         "saga_session_id": "sess-tainted",
-        "channel_id": "ch-1",
+        "channel_id": channel_id,
         "integrity": "untrusted",
     }))
     events: list[tuple[str, dict]] = []
@@ -825,7 +850,7 @@ async def test_all_tainted_session_does_not_dispatch_boundary_synthesis(
     dispatcher = Dispatcher()
     session = SimpleNamespace(
         saga_session_id="sess-tainted",
-        channel_id="ch-1",
+        channel_id=channel_id,
         source_acl=None,
     )
     config = SimpleNamespace(
@@ -842,18 +867,28 @@ async def test_all_tainted_session_does_not_dispatch_boundary_synthesis(
 
     assert accepted is False
     assert dispatcher.calls == 0
-    assert events[0][0] == "saga_synthesis_empty_window"
+    assert [event_type for event_type, _payload in events] == [expected_event]
+    assert classify(expected_event) == expected_classification
 
 
 @pytest.mark.asyncio
 async def test_build_synthesis_prompt_handles_empty_window(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """When the session has no recorded turns, ``_build_synthesis_prompt``
     must still emit a valid synthesis prompt (the lean variant) rather
     than crashing. Pre-181-H regression — _filter_session_turns
     returning [] should produce a template render, not a KeyError.
     """
+    from mimir.feedback import classify
+
+    events: list[tuple[str, dict]] = []
+
+    async def capture(event_type: str, **payload) -> None:
+        events.append((event_type, payload))
+
+    monkeypatch.setattr("mimir.agent.log_event", capture)
     agent = _make_agent(tmp_path)
     event = AgentEvent(
         trigger="saga_session_end",
@@ -863,10 +898,18 @@ async def test_build_synthesis_prompt_handles_empty_window(
     )
     ctx = _make_ctx(event, saga_session_id="sess-empty")
     rendered = await agent._build_synthesis_prompt(ctx, event)
+    await asyncio.gather(*tuple(agent._bg_tasks))
     assert isinstance(rendered, PromptBlock)
     assert "sess-empty" in rendered.content
     assert rendered.content  # non-empty
     assert rendered.labels == InformationFlowLabels()
+    assert [event_type for event_type, _payload in events] == [
+        "saga_synthesis_empty_window",
+    ]
+    assert events[0][1]["reason"] == (
+        "turns.jsonl rotated past this session's records"
+    )
+    assert classify(events[0][0]) == ("negative", "synth_empty_window")
 
 
 # ─── Full-block-stack regression coverage ───────────────────────────
