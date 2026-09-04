@@ -16,7 +16,7 @@ import yaml
 from mimir.acp.daemon import AcpDaemon
 from mimir.acp.hosted import HostedMcpError
 from mimir.acp.profiles import Profile, ProfileStore
-from mimir.acp.proxy import MAX_FRAME_BYTES, FrameWriter, ProxyError, ProxyRouter, _route_stream, run_local_proxy, run_router
+from mimir.acp.proxy import MAX_FRAME_BYTES, FrameWriter, PermissionGrantStore, ProxyError, ProxyRouter, _route_stream, run_local_proxy, run_router
 from mimir.channel_registry import ChannelRegistry
 from mimir.identities import IdentityResolver, hash_web_key
 from mimir.tools.client_provider import MIMIR_HANDS_V1, PermissionDecision, PermissionEligibility, get_turn_capability_context
@@ -90,6 +90,365 @@ async def hosted_router(tmp_path: Path) -> tuple[ProxyRouter, Writer, Writer, st
         "jsonrpc": "2.0", "id": "new", "result": {"sessionId": "session"}
     })
     return router, client, daemon, server_id, connection_id
+
+
+def permission_request(
+    request_id: str | int,
+    session_id: str,
+    wrapper_name: str = "hands_edit",
+    *,
+    tainted: bool = False,
+) -> dict[str, Any]:
+    metadata: dict[str, Any] = {"mimir.wrapper": wrapper_name}
+    if tainted:
+        metadata["mimir.tainted"] = True
+    raw_input = (
+        {"path": "note", "old_text": "old", "new_text": "new"}
+        if wrapper_name == "hands_edit"
+        else {"command": "true"}
+    )
+    return {
+        "jsonrpc": "2.0",
+        "id": request_id,
+        "method": "session/request_permission",
+        "params": {
+            "sessionId": session_id,
+            "toolCall": {
+                "toolCallId": f"call-{request_id}",
+                "title": wrapper_name,
+                "kind": "other",
+                "status": "pending",
+                "rawInput": raw_input,
+            },
+            "options": [
+                {"optionId": "allow_once", "name": "Allow once", "kind": "allow_once"},
+                {"optionId": "allow_session", "name": "Allow for this session", "kind": "allow_always"},
+                {"optionId": "reject_once", "name": "Reject once", "kind": "reject_once"},
+            ],
+            "_meta": metadata,
+        },
+    }
+
+
+async def active_router(session_id: str = "session") -> tuple[ProxyRouter, Writer, Writer]:
+    client = Writer()
+    daemon = Writer()
+    router = ProxyRouter(client, daemon, "secret")
+    await router.route_client({
+        "jsonrpc": "2.0",
+        "id": "new",
+        "method": "session/new",
+        "params": {
+            "cwd": "/workspace",
+            "mcpServers": [{"type": "acp", "name": "other", "serverId": "foreign"}],
+        },
+    })
+    await router.route_daemon({
+        "jsonrpc": "2.0", "id": "new", "result": {"sessionId": session_id}
+    })
+    client.data.clear()
+    daemon.data.clear()
+    return router, client, daemon
+
+
+async def grant_session(
+    router: ProxyRouter,
+    request_id: str | int,
+    session_id: str,
+    wrapper_name: str = "hands_edit",
+) -> None:
+    await router.route_daemon(permission_request(request_id, session_id, wrapper_name))
+    await router.route_client({
+        "jsonrpc": "2.0",
+        "id": request_id,
+        "result": {"outcome": {"outcome": "selected", "optionId": "allow_session"}},
+    })
+
+
+@pytest.mark.asyncio
+async def test_allow_session_grant_is_recorded_only_after_wire_and_audit_request() -> None:
+    router, client, daemon = await active_router()
+    try:
+        request = permission_request(7, "session")
+        await router.route_daemon(request, frame(request))
+        assert bytes(client.data) == frame(request)
+        assert len(router._grants) == 0
+        response = {
+            "jsonrpc": "2.0",
+            "id": 7,
+            "result": {"outcome": {"outcome": "selected", "optionId": "allow_session"}},
+        }
+        await router.route_client(response, frame(response))
+        assert bytes(daemon.data) == frame(response)
+        assert router._grants.allows("session", "hands_edit")
+    finally:
+        await router.close()
+
+
+@pytest.mark.asyncio
+async def test_grants_are_scoped_to_session_and_wrapper() -> None:
+    router, client, daemon = await active_router("one")
+    try:
+        await grant_session(router, 1, "one")
+        await router.route_client({
+            "jsonrpc": "2.0", "id": "new-two", "method": "session/new",
+            "params": {"cwd": "/workspace", "mcpServers": [{"type": "acp", "name": "other", "serverId": "two"}]},
+        })
+        await router.route_daemon({
+            "jsonrpc": "2.0", "id": "new-two", "result": {"sessionId": "two"}
+        })
+        client.data.clear()
+        daemon.data.clear()
+        await router.route_daemon(permission_request(2, "one"))
+        assert messages(daemon)[-1]["result"]["outcome"]["optionId"] == "allow_once"
+        await router.route_daemon(permission_request(3, "one", "hands_shell"))
+        await router.route_daemon(permission_request(4, "two"))
+        assert [item["id"] for item in messages(client)] == [3, 4]
+    finally:
+        await router.close()
+
+
+@pytest.mark.asyncio
+async def test_grants_clear_on_load_exit_and_daemon_generation_change() -> None:
+    router, client, daemon = await active_router()
+    await grant_session(router, 1, "session")
+    assert len(router._grants) == 1
+    await router.route_client({
+        "jsonrpc": "2.0", "id": "load", "method": "session/load",
+        "params": {"cwd": "/workspace", "sessionId": "session", "mcpServers": [{"type": "acp", "name": "other", "serverId": "foreign"}]},
+    })
+    assert len(router._grants) == 0
+    await router.route_daemon({"jsonrpc": "2.0", "id": "load", "result": {}})
+    await grant_session(router, 2, "session")
+    assert len(router._grants) == 1
+    await router.close()
+    assert len(router._grants) == 0
+    replacement, replacement_client, _ = await active_router()
+    try:
+        await replacement.route_daemon(permission_request(3, "session"))
+        assert messages(replacement_client)[-1]["id"] == 3
+    finally:
+        await replacement.close()
+
+
+@pytest.mark.asyncio
+async def test_tainted_matching_request_bypasses_grant_and_reaches_human() -> None:
+    router, client, _ = await active_router()
+    try:
+        await grant_session(router, 1, "session")
+        client.data.clear()
+        request = permission_request(2, "session", tainted=True)
+        await router.route_daemon(request, frame(request))
+        assert bytes(client.data) == frame(request)
+    finally:
+        await router.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("request_id", [9, "nine"])
+async def test_untainted_matching_request_is_answered_allow_once_upstream(
+    request_id: str | int,
+) -> None:
+    router, client, daemon = await active_router()
+    try:
+        await grant_session(router, 1, "session")
+        client.data.clear()
+        daemon.data.clear()
+        await router.route_daemon(permission_request(request_id, "session"))
+        assert bytes(client.data) == b""
+        assert messages(daemon) == [{
+            "jsonrpc": "2.0", "id": request_id,
+            "result": {"outcome": {"outcome": "selected", "optionId": "allow_once"}},
+        }]
+        assert type(messages(daemon)[0]["id"]) is type(request_id)
+    finally:
+        await router.close()
+
+
+@pytest.mark.asyncio
+async def test_malformed_reserved_permission_metadata_fails_closed() -> None:
+    router, client, daemon = await active_router()
+    try:
+        invalid = []
+        false_taint = permission_request(1, "session")
+        false_taint["params"]["_meta"]["mimir.tainted"] = False
+        invalid.append(false_taint)
+        unknown_wrapper = permission_request(2, "session")
+        unknown_wrapper["params"]["_meta"]["mimir.wrapper"] = "hands_python"
+        invalid.append(unknown_wrapper)
+        wrong_options = permission_request(3, "session")
+        wrong_options["params"]["options"] = list(reversed(wrong_options["params"]["options"]))
+        invalid.append(wrong_options)
+        wrong_payload = permission_request(4, "session")
+        wrong_payload["params"]["toolCall"]["rawInput"]["extra"] = True
+        invalid.append(wrong_payload)
+        missing_wrapper = permission_request(5, "session")
+        del missing_wrapper["params"]["_meta"]["mimir.wrapper"]
+        missing_wrapper["params"]["_meta"]["mimir.tainted"] = True
+        invalid.append(missing_wrapper)
+        for request_id, metadata in enumerate((None, {}, {"other": True}, []), 6):
+            missing_metadata = permission_request(request_id, "session")
+            missing_metadata["params"]["_meta"] = metadata
+            invalid.append(missing_metadata)
+        absent_metadata = permission_request(10, "session")
+        del absent_metadata["params"]["_meta"]
+        invalid.append(absent_metadata)
+        camel_payload = permission_request(11, "session")
+        camel_payload["params"]["toolCall"]["rawInput"] = {
+            "path": "note", "oldText": "old", "newText": "new",
+        }
+        invalid.append(camel_payload)
+        wrong_identity = permission_request(12, "session")
+        wrong_identity["params"]["toolCall"]["title"] = "hands_shell"
+        invalid.append(wrong_identity)
+        extra_envelope = permission_request(13, "session")
+        extra_envelope["extra"] = True
+        invalid.append(extra_envelope)
+        extra_params = permission_request(14, "session")
+        extra_params["params"]["extra"] = True
+        invalid.append(extra_params)
+        extra_tool_call = permission_request(15, "session")
+        extra_tool_call["params"]["toolCall"]["extra"] = True
+        invalid.append(extra_tool_call)
+        for request in invalid:
+            with pytest.raises(ProxyError, match="invalid reserved permission"):
+                await router.route_daemon(request)
+        unknown_reserved = permission_request(16, "session")
+        unknown_reserved["params"]["_meta"]["mimir.unknown"] = True
+        with pytest.raises(ProxyError, match="invalid reserved permission"):
+            await router.route_daemon(unknown_reserved)
+        notification = permission_request(17, "session")
+        del notification["id"]
+        with pytest.raises(ProxyError, match="invalid reserved permission"):
+            await router.route_daemon(notification)
+        assert bytes(client.data) == bytes(daemon.data) == b""
+        assert len(router._grants) == 0
+    finally:
+        await router.close()
+
+
+@pytest.mark.asyncio
+async def test_stale_session_or_generation_reserved_traffic_fails_closed() -> None:
+    router, client, _ = await active_router()
+    with pytest.raises(ProxyError, match="stale reserved"):
+        await router.route_daemon(permission_request(1, "retired"))
+    assert bytes(client.data) == b""
+    await router.close()
+    with pytest.raises(ProxyError, match="generation is closed"):
+        await router.route_daemon(permission_request(2, "session"))
+
+
+@pytest.mark.asyncio
+async def test_non_hands_permission_frames_remain_transparent() -> None:
+    router, client, daemon = await active_router()
+    request_raw = b'{ "jsonrpc":"2.0", "id":8, "method":"session/request_permission", "params":{"sessionId":"foreign","toolCall":{}} }\n'
+    response_raw = b'{"jsonrpc":"2.0", "id":8, "result":{"outcome":{"outcome":"selected","optionId":"allow_session"}} }\n'
+    try:
+        await router.route_daemon(json.loads(request_raw), request_raw)
+        await router.route_client(json.loads(response_raw), response_raw)
+        assert bytes(client.data) == request_raw
+        assert bytes(daemon.data) == response_raw
+        assert len(router._grants) == 0
+    finally:
+        await router.close()
+
+
+@pytest.mark.asyncio
+async def test_malformed_correlated_permission_responses_fail_closed() -> None:
+    router, client, daemon = await active_router()
+    invalid_results = [
+        {"outcome": {"outcome": "selected", "optionId": "allow_session"}, "extra": True},
+        {"outcome": {"outcome": "selected", "optionId": "allow_session", "extra": True}},
+        {"outcome": {"outcome": "selected", "optionId": "allow_always"}},
+        {"outcome": {"outcome": "cancelled", "_meta": {}}},
+        {"outcome": {"outcome": "selected", "optionId": "allow_session"}, "_meta": []},
+        {},
+    ]
+    try:
+        for request_id, result in enumerate(invalid_results, 20):
+            await router.route_daemon(permission_request(request_id, "session"))
+            before = bytes(daemon.data)
+            with pytest.raises(ProxyError, match="invalid reserved permission response"):
+                await router.route_client({
+                    "jsonrpc": "2.0", "id": request_id, "result": result,
+                })
+            assert bytes(daemon.data) == before
+        await router.route_daemon(permission_request(30, "session"))
+        before = bytes(daemon.data)
+        with pytest.raises(ProxyError, match="invalid reserved permission response"):
+            await router.route_client({
+                "jsonrpc": "2.0", "id": 30,
+                "result": {"outcome": {"outcome": "selected", "optionId": "allow_session"}},
+                "extra": True,
+            })
+        assert bytes(daemon.data) == before
+        await router.route_daemon(permission_request(31, "session"))
+        router._active_sessions.clear()
+        with pytest.raises(ProxyError, match="stale reserved permission response"):
+            await router.route_client({
+                "jsonrpc": "2.0", "id": 31,
+                "result": {"outcome": {"outcome": "selected", "optionId": "allow_session"}},
+            })
+        with pytest.raises(ProxyError, match="unsolicited response"):
+            await router.route_client({
+                "jsonrpc": "2.0", "id": "uncorrelated",
+                "result": {"outcome": {"outcome": "selected", "optionId": "allow_session"}},
+            })
+        assert len(router._grants) == 0
+    finally:
+        await router.close()
+
+
+@pytest.mark.asyncio
+async def test_hosted_disconnect_revokes_session_grants(tmp_path: Path) -> None:
+    router, _, daemon, _, connection_id = await hosted_router(tmp_path)
+    try:
+        await grant_session(router, 80, "session")
+        assert router._grants.allows("session", "hands_edit")
+        await router.route_daemon({
+            "jsonrpc": "2.0", "id": 81, "method": "mcp/disconnect",
+            "params": {"connectionId": connection_id},
+        })
+        assert len(router._grants) == 0
+        assert messages(daemon)[-1]["id"] == 81
+    finally:
+        await router.close()
+
+
+@pytest.mark.asyncio
+async def test_framing_and_generation_failures_revoke_grants(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    router, _, _ = await active_router()
+    await grant_session(router, 90, "session")
+    router._fail_generation(ConnectionError("daemon failed"))
+    assert len(router._grants) == 0
+    await router.close()
+
+    framing_router, _, _ = await active_router()
+    await grant_session(framing_router, 91, "session")
+    client_reader = asyncio.StreamReader()
+    client_reader.feed_data(b"malformed\n")
+    client_reader.feed_eof()
+    daemon_reader = asyncio.StreamReader()
+    monkeypatch.setattr(
+        "mimir.acp.proxy.ProxyRouter",
+        lambda client_writer, daemon_writer, credential: framing_router,
+    )
+    with pytest.raises(ProxyError, match="invalid frame"):
+        await run_router(
+            client_reader, Writer(), daemon_reader, Writer(), "secret",
+            close_on_daemon_exit=True,
+        )
+    assert len(framing_router._grants) == 0
+
+
+def test_permission_grant_store_keys_exact_session_and_wrapper() -> None:
+    store = PermissionGrantStore()
+    store.add("session", "hands_edit")
+    assert store.allows("session", "hands_edit")
+    assert not store.allows("other", "hands_edit")
+    assert not store.allows("session", "hands_shell")
 
 
 @pytest.mark.asyncio
@@ -654,7 +1013,7 @@ class IntegratedCore:
         context = get_turn_capability_context()
         assert context is not None
         turn_id = kwargs["turn_id"]
-        arguments = {"path": "note", "oldText": "old", "newText": "new"}
+        arguments = {"path": "note", "old_text": "old", "new_text": "new"}
         self.bus.publish({
             "turn_id": turn_id,
             "channel_id": event.channel_id,
@@ -663,11 +1022,11 @@ class IntegratedCore:
             "type": "tool_call",
             "phase": "start",
             "id": "edit-1",
-            "tool_name": "hands_edit",
+            "tool_name": "legacy_edit",
             "args": arguments,
         })
         decision = await context.permission_broker.request_permission(
-            PermissionEligibility("edit-1", "hands_edit", "other", arguments)
+            PermissionEligibility("edit-1", "legacy_edit", "other", arguments)
         )
         assert decision is PermissionDecision.ALLOW_ONCE
         result = await self.channels.send(event.channel_id, "done")
