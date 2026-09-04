@@ -70,6 +70,7 @@ def _scope(
     repository: str = "owner/repo",
     *,
     pr_number: int = 7,
+    observed_head_sha: str = "a" * 40,
 ) -> RepoPRActionScope:
     return RepoPRActionScope(
         provenance="server_discovered",
@@ -83,7 +84,7 @@ def _scope(
         head_repo=repository,
         head_remote="origin",
         destination_ref="refs/heads/worklink/7",
-        observed_head_sha="a" * 40,
+        observed_head_sha=observed_head_sha,
         base_ref="main",
         observed_base_sha="b" * 40,
         pull_request_author="mimir-bot",
@@ -95,6 +96,8 @@ def _auth(
     *,
     repository: str = "owner/repo",
     pr_number: int = 7,
+    observed_head_sha: str = "a" * 40,
+    scope: RepoPRActionScope | None = None,
 ) -> AuthContext:
     current = labels or InformationFlowLabels()
     return AuthContext(
@@ -108,7 +111,11 @@ def _auth(
         enforcement_enabled=True,
         ifc_labels=current,
         ifc_state=InformationFlowState(labels=current),
-        repo_pr_action_scope=_scope(repository, pr_number=pr_number),
+        repo_pr_action_scope=scope or _scope(
+            repository,
+            pr_number=pr_number,
+            observed_head_sha=observed_head_sha,
+        ),
     )
 
 
@@ -165,6 +172,67 @@ def test_cross_pr_scope_keeps_lease_read_untrusted_filesystem_ingest(
     assert source.domain == "filesystem"
     assert (source.integrity, source.integrity_effect) == (
         "untrusted", "active_ingest",
+    )
+
+
+def _assert_scope_mismatch_is_untrusted(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    field: str,
+    value: object,
+) -> None:
+    lease_root = tmp_path / "leases"
+    lease_root.mkdir()
+    _checkout, target, _record = _recorded_lease(lease_root)
+    monkeypatch.setenv("MIMIR_PR_CHECKOUT_LEASE_ROOT", str(lease_root))
+    scope = _scope()
+    object.__setattr__(scope, field, value)
+
+    source = protected_result_source(
+        _auth(scope=scope), principal="filesystem", domain="filesystem",
+        resource_id=str(target), bridge_instance="filesystem",
+    )
+
+    assert source.domain == "filesystem"
+    assert (source.integrity, source.integrity_effect) == (
+        "untrusted", "active_ingest",
+    )
+
+
+def test_different_scope_id_keeps_lease_read_untrusted_filesystem_ingest(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _assert_scope_mismatch_is_untrusted(
+        tmp_path, monkeypatch, field="scope_id", value="c" * 64,
+    )
+
+
+def test_different_repository_keeps_lease_read_untrusted_filesystem_ingest(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _assert_scope_mismatch_is_untrusted(
+        tmp_path, monkeypatch, field="canonical_repo", value="other/repo",
+    )
+
+
+def test_different_pr_number_keeps_lease_read_untrusted_filesystem_ingest(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _assert_scope_mismatch_is_untrusted(
+        tmp_path, monkeypatch, field="pr_number", value=8,
+    )
+
+
+def test_different_head_keeps_lease_read_untrusted_filesystem_ingest(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _assert_scope_mismatch_is_untrusted(
+        tmp_path, monkeypatch, field="observed_head_sha", value="c" * 40,
     )
 
 
