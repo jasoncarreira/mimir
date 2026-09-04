@@ -50,6 +50,13 @@ _recent_agent_pushes: OrderedDict[tuple[str, int, str, str], None] = OrderedDict
 _recent_agent_pushes_lock = threading.Lock()
 
 
+def _history_rewrite_push_permitted(scope: RepoPRActionScope) -> bool:
+    return (
+        scope.event_type in _HISTORY_REWRITE_EVENT_TYPES
+        and scope.destination_ref not in _PROTECTED_BRANCH_REFS
+    )
+
+
 def _record_agent_push(scope: RepoPRActionScope, pushed_head: str) -> None:
     if scope.event_type != "pr_changes_requested_stale":
         return
@@ -861,6 +868,12 @@ class RepoGitTools:
             result = self._command(("merge", "--abort"))
         elif isinstance(operation, GitRebase):
             self._require("repo_rebase", RepoPRAction.WRITE, RepoPRAction.COMMIT)
+            if not _history_rewrite_push_permitted(self._scope):
+                raise GitRefusal(
+                    "rebase_in_lease_refused",
+                    "rebase inside a PR checkout lease is refused because this scope "
+                    "cannot publish rewritten history; use repo_merge to merge main instead",
+                )
             continuing = self._has_in_progress_merge_or_rebase()
             if continuing:
                 if self._scope.event_type != "pr_mergeability_conflicting":
@@ -927,11 +940,12 @@ class RepoGitTools:
                 self._expected_head,
             ))
             rewritten_history = ancestry.returncode != 0
-            if rewritten_history and (
-                self._scope.event_type not in _HISTORY_REWRITE_EVENT_TYPES
-                or self._scope.destination_ref in _PROTECTED_BRANCH_REFS
-            ):
-                raise GitRefusal("force_push_refused", "push would not be a fast-forward")
+            if rewritten_history and not _history_rewrite_push_permitted(self._scope):
+                raise GitRefusal(
+                    "force_push_refused",
+                    "push would not be a fast-forward; operator approval and publication "
+                    "must be completed from the same turn holding this checkout lease",
+                )
             try:
                 push_remote, auth_env, sensitive_values = self._push_remote()
                 remote = self._command((
