@@ -77,6 +77,35 @@ def test_shared_wire_contract_is_stdlib_only_and_exact() -> None:
                 "additionalProperties": False,
             },
         },
+        {
+            "name": "python",
+            "description": "Execute Python code in a persistent per-session namespace on the client host. Returns stdout, stderr, the final expression repr, exception, timeout status, and kernel state.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {"code": {"type": "string"}},
+                "required": ["code"],
+                "additionalProperties": False,
+            },
+            "outputSchema": {
+                "type": "object",
+                "properties": {
+                    "ok": {"type": "boolean"},
+                    "stdout": {"type": "string"},
+                    "stderr": {"type": "string"},
+                    "value": {"type": "string"},
+                    "exception": {"type": "string"},
+                    "timedOut": {"type": "boolean"},
+                    "kernel": {
+                        "type": "string",
+                        "enum": ["fresh", "reused", "timed_out", "crashed"],
+                    },
+                },
+                "required": [
+                    "ok", "stdout", "stderr", "value", "exception", "timedOut", "kernel"
+                ],
+                "additionalProperties": False,
+            },
+        },
     ]
     tree = ast.parse((ROOT / "mimir" / "acp" / "hands_contract.py").read_text())
     imports = {
@@ -92,11 +121,13 @@ def test_wire_contract_is_immutable_and_descriptors_are_defensive_copies() -> No
         "read": "hands_read",
         "edit": "hands_edit",
         "shell": "hands_shell",
+        "python": "hands_python",
     }
     assert HANDS_WRAPPER_TO_PROVIDER == {
         "hands_read": "read",
         "hands_edit": "edit",
         "hands_shell": "shell",
+        "hands_python": "python",
     }
     with pytest.raises(TypeError):
         HANDS_V1_WIRE_TOOLS[0]["description"] = "changed"
@@ -125,6 +156,19 @@ def test_wire_contract_is_immutable_and_descriptors_are_defensive_copies() -> No
             {"command": "pwd"},
             {"stdout": "", "stderr": "", "exitCode": 0},
         ),
+        (
+            "python",
+            {"code": "1 + 1"},
+            {
+                "ok": True,
+                "stdout": "",
+                "stderr": "",
+                "value": "2",
+                "exception": "",
+                "timedOut": False,
+                "kernel": "fresh",
+            },
+        ),
     ],
 )
 def test_argument_and_result_validators_accept_only_exact_shapes(
@@ -150,6 +194,7 @@ def test_argument_and_result_validators_accept_only_exact_shapes(
         ("read", {"content": 1}, True),
         ("edit", {"changed": 1}, True),
         ("shell", {"stdout": "", "stderr": "", "exitCode": True}, True),
+        ("python", {"code": 1}, False),
     ],
 )
 def test_argument_and_result_validators_reject_wrong_types(
@@ -162,6 +207,21 @@ def test_argument_and_result_validators_reject_wrong_types(
 
 def test_validators_reject_unknown_tools() -> None:
     with pytest.raises(HandsContractError, match="unknown Hands provider tool"):
-        validate_tool_arguments("python", {"code": "pass"})
+        validate_tool_arguments("other", {"code": "pass"})
     with pytest.raises(HandsContractError, match="unknown Hands provider tool"):
-        validate_tool_result("python", {})
+        validate_tool_result("other", {})
+
+
+def test_python_kernel_schema_enum_is_exact() -> None:
+    descriptor = hands_v1_wire_descriptors()[3]
+    assert descriptor["name"] == "python"
+    assert descriptor["outputSchema"]["properties"]["kernel"] == {
+        "type": "string",
+        "enum": ["fresh", "reused", "timed_out", "crashed"],
+    }
+    result = {
+        "ok": True, "stdout": "", "stderr": "", "value": "", "exception": "",
+        "timedOut": False, "kernel": "unknown",
+    }
+    with pytest.raises(HandsContractError, match="malformed Hands result"):
+        validate_tool_result("python", result)

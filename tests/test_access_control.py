@@ -7904,6 +7904,7 @@ def _repository_result_labels(repo: str, pr: int, head: str) -> InformationFlowL
             None,
         ),
         ("hands_shell", {"command": "pwd"}, None),
+        ("hands_python", {"code": "1 + 1"}, None),
     ],
 )
 def test_authorized_tainted_edit_and_shell_results_reply_only_to_originating_acp_channel(
@@ -7974,6 +7975,12 @@ def test_authorized_tainted_edit_and_shell_results_reply_only_to_originating_acp
         )
         assert denied.allowed is False, (sink_name, denied.reason)
         assert denied.reason == f"ifc_label_blocked:{category.value}"
+
+
+def test_python_extends_existing_complete_hands_result_policy() -> None:
+    test_authorized_tainted_edit_and_shell_results_reply_only_to_originating_acp_channel(
+        "hands_python", {"code": "1 + 1"}, None,
+    )
 
 
 def test_forge_repository_result_from_different_repository_is_refused() -> None:
@@ -14166,18 +14173,33 @@ async def test_only_admitted_acp_admin_hands_get_client_authorized_operation(
             _live_permission_request(tool_name="hands_shell", args={"command": "git push --force origin main"}),
             lambda _request: pytest.fail("prohibited shell executed"),
         )
+        denied_python = await budget_gate.BudgetGateMiddleware().awrap_tool_call(
+            _live_permission_request(
+                tool_name="hands_python",
+                args={"code": "git push --force origin main"},
+            ),
+            lambda _request: pytest.fail("prohibited Python executed"),
+        )
         allowed = await budget_gate.BudgetGateMiddleware().awrap_tool_call(
             _live_permission_request(),
             lambda request: asyncio.sleep(
                 0, result=ToolMessage(content="ok", tool_call_id=request.tool_call["id"]),
             ),
         )
+        allowed_python = await budget_gate.BudgetGateMiddleware().awrap_tool_call(
+            _live_permission_request(tool_name="hands_python", args={"code": "1 + 1"}),
+            lambda request: asyncio.sleep(
+                0, result=ToolMessage(content="python", tool_call_id=request.tool_call["id"]),
+            ),
+        )
     finally:
         reset_turn_capability_context(token)
 
     assert denied.status == "error"
-    assert issued == ["hands_edit"]
+    assert denied_python.status == "error"
+    assert issued == ["hands_edit", "hands_python"]
     assert allowed.content == "ok"
+    assert allowed_python.content == "python"
 
 
 def test_non_hands_native_sink_inventory_keeps_untrusted_ingest_veto(
@@ -14207,7 +14229,7 @@ def test_non_hands_native_sink_inventory_keeps_untrusted_ingest_veto(
     }
 
     assert actual == expected
-    assert set(access_control._SINK_CATEGORY_MAP) - {"hands_edit", "hands_shell"} == set().union(*expected.values())
+    assert set(access_control._SINK_CATEGORY_MAP) - {"hands_edit", "hands_shell", "hands_python"} == set().union(*expected.values())
     assert not any("*" in name for names in actual.values() for name in names)
     capability_eligible = {
         SinkCategory.SAME_CHANNEL,
@@ -14285,7 +14307,7 @@ def test_non_hands_native_sink_inventory_keeps_untrusted_ingest_veto(
 
 def test_non_acp_execution_decisions_are_unchanged() -> None:
     catalog = access_control.get_operation_catalog()
-    hands = {"hands_read", "hands_edit", "hands_shell"}
+    hands = {"hands_read", "hands_edit", "hands_shell", "hands_python"}
     flows = {
         access_control.ToolFlowDirection.NEITHER: {"approve_declassification", "request_operator_approval", "write_todos", "task"},
         access_control.ToolFlowDirection.SOURCE: {"memory_query", "memory_get", "file_search", "mimir_get_turn", "get_turn", "bash_jobs_list", "bash_job_output", "fetch_channel_history", "list_channels", "list_schedules", "commitment_list", "read_file", "aread", "ls", "als", "glob", "aglob", "grep", "agrep", "Read", "Glob", "Grep", "pr_metadata", "pr_files", "pr_diff", "pr_checks", "pr_reviews", "pr_comments", "pr_review_requests", "repo_status", "repo_diff", "repo_unmerged"},
@@ -14308,7 +14330,7 @@ def test_non_acp_execution_decisions_are_unchanged() -> None:
         "memory_store", "saga_feedback", "saga_mark_contributions",
         "saga_end_session", "saga_record_skill_learning", "saga_forget",
         "set_poller_overrides", "download_files", "adownload_files",
-        "rebuild_index", "hands_edit", "hands_shell",
+        "rebuild_index", "hands_edit", "hands_shell", "hands_python",
     }
     protected_builtins = {
         "Bash", "bash", "bash_exec", "execute", "aexecute", "shell",
@@ -14371,6 +14393,7 @@ def test_non_acp_execution_decisions_are_unchanged() -> None:
     assert catalog.get_decision("hands_read") is OperationDecision.RESOURCE_SCOPED
     assert catalog.get_decision("hands_edit") is OperationDecision.ADMIN_REQUIRED
     assert catalog.get_decision("hands_shell") is OperationDecision.ADMIN_REQUIRED
+    assert catalog.get_decision("hands_python") is OperationDecision.ADMIN_REQUIRED
     assert catalog.get_decision("client_authorized_host_execution") is OperationDecision.UNKNOWN
 
 
@@ -14388,7 +14411,7 @@ async def test_shell_exec_policy_and_execution_are_unchanged(
 
     shell_names = {"shell_exec", "bash_async", "Bash", "bash", "bash_exec", "execute", "aexecute", "shell"}
 
-    assert access_control.SHELL_PROCESS_TOOL_NAMES - {"hands_shell"} == shell_names
+    assert access_control.SHELL_PROCESS_TOOL_NAMES - {"hands_shell", "hands_python"} == shell_names
     assert {name: access_control._TOOL_FLOW_MAP[name] for name in shell_names} == {
         name: access_control.ToolFlowDirection.BOTH for name in shell_names
     }

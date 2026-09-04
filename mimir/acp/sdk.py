@@ -448,7 +448,7 @@ def permission_request_params(
         ],
     }
     if snapshot.wrapper_name is not None:
-        if snapshot.wrapper_name not in {"hands_edit", "hands_shell"}:
+        if snapshot.wrapper_name not in {"hands_edit", "hands_shell", "hands_python"}:
             raise AcpProtocolError("Malformed permission lifecycle snapshot")
         result["_meta"] = {"mimir.wrapper": snapshot.wrapper_name}
         if snapshot.tainted:

@@ -505,6 +505,25 @@ def test_trusted_permission_metadata_is_true_only_and_exact() -> None:
         )
 
 
+def test_python_permission_metadata_and_raw_arguments_are_exact() -> None:
+    snapshot = sdk.PermissionSnapshot(
+        "python-call",
+        "hands_python",
+        "other",
+        {"code": "value = 1\nvalue"},
+        "hands_python",
+        False,
+    )
+
+    params = sdk.permission_request_params("session", snapshot)
+
+    assert params["toolCall"]["rawInput"] == {"code": "value = 1\nvalue"}
+    assert params["_meta"] == {"mimir.wrapper": "hands_python"}
+    assert [option["optionId"] for option in params["options"]] == [
+        "allow_once", "allow_session", "reject_once",
+    ]
+
+
 @pytest.mark.parametrize(
     "payload",
     [

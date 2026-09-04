@@ -31,6 +31,7 @@ from mimir.tools.client_provider import (
     TurnCapabilityContext,
     get_provider_profile,
     hands_edit,
+    hands_python,
     hands_read,
     hands_shell,
     client_authorized_host_execution_metadata,
@@ -163,7 +164,9 @@ async def _invoke_wrapper(wrapper_name: str, provider: Any) -> dict[str, Any]:
             return await hands_edit.ainvoke({
                 "path": "notes.txt", "old_text": "old", "new_text": "new"
             })
-        return await hands_shell.ainvoke({"command": "pwd"})
+        if wrapper_name == "hands_shell":
+            return await hands_shell.ainvoke({"command": "pwd"})
+        return await hands_python.ainvoke({"code": "1 + 1"})
     finally:
         reset_turn_capability_context(token)
 
@@ -340,6 +343,35 @@ def test_profile_has_exact_provider_schemas_and_server_metadata() -> None:
             "efcd767e81a864d776ee5d1d5757f469a0a9719f26d1cc0b3bae611597585186",
             "0cc998ce157fd5a7389d5ea6a2e6a86d20e70d0e1b4db06d8b91e8f17ec51907",
         ),
+        "python": (
+            {
+                "type": "object",
+                "properties": {"code": {"type": "string"}},
+                "required": ["code"],
+                "additionalProperties": False,
+            },
+            {
+                "type": "object",
+                "properties": {
+                    "ok": {"type": "boolean"},
+                    "stdout": {"type": "string"},
+                    "stderr": {"type": "string"},
+                    "value": {"type": "string"},
+                    "exception": {"type": "string"},
+                    "timedOut": {"type": "boolean"},
+                    "kernel": {
+                        "type": "string",
+                        "enum": ["fresh", "reused", "timed_out", "crashed"],
+                    },
+                },
+                "required": [
+                    "ok", "stdout", "stderr", "value", "exception", "timedOut", "kernel"
+                ],
+                "additionalProperties": False,
+            },
+            "e5de9e79f2da6956be1f81b55a9f782098f2cdeb3996cd84a3e38f8efcf40e25",
+            "5705e1d85e12b89447ad83e52b7bacb5dea92bbe3480c5fad138364a1540303c",
+        ),
     }
     assert tuple(tools) == tuple(expected)
     for name, (input_schema, result_schema, input_digest, result_digest) in expected.items():
@@ -354,6 +386,7 @@ def test_profile_has_exact_provider_schemas_and_server_metadata() -> None:
         "hands_read": None,
         "hands_edit": "client_authorized_host_execution",
         "hands_shell": "client_authorized_host_execution",
+        "hands_python": "client_authorized_host_execution",
     }
 
 
@@ -424,6 +457,13 @@ async def test_wrappers_route_through_current_turn_provider() -> None:
         ("hands_read", {"content": "file contents"}),
         ("hands_edit", {"changed": True}),
         ("hands_shell", {"stdout": "/workspace\n", "stderr": "", "exitCode": 0}),
+        (
+            "hands_python",
+            {
+                "ok": True, "stdout": "", "stderr": "", "value": "2",
+                "exception": "", "timedOut": False, "kernel": "fresh",
+            },
+        ),
     ],
 )
 async def test_wrappers_accept_recorded_stock_mcp_results(
@@ -445,7 +485,7 @@ async def test_advertised_output_schemas_drive_accepted_result_shapes() -> None:
     for policy in MIMIR_HANDS_V1.tools:
         schema = _thaw(policy.result_schema)
         structured_content = {
-            name: values_by_type[property_schema["type"]]
+            name: property_schema.get("enum", [values_by_type[property_schema["type"]]])[0]
             for name, property_schema in schema["properties"].items()
         }
         assert set(structured_content) == set(schema["required"])
@@ -607,8 +647,9 @@ def test_hands_surface_is_static_without_client_mcp_registration() -> None:
     assert names.count("hands_read") == 1
     assert names.count("hands_edit") == 1
     assert names.count("hands_shell") == 1
+    assert names.count("hands_python") == 1
     assert tuple(tool.name for tool in HANDS_TOOLS) == (
-        "hands_read", "hands_edit", "hands_shell"
+        "hands_read", "hands_edit", "hands_shell", "hands_python"
     )
     source = Path(__file__).parents[1] / "mimir" / "tools" / "client_provider.py"
     tree = ast.parse(source.read_text())
@@ -625,8 +666,31 @@ def test_access_control_catalogs_hands_profile_policy() -> None:
     assert catalog.get_decision("hands_read") is OperationDecision.RESOURCE_SCOPED
     assert catalog.get_decision("hands_edit") is OperationDecision.ADMIN_REQUIRED
     assert catalog.get_decision("hands_shell") is OperationDecision.ADMIN_REQUIRED
+    assert catalog.get_decision("hands_python") is OperationDecision.ADMIN_REQUIRED
     assert get_tool_flow_direction("hands_read") is ToolFlowDirection.SOURCE
     assert get_tool_flow_direction("hands_edit") is ToolFlowDirection.BOTH
     assert get_tool_flow_direction("hands_shell") is ToolFlowDirection.BOTH
+    assert get_tool_flow_direction("hands_python") is ToolFlowDirection.BOTH
     assert get_sink_category("hands_edit") is SinkCategory.EXTERNAL_MCP
     assert get_sink_category("hands_shell") is SinkCategory.SHELL_PROCESS
+    assert get_sink_category("hands_python") is SinkCategory.SHELL_PROCESS
+
+
+def test_hands_python_policy_and_wire_schema_are_exact() -> None:
+    policy = MIMIR_HANDS_V1.tool("hands_python")
+    assert policy is not None
+    assert (
+        policy.provider_name,
+        policy.classification,
+        policy.flow,
+        policy.sink,
+        policy.resource_namespace,
+        policy.operation,
+    ) == (
+        "python",
+        "admin_required",
+        "both",
+        "shell_process",
+        None,
+        "client_authorized_host_execution",
+    )

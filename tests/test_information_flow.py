@@ -3573,6 +3573,93 @@ def test_acp_successful_provider_result_keeps_active_provider_labels() -> None:
     )
 
 
+@pytest.mark.asyncio
+async def test_python_and_granted_hands_results_propagate_origin_labels_without_declassification() -> None:
+    from mimir.acp.journal import JournalLease
+    from mimir.tools.budget_gate import BudgetGateMiddleware
+    from mimir.tools.client_provider import (
+        MIMIR_HANDS_V1,
+        PermissionDecision,
+        TurnCapabilityContext,
+        reset_turn_capability_context,
+        set_turn_capability_context,
+    )
+
+    initial = InformationFlowLabels()
+    auth = replace(
+        _auth(channel="acp:session", roles=("admin",)),
+        principal="operator",
+        canonical_principal="operator",
+        domain="channel",
+        resource_id="acp:session",
+        bridge_instance="acp-stdio",
+        origin_trigger="acp_session",
+        ifc_labels=initial,
+        ifc_state=InformationFlowState(labels=initial),
+    )
+
+    class Broker:
+        def __init__(self) -> None:
+            self.calls: list[Any] = []
+
+        async def request_permission(self, eligibility: Any) -> PermissionDecision:
+            self.calls.append(eligibility)
+            return PermissionDecision.ALLOW_SESSION
+
+    class Provider:
+        closed = False
+
+    broker = Broker()
+    context = TurnCapabilityContext(
+        permission_broker=broker,
+        provider=Provider(),
+        profile_policy=MIMIR_HANDS_V1,
+        connection_generation=7,
+        prompt_epoch=11,
+        acp_delivery=True,
+        lease=JournalLease("turn", 7, 11),
+    )
+    request = ToolCallRequest(
+        tool_call={
+            "name": "hands_python", "args": {"code": "1 + 1"},
+            "id": "python-call", "type": "tool_call",
+        },
+        tool=None,
+        state=None,
+        runtime=Runtime(context=auth),
+    )
+
+    async def handler(call: ToolCallRequest) -> ToolMessage:
+        return ToolMessage(
+            content=json.dumps({
+                "ok": True, "stdout": "", "stderr": "", "value": "2",
+                "exception": "", "timedOut": False, "kernel": "fresh",
+            }),
+            tool_call_id=call.tool_call["id"],
+            name="hands_python",
+        )
+
+    token = set_turn_capability_context(context)
+    try:
+        result = await BudgetGateMiddleware().awrap_tool_call(request, handler)
+    finally:
+        reset_turn_capability_context(token)
+
+    labels = auth.ifc_state.current(initial)
+    assert result.status != "error"
+    assert len(broker.calls) == 1
+    assert broker.calls[0].arguments == {"code": "1 + 1"}
+    assert broker.calls[0].host_execution.tainted is False
+    assert labels.source_channels == frozenset({"acp:session"})
+    [source] = labels.sources
+    assert source.is_complete is True
+    assert source.resource_id == "acp:session"
+    assert source.authorized_principals == frozenset({"operator"})
+    assert (source.integrity, source.integrity_effect) == (
+        "untrusted", "active_ingest",
+    )
+
+
 def test_failed_provider_contract_result_outside_acp_keeps_provider_labels() -> None:
     from mimir.tools.client_provider import ClientProviderResultError
 

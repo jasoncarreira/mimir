@@ -72,11 +72,36 @@ HANDS_V1_WIRE_TOOLS = tuple(
                 ["stdout", "stderr", "exitCode"],
             ),
         },
+        {
+            "name": "python",
+            "description": "Execute Python code in a persistent per-session namespace on the client host. Returns stdout, stderr, the final expression repr, exception, timeout status, and kernel state.",
+            "inputSchema": _object_schema({"code": _STRING}, ["code"]),
+            "outputSchema": _object_schema(
+                {
+                    "ok": {"type": "boolean"},
+                    "stdout": _STRING,
+                    "stderr": _STRING,
+                    "value": _STRING,
+                    "exception": _STRING,
+                    "timedOut": {"type": "boolean"},
+                    "kernel": {
+                        "type": "string",
+                        "enum": ["fresh", "reused", "timed_out", "crashed"],
+                    },
+                },
+                ["ok", "stdout", "stderr", "value", "exception", "timedOut", "kernel"],
+            ),
+        },
     )
 )
 
 HANDS_PROVIDER_TO_WRAPPER = MappingProxyType(
-    {"read": "hands_read", "edit": "hands_edit", "shell": "hands_shell"}
+    {
+        "read": "hands_read",
+        "edit": "hands_edit",
+        "shell": "hands_shell",
+        "python": "hands_python",
+    }
 )
 HANDS_WRAPPER_TO_PROVIDER = MappingProxyType(
     {wrapper: provider for provider, wrapper in HANDS_PROVIDER_TO_WRAPPER.items()}
@@ -86,11 +111,21 @@ _ARGUMENT_TYPES = MappingProxyType({
     "read": MappingProxyType({"path": str}),
     "edit": MappingProxyType({"path": str, "oldText": str, "newText": str}),
     "shell": MappingProxyType({"command": str}),
+    "python": MappingProxyType({"code": str}),
 })
 _RESULT_TYPES = MappingProxyType({
     "read": MappingProxyType({"content": str}),
     "edit": MappingProxyType({"changed": bool}),
     "shell": MappingProxyType({"stdout": str, "stderr": str, "exitCode": int}),
+    "python": MappingProxyType({
+        "ok": bool,
+        "stdout": str,
+        "stderr": str,
+        "value": str,
+        "exception": str,
+        "timedOut": bool,
+        "kernel": str,
+    }),
 })
 
 
@@ -119,6 +154,10 @@ def _validate_exact_object(
         if not valid:
             raise HandsContractError(f"malformed Hands {kind}")
         result[key] = item
+    if provider_name == "python" and kind == "result" and result["kernel"] not in {
+        "fresh", "reused", "timed_out", "crashed"
+    }:
+        raise HandsContractError("malformed Hands result")
     return result
 
 

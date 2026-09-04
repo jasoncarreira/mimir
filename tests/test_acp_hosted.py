@@ -247,7 +247,7 @@ async def _assert_process_stopped(pid: int) -> None:
     while asyncio.get_running_loop().time() < deadline:
         try:
             state = (Path("/proc") / str(pid) / "stat").read_text().split()[2]
-        except (FileNotFoundError, IndexError):
+        except (FileNotFoundError, ProcessLookupError, IndexError):
             return
         if state == "Z":
             return
@@ -384,6 +384,13 @@ async def test_hosted_provider_owns_internal_session_kernels(tmp_path: Path) -> 
         ("shell", {"stdout": "", "stderr": ""}),
         ("shell", {"stdout": "", "stderr": "", "exitCode": 0, "extra": True}),
         ("shell", {"stdout": "", "stderr": "", "exitCode": False}),
+        (
+            "python",
+            {
+                "ok": True, "stdout": "", "stderr": "", "value": "",
+                "exception": "", "timedOut": 0, "kernel": "fresh",
+            },
+        ),
     ],
 )
 @pytest.mark.asyncio
@@ -403,6 +410,7 @@ async def test_malformed_operation_results_are_internal_errors_without_content(
         "read": {"path": "value"},
         "edit": {"path": "value", "oldText": "old", "newText": "new"},
         "shell": {"command": "true"},
+        "python": {"code": "pass"},
     }
     with pytest.raises(HostedMcpError) as failure:
         await provider.request(
@@ -412,3 +420,100 @@ async def test_malformed_operation_results_are_internal_errors_without_content(
         )
     assert failure.value.as_error() == {"code": -32603, "message": "Internal error"}
     assert "structuredContent" not in failure.value.as_error()
+
+
+@pytest.mark.asyncio
+async def test_tools_list_is_exact_four_tool_profile_and_extra_tool_errors(
+    tmp_path: Path,
+) -> None:
+    provider, connection = await _connected(tmp_path)
+    listed = await provider.request(connection, "tools/list", {})
+    assert [descriptor["name"] for descriptor in listed["tools"]] == [
+        "read", "edit", "shell", "python"
+    ]
+    with pytest.raises(HostedMcpError) as failure:
+        await provider.request(
+            connection, "tools/call", {"name": "Python", "arguments": {"code": "1"}}
+        )
+    assert failure.value.as_error() == {"code": -32602, "message": "Invalid params"}
+    await provider.close()
+
+
+@pytest.mark.asyncio
+async def test_python_result_has_exact_seven_keys(tmp_path: Path) -> None:
+    provider, connection = await _connected(tmp_path)
+    result = await provider.request(
+        connection,
+        "tools/call",
+        {
+            "name": "python",
+            "arguments": {"code": "print('out')\n2 + 3"},
+            "_meta": {"progressToken": "python-progress"},
+        },
+        request_id="python",
+    )
+    assert result["content"] == []
+    structured = result["structuredContent"]
+    assert set(structured) == {
+        "ok", "stdout", "stderr", "value", "exception", "timedOut", "kernel"
+    }
+    assert structured == {
+        "ok": True,
+        "stdout": "out\n",
+        "stderr": "",
+        "value": "5",
+        "exception": "",
+        "timedOut": False,
+        "kernel": "fresh",
+    }
+    assert type(structured["timedOut"]) is bool
+    await provider.close()
+
+
+@pytest.mark.asyncio
+async def test_python_timed_out_is_always_boolean(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider, connection = await _connected(tmp_path)
+
+    async def malformed(*args: object) -> dict[str, object]:
+        return {
+            "ok": False, "stdout": "", "stderr": "", "value": "", "exception": "",
+            "timedOut": 1, "kernel": "timed_out",
+        }
+
+    monkeypatch.setattr(provider, "execute_python", malformed)
+    with pytest.raises(HostedMcpError) as failure:
+        await provider.request(
+            connection,
+            "tools/call",
+            {"name": "python", "arguments": {"code": "pass"}},
+        )
+    assert failure.value.as_error() == {"code": -32603, "message": "Internal error"}
+    await provider.close()
+
+
+@pytest.mark.asyncio
+async def test_spawn_failure_returns_exact_mcp_error_without_structured_content(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from mimir.acp.python_kernel import PythonKernelUnavailable
+
+    provider, connection = await _connected(tmp_path)
+
+    async def unavailable(*args: object) -> dict[str, object]:
+        raise PythonKernelUnavailable("spawn refused")
+
+    monkeypatch.setattr(provider._python_kernels, "execute", unavailable)
+    with pytest.raises(HostedMcpError) as failure:
+        await provider.request(
+            connection,
+            "tools/call",
+            {"name": "python", "arguments": {"code": "1"}},
+        )
+    assert failure.value.as_error() == {
+        "code": -32000,
+        "message": "hands_python kernel unavailable: spawn refused",
+    }
+    assert "structuredContent" not in failure.value.as_error()
+    await provider.close()
