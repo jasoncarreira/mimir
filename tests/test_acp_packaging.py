@@ -73,6 +73,7 @@ def test_wheel_guard_requires_complete_intermediate_surface() -> None:
         "mimir/acp/hosted.py",
         "mimir/acp/profiles.py",
         "mimir/acp/proxy.py",
+        "mimir/acp/python_kernel.py",
         "mimir/acp/relay.py",
         "mimir/acp/ssh.py",
         "mimir/acp/bridge.py",

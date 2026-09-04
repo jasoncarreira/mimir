@@ -31,7 +31,11 @@ def test_hosted_hands_closure_is_stdlib_only_and_runtime_blind() -> None:
     paths = module.module_paths(ROOT / "mimir")
     reached, analyses = module.closure(paths, {"mimir.acp.hosted"})
 
-    assert reached == {"mimir.acp.hosted", "mimir.acp.hands_contract"}
+    assert reached == {
+        "mimir.acp.hosted",
+        "mimir.acp.hands_contract",
+        "mimir.acp.python_kernel",
+    }
     for analysis in analyses.values():
         assert analysis.external_imports <= module.sys.stdlib_module_names
 
