@@ -196,6 +196,73 @@ def configured_pr_checkout_lease_root() -> Path:
     return root.resolve(strict=True)
 
 
+def active_pr_checkout_lease_for_path(path: str | Path) -> PRCheckoutLease | None:
+    """Return the active recorded lease containing a strictly resolved path."""
+    try:
+        root = configured_pr_checkout_lease_root()
+        resource = Path(path).resolve(strict=True)
+        relative = resource.relative_to(root)
+        if not relative.parts:
+            return None
+        lease_path = root / relative.parts[0]
+        if lease_path.is_symlink() or not lease_path.is_dir():
+            return None
+        lease_path = lease_path.resolve(strict=True)
+        if lease_path.parent != root or not resource.is_relative_to(lease_path):
+            return None
+        metadata_path = lease_path / _METADATA
+        git_directory = metadata_path.parent
+        if (
+            git_directory.is_symlink()
+            or not git_directory.is_dir()
+            or metadata_path.is_symlink()
+            or not metadata_path.is_file()
+        ):
+            return None
+        raw = json.loads(metadata_path.read_text(encoding="utf-8"))
+        if not isinstance(raw, dict):
+            return None
+        required_strings = (
+            "canonical_repo",
+            "canonical_origin",
+            "owner",
+            "head_sha",
+            "scope_id",
+            "path",
+            "lease_root",
+            "expires_at",
+        )
+        if any(
+            not isinstance(raw.get(key), str) or not raw[key]
+            for key in required_strings
+        ):
+            return None
+        canonical_repo = raw["canonical_repo"]
+        head_sha = raw["head_sha"]
+        pr_number = raw.get("pr_number")
+        if (
+            canonical_repo.count("/") != 1
+            or any(part in {"", ".", ".."} for part in canonical_repo.split("/"))
+            or "#" in canonical_repo
+            or not isinstance(pr_number, int)
+            or isinstance(pr_number, bool)
+            or pr_number <= 0
+            or len(head_sha) != 40
+            or any(character not in "0123456789abcdef" for character in head_sha.lower())
+        ):
+            return None
+        if Path(raw["path"]).resolve(strict=True) != lease_path:
+            return None
+        if Path(raw["lease_root"]).resolve(strict=True) != root:
+            return None
+        lease = _lease_from_recorded_metadata(lease_path, root)
+        if lease.expires_at <= datetime.now(UTC) or not lease.path.is_dir():
+            return None
+        return lease
+    except (OSError, RuntimeError, ValueError, json.JSONDecodeError):
+        return None
+
+
 def _run(runner: Runner, args: list[str], failure: str) -> str:
     result = runner(args)
     if result.returncode != 0:
