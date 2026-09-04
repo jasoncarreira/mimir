@@ -14,8 +14,9 @@ import pytest
 import yaml
 
 from mimir.acp.daemon import AcpDaemon
+from mimir.acp.hosted import HostedMcpError
 from mimir.acp.profiles import Profile, ProfileStore
-from mimir.acp.proxy import MAX_FRAME_BYTES, FrameWriter, ProxyError, ProxyRouter, _route_stream, run_local_proxy
+from mimir.acp.proxy import MAX_FRAME_BYTES, FrameWriter, ProxyError, ProxyRouter, _route_stream, run_local_proxy, run_router
 from mimir.channel_registry import ChannelRegistry
 from mimir.identities import IdentityResolver, hash_web_key
 from mimir.tools.client_provider import MIMIR_HANDS_V1, PermissionDecision, PermissionEligibility, get_turn_capability_context
@@ -249,7 +250,12 @@ async def test_session_new_captures_cwd_for_hosted_operations(tmp_path: Path) ->
             "jsonrpc": "2.0", "id": 9, "method": "mcp/connect",
             "params": {"serverId": server_id},
         })
-        assert messages(daemon)[-1]["result"]["connectionId"] != connection_id
+        later_connection_id = messages(daemon)[-1]["result"]["connectionId"]
+        assert later_connection_id != connection_id
+        first_session = router._provider._connections[connection_id].session
+        later_session = router._provider._connections[later_connection_id].session
+        assert first_session is later_session
+        assert first_session.cwd == tmp_path
         await router.route_daemon({
             "jsonrpc": "2.0", "id": 4, "method": "mcp/message",
             "params": {"connectionId": connection_id, "method": "tools/call", "params": {
@@ -458,6 +464,97 @@ async def test_hosted_failures_are_supervised_and_generation_state_is_bounded(
             })
     finally:
         await bounded.close()
+
+
+@pytest.mark.asyncio
+async def test_client_session_cancel_tombstones_hosted_request(tmp_path: Path) -> None:
+    router, _, daemon, _, connection_id = await hosted_router(tmp_path)
+    try:
+        await router.route_daemon({
+            "jsonrpc": "2.0", "id": 50, "method": "mcp/message", "params": {
+                "connectionId": connection_id, "method": "tools/call",
+                "params": {"name": "shell", "arguments": {"command": "sleep 30"}},
+            },
+        })
+        await asyncio.sleep(0.05)
+        cancel_raw = b'{ "jsonrpc":"2.0", "method":"session/cancel", "params":{"sessionId":"session"} }\n'
+        before = bytes(daemon.data)
+        await router.route_client(json.loads(cancel_raw), cancel_raw)
+        assert bytes(daemon.data).startswith(before + cancel_raw)
+        await asyncio.sleep(0.05)
+        with pytest.raises(ProxyError, match="duplicate outstanding"):
+            await router.route_daemon({"jsonrpc": "2.0", "id": 50, "method": "foreign"})
+        assert not any(item.get("id") == 50 and ("result" in item or "error" in item) for item in messages(daemon))
+    finally:
+        await router.close()
+
+
+@pytest.mark.asyncio
+async def test_hosted_error_response_writer_failure_fails_generation(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    router, _, _, _, connection_id = await hosted_router(tmp_path)
+
+    class FailedWriter(Writer):
+        def write(self, data: bytes) -> None:
+            raise BrokenPipeError("response failed")
+
+    async def hosted_error(*args: Any, **kwargs: Any) -> dict[str, Any]:
+        raise HostedMcpError(-32000, "hosted failed")
+
+    try:
+        router._daemon._writer = FailedWriter()
+        monkeypatch.setattr(router._provider, "request", hosted_error)
+        await router.route_daemon({
+            "jsonrpc": "2.0", "id": 60, "method": "mcp/message",
+            "params": {"connectionId": connection_id, "method": "tools/list"},
+        })
+        failure = await asyncio.wait_for(router.wait_failed(), 1)
+        assert isinstance(failure, BrokenPipeError)
+    finally:
+        await router.close()
+
+
+@pytest.mark.asyncio
+async def test_grace_period_stream_failure_is_propagated() -> None:
+    client_reader = asyncio.StreamReader()
+    client_reader.feed_eof()
+
+    class FailedReader:
+        async def read(self, size: int) -> bytes:
+            await asyncio.sleep(0.01)
+            raise ConnectionError("grace read failed")
+
+    with pytest.raises(ConnectionError, match="grace read failed"):
+        await run_router(client_reader, Writer(), FailedReader(), Writer(), "secret")
+
+
+@pytest.mark.asyncio
+async def test_live_and_cumulative_hosted_connection_bounds(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    router, _, daemon, server_id, connection_id = await hosted_router(tmp_path)
+    try:
+        monkeypatch.setattr("mimir.acp.proxy.MAX_LIVE_CONNECTIONS", 1)
+        with pytest.raises(ProxyError, match="too many hosted connections"):
+            await router.route_daemon({
+                "jsonrpc": "2.0", "id": 70, "method": "mcp/connect",
+                "params": {"serverId": server_id},
+            })
+        await router.route_daemon({
+            "jsonrpc": "2.0", "id": 71, "method": "mcp/disconnect",
+            "params": {"connectionId": connection_id},
+        })
+        monkeypatch.setattr("mimir.acp.proxy.MAX_LIVE_CONNECTIONS", 10)
+        monkeypatch.setattr("mimir.acp.proxy.MAX_GENERATION_CONNECTION_IDS", 1)
+        with pytest.raises(ProxyError, match="too many hosted connections"):
+            await router.route_daemon({
+                "jsonrpc": "2.0", "id": 72, "method": "mcp/connect",
+                "params": {"serverId": server_id},
+            })
+        assert messages(daemon)[-1]["id"] == 71
+    finally:
+        await router.close()
 
 
 @pytest.mark.asyncio

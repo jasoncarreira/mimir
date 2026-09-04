@@ -144,7 +144,9 @@ class ProxyRouter:
         self._local_sessions: dict[tuple[type[Any], Any], str] = {}
         self._daemon_tombstones: set[tuple[type[Any], Any]] = set()
         self._server_sessions: dict[str, str] = {}
+        self._server_provider_sessions: dict[str, str] = {}
         self._connection_sessions: dict[str, str] = {}
+        self._connection_provider_sessions: dict[str, str] = {}
         self._used_server_ids: set[str] = set()
         self._used_connection_ids: set[str] = set()
         self._local_connections: dict[tuple[type[Any], Any], str] = {}
@@ -221,7 +223,9 @@ class ProxyRouter:
         self._client_requests.clear()
         self._daemon_requests.clear()
         self._server_sessions.clear()
+        self._server_provider_sessions.clear()
         self._connection_sessions.clear()
+        self._connection_provider_sessions.clear()
 
     def _register(
         self,
@@ -267,6 +271,7 @@ class ProxyRouter:
         }]
         self._provider.bind_session(server_id, params["cwd"])
         self._server_sessions[server_id] = server_id
+        self._server_provider_sessions[server_id] = server_id
         return _PendingSession(method, params["cwd"], server_id, session_id), True
 
     def _new_server_id(self) -> str:
@@ -301,8 +306,6 @@ class ProxyRouter:
             session_id = pending.session_id
             if session_id is None:
                 raise ProxyError("invalid frame")
-        self._provider.bind_session(session_id, pending.cwd)
-        self._provider.revoke_session(pending.server_id)
         self._server_sessions[pending.server_id] = session_id
         for connection_id, owner in tuple(self._connection_sessions.items()):
             if owner == pending.server_id:
@@ -317,11 +320,14 @@ class ProxyRouter:
                 except HostedMcpError:
                     pass
                 self._connection_sessions.pop(connection_id, None)
+                self._connection_provider_sessions.pop(connection_id, None)
         for server_id, owner in tuple(self._server_sessions.items()):
             if owner == session_id:
                 self._server_sessions.pop(server_id, None)
-        await self._provider.cancel_session(session_id)
-        self._provider.revoke_session(session_id)
+                provider_session_id = self._server_provider_sessions.pop(server_id, None)
+                if provider_session_id is not None:
+                    await self._provider.cancel_session(provider_session_id)
+                    self._provider.revoke_session(provider_session_id)
 
     async def _client_notification(self, message: dict[str, Any]) -> None:
         if message["method"] not in {"session/cancel", "session/cancellation"}:
@@ -331,7 +337,9 @@ class ProxyRouter:
             raise ProxyError("invalid frame")
         session_id = params["sessionId"]
         self._cancel_local_requests(session_id=session_id)
-        await self._provider.cancel_session(session_id)
+        await asyncio.gather(
+            *(self._provider.cancel_session(item) for item in self._provider_sessions(session_id))
+        )
 
     async def _route_hosted(
         self, message: dict[str, Any], kind: str, method: str, params: Any
@@ -356,12 +364,14 @@ class ProxyRouter:
             key = _request_key(message["id"])
             self._register_local(key)
             session_id = self._server_sessions[server_id]
+            provider_session_id = self._server_provider_sessions[server_id]
             try:
-                connection_id = self._provider.connect(session_id)
+                connection_id = self._provider.connect(provider_session_id)
                 if connection_id in self._used_connection_ids:
                     raise ProxyError("reused hosted connection ID")
                 self._used_connection_ids.add(connection_id)
                 self._connection_sessions[connection_id] = session_id
+                self._connection_provider_sessions[connection_id] = provider_session_id
                 await self._complete_local(key, {"connectionId": connection_id})
             except HostedMcpError as exc:
                 await self._fail_local(key, exc)
@@ -382,6 +392,7 @@ class ProxyRouter:
                 self._cancel_local_requests(connection_id=connection_id)
                 result = await self._provider.disconnect(connection_id)
                 self._connection_sessions.pop(connection_id, None)
+                self._connection_provider_sessions.pop(connection_id, None)
                 await self._complete_local(key, result)
             except HostedMcpError as exc:
                 await self._fail_local(key, exc)
@@ -437,12 +448,14 @@ class ProxyRouter:
         params: Any,
     ) -> None:
         try:
-            result = await self._provider.request(
-                connection_id, method, params, request_id=key[1]
-            )
-            await self._complete_local(key, result)
-        except HostedMcpError as exc:
-            await self._fail_local(key, exc)
+            try:
+                result = await self._provider.request(
+                    connection_id, method, params, request_id=key[1]
+                )
+            except HostedMcpError as exc:
+                await self._fail_local(key, exc)
+            else:
+                await self._complete_local(key, result)
         except asyncio.CancelledError:
             if key not in self._daemon_tombstones:
                 raise
@@ -488,6 +501,19 @@ class ProxyRouter:
                 continue
             self._tombstone(key)
             task.cancel()
+
+    def _provider_sessions(self, session_id: str) -> set[str]:
+        result = {
+            provider_session_id
+            for connection_id, provider_session_id in self._connection_provider_sessions.items()
+            if self._connection_sessions.get(connection_id) == session_id
+        }
+        result.update(
+            provider_session_id
+            for server_id, provider_session_id in self._server_provider_sessions.items()
+            if self._server_sessions.get(server_id) == session_id
+        )
+        return result
 
     def _fail_generation(self, error: BaseException) -> None:
         if not self._failure.done():
@@ -542,6 +568,18 @@ async def _route_stream(reader: Any, route: Any) -> None:
             await route(message, raw + b"\n")
 
 
+async def _raise_completed(
+    completed: set[asyncio.Task[Any]], failure_task: asyncio.Task[BaseException]
+) -> None:
+    ordered = tuple(completed)
+    results = await asyncio.gather(*ordered, return_exceptions=True)
+    if failure_task in completed:
+        raise failure_task.result()
+    for result in results:
+        if isinstance(result, BaseException):
+            raise result
+
+
 async def run_router(
     client_reader: Any,
     client_writer: Any,
@@ -558,17 +596,14 @@ async def run_router(
     tasks = {client_task, daemon_task, failure_task}
     try:
         done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
-        if failure_task in done:
-            raise failure_task.result()
-        await asyncio.gather(*done)
+        await _raise_completed(done, failure_task)
         stream_pending = pending - {failure_task}
         if stream_pending and not (close_on_daemon_exit and daemon_task in done):
             completed, stream_pending = await asyncio.wait(
                 stream_pending | {failure_task}, timeout=PEER_EOF_GRACE_TIMEOUT,
                 return_when=asyncio.FIRST_COMPLETED,
             )
-            if failure_task in completed:
-                raise failure_task.result()
+            await _raise_completed(completed, failure_task)
         pending = stream_pending | ({failure_task} if not failure_task.done() else set())
         for task in pending:
             task.cancel()
