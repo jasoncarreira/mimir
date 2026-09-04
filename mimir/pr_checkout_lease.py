@@ -1187,6 +1187,26 @@ def acquire_pr_checkout_lease(
         foreign_candidates: list[tuple[Path, str]] = []
         rebound_candidates: dict[Path, PRCheckoutLease] = {}
         if foreign_leases:
+            from ._context import active_pr_checkout_lease_paths
+
+            active_paths = {
+                path.resolve(strict=False) for path in active_pr_checkout_lease_paths()
+            }
+            live_leases = [
+                lease for lease in foreign_leases
+                if lease.path.resolve(strict=False) in active_paths
+            ]
+            for lease in live_leases:
+                head = _run(
+                    runner,
+                    ["git", "-C", str(lease.path), "rev-parse", "--verify", "HEAD"],
+                    "live PR checkout lease has no HEAD",
+                ).lower()
+                foreign_candidates.append((lease.path, head))
+            foreign_leases = [
+                lease for lease in foreign_leases if lease not in live_leases
+            ]
+
             try:
                 observed_head = _observe_current_pr_head(scope)
             except Exception:  # noqa: BLE001 - observation failures must fail closed

@@ -880,7 +880,7 @@ def test_acquire_refuses_rebased_lease_when_tracked_base_is_unrelated(
     assert old_lease.path.is_dir()
 
 
-def test_acquire_reuses_second_live_scope_for_same_target(
+def test_acquire_refuses_second_live_scope_for_same_target(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -890,6 +890,42 @@ def test_acquire_reuses_second_live_scope_for_same_target(
     first_scope = replace(scope, event_type="pr_review_requested")
     first = create_pr_checkout_lease(
         first_scope, owner=first_scope.principal, lease_root=lease_root,
+    )
+    metadata_path = first.path / ".git" / "mimir-pr-checkout-lease.json"
+    original_metadata = metadata_path.read_bytes()
+    monkeypatch.setattr(
+        "mimir._context.active_pr_checkout_lease_paths",
+        lambda: {first.path},
+    )
+    monkeypatch.setattr(
+        "mimir.pr_checkout_lease._observe_current_pr_head",
+        lambda _scope: scope.observed_head_sha,
+    )
+
+    with pytest.raises(RuntimeError, match="include another scope"):
+        acquire_pr_checkout_lease(
+            scope, owner=scope.principal, lease_root=lease_root,
+        )
+
+    assert first.path.is_dir()
+    assert metadata_path.read_bytes() == original_metadata
+    assert len([path for path in lease_root.iterdir() if path.is_dir()]) == 1
+
+
+def test_acquire_reuses_ended_scope_for_same_target(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _repo, scope = _repo_and_scope(tmp_path)
+    lease_root = tmp_path / "leases"
+    lease_root.mkdir()
+    first_scope = replace(scope, event_type="pr_review_requested")
+    first = create_pr_checkout_lease(
+        first_scope, owner=first_scope.principal, lease_root=lease_root,
+    )
+    monkeypatch.setattr(
+        "mimir._context.active_pr_checkout_lease_paths",
+        lambda: set(),
     )
     monkeypatch.setattr(
         "mimir.pr_checkout_lease._observe_current_pr_head",
