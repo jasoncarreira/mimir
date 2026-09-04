@@ -33,6 +33,8 @@ from mimir.tools.client_provider import (
     hands_edit,
     hands_read,
     hands_shell,
+    client_authorized_host_execution_metadata,
+    issue_client_authorized_host_execution,
     reset_turn_capability_context,
     set_turn_capability_context,
 )
@@ -178,6 +180,107 @@ def test_registry_contains_only_immutable_mimir_hands_profile() -> None:
         MIMIR_HANDS_V1.adapter = "client-selected"
 
 
+@pytest.mark.parametrize(
+    ("wrapper_name", "auth_changes", "context_changes"),
+    [
+        ("hands_read", {}, {}),
+        ("shell_exec", {}, {}),
+        ("hands_edit", {"roles": ("user",)}, {}),
+        ("hands_edit", {"is_service": True}, {}),
+        ("hands_edit", {}, {"acp_delivery": False}),
+        ("hands_edit", {}, {"profile_policy": None}),
+        ("hands_edit", {}, {"connection_generation": 2}),
+        ("hands_edit", {}, {"prompt_epoch": 2}),
+        ("hands_edit", {}, {"lease_closed": True}),
+        ("hands_edit", {}, {"provider_closed": True}),
+    ],
+)
+def test_client_authorized_host_execution_marker_exclusions_are_exhaustive(
+    wrapper_name: str,
+    auth_changes: dict[str, object],
+    context_changes: dict[str, object],
+) -> None:
+    from mimir.acp.journal import JournalLease
+
+    context_changes = dict(context_changes)
+    provider = SimpleNamespace(closed=context_changes.pop("provider_closed", False))
+    lease = JournalLease("turn", 1, 1)
+    if context_changes.pop("lease_closed", False):
+        lease.close()
+    context = TurnCapabilityContext(
+        permission_broker=SimpleNamespace(request_permission=lambda _: None),
+        provider=provider,
+        profile_policy=MIMIR_HANDS_V1,
+        connection_generation=1,
+        prompt_epoch=1,
+        acp_delivery=True,
+        lease=lease,
+    )
+    context = replace(context, **context_changes)
+    auth = replace(_admin_auth(), **auth_changes)
+    request = object()
+    token = set_turn_capability_context(context)
+    try:
+        marker = issue_client_authorized_host_execution(
+            request_identity=request,
+            auth_context_identity=auth,
+            wrapper_name=wrapper_name,
+            tainted=False,
+        )
+    finally:
+        reset_turn_capability_context(token)
+
+    assert marker is None
+
+
+def test_client_authorized_host_execution_metadata_is_live_and_fails_closed() -> None:
+    from mimir.acp.journal import JournalLease
+
+    class State:
+        tainted: object = False
+
+        def current(self, fallback: object) -> object:
+            return fallback
+
+        def has_untrusted_active_ingest(self, fallback: object) -> object:
+            return self.tainted
+
+    state = State()
+    auth = replace(_admin_auth(), ifc_state=state)
+    lease = JournalLease("turn", 1, 1)
+    context = TurnCapabilityContext(
+        permission_broker=SimpleNamespace(request_permission=lambda _: None),
+        provider=SimpleNamespace(closed=False),
+        profile_policy=MIMIR_HANDS_V1,
+        connection_generation=1,
+        prompt_epoch=1,
+        acp_delivery=True,
+        lease=lease,
+    )
+    token = set_turn_capability_context(context)
+    try:
+        marker = issue_client_authorized_host_execution(
+            request_identity=object(),
+            auth_context_identity=auth,
+            wrapper_name="hands_edit",
+            tainted=False,
+        )
+        assert client_authorized_host_execution_metadata(marker) == (
+            "hands_edit", False,
+        )
+        state.tainted = True
+        assert client_authorized_host_execution_metadata(marker) == (
+            "hands_edit", True,
+        )
+        state.tainted = object()
+        assert client_authorized_host_execution_metadata(marker) is None
+        state.tainted = False
+        lease.close()
+        assert client_authorized_host_execution_metadata(marker) is None
+    finally:
+        reset_turn_capability_context(token)
+
+
 def test_profile_has_exact_provider_schemas_and_server_metadata() -> None:
     tools = {policy.provider_name: policy for policy in MIMIR_HANDS_V1.tools}
     expected = {
@@ -246,6 +349,11 @@ def test_profile_has_exact_provider_schemas_and_server_metadata() -> None:
         assert tools[name].result_schema_digest == result_digest
     assert {policy.classification for policy in MIMIR_HANDS_V1.tools} == {
         "resource_scoped", "admin_required"
+    }
+    assert {policy.wrapper_name: policy.operation for policy in MIMIR_HANDS_V1.tools} == {
+        "hands_read": None,
+        "hands_edit": "client_authorized_host_execution",
+        "hands_shell": "client_authorized_host_execution",
     }
 
 

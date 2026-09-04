@@ -7906,7 +7906,7 @@ def _repository_result_labels(repo: str, pr: int, head: str) -> InformationFlowL
         ("hands_shell", {"command": "pwd"}, None),
     ],
 )
-def test_existing_hands_results_are_complete_untrusted_active_and_origin_channel_only(
+def test_authorized_tainted_edit_and_shell_results_reply_only_to_originating_acp_channel(
     tool_name: str,
     arguments: dict[str, str],
     resources: tuple[str, ...] | None,
@@ -12496,12 +12496,13 @@ def _permission_test_context(broker: object, **changes: object) -> object:
     ("outcome", "allowed"),
     [
         ("allow_once", False),
+        ("allow_session", False),
         ("reject_once", False),
         ("cancelled", False),
         (object(), False),
     ],
 )
-async def test_acp_permission_accepts_only_exact_allow_once(
+async def test_acp_permission_accepts_only_exact_current_call_approvals(
     outcome: object, allowed: bool,
 ) -> None:
     from mimir.tools.budget_gate import _request_permission_async
@@ -12511,7 +12512,7 @@ async def test_acp_permission_accepts_only_exact_allow_once(
         set_turn_capability_context,
     )
 
-    actual = PermissionDecision.ALLOW_ONCE if outcome == "allow_once" else outcome
+    actual = PermissionDecision(outcome) if isinstance(outcome, str) else outcome
     broker = _PermissionTestBroker(actual)
     token = set_turn_capability_context(_permission_test_context(broker))
     request = SimpleNamespace(tool_call={"id": "call-1"})
@@ -12522,7 +12523,7 @@ async def test_acp_permission_accepts_only_exact_allow_once(
     finally:
         reset_turn_capability_context(token)
 
-    assert (denial is None) is (outcome == "allow_once")
+    assert (denial is None) is (outcome in {"allow_once", "allow_session"})
     assert len(broker.calls) == 1
     eligibility = broker.calls[0]
     assert eligibility.tool_call_id == "call-1"
@@ -12719,6 +12720,7 @@ def test_hands_shell_missing_command_fails_before_prohibited_provider_check(
     ("outcome", "expected_denial"),
     [
         ("allow_once", None),
+        ("allow_session", None),
         (
             "reject_once",
             "hands_edit permission was rejected by the operator before execution",
@@ -12881,7 +12883,7 @@ class _ImmediatePermissionBroker:
 
 
 def _live_permission_request(admin: bool = True, tool_name: str = "hands_edit", args: object = None):
-    arguments = args if args is not None else {"path": "a", "oldText": "x", "newText": "y"}
+    arguments = args if args is not None else {"path": "a", "old_text": "x", "new_text": "y"}
     request = _tool_request(_write_auth(admin=admin), tool_name=tool_name, args=arguments)
     request.tool_call["args"] = arguments
     return request
@@ -13712,15 +13714,31 @@ async def test_public_hands_shell_prohibition_gate_order(
     order: list[str] = []
     broker = _ImmediatePermissionBroker(PermissionDecision.ALLOW_ONCE)
     originals = {
+        "strict": budget_gate._validated_arguments,
         "review": budget_gate._resolve_standing_review,
+        "identity": budget_gate._admitted_admin_hands_candidate,
+        "taint": budget_gate._current_ifc_labels,
         "authorize": budget_gate._authorize_tool_call,
         "prohibited": budget_gate._check_prohibited,
+        "marker": budget_gate.issue_client_authorized_host_execution,
         "budget": budget_gate._check_and_increment_or_deny,
     }
+
+    def strict(*args: object, **kwargs: object):
+        order.append("strict")
+        return originals["strict"](*args, **kwargs)
 
     def review(*args: object, **kwargs: object):
         order.append("review")
         return originals["review"](*args, **kwargs)
+
+    def identity(*args: object, **kwargs: object):
+        order.append("identity")
+        return originals["identity"](*args, **kwargs)
+
+    def taint(*args: object, **kwargs: object):
+        order.append("taint")
+        return originals["taint"](*args, **kwargs)
 
     def authorize(*args: object, **kwargs: object):
         order.append("authorize")
@@ -13730,13 +13748,21 @@ async def test_public_hands_shell_prohibition_gate_order(
         order.append("prohibited")
         return originals["prohibited"](*args, **kwargs)
 
+    def marker(*args: object, **kwargs: object):
+        order.append("marker")
+        return originals["marker"](*args, **kwargs)
+
     def budget(*args: object, **kwargs: object):
         order.append("budget")
         return originals["budget"](*args, **kwargs)
 
+    monkeypatch.setattr(budget_gate, "_validated_arguments", strict)
     monkeypatch.setattr(budget_gate, "_resolve_standing_review", review)
+    monkeypatch.setattr(budget_gate, "_admitted_admin_hands_candidate", identity)
+    monkeypatch.setattr(budget_gate, "_current_ifc_labels", taint)
     monkeypatch.setattr(budget_gate, "_authorize_tool_call", authorize)
     monkeypatch.setattr(budget_gate, "_check_prohibited", prohibited)
+    monkeypatch.setattr(budget_gate, "issue_client_authorized_host_execution", marker)
     monkeypatch.setattr(budget_gate, "_check_and_increment_or_deny", budget)
     token = set_turn_capability_context(_capability_for_broker(broker))
     try:
@@ -13756,7 +13782,7 @@ async def test_public_hands_shell_prohibition_gate_order(
         reset_turn_capability_context(token)
 
     assert result.status == "error"
-    assert order == ["review", "authorize", "prohibited"]
+    assert order == ["strict", "review", "identity", "taint", "prohibited"]
     assert broker.calls == []
 
 
@@ -14077,3 +14103,447 @@ async def test_public_sync_permission_result_is_audited(
     assert any(event.get("ok") is (outcome == "allow") for event in events)
     if outcome == "deny":
         assert any(event.get("denied") is True and event.get("error") == result.content for event in events)
+
+
+@pytest.mark.asyncio
+async def test_tainted_turn_refuses_shell_exec_but_reaches_hands_shell_permission() -> None:
+    from langchain_core.messages import ToolMessage
+    from mimir.models import InformationFlowState
+    from mimir.tools.budget_gate import BudgetGateMiddleware
+    from mimir.tools.client_provider import PermissionDecision, reset_turn_capability_context, set_turn_capability_context
+
+    auth = _tainted_admin_operator_write_auth()
+    auth = replace(auth, ifc_state=InformationFlowState(labels=auth.ifc_labels))
+    broker = _ImmediatePermissionBroker(PermissionDecision.ALLOW_ONCE)
+    token = set_turn_capability_context(_capability_for_broker(broker))
+    middleware = BudgetGateMiddleware()
+    try:
+        native = _tool_request(auth, tool_name="shell_exec", args={"command": "printf native"})
+        native_result = await middleware.awrap_tool_call(
+            native, lambda _request: pytest.fail("native shell executed"),
+        )
+        hands = _tool_request(auth, tool_name="hands_shell", args={"command": "printf hands"})
+        hands.tool_call["args"] = {"command": "printf hands"}
+        hands_result = await middleware.awrap_tool_call(
+            hands,
+            lambda request: asyncio.sleep(
+                0, result=ToolMessage(content="hands", tool_call_id=request.tool_call["id"]),
+            ),
+        )
+    finally:
+        reset_turn_capability_context(token)
+
+    assert native_result.status == "error"
+    assert str(native_result.content).startswith(
+        "shell_exec was refused before execution (ifc_label_blocked:shell_process)"
+    )
+    assert hands_result.content == "hands"
+    assert len(broker.calls) == 1
+    assert broker.calls[0].host_execution.operation == "client_authorized_host_execution"
+    assert broker.calls[0].host_execution.tainted is True
+
+
+@pytest.mark.asyncio
+async def test_only_admitted_acp_admin_hands_get_client_authorized_operation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from langchain_core.messages import ToolMessage
+    from mimir.tools import budget_gate
+    from mimir.tools.client_provider import PermissionDecision, reset_turn_capability_context, set_turn_capability_context
+
+    issued: list[str] = []
+    original = budget_gate.issue_client_authorized_host_execution
+
+    def issue(**kwargs: object):
+        issued.append(str(kwargs["wrapper_name"]))
+        return original(**kwargs)
+
+    monkeypatch.setattr(budget_gate, "issue_client_authorized_host_execution", issue)
+    broker = _ImmediatePermissionBroker(PermissionDecision.ALLOW_ONCE)
+    token = set_turn_capability_context(_capability_for_broker(broker))
+    try:
+        denied = await budget_gate.BudgetGateMiddleware().awrap_tool_call(
+            _live_permission_request(tool_name="hands_shell", args={"command": "git push --force origin main"}),
+            lambda _request: pytest.fail("prohibited shell executed"),
+        )
+        allowed = await budget_gate.BudgetGateMiddleware().awrap_tool_call(
+            _live_permission_request(),
+            lambda request: asyncio.sleep(
+                0, result=ToolMessage(content="ok", tool_call_id=request.tool_call["id"]),
+            ),
+        )
+    finally:
+        reset_turn_capability_context(token)
+
+    assert denied.status == "error"
+    assert issued == ["hands_edit"]
+    assert allowed.content == "ok"
+
+
+def test_non_hands_native_sink_inventory_keeps_untrusted_ingest_veto(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    expected = {
+        SinkCategory.SAME_CHANNEL: {"send_message", "react", "harness_auto_deliver", "harness_resend_nudge"},
+        SinkCategory.CROSS_CHANNEL: {"post_message"},
+        SinkCategory.HTTP_WEBHOOK: {"webhook", "http_request"},
+        SinkCategory.NETWORK: {"fetch_url", "web_search"},
+        SinkCategory.SHELL_PROCESS: {"shell_exec", "bash_async", "Bash", "bash", "bash_exec", "execute", "aexecute", "shell"},
+        SinkCategory.SPAWN: {"spawn_open_code", "worklink_run"},
+        SinkCategory.NOTIFICATION: {"operator_alert", "ntfy_send"},
+        SinkCategory.FILE: {"write_file", "edit_file", "Write", "Edit", "download_files", "adownload_files", "rebuild_index", "request_mimir_update"},
+        SinkCategory.SAGA: {"memory_store", "saga_record_skill_learning", "saga_feedback", "saga_mark_contributions", "saga_forget", "saga_end_session", "commitment_complete", "commitment_snooze", "commitment_dismiss", "defer_injected_message"},
+        SinkCategory.SCHEDULER: {"add_schedule", "set_schedule_priority", "remove_schedule", "set_poller_overrides", "reload_pollers"},
+        SinkCategory.PROPOSAL: {"open_proposal", "submit_proposal", "abandon_proposal"},
+        SinkCategory.HARNESS_DISPLAY: {"activity_panel_post", "activity_panel_edit"},
+        SinkCategory.FORGE: {"pr_submit_review", "pr_inline_review_comment", "pr_comment", "issue_comment", "pr_rerequest_review", "unsupported_operation", "repo_checkout", "repo_cleanup", "repo_fetch", "repo_test", "repo_stage", "repo_commit", "repo_merge", "repo_merge_abort", "repo_rebase", "repo_rebase_abort", "repo_revert", "repo_revert_abort", "repo_push"},
+    }
+    actual = {
+        category: {
+            name for name, observed in access_control._SINK_CATEGORY_MAP.items()
+            if observed is category and not name.startswith("hands_")
+        }
+        for category in expected
+    }
+
+    assert actual == expected
+    assert set(access_control._SINK_CATEGORY_MAP) - {"hands_edit", "hands_shell"} == set().union(*expected.values())
+    assert not any("*" in name for names in actual.values() for name in names)
+    capability_eligible = {
+        SinkCategory.SAME_CHANNEL,
+        SinkCategory.CROSS_CHANNEL,
+        SinkCategory.PUBLIC,
+        SinkCategory.SHELL_PROCESS,
+        SinkCategory.SPAWN,
+        SinkCategory.NOTIFICATION,
+        SinkCategory.FILE,
+        SinkCategory.DIRECT_MESSAGE,
+        SinkCategory.SAGA,
+        SinkCategory.SCHEDULER,
+        SinkCategory.PROPOSAL,
+        SinkCategory.FORGE,
+    }
+    capability_excluded = {
+        SinkCategory.NETWORK,
+        SinkCategory.HTTP_WEBHOOK,
+        SinkCategory.EXTERNAL_MCP,
+        SinkCategory.HARNESS_DISPLAY,
+        SinkCategory.UNKNOWN,
+    }
+    assert access_control._SINK_CATEGORY_CAPABILITY_ELIGIBLE == capability_eligible
+    assert capability_eligible.isdisjoint(capability_excluded)
+    assert capability_eligible | capability_excluded == set(SinkCategory)
+
+    from mimir.models import InformationFlowState
+    from mimir.tools import client_provider
+
+    monkeypatch.setattr(
+        client_provider,
+        "client_authorized_host_execution_matches",
+        lambda *_args, **_kwargs: pytest.fail("client-authorized marker consulted"),
+    )
+    auth = _tainted_admin_operator_write_auth()
+    auth = replace(auth, ifc_state=InformationFlowState(labels=auth.ifc_labels))
+    saga_tools = {
+        "memory_store", "saga_record_skill_learning", "saga_feedback",
+        "saga_mark_contributions", "saga_forget", "saga_end_session",
+        "commitment_complete", "commitment_snooze", "commitment_dismiss",
+        "defer_injected_message",
+    }
+    destination_tools = {"fetch_url", "web_search"}
+    display_tools = {"activity_panel_post", "activity_panel_edit"}
+    expected_verdicts = {
+        name: (
+            (True, "harness_metadata_display")
+            if name in display_tools
+            else (False, "saga_mutation_blocked_by_tainted_turn")
+            if name in saga_tools
+            else (False, "egress_destination_not_approved")
+            if name in destination_tools
+            else (False, f"ifc_label_blocked:{category.value}")
+        )
+        for category, names in expected.items()
+        for name in names
+    }
+    observed_verdicts = {}
+    for name in sorted(expected_verdicts):
+        category = access_control._SINK_CATEGORY_MAP[name]
+        decision = SinkGate.check_sink_flow(
+            name,
+            "native-target",
+            auth.ifc_labels,
+            auth,
+            enforce=True,
+            sink_category=category,
+            client_authorized_host_execution=None,
+            request_identity=None,
+        )
+        observed_verdicts[name] = (decision.allowed, decision.reason)
+
+    assert observed_verdicts == expected_verdicts
+
+
+def test_non_acp_execution_decisions_are_unchanged() -> None:
+    catalog = access_control.get_operation_catalog()
+    hands = {"hands_read", "hands_edit", "hands_shell"}
+    flows = {
+        access_control.ToolFlowDirection.NEITHER: {"approve_declassification", "request_operator_approval", "write_todos", "task"},
+        access_control.ToolFlowDirection.SOURCE: {"memory_query", "memory_get", "file_search", "mimir_get_turn", "get_turn", "bash_jobs_list", "bash_job_output", "fetch_channel_history", "list_channels", "list_schedules", "commitment_list", "read_file", "aread", "ls", "als", "glob", "aglob", "grep", "agrep", "Read", "Glob", "Grep", "pr_metadata", "pr_files", "pr_diff", "pr_checks", "pr_reviews", "pr_comments", "pr_review_requests", "repo_status", "repo_diff", "repo_unmerged"},
+        access_control.ToolFlowDirection.BOTH: {"shell_exec", "bash_async", "worklink_run", "web_search", "fetch_url", "http_request", "spawn_open_code", "download_files", "adownload_files", "Bash", "bash", "bash_exec", "execute", "aexecute", "shell", "repo_checkout", "repo_fetch", "repo_test"},
+        access_control.ToolFlowDirection.SINK: {"memory_store", "open_proposal", "submit_proposal", "abandon_proposal", "saga_feedback", "saga_mark_contributions", "saga_end_session", "saga_forget", "saga_record_skill_learning", "rebuild_index", "send_message", "operator_alert", "react", "defer_injected_message", "add_schedule", "set_schedule_priority", "remove_schedule", "set_poller_overrides", "reload_pollers", "commitment_complete", "commitment_snooze", "commitment_dismiss", "request_mimir_update", "post_message", "webhook", "ntfy_send", "write_file", "edit_file", "Write", "Edit", "harness_auto_deliver", "harness_resend_nudge", "activity_panel_post", "activity_panel_edit", "pr_submit_review", "pr_inline_review_comment", "pr_comment", "issue_comment", "pr_rerequest_review", "unsupported_operation", "repo_cleanup", "repo_stage", "repo_commit", "repo_merge", "repo_merge_abort", "repo_rebase", "repo_rebase_abort", "repo_revert", "repo_revert_abort", "repo_push"},
+    }
+    decisions = {
+        OperationDecision.OPEN: {"commitment_list", "memory_query", "memory_get", "web_search", "fetch_url", "write_todos", "defer_injected_message", "request_operator_approval", "commitment_complete", "commitment_snooze", "commitment_dismiss"},
+        OperationDecision.RESOURCE_SCOPED: {"send_message", "react", "fetch_channel_history", "read_file", "aread", "ls", "als", "glob", "aglob", "grep", "agrep", "file_search", "get_turn", "mimir_get_turn", "write_file", "edit_file", "worklink_run", "pr_metadata", "pr_files", "pr_diff", "pr_checks", "pr_reviews", "pr_comments", "pr_review_requests", "pr_submit_review", "pr_inline_review_comment", "pr_comment", "pr_rerequest_review", "unsupported_operation", "repo_checkout", "repo_cleanup", "repo_fetch", "repo_status", "repo_test", "repo_diff", "repo_unmerged", "repo_stage", "repo_commit", "repo_merge", "repo_merge_abort", "repo_rebase", "repo_rebase_abort", "repo_revert", "repo_revert_abort", "repo_push"},
+        OperationDecision.ADMIN_REQUIRED: {"issue_comment", "operator_alert", "approve_declassification", "list_channels", "list_schedules", "add_schedule", "set_schedule_priority", "remove_schedule", "reload_pollers", "open_proposal", "submit_proposal", "abandon_proposal", "request_mimir_update", "shell_exec", "bash_async", "bash_jobs_list", "bash_job_output", "spawn_open_code", "task", "memory_store", "saga_feedback", "saga_mark_contributions", "saga_end_session", "saga_record_skill_learning", "saga_forget", "set_poller_overrides", "download_files", "adownload_files", "rebuild_index", "Bash", "bash", "bash_exec", "execute", "aexecute", "shell", "Write", "Edit", "Read", "Glob", "Grep"},
+        OperationDecision.UNKNOWN: {"post_message", "webhook", "http_request", "ntfy_send", "harness_auto_deliver", "harness_resend_nudge", "activity_panel_post", "activity_panel_edit"},
+    }
+    admin_catalog = {
+        "issue_comment", "operator_alert", "approve_declassification",
+        "list_channels", "list_schedules", "add_schedule",
+        "set_schedule_priority", "remove_schedule", "reload_pollers",
+        "open_proposal", "submit_proposal", "abandon_proposal",
+        "request_mimir_update", "shell_exec", "bash_async",
+        "bash_jobs_list", "bash_job_output", "spawn_open_code", "task",
+        "memory_store", "saga_feedback", "saga_mark_contributions",
+        "saga_end_session", "saga_record_skill_learning", "saga_forget",
+        "set_poller_overrides", "download_files", "adownload_files",
+        "rebuild_index", "hands_edit", "hands_shell",
+    }
+    protected_builtins = {
+        "Bash", "bash", "bash_exec", "execute", "aexecute", "shell",
+        "Write", "Edit", "Read", "Glob", "Grep", "download_files",
+    }
+    readable = {
+        "list_channels": "channel_metadata", "list_schedules": "schedule_metadata", "bash_jobs_list": "shell_jobs", "bash_job_output": "shell_jobs", "read_file": "filesystem", "aread": "filesystem", "ls": "filesystem", "als": "filesystem", "glob": "filesystem", "aglob": "filesystem", "grep": "filesystem", "agrep": "filesystem", "file_search": "filesystem", "get_turn": "turn_history", "mimir_get_turn": "turn_history", "memory_query": "saga", "memory_get": "saga", "pr_metadata": "repository", "pr_files": "repository", "pr_diff": "repository", "pr_checks": "repository", "pr_reviews": "repository", "pr_comments": "repository", "pr_review_requests": "repository", "repo_checkout": "repository", "repo_fetch": "repository", "repo_status": "repository", "repo_test": "repository", "repo_diff": "repository", "repo_unmerged": "repository",
+    }
+    protected = {
+        "fetch_channel_history": "channel_history", "list_channels": "channel_metadata", "list_schedules": "schedule_metadata", "bash_jobs_list": "shell_jobs", "bash_job_output": "shell_jobs", "read_file": "filesystem", "aread": "filesystem", "ls": "filesystem", "als": "filesystem", "glob": "filesystem", "aglob": "filesystem", "grep": "filesystem", "agrep": "filesystem", "download_files": "filesystem", "adownload_files": "filesystem", "Read": "filesystem", "Glob": "filesystem", "Grep": "filesystem", "file_search": "filesystem", "get_turn": "turn_history", "mimir_get_turn": "turn_history", "memory_query": "saga", "memory_get": "saga", "saga_forget": "saga", "commitment_list": "commitments", "shell_exec": "shell", "execute": "shell", "web_search": "web", "worklink_run": "worklink", "spawn_open_code": "coding_worker", "pr_metadata": "repository", "pr_files": "repository", "pr_diff": "repository", "pr_checks": "repository", "pr_reviews": "repository", "pr_comments": "repository", "pr_review_requests": "repository", "repo_checkout": "repository", "repo_fetch": "repository", "repo_status": "repository", "repo_test": "repository", "repo_diff": "repository", "repo_unmerged": "repository", "pr_submit_review": "repository", "pr_inline_review_comment": "repository", "pr_comment": "repository", "issue_comment": "repository", "repo_commit": "repository", "repo_merge": "repository", "repo_merge_abort": "repository", "repo_rebase": "repository", "repo_rebase_abort": "repository", "repo_revert": "repository", "repo_revert_abort": "repository", "repo_push": "repository",
+    }
+    destination_groups = {
+        "filesystem": {"write_file", "edit_file", "rebuild_index", "request_mimir_update", "download_files", "adownload_files", "Write", "Edit"},
+        "shell_process": {"shell_exec", "bash_async", "Bash", "bash", "bash_exec", "execute", "aexecute", "shell"},
+        "spawn_process": {"spawn_open_code"},
+        "proposal": {"open_proposal", "submit_proposal", "abandon_proposal"},
+        "scheduler": {"add_schedule", "set_schedule_priority", "remove_schedule", "set_poller_overrides", "reload_pollers"},
+        "commitments": {"commitment_complete", "commitment_snooze", "commitment_dismiss"},
+        "injected_messages": {"defer_injected_message"},
+        "saga": {"saga_feedback", "saga_mark_contributions", "saga_record_skill_learning", "saga_forget", "memory_store"},
+        "session_boundary": {"saga_end_session"},
+        "message": {"send_message", "react", "post_message", "harness_auto_deliver", "harness_resend_nudge", "activity_panel_post", "activity_panel_edit"},
+        "notification": {"operator_alert", "ntfy_send"},
+        "worklink": {"worklink_run"},
+        "network": {"web_search", "fetch_url", "webhook", "http_request"},
+        "bound_pull_request": {"pr_submit_review", "pr_inline_review_comment", "pr_comment", "pr_rerequest_review", "unsupported_operation", "repo_checkout", "repo_cleanup", "repo_fetch", "repo_test", "repo_stage", "repo_commit", "repo_merge", "repo_merge_abort", "repo_rebase", "repo_rebase_abort", "repo_revert", "repo_revert_abort", "repo_push"},
+        "configured_repository_issue": {"issue_comment"},
+    }
+    destinations = {
+        name: destination
+        for destination, names in destination_groups.items()
+        for name in names
+    }
+
+    assert {name for name in access_control._TOOL_FLOW_MAP if name.startswith("hands_")} == hands
+    assert {
+        direction: {name for name, value in access_control._TOOL_FLOW_MAP.items() if value is direction and name not in hands}
+        for direction in flows
+    } == flows
+    assert {
+        decision: {name for names in decisions.values() for name in names if catalog.get_decision(name, _write_auth(admin=True)) is decision}
+        for decision in decisions
+    } == decisions
+    assert access_control.OperationCatalog._OPEN_OPERATIONS == decisions[OperationDecision.OPEN]
+    assert access_control.OperationCatalog._RESOURCE_SCOPED_OPERATIONS == (
+        decisions[OperationDecision.RESOURCE_SCOPED]
+        - {"send_message", "react", "fetch_channel_history"}
+        | {"hands_read"}
+    )
+    assert access_control.OperationCatalog._ADMIN_REQUIRED_OPERATIONS == admin_catalog
+    assert access_control.OperationCatalog._ADMIN_BUILTIN_TOOL_NAMES == protected_builtins
+    finite_surface = set().union(*flows.values(), hands)
+    assert {
+        name for name in finite_surface
+        if catalog.get_decision(name, _write_auth(admin=True)) is OperationDecision.UNKNOWN
+    } == decisions[OperationDecision.UNKNOWN]
+    assert {name: value for name, value in access_control._OPERATION_READABLE_DOMAIN.items() if name not in hands} == readable
+    assert {name: value for name, value in access_control._OPERATION_SINK_DESTINATION.items() if name not in hands} == destinations
+    assert {name: value for name, value in access_control._PROTECTED_RESULT_DOMAINS.items() if name not in hands} == protected
+    assert catalog.get_decision("hands_read") is OperationDecision.RESOURCE_SCOPED
+    assert catalog.get_decision("hands_edit") is OperationDecision.ADMIN_REQUIRED
+    assert catalog.get_decision("hands_shell") is OperationDecision.ADMIN_REQUIRED
+    assert catalog.get_decision("client_authorized_host_execution") is OperationDecision.UNKNOWN
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("async_hook", [False, True])
+async def test_shell_exec_policy_and_execution_are_unchanged(
+    async_hook: bool,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from langchain_core.messages import ToolMessage
+    from mimir.models import InformationFlowState
+    from mimir.tools.budget_gate import BudgetGateMiddleware
+    from mimir.tools.client_provider import PermissionDecision, reset_turn_capability_context, set_turn_capability_context
+
+    shell_names = {"shell_exec", "bash_async", "Bash", "bash", "bash_exec", "execute", "aexecute", "shell"}
+
+    assert access_control.SHELL_PROCESS_TOOL_NAMES - {"hands_shell"} == shell_names
+    assert {name: access_control._TOOL_FLOW_MAP[name] for name in shell_names} == {
+        name: access_control.ToolFlowDirection.BOTH for name in shell_names
+    }
+    assert {name: access_control._OPERATION_SINK_DESTINATION[name] for name in shell_names} == {
+        name: "shell_process" for name in shell_names
+    }
+    assert access_control.OperationCatalog().get_decision("shell_exec") is OperationDecision.ADMIN_REQUIRED
+    monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
+    auth = _write_auth(admin=True)
+    auth = replace(auth, ifc_state=InformationFlowState(labels=auth.ifc_labels))
+    request = _tool_request(auth, tool_name="shell_exec", args={"command": "pwd"})
+    middleware = BudgetGateMiddleware()
+    if async_hook:
+        result = await middleware.awrap_tool_call(
+            request,
+            lambda call: asyncio.sleep(0, result=ToolMessage(content="native", tool_call_id=call.tool_call["id"])),
+        )
+    else:
+        result = middleware.wrap_tool_call(
+            request,
+            lambda call: ToolMessage(content="native", tool_call_id=call.tool_call["id"]),
+        )
+
+    assert result.content == "native"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("async_hook", [False, True])
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        {},
+        {"path": "a", "old_text": "x"},
+        {"path": "a", "old_text": "x", "new_text": "y", "extra": "z"},
+        {"path": "a", "old_text": "x", "new_text": 7},
+        {"path": "a", "oldText": "x", "newText": "y"},
+        {"path": "a", "old_text": "x", "new_text": "y", "_meta": {"mimir.tainted": True}},
+        {"path": "a", "old_text": "x", "new_text": "y", "mimir_direct_argv": ["true"]},
+    ],
+)
+async def test_admin_hands_exact_schema_precedes_screen_marker_permission_and_execution(
+    monkeypatch: pytest.MonkeyPatch,
+    async_hook: bool,
+    arguments: dict[str, object],
+) -> None:
+    from mimir.tools import budget_gate
+    from mimir.tools.client_provider import PermissionDecision, reset_turn_capability_context, set_turn_capability_context
+
+    broker = _ImmediatePermissionBroker(PermissionDecision.ALLOW_ONCE)
+    token = set_turn_capability_context(_capability_for_broker(broker))
+    monkeypatch.setattr(
+        budget_gate,
+        "_check_prohibited",
+        lambda *_args, **_kwargs: pytest.fail("prohibited screening reached"),
+    )
+    request = _live_permission_request(args=arguments)
+    try:
+        if async_hook:
+            result = await budget_gate.BudgetGateMiddleware().awrap_tool_call(
+                request, lambda _request: pytest.fail("handler executed"),
+            )
+        else:
+            result = budget_gate.BudgetGateMiddleware().wrap_tool_call(
+                request, lambda _request: pytest.fail("handler executed"),
+            )
+    finally:
+        reset_turn_capability_context(token)
+
+    assert result.status == "error"
+    assert result.content == "hands_edit arguments are malformed"
+    assert broker.calls == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("async_hook", [False, True])
+async def test_admin_hands_successful_pipeline_order_is_exact(
+    monkeypatch: pytest.MonkeyPatch,
+    async_hook: bool,
+) -> None:
+    from langchain_core.messages import ToolMessage
+    from mimir.tools import budget_gate
+    from mimir.tools.client_provider import PermissionDecision, reset_turn_capability_context, set_turn_capability_context
+
+    order: list[str] = []
+    broker = _ImmediatePermissionBroker(PermissionDecision.ALLOW_ONCE)
+    if not async_hook:
+        broker.model_task = asyncio.current_task()
+    original_request = broker.request_permission
+
+    async def permission(eligibility: object) -> object:
+        order.append("permission")
+        return await original_request(eligibility)
+
+    broker.request_permission = permission
+    originals = {
+        "strict": budget_gate._validated_arguments,
+        "identity": budget_gate._admitted_admin_hands_candidate,
+        "taint": budget_gate._current_ifc_labels,
+        "prohibited": budget_gate._check_prohibited,
+        "marker": budget_gate.issue_client_authorized_host_execution,
+        "sink": budget_gate._authorize_tool_call,
+        "snapshot": budget_gate._permission_context_is_current,
+    }
+
+    def witness(name: str):
+        def wrapped(*args: object, **kwargs: object):
+            order.append(name)
+            return originals[name](*args, **kwargs)
+        return wrapped
+
+    for name in originals:
+        monkeypatch.setattr(
+            budget_gate,
+            "issue_client_authorized_host_execution" if name == "marker" else (
+                "_authorize_tool_call" if name == "sink" else (
+                    "_permission_context_is_current" if name == "snapshot" else (
+                        "_admitted_admin_hands_candidate" if name == "identity" else (
+                            "_current_ifc_labels" if name == "taint" else (
+                                "_check_prohibited" if name == "prohibited" else "_validated_arguments"
+                            )
+                        )
+                    )
+                )
+            ),
+            witness(name),
+        )
+
+    def sync_handler(request: object) -> ToolMessage:
+        order.append("handler")
+        return ToolMessage(content="ok", tool_call_id=request.tool_call["id"])
+
+    async def async_handler(request: object) -> ToolMessage:
+        order.append("handler")
+        return ToolMessage(content="ok", tool_call_id=request.tool_call["id"])
+
+    token = set_turn_capability_context(_capability_for_broker(broker))
+    try:
+        middleware = budget_gate.BudgetGateMiddleware()
+        if async_hook:
+            result = await middleware.awrap_tool_call(
+                _live_permission_request(), async_handler,
+            )
+        else:
+            result = await asyncio.to_thread(
+                middleware.wrap_tool_call, _live_permission_request(), sync_handler,
+            )
+    finally:
+        reset_turn_capability_context(token)
+
+    assert result.content == "ok"
+    required = [
+        "strict", "identity", "taint", "prohibited", "marker", "sink",
+        "snapshot", "permission", "snapshot", "handler",
+    ]
+    positions: list[int] = []
+    for name in required:
+        positions.append(order.index(name, positions[-1] + 1 if positions else 0))
+    assert positions == sorted(positions)

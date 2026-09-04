@@ -6333,6 +6333,8 @@ class SinkGate:
         operator_shell_request_identity: Any = None,
         tool_call_id: str | None = None,
         requested_cwd: object = None,
+        client_authorized_host_execution: Any = None,
+        request_identity: Any = None,
     ) -> "ToolAuthorization":
         """Check if IFC labels permit flow to the given sink.
 
@@ -6468,6 +6470,16 @@ class SinkGate:
         has_untrusted_active_ingest = _has_untrusted_active_ingest(
             auth_context, ifc_labels,
         )
+        client_authorized = False
+        if client_authorized_host_execution is not None:
+            from .tools.client_provider import client_authorized_host_execution_matches
+
+            client_authorized = client_authorized_host_execution_matches(
+                client_authorized_host_execution,
+                request_identity=request_identity,
+                auth_context_identity=auth_context,
+                wrapper_name=tool_name,
+            )
         operator_binding_matches = _operator_shell_binding_matches(
             operator_shell_binding,
             request_identity=operator_shell_request_identity,
@@ -6501,6 +6513,7 @@ class SinkGate:
             is_application_egress
             and egress_target_requires_taint_gate
             and not allow_untrusted_active_ingest
+            and not client_authorized
             and has_untrusted_active_ingest
         ):
             canonical_principal = getattr(auth_context, "canonical_principal", None)
@@ -6813,6 +6826,7 @@ class SinkGate:
             operator_shell_request_identity=operator_shell_request_identity,
             tool_call_id=tool_call_id,
             requested_cwd=requested_cwd,
+            client_authorized_host_execution=client_authorized,
         )
         effective_target = (
             ChannelResourceAdapter._resolve_channel(target)
@@ -6901,6 +6915,7 @@ class SinkGate:
         operator_shell_request_identity: Any = None,
         tool_call_id: str | None = None,
         requested_cwd: object = None,
+        client_authorized_host_execution: bool = False,
     ) -> frozenset[str]:
         """Return concrete destinations compatible with every current label.
 
@@ -6927,6 +6942,8 @@ class SinkGate:
             }
             else target
         )
+        if client_authorized_host_execution and target is not None:
+            return frozenset({resolved_target_channel})
         is_cross_channel_operation = category in {
             SinkCategory.CROSS_CHANNEL,
             SinkCategory.DIRECT_MESSAGE,
@@ -8522,6 +8539,8 @@ class ToolRegistry:
         operator_shell_request_identity: Any = None,
         operator_shell_audit: Mapping[str, str] | None = None,
         tool_call_id: str | None = None,
+        client_authorized_host_execution: Any = None,
+        request_identity: Any = None,
     ) -> ToolAuthorization:
         """Authorize a tool call using the operation catalog.
 
@@ -8747,6 +8766,8 @@ class ToolRegistry:
                 operator_shell_request_identity=operator_shell_request_identity,
                 tool_call_id=tool_call_id,
                 requested_cwd=(arguments or {}).get("cwd"),
+                client_authorized_host_execution=client_authorized_host_execution,
+                request_identity=request_identity,
             )
             sink_check.repo_pr_action_scope = repo_pr_action_scope
             if not sink_check.allowed and enforce and not preliminary_admin_denied:
