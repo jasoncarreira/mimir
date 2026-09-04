@@ -234,7 +234,7 @@ class ProfileStore:
                 document = json.load(stream, object_pairs_hook=_pairs)
         except ProfileError:
             raise
-        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        except (OSError, UnicodeError, ValueError) as exc:
             raise ProfileError("invalid-profile-store") from exc
         finally:
             if fd >= 0:

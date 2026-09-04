@@ -297,6 +297,18 @@ def test_timeout_field_is_backward_compatible_and_strict(tmp_path: Path) -> None
         s.list()
     assert s.path.read_bytes() == unknown
 
+    oversized = (
+        '{"profiles":{"p":{"home":"/p","remote":null,"timeoutSeconds":'
+        + "9" * 5000
+        + '}},"version":1}'
+    )
+    s.path.write_text(oversized)
+    os.chmod(s.path, 0o600)
+    before = s.path.read_bytes()
+    with pytest.raises(ProfileError, match="invalid-profile-store"):
+        s.list()
+    assert s.path.read_bytes() == before
+
     s.path.write_text('{"profiles":{},"version":1}\n')
     with pytest.raises(ProfileError, match="profile-not-found"):
         s.set_timeout("missing", 60)

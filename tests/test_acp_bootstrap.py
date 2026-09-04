@@ -53,7 +53,10 @@ def test_profile_set_timeout_contract(
     ) == (0, "", "added\n")
     path = tmp_path / "mimir" / "acp" / "profiles.json"
     before = path.read_bytes()
-    invalid = ("", "0", "601", "+1", "1.0", " 1", "１", "²", "١")
+    invalid = (
+        "", "0", "601", "+1", "1.0", " 1", "１", "²", "١",
+        "9" * 5000, "0" * 5000 + "601",
+    )
     for value in invalid:
         args = ["profile", "set-timeout", "default"]
         if value:
@@ -74,7 +77,7 @@ def test_profile_set_timeout_contract(
     ) == (2, "", "profile 'missing' does not exist\n")
     assert path.read_bytes() == before
 
-    for seconds in ("1", "060", "600"):
+    for seconds in ("1", "060", "0" * 5000 + "1", "600"):
         assert invoke(
             tmp_path,
             ["profile", "set-timeout", "default", seconds],
@@ -83,17 +86,23 @@ def test_profile_set_timeout_contract(
         ) == (
             0,
             "",
-            f"Set timeout for profile 'default' to {int(seconds)} seconds.\n",
+            f"Set timeout for profile 'default' to {int(seconds.lstrip('0'))} seconds.\n",
         )
     assert json.loads(path.read_text())["profiles"]["default"]["timeoutSeconds"] == 600
 
-    code, out, err = invoke(
-        tmp_path,
+    forbidden = (
         ["profile", "add-local", "other", "--home", "/tmp", "--timeout", "2"],
-        monkeypatch,
-        capfd,
+        [
+            "profile", "add-ssh", "remote", "--home", "/remote",
+            "--ssh-host", "example.com", "--ssh-user", "agent",
+            "--identity-file", "/id", "--known-hosts-file", "/known",
+            "--timeout", "2",
+        ],
     )
-    assert code == 2 and out == "" and "unrecognized arguments" in err
+    for args in forbidden:
+        code, out, err = invoke(tmp_path, args, monkeypatch, capfd)
+        assert code == 2 and out == "" and "unrecognized arguments" in err
+    assert set(json.loads(path.read_text())["profiles"]) == {"default"}
 
 
 @pytest.mark.parametrize(("port", "valid"), [(0, False), (1, True), (65535, True), (65536, False)])

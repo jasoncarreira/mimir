@@ -979,6 +979,55 @@ async def test_local_proxy_connects_and_stdout_contains_only_protocol(monkeypatc
     assert b"raw-key" not in output.getvalue()
 
 
+@pytest.mark.asyncio
+async def test_local_proxy_propagates_only_selected_profile_timeout(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    profile = Profile("default", tmp_path, timeout_seconds=17)
+    upstream_reader = asyncio.StreamReader()
+    upstream_writer = Writer()
+    input_reader = asyncio.StreamReader()
+    output_writer = Writer()
+    transport = type("Transport", (), {"close": lambda self: None})()
+    observed: list[int] = []
+
+    async def route(
+        client_reader: object,
+        client_writer: object,
+        daemon_reader: object,
+        daemon_writer: object,
+        credential: str,
+        *,
+        timeout_seconds: int,
+    ) -> None:
+        router = ProxyRouter(client_writer, daemon_writer, credential, timeout_seconds)
+        await router.route_client({
+            "jsonrpc": "2.0", "id": "new", "method": "session/new",
+            "params": {
+                "cwd": str(tmp_path),
+                "timeoutSeconds": 1,
+            },
+        })
+        hosted_session = next(iter(router._provider._sessions.values()))
+        observed.append(hosted_session.timeout_seconds)
+        await router.close()
+
+    monkeypatch.setattr("mimir.acp.proxy.socket_path", lambda selected: tmp_path / "socket")
+    monkeypatch.setattr(
+        "mimir.acp.proxy.asyncio.open_unix_connection",
+        lambda path: asyncio.sleep(0, result=(upstream_reader, upstream_writer)),
+    )
+    monkeypatch.setattr(
+        "mimir.acp.proxy.open_stdio",
+        lambda output: asyncio.sleep(0, result=(input_reader, output_writer, transport)),
+    )
+    monkeypatch.setattr("mimir.acp.proxy.run_router", route)
+    monkeypatch.setenv("MIMIR_ACP_TIMEOUT", "1")
+
+    await run_local_proxy(profile, "secret", io.BytesIO())
+    assert observed == [17]
+
+
 class WriterToFile(Writer):
     def __init__(self, output: io.BytesIO) -> None:
         super().__init__()

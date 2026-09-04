@@ -40,7 +40,10 @@ class _Parser(argparse.ArgumentParser):
 def _timeout_seconds(value: str) -> int:
     if not value or any(character < "0" or character > "9" for character in value):
         raise argparse.ArgumentTypeError("must be an ASCII integer from 1 through 600")
-    parsed = int(value)
+    significant = value.lstrip("0")
+    if not significant or len(significant) > 3:
+        raise argparse.ArgumentTypeError("must be an ASCII integer from 1 through 600")
+    parsed = int(significant)
     if not 1 <= parsed <= 600:
         raise argparse.ArgumentTypeError("must be an ASCII integer from 1 through 600")
     return parsed
