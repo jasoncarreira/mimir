@@ -3,6 +3,8 @@ set -eu
 
 uv run pytest -q tests/test_acp_hands_contract.py
 uv run pytest -q tests/test_acp_hosted.py
+uv run pytest -q tests/test_acp_proxy.py
+uv run pytest -q tests/test_acp_sdk_contract.py
 uv run pytest -q tests/test_acp_sessions.py
 uv run pytest -q tests/test_client_provider.py
 uv run pytest -q tests/test_prohibited_action_guard.py

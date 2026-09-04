@@ -550,27 +550,47 @@ async def test_prompt_auth_context_is_scoped_to_the_session_channel(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("permission_decision", "expected_denial"),
+    ("permission_decision", "tool_name", "arguments", "expected_denial", "setup_error"),
     [
-        ("allow_once", None),
+        ("allow_once", "hands_shell", {"command": "printf ok"}, None, False),
         (
             "reject_once",
+            "hands_shell",
+            {"command": "printf ok"},
             "hands_shell permission was rejected by the operator before execution",
+            False,
         ),
-        ("timeout", "hands_shell permission request timed out; execution denied"),
+        (
+            "timeout",
+            "hands_shell",
+            {"command": "printf ok"},
+            "hands_shell permission request timed out; execution denied",
+            False,
+        ),
+        (
+            "allow_session", "hands_python", {"code": "value = 1\nvalue"},
+            None, False,
+        ),
+        (
+            "allow_once", "hands_python", {"code": "value = 1\nvalue"},
+            None, True,
+        ),
     ],
 )
-async def test_permission_denial_executes_nothing_and_returns_explainable_failure(
+async def test_admin_hands_permissions_precede_execution_and_preserve_raw_arguments(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     permission_decision: str,
+    tool_name: str,
+    arguments: dict[str, str],
     expected_denial: str | None,
+    setup_error: bool,
 ) -> None:
     """The authenticated ACP carrier survives every gate before hands execution.
 
     ``ActivePrompt.request_permission`` is live for hands calls. Its ordinary
     success path snapshots the matching public tool call, asks the ACP client,
-    receives ``allow_once``, and only then lets ``wrap_tool_call`` invoke the
+    receives a current-call approval, and only then lets ``wrap_tool_call`` invoke the
     hands provider. Missing/stale prompt state, cancellation, snapshot mismatch,
     missing peer, transport error, or any non-allow client answer fail closed.
     """
@@ -579,6 +599,7 @@ async def test_permission_denial_executes_nothing_and_returns_explainable_failur
     from langgraph.runtime import Runtime
 
     from mimir.tools.budget_gate import BudgetGateMiddleware
+    from mimir.tools.client_provider import hands_python
 
     bundle, core = _bundle(tmp_path)
     agent = MimirAcpAgent(bundle)
@@ -587,9 +608,11 @@ async def test_permission_denial_executes_nothing_and_returns_explainable_failur
         def __init__(self) -> None:
             super().__init__()
             self.permission_snapshots: list[Any] = []
+            self.execution_order: list[str] = []
 
         async def request_tool_permission(self, session_id: str, snapshot: Any) -> Any:
             self.permission_snapshots.append(snapshot)
+            self.execution_order.append("permission")
             if permission_decision == "timeout":
                 await asyncio.Event().wait()
             return sdk.PermissionCompletion(permission_decision)
@@ -599,9 +622,23 @@ async def test_permission_denial_executes_nothing_and_returns_explainable_failur
         ) -> Any:
             if method == "tools/call":
                 self.messages.append((connection_id, method, params))
-                assert params["name"] == "shell"
-                assert params["arguments"] == {"command": "printf ok"}
+                self.execution_order.append("execution")
+                expected_provider = "python" if tool_name == "hands_python" else "shell"
+                assert params["name"] == expected_provider
+                assert params["arguments"] == arguments
                 assert isinstance(params.get("_meta", {}).get("progressToken"), str)
+                if tool_name == "hands_python":
+                    if setup_error:
+                        raise sdk.RequestError(
+                            -32000, "hands_python kernel unavailable: spawn refused"
+                        )
+                    return {
+                        "content": [],
+                        "structuredContent": {
+                            "ok": True, "stdout": "", "stderr": "", "value": "1",
+                            "exception": "", "timedOut": False, "kernel": "fresh",
+                        },
+                    }
                 return {
                     "content": [{"type": "text", "text": "ok"}],
                     "structuredContent": {"stdout": "ok", "stderr": "", "exitCode": 0},
@@ -633,18 +670,17 @@ async def test_permission_denial_executes_nothing_and_returns_explainable_failur
         turn_id = kwargs["turn_id"]
         active = agent._active_prompts[session_id]
         queue = bundle.turn_event_bus._exact_turn_subscribers[turn_id]
-        arguments = {"command": "printf ok"}
         bundle.turn_event_bus.publish({
             "turn_id": turn_id, "channel_id": event.channel_id, "seq": 1,
             "ts": "now", "type": "tool_call", "phase": "start",
-            "id": "shell-1", "tool_name": "hands_shell", "args": arguments,
+            "id": "admin-1", "tool_name": tool_name, "args": arguments,
         })
         await queue.join()
         await active.dispatcher.drain()
         request = ToolCallRequest(
             tool_call={
-                "name": "hands_shell", "args": arguments,
-                "id": "shell-1", "type": "tool_call",
+                "name": tool_name, "args": arguments,
+                "id": "admin-1", "type": "tool_call",
             },
             tool=None, state=None, runtime=Runtime(context=auth),
         )
@@ -652,11 +688,16 @@ async def test_permission_denial_executes_nothing_and_returns_explainable_failur
         owner_loop = asyncio.get_running_loop()
 
         def sync_handler(call: ToolCallRequest) -> ToolMessage:
+            invocation = (
+                hands_python.ainvoke(call.tool_call["args"])
+                if tool_name == "hands_python"
+                else hands_shell.ainvoke(call.tool_call["args"])
+            )
             result = asyncio.run_coroutine_threadsafe(
-                hands_shell.ainvoke(call.tool_call["args"]), owner_loop,
+                invocation, owner_loop,
             ).result(timeout=1)
             return ToolMessage(
-                content=json.dumps(result), tool_call_id="shell-1", name="hands_shell",
+                content=json.dumps(result), tool_call_id="admin-1", name=tool_name,
             )
 
         result = await asyncio.to_thread(
@@ -664,9 +705,15 @@ async def test_permission_denial_executes_nothing_and_returns_explainable_failur
         )
         if expected_denial is None:
             assert result.status != "error", result.content
-            assert json.loads(str(result.content)) == {
-                "stdout": "ok", "stderr": "", "exitCode": 0,
-            }
+            expected_result = (
+                {
+                    "ok": True, "stdout": "", "stderr": "", "value": "1",
+                    "exception": "", "timedOut": False, "kernel": "fresh",
+                }
+                if tool_name == "hands_python"
+                else {"stdout": "ok", "stderr": "", "exitCode": 0}
+            )
+            assert json.loads(str(result.content)) == expected_result
         else:
             assert result.status == "error"
             assert result.content == expected_denial
@@ -680,14 +727,25 @@ async def test_permission_denial_executes_nothing_and_returns_explainable_failur
             break
         await asyncio.sleep(0.01)
     assert client.permission_snapshots
-    response = await prompt
+    if setup_error:
+        with pytest.raises(sdk.RequestError) as raised:
+            await prompt
+        assert raised.value.to_error_obj() == sdk.internal_error().to_error_obj()
+        assert client.updates[-1].status == "failed"
+        assert client.updates[-1].raw_output == {"error": "Tool execution failed"}
+        response = None
+    else:
+        response = await prompt
 
-    assert response.stop_reason == "end_turn"
+    assert response is None or response.stop_reason == "end_turn"
     assert len(client.permission_snapshots) == 1
     snapshot = client.permission_snapshots[0]
-    assert snapshot.tool_call_id == "shell-1"
-    assert snapshot.title == "hands_shell"
-    assert snapshot.raw_input == {"command": "printf ok"}
+    assert snapshot.tool_call_id == "admin-1"
+    assert snapshot.title == tool_name
+    assert snapshot.raw_input == arguments
+    assert client.execution_order == (
+        ["permission", "execution"] if expected_denial is None else ["permission"]
+    )
     assert any(
         method == "tools/call" for _connection, method, _params in client.messages
     ) is (expected_denial is None)
@@ -2241,7 +2299,7 @@ async def test_cancel_boundary_prevents_permission_and_mcp_registration(tmp_path
 
 
 @pytest.mark.asyncio
-async def test_admin_hands_permissions_precede_execution_and_preserve_raw_arguments(
+async def test_daemon_emits_permission_for_every_call_and_stores_no_grant(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture,
 ) -> None:
     """Exercise once-only permission and terminal updates over the public wire."""
@@ -2732,11 +2790,15 @@ async def test_admin_hands_permissions_precede_execution_and_preserve_raw_argume
         await asyncio.gather(*owned_tasks, return_exceptions=True)
 
 
-test_daemon_emits_permission_for_every_call_and_stores_no_grant = (
+test_permission_denial_executes_nothing_and_returns_explainable_failure = (
     test_admin_hands_permissions_precede_execution_and_preserve_raw_arguments
 )
 
 
 test_permission_metadata_uses_live_ifc_taint = (
+    test_daemon_emits_permission_for_every_call_and_stores_no_grant
+)
+
+test_kernel_spawn_mcp_error_becomes_failed_tool_message = (
     test_admin_hands_permissions_precede_execution_and_preserve_raw_arguments
 )

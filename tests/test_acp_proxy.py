@@ -102,11 +102,11 @@ def permission_request(
     metadata: dict[str, Any] = {"mimir.wrapper": wrapper_name}
     if tainted:
         metadata["mimir.tainted"] = True
-    raw_input = (
-        {"path": "note", "old_text": "old", "new_text": "new"}
-        if wrapper_name == "hands_edit"
-        else {"command": "true"}
-    )
+    raw_input = {
+        "hands_edit": {"path": "note", "old_text": "old", "new_text": "new"},
+        "hands_shell": {"command": "true"},
+        "hands_python": {"code": "value = 1\nvalue"},
+    }[wrapper_name]
     return {
         "jsonrpc": "2.0",
         "id": request_id,
@@ -209,6 +209,33 @@ async def test_grants_are_scoped_to_session_and_wrapper() -> None:
 
 
 @pytest.mark.asyncio
+async def test_python_permission_grant_preserves_raw_code_and_scope() -> None:
+    router, client, daemon = await active_router()
+    try:
+        request = permission_request(5, "session", "hands_python")
+        await router.route_daemon(request, frame(request))
+        assert bytes(client.data) == frame(request)
+        assert messages(client)[0]["params"]["toolCall"]["rawInput"] == {
+            "code": "value = 1\nvalue"
+        }
+        await router.route_client({
+            "jsonrpc": "2.0", "id": 5,
+            "result": {"outcome": {"outcome": "selected", "optionId": "allow_session"}},
+        })
+        assert router._grants.allows("session", "hands_python")
+        client.data.clear()
+        daemon.data.clear()
+        await router.route_daemon(permission_request(6, "session", "hands_python"))
+        assert bytes(client.data) == b""
+        assert messages(daemon) == [{
+            "jsonrpc": "2.0", "id": 6,
+            "result": {"outcome": {"outcome": "selected", "optionId": "allow_once"}},
+        }]
+    finally:
+        await router.close()
+
+
+@pytest.mark.asyncio
 async def test_grants_clear_on_load_exit_and_daemon_generation_change() -> None:
     router, client, daemon = await active_router()
     await grant_session(router, 1, "session")
@@ -274,7 +301,7 @@ async def test_malformed_reserved_permission_metadata_fails_closed() -> None:
         false_taint["params"]["_meta"]["mimir.tainted"] = False
         invalid.append(false_taint)
         unknown_wrapper = permission_request(2, "session")
-        unknown_wrapper["params"]["_meta"]["mimir.wrapper"] = "hands_python"
+        unknown_wrapper["params"]["_meta"]["mimir.wrapper"] = "hands_unknown"
         invalid.append(unknown_wrapper)
         wrong_options = permission_request(3, "session")
         wrong_options["params"]["options"] = list(reversed(wrong_options["params"]["options"]))

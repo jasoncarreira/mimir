@@ -36,6 +36,7 @@ PERMISSION_OPTIONS = [
 HANDS_PERMISSION_ARGUMENTS = {
     "hands_edit": (frozenset({"path", "old_text", "new_text"}),),
     "hands_shell": (frozenset({"command"}),),
+    "hands_python": (frozenset({"code"}),),
 }
 
 class ProxyError(RuntimeError):
