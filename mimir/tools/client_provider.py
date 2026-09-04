@@ -213,6 +213,7 @@ _WIRE_TO_POLICY = {
     "read": ("resource_scoped", "source", None, "client-file"),
     "edit": ("admin_required", "both", "external_mcp", "client-file"),
     "shell": ("admin_required", "both", "shell_process", None),
+    "python": ("admin_required", "both", "shell_process", None),
 }
 
 
@@ -307,7 +308,7 @@ def issue_client_authorized_host_execution(
     if (
         policy is None
         or policy.operation != "client_authorized_host_execution"
-        or wrapper_name not in {"hands_edit", "hands_shell"}
+        or wrapper_name not in {"hands_edit", "hands_shell", "hands_python"}
         or not isinstance(tainted, bool)
         or auth_context_identity is None
         or getattr(auth_context_identity, "is_service", False)
@@ -424,6 +425,7 @@ _HANDS_WRAPPER_ARGUMENTS = MappingProxyType({
         "new_text": "newText",
     }),
     "hands_shell": MappingProxyType({"command": "command"}),
+    "hands_python": MappingProxyType({"code": "code"}),
 })
 
 
@@ -465,6 +467,11 @@ class _ShellArgs(BaseModel):
     command: str
 
 
+class _PythonArgs(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    code: str
+
+
 @tool("hands_read", args_schema=_ReadArgs)
 async def hands_read(path: str) -> dict[str, str]:
     """Read client-hosted file content using the admitted hands provider."""
@@ -500,4 +507,14 @@ async def hands_shell(command: str) -> dict[str, str | int]:
     return _validate_result(result, "hands_shell")
 
 
-HANDS_TOOLS = (hands_read, hands_edit, hands_shell)
+@tool("hands_python", args_schema=_PythonArgs)
+async def hands_python(code: str) -> dict[str, bool | str]:
+    """Execute Python code using the admitted client-hosted hands provider."""
+    context, policy = _active_policy("hands_python")
+    if not isinstance(code, str):
+        raise ToolException("hands_python code is malformed")
+    result = await context.provider.call_tool(policy.provider_name, {"code": code})
+    return _validate_result(result, "hands_python")
+
+
+HANDS_TOOLS = (hands_read, hands_edit, hands_shell, hands_python)

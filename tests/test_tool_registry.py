@@ -1661,3 +1661,50 @@ async def test_injected_runtime_delivered_despite_ifc_labels_regression():
     )
     assert parsed_shell["mimir_direct_argv"] == ["git", "status"]
     assert parsed_shell["runtime"] is runtime
+def test_hands_sink_flow_and_ifc_inventory_is_exact() -> None:
+    from mimir import access_control
+
+    assert {
+        name: (
+            access_control.get_sink_category(name),
+            access_control.get_tool_flow_direction(name),
+            access_control.get_operation_catalog().get_decision(name),
+            access_control._OPERATION_READABLE_DOMAIN.get(name),
+            access_control._OPERATION_SINK_DESTINATION.get(name),
+            access_control._PROTECTED_RESULT_DOMAINS.get(name),
+        )
+        for name in ("hands_read", "hands_edit", "hands_shell", "hands_python")
+    } == {
+        "hands_read": (
+            access_control.SinkCategory.UNKNOWN,
+            access_control.ToolFlowDirection.SOURCE,
+            access_control.OperationDecision.RESOURCE_SCOPED,
+            "client_provider",
+            None,
+            "client_provider",
+        ),
+        "hands_edit": (
+            access_control.SinkCategory.EXTERNAL_MCP,
+            access_control.ToolFlowDirection.BOTH,
+            access_control.OperationDecision.ADMIN_REQUIRED,
+            None,
+            "client_provider",
+            "client_provider",
+        ),
+        "hands_shell": (
+            access_control.SinkCategory.SHELL_PROCESS,
+            access_control.ToolFlowDirection.BOTH,
+            access_control.OperationDecision.ADMIN_REQUIRED,
+            None,
+            "shell_process",
+            "client_provider",
+        ),
+        "hands_python": (
+            access_control.SinkCategory.SHELL_PROCESS,
+            access_control.ToolFlowDirection.BOTH,
+            access_control.OperationDecision.ADMIN_REQUIRED,
+            "client_provider",
+            "shell_process",
+            "client_provider",
+        ),
+    }

@@ -3573,6 +3573,44 @@ def test_acp_successful_provider_result_keeps_active_provider_labels() -> None:
     )
 
 
+def test_python_and_granted_hands_results_propagate_origin_labels_without_declassification() -> None:
+    auth = replace(
+        _auth(channel="acp:session", roles=("admin",)),
+        principal="operator",
+        canonical_principal="operator",
+        domain="channel",
+        resource_id="acp:session",
+        bridge_instance="acp-stdio",
+        origin_trigger="acp_session",
+    )
+    authorization = ToolAuthorization(
+        tool_name="hands_python",
+        decision=OperationDecision.ADMIN_REQUIRED,
+        allowed=True,
+        flow_direction=ToolFlowDirection.BOTH,
+        result_integrity="trusted",
+    )
+    labels = classify_protected_result(
+        "hands_python",
+        {"code": "1 + 1"},
+        auth,
+        authorization,
+        result={
+            "ok": True, "stdout": "", "stderr": "", "value": "2",
+            "exception": "", "timedOut": False, "kernel": "fresh",
+        },
+    )
+    assert labels is not None
+    assert labels.source_channels == frozenset({"acp:session"})
+    [source] = labels.sources
+    assert source.is_complete is True
+    assert source.resource_id == "acp:session"
+    assert source.authorized_principals == frozenset({"operator"})
+    assert (source.integrity, source.integrity_effect) == (
+        "untrusted", "active_ingest",
+    )
+
+
 def test_failed_provider_contract_result_outside_acp_keeps_provider_labels() -> None:
     from mimir.tools.client_provider import ClientProviderResultError
 

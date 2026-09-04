@@ -661,7 +661,7 @@ def _hands_has_caller_reserved_arguments(
 ) -> bool:
     arguments = (getattr(request, "tool_call", None) or {}).get("args")
     return (
-        tool_name in {"hands_edit", "hands_shell"}
+        tool_name in {"hands_edit", "hands_shell", "hands_python"}
         and isinstance(arguments, dict)
         and bool(_SERVER_ONLY_SHELL_ARGS & arguments.keys())
     )
@@ -1546,7 +1546,7 @@ def _validated_arguments(request: ToolCallRequest) -> dict[str, Any] | None:
     if not isinstance(arguments, dict):
         return None
     tool_name = _tool_name_from_request(request)
-    if tool_name in {"hands_read", "hands_edit", "hands_shell"}:
+    if tool_name in {"hands_read", "hands_edit", "hands_shell", "hands_python"}:
         return validate_hands_wrapper_arguments(tool_name, arguments)
     tool = getattr(request, "tool", None)
     schema = getattr(tool, "tool_call_schema", None)
@@ -2174,11 +2174,19 @@ def _check_prohibited(tool_name: str, request: "ToolCallRequest") -> str | None:
     args = tc.get("args") if isinstance(tc, dict) else None
     command = None
     if isinstance(args, dict):
-        command = next(
-            (args[name] for name in ("command", "cmd", "script") if name in args),
-            None,
-        )
+        if tool_name == "hands_python":
+            command = args.get("code")
+        else:
+            command = next(
+                (args[name] for name in ("command", "cmd", "script") if name in args),
+                None,
+            )
     if not isinstance(command, str) or not command.strip():
+        if tool_name == "hands_python":
+            return (
+                "PROHIBITED_ACTION: hands_python tool call has no non-empty string "
+                "code argument; refused because it cannot be screened"
+            )
         return (
             "PROHIBITED_ACTION: shell tool call has no non-empty string "
             "command, cmd, or script argument; refused because it cannot be screened"
@@ -2214,7 +2222,7 @@ def _request_for_acp_model(request: Any) -> Any:
         return request
     excluded = {"send_message"}
     if context.profile_policy is not MIMIR_HANDS_V1:
-        excluded.update({"hands_read", "hands_edit", "hands_shell"})
+        excluded.update({"hands_read", "hands_edit", "hands_shell", "hands_python"})
     tools = [
         tool for tool in (getattr(request, "tools", None) or [])
         if _tool_surface_name(tool) not in excluded
@@ -2285,7 +2293,7 @@ def _admitted_admin_hands_candidate(
     policy = context.profile_policy.tool(tool_name) if context is not None and context.profile_policy is MIMIR_HANDS_V1 else None
     lease = getattr(context, "lease", None)
     return (
-        tool_name in {"hands_edit", "hands_shell"}
+        tool_name in {"hands_edit", "hands_shell", "hands_python"}
         and isinstance(arguments, dict)
         and auth_context is not None
         and auth_context.enforcement_enabled is True
@@ -2326,7 +2334,7 @@ def _permission_eligibility(
         return None
     requires_admin = (
         authorization.required_tier is AccessTier.ADMIN
-        or tool_name in {"hands_edit", "hands_shell"}
+        or tool_name in {"hands_edit", "hands_shell", "hands_python"}
     )
     if not requires_admin:
         return None

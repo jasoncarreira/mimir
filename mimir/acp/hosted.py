@@ -301,6 +301,8 @@ class HostedHandsProvider:
             )
         if name == "shell":
             return await self._shell(session, arguments["command"])
+        if name == "python":
+            return await self.execute_python(session, arguments["code"])
         raise _invalid_params()
 
     def _read(self, session: HostedSession, path_value: str) -> dict[str, Any]:
