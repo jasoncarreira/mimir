@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import io
+import json
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -11,6 +12,29 @@ from mimir.acp.agent import ConnectionState, MimirAcpAgent
 from mimir.acp.host import _FrameDelivery, close_protocol_writer
 from mimir.acp.proxy import ProxyRouter, _OutputWriter, run_router
 from mimir.acp.transport import close_writer, pump_stream
+
+
+def _assert_generation_empty(router: ProxyRouter) -> None:
+    assert router._active_sessions == set()
+    assert len(router._grants) == 0
+    assert router._client_requests == {}
+    assert router._client_routes == set()
+    assert router._daemon_requests == {}
+    assert router._local_requests == {}
+    assert router._local_sessions == {}
+    assert router._local_connections == {}
+    assert router._daemon_tombstones == set()
+    assert router._server_sessions == {}
+    assert router._server_provider_sessions == {}
+    assert router._connection_sessions == {}
+    assert router._connection_provider_sessions == {}
+    assert router._explicit_server_sessions == {}
+    assert router._explicit_connection_sessions == {}
+    assert router._used_server_ids == set()
+    assert router._used_connection_ids == set()
+    assert router._provider._connections == {}
+    assert router._provider._processes == {}
+    assert router._provider._python_kernels._processes == {}
 
 
 @pytest.mark.asyncio
@@ -398,3 +422,171 @@ async def test_daemon_eof_retires_generation_before_client_grace(
     assert worker.returncode is not None
     client_reader.feed_eof()
     await asyncio.wait_for(running, 5)
+
+
+@pytest.mark.asyncio
+async def test_daemon_eof_quiesces_inflight_allow_session_response(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class Writer:
+        def __init__(self) -> None:
+            self.closed = False
+
+        def write(self, data: bytes) -> None:
+            del data
+
+        async def drain(self) -> None:
+            return None
+
+        def close(self) -> None:
+            self.closed = True
+
+        def is_closing(self) -> bool:
+            return self.closed
+
+        async def wait_closed(self) -> None:
+            return None
+
+    class BlockingWriter(Writer):
+        def __init__(self) -> None:
+            super().__init__()
+            self.entered = asyncio.Event()
+            self.release = asyncio.Event()
+            self.cancelled = asyncio.Event()
+            self.blocked = False
+
+        async def drain(self) -> None:
+            if self.blocked:
+                return
+            self.blocked = True
+            self.entered.set()
+            try:
+                await self.release.wait()
+            except asyncio.CancelledError:
+                self.cancelled.set()
+                raise
+
+    client_writer = Writer()
+    daemon_writer = BlockingWriter()
+    router = ProxyRouter(client_writer, daemon_writer, "secret")
+    router._active_sessions.add("session")
+    request = {
+        "jsonrpc": "2.0",
+        "id": "permission",
+        "method": "session/request_permission",
+        "params": {
+            "sessionId": "session",
+            "toolCall": {
+                "toolCallId": "call",
+                "title": "hands_edit",
+                "kind": "other",
+                "status": "pending",
+                "rawInput": {"path": "note", "old_text": "old", "new_text": "new"},
+            },
+            "options": [
+                {"optionId": "allow_once", "name": "Allow once", "kind": "allow_once"},
+                {"optionId": "allow_session", "name": "Allow for this session", "kind": "allow_always"},
+                {"optionId": "reject_once", "name": "Reject once", "kind": "reject_once"},
+            ],
+            "_meta": {"mimir.wrapper": "hands_edit"},
+        },
+    }
+    await router.route_daemon(request)
+    response = {
+        "jsonrpc": "2.0",
+        "id": "permission",
+        "result": {"outcome": {"outcome": "selected", "optionId": "allow_session"}},
+    }
+    client_reader = asyncio.StreamReader()
+    client_reader.feed_data(json.dumps(response).encode() + b"\n")
+    daemon_reader = asyncio.StreamReader()
+    monkeypatch.setattr(
+        "mimir.acp.proxy.ProxyRouter",
+        lambda client, daemon, credential, timeout_seconds=60: router,
+    )
+    monkeypatch.setattr("mimir.acp.proxy.PEER_EOF_GRACE_TIMEOUT", 30.0)
+    running = asyncio.create_task(
+        run_router(client_reader, client_writer, daemon_reader, daemon_writer, "secret")
+    )
+    await asyncio.wait_for(daemon_writer.entered.wait(), 5)
+    daemon_reader.feed_eof()
+    await asyncio.wait_for(daemon_writer.cancelled.wait(), 5)
+    assert not running.done()
+    client_reader.feed_eof()
+    await asyncio.wait_for(running, 5)
+    _assert_generation_empty(router)
+    daemon_writer.release.set()
+    await asyncio.sleep(0)
+    _assert_generation_empty(router)
+
+
+@pytest.mark.asyncio
+async def test_daemon_eof_quiesces_inflight_session_transition(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    class Writer:
+        def __init__(self) -> None:
+            self.closed = False
+
+        def write(self, data: bytes) -> None:
+            del data
+
+        async def drain(self) -> None:
+            return None
+
+        def close(self) -> None:
+            self.closed = True
+
+        def is_closing(self) -> bool:
+            return self.closed
+
+        async def wait_closed(self) -> None:
+            return None
+
+    client_writer = Writer()
+    daemon_writer = Writer()
+    router = ProxyRouter(client_writer, daemon_writer, "secret")
+    router._active_sessions.add("session")
+    router._grants.add("session", "hands_python")
+    router._provider.bind_session("session", tmp_path)
+    router._server_sessions["server"] = "session"
+    router._server_provider_sessions["server"] = "session"
+    original_retire = router._retire_session
+    transition_entered = asyncio.Event()
+    transition_release = asyncio.Event()
+
+    async def pause_after_retirement(session_id: str) -> None:
+        await original_retire(session_id)
+        transition_entered.set()
+        await transition_release.wait()
+
+    router._retire_session = pause_after_retirement
+    load = {
+        "jsonrpc": "2.0",
+        "id": "load",
+        "method": "session/load",
+        "params": {"cwd": str(tmp_path), "sessionId": "session", "mcpServers": []},
+    }
+    client_reader = asyncio.StreamReader()
+    client_reader.feed_data(json.dumps(load).encode() + b"\n")
+    daemon_reader = asyncio.StreamReader()
+    monkeypatch.setattr(
+        "mimir.acp.proxy.ProxyRouter",
+        lambda client, daemon, credential, timeout_seconds=60: router,
+    )
+    monkeypatch.setattr("mimir.acp.proxy.PEER_EOF_GRACE_TIMEOUT", 30.0)
+    running = asyncio.create_task(
+        run_router(client_reader, client_writer, daemon_reader, daemon_writer, "secret")
+    )
+    await asyncio.wait_for(transition_entered.wait(), 5)
+    daemon_reader.feed_eof()
+    async with asyncio.timeout(5):
+        while not router._close_complete:
+            await asyncio.sleep(0)
+    assert not running.done()
+    client_reader.feed_eof()
+    await asyncio.wait_for(running, 5)
+    _assert_generation_empty(router)
+    transition_release.set()
+    await asyncio.sleep(0)
+    _assert_generation_empty(router)
