@@ -2432,12 +2432,17 @@ class WorklinkRunner:
         if status is None:
             raise WorklinkError("factory terminal projection is missing")
         if status.is_parked:
+            park_report = (
+                f"factory run is parked; control-plane snapshot: {status.park_snapshot}"
+                if status.park_snapshot is not None
+                else "factory run is parked; no control-plane snapshot published"
+            )
             claims.transition_issue(
                 issue.issue_id,
                 status="blocked",
                 review_ready=False,
                 attempt=claim_record.budget_attempt or claim_record.attempt,
-                reason="factory run is parked",
+                reason=park_report,
             )
             result = WorklinkRunResult(
                 issue.issue_id,
@@ -2445,7 +2450,7 @@ class WorklinkRunner:
                 "needs-human",
                 checkout=Path(factory_record.sandbox),
                 branch=factory_record.branch,
-                reason="factory run is parked",
+                reason=park_report,
             )
             _log_event(
                 "worklink_transition",

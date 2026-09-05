@@ -19,7 +19,7 @@ from .base import Caps, CheckoutShape, RawResult, WorkOrder
 from .opencode import resolve_worklink_opencode_invocation
 
 
-FACTORY_VERSION = "0.8.2"
+FACTORY_VERSION = "0.8.3"
 DEFAULT_FACTORY_ENTRYPOINT = "/opt/mimir-opencode/lib/node_modules/feature-factory/bin/factory.js"
 FACTORY_COMMANDS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("init", ("init",)),
@@ -96,6 +96,7 @@ class FactoryStatus:
     validator: str | None = None
     pr_url: str | None = None
     terminal_result: dict[str, Any] | None = None
+    park_snapshot: str | None = None
     next: str | None = None
     next_present: bool = False
 
@@ -136,6 +137,7 @@ class FactoryStatus:
             "validator": self.validator,
             "pr_url": self.pr_url,
             "terminal_result": self.terminal_result,
+            "park_snapshot": self.park_snapshot,
         }
         if self.next_present:
             payload["next"] = self.next
@@ -296,6 +298,9 @@ def parse_factory_status(payload: bytes | str | Mapping[str, Any]) -> FactorySta
         pr_url=_bounded_text(decoded.get("pr_url"), "pr_url", nullable=True),
         terminal_result=_opaque_dict(
             decoded.get("terminal_result"), "terminal_result", nullable=True
+        ),
+        park_snapshot=_bounded_text(
+            decoded.get("park_snapshot"), "park_snapshot", nullable=True
         ),
         next=next_value,
         next_present=next_present,

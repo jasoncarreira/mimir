@@ -63,11 +63,11 @@ def package_entrypoint(tmp_path: Path) -> Path:
     entrypoint = feature / "bin" / "factory.js"
     entrypoint.write_text("", encoding="utf-8")
     (feature / "package.json").write_text(
-        json.dumps({"name": "feature-factory", "version": "0.8.2"}),
+        json.dumps({"name": "feature-factory", "version": "0.8.3"}),
         encoding="utf-8",
     )
     (adapter / "package.json").write_text(
-        json.dumps({"name": "opencode-feature-factory", "version": "0.8.2"}),
+        json.dumps({"name": "opencode-feature-factory", "version": "0.8.3"}),
         encoding="utf-8",
     )
     return entrypoint
@@ -102,6 +102,27 @@ def test_status_contract_preserves_nullable_fields_and_opaque_terminal_result() 
     assert status.pr_url is None
     assert status.validator is None
     assert status.terminal_result == {"reason": "opaque"}
+    assert parse_factory_status(status.to_json()) == status
+
+
+@pytest.mark.parametrize(
+    ("payload", "expected"),
+    [
+        pytest.param({}, None, id="absent-pre-083"),
+        pytest.param({"park_snapshot": None}, None, id="null"),
+        pytest.param(
+            {"park_snapshot": "/operator/.factory/.parked/1551"},
+            "/operator/.factory/.parked/1551",
+            id="published-path",
+        ),
+    ],
+)
+def test_status_contract_preserves_optional_park_snapshot(
+    payload: dict[str, object], expected: str | None
+) -> None:
+    status = parse_factory_status(status_payload(**payload))
+
+    assert status.park_snapshot == expected
     assert parse_factory_status(status.to_json()) == status
 
 
@@ -180,6 +201,7 @@ def test_top_level_terminal_statuses(terminal: str) -> None:
         ("lock", {"status": "fresh"}),
         ("lock_session", 4),
         ("pr_url", 4),
+        ("park_snapshot", 4),
         ("next", " "),
     ],
 )
@@ -242,12 +264,13 @@ def test_status_rejects_missing_guaranteed_fields(field: str) -> None:
         "validator",
         "pr_url",
         "terminal_result",
+        "park_snapshot",
         "next",
     ],
 )
 def test_status_accepts_each_lifecycle_projection_omitted(field: str) -> None:
     payload = status_payload()
-    payload.pop(field)
+    payload.pop(field, None)
 
     status = parse_factory_status(payload)
 
@@ -311,7 +334,7 @@ def test_status_rejects_invalid_utf8_nul_and_oversize(payload: bytes) -> None:
 def test_resolve_entrypoint_is_absolute_package_bound_and_lockstep(tmp_path: Path) -> None:
     entrypoint = package_entrypoint(tmp_path)
     assert resolve_factory_entrypoint(entrypoint) == entrypoint.resolve()
-    assert FACTORY_VERSION == "0.8.2"
+    assert FACTORY_VERSION == "0.8.3"
     with pytest.raises(FactoryContractError, match="absolute"):
         resolve_factory_entrypoint(Path("feature-factory/bin/factory.js"))
 
@@ -336,7 +359,7 @@ def test_admit_rejects_either_package_version_mismatch(
     entrypoint = package_entrypoint(tmp_path)
     manifest = entrypoint.parents[2] / package / "package.json"
     manifest.write_text(
-        json.dumps({"name": expected_name, "version": "0.8.1"}),
+        json.dumps({"name": expected_name, "version": "0.8.2"}),
         encoding="utf-8",
     )
     calls: list[tuple[str, ...]] = []
