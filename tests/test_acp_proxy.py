@@ -511,6 +511,55 @@ async def test_hosted_disconnect_revokes_session_grants(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_explicit_hands_disconnect_revokes_session_grants_transparently() -> None:
+    client = Writer()
+    daemon = Writer()
+    router = ProxyRouter(client, daemon, "secret")
+    session_request = (
+        b'{ "jsonrpc":"2.0", "id":"new", "method":"session/new", "params":'
+        b'{"cwd":"/workspace","mcpServers":[{"serverId":"explicit-hands",'
+        b'"name":"mimir-hands","type":"acp","extra":{"kept":true}}]} }\n'
+    )
+    connect = (
+        b'{ "jsonrpc":"2.0", "id":70, "method":"mcp/connect", '
+        b'"params":{"serverId":"explicit-hands"} }\n'
+    )
+    connected = (
+        b'{ "jsonrpc":"2.0", "id":70, '
+        b'"result":{"connectionId":"explicit-connection"} }\n'
+    )
+    disconnect = (
+        b'{ "jsonrpc":"2.0", "id":72, "method":"mcp/disconnect", '
+        b'"params":{"connectionId":"explicit-connection"} }\n'
+    )
+    try:
+        await router.route_client(json.loads(session_request), session_request)
+        assert bytes(daemon.data) == session_request
+        client.data.clear()
+        daemon.data.clear()
+        await router.route_daemon(json.loads(connect), connect)
+        assert bytes(client.data) == connect
+        await router.route_client(json.loads(connected), connected)
+        assert bytes(daemon.data) == connected
+        assert "explicit-connection" not in router._explicit_connection_sessions
+        await router.route_daemon({
+            "jsonrpc": "2.0", "id": "new", "result": {"sessionId": "session"}
+        })
+        assert router._explicit_connection_sessions["explicit-connection"] == "session"
+        await grant_session(router, 71, "session")
+        assert router._grants.allows("session", "hands_edit")
+        client.data.clear()
+        await router.route_daemon(json.loads(disconnect), disconnect)
+        assert bytes(client.data) == disconnect
+        assert len(router._grants) == 0
+        client.data.clear()
+        await router.route_daemon(permission_request(73, "session"))
+        assert messages(client)[-1]["id"] == 73
+    finally:
+        await router.close()
+
+
+@pytest.mark.asyncio
 async def test_framing_and_generation_failures_revoke_grants(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
