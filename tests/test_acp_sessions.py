@@ -762,18 +762,34 @@ async def test_admin_hands_permissions_precede_execution_and_preserve_raw_argume
     else:
         response = await prompt
 
+    expected_invocations = 1
+    if permission_decision == "allow_session" and expected_denial is None:
+        repeated = await agent.prompt(
+            session_id,
+            [sdk.TextContentBlock(type="text", text="run python again")],
+        )
+        assert repeated.stop_reason == "end_turn"
+        expected_invocations = 2
+
     assert response is None or response.stop_reason == "end_turn"
-    assert len(client.permission_snapshots) == 1
+    assert len(client.permission_snapshots) == expected_invocations
     snapshot = client.permission_snapshots[0]
     assert snapshot.tool_call_id == "admin-1"
     assert snapshot.title == tool_name
     assert snapshot.raw_input == arguments
     assert client.execution_order == (
-        ["permission", "execution"] if expected_denial is None else ["permission"]
+        ["permission", "execution"] * expected_invocations
+        if expected_denial is None
+        else ["permission"]
     )
     assert any(
         method == "tools/call" for _connection, method, _params in client.messages
     ) is (expected_denial is None)
+    state = agent._sessions[session_id]
+    assert not hasattr(agent, "_permission_grants")
+    assert not hasattr(state, "permission_grants")
+    assert not hasattr(state.record, "permission_grants")
+    assert not hasattr(state.profile_policy, "permission_grants")
 
 
 async def test_cancelled_bound_turn_terminalizes_open_tools(tmp_path: Path) -> None:

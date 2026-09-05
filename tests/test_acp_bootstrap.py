@@ -105,6 +105,32 @@ def test_profile_set_timeout_contract(
     assert set(json.loads(path.read_text())["profiles"]) == {"default"}
 
 
+def test_add_profile_commands_expose_no_timeout_options(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capfd: pytest.CaptureFixture[str],
+) -> None:
+    commands = (
+        ["profile", "add-local", "local", "--home", "/tmp"],
+        [
+            "profile", "add-ssh", "remote", "--home", "/remote",
+            "--ssh-host", "example.com", "--ssh-user", "agent",
+            "--identity-file", "/id", "--known-hosts-file", "/known",
+        ],
+    )
+    for command in commands:
+        for option in ("--timeout", "--timeout-seconds", "--timeoutSeconds"):
+            code, out, err = invoke(
+                tmp_path, [*command, option, "2"], monkeypatch, capfd,
+            )
+            assert code == 2
+            assert out == ""
+            assert "unrecognized arguments" in err
+
+    store = tmp_path / "mimir" / "acp" / "profiles.json"
+    assert not store.exists()
+
+
 @pytest.mark.parametrize(("port", "valid"), [(0, False), (1, True), (65535, True), (65536, False)])
 def test_remote_port_boundaries(tmp_path: Path, port: int, valid: bool, monkeypatch: pytest.MonkeyPatch, capfd: pytest.CaptureFixture[str]) -> None:
     args = ["profile", "add-ssh", "remote", "--home", "/remote", "--ssh-host", "example.com", "--ssh-user", "agent", "--ssh-port", str(port), "--identity-file", "/id", "--known-hosts-file", "/known"]

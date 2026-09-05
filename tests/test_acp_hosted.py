@@ -488,6 +488,43 @@ async def test_call_arguments_metadata_and_results_are_strict(tmp_path: Path) ->
 
 
 @pytest.mark.asyncio
+async def test_tools_call_envelope_accepts_only_name_arguments_and_progress_token(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "value").write_text("ok")
+    provider, connection = await _connected(tmp_path)
+    try:
+        for params in (
+            {"arguments": {"path": "value"}},
+            {"name": "read"},
+            {"name": "read", "arguments": {"path": "value"}, "extra": True},
+            {
+                "name": "read",
+                "arguments": {"path": "value"},
+                "_meta": {"progressToken": "accepted", "extra": True},
+            },
+        ):
+            with pytest.raises(HostedMcpError) as failure:
+                await provider.request(connection, "tools/call", params)
+            assert failure.value.as_error() == {
+                "code": -32602,
+                "message": "Invalid params",
+            }
+
+        assert await provider.request(
+            connection,
+            "tools/call",
+            {
+                "name": "read",
+                "arguments": {"path": "value"},
+                "_meta": {"progressToken": "accepted"},
+            },
+        ) == {"content": [], "structuredContent": {"content": "ok"}}
+    finally:
+        await provider.close()
+
+
+@pytest.mark.asyncio
 async def test_hosted_provider_owns_internal_session_kernels(tmp_path: Path) -> None:
     provider = HostedHandsProvider()
     provider.bind_session("one", tmp_path)

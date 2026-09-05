@@ -677,6 +677,32 @@ async def test_plain_client_without_mcp_capability_can_call_hosted_hands(tmp_pat
 
 
 @pytest.mark.asyncio
+async def test_session_new_first_python_call_has_fresh_empty_namespace(
+    tmp_path: Path,
+) -> None:
+    router, _, daemon, _, connection_id = await hosted_router(tmp_path)
+    try:
+        result = await call_hosted_python(
+            router,
+            daemon,
+            connection_id,
+            "first-python",
+            "globals().get('value_created_before_session_new')",
+        )
+        assert result == {
+            "ok": True,
+            "stdout": "",
+            "stderr": "",
+            "value": "None",
+            "exception": "",
+            "timedOut": False,
+            "kernel": "fresh",
+        }
+    finally:
+        await router.close()
+
+
+@pytest.mark.asyncio
 async def test_router_intercepts_only_ids_minted_by_current_generation(tmp_path: Path) -> None:
     router, client, _, server_id, _ = await hosted_router(tmp_path)
     try:
