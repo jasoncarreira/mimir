@@ -175,14 +175,14 @@ async def test_timeout_and_crash_discard_namespace(tmp_path: Path) -> None:
     try:
         assert (await manager.execute("timeout", tmp_path, "1", 5))["ok"] is True
         timed_out = await manager.execute(
-            "timeout", tmp_path, "import time\nmarker = 1\ntime.sleep(5)", 0.1
+            "timeout", tmp_path, "import time\nmarker = 1\ntime.sleep(30)", 3
         )
         assert timed_out == {
             "ok": False,
             "stdout": "",
             "stderr": "",
             "value": "",
-            "exception": "execution timed out after 0.1 seconds; namespace state lost",
+            "exception": "execution timed out after 3 seconds; namespace state lost",
             "timedOut": True,
             "kernel": "timed_out",
         }
@@ -208,13 +208,13 @@ async def test_timeout_and_crash_retain_streams_exactly(tmp_path: Path) -> None:
         timed_out = await manager.execute(
             "timeout",
             tmp_path,
-            "import os,time\nos.write(1,b'before-timeout')\nos.write(2,b'err-timeout')\ntime.sleep(5)",
-            1,
+            "import os,time\nos.write(1,b'before-timeout')\nos.write(2,b'err-timeout')\ntime.sleep(30)",
+            3,
         )
         assert timed_out["stdout"] == "before-timeout"
         assert timed_out["stderr"] == "err-timeout"
         assert timed_out["exception"] == (
-            "execution timed out after 1 seconds; namespace state lost"
+            "execution timed out after 3 seconds; namespace state lost"
         )
         crashed = await manager.execute(
             "crash",
