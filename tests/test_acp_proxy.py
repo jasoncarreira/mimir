@@ -651,6 +651,8 @@ async def test_hosted_server_id_uses_random_required_format(tmp_path: Path) -> N
             })
         server_ids = [item["params"]["mcpServers"][0]["serverId"] for item in messages(daemon)]
         assert len(set(server_ids)) == 8
+        assert all(value.startswith("mimir-hosted:") for value in server_ids)
+        assert all(len(value) == len("mimir-hosted:") + 24 for value in server_ids)
         assert all(len(value.removeprefix("mimir-hosted:")) == 24 for value in server_ids)
         assert all(value.removeprefix("mimir-hosted:").replace("_", "a").replace("-", "a").isalnum() for value in server_ids)
     finally:

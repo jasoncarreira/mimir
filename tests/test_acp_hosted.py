@@ -562,6 +562,7 @@ async def test_tools_list_is_exact_four_tool_profile_and_extra_tool_errors(
 ) -> None:
     provider, connection = await _connected(tmp_path)
     listed = await provider.request(connection, "tools/list", {})
+    assert listed == {"tools": hands_v1_wire_descriptors()}
     assert [descriptor["name"] for descriptor in listed["tools"]] == [
         "read", "edit", "shell", "python"
     ]
