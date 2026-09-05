@@ -10,7 +10,7 @@ import signal
 import stat
 import sys
 import threading
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, BinaryIO
 
@@ -173,6 +173,9 @@ class _PendingSession:
     server_id: str | None
     session_id: str | None
     explicit_hands_server_ids: tuple[str, ...]
+    claimed_explicit_server_ids: set[str] = field(default_factory=set)
+    explicit_connection_ids: set[str] = field(default_factory=set)
+    resolved_session_id: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -184,8 +187,14 @@ class _PendingPermission:
 
 @dataclass(frozen=True, slots=True)
 class _PendingExplicitConnect:
-    session_id: str
+    owner: str | _PendingSession
     generation: object
+
+    @property
+    def session_id(self) -> str | None:
+        if isinstance(self.owner, str):
+            return self.owner
+        return self.owner.resolved_session_id
 
 
 def _related_permission(message: dict[str, Any]) -> bool:
@@ -363,12 +372,15 @@ class ProxyRouter:
             elif (
                 isinstance(pending, _PendingExplicitConnect)
                 and pending.generation is self._generation
-                and pending.session_id in self._active_sessions
             ):
                 result = message.get("result")
                 connection_id = result.get("connectionId") if isinstance(result, dict) else None
                 if isinstance(connection_id, str) and connection_id:
-                    self._explicit_connection_sessions[connection_id] = pending.session_id
+                    session_id = pending.session_id
+                    if session_id in self._active_sessions:
+                        self._explicit_connection_sessions[connection_id] = session_id
+                    elif isinstance(pending.owner, _PendingSession):
+                        pending.owner.explicit_connection_ids.add(connection_id)
             await self._write_daemon(message, raw)
             if (
                 isinstance(pending, _PendingPermission)
@@ -451,10 +463,14 @@ class ProxyRouter:
                 and set(params) == {"serverId"}
                 and isinstance(params.get("serverId"), str)
             ):
-                session_id = self._explicit_server_sessions.get(params["serverId"])
-                if session_id is not None:
+                owner: str | _PendingSession | None = self._pending_explicit_session(
+                    params["serverId"]
+                )
+                if owner is None:
+                    owner = self._explicit_server_sessions.get(params["serverId"])
+                if owner is not None:
                     self._daemon_requests[key] = _PendingExplicitConnect(
-                        session_id, self._generation
+                        owner, self._generation
                     )
         await self._write_client(message, raw)
 
@@ -522,6 +538,17 @@ class ProxyRouter:
             raise ProxyError("duplicate outstanding request ID")
         self._daemon_requests[key] = None
 
+    def _pending_explicit_session(self, server_id: str) -> _PendingSession | None:
+        for pending in self._client_requests.values():
+            if (
+                pending is not None
+                and server_id in pending.explicit_hands_server_ids
+                and server_id not in pending.claimed_explicit_server_ids
+            ):
+                pending.claimed_explicit_server_ids.add(server_id)
+                return pending
+        return None
+
     async def _prepare_session(
         self, message: dict[str, Any]
     ) -> tuple[_PendingSession | None, bool]:
@@ -552,7 +579,12 @@ class ProxyRouter:
                 else ()
             )
             return _PendingSession(
-                method, params["cwd"], None, session_id, explicit_hands_server_ids
+                method,
+                params["cwd"],
+                None,
+                session_id,
+                explicit_hands_server_ids,
+                resolved_session_id=session_id,
             ), False
         server_id = self._new_server_id()
         params["mcpServers"] = [{
@@ -592,14 +624,18 @@ class ProxyRouter:
             if not isinstance(session_id, str) or not session_id:
                 await self._retire_session(pending.server_id)
                 raise ProxyError("invalid frame")
+            pending.resolved_session_id = session_id
             await self._retire_session(session_id)
         else:
             session_id = pending.session_id
             if session_id is None:
                 raise ProxyError("invalid frame")
+            pending.resolved_session_id = session_id
         self._active_sessions.add(session_id)
         for server_id in pending.explicit_hands_server_ids:
             self._explicit_server_sessions[server_id] = session_id
+        for connection_id in pending.explicit_connection_ids:
+            self._explicit_connection_sessions[connection_id] = session_id
         if pending.server_id is None:
             return
         self._server_sessions[pending.server_id] = session_id

@@ -535,15 +535,17 @@ async def test_explicit_hands_disconnect_revokes_session_grants_transparently() 
     try:
         await router.route_client(json.loads(session_request), session_request)
         assert bytes(daemon.data) == session_request
-        await router.route_daemon({
-            "jsonrpc": "2.0", "id": "new", "result": {"sessionId": "session"}
-        })
         client.data.clear()
         daemon.data.clear()
         await router.route_daemon(json.loads(connect), connect)
         assert bytes(client.data) == connect
         await router.route_client(json.loads(connected), connected)
         assert bytes(daemon.data) == connected
+        assert "explicit-connection" not in router._explicit_connection_sessions
+        await router.route_daemon({
+            "jsonrpc": "2.0", "id": "new", "result": {"sessionId": "session"}
+        })
+        assert router._explicit_connection_sessions["explicit-connection"] == "session"
         await grant_session(router, 71, "session")
         assert router._grants.allows("session", "hands_edit")
         client.data.clear()
