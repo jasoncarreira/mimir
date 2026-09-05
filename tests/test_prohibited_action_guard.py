@@ -237,6 +237,10 @@ class TestIsBashTool:
         assert is_bash_tool("hands_shell") is True
         assert is_bash_tool("client_hands_shell") is False
 
+    def test_hands_python_is_bash(self) -> None:
+        assert is_bash_tool("hands_python") is True
+        assert is_bash_tool("client_hands_python") is False
+
     def test_non_bash_tool_not_checked(self) -> None:
         assert is_bash_tool("send_message") is False
 
@@ -245,6 +249,24 @@ class TestIsBashTool:
 
     def test_unknown_tool_not_bash(self) -> None:
         assert is_bash_tool("some_random_tool") is False
+
+
+def test_hands_python_classification_extracts_code_and_screens_before_permission() -> None:
+    from mimir.tools.budget_gate import _check_prohibited
+
+    request = MagicMock()
+    request.tool_call = {
+        "name": "hands_python",
+        "args": {"code": "git push --force origin main"},
+        "id": "python",
+    }
+    assert _check_prohibited("hands_python", request).startswith("PROHIBITED_ACTION:")
+    for arguments in ({}, {"code": 1}, {"code": ""}):
+        request.tool_call["args"] = arguments
+        assert _check_prohibited("hands_python", request) == (
+            "PROHIBITED_ACTION: hands_python tool call has no non-empty string code "
+            "argument; refused because it cannot be screened"
+        )
 
 
 # ─── BudgetGateMiddleware integration ────────────────────────────────────────

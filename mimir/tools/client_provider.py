@@ -23,6 +23,7 @@ from ..acp.hands_contract import (
 from ..access_control import (
     CLIENT_FILE_RESOURCE_POLICY,
     ClientFileResourcePolicy,
+    _live_untrusted_active_ingest,
     canonical_client_file_resource,
 )
 
@@ -43,6 +44,7 @@ class ClientProviderResultError(ToolException, RuntimeError):
 
 class PermissionDecision(StrEnum):
     ALLOW_ONCE = "allow_once"
+    ALLOW_SESSION = "allow_session"
     REJECT_ONCE = "reject_once"
     CANCELLED = "cancelled"
     NOT_REQUESTED = "not_requested"
@@ -54,6 +56,27 @@ class PermissionEligibility:
     title: str
     kind: str
     arguments: Mapping[str, Any]
+    host_execution: ClientAuthorizedHostExecution | None = None
+
+
+_CLIENT_AUTHORIZED_HOST_EXECUTION_ISSUER = object()
+
+
+@dataclass(frozen=True)
+class ClientAuthorizedHostExecution:
+    operation: str
+    wrapper_name: str
+    tainted: bool
+    request_identity: Any
+    auth_context_identity: Any
+    capability_context_identity: Any
+    policy_identity: Any
+    provider_identity: Any
+    permission_broker_identity: Any
+    lease_identity: Any
+    connection_generation: int
+    prompt_epoch: int
+    _issuer: Any
 
 
 @runtime_checkable
@@ -95,6 +118,7 @@ class ProviderToolPolicy:
     input_schema_digest: str
     result_schema_digest: str
     description: str
+    operation: str | None
 
 
 @dataclass(frozen=True)
@@ -167,6 +191,7 @@ def _tool_policy(
     input_schema: Mapping[str, Any],
     result_schema: Mapping[str, Any],
     description: str,
+    operation: str | None,
 ) -> ProviderToolPolicy:
     return ProviderToolPolicy(
         wrapper_name=wrapper_name,
@@ -180,6 +205,7 @@ def _tool_policy(
         input_schema_digest=_schema_digest(input_schema),
         result_schema_digest=_schema_digest(result_schema),
         description=description,
+        operation=operation,
     )
 
 
@@ -187,6 +213,7 @@ _WIRE_TO_POLICY = {
     "read": ("resource_scoped", "source", None, "client-file"),
     "edit": ("admin_required", "both", "external_mcp", "client-file"),
     "shell": ("admin_required", "both", "shell_process", None),
+    "python": ("admin_required", "both", "shell_process", None),
 }
 
 
@@ -203,6 +230,11 @@ def _hands_policy_from_wire(descriptor: Mapping[str, Any]) -> ProviderToolPolicy
         input_schema=descriptor["inputSchema"],
         result_schema=descriptor["outputSchema"],
         description=descriptor["description"],
+        operation=(
+            "client_authorized_host_execution"
+            if classification == "admin_required"
+            else None
+        ),
     )
 
 MIMIR_HANDS_V1 = ProviderProfile(
@@ -263,12 +295,159 @@ def _active_policy(wrapper_name: str) -> tuple[TurnCapabilityContext, ProviderTo
     return context, policy
 
 
+def issue_client_authorized_host_execution(
+    *,
+    request_identity: Any,
+    auth_context_identity: Any,
+    wrapper_name: str,
+    tainted: bool,
+) -> ClientAuthorizedHostExecution | None:
+    context = get_turn_capability_context()
+    policy = context.profile_policy.tool(wrapper_name) if context is not None and context.profile_policy is MIMIR_HANDS_V1 else None
+    lease = getattr(context, "lease", None)
+    if (
+        policy is None
+        or policy.operation != "client_authorized_host_execution"
+        or wrapper_name not in {"hands_edit", "hands_shell", "hands_python"}
+        or not isinstance(tainted, bool)
+        or auth_context_identity is None
+        or getattr(auth_context_identity, "is_service", False)
+        or "admin" not in (getattr(auth_context_identity, "roles", ()) or ())
+        or not isinstance(getattr(auth_context_identity, "principal", None), str)
+        or not getattr(auth_context_identity, "principal", "")
+        or not isinstance(getattr(auth_context_identity, "canonical_principal", None), str)
+        or not getattr(auth_context_identity, "canonical_principal", "")
+        or context is None
+        or context.acp_delivery is not True
+        or context.provider is None
+        or getattr(context.provider, "closed", False)
+        or context.permission_broker is None
+        or not callable(getattr(context.permission_broker, "request_permission", None))
+        or lease is None
+        or getattr(lease, "closed", True)
+        or getattr(lease, "generation", None) != context.connection_generation
+        or getattr(lease, "epoch", None) != context.prompt_epoch
+    ):
+        return None
+    return ClientAuthorizedHostExecution(
+        operation=policy.operation,
+        wrapper_name=wrapper_name,
+        tainted=tainted,
+        request_identity=request_identity,
+        auth_context_identity=auth_context_identity,
+        capability_context_identity=context,
+        policy_identity=policy,
+        provider_identity=context.provider,
+        permission_broker_identity=context.permission_broker,
+        lease_identity=lease,
+        connection_generation=context.connection_generation,
+        prompt_epoch=context.prompt_epoch,
+        _issuer=_CLIENT_AUTHORIZED_HOST_EXECUTION_ISSUER,
+    )
+
+
+def client_authorized_host_execution_matches(
+    execution: Any,
+    *,
+    request_identity: Any,
+    auth_context_identity: Any,
+    wrapper_name: str,
+) -> bool:
+    context = get_turn_capability_context()
+    if not isinstance(execution, ClientAuthorizedHostExecution) or context is None:
+        return False
+    policy = context.profile_policy.tool(wrapper_name) if context.profile_policy is MIMIR_HANDS_V1 else None
+    lease = context.lease
+    return (
+        execution._issuer is _CLIENT_AUTHORIZED_HOST_EXECUTION_ISSUER
+        and execution.operation == "client_authorized_host_execution"
+        and execution.wrapper_name == wrapper_name
+        and execution.request_identity is request_identity
+        and execution.auth_context_identity is auth_context_identity
+        and execution.capability_context_identity is context
+        and execution.policy_identity is policy
+        and execution.provider_identity is context.provider
+        and execution.permission_broker_identity is context.permission_broker
+        and execution.lease_identity is lease
+        and execution.connection_generation == context.connection_generation
+        and execution.prompt_epoch == context.prompt_epoch
+        and policy is not None
+        and policy.operation == execution.operation
+        and context.acp_delivery is True
+        and context.provider is not None
+        and getattr(context.provider, "closed", False) is False
+        and context.permission_broker is not None
+        and lease is not None
+        and getattr(lease, "closed", True) is False
+        and getattr(lease, "generation", None) == context.connection_generation
+        and getattr(lease, "epoch", None) == context.prompt_epoch
+    )
+
+
+def client_authorized_host_execution_metadata(
+    execution: Any,
+) -> tuple[str, bool] | None:
+    if not isinstance(execution, ClientAuthorizedHostExecution):
+        return None
+    if not client_authorized_host_execution_matches(
+        execution,
+        request_identity=execution.request_identity,
+        auth_context_identity=execution.auth_context_identity,
+        wrapper_name=execution.wrapper_name,
+    ):
+        return None
+    auth_context = execution.auth_context_identity
+    state = getattr(auth_context, "ifc_state", None)
+    current = getattr(state, "current", None)
+    try:
+        labels = current(auth_context.ifc_labels) if callable(current) else None
+    except Exception:
+        return None
+    tainted = _live_untrusted_active_ingest(auth_context, labels)
+    if not isinstance(tainted, bool):
+        return None
+    return execution.wrapper_name, tainted
+
+
 def _validate_result(result: Mapping[str, Any], wrapper_name: str) -> dict[str, Any]:
     provider_name = HANDS_WRAPPER_TO_PROVIDER[wrapper_name]
     try:
         return validate_tool_result(provider_name, result)
     except HandsContractError:
         raise ToolException(f"{wrapper_name} returned a malformed result")
+
+
+_HANDS_WRAPPER_ARGUMENTS = MappingProxyType({
+    "hands_read": MappingProxyType({"path": "path"}),
+    "hands_edit": MappingProxyType({
+        "path": "path",
+        "old_text": "oldText",
+        "new_text": "newText",
+    }),
+    "hands_shell": MappingProxyType({"command": "command"}),
+    "hands_python": MappingProxyType({"code": "code"}),
+})
+
+
+def validate_hands_wrapper_arguments(
+    wrapper_name: str, arguments: Any,
+) -> dict[str, str] | None:
+    names = _HANDS_WRAPPER_ARGUMENTS.get(wrapper_name)
+    policy = MIMIR_HANDS_V1.tool(wrapper_name)
+    if names is None or policy is None or not isinstance(arguments, dict):
+        return None
+    required = policy.input_schema.get("required")
+    properties = policy.input_schema.get("properties")
+    if (
+        set(arguments) != set(names)
+        or set(names.values()) != set(required or ())
+        or not isinstance(properties, Mapping)
+        or set(properties) != set(names.values())
+        or any(properties[provider_name].get("type") != "string" for provider_name in names.values())
+        or any(not isinstance(arguments[wrapper_name], str) for wrapper_name in names)
+    ):
+        return None
+    return dict(arguments)
 
 
 class _ReadArgs(BaseModel):
@@ -286,6 +465,11 @@ class _EditArgs(BaseModel):
 class _ShellArgs(BaseModel):
     model_config = ConfigDict(extra="forbid")
     command: str
+
+
+class _PythonArgs(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    code: str
 
 
 @tool("hands_read", args_schema=_ReadArgs)
@@ -323,4 +507,14 @@ async def hands_shell(command: str) -> dict[str, str | int]:
     return _validate_result(result, "hands_shell")
 
 
-HANDS_TOOLS = (hands_read, hands_edit, hands_shell)
+@tool("hands_python", args_schema=_PythonArgs)
+async def hands_python(code: str) -> dict[str, bool | str]:
+    """Execute Python code using the admitted client-hosted hands provider."""
+    context, policy = _active_policy("hands_python")
+    if not isinstance(code, str):
+        raise ToolException("hands_python code is malformed")
+    result = await context.provider.call_tool(policy.provider_name, {"code": code})
+    return _validate_result(result, "hands_python")
+
+
+HANDS_TOOLS = (hands_read, hands_edit, hands_shell, hands_python)

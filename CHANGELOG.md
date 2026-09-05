@@ -6,6 +6,8 @@ All notable changes will land here. Format loosely follows
 
 ## [Unreleased]
 
+- Add proxy-hosted ACP Hands with exact-call session grants, a persistent
+  per-session Python REPL, profile-owned timeouts, and complete lifecycle cleanup.
 - Upgrade `feature-factory` and `opencode-feature-factory` to 0.8.3 for the ordered
   park sequence, and surface its `park_snapshot` in parked-run records and reports.
 - Upgrade `feature-factory` and `opencode-feature-factory` to 0.8.2, carrying

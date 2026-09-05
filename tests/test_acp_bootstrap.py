@@ -40,6 +40,97 @@ def test_remote_option_presence_and_default_port(tmp_path: Path, monkeypatch: py
     assert (tmp_path / "mimir" / "acp" / "profiles.json").read_bytes() == before
 
 
+def test_profile_set_timeout_contract(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capfd: pytest.CaptureFixture[str],
+) -> None:
+    assert invoke(
+        tmp_path,
+        ["profile", "add-local", "default", "--home", "/tmp"],
+        monkeypatch,
+        capfd,
+    ) == (0, "", "added\n")
+    path = tmp_path / "mimir" / "acp" / "profiles.json"
+    before = path.read_bytes()
+    invalid = (
+        "", "0", "601", "+1", "1.0", " 1", "１", "²", "١",
+        "9" * 5000, "0" * 5000 + "601",
+    )
+    for value in invalid:
+        args = ["profile", "set-timeout", "default"]
+        if value:
+            args.append(value)
+        code, out, err = invoke(tmp_path, args, monkeypatch, capfd)
+        assert code == 2 and out == ""
+        if value:
+            assert err == "argument seconds: must be an ASCII integer from 1 through 600\n"
+        else:
+            assert "required" in err
+        assert path.read_bytes() == before
+
+    assert invoke(
+        tmp_path,
+        ["profile", "set-timeout", "missing", "60"],
+        monkeypatch,
+        capfd,
+    ) == (2, "", "profile 'missing' does not exist\n")
+    assert path.read_bytes() == before
+
+    for seconds in ("1", "060", "0" * 5000 + "1", "600"):
+        assert invoke(
+            tmp_path,
+            ["profile", "set-timeout", "default", seconds],
+            monkeypatch,
+            capfd,
+        ) == (
+            0,
+            "",
+            f"Set timeout for profile 'default' to {int(seconds.lstrip('0'))} seconds.\n",
+        )
+    assert json.loads(path.read_text())["profiles"]["default"]["timeoutSeconds"] == 600
+
+    forbidden = (
+        ["profile", "add-local", "other", "--home", "/tmp", "--timeout", "2"],
+        [
+            "profile", "add-ssh", "remote", "--home", "/remote",
+            "--ssh-host", "example.com", "--ssh-user", "agent",
+            "--identity-file", "/id", "--known-hosts-file", "/known",
+            "--timeout", "2",
+        ],
+    )
+    for args in forbidden:
+        code, out, err = invoke(tmp_path, args, monkeypatch, capfd)
+        assert code == 2 and out == "" and "unrecognized arguments" in err
+    assert set(json.loads(path.read_text())["profiles"]) == {"default"}
+
+
+def test_add_profile_commands_expose_no_timeout_options(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capfd: pytest.CaptureFixture[str],
+) -> None:
+    commands = (
+        ["profile", "add-local", "local", "--home", "/tmp"],
+        [
+            "profile", "add-ssh", "remote", "--home", "/remote",
+            "--ssh-host", "example.com", "--ssh-user", "agent",
+            "--identity-file", "/id", "--known-hosts-file", "/known",
+        ],
+    )
+    for command in commands:
+        for option in ("--timeout", "--timeout-seconds", "--timeoutSeconds"):
+            code, out, err = invoke(
+                tmp_path, [*command, option, "2"], monkeypatch, capfd,
+            )
+            assert code == 2
+            assert out == ""
+            assert "unrecognized arguments" in err
+
+    store = tmp_path / "mimir" / "acp" / "profiles.json"
+    assert not store.exists()
+
+
 @pytest.mark.parametrize(("port", "valid"), [(0, False), (1, True), (65535, True), (65536, False)])
 def test_remote_port_boundaries(tmp_path: Path, port: int, valid: bool, monkeypatch: pytest.MonkeyPatch, capfd: pytest.CaptureFixture[str]) -> None:
     args = ["profile", "add-ssh", "remote", "--home", "/remote", "--ssh-host", "example.com", "--ssh-user", "agent", "--ssh-port", str(port), "--identity-file", "/id", "--known-hosts-file", "/known"]

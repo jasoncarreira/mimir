@@ -73,6 +73,7 @@ def test_wheel_guard_requires_complete_intermediate_surface() -> None:
         "mimir/acp/hosted.py",
         "mimir/acp/profiles.py",
         "mimir/acp/proxy.py",
+        "mimir/acp/python_kernel.py",
         "mimir/acp/relay.py",
         "mimir/acp/ssh.py",
         "mimir/acp/bridge.py",
@@ -103,6 +104,15 @@ def test_acp_docs_cover_client_contract() -> None:
     assert "no plaintext" in docs
     assert "credential-mutation-uncertain" in docs
     assert "12 seconds" in docs and "5 seconds" in docs
+    for text in (
+        "`read`, `edit`, `shell`, and `python`",
+        "mimir acp profile set-timeout PROFILE 60",
+        "`allow_session`",
+        "1,800 seconds of idle time",
+        "does not provide containment",
+        "Session load restores the daemon transcript but retires the old worker first",
+    ):
+        assert text in docs
 
 def test_wheel_guard_matches_finite_acp_source_inventory() -> None:
     members = {member for member in _required_wheel_members() if member.startswith("mimir/acp/")}

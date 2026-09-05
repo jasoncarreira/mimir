@@ -202,6 +202,7 @@ _SINK_CATEGORY_MAP: dict[str, SinkCategory] = {
     "shell": SinkCategory.SHELL_PROCESS,
     "hands_edit": SinkCategory.EXTERNAL_MCP,
     "hands_shell": SinkCategory.SHELL_PROCESS,
+    "hands_python": SinkCategory.SHELL_PROCESS,
     "spawn_open_code": SinkCategory.SPAWN,
     "worklink_run": SinkCategory.SPAWN,
     "ntfy_send": SinkCategory.NOTIFICATION,
@@ -336,6 +337,7 @@ _TOOL_FLOW_MAP: dict[str, ToolFlowDirection] = {
     "hands_read": ToolFlowDirection.SOURCE,
     "hands_edit": ToolFlowDirection.BOTH,
     "hands_shell": ToolFlowDirection.BOTH,
+    "hands_python": ToolFlowDirection.BOTH,
     "Write": ToolFlowDirection.SINK,
     "Edit": ToolFlowDirection.SINK,
     "Read": ToolFlowDirection.SOURCE,
@@ -6333,6 +6335,8 @@ class SinkGate:
         operator_shell_request_identity: Any = None,
         tool_call_id: str | None = None,
         requested_cwd: object = None,
+        client_authorized_host_execution: Any = None,
+        request_identity: Any = None,
     ) -> "ToolAuthorization":
         """Check if IFC labels permit flow to the given sink.
 
@@ -6468,6 +6472,16 @@ class SinkGate:
         has_untrusted_active_ingest = _has_untrusted_active_ingest(
             auth_context, ifc_labels,
         )
+        client_authorized = False
+        if client_authorized_host_execution is not None:
+            from .tools.client_provider import client_authorized_host_execution_matches
+
+            client_authorized = client_authorized_host_execution_matches(
+                client_authorized_host_execution,
+                request_identity=request_identity,
+                auth_context_identity=auth_context,
+                wrapper_name=tool_name,
+            )
         operator_binding_matches = _operator_shell_binding_matches(
             operator_shell_binding,
             request_identity=operator_shell_request_identity,
@@ -6501,6 +6515,7 @@ class SinkGate:
             is_application_egress
             and egress_target_requires_taint_gate
             and not allow_untrusted_active_ingest
+            and not client_authorized
             and has_untrusted_active_ingest
         ):
             canonical_principal = getattr(auth_context, "canonical_principal", None)
@@ -6813,6 +6828,7 @@ class SinkGate:
             operator_shell_request_identity=operator_shell_request_identity,
             tool_call_id=tool_call_id,
             requested_cwd=requested_cwd,
+            client_authorized_host_execution=client_authorized,
         )
         effective_target = (
             ChannelResourceAdapter._resolve_channel(target)
@@ -6901,6 +6917,7 @@ class SinkGate:
         operator_shell_request_identity: Any = None,
         tool_call_id: str | None = None,
         requested_cwd: object = None,
+        client_authorized_host_execution: bool = False,
     ) -> frozenset[str]:
         """Return concrete destinations compatible with every current label.
 
@@ -6927,6 +6944,8 @@ class SinkGate:
             }
             else target
         )
+        if client_authorized_host_execution and target is not None:
+            return frozenset({resolved_target_channel})
         is_cross_channel_operation = category in {
             SinkCategory.CROSS_CHANNEL,
             SinkCategory.DIRECT_MESSAGE,
@@ -7648,6 +7667,7 @@ class OperationCatalog:
         "rebuild_index",
         "hands_edit",
         "hands_shell",
+        "hands_python",
     })
 
     # Global rows from these operations contain protected identities,
@@ -8522,6 +8542,8 @@ class ToolRegistry:
         operator_shell_request_identity: Any = None,
         operator_shell_audit: Mapping[str, str] | None = None,
         tool_call_id: str | None = None,
+        client_authorized_host_execution: Any = None,
+        request_identity: Any = None,
     ) -> ToolAuthorization:
         """Authorize a tool call using the operation catalog.
 
@@ -8747,6 +8769,8 @@ class ToolRegistry:
                 operator_shell_request_identity=operator_shell_request_identity,
                 tool_call_id=tool_call_id,
                 requested_cwd=(arguments or {}).get("cwd"),
+                client_authorized_host_execution=client_authorized_host_execution,
+                request_identity=request_identity,
             )
             sink_check.repo_pr_action_scope = repo_pr_action_scope
             if not sink_check.allowed and enforce and not preliminary_admin_denied:
@@ -9095,6 +9119,7 @@ _PROTECTED_RESULT_DOMAINS: dict[str, str] = {
     # branch was diverged) is what surfaces the omission.
     "hands_edit": "client_provider",
     "hands_shell": "client_provider",
+    "hands_python": "client_provider",
     "pr_submit_review": "repository",
     "pr_inline_review_comment": "repository",
     "pr_comment": "repository",
@@ -9110,7 +9135,9 @@ _PROTECTED_RESULT_DOMAINS: dict[str, str] = {
 }
 
 _ACP_HANDS_RESULT_SOURCE_KIND = "acp_hands_result"
-_ACP_HANDS_RESULT_TOOLS = frozenset({"hands_read", "hands_edit", "hands_shell"})
+_ACP_HANDS_RESULT_TOOLS = frozenset({
+    "hands_read", "hands_edit", "hands_shell", "hands_python"
+})
 
 # Every model-bound tool that does not ingest model-visible content is listed
 # explicitly. This makes exemption a reviewed semantic claim rather than an
@@ -10035,7 +10062,7 @@ def classify_protected_result(
         if tool_name == "hands_edit":
             edit_resource = canonical_client_file_resource(args.get("path"))
             resources = (edit_resource,) if edit_resource is not None else None
-        elif tool_name == "hands_shell":
+        elif tool_name in {"hands_shell", "hands_python"}:
             resources = (channel,) if isinstance(channel, str) else None
         if not (
             authorization.allowed
@@ -10379,6 +10406,7 @@ _OPERATION_READABLE_DOMAIN: dict[str, str] = {
     "memory_query": "saga",
     "memory_get": "saga",
     "hands_read": "client_provider",
+    "hands_python": "client_provider",
     **{
         operation: "repository"
         for operation, direction in _TOOL_FLOW_MAP.items()
@@ -10433,6 +10461,7 @@ _OPERATION_SINK_DESTINATION: dict[str, str] = {
     "shell": "shell_process",
     "hands_edit": "client_provider",
     "hands_shell": "shell_process",
+    "hands_python": "shell_process",
     "Write": "filesystem",
     "Edit": "filesystem",
     "harness_auto_deliver": "message",

@@ -16,6 +16,7 @@ from .hands_contract import (
     validate_tool_arguments,
     validate_tool_result,
 )
+from .python_kernel import PythonKernelManager, PythonKernelUnavailable
 
 
 READ_LIMIT_BYTES = 1024 * 1024
@@ -42,6 +43,7 @@ class HostedMcpError(RuntimeError):
 class HostedSession:
     session_id: str
     cwd: Path
+    timeout_seconds: int = SHELL_TIMEOUT_SECONDS
 
 
 @dataclass(slots=True)
@@ -78,18 +80,28 @@ def _resolved_path(session: HostedSession, value: str) -> Path:
 
 
 class HostedHandsProvider:
-    def __init__(self) -> None:
+    def __init__(self, timeout_seconds: int = SHELL_TIMEOUT_SECONDS) -> None:
+        if (
+            isinstance(timeout_seconds, bool)
+            or not isinstance(timeout_seconds, int)
+            or not 1 <= timeout_seconds <= 600
+        ):
+            raise ValueError("timeout_seconds must be an integer from 1 through 600")
+        self._timeout_seconds = timeout_seconds
         self._sessions: dict[str, HostedSession] = {}
         self._connections: dict[str, _Connection] = {}
         self._used_connection_ids: set[str] = set()
         self._processes: dict[asyncio.subprocess.Process, int] = {}
         self._provider_cancelled: set[asyncio.Task[Any]] = set()
+        self._python_kernels = PythonKernelManager()
         self._closed = False
 
     def bind_session(self, session_id: str, cwd: str | os.PathLike[str]) -> None:
         if not isinstance(session_id, str) or not session_id:
             raise ValueError("session_id must be a non-empty string")
-        self._sessions[session_id] = HostedSession(session_id, Path(os.path.abspath(cwd)))
+        self._sessions[session_id] = HostedSession(
+            session_id, Path(os.path.abspath(cwd)), self._timeout_seconds
+        )
 
     def revoke_session(self, session_id: str) -> None:
         self._sessions.pop(session_id, None)
@@ -116,10 +128,18 @@ class HostedHandsProvider:
         return connection_id
 
     async def disconnect(self, connection_id: str) -> dict[str, Any]:
-        connection = self._connections.pop(connection_id, None)
+        connection = self._connections.get(connection_id)
         if connection is None:
             raise HostedMcpError(-32602, "Unknown MCP connection")
-        await self._cancel_calls(connection)
+        session_id = connection.session.session_id
+        session_connections = tuple(
+            item
+            for item in self._connections.values()
+            if item.session.session_id == session_id
+        )
+        await asyncio.gather(*(self._cancel_calls(item) for item in session_connections))
+        await self._python_kernels.retire(session_id)
+        self._connections.pop(connection_id, None)
         return {}
 
     async def cancel_session(self, session_id: str) -> None:
@@ -130,6 +150,21 @@ class HostedHandsProvider:
                 if connection.session.session_id == session_id
             )
         )
+        await self._python_kernels.retire(session_id)
+
+    async def execute_python(
+        self,
+        session: HostedSession,
+        code: str,
+    ) -> dict[str, Any]:
+        try:
+            return await self._python_kernels.execute(
+                session.session_id, session.cwd, code, session.timeout_seconds
+            )
+        except PythonKernelUnavailable as exc:
+            raise HostedMcpError(
+                -32000, f"hands_python kernel unavailable: {exc}"
+            ) from None
 
     async def close(self) -> None:
         if self._closed:
@@ -144,6 +179,26 @@ class HostedHandsProvider:
                 for process, pgid in tuple(self._processes.items())
             )
         )
+        await self._python_kernels.close()
+
+    def terminate_owned_children(self) -> None:
+        processes = tuple(self._processes.items())
+        self.kill_owned_process_groups()
+        for process, _ in processes:
+            try:
+                os.waitpid(process.pid, 0)
+            except (ChildProcessError, ProcessLookupError):
+                pass
+            self._processes.pop(process, None)
+        self._python_kernels.terminate_owned_children()
+
+    def kill_owned_process_groups(self) -> None:
+        for _, pgid in tuple(self._processes.items()):
+            try:
+                os.killpg(pgid, 9)
+            except ProcessLookupError:
+                pass
+        self._python_kernels.kill_owned_process_groups()
 
     async def request(
         self,
@@ -282,6 +337,8 @@ class HostedHandsProvider:
             )
         if name == "shell":
             return await self._shell(session, arguments["command"])
+        if name == "python":
+            return await self.execute_python(session, arguments["code"])
         raise _invalid_params()
 
     def _read(self, session: HostedSession, path_value: str) -> dict[str, Any]:
@@ -342,7 +399,7 @@ class HostedHandsProvider:
                     pass
 
     async def _shell(self, session: HostedSession, command: str) -> dict[str, Any]:
-        timeout = SHELL_TIMEOUT_SECONDS
+        timeout = session.timeout_seconds
         try:
             process = await asyncio.create_subprocess_exec(
                 "/bin/sh",

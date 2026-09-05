@@ -18,11 +18,11 @@ import mimir.tools.registry as tool_registry
 from mimir._context import reset_current_turn, set_current_turn
 from mimir.access_control import SinkGate
 from mimir.acp import sdk
-from mimir.acp.agent import ActivePrompt, MimirAcpAgent
+from mimir.acp.agent import ActivePrompt, MimirAcpAgent, SessionState
 from mimir.agent import _initialize_ifc_labels
 from mimir.acp.journal import JournalLease
 from mimir.acp.updates import UpdateDispatcher
-from mimir.models import InformationFlowState, TurnContext, TurnInteractivity
+from mimir.models import InformationFlowLabels, InformationFlowState, SourceLabel, TurnContext, TurnInteractivity
 from mimir.tools.registry import send_message
 from mimir.tools.client_provider import MIMIR_HANDS_V1, PermissionDecision, PermissionEligibility, get_turn_capability_context, hands_edit, hands_shell
 from mimir.channel_registry import ChannelRegistry
@@ -144,6 +144,36 @@ async def _ready(home: Path) -> tuple[MimirAcpAgent, Client, CoreAgent]:
 
 def _types(client: Client) -> list[str]:
     return [item.session_update for item in client.updates]
+
+
+def test_daemon_session_state_contains_no_kernel_namespace() -> None:
+    names = {item.name for item in dataclasses.fields(SessionState)}
+    assert names.isdisjoint({"kernel", "namespace", "worker", "python_kernel"})
+
+
+async def test_session_load_restores_transcript_without_kernel_state(
+    tmp_path: Path,
+) -> None:
+    agent, client, _ = await _ready(tmp_path)
+    session_id = (await agent.new_session("/workspace")).session_id
+    await agent.prompt(session_id, [sdk.TextContentBlock(type="text", text="hello")])
+    original = [
+        update.model_dump(mode="json", by_alias=True, exclude_none=True)
+        for update in client.updates
+    ]
+    client.updates.clear()
+    await agent.load_session("/replacement", session_id)
+    replayed = [
+        update.model_dump(mode="json", by_alias=True, exclude_none=True)
+        for update in client.updates
+    ]
+    assert replayed == original
+    assert {item.name for item in dataclasses.fields(SessionState)}.isdisjoint(
+        {"kernel", "namespace", "worker", "python_kernel"}
+    )
+    persisted = "".join(path.read_text() for path in agent._store.root.iterdir())
+    assert "python_kernel" not in persisted
+    assert "namespace" not in persisted
 
 
 async def test_new_prompt_runs_bound_core_and_preserves_update_order(tmp_path: Path) -> None:
@@ -545,27 +575,47 @@ async def test_prompt_auth_context_is_scoped_to_the_session_channel(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("permission_decision", "expected_denial"),
+    ("permission_decision", "tool_name", "arguments", "expected_denial", "setup_error"),
     [
-        ("allow_once", None),
+        ("allow_once", "hands_shell", {"command": "printf ok"}, None, False),
         (
             "reject_once",
+            "hands_shell",
+            {"command": "printf ok"},
             "hands_shell permission was rejected by the operator before execution",
+            False,
         ),
-        ("timeout", "hands_shell permission request timed out; execution denied"),
+        (
+            "timeout",
+            "hands_shell",
+            {"command": "printf ok"},
+            "hands_shell permission request timed out; execution denied",
+            False,
+        ),
+        (
+            "allow_session", "hands_python", {"code": "value = 1\nvalue"},
+            None, False,
+        ),
+        (
+            "allow_once", "hands_python", {"code": "value = 1\nvalue"},
+            None, True,
+        ),
     ],
 )
-async def test_authenticated_acp_hands_shell_reaches_execution_after_permission(
+async def test_admin_hands_permissions_precede_execution_and_preserve_raw_arguments(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     permission_decision: str,
+    tool_name: str,
+    arguments: dict[str, str],
     expected_denial: str | None,
+    setup_error: bool,
 ) -> None:
     """The authenticated ACP carrier survives every gate before hands execution.
 
     ``ActivePrompt.request_permission`` is live for hands calls. Its ordinary
     success path snapshots the matching public tool call, asks the ACP client,
-    receives ``allow_once``, and only then lets ``wrap_tool_call`` invoke the
+    receives a current-call approval, and only then lets ``wrap_tool_call`` invoke the
     hands provider. Missing/stale prompt state, cancellation, snapshot mismatch,
     missing peer, transport error, or any non-allow client answer fail closed.
     """
@@ -574,6 +624,7 @@ async def test_authenticated_acp_hands_shell_reaches_execution_after_permission(
     from langgraph.runtime import Runtime
 
     from mimir.tools.budget_gate import BudgetGateMiddleware
+    from mimir.tools.client_provider import hands_python
 
     bundle, core = _bundle(tmp_path)
     agent = MimirAcpAgent(bundle)
@@ -582,9 +633,11 @@ async def test_authenticated_acp_hands_shell_reaches_execution_after_permission(
         def __init__(self) -> None:
             super().__init__()
             self.permission_snapshots: list[Any] = []
+            self.execution_order: list[str] = []
 
         async def request_tool_permission(self, session_id: str, snapshot: Any) -> Any:
             self.permission_snapshots.append(snapshot)
+            self.execution_order.append("permission")
             if permission_decision == "timeout":
                 await asyncio.Event().wait()
             return sdk.PermissionCompletion(permission_decision)
@@ -594,9 +647,23 @@ async def test_authenticated_acp_hands_shell_reaches_execution_after_permission(
         ) -> Any:
             if method == "tools/call":
                 self.messages.append((connection_id, method, params))
-                assert params["name"] == "shell"
-                assert params["arguments"] == {"command": "printf ok"}
+                self.execution_order.append("execution")
+                expected_provider = "python" if tool_name == "hands_python" else "shell"
+                assert params["name"] == expected_provider
+                assert params["arguments"] == arguments
                 assert isinstance(params.get("_meta", {}).get("progressToken"), str)
+                if tool_name == "hands_python":
+                    if setup_error:
+                        raise sdk.RequestError(
+                            -32000, "hands_python kernel unavailable: spawn refused"
+                        )
+                    return {
+                        "content": [],
+                        "structuredContent": {
+                            "ok": True, "stdout": "", "stderr": "", "value": "1",
+                            "exception": "", "timedOut": False, "kernel": "fresh",
+                        },
+                    }
                 return {
                     "content": [{"type": "text", "text": "ok"}],
                     "structuredContent": {"stdout": "ok", "stderr": "", "exitCode": 0},
@@ -628,18 +695,17 @@ async def test_authenticated_acp_hands_shell_reaches_execution_after_permission(
         turn_id = kwargs["turn_id"]
         active = agent._active_prompts[session_id]
         queue = bundle.turn_event_bus._exact_turn_subscribers[turn_id]
-        arguments = {"command": "printf ok"}
         bundle.turn_event_bus.publish({
             "turn_id": turn_id, "channel_id": event.channel_id, "seq": 1,
             "ts": "now", "type": "tool_call", "phase": "start",
-            "id": "shell-1", "tool_name": "hands_shell", "args": arguments,
+            "id": "admin-1", "tool_name": tool_name, "args": arguments,
         })
         await queue.join()
         await active.dispatcher.drain()
         request = ToolCallRequest(
             tool_call={
-                "name": "hands_shell", "args": arguments,
-                "id": "shell-1", "type": "tool_call",
+                "name": tool_name, "args": arguments,
+                "id": "admin-1", "type": "tool_call",
             },
             tool=None, state=None, runtime=Runtime(context=auth),
         )
@@ -647,11 +713,16 @@ async def test_authenticated_acp_hands_shell_reaches_execution_after_permission(
         owner_loop = asyncio.get_running_loop()
 
         def sync_handler(call: ToolCallRequest) -> ToolMessage:
+            invocation = (
+                hands_python.ainvoke(call.tool_call["args"])
+                if tool_name == "hands_python"
+                else hands_shell.ainvoke(call.tool_call["args"])
+            )
             result = asyncio.run_coroutine_threadsafe(
-                hands_shell.ainvoke(call.tool_call["args"]), owner_loop,
+                invocation, owner_loop,
             ).result(timeout=1)
             return ToolMessage(
-                content=json.dumps(result), tool_call_id="shell-1", name="hands_shell",
+                content=json.dumps(result), tool_call_id="admin-1", name=tool_name,
             )
 
         result = await asyncio.to_thread(
@@ -659,9 +730,15 @@ async def test_authenticated_acp_hands_shell_reaches_execution_after_permission(
         )
         if expected_denial is None:
             assert result.status != "error", result.content
-            assert json.loads(str(result.content)) == {
-                "stdout": "ok", "stderr": "", "exitCode": 0,
-            }
+            expected_result = (
+                {
+                    "ok": True, "stdout": "", "stderr": "", "value": "1",
+                    "exception": "", "timedOut": False, "kernel": "fresh",
+                }
+                if tool_name == "hands_python"
+                else {"stdout": "ok", "stderr": "", "exitCode": 0}
+            )
+            assert json.loads(str(result.content)) == expected_result
         else:
             assert result.status == "error"
             assert result.content == expected_denial
@@ -675,17 +752,44 @@ async def test_authenticated_acp_hands_shell_reaches_execution_after_permission(
             break
         await asyncio.sleep(0.01)
     assert client.permission_snapshots
-    response = await prompt
+    if setup_error:
+        with pytest.raises(sdk.RequestError) as raised:
+            await prompt
+        assert raised.value.to_error_obj() == sdk.internal_error().to_error_obj()
+        assert client.updates[-1].status == "failed"
+        assert client.updates[-1].raw_output == {"error": "Tool execution failed"}
+        response = None
+    else:
+        response = await prompt
 
-    assert response.stop_reason == "end_turn"
-    assert len(client.permission_snapshots) == 1
+    expected_invocations = 1
+    if permission_decision == "allow_session" and expected_denial is None:
+        repeated = await agent.prompt(
+            session_id,
+            [sdk.TextContentBlock(type="text", text="run python again")],
+        )
+        assert repeated.stop_reason == "end_turn"
+        expected_invocations = 2
+
+    assert response is None or response.stop_reason == "end_turn"
+    assert len(client.permission_snapshots) == expected_invocations
     snapshot = client.permission_snapshots[0]
-    assert snapshot.tool_call_id == "shell-1"
-    assert snapshot.title == "hands_shell"
-    assert snapshot.raw_input == {"command": "printf ok"}
+    assert snapshot.tool_call_id == "admin-1"
+    assert snapshot.title == tool_name
+    assert snapshot.raw_input == arguments
+    assert client.execution_order == (
+        ["permission", "execution"] * expected_invocations
+        if expected_denial is None
+        else ["permission"]
+    )
     assert any(
         method == "tools/call" for _connection, method, _params in client.messages
     ) is (expected_denial is None)
+    state = agent._sessions[session_id]
+    assert not hasattr(agent, "_permission_grants")
+    assert not hasattr(state, "permission_grants")
+    assert not hasattr(state.record, "permission_grants")
+    assert not hasattr(state.profile_policy, "permission_grants")
 
 
 async def test_cancelled_bound_turn_terminalizes_open_tools(tmp_path: Path) -> None:
@@ -1568,7 +1672,9 @@ async def test_transport_teardown_is_generation_scoped_and_requires_load(tmp_pat
 
 
 async def test_active_prompt_permission_uses_admitted_snapshot_and_is_once_scoped(
-    tmp_path: Path, middleware_event_logger: None,
+    tmp_path: Path,
+    middleware_event_logger: None,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     class Publisher:
         def __init__(self) -> None:
@@ -1602,12 +1708,20 @@ async def test_active_prompt_permission_uses_admitted_snapshot_and_is_once_scope
 
     missing = await active.request_permission(PermissionEligibility("missing", "ignored", "ignored", {"path": "a"}))
     mismatch = await active.request_permission(PermissionEligibility("tool-1", "ignored", "ignored", {"path": "changed", "token": "secret"}))
+    monkeypatch.setattr(
+        agent_module, "client_authorized_host_execution_metadata", lambda _: None,
+    )
+    indeterminate = await active.request_permission(PermissionEligibility(
+        "tool-1", "hands_edit", "other", {"path": "a", "token": "secret"},
+        object(),
+    ))
     decision = await active.request_permission(PermissionEligibility("tool-1", "ignored", "ignored", {"path": "a", "token": "secret"}))
     lease.close()
     stale = await active.request_permission(PermissionEligibility("tool-1", "ignored", "ignored", {"path": "a", "token": "secret"}))
 
     assert missing is PermissionDecision.NOT_REQUESTED
     assert mismatch is PermissionDecision.NOT_REQUESTED
+    assert indeterminate is PermissionDecision.NOT_REQUESTED
     assert decision is PermissionDecision.ALLOW_ONCE
     assert stale is PermissionDecision.NOT_REQUESTED
     events = [
@@ -1617,6 +1731,7 @@ async def test_active_prompt_permission_uses_admitted_snapshot_and_is_once_scope
     assert events == [
         "acp_permission_guard_snapshot_missing",
         "acp_permission_guard_snapshot_mismatch",
+        "acp_permission_guard_host_execution_missing",
         "acp_permission_guard_prompt_not_current",
     ]
     assert peer.snapshots[0][1].title == "hands_edit"
@@ -2225,7 +2340,7 @@ async def test_cancel_boundary_prevents_permission_and_mcp_registration(tmp_path
 
 
 @pytest.mark.asyncio
-async def test_integrated_hands_edit_permission_wire_and_provider_result(
+async def test_daemon_emits_permission_for_every_call_and_stores_no_grant(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture,
 ) -> None:
     """Exercise once-only permission and terminal updates over the public wire."""
@@ -2394,6 +2509,21 @@ async def test_integrated_hands_edit_permission_wire_and_provider_result(
             )
             for tool_id, path, old_text, new_text in next(turns):
                 arguments = {"path": path, "old_text": old_text, "new_text": new_text}
+                if tool_id == "edit-2":
+                    auth.ifc_state.merge(
+                        InformationFlowLabels().with_source(SourceLabel(
+                            principal="external",
+                            domain="client_provider",
+                            resource_id="client-file:taint",
+                            bridge_instance="acp-stdio",
+                            sensitivity="internal",
+                            authorized_principals=frozenset({"operator"}),
+                            source_kind="protected_tool",
+                            integrity="untrusted",
+                            integrity_effect="active_ingest",
+                        )),
+                        fallback=labels,
+                    )
                 messages: list[Any] = [AIMessage(content="", tool_calls=[{
                     "id": tool_id, "name": "hands_edit", "args": arguments,
                 }])]
@@ -2431,13 +2561,17 @@ async def test_integrated_hands_edit_permission_wire_and_provider_result(
 
         monkeypatch.setattr(core, "run_turn", integrated_turn)
 
-        def permission_request(outer_id: int, tool_id: str, path: str, old: str, new: str) -> dict[str, Any]:
+        def permission_request(outer_id: int, tool_id: str, path: str, old: str, new: str, *, tainted: bool = False) -> dict[str, Any]:
+            metadata: dict[str, Any] = {"mimir.wrapper": "hands_edit"}
+            if tainted:
+                metadata["mimir.tainted"] = True
             return {
                 "jsonrpc": "2.0", "id": outer_id,
                 "method": "session/request_permission",
-                "params": {
-                    "sessionId": session_id,
-                    "toolCall": {
+                    "params": {
+                        "sessionId": session_id,
+                    "_meta": metadata,
+                        "toolCall": {
                         "toolCallId": tool_id, "title": "hands_edit", "kind": "other",
                         "status": "pending", "rawInput": {
                             "path": path, "old_text": old, "new_text": new,
@@ -2445,6 +2579,7 @@ async def test_integrated_hands_edit_permission_wire_and_provider_result(
                     },
                     "options": [
                         {"optionId": "allow_once", "name": "Allow once", "kind": "allow_once"},
+                        {"optionId": "allow_session", "name": "Allow for this session", "kind": "allow_always"},
                         {"optionId": "reject_once", "name": "Reject once", "kind": "reject_once"},
                     ],
                 },
@@ -2491,7 +2626,7 @@ async def test_integrated_hands_edit_permission_wire_and_provider_result(
         )
         await transport.incoming.put({
             "jsonrpc": "2.0", "id": 3,
-            "result": {"outcome": {"outcome": "selected", "optionId": "allow_once"}},
+            "result": {"outcome": {"outcome": "selected", "optionId": "allow_session"}},
         })
         provider_frame = await next_outgoing()
         progress_token = provider_frame["params"]["params"]["_meta"]["progressToken"]
@@ -2544,6 +2679,11 @@ async def test_integrated_hands_edit_permission_wire_and_provider_result(
             "status": "completed", "rawOutput": '{"changed": true}',
         }
         assert (await asyncio.wait_for(prompting, 3)).stop_reason == "end_turn"
+        state = agent._sessions[session_id]
+        assert not hasattr(agent, "_permission_grants")
+        assert not hasattr(state, "permission_grants")
+        assert not hasattr(state.record, "permission_grants")
+        assert not hasattr(state.profile_policy, "permission_grants")
 
         prompting_2 = asyncio.create_task(
             agent.prompt(session_id, [sdk.TextContentBlock(type="text", text="edit again")])
@@ -2567,7 +2707,7 @@ async def test_integrated_hands_edit_permission_wire_and_provider_result(
             "rawInput": {"path": "notes-2.txt", "old_text": "old-2", "new_text": "new-2"},
         }
         assert await next_outgoing() == permission_request(
-            5, "edit-2", "notes-2.txt", "old-2", "new-2"
+            5, "edit-2", "notes-2.txt", "old-2", "new-2", tainted=True,
         )
         await transport.incoming.put({
             "jsonrpc": "2.0", "id": 5,
@@ -2689,3 +2829,17 @@ async def test_integrated_hands_edit_permission_wire_and_provider_result(
         await agent.on_transport_closed(peer.peer_generation)
         await connection.close()
         await asyncio.gather(*owned_tasks, return_exceptions=True)
+
+
+test_permission_denial_executes_nothing_and_returns_explainable_failure = (
+    test_admin_hands_permissions_precede_execution_and_preserve_raw_arguments
+)
+
+
+test_permission_metadata_uses_live_ifc_taint = (
+    test_daemon_emits_permission_for_every_call_and_stores_no_grant
+)
+
+test_kernel_spawn_mcp_error_becomes_failed_tool_message = (
+    test_admin_hands_permissions_precede_execution_and_preserve_raw_arguments
+)

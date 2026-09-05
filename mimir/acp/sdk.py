@@ -337,7 +337,7 @@ class RequestPermissionResponse(MetaSchemaModel):
     )
 
 
-PermissionDecision = Literal["allow_once", "reject_once", "cancelled"]
+PermissionDecision = Literal["allow_once", "allow_session", "reject_once", "cancelled"]
 
 
 @dataclass(frozen=True, slots=True)
@@ -346,6 +346,8 @@ class PermissionSnapshot:
     title: str
     kind: str
     raw_input: Mapping[str, Any]
+    wrapper_name: str | None = None
+    tainted: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -355,7 +357,7 @@ class PermissionCompletion:
 
     @property
     def executable(self) -> bool:
-        return self.decision == "allow_once" and self.error is None
+        return self.decision in {"allow_once", "allow_session"} and self.error is None
 
 
 @runtime_checkable
@@ -427,9 +429,10 @@ def permission_request_params(
         or not isinstance(snapshot.title, str)
         or not isinstance(snapshot.kind, str)
         or not isinstance(snapshot.raw_input, Mapping)
+        or not isinstance(snapshot.tainted, bool)
     ):
         raise AcpProtocolError("Malformed permission lifecycle snapshot")
-    return {
+    result = {
         "sessionId": session_id,
         "toolCall": {
             "toolCallId": snapshot.tool_call_id,
@@ -440,9 +443,19 @@ def permission_request_params(
         },
         "options": [
             {"optionId": "allow_once", "name": "Allow once", "kind": "allow_once"},
+            {"optionId": "allow_session", "name": "Allow for this session", "kind": "allow_always"},
             {"optionId": "reject_once", "name": "Reject once", "kind": "reject_once"},
         ],
     }
+    if snapshot.wrapper_name is not None:
+        if snapshot.wrapper_name not in {"hands_edit", "hands_shell", "hands_python"}:
+            raise AcpProtocolError("Malformed permission lifecycle snapshot")
+        result["_meta"] = {"mimir.wrapper": snapshot.wrapper_name}
+        if snapshot.tainted:
+            result["_meta"]["mimir.tainted"] = True
+    elif snapshot.tainted:
+        raise AcpProtocolError("Malformed permission lifecycle snapshot")
+    return result
 
 
 def validate_acp_mcp_server(value: Any) -> AcpMcpServer:
@@ -475,7 +488,7 @@ def validate_permission_response(value: Any) -> PermissionDecision:
     outcome = response.outcome
     if isinstance(outcome, CancelledPermissionOutcome):
         return "cancelled"
-    if outcome.option_id not in {"allow_once", "reject_once"}:
+    if outcome.option_id not in {"allow_once", "allow_session", "reject_once"}:
         raise AcpProtocolError("Unknown permission option")
     return outcome.option_id
 

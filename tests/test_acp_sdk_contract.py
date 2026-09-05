@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ast
 import asyncio
+import dataclasses
 import inspect
 import io
 import json
@@ -431,7 +432,7 @@ async def test_mcp_response_validation_reuse_and_routing_fail_closed() -> None:
     ]
 
 
-def test_permission_request_is_exact_lifecycle_snapshot() -> None:
+def test_admin_permission_options_are_exact_and_ordered() -> None:
     snapshot = sdk.PermissionSnapshot(
         tool_call_id="tool-7",
         title="Edit local file",
@@ -449,6 +450,7 @@ def test_permission_request_is_exact_lifecycle_snapshot() -> None:
         },
         "options": [
             {"optionId": "allow_once", "name": "Allow once", "kind": "allow_once"},
+            {"optionId": "allow_session", "name": "Allow for this session", "kind": "allow_always"},
             {"optionId": "reject_once", "name": "Reject once", "kind": "reject_once"},
         ],
     }
@@ -458,6 +460,7 @@ def test_permission_request_is_exact_lifecycle_snapshot() -> None:
     "payload,decision",
     [
         ({"outcome": {"outcome": "selected", "optionId": "allow_once"}}, "allow_once"),
+        ({"outcome": {"outcome": "selected", "optionId": "allow_session"}}, "allow_session"),
         (
             {
                 "outcome": {
@@ -474,6 +477,51 @@ def test_permission_request_is_exact_lifecycle_snapshot() -> None:
 )
 def test_permission_response_accepted_shapes(payload: Any, decision: str) -> None:
     assert sdk.validate_permission_response(payload) == decision
+
+
+def test_allow_session_validates_as_current_call_approval() -> None:
+    decision = sdk.validate_permission_response(
+        {"outcome": {"outcome": "selected", "optionId": "allow_session"}}
+    )
+
+    assert decision == "allow_session"
+    assert sdk.PermissionCompletion(decision).executable is True
+
+
+def test_trusted_permission_metadata_is_true_only_and_exact() -> None:
+    base = sdk.PermissionSnapshot(
+        "call", "hands_edit", "other", {"path": "a"}, "hands_edit", False,
+    )
+    assert sdk.permission_request_params("session", base)["_meta"] == {
+        "mimir.wrapper": "hands_edit"
+    }
+    tainted = dataclasses.replace(base, tainted=True)
+    assert sdk.permission_request_params("session", tainted)["_meta"] == {
+        "mimir.wrapper": "hands_edit", "mimir.tainted": True,
+    }
+    with pytest.raises(sdk.AcpProtocolError):
+        sdk.permission_request_params(
+            "session", dataclasses.replace(base, tainted="false")
+        )
+
+
+def test_python_permission_metadata_and_raw_arguments_are_exact() -> None:
+    snapshot = sdk.PermissionSnapshot(
+        "python-call",
+        "hands_python",
+        "other",
+        {"code": "value = 1\nvalue"},
+        "hands_python",
+        False,
+    )
+
+    params = sdk.permission_request_params("session", snapshot)
+
+    assert params["toolCall"]["rawInput"] == {"code": "value = 1\nvalue"}
+    assert params["_meta"] == {"mimir.wrapper": "hands_python"}
+    assert [option["optionId"] for option in params["options"]] == [
+        "allow_once", "allow_session", "reject_once",
+    ]
 
 
 @pytest.mark.parametrize(
@@ -507,6 +555,13 @@ async def test_permission_completion_exposes_cancel_and_errors_without_execution
     allow = await allow_peer.request_tool_permission("s", snapshot)
     assert allow.decision == "allow_once"
     assert allow.executable is True
+    session_peer = sdk.AcpPeer(
+        FakeConnection([{"outcome": {"outcome": "selected", "optionId": "allow_session"}}]),
+        ContractAgent(),
+    )
+    session = await session_peer.request_tool_permission("s", snapshot)
+    assert session.decision == "allow_session"
+    assert session.executable is True
     cancel_peer = sdk.AcpPeer(
         FakeConnection([{"outcome": {"outcome": "cancelled"}}]), ContractAgent()
     )
@@ -527,6 +582,11 @@ async def test_permission_completion_exposes_cancel_and_errors_without_execution
         (
             {"result": {"outcome": {"outcome": "selected", "optionId": "allow_once"}}},
             "allow_once",
+            False,
+        ),
+        (
+            {"result": {"outcome": {"outcome": "selected", "optionId": "allow_session"}}},
+            "allow_session",
             False,
         ),
         (
@@ -575,16 +635,19 @@ async def test_public_connection_permission_completion_correlates_exact_wire_out
                 "status": "pending",
                 "rawInput": {"command": "true"},
             },
-            "options": [
-                {"optionId": "allow_once", "name": "Allow once", "kind": "allow_once"},
-                {"optionId": "reject_once", "name": "Reject once", "kind": "reject_once"},
-            ],
+                "options": [
+                    {"optionId": "allow_once", "name": "Allow once", "kind": "allow_once"},
+                    {"optionId": "allow_session", "name": "Allow for this session", "kind": "allow_always"},
+                    {"optionId": "reject_once", "name": "Reject once", "kind": "reject_once"},
+                ],
         },
     }
     await transport.incoming.put({"jsonrpc": "2.0", "id": emitted["id"], **response})
     completion = await permission_task
     assert completion.decision == decision
-    assert completion.executable is (decision == "allow_once" and not has_error)
+    assert completion.executable is (
+        decision in {"allow_once", "allow_session"} and not has_error
+    )
     if has_error:
         assert isinstance(completion.error, sdk.RequestError)
         assert completion.error.to_error_obj() == response["error"]

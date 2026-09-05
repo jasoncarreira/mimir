@@ -44,12 +44,19 @@ class Profile:
     name: str
     home: Path
     remote: RemoteProfile | None = None
+    timeout_seconds: int = 60
 
     def __post_init__(self) -> None:
         validate_profile_name(self.name)
         home = Path(self.home)
         text = str(home)
         if not PurePosixPath(text).is_absolute() or len(text) > 4096 or _bad_text(text):
+            raise ProfileError()
+        if (
+            isinstance(self.timeout_seconds, bool)
+            or not isinstance(self.timeout_seconds, int)
+            or not 1 <= self.timeout_seconds <= 600
+        ):
             raise ProfileError()
         object.__setattr__(self, "home", home)
 
@@ -117,6 +124,18 @@ class ProfileStore:
         self._write(values)
 
     put = set
+
+    def set_timeout(self, name: str, timeout_seconds: int) -> None:
+        validate_profile_name(name)
+        values = self._read()
+        data = values.get(name)
+        if data is None:
+            raise ProfileError("profile-not-found")
+        profile = self._decode(name, data)
+        values[name] = self._encode(
+            Profile(profile.name, profile.home, profile.remote, timeout_seconds)
+        )
+        self._write(values)
 
     def delete(self, name: str) -> None:
         validate_profile_name(name)
@@ -215,7 +234,7 @@ class ProfileStore:
                 document = json.load(stream, object_pairs_hook=_pairs)
         except ProfileError:
             raise
-        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        except (OSError, UnicodeError, ValueError) as exc:
             raise ProfileError("invalid-profile-store") from exc
         finally:
             if fd >= 0:
@@ -307,14 +326,27 @@ class ProfileStore:
             "host": profile.remote.host, "user": profile.remote.user, "port": profile.remote.port,
             "identityFile": str(profile.remote.identity_file), "knownHostsFile": str(profile.remote.known_hosts_file),
         }
-        return {"home": str(profile.home), "remote": remote}
+        return {
+            "home": str(profile.home),
+            "remote": remote,
+            "timeoutSeconds": profile.timeout_seconds,
+        }
 
     @staticmethod
     def _decode(name: object, data: object) -> Profile:
-        if not isinstance(name, str) or not isinstance(data, dict) or set(data) != {"home", "remote"}:
+        legacy = {"home", "remote"}
+        current = {"home", "remote", "timeoutSeconds"}
+        if not isinstance(name, str) or not isinstance(data, dict) or set(data) not in (legacy, current):
             raise ProfileError()
         home, remote_data = data["home"], data["remote"]
         if not isinstance(home, str): raise ProfileError()
+        timeout_seconds = data.get("timeoutSeconds", 60)
+        if (
+            isinstance(timeout_seconds, bool)
+            or not isinstance(timeout_seconds, int)
+            or not 1 <= timeout_seconds <= 600
+        ):
+            raise ProfileError()
         remote = None
         if remote_data is not None:
             required = {"host", "user", "port", "identityFile", "knownHostsFile"}
@@ -322,7 +354,7 @@ class ProfileStore:
             values = [remote_data[k] for k in ("host", "user", "port", "identityFile", "knownHostsFile")]
             if not all(isinstance(v, str) for v in (values[0], values[1], values[3], values[4])): raise ProfileError()
             remote = RemoteProfile(values[0], values[1], values[2], Path(values[3]), Path(values[4]))
-        return Profile(name, Path(home), remote)
+        return Profile(name, Path(home), remote, timeout_seconds)
 
 
 def profile_json(profile: Profile) -> dict[str, object]:
