@@ -172,12 +172,19 @@ class _PendingSession:
     cwd: str
     server_id: str | None
     session_id: str | None
+    explicit_hands_server_ids: tuple[str, ...]
 
 
 @dataclass(frozen=True, slots=True)
 class _PendingPermission:
     session_id: str
     wrapper_name: str
+    generation: object
+
+
+@dataclass(frozen=True, slots=True)
+class _PendingExplicitConnect:
+    session_id: str
     generation: object
 
 
@@ -314,7 +321,7 @@ class ProxyRouter:
         self._active_sessions: set[str] = set()
         self._client_requests: dict[tuple[type[Any], Any], _PendingSession | None] = {}
         self._daemon_requests: dict[
-            tuple[type[Any], Any], _PendingPermission | None
+            tuple[type[Any], Any], _PendingPermission | _PendingExplicitConnect | None
         ] = {}
         self._local_requests: dict[tuple[type[Any], Any], asyncio.Task[None] | None] = {}
         self._local_sessions: dict[tuple[type[Any], Any], str] = {}
@@ -323,6 +330,8 @@ class ProxyRouter:
         self._server_provider_sessions: dict[str, str] = {}
         self._connection_sessions: dict[str, str] = {}
         self._connection_provider_sessions: dict[str, str] = {}
+        self._explicit_server_sessions: dict[str, str] = {}
+        self._explicit_connection_sessions: dict[str, str] = {}
         self._used_server_ids: set[str] = set()
         self._used_connection_ids: set[str] = set()
         self._local_connections: dict[tuple[type[Any], Any], str] = {}
@@ -342,22 +351,31 @@ class ProxyRouter:
                 return
             if key not in self._daemon_requests:
                 raise ProxyError("unsolicited response")
-            pending_permission = self._daemon_requests.pop(key)
+            pending = self._daemon_requests.pop(key)
             decision = None
-            if pending_permission is not None:
+            if isinstance(pending, _PendingPermission):
                 if (
-                    pending_permission.generation is not self._generation
-                    or pending_permission.session_id not in self._active_sessions
+                    pending.generation is not self._generation
+                    or pending.session_id not in self._active_sessions
                 ):
                     raise ProxyError("stale reserved permission response")
                 decision = _permission_response_decision(message)
+            elif (
+                isinstance(pending, _PendingExplicitConnect)
+                and pending.generation is self._generation
+                and pending.session_id in self._active_sessions
+            ):
+                result = message.get("result")
+                connection_id = result.get("connectionId") if isinstance(result, dict) else None
+                if isinstance(connection_id, str) and connection_id:
+                    self._explicit_connection_sessions[connection_id] = pending.session_id
             await self._write_daemon(message, raw)
             if (
-                pending_permission is not None
+                isinstance(pending, _PendingPermission)
                 and decision == "allow_session"
             ):
                 self._grants.add(
-                    pending_permission.session_id, pending_permission.wrapper_name
+                    pending.session_id, pending.wrapper_name
                 )
             return
         if kind == "notification":
@@ -390,6 +408,17 @@ class ProxyRouter:
             intercepted = await self._route_hosted(message, kind, method, params)
             if intercepted:
                 return
+        if (
+            method == "mcp/disconnect"
+            and kind == "request"
+            and isinstance(params, dict)
+            and set(params) == {"connectionId"}
+        ):
+            connection_id = params.get("connectionId")
+            if isinstance(connection_id, str):
+                session_id = self._explicit_connection_sessions.pop(connection_id, None)
+                if session_id is not None:
+                    self._grants.revoke_session(session_id)
         if kind == "request":
             key = _request_key(message["id"])
             self._register_daemon(key)
@@ -416,6 +445,17 @@ class ProxyRouter:
                     })
                     return
                 self._daemon_requests[key] = pending_permission
+            elif (
+                method == "mcp/connect"
+                and isinstance(params, dict)
+                and set(params) == {"serverId"}
+                and isinstance(params.get("serverId"), str)
+            ):
+                session_id = self._explicit_server_sessions.get(params["serverId"])
+                if session_id is not None:
+                    self._daemon_requests[key] = _PendingExplicitConnect(
+                        session_id, self._generation
+                    )
         await self._write_client(message, raw)
 
     async def wait_failed(self) -> BaseException:
@@ -453,6 +493,11 @@ class ProxyRouter:
         self._server_provider_sessions.clear()
         self._connection_sessions.clear()
         self._connection_provider_sessions.clear()
+        self._explicit_server_sessions.clear()
+        self._explicit_connection_sessions.clear()
+        self._used_server_ids.clear()
+        self._used_connection_ids.clear()
+        self._daemon_tombstones.clear()
 
     def terminate_owned_children(self) -> None:
         self._grants.clear()
@@ -493,7 +538,22 @@ class ProxyRouter:
             await self._retire_session(session_id)
         servers = params.get("mcpServers")
         if "mcpServers" in params and servers != []:
-            return _PendingSession(method, params["cwd"], None, session_id), False
+            explicit_hands_server_ids = (
+                tuple(
+                    server["serverId"]
+                    for server in servers
+                    if isinstance(server, dict)
+                    and server.get("type") == "acp"
+                    and server.get("name") == "mimir-hands"
+                    and isinstance(server.get("serverId"), str)
+                    and server["serverId"]
+                )
+                if isinstance(servers, list)
+                else ()
+            )
+            return _PendingSession(
+                method, params["cwd"], None, session_id, explicit_hands_server_ids
+            ), False
         server_id = self._new_server_id()
         params["mcpServers"] = [{
             "type": "acp",
@@ -503,7 +563,7 @@ class ProxyRouter:
         self._provider.bind_session(server_id, params["cwd"])
         self._server_sessions[server_id] = server_id
         self._server_provider_sessions[server_id] = server_id
-        return _PendingSession(method, params["cwd"], server_id, session_id), True
+        return _PendingSession(method, params["cwd"], server_id, session_id, ()), True
 
     def _new_server_id(self) -> str:
         if len(self._used_server_ids) >= MAX_GENERATION_SERVER_IDS:
@@ -538,6 +598,8 @@ class ProxyRouter:
             if session_id is None:
                 raise ProxyError("invalid frame")
         self._active_sessions.add(session_id)
+        for server_id in pending.explicit_hands_server_ids:
+            self._explicit_server_sessions[server_id] = session_id
         if pending.server_id is None:
             return
         self._server_sessions[pending.server_id] = session_id
@@ -568,6 +630,12 @@ class ProxyRouter:
                 if provider_session_id is not None:
                     await self._provider.cancel_session(provider_session_id)
                     self._provider.revoke_session(provider_session_id)
+        for server_id, owner in tuple(self._explicit_server_sessions.items()):
+            if owner == session_id:
+                self._explicit_server_sessions.pop(server_id, None)
+        for connection_id, owner in tuple(self._explicit_connection_sessions.items()):
+            if owner == session_id:
+                self._explicit_connection_sessions.pop(connection_id, None)
 
     async def _client_notification(self, message: dict[str, Any]) -> None:
         if message["method"] not in {"session/cancel", "session/cancellation"}:
@@ -775,6 +843,11 @@ class ProxyRouter:
         self._server_provider_sessions.clear()
         self._connection_sessions.clear()
         self._connection_provider_sessions.clear()
+        self._explicit_server_sessions.clear()
+        self._explicit_connection_sessions.clear()
+        self._used_server_ids.clear()
+        self._used_connection_ids.clear()
+        self._daemon_tombstones.clear()
         self._generation_cleanup_task = asyncio.create_task(
             self._complete_generation_failure(error)
         )
@@ -905,6 +978,8 @@ async def run_router(
     try:
         done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
         await _raise_completed(done, failure_task)
+        if daemon_task in done:
+            await router.close()
         stream_pending = pending - {failure_task}
         if stream_pending and not (close_on_daemon_exit and daemon_task in done):
             completed, stream_pending = await asyncio.wait(
