@@ -374,7 +374,17 @@ async def test_daemon_eof_retires_generation_before_client_grace(
     )
     daemon_reader.feed_eof()
     async with asyncio.timeout(5):
-        while router._provider._processes or router._provider._python_kernels._processes:
+        while (
+            router._active_sessions
+            or len(router._grants)
+            or router._server_sessions
+            or router._connection_sessions
+            or router._local_requests
+            or router._daemon_requests
+            or router._provider._connections
+            or router._provider._processes
+            or router._provider._python_kernels._processes
+        ):
             await asyncio.sleep(0.01)
     assert not running.done()
     assert router._active_sessions == set()
