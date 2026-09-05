@@ -521,6 +521,72 @@ async def test_daemon_eof_quiesces_inflight_allow_session_response(
 
 
 @pytest.mark.asyncio
+async def test_close_cancels_inflight_allow_session_response_before_clearing_grants() -> None:
+    class Writer:
+        def write(self, data: bytes) -> None:
+            del data
+
+        async def drain(self) -> None:
+            return None
+
+    class BlockingWriter(Writer):
+        def __init__(self) -> None:
+            self.entered = asyncio.Event()
+            self.release = asyncio.Event()
+            self.cancelled = asyncio.Event()
+
+        async def drain(self) -> None:
+            self.entered.set()
+            try:
+                await self.release.wait()
+            except asyncio.CancelledError:
+                self.cancelled.set()
+                raise
+
+    daemon_writer = BlockingWriter()
+    router = ProxyRouter(Writer(), daemon_writer, "secret")
+    router._active_sessions.add("session")
+    request = {
+        "jsonrpc": "2.0",
+        "id": "permission",
+        "method": "session/request_permission",
+        "params": {
+            "sessionId": "session",
+            "toolCall": {
+                "toolCallId": "call",
+                "title": "hands_edit",
+                "kind": "other",
+                "status": "pending",
+                "rawInput": {"path": "note", "old_text": "old", "new_text": "new"},
+            },
+            "options": [
+                {"optionId": "allow_once", "name": "Allow once", "kind": "allow_once"},
+                {"optionId": "allow_session", "name": "Allow for this session", "kind": "allow_always"},
+                {"optionId": "reject_once", "name": "Reject once", "kind": "reject_once"},
+            ],
+            "_meta": {"mimir.wrapper": "hands_edit"},
+        },
+    }
+    await router.route_daemon(request)
+    routing = asyncio.create_task(router.route_client({
+        "jsonrpc": "2.0",
+        "id": "permission",
+        "result": {"outcome": {"outcome": "selected", "optionId": "allow_session"}},
+    }))
+    await asyncio.wait_for(daemon_writer.entered.wait(), 5)
+
+    await asyncio.wait_for(router.close(), 5)
+    assert daemon_writer.cancelled.is_set()
+    assert routing.cancelled()
+    assert router._close_complete is True
+    assert len(router._grants) == 0
+
+    daemon_writer.release.set()
+    await asyncio.sleep(0)
+    assert len(router._grants) == 0
+
+
+@pytest.mark.asyncio
 async def test_daemon_eof_quiesces_inflight_session_transition(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
 ) -> None:

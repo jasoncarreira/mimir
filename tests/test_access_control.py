@@ -13398,7 +13398,11 @@ async def test_public_sync_permission_loop_and_broker_failures_are_denials(
 
 
 @pytest.mark.asyncio
-async def test_public_permission_cannot_elevate_non_admin() -> None:
+@pytest.mark.parametrize("tool_name", ["hands_edit", "hands_shell", "hands_python"])
+@pytest.mark.parametrize("principal_kind", ["non_admin", "service"])
+async def test_public_permission_cannot_elevate_non_admin_or_service_principal(
+    tool_name: str, principal_kind: str,
+) -> None:
     from mimir.tools.budget_gate import BudgetGateMiddleware
     from mimir.tools.client_provider import (
         PermissionDecision,
@@ -13406,11 +13410,29 @@ async def test_public_permission_cannot_elevate_non_admin() -> None:
         set_turn_capability_context,
     )
 
+    arguments = {
+        "hands_edit": {"path": "a", "old_text": "x", "new_text": "y"},
+        "hands_shell": {"command": "printf ok"},
+        "hands_python": {"code": "1 + 1"},
+    }[tool_name]
+    request = _live_permission_request(
+        admin=False, tool_name=tool_name, args=arguments,
+    )
+    if principal_kind == "service":
+        request = _tool_request(
+            replace(
+                request.runtime.context,
+                is_service=True,
+                roles=("service", "admin"),
+            ),
+            tool_name=tool_name,
+            args=arguments,
+        )
     broker = _ImmediatePermissionBroker(PermissionDecision.ALLOW_ONCE)
     token = set_turn_capability_context(_capability_for_broker(broker))
     try:
         result = await BudgetGateMiddleware().awrap_tool_call(
-            _live_permission_request(admin=False), lambda _request: pytest.fail("handler executed"),
+            request, lambda _request: pytest.fail("handler executed"),
         )
     finally:
         reset_turn_capability_context(token)
@@ -13553,6 +13575,56 @@ async def test_public_model_and_tool_hooks_apply_only_acp_override() -> None:
     assert original.system_message.content == "base"
     assert sync_refusal.content == async_refusal.content == "send_message is unavailable on ACP turns; use the ACP bridge"
     assert sync_refusal.status == async_refusal.status == "error"
+    assert broker.calls == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("async_hook", [False, True])
+@pytest.mark.parametrize(
+    "principal_kind", ["non_admin", "service"],
+)
+async def test_admin_hands_identity_gate_precedes_permission_and_provider(
+    monkeypatch: pytest.MonkeyPatch, async_hook: bool, principal_kind: str,
+) -> None:
+    from mimir.tools import budget_gate
+    from mimir.tools.client_provider import (
+        PermissionDecision,
+        reset_turn_capability_context,
+        set_turn_capability_context,
+    )
+
+    broker = _ImmediatePermissionBroker(PermissionDecision.ALLOW_ONCE)
+    request = _live_permission_request(admin=False)
+    if principal_kind == "service":
+        request = _tool_request(
+            replace(
+                request.runtime.context,
+                is_service=True,
+                roles=("service", "admin"),
+            ),
+            tool_name="hands_edit",
+            args={"path": "a", "old_text": "x", "new_text": "y"},
+        )
+    monkeypatch.setattr(
+        budget_gate,
+        "issue_client_authorized_host_execution",
+        lambda **_kwargs: pytest.fail("host-execution token issued"),
+    )
+    token = set_turn_capability_context(_capability_for_broker(broker))
+    try:
+        middleware = budget_gate.BudgetGateMiddleware()
+        if async_hook:
+            result = await middleware.awrap_tool_call(
+                request, lambda _request: pytest.fail("provider executed"),
+            )
+        else:
+            result = middleware.wrap_tool_call(
+                request, lambda _request: pytest.fail("provider executed"),
+            )
+    finally:
+        reset_turn_capability_context(token)
+
+    assert result.status == "error"
     assert broker.calls == []
 
 
@@ -14202,6 +14274,55 @@ async def test_only_admitted_acp_admin_hands_get_client_authorized_operation(
     assert allowed_python.content == "python"
 
 
+@pytest.mark.parametrize("mismatch", ["request", "generation", "epoch"])
+def test_stale_or_forged_hands_authorization_keeps_untrusted_ingest_veto(
+    mismatch: str,
+) -> None:
+    from mimir.models import InformationFlowState
+    from mimir.tools.client_provider import (
+        issue_client_authorized_host_execution,
+        reset_turn_capability_context,
+        set_turn_capability_context,
+    )
+
+    auth = _tainted_admin_operator_write_auth()
+    auth = replace(auth, ifc_state=InformationFlowState(labels=auth.ifc_labels))
+    broker = _ImmediatePermissionBroker(object())
+    context = _capability_for_broker(broker)
+    request = object()
+    token = set_turn_capability_context(context)
+    try:
+        host_execution = issue_client_authorized_host_execution(
+            request_identity=request,
+            auth_context_identity=auth,
+            wrapper_name="hands_shell",
+            tainted=True,
+        )
+        assert host_execution is not None
+        live_request = request
+        if mismatch == "request":
+            live_request = object()
+        elif mismatch == "generation":
+            context.lease.generation += 1
+        else:
+            context.lease.epoch += 1
+        decision = SinkGate.check_sink_flow(
+            "hands_shell",
+            "printf hands",
+            auth.ifc_labels,
+            auth,
+            enforce=True,
+            sink_category=SinkCategory.SHELL_PROCESS,
+            client_authorized_host_execution=host_execution,
+            request_identity=live_request,
+        )
+    finally:
+        reset_turn_capability_context(token)
+
+    assert decision.allowed is False
+    assert decision.reason == "ifc_label_blocked:shell_process"
+
+
 def test_non_hands_native_sink_inventory_keeps_untrusted_ingest_veto(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -14443,16 +14564,13 @@ async def test_shell_exec_policy_and_execution_are_unchanged(
 @pytest.mark.parametrize(
     "arguments",
     [
-        {},
         {"path": "a", "old_text": "x"},
         {"path": "a", "old_text": "x", "new_text": "y", "extra": "z"},
         {"path": "a", "old_text": "x", "new_text": 7},
-        {"path": "a", "oldText": "x", "newText": "y"},
-        {"path": "a", "old_text": "x", "new_text": "y", "_meta": {"mimir.tainted": True}},
-        {"path": "a", "old_text": "x", "new_text": "y", "mimir_direct_argv": ["true"]},
     ],
+    ids=["missing-key", "extra-key", "non-string"],
 )
-async def test_admin_hands_exact_schema_precedes_screen_marker_permission_and_execution(
+async def test_budget_gate_directly_rejects_nonexact_hands_arguments(
     monkeypatch: pytest.MonkeyPatch,
     async_hook: bool,
     arguments: dict[str, object],

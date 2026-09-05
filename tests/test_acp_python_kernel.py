@@ -173,6 +173,7 @@ async def test_exception_utf8_bound_and_omitted_byte_count_are_exact(
 async def test_timeout_and_crash_discard_namespace(tmp_path: Path) -> None:
     manager = PythonKernelManager()
     try:
+        assert (await manager.execute("timeout", tmp_path, "1", 5))["ok"] is True
         timed_out = await manager.execute(
             "timeout", tmp_path, "import time\nmarker = 1\ntime.sleep(5)", 0.1
         )
@@ -203,6 +204,7 @@ async def test_timeout_and_crash_discard_namespace(tmp_path: Path) -> None:
 async def test_timeout_and_crash_retain_streams_exactly(tmp_path: Path) -> None:
     manager = PythonKernelManager()
     try:
+        assert (await manager.execute("timeout", tmp_path, "1", 5))["ok"] is True
         timed_out = await manager.execute(
             "timeout",
             tmp_path,
