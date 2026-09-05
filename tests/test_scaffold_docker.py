@@ -400,7 +400,7 @@ def test_render_dockerfile_is_structurally_parseable(mode, install_opencode):
 
 def test_render_dockerfile_installs_opencode_when_enabled():
     """install_opencode=True adds the OpenCode runtime install to both modes."""
-    assert FACTORY_VERSION == "0.8.2"
+    assert FACTORY_VERSION == "0.8.3"
     for mode in ("workspace", "pypi"):
         out = render_dockerfile([], mode=mode, install_opencode=True)
         assert "npm install --global --prefix /opt/mimir-opencode" in out, mode

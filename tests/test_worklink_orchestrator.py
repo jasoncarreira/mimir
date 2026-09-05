@@ -4706,6 +4706,7 @@ def _factory_lifecycle_status(
     lock: str = "fresh",
     session: str | None = "session-1",
     pr_base: str | None = "main",
+    park_snapshot: str | None = None,
 ) -> Any:
     return parse_factory_status(
         {
@@ -4727,6 +4728,7 @@ def _factory_lifecycle_status(
             "validator": None,
             "pr_url": None,
             "terminal_result": None,
+            "park_snapshot": park_snapshot,
             "next": "implementation",
         }
     )
@@ -5066,8 +5068,20 @@ def test_factory_status_binding_refuses_pre_manifest_diagnostic(tmp_path: Path) 
         orchestrator._require_factory_status(status, record)
 
 
-def test_factory_supervision_drains_exact_handle_while_status_is_polled(
+@pytest.mark.parametrize(
+    ("park_snapshot", "expected_report"),
+    [
+        (None, "no control-plane snapshot published"),
+        (
+            "/operator/.factory/.parked/700",
+            "control-plane snapshot: /operator/.factory/.parked/700",
+        ),
+    ],
+)
+def test_factory_supervision_records_and_reports_park_snapshot(
     tmp_path: Path,
+    park_snapshot: str | None,
+    expected_report: str,
 ) -> None:
     sandbox = tmp_path / "sandbox"
     sandbox.mkdir()
@@ -5076,6 +5090,7 @@ def test_factory_supervision_drains_exact_handle_while_status_is_polled(
     cancelled = asyncio.Event()
     waited: list[tuple[LaunchHandle, int]] = []
     lifecycle: list[tuple[str, LaunchHandle]] = []
+    chainlink_calls: list[list[str]] = []
 
     class Compute:
         async def wait(self, selected: LaunchHandle, timeout_s: int) -> ComputeResult:
@@ -5099,7 +5114,11 @@ def test_factory_supervision_drains_exact_handle_while_status_is_polled(
 
         def status(self, *args: object, **kwargs: object) -> Any:
             assert wait_started.wait(1)
-            return _factory_lifecycle_status(sandbox, status="needs-human")
+            return _factory_lifecycle_status(
+                sandbox,
+                status="needs-human",
+                park_snapshot=park_snapshot,
+            )
 
         def heartbeat(self, *args: object, **kwargs: object) -> None:
             return None
@@ -5108,7 +5127,10 @@ def test_factory_supervision_drains_exact_handle_while_status_is_polled(
         WorklinkRunner(home=tmp_path, repo=tmp_path)._supervise_factory_070(
             issue=IssueContext(700, "epic", "build", {"worklink:epic"}),
             claim_record=ClaimRecord(700, 1, "agent", datetime.now(UTC)),
-            claims=_FactoryLifecycleClaims(),
+            claims=ChainlinkClaims(
+                agent_id="agent",
+                runner=lambda args: chainlink_calls.append(args) or cp(args),
+            ),
             backend=Backend(),
             compute=Compute(),
             factory_record=_factory_lifecycle_record(sandbox, handle),
@@ -5119,6 +5141,14 @@ def test_factory_supervision_drains_exact_handle_while_status_is_polled(
     )
 
     assert result.status == "needs-human"
+    retained = load_factory_record(tmp_path, "700")
+    assert retained is not None
+    assert retained.controller_phase == "parked"
+    assert retained.status is not None
+    assert retained.status.park_snapshot == park_snapshot
+    comments = [call[4] for call in chainlink_calls if call[1:3] == ["issue", "comment"]]
+    assert comments == [f"WORKLINK_BLOCKED {result.reason}"]
+    assert expected_report in comments[0]
     assert waited and waited[0][0] == handle
     assert lifecycle == [("cancel", handle), ("cleanup", handle)]
 
@@ -5861,7 +5891,7 @@ def test_factory_needs_human_transitions_epic_to_parked_tracker_state(
                 "status": "blocked",
                 "review_ready": False,
                 "attempt": 1,
-                "reason": "factory run is parked",
+                "reason": "factory run is parked; no control-plane snapshot published",
             },
         )
     ]
