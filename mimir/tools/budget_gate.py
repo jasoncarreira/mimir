@@ -2743,6 +2743,21 @@ class BudgetGateMiddleware(AgentMiddleware):
         hands_candidate = _admitted_admin_hands_candidate(
             request, tool_name, auth_context, validated_arguments,
         )
+        if (
+            tool_name in {"hands_edit", "hands_shell", "hands_python"}
+            and not hands_candidate
+        ):
+            denial = f"{tool_name} requires an admitted admin ACP Hands principal"
+            _emit_tool_call_sync(
+                tool_name, ok=False, error=denial, denied=True,
+                arguments=validated_arguments,
+            )
+            return ToolMessage(
+                content=denial,
+                tool_call_id=_tool_call_id(request),
+                name=tool_name,
+                status="error",
+            )
         ifc_labels = _current_ifc_labels(auth_context)
         operator_shell_preparation = _prepare_operator_shell_execution(
             request, tool_name, auth_context, ifc_labels,
@@ -3259,6 +3274,21 @@ class BudgetGateMiddleware(AgentMiddleware):
         hands_candidate = _admitted_admin_hands_candidate(
             request, tool_name, auth_context, validated_arguments,
         )
+        if (
+            tool_name in {"hands_edit", "hands_shell", "hands_python"}
+            and not hands_candidate
+        ):
+            denial = f"{tool_name} requires an admitted admin ACP Hands principal"
+            _emit_tool_call_sync(
+                tool_name, ok=False, error=denial, denied=True,
+                arguments=validated_arguments,
+            )
+            return ToolMessage(
+                content=denial,
+                tool_call_id=_tool_call_id(request),
+                name=tool_name,
+                status="error",
+            )
         ifc_labels = _current_ifc_labels(auth_context)
         operator_shell_preparation = _prepare_operator_shell_execution(
             request, tool_name, auth_context, ifc_labels,
