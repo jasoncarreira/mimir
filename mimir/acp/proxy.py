@@ -346,13 +346,26 @@ class ProxyRouter:
         self._local_connections: dict[tuple[type[Any], Any], str] = {}
         self._client_lock = asyncio.Lock()
         self._daemon_lock = asyncio.Lock()
+        self._close_lock = asyncio.Lock()
+        self._client_routes: set[asyncio.Task[Any]] = set()
         self._failure: asyncio.Future[BaseException] = asyncio.get_running_loop().create_future()
         self._generation_cleanup_task: asyncio.Task[None] | None = None
         self._closed = False
+        self._close_complete = False
         self._generation_failed = False
 
     async def route_client(self, message: dict[str, Any], raw: bytes | None = None) -> None:
         self._require_open()
+        task = asyncio.current_task()
+        if task is None:
+            raise RuntimeError("client routing requires an asyncio task")
+        self._client_routes.add(task)
+        try:
+            await self._route_client(message, raw)
+        finally:
+            self._client_routes.discard(task)
+
+    async def _route_client(self, message: dict[str, Any], raw: bytes | None = None) -> None:
         kind = _message_kind(message)
         if kind == "response":
             key = _request_key(message["id"])
@@ -482,38 +495,40 @@ class ProxyRouter:
             raise ProxyError("proxy generation is closed")
 
     async def close(self) -> None:
-        if self._closed:
-            if (
-                self._generation_cleanup_task is not None
-                and self._generation_cleanup_task is not asyncio.current_task()
-            ):
+        async with self._close_lock:
+            if self._close_complete:
+                return
+            self._closed = True
+            current = asyncio.current_task()
+            routes = tuple(task for task in self._client_routes if task is not current)
+            for task in routes:
+                task.cancel()
+            await asyncio.gather(*routes, return_exceptions=True)
+            self._grants.clear()
+            self._active_sessions.clear()
+            tasks = tuple(task for task in self._local_requests.values() if task is not None)
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            self._local_requests.clear()
+            self._local_sessions.clear()
+            self._local_connections.clear()
+            if self._generation_cleanup_task is None:
+                await self._provider.close()
+            elif self._generation_cleanup_task is not asyncio.current_task():
                 await asyncio.shield(self._generation_cleanup_task)
-            return
-        self._closed = True
-        self._grants.clear()
-        self._active_sessions.clear()
-        tasks = tuple(task for task in self._local_requests.values() if task is not None)
-        for task in tasks:
-            task.cancel()
-        await asyncio.gather(*tasks, return_exceptions=True)
-        self._local_requests.clear()
-        self._local_sessions.clear()
-        self._local_connections.clear()
-        if self._generation_cleanup_task is None:
-            await self._provider.close()
-        elif self._generation_cleanup_task is not asyncio.current_task():
-            await asyncio.shield(self._generation_cleanup_task)
-        self._client_requests.clear()
-        self._daemon_requests.clear()
-        self._server_sessions.clear()
-        self._server_provider_sessions.clear()
-        self._connection_sessions.clear()
-        self._connection_provider_sessions.clear()
-        self._explicit_server_sessions.clear()
-        self._explicit_connection_sessions.clear()
-        self._used_server_ids.clear()
-        self._used_connection_ids.clear()
-        self._daemon_tombstones.clear()
+            self._client_requests.clear()
+            self._daemon_requests.clear()
+            self._server_sessions.clear()
+            self._server_provider_sessions.clear()
+            self._connection_sessions.clear()
+            self._connection_provider_sessions.clear()
+            self._explicit_server_sessions.clear()
+            self._explicit_connection_sessions.clear()
+            self._used_server_ids.clear()
+            self._used_connection_ids.clear()
+            self._daemon_tombstones.clear()
+            self._close_complete = True
 
     def terminate_owned_children(self) -> None:
         self._grants.clear()
@@ -947,6 +962,11 @@ async def _route_stream(reader: Any, route: Any) -> None:
             await route(message, raw + b"\n")
 
 
+async def _wait_for_eof(reader: Any) -> None:
+    while await reader.read(64 * 1024):
+        pass
+
+
 async def _raise_completed(
     completed: set[asyncio.Task[Any]], failure_task: asyncio.Task[BaseException]
 ) -> None:
@@ -1015,8 +1035,19 @@ async def run_router(
         done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
         await _raise_completed(done, failure_task)
         if daemon_task in done:
+            client_was_pending = client_task in pending
+            if client_was_pending:
+                client_task.cancel()
+                await asyncio.gather(client_task, return_exceptions=True)
             await router.close()
-        stream_pending = pending - {failure_task}
+            if client_was_pending and not close_on_daemon_exit:
+                peer_task = asyncio.create_task(_wait_for_eof(client_reader))
+                tasks.add(peer_task)
+                stream_pending = {peer_task}
+            else:
+                stream_pending = set()
+        else:
+            stream_pending = pending - {failure_task}
         if stream_pending and not (close_on_daemon_exit and daemon_task in done):
             completed, stream_pending = await asyncio.wait(
                 stream_pending | {failure_task}, timeout=PEER_EOF_GRACE_TIMEOUT,
