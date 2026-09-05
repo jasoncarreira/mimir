@@ -8,6 +8,8 @@ All notable changes will land here. Format loosely follows
 
 - Upgrade `feature-factory` and `opencode-feature-factory` to 0.8.3 for the ordered
   park sequence, and surface its `park_snapshot` in parked-run records and reports.
+- Upgrade `feature-factory` and `opencode-feature-factory` to 0.8.2, carrying
+  diagnostic control-plane snapshots for parked runs.
 - Upgrade `feature-factory` and `opencode-feature-factory` to 0.8.1, which moves
   repository resolver intake before run initialization so rendered work-item
   context is available before a run ID is allocated.
