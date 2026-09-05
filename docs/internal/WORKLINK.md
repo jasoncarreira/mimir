@@ -56,8 +56,8 @@ The in-mimir integrated-epic runner — brief → `work-decomposer` → `decompo
 `integration-validator` → one final draft PR — **was removed in #830** after the
 epic #783 arc concluded (every failure was distribution tax in that layer).
 
-Epics are built by `feature-factory@0.8.2` through the lockstep
-`opencode-feature-factory@0.8.2` adapter. OpenCode's `/feature` workflow owns
+Epics are built by `feature-factory@0.8.3` through the lockstep
+`opencode-feature-factory@0.8.3` adapter. OpenCode's `/feature` workflow owns
 factory transitions. Worklink owns the outer Chainlink claim, isolated attempt
 checkout, OpenCode process, restart record, status observation, repository tests,
 and final PR identity verification.
@@ -100,14 +100,15 @@ and final PR identity verification.
   rather than one being preferred, and a missing `GITHUB_TOKEN` fails naming that
   variable - in both cases without disclosing values.
 - **Controls**: Every control is `node <absolute feature-factory/bin/factory.js>`.
-  Worklink admits the launcher only after package/adapter 0.8.2 verification and
+  Worklink admits the launcher only after package/adapter 0.8.3 verification and
   all 16 nonmutating structural command probes. Status is read with `status
   <run-id> --repo <sandbox> --json`; resume and heartbeat reuse the retained
   session; lock actions use `lock <run-id> <claim|steal|release> --session
   <session> --repo <sandbox>`.
 - **Status contract**: Factory status responses are bounded whole JSON payloads
   with required, typed known fields; additive top-level fields are ignored.
-  `issue_key`, `pr_base`, `lock_session`, and `pr_url` are string-or-null, while
+  `issue_key`, `pr_base`, `lock_session`, and `pr_url` are string-or-null;
+  `park_snapshot` is string-or-null and may be absent in an older status, while
   `validator` and `terminal_result` are object-or-null. Binding a status to a
   Worklink record uses the run ID as identity; the issue key is optional display enrichment. A null PR base is
   allowed during recovery and ordinary running, parked, blocked, or partial
@@ -142,10 +143,11 @@ and final PR identity verification.
   default/fallback `1`; leaf concurrency remains `2`. The 12-hour timeout is a
   process liveness backstop. The 900-second stale threshold emits diagnostics
   only and never dispatches, steals, cancels, or deletes work.
-- **Recovery**: A parked or interrupted run retains its sandbox. A parked run also
-  leaves a diagnostic control-plane snapshot at `<operator root>/.factory/.parked/<run-id>`;
-  Worklink never removes it. The snapshot is not resumable: recovery uses the
-  retained sandbox manifest. Recovery binds
+- **Recovery**: A parked or interrupted run retains its sandbox. The parked report
+  includes the `park_snapshot` path when the factory published a complete current
+  diagnostic control-plane snapshot at `<operator root>/.factory/.parked/<run-id>`;
+  Worklink never removes it. A null snapshot means the sandbox manifest is the only copy.
+  The snapshot is not resumable: recovery uses the retained sandbox manifest. Recovery binds
   the retained identities, including resolving a factory clone through its local
   lease checkout, reads status, obtains a run-ID-first lock only when justified,
   rereads owner/history, and resumes and relaunches OpenCode with one session
@@ -517,7 +519,7 @@ require touching the orchestrator.
 | Adapter | Invocation sketch | Notes |
 |---|---|---|
 | `opencode` | `opencode run --dir <checkout> -- <prompt>` | Sole coding backend for leaf issues; provider and model are selected by opencode configuration/arguments. |
-| `feature_factory` | `opencode run ... --command feature " --autonomous --max-retries 5 <issue>"` | Epic adapter with Worklink-supervised OpenCode and absolute 0.8.2 controls. |
+| `feature_factory` | `opencode run ... --command feature " --autonomous --max-retries 5 <issue>"` | Epic adapter with Worklink-supervised OpenCode and absolute 0.8.3 controls. |
 
 Selection is config, not code (§7): per repo / label / issue-type, with
 a per-category default. The executor consults `Caps` rather than

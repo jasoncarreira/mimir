@@ -68,7 +68,7 @@ ENV NODE_VERSION=22
 ENV MIMIR_FACTORY_ENTRYPOINT=/opt/mimir-opencode/lib/node_modules/feature-factory/bin/factory.js
 ENV PATH="/opt/mimir-opencode/bin:${PATH}"
 ARG MIMIR_ENABLE_OPENCODE=0
-ARG FACTORY_VERSION=0.8.2
+ARG FACTORY_VERSION=0.8.3
 RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates curl gnupg git jq procps ripgrep xz-utils \
         poppler-utils tesseract-ocr tesseract-ocr-eng \
