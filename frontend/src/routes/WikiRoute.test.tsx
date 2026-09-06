@@ -3,7 +3,7 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { readFileSync } from "node:fs";
 import React from "react";
-import { createMemoryRouter, MemoryRouter, Route, RouterProvider, Routes } from "react-router-dom";
+import { MemoryRouter, Route, Routes, useLocation, useNavigate } from "react-router-dom";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { normalizeWikiIndexPayload } from "../api/wiki";
 import type { DashboardSurface } from "../dashboardExtensions";
@@ -256,11 +256,20 @@ describe("WikiRoute", () => {
         const page = pages.find((item) => decodeURIComponent(url).endsWith(item.path.slice(0, -3))) ?? pages[0];
         return jsonResponse(envelope({ ...page, markdown: `Content for ${page.title}` }));
       }));
-      const router = createMemoryRouter([{ path: "/wiki", element: <WikiRoute surface={surface} /> }], {
-        initialEntries: ["/wiki?q=page&category=concepts&pane=list"]
-      });
+      let location!: ReturnType<typeof useLocation>;
+      let navigate!: ReturnType<typeof useNavigate>;
+      // Avoid the data router's Node Request/jsdom AbortSignal mismatch while
+      // retaining real URL state and Back/Forward navigation.
+      function HistoryProbe() {
+        location = useLocation();
+        navigate = useNavigate();
+        return null;
+      }
       render(<QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}>
-        <RouterProvider router={router} />
+        <MemoryRouter initialEntries={["/wiki?q=page&category=concepts&pane=list"]}>
+          <HistoryProbe />
+          <Routes><Route path="/wiki" element={<WikiRoute surface={surface} />} /></Routes>
+        </MemoryRouter>
       </QueryClientProvider>);
       const nav = await screen.findByRole("navigation", { name: "Wiki pages" });
       expect(document.activeElement).toBe(document.body);
@@ -274,10 +283,10 @@ describe("WikiRoute", () => {
       selected.focus();
       const focus = vi.spyOn(selected, "focus");
       scroll.mockClear();
-      // Flush RouterProvider's asynchronous navigation before observing query content.
+      // Flush navigation and focus effects before observing query content.
       await act(async () => { fireEvent.click(selected.querySelector("span")!); });
       await screen.findByText("Content for Page 143");
-      const detailSearch = router.state.location.search;
+      const detailSearch = location.search;
       expect(new URLSearchParams(detailSearch).get("slug")).toBe("concepts/page-143");
       expect(new URLSearchParams(detailSearch).has("pane")).toBe(false);
 
@@ -287,9 +296,9 @@ describe("WikiRoute", () => {
         expect(selected.getAttribute("aria-current")).toBe("true");
         expect((screen.getByLabelText("Search wiki pages") as HTMLInputElement).value).toBe("page");
         expect((screen.getByLabelText("Filter wiki category") as HTMLSelectElement).value).toBe("concepts");
-        expect(new URLSearchParams(router.state.location.search).get("q")).toBe("page");
-        expect(new URLSearchParams(router.state.location.search).get("category")).toBe("concepts");
-        expect(new URLSearchParams(router.state.location.search).get("slug")).toBe("concepts/page-143");
+        expect(new URLSearchParams(location.search).get("q")).toBe("page");
+        expect(new URLSearchParams(location.search).get("category")).toBe("concepts");
+        expect(new URLSearchParams(location.search).get("slug")).toBe("concepts/page-143");
         expect(document.activeElement).toBe(width <= 720 && inDetail ? heading : selected);
         if (width <= 720) {
           expect(scroll.mock.contexts.at(-1)).toBe(inDetail ? detail : sidebar);
@@ -311,12 +320,12 @@ describe("WikiRoute", () => {
         expect(document.activeElement).toBe(returnButton);
       }
       await act(async () => { fireEvent.click(screen.getByRole("button", { name: "Back to pages" })); });
-      expect(new URLSearchParams(router.state.location.search).get("pane")).toBe("list");
+      expect(new URLSearchParams(location.search).get("pane")).toBe("list");
       assertPosition(false);
-      await act(async () => { await router.navigate(-1); });
-      expect(router.state.location.search).toBe(detailSearch);
+      await act(async () => { await navigate(-1); });
+      expect(location.search).toBe(detailSearch);
       assertPosition(true);
-      await act(async () => { await router.navigate(1); });
+      await act(async () => { await navigate(1); });
       assertPosition(false);
       expect(matchMedia).toHaveBeenCalledWith("(max-width: 720px)");
     }

@@ -2,7 +2,7 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { act, cleanup, fireEvent, render, screen, within } from "@testing-library/react";
 import React from "react";
-import { createMemoryRouter, MemoryRouter, Route, RouterProvider, Routes } from "react-router-dom";
+import { MemoryRouter, Route, Routes, useLocation, useNavigate, useNavigationType } from "react-router-dom";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { StateMemoryRoute } from "./StateMemoryRoute";
 import type { DashboardSurface } from "../dashboardExtensions";
@@ -89,17 +89,28 @@ describe("StateMemoryRoute", () => {
         }, { total: 2 }));
         return jsonResponse(envelope({ path: params.get("path"), content: "File content", size: 10, modified: null }));
       }));
-      const router = createMemoryRouter([{ path: "/state-memory", element: <StateMemoryRoute surface={surface} /> }], {
-        initialEntries: ["/state-memory"]
-      });
-      const initialKey = router.state.location.key;
+      let location!: ReturnType<typeof useLocation>;
+      let navigate!: ReturnType<typeof useNavigate>;
+      let historyAction!: ReturnType<typeof useNavigationType>;
+      // Use the same declarative router as the other route tests: the data
+      // router constructs Node Requests with incompatible jsdom AbortSignals.
+      function HistoryProbe() {
+        location = useLocation();
+        navigate = useNavigate();
+        historyAction = useNavigationType();
+        return null;
+      }
       render(<QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}>
-        <RouterProvider router={router} />
+        <MemoryRouter initialEntries={["/state-memory"]}>
+          <HistoryProbe />
+          <Routes><Route path="/state-memory" element={<StateMemoryRoute surface={surface} />} /></Routes>
+        </MemoryRouter>
       </QueryClientProvider>);
+      const initialKey = location.key;
       await screen.findByRole("heading", { name: "memory/INDEX.md" });
-      expect(router.state.location.search).toBe("");
-      expect(router.state.location.key).toBe(initialKey);
-      expect(router.state.historyAction).toBe("POP");
+      expect(location.search).toBe("");
+      expect(location.key).toBe(initialKey);
+      expect(historyAction).toBe("POP");
       const heading = screen.getByRole("heading", { name: "Detail", level: 2 });
       const detailFocus = vi.spyOn(heading, "focus");
       const detail = heading.closest<HTMLElement>("[data-browser-detail]")!;
@@ -119,10 +130,10 @@ describe("StateMemoryRoute", () => {
         origin.focus();
         const focus = vi.spyOn(origin, "focus");
         scroll.mockClear();
-        // Flush RouterProvider's asynchronous navigation before observing query content.
+        // Flush navigation and focus effects before observing query content.
         await act(async () => { fireEvent.click(origin.querySelector("span")!); });
         await screen.findByRole("heading", { name: files[143].path });
-        const detailSearch = router.state.location.search;
+        const detailSearch = location.search;
         expect(new URLSearchParams(detailSearch).get("path")).toBe(files[143].path);
         expect(new URLSearchParams(detailSearch).has("pane")).toBe(false);
         function assertPosition(inDetail: boolean) {
@@ -130,8 +141,8 @@ describe("StateMemoryRoute", () => {
           expect(origin.isConnected).toBe(true);
           expect(sidebar.scrollTop).toBe(3100);
           expect((screen.getByLabelText("Search state and memory files") as HTMLInputElement).value).toBe(query);
-          expect(new URLSearchParams(router.state.location.search).get("q") ?? "").toBe(query);
-          expect(new URLSearchParams(router.state.location.search).get("path")).toBe(files[143].path);
+          expect(new URLSearchParams(location.search).get("q") ?? "").toBe(query);
+          expect(new URLSearchParams(location.search).get("path")).toBe(files[143].path);
           expect(document.activeElement).toBe(width <= 720 && inDetail ? heading : origin);
           if (width <= 720) {
             expect(scroll.mock.contexts.at(-1)).toBe(inDetail ? detail : sidebar);
@@ -159,12 +170,12 @@ describe("StateMemoryRoute", () => {
           expect(document.activeElement).toBe(returnButton);
         }
         await act(async () => { fireEvent.click(screen.getByRole("button", { name: "Back to files" })); });
-        expect(new URLSearchParams(router.state.location.search).get("pane")).toBe("list");
+        expect(new URLSearchParams(location.search).get("pane")).toBe("list");
         assertPosition(false);
-        await act(async () => { await router.navigate(-1); });
-        expect(router.state.location.search).toBe(detailSearch);
+        await act(async () => { await navigate(-1); });
+        expect(location.search).toBe(detailSearch);
         assertPosition(true);
-        await act(async () => { await router.navigate(1); });
+        await act(async () => { await navigate(1); });
         assertPosition(false);
       }
       await journey(within(nav).getByRole("button", { name: "note-143.md" }), "");
