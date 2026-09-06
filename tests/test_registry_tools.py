@@ -728,6 +728,26 @@ class TestTriggerPseudoChannels:
         )
         assert not decision.allowed
 
+    @pytest.mark.parametrize("case", ["operator", "other-channel", "unset", "react"])
+    def test_channel_adapter_admits_only_the_exact_operator_channel(self, monkeypatch, alert_turn, case):
+        """The adapter clause itself must be exact; the IFC gate behind it is defense in depth."""
+        from mimir.access_control import ChannelResourceAdapter
+
+        auth = alert_turn.auth_context
+        tool_name = "react" if case == "react" else "send_message"
+        destination = "discord-other" if case == "other-channel" else "discord-operator"
+        if case == "unset":
+            monkeypatch.delenv("MIMIR_OPERATOR_ALERT_CHANNEL")
+        decision = ChannelResourceAdapter.authorize_channel_operation(
+            tool_name, destination, auth, enforce=True,
+        )
+        if case == "operator":
+            assert decision.allowed is True
+            assert decision.reason == "configured_operator_channel"
+        else:
+            assert decision.allowed is False
+            assert decision.reason == "cross_channel_scope"
+
     @pytest.mark.asyncio
     @pytest.mark.parametrize("tool", [send_message, react])
     @pytest.mark.parametrize("configured", [False, True])
