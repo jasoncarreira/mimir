@@ -886,18 +886,29 @@ async def test_load_always_retires_hosted_state_and_failed_provisional_state(tmp
     try:
         await router.route_client({
             "jsonrpc": "2.0", "id": "load", "method": "session/load", "params": {
-                "cwd": str(tmp_path), "sessionId": "session",
-                "mcpServers": [{"type": "acp", "name": "other", "serverId": "foreign"}],
+                "cwd": str(tmp_path), "sessionId": "session", "mcpServers": [],
             },
         })
+        replacement_server_id = messages(daemon)[-1]["params"]["mcpServers"][0]["serverId"]
+        replacement_connection_id = await connect_hosted(
+            router, daemon, replacement_server_id, 20
+        )
+        assert replacement_connection_id != connection_id
+        await router.route_daemon({
+            "jsonrpc": "2.0", "id": 22, "method": "mcp/disconnect",
+            "params": {"connectionId": connection_id},
+        })
+        assert messages(daemon)[-1] == {"jsonrpc": "2.0", "id": 22, "result": {}}
+        assert replacement_connection_id in router._connection_sessions
         with pytest.raises(ProxyError, match="stale hosted connection ID"):
             await router.route_daemon({
-                "jsonrpc": "2.0", "id": 20, "method": "mcp/message",
+                "jsonrpc": "2.0", "id": 23, "method": "mcp/message",
                 "params": {"connectionId": connection_id, "method": "tools/list"},
             })
+        assert replacement_connection_id in router._connection_sessions
         with pytest.raises(ProxyError, match="stale hosted server ID"):
             await router.route_daemon({
-                "jsonrpc": "2.0", "id": 21, "method": "mcp/connect",
+                "jsonrpc": "2.0", "id": 24, "method": "mcp/connect",
                 "params": {"serverId": server_id},
             })
         await router.route_client({
@@ -910,7 +921,7 @@ async def test_load_always_retires_hosted_state_and_failed_provisional_state(tmp
         })
         with pytest.raises(ProxyError, match="stale hosted server ID"):
             await router.route_daemon({
-                "jsonrpc": "2.0", "id": 22, "method": "mcp/connect",
+                "jsonrpc": "2.0", "id": 25, "method": "mcp/connect",
                 "params": {"serverId": failed_server},
             })
         assert messages(client)[-1]["error"]["message"] == "failed"
@@ -1132,11 +1143,11 @@ async def test_typed_directional_ids_boolean_rejection_and_hosted_cancellation(t
             "jsonrpc": "2.0", "id": 31, "method": "mcp/disconnect",
             "params": {"connectionId": connection_id},
         })
-        with pytest.raises(ProxyError, match="stale hosted connection ID"):
-            await router.route_daemon({
-                "jsonrpc": "2.0", "id": 32, "method": "mcp/disconnect",
-                "params": {"connectionId": connection_id},
-            })
+        await router.route_daemon({
+            "jsonrpc": "2.0", "id": 32, "method": "mcp/disconnect",
+            "params": {"connectionId": connection_id},
+        })
+        assert messages(daemon)[-1] == {"jsonrpc": "2.0", "id": 32, "result": {}}
         assert not any(item.get("id") == 30 and "result" in item for item in messages(daemon))
         assert server_id.startswith("mimir-hosted:")
     finally:
