@@ -152,6 +152,45 @@ afterEach(() => {
 });
 
 describe("FactoryRunsRoute", () => {
+  it.each([
+    { status: "running", valid: true, phase: "monitoring", display: "running", lifecycle: "Active" },
+    { status: "completed", valid: true, phase: "terminal", display: "completed", lifecycle: "Terminal" },
+    { status: "needs-human", valid: true, phase: "parked", display: "needs-human", lifecycle: "Parked/resumable" },
+    { status: null, valid: false, phase: "running", display: "unavailable", lifecycle: "Unavailable" },
+    { status: "running", valid: false, phase: "monitoring", display: "unavailable", lifecycle: "Unavailable" },
+    { status: "pending", valid: true, phase: "starting", display: "pending", lifecycle: "Unavailable" },
+    { status: "unknown", valid: true, phase: "unknown", display: "unknown", lifecycle: "Unavailable" },
+    { status: "running", valid: true, phase: "stopped", display: "running", lifecycle: "Unavailable" },
+    { status: null, valid: false, phase: "failed", display: "failed", lifecycle: "Failed" },
+    { status: "running", valid: false, phase: "failed", display: "failed", lifecycle: "Failed" },
+    { status: "running", valid: true, phase: "failed", display: "failed", lifecycle: "Failed" }
+  ])("distinguishes projection $status/$valid from controller $phase", async ({ status, valid, phase, display, lifecycle }) => {
+    const run = { ...factoryRunDetailFixture.data, status, valid, controller_phase: phase };
+    factoryApi.getFactoryRun.mockResolvedValue({ ...factoryRunDetailFixture, data: run });
+    factoryApi.getFactoryRuns.mockResolvedValue({ ...factoryRunsListFixture, data: { runs: [run] } });
+    renderRoute(<><FactoryRunsRoute surface={surface} /><RunDetail runId={run.run_id} /></>);
+
+    const card = await screen.findByTestId(`factory-run-${run.run_id}`);
+    expect(within(card).getByText(display)).toBeTruthy();
+    const detail = await screen.findByTestId("factory-run-detail");
+    const fact = (label: string) => within(detail).getByText(label, { selector: "dt" }).nextElementSibling?.textContent;
+    expect(fact("Status")).toBe(display);
+    expect(fact("Lifecycle")).toBe(lifecycle);
+    expect(fact("Projected status")).toBe(status ?? "not available");
+    expect(fact("Controller phase")).toBe(phase);
+    if (lifecycle !== "Active") expect(within(detail).queryByText("Active")).toBeNull();
+  });
+
+  it("shows the API's durable issue fallback in list and detail", async () => {
+    const run = { ...factoryRunDetailFixture.data, run_id: "chainlink-1521", issue_key: "1521", status: "completed", controller_phase: "terminal" };
+    factoryApi.getFactoryRun.mockResolvedValue({ ...factoryRunDetailFixture, data: run });
+    factoryApi.getFactoryRuns.mockResolvedValue({ ...factoryRunsListFixture, data: { runs: [run] } });
+    renderRoute(<><FactoryRunsRoute surface={surface} /><RunDetail runId={run.run_id} /></>);
+    expect(await screen.findByText("chainlink-1521 · 1521")).toBeTruthy();
+    const detail = await screen.findByTestId("factory-run-detail");
+    expect(within(detail).getByText("Issue").nextElementSibling?.textContent).toBe("1521");
+  });
+
   it("renders Worklink status, parked recovery, and invalid projection state", async () => {
     factoryApi.getFactoryRuns.mockResolvedValue(factoryRunsListFixture);
 

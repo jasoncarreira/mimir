@@ -465,6 +465,85 @@ async def test_factory_runs_list_with_runs(tmp_path: Path, monkeypatch: pytest.M
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("route", ["list", "detail"])
+@pytest.mark.parametrize(
+    ("valid", "raw_status", "controller_phase", "issue_key", "expected_issue_key"),
+    [
+        pytest.param(True, "running", "running", "CL-1521", "CL-1521", id="valid-running"),
+        pytest.param(True, "completed", "terminal", "CL-1521", "CL-1521", id="valid-completed"),
+        pytest.param(True, "needs-human", "parked", "CL-1521", "CL-1521", id="valid-needs-human"),
+        pytest.param(False, "running", "running", "CL-1521", "CL-1521", id="invalid-running"),
+        pytest.param(False, None, "running", "CL-1521", "CL-1521", id="invalid-null"),
+        pytest.param(None, None, "running", None, "1521", id="missing-projection"),
+        pytest.param(None, None, "failed", None, "1521", id="failed-missing-projection"),
+        pytest.param(False, "running", "failed", "CL-1521", "CL-1521", id="failed-invalid-running"),
+        pytest.param(False, None, "failed", "CL-1521", "CL-1521", id="failed-invalid-null"),
+        pytest.param(True, "running", "failed", "CL-1521", "CL-1521", id="failed-valid-running"),
+        pytest.param(True, "completed", "terminal", None, "1521", id="completed-empty-issue-key"),
+    ],
+)
+async def test_factory_runs_preserve_persisted_projection(
+    tmp_path: Path,
+    route: str,
+    valid: bool | None,
+    raw_status: str | None,
+    controller_phase: str,
+    issue_key: str | None,
+    expected_issue_key: str,
+):
+    """Issue 1544: raw factory state stays separate from controller state."""
+    home = tmp_path / "home"
+    home.mkdir()
+    run_id = "chainlink-1521"
+    sandbox = tmp_path / run_id
+    status = None
+    if valid is not None:
+        status = parse_factory_status({
+            "run_id": run_id,
+            "issue_key": issue_key,
+            "valid": valid,
+            "sandbox_path": str(sandbox),
+            "status": raw_status,
+            "mode": "autonomous",
+            "branch": "epic/1521",
+            "pr_base": "main",
+        })
+    controller_error = "factory observation failed" if controller_phase == "failed" else None
+    save_factory_record(home, FactoryRunRecord(
+        run_id=run_id, issue_id=1521, attempt=1, repository="owner/repo",
+        base_ref="main", branch="epic/1521", launcher="/opt/factory/bin/factory.js",
+        sandbox=str(sandbox), session="session-1", handle=None, status=status,
+        observed_at="2026-09-06T10:00:00Z", controller_phase=controller_phase,
+        controller_error=controller_error,
+    ))
+
+    app = web.Application()
+    web_ui.register_routes(
+        app, turns_log=tmp_path / "turns", events_log=tmp_path / "events", home=home,
+    )
+
+    async with TestClient(TestServer(app)) as client:
+        path = "/api/v1/factory-runs"
+        if route == "detail":
+            path += f"/{run_id}"
+        resp = await client.get(path)
+        assert resp.status == 200
+        body = await resp.json()
+
+    assert body["ok"] is True
+    if route == "list":
+        [run] = body["data"]["runs"]
+    else:
+        run = body["data"]
+    assert run["run_id"] == run_id
+    assert run["issue_key"] == expected_issue_key
+    assert run["status"] == raw_status
+    assert run["valid"] is (valid if valid is not None else False)
+    assert run["controller_phase"] == controller_phase
+    assert run["controller_error"] == controller_error
+
+
+@pytest.mark.asyncio
 async def test_factory_runs_detail(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setenv("WORKLINK_REPO", str(tmp_path))
     home = tmp_path / "home"

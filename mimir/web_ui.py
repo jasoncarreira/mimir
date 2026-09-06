@@ -1578,10 +1578,10 @@ def register_routes(
         state = record.status
         result: dict[str, Any] = {
             "run_id": record.run_id,
-            "issue_key": state.issue_key if state is not None else str(record.issue_id),
+            "issue_key": (state.issue_key if state is not None else None) or str(record.issue_id),
             "valid": state.valid if state is not None else False,
             "sandbox_path": record.sandbox,
-            "status": state.status if state is not None else "pending",
+            "status": state.status if state is not None else None,
             "mode": state.mode if state is not None else "autonomous",
             "branch": record.branch,
             "pr_base": record.base_ref,
