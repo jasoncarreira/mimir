@@ -146,6 +146,29 @@ def test_feature_factory_requires_absolute_entrypoint() -> None:
         BackendRegistry(config)
 
 
+@pytest.mark.parametrize("value", [0, 3, 10])
+def test_gate_rerun_max_failures_config(tmp_path: Path, value: int) -> None:
+    path = tmp_path / "worklink.yaml"
+    assert WorklinkConfig.load(path).defaults.gate_rerun_max_failures == 10
+    path.write_text(f"defaults:\n  gate_rerun_max_failures: {value}\n", encoding="utf-8")
+    assert WorklinkConfig.load(path).defaults.gate_rerun_max_failures == value
+    assert WorklinkDefaults(gate_rerun_max_failures=value).gate_rerun_max_failures == value
+
+
+@pytest.mark.parametrize("value", [-1, True, False, 1.5, 1.0, "3", None, [], {}])
+def test_gate_rerun_max_failures_rejects_nonnegative_nonintegers(
+    tmp_path: Path, value: object
+) -> None:
+    with pytest.raises(ValueError, match="gate_rerun_max_failures.*nonnegative integer"):
+        WorklinkDefaults(gate_rerun_max_failures=value)
+    path = tmp_path / "worklink.yaml"
+    path.write_text(
+        json.dumps({"defaults": {"gate_rerun_max_failures": value}}), encoding="utf-8"
+    )
+    with pytest.raises(ValueError, match="gate_rerun_max_failures.*nonnegative integer"):
+        WorklinkConfig.load(path)
+
+
 def test_worklink_config_malformed_autonomy_ints_fall_back(tmp_path: Path) -> None:
     config_path = tmp_path / "worklink.yaml"
     config_path.write_text(
