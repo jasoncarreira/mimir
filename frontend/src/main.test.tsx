@@ -304,6 +304,17 @@ describe("AppFrame login gate + admin surface gating (#563 / #577)", () => {
 
     const usersTab = await screen.findByRole("tab", { name: "Users" });
     expect(usersTab.getAttribute("aria-selected")).toBe("true");
+    fireEvent.click(screen.getByRole("link", { name: /AdminConfig/ }));
+    expect(await screen.findByRole("tablist", { name: "Admin tabs" })).toBeTruthy();
+    for (const name of ["Config", "MCP Servers", "Users"]) {
+      const tab = screen.getByRole("tab", { name });
+      fireEvent.click(tab);
+      expect(tab.getAttribute("aria-selected")).toBe("true");
+      expect(tab.tabIndex).toBe(0);
+      tab.focus();
+      expect(document.activeElement).toBe(tab);
+      expect(screen.getByRole("tabpanel", { name }).id).toBe(tab.getAttribute("aria-controls"));
+    }
   });
 
   it("does not gate when the server allows unauthenticated access", async () => {
