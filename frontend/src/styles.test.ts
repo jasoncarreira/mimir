@@ -60,7 +60,10 @@ describe.each(skins)("%s narrow-pane stylesheet contract", (skin) => {
     for (const selector of [".wiki-browser", ".memory-browser"]) {
       if (pane <= 960) {
         expect(css(selector)["grid-template-columns"]).toBe("minmax(0, 1fr)");
-        expect(css(`${selector}__sidebar`)).toMatchObject({ position: "static", "max-height": "none" });
+        expect(css(`${selector}__sidebar`)).toMatchObject({
+          position: "static", "max-height": viewport <= 720 ? "65dvh" : "none"
+        });
+        if (viewport <= 720) expect(css(`${selector}__sidebar`).overflow).toBe("auto");
       } else {
         expect(css(selector)["grid-template-columns"]).toMatch(/minmax\(\d+px, \d+px\) minmax\(0, 1fr\)/);
       }
