@@ -26,10 +26,11 @@ from __future__ import annotations
 
 import json
 import logging
-from typing import Any, Optional
+from typing import Annotated, Any, Optional
 
 from langchain.tools import ToolRuntime
 from langchain_core.tools import tool
+from pydantic import BeforeValidator, Field
 
 from ..models import AuthContext
 from .memory import _MEMORY_STATE
@@ -210,15 +211,37 @@ async def saga_mark_contributions(
     return f"saga_mark_contributions ok: credited {len(atom_ids)} atoms"
 
 
+def _coerce_session_list(value: Any) -> Any:
+    if isinstance(value, str):
+        separator = next((sep for sep in ("\n", ";", ",") if sep in value), None)
+        items = value.split(separator) if separator is not None else [value]
+        return [item.strip() for item in items if item.strip()]
+    return value
+
+
+_SessionList = Annotated[
+    Optional[list[str]],
+    BeforeValidator(
+        _coerce_session_list, json_schema_input_type=list[str] | str | None
+    ),
+    Field(description=(
+        "Prefer a list of strings. Also accepts a string: split on newlines if "
+        "present, otherwise semicolons, otherwise commas; without delimiters, "
+        "use one item. String items are stripped and empty items dropped. "
+        "Commas within newline- or semicolon-separated items are preserved."
+    )),
+]
+
+
 @tool
 async def saga_end_session(
     session_id: str,
     summary: str,
-    topics_discussed: Optional[list[str]] = None,
-    decisions_made: Optional[list[str]] = None,
-    unfinished: Optional[list[str]] = None,
+    topics_discussed: _SessionList = None,
+    decisions_made: _SessionList = None,
+    unfinished: _SessionList = None,
     emotional_state: Optional[str] = None,
-    closed_since: Optional[list[str]] = None,
+    closed_since: _SessionList = None,
     runtime: ToolRuntime[AuthContext] = None,  # type: ignore[assignment]
 ) -> str:
     """Close a SAGA session by writing the rendered boundary fields to
