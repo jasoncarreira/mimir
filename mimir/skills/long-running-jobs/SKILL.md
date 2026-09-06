@@ -1,11 +1,19 @@
 ---
 name: long-running-jobs
-description: Run shell commands in the background with output capture and completion callbacks. Use when a command might take more than ~30 seconds (builds, tests, deployments, data processing) and you want to keep working while it runs.
+description: Run shell commands in the background with output capture and completion callbacks, only when a shell execution tool is present in the current turn's tool list. Use when a command might take more than ~30 seconds (builds, tests, deployments, data processing) and you want to keep working while it runs.
 ---
 
-<!-- desc: Run shell commands in the background with output capture and completion callbacks — use when a command might take more than ~30 seconds. -->
+<!-- desc: Run commands longer than ~30 seconds in the background with output capture and callbacks, only when a shell tool is in the current turn's tool list. -->
 
 # Long-Running Jobs
+
+**Tool availability:** Run these shell recipes only when a shell execution tool
+(such as `shell_exec`) is present in the current turn's tool list; use its actual
+name and schema. The same check applies to `bash_async`, output inspection,
+`send_message`, and any saga writes. Service turns, including callback turns,
+can lack tools. If a required tool is absent, state the limitation; do not invent
+alternate tools or claim execution. These recipes do not bypass existing admin
+instructions or authorization requirements.
 
 Some commands take minutes or hours. Rather than blocking on them, you can launch them in the background, capture all output, and get notified when they finish.
 

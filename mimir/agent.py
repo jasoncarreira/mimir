@@ -1775,9 +1775,11 @@ class Agent:
                 # provide for low-tool loops. First in the tuple so the count +
                 # one-shot wrap-up land before the other before_model hooks.
                 from .tools.iteration_gate import IterationGateMiddleware
+                from .tools.service_tool_surface import ServiceToolSurfaceMiddleware
                 self._agent_middleware = (
                     TodoListMiddleware(),
                     IterationGateMiddleware(),
+                    ServiceToolSurfaceMiddleware(),
                     BudgetGateMiddleware(),
                     FetchedContentReminderMiddleware(self._config.home),
                     SkillMemoryInjectionMiddleware(skill_sources),

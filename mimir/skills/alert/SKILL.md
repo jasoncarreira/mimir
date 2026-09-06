@@ -37,6 +37,11 @@ you're already in).
 
 ## How
 
+Delivery requires `send_message` in the current turn's tool list, even when an
+alert channel is configured. Service turns can lack it; state that the alert was
+not sent rather than inventing alternate tools. Backlog writes likewise require
+an available write tool; channel configuration is not authorization to bypass scope.
+
 The alert channel is a normal channel id — the registered bridge
 dispatches by prefix. So just call `send_message` against it like any
 other channel:
