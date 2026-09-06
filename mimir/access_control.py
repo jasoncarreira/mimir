@@ -639,7 +639,7 @@ TRIGGER_AUTHORITY_PROFILES: dict[str, frozenset[str]] = {
         "glob", "aglob", "grep", "agrep", "file_search", "memory_store",
         "saga_feedback", "saga_mark_contributions", "send_message",
         "saga_record_skill_learning", "operator_alert", "shell_exec",
-        "bash_jobs_list", "bash_job_output",
+        "bash_jobs_list", "bash_job_output", "fetch_url",
     }),
     "github": frozenset({
         "worklink_run", "write_file", "edit_file", "shell_exec",
@@ -726,6 +726,7 @@ _FETCH_URL_POLICY_BY_AUTHORITY_PROFILE = {
     "session-boundary": ("github_pr_api", "GITHUB_REPOS"),
 }
 BOUNDED_PROFILE_CAPABILITIES: dict[str, frozenset[str]] = {
+    "research": frozenset({"fetch_url"}),
     "github": frozenset({"fetch_url"}),
     "session-boundary": frozenset({"fetch_url"}),
 }
@@ -751,9 +752,14 @@ def build_trigger_service_principal(
     saga_full_corpus_read: bool = False,
     channel_memory_directory: str | None = None,
     declared_shell_commands: tuple["DeclaredShellCommand", ...] = (),
+    approved_urls: tuple[str, ...] = (),
     creation_path: str,
 ) -> ServicePrincipal:
     """Build one immutable instance principal from already-validated authority."""
+    if profile == "research":
+        capabilities = tuple(cap for cap in capabilities if cap != "fetch_url")
+        if approved_urls:
+            capabilities += ("fetch_url",)
     capability_set = set(capabilities)
     missing = _missing_capability_companions(capability_set, profile=profile)
     if missing:
@@ -820,6 +826,11 @@ def build_trigger_service_principal(
             policies.append(ServiceSinkPolicy(operation, "worklink_repo", "WORKLINK_REPO/MIMIR_WORKLINK_REPO"))
         elif operation == "fetch_url":
             fetch_policy = _FETCH_URL_POLICY_BY_AUTHORITY_PROFILE.get(profile)
+            if profile == "research" and approved_urls:
+                fetch_policy = ("approved_urls", json.dumps([
+                    url + "*" if urlsplit(url).path == "/" and not urlsplit(url).query else url
+                    for url in approved_urls
+                ]))
             if fetch_policy is not None:
                 policies.append(ServiceSinkPolicy(operation, *fetch_policy))
     if "operator_alert" in capabilities:
@@ -5559,7 +5570,8 @@ def _configured_url_approvals(
     variable: str,
 ) -> tuple[frozenset[str], frozenset[_ApprovedURLScope]]:
     """Read exact URLs and explicit ``/*`` URL scopes from operator config."""
-    configured = os.environ.get(variable, "").strip()
+    # Manifest grants are immutable JSON literals; legacy policies name env vars.
+    configured = variable if variable.startswith("[") else os.environ.get(variable, "").strip()
     if not configured:
         return frozenset(), frozenset()
     if configured.startswith("["):

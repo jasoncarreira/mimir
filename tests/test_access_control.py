@@ -5493,6 +5493,80 @@ def test_fetch_url_host_scope_matches_parsed_scheme_and_host(
     assert not access_control.fetch_url_is_approved(target, _write_auth())
 
 
+def test_research_builder_binds_approved_urls_without_widening_other_authority(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
+    monkeypatch.delenv("MIMIR_EGRESS_APPROVED_URLS", raising=False)
+    arguments = dict(
+        canonical="poller:research", trigger="poller", profile="research",
+        tier=CapabilityTier.SCOPED_WITH_PROVENANCE,
+        roots=(tmp_path / "state" / "pollers" / "research",),
+        creation_path="test",
+    )
+    capabilities = ("write_file", "shell_exec", "bash_jobs_list", "bash_job_output")
+    baseline = build_trigger_service_principal(**arguments, capabilities=capabilities)
+    assert build_trigger_service_principal(
+        **arguments, capabilities=(*capabilities, "fetch_url"),
+    ) == baseline
+    service = build_trigger_service_principal(
+        **arguments, capabilities=(*capabilities, "fetch_url"),
+        approved_urls=("https://arxiv.org/", "https://papers.example/paper?id=42"),
+    )
+    policy = service.sink_policy_for("fetch_url")
+    assert policy is not None
+    assert policy.adapter == "approved_urls"
+    assert json.loads(policy.destination) == [
+        "https://arxiv.org/*", "https://papers.example/paper?id=42",
+    ]
+    assert tuple(p for p in service.sink_policies if p.operation != "fetch_url") == baseline.sink_policies
+    assert service.capability_tier is baseline.capability_tier
+    assert service.filesystem_read_roots == baseline.filesystem_read_roots
+    assert "fetch_url" in access_control.TRIGGER_AUTHORITY_PROFILES["research"]
+    assert "fetch_url" in access_control.BOUNDED_PROFILE_CAPABILITIES["research"]
+    registry = ToolRegistry()
+    for principal in (baseline, service):
+        auth = _service_auth(principal, InformationFlowLabels())
+        for operation, target, expected in (
+            ("write_file", str(arguments["roots"][0] / "notes.txt"), True),
+            ("write_file", str(tmp_path / "outside.txt"), False),
+            ("shell_exec", "curl https://unapproved.example/", False),
+        ):
+            decision = registry.authorize_tool(
+                operation, auth, enforce=True, target_channel=target,
+            )
+            assert decision.allowed is expected, (operation, decision.reason)
+
+
+@pytest.mark.parametrize("target", [
+    "https://unapproved.example/pdf/2608.17050",
+    "https://arxiv.org.evil.example/pdf/2608.17050",
+    "https://export.arxiv.org/pdf/2608.17050",
+])
+def test_literal_approved_url_scope_requires_host_equality(target: str) -> None:
+    destination = json.dumps(["https://arxiv.org/*"])
+    assert access_control._target_matches_approved_url(
+        "https://arxiv.org/pdf/2608.17050", destination,
+    )
+    assert not access_control._target_matches_approved_url(target, destination)
+
+
+def test_existing_fetch_profile_policies_are_unchanged(tmp_path: Path) -> None:
+    for profile, adapter, destination in (
+        ("heartbeat", "approved_urls", "MIMIR_HEARTBEAT_APPROVED_URLS"),
+        ("github", "github_pr_api", "GITHUB_REPOS"),
+        ("session-boundary", "github_pr_api", "GITHUB_REPOS"),
+    ):
+        service = build_trigger_service_principal(
+            canonical=f"test:{profile}", trigger="poller", profile=profile,
+            tier=CapabilityTier.UNBOUNDED, capabilities=("fetch_url",),
+            creation_path="test",
+        )
+        assert service.sink_policy_for("fetch_url") == ServiceSinkPolicy(
+            "fetch_url", adapter, destination,
+        )
+
+
 def test_bare_approved_url_remains_exact(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
