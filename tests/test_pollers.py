@@ -317,6 +317,155 @@ def test_research_profile_has_bounded_shell_and_append_credit_authority() -> Non
     assert {"saga_forget", "saga_end_session", "bash_async"}.isdisjoint(profile)
 
 
+@pytest.mark.parametrize("explicit_fetch", [False, True])
+@pytest.mark.parametrize(
+    ("approved", "allowed", "denied"),
+    [
+        (
+            "https://arxiv.org/",
+            "https://arxiv.org/pdf/2608.17050",
+            "https://unapproved.example/pdf/2608.17050",
+        ),
+        (
+            "https://papers.example/paper?id=42",
+            "https://papers.example/paper?id=42",
+            "https://papers.example/paper?id=420",
+        ),
+        (
+            "https://arxiv.org/abs/2608.17050",
+            "https://arxiv.org/abs/2608.17050",
+            "https://arxiv.org/abs/2608.17050/extra",
+        ),
+    ],
+)
+def test_research_approved_urls_manifest_authorizes_only_declared_destinations(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    explicit_fetch: bool, approved: str, allowed: str, denied: str,
+) -> None:
+    monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
+    monkeypatch.delenv("MIMIR_EGRESS_APPROVED_URLS", raising=False)
+    monkeypatch.delenv("MIMIR_HEARTBEAT_APPROVED_URLS", raising=False)
+    skills = tmp_path / "skills"
+    capabilities = ["write_file"] + (["fetch_url"] if explicit_fetch else [])
+    _write_pollers_json(skills / "research", [{
+        "name": "research", "command": "true", "cron": "* * * * *",
+        "authority": _authority(
+            capabilities=capabilities, approved_urls=[approved],
+        ),
+    }])
+
+    [poller] = discover_pollers(skills, state_root=tmp_path / "state" / "pollers")
+    service = poller.resolved_authority()
+    assert set(service.capabilities) == {"write_file", "fetch_url"}
+    assert service.capabilities.count("fetch_url") == 1
+    assert service.capability_tier is CapabilityTier.SCOPED_WITH_PROVENANCE
+    auth = create_auth_context(AgentEvent(
+        trigger="poller", channel_id=poller.channel_id(),
+        service_principal=service.canonical, service_authority=service,
+    ), enforce=True, ifc_labels=InformationFlowLabels())
+    registry = ToolRegistry()
+    for target, expected in ((allowed, True), (denied, False)):
+        decision = registry.authorize_tool(
+            "fetch_url", auth, enforce=True, target_channel=target,
+        )
+        assert decision.allowed is expected, (target, decision.reason)
+        if not expected:
+            assert decision.reason == "egress_destination_not_approved"
+
+
+@pytest.mark.parametrize("url_fields", [{}, {"approved_urls": []}])
+def test_research_without_approved_urls_keeps_default_fetch_refusal(
+    tmp_path: Path, url_fields: dict,
+) -> None:
+    skills = tmp_path / "skills"
+    _write_pollers_json(skills / "research", [{
+        "name": "research", "command": "true", "cron": "* * * * *",
+        "authority": _authority(**url_fields),
+    }])
+    [poller] = discover_pollers(skills, state_root=tmp_path / "state" / "pollers")
+    service = poller.resolved_authority()
+    assert service.capabilities == ("memory_store", "write_file", "send_message")
+    assert service.sink_policy_for("fetch_url") is None
+    auth = create_auth_context(AgentEvent(
+        trigger="poller", channel_id=poller.channel_id(),
+        service_principal=service.canonical, service_authority=service,
+    ), enforce=True, ifc_labels=InformationFlowLabels())
+    assert not ToolRegistry().authorize_tool(
+        "fetch_url", auth, enforce=True,
+        target_channel="https://arxiv.org/abs/2608.17050",
+    ).allowed
+
+
+@pytest.mark.parametrize("url_fields", [{}, {"approved_urls": []}])
+def test_research_explicit_fetch_requires_nonempty_approved_urls(
+    tmp_path: Path, url_fields: dict, caplog: pytest.LogCaptureFixture,
+) -> None:
+    with pytest.raises(ValueError, match="approved_urls"):
+        _parse_poller_authority(
+            _authority(capabilities=["fetch_url"], scoped_roots=[], **url_fields),
+            name="research", persist_dir=tmp_path, state_root=None,
+            manifest_path=tmp_path / "pollers.json",
+        )
+    skills = tmp_path / "skills"
+    _write_pollers_json(skills / "research", [{
+        "name": "empty-fetch", "command": "true", "cron": "* * * * *",
+        "authority": _authority(capabilities=["fetch_url"], **url_fields),
+    }])
+    assert discover_pollers(skills, state_root=tmp_path / "state" / "pollers") == []
+    assert any(
+        "empty-fetch" in record.getMessage() and "approved_urls" in record.getMessage()
+        for record in caplog.records
+    )
+
+
+@pytest.mark.parametrize("approved_urls", [
+    None, "https://arxiv.org/", {}, 42, True, [None], [42], [True],
+    [""], ["not-a-url"], ["//arxiv.org/"], ["http://arxiv.org/"],
+    ["https:///missing-host"], ["https://user:pass@arxiv.org/"],
+    ["https://arxiv.org/#fragment"], [" https://arxiv.org/"],
+    ["https://arxiv.org/ "], ["https://arxiv.org/a b"],
+    ["https://arxiv.org/a\nb"], ["https://arxiv.org/a\tb"],
+    ["https://com/"], ["https://bad_host.example/"],
+    ["https://-bad.example/"], ["https://bad..example/"],
+    ["https://[broken/"], ["https://arxiv.org:bad/"],
+    ["https://arxiv.org:99999/"], ["https://*.example/"],
+    ["https://arxiv.org/*"], ["https://arxiv.org/abs/*"],
+    ["https://arxiv.org/?q=*"],
+    ["https://arxiv.org/../abs/123"], ["https://arxiv.org/a\\b"],
+    ["https://arxiv.org/", "http://unapproved.example/"],
+])
+def test_malformed_approved_urls_rejects_poller_with_named_error(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture, approved_urls: object,
+) -> None:
+    skills = tmp_path / "skills"
+    manifest = skills / "research" / "pollers.json"
+    _write_pollers_json(manifest.parent, [{
+        "name": "bad-urls", "command": "true", "cron": "* * * * *",
+        "authority": _authority(approved_urls=approved_urls),
+    }])
+    assert discover_pollers(skills, state_root=tmp_path / "state" / "pollers") == []
+    assert any(
+        "approved_urls" in record.getMessage()
+        and "bad-urls" in record.getMessage()
+        and str(manifest) in record.getMessage()
+        for record in caplog.records
+    )
+
+
+@pytest.mark.parametrize("profile", ["github", "custom", "heartbeat", "session-boundary"])
+@pytest.mark.parametrize("approved_urls", [[], ["https://arxiv.org/"]])
+def test_approved_urls_is_research_profile_only(
+    tmp_path: Path, profile: str, approved_urls: list[str],
+) -> None:
+    with pytest.raises(ValueError, match="approved_urls"):
+        _parse_poller_authority(
+            _authority(profile=profile, capabilities=[], scoped_roots=[],
+                       approved_urls=approved_urls),
+            name="research", persist_dir=tmp_path, state_root=None,
+            manifest_path=tmp_path / "pollers.json",
+        )
+
+
 def test_research_poller_builds_with_skill_learning_only(tmp_path: Path) -> None:
     persist_dir = tmp_path / "state" / "pollers" / "research-agent"
     persist_dir.mkdir(parents=True)
