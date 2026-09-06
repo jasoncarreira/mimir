@@ -117,7 +117,13 @@ export function safeChainlinkBoardData(data: unknown): ChainlinkBoardData {
       priorities: stringArrayFrom(filters.priorities)
     },
     truncated: typeof source.truncated === "boolean" ? source.truncated : false,
-    total_count: numberFrom(source.total_count) ?? issues.length
+    total_count: numberFrom(source.total_count) ?? issues.length,
+    offset: numberFrom(source.offset) ?? 0,
+    next_offset: numberFrom(source.next_offset),
+    selected_issue: isRecord(source.selected_issue) ? safeIssue(source.selected_issue) : null,
+    selected_issue_state: source.selected_issue_state === "loaded"
+      || source.selected_issue_state === "unavailable" || source.selected_issue_state === "missing"
+      ? source.selected_issue_state : "none"
   };
 }
 
@@ -150,6 +156,7 @@ export interface ReadyDependency {
 export interface BlockedDependency {
   issue: ChainlinkBoardIssue;
   blockers: ChainlinkBoardIssue[];
+  unknownBlockerIds: number[];
 }
 
 export interface DependencyPartition {
@@ -174,8 +181,10 @@ export function partitionDependencies(issues: ChainlinkBoardIssue[]): Dependency
   for (const issue of issues) {
     if (isCompletedStatus(issue.status)) continue;
     const blockers = activeFrom(issue.blocked_by);
-    if (blockers.length) {
-      blocked.push({ issue, blockers });
+    // A filtered page cannot establish whether an absent blocker is completed.
+    const unknownBlockerIds = issue.blocked_by.filter((id) => !byId.has(id));
+    if (blockers.length || unknownBlockerIds.length) {
+      blocked.push({ issue, blockers, unknownBlockerIds });
       continue;
     }
     const unlocks = activeFrom(issue.blocking);

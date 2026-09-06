@@ -1,7 +1,7 @@
 import { useQuery } from "@tanstack/react-query";
 import React from "react";
 import { Link, useSearchParams } from "react-router-dom";
-import { getChainlinkBoard, type ChainlinkBoardIssue } from "../api";
+import { chainlinkBoardHref, getChainlinkBoard, type ChainlinkBoardIssue } from "../api";
 import { drilldownHref, sanitizeHref } from "../routeState";
 import {
   Badge,
@@ -15,8 +15,6 @@ import {
 } from "../ui";
 import {
   formatBoardTime,
-  isCompletedStatus,
-  issueMatchesFilters,
   partitionDependencies,
   safeChainlinkBoardData,
   type ChainlinkBoardFilters
@@ -189,15 +187,24 @@ export function WorklinkPanel({ issue }: { issue: ChainlinkBoardIssue }) {
 function IssueDrawer({
   issue,
   issues,
+  selectedId,
+  state,
+  loading,
   onClose
 }: {
   issue: ChainlinkBoardIssue | null;
   issues: ChainlinkBoardIssue[];
+  selectedId: number | undefined;
+  state: "none" | "loaded" | "unavailable" | "missing";
+  loading: boolean;
   onClose: () => void;
 }) {
   const byId = React.useMemo(() => new Map(issues.map((item) => [item.id, item])), [issues]);
   return (
-    <Drawer open={Boolean(issue)} title={issue ? `#${issue.id} ${issue.title}` : "Issue"} onClose={onClose}>
+    <Drawer open={selectedId !== undefined} title={issue ? `#${issue.id} ${issue.title}` : `Issue #${selectedId}`} onClose={onClose}>
+      {loading ? <LoadingState label="Loading issue detail" /> : null}
+      {state === "unavailable" ? <ErrorState title="Issue detail unavailable">Chainlink issue #{selectedId} exists, but its detail could not be loaded.</ErrorState> : null}
+      {state === "missing" ? <ErrorState title="Issue not found">Chainlink issue #{selectedId} is not in the tracker.</ErrorState> : null}
       {issue ? (
         <div className="chainlink-drawer">
           <div className="chainlink-drawer-section">
@@ -237,47 +244,40 @@ function IssueDrawer({
 
 export function ChainlinkBoardRoute() {
   const [searchParams, setSearchParams] = useSearchParams();
-  const query = useQuery({
-    queryKey: ["chainlink-board"],
-    queryFn: async () => (await getChainlinkBoard({ cache: "no-store" })).data
-  });
-  const [filters, setFilters] = React.useState<ChainlinkBoardFilters>({
+  const filters: ChainlinkBoardFilters = {
     label: searchParams.get("label") || "",
     status: searchParams.get("status") || "",
     priority: searchParams.get("priority") || ""
+  };
+  const showCompleted = searchParams.get("show_completed") === "true";
+  const rawOffset = Number(searchParams.get("offset") || 0);
+  const offset = Number.isSafeInteger(rawOffset) && rawOffset >= 0 ? rawOffset : 0;
+  const rawIssue = Number(searchParams.get("issue"));
+  const selectedIssueId = Number.isSafeInteger(rawIssue) && rawIssue > 0 ? rawIssue : undefined;
+  const params = { ...filters, show_completed: showCompleted, offset, issue: selectedIssueId };
+  const query = useQuery({
+    queryKey: ["chainlink-board", params],
+    queryFn: async ({ signal }) => (await getChainlinkBoard(params, { cache: "no-store", signal })).data
   });
-  const [showCompleted, setShowCompleted] = React.useState(false);
   const board = React.useMemo(() => safeChainlinkBoardData(query.data), [query.data]);
-  const visibleIssues = React.useMemo(
-    () => board.issues.filter((issue) => {
-      if (!issueMatchesFilters(issue, filters)) return false;
-      // github #569: hide completed work by default unless explicitly shown or
-      // the status filter itself targets a completed status.
-      if (!showCompleted && !isCompletedStatus(filters.status) && isCompletedStatus(issue.status)) {
-        return false;
-      }
-      return true;
-    }),
-    [board.issues, filters, showCompleted]
-  );
+  const visibleIssues = board.issues;
   const dependencies = React.useMemo(() => partitionDependencies(board.issues), [board.issues]);
   const visibleById = React.useMemo(() => new Map(visibleIssues.map((issue) => [issue.id, issue])), [visibleIssues]);
   const rootIssues = React.useMemo(
     () => board.roots.map((id) => visibleById.get(id)).filter((issue): issue is ChainlinkBoardIssue => Boolean(issue)),
     [board.roots, visibleById]
   );
-  const selectedIssueId = Number.parseInt(searchParams.get("issue") || "", 10);
-  const selected = Number.isFinite(selectedIssueId)
-    ? board.issues.find((issue) => issue.id === selectedIssueId) ?? null
-    : null;
+  const selected = board.selected_issue_state === "loaded" && board.selected_issue?.id === selectedIssueId
+    ? board.selected_issue : null;
+  const nextOffset = board.next_offset;
+  const canNext = nextOffset !== null && Number.isSafeInteger(nextOffset)
+    && nextOffset > board.offset && nextOffset < board.total_count;
 
-  React.useEffect(() => {
-    setFilters({
-      label: searchParams.get("label") || "",
-      status: searchParams.get("status") || "",
-      priority: searchParams.get("priority") || ""
-    });
-  }, [searchParams]);
+  function setPage(offset: number) {
+    const params = new URLSearchParams(searchParams);
+    params.set("offset", String(offset));
+    setSearchParams(params);
+  }
 
   function selectIssue(issue: ChainlinkBoardIssue | null) {
     const params = new URLSearchParams(searchParams);
@@ -287,8 +287,8 @@ export function ChainlinkBoardRoute() {
   }
 
   function setFilter(key: keyof ChainlinkBoardFilters, value: string) {
-    setFilters((prior) => ({ ...prior, [key]: value }));
     const params = new URLSearchParams(searchParams);
+    params.delete("offset");
     if (value) params.set(key, value);
     else params.delete(key);
     setSearchParams(params);
@@ -302,14 +302,14 @@ export function ChainlinkBoardRoute() {
           <h1>Kanban Board</h1>
           <p className="app-copy">
             {board.generated_at ? `Generated ${board.generated_at}` : "Read-only lifecycle board"}
-            {board.truncated ? ` | showing ${board.issues.length} of ${board.total_count}` : ""}
+            {board.available ? ` | ${board.total_count} matching issues | showing ${board.issues.length ? `${board.offset + 1}-${board.offset + board.issues.length}` : "0"} of ${board.total_count}` : ""}
           </p>
         </div>
         <div className="chainlink-actions">
           <Button disabled={query.isFetching} onClick={() => void query.refetch()} type="button">
             {query.isFetching ? "Refreshing" : "Refresh"}
           </Button>
-          <a className="ui-button ui-button--secondary" href="/api/v1/chainlink-board">JSON</a>
+          <a className="ui-button ui-button--secondary" href={chainlinkBoardHref(params)}>JSON</a>
         </div>
       </div>
       {query.isLoading ? <LoadingState label="Loading Chainlink board" /> : null}
@@ -331,23 +331,32 @@ export function ChainlinkBoardRoute() {
               <label className="turn-checkbox">
                 <input
                   checked={showCompleted}
-                  onChange={(event) => setShowCompleted(event.currentTarget.checked)}
+                  onChange={(event) => {
+                    const params = new URLSearchParams(searchParams);
+                    params.set("show_completed", String(event.currentTarget.checked));
+                    params.delete("offset");
+                    setSearchParams(params);
+                  }}
                   type="checkbox"
                 />
                 <span>Show completed</span>
               </label>
               <Button type="button" onClick={() => {
-                setFilters({ label: "", status: "", priority: "" });
-                setShowCompleted(false);
                 const params = new URLSearchParams(searchParams);
+                params.delete("show_completed");
+                params.delete("offset");
                 params.delete("label");
                 params.delete("status");
                 params.delete("priority");
                 setSearchParams(params);
               }}>Clear</Button>
             </div>
+            <nav aria-label="Board pages" className="chainlink-actions">
+              <Button type="button" disabled={query.isFetching || board.offset <= 0} onClick={() => setPage(Math.max(0, board.offset - 250))}>Previous</Button>
+              <Button type="button" disabled={query.isFetching || !canNext} onClick={() => { if (canNext) setPage(nextOffset!); }}>Next</Button>
+            </nav>
           </Panel>
-          <Panel title="Parent Trees" subtitle="Root issues and visible subissue progress from Chainlink.">
+          <Panel title="Parent Trees" subtitle="Root issues and subissues on this filtered page; other relatives may be omitted.">
             {rootIssues.length ? (
               <ol className="chainlink-tree">
                 {rootIssues.map((issue) => <TreeNode byId={visibleById} issue={issue} key={issue.id} />)}
@@ -376,7 +385,7 @@ export function ChainlinkBoardRoute() {
               );
             })}
           </div>
-          <Panel title="Dependencies" subtitle="What's blocked, by what, and what finishing next unlocks.">
+          <Panel title="Dependencies" subtitle="Dependencies on this filtered page only. Off-page blockers have unknown status; unlock counts omit off-page issues.">
             {dependencies.ready.length || dependencies.blocked.length ? (
               <div className="chainlink-deps">
                 <section className="chainlink-deps__group">
@@ -401,14 +410,14 @@ export function ChainlinkBoardRoute() {
                   <h3>Blocked <Badge tone="danger">{dependencies.blocked.length}</Badge></h3>
                   {dependencies.blocked.length ? (
                     <ul className="chainlink-deps__list">
-                      {dependencies.blocked.map(({ issue, blockers }) => (
+                      {dependencies.blocked.map(({ issue, blockers, unknownBlockerIds }) => (
                         <li key={issue.id}>
                           <button className="chainlink-deps__issue" onClick={() => selectIssue(issue)} type="button">
                             <span className="chainlink-deps__title">
                               <Badge tone={priorityTone[issue.priority] ?? "neutral"}>{issue.priority}</Badge>
                               #{issue.id} {issue.title}
                             </span>
-                            <small>blocked by {blockers.map((item) => `#${item.id} (${item.status})`).join(", ")}</small>
+                            <small>blocked by {[...blockers.map((item) => `#${item.id} (${item.status})`), ...unknownBlockerIds.map((id) => `#${id} (unknown, outside this page)`)].join(", ")}</small>
                           </button>
                         </li>
                       ))}
@@ -422,10 +431,7 @@ export function ChainlinkBoardRoute() {
           </Panel>
         </>
       ) : null}
-      {searchParams.get("issue") && !selected && board.available ? (
-        <ErrorState title="Issue not found">No loaded Chainlink issue matches #{searchParams.get("issue")}.</ErrorState>
-      ) : null}
-      <IssueDrawer issue={selected} issues={board.issues} onClose={() => selectIssue(null)} />
+      <IssueDrawer issue={selected} issues={board.issues} selectedId={selectedIssueId} state={board.selected_issue_state} loading={query.isLoading} onClose={() => selectIssue(null)} />
     </div>
   );
 }
