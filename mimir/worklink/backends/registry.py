@@ -118,6 +118,7 @@ class WorklinkDefaults:
     timeout_s: int = 1800
     priority: str = "normal"
     test_command: str = "uv run pytest -q"
+    gate_rerun_max_failures: int = 10
     backend_by_category: Mapping[str, str] = field(default_factory=dict)
     compute_backend: str = "local_subprocess"
     # Branch that attempt checkouts are cut from and that leaf PRs target. Point
@@ -159,6 +160,8 @@ class WorklinkDefaults:
 
     def validate(self) -> None:
         """Validate all cross-field constraints for Worklink defaults."""
+        if type(self.gate_rerun_max_failures) is not int or self.gate_rerun_max_failures < 0:
+            raise ValueError("worklink gate_rerun_max_failures must be a nonnegative integer")
         required_reaper_ttl_s = minimum_reaper_ttl_s(self.timeout_s)
         if self.reaper_ttl_s < required_reaper_ttl_s:
             raise WorklinkDefaultsValidationError(
@@ -251,6 +254,9 @@ class WorklinkConfig:
             priority=str(defaults_data.get("priority", default_values.priority)),
             test_command=str(
                 defaults_data.get("test_command", default_values.test_command)
+            ),
+            gate_rerun_max_failures=defaults_data.get(
+                "gate_rerun_max_failures", default_values.gate_rerun_max_failures
             ),
             backend_by_category={
                 str(key): str(value) for key, value in category_defaults.items()

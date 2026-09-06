@@ -297,6 +297,139 @@ async def test_gate_records_failed_node_ids_from_pytest_cache(tmp_path: Path) ->
     )
 
 
+@pytest.mark.parametrize("mode,limit,green,flaky,failed,reran", [
+    ("flaky", 10, True, 1, 0, True),
+    ("persistent", 10, False, 0, 1, True),
+    ("mixed", 10, False, 1, 1, True),
+    ("mixed", 1, False, 0, 2, False),
+    ("flaky", 0, False, 0, 1, False),
+    ("skip", 10, False, 0, 1, True),
+])
+@pytest.mark.asyncio
+async def test_gate_reruns_only_failed_nodes_once(
+    tmp_path, monkeypatch, mode, limit, green, flaky, failed, reran,
+) -> None:
+    # Real pytest reports and an awkward parametrized ID exercise both exact
+    # selection and the separation between private selectors and public evidence.
+    repo = _init_gate_repo(tmp_path, f'''
+from pathlib import Path
+import os
+import pytest
+
+@pytest.mark.parametrize("value", [1], ids=["token=top-secret ; $literal"])
+def test_candidate(value):
+    assert os.environ["WORKLINK_GATE_TEST_ENV"] == "same"
+    path = Path("visits")
+    visits = int(path.read_text()) if path.exists() else 0
+    path.write_text(str(visits + 1))
+    if {mode!r} == "skip" and visits:
+        pytest.skip("not a passing rerun")
+    assert visits and {mode!r} != "persistent"
+
+def test_other():
+    path = Path("other-visits")
+    visits = int(path.read_text()) if path.exists() else 0
+    path.write_text(str(visits + 1))
+    assert {mode!r} != "mixed"
+''')
+    monkeypatch.setenv("WORKLINK_GATE_TEST_ENV", "same")
+    result = await observe_evidence(
+        issue=1557, attempt=1, backend="codex", branch="issue/1557-a1",
+        checkout=repo, started_at=datetime.now(UTC), base_ref="main",
+        backend_status="completed",
+        test_command=f"{shlex.quote(sys.executable)} -m pytest -q test_gate_sample.py",
+        gate_rerun_max_failures=limit,
+    )
+    tests = result.evidence.tests
+    assert result.review_ready is green
+    assert len(tests.flaky_tests) == flaky
+    assert len(tests.failed_tests) == failed
+    assert tests.counts.failed == failed
+    assert (tests.rerun is not None) is reran
+    assert (repo / "visits").read_text() == ("2" if reran else "1")
+    assert (repo / "other-visits").read_text() == ("2" if mode == "mixed" and reran else "1")
+    if reran:
+        assert tests.initial_run.exit_code == 1
+        assert "-n 0" in tests.rerun.cmd
+        assert "top-secret" not in tests.rerun.cmd
+    assert "top-secret" not in str(result.evidence)
+
+
+@pytest.mark.parametrize("fault", [
+    "exit", "missing", "total", "errors", "skipped", "failures",
+    "collected", "foreign_failure", "exit_counts",
+])
+@pytest.mark.asyncio
+async def test_gate_rerun_incomplete_reports_fail_closed(tmp_path, monkeypatch, fault):
+    import mimir.worklink.evidence as module
+
+    calls = []
+    node = "test_sample.py::test_one"
+    def runner(command, **kwargs):
+        if not isinstance(command, str):
+            output = "test_sample.py\n" if "--name-only" in command else ""
+            return subprocess.CompletedProcess(command, 0, output, "")
+        calls.append(command)
+        options = shlex.split(shlex.split(command)[0].split("=", 1)[1])
+        report = Path(next(part.split("=", 1)[1] for part in options if part.startswith("--junitxml="))).parent
+        second = len(calls) == 2
+        total, failures, errors, skipped, exit_code = 1, int(not second), 0, 0, int(not second)
+        remaining = [] if second else [node]
+        collected = [node]
+        if second:
+            if fault == "exit": exit_code = 2
+            if fault == "total": total = 0
+            if fault == "errors": errors = 1
+            if fault == "skipped": skipped = 1
+            if fault == "failures": failures = 1
+            if fault == "collected": collected = ["test_sample.py::test_other"]
+            if fault == "foreign_failure":
+                remaining, failures, exit_code = ["test_sample.py::test_other"], 1, 1
+            if fault == "exit_counts": exit_code = 1
+        if not (second and fault == "missing"):
+            (report / "junit.xml").write_text(
+                f'<testsuite tests="{total}" failures="{failures}" errors="{errors}" skipped="{skipped}" />'
+            )
+        cache = report / "cache" / "v" / "cache"
+        cache.mkdir(parents=True)
+        (cache / "lastfailed").write_text(json.dumps(dict.fromkeys(remaining, True)))
+        (cache / "nodeids").write_text(json.dumps(collected))
+        return subprocess.CompletedProcess(command, exit_code, "output", "")
+
+    monkeypatch.setattr("mimir.worklink.checkout.coding_enabled", lambda: False)
+    result = await module.observe_evidence(
+        issue=1557, attempt=1, backend="opencode", branch="issue/1557-a1",
+        checkout=tmp_path, started_at=datetime.now(UTC), base_ref="main",
+        backend_status="completed", test_command="uv run --extra dev --extra bench pytest -q -n 6",
+        runner=runner,
+    )
+    assert len(calls) == 2
+    assert result.status == "failed"
+    assert result.evidence.tests.failed_tests == (node,)
+    assert result.evidence.tests.flaky_tests == ()
+
+
+@pytest.mark.parametrize("command", [
+    "pytest -q && true", "pytest -q || true", "echo pytest", "pytest --unknown",
+    "pytest $TEST_SELECTION", "pytest --ignore tests/foo.py", "pytest --collect-only",
+    "uv run sh -c pytest", "uv run echo pytest", "uv run --unknown pytest",
+    "uv sync pytest",
+])
+def test_gate_rerun_refuses_unknown_command_shapes(command):
+    from mimir.worklink.evidence import _pytest_rerun_command
+    assert _pytest_rerun_command(command, ("tests/test_one.py::test_one",)) is None
+
+
+def test_gate_rerun_preserves_launcher_and_removes_selection():
+    from mimir.worklink.evidence import _pytest_rerun_command
+    command = "uv run --extra dev --extra bench pytest -q -n 6 -k first -m slow tests/ -x --lf"
+    node = "tests/test_one.py::test_one[semi; quoted ' argument]"
+    assert shlex.split(_pytest_rerun_command(command, (node,))) == [
+        "uv", "run", "--extra", "dev", "--extra", "bench", "pytest", "-q",
+        "-n", "0", "-k", "", "-m", "", "--", node,
+    ]
+
+
 def test_evidence_test_command_uses_bare_command_without_model_spec(
     monkeypatch,
 ) -> None:

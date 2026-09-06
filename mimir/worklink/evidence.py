@@ -55,6 +55,10 @@ class TestResult:
     counts: TestCounts | None = None
     failed_tests: tuple[str, ...] = ()
     report_error: str | None = None
+    flaky_tests: tuple[str, ...] = ()
+    initial_run: TestResult | None = None
+    rerun: TestResult | None = None
+    previous_observation: TestResult | None = None
 
 
 @dataclass(frozen=True)
@@ -228,6 +232,7 @@ async def observe_evidence(
     executor_tests: TestResult | None = None,
     skip_test_reason: str | None = None,
     runner: Run | None = None,
+    gate_rerun_max_failures: int = 10,
 ) -> EvidenceValidation:
     """Build evidence by observing a normalized checkout after a backend run."""
     return await _observe_evidence_from_ref(
@@ -253,6 +258,7 @@ async def observe_evidence(
         executor_tests=executor_tests,
         skip_test_reason=skip_test_reason,
         runner=runner,
+        gate_rerun_max_failures=gate_rerun_max_failures,
         include_checkout_status=True,
         checkout_ref=checkout_ref,
     )
@@ -315,6 +321,7 @@ async def _observe_evidence_from_ref(
     checkout_ref: str | None = None,
     pre_commands: list[CommandResult] | None = None,
     pre_observed: bool = True,
+    gate_rerun_max_failures: int = 10,
 ) -> EvidenceValidation:
     runner = runner or _run
     from .checkout import coding_enabled
@@ -370,14 +377,14 @@ async def _observe_evidence_from_ref(
         if checkout_result is not None and checkout_result.returncode != 0:
             tests = TestResult(test_command, None, "checkout failed before test", observed=False)
         else:
-            with _gate_report_directory(checkout, worker_uid_drop) as report_dir:
+            async def run_gate(command: str, report_dir: Path) -> TestResult:
                 if worker_uid_drop:
                     if compute is None:
                         raise ValueError("enabled worker evidence requires a compute backend")
                     if work_spec is None:
                         raise ValueError("worker evidence requires the originating WorkSpec")
                     result = await _run_compute_gate(
-                        test_command,
+                        command,
                         checkout=checkout,
                         work_spec=work_spec,
                         compute=compute,
@@ -385,21 +392,73 @@ async def _observe_evidence_from_ref(
                         report_dir=report_dir,
                     )
                     test = subprocess.CompletedProcess(
-                        ["/bin/sh", "-c", test_command],
+                        ["/bin/sh", "-c", command],
                         result.exit_code,
                         stdout=result.stdout,
                         stderr=result.stderr,
                     )
                 else:
-                    observed_command = _command_with_pytest_report(test_command, report_dir)
+                    observed_command = _command_with_pytest_report(command, report_dir)
                     test = runner(observed_command, cwd=checkout)
-                structured = read_pytest_result(test_command, report_dir)
-                tests = replace(
-                    structured or TestResult(test_command),
+                structured = read_pytest_result(command, report_dir)
+                commands.append(CommandResult(redact_text(command), test.returncode, redact_text(_summarize(test))))
+                return replace(
+                    structured or TestResult(redact_text(command)),
+                    cmd=redact_text(command),
                     exit_code=test.returncode,
-                    summary=_summarize_test_output(test),
+                    summary=redact_text(_summarize_test_output(test)),
                 )
-            commands.append(CommandResult(test_command, test.returncode, _summarize(test)))
+
+            with _gate_report_directory(checkout, worker_uid_drop) as report_dir:
+                tests = await run_gate(test_command, report_dir)
+                failed_ids = _pytest_cache_ids(report_dir, "lastfailed")
+                rerun_command = _pytest_rerun_command(test_command, failed_ids)
+                eligible = (
+                    tests.exit_code == 1
+                    and tests.report_error is None
+                    and tests.counts is not None
+                    and tests.counts.errors == 0
+                    and tests.counts.failed == len(failed_ids)
+                    and 0 < len(failed_ids) <= gate_rerun_max_failures
+                    and rerun_command is not None
+                )
+            if eligible:
+                with _gate_report_directory(checkout, worker_uid_drop) as rerun_dir:
+                    rerun = await run_gate(rerun_command, rerun_dir)
+                    remaining = _pytest_cache_ids(rerun_dir, "lastfailed")
+                    collected = _pytest_cache_ids(rerun_dir, "nodeids")
+                    counts = rerun.counts
+                    # An exit-zero rerun alone is not proof: selection, skips,
+                    # missing reports or a different collected set must fail closed.
+                    complete = (
+                        rerun.exit_code in {0, 1}
+                        and rerun.report_error is None
+                        and counts is not None
+                        and counts.total == len(failed_ids)
+                        and counts.errors == 0
+                        and counts.skipped == 0
+                        and counts.failed == len(remaining)
+                        and counts.passed + counts.failed == counts.total
+                        and set(collected) == set(failed_ids)
+                        and set(remaining) <= set(failed_ids)
+                        and (rerun.exit_code == 0) == (counts.failed == 0)
+                    )
+                initial = tests
+                tests = replace(tests, initial_run=initial, rerun=rerun)
+                if complete:
+                    tests = replace(
+                        tests,
+                        exit_code=rerun.exit_code,
+                        counts=replace(
+                            initial.counts,
+                            passed=initial.counts.passed + len(failed_ids) - len(remaining),
+                            failed=len(remaining),
+                        ),
+                        failed_tests=tuple(redact_text(node)[:1000] for node in remaining),
+                        flaky_tests=tuple(
+                            redact_text(node)[:1000] for node in failed_ids if node not in remaining
+                        ),
+                    )
 
     evidence = WorklinkEvidence(
         issue=issue,
@@ -489,6 +548,84 @@ def _common_status(status: str) -> str:
 _PYTEST_REPORT_MAX_BYTES = 20_000_000
 
 
+def _pytest_cache_ids(report_dir: Path, name: str) -> tuple[str, ...]:
+    """Keep executable selectors private; evidence IDs are separately scrubbed."""
+    try:
+        path = report_dir / "cache" / "v" / "cache" / name
+        if path.stat().st_size > _PYTEST_REPORT_MAX_BYTES:
+            return ()
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        if name == "lastfailed":
+            if not isinstance(payload, dict) or any(value is not True for value in payload.values()):
+                return ()
+            payload = list(payload)
+        if not isinstance(payload, list) or not all(isinstance(node, str) for node in payload):
+            return ()
+        return tuple(payload)
+    except (OSError, ValueError):
+        return ()
+
+
+def _pytest_rerun_command(command: str, node_ids: tuple[str, ...]) -> str | None:
+    """Rewrite only simple pytest invocations, preserving their launcher/extras.
+
+    Unknown options and shell programs are not safe to reinterpret as selectors.
+    Refusing them leaves the original gate failure intact.
+    """
+    if not node_ids or any(not node or "::" not in node or node.startswith("-") or "\x00" in node for node in node_ids):
+        return None
+    if any(char in command for char in "$`\n\r"):
+        return None
+    try:
+        lexer = shlex.shlex(command, posix=True, punctuation_chars=";&|<>()")
+        lexer.whitespace_split = True
+        tokens = list(lexer)
+        if any(token in {";", "&&", "||", "|", "&", "<", ">", "(", ")"} for token in tokens):
+            return None
+        args = shlex.split(command)
+        index = next(i for i, token in enumerate(args) if Path(token).name in {"pytest", "py.test"})
+    except (ValueError, StopIteration):
+        return None
+    prefix = args[:index + 1]
+    launcher_args = args[:index]
+    if launcher_args and Path(launcher_args[0]).name == "uv":
+        if launcher_args[1:2] != ["run"]:
+            return None
+        launcher_args = launcher_args[2:]
+        while launcher_args and launcher_args[0].startswith("-"):
+            option = launcher_args.pop(0)
+            if option in {"--extra", "--group", "--python"} and launcher_args:
+                launcher_args.pop(0)
+            elif option not in {"--no-sync", "--locked", "--frozen", "--all-extras"}:
+                return None
+    if launcher_args and not (
+        len(launcher_args) == 2
+        and Path(launcher_args[0]).name in {"python", "python3", "python3.11", "python3.12", "python3.13", "python3.14"}
+        and launcher_args[1] == "-m"
+    ):
+        return None
+    # Drop original paths, selection and parallelism; preserve execution options
+    # only when their argument shape is known. Never carry --lf/--ff or -x.
+    retained: list[str] = []
+    index += 1
+    while index < len(args):
+        token = args[index]
+        if token in {"-n", "--numprocesses", "--dist", "-k", "-m", "--maxfail"}:
+            index += 2
+            continue
+        if token.startswith(("--numprocesses=", "--dist=", "--maxfail=", "-n=")) or (token.startswith("-n") and token[2:].isdigit()):
+            index += 1
+            continue
+        if token in {"-q", "-v", "-vv", "-s", "--disable-warnings", "--strict-markers", "--strict-config"}:
+            retained.append(token)
+        elif token in {"-x", "--exitfirst", "--lf", "--last-failed", "--ff", "--failed-first"}:
+            pass
+        elif token.startswith("-"):
+            return None
+        index += 1
+    return shlex.join([*prefix, *retained, "-n", "0", "-k", "", "-m", "", "--", *node_ids])
+
+
 def pytest_report_environment(
     command: str,
     report_dir: Path,
@@ -573,7 +710,7 @@ def _is_pytest_command(command: str) -> bool:
 
 
 def _command_with_pytest_report(command: str, report_dir: Path) -> str:
-    environment = pytest_report_environment(command, report_dir)
+    environment = pytest_report_environment(command, report_dir, existing=os.environ.get("PYTEST_ADDOPTS"))
     if not environment:
         return command
     return f"PYTEST_ADDOPTS={shlex.quote(environment['PYTEST_ADDOPTS'])} {command}"
