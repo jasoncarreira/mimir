@@ -598,15 +598,20 @@ DEFAULT_IDENTITIES_YAML = dedent(
 )
 
 
-def _write_if_missing(path: Path, content: str) -> bool:
+def _write_if_missing(path: Path, content: str, *, home: Path | None = None) -> bool:
     """Write ``content`` to ``path`` only if the file doesn't exist.
 
-    Returns True if the file was created.
+    Returns True if the file was created. Pass ``home`` for trusted framework seeds.
     """
     if path.exists():
         return False
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(content, encoding="utf-8")
+    if home is None:
+        path.write_text(content, encoding="utf-8")
+    else:
+        from ..access_control import write_framework_file
+
+        write_framework_file(home, path, content.encode("utf-8"))
     return True
 
 
@@ -864,25 +869,26 @@ def setup_home(
     # and is never re-seeded on later runs.
     if fresh_home and seed_init_block(home) == "created":
         files_created.append(f"memory/core/{INIT_BLOCK_NAME}")
-    if _write_if_missing(home / "state" / "wiki" / "AGENTS.md", DEFAULT_WIKI_AGENTS_MD):
+    if _write_if_missing(home / "state" / "wiki" / "AGENTS.md", DEFAULT_WIKI_AGENTS_MD, home=home):
         files_created.append("state/wiki/AGENTS.md")
-    if _write_if_missing(home / "state" / "wiki" / "index.md", DEFAULT_WIKI_INDEX_MD):
+    if _write_if_missing(home / "state" / "wiki" / "index.md", DEFAULT_WIKI_INDEX_MD, home=home):
         files_created.append("state/wiki/index.md")
-    if _write_if_missing(home / "state" / "wiki" / "log.md", DEFAULT_WIKI_LOG_MD):
+    if _write_if_missing(home / "state" / "wiki" / "log.md", DEFAULT_WIKI_LOG_MD, home=home):
         files_created.append("state/wiki/log.md")
-    if _write_if_missing(home / "state" / "identities.yaml", DEFAULT_IDENTITIES_YAML):
+    if _write_if_missing(home / "state" / "identities.yaml", DEFAULT_IDENTITIES_YAML, home=home):
         files_created.append("state/identities.yaml")
     if _write_if_missing(
-        home / "state" / "heartbeat-backlog.md", DEFAULT_HEARTBEAT_BACKLOG
+        home / "state" / "heartbeat-backlog.md", DEFAULT_HEARTBEAT_BACKLOG, home=home
     ):
         files_created.append("state/heartbeat-backlog.md")
     if _write_if_missing(
         home / "memory" / "issues" / "README.md",
         DEFAULT_ISSUES_README,
+        home=home,
     ):
         files_created.append("memory/issues/README.md")
     if _write_if_missing(
-        home / "state" / "proposed-changes.md", DEFAULT_PROPOSED_CHANGES
+        home / "state" / "proposed-changes.md", DEFAULT_PROPOSED_CHANGES, home=home
     ):
         files_created.append("state/proposed-changes.md")
 

@@ -9,7 +9,6 @@ already exist, so customizations persist.
 from __future__ import annotations
 
 import logging
-import shutil
 from pathlib import Path
 
 log = logging.getLogger(__name__)
@@ -56,6 +55,8 @@ def seed_core_memory(home: Path) -> dict[str, str]:
     ``"present"`` (target already exists; left alone), ``"skipped"``
     (copy failed).
     """
+    from ..access_control import write_framework_file
+
     target_root = home / "memory" / "core"
     target_root.mkdir(parents=True, exist_ok=True)
     out: dict[str, str] = {}
@@ -66,10 +67,10 @@ def seed_core_memory(home: Path) -> dict[str, str]:
             out[name] = "present"
             continue
         try:
-            shutil.copy2(src, dst)
+            write_framework_file(home, dst, src.read_bytes())
             out[name] = "created"
             log.info("seeded default core memory: %s", dst)
-        except OSError as exc:
+        except (OSError, ValueError) as exc:
             log.warning("seed_core_memory: failed to copy %s: %s", name, exc)
             out[name] = "skipped"
     return out
@@ -116,14 +117,16 @@ def seed_init_block(home: Path) -> str:
     ``"present"`` (already there; left alone), or ``"skipped"`` (write
     failed).
     """
+    from ..access_control import write_framework_file
+
     target = home / "memory" / "core" / INIT_BLOCK_NAME
     if target.exists():
         return "present"
     try:
         target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text(INIT_BLOCK_TEXT, encoding="utf-8")
+        write_framework_file(home, target, INIT_BLOCK_TEXT.encode("utf-8"))
         log.info("seeded onboarding bootstrap (fresh home): %s", target)
-    except OSError as exc:
+    except (OSError, ValueError) as exc:
         log.warning("seed_init_block: failed to write %s: %s", target, exc)
         return "skipped"
     return "created"

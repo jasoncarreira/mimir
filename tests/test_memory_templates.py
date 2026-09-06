@@ -9,6 +9,10 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
+from mimir import access_control
+
 from mimir.memory_templates import (
     DEFAULT_ACTION_BOUNDARIES,
     DEFAULT_FILING_RULES,
@@ -38,6 +42,39 @@ CORE_TEMPLATE_NAMES = (
     "50-heartbeat-patterns.md",
     "60-filing-rules.md",
 )
+
+
+@pytest.mark.parametrize("seed", [seed_core_memory, seed_init_block])
+@pytest.mark.parametrize("preexisting", [False, True])
+def test_memory_seed_integrity_after_ledger_initialization(tmp_path, seed, preexisting):
+    home = tmp_path / "home"
+    assert access_control.initialize_file_integrity_ledger(home)
+    rel = Path("memory/core") / (INIT_BLOCK_NAME if seed is seed_init_block else "00-identity.md")
+    if preexisting:
+        (home / rel).parent.mkdir(parents=True)
+        (home / rel).write_text("custom content\n")
+
+    result = seed(home)
+
+    status = result if isinstance(result, str) else result[rel.name]
+    assert status == ("present" if preexisting else "created")
+    assert access_control._persisted_file_integrity(
+        home, rel, require_recorded=True,
+    ) == ("untrusted" if preexisting else "trusted")
+    if preexisting:
+        assert (home / rel).read_text() == "custom content\n"
+
+
+@pytest.mark.parametrize("seed", [seed_core_memory, seed_init_block])
+@pytest.mark.parametrize("error", [OSError, ValueError])
+def test_memory_seed_reports_failed_trusted_write(tmp_path, monkeypatch, seed, error):
+    def fail(home, destination, content):
+        raise error("cannot record trusted bytes")
+
+    monkeypatch.setattr(access_control, "write_framework_file", fail)
+    result = seed(tmp_path)
+    assert (set(result.values()) if isinstance(result, dict) else {result}) == {"skipped"}
+    assert not list((tmp_path / "memory/core").glob("*.md"))
 
 
 def test_core_memory_templates_are_bundled_files() -> None:

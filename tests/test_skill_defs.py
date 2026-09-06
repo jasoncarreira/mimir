@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
 
 import mimir.skill_defs as skill_defs
+from mimir import access_control
 
 from mimir.skill_defs import (
     _bundled_skill_names,
@@ -312,3 +314,87 @@ def test_installed_skill_names_skips_dirs_without_skill_md(tmp_path: Path):
     (skills / "broken").mkdir()  # no SKILL.md
     names = installed_skill_names(tmp_path)
     assert "broken" not in names
+
+
+@pytest.fixture
+def integrity_bundle(tmp_path, monkeypatch):
+    home = tmp_path / "home"
+    home.mkdir()
+    package = tmp_path / "package"
+    source = package / "example"
+    source.mkdir(parents=True)
+    (source / "SKILL.md").write_text("# Package documentation\n")
+    (source / "script.py").write_text("print('package')\n")
+    monkeypatch.setattr(skill_defs, "_BUNDLED_ROOT", package)
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    assert access_control.initialize_file_integrity_ledger(home)
+    metadata = home / ".mimir/file-integrity.json"
+    payload = json.loads(metadata.read_text())
+    payload["__ledger_epoch_ns__"] = 1
+    metadata.write_text(json.dumps(payload))
+    return home, source, metadata
+
+
+def test_refresh_then_read_integrity_with_old_epoch(integrity_bundle):
+    home, source, metadata = integrity_bundle
+    for version in ("first", "second"):
+        (source / "SKILL.md").write_text(version)
+        assert skill_defs.refresh_builtin_skills(home) == {"example": "refreshed"}
+        for name in ("SKILL.md", "script.py"):
+            target = home / ".mimir_builtin_skills/example" / name
+            assert target.read_bytes() == (source / name).read_bytes()
+            assert access_control._filesystem_result_integrity(None, str(target)) == (
+                "trusted", "informational",
+            )
+            assert json.loads(metadata.read_text())[target.relative_to(home).as_posix()] == "trusted"
+
+
+def test_builtin_stray_and_deleted_records(integrity_bundle):
+    home, source, metadata = integrity_bundle
+    skill_defs.refresh_builtin_skills(home)
+    stray = home / ".mimir_builtin_skills/stray.md"
+    stray.write_text("unrecorded")
+    (source / "script.py").unlink()
+    skill_defs.refresh_builtin_skills(home)
+    assert access_control._filesystem_result_integrity(None, str(stray)) == (
+        "untrusted", "active_ingest",
+    )
+    payload = json.loads(metadata.read_text())
+    assert ".mimir_builtin_skills/stray.md" not in payload
+    assert ".mimir_builtin_skills/example/script.py" not in payload
+    assert not (home / ".mimir_builtin_skills/example/script.py").exists()
+
+
+def test_builtin_integrity_migration_is_content_bound_and_idempotent(integrity_bundle, caplog):
+    import shutil
+
+    home, source, metadata = integrity_bundle
+    target = home / ".mimir_builtin_skills/example"
+    shutil.copytree(source, target)
+    (target / "script.py").write_text("not package bytes")
+    (target / "stray.md").write_text("stray")
+    with caplog.at_level("INFO", logger="mimir.skill_defs"):
+        assert skill_defs.migrate_builtin_skill_integrity(home) == 1
+    assert [record.message for record in caplog.records] == [
+        "builtin_skill_integrity_migration recorded=1",
+    ]
+    before = metadata.read_bytes()
+    assert skill_defs.migrate_builtin_skill_integrity(home) == 0
+    assert metadata.read_bytes() == before
+    for name in ("script.py", "stray.md"):
+        assert access_control._filesystem_result_integrity(None, str(target / name)) == (
+            "untrusted", "active_ingest",
+        )
+
+
+def test_builtin_integrity_migration_does_not_follow_redirected_skill(integrity_bundle):
+    import shutil
+
+    home, source, metadata = integrity_bundle
+    outside = home / "docs/redirected"
+    shutil.copytree(source, outside)
+    root = home / ".mimir_builtin_skills"
+    root.mkdir()
+    (root / "example").symlink_to(outside, target_is_directory=True)
+    assert skill_defs.migrate_builtin_skill_integrity(home) == 0
+    assert "docs/redirected/SKILL.md" not in json.loads(metadata.read_text())

@@ -9642,6 +9642,74 @@ def initialize_file_integrity_ledger(home: Path) -> bool:
             return False
 
 
+def record_framework_file_integrity(
+    home: Path,
+    files: Mapping[Path, bytes],
+    publish: Callable[[], None],
+    *,
+    prune_builtin: bool = False,
+) -> int:
+    """Publish framework bytes with a fail-closed ledger transaction.
+
+    Only internal package/scaffold writers may call this. Invalidate old records
+    before publication so an interrupted write cannot inherit trust. The final
+    ledger replacement commits verified bytes together; a crash between the two
+    filesystem publications leaves untrusted records, never speculative trust.
+    """
+    home = home.resolve(strict=True)
+    expected: dict[str, tuple[Path, bytes]] = {}
+    for path, content in files.items():
+        resolved = path.resolve(strict=False)
+        relative = resolved.relative_to(home)
+        if (
+            len(relative.parts) < 2
+            or relative.parts[0] not in _SELF_AUTHORED_FILE_ROOTS - {"skills"}
+            or relative.parts[:2] == ("state", "pollers")
+        ):
+            raise ValueError(f"not a framework scaffold destination: {path}")
+        expected[relative.as_posix()] = (resolved, content)
+
+    metadata_path = home / ".mimir" / "file-integrity.json"
+    with _persisted_file_integrity_lock:
+        payload = json.loads(metadata_path.read_text()) if metadata_path.exists() else {}
+        if not isinstance(payload, dict):
+            raise ValueError("invalid file integrity ledger")
+        epoch = payload.setdefault(_FILE_INTEGRITY_EPOCH_KEY, time.time_ns())
+        if not isinstance(epoch, int) or isinstance(epoch, bool) or epoch <= 0:
+            raise ValueError("invalid file integrity epoch")
+        recorded = sum(payload.get(key) != "trusted" for key in expected)
+        payload.update(dict.fromkeys(expected, "untrusted"))
+        metadata_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = metadata_path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(payload, sort_keys=True) + "\n", encoding="utf-8")
+        tmp.replace(metadata_path)
+        publish()
+        for path, content in expected.values():
+            if path.resolve(strict=True) != path or path.read_bytes() != content:
+                raise ValueError(f"framework output changed during publication: {path}")
+        if prune_builtin:
+            for key in tuple(payload):
+                if key.startswith(".mimir_builtin_skills/") and not (home / key).exists():
+                    del payload[key]
+        payload.update(dict.fromkeys(expected, "trusted"))
+        tmp.write_text(json.dumps(payload, sort_keys=True) + "\n", encoding="utf-8")
+        tmp.replace(metadata_path)
+        return recorded
+
+
+def write_framework_file(home: Path, destination: Path, content: bytes) -> None:
+    """Write one package/template scaffold through the integrity transaction."""
+    def publish() -> None:
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        tmp = destination.with_name(destination.name + ".tmp")
+        # Exclusive creation refuses a pre-planted temporary symlink.
+        with tmp.open("xb") as stream:
+            stream.write(content)
+        tmp.replace(destination)
+
+    record_framework_file_integrity(home, {destination: content}, publish)
+
+
 def record_admin_installed_skill_integrity(home: Path, skill_root: Path) -> bool:
     """Atomically trust every file in one completed admin-installed skill."""
     try:
