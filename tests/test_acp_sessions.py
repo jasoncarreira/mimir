@@ -1786,27 +1786,48 @@ def _hands(server_id: str) -> list[dict[str, Any]]:
 
 
 @pytest.mark.parametrize("failure", ["request_error", "is_error"])
+@pytest.mark.parametrize(
+    ("tool_name", "arguments", "provider_arguments", "provider_message"),
+    [
+        ("hands_read", {"path": "notes.txt"}, {"path": "notes.txt"},
+         "[Errno 2] No such file or directory: 'notes.txt'"),
+        ("hands_read", {"path": "notes.txt"}, {"path": "notes.txt"},
+         "file too large"),
+        ("hands_edit", {"path": "notes.txt", "old_text": "old", "new_text": "new"},
+         {"path": "notes.txt", "oldText": "old", "newText": "new"},
+         "edit mismatch: oldText occurs 0 times"),
+    ],
+)
 async def test_provider_tool_error_becomes_tool_message_and_agent_reply(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: str,
+    tool_name: str, arguments: dict[str, str], provider_arguments: dict[str, str],
+    provider_message: str,
 ) -> None:
     from langchain.agents.middleware import ToolCallRequest
     from langchain_core.messages import AIMessage, ToolMessage
     from langgraph.runtime import Runtime
 
+    from mimir import harness_egress
     from mimir.tools.budget_gate import BudgetGateMiddleware
     from mimir.tools.client_provider import hands_read
     from mimir.turn_event_bus import TurnEventEmitter
 
-    provider_message = "Cannot read notes.txt: file does not exist"
     internal_detail = "private provider traceback at /internal/worker.py:42"
+    sink_events: list[str] = []
+    monkeypatch.setattr(
+        harness_egress, "log_event_sync", lambda event, **kwargs: sink_events.append(event),
+    )
 
     class FailingClient(McpClient):
+        async def request_tool_permission(self, session_id: str, snapshot: Any) -> Any:
+            return sdk.PermissionCompletion("allow_once")
+
         async def message_mcp(self, connection_id: str, method: str, params: Any = None) -> Any:
             if method != "tools/call":
                 return await super().message_mcp(connection_id, method, params)
             self.messages.append((connection_id, method, params))
-            assert params["name"] == "read"
-            assert params["arguments"] == {"path": "notes.txt"}
+            assert params["name"] == tool_name.removeprefix("hands_")
+            assert params["arguments"] == provider_arguments
             if failure == "request_error":
                 raise sdk.RequestError(-32000, provider_message, {"detail": internal_detail})
             return {"isError": True, "content": [{"type": "text", "text": provider_message}]}
@@ -1827,10 +1848,11 @@ async def test_provider_tool_error_becomes_tool_message_and_agent_reply(
             interactivity=TurnInteractivity.INTERACTIVE,
             ifc_labels=labels, ifc_state=InformationFlowState(labels=labels),
             saga_session_id=kwargs["saga_session_id"],
+            enforcement_enabled=True,
         )
         tool_call = {
-            "id": "missing-file", "name": "hands_read",
-            "args": {"path": "notes.txt"}, "type": "tool_call",
+            "id": "missing-file", "name": tool_name,
+            "args": arguments, "type": "tool_call",
         }
         emitter = TurnEventEmitter(
             bundle.turn_event_bus, turn_id=kwargs["turn_id"], channel_id=event.channel_id,
@@ -1842,9 +1864,10 @@ async def test_provider_tool_error_becomes_tool_message_and_agent_reply(
         )
 
         async def handler(call: ToolCallRequest) -> ToolMessage:
-            result = await hands_read.ainvoke(call.tool_call["args"])
+            tool = hands_read if tool_name == "hands_read" else hands_edit
+            result = await tool.ainvoke(call.tool_call["args"])
             return ToolMessage(
-                content=json.dumps(result), tool_call_id=call.tool_call["id"], name="hands_read",
+                content=json.dumps(result), tool_call_id=call.tool_call["id"], name=tool_name,
             )
 
         result = await BudgetGateMiddleware().awrap_tool_call(request, handler)
@@ -1854,6 +1877,9 @@ async def test_provider_tool_error_becomes_tool_message_and_agent_reply(
         await bundle.turn_event_bus._exact_turn_subscribers[kwargs["turn_id"]].join()
         await agent._active_prompts[session_id].dispatcher.drain()
         if result.status == "error":
+            assert harness_egress.harness_sink_allowed(
+                "harness_auto_deliver", event.channel_id, labels, auth,
+            ) is True
             delivered = await core.channels.send(event.channel_id, f"Read failed: {result.content}")
             assert delivered.sent
 
@@ -1885,6 +1911,7 @@ async def test_provider_tool_error_becomes_tool_message_and_agent_reply(
         assert "".join(text for _, text in replies) == f"Read failed: {provider_message}"
         assert len([entry for entry in client.messages if entry[1] == "tools/call"]) == 1
         assert internal_detail not in str(client.updates)
+        assert "sink_blocked" not in sink_events
 
         monkeypatch.setattr(core, "run_turn", original_turn)
         client.updates.clear()

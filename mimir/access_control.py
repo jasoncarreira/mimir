@@ -9903,6 +9903,8 @@ def _acp_failed_tool_error_result(
     result: Any,
     auth_context: "AuthContext | None",
     provenance: ProtectedResultProvenance | None,
+    *,
+    hands_failure: bool = False,
 ) -> "InformationFlowLabels | None":
     """Label an error-only ACP result as informational session-channel input."""
     from langchain_core.messages import ToolMessage
@@ -9910,7 +9912,7 @@ def _acp_failed_tool_error_result(
     from .models import InformationFlowLabels, SourceLabel
     from .tools.client_provider import ClientProviderResultError
 
-    if (
+    if not hands_failure and (
         provenance is not None
         or not (
             isinstance(result, ClientProviderResultError)
@@ -9919,8 +9921,9 @@ def _acp_failed_tool_error_result(
                 and getattr(result, "status", None) == "error"
             )
         )
-        or getattr(auth_context, "origin_trigger", None) != "acp_session"
     ):
+        return None
+    if getattr(auth_context, "origin_trigger", None) != "acp_session":
         return None
     principal = getattr(auth_context, "canonical_principal", None)
     channel = getattr(auth_context, "channel_id", None)
@@ -10048,6 +10051,15 @@ def classify_protected_result(
 
     if tool_name in _ACP_HANDS_RESULT_TOOLS:
         if failed:
+            # Failed Hands calls expose an error, not the attempted file/process input.
+            error_labels = _acp_failed_tool_error_result(
+                result, auth_context, provenance, hands_failure=True,
+            )
+            if error_labels is not None:
+                # An error does not erase sources captured before the failure.
+                for source in provenance.sources if provenance is not None else ():
+                    error_labels = error_labels.with_source(source)
+                return error_labels
             return _incomplete_protected_result(
                 "client_provider", args,
                 tool_name=tool_name,
