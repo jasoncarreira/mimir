@@ -529,15 +529,72 @@ async def test_schema_backed_result_requires_structured_content() -> None:
 
 
 @pytest.mark.asyncio
-async def test_mcp_is_error_result_is_a_tool_failure() -> None:
+@pytest.mark.parametrize("wrapper_name", ["hands_read", "hands_edit", "hands_shell", "hands_python"])
+@pytest.mark.parametrize("structured", [False, True])
+async def test_mcp_is_error_result_is_a_tool_failure(wrapper_name: str, structured: bool) -> None:
     response = {
-        "content": [{"type": "text", "text": "read failed"}],
-        "structuredContent": {"content": "must not be returned"},
+        "content": [{"type": "text", "text": "provider failed"}],
         "isError": True,
     }
+    if structured:
+        response["structuredContent"] = {"content": "must not be returned"}
 
-    with pytest.raises(RuntimeError, match="returned isError"):
-        await _invoke_wrapper("hands_read", _stock_provider(response))
+    with pytest.raises(ToolException) as raised:
+        await _invoke_wrapper(wrapper_name, _stock_provider(response))
+    assert str(raised.value) == "provider failed"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("wrapper_name", "message"), [
+    ("hands_read", "hands_read failed: No such file or directory"),
+    ("hands_read", "hands_read failed: Permission denied"),
+    ("hands_read", "File too large"),
+    ("hands_edit", "oldText not found"),
+    ("hands_edit", "Path is unwritable"),
+    ("hands_shell", "Spawn failed"),
+    ("hands_python", "Kernel unavailable"),
+])
+async def test_provider_rpc_errors_are_tool_failures(wrapper_name: str, message: str) -> None:
+    provider = _stock_provider({})
+
+    async def fail(*args: Any) -> Any:
+        raise agent_module.RequestError(-32000, message, {"internal": "must not leak"})
+
+    provider.peer.message_mcp = fail
+    with pytest.raises(ToolException) as raised:
+        await _invoke_wrapper(wrapper_name, provider)
+    assert str(raised.value) == message
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["transport", "closed", "generation", "replaced"])
+@pytest.mark.parametrize("reply", ["rpc", "isError", "success"])
+async def test_provider_faults_are_not_tool_errors(failure: str, reply: str) -> None:
+    provider = _stock_provider({})
+
+    async def fail(*args: Any) -> Any:
+        if failure == "transport":
+            raise ConnectionError("provider connection lost")
+        if failure == "closed":
+            provider.closed = True
+        elif failure == "generation":
+            provider.session.active_prompt = None
+        else:
+            provider.session.provider = object()
+        if reply == "rpc":
+            raise agent_module.RequestError(-32000, "ordinary provider failure")
+        if reply == "isError":
+            return {"isError": True, "content": [{"type": "text", "text": "failure"}]}
+        return {"structuredContent": {"content": "stale"}}
+
+    provider.peer.message_mcp = fail
+    expected = ConnectionError if failure == "transport" else RuntimeError
+    with pytest.raises(expected) as raised:
+        await _invoke_wrapper("hands_read", provider)
+    assert not isinstance(raised.value, ToolException)
+    assert str(raised.value) == (
+        "provider connection lost" if failure == "transport" else "Stale client provider result"
+    )
 
 
 @pytest.mark.asyncio

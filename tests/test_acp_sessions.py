@@ -1785,6 +1785,124 @@ def _hands(server_id: str) -> list[dict[str, Any]]:
     return [{"type": "acp", "name": "mimir-hands", "serverId": server_id}]
 
 
+@pytest.mark.parametrize("failure", ["request_error", "is_error"])
+async def test_provider_tool_error_becomes_tool_message_and_agent_reply(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: str,
+) -> None:
+    from langchain.agents.middleware import ToolCallRequest
+    from langchain_core.messages import AIMessage, ToolMessage
+    from langgraph.runtime import Runtime
+
+    from mimir.tools.budget_gate import BudgetGateMiddleware
+    from mimir.tools.client_provider import hands_read
+    from mimir.turn_event_bus import TurnEventEmitter
+
+    provider_message = "Cannot read notes.txt: file does not exist"
+    internal_detail = "private provider traceback at /internal/worker.py:42"
+
+    class FailingClient(McpClient):
+        async def message_mcp(self, connection_id: str, method: str, params: Any = None) -> Any:
+            if method != "tools/call":
+                return await super().message_mcp(connection_id, method, params)
+            self.messages.append((connection_id, method, params))
+            assert params["name"] == "read"
+            assert params["arguments"] == {"path": "notes.txt"}
+            if failure == "request_error":
+                raise sdk.RequestError(-32000, provider_message, {"detail": internal_detail})
+            return {"isError": True, "content": [{"type": "text", "text": provider_message}]}
+
+    bundle, core = _bundle(tmp_path)
+    agent = MimirAcpAgent(bundle)
+    client = FailingClient()
+    agent.on_connect(client)
+    await agent.authenticate("mimir-web-key", **{"mimir.webKey": "secret"})
+    session_id = (await agent.new_session(str(tmp_path), mcp_servers=_hands("hands"))).session_id
+    results: list[ToolMessage] = []
+    original_turn = core.run_turn
+
+    async def integrated_turn(event: Any, **kwargs: Any) -> None:
+        labels = _initialize_ifc_labels(event, resolver=bundle.core.identity_resolver)
+        auth = dataclasses.replace(
+            event.continuation_auth_context,
+            interactivity=TurnInteractivity.INTERACTIVE,
+            ifc_labels=labels, ifc_state=InformationFlowState(labels=labels),
+            saga_session_id=kwargs["saga_session_id"],
+        )
+        tool_call = {
+            "id": "missing-file", "name": "hands_read",
+            "args": {"path": "notes.txt"}, "type": "tool_call",
+        }
+        emitter = TurnEventEmitter(
+            bundle.turn_event_bus, turn_id=kwargs["turn_id"], channel_id=event.channel_id,
+        )
+        messages: list[Any] = [AIMessage(content="", tool_calls=[tool_call])]
+        emitter.blocks_from_messages(messages)
+        request = ToolCallRequest(
+            tool_call=tool_call, tool=None, state=None, runtime=Runtime(context=auth),
+        )
+
+        async def handler(call: ToolCallRequest) -> ToolMessage:
+            result = await hands_read.ainvoke(call.tool_call["args"])
+            return ToolMessage(
+                content=json.dumps(result), tool_call_id=call.tool_call["id"], name="hands_read",
+            )
+
+        result = await BudgetGateMiddleware().awrap_tool_call(request, handler)
+        results.append(result)
+        messages.append(result)
+        emitter.blocks_from_messages(messages)
+        await bundle.turn_event_bus._exact_turn_subscribers[kwargs["turn_id"]].join()
+        await agent._active_prompts[session_id].dispatcher.drain()
+        if result.status == "error":
+            delivered = await core.channels.send(event.channel_id, f"Read failed: {result.content}")
+            assert delivered.sent
+
+    monkeypatch.setattr(core, "run_turn", integrated_turn)
+    channel = f"acp:{session_id}"
+    captured = bundle.turn_event_bus.subscribe(channel)
+    try:
+        response = await agent.prompt(
+            session_id, [sdk.TextContentBlock(type="text", text="read notes.txt")],
+        )
+        assert len(results) == 1
+        assert results[0].status == "error"
+        assert results[0].content == provider_message
+        assert response.stop_reason == "end_turn"
+        failed = [
+            (index, update) for index, update in enumerate(client.updates)
+            if update.session_update == "tool_call_update" and update.status == "failed"
+        ]
+        assert len(failed) == 1
+        failed_index, update = failed[0]
+        assert update.tool_call_id == "missing-file"
+        assert update.raw_output == provider_message
+        replies = [
+            (index, update.content.text) for index, update in enumerate(client.updates)
+            if update.session_update == "agent_message_chunk"
+        ]
+        assert replies
+        assert all(index > failed_index for index, _ in replies)
+        assert "".join(text for _, text in replies) == f"Read failed: {provider_message}"
+        assert len([entry for entry in client.messages if entry[1] == "tools/call"]) == 1
+        assert internal_detail not in str(client.updates)
+
+        monkeypatch.setattr(core, "run_turn", original_turn)
+        client.updates.clear()
+        following = await agent.prompt(
+            session_id, [sdk.TextContentBlock(type="text", text="continue without that file")],
+        )
+        assert following.stop_reason == "end_turn"
+        assert "".join(
+            update.content.text for update in client.updates
+            if update.session_update == "agent_message_chunk"
+        ) == "answer"
+        events = [captured.get_nowait() for _ in range(captured.qsize())]
+        assert any(event["type"] == "tool_result" and event.get("status") == "error" for event in events)
+        assert not any(event["type"] == "turn_failed" for event in events)
+    finally:
+        bundle.turn_event_bus.unsubscribe(channel, captured)
+
+
 @pytest.mark.parametrize(
     "servers",
     [

@@ -27,6 +27,7 @@ from mimir.tools.client_provider import (
     ProviderDeclaration,
     ProviderProfile,
     ProviderSchemaError,
+    ProviderToolError,
     TurnCapabilityContext,
     client_authorized_host_execution_metadata,
     reset_turn_capability_context,
@@ -329,6 +330,7 @@ class _AcpProviderConnection:
         ownership = ProgressTokenOwnership(
             self, active.generation, active.epoch, object()
         )
+        provider_error: RequestError | None = None
         try:
             async with self.agent._boundary_lock:
                 if self.closed or not active._is_current() or self.session.provider is not self:
@@ -354,7 +356,10 @@ class _AcpProviderConnection:
                     request_task = asyncio.create_task(
                         self.peer.message_mcp(self.connection_id, "tools/call", params)
                     )
-            result = await request_task
+            try:
+                result = await request_task
+            except RequestError as exc:
+                provider_error = exc
         except asyncio.CancelledError:
             if handle is not None:
                 handle.abandon()
@@ -369,8 +374,18 @@ class _AcpProviderConnection:
                 active.mcp_request_ids.discard(handle.outer_id)
         if self.closed or not active._is_current() or self.session.provider is not self:
             raise RuntimeError("Stale client provider result")
+        if provider_error is not None:
+            raise ProviderToolError(provider_error.to_error_obj()["message"]) from None
         if not isinstance(result, Mapping):
             raise RuntimeError("Malformed client provider result")
+        if result.get("isError") is True:
+            content = result.get("content", [])
+            error_text = "\n".join(
+                block["text"] for block in content
+                if isinstance(block, Mapping) and block.get("type") == "text"
+                and isinstance(block.get("text"), str)
+            ) if isinstance(content, list) else ""
+            raise ProviderToolError(error_text or "Client provider tool returned isError")
         if "structuredContent" not in result:
             session_id = self.session.record.session_id
             _LOGGER.error(
@@ -380,8 +395,6 @@ class _AcpProviderConnection:
             raise ClientProviderResultError(
                 f"Client provider tool {name!r} result is missing structuredContent"
             )
-        if result.get("isError") is True:
-            raise RuntimeError("Client provider tool returned isError")
         structured_content = result["structuredContent"]
         if not isinstance(structured_content, Mapping):
             raise RuntimeError("Malformed client provider structuredContent")
