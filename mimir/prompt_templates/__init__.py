@@ -30,7 +30,6 @@ or modify per their needs.
 from __future__ import annotations
 
 import logging
-import shutil
 from pathlib import Path
 
 from ..worklink.planning import render_decompose_prompt
@@ -102,6 +101,8 @@ def seed_prompts(home: Path) -> dict[str, str]:
     Idempotent — a clean run after the first one is a no-op (everything
     reports ``"present"``).
     """
+    from ..access_control import write_framework_file
+
     target_root = home / "prompts"
     target_root.mkdir(parents=True, exist_ok=True)
     out: dict[str, str] = {}
@@ -113,10 +114,10 @@ def seed_prompts(home: Path) -> dict[str, str]:
             continue
         try:
             text = _render_template(name, src.read_text(encoding="utf-8"))
-            dst.write_text(text, encoding="utf-8")
+            write_framework_file(home, dst, text.encode("utf-8"))
             out[name] = "created"
             log.info("seeded default prompt: %s", dst)
-        except OSError as exc:
+        except (OSError, ValueError) as exc:
             log.warning("seed_prompts: failed to copy %s: %s", name, exc)
             out[name] = "skipped"
     return out

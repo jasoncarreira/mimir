@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from mimir import doc_seed
+from mimir import access_control, doc_seed
 
 
 def _make_source(tmp_path: Path) -> Path:
@@ -119,3 +119,43 @@ def test_graceful_when_no_source(tmp_path, monkeypatch):
     home = _home(tmp_path)
     assert doc_seed.seed_docs(home, version="1.0") == {}
     assert doc_seed.refresh_docs(home, version="1.0") == {}
+
+
+def test_seed_and_refresh_record_only_written_docs(source, tmp_path):
+    home = _home(tmp_path)
+    assert access_control.initialize_file_integrity_ledger(home)
+    existing = home / "docs/configuration.md"
+    existing.parent.mkdir()
+    existing.write_bytes((source / "docs/configuration.md").read_bytes())
+
+    statuses = doc_seed.seed_docs(home, version="1.0")
+    for rel, status in statuses.items():
+        assert access_control._persisted_file_integrity(
+            home, Path(rel), require_recorded=True,
+        ) == ("untrusted" if status == "present" else "trusted")
+
+    assert doc_seed.refresh_docs(home, version="2.0")["docs/configuration.md"] == "unchanged"
+    assert access_control._persisted_file_integrity(
+        home, Path("docs/configuration.md"), require_recorded=True,
+    ) == "untrusted"
+    (source / "docs/configuration.md").write_text("config v3\n")
+    (source / "docs/new.md").write_text("new doc\n")
+    statuses = doc_seed.refresh_docs(home, version="3.0")
+    assert statuses["docs/configuration.md"] == "updated"
+    assert statuses["docs/new.md"] == "created"
+    for rel in ("docs/configuration.md", "docs/new.md"):
+        assert access_control._persisted_file_integrity(home, Path(rel), require_recorded=True) == "trusted"
+        assert (home / rel).read_bytes() == (source / rel).read_bytes()
+
+
+def test_restore_trusts_replacement_not_preexisting_content(source, tmp_path):
+    home = _home(tmp_path)
+    assert access_control.initialize_file_integrity_ledger(home)
+    existing = home / "docs/configuration.md"
+    existing.parent.mkdir()
+    existing.write_text("untrusted edit\n")
+    assert doc_seed.seed_docs(home, restore=True)["docs/configuration.md"] == "restored"
+    assert existing.read_bytes() == (source / "docs/configuration.md").read_bytes()
+    assert access_control._persisted_file_integrity(
+        home, Path("docs/configuration.md"), require_recorded=True,
+    ) == "trusted"

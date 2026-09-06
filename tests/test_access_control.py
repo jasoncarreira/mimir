@@ -678,6 +678,34 @@ def test_service_read_scope_includes_both_home_skill_roots_without_write_scope(
     assert (home / ".mimir_builtin_skills").resolve() not in write_roots
 
 
+def test_service_builtin_read_is_informational_but_write_is_denied(tmp_path, monkeypatch):
+    from mimir.skill_defs import refresh_builtin_skills
+
+    monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
+    assert access_control.initialize_file_integrity_ledger(tmp_path)
+    refresh_builtin_skills(tmp_path)
+    target = tmp_path / ".mimir_builtin_skills/chainlink/SKILL.md"
+    service = get_service_principal("scheduled_tick")
+    auth = _service_auth(service, InformationFlowLabels())
+    source = access_control.protected_result_source(
+        auth, principal=service.canonical, domain="filesystem",
+        resource_id=str(target), bridge_instance="filesystem",
+    )
+    assert (source.integrity, source.integrity_effect) == ("trusted", "informational")
+    token = set_current_turn(SimpleNamespace(turn_id="builtin-read", auth_context=auth))
+    try:
+        registry = ToolRegistry()
+        assert registry.authorize_tool(
+            "read_file", auth, enforce=True, arguments={"file_path": str(target)},
+        ).allowed
+        for tool in ("write_file", "edit_file"):
+            assert not registry.authorize_tool(
+                tool, auth, enforce=True, arguments={"file_path": str(target)},
+            ).allowed
+    finally:
+        reset_current_turn(token)
+
+
 def test_scheduled_tick_read_scope_includes_all_channels_and_remains_read_only(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
