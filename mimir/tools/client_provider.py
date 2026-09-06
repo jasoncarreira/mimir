@@ -42,6 +42,10 @@ class ClientProviderResultError(ToolException, RuntimeError):
     """A rejected client result that must be returned to the model as a tool error."""
 
 
+class ProviderToolError(RuntimeError):
+    """An ordinary provider-reported tool failure, not a transport fault."""
+
+
 class PermissionDecision(StrEnum):
     ALLOW_ONCE = "allow_once"
     ALLOW_SESSION = "allow_session"
@@ -472,6 +476,15 @@ class _PythonArgs(BaseModel):
     code: str
 
 
+async def _call_hands_tool(
+    context: TurnCapabilityContext, policy: ProviderToolPolicy, arguments: Mapping[str, Any],
+) -> Mapping[str, Any]:
+    try:
+        return await context.provider.call_tool(policy.provider_name, arguments)
+    except ProviderToolError as exc:
+        raise ToolException(str(exc)) from None
+
+
 @tool("hands_read", args_schema=_ReadArgs)
 async def hands_read(path: str) -> dict[str, str]:
     """Read client-hosted file content using the admitted hands provider."""
@@ -479,7 +492,7 @@ async def hands_read(path: str) -> dict[str, str]:
     resource = canonical_client_file_resource(path)
     if resource is None or not context.profile_policy.resource_policy.allows(resource):
         raise ToolException("hands_read path is not authorized")
-    result = await context.provider.call_tool(policy.provider_name, {"path": path})
+    result = await _call_hands_tool(context, policy, {"path": path})
     return _validate_result(result, "hands_read")
 
 
@@ -490,8 +503,8 @@ async def hands_edit(path: str, old_text: str, new_text: str) -> dict[str, bool]
     resource = canonical_client_file_resource(path)
     if resource is None or not context.profile_policy.resource_policy.allows(resource):
         raise ToolException("hands_edit path is not authorized")
-    result = await context.provider.call_tool(
-        policy.provider_name,
+    result = await _call_hands_tool(
+        context, policy,
         {"path": path, "oldText": old_text, "newText": new_text},
     )
     return _validate_result(result, "hands_edit")
@@ -503,7 +516,7 @@ async def hands_shell(command: str) -> dict[str, str | int]:
     context, policy = _active_policy("hands_shell")
     if not isinstance(command, str):
         raise ToolException("hands_shell command is malformed")
-    result = await context.provider.call_tool(policy.provider_name, {"command": command})
+    result = await _call_hands_tool(context, policy, {"command": command})
     return _validate_result(result, "hands_shell")
 
 
@@ -513,7 +526,7 @@ async def hands_python(code: str) -> dict[str, bool | str]:
     context, policy = _active_policy("hands_python")
     if not isinstance(code, str):
         raise ToolException("hands_python code is malformed")
-    result = await context.provider.call_tool(policy.provider_name, {"code": code})
+    result = await _call_hands_tool(context, policy, {"code": code})
     return _validate_result(result, "hands_python")
 
 
