@@ -3431,18 +3431,22 @@ if receipt.exists():
         persist_dir=persist_dir,
     )
 
+    # Allow child startup and the durable receipt handshake under xdist load;
+    # stay below the child's 10-second dispatch sleep to exercise the hard kill.
     await run_poller(
         cfg,
         enqueue=_CapturingEnqueue(),
-        timeout=0.5,
+        timeout=2.0,
         home=home,
     )
 
     assert dispatch_started.read_text(encoding="utf-8") == "started"
     assert len(list((persist_dir / ".delivery-receipts").glob("*"))) == 1
+    events = _read_events(home)
+    assert len([event for event in events if event["type"] == "poller_timeout"]) == 1
     alerts = [
         event
-        for event in _read_events(home)
+        for event in events
         if event["type"] == "worklink_run_failure_escalated"
     ]
     assert len(alerts) == 1
