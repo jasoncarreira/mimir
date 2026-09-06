@@ -24,6 +24,7 @@ from __future__ import annotations
 import time
 
 import pytest
+from pydantic import ValidationError
 
 from mimir._context import reset_current_turn, set_current_turn
 from langchain.tools import ToolRuntime
@@ -345,6 +346,71 @@ async def test_mark_contributions_empty_list_is_a_no_op(
 
 
 # ─── saga_end_session ─────────────────────────────────────────────
+
+
+_SESSION_LIST_FIELDS = (
+    "topics_discussed", "decisions_made", "unfinished", "closed_since",
+)
+
+
+@pytest.mark.parametrize("field", _SESSION_LIST_FIELDS)
+@pytest.mark.parametrize(("value", "expected"), [
+    ("  one topic  ", ["one topic"]),
+    (" alpha, beta; gamma \n\n delta, epsilon; zeta \n", [
+        "alpha, beta; gamma", "delta, epsilon; zeta",
+    ]),
+    (" alpha, beta ; ; gamma, delta; ", ["alpha, beta", "gamma, delta"]),
+    (" alpha, , beta, ", ["alpha", "beta"]),
+    (["  one, topic  ", "two; topics"], ["  one, topic  ", "two; topics"]),
+    ("  ", None),
+    (";; ;", None),
+    ([], None),
+    (None, None),
+])
+async def test_end_session_list_shapes(store, turn_with_session, field, value, expected):
+    text = "one, two; three\nfour"
+    out = await saga_ops.saga_end_session.ainvoke({
+        "runtime": _runtime(turn_with_session),
+        "session_id": "sess-abc",
+        "summary": text,
+        "emotional_state": text,
+        field: value,
+    })
+    assert "summary_written=True" in out
+    assert len(store.end_session_calls) == 1
+    call = store.end_session_calls[0]
+    assert call[field] == expected
+    assert call["summary"] == text
+    assert call["emotional_state"] == text
+
+
+@pytest.mark.parametrize("field", _SESSION_LIST_FIELDS)
+@pytest.mark.parametrize("value", [42, False, {"topic": "one"}, [42]])
+async def test_end_session_list_invalid(store, turn_with_session, field, value):
+    with pytest.raises(ValidationError) as exc:
+        await saga_ops.saga_end_session.ainvoke({
+            "runtime": _runtime(turn_with_session),
+            "session_id": "sess-abc",
+            "summary": "done",
+            field: value,
+        })
+    error, = exc.value.errors()
+    assert error["loc"][0] == field
+    assert error["msg"] == (
+        "Input should be a valid string" if isinstance(value, list)
+        else "Input should be a valid list"
+    )
+    assert store.end_session_calls == []
+
+
+@pytest.mark.parametrize("field", _SESSION_LIST_FIELDS)
+def test_end_session_list_schema(field):
+    schema = saga_ops.saga_end_session.tool_call_schema.model_json_schema()
+    prop = schema["properties"][field]
+    assert {shape["type"] for shape in prop["anyOf"]} == {"array", "string", "null"}
+    assert "Prefer a list of strings" in prop["description"]
+    assert "otherwise semicolons, otherwise commas" in prop["description"]
+    assert "Commas within newline- or semicolon-separated items are preserved" in prop["description"]
 
 
 @pytest.mark.asyncio
