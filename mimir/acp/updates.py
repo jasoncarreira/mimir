@@ -241,7 +241,7 @@ class UpdateDispatcher:
                         tool_call_id=tool_id,
                         title=name,
                         kind="other",
-                        raw_input=_freeze_json(_strict_json(event["args"])),
+                        raw_input=_freeze_json(_strict_json(event.get("_permission_args", event["args"]))),
                     )
                 return [ToolCallStart(sessionUpdate="tool_call", toolCallId=tool_id, title=name, kind="other", status="pending", rawInput=raw_input)]
             if phase == "end":
@@ -254,7 +254,7 @@ class UpdateDispatcher:
                         tool_call_id=tool_id,
                         title=name,
                         kind="other",
-                        raw_input=_freeze_json(_strict_json(event["args"])),
+                        raw_input=_freeze_json(_strict_json(event.get("_permission_args", event["args"]))),
                     )
                 args = _client_json(event.get("args"))
                 self._tool_args[tool_id] = args
@@ -290,7 +290,12 @@ def _event_bytes(event: Mapping[str, Any]) -> int:
 
 def _allowed_event(event: Mapping[str, Any]) -> dict[str, Any]:
     keys = {"type", "phase", "id", "tool_name", "args", "content", "status", "is_error"}
-    return _strict_json({key: event[key] for key in keys if key in event})
+    allowed = _strict_json({key: event[key] for key in keys if key in event})
+    # The bus attaches this only to its in-process exact-turn copy. It is
+    # snapshot input, never part of a client update or journal payload.
+    if "_permission_args" in event:
+        allowed["_permission_args"] = _strict_json(event["_permission_args"])
+    return allowed
 
 
 def _strict_json(value: Any, key: str = "") -> Any:

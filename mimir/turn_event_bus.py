@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from copy import deepcopy
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any
 
@@ -129,6 +130,15 @@ class TurnEventBus:
             else None
         )
         try:
+            # Only the exact-turn consumer may see authoritative arguments.
+            # Keep the caller's event and all presentation copies carrier-free.
+            event = {key: value for key, value in event.items() if key != "_permission_args"}
+            permission_args = (
+                {"_permission_args": deepcopy(event["args"])}
+                if exact is not None and event.get("type") == "tool_call"
+                and event.get("phase") in {"start", "end"} and "args" in event
+                else {}
+            )
             event = scrub_turn_event(event)
         except Exception:  # noqa: BLE001 — presentation scrubbing is best-effort
             log.warning(
@@ -142,7 +152,7 @@ class TurnEventBus:
         turn_id = event.get("turn_id")
         exact = self._exact_turn_subscribers.get(turn_id) if isinstance(turn_id, str) else None
         if exact is not None:
-            exact.put_nowait(event)
+            exact.put_nowait({**event, **permission_args} if permission_args else event)
 
         try:
             channel_id = event.get("channel_id") or ""

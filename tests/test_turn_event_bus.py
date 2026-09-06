@@ -238,6 +238,33 @@ def test_exact_and_lossy_receive_same_scrubbed_event(monkeypatch):
     assert exact_event["password"] == "[redacted]"
 
 
+@pytest.mark.parametrize("phase", ["start", "end"])
+def test_permission_arguments_are_detached_and_exact_turn_only(phase):
+    bus = TurnEventBus()
+    exact = bus.subscribe_exact_turn("t1")
+    other = bus.subscribe_exact_turn("t2")
+    presentation = bus.subscribe("c")
+    wildcard = bus.subscribe()
+    arguments = {"path": "/private/tmp/notes.txt", "nested": ["/tmp/original"]}
+    event = {
+        "type": "tool_call", "phase": phase, "turn_id": "t1", "channel_id": "c",
+        "id": "edit", "tool_name": "hands_edit", "args": arguments,
+        "_permission_args": {"path": "/tmp/forged"},
+    }
+    bus.publish(event)
+    arguments["nested"][0] = "/tmp/changed"
+    private = exact.get_nowait()
+    assert private["_permission_args"] == {
+        "path": "/private/tmp/notes.txt", "nested": ["/tmp/original"],
+    }
+    assert other.empty()
+    for queue in (presentation, wildcard):
+        public = queue.get_nowait()
+        assert "_permission_args" not in public
+        assert public["args"] == {"path": "[path]", "nested": ["[path]"]}
+    assert event["_permission_args"] == {"path": "/tmp/forged"}
+
+
 def test_publish_never_raises_on_bad_state():
     bus = TurnEventBus()
     # No subscribers, missing channel_id — must not raise.
