@@ -307,6 +307,17 @@ describe("WikiRoute", () => {
     expect(await screen.findByLabelText("Wiki graph view")).toBeTruthy();
     expect(screen.getByLabelText("Wiki graph legend")).toBeTruthy();
 
+    const readerButton = screen.getByRole("button", { name: "Reader" });
+    readerButton.focus();
+    expect(document.activeElement).toBe(readerButton);
+    fireEvent.click(readerButton);
+    expect(screen.queryByLabelText("Wiki graph view")).toBeNull();
+    const graphButton = screen.getByRole("button", { name: "Graph" });
+    graphButton.focus();
+    expect(document.activeElement).toBe(graphButton);
+    fireEvent.click(graphButton);
+    await screen.findByLabelText("Wiki graph view");
+
     fireEvent.click(screen.getByRole("button", { name: "Open Beta" }));
     await waitFor(() => expect(screen.getAllByRole("heading", { name: "Beta" }).length).toBeGreaterThan(0));
     expect(screen.getByText("topics/beta.md")).toBeTruthy();

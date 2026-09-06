@@ -368,7 +368,7 @@ export function ChainlinkBoardRoute() {
               <EmptyState title="No visible root issues" />
             )}
           </Panel> : null}
-          {view === "board" ? <div className="chainlink-board" aria-label="Chainlink lifecycle columns">
+          {view === "board" ? <div className="chainlink-board" aria-label="Chainlink lifecycle columns" role="region" tabIndex={0}>
             {board.columns.map((column) => {
               const issues = column.issue_ids
                 .map((id) => visibleById.get(id))
