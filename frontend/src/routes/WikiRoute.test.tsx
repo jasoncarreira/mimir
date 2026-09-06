@@ -274,7 +274,8 @@ describe("WikiRoute", () => {
       selected.focus();
       const focus = vi.spyOn(selected, "focus");
       scroll.mockClear();
-      fireEvent.click(selected.querySelector("span")!);
+      // Flush RouterProvider's asynchronous navigation before observing query content.
+      await act(async () => { fireEvent.click(selected.querySelector("span")!); });
       await screen.findByText("Content for Page 143");
       const detailSearch = router.state.location.search;
       expect(new URLSearchParams(detailSearch).get("slug")).toBe("concepts/page-143");
@@ -309,7 +310,7 @@ describe("WikiRoute", () => {
         returnButton.focus();
         expect(document.activeElement).toBe(returnButton);
       }
-      fireEvent.click(screen.getByRole("button", { name: "Back to pages" }));
+      await act(async () => { fireEvent.click(screen.getByRole("button", { name: "Back to pages" })); });
       expect(new URLSearchParams(router.state.location.search).get("pane")).toBe("list");
       assertPosition(false);
       await act(async () => { await router.navigate(-1); });

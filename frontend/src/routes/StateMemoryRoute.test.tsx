@@ -119,7 +119,8 @@ describe("StateMemoryRoute", () => {
         origin.focus();
         const focus = vi.spyOn(origin, "focus");
         scroll.mockClear();
-        fireEvent.click(origin.querySelector("span")!);
+        // Flush RouterProvider's asynchronous navigation before observing query content.
+        await act(async () => { fireEvent.click(origin.querySelector("span")!); });
         await screen.findByRole("heading", { name: files[143].path });
         const detailSearch = router.state.location.search;
         expect(new URLSearchParams(detailSearch).get("path")).toBe(files[143].path);
@@ -157,7 +158,7 @@ describe("StateMemoryRoute", () => {
           returnButton.focus();
           expect(document.activeElement).toBe(returnButton);
         }
-        fireEvent.click(screen.getByRole("button", { name: "Back to files" }));
+        await act(async () => { fireEvent.click(screen.getByRole("button", { name: "Back to files" })); });
         expect(new URLSearchParams(router.state.location.search).get("pane")).toBe("list");
         assertPosition(false);
         await act(async () => { await router.navigate(-1); });
@@ -168,7 +169,7 @@ describe("StateMemoryRoute", () => {
       }
       await journey(within(nav).getByRole("button", { name: "note-143.md" }), "");
       fireEvent.change(screen.getByLabelText("Search state and memory files"), { target: { value: "needle" } });
-      fireEvent.click(screen.getByRole("button", { name: "Search" }));
+      await act(async () => { fireEvent.click(screen.getByRole("button", { name: "Search" })); });
       // Two hits for the same file ensure return remembers the clicked hit, not just its path.
       const hit = await screen.findByRole("button", { name: /:19\s*needle at 19/ });
       await journey(hit, "needle");
