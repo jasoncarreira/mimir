@@ -27,6 +27,7 @@ _SCOPE_ID = re.compile(r"[0-9a-f]{64}")
 _HEAD_SHA = re.compile(r"[0-9a-f]{40}")
 _WRITE_OPERATIONS = frozenset({
     "pr_submit_review", "pr_comment", "pr_rerequest_review",
+    "pr_edit_body",
     "repo_stage", "repo_commit", "repo_push", "unsupported_operation",
 })
 _OPERATION_ACTION = {
@@ -35,6 +36,7 @@ _OPERATION_ACTION = {
     "repo_test": RepoPRAction.TEST.value,
     "pr_submit_review": RepoPRAction.PR_REVIEW.value,
     "pr_comment": RepoPRAction.PR_COMMENT.value,
+    "pr_edit_body": RepoPRAction.PR_EDIT.value,
     "pr_rerequest_review": RepoPRAction.PR_REREQUEST.value,
     "repo_stage": RepoPRAction.WRITE.value,
     "repo_commit": RepoPRAction.COMMIT.value,
@@ -118,6 +120,7 @@ def _effect_result(operation: str) -> str:
     return {
         "pr_submit_review": "review_submitted",
         "pr_comment": "comment_created",
+        "pr_edit_body": "body_updated",
         "pr_rerequest_review": "review_rerequested",
         "repo_stage": "staged",
         "repo_commit": "committed",
@@ -287,8 +290,12 @@ def offline_canary_probes() -> tuple[ParityProbe, ...]:
                     LegacyObservation("allow", "ok")),
         ParityProbe("ordinary_review", "pr_submit_review", "review", _scope("ordinary_review"), head,
                     LegacyObservation("allow", "review_submitted", effect("ordinary_review", "pr_submit_review"), audit("ordinary_review", "pr_submit_review"))),
+        ParityProbe("ordinary_review", "pr_edit_body", "review", _scope("ordinary_review"), head,
+                    LegacyObservation("refuse", "scope_action_denied")),
         ParityProbe("own_pr_remediation", "pr_comment", "remediation", _scope("own_pr_remediation"), head,
                     LegacyObservation("allow", "comment_created", effect("own_pr_remediation", "pr_comment"), audit("own_pr_remediation", "pr_comment"))),
+        ParityProbe("own_pr_remediation", "pr_edit_body", "remediation", _scope("own_pr_remediation"), head,
+                    LegacyObservation("allow", "body_updated", effect("own_pr_remediation", "pr_edit_body"), audit("own_pr_remediation", "pr_edit_body"))),
         ParityProbe("own_pr_remediation", "pr_rerequest_review", "remediation", _scope("own_pr_remediation"), head,
                     LegacyObservation("allow", "review_rerequested", effect("own_pr_remediation", "pr_rerequest_review"), audit("own_pr_remediation", "pr_rerequest_review"))),
         ParityProbe("stale_head_refusal", "repo_push", "remediation", _scope("stale_head_refusal"), head,

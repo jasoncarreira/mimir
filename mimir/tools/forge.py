@@ -688,6 +688,20 @@ def pr_comment(
 
 
 @tool
+def pr_edit_body(
+    repository: str,
+    pull_request: int,
+    body: str,
+    runtime: ToolRuntime[AuthContext] = None,  # type: ignore[assignment]
+) -> dict[str, Any]:
+    """Replace only the bound pull request description with bounded literal text."""
+    scope = _scope(runtime, repository, pull_request)
+    safe_body = _body(body)
+    _call(lambda: _client(scope).edit_pull_request_body(scope, safe_body))
+    return {"status": "body_updated"}
+
+
+@tool
 def issue_comment(
     repository: str,
     issue: int,
@@ -875,6 +889,7 @@ FORGE_TOOLS = tuple(_bind_injected_runtime(forge_tool) for forge_tool in (
     pr_submit_review,
     pr_inline_review_comment,
     pr_comment,
+    pr_edit_body,
     issue_comment,
     pr_rerequest_review,
     unsupported_operation,

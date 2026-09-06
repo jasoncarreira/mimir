@@ -956,6 +956,15 @@ def _emit(prompt: str, **extras: object) -> None:
     event_type = extras.get("event_type")
     if isinstance(event_type, str) and event_type.startswith("pr_"):
         extras.setdefault("subject_type", "pull_request")
+        prompt += (
+            "\n\nFor PR body corrections, use only "
+            "pr_edit_body(repository, pull_request, body) and only when the bound "
+            "scope grants pr.edit. Ordinary review and CI remediation do not grant "
+            "pr.edit. Other PR metadata mutations (title, base, state, labels, "
+            "assignees, draft status) remain unsupported: use unsupported_operation, "
+            "not shell, gh, or direct API fallbacks. The existing pr_rerequest_review "
+            "path remains supported only with pr.rerequest authority."
+        )
     if isinstance(event_type, str) and event_type in REVIEW_NEEDED_EVENT_TYPES:
         related_comment = extras.pop("related_comment", "")
         if isinstance(related_comment, str) and related_comment:

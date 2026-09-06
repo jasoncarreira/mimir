@@ -41,18 +41,18 @@ def test_offline_canary_covers_all_scenarios_and_has_observed_primary_evidence()
     }
     assert report["cutover_blocked"] is False
     assert report["counts"] == {
-        "operations_total": 12,
-        "operations_matched": 12,
+        "operations_total": 14,
+        "operations_matched": 14,
         "operations_mismatched": 0,
         "scenarios_total": 8,
         "scenarios_matched": 8,
         "scenarios_mismatched": 0,
-        "primary_observed_effects": 7,
+        "primary_observed_effects": 8,
         "shadow_observed_effects": 0,
     }
     writes = [row for row in report["operations"] if row["legacy"]["effects"]]
     assert {row["operation"] for row in writes} >= {
-        "pr_submit_review", "pr_comment", "pr_rerequest_review", "repo_push",
+        "pr_submit_review", "pr_comment", "pr_edit_body", "pr_rerequest_review", "repo_push",
     }
     for row in writes:
         assert row["shadow_observed_effect_count"] == 0
@@ -69,6 +69,7 @@ def test_offline_canary_covers_all_scenarios_and_has_observed_primary_evidence()
         ({"operation": "repo_push", "head_is_current": False}, "refuse", "stale_scope"),
         ({"operation": "pr_submit_review"}, "refuse", "scope_action_denied"),
         ({"workflow": "review", "operation": "pr_rerequest_review"}, "refuse", "scope_action_denied"),
+        ({"workflow": "review", "operation": "pr_edit_body"}, "refuse", "scope_action_denied"),
         ({"operation": "pr_resolve_thread", "supported": False}, "escalate", "unsupported_operation"),
         ({"operation": "repo_stage", "conflict_paths": ("conflict.py",), "requested_paths": ("other.py",)}, "refuse", "unproven_conflict_path"),
     ],
@@ -80,6 +81,23 @@ def test_each_shadow_authority_and_refusal_check_is_pinned(changes, decision, re
         result,
         ("escalation",) if decision == "escalate" else (),
     )
+
+
+def test_body_edit_is_allowed_only_for_own_pr_remediation() -> None:
+    probes = [probe for probe in offline_canary_probes() if probe.operation == "pr_edit_body"]
+    assert {probe.scenario for probe in probes} == {"ordinary_review", "own_pr_remediation"}
+    for probe in probes:
+        projection = evaluate_typed_shadow(probe)
+        if probe.workflow == "remediation":
+            assert (projection.decision, projection.result, projection.planned_effects) == (
+                "allow", "body_updated", ("pr_edit_body",),
+            )
+            assert len(probe.legacy.effects) == len(probe.legacy.audits) == 1
+        else:
+            assert (projection.decision, projection.result, projection.planned_effects) == (
+                "refuse", "scope_action_denied", (),
+            )
+            assert probe.legacy.effects == probe.legacy.audits == ()
 
 
 def test_mismatches_are_counted_categorized_and_block_unless_accepted() -> None:
@@ -150,7 +168,10 @@ def test_report_is_written_as_durable_local_artifact(tmp_path: Path) -> None:
     assert not path.with_suffix(".json.tmp").exists()
 
 
-def test_checked_in_evidence_matches_offline_canary() -> None:
-    expected = run_parity(offline_canary_probes())
+def test_checked_in_evidence_matches_original_offline_canary() -> None:
+    # The recorded #1049 artifact predates the #1561 body-edit probes.
+    expected = run_parity(tuple(
+        probe for probe in offline_canary_probes() if probe.operation != "pr_edit_body"
+    ))
     path = Path(__file__).parents[1] / "evidence" / "repo-pr-parity.json"
     assert json.loads(path.read_text(encoding="utf-8")) == expected
