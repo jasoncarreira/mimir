@@ -32,6 +32,8 @@ const statusTone: Record<string, BadgeTone> = {
   "needs-human": "warning",
   interrupted: "warning",
   invalid: "danger",
+  failed: "danger",
+  unavailable: "warning",
   pending: "neutral",
   unknown: "neutral"
 };
@@ -44,6 +46,12 @@ const lockTone: Record<FactoryRunSummary["lock"], BadgeTone> = {
 
 function isTerminalStatus(status: string): boolean {
   return status === "completed" || status === "blocked" || status === "partial";
+}
+
+function displayStatus(run: FactoryRunSummary): string {
+  if (run.controller_phase === "failed") return "failed";
+  if (!run.valid || !run.status) return "unavailable";
+  return run.status;
 }
 
 function formatTime(iso: string | null): string {
@@ -68,7 +76,7 @@ function CompactList({ items, className }: { items: string[]; className: string 
 }
 
 function RunCard({ run, onClick }: { run: FactoryRunSummary; onClick: () => void }) {
-  const status = run.status || "unknown";
+  const status = displayStatus(run);
   const terminal = isTerminalStatus(status);
 
   return (
@@ -110,9 +118,10 @@ export function RunDetail({ runId }: { runId: string }) {
   if (!data) return <EmptyState title="Run not found" />;
 
   const run = data as FactoryRunDetail;
-  const status = run.status || "unknown";
+  const status = displayStatus(run);
   const terminal = isTerminalStatus(status);
   const parked = status === "needs-human";
+  const active = status === "running" && ["running", "monitoring"].includes(run.controller_phase);
   const prHref = sanitizeHref(run.pr_url);
   const hasNext = Object.prototype.hasOwnProperty.call(run, "next");
 
@@ -125,7 +134,8 @@ export function RunDetail({ runId }: { runId: string }) {
         <dl className="facts-grid">
           <div><dt>Issue</dt><dd>{run.issue_key}</dd></div>
           <div><dt>Status</dt><dd><Badge tone={statusTone[status] ?? "neutral"}>{status}</Badge></dd></div>
-          <div><dt>Lifecycle</dt><dd>{parked ? "Parked/resumable" : terminal ? "Terminal" : "Active"}</dd></div>
+          <div><dt>Lifecycle</dt><dd>{status === "failed" ? "Failed" : parked ? "Parked/resumable" : terminal ? "Terminal" : active ? "Active" : "Unavailable"}</dd></div>
+          <div><dt>Projected status</dt><dd>{run.status ?? "not available"}</dd></div>
           <div><dt>Valid projection</dt><dd>{run.valid ? "Yes" : "No"}</dd></div>
           <div><dt>Mode</dt><dd>{run.mode}</dd></div>
           <div><dt>Branch</dt><dd>{run.branch}</dd></div>
