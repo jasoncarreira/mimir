@@ -55,6 +55,23 @@ except ImportError:
 # Matches saga's default. Below 50k vectors, exact is fast enough on CPU.
 APPROX_THRESHOLD = 50_000
 
+_warned_drops: set[str] = set()
+_warned_drops_lock = threading.Lock()
+
+
+def _warn_drops(kind: str, count: int, dimension: int) -> None:
+    """Warn once per index kind per process, even across fresh index instances."""
+    if not count:
+        return
+    with _warned_drops_lock:
+        if kind in _warned_drops:
+            return
+        _warned_drops.add(kind)
+    logger.warning(
+        "VectorIndex dropped %d %s vectors with dimension mismatch (expected dim=%d)",
+        count, kind, dimension,
+    )
+
 
 class VectorIndex:
     """FAISS index keyed on atom_id. Thread-safe via an internal lock —
@@ -147,6 +164,7 @@ class VectorIndex:
                 self._removed.clear()
                 self._next_pos = 0
                 self._built = True
+                self.dimension_mismatch_count = 0
             return
 
         ids: list[str] = []
@@ -175,13 +193,7 @@ class VectorIndex:
                 self._next_pos = 0
                 self._built = True
                 self.dimension_mismatch_count = dimension_mismatches
-            if dimension_mismatches:
-                logger.warning(
-                    "VectorIndex dropped %d atom vectors with dimension mismatch "
-                    "(expected dim=%d)",
-                    dimension_mismatches,
-                    self.dimension,
-                )
+            _warn_drops("atom", dimension_mismatches, self.dimension)
             return
 
         matrix = np.vstack(vecs).astype(np.float32)
@@ -213,13 +225,7 @@ class VectorIndex:
             self._built = True
             self.dimension_mismatch_count = dimension_mismatches
 
-        if dimension_mismatches:
-            logger.warning(
-                "VectorIndex dropped %d atom vectors with dimension mismatch "
-                "(expected dim=%d)",
-                dimension_mismatches,
-                self.dimension,
-            )
+        _warn_drops("atom", dimension_mismatches, self.dimension)
 
         logger.info(
             "VectorIndex built: %d vectors, dim=%d, type=%s",
@@ -270,13 +276,7 @@ class VectorIndex:
                 self._next_pos = 0
                 self._built = True
                 self.dimension_mismatch_count = dimension_mismatches
-            if dimension_mismatches:
-                logger.warning(
-                    "Sessions VectorIndex dropped %d vectors with dimension "
-                    "mismatch (expected dim=%d)",
-                    dimension_mismatches,
-                    self.dimension,
-                )
+            _warn_drops("session", dimension_mismatches, self.dimension)
             return
 
         matrix = np.vstack(vecs).astype(np.float32)
@@ -297,13 +297,7 @@ class VectorIndex:
             self._built = True
             self.dimension_mismatch_count = dimension_mismatches
 
-        if dimension_mismatches:
-            logger.warning(
-                "Sessions VectorIndex dropped %d vectors with dimension mismatch "
-                "(expected dim=%d)",
-                dimension_mismatches,
-                self.dimension,
-            )
+        _warn_drops("session", dimension_mismatches, self.dimension)
 
         logger.info(
             "Sessions VectorIndex built: %d vectors, dim=%d", n, self.dimension,

@@ -266,6 +266,8 @@
     <div class="stat-card"><div class="label">schema</div><div class="value" id="stat-schema">—</div></div>
   </div>
 
+  <p id="embedding-health" role="status" style="overflow-wrap:anywhere">Embedding health: loading</p>
+
   <!-- Section tabs -->
   <div class="section-tabs">
     <button class="tab-btn active" onclick="showSection('recent', this)">Recent</button>
@@ -439,6 +441,18 @@ async function loadStats() {
     document.getElementById("stat-tombstoned").textContent = (d.tombstoned_count || 0).toLocaleString();
     document.getElementById("stat-dbsize").textContent = d.db_size_bytes ? fmtBytes(d.db_size_bytes) : "—";
     document.getElementById("stat-schema").textContent = d.schema_version != null ? "v" + d.schema_version : "—";
+    const health = d.embedding_health || {};
+    const parts = ["Embedding health: " + (health.status || "unknown"),
+      "provider dimension: " + (health.dimension ?? "unknown")];
+    for (const kind of ["atoms", "sessions"]) {
+      const counts = health[kind] || {};
+      const distribution = Object.entries(counts.dimensions || {})
+        .map(([dim, count]) => dim + "d: " + count).join(", ") || "none";
+      parts.push(kind + " [" + distribution + "]; excluded from vector recall: " +
+        (counts.excluded_from_recall ?? "unknown"));
+    }
+    if (health.reason) parts.push(health.reason);
+    document.getElementById("embedding-health").textContent = parts.join(" | ");
   } catch (e) { console.warn("stats fetch failed:", e); }
 }
 
