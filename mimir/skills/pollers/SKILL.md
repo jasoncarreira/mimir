@@ -1,6 +1,6 @@
 ---
 name: pollers
-description: Mechanics for building and managing pollers — subprocess scripts that check external services on a schedule and emit events when something has changed. Use when authoring a new poller (a `pollers.json` manifest plus a script in any language), debugging why a poller isn't firing, or extending an existing one. Pollers run on cron, emit JSONL events when there's something to report, and stay silent otherwise (silence-as-filter). The framework discovers `<home>/skills/<name>/pollers.json` files at startup and via `reload_pollers`; each emitted event becomes a fresh turn on a `poller:<name>` synthetic channel. Companion to the `world-scanning` skill, which catalogs *what's worth polling*. Distinct from `async-tasks` (one-shot wake-up via bash_async, not recurring) and from in-process scheduler callables (saga-consolidate, oauth-usage-poll — those mutate mimir-internal state and aren't subprocess-isolated).
+description: Mechanics for building and managing pollers — subprocess scripts that check external services on a schedule and emit events when something has changed. Tool-dependent operations require the relevant tools in the current turn's tool list; poller service turns can lack tools. Use when authoring a new poller (a `pollers.json` manifest plus a script in any language), debugging why a poller isn't firing, or extending an existing one. Pollers run on cron, emit JSONL events when there's something to report, and stay silent otherwise (silence-as-filter). The framework discovers `<home>/skills/<name>/pollers.json` files at startup and via `reload_pollers`; each emitted event becomes a fresh turn on a `poller:<name>` synthetic channel. Companion to the `world-scanning` skill, which catalogs *what's worth polling*. Distinct from `async-tasks` (one-shot wake-up via bash_async, not recurring) and from in-process scheduler callables (saga-consolidate, oauth-usage-poll — those mutate mimir-internal state and aren't subprocess-isolated).
 success_criteria:
   # The pollers skill is for *building* or *fixing* pollers — both
   # produce a write under skills/<poller>/pollers.json (the manifest)
@@ -24,9 +24,18 @@ success_criteria:
         name: reload_pollers
 ---
 
-<!-- desc: Build and manage pollers — subprocess scripts that check external services on a schedule and emit events when something changes. -->
+<!-- desc: Build and manage pollers that check services on a schedule; tool-dependent steps require tools in the current turn's tool list, which service turns can lack. -->
 
 # Pollers — Event-Driven Monitoring
+
+**Tool availability:** Authoring and management steps below apply only when their
+required tools are present in the current turn's tool list. Poller service turns
+can have a restricted tool list or no tools at all; a manifest capability is not
+proof that a tool is available. Check before shell execution (`shell_exec`),
+`bash_async`, `reload_pollers`, `send_message`, or saga writes such as
+`memory_store` and `saga_feedback`. If a required tool is absent, state the
+limitation rather than inventing alternate tools or claiming the action happened.
+Existing admin instructions and the authority/scoping rules below still apply.
 
 Pollers are lightweight scripts that check external services on a schedule and report back when something needs attention. They live inside skills and are discovered automatically by the scheduler.
 

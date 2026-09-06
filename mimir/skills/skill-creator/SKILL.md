@@ -108,6 +108,10 @@ This field is not an authorization boundary. It does not add, remove, restrict, 
 
 ## Skills that send a message to a specific channel
 
+Gate tool-dependent steps on the current turn's tool list, including
+`send_message`, shell execution, and saga writes. Service turns can lack tools:
+instruct the reader to report unavailable operations, not invent alternate tools.
+
 If your skill calls `send_message`, be deliberate about `channel_id` — getting it wrong fails at runtime, not authoring time.
 
 - **Replying in context? Omit `channel_id`.** It defaults to the current turn's channel (`send_message(text=...)`). This is the right choice for almost every skill — don't name a channel you don't need to.

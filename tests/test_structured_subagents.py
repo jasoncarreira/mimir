@@ -131,17 +131,34 @@ def test_build_mimir_subagents_registers_structured_critic_without_replacing_gp(
     general = specs[0]
     assert [middleware.name for middleware in general["middleware"]] == [
         "TodoListMiddleware",
+        "ServiceToolSurfaceMiddleware",
         "BudgetGateMiddleware",
     ]
     assert critic["response_format"] is CriticFindings
     assert critic["tools"] == []
     assert [middleware.name for middleware in critic["middleware"]] == [
         "TodoListMiddleware",
+        "ServiceToolSurfaceMiddleware",
         "BudgetGateMiddleware",
         "StructuredOutputRetryMiddleware",
     ]
     assert critic["middleware"][0].tools == ()
     assert "Read-only" in critic["description"]
+
+
+def test_every_subagent_registers_service_surface_before_budget_gate_with_home(tmp_path) -> None:
+    from mimir.tools.budget_gate import BudgetGateMiddleware
+    from mimir.tools.service_tool_surface import ServiceToolSurfaceMiddleware
+
+    specs = build_mimir_subagents(home=tmp_path)
+    assert {spec["name"] for spec in specs} == {"general-purpose", "critic-structured"}
+    for spec in specs:
+        middleware = spec["middleware"]
+        assert sum(isinstance(item, ServiceToolSurfaceMiddleware) for item in middleware) == 1
+        surface_index = next(i for i, item in enumerate(middleware)
+                             if isinstance(item, ServiceToolSurfaceMiddleware))
+        assert surface_index + 1 < len(middleware), "service surface must precede BudgetGate"
+        assert isinstance(middleware[surface_index + 1], BudgetGateMiddleware)
 
 
 def test_every_subagent_runs_tool_calls_through_budget_gate() -> None:

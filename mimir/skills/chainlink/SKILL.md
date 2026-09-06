@@ -52,6 +52,11 @@ chainlink init
 
 ## Verifying availability
 
+Check the current turn's tool list before running CLI commands, calling
+`send_message`, or writing to saga via `memory_store`. Service turns can lack
+these tools; report the limitation rather than inventing alternate tools or
+claiming an issue, message, or memory was created.
+
 ```bash
 chainlink --version
 ```

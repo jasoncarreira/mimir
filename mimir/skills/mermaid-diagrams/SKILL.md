@@ -219,6 +219,10 @@ flowchart LR
 
 ## Rendering and sending in mimir
 
+Rendering requires a shell tool and delivery requires `send_message` in the
+current turn's tool list. Service turns can lack either; provide Mermaid source
+as text instead of inventing alternate tools or claiming a render or send.
+
 The mimirbot container ships `mmdc` (`@mermaid-js/mermaid-cli`) on PATH.
 Workflow for sending a rendered diagram in a Discord/Slack reply:
 

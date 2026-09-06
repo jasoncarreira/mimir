@@ -22,6 +22,11 @@ on to memories by editing core blocks or writing files.
 
 ## Contract
 
+Memory operations, including saga writes via `memory_store`, require the
+corresponding tool in the current turn's tool list. Service turns can lack tools;
+state what could not be saved rather than inventing alternate tools or claiming
+persistence. The operator-review requirements below still apply.
+
 **Trigger**: Any turn where mimir might update `memory/core/`, write to `memory/`,
 or file something under `state/`. If you're unsure whether something belongs in
 memory, invoke this skill — the filing rubric is the decision surface.
