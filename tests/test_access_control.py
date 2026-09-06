@@ -7955,6 +7955,7 @@ def test_authorized_tainted_edit_and_shell_results_reply_only_to_originating_acp
         frozenset({"operator"})
     }
     assert {source.bridge_instance for source in labels.sources} == {"acp-stdio"}
+    assert {source.domain for source in labels.sources} == {"client_provider"}
     assert {source.integrity for source in labels.sources} == {"untrusted"}
     assert {source.integrity_effect for source in labels.sources} == {"active_ingest"}
 
@@ -7975,6 +7976,61 @@ def test_authorized_tainted_edit_and_shell_results_reply_only_to_originating_acp
         )
         assert denied.allowed is False, (sink_name, denied.reason)
         assert denied.reason == f"ifc_label_blocked:{category.value}"
+
+
+@pytest.mark.parametrize("tool_name", ["hands_read", "hands_edit", "hands_shell", "hands_python", "read_file"])
+@pytest.mark.parametrize(
+    "invalid_field",
+    [None, "origin_trigger", "canonical_principal", "channel_id", "bridge_instance", "domain"],
+)
+def test_failed_hands_result_is_informational_only_with_complete_acp_context(
+    tool_name: str, invalid_field: str | None,
+) -> None:
+    from langchain_core.messages import ToolMessage
+    from mimir.access_control import ProtectedResultProvenance, ToolAuthorization
+    from mimir.harness_egress import harness_sink_allowed
+
+    channel = "acp:session-1"
+    context = dict(
+        principal="operator", canonical_principal="operator", roles=("admin",),
+        event_ingress=None, trigger="user_message", channel_id=channel,
+        domain="channel", resource_id=channel, bridge_instance="acp-stdio",
+        origin_trigger="acp_session", enforcement_enabled=True,
+        interactivity=TurnInteractivity.INTERACTIVE,
+    )
+    if invalid_field is not None:
+        context[invalid_field] = None
+    auth = AuthContext(**context)
+    labels = classify_protected_result(
+        tool_name, {"path": "notes.txt"}, auth,
+        ToolAuthorization(tool_name=tool_name, decision=OperationDecision.ADMIN_REQUIRED, allowed=True),
+        result=ToolMessage(content="provider error", tool_call_id="failed", status="error"),
+        provenance=ProtectedResultProvenance(sources=()), failed=True,
+    )
+    assert labels is not None
+    if invalid_field is not None or tool_name == "read_file":
+        assert any(not source.is_complete for source in labels.sources)
+        assert labels.has_untrusted_active_ingest is True
+        assert harness_sink_allowed("harness_auto_deliver", channel, labels, auth) is False
+        return
+
+    assert labels.sources == (SourceLabel(
+        principal="operator", domain="channel", resource_id=channel,
+        bridge_instance="acp-stdio", sensitivity="private",
+        authorized_principals=frozenset({"operator"}), source_kind="channel",
+        integrity="untrusted", integrity_effect="informational",
+    ),)
+    assert all(source.is_complete for source in labels.sources)
+    assert labels.has_untrusted_active_ingest is False
+    assert harness_sink_allowed("harness_auto_deliver", channel, labels, auth) is True
+    assert harness_sink_allowed("harness_auto_deliver", "acp:other", labels, auth) is False
+    incomplete = SourceLabel(
+        principal=None, domain="client_provider", resource_id="other.txt",
+        bridge_instance=None, sensitivity="private", source_kind="protected_tool",
+    )
+    assert harness_sink_allowed(
+        "harness_auto_deliver", channel, labels.with_source(incomplete), auth,
+    ) is False
 
 
 def test_python_extends_existing_complete_hands_result_policy() -> None:
