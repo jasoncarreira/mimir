@@ -12604,7 +12604,10 @@ async def test_acp_permission_broker_failures_are_ordinary_denials(
     finally:
         reset_turn_capability_context(token)
 
-    expected = "was cancelled" if isinstance(failure, asyncio.CancelledError) else "failed"
+    expected = (
+        "was withdrawn while waiting for the operator"
+        if isinstance(failure, asyncio.CancelledError) else "failed"
+    )
     assert denial == f"hands_edit permission request {expected}; execution denied"
     assert len(broker.calls) == 1
 
@@ -12736,7 +12739,10 @@ def test_hands_shell_missing_command_fails_before_prohibited_provider_check(
             "not_requested",
             "hands_edit permission request never reached an operator; execution denied",
         ),
-        ("cancelled", "hands_edit permission request was cancelled; execution denied"),
+        (
+            "cancelled",
+            "hands_edit permission request was withdrawn while waiting for the operator; execution denied",
+        ),
         (object(), "hands_edit permission request returned an invalid decision; execution denied"),
     ],
 )
@@ -12798,35 +12804,46 @@ async def test_acp_sync_permission_same_loop_fails_without_request() -> None:
 
 
 @pytest.mark.asyncio
-async def test_acp_permission_timeout_cancels_local_request(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+async def test_acp_permission_caller_cancellation_releases_local_request() -> None:
     from mimir.tools import budget_gate
     from mimir.tools.client_provider import (
         reset_turn_capability_context,
         set_turn_capability_context,
     )
 
+    entered = asyncio.Event()
+    released = asyncio.Event()
+
     class Broker(_PermissionTestBroker):
         async def request_permission(self, eligibility: object) -> object:
             self.calls.append(eligibility)
-            await asyncio.sleep(10)
-            return self.outcome
+            entered.set()
+            try:
+                await asyncio.Event().wait()
+            finally:
+                released.set()
 
     broker = Broker("allow_once")
-    monkeypatch.setattr(budget_gate, "_PERMISSION_TIMEOUT_SECONDS", 0.001)
     token = set_turn_capability_context(_permission_test_context(broker))
-    try:
-        denial = await budget_gate._request_permission_async(
-            SimpleNamespace(tool_call={"id": "timeout"}),
+    task = asyncio.create_task(
+        budget_gate._request_permission_async(
+            SimpleNamespace(tool_call={"id": "caller-cancellation"}),
             "hands_edit",
             _permission_test_authorization(),
             {"path": "a"},
         )
+    )
+    try:
+        await entered.wait()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
     finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
         reset_turn_capability_context(token)
 
-    assert denial == "hands_edit permission request timed out; execution denied"
+    assert released.is_set()
     assert len(broker.calls) == 1
 
 
@@ -13116,7 +13133,7 @@ def test_permission_authorization_diagnostic_scrubs_untrusted_reason(reason: str
     ("outcome", "expected"),
     [
         ("reject_once", "was rejected by the operator before execution"),
-        ("cancelled", "request was cancelled; execution denied"),
+        ("cancelled", "request was withdrawn while waiting for the operator; execution denied"),
         (object(), "request returned an invalid decision; execution denied"),
         (RuntimeError("failed"), "request failed; execution denied"),
     ],
@@ -13239,7 +13256,7 @@ async def test_public_async_permission_caller_cancellation_propagates_and_cleans
 @pytest.mark.asyncio
 @pytest.mark.parametrize("mode", ["raises", "nonawaitable", "timeout"])
 async def test_public_async_permission_broker_failures_fail_closed(
-    monkeypatch: pytest.MonkeyPatch, mode: str,
+    mode: str,
 ) -> None:
     from mimir.tools import budget_gate
     from mimir.tools.client_provider import reset_turn_capability_context, set_turn_capability_context
@@ -13255,11 +13272,10 @@ async def test_public_async_permission_broker_failures_fail_closed(
                 return object()
 
             async def pending():
-                await asyncio.sleep(10)
+                raise TimeoutError("broker timed out")
 
             return pending()
 
-    monkeypatch.setattr(budget_gate, "_PERMISSION_TIMEOUT_SECONDS", 0.001)
     token = set_turn_capability_context(_capability_for_broker(Broker()))
     try:
         result = await budget_gate.BudgetGateMiddleware().awrap_tool_call(
@@ -13272,7 +13288,7 @@ async def test_public_async_permission_broker_failures_fail_closed(
     expected = {
         "raises": "failed",
         "nonawaitable": "returned a non-coroutine",
-        "timeout": "timed out",
+        "timeout": "timed out while waiting for the operator",
     }[mode]
     assert result.content == (
         f"hands_edit permission request {expected}; execution denied"
@@ -13315,7 +13331,7 @@ async def test_public_sync_permission_worker_owner_loop_executes_and_requests_ea
 @pytest.mark.asyncio
 @pytest.mark.parametrize("mode", ["same", "missing", "nonrunning", "closed", "raises", "nonawaitable", "timeout"])
 async def test_public_sync_permission_loop_and_broker_failures_are_denials(
-    monkeypatch: pytest.MonkeyPatch, mode: str,
+    mode: str,
 ) -> None:
     from mimir.tools import budget_gate
     from mimir.tools.client_provider import (
@@ -13336,7 +13352,7 @@ async def test_public_sync_permission_loop_and_broker_failures_are_denials(
 
             async def decide():
                 if mode == "timeout":
-                    await asyncio.sleep(10)
+                    raise TimeoutError("broker timed out")
                 return PermissionDecision.ALLOW_ONCE
 
             return decide()
@@ -13358,7 +13374,6 @@ async def test_public_sync_permission_loop_and_broker_failures_are_denials(
 
         owned_loop, owned_task = await asyncio.to_thread(create_owned_task)
         broker.model_task = owned_task
-    monkeypatch.setattr(budget_gate, "_PERMISSION_TIMEOUT_SECONDS", 0.001)
     token = set_turn_capability_context(_capability_for_broker(broker))
     try:
         if mode in {"raises", "nonawaitable", "timeout"}:
@@ -13389,7 +13404,7 @@ async def test_public_sync_permission_loop_and_broker_failures_are_denials(
         "closed": "has no live owner loop",
         "raises": "failed",
         "nonawaitable": "returned a non-coroutine",
-        "timeout": "timed out",
+        "timeout": "timed out while waiting for the operator",
     }[mode]
     assert result.content == (
         f"hands_edit permission request {expected}; execution denied"
