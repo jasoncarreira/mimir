@@ -328,25 +328,29 @@ async def test_queue_wait_is_outside_timeout_and_other_session_is_parallel(
 ) -> None:
     manager = PythonKernelManager()
     entered = tmp_path / "entered"
+    release = tmp_path / "release"
     try:
         blocker = asyncio.create_task(
             manager.execute(
                 "one",
                 tmp_path,
-                "import pathlib,time\npathlib.Path('entered').write_text('yes')\ntime.sleep(.5)",
-                2,
+                "import pathlib,time\npathlib.Path('entered').write_text('yes')\n"
+                "while not pathlib.Path('release').exists(): time.sleep(.01)",
+                5,
             )
         )
         await _appears(entered)
         queued_at = time.monotonic()
         queued = asyncio.create_task(
-            manager.execute("one", tmp_path, "2", 0.2)
+            manager.execute("one", tmp_path, "2", 1)
         )
+        await asyncio.sleep(1.1)
+        release.write_text("yes")
         await blocker
         queued_result = await queued
         assert queued_result["value"] == "2"
         assert queued_result["timedOut"] is False
-        assert time.monotonic() - queued_at > 0.3
+        assert time.monotonic() - queued_at > 1
 
         parallel_at = time.monotonic()
         first, second = await asyncio.gather(

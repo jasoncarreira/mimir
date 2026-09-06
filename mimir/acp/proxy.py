@@ -738,6 +738,13 @@ class ProxyRouter:
         connection_id = params.get("connectionId")
         if connection_id not in self._connection_sessions:
             if isinstance(connection_id, str) and connection_id in self._used_connection_ids:
+                if method == "mcp/disconnect":
+                    if set(params) != {"connectionId"} or kind != "request":
+                        raise ProxyError("invalid frame")
+                    key = _request_key(message["id"])
+                    self._register_local(key)
+                    await self._complete_local(key, {})
+                    return True
                 raise ProxyError("stale hosted connection ID")
             return False
         if method == "mcp/disconnect":

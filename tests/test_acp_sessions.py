@@ -1593,13 +1593,18 @@ async def test_conforming_provider_manifest_establishes_session(tmp_path: Path) 
 
 
 async def test_provider_indexes_are_session_owned_and_load_uses_fresh_connection(tmp_path: Path) -> None:
-    bundle, _ = _bundle(tmp_path)
+    bundle, core = _bundle(tmp_path)
     agent = MimirAcpAgent(bundle)
     client = McpClient()
     agent.on_connect(client)
     await agent.authenticate("mimir-web-key", **{"mimir.webKey": "secret"})
     first = (await agent.new_session("/one", mcp_servers=_hands("server-a"))).session_id
     second = (await agent.new_session("/two", mcp_servers=_hands("server-b"))).session_id
+    await agent.prompt(first, [sdk.TextContentBlock(type="text", text="persist")])
+    replay = list(client.updates)
+    client.updates.clear()
+    prior = agent._sessions[first]
+    prior_provider = prior.provider
 
     assert set(agent._connection.server_sessions) == {"server-a", "server-b"}
     assert set(agent._connection.connection_sessions) == {"connection-1", "connection-2"}
@@ -1608,8 +1613,24 @@ async def test_provider_indexes_are_session_owned_and_load_uses_fresh_connection
     await agent.load_session("/reloaded", first, mcp_servers=_hands("server-a"))
 
     assert client.connects == ["server-a", "server-b", "server-a"]
-    assert agent._sessions[first].provider.connection_id == "connection-3"
+    loaded = agent._sessions[first]
+    assert loaded is not prior
+    assert loaded.provider is not None
+    assert loaded.provider.connection_id == "connection-3"
+    assert prior_provider is not None and prior_provider.closed is True
     assert "connection-1" not in agent._connection.connection_sessions
+    assert agent._connection.connection_sessions["connection-3"] is loaded
+    assert client.disconnects == ["connection-1"]
+    assert client.updates == replay
+    assert agent._connection.closed is False
+
+    response = await agent.prompt(
+        first, [sdk.TextContentBlock(type="text", text="after load")]
+    )
+
+    assert response.stop_reason == "end_turn"
+    assert len(core.calls) == 2
+    assert loaded.provider.closed is False
     assert client.disconnects == ["connection-1"]
 
 
