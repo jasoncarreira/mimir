@@ -7383,6 +7383,22 @@ class ChannelResourceAdapter:
         resolved_triggering = cls._resolve_channel(triggering_channel)
 
         same_scope = resolved_target == resolved_triggering
+        service = get_trusted_service_from_auth_context(auth_context)
+        operator_delivery = (
+            tool_name == "send_message"
+            and service_can_invoke_operation(service, "send_message")
+            and _target_matches_operator_alert(
+                resolved_target or "", "MIMIR_OPERATOR_ALERT_CHANNEL",
+            )
+        )
+        if operator_delivery:
+            return ToolAuthorization(
+                tool_name=tool_name,
+                decision=OperationDecision.RESOURCE_SCOPED,
+                allowed=True,
+                reason="configured_operator_channel",
+                enforcement_enabled=enforce,
+            )
 
         if same_scope:
             return ToolAuthorization(
@@ -10240,6 +10256,8 @@ _TRUSTED_SERVICE_PRINCIPALS: dict[str, ServicePrincipal] = {
             canonical="scheduler",
             trigger="scheduled_tick",
             capabilities=(
+                "send_message",
+                "operator_alert",
                 "shell_exec",
                 "bash_async",
                 "bash_jobs_list",
@@ -10275,6 +10293,8 @@ _TRUSTED_SERVICE_PRINCIPALS: dict[str, ServicePrincipal] = {
             ),
             sink_destinations=(
                 "configured_channel",
+                "message",
+                "notification",
                 "filesystem",
                 "shell_process",
                 "spawn_process",
@@ -10295,6 +10315,7 @@ _TRUSTED_SERVICE_PRINCIPALS: dict[str, ServicePrincipal] = {
                 ServiceSinkPolicy("bash_async", "shell_profile", "maintenance"),
                 ServiceSinkPolicy("spawn_open_code", "spawn_workspace", "MIMIR_HOME/MIMIR_FILE_TOOL_ROOTS"),
                 ServiceSinkPolicy("worklink_run", "worklink_repo", "WORKLINK_REPO/MIMIR_WORKLINK_REPO"),
+                ServiceSinkPolicy("operator_alert", "operator_alert", "MIMIR_OPERATOR_ALERT_CHANNEL"),
             ),
             saga_full_corpus_read=True,
             creation_path="mimir.scheduler.Scheduler._fire_job",

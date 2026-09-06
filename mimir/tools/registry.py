@@ -289,9 +289,32 @@ async def _reject_trigger_pseudo_channel(tool_name: str, channel_id: str) -> str
     ctx = _resolve_authoritative_turn_context_for_send_message_guard()
     auth = getattr(ctx, "auth_context", None)
     service = get_trusted_service_from_auth_context(auth)
-    if service_can_invoke_operation(service, "operator_alert"):
-        alternative = "the operator alert channel via operator_alert(text=...)"
-    elif isinstance(auth, AuthContext):
+    from ..channel_registry import OPERATOR_CHANNEL_SENTINEL, resolve_deliver_channel
+
+    operator_channel = resolve_deliver_channel(
+        OPERATOR_CHANNEL_SENTINEL, os.environ.get("MIMIR_OPERATOR_ALERT_CHANNEL", ""),
+    )
+    if operator_channel and service is not None and isinstance(auth, AuthContext):
+        options = []
+        for operation, hint in (
+            ("send_message", f"send_message(channel_id={operator_channel!r}, text=...)"),
+            ("operator_alert", "operator_alert(text=...)"),
+        ):
+            if not service_can_invoke_operation(service, operation):
+                continue
+            labels = auth.ifc_state.current(auth.ifc_labels)
+            # Probe each option separately; never spend a live one-shot approval.
+            probe = replace(
+                auth, ifc_labels=labels, ifc_state=InformationFlowState(labels=labels),
+            )
+            if ToolRegistry().authorize_tool(
+                operation, probe, enforce=True,
+                target_channel=operator_channel, ifc_labels=labels,
+            ).allowed:
+                options.append(hint)
+        if options:
+            alternative = " or ".join(options)
+    if alternative == "none available on this turn" and isinstance(auth, AuthContext):
         destination = (
             service.configured_delivery_channel if service else auth.channel_id
         )
@@ -319,6 +342,8 @@ async def _reject_trigger_pseudo_channel(tool_name: str, channel_id: str) -> str
         "channel, not a deliverable channel. A silent turn is the correct way "
         "to decline: end the turn without calling send_message or react. "
         f"Deliverable alternative: {alternative}."
+        + (" No operator channel is configured (MIMIR_OPERATOR_ALERT_CHANNEL is unset)."
+           if not operator_channel else "")
     )
 
 
