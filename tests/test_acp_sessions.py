@@ -577,7 +577,12 @@ async def test_prompt_auth_context_is_scoped_to_the_session_channel(
 @pytest.mark.parametrize(
     ("permission_decision", "tool_name", "arguments", "expected_denial", "setup_error"),
     [
-        ("allow_once", "hands_shell", {"command": "printf ok"}, None, False),
+        ("allow_once", "hands_shell", {"command": "cat /tmp/x"}, None, False),
+        (
+            "allow_once", "hands_python",
+            {"code": "# /tmp/private/notes.txt\n" + "value = 1\n" * 8000},
+            None, False,
+        ),
         (
             "reject_once",
             "hands_shell",
@@ -602,7 +607,7 @@ async def test_prompt_auth_context_is_scoped_to_the_session_channel(
         ),
         (
             "allow_once", "hands_edit",
-            {"path": "tmp/notes.txt", "old_text": "old", "new_text": "new"},
+            {"path": "/private/tmp/notes.txt", "old_text": "old", "new_text": "new"},
             None, False,
         ),
     ],
@@ -630,6 +635,7 @@ async def test_admin_hands_permissions_precede_execution_and_preserve_raw_argume
 
     from mimir.tools.budget_gate import BudgetGateMiddleware
     from mimir.tools.client_provider import hands_python
+    from mimir.turn_event_redaction import scrub_value
 
     bundle, core = _bundle(tmp_path)
     agent = MimirAcpAgent(bundle)
@@ -722,14 +728,31 @@ async def test_admin_hands_permissions_precede_execution_and_preserve_raw_argume
             saga_session_id=kwargs["saga_session_id"],
         )
         active = agent._active_prompts[session_id]
-        active.dispatcher.enqueue({
+        bus = bundle.turn_event_bus
+        queue = bus._exact_turn_subscribers[kwargs["turn_id"]]
+        presentation = bus.subscribe(event.channel_id)
+        wildcard = bus.subscribe()
+        envelope = {"turn_id": kwargs["turn_id"], "channel_id": event.channel_id}
+        bus.publish({
+            **envelope,
             "type": "tool_call", "phase": "start",
             "id": "admin-1", "tool_name": tool_name,
         })
-        active.dispatcher.enqueue({
+        bus.publish({
+            **envelope,
             "type": "tool_call", "phase": "end",
             "id": "admin-1", "tool_name": tool_name, "args": arguments,
         })
+        for subscriber in (presentation, wildcard):
+            start = subscriber.get_nowait()
+            end = subscriber.get_nowait()
+            assert "args" not in start
+            assert end["args"] == scrub_value(arguments)
+            assert "_permission_args" not in start
+            assert "_permission_args" not in end
+        bus.unsubscribe(event.channel_id, presentation)
+        bus.unsubscribe("*", wildcard)
+        await queue.join()
         await active.dispatcher.drain()
         request = ToolCallRequest(
             tool_call={
@@ -830,10 +853,9 @@ async def test_admin_hands_permissions_precede_execution_and_preserve_raw_argume
         if getattr(update, "tool_call_id", None) == "admin-1"
         and update.status == "in_progress"
     )
-    if tool_name == "hands_edit":
-        assert progress.raw_input == {
-            "path": "[path]", "old_text": "old", "new_text": "new",
-        }
+    assert progress.raw_input == scrub_value(arguments)
+    start = next(update for update in client.updates if update.session_update == "tool_call")
+    assert start.raw_input == {}
     assert client.execution_order == (
         ["permission", "execution"] * expected_invocations
         if expected_denial is None

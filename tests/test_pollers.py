@@ -3123,7 +3123,9 @@ async def test_run_poller_timeout_kills_child_holding_pipes(
     if not hasattr(os, "killpg") or not Path("/proc").is_dir():
         pytest.skip("process-group liveness assertion requires POSIX /proc")
 
-    poller_timeout = 0.25
+    # The timeout includes Python startup and child creation under xdist load.
+    # Match the neighboring subprocess tests so the pipe-holder can start.
+    poller_timeout = 2.0
     skill_dir = tmp_path / "skill"
     _install_script(skill_dir, "poller.py", """
 import json, os, subprocess, sys
