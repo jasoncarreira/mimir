@@ -198,10 +198,17 @@ export function DataTable({
   rows: Array<Record<string, React.ReactNode>>;
   caption?: React.ReactNode;
 }) {
+  const captionId = React.useId();
   return (
-    <div className="ui-table-wrap">
+    <div
+      aria-label={caption ? undefined : "Table"}
+      aria-labelledby={caption ? captionId : undefined}
+      className="ui-table-wrap"
+      role="region"
+      tabIndex={0}
+    >
       <table className="ui-table">
-        {caption ? <caption>{caption}</caption> : null}
+        {caption ? <caption id={captionId}>{caption}</caption> : null}
         <thead>
           <tr>
             {columns.map((column) => (

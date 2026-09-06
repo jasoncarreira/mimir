@@ -226,6 +226,10 @@ describe("FactoryRunsRoute", () => {
     renderRoute(<RunDetail runId="834" />);
 
     expect(await screen.findByText("Active")).toBeTruthy();
+    const back = screen.getByRole("link", { name: "Back to list" });
+    expect(back.getAttribute("href")).toBe("/factory-runs");
+    back.focus();
+    expect(document.activeElement).toBe(back);
     expect(screen.getByText("GO-WITH-NITS")).toBeTruthy();
     expect(screen.queryByText("Terminal")).toBeNull();
     expect(screen.getByText("observe")).toBeTruthy();
