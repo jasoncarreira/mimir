@@ -11,6 +11,15 @@ import yaml
 
 
 @dataclass(frozen=True)
+class RepositoryTestSuite:
+    name: str
+    command: str
+    default: bool = False
+    selector_prefixes: tuple[str, ...] = ()
+    selector_suffixes: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
 class RepositoryConfig:
     slug: str
     root: Path
@@ -18,6 +27,7 @@ class RepositoryConfig:
     origin: str
     base_branch: str
     test_command: str | None = None
+    test_suites: tuple[RepositoryTestSuite, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -63,6 +73,7 @@ class RepositoryInventory:
 
 
 _REPOSITORY_SLUG = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+")
+_TEST_SUITE_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]*")
 _GITHUB_ORIGIN = re.compile(
     r"(?:https?://github\.com/|ssh://git@github\.com/|git@github\.com:)"
     r"(?P<owner>[A-Za-z0-9_.-]+)/(?P<repo>[A-Za-z0-9_.-]+?)(?:\.git)?/?"
@@ -86,6 +97,52 @@ def _parse_absolute_root(value: Any, label: str) -> Path:
     if not root.is_absolute() or ".." in root.parts:
         raise ValueError(f"{label}.root must be an absolute path without ~ or ..")
     return root.resolve()
+
+
+def _parse_test_suites(
+    value: Any, label: str, test_command: str | None,
+) -> tuple[RepositoryTestSuite, ...]:
+    if not isinstance(value, list):
+        raise ValueError(f"{label} must be a list")
+    suites: list[RepositoryTestSuite] = []
+    names: set[str] = set()
+    has_default = False
+    for index, item in enumerate(value):
+        suite_label = f"{label}[{index}]"
+        if not isinstance(item, dict):
+            raise ValueError(f"{suite_label} must be a mapping")
+        missing = [key for key in ("name", "command") if key not in item]
+        if missing:
+            raise ValueError(f"{suite_label} missing required field(s): {', '.join(missing)}")
+        if set(item) - {"name", "command", "default", "selector_prefixes", "selector_suffixes"}:
+            raise ValueError(f"{suite_label} contains unknown fields")
+        name = item["name"]
+        if not isinstance(name, str) or _TEST_SUITE_NAME.fullmatch(name) is None:
+            raise ValueError(f"{suite_label}.name must be a safe name matching {_TEST_SUITE_NAME.pattern}")
+        if name in names:
+            raise ValueError(f"{suite_label} duplicate test suite name: {name}")
+        if name == "default" and test_command is not None:
+            raise ValueError(f"{suite_label}.name 'default' is reserved when test_command is nonnull")
+        command = item["command"]
+        if not isinstance(command, str) or not command.strip():
+            raise ValueError(f"{suite_label}.command must be a non-empty string")
+        default = item.get("default", False)
+        if not isinstance(default, bool):
+            raise ValueError(f"{suite_label}.default must be a boolean")
+        if default and has_default:
+            raise ValueError(f"{label} may have at most one default suite")
+        selectors: dict[str, tuple[str, ...]] = {}
+        for field in ("selector_prefixes", "selector_suffixes"):
+            entries = item.get(field, [])
+            if not isinstance(entries, list) or any(
+                not isinstance(entry, str) or not entry.strip() for entry in entries
+            ):
+                raise ValueError(f"{suite_label}.{field} must be a list of non-empty strings")
+            selectors[field] = tuple(entries)
+        names.add(name)
+        has_default = has_default or default
+        suites.append(RepositoryTestSuite(name, command, default, **selectors))
+    return tuple(suites)
 
 
 def _parse_repositories(value: Any) -> tuple[RepositoryConfig, ...]:
@@ -125,7 +182,10 @@ def _parse_repositories(value: Any) -> tuple[RepositoryConfig, ...]:
         test_command = item.get("test_command")
         if test_command is not None and not isinstance(test_command, str):
             raise ValueError(f"{label}.test_command must be a string or null")
-        if set(item) - {"slug", "root", "mode", "origin", "base_branch", "test_command"}:
+        test_suites = _parse_test_suites(
+            item.get("test_suites", []), f"{label}.test_suites", test_command,
+        )
+        if set(item) - {"slug", "root", "mode", "origin", "base_branch", "test_command", "test_suites"}:
             raise ValueError(f"{label} contains unknown fields")
         if slug in slugs:
             raise ValueError(f"duplicate repository slug: {slug}")
@@ -141,6 +201,7 @@ def _parse_repositories(value: Any) -> tuple[RepositoryConfig, ...]:
                 origin=origin.strip(),
                 base_branch=base_branch.strip(),
                 test_command=test_command,
+                test_suites=test_suites,
             )
         )
     return tuple(repositories)

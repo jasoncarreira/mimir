@@ -28,7 +28,7 @@ from .event_logger import safe_log_event
 from .models import RepoPRAction, RepoReviewState
 from .redaction import redact_text
 from .repo_tools import GitRefusal, RepoGitTools
-from .repository_config import RepositoryInventory
+from .repository_config import RepositoryInventory, RepositoryTestSuite
 from .worklink.backends.registry import WorklinkConfig
 from .worklink.identities import get_identities
 from .worklink.worker_client import StaleWorkerExecutorError
@@ -118,13 +118,16 @@ class ProjectTestResult:
     git_context: str = ""
     stdout_path: str = ""
     stderr_path: str = ""
+    suite: str = "default"
 
 
 ContainedRunner = Callable[..., Awaitable[CollectedExecutionResult]]
 CheckoutFactory = Callable[..., ContainedCheckout]
 
 
-def _configured_command(repo_slug: str) -> tuple[tuple[str, ...], dict[str, str], str]:
+def _configured_command(
+    repo_slug: str, selectors: tuple[str, ...] = (), suite: str | None = None,
+) -> tuple[tuple[str, ...], dict[str, str], str, str, bool]:
     """Resolve Worklink's deployment command into one shell-free fixed argv."""
     home = os.environ.get("MIMIR_HOME", "").strip()
     if not home:
@@ -143,7 +146,40 @@ def _configured_command(repo_slug: str) -> tuple[tuple[str, ...], dict[str, str]
         else:
             command = config.defaults.test_command
             source = "deployment"
+        suites = record.test_suites if record is not None else ()
+        legacy = not suites
+        if legacy or (record.test_command is not None and not any(s.default for s in suites)):
+            suites = (RepositoryTestSuite("default", command, default=True), *suites)
+        default = next((s for s in suites if s.default), None)
+        if suite is not None:
+            matches = [s for s in suites if s.name == suite]
+        elif (
+            selectors and not legacy and isinstance(selectors, tuple)
+            and all(isinstance(s, str) for s in selectors)
+        ):
+            matches = [
+                s for s in suites
+                if all(
+                    path.partition("::")[0].startswith(s.selector_prefixes)
+                    or path.partition("::")[0].endswith(s.selector_suffixes)
+                    for path in selectors
+                )
+            ]
+        else:
+            matches = [default] if default is not None else []
+        if len(matches) != 1:
+            raise ProjectTestRefusal(
+                "test_suite_selection_refused",
+                "select exactly one declared test suite: " + ", ".join(s.name for s in suites),
+                execution_started=False,
+            )
+        chosen = matches[0]
+        command = chosen.command
+        if not legacy and chosen in record.test_suites:
+            source = "repository"
         words = shlex.split(command, posix=True)
+    except ProjectTestRefusal:
+        raise
     except (OSError, RuntimeError, ValueError) as exc:
         raise ProjectTestRefusal(
             "test_config_invalid",
@@ -193,6 +229,9 @@ def _configured_command(repo_slug: str) -> tuple[tuple[str, ...], dict[str, str]
                 "test_config_invalid", "test runner is missing", execution_started=False
             )
 
+    if not legacy and selectors and Path(words[0]).name == "npm" and words[1:2] == ["run"]:
+        if "--" not in words:
+            words.append("--")
     executable = Path(words[0])
     try:
         resolved_text = (
@@ -227,10 +266,12 @@ def _configured_command(repo_slug: str) -> tuple[tuple[str, ...], dict[str, str]
             "configured test runner is unavailable",
             execution_started=False,
         )
-    return (str(resolved), *words[1:]), env, source
+    return (str(resolved), *words[1:]), env, source, chosen.name, chosen == default
 
 
-def _validated_selectors(root: Path, selectors: tuple[str, ...]) -> tuple[str, ...]:
+def _validated_selectors(
+    root: Path, selectors: tuple[str, ...], *, suite: str = "default",
+) -> tuple[str, ...]:
     if not isinstance(selectors, tuple):
         raise ProjectTestRefusal(
             "test_selector_invalid",
@@ -259,6 +300,12 @@ def _validated_selectors(root: Path, selectors: tuple[str, ...]) -> tuple[str, .
     for item in selectors:
         path_text, separator, node_id = item.partition("::")
         candidate = PurePosixPath(path_text)
+        if suite == "frontend" and (separator or candidate.suffix not in {".ts", ".tsx"}):
+            raise ProjectTestRefusal(
+                "test_selector_invalid",
+                "frontend selectors must be relative .ts or .tsx paths without node ids",
+                execution_started=False,
+            )
         if (
             not item
             or len(item) > _MAX_SELECTOR_LENGTH
@@ -465,7 +512,9 @@ class RepoProjectTests:
         self._timeout = timeout
         self._output_limit = output_limit
 
-    async def execute(self, selectors: tuple[str, ...] = ()) -> ProjectTestResult:
+    async def execute(
+        self, selectors: tuple[str, ...] = (), *, suite: str | None = None,
+    ) -> ProjectTestResult:
         scope = self._state.action_scope
         if RepoPRAction.TEST.value not in scope.allowed_operations:
             raise ProjectTestRefusal("scope_action_denied", "scope does not grant repo.test", execution_started=False)
@@ -482,10 +531,10 @@ class RepoProjectTests:
                 ),
             ) from exc
         try:
-            command, configured_env, command_source = _configured_command(
-                scope.canonical_repo
+            command, configured_env, command_source, suite_name, is_default = _configured_command(
+                scope.canonical_repo, selectors, suite
             )
-            selected = _validated_selectors(root, selectors)
+            selected = _validated_selectors(root, selectors, suite=suite_name)
         except ProjectTestRefusal as exc:
             raise ProjectTestRefusal(
                 exc.code,
@@ -690,6 +739,7 @@ class RepoProjectTests:
             keep_tail=result.stderr_dropped_bytes > 0,
         )
         truncation = {
+            "suite": suite_name,
             "output_limited": result.output_overflow,
             "stdout_dropped_bytes": result.stdout_dropped_bytes,
             "stderr_dropped_bytes": result.stderr_dropped_bytes,
@@ -708,7 +758,8 @@ class RepoProjectTests:
                 command, command_source, **truncation,
                 git_context=_git_execution_context(),
             )
-        if not selectors:
+        # A non-default suite must not satisfy the existing default-test push gate.
+        if not selectors and is_default:
             head = self._state.git_expected_head
             if head is None:
                 raise ProjectTestRefusal(

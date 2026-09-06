@@ -235,11 +235,14 @@ async def repo_test(
     pull_request: int,
     selectors: tuple[str, ...] = (),
     runtime: ToolRuntime[AuthContext] = None,  # type: ignore[assignment]
+    suite: str | None = None,
 ) -> dict[str, Any]:
-    """Run the deployment-configured tests in the active bound PR checkout."""
+    """Run configured tests in a contained PR snapshot. Pass suite='frontend'
+    for Vitest, or omit suite to infer it from selectors (no selectors: default).
+    """
     try:
         return asdict(
-            await RepoProjectTests(_state(runtime, repository, pull_request)).execute(selectors)
+            await RepoProjectTests(_state(runtime, repository, pull_request)).execute(selectors, suite=suite)
         )
     except (ProjectTestRefusal, RuntimeError, ValueError) as exc:
         code = getattr(exc, "code", "project_test_failed")

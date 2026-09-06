@@ -4166,12 +4166,12 @@ def test_compound_command_refusal_says_what_to_do_instead() -> None:
         (
             "npm run",
             access_control.ServiceShellBindingRule.PROFILE_ALLOWLIST,
-            "typed repo_test tool",
+            "suite='frontend'",
         ),
         (
             "/usr/bin/npm test",
             access_control.ServiceShellBindingRule.PROFILE_ALLOWLIST,
-            "typed repo_test tool",
+            "suite='frontend'",
         ),
         (
             # Single-quoted, so nothing here is an operator; the refusal comes

@@ -6351,7 +6351,7 @@ def test_repo_test_post_execution_permission_failure_taints_turn(
         def __init__(self, review_state):  # type: ignore[no-untyped-def]
             self.review_state = review_state
 
-        async def execute(self, selectors):  # type: ignore[no-untyped-def]
+        async def execute(self, selectors, *, suite=None):  # type: ignore[no-untyped-def]
             raise ProjectTestRefusal(
                 "test_path_permission_denied",
                 "path_mode=0o700 path_uid=1000 path_gid=1000",

@@ -266,8 +266,12 @@ def test_repo_test_schema_exposes_no_execution_authority() -> None:
             coding_enabled=True, require_coding_available=False,
         )
     }
-    properties = tools["repo_test"].tool_call_schema.model_json_schema()["properties"]
-    assert set(properties) == {"repository", "pull_request", "selectors"}
+    schema = tools["repo_test"].tool_call_schema.model_json_schema()
+    properties = schema["properties"]
+    assert set(properties) == {"repository", "pull_request", "selectors", "suite"}
+    assert properties["suite"]["default"] is None
+    assert properties["suite"]["anyOf"] == [{"type": "string"}, {"type": "null"}]
+    assert "suite" not in schema["required"]
 
 
 def test_build_app_checks_enabled_coding_surface_at_startup() -> None:
