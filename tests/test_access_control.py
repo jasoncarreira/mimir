@@ -3717,9 +3717,115 @@ def test_service_shell_binding_refusal_returns_stable_rule(
 
     refusal = bound.tool_call["args"]["mimir_shell_refusal"]
     assert refusal.startswith("shell_exec was refused before execution: ")
-    assert refusal.endswith(f" binding_rule={expected_rule}")
+    assert f" binding_rule={expected_rule}" in refusal
+    _assert_service_shell_redirect(refusal)
     if secret_value is not None:
         assert secret_value not in refusal
+
+
+def _assert_service_shell_redirect(refusal: str) -> None:
+    assert refusal.startswith("shell_exec was refused before execution")
+    assert "\n" not in refusal
+    assert refusal.endswith(
+        " Without shell, if exposed and authorized on this turn, use ls for directory listing,"
+        " read_file for file contents, and grep/glob for searching within allowed read roots."
+    )
+
+
+@pytest.mark.parametrize("rule", [
+    rule for rule in access_control.ServiceShellBindingRule
+    if not rule.value.startswith("operator_")
+])
+def test_service_shell_redirect_covers_binding_refusal_rules(
+    monkeypatch: pytest.MonkeyPatch, rule: access_control.ServiceShellBindingRule,
+) -> None:
+    from mimir.tools import budget_gate
+
+    service = build_trigger_service_principal(
+        canonical="heartbeat", trigger="scheduled_tick", profile="heartbeat",
+        tier=CapabilityTier.CODE_EXECUTION,
+        capabilities=("shell_exec", "bash_jobs_list", "bash_job_output"),
+        creation_path="test",
+    )
+    auth = _service_auth(service, InformationFlowLabels())
+    monkeypatch.setattr(
+        budget_gate, "parse_service_shell_argv_with_diagnostics",
+        lambda *_args, **_kwargs: (None, "synthetic refusal", rule),
+    )
+    bound = budget_gate._request_for_authorized_execution(
+        _tool_request(auth, args={"command": "pwd"}), "shell_exec", auth,
+    )
+    _assert_service_shell_redirect(bound.tool_call["args"]["mimir_shell_refusal"])
+
+
+@pytest.mark.parametrize(("profile", "operations"), [
+    ("scheduler_read_only", "bounded file inspection, read-only Git and Chainlink operations"),
+    ("maintenance", "bounded file/date inspection, read-only Git/GitHub and Chainlink operations"),
+    ("session_boundary", "bounded Chainlink operations and GitHub issue/PR views"),
+    ("repo_review", "bounded repository inspection, review operations and script-free npm ci"),
+    ("upgrade_workspace", "bounded file inspection, workspace Git, Chainlink and uv lock/sync operations"),
+])
+def test_service_shell_profile_denial_names_allowed_operations(
+    profile: str, operations: str,
+) -> None:
+    from mimir.tools import budget_gate
+
+    service = replace(
+        build_trigger_service_principal(
+            canonical="heartbeat", trigger="scheduled_tick", profile="heartbeat",
+            tier=CapabilityTier.CODE_EXECUTION,
+            capabilities=("shell_exec", "bash_jobs_list", "bash_job_output"),
+            creation_path="test",
+        ),
+        sink_policies=(ServiceSinkPolicy("shell_exec", "shell_profile", profile),),
+    )
+    auth = _service_auth(service, InformationFlowLabels())
+    _, detail, _ = access_control.parse_service_shell_argv_with_diagnostics(
+        "curl https://secret.example/token", profile,
+    )
+    refusal = budget_gate._deny_admin_tool(
+        "shell_exec", "service_sink_destination_denied", ctx=auth,
+        enforcement_enabled=True, detail=detail,
+    )
+    _assert_service_shell_redirect(refusal)
+    assert f"Profile allows {operations}" in refusal
+    assert "secret.example" not in refusal
+
+
+def test_service_shell_redirect_is_bounded_and_service_only(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from mimir.tools import budget_gate
+
+    monkeypatch.delenv("MIMIR_HOME", raising=False)
+    monkeypatch.setattr(access_control, "current_turn_scratch_root", lambda: None)
+    service = replace(
+        build_trigger_service_principal(
+            canonical="heartbeat", trigger="scheduled_tick", profile="heartbeat",
+            tier=CapabilityTier.CODE_EXECUTION,
+            capabilities=("shell_exec", "bash_jobs_list", "bash_job_output"),
+            creation_path="test",
+        ),
+        filesystem_read_roots=tuple(f"/owned/root-{i}" for i in range(100)),
+    )
+    message = "shell_exec was refused before execution: a filesystem operand could not be resolved."
+    refusal = budget_gate._service_shell_refusal_guidance(message, "shell_exec", service)
+    _assert_service_shell_redirect(refusal)
+    assert "Allowed read roots (partial list):" in refusal
+    assert '"/owned/root-0"' in refusal
+    assert '"/owned/root-8"' not in refusal
+    assert len(refusal) < 1500
+    assert budget_gate._service_shell_refusal_guidance(message, "shell_exec", None) == message
+    assert budget_gate._service_shell_refusal_guidance(message, "bash_async", service) == message
+    no_roots = replace(service, filesystem_read_roots=())
+    refusal = budget_gate._service_shell_refusal_guidance(message, "shell_exec", no_roots)
+    _assert_service_shell_redirect(refusal)
+    assert "Allowed read roots" not in refusal
+    auth = _service_auth(no_roots, InformationFlowLabels())
+    refusal = budget_gate._deny_admin_tool(
+        "shell_exec", "service_capability_denied", ctx=auth, enforcement_enabled=True,
+    )
+    _assert_service_shell_redirect(refusal)
 
 
 def test_service_shell_binding_refusal_handles_missing_rule(
@@ -3748,10 +3854,12 @@ def test_service_shell_binding_refusal_handles_missing_rule(
         auth,
     )
 
-    assert bound.tool_call["args"]["mimir_shell_refusal"] == (
+    refusal = bound.tool_call["args"]["mimir_shell_refusal"]
+    assert refusal.startswith(
         "shell_exec was refused before execution: synthetic refusal "
         "binding_rule=unknown"
     )
+    _assert_service_shell_redirect(refusal)
 
 
 def test_service_shell_final_binding_refusal_emits_hard_denial(
@@ -4265,6 +4373,9 @@ async def test_refused_service_shell_returns_the_reason_and_executes_nothing(
     assert "maintenance" in result.content       # the profile that refused
     assert "one command per call" in result.content
     assert "shell=False" in result.content
+    _assert_service_shell_redirect(result.content)
+    assert "Pipes, redirections and command chaining are not available on this turn" in result.content
+    assert "a single plain command is available if the profile admits it" in result.content
     # The fail-closed argv must never be what the caller reads instead.
     assert "/usr/bin/false" not in result.content
 
@@ -4574,6 +4685,7 @@ async def test_service_shell_refuses_unauthorized_cwd_without_echoing_it(
 
     assert result.status == "error"
     assert reason in str(result.content)
+    _assert_service_shell_redirect(str(result.content))
     if supplied_cwd:
         assert supplied_cwd not in str(result.content)
     assert "secret-outside-root" not in str(result.content)
@@ -10938,8 +11050,9 @@ def test_service_shell_refuses_whole_argv_when_any_read_operand_is_unsafe(
     assert "mimir_shell_refusal" in bound.tool_call["args"]
 
 
+@pytest.mark.parametrize("exists", [True, False])
 def test_service_shell_refuses_read_operand_outside_principal_roots(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, exists: bool,
 ) -> None:
     home = tmp_path / "home"
     root = tmp_path / "read-root"
@@ -10947,7 +11060,8 @@ def test_service_shell_refuses_read_operand_outside_principal_roots(
     root.mkdir()
     monkeypatch.setenv("MIMIR_HOME", str(home))
     outside = tmp_path / "outside.txt"
-    outside.write_text("ordinary text\n", encoding="utf-8")
+    if exists:
+        outside.write_text("ordinary text\n", encoding="utf-8")
     service = replace(
         build_trigger_service_principal(
             canonical="scheduler:test",
@@ -10977,6 +11091,13 @@ def test_service_shell_refuses_read_operand_outside_principal_roots(
 
     assert decision.allowed is True
     assert "mimir_shell_refusal" in bound.tool_call["args"]
+    refusal = bound.tool_call["args"]["mimir_shell_refusal"]
+    _assert_service_shell_redirect(refusal)
+    assert "Allowed read roots:" in refusal
+    assert str(root) in refusal
+    assert str(home / "state") in refusal
+    assert str(outside) not in refusal
+    assert "protected files remain withheld" in refusal
 
 
 @pytest.mark.parametrize(
