@@ -236,18 +236,26 @@ class UpdateDispatcher:
                 self._open_tools[tool_id] = name
                 raw_input = _client_json(event.get("args")) if "args" in event else {}
                 self._tool_args[tool_id] = raw_input
-                self._snapshots[tool_id] = PermissionSnapshot(
-                    tool_call_id=tool_id,
-                    title=name,
-                    kind="other",
-                    raw_input=_freeze_json(raw_input),
-                )
+                if "args" in event:
+                    self._snapshots[tool_id] = PermissionSnapshot(
+                        tool_call_id=tool_id,
+                        title=name,
+                        kind="other",
+                        raw_input=_freeze_json(_strict_json(event["args"])),
+                    )
                 return [ToolCallStart(sessionUpdate="tool_call", toolCallId=tool_id, title=name, kind="other", status="pending", rawInput=raw_input)]
             if phase == "end":
                 output: list[Any] = []
                 if tool_id not in self._open_tools:
                     self._open_tools[tool_id] = name
                     output.append(ToolCallStart(sessionUpdate="tool_call", toolCallId=tool_id, title=name, kind="other", status="pending"))
+                if "args" in event and tool_id not in self._snapshots:
+                    self._snapshots[tool_id] = PermissionSnapshot(
+                        tool_call_id=tool_id,
+                        title=name,
+                        kind="other",
+                        raw_input=_freeze_json(_strict_json(event["args"])),
+                    )
                 args = _client_json(event.get("args"))
                 self._tool_args[tool_id] = args
                 output.append(ToolCallProgress(sessionUpdate="tool_call_update", toolCallId=tool_id, status="in_progress", rawInput=args))

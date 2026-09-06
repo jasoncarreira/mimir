@@ -600,6 +600,11 @@ async def test_prompt_auth_context_is_scoped_to_the_session_channel(
             "allow_once", "hands_python", {"code": "value = 1\nvalue"},
             None, True,
         ),
+        (
+            "allow_once", "hands_edit",
+            {"path": "tmp/notes.txt", "old_text": "old", "new_text": "new"},
+            None, False,
+        ),
     ],
 )
 async def test_admin_hands_permissions_precede_execution_and_preserve_raw_arguments(
@@ -633,10 +638,14 @@ async def test_admin_hands_permissions_precede_execution_and_preserve_raw_argume
         def __init__(self) -> None:
             super().__init__()
             self.permission_snapshots: list[Any] = []
+            self.permission_requests: list[dict[str, Any]] = []
             self.execution_order: list[str] = []
 
         async def request_tool_permission(self, session_id: str, snapshot: Any) -> Any:
             self.permission_snapshots.append(snapshot)
+            self.permission_requests.append(
+                sdk.permission_request_params(session_id, snapshot)
+            )
             self.execution_order.append("permission")
             if permission_decision == "timeout":
                 await asyncio.Event().wait()
@@ -648,9 +657,22 @@ async def test_admin_hands_permissions_precede_execution_and_preserve_raw_argume
             if method == "tools/call":
                 self.messages.append((connection_id, method, params))
                 self.execution_order.append("execution")
-                expected_provider = "python" if tool_name == "hands_python" else "shell"
+                expected_provider = {
+                    "hands_python": "python",
+                    "hands_edit": "edit",
+                    "hands_shell": "shell",
+                }[tool_name]
                 assert params["name"] == expected_provider
-                assert params["arguments"] == arguments
+                expected_provider_arguments = (
+                    {
+                        "path": arguments["path"],
+                        "oldText": arguments["old_text"],
+                        "newText": arguments["new_text"],
+                    }
+                    if tool_name == "hands_edit"
+                    else arguments
+                )
+                assert params["arguments"] == expected_provider_arguments
                 assert isinstance(params.get("_meta", {}).get("progressToken"), str)
                 if tool_name == "hands_python":
                     if setup_error:
@@ -663,6 +685,11 @@ async def test_admin_hands_permissions_precede_execution_and_preserve_raw_argume
                             "ok": True, "stdout": "", "stderr": "", "value": "1",
                             "exception": "", "timedOut": False, "kernel": "fresh",
                         },
+                    }
+                if tool_name == "hands_edit":
+                    return {
+                        "content": [{"type": "text", "text": "changed"}],
+                        "structuredContent": {"changed": True},
                     }
                 return {
                     "content": [{"type": "text", "text": "ok"}],
@@ -677,7 +704,9 @@ async def test_admin_hands_permissions_precede_execution_and_preserve_raw_argume
         )
     agent.on_connect(client)
     await agent.authenticate("mimir-web-key", **{"mimir.webKey": "secret"})
-    session_id = (await agent.new_session("/one", mcp_servers=_hands("server"))).session_id
+    session_id = (
+        await agent.new_session(str(tmp_path), mcp_servers=_hands("server"))
+    ).session_id
 
     async def integrated_turn(event: Any, **kwargs: Any) -> None:
         bound_auth = event.continuation_auth_context
@@ -692,15 +721,15 @@ async def test_admin_hands_permissions_precede_execution_and_preserve_raw_argume
             ifc_state=InformationFlowState(labels=labels),
             saga_session_id=kwargs["saga_session_id"],
         )
-        turn_id = kwargs["turn_id"]
         active = agent._active_prompts[session_id]
-        queue = bundle.turn_event_bus._exact_turn_subscribers[turn_id]
-        bundle.turn_event_bus.publish({
-            "turn_id": turn_id, "channel_id": event.channel_id, "seq": 1,
-            "ts": "now", "type": "tool_call", "phase": "start",
+        active.dispatcher.enqueue({
+            "type": "tool_call", "phase": "start",
+            "id": "admin-1", "tool_name": tool_name,
+        })
+        active.dispatcher.enqueue({
+            "type": "tool_call", "phase": "end",
             "id": "admin-1", "tool_name": tool_name, "args": arguments,
         })
-        await queue.join()
         await active.dispatcher.drain()
         request = ToolCallRequest(
             tool_call={
@@ -725,9 +754,20 @@ async def test_admin_hands_permissions_precede_execution_and_preserve_raw_argume
                 content=json.dumps(result), tool_call_id="admin-1", name=tool_name,
             )
 
-        result = await asyncio.to_thread(
-            BudgetGateMiddleware().wrap_tool_call, request, sync_handler,
-        )
+        async def async_handler(call: ToolCallRequest) -> ToolMessage:
+            result = await hands_edit.ainvoke(call.tool_call["args"])
+            return ToolMessage(
+                content=json.dumps(result), tool_call_id="admin-1", name=tool_name,
+            )
+
+        if tool_name == "hands_edit":
+            result = await BudgetGateMiddleware().awrap_tool_call(
+                request, async_handler,
+            )
+        else:
+            result = await asyncio.to_thread(
+                BudgetGateMiddleware().wrap_tool_call, request, sync_handler,
+            )
         if expected_denial is None:
             assert result.status != "error", result.content
             expected_result = (
@@ -736,6 +776,8 @@ async def test_admin_hands_permissions_precede_execution_and_preserve_raw_argume
                     "exception": "", "timedOut": False, "kernel": "fresh",
                 }
                 if tool_name == "hands_python"
+                else {"changed": True}
+                if tool_name == "hands_edit"
                 else {"stdout": "ok", "stderr": "", "exitCode": 0}
             )
             assert json.loads(str(result.content)) == expected_result
@@ -777,6 +819,21 @@ async def test_admin_hands_permissions_precede_execution_and_preserve_raw_argume
     assert snapshot.tool_call_id == "admin-1"
     assert snapshot.title == tool_name
     assert snapshot.raw_input == arguments
+    assert client.permission_requests[0]["_meta"] == {"mimir.wrapper": tool_name}
+    assert client.permission_requests[0]["options"] == [
+        {"optionId": "allow_once", "name": "Allow once", "kind": "allow_once"},
+        {"optionId": "allow_session", "name": "Allow for this session", "kind": "allow_always"},
+        {"optionId": "reject_once", "name": "Reject once", "kind": "reject_once"},
+    ]
+    progress = next(
+        update for update in client.updates
+        if getattr(update, "tool_call_id", None) == "admin-1"
+        and update.status == "in_progress"
+    )
+    if tool_name == "hands_edit":
+        assert progress.raw_input == {
+            "path": "[path]", "old_text": "old", "new_text": "new",
+        }
     assert client.execution_order == (
         ["permission", "execution"] * expected_invocations
         if expected_denial is None
@@ -1716,6 +1773,8 @@ async def test_active_prompt_permission_uses_admitted_snapshot_and_is_once_scope
     dispatcher = UpdateDispatcher(Publisher(), lease, 1)
     dispatcher.enqueue({"type": "tool_call", "phase": "start", "id": "tool-1", "tool_name": "hands_edit", "args": {"path": "a", "token": "secret"}})
     dispatcher.enqueue({"type": "tool_call", "phase": "end", "id": "tool-1", "tool_name": "hands_edit", "args": {"path": "changed", "token": "later"}})
+    dispatcher.enqueue({"type": "tool_call", "phase": "start", "id": "no-args", "tool_name": "hands_shell"})
+    dispatcher.enqueue({"type": "tool_call", "phase": "start", "id": "empty", "tool_name": "hands_shell", "args": {}})
     await dispatcher.drain()
     peer = Peer()
     owner = SimpleNamespace(_boundary_lock=asyncio.Lock())
@@ -1727,7 +1786,7 @@ async def test_active_prompt_permission_uses_admitted_snapshot_and_is_once_scope
     )
     session.active_prompt = active
 
-    missing = await active.request_permission(PermissionEligibility("missing", "ignored", "ignored", {"path": "a"}))
+    missing = await active.request_permission(PermissionEligibility("no-args", "ignored", "ignored", {"command": "true"}))
     mismatch = await active.request_permission(PermissionEligibility("tool-1", "ignored", "ignored", {"path": "changed", "token": "secret"}))
     monkeypatch.setattr(
         agent_module, "client_authorized_host_execution_metadata", lambda _: None,
@@ -1737,6 +1796,7 @@ async def test_active_prompt_permission_uses_admitted_snapshot_and_is_once_scope
         object(),
     ))
     decision = await active.request_permission(PermissionEligibility("tool-1", "ignored", "ignored", {"path": "a", "token": "secret"}))
+    empty = await active.request_permission(PermissionEligibility("empty", "ignored", "ignored", {}))
     lease.close()
     stale = await active.request_permission(PermissionEligibility("tool-1", "ignored", "ignored", {"path": "a", "token": "secret"}))
 
@@ -1744,6 +1804,7 @@ async def test_active_prompt_permission_uses_admitted_snapshot_and_is_once_scope
     assert mismatch is PermissionDecision.NOT_REQUESTED
     assert indeterminate is PermissionDecision.NOT_REQUESTED
     assert decision is PermissionDecision.ALLOW_ONCE
+    assert empty is PermissionDecision.NOT_REQUESTED
     assert stale is PermissionDecision.NOT_REQUESTED
     events = [
         json.loads(line)["type"]
@@ -1753,6 +1814,7 @@ async def test_active_prompt_permission_uses_admitted_snapshot_and_is_once_scope
         "acp_permission_guard_snapshot_missing",
         "acp_permission_guard_snapshot_mismatch",
         "acp_permission_guard_host_execution_missing",
+        "acp_permission_guard_snapshot_mismatch",
         "acp_permission_guard_prompt_not_current",
     ]
     assert peer.snapshots[0][1].title == "hands_edit"

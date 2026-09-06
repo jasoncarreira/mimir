@@ -76,6 +76,72 @@ async def test_tool_input_and_output_use_the_same_client_redaction_policy() -> N
 
 
 @pytest.mark.asyncio
+async def test_permission_snapshot_pins_first_unscrubbed_arguments() -> None:
+    publisher = Publisher()
+    dispatcher = UpdateDispatcher(publisher)
+    streamed_path = "/tmp/streamed-notes.txt"
+    block_path = "/tmp/block-notes.txt"
+
+    dispatcher.enqueue({
+        "type": "tool_call", "phase": "start", "id": "streamed",
+        "tool_name": "hands_edit",
+    })
+    dispatcher.enqueue({
+        "type": "tool_call", "phase": "end", "id": "streamed",
+        "tool_name": "hands_edit",
+        "args": {"path": streamed_path, "old_text": "old", "new_text": "new"},
+    })
+    dispatcher.enqueue({
+        "type": "tool_call", "phase": "end", "id": "streamed",
+        "tool_name": "hands_edit",
+        "args": {"path": "/tmp/later.txt", "old_text": "new", "new_text": "later"},
+    })
+    dispatcher.enqueue({
+        "type": "tool_call", "phase": "start", "id": "block",
+        "tool_name": "hands_edit",
+        "args": {"path": block_path, "old_text": "old", "new_text": "new"},
+    })
+    dispatcher.enqueue({
+        "type": "tool_call", "phase": "end", "id": "block",
+        "tool_name": "hands_edit",
+        "args": {"path": "/tmp/changed.txt", "old_text": "new", "new_text": "later"},
+    })
+    dispatcher.enqueue({
+        "type": "tool_call", "phase": "start", "id": "missing",
+        "tool_name": "hands_shell",
+    })
+
+    await dispatcher.drain()
+
+    assert dispatcher.permission_snapshot("streamed").raw_input == {
+        "path": streamed_path, "old_text": "old", "new_text": "new",
+    }
+    assert dispatcher.permission_snapshot("block").raw_input == {
+        "path": block_path, "old_text": "old", "new_text": "new",
+    }
+    assert dispatcher.permission_snapshot("missing") is None
+    raw_inputs = {
+        update.tool_call_id: update.raw_input
+        for update in publisher.updates
+        if update.status == "in_progress" and update.tool_call_id in {"streamed", "block"}
+    }
+    assert raw_inputs == {
+        "streamed": {"path": "[path]", "old_text": "new", "new_text": "later"},
+        "block": {"path": "[path]", "old_text": "new", "new_text": "later"},
+    }
+    starts = {
+        update.tool_call_id: update.raw_input
+        for update in publisher.updates
+        if update.status == "pending" and update.tool_call_id in {"streamed", "block"}
+    }
+    assert starts == {
+        "streamed": {},
+        "block": {"path": "[path]", "old_text": "old", "new_text": "new"},
+    }
+    await finish(dispatcher)
+
+
+@pytest.mark.asyncio
 async def test_orphan_ends_synthesize_pending_in_order() -> None:
     publisher = Publisher()
     dispatcher = UpdateDispatcher(publisher)

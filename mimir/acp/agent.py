@@ -220,7 +220,7 @@ class ActivePrompt:
             return await self._deny_before_peer(
                 "snapshot_missing", eligibility.tool_call_id
             )
-        if _thaw(snapshot.raw_input) != expected:
+        if not expected or _thaw(snapshot.raw_input) != expected:
             return await self._deny_before_peer(
                 "snapshot_mismatch", eligibility.tool_call_id
             )
