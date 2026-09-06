@@ -17,9 +17,10 @@ from __future__ import annotations
 import json
 import os
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Optional
+from unittest.mock import AsyncMock
 
 from langchain.tools import ToolRuntime
 from langchain_core.tools import ToolException
@@ -411,7 +412,7 @@ class TestSendMessage:
         assert event["reason"] == "not_deliverable_channel"
 
     @pytest.mark.asyncio
-    @pytest.mark.parametrize("channel_id", ["poller:gmail-inbox", "scheduler:daily", "system", ""])
+    @pytest.mark.parametrize("channel_id", ["system", ""])
     async def test_non_deliverable_channel_returns_tool_error_and_event(
         self, tmp_path, channel_id,
     ) -> None:
@@ -504,6 +505,132 @@ class TestSendMessage:
 # ────────────────────────────────────────────────────────────────────
 # react
 # ────────────────────────────────────────────────────────────────────
+
+
+class TestTriggerPseudoChannels:
+    @pytest.fixture(autouse=True)
+    def turn(self):
+        ctx = TurnContext(
+            turn_id="pseudo-test", session_id="pseudo-test", trigger="poller",
+            channel_id="poller:feed", started_at=0.0,
+            interactivity=TurnInteractivity.NON_INTERACTIVE,
+        )
+        token = set_current_turn(ctx)
+        yield ctx
+        reset_current_turn(token)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("channel", [
+        "poller:feed", "scheduler:daily", "  PoLlEr:feed  ", "\tScHeDuLeR:daily\n",
+    ])
+    @pytest.mark.parametrize("tool,source", [
+        (send_message, "explicit"), (react, "explicit"),
+        (react, "config"), (react, "current"),
+    ])
+    async def test_rejects_before_routing(self, monkeypatch, turn, channel, tool, source):
+        bridge = _StubBridge()
+        channels = _StubRegistry(bridge, channel_id=channel.strip())
+        set_channel_registry(channels)
+        log = AsyncMock()
+        monkeypatch.setattr("mimir.event_logger.safe_log_event", log)
+        args = {"text": "hello"} if tool is send_message else {"emoji": ":+1:"}
+        if source == "explicit":
+            args["channel_id"] = channel
+        if source == "config":
+            args["config"] = {"configurable": {"channel_id": channel}}
+        token = set_current_channel_id(channel if source == "current" else "chan-1")
+        try:
+            # StructuredTool filters the optional injected config argument.
+            out = await tool.coroutine(**args) if source == "config" else await tool.ainvoke(args)
+        finally:
+            reset_current_channel_id(token)
+        assert f"{tool.name} rejected: {channel.strip()!r}" in out
+        assert "non-conversational trigger channel" in out
+        assert "end the turn without calling send_message or react" in out
+        assert "Deliverable alternative: none available on this turn." in out
+        log.assert_awaited_once_with(
+            f"{tool.name}_blocked", tool=tool.name, channel_id=channel.strip(),
+            reason="trigger_pseudo_channel",
+        )
+        assert channels.find_calls == []
+        assert bridge.send_calls == bridge.react_calls == bridge.history_calls == []
+        assert turn.delivered_channel_ids == set()
+        assert turn.react_count == 0
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("tool", [send_message, react])
+    @pytest.mark.parametrize("case", [
+        "trusted", "missing-cap", "missing-sink", "http", "mismatch",
+        "missing-auth", "unauthorized-channel", "authorized-channel",
+    ])
+    async def test_alternative_requires_authority(self, turn, tool, case):
+        from mimir.access_control import ServicePrincipal, ToolRegistry
+
+        service = ServicePrincipal(
+            canonical="poller:feed", trigger="poller",
+            capabilities=() if case == "missing-cap" else ("operator_alert",),
+            sink_destinations=() if case == "missing-sink" else ("notification",),
+        )
+        auth = _auth_runtime(
+            "poller:other" if case == "mismatch" else service.canonical,
+            trigger="poller", event_ingress="http" if case == "http" else None,
+            is_service=True, service_authority=service,
+        ).context
+        auth = replace(auth, channel_id="poller:feed")
+        if case == "unauthorized-channel":
+            auth = replace(auth, service_authority=replace(
+                service, capabilities=(), configured_delivery_channel="chan-1",
+            ))
+        elif case == "authorized-channel":
+            auth = _auth_runtime().context
+        elif case == "missing-auth":
+            auth = None
+        turn.auth_context = auth
+        bridge = _StubBridge()
+        channels = _StubRegistry(bridge)
+        set_channel_registry(channels)
+        if case in {"authorized-channel", "unauthorized-channel"}:
+            decision = ToolRegistry().authorize_tool(
+                "send_message", auth, enforce=True, target_channel="chan-1",
+                ifc_labels=auth.ifc_state.current(auth.ifc_labels),
+            )
+            assert decision.allowed is (case == "authorized-channel")
+        args = {"text": "hello"} if tool is send_message else {"emoji": ":+1:", "message_id": "m-1"}
+        out = await tool.ainvoke({**args, "channel_id": "poller:feed"})
+        assert "non-conversational trigger channel" in out
+        if case == "trusted":
+            assert "via operator_alert(text=...)" in out
+            assert "none available" not in out
+        else:
+            assert "operator_alert" not in out
+            if case == "authorized-channel":
+                assert "via send_message(channel_id='chan-1', text=...)" in out
+                assert "none available" not in out
+            else:
+                assert "Deliverable alternative: none available on this turn." in out
+        assert bridge.send_calls == bridge.react_calls == []
+        assert turn.delivered_channel_ids == set()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("channel", ["no_reply", "none"])
+    @pytest.mark.parametrize("interactive", [False, True])
+    async def test_no_reply_sentinels_preserve_behavior(self, turn, channel, interactive):
+        turn.interactivity = (
+            TurnInteractivity.INTERACTIVE if interactive else TurnInteractivity.NON_INTERACTIVE
+        )
+        bridge = _StubBridge()
+        set_channel_registry(_StubRegistry(bridge, channel_id=channel))
+        out = await react.ainvoke({"emoji": ":+1:", "message_id": "m-1", "channel_id": channel})
+        assert out.startswith("react ok:")
+        assert bridge.react_calls == [{"cid": channel, "message_id": "m-1", "emoji": ":+1:"}]
+        out = await send_message.ainvoke({"text": "hello", "channel_id": channel})
+        if interactive:
+            assert out.startswith("send_message ok:")
+            assert bridge.send_calls == [{"cid": channel, "text": "hello"}]
+        else:
+            assert "pseudo-channel that means no reply" in out
+            assert bridge.send_calls == []
+        assert "non-conversational trigger channel" not in out
 
 
 class TestReact:

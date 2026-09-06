@@ -328,6 +328,15 @@ def build_turn_prompt(
     if channel_memory_block:
         _add_labeled("Channel context", channel_memory_block)
 
+    if event.channel_id.lower().startswith(("poller:", "scheduler:")):
+        _add_labeled(
+            "Trigger channel",
+            f"`{event.channel_id}` is a non-conversational trigger channel, not "
+            "deliverable via send_message or react. Ending the turn silently "
+            "without calling send_message is normal when there is nothing to report. "
+            "For a genuine notification, use only an authorized delivery alternative.",
+        )
+
     # chainlink #508: optional deliver channel for poller / scheduled-tick
     # turns. Injected as an instruction so the agent JUDGES whether anything is
     # worth surfacing and delivers it via send_message (reusing the real send

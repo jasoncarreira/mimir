@@ -272,6 +272,56 @@ _NON_INTERACTIVE_NO_REPLY_CHANNEL_LITERALS = {
 }
 
 
+async def _reject_trigger_pseudo_channel(tool_name: str, channel_id: str) -> str:
+    from ..access_control import (
+        ToolRegistry,
+        get_trusted_service_from_auth_context,
+        service_can_invoke_operation,
+    )
+    from ..event_logger import safe_log_event
+    from ..models import InformationFlowState
+
+    await safe_log_event(
+        f"{tool_name}_blocked", tool=tool_name, channel_id=channel_id,
+        reason="trigger_pseudo_channel",
+    )
+    alternative = "none available on this turn"
+    ctx = _resolve_authoritative_turn_context_for_send_message_guard()
+    auth = getattr(ctx, "auth_context", None)
+    service = get_trusted_service_from_auth_context(auth)
+    if service_can_invoke_operation(service, "operator_alert"):
+        alternative = "the operator alert channel via operator_alert(text=...)"
+    elif isinstance(auth, AuthContext):
+        destination = (
+            service.configured_delivery_channel if service else auth.channel_id
+        )
+        channels = _STATE["channel_registry"]
+        if (
+            destination
+            and not _is_non_deliverable_channel(destination)
+            and not _is_non_interactive_no_reply_channel(destination)
+            and _acp_channel_is_owned_by_active_turn(destination)
+            and channels is not None
+            and channels.find(destination) is not None
+        ):
+            labels = auth.ifc_state.current(auth.ifc_labels)
+            # A hint must not consume a live one-shot sink approval.
+            probe = replace(
+                auth, ifc_labels=labels, ifc_state=InformationFlowState(labels=labels),
+            )
+            if ToolRegistry().authorize_tool(
+                "send_message", probe, enforce=True,
+                target_channel=destination, ifc_labels=labels,
+            ).allowed:
+                alternative = f"the real bridge channel via send_message(channel_id={destination!r}, text=...)"
+    return (
+        f"{tool_name} rejected: {channel_id!r} is a non-conversational trigger "
+        "channel, not a deliverable channel. A silent turn is the correct way "
+        "to decline: end the turn without calling send_message or react. "
+        f"Deliverable alternative: {alternative}."
+    )
+
+
 async def _reject_send_message(channel_id: str | None, reason: str) -> None:
     from ..event_logger import safe_log_event
 
@@ -801,6 +851,8 @@ async def send_message(
     if _is_non_interactive_no_reply_channel(stripped_channel_id):
         if _active_turn_is_non_interactive_for_send_message_guard():
             await _reject_send_message(channel_id, "non_interactive_no_reply_channel")
+    if stripped_channel_id.lower().startswith(_NON_DELIVERABLE_CHANNEL_PREFIXES):
+        raise ToolException(await _reject_trigger_pseudo_channel("send_message", stripped_channel_id))
     if _is_non_deliverable_channel(stripped_channel_id):
         await _reject_send_message(channel_id, "not_deliverable_channel")
     if not _acp_channel_is_owned_by_active_turn(stripped_channel_id):
@@ -1136,10 +1188,12 @@ async def react(
             recent id-bearing message on the channel.
         channel_id: Channel scope. Defaults to current turn's.
     """
+    cid = _channel_from_config_or_state(channel_id, config)
+    if cid.lower().startswith(_NON_DELIVERABLE_CHANNEL_PREFIXES):
+        return await _reject_trigger_pseudo_channel("react", cid)
     channels = _STATE["channel_registry"]
     if channels is None:
         return "react failed: no channel registry configured"
-    cid = _channel_from_config_or_state(channel_id, config)
     if not cid:
         return "react failed: no channel_id and no current channel"
     bridge = channels.find(cid)
