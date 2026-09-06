@@ -8663,6 +8663,97 @@ async def test_batched_pr_shell_commands_bind_each_exact_checkout_lease(
     assert "no matching checkout lease was found" in str(refused.content)
 
 
+@pytest.mark.parametrize("command", [
+    "chainlink --help", "chainlink -h", "/usr/local/bin/chainlink --help",
+    "chainlink issue delete 42", "contract-cli --help",
+    "chainlink --help=private-value --private-option private-operand",
+])
+def test_service_shell_non_repository_refusal_ignores_review_state_count(
+    command: str, tmp_path: Path,
+) -> None:
+    from mimir.tools import budget_gate
+
+    lease_root = tmp_path / "leases"
+    lease_root.mkdir()
+    states = tuple(
+        _review_state("o/r", number, f"worklink/{number}", str(tmp_path))
+        for number in (42, 43)
+    )
+    for state in states:
+        _attach_test_checkout_lease(state, lease_root, f"pr-{state.pr_number}")
+    service = build_trigger_service_principal(
+        canonical="poller:github-activity", trigger="poller", profile="github",
+        tier=CapabilityTier.CODE_EXECUTION,
+        capabilities=("shell_exec", "bash_jobs_list", "bash_job_output"),
+        declared_shell_commands=(access_control.DeclaredShellCommand(
+            executable="contract-cli", path=tmp_path / "contract-cli",
+            subcommands=(("query",),), options=("--json",),
+        ),),
+        creation_path="test",
+    )
+    refusals = []
+    for count in (1, 2):
+        auth = replace(
+            _service_auth(service, InformationFlowLabels()),
+            repo_pr_scope_registry=RepoPRScopeRegistry(states[:count]),
+        )
+        bound = budget_gate._request_for_authorized_execution(
+            _tool_request(auth, args={"command": command}), "shell_exec", auth,
+        )
+        refusal = bound.tool_call["args"]["mimir_shell_refusal"]
+        assert "binding_rule=profile_allowlist" in refusal
+        assert "private-value" not in refusal
+        assert "private-option" not in refusal
+        assert "private-operand" not in refusal
+        if command.endswith(" --help"):
+            assert "Options sent: --help." in refusal
+        if command.endswith(" -h"):
+            assert "Options sent: -h." in refusal
+        if "chainlink" in command:
+            assert "chainlink issue show <id> --json" in refusal
+            assert "chainlink issue list --json" in refusal
+        refusals.append(refusal)
+        labels = _chainlink_ifc_labels(tainted=True)
+        tainted = replace(auth, ifc_state=InformationFlowState(labels=labels))
+        decision = ToolRegistry().authorize_tool(
+            "shell_exec", tainted, enforce=True,
+            target_channel="chainlink issue close 42",
+        )
+        assert decision.allowed is False
+        assert decision.reason == "chainlink_mutation_blocked_by_untrusted_ingest"
+    assert refusals[0] == refusals[1]
+    assert access_control.resolve_repository_review_state(
+        auth, command=command, cwd=str(tmp_path / "not-a-lease"),
+    ) == (None, None)
+
+    bound = budget_gate._request_for_authorized_execution(
+        _tool_request(auth, args={"command": "git status"}), "shell_exec", auth,
+    )
+    refusal = bound.tool_call["args"]["mimir_shell_refusal"]
+    assert "binding_rule=repository_review_state" in refusal
+    assert (
+        "several checkout leases are active; name the checkout with "
+        "`git -C <lease path>` or the pull request number"
+    ) in refusal
+    assert "no matching checkout lease" not in refusal
+    for executable in ("git", "gh"):
+        declared_service = replace(service, declared_shell_commands=(
+            access_control.DeclaredShellCommand(
+                executable=executable, path=tmp_path / executable,
+                subcommands=(("status",),),
+            ),
+        ))
+        declared_auth = replace(
+            _service_auth(declared_service, InformationFlowLabels()),
+            repo_pr_scope_registry=RepoPRScopeRegistry(states),
+        )
+        state, reason = access_control.resolve_repository_review_state(
+            declared_auth, command=f"{executable} status",
+        )
+        assert state is None
+        assert reason is not None and "several checkout leases" in reason
+
+
 def test_poller_scope_drops_conflicting_snapshots_for_same_pr(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:

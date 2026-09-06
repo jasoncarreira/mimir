@@ -3984,10 +3984,10 @@ _SERVICE_SHELL_DISPLAY_SUBCOMMANDS = frozenset({
     "update", "view",
 })
 _SERVICE_SHELL_DISPLAY_OPTIONS = frozenset({
-    "-C", "-a", "-c", "-l", "-m", "-n", "-p", "-q",
+    "-C", "-a", "-c", "-h", "-l", "-m", "-n", "-p", "-q",
     "--all", "--app", "--approve", "--assignee", "--author", "--base", "--body",
     "--body-file", "--branch", "--comment", "--comments", "--draft", "--head",
-    "--description", "--json", "--jq", "--kind", "--label", "--limit",
+    "--description", "--help", "--json", "--jq", "--kind", "--label", "--limit",
     "--mention", "--milestone", "--no-changelog", "--no-pager", "--oneline",
     "--priority", "--quiet", "--repo", "--request-changes",
     "--search", "--short", "--state", "--status", "--template",
@@ -4691,6 +4691,8 @@ def _service_shell_not_admitted_reason(argv: list[str], destination: str) -> str
             "admitted mutations are issue create/update/comment/label/unlabel/block/unblock/"
             "relate/unrelate/close/reopen/subissue/quick, using only each command's "
             "documented bounded options (-q/--quiet and --json included)."
+            " To inspect the CLI's JSON contract, use chainlink issue show <id> --json"
+            " or chainlink issue list --json."
         )
     elif argv[:1] == ["git"] and destination == "repo_review":
         boundary = (
@@ -5205,6 +5207,23 @@ def resolve_repository_review_state(
     """Resolve one request's PR state without relying on a batched singleton."""
     from .models import RepoPRScopeRegistry
 
+    argv: list[str] = []
+    if isinstance(command, str):
+        try:
+            argv = shlex.split(command)
+        except ValueError:
+            argv = []
+    if path is None and argv:
+        service = get_trusted_service_from_auth_context(auth_context)
+        declared = getattr(service, "declared_shell_commands", ()) or ()
+        # These CLI families have no PR binding. Leave admission to the shell
+        # allowlist and IFC guards, even when a cwd or several leases exist.
+        if argv[0] in _CHAINLINK_EXECUTABLES or (
+            argv[0] not in {"git", "gh"}
+            and any(argv[0] == item.executable for item in declared)
+        ):
+            return None, None
+
     registry = getattr(auth_context, "repo_pr_scope_registry", None)
     if not isinstance(registry, RepoPRScopeRegistry):
         return getattr(auth_context, "repo_review_state", None), None
@@ -5213,12 +5232,6 @@ def resolve_repository_review_state(
         state = registry.resolve_checkout_path(path)
         return state, None if state is not None else "no matching checkout lease was found for the requested path"
 
-    argv: list[str] = []
-    if isinstance(command, str):
-        try:
-            argv = shlex.split(command)
-        except ValueError:
-            argv = []
     if (
         len(argv) >= 4
         and (
@@ -5243,6 +5256,11 @@ def resolve_repository_review_state(
         return state, None if state is not None else "no matching checkout lease was found for the repository command"
     if len(registry.review_states) == 1:
         return registry.review_states[0], None
+    if len(registry.review_states) > 1:
+        return None, (
+            "several checkout leases are active; name the checkout with "
+            "`git -C <lease path>` or the pull request number"
+        )
     return None, "no matching checkout lease was found for the repository command"
 
 
