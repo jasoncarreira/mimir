@@ -594,7 +594,7 @@ async def test_prompt_auth_context_is_scoped_to_the_session_channel(
             "timeout",
             "hands_shell",
             {"command": "printf ok"},
-            "hands_shell permission request timed out; execution denied",
+            "hands_shell permission request timed out while waiting for the operator; execution denied",
             False,
         ),
         (
@@ -654,7 +654,7 @@ async def test_admin_hands_permissions_precede_execution_and_preserve_raw_argume
             )
             self.execution_order.append("permission")
             if permission_decision == "timeout":
-                await asyncio.Event().wait()
+                raise TimeoutError
             return sdk.PermissionCompletion(permission_decision)
 
         async def message_mcp(
@@ -704,10 +704,6 @@ async def test_admin_hands_permissions_precede_execution_and_preserve_raw_argume
             return await super().message_mcp(connection_id, method, params)
 
     client = PermissionClient()
-    if permission_decision == "timeout":
-        monkeypatch.setattr(
-            "mimir.tools.budget_gate._PERMISSION_TIMEOUT_SECONDS", 0.01,
-        )
     agent.on_connect(client)
     await agent.authenticate("mimir-web-key", **{"mimir.webKey": "secret"})
     session_id = (
@@ -869,6 +865,236 @@ async def test_admin_hands_permissions_precede_execution_and_preserve_raw_argume
     assert not hasattr(state, "permission_grants")
     assert not hasattr(state.record, "permission_grants")
     assert not hasattr(state.profile_policy, "permission_grants")
+
+
+@pytest.mark.parametrize("ending", ["approve", "cancel", "disconnect", "replace", "shutdown"])
+async def test_permission_wait_survives_until_answer_or_prompt_cleanup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, ending: str,
+) -> None:
+    """Real peer/broker/gate waits, with sync and async deadlines tested concurrently."""
+    from langchain.agents.middleware import ToolCallRequest
+    from langchain_core.messages import AIMessage, ToolMessage
+    from langgraph.runtime import Runtime
+
+    from mimir.tools.budget_gate import BudgetGateMiddleware
+    from mimir.turn_event_bus import TurnEventEmitter
+
+    monkeypatch.setattr(agent_module, "ACP_GENERATION_RETIRE_GRACE_SECONDS", 0.01)
+
+    async def exercise(sync: bool) -> None:
+        home = tmp_path / ("sync" if sync else "async")
+        home.mkdir()
+        bundle, core = _bundle(home)
+        agent = MimirAcpAgent(bundle)
+        client = McpClient()
+        permission_sent: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+        wire_updates: list[dict[str, Any]] = []
+        barrier = asyncio.Event()
+
+        class WireTransport:
+            def __init__(self) -> None:
+                self.incoming: asyncio.Queue[dict[str, Any] | None] = asyncio.Queue()
+
+            async def receive(self) -> dict[str, Any] | None:
+                return await self.incoming.get()
+
+            async def send(self, message: dict[str, Any]) -> None:
+                sdk.validate_jsonrpc_envelope(message)
+                method = message["method"]
+                params = message["params"]
+                if method == "session/request_permission":
+                    await permission_sent.put(message)
+                    return
+                if method == "session/update":
+                    wire_updates.append(params["update"])
+                    return
+                if method == "mcp/connect":
+                    result = {"connectionId": await client.connect_mcp(params["serverId"])}
+                elif method == "mcp/disconnect":
+                    await client.disconnect_mcp(params["connectionId"])
+                    result = {}
+                else:
+                    assert method == "mcp/message"
+                    if "id" not in message:
+                        await client.notify_mcp(
+                            params["connectionId"], params["method"], params.get("params"),
+                        )
+                        return
+                    result = await client.message_mcp(
+                        params["connectionId"], params["method"], params.get("params"),
+                    )
+                await self.incoming.put({"jsonrpc": "2.0", "id": message["id"], "result": result})
+
+            async def close(self) -> None:
+                return None
+
+        async def route(method: str, params: Any, is_notification: bool) -> None:
+            assert method == "test/barrier" and is_notification
+            barrier.set()
+
+        transport = WireTransport()
+        store = sdk.StrictMessageStateStore()
+        connection = sdk.Connection(
+            route, transport, listening=False, state_store=store,
+        )
+        runner = asyncio.create_task(connection.main_loop())
+        peer = sdk.AcpPeer(connection, agent, store)
+        peer.peer_generation = agent.on_connect(peer)
+        prompting: asyncio.Task[Any] | None = None
+        gate_tasks: list[asyncio.Task[Any]] = []
+        executions: list[str] = []
+        results: list[ToolMessage] = []
+        try:
+            await agent.authenticate("mimir-web-key", **{"mimir.webKey": "secret"})
+            session_id = (await agent.new_session(str(home), mcp_servers=_hands("hands"))).session_id
+
+            async def integrated_turn(event: Any, **kwargs: Any) -> None:
+                labels = _initialize_ifc_labels(event, resolver=bundle.core.identity_resolver)
+                auth = dataclasses.replace(
+                    event.continuation_auth_context,
+                    interactivity=TurnInteractivity.INTERACTIVE,
+                    ifc_labels=labels, ifc_state=InformationFlowState(labels=labels),
+                    saga_session_id=kwargs["saga_session_id"],
+                )
+                arguments = {"path": "notes.txt", "old_text": "old", "new_text": "new"}
+                emitter = TurnEventEmitter(
+                    bundle.turn_event_bus, turn_id=kwargs["turn_id"], channel_id=event.channel_id,
+                )
+                messages: list[Any] = [AIMessage(content="", tool_calls=[{
+                    "id": "waiting-edit", "name": "hands_edit", "args": arguments,
+                }])]
+                emitter.blocks_from_messages(messages)
+                queue = bundle.turn_event_bus._exact_turn_subscribers[kwargs["turn_id"]]
+                await queue.join()
+                await agent._active_prompts[session_id].dispatcher.drain()
+                request = ToolCallRequest(
+                    tool_call={"id": "waiting-edit", "name": "hands_edit", "args": arguments, "type": "tool_call"},
+                    tool=None, state=None, runtime=Runtime(context=auth),
+                )
+                loop = asyncio.get_running_loop()
+
+                async def handler(call: ToolCallRequest) -> ToolMessage:
+                    executions.append(call.tool_call["id"])
+                    result = await hands_edit.ainvoke(call.tool_call["args"])
+                    return ToolMessage(content=json.dumps(result), tool_call_id="waiting-edit", name="hands_edit")
+
+                def sync_handler(call: ToolCallRequest) -> ToolMessage:
+                    return asyncio.run_coroutine_threadsafe(handler(call), loop).result(timeout=3)
+
+                gate = BudgetGateMiddleware()
+                task = asyncio.create_task(
+                    asyncio.to_thread(gate.wrap_tool_call, request, sync_handler)
+                    if sync else gate.awrap_tool_call(request, handler)
+                )
+                gate_tasks.append(task)
+                # Keep the worker observable even when the model task is cancelled.
+                result = await asyncio.shield(task)
+                results.append(result)
+                messages.append(result)
+                emitter.blocks_from_messages(messages)
+                await queue.join()
+                await agent._active_prompts[session_id].dispatcher.drain()
+
+            core.run_turn = integrated_turn
+            prompting = asyncio.create_task(agent.prompt(
+                session_id, [sdk.TextContentBlock(type="text", text="edit notes")],
+            ))
+            permission = await asyncio.wait_for(permission_sent.get(), 3)
+            active = agent._active_prompts[session_id]
+            # Sending precedes handle registration by a few event-loop turns.
+            async with asyncio.timeout(3):
+                while not active.permission_handles:
+                    await asyncio.sleep(0)
+            handles = tuple(active.permission_handles)
+            broker_tasks = tuple(active.permission_tasks)
+            assert executions == []
+            answer = {
+                "jsonrpc": "2.0", "id": permission["id"],
+                "result": {"outcome": {"outcome": "selected", "optionId": "allow_once"}},
+            }
+            if ending == "approve":
+                started = time.monotonic()
+                await asyncio.sleep(35)
+                assert time.monotonic() - started >= 35
+                assert not prompting.done()
+                assert all(not task.done() for task in gate_tasks + list(broker_tasks))
+                assert all(not handle.task.done() for handle in handles)
+                assert executions == []
+                await transport.incoming.put(answer)
+                assert (await asyncio.wait_for(prompting, 3)).stop_reason == "end_turn"
+                assert executions == ["waiting-edit"]
+                assert results[0].status != "error"
+            else:
+                if ending == "cancel":
+                    await asyncio.wait_for(agent.cancel(session_id), 3)
+                elif ending == "replace":
+                    agent.on_connect(Client())
+                    await agent.authenticate("mimir-web-key", **{"mimir.webKey": "secret"})
+                    await asyncio.wait_for(asyncio.gather(*agent._retirement_tasks), 3)
+                else:
+                    if ending == "shutdown":
+                        await transport.incoming.put(None)
+                        await asyncio.wait_for(runner, 3)
+                    peer.mark_transport_dead()
+                    await asyncio.wait_for(agent.on_transport_closed(peer.peer_generation), 3)
+                outcome = (await asyncio.wait_for(asyncio.gather(prompting, return_exceptions=True), 3))[0]
+                if ending == "cancel":
+                    assert outcome.stop_reason == "cancelled"
+                    terminal_wire = [u for u in wire_updates if u.get("toolCallId") == "waiting-edit"]
+                    assert terminal_wire[-1]["sessionUpdate"] == "tool_call_update"
+                    assert terminal_wire[-1]["status"] == "failed"
+                    assert "was withdrawn while waiting for the operator" in str(terminal_wire[-1]["rawOutput"])
+                else:
+                    assert isinstance(outcome, sdk.RequestError)
+                denied = await asyncio.wait_for(asyncio.gather(*gate_tasks), 3)
+                assert denied[0].status == "error"
+                assert executions == []
+                # Replay proves disconnect/shutdown cleanup persisted its failure,
+                # even when the old transport could no longer deliver an update.
+                replay_agent, replay_client, _ = await _ready(home)
+                await replay_agent.load_session(str(home), session_id)
+                terminal = [u for u in replay_client.updates if getattr(u, "tool_call_id", None) == "waiting-edit"]
+                assert terminal[-1].status == "failed"
+                assert "was withdrawn while waiting for the operator" in str(terminal[-1].raw_output)
+                journal = agent._store.paths(session_id)[0]
+                before_late_answer = journal.read_bytes()
+                if ending in {"cancel", "replace"}:
+                    await transport.incoming.put(answer)
+                    await transport.incoming.put({"jsonrpc": "2.0", "method": "test/barrier", "params": {}})
+                    await asyncio.wait_for(barrier.wait(), 3)
+                    assert not runner.done()
+                    assert journal.read_bytes() == before_late_answer
+                else:
+                    assert peer.closed
+                assert executions == []
+                assert not any(method == "tools/call" for _, method, _ in client.messages)
+            assert active.completed.is_set()
+            assert not active.permission_handles
+            assert not active.permission_tasks
+            assert not active.permission_tool_ids
+            assert all(task.done() for task in broker_tasks)
+            assert all(handle.task.done() for handle in handles)
+            assert all(task.done() for handle in handles for task in handle._owned_tasks)
+            assert permission["id"] not in store._outgoing
+            assert permission["id"] not in store._abandoned
+            assert session_id not in agent._active_prompts
+            assert bundle.turn_event_bus._exact_turn_subscribers == {}
+            if ending != "approve":
+                assert "was withdrawn while waiting for the operator" in denied[0].content
+        finally:
+            await agent.on_transport_closed(peer.peer_generation)
+            await transport.incoming.put(None)
+            await asyncio.wait_for(runner, 3)
+            await connection.close()
+            if prompting is not None:
+                await asyncio.gather(prompting, return_exceptions=True)
+            if gate_tasks:
+                await asyncio.wait_for(asyncio.gather(*gate_tasks, return_exceptions=True), 3)
+
+    outcomes = await asyncio.gather(exercise(True), exercise(False), return_exceptions=True)
+    for outcome in outcomes:
+        if isinstance(outcome, BaseException):
+            raise outcome
 
 
 async def test_cancelled_bound_turn_terminalizes_open_tools(tmp_path: Path) -> None:
@@ -2048,7 +2274,9 @@ async def test_cancel_timeout_dirties_execution_and_requires_fresh_load(
     forwarder = asyncio.create_task(pending_handler())
     await started.wait()
     lease = JournalLease("00000000-0000-4000-8000-000000000002", state.generation, 1)
-    publisher = SimpleNamespace(_journal=SimpleNamespace(lock=asyncio.Lock()))
+    publisher = SimpleNamespace(
+        _journal=SimpleNamespace(lock=asyncio.Lock()), _withdrawn_permissions=set(),
+    )
     dispatcher = UpdateDispatcher(publisher, lease, 1)
     active = ActivePrompt(
         state, state.generation, 1, handler, model, forwarder, dispatcher, lease,

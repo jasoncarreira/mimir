@@ -153,6 +153,7 @@ class ActivePrompt:
     journal_lease: JournalLease
     permission_owner_loop: asyncio.AbstractEventLoop
     permission_tasks: set[asyncio.Task[Any]] = field(default_factory=set)
+    permission_tool_ids: set[str] = field(default_factory=set)
     permission_handles: list[AcpRequestHandle] = field(default_factory=list)
     mcp_request_ids: set[Any] = field(default_factory=set)
     mcp_handles: list[AcpRequestHandle] = field(default_factory=list)
@@ -184,12 +185,14 @@ class ActivePrompt:
                 )
             task = asyncio.create_task(self._request_permission(eligibility))
             self.permission_tasks.add(task)
+            self.permission_tool_ids.add(eligibility.tool_call_id)
         try:
             return await task
         except asyncio.CancelledError:
             return ToolPermissionDecision.CANCELLED
         finally:
             self.permission_tasks.discard(task)
+            self.permission_tool_ids.discard(eligibility.tool_call_id)
 
     def _is_current(self) -> bool:
         return (
@@ -765,6 +768,7 @@ class MimirAcpAgent:
             if active.cancelling and not transport:
                 return False
             active.cancelling = True
+            active.dispatcher.publisher._withdrawn_permissions.update(active.permission_tool_ids)
             if transport:
                 active.transport_dead = True
                 active.journal_lease.close()
@@ -1349,6 +1353,7 @@ class _TurnPublisher:
         self._journal = journal
         self._client = client
         self._lease = lease
+        self._withdrawn_permissions: set[str] = set()
 
     async def accept_event(self) -> bool:
         return await self._journal.accept_event(self._lease)
@@ -1357,10 +1362,20 @@ class _TurnPublisher:
         return await self._journal.publish_live(update, self._client, turn_id=self._lease.turn_id, lease=self._lease, accepted=accepted)
 
     async def close_turn(self, terminal_updates: list[Any]) -> list[Any]:
+        self._mark_withdrawn_permissions(terminal_updates)
         return await self._journal.close_turn(self._lease, terminal_updates, self._client)
 
     async def close_abandoned_turn(self, terminal_updates: list[Any]) -> list[Any]:
+        self._mark_withdrawn_permissions(terminal_updates)
         return await self._journal.close_abandoned_turn(self._lease, terminal_updates)
+
+    def _mark_withdrawn_permissions(self, terminal_updates: list[Any]) -> None:
+        # The closed journal boundary can discard the gate's own denial event.
+        for update in terminal_updates:
+            if update.tool_call_id in self._withdrawn_permissions:
+                update.raw_output = {
+                    "error": "Permission request was withdrawn while waiting for the operator; execution denied"
+                }
 
 
 class _OrderedTurnPublisher:

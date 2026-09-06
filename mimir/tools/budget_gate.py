@@ -2201,7 +2201,6 @@ _ACP_DELIVERY_INSTRUCTION = (
 _ACP_SEND_MESSAGE_REFUSAL = (
     "send_message is unavailable on ACP turns; use the ACP bridge"
 )
-_PERMISSION_TIMEOUT_SECONDS = 30.0
 _PERMISSION_REASON_KEY_RE = re.compile(r"[A-Za-z0-9_.:-]{1,200}\Z")
 
 
@@ -2576,7 +2575,8 @@ def _request_permission_sync(
         if not inspect.iscoroutine(coroutine):
             return _permission_failure_message(tool_name, "returned a non-coroutine")
         future = asyncio.run_coroutine_threadsafe(coroutine, loop)
-        decision = future.result(timeout=_PERMISSION_TIMEOUT_SECONDS)
+        # Human review lasts for the prompt lifetime; the broker owns teardown.
+        decision = future.result()
         if decision in {PermissionDecision.ALLOW_ONCE, PermissionDecision.ALLOW_SESSION}:
             if _permission_context_is_current(snapshot):
                 return None
@@ -2586,11 +2586,13 @@ def _request_permission_sync(
         if decision is PermissionDecision.NOT_REQUESTED:
             return _permission_not_requested_message(tool_name)
         if decision is PermissionDecision.CANCELLED:
-            return _permission_failure_message(tool_name, "was cancelled")
+            return _permission_failure_message(tool_name, "was withdrawn while waiting for the operator")
         return _permission_failure_message(tool_name, "returned an invalid decision")
     except concurrent.futures.TimeoutError:
-        return _permission_failure_message(tool_name, "timed out")
-    except (Exception, asyncio.CancelledError):
+        return _permission_failure_message(tool_name, "timed out while waiting for the operator")
+    except (concurrent.futures.CancelledError, asyncio.CancelledError):
+        return _permission_failure_message(tool_name, "was withdrawn while waiting for the operator")
+    except Exception:
         return _permission_failure_message(tool_name, "failed")
     finally:
         if future is None:
@@ -2624,7 +2626,8 @@ async def _request_permission_async(
         if not inspect.iscoroutine(awaitable):
             return _permission_failure_message(tool_name, "returned a non-coroutine")
         task = asyncio.create_task(awaitable)
-        decision = await asyncio.wait_for(task, timeout=_PERMISSION_TIMEOUT_SECONDS)
+        # Match the thread-based path: only prompt teardown withdraws the wait.
+        decision = await task
         if decision in {PermissionDecision.ALLOW_ONCE, PermissionDecision.ALLOW_SESSION}:
             if _permission_context_is_current(snapshot):
                 return None
@@ -2634,15 +2637,15 @@ async def _request_permission_async(
         if decision is PermissionDecision.NOT_REQUESTED:
             return _permission_not_requested_message(tool_name)
         if decision is PermissionDecision.CANCELLED:
-            return _permission_failure_message(tool_name, "was cancelled")
+            return _permission_failure_message(tool_name, "was withdrawn while waiting for the operator")
         return _permission_failure_message(tool_name, "returned an invalid decision")
     except asyncio.CancelledError:
         current = asyncio.current_task()
         propagate_cancellation = current is not None and current.cancelling() > 0
         if not propagate_cancellation:
-            return _permission_failure_message(tool_name, "was cancelled")
+            return _permission_failure_message(tool_name, "was withdrawn while waiting for the operator")
     except TimeoutError:
-        return _permission_failure_message(tool_name, "timed out")
+        return _permission_failure_message(tool_name, "timed out while waiting for the operator")
     except Exception:
         return _permission_failure_message(tool_name, "failed")
     finally:
@@ -2657,7 +2660,7 @@ async def _request_permission_async(
         awaitable = None
     if propagate_cancellation:
         raise asyncio.CancelledError
-    return _permission_failure_message(tool_name, "was cancelled")
+    return _permission_failure_message(tool_name, "was withdrawn while waiting for the operator")
 
 
 class BudgetGateMiddleware(AgentMiddleware):
