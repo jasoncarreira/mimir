@@ -2099,7 +2099,20 @@ textarea {
 
 .chainlink-route {
   display: grid;
+  min-width: 0;
   gap: var(--mimir-space-lg, 24px);
+}
+
+.chainlink-views {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--mimir-space-xs, 8px);
+  margin-top: var(--mimir-space-sm, 12px);
+}
+
+.chainlink-views [aria-pressed="true"] {
+  background: var(--mimir-color-panel-background-muted, #f1f5f2);
+  border-color: var(--mimir-color-chrome-accent, #60786a);
 }
 
 .chainlink-actions,
@@ -2311,6 +2324,7 @@ textarea {
 .chainlink-tree {
   padding-left: 0;
   list-style: none;
+  overflow-x: auto;
 }
 
 .chainlink-tree ol {
@@ -2322,7 +2336,21 @@ textarea {
   gap: var(--mimir-space-xs, 8px);
   align-items: center;
   min-height: 34px;
-  padding-left: calc(var(--tree-depth, 0) * var(--mimir-space-md, 16px));
+  width: 100%;
+  min-width: 200px;
+  padding: var(--mimir-space-2xs, 4px);
+  border: 1px solid transparent;
+  border-radius: var(--mimir-radius-control, 6px);
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.chainlink-tree-row:hover,
+.chainlink-tree-row:focus-visible {
+  border-color: var(--mimir-color-chrome-accent, #60786a);
 }
 
 .chainlink-tree-row span {
