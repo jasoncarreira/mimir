@@ -27,6 +27,10 @@ type BadgeTone = React.ComponentProps<typeof Badge>["tone"];
 const statusTone: Record<string, BadgeTone> = {
   running: "info",
   completed: "success",
+  merged: "success",
+  building: "info",
+  queued: "neutral",
+  skipped: "neutral",
   blocked: "danger",
   partial: "warning",
   "needs-human": "warning",
@@ -135,63 +139,93 @@ export function RunDetail({ runId }: { runId: string }) {
           <div><dt>Issue</dt><dd>{run.issue_key}</dd></div>
           <div><dt>Status</dt><dd><Badge tone={statusTone[status] ?? "neutral"}>{status}</Badge></dd></div>
           <div><dt>Lifecycle</dt><dd>{status === "failed" ? "Failed" : parked ? "Parked/resumable" : terminal ? "Terminal" : active ? "Active" : "Unavailable"}</dd></div>
-          <div><dt>Projected status</dt><dd>{run.status ?? "not available"}</dd></div>
-          <div><dt>Valid projection</dt><dd>{run.valid ? "Yes" : "No"}</dd></div>
-          <div><dt>Mode</dt><dd>{run.mode}</dd></div>
-          <div><dt>Branch</dt><dd>{run.branch}</dd></div>
-          <div><dt>Base</dt><dd>{run.pr_base}</dd></div>
-          <div><dt>Draft PR</dt><dd>{run.pr_draft ? "Yes" : "No"}</dd></div>
-          <div><dt>Controller phase</dt><dd>{run.controller_phase || "unknown"}</dd></div>
-          <div><dt>Observed</dt><dd>{formatTime(run.observed_at)}</dd></div>
-          <div><dt>Sandbox</dt><dd>{run.sandbox_path}</dd></div>
-          {hasNext ? <div><dt>Next action</dt><dd>{run.next || "none"}</dd></div> : null}
-          {run.pr_url ? (
-            <div>
-              <dt>PR URL</dt>
-              <dd>{prHref ? <a href={prHref} rel="noopener noreferrer" target="_blank">{run.pr_url}</a> : run.pr_url}</dd>
-            </div>
-          ) : null}
-          {run.controller_error ? <div><dt>Controller error</dt><dd>{run.controller_error}</dd></div> : null}
         </dl>
       </Panel>
 
-      <Panel title="Lock and session">
-        <dl className="facts-grid">
-          <div><dt>Lock</dt><dd><Badge tone={lockTone[run.lock]}>{run.lock}</Badge></dd></div>
-          <div><dt>Dead lock</dt><dd>{run.dead_lock ? "Yes" : "No"}</dd></div>
-          <div><dt>Session</dt><dd>{run.lock_session || "none"}</dd></div>
-        </dl>
+      <Panel title="Slices" id="factory-slices">
+        {run.slices.length ? (
+          <table className="factory-slices" aria-label="Slice progress">
+            <thead><tr><th scope="col">Name</th><th scope="col">Status</th><th scope="col">Attempt</th></tr></thead>
+            <tbody>
+              {run.slices.map((slice, index) => {
+                // The projection may omit attempts; retain unfamiliar formats verbatim.
+                const match = /^([^:]+):([^:()]+?)(?:\((\d+)\))?$/.exec(slice);
+                const name = match?.[1] ?? slice;
+                const sliceStatus = match?.[2] ?? "unknown";
+                return (
+                  <tr key={`${index}-${slice}`}>
+                    <th scope="row">{name}</th>
+                    <td><Badge tone={Object.hasOwn(statusTone, sliceStatus) ? statusTone[sliceStatus] : "neutral"}>{sliceStatus}</Badge></td>
+                    <td>{match?.[3] ?? "Not reported"}</td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        ) : <p className="app-copy">No slices reported.</p>}
       </Panel>
 
-      <Panel title="Gates">
-        {Object.keys(run.gates).length > 0
-          ? <OpaqueContext value={run.gates} />
-          : <p className="app-copy">No gate context reported.</p>}
-      </Panel>
+      <details className="factory-diagnostics">
+        <summary>Run diagnostics{run.controller_error ? " (controller error reported)" : ""}</summary>
+        <div className="factory-diagnostics__body" role="region" aria-label="Run diagnostics" tabIndex={0}>
+          <Panel title="Run facts">
+            <dl className="facts-grid">
+              <div><dt>Projected status</dt><dd>{run.status ?? "not available"}</dd></div>
+              <div><dt>Valid projection</dt><dd>{run.valid ? "Yes" : "No"}</dd></div>
+              <div><dt>Mode</dt><dd>{run.mode}</dd></div>
+              <div><dt>Branch</dt><dd>{run.branch}</dd></div>
+              <div><dt>Base</dt><dd>{run.pr_base}</dd></div>
+              <div><dt>Draft PR</dt><dd>{run.pr_draft ? "Yes" : "No"}</dd></div>
+              <div><dt>Controller phase</dt><dd>{run.controller_phase || "unknown"}</dd></div>
+              <div><dt>Observed</dt><dd>{formatTime(run.observed_at)}</dd></div>
+              <div><dt>Sandbox</dt><dd>{run.sandbox_path}</dd></div>
+              {hasNext ? <div><dt>Next action</dt><dd>{run.next || "none"}</dd></div> : null}
+              {run.pr_url ? (
+                <div>
+                  <dt>PR URL</dt>
+                  <dd>{prHref ? <a href={prHref} rel="noopener noreferrer" target="_blank">{run.pr_url}</a> : run.pr_url}</dd>
+                </div>
+              ) : null}
+            </dl>
+          </Panel>
 
-      <Panel title="Steps">
-        <CompactList className="factory-steps" items={run.steps} />
-      </Panel>
+          {run.controller_error ? <Panel title="Controller error"><pre className="factory-controller-error">{run.controller_error}</pre></Panel> : null}
 
-      <Panel title="Slices">
-        <CompactList className="factory-slices" items={run.slices} />
-      </Panel>
+          <Panel title="Lock and session">
+            <dl className="facts-grid">
+              <div><dt>Lock</dt><dd><Badge tone={lockTone[run.lock]}>{run.lock}</Badge></dd></div>
+              <div><dt>Dead lock</dt><dd>{run.dead_lock ? "Yes" : "No"}</dd></div>
+              <div><dt>Session</dt><dd>{run.lock_session || "none"}</dd></div>
+            </dl>
+          </Panel>
 
-      <Panel title="Validator">
-        {run.validator
-          ? <Badge tone={run.validator === "NO-GO" ? "danger" : run.validator === "GO-WITH-NITS" ? "warning" : "success"}>{run.validator}</Badge>
-          : <p className="app-copy">No validator verdict reported.</p>}
-      </Panel>
+          <Panel title="Gates">
+            {Object.keys(run.gates).length > 0
+              ? <OpaqueContext value={run.gates} />
+              : <p className="app-copy">No gate context reported.</p>}
+          </Panel>
 
-      <Panel title="Terminal context">
-        {run.terminal_result
-          ? <div data-testid="factory-terminal-context"><OpaqueContext value={run.terminal_result} /></div>
-          : <p className="app-copy">No terminal context reported.</p>}
-      </Panel>
+          <Panel title="Steps">
+            <CompactList className="factory-steps" items={run.steps} />
+          </Panel>
 
-      <Panel title="Cost">
-        <p className="app-copy">Cost attribution is unavailable for this factory projection.</p>
-      </Panel>
+          <Panel title="Validator">
+            {run.validator
+              ? <Badge tone={run.validator === "NO-GO" ? "danger" : run.validator === "GO-WITH-NITS" ? "warning" : "success"}>{run.validator}</Badge>
+              : <p className="app-copy">No validator verdict reported.</p>}
+          </Panel>
+
+          <Panel title="Terminal context">
+            {run.terminal_result
+              ? <div data-testid="factory-terminal-context"><OpaqueContext value={run.terminal_result} /></div>
+              : <p className="app-copy">No terminal context reported.</p>}
+          </Panel>
+
+          <Panel title="Cost">
+            <p className="app-copy">Cost attribution is unavailable for this factory projection.</p>
+          </Panel>
+        </div>
+      </details>
     </div>
   );
 }
