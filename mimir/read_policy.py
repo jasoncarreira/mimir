@@ -436,7 +436,9 @@ def is_current_service_protected_read_path(path: Path) -> bool:
     authority = getattr(auth_context, "service_authority", None)
     from .access_control import service_filesystem_read_roots
 
-    roots = tuple(str(root) for root in service_filesystem_read_roots(authority))
+    roots = tuple(str(root) for root in service_filesystem_read_roots(
+        authority, auth_context=auth_context,
+    ))
     home = _resolved_mimir_home()
     if home is not None:
         roots += (str(home / "memory"),)
@@ -480,7 +482,7 @@ def is_current_service_scoped_read_path(path: Path) -> bool:
     authority = getattr(auth_context, "service_authority", None)
     from .access_control import service_filesystem_read_roots
 
-    for raw_root in service_filesystem_read_roots(authority):
+    for raw_root in service_filesystem_read_roots(authority, auth_context=auth_context):
         try:
             root = Path(raw_root).resolve(strict=True)
             resolved = path.resolve(strict=True)

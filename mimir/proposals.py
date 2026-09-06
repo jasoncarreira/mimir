@@ -29,7 +29,9 @@ Sync by design; async callers (the agent tools) wrap in ``asyncio.to_thread``.
 
 from __future__ import annotations
 
+import hashlib
 import json
+import posixpath
 import re
 import shutil
 import time
@@ -54,7 +56,9 @@ PROPOSALS_REL = Path("scratch") / "proposals"
 #: proposal flow; the upgrade lane is reserved for version-triggered default syncs.
 AGENT_PROPOSAL_LANE = "agent"
 UPGRADE_PROPOSAL_LANE = "upgrade"
-PROPOSAL_LANES = (AGENT_PROPOSAL_LANE, UPGRADE_PROPOSAL_LANE)
+POLLER_PROPOSAL_LANE = "poller"
+POLLER_PROPOSAL_SURFACES = (Path("state/wiki"),)
+PROPOSAL_LANES = (AGENT_PROPOSAL_LANE, UPGRADE_PROPOSAL_LANE, POLLER_PROPOSAL_LANE)
 #: Remote branch prefixes owned by the protected-file proposal workflow.
 PROPOSAL_BRANCH_PREFIXES = ("proposal/", "upgrade/")
 #: Git conflict markers must never be submitted as protected-surface content.
@@ -68,6 +72,47 @@ ProposalPrState = Literal["open", "merged", "closed", "no_pr"]
 
 class ProposalPrError(RuntimeError):
     """The proposal branch was pushed, but the pull request was not opened."""
+
+
+@dataclass(frozen=True)
+class PollerProposalScope:
+    """Trusted owner/turn identity plus untrusted model-supplied source attribution."""
+
+    owner: str
+    turn_id: str
+    source: str
+    origin_ref: str
+
+    def __post_init__(self) -> None:
+        if not re.fullmatch(r"poller:[a-z0-9][a-z0-9_-]*", self.owner):
+            raise ValueError("owner must be canonical poller:<name> with a strict slug")
+        for field in ("turn_id", "source", "origin_ref"):
+            value = getattr(self, field)
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError(f"poller {field} must be nonempty")
+
+
+def poller_branch_name(poller: PollerProposalScope) -> str:
+    """Deterministic branch keyed by owner and the exact, unsanitized turn ID."""
+    slug = re.sub(r"[^a-z0-9_-]+", "-", poller.turn_id.lower()).strip("-")[:40] or "turn"
+    digest = hashlib.sha256(poller.turn_id.encode()).hexdigest()[:24]
+    return f"poller/{poller.owner.removeprefix('poller:')}/{slug}-{digest}"
+
+
+def poller_worktree_path(home: Path, poller: PollerProposalScope) -> Path:
+    """Return the exact worktree namespace for this poller turn."""
+    return Path(home).resolve() / PROPOSALS_REL / poller_branch_name(poller)
+
+
+def _validate_poller(lane: str | None, poller: PollerProposalScope | None,
+                     branch: str | None = None) -> None:
+    if lane == POLLER_PROPOSAL_LANE and poller is None:
+        raise ValueError("poller lane requires poller scope")
+    if poller is not None:
+        if lane not in (None, POLLER_PROPOSAL_LANE):
+            raise ValueError("poller scope cannot be used in another lane")
+        if branch is not None and branch != poller_branch_name(poller):
+            raise ValueError("branch does not match exact poller scope")
 
 
 def normalize_lane(lane: str | None) -> str:
@@ -91,6 +136,7 @@ def default_branch_name(
     current time.
     """
     lane = normalize_lane(lane)
+    _validate_poller(lane, None)
     prefix = "upgrade" if lane == UPGRADE_PROPOSAL_LANE else "proposal"
     slug = re.sub(r"[^a-z0-9]+", "-", label.lower()).strip("-")[:40].rstrip("-")
     if slug == "proposal" and lane != AGENT_PROPOSAL_LANE:
@@ -157,7 +203,7 @@ def _scan_for_secrets(text: str) -> bool:
     return bool(text) and _redact(text) != text
 
 
-def _staged_conflict_marker_paths(worktree: Path) -> list[str]:
+def _staged_conflict_marker_paths(worktree: Path, *, fail_closed: bool = False) -> list[str]:
     """Return staged protected-surface files containing git conflict markers.
 
     The upgrade/defaults reconciliation flow can intentionally write conflict
@@ -167,6 +213,8 @@ def _staged_conflict_marker_paths(worktree: Path) -> list[str]:
     corrupt prompt/core file can be committed and pushed.
     """
     paths = _git(["diff", "--cached", "--name-only"], cwd=worktree)
+    if fail_closed and paths.returncode != 0:
+        raise RuntimeError("git conflict-marker path check failed")
     marked: list[str] = []
     for line in (paths.stdout or "").splitlines():
         rel = line.strip()
@@ -214,7 +262,8 @@ def _worktree_dir(home: Path, branch: str, *, lane: str = AGENT_PROPOSAL_LANE) -
     return _proposals_dir(home, lane=lane) / branch.replace("/", "_")
 
 
-def list_open_proposals(home: Path, *, lane: str | None = None) -> list[tuple[str, Path]]:
+def list_open_proposals(home: Path, *, lane: str | None = None,
+                        poller: PollerProposalScope | None = None) -> list[tuple[str, Path]]:
     """``(branch, worktree_path)`` for each open proposal worktree.
 
     With ``lane`` omitted, returns proposals from all supported lanes under
@@ -223,8 +272,11 @@ def list_open_proposals(home: Path, *, lane: str | None = None) -> list[tuple[st
     """
     home = Path(home).resolve()
     lane = normalize_lane(lane) if lane is not None else None
+    _validate_poller(lane, poller)
     pdir = _proposals_dir(home)
     res = _git(["worktree", "list", "--porcelain"], cwd=home)
+    if res.returncode != 0:
+        raise RuntimeError(_redact(f"git worktree list failed: {res.stderr or ''}"))
     out: list[tuple[str, Path]] = []
     cur_path: Path | None = None
     for line in (res.stdout or "").splitlines():
@@ -235,7 +287,11 @@ def list_open_proposals(home: Path, *, lane: str | None = None) -> list[tuple[st
             if pdir == cur_path or pdir in cur_path.parents:
                 inferred_lane = _lane_for_worktree(home, cur_path)
                 if inferred_lane and (lane is None or inferred_lane == lane):
-                    out.append((name, cur_path))
+                    if poller is None or (
+                        name == poller_branch_name(poller)
+                        and cur_path == poller_worktree_path(home, poller)
+                    ):
+                        out.append((name, cur_path))
             cur_path = None
         elif not line.strip():
             cur_path = None
@@ -285,6 +341,7 @@ def open_proposal(
     base: str = "main",
     branch: str | None = None,
     lane: str = AGENT_PROPOSAL_LANE,
+    poller: PollerProposalScope | None = None,
 ) -> OpenResult:
     """Open a change proposal in ``lane``.
 
@@ -294,6 +351,7 @@ def open_proposal(
     """
     home = Path(home).resolve()
     lane = normalize_lane(lane)
+    _validate_poller(lane, poller, branch)
     if not _has_origin_remote(home):
         return OpenResult(
             ok=False, branch=None, worktree=None, reason="no_remote",
@@ -303,7 +361,7 @@ def open_proposal(
             ),
         )
     _git(["worktree", "prune"], cwd=home)  # clear crash-orphaned worktrees
-    existing = list_open_proposals(home, lane=lane)
+    existing = list_open_proposals(home, lane=lane, poller=poller)
     if existing:
         b, w = existing[0]
         return OpenResult(
@@ -322,8 +380,8 @@ def open_proposal(
             ok=False, branch=None, worktree=None, reason="error",
             detail=_redact(f"git fetch origin {base} failed: {(fetch.stderr or '').strip()}"),
         )
-    branch = branch or default_branch_name(lane=lane)
-    wt = _worktree_dir(home, branch, lane=lane)
+    branch = poller_branch_name(poller) if poller else branch or default_branch_name(lane=lane)
+    wt = poller_worktree_path(home, poller) if poller else _worktree_dir(home, branch, lane=lane)
     wt.parent.mkdir(parents=True, exist_ok=True)
     add = _git(
         ["worktree", "add", "--no-checkout", "-b", branch, str(wt), f"origin/{base}"],
@@ -337,7 +395,7 @@ def open_proposal(
     # Sparse-checkout just the proposable surfaces so the worktree stays small
     # and the agent only sees what it can change (submit stages them regardless).
     # Cone mode also materializes top-level files, which is harmless.
-    surfaces = [s.as_posix() for s in PROPOSAL_SURFACES]
+    surfaces = [s.as_posix() for s in (POLLER_PROPOSAL_SURFACES if poller else PROPOSAL_SURFACES)]
     for step in (["sparse-checkout", "set", "--cone", *surfaces], ["checkout"]):
         r = _git(step, cwd=wt)
         if r.returncode != 0:
@@ -377,6 +435,57 @@ def _cleanup_worktree(home: Path, worktree: Path, branch: str) -> None:
     _git(["branch", "-D", branch], cwd=home)
 
 
+def _check_poller_surface(worktree: Path) -> str | None:
+    """Inspect both index and disk, without rename folding or ignore exclusions."""
+    def checked(args: list[str]) -> str:
+        result = _git(args, cwd=worktree)
+        if result.returncode != 0:
+            raise RuntimeError(_redact(f"git {args[0]} failed: {result.stderr or ''}"))
+        return result.stdout or ""
+
+    def inside(path: str) -> bool:
+        return path.startswith("state/wiki/") and ".." not in Path(path).parts
+
+    for args in (
+        ["diff", "--cached", "--no-renames", "--name-only", "-z"],
+        ["diff", "--no-renames", "--name-only", "-z"],
+        # No --exclude-standard: ignored files are part of the submit boundary.
+        # Git itself excludes the worktree's .git administrative pointer.
+        ["ls-files", "--others", "-z"],
+    ):
+        for path in checked(args).split("\0"):
+            if path and not inside(path):
+                return _redact(f"outside_surface: {path}")
+
+    links: dict[str, str] = {}
+    for entry in checked(["ls-files", "--stage", "-z"]).split("\0"):
+        if not entry:
+            continue
+        metadata, path = entry.split("\t", 1)
+        mode, oid, stage = metadata.split()
+        if inside(path) and mode == "120000":
+            links[path] = checked(["cat-file", "blob", oid])
+        if inside(path) and (stage != "0" or mode not in ("100644", "100755", "120000")):
+            return _redact(f"outside_surface: unsupported index entry {path}")
+    for path, target in links.items():
+        seen = {path}
+        while True:
+            target = posixpath.normpath(posixpath.join(posixpath.dirname(path), target))
+            if not inside(target):
+                return _redact(f"outside_surface: symlink {path}")
+            # Follow staged links, including directory components, not just disk links.
+            prefix = next((p for p in links if target == p or target.startswith(p + "/")), None)
+            if prefix is None:
+                if not (worktree / target).resolve().is_relative_to(worktree / "state/wiki"):
+                    return _redact(f"outside_surface: symlink {path}")
+                break
+            if prefix in seen:
+                return _redact(f"outside_surface: cyclic symlink {path}")
+            seen.add(prefix)
+            path, target = prefix, links[prefix] + target[len(prefix):]
+    return None
+
+
 def finalize_proposal(
     home: Path,
     *,
@@ -385,6 +494,7 @@ def finalize_proposal(
     base: str = "main",
     branch: str | None = None,
     lane: str = AGENT_PROPOSAL_LANE,
+    poller: PollerProposalScope | None = None,
     open_pr: PrOpener | None = None,
 ) -> ProposalResult:
     """Commit the open proposal's changes (memory/core + prompts), push, and PR.
@@ -397,7 +507,8 @@ def finalize_proposal(
     """
     home = Path(home).resolve()
     lane = normalize_lane(lane)
-    opens = list_open_proposals(home, lane=lane)
+    _validate_poller(lane, poller, branch)
+    opens = list_open_proposals(home, lane=lane, poller=poller)
     if not opens:
         return ProposalResult(
             ok=False, branch=None, pushed=False, pr_url=None, reason="no_open",
@@ -414,15 +525,37 @@ def finalize_proposal(
     else:
         branch, wt = opens[0]
 
-    _git(["add", *[s.as_posix() for s in PROPOSAL_SURFACES]], cwd=wt)
+    if poller:
+        try:
+            outside = _check_poller_surface(wt)
+        except (RuntimeError, OSError, ValueError) as exc:
+            return ProposalResult(False, branch, False, None, "error", _redact(str(exc)))
+        if outside:
+            return ProposalResult(False, branch, False, None, "outside_surface", outside)
+    surfaces = POLLER_PROPOSAL_SURFACES if poller else PROPOSAL_SURFACES
+    add = _git(["add", *[s.as_posix() for s in surfaces]], cwd=wt)
+    if poller and add.returncode != 0:
+        return ProposalResult(False, branch, False, None, "error", _redact(add.stderr or "git add failed"))
+    if poller:
+        try:
+            outside = _check_poller_surface(wt)
+        except (RuntimeError, OSError, ValueError) as exc:
+            return ProposalResult(False, branch, False, None, "error", _redact(str(exc)))
+        if outside:
+            return ProposalResult(False, branch, False, None, "outside_surface", outside)
     staged = _git(["diff", "--cached", "--name-only"], cwd=wt)
+    if poller and staged.returncode != 0:
+        return ProposalResult(False, branch, False, None, "error", "git staged diff failed")
     if not (staged.stdout or "").strip():
         return ProposalResult(
             ok=False, branch=branch, pushed=False, pr_url=None, reason="no_changes",
-            detail="no changes under memory/core/ or prompts/ to propose",
+            detail=f"no changes under {', '.join(map(str, surfaces))} to propose",
         )
 
-    conflict_marked = _staged_conflict_marker_paths(wt)
+    try:
+        conflict_marked = _staged_conflict_marker_paths(wt, fail_closed=poller is not None)
+    except (RuntimeError, OSError) as exc:
+        return ProposalResult(False, branch, False, None, "error", _redact(str(exc)))
     if conflict_marked:
         paths = ", ".join(conflict_marked[:5])
         suffix = "" if len(conflict_marked) <= 5 else f" (+{len(conflict_marked) - 5} more)"
@@ -435,6 +568,8 @@ def finalize_proposal(
         )
 
     diff = _git(["diff", "--cached", "-U0"], cwd=wt)
+    if poller and diff.returncode != 0:
+        return ProposalResult(False, branch, False, None, "error", "git staged diff failed")
     added = "\n".join(
         ln for ln in (diff.stdout or "").splitlines()
         if ln.startswith("+") and not ln.startswith("+++")
@@ -445,8 +580,16 @@ def finalize_proposal(
             detail="proposed content contains a secret-shaped token — remove it; proposed files must not hold credentials",
         )
 
+    attribution = ""
+    if poller:
+        source = " ".join(poller.source.split())
+        title = f"[research {poller.owner}] {source}: {title}"
+        attribution = (
+            f"\n\nUntrusted-ingest source (not verified): {source}\n"
+            f"Trusted origin_ref: {poller.origin_ref}\nTurn: {poller.turn_id}"
+        )
     safe_title = _redact(title)
-    safe_rationale = _redact(rationale)
+    safe_rationale = _redact(rationale + attribution)
     commit = _git(["commit", "-m", f"{safe_title}\n\n{safe_rationale}"], cwd=wt)
     if commit.returncode != 0:
         return ProposalResult(
@@ -484,7 +627,8 @@ def finalize_proposal(
 
 
 def abandon_proposal(
-    home: Path, *, branch: str | None = None, lane: str = AGENT_PROPOSAL_LANE
+    home: Path, *, branch: str | None = None, lane: str = AGENT_PROPOSAL_LANE,
+    poller: PollerProposalScope | None = None,
 ) -> bool:
     """Discard an open proposal in ``lane`` (remove its worktree + local branch).
 
@@ -492,7 +636,8 @@ def abandon_proposal(
     """
     home = Path(home).resolve()
     lane = normalize_lane(lane)
-    opens = list_open_proposals(home, lane=lane)
+    _validate_poller(lane, poller, branch)
+    opens = list_open_proposals(home, lane=lane, poller=poller)
     if not opens:
         return False
     if branch is not None:
@@ -772,6 +917,12 @@ def render_open_proposals_block(home: Path) -> str | None:
         except ValueError:
             rel = worktree
         lane = _lane_for_worktree(home, worktree) or "unknown"
+        if lane == POLLER_PROPOSAL_LANE:
+            lines.append(
+                f"- `{branch}` (lane `poller`): research proposal under `{rel}/state/wiki/`; "
+                "only its owning poller turn can submit or abandon it."
+            )
+            continue
         args = "title, rationale" if lane == AGENT_PROPOSAL_LANE else f"title, rationale, lane='{lane}'"
         abandon = "abandon_proposal" if lane == AGENT_PROPOSAL_LANE else f"abandon_proposal(lane='{lane}')"
         lines.append(
@@ -786,6 +937,11 @@ def render_open_proposals_block(home: Path) -> str | None:
 
 
 __all__ = (
+    "PollerProposalScope",
+    "poller_branch_name",
+    "poller_worktree_path",
+    "POLLER_PROPOSAL_LANE",
+    "POLLER_PROPOSAL_SURFACES",
     "OpenResult",
     "render_open_proposals_block",
     "ProposalResult",

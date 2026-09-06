@@ -1497,7 +1497,9 @@ def _request_with_resolved_service_write_path(
             args[argument_name] = str(Path(raw_path).resolve(strict=False))
         else:
             args[argument_name] = str(
-                resolve_trigger_service_write_target(raw_path, policy.destination)
+                resolve_trigger_service_write_target(
+                    raw_path, policy.destination, auth_context=auth_context,
+                )
             )
     except (OSError, RuntimeError, ValueError):
         # Leave the original destination intact so the sink adapter denies it.

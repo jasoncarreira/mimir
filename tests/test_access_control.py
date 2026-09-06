@@ -5493,6 +5493,251 @@ def test_fetch_url_host_scope_matches_parsed_scheme_and_host(
     assert not access_control.fetch_url_is_approved(target, _write_auth())
 
 
+@pytest.fixture
+def research_proposal_auth(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    from mimir.proposals import PollerProposalScope, poller_worktree_path
+
+    monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
+    persist = tmp_path / "state" / "pollers" / "research"
+    persist.mkdir(parents=True)
+    service = build_trigger_service_principal(
+        canonical="poller:research", trigger="poller", profile="research",
+        tier=CapabilityTier.SCOPED_WITH_PROVENANCE,
+        capabilities=("open_proposal", "submit_proposal", "abandon_proposal",
+                      "write_file", "edit_file", "read_file"),
+        roots=(persist,), creation_path="mimir.pollers.run_poller",
+    )
+    scope = PollerProposalScope("poller:research", "turn-one", "paper", "https://example.org/paper")
+    worktree = poller_worktree_path(tmp_path, scope)
+    worktree.mkdir(parents=True)
+    state = SimpleNamespace(scope=scope, worktree=worktree, active=True)
+    auth = SimpleNamespace(**{
+        **vars(_service_auth(service, InformationFlowLabels())),
+        "poller_proposal_state": state,
+    })
+    return auth, persist, worktree
+
+
+@pytest.mark.parametrize("operation", ["write_file", "edit_file"])
+def test_research_proposal_exact_write_grants(
+    research_proposal_auth, tmp_path: Path, operation: str,
+) -> None:
+    from mimir.proposals import PollerProposalScope, poller_worktree_path
+    from mimir._paths import PathOutsideHomeError
+
+    auth, persist, worktree = research_proposal_auth
+    policy = auth.service_authority.sink_policy_for(operation)
+    registry = ToolRegistry()
+    sibling = poller_worktree_path(tmp_path, PollerProposalScope(
+        "poller:other", "turn-one", "paper", "ref",
+    ))
+    other_turn = poller_worktree_path(tmp_path, PollerProposalScope(
+        "poller:research", "turn-two", "paper", "ref",
+    ))
+    token = set_current_turn(SimpleNamespace(turn_id="turn-one", auth_context=auth))
+    try:
+        for target, allowed in [
+            (worktree / "state/wiki/paper.md", True),
+            (persist / "drafts/paper.md", True),
+            (sibling / "state/wiki/paper.md", False),
+            (other_turn / "state/wiki/paper.md", False),
+            (tmp_path / "scratch/turns/turn-one/draft.md", False),
+            (tmp_path / "scratch/other.md", False),
+            (tmp_path / "state/wiki/paper.md", False),
+            (tmp_path / "state/pollers/other/drafts/paper.md", False),
+            (tmp_path / "memory/core/identity.md", False),
+            (tmp_path / "prompts/system.md", False),
+            (worktree / "memory/core/identity.md", False),
+            (worktree / "prompts/system.md", False),
+            (worktree / ".git", False),
+            (worktree / ".git/config", False),
+        ]:
+            decision = registry.authorize_tool(
+                operation, auth, enforce=True, target_channel=str(target),
+            )
+            assert decision.allowed is allowed, (target, decision.reason)
+            if allowed:
+                assert access_control.resolve_trigger_service_write_target(
+                    str(target), policy.destination, auth_context=auth,
+                ) == target
+            else:
+                with pytest.raises(PathOutsideHomeError):
+                    access_control.resolve_trigger_service_write_target(
+                        str(target), policy.destination, auth_context=auth,
+                    )
+    finally:
+        reset_current_turn(token)
+
+
+@pytest.mark.parametrize("invalid", ["missing", "inactive", "owner", "path", "ingress", "context_only"])
+def test_research_proposal_requires_trusted_active_runtime_state(
+    research_proposal_auth, invalid: str, tmp_path: Path,
+) -> None:
+    from dataclasses import replace
+    from mimir._paths import PathOutsideHomeError
+    from mimir.proposals import poller_worktree_path
+
+    auth, _, worktree = research_proposal_auth
+    runtime = SimpleNamespace(**vars(auth))
+    runtime.poller_proposal_state = SimpleNamespace(**vars(auth.poller_proposal_state))
+    if invalid in {"missing", "context_only"}:
+        runtime.poller_proposal_state = None
+    elif invalid == "inactive":
+        runtime.poller_proposal_state.active = False
+    elif invalid == "owner":
+        runtime.poller_proposal_state.scope = replace(runtime.poller_proposal_state.scope, owner="poller:other")
+        runtime.poller_proposal_state.worktree = poller_worktree_path(
+            tmp_path, runtime.poller_proposal_state.scope,
+        )
+        runtime.poller_proposal_state.worktree.mkdir(parents=True)
+        worktree = runtime.poller_proposal_state.worktree
+    elif invalid == "path":
+        runtime.poller_proposal_state.worktree = worktree.parent
+    else:
+        runtime.event_ingress = "http"
+    token = set_current_turn(SimpleNamespace(turn_id="turn-one", auth_context=auth))
+    try:
+        assert access_control._active_poller_proposal_root(runtime) is None
+        target = str(worktree / "state/wiki/paper.md")
+        policy = auth.service_authority.sink_policy_for("write_file")
+        assert not ToolRegistry().authorize_tool(
+            "write_file", runtime, enforce=True, target_channel=target,
+        ).allowed
+        with pytest.raises(PathOutsideHomeError):
+            access_control.resolve_trigger_service_write_target(
+                target, policy.destination, auth_context=runtime,
+            )
+    finally:
+        reset_current_turn(token)
+
+
+@pytest.mark.parametrize("escape", ["outside", "persist", "metadata", "root"])
+def test_research_proposal_rejects_symlink_escapes(research_proposal_auth, escape: str) -> None:
+    from mimir._paths import PathOutsideHomeError
+
+    auth, persist, worktree = research_proposal_auth
+    outside = persist.parent / "other"
+    outside.mkdir()
+    if escape == "root":
+        worktree.rmdir()
+        worktree.symlink_to(outside, target_is_directory=True)
+        target = worktree / "paper.md"
+        assert access_control._active_poller_proposal_root(auth) is None
+    else:
+        destination = {"outside": outside, "persist": persist, "metadata": worktree / ".git"}[escape]
+        if escape == "metadata":
+            destination.mkdir()
+        (worktree / "link").symlink_to(destination, target_is_directory=True)
+        target = worktree / "link/paper.md"
+    assert not ToolRegistry().authorize_tool(
+        "write_file", auth, enforce=True, target_channel=str(target),
+    ).allowed
+    with pytest.raises(PathOutsideHomeError):
+        access_control.resolve_trigger_service_write_target(
+            str(target), auth.service_authority.sink_policy_for("write_file").destination,
+            auth_context=auth,
+        )
+
+
+@pytest.mark.parametrize("invalid", ["ingress", "principal", "nonservice", "profile", "trigger", "caps", "scope_type"])
+def test_research_proposal_root_requires_trusted_research_authority(research_proposal_auth, invalid: str) -> None:
+    from dataclasses import replace
+
+    auth, _, worktree = research_proposal_auth
+    assert access_control._active_poller_proposal_root(auth) == worktree
+    if invalid == "ingress":
+        auth.event_ingress = "http"
+    elif invalid == "principal":
+        auth.canonical_principal = "poller:other"
+    elif invalid == "nonservice":
+        auth.is_service = False
+    elif invalid == "scope_type":
+        auth.poller_proposal_state.scope = SimpleNamespace(**vars(auth.poller_proposal_state.scope))
+    else:
+        change = {
+            "profile": {"authority_profile": "custom"},
+            "trigger": {"trigger": "scheduled_tick"},
+            "caps": {"capabilities": ("write_file", "edit_file", "read_file")},
+        }[invalid]
+        auth.service_authority = replace(auth.service_authority, **change)
+    assert access_control._active_poller_proposal_root(auth) is None
+
+
+def test_research_proposal_sink_requires_exact_owner(research_proposal_auth) -> None:
+    auth, _, _ = research_proposal_auth
+    assert access_control._target_matches_poller_proposal(
+        "proposal", "poller:research", auth_context=auth,
+    )
+    assert not access_control._target_matches_poller_proposal(
+        "proposal", "poller:other", auth_context=auth,
+    )
+
+
+def test_research_proposal_worktree_read_grant(research_proposal_auth) -> None:
+    auth, _, worktree = research_proposal_auth
+    page = worktree / "state/wiki/paper.md"
+    page.parent.mkdir(parents=True)
+    page.write_text("Research draft\n")
+    registry = ToolRegistry()
+    assert registry.authorize_tool(
+        "read_file", auth, enforce=True, arguments={"file_path": str(page)},
+    ).allowed
+    auth.poller_proposal_state.active = False
+    assert not registry.authorize_tool(
+        "read_file", auth, enforce=True, arguments={"file_path": str(page)},
+    ).allowed
+
+
+def test_research_proposal_read_roots_exclude_ordinary_turn_scratch(
+    research_proposal_auth, tmp_path: Path,
+) -> None:
+    auth, _, worktree = research_proposal_auth
+    token = set_current_turn(SimpleNamespace(turn_id="turn-one", auth_context=auth))
+    try:
+        roots = access_control.service_filesystem_read_roots(auth.service_authority, auth_context=auth)
+        assert worktree in roots
+        assert tmp_path / "scratch/turns/turn-one" not in roots
+        assert worktree not in access_control.service_filesystem_read_roots(auth.service_authority)
+    finally:
+        reset_current_turn(token)
+
+
+def test_research_proposal_resolver_binds_virtual_path_from_runtime(
+    research_proposal_auth, tmp_path: Path,
+) -> None:
+    from mimir.tools.budget_gate import _request_with_resolved_service_write_path
+
+    auth, _, worktree = research_proposal_auth
+    target = worktree / "state/wiki/paper.md"
+    virtual = "/" + str(target.relative_to(tmp_path))
+    request = SimpleNamespace(
+        tool_call={"name": "edit_file", "args": {"file_path": virtual}},
+        override=lambda **changes: SimpleNamespace(**changes),
+    )
+    resolved = _request_with_resolved_service_write_path(request, "edit_file", auth)
+    assert resolved.tool_call["args"]["file_path"] == str(target)
+    (worktree / ".git").write_text("gitdir: /operator/repo/.git/worktrees/research\n")
+    assert not ToolRegistry().authorize_tool(
+        "write_file", auth, enforce=True, target_channel=str(worktree / ".git"),
+    ).allowed
+
+
+@pytest.mark.parametrize("operation", ["open_proposal", "submit_proposal", "abandon_proposal"])
+def test_research_proposal_sink_binding_and_lane(research_proposal_auth, operation: str) -> None:
+    from dataclasses import replace
+
+    auth, _, _ = research_proposal_auth
+    registry = ToolRegistry()
+    assert registry.authorize_tool(operation, auth, enforce=True, arguments={"lane": "poller"}).allowed
+    assert registry.authorize_tool(operation, auth, enforce=True, arguments={"lane": "agent"}).allowed
+    for lane in ("upgrade", "other"):
+        assert not registry.authorize_tool(operation, auth, enforce=True, arguments={"lane": lane}).allowed
+    for profile in ("custom", "github"):
+        other = SimpleNamespace(**vars(auth))
+        other.service_authority = replace(auth.service_authority, authority_profile=profile)
+        assert not registry.authorize_tool(operation, other, enforce=True).allowed
+
+
 def test_research_builder_binds_approved_urls_without_widening_other_authority(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:

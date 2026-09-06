@@ -238,6 +238,30 @@ def _authority(**updates: object) -> dict:
     return value
 
 
+@pytest.mark.parametrize("operation", ["open_proposal", "submit_proposal", "abandon_proposal"])
+def test_research_proposal_manifest_caps_are_provenance_scoped(tmp_path: Path, operation: str) -> None:
+    persist = tmp_path / "state/pollers/research"
+    persist.mkdir(parents=True)
+    (tmp_path / "state/wiki/papers").mkdir(parents=True)
+    arguments = dict(
+        name="research", persist_dir=persist, state_root=persist.parent,
+        manifest_path=tmp_path / "skills/research/pollers.json",
+    )
+    authority = _authority(capabilities=[operation, "write_file"])
+    service = _parse_poller_authority(authority, **arguments)
+    assert service.capability_tier is CapabilityTier.SCOPED_WITH_PROVENANCE
+    assert service.sink_policy_for(operation).adapter == "poller_proposal"
+    assert service.sink_policy_for(operation).destination == "poller:research"
+    assert json.loads(service.sink_policy_for("write_file").destination) == [str(persist)]
+    for change, message in [
+        ({"profile": "custom"}, "outside.*profile"),
+        ({"tier": "scope-contained"}, "exceeds declared tier"),
+        ({"scoped_roots": ["state", "wiki:papers"]}, "only declare their own state"),
+    ]:
+        with pytest.raises(ValueError, match=message):
+            _parse_poller_authority({**authority, **change}, **arguments)
+
+
 def test_state_authority_rejects_persist_dir_outside_state_root(tmp_path: Path) -> None:
     state_root = tmp_path / "state" / "pollers"
     outside = tmp_path / "outside"

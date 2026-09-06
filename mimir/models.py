@@ -20,8 +20,10 @@ from pydantic import PlainSerializer
 
 if TYPE_CHECKING:
     from .channel_audience import ChannelAudienceProvider
+    from .proposals import PollerProposalScope
 else:
     ChannelAudienceProvider = Any
+    PollerProposalScope = Any
 
 
 class TurnInteractivity(StrEnum):
@@ -1231,6 +1233,20 @@ class ServerDiscoveredPRScopeStore:
                 self._scopes.pop(target, None)
 
 
+@dataclass
+class PollerProposalState:
+    """Runtime-owned proposal binding; only a verified open activates access."""
+
+    scope: PollerProposalScope | None = None
+    worktree: Path | None = None
+    active: bool = False
+    # Held through the synchronous Git operation, including after async cancellation.
+    _operation_lock: Any = field(default_factory=threading.Lock, repr=False, compare=False)
+
+    def deactivate(self) -> None:
+        self.active = False
+
+
 class _AuthContextAuthoritySlot:
     __slots__ = (
         "_audience_provider",
@@ -1291,6 +1307,9 @@ class AuthContext(_AuthContextAuthoritySlot):
     )
     egress_state: EgressSessionState = field(
         default_factory=EgressSessionState, repr=False, compare=False,
+    )
+    poller_proposal_state: PollerProposalState = field(
+        default_factory=PollerProposalState, repr=False, compare=False,
     )
     # Server-created immutable registry for all valid PR items in one trusted
     # poller payload. Each state carries its own monotonic checkout proof.
