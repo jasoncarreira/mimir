@@ -326,6 +326,21 @@ def main(argv: Sequence[str] | None = None) -> None:
         help="Overwrite --dest if it exists",
     )
 
+    reembed_p = sub.add_parser(
+        "saga-reembed",
+        help="Offline repair of stale-dimension atom and session embeddings.",
+    )
+    reembed_p.add_argument(
+        "--home", type=Path, default=None,
+        help="Agent home (overrides MIMIR_HOME; default: cwd).",
+    )
+    reembed_p.add_argument("--batch-size", type=int, default=50)
+    reembed_p.add_argument(
+        "--batch-delay", type=float, default=0.0,
+        help="Nonnegative seconds between provider batches (default: 0).",
+    )
+    reembed_p.add_argument("--dry-run", action="store_true")
+
     acl_inventory_p = sub.add_parser(
         "saga-acl-inventory",
         help="Classify atom ACLs by persisted writer-path evidence (read-only).",
@@ -654,6 +669,45 @@ def main(argv: Sequence[str] | None = None) -> None:
             print(f"ERROR: {exc}", file=sys.stderr)
             sys.exit(1)
         sys.exit(0)
+
+    if args.command == "saga-reembed":
+        import math
+        import sqlite3
+        from .config import _load_home_dotenv
+
+        if args.batch_size <= 0:
+            parser.error("--batch-size must be positive")
+        if not math.isfinite(args.batch_delay) or args.batch_delay < 0:
+            parser.error("--batch-delay must be finite and nonnegative")
+        home = Path(args.home or os.environ.get("MIMIR_HOME") or Path.cwd()).resolve()
+        os.environ["MIMIR_HOME"] = str(home)
+        _load_home_dotenv(home)
+        if (home / "saga.toml").is_file() and not os.environ.get("SAGA_CONFIG"):
+            os.environ["SAGA_CONFIG"] = str(home / "saga.toml")
+
+        from .saga._config_io import get_config
+        from .saga.reembed import reembed
+
+        db_path = Path(get_config()("storage", "db_path", "saga.db"))
+        if not db_path.is_absolute():
+            db_path = home / ".mimir" / db_path
+        if not args.dry_run:
+            print("OFFLINE ONLY: stop mimir and all Saga writers before running.", flush=True)
+        try:
+            report = reembed(
+                db_path, batch_size=args.batch_size, dry_run=args.dry_run,
+                batch_delay=args.batch_delay,
+                progress=lambda message: print(message, flush=True),
+            )
+        except KeyboardInterrupt:
+            print("Interrupted. Committed batches are preserved; rerun to resume.", file=sys.stderr)
+            sys.exit(130)
+        except (OSError, sqlite3.Error, ValueError, RuntimeError, TypeError, OverflowError) as exc:
+            print(f"ERROR: {exc}. Committed batches are preserved; rerun to resume.", file=sys.stderr)
+            sys.exit(1)
+        if not args.dry_run and (report["atoms_unrepaired"] or report["sessions_unrepaired"]):
+            sys.exit(1)
+        return
 
     if args.command == "saga-acl-inventory":
         from .saga.acl_inventory import inventory_path

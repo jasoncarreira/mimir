@@ -33,6 +33,7 @@ from pathlib import Path
 from typing import Any
 
 from mimir.saga._like import escape_like_pattern
+from mimir.saga.embedding_status import embedding_status
 
 log = logging.getLogger(__name__)
 
@@ -261,6 +262,28 @@ def build_db_stats_payload(db_path: Path) -> dict[str, Any]:
             "SELECT MAX(version) FROM schema_version"
         ).fetchone()[0]
         db_size_bytes = db_path.stat().st_size
+        dimension = None
+        dimension_error = None
+        try:
+            from mimir.saga.embeddings import LocalProvider, get_provider
+
+            provider = get_provider()
+            # LocalProvider.dimensions() loads/downloads the model when cold.
+            if isinstance(provider, LocalProvider) and provider._model is None:
+                raise RuntimeError("local provider dimension unavailable until model is loaded")
+            dimension = provider.dimensions()
+            if not isinstance(dimension, int) or isinstance(dimension, bool) or dimension <= 0:
+                raise ValueError("provider returned an invalid embedding dimension")
+        except Exception as exc:
+            dimension = None
+            dimension_error = str(exc)
+        try:
+            health = embedding_status(conn, dimension)
+        except sqlite3.Error as exc:
+            # Supplemental health must not make otherwise readable DB stats fail.
+            health = {"status": "unknown", "dimension": dimension, "reason": str(exc)}
+        if dimension_error is not None:
+            health["reason"] = dimension_error
         return {
             "ready": True,
             "atom_count": atom_count,
@@ -270,6 +293,7 @@ def build_db_stats_payload(db_path: Path) -> dict[str, Any]:
             "schema_version": schema_ver,
             "db_size_bytes": db_size_bytes,
             "db_path": str(db_path),
+            "embedding_health": health,
         }
     except sqlite3.Error as exc:
         return {"error": str(exc), "ready": False}
