@@ -139,7 +139,11 @@ async def test_real_graph_surface_and_unknown_tool_listing(kind, asynchronous):
                 "execute, write_file, edit_file, send_message."
             )
             assert f"Unavailable common shell/background/file-write/reply tools: {unavailable}" in prompt
-            assert "Service tool availability for this turn:" in prompt
+            # Providers may flatten text blocks with no inserted separator.
+            flattened = "".join(block["text"] for block in messages[0].content)
+            assert flattened.startswith(
+                "Original instructions.\n\nService tool availability for this turn:\n"
+            )
     error = next(message for message in result["messages"] if isinstance(message, ToolMessage))
     assert error.status == "error"
     assert error.tool_call_id == "hallucinated"

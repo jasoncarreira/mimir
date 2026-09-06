@@ -72,7 +72,7 @@ class ServiceToolSurfaceMiddleware(AgentMiddleware):
         )
         unavailable = [name for name in common if name not in names]
         note = (
-            "Service tool availability for this turn:\n"
+            "\n\nService tool availability for this turn:\n"
             f"Available tools: {', '.join(names) or '(none)'}.\n"
             "Unavailable common shell/background/file-write/reply tools: "
             f"{', '.join(unavailable) or '(none)'}.\n"
