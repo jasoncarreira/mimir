@@ -14,6 +14,7 @@ import {
 import type { DashboardSurface } from "../dashboardExtensions";
 import { drilldownHref } from "../routeState";
 import { Badge, Button, DashboardHeader, ErrorState, LoadingState, Panel, TextInput } from "../ui";
+import { useBrowserFocus } from "./useBrowserFocus";
 import {
   countByLayer,
   defaultMemoryPath,
@@ -54,6 +55,7 @@ function TreeNodeView({
   if (node.type === "file") {
     return (
       <button
+        aria-current={selectedPath === node.path}
         className={`memory-browser__file${selectedPath === node.path ? " memory-browser__file--selected" : ""}`}
         onClick={() => onSelect(node.path)}
         type="button"
@@ -93,9 +95,11 @@ function TreeNodeView({
 
 function SearchResults({
   hits,
+  selectedPath,
   onSelect
 }: {
   hits: MemorySearchHit[];
+  selectedPath: string;
   onSelect: (path: string) => void;
 }) {
   if (!hits.length) return <p className="memory-browser__muted">No matching files.</p>;
@@ -104,6 +108,7 @@ function SearchResults({
       {hits.map((hit) => (
         <button
           className="memory-browser__hit"
+          aria-current={selectedPath === hit.path}
           key={`${hit.path}:${hit.line_no}:${hit.snippet}`}
           onClick={() => onSelect(hit.path)}
           type="button"
@@ -170,7 +175,8 @@ function FileDetail({ path }: { path: string }) {
 export function StateMemoryRoute({ surface }: { surface: DashboardSurface }) {
   const [searchParams, setSearchParams] = useSearchParams();
   const [query, setQuery] = React.useState(searchParams.get("q") || "");
-  const selectedPath = searchParams.get("path") || "";
+  const selectedParam = searchParams.get("path") || "";
+  const browserFocus = useBrowserFocus(Boolean(selectedParam) && searchParams.get("pane") !== "list");
   const treeQuery = useQuery({
     queryKey: ["memory-tree"],
     queryFn: async () => (await getMemoryTree()).data
@@ -182,11 +188,13 @@ export function StateMemoryRoute({ surface }: { surface: DashboardSurface }) {
   });
   const tree = treeQuery.data as MemoryTreeDir | undefined;
   const files = React.useMemo(() => (tree ? flattenFiles(tree) : []), [tree]);
+  const selectedPath = selectedParam || defaultMemoryPath(files);
   const { state: stateCount, memory: memoryCount } = React.useMemo(() => countByLayer(files), [files]);
 
   function selectPath(path: string) {
     const params = new URLSearchParams(searchParams);
     params.set("path", path);
+    params.delete("pane");
     if (query.trim()) params.set("q", query.trim());
     else params.delete("q");
     setSearchParams(params);
@@ -195,16 +203,11 @@ export function StateMemoryRoute({ surface }: { surface: DashboardSurface }) {
   function submitSearch(event: React.FormEvent<HTMLFormElement>) {
     event.preventDefault();
     const params = new URLSearchParams(searchParams);
+    params.set("pane", "list");
     if (query.trim()) params.set("q", query.trim());
     else params.delete("q");
     setSearchParams(params);
   }
-
-  React.useEffect(() => {
-    if (!selectedPath && files.length) {
-      selectPath(defaultMemoryPath(files));
-    }
-  }, [files, selectedPath]);
 
   const searchEnvelope = searchQuery.data;
 
@@ -213,8 +216,9 @@ export function StateMemoryRoute({ surface }: { surface: DashboardSurface }) {
       <DashboardHeader eyebrow="State and memory" title={surface.title}>
         <p>Browse searchable markdown files exposed by the existing state/memory endpoints.</p>
       </DashboardHeader>
-      <div className="memory-browser">
+      <div className="memory-browser" {...browserFocus}>
         <Panel
+          data-browser-list
           className="memory-browser__sidebar"
           subtitle="Known state/ files and non-core memory/ files are searchable; core memory is shown read-only when exposed by the tree."
           title="Files"
@@ -234,6 +238,7 @@ export function StateMemoryRoute({ surface }: { surface: DashboardSurface }) {
                 setQuery("");
                 const params = new URLSearchParams(searchParams);
                 params.delete("q");
+                params.set("pane", "list");
                 setSearchParams(params);
               }}
             >
@@ -255,7 +260,7 @@ export function StateMemoryRoute({ surface }: { surface: DashboardSurface }) {
                   <p className="memory-browser__muted">
                     {searchResultsCaption(searchEnvelope.data.hits, searchEnvelope.meta?.total, searchEnvelope.meta?.truncated)}
                   </p>
-                  <SearchResults hits={searchEnvelope.data.hits} onSelect={selectPath} />
+                  <SearchResults hits={searchEnvelope.data.hits} selectedPath={selectedPath} onSelect={selectPath} />
                 </>
               ) : null}
             </section>
@@ -265,7 +270,12 @@ export function StateMemoryRoute({ surface }: { surface: DashboardSurface }) {
             </nav>
           ) : null}
         </Panel>
-        <Panel className="memory-browser__detail" title="Detail">
+        <Panel className="memory-browser__detail" title="Detail" data-browser-detail>
+          <Button className="browser-return" onClick={() => {
+            const params = new URLSearchParams(searchParams);
+            params.set("pane", "list");
+            setSearchParams(params);
+          }}>Back to files</Button>
           <FileDetail path={selectedPath} />
         </Panel>
       </div>

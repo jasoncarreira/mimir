@@ -3829,20 +3829,6 @@ textarea {
     padding-inline: var(--mimir-space-md, 16px);
   }
 
-  .memory-browser {
-    grid-template-columns: 1fr;
-  }
-
-  .wiki-browser {
-    grid-template-columns: 1fr;
-  }
-
-  .memory-browser__sidebar,
-  .wiki-browser__sidebar {
-    position: static;
-    max-height: none;
-  }
-
   .memory-browser__search {
     grid-template-columns: 1fr;
   }
@@ -3867,6 +3853,35 @@ textarea {
 
   .turn-row {
     grid-template-columns: 1fr;
+  }
+}
+
+.browser-return {
+  display: none;
+}
+
+@media (max-width: 720px) {
+  .memory-browser,
+  .wiki-browser {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .memory-browser__sidebar,
+  .wiki-browser__sidebar {
+    position: static;
+    max-height: 65vh;
+    max-height: 65dvh;
+    overflow: auto;
+  }
+
+  .browser-return {
+    display: inline-flex;
+    margin-bottom: var(--mimir-space-md, 16px);
+  }
+
+  [data-browser-detail],
+  [data-browser-list] {
+    scroll-margin-top: var(--mimir-space-md, 16px);
   }
 }
 

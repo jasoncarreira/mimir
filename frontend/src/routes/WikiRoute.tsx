@@ -12,6 +12,7 @@ import {
 } from "../api";
 import type { DashboardSurface } from "../dashboardExtensions";
 import { Badge, Button, DashboardHeader, EmptyState, ErrorState, LoadingState, Panel, TextInput } from "../ui";
+import { useBrowserFocus } from "./useBrowserFocus";
 
 const CATEGORY_PREFIXES = ["concepts/", "entities/", "topics/"];
 const WikiGraphView = React.lazy(() => import("./WikiGraphView"));
@@ -347,6 +348,7 @@ export function WikiRoute({ surface }: { surface: DashboardSurface }) {
   const [category, setCategory] = React.useState(searchParams.get("category") || "");
   const selectedParam = searchParams.get("slug") || "";
   const view = searchParams.get("view") === "graph" ? "graph" : "reader";
+  const browserFocus = useBrowserFocus(Boolean(selectedParam || view === "graph") && searchParams.get("pane") !== "list");
   const indexQuery = useQuery({
     queryKey: ["wiki-index"],
     queryFn: async () => (await getWikiIndex()).data
@@ -367,6 +369,7 @@ export function WikiRoute({ surface }: { surface: DashboardSurface }) {
   function selectPage(page: WikiPageSummary) {
     const params = new URLSearchParams(searchParams);
     params.set("slug", pageKey(page));
+    params.delete("pane");
     params.set("view", "reader");
     if (query.trim()) params.set("q", query.trim());
     else params.delete("q");
@@ -378,6 +381,7 @@ export function WikiRoute({ surface }: { surface: DashboardSurface }) {
   function openPage(slug: string) {
     const params = new URLSearchParams(searchParams);
     params.set("slug", slug);
+    params.delete("pane");
     params.set("view", "reader");
     setSearchParams(params);
   }
@@ -385,6 +389,7 @@ export function WikiRoute({ surface }: { surface: DashboardSurface }) {
   function setView(nextView: "reader" | "graph") {
     const params = new URLSearchParams(searchParams);
     params.set("view", nextView);
+    params.delete("pane");
     if (!params.get("slug") && selected) params.set("slug", selected);
     setSearchParams(params);
   }
@@ -392,6 +397,7 @@ export function WikiRoute({ surface }: { surface: DashboardSurface }) {
   function submitFilters(event: React.FormEvent<HTMLFormElement>) {
     event.preventDefault();
     const params = new URLSearchParams(searchParams);
+    params.set("pane", "list");
     if (query.trim()) params.set("q", query.trim());
     else params.delete("q");
     if (category) params.set("category", category);
@@ -405,8 +411,8 @@ export function WikiRoute({ surface }: { surface: DashboardSurface }) {
       <DashboardHeader eyebrow="Wiki" title={surface.title}>
         <p>{surface.detail}</p>
       </DashboardHeader>
-      <div className="wiki-browser">
-        <Panel className="wiki-browser__sidebar" title="Pages">
+      <div className="wiki-browser" {...browserFocus}>
+        <Panel className="wiki-browser__sidebar" title="Pages" data-browser-list>
           <form className="wiki-browser__search" onSubmit={submitFilters}>
             <TextInput
               aria-label="Search wiki pages"
@@ -433,6 +439,7 @@ export function WikiRoute({ surface }: { surface: DashboardSurface }) {
                 const params = new URLSearchParams(searchParams);
                 params.delete("q");
                 params.delete("category");
+                params.set("pane", "list");
                 setSearchParams(params);
               }}
             >
@@ -461,6 +468,7 @@ export function WikiRoute({ surface }: { surface: DashboardSurface }) {
             <nav aria-label="Wiki pages" className="wiki-browser__list">
               {filteredPages.map((page) => (
                 <button
+                  aria-current={Boolean(selectedPage && page.path === selectedPage.path)}
                   className={`wiki-browser__page${selectedPage && page.path === selectedPage.path ? " wiki-browser__page--selected" : ""}`}
                   key={page.path}
                   onClick={() => selectPage(page)}
@@ -476,6 +484,7 @@ export function WikiRoute({ surface }: { surface: DashboardSurface }) {
         </Panel>
         <Panel
           className="wiki-browser__detail"
+          data-browser-detail
           title={view === "graph" ? "Graph" : "Reader"}
           actions={index ? (
             <div className="wiki-view-toggle" aria-label="Wiki view">
@@ -484,6 +493,11 @@ export function WikiRoute({ surface }: { surface: DashboardSurface }) {
             </div>
           ) : null}
         >
+          <Button className="browser-return" onClick={() => {
+            const params = new URLSearchParams(searchParams);
+            params.set("pane", "list");
+            setSearchParams(params);
+          }}>Back to pages</Button>
           {index ? (
             view === "graph" ? (
               <React.Suspense fallback={<LoadingState label="Loading wiki graph" />}>
