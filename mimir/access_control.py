@@ -4627,7 +4627,8 @@ def _service_shell_typed_tool_guidance(
         if _service_shell_coding_enabled():
             return (
                 " Repository scripts must run through the typed repo_test tool, "
-                "which uses the deployment-configured test command in the bound PR "
+                "with suite='frontend' for the configured frontend suite (or frontend "
+                "file selectors for inference), which runs in a contained bound PR "
                 "checkout; shell_exec does not admit npm run or npm test."
             )
         return (

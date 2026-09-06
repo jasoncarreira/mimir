@@ -1003,9 +1003,11 @@ class _TestResult:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("suite", [None, "frontend"])
 async def test_operator_turn_discovers_live_review_scope_and_reaches_repo_test(
     tmp_path,
     monkeypatch: pytest.MonkeyPatch,
+    suite: str | None,
 ) -> None:
     client = FakeForge()
     set_forge_client(client)
@@ -1018,8 +1020,11 @@ async def test_operator_turn_discovers_live_review_scope_and_reaches_repo_test(
             ("/server/configured/repo",), 1,
         ),
     )
+    calls = []
+
     class Tests:
-        async def execute(self, selectors):
+        async def execute(self, selectors, *, suite=None):
+            calls.append((selectors, suite))
             return _TestResult("ok")
 
     monkeypatch.setattr("mimir.tools.repo.RepoProjectTests", lambda state: Tests())
@@ -1031,7 +1036,9 @@ async def test_operator_turn_discovers_live_review_scope_and_reaches_repo_test(
 
     assert await repo_test.coroutine(
         repository="OWNER/REPO", pull_request=1291, runtime=runtime,
+        **({"suite": suite} if suite is not None else {}),
     ) == {"status": "ok"}
+    assert calls == [((), suite)]
     state = context.server_discovered_pr_states.resolve("owner/repo", 1291)
     assert state is not None
     scope = state.action_scope

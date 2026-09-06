@@ -1,14 +1,16 @@
 from __future__ import annotations
 
 import os
+from dataclasses import FrozenInstanceError
 from pathlib import Path
 import subprocess
 
 import pytest
+import yaml
 
 from mimir import access_control
 from mimir.config import Config
-from mimir.repository_config import RepositoryInventory
+from mimir.repository_config import RepositoryConfig, RepositoryInventory, RepositoryTestSuite
 from mimir.worklink.backends.registry import WorklinkConfig
 
 
@@ -284,3 +286,129 @@ repositories:
 
     with pytest.raises(ValueError, match="duplicate repository root"):
         RepositoryInventory.load(config)
+
+
+def _load_test_suite_inventory(tmp_path: Path, **fields: object) -> RepositoryConfig:
+    config = tmp_path / "repositories.yaml"
+    config.write_text(
+        yaml.safe_dump({"repositories": [{
+            "slug": "owner/repo",
+            "root": str(tmp_path / "repo"),
+            "mode": "rw",
+            "origin": "https://github.com/owner/repo.git",
+            "base_branch": "main",
+            **fields,
+        }]}),
+        encoding="utf-8",
+    )
+    return RepositoryInventory.load(config).repositories[0]
+
+
+def test_repository_test_suite_defaults_and_immutability(tmp_path: Path) -> None:
+    suite = RepositoryTestSuite("unit", "pytest")
+    assert suite.default is False
+    assert suite.selector_prefixes == suite.selector_suffixes == ()
+    with pytest.raises(FrozenInstanceError):
+        suite.name = "changed"
+    repo = RepositoryConfig("owner/repo", tmp_path, "rw", "origin", "main")
+    assert repo.test_suites == ()
+
+
+@pytest.mark.parametrize("test_command", [None, "pytest", ""])
+@pytest.mark.parametrize("explicit_default", [False, True])
+def test_repository_test_suites_parse(tmp_path: Path, test_command, explicit_default) -> None:
+    command = " uv run pytest -q "
+    repo = _load_test_suite_inventory(
+        tmp_path,
+        test_command=test_command,
+        test_suites=[
+            {"name": "Unit_3.11-fast", "command": command, "default": explicit_default,
+             "selector_prefixes": ["tests/", "src/"], "selector_suffixes": [".py", "_test.py"]},
+            {"name": "integration", "command": "make integration"},
+        ],
+    )
+    assert repo.test_command == test_command
+    assert repo.test_suites == (
+        RepositoryTestSuite("Unit_3.11-fast", command, explicit_default,
+                            ("tests/", "src/"), (".py", "_test.py")),
+        RepositoryTestSuite("integration", "make integration"),
+    )
+
+
+@pytest.mark.parametrize("fields", [{}, {"test_suites": []}, {"test_command": "pytest"}])
+def test_repository_test_suites_empty_without_synthesis(tmp_path: Path, fields) -> None:
+    assert _load_test_suite_inventory(tmp_path, **fields).test_suites == ()
+
+
+@pytest.mark.parametrize("default", [False, True])
+def test_default_suite_name_allowed_without_legacy_command(tmp_path: Path, default) -> None:
+    repo = _load_test_suite_inventory(
+        tmp_path, test_command=None,
+        test_suites=[{"name": "default", "command": "pytest", "default": default,
+                      "selector_prefixes": [], "selector_suffixes": []}],
+    )
+    assert repo.test_suites == (RepositoryTestSuite("default", "pytest", default),)
+
+
+@pytest.mark.parametrize("test_command", ["pytest", ""])
+@pytest.mark.parametrize("default", [False, True])
+def test_default_suite_name_reserved_with_legacy_command(tmp_path: Path, test_command, default) -> None:
+    with pytest.raises(ValueError, match="reserved"):
+        _load_test_suite_inventory(
+            tmp_path, test_command=test_command,
+            test_suites=[{"name": "default", "command": "pytest", "default": default}],
+        )
+
+
+@pytest.mark.parametrize("suites, message", [
+    (None, "must be a list"),
+    ({}, "must be a list"),
+    ("unit", "must be a list"),
+    (False, "must be a list"),
+    (0, "must be a list"),
+    ([None], "must be a mapping"),
+    (["unit"], "must be a mapping"),
+    ([[]], "must be a mapping"),
+    ([{}], "missing required field"),
+    ([{"name": "unit"}], "missing required field.*command"),
+    ([{"command": "pytest"}], "missing required field.*name"),
+    ([{"name": "unit", "command": "pytest", "typo": True}], "unknown fields"),
+    ([{"name": "unit", "command": "pytest"}] * 2, "duplicate test suite name"),
+    ([{"name": "unit", "command": "pytest", "default": True},
+      {"name": "integration", "command": "make test", "default": True}], "at most one default"),
+])
+def test_repository_test_suites_reject_invalid_structure(tmp_path: Path, suites, message) -> None:
+    with pytest.raises(ValueError, match=message):
+        _load_test_suite_inventory(tmp_path, test_suites=suites)
+
+
+@pytest.mark.parametrize("name", [None, False, 1, [], {}, "", " ", "unit tests",
+                                      "../unit", "a/b", "a\\b", "-unit", ".", "..",
+                                      "unit;pwd", "unit\n", "unit$HOME"])
+def test_repository_test_suites_reject_unsafe_names(tmp_path: Path, name) -> None:
+    with pytest.raises(ValueError, match="name must be a safe name"):
+        _load_test_suite_inventory(tmp_path, test_suites=[{"name": name, "command": "pytest"}])
+
+
+@pytest.mark.parametrize("command", [None, False, 1, [], {}, "", " \n\t"])
+def test_repository_test_suites_reject_invalid_commands(tmp_path: Path, command) -> None:
+    with pytest.raises(ValueError, match="command must be a non-empty string"):
+        _load_test_suite_inventory(tmp_path, test_suites=[{"name": "unit", "command": command}])
+
+
+@pytest.mark.parametrize("default", [None, 0, 1, "true", "false", [], {}])
+def test_repository_test_suites_reject_non_boolean_default(tmp_path: Path, default) -> None:
+    with pytest.raises(ValueError, match="default must be a boolean"):
+        _load_test_suite_inventory(
+            tmp_path, test_suites=[{"name": "unit", "command": "pytest", "default": default}],
+        )
+
+
+@pytest.mark.parametrize("field", ["selector_prefixes", "selector_suffixes"])
+@pytest.mark.parametrize("value", [None, "tests/", {}, False, 1, [None], [False], [1],
+                                   [[]], [{}], [""], [" \t"], ["valid", ""]])
+def test_repository_test_suites_reject_invalid_selectors(tmp_path: Path, field, value) -> None:
+    with pytest.raises(ValueError, match=field + " must be a list of non-empty strings"):
+        _load_test_suite_inventory(
+            tmp_path, test_suites=[{"name": "unit", "command": "pytest", field: value}],
+        )
