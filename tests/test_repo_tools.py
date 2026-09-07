@@ -39,6 +39,7 @@ from mimir.pr_checkout_lease import (
 from mimir.project_tests import (
     _TIMEOUT_SECONDS,
     ProjectTestRefusal,
+    ProjectTestResult,
     RepoProjectTests,
     _safe_stderr_output,
     _validated_selectors,
@@ -66,6 +67,71 @@ from mimir.repo_tools import (
 )
 from mimir.tools.refusals import ToolPolicyRefusal
 from mimir.worklink.worker_client import StaleWorkerExecutorError
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("code,scoped,decision", [
+    ("test_timeout", False, "publish"),
+    ("test_snapshot_unavailable", False, "publish"),
+    ("test_containment_unavailable", False, "publish"),
+    ("tests_failed", False, "hold"),
+    ("tests_failed", True, "hold"),
+    ("test_timeout", True, "hold"),
+    ("test_snapshot_unavailable", True, "hold"),
+    ("test_containment_unavailable", True, "hold"),
+    ("tests_passed", True, "eligible"),
+    ("tests_passed", False, "eligible"),
+    ("scope_action_denied", False, "refuse"),
+    ("test_snapshot_credentials_refused", False, "refuse"),
+])
+async def test_remediation_publication_decision_table(monkeypatch, code, scoped, decision):
+    from mimir.tools import repo as repo_module
+
+    async def execute(self, selectors, *, suite):
+        assert bool(selectors) is scoped
+        if code not in {"tests_passed", "tests_failed", "test_timeout"}:
+            raise ProjectTestRefusal(code, "unavailable", execution_started=False)
+        return ProjectTestResult(
+            code == "tests_passed", code,
+            None if code == "test_timeout" else (0 if code == "tests_passed" else 1),
+            stdout="1 failed, 2 passed\nFAILED tests/test_fix.py::test_fix"
+            if code == "tests_failed" else "",
+        )
+
+    monkeypatch.setattr(repo_module, "_state", lambda *args: object())
+    monkeypatch.setattr(repo_module.RepoProjectTests, "execute", execute)
+    selectors = ("tests/test_fix.py",) if scoped else ()
+    if code not in {"tests_passed", "tests_failed", "test_timeout"}:
+        with pytest.raises(ToolException) as error:
+            await repo_module.repo_test.coroutine("owner/repo", 42, selectors)
+        guidance = str(error.value).split("\n", 1)[1]
+        assert isinstance(error.value, ToolPolicyRefusal)
+    else:
+        result = await repo_module.repo_test.coroutine("owner/repo", 42, selectors)
+        assert result["code"] == code
+        assert result["ok"] is (code == "tests_passed")
+        guidance = result["remediation_guidance"]
+
+    if decision == "publish":
+        assert not guidance.startswith("Hold publication")
+        assert "After scoped tests pass, commit, push" in guidance
+        assert "re-request review" in guidance
+        assert "did not complete (not failed)" in guidance
+        assert "CI is the validation surface" in guidance
+        if code == "test_timeout":
+            assert "the contained runner did not complete the suite; this is not test evidence either way — push and rely on CI" in guidance
+    elif decision == "hold":
+        assert guidance.startswith("Hold publication")
+        if scoped:
+            assert "scoped tests must pass" in guidance
+            assert "push and rely on CI" not in guidance
+        else:
+            assert "completed failing full-suite run with counts observed and failed_tests non-empty" in guidance
+    elif decision == "eligible":
+        assert "Scoped tests must pass before pushing" in guidance
+    else:
+        assert "does not authorize publication" in guidance
+        assert "commit, push" not in guidance
 
 
 def _git(cwd: Path, *args: str) -> str:

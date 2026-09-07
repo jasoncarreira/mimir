@@ -4,7 +4,7 @@ import ast
 import inspect
 import json
 import textwrap
-from dataclasses import dataclass, replace
+from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
@@ -1134,11 +1134,6 @@ def test_ci_remediation_scope_requires_checkout_before_every_mutation(
     assert "pr.rerequest" not in scope.allowed_operations
 
 
-@dataclass(frozen=True)
-class _TestResult:
-    status: str
-
-
 @pytest.mark.asyncio
 @pytest.mark.parametrize("suite", [None, "frontend"])
 async def test_operator_turn_discovers_live_review_scope_and_reaches_repo_test(
@@ -1161,8 +1156,10 @@ async def test_operator_turn_discovers_live_review_scope_and_reaches_repo_test(
 
     class Tests:
         async def execute(self, selectors, *, suite=None):
+            from mimir.project_tests import ProjectTestResult
+
             calls.append((selectors, suite))
-            return _TestResult("ok")
+            return ProjectTestResult(True, "tests_passed", 0, suite=suite or "default")
 
     monkeypatch.setattr("mimir.tools.repo.RepoProjectTests", lambda state: Tests())
     context = _production_auth_context(tmp_path, "operator_user")
@@ -1171,10 +1168,14 @@ async def test_operator_turn_discovers_live_review_scope_and_reaches_repo_test(
         tool_call_id="operator-review", store=None,
     )
 
-    assert await repo_test.coroutine(
+    result = await repo_test.coroutine(
         repository="OWNER/REPO", pull_request=1291, runtime=runtime,
         **({"suite": suite} if suite is not None else {}),
-    ) == {"status": "ok"}
+    )
+    assert result["ok"] is True
+    assert result["code"] == "tests_passed"
+    assert result["suite"] == (suite or "default")
+    assert "Scoped tests must pass before pushing" in result["remediation_guidance"]
     assert calls == [((), suite)]
     state = context.server_discovered_pr_states.resolve("owner/repo", 1291)
     assert state is not None

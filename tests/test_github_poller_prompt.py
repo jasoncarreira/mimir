@@ -137,3 +137,26 @@ def test_changes_requested_prompt_embeds_the_guidance(poller, monkeypatch):
     assert emitted, "no prompt was emitted"
     assert poller._verification_guidance() in emitted[0]
     assert "re-request review" in emitted[0]
+    assert "Read the latest review, inline, and PR comments on this PR" in emitted[0]
+    assert "Honour an explicit reviewer instruction to publish" in emitted[0]
+    assert "'CI is the gate') on this turn" in emitted[0]
+    assert "Scoped tests must pass before pushing" in emitted[0]
+    assert "is NOT a publication blocker" in emitted[0]
+    assert "counts observed and failed_tests non-empty" in emitted[0]
+    assert "commit, push the fix to the PR branch, and re-request review" in emitted[0]
+    assert "did not complete (not failed) and CI is the validation surface" in emitted[0]
+    assert "not authorization, branch protection, required checks" in emitted[0]
+
+
+def test_remediation_skill_guidance():
+    guidance = (_POLLER.parent.parent / "SKILL.md").read_text()
+    for phrase in (
+        '"CI is the gate") on the next turn',
+        "NOT a\n  publication blocker",
+        "scoped tests must\n  still pass",
+        "`failed_tests` non-empty blocks publication",
+        "commit, push to the PR branch,\n  and re-request review",
+        "**did not complete**",
+        "CI is the validation surface",
+    ):
+        assert phrase in guidance

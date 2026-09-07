@@ -2444,7 +2444,20 @@ def _check_own_changes_requested(
             f"{reviewers} requested changes and no commits have landed "
             f"since (head {head_sha[:8]}). Address the review feedback, "
             f"{_verification_guidance()}, push the fixes, and re-request "
-            f"review.\n{url}"
+            f"review. Read the latest review, inline, and PR comments on this PR. "
+            f"Honour an explicit reviewer instruction to publish (such as 'push' or "
+            f"'CI is the gate') on this turn, subject to the following test policy. "
+            f"Scoped tests must pass before pushing. Attempt the full suite, but "
+            f"a full-suite test_timeout or infrastructure refusal (snapshot unavailable, "
+            f"runner unavailable) is NOT a publication blocker. Only a completed failing "
+            f"full-suite run with counts observed and failed_tests non-empty blocks "
+            f"publication. On timeout or infrastructure unavailability, commit, push "
+            f"the fix to the PR branch, and re-request review without waiting for another "
+            f"contained full-suite run. State in the PR comment that the in-runner full "
+            f"suite did not complete (not failed) and CI is the validation surface. "
+            f"This overrides an agent-local requirement for a green contained full suite "
+            f"before publication, not authorization, branch protection, required checks, "
+            f"or required review on main.\n{url}"
         )
         _emit(
             prompt,
