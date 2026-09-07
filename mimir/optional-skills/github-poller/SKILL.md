@@ -65,12 +65,12 @@ won't watch a GitHub repo, so the framework doesn't seed it by default.
    → silently absent in the subprocess → poller falls through to
    ``gh auth token`` → zero events forever if ``gh`` isn't authed.
 
-3. Bring it live:
-   ```
-   reload_pollers
-   # → "reload_pollers ok: N poller(s) registered — github-activity, ..."
-   ```
-   (Or restart the container; pollers are auto-loaded at startup.)
+3. Bring it live through an operator-managed reload or container restart;
+   pollers are auto-loaded at startup.
+
+Operator/admin turns only: an interactive admin with the `reload_pollers`
+tool available may call it and verify that `github-activity` appears in
+the registered list.
 
 ## What it watches
 
@@ -200,7 +200,7 @@ the same claim retry-eligible after five minutes, while atomic files under
 
 - Unset `GITHUB_REPOS` — the poller exits silently.
 - Or set the cron in `pollers.json` to a far-future expression.
-- Or remove the skill directory: `rm -rf <home>/skills/github-poller/` + `reload_pollers`.
+- Or remove the skill directory: `rm -rf <home>/skills/github-poller/`, then arrange an operator-managed reload or restart.
 
 ## Debugging
 

@@ -301,13 +301,13 @@ Notes:
 
 ### `send_message` goes to chat channels, NOT to Bluesky / X
 
-`send_message` and `react` deliver to Discord / Slack / web channels
+`send_message` delivers to Discord / Slack / web channels
 — whichever bridges the operator has wired up. **Bluesky and X are
 not bridge channels.** Their reply path is `outbox-<platform>.yaml`
 + `social-cli dispatch --platform <platform>`.
 
-If you saw a Bluesky or X post you want to respond to (reply, like,
-repost), that response goes through the outbox above, never through
+To acknowledge or engage with a Bluesky or X post (reply, like,
+repost), route that response through the outbox above, never through
 `send_message`. Using `send_message` here would route to whichever
 Discord/Slack channel happens to be on the turn's context — never to
 the social platform. The post stays unreplied and the operator sees
@@ -367,12 +367,9 @@ Only include creds for platforms you want polled; set
 OAuth 2.0 client credentials — see `AGENT_GUIDE.md` for the
 developer-portal mapping.
 
-After installing the skill and dropping `.env`:
-
-```
-reload_pollers
-# → "social-cli-notifications" appears in the registered list
-```
+Operator/admin turns only: after installing the skill and dropping `.env`,
+an interactive admin with the `reload_pollers` tool available may call it
+and verify that `social-cli-notifications` appears in the registered list.
 
 ## The two pollers
 
@@ -439,8 +436,8 @@ agent crashed mid-response), delete `emitted.json`.
 
 **First-run behavior:** empty cursor → all notifications get
 emitted, up to `--limit` (default 50) per platform. To avoid the
-backlog storm, run `social-cli sync` once in `STATE_DIR` before
-`reload_pollers`, then pre-seed `emitted.json` with those IDs.
+backlog storm, run `social-cli sync` once in `STATE_DIR`, then pre-seed
+`emitted.json` with those IDs before poller startup or reload.
 
 ## Working directory contents
 

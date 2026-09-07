@@ -22,6 +22,8 @@ tools.
 
 from __future__ import annotations
 
+import json
+import re
 from pathlib import Path
 
 import pytest
@@ -190,6 +192,126 @@ def _all_bundled_skill_mds() -> list[Path]:
         if root.is_dir():
             out.extend(sorted(root.rglob("SKILL.md")))
     return out
+
+
+@pytest.fixture
+def registered_tool_names(monkeypatch: pytest.MonkeyPatch) -> set[str]:
+    """Enumerate the registry without provider, CLI, or ambient MCP gating."""
+    from mimir.access_control import TRIGGER_CAPABILITY_TIERS
+    from mimir.tools import forge, mcp, registry, web
+
+    monkeypatch.setattr(web, "web_tools_enabled", lambda _: (True, True))
+    monkeypatch.setattr(forge, "github_identity_is_degraded", lambda: False)
+    monkeypatch.setattr(mcp, "get_mcp_tools", lambda: [])
+    tools = registry.all_mimir_tools(
+        model_spec="anthropic:claude-sonnet-4-6",
+        coding_enabled=True,
+        require_coding_available=False,
+    )
+    # Include the framework-native tools which do not go through this factory.
+    return {tool.name for tool in tools} | set(TRIGGER_CAPABILITY_TIERS)
+
+
+def _ungranted_tool_mentions(
+    text: str, tool_names: set[str], capabilities: set[str],
+) -> list[str]:
+    """Apply the deliberately narrow grammar documented in the pollers skill."""
+    violations = []
+    # A qualifier covers one sentence, never a paragraph, heading, or list item.
+    sentences = re.split(
+        r"(?<=[.!?])\s+|\n\s*\n|\n(?=\s*(?:(?:[-*+]|\#+|\d+\.) |```|~~~))", text,
+    )
+    for sentence in sentences:
+        qualified = sentence.strip().startswith("Operator/admin turns only:")
+        for name in sorted(tool_names - capabilities):
+            # Underscored names are unambiguous even without Markdown. For
+            # ordinary words (react, task, ls), require code markup or a call.
+            token = rf"(?<![\w-]){re.escape(name)}(?![\w-])"
+            pattern = token if "_" in name else rf"`+{name}`+|{token}\s*\("
+            if re.search(pattern, sentence) and not qualified:
+                violations.append(f"{name}: {sentence.strip()}")
+    return violations
+
+
+@pytest.mark.parametrize(
+    "skill_md", _all_bundled_skill_mds(),
+    ids=lambda p: f"{p.parent.parent.name}/{p.parent.name}",
+)
+def test_poller_skill_tools_match_authority(
+    skill_md: Path, registered_tool_names: set[str],
+) -> None:
+    manifest = skill_md.with_name("pollers.json")
+    if not manifest.is_file():
+        return
+    for poller in json.loads(manifest.read_text())["pollers"]:
+        # PollerConfig.resolved_authority defaults to custom with NO grants;
+        # profiles are ceilings, not implicit grants for optional pollers.
+        capabilities = set(poller.get("authority", {}).get("capabilities", ()))
+        violations = _ungranted_tool_mentions(
+            skill_md.read_text(), registered_tool_names, capabilities,
+        )
+        assert not violations, (
+            f"{skill_md} / {poller['name']}: tool instructions exceed poller "
+            "capabilities; qualify operator-only sentences per the pollers skill:\n"
+            + "\n".join(violations)
+        )
+
+
+@pytest.mark.parametrize("text", [
+    "Run reload_pollers now.",
+    "Run `reload_pollers` now.",
+    "```\nreload_pollers\n```",
+    "Operator/admin turns only: configure the account. Run reload_pollers.",
+    "Run reload_pollers. Operator/admin turns only: configure the account.",
+    "Operator/admin turns only: configure the account\n\nRun reload_pollers.",
+    "Operator/admin turns only: configure the account\n- Run reload_pollers.",
+    "Operator/admin turns only: configure the account\n```\nreload_pollers\n```",
+    "Operator/admin turns only: configure the account\n~~~\nreload_pollers\n~~~",
+    "Operator/admin turns only: configure the account\n# Run reload_pollers",
+    "Operator/admin turns only: configure the account\n## Run reload_pollers",
+    "An unrelated Operator/admin turns only: note; run reload_pollers.",
+    "Use `react` to acknowledge.",
+    "Use ``react`` to acknowledge.",
+    "Call react(message_id).",
+])
+def test_tool_qualifier_rejects_unqualified_instructions(text: str) -> None:
+    assert _ungranted_tool_mentions(text, {"reload_pollers", "react"}, set())
+
+
+@pytest.mark.parametrize("text", [
+    "Operator/admin turns only: run `reload_pollers` in an interactive admin turn.",
+    "Operator/admin turns only: an interactive admin with the `reload_pollers`\n"
+    "tool available can reload now.",
+    "React to CI failures; react when CI breaks.",
+    "Do not react to every notification.",
+    "reload_pollers_extra, pre_reload_pollers, reload_pollers-later, `reactor`.",
+    "Use send_message and `write_file` for the notification outbox.",
+])
+def test_tool_qualifier_accepts_qualified_or_granted_instructions(text: str) -> None:
+    assert not _ungranted_tool_mentions(
+        text, {"reload_pollers", "react", "send_message", "write_file"},
+        {"send_message", "write_file"},
+    )
+
+
+@pytest.mark.parametrize("authority", [None, {"profile": "research"}, {
+    "profile": "research", "capabilities": [],
+}])
+def test_poller_conformance_checks_each_poller_without_implicit_grants(
+    tmp_path: Path, authority: dict | None,
+) -> None:
+    skill_md = tmp_path / "SKILL.md"
+    skill_md.write_text("Use `send_message` for notifications.")
+    restricted = {"name": "restricted"}
+    if authority is not None:
+        restricted["authority"] = authority
+    skill_md.with_name("pollers.json").write_text(json.dumps({"pollers": [
+        {"name": "granted", "authority": {"capabilities": ["send_message"]}},
+        restricted,
+    ]}))
+
+    with pytest.raises(AssertionError, match="restricted.*tool instructions"):
+        test_poller_skill_tools_match_authority(skill_md, {"send_message"})
 
 
 @pytest.mark.parametrize(

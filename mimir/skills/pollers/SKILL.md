@@ -37,6 +37,36 @@ proof that a tool is available. Check before shell execution (`shell_exec`),
 limitation rather than inventing alternate tools or claiming the action happened.
 Existing admin instructions and the authority/scoping rules below still apply.
 
+### Poller skill tool conformance
+
+The fast skill-conformance test scans built-in and optional `SKILL.md` files.
+For skills shipping `pollers.json`, each named tool must be in **every** poller's
+declared capabilities or in an explicitly operator-only sentence. Profiles are
+capability ceilings, not default grants; omitted authority grants no tools.
+Capabilities still do not guarantee tool availability in the current turn.
+
+The qualifier grammar is literal: start the sentence with
+`Operator/admin turns only:` and put the tool instruction in that same sentence.
+For example:
+
+Operator/admin turns only: an interactive admin with the `reload_pollers` tool
+available can apply manifest changes without restarting.
+
+A sentence ends at punctuation (`.`, `!`, or `?`) followed by whitespace, a blank
+line, or a new Markdown list item, heading, or code fence; wrapping lines is allowed.
+The qualifier does not carry into another sentence, list item, or code block.
+Do not use an operator heading or an unrelated nearby sentence as a qualifier.
+For bridge-only tools, the operator sentence must also require a configured
+bridge channel and the tool in the current turn's inventory.
+
+The scanner uses the registry's tool names plus framework capability names and
+matches whole identifiers, not substrings. Underscored identifiers are recognized
+in prose, frontmatter, and code; ordinary words such as `react` and `task` count
+only when backtick-quoted or written as calls, so prose like "react to CI" is not
+a tool instruction. Use code markup for ordinary-word tool names when authoring
+instructions. Prefer poller-owned actions (such as notification outbox writes)
+over operator-only tool instructions when the poller needs to respond itself.
+
 Pollers are lightweight scripts that check external services on a schedule and report back when something needs attention. They live inside skills and are discovered automatically by the scheduler.
 
 ## Contract
