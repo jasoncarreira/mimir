@@ -261,9 +261,13 @@ async def test_direct_exit_still_kills_owned_process_group_descendant(
 ) -> None:
     manager = PythonKernelManager()
     identity = tmp_path / "descendant"
+    # Existence is the parent's readiness signal; publish only a complete PID
+    # so process-group cleanup cannot interrupt the fixture's write.
     child_code = (
         "import os,time,pathlib;"
-        f"pathlib.Path({str(identity)!r}).write_text(str(os.getpid()));"
+        f"identity=pathlib.Path({str(identity)!r});"
+        "identity.with_suffix('.tmp').write_text(str(os.getpid()));"
+        "identity.with_suffix('.tmp').replace(identity);"
         "time.sleep(30)"
     )
     code = (

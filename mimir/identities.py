@@ -88,6 +88,36 @@ log = logging.getLogger(__name__)
 WEB_KEY_ALIAS_PREFIX = "webkey:"
 
 
+def web_key_labels(
+    aliases: list[str], labels: object = None,
+) -> dict[str, str]:
+    """Live alias -> public slot name; old unlabelled keys get stable slots.
+
+    Persist this mapping on key mutations so removing a legacy key never
+    renumbers the surviving slots. Labels are metadata, never authorization.
+    """
+    metadata = labels if isinstance(labels, dict) else {}
+    live = dict.fromkeys(
+        a.strip() for a in aliases
+        if isinstance(a, str) and a.strip().startswith(WEB_KEY_ALIAS_PREFIX)
+    )
+    result: dict[str, str] = {}
+    used: set[str] = set()
+    for alias in live:
+        label = metadata.get(alias)
+        if isinstance(label, str) and label.strip() and label.strip() not in used:
+            result[alias] = label.strip()
+            used.add(label.strip())
+    for alias in live:
+        if alias not in result:
+            index = 1
+            while f"legacy-{index}" in used:
+                index += 1
+            result[alias] = f"legacy-{index}"
+            used.add(result[alias])
+    return result
+
+
 def hash_web_key(raw_key: str) -> str:
     """Hash a raw web API key into its ``identities.yaml`` alias form.
 
@@ -146,6 +176,7 @@ class Identity:
     # (see ``capture_dm_channel`` in identities_populator) so the agent can
     # reach this person directly without the operator pre-configuring it.
     dm_channels: dict[str, str] = field(default_factory=dict)
+    web_key_labels: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass
@@ -296,9 +327,9 @@ class IdentityResolver:
 
         try:
             doc = yaml.safe_load(text) or {}
-        except yaml.YAMLError as exc:
+        except yaml.YAMLError:
             log.warning(
-                "identities.yaml parse failed: %s — keeping prior state", exc
+                "identities.yaml parse failed — keeping prior state"
             )
             self._web_gate_latched = True
             return len(self._alias_map)
@@ -322,13 +353,12 @@ class IdentityResolver:
 
         for raw in people:
             if not isinstance(raw, dict):
-                log.warning("identities.yaml: skipping non-dict entry: %r", raw)
+                log.warning("identities.yaml: skipping non-dict entry")
                 continue
             canonical = raw.get("canonical")
             if not isinstance(canonical, str) or not canonical.strip():
                 log.warning(
-                    "identities.yaml: skipping entry without 'canonical' field: %r",
-                    raw,
+                    "identities.yaml: skipping entry without 'canonical' field",
                 )
                 continue
             canonical = canonical.strip()
@@ -353,13 +383,18 @@ class IdentityResolver:
             for alias in raw_aliases:
                 if not isinstance(alias, str) or not alias.strip():
                     log.warning(
-                        "identities.yaml: %s — skipping non-string/empty alias: %r",
+                        "identities.yaml: %s — skipping non-string/empty alias",
                         canonical,
-                        alias,
                     )
                     continue
                 alias = alias.strip()
                 if alias in alias_map and alias_map[alias] != canonical:
+                    if alias.startswith(WEB_KEY_ALIAS_PREFIX):
+                        # Never choose a principal for ambiguous credentials,
+                        # including on reload of a previously valid source.
+                        log.warning("identities.yaml: web key claimed by multiple identities")
+                        self._web_gate_latched = True
+                        return len(self._alias_map)
                     log.warning(
                         "identities.yaml: alias %r already maps to %r, "
                         "overwriting with %r (last-wins)",
@@ -411,6 +446,7 @@ class IdentityResolver:
                 access=access,
                 prefs=dict(prefs),
                 dm_channels=dm_channels,
+                web_key_labels=web_key_labels(aliases, raw.get("web_key_labels")),
             )
             if display_name:
                 display_names[canonical] = display_name

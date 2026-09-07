@@ -786,6 +786,133 @@ def test_identities_list_after_adds(tmp_path: Path, capsys: pytest.CaptureFixtur
     assert "discord-456" in out
 
 
+def test_identities_issue_key_is_additive(tmp_path: Path, capsys: pytest.CaptureFixture):
+    from mimir.identities import IdentityResolver, hash_web_key
+
+    keys = []
+    for options in ([], ["--label", "laptop"]):
+        main(["identities", "issue-key", "alice", "--home", str(tmp_path), *options])
+        out = capsys.readouterr().out
+        assert "existing web keys remain valid" in out
+        assert "now revoked" not in out
+        raw = next(line.split("│", 1)[1].strip() for line in out.splitlines() if "│" in line)
+        keys.append(raw)
+        assert out.count(raw) == 1
+
+    resolver = IdentityResolver(tmp_path)
+    resolver.reload()
+    identity = resolver.identity("alice")
+    assert set(identity.web_key_labels.values()) == {"key-1", "laptop"}
+    assert len(identity.web_key_labels) == 2
+    assert identity.access.is_authorized
+    for raw in keys:
+        assert resolver.resolve_web_key(raw).canonical == "alice"
+        assert hash_web_key(raw) in identity.web_key_labels
+        assert raw not in (tmp_path / "state" / "identities.yaml").read_text()
+
+
+def test_identities_rotate_only_replaces_all_keys_preserving_roles(
+    tmp_path: Path, capsys: pytest.CaptureFixture,
+):
+    from mimir.identities import IdentityResolver
+    from mimir.identities_populator import issue_web_key
+
+    old_keys = [
+        issue_web_key(tmp_path, "alice", roles=["user", "admin"], label=label)
+        for label in ("desktop", "phone")
+    ]
+    main([
+        "identities", "issue-key", "alice", "--home", str(tmp_path),
+        "--rotate-only", "--label", "replacement",
+    ])
+    out = capsys.readouterr().out
+    assert "all previous web keys are now revoked" in out
+    assert "roles unchanged" in out
+    resolver = IdentityResolver(tmp_path)
+    resolver.reload()
+    identity = resolver.identity("alice")
+    assert identity.access.is_admin
+    assert identity.access.is_authorized
+    assert list(identity.web_key_labels.values()) == ["replacement"]
+    for key in old_keys:
+        assert resolver.resolve_web_key(key) is None
+
+
+def test_identities_add_key_preserves_existing_access(tmp_path: Path, capsys):
+    from mimir.identities import IdentityResolver
+    from mimir.identities_populator import issue_web_key
+
+    original = issue_web_key(tmp_path, "alice", roles=["user", "admin"], label="web")
+    main(["identities", "issue-key", "alice", "--home", str(tmp_path), "--label", "acp"])
+    out = capsys.readouterr().out
+    added = next(line.split("│", 1)[1].strip() for line in out.splitlines() if "│" in line)
+    resolver = IdentityResolver(tmp_path)
+    resolver.reload()
+    for key in (original, added):
+        assert resolver.resolve_web_key(key).access.roles == ("user", "admin")
+
+
+@pytest.mark.parametrize("label", [None, "desktop"])
+def test_identities_revoke_key_label_or_all(
+    tmp_path: Path, capsys: pytest.CaptureFixture, label: str | None,
+):
+    from mimir.identities import IdentityResolver
+    from mimir.identities_populator import issue_web_key
+
+    desktop = issue_web_key(tmp_path, "alice", roles=["admin"], label="desktop")
+    phone = issue_web_key(tmp_path, "alice", label="phone")
+    options = ["--label", label] if label is not None else []
+    main(["identities", "revoke-key", "alice", "--home", str(tmp_path), *options])
+    out = capsys.readouterr().out
+    assert ("web key 'desktop'" if label else "all web keys") in out
+    resolver = IdentityResolver(tmp_path)
+    resolver.reload()
+    assert resolver.resolve_web_key(desktop) is None
+    assert (resolver.resolve_web_key(phone) is not None) == (label is not None)
+    assert resolver.identity("alice").access.is_admin
+
+
+def test_identities_list_redacts_web_keys(tmp_path: Path, capsys: pytest.CaptureFixture):
+    import yaml
+
+    from mimir.identities import hash_web_key
+
+    legacy = hash_web_key("legacy-secret")
+    labelled = hash_web_key("labelled-secret")
+    stale = hash_web_key("revoked-secret")
+    path = tmp_path / "state" / "identities.yaml"
+    path.parent.mkdir()
+    path.write_text(yaml.safe_dump({"people": [
+        {
+            "canonical": "alice", "display_name": "Alice", "notes": "Operator",
+            "aliases": ["slack-U05ALICE", f" {legacy} ", labelled],
+            "web_key_labels": {labelled: "laptop", stale: "revoked-label"},
+        },
+        {"canonical": "bob", "aliases": ["discord-456"]},
+    ]}))
+    main(["identities", "list", "--home", str(tmp_path)])
+    out = capsys.readouterr().out
+    for visible in ("alice", "Alice", "Operator", "slack-U05ALICE", "discord-456", "legacy-1", "laptop", "web keys: (none)"):
+        assert visible in out
+    for secret in ("webkey:", legacy.split(":")[1], labelled.split(":")[1], stale.split(":")[1], "legacy-secret", "labelled-secret", "revoked-label"):
+        assert secret not in out
+
+
+@pytest.mark.parametrize("action", ["issue-key", "revoke-key"])
+def test_identities_key_help_documents_scope(action: str, capsys: pytest.CaptureFixture):
+    with pytest.raises(SystemExit) as exc_info:
+        main(["identities", action, "--help"])
+    assert exc_info.value.code == 0
+    out = " ".join(capsys.readouterr().out.split())
+    assert "--label" in out
+    if action == "issue-key":
+        assert "without revoking existing keys" in out
+        assert "replace all existing web keys" in out
+        assert "without changing roles" in out
+    else:
+        assert "omit to revoke all web keys" in out
+
+
 def test_print_setup_report_surfaces_credential_helper_fields(capsys):
     """PR 4d added credentials_written + legacy_token_url_migrated to
     BootstrapResult. The setup report must surface both so the operator

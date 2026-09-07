@@ -39,15 +39,17 @@ describe("UsersView (#563)", () => {
     api.listUsers.mockResolvedValue(
       envelope({
         users: [
-          { canonical: "alice", display_name: "Alice", roles: ["user"], is_admin: false, has_web_key: true },
-          { canonical: "ops", display_name: null, roles: ["user", "admin"], is_admin: true, has_web_key: false }
+          { canonical: "alice", display_name: "Alice", roles: ["user"], is_admin: false, has_web_key: true, web_keys: [{ label: "laptop", present: true }] },
+          { canonical: "ops", display_name: null, roles: ["user", "admin"], is_admin: true, has_web_key: false, web_keys: [] }
         ]
       })
     );
     renderUsers();
     expect(await screen.findByText("alice")).toBeTruthy();
     expect(screen.getByText("ops")).toBeTruthy();
-    expect(screen.getByText("set")).toBeTruthy(); // alice has a key
+    expect(screen.getByText("laptop")).toBeTruthy();
+    expect(screen.getByText("present")).toBeTruthy();
+    expect(screen.getByText("none")).toBeTruthy();
   });
 
   it("mints a key and shows it exactly once (not before)", async () => {
@@ -58,16 +60,19 @@ describe("UsersView (#563)", () => {
     expect(screen.queryByText("sk-minted-once-123")).toBeNull(); // not shown before mint
 
     fireEvent.change(screen.getByLabelText("Canonical id"), { target: { value: "bob" } });
-    fireEvent.click(screen.getByRole("button", { name: /Create \/ rotate key/i }));
+    fireEvent.change(screen.getByLabelText("Key label"), { target: { value: "laptop" } });
+    fireEvent.click(screen.getByRole("button", { name: "Add key" }));
 
-    await waitFor(() => expect(api.issueUserKey).toHaveBeenCalledWith("bob", "user"));
+    await waitFor(() => expect(api.issueUserKey).toHaveBeenCalledWith("bob", "user", { label: "laptop", rotate: false }));
     expect(await screen.findByText("sk-minted-once-123")).toBeTruthy(); // shown once after mint
+    fireEvent.click(screen.getByRole("button", { name: "Dismiss" }));
+    expect(screen.queryByText("sk-minted-once-123")).toBeNull();
   });
 
   it("rotates with role:null and revokes by canonical", async () => {
     api.listUsers.mockResolvedValue(
       envelope({
-        users: [{ canonical: "alice", display_name: null, roles: ["user"], is_admin: false, has_web_key: true }]
+        users: [{ canonical: "alice", display_name: null, roles: ["user"], is_admin: false, has_web_key: true, web_keys: [{ label: "laptop", present: true }, { label: "phone", present: true }] }]
       })
     );
     api.issueUserKey.mockResolvedValue(envelope({ canonical: "alice", key: "rotated-key" }));
@@ -75,10 +80,14 @@ describe("UsersView (#563)", () => {
     renderUsers();
     await screen.findByText("alice");
 
-    fireEvent.click(screen.getByRole("button", { name: "Rotate key" }));
-    await waitFor(() => expect(api.issueUserKey).toHaveBeenCalledWith("alice", null));
+    fireEvent.click(screen.getByRole("button", { name: "Rotate all keys" }));
+    await waitFor(() => expect(api.issueUserKey).toHaveBeenCalledWith("alice", null, { label: undefined, rotate: true }));
 
-    fireEvent.click(screen.getByRole("button", { name: /Revoke/i }));
-    await waitFor(() => expect(api.revokeUserKey).toHaveBeenCalledWith("alice"));
+    await waitFor(() => expect(screen.getByRole("button", { name: "Revoke laptop for alice" }).hasAttribute("disabled")).toBe(false));
+    fireEvent.click(screen.getByRole("button", { name: "Revoke laptop for alice" }));
+    await waitFor(() => expect(api.revokeUserKey).toHaveBeenCalledWith("alice", "laptop"));
+    await waitFor(() => expect(screen.getByRole("button", { name: "Revoke all keys" }).hasAttribute("disabled")).toBe(false));
+    fireEvent.click(screen.getByRole("button", { name: "Revoke all keys" }));
+    await waitFor(() => expect(api.revokeUserKey).toHaveBeenCalledWith("alice", undefined));
   });
 });

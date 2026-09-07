@@ -48,7 +48,7 @@ from typing import Any, Callable, Iterable, Literal, Mapping, Sequence
 import yaml
 
 from .event_logger import log_event, log_event_sync
-from .identities import WEB_KEY_ALIAS_PREFIX, hash_web_key
+from .identities import WEB_KEY_ALIAS_PREFIX, hash_web_key, web_key_labels
 
 log = logging.getLogger(__name__)
 
@@ -122,8 +122,8 @@ def _load_yaml(path: Path) -> tuple[dict[str, Any], str]:
         return {}, ""
     try:
         doc = yaml.safe_load(text) or {}
-    except yaml.YAMLError as exc:
-        log.warning("identities.yaml parse failed: %s — refusing to overwrite", exc)
+    except yaml.YAMLError:
+        log.warning("identities.yaml parse failed — refusing to overwrite")
         # Returning a sentinel telling the caller to abort (preserve the
         # operator's broken-but-recoverable file rather than nuke it).
         raise
@@ -207,16 +207,27 @@ def issue_web_key(
     *,
     roles: Sequence[str] | None = None,
     key_factory: Callable[[], str] | None = None,
+    label: str | None = None,
+    rotate: bool = False,
+    roles_if_new: Sequence[str] | None = None,
 ) -> str:
     """Mint (or rotate) a per-user web API key for ``canonical`` and return the
     RAW key — the only moment it is ever recoverable. The caller shows it once
     and distributes it out-of-band; only ``webkey:<sha256>`` is persisted.
 
-    Rotation-safe: any existing ``webkey:`` alias on the person is dropped
-    first, so re-issuing immediately invalidates the prior key. Creates the
+    Additive by default. ``rotate=True`` explicitly drops ALL existing web keys
+    first. ``label`` names a unique revocation slot (auto-assigned if omitted).
+    Labels live in ``web_key_labels: {webkey:<sha256>: label}``. Creates the
     person entry if absent. ``roles`` (e.g. ``["user"]`` / ``["admin"]``), when
     given, sets ``access.roles`` so a fresh user is usable in one step; omit to
-    leave existing access untouched. Atomic + header-preserving."""
+    leave existing access untouched. ``roles_if_new`` supplies defaults only
+    when creating a person, under the same write lock. Atomic + header-preserving."""
+    if label is not None:
+        if not isinstance(label, str) or not label.strip():
+            raise ValueError("web key label must be a non-empty string")
+        label = label.strip()
+    if not isinstance(rotate, bool):
+        raise ValueError("rotate must be a boolean")
     raw_key = (key_factory or _default_web_key)()
     alias = hash_web_key(raw_key)
     yaml_path = home / "state" / "identities.yaml"
@@ -225,20 +236,39 @@ def issue_web_key(
     if not isinstance(people, list):
         people = []
         doc["people"] = people
+    if any(
+        isinstance(a, str) and a.strip() == alias
+        for person in people if isinstance(person, dict)
+        for a in (person.get("aliases") or [])
+    ):
+        raise ValueError("generated web key is already assigned")
     entry = _find_person(people, canonical)
     if entry is None:
         entry = {"canonical": canonical, "aliases": []}
         people.append(entry)
+        if roles is None:
+            roles = roles_if_new
     aliases = entry.get("aliases")
     if not isinstance(aliases, list):
         aliases = []
         entry["aliases"] = aliases
-    # Drop any prior web key (rotate): the old key stops resolving immediately.
-    aliases[:] = [
-        a for a in aliases
-        if not (isinstance(a, str) and a.startswith(WEB_KEY_ALIAS_PREFIX))
-    ]
+    labels = web_key_labels(aliases, entry.get("web_key_labels"))
+    if rotate:
+        aliases[:] = [
+            a for a in aliases
+            if not (isinstance(a, str) and a.strip().startswith(WEB_KEY_ALIAS_PREFIX))
+        ]
+        labels = {}
+    if label is None:
+        index = 1
+        while f"key-{index}" in labels.values():
+            index += 1
+        label = f"key-{index}"
+    if label in labels.values():
+        raise ValueError("web key label already exists; revoke it first or rotate all keys")
     aliases.append(alias)
+    labels[alias] = label
+    entry["web_key_labels"] = labels
     if roles is not None:
         entry["access"] = {"roles": [str(role) for role in roles]}
     _atomic_write_identities(yaml_path, header, doc)
@@ -247,7 +277,7 @@ def issue_web_key(
             "identity_web_key_issued",
             canonical=canonical,
             roles=list(roles) if roles is not None else None,
-            rotated=True,
+            rotated=rotate,
         )
     except Exception:  # noqa: BLE001 — telemetry must never fail a key operation
         pass
@@ -260,13 +290,18 @@ def revoke_web_key(
     canonical: str,
     *,
     allow_last: bool = True,
+    label: str | None = None,
 ) -> bool:
-    """Drop ``canonical``'s web key alias so the key stops resolving.
+    """Drop one labelled key, or all of ``canonical``'s keys if label is omitted.
 
     Returns True if a key was removed, False if the person is unknown or had
     none. Access roles are left intact (revoke a key ≠ deauthorize the person).
     When ``allow_last`` is false, removing the final web key is refused while
     holding the identities write lock so concurrent revocations cannot race."""
+    if label is not None:
+        if not isinstance(label, str) or not label.strip():
+            raise ValueError("web key label must be a non-empty string")
+        label = label.strip()
     yaml_path = home / "state" / "identities.yaml"
     doc, header = _load_yaml(yaml_path)
     people = doc.get("people")
@@ -279,15 +314,19 @@ def revoke_web_key(
     if not isinstance(aliases, list):
         return False
     before = len(aliases)
+    labels = web_key_labels(aliases, entry.get("web_key_labels"))
     aliases[:] = [
         a for a in aliases
-        if not (isinstance(a, str) and a.startswith(WEB_KEY_ALIAS_PREFIX))
+        if not (isinstance(a, str) and a.strip() in labels
+                and (label is None or labels[a.strip()] == label))
     ]
     if len(aliases) == before:
         return False
+    surviving = {a.strip() for a in aliases if isinstance(a, str)}
+    entry["web_key_labels"] = {a: name for a, name in labels.items() if a in surviving}
     if not allow_last:
         remaining = any(
-            isinstance(alias, str) and alias.startswith(WEB_KEY_ALIAS_PREFIX)
+            isinstance(alias, str) and alias.strip().startswith(WEB_KEY_ALIAS_PREFIX)
             for person in people
             if isinstance(person, dict)
             for alias in (person.get("aliases") or [])

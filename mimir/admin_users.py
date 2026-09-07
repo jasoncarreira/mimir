@@ -5,7 +5,7 @@ per-user web keys. Every route is admin-gated by the ``/api/v1/admin/`` prefix
 in the auth middleware (server.py). These helpers add a second, value-blind
 guarantee: the *only* key material that ever leaves the server is the raw key
 returned ONCE at mint time. The list never returns a raw key OR its hash —
-just whether a key exists.
+just labels and whether keys exist.
 """
 
 from __future__ import annotations
@@ -19,8 +19,8 @@ def build_users_payload(resolver: IdentityResolver) -> dict[str, Any]:
     """List identities for the admin Users page.
 
     Returns NO key material — not the raw key, not the ``webkey:`` hash —
-    only ``has_web_key`` (whether one is set), so the page can show login
-    status + offer rotate/revoke without ever exposing credential bytes."""
+    only labels, presence, and ``has_web_key``, so the page can offer
+    rotate/revoke without ever exposing credential bytes."""
     users: list[dict[str, Any]] = []
     for ident in resolver.all_identities():
         users.append(
@@ -33,6 +33,10 @@ def build_users_payload(resolver: IdentityResolver) -> dict[str, Any]:
                 "has_web_key": any(
                     alias.startswith(WEB_KEY_ALIAS_PREFIX) for alias in ident.aliases
                 ),
+                "web_keys": [
+                    {"label": label, "present": True}
+                    for label in ident.web_key_labels.values()
+                ],
             }
         )
     return {"users": users}
@@ -42,7 +46,7 @@ def roles_for_request(role: Any) -> list[str] | None:
     """Map a Users-page ``role`` field to ``access.roles`` for issue_web_key.
 
     ``"admin"`` → ``["user", "admin"]`` (admin implies user), ``"user"`` →
-    ``["user"]``, ``None``/absent → ``None`` (rotate the key, leave roles
+    ``["user"]``, ``None``/absent → ``None`` (leave roles
     untouched). Raises ValueError on any other value so the endpoint can 400."""
     if role is None:
         return None
