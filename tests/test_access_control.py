@@ -8769,6 +8769,130 @@ def test_github_remediation_file_sink_is_confined_to_exact_active_lease(
 
 
 @pytest.mark.parametrize("tool_name", ["write_file", "edit_file"])
+@pytest.mark.parametrize("enforce", [False, True])
+def test_file_writes_resolve_payload_and_server_discovered_leases(
+    tool_name: str, enforce: bool, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from mimir.models import ServerDiscoveredPRStates
+
+    home = tmp_path / "home"
+    home.mkdir()
+    lease_root = tmp_path / "workspace" / "pr-leases"
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    monkeypatch.setenv("MIMIR_FILE_TOOL_ROOTS", f"{lease_root}:rw")
+    payload = _review_state("o/r", 42, "worklink/42", str(tmp_path))
+    discovered = RepoReviewState(replace(
+        _review_state("o/r", 43, "worklink/43", str(tmp_path)).action_scope,
+        provenance="server_discovered",
+    ))
+    readonly = RepoReviewState(replace(
+        _review_state("o/r", 44, "worklink/44", str(tmp_path)).action_scope,
+        provenance="server_discovered",
+        allowed_operations=frozenset({"repo.inspect", "repo.checkout", "repo.test"}),
+    ))
+    states = (payload, discovered, readonly)
+    checkouts = [
+        _attach_test_checkout_lease(state, lease_root, f"pr-{state.pr_number}")
+        for state in states
+    ]
+    cache = ServerDiscoveredPRStates()
+    cache.remember(discovered)
+    cache.remember(readonly)
+    service = build_trigger_service_principal(
+        canonical="poller:github-activity", trigger="poller", profile="github",
+        tier=CapabilityTier.CODE_EXECUTION, capabilities=(tool_name,),
+        creation_path="test",
+    )
+    auth = replace(
+        _service_auth(service, InformationFlowLabels()),
+        repo_pr_scope_registry=RepoPRScopeRegistry((payload,)),
+        server_discovered_pr_states=cache,
+    )
+    registry = ToolRegistry()
+    shadow_decisions = []
+    monkeypatch.setattr(
+        registry, "_emit_shadow_decision",
+        lambda decision, **kwargs: shadow_decisions.append(decision),
+    )
+    for state, checkout in zip(states, checkouts):
+        shadow_decisions.clear()
+        decision = registry.authorize_tool(
+            tool_name, auth, enforce=enforce,
+            target_channel=str(checkout / "frontend" / "route.tsx"),
+        )
+        assert decision.allowed is (not enforce or state is not readonly)
+        if not enforce and state is readonly:
+            decision = shadow_decisions[0]
+        elif not enforce:
+            assert not any(item.would_block for item in shadow_decisions)
+        assert decision.would_block is (state is readonly)
+        if state is readonly:
+            assert decision.reason == "repo_pr_write_not_granted"
+        fields = decision.as_log_fields()
+        assert fields["scope_id"] == state.action_scope.scope_id
+        assert fields["scope_provenance"] == state.action_scope.provenance
+        assert fields["granted_actions"] == sorted(state.action_scope.allowed_operations)
+
+    checkout = checkouts[1]
+    (checkout / "escape").symlink_to(home, target_is_directory=True)
+    for target in (
+        lease_root / "unowned" / "file.py",
+        home / "outside.py",
+        checkout / ".git" / "config",
+        checkout / "escape" / "file.py",
+    ):
+        shadow_decisions.clear()
+        denied = registry.authorize_tool(
+            tool_name, auth, enforce=enforce, target_channel=str(target),
+        )
+        assert denied.allowed is (not enforce)
+        if not enforce:
+            denied = shadow_decisions[0]
+        assert denied.would_block is True
+        if target == lease_root / "unowned" / "file.py":
+            assert denied.reason == "service_sink_destination_denied"
+
+
+@pytest.mark.parametrize("provenance", ["poller_payload", "server_discovered"])
+def test_checkout_path_resolution_requires_exact_active_lease(
+    provenance: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from mimir.models import ServerDiscoveredPRStates
+
+    state = RepoReviewState(replace(
+        _review_state("o/r", 42, "worklink/42", str(tmp_path)).action_scope,
+        provenance=provenance,
+    ))
+    checkout = _attach_test_checkout_lease(state, tmp_path / "pr-leases", "pr-42")
+    if provenance == "server_discovered":
+        carrier = ServerDiscoveredPRStates()
+        carrier.remember(state)
+    else:
+        carrier = RepoPRScopeRegistry((state,))
+    target = checkout / "file.py"
+    assert carrier.resolve_checkout_path(target) is state
+    monkeypatch.chdir(checkout)
+    assert carrier.resolve_checkout_path("file.py") is None
+    assert carrier.resolve_checkout_path(checkout / "sub" / ".." / "file.py") is None
+    assert carrier.resolve_checkout_path(tmp_path / "file.py") is None
+    (checkout / "escape").symlink_to(tmp_path, target_is_directory=True)
+    assert carrier.resolve_checkout_path(checkout / "escape" / "file.py") is None
+    lease = state.checkout_lease
+    for replacement in (
+        replace(lease, owner="another-principal"),
+        replace(lease, scope_id="another-scope"),
+        replace(lease, expires_at=datetime.now(UTC) - timedelta(seconds=1)),
+        replace(lease, lease_root=tmp_path),
+        None,
+    ):
+        object.__setattr__(state, "checkout_lease", replacement)
+        assert carrier.resolve_checkout_path(target) is None
+    object.__setattr__(state, "checkout_lease", lease)
+    lease.revoke()
+    assert carrier.resolve_checkout_path(target) is None
+
+
+@pytest.mark.parametrize("tool_name", ["write_file", "edit_file"])
 def test_github_review_scope_cannot_write_inside_its_active_lease(
     tool_name: str,
     tmp_path: Path,
