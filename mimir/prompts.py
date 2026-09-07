@@ -53,8 +53,8 @@ your reasoning for the turn. **To say something to a channel you MUST call
 the ``send_message`` tool.** Nothing you write outside a ``send_message``
 call reaches the user.
 
-- ``send_message(text=...)`` with no ``channel_id`` replies in the channel
-  this turn came from — the normal case for a user message.
+- ``send_message(text=..., channel_id=...)`` requires an explicit deliverable
+  channel ID. To reply to a user message, use the channel this turn came from.
 - You can call ``send_message`` **multiple times in one turn**: a multi-part
   reply, or a progress note before a long tool sequence and then the result.
   It does not count against the tool-call budget, so you can always reply

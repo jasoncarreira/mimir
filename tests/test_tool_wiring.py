@@ -191,6 +191,9 @@ class TestChannelToolsInjectedToolArg:
         assert "config" not in props, f"config leaked into tool_call_schema: {props}"
         assert "text" in props
         assert "channel_id" in props
+        assert "channel_id" in schema["required"]
+        assert schema["properties"]["channel_id"]["type"] == "string"
+        assert "default" not in schema["properties"]["channel_id"]
 
     def test_react_config_not_in_tool_call_schema(self) -> None:
         schema = react.tool_call_schema.model_json_schema()
