@@ -313,7 +313,10 @@ async def build_chainlink_board_payload(
             "truncated": False,
             "total_count": 0,
         }
-    if not isinstance(payload, list):
+    exported_issues = payload.get("issues") if isinstance(payload, dict) else None
+    if not isinstance(exported_issues, list) or not all(
+        isinstance(item, dict) for item in exported_issues
+    ):
         return {
             **page_metadata,
             "available": False,
@@ -331,7 +334,7 @@ async def build_chainlink_board_payload(
     # Export supplies global labels, parents and lifecycle metadata. Dependencies
     # are hydrated only after filtering/pagination, never for the whole tracker.
     selected_id = issue
-    merged = [item for item in payload if isinstance(item, dict)]
+    merged = exported_issues
     issues_by_id = {
         issue_id: issue
         for issue in merged

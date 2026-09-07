@@ -133,7 +133,12 @@ async def test_board_pagination_and_selected_detail_remain_admin_only(tmp_path: 
     async def run(home, args):
         calls.append(args)
         if args == ["export", "--json"]:
-            return [{"id": 1214, "title": "Private task", "status": "open"}], None
+            return {"version": 1, "exported_at": "2026-06-18T03:00:00Z", "issues": [{
+                "id": 1214, "title": "Private task", "status": "open",
+                "priority": "normal", "labels": [], "parent_id": None,
+                "description": "Private summary", "comments": [], "closed_at": None,
+                "created_at": "2026-06-17T00:00:00Z", "updated_at": "2026-06-18T00:00:00Z",
+            }]}, None
         return {"id": 1214, "description": "Private detail"}, None
 
     monkeypatch.setattr(chainlink_board, "_run_chainlink_json", run)
