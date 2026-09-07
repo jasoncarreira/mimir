@@ -347,19 +347,39 @@ explicit exception for configured external repository roots, as described below.
 **Repository-review execution profile.** A poller using the built-in `github`
 authority profile is explicitly repo-working. Its `shell_exec` and `bash_async`
 sinks use `shell_profile=repo_review`, while research and custom pollers retain
-`scheduler_read_only`. `repo_review` is a command-shape allow-list for the
-operations observed in review turns: bounded `gh pr view/diff/checks`, Git
-status/log/diff/fetch/checkout, `npm ci --ignore-scripts`, `npm test`/`npm run
-test`, and pytest (directly or as `uv run pytest`) with a narrow selection and
-reporting option allow-list plus relative collection paths. It excludes pytest
-plugin/config/debugger controls such as `-p`, `-c`, `-o`, `--rootdir`, and
-`--pdb`, rejects response files and absolute/traversing collection paths, and scrubs
-`PYTEST_ADDOPTS`/`PYTEST_PLUGINS` for direct execution. It does not admit shell
-launchers, arbitrary interpreters, `spawn_*`, `rm`, Git push/history/config
-mutation, GitHub credential mutation, or open-ended package install/update
-commands. `npm ci --ignore-scripts` is the one declared dependency-materialization
-command because a clean install is part of the repository test contract; lifecycle
-scripts and other network-installing package operations remain denied.
+`scheduler_read_only`. With the #1050 cutover, `repo_review` retains hardened local
+Git inspection (such as status/log/diff), but refuses shell Git writes, including
+fetch/checkout/stage/commit/merge/rebase/push, and **all `gh` commands**, including
+view/diff/checks, before execution in both shadow and enforced mode. Local Git
+inspection requires root confinement, pinned exact argv, and neutralization of
+hooks, fsmonitor, external diff, textconv, filters, credentials, protocols, pager,
+and optional locks; the read allowlist is not a substitute for this hardening.
+Repository mutations and forge reads/writes use typed `repo_*`/`pr_*` tools bound
+to the server-issued immutable `RepoPRActionScope` and `RepoReviewState`, with
+local work confined to their active checkout lease. Repository, PR, observed
+head/base, allowed actions, and publication destination are server-owned; model
+arguments cannot replace them, and stale-snapshot push must refuse before
+publication. This removal does not widen declarations or Worklink allowlists.
+
+`repo_review` returns on admission or refusal before either the configured
+project-test or declared-command mechanism is consulted. Neither
+`MIMIR_PROJECT_TEST_COMMAND` nor per-job `shell_commands` can widen it. There is
+no repo-review pytest/npm allowlist or `npm ci --ignore-scripts` exception;
+remediation tests use typed `repo_test` in the scope-bound lease snapshot.
+
+For other service shell profiles, the configured project-test path uses the
+operator-owned `MIMIR_PROJECT_TEST_COMMAND` JSON object's fixed `argv` prefix
+and `cwd`, not a built-in runner/option allowlist. The executable must be an
+absolute, non-symlink executable regular file outside service-writable roots;
+the resolved working directory must be inside `MIMIR_FILE_TOOL_ROOTS`. Direct
+interpreter/shell commands are invalid. Requests must match the configured
+prefix and may append only zero to 32 relative ASCII test paths/selectors, at
+most 256 characters each and 4,096 bytes combined. Traversal, absolute paths,
+option-shaped values, response files, shell metacharacters, and a caller-added
+`--` are refused; required runner options/separators belong in the fixed operator
+prefix. Execution is synchronous `shell_exec` with `shell=False`, not
+`bash_async`. See [configured project tests](../authorization.md#configured-project-tests)
+for the complete contract.
 
 **No profile admits `--jq`.** `gh` evaluates the filter in-process, and jq's
 `env` and `$ENV` builtins return the process environment — which
@@ -369,14 +389,24 @@ scripts and other network-installing package operations remain denied.
 into the tool result, and from there into the model's context and the turn
 transcript. Enforcement was not a mitigation, because the command was allowed
 rather than merely unblocked. The option is removed from every profile's
-allow-list; callers pass `--json <fields>` and filter the result themselves.
+allow-list; callers in profiles that still admit `gh` pass `--json <fields>` and
+filter the result themselves. `repo_review` admits no `gh` form after #1050.
 Removing it costs nothing, since every non-degenerate filter was already refused
 by the metacharacter scan (`|`, `[`, `]` and `{` never reach `shlex`). Do not
 reintroduce it with `env` blocklisted: that is a denylist over an expression
 language, and the next builtin reaching process state reopens the hole. The same
 question applies to any future option that evaluates a caller-supplied
-expression — `--template` is retained only because gh's template function set is
-fixed and exposes no environment accessor.
+expression — outside `repo_review`, `--template` is retained only because gh's
+template function set is fixed and exposes no environment accessor.
+
+The #1050 live parity canary is a reviewer-owned **BEFORE MERGE** gate, not a
+build blocker. Records live in Chainlink #1050 comments mirrored in the PR body.
+The human remediation record summarized in the
+[authorization reference](../authorization.md#repository-review-and-remediation-1050)
+is partial evidence only. The review-scope cycle, per-write receipt/audit pairing
+on the same scope/head, zero observed shadow effects, stale-snapshot push refusal,
+and scenario totals/mismatch categories remain to be verified under the unchanged
+[reviewer procedure](../internal/repo-pr-parity-canary.md#1050-reviewer-procedure).
 
 **Scheduled-maintenance execution profile.** Static `scheduled_tick` services and
 the built-in heartbeat authority use `shell_profile=maintenance`; GitHub pollers

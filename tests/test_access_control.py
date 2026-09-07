@@ -3611,7 +3611,7 @@ def test_declared_shell_authorization_and_execution_gates_agree(
     assert parse_service_shell_argv("gog gmail search newer_than:24h", profile) is None
 
     for command, expected_admitted in (
-        ("gog gmail search newer_than:24h", True),
+        ("gog gmail search newer_than:24h", profile != "repo_review"),
         ("gog gmail send --to someone@example.com", False),
     ):
         authorization_argv = parse_service_shell_argv(
@@ -3790,7 +3790,7 @@ def test_service_shell_redirect_covers_binding_refusal_rules(
     ("scheduler_read_only", "bounded file inspection, read-only Git and Chainlink operations"),
     ("maintenance", "bounded file/date inspection, read-only Git/GitHub and Chainlink operations"),
     ("session_boundary", "bounded Chainlink operations and GitHub issue/PR views"),
-    ("repo_review", "bounded repository inspection, review operations and script-free npm ci"),
+    ("repo_review", "hardened local read-only Git inspection"),
     ("upgrade_workspace", "bounded file inspection, workspace Git, Chainlink and uv lock/sync operations"),
 ])
 def test_service_shell_profile_denial_names_allowed_operations(
@@ -3816,7 +3816,7 @@ def test_service_shell_profile_denial_names_allowed_operations(
         enforcement_enabled=True, detail=detail,
     )
     _assert_service_shell_redirect(refusal)
-    assert f"Profile allows {operations}" in refusal
+    assert operations in refusal
     assert "secret.example" not in refusal
 
 
@@ -4019,7 +4019,7 @@ def test_service_shell_metacharacter_refusal_records_attempted_command(
     assert "shell syntax is never admitted and no quoting will change that" in refusal
     assert "Issue one command per call" in refusal
     assert "git -C <dir>" in refusal
-    assert "--body-file <path beneath the agent scratch root>" in refusal
+    assert "Use typed PR tools for review bodies" in refusal
 
 
 @pytest.mark.asyncio
@@ -4160,8 +4160,7 @@ def test_service_shell_refusal_reason_withholds_argument_values() -> None:
         "gh pr view 1 --json number --badoption x", "repo_review",
     )
     assert "repo_review" in reason
-    assert "--json" in reason        # a known spelling is named
-    assert "<option>" in reason      # the unknown one is withheld, not echoed
+    assert "typed pr_* tools" in reason
     assert "--badoption" not in reason
 
 
@@ -4184,7 +4183,7 @@ def test_compound_command_refusal_says_what_to_do_instead() -> None:
     assert "'&'" in reason                      # which character
     assert "repo_review" in reason              # which profile
     assert "one command per call" in reason     # compound → single command
-    assert "--body-file" in reason              # multi-line → a file, not inline
+    assert "Use typed PR tools for review bodies" in reason
     assert "shell=False" in reason              # why no rewrite can work
 
 
@@ -6984,17 +6983,12 @@ def test_dynamic_trigger_write_denies_symlinked_protected_paths(
 @pytest.mark.parametrize(
     "command",
     [
-        "gh pr view 979 --repo owner/repo --json number,title,headRefOid",
-        "gh pr diff 979 --repo owner/repo --patch",
-        "gh pr checks 979 --repo owner/repo --required",
         "git status --short",
         "git log --oneline --max-count=10",
         "git diff --stat HEAD~1",
-        "git fetch origin pull/979/head",
-        "npm ci --ignore-scripts --no-audit --no-fund",
     ],
 )
-def test_repo_review_shell_profile_admits_review_commands(
+def test_repo_review_shell_profile_admits_local_inspection_commands(
     command: str,
     repo_review_git_root: Path,
 ) -> None:
@@ -7084,14 +7078,9 @@ def test_repo_review_commands_agree_for_host_and_contained_git_identity(
         "owner/repo", 1279, "worklink/1279", str(repo_review_git_root),
     )
     commands = (
-        "gh pr view 979 --repo owner/repo --json number,title,headRefOid",
-        "gh pr diff 979 --repo owner/repo --patch",
-        "gh pr checks 979 --repo owner/repo --required",
         "git status --short",
         "git log --oneline --max-count=10",
         "git diff --stat HEAD~1",
-        "git fetch origin pull/979/head",
-        "npm ci --ignore-scripts --no-audit --no-fund",
         "git grep -n pattern -- tests/x.py",
         "git blame mimir/agent.py",
         "git merge-base main HEAD",
@@ -7178,16 +7167,228 @@ def test_read_only_git_profiles_refuse_global_config_injection(
 )
 def test_repo_review_git_retains_execution_and_write_capable_refusals(
     command: str,
+    repo_review_git_root: Path,
 ) -> None:
-    argv, reason = parse_service_shell_argv_with_reason(command, "repo_review")
+    state = _review_state("o/r", 7, "worklink/7", str(repo_review_git_root))
+    assert parse_service_shell_argv("git status", "repo_review", review_state=state)
+    argv, reason = parse_service_shell_argv_with_reason(
+        command, "repo_review", review_state=state,
+    )
 
     assert argv is None
-    assert "Admitted inspection alternatives include" in reason
-    assert "Git forms that can execute, write output, contact a remote" in reason
-    assert "git grep" in reason
-    assert "git blame" in reason
-    assert "git merge-base" in reason
-    assert "git rev-list --count" in reason
+    assert "hardened local read-only Git inspection" in reason
+    assert "typed repo_* tools" in reason
+
+
+@pytest.mark.parametrize("tool_name", ["shell_exec", "bash_async"])
+@pytest.mark.parametrize("command_template", [
+    "git checkout worklink/7", "git checkout -B worklink/7",
+    "git add --all", "git add -A", "git add -- file.py",
+    "git commit -m safe", "git commit --file {body}",
+    "git worktree add {root}/another worklink/7",
+    "git fetch", "git fetch origin pull/7/head", "git fetch upstream --prune",
+    "git pull --ff-only origin worklink/7",
+    "git push origin worklink/7:worklink/7",
+    "git push -u origin worklink/7:refs/heads/worklink/7",
+    "git push --set-upstream origin worklink/7:refs/heads/worklink/7",
+    "git push --dry-run origin FETCH_HEAD:refs/heads/worklink/7",
+    "git ls-remote origin refs/pull/7/head",
+    "git -C {root} add --all", "git -C {root} commit -m safe",
+    "git --no-pager -C {root} push origin worklink/7:worklink/7",
+    "gh api repos/o/r/pulls/7/reviews --paginate -X GET",
+    "gh auth status", "gh issue view 7 --repo o/r --comments",
+    "gh pr view 7 --repo o/r --json body", "gh pr diff 7 --repo o/r --patch",
+    "gh pr checks 7 --repo o/r --required",
+    "gh pr checkout 7 --repo o/r --branch worklink/7",
+    "gh pr review 7 --repo o/r --approve --body safe",
+    "gh pr review 7 --repo o/r --approve --body-file {body}",
+    "gh pr review 7 --repo o/r --comment --body-file {body}",
+    "gh pr review 7 --repo o/r --request-changes --body-file {body}",
+    "gh pr edit 7 --repo o/r --add-reviewer reviewer --body-file {body}",
+    "gh pr comment 7 --repo o/r --body-file {body}",
+    "gh issue comment 7 --repo o/r --body-file {body}",
+    "npm ci --ignore-scripts --no-audit --no-fund",
+    "npm test", "npm run test", "uv run pytest -q", "pytest tests",
+    "pwd -P", "ls -la", "wc -l {body}", "grep -n safe {body}",
+    "rg --no-config safe {body}", "jq -r .name {body}",
+    "chainlink issue show 7 --json", "chainlink issue close 7",
+    "/usr/local/bin/chainlink issue show 7 --json",
+])
+def test_repo_review_cutover_refuses_legacy_forms_at_admission_and_binding(
+    tool_name: str, command_template: str, repo_review_state: RepoReviewState,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from mimir.tools import budget_gate
+
+    scratch = tmp_path / "home" / "scratch"
+    scratch.mkdir(parents=True)
+    body = scratch / "body.txt"
+    body.write_text("safe\nreview evidence\n", encoding="utf-8")
+    monkeypatch.setenv("MIMIR_HOME", str(scratch.parent))
+    monkeypatch.setenv("MIMIR_FILE_TOOL_ROOTS", f"{repo_review_state.root}:rw")
+    service = build_trigger_service_principal(
+        canonical="poller:github-activity", trigger="poller", profile="github",
+        tier=CapabilityTier.CODE_EXECUTION,
+        capabilities=("shell_exec", "bash_async", "bash_jobs_list", "bash_job_output"),
+        creation_path="test",
+    )
+    auth = _service_auth(
+        service, InformationFlowLabels(), repo_review_state=repo_review_state,
+    )
+    registry = ToolRegistry()
+    assert registry.authorize_tool(
+        tool_name, auth, enforce=True, target_channel="git status --short",
+    ).allowed
+    command = command_template.format(root=repo_review_state.root, body=body)
+    decision = registry.authorize_tool(
+        tool_name, auth, enforce=True, target_channel=command,
+        arguments={"command": command},
+    )
+    assert not decision.allowed
+    assert decision.reason == "service_sink_destination_denied"
+    assert "typed repo_* tools" in decision.refusal_detail
+    bound = budget_gate._request_for_authorized_execution(
+        _tool_request(auth, tool_name=tool_name, args={
+            "command": command, "mimir_direct_argv": ["/bin/echo", "bypass"],
+        }), tool_name, auth,
+    ).tool_call["args"]
+    assert bound["mimir_direct_argv"] == [
+        "/usr/bin/false", "trusted-service shell argv binding failed closed",
+    ]
+    assert "binding_rule=profile_allowlist" in bound["mimir_shell_refusal"]
+    assert "typed pr_* tools" in bound["mimir_shell_refusal"]
+    assert "do not retry through shell or HTTP commands" in bound["mimir_shell_refusal"]
+
+
+@pytest.mark.parametrize("missing", ["state", "scope", "inspect"])
+def test_repo_review_local_inspection_requires_explicit_inspect_authority(
+    missing: str, repo_review_state: RepoReviewState,
+) -> None:
+    state = repo_review_state
+    assert parse_service_shell_argv("git status", "repo_review", review_state=state)
+    if missing == "state":
+        state = None
+    elif missing == "scope":
+        state = SimpleNamespace(root=state.root)
+    else:
+        state = RepoReviewState(replace(
+            state.action_scope,
+            allowed_operations=state.action_scope.allowed_operations - {access_control.RepoPRAction.INSPECT.value},
+        ))
+    argv, reason, rule = access_control.parse_service_shell_argv_with_diagnostics(
+        "git status", "repo_review", review_state=state,
+    )
+    assert argv is None
+    assert rule is ServiceShellBindingRule.PROFILE_ALLOWLIST
+    assert "inspect permission" in reason
+
+
+@pytest.mark.parametrize("root_kind", ["none", "path-object", "empty", "relative", "missing", "loop"])
+def test_repo_review_local_inspection_requires_existing_absolute_string_root(
+    root_kind: str, repo_review_state: RepoReviewState, tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = Path(repo_review_state.root)
+    monkeypatch.chdir(root.parent)
+    loop = tmp_path / "loop"
+    loop.symlink_to(loop)
+    roots = {
+        "none": None, "path-object": root, "empty": "", "relative": root.name,
+        "missing": str(tmp_path / "absent"), "loop": str(loop),
+    }
+    assert parse_service_shell_argv("git status", "repo_review", review_state=repo_review_state)
+    probes = []
+    real_probe = access_control._maintenance_git_filter_overrides
+
+    def probe(*args, **kwargs):
+        probes.append(args)
+        return real_probe(*args, **kwargs)
+
+    monkeypatch.setattr(access_control, "_maintenance_git_filter_overrides", probe)
+    state = SimpleNamespace(action_scope=repo_review_state.action_scope, root=roots[root_kind])
+    assert parse_service_shell_argv("git status", "repo_review", review_state=state) is None
+    assert probes == [], "invalid roots must be refused before Git config probing"
+
+
+@pytest.mark.parametrize("target_kind", ["relative", "other", "missing", "missing-parent", "loop"])
+def test_repo_review_git_c_requires_absolute_matching_resolvable_root(
+    target_kind: str, repo_review_state: RepoReviewState, tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = Path(repo_review_state.root)
+    monkeypatch.chdir(root.parent)
+    loop = tmp_path / "loop"
+    loop.symlink_to(loop)
+    targets = {
+        "relative": root.name, "other": str(tmp_path),
+        "missing": str(tmp_path / "absent"), "loop": str(loop),
+        "missing-parent": str(root.parent / "absent" / ".." / root.name),
+    }
+    assert parse_service_shell_argv(
+        f"git -C {root} status", "repo_review", review_state=repo_review_state,
+    )
+    assert parse_service_shell_argv(
+        f"git -C {targets[target_kind]} status", "repo_review", review_state=repo_review_state,
+    ) is None
+
+
+@pytest.mark.parametrize("failure", [OSError, RuntimeError, ValueError])
+@pytest.mark.parametrize("location", ["state-root", "git-c"])
+def test_repo_review_root_resolution_errors_fail_closed(
+    failure: type[Exception], location: str, repo_review_state: RepoReviewState,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = Path(repo_review_state.root)
+    alias = tmp_path / "alias"
+    alias.symlink_to(root, target_is_directory=True)
+    command = f"git -C {alias} status" if location == "git-c" else "git status"
+    assert parse_service_shell_argv(command, "repo_review", review_state=repo_review_state)
+    original = Path.resolve
+    failed_path = alias if location == "git-c" else root
+
+    def resolve(path, *args, **kwargs):
+        if path == failed_path:
+            raise failure("synthetic root resolution failure")
+        return original(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "resolve", resolve)
+    argv, reason, rule = access_control.parse_service_shell_argv_with_diagnostics(
+        command, "repo_review", review_state=repo_review_state,
+    )
+    assert argv is None
+    assert rule is ServiceShellBindingRule.PROFILE_ALLOWLIST
+    assert "hardened local read-only Git inspection" in reason
+
+
+@pytest.mark.parametrize("command", [
+    "gh status", "git", "git -C", "git -C /tmp", "git -C {root}",
+    "git status file.py", "git status --", "git status --verbose",
+    "git log --output=/tmp/review-output",
+])
+def test_repo_review_rejects_malformed_or_unsafe_inspection_argv(
+    command: str, repo_review_state: RepoReviewState,
+) -> None:
+    assert parse_service_shell_argv("git status", "repo_review", review_state=repo_review_state)
+    command = command.format(root=repo_review_state.root)
+    assert parse_service_shell_argv(command, "repo_review", review_state=repo_review_state) is None
+
+
+@pytest.mark.parametrize("failure", ["pin", "filter"])
+def test_repo_review_inspection_pin_and_filter_failures_close_binding(
+    failure: str, repo_review_state: RepoReviewState, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    assert parse_service_shell_argv("git status", "repo_review", review_state=repo_review_state)
+    if failure == "pin":
+        monkeypatch.delitem(access_control._MAINTENANCE_PINNED_EXECUTABLES, "git")
+    else:
+        subprocess.run([
+            "git", "-C", repo_review_state.root, "config", "filter.bad.name.clean", "cat",
+        ], check=True)
+    argv, reason, rule = access_control.parse_service_shell_argv_with_diagnostics(
+        "git status", "repo_review", review_state=repo_review_state,
+    )
+    assert argv is None
+    assert rule is ServiceShellBindingRule.PROFILE_ALLOWLIST
 
 
 def test_repo_review_git_deliberately_excludes_ls_remote() -> None:
@@ -7196,7 +7397,96 @@ def test_repo_review_git_deliberately_excludes_ls_remote() -> None:
     )
 
     assert argv is None
-    assert "contact a remote" in reason
+    assert "network operations" in reason
+
+
+@pytest.mark.parametrize("tool_name", ["shell_exec", "bash_async"])
+@pytest.mark.parametrize("operands", [
+    "/dev/null {outside}", "{outside} /dev/null",
+    "../outside ../outside", "escape escape", "escape-dir/outside escape-dir/outside",
+    "-- /dev/null {outside}", "HEAD -- ../outside", "{outside}",
+    "escape", "../outside", "HEAD HEAD", "-- HEAD",
+])
+def test_repo_review_diff_rejects_outside_operands_at_parser_and_binding(
+    operands: str, tool_name: str, repo_review_state: RepoReviewState,
+) -> None:
+    from mimir.tools import budget_gate
+
+    root = Path(repo_review_state.root)
+    outside = root.parent / "outside"
+    outside.write_text("outside secret\n", encoding="utf-8")
+    (root / "escape").symlink_to(outside)
+    (root / "escape-dir").symlink_to(root.parent, target_is_directory=True)
+    command = "git diff " + operands.format(outside=outside)
+    assert parse_service_shell_argv(
+        command, "repo_review", review_state=repo_review_state,
+    ) is None
+    service = build_trigger_service_principal(
+        canonical="poller:github-activity", trigger="poller", profile="github",
+        tier=CapabilityTier.CODE_EXECUTION,
+        capabilities=(tool_name, "bash_jobs_list", "bash_job_output"), creation_path="test",
+    )
+    auth = _service_auth(service, InformationFlowLabels(), repo_review_state=repo_review_state)
+    bound = budget_gate._request_for_authorized_execution(
+        _tool_request(auth, tool_name=tool_name, args={"command": command}), tool_name, auth,
+    ).tool_call["args"]
+    assert bound["mimir_direct_argv"] == [
+        "/usr/bin/false", "trusted-service shell argv binding failed closed",
+    ]
+
+
+@pytest.mark.parametrize("config_source", ["global", "global-include", "local-include"])
+@pytest.mark.parametrize("command", ["git diff", "git diff --stat", "git diff HEAD"])
+def test_repo_review_diff_neutralizes_effective_filters_in_real_execution(
+    config_source: str, command: str, repo_review_state: RepoReviewState,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from mimir.tools import budget_gate
+
+    root = Path(repo_review_state.root)
+    home = tmp_path / "isolated-home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(home / "xdg"))
+    env = access_control._maintenance_git_probe_env()
+    git = ["git", "-C", str(root), "-c", f"safe.directory={root}"]
+    sample = root / "sample.txt"
+    sample.write_text("before\n", encoding="utf-8")
+    (root / ".gitattributes").write_text("sample.txt filter=hostile\n", encoding="utf-8")
+    subprocess.run([*git, "add", "."], env=env, check=True)
+    subprocess.run([
+        *git, "-c", "user.name=test", "-c", "user.email=test@example.com",
+        "commit", "-qm", "initial",
+    ], env=env, check=True)
+    marker = tmp_path / "filter-fired"
+    config = home / ".gitconfig"
+    if config_source != "global":
+        config = tmp_path / "included-config"
+        scope = "--global" if config_source == "global-include" else "--local"
+        subprocess.run([*git, "config", scope, "include.path", str(config)], env=env, check=True)
+    subprocess.run([
+        *git, "config", "--file", str(config), "filter.hostile.clean",
+        f"touch {shlex.quote(str(marker))}; cat",
+    ], env=env, check=True)
+    sample.write_text("after\n", encoding="utf-8")
+    service = build_trigger_service_principal(
+        canonical="poller:github-activity", trigger="poller", profile="github",
+        tier=CapabilityTier.CODE_EXECUTION,
+        capabilities=("shell_exec", "bash_jobs_list", "bash_job_output"), creation_path="test",
+    )
+    auth = _service_auth(service, InformationFlowLabels(), repo_review_state=repo_review_state)
+    argv = parse_service_shell_argv(command, "repo_review", review_state=repo_review_state)
+    assert argv is not None
+    bound = budget_gate._request_for_authorized_execution(
+        _tool_request(auth, tool_name="shell_exec", args={"command": command}), "shell_exec", auth,
+    ).tool_call["args"]
+    assert bound["mimir_direct_argv"] == argv
+    result = subprocess.run(argv, cwd=tmp_path, env=env, capture_output=True, text=True, check=True)
+    assert "sample.txt" in result.stdout
+    assert not marker.exists()
+    # Positive control: this very configuration and worktree trigger the driver.
+    subprocess.run([*git, "diff"], env=env, capture_output=True, check=True)
+    assert marker.exists()
 
 
 def test_repo_review_git_inspection_suppresses_hostile_repository_helpers(
@@ -7260,20 +7550,6 @@ def test_repo_review_git_inspection_suppresses_hostile_repository_helpers(
     assert marker.exists() is False
 
 
-def test_repo_review_shell_profile_admits_pr_view_repo_alias(
-    maintenance_pinned_executables: dict[str, Path],
-) -> None:
-    state = _review_state("jasoncarreira/mimir", 1220, "worklink/1220", "/tmp")
-    argv = parse_service_shell_argv(
-        "gh pr view 1220 -R jasoncarreira/mimir --json "
-        "number,title,state,isDraft,author,headRefOid,reviews,comments,body,files",
-        "repo_review", review_state=state,
-    )
-
-    assert argv is not None
-    assert argv[0] == str(maintenance_pinned_executables["gh"])
-
-
 @pytest.mark.parametrize(
     "command_template",
     [
@@ -7284,33 +7560,34 @@ def test_repo_review_shell_profile_admits_pr_view_repo_alias(
     ],
 )
 @pytest.mark.parametrize(
-    ("repository_option", "repository", "admitted"),
+    ("repository_option", "repository"),
     [
-        ("--repo {}", "acme/widget", True),
-        ("-R {}", "acme/widget", True),
-        ("--repo={}", "acme/widget", True),
-        ("-R{}", "acme/widget", True),
-        ("--repo {}", "victim/private", False),
-        ("-R {}", "victim/private", False),
-        ("--repo={}", "victim/private", False),
-        ("-R{}", "victim/private", False),
+        ("--repo {}", "acme/widget"),
+        ("-R {}", "acme/widget"),
+        ("--repo={}", "acme/widget"),
+        ("-R{}", "acme/widget"),
+        ("--repo {}", "victim/private"),
+        ("-R {}", "victim/private"),
+        ("--repo={}", "victim/private"),
+        ("-R{}", "victim/private"),
     ],
 )
-def test_repo_review_github_reads_bind_every_repository_alias_to_scope(
+def test_repo_review_github_reads_refuse_every_repository_alias_after_cutover(
     command_template: str,
     repository_option: str,
     repository: str,
-    admitted: bool,
-    maintenance_pinned_executables: dict[str, Path],
+    repo_review_git_root: Path,
 ) -> None:
-    state = _review_state("acme/widget", 5, "worklink/5", "/tmp")
+    state = _review_state("acme/widget", 5, "worklink/5", str(repo_review_git_root))
     command = command_template.format(repository_option.format(repository))
 
-    argv = parse_service_shell_argv(
+    argv, reason, rule = access_control.parse_service_shell_argv_with_diagnostics(
         command, "repo_review", review_state=state,
     )
 
-    assert (argv is not None) is admitted, command
+    assert argv is None, command
+    assert rule is access_control.ServiceShellBindingRule.PROFILE_ALLOWLIST
+    assert "typed pr_* tools" in reason
 
 
 @pytest.mark.parametrize(
@@ -7322,7 +7599,7 @@ def test_repo_review_github_reads_bind_every_repository_alias_to_scope(
         "gh issue view 5 --json body",
     ],
 )
-def test_repo_review_github_reads_require_explicit_repository(
+def test_repo_review_github_reads_refuse_implicit_repository_after_cutover(
     command: str,
     maintenance_pinned_executables: dict[str, Path],
 ) -> None:
@@ -7367,18 +7644,17 @@ def test_gh_repository_operand_rejects_equals_prefixed_short_option_value(
 
 
 @pytest.mark.parametrize(
-    ("path", "admitted"),
+    "path",
     [
-        ("repos/acme/widget/contents/README.md", True),
-        ("repos/acme/widget/pulls/5/reviews", True),
-        ("repos/victim/private/contents/README.md", False),
-        ("user/repos", False),
-        ("orgs/secret-org/members", False),
+        "repos/acme/widget/contents/README.md",
+        "repos/acme/widget/pulls/5/reviews",
+        "repos/victim/private/contents/README.md",
+        "user/repos",
+        "orgs/secret-org/members",
     ],
 )
-def test_repo_review_gh_api_is_bounded_to_scope_repository(
+def test_repo_review_gh_api_refuses_even_bound_repository_reads(
     path: str,
-    admitted: bool,
     maintenance_pinned_executables: dict[str, Path],
 ) -> None:
     state = _review_state("acme/widget", 5, "worklink/5", "/tmp")
@@ -7387,7 +7663,7 @@ def test_repo_review_gh_api_is_bounded_to_scope_repository(
         f"gh api {path} --paginate", "repo_review", review_state=state,
     )
 
-    assert (argv is not None) is admitted
+    assert argv is None
 
 
 @pytest.mark.parametrize(
@@ -7437,85 +7713,6 @@ def test_repo_review_shell_profile_rejects_mutating_gh_api(command: str) -> None
     assert parse_service_shell_argv(command, "repo_review") is None
 
 
-def test_repo_review_profile_admits_bounded_review_and_remediation_surface(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    maintenance_pinned_executables: dict[str, Path],
-) -> None:
-    root = tmp_path / "repo"
-    home = tmp_path / "home"
-    scratch = home / "scratch"
-    root.mkdir()
-    scratch.mkdir(parents=True)
-    subprocess.run(["git", "init", "-q", str(root)], check=True)
-    monkeypatch.setenv("MIMIR_HOME", str(home))
-    monkeypatch.setenv("MIMIR_FILE_TOOL_ROOTS", f"{root}:rw")
-    monkeypatch.setenv("GITHUB_REPOS", "o/r")
-    monkeypatch.setenv("MIMIR_GITHUB_SELF_LOGIN", "mimir-bot")
-    message_file = scratch / "commit-message.txt"
-    message_file.write_text("Address review feedback\n", encoding="utf-8")
-    state = _review_state("o/r", 1243, "issue/1028-a1", str(root.resolve()))
-    state.mark_checked_out()
-    service = build_trigger_service_principal(
-        canonical="poller:github-activity", trigger="poller", profile="github",
-        tier=CapabilityTier.CODE_EXECUTION,
-        capabilities=("shell_exec", "bash_jobs_list", "bash_job_output"),
-        creation_path="test",
-    )
-    auth = replace(
-        _service_auth(service, InformationFlowLabels()), repo_review_state=state,
-    )
-    registry = ToolRegistry()
-    worktree = root / "review-worktree"
-    admitted = (
-        "gh api repos/o/r/pulls/1243/reviews --paginate",
-        "gh issue view 1028 --repo o/r --json number,title --comments",
-        "gh auth status",
-        "git log --oneline -5 -- mimir/access_control.py",
-        "git rev-parse HEAD",
-        "git remote -v",
-        "git branch --list issue/1028-a1",
-        "git worktree list --porcelain",
-        "git add mimir/access_control.py tests/test_access_control.py",
-        "git commit -m 'Address review feedback'",
-        f"git commit --file {message_file}",
-        "git checkout issue/1028-a1",
-        "git checkout -B issue/1028-a1",
-        f"git worktree add {worktree} issue/1028-a1",
-        "git pull --ff-only origin issue/1028-a1",
-        "gh pr checkout 1243 --repo o/r --branch issue/1028-a1",
-        "git push --dry-run origin FETCH_HEAD:refs/heads/issue/1028-a1",
-    )
-
-    for command in admitted:
-        decision = registry.authorize_tool(
-            "shell_exec", auth, enforce=True, target_channel=command,
-        )
-        assert decision.allowed is True, (command, decision.refusal_detail)
-
-    for command in (
-        "gh api user/repos --paginate",
-        "gh api orgs/secret-org/members",
-    ):
-        decision = registry.authorize_tool(
-            "shell_exec", auth, enforce=True, target_channel=command,
-        )
-        assert decision.allowed is False, command
-
-    commit_argv = parse_service_shell_argv(
-        "git commit -m safe", "repo_review", review_state=state,
-    )
-    assert commit_argv is not None
-    name_index = commit_argv.index("user.name=mimir")
-    email_index = commit_argv.index("user.email=noreply@mimir-agent.local")
-    assert commit_argv[name_index - 1:name_index + 1] == [
-        "-c", "user.name=mimir",
-    ]
-    assert commit_argv[email_index - 1:email_index + 1] == [
-        "-c", "user.email=noreply@mimir-agent.local",
-    ]
-
-
 @pytest.mark.parametrize(
     "command",
     [
@@ -7554,55 +7751,9 @@ def test_repo_review_profile_denies_privilege_widening_forms(
     monkeypatch.setenv("MIMIR_HOME", str(home))
     monkeypatch.setenv("MIMIR_FILE_TOOL_ROOTS", f"{root}:rw")
     state = _review_state("o/r", 1243, "issue/1028-a1", str(root.resolve()))
-    state.mark_checked_out()
 
     assert parse_service_shell_argv(
         command, "repo_review", review_state=state,
-    ) is None
-
-
-def test_repo_review_worktree_write_stays_inside_configured_repo_roots(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    maintenance_pinned_executables: dict[str, Path],
-) -> None:
-    root = tmp_path / "repo"
-    outside = tmp_path / "outside"
-    home = tmp_path / "home"
-    root.mkdir()
-    outside.mkdir()
-    home.mkdir()
-    subprocess.run(["git", "init", "-q", str(root)], check=True)
-    monkeypatch.setenv("MIMIR_HOME", str(home))
-    monkeypatch.setenv("MIMIR_FILE_TOOL_ROOTS", f"{root}:rw")
-    state = _review_state("o/r", 1243, "fix/1243", str(root.resolve()))
-
-    assert parse_service_shell_argv(
-        f"git worktree add {outside / 'worktree'} fix/1243",
-        "repo_review", review_state=state,
-    ) is None
-
-
-def test_repo_review_push_never_treats_protected_event_branch_as_owned(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    maintenance_pinned_executables: dict[str, Path],
-) -> None:
-    root = tmp_path / "repo"
-    home = tmp_path / "home"
-    root.mkdir()
-    home.mkdir()
-    subprocess.run(["git", "init", "-q", str(root)], check=True)
-    monkeypatch.setenv("MIMIR_HOME", str(home))
-    monkeypatch.setenv("MIMIR_FILE_TOOL_ROOTS", f"{root}:rw")
-    state = _review_state("o/r", 1243, "main", str(root.resolve()))
-    state.mark_checked_out()
-
-    assert parse_service_shell_argv(
-        "git push origin main:main", "repo_review", review_state=state,
-    ) is None
-    assert parse_service_shell_argv(
-        "git push origin main:refs/heads/main", "repo_review", review_state=state,
     ) is None
 
 
@@ -7622,238 +7773,6 @@ def test_repo_review_additions_do_not_widen_other_profiles(
     profile: str, command: str,
 ) -> None:
     assert parse_service_shell_argv(command, profile) is None
-
-
-def test_repo_review_branch_mutations_are_exact_and_checkout_bounded(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    maintenance_pinned_executables: dict[str, Path],
-) -> None:
-    root = tmp_path / "repo"
-    home = tmp_path / "home"
-    root.mkdir()
-    home.mkdir()
-    subprocess.run(["git", "init", "-q", str(root)], check=True)
-    monkeypatch.setenv("MIMIR_HOME", str(home))
-    monkeypatch.setenv("MIMIR_FILE_TOOL_ROOTS", f"{root}:rw")
-    state = _review_state("o/r", 979, "worklink/979", str(root.resolve()))
-    service = build_trigger_service_principal(
-        canonical="poller:github-activity",
-        trigger="poller",
-        profile="github",
-        tier=CapabilityTier.CODE_EXECUTION,
-        capabilities=("shell_exec", "bash_jobs_list", "bash_job_output"),
-        creation_path="test",
-    )
-    auth = replace(
-        _service_auth(service, InformationFlowLabels()),
-        repo_review_state=state,
-    )
-    registry = ToolRegistry()
-
-    checkout_commands = (
-        "gh pr checkout 979 --repo o/r --branch worklink/979",
-        f"git -C {root} checkout worklink/979",
-    )
-    for command in (
-        f"git -C {root} status",
-        f"git -C {root} status --short --branch",
-        f"git -C {root} status --porcelain=v2 --untracked-files=normal",
-    ):
-        assert registry.authorize_tool(
-            "shell_exec", auth, enforce=True, target_channel=command,
-        ).allowed is True
-    for command in checkout_commands:
-        assert registry.authorize_tool(
-            "shell_exec", auth, enforce=True, target_channel=command,
-        ).allowed is True
-
-    push = f"git -C {root} push origin worklink/979:worklink/979"
-    assert registry.authorize_tool(
-        "shell_exec", auth, enforce=True, target_channel=push,
-    ).allowed is False
-
-    state.mark_checked_out()
-    for command in (
-        f"git -C {root} add --all",
-        f"git -C {root} commit -m 'Address review feedback'",
-        push,
-    ):
-        decision = registry.authorize_tool(
-            "shell_exec", auth, enforce=True, target_channel=command,
-        )
-        assert decision.allowed is True, (command, decision.refusal_detail)
-
-    for command in (
-        f"git -C {root} push --force origin worklink/979:worklink/979",
-        f"git -C {root} push origin worklink/979:main",
-        f"git -C {root} push origin main:main",
-        f"git -C {root} push --delete origin worklink/979",
-        f"git -C {root} push --mirror origin",
-        f"git -C {root} checkout main",
-        f"git -C {root} reset --hard HEAD~1",
-        f"git -C {root} rebase main",
-        f"git -C {root} config credential.helper store",
-        f"git -C {tmp_path} push origin worklink/979:worklink/979",
-        f"git -C {root} status --verbose",
-        f"git -C {root} status --porcelain evil",
-        "gh pr checkout 979 --repo attacker/other --branch worklink/979",
-        "gh pr checkout 979 --repo o/r --branch main",
-    ):
-        assert registry.authorize_tool(
-            "shell_exec", auth, enforce=True, target_channel=command,
-        ).allowed is False, command
-
-
-def test_repo_review_git_argv_requires_the_mapped_scope_action(
-    tmp_path: Path,
-    maintenance_pinned_executables: dict[str, Path],
-) -> None:
-    subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)
-    state = _review_state("o/r", 979, "worklink/979", str(tmp_path.resolve()))
-    without_push = replace(
-        state.action_scope,
-        allowed_operations=state.action_scope.allowed_operations
-        - {access_control.RepoPRAction.PUSH.value},
-    )
-    restricted = RepoReviewState(without_push)
-    restricted.mark_checked_out()
-
-    assert parse_service_shell_argv(
-        f"git -C {tmp_path} push origin worklink/979:worklink/979",
-        "repo_review",
-        review_state=restricted,
-    ) is None
-    assert parse_service_shell_argv(
-        f"git -C {tmp_path} status",
-        "repo_review",
-        review_state=restricted,
-    ) is not None
-
-
-def test_repo_review_metadata_writes_are_bound_to_event_repo_and_pr(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    maintenance_pinned_executables: dict[str, Path],
-) -> None:
-    home = tmp_path / "home"
-    scratch = home / "scratch"
-    scratch.mkdir(parents=True)
-    body_file = scratch / "pr-update.md"
-    body_file.write_text("updated evidence")
-    monkeypatch.setenv("MIMIR_HOME", str(home))
-    state = _review_state("o/r", 979, "worklink/979", str(tmp_path))
-
-    edit = parse_service_shell_argv(
-        f"gh pr edit 979 --repo o/r --body-file {body_file} "
-        "--add-reviewer jasoncarreira",
-        "repo_review",
-        review_state=state,
-    )
-    comment = parse_service_shell_argv(
-        f"gh pr comment 979 --repo o/r --body-file {body_file}",
-        "repo_review",
-        review_state=state,
-    )
-
-    assert edit == [
-        str(maintenance_pinned_executables["gh"]),
-        "pr", "edit", "979", "--repo", "o/r", "--body", "updated evidence",
-        "--add-reviewer", "jasoncarreira",
-    ]
-    assert comment == [
-        str(maintenance_pinned_executables["gh"]),
-        "pr", "comment", "979", "--repo", "o/r", "--body", "updated evidence",
-    ]
-
-    without_rerequest = replace(
-        state.action_scope,
-        allowed_operations=state.action_scope.allowed_operations
-        - {access_control.RepoPRAction.PR_REREQUEST.value},
-    )
-    assert parse_service_shell_argv(
-        f"gh pr edit 979 --repo o/r --body-file {body_file} "
-        "--add-reviewer jasoncarreira",
-        "repo_review",
-        review_state=RepoReviewState(without_rerequest),
-    ) is None
-    assert parse_service_shell_argv(
-        f"gh pr comment 979 --repo o/r --body-file {body_file}",
-        "repo_review",
-        review_state=RepoReviewState(without_rerequest),
-    ) is not None
-
-    for command in (
-        f"gh pr edit 978 --repo o/r --body-file {body_file} --add-reviewer jasoncarreira",
-        f"gh pr edit 979 --repo attacker/other --body-file {body_file} --add-reviewer jasoncarreira",
-        f"gh pr edit 979 --repo o/r --body-file {body_file}",
-        "gh pr edit 979 --repo o/r --body injected --add-reviewer jasoncarreira",
-        f"gh pr comment 978 --repo o/r --body-file {body_file}",
-        f"gh pr comment 979 --repo attacker/other --body-file {body_file}",
-        "gh pr comment 979 --repo o/r --body injected",
-    ):
-        assert parse_service_shell_argv(
-            command, "repo_review", review_state=state,
-        ) is None, command
-
-
-def test_repo_review_push_is_still_gated_by_untrusted_active_ingest(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    maintenance_pinned_executables: dict[str, Path],
-) -> None:
-    root = tmp_path / "repo"
-    home = tmp_path / "home"
-    root.mkdir()
-    home.mkdir()
-    subprocess.run(["git", "init", "-q", str(root)], check=True)
-    monkeypatch.setenv("MIMIR_HOME", str(home))
-    monkeypatch.setenv("MIMIR_FILE_TOOL_ROOTS", f"{root}:rw")
-    state = _review_state("o/r", 7, "worklink/7", str(root.resolve()))
-    state.mark_checked_out()
-    service = build_trigger_service_principal(
-        canonical="poller:github-activity", trigger="poller", profile="github",
-        tier=CapabilityTier.CODE_EXECUTION,
-        capabilities=("shell_exec", "bash_jobs_list", "bash_job_output"),
-        creation_path="test",
-    )
-    source = SourceLabel(
-        principal="service:poller:github-activity", domain="channel",
-        resource_id="poller:test", bridge_instance="poller",
-        sensitivity="internal",
-        authorized_principals=frozenset({"service:poller:github-activity"}),
-        source_kind="service", integrity="trusted", integrity_effect="active_ingest",
-    )
-    trusted = InformationFlowLabels().with_channel("poller:test").with_source(source)
-    tainted = InformationFlowLabels().with_channel("poller:test").with_source(
-        replace(source, integrity="untrusted")
-    )
-    command = f"git -C {root} push origin worklink/7:worklink/7"
-
-    allowed = ToolRegistry().authorize_tool(
-        "shell_exec",
-        replace(
-            _service_auth(service, trusted), repo_review_state=state,
-            ifc_state=InformationFlowState(labels=trusted),
-        ),
-        enforce=True,
-        target_channel=command,
-        ifc_labels=trusted,
-    )
-    blocked = ToolRegistry().authorize_tool(
-        "shell_exec",
-        replace(
-            _service_auth(service, tainted), repo_review_state=state,
-            ifc_state=InformationFlowState(labels=tainted),
-        ),
-        enforce=True,
-        target_channel=command,
-        ifc_labels=tainted,
-    )
-
-    assert allowed.allowed is True
-    assert blocked.allowed is False
-    assert blocked.reason == "ifc_label_blocked:shell_process"
 
 
 def test_repo_test_admits_self_trigger_only_and_refuses_monotonic_taint(
@@ -7950,7 +7869,7 @@ def test_repo_test_admits_self_trigger_only_and_refuses_monotonic_taint(
 
 
 @pytest.mark.asyncio
-async def test_repo_review_successful_checkout_unlocks_same_branch_push(
+async def test_repo_review_shell_checkout_cannot_unlock_same_branch_push(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     maintenance_pinned_executables: dict[str, Path],
@@ -8001,18 +7920,21 @@ async def test_repo_review_successful_checkout_unlocks_same_branch_push(
         ),
         handler,
     )
-    assert checkout.status != "error"
+    assert checkout.status == "error"
+    assert state.checked_out is False
+    checkout_root = _attach_test_checkout_lease(state, tmp_path / "leases", "pr-12")
     assert state.checked_out is True
 
     pushed = await middleware.awrap_tool_call(
         _tool_request(
             auth, tool_name="shell_exec",
-            args={"command": f"git -C {root} push origin worklink/12:worklink/12"},
+            args={"command": f"git -C {checkout_root} push origin worklink/12:worklink/12"},
         ),
         handler,
     )
-    assert pushed.status != "error"
-    assert seen[-1][-3:] == ["push", "origin", "worklink/12:worklink/12"]
+    assert pushed.status == "error"
+    assert seen == []
+    assert "typed repo_* tools" in str(pushed.content)
 
 
 def test_github_poller_binds_review_scope_from_server_event_and_origin(
@@ -9053,7 +8975,9 @@ def test_batched_pr_reads_resolve_each_exact_checkout_lease(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("selector", ["git-c", "restrictive-options", "cwd"])
 async def test_batched_pr_shell_commands_bind_each_exact_checkout_lease(
+    selector: str,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     maintenance_pinned_executables: dict[str, Path],
@@ -9095,10 +9019,14 @@ async def test_batched_pr_shell_commands_bind_each_exact_checkout_lease(
 
     middleware = BudgetGateMiddleware()
     for checkout in checkouts:
-        command = f"git -C {checkout} status"
+        arguments = {
+            "git-c": {"command": f"git -C {checkout} status"},
+            "restrictive-options": {"command": f"git --no-ext-diff --no-pager -C {checkout} status"},
+            "cwd": {"command": "git status", "cwd": str(checkout)},
+        }[selector]
         call_auth = replace(auth, ifc_state=InformationFlowState())
         result = await middleware.awrap_tool_call(
-            _tool_request(call_auth, args={"command": command}),
+            _tool_request(call_auth, args=arguments),
             handler,
         )
         assert result.status != "error"
@@ -9109,6 +9037,7 @@ async def test_batched_pr_shell_commands_bind_each_exact_checkout_lease(
     )
 
     assert [argv[-1] for argv in seen] == ["status", "status"]
+    assert [argv[1:3] for argv in seen] == [["-C", str(path)] for path in checkouts]
     assert refused.status == "error"
     assert "no matching checkout lease was found" in str(refused.content)
 
@@ -9155,13 +9084,8 @@ def test_service_shell_non_repository_refusal_ignores_review_state_count(
         assert "private-value" not in refusal
         assert "private-option" not in refusal
         assert "private-operand" not in refusal
-        if command.endswith(" --help"):
-            assert "Options sent: --help." in refusal
-        if command.endswith(" -h"):
-            assert "Options sent: -h." in refusal
-        if "chainlink" in command:
-            assert "chainlink issue show <id> --json" in refusal
-            assert "chainlink issue list --json" in refusal
+        assert "generic commands" in refusal
+        assert "typed repo_* tools" in refusal
         refusals.append(refusal)
         labels = _chainlink_ifc_labels(tainted=True)
         tainted = replace(auth, ifc_state=InformationFlowState(labels=labels))
@@ -9183,7 +9107,7 @@ def test_service_shell_non_repository_refusal_ignores_review_state_count(
     assert "binding_rule=repository_review_state" in refusal
     assert (
         "several checkout leases are active; name the checkout with "
-        "`git -C <lease path>` or the pull request number"
+        "`git -C <lease path>` or an explicit cwd"
     ) in refusal
     assert "no matching checkout lease" not in refusal
     for executable in ("git", "gh"):
@@ -9202,6 +9126,36 @@ def test_service_shell_non_repository_refusal_ignores_review_state_count(
         )
         assert state is None
         assert reason is not None and "several checkout leases" in reason
+
+
+def test_repo_review_gh_pr_number_cannot_select_a_batched_shell_state(
+    tmp_path: Path,
+) -> None:
+    from mimir.tools import budget_gate
+
+    states = tuple(_review_state("o/r", number, f"worklink/{number}", str(tmp_path)) for number in (7, 8))
+    service = build_trigger_service_principal(
+        canonical="poller:github-activity", trigger="poller", profile="github",
+        tier=CapabilityTier.CODE_EXECUTION,
+        capabilities=("shell_exec", "bash_jobs_list", "bash_job_output"), creation_path="test",
+    )
+    auth = replace(
+        _service_auth(service, InformationFlowLabels()),
+        repo_pr_scope_registry=RepoPRScopeRegistry(states),
+    )
+    for command in ("gh pr view 7 --repo o/r", "gh issue view 7 --repo o/r"):
+        state, reason = access_control.resolve_repository_review_state(auth, command=command)
+        assert state is None
+        assert "several checkout leases" in reason
+        bound = budget_gate._request_for_authorized_execution(
+            _tool_request(auth, args={"command": command}), "shell_exec", auth,
+        ).tool_call["args"]
+        assert bound["mimir_direct_argv"] == [
+            "/usr/bin/false", "trusted-service shell argv binding failed closed",
+        ]
+        assert "binding_rule=repository_review_state" in bound["mimir_shell_refusal"]
+    single = replace(auth, repo_pr_scope_registry=RepoPRScopeRegistry(states[:1]))
+    assert access_control.resolve_repository_review_state(single, command="git status") == (states[0], None)
 
 
 def test_poller_scope_drops_conflicting_snapshots_for_same_pr(
@@ -9472,10 +9426,7 @@ def test_every_service_shell_profile_returns_absolute_executables(
             "git status --short",
         ),
         "repo_review": (
-            "pwd -P", "ls -la", "wc -l sample.txt", "grep -n needle sample.txt",
-            "jq -r .name sample.json", "rg --no-config -n needle .",
-            "git status --short", "gh pr view 979 --repo owner/repo --json title",
-            "npm ci --ignore-scripts",
+            "git status --short", "git log --oneline", "git diff --stat",
         ),
         "maintenance": (
             "pwd -P", "ls -la", "wc -l sample.txt", "grep -n needle sample.txt",
@@ -9684,19 +9635,6 @@ def test_upgrade_workspace_git_is_proposal_scoped_and_read_only(
             assert "one argv" in reason
 
 
-def test_repo_review_npm_uses_pinned_interpreter_and_script(
-    maintenance_pinned_executables: dict[str, Path],
-) -> None:
-    assert parse_service_shell_argv(
-        "npm ci --ignore-scripts", "repo_review",
-    ) == [
-        str(maintenance_pinned_executables["node"]),
-        str(maintenance_pinned_executables["npm"]),
-        "ci",
-        "--ignore-scripts",
-    ]
-
-
 def _configure_project_test(
     monkeypatch: pytest.MonkeyPatch,
     *,
@@ -9725,7 +9663,7 @@ def _configure_project_test(
     ids=["python", "javascript", "go-or-rust"],
 )
 @pytest.mark.parametrize(
-    "profile", ["scheduler_read_only", "repo_review", "maintenance", "upgrade_workspace"],
+    "profile", ["scheduler_read_only", "maintenance", "upgrade_workspace"],
 )
 def test_project_test_command_is_configuration_driven_across_profiles(
     pin: str,
@@ -9803,6 +9741,75 @@ def test_operator_arm2_profile_selection_and_coverage_are_documented() -> None:
     assert "approximately **60/293** commands" in design
     assert "31 `chainlink issue show ...` queries and 29 `git status --short` calls" in design
     assert "ceiling, not guaranteed runtime coverage" in design
+
+
+@pytest.mark.parametrize("pin,fixed_arguments", [
+    ("uv", ["run", "pytest", "-q"]), ("npm", ["test", "--"]), ("git", ["test"]),
+])
+def test_repo_review_project_test_override_cannot_bypass_typed_cutover(
+    pin: str, fixed_arguments: list[str], repo_review_state: RepoReviewState,
+    monkeypatch: pytest.MonkeyPatch, maintenance_pinned_executables: dict[str, Path],
+) -> None:
+    from mimir.tools import budget_gate
+
+    executable = maintenance_pinned_executables[pin]
+    _configure_project_test(
+        monkeypatch, executable=executable, repo=Path(repo_review_state.root),
+        fixed_arguments=fixed_arguments,
+    )
+    command = shlex.join([str(executable), *fixed_arguments, "tests/auth"])
+    assert parse_service_shell_argv(command, "maintenance") == [
+        str(executable), *fixed_arguments, "tests/auth",
+    ]
+    service = build_trigger_service_principal(
+        canonical="poller:github-activity", trigger="poller", profile="github",
+        tier=CapabilityTier.CODE_EXECUTION,
+        capabilities=("shell_exec", "bash_jobs_list", "bash_job_output"), creation_path="test",
+    )
+    auth = _service_auth(service, InformationFlowLabels(), repo_review_state=repo_review_state)
+    decision = ToolRegistry().authorize_tool("shell_exec", auth, enforce=True, target_channel=command)
+    assert not decision.allowed
+    assert "typed repo_* tools" in decision.refusal_detail
+    bound = budget_gate._request_for_authorized_execution(
+        _tool_request(auth, args={"command": command}), "shell_exec", auth,
+    ).tool_call["args"]
+    assert bound["mimir_direct_argv"] == [
+        "/usr/bin/false", "trusted-service shell argv binding failed closed",
+    ]
+    assert "binding_rule=profile_allowlist" in bound["mimir_shell_refusal"]
+
+
+@pytest.mark.parametrize("override", ["declared", "project-test"])
+def test_repo_review_inspection_cannot_be_rebound_by_generic_overrides(
+    override: str, repo_review_state: RepoReviewState,
+    maintenance_pinned_executables: dict[str, Path], monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    declared = ()
+    if override == "declared":
+        declared = access_control.parse_declared_shell_commands([{
+            "exec": "git", "path": str(maintenance_pinned_executables["ls"]),
+            "subcommands": [["status"]],
+        }], writable_roots=())
+        assert parse_service_shell_argv("git status", "maintenance", declared=declared) == [
+            str(maintenance_pinned_executables["ls"]), "status",
+        ]
+    else:
+        # Project prefixes resolve the executable as a path, not through PATH.
+        monkeypatch.chdir(maintenance_pinned_executables["git"].parent)
+        _configure_project_test(
+            monkeypatch, executable=maintenance_pinned_executables["git"],
+            repo=Path(repo_review_state.root), fixed_arguments=["status"],
+        )
+        assert parse_service_shell_argv("git status", "maintenance") == [
+            str(maintenance_pinned_executables["git"]), "status",
+        ]
+    argv = parse_service_shell_argv(
+        "git status", "repo_review", review_state=repo_review_state, declared=declared,
+    )
+    assert argv is not None
+    assert argv[:3] == [str(maintenance_pinned_executables["git"]), "-C", repo_review_state.root]
+    assert "credential.helper=" in argv
+    assert "protocol.allow=never" in argv
 
 
 def test_operator_arm2_excludes_configured_project_tests_without_changing_service_profiles(
@@ -11184,206 +11191,51 @@ def test_every_production_service_shell_pin_targets_outside_write_roots(
             assert access_control._maintenance_resolved_pin(command) == expected
 
 
-def test_repo_review_profile_admits_pr_review_with_scratch_body_file(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    maintenance_pinned_executables: dict[str, Path],
-) -> None:
-    """The poller must be able to POST a review, not just read a PR.
-
-    When ``repo_review`` first went live it admitted ``gh pr view``/``diff`` but
-    not ``review``, so the github poller reached a verdict on a PR and had no
-    way to submit it — it reported every command "exiting 1 with empty output"
-    (``/usr/bin/false`` from the fail-closed argv bind) and messaged the
-    operator instead.
-
-    ``--body-file`` is required rather than optional: a review body is
-    multi-line and ``\n`` is a shell control character, so a multi-line
-    ``--body`` can never be admitted. The file path is therefore an egress
-    surface and is confined to the scratch root.
-    """
-    home = tmp_path / "home"
-    scratch = home / "scratch"
-    scratch.mkdir(parents=True)
-    (home / "secret.txt").write_text("SECRET", encoding="utf-8")
-    monkeypatch.setenv("MIMIR_HOME", str(home))
-    monkeypatch.delenv("MIMIR_FILE_TOOL_ROOTS", raising=False)
-    state = _review_state("o/r", 7, "worklink/7", str(tmp_path))
-
-    def admitted(command: str) -> bool:
-        return parse_service_shell_argv(
-            command, "repo_review", review_state=state,
-        ) is not None
-
-    # The body is CAPTURED during authorization (see the check/use-race test
-    # below), so it must already exist and be readable — a not-yet-written body
-    # file is refused rather than admitted on the strength of its path alone.
-    (scratch / "review.md").write_text("## Summary\nbody\n", encoding="utf-8")
-    (scratch / "r.md").write_text("ok\n", encoding="utf-8")
-    assert not admitted(
-        f"gh pr review 7 --repo o/r --approve --body-file {scratch}/absent.md"
-    )
-
-    # Posting a review is admitted, in each verdict shape.
-    for verdict in ("--request-changes", "--approve", "--comment"):
-        assert admitted(
-            f"gh pr review 7 --repo o/r {verdict} --body-file {scratch}/review.md"
-        ), verdict
-    assert admitted("gh pr review 7 --repo o/r --approve --body ok")
-    # Reading still works (regression guard on the pre-existing entries).
-    assert admitted("gh pr view 7 --repo o/r --json number")
-
-    # The body file may not leave scratch — plainly, lexically, or by symlink.
-    assert not admitted(
-        f"gh pr review 7 --repo o/r --approve --body-file {home}/secret.txt"
-    )
-    assert not admitted(
-        f"gh pr review 7 --repo o/r --approve --body-file {scratch}/../secret.txt"
-    )
-    escape = scratch / "escape.md"
-    escape.symlink_to(home / "secret.txt")  # exists, but points outside scratch
-    assert not admitted(
-        f"gh pr review 7 --repo o/r --approve --body-file {escape}"
-    )
-    # A dangling option value must not be treated as absent.
-    assert not admitted("gh pr review 7 --repo o/r --approve --body-file")
-    # Neither newlines nor substitution may reach argv.
-    assert not admitted('gh pr review 7 --repo o/r --approve --body "a\nb"')
-    assert not admitted(
-        'gh pr review 7 --repo o/r --approve --body "$(cat /etc/passwd)"'
-    )
-    # Still no state-changing gh beyond review.
-    assert not admitted("gh pr merge 7 --repo o/r --squash")
-
-
-def test_repo_review_body_is_captured_not_re_looked_up(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    maintenance_pinned_executables: dict[str, Path],
-) -> None:
-    """A review body must survive authorization as CONTENT, never as a path.
-
-    Validating a pathname and then handing the same pathname to ``gh`` is a
-    check/use race (mimir-carreira on #1221): any service-writable process can
-    swap the accepted file — or a parent component — for a symlink pointing
-    outside scratch between the check and ``gh``'s open, publishing arbitrary
-    readable content as a PR review.
-
-    The authorized argv therefore carries the captured body inline and no
-    ``--body-file`` at all, so a post-authorization swap has nothing to act on.
-    """
-    home = tmp_path / "home"
-    scratch = home / "scratch"
-    scratch.mkdir(parents=True)
-    (home / "secret.txt").write_text("TOP SECRET", encoding="utf-8")
-    monkeypatch.setenv("MIMIR_HOME", str(home))
-    monkeypatch.delenv("MIMIR_FILE_TOOL_ROOTS", raising=False)
-
-    body = scratch / "review.md"
-    body.write_text("## Summary\nsecond line\n", encoding="utf-8")
-    state = _review_state("o/r", 7, "worklink/7", str(tmp_path))
-    argv = parse_service_shell_argv(
-        f"gh pr review 7 --repo o/r --request-changes --body-file {body}",
-        "repo_review",
-        review_state=state,
-    )
-
-    assert argv is not None
-    # The pathname does not survive: nothing for gh to look up again.
-    assert "--body-file" not in argv
-    assert str(body) not in argv
-    # Multiline content is inlined verbatim — safe because no shell reparses an
-    # argv list, which is why the control-character rule does not apply here.
-    assert argv[argv.index("--body") + 1] == "## Summary\nsecond line\n"
-
-    # THE RACE: swap the accepted file for a symlink out of scratch, as a
-    # concurrent writer would, then confirm the already-authorized argv is
-    # unaffected and the secret is nowhere in it.
-    body.unlink()
-    body.symlink_to(home / "secret.txt")
-    assert argv[argv.index("--body") + 1] == "## Summary\nsecond line\n"
-    assert not any("TOP SECRET" in part for part in argv)
-
-    # And a body that is ALREADY an outside-pointing symlink is refused outright.
-    assert parse_service_shell_argv(
-        f"gh pr review 7 --repo o/r --approve --body-file {body}", "repo_review",
-        review_state=state,
-    ) is None
-
-    # A swapped PARENT component is refused too (O_NOFOLLOW on each element).
-    nested = scratch / "d" / "b.md"
-    nested.parent.mkdir()
-    nested.write_text("fine", encoding="utf-8")
-    assert parse_service_shell_argv(
-        f"gh pr review 7 --repo o/r --approve --body-file {nested}", "repo_review",
-        review_state=state,
-    ) is not None
-    shutil.rmtree(scratch / "d")
-    (scratch / "d").symlink_to(home)
-    assert parse_service_shell_argv(
-        f"gh pr review 7 --repo o/r --approve --body-file {scratch}/d/secret.txt",
-        "repo_review",
-        review_state=state,
-    ) is None
-
-    # An oversize body is refused rather than silently truncated into a review.
-    big = scratch / "big.md"
-    big.write_text("x" * (access_control._REVIEW_BODY_MAX_BYTES + 1), encoding="utf-8")
-    assert parse_service_shell_argv(
-        f"gh pr review 7 --repo o/r --approve --body-file {big}", "repo_review",
-        review_state=state,
-    ) is None
-
-
 def test_service_shell_pin_inside_configured_write_root_fails_closed(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
+    repo_review_state: RepoReviewState,
 ) -> None:
     home = tmp_path / "home"
     repo = tmp_path / "repo"
-    planted = repo / ".venv" / "bin" / "npm"
+    planted = repo / ".venv" / "bin" / "git"
     home.mkdir()
     planted.parent.mkdir(parents=True)
     planted.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
     planted.chmod(0o755)
     monkeypatch.setenv("MIMIR_HOME", str(home))
     monkeypatch.setenv("MIMIR_FILE_TOOL_ROOTS", f"{repo}:rw")
-    monkeypatch.setitem(access_control._MAINTENANCE_PINNED_EXECUTABLES, "npm", planted)
+    assert parse_service_shell_argv("git status", "repo_review", review_state=repo_review_state)
+    monkeypatch.setitem(access_control._MAINTENANCE_PINNED_EXECUTABLES, "git", planted)
 
     with caplog.at_level("ERROR", logger="mimir.access_control"):
-        assert parse_service_shell_argv("npm ci --ignore-scripts", "repo_review") is None
+        assert parse_service_shell_argv(
+            "git status", "repo_review", review_state=repo_review_state,
+        ) is None
 
     assert "pin resolves within a configured service-writable root" in caplog.text
 
 
-def test_pinned_script_without_pinned_interpreter_fails_closed(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.delitem(access_control._MAINTENANCE_PINNED_EXECUTABLES, "node")
-
-    assert parse_service_shell_argv(
-        "npm ci --ignore-scripts", "repo_review",
-    ) is None
-
-
 def test_admitted_service_shell_command_without_pin_fails_closed(
     monkeypatch: pytest.MonkeyPatch,
+    repo_review_state: RepoReviewState,
 ) -> None:
+    assert parse_service_shell_argv("git status", "repo_review", review_state=repo_review_state)
     captured: list[tuple[str, dict[str, object]]] = []
     monkeypatch.setattr(
         "mimir.tools.budget_gate._emit_event_sync",
         lambda kind, **fields: captured.append((kind, fields)),
     )
-    monkeypatch.delitem(access_control._MAINTENANCE_PINNED_EXECUTABLES, "npm")
+    monkeypatch.delitem(access_control._MAINTENANCE_PINNED_EXECUTABLES, "git")
 
     assert parse_service_shell_argv(
-        "npm ci --ignore-scripts", "repo_review",
+        "git status", "repo_review", review_state=repo_review_state,
     ) is None
     hard = next(fields for kind, fields in captured if kind == "hard_boundary_denied")
     assert hard["boundary"] == "maintenance_pinned_executable"
     assert hard["reason"] == "maintenance_executable_pin_missing"
-    assert hard["target"] == "npm"
+    assert hard["target"] == "git"
 
 
 @pytest.mark.parametrize(
@@ -11556,7 +11408,6 @@ def test_maintenance_github_repository_operands_are_configured(
     [
         ("scheduler_read_only", "scheduler:test", "scheduled_tick", "custom"),
         ("maintenance", "heartbeat", "scheduled_tick", "heartbeat"),
-        ("repo_review", "poller:github-activity", "poller", "github"),
     ],
 )
 def test_service_shell_profiles_refuse_credential_file_operands(
@@ -11751,7 +11602,7 @@ def test_service_shell_operandless_ls_keeps_explicit_operand_compatibility(
     [
         ("custom", "grep -n needle -- {path}"),
         ("heartbeat", "head -n 1 -- {path}"),
-        ("github", "rg --no-config -g '*.txt' needle -- {path}"),
+        ("custom", "rg --no-config -g '*.txt' needle -- {path}"),
     ],
 )
 def test_service_shell_profiles_keep_legitimate_scoped_reads(
@@ -11970,7 +11821,7 @@ def test_maintenance_shell_returns_pinned_execution_argv(
     assert Path(argv[0]).is_absolute()
 
 
-@pytest.mark.parametrize("profile", ["scheduler_read_only", "maintenance", "repo_review"])
+@pytest.mark.parametrize("profile", ["scheduler_read_only", "maintenance"])
 @pytest.mark.parametrize(
     "command",
     [
@@ -12013,7 +11864,6 @@ def test_trusted_service_profiles_admit_bounded_chainlink_surface(
 
 _CHAINLINK_SERVICE_PROFILES = (
     ("maintenance", "heartbeat"),
-    ("repo_review", "github"),
     ("scheduler_read_only", "custom"),
     ("upgrade_workspace", "upgrade"),
 )
@@ -13032,7 +12882,7 @@ def test_no_service_shell_profile_admits_a_caller_supplied_jq_filter(
         "jq -r '$ENV|tostring' sample.json",
     )
     for command in bare_jq_commands:
-        for profile in profiles:
+        for profile in ("scheduler_read_only", "maintenance", "upgrade_workspace"):
             argv = parse_service_shell_argv(command, profile)
             assert argv is not None, (profile, command)
             assert Path(argv[0]).name == "jq", (profile, command, argv)
@@ -13070,7 +12920,7 @@ def test_no_service_shell_profile_admits_a_caller_supplied_jq_filter(
     # ...while the display vocabulary keeps it, so a refusal can still name the
     # option the caller should drop.
     _, reason = access_control.parse_service_shell_argv_with_reason(
-        "gh pr view 1 --repo o/r --json reviews --jq .reviews", "repo_review",
+        "gh pr view 1 --repo o/r --json reviews --jq .reviews", "maintenance",
     )
     assert "--jq" in reason
 
@@ -13135,44 +12985,6 @@ def test_review_skill_only_demonstrates_commands_the_poller_can_run() -> None:
         "mimir/skills/review/SKILL.md demonstrates commands the poller cannot "
         "run:\n  " + "\n  ".join(offenders)
     )
-
-
-def test_repo_review_push_is_bound_to_the_event_branch_not_the_namespace() -> None:
-    """A namespace-only rule let one leaf push into a sibling leaf's PR.
-
-    `issue/1029-a1:refs/heads/issue/1030-a1` was admitted because both sides
-    matched `issue/*`. That fast-forwards commits into another leaf's branch
-    while its PR is under review — the push-layer analogue of #1019, where a
-    build wrote into a concurrent sibling's worktree. Worklink runs two
-    `issue/*` builds at once, so the sibling is normally present.
-    """
-    from mimir.access_control import _repo_review_push_refspec
-
-    event_branch = "issue/1029-a1"
-
-    assert _repo_review_push_refspec(f"{event_branch}:{event_branch}", event_branch)
-    assert _repo_review_push_refspec(
-        f"{event_branch}:refs/heads/{event_branch}", event_branch,
-    )
-    assert _repo_review_push_refspec(
-        f"FETCH_HEAD:refs/heads/{event_branch}", event_branch,
-    )
-
-    # Same namespace, different leaf — the case that was wrongly admitted.
-    assert not _repo_review_push_refspec(
-        f"{event_branch}:refs/heads/issue/1030-a1", event_branch,
-    )
-    assert not _repo_review_push_refspec(
-        f"{event_branch}:refs/heads/fix/anything", event_branch,
-    )
-    # Still denied for the reasons the earlier form already covered.
-    for refspec in (
-        f"{event_branch}:refs/heads/main",
-        f"+{event_branch}:refs/heads/{event_branch}",
-        f":refs/heads/{event_branch}",
-        f"{event_branch}:refs/tags/v1",
-    ):
-        assert not _repo_review_push_refspec(refspec, event_branch), refspec
 
 
 def test_issue_comment_authorization_requires_and_matches_repository_source(

@@ -7,6 +7,26 @@ command-text inference. Sections 4-8 are the design of record for the selected
 Arm 2 implementation. Earlier coverage questions and the possible removal of an
 existing carve-out are resolved below; they are no longer open design choices.
 
+**#1050 repo-review cutover:** references below to unchanged profiles describe the
+Arm 2 change, not permission to retain the historical repo-review shell surface.
+`repo_review` removes shell Git writes and all `gh` invocations, including reads,
+with refusal before execution in shadow and enforced mode. Hardened local Git
+inspection remains root-confined and exact-argv-bound, with hooks, fsmonitor,
+external diff, textconv, filters, credentials, protocols, pager, and optional locks
+neutralized. Repository mutations and forge reads/writes instead use typed
+`repo_*`/`pr_*` tools under a server-issued immutable `RepoPRActionScope` and
+`RepoReviewState`, binding repository, PR, observed head/base, allowed actions,
+and publication destination. Local work uses the matching active checkout lease;
+model-selected paths/refs cannot widen it, and stale-snapshot push must refuse.
+This does not change Arm 2's `scheduler_read_only` selection or its provenance
+rules.
+
+The live parity canary is reviewer-owned **BEFORE MERGE**, not a build blocker;
+records live in Chainlink #1050 comments mirrored in the PR body and were
+completed by the reviewer on 2026-09-07. See the
+[record summary](../authorization.md#repository-review-and-remediation-1050)
+and the unchanged [reviewer procedure](../internal/repo-pr-parity-canary.md#1050-reviewer-procedure).
+
 A turn that has ingested untrusted content cannot run a further shell command. The
 mechanism that prevents this already exists and works, but it is keyed on an
 incidental state object rather than on the property it expresses, so exactly one
@@ -254,6 +274,9 @@ model-derived refusal text is emitted. Non-Arm-2 audit shapes are unchanged.
   retain that behavior, while the hard failures above start no process.
 
 ## 5. Historical sample and the selected ceiling
+
+This table records the pre-#1050 profile comparison, not current `gh` admission:
+all `gh` forms are now outside `repo_review`.
 
 The earlier revision claimed the observed operator commands were covered by
 existing profiles. Run through the real matchers, that is false:

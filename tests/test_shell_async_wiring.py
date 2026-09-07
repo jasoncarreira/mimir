@@ -23,7 +23,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import subprocess
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -1071,12 +1070,18 @@ async def test_bash_async_resolves_channel_from_live_contextvar(
 
 
 @pytest.mark.asyncio
-async def test_service_bash_async_graph_executes_pinned_script_with_interpreter(
+@pytest.mark.parametrize("command", [
+    "npm ci --ignore-scripts",
+    "git push origin worklink/7:worklink/7",
+    "gh pr review 7 --repo o/r --approve --body safe",
+])
+async def test_repo_review_bash_async_graph_refuses_legacy_commands_before_spawn(
+    command: str,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
-    maintenance_pinned_executables: dict[str, Path],
+    repo_review_state,
 ) -> None:
-    """Deepagents must carry the server-bound script argv to real Popen."""
+    """Neither legacy commands nor forged direct argv reach the async spawner."""
     from deepagents import create_deep_agent
     from langchain_core.language_models.fake_chat_models import GenericFakeChatModel
     from langchain_core.messages import AIMessage, HumanMessage
@@ -1088,7 +1093,6 @@ async def test_service_bash_async_graph_executes_pinned_script_with_interpreter(
     )
     from mimir._deepagents_patches import install_deepagents_grep_context_tool
     from mimir.models import AuthContext, InformationFlowLabels, TurnInteractivity
-    from mimir.tools._shell_env import direct_exec_env_overlay
     from mimir.tools.budget_gate import BudgetGateMiddleware
 
     class _ToolCallingFakeModel(GenericFakeChatModel):
@@ -1123,20 +1127,19 @@ async def test_service_bash_async_graph_executes_pinned_script_with_interpreter(
         service_authority=service,
         enforcement_enabled=True,
         ifc_labels=labels,
+        repo_review_state=repo_review_state,
     )
-    command = "npm ci --ignore-scripts"
     decision = ToolRegistry().authorize_tool(
         "bash_async", auth, enforce=True, target_channel=command,
         ifc_labels=labels,
     )
-    assert decision.allowed is True
+    assert decision.allowed is False
+    assert "typed repo_* tools" in decision.refusal_detail
 
     popen_calls: list[tuple[list[str], dict[str, object]]] = []
-    real_popen = subprocess.Popen
-
     def _popen(argv, **kwargs):
         popen_calls.append((list(argv), kwargs))
-        return real_popen(argv, **kwargs)
+        pytest.fail("refused repo-review command reached Popen")
 
     monkeypatch.setattr("mimir.shell_jobs.subprocess.Popen", _popen)
     monkeypatch.setattr(
@@ -1164,23 +1167,14 @@ async def test_service_bash_async_graph_executes_pinned_script_with_interpreter(
         context_schema=AuthContext,
     )
     try:
-        await agent.ainvoke(
+        result = await agent.ainvoke(
             {"messages": [HumanMessage(content="run tests")]}, context=auth,
         )
     finally:
         shell_async.set_shell_job_registry(None, on_complete=None)
 
-    executed_argv, kwargs = popen_calls[-1]
-    expected_argv = [
-        str(maintenance_pinned_executables["node"]),
-        str(maintenance_pinned_executables["npm"]),
-        "ci",
-        "--ignore-scripts",
-    ]
-    assert executed_argv == expected_argv
-    assert executed_argv[:3] != ["/bin/sh", "-c", "touch /tmp/forged"]
-    assert all(Path(path).is_absolute() for path in executed_argv[:2])
-    assert all(not Path(path).is_relative_to(repo) for path in executed_argv[:2])
-    assert kwargs.get("shell", False) is False
-    expected_overlay = direct_exec_env_overlay(expected_argv)
-    assert all(kwargs["env"].get(key) == value for key, value in expected_overlay.items())
+    replies = [message for message in result["messages"] if message.type == "tool"]
+    assert len(replies) == 1
+    assert replies[0].status == "error"
+    assert "typed repo_* tools" in replies[0].content
+    assert popen_calls == []

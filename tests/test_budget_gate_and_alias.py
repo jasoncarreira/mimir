@@ -5925,6 +5925,107 @@ async def test_middleware_emits_tool_error_for_budget_denial(
     assert denied_errors[0]["paired_tool_call"] is True
 
 
+def test_checkout_proof_has_no_legacy_shell_adapter() -> None:
+    import ast
+    import inspect
+
+    from mimir.tools import budget_gate
+
+    tree = ast.parse(inspect.getsource(budget_gate))
+    assert not any(
+        isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Name))
+        and getattr(node, "name", getattr(node, "id", None)) == "_record_repo_review_checkout"
+        for node in ast.walk(tree)
+    )
+    assert not hasattr(RepoReviewState, "mark_checked_out")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("execution_path", ["sync", "async"])
+@pytest.mark.parametrize("enforce", [False, True])
+async def test_repo_review_shell_cutover_cannot_create_checkout_proof(
+    execution_path: str,
+    enforce: bool,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    maintenance_pinned_executables: dict[str, Path],
+) -> None:
+    from mimir.access_control import CapabilityTier, build_trigger_service_principal
+
+    root = tmp_path / "repo"
+    root.mkdir()
+    subprocess.run(["git", "init", "-q", str(root)], check=True)
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    monkeypatch.setenv("MIMIR_FILE_TOOL_ROOTS", f"{root}:rw")
+    monkeypatch.setenv("MIMIR_ACCESS_CONTROL_ENFORCED", "1" if enforce else "0")
+    scope = RepoPRActionScope(
+        provenance="poller_payload",
+        canonical_repo="owner/repo",
+        canonical_root=str(root),
+        canonical_origin="https://github.com/owner/repo.git",
+        principal="poller:github-activity",
+        event_type="pr_changes_requested_stale",
+        allowed_operations=frozenset(action.value for action in RepoPRAction),
+        pr_number=17,
+        head_repo="owner/repo",
+        head_remote="origin",
+        destination_ref="refs/heads/fix/17",
+        observed_head_sha="a" * 40,
+        base_ref="main",
+        observed_base_sha="b" * 40,
+    )
+    state = RepoReviewState(scope)
+    service = build_trigger_service_principal(
+        canonical=scope.principal, trigger="poller", profile="github",
+        tier=CapabilityTier.CODE_EXECUTION,
+        capabilities=("shell_exec", "bash_jobs_list", "bash_job_output"),
+        creation_path="test",
+    )
+    auth = AuthContext(
+        principal=f"service:{service.canonical}",
+        canonical_principal=service.canonical,
+        roles=("service",), event_ingress=None, trigger="poller",
+        channel_id="poller:github-activity", interactivity=None,
+        is_service=True, service_authority=service, enforcement_enabled=enforce,
+        ifc_labels=InformationFlowLabels(),
+        repo_review_state=state, repo_pr_scope_registry=RepoPRScopeRegistry((state,)),
+    )
+    seen: list[list[str]] = []
+
+    def handler(request: ToolCallRequest) -> ToolMessage:
+        seen.append(request.tool_call["args"]["mimir_direct_argv"])
+        return ToolMessage(content="ok", tool_call_id=request.tool_call["id"])
+
+    async def async_handler(request: ToolCallRequest) -> ToolMessage:
+        return handler(request)
+
+    commands = [
+        "git status --porcelain",
+        "gh pr checkout 17 --repo owner/repo --branch fix/17",
+        "git checkout fix/17",
+        "git push origin fix/17:fix/17",
+        "gh pr view 17 --repo owner/repo --json title",
+        "gh pr review 17 --repo owner/repo --approve --body-file scratch/review.md",
+        "git fetch origin", "npm ci --ignore-scripts", "uv run pytest", "pwd",
+    ]
+    middleware = BudgetGateMiddleware()
+    for index, command in enumerate(commands):
+        request = _make_request("shell_exec", str(index), auth, {"command": command})
+        if execution_path == "sync":
+            result = middleware.wrap_tool_call(request, handler)
+        else:
+            result = await middleware.awrap_tool_call(request, async_handler)
+        assert (result.status != "error") is (index == 0), result.content
+        assert state.checked_out is False
+        assert state.checkout_lease is None
+        assert state.git_expected_head is None
+    assert len(seen) == 1
+    assert seen[0][1:3] == ["-C", str(root)]
+    assert seen[0][-2:] == ["status", "--porcelain"]
+
+
 @pytest.mark.asyncio
 async def test_tool_refusal_is_a_result_and_next_tool_call_can_run(
     monkeypatch: pytest.MonkeyPatch,
@@ -5960,18 +6061,11 @@ async def test_tool_refusal_is_a_result_and_next_tool_call_can_run(
         repo_pr_action_scope=scope,
     )
     ctx = _ifc_turn(auth)
-    repo_checkout_failures: list[bool] = []
     repo_classification_failures: list[bool] = []
     repo_events: list[bool] = []
 
-    original_record_checkout = budget_gate_module._record_repo_review_checkout
     original_result_labels = budget_gate_module._result_labels_for_call
     original_emit_tool_call = budget_gate_module._emit_tool_call_sync
-
-    def record_checkout(request, auth_context, *, failed):
-        if request.tool_call["name"] == "repo_push":
-            repo_checkout_failures.append(failed)
-        return original_record_checkout(request, auth_context, failed=failed)
 
     def record_result_labels(tool_name, *args, failed=False, **kwargs):
         if tool_name == "repo_push" and (failed or kwargs.get("result") is not None):
@@ -5983,7 +6077,6 @@ async def test_tool_refusal_is_a_result_and_next_tool_call_can_run(
             repo_events.append(ok)
         return original_emit_tool_call(tool_name, ok=ok, **kwargs)
 
-    monkeypatch.setattr(budget_gate_module, "_record_repo_review_checkout", record_checkout)
     monkeypatch.setattr(budget_gate_module, "_result_labels_for_call", record_result_labels)
     monkeypatch.setattr(budget_gate_module, "_emit_tool_call_sync", record_tool_call)
 
@@ -6060,7 +6153,8 @@ async def test_tool_refusal_is_a_result_and_next_tool_call_can_run(
         },
     ]
     assert ctx.remediation_effects == ["repo_push"]
-    assert repo_checkout_failures == [True, False]
+    assert state.checked_out is False
+    assert state.checkout_lease is None
     assert repo_classification_failures == [True, False]
     assert repo_events == [False, True]
 

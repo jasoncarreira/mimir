@@ -951,7 +951,7 @@ class RepoPRActionScope:
 
 @dataclass(frozen=True)
 class RepoReviewState:
-    """Immutable PR authority plus a monotonic, non-authority checkout proof."""
+    """Immutable PR authority plus typed checkout-lease and execution evidence."""
 
     action_scope: RepoPRActionScope
     checked_out: bool = field(default=False, init=False, compare=False)
@@ -978,9 +978,6 @@ class RepoReviewState:
         if lease is not None and getattr(lease, "is_active", False):
             return str(lease.path)
         return self.action_scope.canonical_root
-
-    def mark_checked_out(self) -> None:
-        object.__setattr__(self, "checked_out", True)
 
     def attach_checkout_lease(self, lease: Any) -> None:
         """Activate only a lease issued for this immutable action scope."""

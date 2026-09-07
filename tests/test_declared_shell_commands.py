@@ -527,15 +527,10 @@ class TestReviewFindings:
 
     @pytest.mark.parametrize(
         "profile",
-        ["maintenance", "repo_review", "scheduler_read_only", "upgrade_workspace"],
+        ["maintenance", "scheduler_read_only", "upgrade_workspace"],
     )
-    def test_declarations_are_additive_under_every_profile(self, profile: str) -> None:
-        """Finding 5. Several branches return early; the check must precede them.
-
-        ``repo_review`` and the per-profile ``git`` handlers return on mismatch,
-        so a fallback placed after the dispatch was reachable for some profiles
-        and not others -- a GitHub poller could never use a declared CLI.
-        """
+    def test_declarations_are_additive_under_non_review_profiles(self, profile: str) -> None:
+        """Other profiles retain additive grants after the repo-review cutover."""
         declared = parse_declared_shell_commands(
             [{"exec": "gog", "path": "/bin/echo", "subcommands": [["gmail", "search"]]}],
             writable_roots=(),
@@ -631,3 +626,58 @@ def test_an_explicit_empty_list_is_valid_and_means_nothing_declared() -> None:
     """Distinct from malformed: `shell_commands: []` is a legitimate no-op."""
     assert parse_declared_shell_commands([], writable_roots=()) == ()
     assert parse_declared_shell_commands(None, writable_roots=()) == ()
+
+
+@pytest.mark.parametrize(("executable", "pin", "arguments"), [
+    ("gog", "ls", ["query"]),
+    ("git", "git", ["push", "origin", "worklink/7:worklink/7"]),
+    ("git-alias", "git", ["push", "origin", "worklink/7:worklink/7"]),
+    ("gh", "gh", ["pr", "view", "7"]),
+    ("forge-alias", "gh", ["pr", "view", "7"]),
+])
+def test_repo_review_declarations_and_binary_aliases_cannot_bypass_cutover(
+    executable: str, pin: str, arguments: list[str], repo_review_state,
+    maintenance_pinned_executables: dict[str, Path],
+) -> None:
+    from mimir.access_control import (
+        CapabilityTier, ToolRegistry, build_trigger_service_principal, create_auth_context,
+    )
+    from mimir.models import AgentEvent, InformationFlowLabels
+    from mimir.tools.budget_gate import _request_for_authorized_execution
+    from langchain.agents.middleware import ToolCallRequest
+    from types import SimpleNamespace
+    from dataclasses import replace
+
+    declared = parse_declared_shell_commands([{
+        "exec": executable, "path": str(maintenance_pinned_executables[pin]),
+        "subcommands": [arguments[:1]],
+    }], writable_roots=())
+    command = " ".join([executable, *arguments])
+    # A working grant, not an invalid declaration that would fail everywhere.
+    assert parse_service_shell_argv(command, "maintenance", declared=declared) == [
+        str(maintenance_pinned_executables[pin]), *arguments,
+    ]
+    service = build_trigger_service_principal(
+        canonical="poller:github-activity", trigger="poller", profile="github",
+        tier=CapabilityTier.CODE_EXECUTION,
+        capabilities=("shell_exec", "bash_jobs_list", "bash_job_output"),
+        declared_shell_commands=declared, creation_path="test",
+    )
+    auth = replace(create_auth_context(AgentEvent(
+        trigger="poller", channel_id=service.canonical,
+        service_principal=service.canonical, service_authority=service,
+    ), enforce=True, ifc_labels=InformationFlowLabels()), repo_review_state=repo_review_state)
+    decision = ToolRegistry().authorize_tool(
+        "shell_exec", auth, enforce=True, target_channel=command,
+    )
+    assert not decision.allowed
+    assert "typed repo_* tools" in decision.refusal_detail
+    request = ToolCallRequest(
+        tool_call={"name": "shell_exec", "args": {"command": command}, "id": "cutover", "type": "tool_call"},
+        tool=None, state={}, runtime=SimpleNamespace(context=auth),
+    )
+    bound = _request_for_authorized_execution(request, "shell_exec", auth).tool_call["args"]
+    assert bound["mimir_direct_argv"] == [
+        "/usr/bin/false", "trusted-service shell argv binding failed closed",
+    ]
+    assert "binding_rule=profile_allowlist" in bound["mimir_shell_refusal"]

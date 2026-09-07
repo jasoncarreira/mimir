@@ -1954,8 +1954,8 @@ def _chainlink_target_argv(target: str | None) -> list[str] | None:
 
 
 #: Refused even when quoted. A newline inside a command string is never a
-#: legitimate argument value, and ``repo_review`` deliberately routes multi-line
-#: review bodies through ``--body-file`` rather than inline ``--body``.
+#: legitimate argument value. Review bodies belong in the typed PR tools, not
+#: shell arguments or shell body files.
 _REFUSED_INSIDE_ANY_QUOTE = frozenset("\n\r")
 
 #: Single quotes make every character literal, but double quotes do NOT: a shell
@@ -2559,123 +2559,6 @@ def _target_matches_read_only_shell_command(argv: list[str]) -> bool:
     )
 
 
-def _target_matches_npm_ci_command(arguments: list[str]) -> bool:
-    """Require a script-free clean install with no operands or option terminator."""
-    allowed_options = frozenset({
-        "--ignore-scripts", "--include=dev", "--no-audit", "--no-fund",
-        "--omit=optional", "--prefer-offline",
-    })
-    return (
-        arguments.count("--ignore-scripts") == 1
-        and all(argument in allowed_options for argument in arguments)
-    )
-
-
-#: Cap on a captured review body. GitHub rejects review bodies past ~65k, so a
-#: larger file is a mistake or an attempt to wedge the exec, not a real review.
-_REVIEW_BODY_MAX_BYTES = 65_536
-
-
-def _capture_review_body_beneath_scratch(path_text: str) -> str | None:
-    """Read a review body from scratch through descriptor-relative no-follow IO.
-
-    Validating a pathname and then handing that same pathname to ``gh`` is a
-    check/use race: ``Path.resolve()`` proves only what the path meant at check
-    time, and any service-writable process can swap the file — or a parent
-    component — for a symlink pointing outside scratch before ``gh`` opens it,
-    publishing arbitrary readable content as a PR review.
-
-    So the pathname never survives authorization. We anchor on the fully
-    resolved scratch root (``resolve()`` leaves no symlinks in it), walk each
-    component with ``O_NOFOLLOW`` (openat semantics), read the contents here,
-    and the caller substitutes ``--body <captured>`` into the already-parsed
-    argv. Inlining multiline text is safe at that point precisely because no
-    shell reparses an argv list — the control-character rule that forced a file
-    in the first place applies to the raw command string, not to argv.
-
-    Mirrors the spawn-artifact hardening in ``tools/registry.py`` (#1134).
-    Returns ``None`` when the body cannot be captured safely, which the caller
-    turns into a refusal.
-    """
-    home = os.environ.get("MIMIR_HOME", "").strip()
-    if not home:
-        return None
-    scratch_root = (Path(home).resolve() / "scratch").resolve()
-    candidate = Path(path_text)
-    if not candidate.is_absolute():
-        candidate = Path(home).resolve() / candidate
-    # Lexical containment first, so a traversal never reaches the walk.
-    try:
-        relative = candidate.relative_to(scratch_root)
-    except ValueError:
-        return None
-    parts = relative.parts
-    if not parts or ".." in parts:
-        return None
-
-    opened: list[int] = []
-    try:
-        opened.append(os.open(scratch_root, os.O_RDONLY | os.O_DIRECTORY))
-    except OSError:
-        return None
-    try:
-        for part in parts[:-1]:
-            opened.append(
-                os.open(
-                    part,
-                    os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
-                    dir_fd=opened[-1],
-                )
-            )
-        fd = os.open(parts[-1], os.O_RDONLY | os.O_NOFOLLOW, dir_fd=opened[-1])
-    except OSError:
-        return None
-    finally:
-        for fd_open in opened:
-            try:
-                os.close(fd_open)
-            except OSError:
-                pass
-    try:
-        with os.fdopen(fd, "rb") as handle:
-            # Read one byte past the cap so an oversize file is detected rather
-            # than silently truncated into a published review.
-            raw = handle.read(_REVIEW_BODY_MAX_BYTES + 1)
-    except OSError:
-        return None
-    if len(raw) > _REVIEW_BODY_MAX_BYTES:
-        return None
-    try:
-        return raw.decode("utf-8")
-    except UnicodeDecodeError:
-        return None
-
-
-def _repo_review_argv_with_captured_body(argv: list[str]) -> list[str] | None:
-    """Replace ``--body-file <path>`` with ``--body <captured contents>``.
-
-    Returns ``argv`` unchanged when no body file is named, or ``None`` when a
-    named body cannot be captured safely.
-    """
-    if "--body-file" not in argv:
-        return argv
-    out: list[str] = []
-    index = 0
-    while index < len(argv):
-        if argv[index] != "--body-file":
-            out.append(argv[index])
-            index += 1
-            continue
-        if index + 1 >= len(argv):
-            return None
-        body = _capture_review_body_beneath_scratch(argv[index + 1])
-        if body is None:
-            return None
-        out.extend(["--body", body])
-        index += 2
-    return out
-
-
 def _git_arguments_without_restrictive_global_options(
     arguments: list[str],
 ) -> list[str]:
@@ -2686,17 +2569,27 @@ def _git_arguments_without_restrictive_global_options(
 
 
 def _repo_review_git_execution_argv(argv: list[str], state: Any) -> list[str] | None:
-    """Return hardened argv for repo inspection or branch-scoped mutation."""
-    if not argv or argv[0] != "git":
+    """Bind local-only inspection to an explicit server-owned review root."""
+    if (
+        not argv or argv[0] != "git"
+        or not _repo_review_action_allowed(state, RepoPRAction.INSPECT)
+    ):
+        return None
+    root_text = getattr(state, "root", None)
+    if not isinstance(root_text, str) or not root_text or not Path(root_text).is_absolute():
+        return None
+    try:
+        root = Path(root_text).resolve(strict=True)
+    except (OSError, RuntimeError, ValueError):
         return None
     git_arguments = _git_arguments_without_restrictive_global_options(argv[1:])
     if git_arguments[:1] == ["-C"]:
-        if state is None or len(git_arguments) < 3:
+        if len(git_arguments) < 3 or not Path(git_arguments[1]).is_absolute():
             return None
         try:
-            if Path(git_arguments[1]).resolve() != Path(state.root).resolve():
+            if Path(git_arguments[1]).resolve(strict=True) != root:
                 return None
-        except (OSError, RuntimeError):
+        except (OSError, RuntimeError, ValueError):
             return None
         subcommand = git_arguments[2]
         arguments = git_arguments[3:]
@@ -2706,19 +2599,6 @@ def _repo_review_git_execution_argv(argv: list[str], state: Any) -> list[str] | 
     else:
         return None
     arguments = list(arguments)
-    required_action = {
-        "checkout": RepoPRAction.CHECKOUT,
-        "add": RepoPRAction.WRITE,
-        "commit": RepoPRAction.COMMIT,
-        "worktree": RepoPRAction.CHECKOUT,
-        "pull": RepoPRAction.CHECKOUT,
-        "push": RepoPRAction.PUSH,
-    }.get(subcommand, RepoPRAction.INSPECT)
-    if state is not None and not _repo_review_action_allowed(state, required_action):
-        return None
-    if state is None and required_action is not RepoPRAction.INSPECT:
-        return None
-    branch = getattr(state, "head_ref", "")
     if subcommand == "status":
         allowed = (
             all(argument.startswith("-") and argument != "--" for argument in arguments)
@@ -2737,46 +2617,6 @@ def _repo_review_git_execution_argv(argv: list[str], state: Any) -> list[str] | 
         )
     elif _repo_review_git_read_arguments(subcommand, arguments):
         allowed = True
-    elif subcommand == "checkout":
-        allowed = arguments in ([branch], ["-B", branch])
-    elif subcommand == "add":
-        path_arguments = arguments[1:] if arguments[:1] == ["--"] else arguments
-        allowed = state.checked_out and (
-            arguments in (["--all"], ["-A"])
-            or bool(path_arguments)
-            and all(_repo_review_relative_path(path) for path in path_arguments)
-        )
-    elif subcommand == "commit":
-        message = None
-        if len(arguments) == 2 and arguments[0] == "-m":
-            message = arguments[1] if arguments[1].strip() else None
-        elif len(arguments) == 2 and arguments[0] == "--file":
-            message = _capture_review_body_beneath_scratch(arguments[1])
-        allowed = state.checked_out and message is not None
-        if allowed:
-            arguments = ["-m", message]
-    elif subcommand == "worktree":
-        allowed = (
-            arguments[:1] == ["add"]
-            and len(arguments) == 3
-            and _repo_review_write_path(arguments[1], state.root)
-            and arguments[2] == branch
-        )
-    elif subcommand == "pull":
-        allowed = state.checked_out and arguments == ["--ff-only", "origin", branch]
-    elif subcommand == "push":
-        push_options = []
-        while arguments[:1] and arguments[0] in {
-            "--dry-run", "-u", "--set-upstream",
-        }:
-            push_options.append(arguments.pop(0))
-        allowed = (
-            state.checked_out
-            and len(arguments) == 2
-            and arguments[0] == "origin"
-            and _repo_review_push_refspec(arguments[1], branch)
-        )
-        arguments = [*push_options, *arguments]
     else:
         return None
     if not allowed:
@@ -2785,28 +2625,9 @@ def _repo_review_git_execution_argv(argv: list[str], state: Any) -> list[str] | 
     git = _maintenance_resolved_pin("git")
     if git is None:
         return None
-    root = Path(state.root).resolve() if state is not None else Path.cwd().resolve()
-    filter_overrides = _maintenance_git_filter_overrides(root, str(git))
+    filter_overrides = _maintenance_git_filter_overrides(root, str(git), effective_config=True)
     if filter_overrides is None:
         return None
-    transport_overrides = (
-        ["-c", "protocol.https.allow=always", "-c", "protocol.ssh.allow=always"]
-        if subcommand == "push"
-        else []
-    )
-    credential_overrides = (
-        ["-c", "credential.helper="]
-        if required_action is RepoPRAction.INSPECT
-        else []
-    )
-    identity_overrides: list[str] = []
-    if subcommand == "commit":
-        from .git_bootstrap import DEFAULT_USER_EMAIL, DEFAULT_USER_NAME
-
-        identity_overrides = [
-            "-c", f"user.name={DEFAULT_USER_NAME}",
-            "-c", f"user.email={DEFAULT_USER_EMAIL}",
-        ]
     safety_options: list[str] = []
     if subcommand in {"diff", "log", "show"}:
         safety_options = ["--no-ext-diff", "--no-textconv"]
@@ -2816,78 +2637,11 @@ def _repo_review_git_execution_argv(argv: list[str], state: Any) -> list[str] | 
         str(git), "-C", str(root),
         *_MAINTENANCE_GIT_BASE_OVERRIDES,
         "-c", f"safe.directory={root}",
-        *credential_overrides,
-        *transport_overrides,
-        *identity_overrides,
+        "-c", "credential.helper=",
         *filter_overrides,
         "--no-pager", "--no-optional-locks", subcommand, *safety_options, *arguments,
     ]
     return execution_argv
-
-
-def _repo_review_relative_path(value: str) -> bool:
-    path = Path(value)
-    return bool(value) and not path.is_absolute() and ".." not in path.parts
-
-
-def _repo_review_write_path(value: str, root: str) -> bool:
-    """Confine a Git-created worktree to an explicit repository write root."""
-    from ._paths import PathOutsideHomeError, resolve_within_roots
-
-    try:
-        candidate = Path(value)
-        resolve_within_roots(
-            _configured_repo_write_roots(),
-            str(candidate if candidate.is_absolute() else Path(root) / candidate),
-        )
-    except (IndexError, OSError, PathOutsideHomeError, RuntimeError, ValueError):
-        return False
-    return True
-
-
-def _repo_review_owned_branch(branch: str, event_branch: str) -> bool:
-    """Admit only the event's own branch, inside a namespace the flow owns.
-
-    Equality is required for every namespace, not just ``worklink/``. A
-    namespace-only rule let one leaf's run push to a sibling's branch --
-    ``issue/1029-a1`` to ``refs/heads/issue/1030-a1`` -- which fast-forwards
-    commits into another leaf's PR while it is under review. Cross-leaf
-    contamination is a demonstrated failure mode here (#1019: a build wrote
-    into a concurrent sibling's worktree, twice in seven builds), and Worklink
-    runs two ``issue/*`` builds concurrently by default.
-
-    Requiring equality is safe because each ``RepoReviewState`` is constructed
-    for one ``pr_changes_requested_stale`` item, so ``head_ref`` is the one PR
-    branch that state can remediate; no selected state legitimately targets a
-    different branch.
-    """
-    return (
-        _valid_git_branch(branch)
-        and branch == event_branch
-        and (
-            branch.startswith("issue/")
-            or branch.startswith("fix/")
-            or branch.startswith("worklink/")
-        )
-    )
-
-
-def _repo_review_push_refspec(refspec: str, event_branch: str) -> bool:
-    if refspec.startswith("+") or refspec.count(":") != 1:
-        return False
-    source, destination = refspec.split(":", 1)
-    if not destination.startswith("refs/heads/"):
-        # Preserve the existing exact event-branch form.
-        return (
-            source == event_branch
-            and destination == event_branch
-            and _repo_review_owned_branch(event_branch, event_branch)
-        )
-    destination_branch = destination.removeprefix("refs/heads/")
-    return (
-        _repo_review_owned_branch(destination_branch, event_branch)
-        and source in {"FETCH_HEAD", destination_branch, event_branch}
-    )
 
 
 _GH_REPOSITORY_OPTION_FORMS = (
@@ -2954,76 +2708,12 @@ def _gh_repository_operand(
     return repository, remaining
 
 
-def _repo_review_bound_repository(review_state: Any) -> str | None:
-    scope = getattr(review_state, "action_scope", None)
-    repository = getattr(scope, "canonical_repo", None)
-    return repository if isinstance(repository, str) and repository else None
-
-
-def _gh_arguments_match_bound_repository(
-    arguments: list[str], bound_repository: str | None,
-) -> bool:
-    parsed = _gh_repository_operand(arguments)
-    return (
-        parsed is not None
-        and _repositories_match(parsed[0], bound_repository)
-    )
-
-
-def _repositories_match(left: str | None, right: str | None) -> bool:
-    return (
-        isinstance(left, str)
-        and isinstance(right, str)
-        and left.casefold() == right.casefold()
-    )
-
-
-def _repo_review_gh_api_arguments(
-    arguments: list[str], review_state: Any = None,
-) -> bool:
-    """Admit a GET-only API path beneath the review scope's repository."""
-    path: str | None = None
-    index = 0
-    while index < len(arguments):
-        argument = arguments[index]
-        if argument == "--paginate":
-            index += 1
-            continue
-        if argument in {"-X", "--method"}:
-            if index + 1 >= len(arguments) or arguments[index + 1] != "GET":
-                return False
-            index += 2
-            continue
-        if argument.startswith("-") or path is not None:
-            return False
-        path = argument
-        index += 1
-    if path is None or re.fullmatch(r"[A-Za-z0-9._~!()+,=:@%/-]+", path) is None:
-        return False
-    segments = path.split("/")
-    if not all(segment not in {"", ".", ".."} for segment in segments):
-        return False
-    return (
-        len(segments) >= 3
-        and segments[0] == "repos"
-        and _repositories_match(
-            f"{segments[1]}/{segments[2]}",
-            _repo_review_bound_repository(review_state),
-        )
-    )
-
-
-def _repo_review_gh_issue_view_arguments(
-    arguments: list[str], review_state: Any = None, *, bind_repository: bool = True,
-) -> bool:
+def _gh_issue_view_arguments(arguments: list[str]) -> bool:
+    """Validate the shared session-boundary issue reader's argument shape."""
     parsed = _gh_repository_operand(arguments)
     if parsed is None:
         return False
-    repository, arguments = parsed
-    if bind_repository and not _repositories_match(
-        repository, _repo_review_bound_repository(review_state),
-    ):
-        return False
+    _repository, arguments = parsed
     if not arguments or arguments[0].startswith("-"):
         return False
     index = 1
@@ -3073,6 +2763,17 @@ def _repo_review_git_read_arguments(subcommand: str, arguments: list[str]) -> bo
             )
         )
     if subcommand in {"diff", "show"}:
+        if subcommand == "diff":
+            # Two file operands can implicitly enable --no-index, even inside
+            # a repository. Admit only one revision and no pathspec separator.
+            operands = [value for value in arguments if not value.startswith("-")]
+            if (
+                "--" in arguments
+                or len(operands) > 1
+                or any(not re.fullmatch(r"(?:HEAD(?:[~^][0-9]*)*|[0-9a-fA-F]{4,40})", value)
+                       for value in operands)
+            ):
+                return False
         return _arguments_match_allowlist(
             arguments,
             exact_options=frozenset({
@@ -3148,15 +2849,6 @@ def _repo_review_git_read_arguments(subcommand: str, arguments: list[str]) -> bo
     return False
 
 
-def _option_value(arguments: list[str], option: str) -> str | None:
-    """Return one separated option value, rejecting absent or repeated options."""
-    positions = [index for index, value in enumerate(arguments) if value == option]
-    if len(positions) != 1 or positions[0] + 1 >= len(arguments):
-        return None
-    value = arguments[positions[0] + 1]
-    return None if value.startswith("-") else value
-
-
 def _repo_review_action_allowed(review_state: Any, action: RepoPRAction) -> bool:
     scope = getattr(review_state, "action_scope", None)
     return (
@@ -3165,184 +2857,11 @@ def _repo_review_action_allowed(review_state: Any, action: RepoPRAction) -> bool
     )
 
 
-def _target_matches_repo_review_shell_command(
-    argv: list[str], review_state: Any = None,
-) -> bool:
-    """Validate commands needed to inspect and test a trusted repository PR."""
-    if _target_matches_read_only_shell_command(argv):
-        return True
-    if not argv:
-        return False
-
-    # ``--jq`` is deliberately absent from every option set below, here and in
-    # the maintenance profile. ``gh`` evaluates the filter in-process, and jq's
-    # ``env`` / ``$ENV`` builtins read the process environment. ``gh`` is the one
-    # service-shell executable explicitly given GITHUB_TOKEN, so ``gh pr view
-    # <n> --repo <r> --json reviews --jq env`` was therefore an
-    # admitted command that printed DISCORD_TOKEN, GITHUB_TOKEN, GPG_KEY,
-    # MIMIR_API_KEY and the provider keys into the tool result, and from there
-    # into the model's context and the turn transcript. Enforcement was no
-    # defence: the command was ALLOWED, not merely unblocked.
-    #
-    # Nothing is lost by removing it. Every non-trivial filter was already
-    # refused, because ``|``, ``[``, ``]`` and ``{`` are shell metacharacters and
-    # the profile scans the raw command string before splitting it; only degenerate
-    # forms like ``--jq .reviews`` ever got through. ``--json`` returns the same
-    # data and the caller filters it itself.
-    #
-    # Do not "fix" this by blocklisting ``env`` and ``$ENV``: that is a denylist
-    # over an expression language, and the next builtin that reaches process
-    # state reopens it. ``--template`` is retained because gh's template function
-    # set is fixed and exposes no environment accessor — verify that claim again
-    # before adding any option that evaluates a caller-supplied expression.
-    if argv[0] == "gh" and argv[1:2] == ["api"]:
-        return _repo_review_gh_api_arguments(argv[2:], review_state)
-
-    if argv[0] == "gh" and argv[1:] == ["auth", "status"]:
-        return True
-
-    if argv[0] == "gh" and len(argv) >= 3 and argv[1] == "issue":
-        return argv[2] == "view" and _repo_review_gh_issue_view_arguments(
-            argv[3:], review_state,
-        )
-
-    if argv[0] == "gh" and len(argv) >= 3 and argv[1] == "pr":
-        subcommand = argv[2]
-        if subcommand == "checkout":
-            return _repo_review_action_allowed(review_state, RepoPRAction.CHECKOUT) and argv[3:] == [
-                str(review_state.pr_number),
-                "--repo", review_state.repo,
-                "--branch", review_state.head_ref,
-            ]
-        if subcommand in {"edit", "comment"}:
-            required_actions = (
-                (RepoPRAction.PR_EDIT, RepoPRAction.PR_REREQUEST)
-                if subcommand == "edit"
-                else (RepoPRAction.PR_COMMENT,)
-            )
-            if (
-                not all(
-                    _repo_review_action_allowed(review_state, action)
-                    for action in required_actions
-                )
-                or argv[3:4] != [str(review_state.pr_number)]
-            ):
-                return False
-            arguments = argv[4:]
-            options = (
-                frozenset({"--add-reviewer", "--body-file", "--repo"})
-                if subcommand == "edit"
-                else frozenset({"--body-file", "--repo"})
-            )
-            return (
-                _arguments_match_allowlist(arguments, exact_options=options)
-                and _option_value(arguments, "--repo") == review_state.repo
-                and _option_value(arguments, "--body-file") is not None
-                and (
-                    subcommand != "edit"
-                    or _option_value(arguments, "--add-reviewer") is not None
-                )
-            )
-        options = {
-            "view": frozenset({
-                "--comments", "--json", "--template",
-            }),
-            "diff": frozenset({"--color", "--name-only", "--patch"}),
-            "checks": frozenset({
-                "--fail-fast", "--interval", "--json",
-                "--required", "--watch",
-            }),
-            # Submitting the review is the point of the repo_review profile —
-            # without this the poller can read a PR and reach a verdict but has
-            # no way to post it, which is exactly what happened when this
-            # profile first went live (the agent reported every command
-            # "exiting 1 with empty output" and messaged the operator instead).
-            #
-            # ``--body-file`` is required, not a convenience: a review body is
-            # inherently multi-line, and ``\n`` is in
-            # ``_SHELL_CONTROL_CHARACTERS`` (correctly — it separates commands),
-            # so a multi-line ``--body`` can never be admitted. Command
-            # substitution (``--body "$(cat ...)"``) is rejected for the same
-            # reason. A file is therefore the only way to carry a real review.
-            #
-            # Its path is constrained to the scratch root below. Unconstrained,
-            # ``--body-file <home>/.env`` would publish the operator's secrets
-            # to GitHub as a review — egress wearing a review's clothes. Scoped
-            # to scratch, a service can only publish what it wrote there itself.
-            "review": frozenset({
-                "--approve", "--body", "--body-file", "--comment", "--repo",
-                "--request-changes",
-            }),
-        }.get(subcommand)
-        read_subcommand = subcommand in {"view", "diff", "checks"}
-        if read_subcommand:
-            options = options | _GH_REPOSITORY_EXACT_OPTIONS
-        if options is None or not _arguments_match_allowlist(
-            argv[3:], exact_options=options,
-            option_prefixes=(
-                _GH_REPOSITORY_OPTION_PREFIXES if read_subcommand else ()
-            ),
-        ):
-            return False
-        if read_subcommand and not _gh_arguments_match_bound_repository(
-            argv[3:], _repo_review_bound_repository(review_state),
-        ):
-            return False
-        if subcommand == "review":
-            if (
-                not _repo_review_action_allowed(review_state, RepoPRAction.PR_REVIEW)
-                or argv[3:4] != [str(review_state.pr_number)]
-                or _option_value(argv[4:], "--repo") != review_state.repo
-            ):
-                return False
-        # The body file's SAFETY is enforced at capture time, not here — see
-        # ``_capture_review_body_beneath_scratch``. Admission only decides the
-        # option is permitted.
-        return True
-
-    if argv[0] == "git":
-        git_arguments = _git_arguments_without_restrictive_global_options(argv[1:])
-        if review_state is not None and git_arguments[:1] == ["-C"]:
-            return _repo_review_git_execution_argv(argv, review_state) is not None
-        if not git_arguments:
-            return False
-        subcommand = git_arguments[0]
-        arguments = git_arguments[1:]
-        if review_state is not None and subcommand in {
-            "add", "checkout", "commit", "pull", "push", "worktree",
-        }:
-            return _repo_review_git_execution_argv(argv, review_state) is not None
-        if _repo_review_git_read_arguments(subcommand, arguments):
-            return True
-        if subcommand == "fetch":
-            if not _arguments_match_allowlist(
-                arguments,
-                exact_options=frozenset({
-                    "--append", "--atomic", "--dry-run", "--no-tags", "--prune",
-                    "--quiet", "--tags", "--verbose",
-                }),
-                option_prefixes=("--depth=", "--deepen=", "--filter="),
-            ):
-                return False
-            operands = [argument for argument in arguments if not argument.startswith("-")]
-            # A URL or ext:: remote can select a helper executable. Review
-            # fetches use only the checkout's conventional configured remotes.
-            return not operands or operands[0] in {"origin", "upstream"}
-        return False
-
-    if argv[0] == "npm":
-        if argv[1:2] == ["ci"]:
-            return _target_matches_npm_ci_command(argv[2:])
-        return False
-    return False
-
-
 def _gh_repo_operands_are_configured(arguments: list[str]) -> bool:
     """Require an explicit gh repository operand to name configured server state.
 
     The syntax matchers accept ``--repo <value>`` without inspecting the value.
-    On a repo-review turn the bound comes from that turn's immutable pull-request
-    scope, but the session-boundary profile carries no such scope, so an
+    The maintenance and session-boundary profiles carry no PR scope, so an
     unchecked operand would reach any repository the process token can see.
     """
     parsed = _gh_repository_operand(arguments)
@@ -3357,9 +2876,7 @@ def _target_matches_session_boundary_shell_command(argv: list[str]) -> bool:
         return True
     if argv[:3] == ["gh", "issue", "view"]:
         return (
-            _repo_review_gh_issue_view_arguments(
-                argv[3:], bind_repository=False,
-            )
+            _gh_issue_view_arguments(argv[3:])
             and _gh_repo_operands_are_configured(argv[3:])
         )
     if argv[:3] == ["gh", "pr", "view"]:
@@ -3447,7 +2964,7 @@ def _maintenance_git_probe_env() -> dict[str, str]:
 
 
 def _maintenance_git_filter_overrides(
-    root: Path, git_executable: str,
+    root: Path, git_executable: str, *, effective_config: bool = False,
 ) -> list[str] | None:
     """Return argv overrides that disable configured content filter drivers.
 
@@ -3457,6 +2974,8 @@ def _maintenance_git_filter_overrides(
     side. Enumerate the effective command-bearing keys with the same hardened
     binary/config/environment contract as execution, validate the NUL-delimited
     names, then shadow each command with an empty command in the final argv.
+    Repo-review opts into effective config (including global and included files);
+    the default preserves the maintenance profile's local-only probe.
 
     Repo-test snapshots are owned by the controller's ``mimir_uid`` while the
     suite runs as ``worklink_uid``. Git otherwise rejects this local-config read
@@ -3467,7 +2986,8 @@ def _maintenance_git_filter_overrides(
         git_executable, "-C", str(root),
         *_MAINTENANCE_GIT_BASE_OVERRIDES,
         "-c", f"safe.directory={root}",
-        "--no-pager", "config", "--local", "--null", "--name-only",
+        "--no-pager", "config", *(["--includes"] if effective_config else ["--local"]),
+        "--null", "--name-only",
         "--get-regexp", r"^filter\..*\.(clean|smudge|process)$",
     ]
     try:
@@ -3857,10 +3377,9 @@ _SHELL_PROFILE_SINGLE_ARGV_HINT = (
     "A trusted-service profile execs one argv directly with shell=False, so "
     "shell syntax is never admitted and no quoting will change that. Issue one "
     "command per call; select the working directory with the command's own "
-    "option (for example 'git -C <dir>') rather than 'cd <dir> && ...'; and pass "
-    "multi-line text through a file option (for example 'gh pr review "
-    "--body-file <path beneath the agent scratch root>') rather than an inline "
-    "multi-line value or a heredoc."
+    "option (for example 'git -C <dir>') rather than 'cd <dir> && ...'. "
+    "Use typed PR tools for review bodies rather than shell body files, inline "
+    "multi-line values, or heredocs."
 )
 
 
@@ -4041,7 +3560,6 @@ class ServiceShellBindingRule(StrEnum):
     PROFILE_ALLOWLIST = "profile_allowlist"
     EXECUTABLE_PIN = "executable_pin"
     REPOSITORY_REVIEW_STATE = "repository_review_state"
-    REVIEW_BODY_CAPTURE = "review_body_capture"
     UNKNOWN_PROFILE = "unknown_profile"
     DECLARED_COMMAND_MISMATCH = "declared_command_mismatch"
     READ_OPERAND_POLICY = "read_operand_policy"
@@ -4690,6 +4208,19 @@ def _service_shell_typed_tool_guidance(
 
 def _service_shell_not_admitted_reason(argv: list[str], destination: str) -> str:
     """Explain that a well-formed command is outside the profile's allowlist."""
+    if destination == "repo_review":
+        return (
+            "The repo_review shell profile admits only hardened local read-only Git "
+            "inspection bound to a server-owned PR state with inspect permission. "
+            "All gh commands, Git mutations and network operations, generic commands, "
+            "and shell test/install commands are refused, including declared-command "
+            "and project-test overrides. Use typed pr_* tools for GitHub reads and "
+            "reviews, issue_comment for issue comments, and typed repo_* tools for "
+            "checkout, fetch, tests, and mutations. Use read_file, glob, grep, or ls "
+            "for bounded filesystem inspection. If a typed operation is unavailable, "
+            "report the limitation; do not retry through shell or HTTP commands."
+            + _service_shell_typed_tool_guidance(argv, destination)
+        )
     supplied = [token for token in argv[1:] if token.startswith("-")]
     named = sorted({
         token for token in supplied if token in _SERVICE_SHELL_DISPLAY_OPTIONS
@@ -4722,19 +4253,6 @@ def _service_shell_not_admitted_reason(argv: list[str], destination: str) -> str
             "documented bounded options (-q/--quiet and --json included)."
             " To inspect the CLI's JSON contract, use chainlink issue show <id> --json"
             " or chainlink issue list --json."
-        )
-    elif argv[:1] == ["git"] and destination == "repo_review":
-        boundary = (
-            " Git forms that can execute, write output, contact a remote, or enable "
-            "textconv/external helpers are deliberately denied."
-        )
-        admitted = (
-            " Admitted inspection alternatives include git status --porcelain; "
-            "git log [options] [-- paths]; git diff [revisions] [-- paths]; "
-            "git show [revision]; git grep [-n] pattern [-- paths]; git blame "
-            "[-L<range>] [revision] [--] path; git merge-base [--is-ancestor] "
-            "<revision> <revision>; git rev-list --count <revision>; git rev-parse, "
-            "git remote -v, git branch --list, and git worktree list --porcelain."
         )
     else:
         boundary = admitted = ""
@@ -4937,6 +4455,18 @@ def parse_service_shell_argv_with_diagnostics(
     if argv[0] == "/usr/local/bin/chainlink":
         argv[0] = "chainlink"
 
+    # Production cutover: no generic grant may bypass the typed repo/PR tools.
+    # Return on both admission and refusal before project tests or declarations.
+    if destination == "repo_review":
+        git_argv = _repo_review_git_execution_argv(argv, review_state)
+        if git_argv is not None:
+            return git_argv, "", None
+        return (
+            None,
+            _service_shell_not_admitted_reason(argv, destination),
+            ServiceShellBindingRule.PROFILE_ALLOWLIST,
+        )
+
     if allow_project_test:
         test_argv, test_reason, test_matched = _project_test_execution_argv(argv)
         if test_matched:
@@ -4948,12 +4478,8 @@ def parse_service_shell_argv_with_diagnostics(
                 )
             return test_argv, "", None
 
-    # Consulted BEFORE the profile dispatch, not after it. Several branches
-    # (repo_review, and the per-profile ``git`` handlers) return on mismatch, so
-    # a check placed after them was reachable for some profiles and not others --
-    # a GitHub poller could never have used a declared CLI. Union semantics are
-    # what "additive" was meant to say; order here only decides which gate speaks
-    # first, and an explicit per-job grant is the more specific statement.
+    # Other profiles retain additive per-job grants before their dispatch.
+    # repo_review is deliberately closed above, regardless of declarations.
     declared_argv = _declared_command_execution_argv(argv, declared)
     if declared_argv is not None:
         return declared_argv, "", None
@@ -4978,39 +4504,6 @@ def parse_service_shell_argv_with_diagnostics(
         # options in the input, while the root-bound profiles additionally add
         # -C, config, and discovered-filter overrides in their binders.
         allowed = _target_matches_read_only_shell_command(argv)
-    elif destination == "repo_review":
-        if not _target_matches_repo_review_shell_command(argv, review_state):
-            return (
-                None,
-                _service_shell_not_admitted_reason(argv, destination),
-                ServiceShellBindingRule.PROFILE_ALLOWLIST,
-            )
-        if argv[0] == "git" and argv[1:2] != ["fetch"]:
-            git_argv = _repo_review_git_execution_argv(argv, review_state)
-            if git_argv is not None:
-                return git_argv, "", None
-            return (
-                None,
-                _service_shell_not_admitted_reason(argv, destination),
-                ServiceShellBindingRule.PROFILE_ALLOWLIST,
-            )
-        pinned, reason = _maintenance_pinned_execution_argv_with_reason(argv)
-        if pinned is None:
-            return None, reason, ServiceShellBindingRule.EXECUTABLE_PIN
-        # Capture any review body HERE, so the returned artifact carries no
-        # pathname for ``gh`` to look up again. See
-        # ``_capture_review_body_beneath_scratch``: validating a path and
-        # then passing that path on is a check/use race.
-        captured = _repo_review_argv_with_captured_body(pinned)
-        if captured is None:
-            return None, (
-                "the '--body-file' path could not be captured. It must resolve "
-                "beneath the agent scratch root, be a regular file reached "
-                "without traversing a symlink, and be at most "
-                f"{_REVIEW_BODY_MAX_BYTES} bytes. The body is read once during "
-                "authorization so the path is never re-opened at execution."
-            ), ServiceShellBindingRule.REVIEW_BODY_CAPTURE
-        return captured, "", None
     elif destination == "maintenance":
         if argv[0] == "git":
             git_argv = _maintenance_git_execution_argv(argv)
@@ -5326,24 +4819,12 @@ def resolve_repository_review_state(
         state = registry.resolve_checkout_path(path)
         return state, None if state is not None else "no matching checkout lease was found for the requested path"
 
-    if (
-        len(argv) >= 4
-        and (
-            argv[:2] == ["gh", "pr"]
-            or argv[:3] == ["gh", "issue", "view"]
-        )
-    ):
-        try:
-            pull_request = int(argv[3])
-        except ValueError:
-            pull_request = None
-        parsed_repository = _gh_repository_operand(argv[4:])
-        repository = parsed_repository[0] if parsed_repository is not None else None
-        state = registry.resolve(repository, pull_request)
-        if state is not None:
-            return state, None
-    if argv[:2] == ["git", "-C"] and len(argv) >= 3:
-        state = registry.resolve_checkout_path(argv[2])
+    git_arguments = (
+        _git_arguments_without_restrictive_global_options(argv[1:])
+        if argv[:1] == ["git"] else []
+    )
+    if git_arguments[:1] == ["-C"] and len(git_arguments) >= 2:
+        state = registry.resolve_checkout_path(git_arguments[1])
         return state, None if state is not None else "no matching checkout lease was found for the repository command"
     if cwd is not None:
         state = registry.resolve_checkout_path(cwd)
@@ -5353,7 +4834,7 @@ def resolve_repository_review_state(
     if len(registry.review_states) > 1:
         return None, (
             "several checkout leases are active; name the checkout with "
-            "`git -C <lease path>` or the pull request number"
+            "`git -C <lease path>` or an explicit cwd"
         )
     return None, "no matching checkout lease was found for the repository command"
 
