@@ -2726,6 +2726,20 @@ def test_partial_evidence_skips_malformed_metadata_without_raw_fallback():
     assert messages[0].response_metadata["tool_events"] == ["token=private-value-123"]
 
 
+def test_partial_evidence_redacts_before_truncating_credentials():
+    from mimir.turn_logger import extract_partial_tool_events
+
+    # Cutting this fixed-length AWS key at 4096 makes it unrecognizable to
+    # downstream redaction. Assert against the leaked fragment, not just the key.
+    message = ToolMessage(content="x" * 4080 + " AKIA1234567890ABCDEF trailing text", tool_call_id="done")
+    events, truncated = extract_partial_tool_events([message])
+    assert truncated is False
+    assert len(events) == 1
+    assert "AKIA" not in events[0]["content"]
+    assert "[truncated]" in events[0]["content"]
+    assert "AKIA1234567890ABCDEF" in message.content
+
+
 async def test_run_turn_emits_turn_failed_event_on_error(tmp_path: Path):
     """Any turn that fails must emit a ``turn_failed`` event so the
     failure is operator-visible (ops dashboard + events.jsonl), not just
@@ -2822,7 +2836,10 @@ async def test_turn_completed_emitted_for_successful_poller_turn(tmp_path: Path)
         source_id="poller:github-activity:1700:batch:0",
         extra={"poller_name": "github-activity", "items": items},
     )
-    await agent.run_turn(event)
+    record = await agent.run_turn(event)
+    assert record.output == "reviewed"
+    assert record.events_partial is False
+    assert record.events_truncated is False
 
     events_log = tmp_path / "home" / "logs" / "events.jsonl"
     evs = [json.loads(ln) for ln in events_log.read_text().splitlines() if ln.strip()]
