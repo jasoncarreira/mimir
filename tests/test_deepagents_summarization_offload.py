@@ -166,7 +166,8 @@ def test_production_backend_offloads_and_preserves_read_boundary(
     hard = next(fields for kind, fields in events if kind == "hard_boundary_denied")
     assert hard["boundary"] == "protected_read_policy"
     assert hard["reason"] == "mimir_home_read_boundary"
-    assert hard["target"] == str(history)
+    assert hard["target"] == _HISTORY_PATH
+    assert hard["remapped_candidate"] == str(history)
     assert hard["trigger"] == "user_message"
 
     denied = backend.write("/not_writable/outside.md", "blocked")

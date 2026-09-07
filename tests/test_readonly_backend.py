@@ -1534,9 +1534,8 @@ class TestOutsideRootGuard:
         outside.write_text("z\n")
         b = WriteGuardBackend(root_dir=home, writable_dirs=["state"], guard_outside_root=True)
         r = b.read(file_path=str(outside))
-        assert "outside the file-tool root" in (r.error or "")
-        assert "MIMIR_FILE_TOOL_ROOTS" in (r.error or "")
-        assert "shell_exec" in (r.error or "")
+        assert "path is not under any configured file-tool root" in (r.error or "")
+        assert str(outside) not in r.error
 
     def test_guard_on_ls_outside_clear_error(self, tmp_path: Path) -> None:
         home = _split_home(tmp_path)
@@ -1544,7 +1543,7 @@ class TestOutsideRootGuard:
         other.mkdir()
         b = WriteGuardBackend(root_dir=home, writable_dirs=["state"], guard_outside_root=True)
         r = b.ls(path=str(other))
-        assert "outside the file-tool root" in (r.error or "")
+        assert "path is not under any configured file-tool root" in (r.error or "")
 
     def test_guard_on_ls_root_lists_home_entries(self, tmp_path: Path) -> None:
         home = _split_home(tmp_path)
@@ -1574,11 +1573,59 @@ class TestOutsideRootGuard:
         assert b.read(file_path="/state/s.txt").file_data["content"] == "hi\n"
         assert b.read(file_path=str(home / "state" / "s.txt")).file_data["content"] == "hi\n"
 
-    def test_guard_only_fires_for_existing_paths(self, tmp_path: Path) -> None:
+    def test_guard_fires_for_missing_absolute_paths(self, tmp_path: Path) -> None:
         home = _split_home(tmp_path)
         b = WriteGuardBackend(root_dir=home, writable_dirs=["state"], guard_outside_root=True)
         r = b.read(file_path=str(tmp_path / "ghost.txt"))  # outside but does NOT exist
-        assert "outside the file-tool root" not in (getattr(r, "error", "") or "")
+        assert "outside_file_tool_roots" in (r.error or "")
+
+    @pytest.mark.parametrize("spelling", ["relative", "physical", "virtual"])
+    def test_guard_preserves_home_policy(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, spelling: str,
+    ) -> None:
+        home = _split_home(tmp_path)
+        monkeypatch.setenv("MIMIR_HOME", str(home))
+        (home / "state" / "s.txt").write_text("safe\n")
+        auth = AuthContext(
+            principal="u", canonical_principal="u", roles=("user",),
+            event_ingress=None, trigger="user_message", channel_id="c",
+            interactivity=None, enforcement_enabled=True,
+        )
+        backend = WriteGuardBackend(
+            root_dir=home, writable_dirs=["state"], guard_outside_root=True,
+        )
+        prefix = {"relative": "", "physical": f"{home}/", "virtual": "/"}[spelling]
+        token = set_current_turn(SimpleNamespace(turn_id="home-policy", auth_context=auth))
+        try:
+            assert backend.read(prefix + "state/s.txt").error is None
+            assert "outside_file_tool_roots" not in (backend.read(prefix + "state/missing.txt").error or "")
+            assert backend.read(prefix + "logs/missing.txt").error == (
+                "Read denied: mimir_home_read_boundary. Use an allowed state path instead."
+            )
+        finally:
+            reset_current_turn(token)
+
+    def test_outside_audit_redacts_both_paths(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from mimir.redaction import redact_payload
+
+        home = _split_home(tmp_path)
+        target = str(tmp_path / ("sk-" + "a" * 48) / "missing.txt")
+        events = []
+        monkeypatch.setattr(
+            "mimir.tools.budget_gate._emit_event_sync",
+            lambda kind, **fields: events.append((kind, fields)),
+        )
+        backend = WriteGuardBackend(
+            root_dir=home, writable_dirs=["state"], guard_outside_root=True,
+        )
+        result = backend.read(target)
+        hard = [fields for kind, fields in events if kind == "hard_boundary_denied"][0]
+        assert redact_payload(target) != target
+        assert hard["target"] == redact_payload(target)
+        assert hard["remapped_candidate"] == redact_payload(str(home / target.lstrip("/")))
+        assert target not in result.error
 
 
 class TestBuildFileToolRoutes:
@@ -2357,7 +2404,49 @@ class TestFileToolRouter:
         _home, _repo, _ref, router = self._router(tmp_path)
         outside = tmp_path / "outside.txt"
         outside.write_text("z\n")
-        assert "outside the file-tool root" in (router.read(str(outside)).error or "")
+        assert "outside_file_tool_roots" in (router.read(str(outside)).error or "")
+
+    @pytest.mark.parametrize("operation", ["read", "aread", "ls", "als", "edit", "aedit"])
+    @pytest.mark.parametrize("existing", [False, True], ids=["typo", "existing"])
+    async def test_outside_root_denial_preserves_requested_path(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+        operation: str, existing: bool,
+    ) -> None:
+        home, repo, _ref, router = self._router(tmp_path)
+        monkeypatch.setenv("MIMIR_HOME", str(home))
+        # The router owns exactly these routes, not the ambient /tmp allowance.
+        target = repo.with_name("repo-typo") / "day3_update.json"
+        if existing:
+            target.parent.mkdir()
+            target.write_text("private\n")
+        events = []
+        monkeypatch.setattr(
+            "mimir.tools.budget_gate._emit_event_sync",
+            lambda kind, **fields: events.append((kind, fields)),
+        )
+        auth = AuthContext(
+            principal="u", canonical_principal="u", roles=("user",),
+            event_ingress=None, trigger="user_message", channel_id="c",
+            interactivity=None, enforcement_enabled=True,
+        )
+        token = set_current_turn(SimpleNamespace(turn_id="outside-roots", auth_context=auth))
+        try:
+            args = (str(target), "private", "changed") if "edit" in operation else (str(target),)
+            result = getattr(router, operation)(*args)
+            if operation.startswith("a"):
+                result = await result
+        finally:
+            reset_current_turn(token)
+        assert "path is not under any configured file-tool root" in result.error
+        assert "mimir_home_read_boundary" not in result.error
+        assert str(target) not in result.error
+        hard = [fields for kind, fields in events if kind == "hard_boundary_denied"]
+        assert len(hard) == 1
+        assert hard[0]["reason"] == "outside_file_tool_roots"
+        assert hard[0]["target"] == str(target)
+        assert hard[0]["remapped_candidate"] == str(home / str(target).lstrip("/"))
+        if existing:
+            assert target.read_text() == "private\n"
 
     def test_drain_denials_forwards_to_home(self, tmp_path: Path) -> None:
         _home, _repo, _ref, router = self._router(tmp_path)
