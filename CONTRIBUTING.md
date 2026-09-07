@@ -58,6 +58,14 @@ test suite — no separate `cd` is needed.
 
 ### Run both, and require both green
 
+Tests have a 300-second per-test bound via pytest-timeout's POSIX `signal`
+method, including inside xdist workers. A timeout reports the failed node id and
+lets the session continue; do not switch to `thread`, which exits the worker.
+The 300-second faulthandler stack dump remains enabled for diagnostics.
+Audit slow tests with `uv run --extra dev pytest --durations=20`. If a test
+legitimately needs more than five minutes, add `@pytest.mark.timeout(seconds)`
+with a comment explaining why; do not raise or disable the default globally.
+
 A scoped run is not evidence. Before submitting a test, run it alone **and** in
 the full suite:
 
