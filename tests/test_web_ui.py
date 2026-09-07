@@ -342,14 +342,14 @@ async def test_chainlink_board_parses_cli_json_and_worklink_evidence(
         """#!/usr/bin/env python3
 import json, sys
 args = sys.argv[1:]
-if args[:2] == ["issue", "list"]:
+if args == ["export", "--json"]:
     print(json.dumps([
         {"id": 524, "title": "Parent", "status": "open", "priority": "high", "labels": ["epic"], "updated_at": "2026-06-18T00:00:00Z"},
-        {"id": 545, "title": "Board", "status": "open", "priority": "medium", "labels": ["worklink:review", "frontend"], "parent_id": 524, "blocked_by": [540], "updated_at": "2026-06-18T01:00:00Z"},
+        {"id": 545, "title": "Board", "status": "open", "priority": "medium", "labels": ["worklink:review", "frontend"], "parent_id": 524, "updated_at": "2026-06-18T01:00:00Z"},
         {"id": 540, "title": "Prereq", "status": "closed", "priority": "low", "labels": [], "updated_at": "2026-06-17T00:00:00Z"}
     ]))
 elif args[:2] == ["issue", "show"] and args[2] == "545":
-    print(json.dumps({"id": 545, "description": "Acceptance criteria", "comments": [{"author": "mimir", "created_at": "2026-06-18T02:00:00Z", "body": "WORKLINK_EVIDENCE attached"}]}))
+    print(json.dumps({"id": 545, "blocked_by": [540], "description": "Acceptance criteria", "comments": [{"author": "mimir", "created_at": "2026-06-18T02:00:00Z", "body": "WORKLINK_EVIDENCE attached"}]}))
 elif args[:2] == ["issue", "show"] and args[2] == "524":
     print(json.dumps({"id": 524, "subissues": [545]}))
 elif args[:2] == ["issue", "show"] and args[2] == "540":
@@ -395,37 +395,58 @@ async def test_chainlink_board_pages_filter_before_cutoff_and_load_selected(
         for i in range(1000, 1300)
     ]
     active[168]["labels"].append("worklink:blocked")
+    active[214]["parent_id"] = 1168
     calls = []
     fail_detail = False
 
     async def run(home, args):
         assert home == tmp_path
         calls.append(args)
-        if args == ["issue", "list", "--status", "all", "--json"]:
+        if args == ["export", "--json"]:
+            assert all(not ({"blocked_by", "blocking", "relations"} & item.keys())
+                       for item in closed + active)
             return closed + active, None
         assert args[:2] == ["issue", "show"]
         if fail_detail:
             return None, "temporary CLI failure"
-        return {"id": int(args[2]), "description": "Old selected detail"}, None
+        issue_id = int(args[2])
+        return {"id": issue_id, "description": "Old selected detail",
+                "blocked_by": [1299] if issue_id in (1168, 1214) else []}, None
+
+    async def request(expected_shows, **kwargs):
+        calls.clear()
+        result = await build_chainlink_board_payload(tmp_path, **kwargs)
+        assert calls[0] == ["export", "--json"]
+        shows = [args for args in calls if args[:2] == ["issue", "show"]]
+        assert len(calls) == 1 + expected_shows
+        assert len(shows) == expected_shows
+        assert len({args[2] for args in shows}) == expected_shows
+        return result
 
     monkeypatch.setattr(chainlink_board, "_run_chainlink_json", run)
-    first = await build_chainlink_board_payload(tmp_path, show_completed=False)
+    first = await request(250, show_completed=False)
     assert first["total_count"] == 300
     assert first["truncated"] is True
     assert first["next_offset"] == 250
     assert len(first["issues"]) == 250
-    assert calls == [["issue", "list", "--status", "all", "--json"]]
-    second = await build_chainlink_board_payload(tmp_path, show_completed=False, offset=250)
+    blocked = next(item for item in first["issues"] if item["id"] == 1168)
+    assert blocked["labels"] == ["old", "worklink:blocked"]
+    assert blocked["status"] == "blocked"
+    dependency_only = next(item for item in first["issues"] if item["id"] == 1214)
+    assert dependency_only["status"] == "blocked"
+    assert {"from": 1299, "to": 1168, "kind": "blocks"} in first["edges"]
+    assert {"from": 1168, "to": 1214, "kind": "parent"} in first["edges"]
+    assert first["filters"]["labels"] == ["old", "worklink:blocked"]
+    second = await request(50, show_completed=False, offset=250)
     assert second["next_offset"] is None
     assert second["truncated"] is True
     assert second["total_count"] == 300
     assert {item["id"] for item in first["issues"] + second["issues"]} == {
         item["id"] for item in active
     }
-    assert {1168, 1214} <= {item["id"] for item in first["issues"] + second["issues"]}
 
-    filtered = await build_chainlink_board_payload(
-        tmp_path, label="old", status="blocked", priority="high", show_completed=False,
+    filtered = await request(
+        2, label="old", status="blocked", priority="high", show_completed=False,
         issue=1299,
     )
     assert [item["id"] for item in filtered["issues"]] == [1168]
@@ -434,23 +455,28 @@ async def test_chainlink_board_pages_filter_before_cutoff_and_load_selected(
     assert filtered["selected_issue"]["id"] == 1299
     assert filtered["selected_issue"]["description"] == "Old selected detail"
     assert filtered["selected_issue_state"] == "loaded"
-    assert filtered["filters"]["labels"] == ["old", "worklink:blocked"]
-    assert sum(args[:2] == ["issue", "show"] for args in calls) == 1
-
-    done = await build_chainlink_board_payload(tmp_path, status="done", show_completed=False)
+    # Global blocked filtering uses lifecycle labels, not dependency discovery.
+    lifecycle = await request(1, status="blocked", show_completed=False)
+    assert [item["id"] for item in lifecycle["issues"]] == [1168]
+    in_page = await request(250, show_completed=False, issue=1214)
+    assert in_page["selected_issue_state"] == "loaded"
+    off_page = await request(251, show_completed=False, issue=1299)
+    assert off_page["selected_issue"]["id"] == 1299
+    done = await request(250, status="done", show_completed=False)
     assert done["total_count"] == 300
     assert all(item["status"] == "done" for item in done["issues"])
-    empty = await build_chainlink_board_payload(tmp_path, label="absent", issue=9999)
+    empty = await request(0, label="absent", issue=9999)
     assert empty["issues"] == []
     assert empty["total_count"] == 0
     assert empty["truncated"] is False
     assert empty["selected_issue_state"] == "missing"
-    assert sum(args[:2] == ["issue", "show"] for args in calls) == 1
     fail_detail = True
-    unavailable = await build_chainlink_board_payload(tmp_path, issue=1214)
+    unavailable = await request(250, show_completed=False, issue=1214)
     assert unavailable["selected_issue_state"] == "unavailable"
     assert unavailable["selected_issue"] is None
-    assert sum(args[:2] == ["issue", "show"] for args in calls) == 2
+    assert next(item for item in unavailable["issues"] if item["id"] == 1168)["labels"] == ["old", "worklink:blocked"]
+    off_page_failure = await request(251, show_completed=False, issue=1299)
+    assert off_page_failure["selected_issue_state"] == "unavailable"
 
 
 @pytest.mark.asyncio
@@ -564,6 +590,85 @@ async def test_factory_runs_list_with_runs(tmp_path: Path, monkeypatch: pytest.M
         assert run["status"] == "running"
         assert run["lock"] == "fresh"
         assert run["next"] == "brief"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("route", ["list", "detail"])
+@pytest.mark.parametrize(
+    ("valid", "raw_status", "controller_phase", "issue_key", "expected_issue_key"),
+    [
+        pytest.param(True, "running", "running", "CL-1521", "CL-1521", id="valid-running"),
+        pytest.param(True, "completed", "terminal", "CL-1521", "CL-1521", id="valid-completed"),
+        pytest.param(True, "needs-human", "parked", "CL-1521", "CL-1521", id="valid-needs-human"),
+        pytest.param(False, "running", "running", "CL-1521", "CL-1521", id="invalid-running"),
+        pytest.param(False, None, "running", "CL-1521", "CL-1521", id="invalid-null"),
+        pytest.param(None, None, "running", None, "1521", id="missing-projection"),
+        pytest.param(None, None, "failed", None, "1521", id="failed-missing-projection"),
+        pytest.param(False, "running", "failed", "CL-1521", "CL-1521", id="failed-invalid-running"),
+        pytest.param(False, None, "failed", "CL-1521", "CL-1521", id="failed-invalid-null"),
+        pytest.param(True, "running", "failed", "CL-1521", "CL-1521", id="failed-valid-running"),
+        pytest.param(True, "completed", "terminal", None, "1521", id="completed-empty-issue-key"),
+    ],
+)
+async def test_factory_runs_preserve_persisted_projection(
+    tmp_path: Path,
+    route: str,
+    valid: bool | None,
+    raw_status: str | None,
+    controller_phase: str,
+    issue_key: str | None,
+    expected_issue_key: str,
+):
+    """Issue 1544: raw factory state stays separate from controller state."""
+    home = tmp_path / "home"
+    home.mkdir()
+    run_id = "chainlink-1521"
+    sandbox = tmp_path / run_id
+    status = None
+    if valid is not None:
+        status = parse_factory_status({
+            "run_id": run_id,
+            "issue_key": issue_key,
+            "valid": valid,
+            "sandbox_path": str(sandbox),
+            "status": raw_status,
+            "mode": "autonomous",
+            "branch": "epic/1521",
+            "pr_base": "main",
+        })
+    controller_error = "factory observation failed" if controller_phase == "failed" else None
+    save_factory_record(home, FactoryRunRecord(
+        run_id=run_id, issue_id=1521, attempt=1, repository="owner/repo",
+        base_ref="main", branch="epic/1521", launcher="/opt/factory/bin/factory.js",
+        sandbox=str(sandbox), session="session-1", handle=None, status=status,
+        observed_at="2026-09-06T10:00:00Z", controller_phase=controller_phase,
+        controller_error=controller_error,
+    ))
+
+    app = web.Application()
+    web_ui.register_routes(
+        app, turns_log=tmp_path / "turns", events_log=tmp_path / "events", home=home,
+    )
+
+    async with TestClient(TestServer(app)) as client:
+        path = "/api/v1/factory-runs"
+        if route == "detail":
+            path += f"/{run_id}"
+        resp = await client.get(path)
+        assert resp.status == 200
+        body = await resp.json()
+
+    assert body["ok"] is True
+    if route == "list":
+        [run] = body["data"]["runs"]
+    else:
+        run = body["data"]
+    assert run["run_id"] == run_id
+    assert run["issue_key"] == expected_issue_key
+    assert run["status"] == raw_status
+    assert run["valid"] is (valid if valid is not None else False)
+    assert run["controller_phase"] == controller_phase
+    assert run["controller_error"] == controller_error
 
 
 @pytest.mark.asyncio

@@ -1,11 +1,19 @@
 ---
 name: async-tasks
-description: Turn "block until condition X is met" into an agent wake-up via the bash_async tool. Use when you need to wait for a one-shot event without burning context — a webhook arriving, a CI pipeline finishing, a file appearing, a long shell command completing — AND you want this conversation to resume with full context when the event fires. Distinct from pollers (recurring) and the synchronous Bash tool (blocks the turn). The completion event lands as a fresh turn on the spawning channel; no polling needed.
+description: Turn "block until condition X is met" into an agent wake-up via bash_async, only when that tool is present in the current turn's tool list. Use when you need to wait for a one-shot event without burning context — a webhook arriving, a CI pipeline finishing, a file appearing, a long shell command completing — AND you want this conversation to resume with full context when the event fires. Distinct from pollers (recurring) and the synchronous Bash tool (blocks the turn). The completion event lands as a fresh turn on the spawning channel; no polling needed.
 ---
 
-<!-- desc: Turn "block until condition X is met" into an agent wake-up via bash_async — use for one-shot async events (webhooks, CI pipelines, file arrival). -->
+<!-- desc: Turn "block until condition X is met" into an agent wake-up for one-shot events, only when bash_async is in the current turn's tool list. -->
 
 # Async Task Patterns
+
+**Tool availability:** These patterns apply only when the required tools are
+present in the current turn's tool list. Check before calling `bash_async`,
+`bash_jobs_list`, `bash_job_output`, `send_message`, or tools for pre-spawn writes.
+Service turns, including completion turns, can lack tools; recheck on each turn.
+If a required tool is absent, state the limitation rather than inventing alternate
+tools or claiming that a job, notification, or write happened. Existing admin
+instructions and authorization requirements still apply.
 
 The deeper move behind any "block until X" primitive is:
 

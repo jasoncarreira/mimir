@@ -150,6 +150,15 @@ and (when set) `user.login != MIMIR_GITHUB_SELF_LOGIN`. Push + review-request
 detection are state-based (head-SHA delta / `requested_reviewers` membership),
 not `created_at`-windowed.
 
+## PR Mutation Boundaries
+
+For PR body corrections, use only `pr_edit_body(repository, pull_request, body)`
+and only when the bound scope grants `pr.edit`. Ordinary review and CI
+remediation do not grant `pr.edit`. Other PR metadata mutations (title, base,
+state, labels, assignees, draft status) remain unsupported: use
+`unsupported_operation`, not shell, `gh`, or direct API fallbacks. The existing
+`pr_rerequest_review` path remains supported only with `pr.rerequest` authority.
+
 ## What it doesn't watch (deliberate)
 
 - **Commits** — already handled by `git pull`. No GitHub-API path for "new commit" wakes today.

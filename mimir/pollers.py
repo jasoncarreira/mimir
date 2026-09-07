@@ -80,6 +80,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import signal
 import time
 import urllib.error
@@ -95,10 +96,12 @@ from .access_control import (
     BOUNDED_PROFILE_CAPABILITIES,
     CapabilityTier,
     ServicePrincipal,
+    SinkCategory,
     TRIGGER_AUTHORITY_PROFILES,
     TRIGGER_CAPABILITY_TIERS,
     agent_writable_roots,
     build_trigger_service_principal,
+    normalize_sink_destination,
     parse_declared_shell_commands,
 )
 from .event_logger import log_event, get_events_path, get_logger
@@ -980,7 +983,7 @@ _AUTHORITY_KEYS = frozenset({"profile", "tier", "capabilities", "scoped_roots"})
 #: Additive, and optional so every manifest written before it existed still
 #: registers. The required-key check above is deliberately "missing" rather than
 #: an exact-set comparison for that reason.
-_OPTIONAL_AUTHORITY_KEYS = frozenset({"shell_commands", "saga_full_corpus_read"})
+_OPTIONAL_AUTHORITY_KEYS = frozenset({"shell_commands", "saga_full_corpus_read", "approved_urls"})
 _TIER_RANK = {
     CapabilityTier.SCOPE_CONTAINED: 0,
     CapabilityTier.SCOPED_WITH_PROVENANCE: 1,
@@ -1053,6 +1056,39 @@ def _parse_poller_authority(
     ):
         raise ValueError("authority capabilities must be a list of non-empty names")
     capabilities = tuple(dict.fromkeys(capabilities_raw))
+    approved_urls: list[str] = []
+    if "approved_urls" in raw:
+        if profile != "research":
+            raise ValueError("authority approved_urls is only supported by the research profile")
+        urls_raw = raw["approved_urls"]
+        if not isinstance(urls_raw, list):
+            raise ValueError("authority approved_urls must be a list of HTTPS URLs")
+        for url in urls_raw:
+            if not isinstance(url, str) or not url or any(
+                char.isspace() or ord(char) < 32 or char in "*\\" for char in url
+            ):
+                raise ValueError(f"invalid approved_urls entry: {url!r}")
+            normalized = normalize_sink_destination(SinkCategory.NETWORK, url)
+            parsed = urllib.parse.urlsplit(normalized) if normalized else None
+            if (
+                parsed is None
+                or parsed.scheme != "https"
+                or "#" in url
+                or not parsed.hostname
+                or not all(
+                    re.fullmatch(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?", label)
+                    for label in parsed.hostname.split(".")
+                )
+                or len(parsed.hostname.split(".")) < 2
+                or any(segment in {".", ".."} for segment in parsed.path.split("/"))
+            ):
+                raise ValueError(f"invalid approved_urls entry: {url!r}")
+            approved_urls.append(normalized)
+    if profile == "research":
+        if "fetch_url" in capabilities and not approved_urls:
+            raise ValueError("fetch_url requires non-empty authority approved_urls")
+        if approved_urls and "fetch_url" not in capabilities:
+            capabilities += ("fetch_url",)
     unknown_caps = set(capabilities) - set(TRIGGER_CAPABILITY_TIERS)
     if unknown_caps:
         raise ValueError(f"unknown capabilities: {', '.join(sorted(unknown_caps))}")
@@ -1072,8 +1108,7 @@ def _parse_poller_authority(
             )
         if name == "session-boundary" and _TIER_RANK[tier] > _TIER_RANK[CapabilityTier.SCOPED_WITH_PROVENANCE]:
             raise ValueError("session-boundary manifest cannot widen the built-in tier")
-    # GitHub fetches are statically unbounded as a generic operation, but this
-    # profile always receives the server-defined GITHUB_REPOS PR-path adapter.
+    # Generic fetches are unbounded, but these profiles bind a destination adapter.
     bounded_profile_capabilities = BOUNDED_PROFILE_CAPABILITIES.get(profile, frozenset())
     if any(
         _TIER_RANK[TRIGGER_CAPABILITY_TIERS[cap]] > _TIER_RANK[tier]
@@ -1150,6 +1185,7 @@ def _parse_poller_authority(
         channel_memory_directory=canonical,
         saga_full_corpus_read=saga_full_corpus_read,
         declared_shell_commands=declared_shell_commands,
+        approved_urls=tuple(approved_urls),
         creation_path=f"mimir.pollers.run_poller:{manifest_path}",
     )
 

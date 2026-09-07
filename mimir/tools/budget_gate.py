@@ -109,7 +109,7 @@ log = logging.getLogger(__name__)
 _STANDING_REVIEW_TOOLS = frozenset({
     "pr_metadata", "pr_files", "pr_diff", "pr_checks", "pr_reviews",
     "pr_comments", "pr_review_requests", "pr_submit_review",
-    "pr_inline_review_comment", "pr_comment", "pr_rerequest_review",
+    "pr_inline_review_comment", "pr_comment", "pr_edit_body", "pr_rerequest_review",
     "repo_checkout", "repo_cleanup", "repo_fetch", "repo_status", "repo_test",
     "repo_diff", "repo_unmerged",
 })
@@ -154,7 +154,7 @@ _SPAWN_OPEN_CODE_ERROR_STATUSES = frozenset({
     "authentication_required", "failed", "proposal_unavailable",
 })
 _REMEDIATION_EFFECT_TOOLS = frozenset({
-    "repo_commit", "repo_push", "pr_comment", "pr_inline_review_comment",
+    "repo_commit", "repo_push", "pr_comment", "pr_edit_body", "pr_inline_review_comment",
     "pr_rerequest_review",
 })
 
@@ -513,7 +513,7 @@ def _extract_sink_target(
     args = tc.get("args") or {}
     tool_name = _tool_name_from_request(request)
     if tool_name in {
-        "pr_submit_review", "pr_inline_review_comment", "pr_comment",
+        "pr_submit_review", "pr_inline_review_comment", "pr_comment", "pr_edit_body",
         "pr_rerequest_review", "unsupported_operation", "repo_checkout",
         "repo_cleanup", "repo_fetch", "repo_test", "repo_stage", "repo_commit", "repo_merge",
         "repo_merge_abort", "repo_rebase", "repo_rebase_abort", "repo_revert",
@@ -1087,6 +1087,48 @@ def _service_shell_refusal(request: ToolCallRequest) -> str | None:
     return refusal if isinstance(refusal, str) and refusal else None
 
 
+def _service_shell_refusal_guidance(
+    message: str, tool_name: str, service: ServicePrincipal | None,
+) -> str:
+    """Add recovery text only; never reinterpret an authorization decision."""
+    if tool_name != "shell_exec" or service is None:
+        return message
+    policy = service.sink_policy_for(tool_name)
+    operations = {
+        "scheduler_read_only": "bounded file inspection, read-only Git and Chainlink operations",
+        "maintenance": "bounded file/date inspection, read-only Git/GitHub and Chainlink operations",
+        "session_boundary": "bounded Chainlink operations and GitHub issue/PR views",
+        "repo_review": "bounded repository inspection, review operations and script-free npm ci",
+        "upgrade_workspace": "bounded file inspection, workspace Git, Chainlink and uv lock/sync operations",
+    }.get(policy.destination if policy is not None else "")
+    if operations and "trusted-service shell profile does not admit" in message:
+        message += f" Profile allows {operations}, subject to its option and scope limits."
+    if "filesystem operand" in message:
+        # Only principal-owned read roots, never the rejected operand or global
+        # configuration. Cap both count and bytes and preserve whole path names.
+        roots = service_filesystem_read_roots(service)
+        shown: list[str] = []
+        size = 0
+        for root in roots:
+            rendered = json.dumps(str(root), ensure_ascii=True)
+            if len(shown) == 8 or size + len(rendered) > 1024:
+                continue
+            shown.append(rendered)
+            size += len(rendered)
+        if shown:
+            qualifier = " (partial list)" if len(shown) < len(roots) else ""
+            message += f" Allowed read roots{qualifier}: {', '.join(shown)}; protected files remain withheld."
+    if "shell metacharacters" in message:
+        message += (
+            " Pipes, redirections and command chaining are not available on this turn;"
+            " a single plain command is available if the profile admits it."
+        )
+    return message + (
+        " Without shell, if exposed and authorized on this turn, use ls for directory listing,"
+        " read_file for file contents, and grep/glob for searching within allowed read roots."
+    )
+
+
 def _duplicate_review_result(request: ToolCallRequest, claim: Any) -> ToolMessage:
     """Return and record the successful no-op without exposing review text."""
     _emit_event_sync(
@@ -1359,9 +1401,10 @@ def _request_for_authorized_execution(
         # executing anything; the argv below stays as defense in depth, so a
         # future refactor that drops this channel still fails closed rather than
         # reaching a shell.
-        args["mimir_shell_refusal"] = (
+        args["mimir_shell_refusal"] = _service_shell_refusal_guidance(
             f"{tool_name} was refused before execution: {refusal} "
-            f"binding_rule={binding_rule.value if binding_rule is not None else 'unknown'}"
+            f"binding_rule={binding_rule.value if binding_rule is not None else 'unknown'}",
+            tool_name, service,
         )
         args["mimir_direct_argv"] = [
             "/usr/bin/false",
@@ -1388,8 +1431,9 @@ def _request_for_authorized_execution(
             args.get("cwd"), service,
         )
     if cwd_refusal is not None:
-        args["mimir_shell_refusal"] = (
-            f"{tool_name} was refused before execution: {cwd_refusal}."
+        args["mimir_shell_refusal"] = _service_shell_refusal_guidance(
+            f"{tool_name} was refused before execution: {cwd_refusal}.",
+            tool_name, service,
         )
         return sanitized_request.override(
             tool_call={**request.tool_call, "args": args}
@@ -1406,9 +1450,10 @@ def _request_for_authorized_execution(
         )
     )
     if confined_argv is None:
-        args["mimir_shell_refusal"] = (
+        args["mimir_shell_refusal"] = _service_shell_refusal_guidance(
             f"{tool_name} was refused before execution: {confinement_refusal} "
-            f"binding_rule={confinement_rule.value if confinement_rule is not None else 'unknown'}"
+            f"binding_rule={confinement_rule.value if confinement_rule is not None else 'unknown'}",
+            tool_name, service,
         )
         return sanitized_request.override(
             tool_call={**request.tool_call, "args": args}
@@ -1825,9 +1870,13 @@ def _deny_admin_tool(
         )
     # ``reason`` stays the machine key on both events; the prose detail is for
     # the caller's tool result only, so the audit stream keeps grouping cleanly.
-    return _admin_denial_message(
+    message = _admin_denial_message(
         tool_name, reason, detail, principal_is_admin="admin" in roles,
     )
+    service = get_trusted_service_from_auth_context(ctx) if isinstance(ctx, AuthContext) else None
+    if tool_name == "shell_exec" and service is not None and not detail:
+        message = f"shell_exec was refused before execution ({reason})."
+    return _service_shell_refusal_guidance(message, tool_name, service)
 
 
 def _check_admin_authorized(

@@ -611,6 +611,15 @@ class GitHubForgeClient:
             raise ForgeError("forge returned invalid comment result")
         return self._comment(data)
 
+    def edit_pull_request_body(self, scope: RepoPRActionScope, body: str) -> None:
+        """Update only the description, never other pull-request metadata."""
+        repository, number = self._target(scope)
+        body = self._body(body)
+        self._confirm_effect_identity(scope)
+        self._request(
+            "PATCH", f"/repos/{repository}/pulls/{number}", body={"body": body},
+        )
+
     def get_open_issue_target(self, repository: str, issue: int) -> IssueTarget:
         """Resolve an exact open issue from server-returned identity fields."""
         if (

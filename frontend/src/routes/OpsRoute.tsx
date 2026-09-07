@@ -71,7 +71,11 @@ function compactNumber(value: number) {
 function formatDateLabel(value: string) {
   const parsed = Date.parse(value);
   if (!Number.isFinite(parsed)) return value;
-  return new Intl.DateTimeFormat(undefined, { month: "short", day: "numeric" }).format(parsed);
+  // Rollup dates are calendar buckets, not instants to shift into local time.
+  const calendarDate = /^\d{4}-\d{2}-\d{2}$/.test(value);
+  return new Intl.DateTimeFormat(undefined, {
+    month: "short", day: "numeric", ...(calendarDate ? { timeZone: "UTC" } : {})
+  }).format(parsed);
 }
 
 function formatTimestamp(value: string) {

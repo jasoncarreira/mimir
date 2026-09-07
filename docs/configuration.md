@@ -313,6 +313,7 @@ repository files and model-generated values never add permission entries.
 | `GITHUB_REPOS` | csv `owner/repository` | unset | Legacy projection of `repositories.yaml` `repositories[].slug`. When the repository inventory is declared, an omitted value is derived and a disagreeing value is a startup error. Without the inventory, it retains the legacy repository allowlist behavior. |
 | `MIMIR_WORKLINK_REPO` | str | unset | Dedicated base repository Worklink branches from (back-compat alias of `WORKLINK_REPO`, which wins). Never inferred from cwd or the Mimir installation. |
 | `MIMIR_WORKLINK_AGENT_ID` | str | process-generated | Internal process-scoped owner inherited by detached Worklink controllers; the server sets this automatically. |
+| `PYTEST_ADDOPTS` | pytest arguments | unset | Existing pytest options are preserved by the Worklink gate alongside its fresh JUnit/cache reporting options. Failed-node reruns override selection and use `-n 0`, retaining execution settings such as warning policies. |
 | `MIMIR_WORKLINK_REAPER_CRON` | cron | `""` (off) | Stale-claim TTL reaper cron; empty registers no job (non-Worklink homes). |
 | `MIMIR_SCRATCH_JANITOR_CRON` | cron | `13 4 * * *` (on) | Daily scratch-retention sweep of the home's ephemeral roots; empty disables. |
 | `MIMIR_SCRATCH_TTL_DAYS` | int | `1` | Age (newest contained mtime, days) before a scratch entry is swept; the recency check keeps in-use checkouts. `<= 0` disables the janitor. |
@@ -422,10 +423,78 @@ that is absent from the neutral inventory is also fatal. Run
 runs before application construction or socket binding and names the repository,
 expected origin, and observed origin on failure.
 
-`repo_test` uses a repository `test_command` when present and otherwise falls
-back to `defaults.test_command`. It POSIX-splits the selected value into fixed
-arguments and runs it without a shell. Results include the resolved command and
-whether it came from `repository` or `deployment` configuration.
+#### Repository Test Suites
+
+Each repository can declare `test_suites` (default `[]`) in
+`repositories.yaml`. Each entry uses the `RepositoryTestSuite` fields:
+
+| Field | Type | Default | Effect |
+|---|---|---|---|
+| `name` | str | required | Unique suite name matching `[A-Za-z0-9][A-Za-z0-9_.-]*`. The name `default` is reserved when the repository has a non-null `test_command`. |
+| `command` | str | required | Non-empty, operator-configured test command, POSIX-split into fixed arguments. |
+| `default` | bool | `false` | Select this suite when neither a suite name nor selectors are supplied. At most one suite may set `default: true`. |
+| `selector_prefixes` | list[str] | `[]` | Non-empty literal prefixes used to route selector paths to this suite. |
+| `selector_suffixes` | list[str] | `[]` | Non-empty literal suffixes used to route selector paths to this suite. |
+
+For Mimir, a two-suite inventory entry looks like this (adjust the root to the
+registered checkout):
+
+```yaml
+repositories:
+  - slug: jasoncarreira/mimir
+    root: /workspace/mimir
+    mode: rw
+    origin: https://github.com/jasoncarreira/mimir.git
+    base_branch: main
+    test_suites:
+      - name: python
+        command: uv run --extra dev --extra bench pytest -q
+        default: true
+        selector_prefixes: [tests/]
+        selector_suffixes: [.py]
+      - name: frontend
+        command: npm run test:ci
+        selector_prefixes: [frontend/]
+        selector_suffixes: [.test.ts, .test.tsx]
+```
+
+`repo_test` resolves the command and suite as follows:
+
+- Without suites, legacy behavior is unchanged: the repository `test_command`
+  wins, otherwise `defaults.test_command` supplies the deployment fallback. This
+  command is exposed as the default suite named `default`.
+- With suites, a declared `default: true` wins. If none is declared but the
+  repository has a `test_command`, that command is synthesized as a default suite
+  named `default`. Deployment configuration does not supply a default when suites
+  are declared.
+- An explicit `suite` selects by name. Otherwise, when selectors are supplied,
+  every selector's path must match a prefix **or** suffix of the same single
+  suite. Matching uses the path before any pytest `::` node suffix, not globs.
+- With neither an explicit suite nor selectors, the default suite is selected.
+  If there is no default, the request is refused. Unknown suite names, ambiguous
+  or unmatched selectors, and mixed selectors that cannot route to one suite are
+  also refused with `test_suite_selection_refused`, which lists available suites.
+
+Selection does not relax selector validation: frontend selectors must be bounded
+relative `.ts` or `.tsx` file paths, with no pytest-style `::` node selectors.
+For example, `frontend/src/example.test.tsx` routes to `frontend` in the sample;
+it cannot be combined with `tests/test_example.py` in an automatically routed run.
+
+The runner POSIX-splits the selected command and launches it without a shell.
+For declared suites using `npm run` scripts, it inserts `--` before appended
+selectors when needed, producing e.g.
+`npm run test:ci -- frontend/src/example.test.tsx`. Mimir's root `package.json`
+defines `test:ci` as `npm ci && vitest run`: npm interprets that script, not the
+runner's command parser. The script runs only in the disposable snapshot under
+the existing containment policy, with a fresh `HOME` per execution and no shared
+npm cache. Suite configuration does not grant live-checkout execution or widen
+containment permissions.
+
+Results include the selected suite, resolved command, and whether the command
+came from `repository` or `deployment` configuration. Only a run of the default
+suite **without selectors** records the existing full-test evidence. In the
+sample, running the frontend suite, even without selectors, does not satisfy or
+bypass that gate; the default Python suite remains required.
 
 ### Defaults
 
@@ -435,6 +504,7 @@ whether it came from `repository` or `deployment` configuration.
 | `defaults.timeout_s` | int | `1800` | Maximum seconds allowed for the backend/compute run. | `timeout_s: 3600` |
 | `defaults.priority` | str | `normal` | Priority supplied to the autonomous arbiter. | `priority: low` |
 | `defaults.test_command` | command string | `uv run pytest -q` | Command Worklink uses for observed test evidence. Granting the typed `repo_test` capability lets a remediation turn run this same configured command, shell-free, in its authorized PR checkout lease. | `test_command: "/usr/bin/npm test"` |
+| `defaults.gate_rerun_max_failures` | nonnegative int | `10` | Maximum failed pytest node IDs eligible for one serial rerun per gate observation; `0` disables reruns. Above the bound, unsupported commands, collection errors, or incomplete rerun reports retain the failed gate. A complete rerun separates `flaky_tests` from persistent `failed_tests` and emits `worklink_gate_flaky_tests`. Both pre-commit and post-commit gate observations retain their evidence. | `gate_rerun_max_failures: 10` |
 | `defaults.backend_by_category` | mapping | `{}` | Selects a backend by tool category after no route matches. | `backend_by_category: {coding-cli: opencode}` |
 | `defaults.category_defaults` | mapping | `{}` | Compatibility alias for `backend_by_category`; ignored when that key is non-empty. | `category_defaults: {coding-cli: opencode}` |
 | `defaults.compute_backend` | compute name | `local_subprocess` | Selects where the tool backend runs. The shipping value is unsandboxed. | `compute_backend: local_subprocess` |

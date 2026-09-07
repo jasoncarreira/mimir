@@ -166,6 +166,14 @@ async def test_build_agent_registers_structured_subagents(
     todo_middleware = [item for item in middleware if item.name == "TodoListMiddleware"]
     assert len(todo_middleware) == 1
     assert [tool.name for tool in todo_middleware[0].tools] == ["write_todos"]
+    from mimir.tools.budget_gate import BudgetGateMiddleware
+    from mimir.tools.service_tool_surface import ServiceToolSurfaceMiddleware
+
+    assert sum(isinstance(item, ServiceToolSurfaceMiddleware) for item in middleware) == 1
+    surface_index = next(i for i, item in enumerate(middleware)
+                         if isinstance(item, ServiceToolSurfaceMiddleware))
+    assert surface_index + 1 < len(middleware), "service surface must precede BudgetGate"
+    assert isinstance(middleware[surface_index + 1], BudgetGateMiddleware)
 
 
 @pytest.mark.asyncio

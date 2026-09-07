@@ -90,7 +90,9 @@ def _make_db(path: Path) -> sqlite3.Connection:
             channel_id TEXT,
             started_at TEXT NOT NULL,
             ended_at TEXT,
-            summary TEXT
+            summary TEXT,
+            embedding BLOB,
+            embedding_dim INTEGER
         );
         CREATE TABLE access_events (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -147,7 +149,7 @@ def _make_db(path: Path) -> sqlite3.Connection:
 
 def _insert_session(conn: sqlite3.Connection, session_id: str, channel_id: str) -> None:
     conn.execute(
-        "INSERT INTO sessions VALUES (?, ?, '2026-05-28T00:00:00Z', NULL, NULL)",
+        "INSERT INTO sessions (id, channel_id, started_at) VALUES (?, ?, '2026-05-28T00:00:00Z')",
         (session_id, channel_id),
     )
     conn.commit()
@@ -229,6 +231,71 @@ def test_build_db_stats_populated(tmp_path: Path) -> None:
     assert result["triple_count"] == 1
     assert result["schema_version"] == 6
     assert result["db_size_bytes"] > 0
+
+
+def test_embedding_health_uses_provider_not_majority(tmp_path, monkeypatch):
+    from unittest.mock import Mock
+    from mimir.saga import embeddings
+
+    provider = Mock()
+    provider.dimensions.return_value = 2
+    monkeypatch.setattr(embeddings, "get_provider", lambda: provider)
+    path = tmp_path / "saga.db"
+    conn = _make_db(path)
+    for i, dim in enumerate((2, 3, 3)):
+        _insert_atom(conn, str(i))
+        conn.execute("INSERT INTO embeddings VALUES (?, 'test', 'test', ?, ?, 'now')",
+                     (str(i), dim, bytes(dim * 4)))
+    conn.commit()
+    conn.close()
+    health = build_db_stats_payload(path)["embedding_health"]
+    assert health == {
+        "dimension": 2, "status": "degraded",
+        "atoms": {"dimensions": {"2": 1, "3": 2}, "excluded_from_recall": 2},
+        "sessions": {"dimensions": {}, "excluded_from_recall": 0},
+    }
+    provider.dimensions.assert_called_once_with()
+    provider.embed.assert_not_called()
+    provider.batch_embed.assert_not_called()
+
+
+@pytest.mark.parametrize("cold_local", [False, True])
+def test_embedding_health_unknown_without_loading(tmp_path, monkeypatch, cold_local):
+    from unittest.mock import Mock
+    from mimir.saga import embeddings
+
+    path = tmp_path / "saga.db"
+    conn = _make_db(path)
+    conn.close()
+    if cold_local:
+        provider = embeddings.LocalProvider()
+        loader = Mock(side_effect=AssertionError("must not load model"))
+        monkeypatch.setattr(provider, "_load_model", loader)
+        monkeypatch.setattr(embeddings, "get_provider", lambda: provider)
+    else:
+        monkeypatch.setattr(embeddings, "get_provider", Mock(side_effect=RuntimeError("unavailable")))
+    result = build_db_stats_payload(path)
+    assert result["ready"] is True
+    health = result["embedding_health"]
+    assert health["status"] == "unknown"
+    assert health["dimension"] is None
+    assert health["atoms"]["excluded_from_recall"] is None
+    assert health["sessions"]["excluded_from_recall"] is None
+    assert health["reason"]
+    if cold_local:
+        loader.assert_not_called()
+
+
+def test_embedding_health_query_failure_preserves_stats(tmp_path):
+    path = tmp_path / "saga.db"
+    conn = _make_db(path)
+    conn.execute("DROP TABLE embeddings")
+    conn.commit()
+    conn.close()
+    result = build_db_stats_payload(path)
+    assert result["ready"] is True
+    assert result["embedding_health"]["status"] == "unknown"
+    assert "reason" in result["embedding_health"]
 
 
 # ─── build_recent_atoms_payload ──────────────────────────────────

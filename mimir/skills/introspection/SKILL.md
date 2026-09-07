@@ -67,6 +67,11 @@ happened", events.jsonl is closer to ground).
 
 ## Key Log Schemas
 
+Tool names in logs (such as `send_message`) are historical evidence, not the
+current turn's tool list. Service turns can lack tools: run queries or persist
+reports only with tools present now; otherwise state the evidence gap, without
+inventing alternate tools or claiming an inspection or write.
+
 ### events.jsonl
 
 Each line is a JSON object:

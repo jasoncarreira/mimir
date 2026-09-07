@@ -121,27 +121,27 @@ function IssueLinks({
 function TreeNode({
   issue,
   byId,
-  depth = 0
+  onOpen
 }: {
   issue: ChainlinkBoardIssue;
   byId: Map<number, ChainlinkBoardIssue>;
-  depth?: number;
+  onOpen: (issue: ChainlinkBoardIssue) => void;
 }) {
   const children = issue.child_ids
     .map((id) => byId.get(id))
     .filter((child): child is ChainlinkBoardIssue => Boolean(child));
   return (
     <li>
-      <div className="chainlink-tree-row" style={{ "--tree-depth": depth } as React.CSSProperties}>
+      <button className="chainlink-tree-row" type="button" onClick={() => onOpen(issue)}>
         <span>#{issue.id} {issue.title}</span>
         <Badge tone={statusTone[issue.status] ?? "neutral"}>{issue.status}</Badge>
         {issue.child_progress.total ? (
           <small>{issue.child_progress.done}/{issue.child_progress.total}</small>
         ) : null}
-      </div>
+      </button>
       {children.length ? (
         <ol>
-          {children.map((child) => <TreeNode byId={byId} depth={depth + 1} issue={child} key={child.id} />)}
+          {children.map((child) => <TreeNode byId={byId} onOpen={onOpen} issue={child} key={child.id} />)}
         </ol>
       ) : null}
     </li>
@@ -244,6 +244,8 @@ function IssueDrawer({
 
 export function ChainlinkBoardRoute() {
   const [searchParams, setSearchParams] = useSearchParams();
+  const view = searchParams.get("view") === "hierarchy" || searchParams.get("view") === "dependencies"
+    ? searchParams.get("view") : "board";
   const filters: ChainlinkBoardFilters = {
     label: searchParams.get("label") || "",
     status: searchParams.get("status") || "",
@@ -257,6 +259,7 @@ export function ChainlinkBoardRoute() {
   const params = { ...filters, show_completed: showCompleted, offset, issue: selectedIssueId };
   const query = useQuery({
     queryKey: ["chainlink-board", params],
+    placeholderData: (previous) => previous,
     queryFn: async ({ signal }) => (await getChainlinkBoard(params, { cache: "no-store", signal })).data
   });
   const board = React.useMemo(() => safeChainlinkBoardData(query.data), [query.data]);
@@ -283,7 +286,7 @@ export function ChainlinkBoardRoute() {
     const params = new URLSearchParams(searchParams);
     if (issue) params.set("issue", String(issue.id));
     else params.delete("issue");
-    setSearchParams(params);
+    setSearchParams(params, { preventScrollReset: true });
   }
 
   function setFilter(key: keyof ChainlinkBoardFilters, value: string) {
@@ -355,17 +358,27 @@ export function ChainlinkBoardRoute() {
               <Button type="button" disabled={query.isFetching || board.offset <= 0} onClick={() => setPage(Math.max(0, board.offset - 250))}>Previous</Button>
               <Button type="button" disabled={query.isFetching || !canNext} onClick={() => { if (canNext) setPage(nextOffset!); }}>Next</Button>
             </nav>
+            <div className="chainlink-views" role="group" aria-label="Task view">
+              {[["board", "Lifecycle board"], ["hierarchy", "Parent Trees"], ["dependencies", "Dependencies"]].map(([value, label]) => (
+                <Button key={value} type="button" aria-pressed={view === value} onClick={() => {
+                  const params = new URLSearchParams(searchParams);
+                  if (value === "board") params.delete("view");
+                  else params.set("view", value);
+                  setSearchParams(params, { preventScrollReset: true });
+                }}>{label}</Button>
+              ))}
+            </div>
           </Panel>
-          <Panel title="Parent Trees" subtitle="Root issues and subissues on this filtered page; other relatives may be omitted.">
+          {view === "hierarchy" ? <Panel title="Parent Trees" subtitle="Root issues and subissues on this filtered page; other relatives may be omitted.">
             {rootIssues.length ? (
               <ol className="chainlink-tree">
-                {rootIssues.map((issue) => <TreeNode byId={visibleById} issue={issue} key={issue.id} />)}
+                {rootIssues.map((issue) => <TreeNode byId={visibleById} issue={issue} key={issue.id} onOpen={selectIssue} />)}
               </ol>
             ) : (
               <EmptyState title="No visible root issues" />
             )}
-          </Panel>
-          <div className="chainlink-board" aria-label="Chainlink lifecycle columns">
+          </Panel> : null}
+          {view === "board" ? <div className="chainlink-board" aria-label="Chainlink lifecycle columns" role="region" tabIndex={0}>
             {board.columns.map((column) => {
               const issues = column.issue_ids
                 .map((id) => visibleById.get(id))
@@ -384,8 +397,8 @@ export function ChainlinkBoardRoute() {
                 </section>
               );
             })}
-          </div>
-          <Panel title="Dependencies" subtitle="Dependencies on this filtered page only. Off-page blockers have unknown status; unlock counts omit off-page issues.">
+          </div> : null}
+          {view === "dependencies" ? <Panel title="Dependencies" subtitle="Dependencies on this filtered page only. Off-page blockers have unknown status; unlock counts omit off-page issues.">
             {dependencies.ready.length || dependencies.blocked.length ? (
               <div className="chainlink-deps">
                 <section className="chainlink-deps__group">
@@ -428,7 +441,7 @@ export function ChainlinkBoardRoute() {
             ) : (
               <EmptyState title="No dependencies between active issues" />
             )}
-          </Panel>
+          </Panel> : null}
         </>
       ) : null}
       <IssueDrawer issue={selected} issues={board.issues} selectedId={selectedIssueId} state={board.selected_issue_state} loading={query.isLoading} onClose={() => selectIssue(null)} />

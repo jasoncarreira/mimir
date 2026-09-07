@@ -757,7 +757,8 @@ function AppFrameContent() {
   const apiKeyRejected = useUiState((state) => state.apiKeyRejected);
   const signedIn = isSignedIn(bootstrap, apiKeyPresent);
   // Gate identity on sign-in so a protected server doesn't fetch whoami pre-login.
-  const { data: whoami } = useWhoami(signedIn);
+  const identity = useWhoami(signedIn);
+  const whoami = identity.data;
   // Open/dev mode (auth not required) doesn't gate /api/v1/admin/ server-side,
   // so surface admin sections there; in a gated server, hide them unless the
   // resolved identity is an admin (server still 403s either way — this is UX).
@@ -793,6 +794,22 @@ function AppFrameContent() {
         reauthenticate={apiKeyRejected}
       />
     );
+  }
+
+  // Do not let the wildcard redirect discard a deep link before its role is known.
+  if (bootstrap?.auth.required) {
+    if (identity.isPending) return <LoadingState label="Loading dashboard identity" />;
+    if (identity.isError) {
+      return (
+        <div>
+          <ErrorState title="Couldn't verify your identity">
+            Dashboard access could not be verified. Retry or sign in with a valid key.
+          </ErrorState>
+          <Button onClick={() => void identity.refetch()}>Retry</Button>
+          <AuthPanel bootstrap={bootstrap} error={null} isError={false} isLoading={false} />
+        </div>
+      );
+    }
   }
 
   const shellProps: ShellProps = {

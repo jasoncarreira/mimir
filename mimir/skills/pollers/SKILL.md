@@ -1,6 +1,6 @@
 ---
 name: pollers
-description: Mechanics for building and managing pollers — subprocess scripts that check external services on a schedule and emit events when something has changed. Use when authoring a new poller (a `pollers.json` manifest plus a script in any language), debugging why a poller isn't firing, or extending an existing one. Pollers run on cron, emit JSONL events when there's something to report, and stay silent otherwise (silence-as-filter). The framework discovers `<home>/skills/<name>/pollers.json` files at startup and via `reload_pollers`; each emitted event becomes a fresh turn on a `poller:<name>` synthetic channel. Companion to the `world-scanning` skill, which catalogs *what's worth polling*. Distinct from `async-tasks` (one-shot wake-up via bash_async, not recurring) and from in-process scheduler callables (saga-consolidate, oauth-usage-poll — those mutate mimir-internal state and aren't subprocess-isolated).
+description: Mechanics for building and managing pollers — subprocess scripts that check external services on a schedule and emit events when something has changed. Tool-dependent operations require the relevant tools in the current turn's tool list; poller service turns can lack tools. Use when authoring a new poller (a `pollers.json` manifest plus a script in any language), debugging why a poller isn't firing, or extending an existing one. Pollers run on cron, emit JSONL events when there's something to report, and stay silent otherwise (silence-as-filter). The framework discovers `<home>/skills/<name>/pollers.json` files at startup and via `reload_pollers`; each emitted event becomes a fresh turn on a `poller:<name>` synthetic channel. Companion to the `world-scanning` skill, which catalogs *what's worth polling*. Distinct from `async-tasks` (one-shot wake-up via bash_async, not recurring) and from in-process scheduler callables (saga-consolidate, oauth-usage-poll — those mutate mimir-internal state and aren't subprocess-isolated).
 success_criteria:
   # The pollers skill is for *building* or *fixing* pollers — both
   # produce a write under skills/<poller>/pollers.json (the manifest)
@@ -24,9 +24,18 @@ success_criteria:
         name: reload_pollers
 ---
 
-<!-- desc: Build and manage pollers — subprocess scripts that check external services on a schedule and emit events when something changes. -->
+<!-- desc: Build and manage pollers that check services on a schedule; tool-dependent steps require tools in the current turn's tool list, which service turns can lack. -->
 
 # Pollers — Event-Driven Monitoring
+
+**Tool availability:** Authoring and management steps below apply only when their
+required tools are present in the current turn's tool list. Poller service turns
+can have a restricted tool list or no tools at all; a manifest capability is not
+proof that a tool is available. Check before shell execution (`shell_exec`),
+`bash_async`, `reload_pollers`, `send_message`, or saga writes such as
+`memory_store` and `saga_feedback`. If a required tool is absent, state the
+limitation rather than inventing alternate tools or claiming the action happened.
+Existing admin instructions and the authority/scoping rules below still apply.
 
 Pollers are lightweight scripts that check external services on a schedule and report back when something needs attention. They live inside skills and are discovered automatically by the scheduler.
 
@@ -189,12 +198,53 @@ if __name__ == "__main__":
 | `name` | yes | Unique identifier. Used in logs and event routing. |
 | `command` | yes | Shell command, relative to the skill directory. |
 | `cron` | yes | Cron expression (5-field, UTC). |
-| `authority` | no | The sole authority declaration for this instance. It must contain exactly `profile`, `tier`, `capabilities`, and `scoped_roots`. Missing authority means an empty capability set. Profiles are `research`, `github`, or `custom`; tiers are `scope-contained`, `scoped-with-provenance`, or `code-execution`. Capability names are checked against the executable tier table. Skill pollers cannot declare unbounded capabilities. `state` resolves only to `state/pollers/<name>`; `wiki:<name>` resolves only to an existing direct child of `state/wiki`. Unknown values, missing/extra authority fields, tier violations, missing roots, and path escapes reject the whole poller. `operator_alert` grants `send_message` only to the single `MIMIR_OPERATOR_ALERT_CHANNEL` destination. Each event carries the resulting immutable `poller:<name>` principal through continuations. |
+| `authority` | no | The sole authority declaration for this instance. Required fields are `profile`, `tier`, `capabilities`, and `scoped_roots`; optional fields include research-only `approved_urls` (see below). Missing authority means an empty capability set. Profiles are `research`, `github`, or `custom`; tiers are `scope-contained`, `scoped-with-provenance`, or `code-execution`. Capability names are checked against the executable tier table. Skill pollers cannot declare unbounded capabilities. `state` resolves only to `state/pollers/<name>`; `wiki:<name>` resolves only to an existing direct child of `state/wiki`. Unknown values, missing/unknown authority fields, tier violations, missing roots, and path escapes reject the whole poller. `operator_alert` grants `send_message` only to the single `MIMIR_OPERATOR_ALERT_CHANNEL` destination. Each event carries the resulting immutable `poller:<name>` principal through continuations. |
 | `env` | no | Additional environment variables for the script. Values are literal — no shell expansion. Use this for fixed config (URLs, feature flags) declared in pollers.json itself. **Do not put secrets here** — `env` is a static config surface (values are literal strings, no shell expansion), not a secret-forwarding path. If a key's name matches a deny-list pattern (`*_API_KEY`, `*_TOKEN`, `*_SECRET`, `*_PASSWORD`, `MIMIR_*`), the framework emits a `poller_env_secret_reintroduced` algedonic warning. Use `pass_env` to forward live secrets from `os.environ`. |
 | `pass_env` | no | List of env var names to pass through from mimir's process environment to the subprocess, **bypassing the deny-suffix/deny-prefix filter** (see [security.md](security.md)). This is the supported path for getting secrets (`GITHUB_TOKEN`, `ANTHROPIC_API_KEY`) and `MIMIR_*`-prefixed knobs into a poller subprocess — the global allowlist `MIMIR_POLLER_ENV_ALLOWLIST` does NOT bypass the deny filter, so it can't be used for `*_TOKEN` keys. Keys not set in `os.environ` are silently skipped; keys whose names match a deny pattern emit a `poller_env_passthrough_named_secret` event (visibility, not blocking). |
 | `batch_size` | no | Coalesce up to N items per emitted AgentEvent (= per turn the agent sees). Default `1` (per-item-per-turn, matches open-strix). Use `>1` for bursty pollers (github-poller, RSS) so the agent sees one turn per cron tick instead of one per item. Items beyond `batch_size` overflow into additional batches with `batch_index` / `batch_count` set in `extra` so the agent can tell it's seeing part of a multi-batch fire. |
 | `recover_failed_turns` | no | Opt into framework recovery of turns whose triggered turn **failed** (chainlink #262). When `true`, the framework stashes each enqueued event by `source_id`, then each cycle reads `turn_failed` / `turn_completed` outcomes to **re-enqueue** (capped) the ones whose turn died — emitting a one-shot `poller_turn_gave_up` signal when the cap is hit. Closes the "poll advanced the cursor but the triggered review/processing turn died" drop (#299) for pollers with no live state to reconcile against (gmail, github issue/comment turns). Default `false`. Leave **off** for pollers that recover another way — github-poller reconciles against `requested_reviewers`, so framework re-enqueue on top would double-fire turns. |
 | `priority` | no | `low` \| `normal` (default) \| `high` — how much resource pressure this poller rides through before the scheduler sheds its fires. The homeostat grades quota/cost pressure into a severity ladder (CLEAR / ELEVATED / TIGHT / BLOCKED): `low` sheds at ELEVATED, `normal` at TIGHT, `high` keeps firing until the provider actively refuses (recorded 429 → BLOCKED sheds everything). A suppressed fire **skips the subprocess entirely** — the cursor stays frozen, so events are delayed, not lost; the next tick after recovery catches up. Each shed fire emits `poller_fire_suppressed` with priority, severity, and the deciding reason. Use `high` for near-interactive feeds the operator actively waits on, `low` for nice-to-have ambient monitoring. |
+
+### Bounded Research Fetches
+
+Research pollers may opt into `fetch_url` with an `authority.approved_urls` list:
+
+```json
+{
+  "profile": "research",
+  "tier": "scoped-with-provenance",
+  "capabilities": ["memory_store", "write_file"],
+  "scoped_roots": ["state"],
+  "approved_urls": [
+    "https://arxiv.org/",
+    "https://papers.example/paper?id=42"
+  ]
+}
+```
+
+A nonempty list automatically includes the bounded `fetch_url` capability; you
+do not need to repeat it in `capabilities`. Omitting the list or setting it to
+`[]` preserves the existing default: no fetch capability. Explicitly requesting
+`fetch_url` in a research profile without a nonempty list rejects the poller.
+The `approved_urls` field is research-profile-only, including when empty.
+
+Entries are exact HTTPS URLs, except that the host-root `https://arxiv.org/`
+grants paths on that host. An exact URL does not approve child paths, other
+papers, or different queries. A host grant does not approve subdomains or
+lookalike hosts. Do not use wildcard syntax anywhere in a manifest URL, including
+paths or queries. The framework represents the host-root grant internally as
+`https://arxiv.org/*`; that internal policy syntax is not manifest syntax.
+
+Malformed URLs, non-HTTPS schemes, userinfo, fragments, whitespace, invalid
+hosts, non-list values, and non-string entries reject the whole poller with a
+diagnostic naming the manifest, poller, and `approved_urls` field. Use a reviewed
+manifest change and `reload_pollers` to change these grants, not an environment
+value, event payload, or operator tuning override.
+
+The builder binds these URLs as a JSON literal in the instance's `approved_urls`
+`ServiceSinkPolicy` destination. This does not change GitHub or built-in fetch
+policies, grant shell network access, or widen filesystem write roots. Existing
+fetch safety and information-flow checks still apply.
 
 ## Operator overrides (`<home>/pollers-overrides.yaml`)
 

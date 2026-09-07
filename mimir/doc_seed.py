@@ -93,9 +93,11 @@ def _write_manifest(home: Path, version: str | None, seeded: set[str]) -> None:
 
 
 def _write_doc(home: Path, rel: str, src: Path) -> None:
+    from .access_control import write_framework_file
+
     dst = home / rel
     dst.parent.mkdir(parents=True, exist_ok=True)
-    dst.write_text(src.read_text(encoding="utf-8"), encoding="utf-8")
+    write_framework_file(home, dst, src.read_bytes())
 
 
 def seed_docs(home: Path, *, restore: bool = False, version: str | None = None) -> dict[str, str]:
@@ -157,7 +159,7 @@ def refresh_docs(home: Path, *, version: str | None = None, force: bool = False)
             if dst.read_text(encoding="utf-8") == new:
                 out[rel] = "unchanged"
             else:
-                dst.write_text(new, encoding="utf-8")
+                _write_doc(home, rel, src)
                 out[rel] = "updated"
             seeded.add(rel)
         elif rel in seeded:

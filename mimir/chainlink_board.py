@@ -14,7 +14,7 @@ from typing import Any
 
 CHAINLINK_TIMEOUT_SECONDS = 5.0
 CHAINLINK_MAX_ISSUES = 250
-CHAINLINK_MAX_SHOWS = 120
+CHAINLINK_MAX_SHOWS = CHAINLINK_MAX_ISSUES
 
 _WORKLINK_EVIDENCE_RE = re.compile(r"^(\d+)-(\d+)\.json$")
 
@@ -297,7 +297,7 @@ async def build_chainlink_board_payload(
         }
 
     payload, error = await _run_chainlink_json(
-        home, ["issue", "list", "--status", "all", "--json"],
+        home, ["export", "--json"],
     )
     if error:
         return {
@@ -328,8 +328,8 @@ async def build_chainlink_board_payload(
             "total_count": 0,
         }
 
-    # List summaries are sufficient for discovery; only the selected issue needs
-    # a show call. Closed history must not consume active-work page slots.
+    # Export supplies global labels, parents and lifecycle metadata. Dependencies
+    # are hydrated only after filtering/pagination, never for the whole tracker.
     selected_id = issue
     merged = [item for item in payload if isinstance(item, dict)]
     issues_by_id = {
@@ -358,22 +358,6 @@ async def build_chainlink_board_payload(
     ]
     summaries.sort(key=lambda issue: (issue["status"] == "done", issue["priority"], issue["id"]))
 
-    if selected_id is not None:
-        selected_raw = issues_by_id.get(selected_id)
-        page_metadata["selected_issue_state"] = "missing"
-        if selected_raw is not None:
-            details = await _load_issue_details(home, [selected_id])
-            detail = details.get(selected_id)
-            page_metadata["selected_issue_state"] = "unavailable"
-            if detail is not None:
-                page_metadata["selected_issue"] = _summarize_issue(
-                    {**selected_raw, **detail},
-                    children_by_parent=children_by_parent,
-                    issues_by_id=issues_by_id,
-                    worklink_by_issue=worklink_by_issue,
-                )
-                page_metadata["selected_issue_state"] = "loaded"
-
     labels = sorted({label for item in summaries for label in item["labels"]})
     priorities = sorted({item["priority"] for item in summaries})
     matching = [
@@ -387,6 +371,36 @@ async def build_chainlink_board_payload(
     summaries = matching[offset:offset + CHAINLINK_MAX_ISSUES]
     if offset + len(summaries) < total_count:
         page_metadata["next_offset"] = offset + len(summaries)
+
+    page_ids = [item["id"] for item in summaries]
+    details = await _load_issue_details(home, page_ids)
+    summaries = [
+        _summarize_issue(
+            {**issues_by_id[item["id"]], **details[item["id"]]},
+            children_by_parent=children_by_parent,
+            issues_by_id=issues_by_id,
+            worklink_by_issue=worklink_by_issue,
+        ) if item["id"] in details else item
+        for item in summaries
+    ]
+
+    if selected_id is not None:
+        selected_raw = issues_by_id.get(selected_id)
+        page_metadata["selected_issue_state"] = "missing"
+        if selected_raw is not None:
+            # Reuse an in-page attempt even when it failed: no duplicate show.
+            if selected_id not in page_ids:
+                details.update(await _load_issue_details(home, [selected_id]))
+            detail = details.get(selected_id)
+            page_metadata["selected_issue_state"] = "unavailable"
+            if detail is not None:
+                page_metadata["selected_issue"] = _summarize_issue(
+                    {**selected_raw, **detail},
+                    children_by_parent=children_by_parent,
+                    issues_by_id=issues_by_id,
+                    worklink_by_issue=worklink_by_issue,
+                )
+                page_metadata["selected_issue_state"] = "loaded"
 
     statuses = ["open", "ready", "blocked", "in-progress", "review", "done"]
     columns = [

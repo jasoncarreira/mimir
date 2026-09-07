@@ -1052,6 +1052,100 @@ def _orchestrator_runner(
     return calls, runner
 
 
+@pytest.mark.parametrize("later_exit_code", [0, 1])
+def test_gate_flakes_survive_second_observation_without_masking_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, later_exit_code: int
+) -> None:
+    import mimir.worklink.orchestrator as orchestrator
+    from mimir.worklink.evidence import validate_evidence
+
+    repo = tmp_path / "repo"
+    worktree = repo.parent / ".worklink" / repo.name / "441-1"
+    calls, runner = _orchestrator_runner(repo, worktree)
+    (tmp_path / "worklink.yaml").write_text(
+        "defaults:\n  gate_rerun_max_failures: 3\n", encoding="utf-8"
+    )
+    registry = BackendRegistry(WorklinkConfig(defaults=WorklinkDefaults(compute_backend="fake_compute")))
+    registry.register(FakeBackend())
+    registry.register_compute(FakeCompute(shared_filesystem=True))
+    original_observe = orchestrator.observe_evidence
+    observations: list[int] = []
+    events: list[tuple[str, dict[str, object]]] = []
+    flaky = "tests/test_gate.py::test_flaky"
+    failed = "tests/test_gate.py::test_later_failure"
+    initial = TestResult("echo ok", 1, "first failure", failed_tests=(flaky,))
+    rerun = TestResult("echo ok", 0, "rerun passed")
+
+    async def observed(**kwargs: Any) -> EvidenceValidation:
+        observations.append(kwargs["gate_rerun_max_failures"])
+        validation = await original_observe(**kwargs)
+        tests = (
+            TestResult("echo ok", 0, "flaky", flaky_tests=(flaky,), initial_run=initial, rerun=rerun)
+            if len(observations) == 1
+            else TestResult(
+                "echo ok", later_exit_code, "later result",
+                failed_tests=(failed,) if later_exit_code else (),
+            )
+        )
+        return validate_evidence(replace(validation.evidence, tests=tests))
+
+    monkeypatch.setattr(orchestrator, "observe_evidence", observed)
+    monkeypatch.setattr(orchestrator, "_log_event", lambda event, **kw: events.append((event, kw)))
+    result = asyncio.run(
+        WorklinkRunner(home=tmp_path, repo=repo, runner=runner, registry=registry).run(
+            441, backend_name="fake", test_command="echo ok"
+        )
+    )
+    assert observations == [3, 3]
+    assert result.review_ready is (later_exit_code == 0)
+    assert bool(result.pr_url) is (later_exit_code == 0)
+    evidence = json.loads(result.evidence_path.read_text(encoding="utf-8"))
+    assert evidence["tests"]["exit_code"] == later_exit_code
+    assert evidence["tests"]["flaky_tests"] == [flaky]
+    assert evidence["tests"]["failed_tests"] == ([failed] if later_exit_code else [])
+    assert evidence["tests"]["initial_run"]["summary"] == "first failure"
+    assert evidence["tests"]["rerun"]["summary"] == "rerun passed"
+    assert [(event, kw["flaky_tests"]) for event, kw in events if event == "worklink_gate_flaky_tests"] == [
+        ("worklink_gate_flaky_tests", [flaky])
+    ]
+    comment = next(
+        args[-1] for args in calls
+        if isinstance(args, list) and args[:3] == ["chainlink", "issue", "comment"]
+        and args[-1].startswith("WORKLINK_EVIDENCE ")
+    )
+    assert f"flaky_tests={json.dumps([flaky])}" in comment
+    assert f"failed_tests={json.dumps([failed] if later_exit_code else [])}" in comment
+
+
+@pytest.mark.parametrize("has_tests", [True, False])
+def test_evidence_comment_and_flake_event_scrub_node_ids(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, has_tests: bool
+) -> None:
+    import mimir.worklink.orchestrator as orchestrator
+
+    secret = "ghp_" + "a" * 36
+    node = f"tests/test_gate.py::test_token[{secret}]"
+    validation = _completion_validation(tmp_path)
+    evidence = replace(
+        validation.evidence,
+        tests=TestResult("pytest", 0, failed_tests=(node,), flaky_tests=(node,)) if has_tests else None,
+    )
+    comments: list[str] = []
+    events: list[dict[str, object]] = []
+    claims = SimpleNamespace(_run=lambda *args: comments.append(args[-1]))
+    monkeypatch.setattr(orchestrator, "_log_event", lambda event, **kw: events.append(kw))
+    orchestrator._comment_evidence(claims, evidence, validation, tmp_path / "evidence.json")
+    orchestrator._log_gate_flaky_tests(evidence)
+    assert secret not in comments[0]
+    assert secret not in json.dumps(events)
+    if has_tests:
+        assert "tests/test_gate.py::test_token[" in comments[0]
+        assert len(events[0]["flaky_tests"]) == 1
+    else:
+        assert "failed_tests=[] flaky_tests=[]" in comments[0]
+        assert events == []
+
+
 def test_worklink_rereads_issue_comments_before_claiming(tmp_path: Path) -> None:
     repo = tmp_path / "repo"
     worktree = repo.parent / ".worklink" / repo.name / "441-2"
@@ -5755,6 +5849,7 @@ def test_factory_completion_requires_entire_success_conjunction(
     validation = _completion_validation(sandbox)
 
     async def observed(**kwargs: object) -> EvidenceValidation:
+        assert kwargs["gate_rerun_max_failures"] == 4
         return validation
 
     monkeypatch.setattr(orchestrator, "observe_evidence", observed)
@@ -5764,6 +5859,7 @@ def test_factory_completion_requires_entire_success_conjunction(
             issue=IssueContext(700, "epic", "build", {"worklink:epic"}),
             record=_completion_record(sandbox),
             test_command="pytest -q",
+            gate_rerun_max_failures=4,
             started_at=datetime.now(UTC),
             runner=_completion_runner(sandbox, case="success"),
         )

@@ -22,6 +22,7 @@ import traceback
 import uuid
 
 import pytest
+import yaml
 from langchain_core.tools import ToolException
 
 from mimir.contained_execution import (
@@ -41,6 +42,7 @@ from mimir.project_tests import (
     RepoProjectTests,
     _safe_stderr_output,
     _validated_selectors,
+    _configured_command,
 )
 from mimir.repo_tools import (
     GitCommit,
@@ -1379,6 +1381,194 @@ def _test_checkout_factory(source: Path, **_kwargs):
     return SimpleNamespace(path=source, capability=SimpleNamespace(path=source), close=lambda: None)
 
 
+def _configure_test_suites(home: Path, state: RepoReviewState, **overrides) -> None:
+    _configure_worklink_test(home)
+    record = {
+        "slug": state.action_scope.canonical_repo,
+        "root": str(state.checkout_lease.path),
+        "origin": f"https://github.com/{state.action_scope.canonical_repo}.git",
+        "mode": "rw", "base_branch": "main",
+        "test_suites": [
+            {"name": "python", "command": "/usr/bin/true -q", "default": True,
+             "selector_prefixes": ["tests/"], "selector_suffixes": [".py"]},
+            {"name": "frontend", "command": "npm run test:ci",
+             "selector_prefixes": ["frontend/"], "selector_suffixes": [".test.ts", ".test.tsx"]},
+        ],
+    }
+    record.update(overrides)
+    (home / "repositories.yaml").write_text(yaml.safe_dump({"repositories": [record]}))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("suite,selectors,expected", [
+    ("frontend", (), "frontend"),
+    ("frontend", ("frontend/example.tsx",), "frontend"),
+    (None, ("frontend/example.tsx",), "frontend"),
+    (None, ("outside.test.ts",), "frontend"),
+    (None, ("test_example.py",), "python"),
+    ("python", (), "python"),
+    (None, (), "python"),
+])
+async def test_project_suite_selection_and_snapshot_argv(
+    repo_tools, tmp_path, monkeypatch, suite, selectors, expected,
+):
+    state = repo_tools[-2]
+    home = tmp_path / "home"
+    _configure_test_suites(home, state)
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("NPM_CONFIG_CACHE", str(home / "shared-cache"))
+    monkeypatch.setenv("NODE_OPTIONS", "--require=/controller/secret.js")
+    monkeypatch.setenv("NPM_TOKEN", "never-forwarded")
+    root = state.checkout_lease.path
+    for path in selectors:
+        target = root / path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text("// fixture\n")
+    # Resolve npm independently of the host's installation and symlink layout.
+    monkeypatch.setattr("mimir.project_tests.shutil.which", lambda *a, **k: "/usr/bin/true")
+    issued = []
+    calls = []
+
+    async def runner(argv, directory, env, projections, **kwargs):
+        calls.append(argv)
+        assert directory.path == issued[-1] != root
+        assert projections == ()
+        assert not {"HOME", "MIMIR_HOME", "NODE_OPTIONS", "NPM_TOKEN", "NPM_CONFIG_CACHE"} & env.keys()
+        (directory.path / "node_modules").mkdir()
+        return CollectedExecutionResult(0, b"suite output", b"", False, False, 0, 0)
+
+    result = await RepoProjectTests(
+        state, runner=runner, checkout_factory=_snapshot_checkout_factory(tmp_path, issued),
+    ).execute(selectors, suite=suite)
+    expected_command = ("/usr/bin/true", "run", "test:ci") if expected == "frontend" else ("/usr/bin/true", "-q")
+    if expected == "frontend" and selectors:
+        expected_command += ("--",)
+    assert calls == [(*expected_command, *selectors)]
+    assert result.suite == expected
+    assert result.returncode == 0 and result.stdout == "suite output"
+    assert state.full_tested_head == (state.git_expected_head if expected == "python" and not selectors else None)
+    assert not (root / "node_modules").exists()
+    assert not issued[0].exists()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("suite,selectors,overlap", [
+    (None, ("frontend/example.tsx", "test_example.py"), False),
+    (None, ("test_example.py", "tracked.txt"), False),
+    (None, ("tracked.txt",), False),
+    ("unknown", (), False),
+    (None, ("test_example.py",), True),
+])
+async def test_project_suite_selection_refuses_without_execution(
+    repo_tools, tmp_path, monkeypatch, suite, selectors, overlap,
+):
+    state = repo_tools[-2]
+    home = tmp_path / "home"
+    _configure_test_suites(home, state)
+    if overlap:
+        config = yaml.safe_load((home / "repositories.yaml").read_text())
+        config["repositories"][0]["test_suites"][1]["selector_suffixes"].append(".py")
+        (home / "repositories.yaml").write_text(yaml.safe_dump(config))
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    for path in selectors:
+        target = state.checkout_lease.path / path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text("fixture\n")
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("suite refusal must precede snapshot creation")
+
+    with pytest.raises(ProjectTestRefusal) as error:
+        await RepoProjectTests(state, checkout_factory=forbidden).execute(selectors, suite=suite)
+    assert error.value.code == "test_suite_selection_refused"
+    assert "python, frontend" in str(error.value)
+
+
+@pytest.mark.parametrize("selector,code", [
+    ("frontend/example.tsx::case", "test_selector_invalid"),
+    ("tracked.txt", "test_selector_invalid"),
+    ("../outside.ts", "test_selector_outside_checkout"),
+    ("/outside.tsx", "test_selector_outside_checkout"),
+    ("-option.ts", "test_selector_invalid"),
+    ("frontend/link.ts", "test_selector_symlink"),
+])
+def test_frontend_selector_guards(tmp_path, selector, code):
+    (tmp_path / "frontend").mkdir()
+    (tmp_path / "frontend/example.tsx").write_text("fixture")
+    (tmp_path / "tracked.txt").write_text("fixture")
+    (tmp_path / "-option.ts").write_text("fixture")
+    (tmp_path / "frontend/link.ts").symlink_to("example.tsx")
+    if selector == "../outside.ts":
+        selector = f"../{tmp_path.name}/frontend/example.tsx"
+    elif selector == "/outside.tsx":
+        selector = str(tmp_path / "frontend/example.tsx")
+    with pytest.raises(ProjectTestRefusal) as error:
+        _validated_selectors(tmp_path, (selector,), suite="frontend")
+    assert error.value.code == code
+
+
+@pytest.mark.asyncio
+async def test_project_legacy_repository_command_keeps_argv(repo_tools, tmp_path, monkeypatch):
+    state = repo_tools[-2]
+    home = tmp_path / "home"
+    _configure_test_suites(home, state, test_suites=[], test_command="/usr/bin/true -q")
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    calls = []
+
+    async def runner(argv, directory, env, projections, **kwargs):
+        calls.append((argv, directory.path))
+        return CollectedExecutionResult(0, b"", b"", False, False, 0, 0)
+
+    result = await RepoProjectTests(state, runner=runner, checkout_factory=_test_checkout_factory).execute(("tracked.txt::case",))
+    assert calls == [(("/usr/bin/true", "-q", "tracked.txt::case"), state.checkout_lease.path)]
+    assert result.suite == "default" and result.command_source == "repository"
+
+
+def test_project_suite_default_and_legacy_fallback(repo_tools, tmp_path, monkeypatch):
+    state = repo_tools[-2]
+    home = tmp_path / "home"
+    frontend = {"name": "frontend", "command": "/usr/bin/true"}
+    _configure_test_suites(home, state, test_suites=[frontend])
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    with pytest.raises(ProjectTestRefusal, match="frontend") as error:
+        _configured_command(state.action_scope.canonical_repo)
+    assert error.value.code == "test_suite_selection_refused"
+    _configure_test_suites(home, state, test_suites=[frontend], test_command="/usr/bin/false -q")
+    command, _, source, suite, is_default = _configured_command(state.action_scope.canonical_repo)
+    assert (command, source, suite, is_default) == (("/usr/bin/false", "-q"), "repository", "default", True)
+    _configure_test_suites(home, state, test_suites=[{
+        "name": "default", "command": "/usr/bin/false", "default": True,
+    }])
+    command, _, source, suite, is_default = _configured_command(state.action_scope.canonical_repo)
+    assert (command, source, suite, is_default) == (("/usr/bin/false",), "repository", "default", True)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("exit_code,overflow,timed_out,code", [
+    (2, False, False, "tests_failed"),
+    (0, True, False, "tests_failed"),
+    (None, False, True, "test_timeout"),
+])
+async def test_frontend_result_preserves_bounded_failure_reporting(
+    repo_tools, tmp_path, monkeypatch, exit_code, overflow, timed_out, code,
+):
+    state = repo_tools[-2]
+    home = tmp_path / "home"
+    _configure_test_suites(home, state)
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    monkeypatch.setattr("mimir.project_tests.shutil.which", lambda *a, **k: "/usr/bin/true")
+
+    async def runner(*args, **kwargs):
+        return CollectedExecutionResult(exit_code, b"x" * 9000, b"e" * 5000, timed_out, overflow, 0, 0)
+
+    result = await RepoProjectTests(state, runner=runner, checkout_factory=_test_checkout_factory).execute(suite="frontend")
+    assert not result.ok and result.code == code and result.suite == "frontend"
+    assert result.returncode == exit_code
+    assert len(result.stdout) == 8000 and len(result.stderr) == 4000
+    assert state.full_tested_head is None
+
+
 def _snapshot_checkout_factory(root: Path, issued: list[Path]):
     def factory(source: Path, **_kwargs):
         boundary = root / f"issued-{len(issued)}"
@@ -1913,11 +2103,13 @@ async def test_project_test_snapshot_credentials_are_named_refusal(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("suite", [None, "frontend"])
 async def test_public_repo_test_credential_fault_persists_no_sensitive_material(
     repo_tools,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
+    suite,
 ) -> None:
     import mimir.event_logger as event_logger
     from mimir.tools import repo as repo_module
@@ -1925,6 +2117,9 @@ async def test_public_repo_test_credential_fault_persists_no_sensitive_material(
     state = repo_tools[-2]
     home = tmp_path / "controller-config"
     _configure_worklink_test(home)
+    if suite is not None:
+        _configure_test_suites(home, state)
+        monkeypatch.setattr("mimir.project_tests.shutil.which", lambda *a, **k: "/usr/bin/true")
     monkeypatch.setenv("MIMIR_HOME", str(home))
     credential_path = state.checkout_lease.path / "nested" / "credentials.json"
     credential_path.parent.mkdir()
@@ -1955,6 +2150,7 @@ async def test_public_repo_test_credential_fault_persists_no_sensitive_material(
                 pull_request=7,
                 selectors=(),
                 runtime=None,
+                suite=suite,
             )
     finally:
         event_logger._logger = previous_logger

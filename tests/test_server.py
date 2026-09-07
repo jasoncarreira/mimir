@@ -207,7 +207,8 @@ def test_production_global_writers_are_confined() -> None:
         for path in (root / "mimir").rglob("*.py")
         if 'os.environ["SAGA_CONFIG"] =' in path.read_text(encoding="utf-8")
     }
-    assert saga_config_writers == {"mimir/runtime.py", "mimir/reindex.py"}
+    # Standalone offline maintenance commands select their home before loading Saga.
+    assert saga_config_writers == {"mimir/runtime.py", "mimir/reindex.py", "mimir/cli.py"}
 
     server_source = (root / "mimir" / "server.py").read_text(encoding="utf-8")
     assert 'os.environ["MIMIR_WORKLINK_AGENT_ID"] = worklink_agent_id' in server_source

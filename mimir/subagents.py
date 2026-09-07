@@ -14,6 +14,7 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 from mimir.structured_output_retry import StructuredOutputRetryMiddleware
 from mimir.tools.budget_gate import BudgetGateMiddleware
 from mimir.tools.fetched_content_inject import FetchedContentReminderMiddleware
+from mimir.tools.service_tool_surface import ServiceToolSurfaceMiddleware
 
 
 _SEVERITY_SYNONYMS = {
@@ -204,6 +205,7 @@ def build_mimir_subagents(*, home: Path | None = None) -> list[dict]:
             **GENERAL_PURPOSE_SUBAGENT,
             "middleware": [
                 TodoListMiddleware(),
+                ServiceToolSurfaceMiddleware(),
                 BudgetGateMiddleware(),
                 *ingestion_middleware,
             ],
@@ -224,6 +226,7 @@ def build_mimir_subagents(*, home: Path | None = None) -> list[dict]:
             "permissions": readonly_filesystem_permissions(),
             "middleware": [
                 _NoTodoListMiddleware(),
+                ServiceToolSurfaceMiddleware(),
                 BudgetGateMiddleware(),
                 *ingestion_middleware,
                 StructuredOutputRetryMiddleware(),

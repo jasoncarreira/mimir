@@ -235,6 +235,7 @@ _SINK_CATEGORY_MAP: dict[str, SinkCategory] = {
     "pr_submit_review": SinkCategory.FORGE,
     "pr_inline_review_comment": SinkCategory.FORGE,
     "pr_comment": SinkCategory.FORGE,
+    "pr_edit_body": SinkCategory.FORGE,
     "issue_comment": SinkCategory.FORGE,
     "pr_rerequest_review": SinkCategory.FORGE,
     "unsupported_operation": SinkCategory.FORGE,
@@ -358,6 +359,7 @@ _TOOL_FLOW_MAP: dict[str, ToolFlowDirection] = {
     "pr_submit_review": ToolFlowDirection.SINK,
     "pr_inline_review_comment": ToolFlowDirection.SINK,
     "pr_comment": ToolFlowDirection.SINK,
+    "pr_edit_body": ToolFlowDirection.SINK,
     "issue_comment": ToolFlowDirection.SINK,
     "pr_rerequest_review": ToolFlowDirection.SINK,
     "unsupported_operation": ToolFlowDirection.SINK,
@@ -576,6 +578,7 @@ TRIGGER_CAPABILITY_TIERS: dict[str, CapabilityTier] = {
     "pr_submit_review": CapabilityTier.SCOPED_WITH_PROVENANCE,
     "pr_inline_review_comment": CapabilityTier.SCOPED_WITH_PROVENANCE,
     "pr_comment": CapabilityTier.SCOPED_WITH_PROVENANCE,
+    "pr_edit_body": CapabilityTier.SCOPED_WITH_PROVENANCE,
     "issue_comment": CapabilityTier.SCOPED_WITH_PROVENANCE,
     "pr_rerequest_review": CapabilityTier.SCOPED_WITH_PROVENANCE,
     "unsupported_operation": CapabilityTier.SCOPED_WITH_PROVENANCE,
@@ -639,7 +642,7 @@ TRIGGER_AUTHORITY_PROFILES: dict[str, frozenset[str]] = {
         "glob", "aglob", "grep", "agrep", "file_search", "memory_store",
         "saga_feedback", "saga_mark_contributions", "send_message",
         "saga_record_skill_learning", "operator_alert", "shell_exec",
-        "bash_jobs_list", "bash_job_output",
+        "bash_jobs_list", "bash_job_output", "fetch_url",
     }),
     "github": frozenset({
         "worklink_run", "write_file", "edit_file", "shell_exec",
@@ -651,6 +654,7 @@ TRIGGER_AUTHORITY_PROFILES: dict[str, frozenset[str]] = {
         "pr_metadata", "pr_files", "pr_diff", "pr_checks", "pr_reviews",
         "pr_comments", "pr_review_requests", "pr_submit_review",
         "pr_inline_review_comment", "pr_comment", "pr_rerequest_review",
+        "pr_edit_body",
         "issue_comment",
         "unsupported_operation", "repo_checkout", "repo_cleanup", "repo_fetch",
         "repo_status", "repo_test", "repo_diff", "repo_unmerged", "repo_stage", "repo_commit",
@@ -669,6 +673,7 @@ TRIGGER_AUTHORITY_PROFILES: dict[str, frozenset[str]] = {
         "pr_metadata", "pr_files", "pr_diff", "pr_checks", "pr_reviews",
         "pr_comments", "pr_review_requests", "pr_submit_review",
         "pr_inline_review_comment", "pr_comment", "pr_rerequest_review",
+        "pr_edit_body",
         "unsupported_operation", "repo_checkout", "repo_cleanup", "repo_fetch",
         "repo_status", "repo_test", "repo_diff", "repo_unmerged", "repo_stage", "repo_commit",
         "repo_merge", "repo_merge_abort", "repo_rebase", "repo_rebase_abort",
@@ -726,6 +731,7 @@ _FETCH_URL_POLICY_BY_AUTHORITY_PROFILE = {
     "session-boundary": ("github_pr_api", "GITHUB_REPOS"),
 }
 BOUNDED_PROFILE_CAPABILITIES: dict[str, frozenset[str]] = {
+    "research": frozenset({"fetch_url"}),
     "github": frozenset({"fetch_url"}),
     "session-boundary": frozenset({"fetch_url"}),
 }
@@ -751,9 +757,14 @@ def build_trigger_service_principal(
     saga_full_corpus_read: bool = False,
     channel_memory_directory: str | None = None,
     declared_shell_commands: tuple["DeclaredShellCommand", ...] = (),
+    approved_urls: tuple[str, ...] = (),
     creation_path: str,
 ) -> ServicePrincipal:
     """Build one immutable instance principal from already-validated authority."""
+    if profile == "research":
+        capabilities = tuple(cap for cap in capabilities if cap != "fetch_url")
+        if approved_urls:
+            capabilities += ("fetch_url",)
     capability_set = set(capabilities)
     missing = _missing_capability_companions(capability_set, profile=profile)
     if missing:
@@ -820,6 +831,11 @@ def build_trigger_service_principal(
             policies.append(ServiceSinkPolicy(operation, "worklink_repo", "WORKLINK_REPO/MIMIR_WORKLINK_REPO"))
         elif operation == "fetch_url":
             fetch_policy = _FETCH_URL_POLICY_BY_AUTHORITY_PROFILE.get(profile)
+            if profile == "research" and approved_urls:
+                fetch_policy = ("approved_urls", json.dumps([
+                    url + "*" if urlsplit(url).path == "/" and not urlsplit(url).query else url
+                    for url in approved_urls
+                ]))
             if fetch_policy is not None:
                 policies.append(ServiceSinkPolicy(operation, *fetch_policy))
     if "operator_alert" in capabilities:
@@ -1146,6 +1162,7 @@ _FORGE_TOOL_ACTIONS: dict[str, str | None] = {
     "pr_submit_review": RepoPRAction.PR_REVIEW.value,
     "pr_inline_review_comment": RepoPRAction.PR_REVIEW.value,
     "pr_comment": RepoPRAction.PR_COMMENT.value,
+    "pr_edit_body": RepoPRAction.PR_EDIT.value,
     "pr_rerequest_review": RepoPRAction.PR_REREQUEST.value,
     "unsupported_operation": None,
 }
@@ -3973,10 +3990,10 @@ _SERVICE_SHELL_DISPLAY_SUBCOMMANDS = frozenset({
     "update", "view",
 })
 _SERVICE_SHELL_DISPLAY_OPTIONS = frozenset({
-    "-C", "-a", "-c", "-l", "-m", "-n", "-p", "-q",
+    "-C", "-a", "-c", "-h", "-l", "-m", "-n", "-p", "-q",
     "--all", "--app", "--approve", "--assignee", "--author", "--base", "--body",
     "--body-file", "--branch", "--comment", "--comments", "--draft", "--head",
-    "--description", "--json", "--jq", "--kind", "--label", "--limit",
+    "--description", "--help", "--json", "--jq", "--kind", "--label", "--limit",
     "--mention", "--milestone", "--no-changelog", "--no-pager", "--oneline",
     "--priority", "--quiet", "--repo", "--request-changes",
     "--search", "--short", "--state", "--status", "--template",
@@ -4616,7 +4633,8 @@ def _service_shell_typed_tool_guidance(
         if _service_shell_coding_enabled():
             return (
                 " Repository scripts must run through the typed repo_test tool, "
-                "which uses the deployment-configured test command in the bound PR "
+                "with suite='frontend' for the configured frontend suite (or frontend "
+                "file selectors for inference), which runs in a contained bound PR "
                 "checkout; shell_exec does not admit npm run or npm test."
             )
         return (
@@ -4680,6 +4698,8 @@ def _service_shell_not_admitted_reason(argv: list[str], destination: str) -> str
             "admitted mutations are issue create/update/comment/label/unlabel/block/unblock/"
             "relate/unrelate/close/reopen/subissue/quick, using only each command's "
             "documented bounded options (-q/--quiet and --json included)."
+            " To inspect the CLI's JSON contract, use chainlink issue show <id> --json"
+            " or chainlink issue list --json."
         )
     elif argv[:1] == ["git"] and destination == "repo_review":
         boundary = (
@@ -5194,6 +5214,23 @@ def resolve_repository_review_state(
     """Resolve one request's PR state without relying on a batched singleton."""
     from .models import RepoPRScopeRegistry
 
+    argv: list[str] = []
+    if isinstance(command, str):
+        try:
+            argv = shlex.split(command)
+        except ValueError:
+            argv = []
+    if path is None and argv:
+        service = get_trusted_service_from_auth_context(auth_context)
+        declared = getattr(service, "declared_shell_commands", ()) or ()
+        # These CLI families have no PR binding. Leave admission to the shell
+        # allowlist and IFC guards, even when a cwd or several leases exist.
+        if argv[0] in _CHAINLINK_EXECUTABLES or (
+            argv[0] not in {"git", "gh"}
+            and any(argv[0] == item.executable for item in declared)
+        ):
+            return None, None
+
     registry = getattr(auth_context, "repo_pr_scope_registry", None)
     if not isinstance(registry, RepoPRScopeRegistry):
         return getattr(auth_context, "repo_review_state", None), None
@@ -5202,12 +5239,6 @@ def resolve_repository_review_state(
         state = registry.resolve_checkout_path(path)
         return state, None if state is not None else "no matching checkout lease was found for the requested path"
 
-    argv: list[str] = []
-    if isinstance(command, str):
-        try:
-            argv = shlex.split(command)
-        except ValueError:
-            argv = []
     if (
         len(argv) >= 4
         and (
@@ -5232,6 +5263,11 @@ def resolve_repository_review_state(
         return state, None if state is not None else "no matching checkout lease was found for the repository command"
     if len(registry.review_states) == 1:
         return registry.review_states[0], None
+    if len(registry.review_states) > 1:
+        return None, (
+            "several checkout leases are active; name the checkout with "
+            "`git -C <lease path>` or the pull request number"
+        )
     return None, "no matching checkout lease was found for the repository command"
 
 
@@ -5559,7 +5595,8 @@ def _configured_url_approvals(
     variable: str,
 ) -> tuple[frozenset[str], frozenset[_ApprovedURLScope]]:
     """Read exact URLs and explicit ``/*`` URL scopes from operator config."""
-    configured = os.environ.get(variable, "").strip()
+    # Manifest grants are immutable JSON literals; legacy policies name env vars.
+    configured = variable if variable.startswith("[") else os.environ.get(variable, "").strip()
     if not configured:
         return frozenset(), frozenset()
     if configured.startswith("["):
@@ -9123,6 +9160,7 @@ _PROTECTED_RESULT_DOMAINS: dict[str, str] = {
     "pr_submit_review": "repository",
     "pr_inline_review_comment": "repository",
     "pr_comment": "repository",
+    "pr_edit_body": "repository",
     "issue_comment": "repository",
     "repo_commit": "repository",
     "repo_merge": "repository",
@@ -9192,12 +9230,14 @@ _REPOSITORY_RESULT_TOOLS = frozenset({
     "pr_comments", "pr_review_requests", "repo_checkout", "repo_fetch",
     "repo_status", "repo_test", "repo_diff", "repo_unmerged",
     "pr_submit_review", "pr_inline_review_comment", "pr_comment",
+    "pr_edit_body",
     "repo_commit", "repo_merge", "repo_merge_abort",
     "repo_rebase", "repo_rebase_abort", "repo_revert", "repo_revert_abort",
     "repo_push",
 })
 _REPOSITORY_MUTATION_RESULT_TOOLS = frozenset({
     "pr_submit_review", "pr_inline_review_comment", "pr_comment",
+    "pr_edit_body",
     "repo_commit", "repo_merge", "repo_merge_abort",
     "repo_rebase", "repo_rebase_abort", "repo_revert", "repo_revert_abort",
     "repo_push",
@@ -9600,6 +9640,74 @@ def initialize_file_integrity_ledger(home: Path) -> bool:
         except (OSError, json.JSONDecodeError):
             log.exception("failed to initialize file integrity ledger at %s", metadata_path)
             return False
+
+
+def record_framework_file_integrity(
+    home: Path,
+    files: Mapping[Path, bytes],
+    publish: Callable[[], None],
+    *,
+    prune_builtin: bool = False,
+) -> int:
+    """Publish framework bytes with a fail-closed ledger transaction.
+
+    Only internal package/scaffold writers may call this. Invalidate old records
+    before publication so an interrupted write cannot inherit trust. The final
+    ledger replacement commits verified bytes together; a crash between the two
+    filesystem publications leaves untrusted records, never speculative trust.
+    """
+    home = home.resolve(strict=True)
+    expected: dict[str, tuple[Path, bytes]] = {}
+    for path, content in files.items():
+        resolved = path.resolve(strict=False)
+        relative = resolved.relative_to(home)
+        if (
+            len(relative.parts) < 2
+            or relative.parts[0] not in _SELF_AUTHORED_FILE_ROOTS - {"skills"}
+            or relative.parts[:2] == ("state", "pollers")
+        ):
+            raise ValueError(f"not a framework scaffold destination: {path}")
+        expected[relative.as_posix()] = (resolved, content)
+
+    metadata_path = home / ".mimir" / "file-integrity.json"
+    with _persisted_file_integrity_lock:
+        payload = json.loads(metadata_path.read_text()) if metadata_path.exists() else {}
+        if not isinstance(payload, dict):
+            raise ValueError("invalid file integrity ledger")
+        epoch = payload.setdefault(_FILE_INTEGRITY_EPOCH_KEY, time.time_ns())
+        if not isinstance(epoch, int) or isinstance(epoch, bool) or epoch <= 0:
+            raise ValueError("invalid file integrity epoch")
+        recorded = sum(payload.get(key) != "trusted" for key in expected)
+        payload.update(dict.fromkeys(expected, "untrusted"))
+        metadata_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = metadata_path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(payload, sort_keys=True) + "\n", encoding="utf-8")
+        tmp.replace(metadata_path)
+        publish()
+        for path, content in expected.values():
+            if path.resolve(strict=True) != path or path.read_bytes() != content:
+                raise ValueError(f"framework output changed during publication: {path}")
+        if prune_builtin:
+            for key in tuple(payload):
+                if key.startswith(".mimir_builtin_skills/") and not (home / key).exists():
+                    del payload[key]
+        payload.update(dict.fromkeys(expected, "trusted"))
+        tmp.write_text(json.dumps(payload, sort_keys=True) + "\n", encoding="utf-8")
+        tmp.replace(metadata_path)
+        return recorded
+
+
+def write_framework_file(home: Path, destination: Path, content: bytes) -> None:
+    """Write one package/template scaffold through the integrity transaction."""
+    def publish() -> None:
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        tmp = destination.with_name(destination.name + ".tmp")
+        # Exclusive creation refuses a pre-planted temporary symlink.
+        with tmp.open("xb") as stream:
+            stream.write(content)
+        tmp.replace(destination)
+
+    record_framework_file_integrity(home, {destination: content}, publish)
 
 
 def record_admin_installed_skill_integrity(home: Path, skill_root: Path) -> bool:
@@ -10483,6 +10591,7 @@ _OPERATION_SINK_DESTINATION: dict[str, str] = {
     "pr_submit_review": "bound_pull_request",
     "pr_inline_review_comment": "bound_pull_request",
     "pr_comment": "bound_pull_request",
+    "pr_edit_body": "bound_pull_request",
     "issue_comment": "configured_repository_issue",
     "pr_rerequest_review": "bound_pull_request",
     "unsupported_operation": "bound_pull_request",

@@ -1101,7 +1101,7 @@ export interface FactoryRunSummary {
   issue_key: string;
   valid: boolean;
   sandbox_path: string;
-  status: string;
+  status: string | null;
   mode: string;
   branch: string;
   pr_base: string;

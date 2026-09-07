@@ -165,6 +165,41 @@ def test_submit_review_uses_json_transport_and_scope_head() -> None:
     }
 
 
+def test_edit_pull_request_body_patches_only_body_at_exact_bound_pulls_endpoint() -> None:
+    session = Session([Response({"login": "reviewer"}), Response({})])
+    client = GitHubForgeClient(token="secret", session=session)
+    client.verify_identity("reviewer")
+    scope = replace(_scope(), canonical_repo="bound/project", pr_number=29)
+    body = 'Description "quoted"\n@/tmp/body.md'
+
+    assert client.edit_pull_request_body(scope, body) is None
+
+    assert [(method, url) for method, url, _ in session.calls] == [
+        ("GET", "https://api.github.com/user"),
+        ("PATCH", "https://api.github.com/repos/bound/project/pulls/29"),
+    ]
+    assert session.calls[1][2]["json"] == {"body": body}
+
+
+@pytest.mark.parametrize("identity", ["unverified", "wrong-principal", "changed-credential"])
+def test_edit_pull_request_body_identity_refusal_without_patch(identity: str) -> None:
+    session = Session([Response({"login": "reviewer"})])
+    client = GitHubForgeClient(token="secret", session=session)
+    scope = _scope()
+    if identity != "unverified":
+        client.verify_identity("reviewer")
+        if identity == "wrong-principal":
+            scope = replace(scope, principal="other-bot")
+        else:
+            client = GitHubForgeClient(token="different-secret", session=session)
+    before = list(session.calls)
+
+    with pytest.raises(GitHubIdentityVerificationError):
+        client.edit_pull_request_body(scope, "Updated description")
+
+    assert session.calls == before
+
+
 def test_mismatched_authenticated_identity_refuses_effect_without_post() -> None:
     session = Session([Response({"login": "other-bot"})])
     client = GitHubForgeClient(token="secret", session=session)

@@ -1092,6 +1092,7 @@ class WorklinkRunner:
             backend_status=raw.backend_status,
             test_command=test_cmd,
             transcript=str(raw.transcript_path) if raw.transcript_path else None,
+            gate_rerun_max_failures=config.defaults.gate_rerun_max_failures,
             blocked_reason=raw.blocked_reason,
             model=invocation_model,
             failure_reason=raw.error if (executor_failed or backend_reported_failure) else None,
@@ -1128,6 +1129,7 @@ class WorklinkRunner:
                     attempt=attempt,
                 )
             else:
+                first_tests = validation.evidence.tests
                 validation = await observe_evidence(
                     issue=issue.issue_id,
                     attempt=attempt,
@@ -1139,6 +1141,7 @@ class WorklinkRunner:
                     backend_status=raw.backend_status,
                     test_command=test_cmd,
                     transcript=str(raw.transcript_path) if raw.transcript_path else None,
+                    gate_rerun_max_failures=config.defaults.gate_rerun_max_failures,
                     blocked_reason=raw.blocked_reason,
                     model=invocation_model,
                     failure_reason=raw.error if (executor_failed or backend_reported_failure) else None,
@@ -1152,6 +1155,25 @@ class WorklinkRunner:
                     compute=compute,
                     on_gate_launch=persist_gate_handle,
                 )
+                if first_tests is not None and first_tests.flaky_tests:
+                    tests = validation.evidence.tests
+                    if tests is not None:
+                        # Retain flake history, not the earlier passing gate verdict.
+                        validation = replace(
+                            validation,
+                            evidence=replace(
+                                validation.evidence,
+                                tests=replace(
+                                    tests,
+                                    flaky_tests=tuple(dict.fromkeys(
+                                        (*first_tests.flaky_tests, *tests.flaky_tests)
+                                    )),
+                                    initial_run=tests.initial_run or first_tests.initial_run,
+                                    rerun=tests.rerun or first_tests.rerun,
+                                    previous_observation=first_tests,
+                                ),
+                            ),
+                        )
                 validation = _with_outside_checkout_detection(
                     validation,
                     issue=issue.issue_id,
@@ -1237,6 +1259,7 @@ class WorklinkRunner:
             )
 
         def log_evidence() -> None:
+            _log_gate_flaky_tests(validation.evidence)
             _log_event(
                 "worklink_evidence",
                 issue_id=issue.issue_id,
@@ -2495,6 +2518,9 @@ class WorklinkRunner:
             issue=issue,
             record=factory_record,
             test_command=test_cmd,
+            gate_rerun_max_failures=WorklinkConfig.load(
+                self.home / "worklink.yaml"
+            ).defaults.gate_rerun_max_failures,
             started_at=started_at,
             runner=runner,
         )
@@ -2869,6 +2895,7 @@ async def _verify_factory_completion(
     test_command: str,
     started_at: datetime,
     runner: Runner,
+    gate_rerun_max_failures: int = 10,
 ) -> tuple[Path, str]:
     status = record.status
     evidence = WorklinkEvidence(
@@ -2925,9 +2952,11 @@ async def _verify_factory_completion(
             backend_status="completed",
             test_command=test_command,
             pr_url=status.pr_url,
+            gate_rerun_max_failures=gate_rerun_max_failures,
             runner=runner,
         )
         evidence = validation.evidence
+        _log_gate_flaky_tests(evidence)
         if evidence.issue != issue.issue_id:
             raise WorklinkError("factory evidence issue mismatch")
         if evidence.branch != record.branch:
@@ -3606,6 +3635,16 @@ def _local_gate_failure_tail(validation: EvidenceValidation) -> str | None:
     return tests.summary
 
 
+def _log_gate_flaky_tests(evidence: WorklinkEvidence) -> None:
+    if evidence.tests is not None and evidence.tests.flaky_tests:
+        _log_event(
+            "worklink_gate_flaky_tests",
+            issue_id=evidence.issue,
+            attempt=evidence.attempt,
+            flaky_tests=[redact_text(node) for node in evidence.tests.flaky_tests],
+        )
+
+
 def _comment_evidence(
     claims: ChainlinkClaims,
     evidence: WorklinkEvidence,
@@ -3614,10 +3653,13 @@ def _comment_evidence(
     *,
     gate_test_tail: str | None = None,
 ) -> None:
+    tests = evidence.tests
     summary = (
         f"WORKLINK_EVIDENCE issue={evidence.issue} attempt={evidence.attempt} "
         f"status={validation.status} review_ready={str(validation.review_ready).lower()} "
         f"files={len(evidence.files_changed)} evidence={evidence_path}"
+        f" failed_tests={json.dumps([redact_text(node) for node in tests.failed_tests] if tests else [])}"
+        f" flaky_tests={json.dumps([redact_text(node) for node in tests.flaky_tests] if tests else [])}"
     )
     reasons = f"\nReasons: {', '.join(validation.reasons)}" if validation.reasons else ""
     # chainlink #815: the failed gate-test output otherwise dies with the worker

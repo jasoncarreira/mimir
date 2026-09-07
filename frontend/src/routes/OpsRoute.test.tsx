@@ -1,10 +1,11 @@
 // @vitest-environment jsdom
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { cleanup, render, screen } from "@testing-library/react";
+import { cleanup, render, screen, within } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { opsDashboardFixture } from "../fixtures/api";
+import { getOpsDashboard } from "../api";
 import { OpsRoute, UsageRoute } from "./OpsRoute";
 
 vi.mock("../api", () => ({
@@ -35,9 +36,58 @@ function renderOpsRoute(initialEntry = "/ops") {
 
 afterEach(() => {
   cleanup();
+  vi.restoreAllMocks();
 });
 
 describe("UsageRoute dashboard (#573)", () => {
+  it.each([
+    ["America/New_York", ["Aug 31", "Sep 6"]],
+    ["UTC", ["Sep 1", "Sep 6"]],
+    ["Asia/Tokyo", ["Sep 1", "Sep 7"]]
+  ] as const)("keeps calendar buckets aligned and timestamps local in %s", async (timeZone, timestampLabels) => {
+    const DateTimeFormat = Intl.DateTimeFormat;
+    // Simulate the browser's default zone/locale, but honor explicit formatter options.
+    vi.spyOn(Intl, "DateTimeFormat").mockImplementation(function (locales, options) {
+      return new DateTimeFormat(locales ?? "en-US", { timeZone, ...options });
+    });
+    const buckets = [
+      ["2026-08-30", "Aug 30"],
+      ["2026-09-01", "Sep 1"],
+      ["2026-09-04", "Sep 4"],
+      ["2026-09-06", "Sep 6"]
+    ] as const;
+    vi.mocked(getOpsDashboard).mockResolvedValueOnce({
+      ok: true,
+      version: "v1",
+      data: {
+        ...opsDashboardFixture,
+        token_usage_history: buckets.map(([date]) => ({
+          date, turn_count: 1, input_tokens: 110_271_350,
+          cache_creation_input_tokens: 0, cache_read_input_tokens: 0,
+          output_tokens: 0, total_cost_usd: null
+        })),
+        usage_history: {
+          codex_plus: {
+            five_hour: ["2026-09-01T00:30:00Z", "2026-09-06T23:30:00Z"].map((ts) => ({
+              ts, utilization: 0.12, resets_at: null, projection: null, pressure: "clear"
+            }))
+          }
+        }
+      }
+    });
+    renderUsageRoute();
+    const chart = await screen.findByLabelText("Daily token volume by token type with token-count axis");
+    for (const [date, label] of buckets) {
+      const bar = within(chart).getByTitle(`${date}: 110,271,350 tokens · 1 turns`);
+      expect(bar.querySelector(".ops-token-day__label")?.textContent).toBe(label);
+      const row = screen.getByRole("cell", { name: date }).closest("tr")!;
+      expect(within(row).getByRole("cell", { name: "110.3M" })).toBeTruthy();
+    }
+    const quota = screen.getByLabelText("codex_plus quota utilization line chart with percent axis");
+    expect(Array.from(quota.querySelectorAll(".ops-quota-line-labels span"), (node) => node.textContent))
+      .toEqual(timestampLabels);
+  });
+
   it("renders usage as its own top-level surface with only usage information", async () => {
     renderUsageRoute("/usage");
 

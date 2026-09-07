@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { MemoryRouter } from "react-router-dom";
+import { BrowserRouter, MemoryRouter } from "react-router-dom";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { ReactNode } from "react";
 
@@ -63,6 +63,7 @@ let bootstrapOverride: typeof protectedBootstrap | null = null;
 
 // Per-test skin shell layout (the real skin drives this via chrome.layout).
 let skinLayout: "top-nav" | "sidebar" = "top-nav";
+let stubAdmin = false;
 
 vi.mock("./api/whoami", () => ({ getWhoami: (...args: unknown[]) => whoami.getWhoami(...args) }));
 
@@ -113,6 +114,13 @@ vi.mock("./routes/WikiRoute", () => {
     WikiRoute: ({ surface }: { surface: { title: string } }) => `wiki-route-stub:${surface.title}`
   };
 });
+vi.mock("./routes/ChainlinkBoardRoute", () => ({ ChainlinkBoardRoute: () => <div>tasks-stub</div> }));
+vi.mock("./routes/FactoryRunsRoute", () => ({ FactoryRunsRoute: () => <div>factory-stub</div> }));
+vi.mock("./routes/TurnsRoute", () => ({ TurnsRoute: () => <div>turns-stub</div> }));
+vi.mock("./routes/AdminRoute", async (original) => {
+  const { AdminRoute } = await original<typeof import("./routes/AdminRoute")>();
+  return { AdminRoute: () => stubAdmin ? <div>admin-stub</div> : <AdminRoute /> };
+});
 
 // Imported after mocks are registered.
 const { AppFrame, resetBrowserSessionStateForApiKeyChange } = await import("./main");
@@ -136,8 +144,10 @@ function renderApp(initialEntries = ["/"]) {
 afterEach(() => {
   cleanup();
   window.localStorage.clear();
+  window.history.replaceState(null, "", "/");
   bootstrapOverride = null;
   skinLayout = "top-nav";
+  stubAdmin = false;
   useChatStore.setState({ messages: [] });
   useUiState.setState({
     selectedChatMessageId: "",
@@ -151,6 +161,118 @@ afterEach(() => {
   routeFailures.chat = false;
   vi.clearAllMocks();
   vi.restoreAllMocks();
+});
+
+describe("protected deep links await initial identity (#1547)", () => {
+  const links = [
+    { id: "chainlink-board", path: "/chainlink", query: "?issue=1521", label: "Tasks", body: "tasks-stub" },
+    { id: "factory-runs", path: "/factory-runs", query: "?run=chainlink-1521", label: "Factory Runs", body: "factory-stub" },
+    { id: "turns", path: "/turns", query: "?turn=turn-1521&tab=events", label: "Turns", body: "turns-stub" },
+    { id: "admin-config", path: "/admin", query: "?tab=users", label: "Admin", body: "admin-stub" }
+  ];
+
+  function deferred<T>() {
+    let resolve!: (value: T) => void;
+    let reject!: (reason: Error) => void;
+    const promise = new Promise<T>((yes, no) => { resolve = yes; reject = no; });
+    return { promise, resolve, reject };
+  }
+
+  function mount() {
+    useUiState.setState({ apiKeyPresent: true });
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false, gcTime: 0 } } });
+    return render(
+      <QueryClientProvider client={client}>
+        <BrowserRouter basename="/app"><AppFrame /></BrowserRouter>
+      </QueryClientProvider>
+    );
+  }
+
+  function configure() {
+    stubAdmin = true;
+    window.localStorage.setItem(STORAGE_KEY, "stored-key");
+    bootstrapOverride = {
+      ...protectedBootstrap,
+      dashboard_extensions: [protectedBootstrap.dashboard_extensions[0], ...links.map((link, index) => ({
+        ...protectedBootstrap.dashboard_extensions[0],
+        id: link.id, route_path: link.path, label: link.label, nav_position: index + 1,
+        requires_role: "admin"
+      }))]
+    };
+  }
+
+  it.each(links)("preserves $label selection on direct open and fresh reload", async (link) => {
+    configure();
+    const url = `/app${link.path}${link.query}`;
+    window.history.replaceState(null, "", url);
+    const replace = vi.spyOn(window.history, "replaceState");
+    const push = vi.spyOn(window.history, "pushState");
+    // A reload starts a new app/query client at the current browser URL, not a cached identity.
+    for (const entry of ["direct open", "reload"]) {
+      const bootstrap = deferred<unknown>();
+      const identity = deferred<unknown>();
+      const { apiFetchEnvelope } = await import("./api");
+      vi.mocked(apiFetchEnvelope).mockImplementationOnce(() => bootstrap.promise as ReturnType<typeof apiFetchEnvelope>);
+      vi.mocked(whoami.getWhoami).mockReturnValueOnce(identity.promise);
+      const calls = vi.mocked(whoami.getWhoami).mock.calls.length;
+      const app = mount();
+      expect(screen.getByText(/Loading server auth policy/)).toBeTruthy();
+      expect(whoami.getWhoami).toHaveBeenCalledTimes(calls);
+      expect(window.location.pathname + window.location.search, entry).toBe(url);
+      await act(async () => bootstrap.resolve({ ok: true, version: "v1", data: bootstrapOverride }));
+      expect(await screen.findByText("Loading dashboard identity")).toBeTruthy();
+      expect(whoami.getWhoami).toHaveBeenCalledTimes(calls + 1);
+      expect(window.location.pathname + window.location.search).toBe(url);
+      expect(screen.queryByText(link.body)).toBeNull();
+      expect(screen.queryByText("chat-stub")).toBeNull();
+      await act(async () => identity.resolve({ data: { is_admin: true } }));
+      expect(await screen.findByText(link.body)).toBeTruthy();
+      expect(window.location.pathname + window.location.search).toBe(url);
+      expect(screen.queryByText("chat-stub")).toBeNull();
+      // BrowserRouter may initialize its history index without changing the URL.
+      expect(replace.mock.calls.every((call) => call[2] === undefined)).toBe(true);
+      expect(push).not.toHaveBeenCalled();
+      app.unmount();
+    }
+  });
+
+  it.each(links)("denies $label after a delayed non-admin identity", async (link) => {
+    configure();
+    const identity = deferred<unknown>();
+    vi.mocked(whoami.getWhoami).mockReturnValueOnce(identity.promise);
+    const url = `/app${link.path}${link.query}`;
+    window.history.replaceState(null, "", url);
+    mount();
+    expect(await screen.findByText("Loading dashboard identity")).toBeTruthy();
+    expect(window.location.pathname + window.location.search).toBe(url);
+    await act(async () => identity.resolve({ data: { is_admin: false } }));
+    expect(await screen.findByText("chat-stub")).toBeTruthy();
+    expect(window.location.pathname).toBe("/app/chat");
+    for (const protectedLink of links) {
+      expect(screen.queryByText(protectedLink.body)).toBeNull();
+      expect(screen.queryByRole("link", { name: new RegExp(protectedLink.label) })).toBeNull();
+    }
+  });
+
+  it("fails closed on identity failure and retries without losing the URL", async () => {
+    configure();
+    const identity = deferred<unknown>();
+    vi.mocked(whoami.getWhoami).mockReturnValueOnce(identity.promise);
+    const url = "/app/admin?tab=mcp";
+    window.history.replaceState(null, "", url);
+    mount();
+    expect(await screen.findByText("Loading dashboard identity")).toBeTruthy();
+    await act(async () => identity.reject(new Error("identity unavailable")));
+    expect(await screen.findByRole("alert")).toHaveProperty("textContent", expect.stringContaining("Couldn't verify your identity"));
+    expect(screen.queryByText("Loading dashboard identity")).toBeNull();
+    expect(screen.queryByText("admin-stub")).toBeNull();
+    expect(screen.queryByText("chat-stub")).toBeNull();
+    expect(window.location.pathname + window.location.search).toBe(url);
+    vi.mocked(whoami.getWhoami).mockResolvedValueOnce({ data: { is_admin: true } });
+    fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+    expect(await screen.findByText("admin-stub")).toBeTruthy();
+    expect(window.location.pathname + window.location.search).toBe(url);
+  });
 });
 
 
@@ -304,6 +426,17 @@ describe("AppFrame login gate + admin surface gating (#563 / #577)", () => {
 
     const usersTab = await screen.findByRole("tab", { name: "Users" });
     expect(usersTab.getAttribute("aria-selected")).toBe("true");
+    fireEvent.click(screen.getByRole("link", { name: /AdminConfig/ }));
+    expect(await screen.findByRole("tablist", { name: "Admin tabs" })).toBeTruthy();
+    for (const name of ["Config", "MCP Servers", "Users"]) {
+      const tab = screen.getByRole("tab", { name });
+      fireEvent.click(tab);
+      expect(tab.getAttribute("aria-selected")).toBe("true");
+      expect(tab.tabIndex).toBe(0);
+      tab.focus();
+      expect(document.activeElement).toBe(tab);
+      expect(screen.getByRole("tabpanel", { name }).id).toBe(tab.getAttribute("aria-controls"));
+    }
   });
 
   it("does not gate when the server allows unauthenticated access", async () => {

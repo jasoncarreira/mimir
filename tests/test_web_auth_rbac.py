@@ -132,7 +132,7 @@ async def test_board_pagination_and_selected_detail_remain_admin_only(tmp_path: 
 
     async def run(home, args):
         calls.append(args)
-        if args[:2] == ["issue", "list"]:
+        if args == ["export", "--json"]:
             return [{"id": 1214, "title": "Private task", "status": "open"}], None
         return {"id": 1214, "description": "Private detail"}, None
 

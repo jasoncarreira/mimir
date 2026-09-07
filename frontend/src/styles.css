@@ -12,7 +12,7 @@
 
 body {
   margin: 0;
-  min-width: 320px;
+  min-width: 0;
   background: var(--mimir-color-background, #f8faf9);
 }
 
@@ -104,7 +104,7 @@ textarea {
 .route-grid,
 .ui-card-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(min(260px, 100%), 1fr));
   gap: var(--mimir-space-md, 16px);
   margin-top: var(--mimir-space-xl, 32px);
 }
@@ -134,11 +134,14 @@ textarea {
 }
 
 .ui-panel {
+  min-width: 0;
+  overflow-wrap: anywhere;
   padding: var(--mimir-space-lg, 24px);
 }
 
 .ui-panel__header {
   display: flex;
+  flex-wrap: wrap;
   gap: var(--mimir-space-md, 16px);
   align-items: start;
   justify-content: space-between;
@@ -163,6 +166,12 @@ textarea {
   display: flex;
   gap: var(--mimir-space-xs, 8px);
   flex-wrap: wrap;
+}
+
+.ui-panel__header > *,
+.ops-header-row > * {
+  min-width: 0;
+  max-width: 100%;
 }
 
 .ui-card {
@@ -315,6 +324,8 @@ textarea {
 }
 
 .ui-table-wrap {
+  min-width: 0;
+  max-width: 100%;
   overflow-x: auto;
 }
 
@@ -558,6 +569,7 @@ textarea {
 
 .app-frame {
   display: grid;
+  grid-template-columns: minmax(0, 1fr);
   grid-template-rows: auto auto minmax(0, 1fr) auto;
   /* Bound the shell to the viewport so the routed content (app-main) scrolls
      internally instead of growing the page — the chat console relies on this
@@ -628,6 +640,8 @@ textarea {
 /* github #577: compact one-line header strip (brand + status). */
 .app-header {
   display: flex;
+  flex-wrap: wrap;
+  min-width: 0;
   gap: var(--mimir-space-md, 16px);
   align-items: center;
   justify-content: space-between;
@@ -658,6 +672,7 @@ textarea {
 
 .app-header__status {
   display: flex;
+  flex-wrap: wrap;
   gap: var(--mimir-space-sm, 12px);
   align-items: center;
   min-width: 0;
@@ -677,6 +692,9 @@ textarea {
 
 
 .skin-picker {
+  min-width: 0;
+  max-width: 100%;
+  flex-wrap: wrap;
   align-items: center;
   display: inline-flex;
   gap: var(--mimir-space-xs);
@@ -690,7 +708,9 @@ textarea {
 }
 
 .skin-picker .ui-input {
-  min-width: 10rem;
+  min-width: 0;
+  width: 10rem;
+  max-width: 100%;
 }
 
 .app-header__signal {
@@ -732,14 +752,14 @@ textarea {
   padding: var(--mimir-space-sm, 12px) var(--mimir-space-lg, 24px) 0;
   border-bottom: var(--mimir-border-width-hairline, 1px) solid var(--mimir-color-chrome-border, #c9d7ce);
   background: var(--mimir-color-chrome-background, #edf3ef);
-  overflow-x: auto;
 }
 
 .app-nav {
   display: flex;
+  flex-wrap: wrap;
   gap: var(--mimir-space-xs, 8px);
   align-items: end;
-  min-width: max-content;
+  min-width: 0;
 }
 
 /* Connected tabs: top-rounded boxes seated on the topnav's baseline rule (no
@@ -796,12 +816,14 @@ textarea {
 }
 
 .app-main {
+  container: app-main / inline-size;
   width: min(1280px, 100%);
   min-width: 0;
   min-height: 0;
   margin: 0 auto;
   padding: var(--mimir-space-xl, 32px);
   overflow-y: auto;
+  overflow-x: auto;
 }
 
 /* ===== github #788: sidebar shell (skin.chrome.layout === "sidebar") ===== */
@@ -813,6 +835,7 @@ textarea {
 }
 
 .app-sidebar {
+  min-width: 0;
   position: sticky;
   top: 0;
   display: flex;
@@ -1667,6 +1690,7 @@ textarea {
 
 .ops-header-row {
   display: flex;
+  flex-wrap: wrap;
   gap: var(--mimir-space-md, 16px);
   align-items: start;
   justify-content: space-between;
@@ -1706,6 +1730,7 @@ textarea {
 
 .ops-route {
   display: grid;
+  grid-template-columns: minmax(0, 1fr);
   gap: var(--mimir-space-lg, 24px);
 }
 
@@ -1748,7 +1773,7 @@ textarea {
 
 .ops-panel-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(min(320px, 100%), 1fr));
   gap: var(--mimir-space-md, 16px);
 }
 
@@ -1958,7 +1983,7 @@ textarea {
 
 .admin-config__split {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(min(280px, 100%), 1fr));
   gap: var(--mimir-space-md, 16px);
 }
 
@@ -1969,6 +1994,7 @@ textarea {
 
 .mcp-route {
   display: grid;
+  grid-template-columns: minmax(0, 1fr);
   gap: var(--mimir-space-lg, 24px);
 }
 
@@ -2099,7 +2125,21 @@ textarea {
 
 .chainlink-route {
   display: grid;
+  min-width: 0;
+  grid-template-columns: minmax(0, 1fr);
   gap: var(--mimir-space-lg, 24px);
+}
+
+.chainlink-views {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--mimir-space-xs, 8px);
+  margin-top: var(--mimir-space-sm, 12px);
+}
+
+.chainlink-views [aria-pressed="true"] {
+  background: var(--mimir-color-panel-background-muted, #f1f5f2);
+  border-color: var(--mimir-color-chrome-accent, #60786a);
 }
 
 .chainlink-actions,
@@ -2119,7 +2159,8 @@ textarea {
 .chainlink-filter {
   display: grid;
   gap: var(--mimir-space-2xs, 4px);
-  min-width: 140px;
+  min-width: min(140px, 100%);
+  max-width: 100%;
   color: var(--mimir-color-text-muted, #58685f);
   font-size: var(--mimir-font-size-xs, 0.75rem);
   font-weight: var(--mimir-font-weight-strong, 700);
@@ -2132,6 +2173,8 @@ textarea {
 
 .chainlink-board {
   display: grid;
+  min-width: 0;
+  max-width: 100%;
   grid-template-columns: repeat(6, minmax(220px, 1fr));
   gap: var(--mimir-space-sm, 12px);
   overflow-x: auto;
@@ -2311,6 +2354,7 @@ textarea {
 .chainlink-tree {
   padding-left: 0;
   list-style: none;
+  overflow-x: auto;
 }
 
 .chainlink-tree ol {
@@ -2322,7 +2366,21 @@ textarea {
   gap: var(--mimir-space-xs, 8px);
   align-items: center;
   min-height: 34px;
-  padding-left: calc(var(--tree-depth, 0) * var(--mimir-space-md, 16px));
+  width: 100%;
+  min-width: 200px;
+  padding: var(--mimir-space-2xs, 4px);
+  border: 1px solid transparent;
+  border-radius: var(--mimir-radius-control, 6px);
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.chainlink-tree-row:hover,
+.chainlink-tree-row:focus-visible {
+  border-color: var(--mimir-color-chrome-accent, #60786a);
 }
 
 .chainlink-tree-row span {
@@ -3060,8 +3118,12 @@ textarea {
 
 .memory-browser__search {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) auto auto;
+  grid-template-columns: minmax(0, 1fr) auto;
   gap: var(--mimir-space-xs, 8px);
+}
+
+.memory-browser__search .ui-input {
+  grid-column: 1 / -1;
 }
 
 .memory-browser__counts {
@@ -3789,6 +3851,43 @@ textarea {
   }
 }
 
+/* Stack readers by available pane width, including the sidebar skin at 1153px.
+   A 300-420px list must not consume most of the reader's usable space. */
+@container app-main (max-width: 960px) {
+  .memory-browser,
+  .wiki-browser {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .memory-browser__sidebar,
+  .wiki-browser__sidebar {
+    position: static;
+    max-height: none;
+  }
+}
+
+@media (max-width: 900px) {
+  .app-frame--sidebar {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .app-sidebar {
+    position: static;
+    height: auto;
+    gap: var(--mimir-space-sm, 12px);
+  }
+
+  .app-sidebar .app-nav {
+    flex-direction: row;
+    flex-wrap: wrap;
+  }
+
+  .app-sidebar-main {
+    height: auto;
+    min-height: 100dvh;
+  }
+}
+
 @media (max-width: 640px) {
   .ui-shell {
     width: min(100% - 24px, 1120px);
@@ -3800,7 +3899,7 @@ textarea {
   }
 
   .ui-panel__header {
-    display: grid;
+    flex-direction: column;
   }
 
   .auth-form {
@@ -3827,20 +3926,6 @@ textarea {
   .app-header,
   .app-topnav {
     padding-inline: var(--mimir-space-md, 16px);
-  }
-
-  .memory-browser {
-    grid-template-columns: 1fr;
-  }
-
-  .wiki-browser {
-    grid-template-columns: 1fr;
-  }
-
-  .memory-browser__sidebar,
-  .wiki-browser__sidebar {
-    position: static;
-    max-height: none;
   }
 
   .memory-browser__search {
@@ -3870,6 +3955,35 @@ textarea {
   }
 }
 
+.browser-return {
+  display: none;
+}
+
+@media (max-width: 720px) {
+  .memory-browser,
+  .wiki-browser {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .memory-browser__sidebar,
+  .wiki-browser__sidebar {
+    position: static;
+    max-height: 65vh;
+    max-height: 65dvh;
+    overflow: auto;
+  }
+
+  .browser-return {
+    display: inline-flex;
+    margin-bottom: var(--mimir-space-md, 16px);
+  }
+
+  [data-browser-detail],
+  [data-browser-list] {
+    scroll-margin-top: var(--mimir-space-md, 16px);
+  }
+}
+
 /* ===== Factory Runs Dashboard ===== */
 .factory-runs {
   padding: var(--mimir-space-md, 1rem);
@@ -3878,7 +3992,7 @@ textarea {
 .factory-runs__list {
   display: grid;
   gap: var(--mimir-space-sm, 0.5rem);
-  grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
+  grid-template-columns: repeat(auto-fill, minmax(min(300px, 100%), 1fr));
 }
 
 .factory-run-card {
@@ -3932,6 +4046,8 @@ textarea {
 }
 
 .factory-run-detail {
+  min-width: 0;
+  overflow-wrap: anywhere;
   padding: var(--mimir-space-md, 1rem);
   display: flex;
   flex-direction: column;
@@ -3956,16 +4072,72 @@ textarea {
   margin: 0;
 }
 
-.factory-steps,
-.factory-slices {
+.factory-steps {
   display: flex;
   flex-wrap: wrap;
   gap: var(--mimir-space-xs, 0.5rem);
 }
 
-.factory-step,
-.factory-slice {
+.factory-step {
   padding: var(--mimir-space-xs, 0.25rem);
+}
+
+.factory-run-detail .facts-grid {
+  grid-template-columns: repeat(auto-fit, minmax(min(140px, 100%), 1fr));
+}
+
+.factory-run-detail .facts-grid > div,
+.factory-run-detail .facts-grid dd {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.factory-slices {
+  width: 100%;
+  table-layout: fixed;
+  border-collapse: collapse;
+}
+
+.factory-slices th,
+.factory-slices td {
+  padding: var(--mimir-space-xs, 0.25rem);
+  text-align: left;
+  vertical-align: top;
+  border-bottom: 1px solid var(--mimir-color-panel-border, #e2e8f0);
+}
+
+.factory-slices .ui-badge {
+  max-width: 100%;
+  white-space: normal;
+}
+
+.factory-diagnostics summary {
+  cursor: pointer;
+  padding: var(--mimir-space-sm, 0.5rem);
+  color: var(--mimir-color-text-muted, #64748b);
+}
+
+.factory-diagnostics summary:focus-visible,
+.factory-diagnostics__body:focus-visible {
+  outline: 2px solid var(--mimir-color-chrome-accent, #2f6f55);
+  outline-offset: 2px;
+}
+
+.factory-diagnostics__body {
+  display: flex;
+  flex-direction: column;
+  gap: var(--mimir-space-sm, 0.5rem);
+  max-height: 50dvh;
+  overflow: auto;
+  padding: var(--mimir-space-xs, 0.25rem);
+}
+
+.factory-controller-error {
+  margin: 0;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  font-family: var(--mimir-font-family-mono, ui-monospace, monospace);
+  color: var(--mimir-color-status-danger, #dc2626);
 }
 
 .dashboard-header {

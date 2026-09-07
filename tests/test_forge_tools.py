@@ -37,6 +37,7 @@ from mimir.models import (
     RepoReviewState,
     ServerDiscoveredPRScopeStore,
     ServerDiscoveredPRStates,
+    SourceLabel,
 )
 from mimir.identities import IdentityResolver
 from mimir.tools.forge import (
@@ -46,6 +47,7 @@ from mimir.tools.forge import (
     pr_comment,
     pr_comments,
     pr_diff,
+    pr_edit_body,
     pr_files,
     pr_inline_review_comment,
     pr_metadata,
@@ -243,6 +245,9 @@ class FakeForge:
         self.calls.append(("comment", scope, body))
         return CommentProjection("1", "reviewer", body, "now", "now")
 
+    def edit_pull_request_body(self, scope, body) -> None:
+        self.calls.append(("edit_body", scope, body))
+
     def get_open_issue_target(self, repository, issue):
         self.calls.append(("issue_target", repository, issue))
         return IssueTarget(repository, issue)
@@ -291,6 +296,7 @@ def test_every_tool_class_invokes_through_langchain_with_injected_runtime(
         (pr_submit_review, {"verdict": "approve", "body": "Looks good"}),
         (pr_inline_review_comment, {"path": "src/app.py", "line": 1, "body": "Fix"}),
         (pr_comment, {"body": "Fixed"}),
+        (pr_edit_body, {"body": "Updated description"}),
         (issue_comment, {"issue": 220, "body": "Analysis"}),
         (pr_rerequest_review, {"reviewer": "reviewer"}),
         (unsupported_operation, {
@@ -314,9 +320,140 @@ def test_every_tool_class_invokes_through_langchain_with_injected_runtime(
 
     assert [call[0] for call in client.calls] == [
         "metadata", "files", "diff", "checks", "reviews", "comments",
-        "review_requests", "review", "inline", "comment", "issue_target",
+        "review_requests", "review", "inline", "comment", "edit_body", "issue_target",
         "issue_comment", "rerequest",
     ]
+
+
+def test_pr_edit_body_schema_exposes_only_repository_pull_request_body() -> None:
+    schema = pr_edit_body.tool_call_schema.model_json_schema()
+    assert set(schema["properties"]) == {"repository", "pull_request", "body"}
+    assert set(schema["required"]) == {"repository", "pull_request", "body"}
+
+
+@pytest.mark.parametrize("remediation", [False, True], ids=["ordinary-review", "own-remediation"])
+def test_pr_edit_body_middleware_action_guard(monkeypatch, remediation: bool) -> None:
+    client = FakeForge()
+    _configure_live_review(monkeypatch, client)
+    scope = access_control._repo_pr_scope(
+        provenance="poller_payload", repo="owner/repo",
+        principal="reviewer" if remediation else "author",
+        event_type="pr_review", review_state="CHANGES_REQUESTED",
+        number=17, head_repo="owner/repo", head_remote="origin",
+        head_ref="change", head_sha="a" * 40, base_ref="main", base_sha="b" * 40,
+    )
+    assert scope is not None
+    assert (RepoPRAction.PR_EDIT.value in scope.allowed_operations) is remediation
+    runtime = _runtime(scope)
+    arguments = {"repository": "owner/repo", "pull_request": 17, "body": "Updated"}
+    request = ToolCallRequest(
+        tool_call={"name": "pr_edit_body", "args": arguments,
+                   "id": "edit-body", "type": "tool_call"},
+        tool=pr_edit_body, state={}, runtime=Runtime(context=runtime.context),
+    )
+
+    def handler(request):
+        assert remediation, "ordinary review reached the tool"
+        result = pr_edit_body.invoke({**request.tool_call["args"], "runtime": runtime})
+        return ToolMessage(content=json.dumps(result), tool_call_id="edit-body")
+
+    result = BudgetGateMiddleware().wrap_tool_call(request, handler)
+
+    if remediation:
+        assert result.status != "error"
+        assert json.loads(result.content) == {"status": "body_updated"}
+        assert client.calls == [("edit_body", scope, "Updated")]
+    else:
+        assert result.status == "error"
+        assert "repo_pr_scope_denied" in str(result.content)
+        assert client.calls == []
+
+
+@pytest.mark.parametrize(
+    ("repository", "pull_request"), [("other/repo", 17), ("owner/repo", 18)],
+    ids=["wrong-repository", "wrong-pr"],
+)
+def test_pr_edit_body_exact_scope_preflight_no_adapter_calls(
+    monkeypatch, repository: str, pull_request: int,
+) -> None:
+    client = FakeForge()
+    set_forge_client(client)
+    monkeypatch.setenv("GITHUB_REPOS", "owner/repo,other/repo")
+    runtime = _runtime(_scope(RepoPRAction.PR_EDIT))
+    request = ToolCallRequest(
+        tool_call={"name": "pr_edit_body", "args": {
+            "repository": repository, "pull_request": pull_request, "body": "Updated",
+        }, "id": "edit-target", "type": "tool_call"},
+        tool=pr_edit_body, state={}, runtime=Runtime(context=runtime.context),
+    )
+
+    result = BudgetGateMiddleware().wrap_tool_call(
+        request, lambda _: pytest.fail("out-of-scope target reached the tool"),
+    )
+
+    assert result.status == "error"
+    assert "outside this turn's scope" in str(result.content)
+    assert client.calls == []
+
+
+@pytest.mark.parametrize("forge_tool", [pr_edit_body, pr_comment], ids=lambda tool: tool.name)
+def test_pr_edit_body_and_comment_untrusted_active_ingest_ifc_denial(forge_tool) -> None:
+    client = FakeForge()
+    set_forge_client(client)
+    runtime = _runtime(_scope(RepoPRAction.PR_EDIT, RepoPRAction.PR_COMMENT))
+    runtime.context.ifc_state.merge(InformationFlowLabels(sources=(SourceLabel(
+        principal="external", domain="web", resource_id="untrusted-description",
+        bridge_instance="test", sensitivity="public", source_kind="protected_tool",
+        integrity="untrusted", integrity_effect="active_ingest",
+    ),)), fallback=runtime.context.ifc_labels)
+    request = ToolCallRequest(
+        tool_call={"name": forge_tool.name, "args": {
+            "repository": "owner/repo", "pull_request": 17, "body": "Updated",
+        }, "id": "edit-ifc", "type": "tool_call"},
+        tool=forge_tool, state={}, runtime=Runtime(context=runtime.context),
+    )
+
+    result = BudgetGateMiddleware().wrap_tool_call(
+        request, lambda _: pytest.fail("untrusted active ingest reached the tool"),
+    )
+
+    assert result.status == "error"
+    assert "ifc_label_blocked:forge" in str(result.content)
+    assert client.calls == []
+
+
+@pytest.mark.parametrize("body", ["", " \n", None, "hello\x00world", "x" * 65_537,
+                                  "\u00e9" * 32_769],
+                         ids=["empty", "whitespace", "none", "null-byte", "oversize", "utf8-oversize"])
+def test_pr_edit_body_validation_rejects_invalid_body_before_adapter(body) -> None:
+    client = FakeForge()
+    set_forge_client(client)
+
+    with pytest.raises(ToolException, match="body must"):
+        pr_edit_body.func(
+            repository="owner/repo", pull_request=17, body=body,
+            runtime=_runtime(_scope(RepoPRAction.PR_EDIT)),
+        )
+
+    assert client.calls == []
+
+
+@pytest.mark.parametrize("body_kind", ["path", "at-path", "byte-limit"])
+def test_pr_edit_body_preserves_bounded_literal_body_without_path_lookup(tmp_path, body_kind) -> None:
+    path = tmp_path / "description.md"
+    path.write_text("Must not be read as the description", encoding="utf-8")
+    body = {"path": str(path), "at-path": f"@{path}", "byte-limit": "\u00e9" * 32_768}[body_kind]
+    client = FakeForge()
+    set_forge_client(client)
+    scope = _scope(RepoPRAction.PR_EDIT)
+
+    result = pr_edit_body.invoke({
+        "repository": "owner/repo", "pull_request": 17, "body": body,
+        "runtime": _runtime(scope),
+    })
+
+    assert result == {"status": "body_updated"}
+    assert client.calls == [("edit_body", scope, body)]
 
 
 def test_read_uses_only_immutable_scope_target() -> None:
@@ -1003,9 +1140,11 @@ class _TestResult:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("suite", [None, "frontend"])
 async def test_operator_turn_discovers_live_review_scope_and_reaches_repo_test(
     tmp_path,
     monkeypatch: pytest.MonkeyPatch,
+    suite: str | None,
 ) -> None:
     client = FakeForge()
     set_forge_client(client)
@@ -1018,8 +1157,11 @@ async def test_operator_turn_discovers_live_review_scope_and_reaches_repo_test(
             ("/server/configured/repo",), 1,
         ),
     )
+    calls = []
+
     class Tests:
-        async def execute(self, selectors):
+        async def execute(self, selectors, *, suite=None):
+            calls.append((selectors, suite))
             return _TestResult("ok")
 
     monkeypatch.setattr("mimir.tools.repo.RepoProjectTests", lambda state: Tests())
@@ -1031,7 +1173,9 @@ async def test_operator_turn_discovers_live_review_scope_and_reaches_repo_test(
 
     assert await repo_test.coroutine(
         repository="OWNER/REPO", pull_request=1291, runtime=runtime,
+        **({"suite": suite} if suite is not None else {}),
     ) == {"status": "ok"}
+    assert calls == [((), suite)]
     state = context.server_discovered_pr_states.resolve("owner/repo", 1291)
     assert state is not None
     scope = state.action_scope

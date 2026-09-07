@@ -1,8 +1,9 @@
 // @vitest-environment jsdom
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { readFileSync } from "node:fs";
 import React from "react";
-import { MemoryRouter, Route, Routes } from "react-router-dom";
+import { MemoryRouter, Route, Routes, useLocation, useNavigate } from "react-router-dom";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { normalizeWikiIndexPayload } from "../api/wiki";
 import type { DashboardSurface } from "../dashboardExtensions";
@@ -196,9 +197,14 @@ function renderRoute(initialEntry = "/wiki?slug=concepts/alpha") {
   );
 }
 
+const originalScrollIntoView = Object.getOwnPropertyDescriptor(HTMLElement.prototype, "scrollIntoView");
+
 afterEach(() => {
   cleanup();
   vi.restoreAllMocks();
+  vi.unstubAllGlobals();
+  if (originalScrollIntoView) Object.defineProperty(HTMLElement.prototype, "scrollIntoView", originalScrollIntoView);
+  else Reflect.deleteProperty(HTMLElement.prototype, "scrollIntoView");
 });
 
 describe("wiki API normalization", () => {
@@ -224,6 +230,107 @@ describe("wiki API normalization", () => {
 });
 
 describe("WikiRoute", () => {
+  it("bounds both narrow sidebars at the same breakpoint used for focus navigation", () => {
+    // jsdom has no layout: this checks the CSS contract, not rendered dimensions.
+    const css = readFileSync("frontend/src/styles.css", "utf8");
+    expect(css).toMatch(/@media \(max-width: 720px\)\s*\{[^@]*?\.memory-browser__sidebar,\s*\.wiki-browser__sidebar\s*\{[^}]*max-height: 65vh;\s*max-height: 65dvh;\s*overflow: auto;/);
+  });
+
+  it.each([[390, 844], [652, 800], [1280, 800]])(
+    "preserves a 144-page sidebar through selection, return and history at %ix%i",
+    async (width, height) => {
+      vi.stubGlobal("innerWidth", width);
+      vi.stubGlobal("innerHeight", height);
+      const matchMedia = vi.fn((query: string) => ({ matches: query === "(max-width: 720px)" && width <= 720 }));
+      vi.stubGlobal("matchMedia", matchMedia);
+      const scroll = vi.fn();
+      Object.defineProperty(HTMLElement.prototype, "scrollIntoView", { configurable: true, value: scroll });
+      const pages = Array.from({ length: 144 }, (_, i) => ({
+        ...indexPayload().pages[0],
+        slug: `page-${String(i).padStart(3, "0")}`,
+        title: `Page ${String(i).padStart(3, "0")}`,
+        path: `concepts/page-${String(i).padStart(3, "0")}.md`
+      }));
+      vi.stubGlobal("fetch", vi.fn(async (url: string) => {
+        if (url.endsWith("/api/v1/wiki")) return jsonResponse(envelope({ ...indexPayload(), page_count: pages.length, pages }));
+        const page = pages.find((item) => decodeURIComponent(url).endsWith(item.path.slice(0, -3))) ?? pages[0];
+        return jsonResponse(envelope({ ...page, markdown: `Content for ${page.title}` }));
+      }));
+      let location!: ReturnType<typeof useLocation>;
+      let navigate!: ReturnType<typeof useNavigate>;
+      // Avoid the data router's Node Request/jsdom AbortSignal mismatch while
+      // retaining real URL state and Back/Forward navigation.
+      function HistoryProbe() {
+        location = useLocation();
+        navigate = useNavigate();
+        return null;
+      }
+      render(<QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}>
+        <MemoryRouter initialEntries={["/wiki?q=page&category=concepts&pane=list"]}>
+          <HistoryProbe />
+          <Routes><Route path="/wiki" element={<WikiRoute surface={surface} />} /></Routes>
+        </MemoryRouter>
+      </QueryClientProvider>);
+      const nav = await screen.findByRole("navigation", { name: "Wiki pages" });
+      expect(document.activeElement).toBe(document.body);
+      expect(within(nav).getAllByRole("button")).toHaveLength(144);
+      const sidebar = nav.closest<HTMLElement>("[data-browser-list]")!;
+      const heading = screen.getByRole("heading", { name: "Reader", level: 2 });
+      const detailFocus = vi.spyOn(heading, "focus");
+      const detail = heading.closest<HTMLElement>("[data-browser-detail]")!;
+      const selected = within(nav).getByRole("button", { name: /^Page 143/ });
+      sidebar.scrollTop = 4200;
+      selected.focus();
+      const focus = vi.spyOn(selected, "focus");
+      scroll.mockClear();
+      // Flush navigation and focus effects before observing query content.
+      await act(async () => { fireEvent.click(selected.querySelector("span")!); });
+      await screen.findByText("Content for Page 143");
+      const detailSearch = location.search;
+      expect(new URLSearchParams(detailSearch).get("slug")).toBe("concepts/page-143");
+      expect(new URLSearchParams(detailSearch).has("pane")).toBe(false);
+
+      function assertPosition(inDetail: boolean) {
+        expect(screen.getByRole("navigation", { name: "Wiki pages" })).toBe(nav);
+        expect(sidebar.scrollTop).toBe(4200);
+        expect(selected.getAttribute("aria-current")).toBe("true");
+        expect((screen.getByLabelText("Search wiki pages") as HTMLInputElement).value).toBe("page");
+        expect((screen.getByLabelText("Filter wiki category") as HTMLSelectElement).value).toBe("concepts");
+        expect(new URLSearchParams(location.search).get("q")).toBe("page");
+        expect(new URLSearchParams(location.search).get("category")).toBe("concepts");
+        expect(new URLSearchParams(location.search).get("slug")).toBe("concepts/page-143");
+        expect(document.activeElement).toBe(width <= 720 && inDetail ? heading : selected);
+        if (width <= 720) {
+          expect(scroll.mock.contexts.at(-1)).toBe(inDetail ? detail : sidebar);
+          expect(scroll).toHaveBeenLastCalledWith({ block: "start" });
+          if (inDetail) expect(detailFocus).toHaveBeenLastCalledWith({ preventScroll: true });
+          if (!inDetail) expect(focus).toHaveBeenLastCalledWith({ preventScroll: true });
+        } else {
+          expect(scroll).not.toHaveBeenCalled();
+          expect(focus).not.toHaveBeenCalled();
+          expect(detailFocus).not.toHaveBeenCalled();
+        }
+      }
+      assertPosition(true);
+      if (width <= 720) {
+        expect(heading.tabIndex).toBe(-1);
+        expect(fireEvent.keyDown(heading, { key: "Tab" })).toBe(true);
+        const returnButton = screen.getByRole("button", { name: "Back to pages" });
+        returnButton.focus();
+        expect(document.activeElement).toBe(returnButton);
+      }
+      await act(async () => { fireEvent.click(screen.getByRole("button", { name: "Back to pages" })); });
+      expect(new URLSearchParams(location.search).get("pane")).toBe("list");
+      assertPosition(false);
+      await act(async () => { await navigate(-1); });
+      expect(location.search).toBe(detailSearch);
+      assertPosition(true);
+      await act(async () => { await navigate(1); });
+      assertPosition(false);
+      expect(matchMedia).toHaveBeenCalledWith("(max-width: 720px)");
+    }
+  );
+
   it("renders read-only markdown, escapes raw HTML, and navigates wikilinks in-app", async () => {
     vi.stubGlobal("fetch", vi.fn(async (url: string) => {
       if (url.endsWith("/api/v1/wiki")) return jsonResponse(envelope(indexPayload()));
@@ -306,6 +413,17 @@ describe("WikiRoute", () => {
     fireEvent.click(await screen.findByRole("button", { name: "Graph" }));
     expect(await screen.findByLabelText("Wiki graph view")).toBeTruthy();
     expect(screen.getByLabelText("Wiki graph legend")).toBeTruthy();
+
+    const readerButton = screen.getByRole("button", { name: "Reader" });
+    readerButton.focus();
+    expect(document.activeElement).toBe(readerButton);
+    fireEvent.click(readerButton);
+    expect(screen.queryByLabelText("Wiki graph view")).toBeNull();
+    const graphButton = screen.getByRole("button", { name: "Graph" });
+    graphButton.focus();
+    expect(document.activeElement).toBe(graphButton);
+    fireEvent.click(graphButton);
+    await screen.findByLabelText("Wiki graph view");
 
     fireEvent.click(screen.getByRole("button", { name: "Open Beta" }));
     await waitFor(() => expect(screen.getAllByRole("heading", { name: "Beta" }).length).toBeGreaterThan(0));

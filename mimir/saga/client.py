@@ -715,48 +715,21 @@ class SagaStore:
         store() incremental-adds keep it current; periodic rebuilds
         handle tombstoning accumulation.
 
-        Dimension resolution order:
-
-        1. The uniform dimension in the ``embeddings`` table — authoritative
-           once any embedding has been stored. Mixed dimensions are rejected.
-        2. Pre-set ``self._embedding_dim`` (constructor arg or cached
-           from a prior call) when the table is empty.
-        3. The configured provider's reported ``dimensions()`` — the
-           right value for an empty DB. Prevents the "fresh DB +
-           non-Voyage provider" failure mode where the previous
-           hardcoded ``1024`` default silently rejected every
-           384-dim (fastembed) or 1536-dim (OpenAI
-           text-embedding-3-small) vector that ever got stored.
-        4. No provider available → return ``None`` so the search
-           caller falls back to FTS-only. Better than building an
-           index at a guessed dim that turns every future ``store()``
-           write into a silent drop.
+        Use the explicit embedder dimension or the configured provider, never
+        the database majority. VectorIndex counts and logs incompatible rows;
+        dashboard embedding health exposes their distribution and exclusions.
+        Without a provider, fall back to FTS rather than guessing a dimension.
         """
         if self._index_built:
             return self._index
         dim = self._embedding_dim
-        rows = conn.execute(
-            "SELECT dim, count(*) FROM embeddings "
-            "WHERE dim IS NOT NULL GROUP BY dim ORDER BY count(*) DESC, dim"
-        ).fetchall()
-        if len(rows) > 1:
-            distribution = ", ".join(
-                f"{row_dim}d x {count}" for row_dim, count in rows
-            )
-            log.error("atoms index has mixed embedding dimensions: %s", distribution)
-            raise RuntimeError(
-                f"cannot build atoms index with mixed embedding dimensions: {distribution}"
-            )
-        if rows:
-            dim = rows[0][0]
-            self._embedding_dim = dim
-        elif dim is None:
+        if dim is None:
             try:
                 from .embeddings import get_provider
 
                 dim = get_provider().dimensions()
             except Exception:
-                # Provider unavailable and DB is genuinely empty.
+                # Provider unavailable: never infer its dimension from old rows.
                 # Cache the miss and return None — search callers
                 # (``_make_faiss_search_fn``) already handle None by
                 # returning empty results, so this gracefully
@@ -821,30 +794,13 @@ class SagaStore:
         if self._sessions_index_built:
             return self._sessions_index
         dim = self._sessions_embedding_dim
-        rows = conn.execute(
-            "SELECT embedding_dim, count(*) FROM sessions "
-            "WHERE embedding IS NOT NULL AND embedding_dim IS NOT NULL "
-            "GROUP BY embedding_dim ORDER BY count(*) DESC, embedding_dim"
-        ).fetchall()
-        if len(rows) > 1:
-            distribution = ", ".join(
-                f"{row_dim}d x {count}" for row_dim, count in rows
-            )
-            log.error("sessions index has mixed embedding dimensions: %s", distribution)
-            raise RuntimeError(
-                "cannot build sessions index with mixed embedding dimensions: "
-                f"{distribution}"
-            )
-        if rows:
-            dim = rows[0][0]
-            self._sessions_embedding_dim = dim
-        elif dim is None:
+        if dim is None:
             try:
                 from .embeddings import get_provider
 
                 dim = get_provider().dimensions()
             except Exception:
-                # Provider unavailable and DB is genuinely empty.
+                # Provider unavailable: do not infer its dimension from old rows.
                 # Return None so search_sessions falls back to recency-only
                 # rather than building an index at the wrong dimension.
                 self._sessions_index_built = True  # cache the miss
@@ -1508,10 +1464,23 @@ class SagaStore:
 
         def _do():
             conn = self._ensure_conn()
+            def checked_embedding(embedding: EmbeddingTuple) -> EmbeddingTuple:
+                blob, _, _, dim = embedding
+                with self._index_lock:
+                    expected = self._index.dimension if self._index is not None else self._embedding_dim
+                    if expected is not None and (dim != expected or len(blob) != expected * 4):
+                        raise ValueError(
+                            f"store embedding dimension mismatch: expected {expected}, "
+                            f"got {dim} ({len(blob)} bytes)"
+                        )
+                return embedding
+
+            if effective_embedding is not None:
+                checked_embedding(effective_embedding)
             result = _store(
                 conn,
                 content,
-                embed_fn=_embed_text_sync,
+                embed_fn=lambda text: checked_embedding(_embed_text_sync(text)),
                 stream=stream or "semantic",
                 profile=profile or "standard",
                 source_type=source_type,

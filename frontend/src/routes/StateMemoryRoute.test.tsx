@@ -1,8 +1,8 @@
 // @vitest-environment jsdom
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, within } from "@testing-library/react";
 import React from "react";
-import { MemoryRouter, Route, Routes } from "react-router-dom";
+import { MemoryRouter, Route, Routes, useLocation, useNavigate, useNavigationType } from "react-router-dom";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { StateMemoryRoute } from "./StateMemoryRoute";
 import type { DashboardSurface } from "../dashboardExtensions";
@@ -50,12 +50,143 @@ function renderRoute(initialEntry = "/state-memory") {
   );
 }
 
+const originalScrollIntoView = Object.getOwnPropertyDescriptor(HTMLElement.prototype, "scrollIntoView");
+
 afterEach(() => {
   cleanup();
   vi.restoreAllMocks();
+  vi.unstubAllGlobals();
+  if (originalScrollIntoView) Object.defineProperty(HTMLElement.prototype, "scrollIntoView", originalScrollIntoView);
+  else Reflect.deleteProperty(HTMLElement.prototype, "scrollIntoView");
 });
 
 describe("StateMemoryRoute", () => {
+  it.each([[390, 844], [652, 800], [1280, 800]])(
+    "preserves a large expanded tree and search origin through history at %ix%i",
+    async (width, height) => {
+      vi.stubGlobal("innerWidth", width);
+      vi.stubGlobal("innerHeight", height);
+      vi.stubGlobal("matchMedia", vi.fn((query: string) => ({ matches: query === "(max-width: 720px)" && width <= 720 })));
+      const scroll = vi.fn();
+      Object.defineProperty(HTMLElement.prototype, "scrollIntoView", { configurable: true, value: scroll });
+      const files = Array.from({ length: 144 }, (_, i) => ({
+        name: `note-${i}.md`, type: "file", path: `memory/archive/nested/note-${i}.md`, size: 10, modified: null, desc: null
+      }));
+      const index = { ...files[0], name: "INDEX.md", path: "memory/INDEX.md" };
+      vi.stubGlobal("fetch", vi.fn(async (url: string) => {
+        const params = new URL(url, "http://localhost").searchParams;
+        if (params.get("view") === "tree") return jsonResponse(envelope({
+          name: "", type: "dir", path: "", children: [{
+            name: "memory", type: "dir", path: "memory", children: [index, {
+              name: "archive", type: "dir", path: "memory/archive", children: [{
+                name: "nested", type: "dir", path: "memory/archive/nested", children: files
+              }]
+            }]
+          }]
+        }));
+        if (params.get("view") === "search") return jsonResponse(envelope({
+          hits: [7, 19].map((line_no) => ({ path: files[143].path, line_no, snippet: `needle at ${line_no}` }))
+        }, { total: 2 }));
+        return jsonResponse(envelope({ path: params.get("path"), content: "File content", size: 10, modified: null }));
+      }));
+      let location!: ReturnType<typeof useLocation>;
+      let navigate!: ReturnType<typeof useNavigate>;
+      let historyAction!: ReturnType<typeof useNavigationType>;
+      // Use the same declarative router as the other route tests: the data
+      // router constructs Node Requests with incompatible jsdom AbortSignals.
+      function HistoryProbe() {
+        location = useLocation();
+        navigate = useNavigate();
+        historyAction = useNavigationType();
+        return null;
+      }
+      render(<QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}>
+        <MemoryRouter initialEntries={["/state-memory"]}>
+          <HistoryProbe />
+          <Routes><Route path="/state-memory" element={<StateMemoryRoute surface={surface} />} /></Routes>
+        </MemoryRouter>
+      </QueryClientProvider>);
+      const initialKey = location.key;
+      await screen.findByRole("heading", { name: "memory/INDEX.md" });
+      expect(location.search).toBe("");
+      expect(location.key).toBe(initialKey);
+      expect(historyAction).toBe("POP");
+      const heading = screen.getByRole("heading", { name: "Detail", level: 2 });
+      const detailFocus = vi.spyOn(heading, "focus");
+      const detail = heading.closest<HTMLElement>("[data-browser-detail]")!;
+      expect(document.activeElement).not.toBe(heading);
+      expect(document.activeElement).toBe(document.body);
+      expect(scroll.mock.contexts).not.toContain(detail);
+      const nav = screen.getByRole("navigation", { name: "State and memory file tree" });
+      const sidebar = nav.closest<HTMLElement>("[data-browser-list]")!;
+      const archive = within(nav).getByRole("button", { name: "archive" });
+      fireEvent.click(archive);
+      const nested = within(nav).getByRole("button", { name: "nested" });
+      fireEvent.click(nested);
+      expect(within(nav).getAllByRole("button", { name: /note-\d+\.md/ })).toHaveLength(144);
+
+      async function journey(origin: HTMLElement, query: string) {
+        sidebar.scrollTop = 3100;
+        origin.focus();
+        const focus = vi.spyOn(origin, "focus");
+        scroll.mockClear();
+        // Flush navigation and focus effects before observing query content.
+        await act(async () => { fireEvent.click(origin.querySelector("span")!); });
+        await screen.findByRole("heading", { name: files[143].path });
+        const detailSearch = location.search;
+        expect(new URLSearchParams(detailSearch).get("path")).toBe(files[143].path);
+        expect(new URLSearchParams(detailSearch).has("pane")).toBe(false);
+        function assertPosition(inDetail: boolean) {
+          expect(sidebar.isConnected).toBe(true);
+          expect(origin.isConnected).toBe(true);
+          expect(sidebar.scrollTop).toBe(3100);
+          expect((screen.getByLabelText("Search state and memory files") as HTMLInputElement).value).toBe(query);
+          expect(new URLSearchParams(location.search).get("q") ?? "").toBe(query);
+          expect(new URLSearchParams(location.search).get("path")).toBe(files[143].path);
+          expect(document.activeElement).toBe(width <= 720 && inDetail ? heading : origin);
+          if (width <= 720) {
+            expect(scroll.mock.contexts.at(-1)).toBe(inDetail ? detail : sidebar);
+            expect(scroll).toHaveBeenLastCalledWith({ block: "start" });
+            if (inDetail) expect(detailFocus).toHaveBeenLastCalledWith({ preventScroll: true });
+            if (!inDetail) expect(focus).toHaveBeenLastCalledWith({ preventScroll: true });
+          } else {
+            expect(scroll).not.toHaveBeenCalled();
+            expect(focus).not.toHaveBeenCalled();
+            expect(detailFocus).not.toHaveBeenCalled();
+          }
+          if (!query) {
+            expect(screen.getByRole("navigation", { name: "State and memory file tree" })).toBe(nav);
+            expect(archive.getAttribute("aria-expanded")).toBe("true");
+            expect(nested.getAttribute("aria-expanded")).toBe("true");
+            expect(origin.getAttribute("aria-current")).toBe("true");
+          }
+        }
+        assertPosition(true);
+        if (width <= 720) {
+          expect(heading.tabIndex).toBe(-1);
+          expect(fireEvent.keyDown(heading, { key: "Tab" })).toBe(true);
+          const returnButton = screen.getByRole("button", { name: "Back to files" });
+          returnButton.focus();
+          expect(document.activeElement).toBe(returnButton);
+        }
+        await act(async () => { fireEvent.click(screen.getByRole("button", { name: "Back to files" })); });
+        expect(new URLSearchParams(location.search).get("pane")).toBe("list");
+        assertPosition(false);
+        await act(async () => { await navigate(-1); });
+        expect(location.search).toBe(detailSearch);
+        assertPosition(true);
+        await act(async () => { await navigate(1); });
+        assertPosition(false);
+      }
+      await journey(within(nav).getByRole("button", { name: "note-143.md" }), "");
+      fireEvent.change(screen.getByLabelText("Search state and memory files"), { target: { value: "needle" } });
+      await act(async () => { fireEvent.click(screen.getByRole("button", { name: "Search" })); });
+      // Two hits for the same file ensure return remembers the clicked hit, not just its path.
+      const hit = await screen.findByRole("button", { name: /:19\s*needle at 19/ });
+      await journey(hit, "needle");
+    }
+  );
+
   it("renders file list counts and auto-selects INDEX.md with parsed desc", async () => {
     vi.stubGlobal("fetch", vi.fn(async (url: string) => {
       if (url.includes("view=tree")) {
