@@ -567,6 +567,13 @@ Both files are operator-owned. No service principal can write either: a poller's
 `<home>/scheduler.yaml` is outside every configured writable folder. That is what
 makes a declaration an authority grant rather than a self-grant.
 
+Research pollers can also declare `open_proposal`, `submit_proposal`, and
+`abandon_proposal` at tier `scoped-with-provenance` or higher. Those grants select
+a wiki-only proposal lane, never a live wiki write. Such pollers may declare only
+their own `state` root; the trusted runtime grants their exact active proposal
+worktree separately. See [Proposal PRs](proposals.md) for the manifest and
+draft-then-propose workflow.
+
 #### Field rules
 
 The catalogue of tools is yours; the **shape** of a declaration is enforced in

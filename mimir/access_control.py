@@ -555,6 +555,9 @@ TRIGGER_CAPABILITY_TIERS: dict[str, CapabilityTier] = {
     "send_message": CapabilityTier.SCOPE_CONTAINED,
     "operator_alert": CapabilityTier.SCOPE_CONTAINED,
     "memory_store": CapabilityTier.SCOPED_WITH_PROVENANCE,
+    "open_proposal": CapabilityTier.SCOPED_WITH_PROVENANCE,
+    "submit_proposal": CapabilityTier.SCOPED_WITH_PROVENANCE,
+    "abandon_proposal": CapabilityTier.SCOPED_WITH_PROVENANCE,
     "saga_feedback": CapabilityTier.SCOPED_WITH_PROVENANCE,
     "saga_mark_contributions": CapabilityTier.SCOPED_WITH_PROVENANCE,
     "saga_end_session": CapabilityTier.SCOPED_WITH_PROVENANCE,
@@ -643,6 +646,7 @@ TRIGGER_AUTHORITY_PROFILES: dict[str, frozenset[str]] = {
         "saga_feedback", "saga_mark_contributions", "send_message",
         "saga_record_skill_learning", "operator_alert", "shell_exec",
         "bash_jobs_list", "bash_job_output", "fetch_url",
+        "open_proposal", "submit_proposal", "abandon_proposal",
     }),
     "github": frozenset({
         "worklink_run", "write_file", "edit_file", "shell_exec",
@@ -662,7 +666,9 @@ TRIGGER_AUTHORITY_PROFILES: dict[str, frozenset[str]] = {
         "repo_revert", "repo_revert_abort", "repo_push",
     }),
     # Custom profiles remain tier-validated and cannot request unbounded sinks.
-    "custom": frozenset(TRIGGER_CAPABILITY_TIERS) - {"issue_comment"},
+    "custom": frozenset(TRIGGER_CAPABILITY_TIERS) - {
+        "issue_comment", "open_proposal", "submit_proposal", "abandon_proposal",
+    },
     "heartbeat": frozenset({
         "write_file", "edit_file", "shell_exec", "bash_async",
         "bash_jobs_list", "bash_job_output", "read_file", "aread", "ls",
@@ -822,6 +828,9 @@ def build_trigger_service_principal(
                 "trigger_service_write_roots",
                 json.dumps([str(root) for root in write_roots]),
             ))
+        elif operation in {"open_proposal", "submit_proposal", "abandon_proposal"}:
+            if profile == "research" and trigger == "poller":
+                policies.append(ServiceSinkPolicy(operation, "poller_proposal", canonical))
         elif operation in {"shell_exec", "bash_async"}:
             shell_profile = _SHELL_PROFILE_BY_AUTHORITY_PROFILE.get(
                 profile, "scheduler_read_only",
@@ -972,7 +981,9 @@ def current_turn_scratch_root() -> Path | None:
     return (Path(home).resolve() / "scratch" / "turns" / turn_id).resolve()
 
 
-def service_filesystem_read_roots(service: ServicePrincipal | None) -> tuple[Path, ...]:
+def service_filesystem_read_roots(
+    service: ServicePrincipal | None, *, auth_context: AuthContext | None = None,
+) -> tuple[Path, ...]:
     """Resolve static read roots plus built-in service-owned workspace roots."""
     if service is None:
         return ()
@@ -990,9 +1001,14 @@ def service_filesystem_read_roots(service: ServicePrincipal | None) -> tuple[Pat
             home_root / ".mimir_builtin_skills",
             home_root / "CHANGELOG.md",
         ))
-    turn_scratch = current_turn_scratch_root()
+    turn_scratch = (
+        None if _is_research_proposal_poller(service) else current_turn_scratch_root()
+    )
     if turn_scratch is not None:
         roots.append(turn_scratch)
+    proposal_root = _active_poller_proposal_root(auth_context)
+    if proposal_root is not None and service == get_trusted_service_from_auth_context(auth_context):
+        roots.append(proposal_root)
     if (
         getattr(service, "trigger", None) == "poller"
         and str(getattr(service, "canonical", "")).startswith("poller:")
@@ -5110,7 +5126,54 @@ def _target_matches_worklink_repo(target: str, destination: str) -> bool:
         return False
 
 
-def _target_within_trigger_service_write_roots(target: str, destination: str) -> bool:
+def _is_research_proposal_poller(service: ServicePrincipal | None) -> bool:
+    return bool(
+        isinstance(service, ServicePrincipal)
+        and service.trigger == "poller"
+        and service.canonical.startswith("poller:")
+        and service.authority_profile == "research"
+        and set(service.capabilities) & {"open_proposal", "submit_proposal", "abandon_proposal"}
+    )
+
+
+def _active_poller_proposal_root(auth_context: AuthContext | None) -> Path | None:
+    """Grant only the exact workspace opened by the trusted runtime tool."""
+    service = get_trusted_service_from_auth_context(auth_context)
+    if not _is_research_proposal_poller(service):
+        return None
+    from .proposals import PollerProposalScope, poller_worktree_path
+
+    state = getattr(auth_context, "poller_proposal_state", None)
+    scope = getattr(state, "scope", None)
+    worktree = getattr(state, "worktree", None)
+    home = os.environ.get("MIMIR_HOME", "").strip()
+    if (
+        not home or getattr(state, "active", False) is not True
+        or not isinstance(scope, PollerProposalScope)
+        or scope.owner != service.canonical
+        or not isinstance(worktree, Path)
+    ):
+        return None
+    try:
+        expected = poller_worktree_path(Path(home), scope)
+        if worktree != expected or expected.resolve(strict=True) != expected:
+            return None
+        return expected if expected.is_dir() else None
+    except (OSError, RuntimeError, ValueError):
+        return None
+
+
+def _target_matches_poller_proposal(
+    target: str, destination: str, *, auth_context: AuthContext | None = None,
+) -> bool:
+    """Bind the fixed proposal sink to its trusted research-poller owner."""
+    service = get_trusted_service_from_auth_context(auth_context)
+    return bool(_is_research_proposal_poller(service) and destination == service.canonical)
+
+
+def _target_within_trigger_service_write_roots(
+    target: str, destination: str, *, auth_context: AuthContext | None = None,
+) -> bool:
     """Confine dynamic trigger writes to frozen roots and safe home data paths."""
     from ._paths import PathOutsideHomeError, resolve_within_roots
 
@@ -5120,12 +5183,20 @@ def _target_within_trigger_service_write_roots(target: str, destination: str) ->
     home_root = Path(home).resolve()
     try:
         raw = json.loads(destination)
-        if not isinstance(raw, list) or not raw or not all(isinstance(p, str) for p in raw):
+        if not isinstance(raw, list) or not all(isinstance(p, str) for p in raw):
             return False
         roots = [Path(path).resolve() for path in raw]
-        turn_scratch = current_turn_scratch_root()
+        service = get_trusted_service_from_auth_context(auth_context)
+        if not roots and not _is_research_proposal_poller(service):
+            return False
+        turn_scratch = (
+            None if _is_research_proposal_poller(service) else current_turn_scratch_root()
+        )
         if turn_scratch is not None:
             roots.append(turn_scratch)
+        proposal_root = _active_poller_proposal_root(auth_context)
+        if proposal_root is not None:
+            roots.append(proposal_root)
         candidate = _resolve_file_tool_target(
             target, home_root, physical_roots=roots,
         )
@@ -5133,8 +5204,8 @@ def _target_within_trigger_service_write_roots(target: str, destination: str) ->
             return False
         scratch_root = (home_root / "scratch").resolve()
         if (candidate == scratch_root or candidate.is_relative_to(scratch_root)) and (
-            turn_scratch is None
-            or not (candidate == turn_scratch or candidate.is_relative_to(turn_scratch))
+            not any(candidate == root or candidate.is_relative_to(root)
+                    for root in (turn_scratch, proposal_root) if root is not None)
         ):
             return False
         memory_root = (home_root / "memory").resolve()
@@ -5153,6 +5224,9 @@ def _target_within_trigger_service_write_roots(target: str, destination: str) ->
         ):
             return False
         resolved = resolve_within_roots(roots, str(candidate))
+        # A symlink must not cross from one grant into another grant.
+        if not any(resolved.is_relative_to(root) for root, _ in lexical_relatives):
+            return False
         resolved_relatives = tuple(
             (root, resolved.relative_to(root))
             for root in roots
@@ -5314,30 +5388,25 @@ def _synthesis_target_matches_session(target: str, channel_id: str | None) -> bo
     return _synthesis_channel_target_matches_session(target, channel_id)
 
 
-def resolve_trigger_service_write_target(target: str, destination: str) -> Path:
+def resolve_trigger_service_write_target(
+    target: str, destination: str, *, auth_context: AuthContext | None = None,
+) -> Path:
     """Resolve a trigger-service write exactly as its sink adapter checks it."""
-    from ._paths import PathOutsideHomeError, resolve_within_roots
+    from ._paths import PathOutsideHomeError
 
     home = os.environ.get("MIMIR_HOME", "").strip()
     if not home:
         raise PathOutsideHomeError("MIMIR_HOME is not configured")
-    raw = json.loads(destination)
-    if not isinstance(raw, list) or not raw or not all(isinstance(p, str) for p in raw):
-        raise PathOutsideHomeError("trigger-service write roots are invalid")
-    roots = [Path(path).resolve() for path in raw]
-    turn_scratch = current_turn_scratch_root()
-    if turn_scratch is not None:
-        roots.append(turn_scratch)
-    candidate = Path(target)
-    if not candidate.is_absolute():
-        candidate = Path(home).resolve() / candidate
-    scratch_root = (Path(home).resolve() / "scratch").resolve()
-    if (candidate == scratch_root or candidate.is_relative_to(scratch_root)) and (
-        turn_scratch is None
-        or not (candidate == turn_scratch or candidate.is_relative_to(turn_scratch))
+    if not _target_within_trigger_service_write_roots(
+        target, destination, auth_context=auth_context,
     ):
-        raise PathOutsideHomeError("scratch target is outside the current turn workspace")
-    return resolve_within_roots(roots, str(candidate))
+        raise PathOutsideHomeError("target is outside trigger-service write grants")
+    candidate = _resolve_file_tool_target(
+        target, home, physical_roots=map(Path, json.loads(destination)),
+    )
+    if candidate is None:
+        raise PathOutsideHomeError("invalid trigger-service write target")
+    return candidate.resolve()
 
 
 _TRIGGER_SERVICE_PROTECTED_READ_NAMES = frozenset({
@@ -5393,7 +5462,7 @@ def _trigger_service_read_target_is_allowed(
     if not isinstance(raw, str) or not raw.strip() or "\x00" in raw:
         return False
     candidate = Path(raw)
-    roots = service_filesystem_read_roots(service)
+    roots = service_filesystem_read_roots(service, auth_context=auth_context)
     home = os.environ.get("MIMIR_HOME", "").strip()
     if home:
         home_root = Path(home).resolve()
@@ -5730,13 +5799,19 @@ def _sink_adapter_admits(
 ) -> bool:
     """Invoke a sink adapter, handing the shell adapter the principal's grants.
 
-    The adapter registry is ``(target, destination) -> bool`` and deliberately
-    knows nothing about principals. Declared shell commands are per-principal, so
-    the shell adapter -- and only it -- is called through the parser directly
-    rather than through that narrow signature. Every other adapter is unchanged.
+    Static adapters use ``(target, destination) -> bool``. Dynamic proposal and
+    write grants receive the runtime carrier explicitly; shell commands receive
+    the principal's declarations rather than consulting ambient context.
     """
     if adapter is None:
         return False
+    if adapter is _target_within_trigger_service_write_roots:
+        return adapter(target, destination, auth_context=auth_context)
+    if adapter is _target_matches_poller_proposal:
+        return (
+            service == get_trusted_service_from_auth_context(auth_context)
+            and adapter(target, destination, auth_context=auth_context)
+        )
     if adapter is _target_matches_shell_profile:
         # Authorization validates the argv shape only. Filesystem operands are
         # resolved once by the execution binder after it has the authoritative
@@ -5758,6 +5833,7 @@ _SERVICE_SINK_ADAPTERS: dict[str, Callable[[str, str], bool]] = {
     "spawn_workspace": _target_within_configured_write_roots,
     "worklink_repo": _target_matches_worklink_repo,
     "trigger_service_write_roots": _target_within_trigger_service_write_roots,
+    "poller_proposal": _target_matches_poller_proposal,
     "operator_alert": _target_matches_operator_alert,
     "approved_urls": _target_matches_approved_url,
     "github_pr_api": _target_matches_github_pr_api,
@@ -6660,7 +6736,7 @@ class SinkGate:
                             resolved_sink_target=resolved_target,
                         )
                     service_policy = candidate
-        if service is not None and sink_category in {
+        if service is not None and (sink_category in {
             SinkCategory.SHELL_PROCESS,
             SinkCategory.SPAWN,
             SinkCategory.FILE,
@@ -6668,7 +6744,7 @@ class SinkGate:
             SinkCategory.HTTP_WEBHOOK,
             SinkCategory.NETWORK,
             SinkCategory.EXTERNAL_MCP,
-        }:
+        } or (sink_category is SinkCategory.PROPOSAL and service.trigger == "poller")):
             tier_allowed, tier_refusal = cls._service_tier_allows(
                 tool_name, ifc_labels, auth_context, service, target,
             )
@@ -8774,6 +8850,23 @@ class ToolRegistry:
         service_allowed_preliminary = (
             service_can_invoke_operation(preliminary_service, tool_name)
         )
+        if (
+            preliminary_service is not None
+            and preliminary_service.trigger == "poller"
+            and sink_category is SinkCategory.PROPOSAL
+            and str((arguments or {}).get("lane") or "agent").strip().lower()
+            not in {"agent", "poller"}
+        ):
+            return ToolAuthorization(
+                tool_name=tool_name,
+                decision=OperationDecision.ADMIN_REQUIRED,
+                allowed=not enforce,
+                reason="service_sink_destination_denied",
+                service_principal=preliminary_service,
+                enforcement_enabled=enforce,
+                is_shadow_decision=not enforce,
+                would_block=True,
+            )
         operator_shell_allowed = _operator_can_invoke_admin_shell(
             tool_name, ifc_labels, auth_context,
         )

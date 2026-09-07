@@ -18,6 +18,9 @@ import pytest
 
 import mimir
 from mimir.proposals import (
+    PollerProposalScope,
+    poller_branch_name,
+    poller_worktree_path,
     abandon_proposal,
     default_branch_name,
     finalize_proposal,
@@ -909,3 +912,331 @@ def test_proposal_pr_opened_classifies_positive() -> None:
     from mimir.feedback.rules import classify
 
     assert classify("proposal_pr_opened") == ("positive", "proposal_pr_opened")
+
+
+@pytest.fixture
+def wiki_home(home: Path) -> Path:
+    (home / "state/wiki").mkdir(parents=True)
+    (home / "state/wiki/paper.md").write_text("original research\n")
+    _git("add", "-f", "state/wiki/paper.md", cwd=home)
+    _git("commit", "-qm", "seed wiki", cwd=home)
+    _git("push", "-q", cwd=home)
+    return home
+
+
+@pytest.fixture
+def poller() -> PollerProposalScope:
+    return PollerProposalScope("poller:research_feed-v2", "turn/123", "https://paper.test/42", "feed:item:9")
+
+
+@pytest.mark.parametrize("owner", ["research", "poller:", "poller:../x", "poller:a/b", "poller:a.b", "poller:A", "poller:a b", "poller:a\n"])
+def test_poller_owner_strict(owner: str) -> None:
+    with pytest.raises(ValueError):
+        PollerProposalScope(owner, "turn", "paper", "feed")
+
+
+def test_poller_scope_frozen_and_collision_resistant(poller: PollerProposalScope, tmp_path: Path) -> None:
+    from dataclasses import FrozenInstanceError, replace
+
+    with pytest.raises(FrozenInstanceError):
+        poller.owner = "poller:other"
+    branch = poller_branch_name(poller)
+    assert branch.startswith("poller/research_feed-v2/turn-123-")
+    assert branch == poller_branch_name(replace(poller, source="other"))
+    assert branch != poller_branch_name(replace(poller, turn_id="turn-123"))
+    assert branch != poller_branch_name(replace(poller, owner="poller:other"))
+    unsafe = replace(poller, turn_id="../../escape\n" + "x" * 1000)
+    path = poller_worktree_path(tmp_path, unsafe)
+    assert path.is_relative_to(tmp_path / "scratch/proposals/poller/research_feed-v2")
+    assert len(path.name) < 100
+    assert poller_worktree_path(tmp_path, poller) == tmp_path / "scratch/proposals" / branch
+
+
+@pytest.mark.parametrize("operation", [open_proposal, finalize_proposal, abandon_proposal, list_open_proposals])
+def test_poller_lane_requires_scope_and_rejects_other_lane(home: Path, poller: PollerProposalScope, operation) -> None:
+    kwargs = {"title": "t", "rationale": "r"} if operation is finalize_proposal else {}
+    with pytest.raises(ValueError, match="requires poller"):
+        operation(home, lane="poller", **kwargs)
+    for lane in ("agent", "upgrade"):
+        with pytest.raises(ValueError, match="another lane"):
+            operation(home, lane=lane, poller=poller, **kwargs)
+
+
+@pytest.mark.parametrize("operation", [open_proposal, finalize_proposal, abandon_proposal])
+def test_poller_rejects_branch_override(home: Path, poller: PollerProposalScope, operation) -> None:
+    kwargs = {"title": "t", "rationale": "r"} if operation is finalize_proposal else {}
+    with pytest.raises(ValueError, match="exact poller scope"):
+        operation(home, lane="poller", poller=poller, branch="poller/other/turn", **kwargs)
+
+
+def test_poller_exact_scope_isolation(wiki_home: Path, poller: PollerProposalScope) -> None:
+    from dataclasses import replace
+
+    scopes = [poller, replace(poller, turn_id="turn-123"), replace(poller, owner="poller:other")]
+    opened = [open_proposal(wiki_home, lane="poller", poller=s) for s in scopes]
+    assert all(r.ok for r in opened)
+    assert open_proposal(wiki_home, lane="poller", poller=poller).reason == "exists"
+    agent = open_proposal(wiki_home)
+    assert agent.ok
+    assert len(list_open_proposals(wiki_home)) == 4
+    for scope, result in zip(scopes, opened):
+        assert list_open_proposals(wiki_home, poller=scope) == [(result.branch, result.worktree)]
+        assert result.worktree == poller_worktree_path(wiki_home, scope)
+        assert not (result.worktree / "memory/core").exists()
+        assert not (result.worktree / "prompts").exists()
+    absent = replace(poller, turn_id="absent")
+    assert not abandon_proposal(wiki_home, lane="poller", poller=absent)
+    assert finalize_proposal(wiki_home, lane="poller", poller=absent, title="t", rationale="r").reason == "no_open"
+    assert abandon_proposal(wiki_home, lane="poller", poller=poller)
+    assert len(list_open_proposals(wiki_home)) == 3
+
+
+def test_poller_submit_attribution_and_live_wiki_untouched(wiki_home: Path, poller: PollerProposalScope) -> None:
+    from dataclasses import replace
+
+    token = "ghp_" + "A" * 36
+    poller = replace(poller, source=poller.source + " " + token)
+    r = open_proposal(wiki_home, lane="poller", poller=poller, branch=poller_branch_name(poller))
+    assert r.ok
+    (r.worktree / "state/wiki/paper.md").write_text("new research\n")
+    (r.worktree / "state/wiki/new.md").write_text("new page\n")
+    calls = []
+    result = finalize_proposal(wiki_home, lane="poller", poller=poller, title="findings", rationale="model claim", open_pr=_opener(calls))
+    assert result.ok and result.pushed
+    assert calls[0]["title"].startswith("[research poller:research_feed-v2] https://paper.test/42")
+    body = calls[0]["body"]
+    assert "Untrusted-ingest source (not verified):" in body
+    assert "Trusted origin_ref: feed:item:9" in body
+    assert "Turn: turn/123" in body
+    assert token not in str(calls)
+    assert token not in _git("log", "-1", "--format=%B", f"origin/{result.branch}", cwd=wiki_home).stdout
+    assert (wiki_home / "state/wiki/paper.md").read_text() == "original research\n"
+    assert not (wiki_home / "state/wiki/new.md").exists()
+    paths = _git("diff", "--name-only", "main", f"origin/{result.branch}", cwd=wiki_home).stdout.splitlines()
+    assert paths == ["state/wiki/new.md", "state/wiki/paper.md"]
+    assert _git("status", "--porcelain", cwd=wiki_home).stdout == ""
+    assert not r.worktree.exists()
+
+
+@pytest.mark.parametrize("kind", ["tracked", "staged", "untracked", "ignored", "rename_out", "rename_in", "copy_out", "newline"])
+def test_poller_rejects_all_outside_surface_changes(wiki_home: Path, poller: PollerProposalScope, kind: str) -> None:
+    r = open_proposal(wiki_home, lane="poller", poller=poller)
+    wt = r.worktree
+    (wt / "state/wiki/paper.md").write_text("valid research\n")
+    outside = "prompts/reflect.md"
+    if kind in ("tracked", "staged", "rename_in"):
+        _git("sparse-checkout", "disable", cwd=wt)
+    if kind in ("tracked", "staged"):
+        (wt / outside).write_text("outside\n")
+        if kind == "staged":
+            _git("add", outside, cwd=wt)
+    elif kind == "rename_in":
+        _git("mv", outside, "state/wiki/import.md", cwd=wt)
+    elif kind in ("rename_out", "copy_out"):
+        outside = "outside.md"
+        if kind == "rename_out":
+            _git("mv", "state/wiki/paper.md", outside, cwd=wt)
+        else:
+            shutil.copy(wt / "state/wiki/paper.md", wt / outside)
+            _git("add", "-f", outside, cwd=wt)
+    else:
+        outside = "scratch/ignored.txt" if kind == "ignored" else "outside\nname.md" if kind == "newline" else "prompts/new.md"
+        (wt / outside).parent.mkdir(parents=True, exist_ok=True)
+        (wt / outside).write_text("outside\n")
+        if kind == "ignored":
+            assert _git("check-ignore", outside, cwd=wt).returncode == 0
+    calls = []
+    result = finalize_proposal(wiki_home, lane="poller", poller=poller, title="t", rationale="r", open_pr=_opener(calls))
+    assert not result.ok and not result.pushed and result.reason == "outside_surface"
+    assert outside in result.detail
+    assert not calls and wt.exists()
+    assert not _git("ls-remote", "--heads", "origin", r.branch, cwd=wiki_home).stdout
+
+
+@pytest.mark.parametrize("staged", [False, True])
+@pytest.mark.parametrize("target", ["../../prompts/reflect.md", "/etc/passwd", "paper.md"])
+def test_poller_symlink_surface(wiki_home: Path, poller: PollerProposalScope, staged: bool, target: str) -> None:
+    r = open_proposal(wiki_home, lane="poller", poller=poller)
+    link = r.worktree / "state/wiki/link.md"
+    link.symlink_to(target)
+    if staged:
+        _git("add", "state/wiki/link.md", cwd=r.worktree)
+        # Index inspection must not be fooled by a safe replacement on disk.
+        link.unlink()
+        link.write_text("safe replacement\n")
+    result = finalize_proposal(wiki_home, lane="poller", poller=poller, title="t", rationale="r", open_pr=_opener([]))
+    if target == "paper.md":
+        assert result.ok
+    else:
+        assert result.reason == "outside_surface" and not result.pushed
+
+
+@pytest.mark.parametrize("content,reason", [("ghp_" + "A" * 36, "secret"), ("<<<<<<< unresolved\n", "conflict_marker")])
+def test_poller_shared_content_guards(wiki_home: Path, poller: PollerProposalScope, content: str, reason: str) -> None:
+    r = open_proposal(wiki_home, lane="poller", poller=poller)
+    (r.worktree / "state/wiki/paper.md").write_text(content)
+    result = finalize_proposal(wiki_home, lane="poller", poller=poller, title="t", rationale="r", open_pr=_opener([]))
+    assert result.reason == reason and not result.pushed
+
+
+@pytest.mark.parametrize("command", ["diff", "ls-files", "cat-file", "add"])
+def test_poller_git_failure_fails_closed(wiki_home: Path, poller: PollerProposalScope, monkeypatch: pytest.MonkeyPatch, command: str) -> None:
+    import mimir.proposals as proposals
+
+    r = open_proposal(wiki_home, lane="poller", poller=poller)
+    (r.worktree / "state/wiki/link.md").symlink_to("paper.md")
+    _git("add", "state/wiki/link.md", cwd=r.worktree)
+    real_git = proposals._git
+
+    def fail(args, cwd):
+        if args[0] == command:
+            return subprocess.CompletedProcess(args, 1, "", "failed")
+        return real_git(args, cwd)
+
+    monkeypatch.setattr(proposals, "_git", fail)
+    result = finalize_proposal(wiki_home, lane="poller", poller=poller, title="t", rationale="r", open_pr=lambda *a: pytest.fail("must not open PR"))
+    assert result.reason == "error" and not result.pushed
+
+
+def test_poller_staged_symlink_chain_rejected(wiki_home: Path, poller: PollerProposalScope) -> None:
+    r = open_proposal(wiki_home, lane="poller", poller=poller)
+    wiki = r.worktree / "state/wiki"
+    (wiki / "first").symlink_to("second/file")
+    (wiki / "second").symlink_to("../../prompts")
+    _git("add", "state/wiki", cwd=r.worktree)
+    (wiki / "second").unlink()
+    (wiki / "second").mkdir()
+    (wiki / "second/file").write_text("safe disk replacement")
+    result = finalize_proposal(wiki_home, lane="poller", poller=poller, title="t", rationale="r")
+    assert result.reason == "outside_surface" and not result.pushed
+
+
+def test_poller_list_requires_exact_worktree_path(wiki_home: Path, poller: PollerProposalScope) -> None:
+    r = open_proposal(wiki_home, lane="poller", poller=poller)
+    moved = r.worktree.parent / "wrong-turn"
+    _git("worktree", "move", str(r.worktree), str(moved), cwd=wiki_home)
+    assert list_open_proposals(wiki_home, poller=poller) == []
+    assert list_open_proposals(wiki_home) == [(r.branch, moved)]
+    assert not abandon_proposal(wiki_home, lane="poller", poller=poller)
+
+
+def test_poller_worktree_list_failure_fails_closed(home: Path, poller: PollerProposalScope, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("mimir.proposals._git", lambda args, cwd: subprocess.CompletedProcess(args, 1, "", "failure"))
+    with pytest.raises(RuntimeError, match="worktree list failed"):
+        finalize_proposal(home, lane="poller", poller=poller, title="t", rationale="r")
+
+
+def test_poller_list_requires_exact_branch_at_correct_path(wiki_home: Path, poller: PollerProposalScope) -> None:
+    r = open_proposal(wiki_home, lane="poller", poller=poller)
+    _git("branch", "-m", "poller/other/turn", cwd=r.worktree)
+    assert list_open_proposals(wiki_home, poller=poller) == []
+    assert not abandon_proposal(wiki_home, lane="poller", poller=poller)
+    assert finalize_proposal(wiki_home, lane="poller", poller=poller, title="t", rationale="r").reason == "no_open"
+    assert r.worktree.exists()
+
+
+@pytest.mark.parametrize("field", ["turn_id", "source", "origin_ref"])
+@pytest.mark.parametrize("value", ["", " \n", None])
+def test_poller_scope_requires_attribution_fields(poller: PollerProposalScope, field: str, value) -> None:
+    from dataclasses import replace
+
+    with pytest.raises(ValueError):
+        replace(poller, **{field: value})
+
+
+@pytest.mark.parametrize("kind", ["gitlink", "unmerged", "cycle", "directory_cycle", "disk_escape"])
+def test_poller_special_index_entries(wiki_home: Path, poller: PollerProposalScope, kind: str) -> None:
+    import mimir.proposals as proposals
+
+    r = open_proposal(wiki_home, lane="poller", poller=poller)
+    wt = r.worktree
+    path = "state/wiki/special"
+    if kind == "gitlink":
+        oid = _git("rev-parse", "HEAD", cwd=wt).stdout.strip()
+        _git("update-index", "--add", "--cacheinfo", f"160000,{oid},{path}", cwd=wt)
+    elif kind == "unmerged":
+        oid = _git("rev-parse", "HEAD:state/wiki/paper.md", cwd=wt).stdout.strip()
+        subprocess.run(["git", "update-index", "--index-info"], cwd=wt,
+                       input=f"100644 {oid} 1\t{path}\n100644 {oid} 2\t{path}\n",
+                       text=True, check=True, capture_output=True)
+    elif kind in ("cycle", "directory_cycle"):
+        (wt / path).symlink_to("special" if kind == "cycle" else "directory/file")
+        if kind == "directory_cycle":
+            (wt / "state/wiki/directory").symlink_to("special")
+        _git("add", "state/wiki", cwd=wt)
+        # Only the index contains the cycle; disk traversal cannot detect it.
+        (wt / path).unlink()
+        (wt / path).write_text("safe disk replacement")
+        if kind == "directory_cycle":
+            (wt / "state/wiki/directory").unlink()
+            (wt / "state/wiki/directory").write_text("safe disk replacement")
+    else:
+        (wt / path).symlink_to("directory/file")
+        _git("add", path, cwd=wt)
+        (wt / "state/wiki/directory").symlink_to(wiki_home)
+    # Probe the real index before git add can remove a gitlink or resolve a conflict.
+    # Disk escape is a pre-stage race boundary; no Git output is fabricated here.
+    reason = proposals._check_poller_surface(wt)
+    assert reason and "outside_surface" in reason
+    if kind in ("gitlink", "unmerged"):
+        assert "unsupported index entry" in reason
+    elif kind in ("cycle", "directory_cycle"):
+        assert "cyclic symlink" in reason
+
+
+@pytest.mark.parametrize("step", ["staged_names", "conflict_names", "content_diff", "post_surface", "surface_exception", "post_exception"])
+def test_poller_late_git_failure_fails_closed(wiki_home: Path, poller: PollerProposalScope, monkeypatch: pytest.MonkeyPatch, step: str) -> None:
+    import mimir.proposals as proposals
+
+    r = open_proposal(wiki_home, lane="poller", poller=poller)
+    (r.worktree / "state/wiki/paper.md").write_text("new research\n")
+    real_git = proposals._git
+    names = 0
+    surface = 0
+
+    def fail(args, cwd):
+        nonlocal names, surface
+        if args == ["diff", "--cached", "--name-only"]:
+            names += 1
+            if (step == "staged_names" and names == 1) or (step == "conflict_names" and names == 2):
+                return subprocess.CompletedProcess(args, 1, "state/wiki/paper.md\n", "failed")
+        if step == "content_diff" and args == ["diff", "--cached", "-U0"]:
+            return subprocess.CompletedProcess(args, 1, "", "failed")
+        if args == ["diff", "--cached", "--no-renames", "--name-only", "-z"]:
+            surface += 1
+            if step == "post_surface" and surface == 2:
+                return subprocess.CompletedProcess(args, 1, "", "failed")
+            if (step == "surface_exception" and surface == 1) or (step == "post_exception" and surface == 2):
+                raise OSError("failed")
+        return real_git(args, cwd)
+
+    monkeypatch.setattr(proposals, "_git", fail)
+    calls = []
+    result = finalize_proposal(wiki_home, lane="poller", poller=poller, title="t", rationale="r", open_pr=_opener(calls))
+    assert result.reason == "error" and not result.pushed
+    assert not calls
+
+
+def test_poller_symlink_lexical_escape_even_when_disk_resolves_inside(wiki_home: Path, poller: PollerProposalScope) -> None:
+    # A tracked root-level link is materialized by cone checkout. It is unchanged,
+    # but reaching wiki through it must not legitimize an out-of-surface target.
+    (wiki_home / "alias").symlink_to("state/wiki")
+    _git("add", "-f", "alias", cwd=wiki_home)
+    _git("commit", "-qm", "seed alias", cwd=wiki_home)
+    _git("push", "-q", cwd=wiki_home)
+    r = open_proposal(wiki_home, lane="poller", poller=poller)
+    link = r.worktree / "state/wiki/escape"
+    link.symlink_to("../../alias/paper.md")
+    assert link.resolve() == r.worktree / "state/wiki/paper.md"
+    result = finalize_proposal(wiki_home, lane="poller", poller=poller, title="t", rationale="r", open_pr=_opener([]))
+    assert result.reason == "outside_surface" and not result.pushed
+
+
+def test_poller_surface_requires_directory_boundary(wiki_home: Path, poller: PollerProposalScope) -> None:
+    r = open_proposal(wiki_home, lane="poller", poller=poller)
+    (r.worktree / "state/wiki/paper.md").write_text("valid research\n")
+    outside = r.worktree / "state/wiki-escape/note.md"
+    outside.parent.mkdir()
+    outside.write_text("outside\n")
+    result = finalize_proposal(wiki_home, lane="poller", poller=poller, title="t", rationale="r", open_pr=_opener([]))
+    assert result.reason == "outside_surface" and not result.pushed

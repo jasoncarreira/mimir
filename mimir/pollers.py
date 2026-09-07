@@ -1129,6 +1129,10 @@ def _parse_poller_authority(
     roots_raw = raw["scoped_roots"]
     if not isinstance(roots_raw, list) or not all(isinstance(item, str) for item in roots_raw):
         raise ValueError("authority scoped_roots must be a list of names")
+    if profile == "research" and set(capabilities) & {
+        "open_proposal", "submit_proposal", "abandon_proposal",
+    } and any(root != "state" for root in roots_raw):
+        raise ValueError("research proposal pollers may only declare their own state root")
     roots: list[Path] = []
     expected_state = persist_dir.resolve()
     home = state_root.parent.parent.resolve() if state_root is not None else None
