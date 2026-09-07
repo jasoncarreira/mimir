@@ -73,6 +73,73 @@ def home(tmp_path: Path) -> Path:
 
 
 class TestBinaryReads:
+    def test_missing_private_import_keeps_reads_working(self, home, monkeypatch):
+        import builtins
+        import importlib.util
+        import sys
+        import mimir.readonly_backend as original
+
+        real_import = builtins.__import__
+
+        def without_private(name, globals=None, locals=None, fromlist=(), level=0):
+            if name == "deepagents.backends.filesystem" and "_get_backend_read_file_type" in fromlist:
+                raise ImportError("simulated upstream private symbol removal")
+            if name == "deepagents.backends.utils" and any(
+                symbol in fromlist for symbol in ("check_empty_content", "slice_read_response")
+            ):
+                raise ImportError("simulated upstream utility removal")
+            return real_import(name, globals, locals, fromlist, level)
+
+        monkeypatch.setattr(builtins, "__import__", without_private)
+        spec = importlib.util.spec_from_file_location("mimir._binary_import_probe", original.__file__)
+        module = importlib.util.module_from_spec(spec)
+        monkeypatch.setitem(sys.modules, spec.name, module)
+        spec.loader.exec_module(module)
+        assert module._get_backend_read_file_type is None
+        (home / "text.txt").write_text("hello\n")
+        (home / "blob.bin").write_bytes(b"a\x00b")
+        (home / "picture.png").write_bytes(b"\x89PNG\r\n\x1a\n")
+        backend = module._RootAwareFilesystemBackend(root_dir=home, virtual_mode=True)
+        assert backend.read("/text.txt").file_data["content"] == "hello\n"
+        assert "Binary file:" in backend.read("/blob.bin").error
+        assert backend.read("/picture.png").file_data["encoding"] == "base64"
+
+    @pytest.mark.parametrize("payload", [b"hello\n", b"", b" \n", b"a\r\nb\rc\n"])
+    @pytest.mark.parametrize(("offset", "limit"), [(0, 2000), (1, 1), (100, 1)])
+    def test_normal_text_delegates(self, home, monkeypatch, payload, offset, limit):
+        from deepagents.backends import FilesystemBackend
+
+        (home / "normal.txt").write_bytes(payload)
+        upstream = FilesystemBackend(root_dir=home, virtual_mode=True)
+        expected = upstream.read("/normal.txt", offset, limit)
+        calls = []
+        real_read = FilesystemBackend.read
+
+        def tracked(self, file_path, offset=0, limit=2000):
+            calls.append((file_path, offset, limit))
+            return real_read(self, file_path, offset, limit)
+
+        monkeypatch.setattr(FilesystemBackend, "read", tracked)
+        actual = _RootAwareFilesystemBackend(root_dir=home, virtual_mode=True).read(
+            "/normal.txt", offset, limit,
+        )
+        assert actual == expected
+        assert calls == [("/normal.txt", offset, limit)]
+
+    @pytest.mark.parametrize("content", ["hello\nworld\n", "", " \n", "a\nb\nc"])
+    @pytest.mark.parametrize(("offset", "limit"), [(0, 2000), (1, 1), (100, 1)])
+    def test_exceptional_text_matches_upstream_format(self, content, offset, limit):
+        from deepagents.backends.protocol import ReadResult
+        from deepagents.backends.utils import check_empty_content, slice_read_response
+        from mimir.readonly_backend import _read_decoded_text
+
+        empty = check_empty_content(content)
+        expected = (
+            ReadResult(file_data={"content": empty, "encoding": "utf-8"})
+            if empty else slice_read_response({"content": content, "encoding": "utf-8"}, offset, limit)
+        )
+        assert _read_decoded_text(content, offset, limit) == expected
+
     @pytest.mark.parametrize("backend_kind", ["guard", "readonly", "route"])
     @pytest.mark.asyncio
     async def test_docx_binary_error(self, home: Path, backend_kind: str) -> None:
