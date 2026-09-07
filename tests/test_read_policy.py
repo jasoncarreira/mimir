@@ -4,7 +4,50 @@ from pathlib import Path
 
 import pytest
 
-from mimir.read_policy import is_protected_read_path, resolve_non_admin_read_target
+from mimir.read_policy import (
+    _has_protected_read_name,
+    is_protected_read_path,
+    protected_read_denial_reason,
+    resolve_non_admin_read_target,
+)
+
+
+@pytest.mark.parametrize("stem", [
+    ".env", ".env.local", ".env.production", ".envrc", "compose.env",
+    "secrets.yaml", "credentials.json", "id_rsa", "server.key",
+])
+@pytest.mark.parametrize("suffix", ["", ".example", ".sample", ".template", ".dist"])
+@pytest.mark.parametrize("uppercase", [False, True])
+def test_protected_names_and_templates(stem, suffix, uppercase, tmp_path, monkeypatch):
+    monkeypatch.delenv("MIMIR_HOME", raising=False)
+    name = stem + suffix
+    target = tmp_path / (name.upper() if uppercase else name)
+    protected = not bool(suffix)
+    assert is_protected_read_path(target) is protected
+    assert _has_protected_read_name(target) is protected
+    assert protected_read_denial_reason(target) == (
+        "protected_name_match" if protected else None
+    )
+
+
+@pytest.mark.parametrize("name", [".env.example.local", ".env.sample.bak", ".env.examples"])
+def test_template_marker_must_be_final(name, tmp_path):
+    assert is_protected_read_path(tmp_path / name)
+
+
+@pytest.mark.parametrize("boundary", ["credentials", "identities", "operator", "symlink"])
+def test_template_does_not_bypass_other_boundaries(boundary, tmp_path, monkeypatch):
+    target = tmp_path / ".env.example"
+    if boundary in {"credentials", "identities"}:
+        target = tmp_path / boundary / target.name
+    elif boundary == "operator":
+        monkeypatch.setenv("MIMIR_MCP_SERVERS_PATH", str(target))
+    else:
+        secret = tmp_path / ".env"
+        secret.write_text("ordinary text\n")
+        target.symlink_to(secret)
+    assert is_protected_read_path(target)
+    assert _has_protected_read_name(target)
 
 
 @pytest.mark.parametrize("virtual", [False, True])

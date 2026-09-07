@@ -325,9 +325,9 @@ def test_non_admin_read_allows_seeded_doc_but_not_protected_doc_name(
     docs.mkdir(parents=True)
     (home / "state").mkdir()
     readme = docs / "README.md"
-    env_example = docs / ".env.example"
+    env_production = docs / ".env.production"
     readme.write_text("docs\n", encoding="utf-8")
-    env_example.write_text("secret-shaped\n", encoding="utf-8")
+    env_production.write_text("secret-shaped\n", encoding="utf-8")
     monkeypatch.setenv("MIMIR_HOME", str(home))
 
     registry = ToolRegistry()
@@ -337,7 +337,7 @@ def test_non_admin_read_allows_seeded_doc_but_not_protected_doc_name(
     )
     denied = registry.authorize_tool(
         "read_file", _read_auth(), enforce=True,
-        arguments={"file_path": "/docs/.env.example"},
+        arguments={"file_path": "/docs/.env.production"},
     )
 
     assert allowed.allowed is True
@@ -11471,6 +11471,95 @@ def test_service_shell_profiles_refuse_credential_file_operands(
     assert "outside the read roots or withheld" in bound.tool_call["args"][
         "mimir_shell_refusal"
     ]
+
+
+@pytest.mark.parametrize("stem", [
+    ".env", ".env.local", ".env.production", ".envrc", "compose.env", "secrets.yaml",
+])
+@pytest.mark.parametrize("suffix", ["", ".example", ".sample", ".template", ".dist", ".EXAMPLE"])
+@pytest.mark.parametrize("service_caller", [False, True])
+def test_template_read_authorization_matches_shell(
+    stem, suffix, service_caller, tmp_path, monkeypatch,
+):
+    home = tmp_path / "home"
+    root = home / "state"
+    root.mkdir(parents=True)
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    target = root / (stem + suffix)
+    # Harmless content isolates the name guard from the content scanner.
+    target.write_text("ordinary text\n", encoding="utf-8")
+    service = replace(
+        build_trigger_service_principal(
+            canonical="scheduler:test", trigger="scheduled_tick", profile="custom",
+            tier=CapabilityTier.CODE_EXECUTION,
+            capabilities=(
+                "shell_exec", "bash_jobs_list", "bash_job_output",
+            ),
+            creation_path="test",
+        ),
+        filesystem_read_roots=(str(root.resolve()),),
+    )
+    auth = _service_auth(service, InformationFlowLabels()) if service_caller else _read_auth()
+    registry = ToolRegistry()
+    for tool in ("read_file", "grep", "glob", "ls"):
+        decision = registry.authorize_tool(
+            tool, auth, enforce=True,
+            arguments={"path": str(target), "pattern": "text"},
+        )
+        assert decision.allowed is bool(suffix), (tool, decision.reason)
+    if service_caller:
+        from mimir.access_control import _service_shell_read_operand_refusal
+
+        refusal = _service_shell_read_operand_refusal(
+            service, ["cat", str(target)], auth_context=auth,
+        )
+        assert (refusal is None) is bool(suffix)
+
+
+@pytest.mark.parametrize("bearing", [False, True], ids=["harmless", "secret-bearing"])
+@pytest.mark.parametrize("name", [".env.example", "server.key.example"])
+def test_template_name_exemption_does_not_bypass_content_scan(
+    bearing: bool, name: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A template marker exempts the NAME only; secret CONTENT still refuses."""
+    home = tmp_path / "home"
+    root = home / "state"
+    root.mkdir(parents=True)
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    target = root / name
+    # Secret-shaped values are assembled at runtime so this source carries none.
+    target.write_text(
+        f"OPENAI_API_KEY={'sk-' + 'A' * 24}\n" if bearing else "PORT=8080\n",
+        encoding="utf-8",
+    )
+    service = replace(
+        build_trigger_service_principal(
+            canonical="scheduler:test", trigger="scheduled_tick", profile="custom",
+            tier=CapabilityTier.CODE_EXECUTION,
+            capabilities=("shell_exec", "bash_jobs_list", "bash_job_output"),
+            creation_path="test",
+        ),
+        filesystem_read_roots=(str(root.resolve()),),
+    )
+    registry = ToolRegistry()
+    for auth in (_read_auth(), _service_auth(service, InformationFlowLabels())):
+        decision = registry.authorize_tool(
+            "read_file", auth, enforce=True,
+            arguments={"path": str(target), "file_path": str(target)},
+        )
+        assert decision.allowed is (not bearing), decision.reason
+        if bearing:
+            # The refusal must come from the content rule, not the name rule,
+            # so the two causes stay distinguishable in the audit record.
+            assert decision.reason != "protected_name_match", decision.reason
+
+    from mimir.access_control import _service_shell_read_operand_refusal
+
+    refusal = _service_shell_read_operand_refusal(
+        service, ["cat", str(target)],
+        auth_context=_service_auth(service, InformationFlowLabels()),
+    )
+    assert (refusal is None) is (not bearing), refusal
 
 
 def test_service_shell_refuses_whole_argv_when_any_read_operand_is_unsafe(

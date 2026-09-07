@@ -183,6 +183,7 @@ def end_read_policy_refusal_capture(
 
 _PROTECTED_BASENAMES = frozenset({
     ".env",
+    ".envrc",
     "compose.env",
     "credentials.json",
     "credentials.yaml",
@@ -203,6 +204,7 @@ _PROTECTED_BASENAMES = frozenset({
 })
 _PROTECTED_DIR_NAMES = frozenset({"credentials", "identities"})
 _PROTECTED_SUFFIXES = frozenset({".key", ".pem", ".p12", ".pfx"})
+_TEMPLATE_SUFFIXES = frozenset({".example", ".sample", ".template", ".dist"})
 
 
 def non_admin_read_filter_enabled() -> bool:
@@ -274,15 +276,7 @@ def is_protected_read_path(path: Path) -> bool:
     except (OSError, RuntimeError):
         return True
 
-    name = resolved.name.lower()
-    if (
-        name in _PROTECTED_BASENAMES
-        or name.startswith(".env.")
-        or resolved.suffix.lower() in _PROTECTED_SUFFIXES
-        or any(part.lower() in _PROTECTED_DIR_NAMES for part in resolved.parts)
-    ):
-        return True
-    if is_operator_secret_read_path(resolved):
+    if _has_protected_read_name(resolved):
         return True
 
     home = _resolved_mimir_home()
@@ -329,10 +323,15 @@ def _has_protected_read_name(path: Path) -> bool:
     except (OSError, RuntimeError):
         return False
     name = resolved.name.lower()
+    suffix = resolved.suffix.lower()
     return (
-        name in _PROTECTED_BASENAMES
-        or name.startswith(".env.")
-        or resolved.suffix.lower() in _PROTECTED_SUFFIXES
+        # Template markers exempt only the basename, never its enclosing path.
+        suffix not in _TEMPLATE_SUFFIXES
+        and (
+            name in _PROTECTED_BASENAMES
+            or name.startswith(".env.")
+            or suffix in _PROTECTED_SUFFIXES
+        )
         or any(part.lower() in _PROTECTED_DIR_NAMES for part in resolved.parts)
         or is_operator_secret_read_path(resolved)
     )
