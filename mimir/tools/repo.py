@@ -241,12 +241,15 @@ async def repo_test(
     for Vitest, or omit suite to infer it from selectors (no selectors: default).
     """
     try:
-        return asdict(
+        result = asdict(
             await RepoProjectTests(_state(runtime, repository, pull_request)).execute(selectors, suite=suite)
         )
+        result["remediation_guidance"] = _remediation_test_guidance(result["code"], scoped=bool(selectors))
+        return result
     except (ProjectTestRefusal, RuntimeError, ValueError) as exc:
         code = getattr(exc, "code", "project_test_failed")
         message = f"project test rejected ({code}): {exc}"
+        message += "\n" + _remediation_test_guidance(code, scoped=bool(selectors))
         raise _tool_refusal(
             message,
             exc,
@@ -256,6 +259,39 @@ async def repo_test(
                 else True
             ),
         ) from exc
+
+
+def _remediation_test_guidance(code: str, *, scoped: bool) -> str:
+    """Publication advice, not authorization or a replacement for CI checks."""
+    publish = (
+        "After scoped tests pass, commit, push the fix to the PR branch, and "
+        "re-request review. In the PR comment state that the in-runner full suite "
+        "did not complete (not failed) and CI is the validation surface. "
+        "Do not wait for another contained full-suite run."
+    )
+    if scoped and code != "tests_passed":
+        return "Hold publication: scoped tests must pass before pushing; this scoped run did not pass."
+    if code == "test_timeout":
+        return (
+            "the contained runner did not complete the suite; this is not test evidence "
+            "either way — push and rely on CI. " + publish
+        )
+    if code in {"test_snapshot_unavailable", "test_containment_unavailable"}:
+        return "Infrastructure unavailable, not a failed suite. " + publish
+    if code == "tests_failed":
+        return (
+            "Hold publication for a completed failing full-suite run with counts observed "
+            "and failed_tests non-empty. If only the runner failed without test evidence, "
+            "report the infrastructure failure, not a failed suite; " + publish
+        )
+    if code == "tests_passed":
+        return (
+            "Scoped tests must pass before pushing. Only a completed failing full-suite "
+            "run with counts observed and failed_tests non-empty blocks publication; "
+            "a full-suite timeout or unavailable snapshot/runner does not. "
+            "Commit, push to the PR branch, and re-request review when these conditions hold."
+        )
+    return "Resolve this refusal; it does not authorize publication or bypass repository policy."
 
 
 @tool

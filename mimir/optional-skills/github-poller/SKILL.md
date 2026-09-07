@@ -116,6 +116,19 @@ For each repo in `GITHUB_REPOS`:
   bounded attempt series and a one-shot give-up signal; because queued emissions
   are not proof of delivery, an unchanged unresolved PR starts a fresh series
   after a 24-hour backstop rather than staying silent forever.
+  For changes-requested remediation, read the latest review, inline, and PR
+  comments on the bound PR. Honour explicit reviewer publication instructions
+  ("push", "CI is the gate") on the next turn, subject to passing scoped tests.
+  Attempt the full suite, but a full-suite `repo_test` `test_timeout` or
+  infrastructure refusal (snapshot unavailable, runner unavailable) is NOT a
+  publication blocker. Only a completed failing full-suite run with counts
+  observed and `failed_tests` non-empty blocks publication; scoped tests must
+  still pass. On incomplete full-suite validation, commit, push to the PR branch,
+  and re-request review without waiting for another contained full-suite run.
+  State in the PR comment that the in-runner full suite **did not complete**, not
+  "failed", and that CI is the validation surface. This takes precedence over
+  agent-local green-full-suite pre-push guidance, not authorization, branch
+  protection, required checks, or required review on main.
 - **Mergeability of your own PRs** — GitHub's per-PR `mergeable` result is
   reconciled with the declared base/head comparison. A clean branch behind its
   base emits `pr_mergeability_rebase`, which uses the existing scoped checkout,
