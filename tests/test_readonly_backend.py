@@ -10,11 +10,13 @@ working against the full home tree.
 from __future__ import annotations
 
 import inspect
+import io
 import json
 import os
 import tempfile
 import threading
 import time
+import zipfile
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import AbstractContextManager
 from pathlib import Path
@@ -68,6 +70,84 @@ def home(tmp_path: Path) -> Path:
     (tmp_path / ".mimir").mkdir()
     (tmp_path / "logs" / "existing.txt").write_text("preexisting log line\n")
     return tmp_path
+
+
+class TestBinaryReads:
+    @pytest.mark.parametrize("backend_kind", ["guard", "readonly", "route"])
+    @pytest.mark.asyncio
+    async def test_docx_binary_error(self, home: Path, backend_kind: str) -> None:
+        target = home / "template.docx"
+        with zipfile.ZipFile(target, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+            archive.writestr("word/document.xml", "<document><p>office needle</p></document>")
+        backend = {
+            "guard": lambda: WriteGuardBackend(home, ["state"]),
+            "readonly": lambda: ReadOnlyFilesystemBackend(home),
+            "route": lambda: _RootAwareFilesystemBackend(root_dir=home, virtual_mode=True),
+        }[backend_kind]()
+        for result in (backend.read("/template.docx"), await backend.aread("/template.docx")):
+            assert result.file_data is None
+            assert result.error.startswith("Binary file: kind=zip-based Office document (DOCX);")
+            assert f"size={target.stat().st_size} bytes" in result.error
+            assert "python -c" in result.error and "zipfile" in result.error
+            assert "word/document.xml" in result.error and "strip XML tags" in result.error
+            assert "pdftotext" not in result.error
+            assert "codec" not in result.error and "position" not in result.error
+            assert len(result.error) < 500
+        assert "/template.docx" in [entry["path"] for entry in backend.ls("/").entries]
+
+    @pytest.mark.parametrize(("name", "payload", "kind", "hint"), [
+        ("report.pdf", b"%PDF-1.7\n", "PDF", "pdftotext"),
+        ("report.data", b"%PDF-1.7\n", "PDF", "pdftotext"),
+        ("blob.bin", b"needle\x00payload", "binary", "text export"),
+        ("opaque", b"\xff\x01\xfe", "binary", "text export"),
+        ("sheet.xlsx", b"PK\x03\x04\x00", "zip-based Office document (XLSX)", "No extractor on this deployment"),
+        ("slides.pptx", b"PK\x03\x04\x00", "zip-based Office document (PPTX)", "No extractor on this deployment"),
+    ])
+    def test_binary_formats(self, home: Path, monkeypatch, name, payload, kind, hint) -> None:
+        (home / name).write_bytes(payload)
+        backend = _RootAwareFilesystemBackend(root_dir=home, virtual_mode=True)
+        result = backend.read(f"/{name}")
+        assert result.file_data is None
+        assert f"kind={kind}; size={len(payload)} bytes" in result.error
+        assert hint in result.error
+        assert "codec" not in result.error and len(result.error) < 500
+        if kind != "PDF":
+            assert "pdftotext" not in result.error
+        monkeypatch.setattr(backend, "_ripgrep_search", lambda *args: None)
+        assert backend.grep("needle", f"/{name}").matches == []
+
+    @pytest.mark.parametrize(("payload", "expected", "replacement"), [
+        (b"caf\xe9\nsecond\n", "caf\ufffd\n", True),
+        (b"\xef\xbb\xbfhello\nsecond\n", "hello\n", False),
+        (b"a" * 4095 + "\u00e9".encode() + b"\n", "a" * 4095 + "\u00e9\n", False),
+    ])
+    def test_text_encodings(self, home: Path, payload, expected, replacement) -> None:
+        (home / "text.txt").write_bytes(payload)
+        backend = WriteGuardBackend(home, ["state"])
+        result = backend.read("/text.txt", limit=1)
+        assert result.error is None
+        assert result.file_data["content"].startswith(expected)
+        assert ("UTF-8 with replacement" in result.file_data["content"]) is replacement
+        assert "second" not in result.file_data["content"]
+
+    def test_binary_probe_is_bounded(self, home: Path, monkeypatch) -> None:
+        import mimir.readonly_backend as module
+
+        target = home / "large.docx"
+        target.write_bytes(b"PK\x03\x04" + b"\x00" * 100_000)
+        real_fdopen = os.fdopen
+        reads = []
+
+        class ProbeOnly(io.BufferedReader):
+            def read(self, size=-1):
+                reads.append(size)
+                assert size == 4096
+                return super().read(size)
+
+        monkeypatch.setattr(module.os, "fdopen", lambda fd, mode: ProbeOnly(real_fdopen(fd, mode)))
+        backend = _RootAwareFilesystemBackend(root_dir=home, virtual_mode=True)
+        assert "size=100004 bytes" in backend.read("/large.docx").error
+        assert reads == [4096]
 
 
 class TestWriteGuardBackend:

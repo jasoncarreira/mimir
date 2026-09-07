@@ -23,6 +23,7 @@ mutator methods added by deepagents (``delete_file``, ``rename``,
 from __future__ import annotations
 
 import asyncio
+import codecs
 import errno
 import json
 import logging
@@ -39,6 +40,7 @@ from typing import Annotated, Any, Literal
 
 from deepagents.backends import FilesystemBackend
 from deepagents.backends.composite import CompositeBackend
+from deepagents.backends.filesystem import _get_backend_read_file_type
 from deepagents.backends.protocol import (
     EditResult,
     FileUploadResponse,
@@ -48,6 +50,7 @@ from deepagents.backends.protocol import (
     ReadResult,
     WriteResult,
 )
+from deepagents.backends.utils import check_empty_content, slice_read_response
 from deepagents.middleware import filesystem as deepagents_filesystem
 from deepagents.middleware.filesystem import FilesystemMiddleware
 from langchain.tools import ToolRuntime
@@ -106,6 +109,46 @@ _UNSAFE_COMPONENT_ERROR = (
 _OS_OPEN = os.open
 _OS_MKDIR = os.mkdir
 _OS_STAT = os.stat
+_TEXT_PROBE_BYTES = 4096
+_BINARY_READ_HINTS = {
+    ".pdf": ("PDF", "Use shell_exec with pdftotext on the PDF to extract text."),
+    ".docx": (
+        "zip-based Office document (DOCX)",
+        "Use shell_exec with python -c and stdlib zipfile to read word/document.xml "
+        "from the zip and strip XML tags (see view-attachment). No new dependency is needed.",
+    ),
+    ".xlsx": (
+        "zip-based Office document (XLSX)",
+        "No extractor on this deployment. Ask for a text or CSV export.",
+    ),
+    ".pptx": (
+        "zip-based Office document (PPTX)",
+        "No extractor on this deployment. Ask for a text export.",
+    ),
+}
+
+
+def _probe_text_file(probe: bytes, suffix: str, size: int) -> str | None:
+    """Classify only a bounded prefix; never decompress an archive to identify it."""
+    kind_hint = _BINARY_READ_HINTS.get(suffix)
+    if kind_hint is None and probe.startswith(b"%PDF-"):
+        kind_hint = _BINARY_READ_HINTS[".pdf"]
+    binary = b"\x00" in probe or probe.startswith(b"PK\x03\x04")
+    try:
+        # A multibyte character split at the probe boundary is not invalid UTF-8.
+        codecs.getincrementaldecoder("utf-8-sig")().decode(probe, final=size <= len(probe))
+    except UnicodeDecodeError:
+        # Latin-1 prose is text-like; control bytes distinguish opaque payloads.
+        binary = binary or any(
+            not char.isprintable() and char not in "\t\n\r\f"
+            for char in probe.decode("latin-1")
+        )
+    if kind_hint is None and not binary:
+        return None
+    kind, hint = kind_hint or (
+        "binary", "No text extractor is available for this format. Ask for a text export.",
+    )
+    return f"Binary file: kind={kind}; size={size} bytes. Next step: {hint}"
 
 
 class _WriteCollision(str):
@@ -628,6 +671,43 @@ class _BoundedFilesystemBackend(FilesystemBackend):
                 on_withheld(reason)
         return reason is not None
 
+    def read(self, file_path: str, offset: int = 0, limit: int = 2000) -> ReadResult:
+        # Preserve native multimodal payloads, but PDFs now use the extraction hint.
+        if _get_backend_read_file_type(file_path) in {"image", "audio", "video"}:
+            return super().read(file_path, offset, limit)
+        try:
+            resolved = self._resolve_path(file_path)
+            if not resolved.is_file():
+                return ReadResult(error=f"File '{file_path}' not found")
+            fd = os.open(resolved, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+            with os.fdopen(fd, "rb") as handle:
+                size = os.fstat(handle.fileno()).st_size
+                probe = handle.read(_TEXT_PROBE_BYTES)
+                error = _probe_text_file(probe, resolved.suffix.lower(), size)
+                if error is not None:
+                    return ReadResult(error=error)
+                raw = probe + handle.read()
+            notice = ""
+            try:
+                content = raw.decode("utf-8-sig")
+            except UnicodeDecodeError:
+                content = raw.decode("utf-8-sig", errors="replace")
+                notice = "\n\n[Decoded as UTF-8 with replacement for non-UTF-8 text bytes.]"
+            # Match the upstream text stream's universal-newline behavior.
+            content = content.replace("\r\n", "\n").replace("\r", "\n")
+            empty = check_empty_content(content)
+            result = (
+                ReadResult(file_data={"content": empty, "encoding": "utf-8"})
+                if empty else slice_read_response(
+                    {"content": content, "encoding": "utf-8"}, offset, limit,
+                )
+            )
+            if notice and result.file_data is not None:
+                result.file_data["content"] += notice
+            return result
+        except (OSError, RuntimeError) as exc:
+            return ReadResult(error=f"Error reading file '{file_path}': {exc}")
+
     def _walk_files(
         self,
         root: Path,
@@ -853,7 +933,11 @@ class _BoundedFilesystemBackend(FilesystemBackend):
             except (OSError, RuntimeError):
                 continue
             try:
-                content = fp.read_text()
+                with fp.open("rb") as handle:
+                    probe = handle.read(_TEXT_PROBE_BYTES)
+                    if _probe_text_file(probe, fp.suffix.lower(), fp.stat().st_size):
+                        continue
+                    content = (probe + handle.read()).decode("utf-8-sig", errors="replace")
             except (UnicodeDecodeError, PermissionError, OSError, RuntimeError):
                 continue
             from .read_policy import non_admin_read_filter_enabled, protected_read_result_reason
