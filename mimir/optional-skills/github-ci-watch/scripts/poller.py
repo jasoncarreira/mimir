@@ -161,7 +161,14 @@ def _check_repo(repo: str, seen: set[int]) -> list[int]:
                     f"CI failure on {repo} main branch: "
                     f"workflow '{workflow}' {conclusion} "
                     f"(run {run_id}, {created}). "
-                    f"URL: {url}"
+                    f"URL: {url}\n"
+                    f"Use fetch_url on https://api.github.com/repos/{repo}/actions/runs/{run_id}/jobs "
+                    "and read the returned /attachments/fetch-cache/ path using read_file "
+                    "to identify the failing job for this run. "
+                    f"Then use fetch_url on https://api.github.com/repos/{repo}/actions/jobs/"
+                    "<job_id>/logs for that failing job and read the returned "
+                    "/attachments/fetch-cache/ path using read_file before diagnosing the failure. "
+                    "If fetching or reading fails, report the limitation rather than guessing."
                 ),
             })
             _log(f"Emitted failure: {repo} {workflow} run {run_id}")

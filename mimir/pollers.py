@@ -1058,8 +1058,8 @@ def _parse_poller_authority(
     capabilities = tuple(dict.fromkeys(capabilities_raw))
     approved_urls: list[str] = []
     if "approved_urls" in raw:
-        if profile != "research":
-            raise ValueError("authority approved_urls is only supported by the research profile")
+        if profile not in {"research", "github"}:
+            raise ValueError("authority approved_urls is only supported by research and github profiles")
         urls_raw = raw["approved_urls"]
         if not isinstance(urls_raw, list):
             raise ValueError("authority approved_urls must be a list of HTTPS URLs")
@@ -1083,6 +1083,8 @@ def _parse_poller_authority(
                 or any(segment in {".", ".."} for segment in parsed.path.split("/"))
             ):
                 raise ValueError(f"invalid approved_urls entry: {url!r}")
+            if profile == "github" and parsed.hostname not in {"api.github.com", "github.com"}:
+                raise ValueError(f"poller {name!r}: approved_urls requires a GitHub host: {url!r}")
             approved_urls.append(normalized)
     if profile == "research":
         if "fetch_url" in capabilities and not approved_urls:

@@ -8,6 +8,7 @@ returned for the seen-set (regardless of whether it emitted).
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
 import pytest
 
@@ -61,6 +62,33 @@ def test_skips_already_seen_failures(monkeypatch, captured):
     newly = poller._check_repo("o/r", seen={2})
     assert captured == []          # run 2 was already reported
     assert set(newly) == {2}       # still observed → stays in the seen-set
+
+
+@pytest.mark.parametrize("conclusion", sorted(poller.FAILURE_CONCLUSIONS))
+def test_failure_prompt_fetches_and_reads_job_log(monkeypatch, captured, conclusion):
+    monkeypatch.setattr(poller, "_gh", lambda *a: [_run(42, conclusion)])
+    poller._check_repo("o/r", seen=set())
+
+    prompt = captured[0]["prompt"]
+    jobs = "https://api.github.com/repos/o/r/actions/runs/42/jobs"
+    logs = "https://api.github.com/repos/o/r/actions/jobs/<job_id>/logs"
+    assert f"fetch_url on {jobs}" in prompt
+    assert f"fetch_url on {logs}" in prompt
+    assert prompt.index(jobs) < prompt.index("read_file") < prompt.index(logs)
+    assert prompt.count("/attachments/fetch-cache/ path using read_file") == 2
+    assert "before diagnosing the failure" in prompt
+    assert "report the limitation rather than guessing" in prompt
+    assert "shell" not in prompt
+    assert "gh " not in prompt
+
+
+def test_manifest_grants_log_fetch_and_read():
+    skill_dir = Path(__file__).resolve().parents[1]
+    authority = json.loads((skill_dir / "pollers.json").read_text())["pollers"][0]["authority"]
+    assert {"fetch_url", "read_file"} <= set(authority["capabilities"])
+    assert authority["approved_urls"] == [
+        "https://api.github.com/repos/", "https://github.com/",
+    ]
 
 
 def test_gh_error_yields_no_events(monkeypatch, captured):
