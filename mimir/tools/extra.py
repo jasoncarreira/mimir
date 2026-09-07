@@ -480,29 +480,28 @@ def shell_exec(
     """
     if not command or not command.strip():
         return "shell_exec failed: command is required"
-    is_project_test = False
-    try:
-        from ._shell_env import bound_direct_exec_argv, direct_exec_env, login_shell_command
-        direct_argv = bound_direct_exec_argv()
-        if direct_argv is None:
-            direct_argv = mimir_direct_argv
-        # Server-authorized argv must never inherit another session's interactive
-        # cd. An explicit/configured cwd has already been checked by middleware.
-        effective_cwd = _effective_shell_cwd(
-            cwd, allow_session_state=direct_argv is None,
-        )
-        argv = (
-            direct_argv
-            if direct_argv is not None
-            else ["bash", "-lc", login_shell_command(command)]
-        )
-        direct_env = direct_exec_env(argv) if direct_argv is not None else None
-        from ..access_control import configured_project_test_cwd
+    from ._shell_env import bound_direct_exec_argv, direct_exec_env, login_shell_command
+    direct_argv = bound_direct_exec_argv()
+    if direct_argv is None:
+        direct_argv = mimir_direct_argv
+    # Server-authorized argv must never inherit another session's interactive
+    # cd. An explicit/configured cwd has already been checked by middleware.
+    effective_cwd = _effective_shell_cwd(
+        cwd, allow_session_state=direct_argv is None,
+    )
+    argv = (
+        direct_argv
+        if direct_argv is not None
+        else ["bash", "-lc", login_shell_command(command)]
+    )
+    direct_env = direct_exec_env(argv) if direct_argv is not None else None
+    from ..access_control import configured_project_test_cwd
 
-        is_project_test = (
-            direct_argv is not None
-            and configured_project_test_cwd(direct_argv) is not None
-        )
+    is_project_test = (
+        direct_argv is not None
+        and configured_project_test_cwd(direct_argv) is not None
+    )
+    try:
         if is_project_test:
             proc = _run_bounded_project_test(
                 argv,
@@ -526,9 +525,20 @@ def shell_exec(
                 f"{_SHELL_STATE['timeout_s']}s"
             )
         return f"shell_exec timed out after {_SHELL_STATE['timeout_s']}s"
-    except FileNotFoundError as exc:
-        executable = direct_argv[0] if direct_argv else "bash"
-        return f"shell_exec failed: executable {executable!r} not found: {exc}"
+    except (FileNotFoundError, NotADirectoryError) as exc:
+        # Use launch-time evidence, not a racy filesystem probe. Do not expose
+        # paths or raw exception text, or guess when both targets match.
+        filename = os.fsdecode(exc.filename) if exc.filename is not None else None
+        failed_cwd = effective_cwd is not None and filename == os.fspath(effective_cwd)
+        failed_executable = bool(argv) and filename == argv[0]
+        if failed_cwd and not failed_executable:
+            reason = "not found" if isinstance(exc, FileNotFoundError) else "not a directory"
+            return f"shell_exec failed: working directory {reason}"
+        if failed_executable and not failed_cwd:
+            # ENOENT can also mean a missing script interpreter or loader.
+            reason = "file not found" if isinstance(exc, FileNotFoundError) else "not a directory"
+            return f"shell_exec failed: executable could not be started ({reason})"
+        return "shell_exec failed: process could not be started (check working directory and executable)"
 
     parts = [f"exit={proc.returncode}"]
     stdout = (proc.stdout or b"").decode("utf-8", errors="replace")
