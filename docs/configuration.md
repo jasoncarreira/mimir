@@ -580,10 +580,29 @@ for an unreferenced backend are warned and dropped.
 |---|---|---|---|---|
 | `backends.opencode.bin` | str | `opencode` | Executable used for `opencode run`. | `bin: /usr/local/bin/opencode` |
 | `backends.opencode.args` | list[str] | `[]` | Adds arguments not owned by Worklink. `-m`/`--model`, `--dir`, and `--` are rejected because Worklink supplies them. | `args: ["--format", "json"]` |
+| `backends.opencode.test_env` | mapping[str, str] | `{}` | Exports test settings into the executor in both coding modes. Only `PYTEST_ADDOPTS` is allowed; values must be plain text with no newlines or control characters. | `test_env: {PYTEST_ADDOPTS: "-n 6"}` |
 | `backends.opencode.bash_allowlist` | list[str] | `["git *", "uv *"]` | Replaces the deny-first shell command grants sent through `OPENCODE_PERMISSION`. Empty denies all shell commands; catch-all `*` is rejected. This is not a process sandbox. | `bash_allowlist: ["git *", "npm test*"]` |
 | `backends.feature_factory.entrypoint` | absolute path | `MIMIR_FACTORY_ENTRYPOINT` or the fixed image path | Exact `feature-factory/bin/factory.js` used by every `node` control command and retained recovery record. | `entrypoint: /opt/mimir-opencode/lib/node_modules/feature-factory/bin/factory.js` |
 
 The retired `backends.feature_factory.bin`, `args`, `ready`, and `reviewer` keys are rejected with migration guidance. The image installs `feature-factory@0.8.3` and `opencode-feature-factory@0.8.3` under one npm prefix and registers only the OpenCode adapter. Runtime controls are `status`, `resume`, `heartbeat`, and run-ID-first `lock` actions; cancellation uses `mimir worklink stop` and never invokes a factory cancel transition.
+
+For example, to bound pytest runs launched by the model (including through bash):
+
+```yaml
+backends:
+  opencode:
+    test_env:
+      PYTEST_ADDOPTS: "-n 6"
+```
+
+Pytest precedence is **pyproject addopts < PYTEST_ADDOPTS < command line**.
+The gate still runs `defaults.test_command` unchanged, so an explicit `-n` on
+that command wins. An executor command can likewise override this default; this
+setting is not a hard resource limit. Values are exported literally, without
+shell expansion or host environment lookup. Secret and model-selection variable
+names are not accepted. The selected `test_env` keys and values are recorded in
+run state, evidence JSON, and the `WORKLINK_EVIDENCE` comment, including recovered
+runs; do not put secrets in test options.
 
 `compute_backends` defaults to `{}`. The sole shipping block is
 `compute_backends.local_subprocess` (hyphenated `local-subprocess` is normalized

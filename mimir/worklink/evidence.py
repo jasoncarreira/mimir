@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 import json
 import os
@@ -90,6 +90,7 @@ class WorklinkEvidence:
     # Commit pushed for this completed attempt. Recovery uses it to detect PR
     # branch updates made after Worklink finished.
     head_sha: str | None = None
+    test_env: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -479,6 +480,7 @@ async def _observe_evidence_from_ref(
         failure_reason=failure_reason,
         blocked_reason=blocked_reason,
         transcript=transcript,
+        test_env=dict(work_spec.backend_config.get("test_env", {})) if work_spec else {},
         executor_tests=executor_tests,
         gate_result_diverged=_gate_results_diverge(executor_tests, tests),
         diff_observed=pre_observed

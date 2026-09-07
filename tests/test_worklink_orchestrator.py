@@ -1052,6 +1052,110 @@ def _orchestrator_runner(
     return calls, runner
 
 
+@pytest.mark.parametrize("outcome", ["success", "backend_failure", "gate_failure", "publish_failure"])
+@pytest.mark.parametrize("recover", [False, True])
+def test_selected_test_env_survives_state_evidence_and_recovery(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, outcome: str, recover: bool
+) -> None:
+    import mimir.worklink.orchestrator as orchestrator
+    from mimir.worklink.run_state import WorklinkRunState, save_run_state
+
+    selected = {"PYTEST_ADDOPTS": "-n 2"}
+    repo = tmp_path / "repo"
+    worktree = repo.parent / ".worklink" / repo.name / "441-1"
+    calls, base_runner = _orchestrator_runner(repo, worktree)
+    states: list[WorklinkRunState] = []
+
+    def runner(args: Sequence[str] | str, **kwargs: Any) -> subprocess.CompletedProcess:
+        result = base_runner(args, **kwargs)
+        if outcome == "gate_failure" and args == "echo ok":
+            return cp(args, returncode=1, stderr="gate failed")
+        if outcome == "publish_failure" and isinstance(args, list) and args[:3] == ["gh", "pr", "create"]:
+            return cp(args, returncode=1, stderr="publication failed")
+        return result
+
+    class SelectedBackend(FakeBackend):
+        def work_spec(self, *args: Any, **kwargs: Any) -> WorkSpec:
+            return replace(
+                super().work_spec(*args, **kwargs),
+                backend_config={
+                    "test_env": {"PYTEST_ADDOPTS": "-n 4"} if recover else selected,
+                    "private_option": "must-not-be-recorded",
+                },
+            )
+
+    class PersistentCompute(FakeCompute):
+        def capabilities(self) -> ComputeCaps:
+            return ComputeCaps(True, False, True, True)
+
+    def save(home: Path, state: WorklinkRunState) -> Path:
+        path = save_run_state(home, state)
+        restored = load_run_state(home, state.issue_id)
+        assert restored == state
+        if state.phase == "spawned":
+            states.append(restored)
+        assert "private_option" not in path.read_text(encoding="utf-8")
+        return path
+
+    monkeypatch.setattr(orchestrator, "save_run_state", save)
+    original_observe = orchestrator.observe_evidence
+
+    async def observe(**kwargs: Any) -> EvidenceValidation:
+        # Exercise the gate-handle replacement as well as initial worker state.
+        kwargs["on_gate_launch"](LaunchHandle("fake_compute", "gate-job"))
+        return await original_observe(**kwargs)
+
+    monkeypatch.setattr(orchestrator, "observe_evidence", observe)
+    backend = SelectedBackend(status="failed" if outcome == "backend_failure" else "success")
+    registry = BackendRegistry(WorklinkConfig(defaults=WorklinkDefaults(compute_backend="fake_compute")))
+    registry.register(backend)
+    registry.register_compute(PersistentCompute())
+    controller = WorklinkRunner(home=tmp_path, repo=repo, runner=runner, registry=registry)
+    if recover:
+        worktree.mkdir(parents=True)
+        save_run_state(tmp_path, WorklinkRunState(
+            issue_id=441, attempt=1, backend="fake", compute_name="fake_compute",
+            handle_substrate="fake_compute", handle_identifier="original-job",
+            branch="issue/441-a1", base_ref="main", local_base="main", repo=str(repo),
+            repo_url="git@github.com:jasoncarreira/mimir.git", test_command="echo ok",
+            started_at=datetime.now(UTC).isoformat(), test_env=selected,
+        ))
+        monkeypatch.setattr(ChainlinkClaims, "review_ready_evidence", lambda *_: None)
+        monkeypatch.setattr(ChainlinkClaims, "_issue_has_label", lambda *_: True)
+        monkeypatch.setattr(orchestrator, "_create_observation_worktree", lambda *a, **kw: CheckoutLease(
+            issue_id=441, attempt=1, repo=repo, path=worktree, branch="issue/441-a1",
+            base_ref="main", local_base="main", isolated_checkout=True,
+        ))
+        monkeypatch.setattr(orchestrator, "_remove_observation_worktree", lambda *a, **kw: None)
+        result = asyncio.run(controller.reattach(441))
+    else:
+        result = asyncio.run(controller.run(441, backend_name="fake", test_command="echo ok"))
+
+    expected_status = {"success": "completed", "publish_failure": "blocked"}.get(outcome, "failed")
+    assert result.status == expected_status, result.reason
+    assert states and all(state.test_env == selected for state in states)
+    assert states[-1].handle_identifier == "gate-job"
+    payload = json.loads(result.evidence_path.read_text(encoding="utf-8"))
+    assert payload["test_env"] == selected
+    assert "must-not-be-recorded" not in json.dumps(payload)
+    comments = [
+        args[-1] for args in calls
+        if isinstance(args, list) and args[:3] == ["chainlink", "issue", "comment"]
+        and args[-1].startswith("WORKLINK_EVIDENCE ")
+    ]
+    assert comments
+    assert all(f"test_env={json.dumps(selected, sort_keys=True)}" in text for text in comments)
+    assert all("private_option" not in text for text in comments)
+
+    for version in (1, 2):
+        old = states[0].to_json()
+        old.pop("test_env")
+        old["version"] = version
+        restored = WorklinkRunState.from_json(old)
+        assert restored.test_env == {}
+        assert restored.to_json()["test_env"] == {}
+
+
 @pytest.mark.parametrize("later_exit_code", [0, 1])
 def test_gate_flakes_survive_second_observation_without_masking_failure(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, later_exit_code: int
@@ -1234,6 +1338,7 @@ def test_worklink_runner_happy_path_fake_backend(tmp_path: Path) -> None:
         )
     )
     assert evidence["base_ref"] == "main"
+    assert evidence["test_env"] == {}
     assert ["git", "-C", str(worktree), "commit", "-m", "worklink: issue #441"] in calls
     assert ["chainlink", "locks", "release", "441"] in calls
     # #518: the attempt branch is pushed from the checkout that owns it (lease.path),
