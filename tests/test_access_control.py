@@ -7257,7 +7257,7 @@ def test_repo_review_local_inspection_requires_existing_absolute_string_root(
     assert probes == [], "invalid roots must be refused before Git config probing"
 
 
-@pytest.mark.parametrize("target_kind", ["relative", "other", "missing", "loop"])
+@pytest.mark.parametrize("target_kind", ["relative", "other", "missing", "missing-parent", "loop"])
 def test_repo_review_git_c_requires_absolute_matching_resolvable_root(
     target_kind: str, repo_review_state: RepoReviewState, tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -7269,6 +7269,7 @@ def test_repo_review_git_c_requires_absolute_matching_resolvable_root(
     targets = {
         "relative": root.name, "other": str(tmp_path),
         "missing": str(tmp_path / "absent"), "loop": str(loop),
+        "missing-parent": str(root.parent / "absent" / ".." / root.name),
     }
     assert parse_service_shell_argv(
         f"git -C {root} status", "repo_review", review_state=repo_review_state,
@@ -7307,7 +7308,7 @@ def test_repo_review_root_resolution_errors_fail_closed(
 
 
 @pytest.mark.parametrize("command", [
-    "gh status", "git", "git -C", "git -C /tmp",
+    "gh status", "git", "git -C", "git -C /tmp", "git -C {root}",
     "git status file.py", "git status --", "git status --verbose",
     "git log --output=/tmp/review-output",
 ])
@@ -7315,6 +7316,7 @@ def test_repo_review_rejects_malformed_or_unsafe_inspection_argv(
     command: str, repo_review_state: RepoReviewState,
 ) -> None:
     assert parse_service_shell_argv("git status", "repo_review", review_state=repo_review_state)
+    command = command.format(root=repo_review_state.root)
     assert parse_service_shell_argv(command, "repo_review", review_state=repo_review_state) is None
 
 
