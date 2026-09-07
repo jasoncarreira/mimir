@@ -143,7 +143,9 @@ def resolved_read_target_from_arguments(
     return str((home / raw_path.lstrip("/")).resolve(strict=False))
 
 
-def emit_hard_read_denial(tool: str, target: Any, reason: str) -> None:
+def emit_hard_read_denial(
+    tool: str, target: Any, reason: str, *, remapped_candidate: str | None = None,
+) -> None:
     """Record a protected result that the backend actually withheld."""
     from ._context import get_current_turn
     from .tools.budget_gate import _emit_hard_boundary_denied
@@ -156,6 +158,10 @@ def emit_hard_read_denial(tool: str, target: Any, reason: str) -> None:
         target=target,
         auth_context=getattr(turn_context, "auth_context", None),
         turn_context=turn_context,
+        event_fields=(
+            {"remapped_candidate": remapped_candidate}
+            if remapped_candidate is not None and remapped_candidate != target else None
+        ),
     )
 
 

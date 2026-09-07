@@ -259,21 +259,30 @@ async def test_drain_deadline_before_and_after_witnesses(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("release_delay,before", [(0.005, True), (0.03, False)])
+@pytest.mark.parametrize("before", [True, False])
 async def test_close_deadline_before_and_after_witnesses(
-    release_delay: float,
     before: bool,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr("mimir.acp.transport.WRITER_CLOSE_TIMEOUT", 0.02)
     monkeypatch.setattr("mimir.acp.transport.WRITER_ABORT_TIMEOUT", 0.05)
     gate = asyncio.Event()
-    writer = StagedWriter(close_gate=gate)
-    release = asyncio.create_task(_release_after(gate, release_delay))
+
+    class ClosingWriter(StagedWriter):
+        def abort(self) -> None:
+            assert not gate.is_set()
+            super().abort()
+            gate.set()
+
+    # Release before waiting, or only after the real close deadline expires.
+    # Neither witness depends on the runner scheduling competing timers on time.
+    if before:
+        gate.set()
+    writer = ClosingWriter(close_gate=gate)
     await close_writer(writer)
     assert writer.aborted is not before
     assert writer.wait_calls == (1 if before else 2)
-    await release
+    assert gate.is_set()
 
 
 @pytest.mark.asyncio

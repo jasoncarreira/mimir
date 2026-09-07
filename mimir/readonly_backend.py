@@ -448,6 +448,10 @@ def _read_denied_message(reason: str) -> str:
         "protected_name_match": "Use a non-secret source or an authorized secret interface.",
         "service_scoped_read_boundary": "Use a path inside this service's configured read roots.",
         "mimir_home_read_boundary": "Use an allowed state path instead.",
+        "outside_file_tool_roots": (
+            "The path is not under any configured file-tool root. "
+            "Check the path spelling or ask the operator to configure its root."
+        ),
         "protected_read_result": "For published PR content, use pr_files or pr_diff.",
     }.get(reason, "Choose an allowed read target.")
     return f"Read denied: {reason}. {guidance}"
@@ -521,14 +525,11 @@ def _contextualize_grep_matches(
 
 
 def _real_path_outside_root(key: str, cwd: Path) -> Path | None:
-    """Return the resolved real path iff ``key`` names an EXISTING file/dir
-    whose real location is outside ``cwd``.
+    """Identify literal outside paths without remapping missing absolute paths.
 
-    Distinguishes "the caller passed a literal absolute path that really exists
-    elsewhere" (so silently remapping it under ``cwd`` would hide it — the
-    false-not-found of chainlink #650) from a normal virtual path (which has no
-    literal real-disk existence). Returns ``None`` when the path doesn't exist
-    or already lives under ``cwd``."""
+    Existing virtual targets retain precedence. Missing descendants of an
+    existing home namespace also retain their virtual spelling (e.g. /state/x).
+    """
     if key == "/":
         return None
     try:
@@ -546,7 +547,7 @@ def _real_path_outside_root(key: str, cwd: Path) -> Path | None:
         literal = Path(key)
         if not literal.is_absolute():
             return None
-        if not literal.exists():
+        if not literal.exists() and (root / literal.parts[1]).exists():
             return None
         real = literal.resolve()
     except OSError:
@@ -1161,7 +1162,9 @@ class _BoundedFilesystemBackend(FilesystemBackend):
             if reason is not None:
                 from .read_policy import emit_hard_read_denial, record_read_policy_refusal
 
-                emit_hard_read_denial("ls", str(requested), reason)
+                emit_hard_read_denial(
+                    "ls", path, reason, remapped_candidate=str(requested),
+                )
                 message = _read_denied_message(reason)
                 record_read_policy_refusal(message)
                 return LsResult(error=message)
@@ -1220,7 +1223,7 @@ class _RootAwareFilesystemBackend(_BoundedFilesystemBackend):
 
     def __init__(self, *args: Any, guard_outside_root: bool = False, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
-        # When True, an absolute path naming a REAL file outside ``cwd`` raises a
+        # When True, an absolute path outside ``cwd`` returns a
         # clear error instead of being silently remapped under ``cwd`` (the
         # false-not-found of chainlink #650). Opt-in: only the home/default
         # backend sets it; CompositeBackend route backends receive
@@ -1238,7 +1241,7 @@ class _RootAwareFilesystemBackend(_BoundedFilesystemBackend):
 
     # --- out-of-root guard (chainlink #650) ---------------------------------
     # When ``guard_outside_root`` is set (the home/default backend), an absolute
-    # path naming a REAL file/dir outside ``cwd`` would otherwise be silently
+    # path outside ``cwd`` would otherwise be silently
     # remapped under ``cwd`` and read back as "not found" (the 746-failure bug).
     # Return a clear, actionable error RESULT instead. We return rather than
     # raise: deepagents' middleware wraps only ``validate_path`` (not the backend
@@ -1247,7 +1250,18 @@ class _RootAwareFilesystemBackend(_BoundedFilesystemBackend):
     # (no WriteGuard wrapper), so read/ls/write/edit all catch the ValueError that
     # ``_resolve_path`` raises when a ..-free symlink resolves outside ``cwd``.
 
-    def _outside_root_msg(self, key: str) -> str:
+    def _outside_root_msg(self, key: str, *, tool: str | None = None) -> str:
+        if tool is not None:
+            from .read_policy import emit_hard_read_denial, record_read_policy_refusal
+
+            reason = "outside_file_tool_roots"
+            emit_hard_read_denial(
+                tool, key, reason,
+                remapped_candidate=str(self.cwd / key.lstrip("/")),
+            )
+            message = _read_denied_message(reason)
+            record_read_policy_refusal(message)
+            return message
         return (
             f"Path '{key}' is outside the file-tool root '{self.cwd}'. It exists "
             f"on disk but the file tools can't reach it — read or edit it with "
@@ -1269,7 +1283,7 @@ class _RootAwareFilesystemBackend(_BoundedFilesystemBackend):
 
     def read(self, file_path: str, offset: int = 0, limit: int = 2000) -> ReadResult:
         if self._is_outside_root(file_path):
-            return ReadResult(error=self._outside_root_msg(file_path))
+            return ReadResult(error=self._outside_root_msg(file_path, tool="read_file"))
         from .read_policy import non_admin_read_filter_enabled, protected_read_result_reason
 
         if non_admin_read_filter_enabled():
@@ -1279,7 +1293,9 @@ class _RootAwareFilesystemBackend(_BoundedFilesystemBackend):
                 if reason is not None:
                     from .read_policy import emit_hard_read_denial, record_read_policy_refusal
 
-                    emit_hard_read_denial("read_file", str(resolved), reason)
+                    emit_hard_read_denial(
+                        "read_file", file_path, reason, remapped_candidate=str(resolved),
+                    )
                     message = self._read_denied_message(reason)
                     record_read_policy_refusal(message)
                     return ReadResult(error=message)
@@ -1300,7 +1316,7 @@ class _RootAwareFilesystemBackend(_BoundedFilesystemBackend):
 
     async def aread(self, file_path: str, offset: int = 0, limit: int = 2000) -> ReadResult:
         if self._is_outside_root(file_path):
-            return ReadResult(error=self._outside_root_msg(file_path))
+            return ReadResult(error=self._outside_root_msg(file_path, tool="read_file"))
         from .read_policy import non_admin_read_filter_enabled, protected_read_result_reason
 
         if non_admin_read_filter_enabled():
@@ -1310,7 +1326,9 @@ class _RootAwareFilesystemBackend(_BoundedFilesystemBackend):
                 if reason is not None:
                     from .read_policy import emit_hard_read_denial, record_read_policy_refusal
 
-                    emit_hard_read_denial("read_file", str(resolved), reason)
+                    emit_hard_read_denial(
+                        "read_file", file_path, reason, remapped_candidate=str(resolved),
+                    )
                     message = self._read_denied_message(reason)
                     record_read_policy_refusal(message)
                     return ReadResult(error=message)
@@ -1361,7 +1379,7 @@ class _RootAwareFilesystemBackend(_BoundedFilesystemBackend):
 
     def ls(self, path: str) -> LsResult:
         if self._is_outside_root(path):
-            return LsResult(error=self._outside_root_msg(path))
+            return LsResult(error=self._outside_root_msg(path, tool="ls"))
         try:
             result = super().ls(path)
         except ValueError as e:
@@ -1376,7 +1394,7 @@ class _RootAwareFilesystemBackend(_BoundedFilesystemBackend):
 
     async def als(self, path: str) -> LsResult:
         if self._is_outside_root(path):
-            return LsResult(error=self._outside_root_msg(path))
+            return LsResult(error=self._outside_root_msg(path, tool="ls"))
         result = await super().als(path)
         if result.error is None:
             self._publish_read_paths([
@@ -1833,6 +1851,8 @@ class WriteGuardBackend:
         new_string: str,
         replace_all: bool = False,
     ) -> EditResult:
+        if self._fs._is_outside_root(file_path):
+            return EditResult(error=self._fs._outside_root_msg(file_path, tool="edit_file"))
         if not self._is_write_allowed(file_path):
             if self._is_prompts_path(file_path):
                 self._record_denial("edit_prompts_readonly", file_path)
