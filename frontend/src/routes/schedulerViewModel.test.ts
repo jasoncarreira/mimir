@@ -79,4 +79,16 @@ describe("scheduler view-model helpers", () => {
     expect(runStateTone({ recent_result: "ok" })).toBe("success");
     expect(formatDateTime("not-a-date")).toBe("not-a-date");
   });
+
+  it("keeps error ahead of suppression, and exposes suppression after recovery", () => {
+    const run = { recent_error: "poller_misfired", suppression_reason: "quota", recent_result: "ok" };
+    expect(runStateLabel(run)).toBe("error");
+    expect(runStateTone(run)).toBe("danger");
+    const recovered = { ...run, recent_error: null };
+    expect(runStateLabel(recovered)).toBe("suppressed");
+    expect(runStateTone(recovered)).toBe("warning");
+    expect(runStateLabel({ ...recovered, suppression_reason: null })).toBe("ok");
+    expect(runStateTone({ ...recovered, suppression_reason: null })).toBe("success");
+    expect(runStateLabel({})).toBe("configured");
+  });
 });

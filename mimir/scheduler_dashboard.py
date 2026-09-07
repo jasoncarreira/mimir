@@ -92,13 +92,35 @@ def _event_detail(event: dict[str, Any]) -> str:
     return event_type
 
 
+def _event_time(event: dict[str, Any] | None) -> datetime | None:
+    try:
+        value = datetime.fromisoformat(_event_ts(event or {}))
+    except ValueError:
+        return None
+    return value if value.tzinfo is not None else None
+
+
+def _unrecovered_error(
+    error: dict[str, Any] | None,
+    success: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    error_time = _event_time(error)
+    success_time = _event_time(success)
+    if error_time is not None and success_time is not None and success_time > error_time:
+        return None
+    return error
+
+
 def _prefer_newer_event(
     current: dict[str, Any] | None,
     candidate: dict[str, Any],
 ) -> dict[str, Any]:
     if current is None:
         return candidate
-    if _event_ts(candidate) >= _event_ts(current):
+    current_time = _event_time(current)
+    candidate_time = _event_time(candidate)
+    # Retain unorderable events so an undated error cannot be hidden by recovery.
+    if candidate_time is None or (current_time is not None and candidate_time >= current_time):
         return candidate
     return current
 
@@ -216,6 +238,7 @@ def _schedule_rows(
         misfired = recent.get(name, {}).get("scheduled_job_misfired")
         recent_error = _newest_event(dropped, misfired)
         last_event = _newest_event(last_ok, suppressed, dropped, misfired)
+        recent_error = _unrecovered_error(recent_error, last_ok)
         rows.append({
             "id": aps_job.id,
             "name": name,
@@ -273,6 +296,7 @@ def _poller_rows(
             )
         ))
         last_event = _newest_event(last_ok, suppressed, recent_error)
+        recent_error = _unrecovered_error(recent_error, last_ok)
         row_usage = usage.get(poller.name)
         rows.append({
             "id": f"{POLLER_CHANNEL_PREFIX}{poller.name}",
