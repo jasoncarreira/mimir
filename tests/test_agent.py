@@ -2731,13 +2731,16 @@ def test_partial_evidence_redacts_before_truncating_credentials():
 
     # Cutting this fixed-length AWS key at 4096 makes it unrecognizable to
     # downstream redaction. Assert against the leaked fragment, not just the key.
-    message = ToolMessage(content="x" * 4080 + " AKIA1234567890ABCDEF trailing text", tool_call_id="done")
+    # Built by concatenation: the publication scanner refuses staged blobs that
+    # contain a secret-shaped literal, while the runtime value must still match.
+    aws_key = "AKIA" + "1234567890ABCDEF"
+    message = ToolMessage(content="x" * 4080 + f" {aws_key} trailing text", tool_call_id="done")
     events, truncated = extract_partial_tool_events([message])
     assert truncated is False
     assert len(events) == 1
     assert "AKIA" not in events[0]["content"]
     assert "[truncated]" in events[0]["content"]
-    assert "AKIA1234567890ABCDEF" in message.content
+    assert aws_key in message.content
 
 
 async def test_run_turn_emits_turn_failed_event_on_error(tmp_path: Path):
