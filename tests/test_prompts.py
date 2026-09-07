@@ -673,6 +673,44 @@ def test_turn_prompt_auto_skill_block_renders_labeled_section():
     assert "outbox + dispatch loop" in prompt
 
 
+@pytest.mark.parametrize("trigger,channel", [
+    ("poller", "poller:feed"), ("scheduled_tick", "scheduler:daily"),
+])
+@pytest.mark.parametrize("capabilities", [None, (), ("operator_alert",)])
+@pytest.mark.parametrize("configured", [False, True])
+def test_service_turn_explains_trigger_channel_without_authority_dependency(
+    monkeypatch, trigger, channel, capabilities, configured,
+):
+    from mimir.models import AgentEvent
+    from mimir.prompts import build_turn_prompt
+
+    if configured:
+        monkeypatch.setenv("MIMIR_OPERATOR_ALERT_CHANNEL", "discord-operator")
+    else:
+        monkeypatch.delenv("MIMIR_OPERATOR_ALERT_CHANNEL", raising=False)
+    prompt = build_turn_prompt(
+        AgentEvent(trigger=trigger, channel_id=channel, content="tick"),
+        trigger_capabilities=capabilities,
+    )
+    assert ("No operator channel is configured" in prompt) is (not configured)
+    assert ("configured operator channel is 'discord-operator'" in prompt) is configured
+    assert "authorized delivery alternative" not in prompt
+    assert f"`{channel}` is a non-conversational trigger channel" in prompt
+    assert "not deliverable via send_message or react" in prompt
+    assert "Ending the turn silently without calling send_message is normal" in prompt
+    assert ("operator_alert(text=...)" in prompt) is (
+        trigger == "poller" and bool(capabilities)
+    )
+
+
+def test_conversation_turn_has_no_trigger_channel_warning():
+    from mimir.models import AgentEvent
+    from mimir.prompts import build_turn_prompt
+
+    prompt = build_turn_prompt(AgentEvent(trigger="user_message", channel_id="web-user"))
+    assert "## Trigger channel" not in prompt
+
+
 def test_turn_prompt_renders_exact_autonomous_trigger_authority():
     from mimir.models import AgentEvent
     from mimir.prompts import build_turn_prompt

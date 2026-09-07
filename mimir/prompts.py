@@ -11,6 +11,7 @@ skills``) come in later phases when the registry is dynamic.
 
 from __future__ import annotations
 
+import os
 from datetime import datetime, timezone
 from typing import Iterable
 
@@ -327,6 +328,26 @@ def build_turn_prompt(
     # return None from load_channel_memory and this section is suppressed.
     if channel_memory_block:
         _add_labeled("Channel context", channel_memory_block)
+
+    if event.channel_id.lower().startswith(("poller:", "scheduler:")):
+        from .channel_registry import OPERATOR_CHANNEL_SENTINEL, resolve_deliver_channel
+
+        operator_channel = resolve_deliver_channel(
+            OPERATOR_CHANNEL_SENTINEL, os.environ.get("MIMIR_OPERATOR_ALERT_CHANNEL", ""),
+        )
+        notification_hint = (
+            f"For a genuine notification, the configured operator channel is {operator_channel!r}; "
+            "use only a delivery tool authorized for this turn."
+            if operator_channel else
+            "No operator channel is configured (MIMIR_OPERATOR_ALERT_CHANNEL is unset)."
+        )
+        _add_labeled(
+            "Trigger channel",
+            f"`{event.channel_id}` is a non-conversational trigger channel, not "
+            "deliverable via send_message or react. Ending the turn silently "
+            "without calling send_message is normal when there is nothing to report. "
+            + notification_hint,
+        )
 
     # chainlink #508: optional deliver channel for poller / scheduled-tick
     # turns. Injected as an instruction so the agent JUDGES whether anything is
