@@ -1143,6 +1143,10 @@ class ServerDiscoveredPRStates:
         with self._lock:
             return self._states.get((repository.lower(), pull_request))
 
+    def resolve_checkout_path(self, path: object) -> RepoReviewState | None:
+        """Apply the same exact-lease guards to a snapshot of discovered states."""
+        return RepoPRScopeRegistry(self.review_states).resolve_checkout_path(path)
+
     def remember(self, state: RepoReviewState) -> RepoReviewState:
         target = (state.repo.lower(), state.pr_number)
         with self._lock:

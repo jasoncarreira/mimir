@@ -5305,6 +5305,13 @@ def resolve_repository_review_state(
         ):
             return None, None
 
+    if path is not None:
+        discovered = getattr(auth_context, "server_discovered_pr_states", None)
+        if discovered is not None:
+            state = discovered.resolve_checkout_path(path)
+            if state is not None:
+                return state, None
+
     registry = getattr(auth_context, "repo_pr_scope_registry", None)
     if not isinstance(registry, RepoPRScopeRegistry):
         return getattr(auth_context, "repo_review_state", None), None
