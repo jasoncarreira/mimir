@@ -347,11 +347,10 @@ or the separate OpenCode executor allowlist.
 
 For #1050, the live review/remediation parity check is reviewer-owned **BEFORE
 MERGE**, not a build blocker. Evidence lives in Chainlink #1050 comments mirrored
-in the PR body. The supplied human remediation record is partial; the remaining
-checks and record summary are in the
-[authorization reference](authorization.md#repository-review-and-remediation-1050).
-Follow the unchanged [reviewer procedure](internal/repo-pr-parity-canary.md#1050-reviewer-procedure);
-the full gate is not yet established by that record.
+in the PR body. The record summary is in the
+[authorization reference](authorization.md#repository-review-and-remediation-1050);
+the [reviewer procedure](internal/repo-pr-parity-canary.md#1050-reviewer-procedure)
+is unchanged and was completed by the reviewer on 2026-09-07.
 
 For Worklink-created PRs, the human review path is always available through the
 PR URL in the Chainlink evidence comment. The GitHub poller additionally opens

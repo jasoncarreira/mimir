@@ -455,10 +455,17 @@ scope `a1b1248a5809...`, head `cf9d4f9045dbd6c2...`, and owner `mimir-carreira` 
 `jasoncarreira/mimir#1847`, using
 `repo_test -> repo_diff -> repo_commit -> repo_push -> pr_comment -> repo_cleanup -> pr_checks -> pr_rerequest_review`.
 It reports one comment, one push, one review re-request, and pre-execution refusal
-of shell Git writes and `gh`. This is partial evidence, not full gate satisfaction:
-the review-scope cycle, receipt/audit pairing on the same scope/head for every
-write, zero observed shadow effects, stale-snapshot push refusal, and scenario
-totals/mismatch categories still require reviewer verification.
+of shell Git writes and `gh`. The reviewer completed the remaining steps on
+2026-09-07 (Chainlink #1050, "Reviewer gate record, part 2" and its correction):
+a review-scope cycle on `jasoncarreira/mimir#1841` with exactly one submitted
+review pinned to the lease head (GitHub review 5125541381 at `c75f7ad29`);
+provider receipts paired to the audit records on the same scope and head for
+every write (commit `e470f81b` with parent `cf9d4f90`, comment 5563439034,
+review re-request 30658296097); zero would-block shadow decisions on any write
+tool in either cycle; the stale-head push refusal established from the
+recorded-snapshot path (`tests/test_pr_checkout_lease.py::test_expired_lease_refuses_resume_after_pr_head_moves`
+and `::test_pr_checkout_lease_fails_closed_on_moved_head`) without mutating a live
+PR; and scenario totals with no mismatch categories.
 
 ### Configured project tests
 

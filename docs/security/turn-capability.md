@@ -22,9 +22,9 @@ This does not change Arm 2's `scheduler_read_only` selection or its provenance
 rules.
 
 The live parity canary is reviewer-owned **BEFORE MERGE**, not a build blocker;
-records live in Chainlink #1050 comments mirrored in the PR body. The supplied
-human remediation record is partial, not full gate satisfaction. See the
-[record summary and outstanding checks](../authorization.md#repository-review-and-remediation-1050)
+records live in Chainlink #1050 comments mirrored in the PR body and were
+completed by the reviewer on 2026-09-07. See the
+[record summary](../authorization.md#repository-review-and-remediation-1050)
 and the unchanged [reviewer procedure](../internal/repo-pr-parity-canary.md#1050-reviewer-procedure).
 
 A turn that has ingested untrusted content cannot run a further shell command. The
