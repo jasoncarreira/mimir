@@ -13,7 +13,7 @@ from .proxy import open_stdio, run_router
 from .transport import FORCE_CLOSE_TIMEOUT, close_writer
 
 SSH_PATH = Path("/usr/bin/ssh")
-CONNECT_TIMEOUT = 12.0
+SPAWN_TIMEOUT = 30.0
 WAIT_TIMEOUT = 1.0
 TERMINATE_TIMEOUT = 2.0
 KILL_TIMEOUT = 1.0
@@ -93,7 +93,7 @@ async def run_ssh_proxy(
 ) -> None:
     process = await asyncio.wait_for(asyncio.create_subprocess_exec(
         *build_ssh_argv(profile, _ssh_path), stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE, env=child_environment(_environment)), CONNECT_TIMEOUT)
+        stderr=asyncio.subprocess.PIPE, env=child_environment(_environment)), SPAWN_TIMEOUT)
     if process.stdin is None or process.stdout is None or process.stderr is None:
         await stop_child(process)
         raise SshError("SSH pipes unavailable")
