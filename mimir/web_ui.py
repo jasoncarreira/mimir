@@ -1788,16 +1788,30 @@ def register_routes(
             body = await request.json()
         except json.JSONDecodeError:
             return json_error("bad_request", "invalid json", status=400)
-        canonical = str((body or {}).get("canonical") or "").strip()
-        if not canonical:
+        if not isinstance(body, dict):
+            return json_error("bad_request", "json object required", status=400)
+        canonical = body.get("canonical")
+        if not isinstance(canonical, str) or not canonical.strip():
             return json_error("bad_request", "canonical required", status=400)
+        canonical = canonical.strip()
+        label = body.get("label")
+        if label is not None and (not isinstance(label, str) or not label.strip()):
+            return json_error("bad_request", "label must be a non-empty string or null", status=400)
+        rotate = body.get("rotate", False)
+        if not isinstance(rotate, bool):
+            return json_error("bad_request", "rotate must be a boolean", status=400)
         try:
             roles = roles_for_request((body or {}).get("role"))
         except ValueError as exc:
             return json_error("bad_request", str(exc), status=400)
         from .identities_populator import issue_web_key
 
-        raw_key = await asyncio.to_thread(issue_web_key, home, canonical, roles=roles)
+        try:
+            raw_key = await asyncio.to_thread(
+                issue_web_key, home, canonical, roles=roles, label=label, rotate=rotate
+            )
+        except ValueError as exc:
+            return json_error("bad_request", str(exc), status=400)
         resolver = request.app.get("identity_resolver")
         if resolver is not None:
             await asyncio.to_thread(resolver.reload)  # make the new key live now
@@ -1811,9 +1825,15 @@ def register_routes(
             body = await request.json()
         except json.JSONDecodeError:
             return json_error("bad_request", "invalid json", status=400)
-        canonical = str((body or {}).get("canonical") or "").strip()
-        if not canonical:
+        if not isinstance(body, dict):
+            return json_error("bad_request", "json object required", status=400)
+        canonical = body.get("canonical")
+        if not isinstance(canonical, str) or not canonical.strip():
             return json_error("bad_request", "canonical required", status=400)
+        canonical = canonical.strip()
+        label = body.get("label")
+        if label is not None and (not isinstance(label, str) or not label.strip()):
+            return json_error("bad_request", "label must be a non-empty string or null", status=400)
         from .identities_populator import LastWebKeyError, revoke_web_key
 
         try:
@@ -1821,10 +1841,13 @@ def register_routes(
                 revoke_web_key,
                 home,
                 canonical,
+                label=label,
                 allow_last=bool(request.app.get("api_key")),
             )
         except LastWebKeyError as exc:
             return json_error("last_web_key", str(exc), status=409)
+        except ValueError as exc:
+            return json_error("bad_request", str(exc), status=400)
         resolver = request.app.get("identity_resolver")
         if resolver is not None:
             await asyncio.to_thread(resolver.reload)

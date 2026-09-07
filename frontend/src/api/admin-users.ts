@@ -22,24 +22,26 @@ export function listUsers(
 export function issueUserKey(
   canonical: string,
   role: "user" | "admin" | null,
+  key: { label?: string; rotate?: boolean } = {},
   options?: ApiClientOptions & RequestInit
 ): Promise<ApiSuccessEnvelope<IssueKeyData>> {
   return apiFetchEnvelope<IssueKeyData>("/api/v1/admin/users/key", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(role ? { canonical, role } : { canonical }),
+    body: JSON.stringify({ canonical, ...(role ? { role } : {}), ...key }),
     ...options
   });
 }
 
 export function revokeUserKey(
   canonical: string,
+  label?: string,
   options?: ApiClientOptions & RequestInit
 ): Promise<ApiSuccessEnvelope<RevokeKeyData>> {
   return apiFetchEnvelope<RevokeKeyData>("/api/v1/admin/users/revoke", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ canonical }),
+    body: JSON.stringify({ canonical, label }),
     ...options
   });
 }

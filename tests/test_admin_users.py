@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
 from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
 
@@ -60,7 +61,8 @@ async def test_admin_users_routes_require_admin(tmp_path: Path) -> None:
 
 
 async def test_list_never_returns_key_material(tmp_path: Path) -> None:
-    key = issue_web_key(tmp_path, "alice", roles=["user"])
+    key = issue_web_key(tmp_path, "alice", roles=["user"], label="laptop")
+    second = issue_web_key(tmp_path, "alice", label="phone")
     async with TestClient(TestServer(_app(tmp_path))) as c:
         body = await (await c.get("/api/v1/admin/users", headers={"X-API-Key": MASTER})).json()
         data = _data(body)
@@ -68,8 +70,12 @@ async def test_list_never_returns_key_material(tmp_path: Path) -> None:
         assert key not in blob  # no raw key
         assert hash_web_key(key) not in blob  # no hash
         assert "webkey:" not in blob  # no alias material at all
+        assert second not in blob and hash_web_key(second) not in blob
         alice = next(u for u in data["users"] if u["canonical"] == "alice")
         assert alice["has_web_key"] is True
+        assert sorted(alice["web_keys"], key=lambda key: key["label"]) == [
+            {"label": "laptop", "present": True}, {"label": "phone", "present": True}
+        ]
         assert alice["roles"] == ["user"] and alice["is_admin"] is False
 
 
@@ -102,12 +108,14 @@ async def test_issue_admin_role_grants_admin(tmp_path: Path) -> None:
 
 async def test_rotate_invalidates_old_key(tmp_path: Path) -> None:
     k1 = issue_web_key(tmp_path, "carol", roles=["user"])
+    other = issue_web_key(tmp_path, "carol", label="phone")
     async with TestClient(TestServer(_app(tmp_path))) as c:
         r = await c.post("/api/v1/admin/users/key", headers={"X-API-Key": MASTER},
-                         json={"canonical": "carol"})  # rotate (no role change)
+                         json={"canonical": "carol", "rotate": True})
         k2 = _data(await r.json())["key"]
         assert k1 != k2
         assert (await c.get("/api/v1/whoami", headers={"X-API-Key": k1})).status == 401  # old dead
+        assert (await c.get("/api/v1/whoami", headers={"X-API-Key": other})).status == 401
         assert (await c.get("/api/v1/whoami", headers={"X-API-Key": k2})).status == 200
 
 
@@ -122,13 +130,99 @@ async def test_revoke_key_blocks_auth(tmp_path: Path) -> None:
         assert (await c.get("/api/v1/whoami", headers={"X-API-Key": key})).status == 401
 
 
-async def test_revoke_last_web_key_without_master_is_refused(tmp_path: Path) -> None:
-    key = issue_web_key(tmp_path, "ops", roles=["admin"])
+async def test_add_and_revoke_label_preserves_other_keys(tmp_path: Path) -> None:
+    original = issue_web_key(tmp_path, "alice", roles=["user"], label="laptop")
+    async with TestClient(TestServer(_app(tmp_path))) as c:
+        response = await c.post(
+            "/api/v1/admin/users/key", headers={"X-API-Key": MASTER},
+            json={"canonical": "alice", "label": "phone"},
+        )
+        assert response.status == 200
+        assert "no-store" in response.headers["Cache-Control"]
+        data = _data(await response.json())
+        assert set(data) == {"canonical", "key"}
+        added = data["key"]
+        for key in (original, added):
+            who = await c.get("/api/v1/whoami", headers={"X-API-Key": key})
+            assert who.status == 200
+            assert _data(await who.json())["roles"] == ["user"]
+        response = await c.post(
+            "/api/v1/admin/users/revoke", headers={"X-API-Key": MASTER},
+            json={"canonical": "alice", "label": "phone"},
+        )
+        assert response.status == 200
+        assert _data(await response.json())["revoked"] is True
+        assert (await c.get("/api/v1/whoami", headers={"X-API-Key": added})).status == 401
+        assert (await c.get("/api/v1/whoami", headers={"X-API-Key": original})).status == 200
+        listing = _data(await (await c.get("/api/v1/admin/users", headers={"X-API-Key": MASTER})).json())
+        assert listing["users"][0]["web_keys"] == [{"label": "laptop", "present": True}]
+        assert listing["users"][0]["has_web_key"] is True
+        response = await c.post(
+            "/api/v1/admin/users/revoke", headers={"X-API-Key": MASTER},
+            json={"canonical": "alice"},
+        )
+        assert response.status == 200
+        listing = _data(await (await c.get("/api/v1/admin/users", headers={"X-API-Key": MASTER})).json())
+        assert listing["users"][0]["web_keys"] == []
+        assert listing["users"][0]["has_web_key"] is False
+
+
+@pytest.mark.parametrize("endpoint", ["key", "revoke"])
+@pytest.mark.parametrize("body", [
+    [], ["alice"], "alice", None, 42,
+    {"canonical": ["alice"]}, {"canonical": 42},
+    {"canonical": "alice", "label": []},
+    {"canonical": "alice", "label": {}},
+    {"canonical": "alice", "label": False},
+    {"canonical": "alice", "label": 123},
+    {"canonical": "alice", "label": ""},
+    {"canonical": "alice", "label": "  "},
+])
+async def test_invalid_key_request_does_not_mutate(tmp_path: Path, endpoint: str, body, monkeypatch) -> None:
+    from unittest.mock import Mock
+
+    key = issue_web_key(tmp_path, "alice", roles=["admin"])
+    before = (tmp_path / "state" / "identities.yaml").read_bytes()
+    mutate = Mock(side_effect=AssertionError("invalid request reached key mutation"))
+    monkeypatch.setattr(f"mimir.identities_populator.{'issue_web_key' if endpoint == 'key' else 'revoke_web_key'}", mutate)
+    async with TestClient(TestServer(_app(tmp_path))) as c:
+        response = await c.post(
+            f"/api/v1/admin/users/{endpoint}", headers={"X-API-Key": MASTER},
+            data=json.dumps(body),
+        )
+        assert response.status == 400
+        mutate.assert_not_called()
+        assert (tmp_path / "state" / "identities.yaml").read_bytes() == before
+        assert (await c.get("/api/v1/whoami", headers={"X-API-Key": key})).status == 200
+
+
+@pytest.mark.parametrize("rotate", [None, "false", "true", 0, 1, [], {}])
+async def test_invalid_rotate_does_not_mutate(tmp_path: Path, rotate, monkeypatch) -> None:
+    from unittest.mock import Mock
+
+    key = issue_web_key(tmp_path, "alice", roles=["admin"])
+    before = (tmp_path / "state" / "identities.yaml").read_bytes()
+    mutate = Mock(side_effect=AssertionError("invalid request reached key mutation"))
+    monkeypatch.setattr("mimir.identities_populator.issue_web_key", mutate)
+    async with TestClient(TestServer(_app(tmp_path))) as c:
+        response = await c.post(
+            "/api/v1/admin/users/key", headers={"X-API-Key": MASTER},
+            json={"canonical": "alice", "rotate": rotate},
+        )
+        assert response.status == 400
+        mutate.assert_not_called()
+        assert (tmp_path / "state" / "identities.yaml").read_bytes() == before
+        assert (await c.get("/api/v1/whoami", headers={"X-API-Key": key})).status == 200
+
+
+@pytest.mark.parametrize("label", [None, "admin-device"])
+async def test_revoke_last_web_key_without_master_is_refused(tmp_path: Path, label) -> None:
+    key = issue_web_key(tmp_path, "ops", roles=["admin"], label="admin-device")
     async with TestClient(TestServer(_app(tmp_path, master_key=""))) as c:
         response = await c.post(
             "/api/v1/admin/users/revoke",
             headers={"X-API-Key": key},
-            json={"canonical": "ops"},
+            json={"canonical": "ops", "label": label},
         )
         assert response.status == 409
         body = await response.json()

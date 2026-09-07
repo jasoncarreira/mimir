@@ -836,6 +836,7 @@ export interface AdminUser {
   is_admin: boolean;
   prefs: Record<string, unknown>;
   has_web_key: boolean;
+  web_keys: { label: string; present: true }[];
 }
 
 export interface AdminUsersData {
