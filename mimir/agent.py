@@ -145,6 +145,7 @@ from .turn_logger import (
     TurnLogger,
     derive_result_fields,
     extract_turn_events,
+    extract_partial_tool_events,
     make_turn_id,
     slim_turn_record,
     truncate_input,
@@ -2825,6 +2826,7 @@ class Agent:
         turn_error_request_summary: dict[str, Any] | None = None
         messages: list[Any] = []
         output = ""
+        events_truncated = False
         # chainlink #376 (PR 3/4): (event, fold_monotonic) for each message
         # folded into THIS turn mid-stream, read from the registry in the finally
         # below (before deactivate pops it) so the turn record can carry the
@@ -2899,25 +2901,25 @@ class Agent:
                 )
         except asyncio.TimeoutError:
             error = f"TurnTimeout: turn exceeded {timeout}s wall-clock limit"
-            events = []
             log.error(
                 "turn timed out after %ss (channel=%s, turn=%s)",
                 timeout, event.channel_id, turn_id,
             )
             await log_event("turn_timeout", channel_id=event.channel_id, timeout_s=timeout)
         except Exception as exc:
-            error = f"{type(exc).__name__}: {exc}"
-            exception_traceback = "".join(
+            from .redaction import redact_text
+
+            error = redact_text(f"{type(exc).__name__}: {exc}")[:2048]
+            exception_traceback = redact_text("".join(
                 traceback.format_exception(type(exc), exc, exc.__traceback__, limit=16)
-            )
+            ))
             # langchain-codex-plus >= 0.0.5 attaches a request-content summary
             # to CodexResponseError; surface it on turn_failed so a content
             # rejection (e.g. "Unsupported content type") names itself.
             _req_summary = getattr(exc, "request_summary", None)
             if isinstance(_req_summary, dict):
                 turn_error_request_summary = _req_summary
-            events = []
-            log.exception("agent.astream failed: %s", exc)
+            log.error("agent.astream failed: %s", error)
             # Mid-turn quota exhaustion handling (SPEC §4.9 / §16 item 18).
             # If the model call surfaced as a 429, record a pause so
             # subsequent scheduled ticks suppress until the window
@@ -3015,6 +3017,10 @@ class Agent:
                     count=len(deferred_events),
                 )
                 self._dispatcher.requeue_front(deferred_events)
+
+        if error is not None:
+            events, events_truncated = extract_partial_tool_events(messages)
+            output = ""
 
         # chainlink #511: if the per-turn iteration ceiling force-stopped this
         # turn, the model never got to deliver — notify the channel rather than
@@ -3278,6 +3284,8 @@ class Agent:
             agent_id=self._config.agent_id,
             saga_atom_ids=saga_atom_ids,
             events=events,
+            events_partial=error is not None,
+            events_truncated=events_truncated,
             # chainlink #376 (PR 3/4): each mid-turn message folded into this turn
             # as ``{t_ms, text}`` — rendered the way the model saw it (author +
             # attachments header, capped) plus a start-relative offset (same axis

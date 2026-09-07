@@ -427,6 +427,44 @@ def extract_turn_events(
     return events, "\n".join(output_parts)
 
 
+def extract_partial_tool_events(messages: list[Any]) -> tuple[list[dict[str, Any]], bool]:
+    """Bounded diagnostic evidence only; never promote interrupted text to output."""
+    from .turn_event_redaction import scrub_value
+
+    events: list[dict[str, Any]] = []
+    size = 2  # JSON array brackets
+    truncated = False
+    for message in messages:
+        if not isinstance(message, (AIMessage, ToolMessage)):
+            continue
+        try:
+            # Scrub BEFORE extraction truncates results (a cut credential may no
+            # longer match a redaction pattern). Do not mutate graph state.
+            safe = message.model_copy(update=scrub_value(redact_payload({
+                "content": message.content,
+                "response_metadata": message.response_metadata,
+                **({"tool_calls": message.tool_calls} if isinstance(message, AIMessage) else {}),
+                "name": message.name,
+                **({"tool_call_id": message.tool_call_id} if isinstance(message, ToolMessage) else {}),
+            })))
+            extracted, _ = extract_turn_events([safe])
+            for event in extracted:
+                if event["type"] not in {"tool_call", "tool_result"}:
+                    continue
+                if event["type"] == "tool_call":
+                    event["args"] = _cap_args(event["args"])
+                event = redact_payload(event)
+                event_size = len(json.dumps(event, ensure_ascii=True).encode("utf-8")) + 2
+                if len(events) >= 64 or size + event_size > 64 * 1024:
+                    return events, True
+                events.append(event)
+                size += event_size
+        except Exception:
+            # Broken diagnostic metadata must not mask the original turn error.
+            truncated = True
+    return events, truncated
+
+
 def derive_result_fields(
     messages: list[Any], *, context: Any | None = None,
 ) -> dict[str, Any]:

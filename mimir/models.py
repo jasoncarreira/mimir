@@ -1688,6 +1688,12 @@ class TurnRecord:
     seq: int | None = None
     saga_atom_ids: list[str] = field(default_factory=list)
     events: list[dict[str, Any]] = field(default_factory=list)
+    # True when events come from an interrupted stream, not a final snapshot.
+    # None on legacy records and callers that do not track stream completion.
+    events_partial: bool | None = None
+    # Partial evidence omitted events due to size limits or malformed metadata.
+    # Individual payload previews carry their own truncation markers.
+    events_truncated: bool = False
     output: str = ""
     # chainlink #376: user messages that arrived mid-turn and were FOLDED into
     # this turn at a before_model boundary. Each entry is ``{"t_ms": float,

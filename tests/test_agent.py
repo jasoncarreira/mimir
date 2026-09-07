@@ -2639,6 +2639,110 @@ async def test_run_turn_records_error_when_ainvoke_raises(tmp_path: Path):
     assert fake_saga.feedback_calls == []
 
 
+@pytest.mark.parametrize("failure", ["exception", "timeout"])
+@pytest.mark.parametrize("shape", ["native", "internal"])
+async def test_failed_turn_preserves_partial_tool_events(tmp_path: Path, failure, shape):
+    secret = "sk-proj-" + "sensitivecredential" * 5
+    calls = [{"id": "done", "name": "write_file", "args": {"api_key": secret}}]
+    if shape == "native":
+        messages = [
+            AIMessage(content="working", tool_calls=calls),
+            ToolMessage(content=f"written token={secret}", tool_call_id="done", name="write_file"),
+        ]
+    else:
+        messages = [AIMessage(content="working", response_metadata={
+            "internal_tool_calls": calls,
+            "internal_tool_results": [{"tool_use_id": "done", "content": f"written token={secret}"}],
+        })]
+
+    class BrokenStream(_FakeAgent):
+        async def astream(self, *args, **kwargs):
+            async for snapshot in super().astream(*args, **kwargs):
+                yield ("values", snapshot)
+                yield ("values", snapshot)  # cumulative snapshots must not duplicate actions
+            if failure == "timeout":
+                await asyncio.sleep(10)
+            raise RuntimeError(f"transport dropped token={secret}")
+
+    fake = BrokenStream(messages)
+    agent = _build_agent(tmp_path, fake_agent=fake)
+    agent._config = replace(agent._config, turn_timeout_seconds=0.05 if failure == "timeout" else 0)
+    record = await agent.run_turn(AgentEvent(trigger="poller", channel_id="ch-1", content="work"))
+    assert [e["type"] for e in record.events] == ["tool_call", "tool_result"]
+    assert record.events_partial is True
+    assert record.events_truncated is False
+    assert record.error.startswith("TurnTimeout:" if failure == "timeout" else "RuntimeError:")
+    assert record.output == ""
+    assert len(fake.invocations) == 1
+    persisted = json.loads((tmp_path / "home/logs/turns.jsonl").read_text().splitlines()[-1])
+    assert persisted["events"] == record.events
+    assert persisted["events_partial"] is True
+    assert secret not in json.dumps(asdict(record))
+    assert secret not in json.dumps(persisted)
+    assert secret not in json.dumps(_read_events(tmp_path))
+    assert not any(e["type"] == "turn_completed" for e in _read_events(tmp_path))
+
+
+@pytest.mark.parametrize("large_results", [False, True])
+async def test_failed_turn_evidence_is_bounded(tmp_path: Path, large_results):
+    class BrokenStream(_FakeAgent):
+        async def astream(self, *args, **kwargs):
+            async for snapshot in super().astream(*args, **kwargs):
+                yield snapshot
+            raise RuntimeError("transport dropped")
+
+    messages = [AIMessage(content="", tool_calls=[{
+        "id": "first", "name": "write_file",
+        "args": {"api_key": "private-value-123", "body": "x" * 20_000},
+    }])]
+    messages.extend(
+        ToolMessage(content="result" * (2000 if large_results else 1), tool_call_id=str(i))
+        for i in range(100)
+    )
+    agent = _build_agent(tmp_path, fake_agent=BrokenStream(messages))
+    record = await agent.run_turn(AgentEvent(trigger="poller", channel_id="ch-1", content="work"))
+    assert record.events_partial is True
+    assert record.events_truncated is True
+    assert 1 < len(record.events) <= 64
+    assert len(json.dumps(record.events, ensure_ascii=True).encode()) <= 64 * 1024
+    assert record.events[0]["args"]["truncated"] is True
+    persisted = json.loads((tmp_path / "home/logs/turns.jsonl").read_text().splitlines()[-1])
+    assert persisted["events"] == record.events
+    assert persisted["events_truncated"] is True
+    assert "private-value-123" not in json.dumps(asdict(record))
+
+
+def test_partial_evidence_skips_malformed_metadata_without_raw_fallback():
+    from mimir.turn_logger import extract_partial_tool_events
+
+    messages = [
+        AIMessage(content="", response_metadata={"tool_events": ["token=private-value-123"]}),
+        ToolMessage(content="completed", tool_call_id="done"),
+    ]
+    events, truncated = extract_partial_tool_events(messages)
+    assert truncated is True
+    assert events == [{"type": "tool_result", "id": "done", "name": None,
+                       "content": "completed", "is_error": False}]
+    assert messages[0].response_metadata["tool_events"] == ["token=private-value-123"]
+
+
+def test_partial_evidence_redacts_before_truncating_credentials():
+    from mimir.turn_logger import extract_partial_tool_events
+
+    # Cutting this fixed-length AWS key at 4096 makes it unrecognizable to
+    # downstream redaction. Assert against the leaked fragment, not just the key.
+    # Built by concatenation: the publication scanner refuses staged blobs that
+    # contain a secret-shaped literal, while the runtime value must still match.
+    aws_key = "AKIA" + "1234567890ABCDEF"
+    message = ToolMessage(content="x" * 4080 + f" {aws_key} trailing text", tool_call_id="done")
+    events, truncated = extract_partial_tool_events([message])
+    assert truncated is False
+    assert len(events) == 1
+    assert "AKIA" not in events[0]["content"]
+    assert "[truncated]" in events[0]["content"]
+    assert aws_key in message.content
+
+
 async def test_run_turn_emits_turn_failed_event_on_error(tmp_path: Path):
     """Any turn that fails must emit a ``turn_failed`` event so the
     failure is operator-visible (ops dashboard + events.jsonl), not just
@@ -2735,7 +2839,10 @@ async def test_turn_completed_emitted_for_successful_poller_turn(tmp_path: Path)
         source_id="poller:github-activity:1700:batch:0",
         extra={"poller_name": "github-activity", "items": items},
     )
-    await agent.run_turn(event)
+    record = await agent.run_turn(event)
+    assert record.output == "reviewed"
+    assert record.events_partial is False
+    assert record.events_truncated is False
 
     events_log = tmp_path / "home" / "logs" / "events.jsonl"
     evs = [json.loads(ln) for ln in events_log.read_text().splitlines() if ln.strip()]
