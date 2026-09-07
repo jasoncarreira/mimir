@@ -125,6 +125,43 @@ async def test_global_dashboard_routes_are_admin_only(tmp_path: Path) -> None:
             assert master.status == 200, path
 
 
+async def test_board_pagination_and_selected_detail_remain_admin_only(tmp_path: Path, monkeypatch) -> None:
+    from mimir import chainlink_board
+
+    calls = []
+
+    async def run(home, args):
+        calls.append(args)
+        if args == ["export", "--json"]:
+            return {"version": 1, "exported_at": "2026-06-18T03:00:00Z", "issues": [{
+                "id": 1214, "title": "Private task", "status": "open",
+                "priority": "normal", "labels": [], "parent_id": None,
+                "description": "Private summary", "comments": [], "closed_at": None,
+                "created_at": "2026-06-17T00:00:00Z", "updated_at": "2026-06-18T00:00:00Z",
+            }]}, None
+        return {"id": 1214, "description": "Private detail"}, None
+
+    monkeypatch.setattr(chainlink_board, "_run_chainlink_json", run)
+    user_key = issue_web_key(tmp_path, "alice", roles=["user"])
+    admin_key = issue_web_key(tmp_path, "ops", roles=["admin"])
+    app = web.Application(middlewares=[_make_auth_middleware("master-secret")])
+    app["identity_resolver"] = _resolver(tmp_path)
+    web_ui.register_routes(app, turns_log=tmp_path / "turns", events_log=tmp_path / "events", home=tmp_path)
+    path = "/api/v1/chainlink-board?offset=250&show_completed=false&issue=1214"
+    async with TestClient(TestServer(app)) as client:
+        for key, status in (("", 401), ("invalid", 401), (user_key, 403)):
+            response = await client.get(path, headers={"X-API-Key": key})
+            assert response.status == status
+            assert calls == []
+        for key in (admin_key, "master-secret"):
+            response = await client.get(path, headers={"X-API-Key": key})
+            assert response.status == 200
+            data = (await response.json())["data"]
+            assert data["issues"] == []
+            assert data["selected_issue"]["description"] == "Private detail"
+        assert len(calls) == 4
+
+
 def test_admin_required_prefix_matching_is_segment_aware() -> None:
     for path in (
         "/api/v1/admin",

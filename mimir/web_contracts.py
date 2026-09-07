@@ -453,6 +453,10 @@ export interface ChainlinkBoardIssue {
 }
 
 export interface ChainlinkBoardData {
+  offset: number;
+  next_offset: number | null;
+  selected_issue: ChainlinkBoardIssue | null;
+  selected_issue_state: "none" | "loaded" | "unavailable" | "missing";
   available: boolean;
   error?: string | null;
   generated_at: string;

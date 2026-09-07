@@ -14,7 +14,7 @@ from typing import Any
 
 CHAINLINK_TIMEOUT_SECONDS = 5.0
 CHAINLINK_MAX_ISSUES = 250
-CHAINLINK_MAX_SHOWS = 120
+CHAINLINK_MAX_SHOWS = CHAINLINK_MAX_ISSUES
 
 _WORKLINK_EVIDENCE_RE = re.compile(r"^(\d+)-(\d+)\.json$")
 
@@ -271,9 +271,19 @@ async def _load_issue_details(home: Path, ids: list[int]) -> dict[int, dict[str,
     return {issue_id: detail for issue_id, detail in pairs if detail is not None}
 
 
-async def build_chainlink_board_payload(home: Path | None) -> dict[str, Any]:
+async def build_chainlink_board_payload(
+    home: Path | None, *, label: str = "", status: str = "", priority: str = "",
+    show_completed: bool = True, offset: int = 0, issue: int | None = None,
+) -> dict[str, Any]:
+    if offset < 0 or (issue is not None and issue <= 0):
+        raise ValueError("offset must be nonnegative and issue must be positive")
+    page_metadata = {
+        "offset": offset, "next_offset": None,
+        "selected_issue": None, "selected_issue_state": "none",
+    }
     if home is None:
         return {
+            **page_metadata,
             "available": False,
             "error": "home path not configured",
             "generated_at": datetime.now(timezone.utc).isoformat(),
@@ -287,10 +297,11 @@ async def build_chainlink_board_payload(home: Path | None) -> dict[str, Any]:
         }
 
     payload, error = await _run_chainlink_json(
-        home, ["issue", "list", "--status", "all", "--json"],
+        home, ["export", "--json"],
     )
     if error:
         return {
+            **page_metadata,
             "available": False,
             "error": error,
             "generated_at": datetime.now(timezone.utc).isoformat(),
@@ -302,8 +313,12 @@ async def build_chainlink_board_payload(home: Path | None) -> dict[str, Any]:
             "truncated": False,
             "total_count": 0,
         }
-    if not isinstance(payload, list):
+    exported_issues = payload.get("issues") if isinstance(payload, dict) else None
+    if not isinstance(exported_issues, list) or not all(
+        isinstance(item, dict) for item in exported_issues
+    ):
         return {
+            **page_metadata,
             "available": False,
             "error": "chainlink returned non-list payload",
             "generated_at": datetime.now(timezone.utc).isoformat(),
@@ -316,17 +331,10 @@ async def build_chainlink_board_payload(home: Path | None) -> dict[str, Any]:
             "total_count": 0,
         }
 
-    raw_issues = [issue for issue in payload if isinstance(issue, dict)]
-    total_count = len(raw_issues)
-    raw_issues = raw_issues[:CHAINLINK_MAX_ISSUES]
-    ids = [issue_id for issue in raw_issues if (issue_id := _issue_id(issue)) is not None]
-    details = await _load_issue_details(home, ids)
-    merged = []
-    for issue in raw_issues:
-        issue_id = _issue_id(issue)
-        detail = details.get(issue_id or -1, {})
-        merged.append({**issue, **detail})
-
+    # Export supplies global labels, parents and lifecycle metadata. Dependencies
+    # are hydrated only after filtering/pagination, never for the whole tracker.
+    selected_id = issue
+    merged = exported_issues
     issues_by_id = {
         issue_id: issue
         for issue in merged
@@ -353,6 +361,50 @@ async def build_chainlink_board_payload(home: Path | None) -> dict[str, Any]:
     ]
     summaries.sort(key=lambda issue: (issue["status"] == "done", issue["priority"], issue["id"]))
 
+    labels = sorted({label for item in summaries for label in item["labels"]})
+    priorities = sorted({item["priority"] for item in summaries})
+    matching = [
+        item for item in summaries
+        if (not label or label in item["labels"])
+        and (not status or item["status"] == status)
+        and (not priority or item["priority"] == priority)
+        and (show_completed or status == "done" or item["status"] != "done")
+    ]
+    total_count = len(matching)
+    summaries = matching[offset:offset + CHAINLINK_MAX_ISSUES]
+    if offset + len(summaries) < total_count:
+        page_metadata["next_offset"] = offset + len(summaries)
+
+    page_ids = [item["id"] for item in summaries]
+    details = await _load_issue_details(home, page_ids)
+    summaries = [
+        _summarize_issue(
+            {**issues_by_id[item["id"]], **details[item["id"]]},
+            children_by_parent=children_by_parent,
+            issues_by_id=issues_by_id,
+            worklink_by_issue=worklink_by_issue,
+        ) if item["id"] in details else item
+        for item in summaries
+    ]
+
+    if selected_id is not None:
+        selected_raw = issues_by_id.get(selected_id)
+        page_metadata["selected_issue_state"] = "missing"
+        if selected_raw is not None:
+            # Reuse an in-page attempt even when it failed: no duplicate show.
+            if selected_id not in page_ids:
+                details.update(await _load_issue_details(home, [selected_id]))
+            detail = details.get(selected_id)
+            page_metadata["selected_issue_state"] = "unavailable"
+            if detail is not None:
+                page_metadata["selected_issue"] = _summarize_issue(
+                    {**selected_raw, **detail},
+                    children_by_parent=children_by_parent,
+                    issues_by_id=issues_by_id,
+                    worklink_by_issue=worklink_by_issue,
+                )
+                page_metadata["selected_issue_state"] = "loaded"
+
     statuses = ["open", "ready", "blocked", "in-progress", "review", "done"]
     columns = [
         {
@@ -368,10 +420,9 @@ async def build_chainlink_board_payload(home: Path | None) -> dict[str, Any]:
             edges.append({"from": blocker, "to": issue["id"], "kind": "blocks"})
         for child in issue["child_ids"]:
             edges.append({"from": issue["id"], "to": child, "kind": "parent"})
-    labels = sorted({label for issue in summaries for label in issue["labels"]})
-    priorities = sorted({issue["priority"] for issue in summaries})
 
     return {
+        **page_metadata,
         "available": True,
         "error": None,
         "generated_at": datetime.now(timezone.utc).isoformat(),
@@ -384,7 +435,7 @@ async def build_chainlink_board_payload(home: Path | None) -> dict[str, Any]:
             "statuses": statuses,
             "priorities": priorities,
         },
-        "truncated": total_count > len(raw_issues),
+        "truncated": total_count > len(summaries),
         "total_count": total_count,
     }
 

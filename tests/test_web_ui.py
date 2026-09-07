@@ -342,14 +342,14 @@ async def test_chainlink_board_parses_cli_json_and_worklink_evidence(
         """#!/usr/bin/env python3
 import json, sys
 args = sys.argv[1:]
-if args[:2] == ["issue", "list"]:
-    print(json.dumps([
-        {"id": 524, "title": "Parent", "status": "open", "priority": "high", "labels": ["epic"], "updated_at": "2026-06-18T00:00:00Z"},
-        {"id": 545, "title": "Board", "status": "open", "priority": "medium", "labels": ["worklink:review", "frontend"], "parent_id": 524, "blocked_by": [540], "updated_at": "2026-06-18T01:00:00Z"},
-        {"id": 540, "title": "Prereq", "status": "closed", "priority": "low", "labels": [], "updated_at": "2026-06-17T00:00:00Z"}
-    ]))
+if args == ["export", "--json"]:
+    print(json.dumps({"version": 1, "exported_at": "2026-06-18T03:00:00Z", "issues": [
+        {"id": 524, "title": "Parent", "status": "open", "priority": "high", "labels": ["epic"], "parent_id": None, "description": "Parent description", "comments": [], "created_at": "2026-06-17T00:00:00Z", "closed_at": None, "updated_at": "2026-06-18T00:00:00Z"},
+        {"id": 545, "title": "Board", "status": "open", "priority": "medium", "labels": ["worklink:review", "frontend"], "parent_id": 524, "description": "Board description", "comments": [], "created_at": "2026-06-17T00:00:00Z", "closed_at": None, "updated_at": "2026-06-18T01:00:00Z"},
+        {"id": 540, "title": "Prereq", "status": "closed", "priority": "low", "labels": [], "parent_id": None, "description": "Prereq description", "comments": [], "created_at": "2026-06-16T00:00:00Z", "closed_at": "2026-06-17T00:00:00Z", "updated_at": "2026-06-17T00:00:00Z"}
+    ]}))
 elif args[:2] == ["issue", "show"] and args[2] == "545":
-    print(json.dumps({"id": 545, "description": "Acceptance criteria", "comments": [{"author": "mimir", "created_at": "2026-06-18T02:00:00Z", "body": "WORKLINK_EVIDENCE attached"}]}))
+    print(json.dumps({"id": 545, "blocked_by": [540], "description": "Acceptance criteria", "comments": [{"author": "mimir", "created_at": "2026-06-18T02:00:00Z", "body": "WORKLINK_EVIDENCE attached"}]}))
 elif args[:2] == ["issue", "show"] and args[2] == "524":
     print(json.dumps({"id": 524, "subissues": [545]}))
 elif args[:2] == ["issue", "show"] and args[2] == "540":
@@ -362,19 +362,201 @@ else:
     chainlink.chmod(0o755)
     monkeypatch.setenv("PATH", f"{bin_dir}:{os.environ.get('PATH', '')}")
 
-    payload = await build_chainlink_board_payload(home)
+    payload = await build_chainlink_board_payload(home, issue=545)
 
     assert payload["available"] is True
     board = next(issue for issue in payload["issues"] if issue["id"] == 545)
     parent = next(issue for issue in payload["issues"] if issue["id"] == 524)
     assert board["status"] == "review"
     assert board["blocked_by"] == [540]
-    assert board["comments"][0]["body"] == "WORKLINK_EVIDENCE attached"
+    assert payload["selected_issue_state"] == "loaded"
+    assert payload["selected_issue"]["comments"][0]["body"] == "WORKLINK_EVIDENCE attached"
     assert board["worklink"]["attempt"] == 2
     assert board["worklink"]["evidence_href"].endswith("state/worklink/evidence/545-2.json")
     assert parent["child_progress"] == {"done": 0, "total": 1}
     assert {"from": 524, "to": 545, "kind": "parent"} in payload["edges"]
     assert {"from": 540, "to": 545, "kind": "blocks"} in payload["edges"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("export_payload", [
+    [], [{"id": 1}], {}, {"version": 1}, {"issues": None},
+    {"issues": {}}, {"issues": [None]}, {"issues": [{"id": 1}, "bad"]},
+])
+async def test_chainlink_board_rejects_invalid_export_envelope(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, export_payload,
+):
+    from mimir import chainlink_board
+
+    calls = []
+
+    async def run(home, args):
+        calls.append(args)
+        return export_payload, None
+
+    monkeypatch.setattr(chainlink_board, "_run_chainlink_json", run)
+    result = await build_chainlink_board_payload(tmp_path)
+    assert result["available"] is False
+    assert result["error"] == "chainlink returned non-list payload"
+    assert result["issues"] == []
+    assert calls == [["export", "--json"]]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("metadata", [{}, {"version": 1, "exported_at": "2026-06-18T03:00:00Z"}])
+async def test_chainlink_board_accepts_empty_export(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, metadata,
+):
+    from mimir import chainlink_board
+
+    async def run(home, args):
+        assert args == ["export", "--json"]
+        return {**metadata, "issues": []}, None
+
+    monkeypatch.setattr(chainlink_board, "_run_chainlink_json", run)
+    result = await build_chainlink_board_payload(tmp_path)
+    assert result["available"] is True
+    assert result["issues"] == []
+    assert result["total_count"] == 0
+
+
+@pytest.mark.asyncio
+async def test_chainlink_board_pages_filter_before_cutoff_and_load_selected(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    from mimir import chainlink_board
+
+    # CLI order puts more than a page of closed history ahead of older work.
+    closed = [
+        {"id": 2000 + i, "title": f"Closed {i}", "status": "closed"}
+        for i in range(300)
+    ]
+    active = [
+        {"id": i, "title": f"Active {i}", "status": "open", "labels": ["old"],
+         "priority": "high" if i == 1168 else "normal"}
+        for i in range(1000, 1300)
+    ]
+    # Match the pinned CLI export record, not the sparse issue-list shape.
+    for item in closed + active:
+        item.setdefault("labels", [])
+        item.setdefault("priority", "normal")
+        item.update({
+            "parent_id": None, "description": "Exported description", "comments": [],
+            "created_at": "2026-06-17T00:00:00Z",
+            "updated_at": "2026-06-18T00:00:00Z",
+            "closed_at": "2026-06-18T00:00:00Z" if item["status"] == "closed" else None,
+        })
+    active[168]["labels"].append("worklink:blocked")
+    active[214]["parent_id"] = 1168
+    calls = []
+    fail_detail = False
+
+    async def run(home, args):
+        assert home == tmp_path
+        calls.append(args)
+        if args == ["export", "--json"]:
+            assert all(not ({"blocked_by", "blocking", "relations"} & item.keys())
+                       for item in closed + active)
+            return {"version": 1, "exported_at": "2026-06-18T03:00:00Z",
+                    "issues": closed + active}, None
+        assert args[:2] == ["issue", "show"]
+        if fail_detail:
+            return None, "temporary CLI failure"
+        issue_id = int(args[2])
+        return {"id": issue_id, "description": "Old selected detail",
+                "blocked_by": [1299] if issue_id in (1168, 1214) else []}, None
+
+    async def request(expected_shows, **kwargs):
+        calls.clear()
+        result = await build_chainlink_board_payload(tmp_path, **kwargs)
+        assert result["available"] is True, result
+        assert calls[0] == ["export", "--json"]
+        shows = [args for args in calls if args[:2] == ["issue", "show"]]
+        assert len(calls) == 1 + expected_shows
+        assert len(shows) == expected_shows
+        assert len({args[2] for args in shows}) == expected_shows
+        return result
+
+    monkeypatch.setattr(chainlink_board, "_run_chainlink_json", run)
+    first = await request(250, show_completed=False)
+    assert first["total_count"] == 300
+    assert first["truncated"] is True
+    assert first["next_offset"] == 250
+    assert len(first["issues"]) == 250
+    blocked = next(item for item in first["issues"] if item["id"] == 1168)
+    assert blocked["labels"] == ["old", "worklink:blocked"]
+    assert blocked["status"] == "blocked"
+    dependency_only = next(item for item in first["issues"] if item["id"] == 1214)
+    assert dependency_only["status"] == "blocked"
+    assert {"from": 1299, "to": 1168, "kind": "blocks"} in first["edges"]
+    assert {"from": 1168, "to": 1214, "kind": "parent"} in first["edges"]
+    assert first["filters"]["labels"] == ["old", "worklink:blocked"]
+    second = await request(50, show_completed=False, offset=250)
+    assert second["next_offset"] is None
+    assert second["truncated"] is True
+    assert second["total_count"] == 300
+    assert {item["id"] for item in first["issues"] + second["issues"]} == {
+        item["id"] for item in active
+    }
+
+    filtered = await request(
+        2, label="old", status="blocked", priority="high", show_completed=False,
+        issue=1299,
+    )
+    assert [item["id"] for item in filtered["issues"]] == [1168]
+    assert filtered["total_count"] == 1
+    assert filtered["truncated"] is False
+    assert filtered["selected_issue"]["id"] == 1299
+    assert filtered["selected_issue"]["description"] == "Old selected detail"
+    assert filtered["selected_issue_state"] == "loaded"
+    # Global blocked filtering uses lifecycle labels, not dependency discovery.
+    lifecycle = await request(1, status="blocked", show_completed=False)
+    assert [item["id"] for item in lifecycle["issues"]] == [1168]
+    in_page = await request(250, show_completed=False, issue=1214)
+    assert in_page["selected_issue_state"] == "loaded"
+    off_page = await request(251, show_completed=False, issue=1299)
+    assert off_page["selected_issue"]["id"] == 1299
+    done = await request(250, status="done", show_completed=False)
+    assert done["total_count"] == 300
+    assert all(item["status"] == "done" for item in done["issues"])
+    empty = await request(0, label="absent", issue=9999)
+    assert empty["issues"] == []
+    assert empty["total_count"] == 0
+    assert empty["truncated"] is False
+    assert empty["selected_issue_state"] == "missing"
+    fail_detail = True
+    unavailable = await request(250, show_completed=False, issue=1214)
+    assert unavailable["selected_issue_state"] == "unavailable"
+    assert unavailable["selected_issue"] is None
+    assert next(item for item in unavailable["issues"] if item["id"] == 1168)["labels"] == ["old", "worklink:blocked"]
+    off_page_failure = await request(251, show_completed=False, issue=1299)
+    assert off_page_failure["selected_issue_state"] == "unavailable"
+
+
+@pytest.mark.asyncio
+async def test_chainlink_board_query_parameters(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    calls = []
+
+    async def build(home, **kwargs):
+        calls.append((home, kwargs))
+        return {"available": True}
+
+    monkeypatch.setattr(web_ui, "build_chainlink_board_payload", build)
+    app = web.Application()
+    web_ui.register_routes(app, turns_log=tmp_path / "turns", events_log=tmp_path / "events", home=tmp_path)
+    async with TestClient(TestServer(app)) as client:
+        response = await client.get(
+            "/api/v1/chainlink-board?offset=250&issue=1214&label=old&status=blocked&priority=high&show_completed=false"
+        )
+        assert response.status == 200
+        assert calls == [(tmp_path, {
+            "offset": 250, "issue": 1214, "label": "old", "status": "blocked",
+            "priority": "high", "show_completed": False,
+        })]
+        for query in ("offset=-1", "offset=abc", "issue=0", "issue=-1", "issue=abc", "show_completed=maybe"):
+            response = await client.get(f"/api/v1/chainlink-board?{query}")
+            assert response.status == 400
+        assert len(calls) == 1
 
 
 @pytest.mark.asyncio

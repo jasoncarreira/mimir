@@ -8,6 +8,31 @@ import {
 } from "./chainlinkBoardViewModel";
 
 describe("chainlink board view-model", () => {
+  it("keeps selected detail separate from page summaries and retains pagination", () => {
+    const board = safeChainlinkBoardData({
+      issues: [{ id: 251 }], total_count: 501, offset: 250, next_offset: 500, truncated: true,
+      selected_issue: { id: 1, description: "Full detail", comments: [{ body: "Comment" }] },
+      selected_issue_state: "loaded"
+    });
+    expect(board.offset).toBe(250);
+    expect(board.next_offset).toBe(500);
+    expect(board.total_count).toBe(501);
+    expect(board.selected_issue?.description).toBe("Full detail");
+    expect(board.selected_issue?.comments[0].body).toBe("Comment");
+    expect(board.issues.map((issue) => issue.id)).toEqual([251]);
+  });
+
+  it("does not classify absent blockers as resolved on partial pages", () => {
+    const board = safeChainlinkBoardData({ issues: [
+      { id: 1, blocked_by: [999], blocking: [2] },
+      { id: 2, blocked_by: [1] }
+    ] });
+    const dependencies = partitionDependencies(board.issues);
+    expect(dependencies.ready).toEqual([]);
+    expect(dependencies.blocked[0].unknownBlockerIds).toEqual([999]);
+    expect(dependencies.blocked[1].blockers.map((issue) => issue.id)).toEqual([1]);
+  });
+
   it("normalizes board payloads and derives lifecycle columns", () => {
     const board = safeChainlinkBoardData({
       available: true,

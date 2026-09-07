@@ -1636,8 +1636,22 @@ def register_routes(
             return json_error("run_not_found", f"factory run not found: {run_id}", status=404)
         return json_success(_serialize_factory_run_detail(record))
 
-    async def chainlink_board_data_v1(_request: web.Request) -> web.Response:
-        payload = await build_chainlink_board_payload(home)
+    async def chainlink_board_data_v1(request: web.Request) -> web.Response:
+        try:
+            offset = int(request.query.get("offset", "0"))
+            issue = int(request.query["issue"]) if "issue" in request.query else None
+            completed = request.query.get("show_completed", "true")
+            if offset < 0 or (issue is not None and issue <= 0) or completed not in {"true", "false"}:
+                raise ValueError("invalid pagination or selection")
+        except ValueError:
+            return json_error("invalid_board_query", "Use a nonnegative offset, positive issue, and boolean show_completed", status=400)
+        payload = await build_chainlink_board_payload(
+            home, offset=offset, issue=issue,
+            label=request.query.get("label", ""),
+            status=request.query.get("status", ""),
+            priority=request.query.get("priority", ""),
+            show_completed=completed == "true",
+        )
         return json_success(payload)
 
     async def chainlink_board_artifact_v1(request: web.Request) -> web.StreamResponse:
