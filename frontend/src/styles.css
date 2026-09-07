@@ -331,6 +331,8 @@ textarea {
 
 .ui-table {
   width: 100%;
+  /* Keep panel wrapping from squeezing columns; the wrapper owns scrolling. */
+  min-width: max-content;
   border-collapse: collapse;
 }
 

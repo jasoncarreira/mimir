@@ -28,6 +28,19 @@ describe.each(skins)("%s narrow-pane stylesheet contract", (skin) => {
   const manifest = readFileSync(new URL(`./skins/${skin}.ts`, import.meta.url), "utf8");
   const sidebar = manifest.includes('layout: "sidebar"');
 
+  it.each([390, 600, 900, 1512])("scrolls wide tables without disabling panel wrapping at %ipx", (viewport) => {
+    const padding = viewport <= 640 ? 16 : 32;
+    const pane = viewport - (sidebar && viewport > 900 ? 280 : 0) - padding * 2;
+    const css = (selector: string) => declarations(selector, viewport, pane);
+
+    expect(css(".ui-panel")).toMatchObject({ "min-width": "0", "overflow-wrap": "anywhere" });
+    expect(css(".ops-panel-stack")["grid-template-columns"]).toBe("minmax(0, 1fr)");
+    expect(css(".ui-table-wrap")).toMatchObject({
+      "min-width": "0", "max-width": "100%", "overflow-x": "auto"
+    });
+    expect(css(".ui-table")).toMatchObject({ width: "100%", "min-width": "max-content" });
+  });
+
   it.each([390, 652, 768, 1153])("keeps shell and controls shrinkable at %ipx", (viewport) => {
     const padding = viewport <= 640 ? 16 : 32;
     const pane = viewport - (sidebar && viewport > 900 ? 280 : 0) - padding * 2;
