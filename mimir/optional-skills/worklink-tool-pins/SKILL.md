@@ -56,8 +56,10 @@ auto-closed because cleanup requires an operator disposition decision.
 ```bash
 cp -r mimir/optional-skills/worklink-tool-pins <home>/skills/
 # Ensure MIMIR_HOME points at the home containing worklink.yaml.
-reload_pollers
 ```
+
+Operator/admin turns only: an interactive admin with the `reload_pollers`
+tool available may call it after installation to register the poller.
 
 The shipped cadence is weekly Sunday 08:00 UTC with low priority so it
 is shed before interactive or high-value pollers under resource pressure.

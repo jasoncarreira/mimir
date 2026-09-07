@@ -47,11 +47,11 @@ Vulnerabilities).
    - `ROOT_DIR` — path to the repository to scan (default: current working directory)
    - `OSV_SCANNER` — path to osv-scanner binary (default: `osv-scanner` from PATH)
 
-4. **Bring it live:**
-   ```bash
-   reload_pollers
-   # → "reload_pollers ok: N poller(s) registered — dependency-advisory-watch, ..."
-   ```
+4. **Bring it live:** arrange an operator-managed reload or restart.
+
+Operator/admin turns only: an interactive admin with the `reload_pollers`
+tool available may call it and verify that `dependency-advisory-watch`
+appears in the registered list.
 
 ## Cadence
 

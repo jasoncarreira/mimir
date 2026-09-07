@@ -1,6 +1,6 @@
 ---
 name: gmail-poller
-description: "Watch a Gmail inbox for new messages via the `gog` Google Workspace CLI — emits one turn per new message ID since the last poll. Cursor is a SET of message IDs (not a timestamp), so reordered or backdated deliveries don't double-emit. Opt-in: copy this directory into `<home>/skills/gmail-poller/`, install `gog`, run the OAuth setup once, set `GOG_ACCOUNT`, then `reload_pollers`. Companion to the `pollers` framework skill and the `world-scanning` skill (catalog of what's worth polling). For a sender-allowlist / label-filter, use a Gmail search query in `MIMIR_GMAIL_QUERY` — the Gmail search language IS the filter mechanism, this poller doesn't reimplement it."
+description: "Watch a Gmail inbox for new messages via the `gog` Google Workspace CLI — emits one turn per new message ID since the last poll. Cursor is a SET of message IDs (not a timestamp), so reordered or backdated deliveries don't double-emit. Opt-in: copy this directory into `<home>/skills/gmail-poller/`, install `gog`, run the OAuth setup once, set `GOG_ACCOUNT`, then arrange an operator-managed reload or restart. Companion to the `pollers` framework skill and the `world-scanning` skill (catalog of what's worth polling). For a sender-allowlist / label-filter, use a Gmail search query in `MIMIR_GMAIL_QUERY` — the Gmail search language IS the filter mechanism, this poller doesn't reimplement it."
 ---
 
 # gmail-poller — watch a Gmail inbox
@@ -102,16 +102,15 @@ won't watch a Gmail inbox, so the framework doesn't seed it by default.
    be stripped by the env filter — explicit `pass_env` bypasses both
    gates.
 
-5. **Bring it live:**
-
-   ```
-   reload_pollers
-   # → "reload_pollers ok: N poller(s) registered — ..., gmail-inbox, ..."
-   ```
+5. **Bring it live:** arrange an operator-managed reload or restart.
 
    The cron starts immediately. First successful run cursors the IDs
    it returned without emitting events for them (no — see "First-run
    behavior" below for the actual policy and why it differs).
+
+Operator/admin turns only: an interactive admin with the `reload_pollers`
+tool available may call it and verify that `gmail-inbox` appears in the
+registered list.
 
 ## What it emits
 
@@ -163,7 +162,7 @@ storm on install, either:
   before the first run, then loosen after the cursor catches up
 - Pre-seed the cursor manually: write a JSON array of message IDs
   to `<home>/state/pollers/gmail-inbox/cursor.json` before
-  `reload_pollers`
+  poller startup or reload
 
 ## Filter via Gmail search, not env-var allowlists
 
