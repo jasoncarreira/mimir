@@ -35,7 +35,7 @@ to inspect them depending on the file type.
 Check the extension:
 - **Images:** `.png`, `.jpg`, `.jpeg`, `.gif`, `.webp`, `.svg`, `.bmp`
 - **Text/code:** `.txt`, `.md`, `.py`, `.js`, `.json`, `.csv`, `.log`, `.yaml`, `.toml`
-- **Documents:** `.pdf`
+- **Documents:** `.pdf`, `.docx`, `.xlsx`, `.pptx`
 - **Other:** anything else
 
 ## Step 2: Choose a Viewing Strategy
@@ -91,10 +91,26 @@ convert state/attachments/12345-image.png -format '%[pixel:p{100,100}]' info: 2>
 ```
 
 ### For PDFs
+Use `pdftotext` only for PDFs, never for Office documents.
 ```bash
 # Extract text
 pdftotext state/attachments/12345-document.pdf - 2>/dev/null
 ```
+
+### For Office Documents
+
+`read_file` reports these as binary, zip-based Office documents. For `.docx`,
+use `shell_exec` with Python's stdlib `zipfile` to read `word/document.xml` and
+strip XML tags. No new dependency is needed:
+
+```bash
+python -c 'import html,re,sys,zipfile; z=zipfile.ZipFile(sys.argv[1]); xml=z.read("word/document.xml").decode("utf-8"); print(html.unescape(re.sub("<[^>]+>", " ", xml)))' state/attachments/12345-document.docx
+```
+
+This extracts main-body text, not layout, images, headers, or footnotes. For
+`.xlsx` and `.pptx`, there is no extractor on this deployment. Ask for a text
+export (or CSV for spreadsheets). Do not suggest `pdftotext`, install new
+dependencies, or probe for LibreOffice as an Office extraction path.
 
 ## Step 3: Be Honest About Limitations
 

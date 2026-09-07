@@ -23,6 +23,7 @@ mutator methods added by deepagents (``delete_file``, ``rename``,
 from __future__ import annotations
 
 import asyncio
+import codecs
 import errno
 import json
 import logging
@@ -39,6 +40,11 @@ from typing import Annotated, Any, Literal
 
 from deepagents.backends import FilesystemBackend
 from deepagents.backends.composite import CompositeBackend
+# Optional upstream internals: dependency bumps must not prevent agent startup.
+try:
+    from deepagents.backends.filesystem import _get_backend_read_file_type
+except ImportError:
+    _get_backend_read_file_type = None
 from deepagents.backends.protocol import (
     EditResult,
     FileUploadResponse,
@@ -106,6 +112,88 @@ _UNSAFE_COMPONENT_ERROR = (
 _OS_OPEN = os.open
 _OS_MKDIR = os.mkdir
 _OS_STAT = os.stat
+_TEXT_PROBE_BYTES = 4096
+# Fallback only when deepagents renames its optional private classifier. Keep
+# native image/audio/video handling upstream; PDF deliberately uses our probe.
+_NATIVE_MEDIA_SUFFIXES = frozenset({
+    ".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".svg", ".ico",
+    ".tif", ".tiff", ".avif", ".heic", ".heif",
+    ".mp3", ".wav", ".ogg", ".flac", ".aac", ".m4a", ".aiff", ".opus",
+    ".mp4", ".mpeg", ".mpg", ".mov", ".avi", ".webm", ".mkv", ".wmv",
+})
+
+
+def _is_native_media(file_path: str) -> bool:
+    if _get_backend_read_file_type is not None:
+        return _get_backend_read_file_type(file_path) in {"image", "audio", "video"}
+    return Path(file_path).suffix.lower() in _NATIVE_MEDIA_SUFFIXES
+
+
+def _read_decoded_text(content: str, offset: int, limit: int) -> ReadResult:
+    """Format exceptional decoded text without depending on upstream internals."""
+    if not content.strip():
+        return ReadResult(file_data={
+            "content": "System reminder: File exists but has empty contents",
+            "encoding": "utf-8",
+        })
+    lines = content.splitlines(keepends=True)
+    if offset >= len(lines):
+        return ReadResult(error=f"Line offset {offset} exceeds file length ({len(lines)} lines)")
+    end = min(offset + limit, len(lines))
+    return ReadResult(
+        file_data={"content": "".join(lines[offset:end]), "encoding": "utf-8"},
+        total_lines=len(lines), start_line=offset + 1, end_line=end,
+        next_offset=end if end < len(lines) else None,
+    )
+
+
+def _read_probed_text(handle, suffix: str) -> tuple[str | None, bytes]:
+    """Share bounded classification and byte loading between read and grep."""
+    size = os.fstat(handle.fileno()).st_size
+    probe = handle.read(_TEXT_PROBE_BYTES)
+    error = _probe_text_file(probe, suffix, size)
+    return (error, b"") if error else (None, probe + handle.read())
+
+
+_BINARY_READ_HINTS = {
+    ".pdf": ("PDF", "Use shell_exec with pdftotext on the PDF to extract text."),
+    ".docx": (
+        "zip-based Office document (DOCX)",
+        "Use shell_exec with python -c and stdlib zipfile to read word/document.xml "
+        "from the zip and strip XML tags (see view-attachment). No new dependency is needed.",
+    ),
+    ".xlsx": (
+        "zip-based Office document (XLSX)",
+        "No extractor on this deployment. Ask for a text or CSV export.",
+    ),
+    ".pptx": (
+        "zip-based Office document (PPTX)",
+        "No extractor on this deployment. Ask for a text export.",
+    ),
+}
+
+
+def _probe_text_file(probe: bytes, suffix: str, size: int) -> str | None:
+    """Classify only a bounded prefix; never decompress an archive to identify it."""
+    kind_hint = _BINARY_READ_HINTS.get(suffix)
+    if kind_hint is None and probe.startswith(b"%PDF-"):
+        kind_hint = _BINARY_READ_HINTS[".pdf"]
+    binary = b"\x00" in probe or probe.startswith(b"PK\x03\x04")
+    try:
+        # A multibyte character split at the probe boundary is not invalid UTF-8.
+        codecs.getincrementaldecoder("utf-8-sig")().decode(probe, final=size <= len(probe))
+    except UnicodeDecodeError:
+        # Latin-1 prose is text-like; control bytes distinguish opaque payloads.
+        binary = binary or any(
+            not char.isprintable() and char not in "\t\n\r\f"
+            for char in probe.decode("latin-1")
+        )
+    if kind_hint is None and not binary:
+        return None
+    kind, hint = kind_hint or (
+        "binary", "No text extractor is available for this format. Ask for a text export.",
+    )
+    return f"Binary file: kind={kind}; size={size} bytes. Next step: {hint}"
 
 
 class _WriteCollision(str):
@@ -629,6 +717,41 @@ class _BoundedFilesystemBackend(FilesystemBackend):
                 on_withheld(reason)
         return reason is not None
 
+    def read(self, file_path: str, offset: int = 0, limit: int = 2000) -> ReadResult:
+        # Preserve native multimodal payloads, but PDFs now use the extraction hint.
+        if _is_native_media(file_path):
+            return super().read(file_path, offset, limit)
+        try:
+            resolved = self._resolve_path(file_path)
+            if not resolved.is_file():
+                return ReadResult(error=f"File '{file_path}' not found")
+            fd = os.open(resolved, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+            with os.fdopen(fd, "rb") as handle:
+                error, raw = _read_probed_text(handle, resolved.suffix.lower())
+                if error is not None:
+                    return ReadResult(error=error)
+            notice = ""
+            try:
+                content = raw.decode("utf-8")
+            except UnicodeDecodeError:
+                content = raw.decode("utf-8-sig", errors="replace")
+                notice = "\n\n[Decoded as UTF-8 with replacement for non-UTF-8 text bytes.]"
+            else:
+                if not raw.startswith(codecs.BOM_UTF8):
+                    # Normal UTF-8 stays on the upstream reader, including its
+                    # empty-file, offset/limit and response metadata behaviour.
+                    return super().read(file_path, offset, limit)
+                content = content.removeprefix("\ufeff")
+            # Only BOM/replacement text uses our compatibility path. It mirrors
+            # upstream universal newlines, empty-content warnings and line slicing.
+            content = content.replace("\r\n", "\n").replace("\r", "\n")
+            result = _read_decoded_text(content, offset, limit)
+            if notice and result.file_data is not None:
+                result.file_data["content"] += notice
+            return result
+        except (OSError, RuntimeError) as exc:
+            return ReadResult(error=f"Error reading file '{file_path}': {exc}")
+
     def _walk_files(
         self,
         root: Path,
@@ -854,7 +977,11 @@ class _BoundedFilesystemBackend(FilesystemBackend):
             except (OSError, RuntimeError):
                 continue
             try:
-                content = fp.read_text()
+                with fp.open("rb") as handle:
+                    error, raw = _read_probed_text(handle, fp.suffix.lower())
+                    if error:
+                        continue
+                    content = raw.decode("utf-8-sig", errors="replace")
             except (UnicodeDecodeError, PermissionError, OSError, RuntimeError):
                 continue
             from .read_policy import non_admin_read_filter_enabled, protected_read_result_reason
