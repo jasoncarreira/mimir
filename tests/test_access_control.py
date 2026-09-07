@@ -7247,9 +7247,9 @@ def test_repo_review_local_inspection_requires_existing_absolute_string_root(
     probes = []
     real_probe = access_control._maintenance_git_filter_overrides
 
-    def probe(*args):
+    def probe(*args, **kwargs):
         probes.append(args)
-        return real_probe(*args)
+        return real_probe(*args, **kwargs)
 
     monkeypatch.setattr(access_control, "_maintenance_git_filter_overrides", probe)
     state = SimpleNamespace(action_scope=repo_review_state.action_scope, root=roots[root_kind])
@@ -7304,6 +7304,36 @@ def test_repo_review_root_resolution_errors_fail_closed(
     assert argv is None
     assert rule is ServiceShellBindingRule.PROFILE_ALLOWLIST
     assert "hardened local read-only Git inspection" in reason
+
+
+@pytest.mark.parametrize("command", [
+    "gh status", "git", "git -C", "git -C /tmp",
+    "git status file.py", "git status --", "git status --verbose",
+    "git log --output=/tmp/review-output",
+])
+def test_repo_review_rejects_malformed_or_unsafe_inspection_argv(
+    command: str, repo_review_state: RepoReviewState,
+) -> None:
+    assert parse_service_shell_argv("git status", "repo_review", review_state=repo_review_state)
+    assert parse_service_shell_argv(command, "repo_review", review_state=repo_review_state) is None
+
+
+@pytest.mark.parametrize("failure", ["pin", "filter"])
+def test_repo_review_inspection_pin_and_filter_failures_close_binding(
+    failure: str, repo_review_state: RepoReviewState, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    assert parse_service_shell_argv("git status", "repo_review", review_state=repo_review_state)
+    if failure == "pin":
+        monkeypatch.delitem(access_control._MAINTENANCE_PINNED_EXECUTABLES, "git")
+    else:
+        subprocess.run([
+            "git", "-C", repo_review_state.root, "config", "filter.bad.name.clean", "cat",
+        ], check=True)
+    argv, reason, rule = access_control.parse_service_shell_argv_with_diagnostics(
+        "git status", "repo_review", review_state=repo_review_state,
+    )
+    assert argv is None
+    assert rule is ServiceShellBindingRule.PROFILE_ALLOWLIST
 
 
 def test_repo_review_git_deliberately_excludes_ls_remote() -> None:
