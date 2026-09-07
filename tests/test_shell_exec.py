@@ -15,6 +15,7 @@ silently revert to the shlex+shell=False path that broke it.
 """
 from __future__ import annotations
 
+import errno
 import json
 import os
 import subprocess
@@ -189,6 +190,59 @@ def test_shell_exec_accepts_explicit_cwd(tmp_path):
     assert str(target) in result
 
 
+@pytest.mark.parametrize("kind", ["missing", "file"])
+@pytest.mark.parametrize("direct", [False, True])
+def test_shell_exec_invalid_cwd_reports_directory_error(tmp_path, kind, direct):
+    target = tmp_path / "private-cwd"
+    if kind == "file":
+        target.write_text("not a directory")
+    args = {"command": "pwd", "cwd": str(target)}
+    if direct:
+        args["mimir_direct_argv"] = [sys.executable, "-c", "import os; print(os.getcwd())"]
+
+    result = shell_exec.invoke(args)
+
+    reason = "not found" if kind == "missing" else "not a directory"
+    assert result == f"shell_exec failed: working directory {reason}"
+    assert str(target) not in result
+
+
+def test_shell_exec_missing_direct_executable(tmp_path):
+    result = shell_exec.invoke({
+        "command": "missing-tool",
+        "cwd": str(tmp_path),
+        "mimir_direct_argv": [str(tmp_path / "private-missing-tool")],
+    })
+
+    assert result == "shell_exec failed: executable could not be started (file not found)"
+
+
+def test_shell_exec_valid_direct_executable_and_cwd(tmp_path):
+    result = shell_exec.invoke({
+        "command": "pwd",
+        "cwd": str(tmp_path),
+        "mimir_direct_argv": [sys.executable, "-c", "import os; print(os.getcwd())"],
+    })
+
+    assert result == f"exit=0\n\nstdout:\n{tmp_path}\n"
+
+
+@pytest.mark.parametrize("filename", [None, "private-unrelated-path", "same-target"])
+@pytest.mark.parametrize("error_type", [FileNotFoundError, NotADirectoryError])
+def test_shell_exec_ambiguous_launch_error_is_redacted(monkeypatch, filename, error_type):
+    def fail(*args, **kwargs):
+        code = errno.ENOENT if error_type is FileNotFoundError else errno.ENOTDIR
+        raise error_type(code, "private exception detail", filename)
+
+    monkeypatch.setattr(extra.subprocess, "run", fail)
+    result = shell_exec.invoke({
+        "command": "pwd", "cwd": "same-target",
+        "mimir_direct_argv": ["same-target"],
+    })
+
+    assert result == "shell_exec failed: process could not be started (check working directory and executable)"
+
+
 def test_shell_exec_standalone_cd_persists_for_later_calls(tmp_path):
     """A successful standalone cd updates the cwd used by later shell calls."""
     target = tmp_path / "workspace"
@@ -249,6 +303,10 @@ def test_authorized_direct_argv_never_inherits_session_cwd(tmp_path, monkeypatch
         return SimpleNamespace(returncode=0, stdout=b"", stderr=b"")
 
     monkeypatch.setattr(extra.subprocess, "run", _run)
+    monkeypatch.setattr(
+        extra, "_run_bounded_project_test",
+        lambda *args, **kwargs: pytest.fail("unconfigured command used project-test runner"),
+    )
     with _shell_session("channel-a"):
         result = shell_exec.invoke({
             "command": "git status --short",

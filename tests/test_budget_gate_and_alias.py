@@ -5724,6 +5724,41 @@ async def test_middleware_records_raised_returned_and_typed_failures(
 
 
 @pytest.mark.asyncio
+async def test_shell_exec_missing_authorized_cwd_returns_directory_error(tmp_path):
+    from mimir.tools.extra import shell_exec
+
+    missing = tmp_path / "private-nonexistent-cwd"
+    handled = False
+
+    async def handler(req: ToolCallRequest) -> ToolMessage:
+        nonlocal handled
+        handled = True
+        return ToolMessage(
+            content=shell_exec.invoke(req.tool_call["args"]),
+            tool_call_id=req.tool_call["id"],
+            name=req.tool_call["name"],
+        )
+
+    token = set_current_turn(_make_ctx(budget=5))
+    try:
+        out = await BudgetGateMiddleware().awrap_tool_call(
+            _make_request(
+                "shell_exec", "missing-cwd",
+                args={"command": "pwd", "cwd": str(missing)},
+            ),
+            handler,
+        )
+    finally:
+        reset_current_turn(token)
+
+    assert handled, out
+    assert isinstance(out, ToolMessage)
+    assert out.tool_call_id == "missing-cwd"
+    assert out.content == "shell_exec failed: working directory not found"
+    assert str(missing) not in out.content
+
+
+@pytest.mark.asyncio
 async def test_shell_exec_timeout_event_contains_redacted_bounded_command(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
