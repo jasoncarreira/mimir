@@ -787,7 +787,7 @@ def build_trigger_service_principal(
     repo_roots = tuple(root.resolve() for root in _configured_repo_roots())
     fetch_cache_roots = (
         (Path(home) / "attachments" / "fetch-cache",)
-        if is_github_activity and home
+        if "fetch_url" in capability_set and home
         else ()
     )
     service_work_roots = (
@@ -840,9 +840,15 @@ def build_trigger_service_principal(
             policies.append(ServiceSinkPolicy(operation, "worklink_repo", "WORKLINK_REPO/MIMIR_WORKLINK_REPO"))
         elif operation == "fetch_url":
             fetch_policy = _FETCH_URL_POLICY_BY_AUTHORITY_PROFILE.get(profile)
-            if profile == "research" and approved_urls:
+            if profile in {"research", "github"} and approved_urls:
+                # GitHub API directory approvals (e.g. /repos/) cover descendants;
+                # research non-root URLs retain their existing exact semantics.
                 fetch_policy = ("approved_urls", json.dumps([
-                    url + "*" if urlsplit(url).path == "/" and not urlsplit(url).query else url
+                    url + "*" if (
+                        (urlsplit(url).path == "/" or (
+                            profile == "github" and urlsplit(url).path.endswith("/")
+                        )) and not urlsplit(url).query
+                    ) else url
                     for url in approved_urls
                 ]))
             if fetch_policy is not None:
@@ -9137,6 +9143,14 @@ class ToolRegistry:
                         service_allowed
                         and not targets_memory
                         and not targets_scratch
+                        # Attachment access follows scoped roots, not a generic
+                        # read capability (inbound uploads belong to channels).
+                        and not (
+                            home and resolved_target_path is not None
+                            and resolved_target_path.is_relative_to(
+                                Path(home).resolve() / "attachments"
+                            )
+                        )
                         and not (
                             service_principal.canonical == "system"
                             and service_principal.trigger == "upgrade"

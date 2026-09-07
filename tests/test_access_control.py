@@ -5794,7 +5794,9 @@ def test_research_builder_binds_approved_urls_without_widening_other_authority(
     ]
     assert tuple(p for p in service.sink_policies if p.operation != "fetch_url") == baseline.sink_policies
     assert service.capability_tier is baseline.capability_tier
-    assert service.filesystem_read_roots == baseline.filesystem_read_roots
+    assert set(service.filesystem_read_roots) == {
+        *baseline.filesystem_read_roots, str(tmp_path / "attachments" / "fetch-cache"),
+    }
     assert "fetch_url" in access_control.TRIGGER_AUTHORITY_PROFILES["research"]
     assert "fetch_url" in access_control.BOUNDED_PROFILE_CAPABILITIES["research"]
     registry = ToolRegistry()
@@ -5822,6 +5824,57 @@ def test_literal_approved_url_scope_requires_host_equality(target: str) -> None:
         "https://arxiv.org/pdf/2608.17050", destination,
     )
     assert not access_control._target_matches_approved_url(target, destination)
+
+
+@pytest.mark.parametrize("canonical", ["poller:github-ci-watch", "poller:github-activity"])
+@pytest.mark.parametrize("fetch", [False, True])
+def test_github_fetch_cache_read_follows_capability(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, canonical: str, fetch: bool,
+) -> None:
+    import hashlib
+
+    monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
+    monkeypatch.setattr(access_control, "_configured_repo_roots", lambda: ())
+    url = "https://api.github.com/repos/o/r/actions/jobs/123/logs"
+    cache = tmp_path / "attachments" / "fetch-cache"
+    cache.mkdir(parents=True)
+    log = cache / f"{hashlib.sha256(url.encode()).hexdigest()[:12]}-123.bin"
+    log.write_text("failed job\n")
+    log.with_name(log.name + ".meta.json").write_text(json.dumps({
+        "url": url, "file_path": "/" + str(log.relative_to(tmp_path)),
+    }))
+    service = build_trigger_service_principal(
+        canonical=canonical, trigger="poller", profile="github",
+        tier=CapabilityTier.CODE_EXECUTION,
+        capabilities=("read_file", "grep", *(("fetch_url",) if fetch else ())),
+        approved_urls=("https://api.github.com/repos/", "https://github.com/"),
+        creation_path="test",
+    )
+    assert (str(cache) in service.filesystem_read_roots) is fetch
+    auth = _service_auth(service, InformationFlowLabels())
+    registry = ToolRegistry()
+    for operation, arguments in (
+        ("read_file", {"file_path": str(log)}),
+        ("grep", {"path": str(log), "pattern": "failed"}),
+    ):
+        decision = registry.authorize_tool(operation, auth, enforce=True, arguments=arguments)
+        assert decision.allowed is fetch, decision.reason
+        if not fetch:
+            assert decision.reason == "read_scope"
+        else:
+            labels = classify_protected_result(operation, arguments, auth, decision)
+            assert labels is not None
+            assert labels.has_untrusted_active_ingest
+            assert {source.integrity for source in labels.sources} == {"untrusted"}
+    for relative in ("attachments/inbound/upload.txt", "attachments/other/log.txt", "attachments/loose.txt"):
+        outside = tmp_path / relative
+        outside.parent.mkdir(parents=True, exist_ok=True)
+        outside.write_text("private\n")
+        decision = registry.authorize_tool(
+            "read_file", auth, enforce=True, arguments={"file_path": str(outside)},
+        )
+        assert not decision.allowed
+        assert decision.reason == "read_scope"
 
 
 def test_existing_fetch_profile_policies_are_unchanged(tmp_path: Path) -> None:

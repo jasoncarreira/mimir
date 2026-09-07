@@ -476,9 +476,9 @@ def test_malformed_approved_urls_rejects_poller_with_named_error(
     )
 
 
-@pytest.mark.parametrize("profile", ["github", "custom", "heartbeat", "session-boundary"])
+@pytest.mark.parametrize("profile", ["custom", "heartbeat", "session-boundary"])
 @pytest.mark.parametrize("approved_urls", [[], ["https://arxiv.org/"]])
-def test_approved_urls_is_research_profile_only(
+def test_approved_urls_requires_supported_profile(
     tmp_path: Path, profile: str, approved_urls: list[str],
 ) -> None:
     with pytest.raises(ValueError, match="approved_urls"):
@@ -488,6 +488,52 @@ def test_approved_urls_is_research_profile_only(
             name="research", persist_dir=tmp_path, state_root=None,
             manifest_path=tmp_path / "pollers.json",
         )
+
+
+@pytest.mark.parametrize("url", [
+    "https://evil.example/", "https://api.github.com.evil.example/repos/",
+    "https://raw.githubusercontent.com/",
+])
+def test_github_approved_urls_rejects_other_hosts_with_named_error(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture, url: str,
+) -> None:
+    skills = tmp_path / "skills"
+    _write_pollers_json(skills / "github-ci-watch", [{
+        "name": "github-ci-watch", "command": "true", "cron": "* * * * *",
+        "authority": _authority(profile="github", capabilities=["fetch_url"], approved_urls=[url]),
+    }])
+    assert discover_pollers(skills, state_root=tmp_path / "state" / "pollers") == []
+    assert "github-ci-watch" in caplog.text
+    assert "approved_urls requires a GitHub host" in caplog.text
+
+
+def test_ci_watch_shipped_manifest_authorizes_only_approved_urls(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
+    manifest = Path(__file__).parents[1] / "mimir/optional-skills/github-ci-watch/pollers.json"
+    raw = json.loads(manifest.read_text())["pollers"][0]
+    service = _parse_poller_authority(
+        raw["authority"], name=raw["name"], persist_dir=tmp_path,
+        state_root=None, manifest_path=manifest,
+    )
+    auth = create_auth_context(AgentEvent(
+        trigger="poller", channel_id="poller:github-ci-watch",
+        service_principal=service.canonical, service_authority=service,
+    ), enforce=True, ifc_labels=InformationFlowLabels())
+    for target, expected in (
+        ("https://api.github.com/repos/o/r/actions/runs/123/jobs", True),
+        ("https://api.github.com/repos/o/r/actions/jobs/456/logs", True),
+        ("https://github.com/o/r/actions/runs/123", True),
+        ("https://unapproved.example/repos/o/r/actions/jobs/456/logs", False),
+        ("https://api.github.com.evil.example/repos/o/r/actions/jobs/456/logs", False),
+        ("https://api.github.com/user", False),
+        ("https://api.github.com/repos-other/o/r", False),
+    ):
+        decision = ToolRegistry().authorize_tool("fetch_url", auth, enforce=True, target_channel=target)
+        assert decision.allowed is expected, decision.reason
+        if not expected:
+            assert decision.reason == "egress_destination_not_approved"
 
 
 def test_research_poller_builds_with_skill_learning_only(tmp_path: Path) -> None:
