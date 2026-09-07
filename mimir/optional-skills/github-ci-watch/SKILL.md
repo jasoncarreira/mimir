@@ -53,7 +53,13 @@ each job log. GitHub requires authentication for job logs even on public repos;
 `gh` follows the download redirect without granting the model a blob-host URL or
 passing credentials to `fetch_url`.
 
-The poller stores the last **32 KiB** of each log as UTF-8 under
+Job-log downloads pass `gh api --allow-escape-sequences`: GitHub Actions logs
+contain ANSI escapes which current gh versions otherwise refuse to output.
+Before saving, the poller strips CSI/OSC terminal sequences and stray ESC/C0
+controls (preserving newline/tab), then applies the byte cap. Escape-sequence
+refusals are reported explicitly if they recur; raw stderr is not put in prompts.
+
+The poller stores the last **32 KiB** of each sanitized log as UTF-8 under
 `$STATE_DIR/logs/<run_id>-<job_id>.log`, within its declared `state` read root.
 The prompt names the failing job, failed steps (when GitHub reports them), and
 saved path. Use `read_file` on that exact path before diagnosing the failure.

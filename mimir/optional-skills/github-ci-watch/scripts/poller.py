@@ -120,6 +120,58 @@ def _enrichment_timeout() -> float:
     return max(0.0, min(15.0, _ENRICHMENT_DEADLINE - time.monotonic()))
 
 
+def _clean_log_tail(output) -> bytes:
+    """Strip terminal controls before capping, with state across read boundaries.
+
+    Scan from the start so even an OSC spanning the retained tail cannot leak
+    its payload. Memory stays bounded independently of log/escape-string size.
+    """
+    output.seek(0)
+    tail = bytearray()
+    state = "text"
+    while chunk := output.read(64 * 1024):
+        clean = bytearray()
+        for byte in chunk:
+            if state == "string":
+                if byte == 7:
+                    state = "text"
+                elif byte == 27:
+                    state = "string_escape"
+            elif state == "string_escape":
+                if byte in (92, 7):  # ST (ESC backslash) or BEL
+                    state = "text"
+                elif byte != 27:
+                    state = "string"
+            elif state == "csi":
+                if 0x40 <= byte <= 0x7e:
+                    state = "text"
+                elif byte == 27:
+                    state = "escape"
+            elif state == "escape":
+                if byte == 91:
+                    state = "csi"
+                elif byte in (93, 80, 88, 94, 95):  # OSC/DCS/SOS/PM/APC
+                    state = "string"
+                elif 0x20 <= byte <= 0x2f:
+                    state = "escape_intermediate"
+                else:
+                    state = "escape" if byte == 27 else "text"
+                    if byte in (9, 10) or byte >= 0x80:
+                        clean.append(byte)
+            elif state == "escape_intermediate":
+                if 0x30 <= byte <= 0x7e:
+                    state = "text"
+                elif byte == 27:
+                    state = "escape"
+            elif byte == 27:
+                state = "escape"
+            elif byte in (9, 10) or (byte >= 0x20 and byte != 0x7f):
+                clean.append(byte)
+        tail.extend(clean)
+        del tail[:-LOG_EXCERPT_BYTES]
+    return bytes(tail)
+
+
 def _job_log(repo: str, run_id: int, job_id: int) -> tuple[Path | None, str]:
     """Use authenticated gh (including its redirect handling), never model fetch_url.
 
@@ -137,18 +189,19 @@ def _job_log(repo: str, run_id: int, job_id: int) -> tuple[Path | None, str]:
         logs.mkdir(parents=True, exist_ok=True)
         with tempfile.TemporaryFile(dir=logs) as output:
             result = subprocess.run(
-                ["gh", "api", f"repos/{repo}/actions/jobs/{job_id}/logs"],
+                ["gh", "api", "--allow-escape-sequences", f"repos/{repo}/actions/jobs/{job_id}/logs"],
                 stdout=output, stderr=subprocess.PIPE, timeout=timeout, env=env,
             )
             if result.returncode:
-                status = re.search(rb"HTTP\s+(\d{3})", result.stderr or b"")
+                stderr = result.stderr or b""
+                if b"escape sequences" in stderr or b"--allow-escape-sequences" in stderr:
+                    return None, "HTTP status unavailable (gh escape-sequence refusal)"
+                status = re.search(rb"HTTP\s+(\d{3})", stderr)
                 return None, (
                     f"HTTP {status[1].decode()}" if status
                     else "HTTP status unavailable (gh failed)"
                 )
-            size = output.seek(0, os.SEEK_END)
-            output.seek(max(0, size - LOG_EXCERPT_BYTES))
-            excerpt = output.read(LOG_EXCERPT_BYTES)
+            excerpt = _clean_log_tail(output)
         if not excerpt:
             return None, "HTTP status unavailable (empty log response)"
         path = logs / f"{run_id}-{job_id}.log"
