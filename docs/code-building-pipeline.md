@@ -327,13 +327,31 @@ general issue/PR close, reopen, merge, and label changes.
 
 The poller emits an agent turn for actionable activity; it does not
 deterministically approve or merge. A new PR, PR push, or review request carries
-a rule requiring the turn to submit its review through the typed review tool or
-`gh pr review`, rather than only writing review prose in chat. Turn finalization
+a rule requiring the turn to submit its review through `pr_submit_review`,
+rather than shell `gh pr review` or only writing review prose in chat. Turn finalization
 emits `poller_review_missed_submission` if the expected submission call is
 absent. While `MIMIR_GITHUB_SELF_LOGIN` remains in GitHub's requested reviewers,
 the poller reconciles and retries a failed/missing review turn up to three times,
 then emits a `pr_review_request_gave_up` signal for operator attention. A review
 already submitted at the current head satisfies a later duplicate request.
+
+Review and remediation turns use typed `repo_*` and `pr_*` tools under a
+server-issued immutable PR action scope and its active checkout lease. Repository,
+PR, observed head/base, allowed actions, and publication destination are bound by
+the server; a model-supplied path, ref, or stale snapshot cannot replace them.
+The `repo_review` shell profile refuses Git writes and all `gh` commands before
+execution, including forge reads. Hardened, root-confined local Git inspection
+remains available with exact argv binding and Git helper/config neutralization.
+This is not a change to the controller's Worklink publication path in section 5
+or the separate OpenCode executor allowlist.
+
+For #1050, the live review/remediation parity check is reviewer-owned **BEFORE
+MERGE**, not a build blocker. Evidence lives in Chainlink #1050 comments mirrored
+in the PR body. The supplied human remediation record is partial; the remaining
+checks and record summary are in the
+[authorization reference](authorization.md#repository-review-and-remediation-1050).
+Follow the unchanged [reviewer procedure](internal/repo-pr-parity-canary.md#1050-reviewer-procedure);
+the full gate is not yet established by that record.
 
 For Worklink-created PRs, the human review path is always available through the
 PR URL in the Chainlink evidence comment. The GitHub poller additionally opens

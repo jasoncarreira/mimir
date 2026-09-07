@@ -13,6 +13,9 @@ allow-list.
 
 ## #1050 reviewer procedure
 
+This is a reviewer-owned **BEFORE MERGE** gate, not an unresolved build blocker.
+Records live in Chainlink #1050 comments mirrored in the PR body.
+
 1. Select one ordinary review request and one changes-requested PR authored by
    the configured bot in the canonical repository. Record each server-issued
    `scope_id` and observed head SHA before acting.

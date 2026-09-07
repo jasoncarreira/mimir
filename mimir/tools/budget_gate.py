@@ -1098,7 +1098,7 @@ def _service_shell_refusal_guidance(
         "scheduler_read_only": "bounded file inspection, read-only Git and Chainlink operations",
         "maintenance": "bounded file/date inspection, read-only Git/GitHub and Chainlink operations",
         "session_boundary": "bounded Chainlink operations and GitHub issue/PR views",
-        "repo_review": "bounded repository inspection, review operations and script-free npm ci",
+        "repo_review": "hardened local read-only Git inspection bound to a server-owned PR state; use typed pr_* and repo_* tools for GitHub operations, checkout, tests and mutations",
         "upgrade_workspace": "bounded file inspection, workspace Git, Chainlink and uv lock/sync operations",
     }.get(policy.destination if policy is not None else "")
     if operations and "trusted-service shell profile does not admit" in message:
@@ -1167,32 +1167,6 @@ async def _claim_review_submission_async(claim: Callable[[], Any]) -> Any:
 
         task.add_done_callback(release_late_claim)
         raise
-
-
-def _record_repo_review_checkout(
-    request: ToolCallRequest, auth_context: AuthContext | None, *, failed: bool,
-) -> None:
-    """Record only a successfully executed checkout of this turn's bound head."""
-    args = request.tool_call.get("args") or {}
-    state, _ = resolve_repository_review_state(
-        auth_context,
-        command=args.get("command"),
-        cwd=args.get("cwd"),
-    )
-    if failed or state is None:
-        return
-    argv = args.get("mimir_direct_argv")
-    if not isinstance(argv, list):
-        return
-    if argv[-7:] == [
-        "pr", "checkout", str(state.pr_number),
-        "--repo", state.repo, "--branch", state.head_ref,
-    ] or (
-        len(argv) >= 2
-        and argv[-2:] == ["checkout", state.head_ref]
-        and argv[1:3] == ["-C", state.root]
-    ):
-        state.mark_checked_out()
 
 
 def _resolve_service_shell_cwd(
@@ -3169,9 +3143,6 @@ class BudgetGateMiddleware(AgentMiddleware):
 
                 policy_refusal = end_read_policy_refusal_capture(read_refusal_token)
                 read_refusal_token = None
-            _record_repo_review_checkout(
-                execution_request, auth_context, failed=True,
-            )
             if isinstance(exc, ToolPolicyRefusal):
                 _record_tool_outcome(
                     tool_name,
@@ -3253,9 +3224,6 @@ class BudgetGateMiddleware(AgentMiddleware):
         is_error = _result_is_error(tool_name, result)
         if not is_error:
             _record_tool_outcome(tool_name)
-        _record_repo_review_checkout(
-            execution_request, auth_context, failed=is_error,
-        )
         result_labels = _result_labels_for_call(
             tool_name,
             request,
@@ -3704,9 +3672,6 @@ class BudgetGateMiddleware(AgentMiddleware):
 
                 policy_refusal = end_read_policy_refusal_capture(read_refusal_token)
                 read_refusal_token = None
-            _record_repo_review_checkout(
-                execution_request, auth_context, failed=True,
-            )
             if isinstance(exc, ToolPolicyRefusal):
                 _record_tool_outcome(
                     tool_name,
@@ -3788,9 +3753,6 @@ class BudgetGateMiddleware(AgentMiddleware):
         is_error = _result_is_error(tool_name, result)
         if not is_error:
             _record_tool_outcome(tool_name)
-        _record_repo_review_checkout(
-            execution_request, auth_context, failed=is_error,
-        )
         result_labels = _result_labels_for_call(
             tool_name,
             request,

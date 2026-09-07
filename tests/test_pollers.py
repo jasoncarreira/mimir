@@ -684,6 +684,7 @@ def test_manifest_rejects_shell_authority_without_job_inspection_companions(
 
 def test_github_activity_observed_operations_are_admitted_when_enforced(
     tmp_path: Path,
+    repo_review_state: RepoReviewState,
 ) -> None:
     manifest_path = (
         Path(__file__).parents[1]
@@ -722,7 +723,10 @@ def test_github_activity_observed_operations_are_admitted_when_enforced(
             integrity="trusted",
         )
     )
-    context = create_auth_context(event, enforce=True, ifc_labels=labels)
+    context = replace(
+        create_auth_context(event, enforce=True, ifc_labels=labels),
+        repo_review_state=repo_review_state,
+    )
     registry = ToolRegistry()
     observed = {
         "bash_job_output",

@@ -148,6 +148,30 @@ def repo_review_git_root(tmp_path):
     return root.resolve()
 
 
+@pytest.fixture
+def repo_review_state(repo_review_git_root):
+    """A real inspection root with all former remediation grants enabled."""
+    from mimir.models import RepoPRAction, RepoPRActionScope, RepoReviewState
+
+    state = RepoReviewState(RepoPRActionScope(
+        provenance="poller_payload", canonical_repo="o/r",
+        canonical_root=str(repo_review_git_root),
+        canonical_origin="https://github.com/o/r.git", principal="mimir-bot",
+        event_type="pr_changes_requested_stale",
+        allowed_operations=frozenset(action.value for action in RepoPRAction),
+        pr_number=7, head_repo="o/r", head_remote="origin",
+        destination_ref="refs/heads/worklink/7", observed_head_sha="a" * 40,
+        base_ref="main", observed_base_sha="b" * 40,
+        pull_request_author="mimir-bot",
+    ))
+    state.attach_checkout_lease(SimpleNamespace(
+        path=repo_review_git_root, lease_root=repo_review_git_root.parent,
+        scope_id=state.action_scope.scope_id, owner=state.action_scope.principal,
+        is_active=True,
+    ))
+    return state
+
+
 # Host-only Mimir settings: set by an operator or a deployment, never by a test.
 _HOST_ONLY_ENV = frozenset(
     {

@@ -421,13 +421,60 @@ matrix, resource adapters, SAGA ownership predicates, or sink map. They live in:
 - `mimir/tools/budget_gate.py`: exact runtime-carrier extraction and live tool
   middleware.
 
+### Repository review and remediation (#1050)
+
+The `repo_review` shell profile retains hardened local inspection, not a second
+repository/forge write API. Shell Git writes (including fetch, checkout, stage,
+commit, merge, rebase, and push) and **all `gh` invocations**, including read-only
+forms, are refused before execution. This boundary applies in shadow and enforced
+mode; neither a PR scope nor a shell-command declaration restores those forms.
+It does not remove controller-internal Git/forge execution or change other shell
+profiles and Worklink executor allowlists.
+
+Retained local Git inspection is argv-bound and root-confined, with executable
+pinning and helper/config neutralization: hooks, fsmonitor, external diff,
+textconv, filters, credentials, protocols, pager, and optional locks cannot turn
+an inspection into a write or helper launch. Profile admission alone is not enough;
+the final hardened argv is the execution artifact.
+
+Use typed `repo_*` and `pr_*` tools for repository mutations and forge reads and
+writes. Their authority comes from a server-issued immutable `RepoPRActionScope`
+and `RepoReviewState`, binding the canonical repository, PR, observed head/base,
+allowed actions, and publication destination. Checkout and local mutation use the
+active controller-issued lease for that same scope, not a model-selected working
+directory or the live source checkout. Model arguments cannot widen the scope,
+replace the remote/ref, or refresh a stale snapshot; typed push must refuse stale
+authority before publication. Review scopes and remediation scopes retain their
+distinct action grants.
+
+The live parity canary is a reviewer-owned **BEFORE MERGE** gate, not a build
+blocker. Records live in Chainlink #1050 comments mirrored in the PR body; the
+[reviewer procedure](internal/repo-pr-parity-canary.md#1050-reviewer-procedure)
+defines the required evidence. The supplied human remediation record reports
+scope `a1b1248a5809...`, head `cf9d4f9045dbd6c2...`, and owner `mimir-carreira` on
+`jasoncarreira/mimir#1847`, using
+`repo_test -> repo_diff -> repo_commit -> repo_push -> pr_comment -> repo_cleanup -> pr_checks -> pr_rerequest_review`.
+It reports one comment, one push, one review re-request, and pre-execution refusal
+of shell Git writes and `gh`. This is partial evidence, not full gate satisfaction:
+the review-scope cycle, receipt/audit pairing on the same scope/head for every
+write, zero observed shadow effects, stale-snapshot push refusal, and scenario
+totals/mismatch categories still require reviewer verification.
+
 ### Configured project tests
 
-`MIMIR_PROJECT_TEST_COMMAND` is the sole trusted-service exception for project
-tests. It is deployment/process configuration, not a repository file or model
-argument. The JSON object fixes both the complete command prefix and project
-working directory. For example, different deployments can select an installed
-JavaScript, Rust, Go, or Python test runner without changing a shell profile.
+`MIMIR_PROJECT_TEST_COMMAND` provides a configured project-test path for service
+shell profiles **other than `repo_review`**. That profile returns on admission or
+refusal before configured tests or declared commands are consulted; neither
+mechanism can restore shell test execution there. Remediation uses typed
+`repo_test` instead.
+
+The setting is deployment/process configuration, not a repository file or model
+argument. Its JSON object has exactly `argv` and `cwd` keys, fixing the complete
+command prefix and project working directory. Requests must match that prefix;
+there is no built-in pytest/npm runner or option allowlist, and
+`npm ci --ignore-scripts` has no repo-review exception. Different deployments can
+select an installed JavaScript, Rust, Go, or Python test runner without changing
+a shell profile.
 
 The model can append zero to 32 relative test paths or selectors. Each is ASCII,
 at most 256 characters, the combined selector payload is at most 4,096 bytes,
@@ -447,8 +494,8 @@ The shell compatibility path runs configured tests only through synchronous
 `project_test_async_refused`, keeping
 the existing 60-second wall-clock bound. Expiry returns the named
 `project_test_timeout` refusal; returned stdout and stderr are capped at 4,000
-and 2,000 characters respectively. With the setting unset, no test command is
-added to a trusted-service profile.
+and 2,000 characters respectively. With the setting unset, this path adds no
+test command to any profile. Setting it never grants tests to `repo_review`.
 
 Remediation turns use the narrower `repo_test` capability. Its command comes
 from the same deployment's `worklink.yaml` `defaults.test_command`; the model
@@ -508,8 +555,12 @@ authorization alone does not provide an OS boundary.
 
 ### Declared shell commands per job
 
-A scheduled job or poller may declare the shell commands it needs, **additively
-on top of** its shell profile. mimir ships no catalogue of the CLIs a deployment
+A scheduled job or poller outside the `repo_review` shell profile may declare
+the shell commands it needs, **additively on top of** its shell profile.
+`repo_review` returns before declarations are consulted, on both admission and
+refusal; `shell_commands` cannot widen its hardened local Git inspection surface
+or restore Git writes, `gh`, package installation, or shell tests.
+mimir ships no catalogue of the CLIs a deployment
 might install, so teaching one job about a deployment-specific tool needs no
 mimir release and does not widen a profile every other job on the host shares.
 
@@ -644,8 +695,9 @@ Two gates run in sequence, and a declaration only affects the second:
 1. **Capability** — is `shell_exec` in the principal's capability set? A manifest
    declaring `shell_commands` without `shell_exec` is rejected at load, because
    the grants would be silently inert.
-2. **Shell profile** — is this argv admitted? Declarations are consulted here,
-   in addition to the profile's own allowlist. The profile is never replaced.
+2. **Shell profile** — is this argv admitted? Except for `repo_review`, declarations
+   are consulted here in addition to the profile's own allowlist. The profile is
+   never replaced; `repo_review` admits or refuses before this mechanism runs.
 
 The argv binding is unchanged: no pipes, redirection, command substitution,
 heredocs or separators, under any declaration. A grant widens *which commands*
