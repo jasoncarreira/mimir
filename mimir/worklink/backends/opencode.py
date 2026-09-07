@@ -137,11 +137,13 @@ class OpenCodeBackend:
     bin: str = "opencode"
     extra_args: Sequence[str] = field(default_factory=tuple)
     bash_allowlist: Sequence[str] = field(default_factory=lambda: DEFAULT_BASH_ALLOWLIST)
+    test_env: Mapping[str, str] = field(default_factory=dict)
     name: str = "opencode"
     checkout_shape: CheckoutShape = CheckoutShape.ISOLATED_CLONE
 
     def __post_init__(self) -> None:
         validate_extra_args(self.extra_args)
+        validate_test_env(self.test_env)
 
     def capabilities(self) -> Caps:
         return Caps(
@@ -182,7 +184,6 @@ class OpenCodeBackend:
         # the executor or repository-controlled test processes it launches.
         from ...tools._shell_env import scrub_model_selection_env
 
-        scrub_model_selection_env(env)
         env["OPENCODE_PERMISSION"] = _permission_override(self.bash_allowlist)
         backend_config: dict[str, object] = {
             "bin": self.bin,
@@ -192,6 +193,7 @@ class OpenCodeBackend:
             "configured_model": resolution.configured_model,
             "model_diverged": resolution.model_diverged,
             "model_source": invocation.model_source,
+            "test_env": dict(self.test_env),
         }
         enabled = _coding_enabled()
         if enabled:
@@ -211,7 +213,9 @@ class OpenCodeBackend:
                 "OPENCODE_PERMISSION": _permission_override(self.bash_allowlist),
             }
             backend_config["worker_projections"] = projections
-            backend_config["pass_env"] = ()
+            backend_config["pass_env"] = tuple(self.test_env)
+        env.update(self.test_env)
+        scrub_model_selection_env(env)
         return WorkSpec(
             issue_id=order.issue_id,
             attempt=attempt,
@@ -374,6 +378,17 @@ def _emit_startup_contention(
         max_attempts=max_attempts,
         outcome=outcome,
     )
+
+
+def validate_test_env(value: object) -> None:
+    label = "worklink backends.opencode.test_env"
+    if not isinstance(value, Mapping):
+        raise ValueError(f"{label} must be a mapping")
+    for key, text in value.items():
+        if key not in {"PYTEST_ADDOPTS"}:
+            raise ValueError(f"{label} key {key!r} is not allowed")
+        if not isinstance(text, str) or any(not char.isprintable() for char in text):
+            raise ValueError(f"{label}.{key} must be plain text without newlines or control characters")
 
 
 def validate_extra_args(args: Sequence[str]) -> None:

@@ -863,6 +863,7 @@ class WorklinkRunner:
                             repo_url=repo_url,
                             test_command=test_cmd,
                             started_at=started,
+                            test_env=spec.backend_config.get("test_env", {}),
                         )
                     except OSError as exc:
                         _log_event(
@@ -1075,6 +1076,7 @@ class WorklinkRunner:
                 repo_url=spec.repo_url,
                 test_command=test_cmd,
                 started_at=started,
+                test_env=spec.backend_config.get("test_env", {}),
             )
 
         # After the #832 substrate cleanup local_subprocess is the only Worklink
@@ -1576,6 +1578,11 @@ class WorklinkRunner:
                 base_ref=state.local_base or state.base_ref,
                 branch=state.branch,
                 test_command=test_cmd or "",
+            )
+            # Recovery records the original selection, not current backend defaults.
+            spec = replace(
+                spec,
+                backend_config={**spec.backend_config, "test_env": dict(state.test_env)},
             )
             claim_record = ClaimRecord(
                 issue_id=issue_id,
@@ -3441,6 +3448,7 @@ def _persist_run_state(
     repo_url: str | None,
     test_command: str | None,
     started_at: datetime,
+    test_env: Mapping[str, str] | None = None,
 ) -> None:
     """Record the worker handle so a fresh controller can reattach (#561).
 
@@ -3466,6 +3474,7 @@ def _persist_run_state(
             process_start_ticks=handle.process_start_ticks,
             shim_pid=handle.shim_pid,
             phase="spawned",
+            test_env=dict(test_env or {}),
         ),
     )
 
@@ -3660,6 +3669,7 @@ def _comment_evidence(
         f"files={len(evidence.files_changed)} evidence={evidence_path}"
         f" failed_tests={json.dumps([redact_text(node) for node in tests.failed_tests] if tests else [])}"
         f" flaky_tests={json.dumps([redact_text(node) for node in tests.flaky_tests] if tests else [])}"
+        f" test_env={json.dumps(evidence.test_env, sort_keys=True)}"
     )
     reasons = f"\nReasons: {', '.join(validation.reasons)}" if validation.reasons else ""
     # chainlink #815: the failed gate-test output otherwise dies with the worker

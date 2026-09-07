@@ -3,6 +3,8 @@ from __future__ import annotations
 import asyncio
 import json
 import subprocess
+import shlex
+import sys
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -1173,6 +1175,93 @@ async def test_opencode_backend_invokes_run_dir_with_prompt_guard(
 def test_opencode_backend_rejects_direct_duplicate_model_flag() -> None:
     with pytest.raises(ValueError, match=r"cannot contain '--model'.*remove it"):
         OpenCodeBackend(extra_args=("--model", "openai/stale-worklink-setting"))
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_opencode_test_env_reaches_pytest_through_bash(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, enabled: bool
+) -> None:
+    monkeypatch.setattr(opencode_module, "_coding_enabled", lambda: enabled)
+    monkeypatch.setattr(
+        opencode_module, "resolve_opencode_invocation",
+        lambda **_: OpenCodeInvocation(
+            model="openai/test-model", provider="openai", model_source="test",
+            config_path=tmp_path / "absent.json", auth_path=tmp_path / "auth.json",
+            auth_type=None,
+        ),
+    )
+    monkeypatch.setattr(
+        opencode_module, "opencode_worker_documents",
+        lambda *_: SimpleNamespace(config_document=b"{}", auth_document=None),
+    )
+    config_path = tmp_path / "worklink.yaml"
+    config_path.write_text(
+        'backends:\n  opencode:\n    test_env:\n      PYTEST_ADDOPTS: "-n 2"\n',
+        encoding="utf-8",
+    )
+    backend = BackendRegistry(WorklinkConfig.load(config_path)).get("opencode")
+    spec = backend.work_spec(
+        WorkOrder(1566, tmp_path, "p", None, 30, {"MIMIR_MODEL_SPEC": "codex-plus:test"}),
+        attempt=1, repo_url="u", base_ref="main", branch="issue/1566-a1",
+        test_command="uv run pytest -q -n 6",
+    )
+    assert spec.env["PYTEST_ADDOPTS"] == "-n 2"
+    assert spec.backend_config["test_env"] == {"PYTEST_ADDOPTS": "-n 2"}
+    assert "MIMIR_MODEL_SPEC" not in spec.env
+    assert spec.test_command == "uv run pytest -q -n 6"
+    if enabled:
+        assert spec.backend_config["pass_env"] == ("PYTEST_ADDOPTS",)
+        env = compute_module._enabled_child_env(spec, "test-1566")
+    else:
+        env = {**compute_module._local_child_env(), **spec.env}
+
+    (tmp_path / "pyproject.toml").write_text(
+        '[tool.pytest.ini_options]\naddopts = "-n 3"\n', encoding="utf-8"
+    )
+    (tmp_path / "test_workers.py").write_text(
+        "def test_ok():\n    assert True\n", encoding="utf-8"
+    )
+    # Stand in for the CLI with a process that launches a bash tool, not a direct
+    # pytest call: the grandchild must inherit the computed executor environment.
+    launcher = "import subprocess, sys; sys.exit(subprocess.call(['/bin/bash', '-c', sys.argv[1]]))"
+    for options, workers in [("", 2), ("-n 1", 1)]:
+        result = subprocess.run(
+            [sys.executable, "-c", launcher,
+             f"{shlex.quote(sys.executable)} -m pytest {options}"],
+            cwd=tmp_path, env=env, capture_output=True, text=True, timeout=60,
+        )
+        assert result.returncode == 0, result.stdout + result.stderr
+        noun = "worker" if workers == 1 else "workers"
+        assert f"created: {workers}/{workers} {noun}" in result.stdout
+
+
+@pytest.mark.parametrize("key", [
+    "OPENAI_API_KEY", "MIMIR_MODEL_SPEC", "OPENCODE_CONFIG", "PATH", "BASH_ENV",
+    "PYTHONPATH", "pytest_addopts",
+])
+def test_opencode_test_env_rejects_disallowed_key(tmp_path: Path, key: str) -> None:
+    path = tmp_path / "worklink.yaml"
+    path.write_text(json.dumps({"backends": {"opencode": {"test_env": {key: "text"}}}}))
+    with pytest.raises(ValueError, match=key):
+        WorklinkConfig.load(path)
+    with pytest.raises(ValueError, match=key):
+        OpenCodeBackend(test_env={key: "text"})
+
+
+@pytest.mark.parametrize("value", ["-n 2\n", "-n 2\r", "-n\x002", "-n\t2", 2, None, [], {}])
+def test_opencode_test_env_rejects_non_plain_text(tmp_path: Path, value: object) -> None:
+    path = tmp_path / "worklink.yaml"
+    path.write_text(json.dumps({"backends": {"opencode": {"test_env": {"PYTEST_ADDOPTS": value}}}}))
+    with pytest.raises(ValueError, match="PYTEST_ADDOPTS"):
+        WorklinkConfig.load(path)
+
+
+@pytest.mark.parametrize("value", [None, [], "-n 2", 6])
+def test_opencode_test_env_requires_mapping(tmp_path: Path, value: object) -> None:
+    path = tmp_path / "worklink.yaml"
+    path.write_text(json.dumps({"backends": {"opencode": {"test_env": value}}}))
+    with pytest.raises(ValueError, match="test_env must be a mapping"):
+        WorklinkConfig.load(path)
 
 
 def test_opencode_backend_logs_native_model_divergence_from_home_default(

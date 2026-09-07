@@ -13,7 +13,7 @@ worker reattach path.
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
 import errno
 import json
@@ -70,6 +70,7 @@ class WorklinkRunState:
     shim_pid: int | None = None
     phase: str = "spawned"
     version: int = RUN_STATE_VERSION
+    test_env: dict[str, str] = field(default_factory=dict)
 
     def to_json(self) -> dict[str, Any]:
         return asdict(self)
@@ -125,6 +126,7 @@ class WorklinkRunState:
             shim_pid=shim_pid,
             phase=phase,
             version=version,
+            test_env=dict(data.get("test_env", {})),
         )
 
 

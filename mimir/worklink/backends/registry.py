@@ -25,6 +25,7 @@ from .opencode import (
     DERIVABLE_TEST_RUNNERS,
     OpenCodeBackend,
     validate_extra_args,
+    validate_test_env,
 )
 
 
@@ -348,6 +349,8 @@ class WorklinkConfig:
             kind="compute backend",
             normalize_compute_names=True,
         )
+        opencode_settings = _expect_mapping(backends.get("opencode"), "worklink backends.opencode")
+        validate_test_env(opencode_settings.get("test_env", {}))
         return cls(
             defaults=defaults,
             repository=repository,
@@ -738,6 +741,7 @@ class BackendRegistry:
             bin=bin_name,
             extra_args=tuple(args),
             bash_allowlist=tuple(bash_allowlist),
+            test_env=settings.get("test_env", {}),
         )
 
     @staticmethod
