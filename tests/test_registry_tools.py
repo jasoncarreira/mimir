@@ -24,6 +24,7 @@ from unittest.mock import AsyncMock
 
 from langchain.tools import ToolRuntime
 from langchain_core.tools import ToolException
+from pydantic import ValidationError
 import pytest
 
 import mimir.tools.registry as registry
@@ -346,7 +347,7 @@ class TestSendMessage:
         set_channel_registry(_StubRegistry(bridge))
         tok = set_current_channel_id("chan-1")
         try:
-            out = await send_message.ainvoke({"text": ""})
+            out = await send_message.ainvoke({"text": "", "channel_id": "chan-1"})
             assert "send_message rejected" in out
             assert "empty message" in out
         finally:
@@ -384,35 +385,27 @@ class TestSendMessage:
         assert event["reason"] == "empty_message"
 
     @pytest.mark.asyncio
-    async def test_no_channel_id_returns_tool_error_and_event(self, tmp_path) -> None:
-        from mimir.event_logger import init_logger
-
-        init_logger(tmp_path / "events.jsonl", session_id="test-session")
+    @pytest.mark.parametrize("target", [{}, {"channel_id": None}])
+    async def test_missing_or_null_channel_fails_validation(self, target) -> None:
         bridge = _StubBridge()
         set_channel_registry(_StubRegistry(bridge))
-        # no contextvar set, no explicit channel_id
-        out = await send_message.ainvoke(
-            {
-                "type": "tool_call",
-                "id": "call-1",
-                "name": "send_message",
-                "args": {"text": "hello"},
-            }
-        )
-        assert out.status == "error"
-        assert "send_message rejected" in out.content
-        assert "not a deliverable channel" in out.content
-        events = [
-            json.loads(line)
-            for line in (tmp_path / "events.jsonl").read_text().splitlines()
-        ]
-        [event] = [e for e in events if e["type"] == "send_message_blocked"]
-        assert event["tool"] == "send_message"
-        assert event["channel_id"] is None
-        assert event["reason"] == "not_deliverable_channel"
+        tok = set_current_channel_id("chan-1")
+        try:
+            with pytest.raises(ValidationError) as exc:
+                await send_message.ainvoke(
+                    {"type": "tool_call", "id": "call-1", "name": "send_message",
+                     "args": {"text": "hello", **target}},
+                    config={"configurable": {"channel_id": "chan-1"}},
+                )
+            [error] = exc.value.errors(include_input=False)
+            assert error["loc"] == ("channel_id",)
+            assert error["type"] == ("string_type" if target else "missing")
+        finally:
+            reset_current_channel_id(tok)
+        assert bridge.send_calls == []
 
     @pytest.mark.asyncio
-    @pytest.mark.parametrize("channel_id", ["system", ""])
+    @pytest.mark.parametrize("channel_id", ["system", "", " \t\n"])
     async def test_non_deliverable_channel_returns_tool_error_and_event(
         self, tmp_path, channel_id,
     ) -> None:
@@ -427,7 +420,8 @@ class TestSendMessage:
                 "id": "call-1",
                 "name": "send_message",
                 "args": {"text": "hello", "channel_id": channel_id},
-            }
+            },
+            config={"configurable": {"channel_id": "chan-1"}},
         )
         assert out.status == "error"
         assert "send_message rejected" in out.content
@@ -1848,12 +1842,11 @@ class TestSendMessageInteractivityGuard:
         )
         cid_tok = set_current_channel_id("chan-1")
         try:
-            out = await send_message.ainvoke({"text": "hi"})
+            with pytest.raises(ValidationError):
+                await send_message.ainvoke({"text": "hi"})
         finally:
             reset_current_channel_id(cid_tok)
             reset_current_turn(turn_tok)
-        assert "send_message rejected" in out
-        assert "not a deliverable channel" in out
         assert bridge.send_calls == []  # nothing was sent
 
     @pytest.mark.asyncio
@@ -1889,12 +1882,11 @@ class TestSendMessageInteractivityGuard:
         )
         cid_tok = set_current_channel_id("chan-1")
         try:
-            out = await send_message.ainvoke({"text": "hi"})
+            with pytest.raises(ValidationError):
+                await send_message.ainvoke({"text": "hi"})
         finally:
             reset_current_channel_id(cid_tok)
             reset_current_turn(turn_tok)
-        assert "send_message rejected" in out
-        assert "not a deliverable channel" in out
         assert bridge.send_calls == []
 
     @pytest.mark.asyncio
@@ -2509,6 +2501,56 @@ class TestSendMessageDelivery:
     """send_message uses final=False (typing stays held to turn end), and a
     soft bridge failure (SendResult.sent=False) surfaces as a failure rather
     than silently looking delivered (auto-dispatch removed → sole reply path)."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "integrities,expected",
+        [
+            pytest.param(None, "untrusted", id="no-turn"),
+            pytest.param((), "untrusted", id="no-sources"),
+            pytest.param(("untrusted",), "untrusted", id="untrusted"),
+            pytest.param(("trusted", "untrusted"), "untrusted", id="mixed"),
+            pytest.param(("trusted",), "trusted", id="trusted"),
+        ],
+    )
+    async def test_send_message_history_integrity(
+        self, tmp_path, monkeypatch, integrities, expected,
+    ) -> None:
+        from mimir.history import MessageBuffer
+
+        bridge = _StubBridge()
+        bridge.name = "discord"
+        set_channel_registry(_StubRegistry(bridge))
+        buf = MessageBuffer(history_path=tmp_path / "chat_history.jsonl")
+        monkeypatch.setattr("mimir.history.get_global_buffer", lambda: buf)
+        ctx = None
+        if integrities is not None:
+            ctx = TurnContext(
+                turn_id="history-integrity", session_id="history-integrity",
+                trigger="user_message", channel_id="chan-1", started_at=0.0,
+                ifc_labels=InformationFlowLabels(sources=tuple(
+                    SourceLabel(
+                        principal="user:alice", domain="channel",
+                        resource_id=f"source-{index}", bridge_instance="discord",
+                        sensitivity="private",
+                        authorized_principals=frozenset({"user:alice"}),
+                        integrity=integrity,
+                    )
+                    for index, integrity in enumerate(integrities)
+                )),
+            )
+        monkeypatch.setattr("mimir._context.get_current_turn", lambda: ctx)
+
+        out = await send_message.ainvoke({"text": "hello", "channel_id": "chan-1"})
+
+        assert out.startswith("send_message ok:")
+        assert bridge.send_calls == [{"cid": "chan-1", "text": "hello"}]
+        [message] = buf.recent_in_channel("chan-1", limit=10)
+        assert message.kind == "assistant_message"
+        assert message.content == "hello"
+        assert message.integrity == expected
+        [persisted] = (tmp_path / "chat_history.jsonl").read_text().splitlines()
+        assert json.loads(persisted)["integrity"] == expected
 
     @pytest.mark.asyncio
     async def test_send_uses_final_false_to_hold_typing(self) -> None:

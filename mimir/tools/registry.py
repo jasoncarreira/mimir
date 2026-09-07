@@ -854,7 +854,7 @@ async def request_operator_approval(
 @tool
 async def send_message(
     text: str,
-    channel_id: Optional[str] = None,
+    channel_id: str,
     config: Annotated[RunnableConfig | None, InjectedToolArg] = None,
 ) -> str:
     """Emit a message to a channel.
