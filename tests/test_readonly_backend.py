@@ -320,8 +320,9 @@ class TestWriteGuardBackend:
         docs = home / "docs"
         docs.mkdir()
         (docs / "README.md").write_text("reference docs\n", encoding="utf-8")
+        (docs / ".env.example").write_text("template docs\n", encoding="utf-8")
         protected = (
-            docs / ".env.example",
+            docs / ".env.production",
             docs / ".env.local",
             docs / "private.key",
             docs / "certificate.pem",
@@ -347,6 +348,9 @@ class TestWriteGuardBackend:
         token = set_current_turn(SimpleNamespace(turn_id="docs-read", auth_context=auth))
         try:
             read = backend.read("/docs/README.md")
+            template = backend.read("/docs/.env.example")
+            templates = backend.glob("*.example", path="/docs")
+            template_matches = backend.grep("template docs", path="/docs")
             glob = backend.glob("*.md", path="/docs")
             listing = backend.ls("/docs")
             write = backend.write("/docs/agent-note.md", "blocked\n")
@@ -356,8 +360,14 @@ class TestWriteGuardBackend:
 
         assert read.error is None
         assert read.file_data["content"] == "reference docs\n"
+        assert template.error is None
+        assert template.file_data["content"] == "template docs\n"
+        assert [match["path"] for match in templates.matches] == ["/docs/.env.example"]
+        assert [match["path"] for match in template_matches.matches] == ["/docs/.env.example"]
         assert [match["path"] for match in glob.matches] == ["/docs/README.md"]
-        assert [entry["path"] for entry in listing.entries] == ["/docs/README.md"]
+        assert {entry["path"] for entry in listing.entries} == {
+            "/docs/README.md", "/docs/.env.example",
+        }
         assert "Write blocked" in (write.error or "")
         assert not (docs / "agent-note.md").exists()
         assert all(result.error and "protected_name_match" in result.error for result in denied)
