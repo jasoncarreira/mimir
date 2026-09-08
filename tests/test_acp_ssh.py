@@ -308,7 +308,9 @@ async def test_ssh_proxy_propagates_only_selected_local_profile_timeout(
         *,
         timeout_seconds: int,
         close_on_daemon_exit: bool,
+        signal_cleanup: object,
     ) -> None:
+        assert callable(signal_cleanup)
         router = ProxyRouter(client_writer, daemon_writer, credential, timeout_seconds)
         await router.route_client({
             "jsonrpc": "2.0", "id": "new", "method": "session/new",
@@ -337,6 +339,105 @@ async def test_ssh_proxy_propagates_only_selected_local_profile_timeout(
         },
     )
     assert observed == [23]
+
+
+@pytest.mark.asyncio
+async def test_signal_does_not_hide_already_observed_ssh_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FailedProcess:
+        returncode = 7
+        stdin = Output(io.BytesIO())
+        stdout = Reader()
+        stderr = Reader()
+        async def wait(self) -> int:
+            return 7
+        def kill(self) -> None:
+            pytest.fail("must not kill a child already observed as exited")
+
+    async def route(*args: object, signal_cleanup: object, **kwargs: object) -> None:
+        # Deterministic ordering: nonzero child status exists before signal
+        # cleanup, while the parent has not yet handled asyncio.wait's result.
+        signal_cleanup()
+
+    monkeypatch.setattr("mimir.acp.ssh.build_ssh_argv", lambda *args: ("unused",))
+    monkeypatch.setattr("mimir.acp.ssh.asyncio.create_subprocess_exec", AsyncMock(return_value=FailedProcess()))
+    monkeypatch.setattr("mimir.acp.ssh.open_stdio", AsyncMock(return_value=(
+        Reader(), Output(io.BytesIO()), type("Transport", (), {"close": lambda self: None})(),
+    )))
+    monkeypatch.setattr("mimir.acp.ssh.run_router", route)
+    with pytest.raises(SshError, match="SSH connection failed"):
+        await run_ssh_proxy(Profile("p", Path("/remote")), "secret", io.BytesIO())
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("slow_close", [False, True])
+async def test_ssh_signal_kills_owned_child_before_slow_teardown(slow_close: bool) -> None:
+    source = r'''
+import asyncio, io, os, signal, sys
+from pathlib import Path
+from types import SimpleNamespace
+from mimir.acp import bootstrap, profiles, proxy, ssh
+profiles.ProfileStore = lambda: SimpleNamespace(get=lambda name: SimpleNamespace(remote=True))
+profiles.selected_profile = lambda name: 'test'
+proxy.SIGNAL_EXIT_TIMEOUT = 0.5
+ssh.build_ssh_argv = lambda *args: (sys.executable, '-c', 'import time; time.sleep(60)')
+original_spawn = asyncio.create_subprocess_exec
+async def spawn(*args, **kwargs):
+    process = await original_spawn(*args, **kwargs)
+    output.write(f'child:{process.pid}\n'.encode()); output.flush()
+    return process
+ssh.asyncio.create_subprocess_exec = spawn
+class Reader:
+    async def read(self, size):
+        output.write(b'ready\n'); output.flush()
+        await asyncio.Future()
+async def stdio(target):
+    return Reader(), proxy._OutputWriter(io.BytesIO()), SimpleNamespace(close=lambda: None)
+ssh.open_stdio = stdio
+original_close = proxy.ProxyRouter.close
+async def close(self):
+    if sys.argv[1] == 'slow':
+        await asyncio.sleep(60)
+    await original_close(self)
+proxy.ProxyRouter.close = close
+async def remote(name, target):
+    global output
+    output = target
+    await ssh.run_ssh_proxy(SimpleNamespace(timeout_seconds=60), 'secret', target)
+ssh.run_remote_proxy = remote
+raise SystemExit(bootstrap.main([]))
+'''
+    process = await asyncio.create_subprocess_exec(
+        sys.executable, "-c", source, "slow" if slow_close else "fast",
+        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+        cwd=Path(__file__).resolve().parents[1],
+    )
+    child_pid = None
+    try:
+        line = await asyncio.wait_for(process.stdout.readline(), 10)
+        assert line.startswith(b"child:")
+        child_pid = int(line.split(b":")[1])
+        assert await asyncio.wait_for(process.stdout.readline(), 10) == b"ready\n"
+        import signal
+        process.send_signal(signal.SIGTERM)
+        stdout, stderr = await asyncio.wait_for(process.communicate(), 3)
+        assert process.returncode == 128 + signal.SIGTERM
+        assert (stdout, stderr) == (b"", b"")
+        # The real SSH stand-in is terminated and reaped, even when the router
+        # close cannot complete before the process-exit watchdog fires.
+        with pytest.raises(ProcessLookupError):
+            os.kill(child_pid, 0)
+        child_pid = None
+    finally:
+        if process.returncode is None:
+            process.kill()
+            await process.communicate()
+        if child_pid is not None:
+            try:
+                os.kill(child_pid, 9)
+            except ProcessLookupError:
+                pass
 
 
 @pytest.mark.asyncio

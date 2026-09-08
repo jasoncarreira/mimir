@@ -1098,9 +1098,18 @@ if sys.argv[1]=='wait': loop.run_forever()
         (await asyncio.wait_for(process.stdout.readline(), 10)).decode()
     )
     assert ownership["pgids"] == ownership["pids"]
-    if shutdown_signal is not None:
-        process.send_signal(shutdown_signal)
-    await asyncio.wait_for(process.wait(), 10)
+    try:
+        if shutdown_signal is not None:
+            process.send_signal(shutdown_signal)
+        stdout, stderr = await asyncio.wait_for(process.communicate(), 10)
+        assert process.returncode == (128 + shutdown_signal if shutdown_signal else 0)
+        assert stdout == b""
+        if shutdown_signal is not None:
+            assert stderr == b""
+    finally:
+        if process.returncode is None:
+            process.kill()
+            await process.communicate()
     assert all(
         await asyncio.gather(
             *(owned_process_reaped(pid) for pid in ownership["pids"])

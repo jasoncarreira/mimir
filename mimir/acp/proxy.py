@@ -4,6 +4,7 @@ import atexit
 import asyncio
 import io
 import json
+import logging
 import os
 import secrets
 import signal
@@ -12,7 +13,7 @@ import sys
 import threading
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, BinaryIO
+from typing import Any, BinaryIO, Callable
 
 from .credentials import CredentialError, NativeCredentialStore
 from .hosted import HostedHandsProvider, HostedMcpError
@@ -20,6 +21,8 @@ from .profiles import Profile, ProfileError, ProfileStore, selected_profile
 from .transport import FORCE_CLOSE_TIMEOUT, PEER_EOF_GRACE_TIMEOUT, close_writer
 
 CONNECT_TIMEOUT = 5.0
+# One process-wide grace from the first signal, not one timeout per await.
+SIGNAL_EXIT_TIMEOUT = 5.0
 MAX_FRAME_BYTES = 1024 * 1024
 MAX_OUTSTANDING_REQUESTS = 1024
 MAX_GENERATION_SERVER_IDS = 1024
@@ -992,9 +995,22 @@ async def _raise_completed(
             raise result
 
 
+class _SignalReapFilter(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        # Synchronous owned-child reaping intentionally races asyncio's child
+        # watcher. This one diagnostic is expected after a committed signal exit;
+        # do not suppress other asyncio errors or unsignalled failures.
+        return record.msg != "Unknown child process pid %d, will report returncode 255"
+
+
 class _ShutdownHooks:
-    def __init__(self, router: ProxyRouter) -> None:
+    def __init__(
+        self, router: ProxyRouter, signal_cleanup: Callable[[], None] | None = None,
+    ) -> None:
         self._router = router
+        self._signal_cleanup = signal_cleanup
+        self._watchdog: threading.Timer | None = None
+        self._failure_detail: bytes | None = None
         self._signals: dict[int, Any] = {}
         self._handler = self._handle_signal
         self._installed = False
@@ -1014,6 +1030,12 @@ class _ShutdownHooks:
     def close(self) -> None:
         if not self._installed:
             return
+        if self.signum is not None:
+            atexit.unregister(self._cleanup)
+            # A signal commits this CLI process to exit. Keep both the deadline
+            # and escalation handler through outer SSH/asyncio.run/atexit drains.
+            # Cancelling the watchdog here would make those waits unbounded again.
+            return
         self._installed = False
         atexit.unregister(self._cleanup)
         if threading.current_thread() is threading.main_thread():
@@ -1025,20 +1047,58 @@ class _ShutdownHooks:
     def _cleanup(self) -> None:
         self._router.terminate_owned_children()
 
+    def record_failure(self, error: BaseException) -> None:
+        if isinstance(error, (asyncio.CancelledError, ProxySignalExit)):
+            return
+        if self._failure_detail is None:
+            # Use exactly the CLI's sanitized origin, never the exception message.
+            from .bootstrap import _origin
+            self._failure_detail = f"detail: {_origin(error)}\nerror: acp-failed\n".encode()
+
+    def _force_exit(self) -> None:
+        assert self.signum is not None
+        if self._failure_detail is not None:
+            try:
+                # Diagnostics must not turn the hard deadline into another
+                # drain wait when stderr is a full or disconnected pipe.
+                os.set_blocking(2, False)
+                os.write(2, self._failure_detail)
+            finally:
+                os._exit(1)
+        os._exit(128 + self.signum)
+
     def _handle_signal(self, signum: int, frame: Any) -> None:
         del frame
         if self.signum is not None:
-            return
+            # A repeated supported signal explicitly abandons graceful draining.
+            os._exit(128 + self.signum)
         self.signum = signum
+        # wait_for/task.cancel cannot bound cancellation-resistant coroutines (or
+        # a blocked event loop). Arm before synchronous cleanup, and retain until
+        # process exit. Normal EOF and genuine failures never arm this watchdog.
+        self._watchdog = threading.Timer(SIGNAL_EXIT_TIMEOUT, self._force_exit)
+        self._watchdog.daemon = True
+        self._watchdog.start()
+        logging.getLogger("asyncio").addFilter(_SignalReapFilter())
+        if self._signal_cleanup is not None:
+            self._signal_cleanup()
         self._cleanup()
-        if self._task is None or self._task.done():
-            # An atexit-only installation has no coroutine left to unwind.
-            raise SystemExit(128 + signum)
         # Wake the loop without throwing through an interrupted selector/transport.
         self._loop.call_soon_threadsafe(self._cancel)
 
     def _cancel(self) -> None:
-        if not self.closing and self._task is not None:
+        if self._task is None or self._task.done():
+            # Readiness can be printed just before the installing task returns;
+            # recheck here, not only in the signal handler, or run_forever hangs.
+            if self._task is not None and not self._task.cancelled():
+                error = self._task.exception()
+                if error is not None:
+                    self.record_failure(error)
+                    # Let the caller report its normal failure/signal result;
+                    # the watchdog still bounds any outer cleanup.
+                    return
+            self._force_exit()
+        if not self.closing:
             self._task.cancel()
 
 
@@ -1051,9 +1111,10 @@ async def run_router(
     *,
     timeout_seconds: int = 60,
     close_on_daemon_exit: bool = False,
+    signal_cleanup: Callable[[], None] | None = None,
 ) -> None:
     router = ProxyRouter(client_writer, daemon_writer, credential, timeout_seconds)
-    hooks = _ShutdownHooks(router)
+    hooks = _ShutdownHooks(router, signal_cleanup)
     hooks.install()
     client_task = asyncio.create_task(_route_stream(client_reader, router.route_client))
     daemon_task = asyncio.create_task(_route_stream(daemon_reader, router.route_daemon))
@@ -1087,6 +1148,14 @@ async def run_router(
             task.cancel()
         await asyncio.gather(*pending, return_exceptions=True)
     except BaseException as exc:
+        hooks.record_failure(exc)
+        for task in tasks:
+            if task.done() and not task.cancelled():
+                error = task.exception()
+                if error is not None:
+                    hooks.record_failure(error)
+                elif task is failure_task:
+                    hooks.record_failure(task.result())
         hooks.closing = True
         for task in tasks:
             if not task.done():
@@ -1096,6 +1165,7 @@ async def run_router(
             raise
         for result in results:
             if isinstance(result, BaseException) and not isinstance(result, asyncio.CancelledError):
+                hooks.record_failure(result)
                 raise result
     finally:
         hooks.closing = True
@@ -1108,6 +1178,9 @@ async def run_router(
                 await asyncio.wait_for(closing, FORCE_CLOSE_TIMEOUT)
             except TimeoutError:
                 pass
+        except BaseException as exc:
+            hooks.record_failure(exc)
+            raise
         finally:
             hooks.close()
     if hooks.signum is not None:

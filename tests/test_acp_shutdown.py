@@ -18,7 +18,7 @@ from mimir.acp.transport import close_writer, pump_stream
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("signum", [signal.SIGTERM, signal.SIGINT, signal.SIGHUP, None])
-@pytest.mark.parametrize("stage", ["read", "idle", "close", "failure", "read-failure", "drain-failure"])
+@pytest.mark.parametrize("stage", ["read", "idle", "close", "failure", "read-failure", "drain-failure", "close-failure"])
 async def test_proxy_signal_teardown_and_client_eof_are_silent(
     signum: signal.Signals | None, stage: str,
 ) -> None:
@@ -47,8 +47,10 @@ async def run_proxy(name, output):
         original_terminate()
         output.write(b'terminated\\n')
     async def close():
-        if stage == 'close' and signum:
+        if stage in ('close', 'close-failure') and signum:
             os.kill(os.getpid(), signum)
+        if stage == 'close-failure':
+            raise ValueError('private shutdown failure')
         await asyncio.sleep(0)
         await original_close()
         if stage == 'failure':
@@ -67,7 +69,7 @@ async def run_proxy(name, output):
                         os.kill(os.getpid(), signum)
                     await asyncio.sleep(0)
         daemon = DrainingReader()
-    if stage in ('read-failure', 'drain-failure') or (signum and stage != 'close'):
+    if stage in ('read-failure', 'drain-failure') or (signum and stage not in ('close', 'close-failure')):
         class SignallingReader:
             async def read(self, size):
                 await asyncio.sleep(0)
@@ -116,6 +118,189 @@ raise SystemExit(bootstrap.main([]))
         assert stderr == b""
         assert process.returncode == (128 + signum if signum else 0)
         assert stdout == (b"terminated\n" if signum else b"") + b"closed\n"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("signum", [signal.SIGTERM, signal.SIGINT, signal.SIGHUP])
+@pytest.mark.parametrize("repeat", [False, True], ids=["deadline", "escalation"])
+@pytest.mark.parametrize("stage", ["route", "close", "writer", "outer", "blocked", "cleanup"])
+async def test_signal_exit_bounds_entire_teardown(
+    signum: signal.Signals, repeat: bool, stage: str,
+) -> None:
+    source = r'''
+import asyncio, io, os, sys, time
+from types import SimpleNamespace
+from mimir.acp import bootstrap, profiles, proxy
+stage = sys.argv[1]
+proxy.SIGNAL_EXIT_TIMEOUT = 30 if sys.argv[2] == 'repeat' else 0.5
+profiles.ProfileStore = lambda: SimpleNamespace(get=lambda name: SimpleNamespace(remote=None))
+profiles.selected_profile = lambda name: 'test'
+
+def mark(value):
+    sink.write(value + b'\n')
+    sink.flush()
+
+async def stuck():
+    mark(b'draining')
+    while True:
+        try:
+            await asyncio.sleep(60)
+        except asyncio.CancelledError:
+            pass
+
+async def run_proxy(name, output):
+    global sink
+    sink = output
+    class Reader:
+        async def read(self, size):
+            mark(b'ready')
+            try:
+                await asyncio.Future()
+            finally:
+                if stage == 'route':
+                    await stuck()
+    class Writer(proxy._OutputWriter):
+        async def wait_closed(self):
+            if stage == 'writer':
+                await stuck()
+    writers = [Writer(io.BytesIO()), proxy._OutputWriter(io.BytesIO())]
+    router = proxy.ProxyRouter(*writers, 'secret')
+    original_close = router.close
+    original_cleanup = router.terminate_owned_children
+    def cleanup():
+        original_cleanup()
+        mark(b'terminated')
+        if stage == 'cleanup':
+            mark(b'draining')
+            time.sleep(60)
+    async def close():
+        if stage == 'blocked':
+            mark(b'draining')
+            time.sleep(60)
+        if stage == 'close':
+            await stuck()
+        await original_close()
+    router.close = close
+    router.terminate_owned_children = cleanup
+    proxy.ProxyRouter = lambda *args: router
+    try:
+        await proxy.run_router(Reader(), writers[0], asyncio.StreamReader(), writers[1], 'secret')
+    finally:
+        if stage == 'outer':
+            await stuck()
+proxy.run_proxy = run_proxy
+raise SystemExit(bootstrap.main([]))
+'''
+    process = await asyncio.create_subprocess_exec(
+        sys.executable, "-c", source, stage, "repeat" if repeat else "deadline",
+        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+        cwd=Path(__file__).resolve().parents[1],
+    )
+    try:
+        assert await asyncio.wait_for(process.stdout.readline(), 10) == b"ready\n"
+        process.send_signal(signum)
+        assert await asyncio.wait_for(process.stdout.readline(), 3) == b"terminated\n"
+        assert await asyncio.wait_for(process.stdout.readline(), 3) == b"draining\n"
+        if repeat:
+            # Different second signal: the first signal owns the exit status.
+            process.send_signal(signal.SIGINT if signum != signal.SIGINT else signal.SIGTERM)
+        stdout, stderr = await asyncio.wait_for(process.communicate(), 3)
+        assert process.returncode == 128 + signum
+        assert (stdout, stderr) == (b"", b"")
+    finally:
+        if process.returncode is None:
+            process.kill()
+            await process.communicate()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("signum", [signal.SIGTERM, signal.SIGINT, signal.SIGHUP])
+async def test_signal_callback_rechecks_completed_installing_task(signum: signal.Signals) -> None:
+    source = r'''
+import asyncio, io, os, sys
+from mimir.acp import proxy
+async def setup():
+    router = proxy.ProxyRouter(proxy._OutputWriter(io.BytesIO()), proxy._OutputWriter(io.BytesIO()), 'secret')
+    hooks = proxy._ShutdownHooks(router)
+    hooks.install()
+    # Queue cancellation while setup is live, then finish without yielding.
+    # A long watchdog proves the callback, not the fallback, handles this race.
+    proxy.SIGNAL_EXIT_TIMEOUT = 60
+    os.kill(os.getpid(), int(sys.argv[1]))
+loop = asyncio.new_event_loop()
+asyncio.set_event_loop(loop)
+loop.run_until_complete(setup())
+loop.run_forever()
+'''
+    process = await asyncio.create_subprocess_exec(
+        sys.executable, "-c", source, str(signum),
+        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+        cwd=Path(__file__).resolve().parents[1],
+    )
+    try:
+        stdout, stderr = await asyncio.wait_for(process.communicate(), 10)
+        assert process.returncode == 128 + signum
+        assert (stdout, stderr) == (b"", b"")
+    finally:
+        if process.returncode is None:
+            process.kill()
+            await process.communicate()
+
+
+@pytest.mark.asyncio
+async def test_signal_deadline_preserves_observed_failure_during_resistant_drain() -> None:
+    source = r'''
+import asyncio, io, os, signal
+from types import SimpleNamespace
+from mimir.acp import bootstrap, profiles, proxy
+profiles.ProfileStore = lambda: SimpleNamespace(get=lambda name: SimpleNamespace(remote=None))
+profiles.selected_profile = lambda name: 'test'
+proxy.SIGNAL_EXIT_TIMEOUT = 0.5
+async def run_proxy(name, output):
+    class Failing:
+        async def read(self, size):
+            await asyncio.sleep(0)
+            os.kill(os.getpid(), signal.SIGTERM)
+            raise ValueError('private failure')
+    class Resistant:
+        async def read(self, size):
+            while True:
+                try:
+                    await asyncio.sleep(60)
+                except asyncio.CancelledError:
+                    pass
+    await proxy.run_router(Failing(), proxy._OutputWriter(io.BytesIO()),
+                           Resistant(), proxy._OutputWriter(io.BytesIO()), 'secret')
+proxy.run_proxy = run_proxy
+raise SystemExit(bootstrap.main([]))
+'''
+    process = await asyncio.create_subprocess_exec(
+        sys.executable, "-c", source,
+        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+        cwd=Path(__file__).resolve().parents[1],
+    )
+    try:
+        stdout, stderr = await asyncio.wait_for(process.communicate(), 10)
+        assert process.returncode == 1
+        assert stdout == b""
+        assert stderr.startswith(b"detail: ValueError at <string>:")
+        assert stderr.endswith(b"\nerror: acp-failed\n")
+        assert b"private failure" not in stderr
+    finally:
+        if process.returncode is None:
+            process.kill()
+            await process.communicate()
+
+
+def test_signal_reap_filter_only_suppresses_expected_watcher_diagnostic() -> None:
+    import logging
+    from mimir.acp.proxy import _SignalReapFilter
+
+    expected = "Unknown child process pid %d, will report returncode 255"
+    def record(message: str) -> logging.LogRecord:
+        return logging.LogRecord("asyncio", logging.WARNING, __file__, 1, message, (123,), None)
+    assert not _SignalReapFilter().filter(record(expected))
+    assert _SignalReapFilter().filter(record("unexpected failure %d"))
 
 
 def _assert_generation_empty(router: ProxyRouter) -> None:
