@@ -46,6 +46,178 @@ def _wait_until_done(registry: ShellJobRegistry, job_id: str, timeout: float = 3
 # ─── basic spawn + capture ────────────────────────────────────────────
 
 
+@pytest.mark.parametrize("limit", [10 * 1024 * 1024, 25])
+def test_redaction_precedes_capture_and_tail_limits(tmp_path, monkeypatch, limit):
+    import io
+
+    secret = "prefix\nprivate-suffix"
+    released = threading.Event()
+    completed = threading.Event()
+    events = []
+
+    class ChunkedPipe(io.BytesIO):
+        def read(self, size=-1):
+            return super().read(min(size, 3))
+
+    payload = ("header\n" + secret + "\nprivate-suffix\n").encode()
+    proc = SimpleNamespace(
+        pid=123,
+        stdout=ChunkedPipe(payload),
+        stderr=ChunkedPipe(payload),
+        wait=lambda: (released.wait(10), 0)[1],
+    )
+    monkeypatch.setattr("mimir.shell_jobs.subprocess.Popen", lambda *a, **kw: proc)
+    monkeypatch.setattr("mimir.shell_jobs.SHELL_JOB_OUTPUT_MAX_BYTES_PER_STREAM", limit)
+    registry = _make_registry(tmp_path)
+
+    def on_complete(job):
+        events.append(registry.read_job_output(job, tail_lines=1))
+        completed.set()
+
+    job = registry.spawn(
+        "declared command", argv=["unused"], on_complete=on_complete,
+        redact_values=("", "private-suffix", secret),
+    )
+    released.set()
+    assert completed.wait(10)
+    expected = b"header\n[REDACTED]\n[REDACTED]\n"[:limit]
+    assert job.stdout_path.read_bytes() == expected
+    assert job.stderr_path.read_bytes() == expected
+    assert secret not in repr(job)
+    assert "redact_values" not in job.snapshot()
+    for result in [events[0], registry.read_job_output(job, tail_lines=1)]:
+        assert "private-suffix" not in str(result)
+        assert "prefix" not in str(result)
+
+
+def test_running_output_withholds_split_secret(tmp_path, monkeypatch):
+    import io
+
+    paused = threading.Event()
+    resume = threading.Event()
+    completed = threading.Event()
+
+    class PausedPipe(io.BytesIO):
+        def read(self, size=-1):
+            if self.tell() == 7:
+                paused.set()
+                assert resume.wait(10)
+            return super().read(7)
+
+    proc = SimpleNamespace(
+        pid=123,
+        stdout=PausedPipe(b"private-secret"),
+        stderr=io.BytesIO(),
+        wait=lambda: (resume.wait(10), 0)[1],
+    )
+    monkeypatch.setattr("mimir.shell_jobs.subprocess.Popen", lambda *a, **kw: proc)
+    registry = _make_registry(tmp_path)
+    job = registry.spawn(
+        "safe", argv=["unused"], redact_values=("private-secret",),
+        on_complete=lambda job: completed.set(),
+    )
+    try:
+        assert paused.wait(10)
+        assert registry.read_job_output(job)["stdout_tail"] == ""
+    finally:
+        resume.set()
+    assert completed.wait(10)
+    assert registry.read_job_output(job)["stdout_tail"] == "[REDACTED]"
+
+
+def test_undeclared_output_is_unchanged(tmp_path):
+    registry = _make_registry(tmp_path)
+    job = registry.spawn(
+        "unscoped command", argv=[sys.executable, "-c", "print('private-value')"],
+        env_overlay={"TOKEN": "private-value"},
+    )
+    _wait_until_done(registry, job.job_id)
+    assert registry.read_job_output(job)["stdout_tail"] == "private-value\n"
+
+
+def test_redacted_spawn_exception_does_not_echo_values(tmp_path, monkeypatch):
+    def fail(*args, **kwargs):
+        raise OSError("private-value")
+
+    monkeypatch.setattr("mimir.shell_jobs.subprocess.Popen", fail)
+    registry = _make_registry(tmp_path)
+    with pytest.raises(RuntimeError, match="spawn failed") as exc:
+        registry.spawn("safe", argv=["unused"], redact_values=("private-value",))
+    assert "private-value" not in str(exc.value)
+    assert exc.value.__suppress_context__
+
+
+def test_redacted_capture_error_does_not_log_values(tmp_path, monkeypatch, caplog):
+    import io
+
+    secret = "private-capture-secret"
+    real_open = Path.open
+    completed = threading.Event()
+    fired = []
+
+    class FailingOutput(io.BytesIO):
+        def write(self, data):
+            raise OSError(secret)
+
+    def failing_open(path, mode="r", *args, **kwargs):
+        if mode == "wb" and path.parent == registry.jobs_dir:
+            return FailingOutput()
+        return real_open(path, mode, *args, **kwargs)
+
+    def on_complete(job):
+        fired.append(job.job_id)
+        completed.set()
+
+    registry = _make_registry(tmp_path)
+    monkeypatch.setattr(Path, "open", failing_open)
+    job = registry.spawn(
+        "safe", argv=[sys.executable, "-c", "import sys; print('out'); print('err', file=sys.stderr)"],
+        redact_values=(secret,), on_complete=on_complete,
+    )
+    assert completed.wait(30)
+    assert fired == [job.job_id]
+    assert job.exit_code == 0
+    assert job.stdout_truncated and job.stderr_truncated
+    for stream in ("stdout", "stderr"):
+        assert (
+            f"shell job {job.job_id} {stream} capture failed; "
+            "discarding remaining output: OSError"
+        ) in caplog.text
+    assert secret not in caplog.text
+
+
+def test_redacted_callback_error_does_not_log_values(tmp_path, caplog):
+    secret = "private-callback-secret"
+    invoked = threading.Event()
+    fired = []
+    waiter_threads = []
+
+    def on_complete(job):
+        fired.append(job.job_id)
+        waiter_threads.append(threading.current_thread())
+        invoked.set()
+        raise RuntimeError(secret)
+
+    registry = _make_registry(tmp_path)
+    job = registry.spawn(
+        "safe", argv=[sys.executable, "-c", "pass"],
+        redact_values=(secret,), on_complete=on_complete,
+    )
+    assert invoked.wait(30)
+    # Invocation precedes exception logging; wait for this job's waiter to finish.
+    waiter_threads[0].join(timeout=30)
+    assert not waiter_threads[0].is_alive()
+    assert fired == [job.job_id]
+    assert job.exit_code == 0
+    assert f"on_complete callback raised for job {job.job_id}" in caplog.text
+    assert secret not in caplog.text
+    assert all(
+        record.exc_info is None
+        for record in caplog.records
+        if record.name == "mimir.shell_jobs" and job.job_id in record.getMessage()
+    )
+
+
 def test_spawn_captures_stdout_and_stderr(tmp_path: Path):
     registry = _make_registry(tmp_path)
     cmd = "echo out; echo err 1>&2"

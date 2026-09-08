@@ -2051,6 +2051,7 @@ class DeclaredShellCommand:
     subcommands: tuple[tuple[str, ...], ...] = ()
     options: tuple[str, ...] = ()
     script: Path | None = None
+    pass_env: tuple[str, ...] = ()
 
 
 class DeclaredShellCommandError(ValueError):
@@ -2181,9 +2182,23 @@ def parse_declared_shell_commands(
         name = entry.get("exec")
         if not isinstance(name, str) or not name or "/" in name or name != Path(name).name:
             raise ValueError(f"shell_commands exec must be a bare command name, got {name!r}")
-        unknown = set(entry) - {"exec", "path", "subcommands", "options", "script"}
+        unknown = set(entry) - {"exec", "path", "subcommands", "options", "script", "pass_env"}
         if unknown:
             raise _declaration_error(name, f"unknown keys {sorted(unknown)}")
+
+        pass_env = entry.get("pass_env", [])
+        if not isinstance(pass_env, list) or not all(
+            isinstance(key, str) and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", key)
+            for key in pass_env
+        ):
+            raise _declaration_error(name, "pass_env must be a list of exact environment variable names")
+        # Credentials must not undo executable/config isolation or gh identity.
+        if any(
+            key in {"PATH", "MIMIR_MODEL_SPEC", "BASH_ENV", "ENV"}
+            or key.startswith(("LD_", "DYLD_", "PYTHON", "GIT_", "GH_"))
+            for key in pass_env
+        ):
+            raise _declaration_error(name, "pass_env cannot override process-control environment")
 
         raw_path = entry.get("path")
         if not isinstance(raw_path, str) or not raw_path:
@@ -2289,6 +2304,7 @@ def parse_declared_shell_commands(
             subcommands=tuple(subcommands),
             options=tuple(options_raw),
             script=script,
+            pass_env=tuple(dict.fromkeys(pass_env)),
         ))
     return tuple(out)
 

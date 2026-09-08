@@ -16,6 +16,119 @@ from mimir.tools import _shell_env
 from mimir.tools._shell_env import direct_exec_env, direct_exec_env_overlay
 
 
+@pytest.mark.parametrize("overlay", [False, True])
+def test_declared_environment_is_bound_to_exact_argv(tmp_path, monkeypatch, overlay):
+    from mimir.access_control import parse_declared_shell_commands
+
+    script = tmp_path / "weather.py"
+    script.write_text("pass\n")
+    monkeypatch.setenv("WEATHER_KEY", "weather-private-value")
+    monkeypatch.setenv("UNDECLARED_KEY", "unrelated-private-value")
+    monkeypatch.delenv("ABSENT_KEY", raising=False)
+    declarations = parse_declared_shell_commands([{
+        "exec": "python3", "path": sys.executable, "script": str(script),
+        "pass_env": ["WEATHER_KEY", "ABSENT_KEY"],
+    }])
+    argv = [str(Path(sys.executable).resolve()), str(script)]
+    events = []
+    from mimir.event_logger import EventLogger
+
+    audit_path = tmp_path / "events.jsonl"
+    logger = EventLogger(audit_path, "pass-env-test")
+
+    def record(kind, **fields):
+        events.append((kind, fields))
+        logger.log_sync(kind, **fields)
+
+    monkeypatch.setattr("mimir.event_logger.log_event_sync", record)
+    token = _shell_env.bind_direct_exec_argv(
+        argv, command=f"python3 {script}", declared=declarations,
+    )
+    try:
+        env = direct_exec_env_overlay(argv) if overlay else direct_exec_env(argv)
+        assert env["WEATHER_KEY"] == "weather-private-value"
+        assert not env.get("UNDECLARED_KEY")
+        assert "ABSENT_KEY" not in env
+        assert "WEATHER_KEY" not in direct_exec_env([*argv, "different-argument"])
+    finally:
+        _shell_env.reset_direct_exec_argv(token)
+    assert "WEATHER_KEY" not in direct_exec_env(argv)
+    assert events == [("service_shell_env_passthrough", {"pass_env": ["WEATHER_KEY"]})]
+    assert "weather-private-value" not in repr(events)
+    audit = audit_path.read_text()
+    assert "WEATHER_KEY" in audit
+    assert "weather-private-value" not in audit
+
+
+def test_declared_environment_requires_matching_pinned_execution(tmp_path, monkeypatch):
+    from mimir.access_control import parse_declared_shell_commands
+
+    monkeypatch.setattr("mimir.event_logger.log_event_sync", lambda *a, **kw: None)
+    monkeypatch.setenv("DECLARED_KEY", "private-value")
+    declared = parse_declared_shell_commands([{
+        "exec": "probe", "path": "/bin/echo", "subcommands": [["status"]],
+        "pass_env": ["DECLARED_KEY"],
+    }])
+    argv = ["/unrelated/echo", "status"]
+    token = _shell_env.bind_direct_exec_argv(argv, command="probe status", declared=declared)
+    try:
+        assert "DECLARED_KEY" not in direct_exec_env(argv)
+    finally:
+        _shell_env.reset_direct_exec_argv(token)
+
+
+@pytest.mark.parametrize("raw", [None, "TOKEN", {}, ["TOKEN*"], ["TOKEN_" + "*"],
+                                      ["TOKEN=value-private"], [""], [1], ["A\nB"]])
+def test_pass_env_requires_exact_names_without_echoing_bad_values(raw):
+    from mimir.access_control import parse_declared_shell_commands
+
+    with pytest.raises(ValueError, match="list of exact environment variable names") as exc:
+        parse_declared_shell_commands([{
+            "exec": "probe", "path": "/bin/echo", "subcommands": [["status"]],
+            "pass_env": raw,
+        }])
+    assert "value-private" not in str(exc.value)
+
+
+@pytest.mark.parametrize("name", ["PATH", "MIMIR_MODEL_SPEC", "BASH_ENV", "ENV",
+                                    "LD_PRELOAD", "DYLD_LIBRARY_PATH", "PYTHONPATH",
+                                    "GIT_CONFIG_GLOBAL", "GH_TOKEN", "GH_CONFIG_DIR"])
+def test_pass_env_cannot_override_execution_or_github_identity(name):
+    from mimir.access_control import parse_declared_shell_commands
+
+    with pytest.raises(ValueError, match="process-control environment"):
+        parse_declared_shell_commands([{
+            "exec": "probe", "path": "/bin/echo", "subcommands": [["status"]],
+            "pass_env": [name],
+        }])
+
+
+def test_missing_declared_environment_surfaces_child_error(tmp_path, monkeypatch):
+    from mimir.access_control import parse_declared_shell_commands
+    from mimir.tools.extra import shell_exec
+
+    monkeypatch.setattr("mimir.event_logger.log_event_sync", lambda *a, **kw: None)
+    monkeypatch.delenv("ABSENT_KEY", raising=False)
+    script = tmp_path / "missing.py"
+    script.write_text("import os, sys\nif 'ABSENT_KEY' not in os.environ:\n"
+                      "    sys.exit('ABSENT_KEY not set by operator')\n")
+    declared = parse_declared_shell_commands([{
+        "exec": "python3", "path": sys.executable, "script": str(script),
+        "pass_env": ["ABSENT_KEY"],
+    }])
+    command = f"python3 {script}"
+    token = _shell_env.bind_direct_exec_argv(
+        [str(Path(sys.executable).resolve()), str(script)], command=command, declared=declared,
+    )
+    try:
+        result = shell_exec.invoke({"command": command})
+    finally:
+        _shell_env.reset_direct_exec_argv(token)
+    assert "exit=1" in result
+    assert "ABSENT_KEY not set by operator" in result
+    assert "refused" not in result
+
+
 def test_direct_exec_env_defaults_to_minimal_non_secret_environment(monkeypatch) -> None:
     monkeypatch.setenv("PYTEST_ADDOPTS", "-q")
     monkeypatch.setenv("PYTEST_PLUGINS", "example")

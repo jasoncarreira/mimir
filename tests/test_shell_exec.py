@@ -524,3 +524,112 @@ async def test_service_shell_exec_graph_executes_server_bound_argv(
     assert not Path(executed_argv[0]).is_relative_to(home)
     assert kwargs.get("shell", False) is False
     assert kwargs["env"] == direct_exec_env(expected_argv)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("async_invoke", [False, True], ids=["sync", "async"])
+async def test_declared_pass_env_reaches_only_matching_script_through_graph(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, async_invoke: bool,
+) -> None:
+    from dataclasses import replace
+
+    from deepagents import create_deep_agent
+    from langchain_core.language_models.fake_chat_models import GenericFakeChatModel
+    from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
+
+    from mimir._deepagents_patches import install_deepagents_grep_context_tool
+    from mimir.access_control import (
+        create_auth_context, get_service_principal, parse_declared_shell_commands,
+    )
+    from mimir.models import AgentEvent, InformationFlowLabels
+    from mimir.tools.budget_gate import BudgetGateMiddleware
+
+    class _ToolCallingFakeModel(GenericFakeChatModel):
+        def bind_tools(self, tools, **kwargs):
+            return self
+
+    credentials = {
+        "DECLARED_ALPHA_TOKEN": "alpha-private-value-1595",
+        "DECLARED_BETA_TOKEN": "beta-private-value-1595",
+        "UNDECLARED_TOKEN": "unrelated-private-value-1595",
+    }
+    for name, value in credentials.items():
+        monkeypatch.setenv(name, value)
+    monkeypatch.delenv("MIMIR_FILE_TOOL_ROOTS", raising=False)
+    scripts = tmp_path / "scripts"
+    scripts.mkdir()
+    declarations = []
+    commands = []
+    for name in ("DECLARED_ALPHA_TOKEN", "DECLARED_BETA_TOKEN"):
+        script = scripts / f"{name.lower()}.py"
+        # Check actual values in the child before redaction hides them from us.
+        script.write_text(
+            "import os, sys\n"
+            f"names = {list(credentials)!r}\n"
+            f"assert {{k: os.environ[k] for k in names if k in os.environ}} == "
+            f"{{{name!r}: {credentials[name]!r}}}\n"
+            f"print('child-ok:{name}')\n"
+            f"print('stdout-secret=' + os.environ[{name!r}])\n"
+            f"print('stderr-secret=' + os.environ[{name!r}], file=sys.stderr)\n",
+            encoding="utf-8",
+        )
+        declarations.append({
+            "exec": "python3", "path": sys.executable,
+            "script": str(script), "pass_env": [name],
+        })
+        commands.append(f"python3 {script}")
+    base = get_service_principal("scheduled_tick")
+    assert base is not None
+    service = replace(base, declared_shell_commands=parse_declared_shell_commands(
+        declarations, writable_roots=(),
+    ))
+    events = []
+    monkeypatch.setattr(
+        "mimir.event_logger.log_event_sync",
+        lambda kind, **fields: events.append((kind, fields)),
+    )
+    monkeypatch.setattr(
+        "mimir.tools.budget_gate._emit_event_sync",
+        lambda kind, **fields: events.append((kind, fields)),
+    )
+    install_deepagents_grep_context_tool()
+    outputs = []
+    # Separate turns avoid the first shell result's IFC labels blocking the next shell.
+    for index, command in enumerate(commands):
+        auth = create_auth_context(
+            AgentEvent(
+                trigger="scheduled_tick", channel_id="scheduler:pass-env",
+                service_principal=service.canonical, service_authority=service,
+            ),
+            enforce=True, ifc_labels=InformationFlowLabels(),
+        )
+        model = _ToolCallingFakeModel(messages=iter([
+            AIMessage(content="", tool_calls=[{
+                "name": "shell_exec", "args": {"command": command},
+                "id": f"pass-env-{index}", "type": "tool_call",
+            }]),
+            AIMessage(content="done"),
+        ]))
+        agent = create_deep_agent(
+            model=model, tools=[shell_exec], system_prompt="test",
+            middleware=[BudgetGateMiddleware()], context_schema=type(auth),
+        )
+        inputs = {"messages": [HumanMessage(content="run the script")]}
+        if async_invoke:
+            result = await agent.ainvoke(inputs, context=auth)
+        else:
+            result = agent.invoke(inputs, context=auth)
+        outputs.extend(m.content for m in result["messages"] if isinstance(m, ToolMessage))
+    assert len(outputs) == 2
+    for output, name in zip(outputs, ("DECLARED_ALPHA_TOKEN", "DECLARED_BETA_TOKEN")):
+        assert "exit=0" in output
+        assert f"child-ok:{name}" in output
+        assert "stdout-secret=[REDACTED]" in output
+        assert "stderr-secret=[REDACTED]" in output
+    assert [fields for kind, fields in events if kind == "service_shell_env_passthrough"] == [
+        {"pass_env": ["DECLARED_ALPHA_TOKEN"]},
+        {"pass_env": ["DECLARED_BETA_TOKEN"]},
+    ]
+    for secret in credentials.values():
+        assert secret not in repr(outputs)
+        assert secret not in repr(events)
