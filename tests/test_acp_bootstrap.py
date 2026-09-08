@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import os
+import pty
+import re
 import runpy
 import subprocess
 import sys
@@ -9,8 +11,23 @@ from pathlib import Path
 
 import pytest
 
-from mimir.acp import bootstrap
+from mimir.acp import bootstrap, credentials
 from mimir.acp.credentials import CredentialError, CredentialMutationUncertain
+
+
+def _intercept_tty(monkeypatch: pytest.MonkeyPatch, answer: object) -> None:
+    """Redirect only "/dev/tty". credentials.os is the os module itself, so an
+    unconditional patch also answers every unrelated open in the process."""
+    real_open = os.open
+
+    def opener(path: str, *args: object, **kwargs: object) -> int:
+        if path != "/dev/tty":
+            return real_open(path, *args, **kwargs)
+        if isinstance(answer, BaseException):
+            raise answer
+        return answer
+
+    monkeypatch.setattr(credentials.os, "open", opener)
 
 
 def invoke(tmp_path: Path, args: list[str], monkeypatch: pytest.MonkeyPatch, capfd: pytest.CaptureFixture[str]) -> tuple[int, str, str]:
@@ -230,6 +247,49 @@ def test_credential_mutation_verbs_dispatch_exactly(tmp_path: Path, monkeypatch:
     assert invoke(tmp_path, ["credential", "replace", "p"], monkeypatch, capfd) == (0, "", "replaced\n")
     assert invoke(tmp_path, ["credential", "remove", "p"], monkeypatch, capfd) == (0, "", "removed\n")
     assert store.writes == ["FIRST", "SECOND"] and store.deletes == 1
+
+
+def test_credential_replace_stores_a_secret_typed_at_a_real_terminal(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capfd: pytest.CaptureFixture[str]) -> None:
+    """The CLI's whole job is to read a secret off a terminal. Stubbing the reader
+    proves the dispatch and nothing about whether the command can run."""
+    assert invoke(tmp_path, ["profile", "add-local", "p", "--home", "/tmp"], monkeypatch, capfd)[0] == 0
+    class Store:
+        value: str | None = "OLD"
+        def require_available(self) -> None: return None
+        def get(self, name: str) -> str | None: return self.value
+        def set(self, name: str, value: str) -> None: self.value = value
+    store = Store()
+    monkeypatch.setattr("mimir.acp.credentials.NativeCredentialStore", lambda: store)
+
+    master, slave = pty.openpty()
+    _intercept_tty(monkeypatch, slave)
+
+    def prompt(text: str, stream: object) -> str:
+        stream.write(text); stream.flush()
+        return stream.readline().rstrip("\n")
+
+    reader = credentials.read_secret_from_tty
+    monkeypatch.setattr("mimir.acp.credentials.read_secret_from_tty", lambda: reader(prompt))
+    os.write(master, b"NEW-SECRET\n")
+    try:
+        assert invoke(tmp_path, ["credential", "replace", "p"], monkeypatch, capfd) == (0, "", "replaced\n")
+    finally:
+        os.close(master)
+    assert store.value == "NEW-SECRET"
+
+
+def test_unexpected_failures_name_their_origin_and_withhold_the_message(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capfd: pytest.CaptureFixture[str]) -> None:
+    assert invoke(tmp_path, ["profile", "add-local", "p", "--home", "/tmp"], monkeypatch, capfd)[0] == 0
+    class Exploding:
+        def require_available(self) -> None: raise ValueError("SECRET-IN-MESSAGE")
+        def get(self, name: str) -> None: return None
+    monkeypatch.setattr("mimir.acp.credentials.NativeCredentialStore", Exploding)
+    code, out, err = invoke(tmp_path, ["credential", "add", "p"], monkeypatch, capfd)
+    assert (code, out) == (1, "")
+    assert "SECRET-IN-MESSAGE" not in err
+    first, second = err.splitlines()
+    assert re.fullmatch(r"detail: ValueError at [\w.]+\.py:\d+", first)
+    assert second == "error: acp-failed"
 
 
 @pytest.mark.parametrize(("group", "verb"), [
