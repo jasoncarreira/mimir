@@ -6125,7 +6125,7 @@ async def test_acp_hands_read_result_allows_final_response_delivery(
     assert response.stop_reason == "end_turn"
     assert probe.result is not None
     assert probe.result.content == "notes contents"
-    assert probe.provider_calls == [("read", {"path": "./notes.txt"})]
+    assert probe.provider_calls == [("read", {"path": "/workspace/notes.txt"})]
     assert [update.session_update for update in client.updates] == [
         "user_message_chunk",
         "agent_message_chunk",
@@ -6170,7 +6170,7 @@ async def test_acp_failed_provider_result_allows_final_response_delivery(
 
     assert response.stop_reason == "end_turn"
     assert probe.result is not None and probe.result.status == "error"
-    assert probe.provider_calls == [("read", {"path": "./notes.txt"})]
+    assert probe.provider_calls == [("read", {"path": "/workspace/notes.txt"})]
     assert [update.session_update for update in client.updates] == [
         "user_message_chunk",
         "agent_message_chunk",
