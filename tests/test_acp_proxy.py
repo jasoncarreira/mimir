@@ -1136,7 +1136,9 @@ if sys.argv[1]=='wait': loop.run_forever()
         if shutdown_signal is not None:
             process.send_signal(shutdown_signal)
         stdout, stderr = await asyncio.wait_for(process.communicate(), 10)
-        assert process.returncode == (128 + shutdown_signal if shutdown_signal else 0)
+        assert process.returncode == (128 + shutdown_signal if shutdown_signal else 0), (
+            f"owned-child exit mismatch: stdout={stdout!r}, stderr={stderr!r}"
+        )
         assert stdout == b""
         if shutdown_signal is not None:
             assert stderr == b""
