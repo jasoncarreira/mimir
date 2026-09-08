@@ -214,6 +214,72 @@ raise SystemExit(bootstrap.main([]))
             await process.communicate()
 
 
+@pytest.mark.parametrize("kind", ["shell", "python"])
+@pytest.mark.parametrize("error", [PermissionError, ProcessLookupError])
+def test_sync_group_cleanup_continues_after_unsignalable_group(
+    kind: str, error: type[OSError], monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from unittest.mock import Mock
+    from mimir.acp.hosted import HostedHandsProvider
+    from mimir.acp.python_kernel import PythonKernelManager
+
+    owner = HostedHandsProvider() if kind == "shell" else PythonKernelManager()
+    owner._processes = {Mock(pid=101): 101, Mock(pid=102): 102}
+    kill = Mock(side_effect=[error("denied or gone"), None])
+    monkeypatch.setattr("os.killpg", kill)
+    if kind == "shell":
+        owner._python_kernels = Mock()
+    owner.kill_owned_process_groups()
+    assert [call.args for call in kill.call_args_list] == [(101, 9), (102, 9)]
+    if kind == "shell":
+        owner._python_kernels.kill_owned_process_groups.assert_called_once_with()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("signum", [signal.SIGTERM, signal.SIGINT, signal.SIGHUP, None])
+@pytest.mark.parametrize("error", ["PermissionError", "RuntimeError"])
+async def test_sync_cleanup_exceptions_do_not_escape_exit_boundary(
+    signum: signal.Signals | None, error: str,
+) -> None:
+    source = r'''
+import asyncio, os, sys
+from types import SimpleNamespace
+from mimir.acp import proxy
+error = getattr(__import__('builtins'), sys.argv[2])
+def outer_cleanup():
+    os.write(1, b'outer\n')
+    raise error('private outer cleanup error')
+def cleanup():
+    os.write(1, b'router\n')
+    raise error('private router cleanup error')
+async def setup():
+    hooks = proxy._ShutdownHooks(SimpleNamespace(terminate_owned_children=cleanup), outer_cleanup)
+    hooks.install()
+loop = asyncio.new_event_loop()
+asyncio.set_event_loop(loop)
+loop.run_until_complete(setup())
+if int(sys.argv[1]):
+    # The installing task is done: exit must come from _cancel, not the deadline.
+    proxy.SIGNAL_EXIT_TIMEOUT = 60
+    os.kill(os.getpid(), int(sys.argv[1]))
+    loop.run_forever()
+loop.close()
+'''
+    process = await asyncio.create_subprocess_exec(
+        sys.executable, "-c", source, str(signum or 0), error,
+        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+        cwd=Path(__file__).resolve().parents[1],
+    )
+    try:
+        stdout, stderr = await asyncio.wait_for(process.communicate(), 10)
+        assert (process.returncode, stderr) == (128 + signum if signum else 0, b"")
+        assert stdout == (b"outer\nrouter\n" if signum else b"router\n")
+    finally:
+        if process.returncode is None:
+            process.kill()
+            await process.communicate()
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("signum", [signal.SIGTERM, signal.SIGINT, signal.SIGHUP])
 async def test_signal_callback_rechecks_completed_installing_task(signum: signal.Signals) -> None:
@@ -307,8 +373,10 @@ def test_signal_reap_filter_only_suppresses_expected_watcher_diagnostic() -> Non
 @pytest.mark.asyncio
 @pytest.mark.parametrize("signum", [signal.SIGTERM, signal.SIGINT, signal.SIGHUP])
 @pytest.mark.parametrize("file_output", [False, True], ids=["pipe-output", "file-output"])
+@pytest.mark.parametrize("file_stderr", [False, True], ids=["pipe-stderr", "file-stderr"])
 async def test_local_proxy_signal_with_real_stdio_and_unix_socket(
-    signum: signal.Signals, file_output: bool, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    signum: signal.Signals, file_output: bool, file_stderr: bool,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     # Do not replace run_proxy, run_router, or open_stdio: all three must run
     # against real OS transports. Only profile/credential lookup is injected.
@@ -336,11 +404,14 @@ raise SystemExit(bootstrap.main(['--profile', 'test']))
     server = await asyncio.start_unix_server(accept, path=".mimir/acp/daemon.sock")
     output_path = tmp_path / "output"
     output_file = output_path.open("wb") if file_output else None
+    stderr_path = tmp_path / "stderr"
+    stderr_file = stderr_path.open("wb") if file_stderr else None
     process = await asyncio.create_subprocess_exec(
         sys.executable, "-c", source, str(tmp_path),
         stdin=asyncio.subprocess.PIPE,
         stdout=output_file if file_output else asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE, cwd=Path(__file__).resolve().parents[1],
+        stderr=stderr_file if file_stderr else asyncio.subprocess.PIPE,
+        cwd=Path(__file__).resolve().parents[1],
     )
     try:
         await asyncio.wait_for(connected.wait(), 10)
@@ -365,6 +436,8 @@ raise SystemExit(bootstrap.main(['--profile', 'test']))
             pytest.fail(f"real stdio startup failed: code={process.returncode}, stderr={stderr!r}")
         process.send_signal(signum)
         stdout, stderr = await asyncio.wait_for(process.communicate(), 10)
+        if file_stderr:
+            stderr = stderr_path.read_bytes()
         assert (process.returncode, stdout, stderr) == (128 + signum, None if file_output else b"", b"")
     finally:
         if process.returncode is None:
@@ -372,6 +445,8 @@ raise SystemExit(bootstrap.main(['--profile', 'test']))
             await process.communicate()
         if output_file is not None:
             output_file.close()
+        if stderr_file is not None:
+            stderr_file.close()
         for writer in peers:
             writer.close()
             try:

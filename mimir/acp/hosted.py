@@ -196,7 +196,9 @@ class HostedHandsProvider:
         for _, pgid in tuple(self._processes.items()):
             try:
                 os.killpg(pgid, 9)
-            except ProcessLookupError:
+            except (ProcessLookupError, PermissionError):
+                # Best-effort signal/atexit cleanup must continue to the other
+                # owned groups, including Python kernels, after a denied group.
                 pass
         self._python_kernels.kill_owned_process_groups()
 

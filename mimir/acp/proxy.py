@@ -1049,7 +1049,13 @@ class _ShutdownHooks:
         self._signals.clear()
 
     def _cleanup(self) -> None:
-        self._router.terminate_owned_children()
+        try:
+            self._router.terminate_owned_children()
+        except Exception:
+            # Last-resort best effort at the signal/atexit boundary. Never throw
+            # through interrupted I/O. Routing and async close failures still use
+            # record_failure; only this synchronous cleanup callback is guarded.
+            pass
 
     def record_failure(self, error: BaseException) -> None:
         if isinstance(error, (asyncio.CancelledError, ProxySignalExit)):
@@ -1083,10 +1089,19 @@ class _ShutdownHooks:
         self._watchdog.start()
         logging.getLogger("asyncio").addFilter(_SignalReapFilter())
         if self._signal_cleanup is not None:
-            self._signal_cleanup()
+            try:
+                self._signal_cleanup()
+            except Exception:
+                # An outer owned-child callback must not prevent router cleanup.
+                pass
         self._cleanup()
         # Wake the loop without throwing through an interrupted selector/transport.
-        self._loop.call_soon_threadsafe(self._cancel)
+        try:
+            self._loop.call_soon_threadsafe(self._cancel)
+        except RuntimeError:
+            # The loop may already be closed during atexit; the watchdog still
+            # owns the process deadline and repeat-signal escalation stays armed.
+            pass
 
     def _cancel(self) -> None:
         if self._task is None or self._task.done():

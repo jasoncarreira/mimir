@@ -339,7 +339,9 @@ class PythonKernelManager:
         for process, pgid in processes:
             try:
                 os.killpg(pgid, 9)
-            except ProcessLookupError:
+            except (ProcessLookupError, PermissionError):
+                # A departed group or a group no longer signalable by this uid
+                # must not throw through synchronous signal/atexit cleanup.
                 pass
 
     async def _spawn(self, cwd: str | os.PathLike[str], deadline: float) -> _Worker:
