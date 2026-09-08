@@ -73,6 +73,9 @@ RECOVERY_STATE_FILE = ".recovery.json"
 #: wedge-guard intent: a persistently-failing item can't re-fire forever.
 DEFAULT_MAX_RECOVERY_ATTEMPTS = 3
 
+#: Bound head-of-line blocking independently of successful retry attempts.
+DEFAULT_MAX_DEFER_SECONDS = 15 * 60.0
+
 #: In-flight stash entries with no terminal outcome within this window are
 #: GC'd (#310). Covers turns that vanished — a mid-turn crash or container
 #: restart that never logged turn_failed/turn_completed — so the stash
@@ -522,6 +525,7 @@ async def reconcile_failed_turns(
     relevance_check: RelevanceFn | None = None,
     max_attempts: int = DEFAULT_MAX_RECOVERY_ATTEMPTS,
     stash_ttl_hours: float = DEFAULT_STASH_TTL_HOURS,
+    max_defer_seconds: float = DEFAULT_MAX_DEFER_SECONDS,
 ) -> dict:
     """Reconcile in-flight poller events against recent turn outcomes.
 
@@ -542,7 +546,12 @@ async def reconcile_failed_turns(
     wedge-guard attempt — when ``enqueue()`` returns True. If the channel
     queue is full (False) or ``enqueue`` raises, the cycle stops without
     advancing the watermark past that outcome, so it's retried next cycle
-    rather than silently re-dropped.
+    rather than silently re-dropped. Continued rejection for
+    ``max_defer_seconds`` retires only that source entry so permanent rejection
+    cannot strand all later outcomes (#1586). The timer survives restart and
+    resets on acceptance. Old ledgers start this timer on first rejection after
+    upgrade; outcomes already rotated away or skipped by an old watermark cannot
+    be recovered by this change (the existing stash TTL still applies).
 
     Watermark (#309): advances only past FULLY-handled outcomes and to the
     outcome's own timestamp — never wall-now — so an outcome written
@@ -711,8 +720,8 @@ async def reconcile_failed_turns(
                             accepted = await enqueue(event)
                         except Exception as exc:  # noqa: BLE001
                             log.warning(
-                                "poller recovery: re-enqueue raised for %s: %s",
-                                source_id, exc,
+                                "poller recovery: re-enqueue raised (%s)",
+                                type(exc).__name__,
                             )
                             accepted = False
                         if accepted:
@@ -720,8 +729,35 @@ async def reconcile_failed_turns(
                             # re-fire (#305).
                             entry["attempts"] = attempts
                             entry["enqueued_at"] = _utc_now_iso()
+                            entry.pop("deferred_since", None)
                             summary["reenqueued"] += 1
                         else:
+                            deferred_dt = _parse_iso(entry.get("deferred_since"))
+                            if deferred_dt is None or deferred_dt.tzinfo is None:
+                                deferred_dt = now_dt
+                                entry["deferred_since"] = now_iso
+                            else:
+                                # No source payload, item refs, exception text,
+                                # or arbitrary ledger strings in diagnostics.
+                                watermark_dt = _parse_iso(watermark)
+                                log.warning(
+                                    "poller recovery: watermark stalled "
+                                    "poller=%s channel_id=%s watermark=%s elapsed_seconds=%.1f",
+                                    poller_name, channel_id,
+                                    watermark_dt.isoformat() if watermark_dt else "",
+                                    max(0.0, (now_dt - deferred_dt).total_seconds()),
+                                )
+                            if (now_dt - deferred_dt).total_seconds() >= max_defer_seconds:
+                                del inflight[source_id]
+                                summary["dropped"] += 1
+                                log.warning(
+                                    "poller recovery: deferred source retired "
+                                    "poller=%s channel_id=%s reason=enqueue_stall_timeout",
+                                    poller_name, channel_id,
+                                )
+                                if isinstance(ts, str):
+                                    watermark = max(watermark, ts)
+                                continue
                             # Queue full / raised: defer. Stop WITHOUT
                             # advancing the watermark past this outcome so
                             # it's retried next cycle (#305).
