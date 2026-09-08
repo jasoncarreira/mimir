@@ -8647,7 +8647,7 @@ def test_authorized_tainted_edit_and_shell_results_reply_only_to_originating_acp
         ),
         allowed=True,
         protected_source_resources=resources,
-        result_integrity="trusted",
+        result_integrity="untrusted" if tool_name == "hands_read" else "trusted",
     )
 
     labels = classify_protected_result(

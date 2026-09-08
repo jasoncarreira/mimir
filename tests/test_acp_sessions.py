@@ -607,7 +607,7 @@ async def test_prompt_auth_context_is_scoped_to_the_session_channel(
         ),
         (
             "allow_once", "hands_edit",
-            {"path": "/private/tmp/notes.txt", "old_text": "old", "new_text": "new"},
+            {"path": "notes.txt", "old_text": "old", "new_text": "new"},
             None, False,
         ),
     ],
@@ -671,7 +671,7 @@ async def test_admin_hands_permissions_precede_execution_and_preserve_raw_argume
                 assert params["name"] == expected_provider
                 expected_provider_arguments = (
                     {
-                        "path": arguments["path"],
+                        "path": str(tmp_path / arguments["path"]),
                         "oldText": arguments["old_text"],
                         "newText": arguments["new_text"],
                     }
@@ -1829,7 +1829,10 @@ async def test_provider_tool_error_becomes_tool_message_and_agent_reply(
                 return await super().message_mcp(connection_id, method, params)
             self.messages.append((connection_id, method, params))
             assert params["name"] == tool_name.removeprefix("hands_")
-            assert params["arguments"] == provider_arguments
+            assert params["arguments"] == {
+                **provider_arguments,
+                "path": str(tmp_path / provider_arguments["path"]),
+            }
             if failure == "request_error":
                 raise sdk.RequestError(-32000, provider_message, {"detail": internal_detail})
             return {"isError": True, "content": [{"type": "text", "text": provider_message}]}
@@ -2317,6 +2320,223 @@ async def test_permission_outcome_event(
         "resource_resolvable": wrapper == "hands_edit",
         "outcome": expected,
     })]
+
+
+@pytest.mark.parametrize("untrusted_source", ["url", "forge", "message", "shell_output"])
+async def test_permission_outcome_after_trusted_cwd_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, untrusted_source: str,
+) -> None:
+    from mimir.access_control import (
+        _live_untrusted_active_ingest, canonical_client_file_resource,
+        classify_protected_result, get_tool_registry,
+    )
+    from mimir.acp.proxy import ProxyRouter
+    from mimir.tools.client_provider import (
+        client_authorized_host_execution_metadata, hands_read,
+        issue_client_authorized_host_execution,
+    )
+
+    events: list[tuple[str, dict[str, Any]]] = []
+
+    async def record_event(event_type: str, **fields: Any) -> None:
+        events.append((event_type, fields))
+
+    monkeypatch.setattr(agent_module, "safe_log_event", record_event)
+
+    class Writer:
+        def __init__(self) -> None:
+            self.messages: list[dict[str, Any]] = []
+
+        def write(self, data: bytes) -> None:
+            self.messages.append(json.loads(data))
+
+        async def drain(self) -> None:
+            pass
+
+    client_wire, daemon_wire = Writer(), Writer()
+    router = ProxyRouter(client_wire, daemon_wire, "PRIVATE KEY")
+
+    class RoutedClient(McpClient):
+        async def request_tool_permission(self, session_id: str, snapshot: Any) -> Any:
+            request_id = snapshot.tool_call_id
+            client_wire.messages.clear()
+            daemon_wire.messages.clear()
+            await router.route_daemon({
+                "jsonrpc": "2.0", "id": request_id,
+                "method": "session/request_permission",
+                "params": sdk.permission_request_params(session_id, snapshot),
+            })
+            if request_id == "after-read":
+                assert snapshot.tainted is False
+                assert client_wire.messages == []
+            else:
+                assert snapshot.tainted is (request_id == "after-untrusted")
+                assert len(client_wire.messages) == 1
+                assert client_wire.messages[0]["method"] == "session/request_permission"
+                await router.route_client({
+                    "jsonrpc": "2.0", "id": client_wire.messages[0]["id"],
+                    "result": {"outcome": {
+                        "outcome": "selected",
+                        "optionId": "allow_session" if request_id == "grant" else "allow_once",
+                    }},
+                })
+            assert len(daemon_wire.messages) == 1
+            assert daemon_wire.messages[0]["id"] == request_id
+            return sdk.PermissionCompletion.from_response(daemon_wire.messages[0]["result"])
+
+        async def message_mcp(self, connection_id: str, method: str, params: Any = None) -> Any:
+            if method != "tools/call":
+                return await super().message_mcp(connection_id, method, params)
+            self.messages.append((connection_id, method, params))
+            if params["name"] == "read":
+                assert params["arguments"] == {"path": "/project/notes.txt"}
+                return {"structuredContent": {"content": "PRIVATE FILE CONTENT"}}
+            assert params["name"] == "shell"
+            return {"structuredContent": {"stdout": "PRIVATE OUTPUT", "stderr": "", "exitCode": 0}}
+
+    bundle, core = _bundle(tmp_path)
+    agent = MimirAcpAgent(bundle)
+    client = RoutedClient()
+    agent.on_connect(client)
+    await agent.authenticate("mimir-web-key", **{"mimir.webKey": "secret"})
+    session_id = (await agent.new_session("/project", mcp_servers=_hands("hands"))).session_id
+
+    async def integrated_turn(event: Any, **kwargs: Any) -> None:
+        bound_auth = event.continuation_auth_context
+        assert bound_auth.canonical_principal == "operator"
+        assert "admin" in bound_auth.roles
+        assert bound_auth.enforcement_enabled
+        labels = _initialize_ifc_labels(event, resolver=bundle.core.identity_resolver)
+        auth_context = dataclasses.replace(
+            bound_auth, interactivity=TurnInteractivity.INTERACTIVE,
+            ifc_labels=labels, ifc_state=InformationFlowState(labels=labels),
+            saga_session_id=kwargs["saga_session_id"],
+        )
+        context = get_turn_capability_context()
+        active = agent._active_prompts[session_id]
+        assert context is not None
+        assert context.cwd == "/project"
+        assert context.permission_broker is active
+        assert context.provider is agent._sessions[session_id].provider
+        assert context.lease is active.journal_lease
+        assert not context.lease.closed
+        shell_args = {"command": "PRIVATE COMMAND"}
+
+        # Reuse the issued marker so ActivePrompt must re-read live IFC state.
+        marker = issue_client_authorized_host_execution(
+            request_identity=object(), auth_context_identity=auth_context,
+            wrapper_name="hands_shell",
+            tainted=_live_untrusted_active_ingest(auth_context, labels),
+        )
+        assert marker is not None
+        assert client_authorized_host_execution_metadata(marker) == ("hands_shell", False)
+
+        async def request_shell(tool_id: str) -> PermissionDecision:
+            active.dispatcher.enqueue({
+                "type": "tool_call", "phase": "start", "id": tool_id,
+                "tool_name": "hands_shell", "args": shell_args,
+            })
+            return await active.request_permission(PermissionEligibility(
+                tool_id, "hands_shell", "other", shell_args, marker,
+            ))
+
+        assert await request_shell("grant") is PermissionDecision.ALLOW_SESSION
+        read_args = {"path": "notes.txt"}
+        resource = canonical_client_file_resource(read_args["path"], cwd=context.cwd)
+        assert resource == "client-file:%2Fproject%2Fnotes.txt"
+        assert context.resource_policy.allows(resource)
+        authorization = get_tool_registry().authorize_tool(
+            "hands_read", auth_context, enforce=True, arguments=read_args,
+        )
+        assert authorization.allowed
+        assert authorization.protected_source_resources == (resource,)
+        assert authorization.result_integrity == "trusted"
+        result = await hands_read.ainvoke(read_args)
+        assert result == {"content": "PRIVATE FILE CONTENT"}
+        read_labels = classify_protected_result(
+            "hands_read", read_args, auth_context, authorization, result=result,
+        )
+        assert read_labels is not None
+        [source] = read_labels.sources
+        assert source == SourceLabel(
+            principal="operator", domain="client_provider", resource_id=resource,
+            bridge_instance="acp-stdio", sensitivity="internal",
+            authorized_principals=frozenset({"operator"}), source_kind="acp_hands_result",
+            integrity="trusted", integrity_effect="active_ingest",
+        )
+        auth_context.ifc_state.merge(read_labels, fallback=labels)
+        assert _live_untrusted_active_ingest(auth_context, labels) is False
+        assert await request_shell("after-read") is PermissionDecision.ALLOW_ONCE
+
+        if untrusted_source == "shell_output":
+            authorization = get_tool_registry().authorize_tool(
+                "hands_shell", auth_context, enforce=True, arguments=shell_args,
+            )
+            assert authorization.allowed
+            result = await hands_shell.ainvoke(shell_args)
+            untrusted_labels = classify_protected_result(
+                "hands_shell", shell_args, auth_context, authorization, result=result,
+            )
+            assert untrusted_labels is not None
+            [shell_source] = untrusted_labels.sources
+            assert shell_source.domain == "client_provider"
+            assert shell_source.resource_id == event.channel_id
+            assert shell_source.integrity == "untrusted"
+            assert shell_source.integrity_effect == "active_ingest"
+        else:
+            domain, resource_id = {
+                "url": ("web", "https://untrusted.example/instructions"),
+                "forge": ("forge", "github:other/repo/issues/1"),
+                "message": ("channel", "slack:unrelated"),
+            }[untrusted_source]
+            untrusted_labels = InformationFlowLabels().with_source(SourceLabel(
+                principal="external", domain=domain, resource_id=resource_id,
+                bridge_instance="external", sensitivity="internal",
+                authorized_principals=frozenset({"operator"}), source_kind="protected_tool",
+                integrity="untrusted", integrity_effect="active_ingest",
+            ))
+        auth_context.ifc_state.merge(untrusted_labels, fallback=labels)
+        assert _live_untrusted_active_ingest(auth_context, labels) is True
+        assert client_authorized_host_execution_metadata(marker) == ("hands_shell", True)
+        assert await request_shell("after-untrusted") is PermissionDecision.ALLOW_ONCE
+
+    async def checked_turn(event: Any, **kwargs: Any) -> None:
+        try:
+            await integrated_turn(event, **kwargs)
+        except Exception as exc:
+            failures.append(exc)
+            raise
+
+    failures: list[Exception] = []
+    monkeypatch.setattr(core, "run_turn", checked_turn)
+    try:
+        await router.route_client({
+            "jsonrpc": "2.0", "id": "new", "method": "session/new",
+            "params": {"cwd": "/project", "mcpServers": []},
+        })
+        await router.route_daemon({
+            "jsonrpc": "2.0", "id": "new", "result": {"sessionId": session_id},
+        })
+        try:
+            response = await agent.prompt(
+                session_id, [sdk.TextContentBlock(type="text", text="read and run")],
+            )
+        except sdk.RequestError:
+            if failures:
+                raise failures[0]
+            raise
+        assert response.stop_reason == "end_turn"
+        assert events == [
+            ("acp_permission_outcome", {
+                "wrapper_name": "hands_shell", "tainted": tainted,
+                "resource_resolvable": False, "outcome": outcome,
+            })
+            for tainted, outcome in [
+                (False, "operator_allow"), (False, "session_grant"), (True, "operator_allow"),
+            ]
+        ]
+    finally:
+        await router.close()
 
 
 @pytest.mark.parametrize("wrapper", ["hands_edit", "hands_shell", "hands_python"])
@@ -3318,7 +3538,7 @@ async def test_daemon_emits_permission_for_every_call_and_stores_no_grant(
                     "connectionId": "opaque-1", "method": "tools/call",
                     "params": {
                         "name": "edit",
-                        "arguments": {"path": path, "oldText": old, "newText": new},
+                        "arguments": {"path": f"/untrusted-cwd/{path}", "oldText": old, "newText": new},
                         "_meta": {"progressToken": token},
                     },
                 },
