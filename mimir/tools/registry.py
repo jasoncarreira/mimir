@@ -532,6 +532,17 @@ def approve_declassification(
     return "approve_declassification failed: missing live authorization middleware"
 
 
+@tool
+def clear_ingest_taint() -> str:
+    """Acknowledge accumulated untrusted ingest on this live admin turn.
+
+    Clears only the ACP ingest-taint acknowledgement gate, not source labels or
+    other IFC restrictions. Later ingest requires another acknowledgement.
+    This audited action requires live authorization middleware.
+    """
+    return "clear_ingest_taint failed: missing live authorization middleware"
+
+
 def _render_approval_metadata(value: object) -> str:
     """Render one approval-prompt value without allowing line injection."""
     return json.dumps(value, ensure_ascii=True)
@@ -3024,6 +3035,7 @@ def all_mimir_tools(
     from .operator_alert import operator_alert
     tools = [
         approve_declassification,
+        clear_ingest_taint,
         request_operator_approval,
         # Memory (read + write)
         memory_query, memory_get, memory_store,

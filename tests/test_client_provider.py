@@ -246,7 +246,9 @@ def test_client_authorized_host_execution_metadata_is_live_and_fails_closed() ->
         def current(self, fallback: object) -> object:
             return fallback
 
-        def has_untrusted_active_ingest(self, fallback: object) -> object:
+        def permission_has_untrusted_active_ingest(self, fallback: object) -> object:
+            if isinstance(self.tainted, Exception):
+                raise self.tainted
             return self.tainted
 
     state = State()
@@ -277,6 +279,8 @@ def test_client_authorized_host_execution_metadata_is_live_and_fails_closed() ->
             "hands_edit", True,
         )
         state.tainted = object()
+        assert client_authorized_host_execution_metadata(marker) is None
+        state.tainted = RuntimeError("unavailable live taint")
         assert client_authorized_host_execution_metadata(marker) is None
         state.tainted = False
         lease.close()

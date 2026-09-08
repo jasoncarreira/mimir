@@ -23,7 +23,6 @@ from ..acp.hands_contract import (
 from ..access_control import (
     CLIENT_FILE_RESOURCE_POLICY,
     ClientFileResourcePolicy,
-    _live_untrusted_active_ingest,
     canonical_client_file_resource,
 )
 
@@ -417,7 +416,10 @@ def client_authorized_host_execution_metadata(
         labels = current(auth_context.ifc_labels) if callable(current) else None
     except Exception:
         return None
-    tainted = _live_untrusted_active_ingest(auth_context, labels)
+    try:
+        tainted = state.permission_has_untrusted_active_ingest(labels)
+    except Exception:
+        return None
     if not isinstance(tainted, bool):
         return None
     return execution.wrapper_name, tainted
