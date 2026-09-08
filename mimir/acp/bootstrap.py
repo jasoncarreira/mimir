@@ -89,6 +89,15 @@ def _status(value: str) -> None:
 def _error(code: str) -> int:
     _status(f"error: {code}"); return 1
 
+def _origin(exc: BaseException) -> str:
+    """Where an unexpected failure came from. The type and site only: an exception
+    message can carry the secret the failing call was handling."""
+    site = None
+    frame = exc.__traceback__
+    while frame is not None:
+        site = f"{os.path.basename(frame.tb_frame.f_code.co_filename)}:{frame.tb_lineno}"; frame = frame.tb_next
+    return f"{type(exc).__name__} at {site or 'unknown'}"
+
 
 def _profile_command(args: argparse.Namespace, output: BinaryIO) -> int:
     from .profiles import Profile, ProfileError, ProfileStore, RemoteProfile
@@ -183,7 +192,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         except SystemExit as exc: return int(exc.code)
         try: return _dispatch(args, output)
         except (BrokenPipeError, ConnectionResetError): return 0
-        except BaseException: return _error("acp-failed")
+        except BaseException as exc: _status(f"detail: {_origin(exc)}"); return _error("acp-failed")
     finally:
         try: output.close()
         except Exception: pass

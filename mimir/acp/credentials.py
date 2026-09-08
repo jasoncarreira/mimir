@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import getpass
+import io
 import os
 import re
 from typing import Any, Callable
@@ -119,7 +120,9 @@ def read_secret_from_tty(prompt: Callable[..., str] = getpass.getpass) -> str:
     try:
         if not os.isatty(fd):
             raise CredentialError("tty-required")
-        with os.fdopen(fd, "r+", encoding="utf-8", closefd=False) as tty:
+        # A terminal is not seekable, so the buffered-random object os.fdopen("r+")
+        # builds cannot wrap one; layer text over the raw file the way getpass does.
+        with io.TextIOWrapper(io.FileIO(fd, "r+", closefd=False), encoding="utf-8", write_through=True) as tty:
             try:
                 return prompt("Credential: ", stream=tty)
             except BaseException as exc:
