@@ -403,6 +403,15 @@ def protected_read_denial_reason(path: Path) -> str | None:
 
     auth_context = getattr(get_current_turn(), "auth_context", None)
     authority = getattr(auth_context, "service_authority", None)
+    # The backend route spans the lease directory, not just this turn's lease.
+    # Recheck the live grant so sibling or revoked checkouts cannot be read
+    # merely because an earlier authorization admitted the tool call.
+    if (
+        getattr(auth_context, "is_service", False)
+        and getattr(authority, "authority_profile", None) == "github"
+        and not service_scoped
+    ):
+        return "service_scoped_read_boundary"
     memory_scope_denied = (
         is_memory_read_path(path)
         and not is_memory_read_path_allowed(path, auth_context)
@@ -482,6 +491,24 @@ def is_current_service_scoped_read_path(path: Path) -> bool:
 
     turn = get_current_turn()
     auth_context = getattr(turn, "auth_context", None)
+    authority = getattr(auth_context, "service_authority", None)
+    from .access_control import service_filesystem_read_roots
+
+    if getattr(authority, "authority_profile", None) == "github":
+        roots = service_filesystem_read_roots(authority, auth_context=auth_context)
+        home = _resolved_mimir_home()
+        if home is not None:
+            roots = (*roots, home / "memory")
+        try:
+            root = max(
+                (root for root in roots if path.is_relative_to(root)),
+                key=lambda root: len(root.parts),
+            )
+            if not path.resolve(strict=True).is_relative_to(root.resolve(strict=True)):
+                return False
+            return not is_memory_read_path(path) or is_memory_read_path_allowed(path, auth_context)
+        except (OSError, RuntimeError, ValueError):
+            return False
     if is_memory_read_path_allowed(path, auth_context):
         return True
     authority = getattr(auth_context, "service_authority", None)
@@ -653,8 +680,16 @@ def resolve_non_admin_read_target(
     candidate = Path(raw_path)
     if not candidate.is_absolute():
         return None
+    from ._context import get_current_turn
+    from .access_control import service_filesystem_read_roots
+
+    auth_context = getattr(get_current_turn(), "auth_context", None)
+    authority = getattr(auth_context, "service_authority", None)
+    # Execution-only roots must not enter the configured-root list: shell cwd
+    # selection also consumes that list. The service resolver validates leases.
+    service_roots = service_filesystem_read_roots(authority, auth_context=auth_context)
     root_pairs: list[tuple[Path, Path]] = []
-    for root in configured_non_admin_read_roots():
+    for root in (*configured_non_admin_read_roots(), *service_roots):
         try:
             resolved_root = root.resolve(strict=True)
         except (OSError, RuntimeError):
@@ -724,6 +759,7 @@ def resolve_non_admin_read_target(
         and (resolved == artifact_root or resolved.is_relative_to(artifact_root))
         or turn_scratch is not None
         and (resolved == turn_scratch or resolved.is_relative_to(turn_scratch))
+        or is_current_service_scoped_read_path(resolved)
     ):
         return None
     # Bind the call to the most specific root named by the caller. A repo path
@@ -734,21 +770,18 @@ def resolve_non_admin_read_target(
     if not (resolved == selected_root or resolved.is_relative_to(selected_root)):
         return None
     if (
-        is_protected_read_path(resolved)
+        protected_read_denial_reason(resolved) is not None
         and not is_large_tool_results_path(resolved)
         and not (allow_home_root and resolved == home)
     ):
         return None
-    from ._context import get_current_turn
-
-    auth_context = getattr(get_current_turn(), "auth_context", None)
     if is_memory_read_path(resolved) and not is_memory_read_path_allowed(
         resolved, auth_context,
     ):
         return None
     if scan_file and (
         not resolved.is_file()
-        or not is_large_tool_results_path(resolved) and file_contains_secret(resolved)
+        or protected_read_result_reason(resolved) is not None
     ):
         return None
     return resolved

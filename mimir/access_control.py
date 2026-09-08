@@ -1016,6 +1016,21 @@ def service_filesystem_read_roots(
     if proposal_root is not None and service == get_trusted_service_from_auth_context(auth_context):
         roots.append(proposal_root)
     if (
+        getattr(service, "authority_profile", None) == "github"
+        and service == get_trusted_service_from_auth_context(auth_context)
+    ):
+        registry = getattr(auth_context, "repo_pr_scope_registry", None)
+        states = list(registry.review_states) if registry is not None else [
+            getattr(auth_context, "repo_review_state", None)
+        ]
+        discovered = getattr(auth_context, "server_discovered_pr_states", None)
+        if discovered is not None:
+            states.extend(discovered.review_states)
+        for state in states:
+            lease = getattr(state, "checkout_lease", None)
+            if lease is not None and _target_within_active_pr_checkout_lease(str(lease.path), state):
+                roots.append(Path(lease.path))
+    if (
         getattr(service, "trigger", None) == "poller"
         and str(getattr(service, "canonical", "")).startswith("poller:")
         and getattr(service, "owned_skill_directory", None)
@@ -4206,20 +4221,43 @@ def _service_shell_typed_tool_guidance(
     return ""
 
 
-def _service_shell_not_admitted_reason(argv: list[str], destination: str) -> str:
+def _service_shell_not_admitted_reason(
+    argv: list[str], destination: str, *, service: "ServicePrincipal | None" = None,
+) -> str:
     """Explain that a well-formed command is outside the profile's allowlist."""
+    if service is not None:
+        alternatives = sorted(
+            name for name in service.capabilities
+            if name.startswith(("pr_", "repo_"))
+            or name in {"issue_comment", "read_file", "glob", "grep", "ls"}
+        )
+        guidance = (
+            f" Available typed tools: {', '.join(alternatives)}."
+            if alternatives else ""
+        )
+        guidance += (
+            " If a typed operation is unavailable, use unsupported_operation to report "
+            "the limitation; do not retry through shell or HTTP commands."
+            if "unsupported_operation" in service.capabilities else
+            " If a typed operation is unavailable, report the limitation; "
+            "do not retry through shell or HTTP commands."
+        )
     if destination == "repo_review":
         return (
             "The repo_review shell profile admits only hardened local read-only Git "
             "inspection bound to a server-owned PR state with inspect permission. "
             "All gh commands, Git mutations and network operations, generic commands, "
             "and shell test/install commands are refused, including declared-command "
-            "and project-test overrides. Use typed pr_* tools for GitHub reads and "
-            "reviews, issue_comment for issue comments, and typed repo_* tools for "
-            "checkout, fetch, tests, and mutations. Use read_file, glob, grep, or ls "
-            "for bounded filesystem inspection. If a typed operation is unavailable, "
-            "report the limitation; do not retry through shell or HTTP commands."
-            + _service_shell_typed_tool_guidance(argv, destination)
+            "and project-test overrides."
+            + (
+                guidance if service is not None else
+                " Use typed pr_* tools for GitHub reads and "
+                "reviews, issue_comment for issue comments, and typed repo_* tools for "
+                "checkout, fetch, tests, and mutations. Use read_file, glob, grep, or ls "
+                "for bounded filesystem inspection. If a typed operation is unavailable, "
+                "report the limitation; do not retry through shell or HTTP commands."
+                + _service_shell_typed_tool_guidance(argv, destination)
+            )
         )
     supplied = [token for token in argv[1:] if token.startswith("-")]
     named = sorted({
@@ -4256,7 +4294,8 @@ def _service_shell_not_admitted_reason(argv: list[str], destination: str) -> str
         )
     else:
         boundary = admitted = ""
-    guidance = _service_shell_typed_tool_guidance(argv, destination)
+    if service is None:
+        guidance = _service_shell_typed_tool_guidance(argv, destination)
     return (
         f"the {destination!r} trusted-service shell profile does not admit "
         f"{_service_shell_command_shape(argv)!r}.{option_text} This profile "
@@ -4463,7 +4502,7 @@ def parse_service_shell_argv_with_diagnostics(
             return git_argv, "", None
         return (
             None,
-            _service_shell_not_admitted_reason(argv, destination),
+            _service_shell_not_admitted_reason(argv, destination, service=service),
             ServiceShellBindingRule.PROFILE_ALLOWLIST,
         )
 
@@ -4510,7 +4549,7 @@ def parse_service_shell_argv_with_diagnostics(
             if git_argv is None:
                 return (
                     None,
-                    _service_shell_not_admitted_reason(argv, destination),
+                    _service_shell_not_admitted_reason(argv, destination, service=service),
                     ServiceShellBindingRule.PROFILE_ALLOWLIST,
                 )
             return git_argv, "", None
@@ -4523,7 +4562,7 @@ def parse_service_shell_argv_with_diagnostics(
             if git_argv is None:
                 return (
                     None,
-                    _service_shell_not_admitted_reason(argv, destination),
+                    _service_shell_not_admitted_reason(argv, destination, service=service),
                     ServiceShellBindingRule.PROFILE_ALLOWLIST,
                 )
             return git_argv, "", None
@@ -4539,7 +4578,7 @@ def parse_service_shell_argv_with_diagnostics(
     if not allowed:
         return (
             None,
-            _service_shell_not_admitted_reason(argv, destination),
+            _service_shell_not_admitted_reason(argv, destination, service=service),
             # Distinguish "this job declared commands and none matched" from
             # "the profile refused it" so a denial event says which gate spoke.
             # ``destination`` keeps meaning the profile, so existing shadow-authz
@@ -5013,6 +5052,8 @@ def _trigger_service_read_target_is_allowed(
         ):
             return False
         resolved = candidate.resolve(strict=True)
+        if service.authority_profile == "github":
+            resolved.relative_to(lexical_root.resolve(strict=True))
         # Infrastructure roots are created lazily on first use. A missing
         # sibling root must not invalidate an otherwise valid existing scope.
         resolved_roots = tuple(root.resolve(strict=False) for root in roots)
@@ -8758,6 +8799,7 @@ class ToolRegistry:
                     )
                     allowed = scoped_read_allowed or (
                         service_allowed
+                        and service_principal.authority_profile != "github"
                         and not targets_memory
                         and not targets_scratch
                         # Attachment access follows scoped roots, not a generic

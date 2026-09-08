@@ -685,6 +685,23 @@ class _BoundedFilesystemBackend(FilesystemBackend):
         self._grep_timeout_seconds = grep_timeout_seconds
         self._glob_timeout_seconds = glob_timeout_seconds
 
+    def _resolve_read_path(self, key: str) -> Path:
+        from ._context import get_current_turn
+        from .read_policy import is_current_service_scoped_read_path, non_admin_read_filter_enabled
+
+        resolved = self._resolve_path(key)
+        auth = getattr(get_current_turn(), "auth_context", None)
+        authority = getattr(auth, "service_authority", None)
+        if non_admin_read_filter_enabled() and getattr(authority, "authority_profile", None) == "github":
+            # Composite routes strip the shared lease parent, not the caller's
+            # selected lease. Check that spelling before resolution loses it.
+            lexical = Path(key)
+            if self.virtual_mode and not lexical.is_relative_to(self.cwd):
+                lexical = self.cwd / key.lstrip("/")
+            if lexical != resolved and not is_current_service_scoped_read_path(lexical):
+                raise ValueError("Read denied: service_scoped_read_boundary")
+        return resolved
+
     def _is_excluded(
         self,
         path: Path,
@@ -1042,7 +1059,7 @@ class _BoundedFilesystemBackend(FilesystemBackend):
                 matches=[],
             )
         try:
-            base_full = self._resolve_path(path or ".")
+            base_full = self._resolve_read_path(path or ".")
         except ValueError:
             return GrepResult(matches=[])
         except (OSError, RuntimeError) as e:
@@ -1127,7 +1144,7 @@ class _BoundedFilesystemBackend(FilesystemBackend):
             return GlobResult(error="Path traversal not allowed in glob pattern", matches=[])
 
         try:
-            search_path = self.cwd if path is None or path == "/" else self._resolve_path(path)
+            search_path = self._resolve_read_path(path or "/")
             from .read_policy import (
                 is_mimir_home_root,
                 non_admin_read_filter_enabled,
@@ -1145,7 +1162,7 @@ class _BoundedFilesystemBackend(FilesystemBackend):
                     return GlobResult(error=message, matches=[])
             if not search_path.exists():
                 return GlobResult(matches=[])
-        except (OSError, RuntimeError) as e:
+        except (OSError, RuntimeError, ValueError) as e:
             display_path = path if path is not None else "<default>"
             return GlobResult(error=f"Error globbing path '{display_path}': {e}", matches=[])
 
@@ -1273,7 +1290,7 @@ class _BoundedFilesystemBackend(FilesystemBackend):
         filtering = non_admin_read_filter_enabled()
         if filtering:
             try:
-                requested = self._resolve_path(path)
+                requested = self._resolve_read_path(path)
                 reason = (
                     None
                     if is_mimir_home_root(requested)
@@ -1307,7 +1324,7 @@ class _BoundedFilesystemBackend(FilesystemBackend):
             safe = []
             for entry in filtered:
                 try:
-                    resolved = self._resolve_path(str(entry.get("path", "")).rstrip("/"))
+                    resolved = self._resolve_read_path(str(entry.get("path", "")).rstrip("/"))
                 except (OSError, RuntimeError, ValueError):
                     from .read_policy import emit_hard_read_denial
 
@@ -1415,7 +1432,7 @@ class _RootAwareFilesystemBackend(_BoundedFilesystemBackend):
 
         if non_admin_read_filter_enabled():
             try:
-                resolved = self._resolve_path(file_path)
+                resolved = self._resolve_read_path(file_path)
                 reason = protected_read_result_reason(resolved)
                 if reason is not None:
                     from .read_policy import emit_hard_read_denial, record_read_policy_refusal
@@ -1448,7 +1465,7 @@ class _RootAwareFilesystemBackend(_BoundedFilesystemBackend):
 
         if non_admin_read_filter_enabled():
             try:
-                resolved = self._resolve_path(file_path)
+                resolved = self._resolve_read_path(file_path)
                 reason = protected_read_result_reason(resolved)
                 if reason is not None:
                     from .read_policy import emit_hard_read_denial, record_read_policy_refusal
