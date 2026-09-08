@@ -2160,7 +2160,7 @@ async def test_active_prompt_permission_uses_admitted_snapshot_and_is_once_scope
 
         async def request_tool_permission(self, session_id: str, snapshot: Any) -> Any:
             self.snapshots.append((session_id, snapshot))
-            return SimpleNamespace(decision="allow_once", error=None)
+            return sdk.PermissionCompletion("allow_once")
 
     lease = JournalLease("00000000-0000-0000-0000-000000000001", 1, 1)
     dispatcher = UpdateDispatcher(Publisher(), lease, 1)
@@ -2207,6 +2207,7 @@ async def test_active_prompt_permission_uses_admitted_snapshot_and_is_once_scope
         "acp_permission_guard_snapshot_missing",
         "acp_permission_guard_snapshot_mismatch",
         "acp_permission_guard_host_execution_missing",
+        "acp_permission_outcome",
         "acp_permission_guard_snapshot_mismatch",
         "acp_permission_guard_prompt_not_current",
     ]
@@ -2216,6 +2217,104 @@ async def test_active_prompt_permission_uses_admitted_snapshot_and_is_once_scope
     with pytest.raises(asyncio.CancelledError):
         await forwarder
     await dispatcher.close()
+
+
+@pytest.mark.parametrize("answer,expected", [
+    ("allow_once", "operator_allow"),
+    ("allow_session", "operator_allow"),
+    ("reject_once", "operator_reject"),
+    ("cancelled", "cancelled"),
+    ("local_cancel", "cancelled"),
+    ("error", "cancelled"),
+    ("stale", "cancelled"),
+    ("session_grant", "session_grant"),
+])
+@pytest.mark.parametrize("wrapper", ["hands_edit", "hands_shell"])
+async def test_permission_outcome_event(
+    monkeypatch: pytest.MonkeyPatch, answer: str, expected: str, wrapper: str,
+) -> None:
+    from mimir.acp.proxy import ProxyRouter
+
+    events = []
+
+    async def record_event(event_type: str, **fields: Any) -> None:
+        events.append((event_type, fields))
+
+    monkeypatch.setattr(agent_module, "safe_log_event", record_event)
+    arguments = (
+        {"path": "/private/secret%20file", "old_text": "PRIVATE OLD", "new_text": "PRIVATE NEW"}
+        if wrapper == "hands_edit" else {"command": "PRIVATE COMMAND"}
+    )
+    tainted = answer != "session_grant"
+    snapshot = sdk.PermissionSnapshot("tool", wrapper, "other", arguments, wrapper, tainted)
+
+    class Dispatcher:
+        async def drain(self) -> None:
+            pass
+
+        def permission_snapshot(self, tool_call_id: str) -> Any:
+            assert tool_call_id == "tool"
+            return snapshot
+
+    class Writer:
+        def __init__(self) -> None:
+            self.messages = []
+
+        def write(self, data: bytes) -> None:
+            self.messages.append(json.loads(data))
+
+        async def drain(self) -> None:
+            pass
+
+    class Peer:
+        async def request_tool_permission(self, session_id: str, snapshot: Any) -> Any:
+            if answer == "session_grant":
+                client, daemon = Writer(), Writer()
+                router = ProxyRouter(client, daemon, "PRIVATE KEY")
+                router._active_sessions.add(session_id)
+                router._grants.add(session_id, wrapper)
+                try:
+                    await router.route_daemon({
+                        "jsonrpc": "2.0", "id": 1, "method": "session/request_permission",
+                        "params": sdk.permission_request_params(session_id, snapshot),
+                    })
+                    assert client.messages == []
+                    assert len(daemon.messages) == 1
+                    return sdk.PermissionCompletion.from_response(daemon.messages[0]["result"])
+                finally:
+                    await router.close()
+            if answer == "local_cancel":
+                raise asyncio.CancelledError
+            if answer == "error":
+                return sdk.PermissionCompletion("reject_once", RuntimeError("PRIVATE ERROR"))
+            if answer == "stale":
+                lease.close()
+                return sdk.PermissionCompletion("allow_once")
+            return sdk.PermissionCompletion(answer)
+
+    lease = JournalLease("00000000-0000-0000-0000-000000000001", 1, 1)
+    session = SimpleNamespace(
+        provider=SimpleNamespace(peer=Peer(), agent=SimpleNamespace(_boundary_lock=asyncio.Lock())),
+        generation=1, prompt_epoch=1, record=SimpleNamespace(session_id="session"),
+    )
+    active = ActivePrompt(
+        session, 1, 1, None, None, None, Dispatcher(), lease, asyncio.get_running_loop(),
+    )
+    session.active_prompt = active
+    decision = await active.request_permission(PermissionEligibility("tool", wrapper, "other", arguments))
+    assert decision == {
+        "session_grant": PermissionDecision.ALLOW_ONCE,
+        "local_cancel": PermissionDecision.CANCELLED,
+        "error": PermissionDecision.CANCELLED,
+        "stale": PermissionDecision.CANCELLED,
+    }.get(answer, answer)
+    # Exact schema rejects accidental argument, path, content, or key disclosure.
+    assert events == [("acp_permission_outcome", {
+        "wrapper_name": wrapper,
+        "tainted": tainted,
+        "resource_resolvable": wrapper == "hands_edit",
+        "outcome": expected,
+    })]
 
 
 @pytest.mark.parametrize("earlier_outcome", ["complete", "cancel"])

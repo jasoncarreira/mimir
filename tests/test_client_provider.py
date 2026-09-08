@@ -28,6 +28,7 @@ from mimir.tools.client_provider import (
     HANDS_TOOLS,
     MIMIR_HANDS_V1,
     PROVIDER_PROFILES,
+    PermissionEligibility,
     TurnCapabilityContext,
     get_provider_profile,
     hands_edit,
@@ -418,6 +419,91 @@ def test_client_file_identity_is_opaque_canonical_utf8() -> None:
     assert not CLIENT_FILE_RESOURCE_POLICY.allows("client-file:any/path")
     assert not CLIENT_FILE_RESOURCE_POLICY.allows("client-file:%gg")
     assert not CLIENT_FILE_RESOURCE_POLICY.allows("file:any")
+
+
+@pytest.mark.parametrize("wrapper", [hands_read, hands_edit])
+@pytest.mark.parametrize(("path", "resource"), [
+    ("relative/../x", "client-file:relative%2F..%2Fx"),
+    ("/tmp/a b", "client-file:%2Ftmp%2Fa%20b"),
+    ("%2f//é\\file", "client-file:%252f%2F%2F%C3%A9%5Cfile"),
+])
+@pytest.mark.parametrize("allowed", [True, False])
+async def test_eligibility_resource_matches_wrapper_policy(
+    wrapper: Any, path: str, resource: str, allowed: bool,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    arguments = {"path": path}
+    wire_arguments = {"path": path}
+    if wrapper is hands_edit:
+        arguments.update(old_text="old", new_text="new")
+        wire_arguments.update(oldText="old", newText="new")
+    eligibility = PermissionEligibility("call", wrapper.name, "other", arguments)
+    assert eligibility.canonical_client_resource == resource
+    checked = []
+
+    def allows(self: ClientFileResourcePolicy, candidate: str) -> bool:
+        assert self is CLIENT_FILE_RESOURCE_POLICY
+        checked.append(candidate)
+        return allowed
+
+    monkeypatch.setattr(ClientFileResourcePolicy, "allows", allows)
+    provider = FakeProvider({"read": {"content": "ok"}, "edit": {"changed": True}})
+    token = set_turn_capability_context(_context(provider))
+    try:
+        if allowed:
+            await wrapper.ainvoke(arguments)
+        else:
+            with pytest.raises(ToolException, match="path is not authorized"):
+                await wrapper.ainvoke(arguments)
+    finally:
+        reset_turn_capability_context(token)
+    assert checked == [eligibility.canonical_client_resource]
+    assert provider.calls == ([(wrapper.name.removeprefix("hands_"), wire_arguments)] if allowed else [])
+
+
+@pytest.mark.parametrize("wrapper", [hands_read, hands_edit])
+@pytest.mark.parametrize("path", ["", "bad\x00path", "\ud800"])
+async def test_invalid_eligibility_resource_still_denied(wrapper: Any, path: str) -> None:
+    arguments = {"path": path}
+    if wrapper is hands_edit:
+        arguments.update(old_text="old", new_text="new")
+    eligibility = PermissionEligibility("call", wrapper.name, "other", arguments)
+    assert eligibility.canonical_client_resource is None
+    provider = FakeProvider({})
+    token = set_turn_capability_context(_context(provider))
+    try:
+        with pytest.raises(ToolException, match="path is not authorized"):
+            await wrapper.ainvoke(arguments)
+    finally:
+        reset_turn_capability_context(token)
+    assert provider.calls == []
+
+
+@pytest.mark.parametrize(("title", "arguments"), [
+    ("hands_shell", {"command": "pwd"}),
+    ("hands_python", {"code": "1 + 1"}),
+    ("other_tool", {"path": "not-a-client-target"}),
+    ("hands_read", {}),
+    ("hands_edit", {"path": None}),
+    ("hands_read", {"path": 1}),
+])
+def test_eligibility_without_client_file_target_has_no_resource(
+    title: str, arguments: dict[str, Any],
+) -> None:
+    assert PermissionEligibility("call", title, "other", arguments).canonical_client_resource is None
+
+
+def test_eligibility_resource_cannot_be_supplied_as_trusted_metadata() -> None:
+    arguments = {"path": "%2F", "canonical_client_resource": "client-file:forged"}
+    eligibility = PermissionEligibility("call", "hands_read", "other", arguments)
+    assert eligibility.canonical_client_resource == "client-file:%252F"
+    with pytest.raises(TypeError, match="canonical_client_resource"):
+        PermissionEligibility(
+            "call", "hands_read", "other", arguments,
+            canonical_client_resource="client-file:forged",
+        )
+    with pytest.raises(FrozenInstanceError):
+        eligibility.canonical_client_resource = "client-file:forged"
 
 
 @pytest.mark.asyncio
