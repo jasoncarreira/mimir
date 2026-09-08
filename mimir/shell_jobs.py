@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import subprocess
 import threading
 import time
@@ -133,6 +134,7 @@ class ShellJob:
     auth_context: object | None = None
     stdout_truncated: bool = False
     stderr_truncated: bool = False
+    redact_values: tuple[str, ...] = field(default=(), repr=False)
     _process: Optional[subprocess.Popen] = field(default=None, repr=False)
     _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
 
@@ -273,6 +275,7 @@ class ShellJobRegistry:
         on_complete: Optional[Callable[["ShellJob"], None]] = None,
         auth_context: object | None = None,
         env_overlay: Optional[dict[str, Optional[str]]] = None,
+        redact_values: tuple[str, ...] = (),
         cwd: Optional[os.PathLike] = None,
     ) -> ShellJob:
         """Spawn argv as a subprocess and register it.
@@ -295,10 +298,21 @@ class ShellJobRegistry:
         ``env_overlay`` merges into the inherited env after defaults
         are applied; keys map to None to *unset* an inherited var.
         ``cwd`` overrides the working directory the subprocess starts in.
+        ``redact_values`` masks exact nonempty values before capture or tail
+        truncation, including values split across pipe reads.
         """
         # Eagerly evict finished jobs that have aged out, bounding the
         # registry size and freeing their on-disk output files.
         self._evict_stale()
+        secrets = sorted(
+            {value.encode("utf-8") for value in redact_values if value},
+            key=len, reverse=True,
+        )
+        redactor = (
+            re.compile(b"|".join(re.escape(value) for value in secrets))
+            if secrets else None
+        )
+        lookbehind = len(secrets[0]) - 1 if secrets else 0
 
         # chainlink #387: cap concurrently-live jobs. The waiter fix stops stuck
         # jobs from leaking forever, but a flood of legitimately-running jobs
@@ -347,11 +361,13 @@ class ShellJobRegistry:
             if os.name != "nt":
                 popen_kwargs["start_new_session"] = True
             proc = subprocess.Popen(argv, **popen_kwargs)
-        except Exception:
+        except Exception as exc:
             stdout_f.close()
             stderr_f.close()
             stdout_path.unlink(missing_ok=True)
             stderr_path.unlink(missing_ok=True)
+            if secrets:
+                raise RuntimeError(f"shell job spawn failed ({type(exc).__name__})") from None
             raise
 
         started_at = time.time()
@@ -365,12 +381,14 @@ class ShellJobRegistry:
             last_live_signal=started_at,
             channel_id=channel_id,
             auth_context=auth_context,
+            redact_values=tuple(redact_values),
             _process=proc,
         )
 
         def _drain(stream, outfile, stream_name, on_signal):
             written = 0
             write_enabled = True
+            pending = b""
             try:
                 while True:
                     try:
@@ -379,7 +397,25 @@ class ShellJobRegistry:
                         # Our pipe end was closed by _waiter to reclaim a drainer
                         # wedged on a backgrounded grandchild's held pipe (#387).
                         break
-                    if not chunk:
+                    eof = not chunk
+                    if redactor is not None and write_enabled:
+                        pending += chunk
+                        # Keep undecidable suffix bytes private until the next
+                        # read. Matches crossing the safe boundary are consumed
+                        # whole, with longest alternatives taking precedence.
+                        end = len(pending) if eof else max(0, len(pending) - lookbehind)
+                        parts = []
+                        start = 0
+                        for match in redactor.finditer(pending):
+                            if match.start() >= end:
+                                break
+                            parts.extend((pending[start:match.start()], b"[REDACTED]"))
+                            start = match.end()
+                            end = max(end, start)
+                        parts.append(pending[start:end])
+                        chunk = b"".join(parts)
+                        pending = pending[end:]
+                    if eof and not chunk:
                         break
                     if write_enabled:
                         remaining = SHELL_JOB_OUTPUT_MAX_BYTES_PER_STREAM - written
@@ -408,9 +444,11 @@ class ShellJobRegistry:
                                     "remaining output: %s",
                                     job_id,
                                     stream_name,
-                                    exc,
+                                    type(exc).__name__ if secrets else exc,
                                 )
                     on_signal()
+                    if eof:
+                        break
             finally:
                 try:
                     outfile.close()
@@ -458,7 +496,10 @@ class ShellJobRegistry:
                     on_complete(job)
                 except Exception:
                     # Never let a callback error break the registry.
-                    log.exception("on_complete callback raised for job %s", job_id)
+                    if secrets:
+                        log.error("on_complete callback raised for job %s", job_id)
+                    else:
+                        log.exception("on_complete callback raised for job %s", job_id)
 
         drain_threads = [
             threading.Thread(

@@ -3120,7 +3120,12 @@ class BudgetGateMiddleware(AgentMiddleware):
             ):
                 from ._shell_env import bind_direct_exec_argv
 
-                direct_argv_token = bind_direct_exec_argv(direct_argv)
+                service = get_trusted_service_from_auth_context(auth_context)
+                direct_argv_token = bind_direct_exec_argv(
+                    direct_argv,
+                    command=request.tool_call["args"].get("command", ""),
+                    declared=getattr(service, "declared_shell_commands", ()) or (),
+                )
             from ..access_control import (
                 begin_protected_result_capture,
                 end_protected_result_capture,
@@ -3651,7 +3656,12 @@ class BudgetGateMiddleware(AgentMiddleware):
             ):
                 from ._shell_env import bind_direct_exec_argv
 
-                direct_argv_token = bind_direct_exec_argv(direct_argv)
+                service = get_trusted_service_from_auth_context(auth_context)
+                direct_argv_token = bind_direct_exec_argv(
+                    direct_argv,
+                    command=request.tool_call["args"].get("command", ""),
+                    declared=getattr(service, "declared_shell_commands", ()) or (),
+                )
             from ..access_control import (
                 begin_protected_result_capture,
                 end_protected_result_capture,

@@ -340,10 +340,12 @@ async def bash_async(
                     f"a retry.  To see all in-flight jobs: bash_jobs_list()."
                 )
 
+    redact_names: tuple[str, ...] = ()
     try:
         from ._shell_env import (
             bound_direct_exec_argv,
             direct_exec_env_overlay,
+            direct_exec_pass_env,
             login_shell_command,
         )
         direct_argv = bound_direct_exec_argv()
@@ -363,7 +365,13 @@ async def bash_async(
         if cwd:
             spawn_kwargs["cwd"] = str(Path(cwd).expanduser())
         if direct_argv is not None:
-            spawn_kwargs["env_overlay"] = direct_exec_env_overlay(argv)
+            redact_names = direct_exec_pass_env(argv)
+            overlay = direct_exec_env_overlay(argv)
+            spawn_kwargs["env_overlay"] = overlay
+            if redact_names:
+                spawn_kwargs["redact_values"] = tuple(
+                    value for name in redact_names if (value := overlay.get(name))
+                )
         job = _REGISTRY.spawn(
             command,  # original (clean) command recorded for display
             **spawn_kwargs,
@@ -374,6 +382,8 @@ async def bash_async(
             else getattr(ctx, "ifc_labels", None)
         )
     except Exception as exc:  # noqa: BLE001
+        if redact_names:
+            return f"bash_async failed: {type(exc).__name__}"
         return f"bash_async failed: {exc}"
 
     return (

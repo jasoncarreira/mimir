@@ -585,6 +585,7 @@ named job:
         - [gmail, search]
         - [calendar, events]
       options: ["--account", "--json", "--from", "--to"]
+      pass_env: [GOG_HOME, GOG_KEYRING_PASSWORD]
 ```
 
 A scheduled job may also select a built-in scheduler authority profile with
@@ -615,7 +616,8 @@ In a poller manifest, inside the existing `authority` block:
   "shell_commands": [
     {"exec": "acli", "path": "/usr/local/bin/acli",
      "subcommands": [["jira", "workitem", "search"]],
-     "options": ["--jql", "--json"]}
+     "options": ["--jql", "--json"],
+     "pass_env": ["ACLI_CONFIG_DIR", "ACLI_EMAIL", "ACLI_SITE", "ACLI_TOKEN"]}
   ]
 }
 ```
@@ -644,6 +646,26 @@ code and cannot be relaxed by configuration.
 | `subcommands` | list of non-empty token lists, matched as a positional prefix against `argv[1:]`. Required unless `script` is given. |
 | `options` | allowlist. An option outside it is refused; there is no wildcard. Both `--opt value` and `--opt=value` are accepted for a listed long option. |
 | `script` | **required** for an interpreter, optional otherwise. Same absolute / resolved / outside-writable-roots rule as `path`. When present it is pinned as the first operand. |
+| `pass_env` | Optional list of exact environment variable names (`[A-Za-z_][A-Za-z0-9_]*`), never values, prefixes, or wildcards. Copies only present parent variables into the matched child's minimal environment. |
+
+`pass_env` belongs to one declaration, not an executable name. Two pinned
+`python3` scripts can receive different credentials. The first matching declaration
+wins, just as for argv admission; grants are not merged. Missing variables are
+omitted, leaving credential errors to the executable. Omitting `pass_env` retains
+the existing environment behavior, including `gh`'s `GITHUB_TOKEN`, isolated
+`GH_CONFIG_DIR`, and identity confirmation.
+
+Process-control names are reserved: `PATH`, `MIMIR_MODEL_SPEC`, `BASH_ENV`, `ENV`,
+and names beginning with `LD_`, `DYLD_`, `PYTHON`, `GIT_`, or `GH_` cannot be
+declared. These must not undo executable isolation or the GitHub identity check.
+`service_shell_env_passthrough` events contain passed names only. Exact nonempty
+forwarded values are masked from stdout/stderr before truncation, tool results,
+and async output capture. This is not a sandbox against an operator-installed
+program deliberately encoding or transmitting its own credentials.
+
+Poller `authority.shell_commands[].pass_env` uses this same mechanism for agent
+shell calls. The existing top-level poller `pass_env` still controls the poller
+process itself, not all children invoked by the resulting agent turn.
 
 Operands are unrestricted once the subcommand prefix and options match — a Gmail
 query or a JQL string is a value, and the argv is executed with `shell=False`.

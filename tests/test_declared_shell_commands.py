@@ -336,10 +336,12 @@ class TestSchedulerWiring:
             "    - exec: gog\n"
             "      path: /bin/echo\n"
             "      subcommands: [[gmail, search]]\n"
+            "      pass_env: [GOG_ACCOUNT, GOG_KEYRING_PASSWORD]\n"
         )
         assert rejections == []
         assert jobs[0].shell_commands == [
-            {"exec": "gog", "path": "/bin/echo", "subcommands": [["gmail", "search"]]},
+            {"exec": "gog", "path": "/bin/echo", "subcommands": [["gmail", "search"]],
+             "pass_env": ["GOG_ACCOUNT", "GOG_KEYRING_PASSWORD"]},
         ]
 
     def test_a_job_without_declarations_is_unchanged(self) -> None:
@@ -366,7 +368,8 @@ class TestPollerWiring:
                 "scoped_roots": ["state"],
                 "shell_commands": [
                     {"exec": "gog", "path": "/bin/echo",
-                     "subcommands": [["gmail", "search"]]},
+                     "subcommands": [["gmail", "search"]],
+                     "pass_env": ["GOG_ACCOUNT", "GOG_KEYRING_PASSWORD"]},
                 ],
             },
             name="demo",
@@ -375,6 +378,9 @@ class TestPollerWiring:
             manifest_path=tmp_path / "skills" / "demo" / "pollers.json",
         )
         assert [d.executable for d in principal.declared_shell_commands] == ["gog"]
+        assert principal.declared_shell_commands[0].pass_env == (
+            "GOG_ACCOUNT", "GOG_KEYRING_PASSWORD",
+        )
 
     def test_shell_commands_without_shell_exec_is_refused(self, tmp_path: Path) -> None:
         """The capability gate runs first; grants without it would be inert."""
@@ -518,6 +524,7 @@ class TestReviewFindings:
             "    - exec: gog\n"
             "      path: /bin/echo\n"
             "      subcommands: [[gmail, search]]\n"
+            "      pass_env: [GOG_ACCOUNT, GOG_KEYRING_PASSWORD]\n"
         )
         job = load_jobs_from_text(text)[0][0]
         round_tripped = load_jobs_from_text(
