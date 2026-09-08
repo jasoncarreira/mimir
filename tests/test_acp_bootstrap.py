@@ -278,6 +278,34 @@ def test_credential_replace_stores_a_secret_typed_at_a_real_terminal(tmp_path: P
     assert store.value == "NEW-SECRET"
 
 
+@pytest.mark.parametrize("code", [0, 2, 129, 130, 143, None])
+def test_dispatch_system_exit_preserves_code_silently(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    capfd: pytest.CaptureFixture[str], code: int | None,
+) -> None:
+    def dispatch(args: object, output: object) -> int:
+        raise SystemExit(code)
+
+    monkeypatch.setattr(bootstrap, "_dispatch", dispatch)
+    assert invoke(tmp_path, [], monkeypatch, capfd) == (code or 0, "", "")
+
+
+@pytest.mark.parametrize("error", [KeyboardInterrupt, BaseException])
+def test_other_base_exceptions_still_report_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    capfd: pytest.CaptureFixture[str], error: type[BaseException],
+) -> None:
+    def dispatch(args: object, output: object) -> int:
+        raise error("private message")
+
+    monkeypatch.setattr(bootstrap, "_dispatch", dispatch)
+    code, out, err = invoke(tmp_path, [], monkeypatch, capfd)
+    assert (code, out) == (1, "")
+    assert re.fullmatch(
+        rf"detail: {error.__name__} at test_acp_bootstrap.py:\d+\nerror: acp-failed\n", err,
+    )
+
+
 def test_unexpected_failures_name_their_origin_and_withhold_the_message(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capfd: pytest.CaptureFixture[str]) -> None:
     assert invoke(tmp_path, ["profile", "add-local", "p", "--home", "/tmp"], monkeypatch, capfd)[0] == 0
     class Exploding:

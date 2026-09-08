@@ -3,6 +3,8 @@ from __future__ import annotations
 import asyncio
 import io
 import json
+import signal
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -12,6 +14,108 @@ from mimir.acp.agent import ConnectionState, MimirAcpAgent
 from mimir.acp.host import _FrameDelivery, close_protocol_writer
 from mimir.acp.proxy import ProxyRouter, _OutputWriter, run_router
 from mimir.acp.transport import close_writer, pump_stream
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("signum", [signal.SIGTERM, signal.SIGINT, signal.SIGHUP, None])
+@pytest.mark.parametrize("stage", ["read", "idle", "close", "failure", "read-failure", "drain-failure"])
+async def test_proxy_signal_teardown_and_client_eof_are_silent(
+    signum: signal.Signals | None, stage: str,
+) -> None:
+    # Real signals in an isolated interpreter cannot affect pytest's event loop.
+    # Deliver during a reader task to exercise interruption of live I/O, rather
+    # than relying on a platform-specific selector to reproduce the old crash.
+    source = """
+import asyncio, io, os, signal, sys
+from types import SimpleNamespace
+from mimir.acp import bootstrap, profiles, proxy
+
+signum = int(sys.argv[1])
+stage = sys.argv[2]
+profiles.ProfileStore = lambda: SimpleNamespace(get=lambda name: SimpleNamespace(remote=None))
+profiles.selected_profile = lambda name: 'test'
+proxy.PEER_EOF_GRACE_TIMEOUT = 0.01
+
+async def run_proxy(name, output):
+    client = asyncio.StreamReader()
+    daemon = asyncio.StreamReader()
+    writers = [proxy._OutputWriter(io.BytesIO()), proxy._OutputWriter(io.BytesIO())]
+    router = proxy.ProxyRouter(*writers, 'secret')
+    original_close = router.close
+    original_terminate = router.terminate_owned_children
+    def terminate():
+        original_terminate()
+        output.write(b'terminated\\n')
+    async def close():
+        if stage == 'close' and signum:
+            os.kill(os.getpid(), signum)
+        await asyncio.sleep(0)
+        await original_close()
+        if stage == 'failure':
+            raise ValueError('private shutdown failure')
+        output.write(b'closed\\n')
+    router.terminate_owned_children = terminate
+    router.close = close
+    proxy.ProxyRouter = lambda *args: router
+    if stage == 'drain-failure':
+        class DrainingReader:
+            async def read(self, size):
+                try:
+                    await asyncio.Future()
+                finally:
+                    if signum:
+                        os.kill(os.getpid(), signum)
+                    await asyncio.sleep(0)
+        daemon = DrainingReader()
+    if stage in ('read-failure', 'drain-failure') or (signum and stage != 'close'):
+        class SignallingReader:
+            async def read(self, size):
+                await asyncio.sleep(0)
+                if stage == 'idle':
+                    output.write(b'ready\\n')
+                elif signum and stage != 'drain-failure':
+                    os.kill(os.getpid(), signum)
+                if stage in ('read-failure', 'drain-failure'):
+                    raise ValueError('private shutdown failure')
+                await asyncio.Future()
+        client = SignallingReader()
+    else:
+        client.feed_eof()
+    try:
+        await proxy.run_router(client, writers[0], daemon, writers[1], 'secret')
+    finally:
+        if 'failure' not in stage:
+            # The outer proxy's transport teardown must see a quiescent router
+            # on signal exits too, not only on the normal EOF return.
+            assert router._close_complete
+            assert all(writer.closed for writer in writers)
+
+proxy.run_proxy = run_proxy
+raise SystemExit(bootstrap.main([]))
+"""
+    process = await asyncio.create_subprocess_exec(
+        sys.executable, "-c", source, str(signum or 0), stage,
+        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+        cwd=Path(__file__).resolve().parents[1],
+    )
+    try:
+        if stage == "idle" and signum:
+            assert await asyncio.wait_for(process.stdout.readline(), 10) == b"ready\n"
+            process.send_signal(signum)
+        stdout, stderr = await asyncio.wait_for(process.communicate(), 15)
+    finally:
+        if process.returncode is None:
+            process.kill()
+            await process.communicate()
+    if "failure" in stage:
+        assert process.returncode == 1
+        assert stderr.startswith(b"detail: ValueError at <string>:")
+        assert stderr.endswith(b"\nerror: acp-failed\n")
+        assert b"private shutdown failure" not in stderr
+    else:
+        assert stderr == b""
+        assert process.returncode == (128 + signum if signum else 0)
+        assert stdout == (b"terminated\n" if signum else b"") + b"closed\n"
 
 
 def _assert_generation_empty(router: ProxyRouter) -> None:

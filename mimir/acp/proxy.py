@@ -46,6 +46,12 @@ class ProxyError(RuntimeError):
     pass
 
 
+class ProxySignalExit(Exception):
+    def __init__(self, signum: int) -> None:
+        self.code = 128 + signum
+        super().__init__(self.code)
+
+
 class PermissionGrantStore:
     def __init__(self) -> None:
         self._grants: set[tuple[str, str]] = set()
@@ -992,6 +998,10 @@ class _ShutdownHooks:
         self._signals: dict[int, Any] = {}
         self._handler = self._handle_signal
         self._installed = False
+        self.signum: int | None = None
+        self.closing = False
+        self._loop = asyncio.get_running_loop()
+        self._task = asyncio.current_task()
 
     def install(self) -> None:
         atexit.register(self._cleanup)
@@ -1017,8 +1027,19 @@ class _ShutdownHooks:
 
     def _handle_signal(self, signum: int, frame: Any) -> None:
         del frame
+        if self.signum is not None:
+            return
+        self.signum = signum
         self._cleanup()
-        raise SystemExit(128 + signum)
+        if self._task is None or self._task.done():
+            # An atexit-only installation has no coroutine left to unwind.
+            raise SystemExit(128 + signum)
+        # Wake the loop without throwing through an interrupted selector/transport.
+        self._loop.call_soon_threadsafe(self._cancel)
+
+    def _cancel(self) -> None:
+        if not self.closing and self._task is not None:
+            self._task.cancel()
 
 
 async def run_router(
@@ -1065,24 +1086,32 @@ async def run_router(
         for task in pending:
             task.cancel()
         await asyncio.gather(*pending, return_exceptions=True)
-    except BaseException:
+    except BaseException as exc:
+        hooks.closing = True
         for task in tasks:
             if not task.done():
                 task.cancel()
-        await asyncio.gather(*tasks, return_exceptions=True)
-        raise
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        if not (isinstance(exc, asyncio.CancelledError) and hooks.signum is not None):
+            raise
+        for result in results:
+            if isinstance(result, BaseException) and not isinstance(result, asyncio.CancelledError):
+                raise result
     finally:
+        hooks.closing = True
         try:
             await router.close()
+            closing = asyncio.gather(
+                close_writer(client_writer), close_writer(daemon_writer), return_exceptions=True
+            )
+            try:
+                await asyncio.wait_for(closing, FORCE_CLOSE_TIMEOUT)
+            except TimeoutError:
+                pass
         finally:
             hooks.close()
-        closing = asyncio.gather(
-            close_writer(client_writer), close_writer(daemon_writer), return_exceptions=True
-        )
-        try:
-            await asyncio.wait_for(closing, FORCE_CLOSE_TIMEOUT)
-        except TimeoutError:
-            pass
+    if hooks.signum is not None:
+        raise ProxySignalExit(hooks.signum)
 
 class _OutputWriter:
     def __init__(self, output: BinaryIO) -> None: self.output, self.closed = output, False
