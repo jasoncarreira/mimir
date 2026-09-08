@@ -164,10 +164,16 @@ async def test_initialize_is_exact_stable_v1(
     }
 
 
+@pytest.mark.parametrize("enforcement_env", [None, "0", "1"])
 async def test_authenticate_uses_resolved_identity_and_factory(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    enforcement_env: str | None,
 ) -> None:
+    if enforcement_env is None:
+        monkeypatch.delenv("MIMIR_ACCESS_CONTROL_ENFORCED", raising=False)
+    else:
+        monkeypatch.setenv("MIMIR_ACCESS_CONTROL_ENFORCED", enforcement_env)
     raw_key = "never-store-this"
     resolver = _resolver(tmp_path, raw_key=raw_key)
     agent = _agent(resolver)

@@ -5737,12 +5737,50 @@ _REPOSITORY_RESULT_RESOURCE = re.compile(
 def _forge_repository_scope_mismatch(
     ifc_labels: Any,
     scope: Any,
+    *,
+    audit_fields: dict[str, Any] | None = None,
 ) -> tuple[str, str, str] | None:
     """Return the first repository result that is outside a forge sink scope."""
     expected_repo = getattr(scope, "canonical_repo", None)
     expected_issue = getattr(scope, "issue_number", None)
     expected_pr = getattr(scope, "pr_number", None)
     expected_head = getattr(scope, "observed_head_sha", None)
+
+    def mismatch(repo: str, pr: str, component: str) -> tuple[str, str, str]:
+        if audit_fields is not None:
+            # Do not reuse the permissive policy parser for audit output. Only
+            # complete, bounded identifiers may cross into the audit record.
+            repo_pattern = r"[A-Za-z0-9][A-Za-z0-9_.-]{0,99}/[A-Za-z0-9][A-Za-z0-9_.-]{0,99}"
+            safe_source = (
+                re.fullmatch(
+                    rf"({repo_pattern})#pull/([1-9][0-9]{{0,9}})@([0-9a-fA-F]{{40}})",
+                    resource_id,
+                )
+                if isinstance(resource_id, str) and len(resource_id) <= 258
+                else None
+            )
+            audit_fields.update({
+                "component": component,
+                "source_canonical_repo": safe_source[1] if safe_source else None,
+                "source_pr_number": int(safe_source[2]) if safe_source else None,
+                "source_observed_head_sha": safe_source[3] if safe_source else None,
+                "sink_canonical_repo": (
+                    expected_repo if isinstance(expected_repo, str)
+                    and len(expected_repo) <= 201
+                    and re.fullmatch(repo_pattern, expected_repo) else None
+                ),
+                "sink_pr_number": (
+                    expected_pr if type(expected_pr) is int
+                    and 0 < expected_pr < 10**10 else None
+                ),
+                "sink_observed_head_sha": (
+                    expected_head if isinstance(expected_head, str)
+                    and len(expected_head) == 40
+                    and re.fullmatch(r"[0-9a-fA-F]{40}", expected_head) else None
+                ),
+            })
+        return repo, pr, component
+
     for source in getattr(ifc_labels, "sources", ()):
         if getattr(source, "domain", None) != "repository":
             continue
@@ -5752,7 +5790,7 @@ def _forge_repository_scope_mismatch(
             if isinstance(resource_id, str) else None
         )
         if match is None:
-            return str(resource_id or "unknown"), "unknown", "resource_id"
+            return mismatch(str(resource_id or "unknown"), "unknown", "resource_id")
         source_repo = match.group("repo")
         source_pr = int(match.group("pr"))
         source_head = match.group("head")
@@ -5761,18 +5799,18 @@ def _forge_repository_scope_mismatch(
                 isinstance(expected_repo, str)
                 and source_repo.casefold() == expected_repo.casefold()
             ):
-                return source_repo, str(source_pr), "canonical_repo"
+                return mismatch(source_repo, str(source_pr), "canonical_repo")
             continue
         if not isinstance(expected_repo, str) or (
             source_repo.casefold() != expected_repo.casefold()
         ):
-            return source_repo, str(source_pr), "canonical_repo"
+            return mismatch(source_repo, str(source_pr), "canonical_repo")
         if source_pr != expected_pr:
-            return source_repo, str(source_pr), "pr_number"
+            return mismatch(source_repo, str(source_pr), "pr_number")
         if not isinstance(expected_head, str) or (
             source_head.casefold() != expected_head.casefold()
         ):
-            return source_repo, str(source_pr), "observed_head_sha"
+            return mismatch(source_repo, str(source_pr), "observed_head_sha")
     return None
 
 
@@ -6394,8 +6432,10 @@ class SinkGate:
             )
 
         if sink_category is SinkCategory.FORGE:
+            forge_scope_mismatch: dict[str, Any] = {}
             mismatch = _forge_repository_scope_mismatch(
                 ifc_labels, repo_pr_action_scope,
+                audit_fields=forge_scope_mismatch,
             )
             if mismatch is not None:
                 source_repo, source_pr, mismatch_component = mismatch
@@ -6410,6 +6450,7 @@ class SinkGate:
                     decision=OperationDecision.ADMIN_REQUIRED,
                     allowed=not enforce,
                     reason="ifc_label_blocked:forge",
+                    forge_scope_mismatch=forge_scope_mismatch,
                     service_principal=service,
                     required_tier=AccessTier.ADMIN,
                     enforcement_enabled=enforce,
@@ -6436,6 +6477,7 @@ class SinkGate:
             tool_call_id=tool_call_id,
             requested_cwd=requested_cwd,
             client_authorized_host_execution=client_authorized,
+            repo_pr_action_scope=repo_pr_action_scope,
         )
         effective_target = (
             ChannelResourceAdapter._resolve_channel(target)
@@ -6525,12 +6567,15 @@ class SinkGate:
         tool_call_id: str | None = None,
         requested_cwd: object = None,
         client_authorized_host_execution: bool = False,
+        repo_pr_action_scope: Any = None,
     ) -> frozenset[str]:
         """Return concrete destinations compatible with every current label.
 
         Ordinary admin authority deliberately does not widen this set. Admins
         must use the distinct audited declassification action before egress.
         """
+        from .models import InformationFlowLabels
+
         if auth_context is None:
             return frozenset()
 
@@ -6617,14 +6662,27 @@ class SinkGate:
             and target is not None
             and isinstance(sources, tuple)
             and bool(sources)
-            and all(source.domain == "repository" for source in sources)
+            and all(
+                source.domain == "repository"
+                or (
+                    tool_name == "pr_submit_review"
+                    and getattr(repo_pr_action_scope, "pr_number", None) is not None
+                    and cls._is_admin_operator_turn(ifc_labels, auth_context)
+                    and cls._is_trusted_operator_turn(
+                        InformationFlowLabels(sources=(source,)), auth_context,
+                    )
+                )
+                for source in sources
+            )
             and _forge_repository_scope_mismatch(
                 ifc_labels,
-                getattr(auth_context, "repo_pr_action_scope", None),
+                repo_pr_action_scope,
             ) is None
         ):
             # Repository command output may flow only back to the immutable
-            # PR/head scope from which it was produced.
+            # PR/head scope from which it was produced. An interactive review
+            # also carries its authenticated operator ingress. Use the resolved
+            # per-call scope: discovery need not populate the turn's scope slot.
             return frozenset({target})
         is_triggering_channel_reply = (
             service is not None
@@ -7843,6 +7901,7 @@ class ToolAuthorization:
     result_integrity: str = "untrusted"
     argument_egress: str = "taint_gated"
     repo_pr_action_scope: Any = field(default=None, repr=False)
+    forge_scope_mismatch: dict[str, Any] | None = None
 
     def as_log_fields(self) -> dict[str, Any]:
         """Return fields for audit logging."""
@@ -7862,6 +7921,7 @@ class ToolAuthorization:
                 getattr(scope, "allowed_operations", frozenset())
             ),
             "refusal_reason": self.reason if not self.allowed else None,
+            "forge_scope_mismatch": self.forge_scope_mismatch,
         }
 
 

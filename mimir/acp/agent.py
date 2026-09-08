@@ -507,6 +507,8 @@ class MimirAcpAgent:
             auth_context = create_auth_context(
                 event,
                 self._identity_resolver,
+                # Deliberate enforced canary ahead of the global rollout:
+                # expose policy failures while other surfaces remain shadow-only.
                 enforce=True,
                 event_ingress=None,
                 audience_provider=self._audience_provider,
