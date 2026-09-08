@@ -2539,6 +2539,153 @@ async def test_permission_outcome_after_trusted_cwd_read(
         await router.close()
 
 
+@pytest.mark.parametrize("wrapper", ["hands_edit", "hands_shell", "hands_python"])
+async def test_admin_clear_restores_proxy_session_grant_until_later_ingest(
+    tmp_path: Path, middleware_event_logger: None, wrapper: str,
+) -> None:
+    from langchain.agents.middleware import ToolCallRequest
+    from langgraph.runtime import Runtime
+
+    from mimir.acp.proxy import ProxyRouter
+    from mimir.models import Integrity, IntegrityEffect
+    from mimir.tools import clear_ingest_taint
+    from mimir.tools.budget_gate import BudgetGateMiddleware
+    from mimir.tools.client_provider import (
+        client_authorized_host_execution_metadata,
+        issue_client_authorized_host_execution,
+    )
+
+    class Writer:
+        def __init__(self) -> None:
+            self.messages: list[dict[str, Any]] = []
+
+        def write(self, data: bytes) -> None:
+            self.messages.append(json.loads(data))
+
+        async def drain(self) -> None:
+            pass
+
+    client_wire, daemon_wire = Writer(), Writer()
+    router = ProxyRouter(client_wire, daemon_wire, "secret")
+
+    class PermissionClient(McpClient):
+        async def request_tool_permission(self, session_id: str, snapshot: Any) -> Any:
+            request_id = len(daemon_wire.messages) + 1
+            await router.route_daemon({
+                "jsonrpc": "2.0", "id": request_id,
+                "method": "session/request_permission",
+                "params": sdk.permission_request_params(session_id, snapshot),
+            })
+            if snapshot.tainted:
+                assert client_wire.messages[-1]["id"] == request_id
+                await router.route_client({
+                    "jsonrpc": "2.0", "id": request_id,
+                    "result": {"outcome": {"outcome": "selected", "optionId": "allow_once"}},
+                })
+            assert daemon_wire.messages[-1]["id"] == request_id
+            return sdk.PermissionCompletion.from_response(daemon_wire.messages[-1]["result"])
+
+    bundle, core = _bundle(tmp_path)
+    agent = MimirAcpAgent(bundle)
+    client = PermissionClient()
+    generation = agent.on_connect(client)
+    await agent.authenticate("mimir-web-key", **{"mimir.webKey": "secret"})
+    session_id = (await agent.new_session(str(tmp_path), mcp_servers=_hands("server"))).session_id
+    router._active_sessions.add(session_id)
+    router._grants.add(session_id, wrapper)
+    arguments = {
+        "hands_edit": {"path": "/private/notes.txt", "old_text": "old", "new_text": "new"},
+        "hands_shell": {"command": "private command"},
+        "hands_python": {"code": "private_value = 1"},
+    }[wrapper]
+
+    async def integrated_turn(event: Any, **kwargs: Any) -> None:
+        labels = _initialize_ifc_labels(event, resolver=bundle.core.identity_resolver)
+        state = InformationFlowState(labels=labels)
+        ingest = InformationFlowLabels().with_source(SourceLabel(
+            principal="external", domain="web", resource_id="https://private.example",
+            bridge_instance=None, sensitivity="public", source_kind="protected_tool",
+            integrity=Integrity.UNTRUSTED, integrity_effect=IntegrityEffect.ACTIVE_INGEST,
+        ))
+        state.merge(ingest)
+        auth = dataclasses.replace(
+            event.continuation_auth_context, interactivity=TurnInteractivity.INTERACTIVE,
+            ifc_labels=labels, ifc_state=state, saga_session_id=kwargs["saga_session_id"],
+        )
+        turn = TurnContext(
+            turn_id=kwargs["turn_id"], session_id=session_id, trigger="user_message",
+            channel_id=event.channel_id, started_at=time.monotonic(), auth_context=auth,
+        )
+        token = set_current_turn(turn)
+        try:
+            active = agent._active_prompts[session_id]
+            marker = issue_client_authorized_host_execution(
+                request_identity=object(), auth_context_identity=auth,
+                wrapper_name=wrapper, tainted=True,
+            )
+            assert marker is not None
+            original = state.current()
+            for index, tainted in enumerate((True, False, True, False)):
+                if index == 2:
+                    # Even a repeated, deduplicated source is a new ingest.
+                    state.merge(ingest)
+                elif index in (1, 3):
+                    request = ToolCallRequest(
+                        tool_call={"name": "clear_ingest_taint", "args": {},
+                                   "id": f"clear-{index}", "type": "tool_call"},
+                        tool=clear_ingest_taint, state=None, runtime=Runtime(context=auth),
+                    )
+
+                    async def unreachable_handler(call: ToolCallRequest) -> Any:
+                        pytest.fail("clear must be handled by authorization middleware")
+
+                    result = await BudgetGateMiddleware().awrap_tool_call(request, unreachable_handler)
+                    assert result.status == "success", result.content
+                assert state.current() == original
+                assert state.has_untrusted_active_ingest() is True
+                assert state.permission_has_untrusted_active_ingest() is tainted
+                assert client_authorized_host_execution_metadata(marker) == (wrapper, tainted)
+                tool_id = f"hands-{index}"
+                active.dispatcher.enqueue({
+                    "type": "tool_call", "phase": "start", "id": tool_id,
+                    "tool_name": wrapper, "args": arguments,
+                })
+                decision = await active.request_permission(PermissionEligibility(
+                    tool_id, wrapper, "other", arguments, marker,
+                ))
+                assert decision == PermissionDecision.ALLOW_ONCE
+                assert router._grants.allows(session_id, wrapper)
+        finally:
+            reset_current_turn(token)
+
+    core.run_turn = integrated_turn
+    try:
+        response = await agent.prompt(session_id, [sdk.TextContentBlock(type="text", text="review ingest")])
+        assert response.stop_reason == "end_turn"
+        assert [message["id"] for message in client_wire.messages] == [1, 3]
+        events = [json.loads(line) for line in (tmp_path / "middleware-events.jsonl").read_text().splitlines()]
+        outcomes = [event for event in events if event["type"] == "acp_permission_outcome"]
+        payloads = [{key: event[key] for key in (
+            "wrapper_name", "tainted", "resource_resolvable", "outcome",
+        )} for event in outcomes]
+        assert payloads == [
+            {"wrapper_name": wrapper, "tainted": tainted,
+             "resource_resolvable": wrapper == "hands_edit", "outcome": outcome}
+            for tainted, outcome in ((True, "operator_allow"), (False, "session_grant"),
+                                     (True, "operator_allow"), (False, "session_grant"))
+        ]
+        clears = [event for event in events if event["type"] == "ifc_ingest_taint_cleared"]
+        assert len(clears) == 2
+        assert all(event["source_count"] == 1 for event in clears)
+        assert all(event["authenticated_admin"] == {
+            "principal": "operator", "canonical_principal": "operator",
+        } for event in clears)
+        print(json.dumps({"acp_permission_outcome": payloads}, sort_keys=True))
+    finally:
+        await router.close()
+        await agent.on_transport_closed(generation)
+
+
 @pytest.mark.parametrize("earlier_outcome", ["complete", "cancel"])
 async def test_progress_token_collision_cleanup_preserves_successor_ownership(
     monkeypatch: pytest.MonkeyPatch, earlier_outcome: str

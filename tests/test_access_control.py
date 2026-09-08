@@ -15549,7 +15549,7 @@ def test_non_acp_execution_decisions_are_unchanged() -> None:
     catalog = access_control.get_operation_catalog()
     hands = {"hands_read", "hands_edit", "hands_shell", "hands_python"}
     flows = {
-        access_control.ToolFlowDirection.NEITHER: {"approve_declassification", "request_operator_approval", "write_todos", "task"},
+        access_control.ToolFlowDirection.NEITHER: {"approve_declassification", "clear_ingest_taint", "request_operator_approval", "write_todos", "task"},
         access_control.ToolFlowDirection.SOURCE: {"memory_query", "memory_get", "file_search", "mimir_get_turn", "get_turn", "bash_jobs_list", "bash_job_output", "fetch_channel_history", "list_channels", "list_schedules", "commitment_list", "read_file", "aread", "ls", "als", "glob", "aglob", "grep", "agrep", "Read", "Glob", "Grep", "pr_metadata", "pr_files", "pr_diff", "pr_checks", "pr_reviews", "pr_comments", "pr_review_requests", "repo_status", "repo_diff", "repo_unmerged"},
         access_control.ToolFlowDirection.BOTH: {"shell_exec", "bash_async", "worklink_run", "web_search", "fetch_url", "http_request", "spawn_open_code", "download_files", "adownload_files", "Bash", "bash", "bash_exec", "execute", "aexecute", "shell", "repo_checkout", "repo_fetch", "repo_test"},
         access_control.ToolFlowDirection.SINK: {"memory_store", "open_proposal", "submit_proposal", "abandon_proposal", "saga_feedback", "saga_mark_contributions", "saga_end_session", "saga_forget", "saga_record_skill_learning", "rebuild_index", "send_message", "operator_alert", "react", "defer_injected_message", "add_schedule", "set_schedule_priority", "remove_schedule", "set_poller_overrides", "reload_pollers", "commitment_complete", "commitment_snooze", "commitment_dismiss", "request_mimir_update", "post_message", "webhook", "ntfy_send", "write_file", "edit_file", "Write", "Edit", "harness_auto_deliver", "harness_resend_nudge", "activity_panel_post", "activity_panel_edit", "pr_submit_review", "pr_inline_review_comment", "pr_comment", "pr_edit_body", "issue_comment", "pr_rerequest_review", "unsupported_operation", "repo_cleanup", "repo_stage", "repo_commit", "repo_merge", "repo_merge_abort", "repo_rebase", "repo_rebase_abort", "repo_revert", "repo_revert_abort", "repo_push"},
@@ -15562,6 +15562,7 @@ def test_non_acp_execution_decisions_are_unchanged() -> None:
     }
     admin_catalog = {
         "issue_comment", "operator_alert", "approve_declassification",
+        "clear_ingest_taint",
         "list_channels", "list_schedules", "add_schedule",
         "set_schedule_priority", "remove_schedule", "reload_pollers",
         "open_proposal", "submit_proposal", "abandon_proposal",
@@ -15572,6 +15573,7 @@ def test_non_acp_execution_decisions_are_unchanged() -> None:
         "set_poller_overrides", "download_files", "adownload_files",
         "rebuild_index", "hands_edit", "hands_shell", "hands_python",
     }
+    decisions[OperationDecision.ADMIN_REQUIRED].add("clear_ingest_taint")
     protected_builtins = {
         "Bash", "bash", "bash_exec", "execute", "aexecute", "shell",
         "Write", "Edit", "Read", "Glob", "Grep", "download_files",

@@ -67,6 +67,7 @@ from ..access_control import (
     SinkCategory,
     ToolAuthorization,
     approve_live_declassification,
+    clear_live_ingest_taint,
     approved_fetch_urls,
     fetch_url_is_approved,
     classify_protected_result,
@@ -1569,6 +1570,8 @@ def _validated_arguments(request: ToolCallRequest) -> dict[str, Any] | None:
     tool_name = _tool_name_from_request(request)
     if tool_name in {"hands_read", "hands_edit", "hands_shell", "hands_python"}:
         return validate_hands_wrapper_arguments(tool_name, arguments)
+    if tool_name == "clear_ingest_taint":
+        return {} if not arguments else None
     tool = getattr(request, "tool", None)
     schema = getattr(tool, "tool_call_schema", None)
     if schema is None:
@@ -2059,6 +2062,27 @@ def _emit_tool_call_sync(
         # both event types don't double-count the same failed invocation.
         error_payload["paired_tool_call"] = True
         _emit_event_sync("tool_error", **error_payload)
+
+
+def _execute_clear_ingest_taint_action(
+    request: ToolCallRequest, auth_context: AuthContext | None,
+) -> ToolMessage:
+    turn = _get_current_turn_context()
+    cleared, outcome = clear_live_ingest_taint(
+        auth_context, turn_id=getattr(turn, "turn_id", None),
+    )
+    content = (
+        "Accumulated ingest taint acknowledged for this turn; source labels are unchanged."
+        if cleared else f"clear_ingest_taint denied: {outcome}"
+    )
+    _emit_tool_call_sync(
+        "clear_ingest_taint", ok=cleared,
+        error=None if cleared else content, denied=not cleared,
+    )
+    return ToolMessage(
+        content=content, tool_call_id=_tool_call_id(request),
+        name="clear_ingest_taint", status="success" if cleared else "error",
+    )
 
 
 def _execute_declassification_action(
@@ -2869,7 +2893,7 @@ class BudgetGateMiddleware(AgentMiddleware):
                 content=refusal, tool_call_id=_tool_call_id(request),
                 name=tool_name, status="error",
             )
-        if tool_name == "approve_declassification":
+        if tool_name in {"approve_declassification", "clear_ingest_taint"}:
             denial = _check_and_increment_or_deny(tool_name)
             if denial is not None:
                 _emit_tool_call_sync(
@@ -2882,6 +2906,8 @@ class BudgetGateMiddleware(AgentMiddleware):
                     name=tool_name,
                     status="error",
                 )
+            if tool_name == "clear_ingest_taint":
+                return _execute_clear_ingest_taint_action(request, auth_context)
             return _execute_declassification_action(
                 request, auth_context, validated_arguments,
             )
@@ -3394,7 +3420,7 @@ class BudgetGateMiddleware(AgentMiddleware):
                 content=refusal, tool_call_id=_tool_call_id(request),
                 name=tool_name, status="error",
             )
-        if tool_name == "approve_declassification":
+        if tool_name in {"approve_declassification", "clear_ingest_taint"}:
             denial = _check_and_increment_or_deny(tool_name)
             if denial is not None:
                 _emit_tool_call_sync(
@@ -3407,6 +3433,8 @@ class BudgetGateMiddleware(AgentMiddleware):
                     name=tool_name,
                     status="error",
                 )
+            if tool_name == "clear_ingest_taint":
+                return _execute_clear_ingest_taint_action(request, auth_context)
             return _execute_declassification_action(
                 request, auth_context, validated_arguments,
             )

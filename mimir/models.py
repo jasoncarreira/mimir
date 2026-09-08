@@ -495,6 +495,9 @@ class InformationFlowState:
         default_factory=dict, repr=False, compare=False,
     )
     _source_arrival_ordinal: int = field(default=0, repr=False, compare=False)
+    _acknowledged_ingest: InformationFlowLabels | None = field(
+        default=None, repr=False, compare=False,
+    )
     _receipt_identity: Any = field(default_factory=object, repr=False, compare=False)
     # Bound once from the server-issued approval request. This lives on the
     # durable IFC cell carried by AuthContext so forked SDK/MCP tasks do not
@@ -520,6 +523,35 @@ class InformationFlowState:
     def source_arrival_ordinal(self) -> int:
         with self._lock:
             return self._source_arrival_ordinal
+
+    def permission_has_untrusted_active_ingest(
+        self, fallback: InformationFlowLabels | None = None,
+    ) -> bool:
+        """ACP prompt taint only; sink and durable trust retain original labels."""
+        with self._lock:
+            current = self.labels if self.labels is not None else fallback
+            return (
+                not isinstance(current, InformationFlowLabels)
+                or (current.has_untrusted_active_ingest and current != self._acknowledged_ingest)
+            )
+
+    def clear_ingest_taint(
+        self, *, fallback: InformationFlowLabels | None, durable_audit: Any,
+    ) -> bool:
+        """Audit and acknowledge the current input snapshot, never an egress."""
+        with self._lock:
+            current = self.labels if self.labels is not None else fallback
+            if not isinstance(current, InformationFlowLabels):
+                return False
+            sources = tuple(
+                source for source in current.sources
+                if source.integrity == Integrity.UNTRUSTED
+                and source.integrity_effect == IntegrityEffect.ACTIVE_INGEST
+            ) if current != self._acknowledged_ingest else ()
+            if not durable_audit(sources):
+                return False
+            self._acknowledged_ingest = current
+            return True
 
     def source_snapshot(
         self, fallback: InformationFlowLabels | None = None,
@@ -548,6 +580,9 @@ class InformationFlowState:
             current = self.labels if self.labels is not None else fallback
             merged = current if isinstance(current, InformationFlowLabels) else InformationFlowLabels()
             if isinstance(added, InformationFlowLabels):
+                # Even re-reading the same deduplicated source is new ingest.
+                if added.has_untrusted_active_ingest:
+                    self._acknowledged_ingest = None
                 for label in added.labels:
                     merged = merged.with_label(label)
                 for channel in added.source_channels:
