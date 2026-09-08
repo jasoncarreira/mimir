@@ -5589,8 +5589,59 @@ def test_all_mimir_tools_includes_both_names(monkeypatch: pytest.MonkeyPatch) ->
     monkeypatch.setenv("MIMIR_MODEL_SPEC", "claude-code:foo")
     names = {t.name for t in all_mimir_tools()}
     assert "approve_declassification" in names
+    assert "clear_ingest_taint" in names
     assert "mimir_get_turn" in names
     assert "get_turn" in names
+
+
+def test_clear_ingest_taint_has_no_arguments_and_refuses_direct_call() -> None:
+    from mimir.tools import clear_ingest_taint
+
+    assert clear_ingest_taint.args == {}
+    assert "missing live authorization middleware" in clear_ingest_taint.invoke({})
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("middleware_path", ["sync", "async"])
+@pytest.mark.parametrize("outcome", [True, False])
+async def test_clear_ingest_taint_intercepts_live_request(
+    monkeypatch: pytest.MonkeyPatch, middleware_path: str, outcome: bool,
+) -> None:
+    from mimir.tools import budget_gate, clear_ingest_taint
+
+    ctx = _make_ctx(budget=5)
+    calls = []
+
+    def clear(auth_context, *, turn_id):
+        calls.append((auth_context, turn_id))
+        return outcome, "cleared" if outcome else "clear_failed"
+
+    def handler(_request):
+        pytest.fail("clear_ingest_taint must not reach the tool handler")
+
+    monkeypatch.setattr(budget_gate, "clear_live_ingest_taint", clear)
+    token = set_current_turn(ctx)
+    try:
+        request = _make_request("clear_ingest_taint").override(tool=clear_ingest_taint)
+        middleware = BudgetGateMiddleware()
+        for _ in range(2):
+            if middleware_path == "sync":
+                result = middleware.wrap_tool_call(request, handler)
+            else:
+                result = await middleware.awrap_tool_call(request, handler)
+            assert result.name == "clear_ingest_taint"
+            assert result.status == ("success" if outcome else "error")
+        assert calls == [(ctx.auth_context, ctx.turn_id)] * 2
+        assert ctx.tool_call_count == 2
+        invalid = request.override(tool_call={**request.tool_call, "args": {"turn_id": "forged"}})
+        if middleware_path == "sync":
+            result = middleware.wrap_tool_call(invalid, handler)
+        else:
+            result = await middleware.awrap_tool_call(invalid, handler)
+        assert result.status == "error"
+        assert len(calls) == 2
+    finally:
+        reset_current_turn(token)
 
 
 # ─── chainlink #118: asyncio strong-ref for fire-and-forget tasks ────────────

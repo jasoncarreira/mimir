@@ -21,12 +21,21 @@ async def _stopped(pid: int) -> bool:
     while asyncio.get_running_loop().time() < deadline:
         try:
             state = (Path("/proc") / str(pid) / "stat").read_text().split()[2]
-        except (FileNotFoundError, IndexError):
+        except (FileNotFoundError, ProcessLookupError, IndexError):
             return True
         if state == "Z":
             return True
         await asyncio.sleep(0.01)
     return False
+
+
+@pytest.mark.asyncio
+async def test_stopped_handles_process_exit_during_proc_read(monkeypatch: pytest.MonkeyPatch) -> None:
+    def exited(path: Path) -> str:
+        raise ProcessLookupError("process exited after opening stat")
+
+    monkeypatch.setattr(Path, "read_text", exited)
+    assert await _stopped(123)
 
 
 async def _appears(path: Path) -> None:
