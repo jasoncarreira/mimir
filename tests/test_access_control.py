@@ -8473,6 +8473,51 @@ def test_python_extends_existing_complete_hands_result_policy() -> None:
     )
 
 
+@pytest.mark.parametrize("case", [
+    "review", "other-tool", "no-scope", "issue-scope", "non-admin",
+    "noninteractive", "event-ingress", "active-repository-ingest", "foreign-channel",
+])
+def test_forge_review_ingress_allowance_guards(case: str) -> None:
+    from mimir.forge import IssueTarget
+
+    auth = _trusted_operator_write_auth(admin=case != "non-admin")
+    labels = auth.ifc_labels
+    scope = _review_state("owner/repo", 17, "fix", "/srv/repo").action_scope
+    tool_name = "pr_comment" if case == "other-tool" else "pr_submit_review"
+    if case == "no-scope":
+        scope = None
+    elif case == "issue-scope":
+        scope = IssueTarget("owner/repo", 17)
+    elif case == "noninteractive":
+        auth = replace(auth, interactivity=TurnInteractivity.NON_INTERACTIVE)
+    elif case == "event-ingress":
+        auth = replace(auth, event_ingress="http")
+    elif case == "foreign-channel":
+        labels = labels.with_source(replace(labels.sources[0], resource_id="slack-C2"))
+
+    # Ingress alone isolates the PR-number guard from repository scope matching.
+    if case not in {"no-scope", "issue-scope"}:
+        repository_source = _repository_result_labels(
+            "owner/repo", 17, scope.observed_head_sha,
+        ).sources[0]
+        if case == "active-repository-ingest":
+            repository_source = replace(
+                repository_source, integrity_effect=IntegrityEffect.ACTIVE_INGEST,
+            )
+        labels = labels.with_source(repository_source)
+    auth = replace(auth, ifc_labels=labels)
+
+    decision = SinkGate.check_sink_flow(
+        tool_name, "owner/repo", labels, auth, enforce=True,
+        sink_category=SinkCategory.FORGE, repo_pr_action_scope=scope,
+    )
+
+    assert decision.allowed is (case == "review"), decision.reason
+    assert decision.would_block is (case != "review")
+    if case != "review":
+        assert decision.reason == "ifc_label_blocked:forge"
+
+
 def test_forge_repository_result_from_different_repository_is_refused() -> None:
     scope = _review_state("owner/repo", 17, "fix", "/srv/repo").action_scope
 
@@ -8501,6 +8546,79 @@ def test_forge_repository_result_from_different_observed_head_is_refused() -> No
     )
 
     assert mismatch == ("owner/repo", "17", "observed_head_sha")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("enforce", [True, False])
+@pytest.mark.parametrize(
+    ("repo", "pr", "head", "component"),
+    [
+        ("other/repo", 17, "a" * 40, "canonical_repo"),
+        ("owner/repo", 18, "a" * 40, "pr_number"),
+        ("owner/repo", 17, "f" * 40, "observed_head_sha"),
+    ],
+)
+async def test_forge_mismatch_decision_audit_identifiers(
+    repo, pr, head, component, enforce, monkeypatch,
+):
+    import asyncio
+
+    scope = _review_state("owner/repo", 17, "fix", "/srv/repo").action_scope
+    decision = SinkGate.check_sink_flow(
+        "pr_comment", "owner/repo", _repository_result_labels(repo, pr, head),
+        None, enforce=enforce, sink_category=SinkCategory.FORGE,
+        repo_pr_action_scope=scope,
+    )
+
+    assert decision.allowed is not enforce
+    assert decision.would_block is True
+    assert decision.as_log_fields()["forge_scope_mismatch"] == {
+        "component": component,
+        "source_canonical_repo": repo,
+        "source_pr_number": pr,
+        "source_observed_head_sha": head,
+        "sink_canonical_repo": "owner/repo",
+        "sink_pr_number": 17,
+        "sink_observed_head_sha": scope.observed_head_sha,
+    }
+    emitted = asyncio.get_running_loop().create_future()
+
+    async def capture(kind, **fields):
+        emitted.set_result((kind, fields))
+
+    monkeypatch.setattr("mimir.event_logger.log_event", capture)
+    registry = ToolRegistry()
+    registry.enable_shadow_logging()
+    registry._emit_shadow_decision(
+        decision, ifc_labels=_repository_result_labels(repo, pr, head),
+        sink_category=SinkCategory.FORGE,
+    )
+    kind, fields = await asyncio.wait_for(emitted, timeout=5)
+    assert kind == "shadow_tool_decision"
+    assert fields["forge_scope_mismatch"] == decision.as_log_fields()["forge_scope_mismatch"]
+
+
+@pytest.mark.parametrize("repo", [
+    "secret body\napi_key=do-not-log", "secret=do-not-log/repo",
+    "x" * 300 + "/repo",
+])
+def test_forge_malformed_source_audit_does_not_leak(repo):
+    scope = _review_state("owner/repo", 17, "fix", "/srv/repo").action_scope
+    decision = SinkGate.check_sink_flow(
+        "pr_comment", "owner/repo", _repository_result_labels(repo, 17, "f" * 40),
+        None, enforce=True, sink_category=SinkCategory.FORGE,
+        repo_pr_action_scope=scope,
+    )
+
+    fields = decision.as_log_fields()
+    diagnostics = fields["forge_scope_mismatch"]
+    assert decision.allowed is False
+    assert diagnostics["source_canonical_repo"] is None
+    assert diagnostics["source_pr_number"] is None
+    assert diagnostics["source_observed_head_sha"] is None
+    assert diagnostics["sink_observed_head_sha"] == scope.observed_head_sha
+    assert repo not in json.dumps(fields)
+    assert "do-not-log" not in json.dumps(fields)
 
 
 def _attach_test_checkout_lease(
