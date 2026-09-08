@@ -256,6 +256,7 @@ def resolve_review_state_for_context(
         and context is not None
         and can_resolve_forge_review_scope(context, stage="stored")
     ) else None
+    snapshot = None
     if stored_scope is not None:
         client = _client_for_repository(repository)
         try:
@@ -278,14 +279,26 @@ def resolve_review_state_for_context(
         store.discard(
             repository, pull_request, expected_scope=stored_scope,
         )
-        stale_refusal = (
-            "pull-request operation rejected: stored server-discovered scope for "
-            f"repository={json.dumps(repository)}, pull_request={pull_request} is stale; "
-            "the pull request head advanced or is no longer open"
-        )
         if isinstance(cache, ServerDiscoveredPRStates):
-            cache.remember_refusal(repository, pull_request, stale_refusal)
-        raise ToolException(stale_refusal)
+            cache.remember_escalation_scope(stored_scope)
+        cause = None
+        if snapshot.state != "open":
+            cause = "the pull request is closed"
+        elif (
+            not isinstance(snapshot.repo, str)
+            or snapshot.repo.lower() != stored_scope.canonical_repo
+            or snapshot.number != stored_scope.pr_number
+        ):
+            cause = "the provider repository or pull request number does not match"
+        if cause is not None:
+            stale_refusal = (
+                "pull-request operation rejected: stored server-discovered scope for "
+                f"repository={json.dumps(repository)}, pull_request={pull_request} is stale; "
+                f"{cause}"
+            )
+            if isinstance(cache, ServerDiscoveredPRStates):
+                cache.remember_refusal(repository, pull_request, stale_refusal)
+            raise ToolException(stale_refusal)
     if (
         not can_resolve_forge_review_scope(context, stage="fetch")
     ):
@@ -293,6 +306,8 @@ def resolve_review_state_for_context(
             cache, registry, repository, pull_request,
         )
         if scope_refusal is not None:
+            if stored_scope is not None:
+                scope_refusal += "; head advanced; discovery not permitted for this turn"
             if isinstance(cache, ServerDiscoveredPRStates):
                 cache.remember_refusal(
                     repository, pull_request, scope_refusal,
@@ -303,17 +318,20 @@ def resolve_review_state_for_context(
             f"repository={json.dumps(repository)}, pull_request={pull_request}; "
             "live scope discovery requires an authenticated operator user turn"
         )
+        if stored_scope is not None:
+            scope_refusal += "; head advanced; discovery not permitted for this turn"
         if isinstance(cache, ServerDiscoveredPRStates):
             cache.remember_refusal(repository, pull_request, scope_refusal)
         raise ToolPolicyRefusal(scope_refusal)
     cached = cache.resolve(repository, pull_request) if cache is not None else None
     if cached is not None:
         return cached
-    client = _client_for_repository(repository)
-    try:
-        snapshot = client.get_pull_request_snapshot(repository.lower(), pull_request)
-    except ForgeError as exc:
-        raise ToolException(f"pull-request operation rejected: {exc}") from exc
+    if snapshot is None:
+        client = _client_for_repository(repository)
+        try:
+            snapshot = client.get_pull_request_snapshot(repository.lower(), pull_request)
+        except ForgeError as exc:
+            raise ToolException(f"pull-request operation rejected: {exc}") from exc
     self_login = os.environ.get("MIMIR_GITHUB_SELF_LOGIN", "").strip()
     if (
         not can_resolve_forge_review_scope(
@@ -328,6 +346,8 @@ def resolve_review_state_for_context(
             f"repository={json.dumps(repository)}, pull_request={pull_request}; "
             "live scope discovery requires an authenticated operator user turn"
         )
+        if stored_scope is not None:
+            scope_refusal += "; head advanced; discovery not permitted for this turn"
         if isinstance(cache, ServerDiscoveredPRStates):
             cache.remember_refusal(repository, pull_request, scope_refusal)
         raise ToolPolicyRefusal(scope_refusal)
@@ -843,7 +863,12 @@ def unsupported_operation(
     runtime: ToolRuntime[AuthContext] = None,  # type: ignore[assignment]
 ) -> dict[str, Any]:
     """Escalate a bound-PR need in prose, including operations already attempted."""
-    scope = _scope(runtime, repository, pull_request)
+    context = getattr(runtime, "context", None)
+    cache = getattr(context, "server_discovered_pr_states", None)
+    state = cache.resolve_for_tool("unsupported_operation", repository, pull_request) if isinstance(
+        cache, ServerDiscoveredPRStates,
+    ) else None
+    scope = state.action_scope if state is not None else _scope(runtime, repository, pull_request)
     safe_description = _bounded_escalation_text(
         description,
         fallback="The caller did not provide a description of the unsupported operation.",

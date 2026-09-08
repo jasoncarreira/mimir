@@ -707,12 +707,143 @@ def test_advanced_head_invalidates_reuse_and_is_not_rechecked_this_turn(
             resolve_review_state_for_context(autonomous, "owner/repo", 1291)
         assert 'repository="owner/repo", pull_request=1291' in str(refused.value)
         assert "head advanced" in str(refused.value)
+        assert "discovery not permitted" in str(refused.value)
 
     assert client.calls == [
         ("snapshot", "owner/repo", 1291),
         ("snapshot", "owner/repo", 1291),
     ]
     assert store.resolve("owner/repo", 1291) is None
+
+
+@pytest.mark.parametrize("turn_kind", ["operator_user", "poller_service"])
+def test_advanced_stored_head_rediscovers_from_observed_snapshot(
+    tmp_path, monkeypatch: pytest.MonkeyPatch, turn_kind: str,
+) -> None:
+    client = FakeForge()
+    client.snapshot_author = "reviewer"
+    _configure_live_review(monkeypatch, client)
+    store = ServerDiscoveredPRScopeStore()
+    operator = replace(
+        _production_auth_context(tmp_path, "operator_user"),
+        server_discovered_pr_scope_store=store,
+    )
+    old = resolve_review_state_for_context(operator, "owner/repo", 1291).action_scope
+    client.calls.clear()
+    client.snapshot_heads = ["e" * 40, "f" * 40]
+    context = replace(
+        _production_auth_context(tmp_path, turn_kind),
+        server_discovered_pr_scope_store=store,
+    )
+
+    fresh = resolve_review_state_for_context(context, "owner/repo", 1291)
+    assert fresh.action_scope is not old
+    assert fresh.action_scope.observed_head_sha == "e" * 40
+    assert fresh.action_scope.provenance == "server_discovered"
+    assert fresh.action_scope.destination_ref == "refs/heads/server-head"
+    assert store.resolve("owner/repo", 1291) is fresh.action_scope
+    assert context.server_discovered_pr_states.refusal("owner/repo", 1291) is None
+    assert resolve_review_state_for_context(context, "owner/repo", 1291) is fresh
+    assert client.calls == [
+        ("snapshot", "owner/repo", 1291), ("reviews", fresh.action_scope),
+    ]
+    assert client.snapshot_heads == ["f" * 40]
+
+
+def test_advanced_stored_head_rechecks_discovery_acceptance(
+    tmp_path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = FakeForge()
+    _configure_live_review(monkeypatch, client)
+    store = ServerDiscoveredPRScopeStore()
+    operator = replace(
+        _production_auth_context(tmp_path, "operator_user"),
+        server_discovered_pr_scope_store=store,
+    )
+    resolve_review_state_for_context(operator, "owner/repo", 1291)
+    client.snapshot_heads = ["e" * 40]
+    context = _poller_context(tmp_path, store)
+    for _ in range(2):
+        with pytest.raises(ToolException, match="head advanced; discovery not permitted"):
+            resolve_review_state_for_context(context, "owner/repo", 1291)
+    assert store.resolve("owner/repo", 1291) is None
+    assert context.server_discovered_pr_states.resolve("owner/repo", 1291) is None
+    assert client.calls == [("snapshot", "owner/repo", 1291)] * 2
+
+
+@pytest.mark.parametrize(
+    ("invalid", "reason"),
+    [("closed", "pull request is closed"),
+     ("repo", "repository or pull request number does not match"),
+     ("number", "repository or pull request number does not match"),
+     ("fetch-denied", "head advanced; discovery not permitted"),
+     ("accept-denied", "head advanced; discovery not permitted")],
+)
+@pytest.mark.asyncio
+async def test_invalid_stored_scope_refuses_reads_but_allows_typed_escalation(
+    tmp_path, monkeypatch: pytest.MonkeyPatch, invalid: str, reason: str,
+) -> None:
+    client = FakeForge()
+    _configure_live_review(monkeypatch, client)
+    store = ServerDiscoveredPRScopeStore()
+    operator = replace(
+        _production_auth_context(tmp_path, "operator_user"),
+        server_discovered_pr_scope_store=store,
+    )
+    old = resolve_review_state_for_context(operator, "owner/repo", 1291).action_scope
+    client.snapshot_heads = ["e" * 40]
+    if invalid == "closed":
+        client.snapshot_state = "closed"
+    elif invalid == "repo":
+        client.snapshot_repo = "attacker/other"
+    elif invalid == "number":
+        get_snapshot = client.get_pull_request_snapshot
+        monkeypatch.setattr(client, "get_pull_request_snapshot", lambda repo, number: replace(
+            get_snapshot(repo, number), number=number + 1,
+        ))
+    context = replace(
+        _production_auth_context(tmp_path, {
+            "fetch-denied": "scheduled_tick", "accept-denied": "poller_service",
+        }.get(invalid, "operator_user")),
+        server_discovered_pr_scope_store=store,
+    )
+    runtime = Runtime(context=context)
+    for _ in range(2):
+        with pytest.raises(ToolException, match=reason):
+            pr_metadata.func(repository="owner/repo", pull_request=1291, runtime=runtime)
+    assert store.resolve("owner/repo", 1291) is None
+    cache = context.server_discovered_pr_states
+    assert cache.resolve("owner/repo", 1291) is None
+    for tool in FORGE_TOOLS:
+        if tool.name != "unsupported_operation":
+            assert cache.resolve_for_tool(tool.name, "owner/repo", 1291) is None
+    assert cache.resolve_for_tool("unsupported_operation", "owner/repo", 1292) is None
+    assert cache.resolve_for_tool("unsupported_operation", "attacker/other", 1291) is None
+
+    monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
+    events = []
+    monkeypatch.setattr("mimir.event_logger.log_durable_event_sync", lambda *a, **kw: events.append(kw))
+    request = ToolCallRequest(
+        tool_call={"name": "unsupported_operation", "args": {
+            "repository": "owner/repo", "pull_request": 1291,
+            "description": "PR reads refused", "attempted_operations": ["pr_metadata"],
+        }, "id": "escalate", "type": "tool_call"},
+        tool=None, state=None, runtime=runtime,
+    )
+
+    async def handler(request):
+        result = unsupported_operation.func(**request.tool_call["args"], runtime=runtime)
+        return ToolMessage(content=json.dumps(result), tool_call_id="escalate")
+
+    result = await BudgetGateMiddleware().awrap_tool_call(request, handler)
+    assert result.status != "error", result.content
+    assert json.loads(result.content)["escalated"] is True
+    assert events[0]["scope_id"] == old.scope_id
+    assert events[0]["repository"] == "owner/repo"
+    assert events[0]["pull_request"] == 1291
+    with pytest.raises(ToolException, match=reason):
+        pr_metadata.func(repository="owner/repo", pull_request=1291, runtime=runtime)
+    assert client.calls == [("snapshot", "owner/repo", 1291)] * 2
 
 
 @pytest.mark.asyncio

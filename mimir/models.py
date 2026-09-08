@@ -1125,6 +1125,23 @@ class ServerDiscoveredPRStates:
     _refusals: dict[tuple[str, int], str] = field(
         default_factory=dict, init=False, repr=False,
     )
+    _escalation_states: dict[tuple[str, int], RepoReviewState] = field(
+        default_factory=dict, init=False, repr=False,
+    )
+
+    def remember_escalation_scope(self, scope: RepoPRActionScope) -> None:
+        """Retain invalidated authority only as context for a local diagnostic."""
+        with self._lock:
+            self._escalation_states[(scope.canonical_repo, scope.pr_number)] = RepoReviewState(scope)
+
+    def resolve_for_tool(
+        self, tool_name: str, repository: str, pull_request: int,
+    ) -> RepoReviewState | None:
+        state = self.resolve(repository, pull_request)
+        if state is None and tool_name == "unsupported_operation":
+            with self._lock:
+                return self._escalation_states.get((repository.lower(), pull_request))
+        return state
 
     @property
     def review_states(self) -> tuple[RepoReviewState, ...]:
@@ -1156,7 +1173,7 @@ class ServerDiscoveredPRStates:
     def remember_refusal(
         self, repository: str, pull_request: int, refusal: str,
     ) -> str:
-        """Keep a deterministic scope failure from being retried this turn."""
+        """Cache only failures that remain true after the resolving call completes."""
         target = (repository.lower(), pull_request)
         with self._lock:
             return self._refusals.setdefault(target, refusal)
