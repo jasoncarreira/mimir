@@ -166,7 +166,17 @@ When `mcpServers` is missing or empty, the local proxy injects one locally hoste
 
 Native Mimir tools operate on the daemon host. Mimir Hands operates with the local client's user authority and returns opaque `client-file:` resources. Its `cwd` is context, not filesystem confinement or a path sandbox. Consent authorizes execution; it does not provide containment, declassify results, or remove their originating-channel taint. Mimir tolerates advertised ACP client `fs` and `terminal` capabilities but never calls them. `additionalDirectories` and arbitrary provider profiles are rejected.
 
-Python keeps one lazy subprocess and in-memory namespace per ACP session. Session load restores the daemon transcript but retires the old worker first, so Python state is never stored in a session or journal and the next call is fresh. Workers retire on load, hosted disconnect, cancellation, daemon-generation replacement, proxy exit, `SIGTERM`, `SIGINT`, `SIGHUP`, or 1,800 seconds of idle time. Shells and Python workers run in owned process groups that are killed and reaped during cleanup. Variables, functions, imports, and loaded data persist only while that worker remains live.
+Python keeps one lazy subprocess and in-memory namespace per canonical project directory (`str(Path(cwd).resolve())`) within the live proxy, with a single session owner until release. Another session using the same directory is refused while the kernel is owned. Hosted disconnect and session load detach the owner without destroying an idle worker, so the next session can reuse its variables, functions, imports, and loaded data. Session load restores the daemon transcript, not Python state: the namespace is never serialized to a session, journal, or disk. Existing transient stdout/stderr capture files are unchanged.
+
+Kernels expire after 1,800 seconds of idle time. The proxy keeps at most 8 project kernels, evicting the least recently used detached kernel when capacity is needed; it refuses a new project when all kernels are owned. Cancellation still kills an active execution and its worker, but releasing an idle kernel preserves it. Proxy exit, `SIGTERM`, `SIGINT`, and `SIGHUP` destroy workers. Shells and Python workers run in owned process groups that are killed and reaped during cleanup. Restarting the proxy or respawning a worker loses all Python state; persistence is live-proxy-only, not durable recovery.
+
+Pass these operator commands as the entire `code` argument to `hands_python` (they use the existing seven-field result and the same Python permission flow):
+
+- `%kernels` lists project `cwd`, session owner, and worker `pid`.
+- `%kernel kill` explicitly kills the current project kernel only if it is unowned or owned by the caller. It cannot target another project.
+- `%kernel release` detaches the caller from the current project without killing its idle worker.
+
+These commands do not add filesystem confinement or widen permissions. The confinement work in #1593 has not landed, and there is no widening path yet. When that work adds spawn-time approved paths, widening them by respawning will still lose the namespace; the operator must be warned before respawn. Reattachment must check the new session's approved set against the worker's spawn-time set rather than inheriting broader access.
 
 ## Troubleshooting
 

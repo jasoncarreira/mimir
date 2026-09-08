@@ -79,7 +79,7 @@ def test_shared_wire_contract_is_stdlib_only_and_exact() -> None:
         },
         {
             "name": "python",
-            "description": "Execute Python code in a persistent per-session namespace on the client host. Returns stdout, stderr, the final expression repr, exception, timeout status, and kernel state.",
+            "description": "Execute Python code in a persistent per-project namespace on the client host, owned by one session at a time. State survives release and session load only within the live proxy; restart or worker respawn loses all state. Use %kernels to list cwd, owner, and pid; %kernel kill to kill the current project kernel only if unowned or owned by you; %kernel release to detach your session from the current project. Returns stdout, stderr, the final expression repr, exception, timeout status, and kernel state.",
             "inputSchema": {
                 "type": "object",
                 "properties": {"code": {"type": "string"}},

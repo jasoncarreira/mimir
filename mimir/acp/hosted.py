@@ -138,7 +138,7 @@ class HostedHandsProvider:
             if item.session.session_id == session_id
         )
         await asyncio.gather(*(self._cancel_calls(item) for item in session_connections))
-        await self._python_kernels.retire(session_id)
+        await self._python_kernels.release(session_id)
         self._connections.pop(connection_id, None)
         return {}
 
@@ -150,7 +150,7 @@ class HostedHandsProvider:
                 if connection.session.session_id == session_id
             )
         )
-        await self._python_kernels.retire(session_id)
+        await self._python_kernels.release(session_id)
 
     async def execute_python(
         self,

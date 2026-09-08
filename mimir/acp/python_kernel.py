@@ -20,6 +20,7 @@ from typing import Any, Coroutine
 STREAM_LIMIT_BYTES = 65_536
 TEXT_LIMIT_BYTES = 16_384
 IDLE_SECONDS = 1_800
+MAX_KERNELS = 8
 _FRAME_LIMIT_BYTES = 16 * 1024 * 1024
 _FILENAME = "<mimir-hands-python>"
 _REAP_TIMEOUT_SECONDS = 5
@@ -159,7 +160,8 @@ class _Worker:
 
 
 @dataclass(slots=True)
-class _Session:
+class _Kernel:
+    owner: str | None = None
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     waiters: int = 0
     worker: _Worker | None = None
@@ -169,7 +171,8 @@ class _Session:
 
 class PythonKernelManager:
     def __init__(self) -> None:
-        self._sessions: dict[str, _Session] = {}
+        self._kernels: dict[str, _Kernel] = {}
+        self._admission = asyncio.Lock()
         self._processes: dict[asyncio.subprocess.Process, int] = {}
         self._reapers: set[asyncio.Task[None]] = set()
         self._directory: Path | None = None
@@ -184,8 +187,44 @@ class PythonKernelManager:
     ) -> dict[str, Any]:
         if self._closed:
             raise PythonKernelUnavailable("kernel manager is closed")
-        state = self._sessions.setdefault(session_id, _Session())
-        state.waiters += 1
+        key = str(Path(cwd).resolve())
+        command = code.strip()
+        if command == "%kernels":
+            return self._control_result(json.dumps(self.kernels()))
+        async with self._admission:
+            if self._closed:
+                raise PythonKernelUnavailable("kernel manager is closed")
+            state = self._kernels.get(key)
+            if state is not None and state.owner not in (None, session_id):
+                raise PythonKernelUnavailable(
+                    f"kernel for {key} is owned by session {state.owner}; refused; "
+                    "release it with %kernel release in the owning session"
+                )
+            if command == "%kernel kill":
+                await self.retire(key)
+                return self._control_result("kernel terminated; namespace state lost")
+            if command == "%kernel release":
+                if state is not None:
+                    async with state.lock:
+                        state.owner = None
+                return self._control_result("kernel released")
+            if state is None:
+                if len(self._kernels) >= MAX_KERNELS:
+                    candidates = [
+                        (item.last_activity, path)
+                        for path, item in self._kernels.items()
+                        if item.owner is None
+                        and not item.lock.locked()
+                        and item.waiters == 0
+                    ]
+                    if not candidates:
+                        raise PythonKernelUnavailable(
+                            "kernel capacity reached; all kernels are owned; refused"
+                        )
+                    await self.retire(min(candidates)[1])
+                state = self._kernels.setdefault(key, _Kernel())
+            state.owner = session_id
+            state.waiters += 1
         try:
             await state.lock.acquire()
         except BaseException:
@@ -199,6 +238,8 @@ class PythonKernelManager:
         stderr_path: Path | None = None
         kernel_state = "fresh"
         try:
+            if self._closed:
+                raise PythonKernelUnavailable("kernel manager is closed")
             if state.worker is not None:
                 if state.worker.process.returncode is not None:
                     result = await self._crashed(state, state.worker, None, None)
@@ -206,7 +247,7 @@ class PythonKernelManager:
                     return result
                 kernel_state = "reused"
             else:
-                state.worker = await self._spawn(cwd, deadline)
+                state.worker = await self._spawn(Path(key), deadline)
             try:
                 stdout_path = self._output_path()
                 stderr_path = self._output_path()
@@ -298,24 +339,55 @@ class PythonKernelManager:
                         pass
             state.lock.release()
             if state.worker is not None and state.waiters == 0:
-                self._arm_idle(session_id, state, state.worker)
+                self._arm_idle(key, state, state.worker)
+            elif state.worker is None and state.waiters == 0:
+                self._kernels.pop(key, None)
 
-    async def retire(self, session_id: str) -> None:
-        state = self._sessions.get(session_id)
+    @staticmethod
+    def _control_result(value: str) -> dict[str, Any]:
+        return {
+            "ok": True, "stdout": "", "stderr": "", "value": value,
+            "exception": "", "timedOut": False, "kernel": "reused",
+        }
+
+    def kernels(self) -> list[dict[str, Any]]:
+        return [
+            {
+                "cwd": key, "owner": state.owner, "pid": state.worker.process.pid,
+                "idle_seconds": max(
+                    0, asyncio.get_running_loop().time() - state.last_activity
+                ),
+            }
+            for key, state in sorted(self._kernels.items())
+            if state.worker is not None
+        ]
+
+    async def release(self, session_id: str) -> None:
+        async with self._admission:
+            for state in tuple(self._kernels.values()):
+                if state.owner == session_id:
+                    async with state.lock:
+                        state.owner = None
+
+    async def retire(self, cwd: str | os.PathLike[str]) -> None:
+        key = str(Path(cwd).resolve())
+        state = self._kernels.get(key)
         if state is None:
             return
         self._cancel_idle(state)
         async with state.lock:
+            self._cancel_idle(state)
             if state.worker is not None:
                 await self._discard(state, state.worker)
         if state.waiters == 0:
-            self._sessions.pop(session_id, None)
+            self._kernels.pop(key, None)
 
     async def close(self) -> None:
         if self._closed:
             return
         self._closed = True
-        await asyncio.gather(*(self.retire(key) for key in tuple(self._sessions)))
+        async with self._admission:
+            await asyncio.gather(*(self.retire(key) for key in tuple(self._kernels)))
         if self._reapers:
             reapers = tuple(self._reapers)
             await asyncio.gather(*reapers)
@@ -489,7 +561,7 @@ class PythonKernelManager:
 
     async def _crashed(
         self,
-        state: _Session,
+        state: _Kernel,
         worker_state: _Worker,
         stdout_path: Path | None,
         stderr_path: Path | None,
@@ -515,7 +587,7 @@ class PythonKernelManager:
             "kernel": "crashed",
         }
 
-    async def _discard(self, state: _Session, worker_state: _Worker) -> None:
+    async def _discard(self, state: _Kernel, worker_state: _Worker) -> None:
         if state.worker is worker_state:
             state.worker = None
         await self._terminate(worker_state)
@@ -547,13 +619,13 @@ class PythonKernelManager:
         finally:
             self._processes.pop(process, None)
 
-    def _cancel_idle(self, state: _Session) -> None:
+    def _cancel_idle(self, state: _Kernel) -> None:
         if state.idle_task is not None:
             state.idle_task.cancel()
             state.idle_task = None
 
     def _arm_idle(
-        self, session_id: str, state: _Session, worker_state: _Worker
+        self, session_id: str, state: _Kernel, worker_state: _Worker
     ) -> None:
         self._cancel_idle(state)
         state.idle_task = asyncio.create_task(
@@ -561,26 +633,23 @@ class PythonKernelManager:
         )
 
     async def _retire_when_idle(
-        self, session_id: str, state: _Session, worker_state: _Worker
+        self, session_id: str, state: _Kernel, worker_state: _Worker
     ) -> None:
         try:
             deadline = state.last_activity + IDLE_SECONDS
             await asyncio.sleep(max(0.0, deadline - asyncio.get_running_loop().time()))
-            if (
-                self._sessions.get(session_id) is state
-                and state.worker is worker_state
-                and state.waiters == 0
-                and not state.lock.locked()
-                and asyncio.get_running_loop().time() >= deadline
-            ):
-                async with state.lock:
-                    if (
-                        self._sessions.get(session_id) is state
-                        and state.worker is worker_state
-                        and state.waiters == 0
-                        and asyncio.get_running_loop().time() >= deadline
-                    ):
+            # Admission and retirement must not hand out a state being removed.
+            async with self._admission:
+                if (
+                    self._kernels.get(session_id) is state
+                    and state.worker is worker_state
+                    and state.waiters == 0
+                    and not state.lock.locked()
+                    and asyncio.get_running_loop().time() >= deadline
+                ):
+                    async with state.lock:
                         await self._discard(state, worker_state)
+                        self._kernels.pop(session_id, None)
         except asyncio.CancelledError:
             pass
         finally:
