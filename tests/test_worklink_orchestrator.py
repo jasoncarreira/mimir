@@ -323,13 +323,15 @@ def test_stuck_cancellation_stops_heartbeat_and_releases_claim(
     repo = tmp_path / "repo"
     worktree = repo.parent / ".worklink" / repo.name / "441-1"
     repo.mkdir()
-    heartbeats: list[ClaimRecord] = []
+    heartbeat_task: asyncio.Task[None] | None = None
+    heartbeat_started = asyncio.Event()
     releases: list[int] = []
     transitions: list[dict[str, object]] = []
     claim = ClaimRecord(441, 1, "agent", datetime.now(UTC))
 
     class StuckCompute(FakeCompute):
         async def wait(self, handle: LaunchHandle, timeout_s: int) -> ComputeResult:
+            await heartbeat_started.wait()
             await asyncio.to_thread(worker_exec._terminate_process_group_pid, 4321, 0)
             raise AssertionError("unreapable cancellation unexpectedly converged")
 
@@ -357,11 +359,14 @@ def test_stuck_cancellation_stops_heartbeat_and_releases_claim(
         "claim_issue",
         lambda self, *args, **kwargs: ClaimResult(True, claim),
     )
-    monkeypatch.setattr(
-        orchestrator.ChainlinkClaims,
-        "heartbeat_issue",
-        lambda self, record: (heartbeats.append(record) or record),
-    )
+
+    def heartbeat_issue(self, record: ClaimRecord) -> ClaimRecord:
+        nonlocal heartbeat_task
+        heartbeat_task = asyncio.current_task()
+        heartbeat_started.set()
+        return record
+
+    monkeypatch.setattr(orchestrator.ChainlinkClaims, "heartbeat_issue", heartbeat_issue)
     monkeypatch.setattr(
         orchestrator.ChainlinkClaims,
         "release_issue",
@@ -372,7 +377,6 @@ def test_stuck_cancellation_stops_heartbeat_and_releases_claim(
         "transition_issue",
         lambda self, *args, **kwargs: transitions.append(kwargs),
     )
-    monkeypatch.setattr(orchestrator, "_CLAIM_HEARTBEAT_INTERVAL_S", 0.001)
     monkeypatch.setattr(
         worker_exec, "_wait_process_group", lambda _process_group, _deadline: False
     )
@@ -381,7 +385,7 @@ def test_stuck_cancellation_stops_heartbeat_and_releases_claim(
     )
     monkeypatch.setattr(worker_exec.os, "killpg", lambda *_args: None)
 
-    async def exercise() -> tuple[object, int]:
+    async def exercise() -> object:
         result = await WorklinkRunner(
             home=tmp_path,
             repo=repo,
@@ -389,15 +393,15 @@ def test_stuck_cancellation_stops_heartbeat_and_releases_claim(
             registry=registry,
             agent_id="agent",
         ).run(441, backend_name="fake", test_command="echo ok")
-        stopped_at = len(heartbeats)
-        await asyncio.sleep(0.01)
-        return result, stopped_at
+        assert heartbeat_task is not None
+        assert heartbeat_task.done()
+        assert heartbeat_task.cancelled()
+        return result
 
-    result, stopped_at = asyncio.run(exercise())
+    result = asyncio.run(exercise())
 
     assert result.status == "failed"
     assert result.reason and "still has live members after SIGKILL" in result.reason
-    assert len(heartbeats) == stopped_at == 1
     assert releases == [claim.issue_id]
     assert transitions[-1]["status"] == "failed"
     assert compute_backend.cleaned == [LaunchHandle("fake_compute", "job-1")]
@@ -807,10 +811,11 @@ def test_leaf_dispatch_failure_clears_ledger_only_after_success(
     result = run_worklink(home=tmp_path, repo=tmp_path, issue_id=701, autonomous=True)
 
     assert result.status == "failed"
-    backed_off, alerts = pending_failure_alerts(state_dir)
+    failed_entry = load_failure_state(state_dir)["issues"]["701"]
+    now = datetime.fromisoformat(failed_entry["failed_at"])
+    backed_off, alerts = pending_failure_alerts(state_dir, now=now)
     assert backed_off == {701}
     assert [alert["issue_id"] for alert in alerts] == [701]
-    failed_entry = load_failure_state(state_dir)["issues"]["701"]
 
     async def blocked_leaf(self: WorklinkRunner, issue_id: int, **_: object):
         return orchestrator.WorklinkRunResult(issue_id, 3, "blocked")
@@ -825,7 +830,7 @@ def test_leaf_dispatch_failure_clears_ledger_only_after_success(
     assert parked_entry["retry_after"] == failed_entry["retry_after"]
     assert parked_entry["notified_signatures"] == failed_entry["notified_signatures"]
     assert parked_entry["occurrence_id"] == failed_entry["occurrence_id"]
-    backed_off, alerts = pending_failure_alerts(state_dir)
+    backed_off, alerts = pending_failure_alerts(state_dir, now=now)
     assert backed_off == {701}
     assert [alert["issue_id"] for alert in alerts] == [701]
 
@@ -857,7 +862,10 @@ def test_epic_dispatch_failure_clears_ledger_only_after_success(
     result = run_worklink_epic(home=tmp_path, repo=tmp_path, issue_id=700, autonomous=True)
 
     assert result.status == "failed"
-    backed_off, alerts = pending_failure_alerts(dispatch_failure_state_dir(tmp_path))
+    state_dir = dispatch_failure_state_dir(tmp_path)
+    failed_entry = load_failure_state(state_dir)["issues"]["700"]
+    now = datetime.fromisoformat(failed_entry["failed_at"])
+    backed_off, alerts = pending_failure_alerts(state_dir, now=now)
     assert backed_off == {700}
     assert [alert["issue_id"] for alert in alerts] == [700]
 
@@ -5474,11 +5482,24 @@ def test_factory_executor_exit_retains_scrubbed_tail_and_record_pointer(
     assert cleaned == [handle]
 
 
+@pytest.fixture
+def factory_clock(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
+    import mimir.worklink.orchestrator as orchestrator
+
+    clock = SimpleNamespace(now=0.0)
+    # Replace only the supervisor's clock lookup, not the event loop's timers.
+    local_asyncio = SimpleNamespace(**vars(asyncio))
+    local_asyncio.get_running_loop = lambda: SimpleNamespace(time=lambda: clock.now)
+    monkeypatch.setattr(orchestrator, "asyncio", local_asyncio)
+    return clock
+
+
 @pytest.mark.parametrize("failure", ["status", "heartbeat", "persistence", "timeout"])
 def test_factory_supervision_cancels_and_cleans_on_every_failure(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     failure: str,
+    factory_clock: SimpleNamespace,
 ) -> None:
     import mimir.worklink.orchestrator as orchestrator
 
@@ -5514,6 +5535,9 @@ def test_factory_supervision_cancels_and_cleans_on_every_failure(
         def heartbeat(self, *args: object, **kwargs: object) -> None:
             if failure == "heartbeat":
                 raise RuntimeError("heartbeat failed")
+            if failure == "timeout":
+                assert factory_clock.now == 0.0, "supervision continued after run deadline"
+                factory_clock.now = 20.0
 
     if failure == "persistence":
         monkeypatch.setattr(
@@ -5522,9 +5546,12 @@ def test_factory_supervision_cancels_and_cleans_on_every_failure(
             lambda *args, **kwargs: (_ for _ in ()).throw(OSError("persist failed")),
         )
     if failure == "timeout":
-        monkeypatch.setattr(orchestrator, "_epic_run_timeout_s", lambda: 0.02)
+        monkeypatch.setattr(orchestrator, "_epic_run_timeout_s", lambda: 20.0)
 
-    with pytest.raises((ValueError, RuntimeError, OSError, orchestrator.WorklinkError)):
+    with pytest.raises(
+        (ValueError, RuntimeError, OSError, orchestrator.WorklinkError),
+        match="factory exceeded run timeout" if failure == "timeout" else None,
+    ):
         asyncio.run(
             WorklinkRunner(home=tmp_path, repo=tmp_path)._supervise_factory_070(
                 issue=IssueContext(700, "epic", "build", {"worklink:epic"}),
@@ -5542,8 +5569,12 @@ def test_factory_supervision_cancels_and_cleans_on_every_failure(
     assert lifecycle == ["cancel", "cleanup"]
 
 
+@pytest.mark.parametrize("expiry", ["status_return", "between_polls"])
 def test_factory_pre_manifest_status_is_bounded_by_startup_deadline(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    factory_clock: SimpleNamespace,
+    expiry: str,
 ) -> None:
     import mimir.worklink.orchestrator as orchestrator
 
@@ -5551,7 +5582,6 @@ def test_factory_pre_manifest_status_is_bounded_by_startup_deadline(
     handle = LaunchHandle("local_subprocess", "123", 456)
     stopped = asyncio.Event()
     lifecycle: list[str] = []
-    status_calls = 0
 
     class Compute:
         async def wait(self, selected: LaunchHandle, timeout_s: int) -> ComputeResult:
@@ -5559,6 +5589,7 @@ def test_factory_pre_manifest_status_is_bounded_by_startup_deadline(
             return ComputeResult(-15, "", "cancelled", handle=selected)
 
         def job_alive(self, selected: LaunchHandle) -> bool:
+            assert factory_clock.now < 30.0, "startup continued past its deadline"
             return not stopped.is_set()
 
         async def cancel(self, selected: LaunchHandle) -> None:
@@ -5572,8 +5603,9 @@ def test_factory_pre_manifest_status_is_bounded_by_startup_deadline(
         poll_interval_s = 0
 
         def status(self, *args: object, **kwargs: object) -> Any:
-            nonlocal status_calls
-            status_calls += 1
+            assert factory_clock.now < 30.0, "status requested after startup deadline"
+            if expiry == "status_return":
+                factory_clock.now = 30.0
             return parse_factory_status(
                 {
                     "run_id": "700",
@@ -5583,7 +5615,13 @@ def test_factory_pre_manifest_status_is_bounded_by_startup_deadline(
                 }
             )
 
-    monkeypatch.setattr(orchestrator, "_FACTORY_STARTUP_STATUS_TIMEOUT_S", 0.03)
+    async def reach_deadline(delay: float) -> None:
+        assert expiry == "between_polls"
+        assert factory_clock.now == 0.0
+        factory_clock.now = 30.0
+
+    monkeypatch.setattr(orchestrator.asyncio, "sleep", reach_deadline)
+    monkeypatch.setattr(orchestrator, "_FACTORY_STARTUP_STATUS_TIMEOUT_S", 30.0)
     with pytest.raises(orchestrator.WorklinkError, match="factory never initialised"):
         asyncio.run(
             WorklinkRunner(home=tmp_path, repo=tmp_path)._supervise_factory_070(
@@ -5600,7 +5638,7 @@ def test_factory_pre_manifest_status_is_bounded_by_startup_deadline(
         )
 
     assert lifecycle == ["cancel", "cleanup"]
-    assert status_calls >= 2
+    assert factory_clock.now == 30.0
 
 
 @pytest.mark.parametrize("after_valid", [False, True])
