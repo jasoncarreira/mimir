@@ -541,8 +541,9 @@ def test_attempt_cap_gives_up_once_then_rearms_after_backstop(
     assert captured_emits[-1]["attempt"] == 1
 
 
+@pytest.mark.parametrize("missing_timestamp", [False, True])
 def test_emitted_but_undelivered_reminder_does_not_charge_or_duplicate(
-    monkeypatch, captured_emits, tmp_path,
+    monkeypatch, captured_emits, tmp_path, missing_timestamp,
 ):
     _patch_api(
         monkeypatch,
@@ -561,7 +562,11 @@ def test_emitted_but_undelivered_reminder_does_not_charge_or_duplicate(
     assert count == 1
     assert cursor["638"]["attempts"] == 0
 
-    _write_recovery(tmp_path, {"queued": _recovery_entry()})
+    queued = _recovery_entry()
+    if missing_timestamp:
+        queued.pop("enqueued_at", None)
+        queued.pop("stashed_at", None)
+    _write_recovery(tmp_path, {"queued": queued})
     count, cursor = poller._check_own_changes_requested(
         "o/r", "tok", "mimir-bot", cursor, now=NOW + timedelta(hours=2),
     )
@@ -572,9 +577,38 @@ def test_emitted_but_undelivered_reminder_does_not_charge_or_duplicate(
     count, cursor = poller._check_own_changes_requested(
         "o/r", "tok", "mimir-bot", cursor, now=NOW + timedelta(days=1),
     )
-    assert count == 1
+    assert count == 2
     assert cursor["638"]["attempts"] == 0
-    assert len(captured_emits) == 2
+    assert len(captured_emits) == 3
+    assert captured_emits[-2] == {
+        "signal": "pr_changes_requested_pending_expired",
+        "repo": "o/r", "number": 638,
+        "last_reminded_at": "2026-07-19T12:00:00Z",
+        "pending_seconds": 86400,
+    }
+    assert captured_emits[-1]["attempt"] == 1
+    # The orphan remains in the ledger: neither the next tick nor the next
+    # hourly cadence may turn the daily re-arm into an emission storm.
+    for elapsed in (timedelta(minutes=15), timedelta(hours=2)):
+        count, later = poller._check_own_changes_requested(
+            "o/r", "tok", "mimir-bot", cursor,
+            now=NOW + timedelta(days=1) + elapsed,
+        )
+        assert count == 0
+        assert later == cursor
+    assert len(captured_emits) == 3
+
+    # A late delivered outcome is counted once, not once per re-emission.
+    queued.update(last_outcome_at="2026-07-20T12:01:00+00:00",
+                  outcome_disposition="charge", attempts=1)
+    _write_recovery(tmp_path, {"queued": queued})
+    count, cursor = poller._check_own_changes_requested(
+        "o/r", "tok", "mimir-bot", cursor,
+        now=NOW + timedelta(days=1, hours=2),
+    )
+    assert count == 1
+    assert cursor["638"]["attempts"] == 1
+    assert captured_emits[-1]["attempt"] == 2
 
 
 def test_hard_refusal_is_uncharged_and_retries_only_at_daily_backstop(

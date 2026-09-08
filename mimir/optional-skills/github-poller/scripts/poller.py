@@ -2328,9 +2328,6 @@ def _check_own_changes_requested(
             event_types=_CHANGES_REQUESTED_TURN_EVENT_TYPES,
             after=recovery_after,
             head_sha=head_sha,
-            pending_before=(
-                observed_at - CHANGES_REQUESTED_GAVE_UP_BACKSTOP
-            ).isoformat(),
         )
         recovery_available = recovery is not None
         latest_refusal_at = ""
@@ -2345,14 +2342,29 @@ def _check_own_changes_requested(
             if found and prior_attempts <= REVIEW_REQUEST_MAX_ATTEMPTS:
                 # Recovery is authoritative over legacy emission-count cursors.
                 prior_attempts = charged
-            if pending:
+            if pending and (
+                last_reminded is None
+                or observed_at - last_reminded < CHANGES_REQUESTED_GAVE_UP_BACKSTOP
+            ):
                 new[key] = {
                     "head_sha": head_sha,
-                    "last_reminded_at": last_reminded_at or observed_at_iso,
+                    "last_reminded_at": last_reminded_at if last_reminded else observed_at_iso,
                     "attempts": prior_attempts,
                     **({"rearmed_at": recovery_after} if recovery_after else {}),
                 }
                 continue
+            if pending:
+                # Bound suppression by the cursor, not ledger timestamps: an
+                # orphan can lack those timestamps. Emitting renews this clock
+                # without resetting or charging the delivered-attempt budget.
+                _emit_signal(
+                    "pr_changes_requested_pending_expired",
+                    repo=repo,
+                    number=number,
+                    last_reminded_at=last_reminded_at,
+                    pending_seconds=int((observed_at - last_reminded).total_seconds()),
+                )
+                count += 1
 
         if latest_refusal_at:
             refused_at = _parse_utc_datetime(latest_refusal_at)
