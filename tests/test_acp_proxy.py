@@ -269,6 +269,9 @@ async def test_grants_are_scoped_to_session_and_wrapper() -> None:
         daemon.data.clear()
         await router.route_daemon(permission_request(2, "one"))
         assert messages(daemon)[-1]["result"]["outcome"]["optionId"] == "allow_once"
+        assert messages(daemon)[-1]["result"]["_meta"] == {
+            "mimir.permission_source": "session_grant"
+        }
         await router.route_daemon(permission_request(3, "one", "hands_shell"))
         await router.route_daemon(permission_request(4, "two"))
         assert [item["id"] for item in messages(client)] == [3, 4]
@@ -297,7 +300,10 @@ async def test_python_permission_grant_preserves_raw_code_and_scope() -> None:
         assert bytes(client.data) == b""
         assert messages(daemon) == [{
             "jsonrpc": "2.0", "id": 6,
-            "result": {"outcome": {"outcome": "selected", "optionId": "allow_once"}},
+            "result": {
+                "outcome": {"outcome": "selected", "optionId": "allow_once"},
+                "_meta": {"mimir.permission_source": "session_grant"},
+            },
         }]
     finally:
         await router.close()
@@ -353,9 +359,37 @@ async def test_untainted_matching_request_is_answered_allow_once_upstream(
         assert bytes(client.data) == b""
         assert messages(daemon) == [{
             "jsonrpc": "2.0", "id": request_id,
-            "result": {"outcome": {"outcome": "selected", "optionId": "allow_once"}},
+            "result": {
+                "outcome": {"outcome": "selected", "optionId": "allow_once"},
+                "_meta": {"mimir.permission_source": "session_grant"},
+            },
         }]
         assert type(messages(daemon)[0]["id"]) is type(request_id)
+    finally:
+        await router.close()
+
+
+@pytest.mark.asyncio
+async def test_session_grant_outcome_visibility() -> None:
+    from mimir.acp.sdk import PermissionCompletion
+
+    router, client, daemon = await active_router()
+    try:
+        await grant_session(router, 1, "session")
+        client.data.clear()
+        daemon.data.clear()
+        await router.route_daemon(permission_request(2, "session"))
+        assert messages(client) == []
+        response, = messages(daemon)
+        assert response["id"] == 2
+        assert response["result"]["_meta"] == {
+            "mimir.permission_source": "session_grant"
+        }
+        completion = PermissionCompletion.from_response(response["result"])
+        assert completion.session_grant is True
+        assert completion.decision == "allow_once"
+        assert completion.executable is True
+        assert completion.error is None
     finally:
         await router.close()
 
