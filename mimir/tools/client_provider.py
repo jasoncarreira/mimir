@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 from contextvars import ContextVar, Token
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import StrEnum
 from types import MappingProxyType
 from typing import Any, Awaitable, Mapping, Protocol, runtime_checkable
@@ -61,6 +61,16 @@ class PermissionEligibility:
     kind: str
     arguments: Mapping[str, Any]
     host_execution: ClientAuthorizedHostExecution | None = None
+    canonical_client_resource: str | None = field(init=False, default=None)
+
+    def __post_init__(self) -> None:
+        # Metadata only: the wrappers still enforce their resource policy.
+        if self.title in {"hands_read", "hands_edit"}:
+            object.__setattr__(
+                self,
+                "canonical_client_resource",
+                canonical_client_file_resource(self.arguments.get("path")),
+            )
 
 
 _CLIENT_AUTHORIZED_HOST_EXECUTION_ISSUER = object()

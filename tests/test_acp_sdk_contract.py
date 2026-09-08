@@ -546,6 +546,62 @@ def test_permission_response_rejects_malformed_unknown_and_persistent(payload: A
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("owned", [False, True], ids=["fallback", "owned"])
+@pytest.mark.parametrize("decision", ["allow_once", "allow_session", "reject_once", "cancelled"])
+@pytest.mark.parametrize(
+    "extra,session_grant,has_error",
+    [
+        ({}, False, False),
+        ({"_meta": None}, False, False),
+        ({"_meta": {"trace": 1}}, False, False),
+        ({"_meta": {"mimir.permission_source": "session_grant"}}, True, False),
+        ({"_meta": {"mimir.permission_source": "unknown"}}, False, False),
+        ({"_meta": {"mimir.permission_source": True}}, False, False),
+        ({"_meta": {"mimir.permission_source": ["session_grant"]}}, False, False),
+        ({"_meta": []}, False, True),
+        ({"_meta": "session_grant"}, False, True),
+    ],
+)
+async def test_permission_completion_preserves_telemetry_only_marker_in_both_paths(
+    owned: bool, decision: str, extra: dict[str, Any],
+    session_grant: bool, has_error: bool,
+) -> None:
+    transport = MemoryTransport()
+    state = sdk.StrictMessageStateStore()
+    connection = sdk.Connection(
+        lambda *_: asyncio.sleep(0), transport, state_store=state,
+    )
+    peer = sdk.AcpPeer(connection, ContractAgent(), state if owned else None)
+    snapshot = sdk.PermissionSnapshot("t", "Run", "execute", {"command": "true"})
+    task = asyncio.create_task(peer.request_tool_permission("s", snapshot))
+    try:
+        emitted = await asyncio.wait_for(transport.outgoing.get(), 1)
+        outcome = {"outcome": "cancelled"} if decision == "cancelled" else {
+            "outcome": "selected", "optionId": decision,
+            "_meta": {"mimir.permission_source": "session_grant"},
+        }
+        await transport.incoming.put({
+            "jsonrpc": "2.0", "id": emitted["id"],
+            "result": {"outcome": outcome, **extra},
+        })
+        completion = await asyncio.wait_for(task, 1)
+        assert completion.session_grant is session_grant
+        assert completion.decision == ("reject_once" if has_error else decision)
+        assert completion.executable is (
+            decision in {"allow_once", "allow_session"} and not has_error
+        )
+        if has_error:
+            assert isinstance(completion.error, sdk.AcpProtocolError)
+            assert str(completion.error) == "Malformed permission response"
+        else:
+            assert completion.error is None
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        await connection.close()
+
+
+@pytest.mark.asyncio
 async def test_permission_completion_exposes_cancel_and_errors_without_execution() -> None:
     snapshot = sdk.PermissionSnapshot("t", "Run", "execute", {"command": "true"})
     allow_peer = sdk.AcpPeer(
@@ -555,6 +611,7 @@ async def test_permission_completion_exposes_cancel_and_errors_without_execution
     allow = await allow_peer.request_tool_permission("s", snapshot)
     assert allow.decision == "allow_once"
     assert allow.executable is True
+    assert allow.session_grant is False
     session_peer = sdk.AcpPeer(
         FakeConnection([{"outcome": {"outcome": "selected", "optionId": "allow_session"}}]),
         ContractAgent(),
@@ -573,6 +630,7 @@ async def test_permission_completion_exposes_cancel_and_errors_without_execution
     assert errored.decision == "reject_once"
     assert isinstance(errored.error, sdk.RequestError)
     assert errored.executable is False
+    assert errored.session_grant is False
 
 
 @pytest.mark.asyncio

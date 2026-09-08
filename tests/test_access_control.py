@@ -5876,6 +5876,281 @@ def test_github_fetch_cache_read_follows_capability(
         assert decision.reason == "read_scope"
 
 
+@pytest.fixture
+def github_activity_fetch_auth(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> AuthContext:
+    monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
+    monkeypatch.setenv("GITHUB_REPOS", "o/r,o/other")
+    monkeypatch.delenv("MIMIR_EGRESS_APPROVED_URLS", raising=False)
+    service = build_trigger_service_principal(
+        canonical="poller:github-activity", trigger="poller", profile="github",
+        tier=CapabilityTier.CODE_EXECUTION, capabilities=("fetch_url",),
+        approved_urls=("https://api.github.com/repos/", "https://github.com/"),
+        creation_path="test",
+    )
+    return _service_auth(
+        service, InformationFlowLabels(),
+        repo_review_state=_review_state("o/r", 42, "worklink/42", str(tmp_path)),
+    )
+
+
+def _assert_activity_fetch(auth: AuthContext, target: str, expected: bool) -> None:
+    assert access_control.fetch_url_is_approved(target, auth) is expected
+    decision = ToolRegistry().authorize_tool(
+        "fetch_url", auth, enforce=True, target_channel=target,
+    )
+    assert decision.allowed is expected, decision.reason
+
+
+@pytest.mark.parametrize("approvals", [(), ("https://github.com/",)])
+def test_github_activity_actions_fetch_requires_manifest_approved_urls(
+    github_activity_fetch_auth: AuthContext, approvals: tuple[str, ...],
+) -> None:
+    auth = github_activity_fetch_auth
+    target = f"https://api.github.com/repos/o/r/commits/{'a' * 40}/check-runs"
+    _assert_activity_fetch(auth, target, True)
+    service = build_trigger_service_principal(
+        canonical="poller:github-activity", trigger="poller", profile="github",
+        tier=CapabilityTier.CODE_EXECUTION, capabilities=("fetch_url",),
+        approved_urls=approvals, creation_path="test",
+    )
+    _assert_activity_fetch(replace(auth, service_authority=service), target, False)
+    _assert_activity_fetch(
+        replace(auth, service_authority=replace(service, capabilities=())), target, False,
+    )
+
+
+@pytest.mark.parametrize("target", [
+    "https://api.github.com:443/repos/o/r/pulls/42/reviews",
+    "https://raw.githubusercontent.com:443/o/r/main/README.md",
+    "https://api.github.com:bad/repos/o/r/pulls/42/reviews",
+    "https://api.github.com:99999/repos/o/r/pulls/42/reviews",
+    "https://user:pass@api.github.com/repos/o/r/pulls/42/reviews",
+    "http://api.github.com/repos/o/r/pulls/42/reviews",
+    "https://raw.githubusercontent.com/o/r/main/../README.md",
+    "https://raw.githubusercontent.com/o/r/main/%2e%2e/README.md",
+    "https://raw.githubusercontent.com/o/r/main/\\README.md",
+])
+def test_github_activity_review_fetch_rejects_malformed_urls(
+    github_activity_fetch_auth: AuthContext, target: str,
+) -> None:
+    _assert_activity_fetch(replace(github_activity_fetch_auth, repo_review_state=None), target, False)
+
+
+@pytest.mark.parametrize("target", [
+    "https://api.github.com:443 ",
+    "https://api.github.com/repos/o/r/pulls/42/reviews ",
+])
+def test_github_activity_remediation_fetch_refuses_original_url_parse_mismatch(
+    github_activity_fetch_auth: AuthContext, target: str,
+) -> None:
+    # Normalization strips trailing spaces; admission must still safely check
+    # the original port and path rather than authorizing a different URL.
+    assert access_control.normalize_sink_destination(SinkCategory.NETWORK, target) is not None
+    _assert_activity_fetch(github_activity_fetch_auth, target, False)
+
+
+def test_github_activity_review_fetch_refuses_ambiguous_scope(github_activity_fetch_auth: AuthContext) -> None:
+    from mimir.models import RepoPRScopeRegistry
+
+    state = github_activity_fetch_auth.repo_review_state
+    auth = replace(github_activity_fetch_auth, repo_pr_scope_registry=RepoPRScopeRegistry((
+        state, _review_state("o/r", 43, "worklink/43", state.action_scope.canonical_root),
+    )))
+    _assert_activity_fetch(auth, "https://api.github.com/repos/o/r/pulls/42/reviews", False)
+
+
+def test_github_activity_review_sink_exception_does_not_widen_research(
+    github_activity_fetch_auth: AuthContext, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    target = "https://raw.githubusercontent.com/o/r/main/README.md"
+    monkeypatch.setenv("MIMIR_EGRESS_APPROVED_URLS", json.dumps([target]))
+    service = build_trigger_service_principal(
+        canonical="poller:research", trigger="poller", profile="research",
+        tier=CapabilityTier.SCOPED_WITH_PROVENANCE, capabilities=("fetch_url",),
+        approved_urls=("https://arxiv.org/",), creation_path="test",
+    )
+    auth = _service_auth(service, InformationFlowLabels())
+    decision = ToolRegistry().authorize_tool("fetch_url", auth, enforce=True, target_channel=target)
+    assert not decision.allowed
+    assert decision.reason == "service_sink_destination_denied"
+
+
+def test_github_activity_ordinary_review_scope_preserves_review_fetch(
+    github_activity_fetch_auth: AuthContext,
+) -> None:
+    scope = replace(
+        github_activity_fetch_auth.repo_review_state.action_scope,
+        event_type="pr_opened", checkout_ref="refs/pull/42/head",
+        pull_request_author="contributor", allowed_operations=access_control._REPO_PR_REVIEW_ACTIONS,
+    )
+    auth = replace(github_activity_fetch_auth, repo_review_state=RepoReviewState(scope))
+    _assert_activity_fetch(auth, "https://raw.githubusercontent.com/o/r/main/README.md", True)
+
+
+def test_github_activity_review_fetch_requires_capability(github_activity_fetch_auth: AuthContext) -> None:
+    service = build_trigger_service_principal(
+        canonical="poller:github-activity", trigger="poller", profile="github",
+        tier=CapabilityTier.CODE_EXECUTION, capabilities=(), creation_path="test",
+    )
+    _assert_activity_fetch(
+        replace(github_activity_fetch_auth, service_authority=service),
+        "https://api.github.com/repos/o/r/pulls/42/reviews", False,
+    )
+
+
+@pytest.mark.parametrize("scope_kind", [
+    "missing", "ambiguous", "review", "read-only", "foreign-author", "fork", "remote",
+])
+def test_github_activity_actions_fetch_requires_trusted_remediation_scope(
+    github_activity_fetch_auth: AuthContext, scope_kind: str,
+) -> None:
+    from mimir.models import RepoPRScopeRegistry
+
+    auth = github_activity_fetch_auth
+    state = auth.repo_review_state
+    if scope_kind == "missing":
+        auth = replace(auth, repo_review_state=None)
+    elif scope_kind == "ambiguous":
+        auth = replace(auth, repo_pr_scope_registry=RepoPRScopeRegistry((
+            state, _review_state("o/other", 43, "worklink/43", state.action_scope.canonical_root),
+        )))
+    else:
+        changes = {
+            "review": {"checkout_ref": "refs/pull/42/head"},
+            "read-only": {"allowed_operations": access_control._REPO_PR_REVIEW_ACTIONS},
+            "foreign-author": {"pull_request_author": "someone-else"},
+            "fork": {"head_repo": "other/r"},
+            "remote": {"head_remote": "source"},
+        }[scope_kind]
+        auth = replace(auth, repo_review_state=RepoReviewState(replace(state.action_scope, **changes)))
+    _assert_activity_fetch(auth, f"https://api.github.com/repos/o/r/commits/{'a' * 40}/check-runs", False)
+
+
+@pytest.mark.parametrize("repo", ["o/other", "other/r", "o/r-extra"])
+@pytest.mark.parametrize("host_path", ["api.github.com/repos", "github.com"])
+def test_github_activity_approved_fetch_rejects_unrelated_repository(
+    github_activity_fetch_auth: AuthContext, repo: str, host_path: str,
+) -> None:
+    _assert_activity_fetch(
+        github_activity_fetch_auth, f"https://{host_path}/{repo}/commits/{'a' * 40}/check-runs", False,
+    )
+
+
+@pytest.mark.parametrize("target", [
+    "https://evil.example/repos/o/r/actions/jobs/123/logs",
+    "https://api.github.com.evil.example/repos/o/r/actions/jobs/123/logs",
+    "https://github.com/repos/o/r/actions/jobs/123/logs",
+    "https://raw.githubusercontent.com/o/r/actions/jobs/123/logs?download=1",
+    "http://api.github.com/repos/o/r/actions/jobs/123/logs",
+    "https://user@api.github.com/repos/o/r/actions/jobs/123/logs",
+    "https://api.github.com:443/repos/o/r/actions/jobs/123/logs",
+    "https://api.github.com/repos/o/r/../other/actions/jobs/123/logs",
+    "https://api.github.com/repos/o/r/%2e%2e/other/actions/jobs/123/logs",
+    "https://api.github.com/repos/o/r/\\other/actions/jobs/123/logs",
+    "https://api.github.com/user",
+    "https://api.github.com/repos-other/o/r/actions/jobs/123/logs",
+])
+def test_github_activity_approved_fetch_rejects_unrelated_host_and_malformed_url(
+    github_activity_fetch_auth: AuthContext, target: str,
+) -> None:
+    target = target.replace("actions/jobs/123/logs", f"commits/{'a' * 40}/check-runs")
+    _assert_activity_fetch(github_activity_fetch_auth, target, False)
+
+
+@pytest.mark.parametrize("boundary", ["manifest", "scope", "repository", "host"])
+def test_github_activity_actions_fetch_cannot_bypass_scope_with_ambient_approval(
+    github_activity_fetch_auth: AuthContext, monkeypatch: pytest.MonkeyPatch, boundary: str,
+) -> None:
+    from mimir.models import EgressSessionState
+
+    auth = github_activity_fetch_auth
+    target = f"https://api.github.com/repos/o/r/commits/{'a' * 40}/check-runs"
+    if boundary == "manifest":
+        auth = replace(auth, service_authority=replace(auth.service_authority, sink_policies=()))
+    elif boundary == "scope":
+        auth = replace(auth, repo_review_state=None)
+    elif boundary == "repository":
+        target = target.replace("/o/r/", "/o/other/")
+    else:
+        target = target.replace("api.github.com", "evil.example")
+    monkeypatch.setenv("MIMIR_EGRESS_APPROVED_URLS", json.dumps([target]))
+    session = EgressSessionState()
+    session.approve_url(target)
+    _assert_activity_fetch(replace(auth, egress_state=session), target, False)
+
+
+@pytest.mark.parametrize("manifest", [False, True])
+def test_github_activity_without_remediation_scope_preserves_bounded_review_fetch(
+    github_activity_fetch_auth: AuthContext, manifest: bool,
+) -> None:
+    auth = replace(github_activity_fetch_auth, repo_review_state=None)
+    if not manifest:
+        auth = replace(auth, service_authority=replace(auth.service_authority, sink_policies=(
+            ServiceSinkPolicy("fetch_url", "github_pr_api", "GITHUB_REPOS"),
+        )))
+    for target in (
+        "https://api.github.com/repos/o/r/pulls/42/reviews",
+        "https://raw.githubusercontent.com/o/r/main/README.md",
+    ):
+        _assert_activity_fetch(auth, target, True)
+    _assert_activity_fetch(auth, "https://api.github.com/repos/o/r/actions/jobs/123/logs", False)
+
+
+@pytest.mark.parametrize("suffix", ["", "?per_page=100"])
+def test_github_activity_metadata_fetch_is_bound_to_active_head(
+    github_activity_fetch_auth: AuthContext, suffix: str,
+) -> None:
+    _assert_activity_fetch(
+        github_activity_fetch_auth,
+        f"https://api.github.com/repos/o/r/commits/{'a' * 40}/check-runs{suffix}", True,
+    )
+
+
+@pytest.mark.parametrize("path", [
+    "actions/jobs/123/logs", "actions/jobs/999/logs", "actions/jobs/123",
+    "actions/runs/123", "actions/runs/999/jobs", "actions/runs/123/logs",
+    f"commits/{'b' * 40}/check-runs", "commits/main/check-runs",
+    f"commits/{'a' * 40}", f"commits/{'a' * 40}/check-runs/123",
+    f"commits/{'a' * 40}/check-runs?ref={'b' * 40}",
+    f"commits/{'a' * 40}/check-runs#logs",
+])
+def test_github_activity_fetch_rejects_same_repo_jobs_runs_and_other_heads(
+    github_activity_fetch_auth: AuthContext, monkeypatch: pytest.MonkeyPatch, path: str,
+) -> None:
+    from mimir.models import EgressSessionState
+
+    target = f"https://api.github.com/repos/o/r/{path}"
+    monkeypatch.setenv("MIMIR_EGRESS_APPROVED_URLS", json.dumps([target]))
+    session = EgressSessionState()
+    session.approve_url(target)
+    _assert_activity_fetch(replace(github_activity_fetch_auth, egress_state=session), target, False)
+    _assert_activity_fetch(github_activity_fetch_auth, f"https://github.com/o/r/{path}", False)
+
+
+@pytest.mark.parametrize("repo,ref,expected", [
+    ("o/r", "42", True), ("o/r", "43", False), ("o/other", "42", False),
+])
+@pytest.mark.parametrize("suffix", ["", "/reviews", "/comments"])
+def test_github_activity_remediation_review_fetch_is_bound_to_active_pr(
+    github_activity_fetch_auth: AuthContext, repo: str, ref: str, expected: bool, suffix: str,
+) -> None:
+    _assert_activity_fetch(
+        github_activity_fetch_auth, f"https://api.github.com/repos/{repo}/pulls/{ref}{suffix}", expected,
+    )
+
+
+@pytest.mark.parametrize("repo,ref,expected", [
+    ("o/r", "a" * 40, True), ("o/r", "b" * 40, False),
+    ("o/r", "main", False), ("o/other", "a" * 40, False),
+])
+def test_github_activity_remediation_raw_fetch_is_bound_to_active_head(
+    github_activity_fetch_auth: AuthContext, repo: str, ref: str, expected: bool,
+) -> None:
+    _assert_activity_fetch(
+        github_activity_fetch_auth, f"https://raw.githubusercontent.com/{repo}/{ref}/README.md", expected,
+    )
+
+
 def test_existing_fetch_profile_policies_are_unchanged(tmp_path: Path) -> None:
     for profile, adapter, destination in (
         ("heartbeat", "approved_urls", "MIMIR_HEARTBEAT_APPROVED_URLS"),
@@ -8473,6 +8748,51 @@ def test_python_extends_existing_complete_hands_result_policy() -> None:
     )
 
 
+@pytest.mark.parametrize("case", [
+    "review", "other-tool", "no-scope", "issue-scope", "non-admin",
+    "noninteractive", "event-ingress", "active-repository-ingest", "foreign-channel",
+])
+def test_forge_review_ingress_allowance_guards(case: str) -> None:
+    from mimir.forge import IssueTarget
+
+    auth = _trusted_operator_write_auth(admin=case != "non-admin")
+    labels = auth.ifc_labels
+    scope = _review_state("owner/repo", 17, "fix", "/srv/repo").action_scope
+    tool_name = "pr_comment" if case == "other-tool" else "pr_submit_review"
+    if case == "no-scope":
+        scope = None
+    elif case == "issue-scope":
+        scope = IssueTarget("owner/repo", 17)
+    elif case == "noninteractive":
+        auth = replace(auth, interactivity=TurnInteractivity.NON_INTERACTIVE)
+    elif case == "event-ingress":
+        auth = replace(auth, event_ingress="http")
+    elif case == "foreign-channel":
+        labels = labels.with_source(replace(labels.sources[0], resource_id="slack-C2"))
+
+    # Ingress alone isolates the PR-number guard from repository scope matching.
+    if case not in {"no-scope", "issue-scope"}:
+        repository_source = _repository_result_labels(
+            "owner/repo", 17, scope.observed_head_sha,
+        ).sources[0]
+        if case == "active-repository-ingest":
+            repository_source = replace(
+                repository_source, integrity_effect=IntegrityEffect.ACTIVE_INGEST,
+            )
+        labels = labels.with_source(repository_source)
+    auth = replace(auth, ifc_labels=labels)
+
+    decision = SinkGate.check_sink_flow(
+        tool_name, "owner/repo", labels, auth, enforce=True,
+        sink_category=SinkCategory.FORGE, repo_pr_action_scope=scope,
+    )
+
+    assert decision.allowed is (case == "review"), decision.reason
+    assert decision.would_block is (case != "review")
+    if case != "review":
+        assert decision.reason == "ifc_label_blocked:forge"
+
+
 def test_forge_repository_result_from_different_repository_is_refused() -> None:
     scope = _review_state("owner/repo", 17, "fix", "/srv/repo").action_scope
 
@@ -8501,6 +8821,79 @@ def test_forge_repository_result_from_different_observed_head_is_refused() -> No
     )
 
     assert mismatch == ("owner/repo", "17", "observed_head_sha")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("enforce", [True, False])
+@pytest.mark.parametrize(
+    ("repo", "pr", "head", "component"),
+    [
+        ("other/repo", 17, "a" * 40, "canonical_repo"),
+        ("owner/repo", 18, "a" * 40, "pr_number"),
+        ("owner/repo", 17, "f" * 40, "observed_head_sha"),
+    ],
+)
+async def test_forge_mismatch_decision_audit_identifiers(
+    repo, pr, head, component, enforce, monkeypatch,
+):
+    import asyncio
+
+    scope = _review_state("owner/repo", 17, "fix", "/srv/repo").action_scope
+    decision = SinkGate.check_sink_flow(
+        "pr_comment", "owner/repo", _repository_result_labels(repo, pr, head),
+        None, enforce=enforce, sink_category=SinkCategory.FORGE,
+        repo_pr_action_scope=scope,
+    )
+
+    assert decision.allowed is not enforce
+    assert decision.would_block is True
+    assert decision.as_log_fields()["forge_scope_mismatch"] == {
+        "component": component,
+        "source_canonical_repo": repo,
+        "source_pr_number": pr,
+        "source_observed_head_sha": head,
+        "sink_canonical_repo": "owner/repo",
+        "sink_pr_number": 17,
+        "sink_observed_head_sha": scope.observed_head_sha,
+    }
+    emitted = asyncio.get_running_loop().create_future()
+
+    async def capture(kind, **fields):
+        emitted.set_result((kind, fields))
+
+    monkeypatch.setattr("mimir.event_logger.log_event", capture)
+    registry = ToolRegistry()
+    registry.enable_shadow_logging()
+    registry._emit_shadow_decision(
+        decision, ifc_labels=_repository_result_labels(repo, pr, head),
+        sink_category=SinkCategory.FORGE,
+    )
+    kind, fields = await asyncio.wait_for(emitted, timeout=5)
+    assert kind == "shadow_tool_decision"
+    assert fields["forge_scope_mismatch"] == decision.as_log_fields()["forge_scope_mismatch"]
+
+
+@pytest.mark.parametrize("repo", [
+    "secret body\napi_key=do-not-log", "secret=do-not-log/repo",
+    "x" * 300 + "/repo",
+])
+def test_forge_malformed_source_audit_does_not_leak(repo):
+    scope = _review_state("owner/repo", 17, "fix", "/srv/repo").action_scope
+    decision = SinkGate.check_sink_flow(
+        "pr_comment", "owner/repo", _repository_result_labels(repo, 17, "f" * 40),
+        None, enforce=True, sink_category=SinkCategory.FORGE,
+        repo_pr_action_scope=scope,
+    )
+
+    fields = decision.as_log_fields()
+    diagnostics = fields["forge_scope_mismatch"]
+    assert decision.allowed is False
+    assert diagnostics["source_canonical_repo"] is None
+    assert diagnostics["source_pr_number"] is None
+    assert diagnostics["source_observed_head_sha"] is None
+    assert diagnostics["sink_observed_head_sha"] == scope.observed_head_sha
+    assert repo not in json.dumps(fields)
+    assert "do-not-log" not in json.dumps(fields)
 
 
 def _attach_test_checkout_lease(

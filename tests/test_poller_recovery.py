@@ -13,6 +13,8 @@ import threading
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+import pytest
+
 from mimir import event_logger, poller_recovery
 from mimir.models import AgentEvent, InformationFlowLabels, SourceLabel
 
@@ -300,6 +302,16 @@ async def test_reconcile_retains_completed_outcome_for_live_state_accounting(
     assert entry["attempts"] == 1
     assert entry["outcome_disposition"] == "charge"
     assert entry["attempt_reasons"] == ["turn_completed_without_state_change"]
+
+    await poller_recovery.reconcile_failed_turns(
+        poller_name="github-activity",
+        channel_id="poller:github-activity",
+        persist_dir=tmp_path,
+        events_path=events,
+        enqueue=_FakeEnqueue(),
+        recover_failed_turns=False,
+    )
+    assert poller_recovery._load_state(tmp_path)["inflight"]["sid-completed"] == entry
 
 
 async def test_reconcile_reenqueues_failed(tmp_path: Path):
@@ -991,6 +1003,96 @@ class _RaisingEnqueue:
     async def __call__(self, event: AgentEvent) -> bool:
         self.calls.append(event)
         raise RuntimeError("dispatcher boom")
+
+
+@pytest.mark.parametrize("raises", [False, True])
+async def test_permanent_backpressure_drains_legacy_ledger_by_source_identity(
+    tmp_path: Path, monkeypatch, caplog, raises: bool,
+):
+    now = datetime.now(tz=timezone.utc)
+    monkeypatch.setattr(poller_recovery, "_utc_now", lambda: now)
+    events = tmp_path / "events.jsonl"
+    watermark = (now - timedelta(seconds=30)).isoformat()
+    failed_at = (now - timedelta(seconds=20)).isoformat()
+    completed_at = (now - timedelta(seconds=10)).isoformat()
+    for source_id in ("blocked-SECRET", "completed", "still-inflight"):
+        await poller_recovery.stash_enqueued_event(
+            tmp_path, _make_event(source_id, items=[{"url": "SECRET"}]),
+        )
+    state = poller_recovery._load_state(tmp_path)
+    state["last_reconciled"] = watermark
+    # Old code wrote last_outcome_at even though enqueue was rejected. It is
+    # not proof of handling and must not suppress the retry after migration.
+    state["inflight"]["blocked-SECRET"]["last_outcome_at"] = failed_at
+    poller_recovery._save_state(tmp_path, state)
+    _write_outcome(events, type_="turn_failed", channel_id="poller:gmail",
+                   source_id="blocked-SECRET", ts=failed_at)
+    _write_outcome(events, type_="turn_completed", channel_id="poller:gmail",
+                   source_id="completed", ts=completed_at)
+
+    async def reject(event):
+        if raises:
+            raise RuntimeError("SECRET")
+        return False
+
+    common = dict(poller_name="gmail", channel_id="poller:gmail",
+                  persist_dir=tmp_path, events_path=events, enqueue=reject)
+    first = await poller_recovery.reconcile_failed_turns(**common)
+    assert first["deferred"] == 1
+    state = poller_recovery._load_state(tmp_path)
+    assert state["last_reconciled"] == watermark
+    assert state["inflight"]["blocked-SECRET"]["attempts"] == 0
+    assert state["inflight"]["blocked-SECRET"]["deferred_since"] == now.isoformat()
+
+    now += timedelta(seconds=poller_recovery.DEFAULT_MAX_DEFER_SECONDS - 1)
+    second = await poller_recovery.reconcile_failed_turns(**common)
+    assert second["deferred"] == 1
+    assert second["dropped"] == 0
+    assert poller_recovery._load_state(tmp_path)["last_reconciled"] == watermark
+    assert f"watermark={watermark}" in caplog.text
+    assert "elapsed_seconds=899.0" in caplog.text
+
+    now += timedelta(seconds=1)
+    third = await poller_recovery.reconcile_failed_turns(**common)
+    assert third["dropped"] == 1
+    assert third["completed"] == 1
+    assert third["deferred"] == third["reenqueued"] == third["gave_up"] == 0
+    state = poller_recovery._load_state(tmp_path)
+    assert state["last_reconciled"] == completed_at
+    # All entries share the same subject; only the rejected source is retired.
+    assert set(state["inflight"]) == {"still-inflight"}
+    assert "elapsed_seconds=900.0" in caplog.text
+    assert "reason=enqueue_stall_timeout" in caplog.text
+    assert "SECRET" not in caplog.text
+    fourth = await poller_recovery.reconcile_failed_turns(**common)
+    assert fourth["dropped"] == fourth["completed"] == 0
+
+
+async def test_transient_deferral_resets_timer_after_acceptance(tmp_path: Path, monkeypatch):
+    now = datetime.now(tz=timezone.utc)
+    monkeypatch.setattr(poller_recovery, "_utc_now", lambda: now)
+    events = tmp_path / "events.jsonl"
+    await poller_recovery.stash_enqueued_event(tmp_path, _make_event("sid-1"))
+    _write_outcome(events, type_="turn_failed", channel_id="poller:gmail",
+                   source_id="sid-1", ts=(now - timedelta(seconds=1)).isoformat())
+    common = dict(poller_name="gmail", channel_id="poller:gmail",
+                  persist_dir=tmp_path, events_path=events)
+    await poller_recovery.reconcile_failed_turns(**common, enqueue=_FullEnqueue())
+    now += timedelta(seconds=10)
+    accepted = await poller_recovery.reconcile_failed_turns(**common, enqueue=_FakeEnqueue())
+    assert accepted["reenqueued"] == 1
+    entry = poller_recovery._load_state(tmp_path)["inflight"]["sid-1"]
+    assert entry["attempts"] == 1
+    assert "deferred_since" not in entry
+    now += timedelta(seconds=poller_recovery.DEFAULT_MAX_DEFER_SECONDS)
+    _write_outcome(events, type_="turn_failed", channel_id="poller:gmail",
+                   source_id="sid-1", ts=(now - timedelta(seconds=1)).isoformat())
+    deferred = await poller_recovery.reconcile_failed_turns(**common, enqueue=_FullEnqueue())
+    assert deferred["deferred"] == 1
+    assert deferred["dropped"] == 0
+    entry = poller_recovery._load_state(tmp_path)["inflight"]["sid-1"]
+    assert entry["attempts"] == 1
+    assert entry["deferred_since"] == now.isoformat()
 
 
 async def test_reconcile_defers_on_queue_full_without_burning_attempt(tmp_path: Path):

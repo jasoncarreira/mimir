@@ -325,6 +325,28 @@ def test_every_tool_class_invokes_through_langchain_with_injected_runtime(
     ]
 
 
+def test_pr_checks_exposes_failure_details_url(monkeypatch) -> None:
+    client = FakeForge()
+    log_url = "https://github.com/owner/repo/actions/runs/123/job/456"
+    monkeypatch.setattr(client, "list_checks", lambda scope: (
+        CheckProjection("tests", "completed", "failure", "start", "end", log_url),
+        CheckProjection("lint", "completed", "success", "start", "end"),
+    ))
+    set_forge_client(client)
+
+    result = pr_checks.invoke({
+        "repository": "owner/repo", "pull_request": 17,
+        "runtime": _runtime(_scope(RepoPRAction.INSPECT)),
+    })
+
+    assert result == [
+        {"name": "tests", "status": "completed", "conclusion": "failure",
+         "started_at": "start", "completed_at": "end", "details_url": log_url},
+        {"name": "lint", "status": "completed", "conclusion": "success",
+         "started_at": "start", "completed_at": "end", "details_url": None},
+    ]
+
+
 def test_pr_edit_body_schema_exposes_only_repository_pull_request_body() -> None:
     schema = pr_edit_body.tool_call_schema.model_json_schema()
     assert set(schema["properties"]) == {"repository", "pull_request", "body"}
@@ -1296,6 +1318,9 @@ async def test_enforced_middleware_resolves_standing_review_before_authorization
 
 
 def _user_turn_context(tmp_path, *, role: str, content: str) -> AuthContext:
+    from mimir.agent import _create_turn_auth_context, _initialize_ifc_labels
+    from mimir.channel_registry import ChannelRegistry, classify_turn_interactivity
+
     state = tmp_path / "state"
     state.mkdir(exist_ok=True)
     (state / "identities.yaml").write_text(
@@ -1310,15 +1335,204 @@ def _user_turn_context(tmp_path, *, role: str, content: str) -> AuthContext:
         channel_id="chat-operator",
         author="chat-requester",
         content=content,
+        source="discord",
+        extra={"channel_visibility": "private", "bridge_instance": "discord-test"},
     )
     resolver = IdentityResolver(tmp_path)
     resolver.reload()
-    return access_control.create_auth_context(
+    context = _create_turn_auth_context(
         event,
         resolver,
+        policy_version=None,
         enforce=True,
-        ifc_labels=InformationFlowLabels(),
+        ifc_labels=_initialize_ifc_labels(event, resolver=resolver),
     )
+    channels = ChannelRegistry()
+    channels.register(SimpleNamespace(prefixes=("chat-",)))
+    return replace(
+        context,
+        interactivity=classify_turn_interactivity(
+            event.channel_id, event.trigger, context.event_ingress, channels,
+        ),
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("ingress", ["main", "acp"])
+@pytest.mark.parametrize(
+    "boundary", ["same", "pr", "repo", "head", "live_head", "channel", "untrusted"],
+)
+async def test_operator_read_then_review_preserves_ifc_boundaries(
+    tmp_path, monkeypatch: pytest.MonkeyPatch, ingress: str, boundary: str,
+) -> None:
+    from mimir.agent import _initialize_ifc_labels
+    from mimir.models import InformationFlowState, TurnInteractivity
+
+    client = FakeForge()
+    set_forge_client(client)
+    monkeypatch.setenv("GITHUB_REPOS", "owner/repo,owner/other")
+    monkeypatch.setenv("MIMIR_GITHUB_SELF_LOGIN", "reviewer")
+    monkeypatch.setenv("MIMIR_ACCESS_CONTROL_ENFORCED", "1")
+    monkeypatch.setattr(
+        access_control, "_canonical_repo_binding_resolution",
+        lambda repo: access_control.RepoBindingResolution(
+            (f"/server/{repo}", f"git@github.com:{repo}.git"),
+            (f"/server/{repo}",), 1,
+        ),
+    )
+    context = _user_turn_context(tmp_path, role="admin", content="Review owner/repo#17")
+    if ingress == "acp":
+        from mimir.acp import sdk
+        from mimir.acp.agent import MimirAcpAgent
+        from mimir.channel_registry import ChannelRegistry, classify_turn_interactivity
+        from mimir.identities import hash_web_key
+        from mimir.turn_event_bus import TurnEventBus
+
+        (tmp_path / "state" / "identities.yaml").write_text(
+            "people:\n  - canonical: requester\n"
+            f"    aliases: ['{hash_web_key('offline-secret')}']\n"
+            "    access: {roles: [admin]}\n", encoding="utf-8",
+        )
+        resolver = IdentityResolver(tmp_path)
+        resolver.reload()
+        events = []
+
+        async def run_turn(event, **kwargs):
+            events.append(event)
+
+        async def session_update(session_id, update):
+            pass
+
+        channels = ChannelRegistry()
+        acp = MimirAcpAgent(SimpleNamespace(
+            core=SimpleNamespace(identity_resolver=resolver),
+            config=SimpleNamespace(home=tmp_path, acp_journal_ttl_days=7),
+            adapters=SimpleNamespace(channels=channels),
+            turn_event_bus=TurnEventBus(), agent=SimpleNamespace(run_turn=run_turn),
+        ))
+        acp.on_connect(SimpleNamespace(session_update=session_update))
+        await acp.authenticate("mimir-web-key", **{"mimir.webKey": "offline-secret"})
+        session_id = (await acp.new_session(str(tmp_path))).session_id
+        await acp.prompt(session_id, [sdk.TextContentBlock(type="text", text="Review owner/repo#17")])
+        event, = events
+        carrier = event.continuation_auth_context
+        assert carrier.enforcement_enabled is True
+        assert carrier.channel_id == event.channel_id == f"acp:{session_id}"
+        labels = _initialize_ifc_labels(event, resolver=resolver)
+        context = replace(
+            carrier, ifc_labels=labels, ifc_state=InformationFlowState(labels=labels),
+            interactivity=classify_turn_interactivity(
+                event.channel_id, event.trigger, carrier.event_ingress, channels,
+            ),
+        )
+
+    assert context.interactivity is TurnInteractivity.INTERACTIVE
+    initial = context.ifc_state.current(context.ifc_labels)
+    assert initial.sources
+    assert all(source.domain.startswith("channel") for source in initial.sources)
+    assert all(source.integrity == "trusted" for source in initial.sources)
+    assert all(source.resource_id == context.channel_id for source in initial.sources)
+    assert context.repo_pr_action_scope is None
+    gate = BudgetGateMiddleware()
+
+    async def invoke(tool, arguments):
+        request = ToolCallRequest(
+            tool_call={"name": tool.name, "args": arguments, "id": tool.name, "type": "tool_call"},
+            tool=tool, state={}, runtime=Runtime(context=context),
+        )
+
+        async def handler(_request):
+            runtime = ToolRuntime(
+                state={}, context=context, config={}, stream_writer=lambda _: None,
+                tool_call_id=tool.name, store=None,
+            )
+            result = tool.func(**arguments, runtime=runtime)
+            return ToolMessage(content=json.dumps(result), tool_call_id=tool.name)
+
+        return await gate.awrap_tool_call(request, handler)
+
+    read = await invoke(pr_diff, {"repository": "owner/repo", "pull_request": 17})
+    assert read.status != "error", read.content
+    labels = context.ifc_state.current(context.ifc_labels)
+    assert set(initial.sources) <= set(labels.sources)
+    repository_sources = [source for source in labels.sources if source.domain == "repository"]
+    assert repository_sources
+    assert context.repo_pr_action_scope is None
+    discovered = context.server_discovered_pr_states.resolve("owner/repo", 17)
+    assert discovered.action_scope.provenance == "server_discovered"
+    assert {source.resource_id for source in repository_sources} == {
+        f"owner/repo#pull/17@{'c' * 40}",
+    }
+
+    arguments = {"repository": "owner/repo", "pull_request": 17,
+                 "verdict": ReviewVerdict.APPROVE, "body": "Reviewed the diff"}
+    if boundary == "pr":
+        arguments["pull_request"] = 18
+    elif boundary == "repo":
+        arguments["repository"] = client.snapshot_repo = "owner/other"
+    elif boundary == "head":
+        # Keep a valid destination; only the already-ingested provenance is stale.
+        source = repository_sources[0]
+        assert "c" * 40 in source.resource_id
+        context.ifc_state.merge(InformationFlowLabels(sources=(
+            replace(source, resource_id=source.resource_id.replace("c" * 40, "e" * 40)),
+        )))
+    elif boundary == "live_head":
+        client.snapshot_heads = ["e" * 40]
+    elif boundary in {"channel", "untrusted"}:
+        source = initial.sources[0]
+        extra = (replace(source, resource_id="other-channel") if boundary == "channel"
+                 else replace(source, integrity="untrusted"))
+        context.ifc_state.merge(InformationFlowLabels(sources=(extra,)))
+
+    if boundary != "live_head":
+        destination = resolve_review_state_for_context(
+            context, arguments["repository"], arguments["pull_request"],
+        )
+        live_labels = context.ifc_state.current(context.ifc_labels)
+        if boundary == "same":
+            scope = destination.action_scope
+            assert scope.canonical_repo == arguments["repository"] == "owner/repo"
+            assert scope.pr_number == arguments["pull_request"] == 17
+            assert scope.observed_head_sha == discovered.action_scope.observed_head_sha == "c" * 40
+            assert all(
+                source.resource_id == f"{scope.canonical_repo}#pull/{scope.pr_number}@{scope.observed_head_sha}"
+                for source in repository_sources
+            )
+            assert access_control._forge_repository_scope_mismatch(live_labels, scope) is None
+        registry = access_control.ToolRegistry()
+        shadow_decisions = []
+        monkeypatch.setattr(
+            registry, "_emit_shadow_decision",
+            lambda decision, **kwargs: shadow_decisions.append(decision),
+        )
+        enforced = registry.authorize_tool(
+            "pr_submit_review", context, enforce=True, arguments=arguments, ifc_labels=live_labels,
+        )
+        shadow = registry.authorize_tool(
+            "pr_submit_review", context, enforce=False, arguments=arguments, ifc_labels=live_labels,
+        )
+        assert enforced.allowed is (boundary == "same"), enforced
+        assert shadow.allowed is True
+        blocked = [decision for decision in shadow_decisions if decision.would_block]
+        assert bool(blocked) is (boundary != "same")
+        if blocked:
+            assert blocked[0].reason == enforced.reason == "ifc_label_blocked:forge"
+            if boundary in {"pr", "repo", "head"}:
+                component = {"pr": "pr_number", "repo": "canonical_repo", "head": "observed_head_sha"}[boundary]
+                assert f"mismatched component: {component}" in enforced.refusal_detail
+
+    result = await invoke(pr_submit_review, arguments)
+    reviews = [call for call in client.calls if call[0] == "review"]
+    if boundary == "same":
+        assert result.status != "error", result.content
+        assert len(reviews) == 1
+        assert reviews[0][1] is discovered.action_scope
+    else:
+        assert result.status == "error", result.content
+        assert reviews == []
+        if boundary == "live_head":
+            assert "head advanced after scope issuance" in str(result.content)
 
 
 @pytest.mark.asyncio

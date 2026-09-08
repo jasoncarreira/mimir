@@ -246,6 +246,8 @@ class ActivePrompt:
             return await self._deny_before_peer("peer_missing", eligibility.tool_call_id)
         handle: AcpRequestHandle | None = None
         agent = provider.agent
+        requested = False
+        outcome = "cancelled"
         try:
             async with agent._boundary_lock:
                 if not self._is_current():
@@ -257,6 +259,7 @@ class ActivePrompt:
                         "provider_changed", eligibility.tool_call_id
                     )
                 if isinstance(peer, AcpPeer) and peer.supports_owned_requests:
+                    requested = True
                     handle = await peer.start_tool_permission(
                         self.session.record.session_id, snapshot
                     )
@@ -266,10 +269,20 @@ class ActivePrompt:
                     self.permission_handles.append(handle)
                     completion_task = handle.task
                 else:
+                    requested = True
                     completion_task = asyncio.create_task(
                         peer.request_tool_permission(self.session.record.session_id, snapshot)
                     )
             completion = await completion_task
+            if not self._is_current() or completion.error is not None:
+                return ToolPermissionDecision.CANCELLED
+            if completion.decision in {"allow_once", "allow_session"}:
+                outcome = "session_grant" if completion.session_grant else "operator_allow"
+                return ToolPermissionDecision(completion.decision)
+            if completion.decision == "reject_once":
+                outcome = "operator_reject"
+                return ToolPermissionDecision.REJECT_ONCE
+            return ToolPermissionDecision.CANCELLED
         except asyncio.CancelledError:
             if handle is not None:
                 handle.abandon()
@@ -277,17 +290,19 @@ class ActivePrompt:
         finally:
             if handle is not None and handle in self.permission_handles:
                 self.permission_handles.remove(handle)
-        if not self._is_current() or completion.error is not None:
-            return ToolPermissionDecision.CANCELLED
-        if completion.decision == "allow_once":
-            return ToolPermissionDecision.ALLOW_ONCE
-        if completion.decision == "allow_session":
-            return ToolPermissionDecision.ALLOW_SESSION
-        if completion.decision == "reject_once":
-            return ToolPermissionDecision.REJECT_ONCE
-        if completion.decision == "cancelled":
-            return ToolPermissionDecision.CANCELLED
-        return ToolPermissionDecision.CANCELLED
+            if requested:
+                # Fixed-size telemetry only: even the canonical resource is a path.
+                await safe_log_event(
+                    "acp_permission_outcome",
+                    wrapper_name=(
+                        eligibility.title if eligibility.title in {
+                            "hands_read", "hands_edit", "hands_shell", "hands_python"
+                        } else "other"
+                    ),
+                    tainted=snapshot.tainted is True,
+                    resource_resolvable=eligibility.canonical_client_resource is not None,
+                    outcome=outcome,
+                )
 
 
 
@@ -507,6 +522,8 @@ class MimirAcpAgent:
             auth_context = create_auth_context(
                 event,
                 self._identity_resolver,
+                # Deliberate enforced canary ahead of the global rollout:
+                # expose policy failures while other surfaces remain shadow-only.
                 enforce=True,
                 event_ingress=None,
                 audience_provider=self._audience_provider,

@@ -354,6 +354,21 @@ class PermissionSnapshot:
 class PermissionCompletion:
     decision: PermissionDecision
     error: BaseException | None = None
+    session_grant: bool = False
+
+    @classmethod
+    def from_response(cls, value: Any) -> PermissionCompletion:
+        decision = validate_permission_response(value)
+        metadata = (
+            value.field_meta if isinstance(value, RequestPermissionResponse)
+            else value.get("_meta")
+        )
+        # Attribution for the daemon's single permission event, never authority.
+        return cls(
+            decision,
+            session_grant=isinstance(metadata, dict)
+            and metadata.get("mimir.permission_source") == "session_grant",
+        )
 
     @property
     def executable(self) -> bool:
@@ -592,7 +607,7 @@ class AcpPeer:
 
         async def completion() -> PermissionCompletion:
             try:
-                return PermissionCompletion(validate_permission_response(await handle.task))
+                return PermissionCompletion.from_response(await handle.task)
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
@@ -679,7 +694,7 @@ class AcpPeer:
             result = await self._connection.send_request(
                 PERMISSION_METHOD, permission_request_params(session_id, snapshot)
             )
-            return PermissionCompletion(validate_permission_response(result))
+            return PermissionCompletion.from_response(result)
         except asyncio.CancelledError:
             raise
         except Exception as exc:

@@ -468,6 +468,8 @@ class ProxyRouter:
                 )
                 if self._grants.allows(session_id, wrapper_name) and not tainted:
                     self._daemon_requests.pop(key)
+                    # Telemetry only: the daemon emits the single permission event
+                    # from this completion; the proxy must not emit another event.
                     await self._write_daemon({
                         "jsonrpc": "2.0",
                         "id": message["id"],
@@ -475,7 +477,8 @@ class ProxyRouter:
                             "outcome": {
                                 "outcome": "selected",
                                 "optionId": "allow_once",
-                            }
+                            },
+                            "_meta": {"mimir.permission_source": "session_grant"},
                         },
                     })
                     return
