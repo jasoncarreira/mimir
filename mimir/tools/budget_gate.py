@@ -521,7 +521,7 @@ def _extract_sink_target(
     }:
         discovered = getattr(auth_context, "server_discovered_pr_states", None)
         state = (
-            discovered.resolve(args.get("repository"), args.get("pull_request"))
+            discovered.resolve_for_tool(tool_name, args.get("repository"), args.get("pull_request"))
             if discovered is not None
             and isinstance(args.get("repository"), str)
             and isinstance(args.get("pull_request"), int)

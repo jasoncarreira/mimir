@@ -8428,7 +8428,8 @@ class ToolRegistry:
                     auth_context, "server_discovered_pr_states", None,
                 )
                 state = (
-                    discovered.resolve(
+                    discovered.resolve_for_tool(
+                        tool_name,
                         tool_arguments.get("repository"),
                         tool_arguments.get("pull_request"),
                     )
