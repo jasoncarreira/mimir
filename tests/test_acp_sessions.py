@@ -999,7 +999,9 @@ async def test_permission_wait_survives_until_answer_or_prompt_cleanup(
             prompting = asyncio.create_task(agent.prompt(
                 session_id, [sdk.TextContentBlock(type="text", text="edit notes")],
             ))
-            permission = await asyncio.wait_for(permission_sent.get(), 3)
+            # Startup speed is not the permission-lifetime property under test;
+            # the per-test watchdog still bounds missing permission delivery.
+            permission = await permission_sent.get()
             active = agent._active_prompts[session_id]
             # Sending precedes handle registration by a few event-loop turns.
             async with asyncio.timeout(3):
