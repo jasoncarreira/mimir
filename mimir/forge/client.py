@@ -55,6 +55,7 @@ class CheckProjection:
     conclusion: str | None
     started_at: str | None
     completed_at: str | None
+    details_url: str | None = None
 
 
 @dataclass(frozen=True)

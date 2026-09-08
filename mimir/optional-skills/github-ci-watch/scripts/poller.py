@@ -24,13 +24,16 @@ from __future__ import annotations
 
 import json
 import os
-import re
 import subprocess
 import sys
 import tempfile
 import time
 from datetime import datetime, timezone
 from pathlib import Path
+
+# Also support import-by-path test runners, which do not add the script directory.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from ci_logs import LOG_EXCERPT_BYTES, capture_job_log, clean_log_tail as _clean_log_tail
 
 STATE_DIR = Path(os.environ.get("STATE_DIR", Path(__file__).parent.parent))
 SEEN_FILE = STATE_DIR / "seen_run_ids.json"
@@ -108,8 +111,6 @@ def _gh(*args: str) -> dict | list | None:
         return None
 
 
-# Store only the last 32 KiB of each failing job's log, not entire build logs.
-LOG_EXCERPT_BYTES = 32 * 1024
 # Reserve time for emitting events and saving the cursor before framework kill.
 _ENRICHMENT_DEADLINE: float | None = None
 
@@ -120,94 +121,22 @@ def _enrichment_timeout() -> float:
     return max(0.0, min(15.0, _ENRICHMENT_DEADLINE - time.monotonic()))
 
 
-def _clean_log_tail(output) -> bytes:
-    """Strip terminal controls before capping, with state across read boundaries.
-
-    Scan from the start so even an OSC spanning the retained tail cannot leak
-    its payload. Memory stays bounded independently of log/escape-string size.
-    """
-    output.seek(0)
-    tail = bytearray()
-    state = "text"
-    while chunk := output.read(64 * 1024):
-        clean = bytearray()
-        for byte in chunk:
-            if state == "string":
-                if byte == 7:
-                    state = "text"
-                elif byte == 27:
-                    state = "string_escape"
-            elif state == "string_escape":
-                if byte in (92, 7):  # ST (ESC backslash) or BEL
-                    state = "text"
-                elif byte != 27:
-                    state = "string"
-            elif state == "csi":
-                if 0x40 <= byte <= 0x7e:
-                    state = "text"
-                elif byte == 27:
-                    state = "escape"
-            elif state == "escape":
-                if byte == 91:
-                    state = "csi"
-                elif byte in (93, 80, 88, 94, 95):  # OSC/DCS/SOS/PM/APC
-                    state = "string"
-                elif 0x20 <= byte <= 0x2f:
-                    state = "escape_intermediate"
-                else:
-                    state = "escape" if byte == 27 else "text"
-                    if byte in (9, 10) or byte >= 0x80:
-                        clean.append(byte)
-            elif state == "escape_intermediate":
-                if 0x30 <= byte <= 0x7e:
-                    state = "text"
-                elif byte == 27:
-                    state = "escape"
-            elif byte == 27:
-                state = "escape"
-            elif byte in (9, 10) or (byte >= 0x20 and byte != 0x7f):
-                clean.append(byte)
-        tail.extend(clean)
-        del tail[:-LOG_EXCERPT_BYTES]
-    return bytes(tail)
-
-
 def _job_log(repo: str, run_id: int, job_id: int) -> tuple[Path | None, str]:
     """Use authenticated gh (including its redirect handling), never model fetch_url.
 
     Spool stdout to disk to avoid holding arbitrarily large logs in memory;
     persist only a bounded tail. Never include raw stderr or signed URLs in prompts.
     """
-    timeout = _enrichment_timeout()
-    if timeout <= 0:
-        return None, "HTTP status unavailable (poller time budget exhausted)"
-    env = os.environ.copy()
-    if env.get("GITHUB_TOKEN"):
-        env["GH_TOKEN"] = env["GITHUB_TOKEN"]
+    excerpt, error = capture_job_log(
+        repo, job_id, token=os.environ.get("GITHUB_TOKEN", ""),
+        timeout=_enrichment_timeout(),
+    )
+    if error:
+        return None, error
     try:
         logs = STATE_DIR / "logs"
         logs.mkdir(parents=True, exist_ok=True)
-        with tempfile.TemporaryFile(dir=logs) as output:
-            result = subprocess.run(
-                ["gh", "api", "--allow-escape-sequences", f"repos/{repo}/actions/jobs/{job_id}/logs"],
-                stdout=output, stderr=subprocess.PIPE, timeout=timeout, env=env,
-            )
-            if result.returncode:
-                stderr = result.stderr or b""
-                if b"escape sequences" in stderr or b"--allow-escape-sequences" in stderr:
-                    return None, "HTTP status unavailable (gh escape-sequence refusal)"
-                status = re.search(rb"HTTP\s+(\d{3})", stderr)
-                return None, (
-                    f"HTTP {status[1].decode()}" if status
-                    else "HTTP status unavailable (gh failed)"
-                )
-            excerpt = _clean_log_tail(output)
-        if not excerpt:
-            return None, "HTTP status unavailable (empty log response)"
         path = logs / f"{run_id}-{job_id}.log"
-        # Preserve the byte cap even when the tail cuts a multibyte character.
-        excerpt = excerpt.decode("utf-8", errors="replace").encode("utf-8")
-        excerpt = excerpt[-LOG_EXCERPT_BYTES:].decode("utf-8", errors="ignore").encode("utf-8")
         with tempfile.NamedTemporaryFile(dir=logs, delete=False) as pending:
             tmp = Path(pending.name)
             pending.write(excerpt)
@@ -216,8 +145,6 @@ def _job_log(repo: str, run_id: int, job_id: int) -> tuple[Path | None, str]:
         finally:
             tmp.unlink(missing_ok=True)
         return path.resolve(), ""
-    except subprocess.TimeoutExpired:
-        return None, "HTTP status unavailable (log fetch timed out)"
     except OSError:
         return None, "HTTP status unavailable (log fetch or state write failed)"
 

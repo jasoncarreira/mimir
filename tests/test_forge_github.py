@@ -95,6 +95,33 @@ def test_metadata_target_and_auth_are_adapter_constructed() -> None:
     assert kwargs["headers"]["Authorization"] == "Bearer secret"
 
 
+@pytest.mark.parametrize("conclusion", ["failure", "timed_out", "action_required", "success"])
+@pytest.mark.parametrize("url_field", ["details_url", "html_url", None])
+def test_checks_preserve_actionable_url(conclusion, url_field) -> None:
+    log_url = "https://github.com/owner/repo/actions/runs/123/job/456"
+    row = {
+        "name": "tests", "status": "completed", "conclusion": conclusion,
+        "started_at": "started", "completed_at": "completed",
+    }
+    if url_field:
+        row[url_field] = log_url
+    if url_field == "details_url":
+        row["html_url"] = "https://github.com/owner/repo/runs/456"
+    session = Session([Response({"check_runs": [row]})])
+
+    result, = GitHubForgeClient(session=session).list_checks(_scope())
+
+    assert result.name == "tests"
+    assert result.status == "completed"
+    assert result.conclusion == conclusion
+    assert result.details_url == (log_url if url_field else None)
+    assert len(session.calls) == 1
+    assert session.calls[0][0] == "GET"
+    assert session.calls[0][1] == (
+        f"https://api.github.com/repos/owner/repo/commits/{'a' * 40}/check-runs?per_page=100"
+    )
+
+
 def test_live_snapshot_normalizes_all_authority_facts() -> None:
     session = Session([Response({
         "number": 17, "state": "open", "user": {"login": "author"},

@@ -325,6 +325,28 @@ def test_every_tool_class_invokes_through_langchain_with_injected_runtime(
     ]
 
 
+def test_pr_checks_exposes_failure_details_url(monkeypatch) -> None:
+    client = FakeForge()
+    log_url = "https://github.com/owner/repo/actions/runs/123/job/456"
+    monkeypatch.setattr(client, "list_checks", lambda scope: (
+        CheckProjection("tests", "completed", "failure", "start", "end", log_url),
+        CheckProjection("lint", "completed", "success", "start", "end"),
+    ))
+    set_forge_client(client)
+
+    result = pr_checks.invoke({
+        "repository": "owner/repo", "pull_request": 17,
+        "runtime": _runtime(_scope(RepoPRAction.INSPECT)),
+    })
+
+    assert result == [
+        {"name": "tests", "status": "completed", "conclusion": "failure",
+         "started_at": "start", "completed_at": "end", "details_url": log_url},
+        {"name": "lint", "status": "completed", "conclusion": "success",
+         "started_at": "start", "completed_at": "end", "details_url": None},
+    ]
+
+
 def test_pr_edit_body_schema_exposes_only_repository_pull_request_body() -> None:
     schema = pr_edit_body.tool_call_schema.model_json_schema()
     assert set(schema["properties"]) == {"repository", "pull_request", "body"}

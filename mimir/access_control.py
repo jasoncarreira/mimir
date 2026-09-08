@@ -5267,6 +5267,77 @@ def fetch_url_is_approved(target: str, auth_context: Any) -> bool:
     normalized = normalize_sink_destination(SinkCategory.NETWORK, target)
     if normalized is None:
         return False
+    service = get_trusted_service_from_auth_context(auth_context)
+    policy = service.sink_policy_for("fetch_url") if service is not None else None
+    if service is not None and service.canonical == "poller:github-activity":
+        from .models import RepoPRActionScope
+
+        # Expanded evidence reads need BOTH manifest authority and the turn's
+        # remediation scope; ambient URL approvals must not bypass either.
+        try:
+            parsed = urlsplit(target)
+            port = parsed.port
+        except ValueError:
+            return False
+        if (
+            not service.has_capability("fetch_url")
+            or parsed.scheme != "https"
+            or parsed.username is not None
+            or parsed.password is not None
+            or port is not None
+            or "%" in parsed.path
+            or "\\" in parsed.path
+            or any(segment in {".", ".."} for segment in parsed.path.split("/"))
+        ):
+            return False
+        state, refusal = resolve_repository_review_state(auth_context)
+        scope = getattr(state, "action_scope", None)
+        # Preserve ordinary review reads; remediation cannot use that fallback
+        # to inspect another PR or mutable/unrelated raw content.
+        if _target_matches_github_pr_api(target, "GITHUB_REPOS"):
+            if refusal is not None:
+                return False
+            if isinstance(scope, RepoPRActionScope) and scope.checkout_ref is None:
+                match = (
+                    _GITHUB_PR_API_PATH.fullmatch(parsed.path)
+                    if parsed.netloc == "api.github.com"
+                    else _GITHUB_RAW_REPO_PATH.fullmatch(parsed.path)
+                )
+                return (
+                    match is not None
+                    and f"{match[1]}/{match[2]}".lower() == scope.canonical_repo.lower()
+                    and match[3].lower() == (
+                        str(scope.pr_number) if parsed.netloc == "api.github.com"
+                        else scope.observed_head_sha.lower()
+                    )
+                )
+            return True
+        if (
+            policy is None
+            or policy.adapter != "approved_urls"
+            or not _target_matches_approved_url(target, policy.destination)
+        ):
+            return False
+        # Job/run IDs do not establish a head binding. Only the poller may
+        # validate those bindings and deliver authenticated, sanitized log tails.
+        match = re.fullmatch(
+            r"/repos/([^/]+)/([^/]+)/commits/([0-9a-fA-F]{40})/check-runs", parsed.path,
+        )
+        return (
+            parsed.netloc.lower() == "api.github.com"
+            and parsed.query in {"", "per_page=100"}
+            and not parsed.fragment
+            and match is not None
+            and refusal is None
+            and isinstance(scope, RepoPRActionScope)
+            and scope.checkout_ref is None
+            and scope.pull_request_author == scope.principal
+            and scope.head_repo.lower() == scope.canonical_repo.lower()
+            and scope.head_remote == "origin"
+            and RepoPRAction.COMMIT.value in scope.allowed_operations
+            and f"{match[1]}/{match[2]}".lower() == scope.canonical_repo.lower()
+            and match[3].lower() == scope.observed_head_sha.lower()
+        )
     if (
         normalized in approved_fetch_urls(auth_context)
         or _target_matches_approved_url(target, "MIMIR_EGRESS_APPROVED_URLS")
@@ -5274,8 +5345,6 @@ def fetch_url_is_approved(target: str, auth_context: Any) -> bool:
         return True
     if _target_matches_configured_github_repo_fetch(target):
         return True
-    service = get_trusted_service_from_auth_context(auth_context)
-    policy = service.sink_policy_for("fetch_url") if service is not None else None
     if policy is None:
         return False
     adapter = _SERVICE_SINK_ADAPTERS.get(policy.adapter)
@@ -5299,6 +5368,13 @@ def _sink_adapter_admits(
     """
     if adapter is None:
         return False
+    if (
+        adapter is _target_matches_approved_url
+        and service is not None
+        and service.canonical == "poller:github-activity"
+        and _target_matches_github_pr_api(target, "GITHUB_REPOS")
+    ):
+        return True
     if adapter is _target_within_trigger_service_write_roots:
         return adapter(target, destination, auth_context=auth_context)
     if adapter is _target_matches_poller_proposal:
