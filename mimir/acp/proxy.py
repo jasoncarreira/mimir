@@ -19,6 +19,7 @@ from .credentials import CredentialError, NativeCredentialStore
 from .hosted import HostedHandsProvider, HostedMcpError
 from .profiles import Profile, ProfileError, ProfileStore, selected_profile
 from .transport import FORCE_CLOSE_TIMEOUT, PEER_EOF_GRACE_TIMEOUT, close_writer
+from .diagnostics import failure_detail
 
 CONNECT_TIMEOUT = 5.0
 # One process-wide grace from the first signal, not one timeout per await.
@@ -1051,9 +1052,7 @@ class _ShutdownHooks:
         if isinstance(error, (asyncio.CancelledError, ProxySignalExit)):
             return
         if self._failure_detail is None:
-            # Use exactly the CLI's sanitized origin, never the exception message.
-            from .bootstrap import _origin
-            self._failure_detail = f"detail: {_origin(error)}\nerror: acp-failed\n".encode()
+            self._failure_detail = failure_detail(error)
 
     def _force_exit(self) -> None:
         assert self.signum is not None
@@ -1071,7 +1070,7 @@ class _ShutdownHooks:
         del frame
         if self.signum is not None:
             # A repeated supported signal explicitly abandons graceful draining.
-            os._exit(128 + self.signum)
+            os._exit(128 + signum)
         self.signum = signum
         # wait_for/task.cancel cannot bound cancellation-resistant coroutines (or
         # a blocked event loop). Arm before synchronous cleanup, and retain until
@@ -1202,18 +1201,58 @@ class _OutputWriter:
     def is_closing(self) -> bool: return self.closed
     async def wait_closed(self) -> None: return None
 
+class _FileOutputWriter(_OutputWriter):
+    """Regular files are not selectable pipes (including on kqueue).
+
+    Buffer at most one frame; each router write is followed by an awaited drain.
+    File I/O runs off-loop so a slow filesystem cannot stall signal cancellation.
+    """
+    def __init__(self, output: BinaryIO) -> None:
+        super().__init__(output)
+        self._pending = bytearray()
+        self._inflight: asyncio.Task[Any] | None = None
+
+    def write(self, data: bytes) -> None:
+        if self.closed:
+            raise BrokenPipeError
+        if len(self._pending) + len(data) > MAX_FRAME_BYTES:
+            raise ProxyError("output frame too large")
+        self._pending.extend(data)
+
+    async def drain(self) -> None:
+        if self._inflight is not None:
+            # Cancellation cannot stop a worker thread. Retain and join that
+            # write on the next drain before closing or starting another write.
+            await asyncio.shield(self._inflight)
+            self._inflight = None
+        data = bytes(self._pending)
+        self._pending.clear()
+        if data:
+            self._inflight = asyncio.create_task(asyncio.to_thread(super().write, data))
+            await asyncio.shield(self._inflight)
+            self._inflight = None
+
+
 async def open_stdio(output: BinaryIO) -> tuple[asyncio.StreamReader, Any, asyncio.BaseTransport]:
     loop = asyncio.get_running_loop(); reader = asyncio.StreamReader()
     protocol = asyncio.StreamReaderProtocol(reader)
     transport, _ = await loop.connect_read_pipe(lambda: protocol, sys.stdin.buffer)
     try:
-        output.fileno()
-    except (AttributeError, io.UnsupportedOperation):
-        writer: Any = _OutputWriter(output)
-    else:
-        output_protocol = asyncio.streams.FlowControlMixin(loop=loop)
-        output_transport, _ = await loop.connect_write_pipe(lambda: output_protocol, output)
-        writer = asyncio.StreamWriter(output_transport, output_protocol, None, loop)
+        try:
+            mode = os.fstat(output.fileno()).st_mode
+        except (AttributeError, io.UnsupportedOperation):
+            writer: Any = _OutputWriter(output)
+        else:
+            if stat.S_ISREG(mode):
+                writer = _FileOutputWriter(output)
+            else:
+                output_protocol = asyncio.streams.FlowControlMixin(loop=loop)
+                output_transport, _ = await loop.connect_write_pipe(lambda: output_protocol, output)
+                writer = asyncio.StreamWriter(output_transport, output_protocol, None, loop)
+    except BaseException:
+        # Output acquisition can fail after input has registered its fd.
+        transport.close()
+        raise
     return reader, writer, transport
 
 

@@ -202,8 +202,9 @@ raise SystemExit(bootstrap.main([]))
         assert await asyncio.wait_for(process.stdout.readline(), 3) == b"terminated\n"
         assert await asyncio.wait_for(process.stdout.readline(), 3) == b"draining\n"
         if repeat:
-            # Different second signal: the first signal owns the exit status.
-            process.send_signal(signal.SIGINT if signum != signal.SIGINT else signal.SIGTERM)
+            # Explicit escalation uses the operator's latest signal.
+            signum = signal.SIGINT if signum != signal.SIGINT else signal.SIGTERM
+            process.send_signal(signum)
         stdout, stderr = await asyncio.wait_for(process.communicate(), 3)
         assert process.returncode == 128 + signum
         assert (stdout, stderr) == (b"", b"")
@@ -301,6 +302,131 @@ def test_signal_reap_filter_only_suppresses_expected_watcher_diagnostic() -> Non
         return logging.LogRecord("asyncio", logging.WARNING, __file__, 1, message, (123,), None)
     assert not _SignalReapFilter().filter(record(expected))
     assert _SignalReapFilter().filter(record("unexpected failure %d"))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("signum", [signal.SIGTERM, signal.SIGINT, signal.SIGHUP])
+@pytest.mark.parametrize("file_output", [False, True], ids=["pipe-output", "file-output"])
+async def test_local_proxy_signal_with_real_stdio_and_unix_socket(
+    signum: signal.Signals, file_output: bool, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Do not replace run_proxy, run_router, or open_stdio: all three must run
+    # against real OS transports. Only profile/credential lookup is injected.
+    source = r'''
+import asyncio, os, sys
+from pathlib import Path
+from types import SimpleNamespace
+from mimir.acp import bootstrap, credentials, profiles, proxy
+os.chdir(sys.argv[1])
+# Relative path avoids platform AF_UNIX path limits from long pytest roots.
+profile = SimpleNamespace(home=Path('.'), remote=None, timeout_seconds=60)
+profiles.ProfileStore = proxy.ProfileStore = lambda: SimpleNamespace(get=lambda name: profile)
+profiles.selected_profile = proxy.selected_profile = lambda name: 'test'
+proxy.NativeCredentialStore = lambda: SimpleNamespace(get=lambda name: 'test-secret')
+raise SystemExit(bootstrap.main(['--profile', 'test']))
+'''
+    directory = tmp_path / ".mimir" / "acp"
+    directory.mkdir(parents=True, mode=0o700)
+    peers: list[asyncio.StreamWriter] = []
+    connected = asyncio.Event()
+    def accept(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        peers.append(writer)
+        connected.set()
+    monkeypatch.chdir(tmp_path)
+    server = await asyncio.start_unix_server(accept, path=".mimir/acp/daemon.sock")
+    output_path = tmp_path / "output"
+    output_file = output_path.open("wb") if file_output else None
+    process = await asyncio.create_subprocess_exec(
+        sys.executable, "-c", source, str(tmp_path),
+        stdin=asyncio.subprocess.PIPE,
+        stdout=output_file if file_output else asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE, cwd=Path(__file__).resolve().parents[1],
+    )
+    try:
+        await asyncio.wait_for(connected.wait(), 10)
+        # An actual routed frame, rather than a sleep or just socket acceptance,
+        # proves stdio and the signal hooks are installed before signalling.
+        frame = b'{"jsonrpc":"2.0","method":"test/ready"}\n'
+        try:
+            peers[0].write(frame)
+            await peers[0].drain()
+        except ConnectionError:
+            stdout, stderr = await asyncio.wait_for(process.communicate(), 10)
+            pytest.fail(f"real stdio startup failed: code={process.returncode}, stderr={stderr!r}")
+        async def ready() -> bytes:
+            if not file_output:
+                return await process.stdout.readline()
+            while output_path.read_bytes() != frame and process.returncode is None:
+                await asyncio.sleep(0.01)
+            return output_path.read_bytes()
+        observed = await asyncio.wait_for(ready(), 10)
+        if observed != frame:
+            stdout, stderr = await asyncio.wait_for(process.communicate(), 10)
+            pytest.fail(f"real stdio startup failed: code={process.returncode}, stderr={stderr!r}")
+        process.send_signal(signum)
+        stdout, stderr = await asyncio.wait_for(process.communicate(), 10)
+        assert (process.returncode, stdout, stderr) == (128 + signum, None if file_output else b"", b"")
+    finally:
+        if process.returncode is None:
+            process.kill()
+            await process.communicate()
+        if output_file is not None:
+            output_file.close()
+        for writer in peers:
+            writer.close()
+            try:
+                await writer.wait_closed()
+            except ConnectionError:
+                pass
+        server.close()
+        await server.wait_closed()
+
+
+@pytest.mark.asyncio
+async def test_stdio_output_failure_closes_acquired_input(monkeypatch: pytest.MonkeyPatch) -> None:
+    from unittest.mock import AsyncMock, Mock
+    from mimir.acp.proxy import open_stdio
+
+    loop = asyncio.get_running_loop()
+    transport = Mock()
+    monkeypatch.setattr(loop, "connect_read_pipe", AsyncMock(return_value=(transport, None)))
+    monkeypatch.setattr(loop, "connect_write_pipe", AsyncMock(side_effect=ValueError("unsupported pipe")))
+    monkeypatch.setattr(sys, "stdin", SimpleNamespace(buffer=object()))
+    import os
+    read_fd, write_fd = os.pipe()
+    with os.fdopen(read_fd, "rb") as reader, os.fdopen(write_fd, "wb") as writer:
+        with pytest.raises(ValueError, match="unsupported pipe"):
+            await open_stdio(writer)
+    transport.close.assert_called_once_with()
+
+
+@pytest.mark.asyncio
+async def test_file_output_is_bounded_off_loop_and_preserves_errors() -> None:
+    import threading
+    from mimir.acp.proxy import _FileOutputWriter, MAX_FRAME_BYTES, ProxyError
+
+    owner = threading.get_ident()
+    class Output(io.BytesIO):
+        def write(self, data: bytes) -> int:
+            assert threading.get_ident() != owner
+            return super().write(data)
+    output = Output()
+    writer = _FileOutputWriter(output)
+    writer.write(b"frame\n")
+    await writer.drain()
+    assert output.getvalue() == b"frame\n"
+    with pytest.raises(ProxyError):
+        writer.write(b"x" * (MAX_FRAME_BYTES + 1))
+    class Failed(Output):
+        def write(self, data: bytes) -> int:
+            raise OSError("disk full")
+    failed = _FileOutputWriter(Failed())
+    failed.write(b"frame\n")
+    with pytest.raises(OSError, match="disk full"):
+        await failed.drain()
+    writer.close()
+    with pytest.raises(BrokenPipeError):
+        writer.write(b"after close")
 
 
 def _assert_generation_empty(router: ProxyRouter) -> None:

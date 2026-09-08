@@ -92,11 +92,8 @@ def _error(code: str) -> int:
 def _origin(exc: BaseException) -> str:
     """Where an unexpected failure came from. The type and site only: an exception
     message can carry the secret the failing call was handling."""
-    site = None
-    frame = exc.__traceback__
-    while frame is not None:
-        site = f"{os.path.basename(frame.tb_frame.f_code.co_filename)}:{frame.tb_lineno}"; frame = frame.tb_next
-    return f"{type(exc).__name__} at {site or 'unknown'}"
+    from .diagnostics import failure_origin
+    return failure_origin(exc)
 
 
 def _profile_command(args: argparse.Namespace, output: BinaryIO) -> int:
