@@ -536,6 +536,56 @@ def test_ci_watch_shipped_manifest_authorizes_only_approved_urls(
             assert decision.reason == "egress_destination_not_approved"
 
 
+@pytest.mark.parametrize("manifest_approval", ["declared", "missing", "empty", "nonmatching"])
+def test_github_activity_shipped_manifest_authorizes_scoped_actions_evidence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, manifest_approval: str,
+) -> None:
+    from mimir.models import RepoPRActionScope, RepoReviewState
+
+    monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
+    monkeypatch.setenv("GITHUB_REPOS", "o/r")
+    monkeypatch.delenv("MIMIR_EGRESS_APPROVED_URLS", raising=False)
+    manifest = Path(__file__).parents[1] / "mimir/optional-skills/github-poller/pollers.json"
+    raw = json.loads(manifest.read_text())["pollers"][0]
+    assert raw["authority"]["approved_urls"] == [
+        "https://api.github.com/repos/", "https://github.com/",
+    ]
+    if manifest_approval == "missing":
+        raw["authority"].pop("approved_urls")
+    elif manifest_approval == "empty":
+        raw["authority"]["approved_urls"] = []
+    elif manifest_approval == "nonmatching":
+        raw["authority"]["approved_urls"] = ["https://api.github.com/repos/other/repo/"]
+    service = _parse_poller_authority(
+        raw["authority"], name=raw["name"], persist_dir=tmp_path,
+        state_root=None, manifest_path=manifest,
+    )
+    auth = create_auth_context(AgentEvent(
+        trigger="poller", channel_id=service.canonical,
+        service_principal=service.canonical, service_authority=service,
+    ), enforce=True, ifc_labels=InformationFlowLabels())
+    scope = RepoPRActionScope(
+        provenance="poller_payload", canonical_repo="o/r", canonical_root=str(tmp_path),
+        canonical_origin="https://github.com/o/r.git", principal="mimir-bot",
+        event_type="pr_ci_failure", allowed_operations=access_control._REPO_PR_CI_REMEDIATION_ACTIONS,
+        pr_number=42, head_repo="o/r", head_remote="origin", destination_ref="refs/heads/fix",
+        observed_head_sha="a" * 40, base_ref="main", observed_base_sha="b" * 40,
+        pull_request_author="mimir-bot",
+    )
+    auth = replace(auth, repo_review_state=RepoReviewState(scope))
+    for target, metadata in (
+        (f"https://api.github.com/repos/o/r/commits/{'a' * 40}/check-runs", True),
+        ("https://api.github.com/repos/o/r/actions/runs/123/jobs", False),
+        ("https://api.github.com/repos/o/r/actions/jobs/456/logs", False),
+        ("https://github.com/o/r/actions/runs/123", False),
+        (f"https://api.github.com/repos/o/r/commits/{'b' * 40}/check-runs", False),
+    ):
+        expected = manifest_approval == "declared" and metadata
+        assert access_control.fetch_url_is_approved(target, auth) is expected
+        decision = ToolRegistry().authorize_tool("fetch_url", auth, enforce=True, target_channel=target)
+        assert decision.allowed is expected, decision.reason
+
+
 def test_research_poller_builds_with_skill_learning_only(tmp_path: Path) -> None:
     persist_dir = tmp_path / "state" / "pollers" / "research-agent"
     persist_dir.mkdir(parents=True)

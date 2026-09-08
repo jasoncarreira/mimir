@@ -494,6 +494,11 @@ class GitHubForgeClient:
                 conclusion=self._text(item.get("conclusion"), 32) or None,
                 started_at=self._text(item.get("started_at"), 64) or None,
                 completed_at=self._text(item.get("completed_at"), 64) or None,
+                details_url=(
+                    self._text(item.get("details_url"), 4_096)
+                    or self._text(item.get("html_url"), 4_096)
+                    or None
+                ),
             )
             for item in rows if isinstance(item, Mapping)
         )
