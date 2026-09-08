@@ -17,6 +17,7 @@ REQUIRED_MEMBERS = (
     "mimir/acp/bootstrap.py",
     "mimir/acp/credentials.py",
     "mimir/acp/daemon.py",
+    "mimir/acp/diagnostics.py",
     "mimir/acp/host.py",
     "mimir/acp/hands_contract.py",
     "mimir/acp/hosted.py",

@@ -102,6 +102,19 @@ async def run_ssh_proxy(
     except BaseException:
         await stop_child(process)
         raise
+    signal_received = False
+
+    def signal_cleanup() -> None:
+        nonlocal signal_received
+        signal_received = process.returncode is None
+        # The router's process-exit watchdog may bypass this function's async
+        # finally block. Terminate the owned SSH child before graceful draining.
+        if process.returncode is None:
+            try:
+                process.kill()
+            except ProcessLookupError:
+                pass
+
     discard = asyncio.create_task(_discard(process.stderr))
     router = asyncio.create_task(
         run_router(
@@ -112,12 +125,17 @@ async def run_ssh_proxy(
             credential,
             timeout_seconds=profile.timeout_seconds,
             close_on_daemon_exit=True,
+            signal_cleanup=signal_cleanup,
         )
     )
     child = asyncio.create_task(process.wait())
     try:
         done, _ = await asyncio.wait((router, child), return_when=asyncio.FIRST_COMPLETED)
-        if child in done:
+        if signal_received:
+            # Our signal handler killed SSH; its status is not a connection
+            # failure. Let the router retain signal/failure precedence.
+            await router
+        elif child in done:
             code = child.result()
             if code:
                 raise SshError("SSH connection failed")

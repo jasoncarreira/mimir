@@ -4,6 +4,7 @@ import atexit
 import asyncio
 import io
 import json
+import logging
 import os
 import secrets
 import signal
@@ -12,14 +13,17 @@ import sys
 import threading
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, BinaryIO
+from typing import Any, BinaryIO, Callable
 
 from .credentials import CredentialError, NativeCredentialStore
 from .hosted import HostedHandsProvider, HostedMcpError
 from .profiles import Profile, ProfileError, ProfileStore, selected_profile
 from .transport import FORCE_CLOSE_TIMEOUT, PEER_EOF_GRACE_TIMEOUT, close_writer
+from .diagnostics import failure_detail
 
 CONNECT_TIMEOUT = 5.0
+# One process-wide grace from the first signal, not one timeout per await.
+SIGNAL_EXIT_TIMEOUT = 5.0
 MAX_FRAME_BYTES = 1024 * 1024
 MAX_OUTSTANDING_REQUESTS = 1024
 MAX_GENERATION_SERVER_IDS = 1024
@@ -44,6 +48,12 @@ HANDS_PERMISSION_ARGUMENTS = {
 
 class ProxyError(RuntimeError):
     pass
+
+
+class ProxySignalExit(Exception):
+    def __init__(self, signum: int) -> None:
+        self.code = 128 + signum
+        super().__init__(self.code)
 
 
 class PermissionGrantStore:
@@ -989,12 +999,29 @@ async def _raise_completed(
             raise result
 
 
+class _SignalReapFilter(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        # Synchronous owned-child reaping intentionally races asyncio's child
+        # watcher. This one diagnostic is expected after a committed signal exit;
+        # do not suppress other asyncio errors or unsignalled failures.
+        return record.msg != "Unknown child process pid %d, will report returncode 255"
+
+
 class _ShutdownHooks:
-    def __init__(self, router: ProxyRouter) -> None:
+    def __init__(
+        self, router: ProxyRouter, signal_cleanup: Callable[[], None] | None = None,
+    ) -> None:
         self._router = router
+        self._signal_cleanup = signal_cleanup
+        self._watchdog: threading.Timer | None = None
+        self._failure_detail: bytes | None = None
         self._signals: dict[int, Any] = {}
         self._handler = self._handle_signal
         self._installed = False
+        self.signum: int | None = None
+        self.closing = False
+        self._loop = asyncio.get_running_loop()
+        self._task = asyncio.current_task()
 
     def install(self) -> None:
         atexit.register(self._cleanup)
@@ -1007,6 +1034,12 @@ class _ShutdownHooks:
     def close(self) -> None:
         if not self._installed:
             return
+        if self.signum is not None:
+            atexit.unregister(self._cleanup)
+            # A signal commits this CLI process to exit. Keep both the deadline
+            # and escalation handler through outer SSH/asyncio.run/atexit drains.
+            # Cancelling the watchdog here would make those waits unbounded again.
+            return
         self._installed = False
         atexit.unregister(self._cleanup)
         if threading.current_thread() is threading.main_thread():
@@ -1016,12 +1049,74 @@ class _ShutdownHooks:
         self._signals.clear()
 
     def _cleanup(self) -> None:
-        self._router.terminate_owned_children()
+        try:
+            self._router.terminate_owned_children()
+        except Exception:
+            # Last-resort best effort at the signal/atexit boundary. Never throw
+            # through interrupted I/O. Routing and async close failures still use
+            # record_failure; only this synchronous cleanup callback is guarded.
+            pass
+
+    def record_failure(self, error: BaseException) -> None:
+        if isinstance(error, (asyncio.CancelledError, ProxySignalExit)):
+            return
+        if self._failure_detail is None:
+            self._failure_detail = failure_detail(error)
+
+    def _force_exit(self) -> None:
+        assert self.signum is not None
+        if self._failure_detail is not None:
+            try:
+                # Diagnostics must not turn the hard deadline into another
+                # drain wait when stderr is a full or disconnected pipe.
+                os.set_blocking(2, False)
+                os.write(2, self._failure_detail)
+            finally:
+                os._exit(1)
+        os._exit(128 + self.signum)
 
     def _handle_signal(self, signum: int, frame: Any) -> None:
         del frame
+        if self.signum is not None:
+            # A repeated supported signal explicitly abandons graceful draining.
+            os._exit(128 + signum)
+        self.signum = signum
+        # wait_for/task.cancel cannot bound cancellation-resistant coroutines (or
+        # a blocked event loop). Arm before synchronous cleanup, and retain until
+        # process exit. Normal EOF and genuine failures never arm this watchdog.
+        self._watchdog = threading.Timer(SIGNAL_EXIT_TIMEOUT, self._force_exit)
+        self._watchdog.daemon = True
+        self._watchdog.start()
+        logging.getLogger("asyncio").addFilter(_SignalReapFilter())
+        if self._signal_cleanup is not None:
+            try:
+                self._signal_cleanup()
+            except Exception:
+                # An outer owned-child callback must not prevent router cleanup.
+                pass
         self._cleanup()
-        raise SystemExit(128 + signum)
+        # Wake the loop without throwing through an interrupted selector/transport.
+        try:
+            self._loop.call_soon_threadsafe(self._cancel)
+        except RuntimeError:
+            # The loop may already be closed during atexit; the watchdog still
+            # owns the process deadline and repeat-signal escalation stays armed.
+            pass
+
+    def _cancel(self) -> None:
+        if self._task is None or self._task.done():
+            # Readiness can be printed just before the installing task returns;
+            # recheck here, not only in the signal handler, or run_forever hangs.
+            if self._task is not None and not self._task.cancelled():
+                error = self._task.exception()
+                if error is not None:
+                    self.record_failure(error)
+                    # Let the caller report its normal failure/signal result;
+                    # the watchdog still bounds any outer cleanup.
+                    return
+            self._force_exit()
+        if not self.closing:
+            self._task.cancel()
 
 
 async def run_router(
@@ -1033,9 +1128,10 @@ async def run_router(
     *,
     timeout_seconds: int = 60,
     close_on_daemon_exit: bool = False,
+    signal_cleanup: Callable[[], None] | None = None,
 ) -> None:
     router = ProxyRouter(client_writer, daemon_writer, credential, timeout_seconds)
-    hooks = _ShutdownHooks(router)
+    hooks = _ShutdownHooks(router, signal_cleanup)
     hooks.install()
     client_task = asyncio.create_task(_route_stream(client_reader, router.route_client))
     daemon_task = asyncio.create_task(_route_stream(daemon_reader, router.route_daemon))
@@ -1068,24 +1164,44 @@ async def run_router(
         for task in pending:
             task.cancel()
         await asyncio.gather(*pending, return_exceptions=True)
-    except BaseException:
+    except BaseException as exc:
+        hooks.record_failure(exc)
+        for task in tasks:
+            if task.done() and not task.cancelled():
+                error = task.exception()
+                if error is not None:
+                    hooks.record_failure(error)
+                elif task is failure_task:
+                    hooks.record_failure(task.result())
+        hooks.closing = True
         for task in tasks:
             if not task.done():
                 task.cancel()
-        await asyncio.gather(*tasks, return_exceptions=True)
-        raise
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        if not (isinstance(exc, asyncio.CancelledError) and hooks.signum is not None):
+            raise
+        for result in results:
+            if isinstance(result, BaseException) and not isinstance(result, asyncio.CancelledError):
+                hooks.record_failure(result)
+                raise result
     finally:
+        hooks.closing = True
         try:
             await router.close()
+            closing = asyncio.gather(
+                close_writer(client_writer), close_writer(daemon_writer), return_exceptions=True
+            )
+            try:
+                await asyncio.wait_for(closing, FORCE_CLOSE_TIMEOUT)
+            except TimeoutError:
+                pass
+        except BaseException as exc:
+            hooks.record_failure(exc)
+            raise
         finally:
             hooks.close()
-        closing = asyncio.gather(
-            close_writer(client_writer), close_writer(daemon_writer), return_exceptions=True
-        )
-        try:
-            await asyncio.wait_for(closing, FORCE_CLOSE_TIMEOUT)
-        except TimeoutError:
-            pass
+    if hooks.signum is not None:
+        raise ProxySignalExit(hooks.signum)
 
 class _OutputWriter:
     def __init__(self, output: BinaryIO) -> None: self.output, self.closed = output, False
@@ -1103,18 +1219,58 @@ class _OutputWriter:
     def is_closing(self) -> bool: return self.closed
     async def wait_closed(self) -> None: return None
 
+class _FileOutputWriter(_OutputWriter):
+    """Regular files are not selectable pipes (including on kqueue).
+
+    Buffer at most one frame; each router write is followed by an awaited drain.
+    File I/O runs off-loop so a slow filesystem cannot stall signal cancellation.
+    """
+    def __init__(self, output: BinaryIO) -> None:
+        super().__init__(output)
+        self._pending = bytearray()
+        self._inflight: asyncio.Task[Any] | None = None
+
+    def write(self, data: bytes) -> None:
+        if self.closed:
+            raise BrokenPipeError
+        if len(self._pending) + len(data) > MAX_FRAME_BYTES:
+            raise ProxyError("output frame too large")
+        self._pending.extend(data)
+
+    async def drain(self) -> None:
+        if self._inflight is not None:
+            # Cancellation cannot stop a worker thread. Retain and join that
+            # write on the next drain before closing or starting another write.
+            await asyncio.shield(self._inflight)
+            self._inflight = None
+        data = bytes(self._pending)
+        self._pending.clear()
+        if data:
+            self._inflight = asyncio.create_task(asyncio.to_thread(super().write, data))
+            await asyncio.shield(self._inflight)
+            self._inflight = None
+
+
 async def open_stdio(output: BinaryIO) -> tuple[asyncio.StreamReader, Any, asyncio.BaseTransport]:
     loop = asyncio.get_running_loop(); reader = asyncio.StreamReader()
     protocol = asyncio.StreamReaderProtocol(reader)
     transport, _ = await loop.connect_read_pipe(lambda: protocol, sys.stdin.buffer)
     try:
-        output.fileno()
-    except (AttributeError, io.UnsupportedOperation):
-        writer: Any = _OutputWriter(output)
-    else:
-        output_protocol = asyncio.streams.FlowControlMixin(loop=loop)
-        output_transport, _ = await loop.connect_write_pipe(lambda: output_protocol, output)
-        writer = asyncio.StreamWriter(output_transport, output_protocol, None, loop)
+        try:
+            mode = os.fstat(output.fileno()).st_mode
+        except (AttributeError, io.UnsupportedOperation):
+            writer: Any = _OutputWriter(output)
+        else:
+            if stat.S_ISREG(mode):
+                writer = _FileOutputWriter(output)
+            else:
+                output_protocol = asyncio.streams.FlowControlMixin(loop=loop)
+                output_transport, _ = await loop.connect_write_pipe(lambda: output_protocol, output)
+                writer = asyncio.StreamWriter(output_transport, output_protocol, None, loop)
+    except BaseException:
+        # Output acquisition can fail after input has registered its fd.
+        transport.close()
+        raise
     return reader, writer, transport
 
 

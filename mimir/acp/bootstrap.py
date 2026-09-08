@@ -92,11 +92,8 @@ def _error(code: str) -> int:
 def _origin(exc: BaseException) -> str:
     """Where an unexpected failure came from. The type and site only: an exception
     message can carry the secret the failing call was handling."""
-    site = None
-    frame = exc.__traceback__
-    while frame is not None:
-        site = f"{os.path.basename(frame.tb_frame.f_code.co_filename)}:{frame.tb_lineno}"; frame = frame.tb_next
-    return f"{type(exc).__name__} at {site or 'unknown'}"
+    from .diagnostics import failure_origin
+    return failure_origin(exc)
 
 
 def _profile_command(args: argparse.Namespace, output: BinaryIO) -> int:
@@ -158,7 +155,7 @@ def _credential_command(args: argparse.Namespace, output: BinaryIO) -> int:
 def _proxy(args: argparse.Namespace, output: BinaryIO) -> int:
     from .credentials import CredentialError
     from .profiles import ProfileError, ProfileStore, selected_profile
-    from .proxy import ProxyError, run_proxy
+    from .proxy import ProxyError, ProxySignalExit, run_proxy
     from .ssh import SshError, run_remote_proxy
     try:
         name = selected_profile(args.proxy_profile); profile = ProfileStore().get(name)
@@ -166,6 +163,7 @@ def _proxy(args: argparse.Namespace, output: BinaryIO) -> int:
         if profile.remote is None: asyncio.run(run_proxy(name, output))
         else: asyncio.run(run_remote_proxy(name, output))
         return 0
+    except ProxySignalExit as exc: raise SystemExit(exc.code) from None
     except ProfileError as exc: return _error(exc.code)
     except CredentialError as exc: return _error(exc.code)
     except (ProxyError, SshError, TimeoutError, ConnectionError, OSError): return _error("connection-failed")
@@ -191,6 +189,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         try: args = _parser(output).parse_args(list(argv or ()))
         except SystemExit as exc: return int(exc.code)
         try: return _dispatch(args, output)
+        except SystemExit as exc: return exc.code if isinstance(exc.code, int) else (0 if exc.code is None else 1)
         except (BrokenPipeError, ConnectionResetError): return 0
         except BaseException as exc: _status(f"detail: {_origin(exc)}"); return _error("acp-failed")
     finally:
