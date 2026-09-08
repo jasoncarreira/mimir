@@ -925,6 +925,7 @@ def _ifc_turn(auth: AuthContext) -> TurnContext:
 @pytest.mark.parametrize("trigger", ["poller", "user_message"])
 def test_repository_result_uses_revalidated_post_execution_scope(
     trigger: str,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     old_scope = RepoPRActionScope(
         provenance="poller_payload",
@@ -1011,6 +1012,39 @@ def test_repository_result_uses_revalidated_post_execution_scope(
     assert before_fix.refusal_detail is not None
     assert "mismatched component: observed_head_sha" in before_fix.refusal_detail
     assert _forge_repository_scope_mismatch(labels, current_scope) is None
+
+    # Exercise the caller boundary with the real forge refusal, not a hand-written detail.
+    admin_auth = replace(auth, roles=("user", "admin"))
+    monkeypatch.setattr(ToolRegistry, "authorize_tool", lambda *a, **kw: before_fix)
+    captured: list[tuple[str, dict[str, Any]]] = []
+    monkeypatch.setattr(
+        "mimir.tools.budget_gate._emit_event_sync",
+        lambda kind, **fields: captured.append((kind, fields)),
+    )
+
+    def handler(req: ToolCallRequest) -> ToolMessage:
+        pytest.fail("a refused forge call must not execute")
+
+    token = set_current_turn(_ifc_turn(admin_auth))
+    try:
+        result = BudgetGateMiddleware().wrap_tool_call(
+            _make_request("repo_test", auth_context=admin_auth, args={
+                "repository": "owner/repo", "pull_request": 17,
+                "body": "private-file-content-and-key-material",
+            }),
+            handler,
+        )
+    finally:
+        reset_current_turn(token)
+    assert result.status == "error"
+    assert before_fix.refusal_detail in result.content
+    assert "repository result from owner/repo#17 cannot flow to owner/repo#17" in result.content
+    assert "requires an admin identity" not in result.content
+    assert "private-file-content-and-key-material" not in result.content
+    assert "ifc_label_blocked:forge" in result.content
+    admin_event = next(fields for kind, fields in captured if kind == "admin_tool_call_denied")
+    tool_event = next(fields for kind, fields in captured if kind == "tool_call_denied")
+    assert admin_event["denial_reason"] == tool_event["reason"] == "ifc_label_blocked:forge"
 
 
 def _install_sink_category_capability(
@@ -2864,6 +2898,62 @@ def test_denial_message_mentions_exempt_tools(monkeypatch: pytest.MonkeyPatch):
     assert hard["trigger"] == "user_message"
 
 
+@pytest.mark.parametrize(
+    "roles, reason, detail, expected",
+    [
+        (("user", "admin"), "ifc_label_blocked:forge", None,
+         "pr_submit_review was refused before execution (ifc_label_blocked:forge): "
+         "information-flow policy blocked this call."),
+        (("user",), "ifc_label_blocked:forge", None,
+         "pr_submit_review was refused before execution (ifc_label_blocked:forge): "
+         "information-flow policy blocked this call."),
+        (("user", "admin"), "service_sink_destination_denied",
+         "shell profile does not allow this command shape",
+         "shell_exec was refused before execution (service_sink_destination_denied): "
+         "shell profile does not allow this command shape"),
+        (("user", "admin"), "other_policy_denied", None,
+         "pr_submit_review was refused before execution (other_policy_denied)."),
+        (("user", "admin"), "admin_required", None,
+         "pr_submit_review was refused before execution (admin_required)."),
+        (("user",), "admin_required", None,
+         "pr_submit_review requires an admin identity (admin_required). "
+         "The tool call was refused before execution."),
+    ],
+)
+def test_authorization_refusal_names_actual_cause(
+    monkeypatch: pytest.MonkeyPatch,
+    roles: tuple[str, ...],
+    reason: str,
+    detail: str | None,
+    expected: str,
+) -> None:
+    from dataclasses import replace
+
+    from mimir.tools.budget_gate import _authorize_tool_call
+
+    tool_name = "shell_exec" if detail else "pr_submit_review"
+    auth = replace(_untainted_ifc_auth(), roles=roles)
+    authorization = ToolAuthorization(
+        tool_name=tool_name,
+        decision=OperationDecision.ADMIN_REQUIRED,
+        allowed=False,
+        reason=reason,
+        refusal_detail=detail,
+    )
+    monkeypatch.setattr(ToolRegistry, "authorize_tool", lambda *a, **kw: authorization)
+    captured: list[tuple[str, dict[str, Any]]] = []
+    monkeypatch.setattr(
+        "mimir.tools.budget_gate._emit_event_sync",
+        lambda kind, **fields: captured.append((kind, fields)),
+    )
+    decision, message = _authorize_tool_call(tool_name, auth)
+    assert decision is authorization
+    assert message == expected
+    admin_event = next(fields for kind, fields in captured if kind == "admin_tool_call_denied")
+    tool_event = next(fields for kind, fields in captured if kind == "tool_call_denied")
+    assert admin_event["denial_reason"] == tool_event["reason"] == reason
+
+
 @pytest.mark.asyncio
 async def test_admin_sensitive_tool_denied_for_non_admin(
     tmp_path: Path,
@@ -2960,7 +3050,8 @@ async def test_http_event_ingress_denies_admin_tool_even_when_trigger_source_for
 
     assert isinstance(out, ToolMessage)
     assert out.status == "error"
-    assert "requires an admin identity (http_event_author_untrusted)" in str(out.content)
+    assert "was refused before execution (http_event_author_untrusted)" in str(out.content)
+    assert "requires an admin identity" not in str(out.content)
     assert handler_calls == 0
     admin_event = next(kw for kind, kw in captured if kind == "admin_tool_call_denied")
     assert admin_event["tool"] == "shell_exec"
@@ -3020,7 +3111,8 @@ async def test_http_event_ingress_denies_admin_tool_when_access_control_disabled
 
     assert isinstance(out, ToolMessage)
     assert out.status == "error"
-    assert "requires an admin identity (http_event_author_untrusted)" in str(out.content)
+    assert "was refused before execution (http_event_author_untrusted)" in str(out.content)
+    assert "requires an admin identity" not in str(out.content)
     assert handler_calls == 0
     admin_event = next(kw for kind, kw in captured if kind == "admin_tool_call_denied")
     assert admin_event["tool"] == "shell_exec"

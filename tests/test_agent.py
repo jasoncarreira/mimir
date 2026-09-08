@@ -1697,9 +1697,10 @@ async def test_run_turn_http_event_ingress_reaches_turn_context_before_admin_too
     assert fake_agent.handler_calls == 0
     assert fake_agent.denial is not None
     assert fake_agent.denial.status == "error"
-    assert "requires an admin identity (http_event_author_untrusted)" in str(
+    assert "was refused before execution (http_event_author_untrusted)" in str(
         fake_agent.denial.content
     )
+    assert "requires an admin identity" not in str(fake_agent.denial.content)
     admin_event = next(kw for kind, kw in captured if kind == "admin_tool_call_denied")
     assert admin_event["tool"] == "shell_exec"
     assert admin_event["canonical_author"] == "root"

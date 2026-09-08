@@ -1773,7 +1773,13 @@ def _admin_denial_message(
     reason_text = f" ({reason})" if reason else ""
     if detail:
         return f"{tool_name} was refused before execution{reason_text}: {detail}"
-    if principal_is_admin and reason == "client_file_scope_denied":
+    if reason and reason.startswith("ifc_label_blocked:"):
+        return (
+            f"{tool_name} was refused before execution{reason_text}: "
+            "information-flow policy blocked this call."
+        )
+    # An identity requirement the caller already satisfies cannot explain a denial.
+    if principal_is_admin:
         return f"{tool_name} was refused before execution{reason_text}."
     return (
         f"{tool_name} requires an admin identity{reason_text}. "
