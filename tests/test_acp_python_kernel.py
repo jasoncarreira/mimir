@@ -250,8 +250,25 @@ async def test_crash_result_survives_killpg_permission_error(
 ) -> None:
     manager = PythonKernelManager()
     denied_groups: list[int] = []
+    terminating: list[kernel._Worker] = []
+    terminate = manager._terminate
+
+    async def observed_terminate(worker: kernel._Worker) -> None:
+        terminating.append(worker)
+        try:
+            await terminate(worker)
+        finally:
+            terminating.pop()
+
+    monkeypatch.setattr(manager, "_terminate", observed_terminate)
 
     def denied(pgid: int, sig: int) -> None:
+        # A call from synchronous kill_owned_process_groups cannot satisfy this
+        # regression: identify the exact _terminate worker and signal site.
+        assert len(terminating) == 1
+        assert terminating[0].pgid == pgid
+        assert terminating[0].signalled is False
+        assert sig == 9
         denied_groups.append(pgid)
         raise PermissionError(1, "Operation not permitted")
 
@@ -364,15 +381,35 @@ async def test_sessions_parallel_and_namespaces_isolated(tmp_path: Path) -> None
 
 
 @pytest.mark.asyncio
-async def test_release_reuses_live_namespace_through_canonical_symlink(tmp_path: Path) -> None:
+async def test_release_reuses_live_namespace_through_canonical_symlink(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from mimir.acp.hosted import HostedHandsProvider
+
+    prepare = kernel.prepare_command
+
+    def require_canonical(argv, *, cwd, **kwargs):
+        # Keep canonical-path wiring observable on the portable test backend too.
+        assert cwd == cwd.resolve()
+        return prepare(argv, cwd=cwd, **kwargs)
+
+    monkeypatch.setattr(kernel, "prepare_command", require_canonical)
+
     cwd = tmp_path / "project"
     cwd.mkdir()
     alias = tmp_path / "alias"
     alias.symlink_to(cwd, target_is_directory=True)
-    manager = PythonKernelManager()
+    provider = HostedHandsProvider()
+    # Binding, not execution, freezes canonical cwd. Going through the real
+    # entrypoint preserves the backend's rejection of later path replacement.
+    provider.bind_session("one", alias)
+    provider.bind_session("two", cwd)
+    one, two = provider._sessions["one"], provider._sessions["two"]
+    assert one.cwd == two.cwd == cwd.resolve()
+    manager = provider._python_kernels
     try:
-        first = await manager.execute(
-            "one", cwd,
+        first = await provider.execute_python(
+            one,
             "import math\nvalue = 81\ndef root(): return math.sqrt(value)\n"
             "transform = lambda x: root() + x",
         )
@@ -383,16 +420,47 @@ async def test_release_reuses_live_namespace_through_canonical_symlink(tmp_path:
         await manager.release("one")
         assert state.owner is None
         assert state.worker is worker and worker.process.returncode is None
-        second = await manager.execute("two", alias, "(root(), transform(3), math.factorial(4))")
+        second = await provider.execute_python(two, "(root(), transform(3), math.factorial(4))")
         assert second["kernel"] == "reused"
         assert second["value"] == "(9.0, 12.0, 24)"
         assert manager._kernels == {str(cwd.resolve()): state}
         assert state.owner == "two"
         await manager.release("one")
         assert state.owner == "two"
-        assert (await manager.execute("two", cwd, "transform(1)"))["value"] == "10.0"
+        assert (await provider.execute_python(two, "transform(1)"))["value"] == "10.0"
     finally:
-        await manager.close()
+        await provider.close()
+
+
+def test_bound_symlink_cwd_stays_frozen_and_replacement_is_rejected(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from mimir.acp.confinement import ConfinementUnavailable, SeatbeltBackend
+    from mimir.acp.hosted import HostedHandsProvider
+
+    cwd = (tmp_path / "project").resolve()
+    outside = (tmp_path / "outside").resolve()
+    cwd.mkdir()
+    outside.mkdir()
+    alias = tmp_path / "alias"
+    alias.symlink_to(cwd, target_is_directory=True)
+    provider = HostedHandsProvider()
+    provider.bind_session("one", alias)
+    session = provider._sessions["one"]
+    assert session.cwd == cwd
+    # Only profile construction runs here; this does not execute Seatbelt or
+    # claim OS confinement on Linux. Use an existing executable for its preflight.
+    monkeypatch.setattr(SeatbeltBackend, "executable", Path(sys.executable))
+    backend = SeatbeltBackend()
+    alias.unlink()
+    alias.symlink_to(outside, target_is_directory=True)
+    prepared = backend.prepare([sys.executable], cwd=session.cwd)
+    assert f"(subpath {json.dumps(str(cwd))})" in prepared.argv[2]
+    assert f"(subpath {json.dumps(str(outside))})" not in prepared.argv[2]
+    cwd.rename(cwd.with_name("original"))
+    cwd.symlink_to(outside, target_is_directory=True)
+    with pytest.raises(ConfinementUnavailable, match="changed identity"):
+        backend.prepare([sys.executable], cwd=session.cwd)
 
 
 @pytest.mark.asyncio
@@ -664,9 +732,19 @@ async def test_function_import_and_loaded_data_persist(tmp_path: Path) -> None:
 async def test_queue_wait_is_outside_timeout_and_other_session_is_parallel(
     tmp_path: Path,
 ) -> None:
+    from mimir.acp.execution_scope import ScopeApproval
+
+    # Direct manager callers supply the canonical cwd frozen by session binding.
+    tmp_path = tmp_path.resolve()
     manager = PythonKernelManager()
     entered = tmp_path / "entered"
     release = tmp_path / "release"
+    # Each project needs explicit access to the two coordination files outside
+    # its cwd; do not make this concurrency test depend on an unconfined backend.
+    markers = (tmp_path / "parallel-one", tmp_path / "parallel-two")
+    for marker in markers:
+        marker.touch()
+    grants = tuple(ScopeApproval(marker, False) for marker in markers)
     parallel_one = tmp_path / "one"
     parallel_two = tmp_path / "two"
     parallel_one.mkdir()
@@ -699,14 +777,16 @@ async def test_queue_wait_is_outside_timeout_and_other_session_is_parallel(
             manager.execute(
                 "parallel-one",
                 parallel_one,
-                f"import pathlib,time\npathlib.Path({str(tmp_path / 'parallel-one')!r}).write_text('yes')\ndeadline=time.monotonic()+3\nwhile not pathlib.Path({str(tmp_path / 'parallel-two')!r}).exists():\n if time.monotonic()>deadline: raise RuntimeError('not parallel')\n time.sleep(.01)\ntime.sleep(.3)\n1",
+                f"import pathlib,time\npathlib.Path({str(markers[0])!r}).write_text('yes')\ndeadline=time.monotonic()+3\nwhile pathlib.Path({str(markers[1])!r}).read_text() != 'yes':\n if time.monotonic()>deadline: raise RuntimeError('not parallel')\n time.sleep(.01)\ntime.sleep(.3)\n1",
                 5,
+                approved_paths=grants,
             ),
             manager.execute(
                 "parallel-two",
                 parallel_two,
-                f"import pathlib,time\npathlib.Path({str(tmp_path / 'parallel-two')!r}).write_text('yes')\ndeadline=time.monotonic()+3\nwhile not pathlib.Path({str(tmp_path / 'parallel-one')!r}).exists():\n if time.monotonic()>deadline: raise RuntimeError('not parallel')\n time.sleep(.01)\ntime.sleep(.3)\n2",
+                f"import pathlib,time\npathlib.Path({str(markers[1])!r}).write_text('yes')\ndeadline=time.monotonic()+3\nwhile pathlib.Path({str(markers[0])!r}).read_text() != 'yes':\n if time.monotonic()>deadline: raise RuntimeError('not parallel')\n time.sleep(.01)\ntime.sleep(.3)\n2",
                 5,
+                approved_paths=grants,
             ),
         )
         assert first["value"] == "1"
