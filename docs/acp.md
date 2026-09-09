@@ -29,9 +29,10 @@ operator-visible limits are:
 - **Python state is temporary.** Closing the client or restarting its proxy loses
   the REPL namespace; loading the daemon transcript does not recover it. Save
   needed results explicitly and rerun initialization after reconnecting.
-  Chainlink #1594 tracks project-path-keyed reuse within one live proxy; the
-  current implementation is session-keyed, and that planned reuse is not
-  persistence across client closure or proxy restart.
+  Reuse is keyed by resolved project path and survives across sessions within
+  one live proxy, with one session owner at a time until release. The proxy
+  holds at most 8 kernels; this is not persistence across client closure or
+  proxy restart.
 - **ACP is admin-only.** Its authenticated admin identity skips non-admin
   protected-read filtering. Validate a read-policy change using a non-admin
   identity on a non-ACP surface, not through an ACP client.
@@ -234,7 +235,17 @@ Native Mimir tools operate on the daemon host. Mimir Hands operates with the loc
 
 `hands_shell` and `hands_python` use OS-level filesystem confinement by default. It is mandatory when the backend is available. Only an unavailable backend permits the separately approved fallback described below. Their confined child processes start in the session cwd and can access its descendants, operator-approved extra files or directories and their descendants, and narrowly required runtime paths. The tools take command/code strings rather than paths, so argument checks alone cannot enforce this boundary. Use `hands_request_scope` to request additional paths before execution. Their output remains untrusted active ingest, so a shell result can still cause the next granted shell call to prompt. Operator consent does not declassify that output. Mimir tolerates advertised ACP client `fs` and `terminal` capabilities but never calls them. `additionalDirectories` and arbitrary provider profiles are rejected.
 
-Python keeps one lazy subprocess and in-memory namespace per ACP session. Session load restores the daemon transcript but retires the old worker first, so Python state is never stored in a session or journal and the next call is fresh. Workers retire on load, hosted disconnect, cancellation, daemon-generation replacement, proxy exit, `SIGTERM`, `SIGINT`, `SIGHUP`, or 1,800 seconds of idle time. Shells and Python workers run in owned process groups that are killed and reaped during cleanup. Variables, functions, imports, and loaded data persist only while that worker remains live.
+Python keeps one lazy subprocess and in-memory namespace per canonical project directory (`str(Path(cwd).resolve())`) within the live proxy, with a single session owner until release. Another session using the same directory is refused while the kernel is owned. Hosted disconnect and session load detach the owner without destroying an idle worker, so the next session can reuse its variables, functions, imports, and loaded data when its approved paths and execution mode match the worker's spawn-time profile. Session load restores the daemon transcript, not Python state: the namespace is never serialized to a session, journal, or disk. Existing transient stdout/stderr capture files are unchanged.
+
+Kernels expire after 1,800 seconds of idle time. The proxy keeps at most 8 project kernels, evicting the least recently used detached kernel when capacity is needed; it refuses a new project when all kernels are owned. Cancellation still kills an active execution and its worker, but releasing an idle kernel preserves it. Proxy exit, `SIGTERM`, `SIGINT`, and `SIGHUP` destroy workers. Shells and Python workers run in owned process groups that are killed and reaped during cleanup. Restarting the proxy or respawning a worker loses all Python state; persistence is live-proxy-only, not durable recovery.
+
+Pass these operator commands as the entire `code` argument to `hands_python` (they use the existing seven-field result and the same Python permission flow):
+
+- `%kernels` lists project `cwd`, session owner, and worker `pid`.
+- `%kernel kill` explicitly kills the current project kernel only if it is unowned or owned by the caller. It cannot target another project.
+- `%kernel release` detaches the caller from the current project without killing its idle worker.
+
+These commands do not widen permissions. Shell and Python children run under OS-level filesystem confinement by default, mandatory wherever a backend is available, using spawn-time approved paths. Widening approved paths requires a respawn that loses the namespace; the operator is warned before approving that change. Before reuse, including reattachment, the manager compares the new session's approved set with the worker's recorded spawn-time set for equality, not subset membership. Equality includes each `ScopeApproval` path and its permission-time `recursive` flag; the same path with a different recursion grant is a different policy. Any difference retires and respawns the worker rather than inheriting broader access; switching execution mode also respawns. Equal-policy reattachment preserves the namespace; different-policy reattachment loses it. On platforms without a backend, the separately approved unconfined mode still provides no filesystem isolation.
 
 ## Troubleshooting
 

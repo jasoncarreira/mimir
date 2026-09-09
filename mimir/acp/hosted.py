@@ -129,7 +129,7 @@ class HostedHandsProvider:
                 loop = asyncio.get_running_loop()
             except RuntimeError:
                 return  # No worker can be executing without its event loop.
-            task = loop.create_task(self._python_kernels.retire(session.kernel_id))
+            task = loop.create_task(self._python_kernels.release(session.session_id))
             self._retirements.add(task)
             task.add_done_callback(self._retirements.discard)
 
@@ -167,8 +167,9 @@ class HostedHandsProvider:
         await asyncio.gather(*(self._cancel_calls(item) for item in session_connections))
         old_scope = connection.session.scope
         old_scope.invalidate(close=True)
-        await self._python_kernels.retire(connection.session.kernel_id)
+        await self._python_kernels.release(session_id)
         # Connection reset revokes grants, not final session rejection/budgets.
+        # The next execution checks the adopter's policy before worker reuse.
         connection.session.scope = ExecutionScope(
             connection.session.cwd, denied=set(old_scope.denied),
             attempts=old_scope.attempts, risk_requested=old_scope.risk_requested,
@@ -187,8 +188,7 @@ class HostedHandsProvider:
                 if connection.session.session_id == session_id
             )
         )
-        if session is not None:
-            await self._python_kernels.retire(session.kernel_id)
+        await self._python_kernels.release(session_id)
 
     async def execute_python(
         self,
@@ -203,7 +203,7 @@ class HostedHandsProvider:
                 if session.scope is not scope or scope.closed:
                     raise HostedMcpError(-32000, "Execution scope changed")
                 return await self._python_kernels.execute(
-                    session.kernel_id, session.cwd, code, session.timeout_seconds,
+                    session.session_id, session.cwd, code, session.timeout_seconds,
                     approved_paths=tuple(scope.approved),
                     allow_unconfined=scope.unconfined_approved,
                 )
@@ -505,7 +505,7 @@ class HostedHandsProvider:
                         if scope.closed or session.scope is not scope or generation != scope.generation:
                             message = "Scope approval expired; access unchanged."
                         elif answer is True:
-                            await self._python_kernels.retire(session.kernel_id)
+                            await self._python_kernels.retire_owned(session.session_id)
                             self._require_live_scope(session)
                             if not scope.closed and session.scope is scope and generation == scope.generation:
                                 scope.approved.add(grant)
@@ -573,7 +573,7 @@ class HostedHandsProvider:
                     prepare_command(("/bin/true",), cwd=session.cwd,
                                     approved_paths=tuple(scope.approved))
                 except BackendUnavailable:
-                    await self._python_kernels.retire(session.kernel_id)
+                    await self._python_kernels.retire_owned(session.session_id)
                     self._require_live_scope(session)
                     if scope.closed or session.scope is not scope or scope.generation != generation:
                         raise HostedMcpError(-32000, "Risk approval expired")

@@ -1004,7 +1004,7 @@ async def test_load_always_retires_hosted_state_and_failed_provisional_state(tmp
 
 
 @pytest.mark.asyncio
-async def test_load_reaps_kernel_before_response_and_next_python_is_fresh(
+async def test_load_releases_kernel_and_next_python_reuses_namespace(
     tmp_path: Path,
 ) -> None:
     router, _, daemon, _, connection_id = await hosted_router(tmp_path)
@@ -1016,8 +1016,7 @@ async def test_load_reaps_kernel_before_response_and_next_python_is_fresh(
             "jsonrpc": "2.0", "id": "load-python", "method": "session/load",
             "params": {"cwd": str(tmp_path), "sessionId": "session", "mcpServers": []},
         })
-        assert worker.returncode is not None
-        assert router._provider._python_kernels._processes == {}
+        assert worker.returncode is None
         load_request = messages(daemon)[-1]
         server_id = load_request["params"]["mcpServers"][0]["serverId"]
         await router.route_daemon({
@@ -1027,14 +1026,15 @@ async def test_load_reaps_kernel_before_response_and_next_python_is_fresh(
         result = await call_hosted_python(
             router, daemon, replacement, 103, "globals().get('value')"
         )
-        assert result["kernel"] == "fresh"
-        assert result["value"] == "None"
+        assert result["kernel"] == "reused"
+        assert result["value"] == "41"
+        assert list(router._provider._python_kernels._processes) == [worker]
     finally:
         await router.close()
 
 
 @pytest.mark.asyncio
-async def test_kernel_retires_at_each_required_lifecycle_boundary(
+async def test_disconnect_and_cancel_kill_active_execution_but_release_idle_kernel(
     tmp_path: Path, lifecycle_backend: str,
 ) -> None:
     from mimir.acp.execution_scope import UNCONFINED_WARNING
@@ -1162,13 +1162,17 @@ async def test_kernel_retires_at_each_required_lifecycle_boundary(
         async with asyncio.timeout(5):
             while router._provider._python_kernels._processes:
                 await asyncio.sleep(0.01)
-        fresh = await call_hosted_python(router, daemon, second_connection, 116, "1")
+        fresh = await call_hosted_python(router, daemon, second_connection, 116, "value = 8")
         assert fresh["kernel"] == "fresh"
+        idle_worker = next(iter(router._provider._python_kernels._processes))
         await router.route_client({
             "jsonrpc": "2.0", "method": "session/cancel",
             "params": {"sessionId": active_session_id},
         })
-        assert router._provider._python_kernels._processes == {}
+        assert idle_worker.returncode is None
+        reused = await call_hosted_python(router, daemon, second_connection, 117, "value")
+        assert reused["kernel"] == "reused"
+        assert reused["value"] == "8"
     finally:
         await router.close()
 

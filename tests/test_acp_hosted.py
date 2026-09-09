@@ -12,7 +12,7 @@ from unittest.mock import AsyncMock, Mock
 import pytest
 
 import mimir.acp.hosted as hosted
-from mimir.acp.hands_contract import hands_v1_wire_descriptors
+from mimir.acp.hands_contract import hands_v1_wire_descriptors, validate_tool_result
 from mimir.acp.hosted import (
     SHELL_TIMEOUT_SECONDS,
     HostedHandsProvider,
@@ -574,21 +574,37 @@ async def test_tools_call_envelope_accepts_only_name_arguments_and_progress_toke
 
 
 @pytest.mark.asyncio
-async def test_hosted_provider_owns_internal_session_kernels(tmp_path: Path) -> None:
+@pytest.mark.parametrize("boundary", ["disconnect", "cancel_session"])
+async def test_hosted_provider_releases_project_kernel(
+    tmp_path: Path, boundary: str,
+) -> None:
     provider = HostedHandsProvider()
-    provider.bind_session("one", tmp_path)
-    provider.bind_session("two", tmp_path)
-    first = await provider.execute_python(provider._sessions["one"], "value = 7\nvalue")
-    reused = await provider.execute_python(provider._sessions["one"], "value")
-    isolated = await provider.execute_python(
-        provider._sessions["two"], "globals().get('value')"
-    )
-    assert first["kernel"] == "fresh"
-    assert reused["kernel"] == "reused"
-    assert reused["value"] == "7"
-    assert isolated["value"] == "None"
-    assert set(provider._python_kernels._sessions) == {provider._sessions[key].kernel_id for key in ("one", "two")}
-    await provider.close()
+    connection = provider.connect("one", tmp_path)
+    alias = tmp_path / "alias"
+    alias.symlink_to(tmp_path, target_is_directory=True)
+    provider.bind_session("two", alias)
+    try:
+        first = await provider.execute_python(provider._sessions["one"], "value = 7\nvalue")
+        reused = await provider.execute_python(provider._sessions["one"], "value")
+        assert first["kernel"] == "fresh"
+        assert reused["kernel"] == "reused"
+        assert reused["value"] == "7"
+        worker = next(iter(provider._python_kernels._processes))
+        with pytest.raises(HostedMcpError, match="kernel unavailable"):
+            await provider.execute_python(provider._sessions["two"], "value = 99")
+        if boundary == "disconnect":
+            await provider.disconnect(connection)
+        else:
+            await provider.cancel_session("one")
+        assert worker.returncode is None
+        transferred = await provider.execute_python(provider._sessions["two"], "value")
+        assert transferred["kernel"] == "reused"
+        assert transferred["value"] == "7"
+        assert set(provider._python_kernels._kernels) == {str(tmp_path.resolve())}
+        with pytest.raises(HostedMcpError, match="kernel unavailable"):
+            await provider.execute_python(provider._sessions["one"], "value")
+    finally:
+        await provider.close()
     assert provider._python_kernels._processes == {}
 
 
@@ -689,6 +705,58 @@ async def test_python_result_has_exact_seven_keys(tmp_path: Path) -> None:
     }
     assert type(structured["timedOut"]) is bool
     await provider.close()
+
+
+@pytest.mark.asyncio
+async def test_python_operator_commands_preserve_wire_contract_and_project_scope(
+    tmp_path: Path,
+) -> None:
+    provider, connection = await _connected(tmp_path)
+    other_project = tmp_path / "other"
+    other_project.mkdir()
+    provider.bind_session("other", other_project)
+    provider.bind_session("contender", tmp_path)
+
+    async def command(code: str) -> dict[str, object]:
+        response = await provider.request(
+            connection, "tools/call", {"name": "python", "arguments": {"code": code}},
+        )
+        assert response["content"] == []
+        return validate_tool_result("python", response["structuredContent"])
+
+    try:
+        await command("value = 7")
+        await provider.execute_python(provider._sessions["other"], "value = 9")
+        listed = await command("%kernels")
+        assert listed["ok"] is True
+        listing = listed["stdout"] + listed["value"]
+        for expected in (str(tmp_path.resolve()), str(other_project.resolve()), "session", "other"):
+            assert expected in listing
+        for process in provider._python_kernels._processes:
+            assert str(process.pid) in listing
+
+        released = await command("%kernel release")
+        assert released["ok"] is True
+        acquired = await provider.execute_python(provider._sessions["contender"], "value")
+        assert acquired["kernel"] == "reused"
+        assert acquired["value"] == "7"
+        with pytest.raises(HostedMcpError, match="owned by session contender; refused"):
+            await command("%kernel kill")
+        preserved = await provider.execute_python(provider._sessions["contender"], "value")
+        assert preserved["kernel"] == "reused"
+        assert preserved["value"] == "7"
+
+        await provider.cancel_session("contender")
+        assert (await command("%kernel kill"))["ok"] is True
+        fresh = await command("globals().get('value')")
+        assert fresh["kernel"] == "fresh"
+        assert fresh["value"] == "None"
+        assert (await command("%kernel kill"))["ok"] is True
+        other = await provider.execute_python(provider._sessions["other"], "value")
+        assert other["kernel"] == "reused"
+        assert other["value"] == "9"
+    finally:
+        await provider.close()
 
 
 @pytest.mark.asyncio

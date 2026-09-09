@@ -275,13 +275,32 @@ def test_hands_and_filesystem_contract() -> None:
         "This is lexical path confinement only",
         "`fs` and `terminal` capabilities but never calls them",
         "`additionalDirectories`",
+        "`hands_shell` and `hands_python` use OS-level filesystem confinement by default",
         "a symlink inside the cwd pointing outside it is still followed",
-        "one lazy subprocess and in-memory namespace per ACP session",
-        "Session load restores the daemon transcript but retires the old worker first",
+        "one lazy subprocess and in-memory namespace per canonical project directory",
+        "str(Path(cwd).resolve())",
+        "single session owner until release",
+        "Session load restores the daemon transcript, not Python state",
+        "namespace is never serialized",
+        "transient stdout/stderr capture files are unchanged",
+        "at most 8 project kernels",
+        "least recently used detached kernel",
+        "refuses a new project when all kernels are owned",
+        "Cancellation still kills an active execution",
+        "live-proxy-only",
+        "%kernels",
+        "%kernel kill",
+        "%kernel release",
+        "Restarting the proxy or respawning a worker loses all Python state",
+        "spawn-time set for equality, not subset membership",
+        "Any difference retires and respawns the worker",
+        "the operator is warned before approving that change",
         "1,800 seconds of idle time",
         "killed and reaped during cleanup",
     ]:
         assert value in text
+    assert "confinement work in #1593 has not landed" not in text
+    assert "there is no widening path yet" not in text
 
 
 def test_troubleshooting_contract() -> None:

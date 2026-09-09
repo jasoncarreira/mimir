@@ -38,7 +38,7 @@ async def test_exact_grant_query_and_idempotence(provider, tmp_path):
     path = tmp_path / "file"
     path.touch()
     session = provider._sessions["s"]
-    provider._python_kernels.retire = AsyncMock()
+    provider._python_kernels.retire_owned = AsyncMock()
     result = await provider.request_scope(session, str(path))
     assert result["approved"] and str(path) in result["paths"]
     assert "all variables/imports will be lost" in result["message"]
@@ -47,7 +47,7 @@ async def test_exact_grant_query_and_idempotence(provider, tmp_path):
     assert (await provider.request_scope(session, ""))["paths"] == result["paths"]
     assert (await provider.request_scope(session, str(path)))["approved"]
     provider._request_scope_permission.assert_awaited_once_with("s", ScopeApproval(path, False))
-    provider._python_kernels.retire.assert_awaited_once()
+    provider._python_kernels.retire_owned.assert_awaited_once()
 
 
 @pytest.mark.asyncio
@@ -58,14 +58,14 @@ async def test_directory_descendant_does_not_prompt(provider, tmp_path):
     sibling = tmp_path / "data-old"
     sibling.mkdir()
     session = provider._sessions["s"]
-    provider._python_kernels.retire = AsyncMock()
+    provider._python_kernels.retire_owned = AsyncMock()
     assert (await provider.request_scope(session, str(path)))["approved"]
     for descendant in (child.parent, child):
         assert (await provider.request_scope(session, str(descendant)))["approved"]
     assert not session.scope.allows(tmp_path)
     assert not session.scope.allows(sibling)
     provider._request_scope_permission.assert_awaited_once_with("s", ScopeApproval(path, True))
-    provider._python_kernels.retire.assert_awaited_once()
+    provider._python_kernels.retire_owned.assert_awaited_once()
 
 
 @pytest.mark.asyncio
@@ -92,12 +92,12 @@ async def test_denial_is_final_for_alias_and_broader_request(provider, tmp_path)
     alias.symlink_to(path)
     session = provider._sessions["s"]
     provider._request_scope_permission.return_value = False
-    provider._python_kernels.retire = AsyncMock()
+    provider._python_kernels.retire_owned = AsyncMock()
     for value in (path, alias, tmp_path):
         result = await provider.request_scope(session, str(value))
         assert not result["approved"]
     provider._request_scope_permission.assert_awaited_once()
-    provider._python_kernels.retire.assert_not_awaited()
+    provider._python_kernels.retire_owned.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -173,6 +173,89 @@ async def test_real_shell_and_persistent_python_scope(tmp_path):
             await check(path, False)
         empty = await provider._shell(session, "cat /etc/hosts >/dev/null 2>/dev/null || true")
         assert empty == {"stdout": "", "stderr": "", "exitCode": 0}
+    finally:
+        await provider.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("backend", ["simulated", "seatbelt"])
+@pytest.mark.parametrize("boundary", ["release", "disconnect", "load"])
+@pytest.mark.parametrize("adopter_policy", ["empty", "nonrecursive"])
+async def test_adopter_cannot_inherit_extra_path(tmp_path, monkeypatch, backend, boundary, adopter_policy):
+    """Real Seatbelt denial plus portable spawn-policy wiring/mutation coverage.
+
+    The simulated backend installs a child-side audit hook for this one fixture
+    file only; it is NOT an OS confinement implementation or proof of one.
+    """
+    import os
+    import mimir.acp.python_kernel as kernels
+
+    if backend == "seatbelt" and sys.platform != "darwin":
+        pytest.skip("real Seatbelt integration requires macOS")
+    cwd = tmp_path / "cwd"
+    cwd.mkdir()
+    approved_dir = tmp_path / "extra"
+    approved_dir.mkdir()
+    extra = approved_dir / "private.txt"
+    extra.write_text("private")
+    if backend == "simulated":
+        def prepare(argv, *, approved_paths=(), **kwargs):
+            argv = tuple(argv)
+            if "--control-fd" in argv:
+                # Freeze the grant in the child at spawn, just like an OS profile.
+                allowed = ScopeApproval(approved_dir, True) in approved_paths
+                wrapper = (
+                    "import sys, os, runpy\n"
+                    f"target={str(extra)!r}\nallowed={allowed!r}\n"
+                    "def audit(event, args):\n"
+                    "    if event == 'open' and not allowed and args[0] == target:\n"
+                    "        raise PermissionError('fixture spawn policy denied')\n"
+                    "sys.addaudithook(audit)\n"
+                    f"sys.argv=['mimir.acp.python_kernel', '--control-fd', {argv[-1]!r}]\n"
+                    "runpy.run_module('mimir.acp.python_kernel', run_name='__main__')\n"
+                )
+                argv = (sys.executable, "-c", wrapper)
+            return PreparedCommand(argv, dict(os.environ))
+        monkeypatch.setattr(hosted, "prepare_command", prepare)
+        monkeypatch.setattr(kernels, "prepare_command", prepare)
+    approve = AsyncMock(return_value=True)
+    provider = HostedHandsProvider(request_scope_permission=approve)
+    connection = provider.connect("a", cwd)
+    provider.bind_session("b", cwd)
+    a, b = provider._sessions["a"], provider._sessions["b"]
+    code = f"open({str(extra)!r}).read()"
+    try:
+        assert (await provider.request_scope(a, str(approved_dir)))["approved"]
+        first = await provider.execute_python(a, "kept = 42\n" + code)
+        assert first["ok"] and first["value"] == "'private'"
+        worker = next(iter(provider._python_kernels._processes))
+        if boundary == "release":
+            await provider.execute_python(a, "%kernel release")
+        elif boundary == "disconnect":
+            await provider.disconnect(connection)
+        else:
+            await provider.cancel_session("a")
+            provider.revoke_session("a")
+            await asyncio.gather(*tuple(provider._retirements))
+        assert worker.returncode is None
+        assert not b.scope.approved
+        if adopter_policy == "nonrecursive":
+            # Model a grant frozen while this same path was a file. Adoption
+            # must not re-derive recursion now that it is a directory.
+            b.scope.approved.add(ScopeApproval(approved_dir, False))
+        denied = await provider.execute_python(b, code)
+        # Assert the denial FIRST: a removed comparison must fail on leaked access,
+        # not on a incidental PID or namespace difference.
+        assert denied["ok"] is False
+        assert "PermissionError" in denied["exception"]
+        assert "private" not in denied["value"]
+        write = await provider.execute_python(b, f"open({str(extra)!r}, 'w').write('bad')")
+        assert not write["ok"] and "PermissionError" in write["exception"]
+        assert extra.read_text() == "private"
+        assert denied["kernel"] == "fresh"
+        assert (await provider.execute_python(b, "'kept' in globals()"))["value"] == "False"
+        assert worker.returncode is not None
+        approve.assert_awaited_once_with("a", ScopeApproval(approved_dir, True))
     finally:
         await provider.close()
 

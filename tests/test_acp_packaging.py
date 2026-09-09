@@ -114,7 +114,9 @@ def test_acp_docs_cover_client_contract() -> None:
         "`allow_session`",
         "1,800 seconds of idle time",
         "`hands_shell` and `hands_python` use OS-level filesystem confinement by default",
-        "Session load restores the daemon transcript but retires the old worker first",
+        "Session load restores the daemon transcript, not Python state",
+        "namespace is never serialized",
+        "live-proxy-only",
     ):
         assert text in docs
 
