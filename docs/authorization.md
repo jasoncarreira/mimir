@@ -6,8 +6,13 @@ requester-resource authorization system. It describes the implementation in
 ownership in `mimir/saga/ownership.py`, and the tool boundary in
 `mimir/tools/budget_gate.py`.
 
-Authorization is implemented but ships in compatibility (shadow) mode. Do not
-enable it for a deployment until the [enablement runbook](#enablement-runbook)
+Authorization ships in compatibility (shadow) mode **except for ACP**, which
+deliberately creates turns with `enforce=True` in `mimir/acp/agent.py` as an
+enforced canary. Other surfaces use the global setting, defaulting to shadow
+decisions. ACP requires an admin identity, so it skips non-admin protected-read
+filtering; test read-policy changes through a non-admin, non-ACP turn instead.
+See [ACP's experimental limits](acp.md#experimental-status) when diagnosing
+ACP-only refusals. Do not enable global enforcement for a deployment until the [enablement runbook](#enablement-runbook)
 has been completed. The earlier
 [requester/resource policy](security/requester-resource-authorization.md) is a
 design and adversarial-review artifact; where its historical status notes differ
@@ -347,6 +352,24 @@ final boundary and obey the configured enforcement mode. SAGA
 ownership does not currently generate field-level IFC labels; after authorized
 recall, injected prompt context receives the conservative turn-level taint.
 
+### Ingest acknowledgement
+
+`clear_ingest_taint` is a model tool for an authenticated, non-service admin on
+a live user-origin turn, including ACP. Ask Mimir to invoke it after reviewing
+the current ingest. It requires the exact live turn and its server-owned IFC
+state; a scheduler, poller, generic HTTP event, or detached call cannot use it.
+The acknowledgement requires a durable `ifc_ingest_taint_cleared` audit record;
+if that write fails, the acknowledgement is refused.
+
+Despite its name, this is **not general untainting**. It acknowledges the current
+ingest snapshot only for the ACP permission prompt, so existing `allow_session`
+grants can apply without another ingest-triggered prompt. It does not grant a
+new permission, remove source or sensitivity labels, or change sink and
+durable-memory decisions. It is not `approve_declassification`. Later untrusted
+active ingest re-arms the prompt, even when it is a reread of an already recorded
+source. Successful cwd-scoped Hands reads do not add untrusted active ingest;
+Hands shell and Python output still do.
+
 ## Configuration
 
 The exhaustive environment-variable contract is
@@ -587,6 +610,14 @@ named job:
       options: ["--account", "--json", "--from", "--to"]
       pass_env: [GOG_HOME, GOG_KEYRING_PASSWORD]
 ```
+
+Here `shell_commands[].pass_env` supplies the matched scheduled command with
+the named variables from the **daemon's environment**. Provision their values
+in the daemon's deployment environment, not in `scheduler.yaml`; the declaration
+only selects names and cannot create missing values. This is distinct from a
+poller manifest's top-level `pass_env`, which configures the poller process.
+The field rules and output-redaction limits below apply to both scheduler and
+poller agent-shell declarations.
 
 A scheduled job may also select a built-in scheduler authority profile with
 `authority_profile`. If omitted, the job retains the shared `scheduled_tick`
