@@ -15,11 +15,14 @@ operator-visible limits are:
   reject paths outside the session cwd, but follow in-cwd symlinks even when
   their targets are outside it. Select a trusted project directory and inspect
   its symlinks before granting access.
-- **Execution is not filesystem-confined.** `hands_shell` runs `/bin/sh -c` and
-  `hands_python` runs a Python REPL. Both start with the session cwd, but the
-  whole filesystem remains reachable subject to the client user's OS permissions.
-  Review execution permission requests and use separate OS-level confinement
-  if needed. Execution confinement is tracked by Chainlink #1593, not shipped.
+- **Execution confinement has one backend, and it is macOS-only.** `hands_shell`
+  and `hands_python` run under OS-level filesystem confinement by default, and it
+  is mandatory wherever a backend is available; a confined child cannot follow a
+  symlink out of the approved paths the way `hands_read` and `hands_edit` can.
+  The only backend today is macOS Seatbelt (`sandbox-exec`), which Apple has
+  deprecated. On a platform with no backend the tools run only after the operator
+  explicitly accepts the unconfined risk, and in that mode the cwd and path-scope
+  grants do not protect files. Chainlink #1597 tracks a Linux backend.
 - **Python state is temporary.** Closing the client or restarting its proxy loses
   the REPL namespace; loading the daemon transcript does not recover it. Save
   needed results explicitly and rerun initialization after reconnecting.
