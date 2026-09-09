@@ -138,29 +138,29 @@ async def test_idle_timer_fires_callback_with_old_session():
     the (now-ended) ChannelSession; subsequent ``touch()`` mints a fresh
     saga_session_id."""
     fired: list[ChannelSession] = []
+    callback_done = asyncio.Event()
 
     async def on_idle(session: ChannelSession) -> None:
         fired.append(session)
+        callback_done.set()
 
-    mgr = SessionManager(idle_minutes=60, on_idle=on_idle)
-    s = await mgr.touch("c1")
+    # Exercise the real timer path, but wait for its observable completion.
+    # A fixed sleep can resume before the callback task (and its async logging)
+    # finishes when the worker-uid CI runner is contended.
+    mgr = SessionManager(idle_minutes=0, on_idle=on_idle)  # minimum: one second
+    try:
+        s = await mgr.touch("c1")
+        await asyncio.wait_for(callback_done.wait(), timeout=5.0)
 
-    # Override the timer with a near-immediate callback.
-    s.idle_handle.cancel()
-    loop = asyncio.get_running_loop()
-    s.idle_handle = loop.call_later(
-        0.05,
-        lambda: asyncio.create_task(mgr._fire_idle(s.saga_session_id, "c1")),
-    )
-    await asyncio.sleep(0.15)
+        assert len(fired) == 1
+        assert fired[0].saga_session_id == s.saga_session_id
+        assert fired[0].ended is True
 
-    assert len(fired) == 1
-    assert fired[0].saga_session_id == s.saga_session_id
-    assert fired[0].ended is True
-
-    # Next touch creates a brand-new session.
-    s_next = await mgr.touch("c1")
-    assert s_next.saga_session_id != s.saga_session_id
+        # Next touch creates a brand-new session.
+        s_next = await mgr.touch("c1")
+        assert s_next.saga_session_id != s.saga_session_id
+    finally:
+        await mgr.shutdown()
 
 
 @pytest.mark.asyncio
