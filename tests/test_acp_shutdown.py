@@ -133,11 +133,10 @@ async def test_signal_exit_bounds_entire_teardown(
     signum: signal.Signals, repeat: bool, stage: str,
 ) -> None:
     source = r'''
-import asyncio, io, os, sys, time
+import asyncio, io, os, sys, threading
 from types import SimpleNamespace
 from mimir.acp import bootstrap, profiles, proxy
 stage = sys.argv[1]
-proxy.SIGNAL_EXIT_TIMEOUT = 30 if sys.argv[2] == 'repeat' else 0.5
 profiles.ProfileStore = lambda: SimpleNamespace(get=lambda name: SimpleNamespace(remote=None))
 profiles.selected_profile = lambda name: 'test'
 
@@ -145,11 +144,25 @@ def mark(value):
     sink.write(value + b'\n')
     sink.flush()
 
+class ControlledTimer(threading.Timer):
+    def start(self):
+        super().start()
+        mark(b'armed')
+
+    def run(self):
+        # Only the parent can expire this watchdog. EOF is not expiration,
+        # and Timer.cancel() must still prevent the product callback.
+        if os.read(0, 1) == b'x' and not self.finished.is_set():
+            self.function(*self.args, **self.kwargs)
+        self.finished.set()
+
+proxy.threading.Timer = ControlledTimer
+
 async def stuck():
     mark(b'draining')
     while True:
         try:
-            await asyncio.sleep(60)
+            await asyncio.Future()
         except asyncio.CancelledError:
             pass
 
@@ -177,11 +190,11 @@ async def run_proxy(name, output):
         mark(b'terminated')
         if stage == 'cleanup':
             mark(b'draining')
-            time.sleep(60)
+            threading.Event().wait()
     async def close():
         if stage == 'blocked':
             mark(b'draining')
-            time.sleep(60)
+            threading.Event().wait()
         if stage == 'close':
             await stuck()
         await original_close()
@@ -197,21 +210,62 @@ proxy.run_proxy = run_proxy
 raise SystemExit(bootstrap.main([]))
 '''
     process = await asyncio.create_subprocess_exec(
-        sys.executable, "-c", source, stage, "repeat" if repeat else "deadline",
+        sys.executable, "-c", source, stage,
+        stdin=asyncio.subprocess.PIPE,
         stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
         cwd=Path(__file__).resolve().parents[1],
     )
     try:
         assert await asyncio.wait_for(process.stdout.readline(), 10) == b"ready\n"
         process.send_signal(signum)
+        assert await asyncio.wait_for(process.stdout.readline(), 3) == b"armed\n"
         assert await asyncio.wait_for(process.stdout.readline(), 3) == b"terminated\n"
         assert await asyncio.wait_for(process.stdout.readline(), 3) == b"draining\n"
         if repeat:
             # Explicit escalation uses the operator's latest signal.
             signum = signal.SIGINT if signum != signal.SIGINT else signal.SIGTERM
             process.send_signal(signum)
+        else:
+            process.stdin.write(b"x")
+            await asyncio.wait_for(process.stdin.drain(), 3)
         stdout, stderr = await asyncio.wait_for(process.communicate(), 3)
         assert process.returncode == 128 + signum
+        assert (stdout, stderr) == (b"", b"")
+    finally:
+        if process.returncode is None:
+            process.kill()
+            await process.communicate()
+
+
+@pytest.mark.asyncio
+async def test_real_signal_watchdog_bounds_blocked_cleanup() -> None:
+    source = r'''
+import asyncio, os, signal, threading
+from types import SimpleNamespace
+from mimir.acp import proxy
+
+proxy.SIGNAL_EXIT_TIMEOUT = 0.5
+
+async def run():
+    hooks = proxy._ShutdownHooks(
+        SimpleNamespace(terminate_owned_children=threading.Event().wait)
+    )
+    hooks.install()
+    os.kill(os.getpid(), signal.SIGTERM)
+    threading.Event().wait()
+
+asyncio.run(run())
+'''
+    process = await asyncio.create_subprocess_exec(
+        sys.executable, "-c", source,
+        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+        cwd=Path(__file__).resolve().parents[1],
+    )
+    try:
+        # No stage marker competes with the real deadline. This timeout is
+        # only a harness bound; the independent product timer must exit.
+        stdout, stderr = await asyncio.wait_for(process.communicate(), 10)
+        assert process.returncode == 128 + signal.SIGTERM
         assert (stdout, stderr) == (b"", b"")
     finally:
         if process.returncode is None:
