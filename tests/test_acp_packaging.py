@@ -65,8 +65,11 @@ def test_wheel_guard_requires_complete_intermediate_surface() -> None:
         "mimir/acp/__init__.py",
         "mimir/acp/__main__.py",
         "mimir/acp/agent.py",
+        "mimir/acp/audit.py",
         "mimir/acp/bootstrap.py",
         "mimir/acp/credentials.py",
+        "mimir/acp/confinement.py",
+        "mimir/acp/execution_scope.py",
         "mimir/acp/daemon.py",
         "mimir/acp/diagnostics.py",
         "mimir/acp/host.py",
@@ -106,11 +109,11 @@ def test_acp_docs_cover_client_contract() -> None:
     assert "credential-mutation-uncertain" in docs
     assert "12 seconds" in docs and "5 seconds" in docs
     for text in (
-        "`read`, `edit`, `shell`, and `python`",
+        "`read`, `edit`, `shell`, `python`, and `request_scope`",
         "mimir acp profile set-timeout PROFILE 60",
         "`allow_session`",
         "1,800 seconds of idle time",
-        "`hands_shell` and `hands_python` are not path-confined",
+        "`hands_shell` and `hands_python` use always-on OS-level filesystem confinement",
         "Session load restores the daemon transcript but retires the old worker first",
     ):
         assert text in docs

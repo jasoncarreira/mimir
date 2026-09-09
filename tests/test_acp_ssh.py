@@ -162,11 +162,13 @@ def _fake_ssh(tmp_path: Path, body: str) -> Path:
 
 
 @pytest.mark.asyncio
-async def test_hosted_shell_inherits_local_proxy_environment_without_web_key(
+@pytest.mark.skipif(sys.platform != "darwin", reason="real Seatbelt hosted shell")
+async def test_hosted_shell_allows_terminal_environment_but_strips_proxy_secrets(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    monkeypatch.setenv("ROUTER_LOCAL_VALUE", "local")
-    monkeypatch.delenv("MIMIR_WEB_KEY", raising=False)
+    monkeypatch.setenv("ROUTER_LOCAL_VALUE", "local-secret")
+    monkeypatch.setenv("MIMIR_WEB_KEY", "environment-web-key")
+    monkeypatch.setenv("TERM", "mimir-test-terminal")
     client_stream = io.BytesIO()
     daemon_stream = io.BytesIO()
     router = ProxyRouter(Output(client_stream), Output(daemon_stream), "raw-web-key")
@@ -206,7 +208,7 @@ async def test_hosted_shell_inherits_local_proxy_environment_without_web_key(
             "jsonrpc": "2.0", "id": 3, "method": "mcp/message", "params": {
                 "connectionId": connection_id, "method": "tools/call", "params": {
                     "name": "shell",
-                    "arguments": {"command": "printf '%s:%s' \"$ROUTER_LOCAL_VALUE\" \"${MIMIR_WEB_KEY-unset}\""},
+                    "arguments": {"command": "printf '%s:%s:%s' \"$TERM\" \"${ROUTER_LOCAL_VALUE-unset}\" \"${MIMIR_WEB_KEY-unset}\""},
                 },
             },
         })
@@ -214,8 +216,9 @@ async def test_hosted_shell_inherits_local_proxy_environment_without_web_key(
             await asyncio.sleep(0.01)
             if sent()[-1].get("id") == 3:
                 break
-        assert sent()[-1]["result"]["structuredContent"]["stdout"] == "local:unset"
-        assert b"raw-web-key" not in daemon_stream.getvalue()
+        assert sent()[-1]["result"]["structuredContent"]["stdout"] == "mimir-test-terminal:unset:unset"
+        for secret in (b"raw-web-key", b"environment-web-key", b"local-secret"):
+            assert secret not in daemon_stream.getvalue()
     finally:
         await router.close()
 
@@ -575,6 +578,7 @@ def stop(*args):
  with open(os.environ['MARKER'],'w') as stream: stream.write('terminated')
  raise SystemExit(0)
 signal.signal(signal.SIGTERM,stop)
+with open(os.environ['MARKER'] + '.ready','w') as stream: stream.write('ready')
 for line in sys.stdin.buffer: time.sleep(10)
 """)
     reader = asyncio.StreamReader()
@@ -583,7 +587,9 @@ for line in sys.stdin.buffer: time.sleep(10)
     transport = type("Transport", (), {"close": lambda self: None})()
     monkeypatch.setattr("mimir.acp.ssh.open_stdio", lambda target: asyncio.sleep(0, result=(reader, Output(target), transport)))
     task = asyncio.create_task(run_ssh_proxy(profile, "secret", output, _ssh_path=ssh, _environment={"PATH": os.environ.get("PATH", ""), "MARKER": str(marker)}))
-    await asyncio.sleep(0.1)
+    async with asyncio.timeout(5):
+        while not Path(str(marker) + ".ready").exists():
+            await asyncio.sleep(0.01)
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
         await task

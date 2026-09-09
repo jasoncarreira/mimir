@@ -1248,6 +1248,7 @@ async def test_client_session_cancel_tombstones_hosted_request(tmp_path: Path) -
         await router.route_client(json.loads(cancel_raw), cancel_raw)
         assert bytes(daemon.data).startswith(before + cancel_raw)
         await asyncio.sleep(0.05)
+        assert not router._generation_failed, repr(router._failure.result())
         with pytest.raises(ProxyError, match="duplicate outstanding"):
             await router.route_daemon({"jsonrpc": "2.0", "id": 50, "method": "foreign"})
         assert not any(item.get("id") == 50 and ("result" in item or "error" in item) for item in messages(daemon))
@@ -1705,3 +1706,305 @@ async def test_invalid_key_reaches_actual_daemon_rejection_through_credential_pa
         await asyncio.wait_for(process.wait(), 10)
         await daemon.stop()
     assert b"invalid-key" not in stderr
+
+
+async def start_scope_permission(
+    router: ProxyRouter, connection_id: str, request_id: int, path: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> asyncio.Task[Any]:
+    """Exercise the real hosted request owner without depending on a sandbox."""
+    provider_id = router._connection_provider_sessions[connection_id]
+
+    async def request(*args: Any, **kwargs: Any) -> dict[str, Any]:
+        approved = await router._request_scope_permission(provider_id, path)
+        return {"approved": approved}
+
+    monkeypatch.setattr(router._provider, "request", request)
+    await router.route_daemon({
+        "jsonrpc": "2.0", "id": request_id, "method": "mcp/message",
+        "params": {
+            "connectionId": connection_id, "method": "tools/call",
+            "params": {"name": "request_scope", "arguments": {"path": path}},
+        },
+    })
+    task = router._local_requests[(int, request_id)]
+    assert task is not None
+    await asyncio.sleep(0)
+    return task
+
+
+@pytest.mark.asyncio
+async def test_scope_permission_is_local_path_only_and_separate_from_wrapper_grants(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    router, client, daemon, _, connection_id = await hosted_router(tmp_path)
+    try:
+        await grant_session(router, 10, "session", "hands_shell")
+        client.data.clear()
+        daemon.data.clear()
+        path = str(tmp_path.parent / "outside")
+        task = await start_scope_permission(router, connection_id, 11, path, monkeypatch)
+        request, = messages(client)
+        assert request["method"] == "session/request_permission"
+        params = request["params"]
+        assert params["sessionId"] == "session"
+        assert params["toolCall"]["rawInput"] == {"path": path}
+        assert "restarts the Python kernel" in params["toolCall"]["title"]
+        assert "loses all REPL state" in params["toolCall"]["title"]
+        assert params["_meta"] == {"mimir.execution_scope": True}
+        assert [item["optionId"] for item in params["options"]] == [
+            "allow_session", "reject_once",
+        ]
+        assert messages(daemon) == []
+        answer = {
+            "jsonrpc": "2.0", "id": request["id"],
+            "result": {"outcome": {"outcome": "selected", "optionId": "allow_session"}},
+        }
+        await router.route_client(answer)
+        await task
+        assert messages(daemon) == [{"jsonrpc": "2.0", "id": 11, "result": {"approved": True}}]
+        assert len(router._grants) == 1
+        assert router._grants.allows("session", "hands_shell")
+        assert not router._grants.allows("session", "hands_python")
+        # A duplicate local answer is consumed, never sent to the daemon.
+        await router.route_client(answer)
+        assert len(messages(daemon)) == 1
+        assert not router._scope_permissions
+        client.data.clear()
+        # Even after a scope approval, a tainted wrapper still reaches the editor.
+        await router.route_daemon(permission_request(18, "session", "hands_shell", tainted=True))
+        assert messages(client)[-1]["params"]["_meta"] == {
+            "mimir.wrapper": "hands_shell", "mimir.tainted": True,
+        }
+    finally:
+        await router.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("result", [
+    {"outcome": {"outcome": "selected", "optionId": "reject_once"}},
+    {"outcome": {"outcome": "selected", "optionId": "allow_once"}},
+    {"outcome": {"outcome": "selected", "optionId": "unknown"}},
+    {"outcome": {"outcome": "cancelled"}},
+    {"outcome": {"outcome": "selected", "optionId": "allow_session", "extra": True}},
+    {"outcome": "allow_session"},
+])
+async def test_scope_permission_rejects_unoffered_cancelled_and_malformed_answers(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, result: dict[str, Any],
+) -> None:
+    router, client, daemon, _, connection_id = await hosted_router(tmp_path)
+    try:
+        client.data.clear()
+        daemon.data.clear()
+        task = await start_scope_permission(router, connection_id, 12, "/outside", monkeypatch)
+        request, = messages(client)
+        await router.route_client({"jsonrpc": "2.0", "id": request["id"], "result": result})
+        await task
+        assert messages(daemon) == [{"jsonrpc": "2.0", "id": 12, "result": {"approved": False}}]
+        assert len(router._grants) == 0
+    finally:
+        await router.close()
+
+
+@pytest.mark.asyncio
+async def test_scope_permission_timeout_and_late_answer_fail_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("mimir.acp.proxy.SCOPE_PERMISSION_TIMEOUT_SECONDS", 0.01)
+    router, client, daemon, _, connection_id = await hosted_router(tmp_path)
+    try:
+        client.data.clear()
+        daemon.data.clear()
+        task = await start_scope_permission(router, connection_id, 13, "/outside", monkeypatch)
+        request, = messages(client)
+        await asyncio.wait_for(task, 1)
+        assert messages(daemon)[-1]["result"] == {"approved": False}
+        await router.route_client({
+            "jsonrpc": "2.0", "id": request["id"],
+            "result": {"outcome": {"outcome": "selected", "optionId": "allow_session"}},
+        })
+        assert len(messages(daemon)) == 1
+        assert not router._scope_permissions
+    finally:
+        await router.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("action", ["cancel", "reload", "disconnect", "generation"])
+async def test_scope_permission_cannot_outlive_its_hosted_request(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, action: str,
+) -> None:
+    router, client, daemon, _, connection_id = await hosted_router(tmp_path)
+    try:
+        client.data.clear()
+        daemon.data.clear()
+        task = await start_scope_permission(router, connection_id, 14, "/outside", monkeypatch)
+        request, = messages(client)
+        if action == "cancel":
+            await router.route_client({
+                "jsonrpc": "2.0", "method": "session/cancel", "params": {"sessionId": "session"},
+            })
+        elif action == "reload":
+            await router.route_client({
+                "jsonrpc": "2.0", "id": "reload", "method": "session/load",
+                "params": {"cwd": str(tmp_path), "sessionId": "session"},
+            })
+        elif action == "disconnect":
+            await router.route_daemon({
+                "jsonrpc": "2.0", "id": 15, "method": "mcp/disconnect",
+                "params": {"connectionId": connection_id},
+            })
+        else:
+            router._fail_generation(RuntimeError("generation failed"))
+        await asyncio.gather(task, return_exceptions=True)
+        if action != "generation":
+            await router.route_client({
+                "jsonrpc": "2.0", "id": request["id"],
+                "result": {"outcome": {"outcome": "selected", "optionId": "allow_session"}},
+            })
+        assert not any(m.get("id") == 14 and m.get("result", {}).get("approved") for m in messages(daemon))
+        assert not router._scope_permissions
+        assert len(router._grants) == 0
+    finally:
+        await router.close()
+
+
+@pytest.mark.asyncio
+async def test_scope_permission_requires_owned_hosted_task_and_bounds_requests(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    router, client, daemon, _, connection_id = await hosted_router(tmp_path)
+    try:
+        client.data.clear()
+        daemon.data.clear()
+        provider_id = router._connection_provider_sessions[connection_id]
+        assert not await router._request_scope_permission(provider_id, "/outside")
+        assert messages(client) == []
+        monkeypatch.setattr("mimir.acp.proxy.MAX_SCOPE_PERMISSION_REQUESTS", 1)
+        task = await start_scope_permission(router, connection_id, 16, "/outside", monkeypatch)
+        request, = messages(client)
+        await router.route_client({
+            "jsonrpc": "2.0", "id": request["id"],
+            "result": {"outcome": {"outcome": "selected", "optionId": "reject_once"}},
+        })
+        await task
+        task2 = await start_scope_permission(router, connection_id, 17, "/other", monkeypatch)
+        await task2
+        assert len(messages(client)) == 1
+        assert messages(daemon)[-1]["result"] == {"approved": False}
+        # Daemon cannot occupy the local permission ID namespace.
+        with pytest.raises(ProxyError, match="duplicate outstanding request ID"):
+            await router.route_daemon(permission_request("mimir-scope:2", "session"))
+    finally:
+        await router.close()
+
+
+@pytest.mark.asyncio
+async def test_scope_permission_allows_only_one_outstanding_request_per_session(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    router, client, daemon, _, connection_id = await hosted_router(tmp_path)
+    try:
+        client.data.clear()
+        daemon.data.clear()
+        first = await start_scope_permission(router, connection_id, 19, "/outside", monkeypatch)
+        request, = messages(client)
+        second = await start_scope_permission(router, connection_id, 20, "/other", monkeypatch)
+        await second
+        assert messages(daemon)[-1] == {"jsonrpc": "2.0", "id": 20, "result": {"approved": False}}
+        assert len(messages(client)) == 1
+        await router.route_client({
+            "jsonrpc": "2.0", "id": request["id"],
+            "result": {"outcome": {"outcome": "selected", "optionId": "allow_session"}},
+        })
+        await first
+        assert messages(daemon)[-1] == {"jsonrpc": "2.0", "id": 19, "result": {"approved": True}}
+    finally:
+        await router.close()
+
+
+@pytest.mark.asyncio
+async def test_daemon_cannot_forge_local_scope_permission_metadata() -> None:
+    router, client, daemon = await active_router()
+    try:
+        request = permission_request(1, "session")
+        request["params"]["_meta"] = {"mimir.execution_scope": True}
+        with pytest.raises(ProxyError, match="invalid reserved permission metadata"):
+            await router.route_daemon(request)
+        assert messages(client) == []
+        assert messages(daemon) == []
+        assert len(router._grants) == 0
+    finally:
+        await router.close()
+
+
+@pytest.mark.asyncio
+async def test_hosted_scope_tool_round_trip_queries_grants_and_final_rejection(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cwd = tmp_path / "cwd"
+    cwd.mkdir()
+    allowed = tmp_path / "allowed.txt"
+    allowed.write_text("outside")
+    rejected = tmp_path / "rejected.txt"
+    rejected.write_text("outside")
+    # This test covers provider -> proxy -> operator -> provider, not the OS
+    # backend (which has separate real confinement probes).
+    monkeypatch.setattr("mimir.acp.hosted.prepare_command", lambda *args, **kwargs: None)
+    router, client, daemon, _, connection_id = await hosted_router(cwd)
+
+    async def start(request_id: int, path: str) -> asyncio.Task[Any]:
+        await router.route_daemon({
+            "jsonrpc": "2.0", "id": request_id, "method": "mcp/message",
+            "params": {
+                "connectionId": connection_id, "method": "tools/call",
+                "params": {"name": "request_scope", "arguments": {"path": path}},
+            },
+        })
+        task = router._local_requests[(int, request_id)]
+        assert task is not None
+        await asyncio.sleep(0)
+        return task
+
+    try:
+        client.data.clear()
+        daemon.data.clear()
+        task = await start(30, "")
+        await task
+        assert messages(client) == []
+        assert messages(daemon)[-1]["result"]["structuredContent"]["paths"] == [str(cwd.resolve())]
+        task = await start(31, str(allowed))
+        request, = messages(client)
+        await router.route_client({
+            "jsonrpc": "2.0", "id": request["id"],
+            "result": {"outcome": {"outcome": "selected", "optionId": "allow_session"}},
+        })
+        await task
+        result = messages(daemon)[-1]["result"]["structuredContent"]
+        assert result["approved"] is True
+        assert set(result["paths"]) == {str(cwd.resolve()), str(allowed.resolve())}
+        assert str(tmp_path.resolve()) not in result["paths"]
+        assert "restart" in result["message"]
+        client.data.clear()
+        task = await start(32, str(rejected))
+        request, = messages(client)
+        await router.route_client({
+            "jsonrpc": "2.0", "id": request["id"],
+            "result": {"outcome": {"outcome": "selected", "optionId": "reject_once"}},
+        })
+        await task
+        assert messages(daemon)[-1]["result"]["structuredContent"]["approved"] is False
+        client.data.clear()
+        task = await start(33, str(rejected))
+        await task
+        assert messages(client) == []
+        result = messages(daemon)[-1]["result"]["structuredContent"]
+        assert result["approved"] is False
+        assert "do not retry" in result["message"]
+        task = await start(34, "")
+        await task
+        assert set(messages(daemon)[-1]["result"]["structuredContent"]["paths"]) == {
+            str(cwd.resolve()), str(allowed.resolve()),
+        }
+    finally:
+        await router.close()

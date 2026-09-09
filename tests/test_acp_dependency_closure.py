@@ -35,6 +35,10 @@ def test_hosted_hands_closure_is_stdlib_only_and_runtime_blind() -> None:
         "mimir.acp.hosted",
         "mimir.acp.hands_contract",
         "mimir.acp.python_kernel",
+        "mimir.acp.confinement",
+        "mimir.acp.execution_scope",
+        "mimir.acp.audit",
+        "mimir.client_file_resources",
     }
     for analysis in analyses.values():
         assert analysis.external_imports <= module.sys.stdlib_module_names

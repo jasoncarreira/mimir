@@ -92,6 +92,15 @@ HANDS_V1_WIRE_TOOLS = tuple(
                 ["ok", "stdout", "stderr", "value", "exception", "timedOut", "kernel"],
             ),
         },
+        {
+            "name": "request_scope",
+            "description": "Request an exact execution path proactively. Empty path queries approved paths without approval. Rejection is final for the session. Approval restarts Python and loses REPL state.",
+            "inputSchema": _object_schema({"path": _STRING}, ["path"]),
+            "outputSchema": _object_schema(
+                {"approved": {"type": "boolean"}, "paths": {"type": "array", "items": _STRING}, "message": _STRING},
+                ["approved", "paths", "message"],
+            ),
+        },
     )
 )
 
@@ -101,6 +110,7 @@ HANDS_PROVIDER_TO_WRAPPER = MappingProxyType(
         "edit": "hands_edit",
         "shell": "hands_shell",
         "python": "hands_python",
+        "request_scope": "hands_request_scope",
     }
 )
 HANDS_WRAPPER_TO_PROVIDER = MappingProxyType(
@@ -109,12 +119,14 @@ HANDS_WRAPPER_TO_PROVIDER = MappingProxyType(
 
 _ARGUMENT_TYPES = MappingProxyType({
     "read": MappingProxyType({"path": str}),
+    "request_scope": MappingProxyType({"path": str}),
     "edit": MappingProxyType({"path": str, "oldText": str, "newText": str}),
     "shell": MappingProxyType({"command": str}),
     "python": MappingProxyType({"code": str}),
 })
 _RESULT_TYPES = MappingProxyType({
     "read": MappingProxyType({"content": str}),
+    "request_scope": MappingProxyType({"approved": bool, "paths": list, "message": str}),
     "edit": MappingProxyType({"changed": bool}),
     "shell": MappingProxyType({"stdout": str, "stderr": str, "exitCode": int}),
     "python": MappingProxyType({
@@ -158,6 +170,9 @@ def _validate_exact_object(
         "fresh", "reused", "timed_out", "crashed"
     }:
         raise HandsContractError("malformed Hands result")
+    if provider_name == "request_scope" and kind == "result":
+        if any(type(path) is not str for path in result["paths"]):
+            raise HandsContractError("malformed Hands result")
     return result
 
 

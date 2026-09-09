@@ -106,6 +106,17 @@ def test_shared_wire_contract_is_stdlib_only_and_exact() -> None:
                 "additionalProperties": False,
             },
         },
+        {
+            "name": "request_scope",
+            "description": "Request an exact execution path proactively. Empty path queries approved paths without approval. Rejection is final for the session. Approval restarts Python and loses REPL state.",
+            "inputSchema": {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"], "additionalProperties": False},
+            "outputSchema": {
+                "type": "object",
+                "properties": {"approved": {"type": "boolean"}, "paths": {"type": "array", "items": {"type": "string"}}, "message": {"type": "string"}},
+                "required": ["approved", "paths", "message"],
+                "additionalProperties": False,
+            },
+        },
     ]
     tree = ast.parse((ROOT / "mimir" / "acp" / "hands_contract.py").read_text())
     imports = {
@@ -122,12 +133,14 @@ def test_wire_contract_is_immutable_and_descriptors_are_defensive_copies() -> No
         "edit": "hands_edit",
         "shell": "hands_shell",
         "python": "hands_python",
+        "request_scope": "hands_request_scope",
     }
     assert HANDS_WRAPPER_TO_PROVIDER == {
         "hands_read": "read",
         "hands_edit": "edit",
         "hands_shell": "shell",
         "hands_python": "python",
+        "hands_request_scope": "request_scope",
     }
     with pytest.raises(TypeError):
         HANDS_V1_WIRE_TOOLS[0]["description"] = "changed"
@@ -225,3 +238,17 @@ def test_python_kernel_schema_enum_is_exact() -> None:
     }
     with pytest.raises(HandsContractError, match="malformed Hands result"):
         validate_tool_result("python", result)
+
+
+@pytest.mark.parametrize("paths", [[1], "path", [None], [True]])
+def test_scope_result_requires_string_path_list(paths: object) -> None:
+    with pytest.raises(HandsContractError):
+        validate_tool_result("request_scope", {"approved": True, "paths": paths, "message": "status"})
+
+
+def test_scope_query_contract_is_exact() -> None:
+    assert validate_tool_arguments("request_scope", {"path": ""}) == {"path": ""}
+    result = {"approved": True, "paths": ["/cwd"], "message": "Current scope"}
+    assert validate_tool_result("request_scope", result) == result
+    with pytest.raises(HandsContractError):
+        validate_tool_arguments("request_scope", {"path": "/file", "command": "hidden"})

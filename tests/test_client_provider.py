@@ -36,6 +36,7 @@ from mimir.tools.client_provider import (
     hands_python,
     hands_read,
     hands_shell,
+    hands_request_scope,
     client_authorized_host_execution_metadata,
     issue_client_authorized_host_execution,
     reset_turn_capability_context,
@@ -166,6 +167,8 @@ async def _invoke_wrapper(wrapper_name: str, provider: Any) -> dict[str, Any]:
             return await hands_edit.ainvoke({
                 "path": "notes.txt", "old_text": "old", "new_text": "new"
             })
+        if wrapper_name == "hands_request_scope":
+            return await hands_request_scope.ainvoke({"path": ""})
         if wrapper_name == "hands_shell":
             return await hands_shell.ainvoke({"command": "pwd"})
         return await hands_python.ainvoke({"code": "1 + 1"})
@@ -379,6 +382,7 @@ def test_profile_has_exact_provider_schemas_and_server_metadata() -> None:
             "5705e1d85e12b89447ad83e52b7bacb5dea92bbe3480c5fad138364a1540303c",
         ),
     }
+    expected["request_scope"] = ({'type': 'object', 'properties': {'path': {'type': 'string'}}, 'required': ['path'], 'additionalProperties': False}, {'type': 'object', 'properties': {'approved': {'type': 'boolean'}, 'paths': {'type': 'array', 'items': {'type': 'string'}}, 'message': {'type': 'string'}}, 'required': ['approved', 'paths', 'message'], 'additionalProperties': False}, '39b714704935190561ed407980480b9a4a0b346b97346e0bff71fb9ace820194', '942370b44a09b40aec41ffa23bd4694e3238f19b136338abd5cb8061095d54f0')
     assert tuple(tools) == tuple(expected)
     for name, (input_schema, result_schema, input_digest, result_digest) in expected.items():
         assert _thaw(tools[name].input_schema) == input_schema
@@ -393,6 +397,7 @@ def test_profile_has_exact_provider_schemas_and_server_metadata() -> None:
         "hands_edit": "client_authorized_host_execution",
         "hands_shell": "client_authorized_host_execution",
         "hands_python": "client_authorized_host_execution",
+        "hands_request_scope": "client_scope_request",
     }
 
 
@@ -724,7 +729,7 @@ async def test_wrappers_accept_recorded_stock_mcp_results(
 
 @pytest.mark.asyncio
 async def test_advertised_output_schemas_drive_accepted_result_shapes() -> None:
-    values_by_type = {"string": "value", "boolean": True, "integer": 1}
+    values_by_type = {"string": "value", "boolean": True, "integer": 1, "array": ["/tmp"]}
 
     for policy in MIMIR_HANDS_V1.tools:
         schema = _thaw(policy.result_schema)
@@ -950,7 +955,7 @@ def test_hands_surface_is_static_without_client_mcp_registration() -> None:
     assert names.count("hands_shell") == 1
     assert names.count("hands_python") == 1
     assert tuple(tool.name for tool in HANDS_TOOLS) == (
-        "hands_read", "hands_edit", "hands_shell", "hands_python"
+        "hands_read", "hands_edit", "hands_shell", "hands_python", "hands_request_scope"
     )
     source = Path(__file__).parents[1] / "mimir" / "tools" / "client_provider.py"
     tree = ast.parse(source.read_text())
@@ -995,3 +1000,76 @@ def test_hands_python_policy_and_wire_schema_are_exact() -> None:
         None,
         "client_authorized_host_execution",
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("path", ["", "/outside/exact.txt"])
+async def test_scope_wrapper_routes_exact_path_without_wrapper_permission(path: str) -> None:
+    from mimir.tools.client_provider import hands_request_scope
+    from mimir.tools.budget_gate import _permission_eligibility
+    result = {"approved": True, "paths": ["/tmp", "/outside/exact.txt"], "message": "Scope"}
+    provider = FakeProvider({"request_scope": result})
+    token = set_turn_capability_context(_context(provider))
+    try:
+        assert await hands_request_scope.ainvoke({"path": path}) == result
+        assert provider.calls == [("request_scope", {"path": path})]
+        assert _permission_eligibility(None, "hands_request_scope", None, {"path": path}) is None
+    finally:
+        reset_turn_capability_context(token)
+
+
+@pytest.mark.parametrize("change", [{}, {"roles": ("user",)}, {"is_service": True}, {"principal": ""}])
+def test_scope_request_requires_live_acp_admin(change: dict) -> None:
+    from mimir.acp.journal import JournalLease
+    context = replace(_context(FakeProvider({})), lease=JournalLease("scope", 1, 1))
+    token = set_turn_capability_context(context)
+    try:
+        auth = replace(_admin_auth(), **change)
+        verdict = get_tool_registry().authorize_tool("hands_request_scope", auth, enforce=False, arguments={"path": ""})
+        assert verdict.allowed is (not change)
+        assert get_tool_flow_direction("hands_request_scope") is ToolFlowDirection.NEITHER
+        assert get_sink_category("hands_request_scope") is SinkCategory.UNKNOWN
+        assert issue_client_authorized_host_execution(request_identity=object(), auth_context_identity=auth, wrapper_name="hands_request_scope", tainted=True) is None
+    finally:
+        reset_turn_capability_context(token)
+    assert not get_tool_registry().authorize_tool("hands_request_scope", _admin_auth(), enforce=False, arguments={"path": ""}).allowed
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("middleware_event_logger")
+async def test_scope_request_middleware_routes_tainted_turn_without_execution_grant() -> None:
+    from langchain.agents.middleware import ToolCallRequest
+    from langchain_core.messages import ToolMessage
+    from langgraph.runtime import Runtime
+    from mimir.acp.journal import JournalLease
+    from mimir.models import InformationFlowLabels, InformationFlowState, SourceLabel
+    from mimir.tools.budget_gate import BudgetGateMiddleware
+
+    class NeverBroker:
+        async def request_permission(self, eligibility):
+            pytest.fail("scope requests must reach the provider, not wrapper permission")
+
+    labels = InformationFlowLabels().with_source(SourceLabel(
+        source_kind="acp_hands_result", principal="admin", domain="client_provider",
+        resource_id="shell", bridge_instance="acp", sensitivity="private",
+        integrity="untrusted", integrity_effect="active_ingest",
+    ))
+    auth = replace(_admin_auth(), ifc_labels=labels, ifc_state=InformationFlowState(labels))
+    context = replace(_context(FakeProvider({})), lease=JournalLease("scope", 1, 1), permission_broker=NeverBroker())
+    token = set_turn_capability_context(context)
+    calls = []
+    request = ToolCallRequest(
+        tool_call={"name": "hands_request_scope", "args": {"path": ""}, "id": "scope", "type": "tool_call"},
+        tool=hands_request_scope, state=None, runtime=Runtime(context=auth),
+    )
+    async def handler(r):
+        calls.append(r.tool_call)
+        return ToolMessage(content='{"approved":true,"paths":["/tmp"],"message":"Current scope"}', tool_call_id="scope")
+    try:
+        before = auth.ifc_state.current(labels)
+        result = await BudgetGateMiddleware().awrap_tool_call(request, handler)
+        assert result.status == "success"
+        assert len(calls) == 1
+        assert auth.ifc_state.current(labels) == before
+    finally:
+        reset_turn_capability_context(token)

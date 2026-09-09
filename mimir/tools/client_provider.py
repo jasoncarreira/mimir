@@ -231,6 +231,7 @@ def _tool_policy(
 
 
 _WIRE_TO_POLICY = {
+    "request_scope": ("admin_required", "neither", None, None),
     "read": ("resource_scoped", "source", None, "client-file"),
     "edit": ("admin_required", "both", "external_mcp", "client-file"),
     "shell": ("admin_required", "both", "shell_process", None),
@@ -252,6 +253,7 @@ def _hands_policy_from_wire(descriptor: Mapping[str, Any]) -> ProviderToolPolicy
         result_schema=descriptor["outputSchema"],
         description=descriptor["description"],
         operation=(
+            "client_scope_request" if provider_name == "request_scope" else
             "client_authorized_host_execution"
             if classification == "admin_required"
             else None
@@ -314,6 +316,31 @@ def _active_policy(wrapper_name: str) -> tuple[TurnCapabilityContext, ProviderTo
     if policy is None:
         raise ToolException("Client provider tool is not admitted")
     return context, policy
+
+
+def client_scope_request_allowed(auth_context: Any, arguments: Any) -> bool:
+    """Authenticate the narrow scope-request operation, not an execution grant."""
+    context = get_turn_capability_context()
+    lease = getattr(context, "lease", None)
+    return (
+        auth_context is not None
+        and not getattr(auth_context, "is_service", False)
+        and "admin" in (getattr(auth_context, "roles", ()) or ())
+        and isinstance(getattr(auth_context, "principal", None), str)
+        and bool(auth_context.principal)
+        and isinstance(getattr(auth_context, "canonical_principal", None), str)
+        and bool(auth_context.canonical_principal)
+        and context is not None
+        and context.acp_delivery is True
+        and context.profile_policy is MIMIR_HANDS_V1
+        and context.provider is not None
+        and not getattr(context.provider, "closed", False)
+        and lease is not None
+        and getattr(lease, "closed", True) is False
+        and getattr(lease, "generation", None) == context.connection_generation
+        and getattr(lease, "epoch", None) == context.prompt_epoch
+        and validate_hands_wrapper_arguments("hands_request_scope", arguments) is not None
+    )
 
 
 def issue_client_authorized_host_execution(
@@ -443,6 +470,7 @@ def _validate_result(result: Mapping[str, Any], wrapper_name: str) -> dict[str, 
 
 _HANDS_WRAPPER_ARGUMENTS = MappingProxyType({
     "hands_read": MappingProxyType({"path": "path"}),
+    "hands_request_scope": MappingProxyType({"path": "path"}),
     "hands_edit": MappingProxyType({
         "path": "path",
         "old_text": "oldText",
@@ -550,4 +578,20 @@ async def hands_python(code: str) -> dict[str, bool | str]:
     return _validate_result(result, "hands_python")
 
 
-HANDS_TOOLS = (hands_read, hands_edit, hands_shell, hands_python)
+@tool("hands_request_scope", args_schema=_ReadArgs)
+async def hands_request_scope(path: str) -> dict[str, Any]:
+    """Request an exact execution path before accessing it outside approved scope.
+
+    Use path="" to query approved paths without prompting. Empty or surprising
+    shell/Python output may be genuine or confinement; it is not proof of denial.
+    Extra directory grants do not include children.
+    Ask proactively for needed paths. Rejection is final: do not request or retry
+    that path again this session. Approval restarts Python and loses REPL state.
+    This does not widen hands_read/hands_edit or acknowledge untrusted ingest.
+    """
+    context, policy = _active_policy("hands_request_scope")
+    result = await _call_hands_tool(context, policy, {"path": path})
+    return _validate_result(result, "hands_request_scope")
+
+
+HANDS_TOOLS = (hands_read, hands_edit, hands_shell, hands_python, hands_request_scope)

@@ -336,6 +336,7 @@ _TOOL_FLOW_MAP: dict[str, ToolFlowDirection] = {
     "execute": ToolFlowDirection.BOTH,
     "aexecute": ToolFlowDirection.BOTH,
     "shell": ToolFlowDirection.BOTH,
+    "hands_request_scope": ToolFlowDirection.NEITHER,
     "hands_read": ToolFlowDirection.SOURCE,
     "hands_edit": ToolFlowDirection.BOTH,
     "hands_shell": ToolFlowDirection.BOTH,
@@ -408,111 +409,14 @@ class ResourceScope:
     sink_destinations: frozenset[str] = frozenset()
 
 
-CLIENT_FILE_RESOURCE_NAMESPACE = "client-file"
-_CLIENT_FILE_UNRESERVED = frozenset(
-    b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~"
-)
-
-
-def canonical_client_file_resource(path: object, cwd: object = None) -> str | None:
-    import posixpath
-
-    if not isinstance(path, str) or not path or "\x00" in path:
-        return None
-    if cwd is not None:
-        if (
-            not isinstance(cwd, str) or not cwd.startswith("/")
-            or "\x00" in cwd
-        ):
-            return None
-        try:
-            cwd.encode("utf-8")
-        except UnicodeEncodeError:
-            return None
-        # POSIX lexical confinement only; never resolve client-hosted symlinks.
-        path = posixpath.normpath("/" + posixpath.join(cwd, path).lstrip("/"))
-    try:
-        encoded = path.encode("utf-8")
-    except UnicodeEncodeError:
-        return None
-    identity = "".join(
-        chr(value) if value in _CLIENT_FILE_UNRESERVED else f"%{value:02X}"
-        for value in encoded
-    )
-    return f"{CLIENT_FILE_RESOURCE_NAMESPACE}:{identity}"
-
-
-def client_file_resource_path(resource: object) -> str | None:
-    """Decode a client resource once, accepting equivalent percent encodings."""
-    prefix = f"{CLIENT_FILE_RESOURCE_NAMESPACE}:"
-    if not isinstance(resource, str) or not resource.startswith(prefix):
-        return None
-    encoded_identity = resource[len(prefix):]
-    if not encoded_identity:
-        return None
-    decoded = bytearray()
-    index = 0
-    while index < len(encoded_identity):
-        value = encoded_identity[index]
-        if ord(value) in _CLIENT_FILE_UNRESERVED:
-            decoded.append(ord(value))
-            index += 1
-            continue
-        if (
-            value != "%"
-            or index + 2 >= len(encoded_identity)
-            or not re.fullmatch(r"[0-9A-Fa-f]{2}", encoded_identity[index + 1:index + 3])
-        ):
-            return None
-        decoded.append(int(encoded_identity[index + 1:index + 3], 16))
-        index += 3
-    try:
-        path = bytes(decoded).decode("utf-8")
-    except UnicodeDecodeError:
-        return None
-    return path if canonical_client_file_resource(path) is not None else None
-
-
-def client_file_resource_is_canonical(resource: object) -> bool:
-    path = client_file_resource_path(resource)
-    return path is not None and canonical_client_file_resource(path) == resource
-
-
-@dataclass(frozen=True)
-class ClientFileResourcePolicy:
-    namespace: str
-    grant: str
-
-    @classmethod
-    def for_cwd(cls, cwd: object) -> ClientFileResourcePolicy:
-        resource = (
-            canonical_client_file_resource(cwd, cwd="/")
-            if isinstance(cwd, str) and cwd.startswith("/") else None
-        )
-        path = client_file_resource_path(resource)
-        grant = canonical_client_file_resource(path.rstrip("/") + "/") if path else None
-        return cls(CLIENT_FILE_RESOURCE_NAMESPACE, f"{grant}*" if grant else "")
-
-    def allows(self, resource: object) -> bool:
-        if self.namespace != CLIENT_FILE_RESOURCE_NAMESPACE or not self.grant.endswith("*"):
-            return False
-        boundary = client_file_resource_path(self.grant[:-1])
-        path = client_file_resource_path(resource)
-        if not boundary or not boundary.startswith("/") or not boundary.endswith("/"):
-            return False
-        if not path or not path.startswith("/"):
-            return False
-        root = client_file_resource_path(canonical_client_file_resource(boundary, cwd="/"))
-        path = client_file_resource_path(canonical_client_file_resource(path, cwd="/"))
-        return root is not None and path is not None and (
-            path == root or path.startswith(root.rstrip("/") + "/")
-        )
-
-
-CLIENT_FILE_RESOURCE_POLICY = ClientFileResourcePolicy(
-    namespace=CLIENT_FILE_RESOURCE_NAMESPACE,
-    # Profile identity only. File grants must come from the bound session cwd.
-    grant="",
+# Re-export the established API from the stdlib leaf used by the local proxy.
+from .client_file_resources import (
+    CLIENT_FILE_RESOURCE_NAMESPACE,
+    CLIENT_FILE_RESOURCE_POLICY,
+    ClientFileResourcePolicy,
+    canonical_client_file_resource,
+    client_file_resource_is_canonical,
+    client_file_resource_path,
 )
 
 
@@ -7595,6 +7499,7 @@ class OperationCatalog:
         "hands_edit",
         "hands_shell",
         "hands_python",
+        "hands_request_scope",
     })
 
     # Global rows from these operations contain protected identities,
@@ -8487,6 +8392,22 @@ class ToolRegistry:
         The ifc_labels parameter enables information flow control sink gate
         checks (chainlink #871).
         """
+        if tool_name == "hands_request_scope":
+            # This can only ask the editor for scope; it neither executes input
+            # nor grants IFC/host-execution authority. Never shadow-allow it.
+            from .tools.client_provider import client_scope_request_allowed
+
+            allowed = client_scope_request_allowed(auth_context, arguments)
+            return ToolAuthorization(
+                tool_name=tool_name,
+                decision=OperationDecision.ADMIN_REQUIRED,
+                allowed=allowed,
+                reason=None if allowed else "scope request requires an admitted admin ACP Hands principal",
+                required_tier=AccessTier.ADMIN,
+                enforcement_enabled=True,
+                would_block=not allowed,
+                flow_direction=ToolFlowDirection.NEITHER,
+            )
         if tool_name.startswith(MCPResourceAdapter._MCP_TOOL_PREFIX) and mcp_tool is not None:
             if ifc_labels is None and auth_context is not None:
                 ifc_labels = getattr(auth_context, "ifc_labels", None)
@@ -9102,6 +9023,7 @@ _ACP_HANDS_RESULT_TOOLS = frozenset({
 # inference from flow direction.
 _NON_INGESTING_RESULT_TOOLS = frozenset({
     # Authorization/workflow actions return only server-created status.
+    "hands_request_scope",
     "approve_declassification",
     "clear_ingest_taint",
     "request_operator_approval",

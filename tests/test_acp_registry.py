@@ -264,7 +264,7 @@ def test_hands_and_filesystem_contract() -> None:
         "`mcpServers` is missing or empty",
         "locally hosted MCP-over-ACP provider named `mimir-hands`",
         "`mimir.hands.v1` profile",
-        "`read`, `edit`, `shell`, and `python`",
+        "`read`, `edit`, `shell`, `python`, and `request_scope`",
         "session new, session load, and provider-list change",
         "`allow_session` creates only an in-memory proxy grant",
         "tainted call always prompts again",

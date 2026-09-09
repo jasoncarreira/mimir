@@ -13,8 +13,12 @@ POLICY = {
     "mimir.acp.bootstrap": {"mimir.acp.profiles", "mimir.acp.credentials", "mimir.acp.proxy", "mimir.acp.ssh", "mimir.acp.relay", "mimir.acp.diagnostics"},
     "mimir.acp.host": {"mimir.acp.transport"},
     "mimir.acp.hands_contract": set(),
-    "mimir.acp.hosted": {"mimir.acp.hands_contract", "mimir.acp.python_kernel"},
-    "mimir.acp.python_kernel": set(),
+    "mimir.acp.hosted": {"mimir.acp.hands_contract", "mimir.acp.python_kernel", "mimir.acp.confinement", "mimir.acp.execution_scope", "mimir.acp.audit"},
+    "mimir.acp.python_kernel": {"mimir.acp.confinement"},
+    "mimir.acp.confinement": set(),
+    "mimir.acp.execution_scope": {"mimir.client_file_resources"},
+    "mimir.acp.audit": set(),
+    "mimir.client_file_resources": set(),
     "mimir.acp.profiles": set(),
     "mimir.acp.credentials": set(),
     "mimir.acp.transport": set(),
@@ -30,8 +34,8 @@ ROOTS = {
     "client": {"mimir.acp.__main__", "mimir.acp.bootstrap", "mimir.acp.host", "mimir.acp.hands_contract", "mimir.acp.hosted"},
 }
 EXPECTED = {
-    "local": {"mimir.acp.proxy", "mimir.acp.profiles", "mimir.acp.credentials", "mimir.acp.transport", "mimir.acp.hosted", "mimir.acp.diagnostics", "mimir.acp.hands_contract", "mimir.acp.python_kernel"},
-    "remote": {"mimir.acp.ssh", "mimir.acp.proxy", "mimir.acp.profiles", "mimir.acp.credentials", "mimir.acp.transport", "mimir.acp.hosted", "mimir.acp.diagnostics", "mimir.acp.hands_contract", "mimir.acp.python_kernel"},
+    "local": {"mimir.acp.proxy", "mimir.acp.profiles", "mimir.acp.credentials", "mimir.acp.transport", "mimir.acp.hosted", "mimir.acp.diagnostics", "mimir.acp.hands_contract", "mimir.acp.python_kernel", "mimir.acp.confinement", "mimir.acp.execution_scope", "mimir.acp.audit", "mimir.client_file_resources"},
+    "remote": {"mimir.acp.ssh", "mimir.acp.proxy", "mimir.acp.profiles", "mimir.acp.credentials", "mimir.acp.transport", "mimir.acp.hosted", "mimir.acp.diagnostics", "mimir.acp.hands_contract", "mimir.acp.python_kernel", "mimir.acp.confinement", "mimir.acp.execution_scope", "mimir.acp.audit", "mimir.client_file_resources"},
     "relay": {"mimir.acp.relay", "mimir.acp.transport"},
     "client": set(POLICY),
 }
