@@ -147,11 +147,7 @@ _ensure_mimir_import_path()
 # the poller must fail rather than run without the filter, because "no filter"
 # means auto-reviewing every author's PR — the exact behaviour #1022 removed.
 from mimir.pollers import _github_author_is_trusted, _github_content_author
-# CI-watch also ships standalone, so the shared implementation lives beside its
-# script. Import the bundled copy, not another optional skill's installed tree.
-_ci_logs = importlib.import_module("mimir.optional-skills.github-ci-watch.scripts.ci_logs")
-capture_job_log = _ci_logs.capture_job_log
-clean_log_tail = _ci_logs.clean_log_tail
+from mimir.ci_logs import capture_job_log, clean_log_tail
 
 STATE_DIR = Path(os.environ.get("STATE_DIR", Path(__file__).parent.parent))
 CURSOR_FILE = STATE_DIR / "cursor.json"

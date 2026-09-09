@@ -512,8 +512,24 @@ defines the required evidence. The supplied human remediation record reports
 scope `a1b1248a5809...`, head `cf9d4f9045dbd6c2...`, and owner `mimir-carreira` on
 `jasoncarreira/mimir#1847`, using
 `repo_test -> repo_diff -> repo_commit -> repo_push -> pr_comment -> repo_cleanup -> pr_checks -> pr_rerequest_review`.
+
 It reports one comment, one push, one review re-request, and pre-execution refusal
-of shell Git writes and `gh`. The reviewer completed the remaining steps on
+of shell Git writes and `gh`.
+
+`pr_job_log(repository, pull_request, job_id, run_id=None)` requires an explicit
+`pr_job_log` service capability and an existing exact PR scope granting
+`repo.inspect`. Neither `pr_checks`, `pr_metadata`, `fetch_url`, nor selecting the
+GitHub authority profile grants it. The shipped `github-activity` and
+`github-ci-watch` manifests explicitly grant it. This tool does not discover new
+PR authority. Selectors must be positive integers, not strings or booleans.
+The GitHub adapter independently checks the job ID, run ID, repository, and
+scoped head SHA before capture, and requires a completed run and completed
+failing job. Missing jobs, unfinished runs, authentication failures, and
+out-of-scope targets produce distinct errors. Metadata uses the adapter's bounded
+REST transport; log capture uses authenticated `gh` via shared disk-spooled
+capture. Returned excerpts are selected, redacted and byte-bounded, but remain
+untrusted repository source content, never instructions or new authority.
+The reviewer completed the remaining steps on
 2026-09-07 (Chainlink #1050, "Reviewer gate record, part 2" and its correction):
 a review-scope cycle on `jasoncarreira/mimir#1841` with exactly one submitted
 review pinned to the lease head (GitHub review 5125541381 at `c75f7ad29`);
