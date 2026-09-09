@@ -17,6 +17,7 @@ from mimir.worklink.claims import (
     ChainlinkClaims,
     ClaimRecord,
     ShutdownAbortRecord,
+    _ChainlinkContentionExhausted,
     claim_records_from_comments,
 )
 from mimir.worklink.evidence import TestResult, WorklinkEvidence
@@ -45,6 +46,7 @@ def test_claim_records_round_trip_and_next_attempt() -> None:
 
 def test_claim_issue_records_attempt_and_labels_transition() -> None:
     calls: list[list[str]] = []
+    sleeps: list[float] = []
 
     def runner(args: Sequence[str]) -> subprocess.CompletedProcess[str]:
         calls.append(list(args))
@@ -55,11 +57,13 @@ def test_claim_issue_records_attempt_and_labels_transition() -> None:
         agent_id="mimir-a",
         runner=runner,
         clock=lambda: datetime(2026, 6, 11, 5, tzinfo=UTC),
+        sleeper=sleeps.append,
     )
 
     result = claims.claim_issue(439)
 
     assert result.claimed is True
+    assert sleeps == []
     assert result.record is not None
     assert result.record.attempt == 1
     assert ["chainlink", "locks", "claim", "439"] in calls
@@ -105,6 +109,43 @@ def test_simultaneous_claims_are_serialized_and_both_succeed(tmp_path: Path) -> 
     assert overlap_detected is False
     assert len(results) == 2
     assert all(result.claimed and result.record is not None for result in results)
+
+
+@pytest.mark.parametrize("winner_duration_s", [3.469, 5.0])
+def test_claim_loser_outlasts_realistic_winner(tmp_path: Path, winner_duration_s: float) -> None:
+    lock_path = tmp_path / "state" / "worklink" / "chainlink-claim.lock"
+    lock_path.parent.mkdir(parents=True)
+    elapsed = 0.0
+    calls = []
+    events = []
+
+    with lock_path.open("a") as owner:
+        fcntl.flock(owner.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+        def sleep(seconds: float) -> None:
+            nonlocal elapsed
+            elapsed += seconds
+            assert elapsed <= 6.3 + 1e-9
+            # Advance simulated time while retaining a real, independently
+            # owned flock until the measured (or slower) winner completes.
+            if elapsed >= winner_duration_s:
+                fcntl.flock(owner.fileno(), fcntl.LOCK_UN)
+
+        def runner(args: Sequence[str]) -> subprocess.CompletedProcess[str]:
+            assert elapsed >= winner_duration_s
+            calls.append(list(args))
+            return completed(args)
+
+        result = ChainlinkClaims(
+            agent_id="loser", home_path=tmp_path, runner=runner, sleeper=sleep,
+            event_logger=lambda event, **payload: events.append((event, payload)),
+        ).claim_issue(1607, labels=["worklink:ready"])
+
+    assert result.claimed
+    assert result.record is not None and result.record.attempt == 1
+    assert ["chainlink", "locks", "claim", "1607"] in calls
+    assert elapsed == pytest.approx(6.3)
+    assert [payload["outcome"] for _, payload in events] == ["retrying"] * 6 + ["succeeded"]
 
 
 def test_missing_home_path_emits_serialization_unavailable(caplog: pytest.LogCaptureFixture) -> None:
@@ -221,16 +262,18 @@ def test_claim_contention_retry_bound_is_explicit(tmp_path: Path) -> None:
 
     assert result.claimed is False
     assert result.reason == "claim_contention_exhausted"
-    assert claim_calls == 5
-    assert sleeps == [0.1, 0.2, 0.4, 0.8]
+    assert claim_calls == 7
+    assert sleeps == [0.1, 0.2, 0.4, 0.8, 1.6, 3.2]
     assert [event["outcome"] for event in events] == [
+        "retrying",
+        "retrying",
         "retrying",
         "retrying",
         "retrying",
         "retrying",
         "exhausted",
     ]
-    assert events[-1]["max_attempts"] == 5
+    assert events[-1]["max_attempts"] == 7
 
 
 @pytest.mark.parametrize("args", [
@@ -254,9 +297,9 @@ def test_generic_contention_retry(tmp_path, args, check):
     )
     with pytest.raises(RuntimeError, match="^chainlink contention exhausted"):
         claims._run(*args, check=check)
-    assert len(calls) == 5
-    assert sleeps == [0.1, 0.2, 0.4, 0.8]
-    assert [p["outcome"] for _, p in events] == ["retrying"] * 4 + ["exhausted"]
+    assert len(calls) == 7
+    assert sleeps == [0.1, 0.2, 0.4, 0.8, 1.6, 3.2]
+    assert [p["outcome"] for _, p in events] == ["retrying"] * 6 + ["exhausted"]
     assert all(p["issue_id"] == (1602 if args[2] == "1602" else None) for _, p in events)
     assert all(p["resource"] == "chainlink_locks_worktree" for _, p in events)
     assert "git process" not in json.dumps(events)
@@ -292,34 +335,63 @@ def test_generic_unrelated_error_is_unchanged(tmp_path, after_contention):
     assert all(event["outcome"] != "succeeded" for event in events)
 
 
-@pytest.mark.parametrize("claim", [False, True])
-def test_independent_descriptor_excludes_invocations_and_bounds_wait(tmp_path, claim):
+@pytest.mark.parametrize("operation", ["claim", "read", "dispatch"])
+def test_independent_descriptor_excludes_invocations_and_bounds_wait(tmp_path, monkeypatch, operation):
     lock_path = tmp_path / "state" / "worklink" / "chainlink-claim.lock"
     lock_path.parent.mkdir(parents=True)
     calls, sleeps, prepared = [], [], []
+
+    def sleep(seconds):
+        sleeps.append(seconds)
+        assert len(sleeps) <= 6, "persistent contention exceeded the retry bound"
+        assert sum(sleeps) <= 6.3 + 1e-9
+
     claims = ChainlinkClaims(
         agent_id="worker", home_path=tmp_path,
-        runner=lambda args: calls.append(args) or completed(args), sleeper=sleeps.append,
+        runner=lambda args: calls.append(args) or completed(args), sleeper=sleep,
     )
     # A separately opened descriptor owns the real OS lock. An in-process
     # mutex cannot observe it, so that mutation would incorrectly run the CLI.
     with lock_path.open("a") as owner:
         fcntl.flock(owner.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-        if claim:
-            with pytest.raises(RuntimeError, match="contention exhausted"):
+        if operation == "claim":
+            with pytest.raises(_ChainlinkContentionExhausted, match="contention exhausted"):
                 claims._claim_lock_with_retry(
                     1602, home_path=tmp_path, before_claim=lambda: prepared.append(True),
                 )
-        else:
-            with pytest.raises(RuntimeError, match="contention exhausted"):
+        elif operation == "read":
+            with pytest.raises(_ChainlinkContentionExhausted, match="contention exhausted"):
                 claims._run("issue", "show", "1602")
+        else:
+            import mimir.worklink.orchestrator as orchestrator
+
+            events = []
+
+            async def run(self, issue_id, **kwargs):
+                return claims.claim_issue(issue_id)
+
+            monkeypatch.setattr(orchestrator.WorklinkRunner, "run", run)
+            monkeypatch.setattr(
+                orchestrator, "_log_event",
+                lambda event, **payload: events.append((event, payload)),
+            )
+            with pytest.raises(_ChainlinkContentionExhausted, match="contention exhausted"):
+                orchestrator.run_worklink(home=tmp_path, repo=tmp_path, issue_id=1602)
+            failure = next(payload for event, payload in events if event == "worklink_run_failed")
+            assert failure["attempt_consumed"] is False
+            assert failure["attempt"] is None
+            assert failure["terminal_error"] == (
+                "_ChainlinkContentionExhausted: chainlink contention exhausted (chainlink_locks_worktree)"
+            )
         assert calls == []
         assert prepared == []
-        assert sleeps == [0.1, 0.2, 0.4, 0.8]
+        assert sleeps == [0.1, 0.2, 0.4, 0.8, 1.6, 3.2]
     assert lock_path.exists()
     # Releasing the external owner lets the complete claim path run without
     # recursively acquiring its own non-reentrant flock.
-    assert claims.claim_issue(1602, before_claim=lambda: prepared.append(True)).claimed
+    result = claims.claim_issue(1602, before_claim=lambda: prepared.append(True))
+    assert result.claimed
+    assert result.record is not None and result.record.attempt == 1
     assert prepared == [True]
     assert len(calls) == 5
 

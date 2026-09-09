@@ -218,6 +218,8 @@ async def test_adopter_cannot_inherit_extra_path(tmp_path, monkeypatch, backend,
             return PreparedCommand(argv, dict(os.environ))
         monkeypatch.setattr(hosted, "prepare_command", prepare)
         monkeypatch.setattr(kernels, "prepare_command", prepare)
+        # The simulated backend must not validate against the host OS backend.
+        monkeypatch.setattr(hosted, "validate_scope", lambda **kw: None)
     approve = AsyncMock(return_value=True)
     provider = HostedHandsProvider(request_scope_permission=approve)
     connection = provider.connect("a", cwd)
