@@ -741,6 +741,7 @@ def test_stale_remote_head_raises_named_refusal_and_never_pushes(repo_tools) -> 
 
 def test_push_argv_has_only_bound_non_force_non_delete_branch_form(repo_tools) -> None:
     _origin, _source, scope, state, _tools = repo_tools
+    original_head = scope.observed_head_sha
     (state.checkout_lease.path / "push.txt").write_text("push me\n", encoding="utf-8")
     _tools.execute(GitCommit(("push.txt",), "push mutation"))
     calls: list[tuple[str, ...]] = []
@@ -754,7 +755,7 @@ def test_push_argv_has_only_bound_non_force_non_delete_branch_form(repo_tools) -
     assert RepoGitTools(state, runner=recording_runner).execute(GitPush()).ok
     pushed_head = _git(state.checkout_lease.path, "rev-parse", "HEAD")
     assert was_agent_push(
-        scope.canonical_repo, scope.pr_number, scope.observed_head_sha, pushed_head,
+        scope.canonical_repo, scope.pr_number, original_head, pushed_head,
     )
     push = next(argv for argv in calls if "push" in argv)
     assert push[-4:] == ("push", "--porcelain", scope.canonical_origin, f"HEAD:{scope.destination_ref}")
@@ -771,6 +772,26 @@ def test_push_argv_has_only_bound_non_force_non_delete_branch_form(repo_tools) -
     assert _git(Path(scope.canonical_origin), "rev-parse", scope.destination_ref) == _git(
         state.checkout_lease.path, "rev-parse", "HEAD",
     )
+
+
+@pytest.mark.parametrize("recreate_tools", [False, True])
+def test_turn_pushes_twice_as_fast_forwards(repo_tools, recreate_tools) -> None:
+    origin, _source, scope, state, tools = repo_tools
+    identity = {key: value for key, value in vars(scope).items() if key != "observed_head_sha"}
+    lease = state.checkout_lease
+    observations = []
+    for name in ("A", "B"):
+        (lease.path / name).write_text(name, encoding="utf-8")
+        tools.execute(GitCommit((name,), f"commit {name}"))
+        head = state.git_expected_head
+        assert tools.execute(GitPush()).ok
+        assert _git(origin, "rev-parse", scope.destination_ref) == head
+        observations.append((scope.observed_head_sha, lease.head_sha, head))
+        assert json.loads((lease.path / ".git/mimir-pr-checkout-lease.json").read_text())["head_sha"] == head
+        assert {key: value for key, value in vars(scope).items() if key != "observed_head_sha"} == identity
+        if recreate_tools:
+            tools = RepoGitTools(state)
+    assert all(scoped == recorded == published for scoped, recorded, published in observations)
 
 
 def _clean_rebase_tools(
@@ -807,6 +828,7 @@ def test_mergeability_rebase_push_uses_exact_head_lease_and_preserves_author(
     tmp_path: Path,
 ) -> None:
     origin, _source, scope, state = _clean_rebase_tools(tmp_path)
+    original_head = scope.observed_head_sha
     calls: list[tuple[str, ...]] = []
 
     def recording_runner(argv, *, env, timeout, output_limit):
@@ -818,7 +840,7 @@ def test_mergeability_rebase_push_uses_exact_head_lease_and_preserves_author(
     assert RepoGitTools(state, runner=recording_runner).execute(GitPush()).ok
     push = next(argv for argv in calls if "push" in argv)
     assert (
-        f"--force-with-lease={scope.destination_ref}:{scope.observed_head_sha}"
+        f"--force-with-lease={scope.destination_ref}:{original_head}"
         in push
     )
     assert _git(origin, "rev-parse", scope.destination_ref) == _git(
@@ -831,6 +853,7 @@ def test_changes_requested_rebase_push_uses_exact_head_lease(tmp_path: Path) -> 
     origin, _source, scope, state = _clean_rebase_tools(
         tmp_path, event_type="pr_changes_requested_stale",
     )
+    original_head = scope.observed_head_sha
     calls: list[tuple[str, ...]] = []
 
     def recording_runner(argv, *, env, timeout, output_limit):
@@ -842,7 +865,7 @@ def test_changes_requested_rebase_push_uses_exact_head_lease(tmp_path: Path) -> 
     assert RepoGitTools(state, runner=recording_runner).execute(GitPush()).ok
     push = next(argv for argv in calls if "push" in argv)
     assert (
-        f"--force-with-lease={scope.destination_ref}:{scope.observed_head_sha}"
+        f"--force-with-lease={scope.destination_ref}:{original_head}"
         in push
     )
     assert _git(origin, "rev-parse", scope.destination_ref) == _git(
@@ -947,6 +970,7 @@ def test_push_refuses_when_successful_command_leaves_remote_unchanged(repo_tools
     assert observed in str(refusal.value)
     assert f"local commit {expected} remains unpushed" in str(refusal.value)
     assert _git(origin, "rev-parse", scope.destination_ref) == observed
+    assert scope.observed_head_sha == lease.head_sha == observed
 
 
 def test_push_succeeds_if_remote_advances_on_top_before_verification(repo_tools) -> None:
@@ -974,7 +998,11 @@ def test_push_succeeds_if_remote_advances_on_top_before_verification(repo_tools)
 
     assert result.ok
     assert remote_head != expected
+    assert scope.observed_head_sha == lease.head_sha == expected
     assert _git(origin, "merge-base", "--is-ancestor", expected, remote_head) == ""
+    with pytest.raises(GitRefusal) as refusal:
+        RepoGitTools(state).execute(GitPush())
+    assert refusal.value.code == "stale_scope"
 
 
 @pytest.mark.parametrize("push_fails", [False, True])

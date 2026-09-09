@@ -197,6 +197,36 @@ def test_later_turn_reuses_same_pr_fast_forward_candidate(
     assert (resumed.path / "fix.txt").read_text(encoding="utf-8") == "same PR fix\n"
 
 
+def test_later_turn_refuses_same_pr_candidate_from_another_source_root(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _repo, scope = _repo_and_scope(tmp_path)
+    lease_root = tmp_path / "leases"
+    lease_root.mkdir()
+    earlier = create_pr_checkout_lease(
+        replace(scope, event_type="pr_review_requested"),
+        owner=scope.principal, lease_root=lease_root,
+    )
+    other_source = tmp_path / "other-source"
+    other_source.mkdir()
+    metadata_path = earlier.path / ".git/mimir-pr-checkout-lease.json"
+    metadata = json.loads(metadata_path.read_text())
+    metadata["source_root"] = str(other_source)
+    metadata_path.write_text(json.dumps(metadata))
+    original_metadata = metadata_path.read_bytes()
+    monkeypatch.setattr(
+        "mimir.pr_checkout_lease._observe_current_pr_head",
+        lambda _scope: scope.observed_head_sha,
+    )
+
+    with pytest.raises(RuntimeError, match="include another scope"):
+        acquire_pr_checkout_lease(scope, owner=scope.principal, lease_root=lease_root)
+
+    assert earlier.path.is_dir()
+    assert metadata_path.read_bytes() == original_metadata
+
+
 def test_later_turn_reuses_patch_identical_rebased_candidate(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -768,9 +798,11 @@ def test_acquire_releases_clean_superseded_scope_and_records_observed_heads(
     )]
 
 
-def test_acquire_releases_published_head_after_metadata_head(
+@pytest.mark.parametrize("unpublished", [False, True])
+def test_acquire_reuses_published_head_after_stale_metadata_head(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    unpublished: bool,
 ) -> None:
     _repo, old_scope = _repo_and_scope(tmp_path)
     lease_root = tmp_path / "leases"
@@ -783,6 +815,12 @@ def test_acquire_releases_published_head_after_metadata_head(
     _git(old_lease.path, "commit", "-q", "-m", "published commit")
     published = _git(old_lease.path, "rev-parse", "HEAD")
     _git(old_lease.path, "push", "-q", "origin", f"HEAD:{old_scope.destination_ref}")
+    _git(old_lease.path, "update-ref", "refs/mimir/pr-checkout-lease/published", published)
+    if unpublished:
+        (old_lease.path / "unpublished.txt").write_text("unpublished B\n", encoding="utf-8")
+        _git(old_lease.path, "add", "unpublished.txt")
+        _git(old_lease.path, "commit", "-q", "-m", "unpublished B")
+    retained_head = _git(old_lease.path, "rev-parse", "HEAD")
     fresh_scope = replace(
         old_scope, observed_head_sha=published, provenance="server_discovered",
     )
@@ -791,14 +829,89 @@ def test_acquire_releases_published_head_after_metadata_head(
         lambda _scope: fresh_scope.observed_head_sha,
     )
 
+    def runner(args):
+        assert "clone" not in args
+        assert "bundle" not in args
+        return subprocess.run(args, capture_output=True, text=True, check=False)
+
+    state = RepoReviewState(fresh_scope)
     fresh_lease, candidates = acquire_pr_checkout_lease(
         fresh_scope, owner=fresh_scope.principal, lease_root=lease_root,
+        review_state=state, runner=runner,
     )
 
-    assert candidates == ()
-    assert not old_lease.path.exists()
-    assert fresh_lease.path.is_dir()
+    assert candidates == ((retained_head,) if unpublished else ())
+    assert fresh_lease.path == old_lease.path
+    assert fresh_lease.head_sha == published
+    assert fresh_lease.scope_id == fresh_scope.scope_id
+    assert state.git_expected_head == retained_head
+    metadata = json.loads((fresh_lease.path / ".git/mimir-pr-checkout-lease.json").read_text())
+    assert metadata["head_sha"] == published
+    assert metadata["scope_id"] == fresh_scope.scope_id
+    assert _git(fresh_lease.path, "rev-parse", "HEAD") == retained_head
     assert not (lease_root / ".recovery").exists()
+
+
+@pytest.mark.parametrize("failure", [None, "fetch", "moved", "ancestry"])
+def test_acquire_fetches_missing_live_head_before_ancestry(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure: str | None,
+) -> None:
+    repo, scope = _repo_and_scope(tmp_path)
+    lease_root = tmp_path / "leases"
+    lease_root.mkdir()
+    lease = create_pr_checkout_lease(scope, owner=scope.principal, lease_root=lease_root)
+    fresh_scope = _advance_pr_head(repo, scope)
+    live_head = fresh_scope.observed_head_sha
+    assert subprocess.run(
+        ["git", "-C", str(lease.path), "cat-file", "-e", live_head],
+        capture_output=True, check=False,
+    ).returncode != 0
+    metadata_path = lease.path / ".git/mimir-pr-checkout-lease.json"
+    original_metadata = metadata_path.read_bytes()
+    monkeypatch.setattr(
+        "mimir.pr_checkout_lease._observe_current_pr_head", lambda _scope: live_head,
+    )
+    fetched = False
+    checked_ancestry = False
+
+    def runner(args):
+        nonlocal fetched, checked_ancestry
+        if str(lease.path) in args:
+            if "fetch" in args:
+                fetched = True
+                if failure == "fetch":
+                    return subprocess.CompletedProcess(args, 1, "", "fetch unavailable")
+            if "FETCH_HEAD^{commit}" in args and failure == "moved":
+                return subprocess.CompletedProcess(args, 0, "f" * 40, "")
+            if "--is-ancestor" in args and live_head in args:
+                assert fetched
+                checked_ancestry = True
+                if failure == "ancestry":
+                    return subprocess.CompletedProcess(args, 128, "", "ancestry unavailable")
+        if failure:
+            assert "clone" not in args
+            assert "bundle" not in args
+        return subprocess.run(args, capture_output=True, text=True, check=False)
+
+    if failure:
+        with pytest.raises(RuntimeError, match="unavailable|PR head advanced"):
+            acquire_pr_checkout_lease(
+                fresh_scope, owner=scope.principal, lease_root=lease_root, runner=runner,
+            )
+        assert lease.path.is_dir()
+        assert metadata_path.read_bytes() == original_metadata
+        assert not (lease_root / ".recovery").exists()
+    else:
+        fresh, candidates = acquire_pr_checkout_lease(
+            fresh_scope, owner=scope.principal, lease_root=lease_root, runner=runner,
+        )
+        assert checked_ancestry
+        assert fresh.path != lease.path
+        assert not lease.path.exists()
+        assert candidates == ()
+    assert fetched
 
 
 def test_acquire_releases_rebased_published_work_by_blob_identity(
@@ -840,6 +953,13 @@ def test_acquire_bundles_unpublished_superseded_work_and_releases_lease(
     )
 
     unpublished = _git(old_lease.path, "rev-parse", "HEAD")
+
+    def stale_patch_comparison(*args, **kwargs):
+        pytest.fail("stale recorded head must not authorize patch-equivalent reuse")
+
+    monkeypatch.setattr(
+        "mimir.pr_checkout_lease._patches_match_published_head", stale_patch_comparison,
+    )
 
     fresh_lease, candidates = acquire_pr_checkout_lease(
         fresh_scope, owner=fresh_scope.principal, lease_root=lease_root,

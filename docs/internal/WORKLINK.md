@@ -893,6 +893,16 @@ Current slice-1 recovery is manual:
   lets a later turn reacquire committed or uncommitted lease work. Force-push
   approval remains turn-scoped, so any permitted rewritten push must be approved
   and published by the same turn that holds the lease.
+- **Multiple pushes and cross-turn reuse:** a remediation turn may publish A and
+  continue with B in the same lease. A later turn reuses that checkout when the
+  live observed PR head is an ancestor of lease HEAD, even if recorded `head_sha`
+  predates A; rebinding updates `head_sha` to the current scoped publication.
+  Repository, origin, source root, owner, PR, destination, branch, and live-turn
+  identity guards still apply. Missing live head objects are fetched and verified
+  before ancestry classification; fetch or ancestry errors fail closed. Existing
+  patch-equivalent rebase reuse applies only when recorded and live heads agree,
+  never by comparing against a stale recorded head. Genuinely divergent stale
+  work is preserved in a verified recovery bundle before replacing its checkout.
 - **Stranded rebased PR lease:** do not reset or delete the checkout. Preserve its
   HEAD as a verified Git bundle under the lease root's `.recovery/` directory
   (and archive dirty worktree files), then have the operator inspect and publish
