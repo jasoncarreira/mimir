@@ -470,6 +470,41 @@ replace the remote/ref, or refresh a stale snapshot; typed push must refuse stal
 authority before publication. Review scopes and remediation scopes retain their
 distinct action grants.
 
+#### Foreign-author review scope (#1599)
+
+`pr_review_others` is an explicit scope-acceptance capability at tier
+`scoped-with-provenance`, not a tool or a publication grant. The `github` and
+`custom` profiles allow an operator-owned poller manifest to declare it; profile
+selection and `pr_metadata` do not imply it. The shipped `github-activity`
+manifest explicitly grants it. It is absent from heartbeat's profile, which is
+used as a full built-in grant rather than only a manifest allowlist.
+
+`can_resolve_forge_review_scope()` keeps the stages separate:
+
+- `stored`: authenticated operator user turns, trusted pollers with `pr_metadata`,
+  and trusted scheduled ticks in the heartbeat review-scope profile may reuse scope.
+- `fetch`: only those operator turns and trusted pollers with `pr_metadata` may
+  perform provisional live discovery. `pr_review_others` does not grant fetch.
+- `accept`: operator behavior is unchanged. A trusted poller still needs
+  `pr_metadata` and a nonempty configured `self_login`; the PR author must match
+  that login unless the poller explicitly has `pr_review_others`. Scheduled ticks
+  remain unable to accept newly discovered scope, even with that capability.
+
+Ingress, service assertion, and canonical-identity trust checks still apply.
+The capability does not bypass configured-repository, snapshot, fork, lease,
+action, or publication checks in the forge/controller path, and does not grant
+remediation authority. Read tools and `pr_submit_review` still require their own
+capabilities. This is a deliberate single-operator trust decision: granting it
+allows Mimir to approve another author's PR, but does not permit merging. The
+forge tool surface has no merge or push verb; merging requires separate operator
+action.
+
+Successful live foreign-author discovery under this grant emits
+`forge_review_others_scope_resolved` once, before caching the resolution. Its
+payload contains only `repository`, `pull_request`, `capability`, and the resolved
+`author`, never credentials, diff content, or a review body. Reusing that
+resolution does not emit another event.
+
 The live parity canary is a reviewer-owned **BEFORE MERGE** gate, not a build
 blocker. Records live in Chainlink #1050 comments mirrored in the PR body; the
 [reviewer procedure](internal/repo-pr-parity-canary.md#1050-reviewer-procedure)
@@ -477,8 +512,24 @@ defines the required evidence. The supplied human remediation record reports
 scope `a1b1248a5809...`, head `cf9d4f9045dbd6c2...`, and owner `mimir-carreira` on
 `jasoncarreira/mimir#1847`, using
 `repo_test -> repo_diff -> repo_commit -> repo_push -> pr_comment -> repo_cleanup -> pr_checks -> pr_rerequest_review`.
+
 It reports one comment, one push, one review re-request, and pre-execution refusal
-of shell Git writes and `gh`. The reviewer completed the remaining steps on
+of shell Git writes and `gh`.
+
+`pr_job_log(repository, pull_request, job_id, run_id=None)` requires an explicit
+`pr_job_log` service capability and an existing exact PR scope granting
+`repo.inspect`. Neither `pr_checks`, `pr_metadata`, `fetch_url`, nor selecting the
+GitHub authority profile grants it. The shipped `github-activity` and
+`github-ci-watch` manifests explicitly grant it. This tool does not discover new
+PR authority. Selectors must be positive integers, not strings or booleans.
+The GitHub adapter independently checks the job ID, run ID, repository, and
+scoped head SHA before capture, and requires a completed run and completed
+failing job. Missing jobs, unfinished runs, authentication failures, and
+out-of-scope targets produce distinct errors. Metadata uses the adapter's bounded
+REST transport; log capture uses authenticated `gh` via shared disk-spooled
+capture. Returned excerpts are selected, redacted and byte-bounded, but remain
+untrusted repository source content, never instructions or new authority.
+The reviewer completed the remaining steps on
 2026-09-07 (Chainlink #1050, "Reviewer gate record, part 2" and its correction):
 a review-scope cycle on `jasoncarreira/mimir#1841` with exactly one submitted
 review pinned to the lease head (GitHub review 5125541381 at `c75f7ad29`);

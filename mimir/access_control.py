@@ -336,6 +336,7 @@ _TOOL_FLOW_MAP: dict[str, ToolFlowDirection] = {
     "execute": ToolFlowDirection.BOTH,
     "aexecute": ToolFlowDirection.BOTH,
     "shell": ToolFlowDirection.BOTH,
+    "hands_request_scope": ToolFlowDirection.NEITHER,
     "hands_read": ToolFlowDirection.SOURCE,
     "hands_edit": ToolFlowDirection.BOTH,
     "hands_shell": ToolFlowDirection.BOTH,
@@ -354,6 +355,7 @@ _TOOL_FLOW_MAP: dict[str, ToolFlowDirection] = {
     "pr_files": ToolFlowDirection.SOURCE,
     "pr_diff": ToolFlowDirection.SOURCE,
     "pr_checks": ToolFlowDirection.SOURCE,
+    "pr_job_log": ToolFlowDirection.SOURCE,
     "pr_reviews": ToolFlowDirection.SOURCE,
     "pr_comments": ToolFlowDirection.SOURCE,
     "pr_review_requests": ToolFlowDirection.SOURCE,
@@ -408,111 +410,14 @@ class ResourceScope:
     sink_destinations: frozenset[str] = frozenset()
 
 
-CLIENT_FILE_RESOURCE_NAMESPACE = "client-file"
-_CLIENT_FILE_UNRESERVED = frozenset(
-    b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~"
-)
-
-
-def canonical_client_file_resource(path: object, cwd: object = None) -> str | None:
-    import posixpath
-
-    if not isinstance(path, str) or not path or "\x00" in path:
-        return None
-    if cwd is not None:
-        if (
-            not isinstance(cwd, str) or not cwd.startswith("/")
-            or "\x00" in cwd
-        ):
-            return None
-        try:
-            cwd.encode("utf-8")
-        except UnicodeEncodeError:
-            return None
-        # POSIX lexical confinement only; never resolve client-hosted symlinks.
-        path = posixpath.normpath("/" + posixpath.join(cwd, path).lstrip("/"))
-    try:
-        encoded = path.encode("utf-8")
-    except UnicodeEncodeError:
-        return None
-    identity = "".join(
-        chr(value) if value in _CLIENT_FILE_UNRESERVED else f"%{value:02X}"
-        for value in encoded
-    )
-    return f"{CLIENT_FILE_RESOURCE_NAMESPACE}:{identity}"
-
-
-def client_file_resource_path(resource: object) -> str | None:
-    """Decode a client resource once, accepting equivalent percent encodings."""
-    prefix = f"{CLIENT_FILE_RESOURCE_NAMESPACE}:"
-    if not isinstance(resource, str) or not resource.startswith(prefix):
-        return None
-    encoded_identity = resource[len(prefix):]
-    if not encoded_identity:
-        return None
-    decoded = bytearray()
-    index = 0
-    while index < len(encoded_identity):
-        value = encoded_identity[index]
-        if ord(value) in _CLIENT_FILE_UNRESERVED:
-            decoded.append(ord(value))
-            index += 1
-            continue
-        if (
-            value != "%"
-            or index + 2 >= len(encoded_identity)
-            or not re.fullmatch(r"[0-9A-Fa-f]{2}", encoded_identity[index + 1:index + 3])
-        ):
-            return None
-        decoded.append(int(encoded_identity[index + 1:index + 3], 16))
-        index += 3
-    try:
-        path = bytes(decoded).decode("utf-8")
-    except UnicodeDecodeError:
-        return None
-    return path if canonical_client_file_resource(path) is not None else None
-
-
-def client_file_resource_is_canonical(resource: object) -> bool:
-    path = client_file_resource_path(resource)
-    return path is not None and canonical_client_file_resource(path) == resource
-
-
-@dataclass(frozen=True)
-class ClientFileResourcePolicy:
-    namespace: str
-    grant: str
-
-    @classmethod
-    def for_cwd(cls, cwd: object) -> ClientFileResourcePolicy:
-        resource = (
-            canonical_client_file_resource(cwd, cwd="/")
-            if isinstance(cwd, str) and cwd.startswith("/") else None
-        )
-        path = client_file_resource_path(resource)
-        grant = canonical_client_file_resource(path.rstrip("/") + "/") if path else None
-        return cls(CLIENT_FILE_RESOURCE_NAMESPACE, f"{grant}*" if grant else "")
-
-    def allows(self, resource: object) -> bool:
-        if self.namespace != CLIENT_FILE_RESOURCE_NAMESPACE or not self.grant.endswith("*"):
-            return False
-        boundary = client_file_resource_path(self.grant[:-1])
-        path = client_file_resource_path(resource)
-        if not boundary or not boundary.startswith("/") or not boundary.endswith("/"):
-            return False
-        if not path or not path.startswith("/"):
-            return False
-        root = client_file_resource_path(canonical_client_file_resource(boundary, cwd="/"))
-        path = client_file_resource_path(canonical_client_file_resource(path, cwd="/"))
-        return root is not None and path is not None and (
-            path == root or path.startswith(root.rstrip("/") + "/")
-        )
-
-
-CLIENT_FILE_RESOURCE_POLICY = ClientFileResourcePolicy(
-    namespace=CLIENT_FILE_RESOURCE_NAMESPACE,
-    # Profile identity only. File grants must come from the bound session cwd.
-    grant="",
+# Re-export the established API from the stdlib leaf used by the local proxy.
+from .client_file_resources import (
+    CLIENT_FILE_RESOURCE_NAMESPACE,
+    CLIENT_FILE_RESOURCE_POLICY,
+    ClientFileResourcePolicy,
+    canonical_client_file_resource,
+    client_file_resource_is_canonical,
+    client_file_resource_path,
 )
 
 
@@ -615,9 +520,11 @@ TRIGGER_CAPABILITY_TIERS: dict[str, CapabilityTier] = {
     "pr_files": CapabilityTier.SCOPE_CONTAINED,
     "pr_diff": CapabilityTier.SCOPE_CONTAINED,
     "pr_checks": CapabilityTier.SCOPE_CONTAINED,
+    "pr_job_log": CapabilityTier.SCOPE_CONTAINED,
     "pr_reviews": CapabilityTier.SCOPE_CONTAINED,
     "pr_comments": CapabilityTier.SCOPE_CONTAINED,
     "pr_review_requests": CapabilityTier.SCOPE_CONTAINED,
+    "pr_review_others": CapabilityTier.SCOPED_WITH_PROVENANCE,
     "pr_submit_review": CapabilityTier.SCOPED_WITH_PROVENANCE,
     "pr_inline_review_comment": CapabilityTier.SCOPED_WITH_PROVENANCE,
     "pr_comment": CapabilityTier.SCOPED_WITH_PROVENANCE,
@@ -698,7 +605,7 @@ TRIGGER_AUTHORITY_PROFILES: dict[str, frozenset[str]] = {
         "pr_metadata", "pr_files", "pr_diff", "pr_checks", "pr_reviews",
         "pr_comments", "pr_review_requests", "pr_submit_review",
         "pr_inline_review_comment", "pr_comment", "pr_rerequest_review",
-        "pr_edit_body",
+        "pr_edit_body", "pr_review_others", "pr_job_log",
         "issue_comment",
         "unsupported_operation", "repo_checkout", "repo_cleanup", "repo_fetch",
         "repo_status", "repo_test", "repo_diff", "repo_unmerged", "repo_stage", "repo_commit",
@@ -1233,6 +1140,7 @@ _FORGE_TOOL_ACTIONS: dict[str, str | None] = {
     "pr_files": RepoPRAction.INSPECT.value,
     "pr_diff": RepoPRAction.INSPECT.value,
     "pr_checks": RepoPRAction.INSPECT.value,
+    "pr_job_log": RepoPRAction.INSPECT.value,
     "pr_reviews": RepoPRAction.INSPECT.value,
     "pr_comments": RepoPRAction.INSPECT.value,
     "pr_review_requests": RepoPRAction.INSPECT.value,
@@ -7611,6 +7519,7 @@ class OperationCatalog:
         "hands_edit",
         "hands_shell",
         "hands_python",
+        "hands_request_scope",
     })
 
     # Global rows from these operations contain protected identities,
@@ -8210,6 +8119,10 @@ def authorize_repo_pr_tool(
     in_scope = (
         scope is not None
         and not missing_actions
+        and (
+            tool_name != "pr_job_log"
+            or (service_principal is not None and service_principal.has_capability("pr_job_log"))
+        )
     )
     return ToolAuthorization(
         tool_name=tool_name,
@@ -8503,6 +8416,22 @@ class ToolRegistry:
         The ifc_labels parameter enables information flow control sink gate
         checks (chainlink #871).
         """
+        if tool_name == "hands_request_scope":
+            # This can only ask the editor for scope; it neither executes input
+            # nor grants IFC/host-execution authority. Never shadow-allow it.
+            from .tools.client_provider import client_scope_request_allowed
+
+            allowed = client_scope_request_allowed(auth_context, arguments)
+            return ToolAuthorization(
+                tool_name=tool_name,
+                decision=OperationDecision.ADMIN_REQUIRED,
+                allowed=allowed,
+                reason=None if allowed else "scope request requires an admitted admin ACP Hands principal",
+                required_tier=AccessTier.ADMIN,
+                enforcement_enabled=True,
+                would_block=not allowed,
+                flow_direction=ToolFlowDirection.NEITHER,
+            )
         if tool_name.startswith(MCPResourceAdapter._MCP_TOOL_PREFIX) and mcp_tool is not None:
             if ifc_labels is None and auth_context is not None:
                 ifc_labels = getattr(auth_context, "ifc_labels", None)
@@ -9076,6 +9005,7 @@ _PROTECTED_RESULT_DOMAINS: dict[str, str] = {
     "pr_files": "repository",
     "pr_diff": "repository",
     "pr_checks": "repository",
+    "pr_job_log": "repository",
     "pr_reviews": "repository",
     "pr_comments": "repository",
     "pr_review_requests": "repository",
@@ -9118,6 +9048,7 @@ _ACP_HANDS_RESULT_TOOLS = frozenset({
 # inference from flow direction.
 _NON_INGESTING_RESULT_TOOLS = frozenset({
     # Authorization/workflow actions return only server-created status.
+    "hands_request_scope",
     "approve_declassification",
     "clear_ingest_taint",
     "request_operator_approval",
@@ -9163,6 +9094,7 @@ _NON_INGESTING_RESULT_TOOLS = frozenset({
 })
 
 _REPOSITORY_RESULT_TOOLS = frozenset({
+    "pr_job_log",
     "pr_metadata", "pr_files", "pr_diff", "pr_checks", "pr_reviews",
     "pr_comments", "pr_review_requests", "repo_checkout", "repo_fetch",
     "repo_status", "repo_test", "repo_diff", "repo_unmerged",
@@ -9185,6 +9117,7 @@ _REPOSITORY_MUTATION_RESULT_TOOLS = frozenset({
 # result taint. MCP reads have equivalent adapter/resource parity checks in
 # MCPResourceAdapter.authorize_call.
 _READ_BACKEND_RESULT_TOOLS = frozenset({
+    "pr_job_log",
     "Read",
     "Glob",
     "Grep",
@@ -10953,8 +10886,8 @@ def can_resolve_forge_review_scope(
       discover any configured pull request.
     - Trusted ``poller`` services that were granted ``pr_metadata`` may reuse
       stored scope and provisionally fetch an open pull request. Acceptance
-      still requires the pull request to be authored by Mimir's configured
-      forge login.
+      still requires Mimir's configured forge login and either matching PR
+      authorship or an explicit ``pr_review_others`` capability.
     - Trusted ``scheduled_tick`` services in a review-scope authority profile
       may reuse scope previously discovered by the server, but may not perform
       new live discovery.
@@ -10996,7 +10929,10 @@ def can_resolve_forge_review_scope(
         return operator_user or (
             poller_service
             and bool(self_login)
-            and pr_author == self_login
+            and (
+                pr_author == self_login
+                or trusted_service.has_capability("pr_review_others")
+            )
         )
     raise ValueError(f"unknown forge review-scope resolution stage: {stage!r}")
 

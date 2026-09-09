@@ -16,6 +16,11 @@ from mimir.acp.proxy import ProxyRouter, _OutputWriter, run_router
 from mimir.acp.transport import close_writer, pump_stream
 
 
+async def _accept_unavailable_backend_risk_for_lifecycle(session_id: str) -> bool:
+    """Explicit test operator consent; available backends still must confine."""
+    return True
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("signum", [signal.SIGTERM, signal.SIGINT, signal.SIGHUP, None])
 @pytest.mark.parametrize("stage", ["read", "idle", "close", "failure", "read-failure", "drain-failure", "close-failure"])
@@ -514,6 +519,8 @@ def _assert_generation_empty(router: ProxyRouter) -> None:
     assert router._local_sessions == {}
     assert router._local_connections == {}
     assert router._daemon_tombstones == set()
+    assert router._execution_permissions == {}
+    assert router._execution_permission_tombstones == set()
     assert router._server_sessions == {}
     assert router._server_provider_sessions == {}
     assert router._connection_sessions == {}
@@ -759,6 +766,7 @@ async def test_proxy_generation_teardown_retires_hosted_ids_grants_calls_and_wor
             return None
 
     router = ProxyRouter(Writer(), Writer(), "secret")
+    router._provider._request_unconfined_permission = _accept_unavailable_backend_risk_for_lifecycle
     router._active_sessions.add("session")
     router._grants.add("session", "hands_python")
     router._server_sessions["server"] = "session"
@@ -775,7 +783,7 @@ async def test_proxy_generation_teardown_retires_hosted_ids_grants_calls_and_wor
         },
     )
     await router._provider.notification(connection_id, "notifications/initialized")
-    await router._provider._python_kernels.execute("session", tmp_path, "value = 1")
+    await router._provider.execute_python(router._provider._sessions["session"], "value = 1")
     worker = next(iter(router._provider._python_kernels._processes))
     shell_call = asyncio.create_task(
         router._provider.request(
@@ -836,6 +844,7 @@ async def test_daemon_eof_retires_generation_before_client_grace(
     client_writer = Writer()
     daemon_writer = Writer()
     router = ProxyRouter(client_writer, daemon_writer, "secret")
+    router._provider._request_unconfined_permission = _accept_unavailable_backend_risk_for_lifecycle
     router._active_sessions.add("session")
     router._grants.add("session", "hands_python")
     router._server_sessions["server"] = "session"
@@ -854,7 +863,7 @@ async def test_daemon_eof_retires_generation_before_client_grace(
         },
     )
     await router._provider.notification(connection_id, "notifications/initialized")
-    await router._provider._python_kernels.execute("session", tmp_path, "value = 1")
+    await router._provider.execute_python(router._provider._sessions["session"], "value = 1")
     worker = next(iter(router._provider._python_kernels._processes))
     await router.route_daemon({
         "jsonrpc": "2.0",

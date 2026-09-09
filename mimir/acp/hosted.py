@@ -9,6 +9,11 @@ import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+from collections.abc import Awaitable, Callable
+
+from .audit import safe_log_event
+from .confinement import prepare_command, ConfinementUnavailable, BackendUnavailable
+from .execution_scope import ExecutionScope, canonical_scope_path, MAX_SCOPE_REQUESTS, SCOPE_WARNING, UNCONFINED_WARNING
 
 from .hands_contract import (
     HandsContractError,
@@ -44,6 +49,12 @@ class HostedSession:
     session_id: str
     cwd: Path
     timeout_seconds: int = SHELL_TIMEOUT_SECONDS
+    scope: ExecutionScope = field(init=False)
+    kernel_id: str = field(default_factory=lambda: secrets.token_urlsafe(18))
+
+    def __post_init__(self) -> None:
+        self.cwd = self.cwd.resolve()
+        self.scope = ExecutionScope(self.cwd)
 
 
 @dataclass(slots=True)
@@ -80,7 +91,11 @@ def _resolved_path(session: HostedSession, value: str) -> Path:
 
 
 class HostedHandsProvider:
-    def __init__(self, timeout_seconds: int = SHELL_TIMEOUT_SECONDS) -> None:
+    def __init__(self, timeout_seconds: int = SHELL_TIMEOUT_SECONDS, *,
+                 request_scope_permission: Callable[[str, str], Awaitable[bool]] | None = None,
+                 request_unconfined_permission: Callable[[str], Awaitable[bool]] | None = None) -> None:
+        self._request_scope_permission = request_scope_permission
+        self._request_unconfined_permission = request_unconfined_permission
         if (
             isinstance(timeout_seconds, bool)
             or not isinstance(timeout_seconds, int)
@@ -92,19 +107,31 @@ class HostedHandsProvider:
         self._connections: dict[str, _Connection] = {}
         self._used_connection_ids: set[str] = set()
         self._processes: dict[asyncio.subprocess.Process, int] = {}
+        self._signalled_processes: set[asyncio.subprocess.Process] = set()
         self._provider_cancelled: set[asyncio.Task[Any]] = set()
         self._python_kernels = PythonKernelManager()
+        self._retirements: set[asyncio.Task[None]] = set()
         self._closed = False
 
     def bind_session(self, session_id: str, cwd: str | os.PathLike[str]) -> None:
         if not isinstance(session_id, str) or not session_id:
             raise ValueError("session_id must be a non-empty string")
+        self.revoke_session(session_id)
         self._sessions[session_id] = HostedSession(
             session_id, Path(os.path.abspath(cwd)), self._timeout_seconds
         )
 
     def revoke_session(self, session_id: str) -> None:
-        self._sessions.pop(session_id, None)
+        session = self._sessions.pop(session_id, None)
+        if session is not None:
+            session.scope.invalidate(close=True)
+            try:
+                loop = asyncio.get_running_loop()
+            except RuntimeError:
+                return  # No worker can be executing without its event loop.
+            task = loop.create_task(self._python_kernels.retire(session.kernel_id))
+            self._retirements.add(task)
+            task.add_done_callback(self._retirements.discard)
 
     def connect(
         self,
@@ -138,11 +165,21 @@ class HostedHandsProvider:
             if item.session.session_id == session_id
         )
         await asyncio.gather(*(self._cancel_calls(item) for item in session_connections))
-        await self._python_kernels.retire(session_id)
+        old_scope = connection.session.scope
+        old_scope.invalidate(close=True)
+        await self._python_kernels.retire(connection.session.kernel_id)
+        # Connection reset revokes grants, not final session rejection/budgets.
+        connection.session.scope = ExecutionScope(
+            connection.session.cwd, denied=set(old_scope.denied),
+            attempts=old_scope.attempts, risk_requested=old_scope.risk_requested,
+        )
         self._connections.pop(connection_id, None)
         return {}
 
     async def cancel_session(self, session_id: str) -> None:
+        session = self._sessions.get(session_id)
+        if session is not None:
+            session.scope.invalidate()
         await asyncio.gather(
             *(
                 self._cancel_calls(connection)
@@ -150,7 +187,8 @@ class HostedHandsProvider:
                 if connection.session.session_id == session_id
             )
         )
-        await self._python_kernels.retire(session_id)
+        if session is not None:
+            await self._python_kernels.retire(session.kernel_id)
 
     async def execute_python(
         self,
@@ -158,10 +196,18 @@ class HostedHandsProvider:
         code: str,
     ) -> dict[str, Any]:
         try:
-            return await self._python_kernels.execute(
-                session.session_id, session.cwd, code, session.timeout_seconds
-            )
-        except PythonKernelUnavailable as exc:
+            scope = session.scope
+            await self._ensure_execution_permission(session)
+            async with scope.execution_lock:
+                self._require_live_scope(session)
+                if session.scope is not scope or scope.closed:
+                    raise HostedMcpError(-32000, "Execution scope changed")
+                return await self._python_kernels.execute(
+                    session.kernel_id, session.cwd, code, session.timeout_seconds,
+                    approved_paths=tuple(scope.approved),
+                    allow_unconfined=scope.unconfined_approved,
+                )
+        except (PythonKernelUnavailable, ConfinementUnavailable) as exc:
             raise HostedMcpError(
                 -32000, f"hands_python kernel unavailable: {exc}"
             ) from None
@@ -170,6 +216,8 @@ class HostedHandsProvider:
         if self._closed:
             return
         self._closed = True
+        for session in self._sessions.values():
+            session.scope.invalidate(close=True)
         connections = tuple(self._connections.values())
         self._connections.clear()
         await asyncio.gather(*(self._cancel_calls(item) for item in connections))
@@ -179,6 +227,8 @@ class HostedHandsProvider:
                 for process, pgid in tuple(self._processes.items())
             )
         )
+        if self._retirements:
+            await asyncio.gather(*tuple(self._retirements))
         await self._python_kernels.close()
 
     def terminate_owned_children(self) -> None:
@@ -327,6 +377,8 @@ class HostedHandsProvider:
             arguments = validate_tool_arguments(name, params["arguments"])
         except HandsContractError:
             raise _invalid_params() from None
+        if name == "request_scope":
+            return await self.request_scope(session, arguments["path"])
         if name == "read":
             return await asyncio.to_thread(self._read, session, arguments["path"])
         if name == "edit":
@@ -400,22 +452,176 @@ class HostedHandsProvider:
                 except FileNotFoundError:
                     pass
 
-    async def _shell(self, session: HostedSession, command: str) -> dict[str, Any]:
-        timeout = session.timeout_seconds
+    def _require_live_scope(self, session: HostedSession) -> None:
+        if self._closed or session.scope.closed:
+            raise HostedMcpError(-32000, "Execution scope is closed")
+
+    async def request_scope(self, session: HostedSession, value: str) -> dict[str, Any]:
+        scope = session.scope
+        self._require_live_scope(session)
         try:
+            prepared = prepare_command(("/bin/true",), cwd=session.cwd,
+                                       approved_paths=tuple(scope.approved),
+                                       allow_unconfined=scope.unconfined_approved)
+            mode_message = (UNCONFINED_WARNING + " This is the next-execution policy; existing children retain their launch policy."
+                            if prepared.execution_mode == "unconfined"
+                            else "CONFINED: Next execution uses confinement; runtime read-only allowances also apply. Existing children retain their launch policy.")
+        except ConfinementUnavailable:
+            mode_message = "BLOCKED: Next execution requires a working confinement backend or separate operator risk acceptance. Existing children retain their launch policy."
+        if value == "":
+            return {"approved": True, "paths": scope.paths(), "message": mode_message}
+        if mode_message.startswith("UNCONFINED:"):
+            await safe_log_event("acp_permission_outcome", wrapper_name="hands_request_scope",
+                                 path="<unconfined>", outcome="denied", resource_resolvable=False)
+            return {"approved": False, "paths": scope.paths(), "message": UNCONFINED_WARNING + " Path grants cannot constrain unconfined execution."}
+        path: Path | None = None
+        approved = False
+        outcome = "denied"
+        message = "Scope denied"
+        try:
+            path = canonical_scope_path(value, session.cwd)
+            if scope.rejected(path):
+                message = "This scope was rejected for this session; do not retry."
+            elif scope.allows(path):
+                approved = True
+                outcome = "already_approved"
+                message = "Scope already approved; Python state unchanged."
+            elif scope.pending or scope.attempts >= MAX_SCOPE_REQUESTS:
+                message = "Scope request limit reached; no approval submitted."
+            elif self._request_scope_permission is None:
+                message = "Scope approval unavailable: no operator permission channel."
+            else:
+                scope.pending = True
+                scope.attempts += 1
+                generation = scope.generation
+                try:
+                    # Validate backend before asking; no unconfined fallback.
+                    prepare_command(("/bin/true",), cwd=session.cwd,
+                                    approved_paths=(*scope.approved, path))
+                    async with asyncio.timeout(60):
+                        answer = await self._request_scope_permission(session.session_id, str(path))
+                    async with scope.execution_lock:
+                        self._require_live_scope(session)
+                        if scope.closed or session.scope is not scope or generation != scope.generation:
+                            message = "Scope approval expired; access unchanged."
+                        elif answer is True:
+                            await self._python_kernels.retire(session.kernel_id)
+                            self._require_live_scope(session)
+                            if not scope.closed and session.scope is scope and generation == scope.generation:
+                                scope.approved.add(path)
+                                approved = True
+                                outcome = "approved"
+                                message = SCOPE_WARNING
+                        else:
+                            scope.denied.add(path)
+                            message = "Scope rejected for this session; do not retry."
+                finally:
+                    scope.pending = False
+        except asyncio.CancelledError:
+            outcome = "cancelled"
+            raise
+        except (ValueError, OSError, ConfinementUnavailable, TimeoutError) as exc:
+            message = f"Scope unavailable: {exc}"
+        finally:
+            await safe_log_event("acp_permission_outcome", wrapper_name="hands_request_scope",
+                                 path=str(path) if path is not None else "<invalid>",
+                                 outcome=outcome, resource_resolvable=path is not None)
+        return {"approved": approved, "paths": scope.paths(), "message": message}
+
+    async def _ensure_execution_permission(self, session: HostedSession) -> None:
+        """Ask only for a missing backend, never to bypass a policy/runtime error."""
+        self._require_live_scope(session)
+        scope = session.scope
+        try:
+            prepare_command(("/bin/true",), cwd=session.cwd,
+                            approved_paths=tuple(scope.approved))
+            return
+        except BackendUnavailable:
+            pass
+        if scope.unconfined_approved:
+            return
+        if scope.risk_pending or scope.risk_requested:
+            await safe_log_event("acp_permission_outcome", wrapper_name="hands_unconfined_execution",
+                                 path="<unconfined>", outcome="denied", resource_resolvable=False)
+            if scope.risk_pending:
+                message = "Unconfined execution is blocked while this session's risk approval is pending"
+            else:
+                message = ("Unconfined execution is blocked: this session's risk request is final "
+                           "and no active risk grant remains. Start or load a new session to request approval.")
+            raise HostedMcpError(-32000, message)
+        if self._request_unconfined_permission is None:
+            await safe_log_event("acp_permission_outcome", wrapper_name="hands_unconfined_execution",
+                                 path="<unconfined>", outcome="denied", resource_resolvable=False)
+            raise HostedMcpError(-32000, "Confinement unavailable; no operator risk approval channel. Execution blocked")
+        scope.risk_requested = True
+        scope.risk_pending = True
+        generation = scope.generation
+        outcome = "denied"
+        try:
+            async with asyncio.timeout(60):
+                answer = await self._request_unconfined_permission(session.session_id)
+            async with scope.execution_lock:
+                self._require_live_scope(session)
+                task = asyncio.current_task()
+                if (scope.closed or session.scope is not scope
+                        or scope.generation != generation or answer is not True
+                        or (task is not None and task.cancelling())):
+                    raise HostedMcpError(-32000, "Unconfined execution rejected or risk approval expired for this session")
+                # A newly available backend always wins; approval never bypasses
+                # a backend that is available but has a malformed profile.
+                try:
+                    prepare_command(("/bin/true",), cwd=session.cwd,
+                                    approved_paths=tuple(scope.approved))
+                except BackendUnavailable:
+                    await self._python_kernels.retire(session.kernel_id)
+                    self._require_live_scope(session)
+                    if scope.closed or session.scope is not scope or scope.generation != generation:
+                        raise HostedMcpError(-32000, "Risk approval expired")
+                    scope.unconfined_approved = True
+                    outcome = "approved"
+        except asyncio.CancelledError:
+            outcome = "cancelled"
+            raise
+        except TimeoutError:
+            raise HostedMcpError(-32000, "Unconfined risk approval timed out; execution blocked") from None
+        finally:
+            scope.risk_pending = False
+            await safe_log_event("acp_permission_outcome", wrapper_name="hands_unconfined_execution",
+                                 path="<unconfined>", outcome=outcome, resource_resolvable=False)
+
+    async def _shell(self, session: HostedSession, command: str) -> dict[str, Any]:
+        scope = session.scope
+        try:
+            await self._ensure_execution_permission(session)
+            async with scope.execution_lock:
+                self._require_live_scope(session)
+                if session.scope is not scope or scope.closed:
+                    raise HostedMcpError(-32000, "Execution scope changed")
+                return await self._confined_shell(session, command)
+        except ConfinementUnavailable as exc:
+            raise HostedMcpError(-32000, f"hands_shell unavailable: {exc}") from None
+
+    async def _confined_shell(self, session: HostedSession, command: str) -> dict[str, Any]:
+        timeout = session.timeout_seconds
+        startup_warning = ""
+        try:
+            prepared = prepare_command(("/bin/sh", "-c", command), cwd=session.cwd,
+                                       approved_paths=tuple(session.scope.approved),
+                                       allow_unconfined=session.scope.unconfined_approved)
+            if prepared.execution_mode == "unconfined":
+                startup_warning = UNCONFINED_WARNING + " "
             process = await asyncio.create_subprocess_exec(
-                "/bin/sh",
-                "-c",
-                command,
+                *prepared.argv,
                 cwd=session.cwd,
-                env=None,
+                env=prepared.env,
                 start_new_session=True,
+                stdin=asyncio.subprocess.DEVNULL,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )
-        except OSError as exc:
+        except (OSError, ConfinementUnavailable) as exc:
             raise HostedMcpError(
-                -32000, f"hands_shell unavailable: {exc}"
+                -32000, f"{startup_warning}hands_shell unavailable: {exc}"
             ) from None
         pgid = process.pid
         self._processes[process] = pgid
@@ -444,8 +650,14 @@ class HostedHandsProvider:
             await self._finish_readers(readers)
             raise
         finally:
-            self._processes.pop(process, None)
+            # A successful shell may leave background children in its group.
+            await self._terminate_process(process, pgid)
+            await self._finish_readers(readers)
         stderr_text = self._format_output(stderr_capture)
+        if prepared.execution_mode == "unconfined":
+            stderr_text = UNCONFINED_WARNING + "\n" + stderr_text
+        if prepared.execution_mode == "confined" and process.returncode and any(text in stderr_text.lower() for text in ("permission denied", "operation not permitted")):
+            stderr_text += "\n[Possible confinement refusal. Use hands_request_scope for the path shown above; empty path lists approved scopes.]"
         if timed_out:
             stderr_text += f"\n[timed out after {timeout} s]"
         return {
@@ -485,15 +697,24 @@ class HostedHandsProvider:
     async def _terminate_process(
         self, process: asyncio.subprocess.Process, pgid: int
     ) -> None:
-        try:
-            os.killpg(pgid, 9)
-        except (ProcessLookupError, PermissionError):
-            pass
+        if process not in self._signalled_processes:
+            try:
+                os.killpg(pgid, 9)
+            except (ProcessLookupError, PermissionError) as error:
+                # Tolerate cleanup races, but EPERM on a first signal to a live
+                # process is not proof of exit and must not enter an endless wait.
+                if isinstance(error, PermissionError) and process.returncode is None:
+                    raise
+            # Retain successful signaling across cancellation of process.wait().
+            # macOS can deny a second killpg while the killed leader has not yet
+            # been reaped and asyncio still reports returncode=None.
+            self._signalled_processes.add(process)
         try:
             await process.wait()
         except ProcessLookupError:
             pass
         self._processes.pop(process, None)
+        self._signalled_processes.discard(process)
 
     async def _cancel_calls(self, connection: _Connection) -> None:
         tasks = tuple(connection.calls.values())

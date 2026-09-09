@@ -56,6 +56,8 @@ async def test_terminate_process_killpg_error_still_reaps_and_untracks(
     provider = HostedHandsProvider()
     process = Mock(spec=asyncio.subprocess.Process)
     process.wait = AsyncMock(return_value=0)
+    # EPERM is tolerated for an exited leader, not an unsignalable live one.
+    process.returncode = 0
     pgid = 12345
     provider._processes[process] = pgid
     killpg = Mock(side_effect=error)
@@ -284,7 +286,7 @@ async def test_shell_uses_bin_sh_cwd_environment_and_bounded_streams(
         },
     )
     assert environment["structuredContent"] == {
-        "stdout": f"{tmp_path}\npresent",
+        "stdout": f"{tmp_path}\n",
         "stderr": "",
         "exitCode": 0,
     }
@@ -388,7 +390,7 @@ async def test_shell_and_python_default_timeout_is_60_seconds(
     observed: list[int | float] = []
 
     async def execute(
-        session_id: str, cwd: Path, code: str, timeout: int | float,
+        session_id: str, cwd: Path, code: str, timeout: int | float, **kwargs: object,
     ) -> dict[str, object]:
         observed.append(timeout)
         return {
@@ -437,7 +439,7 @@ async def test_timeout_comes_only_from_selected_profile(
     observed: list[int | float] = []
 
     async def execute(
-        session_id: str, cwd: Path, code: str, timeout: int | float,
+        session_id: str, cwd: Path, code: str, timeout: int | float, **kwargs: object,
     ) -> dict[str, object]:
         observed.append(timeout)
         return {
@@ -585,7 +587,7 @@ async def test_hosted_provider_owns_internal_session_kernels(tmp_path: Path) -> 
     assert reused["kernel"] == "reused"
     assert reused["value"] == "7"
     assert isolated["value"] == "None"
-    assert set(provider._python_kernels._sessions) == {"one", "two"}
+    assert set(provider._python_kernels._sessions) == {provider._sessions[key].kernel_id for key in ("one", "two")}
     await provider.close()
     assert provider._python_kernels._processes == {}
 
@@ -648,7 +650,7 @@ async def test_tools_list_is_exact_four_tool_profile_and_extra_tool_errors(
     listed = await provider.request(connection, "tools/list", {})
     assert listed == {"tools": hands_v1_wire_descriptors()}
     assert [descriptor["name"] for descriptor in listed["tools"]] == [
-        "read", "edit", "shell", "python"
+        "read", "edit", "shell", "python", "request_scope"
     ]
     with pytest.raises(HostedMcpError) as failure:
         await provider.request(
@@ -720,7 +722,7 @@ async def test_spawn_failure_returns_exact_mcp_error_without_structured_content(
 
     provider, connection = await _connected(tmp_path)
 
-    async def unavailable(*args: object) -> dict[str, object]:
+    async def unavailable(*args: object, **kwargs: object) -> dict[str, object]:
         raise PythonKernelUnavailable("spawn refused")
 
     monkeypatch.setattr(provider._python_kernels, "execute", unavailable)
@@ -735,4 +737,110 @@ async def test_spawn_failure_returns_exact_mcp_error_without_structured_content(
         "message": "hands_python kernel unavailable: spawn refused",
     }
     assert "structuredContent" not in failure.value.as_error()
+    await provider.close()
+
+
+@pytest.fixture(autouse=True)
+def _unit_backend_on_unsupported_platform(monkeypatch):
+    # These pre-existing lifecycle/unit tests exercise real subprocesses, not OS
+    # confinement. The dedicated scope/backend integration tests use Seatbelt.
+    if sys.platform != "darwin":
+        from mimir.acp.confinement import PreparedCommand
+        import mimir.acp.hosted as hosted_module
+        import mimir.acp.python_kernel as kernel_module
+        def prepare(argv, **kwargs):
+            env = dict(os.environ)
+            env.pop("MIMIR_KERNEL_TEST_ENV", None)
+            env.pop("MIMIR_HOSTED_SENTINEL", None)
+            return PreparedCommand(tuple(argv), env)
+        monkeypatch.setattr(hosted_module, "prepare_command", prepare)
+        monkeypatch.setattr(kernel_module, "prepare_command", prepare)
+
+
+@pytest.mark.asyncio
+async def test_shell_double_cancellation_reaps_without_signalling_killed_group_again(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from types import SimpleNamespace
+
+    running = asyncio.Event()
+    reaping = asyncio.Event()
+    signals: list[tuple[int, int]] = []
+
+    class Process:
+        pid = 12345
+        returncode: int | None = None
+
+        def __init__(self) -> None:
+            self.wait_count = 0
+            self.stdout = asyncio.StreamReader()
+            self.stderr = asyncio.StreamReader()
+            self.stdout.feed_eof()
+            self.stderr.feed_eof()
+
+        async def wait(self) -> int:
+            self.wait_count += 1
+            if self.wait_count == 1:
+                running.set()
+                await asyncio.Future()
+            if self.wait_count == 2:
+                reaping.set()
+                await asyncio.Future()
+            self.returncode = -9
+            return -9
+
+    process = Process()
+
+    async def spawn(*args: object, **kwargs: object) -> Process:
+        return process
+
+    def killpg(pgid: int, signal: int) -> None:
+        if signals:
+            # The killed macOS group can refuse a second signal before the
+            # subprocess watcher updates returncode. Never retry that signal.
+            raise PermissionError("already killed, not reaped")
+        signals.append((pgid, signal))
+
+    monkeypatch.setattr(hosted, "prepare_command", lambda *a, **kw: SimpleNamespace(argv=("sh",), env={}, execution_mode="confined"))
+    monkeypatch.setattr(hosted.asyncio, "create_subprocess_exec", spawn)
+    monkeypatch.setattr(hosted.os, "killpg", killpg)
+    provider = HostedHandsProvider()
+    provider.bind_session("session", tmp_path)
+    task = asyncio.create_task(provider._shell(provider._sessions["session"], "unused"))
+    try:
+        await asyncio.wait_for(running.wait(), 1)
+        task.cancel()  # proxy cancellation while the shell is running
+        await asyncio.wait_for(reaping.wait(), 1)
+        task.cancel()  # provider cancellation while process.wait() is reaping
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert signals == [(process.pid, 9)]
+        assert process.returncode == -9
+        assert provider._processes == {}
+        assert provider._signalled_processes == set()
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        await provider.close()
+
+
+@pytest.mark.asyncio
+async def test_first_live_process_signal_denial_is_not_hidden(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class Process:
+        returncode = None
+
+        async def wait(self) -> int:
+            pytest.fail("must not wait forever for an unsignalable live process")
+
+    def denied(*args: object) -> None:
+        raise PermissionError("not allowed")
+
+    monkeypatch.setattr(hosted.os, "killpg", denied)
+    provider = HostedHandsProvider()
+    process = Process()
+    with pytest.raises(PermissionError, match="not allowed"):
+        await provider._terminate_process(process, 12345)
+    assert provider._signalled_processes == set()
     await provider.close()

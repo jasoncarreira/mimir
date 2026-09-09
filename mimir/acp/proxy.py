@@ -29,6 +29,12 @@ MAX_OUTSTANDING_REQUESTS = 1024
 MAX_GENERATION_SERVER_IDS = 1024
 MAX_GENERATION_CONNECTION_IDS = 4096
 MAX_LIVE_CONNECTIONS = 1024
+SCOPE_PERMISSION_TIMEOUT_SECONDS = 60.0
+MAX_SCOPE_PERMISSION_REQUESTS = 1024
+MAX_UNCONFINED_PERMISSION_REQUESTS = 128
+_SCOPE_REQUEST_PREFIX = "mimir-scope:"
+_UNCONFINED_REQUEST_PREFIX = "mimir-unconfined:"
+
 
 PERMISSION_METHOD = "session/request_permission"
 PERMISSION_OPTIONS = [
@@ -196,6 +202,18 @@ class _PendingPermission:
 
 
 @dataclass(frozen=True, slots=True)
+class _PendingExecutionPermission:
+    purpose: str
+    session_id: str
+    provider_session_id: str
+    connection_id: str
+    owner_key: tuple[type[Any], Any]
+    owner_task: asyncio.Task[Any]
+    generation: object
+    completion: asyncio.Future[bool]
+
+
+@dataclass(frozen=True, slots=True)
 class _PendingExplicitConnect:
     owner: str | _PendingSession
     generation: object
@@ -334,7 +352,11 @@ class ProxyRouter:
     ) -> None:
         self._client = FrameWriter(client_writer, credential, inject_credential=False)
         self._daemon = FrameWriter(daemon_writer, credential)
-        self._provider = HostedHandsProvider(timeout_seconds)
+        self._provider = HostedHandsProvider(
+            timeout_seconds,
+            request_scope_permission=self._request_scope_permission,
+            request_unconfined_permission=self._request_unconfined_permission,
+        )
         self._generation = object()
         self._grants = PermissionGrantStore()
         self._active_sessions: set[str] = set()
@@ -345,6 +367,10 @@ class ProxyRouter:
         self._local_requests: dict[tuple[type[Any], Any], asyncio.Task[None] | None] = {}
         self._local_sessions: dict[tuple[type[Any], Any], str] = {}
         self._daemon_tombstones: set[tuple[type[Any], Any]] = set()
+        self._execution_permissions: dict[tuple[type[Any], Any], _PendingExecutionPermission] = {}
+        self._execution_permission_tombstones: set[tuple[type[Any], Any]] = set()
+        self._scope_request_count = 0
+        self._unconfined_request_count = 0
         self._server_sessions: dict[str, str] = {}
         self._server_provider_sessions: dict[str, str] = {}
         self._connection_sessions: dict[str, str] = {}
@@ -379,6 +405,19 @@ class ProxyRouter:
         kind = _message_kind(message)
         if kind == "response":
             key = _request_key(message["id"])
+            scope_permission = self._execution_permissions.get(key)
+            if scope_permission is not None:
+                try:
+                    approved = _permission_response_decision(message) == "allow_session"
+                except ProxyError:
+                    approved = False
+                if not scope_permission.completion.done():
+                    scope_permission.completion.set_result(
+                        approved and self._execution_permission_is_current(scope_permission)
+                    )
+                return
+            if key in self._execution_permission_tombstones:
+                return
             if key in self._daemon_tombstones:
                 return
             if key not in self._daemon_requests:
@@ -500,6 +539,138 @@ class ProxyRouter:
                     )
         await self._write_client(message, raw)
 
+    def _execution_permission_is_current(self, pending: _PendingExecutionPermission) -> bool:
+        return (
+            not self._closed
+            and not self._generation_failed
+            and pending.generation is self._generation
+            and pending.session_id in self._active_sessions
+            and self._connection_sessions.get(pending.connection_id) == pending.session_id
+            and self._connection_provider_sessions.get(pending.connection_id)
+            == pending.provider_session_id
+            and self._local_requests.get(pending.owner_key) is pending.owner_task
+            and pending.owner_key not in self._daemon_tombstones
+            and not pending.owner_task.cancelling()
+        )
+
+    async def _request_scope_permission(self, provider_session_id: str, path: str) -> bool:
+        return await self._request_execution_permission(provider_session_id, path=path)
+
+    async def _request_unconfined_permission(self, provider_session_id: str) -> bool:
+        return await self._request_execution_permission(provider_session_id, path=None)
+
+    async def _request_execution_permission(
+        self, provider_session_id: str, *, path: str | None,
+    ) -> bool:
+        """Ask the operator for one distinct scope or unavailable-backend risk.
+
+        Only a live hosted tools/call task may ask. The provider owns path
+        canonicalization, backend eligibility, final denials, session grants,
+        and the approval audit. Neither flow consults reusable wrapper grants.
+        """
+        task = asyncio.current_task()
+        owner_key = next(
+            (key for key, owner in self._local_requests.items() if owner is task), None
+        )
+        if owner_key is None or task is None:
+            return False
+        connection_id = self._local_connections.get(owner_key)
+        session_id = self._local_sessions.get(owner_key)
+        if connection_id is None or session_id is None:
+            return False
+        unconfined = path is None
+        purpose = "unconfined" if unconfined else "scope"
+        if (
+            (unconfined and self._unconfined_request_count >= MAX_UNCONFINED_PERMISSION_REQUESTS)
+            or (not unconfined and self._scope_request_count >= MAX_SCOPE_PERMISSION_REQUESTS)
+            or len(self._execution_permissions) + len(self._daemon_requests)
+            + len(self._local_requests) >= MAX_OUTSTANDING_REQUESTS
+            or any(item.session_id == session_id for item in self._execution_permissions.values())
+        ):
+            return False
+        pending = _PendingExecutionPermission(
+            purpose, session_id, provider_session_id, connection_id, owner_key, task,
+            self._generation, asyncio.get_running_loop().create_future(),
+        )
+        if not self._execution_permission_is_current(pending):
+            return False
+        if unconfined:
+            self._unconfined_request_count += 1
+            request_id = f"{_UNCONFINED_REQUEST_PREFIX}{self._unconfined_request_count}"
+        else:
+            self._scope_request_count += 1
+            request_id = f"{_SCOPE_REQUEST_PREFIX}{self._scope_request_count}"
+        key = _request_key(request_id)
+        self._execution_permissions[key] = pending
+        # No model-controlled command, code, reason, or backend error is sent.
+        title = (
+            "Confinement is unavailable. Allow UNCONFINED hands_shell and hands_python "
+            "with the local proxy user's unrestricted filesystem permissions? "
+            "The cwd and path-scope grants do NOT protect files in this mode. "
+            "Acceptance restarts any existing Python kernel and loses variables/imports. "
+            "It is for this session only, is not persisted, and is separate "
+            "from tool permissions and taint acknowledgement. Rejection is final "
+            "for this session."
+            if unconfined else
+            "Allow read/write access to this exact path for this session? "
+            "Extra directory paths do not include their children. "
+            "Approval restarts the Python kernel and loses all REPL state."
+        )
+        params = {
+            "sessionId": session_id,
+            "toolCall": {
+                "toolCallId": request_id,
+                "title": title,
+                "kind": "other",
+                "status": "pending",
+                "rawInput": {} if unconfined else {"path": path},
+            },
+            "options": [
+                {
+                    "optionId": "allow_session",
+                    "name": (
+                        "Accept unconfined execution for this session"
+                        if unconfined else "Allow this exact path for this session"
+                    ),
+                    "kind": "allow_always",
+                },
+                {
+                    "optionId": "reject_once",
+                    "name": (
+                        "Reject unconfined execution for this session"
+                        if unconfined else "Reject this path for this session"
+                    ),
+                    "kind": "reject_once",
+                },
+            ],
+            "_meta": {
+                "mimir.unconfined_execution" if unconfined else "mimir.execution_scope": True,
+            },
+        }
+        try:
+            async with asyncio.timeout(SCOPE_PERMISSION_TIMEOUT_SECONDS):
+                await self._write_client({
+                    "jsonrpc": "2.0", "id": request_id,
+                    "method": PERMISSION_METHOD, "params": params,
+                })
+                approved = await pending.completion
+            return approved and self._execution_permission_is_current(pending)
+        except TimeoutError:
+            return False
+        finally:
+            self._execution_permissions.pop(key, None)
+            # Counts bound the separate ID spaces, including completed requests.
+            # Duplicate/late answers must never reach the daemon or another grant.
+            self._execution_permission_tombstones.add(key)
+            if not pending.completion.done():
+                pending.completion.cancel()
+
+    def _cancel_execution_permissions(self, session_id: str | None = None) -> None:
+        for pending in tuple(self._execution_permissions.values()):
+            if session_id is None or pending.session_id == session_id:
+                if not pending.completion.done():
+                    pending.completion.set_result(False)
+
     async def wait_failed(self) -> BaseException:
         return await self._failure
 
@@ -512,6 +683,7 @@ class ProxyRouter:
             if self._close_complete:
                 return
             self._closed = True
+            self._cancel_execution_permissions()
             current = asyncio.current_task()
             routes = tuple(task for task in self._client_routes if task is not current)
             for task in routes:
@@ -541,6 +713,8 @@ class ProxyRouter:
             self._used_server_ids.clear()
             self._used_connection_ids.clear()
             self._daemon_tombstones.clear()
+            self._execution_permissions.clear()
+            self._execution_permission_tombstones.clear()
             self._close_complete = True
 
     def terminate_owned_children(self) -> None:
@@ -558,7 +732,8 @@ class ProxyRouter:
 
     def _register_daemon(self, key: tuple[type[Any], Any]) -> None:
         if (
-            key in self._daemon_requests
+            (isinstance(key[1], str) and key[1].startswith((_SCOPE_REQUEST_PREFIX, _UNCONFINED_REQUEST_PREFIX)))
+            or key in self._daemon_requests
             or key in self._local_requests
             or key in self._daemon_tombstones
             or len(self._daemon_requests) + len(self._local_requests) >= MAX_OUTSTANDING_REQUESTS
@@ -673,6 +848,7 @@ class ProxyRouter:
 
     async def _retire_session(self, session_id: str) -> None:
         self._active_sessions.discard(session_id)
+        self._cancel_execution_permissions(session_id)
         self._grants.revoke_session(session_id)
         for key, permission in tuple(self._daemon_requests.items()):
             if permission is not None and permission.session_id == session_id:
@@ -812,7 +988,8 @@ class ProxyRouter:
 
     def _register_local(self, key: tuple[type[Any], Any]) -> None:
         if (
-            key in self._daemon_requests
+            (isinstance(key[1], str) and key[1].startswith((_SCOPE_REQUEST_PREFIX, _UNCONFINED_REQUEST_PREFIX)))
+            or key in self._daemon_requests
             or key in self._local_requests
             or key in self._daemon_tombstones
             or len(self._daemon_requests) + len(self._local_requests) >= MAX_OUTSTANDING_REQUESTS
@@ -873,6 +1050,8 @@ class ProxyRouter:
     def _cancel_local_requests(
         self, *, session_id: str | None = None, connection_id: str | None = None
     ) -> None:
+        if session_id is not None:
+            self._cancel_execution_permissions(session_id)
         for key, task in tuple(self._local_requests.items()):
             if task is None:
                 continue
@@ -900,6 +1079,7 @@ class ProxyRouter:
         if self._failure.done() or self._generation_cleanup_task is not None:
             return
         self._generation_failed = True
+        self._cancel_execution_permissions()
         self._grants.clear()
         self._active_sessions.clear()
         for task in tuple(self._local_requests.values()):

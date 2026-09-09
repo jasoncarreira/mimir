@@ -15,6 +15,7 @@ from typing import Any
 from langchain.tools import ToolRuntime
 from langchain_core.tools import StructuredTool, ToolException, tool
 from langchain_core.tools.base import create_schema_from_function
+from pydantic import StrictInt
 
 from ..forge import ForgeClient, ForgeError, IssueTarget, ReviewVerdict
 from ..redaction import redact_text
@@ -344,7 +345,10 @@ def resolve_review_state_for_context(
         scope_refusal = (
             "pull-request operation rejected: requested "
             f"repository={json.dumps(repository)}, pull_request={pull_request}; "
-            "live scope discovery requires an authenticated operator user turn"
+            "live scope discovery requires an authenticated operator user turn or a "
+            "trusted poller with pr_metadata and a configured MIMIR_GITHUB_SELF_LOGIN; "
+            "reviewing another author's pull request also requires an explicit "
+            "pr_review_others capability grant"
         )
         if stored_scope is not None:
             scope_refusal += "; head advanced; discovery not permitted for this turn"
@@ -379,6 +383,19 @@ def resolve_review_state_for_context(
             "pull-request operation rejected: live pull request is closed or invalid"
         ))
     state = RepoReviewState(scope)
+    if snapshot.author != self_login:
+        from ..access_control import get_trusted_service_from_auth_context
+        from ..event_logger import log_event_sync
+
+        service = get_trusted_service_from_auth_context(context)
+        if service is not None and service.has_capability("pr_review_others"):
+            log_event_sync(
+                "forge_review_others_scope_resolved",
+                repository=scope.canonical_repo,
+                pull_request=scope.pr_number,
+                capability="pr_review_others",
+                author=snapshot.author,
+            )
     store = getattr(context, "server_discovered_pr_scope_store", None)
     if isinstance(store, ServerDiscoveredPRScopeStore):
         store.remember_server_discovery(scope)
@@ -620,6 +637,37 @@ def pr_checks(
     """List bounded check projections for the bound pull request head."""
     scope = _scope(runtime, repository, pull_request)
     return [asdict(item) for item in _call(lambda: _client(scope).list_checks(scope))]
+
+
+@tool
+def pr_job_log(
+    repository: str,
+    pull_request: StrictInt,
+    job_id: StrictInt,
+    run_id: StrictInt | None = None,
+    runtime: ToolRuntime[AuthContext] = None,  # type: ignore[assignment]
+) -> str:
+    """Read an untrusted, redacted bounded excerpt from one scoped failing CI job."""
+    _repository(repository)
+    for name, value in (("pull_request", pull_request), ("job_id", job_id), ("run_id", run_id)):
+        if name == "run_id" and value is None:
+            continue
+        if type(value) is not int or value < 1:
+            raise ToolPolicyRefusal(f"{name} must be a positive integer")
+    context = getattr(runtime, "context", None)
+    state = None
+    for inventory in (
+        getattr(context, "server_discovered_pr_states", None),
+        getattr(context, "repo_pr_scope_registry", None),
+    ):
+        if isinstance(inventory, (ServerDiscoveredPRStates, RepoPRScopeRegistry)):
+            state = inventory.resolve(repository, pull_request)
+            if state is not None:
+                break
+    if state is None:
+        raise ToolPolicyRefusal("job log rejected: pull request is outside this turn's scope")
+    scope = state.action_scope
+    return _call(lambda: _client(scope).get_job_log(scope, job_id, run_id))
 
 
 @tool
@@ -908,6 +956,7 @@ FORGE_TOOLS = tuple(_bind_injected_runtime(forge_tool) for forge_tool in (
     pr_files,
     pr_diff,
     pr_checks,
+    pr_job_log,
     pr_reviews,
     pr_comments,
     pr_review_requests,
