@@ -1,5 +1,42 @@
 # ACP client
 
+## Experimental status
+
+**ACP and Hands are experimental in 0.9.0.** Do not depend on them for
+multi-client access, filesystem sandboxing, or durable Python state. Current
+operator-visible limits are:
+
+- **One client at a time per daemon home.** A second connection is refused with
+  `An ACP client is already connected`. A stray `mimir acp` process can hold the
+  slot and is a common cause of a client reporting a launch failure. Close the
+  previous client and stop its leftover proxy before retrying; do not start
+  another proxy as a connectivity test while a client is attached.
+- **File confinement is lexical, not a sandbox.** `hands_read` and `hands_edit`
+  reject paths outside the session cwd, but follow in-cwd symlinks even when
+  their targets are outside it. Select a trusted project directory and inspect
+  its symlinks before granting access.
+- **Execution is not filesystem-confined.** `hands_shell` runs `/bin/sh -c` and
+  `hands_python` runs a Python REPL. Both start with the session cwd, but the
+  whole filesystem remains reachable subject to the client user's OS permissions.
+  Review execution permission requests and use separate OS-level confinement
+  if needed. Execution confinement is tracked by Chainlink #1593, not shipped.
+- **Python state is temporary.** Closing the client or restarting its proxy loses
+  the REPL namespace; loading the daemon transcript does not recover it. Save
+  needed results explicitly and rerun initialization after reconnecting.
+  Chainlink #1594 tracks project-path-keyed reuse within one live proxy; the
+  current implementation is session-keyed, and that planned reuse is not
+  persistence across client closure or proxy restart.
+- **ACP is admin-only.** Its authenticated admin identity skips non-admin
+  protected-read filtering. Validate a read-policy change using a non-admin
+  identity on a non-ACP surface, not through an ACP client.
+- **ACP enforces authorization.** `mimir/acp/agent.py` deliberately sets
+  `enforce=True` as an enforced canary. It is currently the only surface with
+  that unconditional override; other surfaces record shadow decisions under
+  the shipped default unless global enforcement is explicitly enabled. When
+  a refusal appears only in ACP, inspect the authorization decision rather
+  than assuming the client is broken. Admin status and client permission do
+  not bypass information-flow controls. See the [authorization reference](authorization.md).
+
 ## Architecture and daemon
 
 Mimir ACP uses this topology:
@@ -42,8 +79,14 @@ Profiles contain only non-secret target, home, socket, SSH identity, and executi
 On the server, issue the existing named admin web credential:
 
 ```sh
-mimir identities issue-key --home /absolute/server/mimir-home CANONICAL --admin
+mimir identities issue-key --home /absolute/server/mimir-home CANONICAL --admin --label CLIENT_NAME
 ```
+
+Web keys are multiple-per-identity. Issuing a key is additive and does not
+invalidate existing keys; use a distinct label for each client. For an existing
+admin identity, `mimir identities issue-key CANONICAL --label CLIENT_NAME`
+preserves its roles (select the server home with `--home` when needed).
+See [web keys](credentials.md#named-web-keys) for selective revocation.
 
 On the client, run `mimir acp credential add PROFILE`. Enrollment reads the value without echo from a controlling TTY, not stdin. The raw key exists only in the client's native OS credential store under service `mimir.acp`; the server stores only its hash. There is no plaintext or third-party fallback, and enrollment fails if no secure backend exists. If the native store raises after a credential mutation was dispatched, the command exits 3 with `credential-mutation-uncertain`; inspect the native store before retrying. Other validation, profile, secure-store selection, read, and TTY failures exit 1. The raw key must never appear as an SSH password, in `sshpass` or PAM reuse, argv, an environment variable, editor JSON, profile JSON, or registry data. `MIMIR_API_KEY` supplies transport/route authority and is not the ACP principal key.
 
@@ -51,7 +94,9 @@ A stock client sends `authenticate` with only `methodId`. The proxy injects proo
 
 Validate enrollment by launching `mimir acp --profile PROFILE` from a stock client and completing its ordinary `authenticate` exchange. There is no `credential validate` command or pre-activation validation protocol.
 
-Rotate in this exact order:
+For an explicit all-key rotation, use this exact order. Unlike additive issuance,
+`--rotate-only` invalidates **all** existing web keys for the identity, including
+other clients' keys; arrange to replace credentials on every affected client:
 
 1. On the server, run `mimir identities issue-key --home /absolute/server/mimir-home CANONICAL --rotate-only`. It immediately invalidates the old key and prints the new key once.
 2. On the client, run `mimir acp credential replace PROFILE` and enter the new value.
@@ -154,7 +199,7 @@ Upstream publishes this schema **only** from a moving `latest` path. Versioned C
 
 ## Connections, sessions, and replay
 
-There is one active ACP connection per `MIMIR_HOME`. Only a newly authenticated connection can supersede the prior generation; failed or partial authentication cannot evict the active client. Reconnection creates a new authentication and generation boundary. Session IDs are owner-bound UUIDv4 values, and reconnection resumes them through `session/load`; provider, permission, and MCP request identities are fresh.
+There is one active ACP connection per `MIMIR_HOME`. The daemon refuses a second connection with `An ACP client is already connected`; release the old connection before reconnecting. Only a newly authenticated connection can supersede the prior generation at the authentication boundary; failed or partial authentication cannot evict the active client. This is not permission for a second simultaneous client to take over: the daemon's admission fence runs first. Reconnection creates a new authentication and generation boundary. Session IDs are owner-bound UUIDv4 values, and reconnection resumes them through `session/load`; provider, permission, and MCP request identities are fresh.
 
 The journal has a default seven-day TTL and a 64 MiB limit. Before replay, Mimir revalidates the provider. A load replays every durably prepared `session/update` with its original sequence, including records already sent. Clients must tolerate duplicates. Replay never re-executes effects. Pending requests and frames are not replayed, external effects are not exactly-once, and cancellation does not roll back completed effects.
 
@@ -162,7 +207,22 @@ Transport death cancels and quarantines only that ACP generation. The daemon, we
 
 ## Providers, permissions, and filesystems
 
-When `mcpServers` is missing or empty, the local proxy injects one locally hosted MCP-over-ACP provider named `mimir-hands`. An explicit nonempty provider collection is preserved. The `mimir.hands.v1` profile contains exactly `read`, `edit`, `shell`, and `python`; it is validated afresh on session new, session load, and provider-list change. Read is prompt-free. Edit, shell, and Python require exact-call operator permission immediately before execution. `allow_session` creates only an in-memory proxy grant for that session and tool, and a tainted call always prompts again. Grants never create daemon authority and are revoked on load, disconnect, generation replacement, or proxy exit.
+When `mcpServers` is missing or empty, the local proxy injects one locally hosted MCP-over-ACP provider named `mimir-hands`. An explicit nonempty provider collection is preserved. The `mimir.hands.v1` profile contains exactly `read`, `edit`, `shell`, and `python`; it is validated afresh on session new, session load, and provider-list change. Read is prompt-free. Edit, shell, and Python require exact-call operator permission immediately before execution. `allow_session` creates only an in-memory proxy grant for that session and tool, and a tainted call always prompts again unless an admin has acknowledged the current ingest snapshot with `clear_ingest_taint`. Grants never create daemon authority and are revoked on load, disconnect, generation replacement, or proxy exit.
+
+An authenticated, non-service admin on a live user turn can ask Mimir to call
+`clear_ingest_taint`. It durably audits and acknowledges only the current ingest
+snapshot for the ACP permission prompt, allowing an existing session grant to
+apply again. It does **not** clear source labels, declassify data, grant execution
+permission, or change sink and durable-memory decisions. Later untrusted active
+ingest, including rereading the same source, re-arms the prompt. See
+[ingest acknowledgement](authorization.md#ingest-acknowledgement) for eligibility
+and audit failure behavior.
+
+**Behavior change in 0.9.0:** the previous `client-file:*` grant permitted
+Hands file access to any path on the operator's machine that the client user
+could access. The grant now comes from the session cwd. If an old workflow
+receives an outside-cwd refusal, open a session rooted at the intended project;
+do not rely on a symlink escape as isolation.
 
 Native Mimir tools operate on the daemon host. Mimir Hands operates with the local client's user authority. `hands_read` and `hands_edit` are confined to the session's bound `cwd`: relative paths are normalized against it, and absolute paths outside it (including sibling directories) are refused. This is lexical path confinement only. The daemon cannot resolve symlinks on the client's filesystem; a symlink inside the cwd pointing outside it is still followed. Admins should scope a directory whose content and symlinks they trust. Successful cwd reads retain their source and originating-channel labels but no longer add untrusted active ingest. They do not clear taint from URLs, forge results, messages, or other untrusted sources.
 
