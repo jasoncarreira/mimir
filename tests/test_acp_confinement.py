@@ -16,7 +16,7 @@ MACOS = pytest.mark.skipif(sys.platform != "darwin", reason="requires macOS Seat
 
 
 def test_unavailable_platform_fails_closed(monkeypatch, tmp_path):
-    monkeypatch.setattr(confinement.sys, "platform", "linux")
+    monkeypatch.setattr(confinement.sys, "platform", "unsupported")
     with pytest.raises(confinement.ConfinementUnavailable, match="unavailable"):
         confinement.prepare_command(["/bin/sh", "-c", "true"], cwd=tmp_path)
 
@@ -209,3 +209,264 @@ def test_scratch_root_cannot_be_removed_by_child(fixture_scope, tmp_path):
     result = subprocess.run(prepared.argv, env=prepared.env, cwd=cwd, capture_output=True, timeout=15)
     assert result.returncode != 0
     assert scratch.is_dir()
+
+
+@pytest.fixture
+def apparmor(monkeypatch, tmp_path):
+    backend = confinement.AppArmorBackend()
+    enabled = tmp_path / "enabled"
+    enabled.write_text("Y\n")
+    tool = tmp_path / "tool"
+    tool.write_text("")
+    tool.chmod(0o700)
+    monkeypatch.setattr(confinement.AppArmorBackend, "enabled", enabled)
+    for name in ("parser", "executable", "interpreter"):
+        monkeypatch.setattr(confinement.AppArmorBackend, name, tool)
+    monkeypatch.setattr(confinement, "_backend", lambda: backend)
+    calls = []
+
+    def run(argv, **kwargs):
+        calls.append((argv, kwargs))
+        stdout = argv[2] + " (enforce)\n" if "-p" in argv else ""
+        return subprocess.CompletedProcess(argv, 0, stdout, "")
+
+    monkeypatch.setattr(confinement.subprocess, "run", run)
+    return backend, calls, run
+
+
+@pytest.mark.parametrize("platform, expected", [
+    ("linux", confinement.AppArmorBackend), ("darwin", confinement.SeatbeltBackend),
+])
+def test_backend_platform_selection(monkeypatch, platform, expected):
+    monkeypatch.setattr(confinement.sys, "platform", platform)
+    assert isinstance(confinement._backend(), expected)
+
+
+@pytest.mark.parametrize("suffix", [
+    '"', "'", " ", "\t", "\n", "\r", "*", "?", "[x]", "{a,b}",
+    "\\", "@{HOME}", "#", ",", "\x00", "\udcff", "\u00a0",
+])
+@pytest.mark.parametrize("source", ["cwd", "approved", "scratch"])
+def test_apparmor_refuses_path_syntax(suffix, source):
+    values = {"cwd": Path("/session"), "approved": Path("/approved"), "scratch": Path("/scratch")}
+    values[source] = Path("/bad" + suffix)
+    with pytest.raises(confinement.ConfinementUnavailable, match="represent"):
+        confinement.apparmor_profile(values["cwd"], [values["approved"]], [values["scratch"]])
+
+
+@pytest.mark.parametrize("path", ["/", "relative", "/a/../b"])
+def test_apparmor_requires_frozen_nonroot_path(path):
+    with pytest.raises(confinement.ConfinementUnavailable):
+        confinement.apparmor_profile(Path(path))
+
+
+def test_apparmor_pure_exact_scope(monkeypatch):
+    def forbidden(*args, **kwargs):
+        pytest.fail("synthesis must not inspect files or start processes")
+    with monkeypatch.context() as patch:
+        for name in ("resolve", "stat", "read_text", "is_dir", "is_file"):
+            patch.setattr(Path, name, forbidden)
+        patch.setattr(subprocess, "run", forbidden)
+        profile = confinement.apparmor_profile(Path("/session"), [Path("/outside/approved")], [Path("/scratch")])
+    assert profile == confinement.apparmor_profile(Path("/session"), [Path("/outside/approved")], [Path("/scratch")])
+    writable = {line.strip() for line in profile.splitlines() if " rw" in line}
+    assert writable == {
+        "/dev/null rw,", "/session rwk,", "/session/ rw,", "/session/** rwk,",
+        "/outside/approved rwk,", "/outside/approved/ rw,", "/outside/approved/** rwk,",
+        "/scratch rwk,", "/scratch/ rw,", "/scratch/** rwk,",
+    }
+    assert "ux," not in profile and "px," not in profile and "change_profile" not in profile
+    assert "complain" not in profile
+    assert "  deny /scratch w," in profile
+    assert "  deny /scratch/ w," in profile
+
+
+@pytest.mark.parametrize("enabled", ["N", "", "yes", "Y (complain)", "\udcff"])
+def test_apparmor_lsm_must_be_enabled(apparmor, tmp_path, enabled):
+    backend, calls, _ = apparmor
+    backend.enabled.write_bytes(enabled.encode("utf-8", errors="surrogateescape"))
+    with pytest.raises(confinement.BackendUnavailable):
+        backend.prepare(["/bin/true"], cwd=tmp_path)
+    assert not calls
+
+
+@pytest.mark.parametrize("missing", ["enabled", "parser", "executable", "interpreter"])
+def test_apparmor_missing_prerequisite(apparmor, tmp_path, monkeypatch, missing):
+    backend, calls, _ = apparmor
+    monkeypatch.setattr(backend, missing, tmp_path / "missing")
+    with pytest.raises(confinement.BackendUnavailable):
+        backend.prepare(["/bin/true"], cwd=tmp_path)
+    assert not calls
+
+
+def test_apparmor_executable_permission_required(apparmor, tmp_path):
+    backend, calls, _ = apparmor
+    backend.parser.chmod(0o600)
+    with pytest.raises(confinement.BackendUnavailable):
+        backend.prepare(["/bin/true"], cwd=tmp_path)
+    assert not calls
+
+
+@pytest.mark.parametrize("name", ["parser", "executable", "interpreter"])
+def test_apparmor_tool_must_be_regular_file(apparmor, monkeypatch, tmp_path, name):
+    backend, calls, _ = apparmor
+    monkeypatch.setattr(backend, name, tmp_path)
+    with pytest.raises(confinement.BackendUnavailable):
+        backend.prepare(["/bin/true"], cwd=tmp_path)
+    assert not calls
+
+
+@pytest.mark.parametrize("path", [Path('/bad"'), Path('/bad\udcff')])
+def test_apparmor_bad_scope_never_uses_existing_risk_consent(apparmor, tmp_path, path):
+    with pytest.raises(confinement.ConfinementUnavailable, match="represent"):
+        confinement.prepare_command(["/bin/true"], cwd=tmp_path,
+                                    approved_paths=[path], allow_unconfined=True)
+    assert not apparmor[1]
+
+
+def test_apparmor_prepares_only_after_load_and_transition(apparmor, tmp_path):
+    backend, calls, _ = apparmor
+    approved = tmp_path / "approved"
+    prepared = backend.prepare(["/bin/sh", "-c", "exit 37"], cwd=tmp_path, approved_paths=[approved])
+    assert prepared.execution_mode == "confined"
+    assert len(calls) == 3
+    assert calls[0][0][-1] == "--skip-kernel-load"
+    assert calls[1][0][-1] == "--replace"
+    assert calls[0][1]["input"] == calls[1][1]["input"] == confinement.apparmor_profile(tmp_path, [approved])
+    assert all("--config-file=/dev/null" in argv and "--skip-cache" in argv and "--Werror" in argv
+               for argv, _ in calls[:2])
+    assert all(kwargs["close_fds"] and kwargs["timeout"] == 15 for _, kwargs in calls)
+    assert prepared.argv == (*calls[2][0], "/bin/sh", "-c", "exit 37")
+    assert calls[2][0][3:9] == ("--", str(backend.interpreter), "-I", "-S", "-c", confinement._APPARMOR_LAUNCH)
+    assert prepared.env["TMPDIR"] == str(tmp_path)
+    assert not any(str(approved) in arg for argv, _ in calls[:2] for arg in argv)
+
+
+@pytest.mark.parametrize("code, label", [
+    (0, "unconfined"), (0, "{name} (complain)"), (0, "other (enforce)"),
+    (1, "{name} (enforce)"), (0, ""), (0, "{name}//other (enforce)"),
+])
+def test_apparmor_transition_not_inferred_from_successful_load(apparmor, monkeypatch, tmp_path, code, label):
+    backend, calls, run = apparmor
+    def bad_probe(argv, **kwargs):
+        result = run(argv, **kwargs)
+        if "-p" in argv:
+            return subprocess.CompletedProcess(argv, code, label.format(name=argv[2]), "")
+        return result
+    monkeypatch.setattr(subprocess, "run", bad_probe)
+    with pytest.raises(confinement.BackendUnavailable, match="transition"):
+        confinement.prepare_command(["/bin/true"], cwd=tmp_path)
+    assert len(calls) == 3
+    prepared = confinement.prepare_command(["/bin/true"], cwd=tmp_path, allow_unconfined=True)
+    assert prepared.execution_mode == "unconfined" and prepared.argv == ("/bin/true",)
+
+
+@pytest.mark.parametrize("phase", [0, 1, 2])
+@pytest.mark.parametrize("failure", ["status", "oserror", "timeout"])
+def test_apparmor_setup_failures_never_silently_execute(apparmor, monkeypatch, tmp_path, phase, failure):
+    backend, calls, run = apparmor
+    def fail(argv, **kwargs):
+        if len(calls) == phase:
+            calls.append((argv, kwargs))
+            if failure == "oserror":
+                raise OSError("fixture")
+            if failure == "timeout":
+                raise subprocess.TimeoutExpired(argv, 15)
+            return subprocess.CompletedProcess(argv, 1, "", "fixture")
+        return run(argv, **kwargs)
+    monkeypatch.setattr(subprocess, "run", fail)
+    with pytest.raises(confinement.ConfinementUnavailable):
+        confinement.prepare_command(["/bin/true"], cwd=tmp_path)
+    assert len(calls) == phase + 1
+    if phase == 0 and failure == "status":
+        calls.clear()
+        with pytest.raises(confinement.ConfinementUnavailable, match="compilation"):
+            confinement.prepare_command(["/bin/true"], cwd=tmp_path, allow_unconfined=True)
+
+
+@pytest.mark.parametrize("kind", ["cwd", "scratch"])
+def test_apparmor_changed_identity_is_not_backend_absence(apparmor, tmp_path, kind):
+    backend, calls, _ = apparmor
+    alias = tmp_path / "alias"
+    alias.symlink_to(tmp_path, target_is_directory=True)
+    kwargs = {"cwd": alias} if kind == "cwd" else {"cwd": tmp_path, "scratch_paths": [alias]}
+    with pytest.raises(confinement.ConfinementUnavailable, match="identity"):
+        confinement.prepare_command(["/bin/true"], allow_unconfined=True, **kwargs)
+    assert not calls
+
+
+@pytest.mark.parametrize("kind", ["cwd", "scratch"])
+def test_apparmor_missing_directory_is_not_backend_absence(apparmor, tmp_path, kind):
+    missing = tmp_path / "missing"
+    kwargs = {"cwd": missing} if kind == "cwd" else {"cwd": tmp_path, "scratch_paths": [missing]}
+    with pytest.raises(confinement.ConfinementUnavailable, match="identity"):
+        confinement.prepare_command(["/bin/true"], allow_unconfined=True, **kwargs)
+
+
+def test_apparmor_empty_command(apparmor, tmp_path):
+    with pytest.raises(ValueError, match="argv"):
+        apparmor[0].prepare([], cwd=tmp_path)
+
+
+@pytest.mark.asyncio
+async def test_apparmor_rejected_candidate_is_never_loaded_or_launched(apparmor, monkeypatch, tmp_path):
+    from unittest.mock import AsyncMock
+    from mimir.acp import hosted
+
+    backend, calls, _ = apparmor
+    monkeypatch.setattr(confinement.sys, "platform", "linux")
+    candidate = tmp_path / "candidate"
+    candidate.mkdir()
+    alias = tmp_path / "alias"
+    alias.symlink_to(candidate, target_is_directory=True)
+    cwd = tmp_path / "cwd"
+    cwd.mkdir()
+    validated = []
+    synthesize = confinement.apparmor_profile
+    def synth(cwd, approved_paths=(), scratch_paths=()):
+        approved_paths = tuple(approved_paths)
+        validated.append(approved_paths)
+        return synthesize(cwd, approved_paths, scratch_paths)
+    monkeypatch.setattr(confinement, "apparmor_profile", synth)
+    async def reject(*args):
+        assert validated[-1] == (candidate.resolve(),)
+        assert all(str(candidate) not in kwargs.get("input", "") for _, kwargs in calls)
+        return False
+    provider = hosted.HostedHandsProvider(request_scope_permission=AsyncMock(side_effect=reject))
+    provider.bind_session("s", cwd)
+    session = provider._sessions["s"]
+    result = await provider.request_scope(session, str(alias))
+    assert not result["approved"]
+    provider._request_scope_permission.assert_awaited_once_with("s", str(candidate.resolve()))
+    assert candidate.resolve() not in session.scope.approved
+    # Exercise the actual execution callsite, stopping at process creation.
+    spawn = AsyncMock(side_effect=OSError("fixture: do not run emulated AppArmor"))
+    monkeypatch.setattr(hosted.asyncio, "create_subprocess_exec", spawn)
+    with pytest.raises(hosted.HostedMcpError, match="fixture"):
+        await provider._confined_shell(session, "true")
+    spawn.assert_awaited_once()
+    assert all(str(candidate) not in kwargs.get("input", "") for _, kwargs in calls)
+    assert validated[-1] == ()
+    await provider.close()
+
+
+def test_apparmor_validation_loads_nothing(apparmor, monkeypatch, tmp_path):
+    monkeypatch.setattr(confinement.sys, "platform", "linux")
+    confinement.validate_scope(cwd=tmp_path, candidate_paths=[tmp_path / "candidate"])
+    assert not apparmor[1]
+
+
+@pytest.mark.parametrize("label", ["unconfined", "intended (complain)", "other (enforce)", "intended (enforce)"])
+def test_apparmor_actual_launcher_checks_label_before_exec(label, tmp_path):
+    # Exercise the actual launcher source in an isolated child, emulating only
+    # the kernel label file. This is not an AppArmor enforcement test.
+    marker = tmp_path / "ran"
+    script = f"""import builtins, io, sys
+real_open = builtins.open
+builtins.open = lambda path, *a, **kw: io.StringIO({label!r}) if path == '/proc/self/attr/current' else real_open(path, *a, **kw)
+sys.argv = ['launcher', 'intended', sys.executable, '-c', {f'from pathlib import Path; Path({str(marker)!r}).touch(); raise SystemExit(37)'!r}]
+exec({confinement._APPARMOR_LAUNCH!r})
+"""
+    result = subprocess.run([sys.executable, "-I", "-S", "-c", script], capture_output=True, timeout=15)
+    assert marker.exists() is (label == "intended (enforce)")
+    assert result.returncode == (37 if label == "intended (enforce)" else 1)

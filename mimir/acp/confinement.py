@@ -7,8 +7,11 @@ file descriptors except their deliberate protocol streams.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
+import re
+import subprocess
 import sys
 import sysconfig
 from collections.abc import Iterable, Sequence
@@ -157,13 +160,147 @@ class SeatbeltBackend:
         return PreparedCommand((str(self.executable), "-p", profile, *argv), env)
 
 
+def apparmor_profile(
+    cwd: Path, approved_paths: Iterable[Path] = (), scratch_paths: Iterable[Path] = (),
+) -> str:
+    """Synthesize only: inputs are frozen absolute paths, never filesystem lookups.
+
+    A suffix below an exact path grants descendants, not similarly named siblings.
+    AppArmor's path language is deliberately restricted rather than escaped.
+    """
+    scratch_paths = tuple(scratch_paths)
+    roots = set()
+    for path in (cwd, *approved_paths, *scratch_paths):
+        value = str(path)
+        try:
+            value.encode("utf-8", errors="strict")
+        except UnicodeError as exc:
+            raise ConfinementUnavailable("AppArmor cannot represent non-UTF-8 paths") from exc
+        if (not value.startswith("/") or value == "/"
+                or any(part in (".", "..") for part in value.split("/"))
+                or not re.fullmatch(r"/[\w./+-]+", value, flags=re.ASCII)):
+            raise ConfinementUnavailable("AppArmor cannot represent scope path unambiguously")
+        roots.add(value)
+    rules = [
+        # No ux/px or change_profile permission: every exec inherits this profile.
+        "  /** ix,",
+        "  /usr/bin/** mr,", "  /bin/** mr,",
+        "  /usr/lib/** mr,", "  /usr/lib64/** mr,",
+        "  /lib/** mr,", "  /lib64/** mr,", "  /usr/local/lib/** mr,",
+        "  /etc/ld.so.cache r,",
+        "  /dev/null rw,", "  /dev/urandom r,", "  /dev/random r,",
+        "  /proc/*/attr/current r,",
+    ]
+    for root in sorted(roots):
+        rules.extend((f"  {root} rwk,", f"  {root}/ rw,", f"  {root}/** rwk,"))
+    # Deny overrides an overlapping cwd grant without denying scratch contents.
+    for path in sorted(set(scratch_paths)):
+        rules.extend((f"  deny {path} w,", f"  deny {path}/ w,"))
+    body = "\n".join(rules)
+    name = "mimir-hands-" + hashlib.sha256(body.encode("utf-8")).hexdigest()
+    return f"profile {name} {{\n{body}\n}}\n"
+
+
+# Use an isolated system interpreter so scope-writable startup modules cannot
+# forge the label check. Both the probe and the actual launcher use this code.
+# Failure exits the confined child; there is no unconfined runtime retry.
+_APPARMOR_LAUNCH = """import os, sys
+with open('/proc/self/attr/current', encoding='ascii') as stream:
+    label = stream.read().strip()
+if label != sys.argv[1] + ' (enforce)':
+    raise SystemExit('AppArmor enforcing transition not verified')
+if len(sys.argv) == 2:
+    print(label)
+else:
+    os.execvpe(sys.argv[2], sys.argv[2:], os.environ)
+"""
+
+
+class AppArmorBackend:
+    """Unverified on real hardware; never infer enforcement from tool presence."""
+
+    parser = Path("/usr/sbin/apparmor_parser")
+    executable = Path("/usr/bin/aa-exec")
+    interpreter = Path("/usr/bin/python3")
+    enabled = Path("/sys/module/apparmor/parameters/enabled")
+
+    def _available(self) -> None:
+        try:
+            if self.enabled.read_text(encoding="ascii").strip() != "Y":
+                raise BackendUnavailable("Hands confinement unavailable: AppArmor LSM is not enabled")
+            for tool in (self.parser, self.executable, self.interpreter):
+                if not tool.is_file() or not os.access(tool, os.X_OK):
+                    raise BackendUnavailable(f"Hands confinement unavailable: missing executable {tool}")
+        except (OSError, UnicodeError) as exc:
+            raise BackendUnavailable("Hands confinement unavailable: cannot verify AppArmor LSM") from exc
+
+    def prepare(
+        self, argv: Sequence[str], *, cwd: Path,
+        approved_paths: Iterable[Path] = (), scratch_paths: Iterable[Path] = (),
+    ) -> PreparedCommand:
+        if not argv:
+            raise ValueError("a confined command requires argv")
+        self._available()
+        scratch_paths = tuple(scratch_paths)
+        for path in (cwd, *scratch_paths):
+            if path.resolve() != path or not path.is_dir():
+                raise ConfinementUnavailable("AppArmor cwd/scratch changed identity")
+        profile = apparmor_profile(cwd, approved_paths, scratch_paths)
+        name = profile.split()[1]
+        env = _environment()
+        env["TMPDIR"] = str(cwd)
+        # Fixed executable/options, sanitized environment, stdin policy, same uid.
+        # Ignore parser.conf (which can enable complain mode or skip loading).
+        parser = (str(self.parser), "--config-file=/dev/null", "--skip-cache", "--Werror")
+        try:
+            checked = subprocess.run(
+                (*parser, "--skip-kernel-load"), input=profile, text=True,
+                capture_output=True, env=env, cwd="/", timeout=15, close_fds=True,
+            )
+            if checked.returncode != 0:
+                raise ConfinementUnavailable("AppArmor profile compilation failed")
+            loaded = subprocess.run(
+                (*parser, "--replace"), input=profile, text=True,
+                capture_output=True, env=env, cwd="/", timeout=15, close_fds=True,
+            )
+            if loaded.returncode != 0:
+                raise BackendUnavailable("Hands confinement unavailable: AppArmor profile load failed for this uid")
+            launcher = (
+                str(self.executable), "-p", name, "--", str(self.interpreter),
+                "-I", "-S", "-c", _APPARMOR_LAUNCH, name,
+            )
+            probe = subprocess.run(
+                launcher, text=True, capture_output=True, env=env, cwd=cwd,
+                timeout=15, close_fds=True,
+            )
+            if not self._transition_verified(probe, name):
+                raise BackendUnavailable("Hands confinement unavailable: AppArmor enforcing transition failed")
+        except (OSError, subprocess.TimeoutExpired, UnicodeError) as exc:
+            raise BackendUnavailable("Hands confinement unavailable: AppArmor verification failed") from exc
+        return PreparedCommand((*launcher, *argv), env)
+
+    @staticmethod
+    def _transition_verified(probe: subprocess.CompletedProcess, name: str) -> bool:
+        return probe.returncode == 0 and probe.stdout.strip() == name + " (enforce)"
+
+
 def _backend() -> ConfinementBackend:
-    # A Linux backend belongs here. Providers do not know the profile format.
+    if sys.platform == "linux":
+        return AppArmorBackend()
     if sys.platform != "darwin":
         raise BackendUnavailable(
             "Hands confinement unavailable on this platform; macOS Seatbelt is required"
         )
     return SeatbeltBackend()
+
+
+def validate_scope(*, cwd: Path, candidate_paths: Iterable[Path]) -> None:
+    """Validate canonical candidate syntax without loading or running its policy."""
+    if sys.platform == "linux":
+        apparmor_profile(cwd, candidate_paths)
+        AppArmorBackend()._available()
+    else:
+        prepare_command(("/bin/true",), cwd=cwd, approved_paths=candidate_paths)
 
 
 def prepare_command(

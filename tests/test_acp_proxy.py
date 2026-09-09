@@ -2065,6 +2065,7 @@ async def test_hosted_scope_tool_round_trip_queries_grants_and_final_rejection(
         "mimir.acp.hosted.prepare_command",
         lambda *args, **kwargs: SimpleNamespace(execution_mode="confined"),
     )
+    monkeypatch.setattr("mimir.acp.hosted.validate_scope", lambda **kwargs: None)
     router, client, daemon, _, connection_id = await hosted_router(cwd)
 
     async def start(request_id: int, path: str) -> asyncio.Task[Any]:

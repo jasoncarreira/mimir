@@ -15,14 +15,17 @@ operator-visible limits are:
   reject paths outside the session cwd, but follow in-cwd symlinks even when
   their targets are outside it. Select a trusted project directory and inspect
   its symlinks before granting access.
-- **Execution confinement has one backend, and it is macOS-only.** `hands_shell`
+- **macOS Seatbelt is the only verified execution-confinement backend.** `hands_shell`
   and `hands_python` run under OS-level filesystem confinement by default, and it
   is mandatory wherever a backend is available; a confined child cannot follow a
   symlink out of the approved paths the way `hands_read` and `hands_edit` can.
-  The only backend today is macOS Seatbelt (`sandbox-exec`), which Apple has
-  deprecated. On a platform with no backend the tools run only after the operator
+  macOS Seatbelt uses `sandbox-exec`, which Apple has deprecated. #1597 adds a
+  Linux AppArmor backend but does not verify Linux confinement on real hardware.
+  With an unavailable backend the tools run only after the operator
   explicitly accepts the unconfined risk, and in that mode the cwd and path-scope
-  grants do not protect files. Chainlink #1597 tracks a Linux backend.
+  grants do not protect files. This existing separate operator-consent fallback
+  is unchanged; malformed profiles or runtime errors never trigger automatic retry
+  without confinement.
 - **Python state is temporary.** Closing the client or restarting its proxy loses
   the REPL namespace; loading the daemon transcript does not recover it. Save
   needed results explicitly and rerun initialization after reconnecting.
@@ -243,10 +246,22 @@ For SSH profiles, additionally confirm the remote `mimir-agent` version is 0.9.0
 ### Hands execution scope
 
 Confined Hands shell and Python execution uses the session's approved paths,
-initially its cwd and descendants. Additional approved file or directory paths
-are literal: approving a directory does not approve its children.
-macOS uses Seatbelt (`sandbox-exec`, deprecated by Apple). A replaceable
-confinement backend seam permits a future Linux backend.
+initially its cwd and descendants. On macOS, additional approved file or directory
+paths are literal: approving a directory does not approve its children. AppArmor
+grants an approved directory and its descendants, never its parent or similarly
+named siblings; its path syntax deliberately supports only ASCII letters, digits,
+underscores, dots, slashes, plus signs and hyphens.
+macOS Seatbelt (`sandbox-exec`, deprecated by Apple) remains the only verified
+backend. #1597 adds Linux AppArmor, not real-hardware verification. The local ACP
+proxy host executes Hands, even with a remote daemon; a container cannot verify
+that host's confinement. An installed parser or enabled AppArmor LSM alone is
+insufficient: an enforcing child transition is required. AppArmor profiles are
+loaded only with the current UID's existing authority, without privilege escalation.
+The initial policy has fixed system runtime read allowances; nonstandard Python
+installations may fail to start and are not retried without confinement.
+
+Live hardware verification, enforcing-vs-complain live checks, and concurrency
+naming/cleanup are deferred to the authorized Linux/AppArmor hardware-verification follow-up to #1597.
 
 #### Unavailable-backend risk approval
 
