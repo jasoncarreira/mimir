@@ -51,10 +51,11 @@ REAPER_PREFIX = "WORKLINK_REAPER "
 REAPER_SKIP_SAMPLE_LIMIT = 20
 
 # Retrying remains useful even with Mimir's mutex: another Chainlink caller may
-# not participate in it. Five total attempts (including the first call) sleep for
-# 0.1 + 0.2 + 0.4 + 0.8 = 1.5 seconds, long enough to absorb a short external
-# Chainlink fetch while keeping genuine persistent contention bounded.
-CLAIM_CONTENTION_MAX_ATTEMPTS = 5
+# not participate in it. On mimirbot 2026-09-09, dispatch to successful claim
+# took 3.469s under contention (#1607). Seven attempts (first immediate) sleep
+# for 0.1 + 0.2 + 0.4 + 0.8 + 1.6 + 3.2 = 6.3s, leaving slower-machine
+# headroom while keeping persistent contention bounded.
+CLAIM_CONTENTION_MAX_ATTEMPTS = 7
 CLAIM_CONTENTION_INITIAL_BACKOFF_S = 0.1
 CLAIM_CONTENDED_RESOURCE = "chainlink_locks_worktree"
 
