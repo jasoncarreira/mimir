@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import errno
 import base64
 from dataclasses import asdict, replace
 import json
@@ -20,6 +21,7 @@ import subprocess
 import tomllib
 import traceback
 import uuid
+from unittest.mock import Mock
 
 import pytest
 import yaml
@@ -67,6 +69,38 @@ from mimir.repo_tools import (
 )
 from mimir.tools.refusals import ToolPolicyRefusal
 from mimir.worklink.worker_client import StaleWorkerExecutorError
+
+
+@pytest.mark.parametrize("error", [PermissionError, ProcessLookupError, OSError],
+                         ids=["EPERM", "ESRCH", "EINVAL"])
+def test_bounded_subprocess_runner_killpg_guard(monkeypatch, error):
+    from mimir import repo_tools
+
+    process = Mock(pid=12345)
+    process.wait.return_value = -signal.SIGKILL
+    selector = Mock()
+    selector.get_map.return_value = {1: object()}
+    monkeypatch.setattr(repo_tools.subprocess, "Popen", Mock(return_value=process))
+    monkeypatch.setattr(repo_tools.selectors, "DefaultSelector", lambda: selector)
+    monkeypatch.setattr(repo_tools.os, "set_blocking", Mock())
+    exc = error(errno.EINVAL if error is OSError else
+                errno.EPERM if error is PermissionError else errno.ESRCH, "signal failed")
+    killpg = Mock(side_effect=exc)
+    monkeypatch.setattr(repo_tools.os, "killpg", killpg)
+
+    if error is OSError:
+        with pytest.raises(OSError) as caught:
+            _bounded_subprocess_runner(("git",), env={}, timeout=0, output_limit=10)
+        assert caught.value is exc
+        process.wait.assert_not_called()
+    else:
+        result = _bounded_subprocess_runner(("git",), env={}, timeout=0, output_limit=10)
+        assert result == GitProcessResult(-signal.SIGKILL, "", "", True, False)
+        process.wait.assert_called_once_with(timeout=1)
+    killpg.assert_called_once_with(process.pid, signal.SIGKILL)
+    selector.close.assert_called_once_with()
+    process.stdout.close.assert_called_once_with()
+    process.stderr.close.assert_called_once_with()
 
 
 @pytest.mark.asyncio

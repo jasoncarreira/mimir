@@ -487,7 +487,7 @@ class HostedHandsProvider:
     ) -> None:
         try:
             os.killpg(pgid, 9)
-        except ProcessLookupError:
+        except (ProcessLookupError, PermissionError):
             pass
         try:
             await process.wait()

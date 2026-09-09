@@ -799,7 +799,7 @@ class _ExternalProcess:
                 return
             try:
                 os.kill(self.pid, 0)
-            except ProcessLookupError:
+            except (ProcessLookupError, PermissionError):
                 return
             await asyncio.sleep(0.05)
 

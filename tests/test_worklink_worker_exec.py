@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import array
 import asyncio
+import errno
 import json
 import os
 from pathlib import Path
@@ -14,6 +15,7 @@ import struct
 import subprocess
 import sys
 import uuid
+from unittest.mock import Mock, call
 
 import pytest
 
@@ -1252,6 +1254,48 @@ def test_arm_parent_death_signal_is_noop_off_linux(monkeypatch) -> None:
     )
 
     worker_exec._arm_parent_death_signal(100)
+
+
+@pytest.mark.parametrize("error", [errno.EPERM, errno.ESRCH, errno.EINVAL], ids=["EPERM", "ESRCH", "EINVAL"])
+def test_terminate_process_group_sigterm_guard(monkeypatch, error) -> None:
+    failure = OSError(error, os.strerror(error))
+    killpg = Mock(side_effect=failure)
+    wait = Mock(return_value=True)
+    monkeypatch.setattr(worker_exec.os, "killpg", killpg)
+    monkeypatch.setattr(worker_exec, "_wait_process_group", wait)
+    monkeypatch.setattr(worker_exec, "_process_group_has_live_members", Mock(return_value=False))
+
+    if error == errno.EINVAL:
+        with pytest.raises(OSError) as raised:
+            worker_exec._terminate_process_group_pid(4321, timeout_s=0)
+        assert raised.value is failure
+        wait.assert_not_called()
+    else:
+        assert worker_exec._terminate_process_group_pid(4321, timeout_s=0) is None
+        wait.assert_called_once()
+        assert wait.call_args.args[0] == 4321
+    killpg.assert_called_once_with(4321, signal.SIGTERM)
+
+
+@pytest.mark.parametrize("error", [errno.EPERM, errno.ESRCH, errno.EINVAL], ids=["EPERM", "ESRCH", "EINVAL"])
+def test_terminate_process_group_sigkill_guard(monkeypatch, error) -> None:
+    failure = OSError(error, os.strerror(error))
+    killpg = Mock(side_effect=[None, failure])
+    wait = Mock(side_effect=[False, True])
+    monkeypatch.setattr(worker_exec.os, "killpg", killpg)
+    monkeypatch.setattr(worker_exec, "_wait_process_group", wait)
+    monkeypatch.setattr(worker_exec, "_process_group_has_live_members", Mock(return_value=True))
+
+    if error == errno.EINVAL:
+        with pytest.raises(OSError) as raised:
+            worker_exec._terminate_process_group_pid(4321, timeout_s=0)
+        assert raised.value is failure
+        assert wait.call_count == 1
+    else:
+        assert worker_exec._terminate_process_group_pid(4321, timeout_s=0) is None
+        assert wait.call_count == 2
+        assert all(args.args[0] == 4321 for args in wait.call_args_list)
+    assert killpg.call_args_list == [call(4321, signal.SIGTERM), call(4321, signal.SIGKILL)]
 
 
 def test_process_group_cancellation_reports_unreapable_member(monkeypatch) -> None:
