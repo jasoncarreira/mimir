@@ -27,6 +27,7 @@ IDLE_SECONDS = 1_800
 _FRAME_LIMIT_BYTES = 16 * 1024 * 1024
 _FILENAME = "<mimir-hands-python>"
 _REAP_TIMEOUT_SECONDS = 5
+_EXIT_CONFIRMATION_SECONDS = 0.1
 
 
 class PythonKernelUnavailable(RuntimeError):
@@ -147,6 +148,7 @@ class _Worker:
     pgid: int
     channel: socket.socket
     usable: bool = False
+    signalled: bool = False
     reaper: asyncio.Task[None] | None = None
 
 
@@ -563,13 +565,27 @@ class PythonKernelManager:
 
     async def _terminate(self, worker_state: _Worker) -> None:
         worker_state.channel.close()
-        try:
-            os.killpg(worker_state.pgid, 9)
-        except ProcessLookupError:
-            pass
-        except PermissionError:
-            if worker_state.process.returncode is None:
-                raise
+        if not worker_state.signalled:
+            try:
+                os.killpg(worker_state.pgid, 9)
+            except ProcessLookupError:
+                pass
+            except PermissionError as denied:
+                if worker_state.process.returncode is None:
+                    # macOS may deny signaling a dying process group before
+                    # asyncio observes the exit. Confirm reaping, rather than
+                    # treating an initial denied signal as successful cleanup.
+                    try:
+                        await asyncio.wait_for(
+                            worker_state.process.wait(), _EXIT_CONFIRMATION_SECONDS
+                        )
+                    except TimeoutError:
+                        raise denied
+                    if worker_state.process.returncode is None:
+                        raise denied
+            # Keep this across cancelled waits: never signal the same worker
+            # twice after a successful signal or a confirmed process exit.
+            worker_state.signalled = True
         reaper = worker_state.reaper
         if reaper is None:
             reaper = asyncio.create_task(self._reap(worker_state.process))

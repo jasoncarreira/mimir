@@ -820,3 +820,72 @@ async def test_directory_substituted_for_output_never_retains_kernel_lock(tmp_pa
     finally:
         async with asyncio.timeout(5):
             await manager.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("exited", [False, True])
+async def test_kernel_signal_denial_requires_confirmed_process_exit(monkeypatch, exited):
+    from unittest.mock import Mock
+    class Process:
+        returncode = None
+        async def wait(self):
+            if not exited:
+                await asyncio.Event().wait()
+            self.returncode = 31
+            return 31
+    process = Process()
+    worker = kernel._Worker(process, 123, Mock())
+    manager = PythonKernelManager()
+    denied = PermissionError("initial signal genuinely denied")
+    def killpg(*args):
+        raise denied
+    monkeypatch.setattr(kernel.os, "killpg", killpg)
+    monkeypatch.setattr(kernel, "_EXIT_CONFIRMATION_SECONDS", 0.01)
+    try:
+        if exited:
+            await manager._terminate(worker)
+            assert worker.signalled
+            assert process.returncode == 31
+        else:
+            with pytest.raises(PermissionError) as caught:
+                await manager._terminate(worker)
+            assert caught.value is denied
+            assert not worker.signalled
+            assert worker.reaper is None
+    finally:
+        await manager.close()
+
+
+@pytest.mark.asyncio
+async def test_kernel_repeated_cancel_does_not_repeat_successful_signal(monkeypatch):
+    from unittest.mock import Mock
+    entered, finish = asyncio.Event(), asyncio.Event()
+    class Process:
+        returncode = None
+        async def wait(self):
+            entered.set()
+            await finish.wait()
+            self.returncode = -9
+            return -9
+    process = Process()
+    worker = kernel._Worker(process, 123, Mock())
+    manager = PythonKernelManager()
+    calls = []
+    def killpg(*args):
+        calls.append(args)
+        if len(calls) > 1:
+            raise PermissionError("dying process group")
+    monkeypatch.setattr(kernel.os, "killpg", killpg)
+    task = asyncio.create_task(manager._terminate(worker))
+    try:
+        await entered.wait()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert worker.signalled
+        finish.set()
+        await manager._terminate(worker)
+        assert calls == [(123, 9)]
+    finally:
+        finish.set()
+        await manager.close()
