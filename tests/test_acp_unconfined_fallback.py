@@ -334,3 +334,14 @@ def test_approved_fallback_cannot_bypass_backend_policy_failure(tmp_path, monkey
     monkeypatch.setattr(confinement, "_backend", FailedPolicy)
     with pytest.raises(confinement.ConfinementUnavailable, match="policy validation failed"):
         confinement.prepare_command(("/bin/true",), cwd=tmp_path, allow_unconfined=True)
+
+
+@pytest.mark.parametrize("truthy", [1, "true", "false", ["approved"]])
+def test_only_literal_true_authorizes_the_unconfined_fallback(tmp_path, unavailable, truthy):
+    """Risk authority is a boolean the host sets after operator consent. A merely
+    truthy value is not consent, so the guard is an identity check, not a test for
+    truthiness that a future config string would satisfy."""
+    with pytest.raises(confinement.BackendUnavailable):
+        confinement.prepare_command(("/bin/true",), cwd=tmp_path, allow_unconfined=truthy)
+    prepared = confinement.prepare_command(("/bin/true",), cwd=tmp_path, allow_unconfined=True)
+    assert prepared.execution_mode == "unconfined"
