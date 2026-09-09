@@ -31,10 +31,18 @@ def contains(root: Path, path: Path) -> bool:
     return root == path or (root.is_dir() and path.is_relative_to(root))
 
 
+@dataclass(frozen=True, order=True)
+class ScopeApproval:
+    """Canonical path and recursion fixed before asking the operator."""
+
+    path: Path
+    recursive: bool
+
+
 @dataclass(slots=True)
 class ExecutionScope:
     cwd: Path
-    approved: set[Path] = field(default_factory=set)
+    approved: set[ScopeApproval] = field(default_factory=set)
     denied: set[Path] = field(default_factory=set)
     execution_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     pending: bool = False
@@ -46,10 +54,13 @@ class ExecutionScope:
     risk_pending: bool = False
 
     def paths(self) -> list[str]:
-        return sorted(str(p) for p in {self.cwd, *self.approved})
+        return sorted(str(p) for p in {self.cwd, *(a.path for a in self.approved)})
 
     def allows(self, path: Path) -> bool:
-        return contains(self.cwd, path) or path in self.approved
+        return contains(self.cwd, path) or any(
+            path == a.path or (a.recursive and path.is_relative_to(a.path))
+            for a in self.approved
+        )
 
     def rejected(self, path: Path) -> bool:
         return any(contains(p, path) or contains(path, p) for p in self.denied)

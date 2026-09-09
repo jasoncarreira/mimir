@@ -10,6 +10,7 @@ from pathlib import Path
 import pytest
 
 from mimir.acp import confinement
+from mimir.acp.execution_scope import ScopeApproval
 
 
 MACOS = pytest.mark.skipif(sys.platform != "darwin", reason="requires macOS Seatbelt")
@@ -41,6 +42,7 @@ def test_environment_does_not_trust_injected_runtime(monkeypatch):
 
 @pytest.fixture
 def fixture_scope(tmp_path):
+    tmp_path = tmp_path.resolve()
     cwd = tmp_path / 'cwd "quoted" café'
     cwd.mkdir()
     outside = tmp_path / "outside"
@@ -68,13 +70,14 @@ def test_shell_scope_exact_file_and_symlink_escape(fixture_scope):
     assert result.returncode == 0, result.stderr
     assert (cwd / "created").read_text() == "local\n"
     approved = outside / "approved"
-    result = run_confined(["/bin/cat", str(approved)], cwd, [approved])
+    approval = ScopeApproval(approved, recursive=False)
+    result = run_confined(["/bin/cat", str(approved)], cwd, [approval])
     assert result.returncode == 0, result.stderr
     for denied in (outside / "denied", cwd / "escape", Path("/etc/hosts")):
         # Redirect contents even if confinement regresses: never print hosts data.
         result = run_confined(
             ["/bin/sh", "-c", f"/bin/cat {shlex.quote(str(denied))} >/dev/null"],
-            cwd, [approved],
+            cwd, [approval],
         )
         assert result.returncode != 0, f"unexpected read permission: {denied}"
     result = run_confined(
@@ -85,10 +88,100 @@ def test_shell_scope_exact_file_and_symlink_escape(fixture_scope):
 
 
 @MACOS
-def test_directory_addition_is_literal_not_subtree(fixture_scope):
+def test_directory_addition_grants_subtree_without_escape(fixture_scope):
     cwd, outside = fixture_scope
-    result = run_confined(["/bin/cat", str(outside / "denied")], cwd, [outside])
-    assert result.returncode != 0
+    directory = outside / "approved-tree"
+    nested = directory / "nested"
+    nested.mkdir(parents=True)
+    existing = nested / "existing"
+    existing.write_text("fixture")
+    sibling = outside / "approved-tree-sibling"
+    sibling.mkdir()
+    (sibling / "denied").write_text("fixture")
+    escape = nested / "escape"
+    escape.symlink_to(outside)
+    approval = ScopeApproval(directory, recursive=True)
+    created = nested / "new" / "created"
+    script = (
+        "from pathlib import Path; "
+        f"existing = Path({str(existing)!r}); "
+        "assert existing.read_text() == 'fixture'; "
+        "existing.write_text('updated'); "
+        f"created = Path({str(created)!r}); "
+        "created.parent.mkdir(); created.write_text('created')"
+    )
+    result = run_confined([sys.executable, "-c", script], cwd, [approval])
+    assert result.returncode == 0, result.stderr
+    assert existing.read_text() == "updated"
+    assert created.read_text() == "created"
+    for denied in (outside / "denied", sibling / "denied", escape / "denied"):
+        result = run_confined(["/bin/cat", str(denied)], cwd, [approval])
+        assert result.returncode != 0, f"unexpected read permission: {denied}"
+        result = run_confined(
+            ["/bin/sh", "-c", f"echo changed > {shlex.quote(str(denied))}"],
+            cwd, [approval],
+        )
+        assert result.returncode != 0, f"unexpected write permission: {denied}"
+        assert denied.read_text() == "fixture"
+    for denied in (outside / "new", sibling / "new", escape / "new"):
+        result = run_confined(
+            ["/bin/sh", "-c", f"echo denied > {shlex.quote(str(denied))}"],
+            cwd, [approval],
+        )
+        assert result.returncode != 0, f"unexpected create permission: {denied}"
+        assert not denied.exists()
+
+
+@pytest.mark.parametrize("recursive", [False, True], ids=["file-literal", "directory-subpath"])
+def test_seatbelt_profile_exact_writable_scope(monkeypatch, fixture_scope, recursive):
+    cwd, outside = fixture_scope
+    approved = outside / "approved"
+    if recursive:
+        approved.unlink()
+        approved.mkdir()
+        (approved / "escape").symlink_to(outside / "denied")
+    approval = ScopeApproval(approved, recursive=recursive)
+    monkeypatch.setattr(confinement.SeatbeltBackend, "executable", Path(sys.executable))
+    prepared = confinement.SeatbeltBackend().prepare(
+        ["/bin/true"], cwd=cwd, approved_paths=[approval],
+    )
+    profile = prepared.argv[2]
+    filters = sorted([
+        f'(subpath {json.dumps(str(cwd), ensure_ascii=False)})',
+        f'({"subpath" if recursive else "literal"} {json.dumps(str(approved), ensure_ascii=False)})',
+    ])
+    # Exact writable rules exclude parent trees, prefix siblings and escape targets.
+    assert [line for line in profile.splitlines() if "file-write" in line] == [
+        "(allow file-read* file-write* " + " ".join(filters) + ")",
+        '(allow file-write* (literal "/dev/null"))',
+    ]
+
+
+@pytest.mark.parametrize("replacement", ["directory", "symlink-to-directory", "symlink-to-file"])
+def test_seatbelt_profile_preserves_file_snapshot(monkeypatch, fixture_scope, replacement):
+    cwd, outside = fixture_scope
+    approved = outside / "approved"
+    assert approved.is_file()
+    approval = ScopeApproval(approved.resolve(), recursive=False)
+    approved.unlink()
+    if replacement == "directory":
+        approved.mkdir()
+    elif replacement == "symlink-to-directory":
+        approved.symlink_to(outside, target_is_directory=True)
+    else:
+        approved.symlink_to(outside / "denied")
+    monkeypatch.setattr(confinement.SeatbeltBackend, "executable", Path(sys.executable))
+    prepared = confinement.SeatbeltBackend().prepare(
+        ["/bin/true"], cwd=cwd, approved_paths=[approval],
+    )
+    filters = sorted([
+        f'(subpath {json.dumps(str(cwd), ensure_ascii=False)})',
+        f'(literal {json.dumps(str(approval.path), ensure_ascii=False)})',
+    ])
+    assert [line for line in prepared.argv[2].splitlines() if "file-write" in line] == [
+        "(allow file-read* file-write* " + " ".join(filters) + ")",
+        '(allow file-write* (literal "/dev/null"))',
+    ]
 
 
 @MACOS
@@ -109,7 +202,8 @@ for line in sys.stdin:
     print(json.dumps({'request': count, 'allowed': allowed}), flush=True)
 """
     prepared = confinement.prepare_command(
-        [sys.executable, "-c", script], cwd=cwd, approved_paths=[approved],
+        [sys.executable, "-c", script], cwd=cwd,
+        approved_paths=[ScopeApproval(approved, recursive=False)],
     )
     paths = [cwd / "inside", approved, outside / "denied", cwd / "escape", Path("/etc/hosts")]
     result = subprocess.run(
@@ -170,9 +264,10 @@ def test_invalid_profile_does_not_execute(tmp_path):
 def test_replaced_approved_file_does_not_grant_new_symlink_target(fixture_scope):
     cwd, outside = fixture_scope
     approved = (outside / "approved").resolve()
+    approval = ScopeApproval(approved, recursive=False)
     approved.unlink()
     approved.symlink_to(outside / "denied")
-    result = run_confined(["/bin/cat", str(approved)], cwd, [approved])
+    result = run_confined(["/bin/cat", str(approved)], cwd, [approval])
     assert result.returncode != 0
 
 

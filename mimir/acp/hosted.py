@@ -13,7 +13,7 @@ from collections.abc import Awaitable, Callable
 
 from .audit import safe_log_event
 from .confinement import prepare_command, ConfinementUnavailable, BackendUnavailable
-from .execution_scope import ExecutionScope, canonical_scope_path, MAX_SCOPE_REQUESTS, SCOPE_WARNING, UNCONFINED_WARNING
+from .execution_scope import ExecutionScope, ScopeApproval, canonical_scope_path, MAX_SCOPE_REQUESTS, SCOPE_WARNING, UNCONFINED_WARNING
 
 from .hands_contract import (
     HandsContractError,
@@ -92,7 +92,7 @@ def _resolved_path(session: HostedSession, value: str) -> Path:
 
 class HostedHandsProvider:
     def __init__(self, timeout_seconds: int = SHELL_TIMEOUT_SECONDS, *,
-                 request_scope_permission: Callable[[str, str], Awaitable[bool]] | None = None,
+                 request_scope_permission: Callable[[str, ScopeApproval], Awaitable[bool]] | None = None,
                  request_unconfined_permission: Callable[[str], Awaitable[bool]] | None = None) -> None:
         self._request_scope_permission = request_scope_permission
         self._request_unconfined_permission = request_unconfined_permission
@@ -494,12 +494,13 @@ class HostedHandsProvider:
                 scope.pending = True
                 scope.attempts += 1
                 generation = scope.generation
+                grant = ScopeApproval(path, recursive=path.is_dir())
                 try:
                     # Validate backend before asking; no unconfined fallback.
                     prepare_command(("/bin/true",), cwd=session.cwd,
-                                    approved_paths=(*scope.approved, path))
+                                    approved_paths=(*scope.approved, grant))
                     async with asyncio.timeout(60):
-                        answer = await self._request_scope_permission(session.session_id, str(path))
+                        answer = await self._request_scope_permission(session.session_id, grant)
                     async with scope.execution_lock:
                         self._require_live_scope(session)
                         if scope.closed or session.scope is not scope or generation != scope.generation:
@@ -508,7 +509,7 @@ class HostedHandsProvider:
                             await self._python_kernels.retire(session.kernel_id)
                             self._require_live_scope(session)
                             if not scope.closed and session.scope is scope and generation == scope.generation:
-                                scope.approved.add(path)
+                                scope.approved.add(grant)
                                 approved = True
                                 outcome = "approved"
                                 message = SCOPE_WARNING
