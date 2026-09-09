@@ -3,6 +3,8 @@ from __future__ import annotations
 import asyncio
 import io
 import json
+import os
+import re
 import signal
 import sys
 from pathlib import Path
@@ -431,14 +433,16 @@ def test_signal_reap_filter_only_suppresses_expected_watcher_diagnostic() -> Non
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("signum", [signal.SIGTERM, signal.SIGINT, signal.SIGHUP])
-@pytest.mark.parametrize("file_output", [False, True], ids=["pipe-output", "file-output"])
-@pytest.mark.parametrize("file_stderr", [False, True], ids=["pipe-stderr", "file-stderr"])
+@pytest.mark.parametrize("output_shape", ["pipe", "file", "tty"])
+@pytest.mark.parametrize("stderr_shape", ["pipe", "file", "tty"])
+@pytest.mark.parametrize("teardown_failure", [False, True], ids=["clean", "failure"])
 async def test_local_proxy_signal_with_real_stdio_and_unix_socket(
-    signum: signal.Signals, file_output: bool, file_stderr: bool,
+    signum: signal.Signals, output_shape: str, stderr_shape: str, teardown_failure: bool,
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     # Do not replace run_proxy, run_router, or open_stdio: all three must run
-    # against real OS transports. Only profile/credential lookup is injected.
+    # against real OS transports. Inject profile/credential lookup and, for the
+    # failure cases, an error after the real router close has completed.
     source = r'''
 import asyncio, os, sys
 from pathlib import Path
@@ -450,6 +454,12 @@ profile = SimpleNamespace(home=Path('.'), remote=None, timeout_seconds=60)
 profiles.ProfileStore = proxy.ProfileStore = lambda: SimpleNamespace(get=lambda name: profile)
 profiles.selected_profile = proxy.selected_profile = lambda name: 'test'
 proxy.NativeCredentialStore = lambda: SimpleNamespace(get=lambda name: 'test-secret')
+if sys.argv[2] == 'failure':
+    original_close = proxy.ProxyRouter.close
+    async def close(self):
+        await original_close(self)
+        raise ValueError('private shutdown failure')
+    proxy.ProxyRouter.close = close
 raise SystemExit(bootstrap.main(['--profile', 'test']))
 '''
     directory = tmp_path / ".mimir" / "acp"
@@ -461,15 +471,30 @@ raise SystemExit(bootstrap.main(['--profile', 'test']))
         connected.set()
     monkeypatch.chdir(tmp_path)
     server = await asyncio.start_unix_server(accept, path=".mimir/acp/daemon.sock")
+    file_output = output_shape == "file"
+    file_stderr = stderr_shape == "file"
+    terminal = None
+    stderr_terminal = None
+    if "tty" in (output_shape, stderr_shape):
+        import pty
+        import tty
+    if output_shape == "tty":
+        terminal = pty.openpty()
+        tty.setraw(terminal[1])
+        os.set_blocking(terminal[0], False)
+    if stderr_shape == "tty":
+        stderr_terminal = pty.openpty()
+        tty.setraw(stderr_terminal[1])
+        os.set_blocking(stderr_terminal[0], False)
     output_path = tmp_path / "output"
     output_file = output_path.open("wb") if file_output else None
     stderr_path = tmp_path / "stderr"
     stderr_file = stderr_path.open("wb") if file_stderr else None
     process = await asyncio.create_subprocess_exec(
-        sys.executable, "-c", source, str(tmp_path),
+        sys.executable, "-c", source, str(tmp_path), "failure" if teardown_failure else "clean",
         stdin=asyncio.subprocess.PIPE,
-        stdout=output_file if file_output else asyncio.subprocess.PIPE,
-        stderr=stderr_file if file_stderr else asyncio.subprocess.PIPE,
+        stdout=terminal[1] if terminal else output_file if file_output else asyncio.subprocess.PIPE,
+        stderr=stderr_terminal[1] if stderr_terminal else stderr_file if file_stderr else asyncio.subprocess.PIPE,
         cwd=Path(__file__).resolve().parents[1],
     )
     try:
@@ -482,8 +507,18 @@ raise SystemExit(bootstrap.main(['--profile', 'test']))
             await peers[0].drain()
         except ConnectionError:
             stdout, stderr = await asyncio.wait_for(process.communicate(), 10)
+            if file_stderr:
+                stderr = stderr_path.read_bytes()
             pytest.fail(f"real stdio startup failed: code={process.returncode}, stderr={stderr!r}")
         async def ready() -> bytes:
+            if terminal:
+                observed = bytearray()
+                while not observed.endswith(b"\n") and process.returncode is None:
+                    try:
+                        observed.extend(os.read(terminal[0], 65536))
+                    except BlockingIOError:
+                        await asyncio.sleep(0.01)
+                return bytes(observed)
             if not file_output:
                 return await process.stdout.readline()
             while output_path.read_bytes() != frame and process.returncode is None:
@@ -492,12 +527,26 @@ raise SystemExit(bootstrap.main(['--profile', 'test']))
         observed = await asyncio.wait_for(ready(), 10)
         if observed != frame:
             stdout, stderr = await asyncio.wait_for(process.communicate(), 10)
+            if file_stderr:
+                stderr = stderr_path.read_bytes()
             pytest.fail(f"real stdio startup failed: code={process.returncode}, stderr={stderr!r}")
         process.send_signal(signum)
         stdout, stderr = await asyncio.wait_for(process.communicate(), 10)
         if file_stderr:
             stderr = stderr_path.read_bytes()
-        assert (process.returncode, stdout, stderr) == (128 + signum, None if file_output else b"", b"")
+        if stderr_terminal:
+            stderr = b""
+            while True:
+                try:
+                    stderr += os.read(stderr_terminal[0], 65536)
+                except BlockingIOError:
+                    break
+        assert stdout == (b"" if output_shape == "pipe" else None)
+        if teardown_failure:
+            assert process.returncode == 1
+            assert re.fullmatch(rb"detail: ValueError at <string>:[0-9]+\nerror: acp-failed\n", stderr)
+        else:
+            assert (process.returncode, stderr) == (128 + signum, b"")
     finally:
         if process.returncode is None:
             process.kill()
@@ -506,6 +555,12 @@ raise SystemExit(bootstrap.main(['--profile', 'test']))
             output_file.close()
         if stderr_file is not None:
             stderr_file.close()
+        if terminal:
+            for fd in terminal:
+                os.close(fd)
+        if stderr_terminal:
+            for fd in stderr_terminal:
+                os.close(fd)
         for writer in peers:
             writer.close()
             try:
