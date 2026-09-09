@@ -18,7 +18,8 @@ async def safe_log_event(event_type: str, **payload: Any) -> None:
     """Write one fixed-shape JSON event; a broken diagnostic sink is nonfatal."""
     if event_type != "acp_permission_outcome":
         return
-    path = payload.get("path")
+    unconfined = payload.get("wrapper_name") == "hands_unconfined_execution"
+    path = "<unconfined>" if unconfined else payload.get("path")
     if not isinstance(path, str):
         path = "<invalid>"
     path = path.encode("utf-8", errors="replace")[:MAX_AUDIT_PATH_BYTES].decode(
@@ -29,10 +30,10 @@ async def safe_log_event(event_type: str, **payload: Any) -> None:
         outcome = "denied"
     record = {
         "type": "acp_permission_outcome",
-        "wrapper_name": "hands_request_scope",
+        "wrapper_name": "hands_unconfined_execution" if unconfined else "hands_request_scope",
         "path": path,
         "outcome": outcome,
-        "resource_resolvable": payload.get("resource_resolvable") is True,
+        "resource_resolvable": not unconfined and payload.get("resource_resolvable") is True,
     }
     try:
         # JSON escaping keeps path newlines/control characters inside one record.

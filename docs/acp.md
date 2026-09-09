@@ -166,7 +166,7 @@ When `mcpServers` is missing or empty, the local proxy injects one locally hoste
 
 Native Mimir tools operate on the daemon host. Mimir Hands operates with the local client's user authority. `hands_read` and `hands_edit` are confined to the session's bound `cwd`: relative paths are normalized against it, and absolute paths outside it (including sibling directories) are refused. This is lexical path confinement only. The daemon cannot resolve symlinks on the client's filesystem; a symlink inside the cwd pointing outside it is still followed. Admins should scope a directory whose content and symlinks they trust. Successful cwd reads retain their source and originating-channel labels but no longer add untrusted active ingest. They do not clear taint from URLs, forge results, messages, or other untrusted sources.
 
-`hands_shell` and `hands_python` use always-on OS-level filesystem confinement. Their child processes start in the session cwd and can access its descendants, exact operator-approved extra paths, and narrowly required runtime paths. The tools take command/code strings rather than paths, so argument checks alone cannot enforce this boundary. Use `hands_request_scope` to request additional paths before execution. Their output remains untrusted active ingest, so a shell result can still cause the next granted shell call to prompt. Operator consent does not declassify that output. Mimir tolerates advertised ACP client `fs` and `terminal` capabilities but never calls them. `additionalDirectories` and arbitrary provider profiles are rejected.
+`hands_shell` and `hands_python` use OS-level filesystem confinement by default. It is mandatory when the backend is available. Only an unavailable backend permits the separately approved fallback described below. Their confined child processes start in the session cwd and can access its descendants, exact operator-approved extra paths, and narrowly required runtime paths. The tools take command/code strings rather than paths, so argument checks alone cannot enforce this boundary. Use `hands_request_scope` to request additional paths before execution. Their output remains untrusted active ingest, so a shell result can still cause the next granted shell call to prompt. Operator consent does not declassify that output. Mimir tolerates advertised ACP client `fs` and `terminal` capabilities but never calls them. `additionalDirectories` and arbitrary provider profiles are rejected.
 
 Python keeps one lazy subprocess and in-memory namespace per ACP session. Session load restores the daemon transcript but retires the old worker first, so Python state is never stored in a session or journal and the next call is fresh. Workers retire on load, hosted disconnect, cancellation, daemon-generation replacement, proxy exit, `SIGTERM`, `SIGINT`, `SIGHUP`, or 1,800 seconds of idle time. Shells and Python workers run in owned process groups that are killed and reaped during cleanup. Variables, functions, imports, and loaded data persist only while that worker remains live.
 
@@ -179,12 +179,48 @@ For SSH profiles, additionally confirm the remote `mimir-agent` version is 0.9.0
 
 ### Hands execution scope
 
-Hands shell and Python execution are always confined to the session's approved
-paths, initially its cwd and descendants. Additional approved file or directory
-paths are literal: approving a directory does not approve its children.
-There is no unconfined fallback: an unavailable backend
-refuses to spawn. macOS uses Seatbelt (`sandbox-exec`, deprecated by Apple).
-A replaceable confinement backend seam permits a future Linux backend.
+Confined Hands shell and Python execution uses the session's approved paths,
+initially its cwd and descendants. Additional approved file or directory paths
+are literal: approving a directory does not approve its children.
+macOS uses Seatbelt (`sandbox-exec`, deprecated by Apple). A replaceable
+confinement backend seam permits a future Linux backend.
+
+#### Unavailable-backend risk approval
+
+Confinement is the default and remains mandatory when a backend is available.
+Only an unavailable platform or confinement backend can offer unconfined
+execution. A malformed profile, profile application error, or child runtime
+failure never triggers a downgrade. There is no automatic fallback or
+model-controlled opt-in flag.
+
+When the backend is unavailable, the operator must explicitly accept the risk
+over `session/request_permission` before execution can start. The warning states
+that `hands_shell` and `hands_python` will run unrestricted by Hands filesystem
+confinement, with the local proxy user's filesystem permissions. The cwd and
+path-scope grants do NOT protect files in unconfined mode, including when the
+agent itself runs remotely.
+
+The risk prompt warns before consent that acceptance restarts any existing
+Python kernel and loses its variables and imports. The restart happens only
+after operator approval, never while waiting for consent.
+
+This risk approval is separate from wrapper permissions, path grants, and taint
+acknowledgement. Acceptance is in-memory, session-only, never persisted, and
+never transferred to another session. Without explicit acceptance, no child is
+spawned. Rejection is final for the session. Cancellation, timeout, malformed
+responses, stale replies, and a missing approval-capable client also cannot
+authorize execution. Risk prompts are bounded; the agent must not retry a refusal.
+
+Scope-query results report unconfined mode in their `message`, and shell/Python
+execution results report it in `stderr`. The five-tool wire contract and result
+schemas do not change. An approved path list is not a security boundary in this
+mode. If a backend later becomes available, that does not retroactively confine
+already-running processes; a scope query must not imply otherwise.
+Filtered environment, safe stdin, output capture, and other non-OS hardening
+remain in effect. Risk acceptance and refusal are audited without command text,
+file contents, or credentials.
+
+#### Confined path requests
 
 Use `hands_request_scope(path)` proactively before shell or Python needs a path
 outside the approved set. `path=""` queries that set without prompting. The wire

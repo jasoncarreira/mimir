@@ -1073,3 +1073,111 @@ async def test_scope_request_middleware_routes_tainted_turn_without_execution_gr
         assert auth.ifc_state.current(labels) == before
     finally:
         reset_turn_capability_context(token)
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("middleware_event_logger")
+async def test_accepted_unconfined_python_does_not_inherit_cwd_read_trust_or_acknowledge_ingest(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import json
+    from langchain.agents.middleware import ToolCallRequest
+    from langchain_core.messages import ToolMessage
+    from langgraph.runtime import Runtime
+    from mimir.acp import confinement
+    from mimir.acp.hosted import HostedHandsProvider
+    from mimir.acp.journal import JournalLease
+    from mimir.access_control import classify_protected_result
+    from mimir.models import InformationFlowLabels, InformationFlowState, SourceLabel
+    from mimir.tools.budget_gate import BudgetGateMiddleware
+    from mimir.tools.client_provider import PermissionDecision
+
+    def unavailable() -> object:
+        raise confinement.BackendUnavailable("test missing backend")
+
+    monkeypatch.setattr(confinement, "_backend", unavailable)
+    cwd = tmp_path / "cwd"
+    cwd.mkdir()
+    (cwd / "trusted.txt").write_text("cwd content")
+    outside = tmp_path / "outside.txt"
+    outside.write_text("outside content")
+    initial = InformationFlowLabels().with_source(SourceLabel(
+        source_kind="protected_tool", principal="admin", domain="web",
+        resource_id="https://example.test/input", bridge_instance="web",
+        authorized_principals=frozenset({"admin"}), sensitivity="internal",
+        integrity="untrusted", integrity_effect="active_ingest",
+    ))
+    state = InformationFlowState(initial)
+    auth = replace(
+        _admin_auth(), channel_id="acp:provenance", resource_id="acp:provenance",
+        bridge_instance="acp-stdio", domain="channel", origin_trigger="acp_session",
+        ifc_labels=initial, ifc_state=state,
+    )
+    risk_requests = []
+
+    async def accept_risk(session_id: str) -> bool:
+        risk_requests.append(session_id)
+        assert state.current() == initial
+        assert state.permission_has_untrusted_active_ingest(initial)
+        return True  # Independent operator risk consent, not ingest acknowledgement.
+
+    class WrapperBroker:
+        def __init__(self) -> None:
+            self.calls = []
+
+        async def request_permission(self, eligibility):
+            self.calls.append(eligibility)
+            return PermissionDecision.ALLOW_SESSION
+
+    broker = WrapperBroker()
+    hosted = HostedHandsProvider(request_unconfined_permission=accept_risk)
+    hosted.bind_session("hosted", cwd)
+    context = replace(
+        _context(FakeProvider({})), cwd=str(cwd),
+        lease=JournalLease("provenance", 1, 1), permission_broker=broker,
+    )
+    token = set_turn_capability_context(context)
+    code = f"from pathlib import Path\nPath({str(outside)!r}).read_text()"
+
+    async def execute(request):
+        result = await hosted.execute_python(hosted._sessions["hosted"], code)
+        assert result["ok"] is True
+        assert result["value"] == repr("outside content")
+        assert "UNCONFINED" in result["stderr"]
+        return ToolMessage(content=json.dumps(result), tool_call_id=request.tool_call["id"])
+
+    try:
+        for call_id in ("python-1", "python-2"):
+            request = ToolCallRequest(
+                tool_call={"name": "hands_python", "args": {"code": code}, "id": call_id, "type": "tool_call"},
+                tool=hands_python, state=None, runtime=Runtime(context=auth),
+            )
+            result = await BudgetGateMiddleware().awrap_tool_call(request, execute)
+            assert result.status == "success"
+        assert risk_requests == ["hosted"]
+        assert len(broker.calls) == 2
+        assert all(call.host_execution.tainted is True for call in broker.calls)
+        current = state.current()
+        assert initial.sources <= current.sources
+        python_sources = [source for source in current.sources if source.source_kind == "acp_hands_result"]
+        assert python_sources
+        assert all(source.integrity == "untrusted" for source in python_sources)
+        assert all(source.integrity_effect == "active_ingest" for source in python_sources)
+        assert current.has_untrusted_active_ingest
+        assert state.permission_has_untrusted_active_ingest(initial)
+
+        # The separate validated cwd-read operation still earns #1584's trust.
+        read_args = {"path": "trusted.txt"}
+        verdict = get_tool_registry().authorize_tool("hands_read", auth, enforce=True, arguments=read_args)
+        assert verdict.allowed and verdict.result_integrity == "trusted"
+        read_labels = classify_protected_result(
+            "hands_read", read_args, auth, verdict, result={"content": "cwd content"},
+        )
+        assert read_labels.sources
+        assert all(source.integrity == "trusted" for source in read_labels.sources)
+        assert not read_labels.has_untrusted_active_ingest
+        # A trusted read does not erase the independent Python/web ingestion.
+        assert state.permission_has_untrusted_active_ingest(initial)
+    finally:
+        reset_turn_capability_context(token)
+        await hosted.close()

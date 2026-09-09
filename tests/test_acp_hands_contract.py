@@ -108,7 +108,7 @@ def test_shared_wire_contract_is_stdlib_only_and_exact() -> None:
         },
         {
             "name": "request_scope",
-            "description": "Request an exact execution path proactively. Empty path queries approved paths without approval. Rejection is final for the session. Approval restarts Python and loses REPL state.",
+            "description": "Request an exact execution path proactively. Empty path queries approved paths and execution mode without approval. Cwd/path grants do not protect files in operator-accepted unconfined mode. Rejection is final for the session. Approval restarts Python and loses REPL state.",
             "inputSchema": {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"], "additionalProperties": False},
             "outputSchema": {
                 "type": "object",

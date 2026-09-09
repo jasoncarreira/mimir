@@ -94,7 +94,7 @@ HANDS_V1_WIRE_TOOLS = tuple(
         },
         {
             "name": "request_scope",
-            "description": "Request an exact execution path proactively. Empty path queries approved paths without approval. Rejection is final for the session. Approval restarts Python and loses REPL state.",
+            "description": "Request an exact execution path proactively. Empty path queries approved paths and execution mode without approval. Cwd/path grants do not protect files in operator-accepted unconfined mode. Rejection is final for the session. Approval restarts Python and loses REPL state.",
             "inputSchema": _object_schema({"path": _STRING}, ["path"]),
             "outputSchema": _object_schema(
                 {"approved": {"type": "boolean"}, "paths": {"type": "array", "items": _STRING}, "message": _STRING},

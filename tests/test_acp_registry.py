@@ -340,3 +340,34 @@ def test_docs_reject_affirmative_ide_and_arbitrary_mcp_claims() -> None:
         re.IGNORECASE,
     )
     assert not affirmative_claim.search(prose)
+
+
+def test_docs_bound_unconfined_fallback_to_explicit_session_risk_approval() -> None:
+    text = " ".join(section("### Hands execution scope", "this heading is absent").split())
+    for value in (
+        "Confinement is the default and remains mandatory when a backend is available",
+        "Only an unavailable platform or confinement backend can offer unconfined execution",
+        "A malformed profile, profile application error, or child runtime failure never triggers a downgrade",
+        "There is no automatic fallback or model-controlled opt-in flag",
+        "operator must explicitly accept the risk over `session/request_permission`",
+        "local proxy user's filesystem permissions",
+        "path-scope grants do NOT protect files in unconfined mode",
+        "separate from wrapper permissions, path grants, and taint acknowledgement",
+        "in-memory, session-only, never persisted",
+        "Without explicit acceptance, no child is spawned",
+        "Rejection is final for the session",
+        "Cancellation, timeout, malformed responses, stale replies",
+        "Risk prompts are bounded",
+        "risk prompt warns before consent that acceptance restarts any existing Python kernel",
+        "restart happens only after operator approval",
+        "does not retroactively confine already-running processes",
+        "Scope-query results report unconfined mode in their `message`",
+        "execution results report it in `stderr`",
+        "Filtered environment, safe stdin, output capture",
+        "without command text, file contents, or credentials",
+        "bounded JSON records to the local proxy's stderr",
+        "does not revoke paths from already-running detached processes",
+    ):
+        assert value in text
+    assert "always confined" not in text
+    assert "There is no unconfined fallback" not in text

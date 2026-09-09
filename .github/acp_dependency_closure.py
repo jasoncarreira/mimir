@@ -14,7 +14,7 @@ POLICY = {
     "mimir.acp.host": {"mimir.acp.transport"},
     "mimir.acp.hands_contract": set(),
     "mimir.acp.hosted": {"mimir.acp.hands_contract", "mimir.acp.python_kernel", "mimir.acp.confinement", "mimir.acp.execution_scope", "mimir.acp.audit"},
-    "mimir.acp.python_kernel": {"mimir.acp.confinement"},
+    "mimir.acp.python_kernel": {"mimir.acp.confinement", "mimir.acp.execution_scope"},
     "mimir.acp.confinement": set(),
     "mimir.acp.execution_scope": {"mimir.client_file_resources"},
     "mimir.acp.audit": set(),

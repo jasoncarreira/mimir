@@ -752,7 +752,7 @@ async def test_shell_double_cancellation_reaps_without_signalling_killed_group_a
             raise PermissionError("already killed, not reaped")
         signals.append((pgid, signal))
 
-    monkeypatch.setattr(hosted, "prepare_command", lambda *a, **kw: SimpleNamespace(argv=("sh",), env={}))
+    monkeypatch.setattr(hosted, "prepare_command", lambda *a, **kw: SimpleNamespace(argv=("sh",), env={}, execution_mode="confined"))
     monkeypatch.setattr(hosted.asyncio, "create_subprocess_exec", spawn)
     monkeypatch.setattr(hosted.os, "killpg", killpg)
     provider = HostedHandsProvider()

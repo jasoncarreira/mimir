@@ -7,6 +7,7 @@ from pathlib import Path
 from mimir.client_file_resources import canonical_client_file_resource, client_file_resource_path
 
 MAX_SCOPE_REQUESTS = 8
+UNCONFINED_WARNING = "UNCONFINED: hands_shell/hands_python run with the local proxy user's filesystem permissions. The cwd and path-scope grants do NOT protect files. Operator approval applies only to this session."
 SCOPE_WARNING = "This changes filesystem access for this session. The Python kernel will restart and all variables/imports will be lost."
 
 
@@ -40,6 +41,9 @@ class ExecutionScope:
     attempts: int = 0
     generation: int = 0
     closed: bool = False
+    unconfined_approved: bool = False
+    risk_requested: bool = False
+    risk_pending: bool = False
 
     def paths(self) -> list[str]:
         return sorted(str(p) for p in {self.cwd, *self.approved})

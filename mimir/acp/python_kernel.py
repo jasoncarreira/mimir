@@ -18,7 +18,8 @@ from pathlib import Path
 from typing import Any, Coroutine
 from collections.abc import Iterable
 
-from .confinement import prepare_command
+from .confinement import prepare_command, ConfinementUnavailable
+from .execution_scope import UNCONFINED_WARNING
 
 
 STREAM_LIMIT_BYTES = 65_536
@@ -156,6 +157,8 @@ class _Worker:
 class _Session:
     directory: Path | None = None
     approved_paths: tuple[Path, ...] = ()
+    allow_unconfined: bool = False
+    execution_mode: str = "confined"
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     waiters: int = 0
     worker: _Worker | None = None
@@ -180,6 +183,30 @@ class PythonKernelManager:
         code: str,
         timeout: int | float = 60,
         *, approved_paths: Iterable[Path] = (),
+        allow_unconfined: bool = False,
+    ) -> dict[str, Any]:
+        try:
+            result = await self._execute(session_id, cwd, code, timeout,
+                                         approved_paths=approved_paths,
+                                         allow_unconfined=allow_unconfined)
+        except PythonKernelUnavailable as exc:
+            state = self._sessions.get(session_id)
+            if state is not None and state.execution_mode == "unconfined":
+                raise PythonKernelUnavailable(UNCONFINED_WARNING + " " + str(exc)) from None
+            raise
+        state = self._sessions.get(session_id)
+        if state is not None and state.execution_mode == "unconfined":
+            result["stderr"] = UNCONFINED_WARNING + "\n" + result["stderr"]
+        return result
+
+    async def _execute(
+        self,
+        session_id: str,
+        cwd: str | os.PathLike[str],
+        code: str,
+        timeout: int | float = 60,
+        *, approved_paths: Iterable[Path] = (),
+        allow_unconfined: bool = False,
     ) -> dict[str, Any]:
         if self._closed:
             raise PythonKernelUnavailable("kernel manager is closed")
@@ -199,7 +226,12 @@ class PythonKernelManager:
         kernel_state = "fresh"
         try:
             policy = tuple(sorted(Path(p) for p in approved_paths))
-            if state.worker is not None and state.approved_paths != policy:
+            prepared = prepare_command((sys.executable,), cwd=Path(cwd),
+                                       approved_paths=policy,
+                                       allow_unconfined=allow_unconfined)
+            state.allow_unconfined = allow_unconfined
+            if state.worker is not None and (state.approved_paths != policy
+                    or state.execution_mode != prepared.execution_mode):
                 await self._discard(state, state.worker)
             state.approved_paths = policy
             if state.directory is None:
@@ -293,7 +325,7 @@ class PythonKernelManager:
             result = self._timeout_result(timeout, stdout_path, stderr_path)
             state.last_activity = loop.time()
             return result
-        except OSError as exc:
+        except (OSError, ConfinementUnavailable) as exc:
             if state.worker is not None:
                 await self._discard(state, state.worker)
             raise PythonKernelUnavailable(str(exc)) from None
@@ -380,7 +412,9 @@ class PythonKernelManager:
                 (sys.executable, "-m", "mimir.acp.python_kernel", "--control-fd", str(child.fileno())),
                 cwd=Path(cwd), approved_paths=state.approved_paths,
                 scratch_paths=(state.directory,),
+                allow_unconfined=state.allow_unconfined,
             )
+            state.execution_mode = prepared.execution_mode
             process = await self._before_deadline(
                 deadline,
                 asyncio.create_subprocess_exec(

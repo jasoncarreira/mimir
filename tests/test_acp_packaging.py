@@ -113,7 +113,7 @@ def test_acp_docs_cover_client_contract() -> None:
         "mimir acp profile set-timeout PROFILE 60",
         "`allow_session`",
         "1,800 seconds of idle time",
-        "`hands_shell` and `hands_python` use always-on OS-level filesystem confinement",
+        "`hands_shell` and `hands_python` use OS-level filesystem confinement by default",
         "Session load restores the daemon transcript but retires the old worker first",
     ):
         assert text in docs

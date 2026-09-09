@@ -582,7 +582,10 @@ async def hands_python(code: str) -> dict[str, bool | str]:
 async def hands_request_scope(path: str) -> dict[str, Any]:
     """Request an exact execution path before accessing it outside approved scope.
 
-    Use path="" to query approved paths without prompting. Empty or surprising
+    Use path="" to query approved paths and execution mode without prompting.
+    If the operator accepted unavailable-backend risk, unconfined mode has no
+    filesystem protection from cwd or path grants. This tool cannot enable it.
+    Empty or surprising
     shell/Python output may be genuine or confinement; it is not proof of denial.
     Extra directory grants do not include children.
     Ask proactively for needed paths. Rejection is final: do not request or retry

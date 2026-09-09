@@ -57,3 +57,21 @@ async def test_scope_audit_does_not_emit_arbitrary_event_types(capsys: pytest.Ca
     await safe_log_event("secret-command", path="/outside", outcome="approved")
     output = capsys.readouterr()
     assert output.out == output.err == ""
+
+
+@pytest.mark.asyncio
+async def test_unconfined_risk_audit_has_no_model_path_or_execution_input(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    await safe_log_event(
+        "acp_permission_outcome", wrapper_name="hands_unconfined_execution",
+        path="secret/path", outcome="approved", resource_resolvable=True,
+        command="secret-command", content="secret-content", reason="secret-reason",
+    )
+    output = capsys.readouterr()
+    assert output.out == ""
+    assert "secret" not in output.err
+    assert json.loads(output.err) == {
+        "type": "acp_permission_outcome", "wrapper_name": "hands_unconfined_execution",
+        "path": "<unconfined>", "outcome": "approved", "resource_resolvable": False,
+    }

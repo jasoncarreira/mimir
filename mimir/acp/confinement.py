@@ -1,4 +1,4 @@
-"""Always-on execution confinement behind a replaceable platform backend.
+"""Default execution confinement behind a replaceable platform backend.
 
 Seatbelt denials are not an audit stream. Children may swallow EPERM; this module
 makes no claim to identify denied paths. Runtime code/data are explicit read-only
@@ -18,13 +18,18 @@ from typing import Protocol
 
 
 class ConfinementUnavailable(RuntimeError):
-    """Execution must not proceed without an available confinement backend."""
+    """Confinement setup failed; execution must not silently downgrade."""
+
+
+class BackendUnavailable(ConfinementUnavailable):
+    """No backend exists here; only operator-approved fallback may proceed."""
 
 
 @dataclass(frozen=True)
 class PreparedCommand:
     argv: tuple[str, ...]
     env: dict[str, str]
+    execution_mode: str = "confined"
 
 
 class ConfinementBackend(Protocol):
@@ -105,7 +110,7 @@ class SeatbeltBackend:
         scratch_paths: Iterable[Path] = (),
     ) -> PreparedCommand:
         if not self.executable.is_file() or not os.access(self.executable, os.X_OK):
-            raise ConfinementUnavailable("Hands confinement unavailable: sandbox-exec is missing")
+            raise BackendUnavailable("Hands confinement unavailable: sandbox-exec is missing")
         if not argv:
             raise ValueError("a confined command requires argv")
         # Session binding freezes the canonical cwd. Following a replacement
@@ -155,7 +160,7 @@ class SeatbeltBackend:
 def _backend() -> ConfinementBackend:
     # A Linux backend belongs here. Providers do not know the profile format.
     if sys.platform != "darwin":
-        raise ConfinementUnavailable(
+        raise BackendUnavailable(
             "Hands confinement unavailable on this platform; macOS Seatbelt is required"
         )
     return SeatbeltBackend()
@@ -167,7 +172,26 @@ def prepare_command(
     cwd: Path,
     approved_paths: Iterable[Path] = (),
     scratch_paths: Iterable[Path] = (),
+    allow_unconfined: bool = False,
 ) -> PreparedCommand:
-    return _backend().prepare(
-        argv, cwd=cwd, approved_paths=approved_paths, scratch_paths=scratch_paths
-    )
+    try:
+        return _backend().prepare(
+            argv, cwd=cwd, approved_paths=approved_paths, scratch_paths=scratch_paths
+        )
+    except BackendUnavailable:
+        if allow_unconfined is not True:
+            raise
+        # This flag is host-owned risk authority, never a tool argument. Preserve
+        # non-OS hardening and still reject replaced cwd/scratch identities.
+        directory = Path(os.path.abspath(cwd))
+        if directory.resolve() != directory or not directory.is_dir():
+            raise ConfinementUnavailable("Hands execution cwd changed identity") from None
+        for value in scratch_paths:
+            path = Path(os.path.abspath(value))
+            if path.resolve() != path or not path.is_dir():
+                raise ConfinementUnavailable("Hands execution scratch changed identity") from None
+        if not argv:
+            raise ValueError("an execution command requires argv")
+        env = _environment()
+        env["TMPDIR"] = str(directory)
+        return PreparedCommand(tuple(argv), env, "unconfined")

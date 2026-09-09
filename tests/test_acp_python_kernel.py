@@ -640,11 +640,13 @@ async def test_deadline_expires_during_spawn_handshake_and_output_setup(
         del args, kwargs
         await asyncio.Event().wait()
 
+    real_spawn = asyncio.create_subprocess_exec
     monkeypatch.setattr(asyncio, "create_subprocess_exec", blocked_spawn)
     assert await spawn_manager.execute("spawn", tmp_path, "1", 0.01) == timeout_result
     assert spawn_manager._processes == {}
     await spawn_manager.close()
-    monkeypatch.undo()
+    # Restore only our spawn patch, not the Linux unit-backend fixture.
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", real_spawn)
 
     handshake_manager = PythonKernelManager()
 
