@@ -618,6 +618,7 @@ TRIGGER_CAPABILITY_TIERS: dict[str, CapabilityTier] = {
     "pr_reviews": CapabilityTier.SCOPE_CONTAINED,
     "pr_comments": CapabilityTier.SCOPE_CONTAINED,
     "pr_review_requests": CapabilityTier.SCOPE_CONTAINED,
+    "pr_review_others": CapabilityTier.SCOPED_WITH_PROVENANCE,
     "pr_submit_review": CapabilityTier.SCOPED_WITH_PROVENANCE,
     "pr_inline_review_comment": CapabilityTier.SCOPED_WITH_PROVENANCE,
     "pr_comment": CapabilityTier.SCOPED_WITH_PROVENANCE,
@@ -698,7 +699,7 @@ TRIGGER_AUTHORITY_PROFILES: dict[str, frozenset[str]] = {
         "pr_metadata", "pr_files", "pr_diff", "pr_checks", "pr_reviews",
         "pr_comments", "pr_review_requests", "pr_submit_review",
         "pr_inline_review_comment", "pr_comment", "pr_rerequest_review",
-        "pr_edit_body",
+        "pr_edit_body", "pr_review_others",
         "issue_comment",
         "unsupported_operation", "repo_checkout", "repo_cleanup", "repo_fetch",
         "repo_status", "repo_test", "repo_diff", "repo_unmerged", "repo_stage", "repo_commit",
@@ -10953,8 +10954,8 @@ def can_resolve_forge_review_scope(
       discover any configured pull request.
     - Trusted ``poller`` services that were granted ``pr_metadata`` may reuse
       stored scope and provisionally fetch an open pull request. Acceptance
-      still requires the pull request to be authored by Mimir's configured
-      forge login.
+      still requires Mimir's configured forge login and either matching PR
+      authorship or an explicit ``pr_review_others`` capability.
     - Trusted ``scheduled_tick`` services in a review-scope authority profile
       may reuse scope previously discovered by the server, but may not perform
       new live discovery.
@@ -10996,7 +10997,10 @@ def can_resolve_forge_review_scope(
         return operator_user or (
             poller_service
             and bool(self_login)
-            and pr_author == self_login
+            and (
+                pr_author == self_login
+                or trusted_service.has_capability("pr_review_others")
+            )
         )
     raise ValueError(f"unknown forge review-scope resolution stage: {stage!r}")
 

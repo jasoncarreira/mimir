@@ -470,6 +470,41 @@ replace the remote/ref, or refresh a stale snapshot; typed push must refuse stal
 authority before publication. Review scopes and remediation scopes retain their
 distinct action grants.
 
+#### Foreign-author review scope (#1599)
+
+`pr_review_others` is an explicit scope-acceptance capability at tier
+`scoped-with-provenance`, not a tool or a publication grant. The `github` and
+`custom` profiles allow an operator-owned poller manifest to declare it; profile
+selection and `pr_metadata` do not imply it. The shipped `github-activity`
+manifest explicitly grants it. It is absent from heartbeat's profile, which is
+used as a full built-in grant rather than only a manifest allowlist.
+
+`can_resolve_forge_review_scope()` keeps the stages separate:
+
+- `stored`: authenticated operator user turns, trusted pollers with `pr_metadata`,
+  and trusted scheduled ticks in the heartbeat review-scope profile may reuse scope.
+- `fetch`: only those operator turns and trusted pollers with `pr_metadata` may
+  perform provisional live discovery. `pr_review_others` does not grant fetch.
+- `accept`: operator behavior is unchanged. A trusted poller still needs
+  `pr_metadata` and a nonempty configured `self_login`; the PR author must match
+  that login unless the poller explicitly has `pr_review_others`. Scheduled ticks
+  remain unable to accept newly discovered scope, even with that capability.
+
+Ingress, service assertion, and canonical-identity trust checks still apply.
+The capability does not bypass configured-repository, snapshot, fork, lease,
+action, or publication checks in the forge/controller path, and does not grant
+remediation authority. Read tools and `pr_submit_review` still require their own
+capabilities. This is a deliberate single-operator trust decision: granting it
+allows Mimir to approve another author's PR, but does not permit merging. The
+forge tool surface has no merge or push verb; merging requires separate operator
+action.
+
+Successful live foreign-author discovery under this grant emits
+`forge_review_others_scope_resolved` once, before caching the resolution. Its
+payload contains only `repository`, `pull_request`, `capability`, and the resolved
+`author`, never credentials, diff content, or a review body. Reusing that
+resolution does not emit another event.
+
 The live parity canary is a reviewer-owned **BEFORE MERGE** gate, not a build
 blocker. Records live in Chainlink #1050 comments mirrored in the PR body; the
 [reviewer procedure](internal/repo-pr-parity-canary.md#1050-reviewer-procedure)

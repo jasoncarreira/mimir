@@ -5,6 +5,7 @@ import inspect
 import json
 import textwrap
 from dataclasses import replace
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -1077,7 +1078,10 @@ def test_poller_turn_refuses_live_scope_for_unowned_open_pr(
 
     assert str(refused.value) == (
         'pull-request operation rejected: requested repository="owner/repo", '
-        "pull_request=1291; live scope discovery requires an authenticated operator user turn"
+        "pull_request=1291; live scope discovery requires an authenticated operator user turn or a "
+        "trusted poller with pr_metadata and a configured MIMIR_GITHUB_SELF_LOGIN; "
+        "reviewing another author's pull request also requires an explicit "
+        "pr_review_others capability grant"
     )
     assert client.calls == [("snapshot", "owner/repo", 1291)]
 
@@ -1100,6 +1104,81 @@ def test_poller_turn_own_merged_pr_yields_terminal_state(
         "pull-request operation rejected: live pull request is closed or invalid"
     )
     assert client.calls == [("snapshot", "owner/repo", 1291)]
+
+
+@pytest.mark.parametrize("case", ["open", "closed", "wrong-repo", "invalid-head", "no-grant"])
+def test_shipped_poller_reviews_others_with_one_audit_event(
+    tmp_path, monkeypatch: pytest.MonkeyPatch, case: str,
+) -> None:
+    from mimir.pollers import _parse_poller_authority
+
+    manifest = Path(__file__).parents[1] / "mimir/optional-skills/github-poller/pollers.json"
+    record = next(item for item in json.loads(manifest.read_text())["pollers"]
+                  if item["name"] == "github-activity")
+    if case == "no-grant":
+        record["authority"]["capabilities"].remove("pr_review_others")
+    authority = _parse_poller_authority(
+        record["authority"], name=record["name"], persist_dir=tmp_path,
+        state_root=None, manifest_path=manifest,
+    )
+    event = AgentEvent(
+        trigger="poller", channel_id=authority.canonical,
+        service_principal=authority.canonical, service_authority=authority,
+    )
+    context = access_control.create_auth_context(
+        event, IdentityResolver(tmp_path), enforce=True,
+        ifc_labels=InformationFlowLabels(),
+    )
+    client = FakeForge()
+    _configure_live_review(monkeypatch, client)
+    events = []
+    monkeypatch.setattr(
+        "mimir.event_logger.log_event_sync",
+        lambda event_type, **payload: events.append((event_type, payload)),
+    )
+    if case == "closed":
+        client.snapshot_state = "closed"
+    elif case == "wrong-repo":
+        client.snapshot_repo = "other/repo"
+    elif case == "invalid-head":
+        client.snapshot_heads = ["invalid"]
+    if case != "open":
+        with pytest.raises(ToolException) as refused:
+            resolve_review_state_for_context(context, "owner/repo", 1291)
+        if case == "no-grant":
+            assert "explicit pr_review_others capability grant" in str(refused.value)
+        assert events == []
+        return
+
+    for stage in ("stored", "fetch", "accept"):
+        assert access_control.can_resolve_forge_review_scope(
+            context, stage=stage, pr_author=client.snapshot_author, self_login="reviewer",
+        )
+    resolved = resolve_review_state_for_context(context, "owner/repo", 1291)
+    assert resolved.action_scope.allowed_operations == frozenset({
+        "repo.inspect", "repo.checkout", "repo.test", "pr.review", "pr.comment",
+    })
+    runtime = ToolRuntime(
+        state={}, context=context, config={}, stream_writer=lambda _: None,
+        tool_call_id="manifest-review", store=None,
+    )
+    arguments = {"repository": "owner/repo", "pull_request": 1291}
+    registry = access_control.ToolRegistry()
+    for tool in (pr_metadata, pr_files, pr_diff, pr_checks, pr_reviews,
+                 pr_comments, pr_review_requests, pr_submit_review):
+        tool_args = dict(arguments)
+        if tool is pr_submit_review:
+            tool_args.update(verdict=ReviewVerdict.APPROVE, body="Looks good")
+        decision = registry.authorize_tool(
+            tool.name, context, enforce=True, arguments=tool_args,
+        )
+        assert decision.allowed, decision
+        tool.func(**tool_args, runtime=runtime)
+    assert resolve_review_state_for_context(context, "owner/repo", 1291) is resolved
+    assert events == [("forge_review_others_scope_resolved", {
+        "repository": "owner/repo", "pull_request": 1291,
+        "capability": "pr_review_others", "author": "untrusted-author",
+    })]
 
 
 def test_user_message_turn_still_discovers_third_party_open_pr(
