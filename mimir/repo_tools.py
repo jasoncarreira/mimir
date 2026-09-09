@@ -300,7 +300,11 @@ def _bounded_subprocess_runner(
             if output_limited:
                 break
         if timed_out or output_limited:
-            os.killpg(process.pid, signal.SIGKILL)
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError):
+                # A departed or no-longer-owned group must not mask the result.
+                pass
         returncode = process.wait(timeout=1)
     finally:
         selector.close()

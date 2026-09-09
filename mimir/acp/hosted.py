@@ -701,10 +701,10 @@ class HostedHandsProvider:
         if process not in self._signalled_processes:
             try:
                 os.killpg(pgid, 9)
-            except ProcessLookupError:
-                pass
-            except PermissionError:
-                if process.returncode is None:
+            except (ProcessLookupError, PermissionError) as error:
+                # Tolerate cleanup races, but EPERM on a first signal to a live
+                # process is not proof of exit and must not enter an endless wait.
+                if isinstance(error, PermissionError) and process.returncode is None:
                     raise
             # Retain successful signaling across cancellation of process.wait().
             # macOS can deny a second killpg while the killed leader has not yet
