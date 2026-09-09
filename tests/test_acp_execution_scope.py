@@ -9,7 +9,7 @@ import pytest
 
 from mimir.acp import hosted
 from mimir.acp.confinement import ConfinementUnavailable, PreparedCommand
-from mimir.acp.execution_scope import canonical_scope_path, MAX_SCOPE_REQUESTS
+from mimir.acp.execution_scope import ScopeApproval, canonical_scope_path, MAX_SCOPE_REQUESTS
 from mimir.acp.hosted import HostedHandsProvider, HostedMcpError
 
 
@@ -45,8 +45,42 @@ async def test_exact_grant_query_and_idempotence(provider, tmp_path):
     assert not session.scope.allows(tmp_path / "sibling")
     assert (await provider.request_scope(session, ""))["paths"] == result["paths"]
     assert (await provider.request_scope(session, str(path)))["approved"]
-    provider._request_scope_permission.assert_awaited_once_with("s", str(path))
+    provider._request_scope_permission.assert_awaited_once_with("s", ScopeApproval(path, False))
     provider._python_kernels.retire.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_directory_descendant_does_not_prompt(provider, tmp_path):
+    path = tmp_path / "data"
+    child = path / "sub" / "deep"
+    child.mkdir(parents=True)
+    sibling = tmp_path / "data-old"
+    sibling.mkdir()
+    session = provider._sessions["s"]
+    provider._python_kernels.retire = AsyncMock()
+    assert (await provider.request_scope(session, str(path)))["approved"]
+    for descendant in (child.parent, child):
+        assert (await provider.request_scope(session, str(descendant)))["approved"]
+    assert not session.scope.allows(tmp_path)
+    assert not session.scope.allows(sibling)
+    provider._request_scope_permission.assert_awaited_once_with("s", ScopeApproval(path, True))
+    provider._python_kernels.retire.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_file_kind_is_frozen_before_permission_reply(provider, tmp_path):
+    path = tmp_path / "file"
+    path.touch()
+    async def approve(session_id, grant):
+        assert grant == ScopeApproval(path, False)
+        path.unlink()
+        path.mkdir()
+        return True
+    provider._request_scope_permission = approve
+    session = provider._sessions["s"]
+    assert (await provider.request_scope(session, str(path)))["approved"]
+    assert session.scope.approved == {ScopeApproval(path, False)}
+    assert not session.scope.allows(path / "child")
 
 
 @pytest.mark.asyncio

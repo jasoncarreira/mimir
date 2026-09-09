@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Any, BinaryIO, Callable
 
 from .credentials import CredentialError, NativeCredentialStore
+from .execution_scope import ScopeApproval
 from .hosted import HostedHandsProvider, HostedMcpError
 from .profiles import Profile, ProfileError, ProfileStore, selected_profile
 from .transport import FORCE_CLOSE_TIMEOUT, PEER_EOF_GRACE_TIMEOUT, close_writer
@@ -553,14 +554,18 @@ class ProxyRouter:
             and not pending.owner_task.cancelling()
         )
 
-    async def _request_scope_permission(self, provider_session_id: str, path: str) -> bool:
-        return await self._request_execution_permission(provider_session_id, path=path)
+    async def _request_scope_permission(
+        self, provider_session_id: str, approval: ScopeApproval,
+    ) -> bool:
+        return await self._request_execution_permission(
+            provider_session_id, path=str(approval.path), recursive=approval.recursive,
+        )
 
     async def _request_unconfined_permission(self, provider_session_id: str) -> bool:
         return await self._request_execution_permission(provider_session_id, path=None)
 
     async def _request_execution_permission(
-        self, provider_session_id: str, *, path: str | None,
+        self, provider_session_id: str, *, path: str | None, recursive: bool = False,
     ) -> bool:
         """Ask the operator for one distinct scope or unavailable-backend risk.
 
@@ -612,8 +617,9 @@ class ProxyRouter:
             "from tool permissions and taint acknowledgement. Rejection is final "
             "for this session."
             if unconfined else
-            "Allow read/write access to this exact path for this session? "
-            "Extra directory paths do not include their children. "
+            "Allow read/write access to "
+            + ("this directory and everything beneath it" if recursive else "this file alone")
+            + " for this session? "
             "Approval restarts the Python kernel and loses all REPL state."
         )
         params = {
@@ -630,7 +636,7 @@ class ProxyRouter:
                     "optionId": "allow_session",
                     "name": (
                         "Accept unconfined execution for this session"
-                        if unconfined else "Allow this exact path for this session"
+                        if unconfined else "Allow this scope for this session"
                     ),
                     "kind": "allow_always",
                 },
