@@ -160,6 +160,9 @@ _TOKEN_PATTERNS: tuple[re.Pattern[str], ...] = (
     # stops at common delimiters so the regex doesn't eat the rest of the line.
     re.compile(r"(?i)(token=|api[_-]?key=|password=|passwd=|secret=)([^\s\"',&]+)"),
     # Credential fields in header, YAML, JSON, and Python-repr colon forms.
+    # The persistent log used to mask less than the transient SSE stream.
+    # Keep secret-removal parity pinned by the shared-corpus tests, not merely
+    # by checking that both outputs changed (one secret could still survive).
     # Requiring a credential-like key and a non-path boundary keeps ordinary
     # prose, timestamps, unrelated mappings, and URL userinfo intact.
     #
