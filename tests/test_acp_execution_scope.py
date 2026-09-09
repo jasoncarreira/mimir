@@ -16,6 +16,7 @@ from mimir.acp.hosted import HostedHandsProvider, HostedMcpError
 @pytest.fixture
 def provider(tmp_path, monkeypatch):
     monkeypatch.setattr(hosted, "prepare_command", lambda argv, **kw: PreparedCommand(tuple(argv), {}))
+    monkeypatch.setattr(hosted, "validate_scope", lambda **kw: None)
     instance = HostedHandsProvider(request_scope_permission=AsyncMock(return_value=True))
     instance.bind_session("s", tmp_path / "cwd")
     return instance

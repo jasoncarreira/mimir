@@ -12,7 +12,7 @@ from typing import Any
 from collections.abc import Awaitable, Callable
 
 from .audit import safe_log_event
-from .confinement import prepare_command, ConfinementUnavailable, BackendUnavailable
+from .confinement import prepare_command, validate_scope, ConfinementUnavailable, BackendUnavailable
 from .execution_scope import ExecutionScope, ScopeApproval, canonical_scope_path, MAX_SCOPE_REQUESTS, SCOPE_WARNING, UNCONFINED_WARNING
 
 from .hands_contract import (
@@ -496,9 +496,8 @@ class HostedHandsProvider:
                 generation = scope.generation
                 grant = ScopeApproval(path, recursive=path.is_dir())
                 try:
-                    # Validate backend before asking; no unconfined fallback.
-                    prepare_command(("/bin/true",), cwd=session.cwd,
-                                    approved_paths=(*scope.approved, grant))
+                    # Candidate validation must not load a pre-approval policy.
+                    validate_scope(cwd=session.cwd, candidate_paths=(*scope.approved, grant))
                     async with asyncio.timeout(60):
                         answer = await self._request_scope_permission(session.session_id, grant)
                     async with scope.execution_lock:

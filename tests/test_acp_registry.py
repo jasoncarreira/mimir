@@ -376,14 +376,14 @@ def test_docs_bound_unconfined_fallback_to_explicit_session_risk_approval() -> N
 def test_experimental_warning_matches_shipped_execution_confinement_contract() -> None:
     opening = " ".join(section("## Experimental status", "## Architecture and daemon").split())
     for value in (
-        "Execution confinement has one backend, and it is macOS-only.",
+        "macOS Seatbelt is the only verified execution-confinement backend.",
         "run under OS-level filesystem confinement by default",
         "mandatory wherever a backend is available",
         "a confined child cannot follow a symlink out of the approved paths",
-        "macOS Seatbelt (`sandbox-exec`)",
-        "On a platform with no backend the tools run only after the operator explicitly accepts the unconfined risk",
+        "macOS Seatbelt uses `sandbox-exec`",
+        "With an unavailable backend the tools run only after the operator explicitly accepts the unconfined risk",
         "cwd and path-scope grants do not protect files",
-        "Chainlink #1597 tracks a Linux backend",
+        "Linux AppArmor backend but does not verify Linux confinement on real hardware",
     ):
         assert value in opening
     assert "not shipped" not in opening.lower()
@@ -392,6 +392,7 @@ def test_experimental_warning_matches_shipped_execution_confinement_contract() -
     # OS execution confinement also hardens the lexical read/edit tools.
     assert "File confinement is lexical, not a sandbox." in opening
     assert "follow in-cwd symlinks even when their targets are outside it" in opening
+    assert "authorized Linux/AppArmor hardware-verification follow-up to #1597" in " ".join(DOCS.split())
 
 
 def test_docs_distinguish_revoked_risk_grant_from_operator_rejection() -> None:
