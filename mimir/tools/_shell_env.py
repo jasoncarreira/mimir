@@ -12,7 +12,12 @@ import shlex
 import sys
 import tempfile
 from contextvars import ContextVar, Token
+from dataclasses import dataclass
 from pathlib import Path
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from ..access_control import DeclaredShellCommand
 
 _TRUSTED_PATH_DIRS = (
     "/usr/local/sbin",
@@ -30,23 +35,63 @@ _MINIMAL_ENV_NAMES = frozenset({"HOME", "LANG", "TZ"})
 _CREDENTIAL_ENV_BY_EXECUTABLE = {
     "gh": frozenset({"GITHUB_TOKEN"}),
 }
-_DIRECT_EXEC_ARGV: ContextVar[tuple[str, ...] | None] = ContextVar(
+
+
+@dataclass(frozen=True)
+class _DirectExecBinding:
+    argv: tuple[str, ...]
+    pass_env: tuple[str, ...] = ()
+
+
+_DIRECT_EXEC_ARGV: ContextVar[_DirectExecBinding | None] = ContextVar(
     "mimir_direct_exec_argv", default=None,
 )
 
 
-def bind_direct_exec_argv(argv: list[str]) -> Token[tuple[str, ...] | None]:
+def bind_direct_exec_argv(
+    argv: list[str], *, command: str = "",
+    declared: tuple[DeclaredShellCommand, ...] = (),
+) -> Token[_DirectExecBinding | None]:
     """Bind middleware-authorized argv across ToolNode's injected-arg scrub."""
-    return _DIRECT_EXEC_ARGV.set(tuple(argv))
+    from ..access_control import _declared_command_execution_argv
+
+    names: tuple[str, ...] = ()
+    if declared:
+        try:
+            original = shlex.split(command)
+        except ValueError:
+            original = []
+        for declaration in declared:
+            candidate = _declared_command_execution_argv(original, (declaration,))
+            if candidate is not None:
+                if candidate == argv:
+                    names = declaration.pass_env
+                break
+    return _DIRECT_EXEC_ARGV.set(_DirectExecBinding(tuple(argv), names))
 
 
-def reset_direct_exec_argv(token: Token[tuple[str, ...] | None]) -> None:
+def reset_direct_exec_argv(token: Token[_DirectExecBinding | None]) -> None:
     _DIRECT_EXEC_ARGV.reset(token)
 
 
 def bound_direct_exec_argv() -> list[str] | None:
     argv = _DIRECT_EXEC_ARGV.get()
-    return list(argv) if argv is not None else None
+    return list(argv.argv) if argv is not None else None
+
+
+def direct_exec_pass_env(argv: list[str] | None) -> tuple[str, ...]:
+    binding = _DIRECT_EXEC_ARGV.get()
+    if binding is not None and argv is not None and binding.argv == tuple(argv):
+        return binding.pass_env
+    return ()
+
+
+def redact_direct_exec_output(
+    text: str, env: dict[str, str], names: tuple[str, ...],
+) -> str:
+    for value in sorted({env[key] for key in names if env.get(key)}, key=len, reverse=True):
+        text = text.replace(value, "[REDACTED]")
+    return text
 
 
 def scrub_model_selection_env(env: dict[str, str]) -> None:
@@ -98,9 +143,18 @@ def direct_exec_env(argv: list[str] | None = None) -> dict[str, str]:
     workspace virtualenv. The project test executable and fixed arguments come
     from operator configuration rather than language-specific inference here.
     Children receive only non-secret process settings by default. Executables
-    that genuinely require a credential are enumerated explicitly above.
+    can receive exact names from the matching operator declaration. The legacy
+    gh credential grant retains its config isolation and identity confirmation.
     """
     env = _minimal_direct_exec_env()
+    names = direct_exec_pass_env(argv)
+    passed = [key for key in names if key in os.environ]
+    for key in passed:
+        env[key] = os.environ[key]
+    if names:
+        from ..event_logger import log_event_sync
+
+        log_event_sync("service_shell_env_passthrough", pass_env=passed)
     executable = Path(argv[0]).name if argv else ""
     for key in _CREDENTIAL_ENV_BY_EXECUTABLE.get(executable, ()):
         if key in os.environ:

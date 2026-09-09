@@ -18,6 +18,7 @@ from mimir.access_control import (
     OperationDecision,
     ToolFlowDirection,
     canonical_client_file_resource,
+    client_file_resource_path,
     get_operation_catalog,
     get_sink_category,
     get_tool_flow_direction,
@@ -105,7 +106,7 @@ def _context(
         prompt_epoch=1,
         acp_delivery=True,
         lease=SimpleNamespace(closed=False),
-        cwd="/untrusted/audit-only",
+        cwd="/tmp",
     )
 
 
@@ -419,7 +420,7 @@ def test_client_file_identity_is_opaque_canonical_utf8() -> None:
     assert canonical_client_file_resource("") is None
     assert canonical_client_file_resource("bad\x00path") is None
     assert canonical_client_file_resource("\ud800") is None
-    assert CLIENT_FILE_RESOURCE_POLICY.allows("client-file:any%2Fpath")
+    assert not CLIENT_FILE_RESOURCE_POLICY.allows("client-file:any%2Fpath")
     assert not CLIENT_FILE_RESOURCE_POLICY.allows("client-file:any/path")
     assert not CLIENT_FILE_RESOURCE_POLICY.allows("client-file:%gg")
     assert not CLIENT_FILE_RESOURCE_POLICY.allows("file:any")
@@ -427,9 +428,9 @@ def test_client_file_identity_is_opaque_canonical_utf8() -> None:
 
 @pytest.mark.parametrize("wrapper", [hands_read, hands_edit])
 @pytest.mark.parametrize(("path", "resource"), [
-    ("relative/../x", "client-file:relative%2F..%2Fx"),
+    ("relative/../x", "client-file:%2Ftmp%2Fx"),
     ("/tmp/a b", "client-file:%2Ftmp%2Fa%20b"),
-    ("%2f//é\\file", "client-file:%252f%2F%2F%C3%A9%5Cfile"),
+    ("%2f//é\\file", "client-file:%2Ftmp%2F%252f%2F%C3%A9%5Cfile"),
 ])
 @pytest.mark.parametrize("allowed", [True, False])
 async def test_eligibility_resource_matches_wrapper_policy(
@@ -437,16 +438,15 @@ async def test_eligibility_resource_matches_wrapper_policy(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     arguments = {"path": path}
-    wire_arguments = {"path": path}
+    wire_arguments = {"path": client_file_resource_path(resource)}
     if wrapper is hands_edit:
         arguments.update(old_text="old", new_text="new")
         wire_arguments.update(oldText="old", newText="new")
-    eligibility = PermissionEligibility("call", wrapper.name, "other", arguments)
-    assert eligibility.canonical_client_resource == resource
     checked = []
 
     def allows(self: ClientFileResourcePolicy, candidate: str) -> bool:
-        assert self is CLIENT_FILE_RESOURCE_POLICY
+        assert self == ClientFileResourcePolicy.for_cwd("/tmp")
+        assert self is not CLIENT_FILE_RESOURCE_POLICY
         checked.append(candidate)
         return allowed
 
@@ -454,6 +454,8 @@ async def test_eligibility_resource_matches_wrapper_policy(
     provider = FakeProvider({"read": {"content": "ok"}, "edit": {"changed": True}})
     token = set_turn_capability_context(_context(provider))
     try:
+        eligibility = PermissionEligibility("call", wrapper.name, "other", arguments)
+        assert eligibility.canonical_client_resource == resource
         if allowed:
             await wrapper.ainvoke(arguments)
         else:
@@ -463,6 +465,158 @@ async def test_eligibility_resource_matches_wrapper_policy(
         reset_turn_capability_context(token)
     assert checked == [eligibility.canonical_client_resource]
     assert provider.calls == ([(wrapper.name.removeprefix("hands_"), wire_arguments)] if allowed else [])
+
+
+@pytest.mark.parametrize("wrapper", [hands_read, hands_edit])
+@pytest.mark.parametrize(("path", "absolute"), [
+    ("notes.txt", "/tmp/work/notes.txt"),
+    ("sub/../notes.txt", "/tmp/work/notes.txt"),
+    ("/tmp/work//sub/./notes.txt", "/tmp/work/sub/notes.txt"),
+    ("//tmp/work/notes.txt", "/tmp/work/notes.txt"),
+    ("../work/notes.txt", "/tmp/work/notes.txt"),
+    ("%2e%2e/notes.txt", "/tmp/work/%2e%2e/notes.txt"),
+    ("/tmp/work", "/tmp/work"),
+    ("../notes.txt", None),
+    ("sub/../../notes.txt", None),
+    ("/tmp/work/../notes.txt", None),
+    ("/tmp/work-sibling/notes.txt", None),
+    ("/etc/passwd", None),
+])
+async def test_file_wrappers_confine_and_dispatch_absolute_paths(
+    wrapper: Any, path: str, absolute: str | None,
+) -> None:
+    provider = FakeProvider({"read": {"content": "ok"}, "edit": {"changed": True}})
+    context = replace(_context(provider), cwd="/tmp/work/./")
+    arguments = {"path": path}
+    if wrapper is hands_edit:
+        arguments.update(old_text="old", new_text="new")
+    token = set_turn_capability_context(context)
+    try:
+        if absolute is None:
+            with pytest.raises(ToolException, match="cwd boundary '/tmp/work/./'"):
+                await wrapper.ainvoke(arguments)
+            assert provider.calls == []
+        else:
+            await wrapper.ainvoke(arguments)
+            wire = {"path": absolute}
+            if wrapper is hands_edit:
+                wire.update(oldText="old", newText="new")
+            assert provider.calls == [(wrapper.name.removeprefix("hands_"), wire)]
+    finally:
+        reset_turn_capability_context(token)
+
+
+@pytest.mark.parametrize("wrapper", [hands_read, hands_edit])
+@pytest.mark.parametrize("cwd", [None, "", "relative", "../tmp", "file:///tmp", 1, "/bad\x00cwd", "/\ud800"])
+@pytest.mark.parametrize("path", ["notes.txt", "/tmp/notes.txt"])
+async def test_file_wrappers_fail_closed_for_invalid_cwd(
+    wrapper: Any, cwd: object, path: str,
+) -> None:
+    provider = FakeProvider({})
+    context = replace(_context(provider), cwd=cwd)
+    assert not context.resource_policy.allows(canonical_client_file_resource(path))
+    arguments = {"path": path}
+    if wrapper is hands_edit:
+        arguments.update(old_text="old", new_text="new")
+    token = set_turn_capability_context(context)
+    try:
+        with pytest.raises(ToolException, match="cwd boundary"):
+            await wrapper.ainvoke(arguments)
+    finally:
+        reset_turn_capability_context(token)
+    assert provider.calls == []
+
+
+@pytest.mark.parametrize(("resource", "allowed"), [
+    ("client-file:%2ftmp%2f%77ork%2fnotes.txt", True),
+    ("client-file:%2Ftmp%2Fwork%2Fsub%2F%2e%2E%2Fnotes.txt", True),
+    ("client-file:%2Ftmp%2Fwork%2F%2e%2e%2Fsecret", False),
+    ("client-file:%2Ftmp%2Fwork-sibling%2Fsecret", False),
+    ("client-file:%2Ftmp%2Fwork%2F%252e%252e%2Fnotes.txt", True),
+    ("client-file:notes.txt", False),
+    ("client-file:%2Ftmp%2Fwork%2F%00", False),
+    ("client-file:%2Ftmp%2Fwork%2F%ff", False),
+    ("client-file:%2Ftmp%2Fwork%2F%gg", False),
+    ("client-file:/tmp/work/notes.txt", False),
+])
+def test_cwd_policy_compares_decoded_normalized_resources(resource: str, allowed: bool) -> None:
+    policy = ClientFileResourcePolicy.for_cwd("/tmp//work/sub/../")
+    assert policy.grant == "client-file:%2Ftmp%2Fwork%2F*"
+    assert policy.allows(resource) is allowed
+    assert not CLIENT_FILE_RESOURCE_POLICY.allows(resource)
+
+
+def test_root_cwd_policy_and_encoded_grant() -> None:
+    assert ClientFileResourcePolicy.for_cwd("/").allows("client-file:%2Fetc%2Ffile")
+    policy = ClientFileResourcePolicy("client-file", "client-file:%2ftmp%2f%77ork%2f*")
+    assert policy.allows("client-file:%2Ftmp%2Fwork%2Ffile")
+    assert not policy.allows("client-file:%2Ftmp%2Fwork-other%2Ffile")
+
+
+@pytest.mark.parametrize(("namespace", "grant"), [
+    ("other", "client-file:%2Ftmp%2Fwork%2F*"),
+    ("client-file", "client-file:%2Ftmp%2Fwork%2F"),
+    ("client-file", "client-file:*"),
+    ("client-file", "client-file:relative%2F*"),
+    ("client-file", "client-file:%2Ftmp%2Fwork*"),
+])
+def test_cwd_policy_rejects_invalid_grants(namespace: str, grant: str) -> None:
+    assert not ClientFileResourcePolicy(namespace, grant).allows(
+        "client-file:%2Ftmp%2Fwork%2Ffile",
+    )
+
+
+@pytest.mark.parametrize("enforce", [True, False])
+@pytest.mark.parametrize("cwd", ["/tmp/work", None, "relative"])
+async def test_denied_cwd_read_never_earns_trust(enforce: bool, cwd: str | None) -> None:
+    provider = FakeProvider({})
+    token = set_turn_capability_context(replace(_context(provider), cwd=cwd))
+    try:
+        authorization = get_tool_registry().authorize_tool(
+            "hands_read", _admin_auth(), enforce=enforce,
+            arguments={"path": "/tmp/work-sibling/secret"},
+        )
+        assert authorization.allowed is (not enforce)
+        assert authorization.would_block
+        assert authorization.result_integrity == "untrusted"
+        assert authorization.protected_source_resources == ()
+        assert "cwd boundary" in authorization.reason
+        with pytest.raises(ToolException, match="cwd boundary"):
+            await hands_read.ainvoke({"path": "/tmp/work-sibling/secret"})
+        assert provider.calls == []
+    finally:
+        reset_turn_capability_context(token)
+
+
+@pytest.mark.parametrize("wrapper", [hands_read, hands_edit])
+async def test_concurrent_sessions_keep_independent_cwd_policies(wrapper: Any) -> None:
+    ready = [asyncio.Event(), asyncio.Event()]
+
+    async def session(index: int) -> None:
+        provider = FakeProvider({"read": {"content": "ok"}, "edit": {"changed": True}})
+        cwd = f"/tmp/session-{index}"
+        context = replace(_context(provider), cwd=cwd)
+        assert context.profile_policy is MIMIR_HANDS_V1
+        token = set_turn_capability_context(context)
+        try:
+            ready[index].set()
+            await ready[1 - index].wait()
+            arguments = {"path": "notes.txt"}
+            if wrapper is hands_edit:
+                arguments.update(old_text="old", new_text="new")
+            eligibility = PermissionEligibility("call", wrapper.name, "other", arguments)
+            assert eligibility.canonical_client_resource == canonical_client_file_resource(
+                f"{cwd}/notes.txt",
+            )
+            await wrapper.ainvoke(arguments)
+            assert provider.calls[0][1]["path"] == f"{cwd}/notes.txt"
+            with pytest.raises(ToolException, match="cwd boundary"):
+                await wrapper.ainvoke({**arguments, "path": f"/tmp/session-{1 - index}/notes.txt"})
+            assert len(provider.calls) == 1
+        finally:
+            reset_turn_capability_context(token)
+
+    await asyncio.gather(session(0), session(1))
 
 
 @pytest.mark.parametrize("wrapper", [hands_read, hands_edit])
@@ -536,7 +690,7 @@ async def test_wrappers_route_through_current_turn_provider() -> None:
     finally:
         reset_turn_capability_context(token)
     assert first.calls[1] == (
-        "edit", {"path": "a", "oldText": "x", "newText": "y"}
+        "edit", {"path": "/tmp/a", "oldText": "x", "newText": "y"}
     )
 
 
@@ -691,10 +845,10 @@ async def test_provider_faults_are_not_tool_errors(failure: str, reply: str) -> 
 @pytest.mark.parametrize(
     ("path", "resource"),
     [
-        ("notes.txt", "client-file:notes.txt"),
+        ("notes.txt", "client-file:%2Ftmp%2Fnotes.txt"),
         ("/tmp/a b", "client-file:%2Ftmp%2Fa%20b"),
-        ("client/../notes.txt", "client-file:client%2F..%2Fnotes.txt"),
-        ("é\\file", "client-file:%C3%A9%5Cfile"),
+        ("client/../notes.txt", "client-file:%2Ftmp%2Fnotes.txt"),
+        ("é\\file", "client-file:%2Ftmp%2F%C3%A9%5Cfile"),
     ],
 )
 async def test_hands_read_central_authorization_allows_admitted_admin(
@@ -712,14 +866,14 @@ async def test_hands_read_central_authorization_allows_admitted_admin(
         assert authorization.allowed is True
         assert authorization.protected_source_resources == (resource,)
         assert authorization.flow_direction is ToolFlowDirection.SOURCE
-        assert authorization.result_integrity == "untrusted"
+        assert authorization.result_integrity == "trusted"
         assert provider.calls == []
         assert await hands_read.ainvoke({"path": path}) == {
             "content": "trusted route"
         }
     finally:
         reset_turn_capability_context(token)
-    assert provider.calls == [("read", {"path": path})]
+    assert provider.calls == [("read", {"path": client_file_resource_path(resource)})]
 
 
 @pytest.mark.asyncio
@@ -786,7 +940,7 @@ async def test_hands_read_rejects_malformed_provider_result() -> None:
 
     with pytest.raises(ToolException, match="malformed result"):
         await _invoke_authorized_read(provider, "a", auth_context=_admin_auth())
-    assert provider.calls == [("read", {"path": "a"})]
+    assert provider.calls == [("read", {"path": "/tmp/a"})]
 
 
 def test_hands_surface_is_static_without_client_mcp_registration() -> None:

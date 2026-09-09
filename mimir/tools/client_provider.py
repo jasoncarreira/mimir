@@ -24,6 +24,7 @@ from ..access_control import (
     CLIENT_FILE_RESOURCE_POLICY,
     ClientFileResourcePolicy,
     canonical_client_file_resource,
+    client_file_resource_path,
 )
 
 
@@ -65,10 +66,13 @@ class PermissionEligibility:
     def __post_init__(self) -> None:
         # Metadata only: the wrappers still enforce their resource policy.
         if self.title in {"hands_read", "hands_edit"}:
+            context = get_turn_capability_context()
             object.__setattr__(
                 self,
                 "canonical_client_resource",
-                canonical_client_file_resource(self.arguments.get("path")),
+                canonical_client_file_resource(
+                    self.arguments.get("path"), cwd=context.cwd if context else None,
+                ),
             )
 
 
@@ -160,6 +164,10 @@ class TurnCapabilityContext:
     acp_delivery: bool
     lease: Any
     cwd: str | None = None
+
+    @property
+    def resource_policy(self) -> ClientFileResourcePolicy:
+        return ClientFileResourcePolicy.for_cwd(self.cwd)
 
 
 _TURN_CAPABILITY_CONTEXT: ContextVar[TurnCapabilityContext | None] = ContextVar(
@@ -501,10 +509,10 @@ async def _call_hands_tool(
 async def hands_read(path: str) -> dict[str, str]:
     """Read client-hosted file content using the admitted hands provider."""
     context, policy = _active_policy("hands_read")
-    resource = canonical_client_file_resource(path)
-    if resource is None or not context.profile_policy.resource_policy.allows(resource):
-        raise ToolException("hands_read path is not authorized")
-    result = await _call_hands_tool(context, policy, {"path": path})
+    resource = canonical_client_file_resource(path, cwd=context.cwd)
+    if resource is None or not context.resource_policy.allows(resource):
+        raise ToolException(f"hands_read path is not authorized by cwd boundary {context.cwd!r}")
+    result = await _call_hands_tool(context, policy, {"path": client_file_resource_path(resource)})
     return _validate_result(result, "hands_read")
 
 
@@ -512,12 +520,12 @@ async def hands_read(path: str) -> dict[str, str]:
 async def hands_edit(path: str, old_text: str, new_text: str) -> dict[str, bool]:
     """Replace exact text in a client-hosted file using the admitted hands provider."""
     context, policy = _active_policy("hands_edit")
-    resource = canonical_client_file_resource(path)
-    if resource is None or not context.profile_policy.resource_policy.allows(resource):
-        raise ToolException("hands_edit path is not authorized")
+    resource = canonical_client_file_resource(path, cwd=context.cwd)
+    if resource is None or not context.resource_policy.allows(resource):
+        raise ToolException(f"hands_edit path is not authorized by cwd boundary {context.cwd!r}")
     result = await _call_hands_tool(
         context, policy,
-        {"path": path, "oldText": old_text, "newText": new_text},
+        {"path": client_file_resource_path(resource), "oldText": old_text, "newText": new_text},
     )
     return _validate_result(result, "hands_edit")
 

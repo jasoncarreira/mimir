@@ -68,6 +68,7 @@ def fake_registry(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> ShellJobRe
     def _fake_spawn(
         command: str, *, argv: list[str], channel_id: str | None,
         on_complete=None, auth_context=None, env_overlay=None, cwd=None,
+        redact_values=(),
     ) -> _FakeJob:
         job = _FakeJob(command=command, channel_id=channel_id)
         job.auth_context = auth_context
@@ -77,6 +78,7 @@ def fake_registry(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> ShellJobRe
             "channel_id": channel_id,
             "auth_context": auth_context,
             "env_overlay": env_overlay,
+            "redact_values": redact_values,
             "cwd": cwd,
             "job": job,
         })
@@ -127,6 +129,40 @@ async def test_bash_async_direct_command_uses_trusted_environment(
 
     overlay = fake_registry._spawned_log[0]["env_overlay"]  # type: ignore[attr-defined]
     assert overlay["PATH"] == direct_exec_env_overlay()["PATH"]
+
+
+@pytest.mark.asyncio
+async def test_bash_async_snapshots_only_declared_values(fake_registry, monkeypatch):
+    from mimir.tools import _shell_env
+
+    overlay = {"TOKEN": "spawn-secret", "OTHER": "not-declared", "EMPTY": "", "UNSET": None}
+    monkeypatch.setattr(_shell_env, "direct_exec_pass_env", lambda argv: ("TOKEN", "EMPTY", "UNSET"))
+    monkeypatch.setattr(_shell_env, "direct_exec_env_overlay", lambda argv: overlay)
+    out = await shell_async.bash_async.coroutine(
+        command="pwd", mimir_direct_argv=["/usr/bin/pwd"],
+    )
+    assert "Spawned job" in out
+    overlay["TOKEN"] = "rotated-secret"
+    assert fake_registry._spawned_log[0]["redact_values"] == ("spawn-secret",)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure_site", ["overlay", "spawn"])
+async def test_bash_async_declared_failure_hides_values(fake_registry, monkeypatch, failure_site):
+    from mimir.tools import _shell_env
+
+    monkeypatch.setattr(_shell_env, "direct_exec_pass_env", lambda argv: ("TOKEN",))
+
+    def fail(*args, **kwargs):
+        raise RuntimeError("private-value")
+
+    monkeypatch.setattr(_shell_env, "direct_exec_env_overlay", lambda argv: {"TOKEN": "private-value"})
+    if failure_site == "overlay":
+        monkeypatch.setattr(_shell_env, "direct_exec_env_overlay", fail)
+    else:
+        monkeypatch.setattr(fake_registry, "spawn", fail)
+    out = await shell_async.bash_async.coroutine(command="pwd", mimir_direct_argv=["/usr/bin/pwd"])
+    assert out == "bash_async failed: RuntimeError"
 
 
 @pytest.mark.asyncio

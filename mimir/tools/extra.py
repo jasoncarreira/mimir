@@ -543,6 +543,12 @@ def shell_exec(
     parts = [f"exit={proc.returncode}"]
     stdout = (proc.stdout or b"").decode("utf-8", errors="replace")
     stderr = (proc.stderr or b"").decode("utf-8", errors="replace")
+    if direct_env is not None:
+        from ._shell_env import direct_exec_pass_env, redact_direct_exec_output
+
+        names = direct_exec_pass_env(argv)
+        stdout = redact_direct_exec_output(stdout, direct_env, names)
+        stderr = redact_direct_exec_output(stderr, direct_env, names)
     if proc.returncode == 0:
         target = _cd_target(command, effective_cwd)
         session_id = _shell_session_id() if direct_argv is None else None

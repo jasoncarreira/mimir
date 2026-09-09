@@ -414,9 +414,23 @@ _CLIENT_FILE_UNRESERVED = frozenset(
 )
 
 
-def canonical_client_file_resource(path: object) -> str | None:
+def canonical_client_file_resource(path: object, cwd: object = None) -> str | None:
+    import posixpath
+
     if not isinstance(path, str) or not path or "\x00" in path:
         return None
+    if cwd is not None:
+        if (
+            not isinstance(cwd, str) or not cwd.startswith("/")
+            or "\x00" in cwd
+        ):
+            return None
+        try:
+            cwd.encode("utf-8")
+        except UnicodeEncodeError:
+            return None
+        # POSIX lexical confinement only; never resolve client-hosted symlinks.
+        path = posixpath.normpath("/" + posixpath.join(cwd, path).lstrip("/"))
     try:
         encoded = path.encode("utf-8")
     except UnicodeEncodeError:
@@ -428,13 +442,14 @@ def canonical_client_file_resource(path: object) -> str | None:
     return f"{CLIENT_FILE_RESOURCE_NAMESPACE}:{identity}"
 
 
-def client_file_resource_is_canonical(resource: object) -> bool:
+def client_file_resource_path(resource: object) -> str | None:
+    """Decode a client resource once, accepting equivalent percent encodings."""
     prefix = f"{CLIENT_FILE_RESOURCE_NAMESPACE}:"
     if not isinstance(resource, str) or not resource.startswith(prefix):
-        return False
+        return None
     encoded_identity = resource[len(prefix):]
     if not encoded_identity:
-        return False
+        return None
     decoded = bytearray()
     index = 0
     while index < len(encoded_identity):
@@ -446,16 +461,21 @@ def client_file_resource_is_canonical(resource: object) -> bool:
         if (
             value != "%"
             or index + 2 >= len(encoded_identity)
-            or not re.fullmatch(r"[0-9A-F]{2}", encoded_identity[index + 1:index + 3])
+            or not re.fullmatch(r"[0-9A-Fa-f]{2}", encoded_identity[index + 1:index + 3])
         ):
-            return False
+            return None
         decoded.append(int(encoded_identity[index + 1:index + 3], 16))
         index += 3
     try:
         path = bytes(decoded).decode("utf-8")
     except UnicodeDecodeError:
-        return False
-    return canonical_client_file_resource(path) == resource
+        return None
+    return path if canonical_client_file_resource(path) is not None else None
+
+
+def client_file_resource_is_canonical(resource: object) -> bool:
+    path = client_file_resource_path(resource)
+    return path is not None and canonical_client_file_resource(path) == resource
 
 
 @dataclass(frozen=True)
@@ -463,17 +483,36 @@ class ClientFileResourcePolicy:
     namespace: str
     grant: str
 
+    @classmethod
+    def for_cwd(cls, cwd: object) -> ClientFileResourcePolicy:
+        resource = (
+            canonical_client_file_resource(cwd, cwd="/")
+            if isinstance(cwd, str) and cwd.startswith("/") else None
+        )
+        path = client_file_resource_path(resource)
+        grant = canonical_client_file_resource(path.rstrip("/") + "/") if path else None
+        return cls(CLIENT_FILE_RESOURCE_NAMESPACE, f"{grant}*" if grant else "")
+
     def allows(self, resource: object) -> bool:
-        return (
-            self.namespace == CLIENT_FILE_RESOURCE_NAMESPACE
-            and self.grant == f"{CLIENT_FILE_RESOURCE_NAMESPACE}:*"
-            and client_file_resource_is_canonical(resource)
+        if self.namespace != CLIENT_FILE_RESOURCE_NAMESPACE or not self.grant.endswith("*"):
+            return False
+        boundary = client_file_resource_path(self.grant[:-1])
+        path = client_file_resource_path(resource)
+        if not boundary or not boundary.startswith("/") or not boundary.endswith("/"):
+            return False
+        if not path or not path.startswith("/"):
+            return False
+        root = client_file_resource_path(canonical_client_file_resource(boundary, cwd="/"))
+        path = client_file_resource_path(canonical_client_file_resource(path, cwd="/"))
+        return root is not None and path is not None and (
+            path == root or path.startswith(root.rstrip("/") + "/")
         )
 
 
 CLIENT_FILE_RESOURCE_POLICY = ClientFileResourcePolicy(
     namespace=CLIENT_FILE_RESOURCE_NAMESPACE,
-    grant=f"{CLIENT_FILE_RESOURCE_NAMESPACE}:*",
+    # Profile identity only. File grants must come from the bound session cwd.
+    grant="",
 )
 
 
@@ -2012,6 +2051,7 @@ class DeclaredShellCommand:
     subcommands: tuple[tuple[str, ...], ...] = ()
     options: tuple[str, ...] = ()
     script: Path | None = None
+    pass_env: tuple[str, ...] = ()
 
 
 class DeclaredShellCommandError(ValueError):
@@ -2142,9 +2182,23 @@ def parse_declared_shell_commands(
         name = entry.get("exec")
         if not isinstance(name, str) or not name or "/" in name or name != Path(name).name:
             raise ValueError(f"shell_commands exec must be a bare command name, got {name!r}")
-        unknown = set(entry) - {"exec", "path", "subcommands", "options", "script"}
+        unknown = set(entry) - {"exec", "path", "subcommands", "options", "script", "pass_env"}
         if unknown:
             raise _declaration_error(name, f"unknown keys {sorted(unknown)}")
+
+        pass_env = entry.get("pass_env", [])
+        if not isinstance(pass_env, list) or not all(
+            isinstance(key, str) and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", key)
+            for key in pass_env
+        ):
+            raise _declaration_error(name, "pass_env must be a list of exact environment variable names")
+        # Credentials must not undo executable/config isolation or gh identity.
+        if any(
+            key in {"PATH", "MIMIR_MODEL_SPEC", "BASH_ENV", "ENV"}
+            or key.startswith(("LD_", "DYLD_", "PYTHON", "GIT_", "GH_"))
+            for key in pass_env
+        ):
+            raise _declaration_error(name, "pass_env cannot override process-control environment")
 
         raw_path = entry.get("path")
         if not isinstance(raw_path, str) or not raw_path:
@@ -2250,6 +2304,7 @@ def parse_declared_shell_commands(
             subcommands=tuple(subcommands),
             options=tuple(options_raw),
             script=script,
+            pass_env=tuple(dict.fromkeys(pass_env)),
         ))
     return tuple(out)
 
@@ -8741,7 +8796,8 @@ class ToolRegistry:
                 profile = getattr(capability_context, "profile_policy", None)
                 resource_policy = getattr(profile, "resource_policy", None)
                 resource = canonical_client_file_resource(
-                    (arguments or {}).get("path")
+                    (arguments or {}).get("path"),
+                    cwd=getattr(capability_context, "cwd", None),
                 )
                 authenticated_admin = (
                     auth_context is not None
@@ -8758,11 +8814,8 @@ class ToolRegistry:
                     and capability_context.acp_delivery is True
                     and profile is MIMIR_HANDS_V1
                     and resource_policy is CLIENT_FILE_RESOURCE_POLICY
-                    and resource_policy.namespace == CLIENT_FILE_RESOURCE_NAMESPACE
-                    and resource_policy.grant
-                    == f"{CLIENT_FILE_RESOURCE_NAMESPACE}:*"
                     and resource is not None
-                    and resource_policy.allows(resource)
+                    and capability_context.resource_policy.allows(resource)
                     and getattr(capability_context, "lease", None) is not None
                     and not getattr(capability_context.lease, "closed", False)
                 )
@@ -8771,14 +8824,17 @@ class ToolRegistry:
                     tool_name=tool_name,
                     decision=OperationDecision.RESOURCE_SCOPED,
                     allowed=in_scope or not enforce,
-                    reason=None if in_scope else "client_file_scope_denied",
+                    reason=None if in_scope else (
+                        "client_file_scope_denied: session cwd boundary "
+                        f"{getattr(capability_context, 'cwd', None)!r}"
+                    ),
                     required_tier=AccessTier.USER if in_scope else AccessTier.ADMIN,
                     enforcement_enabled=enforce,
                     is_shadow_decision=not enforce and not in_scope,
                     would_block=not in_scope,
                     protected_source_resources=(resource,) if in_scope else (),
                     flow_direction=flow_direction,
-                    result_integrity="untrusted",
+                    result_integrity="trusted" if in_scope else "untrusted",
                 )
                 if hands_auth.is_shadow_decision:
                     self._emit_shadow_decision(
@@ -10083,6 +10139,11 @@ def classify_protected_result(
                 auth_context=auth_context,
             )
         labels = InformationFlowLabels().with_channel(channel)
+        # Only an authorized cwd read earns trust; consent to execute does not.
+        trusted_read = (
+            tool_name == "hands_read"
+            and authorization.result_integrity == "trusted"
+        )
         for resource in resources:
             labels = labels.with_source(SourceLabel(
                 principal=principal,
@@ -10092,7 +10153,7 @@ def classify_protected_result(
                 sensitivity="internal",
                 authorized_principals=frozenset({principal}),
                 source_kind=_ACP_HANDS_RESULT_SOURCE_KIND,
-                integrity="untrusted",
+                integrity="trusted" if trusted_read else "untrusted",
                 integrity_effect="active_ingest",
             ))
         return labels
