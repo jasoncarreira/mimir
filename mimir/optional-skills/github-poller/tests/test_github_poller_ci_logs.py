@@ -43,7 +43,7 @@ def ci(monkeypatch, tmp_path):
     payload = (
         b"useful output\n" * 6000 + b"\x1b]0;" + b"hidden" * 20000
         + b"\x1b\\\x1b[31mFAILED sentinel\x1b[0m\x00\x08\r\x7f\t\n"
-        + "\u009dhidden\u009c\u202e".encode()
+        + "\u009dhidden\u009c\u202e".encode() + b"password=x ghp_ci_secret\n"
     )
     calls = []
     log_timeouts = []
@@ -110,6 +110,8 @@ def test_remediation_log_read_reachable(ci, capsys, path):
     assert all(c in "\t\n" or unicodedata.category(c) not in {"Cc", "Cf"} for c in evidence)
     assert len(evidence.encode()) < 2200
     assert "test-token" not in prompt
+    assert "password=x" not in prompt and "ghp_ci_secret" not in prompt
+    assert "[REDACTED]" in prompt
     assert sum("--allow-escape-sequences" in call for call in ci.calls) == 1
 
 

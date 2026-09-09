@@ -31,9 +31,30 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
-# Also support import-by-path test runners, which do not add the script directory.
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-from ci_logs import LOG_EXCERPT_BYTES, capture_job_log, clean_log_tail as _clean_log_tail
+def _ensure_mimir_import_path() -> None:
+    """Resolve the shared package for source and installed-skill entrypoints."""
+    candidates = [Path(__file__).resolve().parents[4]]
+    if source_dir := os.environ.get("MIMIR_SOURCE_DIR"):
+        candidates.append(Path(source_dir))
+    venv_root = Path(sys.executable).parent.parent
+    if venv_root.name in {".venv", "venv"}:
+        candidates.append(venv_root.parent)
+    for candidate in candidates:
+        if not (candidate / "mimir" / "__init__.py").is_file():
+            continue
+        path = str(candidate)
+        while path in sys.path:
+            sys.path.remove(path)
+        sys.path.insert(0, path)
+        # System-python poller commands also need the checkout's runtime deps.
+        for site in sorted((candidate / ".venv" / "lib").glob("python*/site-packages")):
+            if str(site) not in sys.path:
+                sys.path.append(str(site))
+        return
+
+
+_ensure_mimir_import_path()
+from mimir.ci_logs import LOG_EXCERPT_BYTES, capture_job_log, clean_log_tail as _clean_log_tail
 
 STATE_DIR = Path(os.environ.get("STATE_DIR", Path(__file__).parent.parent))
 SEEN_FILE = STATE_DIR / "seen_run_ids.json"

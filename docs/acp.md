@@ -15,11 +15,14 @@ operator-visible limits are:
   reject paths outside the session cwd, but follow in-cwd symlinks even when
   their targets are outside it. Select a trusted project directory and inspect
   its symlinks before granting access.
-- **Execution is not filesystem-confined.** `hands_shell` runs `/bin/sh -c` and
-  `hands_python` runs a Python REPL. Both start with the session cwd, but the
-  whole filesystem remains reachable subject to the client user's OS permissions.
-  Review execution permission requests and use separate OS-level confinement
-  if needed. Execution confinement is tracked by Chainlink #1593, not shipped.
+- **Execution confinement has one backend, and it is macOS-only.** `hands_shell`
+  and `hands_python` run under OS-level filesystem confinement by default, and it
+  is mandatory wherever a backend is available; a confined child cannot follow a
+  symlink out of the approved paths the way `hands_read` and `hands_edit` can.
+  The only backend today is macOS Seatbelt (`sandbox-exec`), which Apple has
+  deprecated. On a platform with no backend the tools run only after the operator
+  explicitly accepts the unconfined risk, and in that mode the cwd and path-scope
+  grants do not protect files. Chainlink #1597 tracks a Linux backend.
 - **Python state is temporary.** Closing the client or restarting its proxy loses
   the REPL namespace; loading the daemon transcript does not recover it. Save
   needed results explicitly and rerun initialization after reconnecting.
@@ -208,7 +211,7 @@ Transport death cancels and quarantines only that ACP generation. The daemon, we
 
 ## Providers, permissions, and filesystems
 
-When `mcpServers` is missing or empty, the local proxy injects one locally hosted MCP-over-ACP provider named `mimir-hands`. An explicit nonempty provider collection is preserved. The `mimir.hands.v1` profile contains exactly `read`, `edit`, `shell`, and `python`; it is validated afresh on session new, session load, and provider-list change. Read is prompt-free. Edit, shell, and Python require exact-call operator permission immediately before execution. `allow_session` creates only an in-memory proxy grant for that session and tool, and a tainted call always prompts again unless an admin has acknowledged the current ingest snapshot with `clear_ingest_taint`. Grants never create daemon authority and are revoked on load, disconnect, generation replacement, or proxy exit.
+When `mcpServers` is missing or empty, the local proxy injects one locally hosted MCP-over-ACP provider named `mimir-hands`. An explicit nonempty provider collection is preserved. The `mimir.hands.v1` profile contains exactly `read`, `edit`, `shell`, `python`, and `request_scope`; it is validated afresh on session new, session load, and provider-list change. Read is prompt-free. Edit, shell, and Python require exact-call operator permission immediately before execution. `allow_session` creates only an in-memory proxy grant for that session and tool, and a tainted call always prompts again unless an admin has acknowledged the current ingest snapshot with `clear_ingest_taint`. Grants never create daemon authority and are revoked on load, disconnect, generation replacement, or proxy exit.
 
 An authenticated, non-service admin on a live user turn can ask Mimir to call
 `clear_ingest_taint`. It durably audits and acknowledges only the current ingest
@@ -227,9 +230,9 @@ do not rely on a symlink escape as isolation.
 
 Native Mimir tools operate on the daemon host. Mimir Hands operates with the local client's user authority. `hands_read` and `hands_edit` are confined to the session's bound `cwd`: relative paths are normalized against it, and absolute paths outside it (including sibling directories) are refused. This is lexical path confinement only. The daemon cannot resolve symlinks on the client's filesystem; a symlink inside the cwd pointing outside it is still followed. Admins should scope a directory whose content and symlinks they trust. Successful cwd reads retain their source and originating-channel labels but no longer add untrusted active ingest. They do not clear taint from URLs, forge results, messages, or other untrusted sources.
 
-`hands_shell` and `hands_python` are not path-confined: they take a command and a code string, not a path. Their child processes start in the session cwd, but can open files elsewhere. Restricting execution requires separate OS-level confinement. Their output remains untrusted active ingest, so a shell result can still cause the next granted shell call to prompt. Operator consent does not declassify that output. Mimir tolerates advertised ACP client `fs` and `terminal` capabilities but never calls them. `additionalDirectories` and arbitrary provider profiles are rejected.
+`hands_shell` and `hands_python` use OS-level filesystem confinement by default. It is mandatory when the backend is available. Only an unavailable backend permits the separately approved fallback described below. Their confined child processes start in the session cwd and can access its descendants, exact operator-approved extra paths, and narrowly required runtime paths. The tools take command/code strings rather than paths, so argument checks alone cannot enforce this boundary. Use `hands_request_scope` to request additional paths before execution. Their output remains untrusted active ingest, so a shell result can still cause the next granted shell call to prompt. Operator consent does not declassify that output. Mimir tolerates advertised ACP client `fs` and `terminal` capabilities but never calls them. `additionalDirectories` and arbitrary provider profiles are rejected.
 
-Python keeps one lazy subprocess and in-memory namespace per canonical project directory (`str(Path(cwd).resolve())`) within the live proxy, with a single session owner until release. Another session using the same directory is refused while the kernel is owned. Hosted disconnect and session load detach the owner without destroying an idle worker, so the next session can reuse its variables, functions, imports, and loaded data. Session load restores the daemon transcript, not Python state: the namespace is never serialized to a session, journal, or disk. Existing transient stdout/stderr capture files are unchanged.
+Python keeps one lazy subprocess and in-memory namespace per canonical project directory (`str(Path(cwd).resolve())`) within the live proxy, with a single session owner until release. Another session using the same directory is refused while the kernel is owned. Hosted disconnect and session load detach the owner without destroying an idle worker, so the next session can reuse its variables, functions, imports, and loaded data when its approved paths and execution mode match the worker's spawn-time profile. Session load restores the daemon transcript, not Python state: the namespace is never serialized to a session, journal, or disk. Existing transient stdout/stderr capture files are unchanged.
 
 Kernels expire after 1,800 seconds of idle time. The proxy keeps at most 8 project kernels, evicting the least recently used detached kernel when capacity is needed; it refuses a new project when all kernels are owned. Cancellation still kills an active execution and its worker, but releasing an idle kernel preserves it. Proxy exit, `SIGTERM`, `SIGINT`, and `SIGHUP` destroy workers. Shells and Python workers run in owned process groups that are killed and reaped during cleanup. Restarting the proxy or respawning a worker loses all Python state; persistence is live-proxy-only, not durable recovery.
 
@@ -239,10 +242,103 @@ Pass these operator commands as the entire `code` argument to `hands_python` (th
 - `%kernel kill` explicitly kills the current project kernel only if it is unowned or owned by the caller. It cannot target another project.
 - `%kernel release` detaches the caller from the current project without killing its idle worker.
 
-These commands do not add filesystem confinement or widen permissions. The confinement work in #1593 has not landed, and there is no widening path yet. When that work adds spawn-time approved paths, widening them by respawning will still lose the namespace; the operator must be warned before respawn. Reattachment must check the new session's approved set against the worker's spawn-time set rather than inheriting broader access.
+These commands do not widen permissions. Shell and Python children run under OS-level filesystem confinement by default, mandatory wherever a backend is available, using spawn-time approved paths. Widening approved paths requires a respawn that loses the namespace; the operator is warned before approving that change. Before reuse, including reattachment, the manager compares the new session's approved set with the worker's recorded spawn-time set for equality, not subset membership. Any difference retires and respawns the worker rather than inheriting broader access; switching execution mode also respawns. Equal-policy reattachment preserves the namespace; different-policy reattachment loses it. On platforms without a backend, the separately approved unconfined mode still provides no filesystem isolation.
 
 ## Troubleshooting
 
 The proxy intentionally reports the generic diagnostic `error: connection-failed`. Confirm the selected profile, then confirm `mimir run` is running with `MIMIR_ACP_ENABLED=true`. As the owner UID, inspect `<MIMIR_HOME>/.mimir/acp`: the directory must be mode `0700`, and `daemon.sock` must be mode `0600`. Start or restart `mimir run` if the daemon is missing or disabled; the proxy will not start it.
 
 For SSH profiles, additionally confirm the remote `mimir-agent` version is 0.9.0, it is on the noninteractive PATH, identity and known-hosts permissions are correct, the host-key entry matches, and remote stdout is banner-free.
+
+
+### Hands execution scope
+
+Confined Hands shell and Python execution uses the session's approved paths,
+initially its cwd and descendants. Additional approved file or directory paths
+are literal: approving a directory does not approve its children.
+macOS uses Seatbelt (`sandbox-exec`, deprecated by Apple). A replaceable
+confinement backend seam permits a future Linux backend.
+
+#### Unavailable-backend risk approval
+
+Confinement is the default and remains mandatory when a backend is available.
+Only an unavailable platform or confinement backend can offer unconfined
+execution. A malformed profile, profile application error, or child runtime
+failure never triggers a downgrade. There is no automatic fallback or
+model-controlled opt-in flag.
+
+When the backend is unavailable, the operator must explicitly accept the risk
+over `session/request_permission` before execution can start. The warning states
+that `hands_shell` and `hands_python` will run unrestricted by Hands filesystem
+confinement, with the local proxy user's filesystem permissions. The cwd and
+path-scope grants do NOT protect files in unconfined mode, including when the
+agent itself runs remotely.
+
+The risk prompt warns before consent that acceptance restarts any existing
+Python kernel and loses its variables and imports. The restart happens only
+after operator approval, never while waiting for consent.
+
+This risk approval is separate from wrapper permissions, path grants, and taint
+acknowledgement. Acceptance is in-memory, session-only, never persisted, and
+never transferred to another session. Without explicit acceptance, no child is
+spawned. Rejection is final for the session. Cancellation, timeout, malformed
+responses, stale replies, and a missing approval-capable client also cannot
+authorize execution. Risk prompts are bounded; the agent must not retry a refusal.
+
+Disconnecting any hosted MCP connection revokes the risk grant for its shared
+session and retires that session's Python kernel. Other connections to the same
+session do not keep the grant. The session's one-risk-request limit and final
+request history survive this connection reset. Reconnecting therefore cannot
+request risk approval again, even if the operator previously accepted it.
+Execution stays blocked with no active risk grant; this does not mean the
+operator rejected the earlier request. Start a new ACP session, or load a session
+as a new provider-session incarnation, to request fresh operator approval and
+start a fresh Python namespace. With an available confinement backend, execution
+can continue confined after connection reset without risk approval.
+
+Scope-query results report unconfined mode in their `message`, and shell/Python
+execution results report it in `stderr`. The five-tool wire contract and result
+schemas do not change. An approved path list is not a security boundary in this
+mode. If a backend later becomes available, that does not retroactively confine
+already-running processes; a scope query must not imply otherwise.
+Filtered environment, safe stdin, output capture, and other non-OS hardening
+remain in effect. Risk acceptance and refusal are audited without command text,
+file contents, or credentials.
+
+#### Confined path requests
+
+Use `hands_request_scope(path)` proactively before shell or Python needs a path
+outside the approved set. `path=""` queries that set without prompting. The wire
+method is `request_scope` with exactly `{path: string}`. Its result is exactly
+`{approved: bool, paths: list[string], message: string}`. Non-empty requests go
+through the provider to the editor's `session/request_permission` channel. Only
+operator approval adds the exact path, never its parent or a glob. Scope prompts
+and scope audit events contain the path and fixed status, not commands or file
+contents. Scope outcomes use the existing `acp_permission_outcome` event name,
+written as bounded JSON records to the local proxy's stderr. These records do
+not use ACP stdout and are not persisted in the daemon journal. A rejected path is final for that session: do not request or retry it.
+
+Approval affects the next shell call. It restarts the persistent Python kernel,
+losing REPL variables and state; the approval prompt states that cost. Approved
+paths are session-local and disappear with the session. This does not widen
+`hands_read` or `hands_edit`, clear ingest labels, acknowledge taint, or grant
+trusted host execution. Those gates remain separate.
+
+Empty or surprising output may be genuine or caused by confinement. Programs can
+swallow permission errors; absence of output is not proof of denial. Diagnostics
+are best effort. Query the approved set and request needed paths proactively
+rather than waiting for a reliable refused-path report.
+
+`hands_request_scope` is a narrow authenticated ACP admin operation. It is routed
+normally; it does not use reusable wrapper execution permissions. It adds a tool
+to the existing `mimir.hands.v1` exact profile. Old peers will fail strict profile
+admission, so update the admin's proxy and server together. There is no separate
+consumer compatibility mode or change to shell/Python arguments.
+
+
+Process-lifetime limitation: same-process-group children are cleaned up, but
+Seatbelt does not provide retroactive revocation of a running process's profile.
+A child can detach with `setsid` (the probe succeeds even with
+`deny process-info*`) and may outlive the session. Such a detached process keeps
+its original OS confinement profile. Ending the session deletes in-memory scope
+grants; it does not revoke paths from already-running detached processes.

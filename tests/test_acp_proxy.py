@@ -10,6 +10,7 @@ import tempfile
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
+from unittest.mock import AsyncMock
 
 import pytest
 import yaml
@@ -45,10 +46,37 @@ def messages(writer: Writer) -> list[dict[str, Any]]:
     return [json.loads(line) for line in bytes(writer.data).splitlines()]
 
 
-async def hosted_router(tmp_path: Path) -> tuple[ProxyRouter, Writer, Writer, str, str]:
+@pytest.fixture(params=["confined", "unavailable"])
+def lifecycle_backend(request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch) -> str:
+    from mimir.acp import confinement
+
+    if request.param == "unavailable":
+        # Force the portable risk path even on the macOS development host.
+        def missing() -> object:
+            raise confinement.BackendUnavailable("test lifecycle backend unavailable")
+        monkeypatch.setattr(confinement, "_backend", missing)
+    else:
+        try:
+            confinement._backend().prepare(("/bin/true",), cwd=Path.cwd().resolve())
+        except confinement.BackendUnavailable:
+            pytest.skip("real confinement backend unavailable")
+    return request.param
+
+
+async def hosted_router(
+    tmp_path: Path, *, approve_unconfined_for_lifecycle: bool = True,
+) -> tuple[ProxyRouter, Writer, Writer, str, str]:
     client = Writer()
     daemon = Writer()
     router = ProxyRouter(client, daemon, "secret")
+    if approve_unconfined_for_lifecycle:
+        # Portable subprocess lifecycle tests explicitly model an operator who
+        # accepts missing-backend risk. Available backends still must confine.
+        # Risk round-trip tests opt out and exercise the real proxy broker.
+        async def accept_unavailable_backend_risk(session_id: str) -> bool:
+            return True
+
+        router._provider._request_unconfined_permission = accept_unavailable_backend_risk
     await router.route_client({
         "jsonrpc": "2.0",
         "id": "new",
@@ -113,8 +141,12 @@ async def call_hosted_python(
     async with asyncio.timeout(5):
         while True:
             for message in messages(daemon):
-                if message.get("id") == request_id and "result" in message:
-                    return message["result"]["structuredContent"]
+                if message.get("id") == request_id:
+                    if "error" in message:
+                        error = message["error"]
+                        raise HostedMcpError(error["code"], error["message"], error.get("data"))
+                    if "result" in message:
+                        return message["result"]["structuredContent"]
             await asyncio.sleep(0.01)
 
 
@@ -761,9 +793,15 @@ async def test_plain_client_without_mcp_capability_can_call_hosted_hands(tmp_pat
 
 @pytest.mark.asyncio
 async def test_session_new_first_python_call_has_fresh_empty_namespace(
-    tmp_path: Path,
+    tmp_path: Path, lifecycle_backend: str,
 ) -> None:
-    router, _, daemon, _, connection_id = await hosted_router(tmp_path)
+    from mimir.acp.execution_scope import UNCONFINED_WARNING
+
+    router, _, daemon, _, connection_id = await hosted_router(
+        tmp_path, approve_unconfined_for_lifecycle=False,
+    )
+    acceptance = AsyncMock(return_value=True)
+    router._provider._request_unconfined_permission = acceptance
     try:
         result = await call_hosted_python(
             router,
@@ -775,12 +813,13 @@ async def test_session_new_first_python_call_has_fresh_empty_namespace(
         assert result == {
             "ok": True,
             "stdout": "",
-            "stderr": "",
+            "stderr": UNCONFINED_WARNING + "\n" if lifecycle_backend == "unavailable" else "",
             "value": "None",
             "exception": "",
             "timedOut": False,
             "kernel": "fresh",
         }
+        assert acceptance.await_count == (1 if lifecycle_backend == "unavailable" else 0)
     finally:
         await router.close()
 
@@ -995,11 +1034,26 @@ async def test_load_releases_kernel_and_next_python_reuses_namespace(
 
 @pytest.mark.asyncio
 async def test_disconnect_and_cancel_kill_active_execution_but_release_idle_kernel(
-    tmp_path: Path,
+    tmp_path: Path, lifecycle_backend: str,
 ) -> None:
-    router, _, daemon, server_id, connection_id = await hosted_router(tmp_path)
+    from mimir.acp.execution_scope import UNCONFINED_WARNING
+
+    router, _, daemon, server_id, connection_id = await hosted_router(
+        tmp_path, approve_unconfined_for_lifecycle=False,
+    )
+    acceptance = AsyncMock(return_value=True)
+    router._provider._request_unconfined_permission = acceptance
+    active_session_id = "session"
     try:
-        await call_hosted_python(router, daemon, connection_id, 110, "value = 1")
+        initial = await call_hosted_python(router, daemon, connection_id, 110, "value = 1")
+        hosted_session = next(iter(router._provider._sessions.values()))
+        if lifecycle_backend == "unavailable":
+            assert acceptance.await_count == 1
+            assert hosted_session.scope.unconfined_approved is True
+            assert initial["stderr"] == UNCONFINED_WARNING + "\n"
+        else:
+            acceptance.assert_not_awaited()
+            assert initial["stderr"] == ""
         second_connection = await connect_hosted(router, daemon, server_id, 111)
         await router.route_daemon({
             "jsonrpc": "2.0", "id": 113, "method": "mcp/message",
@@ -1043,9 +1097,40 @@ async def test_disconnect_and_cancel_kill_active_execution_but_release_idle_kern
             for item in messages(daemon)
         )
         assert not (tmp_path / "queued-ran").exists()
-        fresh_after_disconnect = await call_hosted_python(
-            router, daemon, second_connection, 114, "globals().get('value')"
-        )
+        if lifecycle_backend == "unavailable":
+            assert hosted_session.scope.unconfined_approved is False
+            assert hosted_session.scope.risk_requested is True
+            with pytest.raises(HostedMcpError, match="final and no active risk grant remains"):
+                await call_hosted_python(
+                    router, daemon, second_connection, 114, "globals().get('value')"
+                )
+            # This was an accepted grant that disconnect revoked, not a user
+            # rejection. Reconnecting cannot open a second risk prompt.
+            assert acceptance.await_count == 1
+            assert router._provider._python_kernels._processes == {}
+            await router.route_client({
+                "jsonrpc": "2.0", "id": "new-after-disconnect", "method": "session/new",
+                "params": {"cwd": str(tmp_path)},
+            })
+            new_server = messages(daemon)[-1]["params"]["mcpServers"][0]["serverId"]
+            second_connection = await connect_hosted(router, daemon, new_server, 121)
+            active_session_id = "replacement-session"
+            await router.route_daemon({
+                "jsonrpc": "2.0", "id": "new-after-disconnect",
+                "result": {"sessionId": active_session_id},
+            })
+            assert acceptance.await_count == 1
+            fresh_after_disconnect = await call_hosted_python(
+                router, daemon, second_connection, 123, "globals().get('value')"
+            )
+            assert acceptance.await_count == 2
+            assert fresh_after_disconnect["stderr"] == UNCONFINED_WARNING + "\n"
+        else:
+            fresh_after_disconnect = await call_hosted_python(
+                router, daemon, second_connection, 114, "globals().get('value')"
+            )
+            acceptance.assert_not_awaited()
+            assert fresh_after_disconnect["stderr"] == ""
         assert fresh_after_disconnect["kernel"] == "fresh"
         assert fresh_after_disconnect["value"] == "None"
 
@@ -1081,7 +1166,7 @@ async def test_disconnect_and_cancel_kill_active_execution_but_release_idle_kern
         idle_worker = next(iter(router._provider._python_kernels._processes))
         await router.route_client({
             "jsonrpc": "2.0", "method": "session/cancel",
-            "params": {"sessionId": "session"},
+            "params": {"sessionId": active_session_id},
         })
         assert idle_worker.returncode is None
         reused = await call_hosted_python(router, daemon, second_connection, 117, "value")
@@ -1108,8 +1193,11 @@ class Writer:
  async def drain(self): pass
 async def setup():
  router=ProxyRouter(Writer(),Writer(),'secret')
+ # Explicit operator consent for this portable process-lifecycle fixture.
+ async def accept_unavailable_backend_risk(session_id): return True
+ router._provider._request_unconfined_permission=accept_unavailable_backend_risk
  router._provider.bind_session('session',os.getcwd())
- await router._provider._python_kernels.execute('session',os.getcwd(),'value=1')
+ await router._provider.execute_python(router._provider._sessions['session'],'value=1')
  worker=next(iter(router._provider._python_kernels._processes))
  hooks=_ShutdownHooks(router);hooks.install()
  session=router._provider._sessions['session']
@@ -1117,7 +1205,8 @@ async def setup():
  while not router._provider._processes: await asyncio.sleep(0)
  shell_process=next(iter(router._provider._processes))
  pids=[worker.pid,shell_process.pid]
- print(json.dumps({'pids':pids,'pgids':[os.getpgid(pid) for pid in pids]}),flush=True)
+ print(json.dumps({'pids':pids,'pgids':[os.getpgid(pid) for pid in pids],
+                   'unconfined':session.scope.unconfined_approved}),flush=True)
 loop=asyncio.new_event_loop();asyncio.set_event_loop(loop)
 loop.run_until_complete(setup())
 if sys.argv[1]=='wait': loop.run_forever()
@@ -1145,7 +1234,17 @@ if sys.argv[1]=='wait': loop.run_forever()
         )
         assert stdout == b""
         if shutdown_signal is not None:
-            assert stderr == b""
+            if ownership["unconfined"]:
+                # The accepted-risk audit is required; no shutdown errors or
+                # arbitrary stderr are hidden by the portable consent fixture.
+                assert json.loads(stderr) == {
+                    "type": "acp_permission_outcome",
+                    "wrapper_name": "hands_unconfined_execution",
+                    "path": "<unconfined>", "outcome": "approved",
+                    "resource_resolvable": False,
+                }
+            else:
+                assert stderr == b""
     finally:
         if process.returncode is None:
             process.kill()
@@ -1252,6 +1351,7 @@ async def test_client_session_cancel_tombstones_hosted_request(tmp_path: Path) -
         await router.route_client(json.loads(cancel_raw), cancel_raw)
         assert bytes(daemon.data).startswith(before + cancel_raw)
         await asyncio.sleep(0.05)
+        assert not router._generation_failed, repr(router._failure.result())
         with pytest.raises(ProxyError, match="duplicate outstanding"):
             await router.route_daemon({"jsonrpc": "2.0", "id": 50, "method": "foreign"})
         assert not any(item.get("id") == 50 and ("result" in item or "error" in item) for item in messages(daemon))
@@ -1709,3 +1809,514 @@ async def test_invalid_key_reaches_actual_daemon_rejection_through_credential_pa
         await asyncio.wait_for(process.wait(), 10)
         await daemon.stop()
     assert b"invalid-key" not in stderr
+
+
+async def start_scope_permission(
+    router: ProxyRouter, connection_id: str, request_id: int, path: str,
+    monkeypatch: pytest.MonkeyPatch,
+    *, unconfined: bool = False,
+) -> asyncio.Task[Any]:
+    """Exercise the real hosted request owner without depending on a sandbox."""
+    provider_id = router._connection_provider_sessions[connection_id]
+
+    async def request(*args: Any, **kwargs: Any) -> dict[str, Any]:
+        approved = (
+            await router._request_unconfined_permission(provider_id)
+            if unconfined else await router._request_scope_permission(provider_id, path)
+        )
+        return {"approved": approved}
+
+    monkeypatch.setattr(router._provider, "request", request)
+    await router.route_daemon({
+        "jsonrpc": "2.0", "id": request_id, "method": "mcp/message",
+        "params": {
+            "connectionId": connection_id, "method": "tools/call",
+            "params": {"name": "request_scope", "arguments": {"path": path}},
+        },
+    })
+    task = router._local_requests[(int, request_id)]
+    assert task is not None
+    await asyncio.sleep(0)
+    return task
+
+
+@pytest.mark.asyncio
+async def test_scope_permission_is_local_path_only_and_separate_from_wrapper_grants(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    router, client, daemon, _, connection_id = await hosted_router(tmp_path)
+    try:
+        await grant_session(router, 10, "session", "hands_shell")
+        client.data.clear()
+        daemon.data.clear()
+        path = str(tmp_path.parent / "outside")
+        task = await start_scope_permission(router, connection_id, 11, path, monkeypatch)
+        request, = messages(client)
+        assert request["method"] == "session/request_permission"
+        params = request["params"]
+        assert params["sessionId"] == "session"
+        assert params["toolCall"]["rawInput"] == {"path": path}
+        assert "restarts the Python kernel" in params["toolCall"]["title"]
+        assert "loses all REPL state" in params["toolCall"]["title"]
+        assert params["_meta"] == {"mimir.execution_scope": True}
+        assert [item["optionId"] for item in params["options"]] == [
+            "allow_session", "reject_once",
+        ]
+        assert messages(daemon) == []
+        answer = {
+            "jsonrpc": "2.0", "id": request["id"],
+            "result": {"outcome": {"outcome": "selected", "optionId": "allow_session"}},
+        }
+        await router.route_client(answer)
+        await task
+        assert messages(daemon) == [{"jsonrpc": "2.0", "id": 11, "result": {"approved": True}}]
+        assert len(router._grants) == 1
+        assert router._grants.allows("session", "hands_shell")
+        assert not router._grants.allows("session", "hands_python")
+        # A duplicate local answer is consumed, never sent to the daemon.
+        await router.route_client(answer)
+        assert len(messages(daemon)) == 1
+        assert not router._execution_permissions
+        client.data.clear()
+        # Even after a scope approval, a tainted wrapper still reaches the editor.
+        await router.route_daemon(permission_request(18, "session", "hands_shell", tainted=True))
+        assert messages(client)[-1]["params"]["_meta"] == {
+            "mimir.wrapper": "hands_shell", "mimir.tainted": True,
+        }
+    finally:
+        await router.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("result", [
+    {"outcome": {"outcome": "selected", "optionId": "reject_once"}},
+    {"outcome": {"outcome": "selected", "optionId": "allow_once"}},
+    {"outcome": {"outcome": "selected", "optionId": "unknown"}},
+    {"outcome": {"outcome": "cancelled"}},
+    {"outcome": {"outcome": "selected", "optionId": "allow_session", "extra": True}},
+    {"outcome": "allow_session"},
+])
+@pytest.mark.parametrize("unconfined", [False, True])
+async def test_scope_permission_rejects_unoffered_cancelled_and_malformed_answers(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, result: dict[str, Any],
+    unconfined: bool,
+) -> None:
+    router, client, daemon, _, connection_id = await hosted_router(tmp_path)
+    try:
+        client.data.clear()
+        daemon.data.clear()
+        task = await start_scope_permission(router, connection_id, 12, "/outside", monkeypatch, unconfined=unconfined)
+        request, = messages(client)
+        await router.route_client({"jsonrpc": "2.0", "id": request["id"], "result": result})
+        await task
+        assert messages(daemon) == [{"jsonrpc": "2.0", "id": 12, "result": {"approved": False}}]
+        assert len(router._grants) == 0
+    finally:
+        await router.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("unconfined", [False, True])
+async def test_scope_permission_timeout_and_late_answer_fail_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    unconfined: bool,
+) -> None:
+    monkeypatch.setattr("mimir.acp.proxy.SCOPE_PERMISSION_TIMEOUT_SECONDS", 0.01)
+    router, client, daemon, _, connection_id = await hosted_router(tmp_path)
+    try:
+        client.data.clear()
+        daemon.data.clear()
+        task = await start_scope_permission(router, connection_id, 13, "/outside", monkeypatch, unconfined=unconfined)
+        request, = messages(client)
+        await asyncio.wait_for(task, 1)
+        assert messages(daemon)[-1]["result"] == {"approved": False}
+        await router.route_client({
+            "jsonrpc": "2.0", "id": request["id"],
+            "result": {"outcome": {"outcome": "selected", "optionId": "allow_session"}},
+        })
+        assert len(messages(daemon)) == 1
+        assert not router._execution_permissions
+    finally:
+        await router.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("action", ["cancel", "reload", "disconnect", "generation"])
+@pytest.mark.parametrize("unconfined", [False, True])
+async def test_scope_permission_cannot_outlive_its_hosted_request(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, action: str,
+    unconfined: bool,
+) -> None:
+    router, client, daemon, _, connection_id = await hosted_router(tmp_path)
+    try:
+        client.data.clear()
+        daemon.data.clear()
+        task = await start_scope_permission(router, connection_id, 14, "/outside", monkeypatch, unconfined=unconfined)
+        request, = messages(client)
+        if action == "cancel":
+            await router.route_client({
+                "jsonrpc": "2.0", "method": "session/cancel", "params": {"sessionId": "session"},
+            })
+        elif action == "reload":
+            await router.route_client({
+                "jsonrpc": "2.0", "id": "reload", "method": "session/load",
+                "params": {"cwd": str(tmp_path), "sessionId": "session"},
+            })
+        elif action == "disconnect":
+            await router.route_daemon({
+                "jsonrpc": "2.0", "id": 15, "method": "mcp/disconnect",
+                "params": {"connectionId": connection_id},
+            })
+        else:
+            router._fail_generation(RuntimeError("generation failed"))
+        await asyncio.gather(task, return_exceptions=True)
+        if action != "generation":
+            await router.route_client({
+                "jsonrpc": "2.0", "id": request["id"],
+                "result": {"outcome": {"outcome": "selected", "optionId": "allow_session"}},
+            })
+        assert not any(m.get("id") == 14 and m.get("result", {}).get("approved") for m in messages(daemon))
+        assert not router._execution_permissions
+        assert len(router._grants) == 0
+    finally:
+        await router.close()
+
+
+@pytest.mark.asyncio
+async def test_scope_permission_requires_owned_hosted_task_and_bounds_requests(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    router, client, daemon, _, connection_id = await hosted_router(tmp_path)
+    try:
+        client.data.clear()
+        daemon.data.clear()
+        provider_id = router._connection_provider_sessions[connection_id]
+        assert not await router._request_scope_permission(provider_id, "/outside")
+        assert messages(client) == []
+        monkeypatch.setattr("mimir.acp.proxy.MAX_SCOPE_PERMISSION_REQUESTS", 1)
+        task = await start_scope_permission(router, connection_id, 16, "/outside", monkeypatch)
+        request, = messages(client)
+        await router.route_client({
+            "jsonrpc": "2.0", "id": request["id"],
+            "result": {"outcome": {"outcome": "selected", "optionId": "reject_once"}},
+        })
+        await task
+        task2 = await start_scope_permission(router, connection_id, 17, "/other", monkeypatch)
+        await task2
+        assert len(messages(client)) == 1
+        assert messages(daemon)[-1]["result"] == {"approved": False}
+        # Daemon cannot occupy the local permission ID namespace.
+        with pytest.raises(ProxyError, match="duplicate outstanding request ID"):
+            await router.route_daemon(permission_request("mimir-scope:2", "session"))
+    finally:
+        await router.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("unconfined", [False, True])
+async def test_scope_permission_allows_only_one_outstanding_request_per_session(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    unconfined: bool,
+) -> None:
+    router, client, daemon, _, connection_id = await hosted_router(tmp_path)
+    try:
+        client.data.clear()
+        daemon.data.clear()
+        first = await start_scope_permission(router, connection_id, 19, "/outside", monkeypatch, unconfined=unconfined)
+        request, = messages(client)
+        second = await start_scope_permission(router, connection_id, 20, "/other", monkeypatch, unconfined=unconfined)
+        await second
+        assert messages(daemon)[-1] == {"jsonrpc": "2.0", "id": 20, "result": {"approved": False}}
+        assert len(messages(client)) == 1
+        await router.route_client({
+            "jsonrpc": "2.0", "id": request["id"],
+            "result": {"outcome": {"outcome": "selected", "optionId": "allow_session"}},
+        })
+        await first
+        assert messages(daemon)[-1] == {"jsonrpc": "2.0", "id": 19, "result": {"approved": True}}
+    finally:
+        await router.close()
+
+
+@pytest.mark.asyncio
+async def test_daemon_cannot_forge_local_scope_permission_metadata() -> None:
+    router, client, daemon = await active_router()
+    try:
+        request = permission_request(1, "session")
+        request["params"]["_meta"] = {"mimir.execution_scope": True}
+        with pytest.raises(ProxyError, match="invalid reserved permission metadata"):
+            await router.route_daemon(request)
+        assert messages(client) == []
+        assert messages(daemon) == []
+        assert len(router._grants) == 0
+    finally:
+        await router.close()
+
+
+@pytest.mark.asyncio
+async def test_hosted_scope_tool_round_trip_queries_grants_and_final_rejection(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cwd = tmp_path / "cwd"
+    cwd.mkdir()
+    allowed = tmp_path / "allowed.txt"
+    allowed.write_text("outside")
+    rejected = tmp_path / "rejected.txt"
+    rejected.write_text("outside")
+    # This test covers provider -> proxy -> operator -> provider, not the OS
+    # backend (which has separate real confinement probes).
+    monkeypatch.setattr(
+        "mimir.acp.hosted.prepare_command",
+        lambda *args, **kwargs: SimpleNamespace(execution_mode="confined"),
+    )
+    router, client, daemon, _, connection_id = await hosted_router(cwd)
+
+    async def start(request_id: int, path: str) -> asyncio.Task[Any]:
+        await router.route_daemon({
+            "jsonrpc": "2.0", "id": request_id, "method": "mcp/message",
+            "params": {
+                "connectionId": connection_id, "method": "tools/call",
+                "params": {"name": "request_scope", "arguments": {"path": path}},
+            },
+        })
+        task = router._local_requests[(int, request_id)]
+        assert task is not None
+        await asyncio.sleep(0)
+        return task
+
+    try:
+        client.data.clear()
+        daemon.data.clear()
+        task = await start(30, "")
+        await task
+        assert messages(client) == []
+        assert messages(daemon)[-1]["result"]["structuredContent"]["paths"] == [str(cwd.resolve())]
+        task = await start(31, str(allowed))
+        request, = messages(client)
+        await router.route_client({
+            "jsonrpc": "2.0", "id": request["id"],
+            "result": {"outcome": {"outcome": "selected", "optionId": "allow_session"}},
+        })
+        await task
+        result = messages(daemon)[-1]["result"]["structuredContent"]
+        assert result["approved"] is True
+        assert set(result["paths"]) == {str(cwd.resolve()), str(allowed.resolve())}
+        assert str(tmp_path.resolve()) not in result["paths"]
+        assert "restart" in result["message"]
+        client.data.clear()
+        task = await start(32, str(rejected))
+        request, = messages(client)
+        await router.route_client({
+            "jsonrpc": "2.0", "id": request["id"],
+            "result": {"outcome": {"outcome": "selected", "optionId": "reject_once"}},
+        })
+        await task
+        assert messages(daemon)[-1]["result"]["structuredContent"]["approved"] is False
+        client.data.clear()
+        task = await start(33, str(rejected))
+        await task
+        assert messages(client) == []
+        result = messages(daemon)[-1]["result"]["structuredContent"]
+        assert result["approved"] is False
+        assert "do not retry" in result["message"]
+        task = await start(34, "")
+        await task
+        assert set(messages(daemon)[-1]["result"]["structuredContent"]["paths"]) == {
+            str(cwd.resolve()), str(allowed.resolve()),
+        }
+    finally:
+        await router.close()
+
+
+@pytest.mark.asyncio
+async def test_unconfined_risk_warning_is_fixed_separate_and_session_local(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    router, client, daemon, _, connection_id = await hosted_router(tmp_path)
+    original_request = router._provider.request
+    try:
+        await grant_session(router, 40, "session", "hands_shell")
+        client.data.clear()
+        daemon.data.clear()
+        # A path approval is not acceptance of unrestricted execution.
+        scope_task = await start_scope_permission(router, connection_id, 41, "/outside", monkeypatch)
+        scope_request, = messages(client)
+        await router.route_client({
+            "jsonrpc": "2.0", "id": scope_request["id"],
+            "result": {"outcome": {"outcome": "selected", "optionId": "allow_session"}},
+        })
+        await scope_task
+        client.data.clear()
+        risk_task = await start_scope_permission(
+            router, connection_id, 42, "secret command/file contents", monkeypatch, unconfined=True,
+        )
+        risk_request, = messages(client)
+        params = risk_request["params"]
+        assert risk_request["method"] == "session/request_permission"
+        assert risk_request["id"].startswith("mimir-unconfined:")
+        assert params["_meta"] == {"mimir.unconfined_execution": True}
+        assert params["toolCall"]["rawInput"] == {}
+        title = params["toolCall"]["title"]
+        assert "local proxy user's unrestricted filesystem permissions" in title
+        assert "cwd and path-scope grants do NOT protect files" in title
+        assert "session only" in title and "not persisted" in title
+        assert "Rejection is final" in title
+        assert "restarts any existing Python kernel and loses variables/imports" in title
+        assert "secret" not in json.dumps(risk_request)
+        assert [item["optionId"] for item in params["options"]] == ["allow_session", "reject_once"]
+        # A duplicate answer to the earlier scope cannot answer the risk prompt.
+        await router.route_client({
+            "jsonrpc": "2.0", "id": scope_request["id"],
+            "result": {"outcome": {"outcome": "selected", "optionId": "allow_session"}},
+        })
+        assert not risk_task.done()
+        await router.route_client({
+            "jsonrpc": "2.0", "id": risk_request["id"],
+            "result": {"outcome": {"outcome": "selected", "optionId": "allow_session"}},
+        })
+        await risk_task
+        assert messages(daemon)[-1]["result"] == {"approved": True}
+        assert len(router._grants) == 1
+        client.data.clear()
+        await router.route_daemon(permission_request(43, "session", "hands_shell", tainted=True))
+        assert messages(client)[-1]["params"]["_meta"]["mimir.tainted"] is True
+        # A new session must have its own risk prompt; the first answer is not a
+        # wrapper grant, scope grant, taint acknowledgement, or connection grant.
+        monkeypatch.setattr(router._provider, "request", original_request)
+        await router.route_client({
+            "jsonrpc": "2.0", "id": "new-two", "method": "session/new",
+            "params": {"cwd": str(tmp_path)},
+        })
+        server = messages(daemon)[-1]["params"]["mcpServers"][0]["serverId"]
+        second_connection = await connect_hosted(router, daemon, server, 44)
+        await router.route_daemon({
+            "jsonrpc": "2.0", "id": "new-two", "result": {"sessionId": "two"},
+        })
+        client.data.clear()
+        second_task = await start_scope_permission(
+            router, second_connection, 46, "unused", monkeypatch, unconfined=True,
+        )
+        second_request, = messages(client)
+        assert second_request["params"]["sessionId"] == "two"
+        await router.route_client({
+            "jsonrpc": "2.0", "id": second_request["id"],
+            "result": {"outcome": {"outcome": "selected", "optionId": "reject_once"}},
+        })
+        await second_task
+        assert messages(daemon)[-1]["result"] == {"approved": False}
+    finally:
+        await router.close()
+
+
+@pytest.mark.asyncio
+async def test_unconfined_permission_is_bounded_and_needs_owned_client_request(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    router, client, daemon, server_id, connection_id = await hosted_router(tmp_path)
+    try:
+        client.data.clear()
+        daemon.data.clear()
+        assert not await router._request_unconfined_permission(server_id)
+        assert messages(client) == []
+        monkeypatch.setattr("mimir.acp.proxy.MAX_UNCONFINED_PERMISSION_REQUESTS", 0)
+        task = await start_scope_permission(
+            router, connection_id, 47, "unused", monkeypatch, unconfined=True,
+        )
+        await task
+        assert messages(client) == []
+        assert messages(daemon)[-1]["result"] == {"approved": False}
+        with pytest.raises(ProxyError, match="duplicate outstanding request ID"):
+            await router.route_daemon(permission_request("mimir-unconfined:1", "session"))
+        forged = permission_request(48, "session")
+        forged["params"]["_meta"] = {"mimir.unconfined_execution": True}
+        with pytest.raises(ProxyError, match="invalid reserved permission metadata"):
+            await router.route_daemon(forged)
+        assert messages(client) == []
+        assert len(router._grants) == 0
+    finally:
+        await router.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("decision", ["allow_session", "reject_once"])
+async def test_unconfined_execution_real_operator_round_trip_and_final_state(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, decision: str,
+) -> None:
+    from mimir.acp import confinement
+
+    if sys.platform == "darwin":
+        # Exercise unavailable-platform behavior on the macOS development host.
+        # Linux takes its real, unavailable backend path without this patch.
+        def unavailable() -> object:
+            raise confinement.BackendUnavailable("test backend unavailable")
+
+        monkeypatch.setattr(confinement, "_backend", unavailable)
+    router, client, daemon, _, connection_id = await hosted_router(
+        tmp_path, approve_unconfined_for_lifecycle=False,
+    )
+
+    async def start(request_id: int, name: str, arguments: dict[str, Any]) -> asyncio.Task[Any]:
+        await router.route_daemon({
+            "jsonrpc": "2.0", "id": request_id, "method": "mcp/message",
+            "params": {
+                "connectionId": connection_id, "method": "tools/call",
+                "params": {"name": name, "arguments": arguments},
+            },
+        })
+        task = router._local_requests[(int, request_id)]
+        assert task is not None
+        await asyncio.sleep(0)
+        return task
+
+    try:
+        client.data.clear()
+        daemon.data.clear()
+        query = await start(50, "request_scope", {"path": ""})
+        await query
+        assert messages(client) == []
+        initial_message = messages(daemon)[-1]["result"]["structuredContent"]["message"].lower()
+        assert initial_message.startswith("blocked:")
+        assert "operator risk acceptance" in initial_message
+        assert "existing children retain their launch policy" in initial_message
+        # No model-supplied switch can claim consent or change the exact schema.
+        spoof = await start(51, "shell", {"command": "true", "allow_unconfined": True})
+        await spoof
+        assert messages(daemon)[-1]["error"]["code"] == -32602
+        assert messages(client) == []
+        execution = await start(52, "shell", {"command": "printf safe-output"})
+        request, = messages(client)
+        assert request["params"]["_meta"] == {"mimir.unconfined_execution": True}
+        assert request["params"]["toolCall"]["rawInput"] == {}
+        assert "safe-output" not in json.dumps(request)
+        assert router._provider._processes == {}
+        await router.route_client({
+            "jsonrpc": "2.0", "id": request["id"],
+            "result": {"outcome": {"outcome": "selected", "optionId": decision}},
+        })
+        await asyncio.wait_for(execution, 5)
+        response = messages(daemon)[-1]
+        if decision == "allow_session":
+            result = response["result"]["structuredContent"]
+            assert result["stdout"] == "safe-output"
+            assert "unconfined" in result["stderr"].lower()
+        else:
+            assert "error" in response
+        client.data.clear()
+        retry = await start(53, "shell", {"command": "printf repeated-output"})
+        await asyncio.wait_for(retry, 5)
+        assert messages(client) == []
+        response = messages(daemon)[-1]
+        if decision == "allow_session":
+            assert response["result"]["structuredContent"]["stdout"] == "repeated-output"
+        else:
+            assert "error" in response
+        query = await start(54, "request_scope", {"path": ""})
+        await query
+        assert messages(client) == []
+        message = messages(daemon)[-1]["result"]["structuredContent"]["message"].lower()
+        if decision == "allow_session":
+            assert "unconfined" in message and "do not" in message
+        else:
+            assert message.startswith("blocked:")
+    finally:
+        await router.close()

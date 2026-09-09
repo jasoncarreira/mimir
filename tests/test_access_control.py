@@ -1438,6 +1438,134 @@ def test_synthesis_builtin_has_bounded_closing_reads(tmp_path: Path) -> None:
     assert principal.capability_tier is CapabilityTier.SCOPED_WITH_PROVENANCE
 
 
+@pytest.mark.parametrize("profile", ["github", "custom"])
+@pytest.mark.parametrize("grant", [False, True])
+@pytest.mark.parametrize("tier", [CapabilityTier.SCOPE_CONTAINED, CapabilityTier.SCOPED_WITH_PROVENANCE])
+def test_pr_review_others_manifest_grant_is_explicit_and_tier_checked(
+    tmp_path: Path, profile: str, grant: bool, tier: CapabilityTier,
+) -> None:
+    from mimir.pollers import _parse_poller_authority
+
+    raw = {
+        "profile": profile,
+        "tier": tier.value,
+        "capabilities": ["pr_metadata"] + (["pr_review_others"] if grant else []),
+        "scoped_roots": [],
+    }
+    kwargs = dict(
+        name="review-test", persist_dir=tmp_path / "state", state_root=None,
+        manifest_path=tmp_path / "pollers.json",
+    )
+    if grant and tier is CapabilityTier.SCOPE_CONTAINED:
+        with pytest.raises(ValueError, match="capability exceeds declared tier"):
+            _parse_poller_authority(raw, **kwargs)
+        return
+    service = _parse_poller_authority(raw, **kwargs)
+    assert service.has_capability("pr_review_others") is grant
+    auth = _trusted_service_auth(service, channel_id="poller:review-test")
+    assert access_control.can_resolve_forge_review_scope(
+        auth, stage="accept", pr_author="contributor", self_login="mimir",
+    ) is grant
+
+
+def test_github_activity_manifest_explicitly_grants_pr_review_others(tmp_path: Path) -> None:
+    from mimir.pollers import _parse_poller_authority
+
+    manifest = Path(access_control.__file__).parent / "optional-skills/github-poller/pollers.json"
+    record = next(
+        item for item in json.loads(manifest.read_text())["pollers"]
+        if item["name"] == "github-activity"
+    )
+    assert "pr_review_others" in record["authority"]["capabilities"]
+    (tmp_path / "state").mkdir()
+    service = _parse_poller_authority(
+        record["authority"], name=record["name"], persist_dir=tmp_path / "state",
+        state_root=None, manifest_path=manifest,
+    )
+    assert service.has_capability("pr_review_others")
+
+
+@pytest.mark.parametrize("stage", ["stored", "fetch", "accept"])
+@pytest.mark.parametrize("metadata", [False, True])
+@pytest.mark.parametrize("grant", [False, True])
+@pytest.mark.parametrize("pr_author,self_login", [("mimir", "mimir"), ("other", "mimir"), ("other", ""), ("other", None)])
+def test_poller_review_scope_stages(
+    stage: str, metadata: bool, grant: bool, pr_author: str, self_login: str | None,
+) -> None:
+    service = build_trigger_service_principal(
+        canonical="poller:review-test", trigger="poller", profile="github",
+        tier=CapabilityTier.SCOPED_WITH_PROVENANCE,
+        capabilities=tuple(
+            (["pr_metadata"] if metadata else [])
+            + (["pr_review_others"] if grant else [])
+        ),
+        creation_path="test",
+    )
+    auth = _trusted_service_auth(service, channel_id="poller:review-test")
+    expected = metadata and (
+        stage != "accept" or bool(self_login) and (pr_author == self_login or grant)
+    )
+    assert access_control.can_resolve_forge_review_scope(
+        auth, stage=stage, pr_author=pr_author, self_login=self_login,
+    ) is expected
+
+
+@pytest.mark.parametrize("stage", ["stored", "fetch", "accept"])
+@pytest.mark.parametrize("mutation", [
+    {"event_ingress": "http_event"}, {"event_ingress": ""},
+    {"is_service": False}, {"canonical_principal": "poller:impostor"},
+    {"trigger": "unknown"}, {"service_authority": None},
+])
+def test_pr_review_others_preserves_service_trust_guards(stage: str, mutation: dict) -> None:
+    service = build_trigger_service_principal(
+        canonical="poller:review-test", trigger="poller", profile="github",
+        tier=CapabilityTier.SCOPED_WITH_PROVENANCE,
+        capabilities=("pr_metadata", "pr_review_others"), creation_path="test",
+    )
+    auth = _trusted_service_auth(service, channel_id="poller:review-test")
+    assert not access_control.can_resolve_forge_review_scope(
+        replace(auth, **mutation), stage=stage, pr_author="other", self_login="mimir",
+    )
+    assert not access_control.can_resolve_forge_review_scope(None, stage=stage)
+
+
+@pytest.mark.parametrize("stage", ["stored", "fetch", "accept"])
+@pytest.mark.parametrize("grant", [False, True])
+def test_pr_review_others_does_not_widen_scheduled_ticks(
+    tmp_path: Path, stage: str, grant: bool,
+) -> None:
+    heartbeat = access_control.builtin_trigger_service_principal("heartbeat", tmp_path)
+    scheduler = get_service_principal("scheduled_tick")
+    assert scheduler is not None
+    for service in (heartbeat, scheduler):
+        assert not service.has_capability("pr_review_others")
+        if grant:
+            service = replace(service, capabilities=(*service.capabilities, "pr_review_others"))
+        auth = _trusted_service_auth(service, channel_id="scheduler:test")
+        assert access_control.can_resolve_forge_review_scope(
+            auth, stage=stage, pr_author="other", self_login="mimir",
+        ) is (stage == "stored" and service.authority_profile == "heartbeat")
+
+
+@pytest.mark.parametrize("stage", ["stored", "fetch", "accept"])
+def test_pr_review_others_leaves_operator_scope_resolution_unchanged(stage: str) -> None:
+    auth = _read_auth(admin=True)
+    assert access_control.can_resolve_forge_review_scope(auth, stage=stage)
+    for mutation in (
+        {"roles": ("user",)}, {"canonical_principal": None},
+        {"is_service": True}, {"event_ingress": "http_event"},
+        {"trigger": "scheduled_tick"},
+    ):
+        assert not access_control.can_resolve_forge_review_scope(
+            replace(auth, **mutation), stage=stage,
+        )
+
+
+def test_forge_review_scope_rejects_unknown_stage() -> None:
+    with pytest.raises(ValueError, match="unknown forge review-scope resolution stage"):
+        access_control.can_resolve_forge_review_scope(_read_auth(), stage="publish")
+
+
 def _trusted_service_auth(service: ServicePrincipal, *, channel_id: str) -> AuthContext:
     labels = InformationFlowLabels()
     return replace(
@@ -15545,9 +15673,9 @@ def test_pr_edit_body_catalog_mirrors_comment() -> None:
         assert access_control._OPERATION_SINK_DESTINATION[operation] == "bound_pull_request"
 
 
-def test_non_acp_execution_decisions_are_unchanged() -> None:
+def test_non_acp_execution_decisions_are_unchanged(monkeypatch: pytest.MonkeyPatch) -> None:
     catalog = access_control.get_operation_catalog()
-    hands = {"hands_read", "hands_edit", "hands_shell", "hands_python"}
+    hands = {"hands_read", "hands_edit", "hands_shell", "hands_python", "hands_request_scope"}
     flows = {
         access_control.ToolFlowDirection.NEITHER: {"approve_declassification", "clear_ingest_taint", "request_operator_approval", "write_todos", "task"},
         access_control.ToolFlowDirection.SOURCE: {"memory_query", "memory_get", "file_search", "mimir_get_turn", "get_turn", "bash_jobs_list", "bash_job_output", "fetch_channel_history", "list_channels", "list_schedules", "commitment_list", "read_file", "aread", "ls", "als", "glob", "aglob", "grep", "agrep", "Read", "Glob", "Grep", "pr_metadata", "pr_files", "pr_diff", "pr_checks", "pr_reviews", "pr_comments", "pr_review_requests", "repo_status", "repo_diff", "repo_unmerged"},
@@ -15572,6 +15700,7 @@ def test_non_acp_execution_decisions_are_unchanged() -> None:
         "saga_end_session", "saga_record_skill_learning", "saga_forget",
         "set_poller_overrides", "download_files", "adownload_files",
         "rebuild_index", "hands_edit", "hands_shell", "hands_python",
+        "hands_request_scope",
     }
     decisions[OperationDecision.ADMIN_REQUIRED].add("clear_ingest_taint")
     protected_builtins = {
@@ -15607,6 +15736,10 @@ def test_non_acp_execution_decisions_are_unchanged() -> None:
         for name in names
     }
 
+    flows[access_control.ToolFlowDirection.SOURCE].add("pr_job_log")
+    decisions[OperationDecision.RESOURCE_SCOPED].add("pr_job_log")
+    readable["pr_job_log"] = "repository"
+    protected["pr_job_log"] = "repository"
     assert {name for name in access_control._TOOL_FLOW_MAP if name.startswith("hands_")} == hands
     assert {
         direction: {name for name, value in access_control._TOOL_FLOW_MAP.items() if value is direction and name not in hands}
@@ -15636,6 +15769,21 @@ def test_non_acp_execution_decisions_are_unchanged() -> None:
     assert catalog.get_decision("hands_edit") is OperationDecision.ADMIN_REQUIRED
     assert catalog.get_decision("hands_shell") is OperationDecision.ADMIN_REQUIRED
     assert catalog.get_decision("hands_python") is OperationDecision.ADMIN_REQUIRED
+    assert catalog.get_decision("hands_request_scope") is OperationDecision.ADMIN_REQUIRED
+    # Explicitly own the missing ACP capability state rather than depending on
+    # whatever context another test left behind. Admin role alone never permits
+    # a scope request, even with ordinary enforcement disabled.
+    monkeypatch.setattr(
+        "mimir.tools.client_provider.get_turn_capability_context", lambda: None,
+    )
+    for enforce in (False, True):
+        authorization = access_control.get_tool_registry().authorize_tool(
+            "hands_request_scope", _write_auth(admin=True),
+            enforce=enforce, arguments={"path": ""},
+        )
+        assert not authorization.allowed
+        assert authorization.would_block
+
     assert catalog.get_decision("client_authorized_host_execution") is OperationDecision.UNKNOWN
 
 

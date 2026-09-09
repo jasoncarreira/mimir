@@ -503,6 +503,63 @@ class GitHubForgeClient:
             for item in rows if isinstance(item, Mapping)
         )
 
+    def get_job_log(
+        self, scope: RepoPRActionScope, job_id: int, run_id: int | None = None,
+    ) -> str:
+        """Read one failing job only after independently binding its run and head."""
+        repository, _number = self._target(scope)
+        for name, value in (("job_id", job_id), ("run_id", run_id)):
+            if name == "run_id" and value is None:
+                continue
+            if type(value) is not int or value < 1:
+                raise ForgeError(f"{name} must be a positive integer")
+        job = self._request(
+            "GET", f"/repos/{repository}/actions/jobs/{job_id}",
+            not_found="job not found",
+        )
+        if not isinstance(job, Mapping):
+            raise ForgeError("invalid job metadata")
+        observed_run = job.get("run_id")
+        if (
+            type(job.get("id")) is not int or job["id"] != job_id
+            or type(observed_run) is not int or observed_run < 1
+            or (run_id is not None and observed_run != run_id)
+            or job.get("head_sha") != scope.observed_head_sha
+            or not isinstance(job.get("run_url"), str)
+            or job["run_url"].casefold() != f"https://api.github.com/repos/{repository}/actions/runs/{observed_run}".casefold()
+        ):
+            raise ForgeError("job is outside the scoped repository/run/head")
+        run = self._request(
+            "GET", f"/repos/{repository}/actions/runs/{observed_run}",
+            not_found="run not found",
+        )
+        if not isinstance(run, Mapping):
+            raise ForgeError("invalid run metadata")
+        repo = run.get("repository")
+        repo_name = repo.get("full_name") if isinstance(repo, Mapping) else None
+        if (
+            type(run.get("id")) is not int or run["id"] != observed_run
+            or not isinstance(repo_name, str)
+            or repo_name.casefold() != repository.casefold()
+            or run.get("head_sha") != scope.observed_head_sha
+        ):
+            raise ForgeError("run is outside the scoped repository/run/head")
+        if run.get("status") != "completed":
+            raise ForgeError("run is still in progress; retry after completion")
+        if job.get("status") != "completed" or job.get("conclusion") not in {
+            "failure", "timed_out", "startup_failure", "action_required",
+        }:
+            raise ForgeError("job is not a completed failing job")
+        from ..ci_logs import LOG_EXCERPT_BYTES, capture_job_log
+
+        text, error = capture_job_log(
+            repository, job_id, token=self._token, limit=LOG_EXCERPT_BYTES,
+            timeout=self._timeout,
+        )
+        if error:
+            raise ForgeError(error)
+        return text.decode("utf-8")
+
     def list_reviews(self, scope: RepoPRActionScope) -> tuple[ReviewProjection, ...]:
         repository, number = self._target(scope)
         return tuple(self._review(item) for item in self._paginate(

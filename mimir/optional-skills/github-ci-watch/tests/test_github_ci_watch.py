@@ -76,7 +76,7 @@ def test_failure_prompt_reads_bounded_authenticated_log(monkeypatch, captured, t
     monkeypatch.setattr(poller, "STATE_DIR", tmp_path)
     monkeypatch.setattr(poller, "_ENRICHMENT_DEADLINE", None)
     monkeypatch.setenv("GITHUB_TOKEN", "test-only-token")
-    payload = (b"old output\n" * poller.LOG_EXCERPT_BYTES) + b"FAILED test_example\n"
+    payload = (b"old output\n" * poller.LOG_EXCERPT_BYTES) + b"FAILED test_example\npassword=x ghp_ci_secret\n"
     calls = []
 
     def gh_run(argv, **kwargs):
@@ -94,7 +94,10 @@ def test_failure_prompt_reads_bounded_authenticated_log(monkeypatch, captured, t
     monkeypatch.setattr(poller.subprocess, "run", gh_run)
     poller._check_repo("o/r", seen=set())
     log = tmp_path / "logs/42-101.log"
-    assert log.read_bytes() == payload[-poller.LOG_EXCERPT_BYTES:]
+    assert b"FAILED test_example\n" in log.read_bytes()
+    assert b"[truncated]" in log.read_bytes()
+    assert b"password=x" not in log.read_bytes() and b"ghp_ci_secret" not in log.read_bytes()
+    assert b"[REDACTED]" in log.read_bytes()
     assert log.stat().st_size <= poller.LOG_EXCERPT_BYTES
     assert len(calls) == 3
     prompt = captured[0]["prompt"]
@@ -124,10 +127,12 @@ def test_failed_log_fetch_emits_limitation(monkeypatch, captured, tmp_path, fail
         if failure == "transport":
             raise OSError("private transport detail")
         if failure == "escapes":
-            return SimpleNamespace(returncode=1, stderr=(
+            kwargs["stderr"].write(
                 b"the response contains terminal escape sequences; pass "
                 b"--allow-escape-sequences to output it anyway; private diagnostic"
-            ))
+            )
+            return SimpleNamespace(returncode=1)
+        kwargs["stderr"].write(b"gh: Forbidden (HTTP 403) private diagnostic")
         return SimpleNamespace(returncode=0 if failure == "empty" else 1,
                                stderr=b"gh: Forbidden (HTTP 403) private diagnostic")
 
@@ -199,7 +204,8 @@ def test_log_strips_controls_before_tail_cap(monkeypatch, tmp_path, terminator):
     path, error = poller._job_log("o/r", 42, 101)
     assert not error
     saved = path.read_bytes()
-    assert saved == (visible + b"FAILED\t\n")[-poller.LOG_EXCERPT_BYTES:]
+    assert b"FAILED\t\n" in saved and b"[truncated]" in saved
+    assert len(saved) <= poller.LOG_EXCERPT_BYTES
     assert b"\x1b" not in saved and b"hidden" not in saved
     assert all(byte >= 32 or byte in (9, 10) for byte in saved)
 

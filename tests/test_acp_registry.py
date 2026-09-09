@@ -264,7 +264,7 @@ def test_hands_and_filesystem_contract() -> None:
         "`mcpServers` is missing or empty",
         "locally hosted MCP-over-ACP provider named `mimir-hands`",
         "`mimir.hands.v1` profile",
-        "`read`, `edit`, `shell`, and `python`",
+        "`read`, `edit`, `shell`, `python`, and `request_scope`",
         "session new, session load, and provider-list change",
         "`allow_session` creates only an in-memory proxy grant",
         "tainted call always prompts again",
@@ -275,7 +275,7 @@ def test_hands_and_filesystem_contract() -> None:
         "This is lexical path confinement only",
         "`fs` and `terminal` capabilities but never calls them",
         "`additionalDirectories`",
-        "`hands_shell` and `hands_python` are not path-confined",
+        "`hands_shell` and `hands_python` use OS-level filesystem confinement by default",
         "a symlink inside the cwd pointing outside it is still followed",
         "one lazy subprocess and in-memory namespace per canonical project directory",
         "str(Path(cwd).resolve())",
@@ -292,11 +292,15 @@ def test_hands_and_filesystem_contract() -> None:
         "%kernel kill",
         "%kernel release",
         "Restarting the proxy or respawning a worker loses all Python state",
-        "there is no widening path yet",
+        "spawn-time set for equality, not subset membership",
+        "Any difference retires and respawns the worker",
+        "the operator is warned before approving that change",
         "1,800 seconds of idle time",
         "killed and reaped during cleanup",
     ]:
         assert value in text
+    assert "confinement work in #1593 has not landed" not in text
+    assert "there is no widening path yet" not in text
 
 
 def test_troubleshooting_contract() -> None:
@@ -355,3 +359,71 @@ def test_docs_reject_affirmative_ide_and_arbitrary_mcp_claims() -> None:
         re.IGNORECASE,
     )
     assert not affirmative_claim.search(prose)
+
+
+def test_docs_bound_unconfined_fallback_to_explicit_session_risk_approval() -> None:
+    text = " ".join(section("### Hands execution scope", "this heading is absent").split())
+    for value in (
+        "Confinement is the default and remains mandatory when a backend is available",
+        "Only an unavailable platform or confinement backend can offer unconfined execution",
+        "A malformed profile, profile application error, or child runtime failure never triggers a downgrade",
+        "There is no automatic fallback or model-controlled opt-in flag",
+        "operator must explicitly accept the risk over `session/request_permission`",
+        "local proxy user's filesystem permissions",
+        "path-scope grants do NOT protect files in unconfined mode",
+        "separate from wrapper permissions, path grants, and taint acknowledgement",
+        "in-memory, session-only, never persisted",
+        "Without explicit acceptance, no child is spawned",
+        "Rejection is final for the session",
+        "Cancellation, timeout, malformed responses, stale replies",
+        "Risk prompts are bounded",
+        "risk prompt warns before consent that acceptance restarts any existing Python kernel",
+        "restart happens only after operator approval",
+        "does not retroactively confine already-running processes",
+        "Scope-query results report unconfined mode in their `message`",
+        "execution results report it in `stderr`",
+        "Filtered environment, safe stdin, output capture",
+        "without command text, file contents, or credentials",
+        "bounded JSON records to the local proxy's stderr",
+        "does not revoke paths from already-running detached processes",
+    ):
+        assert value in text
+    assert "always confined" not in text
+    assert "There is no unconfined fallback" not in text
+
+
+def test_experimental_warning_matches_shipped_execution_confinement_contract() -> None:
+    opening = " ".join(section("## Experimental status", "## Architecture and daemon").split())
+    for value in (
+        "Execution confinement has one backend, and it is macOS-only.",
+        "run under OS-level filesystem confinement by default",
+        "mandatory wherever a backend is available",
+        "a confined child cannot follow a symlink out of the approved paths",
+        "macOS Seatbelt (`sandbox-exec`)",
+        "On a platform with no backend the tools run only after the operator explicitly accepts the unconfined risk",
+        "cwd and path-scope grants do not protect files",
+        "Chainlink #1597 tracks a Linux backend",
+    ):
+        assert value in opening
+    assert "not shipped" not in opening.lower()
+    assert "execution is unconfined" not in opening.lower()
+    # Keep the separate direct-file boundary visible instead of implying that
+    # OS execution confinement also hardens the lexical read/edit tools.
+    assert "File confinement is lexical, not a sandbox." in opening
+    assert "follow in-cwd symlinks even when their targets are outside it" in opening
+
+
+def test_docs_distinguish_revoked_risk_grant_from_operator_rejection() -> None:
+    risk = " ".join(section("#### Unavailable-backend risk approval", "#### Confined path requests").split())
+    for value in (
+        "Disconnecting any hosted MCP connection revokes the risk grant for its shared session",
+        "retires that session's Python kernel",
+        "Other connections to the same session do not keep the grant",
+        "one-risk-request limit and final request history survive this connection reset",
+        "Reconnecting therefore cannot request risk approval again, even if the operator previously accepted it",
+        "no active risk grant; this does not mean the operator rejected the earlier request",
+        "Start a new ACP session, or load a session as a new provider-session incarnation",
+        "request fresh operator approval and start a fresh Python namespace",
+        "With an available confinement backend, execution can continue confined after connection reset without risk approval",
+    ):
+        assert value in risk

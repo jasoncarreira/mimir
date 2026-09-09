@@ -886,17 +886,17 @@ async def test_launch_socket_modes_cwd_and_environment_are_exact(
     modes: list[int] = []
     real_output = manager._output_path
 
-    def output_path() -> Path:
-        path = real_output()
+    def output_path(directory: Path) -> Path:
+        path = real_output(directory)
         modes.append(stat.S_IMODE(path.stat().st_mode))
         return path
 
     monkeypatch.setattr(manager, "_output_path", output_path)
     try:
         result = await manager.execute(
-            "one", tmp_path, "import os\n(os.getcwd(),os.environ['MIMIR_KERNEL_TEST_ENV'])"
+            "one", tmp_path, "import os\n(os.getcwd(),os.environ.get('MIMIR_KERNEL_TEST_ENV'))"
         )
-        assert observed["args"] == (
+        assert observed["args"][-5:] == (
             sys.executable,
             "-m",
             "mimir.acp.python_kernel",
@@ -905,13 +905,15 @@ async def test_launch_socket_modes_cwd_and_environment_are_exact(
         )
         options = observed["kwargs"]
         assert options["cwd"] == tmp_path
-        assert options["env"] is None
+        assert isinstance(options["env"], dict)
+        assert "MIMIR_KERNEL_TEST_ENV" not in options["env"]
         assert options["start_new_session"] is True
+        assert options["stdin"] == asyncio.subprocess.DEVNULL
         assert options["stdout"] == asyncio.subprocess.DEVNULL
         assert options["stderr"] == asyncio.subprocess.DEVNULL
         assert modes == [0o600, 0o600]
         assert stat.S_IMODE(manager._directory.stat().st_mode) == 0o700
-        assert result["value"] == f"({str(tmp_path)!r}, 'inherited')"
+        assert result["value"] == f"({str(tmp_path)!r}, None)"
     finally:
         await manager.close()
 
@@ -924,12 +926,12 @@ async def test_output_setup_and_protocol_failures_discard_worker(
     calls = 0
     real_output = manager._output_path
 
-    def fail_second_output() -> Path:
+    def fail_second_output(directory: Path) -> Path:
         nonlocal calls
         calls += 1
         if calls == 2:
             raise OSError("output denied")
-        return real_output()
+        return real_output(directory)
 
     monkeypatch.setattr(manager, "_output_path", fail_second_output)
     with pytest.raises(PythonKernelUnavailable, match="output denied"):
@@ -968,11 +970,13 @@ async def test_deadline_expires_during_spawn_handshake_and_output_setup(
         del args, kwargs
         await asyncio.Event().wait()
 
+    real_spawn = asyncio.create_subprocess_exec
     monkeypatch.setattr(asyncio, "create_subprocess_exec", blocked_spawn)
     assert await spawn_manager.execute("spawn", tmp_path, "1", 0.01) == timeout_result
     assert spawn_manager._processes == {}
     await spawn_manager.close()
-    monkeypatch.undo()
+    # Restore only our spawn patch, not the Linux unit-backend fixture.
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", real_spawn)
 
     handshake_manager = PythonKernelManager()
 
@@ -993,9 +997,9 @@ async def test_deadline_expires_during_spawn_handshake_and_output_setup(
     assert (await setup_manager.execute("setup", tmp_path, "1"))["ok"] is True
     real_output = setup_manager._output_path
 
-    def delayed_output() -> Path:
+    def delayed_output(directory: Path) -> Path:
         time.sleep(0.03)
-        return real_output()
+        return real_output(directory)
 
     monkeypatch.setattr(setup_manager, "_output_path", delayed_output)
     assert await setup_manager.execute("setup", tmp_path, "2", 0.01) == timeout_result
@@ -1061,7 +1065,199 @@ def test_worker_is_plain_exec_subprocess_without_ipykernel_or_zmq() -> None:
     assert "ipykernel" not in imports
     assert "zmq" not in imports
     source = path.read_text()
-    assert '"-m",\n                    "mimir.acp.python_kernel"' in source
+    assert '"-m", "mimir.acp.python_kernel"' in source
     assert "start_new_session=True" in source
     assert sys.executable
     assert os.name == "posix"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("adoption", ["equal", "narrower", "wider", "different"])
+async def test_adoption_compares_complete_spawn_policy(tmp_path, adoption):
+    cwd = tmp_path / "cwd"
+    cwd.mkdir()
+    a, b = tmp_path / "a", tmp_path / "b"
+    a.touch()
+    b.touch()
+    policies = {"equal": (a, a), "narrower": (), "wider": (a, b), "different": (b,)}
+    manager = PythonKernelManager()
+    try:
+        await manager.execute("one", cwd, "kept = 42", approved_paths=(a,))
+        original = next(iter(manager._processes))
+        await manager.release("one")
+        result = await manager.execute("two", cwd, "globals().get('kept')",
+                                       approved_paths=policies[adoption])
+        assert result["kernel"] == ("reused" if adoption == "equal" else "fresh")
+        assert result["value"] == ("42" if adoption == "equal" else "None")
+        assert (original.returncode is None) == (adoption == "equal")
+        state = manager._kernels[str(cwd.resolve())]
+        assert state.worker.approved_paths == tuple(sorted(set(policies[adoption])))
+    finally:
+        await manager.close()
+
+
+@pytest.mark.asyncio
+async def test_retire_owned_does_not_kill_another_sessions_kernel(tmp_path):
+    manager = PythonKernelManager()
+    try:
+        await manager.execute("one", tmp_path, "kept = 42")
+        await manager.retire_owned("two")
+        result = await manager.execute("one", tmp_path, "kept")
+        assert result["kernel"] == "reused" and result["value"] == "42"
+        await manager.retire_owned("one")
+        assert manager.kernels() == []
+        assert not manager._directory_descriptors
+    finally:
+        await manager.close()
+
+
+@pytest.fixture(autouse=True)
+def _unit_backend_on_unsupported_platform(monkeypatch):
+    # These pre-existing lifecycle/unit tests exercise real subprocesses, not OS
+    # confinement. The dedicated scope/backend integration tests use Seatbelt.
+    if sys.platform != "darwin":
+        from mimir.acp.confinement import PreparedCommand
+        import mimir.acp.hosted as hosted_module
+        import mimir.acp.python_kernel as kernel_module
+        def prepare(argv, **kwargs):
+            env = dict(os.environ)
+            env.pop("MIMIR_KERNEL_TEST_ENV", None)
+            env.pop("MIMIR_HOSTED_SENTINEL", None)
+            return PreparedCommand(tuple(argv), env)
+        monkeypatch.setattr(hosted_module, "prepare_command", prepare)
+        monkeypatch.setattr(kernel_module, "prepare_command", prepare)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("ending", ["pass", "import os; os._exit(31)", "import time; time.sleep(30)"])
+async def test_parent_output_reads_retained_inode_not_worker_symlink(tmp_path, ending):
+    cwd = tmp_path / "cwd"
+    cwd.mkdir()
+    secret = tmp_path / "secret"
+    secret.write_text("outside-fixture-must-not-leak")
+    manager = PythonKernelManager()
+    try:
+        await manager.execute("s", cwd, "1")
+        directory = manager._kernels[str(cwd.resolve())].directory
+        code = (f"from pathlib import Path\n"
+                f"for p in Path({str(directory)!r}).iterdir():\n"
+                f"    p.unlink()\n    p.symlink_to({str(secret)!r})\n" + ending)
+        result = await manager.execute("s", cwd, code, 1)
+        assert "outside-fixture-must-not-leak" not in repr(result)
+        assert result["stdout"] == result["stderr"] == ""
+    finally:
+        await manager.close()
+
+
+@pytest.mark.asyncio
+async def test_parent_output_creation_uses_pinned_scratch_directory(tmp_path):
+    manager = PythonKernelManager()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    try:
+        await manager.execute("s", tmp_path, "1")
+        directory = manager._kernels[str(tmp_path.resolve())].directory
+        moved = directory.with_name(directory.name + "-moved")
+        directory.rename(moved)
+        directory.symlink_to(outside, target_is_directory=True)
+        output = manager._output_path(directory)
+        assert not list(outside.iterdir())
+        assert (moved / output.name).is_file()
+        os.close(manager._output_descriptors.pop(output))
+        os.unlink(output.name, dir_fd=manager._directory_descriptors[directory])
+    finally:
+        await manager.close()
+
+
+@pytest.mark.asyncio
+async def test_directory_substituted_for_output_never_retains_kernel_lock(tmp_path):
+    manager = PythonKernelManager()
+    try:
+        await manager.execute("s", tmp_path, "1")
+        directory = manager._kernels[str(tmp_path.resolve())].directory
+        code = ("from pathlib import Path\n"
+                f"for p in Path({str(directory)!r}).iterdir():\n"
+                "    p.unlink()\n    p.mkdir()\n")
+        async with asyncio.timeout(5):
+            result = await manager.execute("s", tmp_path, code)
+            assert result["ok"]
+            assert not manager._output_descriptors
+            assert not manager._kernels[str(tmp_path.resolve())].lock.locked()
+            assert (await manager.execute("s", tmp_path, "42"))["value"] == "42"
+            descriptor = manager._directory_descriptors[directory]
+            await manager.retire(tmp_path)
+            assert directory not in manager._directory_descriptors
+            with pytest.raises(OSError):
+                os.fstat(descriptor)
+    finally:
+        async with asyncio.timeout(5):
+            await manager.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("exited", [False, True])
+async def test_kernel_signal_denial_requires_confirmed_process_exit(monkeypatch, exited):
+    from unittest.mock import Mock
+    class Process:
+        returncode = None
+        async def wait(self):
+            if not exited:
+                await asyncio.Event().wait()
+            self.returncode = 31
+            return 31
+    process = Process()
+    worker = kernel._Worker(process, 123, Mock())
+    manager = PythonKernelManager()
+    denied = PermissionError("initial signal genuinely denied")
+    def killpg(*args):
+        raise denied
+    monkeypatch.setattr(kernel.os, "killpg", killpg)
+    monkeypatch.setattr(kernel, "_EXIT_CONFIRMATION_SECONDS", 0.01)
+    try:
+        if exited:
+            await manager._terminate(worker)
+            assert worker.signalled
+            assert process.returncode == 31
+        else:
+            with pytest.raises(PermissionError) as caught:
+                await manager._terminate(worker)
+            assert caught.value is denied
+            assert not worker.signalled
+            assert worker.reaper is None
+    finally:
+        await manager.close()
+
+
+@pytest.mark.asyncio
+async def test_kernel_repeated_cancel_does_not_repeat_successful_signal(monkeypatch):
+    from unittest.mock import Mock
+    entered, finish = asyncio.Event(), asyncio.Event()
+    class Process:
+        returncode = None
+        async def wait(self):
+            entered.set()
+            await finish.wait()
+            self.returncode = -9
+            return -9
+    process = Process()
+    worker = kernel._Worker(process, 123, Mock())
+    manager = PythonKernelManager()
+    calls = []
+    def killpg(*args):
+        calls.append(args)
+        if len(calls) > 1:
+            raise PermissionError("dying process group")
+    monkeypatch.setattr(kernel.os, "killpg", killpg)
+    task = asyncio.create_task(manager._terminate(worker))
+    try:
+        await entered.wait()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert worker.signalled
+        finish.set()
+        await manager._terminate(worker)
+        assert calls == [(123, 9)]
+    finally:
+        finish.set()
+        await manager.close()
