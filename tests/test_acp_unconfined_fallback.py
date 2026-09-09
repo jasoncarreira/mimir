@@ -175,6 +175,44 @@ async def test_every_unconfined_python_result_labels_mode(tmp_path, unavailable,
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("modes", [("unconfined", "unconfined"), ("unconfined", "confined"), ("confined", "unconfined")])
+@pytest.mark.parametrize("ending", ["success", "crash", "timeout", "startup"])
+async def test_adopted_kernel_warning_uses_this_calls_mode(tmp_path, monkeypatch, modes, ending):
+    import os
+    from mimir.acp import python_kernel as kernels
+
+    mode = modes[0]
+    def prepare(argv, **kwargs):
+        return confinement.PreparedCommand(tuple(argv), dict(os.environ), execution_mode=mode)
+    monkeypatch.setattr(kernels, "prepare_command", prepare)
+    manager = kernels.PythonKernelManager()
+    try:
+        await manager.execute("a", tmp_path, "kept = 42")
+        await manager.release("a")
+        mode = modes[1]
+        if ending == "startup":
+            await manager.retire(tmp_path)
+            async def fail(*args):
+                raise kernels.PythonKernelUnavailable("startup fixture")
+            monkeypatch.setattr(manager, "_spawn", fail)
+            with pytest.raises(kernels.PythonKernelUnavailable) as error:
+                await manager.execute("b", tmp_path, "1")
+            assert str(error.value).count(UNCONFINED_WARNING) == (mode == "unconfined")
+        else:
+            code = {"success": "1", "crash": "import os; os._exit(31)",
+                    "timeout": "import time; time.sleep(30)"}[ending]
+            result = await manager.execute("b", tmp_path, code, timeout=1)
+            assert result["stderr"].count(UNCONFINED_WARNING) == (mode == "unconfined")
+            if ending == "success":
+                assert result["ok"]
+                assert result["kernel"] == ("reused" if modes[0] == mode else "fresh")
+            else:
+                assert not result["ok"]
+    finally:
+        await manager.close()
+
+
+@pytest.mark.asyncio
 async def test_unconfined_shell_failure_and_timeout_label_mode(tmp_path, unavailable):
     provider, session = bind(tmp_path, AsyncMock(return_value=True))
     try:

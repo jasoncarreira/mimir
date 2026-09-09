@@ -19,7 +19,7 @@ from typing import Any, Coroutine
 from collections.abc import Iterable
 
 from .confinement import prepare_command, ConfinementUnavailable
-from .execution_scope import UNCONFINED_WARNING
+from .execution_scope import ScopeApproval, UNCONFINED_WARNING
 
 
 STREAM_LIMIT_BYTES = 65_536
@@ -149,7 +149,7 @@ class _Worker:
     process: asyncio.subprocess.Process
     pgid: int
     channel: socket.socket
-    approved_paths: tuple[Path, ...] = ()
+    approved_paths: tuple[ScopeApproval, ...] = ()
     execution_mode: str = "confined"
     usable: bool = False
     signalled: bool = False
@@ -160,7 +160,7 @@ class _Worker:
 class _Kernel:
     owner: str | None = None
     directory: Path | None = None
-    approved_paths: tuple[Path, ...] = ()
+    approved_paths: tuple[ScopeApproval, ...] = ()
     allow_unconfined: bool = False
     execution_mode: str = "confined"
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
@@ -187,9 +187,12 @@ class PythonKernelManager:
         cwd: str | os.PathLike[str],
         code: str,
         timeout: int | float = 60,
-        *, approved_paths: Iterable[Path] = (),
+        *, approved_paths: Iterable[ScopeApproval] = (),
         allow_unconfined: bool = False,
     ) -> dict[str, Any]:
+        # Warning attribution stays call-local, under the project kernel lock.
+        # A session-id lookup would miss adopted kernels, and a post-call lookup
+        # would lose state after crash/timeout cleanup (or observe a new owner).
         if self._closed:
             raise PythonKernelUnavailable("kernel manager is closed")
         key = str(Path(cwd).resolve())
@@ -247,7 +250,8 @@ class PythonKernelManager:
         try:
             if self._closed:
                 raise PythonKernelUnavailable("kernel manager is closed")
-            policy = tuple(sorted({Path(p) for p in approved_paths}))
+            # Preserve the permission-time recursion bit; never re-stat paths.
+            policy = tuple(sorted(set(approved_paths)))
             prepared = prepare_command((sys.executable,), cwd=Path(cwd),
                                        approved_paths=policy,
                                        allow_unconfined=allow_unconfined)

@@ -12,17 +12,20 @@ Coverage:
 from __future__ import annotations
 
 import asyncio
+import errno
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 import json
 import os
 import re
 import shutil
+import signal
 import stat
 import sys
 import time
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 import yaml
@@ -47,6 +50,7 @@ from mimir.pollers import (
     _github_content_author,
     _github_framework_trigger_is_trusted,
     _github_recovery_relevance_check,
+    _kill_process_group,
     _parse_poller_authority,
     discover_pollers,
     GITHUB_TRUST_ATTEMPTS_PER_FIRE,
@@ -72,6 +76,44 @@ from mimir.models import (
 
 
 # ─── Fixtures ────────────────────────────────────────────────────────
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        pytest.param(PermissionError(errno.EPERM, "denied"), id="PermissionError"),
+        pytest.param(ProcessLookupError(errno.ESRCH, "gone"), id="ESRCH"),
+    ],
+)
+def test_kill_process_group_killpg_error_returns_normally(
+    monkeypatch: pytest.MonkeyPatch, error: OSError,
+) -> None:
+    proc = Mock(spec=asyncio.subprocess.Process)
+    proc.pid = 12345
+    killpg = Mock(side_effect=error)
+    monkeypatch.setattr("mimir.pollers.os.killpg", killpg)
+
+    assert _kill_process_group(proc) is None
+
+    killpg.assert_called_once_with(proc.pid, signal.SIGKILL)
+    proc.kill.assert_not_called()
+
+
+def test_kill_process_group_killpg_einval_propagates(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    proc = Mock(spec=asyncio.subprocess.Process)
+    proc.pid = 12345
+    error = OSError(errno.EINVAL, "invalid signal")
+    killpg = Mock(side_effect=error)
+    monkeypatch.setattr("mimir.pollers.os.killpg", killpg)
+
+    with pytest.raises(OSError) as raised:
+        _kill_process_group(proc)
+
+    assert raised.value is error
+    killpg.assert_called_once_with(proc.pid, signal.SIGKILL)
+    proc.kill.assert_not_called()
 
 
 @pytest.fixture

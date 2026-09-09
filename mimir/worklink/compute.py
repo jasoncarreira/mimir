@@ -798,6 +798,7 @@ class _ExternalProcess:
             if process_is_zombie(self.pid):
                 return
             try:
+                # Authoritative liveness probe: EPERM is not proof of exit.
                 os.kill(self.pid, 0)
             except ProcessLookupError:
                 return

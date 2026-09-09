@@ -230,7 +230,7 @@ do not rely on a symlink escape as isolation.
 
 Native Mimir tools operate on the daemon host. Mimir Hands operates with the local client's user authority. `hands_read` and `hands_edit` are confined to the session's bound `cwd`: relative paths are normalized against it, and absolute paths outside it (including sibling directories) are refused. This is lexical path confinement only. The daemon cannot resolve symlinks on the client's filesystem; a symlink inside the cwd pointing outside it is still followed. Admins should scope a directory whose content and symlinks they trust. Successful cwd reads retain their source and originating-channel labels but no longer add untrusted active ingest. They do not clear taint from URLs, forge results, messages, or other untrusted sources.
 
-`hands_shell` and `hands_python` use OS-level filesystem confinement by default. It is mandatory when the backend is available. Only an unavailable backend permits the separately approved fallback described below. Their confined child processes start in the session cwd and can access its descendants, exact operator-approved extra paths, and narrowly required runtime paths. The tools take command/code strings rather than paths, so argument checks alone cannot enforce this boundary. Use `hands_request_scope` to request additional paths before execution. Their output remains untrusted active ingest, so a shell result can still cause the next granted shell call to prompt. Operator consent does not declassify that output. Mimir tolerates advertised ACP client `fs` and `terminal` capabilities but never calls them. `additionalDirectories` and arbitrary provider profiles are rejected.
+`hands_shell` and `hands_python` use OS-level filesystem confinement by default. It is mandatory when the backend is available. Only an unavailable backend permits the separately approved fallback described below. Their confined child processes start in the session cwd and can access its descendants, operator-approved extra files or directories and their descendants, and narrowly required runtime paths. The tools take command/code strings rather than paths, so argument checks alone cannot enforce this boundary. Use `hands_request_scope` to request additional paths before execution. Their output remains untrusted active ingest, so a shell result can still cause the next granted shell call to prompt. Operator consent does not declassify that output. Mimir tolerates advertised ACP client `fs` and `terminal` capabilities but never calls them. `additionalDirectories` and arbitrary provider profiles are rejected.
 
 Python keeps one lazy subprocess and in-memory namespace per canonical project directory (`str(Path(cwd).resolve())`) within the live proxy, with a single session owner until release. Another session using the same directory is refused while the kernel is owned. Hosted disconnect and session load detach the owner without destroying an idle worker, so the next session can reuse its variables, functions, imports, and loaded data when its approved paths and execution mode match the worker's spawn-time profile. Session load restores the daemon transcript, not Python state: the namespace is never serialized to a session, journal, or disk. Existing transient stdout/stderr capture files are unchanged.
 
@@ -242,7 +242,7 @@ Pass these operator commands as the entire `code` argument to `hands_python` (th
 - `%kernel kill` explicitly kills the current project kernel only if it is unowned or owned by the caller. It cannot target another project.
 - `%kernel release` detaches the caller from the current project without killing its idle worker.
 
-These commands do not widen permissions. Shell and Python children run under OS-level filesystem confinement by default, mandatory wherever a backend is available, using spawn-time approved paths. Widening approved paths requires a respawn that loses the namespace; the operator is warned before approving that change. Before reuse, including reattachment, the manager compares the new session's approved set with the worker's recorded spawn-time set for equality, not subset membership. Any difference retires and respawns the worker rather than inheriting broader access; switching execution mode also respawns. Equal-policy reattachment preserves the namespace; different-policy reattachment loses it. On platforms without a backend, the separately approved unconfined mode still provides no filesystem isolation.
+These commands do not widen permissions. Shell and Python children run under OS-level filesystem confinement by default, mandatory wherever a backend is available, using spawn-time approved paths. Widening approved paths requires a respawn that loses the namespace; the operator is warned before approving that change. Before reuse, including reattachment, the manager compares the new session's approved set with the worker's recorded spawn-time set for equality, not subset membership. Equality includes each `ScopeApproval` path and its permission-time `recursive` flag; the same path with a different recursion grant is a different policy. Any difference retires and respawns the worker rather than inheriting broader access; switching execution mode also respawns. Equal-policy reattachment preserves the namespace; different-policy reattachment loses it. On platforms without a backend, the separately approved unconfined mode still provides no filesystem isolation.
 
 ## Troubleshooting
 
@@ -254,8 +254,8 @@ For SSH profiles, additionally confirm the remote `mimir-agent` version is 0.9.0
 ### Hands execution scope
 
 Confined Hands shell and Python execution uses the session's approved paths,
-initially its cwd and descendants. Additional approved file or directory paths
-are literal: approving a directory does not approve its children.
+initially its cwd and descendants. Additional file approvals cover the file alone;
+directory approvals cover the directory and everything beneath it.
 macOS uses Seatbelt (`sandbox-exec`, deprecated by Apple). A replaceable
 confinement backend seam permits a future Linux backend.
 
@@ -312,7 +312,8 @@ outside the approved set. `path=""` queries that set without prompting. The wire
 method is `request_scope` with exactly `{path: string}`. Its result is exactly
 `{approved: bool, paths: list[string], message: string}`. Non-empty requests go
 through the provider to the editor's `session/request_permission` channel. Only
-operator approval adds the exact path, never its parent or a glob. Scope prompts
+operator approval adds the file alone or the directory and everything beneath it,
+never its parent or a glob. Scope prompts
 and scope audit events contain the path and fixed status, not commands or file
 contents. Scope outcomes use the existing `acp_permission_outcome` event name,
 written as bounded JSON records to the local proxy's stderr. These records do

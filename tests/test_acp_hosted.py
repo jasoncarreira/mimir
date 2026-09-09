@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import asyncio
+import errno
 import os
 import shlex
 import stat
 import sys
 from pathlib import Path
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 
@@ -38,6 +40,53 @@ async def _connected(tmp_path: Path) -> tuple[HostedHandsProvider, str]:
     }
     await provider.notification(connection, "notifications/initialized")
     return provider, connection
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        pytest.param(PermissionError(errno.EPERM, "denied"), id="PermissionError"),
+        pytest.param(ProcessLookupError(errno.ESRCH, "gone"), id="ESRCH"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_terminate_process_killpg_error_still_reaps_and_untracks(
+    monkeypatch: pytest.MonkeyPatch, error: OSError,
+) -> None:
+    provider = HostedHandsProvider()
+    process = Mock(spec=asyncio.subprocess.Process)
+    process.wait = AsyncMock(return_value=0)
+    # EPERM is tolerated for an exited leader, not an unsignalable live one.
+    process.returncode = 0
+    pgid = 12345
+    provider._processes[process] = pgid
+    killpg = Mock(side_effect=error)
+    monkeypatch.setattr(hosted.os, "killpg", killpg)
+
+    assert await provider._terminate_process(process, pgid) is None
+
+    killpg.assert_called_once_with(pgid, 9)
+    process.wait.assert_awaited_once_with()
+    assert provider._processes == {}
+
+
+@pytest.mark.asyncio
+async def test_terminate_process_killpg_einval_propagates(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = HostedHandsProvider()
+    process = Mock(spec=asyncio.subprocess.Process)
+    process.wait = AsyncMock(return_value=0)
+    error = OSError(errno.EINVAL, "invalid signal")
+    killpg = Mock(side_effect=error)
+    monkeypatch.setattr(hosted.os, "killpg", killpg)
+
+    with pytest.raises(OSError) as raised:
+        await provider._terminate_process(process, 12345)
+
+    assert raised.value is error
+    killpg.assert_called_once_with(12345, 9)
+    process.wait.assert_not_awaited()
 
 
 @pytest.mark.asyncio

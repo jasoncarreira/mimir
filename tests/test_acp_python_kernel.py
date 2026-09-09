@@ -1079,6 +1079,8 @@ async def test_adoption_compares_complete_spawn_policy(tmp_path, adoption):
     a, b = tmp_path / "a", tmp_path / "b"
     a.touch()
     b.touch()
+    from mimir.acp.execution_scope import ScopeApproval
+    a, b = ScopeApproval(a, False), ScopeApproval(b, False)
     policies = {"equal": (a, a), "narrower": (), "wider": (a, b), "different": (b,)}
     manager = PythonKernelManager()
     try:

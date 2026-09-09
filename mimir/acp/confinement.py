@@ -16,6 +16,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
 
+from mimir.acp.execution_scope import ScopeApproval
+
 
 class ConfinementUnavailable(RuntimeError):
     """Confinement setup failed; execution must not silently downgrade."""
@@ -38,7 +40,7 @@ class ConfinementBackend(Protocol):
         argv: Sequence[str],
         *,
         cwd: Path,
-        approved_paths: Iterable[Path],
+        approved_paths: Iterable[ScopeApproval],
         scratch_paths: Iterable[Path],
     ) -> PreparedCommand: ...
 
@@ -106,7 +108,7 @@ class SeatbeltBackend:
         argv: Sequence[str],
         *,
         cwd: Path,
-        approved_paths: Iterable[Path] = (),
+        approved_paths: Iterable[ScopeApproval] = (),
         scratch_paths: Iterable[Path] = (),
     ) -> PreparedCommand:
         if not self.executable.is_file() or not os.access(self.executable, os.X_OK):
@@ -127,8 +129,8 @@ class SeatbeltBackend:
         for value in approved_paths:
             # The scope authority freezes canonical paths at approval time. Do
             # not follow a replacement symlink and silently grant its new target.
-            path = Path(os.path.abspath(value))
-            writable.add(_filter(path, tree=False))
+            path = Path(os.path.abspath(value.path))
+            writable.add(_filter(path, tree=value.recursive))
         scratch_roots: list[str] = []
         for value in scratch_paths:
             path = Path(os.path.abspath(value))
@@ -170,7 +172,7 @@ def prepare_command(
     argv: Sequence[str],
     *,
     cwd: Path,
-    approved_paths: Iterable[Path] = (),
+    approved_paths: Iterable[ScopeApproval] = (),
     scratch_paths: Iterable[Path] = (),
     allow_unconfined: bool = False,
 ) -> PreparedCommand:

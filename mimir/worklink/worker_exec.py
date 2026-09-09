@@ -467,6 +467,7 @@ def _process_group_has_live_members(process_group: int) -> bool:
             ):
                 return True
         return False
+    # Best-effort fallback after process enumeration fails, not proof of exit.
     try:
         os.killpg(process_group, 0)
     except (ProcessLookupError, PermissionError):
@@ -485,13 +486,13 @@ def _wait_process_group(process_group: int, deadline: float) -> bool:
 def _terminate_process_group_pid(process_group: int, timeout_s: float = 5.0) -> None:
     try:
         os.killpg(process_group, signal.SIGTERM)
-    except ProcessLookupError:
+    except (ProcessLookupError, PermissionError):
         pass
     _wait_process_group(process_group, time.monotonic() + timeout_s)
     if _process_group_has_live_members(process_group):
         try:
             os.killpg(process_group, signal.SIGKILL)
-        except ProcessLookupError:
+        except (ProcessLookupError, PermissionError):
             pass
         if not _wait_process_group(
             process_group, time.monotonic() + _PROCESS_GROUP_KILL_TIMEOUT_S

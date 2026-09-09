@@ -16,6 +16,7 @@ import pytest
 import yaml
 
 from mimir.acp.daemon import AcpDaemon
+from mimir.acp.execution_scope import ScopeApproval
 from mimir.acp.hosted import HostedMcpError
 from mimir.acp.profiles import Profile, ProfileStore
 from mimir.acp.proxy import MAX_FRAME_BYTES, FrameWriter, PermissionGrantStore, ProxyError, ProxyRouter, _route_stream, run_local_proxy, run_router
@@ -1814,7 +1815,7 @@ async def test_invalid_key_reaches_actual_daemon_rejection_through_credential_pa
 async def start_scope_permission(
     router: ProxyRouter, connection_id: str, request_id: int, path: str,
     monkeypatch: pytest.MonkeyPatch,
-    *, unconfined: bool = False,
+    *, unconfined: bool = False, recursive: bool = False,
 ) -> asyncio.Task[Any]:
     """Exercise the real hosted request owner without depending on a sandbox."""
     provider_id = router._connection_provider_sessions[connection_id]
@@ -1822,7 +1823,9 @@ async def start_scope_permission(
     async def request(*args: Any, **kwargs: Any) -> dict[str, Any]:
         approved = (
             await router._request_unconfined_permission(provider_id)
-            if unconfined else await router._request_scope_permission(provider_id, path)
+            if unconfined else await router._request_scope_permission(
+                provider_id, ScopeApproval(path=Path(path), recursive=recursive),
+            )
         )
         return {"approved": approved}
 
@@ -1841,8 +1844,9 @@ async def start_scope_permission(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("recursive", [False, True], ids=["file", "directory"])
 async def test_scope_permission_is_local_path_only_and_separate_from_wrapper_grants(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, recursive: bool,
 ) -> None:
     router, client, daemon, _, connection_id = await hosted_router(tmp_path)
     try:
@@ -1850,7 +1854,9 @@ async def test_scope_permission_is_local_path_only_and_separate_from_wrapper_gra
         client.data.clear()
         daemon.data.clear()
         path = str(tmp_path.parent / "outside")
-        task = await start_scope_permission(router, connection_id, 11, path, monkeypatch)
+        task = await start_scope_permission(
+            router, connection_id, 11, path, monkeypatch, recursive=recursive,
+        )
         request, = messages(client)
         assert request["method"] == "session/request_permission"
         params = request["params"]
@@ -1858,6 +1864,12 @@ async def test_scope_permission_is_local_path_only_and_separate_from_wrapper_gra
         assert params["toolCall"]["rawInput"] == {"path": path}
         assert "restarts the Python kernel" in params["toolCall"]["title"]
         assert "loses all REPL state" in params["toolCall"]["title"]
+        scope_description = "this directory and everything beneath it" if recursive else "this file alone"
+        assert params["toolCall"]["title"] == (
+            f"Allow read/write access to {scope_description} for this session? "
+            "Approval restarts the Python kernel and loses all REPL state."
+        )
+        assert params["options"][0]["name"] == "Allow this scope for this session"
         assert params["_meta"] == {"mimir.execution_scope": True}
         assert [item["optionId"] for item in params["options"]] == [
             "allow_session", "reject_once",
@@ -1991,7 +2003,9 @@ async def test_scope_permission_requires_owned_hosted_task_and_bounds_requests(
         client.data.clear()
         daemon.data.clear()
         provider_id = router._connection_provider_sessions[connection_id]
-        assert not await router._request_scope_permission(provider_id, "/outside")
+        assert not await router._request_scope_permission(
+            provider_id, ScopeApproval(path=Path("/outside"), recursive=False),
+        )
         assert messages(client) == []
         monkeypatch.setattr("mimir.acp.proxy.MAX_SCOPE_PERMISSION_REQUESTS", 1)
         task = await start_scope_permission(router, connection_id, 16, "/outside", monkeypatch)
