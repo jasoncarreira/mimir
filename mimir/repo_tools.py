@@ -159,7 +159,11 @@ def _git_failure_detail(result: GitProcessResult) -> str:
 
 @dataclass(frozen=True)
 class GitFetch:
-    """Fetch only the immutable head and base refs bound into the scope."""
+    """Fetch only the current observed head and fixed base bound into the scope.
+
+    The observed head advances only after verified own-publication; it is not
+    an immutable snapshot for the lifetime of the turn.
+    """
 
 
 @dataclass(frozen=True)
@@ -1022,6 +1026,13 @@ class RepoGitTools:
                     os.replace(staging, metadata_path)
                 finally:
                     staging.unlink(missing_ok=True)
+                # Deliberately bypass frozen dataclasses in place: callers retain
+                # these lease/scope objects and must observe the head advance;
+                # replacing them with frozen copies would leave callers stale.
+                # Only our verified own-publication reaches this point, and the
+                # persisted lease metadata is atomically replaced above before
+                # either in-memory observation advances. All other scope fields
+                # stay fixed; do not cache these objects as immutable head snapshots.
                 object.__setattr__(lease, "head_sha", self._expected_head)
                 object.__setattr__(self._scope, "observed_head_sha", self._expected_head)
             except GitRefusal as exc:
