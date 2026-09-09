@@ -73,6 +73,10 @@ EventLogger = Callable[..., None]
 log = logging.getLogger(__name__)
 
 
+class _ChainlinkContentionExhausted(RuntimeError):
+    pass
+
+
 def scope_active_worklink_lock_ids(
     active_ids: Iterable[int],
     *,
@@ -403,12 +407,13 @@ class ChainlinkClaims:
             return ClaimResult(False, reason="review_ready_evidence_exists")
 
         claim_home = Path(home_path) if home_path is not None else self.home_path
-        lock = self._claim_lock_with_retry(
-            issue_id, home_path=claim_home, before_claim=before_claim
-        )
+        try:
+            lock = self._claim_lock_with_retry(
+                issue_id, home_path=claim_home, before_claim=before_claim
+            )
+        except _ChainlinkContentionExhausted:
+            return ClaimResult(False, reason="claim_contention_exhausted")
         if lock.returncode != 0:
-            if _is_git_contention(lock):
-                return ClaimResult(False, reason="claim_contention_exhausted")
             return ClaimResult(False, reason=(lock.stderr or lock.stdout).strip() or "claim_failed")
         if "already hold" in ((lock.stdout or "") + (lock.stderr or "")).lower():
             # chainlink #822: the chainlink CLI treats a same-agent re-claim as
@@ -516,7 +521,23 @@ class ChainlinkClaims:
         home_path: Path | None,
         before_claim: Callable[[], None] | None = None,
     ) -> subprocess.CompletedProcess[str]:
-        """Run only the Chainlink claim under the shared-worktree mutex."""
+        return self._run_with_retry(
+            "locks", "claim", str(issue_id), home_path=home_path,
+            before_claim=before_claim,
+        )
+
+    def _run_with_retry(
+        self,
+        *args: str,
+        home_path: Path | None,
+        before_claim: Callable[[], None] | None = None,
+    ) -> subprocess.CompletedProcess[str]:
+        """One mutex acquisition per invocation; the claim never wraps _run.
+
+        Local mutex waits and external Git contention share one bounded budget.
+        The callback runs once, after acquisition and before the first CLI call.
+        """
+        issue_id = int(args[2]) if len(args) > 2 and args[2].isdigit() else None
         lock_path: Path | None = None
         if home_path is None:
             log.warning(
@@ -536,23 +557,30 @@ class ChainlinkClaims:
             lock_path = lock_dir / "chainlink-claim.lock"
 
         result: subprocess.CompletedProcess[str] | None = None
+        prepared = False
         for attempt in range(1, self.contention_max_attempts + 1):
             if lock_path is None:
-                if attempt == 1 and before_claim is not None:
+                if not prepared and before_claim is not None:
                     before_claim()
-                result = self._run("locks", "claim", str(issue_id), check=False)
+                prepared = True
+                result = self.runner([self.chainlink_bin, *args])
             else:
                 with lock_path.open("a", encoding="utf-8") as handle:
-                    fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
                     try:
-                        if attempt == 1 and before_claim is not None:
-                            before_claim()
-                        result = self._run("locks", "claim", str(issue_id), check=False)
-                    finally:
-                        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+                        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    except BlockingIOError:
+                        result = None
+                    else:
+                        try:
+                            if not prepared and before_claim is not None:
+                                before_claim()
+                            prepared = True
+                            result = self.runner([self.chainlink_bin, *args])
+                        finally:
+                            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
-            if not _is_git_contention(result):
-                if attempt > 1:
+            if result is not None and not _is_git_contention(result):
+                if attempt > 1 and result.returncode == 0:
                     self._emit_claim_contention(issue_id, attempt, "succeeded")
                 return result
 
@@ -560,11 +588,12 @@ class ChainlinkClaims:
                 self._emit_claim_contention(issue_id, attempt, "retrying")
                 self.sleeper(self.contention_initial_backoff_s * (2 ** (attempt - 1)))
 
-        assert result is not None
         self._emit_claim_contention(issue_id, self.contention_max_attempts, "exhausted")
-        return result
+        raise _ChainlinkContentionExhausted(
+            "chainlink contention exhausted (chainlink_locks_worktree)"
+        )
 
-    def _emit_claim_contention(self, issue_id: int, attempt: int, outcome: str) -> None:
+    def _emit_claim_contention(self, issue_id: int | None, attempt: int, outcome: str) -> None:
         if self.event_logger is None:
             return
         self.event_logger(
@@ -1243,7 +1272,7 @@ class ChainlinkClaims:
         )
 
     def _run(self, *args: str, check: bool = True) -> subprocess.CompletedProcess[str]:
-        result = self.runner([self.chainlink_bin, *args])
+        result = self._run_with_retry(*args, home_path=self.home_path)
         if check and result.returncode != 0:
             raise RuntimeError((result.stderr or result.stdout).strip() or f"chainlink {' '.join(args)} failed")
         return result
