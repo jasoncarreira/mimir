@@ -7,6 +7,7 @@ import builtins
 import json
 import os
 import shutil
+import secrets
 import socket
 import struct
 import sys
@@ -15,6 +16,10 @@ import traceback
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Coroutine
+from collections.abc import Iterable
+
+from .confinement import prepare_command, ConfinementUnavailable
+from .execution_scope import UNCONFINED_WARNING
 
 
 STREAM_LIMIT_BYTES = 65_536
@@ -23,6 +28,7 @@ IDLE_SECONDS = 1_800
 _FRAME_LIMIT_BYTES = 16 * 1024 * 1024
 _FILENAME = "<mimir-hands-python>"
 _REAP_TIMEOUT_SECONDS = 5
+_EXIT_CONFIRMATION_SECONDS = 0.1
 
 
 class PythonKernelUnavailable(RuntimeError):
@@ -41,18 +47,6 @@ def _bounded_text(value: str, limit: int) -> str:
     else:
         result = ""
     omitted = len(encoded) - len(retained)
-    if omitted:
-        result += f"\n…[truncated {omitted} bytes]"
-    return result
-
-
-def _bounded_file(path: Path, limit: int) -> str:
-    with path.open("rb") as stream:
-        retained = stream.read(limit)
-        stream.seek(0, os.SEEK_END)
-        total = stream.tell()
-    result = retained.decode("utf-8", errors="replace")
-    omitted = total - len(retained)
     if omitted:
         result += f"\n…[truncated {omitted} bytes]"
     return result
@@ -155,11 +149,16 @@ class _Worker:
     pgid: int
     channel: socket.socket
     usable: bool = False
+    signalled: bool = False
     reaper: asyncio.Task[None] | None = None
 
 
 @dataclass(slots=True)
 class _Session:
+    directory: Path | None = None
+    approved_paths: tuple[Path, ...] = ()
+    allow_unconfined: bool = False
+    execution_mode: str = "confined"
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     waiters: int = 0
     worker: _Worker | None = None
@@ -173,6 +172,8 @@ class PythonKernelManager:
         self._processes: dict[asyncio.subprocess.Process, int] = {}
         self._reapers: set[asyncio.Task[None]] = set()
         self._directory: Path | None = None
+        self._output_descriptors: dict[Path, int] = {}
+        self._directory_descriptors: dict[Path, int] = {}
         self._closed = False
 
     async def execute(
@@ -181,6 +182,31 @@ class PythonKernelManager:
         cwd: str | os.PathLike[str],
         code: str,
         timeout: int | float = 60,
+        *, approved_paths: Iterable[Path] = (),
+        allow_unconfined: bool = False,
+    ) -> dict[str, Any]:
+        try:
+            result = await self._execute(session_id, cwd, code, timeout,
+                                         approved_paths=approved_paths,
+                                         allow_unconfined=allow_unconfined)
+        except PythonKernelUnavailable as exc:
+            state = self._sessions.get(session_id)
+            if state is not None and state.execution_mode == "unconfined":
+                raise PythonKernelUnavailable(UNCONFINED_WARNING + " " + str(exc)) from None
+            raise
+        state = self._sessions.get(session_id)
+        if state is not None and state.execution_mode == "unconfined":
+            result["stderr"] = UNCONFINED_WARNING + "\n" + result["stderr"]
+        return result
+
+    async def _execute(
+        self,
+        session_id: str,
+        cwd: str | os.PathLike[str],
+        code: str,
+        timeout: int | float = 60,
+        *, approved_paths: Iterable[Path] = (),
+        allow_unconfined: bool = False,
     ) -> dict[str, Any]:
         if self._closed:
             raise PythonKernelUnavailable("kernel manager is closed")
@@ -199,6 +225,24 @@ class PythonKernelManager:
         stderr_path: Path | None = None
         kernel_state = "fresh"
         try:
+            policy = tuple(sorted(Path(p) for p in approved_paths))
+            prepared = prepare_command((sys.executable,), cwd=Path(cwd),
+                                       approved_paths=policy,
+                                       allow_unconfined=allow_unconfined)
+            state.allow_unconfined = allow_unconfined
+            if state.worker is not None and (state.approved_paths != policy
+                    or state.execution_mode != prepared.execution_mode):
+                await self._discard(state, state.worker)
+            state.approved_paths = policy
+            if state.directory is None:
+                if self._directory is None:
+                    self._directory = Path(tempfile.mkdtemp(prefix="mimir-python-kernel-"))
+                    self._directory.chmod(0o700)
+                state.directory = Path(tempfile.mkdtemp(dir=self._directory)).resolve()
+                state.directory.chmod(0o700)
+                self._directory_descriptors[state.directory] = os.open(
+                    state.directory, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+                )
             if state.worker is not None:
                 if state.worker.process.returncode is not None:
                     result = await self._crashed(state, state.worker, None, None)
@@ -206,10 +250,10 @@ class PythonKernelManager:
                     return result
                 kernel_state = "reused"
             else:
-                state.worker = await self._spawn(cwd, deadline)
+                state.worker = await self._spawn(cwd, deadline, state)
             try:
-                stdout_path = self._output_path()
-                stderr_path = self._output_path()
+                stdout_path = self._output_path(state.directory)
+                stderr_path = self._output_path(state.directory)
             except OSError as exc:
                 await self._discard(state, state.worker)
                 raise PythonKernelUnavailable(str(exc)) from None
@@ -266,8 +310,8 @@ class PythonKernelManager:
                 raise PythonKernelUnavailable("invalid kernel response")
             result = {
                 "ok": response["ok"],
-                "stdout": _bounded_file(stdout_path, STREAM_LIMIT_BYTES),
-                "stderr": _bounded_file(stderr_path, STREAM_LIMIT_BYTES),
+                "stdout": self._bounded_output(stdout_path, STREAM_LIMIT_BYTES),
+                "stderr": self._bounded_output(stderr_path, STREAM_LIMIT_BYTES),
                 "value": response["value"],
                 "exception": response["exception"],
                 "timedOut": False,
@@ -281,7 +325,7 @@ class PythonKernelManager:
             result = self._timeout_result(timeout, stdout_path, stderr_path)
             state.last_activity = loop.time()
             return result
-        except OSError as exc:
+        except (OSError, ConfinementUnavailable) as exc:
             if state.worker is not None:
                 await self._discard(state, state.worker)
             raise PythonKernelUnavailable(str(exc)) from None
@@ -290,15 +334,24 @@ class PythonKernelManager:
                 await self._discard(state, state.worker)
             raise
         finally:
-            for path in (stdout_path, stderr_path):
-                if path is not None:
-                    try:
-                        path.unlink()
-                    except FileNotFoundError:
-                        pass
-            state.lock.release()
-            if state.worker is not None and state.waiters == 0:
-                self._arm_idle(session_id, state, state.worker)
+            try:
+                for path in (stdout_path, stderr_path):
+                    if path is not None:
+                        descriptor = self._output_descriptors.pop(path, None)
+                        try:
+                            if descriptor is not None:
+                                os.close(descriptor)
+                        finally:
+                            try:
+                                os.unlink(path.name, dir_fd=self._directory_descriptors[path.parent])
+                            except OSError:
+                                # Worker-controlled entries may now be directories.
+                                # Never recurse, and never let cleanup retain the lock.
+                                pass
+            finally:
+                state.lock.release()
+                if state.worker is not None and state.waiters == 0:
+                    self._arm_idle(session_id, state, state.worker)
 
     async def retire(self, session_id: str) -> None:
         state = self._sessions.get(session_id)
@@ -308,8 +361,12 @@ class PythonKernelManager:
         async with state.lock:
             if state.worker is not None:
                 await self._discard(state, state.worker)
-        if state.waiters == 0:
+        if state.waiters == 0 and self._sessions.get(session_id) is state:
             self._sessions.pop(session_id, None)
+            if state.directory is not None:
+                descriptor = self._directory_descriptors.pop(state.directory, None)
+                if descriptor is not None:
+                    os.close(descriptor)
 
     async def close(self) -> None:
         if self._closed:
@@ -320,6 +377,9 @@ class PythonKernelManager:
             reapers = tuple(self._reapers)
             await asyncio.gather(*reapers)
             self._reapers.difference_update(reapers)
+        for descriptor in self._directory_descriptors.values():
+            os.close(descriptor)
+        self._directory_descriptors.clear()
         if self._directory is not None:
             await asyncio.to_thread(shutil.rmtree, self._directory, True)
             self._directory = None
@@ -344,22 +404,26 @@ class PythonKernelManager:
                 # must not throw through synchronous signal/atexit cleanup.
                 pass
 
-    async def _spawn(self, cwd: str | os.PathLike[str], deadline: float) -> _Worker:
+    async def _spawn(self, cwd: str | os.PathLike[str], deadline: float, state: _Session) -> _Worker:
         parent, child = socket.socketpair()
         parent.setblocking(False)
         try:
+            prepared = prepare_command(
+                (sys.executable, "-m", "mimir.acp.python_kernel", "--control-fd", str(child.fileno())),
+                cwd=Path(cwd), approved_paths=state.approved_paths,
+                scratch_paths=(state.directory,),
+                allow_unconfined=state.allow_unconfined,
+            )
+            state.execution_mode = prepared.execution_mode
             process = await self._before_deadline(
                 deadline,
                 asyncio.create_subprocess_exec(
-                    sys.executable,
-                    "-m",
-                    "mimir.acp.python_kernel",
-                    "--control-fd",
-                    str(child.fileno()),
+                    *prepared.argv,
                     pass_fds=(child.fileno(),),
                     cwd=cwd,
-                    env=None,
+                    env=prepared.env,
                     start_new_session=True,
+                    stdin=asyncio.subprocess.DEVNULL,
                     stdout=asyncio.subprocess.DEVNULL,
                     stderr=asyncio.subprocess.DEVNULL,
                 ),
@@ -458,14 +522,27 @@ class PythonKernelManager:
         async with asyncio.timeout_at(deadline):
             return await awaitable
 
-    def _output_path(self) -> Path:
-        if self._directory is None:
-            self._directory = Path(tempfile.mkdtemp(prefix="mimir-python-kernel-"))
-            self._directory.chmod(0o700)
-        descriptor, value = tempfile.mkstemp(dir=self._directory)
-        os.fchmod(descriptor, 0o600)
-        os.close(descriptor)
-        return Path(value)
+    def _output_path(self, directory: Path) -> Path:
+        name = secrets.token_hex(16)
+        descriptor = os.open(
+            name, os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600,
+            dir_fd=self._directory_descriptors[directory],
+        )
+        path = directory / name
+        self._output_descriptors[path] = descriptor
+        return path
+
+    def _bounded_output(self, path: Path, limit: int) -> str:
+        # The worker can replace directory entries. Never reopen its path in the
+        # unconfined parent: read the inode retained at mkstemp instead.
+        descriptor = self._output_descriptors[path]
+        retained = os.pread(descriptor, limit, 0)
+        total = os.fstat(descriptor).st_size
+        result = retained.decode("utf-8", errors="replace")
+        omitted = total - len(retained)
+        if omitted > 0:
+            result += f"\n…[truncated {omitted} bytes]"
+        return result
 
     def _timeout_result(
         self,
@@ -475,10 +552,10 @@ class PythonKernelManager:
     ) -> dict[str, Any]:
         return {
             "ok": False,
-            "stdout": _bounded_file(stdout_path, STREAM_LIMIT_BYTES)
+            "stdout": self._bounded_output(stdout_path, STREAM_LIMIT_BYTES)
             if stdout_path is not None
             else "",
-            "stderr": _bounded_file(stderr_path, STREAM_LIMIT_BYTES)
+            "stderr": self._bounded_output(stderr_path, STREAM_LIMIT_BYTES)
             if stderr_path is not None
             else "",
             "value": "",
@@ -503,10 +580,10 @@ class PythonKernelManager:
             returncode = -9
         return {
             "ok": False,
-            "stdout": _bounded_file(stdout_path, STREAM_LIMIT_BYTES)
+            "stdout": self._bounded_output(stdout_path, STREAM_LIMIT_BYTES)
             if stdout_path is not None
             else "",
-            "stderr": _bounded_file(stderr_path, STREAM_LIMIT_BYTES)
+            "stderr": self._bounded_output(stderr_path, STREAM_LIMIT_BYTES)
             if stderr_path is not None
             else "",
             "value": "",
@@ -522,10 +599,27 @@ class PythonKernelManager:
 
     async def _terminate(self, worker_state: _Worker) -> None:
         worker_state.channel.close()
-        try:
-            os.killpg(worker_state.pgid, 9)
-        except ProcessLookupError:
-            pass
+        if not worker_state.signalled:
+            try:
+                os.killpg(worker_state.pgid, 9)
+            except ProcessLookupError:
+                pass
+            except PermissionError as denied:
+                if worker_state.process.returncode is None:
+                    # macOS may deny signaling a dying process group before
+                    # asyncio observes the exit. Confirm reaping, rather than
+                    # treating an initial denied signal as successful cleanup.
+                    try:
+                        await asyncio.wait_for(
+                            worker_state.process.wait(), _EXIT_CONFIRMATION_SECONDS
+                        )
+                    except TimeoutError:
+                        raise denied
+                    if worker_state.process.returncode is None:
+                        raise denied
+            # Keep this across cancelled waits: never signal the same worker
+            # twice after a successful signal or a confirmed process exit.
+            worker_state.signalled = True
         reaper = worker_state.reaper
         if reaper is None:
             reaper = asyncio.create_task(self._reap(worker_state.process))

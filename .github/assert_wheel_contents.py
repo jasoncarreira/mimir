@@ -10,12 +10,16 @@ from zipfile import ZipFile
 
 REQUIRED_MEMBERS = (
     "mimir/web_auth.js",
+    "mimir/client_file_resources.py",
     "mimir/bundled_docs/.env.example",
     "mimir/acp/__init__.py",
     "mimir/acp/__main__.py",
     "mimir/acp/agent.py",
+    "mimir/acp/audit.py",
     "mimir/acp/bootstrap.py",
     "mimir/acp/credentials.py",
+    "mimir/acp/confinement.py",
+    "mimir/acp/execution_scope.py",
     "mimir/acp/daemon.py",
     "mimir/acp/diagnostics.py",
     "mimir/acp/host.py",

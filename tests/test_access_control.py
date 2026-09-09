@@ -15673,9 +15673,9 @@ def test_pr_edit_body_catalog_mirrors_comment() -> None:
         assert access_control._OPERATION_SINK_DESTINATION[operation] == "bound_pull_request"
 
 
-def test_non_acp_execution_decisions_are_unchanged() -> None:
+def test_non_acp_execution_decisions_are_unchanged(monkeypatch: pytest.MonkeyPatch) -> None:
     catalog = access_control.get_operation_catalog()
-    hands = {"hands_read", "hands_edit", "hands_shell", "hands_python"}
+    hands = {"hands_read", "hands_edit", "hands_shell", "hands_python", "hands_request_scope"}
     flows = {
         access_control.ToolFlowDirection.NEITHER: {"approve_declassification", "clear_ingest_taint", "request_operator_approval", "write_todos", "task"},
         access_control.ToolFlowDirection.SOURCE: {"memory_query", "memory_get", "file_search", "mimir_get_turn", "get_turn", "bash_jobs_list", "bash_job_output", "fetch_channel_history", "list_channels", "list_schedules", "commitment_list", "read_file", "aread", "ls", "als", "glob", "aglob", "grep", "agrep", "Read", "Glob", "Grep", "pr_metadata", "pr_files", "pr_diff", "pr_checks", "pr_reviews", "pr_comments", "pr_review_requests", "repo_status", "repo_diff", "repo_unmerged"},
@@ -15700,6 +15700,7 @@ def test_non_acp_execution_decisions_are_unchanged() -> None:
         "saga_end_session", "saga_record_skill_learning", "saga_forget",
         "set_poller_overrides", "download_files", "adownload_files",
         "rebuild_index", "hands_edit", "hands_shell", "hands_python",
+        "hands_request_scope",
     }
     decisions[OperationDecision.ADMIN_REQUIRED].add("clear_ingest_taint")
     protected_builtins = {
@@ -15764,6 +15765,21 @@ def test_non_acp_execution_decisions_are_unchanged() -> None:
     assert catalog.get_decision("hands_edit") is OperationDecision.ADMIN_REQUIRED
     assert catalog.get_decision("hands_shell") is OperationDecision.ADMIN_REQUIRED
     assert catalog.get_decision("hands_python") is OperationDecision.ADMIN_REQUIRED
+    assert catalog.get_decision("hands_request_scope") is OperationDecision.ADMIN_REQUIRED
+    # Explicitly own the missing ACP capability state rather than depending on
+    # whatever context another test left behind. Admin role alone never permits
+    # a scope request, even with ordinary enforcement disabled.
+    monkeypatch.setattr(
+        "mimir.tools.client_provider.get_turn_capability_context", lambda: None,
+    )
+    for enforce in (False, True):
+        authorization = access_control.get_tool_registry().authorize_tool(
+            "hands_request_scope", _write_auth(admin=True),
+            enforce=enforce, arguments={"path": ""},
+        )
+        assert not authorization.allowed
+        assert authorization.would_block
+
     assert catalog.get_decision("client_authorized_host_execution") is OperationDecision.UNKNOWN
 
 

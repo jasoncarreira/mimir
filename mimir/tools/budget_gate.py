@@ -1568,7 +1568,7 @@ def _validated_arguments(request: ToolCallRequest) -> dict[str, Any] | None:
     if not isinstance(arguments, dict):
         return None
     tool_name = _tool_name_from_request(request)
-    if tool_name in {"hands_read", "hands_edit", "hands_shell", "hands_python"}:
+    if tool_name in {"hands_read", "hands_edit", "hands_shell", "hands_python", "hands_request_scope"}:
         return validate_hands_wrapper_arguments(tool_name, arguments)
     if tool_name == "clear_ingest_taint":
         return {} if not arguments else None
@@ -2276,7 +2276,7 @@ def _request_for_acp_model(request: Any) -> Any:
         return request
     excluded = {"send_message"}
     if context.profile_policy is not MIMIR_HANDS_V1:
-        excluded.update({"hands_read", "hands_edit", "hands_shell", "hands_python"})
+        excluded.update({"hands_read", "hands_edit", "hands_shell", "hands_python", "hands_request_scope"})
     tools = [
         tool for tool in (getattr(request, "tools", None) or [])
         if _tool_surface_name(tool) not in excluded
@@ -2383,6 +2383,10 @@ def _permission_eligibility(
     arguments: dict[str, Any] | None,
     host_execution: ClientAuthorizedHostExecution | None = None,
 ) -> tuple[Any, PermissionEligibility, tuple[Any, ...]] | None:
+    # The hosted provider asks the editor about one exact path after routing.
+    # Wrapper permission would incorrectly create a reusable execution grant.
+    if tool_name == "hands_request_scope":
+        return None
     context = get_turn_capability_context()
     if context is None:
         return None
