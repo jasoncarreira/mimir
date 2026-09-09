@@ -344,7 +344,10 @@ def resolve_review_state_for_context(
         scope_refusal = (
             "pull-request operation rejected: requested "
             f"repository={json.dumps(repository)}, pull_request={pull_request}; "
-            "live scope discovery requires an authenticated operator user turn"
+            "live scope discovery requires an authenticated operator user turn or a "
+            "trusted poller with pr_metadata and a configured MIMIR_GITHUB_SELF_LOGIN; "
+            "reviewing another author's pull request also requires an explicit "
+            "pr_review_others capability grant"
         )
         if stored_scope is not None:
             scope_refusal += "; head advanced; discovery not permitted for this turn"
@@ -379,6 +382,19 @@ def resolve_review_state_for_context(
             "pull-request operation rejected: live pull request is closed or invalid"
         ))
     state = RepoReviewState(scope)
+    if snapshot.author != self_login:
+        from ..access_control import get_trusted_service_from_auth_context
+        from ..event_logger import log_event_sync
+
+        service = get_trusted_service_from_auth_context(context)
+        if service is not None and service.has_capability("pr_review_others"):
+            log_event_sync(
+                "forge_review_others_scope_resolved",
+                repository=scope.canonical_repo,
+                pull_request=scope.pr_number,
+                capability="pr_review_others",
+                author=snapshot.author,
+            )
     store = getattr(context, "server_discovered_pr_scope_store", None)
     if isinstance(store, ServerDiscoveredPRScopeStore):
         store.remember_server_discovery(scope)
