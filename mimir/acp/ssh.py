@@ -149,17 +149,26 @@ async def run_ssh_proxy(
             if code:
                 raise SshError("SSH connection failed")
     finally:
-        for task in (router, child, discard):
-            if task is not None and not task.done():
-                task.cancel()
-        await asyncio.gather(router, child, discard, return_exceptions=True)
-        input_transport.close()
-        closing = asyncio.gather(close_writer(writer), close_writer(process.stdin), return_exceptions=True)
+        async def cleanup() -> None:
+            for task in (router, child, discard):
+                if task is not None and not task.done():
+                    task.cancel()
+            await asyncio.gather(router, child, discard, return_exceptions=True)
+            input_transport.close()
+            closing = asyncio.gather(close_writer(writer), close_writer(process.stdin), return_exceptions=True)
+            try:
+                await asyncio.wait_for(closing, FORCE_CLOSE_TIMEOUT)
+            except TimeoutError:
+                pass
+            await stop_child(process)
+
+        # Cancellation can arrive after a router failure has already begun cleanup.
+        cleanup_task = asyncio.create_task(cleanup())
         try:
-            await asyncio.wait_for(closing, FORCE_CLOSE_TIMEOUT)
-        except TimeoutError:
-            pass
-        await stop_child(process)
+            await asyncio.shield(cleanup_task)
+        except asyncio.CancelledError:
+            await cleanup_task
+            raise
 
 async def run_remote_proxy(profile_name: str | None, output: BinaryIO, *, profiles: ProfileStore | None = None, credentials: NativeCredentialStore | None = None) -> None:
     name = selected_profile(profile_name); profile = (profiles or ProfileStore()).get(name)

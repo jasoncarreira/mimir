@@ -2106,7 +2106,8 @@ async def run_poller(
     each emitted event. Returns the count of events successfully
     enqueued (excludes dispatcher-rejected events; those land in
     ``poller_event_rejected`` events for back-pressure auditing).
-    Returns 0 on timeout / error / silence.
+    Timeouts deliver complete lines collected before the kill; errors and
+    silence return 0.
 
     **Command parsing**: ``poller.command`` is parsed by ``/bin/sh -c``
     via ``asyncio.create_subprocess_shell``. Shell features (env-var
@@ -2126,7 +2127,7 @@ async def run_poller(
     from ``Config.home``. It is injected as ``MIMIR_HOME`` for pollers that
     need to resolve files under the agent home without depending on host env.
 
-    Always logs a ``poller_complete`` event at the end so the operator
+    Logs ``poller_complete`` (or ``poller_timeout`` for partial ticks) at the end so the operator
     can audit "did the poll cycle run?" even when nothing was emitted.
     The complete event carries both ``events_emitted`` (successful
     enqueues) and ``events_rejected`` (dispatcher said no, indicating
@@ -2440,6 +2441,7 @@ async def run_poller(
     stdout_bytes = b""
     stderr_bytes = b""
     fatal_error: str | None = None
+    timed_out = False
     try:
         try:
             proc = await asyncio.create_subprocess_shell(
@@ -2480,12 +2482,12 @@ async def run_poller(
                 {stdout_task, stderr_task}, timeout=timeout,
             )
             if pending:
+                timed_out = True
                 _kill_process_group(proc)
                 await proc.wait()
-                for task in pending:
-                    task.cancel()
-                await asyncio.gather(*pending, return_exceptions=True)
-                raise asyncio.TimeoutError
+                # Killing the group closes its pipes. Finish the capped drains
+                # rather than cancelling away their already-collected output.
+                await asyncio.gather(stdout_task, stderr_task)
             stdout_bytes = stdout_task.result()
             stderr_bytes = stderr_task.result()
             # chainlink #410: the ``asyncio.wait`` above bounds only the
@@ -2501,9 +2503,9 @@ async def run_poller(
                     timeout=min(POLLER_EXIT_GRACE_SECONDS, timeout),
                 )
             except asyncio.TimeoutError:
+                timed_out = True
                 _kill_process_group(proc)
                 await proc.wait()
-                raise
             if _overflow["hit"]:
                 await log_event(
                     "poller_output_overflow",
@@ -2522,12 +2524,9 @@ async def run_poller(
                         reason="output_overflow",
                     )
                 return 0
+            if timed_out:
+                raise asyncio.TimeoutError
         except asyncio.TimeoutError:
-            await log_event(
-                "poller_timeout",
-                poller=poller.name,
-                timeout_seconds=int(timeout),
-            )
             if _cb_record_failure(poller.name):
                 await log_event(
                     "poller_circuit_tripped",
@@ -2536,7 +2535,9 @@ async def run_poller(
                     backoff_seconds=POLLER_CIRCUIT_BREAKER_BACKOFF_SECONDS,
                     reason="timeout",
                 )
-            return 0
+            # A killed writer may leave an incomplete final JSONL record.
+            # Trim before decoding, including any partial UTF-8 code point.
+            stdout_bytes = stdout_bytes[:stdout_bytes.rfind(b"\n") + 1]
         except Exception as exc:  # noqa: BLE001 — never let a poller break the scheduler
             fatal_error = f"{type(exc).__name__}: {exc}"
             await log_event(
@@ -2583,7 +2584,7 @@ async def run_poller(
             exit_code=proc.returncode if proc is not None else None,
         )
 
-    if proc is None or proc.returncode != 0:
+    if not timed_out and (proc is None or proc.returncode != 0):
         await log_event(
             "poller_nonzero_exit",
             poller=poller.name,
@@ -2602,7 +2603,8 @@ async def run_poller(
     # Clean exit (returncode == 0) — reset the circuit breaker.  This
     # covers both the "has events" and "silent / no events" outcomes;
     # both mean the subprocess ran to successful completion.
-    _cb_record_success(poller.name)
+    if not timed_out:
+        _cb_record_success(poller.name)
 
     stdout_text = stdout_bytes.decode("utf-8", errors="replace").strip()
 
@@ -2758,18 +2760,6 @@ async def run_poller(
             if k not in ("prompt", "poller", "integrity", "integrity_effect")
         }
         items.append({"prompt": prompt, "extras": extras})
-
-    if not items:
-        await log_event(
-            "poller_complete",
-            poller=poller.name,
-            events_emitted=0,
-            events_rejected=0,
-            items_collected=0,
-            batches_emitted=0,
-            signals_emitted=signals_emitted,
-        )
-        return 0
 
     # Phase 2: batch items into groups of up to ``poller.batch_size``.
     # batch_size=1 preserves the per-item-per-turn shape; >1 coalesces
@@ -2968,13 +2958,17 @@ async def run_poller(
     # came in?" should switch to ``items_collected``; queries asking
     # "how many turns will this fire?" stay on ``events_emitted``.
     await log_event(
-        "poller_complete",
+        "poller_timeout" if timed_out else "poller_complete",
         poller=poller.name,
         events_emitted=event_count,
         events_rejected=rejected_count,
         items_collected=len(items),
         batches_emitted=len(batches),
         signals_emitted=signals_emitted,
+        **({
+            "timeout_seconds": int(timeout),
+            "events_recovered": event_count,
+        } if timed_out else {}),
     )
     return event_count
 
