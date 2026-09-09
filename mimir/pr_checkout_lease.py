@@ -1074,7 +1074,6 @@ def _foreign_candidate_head(
         or lease.owner != owner
         or lease.pr_number != scope.pr_number
         or lease.destination_ref != scope.destination_ref
-        or lease.head_sha.lower() != scope.observed_head_sha.lower()
     ):
         return head, False
     origin = _run(
@@ -1090,6 +1089,23 @@ def _foreign_candidate_head(
     if origin != scope.canonical_origin or branch != scope.head_ref:
         return head, False
     _assert_self_contained_checkout(lease.path, runner=runner)
+    observed_head = scope.observed_head_sha.lower()
+    if runner([
+        "git", "-C", str(lease.path), "cat-file", "-e", f"{observed_head}^{{commit}}",
+    ]).returncode != 0:
+        _run(
+            runner,
+            ["git", "-C", str(lease.path), "fetch", "--no-tags", "origin",
+             scope.checkout_ref or scope.destination_ref],
+            "PR head fetch failed during candidate ancestry inspection",
+        )
+        fetched_head = _run(
+            runner,
+            ["git", "-C", str(lease.path), "rev-parse", "--verify", "FETCH_HEAD^{commit}"],
+            "fetched PR head is missing during candidate ancestry inspection",
+        ).lower()
+        if fetched_head != observed_head:
+            raise RuntimeError("PR head advanced during candidate ancestry inspection")
     ancestor = runner([
         "git", "-C", str(lease.path), "merge-base", "--is-ancestor",
         scope.observed_head_sha.lower(), head,
@@ -1101,6 +1117,9 @@ def _foreign_candidate_head(
             (ancestor.stderr or ancestor.stdout).strip()
             or "PR checkout lease candidate ancestry inspection failed"
         )
+    # Keep rebased-patch reuse only against the current publication, never stale metadata.
+    if lease.head_sha.lower() != observed_head:
+        return head, False
     try:
         equivalent = _patches_match_published_head(
             lease, head=head, base_ref=scope.base_ref, runner=runner,
@@ -1168,6 +1187,7 @@ def _rebind_foreign_candidate(
         lease,
         scope_base_sha=scope.observed_base_sha.lower(),
         base_sha=actual_base,
+        head_sha=scope.observed_head_sha.lower(),
         scope_id=scope.scope_id,
         expires_at=datetime.now(UTC) + ttl,
         recovered=True,
@@ -1279,9 +1299,17 @@ def acquire_pr_checkout_lease(
             except Exception:  # noqa: BLE001 - observation failures must fail closed
                 observed_head = None
 
+            classified = {
+                lease.path: _foreign_candidate_head(
+                    lease, scope, owner=owner, runner=runner,
+                )
+                for lease in foreign_leases
+                if observed_head == scope.observed_head_sha.lower()
+            }
             stale = [
                 lease for lease in foreign_leases
                 if observed_head is not None and lease.head_sha.lower() != observed_head
+                and not classified.get(lease.path, ("", False))[1]
             ]
             retained: list[tuple[Path, str]] = []
             for lease in stale:
@@ -1339,8 +1367,12 @@ def acquire_pr_checkout_lease(
                 _report_superseded_lease(scope, lease, observed_head)
             foreign_leases = [lease for lease in foreign_leases if lease not in stale]
             for lease in foreign_leases:
-                head, reusable = _foreign_candidate_head(
-                    lease, scope, owner=owner, runner=runner,
+                head, reusable = classified.get(lease.path) or (
+                    _run(
+                        runner,
+                        ["git", "-C", str(lease.path), "rev-parse", "--verify", "HEAD"],
+                        "retained PR checkout has no HEAD",
+                    ).lower(), False,
                 )
                 if reusable and observed_head == scope.observed_head_sha.lower():
                     candidates.append((lease.path, head))

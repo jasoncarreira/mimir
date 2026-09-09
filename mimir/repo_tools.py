@@ -8,6 +8,7 @@ configuration overrides, and environment are supplied by the server.
 from __future__ import annotations
 
 import base64
+import json
 from collections import OrderedDict
 from dataclasses import dataclass, replace
 import os
@@ -24,7 +25,7 @@ from urllib.parse import urlsplit
 from .access_control import ToolFlowDirection, authorize_repo_pr_tool
 from .git_bootstrap import DEFAULT_USER_EMAIL, DEFAULT_USER_NAME
 from .models import RepoPRAction, RepoPRActionScope, RepoReviewState
-from .pr_checkout_lease import PUBLISHED_HEAD_REF
+from .pr_checkout_lease import PUBLISHED_HEAD_REF, _METADATA, _metadata
 from .redaction import redact_text
 
 
@@ -158,7 +159,11 @@ def _git_failure_detail(result: GitProcessResult) -> str:
 
 @dataclass(frozen=True)
 class GitFetch:
-    """Fetch only the immutable head and base refs bound into the scope."""
+    """Fetch only the current observed head and fixed base bound into the scope.
+
+    The observed head advances only after verified own-publication; it is not
+    an immutable snapshot for the lifetime of the turn.
+    """
 
 
 @dataclass(frozen=True)
@@ -1007,6 +1012,29 @@ class RepoGitTools:
                     )
                 self._command(("update-ref", PUBLISHED_HEAD_REF, observed))
                 _record_agent_push(self._scope, observed)
+                # Keep the turn identity fixed; only our own verified publication
+                # advances its observation, never a concurrent writer's commit.
+                lease = self._state.checkout_lease
+                advanced_lease = replace(lease, head_sha=self._expected_head)
+                metadata_path = lease.path / _METADATA
+                staging = metadata_path.with_suffix(".tmp")
+                try:
+                    staging.write_text(
+                        json.dumps(_metadata(advanced_lease), sort_keys=True) + "\n",
+                        encoding="utf-8",
+                    )
+                    os.replace(staging, metadata_path)
+                finally:
+                    staging.unlink(missing_ok=True)
+                # Deliberately bypass frozen dataclasses in place: callers retain
+                # these lease/scope objects and must observe the head advance;
+                # replacing them with frozen copies would leave callers stale.
+                # Only our verified own-publication reaches this point, and the
+                # persisted lease metadata is atomically replaced above before
+                # either in-memory observation advances. All other scope fields
+                # stay fixed; do not cache these objects as immutable head snapshots.
+                object.__setattr__(lease, "head_sha", self._expected_head)
+                object.__setattr__(self._scope, "observed_head_sha", self._expected_head)
             except GitRefusal as exc:
                 if exc.code == "git_failed":
                     raise GitRefusal(
