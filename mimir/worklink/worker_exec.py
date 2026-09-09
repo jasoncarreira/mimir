@@ -467,6 +467,7 @@ def _process_group_has_live_members(process_group: int) -> bool:
             ):
                 return True
         return False
+    # Best-effort fallback after process enumeration fails, not proof of exit.
     try:
         os.killpg(process_group, 0)
     except (ProcessLookupError, PermissionError):
