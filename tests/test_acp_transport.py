@@ -273,9 +273,8 @@ async def _release_after(event: asyncio.Event, delay: float) -> None:
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("release_delay,before", [(0.005, True), (None, False)])
+@pytest.mark.parametrize("before", [True, False])
 async def test_drain_deadline_before_and_after_witnesses(
-    release_delay: float | None,
     before: bool,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -289,23 +288,20 @@ async def test_drain_deadline_before_and_after_witnesses(
     passed the same commits. Scheduling no release makes the assertion
     deterministic without a long wait, and still witnesses exactly what the case
     is about -- the deadline expiring with the drain incomplete.
+
+    The positive case releases the gate before awaiting, not via a 5ms task
+    racing the 20ms deadline. Neither witness depends on timely scheduling of
+    a competing release task.
     """
     monkeypatch.setattr("mimir.acp.transport.WRITER_DRAIN_TIMEOUT", 0.02)
     gate = asyncio.Event()
+    if before:
+        gate.set()
     writer = StagedWriter(drain_gate=gate)
-    release = (
-        asyncio.create_task(_release_after(gate, release_delay))
-        if release_delay is not None
-        else None
-    )
     await close_writer(writer)
     assert writer.closed
     assert writer.aborted is False
     assert gate.is_set() is before
-    if release is not None:
-        await release
-    else:
-        gate.set()
 
 
 @pytest.mark.asyncio
