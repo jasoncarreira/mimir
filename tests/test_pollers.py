@@ -3338,15 +3338,19 @@ sys.exit(1)
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("count", [0, 3])
+@pytest.mark.parametrize("tail", ["", '{"prompt": "cut off', '{"prompt": "no newline"}'])
 async def test_run_poller_timeout_kills_subprocess(
-    tmp_path: Path, home: Path,
+    tmp_path: Path, home: Path, count: int, tail: str, monkeypatch,
 ) -> None:
-    """A poller that runs longer than the timeout must be killed.
-    Returns 0 events; logs ``poller_timeout``."""
+    """Recover complete records, never an unterminated final record."""
     skill_dir = tmp_path / "skill"
-    _install_script(skill_dir, "poller.py", """
-import json, time
-print(json.dumps({"poller": "x", "prompt": "would emit"}), flush=True)
+    _install_script(skill_dir, "poller.py", f"""
+import json, sys, time
+for i in range({count}):
+    print(json.dumps({{"prompt": f"event {{i}}"}}), flush=True)
+sys.stdout.write({tail!r})
+sys.stdout.flush()
 time.sleep(120)
 """)
     cfg = PollerConfig(
@@ -3354,13 +3358,28 @@ time.sleep(120)
         cron="* * * * *", env={}, skill_dir=skill_dir,
     )
     enq = _CapturingEnqueue()
+    failures = POLLER_CIRCUIT_BREAKER_THRESHOLD - 1 if count else 0
+    monkeypatch.setitem(
+        _circuit_breakers, cfg.name,
+        _CircuitBreakerState(consecutive_failures=failures),
+    )
     # Use a much shorter timeout for the test.
     n = await run_poller(cfg, enqueue=enq, timeout=2.0)
-    assert n == 0
-    assert enq.events == []
+    assert n == count
+    assert [e.content for e in enq.events] == [f"event {i}" for i in range(count)]
+    assert _circuit_breakers[cfg.name].consecutive_failures == failures + 1
     events = _read_events(home)
     timeouts = [e for e in events if e["type"] == "poller_timeout"]
     assert len(timeouts) == 1
+    assert timeouts[0]["events_recovered"] == count
+    assert not any(e["type"] == "poller_invalid_line" for e in events)
+    assert not any(e["type"] == "poller_nonzero_exit" for e in events)
+    if count:
+        assert _circuit_breakers[cfg.name].disabled_until > time.monotonic()
+        assert any(
+            e["type"] == "poller_circuit_tripped" and e["reason"] == "timeout"
+            for e in events
+        )
 
 
 
@@ -3424,8 +3443,8 @@ print(json.dumps({"poller": "x", "prompt": "would emit"}), flush=True)
 
     n = await run_poller(cfg, enqueue=enq, timeout=poller_timeout)
 
-    assert n == 0
-    assert enq.events == []
+    assert n == 1
+    assert [e.content for e in enq.events] == ["would emit"]
     events = _read_events(home)
     timeouts = [e for e in events if e["type"] == "poller_timeout"]
     assert len(timeouts) == 1
@@ -3453,8 +3472,9 @@ print(json.dumps({"poller": "x", "prompt": "would emit"}), flush=True)
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("count", [0, 3])
 async def test_run_poller_bounded_when_child_closes_pipes_but_keeps_running(
-    tmp_path: Path, home: Path,
+    tmp_path: Path, home: Path, count: int,
 ) -> None:
     """chainlink #410: ``asyncio.wait`` bounds only the pipe drains.
     A poller that CLOSES stdout/stderr (drains hit EOF inside the
@@ -3463,8 +3483,10 @@ async def test_run_poller_bounded_when_child_closes_pipes_but_keeps_running(
     the caller's semaphore slot stayed pinned. The post-EOF reap must
     be grace-bounded and route into the existing timeout path."""
     skill_dir = tmp_path / "skill"
-    _install_script(skill_dir, "poller.py", """
-import os, time
+    _install_script(skill_dir, "poller.py", f"""
+import json, os, time
+for i in range({count}):
+    print(json.dumps({{"prompt": f"event {{i}}"}}), flush=True)
 os.close(1)
 os.close(2)
 time.sleep(30)
@@ -3481,11 +3503,12 @@ time.sleep(30)
     n = await asyncio.wait_for(
         run_poller(cfg, enqueue=enq, timeout=2.0), timeout=15.0,
     )
-    assert n == 0
-    assert enq.events == []
+    assert n == count
+    assert [e.content for e in enq.events] == [f"event {i}" for i in range(count)]
     events = _read_events(home)
     timeouts = [e for e in events if e["type"] == "poller_timeout"]
     assert len(timeouts) == 1
+    assert timeouts[0]["events_recovered"] == count
 
 
 @pytest.mark.asyncio
@@ -5701,31 +5724,47 @@ async def test_drain_capped_none_stream():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("stream", ["stdout", "stderr"])
+@pytest.mark.parametrize("timeout_during_drain", [False, True])
 async def test_run_poller_output_overflow_kills_and_fails(
-    tmp_path: Path, home: Path, monkeypatch,
+    tmp_path: Path, home: Path, monkeypatch, stream: str,
+    timeout_during_drain: bool,
 ) -> None:
     """A poller that floods stdout past the byte ceiling is killed, the
     tick is failed (no events acted on), and poller_output_overflow logs."""
     import mimir.pollers as pollers_mod
     monkeypatch.setattr(pollers_mod, "MAX_POLLER_STDOUT_BYTES", 1024)
+    monkeypatch.setattr(pollers_mod, "MAX_POLLER_STDERR_BYTES", 1024)
+    if timeout_during_drain:
+        drain = pollers_mod._drain_capped
+
+        async def slow_drain(*args, **kwargs):
+            output = await drain(*args, **kwargs)
+            # Force the deadline to expire while an overflowed drain is
+            # finishing, so recovery must still reject its valid prefix.
+            await asyncio.sleep(2.1)
+            return output
+
+        monkeypatch.setattr(pollers_mod, "_drain_capped", slow_drain)
     skill_dir = tmp_path / "skill"
     # Emit a valid event line, then flood far past the 1 KB ceiling.
     _install_script(skill_dir, "poller.py", (
         "import sys, json\n"
-        "print(json.dumps({'poller': 'flood', 'prompt': 'hi'}))\n"
-        "sys.stdout.write('x' * 200000)\n"
-        "sys.stdout.flush()\n"
+        "print(json.dumps({'poller': 'flood', 'prompt': 'hi'}), flush=True)\n"
+        f"sys.{stream}.write('x' * 200000)\n"
+        f"sys.{stream}.flush()\n"
     ))
     cfg = PollerConfig(
         name="flood", command=f"{sys.executable} poller.py",
         cron="* * * * *", env={}, skill_dir=skill_dir,
     )
     enq = _CapturingEnqueue()
-    n = await run_poller(cfg, enqueue=enq)
+    n = await run_poller(cfg, enqueue=enq, timeout=2.0)
     assert n == 0                  # runaway output → nothing acted on
     assert enq.events == []
     types = [e["type"] for e in _read_events(home)]
     assert "poller_output_overflow" in types
+    assert pollers_mod._circuit_breakers[cfg.name].consecutive_failures == 1
 
 
 # ─── priority parsing (priority-banded suppression) ───────────────────

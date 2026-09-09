@@ -638,13 +638,59 @@ while True: time.sleep(1)
 
 
 @pytest.mark.asyncio
+async def test_cancellation_during_writer_cleanup_reaps_child(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    profile, _ = remote_profile(tmp_path)
+    ssh = _fake_ssh(tmp_path, "import time; time.sleep(60)\n")
+    processes: list[asyncio.subprocess.Process] = []
+    spawn = asyncio.create_subprocess_exec
+
+    async def capture_spawn(*args: object, **kwargs: object) -> asyncio.subprocess.Process:
+        process = await spawn(*args, **kwargs)
+        processes.append(process)
+        return process
+
+    closing = asyncio.Event()
+
+    class SlowOutput(Output):
+        async def drain(self) -> None:
+            closing.set()
+            await asyncio.Future()
+
+    output = io.BytesIO()
+    transport = type("Transport", (), {"close": lambda self: None})()
+    monkeypatch.setattr("mimir.acp.ssh.asyncio.create_subprocess_exec", capture_spawn)
+    monkeypatch.setattr("mimir.acp.ssh.open_stdio", AsyncMock(return_value=(
+        Reader(), SlowOutput(output), transport,
+    )))
+    monkeypatch.setattr("mimir.acp.ssh.run_router", AsyncMock(side_effect=SshError("router failed")))
+    monkeypatch.setattr("mimir.acp.ssh.WAIT_TIMEOUT", 0.02)
+    task = asyncio.create_task(run_ssh_proxy(profile, "secret", output, _ssh_path=ssh))
+    try:
+        await asyncio.wait_for(closing.wait(), 10)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(task, 10)
+        assert processes[0].returncode is not None
+        with pytest.raises(ProcessLookupError):
+            os.kill(processes[0].pid, 0)
+    finally:
+        if not task.done():
+            task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        for process in processes:
+            if process.returncode is None:
+                process.kill()
+            await process.wait()
+
+
+@pytest.mark.asyncio
 async def test_unread_stdout_backpressure_cleanup_reaps_child(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     profile, _ = remote_profile(tmp_path)
     marker = tmp_path / "pid"
     ssh = _fake_ssh(tmp_path, """
 import os,sys
 with open(os.environ['MARKER'],'w') as stream: stream.write(str(os.getpid()))
-chunk=b'x' * 65536
+chunk=b'{"jsonrpc":"2.0","method":"session/update","params":{}}\\n'
 while True:
  sys.stdout.buffer.write(chunk); sys.stdout.buffer.flush()
 """)

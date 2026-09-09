@@ -95,6 +95,45 @@ analogue for git credentials.
 | `X_API_KEY`, `X_API_SECRET`, `X_ACCESS_TOKEN`, `X_ACCESS_TOKEN_SECRET` | `social-cli` X provider (OAuth 1.0a) | https://developer.x.com/portal — Keys and tokens | `social-cli whoami -p x` |
 | `ATPROTO_APP_PASSWORD` (a.k.a. `BSKY_APP_PASSWORD` in some docs) | `social-cli` Bluesky provider | Bluesky app → Settings → App passwords | `social-cli whoami -p bsky` |
 
+## Named web keys
+
+Web keys authenticate a canonical identity, unlike the shared `MIMIR_API_KEY`
+transport key. An identity can have multiple labelled web keys. On the server,
+use `mimir identities issue-key <who> --label <name>`; for example, replacing
+the uppercase placeholders:
+
+```sh
+mimir identities issue-key --home /absolute/server/mimir-home CANONICAL --label CLIENT_NAME
+```
+
+Issuing is additive: it does not invalidate existing keys or change an existing
+identity's roles. A new identity defaults to `user`; add `--admin` only when
+intentionally granting admin access, which ACP requires. Labels must be unique
+per identity; omitting `--label` assigns one automatically. The raw key is shown
+once and only its hash is stored on the server. Transfer it securely, never in
+argv, environment variables, editor configuration, or a checked-in file.
+
+On the client, `mimir acp credential add PROFILE` enrolls the key into the native
+OS keychain; `mimir acp credential replace PROFILE` replaces the locally stored
+key for that profile. Both prompt without echo from a controlling terminal,
+not stdin: run them in a terminal, not via a pipe. Issuing a server key does not
+automatically deliver it to a client. Replacing a client keychain entry does not
+revoke the old server key. Follow [ACP enrollment and verification](acp.md#profiles-and-credentials).
+
+To replace just one client's key, issue a new, distinct label, replace the client
+credential, reconnect and authenticate, then revoke the old label:
+
+```sh
+mimir identities revoke-key --home /absolute/server/mimir-home CANONICAL --label OLD_CLIENT_NAME
+```
+
+`mimir identities list --home /absolute/server/mimir-home` lists labels without
+key material. Omitting `--label` from `revoke-key` revokes all keys for that
+identity, leaving roles intact. `issue-key --rotate-only` explicitly invalidates
+all prior keys and issues one replacement without changing roles; it is not the
+normal additive issuance path. Coordinate that outage with every affected
+client using the [ACP all-key rotation sequence](acp.md#profiles-and-credentials).
+
 ## Multi-credential rotation (X, Bluesky)
 
 X requires four env vars to rotate **atomically** — partial updates

@@ -67,14 +67,41 @@ def test_redact_payload_masks_nested_aws_key() -> None:
 # ─── existing patterns still hold (no regression) ──────────────────────
 
 
-def test_durable_redaction_is_superset_of_ephemeral_redaction() -> None:
-    for text in SECRET_TEXT_CORPUS:
-        ephemeral_masked = scrub_text(text) != text
-        durable_masked = redact_text(text) != text
+# Include an independently masked decoy: a changed output alone does not prove
+# that the credential under test disappeared. Short, prefix-free values ensure
+# provider-prefix patterns cannot hide a missing key/value rule.
+KEY_VALUE_PARITY_CORPUS = tuple(
+    (template.format(key=key, secret=secret), secret)
+    for key in ("X-API-Key", "MIMIR_API_KEY", "VOYAGE_API_KEY", "TAVILY_API_KEY", "password")
+    for template in (
+        "> {key}: {secret}",
+        "{key}: {secret}",
+        '{{"{key}": "{secret}"}}',
+        "{{'{key}': '{secret}'}}",
+        "{key}={secret}",
+    )
+    for secret in ("fake-value-one", "fake-value-two")
+)
 
-        assert not ephemeral_masked or durable_masked, (
-            f"ephemeral path masked {text!r}, but durable path did not"
-        )
+
+@pytest.mark.parametrize(
+    ("text", "secret"),
+    [
+        (text, FAKE_SECRET if FAKE_SECRET in text else text)
+        for text in SECRET_TEXT_CORPUS
+    ] + list(KEY_VALUE_PARITY_CORPUS),
+)
+def test_durable_redaction_is_superset_of_ephemeral_redaction(
+    text: str, secret: str
+) -> None:
+    text += "\nother credential: ghp_fakeDecoy123"
+    live = scrub_text(text)
+    durable = redact_text(text)
+
+    assert secret in text
+    assert secret not in live, "the parity corpus must exercise live masking"
+    assert secret not in durable, "durable logs must remove every secret live removes"
+    assert "ghp_fakeDecoy123" not in durable
 
 
 @pytest.mark.parametrize(
