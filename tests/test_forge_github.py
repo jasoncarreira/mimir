@@ -95,6 +95,139 @@ def test_metadata_target_and_auth_are_adapter_constructed() -> None:
     assert kwargs["headers"]["Authorization"] == "Bearer secret"
 
 
+def _job_metadata():
+    return {
+        "id": 456, "run_id": 123, "head_sha": "a" * 40,
+        "run_url": "https://api.github.com/repos/owner/repo/actions/runs/123",
+        "status": "completed", "conclusion": "failure",
+    }
+
+
+def _run_metadata():
+    return {
+        "id": 123, "repository": {"full_name": "owner/repo"},
+        "head_sha": "a" * 40, "status": "completed",
+    }
+
+
+@pytest.mark.parametrize("conclusion", ["failure", "timed_out", "startup_failure", "action_required"])
+@pytest.mark.parametrize("run_id", [None, 123])
+@pytest.mark.parametrize("repo_case", ["owner/repo", "Owner/Repo"])
+def test_job_log_binds_metadata_before_capture(monkeypatch, conclusion, run_id, repo_case):
+    from mimir import ci_logs
+
+    job = {**_job_metadata(), "conclusion": conclusion}
+    job["run_url"] = f"https://api.github.com/repos/{repo_case}/actions/runs/123"
+    run = {**_run_metadata(), "repository": {"full_name": repo_case}}
+    session = Session([Response(job), Response(run)])
+    calls = []
+
+    def capture(repo, job_id, **kwargs):
+        assert len(session.calls) == 2
+        calls.append((repo, job_id, kwargs))
+        return b"selected [REDACTED] excerpt", ""
+
+    monkeypatch.setattr(ci_logs, "capture_job_log", capture)
+    result = GitHubForgeClient(token="secret", session=session).get_job_log(_scope(), 456, run_id)
+    assert result == "selected [REDACTED] excerpt"
+    assert calls == [("owner/repo", 456, {
+        "token": "secret", "limit": ci_logs.LOG_EXCERPT_BYTES, "timeout": 20.0,
+    })]
+    assert [call[1] for call in session.calls] == [
+        "https://api.github.com/repos/owner/repo/actions/jobs/456",
+        "https://api.github.com/repos/owner/repo/actions/runs/123",
+    ]
+
+
+@pytest.mark.parametrize("target,field,value", [
+    ("job", "id", 457), ("job", "id", "456"), ("job", "id", 456.0), ("job", "id", None),
+    ("job", "run_id", None), ("job", "run_id", True), ("job", "run_id", 0), ("job", "run_id", 123.0),
+    ("job", "head_sha", "c" * 40), ("job", "head_sha", None),
+    ("job", "run_url", "https://api.github.com/repos/other/repo/actions/runs/123"),
+    ("job", "run_url", "https://api.github.com/repos/owner/repo/actions/runs/999"),
+    ("job", "run_url", "https://api.github.com/repos/owner/repo/actions/runs/123/extra"),
+    ("job", "run_url", "https://evil.example/repos/owner/repo/actions/runs/123"),
+    ("job", "run_url", None),
+    ("job", "status", "in_progress"), ("job", "status", None),
+    *[("job", "conclusion", value) for value in ["success", "cancelled", "neutral", "skipped", "stale", None]],
+    ("run", "id", 124), ("run", "id", "123"), ("run", "id", 123.0), ("run", "id", None),
+    ("run", "repository", {"full_name": "other/repo"}),
+    ("run", "repository", None), ("run", "repository", {}),
+    ("run", "head_sha", "c" * 40), ("run", "head_sha", None),
+    ("run", "status", "in_progress"), ("run", "status", "queued"), ("run", "status", None),
+])
+def test_job_log_rejects_each_independent_binding_or_state(monkeypatch, target, field, value):
+    from mimir import ci_logs
+
+    job, run = _job_metadata(), _run_metadata()
+    (job if target == "job" else run)[field] = value
+    monkeypatch.setattr(ci_logs, "capture_job_log", lambda *a, **k: pytest.fail("capture before validation"))
+    session = Session([Response(job), Response(run)])
+    message = "run is still in progress" if target == "run" and field == "status" else None
+    with pytest.raises(ForgeError, match=message):
+        GitHubForgeClient(session=session).get_job_log(_scope(), 456)
+
+
+@pytest.mark.parametrize("job_id,run_id", [
+    (None, None),
+    (True, None), (0, None), (-1, None), ("456", None), (1.5, None),
+    (456, True), (456, 0), (456, -1), (456, "123"), (456, 1.5),
+])
+def test_job_log_invalid_ids_do_not_fetch(job_id, run_id):
+    session = Session([])
+    with pytest.raises(ForgeError, match="positive integer"):
+        GitHubForgeClient(session=session).get_job_log(_scope(), job_id, run_id)
+    assert session.calls == []
+
+
+@pytest.mark.parametrize("target", ["job", "run"])
+@pytest.mark.parametrize("payload", [None, [], "invalid"])
+def test_job_log_rejects_non_mapping_metadata(monkeypatch, target, payload):
+    from mimir import ci_logs
+
+    monkeypatch.setattr(ci_logs, "capture_job_log", lambda *a, **k: pytest.fail("invalid metadata captured"))
+    responses = [Response(payload)] if target == "job" else [Response(_job_metadata()), Response(payload)]
+    with pytest.raises(ForgeError, match=f"invalid {target} metadata"):
+        GitHubForgeClient(session=Session(responses)).get_job_log(_scope(), 456)
+
+
+@pytest.mark.parametrize("observed_run", [0, -1, True, 123.0])
+def test_job_log_rejects_self_consistent_invalid_run_id(monkeypatch, observed_run):
+    from mimir import ci_logs
+
+    job = {**_job_metadata(), "run_id": observed_run,
+           "run_url": f"https://api.github.com/repos/owner/repo/actions/runs/{observed_run}"}
+    run = {**_run_metadata(), "id": int(observed_run)}
+    session = Session([Response(job), Response(run)])
+    monkeypatch.setattr(ci_logs, "capture_job_log", lambda *a, **k: pytest.fail("invalid run ID captured"))
+    with pytest.raises(ForgeError, match="outside"):
+        GitHubForgeClient(session=session).get_job_log(_scope(), 456)
+    assert len(session.calls) == 1
+
+
+def test_job_log_explicit_run_mismatch_does_not_fetch_run():
+    session = Session([Response(_job_metadata())])
+    with pytest.raises(ForgeError, match="outside"):
+        GitHubForgeClient(session=session).get_job_log(_scope(), 456, 999)
+    assert len(session.calls) == 1
+
+
+@pytest.mark.parametrize("status,message", [(404, "job not found"), (401, "authentication failed")])
+def test_job_log_metadata_refusals_are_distinct(status, message):
+    session = Session([Response({}, status=status)])
+    with pytest.raises(ForgeError, match=message):
+        GitHubForgeClient(session=session).get_job_log(_scope(), 456)
+
+
+def test_job_log_capture_error_not_returned_as_evidence(monkeypatch):
+    from mimir import ci_logs
+
+    monkeypatch.setattr(ci_logs, "capture_job_log", lambda *a, **k: (b"", "unauthenticated gh"))
+    session = Session([Response(_job_metadata()), Response(_run_metadata())])
+    with pytest.raises(ForgeError, match="unauthenticated gh"):
+        GitHubForgeClient(session=session).get_job_log(_scope(), 456)
+
+
 @pytest.mark.parametrize("conclusion", ["failure", "timed_out", "action_required", "success"])
 @pytest.mark.parametrize("url_field", ["details_url", "html_url", None])
 def test_checks_preserve_actionable_url(conclusion, url_field) -> None:

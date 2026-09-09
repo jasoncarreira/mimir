@@ -15735,6 +15735,10 @@ def test_non_acp_execution_decisions_are_unchanged() -> None:
         for name in names
     }
 
+    flows[access_control.ToolFlowDirection.SOURCE].add("pr_job_log")
+    decisions[OperationDecision.RESOURCE_SCOPED].add("pr_job_log")
+    readable["pr_job_log"] = "repository"
+    protected["pr_job_log"] = "repository"
     assert {name for name in access_control._TOOL_FLOW_MAP if name.startswith("hands_")} == hands
     assert {
         direction: {name for name, value in access_control._TOOL_FLOW_MAP.items() if value is direction and name not in hands}

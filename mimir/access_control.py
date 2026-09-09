@@ -354,6 +354,7 @@ _TOOL_FLOW_MAP: dict[str, ToolFlowDirection] = {
     "pr_files": ToolFlowDirection.SOURCE,
     "pr_diff": ToolFlowDirection.SOURCE,
     "pr_checks": ToolFlowDirection.SOURCE,
+    "pr_job_log": ToolFlowDirection.SOURCE,
     "pr_reviews": ToolFlowDirection.SOURCE,
     "pr_comments": ToolFlowDirection.SOURCE,
     "pr_review_requests": ToolFlowDirection.SOURCE,
@@ -615,6 +616,7 @@ TRIGGER_CAPABILITY_TIERS: dict[str, CapabilityTier] = {
     "pr_files": CapabilityTier.SCOPE_CONTAINED,
     "pr_diff": CapabilityTier.SCOPE_CONTAINED,
     "pr_checks": CapabilityTier.SCOPE_CONTAINED,
+    "pr_job_log": CapabilityTier.SCOPE_CONTAINED,
     "pr_reviews": CapabilityTier.SCOPE_CONTAINED,
     "pr_comments": CapabilityTier.SCOPE_CONTAINED,
     "pr_review_requests": CapabilityTier.SCOPE_CONTAINED,
@@ -699,7 +701,7 @@ TRIGGER_AUTHORITY_PROFILES: dict[str, frozenset[str]] = {
         "pr_metadata", "pr_files", "pr_diff", "pr_checks", "pr_reviews",
         "pr_comments", "pr_review_requests", "pr_submit_review",
         "pr_inline_review_comment", "pr_comment", "pr_rerequest_review",
-        "pr_edit_body", "pr_review_others",
+        "pr_edit_body", "pr_review_others", "pr_job_log",
         "issue_comment",
         "unsupported_operation", "repo_checkout", "repo_cleanup", "repo_fetch",
         "repo_status", "repo_test", "repo_diff", "repo_unmerged", "repo_stage", "repo_commit",
@@ -1234,6 +1236,7 @@ _FORGE_TOOL_ACTIONS: dict[str, str | None] = {
     "pr_files": RepoPRAction.INSPECT.value,
     "pr_diff": RepoPRAction.INSPECT.value,
     "pr_checks": RepoPRAction.INSPECT.value,
+    "pr_job_log": RepoPRAction.INSPECT.value,
     "pr_reviews": RepoPRAction.INSPECT.value,
     "pr_comments": RepoPRAction.INSPECT.value,
     "pr_review_requests": RepoPRAction.INSPECT.value,
@@ -8211,6 +8214,10 @@ def authorize_repo_pr_tool(
     in_scope = (
         scope is not None
         and not missing_actions
+        and (
+            tool_name != "pr_job_log"
+            or (service_principal is not None and service_principal.has_capability("pr_job_log"))
+        )
     )
     return ToolAuthorization(
         tool_name=tool_name,
@@ -9077,6 +9084,7 @@ _PROTECTED_RESULT_DOMAINS: dict[str, str] = {
     "pr_files": "repository",
     "pr_diff": "repository",
     "pr_checks": "repository",
+    "pr_job_log": "repository",
     "pr_reviews": "repository",
     "pr_comments": "repository",
     "pr_review_requests": "repository",
@@ -9164,6 +9172,7 @@ _NON_INGESTING_RESULT_TOOLS = frozenset({
 })
 
 _REPOSITORY_RESULT_TOOLS = frozenset({
+    "pr_job_log",
     "pr_metadata", "pr_files", "pr_diff", "pr_checks", "pr_reviews",
     "pr_comments", "pr_review_requests", "repo_checkout", "repo_fetch",
     "repo_status", "repo_test", "repo_diff", "repo_unmerged",
@@ -9186,6 +9195,7 @@ _REPOSITORY_MUTATION_RESULT_TOOLS = frozenset({
 # result taint. MCP reads have equivalent adapter/resource parity checks in
 # MCPResourceAdapter.authorize_call.
 _READ_BACKEND_RESULT_TOOLS = frozenset({
+    "pr_job_log",
     "Read",
     "Glob",
     "Grep",

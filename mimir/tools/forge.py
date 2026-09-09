@@ -15,6 +15,7 @@ from typing import Any
 from langchain.tools import ToolRuntime
 from langchain_core.tools import StructuredTool, ToolException, tool
 from langchain_core.tools.base import create_schema_from_function
+from pydantic import StrictInt
 
 from ..forge import ForgeClient, ForgeError, IssueTarget, ReviewVerdict
 from ..redaction import redact_text
@@ -639,6 +640,37 @@ def pr_checks(
 
 
 @tool
+def pr_job_log(
+    repository: str,
+    pull_request: StrictInt,
+    job_id: StrictInt,
+    run_id: StrictInt | None = None,
+    runtime: ToolRuntime[AuthContext] = None,  # type: ignore[assignment]
+) -> str:
+    """Read an untrusted, redacted bounded excerpt from one scoped failing CI job."""
+    _repository(repository)
+    for name, value in (("pull_request", pull_request), ("job_id", job_id), ("run_id", run_id)):
+        if name == "run_id" and value is None:
+            continue
+        if type(value) is not int or value < 1:
+            raise ToolPolicyRefusal(f"{name} must be a positive integer")
+    context = getattr(runtime, "context", None)
+    state = None
+    for inventory in (
+        getattr(context, "server_discovered_pr_states", None),
+        getattr(context, "repo_pr_scope_registry", None),
+    ):
+        if isinstance(inventory, (ServerDiscoveredPRStates, RepoPRScopeRegistry)):
+            state = inventory.resolve(repository, pull_request)
+            if state is not None:
+                break
+    if state is None:
+        raise ToolPolicyRefusal("job log rejected: pull request is outside this turn's scope")
+    scope = state.action_scope
+    return _call(lambda: _client(scope).get_job_log(scope, job_id, run_id))
+
+
+@tool
 def pr_reviews(
     repository: str,
     pull_request: int,
@@ -924,6 +956,7 @@ FORGE_TOOLS = tuple(_bind_injected_runtime(forge_tool) for forge_tool in (
     pr_files,
     pr_diff,
     pr_checks,
+    pr_job_log,
     pr_reviews,
     pr_comments,
     pr_review_requests,
