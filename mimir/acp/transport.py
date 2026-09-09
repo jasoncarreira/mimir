@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from typing import Any
 
 WRITER_DRAIN_TIMEOUT = 2.0
@@ -12,16 +12,22 @@ PEER_EOF_GRACE_TIMEOUT = 5.0
 _COPY_CHUNK_BYTES = 64 * 1024
 
 
-async def close_writer(writer: Any) -> None:
+async def close_writer(
+    writer: Any,
+    *,
+    wait_for: Callable[..., Awaitable[Any]] | None = None,
+) -> None:
+    if wait_for is None:
+        wait_for = asyncio.wait_for
     try:
-        await asyncio.wait_for(writer.drain(), WRITER_DRAIN_TIMEOUT)
+        await wait_for(writer.drain(), WRITER_DRAIN_TIMEOUT)
     except (TimeoutError, ConnectionError, OSError):
         pass
     writer.close()
     wait_closed = getattr(writer, "wait_closed", None)
     if wait_closed is not None:
         try:
-            await asyncio.wait_for(wait_closed(), WRITER_CLOSE_TIMEOUT)
+            await wait_for(wait_closed(), WRITER_CLOSE_TIMEOUT)
             return
         except (TimeoutError, ConnectionError, OSError):
             pass
@@ -31,7 +37,7 @@ async def close_writer(writer: Any) -> None:
         abort()
         if wait_closed is not None:
             try:
-                await asyncio.wait_for(wait_closed(), WRITER_ABORT_TIMEOUT)
+                await wait_for(wait_closed(), WRITER_ABORT_TIMEOUT)
             except (TimeoutError, ConnectionError, OSError):
                 pass
 
@@ -59,7 +65,10 @@ async def pump_bidirectional(
     right_writer: Any,
     *,
     close_on_left_exit: bool | Callable[[], bool] = False,
+    wait_for: Callable[..., Awaitable[Any]] | None = None,
 ) -> None:
+    if wait_for is None:
+        wait_for = asyncio.wait_for
     left_task = asyncio.create_task(pump_stream(left_reader, right_writer))
     tasks = {left_task, asyncio.create_task(pump_stream(right_reader, left_writer))}
     try:
@@ -88,11 +97,12 @@ async def pump_bidirectional(
         raise
     finally:
         closing = asyncio.gather(
-            close_writer(left_writer), close_writer(right_writer),
+            close_writer(left_writer, wait_for=wait_for),
+            close_writer(right_writer, wait_for=wait_for),
             return_exceptions=True,
         )
         try:
-            await asyncio.wait_for(closing, FORCE_CLOSE_TIMEOUT)
+            await wait_for(closing, FORCE_CLOSE_TIMEOUT)
         except TimeoutError:
             pass
 

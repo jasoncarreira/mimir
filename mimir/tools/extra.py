@@ -378,7 +378,7 @@ def _run_bounded_project_test(
         if os.name != "nt":
             try:
                 os.killpg(proc.pid, signal.SIGKILL)
-            except ProcessLookupError:
+            except (ProcessLookupError, PermissionError):
                 pass
         else:
             proc.kill()

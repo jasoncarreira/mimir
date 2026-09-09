@@ -143,10 +143,60 @@ async def test_close_writer_drain_timeout_escalates_to_close(
 async def test_close_writer_close_timeout_escalates_to_abort(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr("mimir.acp.transport.WRITER_CLOSE_TIMEOUT", 0.01)
-    monkeypatch.setattr("mimir.acp.transport.WRITER_ABORT_TIMEOUT", 0.01)
-    writer = StagedWriter(close_gate=asyncio.Event())
-    await asyncio.wait_for(close_writer(writer), 0.1)
+    from collections.abc import Awaitable
+
+    monkeypatch.setattr("mimir.acp.transport.WRITER_DRAIN_TIMEOUT", 11.0)
+    monkeypatch.setattr("mimir.acp.transport.WRITER_CLOSE_TIMEOUT", 12.0)
+    monkeypatch.setattr("mimir.acp.transport.WRITER_ABORT_TIMEOUT", 13.0)
+    entered = asyncio.Event()
+    gate = asyncio.Event()
+    operations = []
+    budgets = []
+
+    class ClosingWriter(StagedWriter):
+        async def drain(self) -> None:
+            operations.append("drain")
+            await super().drain()
+
+        def close(self) -> None:
+            operations.append("close")
+            super().close()
+
+        async def wait_closed(self) -> None:
+            operations.append("wait_closed")
+            entered.set()
+            try:
+                await super().wait_closed()
+            except asyncio.CancelledError:
+                operations.append("cancelled")
+                raise
+
+        def abort(self) -> None:
+            operations.append("abort")
+            super().abort()
+
+    async def wait_for(awaitable: Awaitable[object], timeout: float) -> object:
+        budgets.append(timeout)
+        if len(budgets) == 1:
+            return await awaitable
+        entered.clear()
+        task = asyncio.ensure_future(awaitable)
+        try:
+            await entered.wait()
+            return await asyncio.wait_for(task, 0)
+        finally:
+            if not task.done():
+                task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+    writer = ClosingWriter(close_gate=gate)
+    await close_writer(writer, wait_for=wait_for)
+    assert budgets == [11.0, 12.0, 13.0]
+    assert operations == [
+        "drain", "close", "wait_closed", "cancelled",
+        "abort", "wait_closed", "cancelled",
+    ]
+    assert not gate.is_set()
     assert writer.closed
     assert writer.aborted
     assert writer.wait_calls == 2
@@ -223,9 +273,8 @@ async def _release_after(event: asyncio.Event, delay: float) -> None:
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("release_delay,before", [(0.005, True), (None, False)])
+@pytest.mark.parametrize("before", [True, False])
 async def test_drain_deadline_before_and_after_witnesses(
-    release_delay: float | None,
     before: bool,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -239,23 +288,20 @@ async def test_drain_deadline_before_and_after_witnesses(
     passed the same commits. Scheduling no release makes the assertion
     deterministic without a long wait, and still witnesses exactly what the case
     is about -- the deadline expiring with the drain incomplete.
+
+    The positive case releases the gate before awaiting, not via a 5ms task
+    racing the 20ms deadline. Neither witness depends on timely scheduling of
+    a competing release task.
     """
     monkeypatch.setattr("mimir.acp.transport.WRITER_DRAIN_TIMEOUT", 0.02)
     gate = asyncio.Event()
+    if before:
+        gate.set()
     writer = StagedWriter(drain_gate=gate)
-    release = (
-        asyncio.create_task(_release_after(gate, release_delay))
-        if release_delay is not None
-        else None
-    )
     await close_writer(writer)
     assert writer.closed
     assert writer.aborted is False
     assert gate.is_set() is before
-    if release is not None:
-        await release
-    else:
-        gate.set()
 
 
 @pytest.mark.asyncio
@@ -312,38 +358,80 @@ async def test_abort_wait_deadline_before_and_after_witnesses(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("release_delay,before", [(0.005, True), (None, False)])
+@pytest.mark.parametrize("before", [True, False])
 async def test_force_close_deadline_before_and_after_witnesses(
-    release_delay: float | None,
     before: bool,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr("mimir.acp.transport.FORCE_CLOSE_TIMEOUT", 0.02)
-    monkeypatch.setattr("mimir.acp.transport.WRITER_DRAIN_TIMEOUT", 1.0)
+    from collections.abc import Awaitable
+
+    monkeypatch.setattr("mimir.acp.transport.FORCE_CLOSE_TIMEOUT", 14.0)
+    monkeypatch.setattr("mimir.acp.transport.WRITER_DRAIN_TIMEOUT", 11.0)
+    monkeypatch.setattr("mimir.acp.transport.WRITER_CLOSE_TIMEOUT", 12.0)
+    monkeypatch.setattr("mimir.acp.transport.WRITER_ABORT_TIMEOUT", 13.0)
 
     class ClosingGateWriter(StagedWriter):
+        def __init__(self) -> None:
+            super().__init__()
+            self.entered = asyncio.Event()
+            self.settled = False
+            self.cancelled = False
+            self.completed = False
+
         async def drain(self) -> None:
             self.drain_calls += 1
             if self.drain_calls > 1:
-                await gate.wait()
+                self.entered.set()
+                try:
+                    await gate.wait()
+                    self.completed = True
+                except asyncio.CancelledError:
+                    self.cancelled = True
+                    raise
+                finally:
+                    self.settled = True
 
     gate = asyncio.Event()
+    if before:
+        gate.set()
     left = asyncio.StreamReader()
     right = asyncio.StreamReader()
     left.feed_eof()
     right.feed_eof()
     left_writer = ClosingGateWriter()
     right_writer = ClosingGateWriter()
-    release = (
-        asyncio.create_task(_release_after(gate, release_delay))
-        if release_delay is not None
-        else None
+    force_budgets = []
+    writer_budgets = []
+
+    async def wait_for(awaitable: Awaitable[object], timeout: float) -> object:
+        # The outer deadline owns the gather; inner writer waits stay real but untimed.
+        if not isinstance(awaitable, asyncio.Future):
+            writer_budgets.append(timeout)
+            return await awaitable
+        force_budgets.append(timeout)
+        try:
+            await left_writer.entered.wait()
+            await right_writer.entered.wait()
+            if before:
+                return await awaitable
+            return await asyncio.wait_for(awaitable, 0)
+        finally:
+            if not awaitable.done():
+                awaitable.cancel()
+            await asyncio.gather(awaitable, return_exceptions=True)
+
+    await pump_bidirectional(
+        left, left_writer, right, right_writer, wait_for=wait_for,
     )
-    await pump_bidirectional(left, left_writer, right, right_writer)
+    assert force_budgets == [14.0]
+    assert sorted(writer_budgets) == ([11.0, 11.0, 12.0, 12.0] if before else [11.0, 11.0])
     assert gate.is_set() is before
-    if before:
-        assert left_writer.closed and right_writer.closed
-    if release is not None:
-        await release
-    else:
-        gate.set()
+    for writer in (left_writer, right_writer):
+        assert writer.entered.is_set()
+        assert writer.settled
+        assert writer.completed is before
+        assert writer.cancelled is not before
+        assert writer.closed is before
+        assert not writer.aborted
+        assert writer.drain_calls == 2
+        assert writer.wait_calls == (1 if before else 0)

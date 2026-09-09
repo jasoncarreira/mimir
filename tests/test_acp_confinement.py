@@ -10,6 +10,7 @@ from pathlib import Path
 import pytest
 
 from mimir.acp import confinement
+from mimir.acp.execution_scope import ScopeApproval
 
 
 MACOS = pytest.mark.skipif(sys.platform != "darwin", reason="requires macOS Seatbelt")
@@ -41,6 +42,7 @@ def test_environment_does_not_trust_injected_runtime(monkeypatch):
 
 @pytest.fixture
 def fixture_scope(tmp_path):
+    tmp_path = tmp_path.resolve()
     cwd = tmp_path / 'cwd "quoted" café'
     cwd.mkdir()
     outside = tmp_path / "outside"
@@ -68,13 +70,14 @@ def test_shell_scope_exact_file_and_symlink_escape(fixture_scope):
     assert result.returncode == 0, result.stderr
     assert (cwd / "created").read_text() == "local\n"
     approved = outside / "approved"
-    result = run_confined(["/bin/cat", str(approved)], cwd, [approved])
+    approval = ScopeApproval(approved, recursive=False)
+    result = run_confined(["/bin/cat", str(approved)], cwd, [approval])
     assert result.returncode == 0, result.stderr
     for denied in (outside / "denied", cwd / "escape", Path("/etc/hosts")):
         # Redirect contents even if confinement regresses: never print hosts data.
         result = run_confined(
             ["/bin/sh", "-c", f"/bin/cat {shlex.quote(str(denied))} >/dev/null"],
-            cwd, [approved],
+            cwd, [approval],
         )
         assert result.returncode != 0, f"unexpected read permission: {denied}"
     result = run_confined(
@@ -84,8 +87,8 @@ def test_shell_scope_exact_file_and_symlink_escape(fixture_scope):
     assert not (outside / "new").exists()
 
 
-def test_seatbelt_approved_directory_policy_excludes_descendants(monkeypatch, tmp_path):
-    """Pin the shipped literal approval independently of macOS availability."""
+def test_seatbelt_approved_directory_policy_includes_descendants(monkeypatch, tmp_path):
+    """Pin directory-tree approval independently of macOS availability."""
     cwd = (tmp_path / "session").resolve()
     cwd.mkdir()
     approved = (tmp_path / "approved").resolve()
@@ -94,25 +97,114 @@ def test_seatbelt_approved_directory_policy_excludes_descendants(monkeypatch, tm
     monkeypatch.setattr(confinement.SeatbeltBackend, "executable", Path(sys.executable))
     monkeypatch.setattr(confinement, "_runtime_reads", lambda: (set(), set()))
     prepared = confinement.SeatbeltBackend().prepare(
-        ["/bin/true"], cwd=cwd, approved_paths=[approved],
+        ["/bin/true"], cwd=cwd, approved_paths=[ScopeApproval(approved, recursive=True)],
     )
     profile = prepared.argv[2]
-    # Exact rule equality catches replacing literal with subpath, an additional
-    # child grant, or widening the approval to its parent. No helper under test
-    # constructs this expectation.
+    # Exact rule equality catches dropping descendants or widening to a parent.
+    # No helper under test constructs this expectation.
     filters = sorted((f'(subpath {json.dumps(str(cwd))})',
-                      f'(literal {json.dumps(str(approved))})'))
+                      f'(subpath {json.dumps(str(approved))})'))
     writable = [line for line in profile.splitlines()
                 if line.startswith("(allow file-read* file-write*")]
     assert writable == ["(allow file-read* file-write* " + " ".join(filters) + ")"]
-    assert f'(subpath {json.dumps(str(approved))})' not in profile
+    assert f'(literal {json.dumps(str(approved))})' not in profile
 
 
 @MACOS
-def test_directory_addition_is_literal_not_subtree(fixture_scope):
+def test_directory_addition_grants_subtree_without_escape(fixture_scope):
     cwd, outside = fixture_scope
-    result = run_confined(["/bin/cat", str(outside / "denied")], cwd, [outside])
-    assert result.returncode != 0
+    directory = outside / "approved-tree"
+    nested = directory / "nested"
+    nested.mkdir(parents=True)
+    existing = nested / "existing"
+    existing.write_text("fixture")
+    sibling = outside / "approved-tree-sibling"
+    sibling.mkdir()
+    (sibling / "denied").write_text("fixture")
+    escape = nested / "escape"
+    escape.symlink_to(outside)
+    approval = ScopeApproval(directory, recursive=True)
+    created = nested / "new" / "created"
+    script = (
+        "from pathlib import Path; "
+        f"existing = Path({str(existing)!r}); "
+        "assert existing.read_text() == 'fixture'; "
+        "existing.write_text('updated'); "
+        f"created = Path({str(created)!r}); "
+        "created.parent.mkdir(); created.write_text('created')"
+    )
+    result = run_confined([sys.executable, "-c", script], cwd, [approval])
+    assert result.returncode == 0, result.stderr
+    assert existing.read_text() == "updated"
+    assert created.read_text() == "created"
+    for denied in (outside / "denied", sibling / "denied", escape / "denied"):
+        result = run_confined(["/bin/cat", str(denied)], cwd, [approval])
+        assert result.returncode != 0, f"unexpected read permission: {denied}"
+        result = run_confined(
+            ["/bin/sh", "-c", f"echo changed > {shlex.quote(str(denied))}"],
+            cwd, [approval],
+        )
+        assert result.returncode != 0, f"unexpected write permission: {denied}"
+        assert denied.read_text() == "fixture"
+    for denied in (outside / "new", sibling / "new", escape / "new"):
+        result = run_confined(
+            ["/bin/sh", "-c", f"echo denied > {shlex.quote(str(denied))}"],
+            cwd, [approval],
+        )
+        assert result.returncode != 0, f"unexpected create permission: {denied}"
+        assert not denied.exists()
+
+
+@pytest.mark.parametrize("recursive", [False, True], ids=["file-literal", "directory-subpath"])
+def test_seatbelt_profile_exact_writable_scope(monkeypatch, fixture_scope, recursive):
+    cwd, outside = fixture_scope
+    approved = outside / "approved"
+    if recursive:
+        approved.unlink()
+        approved.mkdir()
+        (approved / "escape").symlink_to(outside / "denied")
+    approval = ScopeApproval(approved, recursive=recursive)
+    monkeypatch.setattr(confinement.SeatbeltBackend, "executable", Path(sys.executable))
+    prepared = confinement.SeatbeltBackend().prepare(
+        ["/bin/true"], cwd=cwd, approved_paths=[approval],
+    )
+    profile = prepared.argv[2]
+    filters = sorted([
+        f'(subpath {json.dumps(str(cwd), ensure_ascii=False)})',
+        f'({"subpath" if recursive else "literal"} {json.dumps(str(approved), ensure_ascii=False)})',
+    ])
+    # Exact writable rules exclude parent trees, prefix siblings and escape targets.
+    assert [line for line in profile.splitlines() if "file-write" in line] == [
+        "(allow file-read* file-write* " + " ".join(filters) + ")",
+        '(allow file-write* (literal "/dev/null"))',
+    ]
+
+
+@pytest.mark.parametrize("replacement", ["directory", "symlink-to-directory", "symlink-to-file"])
+def test_seatbelt_profile_preserves_file_snapshot(monkeypatch, fixture_scope, replacement):
+    cwd, outside = fixture_scope
+    approved = outside / "approved"
+    assert approved.is_file()
+    approval = ScopeApproval(approved.resolve(), recursive=False)
+    approved.unlink()
+    if replacement == "directory":
+        approved.mkdir()
+    elif replacement == "symlink-to-directory":
+        approved.symlink_to(outside, target_is_directory=True)
+    else:
+        approved.symlink_to(outside / "denied")
+    monkeypatch.setattr(confinement.SeatbeltBackend, "executable", Path(sys.executable))
+    prepared = confinement.SeatbeltBackend().prepare(
+        ["/bin/true"], cwd=cwd, approved_paths=[approval],
+    )
+    filters = sorted([
+        f'(subpath {json.dumps(str(cwd), ensure_ascii=False)})',
+        f'(literal {json.dumps(str(approval.path), ensure_ascii=False)})',
+    ])
+    assert [line for line in prepared.argv[2].splitlines() if "file-write" in line] == [
+        "(allow file-read* file-write* " + " ".join(filters) + ")",
+        '(allow file-write* (literal "/dev/null"))',
+    ]
 
 
 @MACOS
@@ -133,7 +225,8 @@ for line in sys.stdin:
     print(json.dumps({'request': count, 'allowed': allowed}), flush=True)
 """
     prepared = confinement.prepare_command(
-        [sys.executable, "-c", script], cwd=cwd, approved_paths=[approved],
+        [sys.executable, "-c", script], cwd=cwd,
+        approved_paths=[ScopeApproval(approved, recursive=False)],
     )
     paths = [cwd / "inside", approved, outside / "denied", cwd / "escape", Path("/etc/hosts")]
     result = subprocess.run(
@@ -194,9 +287,10 @@ def test_invalid_profile_does_not_execute(tmp_path):
 def test_replaced_approved_file_does_not_grant_new_symlink_target(fixture_scope):
     cwd, outside = fixture_scope
     approved = (outside / "approved").resolve()
+    approval = ScopeApproval(approved, recursive=False)
     approved.unlink()
     approved.symlink_to(outside / "denied")
-    result = run_confined(["/bin/cat", str(approved)], cwd, [approved])
+    result = run_confined(["/bin/cat", str(approved)], cwd, [approval])
     assert result.returncode != 0
 
 
@@ -275,7 +369,7 @@ def test_apparmor_refuses_path_syntax(suffix, source):
     values = {"cwd": Path("/session"), "approved": Path("/approved"), "scratch": Path("/scratch")}
     values[source] = Path("/bad" + suffix)
     with pytest.raises(confinement.ConfinementUnavailable, match="represent"):
-        confinement.apparmor_profile(values["cwd"], [values["approved"]], [values["scratch"]])
+        confinement.apparmor_profile(values["cwd"], [ScopeApproval(values["approved"], recursive=True)], [values["scratch"]])
 
 
 @pytest.mark.parametrize("path", ["/", "relative", "/a/../b"])
@@ -288,7 +382,7 @@ def test_apparmor_approved_directory_policy_includes_descendants():
     """Pin tree approval in synthesized policy, not live kernel enforcement."""
     baseline = confinement.apparmor_profile(Path("/session"))
     profile = confinement.apparmor_profile(
-        Path("/session"), approved_paths=[Path("/outside/approved")],
+        Path("/session"), approved_paths=[ScopeApproval(Path("/outside/approved"), recursive=True)],
     )
     # Ignore only the content-addressed profile header; compare every rule so
     # dropping descendants or granting a parent/sibling cannot pass unnoticed.
@@ -302,6 +396,28 @@ def test_apparmor_approved_directory_policy_includes_descendants():
     }
 
 
+@pytest.mark.parametrize("replacement", ["directory", "symlink"])
+def test_apparmor_file_approval_never_grows_after_replacement(tmp_path, replacement):
+    cwd = tmp_path / "session"
+    cwd.mkdir()
+    approved = tmp_path / "approved"
+    approved.touch()
+    grant = ScopeApproval(approved, recursive=False)
+    before = confinement.apparmor_profile(cwd, [grant])
+    approved.unlink()
+    if replacement == "directory":
+        approved.mkdir()
+        (approved / "child").touch()
+    else:
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        approved.symlink_to(outside, target_is_directory=True)
+    after = confinement.apparmor_profile(cwd, [grant])
+    assert after == before
+    baseline = set(confinement.apparmor_profile(cwd).splitlines()[1:])
+    assert set(after.splitlines()[1:]) - baseline == {f"  {approved} rwk,"}
+
+
 def test_apparmor_pure_exact_scope(monkeypatch):
     def forbidden(*args, **kwargs):
         pytest.fail("synthesis must not inspect files or start processes")
@@ -309,8 +425,8 @@ def test_apparmor_pure_exact_scope(monkeypatch):
         for name in ("resolve", "stat", "read_text", "is_dir", "is_file"):
             patch.setattr(Path, name, forbidden)
         patch.setattr(subprocess, "run", forbidden)
-        profile = confinement.apparmor_profile(Path("/session"), [Path("/outside/approved")], [Path("/scratch")])
-    assert profile == confinement.apparmor_profile(Path("/session"), [Path("/outside/approved")], [Path("/scratch")])
+        profile = confinement.apparmor_profile(Path("/session"), [ScopeApproval(Path("/outside/approved"), recursive=True)], [Path("/scratch")])
+    assert profile == confinement.apparmor_profile(Path("/session"), [ScopeApproval(Path("/outside/approved"), recursive=True)], [Path("/scratch")])
     writable = {line.strip() for line in profile.splitlines() if " rw" in line}
     assert writable == {
         "/dev/null rw,", "/session rwk,", "/session/ rw,", "/session/** rwk,",
@@ -362,13 +478,13 @@ def test_apparmor_tool_must_be_regular_file(apparmor, monkeypatch, tmp_path, nam
 def test_apparmor_bad_scope_never_uses_existing_risk_consent(apparmor, tmp_path, path):
     with pytest.raises(confinement.ConfinementUnavailable, match="represent"):
         confinement.prepare_command(["/bin/true"], cwd=tmp_path,
-                                    approved_paths=[path], allow_unconfined=True)
+                                    approved_paths=[ScopeApproval(path, recursive=False)], allow_unconfined=True)
     assert not apparmor[1]
 
 
 def test_apparmor_prepares_only_after_load_and_transition(apparmor, tmp_path):
     backend, calls, _ = apparmor
-    approved = tmp_path / "approved"
+    approved = ScopeApproval(tmp_path / "approved", recursive=True)
     prepared = backend.prepare(["/bin/sh", "-c", "exit 37"], cwd=tmp_path, approved_paths=[approved])
     assert prepared.execution_mode == "confined"
     assert len(calls) == 3
@@ -381,7 +497,7 @@ def test_apparmor_prepares_only_after_load_and_transition(apparmor, tmp_path):
     assert prepared.argv == (*calls[2][0], "/bin/sh", "-c", "exit 37")
     assert calls[2][0][3:9] == ("--", str(backend.interpreter), "-I", "-S", "-c", confinement._APPARMOR_LAUNCH)
     assert prepared.env["TMPDIR"] == str(tmp_path)
-    assert not any(str(approved) in arg for argv, _ in calls[:2] for arg in argv)
+    assert not any(str(approved.path) in arg for argv, _ in calls[:2] for arg in argv)
 
 
 @pytest.mark.parametrize("code, label", [
@@ -470,8 +586,9 @@ async def test_apparmor_rejected_candidate_is_never_loaded_or_launched(apparmor,
         validated.append(approved_paths)
         return synthesize(cwd, approved_paths, scratch_paths)
     monkeypatch.setattr(confinement, "apparmor_profile", synth)
+    grant = ScopeApproval(candidate.resolve(), recursive=True)
     async def reject(*args):
-        assert validated[-1] == (candidate.resolve(),)
+        assert validated[-1] == (grant,)
         assert all(str(candidate) not in kwargs.get("input", "") for _, kwargs in calls)
         return False
     provider = hosted.HostedHandsProvider(request_scope_permission=AsyncMock(side_effect=reject))
@@ -479,8 +596,8 @@ async def test_apparmor_rejected_candidate_is_never_loaded_or_launched(apparmor,
     session = provider._sessions["s"]
     result = await provider.request_scope(session, str(alias))
     assert not result["approved"]
-    provider._request_scope_permission.assert_awaited_once_with("s", str(candidate.resolve()))
-    assert candidate.resolve() not in session.scope.approved
+    provider._request_scope_permission.assert_awaited_once_with("s", grant)
+    assert not session.scope.approved
     # Exercise the actual execution callsite, stopping at process creation.
     spawn = AsyncMock(side_effect=OSError("fixture: do not run emulated AppArmor"))
     monkeypatch.setattr(hosted.asyncio, "create_subprocess_exec", spawn)
@@ -494,7 +611,7 @@ async def test_apparmor_rejected_candidate_is_never_loaded_or_launched(apparmor,
 
 def test_apparmor_validation_loads_nothing(apparmor, monkeypatch, tmp_path):
     monkeypatch.setattr(confinement.sys, "platform", "linux")
-    confinement.validate_scope(cwd=tmp_path, candidate_paths=[tmp_path / "candidate"])
+    confinement.validate_scope(cwd=tmp_path, candidate_paths=[ScopeApproval(tmp_path / "candidate", recursive=True)])
     assert not apparmor[1]
 
 

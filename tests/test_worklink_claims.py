@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
+import fcntl
 import json
 from pathlib import Path
 import subprocess
@@ -116,9 +117,8 @@ def test_missing_home_path_emits_serialization_unavailable(caplog: pytest.LogCap
     ).claim_issue(1064, labels=["worklink:ready"])
 
     assert result.claimed is True
-    assert [event for event, _payload in events] == [
-        "worklink_claim_serialization_unavailable"
-    ]
+    assert len(events) == 5
+    assert all(event == "worklink_claim_serialization_unavailable" for event, _ in events)
     assert events[0][1]["reason"] == "home_path_missing"
     assert events[0][1]["resource"] == "chainlink_locks_worktree"
     assert "Worklink claim serialization unavailable" in caplog.text
@@ -231,6 +231,97 @@ def test_claim_contention_retry_bound_is_explicit(tmp_path: Path) -> None:
         "exhausted",
     ]
     assert events[-1]["max_attempts"] == 5
+
+
+@pytest.mark.parametrize("args", [
+    ("locks", "steal", "1602"), ("locks", "release", "1602"),
+    ("locks", "list", "--json"), ("issue", "show", "1602", "--json"),
+    ("issue", "list", "--json"), ("issue", "label", "1602", "worklink:ready"),
+    ("issue", "unlabel", "1602", "worklink:ready"),
+    ("issue", "comment", "1602", "comment"),
+])
+@pytest.mark.parametrize("check", [True, False])
+def test_generic_contention_retry(tmp_path, args, check):
+    calls, sleeps, events = [], [], []
+
+    def runner(command):
+        calls.append(command)
+        return subprocess.CompletedProcess(command, 128, "", "Another git process seems to be running")
+
+    claims = ChainlinkClaims(
+        agent_id="worker", home_path=tmp_path, runner=runner, sleeper=sleeps.append,
+        event_logger=lambda event, **payload: events.append((event, payload)),
+    )
+    with pytest.raises(RuntimeError, match="^chainlink contention exhausted"):
+        claims._run(*args, check=check)
+    assert len(calls) == 5
+    assert sleeps == [0.1, 0.2, 0.4, 0.8]
+    assert [p["outcome"] for _, p in events] == ["retrying"] * 4 + ["exhausted"]
+    assert all(p["issue_id"] == (1602 if args[2] == "1602" else None) for _, p in events)
+    assert all(p["resource"] == "chainlink_locks_worktree" for _, p in events)
+    assert "git process" not in json.dumps(events)
+
+    calls.clear()
+    sleeps.clear()
+    events.clear()
+    claims.runner = lambda command: runner(command) if not calls else completed(command)
+    assert claims._run(*args, check=check).returncode == 0
+    assert sleeps == [0.1]
+    assert [p["outcome"] for _, p in events] == ["retrying", "succeeded"]
+
+
+@pytest.mark.parametrize("after_contention", [False, True])
+def test_generic_unrelated_error_is_unchanged(tmp_path, after_contention):
+    calls, sleeps, events = [], [], []
+
+    def runner(args):
+        calls.append(args)
+        error = "permission denied"
+        if after_contention and len(calls) == 1:
+            error = "Another git process seems to be running"
+        return subprocess.CompletedProcess(args, 1, "", error)
+
+    claims = ChainlinkClaims(
+        agent_id="worker", home_path=tmp_path, runner=runner, sleeper=sleeps.append,
+        event_logger=lambda event, **payload: events.append(payload),
+    )
+    with pytest.raises(RuntimeError, match="^permission denied$"):
+        claims._run("locks", "steal", "1602")
+    assert len(calls) == 1 + after_contention
+    assert sleeps == ([0.1] if after_contention else [])
+    assert all(event["outcome"] != "succeeded" for event in events)
+
+
+@pytest.mark.parametrize("claim", [False, True])
+def test_independent_descriptor_excludes_invocations_and_bounds_wait(tmp_path, claim):
+    lock_path = tmp_path / "state" / "worklink" / "chainlink-claim.lock"
+    lock_path.parent.mkdir(parents=True)
+    calls, sleeps, prepared = [], [], []
+    claims = ChainlinkClaims(
+        agent_id="worker", home_path=tmp_path,
+        runner=lambda args: calls.append(args) or completed(args), sleeper=sleeps.append,
+    )
+    # A separately opened descriptor owns the real OS lock. An in-process
+    # mutex cannot observe it, so that mutation would incorrectly run the CLI.
+    with lock_path.open("a") as owner:
+        fcntl.flock(owner.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        if claim:
+            with pytest.raises(RuntimeError, match="contention exhausted"):
+                claims._claim_lock_with_retry(
+                    1602, home_path=tmp_path, before_claim=lambda: prepared.append(True),
+                )
+        else:
+            with pytest.raises(RuntimeError, match="contention exhausted"):
+                claims._run("issue", "show", "1602")
+        assert calls == []
+        assert prepared == []
+        assert sleeps == [0.1, 0.2, 0.4, 0.8]
+    assert lock_path.exists()
+    # Releasing the external owner lets the complete claim path run without
+    # recursively acquiring its own non-reentrant flock.
+    assert claims.claim_issue(1602, before_claim=lambda: prepared.append(True)).claimed
+    assert prepared == [True]
+    assert len(calls) == 5
 
 
 def test_heartbeat_issue_appends_fresh_claim_record() -> None:
@@ -347,7 +438,7 @@ def test_claim_issue_blocks_when_attempts_exhausted() -> None:
     assert ["chainlink", "issue", "label", "7", "worklink:blocked"] in calls
 
 
-def test_reaper_enforces_own_ttl_before_steal() -> None:
+def test_reaper_enforces_own_ttl_before_steal(tmp_path: Path) -> None:
     calls: list[list[str]] = []
     events: list[tuple[str, dict[str, object]]] = []
 
@@ -365,6 +456,7 @@ def test_reaper_enforces_own_ttl_before_steal() -> None:
     now = datetime(2026, 6, 11, 5, tzinfo=UTC)
     claims = ChainlinkClaims(
         agent_id="mimir-a",
+        home_path=tmp_path,
         runner=runner,
         clock=lambda: now,
         event_logger=lambda event, **payload: events.append((event, payload)),
@@ -493,7 +585,7 @@ def test_part_a_reaper_reports_each_stale_claim_outcome(
         assert result.skipped_issue_ids == {reason: [1400]}
 
 
-def test_part_a_reaper_skip_event_uses_bounded_issue_samples() -> None:
+def test_part_a_reaper_skip_event_uses_bounded_issue_samples(tmp_path: Path) -> None:
     events: list[tuple[str, dict[str, object]]] = []
     now = datetime(2026, 8, 23, tzinfo=UTC)
     records = [
@@ -502,6 +594,7 @@ def test_part_a_reaper_skip_event_uses_bounded_issue_samples() -> None:
     ]
     claims = ChainlinkClaims(
         agent_id="mimir-a",
+        home_path=tmp_path,
         runner=lambda args: subprocess.CompletedProcess(
             list(args), 0, stdout=json.dumps({"locks": {}}), stderr=""
         ),
@@ -924,7 +1017,7 @@ def test_graceful_shutdown_releases_only_this_process_claim_and_forgives_budget(
     assert claims.next_attempt(history) == 2
 
 
-def test_part_c_shutdown_reports_partial_failure_and_timeout_remainder() -> None:
+def test_part_c_shutdown_reports_partial_failure_and_timeout_remainder(tmp_path: Path) -> None:
     now = datetime(2026, 8, 23, tzinfo=UTC)
     records = {
         issue_id: ClaimRecord(issue_id, 1, "mimir-worklink:process-a", now)
@@ -956,6 +1049,7 @@ def test_part_c_shutdown_reports_partial_failure_and_timeout_remainder() -> None
 
         released, failed = ChainlinkClaims(
             agent_id="mimir-worklink:process-a",
+            home_path=tmp_path,
             runner=runner,
             event_logger=lambda event, **payload: events.append((event, payload)),
         ).release_owned_claims_for_shutdown()

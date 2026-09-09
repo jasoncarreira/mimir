@@ -19,6 +19,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
 
+from mimir.acp.execution_scope import ScopeApproval
+
 
 class ConfinementUnavailable(RuntimeError):
     """Confinement setup failed; execution must not silently downgrade."""
@@ -41,7 +43,7 @@ class ConfinementBackend(Protocol):
         argv: Sequence[str],
         *,
         cwd: Path,
-        approved_paths: Iterable[Path],
+        approved_paths: Iterable[ScopeApproval],
         scratch_paths: Iterable[Path],
     ) -> PreparedCommand: ...
 
@@ -109,7 +111,7 @@ class SeatbeltBackend:
         argv: Sequence[str],
         *,
         cwd: Path,
-        approved_paths: Iterable[Path] = (),
+        approved_paths: Iterable[ScopeApproval] = (),
         scratch_paths: Iterable[Path] = (),
     ) -> PreparedCommand:
         if not self.executable.is_file() or not os.access(self.executable, os.X_OK):
@@ -130,8 +132,8 @@ class SeatbeltBackend:
         for value in approved_paths:
             # The scope authority freezes canonical paths at approval time. Do
             # not follow a replacement symlink and silently grant its new target.
-            path = Path(os.path.abspath(value))
-            writable.add(_filter(path, tree=False))
+            path = Path(os.path.abspath(value.path))
+            writable.add(_filter(path, tree=value.recursive))
         scratch_roots: list[str] = []
         for value in scratch_paths:
             path = Path(os.path.abspath(value))
@@ -161,7 +163,7 @@ class SeatbeltBackend:
 
 
 def apparmor_profile(
-    cwd: Path, approved_paths: Iterable[Path] = (), scratch_paths: Iterable[Path] = (),
+    cwd: Path, approved_paths: Iterable[ScopeApproval] = (), scratch_paths: Iterable[Path] = (),
 ) -> str:
     """Synthesize only: inputs are frozen absolute paths, never filesystem lookups.
 
@@ -170,8 +172,10 @@ def apparmor_profile(
     """
     scratch_paths = tuple(scratch_paths)
     roots = set()
-    for path in (cwd, *approved_paths, *scratch_paths):
-        value = str(path)
+    grants = (ScopeApproval(cwd, recursive=True), *approved_paths,
+              *(ScopeApproval(path, recursive=True) for path in scratch_paths))
+    for grant in grants:
+        value = str(grant.path)
         try:
             value.encode("utf-8", errors="strict")
         except UnicodeError as exc:
@@ -180,7 +184,7 @@ def apparmor_profile(
                 or any(part in (".", "..") for part in value.split("/"))
                 or not re.fullmatch(r"/[\w./+-]+", value, flags=re.ASCII)):
             raise ConfinementUnavailable("AppArmor cannot represent scope path unambiguously")
-        roots.add(value)
+        roots.add((value, grant.recursive))
     rules = [
         # No ux/px or change_profile permission: every exec inherits this profile.
         "  /** ix,",
@@ -191,8 +195,10 @@ def apparmor_profile(
         "  /dev/null rw,", "  /dev/urandom r,", "  /dev/random r,",
         "  /proc/*/attr/current r,",
     ]
-    for root in sorted(roots):
-        rules.extend((f"  {root} rwk,", f"  {root}/ rw,", f"  {root}/** rwk,"))
+    for root, recursive in sorted(roots):
+        rules.append(f"  {root} rwk,")
+        if recursive:
+            rules.extend((f"  {root}/ rw,", f"  {root}/** rwk,"))
     # Deny overrides an overlapping cwd grant without denying scratch contents.
     for path in sorted(set(scratch_paths)):
         rules.extend((f"  deny {path} w,", f"  deny {path}/ w,"))
@@ -236,7 +242,7 @@ class AppArmorBackend:
 
     def prepare(
         self, argv: Sequence[str], *, cwd: Path,
-        approved_paths: Iterable[Path] = (), scratch_paths: Iterable[Path] = (),
+        approved_paths: Iterable[ScopeApproval] = (), scratch_paths: Iterable[Path] = (),
     ) -> PreparedCommand:
         if not argv:
             raise ValueError("a confined command requires argv")
@@ -294,7 +300,7 @@ def _backend() -> ConfinementBackend:
     return SeatbeltBackend()
 
 
-def validate_scope(*, cwd: Path, candidate_paths: Iterable[Path]) -> None:
+def validate_scope(*, cwd: Path, candidate_paths: Iterable[ScopeApproval]) -> None:
     """Validate canonical candidate syntax without loading or running its policy."""
     if sys.platform == "linux":
         apparmor_profile(cwd, candidate_paths)
@@ -307,7 +313,7 @@ def prepare_command(
     argv: Sequence[str],
     *,
     cwd: Path,
-    approved_paths: Iterable[Path] = (),
+    approved_paths: Iterable[ScopeApproval] = (),
     scratch_paths: Iterable[Path] = (),
     allow_unconfined: bool = False,
 ) -> PreparedCommand:

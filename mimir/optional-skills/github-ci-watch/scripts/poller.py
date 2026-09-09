@@ -12,6 +12,8 @@ Environment variables:
     STATE_DIR     - Persistent state dir (set by framework)
     GITHUB_REPOS  - Comma-separated owner/repo list (REQUIRED)
     GITHUB_TOKEN  - Optional; falls back to ``gh auth token``
+    GITHUB_CI_MAX_AGE_DAYS - Failure age backstop (default 7 days)
+    GITHUB_CI_MAX_AGE_DAYS_BY_REPO - JSON owner/repo -> positive days overrides
 
 Output contract:
     stdout: JSONL — {"poller": str, "prompt": str, ...} per event
@@ -23,6 +25,7 @@ Output contract:
 from __future__ import annotations
 
 import json
+import math
 import os
 import subprocess
 import sys
@@ -76,24 +79,39 @@ def _emit(event: dict) -> None:
     print(json.dumps(event), flush=True)
 
 
-def _load_seen() -> set[int]:
-    if SEEN_FILE.exists():
-        try:
-            data = json.loads(SEEN_FILE.read_text(encoding="utf-8"))
-            return set(data.get("ids", []))
-        except (json.JSONDecodeError, OSError):
-            pass
-    return set()
+def _load_seen() -> dict[str, dict]:
+    # The legacy shared IDs cannot establish a repository's settled history.
+    # Missing, legacy, or damaged state must bootstrap silently, not replay it.
+    try:
+        data = json.loads(SEEN_FILE.read_text(encoding="utf-8"))
+    except (ValueError, OSError):
+        return {}
+    if not isinstance(data, dict) or not isinstance(data.get("repos"), dict):
+        return {}
+    states = {}
+    for repo, state in data["repos"].items():
+        if not isinstance(state, dict):
+            continue
+        watermark = state.get("watermark")
+        alerted = state.get("alerted")
+        if (type(watermark) is not int or watermark < 0
+                or not isinstance(alerted, list)
+                or any(type(i) is not int or i <= 0 for i in alerted)):
+            continue
+        states[repo] = {"watermark": watermark, "alerted": set(alerted)}
+    return states
 
 
-def _save_seen(ids: set[int]) -> None:
+def _save_seen(states: dict[str, dict]) -> None:
     STATE_DIR.mkdir(parents=True, exist_ok=True)
-    # Keep only the last 200 seen IDs to prevent unbounded growth.
-    trimmed = sorted(ids)[-200:]
+    repos = {}
+    for repo, state in states.items():
+        state["alerted"] = {i for i in state["alerted"] if i > state["watermark"]}
+        repos[repo] = {"watermark": state["watermark"], "alerted": sorted(state["alerted"])}
     tmp = STATE_DIR / f"seen_run_ids.{os.getpid()}.tmp"
     try:
         with tmp.open("w", encoding="utf-8") as handle:
-            json.dump({"ids": trimmed}, handle)
+            json.dump({"repos": repos}, handle)
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(tmp, SEEN_FILE)
@@ -198,45 +216,81 @@ def _failure_logs(repo: str, run_id: int) -> str:
     return "\n".join(lines) or "Log limitation: no failing job reported; HTTP status unavailable."
 
 
-def _check_repo(repo: str, seen: set[int]) -> list[int]:
-    """Check repo for new CI failures on main. Returns list of newly seen IDs."""
-    runs = _gh(
-        "run", "list",
-        "--repo", repo,
-        "--branch", BRANCH,
-        "--limit", str(RUNS_TO_CHECK),
-        "--json", "databaseId,status,conclusion,name,workflowName,createdAt,url",
-    )
-    if runs is None:
-        return []
+def _check_repo(repo: str, seen: dict[str, dict]) -> None:
+    """Advance this repository's settled prefix without stepping over pending runs."""
+    overrides = json.loads(os.environ.get("GITHUB_CI_MAX_AGE_DAYS_BY_REPO", "{}"))
+    if not isinstance(overrides, dict):
+        raise ValueError("GITHUB_CI_MAX_AGE_DAYS_BY_REPO must be a JSON object")
+    try:
+        age_days = float(overrides.get(repo, os.environ.get("GITHUB_CI_MAX_AGE_DAYS", "7")))
+    except (ValueError, TypeError) as exc:
+        raise ValueError("CI maximum age must be a number") from exc
+    if not math.isfinite(age_days) or age_days <= 0:
+        raise ValueError("CI maximum age must be positive and finite")
+    now = datetime.now(timezone.utc)
+    state = seen.get(repo)
+    watermark = state["watermark"] if state is not None else 0
+    limit = RUNS_TO_CHECK
+    while True:
+        runs = _gh(
+            "run", "list",
+            "--repo", repo,
+            "--branch", BRANCH,
+            "--limit", str(limit),
+            "--json", "databaseId,status,conclusion,name,workflowName,createdAt,url",
+        )
+        if runs is None:
+            return
+        # Keep an older pending run observable even when newer runs fill the
+        # normal window. No cursor can cross a gap hidden by a truncated list.
+        if (state is None or len(runs) < limit
+                or any(run["databaseId"] <= watermark for run in runs)):
+            break
+        limit *= 2
 
-    newly_seen: list[int] = []
-    for run in runs:
+    candidates = [run for run in runs if run.get("databaseId", 0) > watermark]
+    pending = [run["databaseId"] for run in candidates if run.get("status") != "completed"]
+    oldest_pending = min(pending) if pending else None
+    settled = [run["databaseId"] for run in candidates
+               if run.get("status") == "completed"
+               and (oldest_pending is None or run["databaseId"] < oldest_pending)]
+    next_watermark = max([watermark, *settled])
+    if state is None:
+        # Settle existing history, but retain gaps so their eventual failures
+        # still alert (#307). Suppress existing failures above those gaps too.
+        if oldest_pending is not None and not settled:
+            next_watermark = oldest_pending - 1
+        seen[repo] = {
+            "watermark": next_watermark,
+            "alerted": {run["databaseId"] for run in candidates
+                        if run.get("status") == "completed"
+                        and run.get("conclusion") in FAILURE_CONCLUSIONS
+                        and run["databaseId"] > next_watermark},
+        }
+        return
+
+    alerted = state["alerted"]
+    for run in candidates:
         run_id = run.get("databaseId")
-        if run_id is None:
-            continue
 
         status = run.get("status", "")
         conclusion = run.get("conclusion", "")
 
-        # Only mark a run "seen" once it has COMPLETED (chainlink #307). An
-        # in-progress / queued run observed now concludes later — recording
-        # it as seen HERE meant its eventual failure was silently skipped on
-        # the next poll (it was already in ``seen``). A non-terminal run is
-        # left UNSEEN so it's re-checked each poll until it concludes, at
-        # which point a failure still emits.
+        # Recording non-terminal runs as settled here silently loses their
+        # eventual failures (chainlink #307).
         if status != "completed":
             continue
-        # Completed → record for the seen-set (whether new or already-seen,
-        # so the caller's union + cap keeps it).
-        newly_seen.append(run_id)
-
-        if run_id in seen:
+        if run_id in alerted:
             continue  # already reported
 
-        # A successful / skipped / cancelled run is recorded as seen above
-        # (so we don't re-check it) but isn't alerted — only failing ones.
         if conclusion in FAILURE_CONCLUSIONS:
+            try:
+                created_at = datetime.fromisoformat(run.get("createdAt", "").replace("Z", "+00:00"))
+                age = (now - created_at).total_seconds()
+            except (ValueError, TypeError, AttributeError):
+                continue  # An unknown age cannot pass the stale-alert backstop.
+            if age > age_days * 86400:
+                continue
             workflow = run.get("workflowName") or run.get("name") or "unknown"
             created = run.get("createdAt", "")
             url = run.get("url", "")
@@ -264,13 +318,15 @@ def _check_repo(repo: str, seen: set[int]) -> list[int]:
                 ),
             })
             _log(f"Emitted failure: {repo} {workflow} run {run_id}")
+            alerted.add(run_id)
 
-    return newly_seen
+    state["watermark"] = next_watermark
+    state["alerted"] = {i for i in alerted if i > next_watermark}
 
 
 _STATE_GITIGNORE = """\
 # Transient github-ci-watch state — seeded by the github-ci-watch skill
-# (write-if-missing; edit freely). The seen-run-ids dedup set churns every
+# (write-if-missing; edit freely). The per-repository CI cursors change every
 # poll and has no audit value; per-directory .gitignore keeps it out of the
 # home's tracked git history.
 seen_run_ids.json
@@ -280,7 +336,7 @@ seen_run_ids.json
 
 def _seed_state_gitignore() -> None:
     """Seed STATE_DIR/.gitignore (only if absent) so the poller's transient
-    seen-ids set isn't committed to the home repo. Best-effort; never fatal."""
+    CI state isn't committed to the home repo. Best-effort; never fatal."""
     try:
         STATE_DIR.mkdir(parents=True, exist_ok=True)
         gi = STATE_DIR / ".gitignore"
@@ -305,15 +361,12 @@ def main() -> int:
 
     repos = [r.strip() for r in repos_raw.split(",") if r.strip()]
     seen = _load_seen()
-    all_seen_this_run: list[int] = []
 
     for repo in repos:
         _log(f"Checking {repo} {BRANCH} CI...")
-        new_ids = _check_repo(repo, seen)
-        all_seen_this_run.extend(new_ids)
+        _check_repo(repo, seen)
 
-    # Update seen set: union of prior + all IDs observed this run.
-    _save_seen(seen | set(all_seen_this_run))
+    _save_seen(seen)
     return 0
 
 

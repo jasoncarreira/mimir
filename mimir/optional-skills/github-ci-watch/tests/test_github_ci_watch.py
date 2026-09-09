@@ -1,14 +1,9 @@
-"""Tests for github-ci-watch's failure detection + seen-set dedup.
-
-Mocks ``_gh`` (the ``gh run list`` wrapper) to return canned run JSON and
-captures ``_emit`` calls. Asserts only NEW, *completed* failures emit,
-that already-seen runs are skipped, and that every observed run id is
-returned for the seen-set (regardless of whether it emitted).
-"""
+"""Failure detection, repository cursor deduplication, and log enrichment."""
 from __future__ import annotations
 
 import json
 import subprocess
+from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -23,7 +18,7 @@ def _run(run_id, conclusion="success", status="completed", workflow="CI"):
         "status": status,
         "conclusion": conclusion,
         "workflowName": workflow,
-        "createdAt": "2026-05-31T00:00:00Z",
+        "createdAt": datetime.now(timezone.utc).isoformat(),
         "url": f"https://github.com/o/r/actions/runs/{run_id}",
     }
 
@@ -45,7 +40,8 @@ def test_emits_only_new_completed_failures(monkeypatch, captured):
     ]
     monkeypatch.setattr(poller, "_gh", lambda *a: runs)
 
-    newly = poller._check_repo("o/r", seen=set())
+    seen = {"o/r": {"watermark": 0, "alerted": set()}}
+    assert poller._check_repo("o/r", seen) is None
 
     emitted = {(e["event_type"], e["run_id"], e["conclusion"]) for e in captured}
     assert ("ci_failure", 2, "failure") in emitted
@@ -53,17 +49,15 @@ def test_emits_only_new_completed_failures(monkeypatch, captured):
     assert {e["run_id"] for e in captured} == {2, 3}  # not 1 (green) or 4 (running)
     # url is populated (regression: poller used to read the wrong JSON field)
     assert all(e["url"].endswith(str(e["run_id"])) for e in captured)
-    # Only COMPLETED run ids are returned for the seen-set; the in-progress
-    # run (4) is intentionally left UNSEEN so its eventual failure can still
-    # emit on a later poll (chainlink #307).
-    assert set(newly) == {1, 2, 3}
+    assert seen["o/r"]["watermark"] == 3
 
 
 def test_skips_already_seen_failures(monkeypatch, captured):
     monkeypatch.setattr(poller, "_gh", lambda *a: [_run(2, "failure")])
-    newly = poller._check_repo("o/r", seen={2})
+    seen = {"o/r": {"watermark": 2, "alerted": set()}}
+    assert poller._check_repo("o/r", seen) is None
     assert captured == []          # run 2 was already reported
-    assert set(newly) == {2}       # still observed → stays in the seen-set
+    assert seen == {"o/r": {"watermark": 2, "alerted": set()}}
 
 
 def _jobs(conclusion="failure"):
@@ -92,7 +86,7 @@ def test_failure_prompt_reads_bounded_authenticated_log(monkeypatch, captured, t
         return SimpleNamespace(returncode=0, stderr=b"")
 
     monkeypatch.setattr(poller.subprocess, "run", gh_run)
-    poller._check_repo("o/r", seen=set())
+    poller._check_repo("o/r", {"o/r": {"watermark": 0, "alerted": set()}})
     log = tmp_path / "logs/42-101.log"
     assert b"FAILED test_example\n" in log.read_bytes()
     assert b"[truncated]" in log.read_bytes()
@@ -137,7 +131,9 @@ def test_failed_log_fetch_emits_limitation(monkeypatch, captured, tmp_path, fail
                                stderr=b"gh: Forbidden (HTTP 403) private diagnostic")
 
     monkeypatch.setattr(poller.subprocess, "run", failed)
-    assert poller._check_repo("o/r", seen=set()) == [42]
+    seen = {"o/r": {"watermark": 0, "alerted": set()}}
+    assert poller._check_repo("o/r", seen) is None
+    assert seen["o/r"]["watermark"] == 42
     prompt = captured[0]["prompt"]
     assert "Failing job 101 (pytest); step: Run tests" in prompt
     assert "Log limitation:" in prompt and expected in prompt
@@ -232,7 +228,9 @@ def test_manifest_grants_log_fetch_and_read():
 
 def test_gh_error_yields_no_events(monkeypatch, captured):
     monkeypatch.setattr(poller, "_gh", lambda *a: None)  # gh CLI failed
-    assert poller._check_repo("o/r", seen=set()) == []
+    seen = {"o/r": {"watermark": 5, "alerted": {8}}}
+    assert poller._check_repo("o/r", seen) is None
+    assert seen == {"o/r": {"watermark": 5, "alerted": {8}}}
     assert captured == []
 
 
@@ -245,18 +243,19 @@ def test_in_progress_run_failure_emits_on_later_poll(monkeypatch, captured):
     monkeypatch.setattr(
         poller, "_gh", lambda *a: [_run(7, "failure", status="in_progress")]
     )
-    newly1 = poller._check_repo("o/r", seen=set())
+    seen = {"o/r": {"watermark": 0, "alerted": set()}}
+    assert poller._check_repo("o/r", seen) is None
     assert captured == []
-    assert set(newly1) == set()  # in-progress → left unseen for re-check
+    assert seen == {"o/r": {"watermark": 0, "alerted": set()}}
 
     # Poll 2: run 7 has now completed as a failure. Because it was never
     # recorded as seen, the failure emits.
     monkeypatch.setattr(
         poller, "_gh", lambda *a: [_run(7, "failure", status="completed")]
     )
-    newly2 = poller._check_repo("o/r", seen=set(newly1))
+    assert poller._check_repo("o/r", seen) is None
     assert {(e["event_type"], e["run_id"]) for e in captured} == {("ci_failure", 7)}
-    assert set(newly2) == {7}
+    assert seen["o/r"]["watermark"] == 7
 
 
 def test_seeds_state_gitignore(tmp_path, monkeypatch):
@@ -276,7 +275,7 @@ def test_save_seen_atomically_preserves_previous_state_on_interrupted_replace(
 ):
     """Part B: a failed write cannot expose a truncated final seen-set."""
     seen_file = tmp_path / "seen_run_ids.json"
-    seen_file.write_text(json.dumps({"ids": [41]}), encoding="utf-8")
+    seen_file.write_text(json.dumps({"repos": {"o/r": {"watermark": 41, "alerted": []}}}), encoding="utf-8")
     monkeypatch.setattr(poller, "STATE_DIR", tmp_path)
     monkeypatch.setattr(poller, "SEEN_FILE", seen_file)
 
@@ -285,7 +284,7 @@ def test_save_seen_atomically_preserves_previous_state_on_interrupted_replace(
 
     monkeypatch.setattr(poller.os, "replace", fail_replace)
     with pytest.raises(OSError, match="simulated interruption"):
-        poller._save_seen({41, 42})
+        poller._save_seen({"o/r": {"watermark": 42, "alerted": set()}})
 
-    assert poller._load_seen() == {41}
+    assert poller._load_seen() == {"o/r": {"watermark": 41, "alerted": set()}}
     assert not list(tmp_path.glob("*.tmp"))

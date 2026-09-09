@@ -19,7 +19,7 @@ from typing import Any, Coroutine
 from collections.abc import Iterable
 
 from .confinement import prepare_command, ConfinementUnavailable
-from .execution_scope import UNCONFINED_WARNING
+from .execution_scope import ScopeApproval, UNCONFINED_WARNING
 
 
 STREAM_LIMIT_BYTES = 65_536
@@ -156,7 +156,7 @@ class _Worker:
 @dataclass(slots=True)
 class _Session:
     directory: Path | None = None
-    approved_paths: tuple[Path, ...] = ()
+    approved_paths: tuple[ScopeApproval, ...] = ()
     allow_unconfined: bool = False
     execution_mode: str = "confined"
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
@@ -182,7 +182,7 @@ class PythonKernelManager:
         cwd: str | os.PathLike[str],
         code: str,
         timeout: int | float = 60,
-        *, approved_paths: Iterable[Path] = (),
+        *, approved_paths: Iterable[ScopeApproval] = (),
         allow_unconfined: bool = False,
     ) -> dict[str, Any]:
         try:
@@ -205,7 +205,7 @@ class PythonKernelManager:
         cwd: str | os.PathLike[str],
         code: str,
         timeout: int | float = 60,
-        *, approved_paths: Iterable[Path] = (),
+        *, approved_paths: Iterable[ScopeApproval] = (),
         allow_unconfined: bool = False,
     ) -> dict[str, Any]:
         if self._closed:
@@ -225,7 +225,7 @@ class PythonKernelManager:
         stderr_path: Path | None = None
         kernel_state = "fresh"
         try:
-            policy = tuple(sorted(Path(p) for p in approved_paths))
+            policy = tuple(sorted(approved_paths))
             prepared = prepare_command((sys.executable,), cwd=Path(cwd),
                                        approved_paths=policy,
                                        allow_unconfined=allow_unconfined)

@@ -232,7 +232,7 @@ do not rely on a symlink escape as isolation.
 
 Native Mimir tools operate on the daemon host. Mimir Hands operates with the local client's user authority. `hands_read` and `hands_edit` are confined to the session's bound `cwd`: relative paths are normalized against it, and absolute paths outside it (including sibling directories) are refused. This is lexical path confinement only. The daemon cannot resolve symlinks on the client's filesystem; a symlink inside the cwd pointing outside it is still followed. Admins should scope a directory whose content and symlinks they trust. Successful cwd reads retain their source and originating-channel labels but no longer add untrusted active ingest. They do not clear taint from URLs, forge results, messages, or other untrusted sources.
 
-`hands_shell` and `hands_python` use OS-level filesystem confinement by default. It is mandatory when the backend is available. Only an unavailable backend permits the separately approved fallback described below. Their confined child processes start in the session cwd and can access its descendants, exact operator-approved extra paths, and narrowly required runtime paths. The tools take command/code strings rather than paths, so argument checks alone cannot enforce this boundary. Use `hands_request_scope` to request additional paths before execution. Their output remains untrusted active ingest, so a shell result can still cause the next granted shell call to prompt. Operator consent does not declassify that output. Mimir tolerates advertised ACP client `fs` and `terminal` capabilities but never calls them. `additionalDirectories` and arbitrary provider profiles are rejected.
+`hands_shell` and `hands_python` use OS-level filesystem confinement by default. It is mandatory when the backend is available. Only an unavailable backend permits the separately approved fallback described below. Their confined child processes start in the session cwd and can access its descendants, operator-approved extra files or directories and their descendants, and narrowly required runtime paths. The tools take command/code strings rather than paths, so argument checks alone cannot enforce this boundary. Use `hands_request_scope` to request additional paths before execution. Their output remains untrusted active ingest, so a shell result can still cause the next granted shell call to prompt. Operator consent does not declassify that output. Mimir tolerates advertised ACP client `fs` and `terminal` capabilities but never calls them. `additionalDirectories` and arbitrary provider profiles are rejected.
 
 Python keeps one lazy subprocess and in-memory namespace per ACP session. Session load restores the daemon transcript but retires the old worker first, so Python state is never stored in a session or journal and the next call is fresh. Workers retire on load, hosted disconnect, cancellation, daemon-generation replacement, proxy exit, `SIGTERM`, `SIGINT`, `SIGHUP`, or 1,800 seconds of idle time. Shells and Python workers run in owned process groups that are killed and reaped during cleanup. Variables, functions, imports, and loaded data persist only while that worker remains live.
 
@@ -246,16 +246,11 @@ For SSH profiles, additionally confirm the remote `mimir-agent` version is 0.9.0
 ### Hands execution scope
 
 Confined Hands shell and Python execution uses the session's approved paths,
-initially its cwd and descendants. **Additional directory approvals intentionally
-have backend-specific meanings**, even when the permission prompt shows the same
-path string. On macOS Seatbelt, additional approved file or directory paths are
-literal: approving `/data` approves the directory entry, not `/data/file.txt` or
-other descendants. On Linux AppArmor, approving `/data` grants that directory and
-all its descendants, never its parent or similarly named siblings. This preserves
-the shipped Seatbelt scope while adopting the directory-tree semantics specified
-for AppArmor in #1597; it is not an accidental implementation difference. Aligning
-the backends, especially widening macOS approvals to include descendants, requires
-a separate security decision and is outside this Linux-backend change.
+initially its cwd and descendants. On both macOS Seatbelt and Linux AppArmor,
+additional file approvals cover the file alone; directory approvals cover the
+directory and everything beneath it, never its parent or similarly named siblings.
+Approval scope is fixed before asking the operator and does not widen if an
+approved file is later replaced with a directory.
 AppArmor's path syntax deliberately supports only ASCII letters, digits,
 underscores, dots, slashes, plus signs and hyphens.
 macOS Seatbelt (`sandbox-exec`, deprecated by Apple) remains the only verified
@@ -323,7 +318,8 @@ outside the approved set. `path=""` queries that set without prompting. The wire
 method is `request_scope` with exactly `{path: string}`. Its result is exactly
 `{approved: bool, paths: list[string], message: string}`. Non-empty requests go
 through the provider to the editor's `session/request_permission` channel. Only
-operator approval adds the exact path, never its parent or a glob. Scope prompts
+operator approval adds the file alone or the directory and everything beneath it,
+never its parent or a glob. Scope prompts
 and scope audit events contain the path and fixed status, not commands or file
 contents. Scope outcomes use the existing `acp_permission_outcome` event name,
 written as bounded JSON records to the local proxy's stderr. These records do

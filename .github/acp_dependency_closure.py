@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Mapping
 
 POLICY = {
-    "mimir.acp.proxy": {"mimir.acp.profiles", "mimir.acp.credentials", "mimir.acp.transport", "mimir.acp.hosted", "mimir.acp.diagnostics"},
+    "mimir.acp.proxy": {"mimir.acp.profiles", "mimir.acp.credentials", "mimir.acp.transport", "mimir.acp.hosted", "mimir.acp.diagnostics", "mimir.acp.execution_scope"},
     "mimir.acp.ssh": {"mimir.acp.proxy", "mimir.acp.profiles", "mimir.acp.credentials", "mimir.acp.transport"},
     "mimir.acp.relay": {"mimir.acp.transport"},
     "mimir.acp.__main__": {"mimir.acp.bootstrap"},
@@ -15,7 +15,7 @@ POLICY = {
     "mimir.acp.hands_contract": set(),
     "mimir.acp.hosted": {"mimir.acp.hands_contract", "mimir.acp.python_kernel", "mimir.acp.confinement", "mimir.acp.execution_scope", "mimir.acp.audit"},
     "mimir.acp.python_kernel": {"mimir.acp.confinement", "mimir.acp.execution_scope"},
-    "mimir.acp.confinement": set(),
+    "mimir.acp.confinement": {"mimir.acp.execution_scope"},
     "mimir.acp.execution_scope": {"mimir.client_file_resources"},
     "mimir.acp.audit": set(),
     "mimir.client_file_resources": set(),
