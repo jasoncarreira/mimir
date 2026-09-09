@@ -246,10 +246,17 @@ For SSH profiles, additionally confirm the remote `mimir-agent` version is 0.9.0
 ### Hands execution scope
 
 Confined Hands shell and Python execution uses the session's approved paths,
-initially its cwd and descendants. On macOS, additional approved file or directory
-paths are literal: approving a directory does not approve its children. AppArmor
-grants an approved directory and its descendants, never its parent or similarly
-named siblings; its path syntax deliberately supports only ASCII letters, digits,
+initially its cwd and descendants. **Additional directory approvals intentionally
+have backend-specific meanings**, even when the permission prompt shows the same
+path string. On macOS Seatbelt, additional approved file or directory paths are
+literal: approving `/data` approves the directory entry, not `/data/file.txt` or
+other descendants. On Linux AppArmor, approving `/data` grants that directory and
+all its descendants, never its parent or similarly named siblings. This preserves
+the shipped Seatbelt scope while adopting the directory-tree semantics specified
+for AppArmor in #1597; it is not an accidental implementation difference. Aligning
+the backends, especially widening macOS approvals to include descendants, requires
+a separate security decision and is outside this Linux-backend change.
+AppArmor's path syntax deliberately supports only ASCII letters, digits,
 underscores, dots, slashes, plus signs and hyphens.
 macOS Seatbelt (`sandbox-exec`, deprecated by Apple) remains the only verified
 backend. #1597 adds Linux AppArmor, not real-hardware verification. The local ACP

@@ -84,6 +84,30 @@ def test_shell_scope_exact_file_and_symlink_escape(fixture_scope):
     assert not (outside / "new").exists()
 
 
+def test_seatbelt_approved_directory_policy_excludes_descendants(monkeypatch, tmp_path):
+    """Pin the shipped literal approval independently of macOS availability."""
+    cwd = (tmp_path / "session").resolve()
+    cwd.mkdir()
+    approved = (tmp_path / "approved").resolve()
+    approved.mkdir()
+    (approved / "child.txt").write_text("fixture")
+    monkeypatch.setattr(confinement.SeatbeltBackend, "executable", Path(sys.executable))
+    monkeypatch.setattr(confinement, "_runtime_reads", lambda: (set(), set()))
+    prepared = confinement.SeatbeltBackend().prepare(
+        ["/bin/true"], cwd=cwd, approved_paths=[approved],
+    )
+    profile = prepared.argv[2]
+    # Exact rule equality catches replacing literal with subpath, an additional
+    # child grant, or widening the approval to its parent. No helper under test
+    # constructs this expectation.
+    filters = sorted((f'(subpath {json.dumps(str(cwd))})',
+                      f'(literal {json.dumps(str(approved))})'))
+    writable = [line for line in profile.splitlines()
+                if line.startswith("(allow file-read* file-write*")]
+    assert writable == ["(allow file-read* file-write* " + " ".join(filters) + ")"]
+    assert f'(subpath {json.dumps(str(approved))})' not in profile
+
+
 @MACOS
 def test_directory_addition_is_literal_not_subtree(fixture_scope):
     cwd, outside = fixture_scope
@@ -258,6 +282,24 @@ def test_apparmor_refuses_path_syntax(suffix, source):
 def test_apparmor_requires_frozen_nonroot_path(path):
     with pytest.raises(confinement.ConfinementUnavailable):
         confinement.apparmor_profile(Path(path))
+
+
+def test_apparmor_approved_directory_policy_includes_descendants():
+    """Pin tree approval in synthesized policy, not live kernel enforcement."""
+    baseline = confinement.apparmor_profile(Path("/session"))
+    profile = confinement.apparmor_profile(
+        Path("/session"), approved_paths=[Path("/outside/approved")],
+    )
+    # Ignore only the content-addressed profile header; compare every rule so
+    # dropping descendants or granting a parent/sibling cannot pass unnoticed.
+    baseline_rules = set(baseline.splitlines()[1:])
+    rules = set(profile.splitlines()[1:])
+    assert baseline_rules <= rules
+    assert rules - baseline_rules == {
+        "  /outside/approved rwk,",
+        "  /outside/approved/ rw,",
+        "  /outside/approved/** rwk,",
+    }
 
 
 def test_apparmor_pure_exact_scope(monkeypatch):
