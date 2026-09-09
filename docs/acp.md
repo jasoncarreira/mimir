@@ -274,6 +274,17 @@ spawned. Rejection is final for the session. Cancellation, timeout, malformed
 responses, stale replies, and a missing approval-capable client also cannot
 authorize execution. Risk prompts are bounded; the agent must not retry a refusal.
 
+Disconnecting any hosted MCP connection revokes the risk grant for its shared
+session and retires that session's Python kernel. Other connections to the same
+session do not keep the grant. The session's one-risk-request limit and final
+request history survive this connection reset. Reconnecting therefore cannot
+request risk approval again, even if the operator previously accepted it.
+Execution stays blocked with no active risk grant; this does not mean the
+operator rejected the earlier request. Start a new ACP session, or load a session
+as a new provider-session incarnation, to request fresh operator approval and
+start a fresh Python namespace. With an available confinement backend, execution
+can continue confined after connection reset without risk approval.
+
 Scope-query results report unconfined mode in their `message`, and shell/Python
 execution results report it in `stderr`. The five-tool wire contract and result
 schemas do not change. An approved path list is not a security boundary in this

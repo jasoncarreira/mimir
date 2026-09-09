@@ -101,7 +101,7 @@ async def test_pending_risk_prompt_bounded_and_cancelled_reply_cannot_install(tm
     task = asyncio.create_task(provider._shell(session, "true"))
     try:
         await entered.wait()
-        with pytest.raises(HostedMcpError, match="pending or final"):
+        with pytest.raises(HostedMcpError, match="pending"):
             await provider._shell(session, "true")
         task.cancel()
         with pytest.raises(HostedMcpError, match="expired"):

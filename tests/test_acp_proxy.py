@@ -10,6 +10,7 @@ import tempfile
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
+from unittest.mock import AsyncMock
 
 import pytest
 import yaml
@@ -43,6 +44,23 @@ def frame(value: object) -> bytes:
 
 def messages(writer: Writer) -> list[dict[str, Any]]:
     return [json.loads(line) for line in bytes(writer.data).splitlines()]
+
+
+@pytest.fixture(params=["confined", "unavailable"])
+def lifecycle_backend(request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch) -> str:
+    from mimir.acp import confinement
+
+    if request.param == "unavailable":
+        # Force the portable risk path even on the macOS development host.
+        def missing() -> object:
+            raise confinement.BackendUnavailable("test lifecycle backend unavailable")
+        monkeypatch.setattr(confinement, "_backend", missing)
+    else:
+        try:
+            confinement._backend().prepare(("/bin/true",), cwd=Path.cwd().resolve())
+        except confinement.BackendUnavailable:
+            pytest.skip("real confinement backend unavailable")
+    return request.param
 
 
 async def hosted_router(
@@ -123,8 +141,12 @@ async def call_hosted_python(
     async with asyncio.timeout(5):
         while True:
             for message in messages(daemon):
-                if message.get("id") == request_id and "result" in message:
-                    return message["result"]["structuredContent"]
+                if message.get("id") == request_id:
+                    if "error" in message:
+                        error = message["error"]
+                        raise HostedMcpError(error["code"], error["message"], error.get("data"))
+                    if "result" in message:
+                        return message["result"]["structuredContent"]
             await asyncio.sleep(0.01)
 
 
@@ -771,9 +793,15 @@ async def test_plain_client_without_mcp_capability_can_call_hosted_hands(tmp_pat
 
 @pytest.mark.asyncio
 async def test_session_new_first_python_call_has_fresh_empty_namespace(
-    tmp_path: Path,
+    tmp_path: Path, lifecycle_backend: str,
 ) -> None:
-    router, _, daemon, _, connection_id = await hosted_router(tmp_path)
+    from mimir.acp.execution_scope import UNCONFINED_WARNING
+
+    router, _, daemon, _, connection_id = await hosted_router(
+        tmp_path, approve_unconfined_for_lifecycle=False,
+    )
+    acceptance = AsyncMock(return_value=True)
+    router._provider._request_unconfined_permission = acceptance
     try:
         result = await call_hosted_python(
             router,
@@ -785,12 +813,13 @@ async def test_session_new_first_python_call_has_fresh_empty_namespace(
         assert result == {
             "ok": True,
             "stdout": "",
-            "stderr": "",
+            "stderr": UNCONFINED_WARNING + "\n" if lifecycle_backend == "unavailable" else "",
             "value": "None",
             "exception": "",
             "timedOut": False,
             "kernel": "fresh",
         }
+        assert acceptance.await_count == (1 if lifecycle_backend == "unavailable" else 0)
     finally:
         await router.close()
 
@@ -1005,11 +1034,26 @@ async def test_load_reaps_kernel_before_response_and_next_python_is_fresh(
 
 @pytest.mark.asyncio
 async def test_kernel_retires_at_each_required_lifecycle_boundary(
-    tmp_path: Path,
+    tmp_path: Path, lifecycle_backend: str,
 ) -> None:
-    router, _, daemon, server_id, connection_id = await hosted_router(tmp_path)
+    from mimir.acp.execution_scope import UNCONFINED_WARNING
+
+    router, _, daemon, server_id, connection_id = await hosted_router(
+        tmp_path, approve_unconfined_for_lifecycle=False,
+    )
+    acceptance = AsyncMock(return_value=True)
+    router._provider._request_unconfined_permission = acceptance
+    active_session_id = "session"
     try:
-        await call_hosted_python(router, daemon, connection_id, 110, "value = 1")
+        initial = await call_hosted_python(router, daemon, connection_id, 110, "value = 1")
+        hosted_session = next(iter(router._provider._sessions.values()))
+        if lifecycle_backend == "unavailable":
+            assert acceptance.await_count == 1
+            assert hosted_session.scope.unconfined_approved is True
+            assert initial["stderr"] == UNCONFINED_WARNING + "\n"
+        else:
+            acceptance.assert_not_awaited()
+            assert initial["stderr"] == ""
         second_connection = await connect_hosted(router, daemon, server_id, 111)
         await router.route_daemon({
             "jsonrpc": "2.0", "id": 113, "method": "mcp/message",
@@ -1053,9 +1097,40 @@ async def test_kernel_retires_at_each_required_lifecycle_boundary(
             for item in messages(daemon)
         )
         assert not (tmp_path / "queued-ran").exists()
-        fresh_after_disconnect = await call_hosted_python(
-            router, daemon, second_connection, 114, "globals().get('value')"
-        )
+        if lifecycle_backend == "unavailable":
+            assert hosted_session.scope.unconfined_approved is False
+            assert hosted_session.scope.risk_requested is True
+            with pytest.raises(HostedMcpError, match="final and no active risk grant remains"):
+                await call_hosted_python(
+                    router, daemon, second_connection, 114, "globals().get('value')"
+                )
+            # This was an accepted grant that disconnect revoked, not a user
+            # rejection. Reconnecting cannot open a second risk prompt.
+            assert acceptance.await_count == 1
+            assert router._provider._python_kernels._processes == {}
+            await router.route_client({
+                "jsonrpc": "2.0", "id": "new-after-disconnect", "method": "session/new",
+                "params": {"cwd": str(tmp_path)},
+            })
+            new_server = messages(daemon)[-1]["params"]["mcpServers"][0]["serverId"]
+            second_connection = await connect_hosted(router, daemon, new_server, 121)
+            active_session_id = "replacement-session"
+            await router.route_daemon({
+                "jsonrpc": "2.0", "id": "new-after-disconnect",
+                "result": {"sessionId": active_session_id},
+            })
+            assert acceptance.await_count == 1
+            fresh_after_disconnect = await call_hosted_python(
+                router, daemon, second_connection, 123, "globals().get('value')"
+            )
+            assert acceptance.await_count == 2
+            assert fresh_after_disconnect["stderr"] == UNCONFINED_WARNING + "\n"
+        else:
+            fresh_after_disconnect = await call_hosted_python(
+                router, daemon, second_connection, 114, "globals().get('value')"
+            )
+            acceptance.assert_not_awaited()
+            assert fresh_after_disconnect["stderr"] == ""
         assert fresh_after_disconnect["kernel"] == "fresh"
         assert fresh_after_disconnect["value"] == "None"
 
@@ -1090,7 +1165,7 @@ async def test_kernel_retires_at_each_required_lifecycle_boundary(
         assert fresh["kernel"] == "fresh"
         await router.route_client({
             "jsonrpc": "2.0", "method": "session/cancel",
-            "params": {"sessionId": "session"},
+            "params": {"sessionId": active_session_id},
         })
         assert router._provider._python_kernels._processes == {}
     finally:

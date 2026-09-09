@@ -371,3 +371,40 @@ def test_docs_bound_unconfined_fallback_to_explicit_session_risk_approval() -> N
         assert value in text
     assert "always confined" not in text
     assert "There is no unconfined fallback" not in text
+
+
+def test_experimental_warning_matches_shipped_execution_confinement_contract() -> None:
+    opening = " ".join(section("## Experimental status", "## Architecture and daemon").split())
+    for value in (
+        "Execution confinement has one backend, and it is macOS-only.",
+        "run under OS-level filesystem confinement by default",
+        "mandatory wherever a backend is available",
+        "a confined child cannot follow a symlink out of the approved paths",
+        "macOS Seatbelt (`sandbox-exec`)",
+        "On a platform with no backend the tools run only after the operator explicitly accepts the unconfined risk",
+        "cwd and path-scope grants do not protect files",
+        "Chainlink #1597 tracks a Linux backend",
+    ):
+        assert value in opening
+    assert "not shipped" not in opening.lower()
+    assert "execution is unconfined" not in opening.lower()
+    # Keep the separate direct-file boundary visible instead of implying that
+    # OS execution confinement also hardens the lexical read/edit tools.
+    assert "File confinement is lexical, not a sandbox." in opening
+    assert "follow in-cwd symlinks even when their targets are outside it" in opening
+
+
+def test_docs_distinguish_revoked_risk_grant_from_operator_rejection() -> None:
+    risk = " ".join(section("#### Unavailable-backend risk approval", "#### Confined path requests").split())
+    for value in (
+        "Disconnecting any hosted MCP connection revokes the risk grant for its shared session",
+        "retires that session's Python kernel",
+        "Other connections to the same session do not keep the grant",
+        "one-risk-request limit and final request history survive this connection reset",
+        "Reconnecting therefore cannot request risk approval again, even if the operator previously accepted it",
+        "no active risk grant; this does not mean the operator rejected the earlier request",
+        "Start a new ACP session, or load a session as a new provider-session incarnation",
+        "request fresh operator approval and start a fresh Python namespace",
+        "With an available confinement backend, execution can continue confined after connection reset without risk approval",
+    ):
+        assert value in risk

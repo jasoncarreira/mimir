@@ -543,7 +543,12 @@ class HostedHandsProvider:
         if scope.risk_pending or scope.risk_requested:
             await safe_log_event("acp_permission_outcome", wrapper_name="hands_unconfined_execution",
                                  path="<unconfined>", outcome="denied", resource_resolvable=False)
-            raise HostedMcpError(-32000, "Unconfined execution not approved; risk request is pending or final for this session")
+            if scope.risk_pending:
+                message = "Unconfined execution is blocked while this session's risk approval is pending"
+            else:
+                message = ("Unconfined execution is blocked: this session's risk request is final "
+                           "and no active risk grant remains. Start or load a new session to request approval.")
+            raise HostedMcpError(-32000, message)
         if self._request_unconfined_permission is None:
             await safe_log_event("acp_permission_outcome", wrapper_name="hands_unconfined_execution",
                                  path="<unconfined>", outcome="denied", resource_resolvable=False)
