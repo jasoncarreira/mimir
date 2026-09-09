@@ -23,9 +23,10 @@ operator-visible limits are:
 - **Python state is temporary.** Closing the client or restarting its proxy loses
   the REPL namespace; loading the daemon transcript does not recover it. Save
   needed results explicitly and rerun initialization after reconnecting.
-  Chainlink #1594 tracks project-path-keyed reuse within one live proxy; the
-  current implementation is session-keyed, and that planned reuse is not
-  persistence across client closure or proxy restart.
+  Reuse is keyed by resolved project path and survives across sessions within
+  one live proxy, with one session owner at a time until release. The proxy
+  holds at most 8 kernels; this is not persistence across client closure or
+  proxy restart.
 - **ACP is admin-only.** Its authenticated admin identity skips non-admin
   protected-read filtering. Validate a read-policy change using a non-admin
   identity on a non-ACP surface, not through an ACP client.

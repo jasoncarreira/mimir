@@ -245,6 +245,46 @@ async def test_timeout_and_crash_retain_streams_exactly(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_crash_result_survives_killpg_permission_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager = PythonKernelManager()
+    denied_groups: list[int] = []
+
+    def denied(pgid: int, sig: int) -> None:
+        denied_groups.append(pgid)
+        raise PermissionError(1, "Operation not permitted")
+
+    try:
+        await manager.execute("crash", tmp_path, "marker = 42")
+        pid = manager.kernels()[0]["pid"]
+        # The worker exits itself; deny only cleanup's group signal, without
+        # leaving a live worker that the patched killpg cannot terminate.
+        with monkeypatch.context() as patch:
+            patch.setattr(kernel.os, "killpg", denied)
+            result = await manager.execute(
+                "crash", tmp_path,
+                "import os\nos.write(1, b'before-crash')\n"
+                "os.write(2, b'err-crash')\nos._exit(31)",
+            )
+        assert denied_groups == [pid]
+        assert result == {
+            "ok": False,
+            "stdout": "before-crash",
+            "stderr": "err-crash",
+            "value": "",
+            "exception": "kernel process exited with code 31; namespace state lost",
+            "timedOut": False,
+            "kernel": "crashed",
+        }
+        fresh = await manager.execute("crash", tmp_path, "globals().get('marker')")
+        assert fresh["kernel"] == "fresh"
+        assert fresh["value"] == "None"
+    finally:
+        await manager.close()
+
+
+@pytest.mark.asyncio
 async def test_live_control_eof_is_killed_without_waiting_for_worker(
     tmp_path: Path,
 ) -> None:

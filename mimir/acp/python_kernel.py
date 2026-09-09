@@ -596,7 +596,9 @@ class PythonKernelManager:
         worker_state.channel.close()
         try:
             os.killpg(worker_state.pgid, 9)
-        except ProcessLookupError:
+        except (ProcessLookupError, PermissionError):
+            # A departed group or a group no longer signalable by this uid
+            # must not throw through kernel cleanup and mask the crash result.
             pass
         reaper = worker_state.reaper
         if reaper is None:
