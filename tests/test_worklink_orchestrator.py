@@ -4021,6 +4021,59 @@ def test_factory_initial_local_launch_provisions_worker_sandbox_permissions(
     assert stat.S_IMODE(sandbox_root.stat().st_mode) == 0o2770
 
 
+@pytest.mark.parametrize("coding", ["0", "1"])
+def test_factory_permission_failure_prevents_launch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, coding: str,
+) -> None:
+    import mimir.worklink.orchestrator as orchestrator
+
+    monkeypatch.setenv("MIMIR_CODING_ENABLED", coding)
+
+    def denied(*args):
+        raise PermissionError("group change denied")
+
+    monkeypatch.setattr(orchestrator.os, "chown", denied)
+    result, launched, _, _ = _run_factory_preflight_case(
+        tmp_path, monkeypatch, credentials={"GITHUB_TOKEN": "github-token"},
+        outcome="needs-human",
+    )
+    assert result.status == "failed"
+    assert not launched
+    assert "cannot share the factory sandbox directory" in result.reason
+    assert "no agent-user fallback" in result.reason
+
+
+def test_factory_missing_worker_identity_is_actionable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import mimir.worklink.orchestrator as orchestrator
+
+    def missing():
+        raise KeyError("mimir account missing")
+
+    monkeypatch.setattr(orchestrator, "get_identities", missing)
+    with pytest.raises(WorklinkError, match="configured worker identities"):
+        orchestrator._prepare_factory_sandbox_permissions(tmp_path, worker_uid_drop=True)
+
+
+def test_factory_non_worker_permissions_are_untouched(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import mimir.worklink.orchestrator as orchestrator
+
+    def unexpected(*args):
+        raise AssertionError("non-worker path must not resolve identities or change ownership")
+
+    tmp_path.chmod(0o700)
+    before = tmp_path.stat()
+    monkeypatch.setattr(orchestrator, "get_identities", unexpected)
+    monkeypatch.setattr(orchestrator.os, "chown", unexpected)
+    monkeypatch.setattr(orchestrator.os, "chmod", unexpected)
+    orchestrator._prepare_factory_sandbox_permissions(tmp_path, worker_uid_drop=False)
+    after = tmp_path.stat()
+    assert (after.st_mode, after.st_gid) == (before.st_mode, before.st_gid)
+
+
 def test_post_merge_factory_failure_pushes_branch_before_record_becomes_failed(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

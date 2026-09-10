@@ -1959,10 +1959,10 @@ class WorklinkRunner:
                 transcript=None,
             )
             _create_factory_sandbox(factory_record, lease)
-            if isinstance(compute, LocalSubprocessComputeBackend):
-                sandbox_root = lease.path / ".factory-sandboxes"
-                os.chown(sandbox_root, -1, get_identities().worklink_gid)
-                os.chmod(sandbox_root, 0o2770)
+            _prepare_factory_sandbox_permissions(
+                lease.path / ".factory-sandboxes",
+                worker_uid_drop=isinstance(compute, LocalSubprocessComputeBackend),
+            )
             handle = await compute.launch(spec)
             factory_record = replace(factory_record, handle=handle)
             try:
@@ -3578,6 +3578,28 @@ def _template_path(home: Path) -> Path:
     if custom.exists():
         return custom
     return Path(__file__).resolve().parents[1] / "prompt_templates" / "worklink-order.md"
+
+
+def _prepare_factory_sandbox_permissions(path: Path, *, worker_uid_drop: bool) -> None:
+    """Share local factory sandboxes with the mandatory contained worker.
+
+    Unlike leaf builds, local factory workloads always drop uid, even when
+    coding_enabled() is false. Missing deployment identities or group-change
+    permission must fail before launch, never select an agent-user fallback.
+    Non-local compute owns its permission contract; leave its sandbox untouched.
+    """
+    if not worker_uid_drop:
+        return
+    try:
+        os.chown(path, -1, get_identities().worklink_gid)
+        os.chmod(path, 0o2770)
+    except Exception as exc:
+        raise WorklinkError(
+            "cannot share the factory sandbox directory with the worklink group; "
+            "local factory execution requires configured worker identities and "
+            "group-change permission; no agent-user fallback "
+            f"({type(exc).__name__}: {exc})"
+        ) from exc
 
 
 def _make_executor_report_dir(issue: int, attempt: int, *, worker_uid_drop: bool) -> Path:
