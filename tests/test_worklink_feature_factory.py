@@ -1015,7 +1015,7 @@ def test_work_spec_carries_the_publishing_identity_into_the_launch_spec(
 
 @pytest.mark.asyncio
 async def test_launch_child_environment_carries_the_publishing_identity(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, synthetic_worklink_identities
 ) -> None:
     """The explicit publishing identity crosses the contained worker boundary."""
     _own_opencode_resolution(tmp_path, monkeypatch)

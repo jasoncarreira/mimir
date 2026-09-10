@@ -71,6 +71,7 @@ def synthetic_worklink_identities(monkeypatch):
         "mimir.project_tests",
         "mimir.worklink.checkout",
         "mimir.worklink.worker_exec",
+        "mimir.worklink.identities",
     ):
         module = __import__(module_name, fromlist=["get_identities"])
         monkeypatch.setattr(module, "get_identities", lambda: identities)

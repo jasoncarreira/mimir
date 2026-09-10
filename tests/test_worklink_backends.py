@@ -1033,7 +1033,7 @@ def test_blocked_reason_from_output_requires_final_line_marker() -> None:
 
 @pytest.mark.asyncio
 async def test_feature_factory_launch_remains_shell_free_argv(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, synthetic_worklink_identities
 ) -> None:
     calls: list[dict[str, Any]] = []
 
