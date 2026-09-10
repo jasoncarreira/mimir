@@ -1037,11 +1037,15 @@ async def test_feature_factory_launch_remains_shell_free_argv(
 ) -> None:
     calls: list[dict[str, Any]] = []
 
-    async def fake_exec(*args: str, **kwargs: Any) -> FakeProcess:
-        calls.append({"args": args, "kwargs": kwargs})
-        return FakeProcess(returncode=0)
+    from mimir.contained_execution import CollectedExecutionResult
+    from types import SimpleNamespace
 
-    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+    async def fake_exec(args, capability, env, projections, **kwargs):
+        calls.append({"args": args, "kwargs": kwargs, "checkout": capability.path})
+        capability._contained_started(SimpleNamespace(pid=None))
+        return CollectedExecutionResult(0, b"", b"", False, False, 0, 0)
+
+    monkeypatch.setattr("mimir.worklink.compute.execute_contained", fake_exec)
     monkeypatch.setattr("mimir.worklink.compute._local_child_env", dict)
     monkeypatch.delenv("MIMIR_FACTORY_MAX_RETRIES", raising=False)
     monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
@@ -1075,9 +1079,11 @@ async def test_feature_factory_launch_remains_shell_free_argv(
         branch="issue/1606-a1",
         test_command="uv run pytest -q",
     )
-    compute = LocalSubprocessComputeBackend()
+    # Execution is mocked: do not resolve production OS accounts for this argv test.
+    compute = LocalSubprocessComputeBackend(_worker_client=object())
 
     handle = await compute.launch(spec)
+    await compute.wait(handle, 30)
     await compute.cleanup(handle)
 
     assert calls[0]["args"] == (
@@ -1095,7 +1101,7 @@ async def test_feature_factory_launch_remains_shell_free_argv(
         " --autonomous --max-retries 5 chainlink-1606",
     )
     assert "shell" not in calls[0]["kwargs"]
-    assert calls[0]["kwargs"]["cwd"] == str(tmp_path)
+    assert calls[0]["checkout"] == tmp_path
 
 
 @pytest.mark.asyncio

@@ -441,6 +441,8 @@ class LocalSubprocessComputeBackend:
         if not command:
             raise ComputeLaunchError("local_subprocess spec.local_argv must not be empty")
         from .checkout import coding_enabled
+        if spec.backend == "feature_factory":
+            return await self._launch_contained(spec, command)
         if coding_enabled() and spec.backend == "opencode":
             return await self._launch_enabled(spec, command)
         # chainlink #830: autonomous local_subprocess builds an allowlisted env
@@ -531,11 +533,20 @@ class LocalSubprocessComputeBackend:
         return handle
 
     async def _launch_enabled(self, spec: WorkSpec, command: tuple[str, ...]) -> LaunchHandle:
+        command = _fd_anchored_opencode_argv(command, spec.local_checkout)
+        return await self._launch_contained(spec, command)
+
+    async def _launch_contained(self, spec: WorkSpec, command: tuple[str, ...]) -> LaunchHandle:
         from .worker_client import WorkerClient, WorkerProjection
 
-        command = _fd_anchored_opencode_argv(command, spec.local_checkout)
         authorization = self._authorized_checkout
-        if authorization is not None and all(
+        factory = spec.backend == "feature_factory"
+        if factory:
+            capability = _PathCheckoutCapability(spec.local_checkout)
+            client = self._worker_client or WorkerClient.for_factory_checkout(
+                spec.local_checkout, issue_id=spec.issue_id, attempt=spec.attempt
+            )
+        elif authorization is not None and all(
             hasattr(authorization, member) for member in ("verify", "duplicate_fd", "path")
         ):
             capability: object = authorization
@@ -580,12 +591,53 @@ class LocalSubprocessComputeBackend:
 
         async def collect_contained() -> CollectedExecutionResult:
             try:
+                if factory:
+                    # Factory publishing/work-item inputs are not the leaf-build
+                    # environment contract. Keep the installed CLI/plugin PATH.
+                    environment = {**_local_child_env(), **spec.env}
+                    runtime_path = environment.get("PATH")
+                    environment.update(base_worker_environment(identifier))
+                    if runtime_path:
+                        environment["PATH"] = runtime_path
+                    environment["XDG_DATA_HOME"] = str(
+                        spec.local_checkout / ".factory-runtime" / "data"
+                    )
+                    if Path(command[0]).name == "opencode":
+                        from ..opencode_config import _read_object, opencode_worker_documents
+                        from .backends.opencode import resolve_worklink_opencode_invocation
+
+                        resolution = resolve_worklink_opencode_invocation(spec.env)
+                        invocation = resolution.invocation
+                        documents = opencode_worker_documents(invocation, resolution.env)
+                        native = (
+                            _read_object(invocation.config_path, kind="config")[0]
+                            if invocation.config_path.exists() else {}
+                        )
+                        # Preserve trusted native plugin registrations, profiles and
+                        # commands; project only the selected provider credentials.
+                        native.update(json.loads(documents.config_document))
+                        projections[:] = [WorkerProjection(
+                            path=".config/opencode/opencode.json",
+                            document=json.dumps(native).encode(),
+                        )]
+                        if documents.auth_document is not None:
+                            projections.append(WorkerProjection(
+                                path=".local/share/opencode/auth.json",
+                                document=documents.auth_document,
+                            ))
+                        for name in invocation.remove_env:
+                            environment.pop(name, None)
+                        environment["OPENCODE_CONFIG"] = (
+                            f"{environment['XDG_CONFIG_HOME']}/opencode/opencode.json"
+                        )
+                else:
+                    environment = _enabled_child_env(spec, identifier)
                 return await execute_contained(
                     command,
                     capability,
                     {
                         key: value
-                        for key, value in _enabled_child_env(spec, identifier).items()
+                        for key, value in environment.items()
                         if key != "HOME"
                     },
                     projections,

@@ -38,7 +38,7 @@ REPO_TEST_UV_CACHE = Path("/opt/mimir-worklink/uv-cache")
 MAX_FDS = 3
 # Deliberately not imported from worker_client: this value must describe the
 # immutable executor installed in the root-owned image, not mutable controller code.
-EXECUTOR_PROTOCOL_IDENTITY = "worklink-executor-v6-bounded-output-path-checkout"
+EXECUTOR_PROTOCOL_IDENTITY = "worklink-executor-v7-factory-path-checkout"
 EXECUTOR_SOURCE_COMMIT_PATH = Path("/opt/mimir-worklink/executor-source-commit")
 _STALE_EXECUTOR_DIAGNOSTIC = (
     "stale root executor image: controller and mimir.worklink.worker_exec protocol "
@@ -152,6 +152,24 @@ def _drop_worker(checkout_fd: int) -> None:
     os.setsid()
     os.fchdir(checkout_fd)
     _verify_worker_identity()
+
+
+def _prepare_factory_runtime(home: Path) -> None:
+    """Refresh auth without discarding attempt-scoped OpenCode session state."""
+    data = Path(".factory-runtime/data/opencode")
+    data.mkdir(parents=True, exist_ok=True)
+    auth = home / ".local/share/opencode/auth.json"
+    if auth.is_file():
+        shutil.copyfile(auth, data / "auth.json")
+        (data / "auth.json").chmod(0o600)
+    else:
+        (data / "auth.json").unlink(missing_ok=True)
+
+
+def _drop_factory(checkout_fd: int, home: Path) -> None:
+    _drop_worker(checkout_fd)
+    # The checkout is attacker-writable. No runtime writes may precede uid drop.
+    _prepare_factory_runtime(home)
 
 
 def _status_fields() -> dict[str, str]:
@@ -595,7 +613,7 @@ def _wait_with_output_limits(
 
 
 def _handle_launch(connection: socket.socket, request: dict[str, Any], fds: list[int]) -> None:
-    path_addressed = request.get("op") == "launch_path"
+    path_addressed = request.get("op") in {"launch_path", "launch_factory"}
     expected_fields = _PATH_LAUNCH_FIELDS if path_addressed else _LAUNCH_FIELDS
     expected_fds = 2 if path_addressed else MAX_FDS
     if set(request) != expected_fields or len(fds) != expected_fds:
@@ -667,7 +685,11 @@ def _handle_launch(connection: socket.socket, request: dict[str, Any], fds: list
             stdout=fds[1],
             stderr=fds[2],
             env=environment,
-            preexec_fn=lambda: _drop_worker(fds[0]),
+            preexec_fn=(
+                (lambda: _drop_factory(fds[0], home))
+                if request.get("op") == "launch_factory"
+                else (lambda: _drop_worker(fds[0]))
+            ),
             close_fds=True,
             pass_fds=(fds[0],),
         )
@@ -704,6 +726,10 @@ def _handle_launch(connection: socket.socket, request: dict[str, Any], fds: list
             _cleanup_home(home)
 
 
+def _handle_launch_factory(connection: socket.socket, request: dict[str, Any], fds: list[int]) -> None:
+    _handle_launch(connection, request, fds)
+
+
 def handle_connection(connection: socket.socket) -> None:
     fds: list[int] = []
     identifier: str | None = None
@@ -722,6 +748,8 @@ def handle_connection(connection: socket.socket) -> None:
         identifier = raw_identifier if isinstance(raw_identifier, str) else None
         if request.get("op") in {"launch", "launch_path"}:
             _handle_launch(connection, request, fds)
+        elif request.get("op") == "launch_factory":
+            _handle_launch_factory(connection, request, fds)
         elif request.get("op") == "cancel":
             _handle_cancel(connection, request, fds)
         elif request.get("op") == "identity":

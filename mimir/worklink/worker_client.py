@@ -13,6 +13,7 @@ from typing import Mapping, Protocol, Sequence
 import uuid
 
 from ..output_capture import OutputSink, open_output_pair
+from . import identities
 
 DEFAULT_EXECUTOR_SOCKET = Path("/run/mimir-worklink/socket/worklink-execd.sock")
 ENABLED_CHECKOUT_ROOT = Path("/var/lib/mimir-worklink/checkouts")
@@ -22,7 +23,7 @@ MAX_PROJECTION_BYTES = 1024 * 1024
 CANCEL_SOCKET_TIMEOUT_S = 20.0
 # Keep this literal independent from worker_exec. The executor runs its image-owned
 # copy, so changing either side of the launch contract requires an image rebuild.
-EXECUTOR_PROTOCOL_IDENTITY = "worklink-executor-v6-bounded-output-path-checkout"
+EXECUTOR_PROTOCOL_IDENTITY = "worklink-executor-v7-factory-path-checkout"
 STALE_EXECUTOR_DIAGNOSTIC = (
     "stale root executor image: controller and mimir.worklink.worker_exec protocol "
     "or source identities do not match; rebuild the image and restart the container"
@@ -107,6 +108,7 @@ class WorkerClient:
         self.issue_id = issue_id
         self.attempt = attempt
         self.run_uid = run_uid
+        self._launch_op = "launch_path" if path_checkout is not None else "launch"
 
     @classmethod
     def for_path_checkout(
@@ -128,6 +130,25 @@ class WorkerClient:
             attempt=attempt,
             run_uid=run_uid,
         )
+
+    @classmethod
+    def for_factory_checkout(
+        cls,
+        path: Path,
+        *,
+        issue_id: int,
+        attempt: int,
+        socket_path: Path = DEFAULT_EXECUTOR_SOCKET,
+    ) -> WorkerClient:
+        client = cls.for_path_checkout(
+            path,
+            issue_id=issue_id,
+            attempt=attempt,
+            run_uid=identities.get_identities().worklink_uid,
+            socket_path=socket_path,
+        )
+        client._launch_op = "launch_factory"
+        return client
 
     def _connect(self, timeout_s: float | None = None) -> socket.socket:
         sock = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
@@ -198,7 +219,7 @@ class WorkerClient:
             raise ValueError("worker environment must contain string pairs")
         request: dict[str, object] = {
             "version": 1,
-            "op": "launch_path" if path_addressed else "launch",
+            "op": self._launch_op,
             "executor_identity": EXECUTOR_PROTOCOL_IDENTITY,
             "id": identifier,
             "argv": list(argv),

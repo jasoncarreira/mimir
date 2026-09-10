@@ -30,6 +30,7 @@ from mimir.worklink.worker_client import (
     verify_executor_identity,
 )
 import mimir.worklink.worker_exec as worker_exec
+from mimir.worklink import identities
 
 
 def _issued(tmp_path: Path) -> Path:
@@ -147,8 +148,10 @@ async def test_client_reports_executor_peer_uid_refusal(tmp_path: Path, monkeypa
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("factory", [False, True])
 async def test_path_client_requests_worker_uid_and_projects_provider_documents(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, factory: bool,
+    synthetic_worklink_identities,
 ) -> None:
     checkout = tmp_path / ".worklink" / "repo" / "41-2"
     checkout.mkdir(parents=True)
@@ -179,8 +182,12 @@ async def test_path_client_requests_worker_uid_and_projects_provider_documents(
 
     monkeypatch.setattr(socket, "SO_PEERCRED", getattr(socket, "SO_PEERCRED", 17), raising=False)
     monkeypatch.setattr(socket, "socket", lambda *args: Peer())
-    client = WorkerClient.for_path_checkout(
-        checkout, issue_id=41, attempt=2, run_uid=1002
+    monkeypatch.setattr(identities, "get_identities", lambda: synthetic_worklink_identities)
+    client = (
+        WorkerClient.for_factory_checkout(checkout, issue_id=41, attempt=2)
+        if factory else WorkerClient.for_path_checkout(
+            checkout, issue_id=41, attempt=2, run_uid=1002
+        )
     )
     process = await client.launch(
         local_checkout=checkout,
@@ -196,9 +203,10 @@ async def test_path_client_requests_worker_uid_and_projects_provider_documents(
     process._socket.close()
 
     request = requests[0]
-    assert request["op"] == "launch_path"
+    assert request["op"] == ("launch_factory" if factory else "launch_path")
     assert request["path"] == str(checkout)
-    assert request["run_uid"] == 1002
+    assert request["run_uid"] == (synthetic_worklink_identities.worklink_uid if factory else 1002)
+    assert set(request) == worker_exec._PATH_LAUNCH_FIELDS
     assert fd_counts == [2]
     assert [item["path"] for item in request["projections"]] == [
         ".config/opencode/opencode.json",
@@ -812,11 +820,15 @@ def test_executor_rejects_mismatched_launch_protocol_identity() -> None:
         worker_exec._handle_launch(object(), request, [-1, -1, -1])
 
 
+@pytest.mark.parametrize("operation,handler", [
+    ("launch_path", "_handle_launch"),
+    ("launch_factory", "_handle_launch_factory"),
+])
 def test_executor_dispatches_path_launch_through_the_connection_handler(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, operation: str, handler: str,
 ) -> None:
     identifier = str(uuid.uuid4())
-    request = {"version": 1, "op": "launch_path", "id": identifier}
+    request = {"version": 1, "op": operation, "id": identifier}
     dispatched: list[tuple[dict[str, object], list[int]]] = []
 
     class Connection:
@@ -832,7 +844,7 @@ def test_executor_dispatches_path_launch_through_the_connection_handler(
     def handle(_connection: object, observed: dict[str, object], fds: list[int]) -> None:
         dispatched.append((observed, fds))
 
-    monkeypatch.setattr(worker_exec, "_handle_launch", handle)
+    monkeypatch.setattr(worker_exec, handler, handle)
     worker_exec.handle_connection(Connection())
 
     assert dispatched == [(request, [])]
@@ -1324,6 +1336,315 @@ def test_process_group_cancellation_reports_unreapable_member(monkeypatch) -> No
     assert signals == [signal.SIGTERM, signal.SIGKILL]
     assert len(waits) == 2
     assert all(deadline is not None for _process_group, deadline in waits)
+
+
+@pytest.fixture
+def factory_request(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    root = tmp_path / ".worklink"
+    checkout = root / "repo" / "41-2"
+    checkout.mkdir(parents=True)
+    checkout.chmod(0o2770)
+    worker_uid = worker_exec.get_identities().worklink_uid
+    monkeypatch.setattr(worker_exec, "get_identities", lambda: SimpleNamespace(
+        mimir_uid=os.getuid(), worklink_uid=worker_uid, worklink_gid=os.getgid(),
+    ))
+    monkeypatch.setattr(worker_exec, "WORKLINK_CHECKOUT_ROOT", root)
+    monkeypatch.setattr(worker_exec, "HOME_ROOT", tmp_path / "homes")
+    worker_exec.HOME_ROOT.mkdir()
+    return {
+        "version": 1, "op": "launch_factory",
+        "executor_identity": EXECUTOR_PROTOCOL_IDENTITY,
+        "id": str(uuid.uuid4()), "issue": 41, "attempt": 2,
+        "path": str(checkout), "run_uid": worker_uid,
+        "argv": ["factory-payload"], "env": {}, "projections": [],
+        "timeout_s": 5, "stdout_limit": 4096, "stderr_limit": 4096,
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("coding_enabled", [False, True])
+async def test_factory_compute_requires_executor_without_agent_fallback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, coding_enabled: bool,
+) -> None:
+    from mimir.worklink import compute
+
+    monkeypatch.setattr("mimir.worklink.checkout.coding_enabled", lambda: coding_enabled)
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", Mock(side_effect=AssertionError("agent spawn")))
+    monkeypatch.setattr(compute, "_fd_anchored_opencode_argv", Mock(side_effect=AssertionError("leaf argv handler")))
+    launches = []
+
+    class Client:
+        async def launch(self, **kwargs):
+            launches.append(kwargs)
+            raise RuntimeError("executor unavailable")
+
+    def factory_client(path, *, issue_id, attempt):
+        assert (path, issue_id, attempt) == (tmp_path, 41, 2)
+        return Client()
+
+    monkeypatch.setattr(WorkerClient, "for_factory_checkout", factory_client)
+    spec = compute.WorkSpec(
+        issue_id=41, attempt=2, repo_url="", base_ref="", branch="", prompt="",
+        rules=None, test_command="", backend="feature_factory", timeout_s=10,
+        local_checkout=tmp_path, local_argv=("factory", "--dir", "factory-specific"),
+    )
+    with pytest.raises(compute.ComputeLaunchError, match="executor unavailable"):
+        await compute.LocalSubprocessComputeBackend().launch(spec)
+    assert len(launches) == 1
+    assert launches[0]["argv"] == spec.local_argv
+    assert "HOME" not in launches[0]["env"]
+
+
+@pytest.mark.parametrize("denial", [
+    "root_uid", "controller_uid", "outside", "symlink", "issue", "attempt",
+    "mode", "owner", "group", "extra", "fd_count", "identity", "home",
+])
+def test_factory_launch_denies_invalid_contract(
+    factory_request, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, denial: str,
+) -> None:
+    request = factory_request
+    checkout = Path(request["path"])
+    expected = "ownership or mode"
+    if denial in {"root_uid", "controller_uid"}:
+        request["run_uid"] = 0 if denial == "root_uid" else os.getuid()
+        expected = "invalid worker uid"
+    elif denial == "outside":
+        request["path"] = str(tmp_path)
+        expected = "outside"
+    elif denial == "symlink":
+        link = checkout.parent / "link"
+        link.symlink_to(checkout)
+        request["path"] = str(link)
+        expected = "shape"
+    elif denial in {"issue", "attempt"}:
+        request[denial] += 1
+        expected = "shape"
+    elif denial == "mode":
+        checkout.chmod(0o770)
+    elif denial in {"owner", "group"}:
+        observed = worker_exec.get_identities()
+        monkeypatch.setattr(worker_exec, "get_identities", lambda: SimpleNamespace(
+            mimir_uid=observed.mimir_uid + (denial == "owner"),
+            worklink_uid=observed.worklink_uid,
+            worklink_gid=observed.worklink_gid + (denial == "group"),
+        ))
+    elif denial in {"extra", "fd_count"}:
+        if denial == "extra":
+            request["uid"] = 0
+        expected = "exact contract"
+    elif denial == "identity":
+        request["executor_identity"] = "old-executor"
+        expected = "stale root executor"
+    elif denial == "home":
+        request["env"] = {"HOME": "/controller"}
+        expected = "HOME"
+    monkeypatch.setattr(worker_exec.subprocess, "Popen", Mock(side_effect=AssertionError("payload ran")))
+    with (tmp_path / "stdout").open("w+b") as stdout, (tmp_path / "stderr").open("w+b") as stderr:
+        fds = [stdout.fileno(), stderr.fileno()]
+        if denial == "fd_count":
+            fds.append(-1)
+        try:
+            with pytest.raises(RuntimeError, match=expected):
+                worker_exec._handle_launch_factory(object(), request, fds)
+        finally:
+            if len(fds) == 3 and fds[0] != stdout.fileno():
+                os.close(fds[0])
+
+
+def test_factory_drops_identity_before_payload_exec_or_spawn(
+    factory_request, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    observed = worker_exec.get_identities()
+    events = []
+    monkeypatch.setattr(worker_exec.ctypes, "CDLL", lambda *a, **kw: SimpleNamespace(prctl=lambda *a: 0))
+    monkeypatch.setattr(worker_exec, "_set_capabilities", lambda caps: None)
+    monkeypatch.setattr(worker_exec, "_last_capability", lambda: 2)
+    monkeypatch.setattr(os, "setgroups", lambda groups: None)
+    monkeypatch.setattr(os, "setresgid", lambda *ids: events.append(("gid", ids)), raising=False)
+
+    def setresuid(*ids):
+        assert ids == (observed.worklink_uid,) * 3
+        assert events == [("gid", (observed.worklink_gid,) * 3)]
+        events.append(("uid", ids))
+
+    monkeypatch.setattr(os, "setresuid", setresuid, raising=False)
+    for name in ("umask", "setsid", "fchdir", "chown"):
+        monkeypatch.setattr(os, name, lambda *a, **kw: None)
+    monkeypatch.setattr(worker_exec, "_verify_worker_identity", lambda: None)
+
+    monkeypatch.setattr(worker_exec, "_prepare_factory_runtime", lambda home: events.append("runtime"))
+
+    def popen(*args, **kwargs):
+        preexec = kwargs.get("preexec_fn")
+        assert callable(preexec), "factory payload requires preexec identity drop"
+        preexec()
+        assert events == [
+            ("gid", (observed.worklink_gid,) * 3),
+            ("uid", (observed.worklink_uid,) * 3),
+            "runtime",
+        ], "payload exec/spawn happened before identity drop"
+        events.extend(["payload-exec", "payload-spawn"])
+        return SimpleNamespace(pid=123, returncode=0)
+
+    monkeypatch.setattr(worker_exec.subprocess, "Popen", popen)
+    monkeypatch.setattr(worker_exec, "_wait_with_output_limits", lambda *a: (0, False, False))
+    with (tmp_path / "stdout").open("w+b") as stdout, (tmp_path / "stderr").open("w+b") as stderr:
+        fds = [stdout.fileno(), stderr.fileno()]
+        try:
+            worker_exec._handle_launch_factory(SimpleNamespace(send=lambda data: None), factory_request, fds)
+        finally:
+            os.close(fds[0])
+    assert events[-2:] == ["payload-exec", "payload-spawn"]
+
+
+def test_factory_descendant_cannot_write_controller_canary_and_negative_control_is_live(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    if sys.platform != "linux" or os.geteuid() != 0:
+        pytest.skip("requires Linux root, unavailable in unprivileged sandboxes")
+    from mimir.worklink.compute import LocalSubprocessComputeBackend, WorkSpec
+
+    observed = worker_exec.get_identities()
+    monkeypatch.setattr(identities, "get_identities", lambda: observed)
+    # Probe kernel authority in a disposable child, not the pytest process.
+    fd = os.open("/tmp", os.O_RDONLY | os.O_DIRECTORY)
+    probe = os.fork()
+    if probe == 0:
+        try:
+            worker_exec._drop_worker(fd)
+        except PermissionError:
+            os._exit(77)
+        except BaseException:
+            os._exit(1)
+        os._exit(0)
+    os.close(fd)
+    _, status = os.waitpid(probe, 0)
+    if os.waitstatus_to_exitcode(status) == 77:
+        pytest.skip("Linux root sandbox lacks authority for the real worker identity drop")
+    assert os.waitstatus_to_exitcode(status) == 0
+
+    repo = worker_exec.WORKLINK_CHECKOUT_ROOT / f"factory-test-{uuid.uuid4()}"
+    boundary = Path("/tmp") / f"factory-exec-{uuid.uuid4()}"
+    checkout = repo / "41-2"
+    home_root = boundary / "homes"
+    controller_home = boundary / "controller"
+    socket_path = boundary / "executor.sock"
+    try:
+        try:
+            checkout.mkdir(parents=True)
+            repo.chmod(0o755)
+            boundary.mkdir(mode=0o755)
+            boundary.chmod(0o755)
+            home_root.mkdir(mode=0o710)
+            os.chown(home_root, 0, observed.worklink_gid)
+            home_root.chmod(0o710)
+            os.chown(checkout, observed.mimir_uid, observed.worklink_gid)
+            checkout.chmod(0o2770)
+            controller_home.mkdir(mode=0o700)
+            os.chown(controller_home, observed.mimir_uid, observed.mimir_uid)
+        except PermissionError:
+            pytest.skip("root sandbox cannot prepare real Worklink checkout ownership")
+        canary = controller_home / "canary"
+        canary.write_text("original")
+        os.chown(canary, observed.mimir_uid, observed.mimir_uid)
+        canary.chmod(0o600)
+        monkeypatch.setattr(worker_exec, "HOME_ROOT", home_root)
+        python = shutil.which("python3", path="/usr/bin:/bin")
+        if python is None:
+            pytest.skip("requires system python3 accessible to both non-root identities")
+        grandchild = (
+            "import os, pathlib\n"
+            "print('euid=' + str(os.geteuid()), flush=True)\n"
+            "try:\n"
+            " pathlib.Path(os.environ['CANARY']).write_text('attacked')\n"
+            "except PermissionError:\n"
+            " print('write-denied', flush=True)\n"
+            "else:\n"
+            " print('write-allowed', flush=True)\n"
+        )
+        payload = (
+            "import subprocess, sys; "
+            f"sys.exit(subprocess.run([sys.executable, '-c', {grandchild!r}], "
+            "start_new_session=True, timeout=5).returncode)"
+        )
+
+        async def controller_run():
+            backend = LocalSubprocessComputeBackend(
+                _worker_client=WorkerClient.for_factory_checkout(
+                    checkout, issue_id=41, attempt=2, socket_path=socket_path,
+                ),
+            )
+            spec = WorkSpec(
+                issue_id=41, attempt=2, repo_url="", base_ref="", branch="",
+                prompt="", rules=None, test_command="", backend="feature_factory",
+                timeout_s=10, local_checkout=checkout,
+                local_argv=[python, "-c", payload], env={"CANARY": str(canary)},
+            )
+            handle = await backend.launch(spec)
+            result = await backend.wait(handle, timeout_s=10)
+            return {"exit_code": result.exit_code, "stdout": result.stdout, "stderr": result.stderr}
+
+        def run():
+            socket_path.unlink(missing_ok=True)
+            with socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET) as listener:
+                listener.bind(str(socket_path))
+                socket_path.chmod(0o666)
+                listener.listen(1)
+                listener.settimeout(15)
+                read_fd, write_fd = os.pipe()
+                pid = os.fork()
+                if pid == 0:
+                    os.close(read_fd)
+                    try:
+                        os.setgroups([observed.worklink_gid])
+                        os.setresgid(*((observed.mimir_uid,) * 3))
+                        os.setresuid(*((observed.mimir_uid,) * 3))
+                        result = asyncio.run(controller_run())
+                    except BaseException as exc:
+                        result = {"error": repr(exc)}
+                    os.write(write_fd, json.dumps(result).encode())
+                    os._exit(0)
+                os.close(write_fd)
+                reaped = False
+                try:
+                    connection, _ = listener.accept()
+                    worker_exec.handle_connection(connection)
+                    _, status = os.waitpid(pid, 0)
+                    reaped = True
+                    result = json.loads(os.read(read_fd, 65536))
+                    assert os.waitstatus_to_exitcode(status) == 0, result
+                    assert "error" not in result, result
+                    assert result["exit_code"] == 0, result
+                    return result
+                finally:
+                    os.close(read_fd)
+                    if not reaped:
+                        os.kill(pid, signal.SIGKILL)
+                        os.waitpid(pid, 0)
+
+        def assert_boundary(result):
+            assert canary.read_text() == "original", result
+            assert result["stdout"] == f"euid={observed.worklink_uid}\nwrite-denied\n"
+            assert result["stderr"] == ""
+
+        assert_boundary(run())
+
+        def controller_identity(checkout_fd, home):
+            os.setgroups([])
+            os.setresgid(*((observed.mimir_uid,) * 3))
+            os.setresuid(*((observed.mimir_uid,) * 3))
+            os.setsid()
+            os.fchdir(checkout_fd)
+
+        monkeypatch.setattr(worker_exec, "_drop_factory", controller_identity)
+        vulnerable = run()
+        assert vulnerable["stdout"] == f"euid={observed.mimir_uid}\nwrite-allowed\n"
+        assert canary.read_text() == "attacked"
+        with pytest.raises(AssertionError):
+            assert_boundary(vulnerable)
+    finally:
+        shutil.rmtree(repo, ignore_errors=True)
+        shutil.rmtree(boundary, ignore_errors=True)
 
 
 def test_worker_payload_cannot_reach_controller_canary_and_detector_is_live() -> None:

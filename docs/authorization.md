@@ -621,7 +621,7 @@ checkouts, worker identity, credential projection, collected output, and
 proposal boundary. They do not make other code-execution paths contained or
 protect an admitted seed from code the operator already approved.
 
-### Surfaces that still execute as the agent user
+### Worklink And Factory Runs
 
 Poller-dispatched Worklink OpenCode builds use the `worklink` uid in a
 group-writable checkout under `/workspace/.worklink`. This prevents generated
@@ -630,9 +630,23 @@ sandbox, does not provide cross-run isolation, and is explicitly not credential
 isolation: the virtiofs home mount remains readable across guest identities
 (#1435).
 
-Feature-factory runs remain outside the contained paths above and still
-execute as the agent user. Track that OS-isolation gap separately; tool-level
-authorization alone does not provide an OS boundary.
+Feature-factory workloads also use the existing root-owned Worklink executor,
+through its distinct `launch_factory` entry point and the same validated
+path-addressed checkout. The executor drops all real, effective, and saved uids
+and gids to the configured `worklink` identity before executing the factory.
+Descendants inherit that identity, including processes that create a new session.
+There is no agent-user fallback when the executor or checkout is unavailable.
+Factory publishing inputs have their own environment contract; the per-leaf
+OpenCode contract is unchanged. Factory status and capability probes are still
+controller operations, not workload launches. This is identity containment, not
+cross-run or credential isolation, and does not guarantee reaping detached
+descendants after a run finishes.
+
+### Surfaces that still execute as the agent user
+
+Factory status and capability probes remain trusted controller operations.
+The identity guarantees above apply to workload execution, not every subprocess
+the agent starts.
 
 ### Declared shell commands per job
 

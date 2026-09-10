@@ -1024,17 +1024,19 @@ async def test_launch_child_environment_carries_the_publishing_identity(
     the allowlist to empty so the assertion cannot be satisfied by inheritance.
     """
     _own_opencode_resolution(tmp_path, monkeypatch)
-    import asyncio as _asyncio
+    from types import SimpleNamespace
+    from mimir.contained_execution import CollectedExecutionResult
 
     from mimir.worklink.compute import LocalSubprocessComputeBackend
 
     captured: dict[str, dict[str, str]] = {}
 
-    async def fake_exec(*_args: str, **kwargs: Any) -> _FakeLaunchProcess:
-        captured["env"] = kwargs["env"]
-        return _FakeLaunchProcess()
+    async def fake_exec(args, capability, env, projections, **kwargs):
+        captured["env"] = env
+        capability._contained_started(SimpleNamespace(pid=None))
+        return CollectedExecutionResult(0, b"", b"", False, False, 0, 0)
 
-    monkeypatch.setattr(_asyncio, "create_subprocess_exec", fake_exec)
+    monkeypatch.setattr("mimir.worklink.compute.execute_contained", fake_exec)
     monkeypatch.setattr("mimir.worklink.compute._local_child_env", dict)
 
     spec = FeatureFactoryBackend(entrypoint="/absolute/factory.js").work_spec(
@@ -1045,8 +1047,11 @@ async def test_launch_child_environment_carries_the_publishing_identity(
         branch="epic/1551",
         test_command="uv run pytest -q",
     )
-    handle = await LocalSubprocessComputeBackend().launch(spec)
+    # The contained executor is mocked; production accounts are not a test input.
+    compute = LocalSubprocessComputeBackend(_worker_client=object())
+    handle = await compute.launch(spec)
     try:
+        await compute.wait(handle, 30)
         assert captured["env"][FACTORY_PUBLISHING_IDENTITY_ENV] == "mimir-carreira"
     finally:
-        await LocalSubprocessComputeBackend().cleanup(handle)
+        await compute.cleanup(handle)

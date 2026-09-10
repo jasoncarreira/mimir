@@ -19,6 +19,10 @@ def test_contained_execution_surfaces_are_not_listed_as_agent_user() -> None:
 
     assert "`repo_test`" not in residual
     assert "`spawn_open_code`" not in residual
+    assert "Feature-factory runs" not in residual
+    factory = _section(text, "Worklink And Factory Runs")
+    assert "`launch_factory`" in factory
+    assert "no agent-user fallback" in factory
 
 
 def test_contained_execution_surface_claims_are_bounded() -> None:
