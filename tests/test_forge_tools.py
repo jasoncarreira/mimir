@@ -903,12 +903,163 @@ def test_heartbeat_git_refuses_incompatible_cached_scope_without_mutation(
         assert context.server_discovered_pr_states.resolve("owner/repo", 17) is None
 
 
+@pytest.mark.parametrize("field", ["type", "trigger", "authority_profile", "canonical"])
+def test_heartbeat_authority_predicate_boundaries(tmp_path, monkeypatch, field):
+    monkeypatch.setenv("MIMIR_CODING_ENABLED", "true")
+    service = access_control.builtin_trigger_service_principal("heartbeat", tmp_path)
+    candidate = SimpleNamespace(**vars(service)) if field == "type" else replace(service, **{field: "other"})
+    assert not access_control.heartbeat_git_authority_enabled(candidate)
+
+
+@pytest.mark.parametrize("field", ["login", "principal", "author", "repository", "capability"])
+def test_heartbeat_direct_authorization_boundaries(tmp_path, monkeypatch, field):
+    client = FakeForge()
+    client.snapshot_author = "reviewer"
+    _configure_live_review(monkeypatch, client)
+    monkeypatch.setenv("MIMIR_CODING_ENABLED", "true")
+    service = access_control.builtin_trigger_service_principal("heartbeat", tmp_path)
+    scope = access_control.create_server_discovered_heartbeat_scope(
+        "owner/repo", client.get_pull_request_snapshot("owner/repo", 17),
+        event_type="heartbeat_pr_maintenance",
+    )
+    if field == "login":
+        monkeypatch.setenv("MIMIR_GITHUB_SELF_LOGIN", "")
+        scope = replace(scope, principal="", pull_request_author="")
+    elif field == "principal":
+        scope = replace(scope, principal="other", pull_request_author="other")
+    elif field == "author":
+        scope = replace(scope, pull_request_author="other")
+    elif field == "repository":
+        scope = replace(scope, canonical_repo="other/repo")
+    else:
+        service = replace(service, capabilities=tuple(c for c in service.capabilities if c != "repo_push"))
+    decision = access_control.authorize_repo_pr_tool(
+        "repo_push", scope, service_principal=service, enforce=True,
+        flow_direction=access_control.ToolFlowDirection.SINK,
+    )
+    assert not decision.allowed
+
+
+@pytest.mark.parametrize("field", ["capability", "profile", "empty_accept", "other_accept"])
+def test_heartbeat_scope_stage_boundaries(tmp_path, monkeypatch, field):
+    monkeypatch.setenv("MIMIR_CODING_ENABLED", "true")
+    context = _production_auth_context(tmp_path, "scheduled_tick")
+    service = context.service_authority
+    stage, author, login = "fetch", "reviewer", "reviewer"
+    if field == "capability":
+        context = replace(context, service_authority=replace(service, capabilities=()))
+    elif field == "profile":
+        context = replace(context, service_authority=replace(service, authority_profile="custom"))
+    elif field == "empty_accept":
+        stage, author, login = "accept", "", ""
+    else:
+        stage, author = "accept", "other"
+    assert not access_control.can_resolve_forge_review_scope(
+        context, stage=stage, pr_author=author, self_login=login,
+    )
+
+
+@pytest.mark.parametrize("repository,number,reason", [
+    ("other/repo", 17, "heartbeat_repository_denied"),
+    ("owner/repo", True, "heartbeat_pr_invalid: pull_request must"),
+    ("owner/repo", "17", "heartbeat_pr_invalid: pull_request must"),
+    ("owner/repo", 0, "heartbeat_pr_invalid: pull_request must"),
+    ("owner/repo", -1, "heartbeat_pr_invalid: pull_request must"),
+])
+def test_heartbeat_resolution_input_boundaries(tmp_path, monkeypatch, repository, number, reason):
+    client = FakeForge()
+    client.snapshot_author = "reviewer"
+    _configure_live_review(monkeypatch, client)
+    monkeypatch.setenv("MIMIR_CODING_ENABLED", "true")
+    context = _production_auth_context(tmp_path, "scheduled_tick")
+    with pytest.raises(ToolException, match=reason):
+        resolve_review_state_for_context(context, repository, number)
+    assert client.calls == []
+
+
+@pytest.mark.parametrize("field", [
+    "canonical_root", "canonical_origin", "head_repo", "head_remote",
+    "destination_ref", "observed_head_sha", "base_ref", "observed_base_sha",
+    "principal", "pull_request_author",
+])
+def test_heartbeat_cached_scope_pin_boundaries(tmp_path, monkeypatch, field):
+    client = FakeForge()
+    client.snapshot_author = "reviewer"
+    _configure_live_review(monkeypatch, client)
+    monkeypatch.setenv("MIMIR_CODING_ENABLED", "true")
+    context = _production_auth_context(tmp_path, "scheduled_tick")
+    scope = access_control.create_server_discovered_heartbeat_scope(
+        "owner/repo", client.get_pull_request_snapshot("owner/repo", 17),
+        event_type="heartbeat_pr_maintenance",
+    )
+    previous = RepoReviewState(replace(scope, **{field: "different"}))
+    context.server_discovered_pr_states.remember(previous)
+    reason = "heartbeat_other_author: cached scope" if field in {"principal", "pull_request_author"} else "stale_scope:"
+    with pytest.raises(ToolException, match=reason):
+        resolve_review_state_for_context(context, "owner/repo", 17)
+    assert context.server_discovered_pr_states.resolve("owner/repo", 17) is previous
+
+
+@pytest.mark.parametrize("field", ["type", "repository_type", "number_type", "closed", "fabricated"])
+def test_heartbeat_provider_boundary_refusals(tmp_path, monkeypatch, field):
+    from mimir.forge import ForgeError
+
+    client = FakeForge()
+    client.snapshot_author = "reviewer"
+    _configure_live_review(monkeypatch, client)
+    monkeypatch.setenv("MIMIR_CODING_ENABLED", "true")
+    snapshot = client.get_pull_request_snapshot("owner/repo", 1)
+    candidate = {
+        "type": SimpleNamespace(**vars(snapshot)),
+        "repository_type": replace(snapshot, repo=None),
+        "number_type": replace(snapshot, number=True),
+        "closed": replace(snapshot, state="closed"),
+        "fabricated": snapshot,
+    }[field]
+    def fetch(*args):
+        if field == "fabricated":
+            raise ForgeError("PR not found")
+        return candidate
+    monkeypatch.setattr(client, "get_pull_request_snapshot", fetch)
+    context = _production_auth_context(tmp_path, "scheduled_tick")
+    reason = "heartbeat_pr_unverified: PR not found" if field == "fabricated" else "heartbeat_pr_invalid: provider must report"
+    with pytest.raises(ToolException, match=reason):
+        resolve_review_state_for_context(context, "owner/repo", 1)
+    assert not context.server_discovered_pr_states.review_states
+
+
+@pytest.mark.parametrize("untrusted", [False, True])
+def test_heartbeat_checkout_rejects_poller_preflight_shortcut(tmp_path, monkeypatch, untrusted):
+    from mimir.tools.forge import remediation_checkout_preflight
+
+    client = FakeForge()
+    client.snapshot_author = "reviewer"
+    _configure_live_review(monkeypatch, client)
+    monkeypatch.setenv("MIMIR_CODING_ENABLED", "true")
+    scope = access_control.create_server_discovered_heartbeat_scope(
+        "owner/repo", client.get_pull_request_snapshot("owner/repo", 17),
+        event_type="pr_changes_requested_stale",
+    )
+    previous = RepoReviewState(replace(scope, provenance="poller_payload", pull_request_author="other"))
+    context = replace(
+        _production_auth_context(tmp_path, "scheduled_tick"),
+        repo_pr_scope_registry=RepoPRScopeRegistry((previous,)),
+    )
+    if untrusted:
+        context = replace(context, event_ingress="http_event")
+    reason = "heartbeat_authority_denied" if untrusted else "heartbeat_other_author"
+    with pytest.raises(ToolException, match=reason):
+        remediation_checkout_preflight(context, "owner/repo", 17)
+
+
 @pytest.mark.parametrize("source", ["store", "cache", "registry", "escalation"])
 @pytest.mark.parametrize("route", ["resolve", "authorize", "checkout", "escalate", "job_log"])
 def test_heartbeat_git_rejects_other_author_scope_reuse(tmp_path, monkeypatch, source, route):
     import mimir.tools.forge as forge
 
+    monkeypatch.setattr(forge, "_emit_unsupported", lambda *args: True)
     client = FakeForge()
+    monkeypatch.setattr(client, "get_job_log", lambda *args: "untrusted job log", raising=False)
     _configure_live_review(monkeypatch, client)
     store = ServerDiscoveredPRScopeStore()
     operator = replace(
@@ -980,7 +1131,9 @@ def test_heartbeat_git_validates_provider_identity(tmp_path, monkeypatch, mutati
 def test_heartbeat_git_rejects_untrusted_context_even_with_cached_scope(tmp_path, monkeypatch, mutation, route):
     import mimir.tools.forge as forge
 
+    monkeypatch.setattr(forge, "_emit_unsupported", lambda *args: True)
     client = FakeForge()
+    monkeypatch.setattr(client, "get_job_log", lambda *args: "untrusted job log", raising=False)
     client.snapshot_author = "reviewer"
     _configure_live_review(monkeypatch, client)
     monkeypatch.setenv("MIMIR_CODING_ENABLED", "true")
@@ -1015,7 +1168,8 @@ def test_heartbeat_git_revalidates_cached_identity(tmp_path, monkeypatch, login)
     context = _production_auth_context(tmp_path, "scheduled_tick")
     resolve_review_state_for_context(context, "owner/repo", 17)
     monkeypatch.setenv("MIMIR_GITHUB_SELF_LOGIN", login)
-    with pytest.raises(ToolException, match="heartbeat_identity_missing|heartbeat_other_author"):
+    reason = "heartbeat_identity_missing" if not login.strip() else "heartbeat_other_author"
+    with pytest.raises(ToolException, match=reason):
         resolve_review_state_for_context(context, "owner/repo", 17)
 
 

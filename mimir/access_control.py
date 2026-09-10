@@ -1389,6 +1389,21 @@ def repo_binding_startup_alerts() -> tuple[dict[str, Any], ...]:
     return tuple(alerts)
 
 
+def heartbeat_cached_scope_refusal(previous: Any, current: Any) -> str | None:
+    """Keep live checkout pins and authority fixed across heartbeat discovery."""
+    if any(getattr(previous, name) != getattr(current, name) for name in (
+        "canonical_repo", "pr_number", "canonical_root", "canonical_origin",
+        "head_repo", "head_remote", "destination_ref", "observed_head_sha",
+        "base_ref", "observed_base_sha",
+    )):
+        return "stale_scope: heartbeat PR SHA/ref or repository binding changed"
+    if any(getattr(previous, name) != getattr(current, name) for name in (
+        "event_type", "allowed_operations", "checkout_ref", "provenance",
+    )):
+        return "heartbeat_scope_incompatible: cached scope is not heartbeat PR maintenance authority"
+    return None
+
+
 def create_server_discovered_heartbeat_scope(
     repo: str,
     pull_request: NormalizedPullRequestSnapshot,

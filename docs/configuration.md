@@ -737,6 +737,21 @@ pinned Git, and lease-root configuration/writability. Satisfy the entire list
 before retrying. Provisioning a lease root grants no general agent write
 authority over it or the live source checkout.
 
+With coding enabled, trusted heartbeat turns can use the typed Git tools for
+checkout, conflict resolution, merge/rebase, revert, commit, and push. Raw shell
+policy is unchanged. Authority comes from a fresh GitHub snapshot of an open PR
+in a configured repository, authored by `MIMIR_GITHUB_SELF_LOGIN`; model tool
+arguments only select a candidate, never its author, refs, SHA, or permissions.
+The server pins those fields and refuses incompatible cached scopes or changed
+heads with named reasons. Rebased publication uses an exact-head force-with-lease,
+not unrestricted force, with the existing protected-ref restrictions intact.
+
+When coding is enabled, the validated lease root is also derived into file-tool
+read scope automatically. Do **not** duplicate it in `MIMIR_FILE_TOOL_ROOTS`.
+Existing active-lease authorization and protected-file checks still apply; this
+does not add a general writable root. The startup `filesystem_read_scope` event
+records the derived lease root and effective non-admin read roots for auditing.
+
 The following code-visible names are explicitly **internal, not operator
 environment variables**:
 

@@ -197,6 +197,47 @@ def test_derived_lease_known_root_preserves_absolute_paths(tmp_path, monkeypatch
     ) == str(home / str(target).lstrip("/"))
 
 
+@pytest.mark.parametrize("escape", ["symlink", "traversal"])
+def test_derived_lease_read_containment(escape, tmp_path, monkeypatch):
+    home = tmp_path / "home"
+    (home / "state").mkdir(parents=True)
+    physical = tmp_path / "physical"
+    root = physical / "leases"
+    root.mkdir(parents=True)
+    alias = tmp_path / "alias"
+    alias.symlink_to(physical, target_is_directory=True)
+    lexical = alias / "leases"
+    outside = physical / "outside.txt"
+    outside.write_text("outside lease\n")
+    (root / "escape").symlink_to(outside)
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    monkeypatch.setenv("MIMIR_FILE_TOOL_ROOTS", "")
+    monkeypatch.setenv("MIMIR_CODING_ENABLED", "1")
+    monkeypatch.setenv("MIMIR_PR_CHECKOUT_LEASE_ROOT", str(lexical))
+    requested = lexical / ("escape" if escape == "symlink" else "../outside.txt")
+    # Keep /tmp enabled: a missing narrow lexical root must not fall back to it.
+    assert resolve_non_admin_read_target(str(requested), scan_file=True) is None
+
+
+def test_derived_lease_does_not_expand_write_configuration(tmp_path, monkeypatch):
+    import os
+
+    from mimir.access_control import _configured_file_write_roots
+
+    home = tmp_path / "home"
+    home.mkdir()
+    root = tmp_path / "leases"
+    root.mkdir()
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    monkeypatch.setenv("MIMIR_FILE_TOOL_ROOTS", "")
+    monkeypatch.setenv("MIMIR_CODING_ENABLED", "1")
+    monkeypatch.setenv("MIMIR_PR_CHECKOUT_LEASE_ROOT", str(root))
+    before = _configured_file_write_roots()
+    assert root in configured_non_admin_read_roots()
+    assert _configured_file_write_roots() == before
+    assert os.environ["MIMIR_FILE_TOOL_ROOTS"] == ""
+
+
 def test_non_admin_attachment_grant_is_scoped_to_the_fetch_cache(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:

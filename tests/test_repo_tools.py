@@ -874,7 +874,7 @@ def test_changes_requested_rebase_push_uses_exact_head_lease(tmp_path: Path) -> 
 
 
 @pytest.mark.parametrize("operation", ["merge", "rebase", "revert"])
-@pytest.mark.parametrize("stale", [False, True])
+@pytest.mark.parametrize("stale", [False, True, "race"])
 def test_heartbeat_live_scope_executes_git_remediation(tmp_path, monkeypatch, operation, stale):
     import mimir.access_control as access
     import mimir.tools.forge as forge
@@ -913,7 +913,25 @@ def test_heartbeat_live_scope_executes_git_remediation(tmp_path, monkeypatch, op
         state.action_scope, owner="mimir-bot",
         lease_root=previous_state.checkout_lease.lease_root, review_state=state,
     )
-    tools = RepoGitTools(state)
+    calls = []
+    concurrent = None
+
+    def advance_remote():
+        _git(source, "checkout", "-q", "worklink/7")
+        (source / "concurrent.txt").write_text("concurrent\n", encoding="utf-8")
+        _git(source, "add", "concurrent.txt")
+        _git(source, "commit", "-qm", "concurrent")
+        _git(source, "push", "-q", "origin", "HEAD:worklink/7")
+        return _git(origin, "rev-parse", previous.destination_ref)
+
+    def runner(argv, *, env, timeout, output_limit):
+        nonlocal concurrent
+        calls.append(argv)
+        if stale == "race" and "push" in argv:
+            concurrent = advance_remote()
+        return _bounded_subprocess_runner(argv, env=env, timeout=timeout, output_limit=output_limit)
+
+    tools = RepoGitTools(state, runner=runner)
     assert tools.execute({
         "merge": GitMerge(), "rebase": GitRebase(),
         "revert": GitRevert(previous.observed_head_sha),
@@ -921,19 +939,21 @@ def test_heartbeat_live_scope_executes_git_remediation(tmp_path, monkeypatch, op
     (lease.path / "tracked.txt").write_text("heartbeat remediation\n", encoding="utf-8")
     assert tools.execute(GitCommit(("tracked.txt",), "heartbeat remediation")).ok
     if stale:
-        _git(source, "checkout", "-q", "worklink/7")
-        (source / "concurrent.txt").write_text("concurrent\n", encoding="utf-8")
-        _git(source, "add", "concurrent.txt")
-        _git(source, "commit", "-qm", "concurrent")
-        _git(source, "push", "-q", "origin", "HEAD:worklink/7")
-        concurrent = _git(origin, "rev-parse", previous.destination_ref)
+        if stale is True:
+            concurrent = advance_remote()
         with pytest.raises(GitRefusal) as refused:
             tools.execute(GitPush())
-        assert refused.value.code == "stale_scope"
+        assert refused.value.code == ("stale_scope" if stale is True else "git_failed")
         assert _git(origin, "rev-parse", previous.destination_ref) == concurrent
+        assert any("push" in argv for argv in calls) is (stale == "race")
     else:
         assert tools.execute(GitPush()).ok
         assert _git(origin, "rev-parse", previous.destination_ref) == _git(lease.path, "rev-parse", "HEAD")
+        push = next(argv for argv in calls if "push" in argv)
+        if operation == "rebase":
+            assert f"--force-with-lease={previous.destination_ref}:{previous.observed_head_sha}" in push
+        else:
+            assert not any(arg.startswith("--force") for arg in push)
 
 
 def test_head_accepted_by_rewritten_push_is_accepted_by_cleanup_when_commit_skipped(

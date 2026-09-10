@@ -1073,6 +1073,37 @@ async def test_mcp_client_import_bug_remains_fatal(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("enabled", [False, True])
+async def test_startup_logs_effective_lease_read_scope(tmp_path, monkeypatch, enabled):
+    from mimir.read_policy import configured_non_admin_read_roots
+
+    home = tmp_path / "home"
+    home.mkdir()
+    root = tmp_path / "leases"
+    root.mkdir()
+    monkeypatch.setenv("MIMIR_CODING_ENABLED", "1" if enabled else "0")
+    monkeypatch.setenv("MIMIR_FILE_TOOL_ROOTS", "")
+    monkeypatch.setenv("MIMIR_PR_CHECKOUT_LEASE_ROOT", str(root))
+    app, control = _controlled_server_app(home, monkeypatch)
+    await _run_startup(app)
+    try:
+        payloads = [
+            fields for kind, fields in control.event_payloads
+            if kind == "filesystem_read_scope"
+        ]
+        assert payloads == [{
+            "coding_enabled": enabled,
+            "derived_pr_checkout_read_roots": [str(root)] if enabled else [],
+            "effective_non_admin_read_roots": [
+                str(path) for path in configured_non_admin_read_roots()
+            ],
+        }]
+        assert (str(root) in payloads[0]["effective_non_admin_read_roots"]) is enabled
+    finally:
+        await _run_cleanup(app)
+
+
+@pytest.mark.asyncio
 async def test_operational_startup_order_and_mcp_bundle_publication(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

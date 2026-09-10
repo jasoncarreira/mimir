@@ -420,6 +420,7 @@ def _resolve_heartbeat_git_state(
     from ..access_control import (
         can_resolve_forge_review_scope,
         create_server_discovered_heartbeat_scope,
+        heartbeat_cached_scope_refusal,
         is_configured_github_repo,
     )
 
@@ -469,19 +470,9 @@ def _resolve_heartbeat_git_state(
     if existing is not None:
         # Never re-pin a live checkout after the provider advances. Git publication
         # also checks the remote ref, closing the race after this API observation.
-        previous = existing.action_scope
-        if any(getattr(previous, name) != getattr(scope, name) for name in (
-            "canonical_repo", "pr_number", "canonical_root", "canonical_origin",
-            "head_repo", "head_remote", "destination_ref", "observed_head_sha",
-            "base_ref", "observed_base_sha",
-        )):
-            raise ToolPolicyRefusal("stale_scope: heartbeat PR SHA/ref or repository binding changed")
-        if any(getattr(previous, name) != getattr(scope, name) for name in (
-            "event_type", "allowed_operations", "checkout_ref", "provenance",
-        )):
-            raise ToolPolicyRefusal(
-                "heartbeat_scope_incompatible: cached scope is not heartbeat PR maintenance authority"
-            )
+        refusal = heartbeat_cached_scope_refusal(existing.action_scope, scope)
+        if refusal is not None:
+            raise ToolPolicyRefusal(refusal)
         return existing
     state = RepoReviewState(scope)
     return cache.remember(state) if cache is not None else state

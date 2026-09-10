@@ -231,6 +231,33 @@ def test_coding_startup_writable_root_and_identity_gate(monkeypatch, tmp_path, d
     assert list(tmp_path.iterdir()) == []
 
 
+def test_coding_startup_rejects_existing_relative_lease_root(monkeypatch, tmp_path):
+    from mimir.tools import all_mimir_tools
+
+    monkeypatch.setattr("mimir.providers.opencode_available", lambda: True)
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "leases").mkdir()
+    monkeypatch.setenv("MIMIR_PR_CHECKOUT_LEASE_ROOT", "leases")
+    with pytest.raises(RuntimeError, match="not configured as an absolute path"):
+        all_mimir_tools(coding_enabled=True)
+
+
+def test_coding_startup_rejects_executable_directory_as_git(monkeypatch, tmp_path):
+    from pathlib import Path
+    from mimir.tools import all_mimir_tools, registry
+
+    git_directory = tmp_path / "git"
+    git_directory.mkdir()
+    monkeypatch.setattr(
+        registry, "Path",
+        lambda value: git_directory if value == "/usr/bin/git" else Path(value),
+    )
+    monkeypatch.setattr("mimir.providers.opencode_available", lambda: True)
+    monkeypatch.setenv("MIMIR_PR_CHECKOUT_LEASE_ROOT", str(tmp_path))
+    with pytest.raises(RuntimeError, match="pinned Git binary /usr/bin/git"):
+        all_mimir_tools(coding_enabled=True)
+
+
 def test_declarative_coding_inventory_does_not_probe_cli_availability(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
