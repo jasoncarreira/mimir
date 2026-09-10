@@ -23,7 +23,7 @@ MAX_PROJECTION_BYTES = 1024 * 1024
 CANCEL_SOCKET_TIMEOUT_S = 20.0
 # Keep this literal independent from worker_exec. The executor runs its image-owned
 # copy, so changing either side of the launch contract requires an image rebuild.
-EXECUTOR_PROTOCOL_IDENTITY = "worklink-executor-v7-factory-path-checkout"
+EXECUTOR_PROTOCOL_IDENTITY = "worklink-executor-v8-factory-subreaper"
 STALE_EXECUTOR_DIAGNOSTIC = (
     "stale root executor image: controller and mimir.worklink.worker_exec protocol "
     "or source identities do not match; rebuild the image and restart the container"
@@ -78,10 +78,29 @@ class WorkerProcess:
     async def wait(self) -> int:
         if self.returncode is None:
             loop = asyncio.get_running_loop()
-            payload = await loop.run_in_executor(None, self._socket.recv, 4096)
-            if not payload:
-                raise RuntimeError("worker executor closed before terminal result")
-            response = json.loads(payload)
+            while True:
+                payload = await loop.run_in_executor(None, self._socket.recv, 4096)
+                if not payload:
+                    raise RuntimeError("worker executor closed before terminal result")
+                response = json.loads(payload)
+                if response.get("id") != self.identifier:
+                    raise RuntimeError("worker executor returned an invalid terminal/event identity")
+                if response.get("status") != "event":
+                    break
+                from ..event_logger import safe_log_event
+
+                event = response.get("event")
+                if event not in {
+                    "worklink_factory_orphan_adopted", "worklink_factory_reap_refused",
+                    "worklink_factory_supervisor_lost",
+                }:
+                    raise RuntimeError("worker executor returned an invalid event")
+                await safe_log_event(event, **{
+                    key: value for key, value in response.items()
+                    if key in {"run_id", "issue_id", "attempt", "pid", "error"}
+                })
+            if "error" in response:
+                raise RuntimeError(str(response["error"]))
             if response.get("id") != self.identifier or response.get("status") != "terminal":
                 raise RuntimeError("worker executor returned an invalid terminal result")
             self.returncode = int(response["exit_code"])

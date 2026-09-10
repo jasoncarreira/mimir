@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import array
 import ctypes
+from dataclasses import dataclass, field
 import json
 import os
 from pathlib import Path, PurePosixPath
@@ -16,7 +17,7 @@ import subprocess
 import sys
 import threading
 import time
-from typing import Any
+from typing import Any, Callable
 
 from .._rmtree import rmtree_missing_ok
 from .checkout import _normalize_checkout_fd
@@ -38,7 +39,7 @@ REPO_TEST_UV_CACHE = Path("/opt/mimir-worklink/uv-cache")
 MAX_FDS = 3
 # Deliberately not imported from worker_client: this value must describe the
 # immutable executor installed in the root-owned image, not mutable controller code.
-EXECUTOR_PROTOCOL_IDENTITY = "worklink-executor-v7-factory-path-checkout"
+EXECUTOR_PROTOCOL_IDENTITY = "worklink-executor-v8-factory-subreaper"
 EXECUTOR_SOURCE_COMMIT_PATH = Path("/opt/mimir-worklink/executor-source-commit")
 _STALE_EXECUTOR_DIAGNOSTIC = (
     "stale root executor image: controller and mimir.worklink.worker_exec protocol "
@@ -68,10 +69,45 @@ _PATH_LAUNCH_FIELDS = frozenset({
 })
 _CANCEL_FIELDS = frozenset({"version", "op", "id", "executor_identity"})
 _IDENTITY_FIELDS = frozenset({"version", "op", "executor_identity"})
-_jobs: dict[str, subprocess.Popen[bytes]] = {}
+_jobs: dict[str, subprocess.Popen[bytes] | _FactoryProcess] = {}
 _launching: set[str] = set()
 _jobs_lock = threading.Lock()
 _OUTPUT_LIMIT_POLL_S = 0.01
+_FACTORY_STOP_TIMEOUT_S = 5.0
+
+
+@dataclass
+class _FactoryProcess:
+    process: subprocess.Popen[bytes]
+    channel: socket.socket
+    emit: Callable[[dict[str, Any]], None]
+    done: threading.Event = field(default_factory=threading.Event)
+    error: str | None = None
+    returncode: int | None = None
+    stop_deadline: float | None = None
+
+    @property
+    def pid(self) -> int:
+        return self.process.pid
+
+    def request_stop(self) -> None:
+        if self.done.is_set():
+            return
+        if self.stop_deadline is None:
+            self.stop_deadline = time.monotonic() + _FACTORY_STOP_TIMEOUT_S
+        try:
+            self.channel.send(b"stop", socket.MSG_DONTWAIT)
+        except OSError:
+            # A full queue already carries a stop; EOF means the monitor will
+            # detect the lost supervisor rather than acknowledging cleanup.
+            pass
+
+    def stop(self) -> None:
+        self.request_stop()
+        if not self.done.wait(_FACTORY_STOP_TIMEOUT_S + _PROCESS_REAP_TIMEOUT_S):
+            raise RuntimeError("worklink_factory_reap_refused: supervisor did not finish")
+        if self.error is not None:
+            raise RuntimeError(self.error)
 
 
 class _CapHeader(ctypes.Structure):
@@ -521,6 +557,9 @@ def _terminate_process_group_pid(process_group: int, timeout_s: float = 5.0) -> 
 
 
 def _terminate_process_group(proc: subprocess.Popen[bytes], timeout_s: float = 5.0) -> None:
+    if isinstance(proc, _FactoryProcess):
+        proc.stop()
+        return
     _terminate_process_group_pid(proc.pid, timeout_s)
     try:
         proc.wait(timeout=_PROCESS_REAP_TIMEOUT_S)
@@ -538,8 +577,14 @@ def _cancel(identifier: str) -> None:
     _terminate_process_group(proc)
 
 
-def _send(connection: socket.socket, response: dict[str, object]) -> None:
-    connection.send(json.dumps(response, separators=(",", ":")).encode())
+def _send(
+    connection: socket.socket, response: dict[str, object], *, nonblocking: bool = False,
+) -> None:
+    payload = json.dumps(response, separators=(",", ":")).encode()
+    if nonblocking:
+        connection.send(payload, socket.MSG_DONTWAIT)
+    else:
+        connection.send(payload)
 
 
 def _validate_executor_identity(request: dict[str, Any]) -> None:
@@ -595,6 +640,8 @@ def _wait_with_output_limits(
     happens before process-group termination so the durable files never retain
     more than the configured cap.
     """
+    if isinstance(proc, _FactoryProcess):
+        return _wait_factory(proc, timeout_s, stdout_fd, stdout_limit, stderr_fd, stderr_limit)
     deadline = time.monotonic() + timeout_s + _CONTROLLER_CANCELLATION_GRACE_S
     while True:
         for fd, limit in ((stdout_fd, stdout_limit), (stderr_fd, stderr_limit)):
@@ -610,6 +657,75 @@ def _wait_with_output_limits(
             _terminate_process_group(proc)
             return proc.returncode if proc.returncode is not None else -signal.SIGKILL, True, False
         time.sleep(_OUTPUT_LIMIT_POLL_S)
+
+
+def _wait_factory(
+    proc: _FactoryProcess, timeout_s: float,
+    stdout_fd: int, stdout_limit: int, stderr_fd: int, stderr_limit: int,
+) -> tuple[int, bool, bool]:
+    deadline = time.monotonic() + timeout_s + _CONTROLLER_CANCELLATION_GRACE_S
+    ready = False
+    timed_out = overflow = False
+    proc.channel.setblocking(False)
+    try:
+        while True:
+            for fd, limit in ((stdout_fd, stdout_limit), (stderr_fd, stderr_limit)):
+                if os.fstat(fd).st_size > limit:
+                    os.ftruncate(fd, limit)
+                    overflow = True
+            timed_out = timed_out or time.monotonic() >= deadline
+            if (overflow or timed_out) and proc.stop_deadline is None:
+                proc.request_stop()
+            try:
+                raw = proc.channel.recv(4096)
+            except BlockingIOError:
+                raw = None
+            if raw == b"":
+                raise RuntimeError("worklink_factory_supervisor_lost: no terminal cleanup report")
+            if raw:
+                packet = json.loads(raw)
+                kind = packet.get("kind")
+                if kind == "ready" and not ready:
+                    ready = True
+                elif kind == "event" and packet.get("event") in {
+                    "worklink_factory_orphan_adopted", "worklink_factory_reap_refused",
+                }:
+                    proc.emit(packet)
+                elif kind == "terminal":
+                    if "error" in packet:
+                        raise RuntimeError(f"worklink_factory_reap_refused: {packet['error']}")
+                    if not ready or type(packet.get("exit_code")) is not int:
+                        raise RuntimeError("worklink_factory_supervisor_lost: invalid cleanup report")
+                    if proc.process.wait(timeout=_PROCESS_REAP_TIMEOUT_S) != 0:
+                        raise RuntimeError("worklink_factory_supervisor_lost: abnormal supervisor exit")
+                    proc.returncode = packet["exit_code"]
+                    return proc.returncode, timed_out, overflow
+                else:
+                    raise RuntimeError("worklink_factory_supervisor_lost: invalid supervisor packet")
+            if proc.stop_deadline is not None and time.monotonic() >= proc.stop_deadline:
+                raise RuntimeError("worklink_factory_reap_refused: supervisor stop deadline exceeded")
+            time.sleep(_OUTPUT_LIMIT_POLL_S)
+    except Exception as exc:
+        proc.error = str(exc)
+        try:
+            proc.emit({"kind": "event", "event": "worklink_factory_supervisor_lost", "error": proc.error})
+        except OSError:
+            pass
+        raise
+    finally:
+        # Closing the exclusive control channel requests cleanup even if the
+        # controller disconnected. Never kill the supervisor's group: it must
+        # remain alive to collect orphans. Only a bounded failed supervisor is
+        # killed, and that loss is explicitly reported above.
+        proc.channel.close()
+        try:
+            proc.process.wait(timeout=_FACTORY_STOP_TIMEOUT_S)
+        except subprocess.TimeoutExpired:
+            proc.error = "worklink_factory_reap_refused: supervisor failed to exit"
+            proc.process.kill()
+            proc.process.wait(timeout=_PROCESS_REAP_TIMEOUT_S)
+        finally:
+            proc.done.set()
 
 
 def _handle_launch(connection: socket.socket, request: dict[str, Any], fds: list[int]) -> None:
@@ -652,7 +768,8 @@ def _handle_launch(connection: socket.socket, request: dict[str, Any], fds: list
             raise RuntimeError("worker id is already active")
         _launching.add(identifier)
     home = Path()
-    proc: subprocess.Popen[bytes] | None = None
+    proc: subprocess.Popen[bytes] | _FactoryProcess | None = None
+    supervisor_parent = supervisor_child = None
     try:
         anchored_fd = os.open(
             ".",
@@ -679,20 +796,42 @@ def _handle_launch(connection: socket.socket, request: dict[str, Any], fds: list
         os.close(anchored_fd)
         anchored_fd = execution_fd
         fds[0] = anchored_fd
+        factory = request.get("op") == "launch_factory"
+        launch_command = command
+        if factory:
+            if sys.platform != "linux":
+                raise RuntimeError("worklink_factory_reap_refused: PR_SET_CHILD_SUBREAPER requires Linux")
+            supervisor_parent, supervisor_child = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+            # This filename and interpreter belong to the installed executor,
+            # not the writable checkout. -I excludes PYTHONPATH and user sites.
+            launch_command = [
+                sys.executable, "-I", str(Path(__file__).with_name("factory_supervisor.py")),
+                str(supervisor_child.fileno()), *command,
+            ]
         proc = subprocess.Popen(
-            command,
+            launch_command,
             stdin=subprocess.DEVNULL,
             stdout=fds[1],
             stderr=fds[2],
             env=environment,
             preexec_fn=(
                 (lambda: _drop_factory(fds[0], home))
-                if request.get("op") == "launch_factory"
+                if factory
                 else (lambda: _drop_worker(fds[0]))
             ),
             close_fds=True,
-            pass_fds=(fds[0],),
+            pass_fds=(fds[0], supervisor_child.fileno()) if factory else (fds[0],),
         )
+        if factory:
+            supervisor_child.close()
+
+            def emit(packet: dict[str, Any]) -> None:
+                connection.send(json.dumps({
+                    **packet, "status": "event", "id": identifier,
+                    "run_id": identifier, "issue_id": request["issue"], "attempt": request["attempt"],
+                }).encode(), socket.MSG_DONTWAIT)
+
+            proc = _FactoryProcess(proc, supervisor_parent, emit)
         with _jobs_lock:
             _jobs[identifier] = proc
             _launching.remove(identifier)
@@ -715,13 +854,25 @@ def _handle_launch(connection: socket.socket, request: dict[str, Any], fds: list
             "exit_code": exit_code,
             "timed_out": timed_out,
             "output_overflow": output_overflow,
-        })
+        }, nonblocking=factory)
     finally:
         with _jobs_lock:
             _launching.discard(identifier)
             active = _jobs.pop(identifier, None) if _jobs.get(identifier) is proc else None
-        if active is not None and active.poll() is None:
+        if isinstance(active, _FactoryProcess):
+            if not active.done.is_set():
+                active.channel.close()
+                try:
+                    active.process.wait(timeout=_FACTORY_STOP_TIMEOUT_S)
+                except subprocess.TimeoutExpired:
+                    active.process.kill()
+                    active.process.wait(timeout=_PROCESS_REAP_TIMEOUT_S)
+                    raise RuntimeError("worklink_factory_reap_refused: supervisor failed during launch")
+        elif active is not None and active.poll() is None:
             _terminate_process_group(active)
+        for channel in (supervisor_parent, supervisor_child):
+            if channel is not None:
+                channel.close()
         if home != Path():
             _cleanup_home(home)
 
@@ -758,7 +909,9 @@ def handle_connection(connection: socket.socket) -> None:
             raise RuntimeError("unsupported worker operation")
     except Exception as exc:
         try:
-            _send(connection, {"id": identifier, "error": str(exc)})
+            # In particular, adoption events can fill an undrained controller
+            # socket. Reporting that failure must not strand an executor thread.
+            _send(connection, {"id": identifier, "error": str(exc)}, nonblocking=True)
         except OSError:
             pass
     finally:
