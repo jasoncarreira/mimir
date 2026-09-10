@@ -176,51 +176,51 @@ async def test_hosted_shell_allows_terminal_environment_but_strips_proxy_secrets
     def sent() -> list[dict[str, object]]:
         return [json.loads(line) for line in daemon_stream.getvalue().splitlines()]
 
-    try:
-        await router.route_client({
-            "jsonrpc": "2.0", "id": "new", "method": "session/new",
-            "params": {"cwd": str(tmp_path)},
-        })
-        server_id = sent()[-1]["params"]["mcpServers"][0]["serverId"]
-        await router.route_daemon({
-            "jsonrpc": "2.0", "id": 1, "method": "mcp/connect",
-            "params": {"serverId": server_id},
-        })
-        connection_id = sent()[-1]["result"]["connectionId"]
-        await router.route_daemon({
-            "jsonrpc": "2.0", "id": 2, "method": "mcp/message", "params": {
-                "connectionId": connection_id, "method": "initialize", "params": {
-                    "protocolVersion": "2025-03-26", "capabilities": {},
-                    "clientInfo": {"name": "client", "version": "1"},
+    # Whole-protocol hang ceiling, including the real Seatbelt shell startup.
+    async with asyncio.timeout(120):
+        try:
+            await router.route_client({
+                "jsonrpc": "2.0", "id": "new", "method": "session/new",
+                "params": {"cwd": str(tmp_path)},
+            })
+            server_id = sent()[-1]["params"]["mcpServers"][0]["serverId"]
+            await router.route_daemon({
+                "jsonrpc": "2.0", "id": 1, "method": "mcp/connect",
+                "params": {"serverId": server_id},
+            })
+            connection_id = sent()[-1]["result"]["connectionId"]
+            await router.route_daemon({
+                "jsonrpc": "2.0", "id": 2, "method": "mcp/message", "params": {
+                    "connectionId": connection_id, "method": "initialize", "params": {
+                        "protocolVersion": "2025-03-26", "capabilities": {},
+                        "clientInfo": {"name": "client", "version": "1"},
+                    },
                 },
-            },
-        })
-        await asyncio.sleep(0)
-        await router.route_daemon({
-            "jsonrpc": "2.0", "method": "mcp/message", "params": {
-                "connectionId": connection_id,
-                "method": "notifications/initialized",
-                "params": {},
-            },
-        })
-        await router.route_daemon({"jsonrpc": "2.0", "id": "new", "result": {"sessionId": "s"}})
-        await router.route_daemon({
-            "jsonrpc": "2.0", "id": 3, "method": "mcp/message", "params": {
-                "connectionId": connection_id, "method": "tools/call", "params": {
-                    "name": "shell",
-                    "arguments": {"command": "printf '%s:%s:%s' \"$TERM\" \"${ROUTER_LOCAL_VALUE-unset}\" \"${MIMIR_WEB_KEY-unset}\""},
+            })
+            await asyncio.sleep(0)
+            await router.route_daemon({
+                "jsonrpc": "2.0", "method": "mcp/message", "params": {
+                    "connectionId": connection_id,
+                    "method": "notifications/initialized",
+                    "params": {},
                 },
-            },
-        })
-        for _ in range(100):
-            await asyncio.sleep(0.01)
-            if sent()[-1].get("id") == 3:
-                break
-        assert sent()[-1]["result"]["structuredContent"]["stdout"] == "mimir-test-terminal:unset:unset"
-        for secret in (b"raw-web-key", b"environment-web-key", b"local-secret"):
-            assert secret not in daemon_stream.getvalue()
-    finally:
-        await router.close()
+            })
+            await router.route_daemon({"jsonrpc": "2.0", "id": "new", "result": {"sessionId": "s"}})
+            await router.route_daemon({
+                "jsonrpc": "2.0", "id": 3, "method": "mcp/message", "params": {
+                    "connectionId": connection_id, "method": "tools/call", "params": {
+                        "name": "shell",
+                        "arguments": {"command": "printf '%s:%s:%s' \"$TERM\" \"${ROUTER_LOCAL_VALUE-unset}\" \"${MIMIR_WEB_KEY-unset}\""},
+                    },
+                },
+            })
+            while sent()[-1].get("id") != 3:
+                await asyncio.sleep(0.01)
+            assert sent()[-1]["result"]["structuredContent"]["stdout"] == "mimir-test-terminal:unset:unset"
+            for secret in (b"raw-web-key", b"environment-web-key", b"local-secret"):
+                assert secret not in daemon_stream.getvalue()
+        finally:
+            await router.close()
 
 
 @pytest.mark.asyncio
@@ -563,11 +563,10 @@ async def test_early_child_failure_cancels_open_client_stdin(monkeypatch: pytest
     output = io.BytesIO()
     transport = type("Transport", (), {"close": lambda self: None})()
     monkeypatch.setattr("mimir.acp.ssh.open_stdio", lambda target: asyncio.sleep(0, result=(reader, Output(target), transport)))
-    with pytest.raises(SshError, match="SSH connection failed"):
-        await asyncio.wait_for(
-            run_ssh_proxy(profile, "secret", output, _ssh_path=ssh, _environment={"PATH": os.environ.get("PATH", "")}),
-            2,
-        )
+    # Whole-protocol hang ceiling, not a deadline for interpreter startup.
+    async with asyncio.timeout(120):
+        with pytest.raises(SshError, match="SSH connection failed"):
+            await run_ssh_proxy(profile, "secret", output, _ssh_path=ssh, _environment={"PATH": os.environ.get("PATH", "")})
 
 
 @pytest.mark.asyncio
@@ -588,14 +587,19 @@ for line in sys.stdin.buffer: time.sleep(10)
     output = io.BytesIO()
     transport = type("Transport", (), {"close": lambda self: None})()
     monkeypatch.setattr("mimir.acp.ssh.open_stdio", lambda target: asyncio.sleep(0, result=(reader, Output(target), transport)))
-    task = asyncio.create_task(run_ssh_proxy(profile, "secret", output, _ssh_path=ssh, _environment={"PATH": os.environ.get("PATH", ""), "MARKER": str(marker)}))
-    async with asyncio.timeout(5):
-        while not Path(str(marker) + ".ready").exists():
-            await asyncio.sleep(0.01)
-    task.cancel()
-    with pytest.raises(asyncio.CancelledError):
-        await task
-    assert marker.read_text() == "terminated"
+    # Readiness and teardown share one whole-protocol hang ceiling.
+    async with asyncio.timeout(120):
+        task = asyncio.create_task(run_ssh_proxy(profile, "secret", output, _ssh_path=ssh, _environment={"PATH": os.environ.get("PATH", ""), "MARKER": str(marker)}))
+        try:
+            while not Path(str(marker) + ".ready").exists():
+                await asyncio.sleep(0.01)
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            assert marker.read_text() == "terminated"
+        finally:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
 
 
 @pytest.mark.asyncio
@@ -618,25 +622,29 @@ while True: time.sleep(1)
     monkeypatch.setattr("mimir.acp.ssh.open_stdio", lambda target: asyncio.sleep(0, result=(reader, Output(target), transport)))
     monkeypatch.setattr("mimir.acp.ssh.WAIT_TIMEOUT", 0.02)
     monkeypatch.setattr("mimir.acp.ssh.TERMINATE_TIMEOUT", 0.05)
-    task = asyncio.create_task(run_ssh_proxy(
-        profile, "secret", output, _ssh_path=ssh,
-        _environment={"PATH": os.environ.get("PATH", ""), "MARKER": str(marker)},
-    ))
-    marker_data = None
-    for _ in range(200):
+    # Readiness and teardown share one whole-protocol hang ceiling.
+    async with asyncio.timeout(120):
+        task = asyncio.create_task(run_ssh_proxy(
+            profile, "secret", output, _ssh_path=ssh,
+            _environment={"PATH": os.environ.get("PATH", ""), "MARKER": str(marker)},
+        ))
         try:
-            marker_data = json.loads(marker.read_text())
-            break
-        except (OSError, json.JSONDecodeError):
-            await asyncio.sleep(0.01)
-    assert marker_data is not None
-    pid = marker_data["pid"]
-    task.cancel()
-    with pytest.raises(asyncio.CancelledError):
-        await asyncio.wait_for(task, 10)
-    assert json.loads(marker.read_text())["terminated"] is True
-    with pytest.raises(ProcessLookupError):
-        os.kill(pid, 0)
+            while True:
+                try:
+                    marker_data = json.loads(marker.read_text())
+                    break
+                except (OSError, json.JSONDecodeError):
+                    await asyncio.sleep(0.01)
+            pid = marker_data["pid"]
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(task, 10)
+            assert json.loads(marker.read_text())["terminated"] is True
+            with pytest.raises(ProcessLookupError):
+                os.kill(pid, 0)
+        finally:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
 
 
 @pytest.mark.asyncio
@@ -666,23 +674,25 @@ async def test_cancellation_during_writer_cleanup_reaps_child(monkeypatch: pytes
     )))
     monkeypatch.setattr("mimir.acp.ssh.run_router", AsyncMock(side_effect=SshError("router failed")))
     monkeypatch.setattr("mimir.acp.ssh.WAIT_TIMEOUT", 0.02)
-    task = asyncio.create_task(run_ssh_proxy(profile, "secret", output, _ssh_path=ssh))
-    try:
-        await asyncio.wait_for(closing.wait(), 10)
-        task.cancel()
-        with pytest.raises(asyncio.CancelledError):
-            await asyncio.wait_for(task, 10)
-        assert processes[0].returncode is not None
-        with pytest.raises(ProcessLookupError):
-            os.kill(processes[0].pid, 0)
-    finally:
-        if not task.done():
+    # Cleanup entry is downstream of spawn, so bound the whole protocol.
+    async with asyncio.timeout(120):
+        task = asyncio.create_task(run_ssh_proxy(profile, "secret", output, _ssh_path=ssh))
+        try:
+            await closing.wait()
             task.cancel()
-        await asyncio.gather(task, return_exceptions=True)
-        for process in processes:
-            if process.returncode is None:
-                process.kill()
-            await process.wait()
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(task, 10)
+            assert processes[0].returncode is not None
+            with pytest.raises(ProcessLookupError):
+                os.kill(processes[0].pid, 0)
+        finally:
+            if not task.done():
+                task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+            for process in processes:
+                if process.returncode is None:
+                    process.kill()
+                await process.wait()
 
 
 @pytest.mark.asyncio
@@ -708,23 +718,27 @@ while True:
     monkeypatch.setattr("mimir.acp.ssh.open_stdio", open_stdio)
     monkeypatch.setattr("mimir.acp.ssh.WAIT_TIMEOUT", 0.02)
     monkeypatch.setattr("mimir.acp.ssh.TERMINATE_TIMEOUT", 0.05)
-    task = asyncio.create_task(run_ssh_proxy(
-        profile, "secret", output, _ssh_path=ssh,
-        _environment={"PATH": os.environ.get("PATH", ""), "MARKER": str(marker)},
-    ))
-    pid = None
-    for _ in range(200):
+    # Readiness and teardown share one whole-protocol hang ceiling.
+    async with asyncio.timeout(120):
+        task = asyncio.create_task(run_ssh_proxy(
+            profile, "secret", output, _ssh_path=ssh,
+            _environment={"PATH": os.environ.get("PATH", ""), "MARKER": str(marker)},
+        ))
         try:
-            pid = int(marker.read_text())
-            break
-        except (OSError, ValueError):
-            await asyncio.sleep(0.01)
-    assert pid is not None
-    await asyncio.sleep(0.05)
-    assert not task.done()
-    task.cancel()
-    with pytest.raises(asyncio.CancelledError):
-        await asyncio.wait_for(task, 10)
-    os.close(read_fd)
-    with pytest.raises(ProcessLookupError):
-        os.kill(pid, 0)
+            while True:
+                try:
+                    pid = int(marker.read_text())
+                    break
+                except (OSError, ValueError):
+                    await asyncio.sleep(0.01)
+            await asyncio.sleep(0.05)
+            assert not task.done()
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(task, 10)
+            with pytest.raises(ProcessLookupError):
+                os.kill(pid, 0)
+        finally:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+            os.close(read_fd)
