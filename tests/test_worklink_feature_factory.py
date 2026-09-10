@@ -1047,7 +1047,8 @@ async def test_launch_child_environment_carries_the_publishing_identity(
         branch="epic/1551",
         test_command="uv run pytest -q",
     )
-    compute = LocalSubprocessComputeBackend()
+    # The contained executor is mocked; production accounts are not a test input.
+    compute = LocalSubprocessComputeBackend(_worker_client=object())
     handle = await compute.launch(spec)
     try:
         await compute.wait(handle, 30)

@@ -3820,9 +3820,16 @@ def _run_factory_preflight_case(
     outcome: str | None = None,
     release_signals: list[str] | None = None,
     checkout_calls: list[dict[str, Any]] | None = None,
+    sandbox_gid: int | None = None,
 ) -> tuple[object, list[WorkSpec], list[str], list[list[str]]]:
     import mimir.worklink.orchestrator as orchestrator
 
+    # The checkout and launch are mocked. Keep real chmod/chown local to the
+    # test user's group instead of requiring deployment accounts or privileges.
+    monkeypatch.setattr(
+        orchestrator, "get_identities",
+        lambda: SimpleNamespace(worklink_gid=os.getgid() if sandbox_gid is None else sandbox_gid),
+    )
     _configure_opencode_oauth(tmp_path, monkeypatch)
     if autonomous:
         (tmp_path / "worklink.yaml").write_text(
@@ -3994,9 +4001,6 @@ def test_factory_initial_local_launch_provisions_worker_sandbox_permissions(
     checkout_calls: list[dict[str, Any]] = []
     ownership: list[tuple[Path, int, int]] = []
     monkeypatch.setattr(
-        orchestrator, "get_identities", lambda: SimpleNamespace(worklink_gid=12345)
-    )
-    monkeypatch.setattr(
         orchestrator.os, "chown", lambda path, uid, gid: ownership.append((path, uid, gid))
     )
     result, launched, _, _ = _run_factory_preflight_case(
@@ -4005,6 +4009,7 @@ def test_factory_initial_local_launch_provisions_worker_sandbox_permissions(
         credentials={"GITHUB_TOKEN": "github-token"},
         outcome="needs-human",
         checkout_calls=checkout_calls,
+        sandbox_gid=12345,
     )
 
     assert result.status == "needs-human"
@@ -4420,6 +4425,10 @@ def test_factory_new_run_uses_resolved_base_for_single_checkout_placement(
 ) -> None:
     import mimir.worklink.orchestrator as orchestrator
 
+    # Placement uses a synthetic checkout owned by the test process.
+    monkeypatch.setattr(
+        orchestrator, "get_identities", lambda: SimpleNamespace(worklink_gid=os.getgid())
+    )
     _configure_opencode_oauth(tmp_path, monkeypatch)
     repo = tmp_path / "repo"
     repo.mkdir()

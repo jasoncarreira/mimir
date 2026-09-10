@@ -1079,7 +1079,8 @@ async def test_feature_factory_launch_remains_shell_free_argv(
         branch="issue/1606-a1",
         test_command="uv run pytest -q",
     )
-    compute = LocalSubprocessComputeBackend()
+    # Execution is mocked: do not resolve production OS accounts for this argv test.
+    compute = LocalSubprocessComputeBackend(_worker_client=object())
 
     handle = await compute.launch(spec)
     await compute.wait(handle, 30)
