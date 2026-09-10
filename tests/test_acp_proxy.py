@@ -1221,40 +1221,41 @@ if sys.argv[1]=='wait': loop.run_forever()
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
-    assert process.stdout is not None
-    ownership = json.loads(
-        (await asyncio.wait_for(process.stdout.readline(), 10)).decode()
-    )
-    assert ownership["pgids"] == ownership["pids"]
     try:
-        if shutdown_signal is not None:
-            process.send_signal(shutdown_signal)
-        stdout, stderr = await asyncio.wait_for(process.communicate(), 10)
-        assert process.returncode == (128 + shutdown_signal if shutdown_signal else 0), (
-            f"owned-child exit mismatch: stdout={stdout!r}, stderr={stderr!r}"
-        )
-        assert stdout == b""
-        if shutdown_signal is not None:
-            if ownership["unconfined"]:
-                # The accepted-risk audit is required; no shutdown errors or
-                # arbitrary stderr are hidden by the portable consent fixture.
-                assert json.loads(stderr) == {
-                    "type": "acp_permission_outcome",
-                    "wrapper_name": "hands_unconfined_execution",
-                    "path": "<unconfined>", "outcome": "approved",
-                    "resource_resolvable": False,
-                }
-            else:
-                assert stderr == b""
+        # One hang guard covers readiness, signal delivery, exit and reaping;
+        # the ownership marker, not a per-read deadline, orders the signal.
+        async with asyncio.timeout(120):
+            assert process.stdout is not None
+            ownership = json.loads(await process.stdout.readline())
+            assert ownership["pgids"] == ownership["pids"]
+            if shutdown_signal is not None:
+                process.send_signal(shutdown_signal)
+            stdout, stderr = await process.communicate()
+            assert process.returncode == (128 + shutdown_signal if shutdown_signal else 0), (
+                f"owned-child exit mismatch: stdout={stdout!r}, stderr={stderr!r}"
+            )
+            assert stdout == b""
+            if shutdown_signal is not None:
+                if ownership["unconfined"]:
+                    # The accepted-risk audit is required; no shutdown errors or
+                    # arbitrary stderr are hidden by the portable consent fixture.
+                    assert json.loads(stderr) == {
+                        "type": "acp_permission_outcome",
+                        "wrapper_name": "hands_unconfined_execution",
+                        "path": "<unconfined>", "outcome": "approved",
+                        "resource_resolvable": False,
+                    }
+                else:
+                    assert stderr == b""
+            assert all(
+                await asyncio.gather(
+                    *(owned_process_reaped(pid) for pid in ownership["pids"])
+                )
+            )
     finally:
         if process.returncode is None:
             process.kill()
             await process.communicate()
-    assert all(
-        await asyncio.gather(
-            *(owned_process_reaped(pid) for pid in ownership["pids"])
-        )
-    )
 
 
 @pytest.mark.asyncio
@@ -1674,7 +1675,7 @@ async def _send(process: asyncio.subprocess.Process, message: dict[str, Any]) ->
 
 async def _receive(process: asyncio.subprocess.Process, stdout: bytearray | None = None) -> dict[str, Any]:
     assert process.stdout
-    raw = await asyncio.wait_for(process.stdout.readline(), 5)
+    raw = await process.stdout.readline()
     if stdout is not None:
         stdout.extend(raw)
     return json.loads(raw)
@@ -1723,56 +1724,57 @@ async def test_real_command_path_flow_and_secret_negative_surfaces(tmp_path: Pat
     process, environment, key_file, command = await _proxy_process(tmp_path, home, secret)
     raw_stdout = bytearray()
     try:
-        initialized = await _request(process, 1, "initialize", {"protocolVersion": 1, "clientCapabilities": {}}, raw_stdout)
-        assert initialized["result"]["authMethods"][0]["id"] == "mimir-web-key"
-        assert (await _request(process, 2, "authenticate", {"methodId": "mimir-web-key", "_meta": {"mimir.fake": "forged"}}, raw_stdout))["result"] == {}
-        created = await _request(process, 3, "session/new", {
-            "cwd": "/workspace",
-            "mcpServers": [{"type": "acp", "name": "mimir-hands", "serverId": "hands"}],
-        }, raw_stdout)
-        session_id = created["result"]["sessionId"]
-        prompted = await _request(process, 4, "session/prompt", {
-            "sessionId": session_id,
-            "prompt": [{"type": "text", "text": "edit"}],
-        }, raw_stdout)
-        assert prompted["result"]["stopReason"] == "end_turn"
-        loaded = await _request(process, 5, "session/load", {
-            "cwd": "/workspace",
-            "sessionId": session_id,
-            "mcpServers": [],
-        }, raw_stdout)
-        assert loaded["result"] == {}
-        core.block = True
-        core.entered.clear()
-        await _send(process, {"jsonrpc": "2.0", "id": 6, "method": "session/prompt", "params": {
-            "sessionId": session_id,
-            "prompt": [{"type": "text", "text": "cancel"}],
-        }})
-        await asyncio.wait_for(core.entered.wait(), 5)
-        await _send(process, {"jsonrpc": "2.0", "method": "session/cancel", "params": {"sessionId": session_id}})
-        while True:
-            response = await _receive(process, raw_stdout)
-            if response.get("id") == 6:
-                break
-            await _answer_client_request(process, response)
-        assert response["result"]["stopReason"] == "cancelled"
-        assert daemon._agent is not None and daemon._agent._bundle is bundle
-        assert core.calls == 2
-    finally:
-        assert process.stdin and process.stdout
-        process.stdin.close()
-        stdout_drain = asyncio.create_task(process.stdout.read())
-        try:
+        # Responses and turn entry order the protocol; only the whole exchange
+        # through EOF and process exit has a harness deadline.
+        async with asyncio.timeout(120):
+            initialized = await _request(process, 1, "initialize", {"protocolVersion": 1, "clientCapabilities": {}}, raw_stdout)
+            assert initialized["result"]["authMethods"][0]["id"] == "mimir-web-key"
+            assert (await _request(process, 2, "authenticate", {"methodId": "mimir-web-key", "_meta": {"mimir.fake": "forged"}}, raw_stdout))["result"] == {}
+            created = await _request(process, 3, "session/new", {
+                "cwd": "/workspace",
+                "mcpServers": [{"type": "acp", "name": "mimir-hands", "serverId": "hands"}],
+            }, raw_stdout)
+            session_id = created["result"]["sessionId"]
+            prompted = await _request(process, 4, "session/prompt", {
+                "sessionId": session_id,
+                "prompt": [{"type": "text", "text": "edit"}],
+            }, raw_stdout)
+            assert prompted["result"]["stopReason"] == "end_turn"
+            loaded = await _request(process, 5, "session/load", {
+                "cwd": "/workspace",
+                "sessionId": session_id,
+                "mcpServers": [],
+            }, raw_stdout)
+            assert loaded["result"] == {}
+            core.block = True
+            core.entered.clear()
+            await _send(process, {"jsonrpc": "2.0", "id": 6, "method": "session/prompt", "params": {
+                "sessionId": session_id,
+                "prompt": [{"type": "text", "text": "cancel"}],
+            }})
+            await core.entered.wait()
+            await _send(process, {"jsonrpc": "2.0", "method": "session/cancel", "params": {"sessionId": session_id}})
+            while True:
+                response = await _receive(process, raw_stdout)
+                if response.get("id") == 6:
+                    break
+                await _answer_client_request(process, response)
+            assert response["result"]["stopReason"] == "cancelled"
+            assert daemon._agent is not None and daemon._agent._bundle is bundle
+            assert core.calls == 2
+            assert process.stdin
+            process.stdin.close()
             await process.stdin.wait_closed()
-            stderr = await process.stderr.read() if process.stderr else b""
-            await asyncio.wait_for(process.wait(), 10)
-            raw_stdout.extend(await stdout_drain)
+            stdout, stderr = await process.communicate()
+            raw_stdout.extend(stdout)
+            assert process.returncode == 0, stderr.decode()
+    finally:
+        try:
+            if process.returncode is None:
+                process.kill()
+                await process.communicate()
         finally:
-            if not stdout_drain.done():
-                stdout_drain.cancel()
-                await asyncio.gather(stdout_drain, return_exceptions=True)
-        await daemon.stop()
-    assert process.returncode == 0, stderr.decode()
+            await daemon.stop()
     profile_bytes = (tmp_path / "config" / "mimir" / "acp" / "profiles.json").read_bytes()
     persisted = b"".join(path.read_bytes() for path in home.rglob("*") if path.is_file())
     exposed = b"\n".join([
@@ -1798,18 +1800,27 @@ async def test_invalid_key_reaches_actual_daemon_rejection_through_credential_pa
     await daemon.start()
     process, _, _, _ = await _proxy_process(tmp_path, home, "invalid-key")
     try:
-        response = await _request(process, 1, "authenticate", {"methodId": "mimir-web-key"})
-        assert response["error"]["code"] == -32000
-        assert daemon._agent is not None
-        assert daemon._agent._auth_context is None
+        # Observe rejection before EOF, then require a clean protocol exit
+        # under the same hang guard rather than timing individual pipe reads.
+        async with asyncio.timeout(120):
+            response = await _request(process, 1, "authenticate", {"methodId": "mimir-web-key"})
+            assert response["error"]["code"] == -32000
+            assert daemon._agent is not None
+            assert daemon._agent._auth_context is None
+            assert process.stdin
+            process.stdin.close()
+            await process.stdin.wait_closed()
+            stdout, stderr = await process.communicate()
+            assert process.returncode == 0, stderr.decode()
+            assert stdout == b""
+            assert b"invalid-key" not in stderr
     finally:
-        assert process.stdin
-        process.stdin.close()
-        await process.stdin.wait_closed()
-        stderr = await process.stderr.read() if process.stderr else b""
-        await asyncio.wait_for(process.wait(), 10)
-        await daemon.stop()
-    assert b"invalid-key" not in stderr
+        try:
+            if process.returncode is None:
+                process.kill()
+                await process.communicate()
+        finally:
+            await daemon.stop()
 
 
 async def start_scope_permission(

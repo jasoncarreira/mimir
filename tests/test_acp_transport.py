@@ -238,8 +238,9 @@ async def test_peer_eof_cancels_blocked_opposite_pump(
     right.feed_eof()
     left_writer = Writer()
     right_writer = StagedWriter(drain_gate=asyncio.Event())
+    # Harness hang ceiling, independent of the product's EOF/drain deadlines.
     await asyncio.wait_for(
-        pump_bidirectional(left, left_writer, right, right_writer), 0.1
+        pump_bidirectional(left, left_writer, right, right_writer), 120
     )
     assert left_writer.closed and right_writer.closed
 
@@ -255,16 +256,27 @@ async def test_force_close_deadline_bounds_writer_cleanup(
     left.feed_eof()
     right.feed_eof()
     class BlocksOnCloseDrain(StagedWriter):
+        cancelled = False
+
         async def drain(self) -> None:
             self.drain_calls += 1
             if self.drain_calls > 1:
-                await asyncio.Event().wait()
+                try:
+                    await asyncio.Event().wait()
+                except asyncio.CancelledError:
+                    self.cancelled = True
+                    raise
 
     left_writer = BlocksOnCloseDrain()
     right_writer = BlocksOnCloseDrain()
+    # The witness below proves force-close won, not this harness hang ceiling.
     await asyncio.wait_for(
-        pump_bidirectional(left, left_writer, right, right_writer), 0.1
+        pump_bidirectional(left, left_writer, right, right_writer), 120
     )
+    for writer in (left_writer, right_writer):
+        assert writer.drain_calls == 2
+        assert writer.cancelled
+        assert not writer.closed
 
 
 async def _release_after(event: asyncio.Event, delay: float) -> None:

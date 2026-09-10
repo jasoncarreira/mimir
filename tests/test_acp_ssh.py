@@ -418,20 +418,22 @@ raise SystemExit(bootstrap.main([]))
     )
     child_pid = None
     try:
-        line = await asyncio.wait_for(process.stdout.readline(), 10)
-        assert line.startswith(b"child:")
-        child_pid = int(line.split(b":")[1])
-        assert await asyncio.wait_for(process.stdout.readline(), 10) == b"ready\n"
-        import signal
-        process.send_signal(signal.SIGTERM)
-        stdout, stderr = await asyncio.wait_for(process.communicate(), 3)
-        assert process.returncode == 128 + signal.SIGTERM
-        assert (stdout, stderr) == (b"", b"")
-        # The real SSH stand-in is terminated and reaped, even when the router
-        # close cannot complete before the process-exit watchdog fires.
-        with pytest.raises(ProcessLookupError):
-            os.kill(child_pid, 0)
-        child_pid = None
+        # Whole-protocol hang ceiling, not a deadline for individual pipe reads.
+        async with asyncio.timeout(120):
+            line = await process.stdout.readline()
+            assert line.startswith(b"child:")
+            child_pid = int(line.split(b":")[1])
+            assert await process.stdout.readline() == b"ready\n"
+            import signal
+            process.send_signal(signal.SIGTERM)
+            stdout, stderr = await process.communicate()
+            assert process.returncode == 128 + signal.SIGTERM
+            assert (stdout, stderr) == (b"", b"")
+            # The real SSH stand-in is terminated and reaped, even when the router
+            # close cannot complete before the process-exit watchdog fires.
+            with pytest.raises(ProcessLookupError):
+                os.kill(child_pid, 0)
+            child_pid = None
     finally:
         if process.returncode is None:
             process.kill()

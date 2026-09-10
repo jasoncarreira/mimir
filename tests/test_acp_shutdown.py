@@ -108,23 +108,24 @@ raise SystemExit(bootstrap.main([]))
         cwd=Path(__file__).resolve().parents[1],
     )
     try:
-        if stage == "idle" and signum:
-            assert await asyncio.wait_for(process.stdout.readline(), 10) == b"ready\n"
-            process.send_signal(signum)
-        stdout, stderr = await asyncio.wait_for(process.communicate(), 15)
+        async with asyncio.timeout(120):
+            if stage == "idle" and signum:
+                assert await process.stdout.readline() == b"ready\n"
+                process.send_signal(signum)
+            stdout, stderr = await process.communicate()
+            if "failure" in stage:
+                assert process.returncode == 1
+                assert stderr.startswith(b"detail: ValueError at <string>:")
+                assert stderr.endswith(b"\nerror: acp-failed\n")
+                assert b"private shutdown failure" not in stderr
+            else:
+                assert stderr == b""
+                assert process.returncode == (128 + signum if signum else 0)
+                assert stdout == (b"terminated\n" if signum else b"") + b"closed\n"
     finally:
         if process.returncode is None:
             process.kill()
             await process.communicate()
-    if "failure" in stage:
-        assert process.returncode == 1
-        assert stderr.startswith(b"detail: ValueError at <string>:")
-        assert stderr.endswith(b"\nerror: acp-failed\n")
-        assert b"private shutdown failure" not in stderr
-    else:
-        assert stderr == b""
-        assert process.returncode == (128 + signum if signum else 0)
-        assert stdout == (b"terminated\n" if signum else b"") + b"closed\n"
 
 
 @pytest.mark.asyncio
@@ -271,9 +272,10 @@ asyncio.run(run())
     try:
         # No stage marker competes with the real deadline. This timeout is
         # only a harness bound; the independent product timer must exit.
-        stdout, stderr = await asyncio.wait_for(process.communicate(), 10)
-        assert process.returncode == 128 + signal.SIGTERM
-        assert (stdout, stderr) == (b"", b"")
+        async with asyncio.timeout(120):
+            stdout, stderr = await process.communicate()
+            assert process.returncode == 128 + signal.SIGTERM
+            assert (stdout, stderr) == (b"", b"")
     finally:
         if process.returncode is None:
             process.kill()
@@ -326,7 +328,7 @@ asyncio.set_event_loop(loop)
 loop.run_until_complete(setup())
 if int(sys.argv[1]):
     # The installing task is done: exit must come from _cancel, not the deadline.
-    proxy.SIGNAL_EXIT_TIMEOUT = 60
+    proxy.threading.Timer = lambda *args: SimpleNamespace(start=lambda: None)
     os.kill(os.getpid(), int(sys.argv[1]))
     loop.run_forever()
 loop.close()
@@ -337,9 +339,10 @@ loop.close()
         cwd=Path(__file__).resolve().parents[1],
     )
     try:
-        stdout, stderr = await asyncio.wait_for(process.communicate(), 10)
-        assert (process.returncode, stderr) == (128 + signum if signum else 0, b"")
-        assert stdout == (b"outer\nrouter\n" if signum else b"router\n")
+        async with asyncio.timeout(120):
+            stdout, stderr = await process.communicate()
+            assert (process.returncode, stderr) == (128 + signum if signum else 0, b"")
+            assert stdout == (b"outer\nrouter\n" if signum else b"router\n")
     finally:
         if process.returncode is None:
             process.kill()
@@ -351,14 +354,15 @@ loop.close()
 async def test_signal_callback_rechecks_completed_installing_task(signum: signal.Signals) -> None:
     source = r'''
 import asyncio, io, os, sys
+from types import SimpleNamespace
 from mimir.acp import proxy
 async def setup():
     router = proxy.ProxyRouter(proxy._OutputWriter(io.BytesIO()), proxy._OutputWriter(io.BytesIO()), 'secret')
     hooks = proxy._ShutdownHooks(router)
     hooks.install()
     # Queue cancellation while setup is live, then finish without yielding.
-    # A long watchdog proves the callback, not the fallback, handles this race.
-    proxy.SIGNAL_EXIT_TIMEOUT = 60
+    # An inert watchdog proves the callback, not the fallback, handles this race.
+    proxy.threading.Timer = lambda *args: SimpleNamespace(start=lambda: None)
     os.kill(os.getpid(), int(sys.argv[1]))
 loop = asyncio.new_event_loop()
 asyncio.set_event_loop(loop)
@@ -371,9 +375,10 @@ loop.run_forever()
         cwd=Path(__file__).resolve().parents[1],
     )
     try:
-        stdout, stderr = await asyncio.wait_for(process.communicate(), 10)
-        assert process.returncode == 128 + signum
-        assert (stdout, stderr) == (b"", b"")
+        async with asyncio.timeout(120):
+            stdout, stderr = await process.communicate()
+            assert process.returncode == 128 + signum
+            assert (stdout, stderr) == (b"", b"")
     finally:
         if process.returncode is None:
             process.kill()
@@ -413,12 +418,13 @@ raise SystemExit(bootstrap.main([]))
         cwd=Path(__file__).resolve().parents[1],
     )
     try:
-        stdout, stderr = await asyncio.wait_for(process.communicate(), 10)
-        assert process.returncode == 1
-        assert stdout == b""
-        assert stderr.startswith(b"detail: ValueError at <string>:")
-        assert stderr.endswith(b"\nerror: acp-failed\n")
-        assert b"private failure" not in stderr
+        async with asyncio.timeout(120):
+            stdout, stderr = await process.communicate()
+            assert process.returncode == 1
+            assert stdout == b""
+            assert stderr.startswith(b"detail: ValueError at <string>:")
+            assert stderr.endswith(b"\nerror: acp-failed\n")
+            assert b"private failure" not in stderr
     finally:
         if process.returncode is None:
             process.kill()
@@ -503,55 +509,56 @@ raise SystemExit(bootstrap.main(['--profile', 'test']))
         cwd=Path(__file__).resolve().parents[1],
     )
     try:
-        await asyncio.wait_for(connected.wait(), 10)
-        # An actual routed frame, rather than a sleep or just socket acceptance,
-        # proves stdio and the signal hooks are installed before signalling.
-        frame = b'{"jsonrpc":"2.0","method":"test/ready"}\n'
-        try:
-            peers[0].write(frame)
-            await peers[0].drain()
-        except ConnectionError:
-            stdout, stderr = await asyncio.wait_for(process.communicate(), 10)
+        async with asyncio.timeout(120):
+            await connected.wait()
+            # An actual routed frame, rather than a sleep or just socket acceptance,
+            # proves stdio and the signal hooks are installed before signalling.
+            frame = b'{"jsonrpc":"2.0","method":"test/ready"}\n'
+            try:
+                peers[0].write(frame)
+                await peers[0].drain()
+            except ConnectionError:
+                stdout, stderr = await process.communicate()
+                if file_stderr:
+                    stderr = stderr_path.read_bytes()
+                pytest.fail(f"real stdio startup failed: code={process.returncode}, stderr={stderr!r}")
+            async def ready() -> bytes:
+                if terminal:
+                    observed = bytearray()
+                    while not observed.endswith(b"\n") and process.returncode is None:
+                        try:
+                            observed.extend(os.read(terminal[0], 65536))
+                        except BlockingIOError:
+                            await asyncio.sleep(0.01)
+                    return bytes(observed)
+                if not file_output:
+                    return await process.stdout.readline()
+                while output_path.read_bytes() != frame and process.returncode is None:
+                    await asyncio.sleep(0.01)
+                return output_path.read_bytes()
+            observed = await ready()
+            if observed != frame:
+                stdout, stderr = await process.communicate()
+                if file_stderr:
+                    stderr = stderr_path.read_bytes()
+                pytest.fail(f"real stdio startup failed: code={process.returncode}, stderr={stderr!r}")
+            process.send_signal(signum)
+            stdout, stderr = await process.communicate()
             if file_stderr:
                 stderr = stderr_path.read_bytes()
-            pytest.fail(f"real stdio startup failed: code={process.returncode}, stderr={stderr!r}")
-        async def ready() -> bytes:
-            if terminal:
-                observed = bytearray()
-                while not observed.endswith(b"\n") and process.returncode is None:
+            if stderr_terminal:
+                stderr = b""
+                while True:
                     try:
-                        observed.extend(os.read(terminal[0], 65536))
+                        stderr += os.read(stderr_terminal[0], 65536)
                     except BlockingIOError:
-                        await asyncio.sleep(0.01)
-                return bytes(observed)
-            if not file_output:
-                return await process.stdout.readline()
-            while output_path.read_bytes() != frame and process.returncode is None:
-                await asyncio.sleep(0.01)
-            return output_path.read_bytes()
-        observed = await asyncio.wait_for(ready(), 10)
-        if observed != frame:
-            stdout, stderr = await asyncio.wait_for(process.communicate(), 10)
-            if file_stderr:
-                stderr = stderr_path.read_bytes()
-            pytest.fail(f"real stdio startup failed: code={process.returncode}, stderr={stderr!r}")
-        process.send_signal(signum)
-        stdout, stderr = await asyncio.wait_for(process.communicate(), 10)
-        if file_stderr:
-            stderr = stderr_path.read_bytes()
-        if stderr_terminal:
-            stderr = b""
-            while True:
-                try:
-                    stderr += os.read(stderr_terminal[0], 65536)
-                except BlockingIOError:
-                    break
-        assert stdout == (b"" if output_shape == "pipe" else None)
-        if teardown_failure:
-            assert process.returncode == 1
-            assert re.fullmatch(rb"detail: ValueError at <string>:[0-9]+\nerror: acp-failed\n", stderr)
-        else:
-            assert (process.returncode, stderr) == (128 + signum, b"")
+                        break
+            assert stdout == (b"" if output_shape == "pipe" else None)
+            if teardown_failure:
+                assert process.returncode == 1
+                assert re.fullmatch(rb"detail: ValueError at <string>:[0-9]+\nerror: acp-failed\n", stderr)
+            else:
+                assert (process.returncode, stderr) == (128 + signum, b"")
     finally:
         if process.returncode is None:
             process.kill()
