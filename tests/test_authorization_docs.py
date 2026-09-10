@@ -15,10 +15,13 @@ def _section(text: str, heading: str) -> str:
 
 def test_contained_execution_surfaces_are_not_listed_as_agent_user() -> None:
     text = DOC.read_text(encoding="utf-8")
-    residual = _section(text, "Surfaces that still execute as the agent user")
-
-    assert "`repo_test`" not in residual
-    assert "`spawn_open_code`" not in residual
+    assert "### Surfaces that still execute as the agent user" not in text
+    worklink = _section(text, "Worklink Runs")
+    assert "Feature-factory fresh and recovery workloads" in worklink
+    assert "`launch_factory`" in worklink
+    assert "irreversible `setresuid` drop" in worklink
+    assert "detached descendants inherit that identity" in worklink
+    assert "does not add descendant lifetime" in worklink
 
 
 def test_contained_execution_surface_claims_are_bounded() -> None:

@@ -14,6 +14,7 @@ import stat
 import struct
 import subprocess
 import sys
+import threading
 import uuid
 from unittest.mock import Mock, call
 
@@ -956,6 +957,275 @@ def test_drop_worker_uses_irreversible_identity_sequence(
     )
     assert events[-1] == ("verify",)
     assert events.count(("caps", set())) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("coding_enabled", [False, True])
+@pytest.mark.parametrize("drop_fails", [False, True])
+@pytest.mark.parametrize("recovery", [False, True])
+async def test_factory_compute_drops_worker_uid_before_payload_spawn(
+    tmp_path, monkeypatch, synthetic_worklink_identities, coding_enabled, drop_fails, recovery,
+) -> None:
+    from mimir.worklink import checkout, compute, identities
+
+    identity = synthetic_worklink_identities
+    monkeypatch.setattr(identities, "get_identities", lambda: identity)
+    monkeypatch.setattr(checkout, "coding_enabled", lambda: coding_enabled)
+    async def refuse_direct_spawn(*args, **kwargs):
+        pytest.fail("factory bypassed the worker executor")
+
+    monkeypatch.setattr(compute.asyncio, "create_subprocess_exec", refuse_direct_spawn)
+    outer = tmp_path / "checkout"
+    checkout_path = outer / ".factory-sandboxes" / "epic-41" if recovery else outer
+    checkout_path.mkdir(parents=True)
+    homes = tmp_path / "homes"
+    homes.mkdir()
+    monkeypatch.setattr(worker_exec, "HOME_ROOT", homes)
+    events = []
+    requests = []
+    responses = []
+
+    class Peer:
+        def sendmsg(self, buffers, ancillary):
+            request = json.loads(buffers[0])
+            requests.append(request)
+            fds = [os.dup(fd) for fd in ancillary[0][2]]
+            try:
+                worker_exec._handle_launch(self, request, fds)
+            except Exception as exc:
+                self.send(json.dumps({"id": request["id"], "error": str(exc)}).encode())
+            finally:
+                for fd in fds:
+                    os.close(fd)
+
+        def send(self, payload):
+            responses.append(payload)
+
+        def recv(self, _size):
+            return responses.pop(0)
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(WorkerClient, "_connect", lambda self, *args: Peer())
+    monkeypatch.setattr(
+        worker_exec, "_open_factory_checkout",
+        lambda request: os.open(checkout_path, os.O_RDONLY | os.O_DIRECTORY),
+    )
+    monkeypatch.setattr(worker_exec.os, "chown", lambda *args, **kwargs: None)
+
+    class Libc:
+        def prctl(self, *args):
+            return 0
+
+    monkeypatch.setattr(worker_exec.ctypes, "CDLL", lambda *args, **kwargs: Libc())
+    monkeypatch.setattr(worker_exec, "_set_capabilities", lambda caps: None)
+    monkeypatch.setattr(worker_exec, "_last_capability", lambda: 2)
+    monkeypatch.setattr(worker_exec.os, "setgroups", lambda groups: None)
+    monkeypatch.setattr(worker_exec.os, "setresgid", lambda *ids: None, raising=False)
+
+    def setresuid(*ids):
+        events.append(("setresuid", ids))
+        if drop_fails:
+            raise PermissionError("test identity drop refused")
+
+    monkeypatch.setattr(worker_exec.os, "setresuid", setresuid, raising=False)
+    monkeypatch.setattr(worker_exec.os, "umask", lambda mode: None)
+    monkeypatch.setattr(worker_exec.os, "setsid", lambda: None)
+    monkeypatch.setattr(worker_exec.os, "fchdir", lambda fd: None)
+    monkeypatch.setattr(worker_exec, "_verify_worker_identity", lambda: None)
+    command = ("/usr/bin/python3", "-c", "print('factory')", "--dir", str(checkout_path))
+
+    def popen(argv, **kwargs):
+        kwargs["preexec_fn"]()
+        events.append(("payload_spawn", tuple(argv)))
+        assert kwargs["env"]["HOME"].startswith(str(homes) + "/")
+        assert tuple(argv) == command
+        return SimpleNamespace(pid=4321, poll=lambda: 0)
+
+    monkeypatch.setattr(worker_exec.subprocess, "Popen", popen)
+    monkeypatch.setattr(worker_exec, "_wait_with_output_limits", lambda *args: (0, False, False))
+    spec = compute.WorkSpec(
+        issue_id=41, attempt=2, repo_url="https://example.test/repo.git",
+        base_ref="main", branch="factory-test", prompt="test", rules=None,
+        test_command="true", backend="feature_factory", timeout_s=10,
+        backend_config={"run_id": "epic-41"},
+        env={"MIMIR_HOME": "/agent-home", "FACTORY_PUBLISHING_IDENTITY": "publisher"},
+        local_checkout=checkout_path, local_argv=command,
+    )
+    backend = compute.LocalSubprocessComputeBackend()
+    if drop_fails:
+        with pytest.raises(compute.ComputeLaunchError, match="test identity drop refused"):
+            await backend.launch(spec)
+    else:
+        handle = await backend.launch(spec)
+        try:
+            result = await backend.wait(handle, 10)
+            assert result.exit_code == 0
+        finally:
+            await backend.cleanup(handle)
+    assert len(requests) == 1
+    assert requests[0]["op"] == "launch_factory"
+    assert requests[0]["run_id"] == "epic-41"
+    assert requests[0]["run_uid"] == identity.worklink_uid
+    assert (requests[0]["issue"], requests[0]["attempt"]) == (41, 2)
+    assert requests[0]["path"] == str(checkout_path)
+    assert requests[0]["argv"] == list(command)
+    assert "HOME" not in requests[0]["env"]
+    assert "MIMIR_HOME" not in requests[0]["env"]
+    assert requests[0]["env"]["FACTORY_PUBLISHING_IDENTITY"] == "publisher"
+    assert requests[0]["env"]["XDG_DATA_HOME"] == str(outer / ".factory-runtime" / "epic-41")
+    assert requests[0]["env"]["PATH"] == "/opt/mimir-opencode/bin:/usr/local/bin:/usr/bin:/bin"
+    expected = [("setresuid", (identity.worklink_uid,) * 3)]
+    if not drop_fails:
+        expected.append(("payload_spawn", command))
+    assert events == expected
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("name", ["HOME", "XDG_CONFIG_HOME", "LD_PRELOAD", "OPENCODE_CONFIG"])
+async def test_factory_environment_cannot_override_worker_home(tmp_path, monkeypatch, name):
+    from mimir.worklink import compute, identities
+
+    monkeypatch.setattr(identities, "get_identities", worker_exec.get_identities)
+    spec = compute.WorkSpec(
+        issue_id=41, attempt=2, repo_url="https://example.test/repo.git",
+        base_ref="main", branch="factory-test", prompt="test", rules=None,
+        test_command="true", backend="feature_factory", timeout_s=10,
+        backend_config={"run_id": "epic-41"}, env={name: "/agent-home"},
+        local_checkout=tmp_path, local_argv=("true",),
+    )
+    with pytest.raises(compute.ComputeLaunchError, match=f"factory environment {name} is denied"):
+        await compute.LocalSubprocessComputeBackend().launch(spec)
+
+
+@pytest.mark.asyncio
+async def test_factory_compute_detached_descendant_cannot_write_agent_home_and_detector_is_live(
+    monkeypatch, synthetic_worklink_identities,
+) -> None:
+    if sys.platform != "linux" or os.geteuid() != 0:
+        pytest.skip("Worklink sandbox cannot drop identities: requires Linux root")
+
+    from mimir.worklink import checkout, compute, identities
+
+    identity = synthetic_worklink_identities
+    monkeypatch.setattr(identities, "get_identities", lambda: identity)
+    monkeypatch.setattr(checkout, "coding_enabled", lambda: False)
+    boundary = Path("/tmp") / f"mimir-factory-descendant-{uuid.uuid4()}"
+    boundary.mkdir(mode=0o755)
+    listener = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+    try:
+        checkout_root = boundary / ".worklink"
+        checkout_path = checkout_root / "repo" / "41-2"
+        checkout_path.mkdir(parents=True)
+        os.chown(checkout_path, identity.mimir_uid, identity.worklink_gid)
+        checkout_path.chmod(0o2770)
+        homes = boundary / "homes"
+        homes.mkdir(mode=0o711)
+        agent_home = boundary / "agent-home"
+        agent_home.mkdir(mode=0o700)
+        os.chown(agent_home, identity.mimir_uid, identity.mimir_uid)
+        canary = agent_home / "canary"
+        canary.write_text("original")
+        os.chown(canary, identity.mimir_uid, identity.mimir_uid)
+        canary.chmod(0o600)
+        monkeypatch.setattr(worker_exec, "WORKLINK_CHECKOUT_ROOT", checkout_root)
+        monkeypatch.setattr(worker_exec, "HOME_ROOT", homes)
+        socket_path = boundary / "executor.sock"
+        listener.bind(str(socket_path))
+        listener.listen(1)
+        listener.settimeout(15)
+        real_connect = WorkerClient._connect
+
+        def connect(client, timeout_s=None):
+            client.socket_path = socket_path
+            return real_connect(client, timeout_s)
+
+        monkeypatch.setattr(WorkerClient, "_connect", connect)
+        grandchild = (
+            "import json, os\n"
+            "written = False\n"
+            "try:\n"
+            f"    with open({str(canary)!r}, 'w') as stream: stream.write('breached')\n"
+            "    written = True\n"
+            "except PermissionError:\n"
+            "    pass\n"
+            "print(json.dumps({'uid': os.geteuid(), 'written': written, "
+            "'detached': os.getsid(0) == os.getpid()}), flush=True)\n"
+        )
+        child = (
+            "import subprocess\n"
+            f"process = subprocess.Popen(['/usr/bin/python3', '-c', {grandchild!r}], start_new_session=True)\n"
+            "raise SystemExit(process.wait(timeout=5))\n"
+        )
+        payload = (
+            "import subprocess\n"
+            f"process = subprocess.Popen(['/usr/bin/python3', '-c', {child!r}])\n"
+            "raise SystemExit(process.wait(timeout=10))\n"
+        )
+        spec = compute.WorkSpec(
+            issue_id=41, attempt=2, repo_url="https://example.test/repo.git",
+            base_ref="main", branch="factory-test", prompt="test", rules=None,
+            test_command="true", backend="feature_factory", timeout_s=15,
+            backend_config={"run_id": "epic-41"}, local_checkout=checkout_path,
+            local_argv=("/usr/bin/python3", "-c", payload),
+        )
+
+        async def run_factory():
+            errors = []
+
+            def serve_once():
+                try:
+                    connection, _ = listener.accept()
+                    worker_exec.handle_connection(connection)
+                except Exception as exc:
+                    errors.append(exc)
+
+            server = threading.Thread(target=serve_once)
+            server.start()
+            backend = compute.LocalSubprocessComputeBackend()
+            try:
+                handle = await backend.launch(spec)
+                try:
+                    result = await backend.wait(handle, 20)
+                    assert result.exit_code == 0, result.stderr
+                    assert not result.timed_out
+                    return json.loads(result.stdout)
+                finally:
+                    await backend.cleanup(handle)
+            finally:
+                await asyncio.to_thread(server.join, 20)
+                assert not server.is_alive()
+                assert not errors
+
+        def assert_contained(report):
+            assert report["uid"] == identity.worklink_uid
+            assert report["written"] is False
+            assert canary.read_text() == "original"
+
+        report = await run_factory()
+        assert report["detached"] is True
+        assert_contained(report)
+
+        # Change only the executor's identity boundary, not the payload or detector.
+        def drop_to_controller(fd):
+            os.setgroups([])
+            os.setresgid(*((identity.worklink_gid,) * 3))
+            os.setresuid(*((identity.mimir_uid,) * 3))
+            os.setsid()
+            os.fchdir(fd)
+
+        monkeypatch.setattr(worker_exec, "_drop_worker", drop_to_controller)
+        control = await run_factory()
+        assert control["detached"] is True
+        assert control["uid"] == identity.mimir_uid
+        assert control["written"] is True
+        with pytest.raises(AssertionError):
+            assert_contained(control)
+        assert canary.read_text() == "breached"
+    finally:
+        listener.close()
+        shutil.rmtree(boundary)
 
 
 def test_worker_identity_verifier_rejects_any_retained_authority(

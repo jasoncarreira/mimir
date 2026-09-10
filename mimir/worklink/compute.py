@@ -441,6 +441,8 @@ class LocalSubprocessComputeBackend:
         if not command:
             raise ComputeLaunchError("local_subprocess spec.local_argv must not be empty")
         from .checkout import coding_enabled
+        if spec.backend == "feature_factory":
+            return await self._launch_factory(spec, command)
         if coding_enabled() and spec.backend == "opencode":
             return await self._launch_enabled(spec, command)
         # chainlink #830: autonomous local_subprocess builds an allowlisted env
@@ -531,7 +533,7 @@ class LocalSubprocessComputeBackend:
         return handle
 
     async def _launch_enabled(self, spec: WorkSpec, command: tuple[str, ...]) -> LaunchHandle:
-        from .worker_client import WorkerClient, WorkerProjection
+        from .worker_client import WorkerClient
 
         command = _fd_anchored_opencode_argv(command, spec.local_checkout)
         authorization = self._authorized_checkout
@@ -552,6 +554,55 @@ class LocalSubprocessComputeBackend:
             raise ComputeLaunchError(
                 "enabled local_subprocess requires an authorized or path-addressed worker checkout"
             )
+        return await self._launch_contained(
+            spec, command, capability, client,
+            lambda identifier: {
+                key: value for key, value in _enabled_child_env(spec, identifier).items()
+                if key != "HOME"
+            },
+        )
+
+    async def _launch_factory(self, spec: WorkSpec, command: tuple[str, ...]) -> LaunchHandle:
+        from .identities import get_identities
+        from .worker_client import WorkerClient
+
+        assert spec.local_checkout is not None
+        client = self._worker_client or WorkerClient.for_factory_checkout(
+            spec.local_checkout,
+            issue_id=spec.issue_id,
+            attempt=spec.attempt,
+            run_uid=get_identities().worklink_uid,
+            run_id=spec.backend_config.get("run_id"),
+        )
+        # The factory owns publication, unlike a per-leaf build. Admit its
+        # controller-selected inputs explicitly, never the controller HOME.
+        allowed = {
+            "MIMIR_WORK_ITEM_JSON", "GH_TOKEN", "GITHUB_TOKEN",
+            "GIT_AUTHOR_NAME", "GIT_AUTHOR_EMAIL", "GIT_COMMITTER_NAME",
+            "GIT_COMMITTER_EMAIL", "FACTORY_PUBLISHING_IDENTITY",
+        }
+        unknown = set(spec.env) - allowed - {"MIMIR_HOME"}
+        if unknown:
+            raise ComputeLaunchError(f"factory environment {sorted(unknown)[0]} is denied")
+        env = {key: value for key, value in spec.env.items() if key in allowed}
+        outer = spec.local_checkout
+        if outer.parent.name == ".factory-sandboxes" and outer.name == client.factory_run_id:
+            outer = outer.parent.parent
+        # Recovery reuses an OpenCode session. Keep only its data in the
+        # worker-writable attempt, not in the disposable HOME or the agent HOME.
+        env["XDG_DATA_HOME"] = str(outer / ".factory-runtime" / client.factory_run_id)
+        env["PATH"] = "/opt/mimir-opencode/bin:/usr/local/bin:/usr/bin:/bin"
+        return await self._launch_contained(
+            spec, command, _PathCheckoutCapability(spec.local_checkout), client,
+            lambda identifier: {**base_worker_environment(identifier), **env},
+        )
+
+    async def _launch_contained(
+        self, spec: WorkSpec, command: tuple[str, ...], capability: object,
+        client: object, environment: Callable[[str], dict[str, str]],
+    ) -> LaunchHandle:
+        from .worker_client import WorkerProjection
+
         projections_raw = spec.backend_config.get("worker_projections", ())
         if isinstance(projections_raw, (str, bytes)) or not isinstance(
             projections_raw, Sequence
@@ -583,11 +634,7 @@ class LocalSubprocessComputeBackend:
                 return await execute_contained(
                     command,
                     capability,
-                    {
-                        key: value
-                        for key, value in _enabled_child_env(spec, identifier).items()
-                        if key != "HOME"
-                    },
+                    environment(identifier),
                     projections,
                     identifier=identifier,
                     timeout_s=spec.timeout_s,

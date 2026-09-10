@@ -6,6 +6,7 @@ from dataclasses import dataclass
 import json
 import math
 import os
+import re
 from pathlib import Path, PurePosixPath
 import socket
 import struct
@@ -22,7 +23,7 @@ MAX_PROJECTION_BYTES = 1024 * 1024
 CANCEL_SOCKET_TIMEOUT_S = 20.0
 # Keep this literal independent from worker_exec. The executor runs its image-owned
 # copy, so changing either side of the launch contract requires an image rebuild.
-EXECUTOR_PROTOCOL_IDENTITY = "worklink-executor-v6-bounded-output-path-checkout"
+EXECUTOR_PROTOCOL_IDENTITY = "worklink-executor-v7-feature-factory"
 STALE_EXECUTOR_DIAGNOSTIC = (
     "stale root executor image: controller and mimir.worklink.worker_exec protocol "
     "or source identities do not match; rebuild the image and restart the container"
@@ -107,6 +108,7 @@ class WorkerClient:
         self.issue_id = issue_id
         self.attempt = attempt
         self.run_uid = run_uid
+        self.factory_run_id: str | None = None
 
     @classmethod
     def for_path_checkout(
@@ -128,6 +130,26 @@ class WorkerClient:
             attempt=attempt,
             run_uid=run_uid,
         )
+
+    @classmethod
+    def for_factory_checkout(
+        cls,
+        path: Path,
+        *,
+        issue_id: int,
+        attempt: int,
+        run_uid: int,
+        run_id: str,
+        socket_path: Path = DEFAULT_EXECUTOR_SOCKET,
+    ) -> WorkerClient:
+        if not isinstance(run_id, str) or re.fullmatch(r"[a-z0-9](?:[a-z0-9._-]*[a-z0-9])?", run_id) is None:
+            raise ValueError("factory run_id is invalid")
+        client = cls.for_path_checkout(
+            path, issue_id=issue_id, attempt=attempt, run_uid=run_uid,
+            socket_path=socket_path,
+        )
+        client.factory_run_id = run_id
+        return client
 
     def _connect(self, timeout_s: float | None = None) -> socket.socket:
         sock = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
@@ -218,6 +240,8 @@ class WorkerClient:
                 "attempt": self.attempt,
                 "run_uid": self.run_uid,
             })
+            if self.factory_run_id is not None:
+                request.update({"op": "launch_factory", "run_id": self.factory_run_id})
         else:
             assert self.checkout is not None
             request.update({

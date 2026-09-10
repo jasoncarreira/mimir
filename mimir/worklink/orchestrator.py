@@ -1890,6 +1890,7 @@ class WorklinkRunner:
                 base_fetch=config.defaults.base_fetch,
                 event_logger=_log_event,
                 runner=_list_runner(runner),
+                worker_eligible=True,
             )
             git_name, git_email = _read_checkout_git_identity(lease.path, runner)
             publishing_identity, publishing_identity_source = (
@@ -2169,13 +2170,33 @@ class WorklinkRunner:
             base=base,
             command_runner=runner,
         )
+        git_name, git_email = _read_checkout_git_identity(sandbox, runner)
+        publishing_identity, publishing_identity_source = (
+            _read_factory_publishing_identity(self.repo)
+        )
+        github_token, github_env = _resolve_factory_github_credential(os.environ)
+        try:
+            GitHubForgeClient(token=github_token).verify_identity(publishing_identity)
+        except GitHubIdentityVerificationError as exc:
+            raise WorklinkError(
+                f"{exc}; selected identity {publishing_identity} "
+                f"from {publishing_identity_source}"
+            ) from exc
         order = WorkOrder(
             issue_id=issue.issue_id,
             checkout=sandbox,
             prompt=_epic_prompt(issue),
             rules=None,
             timeout_s=int(_epic_run_timeout_s()),
-            env={"MIMIR_HOME": str(self.home)},
+            env={
+                "MIMIR_HOME": str(self.home),
+                **github_env,
+                "GIT_AUTHOR_NAME": git_name,
+                "GIT_AUTHOR_EMAIL": git_email,
+                "GIT_COMMITTER_NAME": git_name,
+                "GIT_COMMITTER_EMAIL": git_email,
+                FACTORY_PUBLISHING_IDENTITY_ENV: publishing_identity,
+            },
             transcript_root=self.home / "state" / "worklink" / "transcripts",
         )
         recovery_repo_url = _repo_remote_url(sandbox, runner=runner)
@@ -2193,6 +2214,7 @@ class WorklinkRunner:
             session=session,
             run_id=retained.run_id,
         )
+        _require_factory_launch_binding(spec, retained.run_id, publishing_identity)
         handle = await compute.launch(spec)
         relaunched = replace(
             retained.observed(resumed, datetime.now(UTC).isoformat()),
@@ -2714,7 +2736,9 @@ def _create_factory_sandbox(record: FactoryRunRecord, lease: CheckoutLease) -> P
         raise WorklinkError("factory sandbox does not match the validated run identity")
     if lease.path.is_symlink() or root.is_symlink() or sandbox.is_symlink():
         raise WorklinkError("factory sandbox path may not be a symlink")
-    root.mkdir(mode=0o700, exist_ok=True)
+    # The normalized checkout's setgid bit supplies the worklink group.
+    root.mkdir(mode=0o2770, exist_ok=True)
+    root.chmod(0o2770)
     if sandbox.exists():
         raise WorklinkError(f"factory sandbox already exists: {sandbox}")
     return sandbox

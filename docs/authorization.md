@@ -621,7 +621,7 @@ checkouts, worker identity, credential projection, collected output, and
 proposal boundary. They do not make other code-execution paths contained or
 protect an admitted seed from code the operator already approved.
 
-### Surfaces that still execute as the agent user
+### Worklink Runs
 
 Poller-dispatched Worklink OpenCode builds use the `worklink` uid in a
 group-writable checkout under `/workspace/.worklink`. This prevents generated
@@ -630,9 +630,29 @@ sandbox, does not provide cross-run isolation, and is explicitly not credential
 isolation: the virtiofs home mount remains readable across guest identities
 (#1435).
 
-Feature-factory runs remain outside the contained paths above and still
-execute as the agent user. Track that OS-isolation gap separately; tool-level
-authorization alone does not provide an OS boundary.
+Feature-factory fresh and recovery workloads also use the existing Worklink
+executor and `worklink` uid/gid, through a distinct `launch_factory` operation.
+The per-leaf `launch_path` contract is unchanged. Factory checkouts remain under
+`/workspace/.worklink`; recovery accepts only the retained run's nested
+`.factory-sandboxes/<run_id>` checkout. The executor assigns a private HOME and
+receives selected-provider config/auth projections plus the pinned factory
+plugin, not the controller's HOME. Factory publication credentials are still
+deliberately supplied to the factory, which owns publication.
+OpenCode session data lives in the attempt's `.factory-runtime/<run_id>` so a
+recovery can reuse it without access to the agent's session store. Pre-upgrade
+sessions stored only in the agent HOME are not imported into this boundary.
+
+The executor's irreversible `setresuid` drop precedes execution of the factory
+payload. Children and detached descendants inherit that identity; creating a new
+session does not regain the agent uid. An unprivileged ordering regression and a
+Linux-root-gated detached-grandchild canary test with a live negative control
+cover this boundary. Factory containment fails closed when the executor or its
+checkout validation is unavailable, independently of the OpenCode feature flag.
+No capabilities are granted to the agent. This does not add descendant lifetime
+supervision or cross-run isolation. Factory admission/status/control probes stay
+on the controller; they are not generated-code workload launch sites.
+The controller's separate factory-completion evidence command is not a
+descendant of these launches and is outside this workload boundary.
 
 ### Declared shell commands per job
 

@@ -6147,7 +6147,29 @@ def test_factory_recovery_uses_run_id_first_lock_resume_and_authoritative_status
     dead_lock: bool,
     action: str | None,
 ) -> None:
+    import mimir.worklink.orchestrator as orchestrator
+
     _configure_opencode_oauth(tmp_path, monkeypatch)
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / ".factory.json").write_text(
+        json.dumps({"publishing_identity": "factory-owner", "bootstrap": "uv sync"}),
+        encoding="utf-8",
+    )
+    monkeypatch.delenv("MIMIR_FACTORY_PUBLISHING_IDENTITY", raising=False)
+    monkeypatch.delenv("GH_TOKEN", raising=False)
+    monkeypatch.setenv("GITHUB_TOKEN", "factory-token")
+    verified_identities: list[tuple[str, str]] = []
+
+    class Client:
+        def __init__(self, *, token: str) -> None:
+            self.token = token
+
+        def verify_identity(self, declared: str) -> str:
+            verified_identities.append((self.token, declared))
+            return declared
+
+    monkeypatch.setattr(orchestrator, "GitHubForgeClient", Client)
     sandbox = tmp_path / "sandbox"
     sandbox.mkdir()
     historical = {"reason": "opaque and nonauthoritative"}
@@ -6225,6 +6247,17 @@ def test_factory_recovery_uses_run_id_first_lock_resume_and_authoritative_status
             session_index = tuple(spec.local_argv).index("--session")
             assert spec.local_argv[session_index + 1] == "session-1"
             assert spec.local_argv[-1].split()[-1] == "700"
+            assert verified_identities == [("factory-token", "factory-owner")]
+            assert spec.env == {
+                "MIMIR_HOME": str(tmp_path),
+                "GITHUB_TOKEN": "factory-token",
+                "GH_TOKEN": "factory-token",
+                "GIT_AUTHOR_NAME": "Factory Author",
+                "GIT_AUTHOR_EMAIL": "factory@example.com",
+                "GIT_COMMITTER_NAME": "Factory Author",
+                "GIT_COMMITTER_EMAIL": "factory@example.com",
+                "FACTORY_PUBLISHING_IDENTITY": "factory-owner",
+            }
             return self.handle
 
         async def wait(self, handle: LaunchHandle, timeout_s: int) -> ComputeResult:
@@ -6242,6 +6275,10 @@ def test_factory_recovery_uses_run_id_first_lock_resume_and_authoritative_status
             self.cleaned = True
 
     def runner(args: Sequence[str] | str, **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        if isinstance(args, list) and args[:5] == ["git", "-C", str(sandbox), "config", "--get"]:
+            identity = {"user.name": "Factory Author", "user.email": "factory@example.com"}
+            if args[-1] in identity:
+                return cp(args, stdout=identity[args[-1]] + "\n")
         if isinstance(args, list) and args[-2:] == ["rev-parse", "--show-toplevel"]:
             return cp(args, stdout=f"{sandbox}\n")
         if isinstance(args, list) and args[-2:] == ["rev-parse", "--absolute-git-dir"]:

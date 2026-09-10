@@ -38,7 +38,7 @@ REPO_TEST_UV_CACHE = Path("/opt/mimir-worklink/uv-cache")
 MAX_FDS = 3
 # Deliberately not imported from worker_client: this value must describe the
 # immutable executor installed in the root-owned image, not mutable controller code.
-EXECUTOR_PROTOCOL_IDENTITY = "worklink-executor-v6-bounded-output-path-checkout"
+EXECUTOR_PROTOCOL_IDENTITY = "worklink-executor-v7-feature-factory"
 EXECUTOR_SOURCE_COMMIT_PATH = Path("/opt/mimir-worklink/executor-source-commit")
 _STALE_EXECUTOR_DIAGNOSTIC = (
     "stale root executor image: controller and mimir.worklink.worker_exec protocol "
@@ -66,6 +66,7 @@ _PATH_LAUNCH_FIELDS = frozenset({
     "argv", "env", "projections", "timeout_s", "stdout_limit", "stderr_limit",
     "executor_identity",
 })
+_FACTORY_LAUNCH_FIELDS = _PATH_LAUNCH_FIELDS | {"run_id"}
 _CANCEL_FIELDS = frozenset({"version", "op", "id", "executor_identity"})
 _IDENTITY_FIELDS = frozenset({"version", "op", "executor_identity"})
 _jobs: dict[str, subprocess.Popen[bytes]] = {}
@@ -282,6 +283,64 @@ def _open_path_checkout(request: dict[str, Any]) -> int:
         resolved,
         os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0),
     )
+
+
+def _open_factory_checkout(request: dict[str, Any]) -> int:
+    run_id = request.get("run_id")
+    if not isinstance(run_id, str) or re.fullmatch(r"[a-z0-9](?:[a-z0-9._-]*[a-z0-9])?", run_id) is None:
+        raise RuntimeError("factory run_id is invalid")
+    issue = _positive_integer(request, "issue")
+    attempt = _positive_integer(request, "attempt")
+    if _identity_integer(request, "run_uid") != get_identities().worklink_uid:
+        raise RuntimeError("factory checkout requested an invalid worker uid")
+    path_value = request.get("path")
+    if not isinstance(path_value, str) or not path_value.startswith("/") or "\x00" in path_value:
+        raise RuntimeError("factory checkout path is invalid")
+    try:
+        root = WORKLINK_CHECKOUT_ROOT.resolve(strict=True)
+        requested = Path(path_value)
+        resolved = requested.resolve(strict=True)
+        relative = resolved.relative_to(root)
+    except (OSError, ValueError):
+        raise RuntimeError("factory checkout is outside the Worklink root") from None
+    if (
+        requested != resolved
+        or len(relative.parts) not in (2, 4)
+        or re.fullmatch(r"[A-Za-z0-9._-]+", relative.parts[0]) is None
+        or relative.parts[1] != f"{issue}-{attempt}"
+        or (len(relative.parts) == 4 and relative.parts[2:] != (".factory-sandboxes", run_id))
+    ):
+        raise RuntimeError("factory checkout shape is invalid")
+    outer = root.joinpath(*relative.parts[:2])
+    outer_fd = _open_path_checkout({**request, "path": str(outer)})
+    if len(relative.parts) == 2:
+        return outer_fd
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW
+    try:
+        # Walk from the validated outer FD so neither recovery component can be
+        # swapped for a symlink between canonicalization and opening.
+        sandbox_fd = os.open(".factory-sandboxes", flags, dir_fd=outer_fd)
+        try:
+            fd = os.open(run_id, flags, dir_fd=sandbox_fd)
+        finally:
+            os.close(sandbox_fd)
+    finally:
+        os.close(outer_fd)
+    try:
+        observed = os.fstat(fd)
+        identities = get_identities()
+        if (
+            not stat.S_ISDIR(observed.st_mode)
+            or observed.st_uid not in {identities.worklink_uid, identities.mimir_uid}
+            or observed.st_gid != identities.worklink_gid
+            or observed.st_mode & 0o070 != 0o070
+            or observed.st_mode & stat.S_IWOTH
+        ):
+            raise RuntimeError("factory recovery checkout ownership or mode is invalid")
+        return fd
+    except Exception:
+        os.close(fd)
+        raise
 
 
 def _validate_command(request: dict[str, Any]) -> list[str]:
@@ -595,8 +654,9 @@ def _wait_with_output_limits(
 
 
 def _handle_launch(connection: socket.socket, request: dict[str, Any], fds: list[int]) -> None:
-    path_addressed = request.get("op") == "launch_path"
-    expected_fields = _PATH_LAUNCH_FIELDS if path_addressed else _LAUNCH_FIELDS
+    factory = request.get("op") == "launch_factory"
+    path_addressed = factory or request.get("op") == "launch_path"
+    expected_fields = _FACTORY_LAUNCH_FIELDS if factory else _PATH_LAUNCH_FIELDS if path_addressed else _LAUNCH_FIELDS
     expected_fds = 2 if path_addressed else MAX_FDS
     if set(request) != expected_fields or len(fds) != expected_fds:
         raise RuntimeError(
@@ -609,7 +669,7 @@ def _handle_launch(connection: socket.socket, request: dict[str, Any], fds: list
         raise RuntimeError("invalid worker id")
     _validate_identifier(identifier)
     if path_addressed:
-        fds.insert(0, _open_path_checkout(request))
+        fds.insert(0, _open_factory_checkout(request) if factory else _open_path_checkout(request))
         checkout_root = None
     else:
         checkout_root = _validate_checkout(fds[0], request)
@@ -652,7 +712,7 @@ def _handle_launch(connection: socket.socket, request: dict[str, Any], fds: list
         os.chown(home, get_identities().worklink_uid, get_identities().worklink_gid)
         os.chmod(home, 0o700)
         environment["HOME"] = str(home)
-        execution_fd = _execution_checkout_fd(
+        execution_fd = os.dup(anchored_fd) if factory else _execution_checkout_fd(
             command,
             anchored_fd,
             home,
@@ -720,7 +780,7 @@ def handle_connection(connection: socket.socket) -> None:
             raise RuntimeError("unsupported worker request")
         raw_identifier = request.get("id")
         identifier = raw_identifier if isinstance(raw_identifier, str) else None
-        if request.get("op") in {"launch", "launch_path"}:
+        if request.get("op") in {"launch", "launch_path", "launch_factory"}:
             _handle_launch(connection, request, fds)
         elif request.get("op") == "cancel":
             _handle_cancel(connection, request, fds)

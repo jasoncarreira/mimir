@@ -1017,25 +1017,19 @@ def test_work_spec_carries_the_publishing_identity_into_the_launch_spec(
 async def test_launch_child_environment_carries_the_publishing_identity(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """End of the chain: the value reaches the actual child process environment.
-
-    ``_local_child_env()`` is an allowlist that admits neither ``FACTORY_`` nor the
-    exact name, so this passes only because ``WorkSpec.env`` is merged over it. Stub
-    the allowlist to empty so the assertion cannot be satisfied by inheritance.
-    """
+    """The explicit publishing identity crosses the contained worker boundary."""
     _own_opencode_resolution(tmp_path, monkeypatch)
-    import asyncio as _asyncio
 
     from mimir.worklink.compute import LocalSubprocessComputeBackend
+    from mimir.worklink.worker_client import WorkerClient
 
     captured: dict[str, dict[str, str]] = {}
 
-    async def fake_exec(*_args: str, **kwargs: Any) -> _FakeLaunchProcess:
+    async def fake_launch(self, **kwargs: Any) -> _FakeLaunchProcess:
         captured["env"] = kwargs["env"]
         return _FakeLaunchProcess()
 
-    monkeypatch.setattr(_asyncio, "create_subprocess_exec", fake_exec)
-    monkeypatch.setattr("mimir.worklink.compute._local_child_env", dict)
+    monkeypatch.setattr(WorkerClient, "launch", fake_launch)
 
     spec = FeatureFactoryBackend(entrypoint="/absolute/factory.js").work_spec(
         _factory_order(tmp_path, "mimir-carreira"),
@@ -1045,8 +1039,11 @@ async def test_launch_child_environment_carries_the_publishing_identity(
         branch="epic/1551",
         test_command="uv run pytest -q",
     )
-    handle = await LocalSubprocessComputeBackend().launch(spec)
+    compute = LocalSubprocessComputeBackend()
+    handle = await compute.launch(spec)
     try:
+        await compute.wait(handle, 30)
         assert captured["env"][FACTORY_PUBLISHING_IDENTITY_ENV] == "mimir-carreira"
+        assert "HOME" not in captured["env"]
     finally:
-        await LocalSubprocessComputeBackend().cleanup(handle)
+        await compute.cleanup(handle)

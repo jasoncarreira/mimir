@@ -1037,12 +1037,13 @@ async def test_feature_factory_launch_remains_shell_free_argv(
 ) -> None:
     calls: list[dict[str, Any]] = []
 
-    async def fake_exec(*args: str, **kwargs: Any) -> FakeProcess:
-        calls.append({"args": args, "kwargs": kwargs})
+    from mimir.worklink.worker_client import WorkerClient
+
+    async def fake_launch(self, **kwargs: Any) -> FakeProcess:
+        calls.append({"args": kwargs["argv"], "kwargs": kwargs, "run_id": self.factory_run_id})
         return FakeProcess(returncode=0)
 
-    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
-    monkeypatch.setattr("mimir.worklink.compute._local_child_env", dict)
+    monkeypatch.setattr(WorkerClient, "launch", fake_launch)
     monkeypatch.delenv("MIMIR_FACTORY_MAX_RETRIES", raising=False)
     monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
     monkeypatch.delenv("XDG_DATA_HOME", raising=False)
@@ -1078,6 +1079,7 @@ async def test_feature_factory_launch_remains_shell_free_argv(
     compute = LocalSubprocessComputeBackend()
 
     handle = await compute.launch(spec)
+    await compute.wait(handle, 30)
     await compute.cleanup(handle)
 
     assert calls[0]["args"] == (
@@ -1095,7 +1097,8 @@ async def test_feature_factory_launch_remains_shell_free_argv(
         " --autonomous --max-retries 5 chainlink-1606",
     )
     assert "shell" not in calls[0]["kwargs"]
-    assert calls[0]["kwargs"]["cwd"] == str(tmp_path)
+    assert calls[0]["kwargs"]["local_checkout"] == tmp_path
+    assert calls[0]["run_id"] == "chainlink-1606"
 
 
 @pytest.mark.asyncio

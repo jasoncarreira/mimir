@@ -13,10 +13,10 @@ import tempfile
 import threading
 from typing import Any, Callable, ClassVar, Mapping, Sequence
 
-from ...opencode_config import OpenCodeConfigError
+from ...opencode_config import OpenCodeConfigError, opencode_worker_documents
 from ..compute import ComputeResult, WorkSpec
 from .base import Caps, CheckoutShape, RawResult, WorkOrder
-from .opencode import resolve_worklink_opencode_invocation
+from .opencode import WorkerProjection, resolve_worklink_opencode_invocation
 
 
 FACTORY_VERSION = "0.8.3"
@@ -593,11 +593,25 @@ class FeatureFactoryBackend:
     ) -> WorkSpec:
         try:
             resolution = resolve_worklink_opencode_invocation(order.env)
+            documents = opencode_worker_documents(resolution.invocation, resolution.env)
         except OpenCodeConfigError as exc:
             raise FactoryContractError(
                 f"feature_factory_opencode_resolution_failed:{exc.reason_code}"
             ) from exc
         invocation = resolution.invocation
+        config = json.loads(documents.config_document)
+        # The worker must load the factory command, but no ambient plugins.
+        config["plugin"] = [f"opencode-feature-factory@{FACTORY_VERSION}"]
+        projections = [
+            WorkerProjection(
+                ".config/opencode/opencode.json",
+                json.dumps(config, sort_keys=True, separators=(",", ":")).encode("utf-8"),
+            )
+        ]
+        if documents.auth_document is not None:
+            projections.append(
+                WorkerProjection(".local/share/opencode/auth.json", documents.auth_document)
+            )
         run_id = run_id or epic_run_id(order.issue_id)
         if _RUN_ID.fullmatch(run_id) is None:
             raise FactoryContractError("factory launch run_id has an invalid shape")
@@ -634,6 +648,7 @@ class FeatureFactoryBackend:
                 "configured_model": resolution.configured_model,
                 "model_diverged": resolution.model_diverged,
                 "model_source": invocation.model_source,
+                "worker_projections": projections,
             },
             local_checkout=order.checkout,
             local_argv=command,
