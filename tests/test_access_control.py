@@ -1547,6 +1547,33 @@ def test_pr_review_others_does_not_widen_scheduled_ticks(
         ) is (stage == "stored" and service.authority_profile == "heartbeat")
 
 
+@pytest.mark.parametrize("enabled", [False, True])
+def test_heartbeat_git_flag_preserves_principal_and_shell_policy(tmp_path, monkeypatch, enabled):
+    monkeypatch.delenv("MIMIR_CODING_ENABLED", raising=False)
+    baseline = access_control.builtin_trigger_service_principal("heartbeat", tmp_path)
+    monkeypatch.setenv("MIMIR_CODING_ENABLED", str(enabled).lower())
+    principal = access_control.builtin_trigger_service_principal("heartbeat", tmp_path)
+    assert principal == baseline
+    auth = _trusted_service_auth(principal, channel_id="scheduler:heartbeat")
+    assert access_control.can_resolve_forge_review_scope(auth, stage="stored") is (not enabled)
+    assert access_control.can_resolve_forge_review_scope(auth, stage="fetch") is enabled
+    assert access_control.can_resolve_forge_review_scope(
+        auth, stage="accept", pr_author="mimir", self_login="mimir",
+    ) is enabled
+    for author, login in (("other", "mimir"), ("", ""), ("mimir", None)):
+        assert not access_control.can_resolve_forge_review_scope(
+            auth, stage="accept", pr_author=author, self_login=login,
+        )
+    for name in access_control._REPO_TOOL_ACTIONS:
+        assert access_control.service_can_invoke_operation(principal, name), name
+    for command in ("git push", "git rebase main", "git merge main", "git revert HEAD", "sh -c 'git push'"):
+        decision = ToolRegistry().authorize_tool(
+            "shell_exec", auth, enforce=True, target_channel=command,
+            arguments={"command": command, "cwd": str(tmp_path)},
+        )
+        assert not decision.allowed, command
+
+
 @pytest.mark.parametrize("stage", ["stored", "fetch", "accept"])
 def test_pr_review_others_leaves_operator_scope_resolution_unchanged(stage: str) -> None:
     auth = _read_auth(admin=True)
@@ -9285,6 +9312,114 @@ def test_checkout_lease_read_scope_does_not_bypass_protected_content_veto(
         assert protected_read_result_reason(secret) == "protected_read_result"
     finally:
         reset_current_turn(token)
+
+
+@pytest.mark.parametrize("tool_name", ["write_file", "edit_file"])
+def test_heartbeat_maintenance_file_sink_is_confined_to_exact_active_lease(
+    tool_name: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A heartbeat repairs conflicts through the model-facing file tools.
+
+    Exercised through ``ToolRegistry.authorize_tool`` rather than a direct
+    ``Path.write_text``: the gap this pins was invisible to a test that writes
+    the file itself, because the authorization boundary is what refused.
+    """
+    home = tmp_path / "home"
+    source = tmp_path / "source"
+    lease_root = tmp_path / "pr-leases"
+    for path in (home, source, lease_root):
+        path.mkdir()
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    monkeypatch.setenv("MIMIR_FILE_TOOL_ROOTS", f"{source}:rw")
+    monkeypatch.setenv("MIMIR_CODING_ENABLED", "1")
+
+    state = _review_state("o/r", 42, "worklink/42", str(source))
+    state.action_scope.__dict__["event_type"] = "heartbeat_pr_maintenance"
+    checkout = _attach_test_checkout_lease(
+        state, lease_root, f"{state.action_scope.scope_id[:16]}-lease-a",
+    )
+    other_checkout = lease_root / f"{state.action_scope.scope_id[:16]}-lease-b"
+    other_checkout.mkdir()
+    service = build_trigger_service_principal(
+        canonical="heartbeat", trigger="scheduled_tick", profile="heartbeat",
+        tier=CapabilityTier.CODE_EXECUTION, capabilities=(tool_name,),
+        creation_path="test",
+    )
+    auth = replace(
+        _service_auth(service, InformationFlowLabels()),
+        repo_review_state=state,
+    )
+    registry = ToolRegistry()
+
+    admitted = registry.authorize_tool(
+        tool_name, auth, enforce=True,
+        target_channel=str(checkout / "mimir" / "access_control.py"),
+    )
+    assert admitted.allowed is True, admitted.reason
+    assert admitted.would_block is False
+
+    # The out-of-lease denial must survive the widening.
+    for target in (
+        other_checkout / "tests" / "test_access_control.py",
+        source / "mimir" / "access_control.py",
+    ):
+        denied = registry.authorize_tool(
+            tool_name, auth, enforce=True, target_channel=str(target),
+        )
+        assert denied.allowed is False
+        assert denied.reason == "repo_pr_target_outside_active_lease"
+
+    # Without the operator coding opt-in the heartbeat never reaches the gate.
+    monkeypatch.setenv("MIMIR_CODING_ENABLED", "0")
+    unflagged = registry.authorize_tool(
+        tool_name, auth, enforce=True,
+        target_channel=str(checkout / "mimir" / "access_control.py"),
+    )
+    assert unflagged.allowed is False
+
+
+@pytest.mark.parametrize("tool_name", ["write_file", "edit_file"])
+def test_heartbeat_maintenance_file_sink_requires_the_scope_write_grant(
+    tool_name: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Reaching the gate is not the grant: WRITE must be in allowed_operations."""
+    home = tmp_path / "home"
+    source = tmp_path / "source"
+    lease_root = tmp_path / "pr-leases"
+    for path in (home, source, lease_root):
+        path.mkdir()
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    monkeypatch.setenv("MIMIR_FILE_TOOL_ROOTS", f"{source}:rw")
+    monkeypatch.setenv("MIMIR_CODING_ENABLED", "1")
+
+    state = _review_state("o/r", 42, "worklink/42", str(source))
+    state.action_scope.__dict__["event_type"] = "heartbeat_pr_maintenance"
+    state.action_scope.__dict__["allowed_operations"] = frozenset(
+        action.value for action in access_control.RepoPRAction
+        if action is not access_control.RepoPRAction.WRITE
+    )
+    checkout = _attach_test_checkout_lease(
+        state, lease_root, f"{state.action_scope.scope_id[:16]}-lease-a",
+    )
+    service = build_trigger_service_principal(
+        canonical="heartbeat", trigger="scheduled_tick", profile="heartbeat",
+        tier=CapabilityTier.CODE_EXECUTION, capabilities=(tool_name,),
+        creation_path="test",
+    )
+    auth = replace(
+        _service_auth(service, InformationFlowLabels()),
+        repo_review_state=state,
+    )
+    decision = ToolRegistry().authorize_tool(
+        tool_name, auth, enforce=True,
+        target_channel=str(checkout / "mimir" / "access_control.py"),
+    )
+    assert decision.allowed is False
+    assert decision.reason == "repo_pr_write_not_granted"
 
 
 @pytest.mark.parametrize("tool_name", ["write_file", "edit_file"])

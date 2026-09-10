@@ -41,6 +41,9 @@ _MERGE_KEY_RE = re.compile(r"merge\.([^.\x00]+)\.driver")
 _RECENT_AGENT_PUSH_LIMIT = 1024
 _URL_USERINFO_RE = re.compile(r"(?i)([a-z][a-z0-9+.-]{0,31}://)[^/@\s]+@")
 _HISTORY_REWRITE_EVENT_TYPES = frozenset({
+    # Own-PR heartbeat maintenance has the same rebase publication authority as
+    # poller remediation, still bounded by exact-head leases and protected refs.
+    "heartbeat_pr_maintenance",
     "pr_changes_requested_stale",
     "pr_ci_failure",
     "pr_mergeability_rebase",

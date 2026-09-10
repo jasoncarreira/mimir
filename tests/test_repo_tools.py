@@ -873,6 +873,89 @@ def test_changes_requested_rebase_push_uses_exact_head_lease(tmp_path: Path) -> 
     )
 
 
+@pytest.mark.parametrize("operation", ["merge", "rebase", "revert"])
+@pytest.mark.parametrize("stale", [False, True, "race"])
+def test_heartbeat_live_scope_executes_git_remediation(tmp_path, monkeypatch, operation, stale):
+    import mimir.access_control as access
+    import mimir.tools.forge as forge
+    from mimir.models import AgentEvent, InformationFlowLabels, NormalizedPullRequestSnapshot
+
+    origin, source, previous, previous_state = _repo_scope_and_state(tmp_path)
+    _git(source, "checkout", "-q", "main")
+    (source / "base-only.txt").write_text("advance base\n", encoding="utf-8")
+    _git(source, "add", "base-only.txt")
+    _git(source, "commit", "-qm", "advance base")
+    _git(source, "push", "-q", "origin", "HEAD:main")
+    snapshot = NormalizedPullRequestSnapshot(
+        repo="owner/repo", number=7, state="open", author="mimir-bot",
+        head_repo="owner/repo", head_remote="origin", head_ref="worklink/7",
+        head_sha=previous.observed_head_sha, base_ref="main",
+        base_sha=_git(source, "rev-parse", "HEAD"),
+    )
+    monkeypatch.setenv("MIMIR_CODING_ENABLED", "true")
+    monkeypatch.setenv("MIMIR_GITHUB_SELF_LOGIN", "mimir-bot")
+    monkeypatch.setattr(access, "_configured_scope_github_repos", lambda: frozenset({"owner/repo"}))
+    monkeypatch.setattr(access, "_canonical_repo_binding_resolution", lambda repo: access.RepoBindingResolution(
+        (str(source), str(origin)), (str(source),), 1,
+    ))
+    monkeypatch.setattr(forge, "_client_for_repository", lambda repo: SimpleNamespace(
+        get_pull_request_snapshot=lambda *args: snapshot,
+    ))
+    service = access.builtin_trigger_service_principal("heartbeat", tmp_path)
+    context = access.create_auth_context(
+        AgentEvent(trigger="scheduled_tick", channel_id="scheduler:heartbeat",
+                   service_principal=service.canonical, service_authority=service),
+        None, enforce=True, ifc_labels=InformationFlowLabels(),
+    )
+    state = forge.resolve_review_state_for_context(context, "owner/repo", 7)
+    assert state.action_scope.event_type == "heartbeat_pr_maintenance"
+    lease = create_pr_checkout_lease(
+        state.action_scope, owner="mimir-bot",
+        lease_root=previous_state.checkout_lease.lease_root, review_state=state,
+    )
+    calls = []
+    concurrent = None
+
+    def advance_remote():
+        _git(source, "checkout", "-q", "worklink/7")
+        (source / "concurrent.txt").write_text("concurrent\n", encoding="utf-8")
+        _git(source, "add", "concurrent.txt")
+        _git(source, "commit", "-qm", "concurrent")
+        _git(source, "push", "-q", "origin", "HEAD:worklink/7")
+        return _git(origin, "rev-parse", previous.destination_ref)
+
+    def runner(argv, *, env, timeout, output_limit):
+        nonlocal concurrent
+        calls.append(argv)
+        if stale == "race" and "push" in argv:
+            concurrent = advance_remote()
+        return _bounded_subprocess_runner(argv, env=env, timeout=timeout, output_limit=output_limit)
+
+    tools = RepoGitTools(state, runner=runner)
+    assert tools.execute({
+        "merge": GitMerge(), "rebase": GitRebase(),
+        "revert": GitRevert(previous.observed_head_sha),
+    }[operation]).ok
+    (lease.path / "tracked.txt").write_text("heartbeat remediation\n", encoding="utf-8")
+    assert tools.execute(GitCommit(("tracked.txt",), "heartbeat remediation")).ok
+    if stale:
+        if stale is True:
+            concurrent = advance_remote()
+        with pytest.raises(GitRefusal) as refused:
+            tools.execute(GitPush())
+        assert refused.value.code == ("stale_scope" if stale is True else "git_failed")
+        assert _git(origin, "rev-parse", previous.destination_ref) == concurrent
+        assert any("push" in argv for argv in calls) is (stale == "race")
+    else:
+        assert tools.execute(GitPush()).ok
+        assert _git(origin, "rev-parse", previous.destination_ref) == _git(lease.path, "rev-parse", "HEAD")
+        push = next(argv for argv in calls if "push" in argv)
+        if operation == "rebase":
+            assert f"--force-with-lease={previous.destination_ref}:{previous.observed_head_sha}" in push
+        else:
+            assert not any(arg.startswith("--force") for arg in push)
+
+
 def test_head_accepted_by_rewritten_push_is_accepted_by_cleanup_when_commit_skipped(
     tmp_path: Path,
 ) -> None:

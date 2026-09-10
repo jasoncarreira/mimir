@@ -1298,6 +1298,7 @@ def _repo_pr_scope_resolution(
         and principal == self_login
     )
     is_remediation = is_fresh_changes_requested_remediation or event_type in {
+        "heartbeat_pr_maintenance",
         "pr_changes_requested_stale",
         "pr_ci_failure",
         "pr_mergeability_rebase",
@@ -1386,6 +1387,21 @@ def repo_binding_startup_alerts() -> tuple[dict[str, Any], ...]:
             "operator_visible": True,
         })
     return tuple(alerts)
+
+
+def heartbeat_cached_scope_refusal(previous: Any, current: Any) -> str | None:
+    """Keep live checkout pins and authority fixed across heartbeat discovery."""
+    if any(getattr(previous, name) != getattr(current, name) for name in (
+        "canonical_repo", "pr_number", "canonical_root", "canonical_origin",
+        "head_repo", "head_remote", "destination_ref", "observed_head_sha",
+        "base_ref", "observed_base_sha",
+    )):
+        return "stale_scope: heartbeat PR SHA/ref or repository binding changed"
+    if any(getattr(previous, name) != getattr(current, name) for name in (
+        "event_type", "allowed_operations", "checkout_ref", "provenance",
+    )):
+        return "heartbeat_scope_incompatible: cached scope is not heartbeat PR maintenance authority"
+    return None
 
 
 def create_server_discovered_heartbeat_scope(
@@ -6423,7 +6439,15 @@ class SinkGate:
             github_repo_scope_refusal = None
             scope = None
             if (
-                service.authority_profile == "github"
+                (
+                    service.authority_profile == "github"
+                    # Own-PR heartbeat maintenance repairs conflicts through the
+                    # file tools, so it needs the same active-lease write gate as
+                    # poller remediation. The in-lease RepoPRAction.WRITE grant
+                    # check and the out-of-lease denial below are unchanged, so
+                    # this widens WHO reaches the gate, never what it permits.
+                    or heartbeat_git_authority_enabled(service)
+                )
                 and sink_category is SinkCategory.FILE
             ):
                 review_state = (
@@ -8142,6 +8166,16 @@ def authorize_repo_pr_tool(
         scope is not None
         and not missing_actions
         and (
+            not heartbeat_git_authority_enabled(service_principal)
+            or (
+                bool(os.environ.get("MIMIR_GITHUB_SELF_LOGIN", "").strip())
+                and scope.principal == os.environ.get("MIMIR_GITHUB_SELF_LOGIN", "").strip()
+                and scope.pull_request_author == scope.principal
+                and is_configured_github_repo(scope.canonical_repo)
+                and service_can_invoke_operation(service_principal, tool_name)
+            )
+        )
+        and (
             tool_name != "pr_job_log"
             or (service_principal is not None and service_principal.has_capability("pr_job_log"))
         )
@@ -8588,6 +8622,31 @@ class ToolRegistry:
                 repo_pr_action_scope = (
                     state.action_scope if state is not None else None
                 )
+                if heartbeat_git_authority_enabled(preliminary_service) or heartbeat_git_authority_enabled(
+                    getattr(auth_context, "service_authority", None),
+                ):
+                    from .tools.forge import resolve_review_state_for_context
+
+                    try:
+                        state = resolve_review_state_for_context(
+                            auth_context,
+                            tool_arguments.get("repository"),
+                            tool_arguments.get("pull_request"),
+                        )
+                    except ToolException as exc:
+                        return ToolAuthorization(
+                            tool_name=tool_name,
+                            decision=OperationDecision.RESOURCE_SCOPED,
+                            allowed=not enforce,
+                            reason="repo_pr_scope_denied",
+                            service_principal=preliminary_service,
+                            enforcement_enabled=enforce,
+                            is_shadow_decision=not enforce,
+                            would_block=True,
+                            refusal_detail=str(exc),
+                            flow_direction=flow_direction,
+                        )
+                    repo_pr_action_scope = state.action_scope
             else:
                 repo_pr_action_scope = getattr(
                     auth_context, "repo_pr_action_scope", None,
@@ -10893,6 +10952,17 @@ def is_admin(auth_context: Any) -> bool:
     return "admin" in roles
 
 
+def heartbeat_git_authority_enabled(service: ServicePrincipal | None) -> bool:
+    """Opt in only a server-resolved heartbeat, never model event metadata."""
+    return (
+        coding_enabled()
+        and isinstance(service, ServicePrincipal)
+        and service.trigger == "scheduled_tick"
+        and service.authority_profile == "heartbeat"
+        and service.canonical == "heartbeat"
+    )
+
+
 def can_resolve_forge_review_scope(
     auth_context: Any,
     *,
@@ -10910,9 +10980,9 @@ def can_resolve_forge_review_scope(
       stored scope and provisionally fetch an open pull request. Acceptance
       still requires Mimir's configured forge login and either matching PR
       authorship or an explicit ``pr_review_others`` capability.
-    - Trusted ``scheduled_tick`` services in a review-scope authority profile
-      may reuse scope previously discovered by the server, but may not perform
-      new live discovery.
+    - Trusted heartbeat ``scheduled_tick`` services may reuse server discovery.
+      With the operator's heartbeat Git flag, fresh discovery is restricted to
+      the configured identity's own open PRs; the resolver revalidates caches.
 
     No other turn kind may reuse or discover forge review scope.
     """
@@ -10924,6 +10994,9 @@ def can_resolve_forge_review_scope(
     principal = getattr(auth_context, "canonical_principal", None)
     roles = getattr(auth_context, "roles", ())
     trusted_service = get_trusted_service_from_auth_context(auth_context)
+
+    if heartbeat_git_authority_enabled(trusted_service) and trigger != "scheduled_tick":
+        return False
 
     operator_user = (
         trigger == "user_message"
@@ -10943,12 +11016,20 @@ def can_resolve_forge_review_scope(
         and trusted_service.authority_profile in _PR_REVIEW_SCOPE_AUTHORITY_PROFILES
     )
 
+    heartbeat_git = (
+        trigger == "scheduled_tick"
+        and heartbeat_git_authority_enabled(trusted_service)
+        and trusted_service.has_capability("pr_metadata")
+    )
+
     if stage == "stored":
-        return operator_user or poller_service or scheduled_service
+        return operator_user or poller_service or (
+            scheduled_service and not heartbeat_git_authority_enabled(trusted_service)
+        )
     if stage == "fetch":
-        return operator_user or poller_service
+        return operator_user or poller_service or heartbeat_git
     if stage == "accept":
-        return operator_user or (
+        return (heartbeat_git and bool(self_login) and pr_author == self_login) or operator_user or (
             poller_service
             and bool(self_login)
             and (

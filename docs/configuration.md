@@ -47,7 +47,7 @@ exists — turn it on here first:
 | `MIMIR_ACTIVITY_PANEL_CHANNELS` | A passive, live-updating "working…" panel posted to the channel that accumulates the turn's steps and edits itself in place (Slack `chat.update` / Discord message edit). |
 | `MIMIR_MIDTURN_INJECTION_CHANNELS` | Fold an inbound user message into the currently-running turn instead of queuing it for the next one. |
 | `MIMIR_CHAT_SKILLS_ENABLED` | Chat slash-skill discovery + invocation from a channel. |
-| `MIMIR_CODING_ENABLED` | Expose the `spawn_open_code` coding-assistant tool. Requires the `opencode` CLI on `PATH`; startup fails if enabled without it. |
+| `MIMIR_CODING_ENABLED` | Single coding runtime/build flag. Requires OpenCode, pinned Git, and an existing runtime-writable PR checkout lease root; see [coding prerequisites](#coding-prerequisites). |
 | `MIMIR_FACTORY_EPICS_ENABLED` | Feature-factory epic dispatch in the chainlink-orchestrator poller (for `worklink:epic` issues). |
 
 All channel-list flags take a comma-separated prefix allow-list (e.g.
@@ -87,7 +87,7 @@ All channel-list flags take a comma-separated prefix allow-list (e.g.
 | `MIMIR_MIDTURN_INJECTION_CHANNELS` | csv-list | `""` (off) | Fold inbound `user_message` events into the running turn. Pollers / scheduled ticks excluded. |
 | `MIMIR_CHAT_SKILLS_ENABLED` | bool | `false` | Chat slash-skill discovery/invocation (chainlink #783). |
 | `MIMIR_CHAT_SKILL_ALLOWLIST` | csv-list | `""` | Skill slugs allowed as chat slash-skills (companion to the flag above). |
-| `MIMIR_CODING_ENABLED` | bool | `false` | Expose `spawn_open_code` to the agent. Enabling requires the `opencode` CLI on `PATH`; an unavailable CLI fails startup. |
+| `MIMIR_CODING_ENABLED` | bool | `false` | Enable the coding tool surface and scaffold image's OpenCode install/bootstrap. See [coding prerequisites](#coding-prerequisites); missing prerequisites fail startup together. |
 
 ## Concurrency, queue & timeouts
 
@@ -222,7 +222,7 @@ All channel-list flags take a comma-separated prefix allow-list (e.g.
 | `MIMIR_FOLDERS` | csv `name:mode` | built-in | Per-subdir write permissions under home (`state:rw,logs:ro,...`). Unknown modes → `ro`; unsafe names rejected. |
 | `MIMIR_FILE_OP_ROOTS` | retired tripwire | unset | Retired and ignored. If still present, startup warns to migrate every required root to `MIMIR_FILE_TOOL_ROOTS` and remove the old deployment setting; it grants no access. |
 | `MIMIR_FILE_TOOL_ROOTS` | csv `/absolute/path[:ro\|:rw]` | `""` | Legacy projection of `repositories.yaml` repository and allowed roots. When the YAML inventory is declared, an omitted value is derived and a disagreeing value is a startup error. Without that inventory, it retains the legacy behavior. `/tmp` is always derived as `rw`. See [file-tool access](../README.md#file-tool-access-outside-the-home). |
-| `MIMIR_PR_CHECKOUT_LEASE_ROOT` | absolute path | unset | Root for atomic, scope-bound PR checkout leases. GitHub activity receives write authority only for its active lease path, not this root generally or the live source checkout. |
+| `MIMIR_PR_CHECKOUT_LEASE_ROOT` | absolute path | unset | Existing, non-symlink directory writable by the runtime user, on the same filesystem as the repository root for hardlinks. Not created automatically. GitHub activity receives write authority only for its active lease path, not this root generally or the live source checkout. |
 | `MIMIR_PR_CHECKOUT_LEASE_REAPER_CRON` | cron | `*/15 * * * *` | Expired PR checkout lease reclamation cadence. Each lease's recorded `expires_at` determines eligibility; an empty value disables the scheduled sweep. |
 | `MIMIR_FETCH_URL_DISABLED` | bool | off | Truthy disables the `fetch_url` tool on non-`claude-code` providers. |
 | `MIMIR_FETCH_PDF_MAX_PAGES` | positive int | `100` | Maximum pages extracted from a fetched `application/pdf`; invalid or non-positive values use the default. |
@@ -684,16 +684,73 @@ Optional keys that enable specific tools/skills; unset = the tool/skill is off.
 ## Build- & scaffold-time variables
 
 These are consumed by the Docker scaffold / build (`start.sh`, Dockerfiles,
-`compose.env`), **not** by `config.py` at runtime.
+`compose.env`). `MIMIR_CODING_ENABLED` is also the Python runtime coding flag.
 
 | Flag | Type | Default | Description |
 |---|---|---|---|
 | `MIMIR_GIT_URL` | str | `https://github.com/jasoncarreira/mimir.git` | `start.sh` clone URL for the runtime source (change for forks). |
 | `MIMIR_DEFAULT_BRANCH` | str | `main` | Branch `start.sh` clones. |
 | `MIMIR_ENABLE_CLAUDE_CODE` | bool (`0`/`1`) | `0` | Build arg: `1` installs the Claude Code model adapter; the CLI is operator-provided. |
-| `MIMIR_ENABLE_OPENCODE` | bool (`0`/`1`) | `0` | Scaffold/build arg: `1` installs and configures the OpenCode runtime and bundled plugins. It is not read by the Python runtime. |
+| `MIMIR_CODING_ENABLED` | bool | `false` | Single runtime/build flag: true installs the pinned OpenCode runtime and bundled plugins in scaffold images and bootstraps their config at runtime. |
 | `MIMIR_EXTRAS` | csv-list | `anthropic,discord,slack,mcp` | pip extras build arg (`mimir-agent[...]`) in the PyPI-mode Dockerfile. |
 | `MIMIR_QUOTA_POLL_ENABLED` | bool (`0`/`1`) | unset | Setup-generated compatibility marker for subscription routes. Provider-side polling is not implemented for all routes, so do not treat this marker alone as evidence that quota polling is active. |
+
+### Coding prerequisites
+
+Coding stays disabled by default. `MIMIR_CODING_ENABLED` is the single operator
+flag for the coding tool surface, scaffold image installation, and runtime
+OpenCode bootstrap. Both workspace and PyPI scaffolds pass the same value from
+the Compose project `.env` or shell to `build.args` and `environment`.
+Compose interpolation does not read `compose.env`; putting this flag only there
+does not configure the build. The old scaffold `MIMIR_ENABLE_OPENCODE` knob is no
+longer used. `--opencode` only optionally bakes the home's config into the image;
+it is not required to install OpenCode when coding is enabled.
+
+Before an operator chooses to enable coding, provision all prerequisites:
+
+- Install the pinned OpenCode CLI from `mimir/worklink/tool_pins.py` on the runtime
+  `PATH`. Regenerate older scaffolds and **rebuild the image** after changing the
+  coding flag (`docker compose build`, then `docker compose up -d`). A restart
+  alone cannot install the CLI. Hand-maintained images must supply the same
+  prerequisites themselves; a runtime/build mismatch with a missing CLI is
+  caught at startup rather than exposing broken tools.
+- Provide the executable pinned Git path `/usr/bin/git` (the pin is the path,
+  not a Git release version).
+- Provision `MIMIR_PR_CHECKOUT_LEASE_ROOT` as an absolute, existing, non-symlink
+  directory in the runtime container or host namespace. Set ownership and
+  permissions for the actual runtime UID/GID, including mount permissions:
+  that user must be able to create and write files there. Startup probes this
+  as the runtime user; it does not create the root or repair ownership.
+- Place the lease root on the **same filesystem as the repository root** because
+  checkout leases use hardlinks. Separate Docker volumes can break that contract
+  even when their paths look adjacent. Startup's write probe does not verify
+  cross-root hardlink support.
+- Configure the target repository and its local root in `repositories.yaml`
+  (or the legacy `GITHUB_REPOS` / `MIMIR_FILE_TOOL_ROOTS` projections), plus
+  `MIMIR_GITHUB_SELF_LOGIN` matching the authenticated GitHub account and usable
+  GitHub credentials. Identity verification retains its intentional degraded
+  behavior: an unverified identity hides coding registration, but does not
+  excuse missing local coding prerequisites.
+
+Startup reports all missing local prerequisites in one error, including CLI,
+pinned Git, and lease-root configuration/writability. Satisfy the entire list
+before retrying. Provisioning a lease root grants no general agent write
+authority over it or the live source checkout.
+
+With coding enabled, trusted heartbeat turns can use the typed Git tools for
+checkout, conflict resolution, merge/rebase, revert, commit, and push. Raw shell
+policy is unchanged. Authority comes from a fresh GitHub snapshot of an open PR
+in a configured repository, authored by `MIMIR_GITHUB_SELF_LOGIN`; model tool
+arguments only select a candidate, never its author, refs, SHA, or permissions.
+The server pins those fields and refuses incompatible cached scopes or changed
+heads with named reasons. Rebased publication uses an exact-head force-with-lease,
+not unrestricted force, with the existing protected-ref restrictions intact.
+
+When coding is enabled, the validated lease root is also derived into file-tool
+read scope automatically. Do **not** duplicate it in `MIMIR_FILE_TOOL_ROOTS`.
+Existing active-lease authorization and protected-file checks still apply; this
+does not add a general writable root. The startup `filesystem_read_scope` event
+records the derived lease root and effective non-admin read roots for auditing.
 
 The following code-visible names are explicitly **internal, not operator
 environment variables**:

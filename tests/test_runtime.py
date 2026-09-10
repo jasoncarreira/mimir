@@ -851,6 +851,7 @@ async def test_runtime_preflight_never_retries_permanent_identity_latch(
     assert attempts == ["reviewer"]
     assert forge_tools.github_identity_is_degraded() is True
     assert forge_tools.github_identity_recovery_pending() is False
+    assert ("tools", {"coding_enabled": True}) in events
     await bundle.aclose()
 
 
