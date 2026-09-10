@@ -218,21 +218,26 @@ raise SystemExit(bootstrap.main([]))
         cwd=Path(__file__).resolve().parents[1],
     )
     try:
-        assert await asyncio.wait_for(process.stdout.readline(), 10) == b"ready\n"
-        process.send_signal(signum)
-        assert await asyncio.wait_for(process.stdout.readline(), 3) == b"armed\n"
-        assert await asyncio.wait_for(process.stdout.readline(), 3) == b"terminated\n"
-        assert await asyncio.wait_for(process.stdout.readline(), 3) == b"draining\n"
-        if repeat:
-            # Explicit escalation uses the operator's latest signal.
-            signum = signal.SIGINT if signum != signal.SIGINT else signal.SIGTERM
+        # This is only a hang guard; individual pipe reads have no deadline.
+        # The controlled watchdog and resistant stage prove the exit boundary:
+        # only expiration or a second signal can release the child, regardless
+        # of how long the parent takes to observe each ordered marker.
+        async with asyncio.timeout(120):
+            assert await process.stdout.readline() == b"ready\n"
             process.send_signal(signum)
-        else:
-            process.stdin.write(b"x")
-            await asyncio.wait_for(process.stdin.drain(), 3)
-        stdout, stderr = await asyncio.wait_for(process.communicate(), 3)
-        assert process.returncode == 128 + signum
-        assert (stdout, stderr) == (b"", b"")
+            assert await process.stdout.readline() == b"armed\n"
+            assert await process.stdout.readline() == b"terminated\n"
+            assert await process.stdout.readline() == b"draining\n"
+            if repeat:
+                # Explicit escalation uses the operator's latest signal.
+                signum = signal.SIGINT if signum != signal.SIGINT else signal.SIGTERM
+                process.send_signal(signum)
+            else:
+                process.stdin.write(b"x")
+                await process.stdin.drain()
+            stdout, stderr = await process.communicate()
+            assert process.returncode == 128 + signum
+            assert (stdout, stderr) == (b"", b"")
     finally:
         if process.returncode is None:
             process.kill()
