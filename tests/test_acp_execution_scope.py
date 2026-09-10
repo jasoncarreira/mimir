@@ -178,6 +178,42 @@ async def test_real_shell_and_persistent_python_scope(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_scope_request_refused_when_no_confinement_backend(tmp_path, monkeypatch):
+    """Pin what the simulated adoption fixture stubs out.
+
+    On a host with no OS confinement backend -- the Worklink build sandbox has
+    neither Seatbelt nor AppArmor -- ``validate_scope`` raises and a path grant
+    must be refused rather than granted, because an approved path cannot
+    constrain execution that is not confined. The adoption fixture stubs this
+    validator to stay portable, so without this test the real behaviour would go
+    uncovered on every platform.
+    """
+    from mimir.acp.confinement import BackendUnavailable
+
+    def unavailable(**kwargs):
+        raise BackendUnavailable("no confinement backend on this host")
+
+    monkeypatch.setattr(hosted, "validate_scope", unavailable)
+    cwd = tmp_path / "cwd"
+    cwd.mkdir()
+    extra = tmp_path / "extra"
+    extra.mkdir()
+    provider = HostedHandsProvider(
+        request_scope_permission=lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("must not ask the operator when validation already failed")
+        ),
+    )
+    provider.bind_session("s", cwd)
+    try:
+        result = await provider.request_scope(provider._sessions["s"], str(extra))
+        assert result["approved"] is False
+        assert "Scope unavailable" in result["message"]
+        assert str(extra) not in result["paths"]
+    finally:
+        await provider.close()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("backend", ["simulated", "seatbelt"])
 @pytest.mark.parametrize("boundary", ["release", "disconnect", "load"])
 @pytest.mark.parametrize("adopter_policy", ["empty", "nonrecursive"])
@@ -218,7 +254,12 @@ async def test_adopter_cannot_inherit_extra_path(tmp_path, monkeypatch, backend,
             return PreparedCommand(argv, dict(os.environ))
         monkeypatch.setattr(hosted, "prepare_command", prepare)
         monkeypatch.setattr(kernels, "prepare_command", prepare)
-        # The simulated backend must not validate against the host OS backend.
+        # The simulated backend must not validate against the host OS backend:
+        # on Linux ``validate_scope`` runs ``AppArmorBackend()._available()`` and
+        # refuses where AppArmor is absent, as in the Worklink sandbox, which has
+        # no backend at all. Real-backend behaviour is covered by the ``seatbelt``
+        # variant, and the refusal this hides by
+        # ``test_scope_request_refused_when_no_confinement_backend`` above.
         monkeypatch.setattr(hosted, "validate_scope", lambda **kw: None)
     approve = AsyncMock(return_value=True)
     provider = HostedHandsProvider(request_scope_permission=approve)
