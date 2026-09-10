@@ -860,7 +860,8 @@ def test_executor_rejects_fd_count_and_extra_request_fields() -> None:
         def recvmsg(self, *args: object) -> tuple[bytes, list[object], int, None]:
             return payload, [], 0, None
 
-        def send(self, data: bytes) -> None:
+        def send(self, data: bytes, flags: int = 0) -> None:
+            assert flags == socket.MSG_DONTWAIT
             self.responses.append(json.loads(data))
 
         def close(self) -> None:
@@ -1451,6 +1452,44 @@ def test_factory_launch_denies_invalid_contract(
                 os.close(fds[0])
 
 
+def test_factory_launch_refuses_non_linux_before_spawn(factory_request, tmp_path, monkeypatch):
+    monkeypatch.setattr(worker_exec, "sys", SimpleNamespace(platform="darwin", executable=sys.executable))
+    monkeypatch.setattr(worker_exec.os, "chown", lambda *args, **kwargs: None)
+    spawn = Mock(side_effect=AssertionError("non-Linux factory reached supervisor spawn"))
+    monkeypatch.setattr(worker_exec.subprocess, "Popen", spawn)
+    with (tmp_path / "stdout").open("w+b") as stdout, (tmp_path / "stderr").open("w+b") as stderr:
+        fds = [stdout.fileno(), stderr.fileno()]
+        try:
+            with pytest.raises(RuntimeError, match="PR_SET_CHILD_SUBREAPER requires Linux"):
+                worker_exec._handle_launch_factory(Mock(), factory_request, fds)
+        finally:
+            if len(fds) == 3:
+                os.close(fds[0])
+    spawn.assert_not_called()
+    assert factory_request["id"] not in worker_exec._jobs
+    assert factory_request["id"] not in worker_exec._launching
+    assert not (worker_exec.HOME_ROOT / factory_request["id"]).exists()
+
+
+def test_factory_cancel_uses_supervisor_stop_not_legacy_group(monkeypatch):
+    identifier = str(uuid.uuid4())
+    done = Mock()
+    done.is_set.return_value = False
+    done.wait.return_value = True
+    channel = Mock()
+    process = Mock(pid=123)
+    proc = worker_exec._FactoryProcess(process, channel, Mock(), done=done)
+    monkeypatch.setitem(worker_exec._jobs, identifier, proc)
+    legacy = Mock(side_effect=AssertionError("factory cancellation used legacy group signalling"))
+    monkeypatch.setattr(worker_exec, "_terminate_process_group_pid", legacy)
+    worker_exec._cancel(identifier)
+    channel.send.assert_called_once_with(b"stop", socket.MSG_DONTWAIT)
+    done.wait.assert_called_once_with(worker_exec._FACTORY_STOP_TIMEOUT_S + worker_exec._PROCESS_REAP_TIMEOUT_S)
+    process.wait.assert_not_called()
+    legacy.assert_not_called()
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="Linux factory launch requires PR_SET_CHILD_SUBREAPER")
 def test_factory_drops_identity_before_payload_exec_or_spawn(
     factory_request, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1474,27 +1513,376 @@ def test_factory_drops_identity_before_payload_exec_or_spawn(
 
     monkeypatch.setattr(worker_exec, "_prepare_factory_runtime", lambda home: events.append("runtime"))
 
-    def popen(*args, **kwargs):
+    payload = ["factory-payload", "--dir", "a directory", "--", "$(not-a-shell)"]
+    factory_request["argv"] = payload.copy()
+
+    def popen(command, **kwargs):
+        supervisor = Path(worker_exec.__file__).with_name("factory_supervisor.py")
+        assert supervisor.is_absolute()
+        assert command[:3] == [sys.executable, "-I", str(supervisor)]
+        assert command[4:] == payload
+        assert kwargs["close_fds"] is True
+        assert kwargs["pass_fds"][1] == int(command[3])
+        assert stat.S_ISSOCK(os.fstat(int(command[3])).st_mode)
         preexec = kwargs.get("preexec_fn")
-        assert callable(preexec), "factory payload requires preexec identity drop"
+        assert callable(preexec), "factory supervisor requires preexec identity drop"
         preexec()
         assert events == [
             ("gid", (observed.worklink_gid,) * 3),
             ("uid", (observed.worklink_uid,) * 3),
             "runtime",
-        ], "payload exec/spawn happened before identity drop"
-        events.extend(["payload-exec", "payload-spawn"])
+        ], "supervisor execution happened before identity drop/runtime setup"
+        # supervise() owns prctl-before-payload; its independent tests live in
+        # test_worklink_factory_supervisor, not this mocked exec boundary.
+        events.append("supervisor-exec")
         return SimpleNamespace(pid=123, returncode=0)
 
     monkeypatch.setattr(worker_exec.subprocess, "Popen", popen)
-    monkeypatch.setattr(worker_exec, "_wait_with_output_limits", lambda *a: (0, False, False))
+    responses = []
+    send_flags = []
+
+    def send(data, flags=0):
+        responses.append(json.loads(data))
+        send_flags.append(flags)
+
+    def wait(proc, *args):
+        assert isinstance(proc, worker_exec._FactoryProcess)
+        assert worker_exec._jobs[factory_request["id"]] is proc
+        proc.emit({"kind": "event", "event": "worklink_factory_orphan_adopted", "pid": 456})
+        proc.done.set()
+        return 0, False, False
+
+    monkeypatch.setattr(worker_exec, "_wait_with_output_limits", wait)
     with (tmp_path / "stdout").open("w+b") as stdout, (tmp_path / "stderr").open("w+b") as stderr:
         fds = [stdout.fileno(), stderr.fileno()]
         try:
-            worker_exec._handle_launch_factory(SimpleNamespace(send=lambda data: None), factory_request, fds)
+            worker_exec._handle_launch_factory(
+                SimpleNamespace(send=send),
+                factory_request, fds,
+            )
         finally:
             os.close(fds[0])
-    assert events[-2:] == ["payload-exec", "payload-spawn"]
+    assert events[-1] == "supervisor-exec"
+    assert factory_request["argv"] == payload
+    assert [response["status"] for response in responses] == ["started", "event", "terminal"]
+    assert send_flags == [0, socket.MSG_DONTWAIT, socket.MSG_DONTWAIT]
+    assert responses[1] == {
+        "kind": "event", "event": "worklink_factory_orphan_adopted", "pid": 456,
+        "status": "event", "id": factory_request["id"], "run_id": factory_request["id"],
+        "issue_id": 41, "attempt": 2,
+    }
+    assert factory_request["id"] not in worker_exec._jobs
+    assert not (worker_exec.HOME_ROOT / factory_request["id"]).exists()
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="requires Linux subreaper")
+@pytest.mark.parametrize("mode", ["complete", "cancel", "timeout", "stdout", "stderr", "death"])
+def test_wait_factory_real_supervisor(tmp_path: Path, monkeypatch, mode: str) -> None:
+    from concurrent.futures import ThreadPoolExecutor
+
+    monkeypatch.setattr(worker_exec, "_CONTROLLER_CANCELLATION_GRACE_S", 0)
+    monkeypatch.setattr(worker_exec, "_OUTPUT_LIMIT_POLL_S", .001)
+    monkeypatch.setattr(worker_exec, "_FACTORY_STOP_TIMEOUT_S", 3)
+    monkeypatch.setattr(worker_exec, "_PROCESS_REAP_TIMEOUT_S", 1)
+    legacy = Mock(side_effect=AssertionError("factory used legacy process-group signalling"))
+    monkeypatch.setattr(worker_exec, "_terminate_process_group_pid", legacy)
+    parent, child = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+    events = []
+    payload = "import os, time; os.write(1, b'ready'); time.sleep(30)"
+    if mode == "complete":
+        payload = "import os; os.write(1, b'done'); os._exit(37)"
+    elif mode in {"stdout", "stderr"}:
+        payload = f"import os, time; os.write({1 if mode == 'stdout' else 2}, b'x' * 8192); time.sleep(30)"
+    with parent, child, (tmp_path / "stdout").open("w+b") as stdout, (tmp_path / "stderr").open("w+b") as stderr:
+        process = subprocess.Popen(
+            [sys.executable, "-I", str(Path(worker_exec.__file__).with_name("factory_supervisor.py")),
+             # A bad inherited descriptor simulates supervisor startup death,
+             # without spawning an orphan that pytest cannot reap.
+             "-1" if mode == "death" else str(child.fileno()),
+             sys.executable, "-I", "-c", payload],
+            pass_fds=(child.fileno(),), stdin=subprocess.DEVNULL,
+            stdout=stdout, stderr=stderr,
+        )
+        child.close()
+        proc = worker_exec._FactoryProcess(process, parent, events.append)
+        try:
+            assert proc.pid == process.pid
+            with ThreadPoolExecutor(max_workers=1) as pool:
+                future = pool.submit(
+                    worker_exec._wait_factory, proc, .1 if mode == "timeout" else 10,
+                    stdout.fileno(), 64, stderr.fileno(), 4096 if mode == "death" else 64,
+                )
+                if mode == "cancel":
+                    worker_exec._terminate_process_group(proc)
+                if mode == "death":
+                    with pytest.raises(RuntimeError, match="worklink_factory_supervisor_lost: no terminal cleanup report"):
+                        future.result(timeout=8)
+                    assert proc.returncode is None
+                    assert len(events) == 1
+                    assert events[0]["event"] == "worklink_factory_supervisor_lost"
+                    assert events[0]["error"] == proc.error
+                    with pytest.raises(RuntimeError, match="supervisor_lost"):
+                        proc.stop()
+                else:
+                    code, timed_out, overflow = future.result(timeout=8)
+                    assert code == (37 if mode == "complete" else -signal.SIGTERM)
+                    assert timed_out is (mode == "timeout")
+                    assert overflow is (mode in {"stdout", "stderr"})
+                    assert proc.returncode == code
+                    assert proc.error is None
+                    assert process.returncode == 0
+                    if mode in {"stdout", "stderr"}:
+                        assert (tmp_path / mode).read_bytes() == b"x" * 64
+                    if mode == "complete":
+                        assert (tmp_path / "stdout").read_bytes() == b"done"
+                    proc.stop()
+            assert proc.done.is_set()
+            assert parent.fileno() == -1
+            assert process.poll() is not None
+            legacy.assert_not_called()
+        finally:
+            parent.close()
+            if process.poll() is None:
+                process.wait(timeout=5)
+
+
+def test_wait_factory_unreapable_supervisor_has_finite_stop_bound(tmp_path, monkeypatch):
+    clock = iter(i * .1 for i in range(30))
+    monkeypatch.setattr(worker_exec, "time", SimpleNamespace(
+        monotonic=lambda: next(clock), sleep=lambda _: None,
+    ))
+    monkeypatch.setattr(worker_exec, "_FACTORY_STOP_TIMEOUT_S", .2)
+    monkeypatch.setattr(worker_exec, "_PROCESS_REAP_TIMEOUT_S", .3)
+    channel = Mock()
+    channel.recv.side_effect = BlockingIOError
+    process = Mock(pid=123)
+    process.wait.side_effect = [subprocess.TimeoutExpired("supervisor", .2), 0]
+    events = []
+    proc = worker_exec._FactoryProcess(process, channel, events.append)
+    legacy = Mock(side_effect=AssertionError("legacy factory signal"))
+    monkeypatch.setattr(worker_exec, "_terminate_process_group_pid", legacy)
+    proc.request_stop()
+    deadline = proc.stop_deadline
+    proc.request_stop()
+    assert proc.stop_deadline == deadline
+    with (tmp_path / "output").open("w+b") as output:
+        with pytest.raises(RuntimeError, match="supervisor stop deadline exceeded"):
+            worker_exec._wait_factory(proc, 100, output.fileno(), 64, output.fileno(), 64)
+    assert proc.done.is_set()
+    assert proc.returncode is None
+    assert proc.error == "worklink_factory_reap_refused: supervisor failed to exit"
+    assert events == [{"kind": "event", "event": "worklink_factory_supervisor_lost",
+                       "error": "worklink_factory_reap_refused: supervisor stop deadline exceeded"}]
+    process.wait.assert_has_calls([call(timeout=.2), call(timeout=.3)])
+    process.kill.assert_called_once_with()
+    channel.close.assert_called_once_with()
+    legacy.assert_not_called()
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="Linux factory executor uses SOCK_SEQPACKET")
+@pytest.mark.asyncio
+@pytest.mark.parametrize("ending", ["terminal", "error", "identity", "invalid", "eof"])
+async def test_worker_process_forwards_factory_events_to_owned_logger(tmp_path, monkeypatch, ending):
+    from mimir import event_logger
+
+    path = tmp_path / "events.jsonl"
+    logger = event_logger.EventLogger(path, session_id="factory-test")
+    monkeypatch.setattr(event_logger, "get_logger", lambda: logger)
+    identifier = str(uuid.uuid4())
+    parent, child = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+    with parent, child:
+        process = WorkerProcess(identifier, 123, parent)
+        names = ["worklink_factory_orphan_adopted", "worklink_factory_reap_refused",
+                 "worklink_factory_supervisor_lost"]
+        for name in names:
+            child.send(json.dumps({
+                "id": identifier, "status": "event", "event": name,
+                "run_id": identifier, "issue_id": 41, "attempt": 2, "pid": 456,
+                "error": "cleanup diagnostic", "untrusted_extra": "must not forward",
+            }).encode())
+        packet = {"id": identifier, "status": "terminal", "exit_code": 37,
+                  "timed_out": True, "output_overflow": True}
+        expected = None
+        if ending == "error":
+            packet = {"id": identifier, "error": "cleanup refused"}
+            expected = "cleanup refused"
+        elif ending in {"identity", "invalid"}:
+            packet = {"id": str(uuid.uuid4()) if ending == "identity" else identifier,
+                      "status": "event", "event": names[0] if ending == "identity" else "arbitrary"}
+            expected = "invalid terminal/event identity" if ending == "identity" else "invalid event"
+        elif ending == "eof":
+            expected = "closed before terminal result"
+        if ending != "eof":
+            child.send(json.dumps(packet).encode())
+        child.close()
+        if expected:
+            with pytest.raises(RuntimeError, match=expected):
+                await process.wait()
+            assert process.returncode is None
+        else:
+            assert await process.wait() == 37
+            assert await process.wait() == 37
+            assert process.timed_out and process.output_overflow
+            assert parent.fileno() == -1
+    records = [json.loads(line) for line in path.read_text().splitlines()]
+    assert len(records) == 3
+    assert [record["type"] for record in records] == names
+    for record in records:
+        assert record["run_id"] == identifier
+        assert record["issue_id"] == 41
+        assert record["attempt"] == 2
+        assert record["pid"] == 456
+        assert record["error"] == "cleanup diagnostic"
+        assert "untrusted_extra" not in record
+
+
+def test_factory_stop_refuses_missing_monitor_acknowledgement(monkeypatch):
+    monkeypatch.setattr(worker_exec, "_FACTORY_STOP_TIMEOUT_S", .2)
+    monkeypatch.setattr(worker_exec, "_PROCESS_REAP_TIMEOUT_S", .3)
+    done = Mock()
+    done.is_set.return_value = False
+    done.wait.return_value = False
+    channel = Mock()
+    channel.send.side_effect = BrokenPipeError
+    proc = worker_exec._FactoryProcess(Mock(pid=123), channel, Mock(), done=done)
+    with pytest.raises(RuntimeError, match="worklink_factory_reap_refused: supervisor did not finish"):
+        proc.stop()
+    done.wait.assert_called_once_with(.5)
+    channel.send.assert_called_once_with(b"stop", socket.MSG_DONTWAIT)
+    assert proc.stop_deadline is not None
+    done.is_set.return_value = True
+    proc.request_stop()
+    assert channel.send.call_count == 1
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="Linux factory executor uses SOCK_SEQPACKET")
+@pytest.mark.parametrize("event", ["worklink_factory_orphan_adopted", "worklink_factory_reap_refused"])
+def test_wait_factory_forwards_supervisor_event_before_terminal(tmp_path, event):
+    parent, child = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+    packet = {"kind": "event", "event": event, "pid": 456, "error": "diagnostic"}
+    events = []
+    process = Mock(pid=123)
+    process.wait.return_value = 0
+    proc = worker_exec._FactoryProcess(process, parent, events.append)
+    with parent, child, (tmp_path / "output").open("w+b") as output:
+        for response in ({"kind": "ready"}, packet, {"kind": "terminal", "exit_code": 37}):
+            child.send(json.dumps(response).encode())
+        child.close()
+        assert worker_exec._wait_factory(proc, 10, output.fileno(), 64, output.fileno(), 64) == (37, False, False)
+    assert events == [packet]
+    assert proc.done.is_set()
+    assert proc.error is None
+    assert proc.returncode == 37
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="Linux factory executor uses SOCK_SEQPACKET")
+def test_factory_connection_error_does_not_block_on_full_controller_socket(tmp_path, monkeypatch):
+    import threading
+    import time
+
+    full = threading.Event()
+    received_fds = []
+    sent = []
+    identifier = str(uuid.uuid4())
+
+    def launch(connection, request, fds):
+        assert request["id"] == identifier
+        received_fds.extend(fds)
+        packet = json.dumps({"id": identifier, "status": "event",
+                             "event": "worklink_factory_orphan_adopted", "pid": 456}).encode()
+        try:
+            for _ in range(10000):
+                connection.send(packet, socket.MSG_DONTWAIT)
+                sent.append(packet)
+        except BlockingIOError:
+            full.set()
+            raise
+        raise AssertionError("fixture failed to fill executor send buffer")
+
+    monkeypatch.setattr(worker_exec, "_handle_launch_factory", launch)
+    controller, executor = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+    with controller, executor, (tmp_path / "stdout").open("w+b") as stdout, (tmp_path / "stderr").open("w+b") as stderr:
+        executor.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 4096)
+        controller.sendmsg(
+            [json.dumps({"version": 1, "op": "launch_factory", "id": identifier}).encode()],
+            [(socket.SOL_SOCKET, socket.SCM_RIGHTS, array.array("i", [stdout.fileno(), stderr.fileno()]))],
+        )
+        thread = threading.Thread(target=worker_exec.handle_connection, args=(executor,), daemon=True)
+        thread.start()
+        packets = []
+        try:
+            assert full.wait(2), "launch did not reach downstream event backpressure"
+            # Keep the peer open and undrained until the handler has finished.
+            thread.join(timeout=1)
+            assert not thread.is_alive(), "error reporting blocked on the full controller socket"
+            assert executor.fileno() == -1
+            assert len(received_fds) == 2
+            for fd in received_fds:
+                with pytest.raises(OSError) as closed:
+                    os.fstat(fd)
+                assert closed.value.errno == errno.EBADF
+            assert stat.S_ISREG(os.fstat(stdout.fileno()).st_mode)
+            assert stat.S_ISREG(os.fstat(stderr.fileno()).st_mode)
+        finally:
+            # A mutation that restores blocking error sends must fail the join,
+            # not leave a wedged handler behind. Drain even on assertion failure.
+            controller.settimeout(.1)
+            deadline = time.monotonic() + 3
+            try:
+                while time.monotonic() < deadline:
+                    try:
+                        packet = controller.recv(4096)
+                    except socket.timeout:
+                        continue
+                    if not packet:
+                        break
+                    packets.append(json.loads(packet))
+            finally:
+                controller.close()
+                thread.join(timeout=2)
+            assert not thread.is_alive(), "fixture could not unstick handler by draining peer"
+        assert packets
+        assert len(packets) == len(sent)
+        assert all(packet["status"] == "event" for packet in packets)
+        assert not any(packet.get("status") == "terminal" for packet in packets)
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="Linux factory executor uses SOCK_SEQPACKET")
+@pytest.mark.parametrize(
+    "ready,terminal,supervisor_exit,diagnostic",
+    [
+        (False, {"exit_code": 0}, 0, "invalid cleanup report"),
+        (True, {}, 0, "invalid cleanup report"),
+        (True, {"exit_code": None}, 0, "invalid cleanup report"),
+        (True, {"exit_code": True}, 0, "invalid cleanup report"),
+        (True, {"exit_code": "0"}, 0, "invalid cleanup report"),
+        (True, {"exit_code": 0.0}, 0, "invalid cleanup report"),
+        (True, {"exit_code": 0}, 1, "abnormal supervisor exit"),
+        (True, {"exit_code": 0}, -signal.SIGKILL, "abnormal supervisor exit"),
+        (True, {"exit_code": 0, "error": "children survived"}, 0, "worklink_factory_reap_refused: children survived"),
+    ],
+    ids=["not-ready", "missing-code", "null-code", "bool-code", "string-code", "float-code",
+         "failed-supervisor", "killed-supervisor", "refused"],
+)
+def test_wait_factory_rejects_invalid_terminal(tmp_path, ready, terminal, supervisor_exit, diagnostic):
+    parent, child = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+    process = Mock(pid=123)
+    process.wait.return_value = supervisor_exit
+    events = []
+    proc = worker_exec._FactoryProcess(process, parent, events.append)
+    with parent, child, (tmp_path / "output").open("w+b") as output:
+        if ready:
+            child.send(json.dumps({"kind": "ready"}).encode())
+        child.send(json.dumps({"kind": "terminal", **terminal}).encode())
+        child.close()
+        with pytest.raises(RuntimeError, match=diagnostic):
+            worker_exec._wait_factory(proc, 10, output.fileno(), 64, output.fileno(), 64)
+        assert parent.fileno() == -1
+    assert proc.done.is_set()
+    assert proc.returncode is None
+    assert diagnostic in proc.error
+    assert events == [{"kind": "event", "event": "worklink_factory_supervisor_lost", "error": proc.error}]
+    process.kill.assert_not_called()
 
 
 @pytest.mark.parametrize("git_intake", [False, True], ids=["canary", "git-intake"])
