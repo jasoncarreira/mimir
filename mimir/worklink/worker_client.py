@@ -228,6 +228,10 @@ class WorkerClient:
         return client
 
     def _connect(self, timeout_s: float | None = None) -> socket.socket:
+        # This local executor protocol requires Linux peer authentication; do not
+        # connect (or send a request) when the controller cannot verify root.
+        if not hasattr(socket, "SO_PEERCRED"):
+            raise RuntimeError("worker executor requires Linux SO_PEERCRED peer authentication")
         sock = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
         try:
             if timeout_s is None:

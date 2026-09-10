@@ -339,8 +339,8 @@ def _open_path_checkout(request: dict[str, Any]) -> int:
     )
 
 
-def _open_factory_checkout(request: dict[str, Any]) -> int:
-    """Transfer a never-exposed factory tree, or reopen it without traversing it."""
+def _open_factory_checkout(request: dict[str, Any], *, for_launch: bool = False) -> int:
+    """Validate, then transfer/reopen; launch platform checks precede mutation."""
     issue = _positive_integer(request, "issue")
     attempt = _positive_integer(request, "attempt")
     identities = get_identities()
@@ -395,9 +395,13 @@ def _open_factory_checkout(request: dict[str, Any]) -> int:
             or stat.S_IMODE(checkout.st_mode) != 0o2770
         ):
             raise RuntimeError("factory checkout ownership or mode is invalid")
+        if mode == 0o2700 and request.get("op") == "launch_factory_control":
+            raise RuntimeError("factory control requires an already transferred checkout")
+        # Keep contract guards platform-independent, but refuse unsupported
+        # launches while the validated tree is still private and unmodified.
+        if for_launch and sys.platform != "linux":
+            raise RuntimeError("worklink_factory_reap_refused: PR_SET_CHILD_SUBREAPER requires Linux")
         if mode == 0o2700:
-            if request.get("op") == "launch_factory_control":
-                raise RuntimeError("factory control requires an already transferred checkout")
             # No worker can reach this new tree until the last chmod. Recovery
             # must never repeat a privileged walk of an already exposed tree.
             _normalize_checkout_fd(
@@ -843,10 +847,8 @@ def _handle_launch(connection: socket.socket, request: dict[str, Any], fds: list
     proc: subprocess.Popen[bytes] | _FactoryProcess | None = None
     supervisor_parent = supervisor_child = None
     try:
-        if factory and sys.platform != "linux":
-            raise RuntimeError("worklink_factory_reap_refused: PR_SET_CHILD_SUBREAPER requires Linux")
         if path_addressed:
-            fds.insert(0, _open_factory_checkout(request) if factory else _open_path_checkout(request))
+            fds.insert(0, _open_factory_checkout(request, for_launch=True) if factory else _open_path_checkout(request))
         anchored_fd = os.open(
             ".",
             os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0),
@@ -998,6 +1000,8 @@ def handle_connection(connection: socket.socket) -> None:
 
 
 def serve(socket_path: Path = DEFAULT_EXECUTOR_SOCKET) -> None:
+    if not hasattr(socket, "SO_PEERCRED"):
+        raise RuntimeError("worker executor requires Linux SO_PEERCRED peer authentication")
     socket_path.parent.mkdir(mode=0o710, parents=True, exist_ok=True)
     HOME_ROOT.mkdir(mode=0o710, parents=True, exist_ok=True)
     os.chown(HOME_ROOT, 0, get_identities().worklink_gid)

@@ -87,11 +87,29 @@ def test_factory_control_socket_uses_its_bound(monkeypatch):
 
     sock = Mock()
     sock.getsockopt.return_value = struct.pack("3i", 123, 0, 0)
+    monkeypatch.setattr(worker_client.socket, "SO_PEERCRED", 17, raising=False)
     monkeypatch.setattr(worker_client.socket, "socket", lambda *args: sock)
     client = worker_client.WorkerClient(None)
     client._socket_timeout_s = 7
     assert client._connect() is sock
     sock.settimeout.assert_called_once_with(7)
+
+
+@pytest.mark.parametrize("side", ["client", "executor"])
+def test_executor_requires_peer_credentials_before_side_effects(tmp_path, monkeypatch, side):
+    from mimir.worklink import worker_client
+
+    monkeypatch.delattr(worker_client.socket, "SO_PEERCRED", raising=False)
+    create_socket = Mock(side_effect=AssertionError("unauthenticated socket created"))
+    monkeypatch.setattr(worker_client.socket, "socket", create_socket)
+    path = tmp_path / "not-created" / "executor.sock"
+    with pytest.raises(RuntimeError, match="requires Linux SO_PEERCRED peer authentication"):
+        if side == "client":
+            worker_client.WorkerClient(None, socket_path=path)._connect()
+        else:
+            worker_exec.serve(path)
+    create_socket.assert_not_called()
+    assert not path.parent.exists()
 
 
 @pytest.mark.parametrize("relative,result", [

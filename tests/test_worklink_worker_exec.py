@@ -1403,9 +1403,11 @@ async def test_factory_compute_requires_executor_without_agent_fallback(
     "root_uid", "controller_uid", "outside", "symlink", "issue", "attempt",
     "mode", "owner", "group", "extra", "fd_count", "identity", "home",
 ])
+@pytest.mark.parametrize("platform", ["linux", "darwin"])
 def test_factory_launch_denies_invalid_contract(
-    factory_request, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, denial: str,
+    factory_request, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, denial: str, platform: str,
 ) -> None:
+    monkeypatch.setattr(worker_exec, "sys", SimpleNamespace(platform=platform))
     request = factory_request
     checkout = Path(request["path"])
     expected = "ownership or mode"
@@ -1458,7 +1460,8 @@ def test_factory_launch_denies_invalid_contract(
 
 def test_factory_launch_refuses_non_linux_before_spawn(factory_request, tmp_path, monkeypatch):
     monkeypatch.setattr(worker_exec, "sys", SimpleNamespace(platform="darwin", executable=sys.executable))
-    monkeypatch.setattr(worker_exec.os, "chown", lambda *args, **kwargs: None)
+    transfer = Mock(side_effect=AssertionError("non-Linux launch transferred checkout"))
+    monkeypatch.setattr(worker_exec, "_normalize_checkout_fd", transfer)
     spawn = Mock(side_effect=AssertionError("non-Linux factory reached supervisor spawn"))
     monkeypatch.setattr(worker_exec.subprocess, "Popen", spawn)
     with (tmp_path / "stdout").open("w+b") as stdout, (tmp_path / "stderr").open("w+b") as stderr:
@@ -1470,6 +1473,10 @@ def test_factory_launch_refuses_non_linux_before_spawn(factory_request, tmp_path
             if len(fds) == 3:
                 os.close(fds[0])
     spawn.assert_not_called()
+    transfer.assert_not_called()
+    path = Path(factory_request["path"])
+    assert stat.S_IMODE(path.parent.stat().st_mode) == 0o2700
+    assert path.stat().st_uid == os.getuid()
     assert factory_request["id"] not in worker_exec._jobs
     assert factory_request["id"] not in worker_exec._launching
     assert not (worker_exec.HOME_ROOT / factory_request["id"]).exists()
@@ -1634,12 +1641,16 @@ def test_factory_control_launch_uses_worker_drop_without_runtime_refresh(factory
     factory_request["argv"] = ["uv", "run", "status"]
     opened = []
 
-    def checkout(request):
+    def checkout(request, *, for_launch=False):
+        assert for_launch is True
         fd = os.open(request["path"], os.O_RDONLY | os.O_DIRECTORY)
         opened.append(fd)
         return fd
 
     monkeypatch.setattr(worker_exec, "_open_factory_checkout", checkout)
+    # No supervisor is started in this contract test; do not require the host's
+    # Linux seqpacket transport merely to inspect the selected uid-drop hook.
+    monkeypatch.setattr(worker_exec.socket, "socketpair", lambda *args: (Mock(), Mock()))
     monkeypatch.setattr(os, "chown", lambda *args, **kwargs: None)
     drop = Mock()
     monkeypatch.setattr(worker_exec, "_drop_worker", drop)
