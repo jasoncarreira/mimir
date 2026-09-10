@@ -707,14 +707,15 @@ def test_attempt_is_active_true_for_nested_nonterminal_run(
     assert autonomy._attempt_is_active(child, [record]) is True
 
 
+@pytest.mark.parametrize("inner", [False, True])
 def test_prune_keeps_old_attempt_with_live_nested_factory(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, inner: bool,
 ) -> None:
     _write_worklink_yaml(tmp_path)
     repo = tmp_path / "repo"
     repo.mkdir()
     child = tmp_path / ".worklink" / repo.name / "840-1"
-    sandbox = child / ".factory-sandboxes" / "chainlink-840"
+    sandbox = (child / "checkout" if inner else child) / ".factory-sandboxes" / "chainlink-840"
     sandbox.mkdir(parents=True)
     os.utime(child, (0, 0))
     record = SimpleNamespace(
@@ -728,14 +729,15 @@ def test_prune_keeps_old_attempt_with_live_nested_factory(
     assert child.exists()
 
 
+@pytest.mark.parametrize("inner", [False, True])
 def test_prune_keeps_old_attempt_with_failed_unresumed_factory(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, inner: bool,
 ) -> None:
     _write_worklink_yaml(tmp_path, reaper_ttl_s=3600)
     repo = tmp_path / "repo"
     repo.mkdir()
     child = tmp_path / ".worklink" / repo.name / "841-1"
-    sandbox = child / ".factory-sandboxes" / "chainlink-841"
+    sandbox = (child / "checkout" if inner else child) / ".factory-sandboxes" / "chainlink-841"
     manifest = sandbox / ".factory" / "chainlink-841" / "run.json"
     manifest.parent.mkdir(parents=True)
     manifest.write_text("{}", encoding="utf-8")

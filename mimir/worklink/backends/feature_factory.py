@@ -681,13 +681,19 @@ class FeatureFactoryBackend:
     ) -> subprocess.CompletedProcess[Any]:
         entrypoint = resolve_factory_entrypoint(launcher)
         try:
-            result = _invoke_bounded_or_injected(
-                self.runner,
-                ["node", str(entrypoint), *args],
-                env=_control_environment(),
-                timeout=30,
-                output_limit=_MAX_STATUS_BYTES,
-            )
+            from ..worker_client import factory_checkout_for_path, run_factory_control
+
+            command = ["node", str(entrypoint), *args]
+            if factory_checkout_for_path(sandbox) is not None:
+                result = run_factory_control(
+                    sandbox, command, env=_control_environment(), timeout=30,
+                    output_limit=_MAX_STATUS_BYTES,
+                )
+            else:
+                result = _invoke_bounded_or_injected(
+                    self.runner, command, env=_control_environment(),
+                    timeout=30, output_limit=_MAX_STATUS_BYTES,
+                )
         except subprocess.TimeoutExpired as exc:
             raise FactoryContractError("factory control command timed out") from exc
         _strict_diagnostic(result)

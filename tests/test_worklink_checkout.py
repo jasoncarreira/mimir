@@ -1522,3 +1522,94 @@ def test_non_linux_issued_checkout_rejects_paths_outside_root(
 
     with pytest.raises(ValueError, match="beneath its trusted root"):
         checkout_module._open_issued_checkout(root, relative_path)
+
+
+@pytest.mark.parametrize("coding", [False, True])
+def test_factory_checkout_is_private_inner_clone_regardless_of_coding(tmp_path, monkeypatch, coding):
+    repo = _repo_with_main(tmp_path)
+    monkeypatch.setattr(checkout_module, "coding_enabled", lambda: coding)
+    monkeypatch.setattr(checkout_module, "get_identities", lambda: SimpleNamespace(
+        mimir_uid=os.getuid(), worklink_gid=os.getgid(),
+    ))
+    calls = []
+
+    def runner(args):
+        calls.append(list(args))
+        return subprocess.run(args, capture_output=True, text=True)
+
+    lease = create_isolated_checkout(
+        repo, issue_id=1618, attempt=1, runner=runner, factory_worker=True,
+    )
+    assert lease.path == tmp_path / ".worklink" / repo.name / "1618-1" / "checkout"
+    assert lease.path.parent.stat().st_uid == os.getuid()
+    assert stat.S_IMODE(lease.path.parent.stat().st_mode) == 0o2700
+    assert lease.path.stat().st_uid == os.getuid()
+    assert stat.S_IMODE(lease.path.stat().st_mode) == 0o2770
+    assert "--no-hardlinks" in next(call for call in calls if call[:3] == ["git", "clone", "--local"])
+    for source in (repo / ".git/objects").rglob("*"):
+        if source.is_file():
+            target = lease.path / source.relative_to(repo)
+            assert source.stat().st_ino != target.stat().st_ino
+    assert cleanup_checkout(lease, outcome="failed") is False
+    assert lease.path.exists()
+    assert cleanup_checkout(lease, outcome="completed") is True
+    assert not lease.path.parent.exists()
+
+
+def test_prune_does_not_report_worker_permission_failure(tmp_path, monkeypatch):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    attempt = tmp_path / ".worklink" / repo.name / "1618-1"
+    (attempt / "checkout").mkdir(parents=True)
+    os.utime(attempt, (0, 0))
+    calls = []
+
+    def denied(path, **kwargs):
+        assert path == attempt
+        assert not kwargs.get("ignore_errors", False)
+        raise PermissionError("worker revoked group access")
+
+    monkeypatch.setattr(checkout_module.shutil, "rmtree", denied)
+    assert prune_attempt_checkouts(
+        repo, older_than=timedelta(seconds=1), now=datetime.now(UTC),
+        runner=lambda args: calls.append(args),
+    ) == []
+    assert attempt.exists()
+    assert calls == []
+
+
+def test_prune_rejects_symlink_before_policy_callbacks(tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    root = tmp_path / ".worklink" / repo.name
+    root.mkdir(parents=True)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "retained").write_text("keep")
+    os.utime(outside, (0, 0))
+    (root / "1618-1").symlink_to(outside, target_is_directory=True)
+    callbacks = []
+    assert prune_attempt_checkouts(
+        repo, older_than=timedelta(seconds=1), now=datetime.now(UTC),
+        is_active=lambda path: callbacks.append(path) or False,
+        can_prune=lambda path: callbacks.append(path) or True,
+        runner=lambda args: completed(args),
+    ) == []
+    assert callbacks == []
+    assert (outside / "retained").read_text() == "keep"
+
+
+@pytest.mark.parametrize("mismatch", ["attempt", "checkout"])
+def test_factory_cleanup_boundary_requires_exact_lease_shape(tmp_path, mismatch):
+    parent = tmp_path / ("other-attempt" if mismatch == "attempt" else "1618-1")
+    path = parent / ("other-checkout" if mismatch == "checkout" else "checkout")
+    path.mkdir(parents=True)
+    canary = parent / "must-retain"
+    canary.write_text("keep")
+    lease = CheckoutLease(
+        issue_id=1618, attempt=1, repo=tmp_path, path=path,
+        branch="main", base_ref="main", isolated_checkout=True,
+    )
+    assert cleanup_checkout(lease, outcome="completed") is True
+    assert not path.exists()
+    assert canary.read_text() == "keep"

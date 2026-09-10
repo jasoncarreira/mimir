@@ -1,13 +1,253 @@
 from __future__ import annotations
 
 import json
+import os
+import stat
+import struct
+import subprocess
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 
 from mimir.contained_execution import CollectedExecutionResult
 from mimir.worklink import compute, worker_exec
+
+
+@pytest.fixture
+def factory_control_identity(monkeypatch):
+    from mimir.worklink import worker_client
+
+    # These tests fake the executor, so they must not require host accounts.
+    identity = SimpleNamespace(worklink_uid=42424)
+    monkeypatch.setattr(worker_client.identities, "get_identities", lambda: identity)
+    return identity
+
+
+@pytest.mark.asyncio
+async def test_retained_factory_control_uses_worker_without_runtime_refresh(
+    tmp_path, monkeypatch, factory_control_identity,
+):
+    from mimir.worklink import worker_client
+
+    monkeypatch.setattr(worker_client, "WORKLINK_CHECKOUT_ROOT", tmp_path)
+    checkout = tmp_path / "repo/41-2/checkout"
+    calls = []
+
+    async def launch(client, **kwargs):
+        assert client._socket_timeout_s == 30 + worker_client.CANCEL_SOCKET_TIMEOUT_S
+        assert client.run_uid == factory_control_identity.worklink_uid
+        calls.append((client._launch_op, client.path_checkout, kwargs))
+        os.write(kwargs["stdout_sink"].fd, b"retained-status")
+
+        async def wait():
+            return 0
+
+        return SimpleNamespace(wait=wait, timed_out=False, output_overflow=False)
+
+    monkeypatch.setattr(worker_client.WorkerClient, "launch", launch)
+    result = worker_client.run_factory_control(
+        checkout / ".factory-sandboxes/run", ["node", "factory.js", "status"],
+        env={"HOME": "/controller", "PATH": "/usr/bin:/bin"},
+    )
+    assert result.stdout == b"retained-status"
+    assert result.returncode == 0
+    operation, path, kwargs = calls[0]
+    assert operation == "launch_factory_control"
+    assert path == checkout
+    assert kwargs["local_checkout"] == checkout
+    assert kwargs["env"] == {"PATH": "/usr/bin:/bin"}
+    assert "projections" not in kwargs
+
+
+@pytest.mark.parametrize("failure", ["timed_out", "output_overflow"])
+def test_factory_control_rejects_incomplete_results(
+    tmp_path, monkeypatch, failure, factory_control_identity,
+):
+    from mimir.worklink import worker_client
+
+    monkeypatch.setattr(worker_client, "WORKLINK_CHECKOUT_ROOT", tmp_path)
+
+    async def launch(client, **kwargs):
+        assert client.run_uid == factory_control_identity.worklink_uid
+        async def wait():
+            return 0
+        return SimpleNamespace(wait=wait, timed_out=failure == "timed_out", output_overflow=failure == "output_overflow")
+
+    monkeypatch.setattr(worker_client.WorkerClient, "launch", launch)
+    expected = subprocess.TimeoutExpired if failure == "timed_out" else RuntimeError
+    message = "timed out" if failure == "timed_out" else "factory control output exceeds bounds"
+    with pytest.raises(expected, match=message):
+        worker_client.run_factory_control(tmp_path / "repo/41-2/checkout", ["node", "status"], env={})
+
+
+def test_factory_control_socket_uses_its_bound(monkeypatch):
+    from mimir.worklink import worker_client
+
+    sock = Mock()
+    sock.getsockopt.return_value = struct.pack("3i", 123, 0, 0)
+    monkeypatch.setattr(worker_client.socket, "SO_PEERCRED", 17, raising=False)
+    monkeypatch.setattr(worker_client.socket, "socket", lambda *args: sock)
+    client = worker_client.WorkerClient(None)
+    client._socket_timeout_s = 7
+    assert client._connect() is sock
+    sock.settimeout.assert_called_once_with(7)
+
+
+@pytest.mark.parametrize("side", ["client", "executor"])
+def test_executor_requires_peer_credentials_before_side_effects(tmp_path, monkeypatch, side):
+    from mimir.worklink import worker_client
+
+    monkeypatch.delattr(worker_client.socket, "SO_PEERCRED", raising=False)
+    create_socket = Mock(side_effect=AssertionError("unauthenticated socket created"))
+    monkeypatch.setattr(worker_client.socket, "socket", create_socket)
+    path = tmp_path / "not-created" / "executor.sock"
+    with pytest.raises(RuntimeError, match="requires Linux SO_PEERCRED peer authentication"):
+        if side == "client":
+            worker_client.WorkerClient(None, socket_path=path)._connect()
+        else:
+            worker_exec.serve(path)
+    create_socket.assert_not_called()
+    assert not path.parent.exists()
+
+
+@pytest.mark.parametrize("relative,result", [
+    ("repo/41-2/checkout/nested", "valid"),
+    ("repo/41-2", "none"),
+    ("repo/41-2/project", "none"),
+    ("../41-2/checkout", "error"),
+    ("repo/0-2/checkout", "error"),
+    ("repo/41-0/checkout", "error"),
+    ("repo/41-2/checkout/../elsewhere", "error"),
+])
+def test_factory_control_path_classification(tmp_path, monkeypatch, relative, result):
+    from mimir.worklink import worker_client
+
+    monkeypatch.setattr(worker_client, "WORKLINK_CHECKOUT_ROOT", tmp_path)
+    path = tmp_path / relative
+    if result == "error":
+        with pytest.raises(ValueError):
+            worker_client.factory_checkout_for_path(path)
+    elif result == "none":
+        assert worker_client.factory_checkout_for_path(path) is None
+    else:
+        assert worker_client.factory_checkout_for_path(path) == (tmp_path / "repo/41-2/checkout", 41, 2)
+    assert worker_client.factory_checkout_for_path(tmp_path.parent / "outside/repo/41-2/checkout") is None
+
+
+@pytest.mark.parametrize("guard", ["owner", "directory", "nofollow"])
+def test_factory_controller_boundary_guard(tmp_path, monkeypatch, guard):
+    from mimir.worklink import orchestrator, worker_client
+
+    monkeypatch.setattr(worker_client, "WORKLINK_CHECKOUT_ROOT", tmp_path)
+    monkeypatch.setattr(orchestrator, "get_identities", lambda: SimpleNamespace(mimir_uid=os.getuid()))
+    path = tmp_path / "repo/41-2/checkout"
+    path.mkdir(parents=True)
+    path.parent.chmod(0o2700)
+    real_stat = Path.stat
+    if guard == "nofollow":
+        moved = path.parent.with_name("saved")
+        path.parent.rename(moved)
+        path.parent.symlink_to(moved, target_is_directory=True)
+    else:
+        def observed(target, **kwargs):
+            value = real_stat(target, **kwargs)
+            if target == path.parent:
+                return SimpleNamespace(
+                    st_uid=os.getuid() + (guard == "owner"),
+                    st_mode=(stat.S_IFREG if guard == "directory" else stat.S_IFDIR) | 0o2700,
+                )
+            return value
+        monkeypatch.setattr(Path, "stat", observed)
+    controller = Mock(return_value=subprocess.CompletedProcess([], 0, "", ""))
+    worker = Mock(return_value=subprocess.CompletedProcess([], 0, b"", b""))
+    monkeypatch.setattr(worker_client, "run_factory_control", worker)
+    with pytest.raises(orchestrator.WorklinkError, match="boundary is not controller-owned"):
+        orchestrator._factory_git_runner(controller)(["git", "-C", str(path), "status"])
+    controller.assert_not_called()
+    worker.assert_not_called()
+
+
+def test_factory_git_recovery_uses_owner_not_safe_directory(tmp_path, monkeypatch):
+    from mimir.worklink import orchestrator, worker_client
+
+    monkeypatch.setattr(worker_client, "WORKLINK_CHECKOUT_ROOT", tmp_path)
+    monkeypatch.setattr(orchestrator, "get_identities", lambda: SimpleNamespace(mimir_uid=os.getuid()))
+    checkout = tmp_path / "repo/41-2/checkout"
+    checkout.mkdir(parents=True)
+    calls = []
+
+    def controller(args):
+        calls.append(("controller", args))
+        return subprocess.CompletedProcess(args, 0, "initial", "")
+
+    def worker(root, args, **kwargs):
+        assert root == checkout
+        assert "GIT_CONFIG_COUNT" not in kwargs["env"]
+        assert not any("safe.directory" in arg for arg in args)
+        calls.append(("worker", args))
+        return subprocess.CompletedProcess(args, 0, b"retained", b"")
+
+    monkeypatch.setattr(worker_client, "run_factory_control", worker)
+    run = orchestrator._factory_git_runner(controller)
+    args = ["git", "-C", str(checkout / ".factory-sandboxes/run"), "rev-parse", "HEAD"]
+    checkout.parent.chmod(0o2700)
+    assert run(args).stdout == "initial"
+    checkout.parent.chmod(0o2750)
+    assert run(args).stdout == "retained"
+    assert [who for who, _ in calls] == ["controller", "worker"]
+
+
+def test_legacy_factory_recovery_refuses_before_git_or_lock_mutation(tmp_path, monkeypatch):
+    from mimir.worklink import orchestrator, worker_client
+
+    monkeypatch.setattr(worker_client, "WORKLINK_CHECKOUT_ROOT", tmp_path)
+    launcher = tmp_path / "installed/factory.js"
+    retained = SimpleNamespace(
+        issue_id=41, run_id=orchestrator.factory_record_run_ids(41)[0], repository="owner/repo",
+        base_ref="main", launcher=str(launcher), controller_phase="failed", session="retained",
+        sandbox=str(tmp_path / "repo/41-2/.factory-sandboxes/run"), branch="feature/run",
+    )
+    Path(retained.sandbox).mkdir(parents=True)
+    verify = Mock(return_value="head")
+    monkeypatch.setattr(orchestrator, "_verify_factory_checkout", verify)
+
+    def runner(args):
+        assert args == ["git", "-C", str(tmp_path / "base"), "config", "--get", "remote.origin.url"]
+        return subprocess.CompletedProcess(args, 0, "https://github.com/owner/repo.git", "")
+
+    with pytest.raises(orchestrator.WorklinkError, match="legacy factory checkout"):
+        orchestrator._verify_factory_recovery_target(
+            runner=SimpleNamespace(repo=tmp_path / "base"), issue=SimpleNamespace(issue_id=41),
+            retained=retained, launcher=launcher, repo_slug="owner/repo", base="main",
+            command_runner=runner,
+        )
+    verify.assert_not_called()
+
+
+@pytest.mark.parametrize("command", ["status", "resume", "heartbeat", "lock"])
+def test_factory_backend_controls_use_retained_owner(tmp_path, monkeypatch, command):
+    from mimir.worklink import worker_client
+    from mimir.worklink.backends import feature_factory
+
+    monkeypatch.setattr(worker_client, "WORKLINK_CHECKOUT_ROOT", tmp_path)
+    entrypoint = tmp_path / "installed/bin/factory.js"
+    monkeypatch.setattr(feature_factory, "resolve_factory_entrypoint", lambda path: entrypoint)
+    sandbox = tmp_path / "repo/41-2/checkout/.factory-sandboxes/run"
+    calls = []
+
+    def control(path, argv, **kwargs):
+        calls.append((path, argv))
+        return subprocess.CompletedProcess(argv, 0, b"{}", b"")
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("controller ran a retained-tree control operation")
+
+    monkeypatch.setattr(worker_client, "run_factory_control", control)
+    backend = feature_factory.FeatureFactoryBackend(runner=forbidden)
+    backend._control(entrypoint, [command, "run", "--repo", str(sandbox)], sandbox=sandbox)
+    assert calls == [(sandbox, ["node", str(entrypoint), command, "run", "--repo", str(sandbox)])]
 
 
 @pytest.mark.asyncio
@@ -48,9 +288,9 @@ async def test_factory_projects_native_config_only_for_opencode(
     observed = []
 
     async def execute(command, capability, env, projections, **kwargs):
-        assert env["GIT_CONFIG_COUNT"] == "1"
-        assert env["GIT_CONFIG_KEY_0"] == "safe.directory"
-        assert env["GIT_CONFIG_VALUE_0"] == str(tmp_path / "41-2")
+        assert "GIT_CONFIG_COUNT" not in env
+        assert "GIT_CONFIG_KEY_0" not in env
+        assert "GIT_CONFIG_VALUE_0" not in env
         observed.append((dict(env), {p.path: json.loads(p.document) for p in projections}))
         capability._contained_started(SimpleNamespace(pid=None))
         return CollectedExecutionResult(0, b"", b"", False, False, 0, 0)
