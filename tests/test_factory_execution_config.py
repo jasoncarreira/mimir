@@ -15,8 +15,20 @@ from mimir.contained_execution import CollectedExecutionResult
 from mimir.worklink import compute, worker_exec
 
 
+@pytest.fixture
+def factory_control_identity(monkeypatch):
+    from mimir.worklink import worker_client
+
+    # These tests fake the executor, so they must not require host accounts.
+    identity = SimpleNamespace(worklink_uid=42424)
+    monkeypatch.setattr(worker_client.identities, "get_identities", lambda: identity)
+    return identity
+
+
 @pytest.mark.asyncio
-async def test_retained_factory_control_uses_worker_without_runtime_refresh(tmp_path, monkeypatch):
+async def test_retained_factory_control_uses_worker_without_runtime_refresh(
+    tmp_path, monkeypatch, factory_control_identity,
+):
     from mimir.worklink import worker_client
 
     monkeypatch.setattr(worker_client, "WORKLINK_CHECKOUT_ROOT", tmp_path)
@@ -25,6 +37,7 @@ async def test_retained_factory_control_uses_worker_without_runtime_refresh(tmp_
 
     async def launch(client, **kwargs):
         assert client._socket_timeout_s == 30 + worker_client.CANCEL_SOCKET_TIMEOUT_S
+        assert client.run_uid == factory_control_identity.worklink_uid
         calls.append((client._launch_op, client.path_checkout, kwargs))
         os.write(kwargs["stdout_sink"].fd, b"retained-status")
 
@@ -49,18 +62,23 @@ async def test_retained_factory_control_uses_worker_without_runtime_refresh(tmp_
 
 
 @pytest.mark.parametrize("failure", ["timed_out", "output_overflow"])
-def test_factory_control_rejects_incomplete_results(tmp_path, monkeypatch, failure):
+def test_factory_control_rejects_incomplete_results(
+    tmp_path, monkeypatch, failure, factory_control_identity,
+):
     from mimir.worklink import worker_client
 
     monkeypatch.setattr(worker_client, "WORKLINK_CHECKOUT_ROOT", tmp_path)
 
     async def launch(client, **kwargs):
+        assert client.run_uid == factory_control_identity.worklink_uid
         async def wait():
             return 0
         return SimpleNamespace(wait=wait, timed_out=failure == "timed_out", output_overflow=failure == "output_overflow")
 
     monkeypatch.setattr(worker_client.WorkerClient, "launch", launch)
-    with pytest.raises(subprocess.TimeoutExpired if failure == "timed_out" else RuntimeError):
+    expected = subprocess.TimeoutExpired if failure == "timed_out" else RuntimeError
+    message = "timed out" if failure == "timed_out" else "factory control output exceeds bounds"
+    with pytest.raises(expected, match=message):
         worker_client.run_factory_control(tmp_path / "repo/41-2/checkout", ["node", "status"], env={})
 
 
