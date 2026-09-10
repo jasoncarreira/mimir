@@ -602,6 +602,12 @@ class LocalSubprocessComputeBackend:
                     environment["XDG_DATA_HOME"] = str(
                         spec.local_checkout / ".factory-runtime" / "data"
                     )
+                    # The contained factory does not own its controller-owned checkout.
+                    environment.update({
+                        "GIT_CONFIG_COUNT": "1",
+                        "GIT_CONFIG_KEY_0": "safe.directory",
+                        "GIT_CONFIG_VALUE_0": str(spec.local_checkout),
+                    })
                     if Path(command[0]).name == "opencode":
                         from ..opencode_config import _read_object, opencode_worker_documents
                         from .backends.opencode import resolve_worklink_opencode_invocation
