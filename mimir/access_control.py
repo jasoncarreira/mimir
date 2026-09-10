@@ -6439,7 +6439,15 @@ class SinkGate:
             github_repo_scope_refusal = None
             scope = None
             if (
-                service.authority_profile == "github"
+                (
+                    service.authority_profile == "github"
+                    # Own-PR heartbeat maintenance repairs conflicts through the
+                    # file tools, so it needs the same active-lease write gate as
+                    # poller remediation. The in-lease RepoPRAction.WRITE grant
+                    # check and the out-of-lease denial below are unchanged, so
+                    # this widens WHO reaches the gate, never what it permits.
+                    or heartbeat_git_authority_enabled(service)
+                )
                 and sink_category is SinkCategory.FILE
             ):
                 review_state = (
