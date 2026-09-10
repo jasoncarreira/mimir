@@ -1890,6 +1890,7 @@ class WorklinkRunner:
                 base_fetch=config.defaults.base_fetch,
                 event_logger=_log_event,
                 runner=_list_runner(runner),
+                worker_eligible=isinstance(compute, LocalSubprocessComputeBackend),
             )
             git_name, git_email = _read_checkout_git_identity(lease.path, runner)
             publishing_identity, publishing_identity_source = (
@@ -1958,6 +1959,10 @@ class WorklinkRunner:
                 transcript=None,
             )
             _create_factory_sandbox(factory_record, lease)
+            if isinstance(compute, LocalSubprocessComputeBackend):
+                sandbox_root = lease.path / ".factory-sandboxes"
+                os.chown(sandbox_root, -1, get_identities().worklink_gid)
+                os.chmod(sandbox_root, 0o2770)
             handle = await compute.launch(spec)
             factory_record = replace(factory_record, handle=handle)
             try:
@@ -2193,6 +2198,11 @@ class WorklinkRunner:
             session=session,
             run_id=retained.run_id,
         )
+        if isinstance(compute, LocalSubprocessComputeBackend):
+            # Authorization stays at the original attempt root; --dir still
+            # selects the retained sandbox validated above. Session data is
+            # attempt-scoped as on the initial launch.
+            spec = replace(spec, local_checkout=sandbox.parent.parent)
         handle = await compute.launch(spec)
         relaunched = replace(
             retained.observed(resumed, datetime.now(UTC).isoformat()),

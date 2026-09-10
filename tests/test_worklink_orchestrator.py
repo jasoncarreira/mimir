@@ -3819,6 +3819,7 @@ def _run_factory_preflight_case(
     autonomous: bool = False,
     outcome: str | None = None,
     release_signals: list[str] | None = None,
+    checkout_calls: list[dict[str, Any]] | None = None,
 ) -> tuple[object, list[WorkSpec], list[str], list[list[str]]]:
     import mimir.worklink.orchestrator as orchestrator
 
@@ -3916,7 +3917,13 @@ def _run_factory_preflight_case(
         "release_issue",
         lambda *args, **kwargs: outcome is not None,
     )
-    monkeypatch.setattr(orchestrator, "_create_backend_checkout", lambda *args, **kwargs: lease)
+
+    def create_checkout(*args: object, **kwargs: Any) -> CheckoutLease:
+        if checkout_calls is not None:
+            checkout_calls.append(kwargs)
+        return lease
+
+    monkeypatch.setattr(orchestrator, "_create_backend_checkout", create_checkout)
     monkeypatch.setattr(orchestrator, "GitHubForgeClient", Client)
     monkeypatch.setattr(orchestrator.LocalSubprocessComputeBackend, "launch", launch)
     if outcome is not None:
@@ -3976,6 +3983,37 @@ def _run_factory_preflight_case(
         )
     )
     return result, launched, verified_tokens, commands
+
+
+def test_factory_initial_local_launch_provisions_worker_sandbox_permissions(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import stat
+    import mimir.worklink.orchestrator as orchestrator
+
+    checkout_calls: list[dict[str, Any]] = []
+    ownership: list[tuple[Path, int, int]] = []
+    monkeypatch.setattr(
+        orchestrator, "get_identities", lambda: SimpleNamespace(worklink_gid=12345)
+    )
+    monkeypatch.setattr(
+        orchestrator.os, "chown", lambda path, uid, gid: ownership.append((path, uid, gid))
+    )
+    result, launched, _, _ = _run_factory_preflight_case(
+        tmp_path,
+        monkeypatch,
+        credentials={"GITHUB_TOKEN": "github-token"},
+        outcome="needs-human",
+        checkout_calls=checkout_calls,
+    )
+
+    assert result.status == "needs-human"
+    assert len(launched) == 1
+    assert len(checkout_calls) == 1
+    assert checkout_calls[0]["worker_eligible"] is True
+    sandbox_root = tmp_path / "factory-checkout" / ".factory-sandboxes"
+    assert ownership == [(sandbox_root, -1, 12345)]
+    assert stat.S_IMODE(sandbox_root.stat().st_mode) == 0o2770
 
 
 def test_post_merge_factory_failure_pushes_branch_before_record_becomes_failed(
@@ -6140,16 +6178,25 @@ def test_factory_needs_human_transitions_epic_to_parked_tracker_state(
     ("lock", "dead_lock", "action"),
     [("absent", False, "claim"), ("stale", True, "steal"), ("fresh", False, None)],
 )
+@pytest.mark.parametrize("local_compute", [False, True], ids=["fake", "local"])
 def test_factory_recovery_uses_run_id_first_lock_resume_and_authoritative_status(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     lock: str,
     dead_lock: bool,
     action: str | None,
+    local_compute: bool,
 ) -> None:
+    from mimir.worklink.compute import LocalSubprocessComputeBackend
+
     _configure_opencode_oauth(tmp_path, monkeypatch)
-    sandbox = tmp_path / "sandbox"
-    sandbox.mkdir()
+    attempt = 3 if local_compute else 1
+    original_checkout = tmp_path / ".worklink" / "repo" / f"700-{attempt}"
+    sandbox = (
+        original_checkout / ".factory-sandboxes" / "700"
+        if local_compute else tmp_path / "sandbox"
+    )
+    sandbox.mkdir(parents=True)
     historical = {"reason": "opaque and nonauthoritative"}
 
     def status(value: str, lock_value: str, next_value: str | None = None):
@@ -6241,6 +6288,11 @@ def test_factory_recovery_uses_run_id_first_lock_resume_and_authoritative_status
         async def cleanup(self, handle: LaunchHandle) -> None:
             self.cleaned = True
 
+    class LocalCompute(Compute, LocalSubprocessComputeBackend):
+        async def launch(self, spec: WorkSpec) -> LaunchHandle:
+            self.spec = spec
+            return await super().launch(spec)
+
     def runner(args: Sequence[str] | str, **kwargs: Any) -> subprocess.CompletedProcess[str]:
         if isinstance(args, list) and args[-2:] == ["rev-parse", "--show-toplevel"]:
             return cp(args, stdout=f"{sandbox}\n")
@@ -6259,7 +6311,7 @@ def test_factory_recovery_uses_run_id_first_lock_resume_and_authoritative_status
     retained = FactoryRunRecord(
         run_id="700",
         issue_id=700,
-        attempt=1,
+        attempt=attempt,
         repository="owner/repo",
         base_ref="main",
         branch="epic/700",
@@ -6271,7 +6323,10 @@ def test_factory_recovery_uses_run_id_first_lock_resume_and_authoritative_status
         observed_at="2026-08-18T12:00:00+00:00",
         controller_phase="parked",
     )
-    claim = ClaimRecord(700, 1, "agent", datetime.now(UTC))
+    claim = ClaimRecord(
+        700, attempt, "agent", datetime.now(UTC),
+        budget_attempt=4 if local_compute else None,
+    )
     class Claims:
         agent_id = "agent"
 
@@ -6281,7 +6336,7 @@ def test_factory_recovery_uses_run_id_first_lock_resume_and_authoritative_status
         def transition_issue(self, *args: object, **kwargs: object) -> None:
             return None
 
-    compute = Compute()
+    compute = LocalCompute() if local_compute else Compute()
     result = asyncio.run(
         WorklinkRunner(home=tmp_path, repo=tmp_path / "repo", agent_id="agent")._recover_factory_070(
             issue=IssueContext(700, "epic", "build", {"worklink:epic"}),
@@ -6312,6 +6367,12 @@ def test_factory_recovery_uses_run_id_first_lock_resume_and_authoritative_status
     assert calls[-1] == ("heartbeat", "700", "session-1", str(sandbox))
     assert compute.cancelled and compute.cleaned
     assert compute.launches == 1
+    if local_compute:
+        assert compute.spec.local_checkout == original_checkout
+        assert compute.spec.issue_id == retained.issue_id == 700
+        assert compute.spec.attempt == retained.attempt == 3
+        argv = tuple(compute.spec.local_argv or ())
+        assert argv[argv.index("--dir") + 1] == str(sandbox)
 
 
 @pytest.mark.parametrize(
