@@ -52,9 +52,9 @@ def test_fixture_cleanup_preserves_failure_and_adds_captured_output(
     ready = tmp_path / "ready"
     source = (
         "import pathlib,sys,time; "
-        f"pathlib.Path({str(ready)!r}).write_text(''); "
         "sys.stdout.write('server-out\\n'); sys.stdout.flush(); "
         "sys.stderr.write('server-error\\n'); sys.stderr.flush(); "
+        f"pathlib.Path({str(ready)!r}).write_text(''); "
         "time.sleep(60)"
     )
     original = ValueError("child failed")
@@ -66,10 +66,10 @@ def test_fixture_cleanup_preserves_failure_and_adds_captured_output(
             env=dict(assert_installed_acp.os.environ),
             stop_on_success=False,
         ):
-            for _ in range(100):
-                if ready.exists():
-                    break
+            deadline = time.monotonic() + 10
+            while not ready.exists() and time.monotonic() < deadline:
                 time.sleep(0.01)
+            assert ready.exists(), "fixture server did not flush its output"
             raise original
 
     assert caught.value is original

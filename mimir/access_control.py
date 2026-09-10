@@ -6650,17 +6650,39 @@ class SinkGate:
         client_authorized_host_execution: bool = False,
         repo_pr_action_scope: Any = None,
     ) -> frozenset[str]:
-        """Return concrete destinations compatible with every current label.
+        """Return configured job destinations or label-compatible destinations.
 
         Ordinary admin authority deliberately does not widen this set. Admins
         must use the distinct audited declassification action before egress.
         """
-        from .models import InformationFlowLabels
+        from .models import InformationFlowLabels, TurnInteractivity
 
         if auth_context is None:
             return frozenset()
 
         service = get_trusted_service_from_auth_context(auth_context)
+        # A job's delivery grant is operator configuration, not an audience
+        # inference from its context. Selection owns source confidentiality;
+        # even active untrusted work material may be summarized to this set.
+        if (
+            service is not None
+            and service.trigger in {"poller", "scheduled_tick"}
+            and getattr(auth_context, "interactivity", None)
+            is TurnInteractivity.NON_INTERACTIVE
+            and tool_name == "send_message"
+            and category is SinkCategory.SAME_CHANNEL
+        ):
+            delivery = resolve_deliver_channel(
+                service.configured_delivery_channel,
+                os.environ.get("MIMIR_OPERATOR_ALERT_CHANNEL", ""),
+            )
+            if delivery:
+                return frozenset(channel for channel in (
+                    ChannelResourceAdapter._resolve_channel(
+                        getattr(auth_context, "channel_id", None),
+                    ),
+                    ChannelResourceAdapter._resolve_channel(delivery),
+                ) if channel)
         trusted_operator_turn = cls._is_trusted_operator_turn(
             ifc_labels, auth_context,
         )
