@@ -1547,6 +1547,33 @@ def test_pr_review_others_does_not_widen_scheduled_ticks(
         ) is (stage == "stored" and service.authority_profile == "heartbeat")
 
 
+@pytest.mark.parametrize("enabled", [False, True])
+def test_heartbeat_git_flag_preserves_principal_and_shell_policy(tmp_path, monkeypatch, enabled):
+    monkeypatch.delenv("MIMIR_CODING_ENABLED", raising=False)
+    baseline = access_control.builtin_trigger_service_principal("heartbeat", tmp_path)
+    monkeypatch.setenv("MIMIR_CODING_ENABLED", str(enabled).lower())
+    principal = access_control.builtin_trigger_service_principal("heartbeat", tmp_path)
+    assert principal == baseline
+    auth = _trusted_service_auth(principal, channel_id="scheduler:heartbeat")
+    assert access_control.can_resolve_forge_review_scope(auth, stage="stored") is (not enabled)
+    assert access_control.can_resolve_forge_review_scope(auth, stage="fetch") is enabled
+    assert access_control.can_resolve_forge_review_scope(
+        auth, stage="accept", pr_author="mimir", self_login="mimir",
+    ) is enabled
+    for author, login in (("other", "mimir"), ("", ""), ("mimir", None)):
+        assert not access_control.can_resolve_forge_review_scope(
+            auth, stage="accept", pr_author=author, self_login=login,
+        )
+    for name in access_control._REPO_TOOL_ACTIONS:
+        assert access_control.service_can_invoke_operation(principal, name), name
+    for command in ("git push", "git rebase main", "git merge main", "git revert HEAD", "sh -c 'git push'"):
+        decision = ToolRegistry().authorize_tool(
+            "shell_exec", auth, enforce=True, target_channel=command,
+            arguments={"command": command, "cwd": str(tmp_path)},
+        )
+        assert not decision.allowed, command
+
+
 @pytest.mark.parametrize("stage", ["stored", "fetch", "accept"])
 def test_pr_review_others_leaves_operator_scope_resolution_unchanged(stage: str) -> None:
     auth = _read_auth(admin=True)

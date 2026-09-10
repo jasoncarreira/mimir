@@ -171,6 +171,66 @@ def test_enabled_coding_without_checkout_config_fails_loudly(
         all_mimir_tools(coding_enabled=True)
 
 
+@pytest.mark.parametrize("degraded", [False, True])
+@pytest.mark.parametrize("root_kind", ["unset", "relative", "missing", "file", "symlink", "unwritable"])
+def test_coding_startup_aggregates_missing_prerequisites(
+    monkeypatch, tmp_path, degraded, root_kind,
+) -> None:
+    from mimir.tools import all_mimir_tools
+    from mimir.tools import registry
+
+    monkeypatch.setattr("mimir.tools.forge._github_identity_degraded", degraded)
+    monkeypatch.setattr("mimir.providers.opencode_available", lambda: False)
+    real_access = registry.os.access
+    monkeypatch.setattr(
+        registry.os, "access",
+        lambda path, mode: False if str(path) == "/usr/bin/git" else real_access(path, mode),
+    )
+    root = tmp_path / "leases"
+    if root_kind == "file":
+        root.write_text("not a directory")
+    elif root_kind == "symlink":
+        root.symlink_to(tmp_path, target_is_directory=True)
+    elif root_kind == "unwritable":
+        root.mkdir()
+        # Deterministic even when tests run as root; model a runtime mount denial.
+        def denied(*, dir):
+            assert dir == root
+            raise PermissionError("runtime user cannot write")
+        monkeypatch.setattr(registry.tempfile, "TemporaryFile", denied)
+    monkeypatch.delenv("MIMIR_PR_CHECKOUT_LEASE_ROOT", raising=False)
+    if root_kind != "unset":
+        monkeypatch.setenv(
+            "MIMIR_PR_CHECKOUT_LEASE_ROOT",
+            "relative/leases" if root_kind == "relative" else str(root),
+        )
+
+    with pytest.raises(RuntimeError) as error:
+        all_mimir_tools(coding_enabled=True)
+    message = str(error.value)
+    assert "opencode CLI" in message
+    assert "pinned Git binary /usr/bin/git" in message
+    assert "MIMIR_PR_CHECKOUT_LEASE_ROOT" in message
+    assert message.count("\n- ") == 3
+    if root_kind == "missing":
+        assert not root.exists()
+
+
+@pytest.mark.parametrize("degraded", [False, True])
+def test_coding_startup_writable_root_and_identity_gate(monkeypatch, tmp_path, degraded):
+    from mimir.tools import all_mimir_tools
+    from mimir.tools import registry
+
+    monkeypatch.setattr("mimir.tools.forge._github_identity_degraded", degraded)
+    monkeypatch.setattr("mimir.providers.opencode_available", lambda: True)
+    monkeypatch.setattr(registry.os, "access", lambda path, mode: True)
+    monkeypatch.setenv("MIMIR_PR_CHECKOUT_LEASE_ROOT", str(tmp_path))
+    names = {tool.name for tool in all_mimir_tools(coding_enabled=True)}
+    assert ("spawn_open_code" in names) is not degraded
+    assert ("repo_test" in names) is not degraded
+    assert list(tmp_path.iterdir()) == []
+
+
 def test_declarative_coding_inventory_does_not_probe_cli_availability(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

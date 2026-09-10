@@ -3003,8 +3003,8 @@ def all_mimir_tools(
     use ``MIMIR_MODEL_SPEC`` as before.
 
     ``coding_enabled`` is the operator's explicit opt-in to the coding-assistant
-    surface. Runtime assembly requires the OpenCode CLI by default so startup
-    fails loudly rather than exposing a broken tool. Declarative inventory
+    surface. Runtime assembly validates all local coding prerequisites before
+    identity degradation can hide registration. Declarative inventory
     checks may pass ``require_coding_available=False`` to enumerate the enabled
     surface without probing ambient CLI availability.
 
@@ -3090,34 +3090,47 @@ def all_mimir_tools(
         if fetch_url_on:
             tools.append(fetch_url)
     if coding_enabled:
-        from .forge import github_identity_is_degraded
-        coding_enabled = not github_identity_is_degraded()
-    if coding_enabled:
         if require_coding_available:
             from ..providers import opencode_available
+            missing = []
             if not opencode_available():
-                raise RuntimeError(
-                    "MIMIR_CODING_ENABLED is true, but the opencode CLI is not "
+                missing.append(
+                    "the opencode CLI is not "
                     "installed or is not on PATH"
                 )
             git = Path("/usr/bin/git")
             if not git.is_file() or not os.access(git, os.X_OK):
-                raise RuntimeError(
-                    "MIMIR_CODING_ENABLED is true, but the pinned Git binary "
+                missing.append(
+                    "the pinned Git binary "
                     "/usr/bin/git is unavailable"
                 )
             lease_root_value = os.environ.get("MIMIR_PR_CHECKOUT_LEASE_ROOT", "").strip()
             lease_root = Path(lease_root_value) if lease_root_value else None
             if lease_root is None or not lease_root.is_absolute():
-                raise RuntimeError(
-                    "MIMIR_CODING_ENABLED is true, but "
+                missing.append(
                     "MIMIR_PR_CHECKOUT_LEASE_ROOT is not configured as an absolute path"
                 )
-            if not lease_root.is_dir() or lease_root.is_symlink() or not os.access(lease_root, os.W_OK):
+            else:
+                try:
+                    if not lease_root.is_dir() or lease_root.is_symlink():
+                        raise OSError("must be an existing directory, not a symlink")
+                    # Probe as the runtime user, including read-only mounts and ACLs.
+                    with tempfile.TemporaryFile(dir=lease_root) as probe:
+                        probe.write(b"coding startup probe")
+                        probe.flush()
+                except OSError as exc:
+                    missing.append(
+                        "MIMIR_PR_CHECKOUT_LEASE_ROOT: configured PR checkout "
+                        f"lease root is unavailable or not writable ({exc})"
+                    )
+            if missing:
                 raise RuntimeError(
-                    "MIMIR_CODING_ENABLED is true, but the configured PR checkout "
-                    "lease root is unavailable or not writable"
+                    "MIMIR_CODING_ENABLED is true, but coding prerequisites are missing:\n- "
+                    + "\n- ".join(missing)
                 )
+        from .forge import github_identity_is_degraded
+        coding_enabled = not github_identity_is_degraded()
+    if coding_enabled:
         from .forge import FORGE_TOOLS
         from .repo import REPO_TOOLS
 

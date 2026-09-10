@@ -1709,6 +1709,20 @@ def build_app(config: Config) -> web.Application:
                     job="pr-checkout-lease-reaper",
                 )
 
+        from .read_policy import configured_non_admin_read_roots, derived_pr_checkout_read_root
+
+        derived_lease_read_root = derived_pr_checkout_read_root()
+        await log_event(
+            "filesystem_read_scope",
+            coding_enabled=config.coding_enabled,
+            derived_pr_checkout_read_roots=(
+                [str(derived_lease_read_root)] if derived_lease_read_root is not None else []
+            ),
+            effective_non_admin_read_roots=[
+                str(root) for root in configured_non_admin_read_roots()
+            ],
+        )
+
         # Scratch retention janitor: scratch/ is ephemeral by contract
         # (config.py writable-dirs table) but nothing deleted it — poller-
         # driven per-task clones left a live home with 140 GB in six weeks.

@@ -212,6 +212,15 @@ def resolve_review_state_for_context(
     pull_request: int,
 ) -> RepoReviewState:
     """Context-level variant used by authorization before tool invocation."""
+    from ..access_control import (
+        get_trusted_service_from_auth_context, heartbeat_git_authority_enabled,
+    )
+
+    service = get_trusted_service_from_auth_context(context)
+    if heartbeat_git_authority_enabled(service) or heartbeat_git_authority_enabled(
+        getattr(context, "service_authority", None),
+    ):
+        return _resolve_heartbeat_git_state(context, repository, pull_request)
     cache = getattr(context, "server_discovered_pr_states", None)
     state = cache.resolve(repository, pull_request) if (
         isinstance(cache, ServerDiscoveredPRStates)
@@ -402,6 +411,82 @@ def resolve_review_state_for_context(
     return cache.remember(state) if cache is not None else state
 
 
+def _resolve_heartbeat_git_state(
+    context: AuthContext,
+    repository: str,
+    pull_request: int,
+) -> RepoReviewState:
+    """Live own-PR authority; the operator's cross-turn store is not a grant."""
+    from ..access_control import (
+        can_resolve_forge_review_scope,
+        create_server_discovered_heartbeat_scope,
+        is_configured_github_repo,
+    )
+
+    if not is_configured_github_repo(repository):
+        raise ToolPolicyRefusal("heartbeat_repository_denied: repository is not configured")
+    if type(pull_request) is not int or pull_request < 1:
+        raise ToolPolicyRefusal("heartbeat_pr_invalid: pull_request must be a positive integer")
+    login = os.environ.get("MIMIR_GITHUB_SELF_LOGIN", "").strip()
+    if not login:
+        raise ToolPolicyRefusal("heartbeat_identity_missing: MIMIR_GITHUB_SELF_LOGIN is empty")
+    if not can_resolve_forge_review_scope(context, stage="fetch"):
+        raise ToolPolicyRefusal("heartbeat_authority_denied: trusted pr_metadata capability required")
+    cache = context.server_discovered_pr_states
+    registry = context.repo_pr_scope_registry
+    existing = cache.resolve(repository, pull_request) if cache is not None else None
+    if existing is None and registry is not None:
+        existing = registry.resolve(repository, pull_request)
+    if existing is not None and (
+        existing.action_scope.pull_request_author != login
+        or existing.action_scope.principal != login
+    ):
+        raise ToolPolicyRefusal("heartbeat_other_author: cached scope is not authored by the configured identity")
+    try:
+        snapshot = _client_for_repository(repository).get_pull_request_snapshot(
+            repository.lower(), pull_request,
+        )
+    except ForgeError as exc:
+        raise ToolException(f"heartbeat_pr_unverified: {exc}") from exc
+    from ..models import NormalizedPullRequestSnapshot
+
+    if (
+        not isinstance(snapshot, NormalizedPullRequestSnapshot)
+        or not isinstance(snapshot.repo, str)
+        or snapshot.repo.lower() != repository.lower()
+        or type(snapshot.number) is not int
+        or snapshot.number != pull_request
+        or snapshot.state != "open"
+    ):
+        raise ToolPolicyRefusal("heartbeat_pr_invalid: provider must report the requested open PR")
+    if snapshot.author != login:
+        raise ToolPolicyRefusal("heartbeat_other_author: PR is not authored by the configured identity")
+    scope = create_server_discovered_heartbeat_scope(
+        repository, snapshot, event_type="heartbeat_pr_maintenance",
+    )
+    if scope is None:
+        raise ToolPolicyRefusal("heartbeat_pr_invalid: provider refs or configured repository binding are invalid")
+    if existing is not None:
+        # Never re-pin a live checkout after the provider advances. Git publication
+        # also checks the remote ref, closing the race after this API observation.
+        previous = existing.action_scope
+        if any(getattr(previous, name) != getattr(scope, name) for name in (
+            "canonical_repo", "pr_number", "canonical_root", "canonical_origin",
+            "head_repo", "head_remote", "destination_ref", "observed_head_sha",
+            "base_ref", "observed_base_sha",
+        )):
+            raise ToolPolicyRefusal("stale_scope: heartbeat PR SHA/ref or repository binding changed")
+        if any(getattr(previous, name) != getattr(scope, name) for name in (
+            "event_type", "allowed_operations", "checkout_ref", "provenance",
+        )):
+            raise ToolPolicyRefusal(
+                "heartbeat_scope_incompatible: cached scope is not heartbeat PR maintenance authority"
+            )
+        return existing
+    state = RepoReviewState(scope)
+    return cache.remember(state) if cache is not None else state
+
+
 def revalidate_review_head_for_context(
     context: AuthContext | None,
     repository: str,
@@ -435,6 +520,14 @@ def remediation_checkout_preflight(
     pull_request: int,
 ) -> tuple[RepoReviewState | None, str | None]:
     """Refresh one stale own-remediation scope from a live provider snapshot."""
+    from ..access_control import (
+        get_trusted_service_from_auth_context, heartbeat_git_authority_enabled,
+    )
+
+    if heartbeat_git_authority_enabled(get_trusted_service_from_auth_context(context)) or heartbeat_git_authority_enabled(
+        getattr(context, "service_authority", None),
+    ):
+        return resolve_review_state_for_context(context, repository, pull_request), None
     registry = getattr(context, "repo_pr_scope_registry", None)
     original = registry.resolve(repository, pull_request) if isinstance(
         registry, RepoPRScopeRegistry,
@@ -666,6 +759,14 @@ def pr_job_log(
                 break
     if state is None:
         raise ToolPolicyRefusal("job log rejected: pull request is outside this turn's scope")
+    from ..access_control import (
+        get_trusted_service_from_auth_context, heartbeat_git_authority_enabled,
+    )
+
+    if heartbeat_git_authority_enabled(get_trusted_service_from_auth_context(context)) or heartbeat_git_authority_enabled(
+        getattr(context, "service_authority", None),
+    ):
+        state = resolve_review_state_for_context(context, repository, pull_request)
     scope = state.action_scope
     return _call(lambda: _client(scope).get_job_log(scope, job_id, run_id))
 
@@ -916,6 +1017,14 @@ def unsupported_operation(
     state = cache.resolve_for_tool("unsupported_operation", repository, pull_request) if isinstance(
         cache, ServerDiscoveredPRStates,
     ) else None
+    from ..access_control import (
+        get_trusted_service_from_auth_context, heartbeat_git_authority_enabled,
+    )
+
+    if heartbeat_git_authority_enabled(get_trusted_service_from_auth_context(context)) or heartbeat_git_authority_enabled(
+        getattr(context, "service_authority", None),
+    ):
+        state = resolve_review_state_for_context(context, repository, pull_request)
     scope = state.action_scope if state is not None else _scope(runtime, repository, pull_request)
     safe_description = _bounded_escalation_text(
         description,

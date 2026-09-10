@@ -323,7 +323,7 @@ async def create_agent_runtime(
 
         coding_enabled = getattr(config, "coding_enabled", False)
         if coding_enabled:
-            coding_enabled = initialize_github_forge_identity()
+            initialize_github_forge_identity()
         all_mimir_tools(coding_enabled=coding_enabled)
 
         from .agent import Agent

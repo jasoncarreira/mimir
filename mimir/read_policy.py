@@ -609,6 +609,33 @@ def result_is_protected(path: Path, *, text: str | None = None) -> bool:
     return protected_read_result_reason(path, text=text) is not None
 
 
+def derived_pr_checkout_read_root() -> Path | None:
+    """Return the coding-only lease routing root, not a lease authorization grant.
+
+    Unlike lease provisioning, policy discovery must not create directories.
+    Keep home/protected-system roots out using the file-tool root validator.
+    """
+    from .coding import coding_enabled
+
+    if not coding_enabled():
+        return None
+    home = _resolved_mimir_home()
+    raw = os.environ.get("MIMIR_PR_CHECKOUT_LEASE_ROOT", "").strip()
+    if home is None or not raw or "\x00" in raw:
+        return None
+    from .access_control import _configured_pr_checkout_lease_root
+    from .config import _parse_file_tool_roots
+
+    try:
+        root = _configured_pr_checkout_lease_root()
+        if root is None:
+            return None
+        validated = _parse_file_tool_roots(raw, home, always_rw=())
+    except (OSError, RuntimeError, ValueError):
+        return None
+    return root if any(Path(path) == root for path, _mode in validated) else None
+
+
 def configured_non_admin_read_roots() -> tuple[Path, ...]:
     """Return narrow home roots, configured source roots, and /tmp."""
     home_raw = os.environ.get("MIMIR_HOME", "").strip()
@@ -629,6 +656,7 @@ def configured_non_admin_read_roots() -> tuple[Path, ...]:
     from .access_control import current_turn_scratch_root
 
     turn_scratch = current_turn_scratch_root()
+    lease_root = derived_pr_checkout_read_root()
     roots = [
         home / "state",
         home / "memory",
@@ -638,6 +666,7 @@ def configured_non_admin_read_roots() -> tuple[Path, ...]:
         home / "attachments" / "fetch-cache",
         *((artifact_root,) if artifact_root is not None else ()),
         *((turn_scratch,) if turn_scratch is not None else ()),
+        *((lease_root,) if lease_root is not None else ()),
         *configured_paths,
     ]
 
@@ -656,6 +685,12 @@ def configured_non_admin_read_roots() -> tuple[Path, ...]:
             accepted = False
         if accepted and root not in roots:
             roots.append(root)
+    if lease_root is not None:
+        # Preserve the validated operator spelling when a parent is a symlink.
+        # Containment still binds lexical selection to its physical root below.
+        lexical_lease_root = Path(os.environ["MIMIR_PR_CHECKOUT_LEASE_ROOT"].strip())
+        if lexical_lease_root not in roots:
+            roots.append(lexical_lease_root)
     tmp = Path("/tmp")
     if tmp.is_dir() and tmp not in roots:
         roots.append(tmp)
