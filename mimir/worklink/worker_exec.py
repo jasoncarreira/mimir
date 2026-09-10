@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import array
 import ctypes
+import fcntl
 from dataclasses import dataclass, field
 import json
 import os
@@ -39,7 +40,7 @@ REPO_TEST_UV_CACHE = Path("/opt/mimir-worklink/uv-cache")
 MAX_FDS = 3
 # Deliberately not imported from worker_client: this value must describe the
 # immutable executor installed in the root-owned image, not mutable controller code.
-EXECUTOR_PROTOCOL_IDENTITY = "worklink-executor-v8-factory-subreaper"
+EXECUTOR_PROTOCOL_IDENTITY = "worklink-executor-v9-factory-ownership"
 EXECUTOR_SOURCE_COMMIT_PATH = Path("/opt/mimir-worklink/executor-source-commit")
 _STALE_EXECUTOR_DIAGNOSTIC = (
     "stale root executor image: controller and mimir.worklink.worker_exec protocol "
@@ -336,6 +337,80 @@ def _open_path_checkout(request: dict[str, Any]) -> int:
         resolved,
         os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0),
     )
+
+
+def _open_factory_checkout(request: dict[str, Any]) -> int:
+    """Transfer a never-exposed factory tree, or reopen it without traversing it."""
+    issue = _positive_integer(request, "issue")
+    attempt = _positive_integer(request, "attempt")
+    identities = get_identities()
+    raw = request.get("path")
+    if not isinstance(raw, str) or "\x00" in raw or request.get("run_uid") != identities.worklink_uid:
+        raise RuntimeError("factory checkout path or invalid worker uid")
+    path = Path(raw)
+    try:
+        relative = path.relative_to(WORKLINK_CHECKOUT_ROOT)
+    except ValueError:
+        raise RuntimeError("factory checkout is outside the Worklink root") from None
+    if (
+        not path.is_absolute() or str(path) != raw
+        or len(relative.parts) != 3
+        or re.fullmatch(r"[A-Za-z0-9._-]+", relative.parts[0]) is None
+        or relative.parts[0] in {".", ".."}
+        or relative.parts[1:] != (f"{issue}-{attempt}", "checkout")
+    ):
+        raise RuntimeError("factory checkout shape is invalid")
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW
+    boundary_fd = os.open("/", flags)
+    checkout_fd = -1
+    try:
+        # Anchor every component. A worker-writable ancestor could otherwise
+        # replace the boundary while root walks or chowns the checkout.
+        for component in path.parent.parts[1:]:
+            parent = os.fstat(boundary_fd)
+            if parent.st_uid not in {0, identities.mimir_uid} or (
+                (parent.st_mode & 0o002 or (
+                    parent.st_gid == identities.worklink_gid and parent.st_mode & 0o020
+                )) and not parent.st_mode & stat.S_ISVTX
+            ):
+                raise RuntimeError("factory checkout ancestor is worker-writable")
+            child_fd = os.open(component, flags, dir_fd=boundary_fd)
+            os.close(boundary_fd)
+            boundary_fd = child_fd
+        fcntl.flock(boundary_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        boundary = os.fstat(boundary_fd)
+        mode = stat.S_IMODE(boundary.st_mode)
+        if (
+            boundary.st_uid != identities.mimir_uid
+            or boundary.st_gid != identities.worklink_gid
+            or mode not in {0o2700, 0o2750}
+        ):
+            raise RuntimeError("factory checkout isolation boundary is invalid")
+        checkout_fd = os.open("checkout", flags, dir_fd=boundary_fd)
+        checkout = os.fstat(checkout_fd)
+        expected_owner = identities.mimir_uid if mode == 0o2700 else identities.worklink_uid
+        if (
+            checkout.st_uid != expected_owner
+            or checkout.st_gid != identities.worklink_gid
+            or stat.S_IMODE(checkout.st_mode) != 0o2770
+        ):
+            raise RuntimeError("factory checkout ownership or mode is invalid")
+        if mode == 0o2700:
+            if request.get("op") == "launch_factory_control":
+                raise RuntimeError("factory control requires an already transferred checkout")
+            # No worker can reach this new tree until the last chmod. Recovery
+            # must never repeat a privileged walk of an already exposed tree.
+            _normalize_checkout_fd(
+                checkout_fd, owner_uid=identities.worklink_uid, group_gid=identities.worklink_gid,
+            )
+            os.fchmod(boundary_fd, 0o2750)
+        result = checkout_fd
+        checkout_fd = -1
+        return result
+    finally:
+        if checkout_fd >= 0:
+            os.close(checkout_fd)
+        os.close(boundary_fd)
 
 
 def _validate_command(request: dict[str, Any]) -> list[str]:
@@ -729,7 +804,7 @@ def _wait_factory(
 
 
 def _handle_launch(connection: socket.socket, request: dict[str, Any], fds: list[int]) -> None:
-    path_addressed = request.get("op") in {"launch_path", "launch_factory"}
+    path_addressed = request.get("op") in {"launch_path", "launch_factory", "launch_factory_control"}
     expected_fields = _PATH_LAUNCH_FIELDS if path_addressed else _LAUNCH_FIELDS
     expected_fds = 2 if path_addressed else MAX_FDS
     if set(request) != expected_fields or len(fds) != expected_fds:
@@ -742,12 +817,9 @@ def _handle_launch(connection: socket.socket, request: dict[str, Any], fds: list
     if not isinstance(identifier, str):
         raise RuntimeError("invalid worker id")
     _validate_identifier(identifier)
-    if path_addressed:
-        fds.insert(0, _open_path_checkout(request))
-        checkout_root = None
-    else:
-        checkout_root = _validate_checkout(fds[0], request)
-    for fd in fds[1:]:
+    factory = request.get("op") in {"launch_factory", "launch_factory_control"}
+    checkout_root = None if path_addressed else _validate_checkout(fds[0], request)
+    for fd in fds[0 if path_addressed else 1:]:
         metadata = os.fstat(fd)
         if not stat.S_ISREG(metadata.st_mode):
             raise RuntimeError("worker output FD must be a regular file")
@@ -771,6 +843,10 @@ def _handle_launch(connection: socket.socket, request: dict[str, Any], fds: list
     proc: subprocess.Popen[bytes] | _FactoryProcess | None = None
     supervisor_parent = supervisor_child = None
     try:
+        if factory and sys.platform != "linux":
+            raise RuntimeError("worklink_factory_reap_refused: PR_SET_CHILD_SUBREAPER requires Linux")
+        if path_addressed:
+            fds.insert(0, _open_factory_checkout(request) if factory else _open_path_checkout(request))
         anchored_fd = os.open(
             ".",
             os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0),
@@ -787,7 +863,7 @@ def _handle_launch(connection: socket.socket, request: dict[str, Any], fds: list
         os.chown(home, get_identities().worklink_uid, get_identities().worklink_gid)
         os.chmod(home, 0o700)
         environment["HOME"] = str(home)
-        execution_fd = _execution_checkout_fd(
+        execution_fd = os.dup(anchored_fd) if factory else _execution_checkout_fd(
             command,
             anchored_fd,
             home,
@@ -796,11 +872,8 @@ def _handle_launch(connection: socket.socket, request: dict[str, Any], fds: list
         os.close(anchored_fd)
         anchored_fd = execution_fd
         fds[0] = anchored_fd
-        factory = request.get("op") == "launch_factory"
         launch_command = command
         if factory:
-            if sys.platform != "linux":
-                raise RuntimeError("worklink_factory_reap_refused: PR_SET_CHILD_SUBREAPER requires Linux")
             supervisor_parent, supervisor_child = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
             # This filename and interpreter belong to the installed executor,
             # not the writable checkout. -I excludes PYTHONPATH and user sites.
@@ -816,7 +889,7 @@ def _handle_launch(connection: socket.socket, request: dict[str, Any], fds: list
             env=environment,
             preexec_fn=(
                 (lambda: _drop_factory(fds[0], home))
-                if factory
+                if request.get("op") == "launch_factory"
                 else (lambda: _drop_worker(fds[0]))
             ),
             close_fds=True,
@@ -899,7 +972,7 @@ def handle_connection(connection: socket.socket) -> None:
         identifier = raw_identifier if isinstance(raw_identifier, str) else None
         if request.get("op") in {"launch", "launch_path"}:
             _handle_launch(connection, request, fds)
-        elif request.get("op") == "launch_factory":
+        elif request.get("op") in {"launch_factory", "launch_factory_control"}:
             _handle_launch_factory(connection, request, fds)
         elif request.get("op") == "cancel":
             _handle_cancel(connection, request, fds)

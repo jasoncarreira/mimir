@@ -464,6 +464,7 @@ def create_isolated_checkout(
     event_logger: EventLogger | None = None,
     runner: Runner = _default_runner,
     worker_eligible: bool = False,
+    factory_worker: bool = False,
 ) -> CheckoutLease:
     """Create an attempt-scoped local clone with its own ``.git`` directory.
 
@@ -480,15 +481,27 @@ def create_isolated_checkout(
 
     _assert_base_separate_from_controller(repo)
 
-    worker_accessible = coding_enabled() and worker_eligible
+    worker_accessible = factory_worker or (coding_enabled() and worker_eligible)
     identities = get_identities() if worker_accessible else None
     path = _isolated_checkout_path(
         repo, worklink_dir, issue_id, attempt, worker_authorized=False
     )
     branch = checkout_branch or f"issue/{issue_id}-a{attempt}"
-    path.parent.mkdir(parents=True, exist_ok=True)
+    if factory_worker:
+        path.parent.parent.mkdir(mode=0o755, parents=True, exist_ok=True)
+        path.parent.mkdir(mode=0o755, exist_ok=True)
+    else:
+        path.parent.mkdir(parents=True, exist_ok=True)
     if path.exists():
         raise RuntimeError(f"attempt checkout already exists: {path}")
+    if factory_worker:
+        # Never expose the tree while the executor transfers ownership. The
+        # enclosing attempt remains controller-owned after the worker starts.
+        path.mkdir(mode=0o700)
+        assert identities is not None
+        os.chown(path, -1, identities.worklink_gid)
+        os.chmod(path, 0o2700)
+        path = path / "checkout"
 
     start_point = _prepare_fresh_base(
         repo,
@@ -1233,7 +1246,9 @@ def cleanup_checkout(
                 lease.authorization.close()
             rmtree_missing_ok(lease.path.parent)
             return True
-        rmtree_missing_ok(lease.path)
+        inner = lease.path.name == "checkout" and lease.path.parent.name == f"{lease.issue_id}-{lease.attempt}"
+        target = lease.path.parent if inner else lease.path
+        rmtree_missing_ok(target)
         attempt_branch = f"issue/{lease.issue_id}-a{lease.attempt}"
         if lease.branch == attempt_branch:
             delete = runner(["git", "-C", str(lease.repo), "branch", "-D", lease.branch])
@@ -1282,7 +1297,7 @@ def prune_attempt_checkouts(
         if not root.exists():
             continue
         for child in root.iterdir():
-            if not child.is_dir() or not _attempt_dir_name(child.name):
+            if child.is_symlink() or not child.is_dir() or not _attempt_dir_name(child.name):
                 continue
             mtime = datetime.fromtimestamp(child.stat().st_mtime, tz=now.tzinfo)
             if now - mtime <= older_than:
@@ -1292,7 +1307,12 @@ def prune_attempt_checkouts(
             if can_prune is not None and not can_prune(child):
                 continue
             if isolated:
-                shutil.rmtree(child, ignore_errors=True)
+                try:
+                    shutil.rmtree(child)
+                except OSError:
+                    # A retained worker tree can revoke group access. Do not
+                    # claim successful pruning or clear its recovery records.
+                    continue
             else:
                 result = runner(["git", "-C", str(repo), "worktree", "remove", "--force", str(child)])
                 if result.returncode != 0:

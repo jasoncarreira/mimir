@@ -1342,8 +1342,11 @@ def test_process_group_cancellation_reports_unreapable_member(monkeypatch) -> No
 @pytest.fixture
 def factory_request(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     root = tmp_path / ".worklink"
-    checkout = root / "repo" / "41-2"
+    checkout = root / "repo" / "41-2" / "checkout"
     checkout.mkdir(parents=True)
+    root.chmod(0o755)
+    (root / "repo").chmod(0o755)
+    checkout.parent.chmod(0o2700)
     checkout.chmod(0o2770)
     worker_uid = worker_exec.get_identities().worklink_uid
     monkeypatch.setattr(worker_exec, "get_identities", lambda: SimpleNamespace(
@@ -1423,6 +1426,7 @@ def test_factory_launch_denies_invalid_contract(
     elif denial == "mode":
         checkout.chmod(0o770)
     elif denial in {"owner", "group"}:
+        expected = "boundary|ancestor"
         observed = worker_exec.get_identities()
         monkeypatch.setattr(worker_exec, "get_identities", lambda: SimpleNamespace(
             mimir_uid=observed.mimir_uid + (denial == "owner"),
@@ -1471,6 +1475,226 @@ def test_factory_launch_refuses_non_linux_before_spawn(factory_request, tmp_path
     assert not (worker_exec.HOME_ROOT / factory_request["id"]).exists()
 
 
+@pytest.mark.parametrize("guard", ["boundary_write", "ancestor_write", "ancestor_link", "boundary_link", "checkout_link", "legacy", "control_before_transfer"])
+def test_factory_transfer_refuses_unsafe_boundary(factory_request, monkeypatch, guard):
+    path = Path(factory_request["path"])
+    if guard == "boundary_write":
+        path.parent.chmod(0o2770)
+    elif guard == "ancestor_write":
+        path.parent.parent.chmod(0o777)
+    elif guard in {"ancestor_link", "boundary_link", "checkout_link"}:
+        original = {"ancestor_link": path.parent.parent, "boundary_link": path.parent, "checkout_link": path}[guard]
+        moved = original.with_name(original.name + "-moved")
+        original.rename(moved)
+        original.symlink_to(moved, target_is_directory=True)
+    elif guard == "legacy":
+        factory_request["path"] = str(path.parent)
+    else:
+        factory_request["op"] = "launch_factory_control"
+    transfer = Mock(side_effect=AssertionError("unsafe tree reached privileged traversal"))
+    monkeypatch.setattr(worker_exec, "_normalize_checkout_fd", transfer)
+    with pytest.raises((RuntimeError, OSError)):
+        worker_exec._open_factory_checkout(factory_request)
+    transfer.assert_not_called()
+
+
+def test_factory_transfer_failure_keeps_boundary_private(factory_request, monkeypatch):
+    path = Path(factory_request["path"])
+
+    def fail(fd, **kwargs):
+        assert stat.S_IMODE(path.parent.stat().st_mode) == 0o2700
+        assert os.fstat(fd).st_ino == path.stat().st_ino
+        raise RuntimeError("transfer failed")
+
+    monkeypatch.setattr(worker_exec, "_normalize_checkout_fd", fail)
+    with pytest.raises(RuntimeError, match="transfer failed"):
+        worker_exec._open_factory_checkout(factory_request)
+    assert stat.S_IMODE(path.parent.stat().st_mode) == 0o2700
+
+
+@pytest.mark.parametrize("held_lock", ["shared", "exclusive"])
+def test_factory_boundary_lock_is_nonblocking(factory_request, monkeypatch, held_lock):
+    import fcntl
+
+    path = Path(factory_request["path"])
+    fd = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        fcntl.flock(fd, (fcntl.LOCK_SH if held_lock == "shared" else fcntl.LOCK_EX) | fcntl.LOCK_NB)
+        real_flock = fcntl.flock
+
+        def bounded_flock(fd, operation):
+            assert operation & fcntl.LOCK_NB, "executor must not block on a worker-held lock"
+            return real_flock(fd, operation)
+
+        monkeypatch.setattr(fcntl, "flock", bounded_flock)
+        monkeypatch.setattr(worker_exec, "_normalize_checkout_fd", Mock(side_effect=AssertionError("locked boundary reached transfer")))
+        with pytest.raises(BlockingIOError):
+            worker_exec._open_factory_checkout(factory_request)
+    finally:
+        os.close(fd)
+
+
+@pytest.mark.parametrize("guard", [
+    "ancestor_uid", "ancestor_world_write", "ancestor_group_write",
+    "boundary_uid", "boundary_gid", "boundary_mode",
+    "checkout_uid", "checkout_gid", "checkout_mode",
+])
+def test_factory_metadata_guards_are_independent(factory_request, monkeypatch, guard):
+    path = Path(factory_request["path"])
+    target = path.parent.parent if guard.startswith("ancestor") else path.parent if guard.startswith("boundary") else path
+    target_identity = (target.stat().st_dev, target.stat().st_ino)
+    checkout_identity = (path.stat().st_dev, path.stat().st_ino)
+    real_fstat = os.fstat
+
+    def fstat(fd):
+        value = real_fstat(fd)
+        identity = (value.st_dev, value.st_ino)
+        changed = dict(st_uid=value.st_uid, st_gid=value.st_gid, st_mode=value.st_mode)
+        if identity == target_identity:
+            if guard.endswith("uid"):
+                changed["st_uid"] = os.getuid() + 10000
+            elif guard.endswith("gid"):
+                changed["st_gid"] = os.getgid() + 10000
+            else:
+                modes = {"ancestor_world_write": 0o757, "ancestor_group_write": 0o775,
+                         "boundary_mode": 0o2752, "checkout_mode": 0o2777}
+                changed["st_mode"] = stat.S_IFDIR | modes[guard]
+            return SimpleNamespace(**changed)
+        if guard == "boundary_mode" and identity == checkout_identity:
+            # An exposed tree must otherwise satisfy the recovery owner check.
+            changed["st_uid"] = factory_request["run_uid"]
+            return SimpleNamespace(**changed)
+        return value
+
+    monkeypatch.setattr(os, "fstat", fstat)
+    transfer = Mock()
+    monkeypatch.setattr(worker_exec, "_normalize_checkout_fd", transfer)
+    expected = "ancestor" if guard.startswith("ancestor") else "boundary" if guard.startswith("boundary") else "ownership or mode"
+    with pytest.raises(RuntimeError, match=expected):
+        fd = worker_exec._open_factory_checkout(factory_request)
+        os.close(fd)
+    transfer.assert_not_called()
+
+
+@pytest.mark.parametrize("guard", ["outside", "canonical", "repo_name", "repo_parent", "leaf_name", "worker_uid", "issue", "attempt"])
+def test_factory_path_guards_reject_otherwise_openable_trees(factory_request, monkeypatch, tmp_path, guard):
+    path = Path(factory_request["path"])
+    if guard == "outside":
+        moved = tmp_path / "foreign" / "repo"
+        moved.parent.mkdir(mode=0o755)
+        path.parent.parent.rename(moved)
+        raw = str(moved / "41-2/checkout")
+    elif guard == "canonical":
+        raw = str(path.parent) + "//checkout"
+    elif guard == "repo_name":
+        moved = path.parent.parent.with_name("repo space")
+        path.parent.parent.rename(moved)
+        raw = str(moved / "41-2/checkout")
+    elif guard == "repo_parent":
+        path.parent.rename(tmp_path / "41-2")
+        raw = str(worker_exec.WORKLINK_CHECKOUT_ROOT) + "/../41-2/checkout"
+    elif guard == "worker_uid":
+        factory_request["run_uid"] = 0
+        raw = str(path)
+    elif guard in {"issue", "attempt"}:
+        factory_request[guard] += 1
+        raw = str(path)
+    else:
+        raw = str(path.with_name("other"))
+    factory_request["path"] = raw
+    monkeypatch.setattr(worker_exec, "_normalize_checkout_fd", Mock())
+    with pytest.raises(RuntimeError, match="outside|shape|invalid worker uid"):
+        fd = worker_exec._open_factory_checkout(factory_request)
+        os.close(fd)
+
+
+def test_factory_recovery_checkout_must_be_directory(factory_request, monkeypatch):
+    path = Path(factory_request["path"])
+    path.rmdir()
+    path.write_text("not a directory")
+    path.chmod(0o2770)
+    path.parent.chmod(0o2750)
+    real_fstat = os.fstat
+    identity = (path.stat().st_dev, path.stat().st_ino)
+
+    def fstat(fd):
+        value = real_fstat(fd)
+        if (value.st_dev, value.st_ino) == identity:
+            return SimpleNamespace(st_uid=factory_request["run_uid"], st_gid=value.st_gid, st_mode=value.st_mode)
+        return value
+
+    monkeypatch.setattr(os, "fstat", fstat)
+    with pytest.raises(NotADirectoryError):
+        fd = worker_exec._open_factory_checkout(factory_request)
+        os.close(fd)
+
+
+def test_factory_control_launch_uses_worker_drop_without_runtime_refresh(factory_request, monkeypatch, tmp_path):
+    factory_request["op"] = "launch_factory_control"
+    factory_request["argv"] = ["uv", "run", "status"]
+    opened = []
+
+    def checkout(request):
+        fd = os.open(request["path"], os.O_RDONLY | os.O_DIRECTORY)
+        opened.append(fd)
+        return fd
+
+    monkeypatch.setattr(worker_exec, "_open_factory_checkout", checkout)
+    monkeypatch.setattr(os, "chown", lambda *args, **kwargs: None)
+    drop = Mock()
+    monkeypatch.setattr(worker_exec, "_drop_worker", drop)
+    monkeypatch.setattr(worker_exec, "_drop_factory", Mock(side_effect=AssertionError("control refreshed runtime auth")))
+    monkeypatch.setattr(worker_exec, "_execution_checkout_fd", Mock(side_effect=AssertionError("factory used disposable copy")))
+
+    def spawn(command, **kwargs):
+        kwargs["preexec_fn"]()
+        drop.assert_called_once_with(kwargs["pass_fds"][0])
+        return SimpleNamespace(pid=123)
+
+    def wait(proc, *args):
+        proc.done.set()
+        return 0, False, False
+
+    monkeypatch.setattr(worker_exec.subprocess, "Popen", spawn)
+    monkeypatch.setattr(worker_exec, "_wait_with_output_limits", wait)
+    with (tmp_path / "out").open("w+b") as output:
+        fds = [output.fileno(), output.fileno()]
+        try:
+            worker_exec._handle_launch_factory(Mock(), factory_request, fds)
+        finally:
+            if len(fds) == 3:
+                os.close(fds[0])
+    assert len(opened) == 1
+
+
+@pytest.mark.parametrize("owner_valid", [False, True])
+def test_factory_recovery_requires_worker_owner_without_privileged_walk(factory_request, monkeypatch, owner_valid):
+    path = Path(factory_request["path"])
+    path.parent.chmod(0o2750)
+    (path / "hostile-link").symlink_to("/etc/shadow")
+    os.mkfifo(path / "hostile-fifo")
+    real_fstat = os.fstat
+    inode = path.stat().st_ino
+    worker_uid = factory_request["run_uid"]
+
+    def fstat(fd):
+        value = real_fstat(fd)
+        if value.st_ino == inode and owner_valid:
+            return SimpleNamespace(st_uid=worker_uid, st_gid=value.st_gid, st_mode=value.st_mode)
+        return value
+
+    monkeypatch.setattr(worker_exec.os, "fstat", fstat)
+    transfer = Mock(side_effect=AssertionError("recovery traversed worker tree as root"))
+    monkeypatch.setattr(worker_exec, "_normalize_checkout_fd", transfer)
+    if owner_valid:
+        fd = worker_exec._open_factory_checkout(factory_request)
+        os.close(fd)
+    else:
+        with pytest.raises(RuntimeError, match="ownership or mode"):
+            worker_exec._open_factory_checkout(factory_request)
+    transfer.assert_not_called()
+
+
 def test_factory_cancel_uses_supervisor_stop_not_legacy_group(monkeypatch):
     identifier = str(uuid.uuid4())
     done = Mock()
@@ -1495,6 +1719,9 @@ def test_factory_drops_identity_before_payload_exec_or_spawn(
 ) -> None:
     observed = worker_exec.get_identities()
     events = []
+    transfer = Mock()
+    monkeypatch.setattr(worker_exec, "_normalize_checkout_fd", transfer)
+    monkeypatch.setattr(worker_exec, "_execution_checkout_fd", Mock(side_effect=AssertionError("factory copied to HOME")))
     monkeypatch.setattr(worker_exec.ctypes, "CDLL", lambda *a, **kw: SimpleNamespace(prctl=lambda *a: 0))
     monkeypatch.setattr(worker_exec, "_set_capabilities", lambda caps: None)
     monkeypatch.setattr(worker_exec, "_last_capability", lambda: 2)
@@ -1517,6 +1744,11 @@ def test_factory_drops_identity_before_payload_exec_or_spawn(
     factory_request["argv"] = payload.copy()
 
     def popen(command, **kwargs):
+        transfer.assert_called_once()
+        assert transfer.call_args.kwargs == {
+            "owner_uid": observed.worklink_uid, "group_gid": observed.worklink_gid,
+        }
+        assert stat.S_IMODE(Path(factory_request["path"]).parent.stat().st_mode) == 0o2750
         supervisor = Path(worker_exec.__file__).with_name("factory_supervisor.py")
         assert supervisor.is_absolute()
         assert command[:3] == [sys.executable, "-I", str(supervisor)]
@@ -1561,7 +1793,8 @@ def test_factory_drops_identity_before_payload_exec_or_spawn(
                 factory_request, fds,
             )
         finally:
-            os.close(fds[0])
+            if len(fds) == 3:
+                os.close(fds[0])
     assert events[-1] == "supervisor-exec"
     assert factory_request["argv"] == payload
     assert [response["status"] for response in responses] == ["started", "event", "terminal"]
@@ -1915,7 +2148,7 @@ def test_factory_descendant_cannot_write_controller_canary_and_negative_control_
 
     repo = worker_exec.WORKLINK_CHECKOUT_ROOT / f"factory-test-{uuid.uuid4()}"
     boundary = Path("/tmp") / f"factory-exec-{uuid.uuid4()}"
-    checkout = repo / "41-2"
+    checkout = repo / "41-2" / "checkout"
     home_root = boundary / "homes"
     controller_home = boundary / "controller"
     socket_path = boundary / "executor.sock"
@@ -1930,6 +2163,8 @@ def test_factory_descendant_cannot_write_controller_canary_and_negative_control_
             home_root.chmod(0o710)
             os.chown(checkout, observed.mimir_uid, observed.worklink_gid)
             checkout.chmod(0o2770)
+            os.chown(checkout.parent, observed.mimir_uid, observed.worklink_gid)
+            checkout.parent.chmod(0o2700)
             controller_home.mkdir(mode=0o700)
             os.chown(controller_home, observed.mimir_uid, observed.mimir_uid)
         except PermissionError:
@@ -1968,6 +2203,18 @@ def test_factory_descendant_cannot_write_controller_canary_and_negative_control_
                 for entry in (path / ".git").rglob("*"):
                     os.chown(entry, observed.mimir_uid, observed.worklink_gid)
                 os.chown(path / ".git", observed.mimir_uid, observed.worklink_gid)
+            tracked = checkout / "tracked-bin"
+            tracked.write_text("echo factory")
+            os.chown(tracked, observed.mimir_uid, observed.worklink_gid)
+            for arguments in (
+                ["add", "tracked-bin"],
+                ["-c", "user.name=Factory Test", "-c", "user.email=factory@example.test", "commit", "-m", "initial"],
+            ):
+                subprocess.run(
+                    [git, "-C", str(checkout), *arguments], check=True, capture_output=True,
+                    user=observed.mimir_uid, group=observed.worklink_gid, extra_groups=[],
+                    env={"PATH": "/usr/bin:/bin", "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": "/dev/null"},
+                )
             payload = (
                 "import os, subprocess\n"
                 f"assert os.geteuid() == {observed.worklink_uid}\n"
@@ -1975,15 +2222,29 @@ def test_factory_descendant_cannot_write_controller_canary_and_negative_control_
                 "result = subprocess.run([git, 'rev-parse', '--show-toplevel'], capture_output=True, text=True)\n"
                 "assert result.returncode == 0, result.stderr\n"
                 f"assert result.stdout.strip() == {str(checkout)!r}\n"
+                "assert 'GIT_CONFIG_COUNT' not in os.environ\n"
+                "from pathlib import Path\n"
+                "Path('tracked-bin').chmod(0o755)\n"
+                "result = subprocess.run([git, 'clone', '--local', '.', '.factory-sandboxes/run'], capture_output=True, text=True)\n"
+                "assert result.returncode == 0, result.stderr\n"
+                "Path('.factory-sandboxes/run/run.json').write_text('{\"status\":\"running\"}')\n"
+                "Path('.factory-runtime/data/opencode/opencode.db').write_text('retained-session')\n"
                 f"result = subprocess.run([git, '-C', {str(sibling)!r}, 'rev-parse', '--show-toplevel'], capture_output=True, text=True)\n"
                 "assert result.returncode != 0 and 'dubious ownership' in result.stderr, result\n"
+                f"result = subprocess.run([git, 'clone', '--local', {str(sibling)!r}, 'sibling-clone'], capture_output=True, text=True)\n"
+                "assert result.returncode != 0, result\n"
             )
 
+        control_launch = False
+
         async def controller_run():
+            client = WorkerClient.for_factory_checkout(
+                checkout, issue_id=41, attempt=2, socket_path=socket_path,
+            )
+            if control_launch:
+                client._launch_op = "launch_factory_control"
             backend = LocalSubprocessComputeBackend(
-                _worker_client=WorkerClient.for_factory_checkout(
-                    checkout, issue_id=41, attempt=2, socket_path=socket_path,
-                ),
+                _worker_client=client,
             )
             spec = WorkSpec(
                 issue_id=41, attempt=2, repo_url="", base_ref="", branch="",
@@ -2040,7 +2301,30 @@ def test_factory_descendant_cannot_write_controller_canary_and_negative_control_
 
         if git_intake:
             run()
-            assert checkout.stat().st_uid == observed.mimir_uid
+            assert checkout.stat().st_uid == observed.worklink_uid
+            assert checkout.parent.stat().st_uid == observed.mimir_uid
+            assert stat.S_IMODE(checkout.parent.stat().st_mode) == 0o2750
+            assert (checkout / ".git").stat().st_uid == observed.worklink_uid
+            assert (checkout / ".factory-sandboxes/run/run.json").stat().st_uid == observed.worklink_uid
+            monkeypatch.setattr(worker_exec, "_normalize_checkout_fd", Mock(side_effect=AssertionError("recovery traversed worker tree as root")))
+            payload = (
+                "import os; from pathlib import Path\n"
+                f"assert os.geteuid() == {observed.worklink_uid}\n"
+                "assert Path('.factory-runtime/data/opencode/opencode.db').read_text() == 'retained-session'\n"
+                "state = Path('.factory-sandboxes/run/run.json')\n"
+                "assert state.read_text() == '{\"status\":\"running\"}'\n"
+                "state.write_text('{\"status\":\"resumed\"}')\n"
+                "Path('.factory-runtime/data/opencode/auth.json').write_text('retained-auth')\n"
+            )
+            run()
+            assert json.loads((checkout / ".factory-sandboxes/run/run.json").read_text()) == {"status": "resumed"}
+            control_launch = True
+            payload = (
+                "import os; from pathlib import Path\n"
+                f"assert os.geteuid() == {observed.worklink_uid}\n"
+                "assert Path('.factory-runtime/data/opencode/auth.json').read_text() == 'retained-auth'\n"
+            )
+            run()
             return
         assert_boundary(run())
 

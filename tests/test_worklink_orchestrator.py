@@ -2949,8 +2949,9 @@ def test_worklink_prompt_keeps_planner_suggestion_advisory(
     assert "  cd /workspace/mimir && pytest -q tests/test_identities.py" not in out
 
 @pytest.mark.parametrize("backend_name", ["feature_factory", "opencode", "dummy"])
+@pytest.mark.parametrize("worker_eligible", [False, True])
 def test_registered_backends_use_isolated_checkout_by_default(
-    backend_name: str, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    backend_name: str, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, worker_eligible: bool,
 ) -> None:
     import mimir.worklink.orchestrator as orchestrator
 
@@ -2986,6 +2987,7 @@ def test_registered_backends_use_isolated_checkout_by_default(
         base="main",
         backend=backend,
         runner=runner,
+        worker_eligible=worker_eligible,
     )
 
     assert result is lease
@@ -3000,7 +3002,8 @@ def test_registered_backends_use_isolated_checkout_by_default(
                 "base_fetch": True,
                 "event_logger": None,
                 "runner": runner,
-                "worker_eligible": False,
+                "worker_eligible": worker_eligible,
+                "factory_worker": worker_eligible and backend_name == "feature_factory",
             },
         )
     ]

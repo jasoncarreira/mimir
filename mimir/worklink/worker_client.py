@@ -2,13 +2,16 @@ from __future__ import annotations
 
 import array
 import asyncio
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 import json
 import math
 import os
+import re
 from pathlib import Path, PurePosixPath
 import socket
 import struct
+import subprocess
 from typing import Mapping, Protocol, Sequence
 import uuid
 
@@ -23,7 +26,7 @@ MAX_PROJECTION_BYTES = 1024 * 1024
 CANCEL_SOCKET_TIMEOUT_S = 20.0
 # Keep this literal independent from worker_exec. The executor runs its image-owned
 # copy, so changing either side of the launch contract requires an image rebuild.
-EXECUTOR_PROTOCOL_IDENTITY = "worklink-executor-v8-factory-subreaper"
+EXECUTOR_PROTOCOL_IDENTITY = "worklink-executor-v9-factory-ownership"
 STALE_EXECUTOR_DIAGNOSTIC = (
     "stale root executor image: controller and mimir.worklink.worker_exec protocol "
     "or source identities do not match; rebuild the image and restart the container"
@@ -48,6 +51,60 @@ class CheckoutCapability(Protocol):
 
 class StaleWorkerExecutorError(RuntimeError):
     """The root-owned executor image does not implement this controller contract."""
+
+
+def factory_checkout_for_path(path: Path) -> tuple[Path, int, int] | None:
+    """Locate the factory boundary lexically; the executor verifies it by FD."""
+    try:
+        parts = path.relative_to(WORKLINK_CHECKOUT_ROOT).parts
+    except ValueError:
+        return None
+    if len(parts) < 3 or parts[2] != "checkout":
+        return None
+    match = re.fullmatch(r"([1-9][0-9]*)-([1-9][0-9]*)", parts[1])
+    if match is None or ".." in parts:
+        raise ValueError("invalid factory checkout path")
+    return WORKLINK_CHECKOUT_ROOT.joinpath(*parts[:3]), int(match[1]), int(match[2])
+
+
+def run_factory_control(
+    checkout: Path, argv: Sequence[str], *, env: Mapping[str, str],
+    timeout: float = 30, output_limit: int = 1024 * 1024,
+) -> subprocess.CompletedProcess[bytes]:
+    """Run retained-tree operations as its owner, without refreshing runtime auth."""
+    binding = factory_checkout_for_path(checkout)
+    if binding is None:
+        raise ValueError("factory control requires an inner checkout")
+    root, issue, attempt = binding
+
+    async def run() -> subprocess.CompletedProcess[bytes]:
+        client = WorkerClient.for_factory_checkout(root, issue_id=issue, attempt=attempt)
+        client._launch_op = "launch_factory_control"
+        client._socket_timeout_s = timeout + CANCEL_SOCKET_TIMEOUT_S
+        stdout, stderr = open_output_pair(None, output_limit, None, output_limit)
+        try:
+            process = await client.launch(
+                local_checkout=root, argv=argv,
+                env={key: value for key, value in env.items() if key != "HOME"},
+                identifier=str(uuid.uuid4()), timeout_s=timeout,
+                stdout_sink=stdout, stderr_sink=stderr,
+            )
+            code = await process.wait()
+            if process.timed_out:
+                raise subprocess.TimeoutExpired(argv, timeout)
+            if process.output_overflow:
+                raise RuntimeError("factory control output exceeds bounds")
+            return subprocess.CompletedProcess(
+                argv, code, stdout.read_bounded()[0], stderr.read_bounded()[0],
+            )
+        finally:
+            stdout.close()
+            stderr.close()
+
+    # Factory control has a synchronous API, also called by the async controller.
+    # Own the loop in a thread rather than nesting it in the controller's loop.
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        return pool.submit(lambda: asyncio.run(run())).result()
 
 
 @dataclass(frozen=True)
@@ -127,6 +184,7 @@ class WorkerClient:
         self.issue_id = issue_id
         self.attempt = attempt
         self.run_uid = run_uid
+        self._socket_timeout_s: float | None = None
         self._launch_op = "launch_path" if path_checkout is not None else "launch"
 
     @classmethod
@@ -172,6 +230,8 @@ class WorkerClient:
     def _connect(self, timeout_s: float | None = None) -> socket.socket:
         sock = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
         try:
+            if timeout_s is None:
+                timeout_s = getattr(self, "_socket_timeout_s", None)
             if timeout_s is not None:
                 sock.settimeout(timeout_s)
             sock.connect(str(self.socket_path))

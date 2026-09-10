@@ -62,6 +62,24 @@ factory transitions. Worklink owns the outer Chainlink claim, isolated attempt
 checkout, OpenCode process, restart record, status observation, repository tests,
 and final PR identity verification.
 
+Local factory attempts use
+`/workspace/.worklink/<repo>/<issue>-<attempt>/checkout` (#1618). The enclosing
+attempt is controller-owned, initially `2700`; the privileged executor transfers
+the private inner tree to `worklink:worklink` before spawning, then opens the
+controller-owned boundary to group traversal (`2750`, never worker-writable).
+The clone uses no hardlinks to the base. Factory Git needs no `safe.directory`
+exception. Leaf checkout ownership is unchanged.
+
+The worker-owned checkout, nested factory sandbox, and runtime session database
+persist across recovery. Relaunch validates ownership without a privileged
+recursive walk; retained Git checks and factory control commands run as the
+worker without refreshing runtime auth. Pruning remains a controller operation
+using group access: retained factory records prevent TTL pruning, and a deletion
+denied by worker file modes is not reported as successful. Previously exposed
+flat factory checkouts are refused for recovery and retained for offline
+migration; they are never recursively chowned by root. Deploy controller and
+executor together by rebuilding the executor image before enabling this layout.
+
 - **Poller routing** (opt-in via `MIMIR_FACTORY_EPICS_ENABLED`, default off):
   when the flag is set, the ready-queue poller dispatches `worklink:epic` issues
   (those with both `worklink:ready` and `worklink:epic` labels) via

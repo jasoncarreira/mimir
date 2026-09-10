@@ -1710,6 +1710,8 @@ class WorklinkRunner:
         compute = registry.select_compute(labels=issue.labels, repo=repo_slug)
         if compute.name != "local_subprocess":
             raise WorklinkError("factory runs require local_subprocess supervision")
+        if isinstance(compute, LocalSubprocessComputeBackend):
+            runner = _factory_git_runner(runner)
         if autonomous:
             allowed, reason = config.autonomous_compute_allowed(
                 compute.name, compute.capabilities()
@@ -2199,7 +2201,7 @@ class WorklinkRunner:
             run_id=retained.run_id,
         )
         if isinstance(compute, LocalSubprocessComputeBackend):
-            # Authorization stays at the original attempt root; --dir still
+            # Authorization stays at the original inner checkout; --dir still
             # selects the retained sandbox validated above. Session data is
             # attempt-scoped as on the initial launch.
             spec = replace(spec, local_checkout=sandbox.parent.parent)
@@ -2704,6 +2706,13 @@ def _verify_factory_recovery_target(
     if not retained.session:
         raise WorklinkError("retained factory session is missing")
     sandbox = Path(retained.sandbox)
+    from .worker_client import WORKLINK_CHECKOUT_ROOT, factory_checkout_for_path
+
+    if sandbox.is_relative_to(WORKLINK_CHECKOUT_ROOT) and factory_checkout_for_path(sandbox) is None:
+        raise WorklinkError(
+            "legacy factory checkout has no private ownership-transfer boundary; "
+            "retain it for offline migration, not privileged in-place normalization"
+        )
     if not sandbox.is_absolute() or not sandbox.is_dir() or sandbox.is_symlink():
         raise WorklinkError("retained factory sandbox is unavailable")
     _verify_factory_checkout(
@@ -2714,6 +2723,31 @@ def _verify_factory_recovery_target(
         repository=retained.repository,
     )
     return sandbox
+
+
+def _factory_git_runner(controller_runner: Runner) -> Runner:
+    """Read retained Git metadata as the worker, not by trusting its repo as mimir."""
+    from .backends.feature_factory import _control_environment
+    from .worker_client import factory_checkout_for_path, run_factory_control
+
+    def run(args: Sequence[str]) -> subprocess.CompletedProcess[str]:
+        if len(args) >= 3 and list(args[:2]) == ["git", "-C"]:
+            binding = factory_checkout_for_path(Path(args[2]))
+            if binding is not None:
+                root, _, _ = binding
+                boundary = root.parent.stat(follow_symlinks=False)
+                if boundary.st_uid != get_identities().mimir_uid or not stat.S_ISDIR(boundary.st_mode):
+                    raise WorklinkError("factory checkout boundary is not controller-owned")
+                # Initial clone setup still belongs to the controller. After
+                # exposure, even read-only Git commands use the worker executor.
+                if stat.S_IMODE(boundary.st_mode) != 0o2700:
+                    result = run_factory_control(root, args, env=_control_environment())
+                    return subprocess.CompletedProcess(
+                        args, result.returncode, result.stdout.decode(), result.stderr.decode(),
+                    )
+        return controller_runner(args)
+
+    return run
 
 
 def _create_factory_sandbox(record: FactoryRunRecord, lease: CheckoutLease) -> Path:
@@ -3872,6 +3906,7 @@ def _create_backend_checkout(
         event_logger=event_logger,
         runner=runner,
         worker_eligible=worker_eligible,
+        factory_worker=worker_eligible and isinstance(backend, FeatureFactoryBackend),
     )
 
 
