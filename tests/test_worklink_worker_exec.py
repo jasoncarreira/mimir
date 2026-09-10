@@ -1497,8 +1497,10 @@ def test_factory_drops_identity_before_payload_exec_or_spawn(
     assert events[-2:] == ["payload-exec", "payload-spawn"]
 
 
+@pytest.mark.parametrize("git_intake", [False, True], ids=["canary", "git-intake"])
 def test_factory_descendant_cannot_write_controller_canary_and_negative_control_is_live(
     monkeypatch: pytest.MonkeyPatch,
+    git_intake: bool,
 ) -> None:
     if sys.platform != "linux" or os.geteuid() != 0:
         pytest.skip("requires Linux root, unavailable in unprivileged sandboxes")
@@ -1567,6 +1569,27 @@ def test_factory_descendant_cannot_write_controller_canary_and_negative_control_
             f"sys.exit(subprocess.run([sys.executable, '-c', {grandchild!r}], "
             "start_new_session=True, timeout=5).returncode)"
         )
+        if git_intake:
+            git = shutil.which("git", path="/usr/bin:/bin")
+            if git is None:
+                pytest.skip("requires system Git")
+            sibling = repo / "untrusted"
+            sibling.mkdir(mode=0o755)
+            for path in (checkout, sibling):
+                subprocess.run([git, "init", str(path)], check=True, capture_output=True)
+                for entry in (path / ".git").rglob("*"):
+                    os.chown(entry, observed.mimir_uid, observed.worklink_gid)
+                os.chown(path / ".git", observed.mimir_uid, observed.worklink_gid)
+            payload = (
+                "import os, subprocess\n"
+                f"assert os.geteuid() == {observed.worklink_uid}\n"
+                f"git = {git!r}\n"
+                "result = subprocess.run([git, 'rev-parse', '--show-toplevel'], capture_output=True, text=True)\n"
+                "assert result.returncode == 0, result.stderr\n"
+                f"assert result.stdout.strip() == {str(checkout)!r}\n"
+                f"result = subprocess.run([git, '-C', {str(sibling)!r}, 'rev-parse', '--show-toplevel'], capture_output=True, text=True)\n"
+                "assert result.returncode != 0 and 'dubious ownership' in result.stderr, result\n"
+            )
 
         async def controller_run():
             backend = LocalSubprocessComputeBackend(
@@ -1627,6 +1650,10 @@ def test_factory_descendant_cannot_write_controller_canary_and_negative_control_
             assert result["stdout"] == f"euid={observed.worklink_uid}\nwrite-denied\n"
             assert result["stderr"] == ""
 
+        if git_intake:
+            run()
+            assert checkout.stat().st_uid == observed.mimir_uid
+            return
         assert_boundary(run())
 
         def controller_identity(checkout_fd, home):

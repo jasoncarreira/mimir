@@ -48,6 +48,9 @@ async def test_factory_projects_native_config_only_for_opencode(
     observed = []
 
     async def execute(command, capability, env, projections, **kwargs):
+        assert env["GIT_CONFIG_COUNT"] == "1"
+        assert env["GIT_CONFIG_KEY_0"] == "safe.directory"
+        assert env["GIT_CONFIG_VALUE_0"] == str(tmp_path / "41-2")
         observed.append((dict(env), {p.path: json.loads(p.document) for p in projections}))
         capability._contained_started(SimpleNamespace(pid=None))
         return CollectedExecutionResult(0, b"", b"", False, False, 0, 0)
