@@ -261,7 +261,7 @@ async def test_factory_projects_native_config_only_for_opencode(
     native = {
         "model": "anthropic/test-model",
         "plugin": [
-            ["opencode-feature-factory@0.8.3", {"profile": "production", "options": {"parallel": 3}}],
+            ["opencode-feature-factory@0.8.4", {"profile": "production", "options": {"parallel": 3}}],
             "opencode-project-memory@0.1.0",
             "opencode-anthropic-auth@0.0.13",
         ],

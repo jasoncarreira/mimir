@@ -6,6 +6,11 @@ All notable changes will land here. Format loosely follows
 
 ## [Unreleased]
 
+- Upgrade `feature-factory` and `opencode-feature-factory` to 0.8.4, which
+  reconciles the `feature` skill and the staged workflow on admission rules:
+  0.8.3 stopped rather than improvising when the skill consumed a leading
+  `--max-retries` as an option while the staged workflow preserved it as
+  request content.
 - Add proxy-hosted ACP Hands with exact-call session grants, a persistent
   per-session Python REPL, profile-owned timeouts, and complete lifecycle cleanup.
 - Upgrade `feature-factory` and `opencode-feature-factory` to 0.8.3 for the ordered
