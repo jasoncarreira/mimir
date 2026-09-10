@@ -1088,6 +1088,10 @@ async def test_factory_environment_cannot_override_worker_home(tmp_path, monkeyp
     from mimir.worklink import compute, identities
 
     monkeypatch.setattr(identities, "get_identities", worker_exec.get_identities)
+    def refuse_connect(*args):
+        pytest.fail("invalid factory environment reached the executor socket")
+
+    monkeypatch.setattr(WorkerClient, "_connect", refuse_connect)
     spec = compute.WorkSpec(
         issue_id=41, attempt=2, repo_url="https://example.test/repo.git",
         base_ref="main", branch="factory-test", prompt="test", rules=None,

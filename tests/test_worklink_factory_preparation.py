@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+from dataclasses import replace
 import inspect
 import json
 import stat
@@ -109,7 +110,7 @@ def test_fresh_factory_checkout_is_unconditionally_worker_eligible():
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("failure", [None, "git", "token", "identity"])
+@pytest.mark.parametrize("failure", [None, "git", "token", "identity", "run_id", "publishing_identity"])
 async def test_recovery_prepares_verified_explicit_identity_before_launch(
     tmp_path, monkeypatch, factory_env, failure,
 ):
@@ -137,6 +138,16 @@ async def test_recovery_prepares_verified_explicit_identity_before_launch(
     backend = FeatureFactoryBackend()
     monkeypatch.setattr(FeatureFactoryBackend, "status", lambda *a, **k: status)
     monkeypatch.setattr(FeatureFactoryBackend, "resume", lambda *a, **k: status)
+    if failure in {"run_id", "publishing_identity"}:
+        work_spec = FeatureFactoryBackend.work_spec
+
+        def mismatched_work_spec(self, order, **kwargs):
+            spec = work_spec(self, order, **kwargs)
+            if failure == "run_id":
+                return replace(spec, backend_config={**spec.backend_config, "run_id": "chainlink-42"})
+            return replace(spec, env={**spec.env, "FACTORY_PUBLISHING_IDENTITY": "other-publisher"})
+
+        monkeypatch.setattr(FeatureFactoryBackend, "work_spec", mismatched_work_spec)
     retained = SimpleNamespace(
         run_id="chainlink-41", session="session-1", launcher=backend.entrypoint,
         controller_phase="parked", repository="owner/repo", attempt=2,
@@ -150,7 +161,9 @@ async def test_recovery_prepares_verified_explicit_identity_before_launch(
         return subprocess.CompletedProcess(argv, 1 if failure == "git" else 0, value, "")
 
     expected = {None: "launch reached", "git": "Git identity preflight failed",
-                "token": "GITHUB_TOKEN", "identity": "identity mismatch"}[failure]
+                "token": "GITHUB_TOKEN", "identity": "identity mismatch",
+                "run_id": "run_id does not match",
+                "publishing_identity": "does not carry the resolved publishing identity"}[failure]
     with pytest.raises((RuntimeError, orchestrator.WorklinkError), match=expected):
         await orchestrator.WorklinkRunner(home=tmp_path, repo=tmp_path)._recover_factory_070(
             issue=orchestrator.IssueContext(41, "epic", "build", {"worklink:epic"}),
@@ -161,6 +174,8 @@ async def test_recovery_prepares_verified_explicit_identity_before_launch(
         )
     if failure:
         launch.assert_not_awaited()
+        if failure in {"run_id", "publishing_identity"}:
+            verify.assert_called_once_with("publisher")
     else:
         client.assert_called_once_with(token="github-token")
         verify.assert_called_once_with("publisher")

@@ -117,6 +117,35 @@ def test_factory_recovery_nofollow_blocks_symlink_swap(factory_checkout, monkeyp
         worker_exec._open_factory_checkout(_request(recovery))
 
 
+@pytest.mark.parametrize("component", ["outer", "sandboxes"])
+def test_factory_recovery_anchors_each_parent(factory_checkout, monkeypatch, component):
+    outer, recovery = factory_checkout
+    expected = recovery.stat()
+    parent = outer if component == "outer" else recovery.parent
+    relative = recovery.relative_to(parent)
+    trigger = ".factory-sandboxes" if component == "outer" else "run-1"
+    real_open = os.open
+    swapped = False
+
+    def raced_open(path, flags, *args, **kwargs):
+        nonlocal swapped
+        if not swapped and Path(path).name == trigger:
+            swapped = True
+            parent.rename(parent.with_name(parent.name + "-original"))
+            replacement = parent / relative
+            replacement.mkdir(parents=True)
+            replacement.chmod(0o2775)
+        return real_open(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(worker_exec.os, "open", raced_open)
+    fd = worker_exec._open_factory_checkout(_request(recovery))
+    try:
+        assert swapped
+        assert os.path.samestat(os.fstat(fd), expected)
+    finally:
+        os.close(fd)
+
+
 @pytest.mark.parametrize("field,value", [
     ("run_id", ""), ("run_id", "../run-1"), ("run_id", "Run-1"),
     ("run_id", "-run"), ("run_id", "run-"), ("run_id", None),
@@ -128,20 +157,27 @@ def test_factory_checkout_rejects_invalid_identity(factory_checkout, field, valu
         worker_exec._open_factory_checkout({**_request(factory_checkout[0]), field: value})
 
 
-def test_factory_checkout_rejects_wrong_worker_uid(factory_checkout):
+def test_factory_checkout_rejects_wrong_worker_uid(factory_checkout, monkeypatch):
+    outer_open = Mock(wraps=worker_exec._open_path_checkout)
+    monkeypatch.setattr(worker_exec, "_open_path_checkout", outer_open)
     with pytest.raises(RuntimeError, match="worker uid"):
         worker_exec._open_factory_checkout({**_request(factory_checkout[0]), "run_uid": os.getuid()})
+    outer_open.assert_not_called()
 
 
 @pytest.mark.parametrize("suffix", ["", "repo", "repo/42-2", "repo/41-3",
+    "bad repo/41-2",
     "repo/41-2/child", "repo/41-2/.factory-sandboxes/other",
     "repo/41-2/wrong/run-1", "repo/41-2/.factory-sandboxes/run-1/child"])
-def test_factory_checkout_rejects_path_boundaries(factory_checkout, suffix):
+def test_factory_checkout_rejects_path_boundaries(factory_checkout, suffix, monkeypatch):
     outer, _ = factory_checkout
     path = outer.parent.parent / suffix
     path.mkdir(parents=True, exist_ok=True)
+    outer_open = Mock(wraps=worker_exec._open_path_checkout)
+    monkeypatch.setattr(worker_exec, "_open_path_checkout", outer_open)
     with pytest.raises(RuntimeError, match="shape"):
         worker_exec._open_factory_checkout(_request(path))
+    outer_open.assert_not_called()
 
 
 @pytest.mark.parametrize("path", ["relative", "\x00", None])
@@ -151,8 +187,35 @@ def test_factory_checkout_rejects_invalid_path(factory_checkout, path):
 
 
 def test_factory_checkout_rejects_outside_root(factory_checkout, tmp_path):
+    outside = tmp_path / "outside" / "repo" / "41-2"
+    outside.mkdir(parents=True)
     with pytest.raises(RuntimeError, match="outside"):
-        worker_exec._open_factory_checkout(_request(tmp_path))
+        worker_exec._open_factory_checkout(_request(outside))
+
+
+@pytest.mark.parametrize("recovery", [False, True])
+def test_factory_checkout_rejects_alias_to_valid_checkout(factory_checkout, tmp_path, recovery):
+    alias = tmp_path / "alias"
+    alias.symlink_to(factory_checkout[int(recovery)], target_is_directory=True)
+    with pytest.raises(RuntimeError, match="shape"):
+        worker_exec._open_factory_checkout(_request(alias))
+
+
+def test_factory_checkout_rejects_bool_uid_even_when_equal(factory_checkout, monkeypatch):
+    monkeypatch.setattr(worker_exec, "get_identities", lambda: SimpleNamespace(
+        mimir_uid=os.getuid(), worklink_uid=1, worklink_gid=os.getgid(),
+    ))
+    with pytest.raises(RuntimeError, match="run_uid identity"):
+        worker_exec._open_factory_checkout({**_request(factory_checkout[0]), "run_uid": True})
+
+
+def test_factory_launch_uses_factory_validation(factory_checkout, monkeypatch):
+    monkeypatch.setattr(worker_exec, "_open_path_checkout", Mock(
+        side_effect=AssertionError("invalid factory run_id reached leaf opener"),
+    ))
+    request = {**_request(factory_checkout[0]), "run_id": "../invalid"}
+    with pytest.raises(RuntimeError, match="factory run_id"):
+        worker_exec._handle_launch(Mock(), request, [-1, -1])
 
 
 @pytest.mark.parametrize("component", ["outer", "sandboxes", "recovery"])
@@ -198,7 +261,11 @@ def test_factory_recovery_owner_group_and_type(factory_checkout, monkeypatch, ow
 
 
 @pytest.mark.parametrize("change", ["missing", "extra", "one-fd", "three-fds", "leaf-op", "stale"])
-def test_factory_launch_exact_contract(factory_checkout, change):
+def test_factory_launch_exact_contract(factory_checkout, change, monkeypatch):
+    for opener in ("_open_factory_checkout", "_open_path_checkout"):
+        monkeypatch.setattr(worker_exec, opener, Mock(
+            side_effect=AssertionError("malformed launch reached checkout opener"),
+        ))
     request = _request(factory_checkout[0])
     fds = [-1, -1]
     if change == "missing":
