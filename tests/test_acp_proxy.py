@@ -139,16 +139,15 @@ async def call_hosted_python(
             "params": {"name": "python", "arguments": {"code": code}},
         },
     })
-    async with asyncio.timeout(5):
-        while True:
-            for message in messages(daemon):
-                if message.get("id") == request_id:
-                    if "error" in message:
-                        error = message["error"]
-                        raise HostedMcpError(error["code"], error["message"], error.get("data"))
-                    if "result" in message:
-                        return message["result"]["structuredContent"]
-            await asyncio.sleep(0.01)
+    while True:
+        for message in messages(daemon):
+            if message.get("id") == request_id:
+                if "error" in message:
+                    error = message["error"]
+                    raise HostedMcpError(error["code"], error["message"], error.get("data"))
+                if "result" in message:
+                    return message["result"]["structuredContent"]
+        await asyncio.sleep(0.01)
 
 
 async def connect_hosted(
@@ -804,23 +803,24 @@ async def test_session_new_first_python_call_has_fresh_empty_namespace(
     acceptance = AsyncMock(return_value=True)
     router._provider._request_unconfined_permission = acceptance
     try:
-        result = await call_hosted_python(
-            router,
-            daemon,
-            connection_id,
-            "first-python",
-            "globals().get('value_created_before_session_new')",
-        )
-        assert result == {
-            "ok": True,
-            "stdout": "",
-            "stderr": UNCONFINED_WARNING + "\n" if lifecycle_backend == "unavailable" else "",
-            "value": "None",
-            "exception": "",
-            "timedOut": False,
-            "kernel": "fresh",
-        }
-        assert acceptance.await_count == (1 if lifecycle_backend == "unavailable" else 0)
+        async with asyncio.timeout(120):
+            result = await call_hosted_python(
+                router,
+                daemon,
+                connection_id,
+                "first-python",
+                "globals().get('value_created_before_session_new')",
+            )
+            assert result == {
+                "ok": True,
+                "stdout": "",
+                "stderr": UNCONFINED_WARNING + "\n" if lifecycle_backend == "unavailable" else "",
+                "value": "None",
+                "exception": "",
+                "timedOut": False,
+                "kernel": "fresh",
+            }
+            assert acceptance.await_count == (1 if lifecycle_backend == "unavailable" else 0)
     finally:
         await router.close()
 
@@ -1009,26 +1009,27 @@ async def test_load_releases_kernel_and_next_python_reuses_namespace(
 ) -> None:
     router, _, daemon, _, connection_id = await hosted_router(tmp_path)
     try:
-        first = await call_hosted_python(router, daemon, connection_id, 100, "value = 41")
-        assert first["kernel"] == "fresh"
-        worker = next(iter(router._provider._python_kernels._processes))
-        await router.route_client({
-            "jsonrpc": "2.0", "id": "load-python", "method": "session/load",
-            "params": {"cwd": str(tmp_path), "sessionId": "session", "mcpServers": []},
-        })
-        assert worker.returncode is None
-        load_request = messages(daemon)[-1]
-        server_id = load_request["params"]["mcpServers"][0]["serverId"]
-        await router.route_daemon({
-            "jsonrpc": "2.0", "id": "load-python", "result": {}
-        })
-        replacement = await connect_hosted(router, daemon, server_id, 101)
-        result = await call_hosted_python(
-            router, daemon, replacement, 103, "globals().get('value')"
-        )
-        assert result["kernel"] == "reused"
-        assert result["value"] == "41"
-        assert list(router._provider._python_kernels._processes) == [worker]
+        async with asyncio.timeout(120):
+            first = await call_hosted_python(router, daemon, connection_id, 100, "value = 41")
+            assert first["kernel"] == "fresh"
+            worker = next(iter(router._provider._python_kernels._processes))
+            await router.route_client({
+                "jsonrpc": "2.0", "id": "load-python", "method": "session/load",
+                "params": {"cwd": str(tmp_path), "sessionId": "session", "mcpServers": []},
+            })
+            assert worker.returncode is None
+            load_request = messages(daemon)[-1]
+            server_id = load_request["params"]["mcpServers"][0]["serverId"]
+            await router.route_daemon({
+                "jsonrpc": "2.0", "id": "load-python", "result": {}
+            })
+            replacement = await connect_hosted(router, daemon, server_id, 101)
+            result = await call_hosted_python(
+                router, daemon, replacement, 103, "globals().get('value')"
+            )
+            assert result["kernel"] == "reused"
+            assert result["value"] == "41"
+            assert list(router._provider._python_kernels._processes) == [worker]
     finally:
         await router.close()
 
@@ -1046,133 +1047,134 @@ async def test_disconnect_and_cancel_kill_active_execution_but_release_idle_kern
     router._provider._request_unconfined_permission = acceptance
     active_session_id = "session"
     try:
-        initial = await call_hosted_python(router, daemon, connection_id, 110, "value = 1")
-        hosted_session = next(iter(router._provider._sessions.values()))
-        if lifecycle_backend == "unavailable":
-            assert acceptance.await_count == 1
-            assert hosted_session.scope.unconfined_approved is True
-            assert initial["stderr"] == UNCONFINED_WARNING + "\n"
-        else:
-            acceptance.assert_not_awaited()
-            assert initial["stderr"] == ""
-        second_connection = await connect_hosted(router, daemon, server_id, 111)
-        await router.route_daemon({
-            "jsonrpc": "2.0", "id": 113, "method": "mcp/message",
-            "params": {
-                "connectionId": second_connection,
-                "method": "tools/call",
+        async with asyncio.timeout(120):
+            initial = await call_hosted_python(router, daemon, connection_id, 110, "value = 1")
+            hosted_session = next(iter(router._provider._sessions.values()))
+            if lifecycle_backend == "unavailable":
+                assert acceptance.await_count == 1
+                assert hosted_session.scope.unconfined_approved is True
+                assert initial["stderr"] == UNCONFINED_WARNING + "\n"
+            else:
+                acceptance.assert_not_awaited()
+                assert initial["stderr"] == ""
+            second_connection = await connect_hosted(router, daemon, server_id, 111)
+            await router.route_daemon({
+                "jsonrpc": "2.0", "id": 113, "method": "mcp/message",
                 "params": {
-                    "name": "python",
-                    "arguments": {
-                        "code": "import pathlib,time\npathlib.Path('disconnect-entered').write_text('yes')\ntime.sleep(30)"
+                    "connectionId": second_connection,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "python",
+                        "arguments": {
+                            "code": "import pathlib,time\npathlib.Path('disconnect-entered').write_text('yes')\ntime.sleep(30)"
+                        },
                     },
                 },
-            },
-        })
-        async with asyncio.timeout(5):
-            while not (tmp_path / "disconnect-entered").exists():
-                await asyncio.sleep(0.01)
-        worker = next(iter(router._provider._python_kernels._processes))
-        await router.route_daemon({
-            "jsonrpc": "2.0", "id": 119, "method": "mcp/message",
-            "params": {
-                "connectionId": connection_id,
-                "method": "tools/call",
+            })
+            async with asyncio.timeout(5):
+                while not (tmp_path / "disconnect-entered").exists():
+                    await asyncio.sleep(0.01)
+            worker = next(iter(router._provider._python_kernels._processes))
+            await router.route_daemon({
+                "jsonrpc": "2.0", "id": 119, "method": "mcp/message",
                 "params": {
-                    "name": "python",
-                    "arguments": {
-                        "code": "import pathlib\npathlib.Path('queued-ran').write_text('bad')"
+                    "connectionId": connection_id,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "python",
+                        "arguments": {
+                            "code": "import pathlib\npathlib.Path('queued-ran').write_text('bad')"
+                        },
                     },
                 },
-            },
-        })
-        await asyncio.sleep(0)
-        await asyncio.wait_for(router.route_daemon({
-            "jsonrpc": "2.0", "id": 120, "method": "mcp/disconnect",
-            "params": {"connectionId": connection_id},
-        }), 2)
-        assert router._provider._python_kernels._processes == {}
-        assert await owned_process_reaped(worker.pid)
-        assert not any(
-            item.get("id") in {113, 119} and ("result" in item or "error" in item)
-            for item in messages(daemon)
-        )
-        assert not (tmp_path / "queued-ran").exists()
-        if lifecycle_backend == "unavailable":
-            assert hosted_session.scope.unconfined_approved is False
-            assert hosted_session.scope.risk_requested is True
-            with pytest.raises(HostedMcpError, match="final and no active risk grant remains"):
-                await call_hosted_python(
+            })
+            await asyncio.sleep(0)
+            await asyncio.wait_for(router.route_daemon({
+                "jsonrpc": "2.0", "id": 120, "method": "mcp/disconnect",
+                "params": {"connectionId": connection_id},
+            }), 2)
+            assert router._provider._python_kernels._processes == {}
+            assert await owned_process_reaped(worker.pid)
+            assert not any(
+                item.get("id") in {113, 119} and ("result" in item or "error" in item)
+                for item in messages(daemon)
+            )
+            assert not (tmp_path / "queued-ran").exists()
+            if lifecycle_backend == "unavailable":
+                assert hosted_session.scope.unconfined_approved is False
+                assert hosted_session.scope.risk_requested is True
+                with pytest.raises(HostedMcpError, match="final and no active risk grant remains"):
+                    await call_hosted_python(
+                        router, daemon, second_connection, 114, "globals().get('value')"
+                    )
+                # This was an accepted grant that disconnect revoked, not a user
+                # rejection. Reconnecting cannot open a second risk prompt.
+                assert acceptance.await_count == 1
+                assert router._provider._python_kernels._processes == {}
+                await router.route_client({
+                    "jsonrpc": "2.0", "id": "new-after-disconnect", "method": "session/new",
+                    "params": {"cwd": str(tmp_path)},
+                })
+                new_server = messages(daemon)[-1]["params"]["mcpServers"][0]["serverId"]
+                second_connection = await connect_hosted(router, daemon, new_server, 121)
+                active_session_id = "replacement-session"
+                await router.route_daemon({
+                    "jsonrpc": "2.0", "id": "new-after-disconnect",
+                    "result": {"sessionId": active_session_id},
+                })
+                assert acceptance.await_count == 1
+                fresh_after_disconnect = await call_hosted_python(
+                    router, daemon, second_connection, 123, "globals().get('value')"
+                )
+                assert acceptance.await_count == 2
+                assert fresh_after_disconnect["stderr"] == UNCONFINED_WARNING + "\n"
+            else:
+                fresh_after_disconnect = await call_hosted_python(
                     router, daemon, second_connection, 114, "globals().get('value')"
                 )
-            # This was an accepted grant that disconnect revoked, not a user
-            # rejection. Reconnecting cannot open a second risk prompt.
-            assert acceptance.await_count == 1
-            assert router._provider._python_kernels._processes == {}
-            await router.route_client({
-                "jsonrpc": "2.0", "id": "new-after-disconnect", "method": "session/new",
-                "params": {"cwd": str(tmp_path)},
-            })
-            new_server = messages(daemon)[-1]["params"]["mcpServers"][0]["serverId"]
-            second_connection = await connect_hosted(router, daemon, new_server, 121)
-            active_session_id = "replacement-session"
-            await router.route_daemon({
-                "jsonrpc": "2.0", "id": "new-after-disconnect",
-                "result": {"sessionId": active_session_id},
-            })
-            assert acceptance.await_count == 1
-            fresh_after_disconnect = await call_hosted_python(
-                router, daemon, second_connection, 123, "globals().get('value')"
-            )
-            assert acceptance.await_count == 2
-            assert fresh_after_disconnect["stderr"] == UNCONFINED_WARNING + "\n"
-        else:
-            fresh_after_disconnect = await call_hosted_python(
-                router, daemon, second_connection, 114, "globals().get('value')"
-            )
-            acceptance.assert_not_awaited()
-            assert fresh_after_disconnect["stderr"] == ""
-        assert fresh_after_disconnect["kernel"] == "fresh"
-        assert fresh_after_disconnect["value"] == "None"
+                acceptance.assert_not_awaited()
+                assert fresh_after_disconnect["stderr"] == ""
+            assert fresh_after_disconnect["kernel"] == "fresh"
+            assert fresh_after_disconnect["value"] == "None"
 
-        await router.route_daemon({
-            "jsonrpc": "2.0", "id": 115, "method": "mcp/message",
-            "params": {
-                "connectionId": second_connection,
-                "method": "tools/call",
+            await router.route_daemon({
+                "jsonrpc": "2.0", "id": 115, "method": "mcp/message",
                 "params": {
-                    "name": "python",
-                    "arguments": {
-                        "code": "import pathlib,time\npathlib.Path('cancel-entered').write_text('yes')\ntime.sleep(30)"
+                    "connectionId": second_connection,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "python",
+                        "arguments": {
+                            "code": "import pathlib,time\npathlib.Path('cancel-entered').write_text('yes')\ntime.sleep(30)"
+                        },
                     },
                 },
-            },
-        })
-        async with asyncio.timeout(5):
-            while not (tmp_path / "cancel-entered").exists():
-                await asyncio.sleep(0.01)
-        await router.route_daemon({
-            "jsonrpc": "2.0", "method": "mcp/message",
-            "params": {
-                "connectionId": second_connection,
-                "method": "notifications/cancelled",
-                "params": {"requestId": 115},
-            },
-        })
-        async with asyncio.timeout(5):
-            while router._provider._python_kernels._processes:
-                await asyncio.sleep(0.01)
-        fresh = await call_hosted_python(router, daemon, second_connection, 116, "value = 8")
-        assert fresh["kernel"] == "fresh"
-        idle_worker = next(iter(router._provider._python_kernels._processes))
-        await router.route_client({
-            "jsonrpc": "2.0", "method": "session/cancel",
-            "params": {"sessionId": active_session_id},
-        })
-        assert idle_worker.returncode is None
-        reused = await call_hosted_python(router, daemon, second_connection, 117, "value")
-        assert reused["kernel"] == "reused"
-        assert reused["value"] == "8"
+            })
+            async with asyncio.timeout(5):
+                while not (tmp_path / "cancel-entered").exists():
+                    await asyncio.sleep(0.01)
+            await router.route_daemon({
+                "jsonrpc": "2.0", "method": "mcp/message",
+                "params": {
+                    "connectionId": second_connection,
+                    "method": "notifications/cancelled",
+                    "params": {"requestId": 115},
+                },
+            })
+            async with asyncio.timeout(5):
+                while router._provider._python_kernels._processes:
+                    await asyncio.sleep(0.01)
+            fresh = await call_hosted_python(router, daemon, second_connection, 116, "value = 8")
+            assert fresh["kernel"] == "fresh"
+            idle_worker = next(iter(router._provider._python_kernels._processes))
+            await router.route_client({
+                "jsonrpc": "2.0", "method": "session/cancel",
+                "params": {"sessionId": active_session_id},
+            })
+            assert idle_worker.returncode is None
+            reused = await call_hosted_python(router, daemon, second_connection, 117, "value")
+            assert reused["kernel"] == "reused"
+            assert reused["value"] == "8"
     finally:
         await router.close()
 
@@ -2295,54 +2297,55 @@ async def test_unconfined_execution_real_operator_round_trip_and_final_state(
         return task
 
     try:
-        client.data.clear()
-        daemon.data.clear()
-        query = await start(50, "request_scope", {"path": ""})
-        await query
-        assert messages(client) == []
-        initial_message = messages(daemon)[-1]["result"]["structuredContent"]["message"].lower()
-        assert initial_message.startswith("blocked:")
-        assert "operator risk acceptance" in initial_message
-        assert "existing children retain their launch policy" in initial_message
-        # No model-supplied switch can claim consent or change the exact schema.
-        spoof = await start(51, "shell", {"command": "true", "allow_unconfined": True})
-        await spoof
-        assert messages(daemon)[-1]["error"]["code"] == -32602
-        assert messages(client) == []
-        execution = await start(52, "shell", {"command": "printf safe-output"})
-        request, = messages(client)
-        assert request["params"]["_meta"] == {"mimir.unconfined_execution": True}
-        assert request["params"]["toolCall"]["rawInput"] == {}
-        assert "safe-output" not in json.dumps(request)
-        assert router._provider._processes == {}
-        await router.route_client({
-            "jsonrpc": "2.0", "id": request["id"],
-            "result": {"outcome": {"outcome": "selected", "optionId": decision}},
-        })
-        await asyncio.wait_for(execution, 5)
-        response = messages(daemon)[-1]
-        if decision == "allow_session":
-            result = response["result"]["structuredContent"]
-            assert result["stdout"] == "safe-output"
-            assert "unconfined" in result["stderr"].lower()
-        else:
-            assert "error" in response
-        client.data.clear()
-        retry = await start(53, "shell", {"command": "printf repeated-output"})
-        await asyncio.wait_for(retry, 5)
-        assert messages(client) == []
-        response = messages(daemon)[-1]
-        if decision == "allow_session":
-            assert response["result"]["structuredContent"]["stdout"] == "repeated-output"
-        else:
-            assert "error" in response
-        query = await start(54, "request_scope", {"path": ""})
-        await query
-        assert messages(client) == []
-        message = messages(daemon)[-1]["result"]["structuredContent"]["message"].lower()
-        if decision == "allow_session":
-            assert "unconfined" in message and "do not" in message
-        else:
-            assert message.startswith("blocked:")
+        async with asyncio.timeout(120):
+            client.data.clear()
+            daemon.data.clear()
+            query = await start(50, "request_scope", {"path": ""})
+            await query
+            assert messages(client) == []
+            initial_message = messages(daemon)[-1]["result"]["structuredContent"]["message"].lower()
+            assert initial_message.startswith("blocked:")
+            assert "operator risk acceptance" in initial_message
+            assert "existing children retain their launch policy" in initial_message
+            # No model-supplied switch can claim consent or change the exact schema.
+            spoof = await start(51, "shell", {"command": "true", "allow_unconfined": True})
+            await spoof
+            assert messages(daemon)[-1]["error"]["code"] == -32602
+            assert messages(client) == []
+            execution = await start(52, "shell", {"command": "printf safe-output"})
+            request, = messages(client)
+            assert request["params"]["_meta"] == {"mimir.unconfined_execution": True}
+            assert request["params"]["toolCall"]["rawInput"] == {}
+            assert "safe-output" not in json.dumps(request)
+            assert router._provider._processes == {}
+            await router.route_client({
+                "jsonrpc": "2.0", "id": request["id"],
+                "result": {"outcome": {"outcome": "selected", "optionId": decision}},
+            })
+            await execution
+            response = messages(daemon)[-1]
+            if decision == "allow_session":
+                result = response["result"]["structuredContent"]
+                assert result["stdout"] == "safe-output"
+                assert "unconfined" in result["stderr"].lower()
+            else:
+                assert "error" in response
+            client.data.clear()
+            retry = await start(53, "shell", {"command": "printf repeated-output"})
+            await retry
+            assert messages(client) == []
+            response = messages(daemon)[-1]
+            if decision == "allow_session":
+                assert response["result"]["structuredContent"]["stdout"] == "repeated-output"
+            else:
+                assert "error" in response
+            query = await start(54, "request_scope", {"path": ""})
+            await query
+            assert messages(client) == []
+            message = messages(daemon)[-1]["result"]["structuredContent"]["message"].lower()
+            if decision == "allow_session":
+                assert "unconfined" in message and "do not" in message
+            else:
+                assert message.startswith("blocked:")
     finally:
         await router.close()

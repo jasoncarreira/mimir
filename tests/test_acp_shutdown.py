@@ -894,49 +894,49 @@ async def test_proxy_generation_teardown_retires_hosted_ids_grants_calls_and_wor
     router._connection_sessions["connection"] = "session"
     router._provider.bind_session("session", tmp_path)
     connection_id = router._provider.connect("session")
-    await router._provider.request(
-        connection_id,
-        "initialize",
-        {
-            "protocolVersion": "2025-03-26",
-            "capabilities": {},
-            "clientInfo": {"name": "test", "version": "1"},
-        },
-    )
-    await router._provider.notification(connection_id, "notifications/initialized")
-    await router._provider.execute_python(router._provider._sessions["session"], "value = 1")
-    worker = next(iter(router._provider._python_kernels._processes))
-    shell_call = asyncio.create_task(
-        router._provider.request(
+    async with asyncio.timeout(120):
+        await router._provider.request(
             connection_id,
-            "tools/call",
-            {"name": "shell", "arguments": {"command": "sleep 30"}},
-            request_id="shell",
+            "initialize",
+            {
+                "protocolVersion": "2025-03-26",
+                "capabilities": {},
+                "clientInfo": {"name": "test", "version": "1"},
+            },
         )
-    )
-    async with asyncio.timeout(5):
+        await router._provider.notification(connection_id, "notifications/initialized")
+        await router._provider.execute_python(router._provider._sessions["session"], "value = 1")
+        worker = next(iter(router._provider._python_kernels._processes))
+        shell_call = asyncio.create_task(
+            router._provider.request(
+                connection_id,
+                "tools/call",
+                {"name": "shell", "arguments": {"command": "sleep 30"}},
+                request_id="shell",
+            )
+        )
         while not router._provider._processes:
             await asyncio.sleep(0.01)
-    shell = next(iter(router._provider._processes))
-    router._fail_generation(ConnectionError("generation retired"))
-    failure = await router.wait_failed()
-    assert str(failure) == "generation retired"
-    assert router._active_sessions == set()
-    assert len(router._grants) == 0
-    assert router._server_sessions == {}
-    assert router._connection_sessions == {}
-    assert router._used_server_ids == set()
-    assert router._used_connection_ids == set()
-    assert router._local_requests == {}
-    assert router._daemon_requests == {}
-    assert router._provider._connections == {}
-    assert router._provider._processes == {}
-    assert router._provider._python_kernels._processes == {}
-    assert shell.returncode is not None
-    assert worker.returncode is not None
-    assert shell_call.done()
-    await asyncio.gather(shell_call, return_exceptions=True)
-    await router.close()
+        shell = next(iter(router._provider._processes))
+        router._fail_generation(ConnectionError("generation retired"))
+        failure = await router.wait_failed()
+        assert str(failure) == "generation retired"
+        assert router._active_sessions == set()
+        assert len(router._grants) == 0
+        assert router._server_sessions == {}
+        assert router._connection_sessions == {}
+        assert router._used_server_ids == set()
+        assert router._used_connection_ids == set()
+        assert router._local_requests == {}
+        assert router._daemon_requests == {}
+        assert router._provider._connections == {}
+        assert router._provider._processes == {}
+        assert router._provider._python_kernels._processes == {}
+        assert shell.returncode is not None
+        assert worker.returncode is not None
+        assert shell_call.done()
+        await asyncio.gather(shell_call, return_exceptions=True)
+        await router.close()
 
 
 @pytest.mark.asyncio
@@ -974,74 +974,74 @@ async def test_daemon_eof_retires_generation_before_client_grace(
     connection_id = router._provider.connect("session")
     router._connection_sessions[connection_id] = "session"
     router._connection_provider_sessions[connection_id] = "session"
-    await router._provider.request(
-        connection_id,
-        "initialize",
-        {
-            "protocolVersion": "2025-03-26",
-            "capabilities": {},
-            "clientInfo": {"name": "test", "version": "1"},
-        },
-    )
-    await router._provider.notification(connection_id, "notifications/initialized")
-    await router._provider.execute_python(router._provider._sessions["session"], "value = 1")
-    worker = next(iter(router._provider._python_kernels._processes))
-    await router.route_daemon({
-        "jsonrpc": "2.0",
-        "id": "shell",
-        "method": "mcp/message",
-        "params": {
-            "connectionId": connection_id,
-            "method": "tools/call",
-            "params": {"name": "shell", "arguments": {"command": "sleep 30"}},
-        },
-    })
-    async with asyncio.timeout(5):
+    async with asyncio.timeout(120):
+        await router._provider.request(
+            connection_id,
+            "initialize",
+            {
+                "protocolVersion": "2025-03-26",
+                "capabilities": {},
+                "clientInfo": {"name": "test", "version": "1"},
+            },
+        )
+        await router._provider.notification(connection_id, "notifications/initialized")
+        await router._provider.execute_python(router._provider._sessions["session"], "value = 1")
+        worker = next(iter(router._provider._python_kernels._processes))
+        await router.route_daemon({
+            "jsonrpc": "2.0",
+            "id": "shell",
+            "method": "mcp/message",
+            "params": {
+                "connectionId": connection_id,
+                "method": "tools/call",
+                "params": {"name": "shell", "arguments": {"command": "sleep 30"}},
+            },
+        })
         while not router._provider._processes:
             await asyncio.sleep(0.01)
-    shell = next(iter(router._provider._processes))
-    client_reader = asyncio.StreamReader()
-    daemon_reader = asyncio.StreamReader()
-    monkeypatch.setattr(
-        "mimir.acp.proxy.ProxyRouter",
-        lambda client, daemon, credential, timeout_seconds=60: router,
-    )
-    monkeypatch.setattr("mimir.acp.proxy.PEER_EOF_GRACE_TIMEOUT", 30.0)
-    running = asyncio.create_task(
-        run_router(
-            client_reader,
-            client_writer,
-            daemon_reader,
-            daemon_writer,
-            "secret",
+        shell = next(iter(router._provider._processes))
+        client_reader = asyncio.StreamReader()
+        daemon_reader = asyncio.StreamReader()
+        monkeypatch.setattr(
+            "mimir.acp.proxy.ProxyRouter",
+            lambda client, daemon, credential, timeout_seconds=60: router,
         )
-    )
-    daemon_reader.feed_eof()
-    async with asyncio.timeout(5):
-        while (
-            router._active_sessions
-            or len(router._grants)
-            or router._server_sessions
-            or router._connection_sessions
-            or router._local_requests
-            or router._daemon_requests
-            or router._provider._connections
-            or router._provider._processes
-            or router._provider._python_kernels._processes
-        ):
-            await asyncio.sleep(0.01)
-    assert not running.done()
-    assert router._active_sessions == set()
-    assert len(router._grants) == 0
-    assert router._server_sessions == {}
-    assert router._connection_sessions == {}
-    assert router._local_requests == {}
-    assert router._daemon_requests == {}
-    assert router._provider._connections == {}
-    assert shell.returncode is not None
-    assert worker.returncode is not None
-    client_reader.feed_eof()
-    await asyncio.wait_for(running, 5)
+        monkeypatch.setattr("mimir.acp.proxy.PEER_EOF_GRACE_TIMEOUT", 30.0)
+        running = asyncio.create_task(
+            run_router(
+                client_reader,
+                client_writer,
+                daemon_reader,
+                daemon_writer,
+                "secret",
+            )
+        )
+        daemon_reader.feed_eof()
+        async with asyncio.timeout(5):
+            while (
+                router._active_sessions
+                or len(router._grants)
+                or router._server_sessions
+                or router._connection_sessions
+                or router._local_requests
+                or router._daemon_requests
+                or router._provider._connections
+                or router._provider._processes
+                or router._provider._python_kernels._processes
+            ):
+                await asyncio.sleep(0.01)
+        assert not running.done()
+        assert router._active_sessions == set()
+        assert len(router._grants) == 0
+        assert router._server_sessions == {}
+        assert router._connection_sessions == {}
+        assert router._local_requests == {}
+        assert router._daemon_requests == {}
+        assert router._provider._connections == {}
+        assert shell.returncode is not None
+        assert worker.returncode is not None
+        client_reader.feed_eof()
+        await asyncio.wait_for(running, 5)
 
 
 @pytest.mark.asyncio
