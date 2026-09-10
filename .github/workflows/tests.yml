@@ -177,6 +177,12 @@ jobs:
         # comment for the rationale.
         run: uv sync --extra dev --extra bench
 
+      - name: Install AppArmor syntax checker (no kernel enforcement required)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y apparmor
+          /usr/sbin/apparmor_parser --version
+
       - name: Run mimir test suite
         # ``testpaths`` is set in pyproject.toml so no explicit path
         # arg needed. Excludes saga/saga/tests/ (workspace member's
@@ -245,6 +251,12 @@ jobs:
 
       - name: Sync dependencies (with dev and bench extras)
         run: uv sync --extra dev --extra bench
+
+      - name: Install AppArmor syntax checker (no kernel enforcement required)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y apparmor
+          /usr/sbin/apparmor_parser --version
 
       - name: Seed controller-owned state the worker must not be able to read
         # Mode 600 inside a mode 700 directory, owned by the runner. The worker uid
@@ -392,6 +404,12 @@ jobs:
       - name: Report what resolved
         run: uv pip list
 
+      - name: Install AppArmor syntax checker (no kernel enforcement required)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y apparmor
+          /usr/sbin/apparmor_parser --version
+
       - name: Run mimir test suite against the fresh resolution
         run: uv run pytest -q --tb=short
 
@@ -436,6 +454,12 @@ jobs:
 
       - name: Sync dependencies (with dev and bench extras)
         run: uv sync --extra dev --extra bench
+
+      - name: Install AppArmor syntax checker (no kernel enforcement required)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y apparmor
+          /usr/sbin/apparmor_parser --version
 
       - name: Run mimir test suite (enforcement on)
         env:
