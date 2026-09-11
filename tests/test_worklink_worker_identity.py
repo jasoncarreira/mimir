@@ -212,6 +212,10 @@ def test_ci_frontend_caches_root_dependencies_and_bounds_build() -> None:
     cache = next(step for step in steps if step.get("uses", "").startswith("actions/cache@"))
     assert cache["with"]["path"] == "node_modules"
     assert "${{ runner.os }}" in cache["with"]["key"]
+    # Use the resolved Node version, so changing setup-node invalidates the tree.
+    assert setup.get("id")
+    node_version = "${{ steps." + setup["id"] + ".outputs.node-version }}"
+    assert node_version in cache["with"]["key"]
     assert "${{ hashFiles('package-lock.json') }}" in cache["with"]["key"]
     assert not cache["with"].get("restore-keys")
     install = next(step for step in steps if step.get("run") == "npm ci")
