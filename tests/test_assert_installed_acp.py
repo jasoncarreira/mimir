@@ -50,6 +50,12 @@ def test_fixture_cleanup_preserves_failure_and_adds_captured_output(
     tmp_path: Path,
 ) -> None:
     ready = tmp_path / "ready"
+    # Cleanup terminates the child as soon as readiness is observed, so publish
+    # the marker only after both streams are flushed, never before either write.
+    # The suite's "Event loop is closed" warning comes from an asyncio
+    # BaseSubprocessTransport finalizer, not this synchronous Popen cleanup.
+    # This test owns no asyncio transport/loop or ACP client stub, so that
+    # unrelated warning does not invalidate these captured-output assertions.
     source = (
         "import pathlib,sys,time; "
         "sys.stdout.write('server-out\\n'); sys.stdout.flush(); "
