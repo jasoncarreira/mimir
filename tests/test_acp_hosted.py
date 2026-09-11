@@ -480,7 +480,12 @@ async def test_shell_and_python_default_timeout_is_60_seconds(
     )
     assert provider._sessions["session"].timeout_seconds == 60
     assert observed[-1] == 60
-    assert shell_deadlines == [60]
+    # The configured budget above is exact. This one is DERIVED: the fixture
+    # reconstructs it as `deadline - clock_read`, and the product built that
+    # deadline as `loop.time() + 60`. For a large monotonic base `(t + 60.0) - t`
+    # is not exactly 60.0 -- macOS observed 59.99999999999997 -- so compare with a
+    # tolerance far tighter than any timing signal this asserts.
+    assert shell_deadlines == [pytest.approx(60, abs=1e-6)]
     await provider.close()
 
 
@@ -521,7 +526,8 @@ async def test_timeout_comes_only_from_selected_profile(
         connection, "tools/call", {"name": "python", "arguments": {"code": "pass"}}
     )
     assert observed[-1] == 7
-    assert shell_deadlines == [7]
+    # Derived the same way as the 60-second case above; see that comment.
+    assert shell_deadlines == [pytest.approx(7, abs=1e-6)]
     with pytest.raises(HostedMcpError, match="Invalid params"):
         await provider.request(
             connection,
