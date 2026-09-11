@@ -289,14 +289,20 @@ was reproduced on Linux under eight CPU burners before and after.
 
 The conversion replaced `subprocess.run(capture_output=True, timeout=30)` with a
 manual `Popen` and a `select` loop that drained **stderr only**, while `stdout`
-stayed a pipe nobody read. The child runs pytest with `-s`, so its stdout is
-unbuffered straight into that pipe, and it keeps producing while faulthandler
-dumps every 0.1 s. Once the 64 KiB stdout buffer fills, the child blocks in
-`write()` and can never reach the frames the loop waits for. On an idle machine
-the dump is small enough never to fill it, which is why it passed in isolation.
+stayed a pipe nobody read. That is a real defect on its own terms: a child which
+fills its 64 KiB stdout buffer blocks in `write()` and can never reach the frames
+the loop waits for.
+
+**The link to the SIGSEGV is a HYPOTHESIS, not an established cause.** Two things
+were over-claimed in the first version of this appendix and are corrected here:
+`-s` disables pytest's capture, it does not make Python's own stdout unbuffered;
+and a blocked `write()` would produce a hang rather than a segfault. No
+diagnostic was captured from the crashed child, and passing stress reruns do not
+establish why the earlier run crashed -- only that the failure did not recur.
 
 Fix: select on BOTH pipes, accumulate each separately, and drop a stream from the
-select set on EOF. Verified 6/6 under load.
+select set on EOF. That is correct independently of the crash question. Verified
+6/6 under eight CPU burners.
 
 **`tests/test_shell_jobs.py::test_backgrounded_grandchild_does_not_block_waiter`
 -- `ProcessLookupError: [Errno 3] No such process`.**

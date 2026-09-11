@@ -2042,14 +2042,19 @@ def _run_synthetic_pytest(
         try:
             if release_on_dump:
                 assert child.stderr is not None and child.stdout is not None
-                # Drain BOTH pipes while waiting. The child runs pytest with -s,
-                # so its stdout is unbuffered straight into this pipe, and it
-                # keeps producing while faulthandler dumps every 0.1 s. Selecting
-                # on stderr alone leaves stdout undrained: once its 64 KiB buffer
-                # fills, the child blocks in write() and can never reach the
-                # frames this loop is waiting for. That deadlock is what made the
-                # test fail under the full -n 6 Linux run while passing in
-                # isolation, where the dump is small enough never to fill it.
+                # Drain BOTH pipes while waiting. Selecting on stderr alone
+                # leaves stdout undrained, and a child that fills its 64 KiB
+                # stdout buffer blocks in write() and can never reach the frames
+                # this loop waits for. Draining both removes that failure mode
+                # regardless of what else is going on.
+                #
+                # HYPOTHESIS, not established: the undrained pipe is also why
+                # this test failed with SIGSEGV on the loaded Linux CI leg while
+                # passing in isolation. A blocked write alone would produce a
+                # hang rather than a segfault, and no diagnostic was captured
+                # from the crashed child, so the causal chain is unproven. What
+                # IS established is that draining both pipes is correct here and
+                # that the test passed 6/6 under eight CPU burners afterwards.
                 waiting = [child.stderr, child.stdout]
                 while not all(frame in prefix for frame in (
                     b"in blocked_worker", b"in test_synthetic_hang",
