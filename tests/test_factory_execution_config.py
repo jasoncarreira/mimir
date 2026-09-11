@@ -309,7 +309,16 @@ async def test_factory_projects_native_config_only_for_opencode(
         assert (await backend.wait(handle, 10)).exit_code == 0
         await backend.cleanup(handle)
     first_env, projections = observed[0]
-    assert first_env["XDG_DATA_HOME"] == str(spec.local_checkout / ".factory-runtime/data")
+    # The data dir is a SIBLING of the checkout, never inside it. opencode
+    # snapshots its working tree with `git add --all`, so a data dir within that
+    # tree makes every snapshot index the previous snapshot's objects -- which
+    # took chainlink #1610 attempt 6 to a 6.2 GiB store and a single `git add`
+    # running 2h08m at 350% CPU. Assert the INVARIANT as well as the path, so a
+    # future edit that moves it back inside fails here rather than in a run.
+    data_home = Path(first_env["XDG_DATA_HOME"])
+    assert data_home == spec.local_checkout.parent / ".factory-runtime" / "data"
+    assert spec.local_checkout not in data_home.parents
+    assert not data_home.is_relative_to(spec.local_checkout)
     assert observed[1][0]["XDG_DATA_HOME"] == first_env["XDG_DATA_HOME"]
     assert observed[1][0]["XDG_CONFIG_HOME"] != first_env["XDG_CONFIG_HOME"]
     assert first_env["PATH"] == "/opt/mimir-opencode/bin:/usr/bin:/bin"

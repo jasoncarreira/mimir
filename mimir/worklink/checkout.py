@@ -501,6 +501,19 @@ def create_isolated_checkout(
         assert identities is not None
         os.chown(path, -1, identities.worklink_gid)
         os.chmod(path, 0o2700)
+        # opencode's data dir (XDG_DATA_HOME) lives HERE, beside the checkout
+        # rather than inside it, because opencode snapshots its working tree and
+        # a data dir within that tree makes each snapshot index the previous
+        # one's objects (chainlink #1610 attempt 6). Pre-created by the
+        # controller because the boundary stays controller-owned at 0o2750 once
+        # the executor transfers the checkout, which leaves the worker group
+        # r-x and unable to create this itself. 0o2770 grants the worklink group
+        # write without widening the boundary, and setgid keeps everything the
+        # worker writes here group-owned. It is swept with the attempt.
+        runtime = path / ".factory-runtime"
+        runtime.mkdir(mode=0o700)
+        os.chown(runtime, -1, identities.worklink_gid)
+        os.chmod(runtime, 0o2770)
         path = path / "checkout"
 
     start_point = _prepare_fresh_base(

@@ -599,8 +599,21 @@ class LocalSubprocessComputeBackend:
                     environment.update(base_worker_environment(identifier))
                     if runtime_path:
                         environment["PATH"] = runtime_path
+                    # MUST stay OUTSIDE the checkout. opencode snapshots its
+                    # working tree with `git add --all` using a git-dir under
+                    # $XDG_DATA_HOME, so a data dir inside that tree makes every
+                    # snapshot index the objects the previous snapshot wrote.
+                    # Observed on chainlink #1610 attempt 6: the store reached
+                    # 6.2 GiB of a 6.8 GiB checkout (the repo itself is 247 MiB),
+                    # and one `git add --all` ran 2h08m at 350% CPU without
+                    # finishing, so the run burned three hours before the first
+                    # spec step. The attempt directory is the right home: still
+                    # per-attempt and still swept with the attempt, but a sibling
+                    # of the tree rather than inside it. checkout.py pre-creates
+                    # it group-writable because the worker runs as `worklink`
+                    # while the attempt boundary stays controller-owned.
                     environment["XDG_DATA_HOME"] = str(
-                        spec.local_checkout / ".factory-runtime" / "data"
+                        spec.local_checkout.parent / ".factory-runtime" / "data"
                     )
                     if Path(command[0]).name == "opencode":
                         from ..opencode_config import _read_object, opencode_worker_documents

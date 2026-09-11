@@ -1545,6 +1545,19 @@ def test_factory_checkout_is_private_inner_clone_regardless_of_coding(tmp_path, 
     assert stat.S_IMODE(lease.path.parent.stat().st_mode) == 0o2700
     assert lease.path.stat().st_uid == os.getuid()
     assert stat.S_IMODE(lease.path.stat().st_mode) == 0o2770
+    # opencode's XDG_DATA_HOME lives beside the checkout, not inside it: a data
+    # dir within the snapshotted tree makes each `git add --all` index the
+    # previous snapshot's objects (chainlink #1610 attempt 6). The controller
+    # must pre-create it group-writable, because the attempt boundary is
+    # tightened to 0o2750 when the executor transfers the checkout, leaving the
+    # worker group r-x and unable to create it.
+    runtime = lease.path.parent / ".factory-runtime"
+    assert runtime.is_dir(), "controller must pre-create the opencode data dir"
+    assert runtime.stat().st_gid == os.getgid()
+    assert stat.S_IMODE(runtime.stat().st_mode) == 0o2770, (
+        "worker group needs write here or opencode cannot create its data dir"
+    )
+    assert runtime.parent == lease.path.parent and runtime != lease.path
     assert "--no-hardlinks" in next(call for call in calls if call[:3] == ["git", "clone", "--local"])
     for source in (repo / ".git/objects").rglob("*"):
         if source.is_file():
