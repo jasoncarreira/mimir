@@ -275,3 +275,29 @@ a short startup deadline or sleep window.
 The feature-factory capability-contract test's `timeout == 5` assertion and its
 injected `TimeoutExpired(..., 5)` hazard are intentionally unchanged: they inspect
 or simulate product policy without waiting for a real five-second subprocess.
+
+
+## Reverted before merge (added 2026-09-11)
+
+Two conversions are NOT in this PR. They were written, failed CI on Linux under
+the full `-n 6` run, and were reverted to `main` rather than shipped or patched
+under time pressure:
+
+- `tests/test_repo_tools.py::test_project_test_retains_builtin_hang_dump_after_stderr_truncation`
+  failed `assert completed.returncode == 0` with **-11 (SIGSEGV)**.
+- `tests/test_shell_jobs.py::test_backgrounded_grandchild_does_not_block_waiter`
+  failed with `ProcessLookupError: [Errno 3] No such process`.
+
+Both pass in isolation on Linux, so they are load-dependent rather than
+platform-dependent, and neither reproduces on macOS locally.
+
+The likely defect in the first is visible in the conversion itself and is worth
+recording so it is not repeated: it replaced
+`subprocess.run(capture_output=True, timeout=30)` with a manual `Popen` plus a
+`select` loop that drains **stderr only**, while `stdout` remained a pipe that is
+never read. A child that fills the stdout buffer then blocks, and a large
+faulthandler dump under load is exactly the case that fills it. Any retry of this
+conversion must drain BOTH pipes, or leave stdout unbuffered to a file.
+
+These two tests therefore keep their original wall-clock bounds and remain
+UNCONVERTED. That is a known gap, not a claim of safety.
