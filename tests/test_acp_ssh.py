@@ -4,6 +4,7 @@ import asyncio
 import io
 import json
 import os
+import signal
 import subprocess
 import sys
 from pathlib import Path
@@ -244,15 +245,16 @@ async def test_stubborn_child_is_killed_and_reaped(monkeypatch: pytest.MonkeyPat
     profile, _ = remote_profile(tmp_path)
     marker = tmp_path / "child.json"
     ssh = _fake_ssh(tmp_path, """
-import json,os,signal,sys,time
-def ignore(*args):
- with open(os.environ['MARKER']) as stream: data=json.load(stream)
- data['terminated']=True
- with open(os.environ['MARKER'],'w') as stream: json.dump(data,stream)
-signal.signal(signal.SIGTERM,ignore)
-with open(os.environ['MARKER'],'w') as stream: json.dump({'pid':os.getpid(),'terminated':False},stream)
+import json,os,signal,time
+signal.signal(signal.SIGTERM,signal.SIG_IGN)
+with open(os.environ['MARKER'],'w') as stream: json.dump({'pid':os.getpid()},stream)
 while True: time.sleep(1)
 """)
+    async def stop_and_check(process: asyncio.subprocess.Process) -> None:
+        await stop_child(process)
+        assert process.returncode == -signal.SIGKILL
+
+    monkeypatch.setattr("mimir.acp.ssh.stop_child", stop_and_check)
     reader = asyncio.StreamReader()
     output = io.BytesIO()
     transport = type("Transport", (), {"close": lambda self: None})()
@@ -263,6 +265,7 @@ while True: time.sleep(1)
         profile, "secret", output, _ssh_path=ssh,
         _environment={"PATH": os.environ.get("PATH", ""), "MARKER": str(marker)},
     ))
+    # The marker acknowledges SIGTERM is ignored; it is never rewritten during cleanup.
     marker_data = None
     for _ in range(200):
         try:
@@ -275,7 +278,6 @@ while True: time.sleep(1)
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
         await asyncio.wait_for(task, 10)
-    assert json.loads(marker.read_text())["terminated"] is True
     with pytest.raises(ProcessLookupError):
         os.kill(pid, 0)
 

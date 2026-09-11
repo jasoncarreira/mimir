@@ -322,6 +322,85 @@ async def test_clean_close_allows_immediate_reconnect(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("request_id", [4242, "duplicate"])
+async def test_duplicate_request_ids_receive_independent_responses(request_id: int | str) -> None:
+    home = _short_home()
+    daemon = AcpDaemon(_bundle(home))
+    release_first = asyncio.Event()
+    calls: list[str] = []
+    notifications: list[str] = []
+
+    class Agent:
+        def on_connect(self, peer: object) -> int:
+            return 1
+
+        async def authenticate(self, method_id: str, **kwargs: object) -> sdk.AuthenticateResponse:
+            return sdk.AuthenticateResponse()
+
+        async def new_session(self, cwd: str, **kwargs: object) -> sdk.NewSessionResponse:
+            calls.append(cwd)
+            if cwd == "/first":
+                await release_first.wait()
+            return sdk.NewSessionResponse(sessionId=cwd)
+
+        async def ext_notification(self, method: str, params: dict[str, object]) -> None:
+            notifications.append(method)
+
+    writer = None
+    try:
+        await daemon.start()
+        daemon._agent = Agent()
+        reader, writer = await asyncio.open_unix_connection(str(daemon.socket_path))
+        writer.write(
+            b'{"jsonrpc":"2.0","id":1,"method":"authenticate",'
+            b'"params":{"methodId":"mimir-web-key"}}\n'
+        )
+        await writer.drain()
+        assert json.loads(await asyncio.wait_for(reader.readline(), 2.0)) == {
+            "jsonrpc": "2.0", "id": 1, "result": {},
+        }
+
+        # Send both before reading either response; the first handler is held
+        # until the second response arrives to pin the lack of ordering.
+        for cwd in ("/first", "/second"):
+            writer.write((json.dumps({
+                "jsonrpc": "2.0", "id": request_id, "method": "session/new",
+                "params": {"cwd": cwd, "mcpServers": []},
+            }) + "\n").encode())
+        await writer.drain()
+        second = json.loads(await asyncio.wait_for(reader.readline(), 2.0))
+        release_first.set()
+        first = json.loads(await asyncio.wait_for(reader.readline(), 2.0))
+        assert second == {
+            "jsonrpc": "2.0", "id": request_id, "result": {"sessionId": "/second"},
+        }
+        assert first == {
+            "jsonrpc": "2.0", "id": request_id, "result": {"sessionId": "/first"},
+        }
+        assert calls == ["/first", "/second"]
+
+        # Authentication fences earlier handlers, including the notification.
+        # Its response also proves the duplicate IDs did not close the peer.
+        writer.write(
+            b'{"jsonrpc":"2.0","method":"_note","params":{}}\n'
+            b'{"jsonrpc":"2.0","id":2,"method":"authenticate",'
+            b'"params":{"methodId":"mimir-web-key"}}\n'
+        )
+        await writer.drain()
+        assert json.loads(await asyncio.wait_for(reader.readline(), 2.0)) == {
+            "jsonrpc": "2.0", "id": 2, "result": {},
+        }
+        assert notifications == ["note"]
+    finally:
+        release_first.set()
+        if writer is not None:
+            writer.close()
+            await writer.wait_closed()
+        await daemon.stop()
+        shutil.rmtree(home)
+
+
+@pytest.mark.asyncio
 async def test_tcp_reset_retires_inflight_peer_and_allows_prompt_reconnect(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
