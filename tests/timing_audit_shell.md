@@ -281,8 +281,17 @@ or simulate product policy without waiting for a real five-second subprocess.
 ## Two conversions that failed CI, and why (added 2026-09-11)
 
 Both failed the Linux `pytest (3.11)` leg under the full `-n 6` run while passing
-in isolation and on macOS. Both are FIXED here rather than reverted; each cause
-was reproduced on Linux under eight CPU burners before and after.
+in isolation and on macOS. Both are FIXED here rather than reverted.
+
+The evidence behind the two fixes is NOT equally strong, and the difference
+matters:
+
+- For the `ProcessLookupError`, the cause was reproduced and the fix verified
+  against it: 1 failure in 6 before, 12/12 after, under eight CPU burners.
+- For the SIGSEGV, only NON-RECURRENCE was shown: 6/6 under the same load after
+  the fix. The crash itself was never reproduced on demand and no diagnostic was
+  captured from the crashed child, so the fix is justified by the undrained-pipe
+  defect being real on its own terms, not by a demonstrated causal link.
 
 **`tests/test_repo_tools.py::test_project_test_retains_builtin_hang_dump_after_stderr_truncation`
 -- `assert completed.returncode == 0` gave -11 (SIGSEGV).**
