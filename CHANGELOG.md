@@ -6,6 +6,15 @@ All notable changes will land here. Format loosely follows
 
 ## [Unreleased]
 
+- Upgrade `feature-factory` and `opencode-feature-factory` to 0.8.5, which makes
+  both skills carry the complete `factory init` invocation, bound to `WORKFLOW.md`
+  by byte equality. 0.8.4 described that command's tail three incompatible ways —
+  a `$RUN_REPO` tail claim, "repository flag last", and a canonical block ending
+  `--repo "$O" --json` — so a driver following the prose built init from a
+  compatibility stem, omitted `--json`, and could not read a successful init's
+  response; the workflow then correctly refused to reinitialize. The canonical
+  block also gained `--max-retries`, and `status --json` now reports
+  `max_retries`.
 - Upgrade `feature-factory` and `opencode-feature-factory` to 0.8.4, which
   reconciles the `feature` skill and the staged workflow on admission rules:
   0.8.3 stopped rather than improvising when the skill consumed a leading
