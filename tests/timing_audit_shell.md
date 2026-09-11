@@ -277,27 +277,38 @@ injected `TimeoutExpired(..., 5)` hazard are intentionally unchanged: they inspe
 or simulate product policy without waiting for a real five-second subprocess.
 
 
-## Reverted before merge (added 2026-09-11)
 
-Two conversions are NOT in this PR. They were written, failed CI on Linux under
-the full `-n 6` run, and were reverted to `main` rather than shipped or patched
-under time pressure:
+## Two conversions that failed CI, and why (added 2026-09-11)
 
-- `tests/test_repo_tools.py::test_project_test_retains_builtin_hang_dump_after_stderr_truncation`
-  failed `assert completed.returncode == 0` with **-11 (SIGSEGV)**.
-- `tests/test_shell_jobs.py::test_backgrounded_grandchild_does_not_block_waiter`
-  failed with `ProcessLookupError: [Errno 3] No such process`.
+Both failed the Linux `pytest (3.11)` leg under the full `-n 6` run while passing
+in isolation and on macOS. Both are FIXED here rather than reverted; each cause
+was reproduced on Linux under eight CPU burners before and after.
 
-Both pass in isolation on Linux, so they are load-dependent rather than
-platform-dependent, and neither reproduces on macOS locally.
+**`tests/test_repo_tools.py::test_project_test_retains_builtin_hang_dump_after_stderr_truncation`
+-- `assert completed.returncode == 0` gave -11 (SIGSEGV).**
 
-The likely defect in the first is visible in the conversion itself and is worth
-recording so it is not repeated: it replaced
-`subprocess.run(capture_output=True, timeout=30)` with a manual `Popen` plus a
-`select` loop that drains **stderr only**, while `stdout` remained a pipe that is
-never read. A child that fills the stdout buffer then blocks, and a large
-faulthandler dump under load is exactly the case that fills it. Any retry of this
-conversion must drain BOTH pipes, or leave stdout unbuffered to a file.
+The conversion replaced `subprocess.run(capture_output=True, timeout=30)` with a
+manual `Popen` and a `select` loop that drained **stderr only**, while `stdout`
+stayed a pipe nobody read. The child runs pytest with `-s`, so its stdout is
+unbuffered straight into that pipe, and it keeps producing while faulthandler
+dumps every 0.1 s. Once the 64 KiB stdout buffer fills, the child blocks in
+`write()` and can never reach the frames the loop waits for. On an idle machine
+the dump is small enough never to fill it, which is why it passed in isolation.
 
-These two tests therefore keep their original wall-clock bounds and remain
-UNCONVERTED. That is a known gap, not a claim of safety.
+Fix: select on BOTH pipes, accumulate each separately, and drop a stream from the
+select set on EOF. Verified 6/6 under load.
+
+**`tests/test_shell_jobs.py::test_backgrounded_grandchild_does_not_block_waiter`
+-- `ProcessLookupError: [Errno 3] No such process`.**
+
+`descendant_alive()` reads `/proc/<pid>/status` and caught only
+`FileNotFoundError`. When a pid disappears between the path lookup and the read,
+Linux reports **ESRCH (`ProcessLookupError`)**, not ENOENT. The race window is
+wide enough to hit on a loaded runner and effectively never on an idle one.
+
+Fix: catch `(FileNotFoundError, ProcessLookupError)` -- both mean "gone".
+Verified 1 failure in 6 before the fix and 12/12 after, under identical load.
+
+The sibling `/proc/self/fd` guard at line ~307 was checked and deliberately left
+alone: that path always reads `self`, so a closed fd gives ENOENT and ESRCH
+cannot arise there.

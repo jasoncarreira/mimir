@@ -6,15 +6,17 @@ drop ``channel_name`` (mimir uses just ``channel_id``)."""
 from __future__ import annotations
 
 import os
-import subprocess
+import queue
 import sys
 import threading
 import time
+from contextlib import ExitStack, contextmanager
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
+import mimir.shell_jobs as shell_jobs
 from mimir.shell_jobs import (
     EVICT_AFTER_SECONDS,
     POST_EXIT_GRACE_SECONDS,
@@ -33,14 +35,64 @@ def _make_registry(tmp_path: Path) -> ShellJobRegistry:
     return ShellJobRegistry(jobs_dir=tmp_path / "shell-jobs")
 
 
-def _wait_until_done(registry: ShellJobRegistry, job_id: str, timeout: float = 30.0) -> None:
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        job = registry.get(job_id)
-        if job is not None and job.exit_code is not None:
-            return
-        time.sleep(0.05)
-    raise AssertionError(f"job {job_id} did not exit within {timeout}s")
+@contextmanager
+def _held_job(registry: ShellJobRegistry, name: str):
+    """Hold a real child until release; pytest-timeout bounds the whole protocol."""
+    ready_path = registry.jobs_dir / f"{name}.ready"
+    release_path = registry.jobs_dir / f"{name}.release"
+    os.mkfifo(ready_path)
+    os.mkfifo(release_path)
+    ready = os.open(ready_path, os.O_RDWR)
+    release = os.open(release_path, os.O_RDWR)
+    completed = threading.Event()
+    job = None
+    try:
+        job = registry.spawn(
+            name,
+            argv=[sys.executable, "-c",
+                  "import sys; "
+                  "release = open(sys.argv[2], 'rb', buffering=0); "
+                  "ready = open(sys.argv[1], 'wb', buffering=0); "
+                  "ready.write(b'R'); release.read(1)",
+                  str(ready_path), str(release_path)],
+            on_complete=lambda _job: completed.set(),
+        )
+        assert os.read(ready, 1) == b"R"
+        assert job._process.poll() is None
+        yield job
+    finally:
+        os.write(release, b"X")
+        try:
+            if job is not None:
+                job._process.wait()
+                completed.wait()
+                assert job._process.poll() == 0
+                assert job._process.stdout.closed and job._process.stderr.closed
+        finally:
+            if job is not None:
+                job._process.stdout.close()
+                job._process.stderr.close()
+            os.close(ready)
+            os.close(release)
+            ready_path.unlink()
+            release_path.unlink()
+
+
+def _wait_until_done(registry: ShellJobRegistry, job_id: str) -> None:
+    """Join only this job's lifecycle; pytest bounds the whole protocol."""
+    job = registry.get(job_id)
+    assert job is not None
+    process = job._process
+    assert process is not None
+    process.wait()
+    names = {f"shelljob-{role}-{job_id}" for role in ("wait", "out", "err")}
+    owned = [thread for thread in threading.enumerate() if thread.name in names]
+    for thread in owned:
+        thread.join()
+    assert not any(thread.is_alive() for thread in owned)
+    assert process.poll() is not None
+    assert job.exit_code == process.returncode
+    assert process.stdout.closed and process.stderr.closed
 
 
 # ─── basic spawn + capture ────────────────────────────────────────────
@@ -64,7 +116,7 @@ def test_redaction_precedes_capture_and_tail_limits(tmp_path, monkeypatch, limit
         pid=123,
         stdout=ChunkedPipe(payload),
         stderr=ChunkedPipe(payload),
-        wait=lambda: (released.wait(10), 0)[1],
+        wait=lambda: (released.wait(), 0)[1],
     )
     monkeypatch.setattr("mimir.shell_jobs.subprocess.Popen", lambda *a, **kw: proc)
     monkeypatch.setattr("mimir.shell_jobs.SHELL_JOB_OUTPUT_MAX_BYTES_PER_STREAM", limit)
@@ -79,7 +131,7 @@ def test_redaction_precedes_capture_and_tail_limits(tmp_path, monkeypatch, limit
         redact_values=("", "private-suffix", secret),
     )
     released.set()
-    assert completed.wait(10)
+    completed.wait()
     expected = b"header\n[REDACTED]\n[REDACTED]\n"[:limit]
     assert job.stdout_path.read_bytes() == expected
     assert job.stderr_path.read_bytes() == expected
@@ -101,14 +153,14 @@ def test_running_output_withholds_split_secret(tmp_path, monkeypatch):
         def read(self, size=-1):
             if self.tell() == 7:
                 paused.set()
-                assert resume.wait(10)
+                resume.wait()
             return super().read(7)
 
     proc = SimpleNamespace(
         pid=123,
         stdout=PausedPipe(b"private-secret"),
         stderr=io.BytesIO(),
-        wait=lambda: (resume.wait(10), 0)[1],
+        wait=lambda: (resume.wait(), 0)[1],
     )
     monkeypatch.setattr("mimir.shell_jobs.subprocess.Popen", lambda *a, **kw: proc)
     registry = _make_registry(tmp_path)
@@ -117,11 +169,11 @@ def test_running_output_withholds_split_secret(tmp_path, monkeypatch):
         on_complete=lambda job: completed.set(),
     )
     try:
-        assert paused.wait(10)
+        paused.wait()
         assert registry.read_job_output(job)["stdout_tail"] == ""
     finally:
         resume.set()
-    assert completed.wait(10)
+    completed.wait()
     assert registry.read_job_output(job)["stdout_tail"] == "[REDACTED]"
 
 
@@ -174,7 +226,8 @@ def test_redacted_capture_error_does_not_log_values(tmp_path, monkeypatch, caplo
         "safe", argv=[sys.executable, "-c", "import sys; print('out'); print('err', file=sys.stderr)"],
         redact_values=(secret,), on_complete=on_complete,
     )
-    assert completed.wait(30)
+    _wait_until_done(registry, job.job_id)
+    assert completed.is_set()
     assert fired == [job.job_id]
     assert job.exit_code == 0
     assert job.stdout_truncated and job.stderr_truncated
@@ -203,9 +256,8 @@ def test_redacted_callback_error_does_not_log_values(tmp_path, caplog):
         "safe", argv=[sys.executable, "-c", "pass"],
         redact_values=(secret,), on_complete=on_complete,
     )
-    assert invoked.wait(30)
-    # Invocation precedes exception logging; wait for this job's waiter to finish.
-    waiter_threads[0].join(timeout=30)
+    _wait_until_done(registry, job.job_id)
+    assert invoked.is_set()
     assert not waiter_threads[0].is_alive()
     assert fired == [job.job_id]
     assert job.exit_code == 0
@@ -235,52 +287,26 @@ def test_spawn_captures_stdout_and_stderr(tmp_path: Path):
 
 @pytest.mark.skipif(not Path("/proc").is_dir(), reason="requires procfs")
 def test_finished_jobs_release_all_pipe_descriptors(tmp_path: Path):
-    """Count in an isolated process so unrelated suite activity cannot move FDs."""
-    script = """
-import os
-import sys
-import time
-from pathlib import Path
-from mimir.shell_jobs import ShellJobRegistry
+    """Track the owned pipe identities, not an ambient descriptor-count delta."""
+    registry = _make_registry(tmp_path)
+    with ExitStack() as stack:
+        jobs = [stack.enter_context(_held_job(registry, f"fd-{i}")) for i in range(10)]
+        job_pipes = {
+            os.readlink(f"/proc/self/fd/{stream.fileno()}")
+            for job in jobs
+            for stream in (job._process.stdout, job._process.stderr)
+        }
+        assert len(job_pipes) == 20
 
-registry = ShellJobRegistry(Path(sys.argv[1]))
-baseline = len(os.listdir('/proc/self/fd'))
-# Keep every child alive until its two pipe identities have been captured.
-jobs = [registry.spawn('ok', argv=[sys.executable, '-c', 'import time; time.sleep(0.2)']) for _ in range(10)]
-job_pipes = {
-    os.readlink(f'/proc/self/fd/{stream.fileno()}')
-    for job in jobs
-    for stream in (job._process.stdout, job._process.stderr)
-}
-deadline = time.time() + 10
-while any(job.exit_code is None for job in jobs) and time.time() < deadline:
-    time.sleep(0.01)
-assert all(job.exit_code == 0 for job in jobs)
-assert all(job._process.stdout.closed and job._process.stderr.closed for job in jobs)
-
-def open_fd_targets():
+    # _held_job asserts closure at completion, before its defensive cleanup.
+    assert all(job.exit_code == 0 for job in jobs)
     targets = set()
-    for name in os.listdir('/proc/self/fd'):
+    for name in os.listdir("/proc/self/fd"):
         try:
-            targets.add(os.readlink(f'/proc/self/fd/{name}'))
+            targets.add(os.readlink(f"/proc/self/fd/{name}"))
         except FileNotFoundError:
             pass
-    return targets
-
-assert job_pipes.isdisjoint(open_fd_targets())
-# A completion wakes the registry sweeper, whose glob briefly opens the jobs
-# directory. Wait out that transient FD instead of racing it (Python 3.11 CI
-# exposed the race); a permanently leaked descriptor still fails this bound.
-deadline = time.time() + 2
-while len(os.listdir('/proc/self/fd')) != baseline and time.time() < deadline:
-    time.sleep(0.01)
-assert len(os.listdir('/proc/self/fd')) == baseline
-"""
-    subprocess.run(
-        [sys.executable, "-c", script, str(tmp_path / "fd-jobs")],
-        check=True,
-        timeout=30,
-    )
+    assert job_pipes.isdisjoint(targets)
 
 
 def test_output_write_failure_keeps_draining_and_completes(
@@ -317,17 +343,22 @@ def test_output_write_failure_keeps_draining_and_completes(
     monkeypatch.setattr("mimir.shell_jobs.MAX_LIVE_SHELL_JOBS", 1)
     registry = _make_registry(tmp_path)
     completed = threading.Event()
+    produced = tmp_path / "produced"
     job = registry.spawn(
         "large producer",
         argv=[
             sys.executable,
             "-c",
-            "import os; [os.write(1, b'x' * 4096) for _ in range(64)]",
+            "import os, sys; from pathlib import Path; "
+            "count = sum(os.write(1, b'x' * 4096) for _ in range(64)); "
+            "Path(sys.argv[1]).write_text(str(count))", str(produced),
         ],
         on_complete=lambda _job: completed.set(),
     )
 
-    assert completed.wait(timeout=30), "write failure wedged the child"
+    _wait_until_done(registry, job.job_id)
+    assert completed.is_set()
+    assert produced.read_text() == "262144"
     assert failed_writes, "the injected write failure did not execute"
     assert job.exit_code == 0
     assert job._process is not None and job._process.poll() == 0
@@ -339,8 +370,8 @@ def test_output_write_failure_keeps_draining_and_completes(
     # Completion releases the sole live-job slot and makes the record evictable.
     next_job = registry.spawn("true", argv=[sys.executable, "-c", "pass"])
     _wait_until_done(registry, next_job.job_id)
-    job.finished_at = time.time() - EVICT_AFTER_SECONDS
-    assert registry._evict_stale()[0].job_id == job.job_id
+    evicted = registry._evict_stale(now=job.finished_at + EVICT_AFTER_SECONDS)
+    assert evicted[0].job_id == job.job_id
 
 
 def test_output_write_bound_discards_excess_without_wedging(
@@ -352,19 +383,24 @@ def test_output_write_bound_discards_excess_without_wedging(
     )
     registry = _make_registry(tmp_path)
     completed = threading.Event()
+    produced = tmp_path / "produced"
     job = registry.spawn(
         "bounded producer",
         argv=[
             sys.executable,
             "-c",
-            "import os; "
-            "[(os.write(1, b'y' * 4096), os.write(2, b'z' * 4096)) "
-            "for _ in range(64)]",
+            "import os, sys; from pathlib import Path; "
+            "counts = [(os.write(1, b'y' * 4096), os.write(2, b'z' * 4096)) "
+            "for _ in range(64)]; "
+            "Path(sys.argv[1]).write_text(str(tuple(map(sum, zip(*counts)))))",
+            str(produced),
         ],
         on_complete=lambda _job: completed.set(),
     )
 
-    assert completed.wait(timeout=30), "output cap wedged the child"
+    _wait_until_done(registry, job.job_id)
+    assert completed.is_set()
+    assert produced.read_text() == "(262144, 262144)"
     assert job.exit_code == 0
     assert job.stdout_path.stat().st_size == limit
     assert job.stderr_path.stat().st_size == limit
@@ -409,11 +445,8 @@ def test_on_complete_fires_after_exit(tmp_path: Path):
         argv=["bash", "-c", "echo done"],
         on_complete=on_complete,
     )
-    # 30s timeout gives headroom for CI runner variance — PR #136 CI
-    # caught a 3.12-only flake in a sibling test at the original 5s
-    # threshold. proc.wait → drainer thread → callback chain is normally
-    # sub-second; 30s only affects wall-clock on legitimate test failures.
-    assert event.wait(timeout=30.0), "on_complete didn't fire"
+    _wait_until_done(registry, job.job_id)
+    assert event.is_set(), "on_complete didn't fire"
     assert fired == [job.job_id]
     # Snapshot has both fields populated by the time the callback runs.
     snap = job.snapshot()
@@ -432,13 +465,8 @@ def test_on_complete_error_isolated_from_registry(tmp_path: Path):
         raise RuntimeError("boom")
 
     job1 = registry.spawn("true", argv=["bash", "-c", "true"], on_complete=bad_callback)
-    # 30s timeout — see test_on_complete_fires_when_subprocess_exits
-    # for the CI-runner-variance rationale.
-    assert finished.wait(timeout=30.0)
-    # Brief wait for the waiter thread to handle the post-callback
-    # registry update — exit_code is set BEFORE the callback fires, so
-    # the job is already marked done.
     _wait_until_done(registry, job1.job_id)
+    assert finished.is_set()
     # And the registry can still spawn / read.
     job2 = registry.spawn("echo two", argv=["bash", "-c", "echo two"])
     _wait_until_done(registry, job2.job_id)
@@ -452,14 +480,14 @@ def test_on_complete_runs_for_nonzero_exit(tmp_path: Path):
     def on_complete(job):
         fired.set()
 
-    registry.spawn(
+    job = registry.spawn(
         "exit-3",
         argv=["bash", "-c", "exit 3"],
         on_complete=on_complete,
     )
-    # 30s timeout — see test_on_complete_fires_when_subprocess_exits
-    # for the CI-runner-variance rationale.
-    assert fired.wait(timeout=30.0), "on_complete must fire on nonzero exits"
+    _wait_until_done(registry, job.job_id)
+    assert fired.is_set(), "on_complete must fire on nonzero exits"
+    assert job.exit_code == 3
 
 
 # ─── channel_id captured at spawn time ────────────────────────────────
@@ -553,16 +581,11 @@ def test_cwd_kwarg_honored_by_subprocess(tmp_path: Path):
 
 def test_running_jobs_visible_immediately(tmp_path: Path):
     registry = _make_registry(tmp_path)
-    job = registry.spawn(
-        "sleep-job",
-        argv=["bash", "-c", "sleep 2"],
-    )
-    # Visible right away — even though the visibility threshold for
-    # exited jobs is 10s, running jobs surface immediately.
-    visible = registry.visible_jobs()
-    assert any(j.job_id == job.job_id for j in visible)
-    running = registry.running_jobs()
-    assert any(j.job_id == job.job_id for j in running)
+    with _held_job(registry, "visible") as job:
+        visible = registry.visible_jobs()
+        assert any(j.job_id == job.job_id for j in visible)
+        running = registry.running_jobs()
+        assert any(j.job_id == job.job_id for j in running)
 
 
 def test_short_finished_job_not_visible_after_grace(tmp_path: Path):
@@ -571,9 +594,8 @@ def test_short_finished_job_not_visible_after_grace(tmp_path: Path):
     registry = _make_registry(tmp_path)
     job = registry.spawn("quick", argv=["bash", "-c", "echo ok"])
     _wait_until_done(registry, job.job_id)
-    # Walk the clock forward so the visibility-threshold + grace logic
-    # treats this job as past-the-grace-window.
-    later = time.time() + POST_EXIT_GRACE_SECONDS + UI_VISIBILITY_THRESHOLD_SECONDS + 5
+    job.started_at = job.finished_at - 0.1
+    later = job.finished_at + POST_EXIT_GRACE_SECONDS + UI_VISIBILITY_THRESHOLD_SECONDS
     visible = registry.visible_jobs(now=later)
     assert not any(j.job_id == job.job_id for j in visible)
 
@@ -584,7 +606,7 @@ def test_finished_job_persists_in_all_jobs_after_grace(tmp_path: Path):
     registry = _make_registry(tmp_path)
     job = registry.spawn("persisted", argv=["bash", "-c", "echo persisted"])
     _wait_until_done(registry, job.job_id)
-    later = time.time() + 9999
+    later = job.finished_at + POST_EXIT_GRACE_SECONDS + UI_VISIBILITY_THRESHOLD_SECONDS
     assert any(j.job_id == job.job_id for j in registry.visible_jobs(now=later)) is False
     assert any(j.job_id == job.job_id for j in registry.all_jobs()) is True
     assert "persisted" in registry.read_job_output(job)["stdout_tail"]
@@ -691,24 +713,29 @@ def test_shell_job_snapshots_running_scope_filters(tmp_path: Path):
         channel_id="test-channel", canonical_principal="tester",
         principal="tester", is_service=False,
     )
-    finished = registry.spawn("done", argv=["bash", "-c", "true"])
-    _wait_until_done(registry, finished.job_id)
-    sleeping = registry.spawn("sleeping", argv=["bash", "-c", "sleep 2"])
-    for job in (finished, sleeping):
-        job.channel_id = auth.channel_id
-        job.auth_context = auth
-
-    running_snaps = shell_job_snapshots(
-        registry, auth_context=auth, scope="running",
+    completed = threading.Event()
+    finished = registry.spawn(
+        "done", argv=["bash", "-c", "true"],
+        on_complete=lambda _job: completed.set(),
     )
-    running_ids = [s["job_id"] for s in running_snaps]
-    assert sleeping.job_id in running_ids
-    assert finished.job_id not in running_ids
+    completed.wait()
+    assert finished.exit_code == 0
+    with _held_job(registry, "running") as running:
+        for job in (finished, running):
+            job.channel_id = auth.channel_id
+            job.auth_context = auth
 
-    all_snaps = shell_job_snapshots(registry, auth_context=auth, scope="all")
-    all_ids = [s["job_id"] for s in all_snaps]
-    assert sleeping.job_id in all_ids
-    assert finished.job_id in all_ids
+        running_snaps = shell_job_snapshots(
+            registry, auth_context=auth, scope="running",
+        )
+        running_ids = [s["job_id"] for s in running_snaps]
+        assert running.job_id in running_ids
+        assert finished.job_id not in running_ids
+
+        all_snaps = shell_job_snapshots(registry, auth_context=auth, scope="all")
+        all_ids = [s["job_id"] for s in all_snaps]
+        assert running.job_id in all_ids
+        assert finished.job_id in all_ids
 
 
 def test_shell_job_snapshots_returns_empty_when_no_registry():
@@ -785,7 +812,7 @@ def test_evict_stale_removes_old_finished_job_and_unlinks_files(tmp_path: Path):
     assert job.stderr_path.exists()
 
     # Wind the clock forward past the eviction window.
-    stale_now = time.time() + EVICT_AFTER_SECONDS + 1
+    stale_now = job.finished_at + EVICT_AFTER_SECONDS
     evicted = registry._evict_stale(now=stale_now)
 
     assert len(evicted) == 1
@@ -802,16 +829,12 @@ def test_evict_stale_preserves_running_job(tmp_path: Path):
     """A running job (exit_code is None) must never be evicted, regardless
     of how far the clock advances."""
     registry = _make_registry(tmp_path)
-    job = registry.spawn("sleep-long", argv=["bash", "-c", "sleep 60"])
+    with _held_job(registry, "preserved") as job:
+        far_future = time.time() + EVICT_AFTER_SECONDS * 10
+        evicted = registry._evict_stale(now=far_future)
 
-    far_future = time.time() + EVICT_AFTER_SECONDS * 10
-    evicted = registry._evict_stale(now=far_future)
-
-    assert len(evicted) == 0
-    assert registry.get(job.job_id) is not None
-    # Clean up the sleeping process.
-    if job._process is not None:
-        job._process.kill()
+        assert len(evicted) == 0
+        assert registry.get(job.job_id) is not None
 
 
 def test_evict_stale_preserves_recently_finished_job(tmp_path: Path):
@@ -821,8 +844,7 @@ def test_evict_stale_preserves_recently_finished_job(tmp_path: Path):
     job = registry.spawn("echo keep-me", argv=["bash", "-c", "echo keep-me"])
     _wait_until_done(registry, job.job_id)
 
-    # Use current time — job just finished, far from the eviction window.
-    evicted = registry._evict_stale(now=time.time())
+    evicted = registry._evict_stale(now=job.finished_at)
 
     assert len(evicted) == 0
     assert registry.get(job.job_id) is not None
@@ -851,35 +873,55 @@ def test_registry_startup_reclaims_stale_restart_residue(tmp_path: Path):
 def test_scheduled_eviction_does_not_require_later_spawn(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ):
-    monkeypatch.setattr("mimir.shell_jobs.EVICT_AFTER_SECONDS", 0.05)
+    ticks = queue.Queue()
+    waiting = queue.Queue()
+    clock = [1000.0]
+
+    class ManualCondition:
+        # The test serializes registry changes before issuing each sweep tick.
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            pass
+
+        def notify(self):
+            pass
+
+        def wait(self, timeout=None):
+            waiting.put(timeout)
+            if ticks.get() == "stop":
+                raise StopIteration
+
+    class SteppedSweeper(shell_jobs._RegistrySweeper):
+        def _run(self):
+            try:
+                super()._run()
+            except StopIteration:
+                pass
+
+    sweeper = SteppedSweeper()
+    sweeper._condition = ManualCondition()
+    monkeypatch.setattr(shell_jobs, "_REGISTRY_SWEEPER", sweeper)
+    monkeypatch.setattr(shell_jobs, "time", SimpleNamespace(time=lambda: clock[0]))
     registry = _make_registry(tmp_path)
-    job = registry.spawn("done", argv=[sys.executable, "-c", "pass"])
+    try:
+        waiting.get()
+        job = registry.spawn("done", argv=[sys.executable, "-c", "pass"])
+        _wait_until_done(registry, job.job_id)
+        assert registry.get(job.job_id) is job
+        assert job.stdout_path.exists() and job.stderr_path.exists()
 
-    # Poll for the whole postcondition, never for an intermediate state. Two
-    # separate races make an intermediate assertion unreliable here: the sweep
-    # can evict the job before a poll observes its exit code (after which
-    # get() returns None forever and a wait-for-exit spins to its deadline),
-    # and _evict_stale pops the registry entry under its lock but unlinks the
-    # output files outside it, so removal and unlink are not simultaneous.
-    #
-    # Only a job with both exit_code and finished_at set is eligible for
-    # eviction, so reaching this postcondition also establishes that the job
-    # ran to completion -- and no second spawn() occurs, which is the property
-    # under test.
-    def evicted() -> bool:
-        return (
-            registry.get(job.job_id) is None
-            and not job.stdout_path.exists()
-            and not job.stderr_path.exists()
-        )
-
-    deadline = time.time() + 30.0
-    while not evicted() and time.time() < deadline:
-        time.sleep(0.02)
-
-    assert registry.get(job.job_id) is None
-    assert not job.stdout_path.exists()
-    assert not job.stderr_path.exists()
+        clock[0] = job.finished_at + EVICT_AFTER_SECONDS
+        ticks.put("sweep")
+        waiting.get()  # The entire sweep, including unlinking, has returned.
+        assert registry.get(job.job_id) is None
+        assert not job.stdout_path.exists()
+        assert not job.stderr_path.exists()
+    finally:
+        ticks.put("stop")
+        sweeper._thread.join()
+        assert not sweeper._thread.is_alive()
 
 
 def test_spawn_failure_removes_opened_output_files(tmp_path: Path):
@@ -890,16 +932,19 @@ def test_spawn_failure_removes_opened_output_files(tmp_path: Path):
     assert list(registry.jobs_dir.iterdir()) == []
 
 
-def test_spawn_triggers_eviction_of_old_jobs(tmp_path: Path):
+def test_spawn_triggers_eviction_of_old_jobs(tmp_path: Path, monkeypatch):
     """spawn() must call _evict_stale so stale entries are removed as a
     side-effect of adding new work (no separate background thread needed)."""
+    # Only eager eviction is under test; a background sweep must not satisfy it.
+    monkeypatch.setattr(shell_jobs, "_REGISTRY_SWEEPER", SimpleNamespace(
+        register=lambda registry: None, wake=lambda: None,
+    ))
+    clock = [1000.0]
+    monkeypatch.setattr(shell_jobs, "time", SimpleNamespace(time=lambda: clock[0]))
     registry = _make_registry(tmp_path)
-
-    # Spawn a job, wait for it to finish, then age its finished_at past
-    # the eviction window by patching the field directly.
     old_job = registry.spawn("echo old", argv=["bash", "-c", "echo old"])
     _wait_until_done(registry, old_job.job_id)
-    old_job.finished_at = time.time() - (EVICT_AFTER_SECONDS + 10)
+    clock[0] = old_job.finished_at + EVICT_AFTER_SECONDS
 
     # A new spawn must trigger eviction of the old job.
     new_job = registry.spawn("echo new", argv=["bash", "-c", "echo new"])
@@ -912,25 +957,94 @@ def test_spawn_triggers_eviction_of_old_jobs(tmp_path: Path):
 # ─── chainlink #387: stuck-job leak + job cap ──────────────────────────
 
 
+@pytest.mark.skipif(not Path("/proc").is_dir(), reason="requires procfs for descendant liveness")
 def test_backgrounded_grandchild_does_not_block_waiter(tmp_path: Path, monkeypatch):
     """chainlink #387: a job whose process backgrounds a grandchild that keeps
     the stdout/stderr pipe open must still be marked finished within the bounded
     drain-join window — not stuck status=running forever (which pre-fix also
     leaked the job + its drainer threads + pipe FDs)."""
-    monkeypatch.setattr("mimir.shell_jobs.DRAIN_JOIN_TIMEOUT_SECONDS", 0.5)
     registry = _make_registry(tmp_path)
+    job_id = registry._make_job_id()
+    monkeypatch.setattr(registry, "_make_job_id", lambda: job_id)
     waiter_done = threading.Event()
-    # Parent exits 0 immediately but backgrounds a sleeper that inherits the
-    # pipe, so the drainers can't EOF on the parent's exit.
-    job = registry.spawn(
-        "bg",
-        argv=["sh", "-c", "sleep 3 & exit 0"],
-        on_complete=lambda _job: waiter_done.set(),
-    )
-    # Pre-fix the waiter would block ~3s on the unbounded drainer join; the fix
-    # marks it finished within the 0.5s bounded window + pipe close.
-    assert waiter_done.wait(timeout=2.5), "waiter remained blocked by grandchild pipes"
-    assert job.exit_code == 0
+    joins = []
+    real_join = threading.Thread.join
+
+    def observe_join(thread, timeout=None):
+        if threading.current_thread().name == f"shelljob-wait-{job_id}":
+            joins.append(timeout)
+            # An unbounded-join regression is an assertion failure, not a hang.
+            # Normal bounded joins still execute against the real held pipes.
+            if timeout is None:
+                return
+        return real_join(thread, timeout)
+
+    monkeypatch.setattr(threading.Thread, "join", observe_join)
+    ready_path, release_path = tmp_path / "ready", tmp_path / "release"
+    os.mkfifo(ready_path)
+    os.mkfifo(release_path)
+    ready = os.open(ready_path, os.O_RDWR)
+    release = os.open(release_path, os.O_RDWR)
+    grandchild = None
+    job = None
+    owned = []
+
+    def descendant_alive():
+        try:
+            status = Path(f"/proc/{grandchild}/status").read_text()
+        except (FileNotFoundError, ProcessLookupError):
+            # A pid that disappears between the path lookup and the read reports
+            # ESRCH (ProcessLookupError), not ENOENT. Both mean "gone". Catching
+            # only FileNotFoundError made this test fail as
+            # `ProcessLookupError: [Errno 3] No such process` under load -- the
+            # race window is wide enough to hit on a loaded Linux runner and
+            # effectively never on an idle one, which is why it passed in
+            # isolation and on macOS while failing the full -n 6 CI leg.
+            return False
+        return not any(
+            line.startswith("State:") and "Z" in line for line in status.splitlines()
+        )
+
+    try:
+        job = registry.spawn(
+            "bg", argv=[sys.executable, "-c",
+                "import os, sys\n"
+                "if os.fork(): os._exit(0)\n"
+                "release = open(sys.argv[2], 'rb', buffering=0)\n"
+                "with open(sys.argv[1], 'w') as ready:\n"
+                "    ready.write(str(os.getpid()) + '\\n')\n"
+                "release.read(1)\n",
+                str(ready_path), str(release_path)],
+            on_complete=lambda _job: waiter_done.set(),
+        )
+        with os.fdopen(os.dup(ready)) as reader:
+            grandchild = int(reader.readline())
+        names = {f"shelljob-{role}-{job_id}" for role in ("wait", "out", "err")}
+        owned = [thread for thread in threading.enumerate() if thread.name in names]
+        assert descendant_alive()
+        waiter_done.wait()
+        assert joins and all(
+            timeout is not None and 0 < timeout <= shell_jobs.DRAIN_JOIN_TIMEOUT_SECONDS
+            for timeout in joins
+        ), f"waiter requested unbounded drain joins: {joins}"
+        assert job.exit_code == job._process.poll() == 0
+        assert descendant_alive(), "pipe holder exited before the completion assertion"
+        assert job._process.stdout.closed and job._process.stderr.closed
+    finally:
+        os.write(release, b"X")
+        if job is not None:
+            job._process.wait()
+        for thread in owned:
+            real_join(thread)
+        if grandchild is not None:
+            while descendant_alive():
+                time.sleep(0.05)
+            assert not descendant_alive()
+        assert not any(thread.is_alive() for thread in owned)
+        os.close(ready)
+        os.close(release)
+        ready_path.unlink()
+        release_path.unlink()
 
 
 def test_spawn_refuses_beyond_live_job_cap(tmp_path: Path, monkeypatch):
@@ -938,7 +1052,12 @@ def test_spawn_refuses_beyond_live_job_cap(tmp_path: Path, monkeypatch):
     clear error (the bash_async tool surfaces it)."""
     monkeypatch.setattr("mimir.shell_jobs.MAX_LIVE_SHELL_JOBS", 2)
     registry = _make_registry(tmp_path)
-    registry.spawn("s1", argv=["bash", "-c", "sleep 2"])
-    registry.spawn("s2", argv=["bash", "-c", "sleep 2"])
-    with pytest.raises(RuntimeError, match="too many live shell jobs"):
-        registry.spawn("s3", argv=["bash", "-c", "sleep 2"])
+    with _held_job(registry, "s1"), _held_job(registry, "s2"):
+        with pytest.raises(RuntimeError, match="too many live shell jobs"):
+            # If admission regresses, this extra child still exits on its own.
+            completed = threading.Event()
+            registry.spawn(
+                "s3", argv=[sys.executable, "-c", "pass"],
+                on_complete=lambda _job: completed.set(),
+            )
+            completed.wait()
