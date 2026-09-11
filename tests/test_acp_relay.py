@@ -85,12 +85,40 @@ async def test_relay_round_trip_and_cleanup(monkeypatch: pytest.MonkeyPatch, tmp
 async def test_dead_relay_client_promptly_closes_daemon_connection(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
 ) -> None:
-    client_reader = asyncio.StreamReader()
+    reading = asyncio.Event()
+
+    class ClientReader(asyncio.StreamReader):
+        async def read(self, n=-1):
+            reading.set()
+            return await super().read(n)
+
+    client_reader = ClientReader()
     daemon_reader = asyncio.StreamReader()
     daemon_closed = asyncio.Event()
     stdout_read_fd, stdout_write_fd = os.pipe()
     stdout = os.fdopen(stdout_write_fd, "wb", buffering=0)
     client_writer = await _output_writer(stdout)
+    pipe_lost = asyncio.Event()
+    protocol = client_writer.transport.get_protocol()
+    connection_lost = protocol.connection_lost
+
+    def lost(exc):
+        connection_lost(exc)
+        pipe_lost.set()
+
+    monkeypatch.setattr(protocol, "connection_lost", lost)
+    from mimir.acp.transport import pump_bidirectional
+    decisions = []
+
+    async def pump(*args, close_on_left_exit):
+        def close_now():
+            decision = close_on_left_exit() if callable(close_on_left_exit) else close_on_left_exit
+            decisions.append(decision)
+            return decision
+
+        await pump_bidirectional(*args, close_on_left_exit=close_now)
+
+    monkeypatch.setattr("mimir.acp.relay.pump_bidirectional", pump)
 
     class DaemonWriter(_Output):
         def write_eof(self) -> None:
@@ -114,15 +142,16 @@ async def test_dead_relay_client_promptly_closes_daemon_connection(
     monkeypatch.setattr("mimir.acp.relay._stdio", stdio)
 
     relay = asyncio.create_task(run_relay(tmp_path, io.BytesIO()))
-    await asyncio.sleep(0.02)
+    await reading.wait()
     assert not daemon_closed.is_set(), "a quiet live relay client was evicted"
 
     os.close(stdout_read_fd)
-    await asyncio.sleep(0.02)
+    await pipe_lost.wait()
     assert client_writer.is_closing()
     client_reader.feed_eof()
-    await asyncio.wait_for(daemon_closed.wait(), 0.1)
-    await asyncio.wait_for(relay, 0.1)
+    await relay
+    assert daemon_closed.is_set()
+    assert decisions == [True], "dead client incorrectly received a half-close grace period"
 
 
 @pytest.mark.asyncio

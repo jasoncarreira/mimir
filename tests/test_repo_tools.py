@@ -18,6 +18,7 @@ import struct
 import sys
 from types import SimpleNamespace
 import subprocess
+import time
 import tomllib
 import traceback
 import uuid
@@ -2011,10 +2012,14 @@ async def test_project_tests_scrub_checkout_home_and_sensitive_output(
     assert secret not in result.stdout + result.stderr
 
 
-def _run_synthetic_pytest(tmp_path: Path, test_source: str) -> subprocess.CompletedProcess[bytes]:
+def _run_synthetic_pytest(
+    tmp_path: Path, test_source: str, release_on_dump: bool = False,
+) -> subprocess.CompletedProcess[bytes]:
     test_path = tmp_path / "test_synthetic_hang.py"
     test_path.write_text(test_source, encoding="utf-8")
-    return subprocess.run(
+    # One ceiling for startup, dump observation, release and process reap.
+    deadline = time.monotonic() + 240
+    with subprocess.Popen(
         [
             sys.executable,
             "-m",
@@ -2028,13 +2033,36 @@ def _run_synthetic_pytest(tmp_path: Path, test_source: str) -> subprocess.Comple
             "faulthandler_exit_on_timeout=false",
         ],
         cwd=tmp_path,
-        capture_output=True,
-        check=False,
-        # Nested pytest startup can be heavily delayed while the full suite is
-        # contending for CPU; keep this outer guard well above the intentional
-        # three-second sleep that the assertion exercises.
-        timeout=30,
-    )
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    ) as child:
+        prefix = b""
+        try:
+            if release_on_dump:
+                assert child.stderr is not None
+                while not all(frame in prefix for frame in (
+                    b"in blocked_worker", b"in test_synthetic_hang",
+                )):
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0 or not select.select(
+                        [child.stderr], [], [], remaining,
+                    )[0]:
+                        raise subprocess.TimeoutExpired(child.args, 240)
+                    chunk = os.read(child.stderr.fileno(), 65536)
+                    if not chunk:
+                        break  # Assertions below diagnose an exited child.
+                    prefix += chunk
+            stdout, stderr = child.communicate(
+                input=b"\n", timeout=max(0, deadline - time.monotonic()),
+            )
+            return subprocess.CompletedProcess(
+                child.args, child.returncode, stdout, prefix + stderr,
+            )
+        finally:
+            if child.poll() is None:
+                child.kill()
+                child.communicate()
 
 
 @pytest.mark.asyncio
@@ -2044,24 +2072,39 @@ async def test_project_test_retains_builtin_hang_dump_after_stderr_truncation(
     completed = await asyncio.to_thread(
         _run_synthetic_pytest,
         tmp_path,
+        "import faulthandler\n"
         "import os\n"
         "import threading\n"
-        "import time\n"
+        "import sys\n"
         "\n"
-        "def blocked_worker(gate):\n"
+        # Preserve pytest's real dump arguments, but arm only once both frames
+        # exist. Even test setup must not race the 0.1s diagnostic threshold.
+        "arm_dump = faulthandler.dump_traceback_later\n"
+        "pending_dump = None\n"
+        "def defer_dump(*args, **kwargs):\n"
+        "    global pending_dump\n"
+        "    pending_dump = (args, kwargs)\n"
+        "faulthandler.dump_traceback_later = defer_dump\n"
+        "\n"
+        "def blocked_worker(gate, entered):\n"
+        "    entered.set()\n"
         "    gate.wait()\n"
         "\n"
         "def test_synthetic_hang():\n"
         "    credential = 'credential-value-must-not-appear'\n"
         "    gate = threading.Event()\n"
-        "    threading.Thread(target=blocked_worker, args=(gate,), daemon=True).start()\n"
+        "    entered = threading.Event()\n"
+        "    worker = threading.Thread(target=blocked_worker, args=(gate, entered))\n"
+        "    worker.start()\n"
+        "    entered.wait()\n"
         "    os.write(2, b'x' * 5000)\n"
-        # 0.1s faulthandler threshold against a 3s hang: a 30x margin, because a
-        # contended CI runner can otherwise finish a 0.2s sleep before the dump
-        # is written. Observed failing twice on pytest-macos (3.11) at that margin
-        # while passing locally and on every Linux job.
-        "    time.sleep(3.0)\n"
+        "    arm_dump(*pending_dump[0], **pending_dump[1])\n"
+        # Parent releases stdin only after observing both blocked stack frames.
+        "    sys.stdin.readline()\n"
+        "    gate.set()\n"
+        "    worker.join()\n"
         "    assert credential\n",
+        True,
     )
     assert completed.returncode == 0
     assert len(completed.stderr) > 4_000
@@ -2168,7 +2211,8 @@ async def test_project_test_hang_is_observable_before_runner_completes(
     task = asyncio.create_task(RepoProjectTests(
         state, runner=runner, checkout_factory=_test_checkout_factory,
     ).execute(("tracked.txt",)))
-    await asyncio.wait_for(output_written.wait(), 1)
+    # Real Git setup and the entire runner protocol share pytest's 300s ceiling.
+    await output_written.wait()
 
     stdout_path = observed["stdout_path"]
     stderr_path = observed["stderr_path"]

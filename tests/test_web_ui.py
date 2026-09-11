@@ -1918,6 +1918,7 @@ async def test_api_v1_live_events_since_backfill_is_strict(app):
 
 
 @pytest.mark.asyncio
+@pytest.mark.timeout(30)
 async def test_scoped_live_events_poll_advances_past_filtered_records(
     app, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1932,9 +1933,13 @@ async def test_scoped_live_events_poll_advances_past_filtered_records(
         "\n".join(json.dumps(row) for row in rows) + "\n", encoding="utf-8"
     )
     calls: list[str | None] = []
+    second_scan = asyncio.Event()
+    loop = asyncio.get_running_loop()
 
     def recording_reader(path: Path, **kwargs):
         calls.append(kwargs.get("since"))
+        if len(calls) == 2:
+            loop.call_soon_threadsafe(second_scan.set)
         return read_live_event_items_since(path, **kwargs)
 
     monkeypatch.setattr(web_ui, "read_live_event_items_since", recording_reader)
@@ -1943,10 +1948,7 @@ async def test_scoped_live_events_poll_advances_past_filtered_records(
     async with TestClient(TestServer(a)) as client:
         resp = await client.get("/api/v1/live-events?channel=web-alice")
         delivered = await _read_sse_data(resp)
-        for _ in range(100):
-            if len(calls) >= 2:
-                break
-            await asyncio.sleep(0.01)
+        await second_scan.wait()
         resp.close()
 
     scanned_cursor = turn_record_to_live_items(rows[-1])[-1].cursor

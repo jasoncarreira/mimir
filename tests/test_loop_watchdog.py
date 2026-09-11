@@ -117,6 +117,7 @@ def test_start_thread_then_stop_is_safe():
         wd.stop()
 
 
+@pytest.mark.timeout(30)
 def test_sustained_stall_fires_structured_alert_once_off_loop(monkeypatch):
     events = []
     alerts = []
@@ -128,14 +129,26 @@ def test_sustained_stall_fires_structured_alert_once_off_loop(monkeypatch):
         notify=lambda stall_s, stack: alerts.append(
             (stall_s, threading.get_ident())),
     )
+    checked = threading.Event()
+    original_check = wd._check_once
+    checks = 0
+
+    def check(now):
+        nonlocal checks
+        # Exercise repeated checks of one frozen heartbeat on the real thread.
+        original_check(wd._beat + 1.0)
+        checks += 1
+        if checks == 2:
+            wd.stop()
+            checked.set()
+
+    monkeypatch.setattr(wd, "_check_once", check)
     wd.start_thread(loop_thread_id=main_thread_id)
-    # start_thread() refreshes the beat to a real monotonic timestamp; move it
-    # just far enough into the past so this remains valid on fast and slow hosts.
-    wd._beat -= 1.0
     try:
-        threading.Event().wait(0.15)
+        checked.wait()
     finally:
         wd.stop()
+        wd._thread.join()
     assert len(alerts) == 1
     assert alerts[0][0] >= 0.03
     assert alerts[0][1] != main_thread_id

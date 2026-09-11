@@ -102,6 +102,26 @@ def _short_debounce(
     monkeypatch.setattr(git_tracking, "DEBOUNCE_SECONDS", seconds)
 
 
+@pytest.fixture
+def retry_gate(monkeypatch: pytest.MonkeyPatch):
+    """Hold each real retry until its owner explicitly releases it."""
+    entered = asyncio.Queue()
+    real_retry = git_tracking._retry_push
+
+    async def gated_retry(**kwargs: Any) -> None:
+        release = asyncio.Event()
+        entered.put_nowait(release)
+        await release.wait()
+        await real_retry(**{**kwargs, "delay": 0.0})
+
+    monkeypatch.setattr(git_tracking, "_retry_push", gated_retry)
+    return entered
+
+
+# Task/event joins below share pytest's 300s whole-test hang ceiling. Real Git
+# startup is not a per-stage timing assertion.
+
+
 # ─── disabled-flag and missing-repo paths ───────────────────────────
 
 
@@ -199,7 +219,7 @@ async def test_commit_and_schedule_push(
 
     # Wait for the debounced push to fire and fail (no remote set).
     assert git_tracking._pending_push_task is not None
-    await asyncio.wait_for(git_tracking._pending_push_task, timeout=2.0)
+    await git_tracking._pending_push_task
     events = _read_events(tmp_path)
     push_failures = [e for e in events if e["type"] == "git_push_failed"]
     assert len(push_failures) == 1
@@ -316,7 +336,7 @@ async def test_debounced_push_pulls_rebase_before_push(
         turn_id="t1", trigger="user_message", home=home_repo, enabled=True,
     )
     assert git_tracking._pending_push_task is not None
-    await asyncio.wait_for(git_tracking._pending_push_task, timeout=3.0)
+    await git_tracking._pending_push_task
 
     seq = [" ".join(a) for a in calls]
     pull_idx = next(i for i, s in enumerate(seq) if s.startswith("pull --rebase"))
@@ -384,7 +404,7 @@ async def test_debounced_push_aborts_rebase_and_skips_push_on_pull_failure(
         turn_id="t2", trigger="user_message", home=home_repo, enabled=True,
     )
     assert git_tracking._pending_push_task is not None
-    await asyncio.wait_for(git_tracking._pending_push_task, timeout=3.0)
+    await git_tracking._pending_push_task
 
     # Let the retry task that was scheduled for the blocked pull shut down before
     # inspecting the call log; this test is about the debounced push cycle, not
@@ -457,7 +477,7 @@ async def test_debounce_coalesces_burst_to_single_push(
     assert git_tracking._pending_push_task is not None
     release_push.set()
     try:
-        await asyncio.wait_for(git_tracking._pending_push_task, timeout=3.0)
+        await git_tracking._pending_push_task
     except asyncio.CancelledError:
         pass
 
@@ -470,7 +490,14 @@ async def test_debounce_reset_cancels_prior_task(
 ) -> None:
     """A second commit before the debounce expires must cancel the
     prior pending push task and schedule a new one."""
-    _short_debounce(monkeypatch, 5.0)  # generous so the task stays pending
+    entered = asyncio.Queue()
+    release = asyncio.Event()
+
+    async def controlled_push(**kwargs: Any) -> None:
+        entered.put_nowait(kwargs["turn_id"])
+        await release.wait()
+
+    monkeypatch.setattr(git_tracking, "_debounced_push", controlled_push)
 
     (home_repo / "memory").mkdir()
     (home_repo / "memory" / "a.md").write_text("a\n")
@@ -479,6 +506,7 @@ async def test_debounce_reset_cancels_prior_task(
     )
     first_task = git_tracking._pending_push_task
     assert first_task is not None
+    assert await entered.get() == "t1"
     assert not first_task.done()
 
     (home_repo / "memory" / "b.md").write_text("b\n")
@@ -488,6 +516,8 @@ async def test_debounce_reset_cancels_prior_task(
     second_task = git_tracking._pending_push_task
     assert second_task is not None
     assert second_task is not first_task
+    assert await entered.get() == "t2"
+    assert first_task.cancelling()
     # Yield once so the cancellation settles. The task may either land
     # in cancelled() state OR exit cleanly via the
     # "except CancelledError: return" branch in _debounced_push —
@@ -756,7 +786,7 @@ async def test_push_timeout_logs_git_push_failed(
         enabled=True,
     )
     assert git_tracking._pending_push_task is not None
-    await asyncio.wait_for(git_tracking._pending_push_task, timeout=2.0)
+    await git_tracking._pending_push_task
 
     events = _read_events(tmp_path)
     push_failures = [e for e in events if e["type"] == "git_push_failed"]
@@ -827,7 +857,7 @@ async def test_push_success_emits_git_push_ok(
         home=home_repo, enabled=True,
     )
     assert git_tracking._pending_push_task is not None
-    await asyncio.wait_for(git_tracking._pending_push_task, timeout=2.0)
+    await git_tracking._pending_push_task
 
     events = _read_events(tmp_path)
     push_oks = [e for e in events if e["type"] == "git_push_ok"]
@@ -875,7 +905,7 @@ async def test_no_remote_skips_push_silently(
 
     # Wait past debounce.
     assert git_tracking._pending_push_task is not None
-    await asyncio.wait_for(git_tracking._pending_push_task, timeout=2.0)
+    await git_tracking._pending_push_task
 
     # Push was NOT invoked, and no failure event surfaced.
     assert push_calls == []
@@ -1219,11 +1249,10 @@ def test_render_git_status_line_plural_with_truncation(home_repo: Path) -> None:
 @pytest.mark.asyncio
 async def test_push_failure_schedules_retry(
     home_repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    retry_gate,
 ) -> None:
     """A push failure should schedule a retry task in _push_retry_tasks."""
     _short_debounce(monkeypatch, 0.02)
-    # long delays — this test only checks scheduling.
-    monkeypatch.setattr(git_tracking, "PUSH_RETRY_DELAYS", (5.0, 10.0, 20.0))
 
     subprocess.run(
         ["git", "remote", "add", "origin", str(tmp_path / "nonexistent.git")],
@@ -1237,12 +1266,13 @@ async def test_push_failure_schedules_retry(
     )
     # Wait for the debounce push to fail.
     assert git_tracking._pending_push_task is not None
-    await asyncio.wait_for(git_tracking._pending_push_task, timeout=2.0)
+    await git_tracking._pending_push_task
 
     # A retry task should have been created.
     key = git_tracking._home_key(home_repo)
     retry_task = git_tracking._push_retry_tasks.get(key)
     assert retry_task is not None
+    await retry_gate.get()
     assert not retry_task.done()
 
     # Clean up.
@@ -1265,6 +1295,7 @@ async def test_debounced_push_schedules_retry_under_home_lock(
     )
     key = git_tracking._home_key(home_repo)
     observed: list[bool] = []
+    release_retry = asyncio.Event()
 
     async def fake_has_origin(_home: Path) -> bool:
         return True
@@ -1278,7 +1309,7 @@ async def test_debounced_push_schedules_retry_under_home_lock(
 
     def fake_schedule_retry_locked(**kwargs: Any) -> None:
         observed.append(git_tracking._get_lock(home_repo).locked())
-        git_tracking._push_retry_tasks[key] = asyncio.create_task(asyncio.sleep(10))
+        git_tracking._push_retry_tasks[key] = asyncio.create_task(release_retry.wait())
 
     monkeypatch.setattr(git_tracking, "_has_origin_remote", fake_has_origin)
     monkeypatch.setattr(git_tracking, "_git", fake_git)
@@ -1289,21 +1320,22 @@ async def test_debounced_push_schedules_retry_under_home_lock(
     task = asyncio.create_task(
         git_tracking._debounced_push(turn_id="t-lock", home=home_repo)
     )
-    await asyncio.wait_for(task, timeout=2.0)
+    await task
 
     assert observed == [True]
     retry = git_tracking._push_retry_tasks.get(key)
     assert retry is not None
     retry.cancel()
+    await asyncio.gather(retry, return_exceptions=True)
 
 
 @pytest.mark.asyncio
 async def test_retry_success_emits_git_push_ok(
     home_repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    retry_gate,
 ) -> None:
     """A retry that succeeds emits git_push_ok with via='retry'."""
     _short_debounce(monkeypatch, 0.02)
-    monkeypatch.setattr(git_tracking, "PUSH_RETRY_DELAYS", (0.03, 0.10, 0.20))
 
     subprocess.run(
         ["git", "remote", "add", "origin", str(tmp_path / "nonexistent.git")],
@@ -1335,12 +1367,13 @@ async def test_retry_success_emits_git_push_ok(
     )
     # Wait for debounce push (fails) and then the retry (succeeds).
     assert git_tracking._pending_push_task is not None
-    await asyncio.wait_for(git_tracking._pending_push_task, timeout=2.0)
+    await git_tracking._pending_push_task
 
     key = git_tracking._home_key(home_repo)
     retry_task = git_tracking._push_retry_tasks.get(key)
     assert retry_task is not None
-    await asyncio.wait_for(retry_task, timeout=2.0)
+    (await retry_gate.get()).set()
+    await retry_task
 
     events = _read_events(tmp_path)
     ok_events = [e for e in events if e["type"] == "git_push_ok"]
@@ -1352,10 +1385,10 @@ async def test_retry_success_emits_git_push_ok(
 @pytest.mark.asyncio
 async def test_retry_exhaustion_emits_git_push_stale(
     home_repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    retry_gate,
 ) -> None:
     """After all retries fail, git_push_stale is emitted with unpushed commit count."""
     _short_debounce(monkeypatch, 0.02)
-    monkeypatch.setattr(git_tracking, "PUSH_RETRY_DELAYS", (0.02, 0.03, 0.04))
 
     subprocess.run(
         ["git", "remote", "add", "origin", str(tmp_path / "nonexistent.git")],
@@ -1370,7 +1403,7 @@ async def test_retry_exhaustion_emits_git_push_stale(
 
     # Drive the debounce push.
     assert git_tracking._pending_push_task is not None
-    await asyncio.wait_for(git_tracking._pending_push_task, timeout=2.0)
+    await git_tracking._pending_push_task
 
     # Chain through all retries. Each retry creates a new task ref.
     # Drive until no retry task remains.
@@ -1379,9 +1412,10 @@ async def test_retry_exhaustion_emits_git_push_stale(
         retry = git_tracking._push_retry_tasks.get(key)
         if retry is None or retry.done():
             break
+        (await retry_gate.get()).set()
         try:
-            await asyncio.wait_for(retry, timeout=2.0)
-        except (asyncio.TimeoutError, asyncio.CancelledError):
+            await retry
+        except asyncio.CancelledError:
             break
 
     events = _read_events(tmp_path)
@@ -1395,12 +1429,11 @@ async def test_retry_exhaustion_emits_git_push_stale(
 @pytest.mark.asyncio
 async def test_new_commit_cancels_retry(
     home_repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    retry_gate,
 ) -> None:
     """A new commit (triggering a debounce push) should cancel any pending
     retry task."""
     _short_debounce(monkeypatch, 0.02)
-    # long delays so retry stays pending.
-    monkeypatch.setattr(git_tracking, "PUSH_RETRY_DELAYS", (10.0, 20.0, 40.0))
 
     subprocess.run(
         ["git", "remote", "add", "origin", str(tmp_path / "nonexistent.git")],
@@ -1412,11 +1445,13 @@ async def test_new_commit_cancels_retry(
         turn_id="t1", trigger="user_message", home=home_repo, enabled=True,
     )
     # First debounce fails, schedules retry.
-    await asyncio.wait_for(git_tracking._pending_push_task, timeout=2.0)
+    assert git_tracking._pending_push_task is not None
+    await git_tracking._pending_push_task
 
     key = git_tracking._home_key(home_repo)
     retry_task = git_tracking._push_retry_tasks.get(key)
     assert retry_task is not None and not retry_task.done()
+    await retry_gate.get()
 
     # New commit — should cancel the retry.
     (home_repo / "memory" / "y.md").write_text("v2\n")
@@ -1424,6 +1459,7 @@ async def test_new_commit_cancels_retry(
         turn_id="t2", trigger="user_message", home=home_repo, enabled=True,
     )
     # The retry task should be cancelled.
+    assert retry_task.cancelling()
     try:
         await retry_task
     except asyncio.CancelledError:

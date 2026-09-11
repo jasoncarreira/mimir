@@ -1075,6 +1075,15 @@ def test_terminal_waits_for_in_group_writers_before_cleanup(tmp_path: Path, monk
         cleanup_home(home)
 
     monkeypatch.setattr(worker_exec, "_cleanup_home", observed_cleanup)
+    monitor = worker_exec._wait_with_output_limits
+
+    def after_leader_exit(proc, *args):
+        # Deadline enforcement has its own controlled test. Here the protocol
+        # ceiling owns interpreter startup; retain the real group cleanup path.
+        proc.wait()
+        return monitor(proc, *args)
+
+    monkeypatch.setattr(worker_exec, "_wait_with_output_limits", after_leader_exit)
     request = {
         "version": 1,
         "op": "launch",
@@ -1085,9 +1094,16 @@ def test_terminal_waits_for_in_group_writers_before_cleanup(tmp_path: Path, monk
         "device": 0,
         "inode": 0,
         "argv": [
-            "/bin/sh",
+            sys.executable,
             "-c",
-            '(trap "" TERM; printf ready; sleep 30; printf late > "$HOME/retained") & sleep .2',
+            "import os, signal; r,w=os.pipe(); pid=os.fork(); "
+            "exec(\"if pid == 0:\\n"
+            " signal.signal(signal.SIGTERM, signal.SIG_IGN)\\n"
+            " os.write(1, b'ready')\\n"
+            " os.write(w, b'R')\\n"
+            " while True: signal.pause()\\n"
+            "else:\\n"
+            " assert os.read(r, 1) == b'R'\\n\")",
         ],
         "env": {"PATH": "/usr/bin:/bin"},
         "projections": [],
@@ -1103,6 +1119,11 @@ def test_terminal_waits_for_in_group_writers_before_cleanup(tmp_path: Path, monk
         assert not (tmp_path / "homes" / identifier).exists()
         assert stderr_path.read_bytes() == b""
     finally:
+        if responses:
+            try:
+                os.killpg(int(responses[0]["pid"]), signal.SIGKILL)
+            except ProcessLookupError:
+                pass
         for fd in fds:
             if fd >= 0:
                 try:
@@ -1823,20 +1844,27 @@ def test_factory_drops_identity_before_payload_exec_or_spawn(
 @pytest.mark.parametrize("mode", ["complete", "cancel", "timeout", "stdout", "stderr", "death"])
 def test_wait_factory_real_supervisor(tmp_path: Path, monkeypatch, mode: str) -> None:
     from concurrent.futures import ThreadPoolExecutor
+    import threading
+    from types import SimpleNamespace
 
     monkeypatch.setattr(worker_exec, "_CONTROLLER_CANCELLATION_GRACE_S", 0)
     monkeypatch.setattr(worker_exec, "_OUTPUT_LIMIT_POLL_S", .001)
-    monkeypatch.setattr(worker_exec, "_FACTORY_STOP_TIMEOUT_S", 3)
-    monkeypatch.setattr(worker_exec, "_PROCESS_REAP_TIMEOUT_S", 1)
+    # Select expiry explicitly after payload readiness. Other modes never
+    # advance the deadline clock; real protocol I/O keeps its normal semantics.
+    monkeypatch.setattr(worker_exec, "time", SimpleNamespace(
+        monotonic=lambda: 0, sleep=worker_exec.time.sleep,
+    ))
     legacy = Mock(side_effect=AssertionError("factory used legacy process-group signalling"))
     monkeypatch.setattr(worker_exec, "_terminate_process_group_pid", legacy)
     parent, child = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
     events = []
-    payload = "import os, time; os.write(1, b'ready'); time.sleep(30)"
+    ready = tmp_path / "ready"
+    payload = "import os, signal; os.write(1, b'ready'); signal.pause()"
     if mode == "complete":
         payload = "import os; os.write(1, b'done'); os._exit(37)"
     elif mode in {"stdout", "stderr"}:
-        payload = f"import os, time; os.write({1 if mode == 'stdout' else 2}, b'x' * 8192); time.sleep(30)"
+        payload = f"import os, signal; os.write({1 if mode == 'stdout' else 2}, b'x' * 8192); signal.pause()"
+    payload = f"from pathlib import Path; Path({str(ready)!r}).touch(); " + payload
     with parent, child, (tmp_path / "stdout").open("w+b") as stdout, (tmp_path / "stderr").open("w+b") as stderr:
         process = subprocess.Popen(
             [sys.executable, "-I", str(Path(worker_exec.__file__).with_name("factory_supervisor.py")),
@@ -1851,16 +1879,22 @@ def test_wait_factory_real_supervisor(tmp_path: Path, monkeypatch, mode: str) ->
         proc = worker_exec._FactoryProcess(process, parent, events.append)
         try:
             assert proc.pid == process.pid
+            if mode != "death":
+                # The supervisor's ready packet precedes Popen; wait for the
+                # payload interpreter itself before expiring or cancelling it.
+                while not ready.exists():
+                    assert process.poll() is None, "supervisor exited before payload readiness"
+                    threading.Event().wait(.01)
             with ThreadPoolExecutor(max_workers=1) as pool:
                 future = pool.submit(
-                    worker_exec._wait_factory, proc, .1 if mode == "timeout" else 10,
+                    worker_exec._wait_factory, proc, 0 if mode == "timeout" else 10,
                     stdout.fileno(), 64, stderr.fileno(), 4096 if mode == "death" else 64,
                 )
                 if mode == "cancel":
                     worker_exec._terminate_process_group(proc)
                 if mode == "death":
                     with pytest.raises(RuntimeError, match="worklink_factory_supervisor_lost: no terminal cleanup report"):
-                        future.result(timeout=8)
+                        future.result()
                     assert proc.returncode is None
                     assert len(events) == 1
                     assert events[0]["event"] == "worklink_factory_supervisor_lost"
@@ -1868,7 +1902,7 @@ def test_wait_factory_real_supervisor(tmp_path: Path, monkeypatch, mode: str) ->
                     with pytest.raises(RuntimeError, match="supervisor_lost"):
                         proc.stop()
                 else:
-                    code, timed_out, overflow = future.result(timeout=8)
+                    code, timed_out, overflow = future.result()
                     assert code == (37 if mode == "complete" else -signal.SIGTERM)
                     assert timed_out is (mode == "timeout")
                     assert overflow is (mode in {"stdout", "stderr"})
@@ -1887,7 +1921,7 @@ def test_wait_factory_real_supervisor(tmp_path: Path, monkeypatch, mode: str) ->
         finally:
             parent.close()
             if process.poll() is None:
-                process.wait(timeout=5)
+                process.wait()
 
 
 def test_wait_factory_unreapable_supervisor_has_finite_stop_bound(tmp_path, monkeypatch):

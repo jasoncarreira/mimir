@@ -46,7 +46,8 @@ def _logger(tmp_path: Path):
 
 
 @pytest.mark.asyncio
-async def test_twenty_channels_at_max_five_drain_in_per_channel_order(tmp_path: Path):
+@pytest.mark.timeout(30)
+async def test_twenty_channels_at_max_five_drain_in_per_channel_order(tmp_path: Path, monkeypatch):
     """20 channels × 5 events each at ``max_concurrent_turns=5``.
 
     Per-channel FIFO must be preserved even though the global cap forces
@@ -58,19 +59,33 @@ async def test_twenty_channels_at_max_five_drain_in_per_channel_order(tmp_path: 
     peak = 0
     lock = asyncio.Lock()
     seen: dict[str, list[int]] = {}
+    release = asyncio.Event()
+    contended = asyncio.Event()
+    attempts = 0
 
     async def runner(event: AgentEvent) -> None:
         nonlocal in_flight, peak
         async with lock:
             in_flight += 1
             peak = max(peak, in_flight)
-        # Stagger work so contention is real, not theoretical.
-        await asyncio.sleep(0.01)
+        if in_flight == 20:
+            contended.set()  # Also finish the observation if the cap is bypassed.
+        await release.wait()
         async with lock:
             in_flight -= 1
             seen.setdefault(event.channel_id, []).append(int(event.content))
 
     disp = Dispatcher(cfg, runner)
+    acquire = disp._semaphore.acquire
+
+    async def observed_acquire():
+        nonlocal attempts
+        attempts += 1
+        if attempts == 20:
+            contended.set()
+        return await acquire()
+
+    monkeypatch.setattr(disp._semaphore, "acquire", observed_acquire)
     for ch in range(20):
         for seq in range(5):
             ok = await disp.enqueue(
@@ -78,7 +93,12 @@ async def test_twenty_channels_at_max_five_drain_in_per_channel_order(tmp_path: 
             )
             assert ok, f"queue rejected c{ch}/{seq} unexpectedly"
 
-    await disp.drain()
+    try:
+        await contended.wait()
+        assert in_flight == 5
+    finally:
+        release.set()
+        await disp.drain()
 
     # Per-channel order strictly preserved.
     for ch in range(20):

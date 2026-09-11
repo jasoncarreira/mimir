@@ -7,6 +7,7 @@ import shlex
 import stat
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
 import pytest
@@ -89,9 +90,25 @@ async def test_terminate_process_killpg_einval_propagates(
     process.wait.assert_not_awaited()
 
 
+@pytest.fixture
+def shell_timers(monkeypatch):
+    timers = []
+
+    def timeout_at(deadline):
+        timer = asyncio.timeout(None)
+        timers.append(timer)
+        return timer
+
+    monkeypatch.setattr(hosted, "asyncio", SimpleNamespace(**{
+        **vars(asyncio), "timeout_at": timeout_at,
+    }))
+    return timers
+
+
+@pytest.mark.timeout(120)
 @pytest.mark.asyncio
 async def test_shell_and_python_cleanup_kill_owned_process_groups(
-    tmp_path: Path,
+    tmp_path: Path, shell_timers,
 ) -> None:
     provider, connection = await _connected(tmp_path)
     await provider.request(
@@ -101,24 +118,37 @@ async def test_shell_and_python_cleanup_kill_owned_process_groups(
         request_id="python",
     )
     python_process = next(iter(provider._python_kernels._processes))
+    owned = asyncio.Event()
+
+    class Processes(dict):
+        def __setitem__(self, process, pgid):
+            super().__setitem__(process, pgid)
+            owned.set()
+
+    provider._processes = Processes()
+    command = f"exec {shlex.quote(sys.executable)} -c 'import signal; signal.pause()'"
     shell_call = asyncio.create_task(
         provider.request(
             connection,
             "tools/call",
-            {"name": "shell", "arguments": {"command": "sleep 30"}},
+            {"name": "shell", "arguments": {"command": command}},
             request_id="shell",
         )
     )
-    async with asyncio.timeout(2):
-        while not provider._processes:
-            await asyncio.sleep(0.01)
-    shell_process = next(iter(provider._processes))
-    await provider.close()
-    await asyncio.gather(shell_call, return_exceptions=True)
-    assert shell_process.returncode is not None
-    assert python_process.returncode is not None
-    assert provider._processes == {}
-    assert provider._python_kernels._processes == {}
+    try:
+        await owned.wait()
+        shell_process = next(iter(provider._processes))
+        assert shell_process.returncode is None
+        await provider.close()
+        await asyncio.gather(shell_call, return_exceptions=True)
+        assert shell_process.returncode is not None
+        assert python_process.returncode is not None
+        assert provider._processes == {}
+        assert provider._python_kernels._processes == {}
+    finally:
+        shell_call.cancel()
+        await asyncio.gather(shell_call, return_exceptions=True)
+        await provider.close()
 
 
 @pytest.mark.asyncio
@@ -311,21 +341,17 @@ async def test_shell_uses_bin_sh_cwd_environment_and_bounded_streams(
     assert SHELL_TIMEOUT_SECONDS == 60
 
 
-@pytest.mark.asyncio
 async def _child_identity(path: Path) -> tuple[int, int]:
-    deadline = asyncio.get_running_loop().time() + 5
-    while asyncio.get_running_loop().time() < deadline:
+    while True:
         try:
             pid, pgid = path.read_text().split()
             return int(pid), int(pgid)
         except (FileNotFoundError, ValueError):
             await asyncio.sleep(0.01)
-    raise AssertionError("owned grandchild did not start")
 
 
 async def _assert_process_stopped(pid: int) -> None:
-    deadline = asyncio.get_running_loop().time() + 5
-    while asyncio.get_running_loop().time() < deadline:
+    while True:
         try:
             state = (Path("/proc") / str(pid) / "stat").read_text().split()[2]
         except (FileNotFoundError, ProcessLookupError, IndexError):
@@ -333,21 +359,23 @@ async def _assert_process_stopped(pid: int) -> None:
         if state == "Z":
             return
         await asyncio.sleep(0.01)
-    raise AssertionError(f"owned process {pid} is still running")
 
 
 def _pipe_holding_grandchild_command(identity: Path) -> str:
     source = (
-        "import os,time; "
-        f"open({str(identity)!r},'w').write(f'{{os.getpid()}} {{os.getpgrp()}}'); "
-        "print('held',flush=True); time.sleep(30)"
+        "import os,signal,pathlib; "
+        "print('held',flush=True); "
+        f"p=pathlib.Path({str(identity)!r}); "
+        "p.with_suffix('.tmp').write_text(f'{os.getpid()} {os.getpgrp()}'); "
+        "p.with_suffix('.tmp').replace(p); signal.pause()"
     )
     return f"{shlex.quote(sys.executable)} -c {shlex.quote(source)} &"
 
 
+@pytest.mark.timeout(120)
 @pytest.mark.asyncio
 async def test_shell_deadline_kills_pipe_holding_owned_grandchild(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, shell_timers,
 ) -> None:
     provider = HostedHandsProvider(1)
     provider.bind_session("session", tmp_path)
@@ -362,29 +390,74 @@ async def test_shell_deadline_kills_pipe_holding_owned_grandchild(
         },
     )
     await provider.notification(connection, "notifications/initialized")
+    captures = []
+    drain = provider._drain_output
+
+    async def observed_drain(stream, capture):
+        captures.append(capture)
+        await drain(stream, capture)
+
+    monkeypatch.setattr(provider, "_drain_output", observed_drain)
     identity = tmp_path / "timeout-child"
-    result = await provider.request(
+    call = asyncio.create_task(provider.request(
         connection,
         "tools/call",
         {
             "name": "shell",
             "arguments": {"command": _pipe_holding_grandchild_command(identity)},
         },
-    )
-    pid, pgid = await _child_identity(identity)
-    assert result["structuredContent"] == {
-        "stdout": "held\n",
-        "stderr": "\n[timed out after 1 s]",
-        "exitCode": -1,
-    }
-    assert pgid != os.getpgrp()
-    await _assert_process_stopped(pid)
-    assert not provider._processes
+    ))
+    try:
+        pid, pgid = await _child_identity(identity)
+        while not any(capture.retained == b"held\n" for capture in captures):
+            await asyncio.sleep(0)
+        while any(process.returncode is None for process in provider._processes):
+            await asyncio.sleep(0)
+        assert not call.done()  # The exited shell's descendant still holds its pipes.
+        shell_timers[-1].reschedule(0)
+        result = await call
+        assert result["structuredContent"] == {
+            "stdout": "held\n",
+            "stderr": "\n[timed out after 1 s]",
+            "exitCode": -1,
+        }
+        assert pgid != os.getpgrp()
+        await _assert_process_stopped(pid)
+        assert not provider._processes
+    finally:
+        call.cancel()
+        await asyncio.gather(call, return_exceptions=True)
+        await provider.close()
 
 
+@pytest.fixture
+def shell_deadlines(monkeypatch: pytest.MonkeyPatch) -> list[float]:
+    observed = []
+    clock_reads = []
+
+    def clock() -> float:
+        now = asyncio.get_running_loop().time()
+        clock_reads.append(now)
+        return now
+
+    def timeout_at(deadline: float) -> object:
+        assert len(clock_reads) == 1
+        observed.append(deadline - clock_reads.pop())
+        return asyncio.timeout_at(deadline)
+
+    # Observe the producer, not elapsed startup time; leave asyncio's own clock alone.
+    monkeypatch.setattr(hosted, "asyncio", SimpleNamespace(**{
+        **vars(asyncio),
+        "get_running_loop": lambda: SimpleNamespace(time=clock),
+        "timeout_at": timeout_at,
+    }))
+    return observed
+
+
+@pytest.mark.timeout(120)
 @pytest.mark.asyncio
 async def test_shell_and_python_default_timeout_is_60_seconds(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, shell_deadlines: list[float],
 ) -> None:
     provider, connection = await _connected(tmp_path)
     observed: list[int | float] = []
@@ -398,15 +471,7 @@ async def test_shell_and_python_default_timeout_is_60_seconds(
             "exception": "", "timedOut": False, "kernel": "fresh",
         }
 
-    real_timeout_at = asyncio.timeout_at
-    started = asyncio.get_running_loop().time()
-
-    def timeout_at(deadline: float) -> object:
-        observed.append(deadline - started)
-        return real_timeout_at(deadline)
-
     monkeypatch.setattr(provider._python_kernels, "execute", execute)
-    monkeypatch.setattr(hosted.asyncio, "timeout_at", timeout_at)
     await provider.request(
         connection, "tools/call", {"name": "shell", "arguments": {"command": "true"}}
     )
@@ -415,13 +480,14 @@ async def test_shell_and_python_default_timeout_is_60_seconds(
     )
     assert provider._sessions["session"].timeout_seconds == 60
     assert observed[-1] == 60
-    assert observed[0] == pytest.approx(60, abs=1)
+    assert shell_deadlines == [60]
     await provider.close()
 
 
+@pytest.mark.timeout(120)
 @pytest.mark.asyncio
 async def test_timeout_comes_only_from_selected_profile(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, shell_deadlines: list[float],
 ) -> None:
     monkeypatch.setenv("MIMIR_ACP_TIMEOUT", "1")
     provider = HostedHandsProvider(7)
@@ -447,15 +513,7 @@ async def test_timeout_comes_only_from_selected_profile(
             "exception": "", "timedOut": False, "kernel": "fresh",
         }
 
-    real_timeout_at = asyncio.timeout_at
-    started = asyncio.get_running_loop().time()
-
-    def timeout_at(deadline: float) -> object:
-        observed.append(deadline - started)
-        return real_timeout_at(deadline)
-
     monkeypatch.setattr(provider._python_kernels, "execute", execute)
-    monkeypatch.setattr(hosted.asyncio, "timeout_at", timeout_at)
     await provider.request(
         connection, "tools/call", {"name": "shell", "arguments": {"command": "true"}}
     )
@@ -463,7 +521,7 @@ async def test_timeout_comes_only_from_selected_profile(
         connection, "tools/call", {"name": "python", "arguments": {"code": "pass"}}
     )
     assert observed[-1] == 7
-    assert observed[0] == pytest.approx(7, abs=1)
+    assert shell_deadlines == [7]
     with pytest.raises(HostedMcpError, match="Invalid params"):
         await provider.request(
             connection,
@@ -474,9 +532,10 @@ async def test_timeout_comes_only_from_selected_profile(
 
 
 @pytest.mark.parametrize("action", ["cancel", "close"])
+@pytest.mark.timeout(120)
 @pytest.mark.asyncio
 async def test_shell_cancel_and_close_kill_pipe_holding_owned_grandchild(
-    tmp_path: Path, action: str
+    tmp_path: Path, action: str, shell_timers,
 ) -> None:
     provider, connection = await _connected(tmp_path)
     identity = tmp_path / f"{action}-child"
@@ -493,22 +552,27 @@ async def test_shell_cancel_and_close_kill_pipe_holding_owned_grandchild(
             request_id="cancel-me",
         )
     )
-    pid, pgid = await _child_identity(identity)
-    while any(process.returncode is None for process in provider._processes):
-        await asyncio.sleep(0)
-    if action == "cancel":
-        await provider.notification(
-            connection, "notifications/cancelled", {"requestId": "cancel-me"}
-        )
-    else:
+    try:
+        pid, pgid = await _child_identity(identity)
+        while any(process.returncode is None for process in provider._processes):
+            await asyncio.sleep(0)
+        assert not call.done()
+        if action == "cancel":
+            await provider.notification(
+                connection, "notifications/cancelled", {"requestId": "cancel-me"}
+            )
+        else:
+            await provider.close()
+        with pytest.raises(HostedMcpError, match="Request cancelled") as cancelled:
+            await call
+        assert cancelled.value.code == -32800
+        assert pgid != os.getpgrp()
+        await _assert_process_stopped(pid)
+        assert not provider._processes
+    finally:
+        call.cancel()
+        await asyncio.gather(call, return_exceptions=True)
         await provider.close()
-    with pytest.raises(HostedMcpError, match="Request cancelled") as cancelled:
-        await call
-    assert cancelled.value.code == -32800
-    assert pgid != os.getpgrp()
-    await _assert_process_stopped(pid)
-    assert not provider._processes
-    await provider.close()
 
 
 @pytest.mark.asyncio
@@ -825,6 +889,7 @@ def _unit_backend_on_unsupported_platform(monkeypatch):
         monkeypatch.setattr(kernel_module, "prepare_command", prepare)
 
 
+@pytest.mark.timeout(120)
 @pytest.mark.asyncio
 async def test_shell_double_cancellation_reaps_without_signalling_killed_group_again(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
@@ -876,9 +941,9 @@ async def test_shell_double_cancellation_reaps_without_signalling_killed_group_a
     provider.bind_session("session", tmp_path)
     task = asyncio.create_task(provider._shell(provider._sessions["session"], "unused"))
     try:
-        await asyncio.wait_for(running.wait(), 1)
+        await running.wait()
         task.cancel()  # proxy cancellation while the shell is running
-        await asyncio.wait_for(reaping.wait(), 1)
+        await reaping.wait()
         task.cancel()  # provider cancellation while process.wait() is reaping
         with pytest.raises(asyncio.CancelledError):
             await task

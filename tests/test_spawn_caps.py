@@ -179,6 +179,7 @@ async def test_tool_depth_refusal_and_below_cap_propagation(tmp_path, monkeypatc
 
 
 @pytest.mark.asyncio
+@pytest.mark.timeout(30)
 async def test_tool_semaphore_bounds_concurrent_contained_spawns(tmp_path, monkeypatch):
     from mimir.contained_execution import CollectedExecutionResult
     seed, calls, contained_execution = _surface_setup(tmp_path, monkeypatch)
@@ -187,11 +188,26 @@ async def test_tool_semaphore_bounds_concurrent_contained_spawns(tmp_path, monke
     release = asyncio.Event()
     active = 0
     maximum = 0
+    attempted = asyncio.Event()
+    guard = _spawn_guard_init()
+    acquire = guard.sem.acquire
+    acquisitions = 0
+
+    async def observed_acquire():
+        nonlocal acquisitions
+        acquisitions += 1
+        if acquisitions == 2:
+            attempted.set()
+        return await acquire()
+
+    monkeypatch.setattr(guard.sem, "acquire", observed_acquire)
 
     async def runner(argv, directory, worker_env, projections=(), **kwargs):
         nonlocal active, maximum
         active += 1
         maximum = max(maximum, active)
+        if active == 2:
+            attempted.set()  # A bypass must reach the assertion, not hang.
         entered.set()
         await release.wait()
         active -= 1
@@ -201,8 +217,11 @@ async def test_tool_semaphore_bounds_concurrent_contained_spawns(tmp_path, monke
     first = asyncio.create_task(spawn_open_code.ainvoke({"prompt": "one", "cwd": str(seed)}))
     await entered.wait()
     second = asyncio.create_task(spawn_open_code.ainvoke({"prompt": "two", "cwd": str(seed)}))
-    await asyncio.sleep(0.05)
-    assert maximum == 1
-    release.set()
-    await asyncio.gather(first, second)
+    try:
+        await attempted.wait()
+        assert maximum == 1
+        assert acquisitions == 2
+    finally:
+        release.set()
+        await asyncio.gather(first, second)
     assert maximum == 1

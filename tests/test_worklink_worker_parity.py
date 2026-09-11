@@ -306,11 +306,12 @@ async def test_job_alive_tracks_contained_task_and_direct_process(
     monkeypatch.setattr("mimir.worklink.checkout.coding_enabled", lambda: False)
     direct = LocalSubprocessComputeBackend()
     direct_handle = await direct.launch(
-        direct_spec("import time; time.sleep(30)")
+        direct_spec("import threading; threading.Event().wait()")
     )
     assert direct.job_alive(direct_handle) is True
     await direct.cancel(direct_handle)
-    await direct.wait(direct_handle, 2)
+    result = await direct.wait(direct_handle, None)
+    assert result.exit_code == -signal.SIGTERM
     assert direct.job_alive(direct_handle) is False
     await direct.cleanup(direct_handle)
 
@@ -424,7 +425,7 @@ def direct_spec(source: str) -> WorkSpec:
 
 
 async def run_direct(
-    monkeypatch: pytest.MonkeyPatch, source: str, timeout: float = 3
+    monkeypatch: pytest.MonkeyPatch, source: str, timeout: float | None = None
 ) -> Any:
     monkeypatch.setattr("mimir.worklink.checkout.coding_enabled", lambda: False)
     backend = LocalSubprocessComputeBackend()
@@ -441,9 +442,9 @@ async def wait_for_child_ready(read_fd: int) -> None:
         os.fdopen(read_fd, "rb", buffering=0),
     )
     try:
-        # This bound is only a hang guard for a child that fails before signalling
-        # readiness, not an assertion about interpreter-startup latency.
-        assert await asyncio.wait_for(reader.readexactly(1), timeout=10) == b"1"
+        # The per-test ceiling covers spawn through cleanup, without restarting
+        # a budget at each protocol stage.
+        assert await reader.readexactly(1) == b"1"
     finally:
         transport.close()
 
@@ -455,35 +456,35 @@ async def test_direct_terminated_output_is_durable_while_running(
 ) -> None:
     monkeypatch.setattr("mimir.worklink.checkout.coding_enabled", lambda: False)
     backend = LocalSubprocessComputeBackend()
+    ready = tmp_path / "ready"
     work = direct_spec(
-        "import sys,time; "
+        "import sys,threading,pathlib; "
         "sys.stdout.write('before termination\\n'); "
         "sys.stderr.write('diagnostic stderr\\n'); "
-        "sys.stdout.flush(); sys.stderr.flush(); time.sleep(30)"
+        "sys.stdout.flush(); sys.stderr.flush(); "
+        f"pathlib.Path({str(ready)!r}).touch(); threading.Event().wait()"
     )
     output_root = tmp_path / "state" / "worklink" / "transcripts"
     object.__setattr__(work, "output_root", output_root)
     handle = await backend.launch(work)
 
-    stdout_files: list[Path] = []
-    for _ in range(200):
-        stdout_files = list(output_root.glob("*.stdout.log"))
-        if stdout_files and stdout_files[0].read_bytes() == b"before termination\n":
-            break
+    while not ready.exists():
         await asyncio.sleep(0.01)
+    stdout_files = list(output_root.glob("*.stdout.log"))
     assert len(stdout_files) == 1
     assert stdout_files[0].read_bytes() == b"before termination\n"
     assert stat.S_ISREG(stdout_files[0].stat().st_mode)
 
     if termination == "sigterm":
         await backend.cancel(handle)
-        result = await backend.wait(handle, 2)
+        result = await backend.wait(handle, None)
         assert result.timed_out is False
     else:
-        result = await backend.wait(handle, 0.01)
+        result = await backend.wait(handle, 0)
         assert result.timed_out is True
     await backend.cleanup(handle)
 
+    assert result.exit_code == -signal.SIGTERM
     assert result.stdout_path == stdout_files[0]
     assert result.stdout_path.read_text() == "before termination\n"
     assert result.stderr_path is not None
@@ -502,6 +503,7 @@ async def test_direct_termination_kills_pipe_holding_grandchild(
     signals: list[int] = []
     original_killpg = os.killpg
     test_ready_r, test_ready_w = os.pipe()
+    release_r, release_w = os.pipe()
 
     def expedited_terminate(process_group: int, timeout_s: float = 5.0) -> None:
         original_terminate(process_group, 0.05)
@@ -511,7 +513,7 @@ async def test_direct_termination_kills_pipe_holding_grandchild(
         original_killpg(process_group, sig)
 
     async def create_with_readiness(*args: Any, **kwargs: Any) -> Any:
-        kwargs["pass_fds"] = (test_ready_w,)
+        kwargs["pass_fds"] = (test_ready_w, release_r)
         return await original_create(*args, **kwargs)
 
     monkeypatch.setattr(worker_exec, "_terminate_process_group_pid", expedited_terminate)
@@ -522,29 +524,29 @@ async def test_direct_termination_kills_pipe_holding_grandchild(
         monkeypatch.setenv("MIMIR_WORKLINK_MAX_STDOUT_BYTES", "1")
     output = "overflow" if trigger == "overflow" else "ready"
     source = (
-        "import os,subprocess,sys,time; "
+        "import os,subprocess,sys,threading; "
         "ready_r,ready_w=os.pipe(); "
-        "child_source=f\"import os,signal,time; "
+        "child_source=f\"import os,signal,threading; "
         "signal.signal(signal.SIGTERM,signal.SIG_IGN); "
-        "os.write({ready_w},b'1'); os.close({ready_w}); time.sleep(30)\"; "
+        "os.write({ready_w},b'1'); os.close({ready_w}); threading.Event().wait()\"; "
         "subprocess.Popen([sys.executable,'-c',child_source],pass_fds=(ready_w,)); "
         "os.close(ready_w); "
         "assert os.read(ready_r,1)==b'1'; os.close(ready_r); "
-        f"print({output!r},flush=True); "
         f"os.write({test_ready_w},b'1'); os.close({test_ready_w}); "
-        "time.sleep(30)"
+        f"assert os.read({release_r},1)==b'1'; os.close({release_r}); "
+        f"print({output!r},flush=True); "
+        "threading.Event().wait()"
     )
     backend = LocalSubprocessComputeBackend()
     handle = await backend.launch(direct_spec(source))
     os.close(test_ready_w)
+    os.close(release_r)
     await wait_for_child_ready(test_ready_r)
+    # Overflow cannot kill the leader before its readiness write completes.
+    os.write(release_w, b"1")
+    os.close(release_w)
 
-    result = await asyncio.wait_for(
-        backend.wait(handle, 0.2 if trigger == "timeout" else 2),
-        # This bound is only a hang guard for broken termination, not a latency
-        # assertion about signal delivery or output-pipe draining.
-        timeout=10,
-    )
+    result = await backend.wait(handle, 0 if trigger == "timeout" else None)
     await backend.cleanup(handle)
 
     assert result.timed_out is (trigger == "timeout")
@@ -602,6 +604,15 @@ async def test_closed_worker_direct_parity_inventory(
             os.fchdir(fd)
 
         monkeypatch.setattr(worker_exec, "_drop_worker", enter_worker)
+        monitor = worker_exec._wait_with_output_limits
+
+        def after_output_producer(proc: Any, *args: Any) -> Any:
+            # Output goes directly to files, so completion does not need the
+            # monitor to drain a pipe. Startup belongs to the protocol ceiling.
+            proc.wait()
+            return monitor(proc, *args)
+
+        monkeypatch.setattr(worker_exec, "_wait_with_output_limits", after_output_producer)
 
         def serve() -> None:
             try:
@@ -623,8 +634,8 @@ async def test_closed_worker_direct_parity_inventory(
             authorization, worker_client=client
         )
         handle = await backend.launch(work)
-        worker = await backend.wait(handle, 5)
-        server.join(timeout=5)
+        worker = await backend.wait(handle, None)
+        server.join()
         assert not server.is_alive()
         assert handle.identifier not in worker_exec._jobs
         assert not (worker_exec.HOME_ROOT / handle.identifier).exists()
@@ -635,7 +646,7 @@ async def test_closed_worker_direct_parity_inventory(
         monkeypatch.setattr("mimir.worklink.checkout.coding_enabled", lambda: False)
         direct_backend = LocalSubprocessComputeBackend()
         direct_handle = await direct_backend.launch(direct_spec(source))
-        direct = await direct_backend.wait(direct_handle, 5)
+        direct = await direct_backend.wait(direct_handle, None)
         await direct_backend.cleanup(direct_handle)
         with pytest.raises(KeyError):
             await direct_backend.wait(direct_handle, 1)
@@ -658,7 +669,7 @@ async def test_closed_worker_direct_parity_inventory(
         backend, handle = await launch_worker(monkeypatch, client)
         worker = await backend.wait(handle, 0.01)
         await backend.cleanup(handle)
-        direct = await run_direct(monkeypatch, "import time; time.sleep(2)", timeout=0.01)
+        direct = await run_direct(monkeypatch, "import threading; threading.Event().wait()", timeout=0)
         assert client.cancelled == [handle.identifier]
         assert worker.timed_out is direct.timed_out is True
         assert worker.exit_code == direct.exit_code == -15
@@ -675,10 +686,10 @@ async def test_closed_worker_direct_parity_inventory(
             [
                 sys.executable,
                 "-c",
-                "import os,signal,time; "
+                "import os,signal,threading; "
                 "signal.signal(signal.SIGTERM,signal.SIG_IGN); "
                 f"os.write({executor_ready_w},b'1'); os.close({executor_ready_w}); "
-                "time.sleep(30)",
+                "threading.Event().wait()",
             ],
             start_new_session=True,
             pass_fds=(executor_ready_w,),
@@ -751,7 +762,7 @@ async def test_closed_worker_direct_parity_inventory(
         backend, handle = await launch_worker(monkeypatch, auth_client)
         worker_exec._jobs[handle.identifier] = executor_process
         await backend.cancel(handle)
-        worker = await backend.wait(handle, 2)
+        worker = await backend.wait(handle, None)
         executor_events.append("terminal")
         await backend.cleanup(handle)
         executor_events.append("cleanup")
@@ -815,16 +826,16 @@ async def test_closed_worker_direct_parity_inventory(
         direct_backend = LocalSubprocessComputeBackend()
         direct_handle = await direct_backend.launch(
             direct_spec(
-                "import os,signal,time; "
+                "import os,signal,threading; "
                 "signal.signal(signal.SIGTERM, lambda *_: os.write(1,b'term\\n')); "
                 "os.write(1,b'ready\\n'); "
                 f"os.write({direct_ready_w},b'1'); os.close({direct_ready_w}); "
-                "time.sleep(30)"
+                "threading.Event().wait()"
             )
         )
         os.close(direct_ready_w)
         await wait_for_child_ready(direct_ready_r)
-        direct = await direct_backend.wait(direct_handle, 0.2)
+        direct = await direct_backend.wait(direct_handle, 0)
         direct_events.append("terminal")
         await direct_backend.cleanup(direct_handle)
         direct_events.append("cleanup")
@@ -844,8 +855,8 @@ async def test_closed_worker_direct_parity_inventory(
         backend, first = await launch_worker(monkeypatch, client)
         second = await backend.launch(spec())
         assert first.identifier != second.identifier
-        first_wait = asyncio.create_task(backend.wait(first, 2))
-        second_wait = asyncio.create_task(backend.wait(second, 2))
+        first_wait = asyncio.create_task(backend.wait(first, None))
+        second_wait = asyncio.create_task(backend.wait(second, None))
         mismatched = LaunchHandle(
             first.substrate,
             first.identifier,
@@ -887,8 +898,8 @@ async def test_closed_worker_direct_parity_inventory(
         direct_ready = tmp_path / "direct-one-ready"
         direct_first = await direct_backend.launch(
             direct_spec(
-                "import pathlib,time; print('direct one',flush=True); "
-                f"pathlib.Path({str(direct_ready)!r}).touch(); time.sleep(30)"
+                "import pathlib,threading; print('direct one',flush=True); "
+                f"pathlib.Path({str(direct_ready)!r}).touch(); threading.Event().wait()"
             )
         )
         direct_second = await direct_backend.launch(direct_spec("print('direct two')"))
@@ -907,14 +918,12 @@ async def test_closed_worker_direct_parity_inventory(
             await direct_backend.cleanup(direct_mismatched)
         assert direct_first.identifier in direct_backend._jobs
         assert direct_second.identifier in direct_backend._jobs
-        direct_second_result = await direct_backend.wait(direct_second, 2)
-        for _ in range(200):
-            if direct_ready.exists():
-                break
+        direct_second_result = await direct_backend.wait(direct_second, None)
+        while not direct_ready.exists():
             await asyncio.sleep(0.01)
         assert direct_ready.exists()
         await direct_backend.cancel(direct_first)
-        direct_first_result = await direct_backend.wait(direct_first, 2)
+        direct_first_result = await direct_backend.wait(direct_first, None)
         await direct_backend.cleanup(direct_first)
         await direct_backend.cleanup(direct_second)
         assert (direct_first_result.stdout, direct_first_result.stderr, direct_first_result.exit_code) == (
@@ -993,8 +1002,9 @@ async def test_closed_worker_direct_parity_inventory(
         monkeypatch.delenv("MIMIR_CODING_ENABLED", raising=False)
         baseline_backend = LocalSubprocessComputeBackend()
         baseline_handle = await baseline_backend.launch(disabled_spec())
-        baseline = await baseline_backend.wait(baseline_handle, 2)
+        baseline = await baseline_backend.wait(baseline_handle, None)
         await baseline_backend.cleanup(baseline_handle)
+        assert (baseline.exit_code, baseline.stdout, baseline.stderr) == (0, "unchanged\n", "")
 
         for flag in ("false", None):
             if flag is None:
@@ -1005,7 +1015,7 @@ async def test_closed_worker_direct_parity_inventory(
                 ForbiddenAuthorization()
             )
             handle = await backend.launch(disabled_spec())
-            result = await backend.wait(handle, 2)
+            result = await backend.wait(handle, None)
             await backend.cleanup(handle)
             assert result_shape(result) == result_shape(baseline)
         assert touched == {

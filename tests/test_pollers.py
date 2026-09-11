@@ -1799,6 +1799,7 @@ print(json.dumps({"poller": "x", "prompt": prompt}))
 
 
 @pytest.mark.asyncio
+@pytest.mark.timeout(60)
 async def test_run_poller_exports_its_effective_timeout(
     tmp_path: Path, home: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1809,6 +1810,11 @@ async def test_run_poller_exports_its_effective_timeout(
     different one must have that value reach the subprocess, or a poller sizing
     its deadlines from the env would overrun.
     """
+    async def ready():
+        pass
+
+    # This tests the exported value, not Python startup within that value.
+    _control_poller_wait(monkeypatch, ready, expire=False)
     monkeypatch.delenv("POLLER_TIMEOUT_SECONDS", raising=False)
     skill_dir = tmp_path / "skill"
     _install_script(skill_dir, "poller.py", """
@@ -3379,21 +3385,73 @@ sys.exit(1)
     assert stderr[0].get("exit_code") == 1
 
 
+def _control_poller_wait(monkeypatch, ready, *, expire=True, reap=False):
+    """Replace only the poller's deadline, not the event loop's clock/waits.
+
+    Readiness has no stage deadline: the test's whole-protocol timeout bounds
+    startup, the handshake, expiry, and cleanup together.
+    """
+    from mimir import pollers
+
+    calls = []
+
+    async def wait(tasks, *, timeout):
+        calls.append(("drain", timeout))
+        await ready()
+        if expire:
+            return set(), set(tasks)
+        return await asyncio.wait(tasks)
+
+    async def wait_for(awaitable, *, timeout):
+        calls.append(("reap", timeout))
+        if reap:
+            awaitable.close()
+            raise asyncio.TimeoutError
+        return await asyncio.wait_for(awaitable, timeout=timeout)
+
+    monkeypatch.setattr(pollers, "asyncio", SimpleNamespace(
+        **{name: getattr(asyncio, name) for name in dir(asyncio)
+           if name not in {"wait", "wait_for"}},
+        wait=wait, wait_for=wait_for,
+    ))
+    return calls
+
+
+async def _poller_file_ready(path):
+    while not path.exists():
+        await asyncio.sleep(0.01)
+
+
+def _poller_clock(monkeypatch):
+    from mimir import pollers
+
+    now = [100.0]
+    monkeypatch.setattr(pollers, "time", SimpleNamespace(
+        **{name: getattr(time, name) for name in dir(time) if name != "monotonic"},
+        monotonic=lambda: now[0],
+    ))
+    return now
+
+
 @pytest.mark.asyncio
+@pytest.mark.timeout(60)
 @pytest.mark.parametrize("count", [0, 3])
 @pytest.mark.parametrize("tail", ["", '{"prompt": "cut off', '{"prompt": "no newline"}'])
 async def test_run_poller_timeout_kills_subprocess(
     tmp_path: Path, home: Path, count: int, tail: str, monkeypatch,
 ) -> None:
     """Recover complete records, never an unterminated final record."""
+    now = _poller_clock(monkeypatch)
     skill_dir = tmp_path / "skill"
     _install_script(skill_dir, "poller.py", f"""
-import json, sys, time
+import json, sys, signal
+from pathlib import Path
 for i in range({count}):
     print(json.dumps({{"prompt": f"event {{i}}"}}), flush=True)
 sys.stdout.write({tail!r})
 sys.stdout.flush()
-time.sleep(120)
+Path("output-ready").touch()
+signal.pause()
 """)
     cfg = PollerConfig(
         name="x", command=f"{sys.executable} poller.py",
@@ -3405,8 +3463,11 @@ time.sleep(120)
         _circuit_breakers, cfg.name,
         _CircuitBreakerState(consecutive_failures=failures),
     )
-    # Use a much shorter timeout for the test.
+    calls = _control_poller_wait(
+        monkeypatch, lambda: _poller_file_ready(skill_dir / "output-ready"),
+    )
     n = await run_poller(cfg, enqueue=enq, timeout=2.0)
+    assert calls[0] == ("drain", 2.0)
     assert n == count
     assert [e.content for e in enq.events] == [f"event {i}" for i in range(count)]
     assert _circuit_breakers[cfg.name].consecutive_failures == failures + 1
@@ -3417,7 +3478,9 @@ time.sleep(120)
     assert not any(e["type"] == "poller_invalid_line" for e in events)
     assert not any(e["type"] == "poller_nonzero_exit" for e in events)
     if count:
-        assert _circuit_breakers[cfg.name].disabled_until > time.monotonic()
+        assert _circuit_breakers[cfg.name].disabled_until == (
+            now[0] + POLLER_CIRCUIT_BREAKER_BACKOFF_SECONDS
+        )
         assert any(
             e["type"] == "poller_circuit_tripped" and e["reason"] == "timeout"
             for e in events
@@ -3444,8 +3507,9 @@ def _live_process_group_members(process_group: int) -> list[int]:
 
 
 @pytest.mark.asyncio
+@pytest.mark.timeout(60)
 async def test_run_poller_timeout_kills_child_holding_pipes(
-    tmp_path: Path, home: Path,
+    tmp_path: Path, home: Path, monkeypatch,
 ) -> None:
     """Timeout kills the whole process group, not just the shell.
 
@@ -3457,22 +3521,20 @@ async def test_run_poller_timeout_kills_child_holding_pipes(
     if not hasattr(os, "killpg") or not Path("/proc").is_dir():
         pytest.skip("process-group liveness assertion requires POSIX /proc")
 
-    # The timeout includes Python startup and child creation under xdist load.
-    # Match the neighboring subprocess tests so the pipe-holder can start.
-    poller_timeout = 2.0
     skill_dir = tmp_path / "skill"
     _install_script(skill_dir, "poller.py", """
 import json, os, subprocess, sys
 child = subprocess.Popen([
     sys.executable,
     "-c",
-    "import signal; "
+    "import signal; from pathlib import Path; Path('grandchild-ready').touch(); "
     "signal.pause()",
 ])
 pgid_path = os.path.join(os.environ["STATE_DIR"], "child.pgid")
 with open(pgid_path, "w", encoding="utf-8") as f:
     f.write(str(os.getpgrp()))
 print(json.dumps({"poller": "x", "prompt": "would emit"}), flush=True)
+open("output-ready", "w").close()
 """)
     cfg = PollerConfig(
         name="child-holder",
@@ -3483,15 +3545,38 @@ print(json.dumps({"poller": "x", "prompt": "would emit"}), flush=True)
     )
     enq = _CapturingEnqueue()
 
-    n = await run_poller(cfg, enqueue=enq, timeout=poller_timeout)
+    async def ready():
+        await _poller_file_ready(skill_dir / "grandchild-ready")
+        await _poller_file_ready(skill_dir / "child.pgid")
+        await _poller_file_ready(skill_dir / "output-ready")
 
+    from mimir import pollers
+
+    killpg = Mock(wraps=os.killpg)
+    monkeypatch.setattr(pollers, "os", SimpleNamespace(
+        **{name: getattr(os, name) for name in dir(os) if name != "killpg"},
+        killpg=killpg,
+    ))
+    kill_group = pollers._kill_process_group
+
+    def observed_kill(proc):
+        kill_group(proc)
+        if not killpg.called:
+            # Rescue only a missing group kill so the regression fails the
+            # signal assertion, not a wait on the descendant's open pipes.
+            os.killpg(proc.pid, signal.SIGKILL)
+
+    monkeypatch.setattr(pollers, "_kill_process_group", observed_kill)
+    _control_poller_wait(monkeypatch, ready)
+    n = await run_poller(cfg, enqueue=enq, timeout=2.0)
+
+    child_pgid = int((skill_dir / "child.pgid").read_text())
+    killpg.assert_any_call(child_pgid, signal.SIGKILL)
     assert n == 1
     assert [e.content for e in enq.events] == ["would emit"]
     events = _read_events(home)
     timeouts = [e for e in events if e["type"] == "poller_timeout"]
     assert len(timeouts) == 1
-
-    child_pgid = int((skill_dir / "child.pgid").read_text())
 
     # Poll rather than sampling once. ``run_poller`` returns after killing the
     # group, but ``proc.wait()`` reaps only the direct child — a descendant
@@ -3501,12 +3586,10 @@ print(json.dumps({"poller": "x", "prompt": "would emit"}), flush=True)
     # not, and this assertion failed spuriously — which sent eight Worklink
     # executors editing ``mimir/pollers.py`` to satisfy it (chainlink #1258).
     #
-    # This still asserts the teardown property: a group that genuinely retains a
-    # live member stays non-empty until the deadline expires and then fails.
-    deadline = time.monotonic() + 5.0
+    # The whole-protocol ceiling also covers kernel teardown visibility.
     while True:
         live_group_members = _live_process_group_members(child_pgid)
-        if not live_group_members or time.monotonic() >= deadline:
+        if not live_group_members:
             break
         await asyncio.sleep(0.05)
 
@@ -3514,9 +3597,10 @@ print(json.dumps({"poller": "x", "prompt": "would emit"}), flush=True)
 
 
 @pytest.mark.asyncio
+@pytest.mark.timeout(60)
 @pytest.mark.parametrize("count", [0, 3])
 async def test_run_poller_bounded_when_child_closes_pipes_but_keeps_running(
-    tmp_path: Path, home: Path, count: int,
+    tmp_path: Path, home: Path, count: int, monkeypatch,
 ) -> None:
     """chainlink #410: ``asyncio.wait`` bounds only the pipe drains.
     A poller that CLOSES stdout/stderr (drains hit EOF inside the
@@ -3526,25 +3610,27 @@ async def test_run_poller_bounded_when_child_closes_pipes_but_keeps_running(
     be grace-bounded and route into the existing timeout path."""
     skill_dir = tmp_path / "skill"
     _install_script(skill_dir, "poller.py", f"""
-import json, os, time
+import json, os, signal
+from pathlib import Path
 for i in range({count}):
     print(json.dumps({{"prompt": f"event {{i}}"}}), flush=True)
 os.close(1)
 os.close(2)
-time.sleep(30)
+Path("fds-closed").touch()
+signal.pause()
 """)
     cfg = PollerConfig(
-        name="fd-closer", command=f"{sys.executable} poller.py",
+        # Replace the shell so it cannot keep duplicate pipe FDs open.
+        name="fd-closer", command=f"exec {sys.executable} poller.py",
         cron="* * * * *", env={}, skill_dir=skill_dir,
     )
     enq = _CapturingEnqueue()
-    # Outer wait_for fails the test promptly on regression instead of
-    # hanging the suite for the child's 30s sleep. The grace window is
-    # min(POLLER_EXIT_GRACE_SECONDS, timeout), so worst case here is
-    # ~2s (drain timeout) + ~2s (exit grace) — well under the bound.
-    n = await asyncio.wait_for(
-        run_poller(cfg, enqueue=enq, timeout=2.0), timeout=15.0,
+    calls = _control_poller_wait(
+        monkeypatch, lambda: _poller_file_ready(skill_dir / "fds-closed"),
+        expire=False, reap=True,
     )
+    n = await run_poller(cfg, enqueue=enq, timeout=2.0)
+    assert calls == [("drain", 2.0), ("reap", 2.0)]
     assert n == count
     assert [e.content for e in enq.events] == [f"event {i}" for i in range(count)]
     events = _read_events(home)
@@ -3728,10 +3814,31 @@ print(json.dumps({"poller": "x", "prompt": "repair", "delivery_key": "ci:key"}))
     assert len(receipts) == int(accepted)
 
 
+def _observe_poller_barrier(monkeypatch):
+    from mimir import pollers
+
+    completed = asyncio.Event()
+    drain = pollers._drain_capped
+
+    async def observed_drain(stream, limit, overflow, on_line=None):
+        async def observed_line(line):
+            await on_line(line)
+            completed.set()
+
+        return await drain(
+            stream, limit, overflow, observed_line if on_line else None,
+        )
+
+    monkeypatch.setattr(pollers, "_drain_capped", observed_drain)
+    return completed
+
+
 @pytest.mark.asyncio
+@pytest.mark.timeout(60)
 async def test_delivery_barrier_is_acked_before_dispatch_phase_timeout(
     tmp_path: Path,
     home: Path,
+    monkeypatch,
 ) -> None:
     """A hard kill after the barrier cannot lose the accepted failure alert."""
     skill_dir = tmp_path / "skill"
@@ -3753,12 +3860,12 @@ print(json.dumps({{
     "delivery_barrier": True,
 }}), flush=True)
 receipt = Path(os.environ["STATE_DIR"]) / ".delivery-receipts" / hashlib.sha256(delivery_key.encode()).hexdigest()
-deadline = time.monotonic() + 2
-while not receipt.exists() and time.monotonic() < deadline:
+while not receipt.exists():
     time.sleep(0.01)
 if receipt.exists():
     Path({str(dispatch_started)!r}).write_text("started", encoding="utf-8")
-    time.sleep(10)
+    import signal
+    signal.pause()
 """)
     cfg = PollerConfig(
         name="x",
@@ -3769,8 +3876,15 @@ if receipt.exists():
         persist_dir=persist_dir,
     )
 
-    # Allow child startup and the durable receipt handshake under xdist load;
-    # stay below the child's 10-second dispatch sleep to exercise the hard kill.
+    completed = _observe_poller_barrier(monkeypatch)
+
+    async def ready():
+        await completed.wait()
+        # A missing receipt is an assertion failure below, not a readiness hang.
+        if list((persist_dir / ".delivery-receipts").glob("*")):
+            await _poller_file_ready(dispatch_started)
+
+    _control_poller_wait(monkeypatch, ready)
     await run_poller(
         cfg,
         enqueue=_CapturingEnqueue(),
@@ -3778,8 +3892,9 @@ if receipt.exists():
         home=home,
     )
 
-    assert dispatch_started.read_text(encoding="utf-8") == "started"
     assert len(list((persist_dir / ".delivery-receipts").glob("*"))) == 1
+    assert dispatch_started.exists()
+    assert dispatch_started.read_text(encoding="utf-8") == "started"
     events = _read_events(home)
     assert len([event for event in events if event["type"] == "poller_timeout"]) == 1
     alerts = [
@@ -3791,6 +3906,7 @@ if receipt.exists():
 
 
 @pytest.mark.asyncio
+@pytest.mark.timeout(60)
 async def test_delivery_barrier_refuses_receipt_when_alert_append_fails(
     tmp_path: Path,
     home: Path,
@@ -3823,11 +3939,10 @@ print(json.dumps({{
     "delivery_barrier": True,
 }}), flush=True)
 receipt = Path(os.environ["STATE_DIR"]) / ".delivery-receipts" / hashlib.sha256(delivery_key.encode()).hexdigest()
-deadline = time.monotonic() + 1
-while not receipt.exists() and time.monotonic() < deadline:
+while True:
+    if receipt.exists():
+        Path({str(dispatch_started)!r}).write_text("started", encoding="utf-8")
     time.sleep(0.01)
-if receipt.exists():
-    Path({str(dispatch_started)!r}).write_text("started", encoding="utf-8")
 """)
 
     from mimir import event_logger as _event_logger
@@ -3848,7 +3963,10 @@ if receipt.exists():
         persist_dir=persist_dir,
     )
 
+    completed = _observe_poller_barrier(monkeypatch)
+    _control_poller_wait(monkeypatch, completed.wait)
     await run_poller(cfg, enqueue=_CapturingEnqueue(), timeout=2, home=home)
+    assert completed.is_set(), "barrier refusal must finish before checking absence"
 
     receipts = list((persist_dir / ".delivery-receipts").glob("*")) if (
         persist_dir / ".delivery-receipts"
@@ -5525,7 +5643,7 @@ async def test_circuit_breaker_resets_after_successful_run(tmp_path, home, clear
 
 @pytest.mark.asyncio
 async def test_circuit_breaker_rearms_after_backoff_expiry(
-    tmp_path, home, clear_circuit_breakers,
+    tmp_path, home, clear_circuit_breakers, monkeypatch,
 ):
     """chainlink #409: the failure counter only resets on a CLEAN run,
     so a hard-down poller's count keeps climbing past the threshold.
@@ -5533,15 +5651,16 @@ async def test_circuit_breaker_rearms_after_backoff_expiry(
     threshold expired and never re-armed — the poller stormed every
     tick forever. Every failure at/past the threshold must re-open the
     circuit."""
+    now = _poller_clock(monkeypatch)
     cfg = _failing_poller_cfg(tmp_path)
     enq = _CapturingEnqueue()
 
-    # Trip the circuit, then simulate the backoff window expiring.
+    # Advance only the product clock; leave the stored deadline intact.
     for _ in range(POLLER_CIRCUIT_BREAKER_THRESHOLD):
         await run_poller(cfg, enqueue=enq)
     state = _circuit_breakers[cfg.name]
-    assert state.disabled_until > time.monotonic()
-    state.disabled_until = time.monotonic() - 1.0
+    assert state.disabled_until == now[0] + POLLER_CIRCUIT_BREAKER_BACKOFF_SECONDS
+    now[0] = state.disabled_until + 1.0
 
     # The poller is still hard-down: this run executes (circuit no
     # longer open), fails, and pushes the count PAST the threshold —
@@ -5549,7 +5668,7 @@ async def test_circuit_breaker_rearms_after_backoff_expiry(
     await run_poller(cfg, enqueue=enq)
     state = _circuit_breakers[cfg.name]
     assert state.consecutive_failures == POLLER_CIRCUIT_BREAKER_THRESHOLD + 1
-    assert state.disabled_until > time.monotonic(), (
+    assert state.disabled_until == now[0] + POLLER_CIRCUIT_BREAKER_BACKOFF_SECONDS, (
         "circuit must re-open on every failure at/past the threshold "
         "(chainlink #409) — exact-equality arming storms forever after "
         "the first backoff expires"
@@ -5766,6 +5885,7 @@ async def test_drain_capped_none_stream():
 
 
 @pytest.mark.asyncio
+@pytest.mark.timeout(60)
 @pytest.mark.parametrize("stream", ["stdout", "stderr"])
 @pytest.mark.parametrize("timeout_during_drain", [False, True])
 async def test_run_poller_output_overflow_kills_and_fails(
@@ -5777,17 +5897,25 @@ async def test_run_poller_output_overflow_kills_and_fails(
     import mimir.pollers as pollers_mod
     monkeypatch.setattr(pollers_mod, "MAX_POLLER_STDOUT_BYTES", 1024)
     monkeypatch.setattr(pollers_mod, "MAX_POLLER_STDERR_BYTES", 1024)
-    if timeout_during_drain:
-        drain = pollers_mod._drain_capped
+    drain = pollers_mod._drain_capped
+    drained = []
+    both_drained = asyncio.Event()
+    release = asyncio.Event()
 
-        async def slow_drain(*args, **kwargs):
-            output = await drain(*args, **kwargs)
-            # Force the deadline to expire while an overflowed drain is
-            # finishing, so recovery must still reject its valid prefix.
-            await asyncio.sleep(2.1)
-            return output
+    async def held_drain(*args, **kwargs):
+        output = await drain(*args, **kwargs)
+        drained.append(output)
+        if len(drained) == 2:
+            both_drained.set()
+        await release.wait()
+        return output
 
-        monkeypatch.setattr(pollers_mod, "_drain_capped", slow_drain)
+    async def ready():
+        await both_drained.wait()
+        release.set()
+
+    monkeypatch.setattr(pollers_mod, "_drain_capped", held_drain)
+    _control_poller_wait(monkeypatch, ready, expire=timeout_during_drain)
     skill_dir = tmp_path / "skill"
     # Emit a valid event line, then flood far past the 1 KB ceiling.
     _install_script(skill_dir, "poller.py", (

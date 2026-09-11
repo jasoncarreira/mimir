@@ -8,8 +8,8 @@ import os
 import socket
 import stat
 import sys
-import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -17,9 +17,11 @@ import mimir.acp.python_kernel as kernel
 from mimir.acp.python_kernel import PythonKernelManager, PythonKernelUnavailable
 
 
+pytestmark = pytest.mark.timeout(120)
+
+
 async def _stopped(pid: int) -> bool:
-    deadline = asyncio.get_running_loop().time() + 5
-    while asyncio.get_running_loop().time() < deadline:
+    while True:
         try:
             state = (Path("/proc") / str(pid) / "stat").read_text().split()[2]
         except (FileNotFoundError, ProcessLookupError, IndexError):
@@ -27,7 +29,6 @@ async def _stopped(pid: int) -> bool:
         if state == "Z":
             return True
         await asyncio.sleep(0.01)
-    return False
 
 
 @pytest.mark.asyncio
@@ -40,9 +41,23 @@ async def test_stopped_handles_process_exit_during_proc_read(monkeypatch: pytest
 
 
 async def _appears(path: Path) -> None:
-    async with asyncio.timeout(5):
-        while not path.exists():
-            await asyncio.sleep(0.01)
+    while not path.exists():
+        await asyncio.sleep(0.01)
+
+
+@pytest.fixture
+def execution_timers(monkeypatch):
+    timers = []
+
+    def timeout_at(deadline):
+        timer = asyncio.timeout(None)
+        timers.append(timer)
+        return timer
+
+    monkeypatch.setattr(kernel, "asyncio", SimpleNamespace(**{
+        **vars(asyncio), "timeout_at": timeout_at,
+    }))
+    return timers
 
 
 @pytest.mark.asyncio
@@ -180,13 +195,19 @@ async def test_exception_utf8_bound_and_omitted_byte_count_are_exact(
 
 
 @pytest.mark.asyncio
-async def test_timeout_and_crash_discard_namespace(tmp_path: Path) -> None:
+async def test_timeout_and_crash_discard_namespace(tmp_path: Path, execution_timers) -> None:
     manager = PythonKernelManager()
+    task = None
     try:
         assert (await manager.execute("timeout", tmp_path, "1", 5))["ok"] is True
-        timed_out = await manager.execute(
-            "timeout", tmp_path, "import time\nmarker = 1\ntime.sleep(30)", 3
-        )
+        task = asyncio.create_task(manager.execute(
+            "timeout", tmp_path,
+            "import pathlib,signal\nmarker = 1\npathlib.Path('entered').touch()\nsignal.pause()", 3
+        ))
+        await _appears(tmp_path / "entered")
+        assert not task.done()
+        execution_timers[-1].reschedule(0)
+        timed_out = await task
         assert timed_out == {
             "ok": False,
             "stdout": "",
@@ -207,20 +228,29 @@ async def test_timeout_and_crash_discard_namespace(tmp_path: Path) -> None:
         assert crashed["stdout"] == ""
         assert (await manager.execute("timeout", tmp_path, "1"))["kernel"] == "fresh"
     finally:
+        if task is not None:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
         await manager.close()
 
 
 @pytest.mark.asyncio
-async def test_timeout_and_crash_retain_streams_exactly(tmp_path: Path) -> None:
+async def test_timeout_and_crash_retain_streams_exactly(tmp_path: Path, execution_timers) -> None:
     manager = PythonKernelManager()
+    task = None
     try:
         assert (await manager.execute("timeout", tmp_path, "1", 5))["ok"] is True
-        timed_out = await manager.execute(
+        task = asyncio.create_task(manager.execute(
             "timeout",
             tmp_path,
-            "import os,time\nos.write(1,b'before-timeout')\nos.write(2,b'err-timeout')\ntime.sleep(30)",
+            "import os,signal,pathlib\nos.write(1,b'before-timeout')\nos.write(2,b'err-timeout')\npathlib.Path('entered').touch()\nsignal.pause()",
             3,
-        )
+        ))
+        await _appears(tmp_path / "entered")
+        assert not task.done()
+        execution_timers[-1].reschedule(0)
+        timed_out = await task
+        assert timed_out["kernel"] == "timed_out"
         assert timed_out["stdout"] == "before-timeout"
         assert timed_out["stderr"] == "err-timeout"
         assert timed_out["exception"] == (
@@ -241,6 +271,9 @@ async def test_timeout_and_crash_retain_streams_exactly(tmp_path: Path) -> None:
             "kernel": "crashed",
         }
     finally:
+        if task is not None:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
         await manager.close()
 
 
@@ -301,18 +334,38 @@ async def test_crash_result_survives_killpg_permission_error(
         await manager.close()
 
 
+@pytest.mark.timeout(120)
 @pytest.mark.asyncio
 async def test_live_control_eof_is_killed_without_waiting_for_worker(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     manager = PythonKernelManager()
+    trace = []
+    receive = manager._receive
+
+    async def observed_receive(channel):
+        try:
+            result = await receive(channel)
+        except EOFError:
+            assert next(iter(manager._processes)).returncode is None
+            trace.append("live EOF")
+            raise
+        assert result == {"ready": True}
+        trace.append("cold handshake")
+        return result
+
+    monkeypatch.setattr(manager, "_receive", observed_receive)
+    monkeypatch.setattr(kernel, "asyncio", SimpleNamespace(**{
+        **vars(asyncio), "timeout_at": lambda deadline: asyncio.timeout(None),
+    }))
     try:
         result = await manager.execute(
             "eof",
             tmp_path,
-            "import os,stat,time\nfor fd in range(3,256):\n try:\n  if stat.S_ISSOCK(os.fstat(fd).st_mode): os.close(fd)\n except OSError: pass\ntime.sleep(10)",
-            2,
+            "import os,stat,signal\nfor fd in range(3,256):\n try:\n  if stat.S_ISSOCK(os.fstat(fd).st_mode): os.close(fd)\n except OSError: pass\nsignal.pause()",
+            120,
         )
+        assert trace == ["cold handshake", "live EOF"]
         assert result["kernel"] == "crashed"
         assert result["exception"] == (
             "kernel process exited with code -9; namespace state lost"
@@ -331,11 +384,11 @@ async def test_direct_exit_still_kills_owned_process_group_descendant(
     # Existence is the parent's readiness signal; publish only a complete PID
     # so process-group cleanup cannot interrupt the fixture's write.
     child_code = (
-        "import os,time,pathlib;"
+        "import os,signal,pathlib;"
         f"identity=pathlib.Path({str(identity)!r});"
         "identity.with_suffix('.tmp').write_text(str(os.getpid()));"
         "identity.with_suffix('.tmp').replace(identity);"
-        "time.sleep(30)"
+        "signal.pause()"
     )
     code = (
         "import os,subprocess,sys,time\n"
@@ -345,9 +398,6 @@ async def test_direct_exit_still_kills_owned_process_group_descendant(
     )
     try:
         result = await manager.execute("descendant", tmp_path, code)
-        async with asyncio.timeout(5):
-            while not identity.read_text():
-                await asyncio.sleep(0.01)
         pid = int(identity.read_text())
         assert result["exception"] == (
             "kernel process exited with code 37; namespace state lost"
@@ -364,11 +414,21 @@ async def test_sessions_parallel_and_namespaces_isolated(tmp_path: Path) -> None
     first_cwd.mkdir()
     second_cwd.mkdir()
     manager = PythonKernelManager()
+    tasks = []
     try:
-        first, second = await asyncio.gather(
-            manager.execute("one", first_cwd, "import time\ntime.sleep(.2)\nvalue = 1"),
-            manager.execute("two", second_cwd, "import time\ntime.sleep(.2)\nvalue = 2"),
-        )
+        for name, cwd, value in (("one", first_cwd, 1), ("two", second_cwd, 2)):
+            tasks.append(asyncio.create_task(manager.execute(
+                name, cwd,
+                "import pathlib,time\npathlib.Path('entered').touch()\n"
+                "while not pathlib.Path('release').exists(): time.sleep(.01)\n"
+                f"value = {value}", 120,
+            )))
+        await _appears(first_cwd / "entered")
+        await _appears(second_cwd / "entered")
+        assert all(not task.done() for task in tasks)
+        (first_cwd / "release").touch()
+        (second_cwd / "release").touch()
+        first, second = await asyncio.gather(*tasks)
         assert first["kernel"] == second["kernel"] == "fresh"
         values = await asyncio.gather(
             manager.execute("one", first_cwd, "value"),
@@ -377,6 +437,9 @@ async def test_sessions_parallel_and_namespaces_isolated(tmp_path: Path) -> None
         assert [item["value"] for item in values] == ["1", "2"]
         assert set(manager._kernels) == {str(first_cwd.resolve()), str(second_cwd.resolve())}
     finally:
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
         await manager.close()
 
 
@@ -484,9 +547,8 @@ async def test_other_session_cannot_execute_kill_or_release_owned_cwd(
                 "while not pathlib.Path('finish').exists(): time.sleep(.01)",
             ))
             await _appears(tmp_path / "entered")
-        async with asyncio.timeout(2):
-            with pytest.raises(PythonKernelUnavailable, match="owned.*owner.*refused"):
-                await manager.execute("intruder", alias, command)
+        with pytest.raises(PythonKernelUnavailable, match="owned.*owner.*refused"):
+            await manager.execute("intruder", alias, command)
         await manager.release("intruder")
         assert state.owner == "owner"
         assert state.worker is worker
@@ -531,23 +593,22 @@ async def test_control_command_waiting_admission_is_rejected_when_close_begins(
     admission = manager._admission = _ObservedLock()
     tasks = []
     try:
-        async with asyncio.timeout(5):
-            async with admission:
-                command = asyncio.create_task(
-                    manager.execute("one", tmp_path, "%kernel release")
-                )
-                tasks.append(command)
-                await admission.waiting.wait()
-                assert not manager._closed
-                admission.waiting.clear()
-                closing = asyncio.create_task(manager.close())
-                tasks.append(closing)
-                await admission.waiting.wait()
-                assert manager._closed
-                assert not command.done()
-            with pytest.raises(PythonKernelUnavailable, match="^kernel manager is closed$"):
-                await command
-            await closing
+        async with admission:
+            command = asyncio.create_task(
+                manager.execute("one", tmp_path, "%kernel release")
+            )
+            tasks.append(command)
+            await admission.waiting.wait()
+            assert not manager._closed
+            admission.waiting.clear()
+            closing = asyncio.create_task(manager.close())
+            tasks.append(closing)
+            await admission.waiting.wait()
+            assert manager._closed
+            assert not command.done()
+        with pytest.raises(PythonKernelUnavailable, match="^kernel manager is closed$"):
+            await command
+        await closing
     finally:
         for task in tasks:
             task.cancel()
@@ -571,28 +632,27 @@ async def test_execution_waiting_state_lock_is_rejected_when_close_begins(
 
     monkeypatch.setattr(manager, "_spawn", unexpected_spawn)
     try:
-        async with asyncio.timeout(5):
-            async with lock:
-                execution = asyncio.create_task(manager.execute("one", tmp_path, "42"))
-                tasks.append(execution)
-                await lock.waiting.wait()
-                assert state.waiters == 1
-                assert state.owner == "one"
-                assert not manager._closed
-                # Hold close at admission until execution checks the closed flag.
-                await admission.acquire()
-                closing = asyncio.create_task(manager.close())
-                tasks.append(closing)
-                await admission.waiting.wait()
-                assert manager._closed
-                assert not execution.done()
-            with pytest.raises(PythonKernelUnavailable, match="^kernel manager is closed$"):
-                await execution
-            assert state.waiters == 0
-            assert not lock.locked()
-            assert state.worker is None
-            admission.release()
-            await closing
+        async with lock:
+            execution = asyncio.create_task(manager.execute("one", tmp_path, "42"))
+            tasks.append(execution)
+            await lock.waiting.wait()
+            assert state.waiters == 1
+            assert state.owner == "one"
+            assert not manager._closed
+            # Hold close at admission until execution checks the closed flag.
+            await admission.acquire()
+            closing = asyncio.create_task(manager.close())
+            tasks.append(closing)
+            await admission.waiting.wait()
+            assert manager._closed
+            assert not execution.done()
+        with pytest.raises(PythonKernelUnavailable, match="^kernel manager is closed$"):
+            await execution
+        assert state.waiters == 0
+        assert not lock.locked()
+        assert state.worker is None
+        admission.release()
+        await closing
     finally:
         for task in tasks:
             task.cancel()
@@ -672,7 +732,7 @@ async def test_capacity_evicts_least_active_detached_kernel_and_descendant(tmp_p
         spawned = await manager.execute(
             "2", victim_cwd,
             "import os,signal,subprocess,sys\nsignal.signal(signal.SIGCHLD, signal.SIG_IGN)\n"
-            "child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'])\n"
+            "child = subprocess.Popen([sys.executable, '-c', 'import signal; signal.pause()'])\n"
             "(child.pid, os.getpgid(child.pid))",
         )
         child_pid, child_pgid = ast.literal_eval(spawned["value"])
@@ -695,13 +755,12 @@ async def test_capacity_evicts_least_active_detached_kernel_and_descendant(tmp_p
         assert worker.process not in manager._processes
         assert await _stopped(worker.process.pid)
         assert await _stopped(child_pid)
-        async with asyncio.timeout(5):
-            while True:
-                try:
-                    os.killpg(worker.pgid, 0)
-                except ProcessLookupError:
-                    break
-                await asyncio.sleep(0.01)
+        while True:
+            try:
+                os.killpg(worker.pgid, 0)
+            except ProcessLookupError:
+                break
+            await asyncio.sleep(0.01)
         for index in (0, 1):
             result = await manager.execute(str(index), tmp_path / str(index), "value")
             assert result["kernel"] == "reused"
@@ -728,9 +787,10 @@ async def test_function_import_and_loaded_data_persist(tmp_path: Path) -> None:
         await manager.close()
 
 
+@pytest.mark.timeout(120)
 @pytest.mark.asyncio
 async def test_queue_wait_is_outside_timeout_and_other_session_is_parallel(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from mimir.acp.execution_scope import ScopeApproval
 
@@ -749,6 +809,25 @@ async def test_queue_wait_is_outside_timeout_and_other_session_is_parallel(
     parallel_two = tmp_path / "two"
     parallel_one.mkdir()
     parallel_two.mkdir()
+    loop = asyncio.get_running_loop()
+    now = 1000.0
+    queued = None
+    queued_reads = []
+    tasks = []
+
+    class Clock:
+        def time(self):
+            if asyncio.current_task() is queued:
+                queued_reads.append(now)
+            return now
+
+        def __getattr__(self, name):
+            return getattr(loop, name)
+
+    monkeypatch.setattr(kernel, "asyncio", SimpleNamespace(**{
+        **vars(asyncio), "get_running_loop": lambda: Clock(),
+        "timeout_at": lambda deadline: asyncio.timeout(0 if deadline <= now else None),
+    }))
     try:
         blocker = asyncio.create_task(
             manager.execute(
@@ -756,69 +835,100 @@ async def test_queue_wait_is_outside_timeout_and_other_session_is_parallel(
                 tmp_path,
                 "import pathlib,time\npathlib.Path('entered').write_text('yes')\n"
                 "while not pathlib.Path('release').exists(): time.sleep(.01)",
-                5,
+                120,
             )
         )
-        await _appears(entered)
-        queued_at = time.monotonic()
+        tasks.append(blocker)
+        while not entered.exists():
+            await asyncio.sleep(0)
+        state = manager._kernels[str(tmp_path)]
+        # The active call already holds this lock; observe its real queued waiter.
+        lock = state.lock
         queued = asyncio.create_task(
             manager.execute("one", tmp_path, "2", 1)
         )
-        await asyncio.sleep(1.1)
+        tasks.append(queued)
+        while state.waiters != 1:
+            await asyncio.sleep(0)
+        assert lock.locked()
+        now += 2  # More than the queued call's budget, without spending wall time.
+        assert queued_reads == []
+        assert not queued.done()
         release.write_text("yes")
-        await blocker
+        assert (await blocker)["ok"]
         queued_result = await queued
         assert queued_result["value"] == "2"
         assert queued_result["timedOut"] is False
-        assert time.monotonic() - queued_at > 1
+        assert queued_reads[0] == 1002.0
 
-        parallel_at = time.monotonic()
         first, second = await asyncio.gather(
             manager.execute(
                 "parallel-one",
                 parallel_one,
-                f"import pathlib,time\npathlib.Path({str(markers[0])!r}).write_text('yes')\ndeadline=time.monotonic()+3\nwhile pathlib.Path({str(markers[1])!r}).read_text() != 'yes':\n if time.monotonic()>deadline: raise RuntimeError('not parallel')\n time.sleep(.01)\ntime.sleep(.3)\n1",
-                5,
+                f"import pathlib,time\npathlib.Path({str(markers[0])!r}).write_text('yes')\nwhile pathlib.Path({str(markers[1])!r}).read_text() != 'yes': time.sleep(.01)\n1",
+                120,
                 approved_paths=grants,
             ),
             manager.execute(
                 "parallel-two",
                 parallel_two,
-                f"import pathlib,time\npathlib.Path({str(markers[1])!r}).write_text('yes')\ndeadline=time.monotonic()+3\nwhile pathlib.Path({str(markers[0])!r}).read_text() != 'yes':\n if time.monotonic()>deadline: raise RuntimeError('not parallel')\n time.sleep(.01)\ntime.sleep(.3)\n2",
-                5,
+                f"import pathlib,time\npathlib.Path({str(markers[1])!r}).write_text('yes')\nwhile pathlib.Path({str(markers[0])!r}).read_text() != 'yes': time.sleep(.01)\n2",
+                120,
                 approved_paths=grants,
             ),
         )
         assert first["value"] == "1"
         assert second["value"] == "2"
-        assert time.monotonic() - parallel_at < 2
     finally:
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
         await manager.close()
 
 
+@pytest.mark.timeout(120)
 @pytest.mark.asyncio
 async def test_queued_and_active_cancellation_have_distinct_worker_effects(
     tmp_path: Path,
 ) -> None:
     manager = PythonKernelManager()
+    tasks = []
     try:
+        assert (await manager.execute("one", tmp_path, "value = 4"))["ok"]
+        state = manager._kernels[str(tmp_path.resolve())]
+        worker = state.worker
+        lock = state.lock = _ObservedLock()
         active = asyncio.create_task(
-            manager.execute("one", tmp_path, "import time\ntime.sleep(.25)\nvalue=4")
+            manager.execute("one", tmp_path,
+                            "import pathlib,time\npathlib.Path('entered').touch()\n"
+                            "while not pathlib.Path('release').exists(): time.sleep(.01)",
+                            120)
         )
-        await asyncio.sleep(0.05)
-        queued = asyncio.create_task(manager.execute("one", tmp_path, "value"))
-        while manager._kernels[str(tmp_path.resolve())].waiters != 1:
+        tasks.append(active)
+        while not (tmp_path / "entered").exists():
             await asyncio.sleep(0)
+        queued = asyncio.create_task(manager.execute("one", tmp_path, "value"))
+        tasks.append(queued)
+        await lock.waiting.wait()
+        assert state.waiters == 1
         queued.cancel()
         with pytest.raises(asyncio.CancelledError):
             await queued
-        await active
-        assert (await manager.execute("one", tmp_path, "value"))["kernel"] == "reused"
+        assert state.waiters == 0
+        assert state.worker is worker and worker.process.returncode is None
+        assert not active.done()
+        (tmp_path / "release").touch()
+        assert (await active)["ok"]
+        retained = await manager.execute("one", tmp_path, "value")
+        assert retained["kernel"] == "reused" and retained["value"] == "4"
 
         cancelled = asyncio.create_task(
-            manager.execute("one", tmp_path, "import time\ntime.sleep(10)")
+            manager.execute("one", tmp_path,
+                            "pathlib.Path('cancelling').touch()\n"
+                            "while True: time.sleep(1)", 120)
         )
-        while not manager._kernels[str(tmp_path.resolve())].lock.locked():
+        tasks.append(cancelled)
+        while not (tmp_path / "cancelling").exists():
             await asyncio.sleep(0)
         cancelled.cancel()
         with pytest.raises(asyncio.CancelledError):
@@ -826,9 +936,13 @@ async def test_queued_and_active_cancellation_have_distinct_worker_effects(
         assert manager._processes == {}
         assert (await manager.execute("one", tmp_path, "1"))["kernel"] == "fresh"
     finally:
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
         await manager.close()
 
 
+@pytest.mark.timeout(120)
 @pytest.mark.asyncio
 async def test_worker_and_idle_task_are_lazy(tmp_path: Path) -> None:
     manager = PythonKernelManager()
@@ -836,31 +950,82 @@ async def test_worker_and_idle_task_are_lazy(tmp_path: Path) -> None:
     assert manager._processes == {}
     assert kernel.IDLE_SECONDS == 1_800
     first = asyncio.create_task(
-        manager.execute("one", tmp_path, "import time\ntime.sleep(.2)\nsequence = [1]")
+        manager.execute("one", tmp_path,
+                        "import pathlib,time\npathlib.Path('entered').touch()\n"
+                        "while not pathlib.Path('release').exists(): time.sleep(.01)\n"
+                        "sequence = [1]", 120)
     )
-    await asyncio.sleep(0.05)
-    second = asyncio.create_task(manager.execute("one", tmp_path, "sequence.append(2)\nsequence"))
+    tasks = [first]
     try:
+        while not (tmp_path / "entered").exists():
+            await asyncio.sleep(0)
+        state = manager._kernels[str(tmp_path.resolve())]
+        assert state.idle_task is None
+        second = asyncio.create_task(manager.execute("one", tmp_path, "sequence.append(2)\nsequence"))
+        tasks.append(second)
+        while state.waiters != 1:
+            await asyncio.sleep(0)
+        assert not first.done() and not second.done()
+        (tmp_path / "release").touch()
         assert (await first)["value"] == ""
         assert (await second)["value"] == "[1, 2]"
         assert manager._kernels[str(tmp_path.resolve())].idle_task is not None
     finally:
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
         await manager.close()
 
 
+@pytest.fixture
+def idle_clock(monkeypatch):
+    class Clock:
+        now = 1000.0
+
+        def __init__(self):
+            self.waits = asyncio.Queue()
+
+        def time(self):
+            return self.now
+
+        def __getattr__(self, name):
+            return getattr(asyncio.get_running_loop(), name)
+
+        async def sleep(self, delay):
+            release = asyncio.Event()
+            self.waits.put_nowait((asyncio.current_task(), delay, release))
+            await release.wait()
+
+        async def expire(self, timer):
+            task, delay, release = timer
+            assert delay == kernel.IDLE_SECONDS == 1800
+            self.now += delay
+            release.set()
+            await task
+
+    clock = Clock()
+    monkeypatch.setattr(kernel, "asyncio", SimpleNamespace(**{
+        **vars(asyncio), "get_running_loop": lambda: clock,
+        "sleep": clock.sleep, "timeout_at": lambda deadline: asyncio.timeout(None),
+    }))
+    return clock
+
+
+@pytest.mark.timeout(120)
 @pytest.mark.asyncio
 async def test_idle_retirement_discards_worker_and_next_call_is_fresh(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, idle_clock,
 ) -> None:
-    monkeypatch.setattr(kernel, "IDLE_SECONDS", 0.05)
     manager = PythonKernelManager()
     try:
         await manager.execute("one", tmp_path, "value = 9")
         state = manager._kernels[str(tmp_path.resolve())]
         process = state.worker.process
-        async with asyncio.timeout(2):
-            while str(tmp_path.resolve()) in manager._kernels:
-                await asyncio.sleep(0.01)
+        timer = await idle_clock.waits.get()
+        assert timer[0] is state.idle_task
+        assert state.worker.process.returncode is None
+        await idle_clock.expire(timer)
+        assert str(tmp_path.resolve()) not in manager._kernels
         assert state.worker is None
         assert await _stopped(process.pid)
         result = await manager.execute("one", tmp_path, "globals().get('value')")
@@ -870,43 +1035,65 @@ async def test_idle_retirement_discards_worker_and_next_call_is_fresh(
         await manager.close()
 
 
+@pytest.mark.timeout(120)
 @pytest.mark.asyncio
 async def test_registered_waiter_wins_idle_retirement_race(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, idle_clock,
 ) -> None:
-    monkeypatch.setattr(kernel, "IDLE_SECONDS", 0.1)
     manager = PythonKernelManager()
+    tasks = []
     try:
         await manager.execute("one", tmp_path, "value = 1")
+        initial = await idle_clock.waits.get()
         active = asyncio.create_task(
-            manager.execute("one", tmp_path, "import time\ntime.sleep(.2)\nvalue")
+            manager.execute("one", tmp_path,
+                            "import pathlib,time\npathlib.Path('entered').touch()\n"
+                            "while not pathlib.Path('release').exists(): time.sleep(.01)\nvalue")
         )
-        await asyncio.sleep(0.02)
+        tasks.append(active)
+        while not (tmp_path / "entered").exists():
+            await asyncio.sleep(0)
+        await initial[0]
+        state = manager._kernels[str(tmp_path.resolve())]
+        assert state.idle_task is None
         waiter = asyncio.create_task(manager.execute("one", tmp_path, "value + 1"))
+        tasks.append(waiter)
+        while state.waiters != 1:
+            await asyncio.sleep(0)
+        assert not active.done() and not waiter.done()
+        (tmp_path / "release").touch()
         assert (await active)["kernel"] == "reused"
         assert (await waiter)["value"] == "2"
-        await asyncio.sleep(0.15)
+        timer = await idle_clock.waits.get()
+        assert timer[0] is state.idle_task
+        await idle_clock.expire(timer)
         assert str(tmp_path.resolve()) not in manager._kernels
         assert (await manager.execute("one", tmp_path, "3"))["kernel"] == "fresh"
     finally:
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
         await manager.close()
 
 
+@pytest.mark.timeout(120)
 @pytest.mark.asyncio
 async def test_real_waiter_registered_at_idle_expiry_keeps_worker(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, idle_clock,
 ) -> None:
-    monkeypatch.setattr(kernel, "IDLE_SECONDS", 0.1)
     manager = PythonKernelManager()
+    waiter = None
     try:
         await manager.execute("one", tmp_path, "value = 9")
         state = manager._kernels[str(tmp_path.resolve())]
         worker = state.worker
+        timer = await idle_clock.waits.get()
+        assert timer[0] is state.idle_task
         await state.lock.acquire()
         waiter = asyncio.create_task(manager.execute("one", tmp_path, "value"))
         while state.waiters != 1:
             await asyncio.sleep(0)
-        await asyncio.sleep(0.15)
+        await idle_clock.expire(timer)
         assert state.worker is worker
         assert worker is not None and worker.process.returncode is None
         state.lock.release()
@@ -914,6 +1101,9 @@ async def test_real_waiter_registered_at_idle_expiry_keeps_worker(
         assert result["kernel"] == "reused"
         assert result["value"] == "9"
     finally:
+        if waiter is not None:
+            waiter.cancel()
+            await asyncio.gather(waiter, return_exceptions=True)
         if manager._kernels.get(str(tmp_path.resolve())) is not None:
             state = manager._kernels[str(tmp_path.resolve())]
             if state.lock.locked():
@@ -921,6 +1111,7 @@ async def test_real_waiter_registered_at_idle_expiry_keeps_worker(
         await manager.close()
 
 
+@pytest.mark.timeout(120)
 @pytest.mark.asyncio
 async def test_late_background_output_is_discarded_between_calls(tmp_path: Path) -> None:
     manager = PythonKernelManager()
@@ -928,10 +1119,22 @@ async def test_late_background_output_is_discarded_between_calls(tmp_path: Path)
         first = await manager.execute(
             "one",
             tmp_path,
-            "import threading,time\ndef late():\n time.sleep(.1)\n print('late',flush=True)\nthreading.Thread(target=late,daemon=True).start()",
+            "import threading,time,pathlib,os\n"
+            "def late():\n"
+            " while not pathlib.Path('release').exists(): time.sleep(.01)\n"
+            " print('late',flush=True)\n"
+            " discarded = os.fstat(1).st_rdev == os.stat(os.devnull).st_rdev\n"
+            " pathlib.Path('emitted').write_text(str(discarded))\n"
+            "threading.Thread(target=late,daemon=True).start()",
         )
         assert first["stdout"] == ""
-        await asyncio.sleep(0.2)
+        (tmp_path / "release").touch()
+        while not (tmp_path / "emitted").exists():
+            await asyncio.sleep(0)
+        # Readiness follows the actual write, while no execution owns stdout.
+        while not (destination := (tmp_path / "emitted").read_text()):
+            await asyncio.sleep(0)
+        assert destination == "True"
         second = await manager.execute("one", tmp_path, "print('current')")
         assert second["stdout"] == "current\n"
     finally:
@@ -1031,62 +1234,74 @@ async def test_output_setup_and_protocol_failures_discard_worker(
     await manager.close()
 
 
+@pytest.mark.timeout(120)
+@pytest.mark.parametrize("phase", ["spawn", "handshake", "output"])
 @pytest.mark.asyncio
 async def test_deadline_expires_during_spawn_handshake_and_output_setup(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, phase: str,
 ) -> None:
-    timeout_result = {
-        "ok": False,
-        "stdout": "",
-        "stderr": "",
-        "value": "",
-        "exception": "execution timed out after 0.01 seconds; namespace state lost",
-        "timedOut": True,
-        "kernel": "timed_out",
-    }
-    spawn_manager = PythonKernelManager()
+    manager = PythonKernelManager()
+    loop = asyncio.get_running_loop()
+    now = 1000.0
+    trace = []
+    timers = []
 
-    async def blocked_spawn(*args: object, **kwargs: object) -> None:
-        del args, kwargs
+    class Clock:
+        def time(self):
+            return now
+
+        def __getattr__(self, name):
+            return getattr(loop, name)
+
+    def timeout_at(deadline):
+        assert deadline == 1060.0
+        timer = asyncio.timeout_at(0 if now > deadline else None)
+        timers.append(timer)
+        return timer
+
+    async def blocked(*args, **kwargs):
+        nonlocal now
+        if phase == "handshake":
+            # _receive is reached only after a real child has been spawned and owned.
+            assert len(manager._processes) == 1
+        trace.append(phase)
+        now = 1061.0
+        timers[-1].reschedule(0)
         await asyncio.Event().wait()
 
-    real_spawn = asyncio.create_subprocess_exec
-    monkeypatch.setattr(asyncio, "create_subprocess_exec", blocked_spawn)
-    assert await spawn_manager.execute("spawn", tmp_path, "1", 0.01) == timeout_result
-    assert spawn_manager._processes == {}
-    await spawn_manager.close()
-    # Restore only our spawn patch, not the Linux unit-backend fixture.
-    monkeypatch.setattr(asyncio, "create_subprocess_exec", real_spawn)
+    real_output = manager._output_path
 
-    handshake_manager = PythonKernelManager()
+    def expired_output(directory):
+        nonlocal now
+        path = real_output(directory)
+        trace.append("output")
+        now = 1061.0
+        return path
 
-    async def blocked_handshake(channel: socket.socket) -> dict[str, object]:
-        del channel
-        await asyncio.Event().wait()
-
-    monkeypatch.setattr(handshake_manager, "_receive", blocked_handshake)
-    handshake = await handshake_manager.execute("handshake", tmp_path, "1", 1)
-    assert handshake == {
-        **timeout_result,
-        "exception": "execution timed out after 1 seconds; namespace state lost",
-    }
-    assert handshake_manager._processes == {}
-    await handshake_manager.close()
-
-    setup_manager = PythonKernelManager()
-    assert (await setup_manager.execute("setup", tmp_path, "1"))["ok"] is True
-    real_output = setup_manager._output_path
-
-    def delayed_output(directory: Path) -> Path:
-        time.sleep(0.03)
-        return real_output(directory)
-
-    monkeypatch.setattr(setup_manager, "_output_path", delayed_output)
-    assert await setup_manager.execute("setup", tmp_path, "2", 0.01) == timeout_result
-    assert setup_manager._processes == {}
-    await setup_manager.close()
+    try:
+        if phase == "output":
+            assert (await manager.execute("setup", tmp_path, "1"))["ok"]
+            monkeypatch.setattr(manager, "_output_path", expired_output)
+        if phase == "handshake":
+            monkeypatch.setattr(manager, "_receive", blocked)
+        monkeypatch.setattr(kernel, "asyncio", SimpleNamespace(**{
+            **vars(asyncio), "get_running_loop": lambda: Clock(),
+            "timeout_at": timeout_at,
+            "create_subprocess_exec": blocked if phase == "spawn" else asyncio.create_subprocess_exec,
+        }))
+        result = await manager.execute("setup", tmp_path, "2", 60)
+        assert trace == (["output", "output"] if phase == "output" else [phase])
+        assert result == {
+            "ok": False, "stdout": "", "stderr": "", "value": "",
+            "exception": "execution timed out after 60 seconds; namespace state lost",
+            "timedOut": True, "kernel": "timed_out",
+        }
+        assert manager._processes == {}
+    finally:
+        await manager.close()
 
 
+@pytest.mark.timeout(120)
 @pytest.mark.asyncio
 async def test_bounded_wait_retains_ownership_until_eventual_direct_reap(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -1095,12 +1310,14 @@ async def test_bounded_wait_retains_ownership_until_eventual_direct_reap(
     process = await asyncio.create_subprocess_exec(
         sys.executable,
         "-c",
-        "import time; time.sleep(30)",
+        "import signal; signal.pause()",
         start_new_session=True,
         stdout=asyncio.subprocess.DEVNULL,
         stderr=asyncio.subprocess.DEVNULL,
     )
     release = asyncio.Event()
+    entered = asyncio.Event()
+    trace = []
 
     class DelayedProcess:
         pid = process.pid
@@ -1110,8 +1327,12 @@ async def test_bounded_wait_retains_ownership_until_eventual_direct_reap(
             return process.returncode
 
         async def wait(self) -> int:
+            trace.append("wait")
+            entered.set()
             await release.wait()
-            return await process.wait()
+            result = await process.wait()
+            trace.append("reaped")
+            return result
 
     delayed = DelayedProcess()
     manager = PythonKernelManager()
@@ -1119,18 +1340,36 @@ async def test_bounded_wait_retains_ownership_until_eventual_direct_reap(
     child.close()
     worker = kernel._Worker(delayed, process.pid, parent)
     manager._processes[delayed] = process.pid
-    monkeypatch.setattr(kernel, "_REAP_TIMEOUT_SECONDS", 0.01)
 
-    started = time.monotonic()
-    await manager._terminate(worker)
-    assert time.monotonic() - started < 0.2
-    assert delayed in manager._processes
-    assert manager._reapers
-    release.set()
-    await manager.close()
-    assert process.returncode is not None
-    assert delayed not in manager._processes
-    assert manager._reapers == set()
+    async def expire_wait(awaitable, timeout):
+        assert timeout == kernel._REAP_TIMEOUT_SECONDS
+        await entered.wait()
+        trace.append("expiry")
+        async with asyncio.timeout(0):
+            return await awaitable
+
+    monkeypatch.setattr(kernel, "asyncio", SimpleNamespace(**{
+        **vars(asyncio), "wait_for": expire_wait,
+    }))
+    try:
+        await manager._terminate(worker)
+        trace.append("returned")
+        assert trace == ["wait", "expiry", "returned"]
+        assert delayed in manager._processes
+        assert worker.reaper in manager._reapers
+        assert not worker.reaper.done()
+        release.set()
+        await manager.close()
+        assert trace == ["wait", "expiry", "returned", "reaped"]
+        assert process.returncode is not None
+        assert delayed not in manager._processes
+        assert manager._reapers == set()
+    finally:
+        release.set()
+        await manager.close()
+        if process.returncode is None:
+            process.kill()
+        await process.wait()
 
 
 def test_worker_is_plain_exec_subprocess_without_ipykernel_or_zmq() -> None:
@@ -1211,23 +1450,36 @@ def _unit_backend_on_unsupported_platform(monkeypatch):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("ending", ["pass", "import os; os._exit(31)", "import time; time.sleep(30)"])
-async def test_parent_output_reads_retained_inode_not_worker_symlink(tmp_path, ending):
+@pytest.mark.parametrize("ending", ["pass", "import os; os._exit(31)", "timeout"])
+async def test_parent_output_reads_retained_inode_not_worker_symlink(tmp_path, ending, execution_timers):
     cwd = tmp_path / "cwd"
     cwd.mkdir()
     secret = tmp_path / "secret"
     secret.write_text("outside-fixture-must-not-leak")
     manager = PythonKernelManager()
+    task = None
     try:
         await manager.execute("s", cwd, "1")
         directory = manager._kernels[str(cwd.resolve())].directory
+        tail = ("import signal\nPath('entered').touch()\nsignal.pause()"
+                if ending == "timeout" else ending)
         code = (f"from pathlib import Path\n"
                 f"for p in Path({str(directory)!r}).iterdir():\n"
-                f"    p.unlink()\n    p.symlink_to({str(secret)!r})\n" + ending)
-        result = await manager.execute("s", cwd, code, 1)
+                f"    p.unlink()\n    p.symlink_to({str(secret)!r})\n" + tail)
+        task = asyncio.create_task(manager.execute("s", cwd, code, 1))
+        if ending == "timeout":
+            await _appears(cwd / "entered")
+            assert not task.done()
+            execution_timers[-1].reschedule(0)
+        result = await task
         assert "outside-fixture-must-not-leak" not in repr(result)
         assert result["stdout"] == result["stderr"] == ""
+        assert result["kernel"] == {"pass": "reused", "import os; os._exit(31)": "crashed",
+                                    "timeout": "timed_out"}[ending]
     finally:
+        if task is not None:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
         await manager.close()
 
 
@@ -1260,29 +1512,29 @@ async def test_directory_substituted_for_output_never_retains_kernel_lock(tmp_pa
         code = ("from pathlib import Path\n"
                 f"for p in Path({str(directory)!r}).iterdir():\n"
                 "    p.unlink()\n    p.mkdir()\n")
-        async with asyncio.timeout(5):
-            result = await manager.execute("s", tmp_path, code)
-            assert result["ok"]
-            assert not manager._output_descriptors
-            assert not manager._kernels[str(tmp_path.resolve())].lock.locked()
-            assert (await manager.execute("s", tmp_path, "42"))["value"] == "42"
-            descriptor = manager._directory_descriptors[directory]
-            await manager.retire(tmp_path)
-            assert directory not in manager._directory_descriptors
-            with pytest.raises(OSError):
-                os.fstat(descriptor)
+        result = await manager.execute("s", tmp_path, code)
+        assert result["ok"]
+        assert not manager._output_descriptors
+        assert not manager._kernels[str(tmp_path.resolve())].lock.locked()
+        assert (await manager.execute("s", tmp_path, "42"))["value"] == "42"
+        descriptor = manager._directory_descriptors[directory]
+        await manager.retire(tmp_path)
+        assert directory not in manager._directory_descriptors
+        with pytest.raises(OSError):
+            os.fstat(descriptor)
     finally:
-        async with asyncio.timeout(5):
-            await manager.close()
+        await manager.close()
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("exited", [False, True])
 async def test_kernel_signal_denial_requires_confirmed_process_exit(monkeypatch, exited):
     from unittest.mock import Mock
+    entered = asyncio.Event()
     class Process:
         returncode = None
         async def wait(self):
+            entered.set()
             if not exited:
                 await asyncio.Event().wait()
             self.returncode = 31
@@ -1294,7 +1546,17 @@ async def test_kernel_signal_denial_requires_confirmed_process_exit(monkeypatch,
     def killpg(*args):
         raise denied
     monkeypatch.setattr(kernel.os, "killpg", killpg)
-    monkeypatch.setattr(kernel, "_EXIT_CONFIRMATION_SECONDS", 0.01)
+    async def wait_for(awaitable, timeout):
+        if timeout != kernel._EXIT_CONFIRMATION_SECONDS:
+            return await asyncio.wait_for(awaitable, timeout)
+        task = asyncio.create_task(awaitable)
+        await entered.wait()
+        async with asyncio.timeout(None if exited else 0):
+            return await task
+
+    monkeypatch.setattr(kernel, "asyncio", SimpleNamespace(**{
+        **vars(asyncio), "wait_for": wait_for,
+    }))
     try:
         if exited:
             await manager._terminate(worker)
@@ -1306,6 +1568,7 @@ async def test_kernel_signal_denial_requires_confirmed_process_exit(monkeypatch,
             assert caught.value is denied
             assert not worker.signalled
             assert worker.reaper is None
+        assert entered.is_set()
     finally:
         await manager.close()
 
@@ -1330,6 +1593,13 @@ async def test_kernel_repeated_cancel_does_not_repeat_successful_signal(monkeypa
         if len(calls) > 1:
             raise PermissionError("dying process group")
     monkeypatch.setattr(kernel.os, "killpg", killpg)
+    async def wait_for(awaitable, timeout):
+        assert timeout == kernel._REAP_TIMEOUT_SECONDS
+        return await awaitable
+
+    monkeypatch.setattr(kernel, "asyncio", SimpleNamespace(**{
+        **vars(asyncio), "wait_for": wait_for,
+    }))
     task = asyncio.create_task(manager._terminate(worker))
     try:
         await entered.wait()

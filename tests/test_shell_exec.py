@@ -383,16 +383,43 @@ def test_configured_project_test_timeout_is_named_and_output_is_bounded(
     assert len(output) < 7000
 
 
-def test_project_test_capture_discards_output_past_hard_byte_cap(tmp_path: Path) -> None:
-    completed = extra._run_bounded_project_test(
-        [sys.executable, "-c", "import sys; sys.stdout.write('x' * 1000000)"],
-        cwd=tmp_path,
-        timeout=5,
-        env=dict(os.environ),
-    )
+def test_project_test_capture_discards_output_past_hard_byte_cap(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    processes = []
+    popen = subprocess.Popen
 
-    assert completed.returncode == 0
-    assert len(completed.stdout) == extra._PROJECT_TEST_CAPTURE_BYTES
+    def launch(*args, **kwargs):
+        process = popen(*args, **kwargs)
+        processes.append(process)
+        return process
+
+    monkeypatch.setattr(extra.subprocess, "Popen", launch)
+    produced = tmp_path / "produced"
+    try:
+        completed = extra._run_bounded_project_test(
+            [sys.executable, "-c",
+             "import sys; from pathlib import Path; "
+             "count = sys.stdout.write('x' * 1000000); sys.stdout.flush(); "
+             "Path(sys.argv[1]).write_text(str(count))", str(produced)],
+            cwd=tmp_path,
+            # No startup-inclusive stage deadline: pytest bounds the entire test.
+            timeout=None,
+            env=dict(os.environ),
+        )
+
+        assert len(processes) == 1
+        assert processes[0].poll() == 0
+        assert completed.returncode == 0
+        assert produced.read_text() == "1000000"
+        assert len(completed.stdout) == extra._PROJECT_TEST_CAPTURE_BYTES
+    finally:
+        for process in processes:
+            if process.poll() is None:
+                process.kill()
+            process.wait()
+            process.stdout.close()
+            process.stderr.close()
 
 
 # ─── trusted system tools + venv-bin fallback on PATH ────────────────

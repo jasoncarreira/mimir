@@ -785,8 +785,8 @@ async def test_plain_client_without_mcp_capability_can_call_hosted_hands(tmp_pat
                 "name": "read", "arguments": {"path": "note"},
             }},
         })
-        await asyncio.sleep(0.05)
-        assert messages(daemon)[-1]["result"]["structuredContent"] == {"content": "hello"}
+        await router._local_requests[(int, 3)]
+        assert messages(daemon)[-1]["result"].get("structuredContent") == {"content": "hello"}
     finally:
         await router.close()
 
@@ -867,8 +867,8 @@ async def test_session_new_captures_cwd_for_hosted_operations(tmp_path: Path) ->
                 "name": "read", "arguments": {"path": "cwd.txt"},
             }},
         })
-        await asyncio.sleep(0.05)
-        assert messages(daemon)[-1]["result"]["structuredContent"]["content"] == "captured"
+        await router._local_requests[(int, 4)]
+        assert messages(daemon)[-1]["result"].get("structuredContent") == {"content": "captured"}
     finally:
         await router.close()
 
@@ -1263,21 +1263,31 @@ if sys.argv[1]=='wait': loop.run_forever()
 @pytest.mark.asyncio
 async def test_typed_directional_ids_boolean_rejection_and_hosted_cancellation(tmp_path: Path) -> None:
     router, _, daemon, server_id, connection_id = await hosted_router(tmp_path)
+    # The selected execution budget outlives the whole-test 300s hang guard.
+    router._provider._connections[connection_id].session.timeout_seconds = 600
+    os.mkfifo(tmp_path / "release")
     try:
         await router.route_daemon({
             "jsonrpc": "2.0", "id": 30, "method": "mcp/message", "params": {
                 "connectionId": connection_id, "method": "tools/call",
-                "params": {"name": "shell", "arguments": {"command": "sleep 30"}},
+                "params": {"name": "shell", "arguments": {
+                    "command": "printf ready > started; read value < release",
+                }},
             },
         })
-        await asyncio.sleep(0.05)
+        request = router._local_requests[(int, 30)]
+        while not (tmp_path / "started").exists() or not router._provider._processes:
+            assert not request.done(), "hosted shell ended before readiness"
+            await asyncio.sleep(0)
+        assert router._provider._processes
         await router.route_daemon({
             "jsonrpc": "2.0", "method": "mcp/message", "params": {
                 "connectionId": connection_id, "method": "notifications/cancelled",
                 "params": {"requestId": 30},
             },
         })
-        await asyncio.sleep(0.05)
+        assert await asyncio.gather(request, return_exceptions=True) == [None]
+        assert not router._provider._processes
         with pytest.raises(ProxyError, match="duplicate outstanding"):
             await router.route_daemon({"jsonrpc": "2.0", "id": 30, "method": "foreign"})
         await router.route_daemon({"jsonrpc": "2.0", "id": "30", "method": "foreign"})
@@ -1342,19 +1352,29 @@ async def test_hosted_failures_are_supervised_and_generation_state_is_bounded(
 @pytest.mark.asyncio
 async def test_client_session_cancel_tombstones_hosted_request(tmp_path: Path) -> None:
     router, _, daemon, _, connection_id = await hosted_router(tmp_path)
+    # Only cancellation, not an expiring shell sleep, can end this producer.
+    router._provider._connections[connection_id].session.timeout_seconds = 600
+    os.mkfifo(tmp_path / "release")
     try:
         await router.route_daemon({
             "jsonrpc": "2.0", "id": 50, "method": "mcp/message", "params": {
                 "connectionId": connection_id, "method": "tools/call",
-                "params": {"name": "shell", "arguments": {"command": "sleep 30"}},
+                "params": {"name": "shell", "arguments": {
+                    "command": "printf ready > started; read value < release",
+                }},
             },
         })
-        await asyncio.sleep(0.05)
+        request = router._local_requests[(int, 50)]
+        while not (tmp_path / "started").exists() or not router._provider._processes:
+            assert not request.done(), "hosted shell ended before readiness"
+            await asyncio.sleep(0)
+        assert router._provider._processes
         cancel_raw = b'{ "jsonrpc":"2.0", "method":"session/cancel", "params":{"sessionId":"session"} }\n'
         before = bytes(daemon.data)
         await router.route_client(json.loads(cancel_raw), cancel_raw)
         assert bytes(daemon.data).startswith(before + cancel_raw)
-        await asyncio.sleep(0.05)
+        assert await asyncio.gather(request, return_exceptions=True) == [None]
+        assert not router._provider._processes
         assert not router._generation_failed, repr(router._failure.result())
         with pytest.raises(ProxyError, match="duplicate outstanding"):
             await router.route_daemon({"jsonrpc": "2.0", "id": 50, "method": "foreign"})

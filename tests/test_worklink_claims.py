@@ -6,7 +6,6 @@ import json
 from pathlib import Path
 import subprocess
 import threading
-import time
 from typing import Sequence
 
 import pytest
@@ -73,12 +72,21 @@ def test_claim_issue_records_attempt_and_labels_transition() -> None:
     assert comment_calls and "WORKLINK_CLAIM" in comment_calls[0][-1]
 
 
+@pytest.mark.timeout(30)
 def test_simultaneous_claims_are_serialized_and_both_succeed(tmp_path: Path) -> None:
     start = threading.Barrier(2)
     runner_guard = threading.Lock()
     claim_active = False
     overlap_detected = False
     results = []
+    attempted = threading.Event()
+    release = threading.Event()
+    first_finished = threading.Event()
+
+    def contended_sleep(seconds):
+        # The loser only gets here after a real nonblocking flock failed.
+        attempted.set()
+        first_finished.wait()
 
     def runner(args: Sequence[str]) -> subprocess.CompletedProcess[str]:
         nonlocal claim_active, overlap_detected
@@ -88,22 +96,34 @@ def test_simultaneous_claims_are_serialized_and_both_succeed(tmp_path: Path) -> 
         with runner_guard:
             if claim_active:
                 overlap_detected = True
+                attempted.set()
             claim_active = True
-        time.sleep(0.05)
+        release.wait()
         with runner_guard:
             claim_active = False
         return completed(call)
 
     def claim(issue_id: int) -> None:
-        claims = ChainlinkClaims(agent_id=f"worker-{issue_id}", runner=runner, home_path=tmp_path)
+        claims = ChainlinkClaims(
+            agent_id=f"worker-{issue_id}", runner=runner, home_path=tmp_path,
+            sleeper=contended_sleep,
+        )
         start.wait()
-        results.append(claims.claim_issue(issue_id, labels=["worklink:ready"]))
+        try:
+            results.append(claims.claim_issue(issue_id, labels=["worklink:ready"]))
+        finally:
+            first_finished.set()
 
     threads = [threading.Thread(target=claim, args=(issue_id,)) for issue_id in (1064, 1065)]
     for thread in threads:
         thread.start()
-    for thread in threads:
-        thread.join(timeout=5)
+    try:
+        attempted.wait()
+        assert overlap_detected is False
+    finally:
+        release.set()
+        for thread in threads:
+            thread.join()
 
     assert all(not thread.is_alive() for thread in threads)
     assert overlap_detected is False

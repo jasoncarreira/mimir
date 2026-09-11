@@ -200,7 +200,9 @@ async def test_fifo_pressure_and_drain_wait_for_every_update() -> None:
 async def test_close_suspends_then_times_out_when_full_worker_is_blocked(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr("mimir.acp.updates.UPDATE_CLOSE_TIMEOUT", 0.02)
+    from types import SimpleNamespace
+    from mimir.acp import updates
+
     publisher = Publisher()
     publisher.block = True
     dispatcher = UpdateDispatcher(publisher)
@@ -208,18 +210,42 @@ async def test_close_suspends_then_times_out_when_full_worker_is_blocked(
     for _ in range(MAX_UPDATE_ITEMS):
         dispatcher.enqueue(event)
     await publisher.entered.wait()
-    ticks = 0
+    joining = asyncio.Event()
+    real_join = dispatcher.queue.join
 
-    async def witness() -> None:
-        nonlocal ticks
-        while dispatcher._worker is not None:
-            ticks += 1
-            await asyncio.sleep(0.001)
+    async def join():
+        joining.set()
+        await real_join()
 
-    witnessing = asyncio.create_task(witness())
-    await asyncio.wait_for(dispatcher.close(), 0.1)
-    await witnessing
-    assert ticks < 50
+    async def expire(awaitable, timeout):
+        assert timeout == updates.UPDATE_CLOSE_TIMEOUT
+        closing = asyncio.create_task(awaitable)
+        observation = asyncio.create_task(joining.wait())
+        try:
+            await asyncio.wait({closing, observation}, return_when=asyncio.FIRST_COMPLETED)
+            assert joining.is_set(), "graceful close did not wait for queued publication"
+            assert not closing.done(), "close bypassed the blocked publisher"
+            return await asyncio.wait_for(closing, 0)
+        finally:
+            observation.cancel()
+            closing.cancel()
+            await asyncio.gather(observation, closing, return_exceptions=True)
+
+    monkeypatch.setattr(dispatcher.queue, "join", join)
+    monkeypatch.setattr(updates, "asyncio", SimpleNamespace(
+        **{name: getattr(asyncio, name) for name in dir(asyncio) if name != "wait_for"},
+        wait_for=expire,
+    ))
+    try:
+        await dispatcher.close()
+    finally:
+        if dispatcher._worker is not None:
+            publisher.release.set()
+            await dispatcher.queue.put(None)
+            dispatcher._queued_sizes.put_nowait(0)
+            await dispatcher._worker
+    assert isinstance(dispatcher.failure, TimeoutError)
+    assert not publisher.release.is_set()
     assert dispatcher._worker is None
     assert dispatcher.queue.empty()
 
