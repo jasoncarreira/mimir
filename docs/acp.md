@@ -116,6 +116,24 @@ Upstream publishes this schema **only** from a moving `latest` path. Versioned C
 
 ## Connections, sessions, and replay
 
+### JSON-RPC request IDs
+
+The daemon does not deduplicate or reject reused JSON-RPC request IDs. Each
+request is processed independently and receives its own response echoing its
+`id`, even if another request on the same connection has the same ID. For example,
+two successful `session/new` requests with `id: 4242` create two distinct sessions
+and return two responses with `id: 4242`; the collision does not close the connection.
+An ID is a correlation token, not an idempotency key: resending a request can
+repeat its effects.
+
+Clients must use unique request IDs on a live connection for unambiguous
+correlation. Requests can run concurrently, so responses are not guaranteed to
+arrive in request order. Match responses by ID, not by position; a reused ID
+cannot distinguish two outstanding requests. Notifications (messages without
+an `id`) remain response-free and are not subject to request-ID correlation.
+
+### Session lifetime
+
 There is one active ACP connection per `MIMIR_HOME`. Only a newly authenticated connection can supersede the prior generation; failed or partial authentication cannot evict the active client. Reconnection creates a new authentication and generation boundary. Session IDs are owner-bound UUIDv4 values, and reconnection resumes them through `session/load`; provider, permission, and MCP request identities are fresh.
 
 The journal has a default seven-day TTL and a 64 MiB limit. Before replay, Mimir revalidates the provider. A load replays every durably prepared `session/update` with its original sequence, including records already sent. Clients must tolerate duplicates. Replay never re-executes effects. Pending requests and frames are not replayed, external effects are not exactly-once, and cancellation does not roll back completed effects.
