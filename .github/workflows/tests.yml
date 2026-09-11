@@ -519,7 +519,7 @@ jobs:
 
   frontend:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 15
     steps:
       - name: Checkout
         uses: actions/checkout@v5
@@ -530,10 +530,19 @@ jobs:
           node-version: "24"
           cache: npm
 
+      - name: Cache frontend dependencies
+        id: node-modules
+        uses: actions/cache@v4
+        with:
+          path: node_modules
+          key: ${{ runner.os }}-node-modules-${{ hashFiles('package-lock.json') }}
+
       - name: Install frontend dependencies
+        if: steps.node-modules.outputs.cache-hit != 'true'
         run: npm ci
 
       - name: Typecheck and build React app
+        timeout-minutes: 5
         run: |
           npm run test
           npm run build
