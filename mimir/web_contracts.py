@@ -1099,6 +1099,7 @@ export interface TurnStreamEvent {
 
 export interface FactoryRunSummary {
   run_id: string;
+  clearable: boolean;
   issue_key: string;
   valid: boolean;
   sandbox_path: string;
@@ -1127,6 +1128,15 @@ export interface FactoryRunDetail extends FactoryRunSummary {
 
 export interface FactoryRunsData {
   runs: FactoryRunSummary[];
+}
+
+export interface FactoryRunArchiveRequest {
+  reason: string;
+}
+
+export interface FactoryRunArchiveData {
+  run_id: string;
+  archived: boolean;
 }
 """
 

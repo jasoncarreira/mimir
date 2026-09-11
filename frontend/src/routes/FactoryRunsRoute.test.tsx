@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 import { readFileSync } from "node:fs";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import type React from "react";
 import { MemoryRouter } from "react-router-dom";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -15,13 +15,14 @@ import type {
 import type { DashboardSurface } from "../dashboardExtensions";
 
 const { factoryApi } = vi.hoisted(() => ({
-  factoryApi: { getFactoryRun: vi.fn(), getFactoryRuns: vi.fn() }
+  factoryApi: { getFactoryRun: vi.fn(), getFactoryRuns: vi.fn(), archiveFactoryRun: vi.fn() }
 }));
 
 vi.mock("../api/factory-runs", async (original) => ({
   ...(await original<Record<string, unknown>>()),
   getFactoryRun: factoryApi.getFactoryRun,
-  getFactoryRuns: factoryApi.getFactoryRuns
+  getFactoryRuns: factoryApi.getFactoryRuns,
+  archiveFactoryRun: factoryApi.archiveFactoryRun
 }));
 
 const { FactoryRunsRoute, RunDetail } = await import("./FactoryRunsRoute");
@@ -48,6 +49,7 @@ const baseFactoryRun = {
   run_id: "834",
   issue_key: "834",
   valid: true,
+  clearable: false,
   sandbox_path: "/srv/mimir/factory/834",
   status: "running",
   mode: "autonomous",
@@ -76,6 +78,7 @@ const factoryRunsListFixture: ApiSuccessEnvelope<FactoryRunsData, ListMeta> = {
         issue_key: "833",
         sandbox_path: "/srv/mimir/factory/833",
         status: "completed",
+        clearable: true,
         branch: "slice/833-factory-run",
         pr_draft: false,
         lock: "absent",
@@ -169,9 +172,91 @@ afterEach(() => {
   cleanup();
   factoryApi.getFactoryRun.mockReset();
   factoryApi.getFactoryRuns.mockReset();
+  factoryApi.archiveFactoryRun.mockReset();
 });
 
 describe("FactoryRunsRoute", () => {
+  it("posts the typed archive request to the encoded run endpoint", async () => {
+    const { archiveFactoryRun } = await vi.importActual<typeof import("../api/factory-runs")>("../api/factory-runs");
+    const response = { ok: true, version: "v1", data: { run_id: "run/833", archived: true } };
+    const fetchImpl = vi.fn().mockResolvedValue(new Response(JSON.stringify(response), {
+      headers: { "Content-Type": "application/json" }
+    }));
+    expect(await archiveFactoryRun("run/833", { reason: "Finished run" }, { fetchImpl })).toEqual(response);
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
+    const [url, request] = fetchImpl.mock.calls[0];
+    expect(url).toBe("/api/v1/factory-runs/run%2F833/archive");
+    expect(request.method).toBe("POST");
+    expect(request.headers.get("Content-Type")).toBe("application/json");
+    expect(JSON.parse(request.body)).toEqual({ reason: "Finished run" });
+  });
+
+  it("names the run in the archive dialog and cancels without a request", async () => {
+    factoryApi.getFactoryRuns.mockResolvedValue(factoryRunsListFixture);
+    renderRoute(<FactoryRunsRoute surface={surface} />);
+    fireEvent.click(await screen.findByRole("button", { name: "Archive run 833" }));
+    const dialog = screen.getByRole("dialog", { name: "Archive run 833?" });
+    expect(within(dialog).getByText(/does not delete the run/)).toBeTruthy();
+    expect(factoryApi.archiveFactoryRun).not.toHaveBeenCalled();
+    fireEvent.click(within(dialog).getByRole("button", { name: "Cancel" }));
+    expect(screen.queryByRole("dialog")).toBeNull();
+    expect(factoryApi.archiveFactoryRun).not.toHaveBeenCalled();
+    expect(screen.getByTestId("factory-run-833")).toBeTruthy();
+  });
+
+  it("confirms exactly once while pending and removes the row only after refetch", async () => {
+    let resolveArchive!: (value: unknown) => void;
+    let resolveList!: (value: unknown) => void;
+    factoryApi.archiveFactoryRun.mockReturnValue(new Promise((resolve) => { resolveArchive = resolve; }));
+    factoryApi.getFactoryRuns.mockResolvedValueOnce(factoryRunsListFixture)
+      .mockReturnValueOnce(new Promise((resolve) => { resolveList = resolve; }));
+    renderRoute(<FactoryRunsRoute surface={surface} />);
+    fireEvent.click(await screen.findByRole("button", { name: "Archive run 833" }));
+    const dialog = screen.getByRole("dialog");
+    fireEvent.change(within(dialog).getByLabelText("Archive reason"), { target: { value: "  Finished run  " } });
+    expect(factoryApi.archiveFactoryRun).not.toHaveBeenCalled();
+    const confirm = within(dialog).getByRole("button", { name: "Confirm archive" });
+    fireEvent.click(confirm);
+    fireEvent.click(confirm);
+    fireEvent.submit(dialog.querySelector("form")!);
+    await waitFor(() => expect(factoryApi.archiveFactoryRun).toHaveBeenCalledTimes(1));
+    expect(factoryApi.archiveFactoryRun).toHaveBeenCalledWith("833", { reason: "Finished run" });
+    expect((confirm as HTMLButtonElement).disabled).toBe(true);
+    expect(screen.getByTestId("factory-run-833")).toBeTruthy();
+    await act(async () => resolveArchive({ ok: true, version: "v1", data: { run_id: "833", archived: true } }));
+    await waitFor(() => expect(factoryApi.getFactoryRuns).toHaveBeenCalledTimes(2));
+    expect(screen.getByTestId("factory-run-833")).toBeTruthy();
+    await act(async () => resolveList({ ...factoryRunsListFixture, data: {
+      runs: factoryRunsListFixture.data.runs.filter((run) => run.run_id !== "833")
+    } }));
+    await waitFor(() => expect(screen.queryByTestId("factory-run-833")).toBeNull());
+    expect(screen.queryByRole("dialog")).toBeNull();
+    expect(factoryApi.archiveFactoryRun).toHaveBeenCalledTimes(1);
+  });
+
+  it("shows the server refusal and retains the row", async () => {
+    factoryApi.getFactoryRuns.mockResolvedValue(factoryRunsListFixture);
+    factoryApi.archiveFactoryRun.mockRejectedValue(new Error("Run has a fresh live lock"));
+    renderRoute(<FactoryRunsRoute surface={surface} />);
+    fireEvent.click(await screen.findByRole("button", { name: "Archive run 833" }));
+    fireEvent.change(screen.getByLabelText("Archive reason"), { target: { value: "Finished run" } });
+    fireEvent.click(screen.getByRole("button", { name: "Confirm archive" }));
+    expect(await screen.findByText("Run has a fresh live lock")).toBeTruthy();
+    expect(screen.getByTestId("factory-run-833")).toBeTruthy();
+    expect(factoryApi.getFactoryRuns).toHaveBeenCalledTimes(1);
+    expect((screen.getByRole("button", { name: "Confirm archive" }) as HTMLButtonElement).disabled).toBe(false);
+  });
+
+  it("offers archive only when the server marks a run clearable", async () => {
+    factoryApi.getFactoryRuns.mockResolvedValue(factoryRunsListFixture);
+    renderRoute(<FactoryRunsRoute surface={surface} />);
+    await screen.findByTestId("factory-run-834");
+    expect(screen.getAllByRole("button", { name: /^Archive run/ })).toHaveLength(1);
+    for (const runId of ["834", "832", "831"]) {
+      expect(screen.queryByRole("button", { name: `Archive run ${runId}` })).toBeNull();
+    }
+  });
+
   describe.each(["default-retro", "neon-terminal", "cosmic-nebula"])("%s slice-first detail", (skin) => {
     it.each([{ width: 1153, height: 1082 }, { width: 390, height: 844 }])(
       "keeps both observed shapes ahead of diagnostics at $width x $height",

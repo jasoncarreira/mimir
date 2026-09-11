@@ -54,7 +54,7 @@ from .dashboard_extensions import (
     add_backend_namespace_routes,
     first_party_dashboard_extensions,
 )
-from .event_logger import safe_log_event
+from .event_logger import log_durable_event_sync, safe_log_event
 from .chainlink_board import (
     build_chainlink_board_payload,
     resolve_worklink_artifact,
@@ -63,6 +63,8 @@ from .worklink.backends.feature_factory import _RUN_ID as _FACTORY_RUN_ID_RE
 from .worklink.factory_state import (
     FactoryRunRecord,
     FactoryRecordError,
+    archive_factory_record,
+    factory_process_is_verified_dead,
     list_factory_records,
     load_factory_record,
 )
@@ -1578,6 +1580,7 @@ def register_routes(
         state = record.status
         result: dict[str, Any] = {
             "run_id": record.run_id,
+            "clearable": factory_process_is_verified_dead(record),
             "issue_key": (state.issue_key if state is not None else None) or str(record.issue_id),
             "valid": state.valid if state is not None else False,
             "sandbox_path": record.sandbox,
@@ -1618,8 +1621,7 @@ def register_routes(
             meta=list_meta(cursor=None, limit=None, total=len(runs), truncated=False),
         )
 
-    async def factory_runs_detail_v1(request: web.Request) -> web.Response:
-        """GET /api/v1/factory-runs/{run_id} — get a specific factory run."""
+    def _factory_run_for_request(request: web.Request) -> FactoryRunRecord | web.Response:
         run_id = request.match_info.get("run_id", "").strip()
         if not run_id:
             return json_error("missing_run_id", "run_id is required", status=400)
@@ -1634,7 +1636,44 @@ def register_routes(
             return json_error("run_invalid", "factory run record is malformed", status=400)
         if record is None:
             return json_error("run_not_found", f"factory run not found: {run_id}", status=404)
+        return record
+
+    async def factory_runs_detail_v1(request: web.Request) -> web.Response:
+        """GET /api/v1/factory-runs/{run_id} — get a specific factory run."""
+        record = _factory_run_for_request(request)
+        if isinstance(record, web.Response):
+            return record
         return json_success(_serialize_factory_run_detail(record))
+
+    async def factory_runs_archive_v1(request: web.Request) -> web.Response:
+        record = _factory_run_for_request(request)
+        if isinstance(record, web.Response):
+            return record
+        try:
+            body = await request.json()
+        except (ValueError, UnicodeDecodeError):
+            return json_error("invalid_reason", "reason must be a nonempty string", status=400)
+        reason = body.get("reason") if isinstance(body, dict) else None
+        if not isinstance(reason, str) or not reason.strip():
+            return json_error("invalid_reason", "reason must be a nonempty string", status=400)
+        if not factory_process_is_verified_dead(record):
+            return json_error(
+                "run_not_verified_dead", "cannot prove factory process is dead", status=409,
+            )
+        identity = request.get("auth_identity")
+        operator = identity.canonical if identity is not None else (
+            "master" if request.get("auth_is_master") else "anonymous"
+        )
+        try:
+            await asyncio.to_thread(
+                archive_factory_record, home, record,
+                event_logger=log_durable_event_sync,
+                source_kind="web_ui",
+                reason=f"web archive by {operator}: {reason.strip()}",
+            )
+        except FactoryRecordError:
+            return json_error("run_archive_failed", "factory run could not be archived", status=500)
+        return json_success({"run_id": record.run_id, "archived": True})
 
     async def chainlink_board_data_v1(request: web.Request) -> web.Response:
         try:
@@ -2347,6 +2386,7 @@ def register_routes(
     def factory_runs_backend_routes() -> list[DashboardBackendRoute]:
         return [
             DashboardBackendRoute("GET", "/api/v1/factory-runs", factory_runs_list_v1),
+            DashboardBackendRoute("POST", "/api/v1/factory-runs/{run_id:.*}/archive", factory_runs_archive_v1),
             DashboardBackendRoute("GET", "/api/v1/factory-runs/{run_id:.*}", factory_runs_detail_v1),
         ]
 
