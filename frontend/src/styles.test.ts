@@ -28,6 +28,43 @@ describe.each(skins)("%s narrow-pane stylesheet contract", (skin) => {
   const manifest = readFileSync(new URL(`./skins/${skin}.ts`, import.meta.url), "utf8");
   const sidebar = manifest.includes('layout: "sidebar"');
 
+  it.each([390, 600, 900, 1512])("contains Kanban titles and drawer content at %ipx", (viewport) => {
+    const padding = viewport <= 640 ? 16 : 32;
+    const pane = viewport - (sidebar && viewport > 900 ? 280 : 0) - padding * 2;
+    const css = (selector: string) => declarations(selector, viewport, pane);
+
+    expect(css(".chainlink-board")).toMatchObject({
+      "grid-template-columns": "repeat(6, minmax(220px, 1fr))", "overflow-x": "auto"
+    });
+    expect(css(".chainlink-column")["min-width"]).toBe("220px");
+    for (const selector of [".chainlink-column__cards", ".chainlink-card",
+      ".chainlink-drawer", ".chainlink-drawer-section"]) {
+      expect(css(selector), selector).toMatchObject({
+        "min-width": "0", "grid-template-columns": "minmax(0, 1fr)"
+      });
+    }
+    expect(css(".chainlink-card__title")).toMatchObject({
+      "min-width": "0", "overflow-wrap": "anywhere"
+    });
+    expect(css(".chainlink-route .ui-drawer")).toMatchObject({
+      "min-width": "0", "max-width": "100%", "overflow-wrap": "anywhere"
+    });
+    expect(css(".chainlink-drawer")["max-width"]).toBe("100%");
+    for (const selector of [".chainlink-description", ".chainlink-drawer pre"]) {
+      expect(css(selector), selector).toMatchObject({
+        "min-width": "0", "max-width": "100%", "overflow-x": "auto"
+      });
+    }
+    expect(css(".chainlink-description")["white-space"]).toBe("pre-wrap");
+    expect(css(".ui-code")).toMatchObject({ "min-width": "0", "max-width": "100%" });
+    expect(css(".ui-code pre")["overflow-x"]).toBe("auto");
+    for (const selector of [".chainlink-card__title", ".chainlink-route .ui-drawer", ".chainlink-drawer"]) {
+      expect(css(selector).overflow, selector).toBeUndefined();
+      expect(css(selector)["overflow-x"], selector).toBeUndefined();
+      expect(css(selector)["text-overflow"], selector).toBeUndefined();
+    }
+  });
+
   it.each([390, 600, 900, 1512])("scrolls wide tables without disabling panel wrapping at %ipx", (viewport) => {
     const padding = viewport <= 640 ? 16 : 32;
     const pane = viewport - (sidebar && viewport > 900 ? 280 : 0) - padding * 2;
