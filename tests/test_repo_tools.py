@@ -1758,7 +1758,8 @@ def test_project_suite_default_and_legacy_fallback(repo_tools, tmp_path, monkeyp
 @pytest.mark.asyncio
 @pytest.mark.parametrize("exit_code,overflow,timed_out,code", [
     (2, False, False, "tests_failed"),
-    (0, True, False, "tests_failed"),
+    (0, True, False, "test_output_overflow"),
+    (2, True, False, "tests_failed_output_overflow"),
     (None, False, True, "test_timeout"),
 ])
 async def test_frontend_result_preserves_bounded_failure_reporting(
@@ -1778,6 +1779,46 @@ async def test_frontend_result_preserves_bounded_failure_reporting(
     assert result.returncode == exit_code
     assert len(result.stdout) == 8000 and len(result.stderr) == 4000
     assert state.full_tested_head is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("exit_code,overflow,timed_out,code", [
+    (0, False, False, "tests_passed"),
+    (2, False, False, "tests_failed"),
+    (0, True, False, "test_output_overflow"),
+    (2, True, False, "tests_failed_output_overflow"),
+    (None, True, False, "tests_failed_output_overflow"),
+    (0, True, True, "test_timeout"),
+    (2, True, True, "test_timeout"),
+])
+async def test_project_test_output_overflow_verdict_and_accounting(
+    repo_tools, tmp_path, monkeypatch, exit_code, overflow, timed_out, code,
+):
+    state = repo_tools[-2]
+    home = tmp_path / "home"
+    _configure_worklink_test(home)
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    stdout_dropped = 123 if overflow else 0
+    stderr_dropped = 456 if overflow else 0
+
+    async def runner(*args, **kwargs):
+        return CollectedExecutionResult(
+            exit_code, b"x" * 9000, b"e" * 5000, timed_out, overflow,
+            stdout_dropped, stderr_dropped,
+        )
+
+    result = await RepoProjectTests(
+        state, runner=runner, checkout_factory=_test_checkout_factory,
+    ).execute()
+
+    assert result.code == code
+    assert result.ok is (code == "tests_passed")
+    assert result.returncode == (None if timed_out else exit_code)
+    assert result.output_limited is overflow
+    assert result.stdout_dropped_bytes == stdout_dropped
+    assert result.stderr_dropped_bytes == stderr_dropped
+    assert len(result.stdout) == 8000 and len(result.stderr) == 4000
+    assert state.full_tested_head == (state.git_expected_head if result.ok else None)
 
 
 def _snapshot_checkout_factory(root: Path, issued: list[Path]):
@@ -1892,7 +1933,7 @@ async def test_project_tests_use_snapshot_collected_result_and_worker_environmen
     assert env["GIT_CONFIG_COUNT"] == "1"
     assert env["GIT_CONFIG_KEY_0"] == "safe.directory"
     assert env["GIT_CONFIG_VALUE_0"] == "*"
-    assert kwargs["stdout_limit"] == kwargs["stderr_limit"] == 64 * 1024
+    assert kwargs["stdout_limit"] == kwargs["stderr_limit"] == 16 * 1024 * 1024
     # Assert propagation, not the magnitude: the value is pinned as a floor
     # by test_project_test_timeout_can_actually_run_this_repository_suite.
     assert kwargs["timeout_s"] == _TIMEOUT_SECONDS
@@ -2120,7 +2161,7 @@ async def test_project_test_hang_is_observable_before_runner_completes(
     assert task.done() is False
     assert b"test_never_finishes.py::test_hangs" in stdout_path.read_bytes()
     assert b"test_never_finishes.py" in stderr_path.read_bytes()
-    assert observed["stdout_limit"] == observed["stderr_limit"] == 64 * 1024
+    assert observed["stdout_limit"] == observed["stderr_limit"] == 16 * 1024 * 1024
     assert stdout_path.stat().st_size <= 64 * 1024
     assert stderr_path.stat().st_size <= 64 * 1024
 
