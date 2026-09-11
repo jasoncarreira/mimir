@@ -250,24 +250,51 @@ for line in sys.stdin.buffer:
     assert "sentinel" not in json.dumps(captured)
 
 
-@pytest.fixture
-def delayed_spawn(monkeypatch: pytest.MonkeyPatch) -> AsyncMock:
-    spawn = AsyncMock(wraps=asyncio.create_subprocess_exec)
-
-    async def delayed(*args: object, **kwargs: object) -> asyncio.subprocess.Process:
-        await asyncio.sleep(0.2)
-        return await spawn(*args, **kwargs)
-
-    monkeypatch.setattr("mimir.acp.ssh.asyncio.create_subprocess_exec", delayed)
-    return spawn
-
-
 @pytest.mark.asyncio
 @pytest.mark.parametrize("times_out", [False, True], ids=["default-bound", "spawn-timeout"])
 async def test_local_spawn_bound(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, delayed_spawn: AsyncMock,
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
     times_out: bool,
 ) -> None:
+    from types import SimpleNamespace
+    from mimir.acp import ssh as ssh_module
+
+    spawn = AsyncMock(wraps=asyncio.create_subprocess_exec)
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    cancelled = asyncio.Event()
+    budgets = []
+
+    async def delayed(*args, **kwargs):
+        entered.set()
+        try:
+            await release.wait()
+        except asyncio.CancelledError:
+            cancelled.set()
+            raise
+        return await spawn(*args, **kwargs)
+
+    async def wait_for(awaitable, timeout):
+        if budgets:
+            return await asyncio.wait_for(awaitable, timeout)
+        budgets.append(timeout)
+        spawning = asyncio.create_task(awaitable)
+        try:
+            await entered.wait()
+            assert timeout == ssh_module.SPAWN_TIMEOUT
+            if times_out:
+                return await asyncio.wait_for(spawning, 0)
+            release.set()
+            return await spawning
+        finally:
+            spawning.cancel()
+            await asyncio.gather(spawning, return_exceptions=True)
+
+    monkeypatch.setattr(ssh_module, "asyncio", SimpleNamespace(
+        **{name: getattr(asyncio, name) for name in dir(asyncio)
+           if name not in {"wait_for", "create_subprocess_exec"}},
+        wait_for=wait_for, create_subprocess_exec=delayed,
+    ))
     profile, _ = remote_profile(tmp_path)
     ssh = _fake_ssh(tmp_path, "raise SystemExit(0)\n")
     reader = asyncio.StreamReader()
@@ -278,15 +305,16 @@ async def test_local_spawn_bound(
     monkeypatch.setattr("mimir.acp.ssh.open_stdio", stdio)
 
     if times_out:
-        monkeypatch.setattr("mimir.acp.ssh.SPAWN_TIMEOUT", 0.01)
         with pytest.raises(TimeoutError):
             await run_ssh_proxy(profile, "secret", output, _ssh_path=ssh)
         # Cancellation precedes the real spawn: no child or subprocess pipes exist.
-        delayed_spawn.assert_not_awaited()
+        assert cancelled.is_set()
+        spawn.assert_not_awaited()
         stdio.assert_not_awaited()
     else:
         await run_ssh_proxy(profile, "secret", output, _ssh_path=ssh)
-        delayed_spawn.assert_awaited_once()
+        assert not cancelled.is_set()
+        spawn.assert_awaited_once()
         stdio.assert_awaited_once()
 
 

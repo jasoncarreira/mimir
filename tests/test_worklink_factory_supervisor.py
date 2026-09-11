@@ -31,13 +31,30 @@ import ctypes, importlib.util, json, os, signal, socket, subprocess, sys, time
 source, registry, mode, mutate, payload = sys.argv[1:]
 assert ctypes.CDLL(None).prctl(36, 1, 0, 0, 0) == 0
 parent, child = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
-parent.settimeout(8)
 if mode == "backpressure":
     child.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 4096)
 command = [sys.executable, "-I", source, str(child.fileno()), sys.executable, "-I", "-c", payload, registry]
 if mutate == "yes":
     wrapper = "import importlib.util,sys; s=importlib.util.spec_from_file_location('s',sys.argv[1]); m=importlib.util.module_from_spec(s); s.loader.exec_module(m); m._enable_subreaper=lambda:None; sys.exit(m.main(sys.argv[2:]))"
     command = [sys.executable, "-I", "-c", wrapper] + command[2:]
+if mode == "live_reap":
+    wrapper = """import importlib.util, sys
+s = importlib.util.spec_from_file_location('s', sys.argv[1])
+m = importlib.util.module_from_spec(s)
+s.loader.exec_module(m)
+observe = m._observe
+adopted = False
+def observed(channel, primary, adoptions):
+    global adopted
+    children = observe(channel, primary, adoptions)
+    if adopted:
+        open(sys.argv[-1] + '.checked', 'w').close()
+    adopted = adopted or any(pid != primary for pid in children)
+    return children
+m._observe = observed
+sys.exit(m.main(sys.argv[2:]))
+"""
+    command = [sys.executable, '-I', '-c', wrapper] + command[2:]
 process = subprocess.Popen(command, pass_fds=(child.fileno(),))
 child.close()
 events = []
@@ -45,9 +62,7 @@ try:
     ready = json.loads(parent.recv(4096))
     assert ready == {"kind": "ready"}, ready
     if mode in ("stop", "eof"):
-        deadline = time.monotonic() + 5
         while not os.path.exists(registry + ".ready"):
-            assert time.monotonic() < deadline
             time.sleep(.01)
         if mode == "eof":
             parent.close()
@@ -55,7 +70,7 @@ try:
             parent.send(b"stop, not necessarily JSON")
     if mode == "backpressure":
         # Do not drain even one event until cleanup and reporting have ended.
-        process.wait(timeout=6)
+        process.wait()
     if mode != "eof":
         while True:
             packet = parent.recv(4096)
@@ -66,7 +81,7 @@ try:
             events.append(event)
             if event["kind"] == "terminal":
                 break
-    result = process.wait(timeout=6)
+    result = process.wait()
     with open(registry) as stream:
         pids = [int(line) for line in stream]
     leaked = [pid for pid in pids if os.path.exists('/proc/' + str(pid))]
@@ -125,7 +140,6 @@ if middle == 0:
 os.close(write_fd)
 assert os.read(read_fd, 1) == b'R'
 os.waitpid(middle, 0)
-time.sleep(.1)
 open(registry + '.ready', 'w').close()
 '''
 
@@ -136,13 +150,18 @@ def spawn_on_term(sig, frame):
         while True:
             time.sleep(1)
 signal.signal(signal.SIGTERM, spawn_on_term)
+read_fd, write_fd = os.pipe()
 if os.fork() == 0:
     record()
     if os.fork() == 0:
         record()
+        os.write(write_fd, b'R')
+    else:
+        os.write(write_fd, b'R')
     while True:
         time.sleep(1)
-time.sleep(.1)
+assert os.read(read_fd, 1) == b'R'
+assert os.read(read_fd, 1) == b'R'
 open(registry + '.ready', 'w').close()
 while True:
     time.sleep(1)
@@ -153,7 +172,8 @@ def run_isolated(tmp_path, payload, *, mode="normal", mutate=False):
     completed = subprocess.run(
         [sys.executable, "-I", "-c", HARNESS, str(SOURCE), str(tmp_path / "pids"),
          mode, "yes" if mutate else "no", payload],
-        capture_output=True, text=True, timeout=20,
+        # One ceiling covers harness startup, descendants, reporting and reaping.
+        capture_output=True, text=True, timeout=240,
     )
     assert completed.returncode == 0, completed.stderr
     return json.loads(completed.stdout)
@@ -206,14 +226,19 @@ def test_failure_exit_is_reported_not_supervisor_exit(tmp_path):
 
 def test_zombie_adoptee_is_reported(tmp_path):
     payload = PRELUDE + r'''
-if os.fork() == 0:
+read_fd, write_fd = os.pipe()
+middle = os.fork()
+if middle == 0:
     record()
-    if os.fork() == 0:
+    zombie = os.fork()
+    if zombie == 0:
         record()
         os._exit(0)
-    time.sleep(.1)
+    os.waitid(os.P_PID, zombie, os.WEXITED | os.WNOWAIT)
+    os.write(write_fd, b'R')
     os._exit(0)
-time.sleep(.3)
+assert os.read(read_fd, 1) == b'R'
+os.waitid(os.P_PID, middle, os.WEXITED | os.WNOWAIT)
 '''
     result = run_isolated(tmp_path, payload)
     assert_clean(result)
@@ -236,12 +261,11 @@ if middle == 0:
 os.close(write_fd)
 zombie = int(os.read(read_fd, 100))
 os.waitpid(middle, 0)
-deadline = time.monotonic() + 3
-while os.path.exists('/proc/' + str(zombie)):
-    assert time.monotonic() < deadline, 'adopted zombie retained until run ends'
+while not os.path.exists(registry + '.checked'):
     time.sleep(.01)
+assert not os.path.exists('/proc/' + str(zombie)), 'adopted zombie retained after reap iteration'
 '''
-    result = run_isolated(tmp_path, payload)
+    result = run_isolated(tmp_path, payload, mode="live_reap")
     assert_clean(result)
     assert result["result"] == 0
     assert result["events"][-1] == {"kind": "terminal", "exit_code": 0}
@@ -254,12 +278,16 @@ middle = os.fork()
 if middle == 0:
     record()
     os.setsid()
+    read_fd, write_fd = os.pipe()
     for _ in range(40):
         if os.fork() == 0:
             record()
             signal.signal(signal.SIGTERM, signal.SIG_IGN)
+            os.write(write_fd, b'R')
             while True:
                 time.sleep(1)
+    for _ in range(40):
+        assert os.read(read_fd, 1) == b'R'
     os._exit(0)
 os.waitpid(middle, 0)
 while True:

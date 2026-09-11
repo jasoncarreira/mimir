@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import json
 import os
-import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -105,7 +105,9 @@ def test_writes_within_ttl_are_not_seen_until_invalidate(tmp_path: Path):
     assert [r["i"] for r in snap.records()] == [2, 1]
 
 
-def test_records_re_reads_after_ttl_expiry_when_mtime_changes(tmp_path: Path):
+def test_records_re_reads_after_ttl_expiry_when_mtime_changes(tmp_path: Path, monkeypatch):
+    now = 100.0
+    monkeypatch.setattr("mimir.jsonl_snapshot.time", SimpleNamespace(monotonic=lambda: now))
     path = tmp_path / "events.jsonl"
     _write_jsonl(path, [{"i": 1}])
     snap = JsonlSnapshot(path, ttl_s=0.05)
@@ -114,18 +116,21 @@ def test_records_re_reads_after_ttl_expiry_when_mtime_changes(tmp_path: Path):
 
     _append_jsonl(path, [{"i": 2}])
     _bump_mtime(path)
-    time.sleep(0.06)  # past the TTL
+    assert [r["i"] for r in snap.records()] == [1]
+    now += 0.06
 
     # Past TTL + mtime advanced → re-read.
     assert [r["i"] for r in snap.records()] == [2, 1]
 
 
-def test_records_skips_re_read_when_mtime_unchanged(tmp_path: Path):
+def test_records_skips_re_read_when_mtime_unchanged(tmp_path: Path, monkeypatch):
     """After TTL expiry the snapshot stat()s the file. If mtime is
     unchanged, the cache is reused — only the TTL window is reset.
     Pin by patching tail_jsonl_records to count calls."""
     from unittest.mock import patch
 
+    now = 100.0
+    monkeypatch.setattr("mimir.jsonl_snapshot.time", SimpleNamespace(monotonic=lambda: now))
     path = tmp_path / "events.jsonl"
     _write_jsonl(path, [{"i": 1}, {"i": 2}])
     snap = JsonlSnapshot(path, ttl_s=0.05)
@@ -133,7 +138,7 @@ def test_records_skips_re_read_when_mtime_unchanged(tmp_path: Path):
     # Prime the cache.
     snap.records()
 
-    time.sleep(0.06)  # past TTL but no mtime change
+    now += 0.06
 
     # Patch the underlying reader to fail loudly if called.
     call_count = {"n": 0}
@@ -145,6 +150,7 @@ def test_records_skips_re_read_when_mtime_unchanged(tmp_path: Path):
 
     with patch("mimir.jsonl_snapshot.tail_jsonl_records", side_effect=_counting_tail):
         snap.records()
+        assert snap._cache_until == now + 0.05
         assert call_count["n"] == 0, (
             "mtime unchanged after TTL expiry must not trigger a re-read"
         )

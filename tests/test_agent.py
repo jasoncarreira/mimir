@@ -2030,6 +2030,7 @@ async def test_continuation_written_even_without_assistant_output(
     assert payload["association"]["branch"] == "chainlink-740-budget-continuation--be-agent-finalizer"
 
 
+@pytest.mark.timeout(30)
 async def test_budget_continuation_timeout_logs_failure_and_still_runs_finalize_hooks(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -2044,30 +2045,58 @@ async def test_budget_continuation_timeout_logs_failure_and_still_runs_finalize_
         fake_saga=None,
     )
     finalized: list[str] = []
+    import threading
+    from unittest.mock import Mock
+    import mimir.agent as agent_module
+
+    release = threading.Event()
+    finished = threading.Event()
+    started = asyncio.Event()
+    loop = asyncio.get_running_loop()
+
+    async def wait_for_started(awaitable, timeout):
+        if timeout == 0.01:
+            # Arm the real timeout only once its producer is running. Executor
+            # startup is not part of the continuation timeout regression.
+            awaitable = asyncio.create_task(awaitable)
+            await started.wait()
+        return await asyncio.wait_for(awaitable, timeout=timeout)
+
+    monkeypatch.setattr(agent_module, "asyncio", Mock(
+        wraps=asyncio, wait_for=wait_for_started,
+        TimeoutError=asyncio.TimeoutError, CancelledError=asyncio.CancelledError,
+    ))
 
     class _FinalizeHook:
         async def finalize(self, ctx, event, record):
             finalized.append(record.turn_id)
 
     def _slow_continuation(**_kwargs):
-        time.sleep(0.2)
+        try:
+            loop.call_soon_threadsafe(started.set)
+            release.wait()
+        finally:
+            finished.set()
         return None
 
     monkeypatch.setattr("mimir.agent.maybe_create_worklink_budget_continuation", _slow_continuation)
     monkeypatch.setattr("mimir.agent._worklink_continuation_timeout_seconds", lambda _cfg: 0.01)
     agent._hooks.append(_FinalizeHook())
 
-    record = await asyncio.wait_for(
-        agent.run_turn(
+    try:
+        record = await agent.run_turn(
             AgentEvent(
                 trigger="scheduled_tick",
                 channel_id="ops",
                 content="generic worklink follow-up",
                 source_id="budget-timeout-src",
             )
-        ),
-        timeout=5.0,
-    )
+        )
+        assert not finished.is_set()
+    finally:
+        release.set()
+        if started.is_set():
+            await asyncio.to_thread(finished.wait)
 
     assert record.output == "ok"
     assert finalized == [record.turn_id]
@@ -2642,6 +2671,7 @@ async def test_run_turn_records_error_when_ainvoke_raises(tmp_path: Path):
 
 @pytest.mark.parametrize("failure", ["exception", "timeout"])
 @pytest.mark.parametrize("shape", ["native", "internal"])
+@pytest.mark.timeout(30)
 async def test_failed_turn_preserves_partial_tool_events(tmp_path: Path, failure, shape):
     secret = "sk-proj-" + "sensitivecredential" * 5
     calls = [{"id": "done", "name": "write_file", "args": {"api_key": secret}}]
@@ -2662,7 +2692,7 @@ async def test_failed_turn_preserves_partial_tool_events(tmp_path: Path, failure
                 yield ("values", snapshot)
                 yield ("values", snapshot)  # cumulative snapshots must not duplicate actions
             if failure == "timeout":
-                await asyncio.sleep(10)
+                await asyncio.Event().wait()
             raise RuntimeError(f"transport dropped token={secret}")
 
     fake = BrokenStream(messages)

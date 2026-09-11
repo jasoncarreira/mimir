@@ -1342,6 +1342,7 @@ class _FakeResp:
 
 
 @pytest.mark.asyncio
+@pytest.mark.timeout(30)
 async def test_supervisor_fires_algedonic_after_three_attempts(monkeypatch, tmp_path: Path):
     """``discord_bridge_retry`` event should fire only after attempts >= 3
     so a one-off transient doesn't spam the algedonic block. Pinned via
@@ -1362,10 +1363,12 @@ async def test_supervisor_fires_algedonic_after_three_attempts(monkeypatch, tmp_
 
     attempts = {"n": 0}
     hold_open = asyncio.Event()
+    fifth_started = asyncio.Event()
 
     async def fake_start(token):
         attempts["n"] += 1
         if attempts["n"] >= 5:
+            fifth_started.set()
             await hold_open.wait()
         raise discord.DiscordServerError(
             _FakeResp(status=503), {"code": 0, "message": "boom"},
@@ -1379,14 +1382,16 @@ async def test_supervisor_fires_algedonic_after_three_attempts(monkeypatch, tmp_
     )
 
     await bridge.connect()
-    for _ in range(100):
-        if attempts["n"] >= 5:
-            break
-        await asyncio.sleep(0.01)
+    try:
+        await fifth_started.wait()
+        await asyncio.gather(*(
+            task for task in bridge._background_tasks if task is not bridge._runner
+        ))
+    finally:
+        bridge._runner.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await bridge._runner
     assert attempts["n"] == 5
-    # Wait briefly for any pending log-event tasks to drain.
-    for _ in range(20):
-        await asyncio.sleep(0)
 
     retry_events = [(k, f) for k, f in captured if k == "discord_bridge_retry"]
     # Four failures before the fifth attempt blocks; events fire on attempts 3, 4.
@@ -1394,11 +1399,6 @@ async def test_supervisor_fires_algedonic_after_three_attempts(monkeypatch, tmp_
     assert retry_events[0][1]["attempt"] == 3
     assert retry_events[1][1]["attempt"] == 4
     assert not any(k == "discord_bridge_exited" for k, _ in captured)
-
-    assert bridge._runner is not None
-    bridge._runner.cancel()
-    with pytest.raises(asyncio.CancelledError):
-        await bridge._runner
 
 
 @pytest.mark.asyncio
@@ -1437,12 +1437,32 @@ async def test_supervisor_clean_exit_when_client_returns(monkeypatch, tmp_path: 
 
 
 @pytest.mark.asyncio
+@pytest.mark.timeout(30)
 async def test_disconnect_cancels_supervisor_cleanly(monkeypatch, tmp_path: Path):
     """``disconnect()`` during a backoff sleep must cancel the supervisor
     cleanly without re-raising CancelledError into the caller."""
     import discord
     bridge = DiscordBridge(token="x", enqueue=AsyncMock(return_value=True))
-    bridge._RECONNECT_BACKOFF_INITIAL_SECONDS = 5.0  # long enough to interrupt mid-sleep
+    bridge._RECONNECT_BACKOFF_INITIAL_SECONDS = 5.0
+    backoff_started = asyncio.Event()
+    backoff_cancelled = asyncio.Event()
+    delays = []
+
+    async def backoff_sleep(delay):
+        delays.append(delay)
+        backoff_started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            backoff_cancelled.set()
+            raise
+
+    # Patch the bridge's module binding, not the shared asyncio module.
+    import mimir.bridges.discord as discord_module
+    from unittest.mock import Mock
+    monkeypatch.setattr(discord_module, "asyncio", Mock(
+        wraps=asyncio, sleep=backoff_sleep, CancelledError=asyncio.CancelledError,
+    ))
 
     async def fake_start(token):
         raise discord.DiscordServerError(
@@ -1457,11 +1477,17 @@ async def test_disconnect_cancels_supervisor_cleanly(monkeypatch, tmp_path: Path
     )
 
     await bridge.connect()
-    # Let the supervisor hit its first failure + start the backoff sleep.
-    await asyncio.sleep(0.05)
-    # Now disconnect — should cancel the supervisor task, not raise.
-    await bridge.disconnect()
-    assert bridge._runner is None
+    runner = bridge._runner
+    try:
+        await backoff_started.wait()
+        # Now disconnect -- should cancel the supervisor task, not raise.
+        await bridge.disconnect()
+        assert bridge._runner is None
+        assert delays == [5.0]
+        assert backoff_cancelled.is_set()
+    finally:
+        runner.cancel()
+        await asyncio.gather(runner, return_exceptions=True)
 
 
 @pytest.mark.asyncio

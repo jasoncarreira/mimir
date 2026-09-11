@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+import shlex
+import sys
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
@@ -9,6 +12,24 @@ import pytest
 from mimir.acp import confinement, hosted
 from mimir.acp.hosted import HostedHandsProvider, HostedMcpError
 from mimir.acp.execution_scope import UNCONFINED_WARNING
+
+
+@pytest.fixture
+def execution_timers(monkeypatch):
+    from mimir.acp import python_kernel
+
+    timers = []
+
+    def timeout_at(deadline):
+        timer = asyncio.timeout(None)
+        timers.append(timer)
+        return timer
+
+    for module in (hosted, python_kernel):
+        monkeypatch.setattr(module, "asyncio", SimpleNamespace(**{
+            **vars(asyncio), "timeout_at": timeout_at,
+        }))
+    return timers
 
 
 @pytest.fixture
@@ -160,20 +181,36 @@ async def test_risk_grant_is_not_shared_with_second_session_or_rebind(tmp_path, 
         await provider.close()
 
 
+@pytest.mark.timeout(120)
 @pytest.mark.asyncio
-@pytest.mark.parametrize("code", ["1/0", "import os; os._exit(31)", "import time; time.sleep(30)"])
-async def test_every_unconfined_python_result_labels_mode(tmp_path, unavailable, code):
+@pytest.mark.parametrize("code", ["1/0", "import os; os._exit(31)", "timeout"])
+async def test_every_unconfined_python_result_labels_mode(tmp_path, unavailable, code, execution_timers):
     provider, session = bind(tmp_path, AsyncMock(return_value=True))
+    task = None
     try:
         await provider.execute_python(session, "1")
         session.timeout_seconds = 1
-        result = await provider.execute_python(session, code)
+        source = ("from pathlib import Path\nimport signal\nPath('entered').touch()\nsignal.pause()"
+                  if code == "timeout" else code)
+        task = asyncio.create_task(provider.execute_python(session, source))
+        if code == "timeout":
+            while not (tmp_path / "entered").exists():
+                await asyncio.sleep(0)
+            assert not task.done()
+            execution_timers[-1].reschedule(0)
+        result = await task
         assert result["stderr"].startswith(UNCONFINED_WARNING)
         assert not result["ok"]
+        assert result["kernel"] == {"1/0": "reused", "import os; os._exit(31)": "crashed",
+                                    "timeout": "timed_out"}[code]
     finally:
+        if task is not None:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
         await provider.close()
 
 
+@pytest.mark.timeout(120)
 @pytest.mark.asyncio
 @pytest.mark.parametrize("modes", [("unconfined", "unconfined"), ("unconfined", "confined"), ("confined", "unconfined")])
 @pytest.mark.parametrize("ending", ["success", "crash", "timeout", "startup"])
@@ -186,6 +223,14 @@ async def test_adopted_kernel_warning_uses_this_calls_mode(tmp_path, monkeypatch
         return confinement.PreparedCommand(tuple(argv), dict(os.environ), execution_mode=mode)
     monkeypatch.setattr(kernels, "prepare_command", prepare)
     manager = kernels.PythonKernelManager()
+    task = None
+    timers = []
+
+    def timeout_at(deadline):
+        timer = asyncio.timeout(None)
+        timers.append(timer)
+        return timer
+
     try:
         await manager.execute("a", tmp_path, "kept = 42")
         await manager.release("a")
@@ -200,28 +245,59 @@ async def test_adopted_kernel_warning_uses_this_calls_mode(tmp_path, monkeypatch
             assert str(error.value).count(UNCONFINED_WARNING) == (mode == "unconfined")
         else:
             code = {"success": "1", "crash": "import os; os._exit(31)",
-                    "timeout": "import time; time.sleep(30)"}[ending]
-            result = await manager.execute("b", tmp_path, code, timeout=1)
+                    "timeout": "import pathlib,time\npathlib.Path('executing').touch()\nwhile True: time.sleep(1)"}[ending]
+            if ending == "timeout":
+                # Allow adoption/respawn and handshake to finish before expiring
+                # the real response timeout, without changing the event-loop clock.
+                monkeypatch.setattr(kernels, "asyncio", SimpleNamespace(**{
+                    **vars(asyncio), "timeout_at": timeout_at,
+                }))
+            task = asyncio.create_task(manager.execute("b", tmp_path, code, timeout=120))
+            if ending == "timeout":
+                while not (tmp_path / "executing").exists():
+                    await asyncio.sleep(0)
+                state = manager._kernels[str(tmp_path.resolve())]
+                assert state.worker.execution_mode == mode
+                assert not task.done()
+                timers[-1].reschedule(0)
+            result = await task
             assert result["stderr"].count(UNCONFINED_WARNING) == (mode == "unconfined")
             if ending == "success":
                 assert result["ok"]
                 assert result["kernel"] == ("reused" if modes[0] == mode else "fresh")
             else:
                 assert not result["ok"]
+                assert result["kernel"] == ("crashed" if ending == "crash" else "timed_out")
     finally:
+        if task is not None:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
         await manager.close()
 
 
+@pytest.mark.timeout(120)
 @pytest.mark.asyncio
-async def test_unconfined_shell_failure_and_timeout_label_mode(tmp_path, unavailable):
+async def test_unconfined_shell_failure_and_timeout_label_mode(tmp_path, unavailable, execution_timers):
     provider, session = bind(tmp_path, AsyncMock(return_value=True))
+    task = None
     try:
         failed = await provider._shell(session, "exit 3")
         assert failed["exitCode"] == 3 and failed["stderr"].startswith(UNCONFINED_WARNING)
         session.timeout_seconds = 1
-        timeout = await provider._shell(session, "sleep 30")
+        source = "from pathlib import Path; import signal; Path('entered').touch(); signal.pause()"
+        task = asyncio.create_task(provider._shell(
+            session, f"exec {shlex.quote(sys.executable)} -c {shlex.quote(source)}",
+        ))
+        while not (tmp_path / "entered").exists():
+            await asyncio.sleep(0)
+        assert not task.done()
+        execution_timers[-1].reschedule(0)
+        timeout = await task
         assert timeout["exitCode"] == -1 and timeout["stderr"].startswith(UNCONFINED_WARNING)
     finally:
+        if task is not None:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
         await provider.close()
 
 

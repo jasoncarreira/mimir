@@ -1212,6 +1212,7 @@ async def test_slack_supervisor_does_not_retry_on_missing_scope(monkeypatch, tmp
 
 
 @pytest.mark.asyncio
+@pytest.mark.timeout(30)
 async def test_slack_supervisor_fires_algedonic_after_three_attempts(monkeypatch, tmp_path: Path):
     """``slack_bridge_retry`` event should fire only after attempts >= 3
     so a one-off transient doesn't spam the algedonic block."""
@@ -1232,10 +1233,12 @@ async def test_slack_supervisor_fires_algedonic_after_three_attempts(monkeypatch
 
     attempts = {"n": 0}
     hold_open = asyncio.Event()
+    fifth_started = asyncio.Event()
 
     async def fake_start_async():
         attempts["n"] += 1
         if attempts["n"] >= 5:
+            fifth_started.set()
             await hold_open.wait()
         raise SlackApiError(
             message="503", response={"ok": False, "error": "service_unavailable"},
@@ -1250,23 +1253,22 @@ async def test_slack_supervisor_fires_algedonic_after_three_attempts(monkeypatch
     )
 
     bridge._runner = asyncio.create_task(bridge._supervised_run())
-    for _ in range(100):
-        if attempts["n"] >= 5:
-            break
-        await asyncio.sleep(0.01)
+    try:
+        await fifth_started.wait()
+        await asyncio.gather(*(
+            task for task in bridge._background_tasks if task is not bridge._runner
+        ))
+    finally:
+        bridge._runner.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await bridge._runner
     assert attempts["n"] == 5
-    for _ in range(20):
-        await asyncio.sleep(0)
 
     retry_events = [(k, f) for k, f in captured if k == "slack_bridge_retry"]
     assert len(retry_events) == 2  # attempts 3, 4; the fifth remains in progress
     assert retry_events[0][1]["attempt"] == 3
     assert retry_events[0][1]["slack_error"] == "service_unavailable"
     assert not any(k == "slack_bridge_exited" for k, _ in captured)
-
-    bridge._runner.cancel()
-    with pytest.raises(asyncio.CancelledError):
-        await bridge._runner
 
 
 @pytest.mark.asyncio

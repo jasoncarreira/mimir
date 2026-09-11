@@ -8,7 +8,6 @@ import json
 import multiprocessing
 import os
 import threading
-import time
 from pathlib import Path
 
 import pytest
@@ -23,13 +22,29 @@ from mimir.event_logger import (
 
 def _append_from_process(
     path: Path,
-    started: multiprocessing.synchronize.Event,
-    finished: multiprocessing.synchronize.Event,
+    observation,
+    retry: multiprocessing.synchronize.Event,
 ) -> None:
+    import mimir.event_logger as event_logger
+    from types import SimpleNamespace
+
+    def observed_flock(fd, operation):
+        try:
+            return fcntl.flock(fd, operation)
+        except BlockingIOError:
+            observation.send("blocked")
+            # Keep the writer parked until the parent has observed contention
+            # and joined the trim, without spending the product retry budget.
+            retry.wait()
+            return fcntl.flock(fd, operation)
+
+    event_logger.fcntl = SimpleNamespace(
+        flock=observed_flock, LOCK_EX=fcntl.LOCK_EX,
+        LOCK_NB=fcntl.LOCK_NB, LOCK_UN=fcntl.LOCK_UN,
+    )
     logger = EventLogger(path, session_id="detached")
-    started.set()
     logger.log_sync("detached_event", source="worklink")
-    finished.set()
+    observation.send("finished")
 
 
 @pytest.mark.asyncio
@@ -358,6 +373,7 @@ def test_log_sync_redacts_token_shaped_values(tmp_path: Path):
     assert record["stderr"] == "OPENAI_API_KEY=[REDACTED]"
 
 
+@pytest.mark.timeout(30)
 def test_log_sync_holds_io_lock(tmp_path):
     """chainlink #393: log_sync must acquire _io_lock so it can't write
     concurrently with _trim_sync's tail-read+rename (which would lose the
@@ -368,22 +384,46 @@ def test_log_sync_holds_io_lock(tmp_path):
 
     logger = EventLogger(tmp_path / "events.jsonl", session_id="t")
     done = threading.Event()
+    observed = threading.Event()
+    attempted = []
+    lock = logger._io_lock
 
-    logger._io_lock.acquire()
+    class ObservedLock:
+        def __enter__(self):
+            acquired = lock.acquire(blocking=False)
+            attempted.append(acquired)
+            observed.set()
+            if not acquired:
+                lock.acquire()
+
+        def __exit__(self, *exc):
+            lock.release()
+
+    logger._io_lock = ObservedLock()
+
+    def append():
+        try:
+            logger.log_sync("evt_x")
+        finally:
+            done.set()
+            observed.set()  # Missing lock acquisition must fail, not time out.
+
+    lock.acquire()
+    thread = threading.Thread(target=append, daemon=True)
     try:
-        threading.Thread(
-            target=lambda: (logger.log_sync("evt_x"), done.set()),
-            daemon=True,
-        ).start()
-        # Blocked while we hold the lock (would NOT block pre-fix).
-        assert not done.wait(timeout=0.4), "log_sync did not respect _io_lock"
+        thread.start()
+        observed.wait()
+        assert attempted == [False], "log_sync did not contend on _io_lock"
+        assert not done.is_set(), "log_sync did not respect _io_lock"
     finally:
-        logger._io_lock.release()
+        lock.release()
+        thread.join()
 
-    assert done.wait(timeout=2.0), "log_sync did not proceed after lock release"
+    assert done.is_set(), "log_sync did not proceed after lock release"
     assert '"type": "evt_x"' in (tmp_path / "events.jsonl").read_text()
 
 
+@pytest.mark.timeout(30)
 def test_process_append_survives_trim_rename_window(tmp_path, monkeypatch):
     """A detached writer waits for trim's rename and lands on the new inode."""
     path = tmp_path / "events.jsonl"
@@ -398,7 +438,7 @@ def test_process_append_survives_trim_rename_window(tmp_path, monkeypatch):
 
     def paused_rename(source, target):
         rename_reached.set()
-        assert allow_rename.wait(timeout=5.0), "test did not release trim rename"
+        allow_rename.wait()
         return original_rename(source, target)
 
     monkeypatch.setattr(Path, "rename", paused_rename)
@@ -409,29 +449,30 @@ def test_process_append_survives_trim_rename_window(tmp_path, monkeypatch):
 
     trim_thread = threading.Thread(target=trim, daemon=True)
     trim_thread.start()
-    assert rename_reached.wait(timeout=2.0), "trim did not reach rename window"
-
     ctx = multiprocessing.get_context("spawn")
-    append_started = ctx.Event()
-    append_finished = ctx.Event()
+    observation, sender = ctx.Pipe(duplex=False)
+    retry = ctx.Event()
     process = ctx.Process(
         target=_append_from_process,
-        args=(path, append_started, append_finished),
+        args=(path, sender, retry),
     )
-    process.start()
     try:
-        assert append_started.wait(timeout=5.0), "detached writer did not start"
-        assert not append_finished.wait(timeout=0.2), (
-            "detached append was not serialized with trim"
-        )
+        rename_reached.wait()
+        process.start()
+        sender.close()
+        assert observation.recv() == "blocked", "detached append bypassed trim's lock"
     finally:
         allow_rename.set()
-        process.join(timeout=5.0)
-        if process.is_alive():
-            process.terminate()
-            process.join(timeout=2.0)
+        trim_thread.join()
+        retry.set()
+        if process.pid is not None:
+            process.join(timeout=5.0)
+            if process.is_alive():
+                process.terminate()
+                process.join()
+        sender.close()
+        observation.close()
 
-    trim_thread.join(timeout=2.0)
     assert trim_finished.is_set(), "trim did not finish"
     assert process.exitcode == 0
     records = [json.loads(line) for line in path.read_text().splitlines()]

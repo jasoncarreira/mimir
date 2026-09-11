@@ -482,15 +482,38 @@ def test_capability_probe_rejects_execution_hazards(tmp_path: Path, mode: str) -
         probe_factory_capabilities(entrypoint, runner=runner)
 
 
-def test_bounded_runner_stops_oversize_output_during_execution(tmp_path: Path) -> None:
-    with pytest.raises(FactoryContractError, match="output exceeds bounds"):
-        _run_bounded(
-            [sys.executable, "-c", "import sys; sys.stdout.write('x' * 1000000)"],
-            cwd=tmp_path,
-            env={"PATH": os.environ.get("PATH", "")},
-            timeout=5,
-            output_limit=1024,
-        )
+def test_bounded_runner_stops_oversize_output_during_execution(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    processes = []
+    popen = subprocess.Popen
+
+    def launch(*args, **kwargs):
+        process = popen(*args, **kwargs)
+        processes.append(process)
+        return process
+
+    monkeypatch.setattr(subprocess, "Popen", launch)
+    try:
+        with pytest.raises(FactoryContractError, match="output exceeds bounds"):
+            _run_bounded(
+                [sys.executable, "-c", "import sys; sys.stdout.write('x' * 1000000)"],
+                cwd=tmp_path,
+                env={"PATH": os.environ.get("PATH", "")},
+                # Overflow, not startup speed, is the oracle. The whole-test
+                # pytest-timeout ceiling remains active if execution wedges.
+                timeout=None,
+                output_limit=1024,
+            )
+        assert len(processes) == 1
+        assert processes[0].poll() is not None
+    finally:
+        for process in processes:
+            if process.poll() is None:
+                process.kill()
+            process.wait()
+            process.stdout.close()
+            process.stderr.close()
 
 
 @pytest.mark.parametrize(

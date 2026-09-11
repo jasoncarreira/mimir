@@ -462,6 +462,7 @@ async def test_cross_author_pull_respects_source_allowlist(tmp_path: Path):
 
 
 @pytest.mark.asyncio
+@pytest.mark.timeout(30)
 async def test_concurrent_appends_run_in_parallel_on_thread_pool(tmp_path: Path):
     """CR#17 regression: the previous ``async with self._write_lock``
     held the lock across ``await asyncio.to_thread(self._append_disk)``,
@@ -476,7 +477,6 @@ async def test_concurrent_appends_run_in_parallel_on_thread_pool(tmp_path: Path)
 
     buf = _make_buffer(tmp_path)
 
-    inside = threading.Event()
     seen_two = threading.Event()
     release = threading.Event()
     in_flight_count = 0
@@ -492,10 +492,9 @@ async def test_concurrent_appends_run_in_parallel_on_thread_pool(tmp_path: Path)
             seen_thread_ids.add(threading.get_ident())
             if in_flight_count >= 2:
                 seen_two.set()
-        inside.set()
         # Block until the test releases — both threads must be parked
         # here at once for the assertion to fire.
-        release.wait(timeout=2.0)
+        release.wait()
         with in_flight_lock:
             in_flight_count -= 1
         original_append_disk(msg)
@@ -515,18 +514,19 @@ async def test_concurrent_appends_run_in_parallel_on_thread_pool(tmp_path: Path)
     # Wait for both threads to be inside _append_disk simultaneously.
     # If the lock were still held across to_thread, the second append
     # would never enter — only one thread would ever be in flight.
-    await asyncio.get_event_loop().run_in_executor(
-        None, lambda: seen_two.wait(timeout=2.0)
-    )
-    assert seen_two.is_set(), (
-        "expected two concurrent _append_disk calls; the lock is back"
-    )
-    assert len(seen_thread_ids) == 2, (
-        f"expected two distinct threads; saw {seen_thread_ids}"
-    )
-
-    release.set()
-    await asyncio.gather(t1, t2)
+    try:
+        await asyncio.to_thread(seen_two.wait, 2.0)
+        assert seen_two.is_set(), (
+            "expected two concurrent _append_disk calls; the lock is back"
+        )
+        with in_flight_lock:
+            assert in_flight_count == 2
+            assert len(seen_thread_ids) == 2, (
+                f"expected two distinct threads; saw {seen_thread_ids}"
+            )
+    finally:
+        release.set()
+        await asyncio.gather(t1, t2)
 
     # Both records on disk, one per line, no interleaving.
     lines = (tmp_path / "messages" / "chat_history.jsonl").read_text().splitlines()

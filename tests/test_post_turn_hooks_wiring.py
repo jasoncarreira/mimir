@@ -105,8 +105,9 @@ async def test_wiki_backlinks_fires_on_edit(
     ctx = _ctx()
     ctx.wiki_mtime_snapshot = agent._snapshot_wiki_mtimes()
     # Mutate the wiki page so its mtime advances.
-    time.sleep(0.01)
+    before = p.stat()
     p.write_text("changed body")
+    os.utime(p, ns=(before.st_atime_ns, before.st_mtime_ns + 1_000_000_000))
 
     await agent._post_turn_wiki_backlinks(ctx)
     ran.assert_awaited_once_with(agent._config.home)
@@ -152,8 +153,10 @@ async def test_wiki_backlinks_ignores_generated_outputs(
     ctx.wiki_mtime_snapshot = agent._snapshot_wiki_mtimes()
     # Only touch a generated output; the snapshot didn't include it,
     # and the after-walk won't include it either — should be no diff.
-    time.sleep(0.01)
-    (tmp_path / "state" / "wiki" / "orphans.md").write_text("regenerated")
+    p = tmp_path / "state" / "wiki" / "orphans.md"
+    before = p.stat()
+    p.write_text("regenerated")
+    os.utime(p, ns=(before.st_atime_ns, before.st_mtime_ns + 1_000_000_000))
 
     await agent._post_turn_wiki_backlinks(ctx)
     ran.assert_not_awaited()
@@ -168,17 +171,22 @@ async def test_wiki_backlinks_swallow_exceptions(
     agent = _make_agent(tmp_path)
     p = _write_wiki_page(tmp_path, "p.md")
 
+    calls = []
+
     async def _boom(*a: Any, **k: Any) -> None:
+        calls.append(a)
         raise RuntimeError("regen boom")
 
     monkeypatch.setattr("mimir.wiki_backlinks.run", _boom)
 
     ctx = _ctx()
     ctx.wiki_mtime_snapshot = agent._snapshot_wiki_mtimes()
-    time.sleep(0.01)
+    before = p.stat()
     p.write_text("changed")
+    os.utime(p, ns=(before.st_atime_ns, before.st_mtime_ns + 1_000_000_000))
     # Must not raise.
     await agent._post_turn_wiki_backlinks(ctx)
+    assert calls == [(agent._config.home,)]
 
 
 # ─── IndexRebuildHook ─────────────────────────────────────────────
