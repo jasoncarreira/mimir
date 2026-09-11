@@ -5685,6 +5685,7 @@ def test_factory_pre_manifest_status_is_bounded_by_startup_deadline(
     handle = LaunchHandle("local_subprocess", "123", 456)
     stopped = asyncio.Event()
     lifecycle: list[str] = []
+    status_calls = 0
 
     class Compute:
         async def wait(self, selected: LaunchHandle, timeout_s: int) -> ComputeResult:
@@ -5706,9 +5707,10 @@ def test_factory_pre_manifest_status_is_bounded_by_startup_deadline(
         poll_interval_s = 0
 
         def status(self, *args: object, **kwargs: object) -> Any:
+            nonlocal status_calls
             assert factory_clock.now < 30.0, "status requested after startup deadline"
-            if expiry == "status_return":
-                factory_clock.now = 30.0
+            status_calls += 1
+            factory_clock.now += 10.0
             return parse_factory_status(
                 {
                     "run_id": "700",
@@ -5719,9 +5721,9 @@ def test_factory_pre_manifest_status_is_bounded_by_startup_deadline(
             )
 
     async def reach_deadline(delay: float) -> None:
-        assert expiry == "between_polls"
-        assert factory_clock.now == 0.0
-        factory_clock.now = 30.0
+        # Expire on the third status return or after the second poll's sleep.
+        if expiry == "between_polls":
+            factory_clock.now += 5.0
 
     monkeypatch.setattr(orchestrator.asyncio, "sleep", reach_deadline)
     monkeypatch.setattr(orchestrator, "_FACTORY_STARTUP_STATUS_TIMEOUT_S", 30.0)
@@ -5740,6 +5742,7 @@ def test_factory_pre_manifest_status_is_bounded_by_startup_deadline(
             )
         )
 
+    assert status_calls >= 2
     assert lifecycle == ["cancel", "cleanup"]
     assert factory_clock.now == 30.0
 
