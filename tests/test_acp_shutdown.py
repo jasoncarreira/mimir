@@ -24,7 +24,7 @@ def _journal_source(progress: Path) -> str:
     # Keep C-level bytes separate: they have no line framing and must not alter
     # the existing text journal's ordered prefix. Neither file needs pipe EOF.
     return f"_journal_path = {str(progress)!r}\n" + r'''
-import os, signal, threading
+import os, signal, socket, threading
 from mimir.acp import proxy
 _journal_fd = os.open(_journal_path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
 _wakeup_fd = os.open(_journal_path + '.wakeup',
@@ -33,15 +33,60 @@ def record(value):
     os.write(_journal_fd, value + b'\n')
 record(b'child-started')
 
+_tee_writer = None
+_tee_ack = threading.Event()
+def _journal_flush():
+    if _tee_writer is not None:
+        _tee_ack.clear()
+        _tee_writer.sendall(b'\0')
+        _tee_ack.wait()
+
 _journal_install = proxy._ShutdownHooks.install
 def _install(self):
+    global _tee_writer, _tee_thread
     record(b'install-enter')
     _journal_install(self)
-    signal.set_wakeup_fd(_wakeup_fd)
+    reader, _tee_writer = socket.socketpair()
+    _tee_writer.setblocking(False)
+    production_fd = signal.set_wakeup_fd(_tee_writer.fileno())
+    assert production_fd >= 0
+    def forward():
+        with reader:
+            while True:
+                data = reader.recv(4096)
+                for value in data:
+                    if value == 255:
+                        return
+                    if value == 0:
+                        _tee_ack.set()
+                        continue
+                    os.write(_wakeup_fd, bytes([value]))
+                    try:
+                        os.write(production_fd, bytes([value]))
+                    except BlockingIOError:
+                        # A full production socket is already readable.
+                        pass
+    _tee_thread = threading.Thread(target=forward, daemon=True)
+    _tee_thread.start()
     record(b'handlers-installed')
 proxy._ShutdownHooks.install = _install
+_journal_close_wakeup = proxy._ShutdownHooks._close_wakeup
+def _close_wakeup(self):
+    global _tee_writer
+    if _tee_writer is not None:
+        signal.set_wakeup_fd(_wakeup_fd)
+        _journal_flush()
+        writer, _tee_writer = _tee_writer, None
+        writer.sendall(b'\xff')
+        _tee_thread.join()
+        writer.close()
+    _journal_close_wakeup(self)
+    # After loop close, retain the original journal's C-delivery evidence.
+    signal.set_wakeup_fd(_wakeup_fd)
+proxy._ShutdownHooks._close_wakeup = _close_wakeup
 _journal_signal = proxy._ShutdownHooks._handle_signal
 def _handle_signal(self, signum, frame):
+    _journal_flush()
     record(b'signal-enter:' + str(signum).encode())
     return _journal_signal(self, signum, frame)
 proxy._ShutdownHooks._handle_signal = _handle_signal
@@ -50,6 +95,11 @@ def _force_exit(self):
     record(b'force-exit-enter')
     return _journal_force_exit(self)
 proxy._ShutdownHooks._force_exit = _force_exit
+_journal_exit = os._exit
+def _exit(code):
+    _journal_flush()
+    _journal_exit(code)
+os._exit = _exit
 
 class JournalTimer(threading.Timer):
     def __init__(self, interval, function, args=None, kwargs=None):
@@ -91,6 +141,171 @@ async def _shutdown_ceiling(
 async def _accept_unavailable_backend_risk_for_lifecycle(session_id: str) -> bool:
     """Explicit test operator consent; available backends still must confine."""
     return True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("journal", [False, True], ids=["production", "chained-journal"])
+@pytest.mark.parametrize("signum", [signal.SIGTERM, signal.SIGINT, signal.SIGHUP])
+async def test_idle_selector_signal_wakes_and_tears_down(
+    journal: bool, signum: signal.Signals, tmp_path: Path,
+) -> None:
+    progress = tmp_path / "child-progress"
+    source = (_journal_source(progress) if journal else "") + r'''
+import asyncio, io, os, signal, socket, sys, threading
+from mimir.acp import proxy
+
+signum = int(sys.argv[1])
+loop = asyncio.new_event_loop()
+asyncio.set_event_loop(loop)
+select = loop._selector.select
+installed = None
+observed = False
+original_install = proxy._ShutdownHooks.install
+def install(self):
+    global installed
+    original_install(self)
+    installed = self
+proxy._ShutdownHooks.install = install
+
+def idle_select(timeout=None):
+    global observed
+    if installed is not None and not observed and timeout is None:
+        # This isolated loop owns all its state. No scheduled deadline, runnable
+        # callback or readable descriptor can rescue a missing signal wakeup.
+        assert not loop._ready
+        assert not loop._scheduled
+        assert select(0) == []
+        observed = True
+        os.write(1, b'idle\n')
+        events = select(None)
+        reader = installed._wakeup[0]
+        assert any(key.fd == reader.fileno() for key, mask in events)
+        assert reader.recv(4096, socket.MSG_PEEK) == bytes([signum])
+        os.write(1, b'woken\n')
+        return events
+    return select(timeout)
+loop._selector.select = idle_select
+
+def deliver():
+    assert os.read(0, 1) == b'x'
+    # Target the worker: do not rely on EINTR interrupting main's selector.
+    signal.pthread_kill(threading.get_ident(), signum)
+threading.Thread(target=deliver, daemon=True).start()
+
+async def run():
+    writers = [proxy._OutputWriter(io.BytesIO()), proxy._OutputWriter(io.BytesIO())]
+    try:
+        await proxy.run_router(asyncio.StreamReader(), writers[0],
+                               asyncio.StreamReader(), writers[1], 'secret')
+    except proxy.ProxySignalExit as exc:
+        assert exc.code == 128 + signum
+        assert installed._router._close_complete
+        assert all(writer.closed for writer in writers)
+        os.write(1, b'torn-down\n')
+    else:
+        raise AssertionError('signal did not shut down router')
+loop.run_until_complete(run())
+assert observed
+assert installed._wakeup is not None  # retained for outer async drains
+loop.close()
+assert installed._wakeup is None
+assert signal.getsignal(signum) is installed._handler
+installed._watchdog.cancel()
+'''
+    process = await asyncio.create_subprocess_exec(
+        sys.executable, "-c", source, str(signum),
+        stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE, cwd=Path(__file__).resolve().parents[1],
+    )
+    try:
+        async with _shutdown_ceiling(process, progress, lambda: "idle selector"):
+            assert await process.stdout.readline() == b"idle\n"
+            # The bound lives in the parent, never in the idle child's loop.
+            async with asyncio.timeout(5.0):
+                stdout, stderr = await process.communicate(b"x")
+            assert (process.returncode, stdout, stderr) == (0, b"woken\ntorn-down\n", b"")
+        if journal:
+            assert progress.with_suffix(".wakeup").read_bytes() == bytes([signum])
+            assert f"signal-enter:{signum}" in progress.read_text().splitlines()
+    finally:
+        if process.returncode is None:
+            process.kill()
+            await process.communicate()
+
+
+@pytest.mark.parametrize("finish", ["hooks-close", "loop-close", "install-failure"])
+def test_signal_wakeup_resource_lifetime(finish: str) -> None:
+    import subprocess
+
+    source = r'''
+import asyncio, signal, socket, sys
+from types import SimpleNamespace
+from mimir.acp import proxy
+
+finish = sys.argv[1]
+loop = asyncio.new_event_loop()
+previous_reader, previous_writer = socket.socketpair()
+previous_writer.setblocking(False)
+signal.set_wakeup_fd(previous_writer.fileno())
+previous_handler = signal.getsignal(signal.SIGTERM)
+sockets = []
+socketpair = socket.socketpair
+def tracked_pair():
+    pair = socketpair()
+    sockets.extend(pair)
+    return pair
+proxy.socket.socketpair = tracked_pair
+set_wakeup_fd = signal.set_wakeup_fd
+def failed_install(*args, **kwargs):
+    raise ValueError('injected wakeup installation failure')
+
+async def run():
+    global hooks
+    hooks = proxy._ShutdownHooks(SimpleNamespace(terminate_owned_children=lambda: None))
+    if finish == 'install-failure':
+        signal.set_wakeup_fd = failed_install
+        try:
+            hooks.install()
+        except ValueError as exc:
+            assert str(exc) == 'injected wakeup installation failure'
+        else:
+            raise AssertionError('installation should fail')
+        finally:
+            signal.set_wakeup_fd = set_wakeup_fd
+        assert signal.getsignal(signal.SIGTERM) is previous_handler
+        assert len(loop._selector.get_map()) == 1  # only asyncio's own socket
+        return
+    hooks.install()
+    assert set_wakeup_fd(sockets[1].fileno()) == sockets[1].fileno()
+    try:
+        loop.close()
+    except RuntimeError:
+        pass
+    else:
+        raise AssertionError('closing a running loop must fail')
+    assert all(sock.fileno() >= 0 for sock in sockets)
+    if finish == 'hooks-close':
+        hooks.close()
+        hooks.close()
+        assert signal.getsignal(signal.SIGTERM) is previous_handler
+        assert len(loop._selector.get_map()) == 1
+
+loop.run_until_complete(run())
+loop.close()
+loop.close()
+assert len(sockets) == 2
+assert all(sock.fileno() == -1 for sock in sockets)
+assert set_wakeup_fd(-1) == previous_writer.fileno()
+hooks.close()
+assert signal.getsignal(signal.SIGTERM) is previous_handler
+previous_reader.close()
+previous_writer.close()
+'''
+    result = subprocess.run(
+        [sys.executable, "-c", source, finish], capture_output=True, timeout=120,
+        cwd=Path(__file__).resolve().parents[1],
+    )
+    assert (result.returncode, result.stdout, result.stderr) == (0, b"", b"")
 
 
 @pytest.mark.asyncio
@@ -243,13 +458,13 @@ async def _signal_exit_protocol(
 @pytest.mark.asyncio
 @pytest.mark.parametrize("signum", [signal.SIGTERM, signal.SIGINT, signal.SIGHUP])
 @pytest.mark.parametrize("repeat", [False, True], ids=["deadline", "escalation"])
-@pytest.mark.parametrize("stage", ["route", "close", "writer", "outer", "blocked", "cleanup"])
+@pytest.mark.parametrize("stage", ["route", "close", "writer", "outer", "post-loop", "blocked", "cleanup"])
 async def test_signal_exit_bounds_entire_teardown(
     signum: signal.Signals, repeat: bool, stage: str, tmp_path: Path,
 ) -> None:
     progress = tmp_path / "child-progress"
     source = _journal_source(progress) + r'''
-import asyncio, io, os, sys, threading
+import atexit, asyncio, io, os, sys, threading
 from types import SimpleNamespace
 from mimir.acp import bootstrap, profiles, proxy
 stage = sys.argv[1]
@@ -323,6 +538,15 @@ async def run_proxy(name, output):
     finally:
         if stage == 'outer':
             await stuck()
+        if stage == 'post-loop':
+            loop = asyncio.get_running_loop()
+            def after_loop():
+                assert loop.is_closed()
+                record(b'draining')
+                # bootstrap has closed its reserved output and restored fd 1.
+                os.write(1, b'draining\n')
+                threading.Event().wait()
+            atexit.register(after_loop)
 proxy.run_proxy = run_proxy
 raise SystemExit(bootstrap.main([]))
 '''
@@ -515,6 +739,7 @@ def deliver():
     record(b'main-blocked')
     signal.pthread_kill(threading.get_ident(), signal.SIGTERM)
     record(b'worker-signalled')
+    _journal_flush()
     os.write(1, b'delivered\n')
 
 async def run():
