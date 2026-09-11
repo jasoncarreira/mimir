@@ -50,14 +50,24 @@ def test_fixture_cleanup_preserves_failure_and_adds_captured_output(
     tmp_path: Path,
 ) -> None:
     ready = tmp_path / "ready"
+    stdout_ready = tmp_path / "stdout-ready"
+    release_stderr = tmp_path / "release-stderr"
     source = (
-        "import pathlib,sys,time; "
-        "sys.stdout.write('server-out\\n'); sys.stdout.flush(); "
-        "sys.stderr.write('server-error\\n'); sys.stderr.flush(); "
-        f"pathlib.Path({str(ready)!r}).write_text(''); "
+        "import pathlib,sys,time\n"
+        "sys.stdout.write('server-out\\n'); sys.stdout.flush()\n"
+        f"pathlib.Path({str(stdout_ready)!r}).write_text('')\n"
+        f"while not pathlib.Path({str(release_stderr)!r}).exists(): time.sleep(0.01)\n"
+        "sys.stderr.write('server-error\\n'); sys.stderr.flush()\n"
+        f"pathlib.Path({str(ready)!r}).write_text('')\n"
         "time.sleep(60)"
     )
     original = ValueError("child failed")
+
+    def wait_for(marker: Path) -> None:
+        deadline = time.monotonic() + 10
+        while not marker.exists() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert marker.exists(), f"fixture server did not publish {marker.name}"
 
     with pytest.raises(ValueError) as caught:
         with assert_installed_acp._fixture_server(
@@ -66,10 +76,14 @@ def test_fixture_cleanup_preserves_failure_and_adds_captured_output(
             env=dict(assert_installed_acp.os.environ),
             stop_on_success=False,
         ):
-            deadline = time.monotonic() + 10
-            while not ready.exists() and time.monotonic() < deadline:
-                time.sleep(0.01)
-            assert ready.exists(), "fixture server did not flush its output"
+            # Hold the child between flushes to make #1455's old ordering
+            # deterministic: publishing ready before the writes lets this
+            # exception terminate it with stdout intact and stderr empty.
+            wait_for(stdout_ready)
+            if ready.exists():
+                raise original
+            release_stderr.touch()
+            wait_for(ready)
             raise original
 
     assert caught.value is original
