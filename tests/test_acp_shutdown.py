@@ -128,28 +128,89 @@ raise SystemExit(bootstrap.main([]))
             await process.communicate()
 
 
+async def _signal_exit_protocol(
+    process: asyncio.subprocess.Process, progress: Path,
+    signum: signal.Signals, repeat: bool, *, timeout: float = 120,
+) -> None:
+    outstanding = "ready"
+
+    async def protocol() -> None:
+        nonlocal outstanding, signum
+        for marker in ("ready", "armed", "terminated", "draining"):
+            outstanding = marker
+            observed = await process.stdout.readline()
+            assert observed == marker.encode() + b"\n", (marker, observed)
+            if marker == "ready":
+                process.send_signal(signum)
+        outstanding = "exit"
+        if repeat:
+            signum = signal.SIGINT if signum != signal.SIGINT else signal.SIGTERM
+            process.send_signal(signum)
+        else:
+            process.stdin.write(b"x")
+            await process.stdin.drain()
+        stdout, stderr = await process.communicate()
+        assert process.returncode == 128 + signum
+        assert (stdout, stderr) == (b"", b"")
+
+    task = asyncio.create_task(protocol())
+    try:
+        # Shield preserves the child's observer when the whole-protocol ceiling
+        # expires. The journal can be read without waiting for pipe EOF or exit.
+        async with asyncio.timeout(timeout):
+            await asyncio.shield(task)
+    except TimeoutError:
+        state = progress.read_text() if progress.exists() else "<no child progress>"
+        pytest.fail(
+            f"ACP shutdown ceiling expired: outstanding={outstanding}, "
+            f"pid={process.pid}, returncode={process.returncode}; child progress:\n{state}"
+        )
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("signum", [signal.SIGTERM, signal.SIGINT, signal.SIGHUP])
 @pytest.mark.parametrize("repeat", [False, True], ids=["deadline", "escalation"])
 @pytest.mark.parametrize("stage", ["route", "close", "writer", "outer", "blocked", "cleanup"])
 async def test_signal_exit_bounds_entire_teardown(
-    signum: signal.Signals, repeat: bool, stage: str,
+    signum: signal.Signals, repeat: bool, stage: str, tmp_path: Path,
 ) -> None:
     source = r'''
 import asyncio, io, os, sys, threading
 from types import SimpleNamespace
 from mimir.acp import bootstrap, profiles, proxy
 stage = sys.argv[1]
+progress = os.open(sys.argv[2], os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+def record(value):
+    os.write(progress, value + b'\n')
+record(b'child-started')
 profiles.ProfileStore = lambda: SimpleNamespace(get=lambda name: SimpleNamespace(remote=None))
 profiles.selected_profile = lambda name: 'test'
 
 def mark(value):
+    record(value)
     sink.write(value + b'\n')
     sink.flush()
 
+original_install = proxy._ShutdownHooks.install
+def install(self):
+    record(b'install-enter')
+    original_install(self)
+    record(b'handlers-installed')
+proxy._ShutdownHooks.install = install
+original_signal = proxy._ShutdownHooks._handle_signal
+def handle_signal(self, signum, frame):
+    record(b'signal-enter:' + str(signum).encode())
+    return original_signal(self, signum, frame)
+proxy._ShutdownHooks._handle_signal = handle_signal
+
 class ControlledTimer(threading.Timer):
     def start(self):
+        record(b'watchdog-start-enter')
         super().start()
+        record(b'watchdog-start-returned')
         mark(b'armed')
 
     def run(self):
@@ -212,8 +273,9 @@ async def run_proxy(name, output):
 proxy.run_proxy = run_proxy
 raise SystemExit(bootstrap.main([]))
 '''
+    progress = tmp_path / "child-progress"
     process = await asyncio.create_subprocess_exec(
-        sys.executable, "-c", source, stage,
+        sys.executable, "-c", source, stage, str(progress),
         stdin=asyncio.subprocess.PIPE,
         stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
         cwd=Path(__file__).resolve().parents[1],
@@ -223,26 +285,57 @@ raise SystemExit(bootstrap.main([]))
         # The controlled watchdog and resistant stage prove the exit boundary:
         # only expiration or a second signal can release the child, regardless
         # of how long the parent takes to observe each ordered marker.
-        async with asyncio.timeout(120):
-            assert await process.stdout.readline() == b"ready\n"
-            process.send_signal(signum)
-            assert await process.stdout.readline() == b"armed\n"
-            assert await process.stdout.readline() == b"terminated\n"
-            assert await process.stdout.readline() == b"draining\n"
-            if repeat:
-                # Explicit escalation uses the operator's latest signal.
-                signum = signal.SIGINT if signum != signal.SIGINT else signal.SIGTERM
-                process.send_signal(signum)
-            else:
-                process.stdin.write(b"x")
-                await process.stdin.drain()
-            stdout, stderr = await process.communicate()
-            assert process.returncode == 128 + signum
-            assert (stdout, stderr) == (b"", b"")
+        await _signal_exit_protocol(process, progress, signum, repeat)
+        assert progress.read_text().splitlines()[:8] == [
+            "child-started", "install-enter", "handlers-installed", "ready",
+            f"signal-enter:{signum}", "watchdog-start-enter",
+            "watchdog-start-returned", "armed",
+        ]
     finally:
         if process.returncode is None:
             process.kill()
             await process.communicate()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("outstanding", ["armed", "terminated", "draining"])
+async def test_signal_exit_timeout_reports_child_progress(
+    outstanding: str, tmp_path: Path,
+) -> None:
+    # A deliberately sleeping child, not a cancelled mock read: diagnostics
+    # must be available while the child is alive and its pipes remain open.
+    source = r'''
+import os, signal, sys, time
+signal.signal(signal.SIGINT, signal.SIG_IGN)
+markers = ['ready', 'armed', 'terminated', 'draining']
+outstanding = sys.argv[2]
+with open(sys.argv[1], 'w') as progress:
+    progress.write('simulated child sleeping before ' + outstanding + '\n')
+for marker in markers[:markers.index(outstanding)]:
+    os.write(1, marker.encode() + b'\n')
+os.write(2, b'sleeping\n')
+time.sleep(3600)
+'''
+    progress = tmp_path / "child-progress"
+    process = await asyncio.create_subprocess_exec(
+        sys.executable, "-c", source, str(progress), outstanding,
+        stdin=asyncio.subprocess.PIPE,
+        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+    )
+    try:
+        async with asyncio.timeout(120):
+            assert await process.stderr.readline() == b"sleeping\n"
+        # Startup has completed; shorten only this diagnostic self-test's ceiling.
+        with pytest.raises(pytest.fail.Exception) as failure:
+            await _signal_exit_protocol(process, progress, signal.SIGINT, False, timeout=0.05)
+        message = str(failure.value)
+        assert f"outstanding={outstanding}" in message
+        assert f"pid={process.pid}, returncode=None" in message
+        assert f"simulated child sleeping before {outstanding}" in message
+    finally:
+        if process.returncode is None:
+            process.kill()
+        await process.communicate()
 
 
 @pytest.mark.asyncio
