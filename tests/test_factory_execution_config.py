@@ -250,6 +250,35 @@ def test_factory_backend_controls_use_retained_owner(tmp_path, monkeypatch, comm
     assert calls == [(sandbox, ["node", str(entrypoint), command, "run", "--repo", str(sandbox)])]
 
 
+def test_executor_auth_path_and_exported_xdg_data_home_agree() -> None:
+    """The two sides of the factory runtime contract must resolve to one place.
+
+    `compute.py` exports XDG_DATA_HOME for the run; `worker_exec` copies the
+    OpenCode auth file in for it to read. They live in different modules and are
+    expressed against different roots -- an absolute path built from
+    `spec.local_checkout` on one side, a path relative to the checkout the worker
+    chdir'd into on the other.
+
+    Chainlink #1933 moved XDG_DATA_HOME beside the checkout and changed only one
+    of them. The next run failed about nine seconds in with
+    `AI_LoadAPIKeyError: OpenAI API key is missing` and no other symptom, because
+    OpenCode was reading a directory nobody wrote. Nothing failed at the seam,
+    which is exactly why this assertion exists.
+    """
+    from mimir.worklink.worker_exec import FACTORY_RUNTIME_DATA
+
+    checkout = Path("/var/lib/mimir-worklink/checkouts/mimir/1610-7/checkout")
+    exported = checkout.parent / ".factory-runtime" / "data"
+    written = Path(os.path.normpath(checkout / FACTORY_RUNTIME_DATA))
+
+    assert written == exported / "opencode", (
+        "executor auth directory and exported XDG_DATA_HOME have diverged: "
+        f"executor writes {written}, OpenCode reads {exported}/opencode"
+    )
+    assert not written.is_relative_to(checkout)
+    assert not exported.is_relative_to(checkout)
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("opencode", [True, False])
 async def test_factory_projects_native_config_only_for_opencode(
@@ -340,33 +369,41 @@ async def test_factory_projects_native_config_only_for_opencode(
 def test_factory_runtime_refreshes_auth_and_retains_sessions(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    checkout = tmp_path / "attempt"
-    checkout.mkdir()
+    # The runtime is a SIBLING of the checkout, matching the XDG_DATA_HOME that
+    # compute.py exports; a data dir inside the checkout makes OpenCode's own
+    # snapshots index themselves (#1933).
+    attempt = tmp_path / "1610-7"
+    checkout = attempt / "checkout"
+    checkout.mkdir(parents=True)
     monkeypatch.chdir(checkout)
-    for attempt in range(2):
-        home = tmp_path / f"home-{attempt}"
+    for attempt_index in range(2):
+        home = tmp_path / f"home-{attempt_index}"
         auth = home / ".local/share/opencode/auth.json"
         auth.parent.mkdir(parents=True)
-        auth.write_text(json.dumps({"anthropic": {"type": "api", "key": f"key-{attempt}"}}))
+        auth.write_text(json.dumps({"anthropic": {"type": "api", "key": f"key-{attempt_index}"}}))
         worker_exec._prepare_factory_runtime(home)
-        data = checkout / ".factory-runtime/data/opencode"
+        data = attempt / ".factory-runtime/data/opencode"
+        assert not data.is_relative_to(checkout), "runtime must not live inside the snapshotted tree"
         assert (data / "auth.json").read_bytes() == auth.read_bytes()
         assert (data / "auth.json").stat().st_mode & 0o777 == 0o600
         session = data / "opencode.db"
-        if attempt == 0:
+        if attempt_index == 0:
             session.write_bytes(b"retained-session")
         else:
             assert session.read_bytes() == b"retained-session"
 
 
 def test_factory_runtime_without_auth(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.chdir(tmp_path)
-    stale = tmp_path / ".factory-runtime/data/opencode/auth.json"
+    attempt = tmp_path / "1610-7"
+    checkout = attempt / "checkout"
+    checkout.mkdir(parents=True)
+    monkeypatch.chdir(checkout)
+    stale = attempt / ".factory-runtime/data/opencode/auth.json"
     stale.parent.mkdir(parents=True)
     stale.write_text('{"old-provider": {"type": "api", "key": "stale"}}')
     worker_exec._prepare_factory_runtime(tmp_path / "empty-home")
-    assert (tmp_path / ".factory-runtime/data/opencode").is_dir()
-    assert not (tmp_path / ".factory-runtime/data/opencode/auth.json").exists()
+    assert (attempt / ".factory-runtime/data/opencode").is_dir()
+    assert not (attempt / ".factory-runtime/data/opencode/auth.json").exists()
 
 
 def test_factory_runtime_preparation_follows_successful_drop(

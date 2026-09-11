@@ -327,3 +327,32 @@ Verified 1 failure in 6 before the fix and 12/12 after, under identical load.
 The sibling `/proc/self/fd` guard at line ~307 was checked and deliberately left
 alone: that path always reads `self`, so a closed fd gives ENOENT and ESRCH
 cannot arise there.
+
+
+## The SIGSEGV conversion is REVERTED on main (added 2026-09-11, later)
+
+`test_project_test_retains_builtin_hang_dump_after_stderr_truncation` is back to
+its pre-audit form. The `-11` did NOT go away when both pipes were drained: it
+recurred on `pytest-enforced` after that change shipped, which settles the
+hypothesis recorded above -- the undrained pipe was a real defect but not the
+cause of the crash.
+
+The likelier cause is visible in what the conversion did to the synthetic child.
+To stop the 0.1 s faulthandler threshold racing test setup, it intercepted
+`faulthandler.dump_traceback_later`, deferred it, and then re-armed it manually
+from inside the test while a worker thread was blocked. That arms a C-level
+watchdog which walks thread stacks; interposing on pytest's own arming and
+re-arming it later is a plausible route to a segfault, and is a far better
+candidate than a blocked `write()`.
+
+The trade was bad on its own terms regardless of cause: the original bound flaked
+twice on macOS, and the conversion crashed on Linux. A crash is worse than a
+flake.
+
+So this test keeps its `time.sleep(3.0)` against the 0.1 s threshold and is
+UNCONVERTED. A future attempt must avoid interposing on faulthandler's arming --
+control the dump threshold through pytest configuration or a separate process instead.
+
+The sibling conversion in the same file (`test_project_test_hang_is_observable_before_runner_completes`,
+which dropped a one-second `asyncio.wait_for` in favour of pytest's own ceiling)
+is unaffected and stays.
