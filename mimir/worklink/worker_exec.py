@@ -191,9 +191,20 @@ def _drop_worker(checkout_fd: int) -> None:
     _verify_worker_identity()
 
 
+#: OpenCode's data directory for a factory run, relative to the checkout the
+#: worker chdir'd into. This MUST stay in step with the ``XDG_DATA_HOME`` that
+#: ``compute.py`` exports for the same run: the executor writes auth here and
+#: OpenCode reads it from there, so a divergence silently produces
+#: ``AI_LoadAPIKeyError: OpenAI API key is missing`` seconds into the run with no
+#: other symptom. It sits BESIDE the checkout rather than inside it, because a
+#: data dir within the snapshotted tree makes every ``git add --all`` index the
+#: previous snapshot's objects (chainlink #1610 attempt 6, #1933).
+FACTORY_RUNTIME_DATA = Path("../.factory-runtime/data/opencode")
+
+
 def _prepare_factory_runtime(home: Path) -> None:
     """Refresh auth without discarding attempt-scoped OpenCode session state."""
-    data = Path(".factory-runtime/data/opencode")
+    data = FACTORY_RUNTIME_DATA
     data.mkdir(parents=True, exist_ok=True)
     auth = home / ".local/share/opencode/auth.json"
     if auth.is_file():
