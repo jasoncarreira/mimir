@@ -57,7 +57,11 @@ from .worklink.worker_client import StaleWorkerExecutorError
 #: denies the agent any full-suite evidence of its own, which is what happened
 #: through nine review rounds on #1594.
 _TIMEOUT_SECONDS = 1800.0
-_CAPTURE_BYTES = 64 * 1024
+# A full suite includes wheel builds and dependency setup, not just one command:
+# allow 16x shell_exec's 1 MiB per stream, matching Worklink's 16 MiB stderr
+# budget while staying at one quarter of its 64 MiB stdout budget. Overflow
+# still stops execution; the smaller returned excerpts remain unchanged.
+_CAPTURE_BYTES = 16 * 1024 * 1024
 _RETURN_STDOUT_CHARS = 8_000
 _RETURN_STDERR_CHARS = 4_000
 _LIVE_OUTPUT_ROOT = Path("state/worklink/transcripts")
@@ -753,8 +757,13 @@ class RepoProjectTests:
                 stderr_path=stderr_relative,
             )
         if result.exit_code != 0 or result.output_overflow:
+            code = "tests_failed"
+            if result.output_overflow:
+                # Preserve the exit distinction without treating truncated evidence
+                # as a pass, even when the child managed to exit successfully.
+                code = "test_output_overflow" if result.exit_code == 0 else "tests_failed_output_overflow"
             return ProjectTestResult(
-                False, "tests_failed", result.exit_code, stdout, stderr,
+                False, code, result.exit_code, stdout, stderr,
                 command, command_source, **truncation,
                 git_context=_git_execution_context(),
             )
