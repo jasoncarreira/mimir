@@ -8,6 +8,7 @@ import logging
 import os
 import secrets
 import signal
+import socket
 import stat
 import sys
 import threading
@@ -1208,13 +1209,62 @@ class _ShutdownHooks:
         self.closing = False
         self._loop = asyncio.get_running_loop()
         self._task = asyncio.current_task()
+        self._wakeup: tuple[socket.socket, socket.socket] | None = None
+        self._previous_wakeup_fd = -1
+        self._loop_close = self._loop.close
+
+    def _drain_wakeup(self) -> None:
+        assert self._wakeup is not None
+        try:
+            while self._wakeup[0].recv(4096):
+                pass
+        except BlockingIOError:
+            pass
+
+    def _close_wakeup(self) -> None:
+        if self._wakeup is None:
+            return
+        # Detach before closing descriptors, so a signal cannot write to a
+        # recycled fd. The Python handler deliberately has a longer lifetime.
+        signal.set_wakeup_fd(self._previous_wakeup_fd)
+        reader, writer = self._wakeup
+        self._loop.remove_reader(reader.fileno())
+        reader.close()
+        writer.close()
+        self._wakeup = None
+        self._loop.close = self._loop_close
+
+    def _close_loop(self) -> None:
+        if self._loop.is_running():
+            # Preserve close()'s error without dismantling a live loop's wakeup.
+            self._loop_close()
+            return
+        self._close_wakeup()
+        self._loop_close()
 
     def install(self) -> None:
-        atexit.register(self._cleanup)
         if threading.current_thread() is threading.main_thread():
+            reader, writer = socket.socketpair()
+            try:
+                reader.setblocking(False)
+                writer.setblocking(False)
+                self._loop.add_reader(reader.fileno(), self._drain_wakeup)
+                self._previous_wakeup_fd = signal.set_wakeup_fd(
+                    writer.fileno(), warn_on_full_buffer=False,
+                )
+            except BaseException:
+                self._loop.remove_reader(reader.fileno())
+                reader.close()
+                writer.close()
+                raise
+            self._wakeup = reader, writer
+            # asyncio has no public close-callback API. Bind cleanup to close,
+            # not task cancellation: Runner still drains tasks and the executor.
+            self._loop.close = self._close_loop
             for signum in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
                 self._signals[signum] = signal.getsignal(signum)
                 signal.signal(signum, self._handler)
+        atexit.register(self._cleanup)
         self._installed = True
 
     def close(self) -> None:
@@ -1233,6 +1283,7 @@ class _ShutdownHooks:
                 if signal.getsignal(signum) is self._handler:
                     signal.signal(signum, previous)
         self._signals.clear()
+        self._close_wakeup()
 
     def _cleanup(self) -> None:
         try:
