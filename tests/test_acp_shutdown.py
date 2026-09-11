@@ -7,6 +7,8 @@ import os
 import re
 import signal
 import sys
+from collections.abc import AsyncIterator, Callable
+from contextlib import asynccontextmanager
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -18,6 +20,74 @@ from mimir.acp.proxy import ProxyRouter, _OutputWriter, run_router
 from mimir.acp.transport import close_writer, pump_stream
 
 
+def _journal_source(progress: Path) -> str:
+    # Keep C-level bytes separate: they have no line framing and must not alter
+    # the existing text journal's ordered prefix. Neither file needs pipe EOF.
+    return f"_journal_path = {str(progress)!r}\n" + r'''
+import os, signal, threading
+from mimir.acp import proxy
+_journal_fd = os.open(_journal_path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+_wakeup_fd = os.open(_journal_path + '.wakeup',
+                     os.O_WRONLY | os.O_CREAT | os.O_APPEND | os.O_NONBLOCK, 0o600)
+def record(value):
+    os.write(_journal_fd, value + b'\n')
+record(b'child-started')
+
+_journal_install = proxy._ShutdownHooks.install
+def _install(self):
+    record(b'install-enter')
+    _journal_install(self)
+    signal.set_wakeup_fd(_wakeup_fd)
+    record(b'handlers-installed')
+proxy._ShutdownHooks.install = _install
+_journal_signal = proxy._ShutdownHooks._handle_signal
+def _handle_signal(self, signum, frame):
+    record(b'signal-enter:' + str(signum).encode())
+    return _journal_signal(self, signum, frame)
+proxy._ShutdownHooks._handle_signal = _handle_signal
+_journal_force_exit = proxy._ShutdownHooks._force_exit
+def _force_exit(self):
+    record(b'force-exit-enter')
+    return _journal_force_exit(self)
+proxy._ShutdownHooks._force_exit = _force_exit
+
+class JournalTimer(threading.Timer):
+    def __init__(self, interval, function, args=None, kwargs=None):
+        def fired(*args, **kwargs):
+            record(b'watchdog-fired')
+            return function(*args, **kwargs)
+        super().__init__(interval, fired, args, kwargs)
+
+    def start(self):
+        record(b'watchdog-start-enter')
+        super().start()
+        record(b'watchdog-start-returned')
+proxy.threading.Timer = JournalTimer
+'''
+
+
+@asynccontextmanager
+async def _shutdown_ceiling(
+    process: asyncio.subprocess.Process, progress: Path, outstanding: Callable[[], str],
+    *, timeout: float = 120,
+) -> AsyncIterator[None]:
+    try:
+        async with asyncio.timeout(timeout):
+            yield
+    except TimeoutError:
+        state = progress.read_text() if progress.exists() else "<no child progress>"
+        wakeup = Path(str(progress) + ".wakeup")
+        delivery = (
+            " ".join(f"wakeup-byte:{value}" for value in wakeup.read_bytes()) or "<no wakeup bytes>"
+            if wakeup.exists() else "<wakeup journal not created>"
+        )
+        pytest.fail(
+            f"ACP shutdown ceiling expired: outstanding={outstanding()}, "
+            f"pid={process.pid}, returncode={process.returncode}; child progress:\n{state}"
+            f"\nsignal delivery: {delivery}"
+        )
+
+
 async def _accept_unavailable_backend_risk_for_lifecycle(session_id: str) -> bool:
     """Explicit test operator consent; available backends still must confine."""
     return True
@@ -27,12 +97,13 @@ async def _accept_unavailable_backend_risk_for_lifecycle(session_id: str) -> boo
 @pytest.mark.parametrize("signum", [signal.SIGTERM, signal.SIGINT, signal.SIGHUP, None])
 @pytest.mark.parametrize("stage", ["read", "idle", "close", "failure", "read-failure", "drain-failure", "close-failure"])
 async def test_proxy_signal_teardown_and_client_eof_are_silent(
-    signum: signal.Signals | None, stage: str,
+    signum: signal.Signals | None, stage: str, tmp_path: Path,
 ) -> None:
     # Real signals in an isolated interpreter cannot affect pytest's event loop.
     # Deliver during a reader task to exercise interruption of live I/O, rather
     # than relying on a platform-specific selector to reproduce the old crash.
-    source = """
+    progress = tmp_path / "child-progress"
+    source = _journal_source(progress) + """
 import asyncio, io, os, signal, sys
 from types import SimpleNamespace
 from mimir.acp import bootstrap, profiles, proxy
@@ -52,8 +123,10 @@ async def run_proxy(name, output):
     original_terminate = router.terminate_owned_children
     def terminate():
         original_terminate()
+        record(b'terminated')
         output.write(b'terminated\\n')
     async def close():
+        record(b'draining')
         if stage in ('close', 'close-failure') and signum:
             os.kill(os.getpid(), signum)
         if stage == 'close-failure':
@@ -81,6 +154,7 @@ async def run_proxy(name, output):
             async def read(self, size):
                 await asyncio.sleep(0)
                 if stage == 'idle':
+                    record(b'ready')
                     output.write(b'ready\\n')
                 elif signum and stage != 'drain-failure':
                     os.kill(os.getpid(), signum)
@@ -107,11 +181,13 @@ raise SystemExit(bootstrap.main([]))
         stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
         cwd=Path(__file__).resolve().parents[1],
     )
+    outstanding = "ready" if stage == "idle" and signum else "exit"
     try:
-        async with asyncio.timeout(120):
+        async with _shutdown_ceiling(process, progress, lambda: outstanding):
             if stage == "idle" and signum:
                 assert await process.stdout.readline() == b"ready\n"
                 process.send_signal(signum)
+            outstanding = "exit"
             stdout, stderr = await process.communicate()
             if "failure" in stage:
                 assert process.returncode == 1
@@ -157,14 +233,8 @@ async def _signal_exit_protocol(
     try:
         # Shield preserves the child's observer when the whole-protocol ceiling
         # expires. The journal can be read without waiting for pipe EOF or exit.
-        async with asyncio.timeout(timeout):
+        async with _shutdown_ceiling(process, progress, lambda: outstanding, timeout=timeout):
             await asyncio.shield(task)
-    except TimeoutError:
-        state = progress.read_text() if progress.exists() else "<no child progress>"
-        pytest.fail(
-            f"ACP shutdown ceiling expired: outstanding={outstanding}, "
-            f"pid={process.pid}, returncode={process.returncode}; child progress:\n{state}"
-        )
     finally:
         task.cancel()
         await asyncio.gather(task, return_exceptions=True)
@@ -177,15 +247,12 @@ async def _signal_exit_protocol(
 async def test_signal_exit_bounds_entire_teardown(
     signum: signal.Signals, repeat: bool, stage: str, tmp_path: Path,
 ) -> None:
-    source = r'''
+    progress = tmp_path / "child-progress"
+    source = _journal_source(progress) + r'''
 import asyncio, io, os, sys, threading
 from types import SimpleNamespace
 from mimir.acp import bootstrap, profiles, proxy
 stage = sys.argv[1]
-progress = os.open(sys.argv[2], os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
-def record(value):
-    os.write(progress, value + b'\n')
-record(b'child-started')
 profiles.ProfileStore = lambda: SimpleNamespace(get=lambda name: SimpleNamespace(remote=None))
 profiles.selected_profile = lambda name: 'test'
 
@@ -194,23 +261,9 @@ def mark(value):
     sink.write(value + b'\n')
     sink.flush()
 
-original_install = proxy._ShutdownHooks.install
-def install(self):
-    record(b'install-enter')
-    original_install(self)
-    record(b'handlers-installed')
-proxy._ShutdownHooks.install = install
-original_signal = proxy._ShutdownHooks._handle_signal
-def handle_signal(self, signum, frame):
-    record(b'signal-enter:' + str(signum).encode())
-    return original_signal(self, signum, frame)
-proxy._ShutdownHooks._handle_signal = handle_signal
-
 class ControlledTimer(threading.Timer):
     def start(self):
-        record(b'watchdog-start-enter')
         super().start()
-        record(b'watchdog-start-returned')
         mark(b'armed')
 
     def run(self):
@@ -273,9 +326,8 @@ async def run_proxy(name, output):
 proxy.run_proxy = run_proxy
 raise SystemExit(bootstrap.main([]))
 '''
-    progress = tmp_path / "child-progress"
     process = await asyncio.create_subprocess_exec(
-        sys.executable, "-c", source, stage, str(progress),
+        sys.executable, "-c", source, stage,
         stdin=asyncio.subprocess.PIPE,
         stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
         cwd=Path(__file__).resolve().parents[1],
@@ -291,6 +343,13 @@ raise SystemExit(bootstrap.main([]))
             f"signal-enter:{signum}", "watchdog-start-enter",
             "watchdog-start-returned", "armed",
         ]
+        delivered = [signum]
+        if repeat:
+            delivered.append(signal.SIGINT if signum != signal.SIGINT else signal.SIGTERM)
+            assert f"signal-enter:{delivered[-1]}" in progress.read_text().splitlines()
+        else:
+            assert progress.read_text().splitlines()[-2:] == ["watchdog-fired", "force-exit-enter"]
+        assert progress.with_suffix(".wakeup").read_bytes() == bytes(delivered)
     finally:
         if process.returncode is None:
             process.kill()
@@ -304,26 +363,27 @@ async def test_signal_exit_timeout_reports_child_progress(
 ) -> None:
     # A deliberately sleeping child, not a cancelled mock read: diagnostics
     # must be available while the child is alive and its pipes remain open.
-    source = r'''
+    progress = tmp_path / "child-progress"
+    source = _journal_source(progress) + r'''
 import os, signal, sys, time
-signal.signal(signal.SIGINT, signal.SIG_IGN)
+signal.set_wakeup_fd(_wakeup_fd)
+signal.signal(signal.SIGINT, lambda signum, frame: record(b'signal-enter:' + str(signum).encode()))
 markers = ['ready', 'armed', 'terminated', 'draining']
-outstanding = sys.argv[2]
-with open(sys.argv[1], 'w') as progress:
-    progress.write('simulated child sleeping before ' + outstanding + '\n')
+outstanding = sys.argv[1]
+record(('simulated child sleeping before ' + outstanding).encode())
 for marker in markers[:markers.index(outstanding)]:
     os.write(1, marker.encode() + b'\n')
 os.write(2, b'sleeping\n')
 time.sleep(3600)
 '''
-    progress = tmp_path / "child-progress"
     process = await asyncio.create_subprocess_exec(
-        sys.executable, "-c", source, str(progress), outstanding,
+        sys.executable, "-c", source, outstanding,
         stdin=asyncio.subprocess.PIPE,
         stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+        cwd=Path(__file__).resolve().parents[1],
     )
     try:
-        async with asyncio.timeout(120):
+        async with _shutdown_ceiling(process, progress, lambda: "sleeping"):
             assert await process.stderr.readline() == b"sleeping\n"
         # Startup has completed; shorten only this diagnostic self-test's ceiling.
         with pytest.raises(pytest.fail.Exception) as failure:
@@ -339,8 +399,161 @@ time.sleep(3600)
 
 
 @pytest.mark.asyncio
-async def test_real_signal_watchdog_bounds_blocked_cleanup() -> None:
-    source = r'''
+@pytest.mark.timeout(120)
+@pytest.mark.parametrize("stage", ["unarmed", "never-fired", "force-exit", "escalation"])
+async def test_shutdown_journal_timeout_distinguishes_surviving_child(
+    stage: str, tmp_path: Path,
+) -> None:
+    progress = tmp_path / "child-progress"
+    source = _journal_source(progress) + r'''
+import asyncio
+from types import SimpleNamespace
+
+class ControlledTimer(JournalTimer):
+    def run(self):
+        if os.read(0, 1) == b'x':
+            self.function(*self.args, **self.kwargs)
+
+proxy.threading.Timer = ControlledTimer
+_journal_force_exit = lambda self: record(b'force-exit-survived')
+os._exit = lambda code: record(b'escalation-survived:' + str(code).encode())
+
+def cleanup():
+    record(b'cleanup-enter')
+    threading.Event().wait()
+
+async def run():
+    hooks = proxy._ShutdownHooks(SimpleNamespace(terminate_owned_children=cleanup))
+    hooks.install()
+    os.write(1, b'ready\n')
+    threading.Event().wait()
+
+asyncio.run(run())
+'''
+    process = await asyncio.create_subprocess_exec(
+        sys.executable, "-c", source,
+        stdin=asyncio.subprocess.PIPE,
+        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+        cwd=Path(__file__).resolve().parents[1],
+    )
+
+    async def await_marker(marker: str) -> None:
+        while marker not in progress.read_text().splitlines():
+            assert process.returncode is None
+            await asyncio.sleep(0.01)
+
+    try:
+        async with _shutdown_ceiling(process, progress, lambda: "self-test handshake"):
+            assert await process.stdout.readline() == b"ready\n"
+            if stage != "unarmed":
+                process.send_signal(signal.SIGTERM)
+                await await_marker("cleanup-enter")
+            if stage == "force-exit":
+                process.stdin.write(b"x")
+                await process.stdin.drain()
+                await await_marker("force-exit-survived")
+            elif stage == "escalation":
+                process.send_signal(signal.SIGINT)
+                await await_marker(f"escalation-survived:{128 + signal.SIGINT}")
+            # The short timeout tests formatting, never child startup or delivery.
+            with pytest.raises(pytest.fail.Exception) as failure:
+                async with _shutdown_ceiling(process, progress, lambda: "exit", timeout=0.05):
+                    await process.wait()
+            message = str(failure.value)
+            assert "outstanding=exit" in message
+            assert f"pid={process.pid}, returncode=None" in message
+            assert "child-started\ninstall-enter\nhandlers-installed\n" in message
+            if stage == "unarmed":
+                assert "<no wakeup bytes>" in message
+                assert "signal-enter:" not in message
+                assert "watchdog-start-enter" not in message
+            else:
+                assert f"wakeup-byte:{signal.SIGTERM}" in message
+                assert f"signal-enter:{signal.SIGTERM}\n" in message
+                assert "watchdog-start-enter\nwatchdog-start-returned\ncleanup-enter\n" in message
+            if stage == "force-exit":
+                assert "watchdog-fired\nforce-exit-enter\nforce-exit-survived\n" in message
+            else:
+                assert "watchdog-fired" not in message
+                assert "force-exit-enter" not in message
+            if stage == "escalation":
+                assert f"wakeup-byte:{signal.SIGINT}" in message
+                assert f"signal-enter:{signal.SIGINT}\nescalation-survived:" in message
+            assert process.returncode is None
+    finally:
+        if process.returncode is None:
+            process.kill()
+        await process.communicate()
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(120)
+async def test_shutdown_journal_wakeup_without_python_signal_handler(tmp_path: Path) -> None:
+    progress = tmp_path / "child-progress"
+    source = _journal_source(progress) + r'''
+import asyncio, ctypes, select, socket, time
+from types import SimpleNamespace
+
+reader, writer = socket.socketpair()
+writer.sendall(b'x')
+assert select.select([reader], [], [], 0)[0]
+libc = ctypes.CDLL(None)
+libc.recv.argtypes = [ctypes.c_int, ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int]
+libc.recv.restype = ctypes.c_ssize_t
+buffer = ctypes.create_string_buffer(2)
+
+def deliver():
+    # Losing readability proves libc consumed the first byte of MSG_WAITALL.
+    # The peer stays open and never sends the second byte. Target this worker,
+    # not main: the C handler writes a byte without interrupting main's recv.
+    while select.select([reader], [], [], 0)[0]:
+        time.sleep(0.001)
+    record(b'main-blocked')
+    signal.pthread_kill(threading.get_ident(), signal.SIGTERM)
+    record(b'worker-signalled')
+    os.write(1, b'delivered\n')
+
+async def run():
+    hooks = proxy._ShutdownHooks(SimpleNamespace(terminate_owned_children=lambda: None))
+    hooks.install()
+    threading.Thread(target=deliver, daemon=True).start()
+    libc.recv(reader.fileno(), buffer, 2, socket.MSG_WAITALL)
+    record(b'recv-returned')
+    threading.Event().wait()
+
+asyncio.run(run())
+'''
+    process = await asyncio.create_subprocess_exec(
+        sys.executable, "-c", source,
+        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+        cwd=Path(__file__).resolve().parents[1],
+    )
+    try:
+        async with _shutdown_ceiling(process, progress, lambda: "C delivery handshake"):
+            assert await process.stdout.readline() == b"delivered\n"
+            assert progress.with_suffix(".wakeup").read_bytes() == bytes([signal.SIGTERM])
+            with pytest.raises(pytest.fail.Exception) as failure:
+                async with _shutdown_ceiling(process, progress, lambda: "Python handler", timeout=0.05):
+                    await process.wait()
+            message = str(failure.value)
+            assert "outstanding=Python handler" in message
+            assert f"pid={process.pid}, returncode=None" in message
+            assert "handlers-installed\nmain-blocked\nworker-signalled\n" in message
+            assert f"wakeup-byte:{signal.SIGTERM}" in message
+            assert "signal-enter:" not in message
+            assert "watchdog-start-enter" not in message
+            assert "recv-returned" not in message
+            assert process.returncode is None
+    finally:
+        if process.returncode is None:
+            process.kill()
+        await process.communicate()
+
+
+@pytest.mark.asyncio
+async def test_real_signal_watchdog_bounds_blocked_cleanup(tmp_path: Path) -> None:
+    progress = tmp_path / "child-progress"
+    source = _journal_source(progress) + r'''
 import asyncio, os, signal, threading
 from types import SimpleNamespace
 from mimir.acp import proxy
@@ -365,10 +578,11 @@ asyncio.run(run())
     try:
         # No stage marker competes with the real deadline. This timeout is
         # only a harness bound; the independent product timer must exit.
-        async with asyncio.timeout(120):
+        async with _shutdown_ceiling(process, progress, lambda: "exit"):
             stdout, stderr = await process.communicate()
             assert process.returncode == 128 + signal.SIGTERM
             assert (stdout, stderr) == (b"", b"")
+            assert progress.read_text().splitlines()[-2:] == ["watchdog-fired", "force-exit-enter"]
     finally:
         if process.returncode is None:
             process.kill()
@@ -400,9 +614,10 @@ def test_sync_group_cleanup_continues_after_unsignalable_group(
 @pytest.mark.parametrize("signum", [signal.SIGTERM, signal.SIGINT, signal.SIGHUP, None])
 @pytest.mark.parametrize("error", ["PermissionError", "RuntimeError"])
 async def test_sync_cleanup_exceptions_do_not_escape_exit_boundary(
-    signum: signal.Signals | None, error: str,
+    signum: signal.Signals | None, error: str, tmp_path: Path,
 ) -> None:
-    source = r'''
+    progress = tmp_path / "child-progress"
+    source = _journal_source(progress) + r'''
 import asyncio, os, sys
 from types import SimpleNamespace
 from mimir.acp import proxy
@@ -432,7 +647,7 @@ loop.close()
         cwd=Path(__file__).resolve().parents[1],
     )
     try:
-        async with asyncio.timeout(120):
+        async with _shutdown_ceiling(process, progress, lambda: "exit"):
             stdout, stderr = await process.communicate()
             assert (process.returncode, stderr) == (128 + signum if signum else 0, b"")
             assert stdout == (b"outer\nrouter\n" if signum else b"router\n")
@@ -444,8 +659,11 @@ loop.close()
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("signum", [signal.SIGTERM, signal.SIGINT, signal.SIGHUP])
-async def test_signal_callback_rechecks_completed_installing_task(signum: signal.Signals) -> None:
-    source = r'''
+async def test_signal_callback_rechecks_completed_installing_task(
+    signum: signal.Signals, tmp_path: Path,
+) -> None:
+    progress = tmp_path / "child-progress"
+    source = _journal_source(progress) + r'''
 import asyncio, io, os, sys
 from types import SimpleNamespace
 from mimir.acp import proxy
@@ -468,7 +686,7 @@ loop.run_forever()
         cwd=Path(__file__).resolve().parents[1],
     )
     try:
-        async with asyncio.timeout(120):
+        async with _shutdown_ceiling(process, progress, lambda: "exit"):
             stdout, stderr = await process.communicate()
             assert process.returncode == 128 + signum
             assert (stdout, stderr) == (b"", b"")
@@ -479,8 +697,9 @@ loop.run_forever()
 
 
 @pytest.mark.asyncio
-async def test_signal_deadline_preserves_observed_failure_during_resistant_drain() -> None:
-    source = r'''
+async def test_signal_deadline_preserves_observed_failure_during_resistant_drain(tmp_path: Path) -> None:
+    progress = tmp_path / "child-progress"
+    source = _journal_source(progress) + r'''
 import asyncio, io, os, signal
 from types import SimpleNamespace
 from mimir.acp import bootstrap, profiles, proxy
@@ -511,7 +730,7 @@ raise SystemExit(bootstrap.main([]))
         cwd=Path(__file__).resolve().parents[1],
     )
     try:
-        async with asyncio.timeout(120):
+        async with _shutdown_ceiling(process, progress, lambda: "exit"):
             stdout, stderr = await process.communicate()
             assert process.returncode == 1
             assert stdout == b""
@@ -547,7 +766,8 @@ async def test_local_proxy_signal_with_real_stdio_and_unix_socket(
     # Do not replace run_proxy, run_router, or open_stdio: all three must run
     # against real OS transports. Inject profile/credential lookup and, for the
     # failure cases, an error after the real router close has completed.
-    source = r'''
+    progress = tmp_path / "child-progress"
+    source = _journal_source(progress) + r'''
 import asyncio, os, sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -601,8 +821,9 @@ raise SystemExit(bootstrap.main(['--profile', 'test']))
         stderr=stderr_terminal[1] if stderr_terminal else stderr_file if file_stderr else asyncio.subprocess.PIPE,
         cwd=Path(__file__).resolve().parents[1],
     )
+    outstanding = "ready"
     try:
-        async with asyncio.timeout(120):
+        async with _shutdown_ceiling(process, progress, lambda: outstanding):
             await connected.wait()
             # An actual routed frame, rather than a sleep or just socket acceptance,
             # proves stdio and the signal hooks are installed before signalling.
@@ -636,6 +857,7 @@ raise SystemExit(bootstrap.main(['--profile', 'test']))
                     stderr = stderr_path.read_bytes()
                 pytest.fail(f"real stdio startup failed: code={process.returncode}, stderr={stderr!r}")
             process.send_signal(signum)
+            outstanding = "exit"
             stdout, stderr = await process.communicate()
             if file_stderr:
                 stderr = stderr_path.read_bytes()
