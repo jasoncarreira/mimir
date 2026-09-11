@@ -289,6 +289,12 @@ def opencode_worker_documents(
     config = {
         "model": invocation.model,
         "provider": {invocation.provider: provider_config},
+        # Worker runs operate inside their own checkout. Denying external
+        # directories keeps opencode from reaching outside it -- defence in
+        # depth beside the uid boundary, not a replacement for it. Applies to
+        # every worker surface that builds this document: leaf builds, factory
+        # runs, and spawn_open_code.
+        "permission": {"external_directory": "deny"},
     }
     config_document = _encode_projection(config, auth=False)
     auth_document: bytes | None = None

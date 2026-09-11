@@ -76,6 +76,10 @@ def test_enabled_opencode_spec_contains_worker_local_selected_projections(
     assert json.loads(projections[0].document) == {
         "model": "proxy/model",
         "provider": {"proxy": {"options": {"apiKey": "referenced"}}},
+        # Leaf builds get the same containment default as factory runs and
+        # spawn_open_code: the worker document is built by one function, so the
+        # deny applies to every surface rather than only the one that needed it.
+        "permission": {"external_directory": "deny"},
     }
     assert json.loads(projections[1].document) == {
         "proxy": {"type": "oauth", "access": "access", "refresh": "refresh", "expires": 7}

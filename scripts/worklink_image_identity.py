@@ -434,7 +434,7 @@ if home.parent != Path("/var/lib/mimir-worklink/homes"):
     raise SystemExit("coding CLI received an invalid HOME")
 config = json.loads((home / ".config/opencode/opencode.json").read_text())
 auth = json.loads((home / ".local/share/opencode/auth.json").read_text())
-if config != {"model": "proof/model", "provider": {"proof": {"endpoint": "https://proof.invalid", "apiKey": "provider-reference"}}}:
+if config != {"model": "proof/model", "provider": {"proof": {"endpoint": "https://proof.invalid", "apiKey": "provider-reference"}}, "permission": {"external_directory": "deny"}}:
     raise SystemExit("selected provider configuration was not projected exactly")
 if auth != {"proof": {"type": "api", "key": "projected-secret"}}:
     raise SystemExit("selected provider auth was not projected exactly")
@@ -541,7 +541,7 @@ if identifier.version != 4 or str(identifier) != home.name:
     raise SystemExit("spawn fake did not receive a canonical UUIDv4 identifier")
 config = json.loads((home / ".config/opencode/opencode.json").read_text())
 auth = json.loads((home / ".local/share/opencode/auth.json").read_text())
-expected_config = {"model": "proof/model", "provider": {"proof": {"endpoint": "https://proof.invalid"}}}
+expected_config = {"model": "proof/model", "provider": {"proof": {"endpoint": "https://proof.invalid"}}, "permission": {"external_directory": "deny"}}
 expected_auth = {"proof": {"type": "oauth", "access": "oauth-access-proof", "refresh": "oauth-refresh-proof", "expires": 4102444800000}}
 if config != expected_config:
     raise SystemExit("spawn fake did not read the selected provider config projection")

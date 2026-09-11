@@ -223,6 +223,10 @@ def test_worker_documents_select_only_complete_native_record(
     assert json.loads(config_document) == {
         "model": "proxy/model",
         "provider": {"proxy": {"options": {"apiKey": "from-env"}}},
+        # Worker documents deny external directories on every surface that
+        # builds them; asserted here so the containment default cannot be
+        # dropped silently by a later config edit.
+        "permission": {"external_directory": "deny"},
     }
     assert auth_document is not None
     assert json.loads(auth_document) == {"proxy": entry}
