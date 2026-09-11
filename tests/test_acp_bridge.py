@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import uuid
 from pathlib import Path
 
 import pytest
@@ -29,8 +30,13 @@ async def test_plain_text_is_authoritative_update_and_exact_result() -> None:
     result = await bridge.send("acp:session", "hello")
     assert result == SendResult(sent=True, chunks=1)
     assert publisher.updates[0].content.text == "hello"
-    assert publisher.updates[0].message_id is None
+    first_message_id = publisher.updates[0].message_id
+    assert str(uuid.UUID(first_message_id)) == first_message_id
     assert publisher.updates[0].session_update == "agent_message_chunk"
+    assert await bridge.send("acp:session", "hello") == SendResult(sent=True, chunks=1)
+    second_message_id = publisher.updates[1].message_id
+    assert str(uuid.UUID(second_message_id)) == second_message_id
+    assert second_message_id != first_message_id
     assert ACPBridge.prefixes == ("acp:",)
     assert ACPBridge.name == "acp"
 

@@ -688,8 +688,9 @@ class MimirAcpAgent:
         response = PromptResponse(stopReason="end_turn")
         failed: BaseException | None = None
         try:
+            message_id = str(uuid.uuid4())
             for block in blocks:
-                await journal.publish_live(UserMessageChunk(sessionUpdate="user_message_chunk", content=block), client, turn_id=turn_id, lease=lease)
+                await journal.publish_live(UserMessageChunk(sessionUpdate="user_message_chunk", content=block, messageId=message_id), client, turn_id=turn_id, lease=lease)
             event = AgentEvent(trigger="user_message", channel_id=record.thread_id, content=self._normalize_prompt(blocks), author=owner, author_display=self._display_name_for(state) or owner, author_id=owner, source_id=turn_id, source="acp", extra={"channel_visibility": "private", "bridge_instance": _ACP_BRIDGE_INSTANCE}, continuation_auth_context=self._auth_context_for(state))
             async with self._boundary_lock:
                 if not active._is_current():

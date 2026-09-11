@@ -32,6 +32,166 @@ async def finish(dispatcher: UpdateDispatcher) -> None:
     await dispatcher.close()
 
 
+_MISSING = object()
+_PRESENTATION_CASES = [
+    ("read_file", {"file_path": "src/example.py"}, "Read src/example.py", "read"),
+    ("hands_read", {"path": "notes.txt"}, "Read notes.txt", "read"),
+    ("memory_get", {"atom_ids": ["atom-1"]}, "Read atom-1", "read"),
+    ("edit_file", {"file_path": "src/example.py"}, "Edit src/example.py", "edit"),
+    ("write_file", {"file_path": "src/example.py"}, "Edit src/example.py", "edit"),
+    ("hands_edit", {"path": "notes.txt"}, "Edit notes.txt", "edit"),
+    ("glob", {"pattern": "*.py"}, "Search *.py", "search"),
+    ("grep", {"pattern": "needle"}, "Search needle", "search"),
+    ("file_search", {"query": "symbol"}, "Search symbol", "search"),
+    ("web_search", {"query": "release notes"}, "Search release notes", "search"),
+    ("memory_query", {"query": "prior decision"}, "Search prior decision", "search"),
+    ("shell_exec", {"command": "python --token supersecret"}, "Run python", "execute"),
+    ("bash_async", {"command": "make test"}, "Run make", "execute"),
+    ("hands_shell", {"command": '"my tool" --flag'}, "Run my tool", "execute"),
+    ("hands_python", {"code": "print('supersecret')"}, "Run Python", "execute"),
+    ("fetch_url", {"url": "example.com"}, "Fetch example.com", "fetch"),
+    ("write_todos", {"todos": [{"content": "supersecret"}]}, "Update todos", "other"),
+    ("hands_request_scope", {"path": "src/example.py"}, "Request scope src/example.py", "other"),
+]
+
+
+def _start_event(lifecycle: str, name: object, args: object) -> dict[str, object]:
+    if lifecycle == "start":
+        event: dict[str, object] = {"type": "tool_call", "phase": "start", "id": "tool"}
+    elif lifecycle == "tool_call_end":
+        event = {"type": "tool_call", "phase": "end", "id": "tool"}
+    else:
+        event = {
+            "type": "tool_result",
+            "phase": "end",
+            "id": "tool",
+            "status": "ok",
+        }
+    if name is not _MISSING:
+        event["tool_name"] = name
+    if args is not _MISSING:
+        event["args"] = args
+    return event
+
+
+@pytest.mark.parametrize("lifecycle", ["start", "tool_call_end", "tool_result_end"])
+@pytest.mark.parametrize("name,args,title,kind", _PRESENTATION_CASES)
+@pytest.mark.asyncio
+async def test_finite_tool_presentation_matrix_at_every_start_site(
+    lifecycle: str,
+    name: str,
+    args: object,
+    title: str,
+    kind: str,
+) -> None:
+    publisher = Publisher()
+    dispatcher = UpdateDispatcher(publisher)
+    dispatcher.enqueue(_start_event(lifecycle, name, args))
+    await dispatcher.drain()
+
+    starts = [item for item in publisher.updates if item.session_update == "tool_call"]
+    assert len(starts) == 1
+    assert (starts[0].title, starts[0].kind) == (title, kind)
+    await finish(dispatcher)
+
+
+_DETAIL_LIMIT = "x" * 77 + "..."
+_PRESENTATION_EDGES = [
+    ("read_file", {"file_path": "x" * 100}, f"Read {_DETAIL_LIMIT}", "read"),
+    ("x" * 100, {}, _DETAIL_LIMIT, "other"),
+    ("read_file", {"file_path": "token=supersecret"}, "Read [redacted]", "read"),
+    ("read_file", {"file_path": "/private/example.py"}, "Read [path]", "read"),
+    ("read_file", {"file_path": "~/private/example.py"}, "Read [path]", "read"),
+    ("read_file", {"file_path": "C:\\Users\\me\\example.py"}, "Read [path]", "read"),
+    ("read_file", {"file_path": "src/example.py"}, "Read src/example.py", "read"),
+    ("read_file", {"file_path": "tests/example.py"}, "Read [path]", "read"),
+    ("arbitrary_tool", {}, "arbitrary_tool", "other"),
+    ("read_file_extra", {"file_path": "src/example.py"}, "read_file_extra", "other"),
+    ("Read_File", {"file_path": "src/example.py"}, "Read_File", "other"),
+    (" read_file ", {"file_path": "src/example.py"}, "read_file", "other"),
+    (_MISSING, {}, "unknown", "other"),
+    ("", {}, "unknown", "other"),
+    ("   ", {}, "unknown", "other"),
+    ("read_file", _MISSING, "Read", "read"),
+    ("read_file", None, "Read", "read"),
+    ("read_file", "src/example.py", "Read", "read"),
+    ("read_file", {"file_path": 42}, "Read", "read"),
+    ("read_file", {"file_path": None}, "Read", "read"),
+    ("memory_get", {}, "Read", "read"),
+    ("memory_get", {"atom_ids": None}, "Read", "read"),
+    ("memory_get", {"atom_ids": "atom-1"}, "Read", "read"),
+    ("memory_get", {"atom_ids": []}, "Read", "read"),
+    ("memory_get", {"atom_ids": [42, "atom-2"]}, "Read", "read"),
+    ("memory_get", {"atom_ids": ["atom-1", "token=supersecret"]}, "Read atom-1", "read"),
+    ("hands_python", {"code": "token='supersecret'\nprint(token)"}, "Run Python", "execute"),
+    ("write_todos", {"todos": [{"content": "token=supersecret"}]}, "Update todos", "other"),
+    ("hands_request_scope", {"path": ""}, "Request scope", "other"),
+]
+
+
+@pytest.mark.parametrize("lifecycle", ["start", "tool_call_end", "tool_result_end"])
+@pytest.mark.parametrize("name,args,title,kind", _PRESENTATION_EDGES)
+@pytest.mark.asyncio
+async def test_tool_presentation_edges_at_every_start_site(
+    lifecycle: str,
+    name: object,
+    args: object,
+    title: str,
+    kind: str,
+) -> None:
+    publisher = Publisher()
+    dispatcher = UpdateDispatcher(publisher)
+    dispatcher.enqueue(_start_event(lifecycle, name, args))
+    await dispatcher.drain()
+
+    starts = [item for item in publisher.updates if item.session_update == "tool_call"]
+    assert len(starts) == 1
+    assert (starts[0].title, starts[0].kind) == (title, kind)
+    assert "supersecret" not in starts[0].title
+    await finish(dispatcher)
+
+
+_SHELL_EDGES = [
+    ({"command": "python --token supersecret"}, "Run python"),
+    ({"command": "python"}, "Run python"),
+    ({"command": "/usr/bin/python --version"}, "Run [path]"),
+    ({"command": "bin/tool --flag"}, "Run bin/tool"),
+    ({"command": '"my tool" --token supersecret'}, "Run my tool"),
+    ({"command": "token=supersecret --flag"}, "Run [redacted]"),
+    (_MISSING, "Run"),
+    (None, "Run"),
+    ({}, "Run"),
+    ({"command": None}, "Run"),
+    ({"command": 42}, "Run"),
+    ({"command": ""}, "Run"),
+    ({"command": "   "}, "Run"),
+    ({"command": "'unterminated"}, "Run"),
+    ({"command": "'' second"}, "Run"),
+]
+
+
+@pytest.mark.parametrize("lifecycle", ["start", "tool_call_end", "tool_result_end"])
+@pytest.mark.parametrize("name", ["shell_exec", "bash_async", "hands_shell"])
+@pytest.mark.parametrize("args,title", _SHELL_EDGES)
+@pytest.mark.asyncio
+async def test_shell_presentation_exposes_only_first_argv_at_every_start_site(
+    lifecycle: str,
+    name: str,
+    args: object,
+    title: str,
+) -> None:
+    publisher = Publisher()
+    dispatcher = UpdateDispatcher(publisher)
+    dispatcher.enqueue(_start_event(lifecycle, name, args))
+    await dispatcher.drain()
+
+    starts = [item for item in publisher.updates if item.session_update == "tool_call"]
+    assert len(starts) == 1
+    assert (starts[0].title, starts[0].kind) == (title, "execute")
+    assert "supersecret" not in starts[0].title
+    await finish(dispatcher)
+
+
 @pytest.mark.asyncio
 async def test_complete_suppression_tool_and_redaction_mapping() -> None:
     publisher = Publisher()
@@ -120,6 +280,14 @@ async def test_permission_snapshot_pins_first_unscrubbed_arguments() -> None:
         "path": block_path, "old_text": "old", "new_text": "new",
     }
     assert dispatcher.permission_snapshot("missing") is None
+    assert (
+        dispatcher.permission_snapshot("streamed").title,
+        dispatcher.permission_snapshot("streamed").kind,
+    ) == ("hands_edit", "other")
+    assert (
+        dispatcher.permission_snapshot("block").title,
+        dispatcher.permission_snapshot("block").kind,
+    ) == ("hands_edit", "other")
     raw_inputs = {
         update.tool_call_id: update.raw_input
         for update in publisher.updates
@@ -130,13 +298,17 @@ async def test_permission_snapshot_pins_first_unscrubbed_arguments() -> None:
         "block": {"path": "[path]", "old_text": "new", "new_text": "later"},
     }
     starts = {
-        update.tool_call_id: update.raw_input
+        update.tool_call_id: (update.title, update.kind, update.raw_input)
         for update in publisher.updates
         if update.status == "pending" and update.tool_call_id in {"streamed", "block"}
     }
     assert starts == {
-        "streamed": {},
-        "block": {"path": "[path]", "old_text": "old", "new_text": "new"},
+        "streamed": ("Edit", "edit", {}),
+        "block": (
+            "Edit [path]",
+            "edit",
+            {"path": "[path]", "old_text": "old", "new_text": "new"},
+        ),
     }
     await finish(dispatcher)
 
