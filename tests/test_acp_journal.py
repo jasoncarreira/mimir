@@ -13,6 +13,7 @@ from mimir.acp.sdk import RequestError, TextContentBlock, UserMessageChunk
 from mimir.acp.session_store import SessionStore
 
 TURN_ID = "00000000-0000-4000-8000-000000000000"
+DAY_NS = 86_400_000_000_000
 
 
 class Client:
@@ -271,7 +272,7 @@ def test_ttl_marker_before_unlink_failure_and_retry(tmp_path: Path, monkeypatch:
     monkeypatch.setattr(store, "mark", original)
     store.sweep_expired(1, now_ns=mtime + 86_400_000_000_001)
     assert not record.journal_path.exists()
-    assert json.loads(record.metadata_path.read_text())["replayability"] == "expired"
+    assert not record.metadata_path.exists()
 
 
 def test_delete_marker_before_unlink_failure_and_retry(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -287,6 +288,174 @@ def test_delete_marker_before_unlink_failure_and_retry(tmp_path: Path, monkeypat
     assert not record.journal_path.exists()
     assert json.loads(record.metadata_path.read_text())["replayability"] == "deleted"
     store.delete_owned_session(record.session_id, "owner")
+
+
+@pytest.mark.parametrize("reason", ["replayable", "overflowed", "expired", "deleted", "io_failed"])
+@pytest.mark.parametrize("paired", [True, False])
+def test_sweep_protects_before_validation(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, reason: str, paired: bool) -> None:
+    store = SessionStore(tmp_path)
+    record = store.create_session("owner")
+    store.mark(record.session_id, "owner", reason)
+    if not paired:
+        record.journal_path.unlink()
+    before = record.metadata_path.read_bytes()
+    validations = []
+    original = store._validate_file
+
+    def validate(path: Path) -> None:
+        validations.append(path)
+        original(path)
+
+    monkeypatch.setattr(store, "_validate_file", validate)
+    store.sweep_expired(7, now_ns=record.metadata_path.stat().st_mtime_ns + 8 * DAY_NS,
+                        protected_sessions=frozenset({record.session_id}))
+    assert validations == []
+    assert record.metadata_path.read_bytes() == before
+    assert record.journal_path.exists() == paired
+
+
+@pytest.mark.parametrize("reason", ["replayable", "overflowed", "deleted", "io_failed"])
+@pytest.mark.parametrize("newer", ["metadata", "journal"])
+def test_sweep_pair_uses_reason_specific_mtime_and_strict_ttl(tmp_path: Path, reason: str, newer: str) -> None:
+    store = SessionStore(tmp_path)
+    record = store.create_session("owner")
+    store.mark(record.session_id, "owner", reason)
+    metadata_mtime = 3 * DAY_NS if newer == "metadata" else DAY_NS
+    journal_mtime = 3 * DAY_NS if newer == "journal" else DAY_NS
+    os.utime(record.metadata_path, ns=(metadata_mtime, metadata_mtime))
+    os.utime(record.journal_path, ns=(journal_mtime, journal_mtime))
+    mtime = journal_mtime if reason == "replayable" else max(metadata_mtime, journal_mtime)
+    before = record.metadata_path.read_bytes()
+    store.sweep_expired(7, now_ns=mtime + 7 * DAY_NS)
+    assert record.journal_path.exists()
+    assert record.metadata_path.read_bytes() == before
+    store.sweep_expired(7, now_ns=mtime + 7 * DAY_NS + 1)
+    assert not record.journal_path.exists()
+    assert not record.metadata_path.exists()
+
+
+@pytest.mark.parametrize("reason", ["replayable", "overflowed", "deleted", "io_failed"])
+def test_sweep_metadata_only_legacy_uses_metadata_ttl(tmp_path: Path, reason: str) -> None:
+    store = SessionStore(tmp_path)
+    record = store.create_session("owner")
+    store.mark(record.session_id, "owner", reason)
+    record.journal_path.unlink()
+    mtime = record.metadata_path.stat().st_mtime_ns
+    before = record.metadata_path.read_bytes()
+    store.sweep_expired(7, now_ns=mtime + 7 * DAY_NS)
+    assert record.metadata_path.read_bytes() == before
+    store.sweep_expired(7, now_ns=mtime + 7 * DAY_NS + 1)
+    assert not record.metadata_path.exists()
+
+
+@pytest.mark.parametrize("paired", [True, False])
+def test_sweep_expired_marker_retries_without_waiting(tmp_path: Path, paired: bool) -> None:
+    store = SessionStore(tmp_path)
+    record = store.create_session("owner")
+    store.mark(record.session_id, "owner", "expired")
+    if not paired:
+        record.journal_path.unlink()
+    store.sweep_expired(7, now_ns=0)
+    assert not record.metadata_path.exists()
+    assert not record.journal_path.exists()
+
+
+@pytest.mark.parametrize("reason", ["replayable", "overflowed", "expired", "deleted", "io_failed"])
+@pytest.mark.parametrize("target", ["metadata", "journal"])
+@pytest.mark.parametrize("unsafe", ["mode", "symlink", "directory"])
+def test_sweep_skips_unsafe_files(tmp_path: Path, reason: str, target: str, unsafe: str) -> None:
+    store = SessionStore(tmp_path)
+    record = store.create_session("owner")
+    store.mark(record.session_id, "owner", reason)
+    path = record.metadata_path if target == "metadata" else record.journal_path
+    other = record.journal_path if target == "metadata" else record.metadata_path
+    before = other.read_bytes()
+    if unsafe == "mode":
+        path.chmod(0o644)
+    else:
+        path.unlink()
+        if unsafe == "symlink":
+            path.symlink_to(tmp_path / "missing")
+        else:
+            path.mkdir()
+    store.sweep_expired(7, now_ns=other.stat().st_mtime_ns + 8 * DAY_NS)
+    assert other.read_bytes() == before
+    assert path.lstat()
+
+
+@pytest.mark.parametrize("paired", [True, False])
+@pytest.mark.parametrize("invalid", ["json", "schema", "extra", "reason", "session_id"])
+@pytest.mark.parametrize("reason", ["replayable", "expired"])
+def test_sweep_skips_unknown_or_malformed_metadata(tmp_path: Path, paired: bool, invalid: str, reason: str) -> None:
+    store = SessionStore(tmp_path)
+    record = store.create_session("owner")
+    payload = json.loads(record.metadata_path.read_text())
+    payload["replayability"] = reason
+    if invalid == "schema":
+        payload["schema_version"] = 2
+    elif invalid == "extra":
+        payload["unknown"] = True
+    elif invalid == "reason":
+        payload["replayability"] = "unknown"
+    elif invalid == "session_id":
+        payload["session_id"] = "invalid"
+    record.metadata_path.write_text("{" if invalid == "json" else json.dumps(payload))
+    if not paired:
+        record.journal_path.unlink()
+    before = record.metadata_path.read_bytes()
+    store.sweep_expired(7, now_ns=record.metadata_path.stat().st_mtime_ns + 8 * DAY_NS)
+    assert record.metadata_path.read_bytes() == before
+    assert record.journal_path.exists() == paired
+
+
+@pytest.mark.parametrize("failure", ["journal", "metadata"])
+def test_sweep_unlink_retry_and_durable_cleanup_order(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: str) -> None:
+    store = SessionStore(tmp_path)
+    record = store.create_session("owner")
+    actions = []
+    original_unlink = Path.unlink
+    original_fsync = store._fsync_parent
+    fail = True
+
+    def unlink(path: Path, *args, **kwargs) -> None:
+        nonlocal fail
+        if path in (record.journal_path, record.metadata_path):
+            assert json.loads(record.metadata_path.read_text())["replayability"] == "expired"
+            target = "journal" if path == record.journal_path else "metadata"
+            actions.append(target)
+            if fail and target == failure:
+                fail = False
+                raise OSError("unlink")
+        original_unlink(path, *args, **kwargs)
+
+    def fsync() -> None:
+        actions.append("fsync")
+        original_fsync()
+
+    monkeypatch.setattr(Path, "unlink", unlink)
+    monkeypatch.setattr(store, "_fsync_parent", fsync)
+    store.sweep_expired(7, now_ns=record.journal_path.stat().st_mtime_ns + 8 * DAY_NS)
+    assert not fail
+    assert json.loads(record.metadata_path.read_text())["replayability"] == "expired"
+    assert record.journal_path.exists() == (failure == "journal")
+    actions.clear()
+    store.sweep_expired(7, now_ns=0)
+    assert actions == ["journal", "fsync", "metadata", "fsync"]
+    assert not record.journal_path.exists()
+    assert not record.metadata_path.exists()
+
+
+@pytest.mark.parametrize("loader", ["load_owned", "load_owned_live"])
+def test_reclaimed_session_error_is_actionable_and_owner_independent(tmp_path: Path, loader: str) -> None:
+    store = SessionStore(tmp_path)
+    record = store.create_session("owner")
+    expected = "Invalid session: unavailable or reclaimed; create a new session with session/new"
+    with pytest.raises(RequestError, match=expected):
+        getattr(store, loader)(record.session_id, "foreign")
+    store.sweep_expired(7, now_ns=record.journal_path.stat().st_mtime_ns + 8 * DAY_NS)
+    for owner in ("owner", "foreign"):
+        with pytest.raises(RequestError, match=expected):
+            getattr(store, loader)(record.session_id, owner)
 
 
 @pytest.mark.asyncio
@@ -402,3 +571,4 @@ def test_post_marker_cleanup_failure_retries(tmp_path: Path, monkeypatch: pytest
 
     assert cleanup_calls == 1
     assert not record.journal_path.exists()
+    assert record.metadata_path.exists() == (operation == "delete")

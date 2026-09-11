@@ -145,28 +145,38 @@ class SessionStore:
         record.journal_path.unlink(missing_ok=True)
         self._fsync_parent()
 
-    def sweep_expired(self, ttl_days: int, *, now_ns: int | None = None) -> None:
+    def sweep_expired(self, ttl_days: int, *, now_ns: int | None = None, protected_sessions: frozenset[str] = frozenset()) -> None:
         if ttl_days <= 0:
             raise ValueError("ttl_days must be positive")
         now_ns = now_ns if now_ns is not None else __import__("time").time_ns()
         ttl_ns = ttl_days * 86_400_000_000_000
         for metadata in self.root.glob("*.meta.json"):
             session_id = metadata.name.removesuffix(".meta.json")
+            if session_id in protected_sessions:
+                continue
             try:
                 journal, _ = self.paths(session_id)
                 self._validate_file(metadata)
                 payload = json.loads(metadata.read_text(encoding="utf-8"))
                 self._validate_payload(payload, session_id)
                 reason = payload["replayability"]
-                if reason == "replayable":
+                metadata_mtime = metadata.stat().st_mtime_ns
+                try:
                     self._validate_file(journal)
-                    if now_ns > journal.stat().st_mtime_ns + ttl_ns:
-                        self.mark(session_id, payload["owner_principal"], "expired")
-                        journal.unlink(missing_ok=True)
-                        self._fsync_parent()
-                elif reason in {"expired", "deleted", "overflowed", "io_failed"}:
-                    journal.unlink(missing_ok=True)
-                    self._fsync_parent()
+                except FileNotFoundError:
+                    mtime = metadata_mtime
+                else:
+                    journal_mtime = journal.stat().st_mtime_ns
+                    mtime = journal_mtime if reason == "replayable" else max(metadata_mtime, journal_mtime)
+                if reason != "expired":
+                    if now_ns <= mtime + ttl_ns:
+                        continue
+                    # Keep a retry marker until journal removal is durable.
+                    self.mark(session_id, payload["owner_principal"], "expired")
+                journal.unlink(missing_ok=True)
+                self._fsync_parent()
+                metadata.unlink()
+                self._fsync_parent()
             except BaseException:
                 continue
 
@@ -229,7 +239,7 @@ class SessionStore:
 
 
 def _invalid_session() -> RequestError:
-    return RequestError(-32602, "Invalid session")
+    return RequestError(-32602, "Invalid session: unavailable or reclaimed; create a new session with session/new")
 
 
 def _unavailable(reason: str) -> RequestError:

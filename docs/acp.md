@@ -138,6 +138,29 @@ There is one active ACP connection per `MIMIR_HOME`. Only a newly authenticated 
 
 The journal has a default seven-day TTL and a 64 MiB limit. Before replay, Mimir revalidates the provider. A load replays every durably prepared `session/update` with its original sequence, including records already sent. Clients must tolerate duplicates. Replay never re-executes effects. Pending requests and frames are not replayed, external effects are not exactly-once, and cancellation does not roll back completed effects.
 
+Set `MIMIR_ACP_JOURNAL_TTL_DAYS` to a positive integer to change retention. The
+age-based default preserves a week of recovery regardless of session churn;
+a count limit could evict recent recoverable sessions during a burst. Age is
+measured from the journal's last write, not replay. Attached sessions and
+in-flight admission, replay, and prompt cleanup are protected even past the TTL.
+After they detach, overdue files are eligible at the next sweep.
+
+Sweeping runs off the event loop on the first authenticated session operation,
+then at most hourly on subsequent operations, not once per session creation.
+This reuses the existing maintenance cadence rather than adding a scheduled
+task: an idle daemon creates no new journals and resumes cleanup on activity.
+Admissions wait for a sweep to finish so loading cannot race deletion.
+Successful reclamation removes both `.jsonl` and `.meta.json`; a failed removal
+keeps an expired metadata marker for retry. Existing metadata-only records can
+be deletion/expiry tombstones, not evidence of a growing orphan leak. Validated
+metadata-only records age from metadata mtime; terminal records age from the
+newer file mtime, while expired cleanup markers retry immediately. Unknown or
+unsafe files are left untouched for operator inspection.
+
+Loading a reclaimed ID returns an actionable invalid-session error directing
+the client to `session/new`, never an empty replay. Channel-audience lookup,
+the other reader, treats missing files as an unknown audience (fails closed).
+
 Transport death cancels and quarantines only that ACP generation. The daemon, web UI, bridges, scheduler, unrelated work, and completed effects remain alive.
 
 ## Providers, permissions, and filesystems

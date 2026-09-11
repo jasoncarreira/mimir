@@ -3,6 +3,8 @@ from __future__ import annotations
 import asyncio
 import dataclasses
 import json
+import os
+import threading
 import time
 from pathlib import Path
 from types import SimpleNamespace
@@ -1135,7 +1137,7 @@ async def test_sweep_runs_off_loop_once_per_interval(tmp_path: Path, monkeypatch
     calls: list[tuple[int, bool]] = []
     original = agent._store.sweep
 
-    def sweep(days: int) -> None:
+    def sweep(days: int, **kwargs) -> None:
         try:
             asyncio.get_running_loop()
         except RuntimeError:
@@ -1143,7 +1145,7 @@ async def test_sweep_runs_off_loop_once_per_interval(tmp_path: Path, monkeypatch
         else:
             off_loop = False
         calls.append((days, off_loop))
-        original(days)
+        original(days, **kwargs)
 
     monkeypatch.setattr(agent._store, "sweep", sweep)
     session_id = (await agent.new_session("/one")).session_id
@@ -1154,6 +1156,250 @@ async def test_sweep_runs_off_loop_once_per_interval(tmp_path: Path, monkeypatch
     agent._last_sweep -= agent_module.ACP_SESSION_SWEEP_INTERVAL_SECONDS
     await agent.load_session("/three", session_id)
     assert calls == [(7, True), (7, True)]
+
+
+async def test_retention_reclaims_expired_pair_but_retained_session_replays(tmp_path: Path) -> None:
+    agent, client, _ = await _ready(tmp_path)
+    expired = (await agent.new_session("/expired")).session_id
+    retained = (await agent.new_session("/retained")).session_id
+    await agent.prompt(retained, [sdk.TextContentBlock(type="text", text="retained")])
+    expected = list(client.updates)
+    for session_id in (expired, retained):
+        await agent._detach_session(session_id)
+    expired_paths = agent._store.paths(expired)
+    retained_paths = agent._store.paths(retained)
+    before = [path.read_bytes() for path in retained_paths]
+    for path in expired_paths:
+        os.utime(path, ns=(1, 1))
+    agent._last_sweep -= agent_module.ACP_SESSION_SWEEP_INTERVAL_SECONDS
+    client.updates.clear()
+
+    await agent.load_session("/replay", retained)
+
+    assert client.updates == expected
+    assert [path.read_bytes() for path in retained_paths] == before
+    assert all(not path.exists() for path in expired_paths)
+    client.updates.clear()
+    with pytest.raises(sdk.RequestError) as raised:
+        await agent.load_session("/reclaimed", expired)
+    assert raised.value.to_error_obj() == {
+        "code": -32602,
+        "message": "Invalid session: unavailable or reclaimed; create a new session with session/new",
+        "data": None,
+    }
+    assert client.updates == []
+    assert all(not path.exists() for path in expired_paths)
+
+
+@pytest.mark.parametrize("bound_only", [False, True])
+async def test_retention_preserves_idle_live_session_until_detach(
+    tmp_path: Path, bound_only: bool,
+) -> None:
+    agent, _, _ = await _ready(tmp_path)
+    session_id = (await agent.new_session("/idle")).session_id
+    state = agent._sessions[session_id]
+    assert state.active_prompt is None
+    if bound_only:
+        # A connection may still own the session after its main index is removed.
+        agent._sessions.pop(session_id)
+    paths = agent._store.paths(session_id)
+    before = [path.read_bytes() for path in paths]
+    for path in paths:
+        os.utime(path, ns=(1, 1))
+    agent._last_sweep -= agent_module.ACP_SESSION_SWEEP_INTERVAL_SECONDS
+
+    await agent.new_session("/sweep")
+
+    assert [path.read_bytes() for path in paths] == before
+    assert json.loads(paths[1].read_text())["replayability"] == "replayable"
+    await agent._detach_state(state)
+    agent._last_sweep -= agent_module.ACP_SESSION_SWEEP_INTERVAL_SECONDS
+    await agent.new_session("/sweep-after-detach")
+    assert all(not path.exists() for path in paths)
+
+
+@pytest.mark.parametrize("phase", ["new_provider", "load_provider", "load_replay"])
+async def test_retention_pins_pending_admission_and_replay(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, phase: str,
+) -> None:
+    agent, client, _ = await _ready(tmp_path)
+    session_id = (await agent.new_session("/seed")).session_id
+    await agent.prompt(session_id, [sdk.TextContentBlock(type="text", text="replay marker")])
+    expected = list(client.updates)
+    await agent._detach_session(session_id)
+    client.updates.clear()
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    original_admit = agent._admit_provider
+    original_update = client.session_update
+    snapshots: list[frozenset[str]] = []
+    original_sweep = agent._store.sweep
+
+    async def admit(state: Any, **kwargs: Any) -> None:
+        nonlocal session_id
+        if state.environment.cwd == "/pending":
+            session_id = state.record.session_id
+            entered.set()
+            await release.wait()
+        await original_admit(state, **kwargs)
+
+    async def replay(session: str, update: Any) -> None:
+        entered.set()
+        await release.wait()
+        await original_update(session, update)
+
+    def sweep(days: int, *, protected_sessions: frozenset[str]) -> None:
+        snapshots.append(protected_sessions)
+        original_sweep(days, protected_sessions=protected_sessions)
+
+    monkeypatch.setattr(agent._store, "sweep", sweep)
+    if phase == "load_replay":
+        monkeypatch.setattr(client, "session_update", replay)
+    else:
+        monkeypatch.setattr(agent, "_admit_provider", admit)
+    pending = asyncio.create_task(
+        agent.new_session("/pending") if phase == "new_provider"
+        else agent.load_session("/pending", session_id)
+    )
+    try:
+        await asyncio.wait_for(entered.wait(), 1)
+        assert session_id not in agent._sessions
+        assert all(session_id not in connection.bound_sessions for connection in agent._connections.values())
+        paths = agent._store.paths(session_id)
+        before = [path.read_bytes() for path in paths]
+        for path in paths:
+            os.utime(path, ns=(1, 1))
+        agent._last_sweep -= agent_module.ACP_SESSION_SWEEP_INTERVAL_SECONDS
+        await agent.new_session("/sweep")
+        assert snapshots == [frozenset({session_id})]
+        assert [path.read_bytes() for path in paths] == before
+        assert json.loads(paths[1].read_text())["replayability"] == "replayable"
+    finally:
+        release.set()
+        await asyncio.wait_for(pending, 1)
+    assert session_id in agent._sessions
+    assert pending not in agent._journal_users
+    if phase != "new_provider":
+        assert client.updates == expected
+    await agent._detach_session(session_id)
+    agent._last_sweep -= agent_module.ACP_SESSION_SWEEP_INTERVAL_SECONDS
+    await agent.new_session("/sweep-unpinned")
+    assert all(not path.exists() for path in paths)
+
+
+async def test_retention_pins_detached_prompt_through_cleanup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    agent, _, core = await _ready(tmp_path)
+    session_id = (await agent.new_session("/prompt")).session_id
+    core.gate = asyncio.Event()
+    cleanup_entered = asyncio.Event()
+    cleanup_release = asyncio.Event()
+    original_close = UpdateDispatcher.close
+
+    async def close(dispatcher: UpdateDispatcher) -> None:
+        cleanup_entered.set()
+        await cleanup_release.wait()
+        await original_close(dispatcher)
+
+    monkeypatch.setattr(UpdateDispatcher, "close", close)
+    prompting = asyncio.create_task(agent.prompt(
+        session_id, [sdk.TextContentBlock(type="text", text="cleanup marker")],
+    ))
+    try:
+        await asyncio.wait_for(core.entered.wait(), 1)
+        active = agent._active_prompts[session_id]
+        core.gate.set()
+        await asyncio.wait_for(cleanup_entered.wait(), 1)
+        await agent._detach_state(active.session)
+        assert session_id not in agent._sessions
+        assert session_id not in agent._connection.bound_sessions
+        assert not active.completed.is_set()
+        paths = agent._store.paths(session_id)
+        before = [path.read_bytes() for path in paths]
+        for path in paths:
+            os.utime(path, ns=(1, 1))
+        agent._last_sweep -= agent_module.ACP_SESSION_SWEEP_INTERVAL_SECONDS
+        await agent.new_session("/sweep-cleanup")
+        assert [path.read_bytes() for path in paths] == before
+        assert json.loads(paths[1].read_text())["replayability"] == "replayable"
+    finally:
+        core.gate.set()
+        cleanup_release.set()
+        await asyncio.wait_for(prompting, 1)
+    assert active.completed.is_set()
+    assert prompting not in agent._journal_users
+    agent._last_sweep -= agent_module.ACP_SESSION_SWEEP_INTERVAL_SECONDS
+    await agent.new_session("/sweep-completed")
+    assert all(not path.exists() for path in paths)
+
+
+async def test_cancelled_retention_worker_fences_load_and_new_until_finished(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    agent, client, _ = await _ready(tmp_path)
+    session_id = (await agent.new_session("/seed")).session_id
+    await agent.prompt(session_id, [sdk.TextContentBlock(type="text", text="fence marker")])
+    expected = list(client.updates)
+    client.updates.clear()
+    await agent._detach_session(session_id)
+    paths = agent._store.paths(session_id)
+    before = [path.read_bytes() for path in paths]
+    worker_entered = asyncio.Event()
+    worker_release = threading.Event()
+    worker_finished = threading.Event()
+    loop = asyncio.get_running_loop()
+    original_sweep = agent._store.sweep
+    snapshots: list[frozenset[str]] = []
+
+    def sweep(days: int, *, protected_sessions: frozenset[str]) -> None:
+        snapshots.append(protected_sessions)
+        if len(snapshots) == 1:
+            loop.call_soon_threadsafe(worker_entered.set)
+            assert worker_release.wait(5), "test did not release retention worker"
+            original_sweep(days, protected_sessions=protected_sessions)
+            worker_finished.set()
+        else:
+            original_sweep(days, protected_sessions=protected_sessions)
+
+    monkeypatch.setattr(agent._store, "sweep", sweep)
+    agent._last_sweep -= agent_module.ACP_SESSION_SWEEP_INTERVAL_SECONDS
+    sweeping = asyncio.create_task(agent.new_session("/cancelled-sweep"))
+    admissions: list[asyncio.Task[Any]] = []
+    attempted = [asyncio.Event(), asyncio.Event()]
+
+    async def admit(index: int) -> Any:
+        attempted[index].set()
+        result = await (agent.load_session("/load", session_id) if index == 0 else agent.new_session("/new"))
+        assert worker_finished.is_set(), "admitted while deletion worker was running"
+        return result
+
+    try:
+        await asyncio.wait_for(worker_entered.wait(), 1)
+        sweeping.cancel()
+        # Each event fires immediately before entering the real admission gate.
+        admissions = [asyncio.create_task(admit(index)) for index in range(2)]
+        for event in attempted:
+            await asyncio.wait_for(event.wait(), 1)
+        assert not sweeping.done()
+        assert all(not task.done() for task in admissions)
+        assert not worker_finished.is_set()
+        assert snapshots == [frozenset()]
+        assert agent._sessions == {}
+        assert client.updates == []
+        assert [path.read_bytes() for path in paths] == before
+        assert set(agent._store.root.glob("*.meta.json")) == {paths[1]}
+    finally:
+        worker_release.set()
+        results = await asyncio.wait_for(asyncio.gather(sweeping, *admissions, return_exceptions=True), 2)
+    assert isinstance(results[0], sdk.RequestError)
+    assert results[0].to_error_obj() == sdk.internal_error().to_error_obj()
+    assert all(not isinstance(result, BaseException) for result in results[1:])
+    assert client.updates == expected
+    assert [path.read_bytes() for path in paths] == before
+    assert session_id in agent._sessions
+    assert results[2].session_id in agent._sessions
+    assert all(path.exists() for path in agent._store.paths(results[2].session_id))
 
 
 async def test_malformed_provider_declaration_creates_no_state(tmp_path: Path) -> None:
@@ -1267,7 +1513,7 @@ async def test_overflowed_session_accepts_later_live_prompts(tmp_path: Path, mon
     assert [update.content.text for update in client.updates if update.session_update == "user_message_chunk"] == ["first", "second"]
     sequences = [update.field_meta["mimir.sequence"] for update in client.updates]
     assert sequences == list(range(len(sequences)))
-    assert not agent._store.paths(session_id)[0].exists()
+    assert agent._store.paths(session_id)[0].exists()
     client.updates.clear()
     with pytest.raises(sdk.RequestError, match="Session replay unavailable: overflowed"):
         await agent.load_session("/two", session_id)

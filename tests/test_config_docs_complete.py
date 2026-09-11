@@ -204,7 +204,9 @@ def test_acp_journal_ttl_reference_contract():
     ]
     assert rows == [
         "| `MIMIR_ACP_JOURNAL_TTL_DAYS` | positive int | `7` | "
-        "Days to retain replayable ACP session journals before expiry. |"
+        "Days since last journal write before reclaiming ACP journal and metadata files; "
+        "live/in-flight sessions are protected. Sweeps run on activity at most hourly. "
+        "See [retention details](acp.md#connections-sessions-and-replay). |"
     ]
 
 

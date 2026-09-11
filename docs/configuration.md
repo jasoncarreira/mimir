@@ -118,7 +118,7 @@ All channel-list flags take a comma-separated prefix allow-list (e.g.
 | `MIMIR_RECENT_AUTHOR_CROSS` | int | `10` | Cross-channel recent messages anchored to the initiating user. |
 | `MIMIR_RECENT_CROSS_HOURS` | int | `24` | Lookback window (hours) for cross-channel recent activity. |
 | `MIMIR_RECENT_SOURCES` | csv-list | `slack,discord,bluesky,web,stdin,acp` | Allowlist of `Message.source` values in Recent activity. `*`/`all` = allow all; `""` = none. |
-| `MIMIR_ACP_JOURNAL_TTL_DAYS` | positive int | `7` | Days to retain replayable ACP session journals before expiry. |
+| `MIMIR_ACP_JOURNAL_TTL_DAYS` | positive int | `7` | Days since last journal write before reclaiming ACP journal and metadata files; live/in-flight sessions are protected. Sweeps run on activity at most hourly. See [retention details](acp.md#connections-sessions-and-replay). |
 | `MIMIR_ACP_ENABLED` | bool | enabled on POSIX with verifiable peer credentials | Start the owner-only Unix ACP daemon with `mimir run`. An explicit false value (`0`, `false`, `no`, `off`, or `n`, case-insensitive) prevents all ACP daemon construction; explicit enable fails on unsupported platforms. |
 | `MIMIR_RECENT_MESSAGE_CHARS` | int | `4096` | Per-message render cap (chars) in Recent activity. `0` = no cap. |
 | `MIMIR_RECENT_BOUNDARIES` | int | `3` | Recent session boundaries rendered under "Recent session summaries". `0` disables. |
