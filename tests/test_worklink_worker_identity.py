@@ -200,6 +200,32 @@ def test_ci_worker_uid_leg_seeds_the_state_that_makes_it_discriminating() -> Non
     assert env.get("MIMIR_FILE_TOOL_ROOTS")
 
 
+def test_ci_frontend_caches_root_dependencies_and_bounds_build() -> None:
+    workflow = yaml.safe_load(
+        (ROOT / ".github/workflows/tests.yml").read_text(encoding="utf-8")
+    )
+    job = workflow["jobs"]["frontend"]
+    assert job["timeout-minutes"] == 15
+    steps = job["steps"]
+    setup = next(step for step in steps if step.get("uses", "").startswith("actions/setup-node@"))
+    assert setup["with"]["cache"] == "npm"
+    cache = next(step for step in steps if step.get("uses", "").startswith("actions/cache@"))
+    assert cache["with"]["path"] == "node_modules"
+    assert "${{ runner.os }}" in cache["with"]["key"]
+    # Use the resolved Node version, so changing setup-node invalidates the tree.
+    assert setup.get("id")
+    node_version = "${{ steps." + setup["id"] + ".outputs.node-version }}"
+    assert node_version in cache["with"]["key"]
+    assert "${{ hashFiles('package-lock.json') }}" in cache["with"]["key"]
+    assert not cache["with"].get("restore-keys")
+    install = next(step for step in steps if step.get("run") == "npm ci")
+    assert install["if"] == f"steps.{cache['id']}.outputs.cache-hit != 'true'"
+    build = next(step for step in steps if step.get("name") == "Typecheck and build React app")
+    assert build["timeout-minutes"] == 5
+    assert build["run"].splitlines() == ["npm run test", "npm run build"]
+    assert steps.index(setup) < steps.index(cache) < steps.index(install) < steps.index(build)
+
+
 def test_ci_runs_the_committed_live_image_proof() -> None:
     workflow = (ROOT / ".github/workflows/tests.yml").read_text(encoding="utf-8")
     proof = (ROOT / "scripts/worklink_image_identity.py").read_text(encoding="utf-8")
