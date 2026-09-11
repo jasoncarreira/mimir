@@ -815,6 +815,7 @@ async def test_factory_runs_detail_loads_record_with_minted_run_id(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("operation", ["detail", "archive"])
 @pytest.mark.parametrize(
     ("unsafe_path", "error_code"),
     [
@@ -832,6 +833,7 @@ async def test_factory_runs_detail_rejects_unsafe_run_ids(
     monkeypatch: pytest.MonkeyPatch,
     unsafe_path: str,
     error_code: str,
+    operation: str,
 ):
     monkeypatch.setenv("WORKLINK_REPO", str(tmp_path))
     home = tmp_path / "home"
@@ -853,7 +855,11 @@ async def test_factory_runs_detail_rejects_unsafe_run_ids(
 
     client = TestClient(TestServer(app))
     async with client as cli:
-        resp = await cli.get(URL(f"/api/v1/factory-runs/{unsafe_path}", encoded=True))
+        path = f"/api/v1/factory-runs/{unsafe_path}"
+        resp = (
+            await cli.post(URL(path + "/archive", encoded=True), json={"reason": "cleanup"})
+            if operation == "archive" else await cli.get(URL(path, encoded=True))
+        )
         assert resp.status == 400
         data = await resp.json()
         assert data["ok"] is False
@@ -924,7 +930,8 @@ async def test_factory_runs_detail_rejects_symlinked_parent_directory(
 
 
 @pytest.mark.asyncio
-async def test_factory_runs_detail_not_found(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+@pytest.mark.parametrize("operation", ["detail", "archive"])
+async def test_factory_runs_detail_not_found(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, operation: str):
     monkeypatch.setenv("WORKLINK_REPO", str(tmp_path))
     home = tmp_path / "home"
     home.mkdir()
@@ -935,10 +942,160 @@ async def test_factory_runs_detail_not_found(tmp_path: Path, monkeypatch: pytest
 
     client = TestClient(TestServer(app))
     async with client as cli:
-        resp = await cli.get("/api/v1/factory-runs/999")
+        resp = (
+            await cli.post("/api/v1/factory-runs/999/archive", json={"reason": "cleanup"})
+            if operation == "archive" else await cli.get("/api/v1/factory-runs/999")
+        )
         assert resp.status == 404
         data = await resp.json()
         assert data["ok"] is False
+        assert data["error"]["code"] == "run_not_found"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "process_state",
+    ["dead", "live", "permission_denied", "unreadable_ticks", "missing_handle", "missing_ticks", "audit_failure"],
+)
+async def test_factory_runs_archive_authorization_and_liveness(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, process_state: str,
+):
+    from mimir import event_logger
+    from mimir.event_logger import EventLogger
+    from mimir.server import _make_auth_middleware
+    from mimir.worklink import factory_state
+    from mimir.worklink.compute import LaunchHandle
+
+    home = tmp_path / "home"
+    home.mkdir()
+    key = issue_web_key(home, "alice", roles=["user"])
+    admin_key = issue_web_key(home, "bob", roles=["admin"])
+    resolver = IdentityResolver(home)
+    resolver.reload()
+    assert not resolver.identity("alice").access.is_admin
+    events = tmp_path / "events.jsonl"
+    logger = EventLogger(events, session_id="archive-test")
+    monkeypatch.setattr(event_logger, "_logger", logger)
+    if process_state == "audit_failure":
+        def fail_audit(*args, **kwargs):
+            raise OSError("audit disk unavailable")
+        monkeypatch.setattr(logger, "_append_record_sync", fail_audit)
+
+    def probe(pid, signal):
+        assert (pid, signal) == (987654, 0)
+        if process_state in {"dead", "audit_failure"}:
+            raise ProcessLookupError
+        if process_state == "permission_denied":
+            raise PermissionError
+
+    monkeypatch.setattr(factory_state.os, "kill", probe)
+    monkeypatch.setattr(factory_state, "process_is_zombie", lambda pid: False)
+    monkeypatch.setattr(
+        factory_state, "process_start_ticks",
+        lambda pid: None if process_state == "unreadable_ticks" else 123,
+    )
+    run_id = epic_run_id(1620)
+    sandbox = tmp_path / run_id
+    sandbox.mkdir()
+    marker = sandbox / "retained.txt"
+    marker.write_text("keep checkout and manifests")
+    record = FactoryRunRecord(
+        run_id=run_id, issue_id=1620, attempt=2, repository="owner/repo",
+        base_ref="main", branch="worklink/1620", launcher="/opt/factory/bin/factory.js",
+        sandbox=str(sandbox), session="session-1",
+        handle=None if process_state == "missing_handle" else LaunchHandle(
+            substrate="local_subprocess", identifier="987654", shim_pid=987654,
+            process_start_ticks=None if process_state == "missing_ticks" else 123,
+        ),
+        status=None, observed_at="2026-09-11T10:00:00Z", controller_phase="running",
+    )
+    save_factory_record(home, record)
+    source = factory_state.factory_record_path(home, run_id)
+    original = source.read_bytes()
+    app = web.Application(middlewares=[_make_auth_middleware("master-secret")])
+    app["identity_resolver"] = resolver
+    web_ui.register_routes(app, turns_log=tmp_path / "turns", events_log=events, home=home)
+    async with TestClient(TestServer(app)) as client:
+        headers = {"X-API-Key": admin_key}
+        unauthorized = await client.post(f"/api/v1/factory-runs/{run_id}/archive", json={"reason": "cleanup"})
+        assert unauthorized.status == 401
+        forbidden = await client.post(
+            f"/api/v1/factory-runs/{run_id}/archive", headers={"X-API-Key": key},
+            json={"reason": "cleanup"},
+        )
+        assert forbidden.status == 403
+        assert source.read_bytes() == original
+        assert not events.exists()
+        for path in ("/api/v1/factory-runs", f"/api/v1/factory-runs/{run_id}"):
+            response = await client.get(path, headers=headers)
+            assert response.status == 200
+            data = (await response.json())["data"]
+            summary = data["runs"][0] if "runs" in data else data
+            assert summary["clearable"] is (process_state in {"dead", "audit_failure"})
+        response = await client.post(
+            f"/api/v1/factory-runs/{run_id}/archive", headers=headers,
+            json={"reason": "  clear stale run  ", "operator": "mallory", "principal": "mallory"},
+        )
+        payload = await response.json()
+        validate_api_envelope(payload)
+        if process_state == "dead":
+            assert response.status == 200
+            assert payload["data"] == {"run_id": run_id, "archived": True}
+            assert not source.exists()
+            audits = [json.loads(line) for line in events.read_text().splitlines()]
+            assert len(audits) == 1
+            audit = audits[0]
+            assert audit["type"] == "worklink_factory_record_archived"
+            assert audit["source"] == "web_ui"
+            assert audit["reason"] == "web archive by bob: clear stale run"
+            assert audit["run_id"] == run_id
+            assert audit["issue_id"] == 1620
+            assert audit["attempt"] == 2
+            assert audit["session"] == "session-1"
+            assert audit["phase"] == "running"
+            assert Path(audit["archive_path"]).read_bytes() == original
+            response = await client.get("/api/v1/factory-runs", headers=headers)
+            assert (await response.json())["data"]["runs"] == []
+            response = await client.post(
+                f"/api/v1/factory-runs/{run_id}/archive", headers=headers, json={"reason": "repeat"},
+            )
+            assert response.status == 404
+        else:
+            assert response.status == (500 if process_state == "audit_failure" else 409)
+            assert payload["error"]["code"] == (
+                "run_archive_failed" if process_state == "audit_failure" else "run_not_verified_dead"
+            )
+            assert source.read_bytes() == original
+            assert not events.exists()
+            archive = factory_state.factory_record_archive_dir(home)
+            assert not archive.exists() or list(archive.iterdir()) == []
+        assert marker.read_text() == "keep checkout and manifests"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("body", [{}, {"reason": ""}, {"reason": "  "}, {"reason": 1}, [], None, "malformed"])
+async def test_factory_runs_archive_rejects_invalid_reason(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, body):
+    record = FactoryRunRecord(
+        run_id="1620", issue_id=1620, attempt=1, repository="owner/repo",
+        base_ref="main", branch="worklink/1620", launcher="/opt/factory/bin/factory.js",
+        sandbox=str(tmp_path / "sandbox"), session=None, handle=None, status=None,
+        observed_at=None, controller_phase="terminal",
+    )
+    save_factory_record(tmp_path, record)
+    monkeypatch.setattr(
+        web_ui, "factory_process_is_verified_dead",
+        lambda record: pytest.fail("invalid reason reached liveness check"),
+    )
+    app = web.Application()
+    web_ui.register_routes(app, turns_log=tmp_path / "turns", events_log=tmp_path / "events", home=tmp_path)
+    async with TestClient(TestServer(app)) as client:
+        response = await client.post(
+            "/api/v1/factory-runs/1620/archive",
+            data="{" if body == "malformed" else json.dumps(body),
+            headers={"Content-Type": "application/json"},
+        )
+        assert response.status == 400
+        assert (await response.json())["error"]["code"] == "invalid_reason"
 
 
 @pytest.mark.asyncio

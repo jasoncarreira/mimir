@@ -1,7 +1,8 @@
-import { useQuery } from "@tanstack/react-query";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import React from "react";
 import { Link, useSearchParams } from "react-router-dom";
 import {
+  archiveFactoryRun,
   getFactoryRun,
   getFactoryRuns,
   type FactoryRunDetail,
@@ -11,7 +12,9 @@ import type { DashboardSurface } from "../dashboardExtensions";
 import { sanitizeHref } from "../routeState";
 import {
   Badge,
+  Button,
   CodeBlock,
+  Dialog,
   EmptyState,
   ErrorState,
   LoadingState,
@@ -232,6 +235,22 @@ export function RunDetail({ runId }: { runId: string }) {
 
 export function FactoryRunsRoute({ surface }: FactoryRunsRouteProps) {
   const [searchParams, setSearchParams] = useSearchParams();
+  const client = useQueryClient();
+  const [archiveRunId, setArchiveRunId] = React.useState<string | null>(null);
+  const [reason, setReason] = React.useState("");
+  const archiveInFlight = React.useRef(false);
+  const archive = useMutation({
+    mutationFn: ({ runId, reason }: { runId: string; reason: string }) => archiveFactoryRun(runId, { reason }),
+    retry: false,
+    onSuccess: async () => {
+      await client.invalidateQueries({ queryKey: ["factory-runs"] });
+      setArchiveRunId(null);
+    },
+    onSettled: () => { archiveInFlight.current = false; }
+  });
+  const closeArchive = () => {
+    if (!archiveInFlight.current) setArchiveRunId(null);
+  };
   const runId = searchParams.get("run");
   const { data, isLoading, error } = useQuery({
     queryKey: ["factory-runs"],
@@ -258,17 +277,50 @@ export function FactoryRunsRoute({ surface }: FactoryRunsRouteProps) {
       <DashboardHeader surface={surface} />
       <div className="factory-runs__list">
         {runs.map((run) => (
-          <RunCard
-            key={run.run_id}
-            onClick={() => {
-              const params = new URLSearchParams(searchParams);
-              params.set("run", run.run_id);
-              setSearchParams(params);
-            }}
-            run={run}
-          />
+          <div key={run.run_id}>
+            <RunCard
+              onClick={() => {
+                const params = new URLSearchParams(searchParams);
+                params.set("run", run.run_id);
+                setSearchParams(params);
+              }}
+              run={run}
+            />
+            {run.clearable ? (
+              <Button
+                aria-label={`Archive run ${run.run_id}`}
+                disabled={archive.isPending}
+                onClick={() => {
+                  archive.reset();
+                  setReason("");
+                  setArchiveRunId(run.run_id);
+                }}
+              >Archive</Button>
+            ) : null}
+          </div>
         ))}
       </div>
+      <Dialog open={archiveRunId !== null} title={`Archive run ${archiveRunId}?`} onClose={closeArchive}>
+        <p className="app-copy">Archive run {archiveRunId} to remove it from this list. This does not delete the run.</p>
+        <form onSubmit={(event) => {
+          event.preventDefault();
+          if (!archiveRunId || !reason.trim() || archiveInFlight.current) return;
+          archiveInFlight.current = true;
+          archive.mutate({ runId: archiveRunId, reason: reason.trim() });
+        }}>
+          <label>
+            Archive reason
+            <textarea className="ui-input" required disabled={archive.isPending} value={reason} onChange={(event) => setReason(event.target.value)} />
+          </label>
+          <div className="route-state-form__actions">
+            <Button type="button" disabled={archive.isPending} onClick={closeArchive}>Cancel</Button>
+            <Button type="submit" variant="primary" disabled={archive.isPending || !reason.trim()}>
+              {archive.isPending ? "Archiving..." : "Confirm archive"}
+            </Button>
+          </div>
+        </form>
+        {archive.error ? <ErrorState title="Archive failed">{archive.error.message}</ErrorState> : null}
+      </Dialog>
     </div>
   );
 }
