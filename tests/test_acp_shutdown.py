@@ -488,6 +488,10 @@ asyncio.run(run())
 
 @pytest.mark.asyncio
 @pytest.mark.timeout(120)
+@pytest.mark.skipif(
+    sys.platform != "linux",
+    reason="C-delivery handshake relies on Linux socketpair MSG_WAITALL readability semantics",
+)
 async def test_shutdown_journal_wakeup_without_python_signal_handler(tmp_path: Path) -> None:
     progress = tmp_path / "child-progress"
     source = _journal_source(progress) + r'''
