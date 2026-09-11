@@ -9,6 +9,7 @@ from collections import deque
 from collections.abc import Mapping
 from contextvars import ContextVar
 from dataclasses import dataclass, field, replace
+from functools import wraps
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -91,6 +92,18 @@ ACP_DISCONNECT_TIMEOUT_SECONDS = 1.0
 ACP_AUDIT_EVENT_LIMIT = 256
 ACP_SESSION_SWEEP_INTERVAL_SECONDS = 60 * 60
 _LOGGER = logging.getLogger(__name__)
+
+
+def _uses_journal(method):
+    @wraps(method)
+    async def guarded(self, *args, **kwargs):
+        task = asyncio.current_task()
+        self._journal_users[task] = set()
+        try:
+            return await method(self, *args, **kwargs)
+        finally:
+            self._journal_users.pop(task, None)
+    return guarded
 
 
 @dataclass(frozen=True)
@@ -389,6 +402,7 @@ class MimirAcpAgent:
         )
         self._last_sweep: float | None = None
         self._sweep_lock = asyncio.Lock()
+        self._journal_users: dict[asyncio.Task[Any], set[str]] = {}
         self._journals = JournalCache(self._store)
         self._client: Client | None = None
         self._generation = 0
@@ -526,6 +540,7 @@ class MimirAcpAgent:
             task.add_done_callback(_consume_background_task)
         return AuthenticateResponse()
 
+    @_uses_journal
     async def new_session(self, cwd: str, additional_directories: list[str] | None = None, mcp_servers: object | None = None, **kwargs: Any) -> NewSessionResponse:
         owner = await self._begin_stateful()
         self._validate_directories(additional_directories)
@@ -538,6 +553,7 @@ class MimirAcpAgent:
         state: SessionState | None = None
         try:
             record = self._store.create_owned_session(owner)
+            self._journal_users[asyncio.current_task()].add(record.session_id)
             self._journals.open(record, client)
             state = SessionState(record, SessionEnvironment(cwd, copy.deepcopy(mcp_servers)), self._generation, declaration, MIMIR_HANDS_V1 if declaration else None)
             await self._admit_provider(state, include_schema_diagnostics=True)
@@ -556,8 +572,10 @@ class MimirAcpAgent:
         self._install_state(state)
         return NewSessionResponse(sessionId=record.session_id)
 
+    @_uses_journal
     async def load_session(self, cwd: str, session_id: str, mcp_servers: object | None = None, additional_directories: list[str] | None = None, **kwargs: Any) -> LoadSessionResponse | None:
         owner = await self._begin_stateful()
+        self._journal_users[asyncio.current_task()].add(session_id)
         self._validate_directories(additional_directories)
         client = self._require_client()
         declaration = self._validate_declaration(cwd, mcp_servers)
@@ -589,8 +607,10 @@ class MimirAcpAgent:
         self._install_state(state)
         return LoadSessionResponse()
 
+    @_uses_journal
     async def prompt(self, session_id: str, prompt: list[Any], **kwargs: Any) -> PromptResponse:
         owner = await self._begin_stateful()
+        self._journal_users[asyncio.current_task()].add(session_id)
         blocks = self._validate_prompt(prompt)
         client = self._require_client()
         state = self._sessions.get(session_id)
@@ -1025,22 +1045,39 @@ class MimirAcpAgent:
             )
         ):
             raise auth_required_error()
-        now = asyncio.get_running_loop().time()
-        if (
-            self._last_sweep is None
-            or now - self._last_sweep >= ACP_SESSION_SWEEP_INTERVAL_SECONDS
-        ):
-            async with self._sweep_lock:
-                now = asyncio.get_running_loop().time()
-                if (
-                    self._last_sweep is None
-                    or now - self._last_sweep >= ACP_SESSION_SWEEP_INTERVAL_SECONDS
-                ):
-                    try:
-                        await asyncio.to_thread(self._store.sweep, self._ttl_days)
-                    except BaseException:
-                        raise internal_error() from None
-                    self._last_sweep = now
+        # Every admission waits, even if another request has already swept.
+        # Pins are acquired without yielding after this gate, so the worker's
+        # snapshot covers all journal users until deletion has finished.
+        async with self._sweep_lock:
+            now = asyncio.get_running_loop().time()
+            if (
+                self._last_sweep is None
+                or now - self._last_sweep >= ACP_SESSION_SWEEP_INTERVAL_SECONDS
+            ):
+                try:
+                    protected = set(self._sessions)
+                    for connection_state in self._connections.values():
+                        protected.update(connection_state.bound_sessions)
+                    for sessions in self._journal_users.values():
+                        protected.update(sessions)
+                    worker = asyncio.create_task(asyncio.to_thread(
+                        self._store.sweep, self._ttl_days,
+                        protected_sessions=frozenset(protected),
+                    ))
+                    cancelled = False
+                    while not worker.done():
+                        try:
+                            await asyncio.shield(worker)
+                        except asyncio.CancelledError:
+                            # Cancelling to_thread does not stop deletion.
+                            # Keep admissions fenced until it really ends.
+                            cancelled = True
+                    worker.result()
+                    if cancelled:
+                        raise asyncio.CancelledError
+                except BaseException:
+                    raise internal_error() from None
+                self._last_sweep = now
         if connection is None:
             if self._auth_context is not auth_context:
                 raise auth_required_error()
