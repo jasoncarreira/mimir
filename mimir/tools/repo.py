@@ -271,7 +271,9 @@ def _remediation_test_guidance(code: str, *, scoped: bool) -> str:
     )
     if scoped and code != "tests_passed":
         return "Hold publication: scoped tests must pass before pushing; this scoped run did not pass."
-    if code == "test_timeout":
+    # Overflow stops execution, so even a nonzero exit is incomplete evidence,
+    # not an observed completed failing suite. Scoped runs remain blocked above.
+    if code in {"test_timeout", "test_output_overflow", "tests_failed_output_overflow"}:
         return (
             "the contained runner did not complete the suite; this is not test evidence "
             "either way — push and rely on CI. " + publish

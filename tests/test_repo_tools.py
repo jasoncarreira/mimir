@@ -106,6 +106,10 @@ def test_bounded_subprocess_runner_killpg_guard(monkeypatch, error):
 @pytest.mark.asyncio
 @pytest.mark.parametrize("code,scoped,decision", [
     ("test_timeout", False, "publish"),
+    ("test_output_overflow", False, "publish"),
+    ("tests_failed_output_overflow", False, "publish"),
+    ("test_output_overflow", True, "hold"),
+    ("tests_failed_output_overflow", True, "hold"),
     ("test_snapshot_unavailable", False, "publish"),
     ("test_containment_unavailable", False, "publish"),
     ("tests_failed", False, "hold"),
@@ -121,13 +125,20 @@ def test_bounded_subprocess_runner_killpg_guard(monkeypatch, error):
 async def test_remediation_publication_decision_table(monkeypatch, code, scoped, decision):
     from mimir.tools import repo as repo_module
 
+    result_codes = {
+        "tests_passed", "tests_failed", "test_timeout",
+        "test_output_overflow", "tests_failed_output_overflow",
+    }
+
     async def execute(self, selectors, *, suite):
         assert bool(selectors) is scoped
-        if code not in {"tests_passed", "tests_failed", "test_timeout"}:
+        if code not in result_codes:
             raise ProjectTestRefusal(code, "unavailable", execution_started=False)
         return ProjectTestResult(
             code == "tests_passed", code,
-            None if code == "test_timeout" else (0 if code == "tests_passed" else 1),
+            None if code == "test_timeout" else (
+                0 if code in {"tests_passed", "test_output_overflow"} else 1
+            ),
             stdout="1 failed, 2 passed\nFAILED tests/test_fix.py::test_fix"
             if code == "tests_failed" else "",
         )
@@ -135,7 +146,7 @@ async def test_remediation_publication_decision_table(monkeypatch, code, scoped,
     monkeypatch.setattr(repo_module, "_state", lambda *args: object())
     monkeypatch.setattr(repo_module.RepoProjectTests, "execute", execute)
     selectors = ("tests/test_fix.py",) if scoped else ()
-    if code not in {"tests_passed", "tests_failed", "test_timeout"}:
+    if code not in result_codes:
         with pytest.raises(ToolException) as error:
             await repo_module.repo_test.coroutine("owner/repo", 42, selectors)
         guidance = str(error.value).split("\n", 1)[1]
@@ -146,13 +157,18 @@ async def test_remediation_publication_decision_table(monkeypatch, code, scoped,
         assert result["ok"] is (code == "tests_passed")
         guidance = result["remediation_guidance"]
 
+    if decision != "refuse":
+        assert guidance != (
+            "Resolve this refusal; it does not authorize publication or bypass repository policy."
+        )
+
     if decision == "publish":
         assert not guidance.startswith("Hold publication")
         assert "After scoped tests pass, commit, push" in guidance
         assert "re-request review" in guidance
         assert "did not complete (not failed)" in guidance
         assert "CI is the validation surface" in guidance
-        if code == "test_timeout":
+        if code in {"test_timeout", "test_output_overflow", "tests_failed_output_overflow"}:
             assert "the contained runner did not complete the suite; this is not test evidence either way — push and rely on CI" in guidance
     elif decision == "hold":
         assert guidance.startswith("Hold publication")
