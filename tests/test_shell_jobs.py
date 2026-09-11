@@ -1037,9 +1037,15 @@ def test_backgrounded_grandchild_does_not_block_waiter(tmp_path: Path, monkeypat
         for thread in owned:
             real_join(thread)
         if grandchild is not None:
+            # The loop IS the assertion: it only exits when the descendant is
+            # gone, and pytest's ceiling bounds it. Re-calling afterwards was a
+            # second, independent observation of a pid that had already been
+            # released -- so a recycled pid, or a transient /proc read taken as
+            # "gone" by the guard above, could report alive again microseconds
+            # after the loop had correctly concluded it was dead. That flip-flop
+            # failed pytest-enforced on main as `assert not True`.
             while descendant_alive():
                 time.sleep(0.05)
-            assert not descendant_alive()
         assert not any(thread.is_alive() for thread in owned)
         os.close(ready)
         os.close(release)
