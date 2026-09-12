@@ -34,6 +34,7 @@ from __future__ import annotations
 import logging
 import sqlite3
 import threading
+from collections.abc import Iterable
 
 import numpy as np
 
@@ -249,6 +250,15 @@ class VectorIndex:
             FROM sessions
             WHERE embedding IS NOT NULL
         """).fetchall()
+        self.build_from_session_rows(rows)
+
+    def build_from_session_rows(
+        self, rows: Iterable[tuple[str, bytes | None, int | None]],
+    ) -> None:
+        """Build from an already-selected pool without reading other sessions."""
+        if not FAISS_AVAILABLE:
+            self._built = True
+            return
 
         ids: list[str] = []
         vecs: list[np.ndarray] = []
@@ -284,7 +294,7 @@ class VectorIndex:
         n = len(vecs)
 
         with self._lock:
-            # Sessions are always small — IndexFlatIP is fast enough forever.
+            # Exact cosine search over the supplied session pool.
             self._index = faiss.IndexFlatIP(self.dimension)
             self._index.add(matrix)
             self._id_to_pos = {}
