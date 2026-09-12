@@ -303,7 +303,10 @@ async def test_start_mcp_servers_returns_tools_and_policy_attention(
 
 
 @pytest.mark.asyncio
-async def test_start_mcp_servers_failure_shuts_down_and_returns_no_manager() -> None:
+async def test_start_mcp_servers_failure_shuts_down_and_returns_no_manager(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("mimir.server.log_event", AsyncMock())
     manager = MagicMock()
     manager.start_servers = AsyncMock(side_effect=RuntimeError("start failed"))
     manager.shutdown = AsyncMock()
@@ -316,7 +319,10 @@ async def test_start_mcp_servers_failure_shuts_down_and_returns_no_manager() -> 
 
 
 @pytest.mark.asyncio
-async def test_start_mcp_servers_retains_manager_when_failure_shutdown_fails() -> None:
+async def test_start_mcp_servers_retains_manager_when_failure_shutdown_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("mimir.server.log_event", AsyncMock())
     manager = MagicMock()
     manager.start_servers = AsyncMock(side_effect=RuntimeError("start failed"))
     manager.shutdown = AsyncMock(side_effect=RuntimeError("shutdown failed"))
@@ -351,6 +357,104 @@ async def test_start_mcp_servers_emits_operator_event_for_skipped_server(
     assert returned_manager is manager
     assert tools == []
     assert events == [("mcp_server_start_failed", manager.startup_failures[0])]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("defect", ["collision", "duplicate_batch", "missing_provenance", None])
+async def test_mcp_acceptance_writes_events_and_preserves_healthy_servers(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, defect: str | None,
+) -> None:
+    from mimir.event_logger import EventLogger
+    from mimir.mcp_client import MCPManager, MCPProvenance, MCPServerConfig
+
+    events_path = tmp_path / "events.jsonl"
+    monkeypatch.setattr("mimir.server.log_event", EventLogger(events_path, "mcp-test").log)
+    configs = [
+        MCPServerConfig(name=name, command="unused", args=[], server_config_id=name)
+        for name in ("healthy", "candidate", "later")
+    ]
+
+    def tool(config: Any, name: str) -> Any:
+        return SimpleNamespace(
+            name=name,
+            mcp_provenance=MCPProvenance.create(config, name, {}),
+        )
+
+    healthy = tool(configs[0], "mcp_healthy_read")
+    candidate = tool(configs[1], "mcp_candidate_read")
+    later = tool(configs[2], candidate.name if defect else "mcp_later_read")
+    batches = [[healthy], [candidate], [later]]
+    if defect == "collision":
+        batches[1].append(tool(configs[1], healthy.name))
+    elif defect == "duplicate_batch":
+        batches[1].append(tool(configs[1], candidate.name))
+    elif defect == "missing_provenance":
+        batches[1].append(SimpleNamespace(name="mcp_unstamped"))
+    connections = [
+        SimpleNamespace(
+            discover_tools=AsyncMock(return_value=batch),
+            exit_stack=SimpleNamespace(aclose=AsyncMock()),
+        )
+        for batch in batches
+    ]
+    manager = MCPManager()
+    monkeypatch.setattr(manager, "_connect", AsyncMock(side_effect=connections))
+    try:
+        returned_manager, tools = await _start_mcp_servers(manager, configs)
+        assert returned_manager is manager
+        assert tools == ([healthy, later] if defect else [healthy, candidate, later])
+        assert manager.connections == connections
+        for connection in connections:
+            connection.exit_stack.aclose.assert_not_awaited()
+        records = [json.loads(line) for line in events_path.read_text().splitlines()]
+        failures = [record for record in records if record["type"] == "mcp_server_start_failed"]
+        assert len(failures) == (1 if defect else 0)
+        if defect:
+            assert failures[0]["server_config_id"] == "candidate"
+            assert failures[0]["server_name"] == "candidate"
+            expected_error = "missing provenance" if defect == "missing_provenance" else "display-name collision"
+            assert expected_error in failures[0]["error"]
+        assert not any(record["type"] == "mcp_startup_failed" for record in records)
+        ready = [record for record in records if record["type"] == "mcp_servers_ready"]
+        assert len(ready) == 1
+        assert ready[0]["tool_names"] == [tool.name for tool in tools]
+        assert ready[0]["count"] == len(tools)
+    finally:
+        await manager.shutdown()
+    for connection in connections:
+        connection.exit_stack.aclose.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("shutdown_fails", [False, True])
+@pytest.mark.parametrize("prior_failure", [False, True])
+async def test_mcp_global_abort_writes_events_before_return(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    shutdown_fails: bool, prior_failure: bool,
+) -> None:
+    from mimir.event_logger import EventLogger
+
+    events_path = tmp_path / "events.jsonl"
+    monkeypatch.setattr("mimir.server.log_event", EventLogger(events_path, "mcp-abort-test").log)
+    failure = {"server_config_id": "broken-id", "server_name": "broken", "error": "invalid tools"}
+    manager = SimpleNamespace(
+        start_servers=AsyncMock(side_effect=RuntimeError("global startup abort")),
+        shutdown=AsyncMock(side_effect=RuntimeError("cleanup failed") if shutdown_fails else None),
+        startup_failures=[failure] if prior_failure else [],
+    )
+
+    returned_manager, tools = await _start_mcp_servers(manager, [])
+
+    assert returned_manager is (manager if shutdown_fails else None)
+    assert tools == []
+    manager.shutdown.assert_awaited_once()
+    records = [json.loads(line) for line in events_path.read_text().splitlines()]
+    assert [record["type"] for record in records] == (
+        ["mcp_startup_failed", "mcp_server_start_failed"] if prior_failure else ["mcp_startup_failed"]
+    )
+    assert records[0]["error"] == "global startup abort"
+    if prior_failure:
+        assert {key: records[1][key] for key in failure} == failure
 
 
 def test_runtime_field_proxies_delegate_and_fail_closed() -> None:

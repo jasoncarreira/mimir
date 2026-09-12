@@ -844,8 +844,15 @@ class TestMCPDurableIdentity:
             "a": _FakeSession([_FakeMCPTool("b_c")]),
         })
 
-        with pytest.raises(ValueError, match="display-name collision"):
-            await MCPManager().start_servers(configs)
+        manager = MCPManager()
+        try:
+            tools = await manager.start_servers(configs)
+            assert [tool.name for tool in tools] == ["mcp_a_b_c"]
+            assert len(manager.startup_failures) == 1
+            assert manager.startup_failures[0]["server_config_id"] == "server-a"
+            assert "display-name collision" in manager.startup_failures[0]["error"]
+        finally:
+            await manager.shutdown()
 
     @pytest.mark.asyncio
     async def test_duplicate_explicit_id_fails_before_connect(
@@ -1925,3 +1932,75 @@ class TestProductionMCPPolicyWiring:
         assert shadow_failed.is_shadow_decision is True
         assert shadow_failed.reason == "mcp_adapter_exception"
         clear_mcp_adapter_registry()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("hostile", [False, True])
+async def test_discovery_prompt_boundary(tmp_path, monkeypatch, hostile):
+    from contextlib import AsyncExitStack
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+    from mimir import event_logger
+    from mimir.mcp_client import (
+        MCPConnection, MAX_MCP_DESCRIPTION_LENGTH, MAX_MCP_TOOLS_PER_SERVER,
+    )
+
+    path = tmp_path / "events.jsonl"
+    monkeypatch.setattr(event_logger, "_logger", event_logger.EventLogger(path, "boundary"))
+    description = "Useful documentation.\nWith details."
+    if hostile:
+        description = "\x00\u202e" + "x" * 2_000_000
+    schema = {"type": "object", "properties": {
+        "query": {"type": "string", "description": description},
+        "other": {"type": "string", "description": description},
+    }}
+    remote = [SimpleNamespace(name="search-1", description=description, inputSchema=schema)]
+    if hostile:
+        remote += [SimpleNamespace(name="bad/name", description="bad", inputSchema={})]
+        remote += [SimpleNamespace(name=f"tool_{i}", description="ok", inputSchema={}) for i in range(5000)]
+    conn = MCPConnection(
+        MCPServerConfig(name="docs", command="unused", args=[]),
+        AsyncMock(list_tools=AsyncMock(return_value=SimpleNamespace(tools=remote))),
+        AsyncExitStack(),
+    )
+    tools = await conn.discover_tools()
+    assert len(tools) == (MAX_MCP_TOOLS_PER_SERVER - 1 if hostile else 1)
+    assert all("bad" not in tool.name for tool in tools)
+    tool = tools[0]
+    assert len(tool.description) <= MAX_MCP_DESCRIPTION_LENGTH
+    field_descriptions = [p["description"] for p in tool.args_schema.model_json_schema()["properties"].values()]
+    assert sum(map(len, field_descriptions)) <= MAX_MCP_DESCRIPTION_LENGTH
+    assert all("\x00" not in text and "\u202e" not in text for text in [tool.description, *field_descriptions])
+    # Sanitization must not change the remote schema used for provenance hashing.
+    assert schema["properties"]["query"]["description"] == description
+    events = [json.loads(line) for line in path.read_text().splitlines()] if path.exists() else []
+    if hostile:
+        assert {event["type"] for event in events} == {
+            "mcp_tools_dropped", "mcp_tool_rejected", "mcp_tool_description_bounded",
+        }
+        assert all(event["server_name"] == "docs" for event in events)
+        assert next(e for e in events if e["type"] == "mcp_tools_dropped")["dropped"] == len(remote) - MAX_MCP_TOOLS_PER_SERVER
+    else:
+        assert tool.description.startswith(description + "\n\nParameters:")
+        assert field_descriptions == [description, description]
+        assert events == []
+
+
+@pytest.mark.parametrize("name", ["", "bad.name", "bad/name", "bad name", "bad\n", "caf\u00e9", "x" * 56])
+def test_bridge_rejects_invalid_names(name):
+    from unittest.mock import AsyncMock
+    from mimir.mcp_client import _bridge_mcp_tool
+
+    with pytest.raises(ValueError, match="MCP tool name"):
+        _bridge_mcp_tool(server_name="docs", tool_name=name, description="ok", input_schema={}, session=AsyncMock())
+
+
+def test_bridge_accepts_maximum_valid_name():
+    from unittest.mock import AsyncMock
+    from mimir.mcp_client import _bridge_mcp_tool
+
+    name = "A_0-" + "x" * 51
+    tool = _bridge_mcp_tool(server_name="docs", tool_name=name, description="ok", input_schema={}, session=AsyncMock())
+    assert tool.name == "mcp_docs_" + name
+    assert len(tool.name) == 64
+    assert tool.description == "ok"

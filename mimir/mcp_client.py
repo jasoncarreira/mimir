@@ -39,6 +39,7 @@ import logging
 import os
 import re
 import threading
+import unicodedata
 import uuid
 from contextlib import AsyncExitStack
 from dataclasses import dataclass, replace
@@ -51,6 +52,7 @@ from mcp.client.stdio import stdio_client
 from pydantic import Field, create_model
 
 from ._atomic import atomic_write_json
+from .event_logger import log_event_sync
 
 log = logging.getLogger(__name__)
 
@@ -59,6 +61,35 @@ log = logging.getLogger(__name__)
 DEFAULT_MCP_INITIALIZE_TIMEOUT_S = 30.0
 DEFAULT_MCP_CALL_TIMEOUT_S = 60.0
 DEFAULT_MCP_SHUTDOWN_TIMEOUT_S = 10.0
+
+# Keep a single server's repeated prompt overhead finite while accommodating
+# ordinary catalogs. 64 also leaves room for native tools in common 128-tool APIs.
+MAX_MCP_TOOLS_PER_SERVER = 64
+# Common model APIs require ASCII function names of at most 64 characters,
+# including our namespace. Reject rather than rewrite authoritative remote names.
+MAX_MCP_TOOL_NAME_LENGTH = 64
+# About a page of documentation per tool, plus one shared page for schema fields.
+# The field budget prevents many property descriptions bypassing the prose cap.
+MAX_MCP_DESCRIPTION_LENGTH = 4096
+
+
+def _validated_mcp_name(server_name: str, tool_name: str) -> str:
+    name = f"mcp_{server_name}_{tool_name}"
+    if (
+        not tool_name
+        or len(name) > MAX_MCP_TOOL_NAME_LENGTH
+        or re.fullmatch(r"[A-Za-z0-9_-]+", name) is None
+    ):
+        raise ValueError("MCP tool name must be ASCII alphanumeric/underscore/hyphen and fit the 64-character namespace")
+    return name
+
+
+def _bounded_mcp_description(text: str, limit: int) -> str:
+    # Preserve ordinary multiline documentation, not terminal/bidi controls.
+    return "".join(
+        char for char in text[:limit]
+        if char in "\n\t" or unicodedata.category(char) not in {"Cc", "Cf", "Cs"}
+    )
 
 # Matches ``${VAR_NAME}`` anywhere in a string. Pre-fix the parser only
 # accepted the exact form ``^${VAR}$`` — common operator patterns like
@@ -487,7 +518,23 @@ class MCPConnection:
         result = await self.session.list_tools()
         tools: list[StructuredTool] = []
         config_id = server_config_id or self.config.server_config_id
-        for mcp_tool in result.tools:
+        if len(result.tools) > MAX_MCP_TOOLS_PER_SERVER:
+            log_event_sync(
+                "mcp_tools_dropped", server_name=self.config.name,
+                server_config_id=config_id, reason="tool_count_limit",
+                limit=MAX_MCP_TOOLS_PER_SERVER,
+                dropped=len(result.tools) - MAX_MCP_TOOLS_PER_SERVER,
+            )
+        for index, mcp_tool in enumerate(result.tools[:MAX_MCP_TOOLS_PER_SERVER]):
+            try:
+                _validated_mcp_name(self.config.name, mcp_tool.name)
+            except ValueError:
+                log_event_sync(
+                    "mcp_tool_rejected", server_name=self.config.name,
+                    server_config_id=config_id, tool_index=index,
+                    reason="invalid_tool_name", limit=MAX_MCP_TOOL_NAME_LENGTH,
+                )
+                continue
             provenance = MCPProvenance.create(
                 config=self.config,
                 tool_name=mcp_tool.name,
@@ -775,14 +822,27 @@ class MCPManager:
         register_configured_mcp_adapters(configs)
         all_tools: list[StructuredTool] = []
         successful_config_ids: set[str] = set()
+        display_names: set[str] = set()
         for config in configs:
             try:
                 conn = await self._connect(config)
+                # Retain ownership even if discovery or acceptance fails.
+                self.connections.append(conn)
                 tools = await conn.discover_tools(
                     call_timeout_s=self._call_timeout,
                     server_config_id=config.server_config_id or None,
                 )
-                self.connections.append(conn)
+                server_names: set[str] = set()
+                for tool in tools:
+                    if get_tool_provenance(tool) is None:
+                        raise ValueError(f"MCP tool {tool.name!r} is missing provenance")
+                    if tool.name in display_names or tool.name in server_names:
+                        raise ValueError(
+                            f"MCP display-name collision for {tool.name!r}; "
+                            "display names are not authoritative identities"
+                        )
+                    server_names.add(tool.name)
+                display_names.update(server_names)
                 successful_config_ids.add(config.server_config_id)
                 all_tools.extend(tools)
                 log.info(
@@ -814,18 +874,6 @@ class MCPManager:
                 )
                 if fail_fast:
                     raise
-        display_identities: dict[str, str] = {}
-        for tool in all_tools:
-            provenance = get_tool_provenance(tool)
-            if provenance is None:
-                raise ValueError(f"MCP tool {tool.name!r} is missing provenance")
-            if tool.name in display_identities:
-                raise ValueError(
-                    f"MCP display-name collision for {tool.name!r}; "
-                    "display names are not authoritative identities"
-                )
-            display_identities[tool.name] = provenance.tool_id
-
         for tool in all_tools:
             provenance = get_tool_provenance(tool)
             assert provenance is not None
@@ -1003,7 +1051,25 @@ def _bridge_mcp_tool(
     Provenance is attached as a custom attribute for drift detection
     and authorization (chainlink #870).
     """
+    namespaced_name = _validated_mcp_name(server_name, tool_name)
+    original_description = description
+    description = _bounded_mcp_description(description, MAX_MCP_DESCRIPTION_LENGTH)
     properties = input_schema.get("properties", {})
+    bounded_properties = {}
+    field_budget = MAX_MCP_DESCRIPTION_LENGTH
+    changed_fields = 0
+    for prop_name, prop_info in properties.items():
+        prop_info = dict(prop_info)
+        original = prop_info.get("description", "")
+        bounded = _bounded_mcp_description(original, field_budget)
+        field_budget -= len(bounded)
+        if bounded != original:
+            changed_fields += 1
+        if "description" in prop_info:
+            prop_info["description"] = bounded
+        bounded_properties[prop_name] = prop_info
+    input_schema = {**input_schema, "properties": bounded_properties}
+    properties = bounded_properties
     required_fields = set(input_schema.get("required", []))
     schema_desc_parts: list[str] = []
     for prop_name, prop_info in properties.items():
@@ -1016,7 +1082,15 @@ def _bridge_mcp_tool(
         if schema_desc_parts
         else description
     )
-    namespaced_name = f"mcp_{server_name}_{tool_name}"
+    bounded_description = _bounded_mcp_description(full_description, MAX_MCP_DESCRIPTION_LENGTH)
+    if (description != original_description or bounded_description != full_description or changed_fields):
+        log_event_sync(
+            "mcp_tool_description_bounded", server_name=server_name,
+            tool_name=tool_name, limit=MAX_MCP_DESCRIPTION_LENGTH,
+            description_changed=(description != original_description or bounded_description != full_description),
+            schema_descriptions_changed=changed_fields,
+        )
+    full_description = bounded_description
     args_schema = _build_args_schema(namespaced_name, input_schema)
 
     async def _call_mcp_tool(**kwargs: Any) -> str:

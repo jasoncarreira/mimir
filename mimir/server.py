@@ -79,12 +79,16 @@ async def _start_mcp_servers(
     except Exception as exc:  # noqa: BLE001 — log + continue
         log.warning("MCP startup failed: %s", exc)
         mcp_tools = []
+        await log_event("mcp_startup_failed", error=str(exc))
+        for failure in getattr(mcp_manager, "startup_failures", []):
+            await log_event("mcp_server_start_failed", **failure)
+        retained_manager = None
         try:
             await mcp_manager.shutdown()
         except Exception as shutdown_exc:  # noqa: BLE001
             log.warning("MCP shutdown after startup failure failed: %s", shutdown_exc)
-            return mcp_manager, []
-        return None, []
+            retained_manager = mcp_manager
+        return retained_manager, []
     for failure in getattr(mcp_manager, "startup_failures", []):
         await log_event("mcp_server_start_failed", **failure)
     if mcp_tools:
