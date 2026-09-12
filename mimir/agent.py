@@ -169,8 +169,9 @@ NON_USER_QUERY_TRIGGERS: frozenset[str] = frozenset(
     {"saga_session_end", "scheduled_tick", "poller", "upgrade"}
 )
 
-NON_OPERATOR_USER_MESSAGE_SOURCES: frozenset[str] = frozenset(
-    {"", "web", "api", "stdin", "http"}
+# Only identity-attributed interactive adapters may establish trusted input.
+OPERATOR_USER_MESSAGE_SOURCES: frozenset[str] = frozenset(
+    {"slack", "discord", "web", "acp"}
 )
 
 # Autonomous-work triggers — cron-fired and poller-fired turns that
@@ -454,7 +455,9 @@ def _initialize_ifc_labels(
         event.trigger == "user_message"
         and bool(event.author)
         and HTTP_EVENT_INGRESS_EXTRA_KEY not in extra
-        and normalized_source not in NON_OPERATOR_USER_MESSAGE_SOURCES
+        and normalized_source in OPERATOR_USER_MESSAGE_SOURCES
+        and resolver is not None
+        and resolver.access_metadata(event.author).is_authorized
     ):
         integrity = Integrity.TRUSTED
     elif (

@@ -1839,6 +1839,10 @@ async def test_run_turn_no_injected_inputs_when_nothing_folded(tmp_path: Path):
     _mti._REGISTRY.clear()
     fake_agent = _FakeAgent(response_messages=[AIMessage(content="ok")])
     agent = _build_agent(tmp_path, fake_agent=fake_agent, fake_saga=None)
+    agent._identity_resolver = _resolver(
+        agent._config.home,
+        "people:\n  - canonical: alice\n    access: {roles: [user]}\n",
+    )
     record = await agent.run_turn(
         AgentEvent(
             trigger="user_message",
@@ -3067,6 +3071,11 @@ async def test_run_turn_persists_computed_operator_integrity(tmp_path: Path):
         fake_agent=_FakeAgent(response_messages=[AIMessage(content="ok")]),
         fake_saga=_FakeSaga(),
     )
+    resolver = _resolver(
+        agent._config.home,
+        "people:\n  - canonical: operator\n    access: {roles: [user]}\n",
+    )
+    agent._identity_resolver = resolver
     event = AgentEvent(
         trigger="user_message",
         channel_id="acp-session-1",
@@ -3074,7 +3083,7 @@ async def test_run_turn_persists_computed_operator_integrity(tmp_path: Path):
         author="operator",
         source="acp",
     )
-    computed_labels = _initialize_ifc_labels(event)
+    computed_labels = _initialize_ifc_labels(event, resolver=resolver)
 
     await agent.run_turn(event)
 
@@ -3082,7 +3091,52 @@ async def test_run_turn_persists_computed_operator_integrity(tmp_path: Path):
     assert all(source.integrity == "trusted" for source in computed_labels.sources)
     assert inbound.integrity == "trusted"
     assert event.ifc_labels is None
-    assert _initialize_ifc_labels(event) == computed_labels
+    assert _initialize_ifc_labels(event, resolver=resolver) == computed_labels
+
+
+@pytest.mark.parametrize("trusted", [True, False])
+async def test_run_turn_prompt_omits_ledger_untrusted_channel_memory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, trusted: bool,
+):
+    from mimir.access_control import (
+        _persisted_file_integrity,
+        initialize_file_integrity_ledger,
+        record_file_write_integrity,
+    )
+
+    home = tmp_path / "home"
+    relative = Path("memory/channels/discord-123/notes.md")
+    note = home / relative
+    note.parent.mkdir(parents=True)
+    note.write_text("CHANNEL_MEMORY_PAYLOAD", encoding="utf-8")
+    assert initialize_file_integrity_ledger(home)
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    assert record_file_write_integrity(
+        str(note), InformationFlowLabels() if trusted else None,
+    )
+    assert _persisted_file_integrity(home, relative) == (
+        "trusted" if trusted else "untrusted"
+    )
+
+    fake_agent = _FakeAgent(response_messages=[AIMessage(content="ok")])
+    agent = _build_agent(tmp_path, fake_agent=fake_agent)
+    agent._identity_resolver = _resolver(
+        home,
+        "people:\n  - canonical: alice\n    access: {roles: [user]}\n",
+    )
+    record = await agent.run_turn(AgentEvent(
+        trigger="user_message",
+        channel_id="discord-123",
+        content="PROMPT_REQUEST_CONTROL",
+        author="alice",
+        source="discord",
+    ))
+
+    assert record.error is None
+    [invocation] = fake_agent.invocations
+    prompt = invocation["state"]["messages"][0].content
+    assert "PROMPT_REQUEST_CONTROL" in prompt
+    assert ("CHANNEL_MEMORY_PAYLOAD" in prompt) is trusted
 
 
 async def test_run_turn_does_not_trust_event_supplied_integrity(tmp_path: Path):
@@ -3274,10 +3328,14 @@ async def test_run_turn_auto_delivers_final_text_when_enabled(tmp_path: Path):
     agent._channels = registry  # type: ignore[attr-defined]
     agent._config.auto_deliver_final_text_channels = ("ch-",)
     agent._config.resend_nudge_channels = ("ch-",)
+    agent._identity_resolver = _resolver(
+        agent._config.home,
+        "people:\n  - canonical: test-user\n    access: {roles: [user]}\n",
+    )
 
     event = AgentEvent(
         trigger="user_message", channel_id="ch-1", content="hi",
-        author="test-user", source="test",
+        author="test-user", source="discord",
     )
     record = await agent.run_turn(event)
 
