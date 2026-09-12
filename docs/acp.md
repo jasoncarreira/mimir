@@ -11,14 +11,22 @@ operator-visible limits are:
   slot and is a common cause of a client reporting a launch failure. Close the
   previous client and stop its leftover proxy before retrying; do not start
   another proxy as a connectivity test while a client is attached.
-- **File confinement is lexical, not a sandbox.** `hands_read` and `hands_edit`
-  reject paths outside the session cwd, but follow in-cwd symlinks even when
-  their targets are outside it. Select a trusted project directory and inspect
-  its symlinks before granting access.
+- **Hosted file access checks resolved targets.** `hands_read` and `hands_edit`
+  refuse targets outside the session cwd unless explicitly scope-approved.
+  In-cwd symlinks to in-cwd targets still work. External links (including linked
+  vendor directories) require `hands_request_scope` with the canonical target
+  file or directory; its operator prompt names that resolved scope. Reads can
+  then follow the link. Edits must instead use the canonical absolute target
+  path, even after approval, so an in-cwd alias cannot hide an external edit.
+  File access walks canonical path components with no-follow directory handles;
+  reads and atomic edits use the pinned parent, not a re-resolved pathname.
+  Replacement symlinks cannot redirect access between validation and use.
+  Inspecting symlinks before granting access is not a substitute for these
+  checks: a child can create links after the grant.
 - **macOS Seatbelt remains the only execution-confinement backend verified on real hardware.** `hands_shell`
   and `hands_python` run under OS-level filesystem confinement by default, and it
   is mandatory wherever a backend is available; a confined child cannot follow a
-  symlink out of the approved paths the way `hands_read` and `hands_edit` can.
+  symlink out of the approved paths.
   macOS Seatbelt uses `sandbox-exec`, which Apple has deprecated. The Linux
   AppArmor backend is merged, and its parser syntax is verified in Linux CI via
   #1601; real-hardware enforcement remains unverified.
