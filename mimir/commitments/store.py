@@ -10,22 +10,26 @@ AND whose terminal event is older than ``terminal_retention_days``
 (``pending | delivered | snoozed``) live forever — that's how a
 60-day commitment survives across multiple trim cycles.
 
-Concurrency: an ``asyncio.Lock`` serializes appends. The current-
-state replay is read-only and uses a streaming tail-friendly reader
-(``tail_jsonl_records``); replays don't hold the lock.
+Concurrency: every writer takes a stable sidecar ``flock``. Maintenance
+prepares replacements without that lock, then validates the source and
+publishes under it; a changed source aborts maintenance, never an append.
+Lock acquisition is bounded; replays remain read-only and lock-free.
 """
 
 from __future__ import annotations
 
 import asyncio
+import fcntl
 import json
 import logging
 import os
 import sqlite3
+import tempfile
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 from mimir.models import AuthContext
 
@@ -46,6 +50,9 @@ log = logging.getLogger(__name__)
 
 # Number of days terminal records are retained before ``trim()`` drops them.
 DEFAULT_TERMINAL_RETENTION_DAYS = 30
+
+# Bound contention on the agent turn path, including a stopped lock holder.
+_WRITE_LOCK_TIMEOUT_SECS = 0.25
 
 
 #: Current schema version for every event appended to the JSONL.
@@ -130,15 +137,58 @@ class CommitmentsStore:
 
     # ─── Appenders ──────────────────────────────────────────────────
 
+    @contextmanager
+    def _writer_lock(self) -> Iterator[None]:
+        # Never unlink this sidecar: the log inode changes on replacement.
+        # Closing the fd (including process death) releases flock automatically.
+        with self.path.with_suffix(self.path.suffix + ".lock").open("a") as lock:
+            deadline = time.monotonic() + _WRITE_LOCK_TIMEOUT_SECS
+            while True:
+                try:
+                    fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    if time.monotonic() >= deadline:
+                        raise TimeoutError("commitments writer lock busy; retry")
+                    time.sleep(0.005)
+            try:
+                yield
+            finally:
+                fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+
+    @contextmanager
+    def _rewrite_target(self) -> Iterator[Path]:
+        # Unique even for concurrent maintenance in the same process.
+        with tempfile.NamedTemporaryFile(
+            dir=self.path.parent, prefix=self.path.name + ".", suffix=".tmp",
+            delete=False,
+        ) as target:
+            tmp = Path(target.name)
+        try:
+            yield tmp
+        finally:
+            tmp.unlink(missing_ok=True)
+
+    def _publish_rewrite(self, tmp: Path, before: os.stat_result) -> None:
+        with self._writer_lock():
+            after = self.path.stat()
+            # Appends grow the file; another rewrite changes its inode. Include
+            # nanosecond timestamps as well to reject other in-place changes.
+            fields = ("st_dev", "st_ino", "st_size", "st_mtime_ns", "st_ctime_ns")
+            if any(getattr(before, field) != getattr(after, field) for field in fields):
+                raise BlockingIOError("commitments changed during rewrite; retry")
+            os.replace(tmp, self.path)
+
     def _append_line_sync(self, event: dict[str, Any]) -> None:
         """Durably append one complete JSONL record.
 
-        Atomic whole-file replacement is intentionally not used for this
-        append-only, multi-process log: replacing a stale snapshot can discard
-        sibling appends. O_APPEND plus one buffered write preserves append
-        ordering; flush/fsync prevents a reported transition remaining buffered.
+        O_APPEND plus flush/fsync makes successful appends durable. Every writer
+        locks BEFORE opening the log, so it cannot append to a replaced inode.
+        Whole-file maintenance must use _publish_rewrite: only an unchanged
+        snapshot may replace this append-only, multi-process log. Preparation
+        and fsync of replacements never hold the writer lock.
         """
-        with self.path.open("a", encoding="utf-8") as f:
+        with self._writer_lock(), self.path.open("a", encoding="utf-8") as f:
             f.write(json.dumps(event, ensure_ascii=True, default=str) + "\n")
             f.flush()
             os.fsync(f.fileno())
@@ -192,6 +242,9 @@ class CommitmentsStore:
         A row is trusted only when its exact ``saga_session_id`` resolves to a
         complete ownership tuple. Missing databases, schemas, sessions, or ACL
         columns fail closed to the reserved admin-only owner.
+
+        Concurrent writes abort with BlockingIOError; retry the migration.
+        Preparation is lock-free; only validation and publication exclude writers.
         """
         if not self.path.exists():
             return 0
@@ -228,6 +281,7 @@ class CommitmentsStore:
 
         changed = 0
         rewritten: list[str] = []
+        before = self.path.stat()
         with self.path.open("r", encoding="utf-8", newline="") as source:
             for line in source:
                 try:
@@ -265,12 +319,12 @@ class CommitmentsStore:
                         line = json.dumps(event, ensure_ascii=True, default=str) + ending
                 rewritten.append(line)
         if changed:
-            tmp = self.path.with_suffix(self.path.suffix + ".ownership.tmp")
-            with tmp.open("w", encoding="utf-8", newline="") as target:
-                target.write("".join(rewritten))
-                target.flush()
-                os.fsync(target.fileno())
-            os.replace(tmp, self.path)
+            with self._rewrite_target() as tmp:
+                with tmp.open("w", encoding="utf-8", newline="") as target:
+                    target.write("".join(rewritten))
+                    target.flush()
+                    os.fsync(target.fileno())
+                self._publish_rewrite(tmp, before)
         return changed
 
     def _can_apply(
@@ -907,25 +961,22 @@ class CommitmentsStore:
 
         Returns the number of records dropped. Uses atomic
         rename (temp file + os.replace) so an interrupted trim never
-        leaves the store in a half-written state. Holds the lock for
-        the entire operation; the file is briefly unavailable to
-        appenders during the rewrite.
+        leaves the store in a half-written state. Preparation does not exclude
+        sibling writers. If the source changes, raises BlockingIOError instead
+        of publishing a stale snapshot; callers may retry. Only validation and
+        publication hold the cross-process lock, with a bounded acquisition wait.
         """
         if not self.path.exists():
             return 0
 
-        # First pass (no lock): identify which ids to drop via the
-        # shared predicate helper. PR #120 re-review N1.
+        # Validate from before the candidate replay, not just the copying pass.
+        before = self.path.stat()
         candidates = self.find_trim_candidates(now_unix=now_unix)
         drop_ids: set[str] = {rid for rid, _ in candidates}
         if not drop_ids:
             return 0
 
-        # Second pass (under lock): rewrite, dropping all events for
-        # the chosen ids. We re-read the file under the lock to catch
-        # any appends that landed between the state-read and trim.
-        async with self._lock:
-            tmp = self.path.with_suffix(self.path.suffix + ".tmp")
+        with self._rewrite_target() as tmp:
             kept_lines = 0
             dropped_events = 0
             with self.path.open("r", encoding="utf-8") as src, \
@@ -956,7 +1007,7 @@ class CommitmentsStore:
                 # half-written" needs this to hold. Page-cache → disk.
                 dst.flush()
                 os.fsync(dst.fileno())
-            os.replace(tmp, self.path)
+            self._publish_rewrite(tmp, before)
         log.info(
             "commitments trim: dropped %d records (%d events), kept %d lines",
             len(drop_ids), dropped_events, kept_lines,

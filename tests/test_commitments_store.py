@@ -6,6 +6,8 @@ import asyncio
 import json
 import os
 import sqlite3
+import subprocess
+import sys
 import time
 from pathlib import Path
 
@@ -281,9 +283,13 @@ def test_ownership_migration_is_atomic_preserves_malformed_and_is_idempotent(
     migrated = commitments_path.read_bytes()
     assert migrated.startswith(malformed)
     assert fsync_calls
-    assert replace_calls == [(
-        commitments_path.with_suffix(".jsonl.ownership.tmp"), commitments_path,
-    )]
+    assert len(replace_calls) == 1
+    source, destination = replace_calls[0]
+    assert source.parent == commitments_path.parent
+    assert source.name.startswith(commitments_path.name + ".")
+    assert source.suffix == ".tmp"
+    assert destination == commitments_path
+    assert not source.exists()
     assert store.current_state()[record.id].owner_principal == "legacy_admin"
 
     replace_calls.clear()
@@ -696,6 +702,117 @@ async def test_trim_empty_file_returns_zero(tmp_path: Path):
 
 
 # ─── Path / file behavior ────────────────────────────────────────────
+
+
+@pytest.mark.parametrize("operation", ["trim", "migrate_ownership"])
+def test_rewrite_preserves_concurrent_process_append(tmp_path, monkeypatch, operation):
+    """Pause after copying, and complete a live commitment in another process.
+
+    The unguarded read/fsync/replace implementation loses this exact append.
+    The child must finish while preparation is paused, not wait out a rewrite.
+    """
+    store = CommitmentsStore(path=tmp_path / "c.jsonl")
+    for rid in ("old", "live"):
+        asyncio.run(store.add(CommitmentRecord(id=rid, text=rid, channel_id="c1")))
+    store._append_line_sync({
+        "type": "commitment_completed", "id": "old", "at_unix": 1,
+    })
+    real_fsync = os.fsync
+    appended = False
+
+    def append_during_fsync(fd):
+        nonlocal appended
+        real_fsync(fd)
+        assert not appended
+        child = subprocess.run(
+            [sys.executable, "-c", """
+import asyncio, sys
+from pathlib import Path
+from mimir.commitments.store import CommitmentsStore
+store = CommitmentsStore(path=Path(sys.argv[1]))
+assert asyncio.run(store.complete('live', message_id='sibling-completion'))
+""", str(store.path)],
+            capture_output=True, text=True, timeout=10,
+        )
+        assert child.returncode == 0, child.stderr
+        appended = True
+
+    with monkeypatch.context() as patch:
+        patch.setattr(os, "fsync", append_during_fsync)
+        try:
+            if operation == "trim":
+                asyncio.run(store.trim())
+            else:
+                store.migrate_ownership()
+        except BlockingIOError as exc:
+            assert "changed during rewrite" in str(exc)
+
+    assert appended
+    state = store.current_state()
+    assert state["live"].status == "completed"
+    assert state["live"].completion_message_id == "sibling-completion"
+    assert not list(tmp_path.glob("*.tmp"))
+    # A quiet retry succeeds, without losing the now-durable completion.
+    if operation == "trim":
+        assert asyncio.run(store.trim()) == 1
+    else:
+        assert store.migrate_ownership() == 2
+    assert store.current_state()["live"].status == "completed"
+
+
+@pytest.mark.parametrize("operation", ["append", "trim", "migrate_ownership"])
+def test_writer_lock_is_bounded_and_released_on_process_death(tmp_path, operation):
+    store = CommitmentsStore(path=tmp_path / "c.jsonl")
+    asyncio.run(store.add(CommitmentRecord(id="old", text="old", channel_id="c1")))
+    store._append_line_sync({
+        "type": "commitment_completed", "id": "old", "at_unix": 1,
+    })
+    before = store.path.read_bytes()
+    child = subprocess.Popen(
+        [sys.executable, "-c", """
+import sys
+from pathlib import Path
+from mimir.commitments.store import CommitmentsStore
+with CommitmentsStore(path=Path(sys.argv[1]))._writer_lock():
+    print('locked', flush=True)
+    sys.stdin.read()
+""", str(store.path)],
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        assert child.stdout.readline().strip() == "locked"
+        start = time.monotonic()
+        with pytest.raises(TimeoutError, match="writer lock busy"):
+            if operation == "append":
+                store._append_line_sync({"type": "test", "id": "new"})
+            elif operation == "trim":
+                asyncio.run(store.trim())
+            else:
+                store.migrate_ownership()
+        assert time.monotonic() - start < 2
+        assert store.path.read_bytes() == before
+        assert not list(tmp_path.glob("*.tmp"))
+    finally:
+        child.kill()
+        child.communicate(timeout=10)
+    store._append_line_sync({"type": "test", "id": "after-crash"})
+    assert json.loads(store.path.read_text().splitlines()[-1])["id"] == "after-crash"
+
+
+def test_rewrite_rejects_same_size_sibling_replacement(tmp_path):
+    store = CommitmentsStore(path=tmp_path / "c.jsonl")
+    store.path.write_text("old\n")
+    before = store.path.stat()
+    with store._rewrite_target() as ours, store._rewrite_target() as sibling:
+        assert ours != sibling
+        ours.write_text("our\n")
+        sibling.write_text("new\n")
+        store._publish_rewrite(sibling, before)
+        with pytest.raises(BlockingIOError, match="changed during rewrite"):
+            store._publish_rewrite(ours, before)
+    assert store.path.read_text() == "new\n"
+    assert not list(tmp_path.glob("*.tmp"))
 
 
 @pytest.mark.asyncio
