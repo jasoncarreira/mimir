@@ -4921,6 +4921,61 @@ async def test_fire_poller_budget_caps_events_enqueued_by_one_fire(
 
 
 @pytest.mark.asyncio
+async def test_fire_poller_headroom_stashes_and_replays_pending_only(
+    tmp_path: Path, monkeypatch,
+):
+    from mimir import poller_recovery
+    from mimir.event_logger import init_logger
+
+    init_logger(tmp_path / "logs" / "events.jsonl", session_id="test-session")
+    accepted: list[AgentEvent] = []
+
+    async def enqueue(event):
+        accepted.append(event)
+        return True
+
+    sched = Scheduler(tmp_path / "s.yaml", enqueue, home=tmp_path)
+    skills = tmp_path / "skills"
+    _drop_priority_poller(
+        skills, "p1", priority="normal",
+        budget={"windows": {"1h": {"max_agent_turns": 2}}},
+    )
+    sched.add_poller_jobs(skills)
+    poller = sched._pollers["p1"]
+    assert poller.recover_failed_turns is False
+    persist = poller.resolved_persist_dir()
+
+    async def emit_five(poller, enqueue, **kwargs):
+        for index in range(5):
+            event = AgentEvent(
+                trigger="poller", channel_id=poller.channel_id(),
+                content=str(index), source_id=f"sid-{index}", source="poller",
+            )
+            if await enqueue(event):
+                await poller_recovery.stash_enqueued_event(persist, event)
+
+    with monkeypatch.context() as patch:
+        patch.setattr("mimir.scheduler.run_poller", emit_five)
+        await sched._fire_poller(poller_name="p1")
+    assert [event.source_id for event in accepted] == ["sid-0", "sid-1"]
+    state = poller_recovery._load_state(persist)
+    assert {sid for sid, entry in state["inflight"].items()
+            if entry.get("pending_enqueue")} == {"sid-2", "sid-3", "sid-4"}
+
+    # Recreate the scheduler: pending delivery must survive process-local state.
+    sched = Scheduler(tmp_path / "s.yaml", enqueue, home=tmp_path)
+    sched.add_poller_jobs(skills)
+    await sched._fire_poller(poller_name="p1")
+    assert [event.source_id for event in accepted] == [f"sid-{i}" for i in range(4)]
+    assert poller_recovery._load_state(persist)["inflight"]["sid-4"]["pending_enqueue"]
+    await sched._fire_poller(poller_name="p1")
+    await sched._fire_poller(poller_name="p1")
+    assert [event.source_id for event in accepted] == [f"sid-{i}" for i in range(5)]
+    assert all(not entry.get("pending_enqueue")
+               for entry in poller_recovery._load_state(persist)["inflight"].values())
+
+
+@pytest.mark.asyncio
 async def test_fire_poller_budget_admits_all_events_within_headroom(
     tmp_path: Path, monkeypatch,
 ):

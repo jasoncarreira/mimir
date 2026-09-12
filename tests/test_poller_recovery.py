@@ -816,7 +816,10 @@ async def test_reconcile_watermark_prevents_reprocessing(tmp_path: Path):
     assert len(enq.calls) == 1
 
 
-async def test_reconcile_reenqueue_restamps_forged_stash_fields(tmp_path: Path):
+@pytest.mark.parametrize("pending_enqueue", [False, True])
+async def test_reconcile_reenqueue_restamps_forged_stash_fields(
+    tmp_path: Path, pending_enqueue: bool,
+):
     """chainlink #422: ``.recovery.json`` lives in the poller-writable
     persist_dir, so a malicious skill could rewrite a stashed event's
     channel/trigger/source and have the recovery path enqueue an event
@@ -839,9 +842,12 @@ async def test_reconcile_reenqueue_restamps_forged_stash_fields(tmp_path: Path):
     forged.extra["channel_visibility"] = "private"
     forged.extra["bridge_instance"] = "discord"
     forged.extra["poller_name"] = "not-gmail"
-    await poller_recovery.stash_enqueued_event(tmp_path, forged)
-    _write_outcome(events, type_="turn_failed", channel_id="poller:gmail",
-                   source_id="sid-1", ts=_ts(5))
+    await poller_recovery.stash_enqueued_event(
+        tmp_path, forged, pending_enqueue=pending_enqueue,
+    )
+    if not pending_enqueue:
+        _write_outcome(events, type_="turn_failed", channel_id="poller:gmail",
+                       source_id="sid-1", ts=_ts(5))
     enq = _FakeEnqueue()
     summary = await poller_recovery.reconcile_failed_turns(
         poller_name="gmail", channel_id="poller:gmail",
@@ -1157,3 +1163,38 @@ async def test_reconcile_gcs_expired_stash(tmp_path: Path):
     )
     assert s["expired"] == 1
     assert poller_recovery._load_state(tmp_path)["inflight"] == {}
+
+
+@pytest.mark.parametrize("raises", [False, True])
+async def test_pending_enqueue_waits_without_expiry_or_attempt_charge(
+    tmp_path: Path, monkeypatch, raises: bool,
+):
+    now = datetime.now(tz=timezone.utc)
+    monkeypatch.setattr(poller_recovery, "_utc_now", lambda: now)
+    await poller_recovery.stash_enqueued_event(
+        tmp_path, _make_event("pending"), pending_enqueue=True,
+    )
+    common = dict(
+        poller_name="gmail", channel_id="poller:gmail", persist_dir=tmp_path,
+        events_path=tmp_path / "events.jsonl", recover_failed_turns=False,
+        max_attempts=0,
+    )
+    for _ in range(2):
+        now += timedelta(hours=72)
+        summary = await poller_recovery.reconcile_failed_turns(
+            **common, enqueue=_RaisingEnqueue() if raises else _FullEnqueue(),
+        )
+        assert summary["deferred"] == 1
+        assert summary["expired"] == summary["gave_up"] == summary["dropped"] == 0
+        entry = poller_recovery._load_state(tmp_path)["inflight"]["pending"]
+        assert entry["pending_enqueue"] is True
+        assert entry["attempts"] == 0
+    enqueue = _FakeEnqueue()
+    summary = await poller_recovery.reconcile_failed_turns(**common, enqueue=enqueue)
+    assert summary["reenqueued"] == 1
+    entry = poller_recovery._load_state(tmp_path)["inflight"]["pending"]
+    assert "pending_enqueue" not in entry
+    assert entry["attempts"] == 0
+    assert entry["stashed_at"] == now.isoformat()
+    await poller_recovery.reconcile_failed_turns(**common, enqueue=enqueue)
+    assert len(enqueue.calls) == 1

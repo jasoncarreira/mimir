@@ -275,8 +275,8 @@ class TickBudget:
         #: a tick squeezed by slow startup is distinguishable from a slow API.
         self.startup_consumed = consumed
         self.truncated: dict[str, int] = {}
-        #: True once the hard deadline forced a truncation. The tick must not
-        #: advance its `since` watermark in that case — see main().
+        #: True once a since-gated window is incomplete, due to a deadline or
+        #: API failure. The tick must not advance its watermark — see main().
         self.hard_truncated = False
 
     def elapsed(self) -> float:
@@ -376,7 +376,7 @@ def _wall_clock_deadline(seconds: float):
 def _refused_window(
     tick_budget: "TickBudget | None", data: object, pass_name: str,
 ) -> bool:
-    """Whether a since-gated listing call came back empty because of the budget.
+    """Whether a since-gated listing failed or was refused by the budget.
 
     These passes rebuild their entire window from one listing call, so a refusal
     is indistinguishable from "nothing new" at the call site — and advancing
@@ -386,8 +386,7 @@ def _refused_window(
     """
     if tick_budget is None:
         return False
-    explicitly_refused = data is _GH_API_BUDGET_REFUSED
-    if not explicitly_refused and (data is not None or not tick_budget.hard_exhausted()):
+    if data is not None and data is not _GH_API_BUDGET_REFUSED:
         return False
     tick_budget.hard_truncated = True
     tick_budget.note_truncation(pass_name, 1)
@@ -724,8 +723,8 @@ def _gh_api(endpoint: str, token: str) -> list | dict | None | _GhApiBudgetRefus
     """Call ``gh api <endpoint> --paginate`` and return parsed JSON.
 
     Returns ``None`` on an ordinary API error and a private marker when the tick
-    budget refuses the call. Since-gated callers must distinguish those cases so
-    they do not advance their watermark over a window they never collected.
+    budget refuses the call. Since-gated callers must hold their watermark in
+    either case rather than advancing over a window they never collected.
     """
     try:
         env = {**os.environ, "GH_TOKEN": token} if token else None
@@ -1376,6 +1375,8 @@ def _collect_issue_comment_context(
     since: str,
     token: str,
     me: str,
+    *,
+    tick_budget: "TickBudget | None" = None,
 ) -> tuple[list[dict] | None, dict[str, str]]:
     """Fetch comments once and collect recent PR prose for review prompts."""
     data = _gh_api(
@@ -1384,6 +1385,7 @@ def _collect_issue_comment_context(
         token,
     )
     if not isinstance(data, list):
+        _refused_window(tick_budget, data, "issue_comment_context_window")
         return None, {}
     context: dict[str, str] = {}
     for comment in data:
@@ -1440,6 +1442,7 @@ def _check_issue_comments(
             token,
         )
     if not isinstance(data, list):
+        _refused_window(tick_budget, data, "issue_comments_window")
         return 0
     count = 0
     parent_cache: dict[str, dict | None] = {}
@@ -3230,7 +3233,7 @@ def main() -> None:
         }
         review_needed_pr_numbers: set[str] = set()
         issue_comments, review_context = _collect_issue_comment_context(
-            repo, since, token, me,
+            repo, since, token, me, tick_budget=budget,
         )
         pr_opened_count = _check_prs(
             repo, since, token, me, trust_cache, surfaced_untrusted,
@@ -3303,7 +3306,7 @@ def main() -> None:
             new_reconcile_offsets[repo] = 0
 
     if budget.hard_truncated:
-        # The hard deadline cut per-PR work short. Holding the watermark keeps
+        # A deadline or API failure left a window incomplete. Holding it keeps
         # the since-based passes (notably _check_pr_reviews, which has no dedupe
         # cursor of its own) from stepping over events this tick never reached.
         # Re-delivering a nudge is recoverable; dropping a review is not, and

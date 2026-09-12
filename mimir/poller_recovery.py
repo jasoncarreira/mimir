@@ -11,8 +11,10 @@ with **no live state to reconcile against** (gmail, github
 issue/comment turns) this module closes it generically via the event
 log:
 
-* At every accepted enqueue, the framework stashes the ``AgentEvent`` keyed by its
-  ``source_id`` (the poller batch's stable per-fire id).
+* At every accepted enqueue or scheduler headroom rejection, the framework
+  stashes the ``AgentEvent`` keyed by its ``source_id``. Headroom rejections
+  carry ``pending_enqueue`` and wait without expiry for budgeted delivery,
+  independently of failed-turn recovery opt-in.
 * Turn outcomes are logged with that ``source_id``
   (``turn_failed`` / ``turn_completed``, #517). Each poll cycle the
   framework reads outcomes since the last reconcile and, per stashed
@@ -233,6 +235,7 @@ async def stash_enqueued_event(
     event: AgentEvent,
     *,
     enqueued_at: str | None = None,
+    pending_enqueue: bool = False,
 ) -> None:
     """Record an enqueued poller ``AgentEvent`` as in-flight, keyed by its
     ``source_id``, so a later failed turn can re-enqueue it.
@@ -242,12 +245,18 @@ async def stash_enqueued_event(
     should be captured immediately before the accepted enqueue so an empty
     reconciliation watermark has a safe lower scan bound.
 
+    ``pending_enqueue`` records a fresh event rejected by scheduler headroom.
+    Existing entries belong to reconciliation and must not be overwritten by
+    its budget callback. Pending delivery is independent of failed-turn opt-in.
+
     No-op when the event has no ``source_id`` — without it the outcome event
     can't be correlated back, so it isn't recoverable this way.
     """
     if not event.source_id:
         return
     state = await asyncio.to_thread(_load_state, persist_dir)
+    if pending_enqueue and event.source_id in state["inflight"]:
+        return
     stashed_dt = _utc_now()
     stashed_at = stashed_dt.isoformat()
     state["inflight"][event.source_id] = {
@@ -265,6 +274,8 @@ async def stash_enqueued_event(
         ).isoformat(),
         "event": _event_to_stash(event),
     }
+    if pending_enqueue:
+        state["inflight"][event.source_id]["pending_enqueue"] = True
     await asyncio.to_thread(_save_state, persist_dir, state)
 
 
@@ -335,6 +346,8 @@ def _gc_expired_inflight(
             del inflight[source_id]
             dropped += 1
             continue
+        if entry.get("pending_enqueue") is True:
+            continue  # Intentional budget waiting is not an abandoned turn.
         dt = _parse_iso(entry.get("stashed_at"))
         if dt is None:
             entry["stashed_at"] = now_dt.isoformat()  # backfill; GC next window
@@ -783,16 +796,20 @@ async def reconcile_failed_turns(
     # to silently losing a one-shot notification.
     restart_iso = await asyncio.to_thread(_read_last_unclean_restart, events_path)
     restart_dt = _parse_iso(restart_iso)
-    if restart_dt is not None and not summary["deferred"]:
+    # Pending initial deliveries need neither a restart nor a failed outcome.
+    # Both paths use the same identity restore and budgeted enqueue callback.
+    if not summary["deferred"]:
         for source_id in list(inflight):
             entry = inflight.get(source_id)
             if not isinstance(entry, dict):
                 continue
+            pending_enqueue = entry.get("pending_enqueue") is True
             enqueued_iso = entry.get("enqueued_at") or entry.get("stashed_at")
             enqueued_dt = _parse_iso(enqueued_iso)
             outcome_dt = _parse_iso(entry.get("last_outcome_at"))
-            if (
-                enqueued_dt is None
+            if not pending_enqueue and (
+                restart_dt is None
+                or enqueued_dt is None
                 or enqueued_dt >= restart_dt
                 or (outcome_dt is not None and outcome_dt >= enqueued_dt)
                 or entry.get("unclean_replayed_at") == restart_iso
@@ -810,7 +827,7 @@ async def reconcile_failed_turns(
                 del inflight[source_id]
                 summary["stale_dropped"] += 1
                 continue
-            if attempts > max_attempts:
+            if not pending_enqueue and attempts > max_attempts:
                 try:
                     await _emit_gave_up(poller_name, channel_id, entry, source_id)
                 except Exception as exc:  # noqa: BLE001
@@ -825,6 +842,7 @@ async def reconcile_failed_turns(
                 del inflight[source_id]
                 summary["dropped"] += 1
                 continue
+            enqueued_at = _utc_now_iso()
             try:
                 accepted = await enqueue(event)
             except Exception as exc:  # noqa: BLE001
@@ -836,11 +854,16 @@ async def reconcile_failed_turns(
             if not accepted:
                 summary["deferred"] += 1
                 break
-            entry["attempts"] = attempts
-            entry["enqueued_at"] = _utc_now_iso()
-            entry["unclean_replayed_at"] = restart_iso
+            entry["enqueued_at"] = enqueued_at
+            if pending_enqueue:
+                entry.pop("pending_enqueue")
+                # Start the abandoned-turn TTL only after initial delivery.
+                entry["stashed_at"] = enqueued_at
+            else:
+                entry["attempts"] = attempts
+                entry["unclean_replayed_at"] = restart_iso
+                summary["unclean_reenqueued"] += 1
             summary["reenqueued"] += 1
-            summary["unclean_reenqueued"] += 1
 
     if summary["deferred"]:
         # We stopped on back-pressure. Persist the watermark exactly where

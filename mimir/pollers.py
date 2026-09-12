@@ -69,7 +69,7 @@ interval. The effective value is exported to the child as
 ``POLLER_TIMEOUT_SECONDS`` so a poller can bound its own work against the cap it
 will actually be killed at. Longer-running pollers should still run faster or
 restructure as ``async-tasks``-style background jobs that emit on completion —
-overrunning discards every event the run had already emitted.
+overrunning discards all buffered events, leaving an unsaved cursor to retry.
 """
 
 from __future__ import annotations
@@ -118,8 +118,9 @@ log = logging.getLogger(__name__)
 
 # Wall-clock ceiling for one poller subprocess. Overrunning it is not a partial
 # result: the timeout path discards the stdout already collected (see the
-# ``asyncio.TimeoutError`` handler in ``run_poller``), so every event the tick had
-# emitted is lost and its cursor never advances.
+# ``asyncio.TimeoutError`` handler in ``run_poller``). No buffered AgentEvents
+# are delivered: a child that saves its cursor at completion can retry safely.
+# Signals already acknowledged through a durable delivery barrier are retained.
 #
 # Raised 60 -> 120 (chainlink #1433). Safe against fire-stacking because the
 # shortest configured cadence is ``*/10`` (600s) and jobs register with
@@ -2535,9 +2536,9 @@ async def run_poller(
                     backoff_seconds=POLLER_CIRCUIT_BREAKER_BACKOFF_SECONDS,
                     reason="timeout",
                 )
-            # A killed writer may leave an incomplete final JSONL record.
-            # Trim before decoding, including any partial UTF-8 code point.
-            stdout_bytes = stdout_bytes[:stdout_bytes.rfind(b"\n") + 1]
+            # The child may not have committed its cursor. Delivering even
+            # complete records would duplicate turns when the next tick retries.
+            stdout_bytes = b""
         except Exception as exc:  # noqa: BLE001 — never let a poller break the scheduler
             fatal_error = f"{type(exc).__name__}: {exc}"
             await log_event(

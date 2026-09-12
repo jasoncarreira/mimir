@@ -3440,7 +3440,7 @@ def _poller_clock(monkeypatch):
 async def test_run_poller_timeout_kills_subprocess(
     tmp_path: Path, home: Path, count: int, tail: str, monkeypatch,
 ) -> None:
-    """Recover complete records, never an unterminated final record."""
+    """Discard all records from a tick that could not commit its cursor."""
     now = _poller_clock(monkeypatch)
     skill_dir = tmp_path / "skill"
     _install_script(skill_dir, "poller.py", f"""
@@ -3468,13 +3468,13 @@ signal.pause()
     )
     n = await run_poller(cfg, enqueue=enq, timeout=2.0)
     assert calls[0] == ("drain", 2.0)
-    assert n == count
-    assert [e.content for e in enq.events] == [f"event {i}" for i in range(count)]
+    assert n == 0
+    assert enq.events == []
     assert _circuit_breakers[cfg.name].consecutive_failures == failures + 1
     events = _read_events(home)
     timeouts = [e for e in events if e["type"] == "poller_timeout"]
     assert len(timeouts) == 1
-    assert timeouts[0]["events_recovered"] == count
+    assert timeouts[0]["events_recovered"] == 0
     assert not any(e["type"] == "poller_invalid_line" for e in events)
     assert not any(e["type"] == "poller_nonzero_exit" for e in events)
     if count:
@@ -3572,8 +3572,8 @@ open("output-ready", "w").close()
 
     child_pgid = int((skill_dir / "child.pgid").read_text())
     killpg.assert_any_call(child_pgid, signal.SIGKILL)
-    assert n == 1
-    assert [e.content for e in enq.events] == ["would emit"]
+    assert n == 0
+    assert enq.events == []
     events = _read_events(home)
     timeouts = [e for e in events if e["type"] == "poller_timeout"]
     assert len(timeouts) == 1
@@ -3631,12 +3631,54 @@ signal.pause()
     )
     n = await run_poller(cfg, enqueue=enq, timeout=2.0)
     assert calls == [("drain", 2.0), ("reap", 2.0)]
-    assert n == count
-    assert [e.content for e in enq.events] == [f"event {i}" for i in range(count)]
+    assert n == 0
+    assert enq.events == []
     events = _read_events(home)
     timeouts = [e for e in events if e["type"] == "poller_timeout"]
     assert len(timeouts) == 1
-    assert timeouts[0]["events_recovered"] == count
+    assert timeouts[0]["events_recovered"] == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(60)
+@pytest.mark.parametrize("expire", [False, True])
+async def test_run_poller_cursor_retry_delivers_once(
+    tmp_path: Path, home: Path, monkeypatch, expire: bool,
+) -> None:
+    """Only a completed tick delivers; a killed tick retries its unsaved window."""
+    skill_dir = tmp_path / "skill"
+    _install_script(skill_dir, "poller.py", """
+import json, os, signal
+from pathlib import Path
+cursor = Path(os.environ["STATE_DIR"]) / "cursor"
+if not cursor.exists():
+    for i in range(4):
+        print(json.dumps({"prompt": f"event {i}"}), flush=True)
+Path("output-ready").touch()
+if Path("hold").exists():
+    signal.pause()
+cursor.touch()
+""")
+    if expire:
+        (skill_dir / "hold").touch()
+    cfg = PollerConfig(
+        name="cursor-retry", command=f"{sys.executable} poller.py",
+        cron="* * * * *", env={}, skill_dir=skill_dir,
+    )
+    enq = _CapturingEnqueue()
+    with monkeypatch.context() as patch:
+        _control_poller_wait(
+            patch, lambda: _poller_file_ready(skill_dir / "output-ready"),
+            expire=expire,
+        )
+        assert await run_poller(cfg, enqueue=enq) == (0 if expire else 4)
+    assert (cfg.resolved_persist_dir() / "cursor").exists() is not expire
+    if expire:
+        assert enq.events == []
+        (skill_dir / "hold").unlink()
+    assert await run_poller(cfg, enqueue=enq) == (4 if expire else 0)
+    assert await run_poller(cfg, enqueue=enq) == 0
+    assert [event.content for event in enq.events] == [f"event {i}" for i in range(4)]
 
 
 @pytest.mark.asyncio
