@@ -362,8 +362,10 @@ The acknowledgement requires a durable `ifc_ingest_taint_cleared` audit record;
 if that write fails, the acknowledgement is refused.
 
 Despite its name, this is **not general untainting**. It acknowledges the current
-ingest snapshot only for the ACP permission prompt, so existing `allow_session`
-grants can apply without another ingest-triggered prompt. It does not grant a
+ingest snapshot only for the ACP permission prompt. Acknowledging untrusted
+ingest invalidates existing `allow_session` grants: the next wrapper call needs
+a fresh human response, and a new `allow_session` response can then be reused.
+The tool call itself is not evidence of operator consent. It does not grant a
 new permission, remove source or sensitivity labels, or change sink and
 durable-memory decisions. It is not `approve_declassification`. Later untrusted
 active ingest re-arms the prompt, even when it is a reread of an already recorded

@@ -132,6 +132,7 @@ class SessionState:
     execution_session_key: int = 0
     active_prompt: ActivePrompt | None = None
     dirty: bool = False
+    ingest_acknowledgement: str | None = None
 
 
 @dataclass
@@ -171,6 +172,12 @@ class ActivePrompt:
     def report_final_text_delivery_failure(self, reason: str) -> None:
         if self.final_text_delivery_failure is None:
             self.final_text_delivery_failure = reason
+
+    def acknowledge_ingest(self) -> None:
+        # Session-owned: a clear may be the last tool call of the current turn.
+        if not self._is_current():
+            raise RuntimeError("ingest acknowledgement requires a live ACP prompt")
+        self.session.ingest_acknowledgement = uuid.uuid4().hex
 
     async def request_permission(
         self, eligibility: PermissionEligibility
@@ -240,6 +247,7 @@ class ActivePrompt:
                 snapshot,
                 wrapper_name=trusted_metadata[0],
                 tainted=trusted_metadata[1],
+                ingest_acknowledgement=self.session.ingest_acknowledgement,
             )
         provider = self.session.provider
         peer = provider.peer if provider is not None else None
