@@ -297,9 +297,17 @@ def _build_probe_from_spec(
 
     fn: Callable[[], tuple[bool, str]] | None
     if kind == "subprocess":
+        binary = probe_spec.get("binary")
+        cmd = probe_spec.get("cmd")
+        if not binary or not cmd:
+            log.warning(
+                "credentials_manifest_skipped: %s name=%r — subprocess probe has no binary or cmd",
+                manifest_path, name,
+            )
+            return None
         fn = _make_subprocess_probe(
-            binary=probe_spec["binary"],
-            cmd=list(probe_spec["cmd"]),
+            binary=binary,
+            cmd=list(cmd),
             env_vars=env_vars,
             success_detail=probe_spec.get("success_detail"),
         )
@@ -322,9 +330,16 @@ def _build_probe_from_spec(
     elif kind == "not_implemented":
         fn = _make_not_implemented_probe(cred_type)
     elif kind == "python":
+        script = probe_spec.get("script")
+        if not script:
+            log.warning(
+                "credentials_manifest_skipped: %s name=%r — python probe has no script",
+                manifest_path, name,
+            )
+            return None
         fn = _make_python_probe(
             manifest_path.parent,
-            script=probe_spec["script"],
+            script=script,
             function=probe_spec.get("function", "probe"),
         )
     else:
