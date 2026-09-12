@@ -4,6 +4,7 @@ import asyncio
 import gc
 import json
 import os
+import threading
 import weakref
 from pathlib import Path
 
@@ -485,6 +486,81 @@ def test_corruption_marks_io_failed_before_any_replay(tmp_path: Path, body: byte
         SessionJournal(store, record, client)
     assert client.updates == []
     assert json.loads(record.metadata_path.read_text())["replayability"] == "io_failed"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("suffix", [
+    b"not-json\n", b'{"kind":"sent","sequence":0,"sequence":0}\n',
+    b'{"kind":"sent","sequence":true}\n',
+    b'{"kind":"sent","sequence":1}\n',
+    b'{"kind":"sent","sequence":0}\n' * 2,
+    b'{"kind":"sent","sequence":0}',
+    prepared_row(1).replace(b'user_message_chunk', b'unknown_update'),
+])
+async def test_deferred_replay_validates_entire_file_before_output(
+    tmp_path: Path, suffix: bytes,
+) -> None:
+    store = SessionStore(tmp_path)
+    record = store.create_session("owner")
+    record.journal_path.write_bytes(prepared_row() + suffix)
+    client = Client()
+    journal = JournalCache(store).open(record, client, defer_validation=True)
+    with pytest.raises(RequestError, match="io_failed"):
+        await journal.send_replay()
+    assert client.updates == []
+    assert json.loads(record.metadata_path.read_text())["replayability"] == "io_failed"
+
+
+@pytest.mark.asyncio
+async def test_cancelled_reader_holds_lock_until_worker_finishes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = SessionStore(tmp_path)
+    record = store.create_session("owner")
+    record.journal_path.write_bytes(prepared_row())
+    client = Client()
+    cache = JournalCache(store)
+    journal = cache.open(record, client, defer_validation=True)
+    entered = asyncio.Event()
+    release = threading.Event()
+    loop = asyncio.get_running_loop()
+    original = journal._read_validated
+    reads = []
+
+    def read_validated():
+        reads.append(threading.get_ident())
+        loop.call_soon_threadsafe(entered.set)
+        assert release.wait(5)
+        return original()
+
+    monkeypatch.setattr(journal, "_read_validated", read_validated)
+    replay = asyncio.create_task(journal.send_replay())
+    live = None
+    try:
+        await asyncio.wait_for(entered.wait(), 2)
+        replay.cancel()
+        await asyncio.sleep(0)
+        replay.cancel()
+        cache.release(record.session_id)
+        assert cache.open(record, client) is journal
+        live = asyncio.create_task(journal.publish_live(update("next")))
+        await asyncio.sleep(0)
+        assert journal.lock.locked()
+        assert not replay.done()
+        assert not live.done()
+        assert len(reads) == 1
+        assert client.updates == []
+    finally:
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await replay
+        if live is not None:
+            await live
+    assert len(reads) == 1
+    assert client.updates[0][1].field_meta == {"mimir.sequence": 1}
+    await journal.send_replay()
+    assert len(reads) == 2
+    assert [u.field_meta["mimir.sequence"] for _, u in client.updates] == [1, 0, 1]
 
 
 def test_ttl_marker_before_unlink_failure_and_retry(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

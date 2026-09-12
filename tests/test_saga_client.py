@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 import json
 import sqlite3
+import threading
 from pathlib import Path
 
 import pytest
@@ -11,6 +13,56 @@ from mimir.reflection import most_retrieved
 from mimir.saga import _config_io
 from mimir.saga.client import SagaStore
 from mimir.saga_client import RecordingSagaClient, SagaError, make_saga_client
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("method", [
+    "rebuild_index_if_needed", "consolidate", "consolidate_skill_memories",
+])
+async def test_maintenance_migrations_run_off_loop_under_db_lock(tmp_path, monkeypatch, method):
+    store = SagaStore(db_path=tmp_path / "store.db")
+    # An empty database must not need synthesis or an external provider.
+    store._rich_synth_fn = object()
+    loop = asyncio.get_running_loop()
+    loop_thread = threading.get_ident()
+    migration_started = asyncio.Event()
+    release_migration = threading.Event()
+    migrate = store._apply_pending_migrations
+    migration_connections = []
+
+    def paused_migration(conn, *, fresh):
+        assert threading.get_ident() != loop_thread
+        migration_connections.append(conn)
+        loop.call_soon_threadsafe(migration_started.set)
+        assert release_migration.wait(10), "event loop did not release migration"
+        migrate(conn, fresh=fresh)
+
+    monkeypatch.setattr(store, "_apply_pending_migrations", paused_migration)
+    kwargs = {"dedup_threshold": 0.95} if method != "rebuild_index_if_needed" else {}
+    tasks = [asyncio.create_task(getattr(store, method)(**kwargs)) for _ in range(2)]
+    started = asyncio.create_task(migration_started.wait())
+    try:
+        completed, _ = await asyncio.wait(
+            [started, *tasks], timeout=5, return_when=asyncio.FIRST_COMPLETED,
+        )
+        for task in tasks:
+            if task in completed:
+                task.result()
+        assert started in completed, "migration never started"
+        # This runs on the loop while migration is paused in a worker. RLock
+        # reentrancy would let this succeed if the loop owned the lock instead.
+        acquired = store._db_lock.acquire(blocking=False)
+        if acquired:
+            store._db_lock.release()
+        assert not acquired
+        release_migration.set()
+        await asyncio.wait_for(asyncio.gather(*tasks), timeout=10)
+        assert migration_connections == [store._conn]
+    finally:
+        release_migration.set()
+        started.cancel()
+        await asyncio.gather(started, *tasks, return_exceptions=True)
+        await store.close()
 
 
 @pytest.fixture(params=["default", "relative", "absolute"])

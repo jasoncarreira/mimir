@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import io
 import json
+import threading
 from importlib.metadata import version
 from pathlib import Path
 from types import SimpleNamespace
@@ -77,6 +78,48 @@ async def _agent_with_session(tmp_path: Path) -> tuple[MimirAcpAgent, str, int]:
     )
     session_id = (await agent.new_session("/workspace")).session_id
     return agent, session_id, generation
+
+
+@pytest.mark.parametrize("cached", [False, True])
+async def test_load_session_reads_and_validates_once_off_loop(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, cached: bool,
+) -> None:
+    from mimir.acp.journal import SessionJournal
+
+    agent, session_id, _ = await _agent_with_session(tmp_path)
+    journal = agent._journals._sessions[session_id]
+    updates = []
+
+    async def session_update(session_id, update):
+        assert threading.get_ident() == loop_thread
+        updates.append(update)
+
+    client = agent._require_client()
+    client.session_update = session_update
+    loop_thread = threading.get_ident()
+    await journal.publish_live(sdk.UserMessageChunk(
+        sessionUpdate="user_message_chunk",
+        content=sdk.TextContentBlock(type="text", text="persisted"),
+    ))
+    updates.clear()
+    if not cached:
+        agent._journals.release(session_id)
+        del journal
+    reads = []
+    original = SessionJournal._read_validated
+
+    def read_validated(self):
+        reads.append(threading.get_ident())
+        assert reads[-1] != loop_thread
+        return original(self)
+
+    monkeypatch.setattr(SessionJournal, "_read_validated", read_validated)
+    await agent.load_session("/reloaded", session_id)
+    assert len(reads) == 1
+    assert len(updates) == 1
+    assert updates[0].content.text == "persisted"
+    assert updates[0].field_meta == {"mimir.sequence": 0}
+    assert agent._journals._sessions[session_id].next_sequence == 1
 
 
 def _dump(response: Any) -> dict[str, Any]:

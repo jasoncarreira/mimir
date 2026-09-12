@@ -177,6 +177,48 @@ async def test_async_log_offloads_append_io_to_worker_thread(tmp_path: Path):
     assert json.loads(path.read_text().strip())["i"] == 1
 
 
+@pytest.mark.asyncio
+async def test_async_log_redaction_keeps_loop_responsive_under_logger_lock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import mimir.event_logger as event_logger
+
+    path = tmp_path / "events.jsonl"
+    logger = EventLogger(path, session_id="redaction-offloop")
+    lock = logger._ensure_lock()
+    loop = asyncio.get_running_loop()
+    loop_thread = threading.get_ident()
+    released = threading.Event()
+    observations = []
+    original_redact = event_logger.redact_payload
+
+    def slow_redact(payload):
+        # Only the event loop can release this simulated expensive redaction.
+        loop.call_soon_threadsafe(released.set)
+        responsive = released.wait(timeout=2.0)
+        observations.append((responsive, threading.get_ident(), lock.locked()))
+        return original_redact(payload)
+
+    monkeypatch.setattr(event_logger, "redact_payload", slow_redact)
+    try:
+        await asyncio.wait_for(
+            logger.log("tool_result", nested={"detail": "token=github_pat_11ABCDEFG_xyz0123"}),
+            timeout=5.0,
+        )
+    finally:
+        released.set()
+
+    assert len(observations) == 1
+    responsive, redaction_thread, lock_held = observations[0]
+    assert responsive, "redaction blocked the event-loop callback"
+    assert redaction_thread != loop_thread
+    assert lock_held, "record construction must remain inside the logger async lock"
+    record = json.loads(path.read_text())
+    assert record["nested"] == {"detail": "token=[REDACTED]"}
+    assert record["type"] == "tool_result"
+    assert record["session_id"] == "redaction-offloop"
+
+
 def test_log_sync_does_not_mkdir_after_initialization(tmp_path: Path, monkeypatch):
     path = tmp_path / "events.jsonl"
     logger = EventLogger(path, session_id="proc-1")

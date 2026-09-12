@@ -620,7 +620,7 @@ class MimirAcpAgent:
         prior_client = prior_journal.current_client if prior_journal is not None else None
         try:
             record = self._store.load_owned(session_id, owner)
-            journal = self._journals.open(record, client)
+            journal = self._journals.open(record, client, defer_validation=True)
             state = SessionState(record, SessionEnvironment(cwd, copy.deepcopy(mcp_servers)), self._generation, declaration, MIMIR_HANDS_V1 if declaration else None, execution_session_key=max(self._execution_keys.get(session_id, 0), self._sessions.get(session_id, SessionState(record, SessionEnvironment(cwd, None), self._generation)).execution_session_key) + 1)
             await self._admit_provider(state)
             await journal.send_replay(client)

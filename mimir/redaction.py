@@ -463,6 +463,11 @@ def _scanned_block_scalar_lines(text: str) -> list[int]:
     return sorted(body_lines)
 
 
+# 64 Ki characters keeps composition near the measured 40 ms diagnostic case;
+# multi-MB subprocess output uses the scanner without dropping any secret text.
+MAX_YAML_REDACTION_CHARS = 64 * 1024
+
+
 def _mask_block_scalar_lines(text: str) -> str:
     # A YAML block scalar must contain one of its two style indicators. Keep
     # parser construction off the common durable-log path, where almost every
@@ -471,7 +476,11 @@ def _mask_block_scalar_lines(text: str) -> str:
         return text
 
     try:
-        line_numbers = _yaml_block_scalar_lines(text)
+        line_numbers = (
+            _yaml_block_scalar_lines(text)
+            if len(text) <= MAX_YAML_REDACTION_CHARS
+            else None
+        )
         if line_numbers is None:
             line_numbers = _scanned_block_scalar_lines(text)
         if not line_numbers:

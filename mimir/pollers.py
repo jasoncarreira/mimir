@@ -2577,11 +2577,12 @@ async def run_poller(
         await log_event(
             "poller_stderr",
             poller=poller.name,
-            stderr=_redact_poller_env_values(
+            stderr=(await asyncio.to_thread(
+                _redact_poller_env_values,
                 stderr_text,
                 env,
                 explicit_env_redact_keys,
-            )[:POLLER_STDERR_LOG_CHARS],
+            ))[:POLLER_STDERR_LOG_CHARS],
             exit_code=proc.returncode if proc is not None else None,
         )
 
@@ -2640,11 +2641,12 @@ async def run_poller(
             await log_event(
                 "poller_invalid_line",
                 poller=poller.name,
-                line=_redact_poller_env_values(
+                line=(await asyncio.to_thread(
+                    _redact_poller_env_values,
                     line,
                     env,
                     explicit_env_redact_keys,
-                )[:POLLER_INVALID_LINE_CHARS],
+                ))[:POLLER_INVALID_LINE_CHARS],
             )
             continue
 

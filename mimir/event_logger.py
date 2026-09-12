@@ -187,9 +187,10 @@ class EventLogger:
 
     async def log(self, event_type: str, **payload: Any) -> None:
         try:
-            record = self._record(event_type, payload)
             async with self._ensure_lock():
-                await asyncio.to_thread(self._append_record_sync, record)
+                await asyncio.to_thread(
+                    lambda: self._append_record_sync(self._record(event_type, payload))
+                )
                 # Hysteresis: trim only when over cap by ≥10%. Without the
                 # buffer, every event past the cap triggers an O(file)
                 # rewrite — a high-throughput agent under a small cap pays
