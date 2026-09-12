@@ -163,11 +163,41 @@ async def test_execute_contained_timeout_reaps_when_cancel_reports_failure(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("caller_owned", [False, True])
+@pytest.mark.parametrize("overflow", [False, True])
 async def test_execute_contained_cancellation_sends_cancel_before_reraising(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, caller_owned: bool, overflow: bool,
 ) -> None:
-    client = Client(immediate=False)
+    collecting = asyncio.Event()
+    cancelling_overflow = asyncio.Event()
+    owned_tasks: dict[str, asyncio.Task[Any]] = {}
+    create_task = asyncio.create_task
+
+    def track_task(coro: Any, **kwargs: Any) -> asyncio.Task[Any]:
+        task = create_task(coro, **kwargs)
+        if coro.cr_code.co_qualname.startswith("execute_contained.<locals>."):
+            owned_tasks[coro.cr_code.co_name] = task
+        return task
+
+    monkeypatch.setattr(contained.asyncio, "create_task", track_task)
+
+    class CancellingClient(Client):
+        async def cancel(self, identifier: str) -> None:
+            if overflow and not cancelling_overflow.is_set():
+                cancelling_overflow.set()
+                await asyncio.Event().wait()
+            await super().cancel(identifier)
+
+    client = CancellingClient(b"x" * 101 if overflow else b"", immediate=False)
+    wait = client.process.wait
+
+    async def observed_wait() -> int:
+        collecting.set()
+        return await wait()
+
+    monkeypatch.setattr(client.process, "wait", observed_wait)
     install_client(monkeypatch, client)
+    sinks = output_capture.open_output_pair(None, 100, None, 100) if caller_owned else None
     task = asyncio.create_task(
         execute_contained(
             ("tool",),
@@ -177,15 +207,50 @@ async def test_execute_contained_cancellation_sends_cancel_before_reraising(
             timeout_s=10,
             stdout_limit=100,
             stderr_limit=100,
+            stdout_sink=sinks[0] if sinks else None,
+            stderr_sink=sinks[1] if sinks else None,
         )
     )
-    await asyncio.sleep(0)
-    task.cancel()
+    try:
+        await asyncio.wait_for(collecting.wait(), 1)
+        if overflow:
+            await asyncio.wait_for(cancelling_overflow.wait(), 1)
+        launched_sinks = [client.launched[0][name] for name in ("stdout_sink", "stderr_sink")]
+        descriptors = [sink.fd for sink in launched_sinks]
+        task.cancel()
 
-    with pytest.raises(asyncio.CancelledError):
-        await task
-    assert client.cancelled == ["aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"]
-    assert client.process.returncode == -15
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert client.cancelled == ["aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"]
+        assert client.process.returncode == -15
+        assert set(owned_tasks) == {"monitor_output", "collect"} | (
+            {"cancel_for_overflow"} if overflow else set()
+        )
+        assert all(task.done() for task in owned_tasks.values())
+        assert owned_tasks["monitor_output"].cancelled()
+        if overflow:
+            assert owned_tasks["cancel_for_overflow"].cancelled()
+        for sink, fd in zip(launched_sinks, descriptors):
+            if caller_owned:
+                assert sink.fd == fd
+                os.fstat(fd)
+            else:
+                assert sink.fd == -1
+                with pytest.raises(OSError) as raised:
+                    os.fstat(fd)
+                assert raised.value.errno == errno.EBADF
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        for owned_task in owned_tasks.values():
+            owned_task.cancel()
+        await asyncio.gather(*owned_tasks.values(), return_exceptions=True)
+        for launch in client.launched:
+            launch["stdout_sink"].close()
+            launch["stderr_sink"].close()
+        if sinks:
+            for sink in sinks:
+                sink.close()
 
 
 @pytest.mark.asyncio

@@ -372,7 +372,6 @@ async def test_fifo_pressure_and_drain_wait_for_every_update() -> None:
 async def test_close_suspends_then_times_out_when_full_worker_is_blocked(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from types import SimpleNamespace
     from mimir.acp import updates
 
     publisher = Publisher()
@@ -382,44 +381,65 @@ async def test_close_suspends_then_times_out_when_full_worker_is_blocked(
     for _ in range(MAX_UPDATE_ITEMS):
         dispatcher.enqueue(event)
     await publisher.entered.wait()
-    joining = asyncio.Event()
-    real_join = dispatcher.queue.join
-
-    async def join():
-        joining.set()
-        await real_join()
-
-    async def expire(awaitable, timeout):
-        assert timeout == updates.UPDATE_CLOSE_TIMEOUT
-        closing = asyncio.create_task(awaitable)
-        observation = asyncio.create_task(joining.wait())
-        try:
-            await asyncio.wait({closing, observation}, return_when=asyncio.FIRST_COMPLETED)
-            assert joining.is_set(), "graceful close did not wait for queued publication"
-            assert not closing.done(), "close bypassed the blocked publisher"
-            return await asyncio.wait_for(closing, 0)
-        finally:
-            observation.cancel()
-            closing.cancel()
-            await asyncio.gather(observation, closing, return_exceptions=True)
-
-    monkeypatch.setattr(dispatcher.queue, "join", join)
-    monkeypatch.setattr(updates, "asyncio", SimpleNamespace(
-        **{name: getattr(asyncio, name) for name in dir(asyncio) if name != "wait_for"},
-        wait_for=expire,
-    ))
+    # The in-flight publication has freed a slot. Fill it so close cannot
+    # enqueue its sentinel before timing out.
+    dispatcher.enqueue(event)
+    assert dispatcher.queue.full()
+    monkeypatch.setattr(updates, "UPDATE_CLOSE_TIMEOUT", 0.02)
+    worker = dispatcher._worker
+    assert worker is not None
+    closing = asyncio.create_task(dispatcher.close())
     try:
-        await dispatcher.close()
+        await asyncio.sleep(0)
+        assert not closing.done()
+        await asyncio.wait_for(asyncio.shield(closing), 1)
+        assert worker.cancelled(), "close must stop the worker, not just detach it"
+        assert not dispatcher._publication_failed
+        assert isinstance(dispatcher.failure, TimeoutError)
+        assert not publisher.release.is_set()
+        assert dispatcher._worker is None
+        assert dispatcher.queue.empty()
+        assert dispatcher.queued_bytes == 0
+        await asyncio.wait_for(dispatcher.queue.join(), 1)
     finally:
-        if dispatcher._worker is not None:
-            publisher.release.set()
-            await dispatcher.queue.put(None)
-            dispatcher._queued_sizes.put_nowait(0)
-            await dispatcher._worker
-    assert isinstance(dispatcher.failure, TimeoutError)
-    assert not publisher.release.is_set()
-    assert dispatcher._worker is None
-    assert dispatcher.queue.empty()
+        closing.cancel()
+        worker.cancel()
+        await asyncio.gather(closing, worker, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_close_backstop_reports_a_cancellation_resistant_publisher(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from mimir.acp import updates
+
+    class ResistantPublisher(Publisher):
+        async def publish_live(self, update):
+            self.entered.set()
+            while not self.release.is_set():
+                try:
+                    await self.release.wait()
+                except asyncio.CancelledError:
+                    # Deliberately broken dependency to exercise the backstop.
+                    continue
+
+    publisher = ResistantPublisher()
+    dispatcher = UpdateDispatcher(publisher)
+    dispatcher.enqueue(_start_event("start", "search", {}))
+    await publisher.entered.wait()
+    monkeypatch.setattr(updates, "UPDATE_CLOSE_TIMEOUT", 0.02)
+    worker = dispatcher._worker
+    closing = asyncio.create_task(dispatcher.close())
+    try:
+        done, _ = await asyncio.wait({closing}, timeout=1)
+        assert closing in done, "close's cancellation backstop was not bounded"
+        with pytest.raises(TimeoutError):
+            await closing
+        assert dispatcher._worker is worker
+        assert worker is not None and not worker.done()
+    finally:
+        publisher.release.set()
+        await asyncio.gather(closing, worker, return_exceptions=True)
 
 
 @pytest.mark.asyncio

@@ -178,7 +178,12 @@ class UpdateDispatcher:
             if self._failure is None:
                 self._failure = exc
             worker.cancel()
-            await asyncio.gather(worker, return_exceptions=True)
+            # Shield the gather so wait_for cannot itself wait indefinitely for
+            # a publisher that resists cancellation. Keep ownership on failure.
+            await asyncio.wait_for(
+                asyncio.shield(asyncio.gather(worker, return_exceptions=True)),
+                UPDATE_CLOSE_TIMEOUT,
+            )
             while not self.queue.empty():
                 self.queue.get_nowait()
                 size = self._queued_sizes.get_nowait()
@@ -224,7 +229,7 @@ class UpdateDispatcher:
                                     await self.publisher.publish_live(update)
                                 else:
                                     await self.publisher.publish_live(update, accepted=True)
-                            except BaseException as exc:
+                            except Exception as exc:
                                 if self._failure is None:
                                     self._failure = exc
                                 self._publication_failed = True

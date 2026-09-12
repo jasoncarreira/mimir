@@ -331,51 +331,59 @@ async def execute_contained(
         return await process.wait()
 
     monitor_task = asyncio.create_task(monitor_output())
-    collect_task = asyncio.create_task(collect())
-    timed_out = False
     try:
+        collect_task = asyncio.create_task(collect())
+        timed_out = False
         try:
-            exit_code = await asyncio.wait_for(asyncio.shield(collect_task), timeout_s)
-        except TimeoutError:
-            timed_out = True
             try:
-                await client.cancel(identifier)
-            except Exception:
-                pass
+                exit_code = await asyncio.wait_for(asyncio.shield(collect_task), timeout_s)
+            except TimeoutError:
+                timed_out = True
+                try:
+                    await client.cancel(identifier)
+                except Exception:
+                    pass
+                finally:
+                    exit_code = await collect_task
+        except asyncio.CancelledError:
+            await asyncio.shield(client.cancel(identifier))
+            try:
+                await asyncio.shield(collect_task)
             finally:
-                exit_code = await collect_task
-    except asyncio.CancelledError:
-        await asyncio.shield(client.cancel(identifier))
+                raise
+        monitor_task.cancel()
+        await asyncio.gather(monitor_task, return_exceptions=True)
+        if cancel_task is not None:
+            await cancel_task
+        stdout, stdout_dropped = stdout_sink.read_bounded(scrubber=scrubber)
+        stderr, stderr_dropped = stderr_sink.read_bounded(scrubber=scrubber)
+        observed_overflow = (
+            stdout_sink.did_overflow
+            or stderr_sink.did_overflow
+            or getattr(process, "output_overflow", False)
+        )
+        if observed_overflow and not output_overflow:
+            output_overflow = True
+            await cancel_for_overflow()
+        stdout_sink.truncate_to_limit()
+        stderr_sink.truncate_to_limit()
+        return CollectedExecutionResult(
+            exit_code=exit_code,
+            stdout=stdout,
+            stderr=stderr,
+            timed_out=timed_out or getattr(process, "timed_out", False),
+            output_overflow=output_overflow,
+            stdout_dropped_bytes=stdout_dropped,
+            stderr_dropped_bytes=stderr_dropped,
+        )
+    finally:
         try:
-            await asyncio.shield(collect_task)
+            monitor_task.cancel()
+            await asyncio.gather(monitor_task, return_exceptions=True)
+            if cancel_task is not None:
+                cancel_task.cancel()
+                await asyncio.gather(cancel_task, return_exceptions=True)
         finally:
-            raise
-    monitor_task.cancel()
-    await asyncio.gather(monitor_task, return_exceptions=True)
-    if cancel_task is not None:
-        await cancel_task
-    stdout, stdout_dropped = stdout_sink.read_bounded(scrubber=scrubber)
-    stderr, stderr_dropped = stderr_sink.read_bounded(scrubber=scrubber)
-    observed_overflow = (
-        stdout_sink.did_overflow
-        or stderr_sink.did_overflow
-        or getattr(process, "output_overflow", False)
-    )
-    if observed_overflow and not output_overflow:
-        output_overflow = True
-        await cancel_for_overflow()
-    stdout_sink.truncate_to_limit()
-    stderr_sink.truncate_to_limit()
-    result = CollectedExecutionResult(
-        exit_code=exit_code,
-        stdout=stdout,
-        stderr=stderr,
-        timed_out=timed_out or getattr(process, "timed_out", False),
-        output_overflow=output_overflow,
-        stdout_dropped_bytes=stdout_dropped,
-        stderr_dropped_bytes=stderr_dropped,
-    )
-    if opened_here:
-        stdout_sink.close()
-        stderr_sink.close()
-    return result
+            if opened_here:
+                stdout_sink.close()
+                stderr_sink.close()
