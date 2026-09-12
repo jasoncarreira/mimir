@@ -10039,11 +10039,29 @@ def classify_protected_result(
             ),
             source_kind="protected_tool",
             integrity="untrusted",
-            # Unlike poller ingress, repository results have no trusted author
-            # attestation. Exact PR scope bounds repository sinks; it does not
-            # exempt attacker-controlled text from global active-ingest gates.
+            # Unknown authorship remains active ingest. Native forge reads may
+            # publish exact-scope, server-attested provenance for every author.
             integrity_effect="active_ingest",
         )
+        if not failed and provenance is not None and provenance.sources:
+            if all(
+                item.domain == source.domain
+                and item.resource_id == source.resource_id
+                and item.principal == source.principal
+                and item.bridge_instance == source.bridge_instance
+                and item.sensitivity == source.sensitivity
+                and item.authorized_principals == source.authorized_principals
+                and item.source_kind == source.source_kind
+                and item.integrity_effect == source.integrity_effect
+                for item in provenance.sources
+            ):
+                source = replace(
+                    source,
+                    integrity=(
+                        "trusted" if all(item.integrity == "trusted" for item in provenance.sources)
+                        else "untrusted"
+                    ),
+                )
         labels = InformationFlowLabels().with_source(source)
         channel = getattr(auth_context, "channel_id", None)
         return labels.with_channel(channel) if channel else labels

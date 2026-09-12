@@ -488,9 +488,33 @@ class InformationFlowLabels:
 
 
 @dataclass
+class RepositoryAuthorTrustCache:
+    """Turn-local GitHub verdicts; transport uncertainty is never cached."""
+
+    _verdicts: dict[tuple[str, str], bool] = field(default_factory=dict, repr=False)
+    _lock: Any = field(default_factory=threading.Lock, repr=False, compare=False)
+
+    def resolve(self, repository: str, author: str, attest: Any) -> bool | None:
+        key = (repository.casefold(), author.casefold())
+        # Serialize concurrent reads so one author incurs only one attestation.
+        # Callers execute in worker threads, never on the event loop.
+        with self._lock:
+            if key in self._verdicts:
+                return self._verdicts[key]
+            verdict = attest()
+            if type(verdict) is bool:
+                self._verdicts[key] = verdict
+                return verdict
+            return None
+
+
+@dataclass
 class InformationFlowState:
     """Turn-local monotonic IFC state shared by frozen runtime carriers."""
 
+    repository_author_trust: RepositoryAuthorTrustCache = field(
+        default_factory=RepositoryAuthorTrustCache, repr=False, compare=False, init=False,
+    )
     labels: InformationFlowLabels | None = None
     _declassification: "DeclassificationCapability | None" = field(
         default=None, repr=False, compare=False,

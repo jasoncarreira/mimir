@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import os
@@ -9,6 +10,7 @@ import re
 import threading
 import unicodedata
 from dataclasses import asdict
+from functools import wraps
 from pathlib import Path
 from typing import Any
 
@@ -679,6 +681,58 @@ def _call(operation: Any) -> Any:
         raise ToolException(str(exc)) from exc
 
 
+def _publish_author_attestation(
+    runtime: ToolRuntime[AuthContext] | None,
+    scope: RepoPRActionScope,
+    authors: tuple[str, ...],
+) -> None:
+    """Publish provenance only for authors obtained from native forge projections.
+
+    Missing actors/adapters and unavailable attestation fail closed for this
+    result. Only definitive verdicts enter the turn-local cache; no PR-level
+    verdict is persisted. Logs, checks and mutation output are not author text
+    and deliberately do not use this exemption.
+    """
+    from ..access_control import publish_protected_result
+    from ..models import SourceLabel
+
+    context = getattr(runtime, "context", None)
+    if context is None:
+        return
+    attest = getattr(_client(scope), "author_is_trusted", None)
+    if not callable(attest):
+        return
+    trusted = True
+    for author in dict.fromkeys(authors):
+        if not isinstance(author, str) or not author:
+            trusted = False
+            continue
+        verdict = context.ifc_state.repository_author_trust.resolve(
+            scope.canonical_repo, author,
+            lambda: attest(scope.canonical_repo, author),
+        )
+        trusted = trusted and verdict is True
+    principal = context.canonical_principal
+    if context.is_service and principal:
+        principal = f"service:{principal}"
+    publish_protected_result((SourceLabel(
+        principal=principal, domain="repository",
+        resource_id=f"{scope.canonical_repo}#pull/{scope.pr_number}@{scope.observed_head_sha}",
+        bridge_instance="forge", sensitivity="internal",
+        authorized_principals=frozenset({principal}) if principal else frozenset(),
+        source_kind="protected_tool", integrity="trusted" if trusted else "untrusted",
+        integrity_effect="active_ingest",
+    ),))
+
+
+def _pr_content_authors(client: ForgeClient, scope: RepoPRActionScope) -> tuple[str, ...]:
+    """Bind PR-owned diff/file text to API authorship at the scoped head."""
+    metadata = client.get_pull_request(scope)
+    if metadata.number != scope.pr_number or metadata.head_sha != scope.observed_head_sha:
+        return ("",)
+    return (metadata.author,)
+
+
 @tool
 def pr_metadata(
     repository: str,
@@ -687,7 +741,12 @@ def pr_metadata(
 ) -> dict[str, Any]:
     """Read metadata for an exact pull request authorized by this turn."""
     scope = _scope(runtime, repository, pull_request)
-    return asdict(_call(lambda: _client(scope).get_pull_request(scope)))
+    metadata = _call(lambda: _client(scope).get_pull_request(scope))
+    authors = (metadata.author,) if (
+        metadata.number == scope.pr_number and metadata.head_sha == scope.observed_head_sha
+    ) else ("",)
+    _publish_author_attestation(runtime, scope, authors)
+    return asdict(metadata)
 
 
 @tool
@@ -698,7 +757,11 @@ def pr_files(
 ) -> list[dict[str, Any]]:
     """List bounded file projections for the pull request bound to this turn."""
     scope = _scope(runtime, repository, pull_request)
-    return [asdict(item) for item in _call(lambda: _client(scope).list_files(scope))]
+    client = _client(scope)
+    items = _call(lambda: client.list_files(scope))
+    if callable(getattr(client, "author_is_trusted", None)):
+        _publish_author_attestation(runtime, scope, _call(lambda: _pr_content_authors(client, scope)))
+    return [asdict(item) for item in items]
 
 
 @tool
@@ -709,7 +772,11 @@ def pr_diff(
 ) -> str:
     """Read the bounded unified diff for the pull request bound to this turn."""
     scope = _scope(runtime, repository, pull_request)
-    return _call(lambda: _client(scope).get_diff(scope))
+    client = _client(scope)
+    diff = _call(lambda: client.get_diff(scope))
+    if callable(getattr(client, "author_is_trusted", None)):
+        _publish_author_attestation(runtime, scope, _call(lambda: _pr_content_authors(client, scope)))
+    return diff
 
 
 @tool
@@ -770,7 +837,9 @@ def pr_reviews(
 ) -> list[dict[str, Any]]:
     """List bounded submitted-review projections for the bound pull request."""
     scope = _scope(runtime, repository, pull_request)
-    return [asdict(item) for item in _call(lambda: _client(scope).list_reviews(scope))]
+    items = _call(lambda: _client(scope).list_reviews(scope))
+    _publish_author_attestation(runtime, scope, tuple(item.author for item in items))
+    return [asdict(item) for item in items]
 
 
 @tool
@@ -781,7 +850,9 @@ def pr_comments(
 ) -> list[dict[str, Any]]:
     """List bounded conversation and inline comments for the bound pull request."""
     scope = _scope(runtime, repository, pull_request)
-    return [asdict(item) for item in _call(lambda: _client(scope).list_comments(scope))]
+    items = _call(lambda: _client(scope).list_comments(scope))
+    _publish_author_attestation(runtime, scope, tuple(item.author for item in items))
+    return [asdict(item) for item in items]
 
 
 @tool
@@ -1041,6 +1112,15 @@ def _bind_injected_runtime(forge_tool: StructuredTool) -> StructuredTool:
     if forge_tool.func is None:
         raise RuntimeError(f"forge tool {forge_tool.name!r} has no sync callable")
     forge_tool.func.__annotations__["runtime"] = ToolRuntime
+    sync_function = forge_tool.func
+
+    @wraps(sync_function)
+    async def off_loop(*args: Any, **kwargs: Any) -> Any:
+        # Explicitly offload both the forge transport and author attestation.
+        # to_thread propagates the exact call's protected-provenance capture.
+        return await asyncio.to_thread(sync_function, *args, **kwargs)
+
+    forge_tool.coroutine = off_loop
     forge_tool.args_schema = create_schema_from_function(
         forge_tool.name,
         forge_tool.func,
