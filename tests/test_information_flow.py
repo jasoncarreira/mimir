@@ -6,6 +6,7 @@ import hashlib
 import json
 import logging
 import subprocess
+from collections.abc import Callable
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -78,6 +79,7 @@ from mimir.models import (
     RepoPRActionScope,
     RepoReviewState,
     SourceLabel,
+    TurnContext,
     TurnInteractivity,
 )
 from mimir.pr_checkout_lease import PRCheckoutLease, _metadata
@@ -114,6 +116,23 @@ def ingress_resolver(tmp_path: Path) -> IdentityResolver:
     resolver = IdentityResolver(home)
     resolver.reload()
     return resolver
+
+
+@pytest.fixture
+def bind_approval_turn(request: pytest.FixtureRequest) -> Callable[[AuthContext], TurnContext]:
+    from mimir._context import reset_current_turn, set_current_turn
+
+    def bind(auth: AuthContext) -> TurnContext:
+        turn = TurnContext(
+            turn_id=request.node.nodeid, session_id=auth.channel_id,
+            trigger=auth.trigger, channel_id=auth.channel_id,
+            started_at=0.0, auth_context=auth, ifc_labels=auth.ifc_labels,
+        )
+        token = set_current_turn(turn)
+        request.addfinalizer(lambda: reset_current_turn(token))
+        return turn
+
+    return bind
 
 
 def _auth(channel: str = "slack-C1", *, roles: tuple[str, ...] = ()) -> AuthContext:
@@ -4494,7 +4513,9 @@ def test_worklink_run_is_blocked_after_shell_result_taints_live_turn(
     assert after.reason == "ifc_label_blocked:spawn"
 
 
-def test_user_approval_adds_only_one_exact_url_to_session(tmp_path: Path) -> None:
+def test_user_approval_adds_only_one_exact_url_to_session(
+    tmp_path: Path, bind_approval_turn: Callable[[AuthContext], TurnContext],
+) -> None:
     from mimir.event_logger import _reset_logger_for_tests, init_logger
 
     source = SourceLabel(
@@ -4505,6 +4526,7 @@ def test_user_approval_adds_only_one_exact_url_to_session(tmp_path: Path) -> Non
     )
     labels = InformationFlowLabels().with_channel("slack-C1").with_source(source)
     auth = replace(_auth(roles=("admin",)), ifc_labels=labels)
+    turn = bind_approval_turn(auth)
     exact = "https://example.test/report?day=1"
     init_logger(tmp_path / "events.jsonl", session_id="egress-approval-test")
     try:
@@ -4512,7 +4534,7 @@ def test_user_approval_adds_only_one_exact_url_to_session(tmp_path: Path) -> Non
             "fetch_url", exact, labels, auth, enforce=True,
         ).reason == "egress_destination_not_approved"
         assert approve_live_declassification(
-            auth, sink_category="network", destination=exact,
+            auth, turn_id=turn.turn_id, sink_category="network", destination=exact,
             reason="operator approved this exact fetch URL",
         ) == (True, "approved")
     finally:
@@ -4531,16 +4553,18 @@ def test_user_approval_adds_only_one_exact_url_to_session(tmp_path: Path) -> Non
 
 def test_approved_fetch_destination_remains_taint_independent(
     tmp_path: Path,
+    bind_approval_turn: Callable[[AuthContext], TurnContext],
 ) -> None:
     from mimir.event_logger import _reset_logger_for_tests, init_logger
 
     destination = "https://example.test/fixed"
     labels = _labels()
     auth = replace(_auth(roles=("admin",)), ifc_labels=labels)
+    turn = bind_approval_turn(auth)
     init_logger(tmp_path / "events.jsonl", session_id="egress-payload-test")
     try:
         assert approve_live_declassification(
-            auth, sink_category="network", destination=destination,
+            auth, turn_id=turn.turn_id, sink_category="network", destination=destination,
             reason="approve this exact fetch URL for the session",
         ) == (True, "approved")
     finally:
@@ -5661,13 +5685,14 @@ def test_declassification_audit_failure_keeps_labels():
     assert result is labels
 
 
-def test_live_declassification_is_one_use_exact_and_preserves_sources(tmp_path):
+def test_live_declassification_is_one_use_exact_and_preserves_sources(tmp_path, bind_approval_turn):
     from mimir.event_logger import _reset_logger_for_tests, init_logger
 
     events_path = tmp_path / "events.jsonl"
     init_logger(events_path, session_id="ifc-live-test")
     labels = _labels(labels=ALL_LABELS)
     auth = replace(_auth(roles=("admin",)), ifc_labels=labels)
+    turn = bind_approval_turn(auth)
     destination = str(tmp_path / "approved.txt")
     try:
         denied = SinkGate.check_sink_flow(
@@ -5675,6 +5700,7 @@ def test_live_declassification_is_one_use_exact_and_preserves_sources(tmp_path):
         )
         approved, reason = approve_live_declassification(
             auth,
+            turn_id=turn.turn_id,
             sink_category="file",
             destination=destination,
             reason="operator approved this exact file write",
@@ -5748,12 +5774,13 @@ def test_shadow_approval_mismatch_does_not_spend_grant(mismatch):
     assert state.consume_sink_approval(**arguments)
 
 
-def test_live_declassification_does_not_cross_turn_or_sink_category(tmp_path):
+def test_live_declassification_does_not_cross_turn_or_sink_category(tmp_path, bind_approval_turn):
     from mimir.event_logger import _reset_logger_for_tests, init_logger
 
     init_logger(tmp_path / "events.jsonl", session_id="ifc-isolation-test")
     labels = _labels()
     auth = replace(_auth(roles=("admin",)), ifc_labels=labels)
+    turn = bind_approval_turn(auth)
     other_turn = replace(_auth(roles=("admin",)), ifc_labels=labels)
     destination = str(tmp_path / "approved.txt")
     try:
@@ -5762,6 +5789,7 @@ def test_live_declassification_does_not_cross_turn_or_sink_category(tmp_path):
             sink_category="file",
             destination=destination,
             reason="one exact write",
+            turn_id=turn.turn_id,
         ) == (True, "approved")
     finally:
         _reset_logger_for_tests()
@@ -5781,18 +5809,20 @@ def test_live_declassification_does_not_cross_turn_or_sink_category(tmp_path):
     assert original.allowed is True
 
 
-def test_live_declassification_audit_failure_and_new_taint_fail_closed(tmp_path):
+def test_live_declassification_audit_failure_and_new_taint_fail_closed(tmp_path, bind_approval_turn):
     from mimir.event_logger import _reset_logger_for_tests, init_logger
 
     labels = _labels()
     auth = replace(_auth(roles=("admin",)), ifc_labels=labels)
     destination = str(tmp_path / "approved.txt")
     _reset_logger_for_tests()
+    turn = bind_approval_turn(auth)
     assert approve_live_declassification(
         auth,
         sink_category="file",
         destination=destination,
         reason="audit is unavailable",
+        turn_id=turn.turn_id,
     ) == (False, "approval_failed")
     assert SinkGate.check_sink_flow(
         "write_file", destination, labels, auth, enforce=True,
@@ -5805,6 +5835,7 @@ def test_live_declassification_audit_failure_and_new_taint_fail_closed(tmp_path)
             sink_category="file",
             destination=destination,
             reason="source snapshot must remain exact",
+            turn_id=turn.turn_id,
         ) == (True, "approved")
         auth.ifc_state.merge(
             InformationFlowLabels(
@@ -5823,6 +5854,7 @@ def test_live_declassification_audit_failure_and_new_taint_fail_closed(tmp_path)
             sink_category="file",
             destination=destination,
             reason="new taint must invalidate approval",
+            turn_id=turn.turn_id,
         ) == (True, "approved")
     finally:
         _reset_logger_for_tests()

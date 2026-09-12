@@ -90,6 +90,104 @@ def test_clear_requires_matching_live_turn(live_turn, case, monkeypatch):
     assert access_control.clear_live_ingest_taint(auth, turn_id=turn_id)[0] is False
 
 
+@pytest.mark.parametrize(("changes", "reason"), [
+    ({"roles": ("user",)}, "admin_required"),
+    ({"roles": (), "trigger": "poller"}, "admin_required"),
+    ({"principal": ""}, "missing_authenticated_admin"),
+    ({"canonical_principal": None}, "missing_authenticated_admin"),
+    ({"is_service": True}, "service_identity_forbidden"),
+    ({"roles": ("admin", "service")}, "service_identity_forbidden"),
+    ({"service_authority": object()}, "service_identity_forbidden"),
+    ({"principal": "service:poller"}, "service_identity_forbidden"),
+    ({"canonical_principal": " SERVICE:poller "}, "service_identity_forbidden"),
+    ({"trigger": "poller"}, "user_origin_required"),
+    ({"trigger": "shell_job_complete"}, "user_origin_required"),
+    ({"origin_trigger": "scheduled_tick"}, "user_origin_required"),
+    ({"event_ingress": "http_event"}, "user_origin_required"),
+    ({"ifc_state": None}, "missing_ifc_state"),
+])
+def test_declassification_refuses_non_operator_origins(live_turn, changes, reason):
+    auth = replace(live_turn.auth_context, **changes)
+    live_turn.auth_context = auth
+    destination = "https://attacker.test/x?d=secret"
+    assert access_control.approve_live_declassification(
+        auth, sink_category="network", destination=destination, reason="send output",
+        turn_id=live_turn.turn_id,
+    ) == (False, reason)
+    assert not auth.egress_state.is_url_approved(destination)
+    if isinstance(auth.ifc_state, InformationFlowState):
+        assert auth.ifc_state._declassification is None
+        assert auth.ifc_state.has_untrusted_active_ingest()
+
+
+@pytest.mark.parametrize("case", [
+    "auth", "turn", "id", "blank_id", "non_string_id", "carrier", "turn_auth",
+])
+def test_declassification_requires_matching_live_turn(live_turn, case, monkeypatch):
+    auth = live_turn.auth_context
+    state = auth.ifc_state
+    turn_id = live_turn.turn_id
+    if case == "auth":
+        auth = None
+    elif case == "id":
+        turn_id = "other"
+    elif case == "blank_id":
+        turn_id = " "
+        live_turn.turn_id = turn_id
+    elif case == "non_string_id":
+        turn_id = None
+        live_turn.turn_id = turn_id
+    elif case == "carrier":
+        auth = _auth()
+        # Equal label snapshots are not the same live state object.
+        assert auth.ifc_state == state
+        assert auth.ifc_state is not state
+    elif case == "turn_auth":
+        live_turn.auth_context = None
+    elif case == "turn":
+        monkeypatch.setattr("mimir._context.get_current_turn", lambda: None)
+    assert access_control.approve_live_declassification(
+        auth, turn_id=turn_id, sink_category="network",
+        destination="https://attacker.test/x?d=secret", reason="send output",
+    ) == (False, "missing_auth_context" if case == "auth" else "missing_live_turn")
+    assert state._declassification is None
+    if auth is not None:
+        assert auth.ifc_state._declassification is None
+        assert not auth.egress_state.is_url_approved("https://attacker.test/x?d=secret")
+
+
+@pytest.mark.parametrize("origin", [None, "user_message", "acp_session"])
+def test_operator_declassification_then_fetch(live_turn, origin):
+    from langchain.agents.middleware import ToolCallRequest
+    from langchain_core.messages import ToolMessage
+    from langgraph.runtime import Runtime
+    from mimir.tools.budget_gate import BudgetGateMiddleware
+
+    auth = replace(live_turn.auth_context, origin_trigger=origin)
+    live_turn.auth_context = auth
+    destination = "https://example.test/operator-approved?d=secret"
+    middleware = BudgetGateMiddleware()
+    calls = []
+
+    def handler(request):
+        calls.append(request.tool_call["name"])
+        return ToolMessage(content="response", tool_call_id=request.tool_call["id"])
+
+    def invoke(name, args):
+        return middleware.wrap_tool_call(ToolCallRequest(
+            tool_call={"name": name, "args": args, "id": name, "type": "tool_call"},
+            tool=None, state=None, runtime=Runtime(context=auth),
+        ), handler)
+
+    assert invoke("fetch_url", {"url": destination}).status == "error"
+    assert invoke("approve_declassification", {
+        "sink_category": "network", "destination": destination, "reason": "operator consent",
+    }).status == "success"
+    assert auth.egress_state.is_url_approved(destination)
+    assert invoke("fetch_url", {"url": destination}).status == "success"
+    assert calls == ["fetch_url"]
+
+
 def test_clear_audit_is_private_and_failure_is_atomic(live_turn, tmp_path, monkeypatch):
     auth = live_turn.auth_context
     original = auth.ifc_state.current()
@@ -210,6 +308,7 @@ def test_shadow_declassification_parity(live_turn, tool, target, case, monkeypat
     monkeypatch.setattr("mimir.models.time.monotonic", lambda: now)
     assert access_control.approve_live_declassification(
         auth, sink_category=access_control.get_sink_category(tool).value,
+        turn_id=live_turn.turn_id,
         destination=target, reason="approve one exact output",
     ) == (True, "approved")
     grant = auth.ifc_state._declassification
@@ -257,6 +356,7 @@ async def test_registry_shadow_approval_census(live_turn, tool, target, monkeypa
 
     assert access_control.approve_live_declassification(
         auth, sink_category=access_control.get_sink_category(tool).value,
+        turn_id=live_turn.turn_id,
         destination=target, reason="approve one census output",
     ) == (True, "approved")
     grant = auth.ifc_state._declassification
@@ -352,6 +452,7 @@ async def test_egress_still_requires_declassification(live_turn, tool, target, t
     if tool in {"write_file", "http_request"}:
         assert access_control.approve_live_declassification(
             auth, sink_category=access_control.get_sink_category(tool).value,
+            turn_id=live_turn.turn_id,
             destination=target, reason="one output still needs its own approval",
         )[0]
         approved = access_control.SinkGate.check_sink_flow(tool, target, auth.ifc_labels, auth, enforce=True)

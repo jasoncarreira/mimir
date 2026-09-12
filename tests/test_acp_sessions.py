@@ -879,9 +879,13 @@ async def test_admin_hands_permissions_precede_execution_and_preserve_raw_argume
     assert not hasattr(state.profile_policy, "permission_grants")
 
 
-@pytest.mark.parametrize("ending", ["approve", "cancel", "disconnect", "replace", "shutdown"])
+@pytest.mark.parametrize(("ending", "shield"), [
+    ("approve", True), ("cancel", True), ("disconnect", True),
+    ("replace", True), ("shutdown", True),
+    ("cancel", False), ("model_cancel", False),
+])
 async def test_permission_wait_survives_until_answer_or_prompt_cleanup(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, ending: str,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, ending: str, shield: bool,
 ) -> None:
     """Real peer/broker/gate waits, with sync and async deadlines tested concurrently."""
     from langchain.agents.middleware import ToolCallRequest
@@ -956,6 +960,7 @@ async def test_permission_wait_survives_until_answer_or_prompt_cleanup(
         gate_tasks: list[asyncio.Task[Any]] = []
         executions: list[str] = []
         results: list[ToolMessage] = []
+        decisions: list[Any] = []
         try:
             await agent.authenticate("mimir-web-key", **{"mimir.webKey": "secret"})
             session_id = (await agent.new_session(str(home), mcp_servers=_hands("hands"))).session_id
@@ -979,6 +984,15 @@ async def test_permission_wait_survives_until_answer_or_prompt_cleanup(
                 queue = bundle.turn_event_bus._exact_turn_subscribers[kwargs["turn_id"]]
                 await queue.join()
                 await agent._active_prompts[session_id].dispatcher.drain()
+                active = agent._active_prompts[session_id]
+                request_permission = active.request_permission
+
+                async def observe_permission(eligibility: Any) -> Any:
+                    decision = await request_permission(eligibility)
+                    decisions.append(decision)
+                    return decision
+
+                active.request_permission = observe_permission
                 request = ToolCallRequest(
                     tool_call={"id": "waiting-edit", "name": "hands_edit", "args": arguments, "type": "tool_call"},
                     tool=None, state=None, runtime=Runtime(context=auth),
@@ -999,8 +1013,9 @@ async def test_permission_wait_survives_until_answer_or_prompt_cleanup(
                     if sync else gate.awrap_tool_call(request, handler)
                 )
                 gate_tasks.append(task)
-                # Keep the worker observable even when the model task is cancelled.
-                result = await asyncio.shield(task)
+                # Shielded waits exercise withdrawal independently of model cancellation;
+                # unshielded waits preserve the runtime's model -> gate -> broker chain.
+                result = await asyncio.shield(task) if shield else await task
                 results.append(result)
                 messages.append(result)
                 emitter.blocks_from_messages(messages)
@@ -1041,6 +1056,9 @@ async def test_permission_wait_survives_until_answer_or_prompt_cleanup(
             else:
                 if ending == "cancel":
                     await asyncio.wait_for(agent.cancel(session_id), 3)
+                elif ending == "model_cancel":
+                    # Cancel only the model, without first withdrawing peer handles.
+                    active.model_task.cancel()
                 elif ending == "replace":
                     agent.on_connect(Client())
                     await agent.authenticate("mimir-web-key", **{"mimir.webKey": "secret"})
@@ -1054,14 +1072,22 @@ async def test_permission_wait_survives_until_answer_or_prompt_cleanup(
                 outcome = (await asyncio.wait_for(asyncio.gather(prompting, return_exceptions=True), 3))[0]
                 if ending == "cancel":
                     assert outcome.stop_reason == "cancelled"
+                    assert active.model_task.cancelled()
+                    assert not active.session.dirty
                     terminal_wire = [u for u in wire_updates if u.get("toolCallId") == "waiting-edit"]
                     assert terminal_wire[-1]["sessionUpdate"] == "tool_call_update"
                     assert terminal_wire[-1]["status"] == "failed"
                     assert "was withdrawn while waiting for the operator" in str(terminal_wire[-1]["rawOutput"])
                 else:
                     assert isinstance(outcome, sdk.RequestError)
-                denied = await asyncio.wait_for(asyncio.gather(*gate_tasks), 3)
-                assert denied[0].status == "error"
+                denied = await asyncio.wait_for(asyncio.gather(*gate_tasks, return_exceptions=True), 3)
+                if shield:
+                    assert denied[0].status == "error"
+                    assert decisions == [agent_module.ToolPermissionDecision.CANCELLED]
+                else:
+                    assert isinstance(denied[0], asyncio.CancelledError)
+                    with pytest.raises(asyncio.CancelledError):
+                        await active.model_task
                 assert executions == []
                 # Replay proves disconnect/shutdown cleanup persisted its failure,
                 # even when the old transport could no longer deliver an update.
@@ -1069,10 +1095,11 @@ async def test_permission_wait_survives_until_answer_or_prompt_cleanup(
                 await replay_agent.load_session(str(home), session_id)
                 terminal = [u for u in replay_client.updates if getattr(u, "tool_call_id", None) == "waiting-edit"]
                 assert terminal[-1].status == "failed"
-                assert "was withdrawn while waiting for the operator" in str(terminal[-1].raw_output)
+                if ending != "model_cancel":
+                    assert "was withdrawn while waiting for the operator" in str(terminal[-1].raw_output)
                 journal = agent._store.paths(session_id)[0]
                 before_late_answer = journal.read_bytes()
-                if ending in {"cancel", "replace"}:
+                if ending in {"cancel", "replace", "model_cancel"}:
                     await transport.incoming.put(answer)
                     await transport.incoming.put({"jsonrpc": "2.0", "method": "test/barrier", "params": {}})
                     await asyncio.wait_for(barrier.wait(), 3)
@@ -1088,13 +1115,21 @@ async def test_permission_wait_survives_until_answer_or_prompt_cleanup(
             assert not active.permission_tool_ids
             assert all(task.done() for task in broker_tasks)
             assert all(handle.task.done() for handle in handles)
+            if ending in {"cancel", "model_cancel"}:
+                assert all(handle._abandoned for handle in handles)
             assert all(task.done() for handle in handles for task in handle._owned_tasks)
             assert permission["id"] not in store._outgoing
             assert permission["id"] not in store._abandoned
             assert session_id not in agent._active_prompts
             assert bundle.turn_event_bus._exact_turn_subscribers == {}
-            if ending != "approve":
+            if ending != "approve" and shield:
                 assert "was withdrawn while waiting for the operator" in denied[0].content
+            if ending == "cancel":
+                core.run_turn = CoreAgent.run_turn.__get__(core)
+                response = await agent.prompt(
+                    session_id, [sdk.TextContentBlock(type="text", text="after cancel")],
+                )
+                assert response.stop_reason == "end_turn"
         finally:
             await agent.on_transport_closed(peer.peer_generation)
             await transport.incoming.put(None)
@@ -1105,7 +1140,10 @@ async def test_permission_wait_survives_until_answer_or_prompt_cleanup(
             if gate_tasks:
                 await asyncio.wait_for(asyncio.gather(*gate_tasks, return_exceptions=True), 3)
 
-    outcomes = await asyncio.gather(exercise(True), exercise(False), return_exceptions=True)
+    # A thread's run_coroutine_threadsafe permission is outside the model await
+    # chain; only prompt teardown (not model.cancel alone) withdraws that request.
+    paths = [False] if ending == "model_cancel" else [True, False]
+    outcomes = await asyncio.gather(*(exercise(sync) for sync in paths), return_exceptions=True)
     for outcome in outcomes:
         if isinstance(outcome, BaseException):
             raise outcome

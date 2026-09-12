@@ -287,7 +287,9 @@ def test_synthesis_write_executes_resolved_authorized_path(
 def test_private_admin_can_approve_only_one_exact_file_sink_through_middleware(
     tmp_path: Path,
 ) -> None:
+    from mimir._context import reset_current_turn, set_current_turn
     from mimir.event_logger import _reset_logger_for_tests, init_logger
+    from mimir.models import TurnContext
 
     labels = InformationFlowLabels(
         labels=frozenset({"private"}),
@@ -333,6 +335,11 @@ def test_private_admin_can_approve_only_one_exact_file_sink_through_middleware(
         handler,
     )
     init_logger(tmp_path / "events.jsonl", session_id="ifc-middleware-test")
+    token = set_current_turn(TurnContext(
+        turn_id="approval-turn", session_id="ifc-middleware-test",
+        trigger="user_message", channel_id=auth.channel_id,
+        started_at=0.0, auth_context=auth,
+    ))
     try:
         approval = middleware.wrap_tool_call(
             _make_request(
@@ -356,6 +363,7 @@ def test_private_admin_can_approve_only_one_exact_file_sink_through_middleware(
             handler,
         )
     finally:
+        reset_current_turn(token)
         _reset_logger_for_tests()
 
     assert denied_before.status == "error"
