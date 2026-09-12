@@ -48,9 +48,9 @@ def factory_run_timeout_s() -> float:
 def minimum_reaper_ttl_s(timeout_s: int) -> int:
     """Return the leaf-claim floor, twice the maximum leaf worker runtime.
 
-    Factory claims are excluded by ``ChainlinkClaims.reap_home`` and have their
-    own durable recovery path, so leaf locks must not inherit the much longer
-    factory timeout.
+    Live factory claims are excluded by ``ChainlinkClaims.reap_home`` and have
+    their own durable recovery path. Only stale review-only epic locks may be
+    released without relabelling, so leaf locks need not inherit factory timeout.
     """
     return 2 * timeout_s
 

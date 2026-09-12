@@ -1886,7 +1886,7 @@ class WorklinkRunner:
         lease: CheckoutLease | None = None
         try:
             if retained is not None:
-                return await self._recover_factory_070(
+                result = await self._recover_factory_070(
                     issue=issue,
                     claim_record=claim_record,
                     claims=claims,
@@ -1899,106 +1899,107 @@ class WorklinkRunner:
                     test_cmd=test_cmd,
                     runner=runner,
                 )
-            lease = _create_backend_checkout(
-                self.repo,
-                issue_id=issue_id,
-                attempt=claim_record.attempt,
-                base=base,
-                backend=selected,
-                base_fetch=config.defaults.base_fetch,
-                event_logger=_log_event,
-                runner=_list_runner(runner),
-                worker_eligible=isinstance(compute, LocalSubprocessComputeBackend),
-            )
-            git_name, git_email = _read_checkout_git_identity(lease.path, runner)
-            publishing_identity, publishing_identity_source = (
-                _read_factory_publishing_identity(self.repo)
-            )
-            github_token, github_env = _resolve_factory_github_credential(os.environ)
-            try:
-                GitHubForgeClient(token=github_token).verify_identity(publishing_identity)
-            except GitHubIdentityVerificationError as exc:
-                raise WorklinkError(
-                    f"{exc}; selected identity {publishing_identity} "
-                    f"from {publishing_identity_source}"
-                ) from exc
-            order = WorkOrder(
-                issue_id=issue_id,
-                checkout=lease.path,
-                prompt=_epic_prompt(issue),
-                rules=None,
-                timeout_s=int(_epic_run_timeout_s()),
-                env={
-                    "MIMIR_HOME": str(self.home),
-                    "MIMIR_WORK_ITEM_JSON": work_item_json,
-                    **github_env,
-                    "GIT_AUTHOR_NAME": git_name,
-                    "GIT_AUTHOR_EMAIL": git_email,
-                    "GIT_COMMITTER_NAME": git_name,
-                    "GIT_COMMITTER_EMAIL": git_email,
-                    # The factory child does the publishing, and 0.8.0+ compares this
-                    # declared identity against ``gh api /user`` at Gate 1.
-                    #
-                    # Two DIFFERENT names are in play: the operator selects the identity
-                    # with MIMIR_FACTORY_PUBLISHING_IDENTITY, the child reads the
-                    # factory's own FACTORY_PUBLISHING_IDENTITY. Forward the value the
-                    # controller already resolved and verified above, under the child's
-                    # name -- inheritance alone would carry nothing in the local case,
-                    # where the identity comes from .factory.json and no variable is
-                    # exported at all. This also keeps the controller authoritative over
-                    # whatever .factory.json the sandbox happens to hold.
-                    FACTORY_PUBLISHING_IDENTITY_ENV: publishing_identity,
-                },
-                transcript_root=self.home / "state" / "worklink" / "transcripts",
-            )
-            spec = selected.work_spec(
-                order,
-                attempt=claim_record.attempt,
-                repo_url=repo_url,
-                base_ref=lease.base_ref,
-                branch=f"feature/{run_id}",
-                test_command=test_cmd,
-            )
-            _require_factory_launch_binding(spec, run_id, publishing_identity)
-            factory_record = FactoryRunRecord(
-                run_id=run_id,
-                issue_id=issue_id,
-                attempt=claim_record.attempt,
-                repository=repo_slug,
-                base_ref=base,
-                branch=f"feature/{run_id}",
-                launcher=str(launcher),
-                sandbox=str(lease.path / ".factory-sandboxes" / run_id),
-                session=None,
-                handle=None,
-                status=None,
-                observed_at=None,
-                controller_phase="running",
-                transcript=None,
-            )
-            _create_factory_sandbox(factory_record, lease)
-            _prepare_factory_sandbox_permissions(
-                lease.path / ".factory-sandboxes",
-                worker_uid_drop=isinstance(compute, LocalSubprocessComputeBackend),
-            )
-            handle = await compute.launch(spec)
-            factory_record = replace(factory_record, handle=handle)
-            try:
-                save_factory_record(self.home, factory_record)
-            except BaseException:
-                await _cancel_and_cleanup_factory_handle(compute, handle)
-                raise
-            return await self._supervise_factory_070(
-                issue=issue,
-                claim_record=claim_record,
-                claims=claims,
-                backend=selected,
-                compute=compute,
-                factory_record=factory_record,
-                test_cmd=test_cmd,
-                runner=runner,
-                started_at=datetime.now(UTC),
-            )
+            else:
+                lease = _create_backend_checkout(
+                    self.repo,
+                    issue_id=issue_id,
+                    attempt=claim_record.attempt,
+                    base=base,
+                    backend=selected,
+                    base_fetch=config.defaults.base_fetch,
+                    event_logger=_log_event,
+                    runner=_list_runner(runner),
+                    worker_eligible=isinstance(compute, LocalSubprocessComputeBackend),
+                )
+                git_name, git_email = _read_checkout_git_identity(lease.path, runner)
+                publishing_identity, publishing_identity_source = (
+                    _read_factory_publishing_identity(self.repo)
+                )
+                github_token, github_env = _resolve_factory_github_credential(os.environ)
+                try:
+                    GitHubForgeClient(token=github_token).verify_identity(publishing_identity)
+                except GitHubIdentityVerificationError as exc:
+                    raise WorklinkError(
+                        f"{exc}; selected identity {publishing_identity} "
+                        f"from {publishing_identity_source}"
+                    ) from exc
+                order = WorkOrder(
+                    issue_id=issue_id,
+                    checkout=lease.path,
+                    prompt=_epic_prompt(issue),
+                    rules=None,
+                    timeout_s=int(_epic_run_timeout_s()),
+                    env={
+                        "MIMIR_HOME": str(self.home),
+                        "MIMIR_WORK_ITEM_JSON": work_item_json,
+                        **github_env,
+                        "GIT_AUTHOR_NAME": git_name,
+                        "GIT_AUTHOR_EMAIL": git_email,
+                        "GIT_COMMITTER_NAME": git_name,
+                        "GIT_COMMITTER_EMAIL": git_email,
+                        # The factory child does the publishing, and 0.8.0+ compares this
+                        # declared identity against ``gh api /user`` at Gate 1.
+                        #
+                        # Two DIFFERENT names are in play: the operator selects the identity
+                        # with MIMIR_FACTORY_PUBLISHING_IDENTITY, the child reads the
+                        # factory's own FACTORY_PUBLISHING_IDENTITY. Forward the value the
+                        # controller already resolved and verified above, under the child's
+                        # name -- inheritance alone would carry nothing in the local case,
+                        # where the identity comes from .factory.json and no variable is
+                        # exported at all. This also keeps the controller authoritative over
+                        # whatever .factory.json the sandbox happens to hold.
+                        FACTORY_PUBLISHING_IDENTITY_ENV: publishing_identity,
+                    },
+                    transcript_root=self.home / "state" / "worklink" / "transcripts",
+                )
+                spec = selected.work_spec(
+                    order,
+                    attempt=claim_record.attempt,
+                    repo_url=repo_url,
+                    base_ref=lease.base_ref,
+                    branch=f"feature/{run_id}",
+                    test_command=test_cmd,
+                )
+                _require_factory_launch_binding(spec, run_id, publishing_identity)
+                factory_record = FactoryRunRecord(
+                    run_id=run_id,
+                    issue_id=issue_id,
+                    attempt=claim_record.attempt,
+                    repository=repo_slug,
+                    base_ref=base,
+                    branch=f"feature/{run_id}",
+                    launcher=str(launcher),
+                    sandbox=str(lease.path / ".factory-sandboxes" / run_id),
+                    session=None,
+                    handle=None,
+                    status=None,
+                    observed_at=None,
+                    controller_phase="running",
+                    transcript=None,
+                )
+                _create_factory_sandbox(factory_record, lease)
+                _prepare_factory_sandbox_permissions(
+                    lease.path / ".factory-sandboxes",
+                    worker_uid_drop=isinstance(compute, LocalSubprocessComputeBackend),
+                )
+                handle = await compute.launch(spec)
+                factory_record = replace(factory_record, handle=handle)
+                try:
+                    save_factory_record(self.home, factory_record)
+                except BaseException:
+                    await _cancel_and_cleanup_factory_handle(compute, handle)
+                    raise
+                result = await self._supervise_factory_070(
+                    issue=issue,
+                    claim_record=claim_record,
+                    claims=claims,
+                    backend=selected,
+                    compute=compute,
+                    factory_record=factory_record,
+                    test_cmd=test_cmd,
+                    runner=runner,
+                    started_at=datetime.now(UTC),
+                )
         except Exception as exc:
             original_reason = str(exc)
             try:
@@ -2049,7 +2050,7 @@ class WorklinkRunner:
                     else {}
                 ),
             )
-            return WorklinkRunResult(
+            result = WorklinkRunResult(
                 issue_id,
                 claim_record.attempt,
                 "failed",
@@ -2060,13 +2061,19 @@ class WorklinkRunner:
                 preservation_error=preservation_error,
             )
         finally:
-            _release_issue_and_clear_run_state(
+            released = _release_issue_and_clear_run_state(
                 claims,
                 home=self.home,
                 issue_id=issue_id,
                 attempt=claim_record.attempt,
                 trigger_ready_scan=autonomous,
             )
+        if not released:
+            reason = "terminal recovery incomplete: Chainlink lock release failed"
+            if result.reason:
+                reason = f"{result.reason}; {reason}"
+            result = replace(result, status="failed", reason=reason)
+        return result
 
     async def _recover_factory_070(
         self,

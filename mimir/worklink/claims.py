@@ -845,6 +845,7 @@ class ChainlinkClaims:
         records: Iterable[ClaimRecord],
         *,
         ttl: timedelta,
+        release_only_issue_ids: Iterable[int] = (),
     ) -> ReapResult:
         """Release stale claims and move the issue back to ready or blocked.
 
@@ -853,6 +854,7 @@ class ChainlinkClaims:
         steal is attempted.
         """
         now = self.clock()
+        release_only_ids = set(release_only_issue_ids)
         reaped: list[ClaimRecord] = []
         examined = 0
         skipped: dict[str, int] = {}
@@ -876,6 +878,24 @@ class ChainlinkClaims:
             if not lock_held:
                 record_skip("lock_not_held", record.issue_id)
                 continue
+            current = record
+            for candidate in claim_records_from_comments(self._issue_comments(record.issue_id)):
+                if candidate.issue_id == record.issue_id and _claim_is_newer(candidate, current):
+                    current = candidate
+            if current != record:
+                record_skip("claim_changed", record.issue_id)
+                continue
+            try:
+                labels = self._issue_labels(record.issue_id, strict=True)
+            except (RuntimeError, OSError):
+                record_skip("epic_label_unavailable", record.issue_id)
+                continue
+            is_epic = WORKLINK_EPIC_LABEL in labels
+            review_only = "worklink:review" in labels and "worklink:in-progress" not in labels
+            if (is_epic or record.issue_id in release_only_ids) and not review_only:
+                record_skip("epic_not_review_only", record.issue_id)
+                continue
+            release_only = is_epic or record.issue_id in release_only_ids
             steal = self._run("locks", "steal", str(record.issue_id), check=False)
             self._emit_claim_stolen(
                 issue_id=record.issue_id,
@@ -887,7 +907,7 @@ class ChainlinkClaims:
             if steal.returncode != 0:
                 record_skip("lock_steal_failed", record.issue_id)
                 continue
-            if not self._issue_has_label(record.issue_id, "worklink:in-progress"):
+            if release_only or not self._issue_has_label(record.issue_id, "worklink:in-progress"):
                 self._run("locks", "release", str(record.issue_id), check=False)
                 record_skip("in_progress_label_missing", record.issue_id)
                 continue
@@ -940,15 +960,23 @@ class ChainlinkClaims:
             skipped_issue_ids=skipped_issue_ids,
         )
 
-    def _issue_labels(self, issue_id: int) -> set[str]:
+    def _issue_labels(self, issue_id: int, *, strict: bool = False) -> set[str]:
         """Return current labels when Chainlink exposes them, otherwise empty."""
         result = self._run("issue", "show", str(issue_id), "--json", check=False)
         if result.returncode != 0:
+            if strict:
+                raise RuntimeError("issue labels unavailable")
             return set()
         try:
             data = json.loads(result.stdout or "{}")
         except json.JSONDecodeError:
+            if strict:
+                raise RuntimeError("issue labels unavailable")
             return set()
+        if strict and (
+            not isinstance(data, dict) or not isinstance(data.get("labels"), (list, dict))
+        ):
+            raise RuntimeError("issue labels unavailable")
         raw_labels = data.get("labels")
         labels: set[str] = set()
         if isinstance(raw_labels, list):
@@ -959,6 +987,10 @@ class ChainlinkClaims:
                     name = item.get("name") or item.get("label")
                     if name:
                         labels.add(str(name))
+                    elif strict:
+                        raise RuntimeError("issue labels unavailable")
+                elif strict:
+                    raise RuntimeError("issue labels unavailable")
         elif isinstance(raw_labels, dict):
             labels.update(str(name) for name in raw_labels)
         return labels
@@ -1207,6 +1239,7 @@ class ChainlinkClaims:
         records-in transform that's trivial to unit-test.
         """
         latest: dict[int, ClaimRecord] = {}
+        release_only_ids: set[int] = set()
         discovery_skipped: dict[str, int] = {}
         try:
             issue_ids = set(self._list_issue_ids("worklink:in-progress"))
@@ -1226,23 +1259,25 @@ class ChainlinkClaims:
             # Factory claims have a longer runtime than leaves. If labels cannot
             # be read, fail closed and skip the issue rather than applying the
             # leaf TTL to a factory lock whose epic marker could not be observed.
-            epic_status = self._issue_has_label(
-                issue_id,
-                WORKLINK_EPIC_LABEL,
-                default_on_unavailable=None,
-            )
-            if epic_status is None:
+            try:
+                labels = self._issue_labels(issue_id, strict=True)
+            except (RuntimeError, OSError):
                 discovery_skipped["epic_label_unavailable"] = (
                     discovery_skipped.get("epic_label_unavailable", 0) + 1
                 )
                 continue
-            if epic_status:
-                continue
+            if WORKLINK_EPIC_LABEL in labels:
+                if "worklink:review" not in labels or "worklink:in-progress" in labels:
+                    continue
+                # Pin cleanup to release-only even if labels change after stealing.
+                release_only_ids.add(issue_id)
             for record in claim_records_from_comments(self._issue_comments(issue_id)):
                 current = latest.get(record.issue_id)
                 if current is None or _claim_is_newer(record, current):
                     latest[record.issue_id] = record
-        result = self.reap_stale_claims(latest.values(), ttl=ttl)
+        result = self.reap_stale_claims(
+            latest.values(), ttl=ttl, release_only_issue_ids=release_only_ids,
+        )
         if not discovery_skipped:
             return result
         return ReapResult(
