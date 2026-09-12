@@ -2745,8 +2745,8 @@ async def test_pr_refusal_event_identifies_repository_and_number(
 
     assert result.status == "error"
     tool_call = next(fields for kind, fields in events if kind == "tool_call")
-    assert tool_call["repository"] == "owner/repo"
-    assert tool_call["pull_request"] == 1300
+    assert tool_call["arguments"]["repository"] == "owner/repo"
+    assert tool_call["arguments"]["pull_request"] == 1300
     assert tool_call["denied"] is True
 
 

@@ -1691,27 +1691,28 @@ class Agent:
             # chainlink #650) are routed to real-FS backends via a
             # CompositeBackend; the home stays the default (guarding out-of-root
             # absolute paths with a clear error instead of a false not-found).
-            if self._backend is None:
-                home_backend = WriteGuardBackend(
-                    root_dir=self._config.home,
-                    writable_dirs=self._config.writable_dirs,
-                    guard_outside_root=True,
+            # Refresh routes on graph builds (including retries after failed
+            # builds), not on file operations: the lease root may appear later.
+            home_backend = WriteGuardBackend(
+                root_dir=self._config.home,
+                writable_dirs=self._config.writable_dirs,
+                guard_outside_root=True,
+            )
+            roots = getattr(self._config, "file_tool_roots", ()) or ()
+            lease_root = os.environ.get("MIMIR_PR_CHECKOUT_LEASE_ROOT", "").strip()
+            if lease_root:
+                candidate = Path(lease_root)
+                if candidate.is_absolute() and candidate.is_dir() and not candidate.is_symlink():
+                    roots = (*roots, (str(candidate.resolve()), "rw"))
+            routes = build_file_tool_routes(roots) if roots else {}
+            if routes:
+                self._backend = FileToolRouter(default=home_backend, routes=routes)
+                log.info(
+                    "file tools: %d extra root(s) routed beyond the home: %s",
+                    len(routes), ", ".join(sorted(routes)),
                 )
-                roots = getattr(self._config, "file_tool_roots", ()) or ()
-                lease_root = os.environ.get("MIMIR_PR_CHECKOUT_LEASE_ROOT", "").strip()
-                if lease_root:
-                    candidate = Path(lease_root)
-                    if candidate.is_absolute() and candidate.is_dir() and not candidate.is_symlink():
-                        roots = (*roots, (str(candidate.resolve()), "rw"))
-                routes = build_file_tool_routes(roots) if roots else {}
-                if routes:
-                    self._backend = FileToolRouter(default=home_backend, routes=routes)
-                    log.info(
-                        "file tools: %d extra root(s) routed beyond the home: %s",
-                        len(routes), ", ".join(sorted(routes)),
-                    )
-                else:
-                    self._backend = home_backend
+            else:
+                self._backend = home_backend
 
             # Bridge ChatCodexPlus's per-response x-codex-* headers
             # into the same RateLimitStore that OpenAIQuotaProvider
