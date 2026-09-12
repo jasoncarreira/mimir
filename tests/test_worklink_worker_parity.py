@@ -555,9 +555,13 @@ async def test_direct_termination_kills_pipe_holding_grandchild(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("scenario", SCENARIOS)
+@pytest.mark.parametrize(
+    "scenario,delay_term_output",
+    [pytest.param(scenario, False, id=scenario) for scenario in SCENARIOS]
+    + [pytest.param("running_cancellation", True, id="running_cancellation-delayed-handler")],
+)
 async def test_closed_worker_direct_parity_inventory(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, scenario: str
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, scenario: str, delay_term_output: bool
 ) -> None:
     assert SCENARIOS == (
         "normal_completion",
@@ -824,10 +828,17 @@ async def test_closed_worker_direct_parity_inventory(
         monkeypatch.setattr(compute.os, "killpg", observed_killpg)
         monkeypatch.setattr("mimir.worklink.checkout.coding_enabled", lambda: False)
         direct_backend = LocalSubprocessComputeBackend()
+        # Negative control: hold the handler before its write until SIGKILL,
+        # independent of scheduler load or the duration of the TERM grace.
+        term_handler = (
+            "lambda *_: (threading.Event().wait(), os.write(1,b'term\\n'))"
+            if delay_term_output
+            else "lambda *_: os.write(1,b'term\\n')"
+        )
         direct_handle = await direct_backend.launch(
             direct_spec(
                 "import os,signal,threading; "
-                "signal.signal(signal.SIGTERM, lambda *_: os.write(1,b'term\\n')); "
+                f"signal.signal(signal.SIGTERM, {term_handler}); "
                 "os.write(1,b'ready\\n'); "
                 f"os.write({direct_ready_w},b'1'); os.close({direct_ready_w}); "
                 "threading.Event().wait()"
@@ -840,9 +851,14 @@ async def test_closed_worker_direct_parity_inventory(
         await direct_backend.cleanup(direct_handle)
         direct_events.append("cleanup")
         assert direct_events == ["term", "kill", "reap", "terminal", "cleanup"]
-        assert (direct.exit_code, direct.stdout, direct.stderr, direct.timed_out) == (
+        # The ready handshake owns the first write. TERM has a bounded grace,
+        # not a guarantee that the handler runs/writes before KILL, so do not
+        # require its "term" line. Signal ordering remains asserted above.
+        assert direct.stdout in ("ready\n", "ready\nterm\n")
+        if delay_term_output:
+            assert direct.stdout == "ready\n"
+        assert (direct.exit_code, direct.stderr, direct.timed_out) == (
             -signal.SIGKILL,
-            "ready\nterm\n",
             "",
             True,
         )
