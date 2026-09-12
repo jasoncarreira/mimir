@@ -3824,6 +3824,8 @@ def _run_factory_preflight_case(
     release_signals: list[str] | None = None,
     checkout_calls: list[dict[str, Any]] | None = None,
     sandbox_gid: int | None = None,
+    release_confirmed: bool = True,
+    terminal: Any = None,
 ) -> tuple[object, list[WorkSpec], list[str], list[list[str]]]:
     import mimir.worklink.orchestrator as orchestrator
 
@@ -3925,7 +3927,7 @@ def _run_factory_preflight_case(
     monkeypatch.setattr(
         orchestrator.ChainlinkClaims,
         "release_issue",
-        lambda *args, **kwargs: outcome is not None,
+        lambda *args, **kwargs: release_confirmed,
     )
 
     def create_checkout(*args: object, **kwargs: Any) -> CheckoutLease:
@@ -3938,6 +3940,8 @@ def _run_factory_preflight_case(
     monkeypatch.setattr(orchestrator.LocalSubprocessComputeBackend, "launch", launch)
     if outcome is not None:
         async def supervise(*args: object, **kwargs: object) -> object:
+            if terminal is not None:
+                return await terminal(**kwargs)
             if outcome == "post_merge_refusal":
                 current = kwargs["factory_record"]
                 assert isinstance(current, FactoryRunRecord)
@@ -3993,6 +3997,68 @@ def _run_factory_preflight_case(
         )
     )
     return result, launched, verified_tokens, commands
+
+
+@pytest.mark.parametrize("release_confirmed", [False, True])
+@pytest.mark.parametrize("completion", ["completed", "exception", "cancelled"])
+def test_factory_launch_requires_confirmed_cleanup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    release_confirmed: bool, completion: str,
+) -> None:
+    import mimir.worklink.orchestrator as orchestrator
+
+    signals: list[str] = []
+    clears: list[tuple[Path, int]] = []
+    transitions: list[dict[str, Any]] = []
+    expected = orchestrator.WorklinkRunResult(
+        700, 1, "completed", checkout=tmp_path / "sandbox",
+        branch="feature/chainlink-700", pr_url="https://github.com/owner/repo/pull/7",
+        reason="factory completed", preserved_ref="refs/heads/preserved",
+    )
+
+    async def terminal(**kwargs: Any) -> object:
+        monkeypatch.setattr(
+            kwargs["claims"], "transition_issue",
+            lambda *args, **values: transitions.append(values),
+        )
+        if completion == "cancelled":
+            raise asyncio.CancelledError
+        if completion == "exception":
+            raise WorklinkError("factory refused")
+        kwargs["claims"].transition_issue(700, status="completed", review_ready=True)
+        return expected
+
+    monkeypatch.setattr(
+        orchestrator, "clear_run_state", lambda home, issue_id: clears.append((home, issue_id))
+    )
+    kwargs = dict(
+        credentials={"GITHUB_TOKEN": "github-token"}, autonomous=True,
+        outcome="completed", release_signals=signals,
+        release_confirmed=release_confirmed, terminal=terminal,
+    )
+    if completion == "cancelled":
+        with pytest.raises(asyncio.CancelledError):
+            _run_factory_preflight_case(tmp_path, monkeypatch, **kwargs)
+        assert transitions == []
+    else:
+        result, launched, _, _ = _run_factory_preflight_case(tmp_path, monkeypatch, **kwargs)
+        assert len(launched) == 1
+        original_reason = "factory completed" if completion == "completed" else "factory refused"
+        reason = original_reason
+        if not release_confirmed:
+            reason += "; terminal recovery incomplete: Chainlink lock release failed"
+        assert result.reason == reason
+        if completion == "completed":
+            assert result == replace(
+                expected, status="completed" if release_confirmed else "failed", reason=reason
+            )
+            assert transitions == [{"status": "completed", "review_ready": True}]
+        else:
+            assert result.status == "failed"
+            assert len(transitions) == 1
+            assert transitions[0]["reason"] == original_reason
+    assert clears == ([(tmp_path, 700)] if release_confirmed else [])
+    assert signals == (["worklink_slot_released"] if release_confirmed else [])
 
 
 def test_factory_initial_local_launch_provisions_worker_sandbox_permissions(
@@ -4651,8 +4717,9 @@ def test_factory_new_run_uses_resolved_base_for_single_checkout_placement(
     assert sandbox_declaration.read_bytes() == sandbox_declaration_before
 
 
+@pytest.mark.parametrize("release_confirmed", [False, True])
 def test_factory_identity_preflight_is_not_repeated_for_retained_run(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, release_confirmed: bool
 ) -> None:
     import mimir.worklink.orchestrator as orchestrator
 
@@ -4704,9 +4771,21 @@ def test_factory_identity_preflight_is_not_repeated_for_retained_run(
     (tmp_path / "sandbox").mkdir()
     save_factory_record(tmp_path, retained)
 
+    expected = orchestrator.WorklinkRunResult(
+        700, 1, "completed", checkout=Path(retained.sandbox), branch=retained.branch,
+        pr_url="https://github.com/owner/repo/pull/7", reason="recovered completion",
+    )
+    transitions: list[dict[str, object]] = []
+    clears: list[int] = []
+    signals: list[Path] = []
+    (tmp_path / "worklink.yaml").write_text(
+        "defaults:\n  allow_autonomous_local_subprocess: true\n", encoding="utf-8"
+    )
+
     async def recover(self: object, **kwargs: object) -> object:
         assert kwargs["retained"] == retained
-        return orchestrator.WorklinkRunResult(700, 1, "needs-human")
+        kwargs["claims"].transition_issue(700, status="completed", review_ready=True)
+        return expected
 
     def unexpected(*args: object, **kwargs: object) -> object:
         raise AssertionError("new-run identity preflight reached during recovery")
@@ -4719,7 +4798,17 @@ def test_factory_identity_preflight_is_not_repeated_for_retained_run(
 
     monkeypatch.setattr(orchestrator.ChainlinkClaims, "claim_issue", claim_issue)
     monkeypatch.setattr(
-        orchestrator.ChainlinkClaims, "release_issue", lambda *args, **kwargs: None
+        orchestrator.ChainlinkClaims, "release_issue", lambda *args, **kwargs: release_confirmed
+    )
+    monkeypatch.setattr(
+        orchestrator.ChainlinkClaims, "transition_issue",
+        lambda *args, **kwargs: transitions.append(kwargs),
+    )
+    monkeypatch.setattr(
+        orchestrator, "clear_run_state", lambda home, issue_id: clears.append(issue_id)
+    )
+    monkeypatch.setattr(
+        orchestrator, "_trigger_ready_scan_after_release", lambda home: signals.append(home)
     )
     monkeypatch.setattr(WorklinkRunner, "_recover_factory_070", recover)
     monkeypatch.setattr(orchestrator, "_read_checkout_git_identity", unexpected)
@@ -4727,10 +4816,18 @@ def test_factory_identity_preflight_is_not_repeated_for_retained_run(
     monkeypatch.setattr(orchestrator, "_resolve_factory_github_credential", unexpected)
 
     result = asyncio.run(
-        WorklinkRunner(home=tmp_path, repo=repo, runner=runner, agent_id="agent").run_epic(700)
+        WorklinkRunner(home=tmp_path, repo=repo, runner=runner, agent_id="agent").run_epic(
+            700, autonomous=True
+        )
     )
 
-    assert result.status == "needs-human", result.reason
+    assert result == (expected if release_confirmed else replace(
+        expected, status="failed",
+        reason="recovered completion; terminal recovery incomplete: Chainlink lock release failed",
+    ))
+    assert transitions == [{"status": "completed", "review_ready": True}]
+    assert clears == ([700] if release_confirmed else [])
+    assert signals == ([tmp_path] if release_confirmed else [])
 
 
 @pytest.mark.parametrize("refusal", ["sandbox", "launcher", "base", "session", "lifecycle"])

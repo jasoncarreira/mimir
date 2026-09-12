@@ -469,21 +469,34 @@ def test_claim_issue_enforces_max_active_locks_after_reservation() -> None:
     assert not any(call[:3] == ["chainlink", "issue", "comment"] for call in calls)
 
 
-def test_claim_issue_cap_reports_known_capacity_consuming_issue_ids() -> None:
+@pytest.mark.parametrize("holders", [
+    {"7": {"issue_id": 7}, "8": {"issue_id": 8}},
+    {"7": {}, "8": {}},
+])
+@pytest.mark.parametrize("active_label", [None, "worklink:epic"])
+def test_claim_issue_cap_reports_known_capacity_consuming_issue_ids(holders, active_label) -> None:
     def runner(args: Sequence[str]) -> subprocess.CompletedProcess[str]:
         args = list(args)
         if args[1:4] == ["locks", "list", "--json"]:
             return subprocess.CompletedProcess(
                 args,
                 0,
-                stdout='{"locks":{"7":{"issue_id":7},"8":{"issue_id":8}}}',
+                stdout=json.dumps({"locks": holders}),
                 stderr="",
+            )
+        if args[1:3] == ["issue", "list"]:
+            return subprocess.CompletedProcess(
+                args, 0, json.dumps([
+                    {"id": 7, "labels": ["worklink:epic", "worklink:review"]},
+                    {"id": 8, "labels": ["worklink:epic", "worklink:ready"]},
+                ]), "",
             )
         return completed(args)
 
     result = ChainlinkClaims(agent_id="mimir-a", runner=runner).claim_issue(
         8,
         max_active_locks=1,
+        active_label=active_label,
     )
 
     assert result.reason and "active issue ids: [7]" in result.reason
@@ -536,6 +549,8 @@ def test_reaper_enforces_own_ttl_before_steal(tmp_path: Path) -> None:
 
     def runner(args: Sequence[str]) -> subprocess.CompletedProcess[str]:
         calls.append(list(args))
+        if list(args)[1:3] == ["issue", "show"]:
+            return subprocess.CompletedProcess(args, 0, '{"labels":["worklink:in-progress"]}', "")
         if list(args)[1:3] == ["locks", "list"]:
             return subprocess.CompletedProcess(
                 list(args),
@@ -606,6 +621,8 @@ def test_reaper_blocks_after_max_attempts() -> None:
 
     def runner(args: Sequence[str]) -> subprocess.CompletedProcess[str]:
         calls.append(list(args))
+        if list(args)[1:3] == ["issue", "show"]:
+            return subprocess.CompletedProcess(args, 0, '{"labels":["worklink:in-progress"]}', "")
         if list(args)[1:3] == ["locks", "list"]:
             return subprocess.CompletedProcess(
                 list(args),

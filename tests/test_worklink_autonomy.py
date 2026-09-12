@@ -10,6 +10,7 @@ ready-queue poller's discovery/dispatch (cap-respecting, detached).
 from __future__ import annotations
 
 import ast
+from dataclasses import replace
 import importlib.util
 import json
 import os
@@ -58,6 +59,7 @@ class FakeChainlink:
         active_locks: list[int] | None = None,
         lock_agents: dict[int, str] | None = None,
         epic_ids: set[int] | None = None,
+        review_ids: set[int] | None = None,
     ) -> None:
         self.in_progress = in_progress or []
         self.ready = ready or []
@@ -66,6 +68,7 @@ class FakeChainlink:
         self.active_locks = active_locks if active_locks is not None else list(self.in_progress)
         self.lock_agents = lock_agents or {}
         self.epic_ids = epic_ids or set()
+        self.review_ids = review_ids or set()
         self.calls: list[list[str]] = []
 
     def __call__(self, args: Sequence[str]) -> subprocess.CompletedProcess[str]:
@@ -92,6 +95,8 @@ class FakeChainlink:
                 labels.append("worklink:in-progress")
             if issue_id in self.epic_ids:
                 labels.append("worklink:epic")
+            if issue_id in self.review_ids:
+                labels.append("worklink:review")
             payload = {"id": issue_id, "comments": list(self.comments.get(issue_id, [])), "labels": labels}
             return cp(stdout=json.dumps(payload))
         if tail[:2] == ["locks", "list"]:
@@ -457,6 +462,219 @@ def test_reap_home_does_not_steal_fresh_lock_after_label_transition() -> None:
 
     assert claims.reap_home(ttl=timedelta(hours=2)).reaped == []
     assert "locks steal 59" not in fake.names()
+
+
+@pytest.mark.parametrize("attempt", [1, 3])
+@pytest.mark.parametrize("change_after_steal", [False, True])
+@pytest.mark.parametrize("entrypoint", ["home", "direct"])
+def test_reap_home_releases_stale_review_epic_without_relabelling(attempt, change_after_steal, entrypoint):
+    stale = ClaimRecord(1631, attempt, "old", datetime.now(UTC) - timedelta(hours=3))
+    fake = FakeChainlink(
+        active_locks=[1631], epic_ids={1631}, review_ids={1631},
+        comments={1631: [stale.to_comment()]},
+    )
+
+    def runner(args):
+        result = fake(args)
+        if list(args)[1:3] == ["locks", "steal"] and change_after_steal:
+            fake.in_progress = [1631]
+            fake.review_ids.clear()
+            fake.epic_ids.clear()
+        return result
+
+    claims = ChainlinkClaims(agent_id="t", runner=runner)
+    result = (
+        claims.reap_home(ttl=timedelta(hours=2))
+        if entrypoint == "home"
+        else claims.reap_stale_claims([stale], ttl=timedelta(hours=2))
+    )
+
+    assert "locks steal 1631" in fake.names()
+    assert "locks release 1631" in fake.names()
+    assert result.reaped == []  # Release-only is not a ready/blocked recovery.
+    assert not any(c[1] == "issue" and c[2] in {"label", "unlabel", "comment"} for c in fake.calls)
+
+
+@pytest.mark.parametrize("scenario", ["fresh", "heartbeat", "latest", "live", "contradictory"])
+def test_reap_home_protects_noneligible_epic_claims(scenario):
+    history = [_claim_comment(1631, attempt=1, age=timedelta(hours=3))]
+    if scenario == "fresh":
+        history = [_claim_comment(1631, attempt=1, age=timedelta(minutes=5))]
+    elif scenario == "heartbeat":
+        history = [_claim_comment(
+            1631, attempt=1, age=timedelta(hours=3), heartbeat_age=timedelta(minutes=5),
+        )]
+    elif scenario == "latest":
+        history.append(_claim_comment(1631, attempt=2, age=timedelta(minutes=5)))
+    fake = FakeChainlink(
+        active_locks=[1631], epic_ids={1631}, comments={1631: history},
+        review_ids=set() if scenario == "live" else {1631},
+        in_progress=[1631] if scenario in {"live", "contradictory"} else [],
+    )
+
+    assert ChainlinkClaims(agent_id="t", runner=fake).reap_home(ttl=timedelta(hours=2)).reaped == []
+    assert not any(c[1] == "locks" and c[2] in {"steal", "release"} for c in fake.calls)
+
+
+@pytest.mark.parametrize("scenario", [
+    "live", "contradictory", "no_review", "unreadable", "missing_labels",
+    "invalid_labels", "heartbeat", "new_claim",
+])
+def test_reap_home_rechecks_review_epic_before_forceful_steal(scenario):
+    now = datetime.now(UTC)
+    stale = ClaimRecord(1631, 1, "old", now - timedelta(hours=3))
+    fake = FakeChainlink(
+        active_locks=[1631], epic_ids={1631}, review_ids={1631},
+        comments={1631: [stale.to_comment()]},
+    )
+    rechecking = False
+
+    def runner(args):
+        nonlocal rechecking
+        result = fake(args)
+        # The second lock query is the held-lock guard, after discovery.
+        if list(args)[1:3] == ["locks", "list"] and fake.names().count("locks list --json") == 2:
+            rechecking = True
+        if rechecking and list(args)[1:3] == ["issue", "show"]:
+            payload = json.loads(result.stdout)
+            if scenario == "unreadable":
+                return cp(returncode=1)
+            if scenario == "missing_labels":
+                payload.pop("labels")
+            elif scenario == "invalid_labels":
+                payload["labels"] = "worklink:review"
+            elif scenario in {"live", "contradictory", "no_review"}:
+                payload["labels"] = ["worklink:epic"]
+                if scenario != "no_review":
+                    payload["labels"].append("worklink:in-progress")
+                if scenario == "contradictory":
+                    payload["labels"].append("worklink:review")
+            elif scenario in {"heartbeat", "new_claim"}:
+                updated = (
+                    replace(stale, heartbeat_at=now - timedelta(minutes=1))
+                    if scenario == "heartbeat"
+                    else ClaimRecord(1631, 2, "new", now - timedelta(minutes=5))
+                )
+                payload["comments"].append(updated.to_comment())
+            return cp(stdout=json.dumps(payload))
+        return result
+
+    result = ChainlinkClaims(agent_id="t", runner=runner).reap_home(ttl=timedelta(hours=2))
+
+    assert rechecking
+    assert result.reaped == []
+    assert result.skipped
+    assert not any(c[1] == "locks" and c[2] in {"steal", "release"} for c in fake.calls)
+
+
+@pytest.mark.parametrize("labels", [
+    ["worklink:epic"],
+    ["worklink:epic", "worklink:review", "worklink:in-progress"],
+], ids=["no_review", "in_progress"])
+def test_reap_home_discovery_excludes_epic_before_labels_change(labels):
+    fake = FakeChainlink(
+        active_locks=[1631], epic_ids={1631}, review_ids={1631},
+        comments={1631: [_claim_comment(1631, attempt=1, age=timedelta(hours=3))]},
+    )
+    shows = 0
+
+    def runner(args):
+        nonlocal shows
+        result = fake(args)
+        if list(args)[1:3] == ["issue", "show"]:
+            shows += 1
+            if shows == 1:
+                payload = json.loads(result.stdout)
+                payload["labels"] = labels
+                return cp(stdout=json.dumps(payload))
+        return result
+
+    result = ChainlinkClaims(agent_id="t", runner=runner).reap_home(ttl=timedelta(hours=2))
+
+    assert result.examined == 0
+    assert shows == 1
+    assert not any(c[1] == "locks" and c[2] in {"steal", "release"} for c in fake.calls)
+
+
+@pytest.mark.parametrize("phase", ["discovery", "pre_steal"])
+@pytest.mark.parametrize("failure", [
+    cp(returncode=1), cp(stdout="not json"), cp(stdout="null"), cp(stdout="[]"),
+    cp(stdout='{}'), cp(stdout='{"labels":null}'), cp(stdout='{"labels":"worklink:review"}'),
+    cp(stdout='{"labels":[{}]}'), cp(stdout='{"labels":[null]}'), OSError("tracker unavailable"),
+], ids=["rc", "json", "null", "array", "missing", "null_labels", "scalar_labels",
+        "unnamed_label", "invalid_item", "oserror"])
+def test_reaper_unavailable_labels_fail_closed(phase, failure):
+    fake = FakeChainlink(
+        in_progress=[1631], active_locks=[1631],
+        comments={1631: [_claim_comment(1631, attempt=1, age=timedelta(hours=3))]},
+    )
+    shows = 0
+
+    def runner(args):
+        nonlocal shows
+        result = fake(args)
+        if list(args)[1:3] == ["issue", "show"]:
+            shows += 1
+            # Discovery reads labels, then comments; the held-lock guard is
+            # followed by another comment read and the pre-steal label read.
+            if shows == (1 if phase == "discovery" else 4):
+                if isinstance(failure, OSError):
+                    raise failure
+                return failure
+        return result
+
+    result = ChainlinkClaims(agent_id="t", runner=runner).reap_home(ttl=timedelta(hours=2))
+
+    assert result.skipped == {"epic_label_unavailable": 1}
+    assert result.reaped == []
+    assert not any(c[1] == "locks" and c[2] in {"steal", "release"} for c in fake.calls)
+
+
+@pytest.mark.parametrize("still_review", [False, True])
+def test_reap_home_keeps_discovered_epic_release_only_after_epic_label_removed(still_review):
+    fake = FakeChainlink(
+        active_locks=[1631], epic_ids={1631}, review_ids={1631},
+        comments={1631: [_claim_comment(1631, attempt=1, age=timedelta(hours=3))]},
+    )
+
+    def runner(args):
+        result = fake(args)
+        if list(args)[1:3] == ["locks", "list"] and fake.names().count("locks list --json") == 2:
+            fake.epic_ids.clear()
+            if not still_review:
+                fake.review_ids.clear()
+        if list(args)[1:3] == ["locks", "steal"]:
+            fake.in_progress = [1631]
+            fake.review_ids.clear()
+        return result
+
+    result = ChainlinkClaims(agent_id="t", runner=runner).reap_home(ttl=timedelta(hours=2))
+
+    assert ("locks steal 1631" in fake.names()) is still_review
+    assert ("locks release 1631" in fake.names()) is still_review
+    assert result.reaped == []
+    assert not any(c[1] == "issue" and c[2] in {"label", "unlabel", "comment"} for c in fake.calls)
+
+
+@pytest.mark.parametrize("review", [False, True])
+def test_reaper_rechecks_new_epic_label_without_discovery_pin(review):
+    fake = FakeChainlink(
+        in_progress=[1631], active_locks=[1631],
+        comments={1631: [_claim_comment(1631, attempt=1, age=timedelta(hours=3))]},
+    )
+
+    def runner(args):
+        result = fake(args)
+        if list(args)[1:3] == ["locks", "list"] and fake.names().count("locks list --json") == 2:
+            fake.epic_ids.add(1631)
+            if review:
+                fake.review_ids.add(1631)
+        return result
+
+    result = ChainlinkClaims(agent_id="t", runner=runner).reap_home(ttl=timedelta(hours=2))
+
+    assert result.skipped == {"epic_not_review_only": 1}
+    assert not any(c[1] == "locks" and c[2] in {"steal", "release"} for c in fake.calls)
 
 
 def test_reap_home_reclaims_lock_with_distinct_chainlink_tracker_owner() -> None:
