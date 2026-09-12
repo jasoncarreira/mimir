@@ -12,9 +12,41 @@ import sys
 import textwrap
 import time
 import tomllib
+from types import SimpleNamespace
 import xml.etree.ElementTree as ET
 
 import pytest
+
+
+def _kill_child_group(process):
+    """Signal the owned group without mistaking EPERM for a live child's exit."""
+    try:
+        os.killpg(process.pid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError) as error:
+        # An exited group leader can leave an unsignalable group on macOS.
+        # EPERM while the direct child is still live must remain an error.
+        if isinstance(error, PermissionError) and process.returncode is None:
+            raise
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX process groups")
+@pytest.mark.parametrize("returncode", [None, 0, -signal.SIGKILL])
+@pytest.mark.parametrize("error_type", [ProcessLookupError, PermissionError])
+def test_kill_child_group_cleanup_races(monkeypatch, returncode, error_type):
+    process = SimpleNamespace(pid=12345, returncode=returncode)
+    calls = []
+
+    def denied_killpg(pid, sig):
+        calls.append((pid, sig))
+        raise error_type("cleanup race")
+
+    monkeypatch.setattr(os, "killpg", denied_killpg)
+    if error_type is PermissionError and returncode is None:
+        with pytest.raises(PermissionError, match="cleanup race"):
+            _kill_child_group(process)
+    else:
+        _kill_child_group(process)
+    assert calls == [(process.pid, signal.SIGKILL)]
 
 
 def _wait_for_child(process, *, timeout=30, drain_timeout=1):
@@ -71,10 +103,7 @@ def _wait_for_child(process, *, timeout=30, drain_timeout=1):
                         selector.unregister(key.fileobj)
         return tuple(data.decode(errors="replace") for data in output.values())
     finally:
-        try:
-            os.killpg(process.pid, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
+        _kill_child_group(process)
         # Reap only the direct child; never reintroduce an unbounded communicate().
         process.wait(timeout=5)
 
@@ -111,10 +140,7 @@ def test_wait_for_child_does_not_require_descendant_pipe_eof(capfd):
                         assert stdout == 'child stdout\n'
                         assert stderr == 'child stderr\n'
                 finally:
-                    try:
-                        os.killpg(process.pid, signal.SIGKILL)
-                    except ProcessLookupError:
-                        pass
+                    _kill_child_group(process)
                     process.wait(timeout=5)
     finally:
         os.close(release_reader)
