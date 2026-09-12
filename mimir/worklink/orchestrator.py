@@ -9,6 +9,7 @@ PR only after the evidence gate passes, then clean up and release the lock.
 from __future__ import annotations
 
 import asyncio
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field, replace
 from datetime import UTC, datetime
 import json
@@ -22,8 +23,9 @@ import subprocess
 import tempfile
 import unicodedata
 import warnings
-from typing import Any, Callable, Iterable, Mapping, Sequence
+from typing import Any, Callable, Iterable, Iterator, Mapping, Sequence
 
+from .._atomic import atomic_write_json
 from .._rmtree import rmtree_missing_ok
 from ..forge.github import GitHubForgeClient, GitHubIdentityVerificationError
 from .backends import (
@@ -1215,40 +1217,29 @@ class WorklinkRunner:
             # remote); pushing from ``self.repo`` fails with
             # "src refspec <branch> does not match any". This is also correct
             # for the legacy worktree shape, which shares the parent's refs.
+            step = "fence"
             try:
-                _git_push(lease.path, lease.branch, runner=runner, publication=publication)
+                with _leaf_publication(self.home, issue.issue_id, attempt) as intent:
+                    step = "push"
+                    _git_push(lease.path, lease.branch, runner=runner, publication=publication)
+                    validation = _with_head_sha(
+                        validation, lease.path, runner=runner, publication=publication
+                    )
+                    step = "pull request"
+                    intent.pr_started = True
+                    pr_url = _open_pr(
+                        self.repo, issue, lease.branch, validation.evidence,
+                        pr_body_section=pr_body_section, base=lease.base_ref, runner=runner,
+                    )
+                    validation = _with_pr_url(validation, pr_url)
+                    step = "completed evidence"
+                    evidence_path = _write_evidence(self.home, validation.evidence)
+                    intent.completed = True
             except Exception as exc:
                 validation = _publication_failed_validation(
-                    validation,
-                    step="push",
-                    error=exc,
-                    issue_id=issue.issue_id,
-                    attempt=attempt,
+                    validation, step=step, error=exc,
+                    issue_id=issue.issue_id, attempt=attempt,
                 )
-            else:
-                validation = _with_head_sha(
-                    validation, lease.path, runner=runner, publication=publication
-                )
-                try:
-                    pr_url = _open_pr(
-                        self.repo,
-                        issue,
-                        lease.branch,
-                        validation.evidence,
-                        pr_body_section=pr_body_section,
-                        base=lease.base_ref,
-                        runner=runner,
-                    )
-                except Exception as exc:
-                    validation = _publication_failed_validation(
-                        validation,
-                        step="pull request",
-                        error=exc,
-                        issue_id=issue.issue_id,
-                        attempt=attempt,
-                    )
-                else:
-                    validation = _with_pr_url(validation, pr_url)
             evidence_path = _write_evidence(self.home, validation.evidence)
         post_publication_errors: list[str] = []
 
@@ -3733,13 +3724,61 @@ def _format_work_order(order: WorkOrder, *, backend: str) -> str:
     return json.dumps(payload, indent=2, sort_keys=True)
 
 
+@dataclass
+class _PublicationIntent:
+    pr_started: bool = False
+    completed: bool = False
+
+
+@contextmanager
+def _leaf_publication(home: Path, issue_id: int, attempt: int) -> Iterator[_PublicationIntent]:
+    """Fence even already-admitted replacements, independently of claim liveness.
+
+    Exclusive creation is cross-process coordination; the file is deliberately
+    NOT removed on process death or an ambiguous PR result. Operators must
+    reconcile such intents before retrying. All controllers share Worklink home.
+    """
+    directory = home / "state" / "worklink" / "publications"
+    directory.mkdir(parents=True, exist_ok=True)
+    path = directory / f"{issue_id}.json"
+    intent = _PublicationIntent()
+    # Never overwrite an existing intent, including an empty/corrupt one.
+    with path.open("x", encoding="utf-8") as handle:
+        json.dump({"issue": issue_id, "attempt": attempt}, handle)
+        handle.flush()
+        os.fsync(handle.fileno())
+    directory_fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(directory_fd)
+    finally:
+        os.close(directory_fd)
+    try:
+        # Admission's latest-only check is insufficient for an already-admitted
+        # replacement whose newer, pre-publication evidence masks the original.
+        evidence_dir = home / "state" / "worklink" / "evidence"
+        for evidence_path in evidence_dir.iterdir():
+            if not re.fullmatch(rf"{issue_id}-\d+\.json", evidence_path.name):
+                continue
+            payload = json.loads(evidence_path.read_text(encoding="utf-8"))
+            if not isinstance(payload, dict) or payload.get("status") not in {
+                "completed", "failed", "blocked",
+            }:
+                raise WorklinkError(f"publication evidence unavailable: {evidence_path}")
+            if payload.get("pr_url"):
+                raise WorklinkError(f"publication already recorded: {evidence_path}")
+        yield intent
+    finally:
+        # A failed push cannot have created a PR. Once PR creation starts, only
+        # durable completed evidence can take over the barrier. Exceptions and
+        # cancellation otherwise retain the intent, including gh nonzero exits.
+        if not intent.pr_started or intent.completed:
+            path.unlink()
+
+
 def _write_evidence(home: Path, evidence: WorklinkEvidence) -> Path:
     path = home / "state" / "worklink" / "evidence" / f"{evidence.issue}-{evidence.attempt}.json"
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(
-        json.dumps(_evidence_json(evidence), indent=2, sort_keys=True),
-        encoding="utf-8",
-    )
+    atomic_write_json(path, _evidence_json(evidence))
     return path
 
 
