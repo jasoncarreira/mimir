@@ -9175,7 +9175,7 @@ def test_forge_review_ingress_allowance_guards(case: str) -> None:
         repository_source = _repository_result_labels(
             "owner/repo", 17, scope.observed_head_sha,
         ).sources[0]
-        if case == "active-repository-ingest":
+        if case != "review":
             repository_source = replace(
                 repository_source, integrity_effect=IntegrityEffect.ACTIVE_INGEST,
             )
@@ -9187,10 +9187,36 @@ def test_forge_review_ingress_allowance_guards(case: str) -> None:
         sink_category=SinkCategory.FORGE, repo_pr_action_scope=scope,
     )
 
-    assert decision.allowed is (case == "review"), decision.reason
-    assert decision.would_block is (case != "review")
-    if case != "review":
+    expected_allowed = case in {"review", "active-repository-ingest"}
+    assert decision.allowed is expected_allowed, decision.reason
+    assert decision.would_block is (not expected_allowed)
+    if not expected_allowed:
         assert decision.reason == "ifc_label_blocked:forge"
+
+
+@pytest.mark.parametrize("boundary", ["same", "repo", "pr", "head"])
+def test_forge_review_allowed_sinks_requires_exact_repository_scope(boundary: str) -> None:
+    auth = _trusted_operator_write_auth(admin=True)
+    scope = _review_state("owner/repo", 17, "fix", "/srv/repo").action_scope
+    source = _repository_result_labels(
+        "other/repo" if boundary == "repo" else "owner/repo",
+        18 if boundary == "pr" else 17,
+        "f" * 40 if boundary == "head" else scope.observed_head_sha,
+    ).sources[0]
+    labels = auth.ifc_labels.with_source(replace(
+        source, integrity_effect=IntegrityEffect.ACTIVE_INGEST,
+    ))
+    auth = replace(auth, ifc_labels=labels)
+    target = f"owner/repo#pull/17@{scope.observed_head_sha}:{scope.scope_id}"
+
+    # Exercise the local allowance independently of check_sink_flow's earlier
+    # mismatch rejection, which otherwise masks removal of this boundary.
+    allowed = SinkGate._get_allowed_sinks(
+        "pr_submit_review", SinkCategory.FORGE, auth,
+        ifc_labels=labels, target=target, repo_pr_action_scope=scope,
+    )
+
+    assert allowed == (frozenset({target}) if boundary == "same" else frozenset())
 
 
 def test_forge_repository_result_from_different_repository_is_refused() -> None:
@@ -16048,7 +16074,6 @@ def test_pr_edit_body_catalog_mirrors_comment() -> None:
         assert access_control._TYPED_REPO_PR_TOOL_ACTIONS[operation] == action.value
         assert access_control._PROTECTED_RESULT_DOMAINS[operation] == "repository"
         assert operation in access_control._REPOSITORY_RESULT_TOOLS
-        assert operation in access_control._REPOSITORY_MUTATION_RESULT_TOOLS
         assert operation not in access_control._OPERATION_READABLE_DOMAIN
         assert access_control._OPERATION_SINK_DESTINATION[operation] == "bound_pull_request"
 

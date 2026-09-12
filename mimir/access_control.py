@@ -6797,7 +6797,7 @@ class SinkGate:
                 or (
                     tool_name == "pr_submit_review"
                     and getattr(repo_pr_action_scope, "pr_number", None) is not None
-                    and cls._is_admin_operator_turn(ifc_labels, auth_context)
+                    and "admin" in (getattr(auth_context, "roles", ()) or ())
                     and cls._is_trusted_operator_turn(
                         InformationFlowLabels(sources=(source,)), auth_context,
                     )
@@ -6813,6 +6813,8 @@ class SinkGate:
             # PR/head scope from which it was produced. An interactive review
             # also carries its authenticated operator ingress. Use the resolved
             # per-call scope: discovery need not populate the turn's scope slot.
+            # Check ingress per source, not global taint: repository reads are
+            # active ingestion, but this allowance bounds only this PR sink.
             return frozenset({target})
         is_triggering_channel_reply = (
             service is not None
@@ -9163,13 +9165,6 @@ _REPOSITORY_RESULT_TOOLS = frozenset({
     "repo_rebase", "repo_rebase_abort", "repo_revert", "repo_revert_abort",
     "repo_push",
 })
-_REPOSITORY_MUTATION_RESULT_TOOLS = frozenset({
-    "pr_submit_review", "pr_inline_review_comment", "pr_comment",
-    "pr_edit_body",
-    "repo_commit", "repo_merge", "repo_merge_abort",
-    "repo_rebase", "repo_rebase_abort", "repo_revert", "repo_revert_abort",
-    "repo_push",
-})
 
 # Independent semantic inventory for tools whose results come from a read
 # backend. Startup rejects drift toward SINK/NEITHER before it can suppress
@@ -10044,14 +10039,10 @@ def classify_protected_result(
             ),
             source_kind="protected_tool",
             integrity="untrusted",
-            # Read results are informational within the immutable PR scope.
-            # Mutation responses and failures can contain Git/forge output, so
-            # they remain active ingestion attributed to that exact scope.
-            integrity_effect=(
-                "active_ingest"
-                if failed or tool_name in _REPOSITORY_MUTATION_RESULT_TOOLS
-                else "informational"
-            ),
+            # Unlike poller ingress, repository results have no trusted author
+            # attestation. Exact PR scope bounds repository sinks; it does not
+            # exempt attacker-controlled text from global active-ingest gates.
+            integrity_effect="active_ingest",
         )
         labels = InformationFlowLabels().with_source(source)
         channel = getattr(auth_context, "channel_id", None)
@@ -10145,7 +10136,10 @@ def classify_protected_result(
     if tool_name.startswith(MCPResourceAdapter._MCP_TOOL_PREFIX):
         resources = authorization.protected_source_resources
         if resources == ():
-            return None
+            # Direction describes the call, not its remote-controlled response.
+            # With no read resource, attribute output to the tool itself; only
+            # the reviewed result_integrity grant can make that output trusted.
+            resources = (f"mcp-tool:{tool_name}",)
         principal = getattr(auth_context, "canonical_principal", None)
         labels = InformationFlowLabels()
         integrity = (
@@ -10815,6 +10809,9 @@ def assert_model_tool_inventory_cataloged(
     })
     unclassified_results = sorted({
         tool_name for tool_name in tool_names
+        # MCP has a total result classifier above, including sink/neither calls
+        # and unresolved failures. It needs no per-tool native inventory entry;
+        # flow direction never exempts its remote response from provenance.
         if not tool_name.startswith(MCPResourceAdapter._MCP_TOOL_PREFIX)
         and tool_name not in _PROTECTED_RESULT_DOMAINS
         and tool_name not in _NON_INGESTING_RESULT_TOOLS
