@@ -60,6 +60,62 @@ async def test_append_writes_jsonl_and_updates_deques(tmp_path: Path):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["user_message", "assistant_message"])
+@pytest.mark.parametrize("surface", ["disk", "live_prompt", "replayed_prompt"])
+async def test_history_redacts_credentials(tmp_path: Path, kind: str, surface: str):
+    buf = _make_buffer(tmp_path)
+    credential = "ghp_" + "syntheticDeployCredential123456789"
+    content = f"Deploy with {credential}\n\tThen report back: caf\u00e9, \u6771\u4eac."
+    expected = content.replace(credential, "[REDACTED]")
+    msg = buf.make_message(
+        channel_id="dm-alice", kind=kind, content=content, author="alice",
+    )
+    await buf.append(msg)
+    assert msg.content == content  # The caller's inbound message is not mutated.
+
+    if surface == "disk":
+        stored = buf.history_path.read_text(encoding="utf-8")
+        assert credential not in stored
+        assert json.loads(stored)["content"] == expected
+    else:
+        if surface == "replayed_prompt":
+            buf = _make_buffer(tmp_path)
+            assert buf.replay() == 1
+        messages = buf.assemble_recent_activity_candidates(
+            channel_id="dm-alice", author="alice", recent_per_channel=10,
+            recent_author_cross=0, cross_hours=24,
+        )
+        assert len(messages) == 1
+        rendered = render_recent_activity(messages)
+        assert credential not in rendered
+        assert expected in rendered
+
+
+@pytest.mark.asyncio
+async def test_history_preserves_ordinary_multiline_unicode(tmp_path: Path):
+    buf = _make_buffer(tmp_path)
+    content = 'Hello, caf\u00e9 and \u6771\u4eac!\n\n```python\n\tprint("hello")\n```\r\n'
+    msg = buf.make_message(channel_id="web-a", kind="user_message", content=content)
+    await buf.append(msg)
+    assert json.loads(buf.history_path.read_text(encoding="utf-8")) == msg.to_dict()
+    assert buf.replay() == 1
+    assert buf.recent_for_channel("web-a", 1)[0].content == content
+
+
+def test_replay_leaves_legacy_history_unchanged(tmp_path: Path):
+    buf = _make_buffer(tmp_path)
+    msg = buf.make_message(
+        channel_id="dm-alice", kind="user_message", content="token=legacy-credential",
+    )
+    buf.history_path.parent.mkdir(parents=True)
+    original = (json.dumps(msg.to_dict()) + "\n").encode("utf-8")
+    buf.history_path.write_bytes(original)
+    assert buf.replay() == 1
+    assert buf.recent_for_channel("dm-alice", 1)[0] == msg
+    assert buf.history_path.read_bytes() == original
+
+
+@pytest.mark.asyncio
 async def test_disk_history_trims_to_newest_records(tmp_path: Path):
     buf = _make_buffer(tmp_path, disk_max=3)
     for i in range(4):
