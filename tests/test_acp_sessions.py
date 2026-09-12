@@ -3023,12 +3023,25 @@ async def test_cancel_timeout_dirties_execution_and_requires_fresh_load(
             resisted.set()
             await release.wait()
 
-    async def pending_handler() -> None:
+    async def pending_forwarder() -> None:
         await asyncio.Future()
 
+    async def completing_handler() -> None:
+        # Model a turn that resists cancellation but eventually completes, not
+        # one that outlives detach. Match the real handler's completion boundary.
+        try:
+            await asyncio.shield(model)
+        finally:
+            forwarder.cancel()
+            await asyncio.gather(forwarder, return_exceptions=True)
+            await dispatcher.close()
+            state.active_prompt = None
+            agent._active_prompts.pop(session_id, None)
+            active.completed.set()
+
     model = asyncio.create_task(resistant_model())
-    handler = asyncio.create_task(pending_handler())
-    forwarder = asyncio.create_task(pending_handler())
+    handler = asyncio.create_task(completing_handler())
+    forwarder = asyncio.create_task(pending_forwarder())
     await started.wait()
     lease = JournalLease("00000000-0000-4000-8000-000000000002", state.generation, 1)
     publisher = SimpleNamespace(
@@ -3043,13 +3056,38 @@ async def test_cancel_timeout_dirties_execution_and_requires_fresh_load(
     agent._active_prompts[session_id] = active
     monkeypatch.setattr(agent_module, "ACP_PROMPT_CANCEL_GRACE_SECONDS", 0.01)
 
-    if ownership == "detached":
-        await agent._detach_state(state)
-    elif ownership == "successor":
-        await agent.load_session("/successor", session_id)
-        await agent.load_session("/successor", session_id)
-    await agent._cancel_active(active, transport=False)
-    await resisted.wait()
+    transition = None
+    try:
+        await agent._cancel_active(active, transport=False)
+        await resisted.wait()
+        assert state.dirty is True
+        assert not active.completed.is_set()
+        assert session_id not in agent._environments
+        with pytest.raises(sdk.RequestError):
+            await agent.prompt(session_id, [])
+        if ownership == "detached":
+            transition = asyncio.create_task(agent._detach_state(state))
+        elif ownership == "successor":
+            transition = asyncio.create_task(agent.load_session("/successor", session_id))
+        if transition is not None:
+            # #1961 requires detach/replacement to wait past cancellation grace.
+            # A permanently resistant model would stay blocked (#1671); this
+            # fixture explicitly releases it only after proving that boundary.
+            with pytest.raises(TimeoutError):
+                await asyncio.wait_for(asyncio.shield(transition), 0.05)
+            assert agent._sessions[session_id] is state
+            assert not active.completed.is_set()
+        release.set()
+        await asyncio.wait_for(handler, 1)
+        if transition is not None:
+            await asyncio.wait_for(transition, 1)
+        assert active.completed.is_set()
+    finally:
+        release.set()
+        await asyncio.gather(model, handler, return_exceptions=True)
+        if transition is not None:
+            transition.cancel()
+            await asyncio.gather(transition, return_exceptions=True)
     assert state.dirty is True
     if ownership == "detached":
         assert session_id not in agent._sessions
@@ -3066,12 +3104,7 @@ async def test_cancel_timeout_dirties_execution_and_requires_fresh_load(
         with pytest.raises(sdk.RequestError):
             await agent.prompt(session_id, [])
 
-    release.set()
-    await model
-    for task in (handler, forwarder):
-        task.cancel()
-        with pytest.raises(asyncio.CancelledError):
-            await task
+    assert forwarder.done()
 
 
 async def test_idle_and_repeated_cancel_are_structured_owned_noops(
@@ -3152,20 +3185,30 @@ async def test_repeated_generation_retirement_releases_maps_and_peers_but_keeps_
     assert [u.field_meta["mimir.sequence"] for u in client.updates] == list(range(10))
 
 
-async def test_detach_releases_cache_but_live_publisher_survives_reload(tmp_path: Path) -> None:
+async def test_detach_cancels_turn_and_reload_reconstructs_released_journal(tmp_path: Path) -> None:
     agent, client, core = await _ready(tmp_path)
     session_id = (await agent.new_session("/one")).session_id
     state = agent._sessions[session_id]
     core.gate = asyncio.Event()
     prompting = asyncio.create_task(agent.prompt(session_id, [sdk.TextContentBlock(type="text", text="hello")]))
     await core.entered.wait()
-    journal = agent._journals._sessions[session_id]
+    active = state.active_prompt
+    reference = weakref.ref(agent._journals._sessions[session_id])
     await agent._detach_state(state)
+    assert active.completed.is_set()
+    assert (await prompting).stop_reason == "cancelled"
     assert agent._execution_keys == agent._journals._sessions == {}
-    assert agent._journals._retired[session_id] is journal
+    assert [u.field_meta["mimir.sequence"] for u in client.updates] == [0]
+    # No draining publisher survives detach. Drop our own task/ActivePrompt
+    # references and prove reload works from disk, not incidental frame liveness.
+    del active, prompting
+    gc.collect()
+    assert reference() is None
+    assert dict(agent._journals._retired) == {}
     await agent.load_session("/two", session_id)
-    assert agent._journals._sessions[session_id] is journal
+    journal = agent._journals._sessions[session_id]
     assert journal.current_client is client
+    assert journal.next_sequence == 1
     successor_key = agent._execution_keys[session_id]
     await agent._detach_state(state)
     assert agent._journals._sessions[session_id] is journal
@@ -3173,9 +3216,9 @@ async def test_detach_releases_cache_but_live_publisher_survives_reload(tmp_path
     assert agent._execution_keys[session_id] == successor_key
     assert agent._environments[session_id][1].cwd == "/two"
     core.gate.set()
-    await prompting
-    assert journal.next_sequence == 5
-    assert [u.field_meta["mimir.sequence"] for u in client.updates] == [0, 0, 1, 2, 3, 4]
+    await agent.prompt(session_id, [sdk.TextContentBlock(type="text", text="next")])
+    assert journal.next_sequence == 6
+    assert [u.field_meta["mimir.sequence"] for u in client.updates] == [0, 0, 1, 2, 3, 4, 5]
 
 
 @pytest.mark.parametrize("installed", [False, True])

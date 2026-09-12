@@ -280,8 +280,15 @@ class JournalCache:
             session_id, journal.record.owner_principal, "io_failed"
         ):
             return
-        # Publishers still draining an old turn must share the successor's lock
-        # and sequence counter. Once they disappear, durable replay can reopen it.
+        # Preserve identity (lock and sequence counter) while any caller still
+        # owns this journal; release drops cache ownership, not caller ownership.
+        # load_session, for example, holds its replay journal across detach/open.
+        # Detach cancels and awaits the active turn BEFORE release: it does not
+        # leave a draining publisher. The cache API also permits release during
+        # delivery, so callers retaining a journal must not get a second lock.
+        # With no remaining owner, the weak entry vanishes and open reconstructs
+        # from durable storage; detach/reload correctness must not depend on GC
+        # timing of a completed handler frame.
         self._retired[session_id] = journal
         self._sessions.pop(session_id, None)
 
