@@ -6340,6 +6340,9 @@ def test_factory_recovery_uses_run_id_first_lock_resume_and_authoritative_status
     from mimir.worklink.compute import LocalSubprocessComputeBackend
     from mimir.worklink.run_state import process_start_ticks
 
+    if local_compute and sys.platform != "linux":
+        pytest.skip("real process identity/reclamation integration requires Linux /proc")
+
     _configure_opencode_oauth(tmp_path, monkeypatch)
     attempt = 3 if local_compute else 1
     original_checkout = tmp_path / ".worklink" / "repo" / f"700-{attempt}"

@@ -36,7 +36,6 @@ from mimir.worklink.factory_state import (
     list_factory_records,
     save_factory_record,
 )
-from mimir.worklink.run_state import process_start_ticks
 from mimir.worklink.dispatch_failures import (
     dispatch_failure_state_dir,
     failure_state_transaction,
@@ -703,6 +702,15 @@ def _seed_factory_run(child: Path, issue_id: int, status: str) -> None:
     )
 
 
+@pytest.fixture
+def factory_process_ticks(monkeypatch: pytest.MonkeyPatch) -> None:
+    # These tests exercise record/pruning policy, not Linux /proc parsing.
+    # Keep a real live PID but supply deterministic identity evidence on macOS too.
+    monkeypatch.setattr(
+        "mimir.worklink.factory_state.process_start_ticks", lambda pid: 100,
+    )
+
+
 def _factory_record(
     sandbox: Path,
     *,
@@ -711,8 +719,7 @@ def _factory_record(
     process: str = "live",
 ) -> FactoryRunRecord:
     pid = os.getpid()
-    ticks = process_start_ticks(pid)
-    assert ticks is not None
+    ticks = 100
     handle = LaunchHandle(
         substrate="unknown" if process == "unknown-substrate" else "local_subprocess",
         identifier=str(pid),
@@ -741,6 +748,7 @@ def _factory_record(
     )
 
 
+@pytest.mark.usefixtures("factory_process_ticks")
 def test_attempt_is_active_true_for_nested_nonterminal_run(tmp_path: Path) -> None:
     child = tmp_path / ".worklink" / "840-1"
     child.mkdir(parents=True)
@@ -750,6 +758,7 @@ def test_attempt_is_active_true_for_nested_nonterminal_run(tmp_path: Path) -> No
 
 @pytest.mark.parametrize("inner", [False, True])
 @pytest.mark.parametrize("phase", ["running", "failed", "stopped", "terminal"])
+@pytest.mark.usefixtures("factory_process_ticks")
 def test_prune_keeps_old_attempt_with_live_nested_factory(
     tmp_path: Path, inner: bool, phase: str,
 ) -> None:
@@ -770,6 +779,7 @@ def test_prune_keeps_old_attempt_with_live_nested_factory(
 @pytest.mark.parametrize("inner", [False, True])
 @pytest.mark.parametrize("phase", ["terminal", "failed", "stopped", "running"])
 @pytest.mark.parametrize("status", [None, "running", "completed"])
+@pytest.mark.usefixtures("factory_process_ticks")
 def test_prune_removes_old_attempt_with_verified_dead_unresumed_factory(
     tmp_path: Path, inner: bool, phase: str, status: str | None,
 ) -> None:
@@ -790,6 +800,7 @@ def test_prune_removes_old_attempt_with_verified_dead_unresumed_factory(
     assert not manifest.exists()
 
 
+@pytest.mark.usefixtures("factory_process_ticks")
 def test_attempt_is_active_false_for_terminal_or_absent(tmp_path: Path) -> None:
     done = tmp_path / ".worklink" / "841-1"
     done.mkdir(parents=True)
@@ -805,6 +816,7 @@ def test_attempt_is_active_false_for_terminal_or_absent(tmp_path: Path) -> None:
 
 
 @pytest.mark.parametrize("phase", ["parked", "running", "failed", "stopped", "terminal"])
+@pytest.mark.usefixtures("factory_process_ticks")
 def test_prune_preserves_parked_factory(tmp_path: Path, phase: str) -> None:
     repo = tmp_path / "repo"
     repo.mkdir()
@@ -825,6 +837,7 @@ def test_prune_preserves_parked_factory(tmp_path: Path, phase: str) -> None:
 @pytest.mark.parametrize(
     "process", ["missing-handle", "missing-ticks", "unknown-substrate", "unreadable-ticks"]
 )
+@pytest.mark.usefixtures("factory_process_ticks")
 def test_prune_fails_closed_without_process_verification(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, phase: str,
     status: str | None, process: str,
@@ -847,6 +860,7 @@ def test_prune_fails_closed_without_process_verification(
     assert sandbox.is_dir()
 
 
+@pytest.mark.usefixtures("factory_process_ticks")
 def test_prune_preserves_unknown_factory_phase(tmp_path: Path) -> None:
     repo = tmp_path / "repo"
     repo.mkdir()
@@ -864,6 +878,7 @@ def test_prune_preserves_unknown_factory_phase(tmp_path: Path) -> None:
     assert sandbox.is_dir()
 
 
+@pytest.mark.usefixtures("factory_process_ticks")
 def test_prune_checks_live_record_after_dead_record_for_same_checkout(tmp_path: Path) -> None:
     repo = tmp_path / "repo"
     repo.mkdir()
