@@ -296,6 +296,8 @@ async def test_clean_close_allows_immediate_reconnect(
     async def run_until_eof(
         reader: asyncio.StreamReader, writer: asyncio.StreamWriter,
     ) -> None:
+        writer.write(b"admitted\n")
+        await writer.drain()
         await reader.read()
         writer.close()
         await writer.wait_closed()
@@ -305,15 +307,15 @@ async def test_clean_close_allows_immediate_reconnect(
     first_reader, first_writer = await asyncio.open_unix_connection(
         str(daemon.socket_path)
     )
-    del first_reader
+    assert await first_reader.readline() == b"admitted\n"
     first_writer.close()
     await first_writer.wait_closed()
 
     second_reader, second_writer = await asyncio.open_unix_connection(
         str(daemon.socket_path)
     )
-    with pytest.raises(TimeoutError):
-        await asyncio.wait_for(second_reader.readline(), 0.05)
+    # Silence could also mean admission is still waiting on the retiring peer.
+    assert await asyncio.wait_for(second_reader.readline(), 0.05) == b"admitted\n"
 
     second_writer.close()
     await second_writer.wait_closed()
@@ -587,12 +589,15 @@ async def test_shutdown_closes_at_most_four_peers_concurrently(
     active = 0
     maximum = 0
     release = asyncio.Event()
+    saturated = asyncio.Event()
 
     class SlowWriter(_Writer):
         async def wait_closed(self) -> None:
             nonlocal active, maximum
             active += 1
             maximum = max(maximum, active)
+            if active == 4:
+                saturated.set()
             try:
                 await release.wait()
             finally:
@@ -602,10 +607,11 @@ async def test_shutdown_closes_at_most_four_peers_concurrently(
     peers = [_Peer(SlowWriter(), task) for task in tasks]
     daemon._peers.update(peers)
     stopping = asyncio.create_task(daemon._stop_peers())
-    await asyncio.sleep(0.01)
+    await saturated.wait()
     assert maximum == 4
     release.set()
     await stopping
+    assert maximum == 4
     shutil.rmtree(home)
 
 
@@ -669,6 +675,7 @@ async def test_authenticated_connection_outlives_preauth_deadline(
 ) -> None:
     home = _short_home()
     release = asyncio.Event()
+    authenticated = asyncio.Event()
 
     class Agent:
         def on_connect(self, peer: object) -> int:
@@ -679,6 +686,7 @@ async def test_authenticated_connection_outlives_preauth_deadline(
 
     async def runner(agent: object, **kwargs: object) -> None:
         await agent.authenticate("mimir-web-key")
+        authenticated.set()
         await release.wait()
 
     daemon = AcpDaemon(_bundle(home))
@@ -687,6 +695,7 @@ async def test_authenticated_connection_outlives_preauth_deadline(
     monkeypatch.setattr("mimir.acp.daemon.ACP_AUTH_TIMEOUT", 0.01)
     writer = _Writer()
     task = asyncio.create_task(daemon._run_peer(asyncio.StreamReader(), writer))
+    await authenticated.wait()
     await asyncio.sleep(0.03)
     assert not task.done()
     release.set()
@@ -1410,13 +1419,26 @@ async def test_close_that_raises_in_the_first_grace_interval_fences_admission(
     monkeypatch.setattr("mimir.acp.daemon._peer_uid", lambda sock: os.getuid())
     daemon._uid = os.getuid()
     entered = asyncio.Event()
+    release = asyncio.Event()
+    close_task = None
+
+    async def observe_grace(tasks, **kwargs):
+        # Release only once cancellation has reached the first bounded wait.
+        if close_task in tasks:
+            release.set()
+        return await asyncio.wait(tasks, **kwargs)
 
     async def fails_during_grace(self: object) -> None:
+        nonlocal close_task
+        close_task = asyncio.current_task()
         entered.set()
-        await asyncio.sleep(0)          # let the runner reach the shield
+        await release.wait()
         raise RuntimeError("cleanup failed before any cancel")
 
     monkeypatch.setattr(sdk.Connection, "close", fails_during_grace)
+    monkeypatch.setattr(sdk, "asyncio", SimpleNamespace(**{
+        **vars(asyncio), "wait": observe_grace,
+    }))
     # Generous, so the close finishes INSIDE the first interval rather than
     # being cancelled: this is the path that skipped the report.
     monkeypatch.setattr("mimir.acp.sdk.ACP_CLOSE_CANCEL_TIMEOUT", 1.0)
@@ -1443,6 +1465,7 @@ async def test_close_that_raises_in_the_first_grace_interval_fences_admission(
         assert daemon._admitted == 0, "replacement admitted after failed teardown"
         assert b"error" in bytes(writer.data)
     finally:
+        release.set()
         await asyncio.wait({runner}, timeout=1.0)
         shutil.rmtree(home)
 

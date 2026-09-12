@@ -5,6 +5,7 @@ import io
 import json
 import os
 import re
+import shlex
 import signal
 import sys
 import time
@@ -195,6 +196,17 @@ async def _shutdown_ceiling(
 async def _accept_unavailable_backend_risk_for_lifecycle(session_id: str) -> bool:
     """Explicit test operator consent; available backends still must confine."""
     return True
+
+
+@pytest.fixture
+def lifecycle_shell(monkeypatch: pytest.MonkeyPatch) -> str:
+    # Only generation teardown may finish this shell, not a sleep or tool timer.
+    import mimir.acp.hosted as hosted
+
+    monkeypatch.setattr(hosted, "asyncio", SimpleNamespace(**{
+        **vars(asyncio), "timeout_at": lambda deadline: asyncio.timeout(None),
+    }))
+    return f"exec {shlex.quote(sys.executable)} -c 'import signal; signal.pause()'"
 
 
 @pytest.mark.asyncio
@@ -830,6 +842,8 @@ asyncio.run(run())
     try:
         async with _shutdown_ceiling(process, progress, lambda: "flush handshake"):
             assert await process.stdout.readline() == b"flush-blocked\n"
+            # The main-thread flush marker does not order the timer thread.
+            await _await_diagnostic(progress, "watchdog-input-wait")
         with pytest.raises(pytest.fail.Exception) as failure:
             async with _shutdown_ceiling(process, progress, lambda: "exit", timeout=0.05):
                 await process.wait()
@@ -1311,7 +1325,15 @@ from types import SimpleNamespace
 from mimir.acp import bootstrap, profiles, proxy
 profiles.ProfileStore = lambda: SimpleNamespace(get=lambda name: SimpleNamespace(remote=None))
 profiles.selected_profile = lambda name: 'test'
-proxy.SIGNAL_EXIT_TIMEOUT = 0.5
+proxy.threading.Timer = InputTimer
+observed_failure = False
+original_record_failure = proxy._ShutdownHooks.record_failure
+def record_failure(self, error):
+    global observed_failure
+    original_record_failure(self, error)
+    if isinstance(error, ValueError):
+        observed_failure = True
+proxy._ShutdownHooks.record_failure = record_failure
 async def run_proxy(name, output):
     class Failing:
         async def read(self, size):
@@ -1324,7 +1346,9 @@ async def run_proxy(name, output):
                 try:
                     await asyncio.sleep(60)
                 except asyncio.CancelledError:
-                    pass
+                    assert observed_failure
+                    output.write(b'failure-draining\n')
+                    output.flush()
     await proxy.run_router(Failing(), proxy._OutputWriter(io.BytesIO()),
                            Resistant(), proxy._OutputWriter(io.BytesIO()), 'secret')
 proxy.run_proxy = run_proxy
@@ -1332,12 +1356,16 @@ raise SystemExit(bootstrap.main([]))
 '''
     process = await asyncio.create_subprocess_exec(
         sys.executable, "-c", source,
+        stdin=asyncio.subprocess.PIPE,
         stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
         cwd=Path(__file__).resolve().parents[1],
     )
     try:
         async with _shutdown_ceiling(process, progress, lambda: "exit"):
-            stdout, stderr = await process.communicate()
+            assert await process.stdout.readline() == b"failure-draining\n"
+            # Failure precedence, not scheduler speed against a real timer, is
+            # the subject. Expire only after observation and resistant drain.
+            stdout, stderr = await process.communicate(b"x")
             assert process.returncode == 1
             assert stdout == b""
             assert stderr.startswith(b"detail: ValueError at <string>:")
@@ -1810,7 +1838,7 @@ async def test_candidate_connection_does_not_retire_active_generation() -> None:
 
 @pytest.mark.asyncio
 async def test_proxy_generation_teardown_retires_hosted_ids_grants_calls_and_workers(
-    tmp_path: Path,
+    tmp_path: Path, lifecycle_shell: str,
 ) -> None:
     class Writer:
         def write(self, data: bytes) -> None:
@@ -1844,7 +1872,7 @@ async def test_proxy_generation_teardown_retires_hosted_ids_grants_calls_and_wor
             router._provider.request(
                 connection_id,
                 "tools/call",
-                {"name": "shell", "arguments": {"command": "sleep 30"}},
+                {"name": "shell", "arguments": {"command": lifecycle_shell}},
                 request_id="shell",
             )
         )
@@ -1874,7 +1902,7 @@ async def test_proxy_generation_teardown_retires_hosted_ids_grants_calls_and_wor
 
 @pytest.mark.asyncio
 async def test_daemon_eof_retires_generation_before_client_grace(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, lifecycle_shell: str,
 ) -> None:
     class Writer:
         def __init__(self) -> None:
@@ -1927,7 +1955,7 @@ async def test_daemon_eof_retires_generation_before_client_grace(
             "params": {
                 "connectionId": connection_id,
                 "method": "tools/call",
-                "params": {"name": "shell", "arguments": {"command": "sleep 30"}},
+                "params": {"name": "shell", "arguments": {"command": lifecycle_shell}},
             },
         })
         while not router._provider._processes:

@@ -154,20 +154,36 @@ def test_wait_for_child_does_not_require_descendant_pipe_eof(capfd):
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX process groups and pipes")
 @pytest.mark.parametrize("close_streams", [False, True], ids=["open-pipes", "closed-pipes"])
 def test_wait_for_child_reports_live_child(close_streams):
+    ready_reader, ready_writer = os.pipe()
     command = "import os; os.write(2, b'before shutdown\\n'); "
     if close_streams:
         command += "os.close(1); os.close(2); "
-    with subprocess.Popen(
-        [sys.executable, "-c", command + "os.read(0, 1)"],
-        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-        start_new_session=True,
-    ) as process:
-        with pytest.raises(pytest.fail.Exception) as failure:
-            _wait_for_child(process, timeout=1)
-        assert "hit the 1s guard: mechanism (b)" in str(failure.value)
-        assert "direct child had not exited (returncode=None)" in str(failure.value)
-        assert "before shutdown" in str(failure.value)
-        assert process.returncode == -signal.SIGKILL
+    command += f"os.write({ready_writer}, b'1'); os.close({ready_writer}); os.read(0, 1)"
+    try:
+        with subprocess.Popen(
+            [sys.executable, "-c", command],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            pass_fds=(ready_writer,), start_new_session=True,
+        ) as process:
+            os.close(ready_writer)
+            ready_writer = None
+            try:
+                # Arm the live-child guard only after the diagnostic write and
+                # optional pipe closures, not against interpreter startup.
+                assert os.read(ready_reader, 1) == b"1"
+                with pytest.raises(pytest.fail.Exception) as failure:
+                    _wait_for_child(process, timeout=1)
+                assert "hit the 1s guard: mechanism (b)" in str(failure.value)
+                assert "direct child had not exited (returncode=None)" in str(failure.value)
+                assert "before shutdown" in str(failure.value)
+                assert process.returncode == -signal.SIGKILL
+            finally:
+                _kill_child_group(process)
+                process.wait(timeout=5)
+    finally:
+        os.close(ready_reader)
+        if ready_writer is not None:
+            os.close(ready_writer)
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX process groups and pipes")
