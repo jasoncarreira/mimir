@@ -631,17 +631,23 @@ for line in sys.stdin.buffer: time.sleep(10)
 
 
 @pytest.mark.asyncio
-async def test_stubborn_child_is_killed_and_reaped(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+@pytest.mark.parametrize("handler_delay", [0, 60], ids=["handler-returns", "handler-interrupted"])
+async def test_stubborn_child_is_killed_and_reaped(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, handler_delay: int,
+) -> None:
     profile, _ = remote_profile(tmp_path)
     marker = tmp_path / "child.json"
+    terminated = tmp_path / "terminated"
     ssh = _fake_ssh(tmp_path, """
-import json,os,signal,sys,time
+import json,os,signal,time
 def ignore(*args):
- with open(os.environ['MARKER']) as stream: data=json.load(stream)
- data['terminated']=True
- with open(os.environ['MARKER'],'w') as stream: json.dump(data,stream)
+ # Publish acknowledgement without truncating/re-writing the readiness JSON:
+ # SIGKILL may interrupt the handler at any instruction.
+ fd=os.open(os.environ['TERMINATED'],os.O_CREAT|os.O_WRONLY,0o600)
+ os.close(fd)
+ time.sleep(float(os.environ['HANDLER_DELAY']))
 signal.signal(signal.SIGTERM,ignore)
-with open(os.environ['MARKER'],'w') as stream: json.dump({'pid':os.getpid(),'terminated':False},stream)
+with open(os.environ['MARKER'],'w') as stream: json.dump({'pid':os.getpid()},stream)
 while True: time.sleep(1)
 """)
     reader = asyncio.StreamReader()
@@ -649,12 +655,16 @@ while True: time.sleep(1)
     transport = type("Transport", (), {"close": lambda self: None})()
     monkeypatch.setattr("mimir.acp.ssh.open_stdio", lambda target: asyncio.sleep(0, result=(reader, Output(target), transport)))
     monkeypatch.setattr("mimir.acp.ssh.WAIT_TIMEOUT", 0.02)
-    monkeypatch.setattr("mimir.acp.ssh.TERMINATE_TIMEOUT", 0.05)
+    # Keep the production SIGTERM grace period so the child can acknowledge
+    # the signal even on a loaded parallel CI runner.
     # Readiness and teardown share one whole-protocol hang ceiling.
     async with asyncio.timeout(120):
         task = asyncio.create_task(run_ssh_proxy(
             profile, "secret", output, _ssh_path=ssh,
-            _environment={"PATH": os.environ.get("PATH", ""), "MARKER": str(marker)},
+            _environment={
+                "PATH": os.environ.get("PATH", ""), "MARKER": str(marker),
+                "TERMINATED": str(terminated), "HANDLER_DELAY": str(handler_delay),
+            },
         ))
         try:
             while True:
@@ -667,7 +677,8 @@ while True: time.sleep(1)
             task.cancel()
             with pytest.raises(asyncio.CancelledError):
                 await asyncio.wait_for(task, 10)
-            assert json.loads(marker.read_text())["terminated"] is True
+            assert terminated.is_file()
+            assert json.loads(marker.read_text()) == marker_data
             with pytest.raises(ProcessLookupError):
                 os.kill(pid, 0)
         finally:
