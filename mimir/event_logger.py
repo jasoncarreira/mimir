@@ -187,9 +187,16 @@ class EventLogger:
 
     async def log(self, event_type: str, **payload: Any) -> None:
         try:
-            record = self._record(event_type, payload)
+            # Capture occurrence time before either the logger lock or executor
+            # can delay us; recovery compares it with independently stamped state.
+            record = self._record_header(event_type)
+
+            def redact_and_append() -> None:
+                record.update(redact_payload(payload))
+                self._append_record_sync(record)
+
             async with self._ensure_lock():
-                await asyncio.to_thread(self._append_record_sync, record)
+                await asyncio.to_thread(redact_and_append)
                 # Hysteresis: trim only when over cap by ≥10%. Without the
                 # buffer, every event past the cap triggers an O(file)
                 # rewrite — a high-throughput agent under a small cap pays
@@ -229,6 +236,11 @@ class EventLogger:
         self._append_record_sync(record, durable=True)
 
     def _record(self, event_type: str, payload: dict[str, Any]) -> dict[str, Any]:
+        rec = self._record_header(event_type)
+        rec.update(redact_payload(payload))
+        return rec
+
+    def _record_header(self, event_type: str) -> dict[str, Any]:
         rec: dict[str, Any] = {
             "timestamp": _utc_now_iso(),
             "type": event_type,
@@ -236,7 +248,6 @@ class EventLogger:
         }
         if self._agent_id is not None:
             rec["agent_id"] = self._agent_id
-        rec.update(redact_payload(payload))
         return rec
 
     async def _trim(self) -> None:

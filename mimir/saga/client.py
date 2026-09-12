@@ -804,8 +804,9 @@ class SagaStore:
         This public maintenance entry point lets the scheduler run the check
         independently of consolidation and forgetting cycles.
         """
-        conn = self._ensure_conn()
-        return await self._db_locked(lambda: self._rebuild_index_if_needed(conn))
+        return await self._db_locked(
+            lambda: self._rebuild_index_if_needed(self._ensure_conn())
+        )
 
     def _ensure_sessions_index(self, conn: sqlite3.Connection) -> VectorIndex | None:
         """Lazily build the sessions FAISS index from sessions.embedding.
@@ -1825,7 +1826,7 @@ class SagaStore:
         # the parent loop). Instead, we resolve clusters here on the
         # caller's loop, run the LLM calls concurrently, and pass a
         # pre-computed lookup into a sync consolidate variant.
-        conn = self._ensure_conn()
+        conn = await self._db_locked(self._ensure_conn)
 
         # 0. Pass 1 (dedup): tighter clusterer collapses near-duplicate
         # raws into one canonical each, tombstoning the rest. Reads ACT-R
@@ -2358,7 +2359,7 @@ class SagaStore:
         from .embeddings import resolve_auto_threshold
         from ._config_io import get_config
 
-        conn = self._ensure_conn()
+        conn = await self._db_locked(self._ensure_conn)
         # chainlink #386: shared-conn read under _db_lock (see consolidate()).
         skills = await self._db_locked(
             lambda: distinct_skill_scopes(conn, agent_id=self._agent_id)

@@ -51,7 +51,7 @@ _UPDATE_ADAPTER = TypeAdapter(SessionNotification.model_fields["update"].annotat
 
 
 class SessionJournal:
-    def __init__(self, store: SessionStore, record: SessionRecord, client: Any | None = None) -> None:
+    def __init__(self, store: SessionStore, record: SessionRecord, client: Any | None = None, *, defer_validation: bool = False) -> None:
         self.store = store
         self.record = record
         self.current_client = client
@@ -60,6 +60,10 @@ class SessionJournal:
         self._reported = False
         self._fatal = False
         self._retain_failed: Callable[[SessionJournal], None] | None = None
+        self.next_sequence = 0
+        self._initialized = False
+        if defer_validation:
+            return
         try:
             prepared, _ = self._read_validated()
         except BaseException as exc:
@@ -69,6 +73,7 @@ class SessionJournal:
             self._report_once("ACP journal validation failed; replay disabled")
             raise RequestError(-32603, "Session replay unavailable: io_failed") from exc
         self.next_sequence = len(prepared)
+        self._initialized = True
 
     def bind_client(self, client: Any) -> None:
         self.current_client = client
@@ -122,6 +127,8 @@ class SessionJournal:
         terminal_updates: list[Any],
     ) -> list[Any]:
         async with self.lock:
+            if not self._initialized:
+                await self._read_for_replay()
             lease.close()
             if lease._terminalized:
                 return []
@@ -134,6 +141,8 @@ class SessionJournal:
     async def _publish_locked(self, update: Any, client: Any, turn_id: str | None) -> Any:
         if self._fatal or client is None:
             raise RequestError(-32603, "Internal error")
+        if not self._initialized:
+            await self._read_for_replay()
         update, sequence = self._prepare_locked(update, turn_id)
         sent = _line({"kind": "sent", "sequence": sequence})
         await client.session_update(self.record.session_id, update)
@@ -179,21 +188,42 @@ class SessionJournal:
             client = client or self.current_client
             if client is None:
                 raise RequestError(-32603, "Internal error")
-            try:
-                prepared, _ = self._read_validated()
-            except BaseException as exc:
-                self.journal_enabled = False
-                self._fatal = True
-                self._mark_io_failed()
-                self._report_once("ACP journal replay failed; replay disabled")
-                raise RequestError(-32603, "Session replay unavailable: io_failed") from exc
-            for item in prepared:
-                update = _UPDATE_ADAPTER.validate_python(item["update"])
+            prepared = await self._read_for_replay()
+            for update in prepared:
                 await client.session_update(self.record.session_id, update)
 
-    def _read_validated(self) -> tuple[list[dict[str, Any]], set[int]]:
+    async def _read_for_replay(self) -> list[Any]:
+        # Callers hold the journal lock through reading and delivery. Drain even
+        # on cancellation: to_thread cannot stop an already running reader.
+        if self._fatal:
+            raise RequestError(-32603, "Session replay unavailable: io_failed")
+        task = asyncio.create_task(asyncio.to_thread(self._read_validated))
+        cancelled = False
+        while not task.done():
+            try:
+                await asyncio.shield(task)
+            except asyncio.CancelledError:
+                cancelled = True
+            except BaseException:
+                break
+        try:
+            prepared, _ = task.result()
+        except BaseException as exc:
+            self.journal_enabled = False
+            self._fatal = True
+            self._mark_io_failed()
+            self._report_once("ACP journal replay failed; replay disabled")
+            raise RequestError(-32603, "Session replay unavailable: io_failed") from exc
+        if not self._initialized:
+            self.next_sequence = len(prepared)
+            self._initialized = True
+        if cancelled:
+            raise asyncio.CancelledError
+        return prepared
+
+    def _read_validated(self) -> tuple[list[Any], set[int]]:
         self.store._validate_file(self.record.journal_path)
-        prepared: list[dict[str, Any]] = []
+        prepared: list[Any] = []
         sent: set[int] = set()
         with self.record.journal_path.open("rb") as stream:
             for raw in stream:
@@ -208,8 +238,7 @@ class SessionJournal:
                         raise ValueError("invalid prepared record")
                     if item["update"].get("_meta") != {"mimir.sequence": sequence}:
                         raise ValueError("invalid prepared metadata")
-                    _UPDATE_ADAPTER.validate_python(item["update"])
-                    prepared.append(item)
+                    prepared.append(_UPDATE_ADAPTER.validate_python(item["update"]))
                 elif item.get("kind") == "sent":
                     sequence = item.get("sequence")
                     if set(item) != {"kind", "sequence"} or not isinstance(sequence, int) or isinstance(sequence, bool) or sequence < 0 or sequence >= len(prepared) or sequence in sent:
@@ -254,10 +283,10 @@ class JournalCache:
         self._sessions: dict[str, SessionJournal] = {}
         self._retired: WeakValueDictionary[str, SessionJournal] = WeakValueDictionary()
 
-    def open(self, record: SessionRecord, client: Any | None = None) -> SessionJournal:
+    def open(self, record: SessionRecord, client: Any | None = None, *, defer_validation: bool = False) -> SessionJournal:
         journal = self._sessions.get(record.session_id) or self._retired.get(record.session_id)
         if journal is None:
-            journal = SessionJournal(self.store, record, client)
+            journal = SessionJournal(self.store, record, client, defer_validation=defer_validation)
             journal._retain_failed = self._retain_failed_journal
         elif client is not None:
             journal.bind_client(client)

@@ -710,3 +710,42 @@ def test_existing_anthropic_and_bearer_patterns_unbroken() -> None:
 def test_benign_text_passes_through() -> None:
     text = "the quick brown fox jumps over 13 lazy dogs"
     assert redact_text(text) == text
+
+
+@pytest.mark.parametrize("extra", [0, 1])
+def test_yaml_composition_size_boundary(monkeypatch, extra) -> None:
+    import mimir.redaction as redaction
+
+    calls = []
+    original = redaction._yaml_block_scalar_lines
+
+    def compose(text):
+        calls.append(len(text))
+        return original(text)
+
+    monkeypatch.setattr(redaction, "_yaml_block_scalar_lines", compose)
+    prefix = "password: |\n  boundary-secret\n# "
+    size = redaction.MAX_YAML_REDACTION_CHARS + extra
+    text = prefix + "x" * (size - len(prefix))
+    out = redact_text(text)
+    assert "boundary-secret" not in out
+    assert "[REDACTED]" in out
+    assert calls == ([size] if extra == 0 else [])
+
+
+@pytest.mark.parametrize(("header", "options"), BLOCK_SCALAR_PRODUCTIONS)
+def test_large_yaml_uses_scanner_without_losing_secret_bodies(
+    monkeypatch, header, options,
+) -> None:
+    import mimir.redaction as redaction
+
+    calls = []
+    monkeypatch.setattr(redaction, "_yaml_block_scalar_lines", lambda text: calls.append(text))
+    secret = "large-body-secret"
+    text = "# " + "x" * redaction.MAX_YAML_REDACTION_CHARS + "\n"
+    text += _wrapped_block(header, secret, **options)
+    out = redact_text(text)
+    assert calls == []
+    assert secret not in out
+    assert "[REDACTED]" in out
+    assert "sibling: keep-sibling" in out

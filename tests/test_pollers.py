@@ -22,6 +22,7 @@ import shutil
 import signal
 import stat
 import sys
+import threading
 import time
 from pathlib import Path
 from types import SimpleNamespace
@@ -3155,6 +3156,67 @@ print(json.dumps({"poller": "x", "prompt": "second"}))
     events = _read_events(home)
     invalid = [e for e in events if e["type"] == "poller_invalid_line"]
     assert len(invalid) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("env_source", ["pass_env", "env"])
+@pytest.mark.parametrize(
+    ("stream", "event_type", "field", "cap_name"),
+    [
+        ("stderr", "poller_stderr", "stderr", "POLLER_STDERR_LOG_CHARS"),
+        ("stdout", "poller_invalid_line", "line", "POLLER_INVALID_LINE_CHARS"),
+    ],
+)
+async def test_run_poller_diagnostic_redaction_offloop_before_truncation(
+    tmp_path: Path, home: Path, monkeypatch: pytest.MonkeyPatch,
+    env_source: str, stream: str, event_type: str, field: str, cap_name: str,
+) -> None:
+    import mimir.pollers as pollers
+
+    cap = getattr(pollers, cap_name)
+    # No token shape or credential label: only exact env matching can mask this.
+    secret = "opaque-" + "abcdefghij" * (cap // 10 + 1)
+    suffix = " retained-context " + "z" * cap
+    diagnostic = f"diagnostic {secret}{suffix}"
+    skill_dir = tmp_path / "skill"
+    _install_script(skill_dir, "poller.py", f"""
+import json, os, sys
+print('diagnostic ' + os.environ['WEBHOOK_HMAC'] + {suffix!r}, file=sys.{stream})
+print(json.dumps({{"poller": "redaction-offloop", "prompt": "ok"}}))
+""")
+    monkeypatch.setenv("WEBHOOK_HMAC", secret)
+    cfg = PollerConfig(
+        name="redaction-offloop", command=f"{sys.executable} poller.py",
+        cron="* * * * *", skill_dir=skill_dir,
+        env={"WEBHOOK_HMAC": secret} if env_source == "env" else {},
+        pass_env=("WEBHOOK_HMAC",) if env_source == "pass_env" else (),
+    )
+    loop = asyncio.get_running_loop()
+    loop_thread = threading.get_ident()
+    observations = []
+    original_redact = pollers._redact_poller_env_values
+
+    def slow_redact(text, env, redact_keys):
+        released = threading.Event()
+        loop.call_soon_threadsafe(released.set)
+        responsive = released.wait(timeout=2.0)
+        observations.append((text, responsive, threading.get_ident()))
+        return original_redact(text, env, redact_keys)
+
+    monkeypatch.setattr(pollers, "_redact_poller_env_values", slow_redact)
+    enq = _CapturingEnqueue()
+    assert await asyncio.wait_for(run_poller(cfg, enqueue=enq), timeout=10.0) == 1
+    assert [event.content for event in enq.events] == ["ok"]
+    [event] = [event for event in _read_events(home) if event["type"] == event_type]
+    assert event[field] == ("diagnostic [REDACTED]" + suffix)[:cap]
+    assert len(event[field]) == cap
+    if stream == "stderr":
+        assert event["exit_code"] == 0
+    assert len(observations) == 1
+    text, responsive, redaction_thread = observations[0]
+    assert text == diagnostic, "redaction must receive the entire diagnostic"
+    assert responsive, "diagnostic redaction blocked the event-loop callback"
+    assert redaction_thread != loop_thread
 
 
 @pytest.mark.asyncio
