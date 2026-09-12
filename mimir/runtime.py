@@ -174,6 +174,18 @@ class AgentRuntimeBundle:
         await asyncio.shield(self._close_task)
 
 
+def resolve_saga_db_path(home: Path) -> Path:
+    """Resolve SAGA storage paths relative to the home's .mimir directory."""
+    home_saga_toml = home / "saga.toml"
+    if home_saga_toml.is_file() and not os.environ.get("SAGA_CONFIG"):
+        os.environ["SAGA_CONFIG"] = str(home_saga_toml)
+
+    from .saga._config_io import get_config
+
+    db_path = Path(get_config()("storage", "db_path", "saga.db"))
+    return db_path if db_path.is_absolute() else home / ".mimir" / db_path
+
+
 def create_core_services(config: Config) -> CoreServices:
     from .chat_skills import ChatSkillRegistry
     from .identities import IdentityResolver
@@ -181,16 +193,7 @@ def create_core_services(config: Config) -> CoreServices:
     identity_resolver = IdentityResolver(home=config.home)
     aliases_loaded = identity_resolver.reload()
 
-    home_saga_toml = config.home / "saga.toml"
-    if home_saga_toml.is_file() and not os.environ.get("SAGA_CONFIG"):
-        os.environ["SAGA_CONFIG"] = str(home_saga_toml)
-
-    from .saga._config_io import get_config as get_saga_config
-
-    configured_db_path = get_saga_config()("storage", "db_path", "saga.db")
-    saga_db_path = Path(configured_db_path)
-    if not saga_db_path.is_absolute():
-        saga_db_path = config.home / ".mimir" / saga_db_path
+    saga_db_path = resolve_saga_db_path(config.home)
 
     chat_skill_registry = ChatSkillRegistry.from_config(config)
     return CoreServices(

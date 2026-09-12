@@ -88,6 +88,7 @@ from .file_memory_dashboard import (
     render_memory_html,
     search_files,
 )
+from .runtime import resolve_saga_db_path
 from .saga_dashboard import (
     build_activation_hist_payload,
     build_atom_payload,
@@ -1558,7 +1559,7 @@ def register_routes(
     # referenced by both the session browser and the SAGA dashboard handlers.
     _saga_db: Path | None = saga_db
     if _saga_db is None and home is not None:
-        _saga_db = home / ".mimir" / "saga.db"
+        _saga_db = resolve_saga_db_path(home)
 
     async def ops_page(request: web.Request) -> web.Response:
         # Static HTML shell — frontend AJAX-fetches /api/ops via the
@@ -2127,12 +2128,8 @@ def register_routes(
 
     # ── /saga — saga DB viewer ───────────────────────────────────────
 
-    # Resolve the DB path: use the explicit ``saga_db`` kwarg when
-    # provided (server.py passes the saga.toml-resolved path); otherwise
-    # derive from ``home``. The canonical location is
-    # ``<home>/.mimir/saga.db`` (saga's default ``[storage].db_path``);
-    # the older ``<home>/state/saga.db`` fallback predated the move to
-    # ``.mimir/`` and pointed at a file that no longer exists.
+    # The explicit ``saga_db`` kwarg takes precedence; otherwise the
+    # shared resolver selects the configured store for ``home``.
     async def saga_page(_request: web.Request) -> web.Response:
         return web.Response(
             text=render_saga_html(),

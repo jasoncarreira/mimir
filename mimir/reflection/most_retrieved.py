@@ -51,8 +51,12 @@ def add_argparse(p: argparse.ArgumentParser) -> None:
 #          event-stream-tail) — this aggregates contribution counts.
 # loop_id: 2.5
 async def run(args: argparse.Namespace) -> int:
+    from mimir.runtime import resolve_saga_db_path
+
     cfg = Config.from_env()
-    client = make_saga_client(db_path=cfg.home / ".mimir" / "saga.db")
+    client = make_saga_client(
+        db_path=resolve_saga_db_path(cfg.home), require_existing=True
+    )
     auth_context = create_local_operator_auth_context(
         principal="operator",
         trigger="reflection_cli",

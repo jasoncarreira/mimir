@@ -148,6 +148,48 @@ def test_check_all_combines_both_dbs(tmp_path: Path):
 # ── missing DBs ──────────────────────────────────────────────────────
 
 
+@pytest.mark.parametrize("absolute", [False, True])
+def test_saga_configured_path(tmp_path, monkeypatch, absolute):
+    from mimir.saga import _config_io
+
+    monkeypatch.setattr(_config_io, "_config", None)
+    monkeypatch.setattr(_config_io, "_config_loaded", False)
+    monkeypatch.setattr(_config_io, "_explicit_keys", {})
+    monkeypatch.delenv("SAGA_CONFIG", raising=False)
+    original = _init_saga(tmp_path)
+    target = original.with_name("custom #?%.db")
+    original.rename(target)
+    configured = str(target) if absolute else target.name
+    (tmp_path / "saga.toml").write_text(f'[storage]\ndb_path = "{configured}"\n')
+    checks = check_saga(tmp_path)
+    assert len(checks) == 6
+    assert all(c.ok for c in checks), checks
+    assert not original.exists()
+    target.unlink()
+    checks = check_saga(tmp_path)
+    assert len(checks) == 1
+    assert checks[0].name == "saga_db_present"
+    assert checks[0].detail == f"missing: {target}"
+    assert not target.exists()
+
+
+@pytest.mark.parametrize("probe,args", [
+    ("_check_sqlite_integrity", ()),
+    ("_check_foreign_keys", ()),
+    ("_check_fts5_integrity", ("atoms_fts",)),
+    ("_check_fts5_row_count_match", ("atoms", "atoms_fts")),
+    ("_check_embedding_dim_uniform", ("embeddings", "vec")),
+])
+def test_probe_does_not_create_missing_store(tmp_path, probe, args):
+    from mimir import index_integrity
+
+    target = tmp_path / "missing #?%.db"
+    result = getattr(index_integrity, probe)(target, "saga", *args)
+    assert not result.ok
+    assert "can't open db" in result.detail
+    assert list(tmp_path.iterdir()) == []
+
+
 def test_missing_file_corpus_db_reports_clearly(tmp_path: Path):
     checks = check_file_corpus(tmp_path)
     assert len(checks) == 1

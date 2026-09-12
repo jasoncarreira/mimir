@@ -47,6 +47,8 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Iterable
 
+from ..runtime import resolve_saga_db_path
+
 log = logging.getLogger(__name__)
 
 # ─── Data model ────────────────────────────────────────────────────────
@@ -960,11 +962,11 @@ def run(args: argparse.Namespace) -> int:
     # learning count (#267). Missing db / open failure just drops that one
     # evidence input — the rest of the skill-health section still computes.
     saga_conn = None
-    saga_db = home / ".mimir" / "saga.db"
+    saga_db = resolve_saga_db_path(home)
     if saga_db.is_file():
         try:
             import sqlite3
-            saga_conn = sqlite3.connect(f"file:{saga_db}?mode=ro", uri=True)
+            saga_conn = sqlite3.connect(f"{saga_db.resolve().as_uri()}?mode=ro", uri=True)
         except Exception:  # noqa: BLE001
             log.warning("introspection: saga.db open failed", exc_info=True)
             saga_conn = None
