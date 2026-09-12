@@ -186,8 +186,11 @@ class _TerminalClaimRelease:
     trigger_ready_scan: bool = False
     attempted: bool = False
     confirmed: bool = False
+    retain_for_recovery: bool = False
 
     def __call__(self) -> bool:
+        if self.retain_for_recovery:
+            return False
         if self.attempted:
             return self.confirmed
         self.attempted = True
@@ -977,6 +980,17 @@ class WorklinkRunner:
                 checkout=lease.path if lease else None,
                 branch=lease.branch if lease else None,
             )
+        except BaseException as exc:
+            # No terminal routing occurred. Keep both recovery handles, even
+            # when the finally block below requests release after teardown.
+            terminal_release.retain_for_recovery = True
+            _log_event(
+                "worklink_run_interrupted",
+                issue_id=issue.issue_id,
+                attempt=record.attempt,
+                error=f"{type(exc).__name__}: {exc}",
+            )
+            raise
         finally:
             try:
                 try:

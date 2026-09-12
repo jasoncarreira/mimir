@@ -8,7 +8,7 @@ import subprocess
 import sys
 import threading
 from dataclasses import replace
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Sequence
@@ -1508,6 +1508,97 @@ def test_report_cleanup_failure_cannot_skip_lock_release_or_state_clear(
     assert result.status == "completed"
     assert ["chainlink", "locks", "release", "441"] in calls
     assert load_run_state(tmp_path, 441) is None
+
+
+@pytest.mark.parametrize("interruption", [asyncio.CancelledError, KeyboardInterrupt, SystemExit])
+@pytest.mark.parametrize("via_cli", [False, True])
+def test_interrupted_claim_is_reapable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, interruption: type[BaseException],
+    via_cli: bool,
+) -> None:
+    import mimir.worklink.orchestrator as orchestrator
+    from mimir.cli import main
+
+    repo = tmp_path / "repo"
+    worktree = repo.parent / ".worklink" / repo.name / "441-1"
+    calls, base_runner = _orchestrator_runner(repo, worktree)
+    labels = {"worklink", "worklink:ready"}
+    held = False
+    events: list[tuple[str, dict[str, Any]]] = []
+    error = interruption("operator interrupted")
+
+    def runner(args, **kwargs):
+        nonlocal held
+        if isinstance(args, list) and args[:2] == ["chainlink", "locks"]:
+            if args[2] == "claim":
+                held = True
+            elif args[2] == "release":
+                held = False
+            elif args[2] == "list":
+                return cp(args, stdout=json.dumps({"locks": [{"issue_id": 441}] if held else []}))
+        if isinstance(args, list) and args[:2] == ["chainlink", "issue"]:
+            if args[2] == "label":
+                labels.add(args[4])
+            elif args[2] == "unlabel":
+                labels.discard(args[4])
+            elif args[2] == "show":
+                issue = json.loads(ISSUE_JSON)
+                issue["labels"] = sorted(labels)
+                return cp(args, stdout=json.dumps(issue))
+        return base_runner(args, **kwargs)
+
+    class InterruptedCompute(FakeCompute):
+        async def launch(self, spec):
+            assert held and "worklink:in-progress" in labels
+            assert load_run_state(tmp_path, 441) is not None
+            raise error
+
+    registry = BackendRegistry(
+        WorklinkConfig(defaults=WorklinkDefaults(compute_backend="fake_compute"))
+    )
+    registry.register(FakeBackend())
+    registry.register_compute(InterruptedCompute())
+    monkeypatch.setattr(orchestrator, "_log_event", lambda event, **fields: events.append((event, fields)))
+
+    async def invoke():
+        # Catch inside the root coroutine so asyncio does not special-case KeyboardInterrupt.
+        with pytest.raises(interruption) as caught:
+            await WorklinkRunner(home=tmp_path, repo=repo, runner=runner, registry=registry).run(
+                441, backend_name="fake", test_command="echo ok"
+            )
+        assert caught.value is error
+
+    if via_cli:
+        monkeypatch.setattr(orchestrator, "_runner_for_home", lambda *_: runner)
+        monkeypatch.setattr(orchestrator, "BackendRegistry", lambda _: registry)
+        with pytest.raises(interruption) as caught:
+            main([
+                "worklink", "run", "441", "--home", str(tmp_path), "--repo", str(repo),
+                "--backend", "fake", "--test-command", "echo ok",
+            ])
+        assert caught.value is error
+    else:
+        asyncio.run(invoke())
+
+    assert not ("worklink:in-progress" in labels and not held)
+    assert load_run_state(tmp_path, 441) is not None
+    event_name = "worklink_run_failed" if via_cli else "worklink_run_interrupted"
+    failure = next(fields for event, fields in events if event == event_name)
+    assert failure["issue_id"] == 441
+    assert failure["attempt"] == 1
+    records = claim_records_from_comments(
+        call[4] for call in calls
+        if isinstance(call, list) and call[:3] == ["chainlink", "issue", "comment"]
+    )
+    assert len(records) == 1
+    claims = ChainlinkClaims(
+        agent_id="reaper", runner=runner,
+        clock=lambda: datetime.now(UTC) + timedelta(days=1),
+    )
+    assert claims.reap_stale_claims(records, ttl=timedelta(minutes=1)).reaped == records
+    assert not held
+    assert "worklink:in-progress" not in labels
+    assert "worklink:ready" in labels
 
 
 def test_bounded_timeout_releases_lock_before_failure_routing(tmp_path: Path) -> None:
