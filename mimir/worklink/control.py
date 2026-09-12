@@ -280,6 +280,13 @@ def stop_worklink(
     run = runner or _runner(home, chainlink_bin)
     with _claim_mutex(home):
         state = load_run_state(home, issue_id)
+        state_cleared = False
+        if state is not None and not process_is_alive(state):
+            clear_run_state(home, issue_id)
+            state_cleared = load_run_state(home, issue_id) is None
+            # Epic dispatch uses factory records, not leaf run state. A stale
+            # leaf record must not hide a verified live factory handle.
+            state = None
         if state is None:
             factory = next(
                 (
@@ -290,7 +297,9 @@ def stop_worklink(
                 None,
             )
             if factory is None or factory.handle is None:
-                return WorklinkStopResult(issue_id, False, reason="no live run")
+                return WorklinkStopResult(
+                    issue_id, False, state_cleared=state_cleared, reason="no live run"
+                )
             try:
                 asyncio.run(LocalSubprocessComputeBackend().cancel(factory.handle))
             except (KeyError, RuntimeError, OSError) as exc:
@@ -306,17 +315,9 @@ def stop_worklink(
             return WorklinkStopResult(
                 issue_id,
                 True,
-                state_cleared=False,
+                state_cleared=state_cleared,
                 claim_released=release.returncode == 0,
                 label_cleared=unlabel.returncode == 0,
-            )
-        if not process_is_alive(state):
-            clear_run_state(home, issue_id)
-            return WorklinkStopResult(
-                issue_id,
-                False,
-                state_cleared=load_run_state(home, issue_id) is None,
-                reason="no live run",
             )
         if state.phase != "spawned":
             return WorklinkStopResult(issue_id, False, reason="no live run")

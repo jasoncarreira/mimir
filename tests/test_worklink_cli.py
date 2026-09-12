@@ -1069,11 +1069,15 @@ def test_reconcile_lock_release_failure_retains_state_and_emits_actionable_event
     ]
 
 
+@pytest.mark.parametrize("stale_leaf", [False, True])
 def test_factory_stop_finds_production_record_and_cancels_verified_handle(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str], stale_leaf: bool,
 ) -> None:
     import mimir.worklink.control as control
 
+    if stale_leaf:
+        _state(tmp_path, 700, 999_999_999, ticks=1, started_at=datetime.now(UTC))
     sandbox = tmp_path / "chainlink-700"
     sandbox.mkdir()
     status = parse_factory_status(
@@ -1099,7 +1103,7 @@ def test_factory_stop_finds_production_record_and_cancels_verified_handle(
             "next": "implementation",
         }
     )
-    handle = LaunchHandle("local_subprocess", "4321", 99)
+    handle = LaunchHandle("local_subprocess", "worker-job", 99, shim_pid=4321)
     save_factory_record(
         tmp_path,
         FactoryRunRecord(
@@ -1126,14 +1130,18 @@ def test_factory_stop_finds_production_record_and_cancels_verified_handle(
 
     monkeypatch.setattr(control, "factory_process_is_alive", lambda record: True)
     monkeypatch.setattr(control.LocalSubprocessComputeBackend, "cancel", cancel)
-    result = stop_worklink(
-        tmp_path,
-        700,
-        runner=lambda args: commands.append(list(args))
-        or subprocess.CompletedProcess(args, 0, stdout="", stderr=""),
+    monkeypatch.setattr(
+        control, "_runner", lambda home, binary: (
+            lambda args: commands.append(list(args))
+            or subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+        ),
     )
+    with pytest.raises(SystemExit) as exc:
+        main(["worklink", "stop", "700", "--home", str(tmp_path)])
 
-    assert result.stopped
+    assert exc.value.code == 0
+    assert "worklink #700: stopped;" in capsys.readouterr().out
+    assert load_run_state(tmp_path, 700) is None
     assert cancelled == [handle]
     stopped = load_factory_record(tmp_path, "chainlink-700")
     assert stopped is not None
@@ -1145,13 +1153,39 @@ def test_factory_stop_finds_production_record_and_cancels_verified_handle(
     assert all("factory" not in command for command in commands)
 
 
-def test_factory_stop_refuses_unverified_or_reused_process_identity(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize("stale_leaf", [False, True])
+def test_stop_cli_no_live_run_is_successful_noop(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str], stale_leaf: bool,
 ) -> None:
     import mimir.worklink.control as control
 
+    if stale_leaf:
+        _state(tmp_path, 700, 999_999_999, ticks=1, started_at=datetime.now(UTC))
+
+    def unexpected(*args: object) -> None:
+        pytest.fail("no-live-run stop must not cancel or mutate Chainlink")
+
+    monkeypatch.setattr(control, "_runner", lambda *args: unexpected)
+    monkeypatch.setattr(control.LocalSubprocessComputeBackend, "cancel", unexpected)
+    with pytest.raises(SystemExit) as exc:
+        main(["worklink", "stop", "700", "--home", str(tmp_path)])
+
+    assert exc.value.code == 0
+    assert capsys.readouterr().out == "worklink #700: nothing stopped (no live run)\n"
+    assert load_run_state(tmp_path, 700) is None
+
+
+def test_factory_stop_refuses_unverified_or_reused_process_identity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from types import SimpleNamespace
+
+    import mimir.worklink.control as control
+
     monkeypatch.setattr(control, "load_run_state", lambda home, issue_id: None)
-    monkeypatch.setattr(control, "load_factory_records_for_issue", lambda home, issue_id: [object()])
+    record = SimpleNamespace(handle=LaunchHandle("local_subprocess", "4321", 99))
+    monkeypatch.setattr(control, "load_factory_records_for_issue", lambda home, issue_id: [record])
     monkeypatch.setattr(control, "factory_process_is_alive", lambda record: False)
     monkeypatch.setattr(
         control.LocalSubprocessComputeBackend,
@@ -1163,6 +1197,29 @@ def test_factory_stop_refuses_unverified_or_reused_process_identity(
 
     assert not result.stopped
     assert result.reason == "no live run"
+
+
+def test_stop_cli_refuses_unverified_live_leaf(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    import mimir.worklink.control as control
+
+    state = _state(tmp_path, 700, os.getpid(), ticks=None, started_at=datetime.now(UTC))
+
+    def unexpected(*args: object) -> None:
+        pytest.fail("unverified live leaf must not be signalled or bypassed")
+
+    monkeypatch.setattr(control, "load_factory_records_for_issue", unexpected)
+    monkeypatch.setattr(control.LocalSubprocessComputeBackend, "cancel", unexpected)
+    with pytest.raises(SystemExit) as exc:
+        main(["worklink", "stop", "700", "--home", str(tmp_path)])
+
+    assert exc.value.code == 1
+    assert capsys.readouterr().out == (
+        "worklink #700: nothing stopped "
+        "(live PID could not be verified; refusing to signal it)\n"
+    )
+    assert load_run_state(tmp_path, 700) == state
 
 
 @pytest.mark.skipif(not Path("/proc").is_dir(), reason="requires procfs")
