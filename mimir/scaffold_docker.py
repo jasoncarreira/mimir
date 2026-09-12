@@ -735,7 +735,7 @@ _START_SH_TEMPLATE = """\
 #      into /workspace/<repo-name>. Subsequent runs leave the worktree
 #      alone — the agent owns its branches + uncommitted state.
 #   2. git + gh auth from GITHUB_TOKEN (clone of private upstreams).
-#   3. uv sync (idempotent).
+#   3. uv sync (idempotent), then build the React console if absent.
 #   4. mimir setup --home /mimir-home (idempotent; only writes missing
 #      files).
 #   5. exec mimir run.
@@ -793,6 +793,13 @@ if [ "${MIMIR_ENABLE_CLAUDE_CODE:-0}" = "1" ]; then
 fi
 echo "[start.sh] uv sync (extras: ${UV_EXTRAS:-(none)})"
 uv sync $UV_EXTRAS
+
+# The workspace volume preserves the bundle across container restarts.
+if [ ! -f "mimir/react_app/dist/index.html" ]; then
+    echo "[start.sh] building React console (bundle absent)"
+    npm ci --include=dev
+    npm run build
+fi
 
 # ─── skill-required extras (chainlink #406) ────────────────────────
 # Optional skills can declare ``requires_extras`` in their SKILL.md
