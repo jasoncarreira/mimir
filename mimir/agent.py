@@ -3216,13 +3216,15 @@ class Agent:
             # submission(s). Generic (non-PR-specific) markers all match the
             # same submissions and degrade to all-or-nothing — no false
             # positives, just no per-item attribution.
-            missed = [
-                m for m in sub_markers
+            missed = []
+            # Keep gh calls sequential, but off the event loop: each network
+            # subprocess can take up to 15 seconds.
+            for m in sub_markers:
                 if (
                     _count_expected_tool_calls(events, m) == 0
-                    and not _gh_review_submitted_for_marker(m)
-                )
-            ]
+                    and not await asyncio.to_thread(_gh_review_submitted_for_marker, m)
+                ):
+                    missed.append(m)
             if isinstance(signal_type, str) and signal_type.strip() and missed:
                 ext = event.extra or {}
                 items = ext.get("items") or []

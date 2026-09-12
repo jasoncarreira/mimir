@@ -4303,6 +4303,79 @@ def test_gh_review_submitted_for_marker_requires_head_when_present(monkeypatch):
     }) is False
 
 
+async def test_run_turn_review_reconciliation_keeps_event_loop_responsive(
+    tmp_path: Path, monkeypatch,
+):
+    import threading
+
+    agent = _build_agent(
+        tmp_path,
+        fake_agent=_FakeAgent(response_messages=[AIMessage(content="Drafted reviews")]),
+        fake_saga=None,
+        session_manager=_FakeSessionManager(),
+    )
+    numbers = [522, 523, 524]
+    started = [asyncio.Event() for _ in numbers]
+    release = [threading.Event() for _ in numbers]
+    progressed = []
+    calls = []
+    loop = asyncio.get_running_loop()
+
+    def fake_run(cmd, **kwargs):
+        index = len(calls)
+        calls.append(cmd)
+        assert kwargs["timeout"] == 15
+        loop.call_soon_threadsafe(started[index].set)
+        # Only the concurrent coroutine can release this blocking call. The
+        # timeout lets the synchronous negative control fail without hanging.
+        progressed.append(release[index].wait(timeout=2))
+        reviews = [{
+            "user": {"login": "reviewer"},
+            "state": "APPROVED",
+            "commit_id": "current-head",
+        }] if numbers[index] == 523 else []
+        return SimpleNamespace(returncode=0, stdout=json.dumps(reviews))
+
+    async def make_progress():
+        for began, unblock in zip(started, release):
+            await began.wait()
+            unblock.set()
+
+    monkeypatch.setattr("mimir.agent.subprocess.run", fake_run)
+    event = AgentEvent(
+        trigger="poller", channel_id="poller:github-activity",
+        content="Review these PRs", source_id="review-batch",
+        extra={"items": [{"expected_tool_call": {
+            "repo": "o/r", "number": number, "reviewer": "reviewer",
+            "head_sha": "current-head", "ref": f"o/r#{number}",
+            "bash_substrings": [f"gh pr review {number} "],
+            "signal_on_missing": "poller_review_missed_submission",
+        }} for number in numbers]},
+    )
+    progress_task = asyncio.create_task(make_progress())
+    try:
+        await agent.run_turn(event)
+        await asyncio.wait_for(progress_task, timeout=5)
+    finally:
+        for unblock in release:
+            unblock.set()
+        progress_task.cancel()
+        await asyncio.gather(progress_task, return_exceptions=True)
+
+    assert progressed == [True, True, True], "event loop stalled during gh checks"
+    assert calls == [
+        ["gh", "api", f"repos/o/r/pulls/{number}/reviews", "--paginate"]
+        for number in numbers
+    ]
+    events_log = tmp_path / "home" / "logs" / "events.jsonl"
+    evs = [json.loads(line) for line in events_log.read_text().splitlines()]
+    [missed] = [e for e in evs if e.get("type") == "poller_review_missed_submission"]
+    assert missed["expected"] == 3
+    assert missed["submitted"] == 1
+    assert missed["missed"] == 2
+    assert missed["missed_refs"] == ["o/r#522", "o/r#524"]
+
+
 async def test_run_turn_emits_missed_submission_for_unsubmitted_poller_review(
     tmp_path: Path,
 ):
