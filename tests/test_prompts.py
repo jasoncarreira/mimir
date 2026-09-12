@@ -6,6 +6,8 @@ indirectly by agent / dispatcher tests."""
 from __future__ import annotations
 
 import os
+import time
+from pathlib import Path
 
 import pytest
 
@@ -13,7 +15,88 @@ from mimir.config import Config
 from mimir.prompts import build_system_prompt
 
 
+@pytest.mark.parametrize("reader", ["core", "channel", "index"])
+@pytest.mark.parametrize("write_kind", ["recorded_untrusted", "external", "invalid_ledger"])
+def test_prompt_readers_omit_ledger_untrusted_files(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, reader: str, write_kind: str,
+):
+    from mimir.access_control import (
+        _persisted_file_integrity,
+        initialize_file_integrity_ledger,
+        record_file_write_integrity,
+    )
+    from mimir.core_blocks import load_channel_memory, load_core
+    from mimir.index import IndexGenerator
+    from mimir.models import AgentEvent, InformationFlowLabels
+    from mimir.prompts import build_turn_prompt
+
+    relative = Path({
+        "core": "memory/core/00-target.md",
+        "channel": "memory/channels/chat/00-target.md",
+        "index": "memory/INDEX.md",
+    }[reader])
+    target = tmp_path / relative
+    target.parent.mkdir(parents=True)
+    target.write_text("TRUSTED_MEMORY_CONTROL", encoding="utf-8")
+    assert initialize_file_integrity_ledger(tmp_path)
+    monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
+    if write_kind == "recorded_untrusted":
+        assert record_file_write_integrity(str(target), InformationFlowLabels())
+
+    def prompt():
+        if reader == "core":
+            return build_system_prompt(core_blocks=load_core(tmp_path))
+        if reader == "channel":
+            return build_turn_prompt(
+                AgentEvent(trigger="user_message", channel_id="chat", content="hello"),
+                channel_memory_block=load_channel_memory(tmp_path, "chat"),
+            )
+        return build_system_prompt(
+            memory_index_body=IndexGenerator(tmp_path).read_memory_index(),
+        )
+
+    # Both recorded and pre-epoch trust remain visible; don't just disable memory.
+    assert "TRUSTED_MEMORY_CONTROL" in prompt()
+    if write_kind == "external":
+        # Cross filesystem timestamp granularity before bypassing protected writes.
+        time.sleep(0.02)
+    target.write_text("UNTRUSTED_MEMORY_PAYLOAD", encoding="utf-8")
+    if write_kind == "recorded_untrusted":
+        assert record_file_write_integrity(str(target), None)
+    elif write_kind == "invalid_ledger":
+        (tmp_path / ".mimir" / "file-integrity.json").write_text("not-json")
+    assert _persisted_file_integrity(tmp_path, relative) == "untrusted"
+
+    # Readers must use their supplied home, not an ambient deployment's ledger.
+    monkeypatch.setenv("MIMIR_HOME", str(tmp_path / "different-home"))
+    rendered = prompt()
+    assert "UNTRUSTED_MEMORY_PAYLOAD" not in rendered
+    section = {"core": "Core memory", "channel": "Channel context", "index": "Memory index"}
+    assert f"## {section[reader]}" not in rendered.splitlines()
+
+
 # ---- v0.4 §6: operator alert channel surfacing ---------------------------
+
+
+@pytest.mark.parametrize("target_kind", ["outside", "missing", "untrusted", "trusted"])
+def test_prompt_file_trust_uses_canonical_contained_path(tmp_path: Path, target_kind: str):
+    from mimir.access_control import initialize_file_integrity_ledger
+    from mimir.core_blocks import _prompt_file_is_trusted
+
+    home = tmp_path / "home"
+    home.mkdir()
+    target = (tmp_path if target_kind == "outside" else home) / "target.md"
+    if target_kind != "missing":
+        target.write_text("memory")
+    link = home / "alias.md"
+    link.symlink_to(target)
+    assert initialize_file_integrity_ledger(home)
+    if target_kind == "untrusted":
+        # Only the canonical target has a ledger entry, not its alias.
+        (home / ".mimir" / "file-integrity.json").write_text(
+            '{"target.md":"untrusted"}', encoding="utf-8",
+        )
+    assert _prompt_file_is_trusted(home, link) is (target_kind == "trusted")
 
 
 def test_system_prompt_includes_operator_alert_channel():

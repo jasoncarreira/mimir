@@ -66,6 +66,28 @@ def test_build_memory_index_includes_core_with_tag(tmp_path: Path):
     assert "- INDEX.md" not in body
 
 
+def test_missing_memory_index_omits_untrusted_descriptions(tmp_path: Path, monkeypatch):
+    from mimir.access_control import initialize_file_integrity_ledger, record_file_write_integrity
+    from mimir.prompts import build_system_prompt
+
+    memory = tmp_path / "memory"
+    memory.mkdir()
+    trusted = memory / "trusted.md"
+    trusted.write_text("<!-- desc: TRUSTED_DESCRIPTION -->\ntrusted body")
+    untrusted = memory / "untrusted.md"
+    untrusted.write_text("<!-- desc: UNTRUSTED_DESCRIPTION -->\nuntrusted body")
+    assert initialize_file_integrity_ledger(tmp_path)
+    monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
+    assert record_file_write_integrity(str(untrusted), None)
+    monkeypatch.setenv("MIMIR_HOME", str(tmp_path / "different-home"))
+
+    body = IndexGenerator(tmp_path).read_memory_index()
+    prompt = build_system_prompt(memory_index_body=body)
+    assert "TRUSTED_DESCRIPTION" in prompt
+    assert "UNTRUSTED_DESCRIPTION" not in prompt
+    assert "untrusted.md" not in prompt
+
+
 def test_build_memory_index_survives_non_utf8_file(tmp_path: Path):
     """Regression #470: a memory *.md with a stray non-UTF-8 byte must not
     crash index building (it feeds the system prompt; UnicodeDecodeError is a

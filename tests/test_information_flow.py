@@ -61,6 +61,7 @@ from mimir.agent import (
     _recent_message_is_self_authored,
 )
 from mimir.history import Message, MessageBuffer
+from mimir.identities import IdentityResolver
 from mimir.bridges._activity_panel import ActivityPanel
 from mimir.bridges.base import Bridge, MessageUpdate, SendResult
 from mimir.channel_registry import ChannelRegistry
@@ -89,6 +90,29 @@ from mimir.worklink.continuation import (
 
 
 ALL_LABELS = frozenset({"private", "confidential", "internal", "public"})
+
+
+@pytest.fixture
+def ingress_resolver(tmp_path: Path) -> IdentityResolver:
+    home = tmp_path / "ingress-identities"
+    state = home / "state"
+    state.mkdir(parents=True)
+    (state / "identities.yaml").write_text(
+        "people:\n"
+        "  - canonical: user-1\n"
+        "    aliases: [slack-U1]\n"
+        "    access: {roles: [user, admin]}\n"
+        "  - canonical: operator\n"
+        "    access: {roles: [admin]}\n"
+        "  - canonical: member\n"
+        "    access: {roles: [user]}\n"
+        "  - canonical: unprivileged\n"
+        "    aliases: [known-without-roles]\n",
+        encoding="utf-8",
+    )
+    resolver = IdentityResolver(home)
+    resolver.reload()
+    return resolver
 
 
 def _auth(channel: str = "slack-C1", *, roles: tuple[str, ...] = ()) -> AuthContext:
@@ -572,7 +596,7 @@ def test_integrity_gate_helper_is_exact_and_least_trusted_on_mixing():
 @pytest.mark.parametrize(
     ("event", "expected"),
     [
-        (AgentEvent(trigger="user_message", channel_id="slack-C1", author="slack-U1", source="slack"), "trusted"),
+        (AgentEvent(trigger="user_message", channel_id="slack-C1", author="slack-U1", source="slack"), "untrusted"),
         (AgentEvent(trigger="user_message", channel_id="web", author="claimed", source="web"), "untrusted"),
         (AgentEvent(trigger="user_message", channel_id="api", author="claimed", source="api"), "untrusted"),
         (AgentEvent(trigger="user_message", channel_id="stdin", author="claimed", source="stdin"), "untrusted"),
@@ -586,9 +610,78 @@ def test_ingress_integrity_derivation_defaults_fail_closed(event: AgentEvent, ex
     assert source.integrity_effect == "active_ingest"
 
 
-@pytest.mark.parametrize("client_source", [None, "web"])
+@pytest.mark.parametrize("source", ["slack", "discord", "web", "acp"])
+@pytest.mark.parametrize(
+    ("author", "with_resolver", "http_ingress", "trigger", "trusted"),
+    [
+        pytest.param("slack-U1", True, False, "user_message", True, id="authorized-alias"),
+        pytest.param("operator", True, False, "user_message", True, id="admin-only"),
+        pytest.param("member", True, False, "user_message", True, id="user-only"),
+        pytest.param("unknown", True, False, "user_message", False, id="unknown"),
+        pytest.param("known-without-roles", True, False, "user_message", False, id="unprivileged"),
+        pytest.param(None, True, False, "user_message", False, id="missing-author"),
+        pytest.param("", True, False, "user_message", False, id="empty-author"),
+        pytest.param("slack-U1", False, False, "user_message", False, id="missing-resolver"),
+        pytest.param("slack-U1", True, True, "user_message", False, id="http-spoof"),
+        pytest.param("slack-U1", True, False, "unknown", False, id="non-user-trigger"),
+    ],
+)
+def test_user_ingress_trust_requires_authorized_identity_and_bridge(
+    ingress_resolver: IdentityResolver,
+    source: str,
+    author: str | None,
+    with_resolver: bool,
+    http_ingress: bool,
+    trigger: str,
+    trusted: bool,
+) -> None:
+    assert ingress_resolver.identity("known-without-roles") is not None
+    assert ingress_resolver.identity("unknown") is None
+    event = AgentEvent(
+        trigger=trigger, channel_id="slack-C1", author=author, source=source,
+        extra=(
+            {HTTP_EVENT_INGRESS_EXTRA_KEY: HTTP_EVENT_INGRESS_EXTRA_VALUE}
+            if http_ingress else {}
+        ),
+    )
+
+    labels = _initialize_ifc_labels(
+        event, resolver=ingress_resolver if with_resolver else None,
+    )
+
+    assert len(labels.sources) == 1
+    ingress = next(iter(labels.sources))
+    assert ingress.integrity == ("trusted" if trusted else "untrusted")
+    assert ingress.integrity_effect == "active_ingest"
+    assert labels.has_untrusted_active_ingest is (not trusted)
+    if author == "slack-U1" and with_resolver:
+        assert ingress.principal == "user-1"
+
+
+@pytest.mark.parametrize("source", [None, "", "external", "api", "http", "stdin"])
+def test_authorized_identity_does_not_trust_unknown_ingress_source(
+    ingress_resolver: IdentityResolver,
+    source: str | None,
+) -> None:
+    event = AgentEvent(
+        trigger="user_message", channel_id="slack-C1", author="slack-U1",
+        source=source,
+    )
+    assert ingress_resolver.access_metadata(event.author).is_authorized is True
+
+    labels = _initialize_ifc_labels(event, resolver=ingress_resolver)
+
+    ingress = next(iter(labels.sources))
+    assert ingress.principal == "user-1"
+    assert ingress.integrity == "untrusted"
+    assert ingress.integrity_effect == "active_ingest"
+    assert labels.has_untrusted_active_ingest is True
+
+
+@pytest.mark.parametrize("client_source", [None, "slack", "discord", "web", "acp"])
 def test_http_event_ingress_marker_taints_audience_egress_regardless_of_client_source(
     monkeypatch: pytest.MonkeyPatch,
+    ingress_resolver: IdentityResolver,
     client_source: str | None,
 ) -> None:
     target = "https://audience.example/hook"
@@ -602,7 +695,7 @@ def test_http_event_ingress_marker_taints_audience_egress_regardless_of_client_s
         extra={HTTP_EVENT_INGRESS_EXTRA_KEY: HTTP_EVENT_INGRESS_EXTRA_VALUE},
     )
 
-    labels = _initialize_ifc_labels(event)
+    labels = _initialize_ifc_labels(event, resolver=ingress_resolver)
     source = next(iter(labels.sources))
     decision = SinkGate.check_sink_flow(
         "webhook", target, labels, _auth(roles=("admin",)), enforce=True,
@@ -614,10 +707,12 @@ def test_http_event_ingress_marker_taints_audience_egress_regardless_of_client_s
     assert decision.reason == "ifc_label_blocked:http_webhook"
 
 
-def _runtime_operator_context(event: AgentEvent) -> tuple[AuthContext, InformationFlowLabels]:
-    labels = _initialize_ifc_labels(event)
+def _runtime_operator_context(
+    event: AgentEvent, resolver: IdentityResolver,
+) -> tuple[AuthContext, InformationFlowLabels]:
+    labels = _initialize_ifc_labels(event, resolver=resolver)
     auth = replace(
-        create_auth_context(event, enforce=True, ifc_labels=labels),
+        create_auth_context(event, resolver=resolver, enforce=True, ifc_labels=labels),
         roles=("user", "admin"),
         interactivity=TurnInteractivity.INTERACTIVE,
     )
@@ -627,6 +722,7 @@ def _runtime_operator_context(event: AgentEvent) -> tuple[AuthContext, Informati
 def test_clean_operator_runtime_ingress_can_use_required_sinks_under_enforcement(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    ingress_resolver: IdentityResolver,
 ) -> None:
     destination = "https://approved.example/operator-input"
     monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
@@ -635,7 +731,7 @@ def test_clean_operator_runtime_ingress_can_use_required_sinks_under_enforcement
         trigger="user_message", channel_id="slack-C1", author="user-1",
         source="slack", content="make the requested local change",
     )
-    auth, labels = _runtime_operator_context(event)
+    auth, labels = _runtime_operator_context(event, ingress_resolver)
     target = str(tmp_path / "operator.txt")
 
     assert labels.has_untrusted_active_ingest is False
@@ -654,12 +750,14 @@ def test_clean_operator_runtime_ingress_can_use_required_sinks_under_enforcement
         assert decision.would_block is False
 
 
-def test_clean_operator_can_direct_channel_and_notification_egress() -> None:
+def test_clean_operator_can_direct_channel_and_notification_egress(
+    ingress_resolver: IdentityResolver,
+) -> None:
     event = AgentEvent(
         trigger="user_message", channel_id="slack-C1", author="user-1",
         source="slack", content="send the requested update",
     )
-    auth, labels = _runtime_operator_context(event)
+    auth, labels = _runtime_operator_context(event, ingress_resolver)
 
     for tool in ("send_message", "react"):
         decision = ToolRegistry().authorize_tool(
@@ -699,12 +797,13 @@ def test_clean_operator_can_direct_channel_and_notification_egress() -> None:
 )
 def test_cross_channel_operator_allowance_requires_authenticated_ingress_conjuncts(
     auth_change: dict[str, object],
+    ingress_resolver: IdentityResolver,
 ) -> None:
     event = AgentEvent(
         trigger="user_message", channel_id="slack-C1", author="user-1",
         source="slack", content="send the requested update",
     )
-    auth, labels = _runtime_operator_context(event)
+    auth, labels = _runtime_operator_context(event, ingress_resolver)
 
     decision = ToolRegistry().authorize_tool(
         "send_message", replace(auth, **auth_change), enforce=True,
@@ -714,12 +813,14 @@ def test_cross_channel_operator_allowance_requires_authenticated_ingress_conjunc
     assert decision.allowed is False
 
 
-def test_cross_channel_operator_allowance_recloses_for_live_taint_and_source_acl() -> None:
+def test_cross_channel_operator_allowance_recloses_for_live_taint_and_source_acl(
+    ingress_resolver: IdentityResolver,
+) -> None:
     event = AgentEvent(
         trigger="user_message", channel_id="slack-C1", author="user-1",
         source="slack", content="send the requested update",
     )
-    auth, labels = _runtime_operator_context(event)
+    auth, labels = _runtime_operator_context(event, ingress_resolver)
     untrusted = SourceLabel(
         principal="github", domain="filesystem", resource_id="issue.md",
         bridge_instance="filesystem", sensitivity="private",
@@ -736,7 +837,7 @@ def test_cross_channel_operator_allowance_recloses_for_live_taint_and_source_acl
     assert tainted_decision.allowed is False
     assert tainted_decision.reason == "ifc_label_blocked:same_channel"
 
-    clean_auth, clean_labels = _runtime_operator_context(event)
+    clean_auth, clean_labels = _runtime_operator_context(event, ingress_resolver)
     unauthorized_private_source = SourceLabel(
         principal="user-3", domain="protected_tool", resource_id="private-record",
         bridge_instance="mimir", sensitivity="private",
@@ -752,12 +853,14 @@ def test_cross_channel_operator_allowance_recloses_for_live_taint_and_source_acl
     assert acl_decision.reason == "ifc_label_blocked:same_channel"
 
 
-def test_cross_channel_operator_allowance_fails_closed_if_live_taint_is_unknown() -> None:
+def test_cross_channel_operator_allowance_fails_closed_if_live_taint_is_unknown(
+    ingress_resolver: IdentityResolver,
+) -> None:
     event = AgentEvent(
         trigger="user_message", channel_id="slack-C1", author="user-1",
         source="slack", content="send the requested update",
     )
-    auth, labels = _runtime_operator_context(event)
+    auth, labels = _runtime_operator_context(event, ingress_resolver)
     unknown_state = SimpleNamespace(
         has_untrusted_active_ingest=lambda _: None,
         consume_sink_approval=lambda **_: False,
@@ -774,12 +877,13 @@ def test_cross_channel_operator_allowance_fails_closed_if_live_taint_is_unknown(
 
 def test_untrusted_ingest_recloses_operator_action_sinks_but_not_reply(
     tmp_path: Path,
+    ingress_resolver: IdentityResolver,
 ) -> None:
     event = AgentEvent(
         trigger="user_message", channel_id="slack-C1", author="user-1",
         source="slack", content="inspect this PR and then act",
     )
-    auth, labels = _runtime_operator_context(event)
+    auth, labels = _runtime_operator_context(event, ingress_resolver)
     untrusted = SourceLabel(
         principal="github", domain="filesystem", resource_id="pr-body.md",
         bridge_instance="filesystem", sensitivity="internal",
@@ -922,12 +1026,14 @@ def test_non_user_trigger_does_not_gain_originating_channel_carveout(trigger: st
     assert decision.reason == "ifc_label_blocked:same_channel"
 
 
-def test_cross_channel_recent_activity_requires_trust_for_same_channel_sinks():
+def test_cross_channel_recent_activity_requires_trust_for_same_channel_sinks(
+    ingress_resolver: IdentityResolver,
+):
     event = AgentEvent(
         trigger="user_message", channel_id="slack-C1", author="user-1",
         source="slack", content="reply to me",
     )
-    auth, labels = _runtime_operator_context(event)
+    auth, labels = _runtime_operator_context(event, ingress_resolver)
     trusted_self_authored = _prompt_source_labels(
         auth, domain="recent_activity", resource="message:self",
         channel_id="slack-C2", principal="service:mimir", self_authored=True,
@@ -4093,6 +4199,7 @@ def test_operator_seeded_file_without_provenance_is_trusted_informational(
 def test_admin_installed_skill_read_does_not_block_turn_sinks(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    ingress_resolver: IdentityResolver,
 ) -> None:
     home = tmp_path / "home"
     source_root = tmp_path / "optional-skills"
@@ -4108,7 +4215,7 @@ def test_admin_installed_skill_read_does_not_block_turn_sinks(
         trigger="user_message", channel_id="slack-C1", author="user-1",
         source="slack", content="use the github skill",
     )
-    labels = _initialize_ifc_labels(event)
+    labels = _initialize_ifc_labels(event, resolver=ingress_resolver)
     state = InformationFlowState(labels=labels)
     auth = replace(
         create_auth_context(event, enforce=True, ifc_labels=labels),
@@ -6307,7 +6414,9 @@ async def test_agent_graph_tool_call_survives_populated_auth_context(
     assert "unhashable" not in str(tool_messages[-1].content)
 
 
-def test_non_admin_operator_turn_is_denied_cross_channel_at_the_sink_gate() -> None:
+def test_non_admin_operator_turn_is_denied_cross_channel_at_the_sink_gate(
+    ingress_resolver: IdentityResolver,
+) -> None:
     """The admin conjunct must be load-bearing, and provably so.
 
     Deleting `"admin" in roles` from the cross-channel allowance left every
@@ -6321,7 +6430,8 @@ def test_non_admin_operator_turn_is_denied_cross_channel_at_the_sink_gate() -> N
         trigger="user_message", channel_id="slack-C1", author="user-1",
         source="slack", content="send this elsewhere",
     )
-    labels = _initialize_ifc_labels(event)
+    labels = _initialize_ifc_labels(event, resolver=ingress_resolver)
+    assert labels.has_untrusted_active_ingest is False
     non_admin = replace(
         create_auth_context(event, enforce=True, ifc_labels=labels),
         roles=("user",),
@@ -6344,7 +6454,9 @@ def test_non_admin_operator_turn_is_denied_cross_channel_at_the_sink_gate() -> N
     assert reply.allowed is True
 
 
-def test_admin_operator_cross_channel_send_succeeds_through_real_sink() -> None:
+def test_admin_operator_cross_channel_send_succeeds_through_real_sink(
+    ingress_resolver: IdentityResolver,
+) -> None:
     event = AgentEvent(
         trigger="user_message",
         channel_id="slack-origin",
@@ -6352,7 +6464,7 @@ def test_admin_operator_cross_channel_send_succeeds_through_real_sink() -> None:
         source="slack",
         content="send the requested update",
     )
-    auth, labels = _runtime_operator_context(event)
+    auth, labels = _runtime_operator_context(event, ingress_resolver)
     decision = ToolRegistry().authorize_tool(
         "send_message",
         auth,
@@ -6617,7 +6729,9 @@ def test_unknown_canonical_looking_recent_author_is_omitted_without_silencing_re
         "unauthorized_source",
     ],
 )
-def test_cross_channel_sink_refusal_matrix(case: str) -> None:
+def test_cross_channel_sink_refusal_matrix(
+    case: str, ingress_resolver: IdentityResolver,
+) -> None:
     event = AgentEvent(
         trigger="user_message",
         channel_id="slack-origin",
@@ -6625,7 +6739,7 @@ def test_cross_channel_sink_refusal_matrix(case: str) -> None:
         source="slack",
         content="send the requested update",
     )
-    auth, labels = _runtime_operator_context(event)
+    auth, labels = _runtime_operator_context(event, ingress_resolver)
     if case == "non_admin":
         auth = replace(auth, roles=("user",))
     elif case == "shell_job_complete":
