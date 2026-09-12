@@ -205,10 +205,7 @@ _DEFAULTS = {
         "intentional_forgetting_enabled": False,
         "intentional_forgetting_mode": "flag",  # "flag" | "auto"
         "forgetting_contribution_threshold": 0.15,
-        "forgetting_min_retrievals": 5,
         "forgetting_contradiction_threshold": 0.85,
-        "forgetting_confidence_floor": 0.1,
-        "forgetting_grace_days": 14,
         "protection_days": 7,
         "compaction_full_min_age_days": 7,
         "compaction_full_max_access": 3,

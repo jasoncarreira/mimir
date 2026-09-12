@@ -173,7 +173,8 @@ def forget_by_criteria(
     match (and are tombstoned, unless dry_run=True).
 
     ``max_atoms`` is a hard cap to prevent runaway forgetting from a
-    misconfigured criterion.
+    misconfigured criterion. Destructive calls require at least one selection
+    criterion; agent/owner/origin scope and ``max_atoms`` do not count.
 
     ``min_retrievals``: only forget atoms whose total retrieval count
     (``retrieval`` + ``feedback_positive`` access events) is *strictly
@@ -199,6 +200,16 @@ def forget_by_criteria(
         params.append(owner_principal)
     elif origin_domains is not None:
         return ForgetResult(dry_run=dry_run)
+
+    if not dry_run and all(value is None for value in (
+        min_age_days, activation_below, min_retrievals, stream, memory_type, source_type,
+    )):
+        raise ValueError(
+            "Destructive forget_by_criteria requires at least one selection criterion: "
+            "min_age_days, activation_below, min_retrievals, stream, memory_type, or "
+            "source_type. Agent/owner/origin scope and max_atoms do not count; "
+            "set a selection criterion or use dry_run=True to preview."
+        )
     joins: list[str] = []
 
     # ``now`` for age + activation math. Defaults to wall clock; bench
