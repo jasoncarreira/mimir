@@ -5,14 +5,155 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
+import selectors
 import signal
 import subprocess
 import sys
 import textwrap
+import time
 import tomllib
 import xml.etree.ElementTree as ET
 
 import pytest
+
+
+def _wait_for_child(process, *, timeout=30, drain_timeout=1):
+    """Collect output without requiring inherited writers to reach EOF.
+
+    The caller starts a new session; this helper also cleans up that owned
+    process group, including descendants left behind by an exited controller.
+    """
+    output = {process.stdout: bytearray(), process.stderr: bytearray()}
+    deadline = time.monotonic() + timeout
+    drain_deadline = None
+    try:
+        with selectors.DefaultSelector() as selector:
+            for stream in output:
+                os.set_blocking(stream.fileno(), False)
+                selector.register(stream, selectors.EVENT_READ)
+            while True:
+                returncode = process.poll()
+                now = time.monotonic()
+                if returncode is not None:
+                    if drain_deadline is None:
+                        drain_deadline = now + drain_timeout
+                    if not selector.get_map():
+                        break
+                    if now >= drain_deadline:
+                        print(
+                            f"Child pytest stream guard ({drain_timeout}s): mechanism (a); "
+                            f"direct child had exited (returncode={returncode}), "
+                            "but captured streams are still open; checking collected output",
+                            file=sys.stderr,
+                        )
+                        break
+                elif now >= deadline:
+                    pytest.fail(
+                        f"Child pytest hit the {timeout}s guard: mechanism (b); "
+                        "direct child had not exited (returncode=None); "
+                        "possible nested-pytest shutdown hang\n"
+                        + "\n".join(data.decode(errors="replace") for data in output.values())
+                    )
+                bound = drain_deadline if drain_deadline is not None else deadline
+                # Drain during execution too: wait() alone can deadlock on a full pipe.
+                interval = min(0.05, max(0, bound - now))
+                if not selector.get_map():
+                    try:
+                        process.wait(timeout=interval)
+                    except subprocess.TimeoutExpired:
+                        pass
+                    continue
+                for key, _ in selector.select(interval):
+                    chunk = os.read(key.fd, 65536)
+                    if chunk:
+                        output[key.fileobj].extend(chunk)
+                    else:
+                        selector.unregister(key.fileobj)
+        return tuple(data.decode(errors="replace") for data in output.values())
+    finally:
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        # Reap only the direct child; never reintroduce an unbounded communicate().
+        process.wait(timeout=5)
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX process groups and pipes")
+def test_wait_for_child_does_not_require_descendant_pipe_eof(capfd):
+    release_reader, release_writer = os.pipe()
+    try:
+        # The descendant cannot finish until we release it. No timing race or
+        # sleep is needed to keep both inherited output pipes open.
+        command = [sys.executable, "-c", textwrap.dedent(f"""\
+            import os, subprocess, sys
+            subprocess.Popen(
+                [sys.executable, '-c', 'import os; os.read({release_reader}, 1)'],
+                pass_fds=({release_reader},),
+            )
+            os.write(1, b'child stdout\\n')
+            os.write(2, b'child stderr\\n')
+            """)]
+        # Separate children avoid communicate() consuming the new helper's output.
+        for legacy in (True, False):
+            with subprocess.Popen(
+                command, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                pass_fds=(release_reader,), start_new_session=True,
+            ) as process:
+                try:
+                    if legacy:
+                        assert process.wait(timeout=5) == 0
+                        with pytest.raises(subprocess.TimeoutExpired):
+                            process.communicate(timeout=1)
+                    else:
+                        stdout, stderr = _wait_for_child(process, drain_timeout=0.1)
+                        assert process.returncode == 0
+                        assert stdout == 'child stdout\n'
+                        assert stderr == 'child stderr\n'
+                finally:
+                    try:
+                        os.killpg(process.pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                    process.wait(timeout=5)
+    finally:
+        os.close(release_reader)
+        os.close(release_writer)
+    diagnostic = capfd.readouterr().err
+    assert "mechanism (a)" in diagnostic
+    assert "direct child had exited (returncode=0)" in diagnostic
+    assert "captured streams are still open" in diagnostic
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX process groups and pipes")
+@pytest.mark.parametrize("close_streams", [False, True], ids=["open-pipes", "closed-pipes"])
+def test_wait_for_child_reports_live_child(close_streams):
+    command = "import os; os.write(2, b'before shutdown\\n'); "
+    if close_streams:
+        command += "os.close(1); os.close(2); "
+    with subprocess.Popen(
+        [sys.executable, "-c", command + "os.read(0, 1)"],
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        start_new_session=True,
+    ) as process:
+        with pytest.raises(pytest.fail.Exception) as failure:
+            _wait_for_child(process, timeout=1)
+        assert "hit the 1s guard: mechanism (b)" in str(failure.value)
+        assert "direct child had not exited (returncode=None)" in str(failure.value)
+        assert "before shutdown" in str(failure.value)
+        assert process.returncode == -signal.SIGKILL
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX process groups and pipes")
+def test_wait_for_child_drains_output_while_child_runs():
+    with subprocess.Popen(
+        [sys.executable, "-c", "import os; os.write(1, b'x' * 1000000); os.write(2, b'y' * 1000000)"],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True,
+    ) as process:
+        stdout, stderr = _wait_for_child(process)
+        assert process.returncode == 0
+        assert stdout == "x" * 1000000
+        assert stderr == "y" * 1000000
 
 
 def test_timeout_policy():
@@ -138,14 +279,9 @@ def test_hanging_async_test_fails_and_session_continues(tmp_path, workers):
     ]
     with subprocess.Popen(
         command, cwd=tmp_path, env=env, stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE, text=True, start_new_session=True,
+        stderr=subprocess.PIPE, start_new_session=True,
     ) as process:
-        try:
-            stdout, stderr = process.communicate(timeout=30)
-        except subprocess.TimeoutExpired:
-            os.killpg(process.pid, signal.SIGKILL)
-            process.communicate()
-            pytest.fail("Child pytest hit the 30s guard instead of reporting the timed-out node id")
+        stdout, stderr = _wait_for_child(process)
     assert process.returncode == 1, stdout + stderr
     nodeid = "test_hang.py::test_hangs_in_event_loop"
     assert f"FAILED {nodeid} - Failed: Timeout (>2.0s) from pytest-timeout." in stdout
