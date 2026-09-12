@@ -8373,7 +8373,12 @@ class ToolRegistry:
                 redacted_requested_target = str(redacted_requested_target)[
                     :_MAX_REQUESTED_TARGET_LENGTH
                 ]
-            redacted_resolved_target = redact_payload(resolved_target)
+            if sink_category is SinkCategory.SHELL_PROCESS:
+                # The renderer needs shell syntax, not the JSON-resolved argv.
+                argv, _ = service_shell_argv_for_log(target or "")
+                redacted_resolved_target = json.dumps(argv)
+            else:
+                redacted_resolved_target = redact_payload(resolved_target)
             if redacted_resolved_target is not None:
                 redacted_resolved_target = str(redacted_resolved_target)[
                     :_MAX_REQUESTED_TARGET_LENGTH
