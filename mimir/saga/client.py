@@ -1710,6 +1710,20 @@ class SagaStore:
         # would re-derive them via LLM; here we just persist what was
         # passed in. We supply a stub boundary_synth_fn that returns
         # the agent's pre-computed fields.
+        # Summary synthesis is already complete and independent of DB state.
+        # Keep provider retries outside both locks; reflect still checks row
+        # identity/idempotency and writes under BEGIN IMMEDIATE.
+        embedding = None
+        if summary and summary.strip():
+            try:
+                embedding = await asyncio.to_thread(_embed_text_sync, summary.strip())
+            except Exception:
+                log.warning(
+                    "Session %s summary embedding failed; closing without embedding",
+                    session_id,
+                    exc_info=True,
+                )
+
         def _stub_synth(_atoms, _ctx):
             return {
                 "summary": summary,
@@ -1725,7 +1739,7 @@ class SagaStore:
                 conn,
                 session_id=session_id,
                 channel_id=channel_id,
-                embed_fn=_embed_text_sync,
+                embed_fn=lambda _summary: embedding,
                 boundary_synth_fn=_stub_synth,
                 owner_principal=owner_principal,
                 origin_channel=origin_channel,

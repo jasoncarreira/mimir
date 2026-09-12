@@ -39,6 +39,8 @@ import json
 import sqlite3
 from typing import Any
 
+from .sagatools import _ATOM_CONTENT_CAP
+
 # Atom source_type tag for skill-learning atoms. Recall (mimir/saga/recall.py)
 # excludes this source_type from general candidate hydration.
 SKILL_LEARNING_SOURCE_TYPE = "skill_learning"
@@ -243,6 +245,8 @@ def render_skill_learnings(learnings: list[dict]) -> str:
         for item in group:
             kind = item.get("kind") or "?"
             content = " ".join(str(item.get("content") or "").split())
+            if len(content) > _ATOM_CONTENT_CAP:
+                content = content[:_ATOM_CONTENT_CAP] + "…"
             lines.append(f"- [{kind}] {content}")
     return "\n".join(lines)
 

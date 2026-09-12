@@ -30,6 +30,7 @@ from mimir.models import (
     TurnContext,
 )
 from mimir.skill_memory import SKILL_LEARNING_SOURCE_TYPE
+from mimir.sagatools import _ATOM_CONTENT_CAP
 from mimir.tools.memory import _MEMORY_STATE
 from mimir.tools.saga_ops import saga_record_skill_learning
 
@@ -219,6 +220,31 @@ async def test_rejects_empty_content_without_writing(store, turn_with_session):
     msg = await _call(turn_with_session, skill="memory", kind="tip", content="   ")
     assert "failed" in msg and "content is required" in msg
     assert store.calls == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("content", [
+    "x" * (_ATOM_CONTENT_CAP + 1),
+    " " + "x" * _ATOM_CONTENT_CAP,
+    "x" + " " * _ATOM_CONTENT_CAP,
+])
+async def test_rejects_raw_overlong_content_before_store(store, turn_with_session, content):
+    msg = await _call(turn_with_session, skill="memory", kind="tip", content=content)
+
+    assert "failed" in msg
+    assert f"content exceeds {_ATOM_CONTENT_CAP} characters" in msg
+    assert "Shorten" in msg
+    assert store.calls == []
+
+
+@pytest.mark.asyncio
+async def test_accepts_exact_content_cap(store, turn_with_session):
+    content = "x" * _ATOM_CONTENT_CAP
+    msg = await _call(turn_with_session, skill="memory", kind="tip", content=content)
+
+    assert "ok" in msg
+    assert len(store.calls) == 1
+    assert store.calls[0]["content"] == content
 
 
 @pytest.mark.asyncio
