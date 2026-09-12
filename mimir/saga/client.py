@@ -391,8 +391,10 @@ class SagaStore:
         synonyms: dict[str, list[str]] | None = None,
         include_triples_in_response: bool = True,
         triples_top_n: int = 10,
+        require_existing: bool = False,
     ) -> None:
         self._db_path = db_path
+        self._require_existing = require_existing
         self._conn = conn  # may be None until first use
         self._agent_id = agent_id
         self._embedding_dim = embedding_dim
@@ -469,9 +471,29 @@ class SagaStore:
     def _connect_db_path(self, *, enable_wal: bool = True) -> sqlite3.Connection:
         if self._db_path is None:
             raise RuntimeError("SagaStore: cannot open path connection without db_path")
-        conn = sqlite3.connect(str(self._db_path), check_same_thread=False)
-        self._configure_connection(conn, enable_wal=enable_wal)
+        # SQLite enforces non-creation at open time, including per-call reads.
+        target = (
+            self._db_path.absolute().as_uri() + "?mode=rw"
+            if self._require_existing else str(self._db_path)
+        )
+        conn = sqlite3.connect(
+            target, uri=self._require_existing, check_same_thread=False
+        )
+        try:
+            self._validate_existing_store(conn)
+            self._configure_connection(conn, enable_wal=enable_wal)
+        except Exception:
+            conn.close()
+            raise
         return conn
+
+    def _validate_existing_store(self, conn: sqlite3.Connection) -> None:
+        if self._require_existing and conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='atoms'"
+        ).fetchone() is None:
+            from ..saga_client import SagaError
+
+            raise SagaError("SagaStore: existing database has no atoms table")
 
     def _operation_conn(self) -> tuple[sqlite3.Connection, bool]:
         """Return a connection for one read-heavy operation.
@@ -607,13 +629,15 @@ class SagaStore:
 
     def _ensure_conn(self) -> sqlite3.Connection:
         if self._conn is not None:
+            self._validate_existing_store(self._conn)
             return self._conn
         if self._db_path is None:
             raise RuntimeError(
                 "SagaStore: no db_path and no conn provided. "
                 "Construct with SagaStore(db_path=Path(...)) or pass conn=..."
             )
-        self._db_path.parent.mkdir(parents=True, exist_ok=True)
+        if not self._require_existing:
+            self._db_path.parent.mkdir(parents=True, exist_ok=True)
         # Assign to a LOCAL variable first; only promote to ``self._conn``
         # after schema setup + pending migrations succeed. If we assign
         # ``self._conn`` first and the migration then raises, the next
@@ -1686,6 +1710,20 @@ class SagaStore:
         # would re-derive them via LLM; here we just persist what was
         # passed in. We supply a stub boundary_synth_fn that returns
         # the agent's pre-computed fields.
+        # Summary synthesis is already complete and independent of DB state.
+        # Keep provider retries outside both locks; reflect still checks row
+        # identity/idempotency and writes under BEGIN IMMEDIATE.
+        embedding = None
+        if summary and summary.strip():
+            try:
+                embedding = await asyncio.to_thread(_embed_text_sync, summary.strip())
+            except Exception:
+                log.warning(
+                    "Session %s summary embedding failed; closing without embedding",
+                    session_id,
+                    exc_info=True,
+                )
+
         def _stub_synth(_atoms, _ctx):
             return {
                 "summary": summary,
@@ -1707,7 +1745,7 @@ class SagaStore:
                 conn,
                 session_id=session_id,
                 channel_id=channel_id,
-                embed_fn=_embed_text_sync,
+                embed_fn=lambda _summary: embedding,
                 expected_embedding_dim=expected_dim,
                 boundary_synth_fn=_stub_synth,
                 owner_principal=owner_principal,

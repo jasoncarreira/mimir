@@ -26,6 +26,48 @@ from mimir.reflection.introspection_report import (
 NOW = datetime(2026, 5, 1, 12, 0, tzinfo=timezone.utc)
 
 
+@pytest.mark.parametrize("exists", [False, True])
+def test_run_uses_configured_saga_readonly(tmp_path, monkeypatch, exists, capsys):
+    import argparse
+    import sqlite3
+    from mimir.reflection import introspection_report
+    from mimir.saga import _config_io
+
+    monkeypatch.setattr(_config_io, "_config", None)
+    monkeypatch.setattr(_config_io, "_config_loaded", False)
+    monkeypatch.setattr(_config_io, "_explicit_keys", {})
+    monkeypatch.delenv("SAGA_CONFIG", raising=False)
+    target = tmp_path / ".mimir" / "custom #?%.db"
+    target.parent.mkdir()
+    (tmp_path / "saga.toml").write_text('[storage]\ndb_path = "custom #?%.db"\n')
+    if exists:
+        conn = sqlite3.connect(target)
+        conn.execute("CREATE TABLE marker (value TEXT)")
+        conn.close()
+    seen = []
+
+    def aggregate_stub(*args, saga_conn, **kwargs):
+        seen.append(saga_conn)
+        if exists:
+            assert saga_conn.execute("SELECT COUNT(*) FROM marker").fetchone() == (0,)
+            with pytest.raises(sqlite3.OperationalError, match="readonly"):
+                saga_conn.execute("INSERT INTO marker VALUES ('write')")
+        else:
+            assert saga_conn is None
+        return Report(days=7, generated_at=NOW)
+
+    monkeypatch.setattr(introspection_report, "aggregate", aggregate_stub)
+    parser = argparse.ArgumentParser()
+    introspection_report.add_argparse(parser)
+    assert introspection_report.run(parser.parse_args(["--home", str(tmp_path)])) == 0
+    assert len(seen) == 1
+    assert target.exists() == exists
+    assert not (target.parent / "saga.db").exists()
+    if exists:
+        with pytest.raises(sqlite3.ProgrammingError, match="closed"):
+            seen[0].execute("SELECT 1")
+
+
 def _write_turn(
     path: Path,
     *,

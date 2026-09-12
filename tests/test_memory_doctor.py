@@ -84,6 +84,34 @@ def _init_saga_doctor_db(home: Path) -> Path:
     return db_path
 
 
+@pytest.mark.parametrize("absolute", [False, True])
+def test_doctor_configured_saga_path(tmp_path, monkeypatch, absolute):
+    from mimir.saga import _config_io
+
+    monkeypatch.setattr(_config_io, "_config", None)
+    monkeypatch.setattr(_config_io, "_config_loaded", False)
+    monkeypatch.setattr(_config_io, "_explicit_keys", {})
+    monkeypatch.delenv("SAGA_CONFIG", raising=False)
+    original = _init_saga_doctor_db(tmp_path)
+    target = original.with_name("custom #?%.db")
+    original.rename(target)
+    configured = str(target) if absolute else target.name
+    (tmp_path / "saga.toml").write_text(f'[storage]\ndb_path = "{configured}"\n')
+    before = target.read_bytes()
+    report = run_doctor(tmp_path)
+    saga = next(s for s in report.sections if s.name == "saga")
+    assert saga.metrics["sqlite_integrity_ok"] == 1
+    assert saga.metrics["atoms_total"] == 0
+    assert target.read_bytes() == before
+    assert not original.exists()
+    target.unlink()
+    report = run_doctor(tmp_path)
+    finding = next(f for f in report.findings if f.check == "missing-db")
+    assert finding.path == target.relative_to(tmp_path).as_posix()
+    assert not target.exists()
+    assert not original.exists()
+
+
 def _find(report, *, layer: str, check: str, path: str | None = None):
     matches = [
         f for f in report.findings

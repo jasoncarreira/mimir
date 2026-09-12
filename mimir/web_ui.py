@@ -77,6 +77,7 @@ from .ops_dashboard import (
     render_dashboard_html,
 )
 from .scheduler_dashboard import (
+    POLLER_REGISTRATION_ERROR_TYPES,
     build_scheduler_dashboard_payload,
     parse_due_window,
 )
@@ -88,6 +89,7 @@ from .file_memory_dashboard import (
     render_memory_html,
     search_files,
 )
+from .runtime import resolve_saga_db_path
 from .saga_dashboard import (
     build_activation_hist_payload,
     build_atom_payload,
@@ -1558,7 +1560,7 @@ def register_routes(
     # referenced by both the session browser and the SAGA dashboard handlers.
     _saga_db: Path | None = saga_db
     if _saga_db is None and home is not None:
-        _saga_db = home / ".mimir" / "saga.db"
+        _saga_db = resolve_saga_db_path(home)
 
     async def ops_page(request: web.Request) -> web.Response:
         # Static HTML shell — frontend AJAX-fetches /api/ops via the
@@ -1753,7 +1755,7 @@ def register_routes(
                         if job.id.startswith("scheduler:") and (job.kwargs or {}).get("job") is not None
                     }
                     expected_schedule_names.discard("")
-                    expected_poller_names = set(scheduler._pollers)  # noqa: SLF001
+                expected_poller_names = set(scheduler._pollers)  # noqa: SLF001
 
             scheduler_event_types = {
                 "scheduled_tick",
@@ -1772,6 +1774,9 @@ def register_routes(
                 "poller_event_rejected",
                 "poller_circuit_open",
                 "poller_missing_required_env",
+                *POLLER_REGISTRATION_ERROR_TYPES,
+                "poller_tick_hard_deadline",
+                "poller_pr_reconcile_truncated",
             }
 
             def _scheduler_event_name(record: dict[str, Any]) -> str:
@@ -1791,24 +1796,10 @@ def register_routes(
                 if event_type in scheduler_event_types:
                     return _scheduler_event_name(record) in expected_schedule_names
                 if event_type in poller_event_types:
+                    if event_type in POLLER_REGISTRATION_ERROR_TYPES:
+                        return bool(_poller_event_name(record) or record.get("manifest_path"))
                     return _poller_event_name(record) in expected_poller_names
                 return False
-
-            def _found_all_scheduler_state(records: list[dict[str, Any]]) -> bool:
-                found_schedules = {
-                    _scheduler_event_name(record)
-                    for record in records
-                    if str(record.get("type") or "") in scheduler_event_types
-                }
-                found_pollers = {
-                    _poller_event_name(record)
-                    for record in records
-                    if str(record.get("type") or "") in poller_event_types
-                }
-                return (
-                    found_schedules >= expected_schedule_names
-                    and found_pollers >= expected_poller_names
-                )
 
             return build_scheduler_dashboard_payload(
                 scheduler=scheduler,
@@ -1817,7 +1808,8 @@ def register_routes(
                     events_log,
                     max_records=SCHEDULER_STATE_EVENT_SCAN_RECORDS,
                     include=_is_scheduler_state_event,
-                    stop_when=_found_all_scheduler_state,
+                    # Healthy registered siblings cannot bound the search for
+                    # failures that never made it into the registry.
                 ),
                 due_window=due_window,
             )
@@ -2127,12 +2119,8 @@ def register_routes(
 
     # ── /saga — saga DB viewer ───────────────────────────────────────
 
-    # Resolve the DB path: use the explicit ``saga_db`` kwarg when
-    # provided (server.py passes the saga.toml-resolved path); otherwise
-    # derive from ``home``. The canonical location is
-    # ``<home>/.mimir/saga.db`` (saga's default ``[storage].db_path``);
-    # the older ``<home>/state/saga.db`` fallback predated the move to
-    # ``.mimir/`` and pointed at a file that no longer exists.
+    # The explicit ``saga_db`` kwarg takes precedence; otherwise the
+    # shared resolver selects the configured store for ``home``.
     async def saga_page(_request: web.Request) -> web.Response:
         return web.Response(
             text=render_saga_html(),

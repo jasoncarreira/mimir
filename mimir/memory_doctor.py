@@ -29,6 +29,7 @@ from .index import (
     render_memory_index,
 )
 from .wiki_backlinks import build_graph
+from .runtime import resolve_saga_db_path
 
 LEARNINGS_PENDING_MAX_BYTES = 8_192
 LEARNINGS_PENDING_MAX_LINES = 200
@@ -330,7 +331,7 @@ def _check_memory_index(home: Path, findings: list[DoctorFinding]) -> DoctorSect
 
 
 def _check_saga_substrate(home: Path, findings: list[DoctorFinding]) -> DoctorSection:
-    db_path = home / ".mimir" / "saga.db"
+    db_path = resolve_saga_db_path(home)
     rel = _rel(home, db_path)
     metrics: dict[str, int] = {"exists": int(db_path.is_file())}
     if not db_path.is_file():
@@ -432,7 +433,7 @@ def _collect_saga_integrity_metrics(
 
 def _connect_sqlite_readonly(db_path: Path) -> sqlite3.Connection | None:
     try:
-        return sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        return sqlite3.connect(f"{db_path.resolve().as_uri()}?mode=ro", uri=True)
     except sqlite3.Error:
         return None
 

@@ -452,13 +452,18 @@ def make_saga_client(
     db_path: Path | None = None,
     embedding_dim: int | None = None,
     record_calls: bool = True,
+    require_existing: bool = False,
 ) -> SagaClient:
     """Build the in-process saga client (``SagaStore``).
 
     saga runs in-process — the ``mimir.saga`` clean-room rewrite of saga's
     retrieval/consolidation engine. ``db_path`` defaults to
-    ``$MIMIR_HOME/.mimir/saga.db``; pass explicitly to override (tests,
-    alternative DB layouts).
+    the runtime-resolved storage path under ``MIMIR_HOME`` (including
+    ``storage.db_path`` configuration); pass explicitly to override.
+
+    ``require_existing`` refuses missing files and stores without an atoms
+    table on first use, rather than initializing them. Normal creation is
+    unchanged when False.
 
     ``record_calls`` (default True): wrap the client in
     ``RecordingSagaClient`` so each call appends a ``SagaCallRecord`` to the
@@ -478,9 +483,16 @@ def make_saga_client(
                 "supplied — cannot resolve the in-process SagaStore db path. "
                 "Set MIMIR_HOME or pass db_path explicitly."
             )
-        resolved_db = Path(home) / ".mimir" / "saga.db"
-    resolved_db.parent.mkdir(parents=True, exist_ok=True)
-    inner: SagaClient = SagaStore(db_path=resolved_db, embedding_dim=embedding_dim)
+        from .runtime import resolve_saga_db_path
+
+        resolved_db = resolve_saga_db_path(Path(home))
+    if not require_existing:
+        resolved_db.parent.mkdir(parents=True, exist_ok=True)
+    inner: SagaClient = SagaStore(
+        db_path=resolved_db,
+        embedding_dim=embedding_dim,
+        require_existing=require_existing,
+    )
     if record_calls:
         return RecordingSagaClient(inner)  # type: ignore[return-value]
     return inner

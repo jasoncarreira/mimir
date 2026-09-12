@@ -482,15 +482,25 @@ def _oldest_inflight_timestamp(inflight: dict) -> str:
     return min(timestamps, default="")
 
 
-def _read_last_unclean_restart(events_path: Path) -> str:
-    """Return the newest durable unclean-restart marker timestamp."""
+def _read_last_unclean_restart(events_path: Path, since_dt: datetime) -> str:
+    """Return the newest restart newer than the oldest relevant enqueue.
+
+    Use the outcome scanner's disorder grace, not a record cap: a busy log
+    must not hide a crash marker that can still require replay.
+    """
     if not events_path.exists():
         return ""
+    cutoff_floor = since_dt - timedelta(seconds=_OUTCOME_SCAN_GRACE_SECONDS)
     try:
         for rec in tail_jsonl_records(events_path):
-            if rec.get("type") == _UNCLEAN_RESTART_TYPE:
-                ts = rec.get("timestamp")
-                return ts if isinstance(ts, str) and _parse_iso(ts) is not None else ""
+            ts = rec.get("timestamp")
+            rec_dt = _parse_iso(ts)
+            if rec_dt is None or rec_dt.tzinfo is None:
+                continue
+            if rec_dt < cutoff_floor:
+                break
+            if rec.get("type") == _UNCLEAN_RESTART_TYPE and rec_dt > since_dt:
+                return ts
     except OSError as exc:
         log.warning("poller recovery: restart marker read failed for %s: %s", events_path, exc)
     return ""
@@ -853,7 +863,25 @@ async def reconcile_failed_turns(
     # once for this marker. This is deliberately at-least-once: if the outcome
     # record itself was lost in the same crash, a duplicate turn is preferable
     # to silently losing a one-shot notification.
-    restart_iso = await asyncio.to_thread(_read_last_unclean_restart, events_path)
+    # Completed/live-state entries cannot need crash replay. Use latest enqueue,
+    # not scan_from (the original outcome bound), so retries move this bound
+    # forward. The outcome watermark is unsafe here: it may pass a marker whose
+    # replay was deferred. Keep that marker discoverable on the next cycle.
+    restart_enqueues = []
+    if not summary["deferred"]:
+        for entry in inflight.values():
+            enqueued_dt = _parse_iso(entry.get("enqueued_at") or entry.get("stashed_at"))
+            outcome_dt = _parse_iso(entry.get("last_outcome_at"))
+            if enqueued_dt is not None and (
+                outcome_dt is None or outcome_dt < enqueued_dt
+            ):
+                restart_enqueues.append(enqueued_dt)
+    restart_iso = (
+        await asyncio.to_thread(
+            _read_last_unclean_restart, events_path, min(restart_enqueues),
+        )
+        if restart_enqueues else ""
+    )
     restart_dt = _parse_iso(restart_iso)
     # Pending initial deliveries need neither a restart nor a failed outcome.
     # Both paths use the same identity restore and budgeted enqueue callback.

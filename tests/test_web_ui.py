@@ -48,6 +48,46 @@ def app(tmp_path: Path) -> tuple[web.Application, Path, Path]:
     return a, turns_log, events_log
 
 
+@pytest.mark.parametrize("explicit", [False, True])
+@pytest.mark.parametrize("config_source", ["home", "env"])
+async def test_saga_route_uses_configured_path(tmp_path, monkeypatch, explicit, config_source):
+    from mimir.saga import _config_io
+
+    monkeypatch.setattr(_config_io, "_config", None)
+    monkeypatch.setattr(_config_io, "_config_loaded", False)
+    monkeypatch.setattr(_config_io, "_explicit_keys", {})
+    monkeypatch.delenv("SAGA_CONFIG", raising=False)
+    (tmp_path / "saga.toml").write_text('[storage]\ndb_path = "custom.db"\n')
+    configured = tmp_path / ".mimir" / "custom.db"
+    if config_source == "env":
+        configured = tmp_path / "external.db"
+        config = tmp_path / "external.toml"
+        config.write_text(f'[storage]\ndb_path = "{configured}"\n')
+        monkeypatch.setenv("SAGA_CONFIG", str(config))
+    override = tmp_path / "override.db"
+    expected = override if explicit else configured
+    seen = []
+
+    def stats(path):
+        seen.append(path)
+        return {"configured_path": str(path)}
+
+    monkeypatch.setattr(web_ui, "build_db_stats_payload", stats)
+    app = web.Application()
+    web_ui.register_routes(
+        app, turns_log=tmp_path / "turns.jsonl",
+        events_log=tmp_path / "events.jsonl", home=tmp_path,
+        saga_db=override if explicit else None,
+    )
+    async with TestClient(TestServer(app)) as client:
+        response = await client.get("/api/saga?view=stats")
+        assert response.status == 200
+        assert (await response.json())["configured_path"] == str(expected)
+    assert seen == [expected]
+    assert not expected.exists()
+    assert not (tmp_path / ".mimir" / "saga.db").exists()
+
+
 def test_generated_typescript_contracts_are_current():
     generated = Path("frontend/src/api/generated/contracts.ts").read_text(
         encoding="utf-8"
@@ -3444,6 +3484,106 @@ async def test_api_v1_scheduler_lists_schedules_pollers_and_commitments(tmp_path
     assert body["data"]["commitments"][0]["id"] == "c-soon"
     assert body["data"]["actions"]["mutations_enabled"] is False
     assert "trigger" in body["data"]["actions"]["deferred"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("healthy_sibling", [False, True])
+@pytest.mark.parametrize("failure,expected_name,detail", [
+    ({"type": "poller_reload_invalid_manifest", "error": "Invalid JSON", "preserved_pollers": []},
+     "broken/pollers.json", "Invalid JSON"),
+    ({"type": "poller_reload_invalid_entry", "poller": "broken", "reason": "command must be a string"},
+     "broken", "command must be a string"),
+    ({"type": "poller_reload_invalid_entry", "poller": None, "reason": "entry must be an object"},
+     "broken/pollers.json", "entry must be an object"),
+    ({"type": "poller_reload_invalid_cron", "poller": "broken", "cron": "bad",
+      "error": "ValueError: Wrong number of fields", "preserved_pollers": []},
+     "broken", "ValueError: Wrong number of fields"),
+])
+async def test_api_v1_scheduler_shows_unregistered_poller_failures(
+    tmp_path: Path, healthy_sibling, failure, expected_name, detail,
+):
+    async def enqueue(_event):
+        return True
+
+    scheduler = Scheduler(tmp_path / "scheduler.yaml", enqueue, home=tmp_path)
+    records = [{
+        **failure, "manifest_path": "broken/pollers.json",
+        "timestamp": "2026-09-07T10:00:00Z",
+    }]
+    if healthy_sibling:
+        scheduler._pollers["healthy"] = PollerConfig("healthy", "true", "* * * * *", {}, tmp_path)
+        await scheduler.add_job(SchedulerJob(name="healthy-schedule", prompt="Check", cron="* * * * *"))
+        records.extend([
+            {"type": "poller_complete", "poller": "healthy", "events_emitted": 1,
+             "timestamp": "2026-09-07T11:00:00Z"},
+            {"type": "scheduled_tick", "schedule_name": "healthy-schedule",
+             "timestamp": "2026-09-07T11:00:00Z"},
+        ])
+    records.extend([
+        {"type": "unrelated_error", "poller": "broken", "manifest_path": "unrelated.json", "error": "excluded"},
+        {"type": "poller_exec_error", "poller": "unregistered-runtime", "error": "excluded"},
+        {"type": "poller_complete", "poller": "unregistered-success"},
+        {"type": "unrelated_error", "poller": "healthy", "error": "excluded"},
+        {"type": "poller_reload_invalid_entry", "reason": "excluded"},
+    ])
+    events_log = tmp_path / "events.jsonl"
+    events_log.write_text("".join(json.dumps(record) + "\n" for record in records), encoding="utf-8")
+    a = web.Application()
+    a["scheduler"] = scheduler
+    web_ui.register_routes(a, turns_log=tmp_path / "turns.jsonl", events_log=events_log, home=tmp_path)
+    async with TestClient(TestServer(a)) as client:
+        resp = await client.get("/api/v1/scheduler")
+        body = await resp.json()
+
+    assert resp.status == 200
+    validate_api_envelope(body, expect_ok=True)
+    rows = {row["name"]: row for row in body["data"]["pollers"]}
+    assert set(rows) == {expected_name} | ({"healthy"} if healthy_sibling else set())
+    assert rows[expected_name]["id"] == f"poller:{expected_name}"
+    assert rows[expected_name]["recent_error"] == detail
+    assert rows[expected_name]["manifest_path"] == "broken/pollers.json"
+    assert rows[expected_name]["next_run_at"] is None
+    assert rows[expected_name]["last_run_at"] == "2026-09-07T10:00:00Z"
+    if healthy_sibling:
+        assert rows["healthy"]["recent_result"] == "emitted=1 rejected=0"
+        assert rows["healthy"]["recent_error"] is None
+    assert "excluded" not in json.dumps(body)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("signal,fields,detail", [
+    ("poller_tick_hard_deadline",
+     {"elapsed_seconds": 48.2, "startup_consumed_seconds": 3.1, "hard_deadline_seconds": 48,
+      "truncated": {"reviews": 2}},
+     "elapsed_seconds=48.2 startup_consumed_seconds=3.1 hard_deadline_seconds=48 truncated={'reviews': 2}"),
+    ("poller_pr_reconcile_truncated", {"deadline_seconds": 30, "truncated": {"ci": 4}},
+     "deadline_seconds=30 truncated={'ci': 4}"),
+    ("poller_reload_invalid_entry", {"reason": "missing command"}, "missing command"),
+    ("poller_reload_invalid_cron", {"error": "invalid cron"}, "invalid cron"),
+])
+async def test_api_v1_scheduler_renders_poller_failure_details(tmp_path: Path, signal, fields, detail):
+    async def enqueue(_event):
+        return True
+
+    scheduler = Scheduler(tmp_path / "scheduler.yaml", enqueue, home=tmp_path)
+    scheduler._pollers["github"] = PollerConfig("github", "true", "* * * * *", {}, tmp_path)
+    events_log = tmp_path / "events.jsonl"
+    events_log.write_text("".join(json.dumps(record) + "\n" for record in [
+        {"type": "poller_complete", "poller": "github", "timestamp": "2026-09-07T09:00:00Z"},
+        {"type": signal, "poller": "github", "timestamp": "2026-09-07T10:00:00Z", **fields},
+        {"type": "unrelated_error", "poller": "github", "error": "excluded"},
+    ]), encoding="utf-8")
+    a = web.Application()
+    a["scheduler"] = scheduler
+    web_ui.register_routes(a, turns_log=tmp_path / "turns.jsonl", events_log=events_log, home=tmp_path)
+    async with TestClient(TestServer(a)) as client:
+        resp = await client.get("/api/v1/scheduler")
+        body = await resp.json()
+
+    assert resp.status == 200
+    row, = body["data"]["pollers"]
+    assert row["recent_error"] == (f"{signal}: {detail}" if "truncated" in fields else detail)
+    assert row["last_run_at"] == "2026-09-07T10:00:00Z"
 
 
 def test_scheduler_state_event_scan_has_bounded_never_fired_path(tmp_path: Path):

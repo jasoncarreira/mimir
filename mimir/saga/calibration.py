@@ -70,7 +70,11 @@ def re_embed(
     )
     model_name = cfg("embedding", "model", "")
 
-    conn = sqlite3.connect(str(db_path), check_same_thread=False)
+    mode = "ro" if dry_run else "rw"
+    conn = sqlite3.connect(
+        f"{db_path.resolve().as_uri()}?mode={mode}",
+        uri=True, check_same_thread=False,
+    )
     conn.row_factory = sqlite3.Row
     try:
         rows = conn.execute(

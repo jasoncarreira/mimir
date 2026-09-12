@@ -11,6 +11,7 @@ synthetic DBs (no real provider calls).
 from __future__ import annotations
 
 import sqlite3
+import argparse
 import struct
 from pathlib import Path
 
@@ -21,6 +22,7 @@ from mimir.reindex import (
     _expected_blob_len,
     reindex_file_search,
     reindex_saga_atoms,
+    dispatch,
 )
 
 
@@ -120,6 +122,75 @@ def test_expected_blob_len_is_4_bytes_per_dim():
     assert _expected_blob_len(384) == 1536
     assert _expected_blob_len(1024) == 4096
     assert _expected_blob_len(1536) == 6144
+
+
+@pytest.mark.parametrize("configured", [None, "nested/custom #?%.db", "absolute"])
+def test_dispatch_reembeds_resolved_store(tmp_path, monkeypatch, patch_provider, configured):
+    import mimir.saga._config_io as config_io
+
+    patch_provider(dim=4)
+    monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
+    monkeypatch.delenv("SAGA_CONFIG", raising=False)
+    if configured == "absolute":
+        configured = str(tmp_path / "external.db")
+    config = {"embedding": {"provider": "openai"}}
+    if configured is not None:
+        config["storage"] = {"db_path": configured}
+    monkeypatch.setattr(config_io, "_config", config)
+    db = Path(configured or "saga.db")
+    if not db.is_absolute():
+        db = tmp_path / ".mimir" / db
+    db.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(db)
+    conn.executescript(
+        "CREATE TABLE atoms (id INTEGER PRIMARY KEY, content TEXT, tombstoned INTEGER);"
+        "CREATE TABLE embeddings (atom_id INTEGER PRIMARY KEY, provider TEXT, model TEXT, "
+        "dim INTEGER, vec BLOB, embedded_at TEXT);"
+        "INSERT INTO atoms VALUES (1, 'real memory', 0);"
+        "INSERT INTO embeddings VALUES (1, 'old', 'old', 1, X'00000000', 'old');"
+    )
+    conn.close()
+    args = argparse.Namespace(home=tmp_path, target="atoms", apply=True, batch_size=50)
+    assert dispatch(args) == 0
+    conn = sqlite3.connect(db)
+    try:
+        assert conn.execute("SELECT provider, dim, length(vec) FROM embeddings").fetchone() == (
+            "openai", 4, 16,
+        )
+    finally:
+        conn.close()
+    assert not (tmp_path / "saga.db").exists()
+    assert list(tmp_path.rglob("*.db")) == [db]
+
+
+@pytest.mark.parametrize("apply", [False, True])
+@pytest.mark.parametrize("state", ["missing", "schemaless", "empty"])
+def test_dispatch_distinguishes_missing_schema_from_empty_atoms(
+    tmp_path, monkeypatch, patch_provider, capsys, apply, state,
+):
+    patch_provider(dim=4)
+    monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
+    monkeypatch.delenv("SAGA_CONFIG", raising=False)
+    db = tmp_path / ".mimir" / "saga.db"
+    db.parent.mkdir()
+    if state == "schemaless":
+        db.touch()
+    elif state == "empty":
+        conn = sqlite3.connect(db)
+        conn.execute("CREATE TABLE atoms (id INTEGER, content TEXT, tombstoned INTEGER)")
+        conn.close()
+    args = argparse.Namespace(home=tmp_path, target="atoms", apply=apply, batch_size=50)
+    assert dispatch(args) == (0 if state == "empty" else 2)
+    error = capsys.readouterr().err
+    if state == "missing":
+        assert "unable to open database" in error
+        assert not db.exists()
+    elif state == "schemaless":
+        assert "no such table: atoms" in error
+        assert db.stat().st_size == 0
+    else:
+        assert not error
+    assert not (tmp_path / "saga.db").exists()
 
 
 def test_atoms_delegates_to_saga_calibration_dry_run(tmp_path, patch_provider, monkeypatch):

@@ -11,6 +11,8 @@ Pins the behaviors that addressed reviewer findings #4, #5, #7, #9, #10:
 
 from __future__ import annotations
 
+import asyncio
+import threading
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 
@@ -119,6 +121,72 @@ async def test_end_session_without_channel_id_still_works(client, monkeypatch):
     result = await client.end_session("s2", "summary", auth_context=_end_auth("s2"))
     assert result["channel"] is None
     assert result["session_summary_written"] is True
+
+
+@pytest.mark.asyncio
+async def test_end_session_embedding_does_not_block_writer(client, monkeypatch):
+    started = threading.Event()
+    release = threading.Event()
+    embedding = (b"\x00" * 16, "stub", "stub-4d", 4)
+    calls = []
+
+    def slow_embed(text):
+        calls.append(text)
+        started.set()
+        assert release.wait(10), "test did not release embedding provider"
+        return embedding
+
+    monkeypatch.setattr("mimir.saga.client._embed_text_sync", slow_embed)
+    conn = client._ensure_conn()
+    statements = []
+    conn.set_trace_callback(statements.append)
+    closing = asyncio.create_task(client.end_session(
+        "slow", "  summary  ", auth_context=_end_auth("slow")
+    ))
+    try:
+        assert await asyncio.to_thread(started.wait, 5)
+        # A real second writer must finish while the provider is still blocked.
+        stored = await asyncio.wait_for(client.store(
+            "concurrent writer", precomputed_embedding=embedding,
+        ), timeout=5)
+        assert stored["stored"] is True
+        assert not closing.done()
+    finally:
+        release.set()
+        await closing
+        conn.set_trace_callback(None)
+    assert calls == ["summary"]
+    assert conn.execute(
+        "SELECT summary, embedding, embedding_dim FROM sessions WHERE id = 'slow'"
+    ).fetchone() == ("summary", embedding[0], 4)
+    insert = next(i for i, sql in enumerate(statements) if "INSERT INTO sessions" in sql)
+    assert statements[insert - 2] == "BEGIN IMMEDIATE"
+    assert statements[insert + 1] == "COMMIT"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("summary", ["summary", "   "])
+async def test_end_session_embedding_failure_and_empty_control(
+    client, monkeypatch, caplog, summary,
+):
+    calls = []
+
+    def failing_embed(text):
+        calls.append(text)
+        raise RuntimeError("provider unavailable")
+
+    monkeypatch.setattr("mimir.saga.client._embed_text_sync", failing_embed)
+    result = await client.end_session("failure", summary, auth_context=_end_auth("failure"))
+    assert result["session_summary_written"] is True
+    assert client._ensure_conn().execute(
+        "SELECT embedding, embedding_dim FROM sessions WHERE id = 'failure'"
+    ).fetchone() == (None, None)
+    if summary.strip():
+        assert calls == [summary]
+        assert "Session failure summary embedding failed" in caplog.text
+    else:
+        assert calls == []
+        assert "summary embedding failed" not in caplog.text
 
 
 @pytest.mark.asyncio
