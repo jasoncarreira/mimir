@@ -279,18 +279,47 @@ journal preparation, so live delivery and exact replay retain the stored value.
 Legacy journal entries without `messageId` remain valid and replay without an ID;
 Mimir does not backfill or reconstruct them.
 
-ACP intentionally advertises neither configuration options nor session modes.
-The model and compiled graph are process-global, providers accept open-ended
-model names rather than a finite selectable set, and session metadata has no
-model or policy-posture field. Exposing a client selector in that architecture
-could not safely make the selection session-owned or prevent it from weakening
-server policy. The server's configured model and authorization policy therefore
-remain authoritative.
-
 The `acp` package extra is intentionally retained as an empty compatibility
 extra, so existing `mimir-agent[acp]` install spelling continues to work. ACP's
 dependencies are already core dependencies; the extra installs nothing
 additional.
+
+### Session config-options decision
+
+**Decision: omit ACP session config options.** Do not advertise `configOptions`
+or add a `set_config_option` handler. Session modes also remain unadvertised.
+The server's configured model and authorization policy remain authoritative;
+this is a deliberate scope decision, not a missing client selector.
+
+The reasons are grounded in the current implementation:
+
+- [The ACP agent](../mimir/acp/agent.py) creates and loads session records without
+  model selections and sends prompts to `self._bundle.agent.run_turn`.
+  [The core Agent](../mimir/agent.py) caches its model in `_agent_model` and its
+  compiled graph in `_agent`; `_build_agent_if_needed` can rebuild the graph
+  while reusing the model. These are shared by sessions using the server
+  runtime's core Agent, not strictly process-global variables or session-owned
+  choices. `resolve_model_from_config` reads `MIMIR_MODEL_SPEC` or server config,
+  not an ACP session selection.
+- [The provider registry](../mimir/providers.py) describes routing families,
+  not an enumerable menu of supported model IDs. `provider_for_model_name`
+  matches prefixes and falls back for unknown names; this does not guarantee
+  those names are available. A finite client selector would need a separate,
+  server-approved model catalogue.
+- [SessionStore._validate_payload](../mimir/acp/session_store.py) accepts exactly
+  `schema_version`, `session_id`, `thread_id`, `owner_principal`, `lifecycle`, and
+  `replayability`, with schema version `1`. There is no model or policy-posture
+  field. Persisting a selection in this metadata would require a versioned
+  schema migration, not simply adding a field.
+- Production `mimir/acp/` has no `configOptions` or `config_option` path to
+  preserve. [test_agent_exposes_no_out_of_scope_handlers](../tests/test_acp_agent.py)
+  explicitly forbids `set_config_option`; the omission is already enforced.
+
+These constraints do not make safe options impossible, but adopting them would
+require a separately scoped design rather than exposing the shared runtime's
+settings. Any future option must be session-owned, validated, and covered across
+new, load, and change flows. **A client selection must never grant authority or
+weaken server-side policy.** This decision adds no config-options implementation.
 
 ## Providers, permissions, and filesystems
 

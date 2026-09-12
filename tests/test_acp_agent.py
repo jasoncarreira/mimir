@@ -690,6 +690,8 @@ def test_agent_exposes_no_out_of_scope_handlers(tmp_path: Path) -> None:
         "resume_session",
         "close_session",
         "set_session_mode",
+        # Deliberately omitted: shared runtime settings are not session choices.
+        # See docs/acp.md#session-config-options-decision for the policy boundary.
         "set_config_option",
         "session_update",
         "request_permission",
