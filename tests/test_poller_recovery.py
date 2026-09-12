@@ -1166,7 +1166,7 @@ async def test_reconcile_gcs_expired_stash(tmp_path: Path):
 
 
 @pytest.mark.parametrize("raises", [False, True])
-async def test_pending_enqueue_waits_without_expiry_or_attempt_charge(
+async def test_pending_enqueue_below_cap_waits_without_expiry_or_attempt_charge(
     tmp_path: Path, monkeypatch, raises: bool,
 ):
     now = datetime.now(tz=timezone.utc)
@@ -1198,3 +1198,104 @@ async def test_pending_enqueue_waits_without_expiry_or_attempt_charge(
     assert entry["stashed_at"] == now.isoformat()
     await poller_recovery.reconcile_failed_turns(**common, enqueue=enqueue)
     assert len(enqueue.calls) == 1
+
+
+async def test_pending_cap_under_sustained_over_headroom_emission(tmp_path, monkeypatch):
+    # Pin the production policy as well as exercising a small equivalent queue.
+    assert poller_recovery.MAX_PENDING_ENQUEUE == 1000
+    monkeypatch.setattr(poller_recovery, "MAX_PENDING_ENQUEUE", 8)
+    now = datetime(2026, 9, 12, tzinfo=timezone.utc)
+    monkeypatch.setattr(poller_recovery, "_utc_now", lambda: now)
+    signals = []
+
+    async def capture(type_, **fields):
+        signals.append({"type": type_, **fields})
+
+    monkeypatch.setattr(poller_recovery, "log_event", capture)
+    delivered = []
+    expected_pending = []
+    retired = 0
+    for tick in range(10):
+        headroom = 2
+
+        async def enqueue(event):
+            nonlocal headroom
+            if not headroom:
+                return False
+            headroom -= 1
+            delivered.append(event.source_id)
+            return True
+
+        # Reconcile old work first, then emit five new batches with only two
+        # delivery slots each tick. No relevance check or failed-turn opt-in.
+        before = len(delivered)
+        await poller_recovery.reconcile_failed_turns(
+            poller_name="gmail", channel_id="poller:gmail", persist_dir=tmp_path,
+            events_path=tmp_path / "events.jsonl", enqueue=enqueue,
+            recover_failed_turns=False,
+        )
+        replayed = delivered[before:]
+        assert replayed == expected_pending[:len(replayed)]
+        expected_pending = expected_pending[len(replayed):]
+        for index in range(5):
+            sid = f"{tick}-{index}"
+            event = _make_event(sid)
+            accepted = await enqueue(event)
+            await poller_recovery.stash_enqueued_event(
+                tmp_path, event, pending_enqueue=not accepted,
+            )
+            if not accepted:
+                expected_pending.append(sid)
+                if len(expected_pending) > 8:
+                    expected_pending.pop(0)
+                    retired += 1
+            state = poller_recovery._load_state(tmp_path)["inflight"]
+            pending = [sid for sid, entry in state.items() if entry.get("pending_enqueue")]
+            assert pending == expected_pending
+            assert len(pending) <= 8  # bound holds even within a burst
+            assert all(sid in state for sid in delivered)  # no accepted eviction
+        now += timedelta(minutes=10)
+
+    assert len(delivered) == 20
+    assert retired == 22
+    assert sum(signal["retired"] for signal in signals) == retired
+    assert all(signal["type"] == "poller_pending_gave_up" for signal in signals)
+    assert all(signal["reason"] == "pending_count_limit" for signal in signals)
+    assert all(signal["poller"] == "gmail" and signal["limit"] == 8 for signal in signals)
+    assert all("do the thing" not in json.dumps(signal) for signal in signals)
+
+
+@pytest.mark.parametrize("log_raises", [False, True])
+async def test_pending_cap_trims_legacy_ledger_before_deferred_replay(
+    tmp_path, monkeypatch, log_raises,
+):
+    signals = []
+
+    async def capture(type_, **fields):
+        signals.append({"type": type_, **fields})
+        if log_raises:
+            raise OSError("logger unavailable")
+
+    monkeypatch.setattr(poller_recovery, "log_event", capture)
+    # Build a pre-ceiling ledger, then apply the new smaller bound on restart.
+    for sid in ("newest", "oldest", "middle"):
+        await poller_recovery.stash_enqueued_event(
+            tmp_path, _make_event(sid), pending_enqueue=True,
+        )
+    state = poller_recovery._load_state(tmp_path)
+    for sid, age in (("oldest", 300), ("middle", 200), ("newest", 100)):
+        state["inflight"][sid]["stashed_at"] = _ts(age)
+    poller_recovery._save_state(tmp_path, state)
+    monkeypatch.setattr(poller_recovery, "MAX_PENDING_ENQUEUE", 2)
+    common = dict(
+        poller_name="gmail", channel_id="poller:gmail", persist_dir=tmp_path,
+        events_path=tmp_path / "events.jsonl", enqueue=_FullEnqueue(),
+        recover_failed_turns=False,
+    )
+    summary = await poller_recovery.reconcile_failed_turns(**common)
+    assert summary["gave_up"] == 1
+    assert summary["deferred"] == 1
+    assert set(poller_recovery._load_state(tmp_path)["inflight"]) == {"middle", "newest"}
+    assert signals[0]["retired"] == 1
+    await poller_recovery.reconcile_failed_turns(**common)
+    assert len(signals) == 1  # retirement stays durable even if logging failed

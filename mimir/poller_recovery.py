@@ -13,8 +13,10 @@ log:
 
 * At every accepted enqueue or scheduler headroom rejection, the framework
   stashes the ``AgentEvent`` keyed by its ``source_id``. Headroom rejections
-  carry ``pending_enqueue`` and wait without expiry for budgeted delivery,
-  independently of failed-turn recovery opt-in.
+  carry ``pending_enqueue`` and wait for budgeted delivery independently of
+  failed-turn recovery opt-in. They bypass the abandoned-turn TTL (#310), but
+  a separate 1,000-entry per-poller pending cap bounds growth. Overflow retires
+  the oldest pending entries with an operator-visible give-up signal.
 * Turn outcomes are logged with that ``source_id``
   (``turn_failed`` / ``turn_completed``, #517). Each poll cycle the
   framework reads outcomes since the last reconcile and, per stashed
@@ -84,6 +86,12 @@ DEFAULT_MAX_DEFER_SECONDS = 15 * 60.0
 #: can't grow unbounded. Generous: an item still unresolved after two days
 #: is abandoned, not in-flight.
 DEFAULT_STASH_TTL_HOURS = 48.0
+
+#: Pending initial deliveries bypass the abandoned-turn TTL. Keep at most
+#: 1,000 per poller: over a day of a 5-batch/10-minute source outpacing
+#: 3 deliveries/hour (27 net/hour), while also bounding same-tick bursts.
+#: Prefer recent work on overflow; retirement emits poller_pending_gave_up.
+MAX_PENDING_ENQUEUE = 1000
 
 _TURN_OUTCOME_TYPES = ("turn_completed", "turn_failed")
 _UNCLEAN_RESTART_TYPE = "liveness_unclean_restart"
@@ -276,7 +284,54 @@ async def stash_enqueued_event(
     }
     if pending_enqueue:
         state["inflight"][event.source_id]["pending_enqueue"] = True
+        await _bound_pending_enqueue(
+            state["inflight"], event.channel_id.removeprefix("poller:"),
+            event.channel_id,
+        )
     await asyncio.to_thread(_save_state, persist_dir, state)
+
+
+async def _bound_pending_enqueue(
+    inflight: dict, poller_name: str, channel_id: str,
+) -> int:
+    """Retire oldest pending entries above the cap, never accepted deliveries.
+
+    Enforce at admission as well as reconciliation, including old oversized
+    ledgers. Aggregate overflow into one payload-free operator signal per call.
+    Like _emit_gave_up, logging is best-effort and cannot strand the ledger.
+    """
+    pending = [
+        source_id for source_id, entry in inflight.items()
+        if isinstance(entry, dict) and entry.get("pending_enqueue") is True
+    ]
+    excess = len(pending) - MAX_PENDING_ENQUEUE
+    if excess <= 0:
+        return 0
+
+    def first_seen(source_id: str) -> datetime:
+        dt = _parse_iso(inflight[source_id].get("stashed_at"))
+        # Malformed legacy timestamps are oldest, not immortal. Stable sorting
+        # preserves insertion order for equal timestamps (same-tick batches).
+        return dt if dt is not None and dt.tzinfo is not None else datetime.min.replace(
+            tzinfo=timezone.utc,
+        )
+
+    for source_id in sorted(pending, key=first_seen)[:excess]:
+        del inflight[source_id]
+    log.warning(
+        "poller recovery: pending cap exceeded poller=%s retired=%d cap=%d",
+        poller_name, excess, MAX_PENDING_ENQUEUE,
+    )
+    try:
+        await log_event(
+            "poller_pending_gave_up", poller=poller_name, channel_id=channel_id,
+            reason="pending_count_limit", retired=excess, limit=MAX_PENDING_ENQUEUE,
+            detail=f"{poller_name}: pending backlog exceeded {MAX_PENDING_ENQUEUE}; "
+                   f"retired {excess} oldest undelivered events",
+        )
+    except Exception as exc:  # noqa: BLE001 — match the #318 give-up contract
+        log.warning("poller recovery: pending give-up emit failed (%s)", type(exc).__name__)
+    return excess
 
 
 def _event_from_stash(d: Any) -> AgentEvent | None:
@@ -595,6 +650,10 @@ async def reconcile_failed_turns(
     summary["expired"], summary["dropped"] = _gc_expired_inflight(
         inflight, stash_ttl_hours, now_dt,
     )
+
+    # Pending entries have a separate count ceiling, including legacy ledgers
+    # that grew before this bound existed. Run before any replay can defer.
+    summary["gave_up"] += await _bound_pending_enqueue(inflight, poller_name, channel_id)
 
     # Fast path: nothing stashed → nothing to reconcile. Advance the
     # watermark so the first real reconcile after events accrue doesn't
