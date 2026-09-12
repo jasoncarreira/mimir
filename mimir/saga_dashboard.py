@@ -24,7 +24,6 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import os
 import re
 import sqlite3
 import time
@@ -32,6 +31,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from mimir.config import _env_float, _env_int
 from mimir.saga._like import escape_like_pattern
 from mimir.saga.embedding_status import embedding_status
 
@@ -667,13 +667,12 @@ _SQL_MAX_ROWS = 1000
 # not work *performed* or a single value's size, so a recursive-CTE compute bomb
 # (CPU) or a huge ``zeroblob()``/``randomblob()`` scalar (memory) can hang or OOM
 # the ``asyncio.to_thread`` worker. These two limits close that availability gap:
-#   - ``_SQL_TIMEOUT_S``: wall-clock budget enforced via a progress handler that
-#     aborts the running statement (covers execute AND lazy row streaming).
-#   - ``_SQL_MAX_VALUE_BYTES``: caps any single string/blob/row via
+#   - ``MIMIR_SAGA_SQL_TIMEOUT_S``: wall-clock budget enforced via a progress
+#     handler that aborts the statement (covers execute AND lazy row streaming).
+#   - ``MIMIR_SAGA_SQL_MAX_VALUE_BYTES``: caps any single string/blob/row via
 #     ``SQLITE_LIMIT_LENGTH`` so an oversized scalar raises before allocating.
-# Both are env-tunable for operators who knowingly enable the SQL console.
-_SQL_TIMEOUT_S = float(os.environ.get("MIMIR_SAGA_SQL_TIMEOUT_S") or 5.0)
-_SQL_MAX_VALUE_BYTES = int(os.environ.get("MIMIR_SAGA_SQL_MAX_VALUE_BYTES") or 10_000_000)
+# Both resolve at call time, after startup loads the home dotenv, with defaults
+# of 5.0 seconds and 10,000,000 bytes for unset, empty, or malformed values.
 # VM opcodes between progress-handler deadline checks (cheap; sub-ms cadence).
 _SQL_PROGRESS_OPS = 1000
 
@@ -688,7 +687,7 @@ def _apply_sql_value_limit(conn: sqlite3.Connection) -> None:
     if setlimit is None or category is None:
         return
     try:
-        setlimit(category, _SQL_MAX_VALUE_BYTES)
+        setlimit(category, _env_int("MIMIR_SAGA_SQL_MAX_VALUE_BYTES", 10_000_000))
     except (sqlite3.Error, OverflowError, ValueError):
         pass
 
@@ -766,7 +765,8 @@ def build_sql_payload(db_path: Path, sql: str) -> dict[str, Any]:
     # chainlink #611: bound per-value memory + wall-clock CPU. mode=ro already
     # prevents writes; these stop a compute/memory DoS the row cap can't.
     _apply_sql_value_limit(conn)
-    deadline = time.monotonic() + _SQL_TIMEOUT_S
+    timeout_s = _env_float("MIMIR_SAGA_SQL_TIMEOUT_S", 5.0)
+    deadline = time.monotonic() + timeout_s
     timed_out = False
 
     def _abort_if_overtime() -> int:
@@ -807,9 +807,9 @@ def build_sql_payload(db_path: Path, sql: str) -> dict[str, Any]:
         }
     except sqlite3.Error as exc:
         if timed_out:
-            log.warning("saga_dashboard: sql query exceeded %ss limit", _SQL_TIMEOUT_S)
+            log.warning("saga_dashboard: sql query exceeded %ss limit", timeout_s)
             return {
-                "error": f"query exceeded the {_SQL_TIMEOUT_S:g}s time limit",
+                "error": f"query exceeded the {timeout_s:g}s time limit",
                 "rejected": False,
             }
         log.warning("saga_dashboard: sql query failed: %s", exc)
