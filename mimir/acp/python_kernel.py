@@ -252,9 +252,11 @@ class PythonKernelManager:
                 raise PythonKernelUnavailable("kernel manager is closed")
             # Preserve the permission-time recursion bit; never re-stat paths.
             policy = tuple(sorted(set(approved_paths)))
-            prepared = prepare_command((sys.executable,), cwd=Path(cwd),
+            prepared = await asyncio.to_thread(prepare_command, (sys.executable,), cwd=Path(cwd),
                                        approved_paths=policy,
                                        allow_unconfined=allow_unconfined)
+            if self._closed:
+                raise PythonKernelUnavailable("kernel manager is closed")
             execution_mode = prepared.execution_mode
             state.allow_unconfined = allow_unconfined
             # Check the actual worker's spawn-time profile on EVERY reuse,
@@ -484,12 +486,15 @@ class PythonKernelManager:
         parent, child = socket.socketpair()
         parent.setblocking(False)
         try:
-            prepared = prepare_command(
+            prepared = await asyncio.to_thread(
+                prepare_command,
                 (sys.executable, "-m", "mimir.acp.python_kernel", "--control-fd", str(child.fileno())),
                 cwd=Path(cwd), approved_paths=state.approved_paths,
                 scratch_paths=(state.directory,),
                 allow_unconfined=state.allow_unconfined,
             )
+            if self._closed:
+                raise PythonKernelUnavailable("kernel manager is closed")
             state.execution_mode = prepared.execution_mode
             process = await self._before_deadline(
                 deadline,

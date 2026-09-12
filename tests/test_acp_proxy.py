@@ -2332,6 +2332,14 @@ async def test_hosted_scope_tool_round_trip_queries_grants_and_final_rejection(
     )
     monkeypatch.setattr("mimir.acp.hosted.validate_scope", lambda **kwargs: None)
     router, client, daemon, _, connection_id = await hosted_router(cwd)
+    written = asyncio.Event()
+    write = client.write
+
+    def notify_write(data: bytes) -> None:
+        write(data)
+        written.set()
+
+    monkeypatch.setattr(client, "write", notify_write)
 
     async def start(request_id: int, path: str) -> asyncio.Task[Any]:
         await router.route_daemon({
@@ -2354,6 +2362,8 @@ async def test_hosted_scope_tool_round_trip_queries_grants_and_final_rejection(
         assert messages(client) == []
         assert messages(daemon)[-1]["result"]["structuredContent"]["paths"] == [str(cwd.resolve())]
         task = await start(31, str(allowed))
+        await asyncio.wait_for(written.wait(), 5)
+        written.clear()
         request, = messages(client)
         await router.route_client({
             "jsonrpc": "2.0", "id": request["id"],
@@ -2367,6 +2377,7 @@ async def test_hosted_scope_tool_round_trip_queries_grants_and_final_rejection(
         assert "restart" in result["message"]
         client.data.clear()
         task = await start(32, str(rejected))
+        await asyncio.wait_for(written.wait(), 5)
         request, = messages(client)
         await router.route_client({
             "jsonrpc": "2.0", "id": request["id"],
@@ -2517,6 +2528,15 @@ async def test_unconfined_execution_real_operator_round_trip_and_final_state(
         tmp_path, approve_unconfined_for_lifecycle=False,
     )
 
+    written = asyncio.Event()
+    write = client.write
+
+    def notify_write(data: bytes) -> None:
+        write(data)
+        written.set()
+
+    monkeypatch.setattr(client, "write", notify_write)
+
     async def start(request_id: int, name: str, arguments: dict[str, Any]) -> asyncio.Task[Any]:
         await router.route_daemon({
             "jsonrpc": "2.0", "id": request_id, "method": "mcp/message",
@@ -2547,6 +2567,7 @@ async def test_unconfined_execution_real_operator_round_trip_and_final_state(
             assert messages(daemon)[-1]["error"]["code"] == -32602
             assert messages(client) == []
             execution = await start(52, "shell", {"command": "printf safe-output"})
+            await asyncio.wait_for(written.wait(), 5)
             request, = messages(client)
             assert request["params"]["_meta"] == {"mimir.unconfined_execution": True}
             assert request["params"]["toolCall"]["rawInput"] == {}

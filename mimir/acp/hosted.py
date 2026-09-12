@@ -446,7 +446,10 @@ class HostedHandsProvider:
             with _file_parent(session, path_value, edit=True) as (parent, name):
                 descriptor = os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=parent)
                 with os.fdopen(descriptor, "rb") as stream:
-                    original = stream.read()
+                    original = stream.read(READ_LIMIT_BYTES + 1)
+                    if len(original) > READ_LIMIT_BYTES:
+                        size = os.fstat(stream.fileno()).st_size
+                        raise HostedMcpError(-32000, f"file too large ({size} bytes)")
                     mode = stat.S_IMODE(os.fstat(stream.fileno()).st_mode)
                 old = old_text.encode("utf-8")
                 new = new_text.encode("utf-8")
@@ -486,15 +489,21 @@ class HostedHandsProvider:
     async def request_scope(self, session: HostedSession, value: str) -> dict[str, Any]:
         scope = session.scope
         self._require_live_scope(session)
+        generation = scope.generation
+        allow_unconfined = scope.unconfined_approved
         try:
-            prepared = prepare_command(("/bin/true",), cwd=session.cwd,
+            prepared = await asyncio.to_thread(prepare_command, ("/bin/true",), cwd=session.cwd,
                                        approved_paths=tuple(scope.approved),
-                                       allow_unconfined=scope.unconfined_approved)
+                                       allow_unconfined=allow_unconfined)
             mode_message = (UNCONFINED_WARNING + " This is the next-execution policy; existing children retain their launch policy."
                             if prepared.execution_mode == "unconfined"
                             else "CONFINED: Next execution uses confinement; runtime read-only allowances also apply. Existing children retain their launch policy.")
         except ConfinementUnavailable:
             mode_message = "BLOCKED: Next execution requires a working confinement backend or separate operator risk acceptance. Existing children retain their launch policy."
+        self._require_live_scope(session)
+        if (session.scope is not scope or scope.generation != generation
+                or scope.unconfined_approved != allow_unconfined):
+            raise HostedMcpError(-32000, "Execution scope changed")
         if value == "":
             return {"approved": True, "paths": scope.paths(), "message": mode_message}
         if mode_message.startswith("UNCONFINED:"):
@@ -559,12 +568,20 @@ class HostedHandsProvider:
         """Ask only for a missing backend, never to bypass a policy/runtime error."""
         self._require_live_scope(session)
         scope = session.scope
+        generation = scope.generation
         try:
-            prepare_command(("/bin/true",), cwd=session.cwd,
+            await asyncio.to_thread(prepare_command, ("/bin/true",), cwd=session.cwd,
                             approved_paths=tuple(scope.approved))
-            return
         except BackendUnavailable:
             pass
+        else:
+            self._require_live_scope(session)
+            if session.scope is not scope or scope.generation != generation:
+                raise HostedMcpError(-32000, "Execution scope changed")
+            return
+        self._require_live_scope(session)
+        if session.scope is not scope or scope.generation != generation:
+            raise HostedMcpError(-32000, "Execution scope changed")
         if scope.unconfined_approved:
             return
         if scope.risk_pending or scope.risk_requested:
@@ -597,7 +614,7 @@ class HostedHandsProvider:
                 # A newly available backend always wins; approval never bypasses
                 # a backend that is available but has a malformed profile.
                 try:
-                    prepare_command(("/bin/true",), cwd=session.cwd,
+                    await asyncio.to_thread(prepare_command, ("/bin/true",), cwd=session.cwd,
                                     approved_paths=tuple(scope.approved))
                 except BackendUnavailable:
                     await self._python_kernels.retire_owned(session.session_id)
@@ -606,6 +623,9 @@ class HostedHandsProvider:
                         raise HostedMcpError(-32000, "Risk approval expired")
                     scope.unconfined_approved = True
                     outcome = "approved"
+                self._require_live_scope(session)
+                if session.scope is not scope or scope.generation != generation:
+                    raise HostedMcpError(-32000, "Risk approval expired")
         except asyncio.CancelledError:
             outcome = "cancelled"
             raise
@@ -631,10 +651,15 @@ class HostedHandsProvider:
     async def _confined_shell(self, session: HostedSession, command: str) -> dict[str, Any]:
         timeout = session.timeout_seconds
         startup_warning = ""
+        scope = session.scope
+        generation = scope.generation
         try:
-            prepared = prepare_command(("/bin/sh", "-c", command), cwd=session.cwd,
-                                       approved_paths=tuple(session.scope.approved),
-                                       allow_unconfined=session.scope.unconfined_approved)
+            prepared = await asyncio.to_thread(prepare_command, ("/bin/sh", "-c", command), cwd=session.cwd,
+                                       approved_paths=tuple(scope.approved),
+                                       allow_unconfined=scope.unconfined_approved)
+            self._require_live_scope(session)
+            if session.scope is not scope or scope.generation != generation:
+                raise HostedMcpError(-32000, "Execution scope changed")
             if prepared.execution_mode == "unconfined":
                 startup_warning = UNCONFINED_WARNING + " "
             process = await asyncio.create_subprocess_exec(
