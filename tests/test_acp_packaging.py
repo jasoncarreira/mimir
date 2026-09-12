@@ -50,6 +50,16 @@ def test_acp_and_mcp_dependency_declarations() -> None:
     assert dependency_groups["dev"].count("mcp>=1.27") == 1
 
 
+def test_project_readme_and_urls() -> None:
+    project = _project_config()["project"]
+    assert project["readme"] == "README.md"
+    assert project["urls"] == {
+        "Homepage": "https://github.com/jasoncarreira/mimir",
+        "Repository": "https://github.com/jasoncarreira/mimir",
+        "Documentation": "https://github.com/jasoncarreira/mimir/tree/main/docs",
+        "Issues": "https://github.com/jasoncarreira/mimir/issues",
+    }
+
 
 def test_both_console_scripts_use_the_early_entrypoint() -> None:
     scripts = _project_config()["project"]["scripts"]

@@ -38,6 +38,20 @@ PROFILE_COMMANDS = [
     "mimir acp credential list",
     "mimir acp --profile PROFILE",
 ]
+QUICK_START_CONSOLE = [
+    "MIMIR_HOME=/absolute/server/mimir-home MIMIR_ACP_ENABLED=true mimir run",
+    "mimir identities issue-key --home /absolute/server/mimir-home CANONICAL --admin --label CLIENT_NAME",
+    "\n".join(
+        [
+            "mimir acp profile add-local PROFILE --home /absolute/server/mimir-home",
+            "mimir acp credential add PROFILE",
+            "mimir acp profile list",
+            "mimir acp credential list",
+            "command -v uvx",
+        ]
+    ),
+]
+QUICK_START_JETBRAINS = '{"default_mcp_settings":{"use_idea_mcp":false,"use_custom_mcp":false},"agent_servers":{"mimir":{"command":"/absolute/path/to/uvx","args":["mimir-agent==0.9.0","acp"],"env":{"MIMIR_ACP_PROFILE":"PROFILE"}}}}'
 
 
 def section(start: str, end: str) -> str:
@@ -151,11 +165,43 @@ def test_timing_contract() -> None:
 
 
 def test_profile_commands_exact() -> None:
-    block = fenced("sh")[0]
+    blocks = fenced("sh")
+    assert blocks == [
+        "\n".join(PROFILE_COMMANDS),
+        "mimir identities issue-key --home /absolute/server/mimir-home CANONICAL --admin --label CLIENT_NAME",
+    ]
+    block = blocks[0]
     assert block.splitlines() == PROFILE_COMMANDS
     profile_text = section("## Profiles and credentials", "## SSH transport")
     assert "`MIMIR_ACP_PROFILE` may select a non-secret profile name only; it must never contain a key." in profile_text
     assert not {"--destination", "--remote-home", "--identity"} & set(re.findall(r"--[a-z-]+", block))
+
+
+def test_quick_start_recipe_and_outcome() -> None:
+    assert DOCS.index("## Quick start") < DOCS.index("## Architecture and daemon")
+    assert fenced("console") == QUICK_START_CONSOLE
+    assert fenced("jsonc") == [QUICK_START_JETBRAINS]
+    text = " ".join(section("## Quick start", "## Architecture and daemon").split())
+    for value in (
+        "Goal: connect an editor to an already-running Mimir daemon and get the first response",
+        "macOS or Linux client with a native OS credential store and `uvx` installed",
+        "matching `mimir-agent` artifact published or provisioned",
+        "initialized Mimir home and configured model",
+        "not evidence that the package is available from PyPI",
+        "Native Mimir file, shell, and memory tools operate on the daemon/server host",
+        "Mimir Hands operates on the editor/client host",
+        "selected editor project and with the local user's authority",
+        "Profiles, credentials, and editor configuration always belong on the client",
+        "Enter the issued key only at the secure credential-enrollment prompt",
+        "Never put it in argv or editor configuration",
+        "local checks only",
+        "do not contact the daemon or validate server credentials",
+        "GUI applications may not inherit the shell's `PATH`",
+        "absolute path printed by `command -v uvx`",
+        "editor lists Mimir, authentication completes, a session opens, Mimir answers a prompt",
+        "invoked tools render with semantic titles",
+    ):
+        assert value in text
 
 
 def test_credentials_auth_and_rotation() -> None:
@@ -207,7 +253,7 @@ def test_ssh_policy_and_trust_boundary() -> None:
         "Socket modes do not isolate",
     ]:
         assert value in text
-    assert all("StrictHostKeyChecking=no" not in block for language in ("sh", "json", "text") for block in fenced(language))
+    assert all("StrictHostKeyChecking=no" not in block for language in ("sh", "json", "text", "console", "jsonc") for block in fenced(language))
     assert "Never use `StrictHostKeyChecking=no`" in text
 
 
@@ -256,6 +302,25 @@ def test_connection_session_replay_and_cancellation() -> None:
         "web UI, bridges, scheduler, unrelated work",
     ]:
         assert value in text
+
+    normalized = " ".join(text.split())
+    for value in [
+        "All chunks in one logical user prompt share one `messageId`",
+        "all agent chunks from one logical bridge send share another",
+        "assigned before journal preparation",
+        "live delivery and exact replay retain the stored value",
+        "Legacy journal entries without `messageId` remain valid and replay without an ID",
+        "does not backfill or reconstruct them",
+        "advertises neither configuration options nor session modes",
+        "model and compiled graph are process-global",
+        "providers accept open-ended model names rather than a finite selectable set",
+        "session metadata has no model or policy-posture field",
+        "prevent it from weakening server policy",
+        "server's configured model and authorization policy therefore remain authoritative",
+        "`acp` package extra is intentionally retained as an empty compatibility extra",
+        "ACP's dependencies are already core dependencies",
+    ]:
+        assert value in normalized
 
 
 def test_hands_and_filesystem_contract() -> None:
@@ -323,7 +388,7 @@ def test_troubleshooting_contract() -> None:
 
 
 def test_examples_do_not_leak_secrets_or_invent_commands() -> None:
-    examples = "\n".join(block for language in ("sh", "json", "text") for block in fenced(language))
+    examples = "\n".join(block for language in ("sh", "json", "text", "console", "jsonc") for block in fenced(language))
     for forbidden in ["MIMIR_API_KEY", "--destination", "--remote-home", "sshpass", "credential validate", "StrictHostKeyChecking=no", "idea_mcp_allowed_tools"]:
         assert forbidden not in examples
     assert "launches a standalone runtime" not in DOCS
@@ -393,16 +458,18 @@ def test_docs_bound_unconfined_fallback_to_explicit_session_risk_approval() -> N
 
 
 def test_experimental_warning_matches_shipped_execution_confinement_contract() -> None:
-    opening = " ".join(section("## Experimental status", "## Architecture and daemon").split())
+    opening = " ".join(section("## Experimental status", "## Quick start").split())
     for value in (
-        "macOS Seatbelt is the only verified execution-confinement backend.",
+        "macOS Seatbelt remains the only execution-confinement backend verified on real hardware.",
         "run under OS-level filesystem confinement by default",
         "mandatory wherever a backend is available",
         "a confined child cannot follow a symlink out of the approved paths",
         "macOS Seatbelt uses `sandbox-exec`",
         "With an unavailable backend the tools run only after the operator explicitly accepts the unconfined risk",
         "cwd and path-scope grants do not protect files",
-        "Linux AppArmor backend but does not verify Linux confinement on real hardware",
+        "Linux AppArmor backend is merged",
+        "parser syntax is verified in Linux CI via #1601",
+        "real-hardware enforcement remains unverified",
     ):
         assert value in opening
     assert "not shipped" not in opening.lower()
@@ -411,7 +478,8 @@ def test_experimental_warning_matches_shipped_execution_confinement_contract() -
     # OS execution confinement also hardens the lexical read/edit tools.
     assert "File confinement is lexical, not a sandbox." in opening
     assert "follow in-cwd symlinks even when their targets are outside it" in opening
-    assert "authorized Linux/AppArmor hardware-verification follow-up to #1597" in " ".join(DOCS.split())
+    status = "The Linux AppArmor backend is merged, and its parser syntax is verified in Linux CI via #1601; real-hardware enforcement remains unverified."
+    assert " ".join(DOCS.split()).count(status) == 2
 
 
 def test_docs_distinguish_revoked_risk_grant_from_operator_rejection() -> None:

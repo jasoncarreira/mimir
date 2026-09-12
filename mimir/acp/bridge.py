@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import uuid
 from pathlib import Path
 from typing import Any, ClassVar
 
@@ -55,6 +56,7 @@ class ACPBridge(Bridge):
         update = AgentMessageChunk(
             sessionUpdate="agent_message_chunk",
             content=TextContentBlock(type="text", text=text),
+            messageId=str(uuid.uuid4()),
         )
         try:
             await publisher.publish_live(update)

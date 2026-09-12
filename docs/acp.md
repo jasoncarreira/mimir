@@ -15,12 +15,13 @@ operator-visible limits are:
   reject paths outside the session cwd, but follow in-cwd symlinks even when
   their targets are outside it. Select a trusted project directory and inspect
   its symlinks before granting access.
-- **macOS Seatbelt is the only verified execution-confinement backend.** `hands_shell`
+- **macOS Seatbelt remains the only execution-confinement backend verified on real hardware.** `hands_shell`
   and `hands_python` run under OS-level filesystem confinement by default, and it
   is mandatory wherever a backend is available; a confined child cannot follow a
   symlink out of the approved paths the way `hands_read` and `hands_edit` can.
-  macOS Seatbelt uses `sandbox-exec`, which Apple has deprecated. #1597 adds a
-  Linux AppArmor backend but does not verify Linux confinement on real hardware.
+  macOS Seatbelt uses `sandbox-exec`, which Apple has deprecated. The Linux
+  AppArmor backend is merged, and its parser syntax is verified in Linux CI via
+  #1601; real-hardware enforcement remains unverified.
   With an unavailable backend the tools run only after the operator
   explicitly accepts the unconfined risk, and in that mode the cwd and path-scope
   grants do not protect files. This existing separate operator-consent fallback
@@ -43,6 +44,66 @@ operator-visible limits are:
   a refusal appears only in ACP, inspect the authorization decision rather
   than assuming the client is broken. Admin status and client permission do
   not bypass information-flow controls. See the [authorization reference](authorization.md).
+
+## Quick start: get a first response in JetBrains
+
+Goal: connect an editor to an already-running Mimir daemon and get the first
+response.
+
+Prerequisites are a macOS or Linux client with a native OS credential store and
+`uvx` installed, plus a matching `mimir-agent` artifact published or provisioned
+in your environment. The server needs an initialized Mimir home and configured
+model. The registry's 0.9.0 candidate is not evidence that the package is
+available from PyPI.
+
+Know the machine boundary before starting. Native Mimir file, shell, and memory
+tools operate on the daemon/server host. Mimir Hands operates on the
+editor/client host, in the selected editor project and with the local user's
+authority. The local recipe below uses the same host for both roles; for a
+remote daemon, create the profile on the client using the [SSH transport](#ssh-transport)
+instructions instead. Profiles, credentials, and editor configuration always
+belong on the client.
+
+1. Start Mimir on the server with ACP enabled:
+
+```console
+MIMIR_HOME=/absolute/server/mimir-home MIMIR_ACP_ENABLED=true mimir run
+```
+
+Keep that daemon running. In a separate server terminal, issue a named admin
+key, replacing the identity and client-label placeholders:
+
+```console
+mimir identities issue-key --home /absolute/server/mimir-home CANONICAL --admin --label CLIENT_NAME
+```
+
+2. On the client, create the local profile, enroll the key through the secure
+credential prompt, inspect the local records, and locate `uvx`:
+
+```console
+mimir acp profile add-local PROFILE --home /absolute/server/mimir-home
+mimir acp credential add PROFILE
+mimir acp profile list
+mimir acp credential list
+command -v uvx
+```
+
+Enter the issued key only at the secure credential-enrollment prompt. Never put
+it in argv or editor configuration. The profile and credential listings are
+local checks only: they show configured profile records and credential presence,
+but do not contact the daemon or validate server credentials.
+
+3. GUI applications may not inherit the shell's `PATH`. Save the following as
+`~/.jetbrains/acp.json`, replacing `/absolute/path/to/uvx` with the absolute path
+printed by `command -v uvx` and replacing `PROFILE` with the profile name:
+
+```jsonc
+{"default_mcp_settings":{"use_idea_mcp":false,"use_custom_mcp":false},"agent_servers":{"mimir":{"command":"/absolute/path/to/uvx","args":["mimir-agent==0.9.0","acp"],"env":{"MIMIR_ACP_PROFILE":"PROFILE"}}}}
+```
+
+Success means the editor lists Mimir, authentication completes, a session
+opens, Mimir answers a prompt, and any invoked tools render with semantic
+titles.
 
 ## Architecture and daemon
 
@@ -212,6 +273,25 @@ The journal has a default seven-day TTL and a 64 MiB limit. Before replay, Mimir
 
 Transport death cancels and quarantines only that ACP generation. The daemon, web UI, bridges, scheduler, unrelated work, and completed effects remain alive.
 
+All chunks in one logical user prompt share one `messageId`, and all agent
+chunks from one logical bridge send share another. These IDs are assigned before
+journal preparation, so live delivery and exact replay retain the stored value.
+Legacy journal entries without `messageId` remain valid and replay without an ID;
+Mimir does not backfill or reconstruct them.
+
+ACP intentionally advertises neither configuration options nor session modes.
+The model and compiled graph are process-global, providers accept open-ended
+model names rather than a finite selectable set, and session metadata has no
+model or policy-posture field. Exposing a client selector in that architecture
+could not safely make the selection session-owned or prevent it from weakening
+server policy. The server's configured model and authorization policy therefore
+remain authoritative.
+
+The `acp` package extra is intentionally retained as an empty compatibility
+extra, so existing `mimir-agent[acp]` install spelling continues to work. ACP's
+dependencies are already core dependencies; the extra installs nothing
+additional.
+
 ## Providers, permissions, and filesystems
 
 When `mcpServers` is missing or empty, the local proxy injects one locally hosted MCP-over-ACP provider named `mimir-hands`. An explicit nonempty provider collection is preserved. The `mimir.hands.v1` profile contains exactly `read`, `edit`, `shell`, `python`, and `request_scope`; it is validated afresh on session new, session load, and provider-list change. Read is prompt-free. Edit, shell, and Python require exact-call operator permission immediately before execution. `allow_session` creates only an in-memory proxy grant for that session and tool, and a tainted call always prompts again unless an admin has acknowledged the current ingest snapshot with `clear_ingest_taint`. Grants never create daemon authority and are revoked on load, disconnect, generation replacement, or proxy exit.
@@ -264,17 +344,19 @@ Approval scope is fixed before asking the operator and does not widen if an
 approved file is later replaced with a directory.
 AppArmor's path syntax deliberately supports only ASCII letters, digits,
 underscores, dots, slashes, plus signs and hyphens.
-macOS Seatbelt (`sandbox-exec`, deprecated by Apple) remains the only verified
-backend. #1597 adds Linux AppArmor, not real-hardware verification. The local ACP
-proxy host executes Hands, even with a remote daemon; a container cannot verify
-that host's confinement. An installed parser or enabled AppArmor LSM alone is
-insufficient: an enforcing child transition is required. AppArmor profiles are
-loaded only with the current UID's existing authority, without privilege escalation.
+macOS Seatbelt (`sandbox-exec`, deprecated by Apple) remains the only
+execution-confinement backend verified on real hardware. The Linux AppArmor
+backend is merged, and its parser syntax is verified in Linux CI via #1601;
+real-hardware enforcement remains unverified. The local ACP proxy host executes
+Hands, even with a remote daemon; a container cannot verify that host's
+confinement. An installed parser or enabled AppArmor LSM alone is insufficient:
+an enforcing child transition is required. AppArmor profiles are loaded only
+with the current UID's existing authority, without privilege escalation.
 The initial policy has fixed system runtime read allowances; nonstandard Python
 installations may fail to start and are not retried without confinement.
 
 Live hardware verification, enforcing-vs-complain live checks, and concurrency
-naming/cleanup are deferred to the authorized Linux/AppArmor hardware-verification follow-up to #1597.
+naming/cleanup remain deferred to a Linux/AppArmor hardware-verification follow-up.
 
 #### Unavailable-backend risk approval
 

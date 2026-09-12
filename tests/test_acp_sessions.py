@@ -5,6 +5,7 @@ import copy
 import dataclasses
 import json
 import time
+import uuid
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -202,10 +203,14 @@ async def test_new_prompt_runs_bound_core_and_preserves_update_order(tmp_path: P
     assert client.updates[3].raw_input == {"token": "[redacted]", "query": "x"}
     first_chunk = client.updates[0].model_dump(mode="json", by_alias=True, exclude_none=True)
     assert first_chunk["content"] == {"type": "text", "text": "hello"}
-    assert "messageId" not in first_chunk
+    first_message_id = first_chunk["messageId"]
+    assert str(uuid.UUID(first_message_id)) == first_message_id
     second_chunk = client.updates[1].model_dump(mode="json", by_alias=True, exclude_none=True)
     assert second_chunk["content"] == {"type": "resource_link", "name": "guide", "uri": "file:///guide"}
-    assert "messageId" not in second_chunk
+    assert second_chunk["messageId"] == first_message_id
+    agent_message_id = client.updates[5].message_id
+    assert str(uuid.UUID(agent_message_id)) == agent_message_id
+    assert agent_message_id != first_message_id
     event, kwargs = core.calls[0]
     assert event.content == 'hello\n[resource_link]{"name":"guide","type":"resource_link","uri":"file:///guide"}'
     assert event.author == event.author_id == "operator"
@@ -213,6 +218,11 @@ async def test_new_prompt_runs_bound_core_and_preserves_update_order(tmp_path: P
     assert kwargs["session_id"] == kwargs["saga_session_id"] == f"acp:{session_id}"
     assert core.subscriptions[0] is not None
     assert agent._bundle.turn_event_bus._exact_turn_subscribers == {}
+    prior_updates = len(client.updates)
+    await agent.prompt(session_id, [sdk.TextContentBlock(type="text", text="hello")])
+    next_message_id = client.updates[prior_updates].message_id
+    assert str(uuid.UUID(next_message_id)) == next_message_id
+    assert next_message_id != first_message_id
 
 
 async def test_acp_send_message_rejects_slack_turn_without_journal_append_and_allows_owner(
@@ -1520,7 +1530,7 @@ async def test_transport_death_terminalizes_provider_call_in_persisted_session(
         "in_progress",
         "failed",
     ]
-    assert replayed[0].title == "hands_read"
+    assert (replayed[0].title, replayed[0].kind) == ("Read", "read")
     assert replayed[1].title is None
     assert replayed[-1].raw_output == {
         "error": "Client disconnected during tool execution"
@@ -3554,7 +3564,7 @@ async def test_daemon_emits_permission_for_every_call_and_stores_no_grant(
         assert start_1_update["_meta"] == {"mimir.sequence": 1}
         assert {key: value for key, value in start_1_update.items() if key != "_meta"} == {
             "sessionUpdate": "tool_call", "toolCallId": "edit-1",
-            "title": "hands_edit", "kind": "other", "status": "pending",
+            "title": "Edit notes-1.txt", "kind": "edit", "status": "pending",
             "rawInput": {"path": "notes-1.txt", "old_text": "old-1", "new_text": "new-1"},
         }
         progress_1 = await next_outgoing()
@@ -3639,7 +3649,7 @@ async def test_daemon_emits_permission_for_every_call_and_stores_no_grant(
         assert start_2_update["_meta"] == {"mimir.sequence": 5}
         assert {key: value for key, value in start_2_update.items() if key != "_meta"} == {
             "sessionUpdate": "tool_call", "toolCallId": "edit-2",
-            "title": "hands_edit", "kind": "other", "status": "pending",
+            "title": "Edit notes-2.txt", "kind": "edit", "status": "pending",
             "rawInput": {"path": "notes-2.txt", "old_text": "old-2", "new_text": "new-2"},
         }
         progress_2 = await next_outgoing()
@@ -3687,7 +3697,7 @@ async def test_daemon_emits_permission_for_every_call_and_stores_no_grant(
         assert rejected_start["_meta"] == {"mimir.sequence": 9}
         assert {key: value for key, value in rejected_start.items() if key != "_meta"} == {
             "sessionUpdate": "tool_call", "toolCallId": "edit-3",
-            "title": "hands_edit", "kind": "other", "status": "pending",
+            "title": "Edit notes-3.txt", "kind": "edit", "status": "pending",
             "rawInput": {"path": "notes-3.txt", "old_text": "old-3", "new_text": "new-3"},
         }
         rejected_progress = (await next_outgoing())["params"]["update"]

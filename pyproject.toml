@@ -8,6 +8,7 @@
 name = "mimir-agent"
 version = "0.9.0"
 description = "Memory-centric agent harness on deepagents / LangGraph"
+readme = "README.md"
 requires-python = ">=3.11"
 authors = [{ name = "Jason Carreira" }]
 license = { text = "MIT" }
@@ -43,6 +44,12 @@ dependencies = [
     "agent-client-protocol==0.12.0",
     "keyring==25.7.0",
 ]
+
+[project.urls]
+Homepage = "https://github.com/jasoncarreira/mimir"
+Repository = "https://github.com/jasoncarreira/mimir"
+Documentation = "https://github.com/jasoncarreira/mimir/tree/main/docs"
+Issues = "https://github.com/jasoncarreira/mimir/issues"
 
 [project.optional-dependencies]
 # Model-provider extras — install the one(s) you'll actually use.

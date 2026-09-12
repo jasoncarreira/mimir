@@ -9,7 +9,7 @@ import pytest
 
 import mimir.acp.journal as journal_module
 from mimir.acp.journal import SessionJournal, _line, _with_sequence
-from mimir.acp.sdk import RequestError, TextContentBlock, UserMessageChunk
+from mimir.acp.sdk import AgentMessageChunk, RequestError, TextContentBlock, UserMessageChunk
 from mimir.acp.session_store import SessionStore
 
 TURN_ID = "00000000-0000-4000-8000-000000000000"
@@ -41,12 +41,24 @@ class BlockingClient(Client):
         await super().session_update(session_id, update)
 
 
-def update(text: str = "hello") -> UserMessageChunk:
-    return UserMessageChunk(sessionUpdate="user_message_chunk", content=TextContentBlock(type="text", text=text))
+def update(text: str = "hello", message_id: str | None = None) -> UserMessageChunk:
+    return UserMessageChunk(
+        sessionUpdate="user_message_chunk",
+        content=TextContentBlock(type="text", text=text),
+        messageId=message_id,
+    )
 
 
-def prepared_row(sequence: int = 0) -> bytes:
-    payload = _with_sequence(update(), sequence).model_dump(mode="json", by_alias=True, exclude_none=True)
+def agent_update(text: str = "hello", message_id: str | None = None) -> AgentMessageChunk:
+    return AgentMessageChunk(
+        sessionUpdate="agent_message_chunk",
+        content=TextContentBlock(type="text", text=text),
+        messageId=message_id,
+    )
+
+
+def prepared_row(sequence: int = 0, item=None) -> bytes:
+    payload = _with_sequence(item or update(), sequence).model_dump(mode="json", by_alias=True, exclude_none=True)
     return _line({"kind": "prepared", "sequence": sequence, "turn_id": TURN_ID, "update": payload})
 
 
@@ -225,6 +237,111 @@ async def test_prepared_without_sent_replays_every_time_without_mutation(tmp_pat
     assert before == after
     assert len(client.updates) == 2
     assert client.updates[0][1].field_meta == {"mimir.sequence": 0}
+
+
+@pytest.mark.asyncio
+async def test_preassigned_message_ids_survive_prepare_live_and_repeated_replay(
+    tmp_path: Path,
+) -> None:
+    store = SessionStore(tmp_path)
+    record = store.create_session("owner")
+    client = Client()
+    journal = SessionJournal(store, record, client)
+    user_id = "10000000-0000-4000-8000-000000000001"
+    agent_id = "20000000-0000-4000-8000-000000000002"
+
+    await journal.publish_live(update("question", user_id), turn_id=TURN_ID)
+    await journal.publish_live(agent_update("answer", agent_id), turn_id=TURN_ID)
+
+    live = [
+        item.model_dump(mode="json", by_alias=True, exclude_none=True)
+        for _, item in client.updates
+    ]
+    assert [item["messageId"] for item in live] == [user_id, agent_id]
+    prepared = [
+        json.loads(line)["update"]
+        for line in record.journal_path.read_text().splitlines()
+        if json.loads(line)["kind"] == "prepared"
+    ]
+    assert prepared == live
+    before = (
+        record.journal_path.read_bytes(),
+        record.journal_path.stat().st_mtime_ns,
+        record.metadata_path.read_bytes(),
+        record.metadata_path.stat().st_mtime_ns,
+        journal.next_sequence,
+    )
+    client.updates.clear()
+    await journal.send_replay()
+    await journal.send_replay()
+    replayed = [
+        item.model_dump(mode="json", by_alias=True, exclude_none=True)
+        for _, item in client.updates
+    ]
+    assert replayed == live + live
+    assert (
+        record.journal_path.read_bytes(),
+        record.journal_path.stat().st_mtime_ns,
+        record.metadata_path.read_bytes(),
+        record.metadata_path.stat().st_mtime_ns,
+        journal.next_sequence,
+    ) == before
+
+
+@pytest.mark.asyncio
+async def test_mixed_legacy_and_identified_messages_replay_without_backfill_or_rewrite(
+    tmp_path: Path,
+) -> None:
+    store = SessionStore(tmp_path)
+    record = store.create_session("owner")
+    user_id = "30000000-0000-4000-8000-000000000003"
+    agent_id = "40000000-0000-4000-8000-000000000004"
+    messages = [
+        update("old user"),
+        agent_update("old agent"),
+        update("new user", user_id),
+        agent_update("new agent", agent_id),
+    ]
+    record.journal_path.write_bytes(
+        b"".join(prepared_row(sequence, item) for sequence, item in enumerate(messages))
+    )
+    client = Client()
+    journal = SessionJournal(store, record, client)
+    before = (
+        record.journal_path.read_bytes(),
+        record.journal_path.stat().st_mtime_ns,
+        record.metadata_path.read_bytes(),
+        record.metadata_path.stat().st_mtime_ns,
+        journal.next_sequence,
+    )
+
+    await journal.send_replay()
+    await journal.send_replay()
+
+    replayed = [
+        item.model_dump(mode="json", by_alias=True, exclude_none=True)
+        for _, item in client.updates
+    ]
+    expected = [
+        _with_sequence(item, sequence).model_dump(
+            mode="json", by_alias=True, exclude_none=True
+        )
+        for sequence, item in enumerate(messages)
+    ]
+    assert replayed == expected + expected
+    assert [item.get("messageId") for item in replayed[:4]] == [
+        None,
+        None,
+        user_id,
+        agent_id,
+    ]
+    assert (
+        record.journal_path.read_bytes(),
+        record.journal_path.stat().st_mtime_ns,
+        record.metadata_path.read_bytes(),
+        record.metadata_path.stat().st_mtime_ns,
+        journal.next_sequence,
+    ) == before
 
 
 @pytest.mark.asyncio

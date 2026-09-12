@@ -2,18 +2,41 @@ from __future__ import annotations
 
 import asyncio
 import json
+import shlex
 from collections.abc import Mapping
 from typing import Any
 
 from mimir.acp.journal import JournalLease
 from mimir.acp.sdk import AgentPlanUpdate, PermissionSnapshot, PlanEntry, RequestError, ToolCallProgress, ToolCallStart
-from mimir.turn_event_redaction import scrub_value
+from mimir.turn_event_redaction import scrub_detail, scrub_value
 
 _SENSITIVE = {"authorization", "cookie", "password", "passwd", "secret", "token", "api_key", "apikey", "access_key", "private_key"}
 _VALID_TODO_STATUS = {"pending", "in_progress", "completed"}
 MAX_UPDATE_ITEMS = 128
 MAX_UPDATE_BYTES = 8 * 1024 * 1024
 UPDATE_CLOSE_TIMEOUT = 2.0
+
+_TOOL_PRESENTATIONS = {
+    "read_file": ("read", "Read", "file_path"),
+    "hands_read": ("read", "Read", "path"),
+    "memory_get": ("read", "Read", "atom_ids"),
+    "edit_file": ("edit", "Edit", "file_path"),
+    "write_file": ("edit", "Edit", "file_path"),
+    "hands_edit": ("edit", "Edit", "path"),
+    "glob": ("search", "Search", "pattern"),
+    "grep": ("search", "Search", "pattern"),
+    "file_search": ("search", "Search", "query"),
+    "web_search": ("search", "Search", "query"),
+    "memory_query": ("search", "Search", "query"),
+    "shell_exec": ("execute", "Run", "command"),
+    "bash_async": ("execute", "Run", "command"),
+    "hands_shell": ("execute", "Run", "command"),
+    "hands_python": ("execute", "Run Python", None),
+    "fetch_url": ("fetch", "Fetch", "url"),
+    "write_todos": ("other", "Update todos", None),
+    "hands_request_scope": ("other", "Request scope", "path"),
+}
+_SHELL_TOOLS = {"shell_exec", "bash_async", "hands_shell"}
 
 
 class UpdateDispatcher:
@@ -243,12 +266,14 @@ class UpdateDispatcher:
                         kind="other",
                         raw_input=_freeze_json(_strict_json(event.get("_permission_args", event["args"]))),
                     )
-                return [ToolCallStart(sessionUpdate="tool_call", toolCallId=tool_id, title=name, kind="other", status="pending", rawInput=raw_input)]
+                title, tool_kind = _tool_presentation(name, event.get("args"))
+                return [ToolCallStart(sessionUpdate="tool_call", toolCallId=tool_id, title=title, kind=tool_kind, status="pending", rawInput=raw_input)]
             if phase == "end":
                 output: list[Any] = []
                 if tool_id not in self._open_tools:
                     self._open_tools[tool_id] = name
-                    output.append(ToolCallStart(sessionUpdate="tool_call", toolCallId=tool_id, title=name, kind="other", status="pending"))
+                    title, tool_kind = _tool_presentation(name, event.get("args"))
+                    output.append(ToolCallStart(sessionUpdate="tool_call", toolCallId=tool_id, title=title, kind=tool_kind, status="pending"))
                 if "args" in event and tool_id not in self._snapshots:
                     self._snapshots[tool_id] = PermissionSnapshot(
                         tool_call_id=tool_id,
@@ -269,7 +294,8 @@ class UpdateDispatcher:
             output = []
             if tool_id not in self._open_tools:
                 self._open_tools[tool_id] = name
-                output.append(ToolCallStart(sessionUpdate="tool_call", toolCallId=tool_id, title=name, kind="other", status="pending"))
+                title, tool_kind = _tool_presentation(name, event.get("args"))
+                output.append(ToolCallStart(sessionUpdate="tool_call", toolCallId=tool_id, title=title, kind=tool_kind, status="pending"))
             failed = event.get("status") not in {None, "ok", "completed", "success"} or bool(event.get("is_error"))
             content = _client_json(event.get("content"))
             output.append(ToolCallProgress(sessionUpdate="tool_call_update", toolCallId=tool_id, status="failed" if failed else "completed", rawOutput=content))
@@ -282,6 +308,31 @@ class UpdateDispatcher:
                     output.append(plan)
             return output
         return []
+
+
+def _tool_presentation(name: str, args: Any) -> tuple[str, str]:
+    presentation = _TOOL_PRESENTATIONS.get(name)
+    if presentation is None:
+        return scrub_detail(name, limit=80) or "unknown", "other"
+    kind, phrase, detail_key = presentation
+    detail = None
+    if detail_key is not None and isinstance(args, Mapping):
+        value = args.get(detail_key)
+        if name == "memory_get":
+            if isinstance(value, list) and value and isinstance(value[0], str):
+                detail = value[0]
+        elif name in _SHELL_TOOLS:
+            if isinstance(value, str):
+                try:
+                    tokens = shlex.split(value, posix=True)
+                except ValueError:
+                    tokens = []
+                if tokens and tokens[0]:
+                    detail = tokens[0]
+        elif isinstance(value, str):
+            detail = value
+    cleaned = scrub_detail(detail, limit=80)
+    return (f"{phrase} {cleaned}" if cleaned is not None else phrase), kind
 
 
 def _event_bytes(event: Mapping[str, Any]) -> int:
