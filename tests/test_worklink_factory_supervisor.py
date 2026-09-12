@@ -28,7 +28,7 @@ spec.loader.exec_module(supervisor)
 # in the supervisor. No subreaper state or process-wide waits touch pytest.
 HARNESS = r'''
 import ctypes, importlib.util, json, os, signal, socket, subprocess, sys, time
-source, registry, mode, mutate, payload = sys.argv[1:]
+source, registry, mode, mutate, term_ready_pids, payload = sys.argv[1:]
 assert ctypes.CDLL(None).prctl(36, 1, 0, 0, 0) == 0
 parent, child = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
 if mode == "backpressure":
@@ -83,6 +83,20 @@ try:
     if mode in ("stop", "eof", "SIGTERM", "SIGINT"):
         while not os.path.exists(registry + ".ready"):
             time.sleep(.01)
+        if int(term_ready_pids):
+            # Establish the adversarial population before cancellation without
+            # changing the supervisor's TERM/KILL/reap path or its deadlines.
+            # A busy runner need not schedule three forks within TERM_GRACE.
+            with open(registry) as stream:
+                primary = int(stream.readline())
+            os.killpg(primary, signal.SIGTERM)
+            deadline = time.monotonic() + 10
+            while True:
+                with open(registry) as stream:
+                    if len(stream.readlines()) >= int(term_ready_pids):
+                        break
+                assert time.monotonic() < deadline, 'fixture TERM handlers did not record descendants'
+                time.sleep(.01)
         if mode in ("SIGTERM", "SIGINT"):
             process.send_signal(getattr(signal, mode))
         elif mode == "eof":
@@ -196,10 +210,11 @@ while True:
 '''
 
 
-def run_isolated(tmp_path, payload, *, mode="normal", mutate=False):
+def run_isolated(tmp_path, payload, *, mode="normal", mutate=False, term_ready_pids=0):
     completed = subprocess.run(
         [sys.executable, "-I", "-c", HARNESS, str(SOURCE), str(tmp_path / "pids"),
-         mode, mutate if isinstance(mutate, str) else "yes" if mutate else "no", payload],
+         mode, mutate if isinstance(mutate, str) else "yes" if mutate else "no",
+         str(term_ready_pids), payload],
         # One ceiling covers harness startup, descendants, reporting and reaping.
         capture_output=True, text=True, timeout=240,
     )
@@ -230,7 +245,7 @@ def test_disabled_prctl_mutation_is_detected_and_fixture_reaps_leak(tmp_path):
 
 @pytest.mark.parametrize("mode", ["stop", "eof"])
 def test_cancellation_reaps_multigeneration_respawning_group(tmp_path, mode):
-    result = run_isolated(tmp_path, RESPAWN, mode=mode)
+    result = run_isolated(tmp_path, RESPAWN, mode=mode, term_ready_pids=6)
     assert_clean(result)
     assert len(result["pids"]) >= 6  # TERM handlers really forked another generation.
     if mode == "stop":
