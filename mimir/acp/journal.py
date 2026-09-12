@@ -6,7 +6,9 @@ import os
 import sys
 from pathlib import Path
 from dataclasses import dataclass, field
+from collections.abc import Callable
 from typing import Any
+from weakref import WeakValueDictionary
 
 from pydantic import TypeAdapter
 
@@ -57,12 +59,13 @@ class SessionJournal:
         self.journal_enabled = record.replayability == "replayable"
         self._reported = False
         self._fatal = False
+        self._retain_failed: Callable[[SessionJournal], None] | None = None
         try:
             prepared, _ = self._read_validated()
         except BaseException as exc:
             self.journal_enabled = False
             self._fatal = True
-            self.store.try_mark(record.session_id, record.owner_principal, "io_failed")
+            self._mark_io_failed()
             self._report_once("ACP journal validation failed; replay disabled")
             raise RequestError(-32603, "Session replay unavailable: io_failed") from exc
         self.next_sequence = len(prepared)
@@ -140,7 +143,7 @@ class SessionJournal:
             except BaseException:
                 self.journal_enabled = False
                 self._fatal = True
-                self.store.try_mark(self.record.session_id, self.record.owner_principal, "io_failed")
+                self._mark_io_failed()
                 self._report_once("ACP journal write failed after delivery; replay disabled")
         return update
 
@@ -164,13 +167,15 @@ class SessionJournal:
             except BaseException as exc:
                 self.journal_enabled = False
                 self._fatal = True
-                self.store.try_mark(self.record.session_id, self.record.owner_principal, "io_failed")
+                self._mark_io_failed()
                 self._report_once("ACP journal write failed; replay disabled")
                 raise RequestError(-32603, "Internal error") from exc
         return update, sequence
 
     async def send_replay(self, client: Any | None = None) -> None:
         async with self.lock:
+            if self._fatal:
+                raise RequestError(-32603, "Session replay unavailable: io_failed")
             client = client or self.current_client
             if client is None:
                 raise RequestError(-32603, "Internal error")
@@ -178,7 +183,8 @@ class SessionJournal:
                 prepared, _ = self._read_validated()
             except BaseException as exc:
                 self.journal_enabled = False
-                self.store.try_mark(self.record.session_id, self.record.owner_principal, "io_failed")
+                self._fatal = True
+                self._mark_io_failed()
                 self._report_once("ACP journal replay failed; replay disabled")
                 raise RequestError(-32603, "Session replay unavailable: io_failed") from exc
             for item in prepared:
@@ -230,6 +236,12 @@ class SessionJournal:
         finally:
             os.close(fd)
 
+    def _mark_io_failed(self) -> None:
+        if not self.store.try_mark(
+            self.record.session_id, self.record.owner_principal, "io_failed"
+        ) and self._retain_failed is not None:
+            self._retain_failed(self)
+
     def _report_once(self, message: str) -> None:
         if not self._reported:
             print(message, file=sys.stderr)
@@ -240,18 +252,49 @@ class JournalCache:
     def __init__(self, store: SessionStore) -> None:
         self.store = store
         self._sessions: dict[str, SessionJournal] = {}
+        self._retired: WeakValueDictionary[str, SessionJournal] = WeakValueDictionary()
 
     def open(self, record: SessionRecord, client: Any | None = None) -> SessionJournal:
-        journal = self._sessions.get(record.session_id)
+        journal = self._sessions.get(record.session_id) or self._retired.get(record.session_id)
         if journal is None:
             journal = SessionJournal(self.store, record, client)
-            self._sessions[record.session_id] = journal
+            journal._retain_failed = self._retain_failed_journal
         elif client is not None:
             journal.bind_client(client)
+        self._sessions[record.session_id] = journal
+        self._retired.pop(record.session_id, None)
         return journal
+
+    def _retain_failed_journal(self, journal: SessionJournal) -> None:
+        # An in-flight write can fail after release demotes the cache entry.
+        self._sessions[journal.record.session_id] = journal
+        self._retired.pop(journal.record.session_id, None)
+
+    def release(self, session_id: str) -> None:
+        journal = self._sessions.get(session_id)
+        if journal is None:
+            return
+        journal.current_client = None
+        # A failed marker must not let reopening forget an in-memory fatal fence.
+        if journal._fatal and not self.store.try_mark(
+            session_id, journal.record.owner_principal, "io_failed"
+        ):
+            return
+        # Preserve identity (lock and sequence counter) while any caller still
+        # owns this journal; release drops cache ownership, not caller ownership.
+        # load_session, for example, holds its replay journal across detach/open.
+        # Detach cancels and awaits the active turn BEFORE release: it does not
+        # leave a draining publisher. The cache API also permits release during
+        # delivery, so callers retaining a journal must not get a second lock.
+        # With no remaining owner, the weak entry vanishes and open reconstructs
+        # from durable storage; detach/reload correctness must not depend on GC
+        # timing of a completed handler frame.
+        self._retired[session_id] = journal
+        self._sessions.pop(session_id, None)
 
     def discard(self, session_id: str) -> None:
         self._sessions.pop(session_id, None)
+        self._retired.pop(session_id, None)
 
 
 def _with_sequence(update: Any, sequence: int) -> Any:
