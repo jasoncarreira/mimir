@@ -236,11 +236,10 @@ def _make_faiss_search_fn(
 ):
     """Return an authorization-scoped VectorIndex search adapter.
 
-    FAISS cannot express the SQL ownership predicate itself, so the adapter
-    materializes the caller's authorized live-id set before search and removes
-    unauthorized IDs before they reach RRF.  It over-fetches to the index size
-    so authorized results are not truncated merely because hidden vectors rank
-    above them.
+    Preserve the full-search authorized top-k, including when hidden vectors
+    rank above every eligible atom. Authorization uses primary-key lookups in
+    bounded batches, not a store-wide allowed-id set. The FAISS search itself
+    remains index-sized: bounding candidates would silently sacrifice recall.
     """
 
     def _fn(query_emb: list[float], top_k: int) -> list[tuple[str, float]]:
@@ -257,22 +256,29 @@ def _make_faiss_search_fn(
             auth_where, auth_params = read_authorization.selection_predicate("a")
         else:
             auth_where, auth_params = authorization_predicate(auth_scope, table="a")
-        allowed = {
-            row[0]
-            for row in conn.execute(
-                f"SELECT a.id FROM atoms a WHERE a.tombstoned = 0 "
-                f"AND a.agent_id IN (?, 'shared') AND {auth_where}",
-                [agent_id] + auth_params,
-            ).fetchall()
-        }
-        if not allowed:
+        if top_k <= 0:
             return []
         search_k = max(top_k, index.total_vectors)
-        return [
-            (atom_id, similarity)
-            for atom_id, similarity in index.search(query_emb, top_k=search_k)
-            if atom_id in allowed
-        ][:top_k]
+        candidates = index.search(query_emb, top_k=search_k)
+        result: list[tuple[str, float]] = []
+        for start in range(0, len(candidates), 256):
+            batch = candidates[start:start + 256]
+            placeholders = ",".join("?" for _ in batch)
+            allowed = {
+                row[0]
+                for row in conn.execute(
+                    f"SELECT a.id FROM atoms a WHERE a.id IN ({placeholders}) "
+                    f"AND a.tombstoned = 0 "
+                    f"AND a.agent_id IN (?, 'shared') AND {auth_where}",
+                    [atom_id for atom_id, _ in batch] + [agent_id] + auth_params,
+                ).fetchall()
+            }
+            for atom_id, similarity in batch:
+                if atom_id in allowed:
+                    result.append((atom_id, similarity))
+                    if len(result) == top_k:
+                        return result
+        return result
 
     return _fn
 
@@ -2720,7 +2726,7 @@ class SagaStore:
         rows = conn.execute(
             f"""
             SELECT id, channel_id, started_at, ended_at, summary, reflected_at,
-                   embedding
+                   embedding_dim, embedding
             FROM sessions INDEXED BY {recency_index}
             WHERE {auth_where} {channel_clause}
             ORDER BY COALESCE(ended_at, reflected_at) DESC, id ASC
@@ -2734,17 +2740,17 @@ class SagaStore:
         sim_map: dict[str, float] = {}  # session_id → cosine similarity
 
         if query_emb and eligible_ids:
-            with self._sessions_index_lock:
-                index = self._ensure_sessions_index(conn)
-            if index is not None:
-                # FAISS cannot apply the SQL authorization predicate. Search
-                # the complete sessions index, as the atom lane does, so
-                # hidden vectors cannot consume an eligible session's slot.
-                for sess_id, score in index.search(
-                    query_emb, top_k=index.total_vectors
-                ):
-                    if sess_id in eligible_ids:
-                        sim_map[sess_id] = float(score)
+            # Request-local: authorization and the 500-row cap precede all
+            # vector work. Hidden sessions never enter the index or take slots.
+            index = VectorIndex(dimension=len(query_emb))
+            index.build_from_session_rows(
+                (row[0], row[-1], row[-2]) for row in rows
+            )
+            for sess_id, score in index.search(
+                query_emb, top_k=len(rows)
+            ):
+                if sess_id in eligible_ids:
+                    sim_map[sess_id] = float(score)
 
             if not sim_map:
                 # Python cosine fallback (FAISS unavailable or empty).
@@ -2775,7 +2781,7 @@ class SagaStore:
         # ── Step 3: score each session ──
         now_ts = datetime.now(tz=timezone.utc).timestamp()
         results: list[dict] = []
-        for sess_id, ch_id, started_at, ended_at, summary, reflected_at, _ in rows:
+        for sess_id, ch_id, started_at, ended_at, summary, reflected_at, _, _ in rows:
             sim = sim_map.get(sess_id, 0.0)
 
             # Recency reference: ended_at, falling back to reflected_at —
@@ -2847,7 +2853,7 @@ class SagaStore:
         ranked by recency only (still returned when alpha < 1.0).
 
         Two semantic paths:
-        1. Sessions FAISS index (``_ensure_sessions_index``), built lazily.
+        1. Request-local FAISS index of the authorized SQL pool (at most 500).
         2. Python-side cosine over ``sessions.embedding`` when FAISS is
            unavailable or the index is empty.
 

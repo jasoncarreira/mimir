@@ -144,7 +144,7 @@ async def test_search_sessions_skips_mismatched_dim_embedding(store, tmp_path, m
     import struct
 
     # Force the Python cosine fallback (bypass the sessions FAISS index).
-    monkeypatch.setattr(type(store), "_ensure_sessions_index", lambda self, conn: None)
+    monkeypatch.setattr("mimir.saga.vector_index.FAISS_AVAILABLE", False)
 
     await store.end_session("sess-good", "Python asyncio patterns", channel_id="ch", auth_context=_end_auth("sess-good"))
     await store.end_session("sess-bad", "Cooking pasta and risotto", channel_id="ch", auth_context=_end_auth("sess-bad"))
@@ -221,31 +221,45 @@ async def test_search_sessions_limit(store):
 
 
 @pytest.mark.asyncio
-async def test_search_sessions_foreign_neighbors_do_not_starve_semantic_scores(store):
+@pytest.mark.parametrize("use_faiss", [True, False])
+async def test_search_sessions_foreign_neighbors_do_not_starve_semantic_scores(
+    store, monkeypatch, use_faiss,
+):
     """Foreign nearest neighbors must not consume the caller's FAISS slots."""
+    import math
+    import struct
+
+    import mimir.saga.vector_index as vector_index
+
+    if use_faiss and not vector_index.FAISS_AVAILABLE:
+        pytest.skip("FAISS not installed")
+    monkeypatch.setattr(vector_index, "FAISS_AVAILABLE", use_faiss)
+    monkeypatch.setattr("mimir.saga.client._query_embed_sync", lambda _: [1., 0., 0., 0.])
+
+    def embedding(similarity):
+        return struct.pack("4f", similarity, math.sqrt(1 - similarity**2), 0., 0.)
+
     conn = store._ensure_conn()
     recent = datetime.now(tz=timezone.utc)
     old = recent - timedelta(days=365)
     rows = []
-    ranked = []
-    for i in range(10):
+    # Eligible rows are older than the global 500-row recency cap.
+    for i in range(600):
         session_id = f"foreign-{i}"
         rows.append((
             session_id, recent.isoformat(), recent.isoformat(),
-            "foreign nearest neighbor", b"foreign", "user:bob", "private",
+            "foreign nearest neighbor", embedding(1.0), "user:bob", "private",
         ))
-        ranked.append((session_id, 1.0 - i / 100.0))
     rows.extend([
         (
             "alice-relevant", old.isoformat(), old.isoformat(),
-            "authorized semantic match", b"relevant", "user:alice", "private",
+            "authorized semantic match", embedding(0.9), "user:alice", "private",
         ),
         (
             "alice-recent", recent.isoformat(), recent.isoformat(),
-            "authorized but irrelevant", b"irrelevant", "user:alice", "private",
+            "authorized but irrelevant", embedding(0.1), "user:alice", "private",
         ),
     ])
-    ranked.extend([("alice-relevant", 0.9), ("alice-recent", 0.1)])
     conn.executemany(
         """
         INSERT INTO sessions (
@@ -257,15 +271,6 @@ async def test_search_sessions_foreign_neighbors_do_not_starve_semantic_scores(s
     )
     conn.commit()
 
-    class _RankedSessionIndex:
-        total_vectors = len(ranked)
-
-        def search(self, _query_emb, top_k):
-            return ranked[:top_k]
-
-    store._sessions_index = _RankedSessionIndex()
-    store._sessions_index_built = True
-
     results = await store.search_sessions(
         "semantic match", alpha=0.7, limit=2, auth_context=ALICE_SCOPE,
     )
@@ -276,6 +281,81 @@ async def test_search_sessions_foreign_neighbors_do_not_starve_semantic_scores(s
     assert results[0]["similarity_score"] == 0.9
     assert results[1]["similarity_score"] == 0.1
     assert all(not result["session_id"].startswith("foreign-") for result in results)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("channel_id", [None, "target"])
+async def test_search_sessions_bounds_index_work_cold_after_rotation(
+    store, monkeypatch, channel_id,
+):
+    """SQL eligibility precedes the cap, including after rotation and ACL edits."""
+    import struct
+    import weakref
+
+    from mimir.saga.vector_index import VectorIndex
+
+    conn = store._ensure_conn()
+    blob = struct.pack("4f", 1., 0., 0., 0.)
+    rows = [
+        (f"alice-{i:04d}", "2025-01-01", "target", "user:alice", blob)
+        for i in range(600)
+    ] + [
+        (f"hidden-{i:04d}", "2026-01-01", "target", "user:bob", blob)
+        for i in range(600)
+    ]
+    if channel_id:
+        rows += [
+            (f"other-{i:04d}", "2026-01-01", "other", "user:alice", blob)
+            for i in range(600)
+        ]
+    conn.executemany(
+        "INSERT INTO sessions (id, started_at, ended_at, channel_id, owner_principal, "
+        "embedding, embedding_dim, visibility) VALUES (?, '2025-01-01', ?, ?, ?, ?, 4, 'private')",
+        rows,
+    )
+    conn.commit()
+    built_ids = []
+    searched = []
+    refs = []
+    original_build = VectorIndex.build_from_session_rows
+    original_search = VectorIndex.search
+
+    def build(index, selected_rows):
+        selected_rows = list(selected_rows)
+        built_ids.append([row[0] for row in selected_rows])
+        refs.append(weakref.ref(index))
+        return original_build(index, selected_rows)
+
+    def search(index, query, top_k):
+        searched.append((index.total_vectors, top_k))
+        return original_search(index, query, top_k)
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("Session search must not build/read the global session index")
+
+    monkeypatch.setattr(VectorIndex, "build_from_session_rows", build)
+    monkeypatch.setattr(VectorIndex, "search", search)
+    monkeypatch.setattr(VectorIndex, "build_from_sessions", forbidden)
+    monkeypatch.setattr(store, "_ensure_sessions_index", forbidden)
+    monkeypatch.setattr("mimir.saga.client._query_embed_sync", lambda _: [1., 0., 0., 0.])
+
+    for offset in (0, 1):
+        if offset:
+            await store.end_session("rotation", "New session", auth_context=_end_auth("rotation"))
+            conn.execute("UPDATE sessions SET owner_principal = 'user:bob' WHERE id = 'alice-0000'")
+            conn.commit()
+        results = await store.search_sessions(
+            "q", channel_id=channel_id, alpha=1.0, limit=500, auth_context=ALICE_SCOPE,
+        )
+        expected = [f"alice-{i:04d}" for i in range(offset, 500 + offset)]
+        assert built_ids[-1] == expected
+        assert {r["session_id"] for r in results} == set(expected)
+        assert all(r["similarity_score"] == 1.0 for r in results)
+        assert searched[-1][0] <= 500
+        assert searched[-1][1] == 500
+        assert refs[-1]() is None, "Request-local vectors must not be retained"
+        assert store._sessions_index is None
+    assert len(built_ids) == len(searched) == 2
 
 
 @pytest.mark.asyncio
