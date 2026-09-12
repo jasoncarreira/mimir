@@ -5629,6 +5629,155 @@ async def test_shadow_denial_event_is_self_classifying() -> None:
     assert captured[0][1]["service_principal"] == "scheduler"
 
 
+def test_authorize_tool_returns_through_finish() -> None:
+    tree = ast.parse(Path(access_control.__file__).read_text(encoding="utf-8"))
+    registry = next(
+        node for node in tree.body
+        if isinstance(node, ast.ClassDef) and node.name == "ToolRegistry"
+    )
+    authorize = next(
+        node for node in registry.body
+        if isinstance(node, ast.FunctionDef) and node.name == "authorize_tool"
+    )
+    pending = list(authorize.body)
+    returns = []
+    while pending:
+        node = pending.pop()
+        # Nested helpers (including finish itself) do not return from authorize_tool.
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            continue
+        if isinstance(node, ast.Return):
+            returns.append(node)
+        pending.extend(ast.iter_child_nodes(node))
+
+    assert returns
+    assert [
+        node.lineno for node in returns
+        if not (
+            isinstance(node.value, ast.Call)
+            and isinstance(node.value.func, ast.Name)
+            and node.value.func.id == "finish"
+        )
+    ] == []
+
+
+def test_authorize_tool_read_scope_passes_requested_target_to_emitter(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    registry = ToolRegistry()
+    captured = []
+    monkeypatch.setattr(
+        registry, "_emit_shadow_decision",
+        lambda auth, **fields: captured.append(fields),
+    )
+    decision = registry.authorize_tool(
+        "read_file", enforce=False, target_channel="not-the-read-target",
+        arguments={"file_path": "/memory/private.md"},
+    )
+    assert decision.reason == "read_scope"
+    assert len(captured) == 1
+    assert captured[0]["requested_target"] == "/memory/private.md"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("logging_enabled", [False, True])
+@pytest.mark.parametrize(
+    "tool,reason",
+    [
+        ("fetch_channel_history", "cross_channel_scope"),
+        ("issue_comment", "issue_repository_source_required"),
+        ("issue_comment", "issue_destination_resolution_failed"),
+        ("pr_metadata", "repo_pr_scope_denied"),
+        ("open_proposal", "service_sink_destination_denied"),
+    ],
+)
+async def test_shadow_early_return_parity(
+    monkeypatch: pytest.MonkeyPatch, research_proposal_auth,
+    tool: str, reason: str, logging_enabled: bool,
+) -> None:
+    registry = ToolRegistry()
+    if logging_enabled:
+        registry.enable_shadow_logging()
+    auth = _write_auth()
+    arguments = {}
+    captured = []
+
+    async def capture(kind, **fields):
+        captured.append((kind, fields))
+
+    def fail_resolution(*args, **kwargs):
+        raise access_control.ToolException("resolution refused")
+
+    if reason == "issue_destination_resolution_failed":
+        source = SourceLabel(
+            principal="alice", domain="repository", resource_id="owner/repo",
+            bridge_instance="forge", sensitivity="internal",
+            authorized_principals=frozenset({"alice"}),
+        )
+        auth = replace(auth, ifc_labels=InformationFlowLabels().with_source(source))
+        monkeypatch.setattr("mimir.tools.forge.resolve_issue_comment_target", fail_resolution)
+    elif reason == "repo_pr_scope_denied":
+        monkeypatch.setattr(access_control, "heartbeat_git_authority_enabled", lambda service: True)
+        monkeypatch.setattr("mimir.tools.forge.resolve_review_state_for_context", fail_resolution)
+    elif tool == "open_proposal":
+        auth, _, _ = research_proposal_auth
+        arguments = {"lane": "operator"}
+
+    monkeypatch.setattr("mimir.event_logger.log_event", capture)
+    shadow = registry.authorize_tool(
+        tool, auth, enforce=False, target_channel="slack-C2", arguments=arguments,
+    )
+    await asyncio.sleep(0)
+    assert shadow.allowed is True
+    assert shadow.is_shadow_decision is True
+    assert shadow.would_block is True
+    assert shadow.reason == reason
+    assert len(captured) == int(logging_enabled)
+    if logging_enabled:
+        kind, fields = captured[0]
+        assert kind == "shadow_tool_decision"
+        assert fields["reason"] == reason
+        assert fields["would_block"] is True
+        assert fields["allowed"] is True
+
+    captured.clear()
+    enforced = registry.authorize_tool(
+        tool, auth, enforce=True, target_channel="slack-C2", arguments=arguments,
+    )
+    await asyncio.sleep(0)
+    assert enforced.allowed is False
+    assert enforced.reason == shadow.reason
+    assert enforced.would_block is True
+    assert enforced.is_shadow_decision is False
+    assert captured == []
+
+
+@pytest.mark.asyncio
+async def test_shadow_admin_denial_omits_sink_refusal_not_returned_by_enforcement(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    registry = ToolRegistry()
+    registry.enable_shadow_logging()
+    auth = replace(_write_auth(), ifc_labels=InformationFlowLabels(labels=frozenset({"private"})))
+    captured = []
+
+    async def capture(kind, **fields):
+        captured.append((kind, fields))
+
+    monkeypatch.setattr("mimir.event_logger.log_event", capture)
+    sink = SinkGate.check_sink_flow("memory_store", "saga", auth.ifc_labels, auth, enforce=True)
+    assert not sink.allowed
+    assert sink.reason == "saga_mutation_blocked_by_tainted_turn"
+    shadow = registry.authorize_tool("memory_store", auth, enforce=False)
+    enforced = registry.authorize_tool("memory_store", auth, enforce=True)
+    await asyncio.sleep(0)
+    assert shadow.allowed is True
+    assert enforced.allowed is False
+    assert shadow.reason == enforced.reason == "admin_required"
+    assert len(captured) == 1
+    assert captured[0][1]["reason"] == enforced.reason
+
+
 @pytest.mark.asyncio
 async def test_shadow_sink_event_records_redacted_resolved_destination() -> None:
     registry = ToolRegistry()
@@ -6771,7 +6920,7 @@ async def test_ifc_shadow_denial_records_one_bounded_redacted_causing_source(
     )
     labels = InformationFlowLabels().with_source(compatible).with_source(causing)
     auth = replace(
-        _write_auth(),
+        _write_auth(admin=True),
         domain="channel",
         resource_id="slack-C1",
         bridge_instance="slack",
@@ -6965,6 +7114,7 @@ async def test_ifc_source_recording_failure_cannot_change_live_decision(
 
     assert shadow.allowed is True
     assert shadow.reason == "cross_channel_scope"
+    assert len(captured) == 1
     assert captured[0]["reason"] == enforced.reason == "ifc_label_blocked:same_channel"
     assert captured[0]["ifc_source_scope"] == "classification_failed"
     assert "ifc_source" not in captured[0]

@@ -200,6 +200,109 @@ def test_continuation_clear_does_not_mutate_bound_turn(live_turn):
 
 
 @pytest.mark.parametrize(("tool", "target"), [
+    ("write_file", "/tmp/shadow-approved-output.txt"),
+    ("http_request", "https://example.com/shadow-output"),
+])
+@pytest.mark.parametrize("case", ["matching", "destination", "principal", "expired"])
+def test_shadow_declassification_parity(live_turn, tool, target, case, monkeypatch):
+    auth = live_turn.auth_context
+    now = 100.0
+    monkeypatch.setattr("mimir.models.time.monotonic", lambda: now)
+    assert access_control.approve_live_declassification(
+        auth, sink_category=access_control.get_sink_category(tool).value,
+        destination=target, reason="approve one exact output",
+    ) == (True, "approved")
+    grant = auth.ifc_state._declassification
+    if case == "destination":
+        target += "/other"
+    elif case == "principal":
+        auth = replace(auth, canonical_principal="other")
+    elif case == "expired":
+        now += 31
+
+    shadow = [access_control.SinkGate.check_sink_flow(
+        tool, target, auth.ifc_labels, auth, enforce=False,
+    ) for _ in range(2)]
+    assert auth.ifc_state._declassification is grant
+    enforced = [access_control.SinkGate.check_sink_flow(
+        tool, target, auth.ifc_labels, auth, enforce=True,
+    ) for _ in range(2)]
+    for index, (observed, actual) in enumerate(zip(shadow, enforced)):
+        approved = case == "matching" and index == 0
+        assert observed.allowed
+        assert actual.allowed is approved
+        assert observed.would_block is (not approved)
+        assert observed.decision == actual.decision
+        assert observed.reason == actual.reason
+        assert (observed.reason == "ifc_declassification_approved") is approved
+    assert auth.ifc_state.current() is auth.ifc_labels
+
+
+@pytest.mark.parametrize(("tool", "target"), [
+    ("write_file", "/tmp/shadow-census-output.txt"),
+    ("http_request", "https://example.com/shadow-census-output"),
+])
+async def test_registry_shadow_approval_census(live_turn, tool, target, monkeypatch):
+    auth = live_turn.auth_context
+    # Isolate approval accounting from the uncataloged HTTP operation denial.
+    catalog = access_control.OperationCatalog()
+    catalog.register_operation("http_request", access_control.OperationDecision.ADMIN_REQUIRED)
+    monkeypatch.setattr(access_control, "get_operation_catalog", lambda: catalog)
+    registry = access_control.ToolRegistry()
+    registry.enable_shadow_logging()
+    captured = []
+
+    async def capture(kind, **fields):
+        captured.append((kind, fields))
+
+    assert access_control.approve_live_declassification(
+        auth, sink_category=access_control.get_sink_category(tool).value,
+        destination=target, reason="approve one census output",
+    ) == (True, "approved")
+    grant = auth.ifc_state._declassification
+    monkeypatch.setattr("mimir.event_logger.log_event", capture)
+    arguments = (
+        {"file_path": target, "content": "secret"}
+        if tool == "write_file"
+        else {"url": target}
+    )
+    shadow = []
+    for attempt in range(2):
+        result = registry.authorize_tool(
+            tool, auth, enforce=False, target_channel=target,
+            arguments=arguments, ifc_labels=auth.ifc_labels,
+        )
+        shadow.append(result)
+        await asyncio.sleep(0)
+        assert result.allowed
+        if attempt == 0:
+            assert not result.would_block
+        assert len(captured) == attempt
+        assert auth.ifc_state._declassification is grant
+
+    kind, fields = captured[0]
+    assert kind == "shadow_tool_decision"
+    assert fields["tool"] == tool
+    assert fields["would_block"] is True
+    assert fields["reason"] == f"ifc_label_blocked:{access_control.get_sink_category(tool).value}"
+    for attempt in range(2):
+        enforced = registry.authorize_tool(
+            tool, auth, enforce=True, target_channel=target,
+            arguments=arguments, ifc_labels=auth.ifc_labels,
+        )
+        assert enforced.allowed is (attempt == 0)
+        assert enforced.would_block is bool(attempt)
+        if attempt == 0:
+            assert enforced.reason == shadow[0].reason
+            assert enforced.decision == shadow[0].decision
+        else:
+            assert enforced.reason == fields["reason"]
+            assert enforced.decision.value == fields["decision"]
+    await asyncio.sleep(0)
+    assert len(captured) == 1
+
+
+@pytest.mark.parametrize(("tool", "target"), [
     ("write_file", "/tmp/private-output.txt"),
     ("fetch_url", "https://example.com/unapproved"),
     ("http_request", "https://example.com/output"),

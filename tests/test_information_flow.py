@@ -5589,6 +5589,46 @@ def test_live_declassification_is_one_use_exact_and_preserves_sources(tmp_path):
     assert record["source_labels"]
 
 
+@pytest.mark.parametrize("mismatch", ["sink_category", "destination", "canonical_principal", "labels", "source_channels", "sources"])
+def test_shadow_approval_mismatch_does_not_spend_grant(mismatch):
+    labels = _labels()
+    state = InformationFlowState(labels)
+    assert state.approve_sink_once(
+        fallback=labels, sink_category="file", destination="/tmp/approved",
+        canonical_principal="operator", lifetime_seconds=30,
+        durable_audit=lambda *_: True,
+    )
+    arguments = dict(current=labels, sink_category="file", destination="/tmp/approved",
+                     canonical_principal="operator")
+    wrong = dict(arguments)
+    if mismatch in {"labels", "source_channels", "sources"}:
+        changed = {
+            "labels": frozenset({"unknown"}),
+            "source_channels": frozenset({"other-channel"}),
+            "sources": (SourceLabel(
+                principal="other", domain="other", resource_id="other",
+                bridge_instance="other", sensitivity="private",
+            ),),
+        }
+        wrong["current"] = replace(labels, **{mismatch: changed[mismatch]})
+    else:
+        wrong[mismatch] = "other"
+    assert not state.consume_sink_approval(**wrong, shadow=True)
+    assert not state.consume_sink_approval(**wrong)
+    assert state.consume_sink_approval(**arguments, shadow=True)
+    assert not state.consume_sink_approval(**arguments, shadow=True)
+    assert state.consume_sink_approval(**arguments)
+    assert not state.consume_sink_approval(**arguments)
+    # A newly issued grant has its own shadow one-use budget.
+    assert state.approve_sink_once(
+        fallback=labels, sink_category="file", destination="/tmp/approved",
+        canonical_principal="operator", lifetime_seconds=30,
+        durable_audit=lambda *_: True,
+    )
+    assert state.consume_sink_approval(**arguments, shadow=True)
+    assert state.consume_sink_approval(**arguments)
+
+
 def test_live_declassification_does_not_cross_turn_or_sink_category(tmp_path):
     from mimir.event_logger import _reset_logger_for_tests, init_logger
 
@@ -6753,7 +6793,8 @@ def _install_category_capability() -> tuple[
     return state, state.current(), reply_source, event
 
 
-def test_category_capability_is_reusable_and_coexists_with_exact_one_shot():
+@pytest.mark.parametrize("shadow", [False, True])
+def test_category_capability_is_reusable_and_coexists_with_exact_one_shot(shadow):
     state, current, _, _ = _install_category_capability()
     assert current is not None
     assert state.approve_sink_once(
@@ -6771,6 +6812,7 @@ def test_category_capability_is_reusable_and_coexists_with_exact_one_shot():
         destination="exact-command",
         canonical_principal="user-1",
         turn_id="turn-1",
+        shadow=shadow,
     )
     for destination in ("first", "second"):
         assert state.consume_sink_approval(
@@ -6779,6 +6821,7 @@ def test_category_capability_is_reusable_and_coexists_with_exact_one_shot():
             destination=destination,
             canonical_principal="user-1",
             turn_id="turn-1",
+            shadow=shadow,
         )
     assert not state.consume_sink_approval(
         current=current,
@@ -6786,6 +6829,7 @@ def test_category_capability_is_reusable_and_coexists_with_exact_one_shot():
         destination="third",
         canonical_principal="other-user",
         turn_id="turn-1",
+        shadow=shadow,
     )
     assert not state.consume_sink_approval(
         current=current,
@@ -6793,6 +6837,7 @@ def test_category_capability_is_reusable_and_coexists_with_exact_one_shot():
         destination="third",
         canonical_principal="user-1",
         turn_id="turn-2",
+        shadow=shadow,
     )
 
 
