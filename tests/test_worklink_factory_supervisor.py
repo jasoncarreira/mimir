@@ -43,13 +43,18 @@ s = importlib.util.spec_from_file_location('s', sys.argv[1])
 m = importlib.util.module_from_spec(s)
 s.loader.exec_module(m)
 observe = m._observe
-adopted = False
+pending = set()
 def observed(channel, primary, adoptions):
-    global adopted
+    # _observe only enumerates; the reap runs after it, over the pids it
+    # returned. An adoptee can be re-parented while still ALIVE, and then that
+    # iteration's waitpid(WNOHANG) reaps nothing. Signal on a pid we saw having
+    # LEFT the child set, which is what reaping it means, rather than on merely
+    # having seen it.
     children = observe(channel, primary, adoptions)
-    if adopted:
+    live = {pid for pid in children if pid != primary}
+    if pending and not (pending & live):
         open(sys.argv[-1] + '.checked', 'w').close()
-    adopted = adopted or any(pid != primary for pid in children)
+    pending.update(live)
     return children
 m._observe = observed
 sys.exit(m.main(sys.argv[2:]))
