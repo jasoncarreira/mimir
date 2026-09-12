@@ -25,11 +25,12 @@ from mimir.chat_skills import (
 )
 from mimir.bridges.web_chat import DEFAULT_CHANNEL, WebChatBridge, _Subscriber
 from mimir.history import MessageBuffer, render_recent_activity
+from mimir.http_ingress import SERVER_OWNED_EXTRA_KEYS
 from mimir.identities import IdentityResolver
 from mimir.models import AgentEvent, SessionACL
 from mimir.saga.ownership import is_user_accessible
 from mimir.web_contracts import validate_api_envelope, validate_live_event
-from mimir.worklink.continuation import HTTP_EVENT_INGRESS_EXTRA_KEY
+from mimir.worklink.continuation import HTTP_EVENT_INGRESS_EXTRA_KEY, WORKLINK_HINT_EXTRA_KEYS
 
 
 class StubChatSkillRegistry:
@@ -82,6 +83,19 @@ def _authed_bridge_app(
     app = web.Application(middlewares=[inject_identity])
     bridge.register_routes(app)
     return bridge, app, enqueued
+
+
+@pytest.mark.parametrize("route", ["/chat", "/api/v1/chat"])
+async def test_chat_strips_server_and_worklink_extra(tmp_path: Path, route: str):
+    _, app, enqueued = _authed_bridge_app(tmp_path)
+    extra = dict.fromkeys(SERVER_OWNED_EXTRA_KEYS | WORKLINK_HINT_EXTRA_KEYS, "forged")
+    extra["keep"] = "me"
+    extra["nested"] = [dict.fromkeys(WORKLINK_HINT_EXTRA_KEYS, "forged")]
+    async with TestClient(TestServer(app)) as client:
+        response = await client.post(route, json={"content": "hello", "extra": extra})
+    assert response.status == 200
+    assert len(enqueued) == 1
+    assert enqueued[0].extra == {"keep": "me", "nested": [{}]}
 
 
 @pytest.fixture
@@ -1175,3 +1189,83 @@ async def test_authenticated_stream_only_receives_own_web_channel(tmp_path):
 
     assert payload["channel_id"] == "web-alice"
     assert payload["text"] == "alice visible"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("route", ["/chat", "/api/v1/chat"])
+async def test_forged_deliver_cannot_send_agent_failure_to_private_channel(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, route: str,
+):
+    import mimir.event_logger as event_logger
+    from mimir.config import Config
+    from mimir.identities_populator import issue_web_key
+    from mimir.index import IndexGenerator
+    from mimir.server import _make_auth_middleware
+    from mimir.turn_logger import TurnLogger
+
+    monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
+    monkeypatch.setenv("MIMIR_ACCESS_CONTROL_ENFORCED", "false")
+    monkeypatch.setattr(
+        event_logger, "_logger",
+        event_logger.EventLogger(tmp_path / "logs" / "events.jsonl", "test"),
+    )
+    user_key = issue_web_key(tmp_path, "alice", roles=["user"])
+    resolver = IdentityResolver(home=tmp_path)
+    resolver.reload()
+    _, app, enqueued = _authed_bridge_app(tmp_path)
+    app.middlewares[:] = [_make_auth_middleware("master-secret")]
+    app["identity_resolver"] = resolver
+
+    async with TestClient(TestServer(app)) as client:
+        response = await client.post(
+            route,
+            headers={"X-API-Key": user_key},
+            json={
+                "content": "hello",
+                "extra": {
+                    "deliver": "slack-C0PRIVATE",
+                    "schedule_name": "forged-job",
+                },
+            },
+        )
+        assert response.status == 200
+
+    assert len(enqueued) == 1
+    assert enqueued[0].author == "alice"
+
+    class FailingGraph:
+        async def astream(self, *args, **kwargs):
+            raise RuntimeError("forged deliver regression failure")
+            yield  # pragma: no cover
+
+    class RecordingChannels:
+        def __init__(self):
+            self.finds = []
+            self.sends = []
+
+        def find(self, channel_id):
+            self.finds.append(channel_id)
+            return None
+
+        async def send(self, channel_id, text, **kwargs):
+            self.sends.append((channel_id, text))
+            return SimpleNamespace(sent=True, message_id="recorded")
+
+    channels = RecordingChannels()
+    agent = Agent(
+        config=Config.from_env(),
+        turn_logger=TurnLogger(tmp_path / "logs" / "turns.jsonl"),
+        message_buffer=MessageBuffer(
+            history_path=tmp_path / "messages.jsonl", resolver=resolver,
+        ),
+        index_generator=IndexGenerator(tmp_path),
+        channel_registry=channels,
+        turn_hooks=[],
+    )
+    agent._agent = FailingGraph()
+
+    record = await agent.run_turn(enqueued[0])
+
+    assert record.error == "RuntimeError: forged deliver regression failure"
+    assert "web-alice" in channels.finds
+    assert not any(channel == "slack-C0PRIVATE" for channel, _ in channels.sends)
