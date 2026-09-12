@@ -238,6 +238,59 @@ async def test_relative_absolute_symlink_encoding_size_and_frame_contract(
 
 
 @pytest.mark.asyncio
+async def test_edit_size_limit_bounds_read_and_preserves_target(tmp_path: Path, monkeypatch) -> None:
+    provider, connection = await _connected(tmp_path)
+    target = tmp_path / "target"
+    content = b"before" + b"x" * (hosted.READ_LIMIT_BYTES - 6)
+    target.write_bytes(content + b"x")
+    inode = target.stat().st_ino
+    fdopen = os.fdopen
+    reads = []
+
+    class BoundedReader:
+        def __init__(self, stream):
+            self.stream = stream
+
+        def __enter__(self):
+            self.stream.__enter__()
+            return self
+
+        def __exit__(self, *args):
+            return self.stream.__exit__(*args)
+
+        def fileno(self):
+            return self.stream.fileno()
+
+        def read(self, size=-1):
+            # Fail safely even if a regression attempts an unbounded allocation.
+            assert size == hosted.READ_LIMIT_BYTES + 1
+            reads.append(size)
+            return self.stream.read(size)
+
+    monkeypatch.setattr(hosted.os, "fdopen", lambda fd, mode: (
+        BoundedReader(fdopen(fd, mode)) if mode == "rb" else fdopen(fd, mode)
+    ))
+    arguments = {"path": "target", "oldText": "before", "newText": "after!"}
+    try:
+        with pytest.raises(HostedMcpError) as too_large:
+            await provider.request(connection, "tools/call", {"name": "edit", "arguments": arguments})
+        assert too_large.value.as_error() == {
+            "code": -32000,
+            "message": f"file too large ({hosted.READ_LIMIT_BYTES + 1} bytes)",
+        }
+        assert target.read_bytes() == content + b"x"
+        assert target.stat().st_ino == inode
+        assert list(tmp_path.iterdir()) == [target]
+        target.write_bytes(content)
+        result = await provider.request(connection, "tools/call", {"name": "edit", "arguments": arguments})
+        assert result["structuredContent"] == {"changed": True}
+        assert target.read_bytes() == b"after!" + content[6:]
+        assert len(reads) == 2
+    finally:
+        await provider.close()
+
+
+@pytest.mark.asyncio
 async def test_edit_cardinality_atomic_mode_and_symlink_contract(tmp_path: Path) -> None:
     provider, connection = await _connected(tmp_path)
     target = tmp_path / "target"

@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import json
+import asyncio
 import os
 import shlex
 import subprocess
 import sys
+import threading
 from pathlib import Path
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -14,6 +17,196 @@ from mimir.acp.execution_scope import ScopeApproval
 
 
 MACOS = pytest.mark.skipif(sys.platform != "darwin", reason="requires macOS Seatbelt")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("site,outcome", [
+    (site, outcome)
+    for site in ("scope", "permission", "permission-missing", "risk-recheck", "risk-recovered",
+                 "shell", "execute", "execute-reuse", "spawn")
+    for outcome in (("success", "error", "closed") if site in ("execute", "execute-reuse", "spawn")
+                    else ("success", "error", "closed", "invalidated", "replaced",
+                          "scope-closed", "provider-closed")
+                    + (("consent-granted", "consent-revoked") if site == "scope" else ()))
+])
+async def test_prepare_off_loop(monkeypatch, tmp_path, site, outcome):
+    from mimir.acp import hosted, python_kernel
+
+    loop = asyncio.get_running_loop()
+    loop_thread = threading.get_ident()
+    permission = AsyncMock(return_value=True)
+    provider = hosted.HostedHandsProvider(request_unconfined_permission=permission)
+    provider.bind_session("s", tmp_path)
+    session = provider._sessions["s"]
+    manager = provider._python_kernels
+    is_kernel = site in ("execute", "execute-reuse", "spawn")
+    target = 2 if site in ("risk-recheck", "risk-recovered", "spawn") else 1
+    armed = site != "execute-reuse"
+    if outcome == "consent-revoked":
+        session.scope.unconfined_approved = True
+    calls = []
+    closing = []
+
+    def prepare(argv, **kwargs):
+        # A direct-call mutation fails immediately, rather than deadlocking the loop.
+        assert threading.get_ident() != loop_thread
+        calls.append((tuple(argv), kwargs))
+        index = len(calls)
+        resumed = threading.Event()
+
+        def handshake():
+            if armed and index == target:
+                if is_kernel:
+                    if outcome == "closed":
+                        closing.append(asyncio.create_task(manager.close()))
+                elif outcome == "replaced":
+                    session.scope = hosted.ExecutionScope(tmp_path)
+                elif outcome in ("closed", "invalidated"):
+                    session.scope.invalidate(close=outcome == "closed")
+                elif outcome == "scope-closed":
+                    session.scope.closed = True
+                elif outcome == "provider-closed":
+                    provider._closed = True
+                elif outcome in ("consent-granted", "consent-revoked"):
+                    session.scope.unconfined_approved = outcome == "consent-granted"
+            loop.call_soon(resumed.set)
+
+        loop.call_soon_threadsafe(handshake)
+        assert resumed.wait(5), "event loop did not respond during preparation"
+        if armed and index == target and outcome == "error":
+            raise confinement.ConfinementUnavailable("fixture preparation failure")
+        if site in ("risk-recheck", "permission-missing") or (site == "risk-recovered" and index == 1):
+            raise confinement.BackendUnavailable("fixture missing backend")
+        return confinement.PreparedCommand(tuple(argv), confinement._environment())
+
+    monkeypatch.setattr(python_kernel if is_kernel else hosted, "prepare_command", prepare)
+    try:
+        if site == "execute-reuse":
+            assert (await manager.execute("s", tmp_path, "40 + 2"))["value"] == "42"
+            calls.clear()
+            armed = True
+        if site == "scope":
+            operation = provider.request_scope(session, "")
+        elif site in ("permission", "permission-missing", "risk-recheck", "risk-recovered"):
+            operation = provider._ensure_execution_permission(session)
+        elif site == "shell":
+            operation = provider._shell(session, "printf fixture")
+            # Exercise only launch preparation here; permission probes have their own cases.
+            monkeypatch.setattr(provider, "_ensure_execution_permission", AsyncMock())
+        else:
+            operation = manager.execute("s", tmp_path, "40 + 2")
+        if outcome not in ("success", "error") or (outcome == "error" and site != "scope"):
+            error = python_kernel.PythonKernelUnavailable if is_kernel else (
+                confinement.ConfinementUnavailable if site in ("permission", "permission-missing", "risk-recheck", "risk-recovered")
+                and outcome == "error" else hosted.HostedMcpError
+            )
+            with pytest.raises(error, match="fixture preparation failure|closed|expired|changed"):
+                await operation
+        else:
+            result = await operation
+            if site == "scope":
+                assert result["approved"] is True
+                assert result["paths"] == [str(tmp_path)]
+                assert result["message"].startswith("BLOCKED:" if outcome == "error" else "CONFINED:")
+            elif site == "shell":
+                assert result == {"stdout": "fixture", "stderr": "", "exitCode": 0}
+            elif is_kernel:
+                assert result["ok"] and result["value"] == "42"
+                reused = await manager.execute("s", tmp_path, "6 * 7")
+                assert reused["kernel"] == "reused" and reused["value"] == "42"
+            elif site in ("risk-recheck", "permission-missing"):
+                assert session.scope.unconfined_approved
+        assert len(calls) >= target
+        assert all(call[1]["cwd"] == tmp_path for call in calls)
+        assert all(call[1]["approved_paths"] == () for call in calls)
+        if site in ("risk-recheck", "risk-recovered") or (site == "permission-missing" and outcome == "success"):
+            permission.assert_awaited_once_with("s")
+            assert not session.scope.risk_pending
+            assert session.scope.unconfined_approved is (outcome == "success" and site != "risk-recovered")
+        else:
+            permission.assert_not_awaited()
+        if outcome != "success":
+            assert not provider._processes
+            assert not manager._processes
+    finally:
+        await asyncio.gather(*closing)
+        if outcome == "provider-closed":
+            provider._closed = False
+        await provider.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["scope", "risk"])
+async def test_prepare_off_loop_preserves_approval_serialization(monkeypatch, tmp_path, kind):
+    from mimir.acp import hosted
+
+    loop = asyncio.get_running_loop()
+    loop_thread = threading.get_ident()
+    probes = asyncio.Queue()
+    prompted = asyncio.Event()
+    answer = asyncio.Event()
+
+    async def approve(*args):
+        prompted.set()
+        await answer.wait()
+        return True
+
+    permission = AsyncMock(side_effect=approve)
+    provider = hosted.HostedHandsProvider(
+        request_scope_permission=permission, request_unconfined_permission=permission,
+    )
+    cwd = tmp_path / "cwd"
+    cwd.mkdir()
+    candidate = tmp_path / "candidate"
+    candidate.touch()
+    provider.bind_session("s", cwd)
+    session = provider._sessions["s"]
+    releases = []
+
+    def prepare(argv, **kwargs):
+        assert threading.get_ident() != loop_thread
+        resumed = threading.Event()
+        releases.append(resumed)
+        loop.call_soon_threadsafe(probes.put_nowait, resumed)
+        assert resumed.wait(5), "probe was not released"
+        if kind == "risk":
+            raise confinement.BackendUnavailable("fixture")
+        return confinement.PreparedCommand(tuple(argv), {})
+
+    monkeypatch.setattr(hosted, "prepare_command", prepare)
+    monkeypatch.setattr(hosted, "validate_scope", lambda **kwargs: None)
+    operation = (lambda: provider.request_scope(session, str(candidate))) if kind == "scope" else (
+        lambda: provider._ensure_execution_permission(session)
+    )
+    tasks = [asyncio.create_task(operation()) for _ in range(2)]
+    try:
+        for _ in range(2):
+            (await asyncio.wait_for(probes.get(), 5)).set()
+        await asyncio.wait_for(prompted.wait(), 5)
+        done, pending = await asyncio.wait(tasks, timeout=5, return_when=asyncio.FIRST_COMPLETED)
+        assert len(done) == len(pending) == 1
+        permission.assert_awaited_once()
+        assert not session.scope.approved and not session.scope.unconfined_approved
+        rejected = await asyncio.gather(*done, return_exceptions=True)
+        if kind == "scope":
+            assert not rejected[0]["approved"]
+        else:
+            assert isinstance(rejected[0], hosted.HostedMcpError)
+            assert "pending" in str(rejected[0])
+        answer.set()
+        if kind == "risk":
+            (await asyncio.wait_for(probes.get(), 5)).set()
+        await asyncio.gather(*pending)
+        assert bool(session.scope.approved) is (kind == "scope")
+        assert session.scope.unconfined_approved is (kind == "risk")
+        assert not session.scope.pending and not session.scope.risk_pending
+    finally:
+        for release in releases:
+            release.set()
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        await provider.close()
 
 
 def test_unavailable_platform_fails_closed(monkeypatch, tmp_path):
