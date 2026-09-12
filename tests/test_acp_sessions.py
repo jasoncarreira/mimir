@@ -1708,6 +1708,127 @@ async def test_detach_waits_for_prompt_before_reloading(
         await asyncio.gather(first, loading, cancellation_started, return_exceptions=True)
 
 
+@pytest.mark.parametrize("route", ["drain", "ordered", "failure"])
+async def test_stalled_read_peer_prompt_then_load_is_bounded(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, route: str,
+) -> None:
+    from mimir.acp import updates
+
+    bundle, core = _bundle(tmp_path)
+    agent = MimirAcpAgent(bundle)
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    class StalledClient(Client):
+        async def session_update(self, session_id: str, update: Any) -> None:
+            if entered.is_set() or update.session_update == "tool_call":
+                entered.set()
+                await release.wait()
+            await super().session_update(session_id, update)
+
+    client = StalledClient()
+    generation = agent.on_connect(client)
+    await agent.initialize(1)
+    await agent.authenticate("mimir-web-key", **{"mimir.webKey": "secret"})
+    session_id = (await agent.new_session("/one")).session_id
+    connection = agent._connections[generation]
+    state = agent._sessions[session_id]
+    monkeypatch.setattr(updates, "UPDATE_DELIVERY_TIMEOUT", 0.1)
+
+    async def turn(event: Any, **kwargs: Any) -> None:
+        core.bus.publish({
+            "turn_id": kwargs["turn_id"], "channel_id": event.channel_id,
+            "type": "tool_call", "phase": "start", "id": "stalled-tool",
+            "tool_name": "lookup",
+        })
+        await entered.wait()
+        if route == "ordered":
+            await core.channels.send(event.channel_id, "answer")
+        elif route == "failure":
+            raise RuntimeError("model failed")
+
+    core.run_turn = turn
+    prompting = asyncio.create_task(agent.prompt(session_id, [sdk.TextContentBlock(type="text", text="first")]))
+    loading = None
+    try:
+        await asyncio.wait_for(entered.wait(), 2)
+        active = state.active_prompt
+        assert active is not None
+        loading = asyncio.create_task(agent.load_session("/two", session_id))
+        # Shield so a missing production bound fails here by TimeoutError,
+        # rather than test cancellation accidentally rescuing the handler.
+        with pytest.raises(sdk.RequestError):
+            await asyncio.wait_for(asyncio.shield(loading), 3)
+        with pytest.raises(sdk.RequestError):
+            await asyncio.wait_for(asyncio.shield(prompting), 3)
+        await asyncio.wait_for(asyncio.gather(*agent._retirement_tasks), 3)
+        assert connection.transport_dead and active.transport_dead
+        assert active.completed.is_set()
+        assert not release.is_set()
+
+        replacement = Client()
+        agent.on_connect(replacement)
+        await agent.authenticate("mimir-web-key", **{"mimir.webKey": "secret"})
+        await agent.load_session("/reconnected", session_id)
+        tool_updates = [item for item in replacement.updates if getattr(item, "tool_call_id", None) == "stalled-tool"]
+        assert [item.status for item in tool_updates] == ["pending", "failed"]
+        assert not any(getattr(item, "tool_call_id", None) == "stalled-tool" for item in client.updates)
+    finally:
+        release.set()
+        tasks = [prompting, *([loading] if loading is not None else [])]
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        await asyncio.gather(*agent._retirement_tasks, return_exceptions=True)
+
+
+async def test_slow_replay_renews_waiting_prompt_drain_budget(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from mimir.acp import updates
+
+    agent, client, core = await _ready(tmp_path)
+    session_id = (await agent.new_session("/one")).session_id
+    core.pressure = 30
+    await agent.prompt(session_id, [sdk.TextContentBlock(type="text", text="history")])
+    core.pressure = 0
+    core.gate = asyncio.Event()
+    core.entered.clear()
+    prompting = asyncio.create_task(agent.prompt(session_id, [sdk.TextContentBlock(type="text", text="live")]))
+    await core.entered.wait()
+    connection = agent._connection
+    replay_started = asyncio.Event()
+    original = client.session_update
+    loop = asyncio.get_running_loop()
+
+    async def slow_update(session: str, update: Any) -> None:
+        replay_started.set()
+        ready = asyncio.Event()
+        timer = loop.call_later(0.1, ready.set)
+        try:
+            await ready.wait()
+            await original(session, update)
+        finally:
+            timer.cancel()
+
+    monkeypatch.setattr(client, "session_update", slow_update)
+    started = loop.time()
+    loading = asyncio.create_task(agent.load_session("/two", session_id))
+    try:
+        await asyncio.wait_for(replay_started.wait(), 2)
+        core.gate.set()
+        await asyncio.wait_for(asyncio.shield(loading), 15)
+        await asyncio.wait_for(asyncio.shield(prompting), 15)
+        assert loop.time() - started > updates.UPDATE_DELIVERY_TIMEOUT
+        assert not connection.transport_dead
+        assert agent._sessions[session_id].environment.cwd == "/two"
+    finally:
+        core.gate.set()
+        prompting.cancel()
+        loading.cancel()
+        await asyncio.gather(prompting, loading, return_exceptions=True)
+
+
 async def test_detaching_state_blocks_prompts_without_unbinding_replacement(tmp_path: Path) -> None:
     bundle, _ = _bundle(tmp_path)
     agent = MimirAcpAgent(bundle)
@@ -3220,17 +3341,20 @@ async def test_detach_cancels_turn_and_reload_reconstructs_released_journal(tmp_
     # No draining publisher survives detach. Drop our own task/ActivePrompt
     # references and prove reload works from disk, not incidental frame liveness.
     del active, prompting
+    # asyncio timeout handles retain their captured Context until the loop
+    # removes cancelled timers, even after the owning handler has completed.
+    await asyncio.sleep(0)
     gc.collect()
     assert reference() is None
     assert dict(agent._journals._retired) == {}
     await agent.load_session("/two", session_id)
     journal = agent._journals._sessions[session_id]
-    assert journal.current_client is client
+    assert journal.current_client.peer is client
     assert journal.next_sequence == 1
     successor_key = agent._execution_keys[session_id]
     await agent._detach_state(state)
     assert agent._journals._sessions[session_id] is journal
-    assert journal.current_client is client
+    assert journal.current_client.peer is client
     assert agent._execution_keys[session_id] == successor_key
     assert agent._environments[session_id][1].cwd == "/two"
     core.gate.set()
@@ -3274,7 +3398,7 @@ async def test_failed_load_releases_only_unowned_journal(
         assert agent._execution_keys == {}
     client.updates.clear()
     await agent.load_session("/retry", session_id)
-    assert agent._journals._sessions[session_id].current_client is client
+    assert agent._journals._sessions[session_id].current_client.peer is client
     assert [u.field_meta["mimir.sequence"] for u in client.updates] == list(range(5))
 
 

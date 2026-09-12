@@ -3,11 +3,12 @@ from __future__ import annotations
 import asyncio
 import json
 import shlex
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from typing import Any
 
 from mimir.acp.journal import JournalLease
 from mimir.acp.sdk import AgentPlanUpdate, PermissionSnapshot, PlanEntry, RequestError, ToolCallProgress, ToolCallStart
+from mimir.acp.transport import WRITER_DRAIN_TIMEOUT
 from mimir.turn_event_redaction import scrub_detail, scrub_value
 
 _SENSITIVE = {"authorization", "cookie", "password", "passwd", "secret", "token", "api_key", "apikey", "access_key", "private_key"}
@@ -15,6 +16,9 @@ _VALID_TODO_STATUS = {"pending", "in_progress", "completed"}
 MAX_UPDATE_ITEMS = 128
 MAX_UPDATE_BYTES = 8 * 1024 * 1024
 UPDATE_CLOSE_TIMEOUT = 2.0
+# Match the proxy/relay's per-write budget, not a whole-turn/replay deadline.
+# Every completed update renews the budget, regardless of the queue's length.
+UPDATE_DELIVERY_TIMEOUT = WRITER_DRAIN_TIMEOUT
 
 _TOOL_PRESENTATIONS = {
     "read_file": ("read", "Read", "file_path"),
@@ -39,16 +43,40 @@ _TOOL_PRESENTATIONS = {
 _SHELL_TOOLS = {"shell_exec", "bash_async", "hands_shell"}
 
 
+class UpdateClient:
+    """Bound journal delivery (including replay) without changing the MCP peer."""
+
+    def __init__(self, peer: Any, on_stall: Callable[[], None], is_dead: Callable[[], bool], on_progress: Callable[[], None] = lambda: None) -> None:
+        self.peer = peer
+        self.on_stall = on_stall
+        self.is_dead = is_dead
+        self.on_progress = on_progress
+
+    async def session_update(self, session_id: str, update: Any) -> None:
+        if self.is_dead():
+            raise ConnectionError("ACP update peer is unusable")
+        try:
+            async with asyncio.timeout(UPDATE_DELIVERY_TIMEOUT):
+                await self.peer.session_update(session_id, update)
+            self.on_progress()
+        except TimeoutError:
+            self.on_stall()
+            raise
+
+
 class UpdateDispatcher:
     def __init__(
         self,
         publisher: Any,
         lease: JournalLease | None = None,
         epoch: int = 0,
+        on_stall: Callable[[], None] | None = None,
     ) -> None:
         self.publisher = publisher
         self.lease = lease
         self.epoch = epoch
+        self._on_stall = on_stall
+        self._drain_timeouts: set[asyncio.Timeout] = set()
         self.queue: asyncio.Queue[dict[str, Any] | None] = asyncio.Queue(maxsize=MAX_UPDATE_ITEMS)
         self._queued_bytes = 0
         self._queued_sizes: asyncio.Queue[int] = asyncio.Queue()
@@ -106,7 +134,7 @@ class UpdateDispatcher:
 
     async def drain(self) -> None:
         self._ensure_worker()
-        await self.queue.join()
+        await self._join()
         if self._failure is not None:
             raise RequestError(-32603, "Internal error") from self._failure
 
@@ -114,18 +142,39 @@ class UpdateDispatcher:
         self._ensure_worker()
         if self._failure is None:
             self._failure = error or RuntimeError("ACP turn failed")
-        await self.queue.join()
+        await self._join()
         for tool_id, name in list(self._open_tools.items()):
             self.enqueue({"type": "_terminal", "phase": "end", "id": tool_id, "tool_name": name})
-        await self.queue.join()
+        await self._join()
         raise RequestError(-32603, "Internal error") from self._failure
+
+    async def _join(self) -> None:
+        timeout = asyncio.timeout(UPDATE_DELIVERY_TIMEOUT)
+        self._drain_timeouts.add(timeout)
+        try:
+            async with timeout:
+                await self.queue.join()
+        except TimeoutError as exc:
+            error = TimeoutError("ACP update delivery stalled")
+            if self._failure is None:
+                self._failure = error
+            if self._on_stall is not None:
+                self._on_stall()
+            raise error from exc
+        finally:
+            self._drain_timeouts.discard(timeout)
+
+    def _made_progress(self) -> None:
+        for timeout in self._drain_timeouts:
+            if not timeout.expired():
+                timeout.reschedule(asyncio.get_running_loop().time() + UPDATE_DELIVERY_TIMEOUT)
 
     async def terminalize_cancelled(self) -> None:
         if self._terminalized_cancelled:
             return
         self._terminalized_cancelled = True
         self._ensure_worker()
-        await self.queue.join()
+        await self._join()
         updates = [
             ToolCallProgress(
                 sessionUpdate="tool_call_update",
@@ -229,6 +278,7 @@ class UpdateDispatcher:
                                     await self.publisher.publish_live(update)
                                 else:
                                     await self.publisher.publish_live(update, accepted=True)
+                                self._made_progress()
                             except Exception as exc:
                                 if self._failure is None:
                                     self._failure = exc
@@ -239,6 +289,7 @@ class UpdateDispatcher:
                 self._queued_sizes.task_done()
                 self._queued_bytes -= size
                 self.queue.task_done()
+                self._made_progress()
 
     def _map(self, event: dict[str, Any]) -> list[Any]:
         kind = event.get("type")
