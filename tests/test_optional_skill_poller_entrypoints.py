@@ -34,6 +34,7 @@ the source-checkout shortcut, so the deployment locators are the only way throug
 
 from __future__ import annotations
 
+import ast
 import json
 import os
 import shlex
@@ -112,6 +113,146 @@ def _manifest_pass_env(skill: Path) -> set[str]:
     for poller in data.get("pollers") or []:
         names.update(poller.get("pass_env") or [])
     return names
+
+
+def _env_reads(source: str) -> set[str]:
+    """Collect literal env reads, resolving name parameters at helper call sites.
+
+    Fail closed on dynamic keys instead of silently dropping a new read from
+    coverage. This checks source without importing or executing a poller.
+    """
+    tree = ast.parse(source)
+    parents = {child: node for node in ast.walk(tree) for child in ast.iter_child_nodes(node)}
+    names: set[str] = set()
+
+    def resolve(key: ast.expr, node: ast.AST) -> None:
+        if isinstance(key, ast.Constant) and isinstance(key.value, str):
+            names.add(key.value)
+            return
+        owner = node
+        while owner in parents and not isinstance(owner, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            owner = parents[owner]
+        assert isinstance(key, ast.Name) and isinstance(owner, (ast.FunctionDef, ast.AsyncFunctionDef)), (
+            f"unresolved env key at line {node.lineno}: {ast.unparse(key)}"
+        )
+        parameters = [arg.arg for arg in owner.args.posonlyargs + owner.args.args]
+        assert key.id in parameters, f"unresolved env parameter: {key.id}"
+        index = parameters.index(key.id)
+        calls = [
+            call for call in ast.walk(tree)
+            if isinstance(call, ast.Call) and isinstance(call.func, ast.Name)
+            and call.func.id == owner.name
+        ]
+        assert calls, f"no call sites for env helper {owner.name}"
+        for call in calls:
+            argument = call.args[index] if len(call.args) > index else next(
+                (kw.value for kw in call.keywords if kw.arg == key.id), None,
+            )
+            assert argument is not None, f"missing env key for {owner.name}"
+            assert isinstance(argument, ast.Constant) and isinstance(argument.value, str), (
+                f"dynamic env helper argument at line {call.lineno}"
+            )
+            names.add(argument.value)
+
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call) and ast.unparse(node.func) in {"os.getenv", "os.environ.get"}:
+            key = node.args[0] if node.args else next(
+                (kw.value for kw in node.keywords if kw.arg == "key"), None,
+            )
+            assert key is not None, f"missing env key at line {node.lineno}"
+            resolve(key, node)
+        elif isinstance(node, ast.Subscript) and isinstance(node.ctx, ast.Load):
+            if ast.unparse(node.value) == "os.environ":
+                resolve(node.slice, node)
+    return names
+
+
+def _assert_manifest_env(skill: Path, entrypoint: Path, poller: dict) -> None:
+    from mimir.pollers import _BUILTIN_POLLER_ENV_ALLOWLIST, _POLLER_INJECTED_ENV_KEYS
+
+    # Timeout is injected by _run_one, separately from the discovery-time keys.
+    supplied = (
+        _BUILTIN_POLLER_ENV_ALLOWLIST | _POLLER_INJECTED_ENV_KEYS
+        | {"POLLER_TIMEOUT_SECONDS"}
+        | set(poller.get("pass_env", [])) | set(poller.get("env", {}))
+    )
+    missing = _env_reads((skill / entrypoint).read_text(encoding="utf-8")) - supplied
+    assert not missing, f"{skill.name}/{poller['name']}: missing manifest env: {sorted(missing)}"
+
+
+@pytest.mark.parametrize(("skill", "entrypoint"), _ENTRYPOINTS)
+def test_poller_env_reads_are_declared(skill: Path, entrypoint: Path) -> None:
+    manifest = json.loads((skill / "pollers.json").read_text(encoding="utf-8"))
+    for poller in manifest["pollers"]:
+        if str(entrypoint) in shlex.split(poller["command"]):
+            _assert_manifest_env(skill, entrypoint, poller)
+
+
+@pytest.mark.parametrize(("skill_name", "name"), [
+    ("github-ci-watch", "GITHUB_CI_MAX_AGE_DAYS_BY_REPO"),
+    ("github-ci-watch", "GITHUB_CI_MAX_AGE_DAYS"),
+    ("worklink-tool-pins", "WORKLINK_CONFIG"),
+    ("worklink-tool-pins", "CHAINLINK_CWD"),
+    ("worklink-tool-pins", "CHAINLINK_BIN"),
+    ("chainlink-orchestrator", "CHAINLINK_BIN"),
+])
+def test_manifest_env_check_rejects_missing_passthrough(skill_name: str, name: str) -> None:
+    skill = _SKILL_ROOT / skill_name
+    poller = json.loads((skill / "pollers.json").read_text(encoding="utf-8"))["pollers"][0]
+    poller["pass_env"].remove(name)
+    with pytest.raises(AssertionError, match=name):
+        _assert_manifest_env(skill, Path("scripts/poller.py"), poller)
+
+
+@pytest.mark.parametrize("skill_name", ["worklink-tool-pins", "chainlink-orchestrator"])
+@pytest.mark.parametrize(("binary", "omit_passthrough", "expected"), [
+    pytest.param(None, False, "chainlink", id="unset"),
+    pytest.param("", False, "chainlink", id="empty"),
+    pytest.param("/custom tools/chainlink", False, "/custom tools/chainlink", id="override"),
+    pytest.param("/custom tools/chainlink", True, "chainlink", id="missing-passthrough-control"),
+])
+def test_chainlink_binary_selection_from_manifest(
+    skill_name: str, binary: str | None, omit_passthrough: bool, expected: str,
+    tmp_path: Path,
+) -> None:
+    skill = _SKILL_ROOT / skill_name
+    declared = _manifest_pass_env(skill)
+    if omit_passthrough:
+        declared.remove("CHAINLINK_BIN")
+    host_env = {"MIMIR_SOURCE_DIR": str(_ROOT)}
+    if binary is not None:
+        host_env["CHAINLINK_BIN"] = binary
+    env = {name: value for name, value in host_env.items() if name in declared}
+    # A child process owns its entire env; no host override or imported poller
+    # can mask a missing declaration or alter the binary selection.
+    proc = subprocess.run(
+        [sys.executable, "-c", (
+            "import runpy, sys; "
+            "poller = runpy.run_path(sys.argv[1]); "
+            "print(poller['_chainlink_bin']())"
+        ), str(skill / "scripts" / "poller.py")],
+        cwd=tmp_path, env=env, capture_output=True, text=True, timeout=30,
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout.strip() == expected
+
+
+def test_env_read_detection() -> None:
+    assert _env_reads('''
+import os
+os.environ.get("DIRECT", "fallback")
+os.getenv("GETENV")
+os.environ["INDEX"]
+os.environ["OUTPUT_ONLY"] = "value"
+# os.getenv("COMMENT_ONLY")
+text = 'os.environ.get("STRING_ONLY")'
+def flag(name, default=False):
+    return os.environ.get(name, default)
+flag("HELPER")
+flag(name="KEYWORD")
+''') == {"DIRECT", "GETENV", "INDEX", "HELPER", "KEYWORD"}
+    with pytest.raises(AssertionError, match="unresolved env key"):
+        _env_reads('os.environ.get(prefix + "_TOKEN")')
 
 
 @pytest.mark.parametrize("poller", _IMPORT_REPAIR_POLLERS, ids=lambda path: path.parents[1].name)

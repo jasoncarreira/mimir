@@ -1697,11 +1697,18 @@ class SagaStore:
 
         def _do():
             conn = self._ensure_conn()
+            with self._sessions_index_lock:
+                expected_dim = (
+                    self._sessions_index.dimension
+                    if self._sessions_index is not None
+                    else self._sessions_embedding_dim
+                )
             result = _reflect(
                 conn,
                 session_id=session_id,
                 channel_id=channel_id,
                 embed_fn=_embed_text_sync,
+                expected_embedding_dim=expected_dim,
                 boundary_synth_fn=_stub_synth,
                 owner_principal=owner_principal,
                 origin_channel=origin_channel,

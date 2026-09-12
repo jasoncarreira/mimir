@@ -74,7 +74,10 @@ def test_no_drift_exits_zero_silently(fresh_poller, monkeypatch, capsys):
     assert _events(capsys) == []
 
 
-def test_detected_drift_files_issue_and_emits_jsonl(fresh_poller, monkeypatch, capsys):
+@pytest.mark.parametrize("binary", [None, "", "/custom tools/chainlink"])
+def test_detected_drift_files_issue_and_emits_jsonl(fresh_poller, monkeypatch, capsys, binary):
+    if binary is not None:
+        monkeypatch.setenv("CHAINLINK_BIN", binary)
     home = Path(sys.modules["os"].environ["MIMIR_HOME"])
     _write_config(
         home,
@@ -118,7 +121,8 @@ def test_detected_drift_files_issue_and_emits_jsonl(fresh_poller, monkeypatch, c
     assert "Chainlink bump issue: #900" in events[0]["prompt"]
 
     create = calls[1]
-    assert create[:3] == ["/usr/local/bin/chainlink", "issue", "create"]
+    assert calls[0][:3] == [binary or "chainlink", "issue", "search"]
+    assert create[:3] == [binary or "chainlink", "issue", "create"]
     assert "--priority" in create and create[create.index("--priority") + 1] == "low"
     body = create[create.index("--description") + 1]
     assert "Suggested test command: codex --version && echo smoke" in body
@@ -144,7 +148,7 @@ def test_reuses_existing_issue_by_dedupe_key(fresh_poller, monkeypatch, capsys):
     def runner(cwd):
         def run(args, **kwargs):
             calls.append(args)
-            assert args[:3] == ["/usr/local/bin/chainlink", "issue", "search"]
+            assert args[:3] == ["chainlink", "issue", "search"]
             return subprocess.CompletedProcess(
                 args,
                 0,

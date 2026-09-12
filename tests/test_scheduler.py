@@ -4592,6 +4592,111 @@ async def test_fire_poller_suppressed_skips_subprocess_and_emits(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("source", ["timed", "triggered"])
+async def test_fire_poller_unknown_names_do_not_allocate_locks(tmp_path: Path, source):
+    sched = Scheduler(scheduler_yaml=tmp_path / "s.yaml", enqueue=mock.AsyncMock())
+    names = [f"unknown-{i}" for i in range(100)]
+    with mock.patch("mimir.scheduler.run_poller", new_callable=mock.AsyncMock) as run:
+        await asyncio.gather(*(
+            sched._fire_poller(poller_name=name, source=source) for name in names
+        ))
+
+    assert sched._poller_fire_locks == {}
+    run.assert_not_awaited()
+    sched._enqueue.assert_not_awaited()
+    events = _scheduler_events(tmp_path)
+    assert len(events) == len(names)
+    assert {event["poller"] for event in events} == set(names)
+    assert all(
+        event["type"] == "poller_fire_dropped"
+        and event["reason"] == "poller_not_in_registry"
+        for event in events
+    )
+
+
+@pytest.mark.asyncio
+async def test_fire_poller_registered_name_still_runs_and_reuses_lock(tmp_path: Path):
+    """Control: rejecting every fire must not satisfy the unknown-name regression."""
+    sched = Scheduler(scheduler_yaml=tmp_path / "s.yaml", enqueue=mock.AsyncMock())
+    skills = tmp_path / "skills"
+    _drop_priority_poller(skills, "p1", priority="normal")
+    sched.add_poller_jobs(skills)
+    with mock.patch("mimir.scheduler.run_poller", new_callable=mock.AsyncMock) as run:
+        await sched._fire_poller(poller_name="p1")
+        lock = sched._poller_fire_locks["p1"]
+        await sched._fire_poller(poller_name="p1", source="triggered")
+
+    assert run.await_count == 2
+    assert all(call.args[0] is sched._pollers["p1"] for call in run.await_args_list)
+    assert sched._poller_fire_locks == {"p1": lock}
+    assert not lock.locked()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("reinstall", [False, True])
+async def test_fire_poller_lock_survives_unregister_with_waiter(tmp_path: Path, reinstall):
+    sched = Scheduler(scheduler_yaml=tmp_path / "s.yaml", enqueue=mock.AsyncMock())
+    skills = tmp_path / "skills"
+    _drop_priority_poller(skills, "p1", priority="normal")
+    sched.add_poller_jobs(skills)
+    original = sched._pollers["p1"]
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    waiting = asyncio.Event()
+    calls = []
+
+    async def run(poller, **kwargs):
+        calls.append(poller)
+        if len(calls) == 1:
+            entered.set()
+            await release.wait()
+
+    async def queued_fire():
+        waiting.set()
+        await sched._fire_poller(poller_name="p1", source="triggered")
+
+    tasks = []
+    with mock.patch("mimir.scheduler.run_poller", new=run):
+        try:
+            tasks.append(asyncio.create_task(sched._fire_poller(poller_name="p1")))
+            await asyncio.wait_for(entered.wait(), timeout=5)
+            lock = sched._poller_fire_locks["p1"]
+            tasks.append(asyncio.create_task(queued_fire()))
+            await asyncio.wait_for(waiting.wait(), timeout=5)
+            assert not tasks[1].done()
+
+            sched._apply_reinstall([], [], [])
+            assert "p1" not in sched._pollers
+            await sched._fire_poller(poller_name="p1")
+            assert calls == [original]
+            assert sched._poller_fire_locks["p1"] is lock
+
+            if reinstall:
+                sched.add_poller_jobs(skills)
+                assert sched._pollers["p1"] is not original
+                waiting.clear()
+                tasks.append(asyncio.create_task(queued_fire()))
+                await asyncio.wait_for(waiting.wait(), timeout=5)
+                assert not tasks[-1].done()
+                assert calls == [original]
+                assert sched._poller_fire_locks["p1"] is lock
+
+            release.set()
+            await asyncio.wait_for(asyncio.gather(*tasks), timeout=5)
+        finally:
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+    assert calls == ([original, sched._pollers["p1"], sched._pollers["p1"]]
+                     if reinstall else [original])
+    assert not lock.locked()
+    dropped = [e for e in _scheduler_events(tmp_path) if e["type"] == "poller_fire_dropped"]
+    assert len(dropped) == (1 if reinstall else 2)
+    assert all(e["reason"] == "poller_not_in_registry" for e in dropped)
+
+
+@pytest.mark.asyncio
 async def test_triggered_poller_is_arbiter_gated_and_observable(tmp_path: Path, monkeypatch):
     from mimir.event_logger import init_logger
 

@@ -13,6 +13,9 @@ from __future__ import annotations
 
 import asyncio
 import errno
+import fcntl
+import hashlib
+import importlib.util
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 import json
@@ -52,6 +55,8 @@ from mimir.pollers import (
     _github_recovery_relevance_check,
     _kill_process_group,
     _parse_poller_authority,
+    _prune_delivery_receipts,
+    _write_delivery_receipt,
     discover_pollers,
     GITHUB_TRUST_ATTEMPTS_PER_FIRE,
     run_poller,
@@ -3854,6 +3859,476 @@ print(json.dumps({"poller": "x", "prompt": "repair", "delivery_key": "ci:key"}))
 
     receipts = list((persist_dir / ".delivery-receipts").glob("*"))
     assert len(receipts) == int(accepted)
+
+
+@pytest.fixture
+def worklink_receipts(home: Path):
+    from mimir.worklink import dispatch_failures as failures
+
+    state = failures.dispatch_failure_state_dir(home)
+    cfg = PollerConfig("worklink-ready-queue", "true", "* * * * *", {}, home, state)
+
+    def record(issue=42, error="failed"):
+        entry = failures.record_failure(
+            state, issue_id=issue, attempt=1, exit_status=1, error=error, log_path=None,
+        )
+        key = f"worklink-run-failure:{issue}:{entry['signature']}:{entry['occurrence_id']}"
+        _write_delivery_receipt(state, key)
+        path = state / ".delivery-receipts" / hashlib.sha256(key.encode()).hexdigest()
+        return entry, key, path
+
+    return failures, state, cfg, record
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("exit_code", [0, 1])
+async def test_worklink_receipt_pruning_requires_clean_exit(home: Path, worklink_receipts, exit_code):
+    failures, state, cfg, record = worklink_receipts
+    entry, _, receipt = record()
+    failures.mark_failure_notified(state, 42, entry["signature"], entry["occurrence_id"])
+    await run_poller(
+        replace(cfg, command=f"exit {exit_code}"), enqueue=_CapturingEnqueue(), home=home,
+    )
+    assert receipt.exists() is bool(exit_code)
+
+
+@pytest.mark.parametrize("name", ["github-activity", "other"])
+def test_receipt_pruning_is_worklink_only(home: Path, worklink_receipts, name):
+    failures, state, cfg, record = worklink_receipts
+    entry, _, receipt = record()
+    failures.mark_failure_notified(state, 42, entry["signature"], entry["occurrence_id"])
+    _prune_delivery_receipts(replace(cfg, name=name), home)
+    assert receipt.exists()
+    _prune_delivery_receipts(cfg, home)
+    assert not receipt.exists()
+
+
+@pytest.mark.asyncio
+async def test_worklink_receipt_growth_reclaimed_without_replaying_acknowledged_failures(
+    home: Path, worklink_receipts,
+):
+    failures, state, cfg, record = worklink_receipts
+    # Reproduce many occurrence receipts with only the last occurrence in the
+    # ledger. Include legacy empty receipts, not a new metadata-only format.
+    obsolete = [record(error=f"failure {index}")[2] for index in range(40)]
+    entry, _, acknowledged = record(error="acknowledged")
+    failures.mark_failure_notified(state, 42, entry["signature"], entry["occurrence_id"])
+    pending, pending_key, pending_path = record(issue=43)
+    os.utime(pending_path, (1, 1))
+    continuations = home / "state/worklink/continuations"
+    continuations.mkdir(parents=True)
+    protected = {pending_path}
+    for identity in ("pending", "actioned"):
+        (continuations / f"{identity}.json").write_text(json.dumps({
+            "kind": "worklink_tool_budget_continuation", "idempotency_key": identity,
+            "actioned_at": "2020-01-01T00:00:00Z" if identity == "actioned" else None,
+        }))
+        key = f"worklink-continuation:{identity}"
+        _write_delivery_receipt(state, key)
+        protected.add(state / ".delivery-receipts" / hashlib.sha256(key.encode()).hexdigest())
+
+    await run_poller(cfg, enqueue=_CapturingEnqueue(), home=home)
+
+    assert set((state / ".delivery-receipts").iterdir()) == protected
+    assert not acknowledged.exists()
+    assert not any(path.exists() for path in obsolete)
+    _, alerts = failures.pending_failure_alerts(state)
+    assert [alert["issue_id"] for alert in alerts] == [43]
+    assert failures.delivery_receipt_exists(state, pending_key)
+    # The actual consumer's existing acknowledgement transaction takes over
+    # dedupe before the last current failure receipt can be reclaimed.
+    failures.mark_failure_notified(state, 43, pending["signature"], pending["occurrence_id"])
+    _prune_delivery_receipts(cfg, home)
+    assert not pending_path.exists()
+    assert failures.pending_failure_alerts(state)[1] == []
+
+
+@pytest.fixture
+def worklink_receipt_consumer(monkeypatch):
+    path = Path(__file__).parents[1] / "mimir/optional-skills/chainlink-orchestrator/scripts/poller.py"
+    spec = importlib.util.spec_from_file_location("_receipt_worklink_consumer_test", path)
+    consumer = importlib.util.module_from_spec(spec)
+    monkeypatch.setitem(sys.modules, spec.name, consumer)
+    # This script owns import-path repair. Keep that mutation local to the test.
+    monkeypatch.setattr(sys, "path", sys.path.copy())
+    spec.loader.exec_module(consumer)
+    return consumer
+
+
+def test_worklink_receipt_pruning_preserves_barrier_crash_window_and_negative_control(
+    home: Path, worklink_receipts, worklink_receipt_consumer, monkeypatch,
+):
+    failures, state, cfg, record = worklink_receipts
+    _, _, receipt = record()
+    # Child died after observing the receipt but before persisting notification.
+    os.utime(receipt, (1, 1))
+    _prune_delivery_receipts(cfg, home)
+    assert receipt.exists()
+    consumer = worklink_receipt_consumer
+    emitted = []
+    monkeypatch.setattr(consumer, "_emit", emitted.append)
+    budget = SimpleNamespace(hard_exhausted=lambda: True)
+    ledger = (state / failures.STATE_FILE).read_bytes()
+    assert consumer._deliver_failure_alerts(state, failures.pending_failure_alerts(state)[1], budget)
+    assert emitted == []
+    assert failures.pending_failure_alerts(state)[1] == []
+
+    # Negative control: deleting the receipt while the cursor is still in the
+    # crash window makes the real consumer emit the same occurrence again.
+    (state / failures.STATE_FILE).write_bytes(ledger)
+    receipt.unlink()
+    assert not consumer._deliver_failure_alerts(state, failures.pending_failure_alerts(state)[1], budget)
+    assert len(emitted) == 1
+    assert emitted[0]["delivery_barrier"] is True
+
+
+@pytest.mark.parametrize("ancestor", ["state", "pollers", "worklink-ready-queue"])
+def test_worklink_receipt_pruning_refuses_symlinked_ancestry(
+    home: Path, worklink_receipts, ancestor: str,
+):
+    failures, state, cfg, record = worklink_receipts
+    entry, _, obsolete = record()
+    failures.mark_failure_notified(state, 42, entry["signature"], entry["occurrence_id"])
+    continuations = home / "state/worklink/continuations"
+    continuations.mkdir(parents=True)
+    (continuations / "live.json").write_text(json.dumps({
+        "kind": "worklink_tool_budget_continuation", "idempotency_key": "live",
+    }))
+    key = "worklink-continuation:live"
+    _write_delivery_receipt(state, key)
+    alias = {"state": home / "state", "pollers": state.parent, "worklink-ready-queue": state}[ancestor]
+    target = home / "relocated"
+    alias.rename(target)
+    alias.symlink_to(target, target_is_directory=True)
+    # Reproduce discovery's resolved persist_dir with a lexical authoritative home.
+    _prune_delivery_receipts(replace(cfg, persist_dir=state.resolve()), home)
+    assert failures.delivery_receipt_exists(state, key)
+    assert obsolete.exists(), "ambiguous ancestry must skip the entire sweep"
+
+
+def test_worklink_receipt_pruning_skips_contended_lock(
+    home: Path, worklink_receipts, monkeypatch,
+):
+    failures, state, cfg, record = worklink_receipts
+    entry, _, receipt = record()
+    failures.mark_failure_notified(state, 42, entry["signature"], entry["occurrence_id"])
+    with (state / f"{failures.STATE_FILE}.lock").open("a") as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        flock = fcntl.flock
+
+        def nonblocking_only(fd, operation):
+            assert operation == fcntl.LOCK_EX | fcntl.LOCK_NB
+            return flock(fd, operation)
+
+        with monkeypatch.context() as patch:
+            patch.setattr("mimir.pollers.fcntl.flock", nonblocking_only)
+            _prune_delivery_receipts(cfg, home)
+        assert receipt.exists()
+    _prune_delivery_receipts(cfg, home)
+    assert not receipt.exists(), "uncontended cleanup must still run"
+
+
+@pytest.mark.parametrize("transition", [
+    "acknowledged", "superseded", "succeeded", "same-signature", "signature-only", "missing",
+])
+def test_worklink_stale_alert_snapshot_not_reemitted_after_receipt_pruning(
+    home: Path, worklink_receipts, worklink_receipt_consumer, monkeypatch, transition,
+):
+    failures, state, cfg, record = worklink_receipts
+    entry, _, receipt = record()
+    snapshot = failures.pending_failure_alerts(state)[1]
+    if transition == "acknowledged":
+        failures.mark_failure_notified(state, 42, entry["signature"], entry["occurrence_id"])
+    elif transition == "superseded":
+        record(error="new failure")
+    elif transition == "same-signature":
+        record()
+    elif transition in {"signature-only", "missing"}:
+        with failures.failure_state_transaction(state) as ledger:
+            if transition == "missing":
+                ledger["issues"].clear()
+            else:
+                # Defense in depth against corrupt state: normal producers
+                # always allocate a new occurrence when changing the signature.
+                ledger["issues"]["42"]["signature"] = "changed-without-new-occurrence"
+    else:
+        failures.record_success(state, 42)
+    _prune_delivery_receipts(cfg, home)
+    assert not receipt.exists()
+    emitted = Mock()
+    monkeypatch.setattr(worklink_receipt_consumer, "_emit", emitted)
+    budget = SimpleNamespace(hard_exhausted=lambda: pytest.fail("stale snapshot entered wait"))
+    assert worklink_receipt_consumer._deliver_failure_alerts(state, snapshot, budget)
+    emitted.assert_not_called()
+
+
+def test_worklink_emission_is_locked_but_wait_releases_lock_and_revalidates(
+    home: Path, worklink_receipts, worklink_receipt_consumer, monkeypatch,
+):
+    failures, state, cfg, record = worklink_receipts
+    entry, key, receipt = record()
+    receipt.unlink()
+    alerts = failures.pending_failure_alerts(state)[1]
+    emitted = []
+    lock_path = state / f"{failures.STATE_FILE}.lock"
+
+    def emit(alert):
+        with lock_path.open("a") as probe:
+            with pytest.raises(BlockingIOError):
+                fcntl.flock(probe.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        emitted.append(alert)
+
+    def begin_wait():
+        # A competing process can acknowledge and prune between emission and
+        # the receipt check. The waiter must finish from the updated cursor.
+        with lock_path.open("a") as probe:
+            fcntl.flock(probe.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        _write_delivery_receipt(state, key)
+        failures.mark_failure_notified(state, 42, entry["signature"], entry["occurrence_id"])
+        _prune_delivery_receipts(cfg, home)
+        assert not receipt.exists()
+        return False
+
+    monkeypatch.setattr(worklink_receipt_consumer, "_emit", emit)
+    budget = SimpleNamespace(
+        hard_exhausted=begin_wait,
+        hard_remaining=lambda: pytest.fail("acknowledged cursor did not finish the wait"),
+    )
+    assert worklink_receipt_consumer._deliver_failure_alerts(state, alerts, budget)
+    assert len(emitted) == 1
+
+
+@pytest.mark.parametrize("broken", [
+    "missing-ledger", "malformed-ledger", "invalid-entry", "ledger-symlink",
+    "malformed-sidecar", "sidecar-symlink", "worklink-symlink", "receipts-symlink", "fsync",
+])
+def test_worklink_receipt_pruning_fails_closed(home: Path, worklink_receipts, monkeypatch, broken):
+    failures, state, cfg, record = worklink_receipts
+    entry, _, receipt = record()
+    failures.mark_failure_notified(state, 42, entry["signature"], entry["occurrence_id"])
+    ledger = state / failures.STATE_FILE
+    if broken == "missing-ledger":
+        ledger.unlink()
+    elif broken == "malformed-ledger":
+        ledger.write_text("{")
+    elif broken == "invalid-entry":
+        ledger.write_text('{"version": 1, "issues": {"42": {}}}')
+    elif broken == "ledger-symlink":
+        target = home / "ledger.json"
+        ledger.rename(target)
+        ledger.symlink_to(target)
+    elif broken in {"malformed-sidecar", "sidecar-symlink"}:
+        directory = home / "state/worklink/continuations"
+        directory.mkdir(parents=True)
+        sidecar = directory / "pending.json"
+        if broken == "malformed-sidecar":
+            sidecar.write_text("{")
+        else:
+            target = home / "sidecar.json"
+            target.write_text('{"kind": "worklink_tool_budget_continuation", "idempotency_key": "pending"}')
+            sidecar.symlink_to(target)
+    elif broken == "worklink-symlink":
+        outside = home / "outside"
+        outside.mkdir()
+        (state.parent.parent / "worklink").symlink_to(outside, target_is_directory=True)
+    elif broken == "receipts-symlink":
+        outside = home / "outside"
+        receipt.parent.rename(outside)
+        (state / ".delivery-receipts").symlink_to(outside, target_is_directory=True)
+        receipt = outside / receipt.name
+    else:
+        monkeypatch.setattr("mimir.pollers.os.fsync", Mock(side_effect=OSError("disk error")))
+    _prune_delivery_receipts(cfg, home)
+    assert receipt.exists()
+
+
+def test_worklink_receipt_acknowledgement_failure_and_stale_occurrence_remain_safe(
+    home: Path, worklink_receipts, monkeypatch,
+):
+    failures, state, cfg, record = worklink_receipts
+    old, _, obsolete = record()
+    current, key, receipt = record()
+    failures.mark_failure_notified(state, 42, old["signature"], old["occurrence_id"])
+    with monkeypatch.context() as patch:
+        patch.setattr(failures, "save_failure_state", Mock(side_effect=OSError("disk full")))
+        with pytest.raises(OSError):
+            failures.mark_failure_notified(state, 42, current["signature"], current["occurrence_id"])
+    _prune_delivery_receipts(cfg, home)
+    assert not obsolete.exists()
+    assert receipt.exists()
+    assert failures.delivery_receipt_exists(state, key)
+    assert len(failures.pending_failure_alerts(state)[1]) == 1
+
+
+def test_worklink_receipt_pruning_excludes_receipts_created_during_sweep(
+    home: Path, worklink_receipts, monkeypatch,
+):
+    failures, state, cfg, record = worklink_receipts
+    entry, _, obsolete = record()
+    failures.mark_failure_notified(state, 42, entry["signature"], entry["occurrence_id"])
+    load = json.load
+    key = "worklink-continuation:concurrently-created"
+    created = []
+    removed = []
+    unlink = os.unlink
+
+    def load_with_new_receipt(handle):
+        payload = load(handle)
+        if not created:
+            _write_delivery_receipt(state, key)
+            created.append(key)
+        return payload
+
+    def observed_unlink(name, **kwargs):
+        removed.append(name)
+        return unlink(name, **kwargs)
+
+    monkeypatch.setattr("mimir.pollers.json.load", load_with_new_receipt)
+    monkeypatch.setattr("mimir.pollers.os.unlink", observed_unlink)
+    _prune_delivery_receipts(cfg, home)
+    assert created == [key]
+    assert hashlib.sha256(key.encode()).hexdigest() not in removed
+    assert not obsolete.exists()
+    assert failures.delivery_receipt_exists(state, key)
+
+
+def test_worklink_receipt_pruning_requires_matching_scope(home: Path, worklink_receipts):
+    failures, state, cfg, record = worklink_receipts
+    entry, _, receipt = record()
+    failures.mark_failure_notified(state, 42, entry["signature"], entry["occurrence_id"])
+    wrong = home / "unrelated"
+    wrong.mkdir()
+    _prune_delivery_receipts(replace(cfg, persist_dir=wrong), home)
+    assert receipt.exists(), "a mismatched config must not authorize cleanup in home"
+    _prune_delivery_receipts(cfg, home)
+    assert not receipt.exists()
+
+
+@pytest.mark.parametrize("target", ["lock", "continuations"])
+def test_worklink_receipt_pruning_refuses_additional_symlinks(home: Path, worklink_receipts, target):
+    failures, state, cfg, record = worklink_receipts
+    entry, _, receipt = record()
+    failures.mark_failure_notified(state, 42, entry["signature"], entry["occurrence_id"])
+    if target == "lock":
+        path = state / f"{failures.STATE_FILE}.lock"
+    else:
+        path = home / "state/worklink/continuations"
+        path.mkdir(parents=True)
+    outside = home / "outside"
+    path.rename(outside)
+    path.symlink_to(outside, target_is_directory=target == "continuations")
+    _prune_delivery_receipts(cfg, home)
+    assert receipt.exists()
+
+
+def test_worklink_receipt_pruning_only_deletes_receipt_files(home: Path, worklink_receipts):
+    failures, state, cfg, record = worklink_receipts
+    entry, _, receipt = record()
+    failures.mark_failure_notified(state, 42, entry["signature"], entry["occurrence_id"])
+    directory = receipt.parent
+    outside = home / "outside"
+    outside.touch()
+    link = directory / ("a" * 64)
+    link.symlink_to(outside)
+    note = directory / "operator-note"
+    note.touch()
+    _prune_delivery_receipts(cfg, home)
+    assert not receipt.exists()
+    assert link.is_symlink()
+    assert outside.exists()
+    assert note.exists()
+
+
+@pytest.mark.parametrize("target", ["ledger", "sidecar"])
+def test_worklink_receipt_pruning_never_parses_nonregular_files(
+    home: Path, worklink_receipts, monkeypatch, target,
+):
+    failures, state, cfg, record = worklink_receipts
+    entry, _, receipt = record()
+    failures.mark_failure_notified(state, 42, entry["signature"], entry["occurrence_id"])
+    if target == "ledger":
+        path = state / failures.STATE_FILE
+        path.unlink()
+    else:
+        path = home / "state/worklink/continuations/pending.json"
+        path.parent.mkdir(parents=True)
+    os.mkfifo(path)
+    load = json.load
+    parsed = []
+
+    def regular_only(handle):
+        parsed.append(stat.S_ISREG(os.fstat(handle.fileno()).st_mode))
+        return load(handle)
+
+    monkeypatch.setattr("mimir.pollers.json.load", regular_only)
+    _prune_delivery_receipts(cfg, home)
+    assert all(parsed), "nonregular input reached the JSON reader"
+    assert receipt.exists()
+
+
+@pytest.mark.parametrize("invalid", [
+    "version", "issues", "entry-type", "issue-id", "signature-type", "signature-empty",
+    "active", "notified-type", "notified-member", "occurrence", "sidecar-kind", "sidecar-key",
+])
+def test_worklink_receipt_pruning_validates_complete_state(home: Path, worklink_receipts, invalid):
+    failures, state, cfg, record = worklink_receipts
+    entry, _, receipt = record()
+    failures.mark_failure_notified(state, 42, entry["signature"], entry["occurrence_id"])
+    path = state / failures.STATE_FILE
+    ledger = json.loads(path.read_text())
+    if invalid == "version":
+        ledger["version"] = 2
+    elif invalid == "issues":
+        ledger["issues"] = []
+    elif invalid == "entry-type":
+        ledger["issues"]["42"] = []
+    elif invalid.startswith("sidecar-"):
+        sidecar = {"kind": "worklink_tool_budget_continuation", "idempotency_key": "pending"}
+        sidecar["kind" if invalid == "sidecar-kind" else "idempotency_key"] = 42
+        sidecar_path = home / "state/worklink/continuations/pending.json"
+        sidecar_path.parent.mkdir(parents=True)
+        sidecar_path.write_text(json.dumps(sidecar))
+    else:
+        field, value = {
+            "issue-id": ("issue_id", True), "signature-type": ("signature", 42),
+            "signature-empty": ("signature", ""), "active": ("active", None),
+            "notified-type": ("notified_signatures", {entry["signature"]: True}),
+            "notified-member": ("notified_signatures", [entry["signature"], None]),
+            "occurrence": ("occurrence_id", 42),
+        }[invalid]
+        ledger["issues"]["42"][field] = value
+    path.write_text(json.dumps(ledger))
+    _prune_delivery_receipts(cfg, home)
+    assert receipt.exists()
+
+
+@pytest.mark.parametrize("fail_at", [None, "ledger", "state-root"])
+def test_worklink_receipt_pruning_syncs_evidence_before_deletion(
+    home: Path, worklink_receipts, monkeypatch, fail_at,
+):
+    failures, state, cfg, record = worklink_receipts
+    entry, _, receipt = record()
+    failures.mark_failure_notified(state, 42, entry["signature"], entry["occurrence_id"])
+    names = {path.stat().st_ino: name for name, path in (
+        ("ledger", state / failures.STATE_FILE), ("state-root", state), ("receipts", receipt.parent),
+    )}
+    fsync = os.fsync
+    synced = []
+
+    def sync(fd):
+        name = names[os.fstat(fd).st_ino]
+        if name == fail_at:
+            raise OSError("simulated durability failure")
+        synced.append(name)
+        fsync(fd)
+
+    monkeypatch.setattr("mimir.pollers.os.fsync", sync)
+    _prune_delivery_receipts(cfg, home)
+    if fail_at:
+        assert receipt.exists()
+    else:
+        assert not receipt.exists()
+        assert synced == ["ledger", "state-root", "receipts"]
 
 
 def _observe_poller_barrier(monkeypatch):

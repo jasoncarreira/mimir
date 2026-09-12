@@ -48,6 +48,7 @@ from mimir.worklink.dispatch_failures import (
     POLLER_NAME,
     delivery_receipt_exists,
     dispatch_failure_state_dir,
+    failure_state_transaction,
     mark_failure_notified,
     pending_failure_alerts,
 )
@@ -400,36 +401,58 @@ def _deliver_failure_alerts(
     tick_budget: TickBudget,
 ) -> bool:
     """Emit alerts and wait for the framework's durable delivery barriers."""
+    def still_pending(state, alert):
+        entry = state["issues"].get(str(alert["issue_id"]))
+        return (
+            isinstance(entry, dict)
+            and entry.get("active") is True
+            and entry.get("signature") == alert["error_signature"]
+            and entry.get("occurrence_id") == alert["failure_occurrence_id"]
+            and alert["error_signature"] not in (entry.get("notified_signatures") or [])
+        )
+
     pending: dict[str, dict[str, object]] = {}
     for alert in alerts:
         delivery_key = (
             f"worklink-run-failure:{alert['issue_id']}:"
             f"{alert['error_signature']}:{alert['failure_occurrence_id']}"
         )
-        if delivery_receipt_exists(state_dir, delivery_key):
+        # The supplied alert list is only a snapshot. Revalidate under the
+        # janitor/writer lock and keep it through receipt check and emission;
+        # an acknowledged receipt may already have been reclaimed.
+        with failure_state_transaction(state_dir) as state:
+            if not still_pending(state, alert):
+                continue
+            delivered = delivery_receipt_exists(state_dir, delivery_key)
+            if not delivered:
+                alert["delivery_key"] = delivery_key
+                alert["delivery_barrier"] = True
+                _emit(alert)
+                pending[delivery_key] = alert
+        if delivered:
             mark_failure_notified(
                 state_dir,
                 int(alert["issue_id"]),
                 str(alert["error_signature"]),
-                str(alert["failure_occurrence_id"]),
+                alert["failure_occurrence_id"],
             )
-            continue
-        alert["delivery_key"] = delivery_key
-        alert["delivery_barrier"] = True
-        _emit(alert)
-        pending[delivery_key] = alert
 
     while pending and not tick_budget.hard_exhausted():
-        acknowledged = [
-            key for key in pending if delivery_receipt_exists(state_dir, key)
-        ]
+        # Never hold the ledger lock while waiting for framework acknowledgement.
+        # Another consumer may acknowledge and prune before this waiter observes
+        # the receipt, so the cursor is also a terminal condition for the wait.
+        with failure_state_transaction(state_dir) as state:
+            acknowledged = [
+                key for key, alert in pending.items()
+                if not still_pending(state, alert) or delivery_receipt_exists(state_dir, key)
+            ]
         for key in acknowledged:
             alert = pending.pop(key)
             mark_failure_notified(
                 state_dir,
                 int(alert["issue_id"]),
                 str(alert["error_signature"]),
-                str(alert["failure_occurrence_id"]),
+                alert["failure_occurrence_id"],
             )
         if pending:
             time.sleep(min(0.05, max(0.0, tick_budget.hard_remaining())))

@@ -15,6 +15,8 @@
       "pass_env": [
         "GITHUB_TOKEN",
         "GITHUB_REPOS",
+        "GITHUB_CI_MAX_AGE_DAYS_BY_REPO",
+        "GITHUB_CI_MAX_AGE_DAYS",
         "MIMIR_HOME",
         "MIMIR_SOURCE_DIR"
       ]

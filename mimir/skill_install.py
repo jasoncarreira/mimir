@@ -44,6 +44,7 @@ import re
 import shutil
 import subprocess
 import sys
+import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -298,20 +299,30 @@ def install(
     # re-raise on failure; dest is never touched until the copy fully succeeds.
     # Mirrors refresh_builtin_skills. symlinks=True preserves in-bundle links
     # instead of dereferencing their contents (#500); escaping links were
-    # rejected above.
+    # rejected above. Keep the old directory until integrity recording succeeds:
+    # the recorder needs the final path, so a failed record must roll it back.
     tmp = dest_root / f"{name}.tmp"
     if tmp.exists():
         shutil.rmtree(tmp, ignore_errors=True)
+    backup = None
+    published = False
     try:
         shutil.copytree(src, tmp, ignore=_ignore, symlinks=True)
         if dest.exists():
-            rmtree_missing_ok(dest)
+            backup = dest.rename(dest_root / f".{name}.{uuid.uuid4().hex}.bak")
         tmp.rename(dest)
+        published = True
         if not record_admin_installed_skill_integrity(home, dest):
             raise OSError(f"failed to record trusted skill integrity for {dest}")
     except BaseException:
         shutil.rmtree(tmp, ignore_errors=True)
+        if published:
+            rmtree_missing_ok(dest)
+        if backup is not None:
+            backup.rename(dest)
         raise
+    if backup is not None:
+        rmtree_missing_ok(backup)
 
     return InstallResult(
         name=name,

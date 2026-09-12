@@ -2328,6 +2328,15 @@ class Scheduler:
         trigger_reason: str | None = None,
     ) -> None:
         """Serialize timed and completion-triggered fires for one poller."""
+        if poller_name not in self._pollers:
+            await log_event(
+                "poller_fire_dropped",
+                poller=poller_name,
+                reason="poller_not_in_registry",
+            )
+            return
+        # No await between admission and allocation. Keep existing locks across
+        # reloads: replacing one could split active holders and queued waiters.
         lock = self._poller_fire_locks.setdefault(poller_name, asyncio.Lock())
         async with lock:
             await log_event(
