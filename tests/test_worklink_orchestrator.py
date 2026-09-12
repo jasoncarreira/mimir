@@ -1842,6 +1842,38 @@ def test_publication_fence_failures_and_retry(tmp_path: Path, monkeypatch, failu
         assert len(publications) == 2  # one rejected request, one successful PR
 
 
+def test_publication_fence_accepts_missing_evidence_directory(tmp_path: Path) -> None:
+    from mimir.worklink.orchestrator import _leaf_publication
+
+    evidence_dir = tmp_path / "state/worklink/evidence"
+    assert not evidence_dir.exists()
+    with _leaf_publication(tmp_path, 441, 1):
+        assert evidence_dir.is_dir()
+        assert (tmp_path / "state/worklink/publications/441.json").is_file()
+    assert not (tmp_path / "state/worklink/publications/441.json").exists()
+
+
+def test_first_publication_creates_evidence_directory(tmp_path: Path) -> None:
+    """A fresh home must publish on attempt one, without seeded evidence."""
+    repo = tmp_path / "repo"
+    worktree = repo.parent / ".worklink" / repo.name / "441-1"
+    calls, runner = _orchestrator_runner(repo, worktree)
+    evidence_dir = tmp_path / "state/worklink/evidence"
+    assert not evidence_dir.exists()
+    registry = BackendRegistry(WorklinkConfig())
+    registry.register(FakeBackend())
+    result = asyncio.run(WorklinkRunner(
+        home=tmp_path, repo=repo, runner=runner, registry=registry,
+    ).run(441, backend_name="fake", test_command="echo ok"))
+    assert result.status == "completed", result.reason
+    assert sum(c[:3] == ["gh", "pr", "create"] for c in calls if isinstance(c, list)) == 1
+    evidence = json.loads((evidence_dir / "441-1.json").read_text())
+    assert evidence["status"] == "completed"
+    assert evidence["pr_url"] == result.pr_url
+    assert result.pr_url
+    assert not (tmp_path / "state/worklink/publications/441.json").exists()
+
+
 def test_publication_fence_reads_older_completed_evidence(tmp_path: Path) -> None:
     """Late replacement passes latest-only admission, but cannot publish."""
     repo = tmp_path / "repo"

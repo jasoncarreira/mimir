@@ -3756,6 +3756,7 @@ def _leaf_publication(home: Path, issue_id: int, attempt: int) -> Iterator[_Publ
         # Admission's latest-only check is insufficient for an already-admitted
         # replacement whose newer, pre-publication evidence masks the original.
         evidence_dir = home / "state" / "worklink" / "evidence"
+        evidence_dir.mkdir(parents=True, exist_ok=True)
         for evidence_path in evidence_dir.iterdir():
             if not re.fullmatch(rf"{issue_id}-\d+\.json", evidence_path.name):
                 continue
