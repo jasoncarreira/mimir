@@ -335,9 +335,13 @@ When `mcpServers` is missing or empty, the local proxy injects one locally hoste
 
 An authenticated, non-service admin on a live user turn can ask Mimir to call
 `clear_ingest_taint`. It durably audits and acknowledges only the current ingest
-snapshot for the ACP permission prompt, allowing an existing session grant to
-apply again. It does **not** clear source labels, declassify data, grant execution
-permission, or change sink and durable-memory decisions. Later untrusted active
+snapshot for the ACP permission prompt. Acknowledging untrusted ingest revokes
+existing wrapper session grants, even if no permission request occurred while
+tainted. The next call requires a fresh human response; choosing `allow_session`
+there enables reuse again until another acknowledgement or session reset.
+Clearing alone cannot restore a grant. It does **not** clear source labels,
+declassify data, grant execution permission, or change sink and durable-memory
+decisions. Later untrusted active
 ingest, including rereading the same source, re-arms the prompt. See
 [ingest acknowledgement](authorization.md#ingest-acknowledgement) for eligibility
 and audit failure behavior.

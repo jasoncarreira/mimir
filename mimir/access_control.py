@@ -7045,6 +7045,13 @@ def clear_live_ingest_taint(
                 source_count=len(sources),
                 authenticated_admin={"principal": principal, "canonical_principal": canonical},
             )
+            if sources and auth_context.origin_trigger == "acp_session":
+                from .tools.client_provider import get_turn_capability_context
+
+                # Publish the boundary before clearing, including when no more
+                # permission requests occur in this turn. Failure leaves taint.
+                context = get_turn_capability_context()
+                context.permission_broker.acknowledge_ingest()
         except Exception:
             log.warning("ifc ingest taint clear audit failed")
             return False

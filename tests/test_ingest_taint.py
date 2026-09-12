@@ -4,6 +4,7 @@ import asyncio
 import json
 import time
 from dataclasses import replace
+from types import SimpleNamespace
 
 import pytest
 
@@ -133,6 +134,41 @@ def test_clear_only_affects_permission_taint_and_repeats(live_turn):
         assert state.permission_has_untrusted_active_ingest()
     state.merge(InformationFlowLabels().with_source(replace(original.sources[0], resource_id="new")))
     assert state.permission_has_untrusted_active_ingest()
+
+
+@pytest.mark.parametrize("current", [True, False])
+def test_acp_clear_publishes_session_boundary_before_untainting(live_turn, monkeypatch, current):
+    from mimir.acp.agent import ActivePrompt
+
+    session = SimpleNamespace(ingest_acknowledgement=None)
+    active = SimpleNamespace(session=session, _is_current=lambda: current)
+    broker = SimpleNamespace(acknowledge_ingest=lambda: ActivePrompt.acknowledge_ingest(active))
+    monkeypatch.setattr(
+        "mimir.tools.client_provider.get_turn_capability_context",
+        lambda: SimpleNamespace(permission_broker=broker),
+    )
+    auth = replace(live_turn.auth_context, origin_trigger="acp_session")
+    live_turn.auth_context = auth
+    result = access_control.clear_live_ingest_taint(auth, turn_id=live_turn.turn_id)
+    assert result[0] is current
+    assert auth.ifc_state.permission_has_untrusted_active_ingest() is not current
+    boundary = session.ingest_acknowledgement
+    if current:
+        assert isinstance(boundary, str) and len(boundary) == 32
+        assert access_control.clear_live_ingest_taint(auth, turn_id=live_turn.turn_id)[0]
+        assert session.ingest_acknowledgement == boundary  # No-op clears retain consent.
+    else:
+        assert boundary is None
+
+
+def test_acp_clear_without_broker_keeps_taint(live_turn, monkeypatch):
+    monkeypatch.setattr("mimir.tools.client_provider.get_turn_capability_context", lambda: None)
+    auth = replace(live_turn.auth_context, origin_trigger="acp_session")
+    live_turn.auth_context = auth
+    assert access_control.clear_live_ingest_taint(auth, turn_id=live_turn.turn_id) == (
+        False, "clear_failed",
+    )
+    assert auth.ifc_state.permission_has_untrusted_active_ingest()
 
 
 def test_clear_requires_labels_and_snapshot_match():

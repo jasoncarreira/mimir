@@ -2683,7 +2683,7 @@ async def test_permission_outcome_after_trusted_cwd_read(
 
 
 @pytest.mark.parametrize("wrapper", ["hands_edit", "hands_shell", "hands_python"])
-async def test_admin_clear_restores_proxy_session_grant_until_later_ingest(
+async def test_model_clear_requires_fresh_proxy_session_grant_after_ingest(
     tmp_path: Path, middleware_event_logger: None, wrapper: str,
 ) -> None:
     from langchain.agents.middleware import ToolCallRequest
@@ -2719,12 +2719,15 @@ async def test_admin_clear_restores_proxy_session_grant_until_later_ingest(
                 "method": "session/request_permission",
                 "params": sdk.permission_request_params(session_id, snapshot),
             })
-            if snapshot.tainted:
+            if request_id in (1, 2, 4, 5, 7):
                 assert client_wire.messages[-1]["id"] == request_id
                 await router.route_client({
                     "jsonrpc": "2.0", "id": request_id,
-                    "result": {"outcome": {"outcome": "selected", "optionId": "allow_once"}},
+                    "result": {"outcome": {"outcome": "selected", "optionId":
+                        "allow_once" if request_id == 4 else "allow_session"}},
                 })
+            else:
+                assert client_wire.messages[-1]["id"] != request_id
             assert daemon_wire.messages[-1]["id"] == request_id
             return sdk.PermissionCompletion.from_response(daemon_wire.messages[-1]["result"])
 
@@ -2735,14 +2738,17 @@ async def test_admin_clear_restores_proxy_session_grant_until_later_ingest(
     await agent.authenticate("mimir-web-key", **{"mimir.webKey": "secret"})
     session_id = (await agent.new_session(str(tmp_path), mcp_servers=_hands("server"))).session_id
     router._active_sessions.add(session_id)
-    router._grants.add(session_id, wrapper)
     arguments = {
         "hands_edit": {"path": "/private/notes.txt", "old_text": "old", "new_text": "new"},
         "hands_shell": {"command": "private command"},
         "hands_python": {"code": "private_value = 1"},
     }[wrapper]
 
+    turn_count = 0
+
     async def integrated_turn(event: Any, **kwargs: Any) -> None:
+        nonlocal turn_count
+        turn_count += 1
         labels = _initialize_ifc_labels(event, resolver=bundle.core.identity_resolver)
         state = InformationFlowState(labels=labels)
         ingest = InformationFlowLabels().with_source(SourceLabel(
@@ -2750,7 +2756,6 @@ async def test_admin_clear_restores_proxy_session_grant_until_later_ingest(
             bridge_instance=None, sensitivity="public", source_kind="protected_tool",
             integrity=Integrity.UNTRUSTED, integrity_effect=IntegrityEffect.ACTIVE_INGEST,
         ))
-        state.merge(ingest)
         auth = dataclasses.replace(
             event.continuation_auth_context, interactivity=TurnInteractivity.INTERACTIVE,
             ifc_labels=labels, ifc_state=state, saga_session_id=kwargs["saga_session_id"],
@@ -2764,15 +2769,18 @@ async def test_admin_clear_restores_proxy_session_grant_until_later_ingest(
             active = agent._active_prompts[session_id]
             marker = issue_client_authorized_host_execution(
                 request_identity=object(), auth_context_identity=auth,
-                wrapper_name=wrapper, tainted=True,
+                wrapper_name=wrapper, tainted=False,
             )
             assert marker is not None
-            original = state.current()
-            for index, tainted in enumerate((True, False, True, False)):
-                if index == 2:
+            steps = range(7) if turn_count == 1 else range(7, 9)
+            for index in steps:
+                tainted = index == 3
+                if index in (1, 3, 6):
                     # Even a repeated, deduplicated source is a new ingest.
                     state.merge(ingest)
-                elif index in (1, 3):
+                if index in (1, 4, 6):
+                    # Model follows injected instructions before the proxy has
+                    # observed taint. Clearing is not an operator approval.
                     request = ToolCallRequest(
                         tool_call={"name": "clear_ingest_taint", "args": {},
                                    "id": f"clear-{index}", "type": "tool_call"},
@@ -2784,8 +2792,11 @@ async def test_admin_clear_restores_proxy_session_grant_until_later_ingest(
 
                     result = await BudgetGateMiddleware().awrap_tool_call(request, unreachable_handler)
                     assert result.status == "success", result.content
-                assert state.current() == original
-                assert state.has_untrusted_active_ingest() is True
+                if index == 6:
+                    # No post-clear permission request in this turn. The next
+                    # clean turn must still invalidate the standing grant.
+                    continue
+                assert state.has_untrusted_active_ingest() is (1 <= index <= 5)
                 assert state.permission_has_untrusted_active_ingest() is tainted
                 assert client_authorized_host_execution_metadata(marker) == (wrapper, tainted)
                 tool_id = f"hands-{index}"
@@ -2796,7 +2807,10 @@ async def test_admin_clear_restores_proxy_session_grant_until_later_ingest(
                 decision = await active.request_permission(PermissionEligibility(
                     tool_id, wrapper, "other", arguments, marker,
                 ))
-                assert decision == PermissionDecision.ALLOW_ONCE
+                assert decision == (
+                    PermissionDecision.ALLOW_SESSION if index in (0, 1, 4, 7)
+                    else PermissionDecision.ALLOW_ONCE
+                )
                 assert router._grants.allows(session_id, wrapper)
         finally:
             reset_current_turn(token)
@@ -2805,7 +2819,9 @@ async def test_admin_clear_restores_proxy_session_grant_until_later_ingest(
     try:
         response = await agent.prompt(session_id, [sdk.TextContentBlock(type="text", text="review ingest")])
         assert response.stop_reason == "end_turn"
-        assert [message["id"] for message in client_wire.messages] == [1, 3]
+        response = await agent.prompt(session_id, [sdk.TextContentBlock(type="text", text="continue")])
+        assert response.stop_reason == "end_turn"
+        assert [message["id"] for message in client_wire.messages] == [1, 2, 4, 5, 7]
         events = [json.loads(line) for line in (tmp_path / "middleware-events.jsonl").read_text().splitlines()]
         outcomes = [event for event in events if event["type"] == "acp_permission_outcome"]
         payloads = [{key: event[key] for key in (
@@ -2814,11 +2830,13 @@ async def test_admin_clear_restores_proxy_session_grant_until_later_ingest(
         assert payloads == [
             {"wrapper_name": wrapper, "tainted": tainted,
              "resource_resolvable": wrapper == "hands_edit", "outcome": outcome}
-            for tainted, outcome in ((True, "operator_allow"), (False, "session_grant"),
-                                     (True, "operator_allow"), (False, "session_grant"))
+            for tainted, outcome in ((False, "operator_allow"), (False, "operator_allow"),
+                                     (False, "session_grant"), (True, "operator_allow"),
+                                     (False, "operator_allow"), (False, "session_grant"),
+                                     (False, "operator_allow"), (False, "session_grant"))
         ]
         clears = [event for event in events if event["type"] == "ifc_ingest_taint_cleared"]
-        assert len(clears) == 2
+        assert len(clears) == 3
         assert all(event["source_count"] == 1 for event in clears)
         assert all(event["authenticated_admin"] == {
             "principal": "operator", "canonical_principal": "operator",

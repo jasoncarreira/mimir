@@ -348,6 +348,7 @@ class PermissionSnapshot:
     raw_input: Mapping[str, Any]
     wrapper_name: str | None = None
     tainted: bool = False
+    ingest_acknowledgement: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -468,6 +469,8 @@ def permission_request_params(
         result["_meta"] = {"mimir.wrapper": snapshot.wrapper_name}
         if snapshot.tainted:
             result["_meta"]["mimir.tainted"] = True
+        if snapshot.ingest_acknowledgement is not None:
+            result["_meta"]["mimir.ingest_acknowledgement"] = snapshot.ingest_acknowledgement
     elif snapshot.tainted:
         raise AcpProtocolError("Malformed permission lifecycle snapshot")
     return result
