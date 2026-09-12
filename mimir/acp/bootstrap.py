@@ -4,7 +4,9 @@ import argparse
 import asyncio
 import json
 import os
+import signal
 import sys
+import threading
 from collections.abc import Sequence
 from pathlib import Path
 from typing import BinaryIO
@@ -157,6 +159,15 @@ def _proxy(args: argparse.Namespace, output: BinaryIO) -> int:
     from .profiles import ProfileError, ProfileStore, selected_profile
     from .proxy import ProxyError, ProxySignalExit, run_proxy
     from .ssh import SshError, run_remote_proxy
+    def startup_sigint(signum: int, frame: object) -> None:
+        # Before router hooks own SIGINT, exit without entering async teardown.
+        # Runner's default cancellation can otherwise strand a blocked close
+        # with no product watchdog. A non-default handler prevents that takeover.
+        os._exit(128 + signum)
+
+    main_thread = threading.current_thread() is threading.main_thread()
+    if main_thread:
+        previous_sigint = signal.signal(signal.SIGINT, startup_sigint)
     try:
         name = selected_profile(args.proxy_profile); profile = ProfileStore().get(name)
         if profile is None: return _error("profile-not-found")
@@ -167,6 +178,10 @@ def _proxy(args: argparse.Namespace, output: BinaryIO) -> int:
     except ProfileError as exc: return _error(exc.code)
     except CredentialError as exc: return _error(exc.code)
     except (ProxyError, SshError, TimeoutError, ConnectionError, OSError): return _error("connection-failed")
+    finally:
+        # Keep committed product signal exits armed through outer teardown.
+        if main_thread and signal.getsignal(signal.SIGINT) is startup_sigint:
+            signal.signal(signal.SIGINT, previous_sigint)
 
 
 def _dispatch(args: argparse.Namespace, output: BinaryIO) -> int:
