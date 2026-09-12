@@ -1139,13 +1139,13 @@ async def _authenticated_shell_category_runtime(
         trigger="user_message",
         channel_id="slack-C1",
         content="request",
-        author="slack-U2",
+        author="slack-U1",
         source="slack",
     )
     initial = _initialize_ifc_labels(request_event, resolver=resolver)
     auth = AuthContext(
-        principal="slack-U2",
-        canonical_principal="requester",
+        principal="slack-U1",
+        canonical_principal="operator",
         roles=("admin",),
         event_ingress="slack",
         trigger="user_message",
@@ -1166,7 +1166,11 @@ async def _authenticated_shell_category_runtime(
         identity_resolver=resolver,
         interactivity=TurnInteractivity.INTERACTIVE,
     )
-    mti.register_inflight("slack-C1")
+    from mimir.turn_event_bus import TurnEventEmitter
+
+    mti.register_inflight("slack-C1", emitter=TurnEventEmitter(
+        None, turn_id=turn.turn_id, channel_id="slack-C1", auth_context=auth,
+    ))
     token = set_current_turn(turn)
     try:
         request_result = await tool_registry.request_operator_approval.ainvoke({
@@ -1193,7 +1197,7 @@ async def _authenticated_shell_category_runtime(
     current = auth.ifc_state.current()
     assert current is not None
     assert current.sources[-1].principal == "operator"
-    assert auth.canonical_principal == "requester"
+    assert auth.canonical_principal == "operator"
     return turn, auth, {"dispatcher": dispatcher, "folded": folded}
 
 

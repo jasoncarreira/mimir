@@ -85,6 +85,23 @@ borrow authority through a ContextVar or a "single active turn" heuristic.
 Reloading identities after turn creation also cannot widen that turn's frozen
 role snapshot.
 
+### Mid-turn injection
+
+Dispatcher mid-turn injection and startup queue draining require a known incoming
+identity whose canonical principal matches the running turn's frozen `AuthContext`.
+Same-principal aliases may inject; different principals, unknown identities,
+missing carriers, and generic HTTP ingress cannot. This guard is always on,
+including in shadow mode. Refused injections remain queued for a fresh turn with
+their own authorization context; a mismatched startup message is also a FIFO
+boundary for later messages.
+
+Channel membership and IFC `authorized_principals` are data-access facts, not
+authenticated requester identity. Folding text does not replace the running
+turn's principal or roles, so allowing another channel member to inject would let
+their instructions execute with the running requester's authority. Operator
+approval replies are subject to the same principal check before consent is
+recorded; a different operator cannot inject into another requester's turn.
+
 ### HTTP ingress marker
 
 Generic `POST /event` authenticates transport, not a named requester. The server
@@ -426,9 +443,12 @@ egress paths exist and therefore must be reviewed with the catalog/adapters:
 - `MIMIR_AUTO_DELIVER_FINAL_TEXT_CHANNELS`, `MIMIR_RESEND_NUDGE_CHANNELS`, and
   `MIMIR_ACTIVITY_PANEL_CHANNELS` enable harness egress that remains subject to
   the final IFC sink gate.
-- `MIMIR_MIDTURN_INJECTION_CHANNELS` and `MIMIR_ATTACHMENTS_MAX_BYTES` shape
-  inbound data that contributes to the turn's labels; they do not establish
-  requester authority.
+- `MIMIR_MIDTURN_INJECTION_CHANNELS` opts channels into folding messages into
+  a running turn. Because folded instructions use that turn's authority, the
+  principal guard requires a known identity matching its frozen requester;
+  channel membership alone is insufficient.
+- `MIMIR_ATTACHMENTS_MAX_BYTES` limits inbound attachment data; it does not
+  establish requester authority.
 - `MIMIR_CHAT_SKILLS_ENABLED` and `MIMIR_CHAT_SKILL_ALLOWLIST` change the
   chat-visible operation surface; they do not bypass the operation catalog.
 

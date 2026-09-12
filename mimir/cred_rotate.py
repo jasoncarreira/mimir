@@ -52,6 +52,7 @@ from pathlib import Path
 from typing import Any
 
 from .cred_verify import get_probes
+from .redaction import redact_text
 
 
 _COMPOSE_FILES = ("compose.yml", "compose.yaml", "docker-compose.yml", "docker-compose.yaml")
@@ -95,8 +96,13 @@ def _emit(deployment_dir: Path, kind: str, **fields: Any) -> None:
     }
     log_path = deployment_dir / "rotations.jsonl"
     try:
-        with log_path.open("a", encoding="utf-8") as f:
-            f.write(json.dumps(record) + "\n")
+        with open(
+            log_path, "a", encoding="utf-8",
+            opener=lambda path, flags: os.open(path, flags, 0o600),
+        ) as f:
+            # Creation mode does not tighten an existing audit file.
+            os.fchmod(f.fileno(), 0o600)
+            f.write(redact_text(json.dumps(record)) + "\n")
     except OSError as exc:
         print(f"warn: failed to write rotations.jsonl: {exc}", file=sys.stderr)
 
@@ -372,7 +378,7 @@ def _verify_in_container(compose_file: Path, service: str,
         "mimir", "verify-cred", cred_name, timeout=30,
     )
     detail = (out or err or "").splitlines()[0] if (out or err) else f"exit {rc}"
-    return (rc == 0, detail)
+    return (rc == 0, redact_text(detail))
 
 
 # ── orchestration ────────────────────────────────────────────────────

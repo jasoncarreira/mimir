@@ -86,6 +86,18 @@ def direct_exec_pass_env(argv: list[str] | None) -> tuple[str, ...]:
     return ()
 
 
+def direct_exec_redact_names(argv: list[str] | None) -> tuple[str, ...]:
+    """Mask declared values and implicit credential grants, not baseline settings.
+
+    Resolve values from the child environment, never from a later parent snapshot.
+    """
+    executable = Path(argv[0]).name if argv else ""
+    return tuple(dict.fromkeys((
+        *direct_exec_pass_env(argv),
+        *sorted(_CREDENTIAL_ENV_BY_EXECUTABLE.get(executable, ())),
+    )))
+
+
 def redact_direct_exec_output(
     text: str, env: dict[str, str], names: tuple[str, ...],
 ) -> str:

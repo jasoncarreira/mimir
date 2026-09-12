@@ -32,7 +32,7 @@ from langgraph.config import get_config
 from .prompt_safety import sanitize_prompt_field
 
 if TYPE_CHECKING:
-    from .models import AgentEvent
+    from .models import AgentEvent, AuthContext
 
 log = logging.getLogger(__name__)
 
@@ -68,6 +68,7 @@ class _Inflight:
     folded: list[tuple["AgentEvent", float]] = field(default_factory=list)
     deferred: dict[str, str] = field(default_factory=dict)
     emitter: Any | None = None
+    auth_context: "AuthContext | None" = None
     authenticated_grants: dict[int, Any] = field(default_factory=dict)
     active: bool = True
 
@@ -84,6 +85,8 @@ def register_inflight(channel_id: str | None, *, emitter: Any | None = None) -> 
 
     Overwrites any prior entry for the channel — the dispatcher serializes per
     channel, so a leftover entry from a crashed turn is self-healed here.
+    Snapshot the emitter's server-created AuthContext, never ambient turn state.
+    A missing carrier leaves authenticated ingress injection disabled.
     """
     if not channel_id:
         return
@@ -91,7 +94,9 @@ def register_inflight(channel_id: str | None, *, emitter: Any | None = None) -> 
 
     clear_channel(channel_id)
     with _LOCK:
-        _REGISTRY[channel_id] = _Inflight(emitter=emitter)
+        _REGISTRY[channel_id] = _Inflight(
+            emitter=emitter, auth_context=getattr(emitter, "_auth_context", None),
+        )
 
 
 def deactivate(
@@ -182,16 +187,58 @@ def inject_message(channel_id: str, event: "AgentEvent") -> str:
         return "injected"
 
 
+def can_inject_authenticated_message(
+    channel_id: str, event: "AgentEvent", resolver: Any,
+) -> bool:
+    """Require a known incoming identity matching the frozen running principal.
+
+    Channel membership and IFC audiences describe data access, not who may issue
+    instructions using the running turn's authority. Unknown ids must not match
+    merely because IdentityResolver.resolve() passes them through unchanged.
+    """
+    from .access_control import HTTP_EVENT_INGRESS_EXTRA_KEY
+    from .models import AuthContext
+
+    # Callers serialize registry access with _LOCK or run synchronously on the
+    # dispatcher thread (startup drain); this function never yields.
+    inflight = _REGISTRY.get(channel_id)
+    auth = inflight.auth_context if inflight is not None and inflight.active else None
+    if (
+        not isinstance(auth, AuthContext)
+        or resolver is None
+        or not auth.principal
+        or not auth.canonical_principal
+        or auth.is_service
+        or auth.trigger != "user_message"
+        or auth.channel_id != channel_id
+        or auth.event_ingress == "http_event"
+        or event.trigger != "user_message"
+        or event.channel_id != channel_id
+        or event.extra.get(HTTP_EVENT_INGRESS_EXTRA_KEY) is not None
+    ):
+        return False
+    incoming = resolver.identity(event.author)
+    running = resolver.identity(auth.principal)
+    return (
+        incoming is not None
+        and running is not None
+        and not incoming.access.is_service
+        and incoming.canonical == running.canonical == auth.canonical_principal
+    )
+
+
 def inject_authenticated_message(
     channel_id: str,
     event: "AgentEvent",
     resolver: Any,
 ) -> str:
-    """Inject an ingress-authorized event, recording operator consent first."""
+    """Inject only a same-principal event, then record any operator consent."""
     with _LOCK:
         inflight = _REGISTRY.get(channel_id)
         if inflight is None or not inflight.active:
             return "no_active_turn"
+        if not can_inject_authenticated_message(channel_id, event, resolver):
+            return "principal_mismatch"
         from .agent import _initialize_ifc_labels
         from .operator_approval import pending_request, record_authenticated_response
 
