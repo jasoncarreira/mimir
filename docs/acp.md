@@ -21,6 +21,9 @@ operator-visible limits are:
   File access walks canonical path components with no-follow directory handles;
   reads and atomic edits use the pinned parent, not a re-resolved pathname.
   Replacement symlinks cannot redirect access between validation and use.
+  Reading a file requires read permission on every ancestor directory within the
+  boundary, not merely search permission, because access is performed through
+  pinned directory descriptors.
   Inspecting symlinks before granting access is not a substitute for these
   checks: a child can create links after the grant.
 - **macOS Seatbelt remains the only execution-confinement backend verified on real hardware.** `hands_shell`
@@ -335,9 +338,13 @@ When `mcpServers` is missing or empty, the local proxy injects one locally hoste
 
 An authenticated, non-service admin on a live user turn can ask Mimir to call
 `clear_ingest_taint`. It durably audits and acknowledges only the current ingest
-snapshot for the ACP permission prompt, allowing an existing session grant to
-apply again. It does **not** clear source labels, declassify data, grant execution
-permission, or change sink and durable-memory decisions. Later untrusted active
+snapshot for the ACP permission prompt. Acknowledging untrusted ingest revokes
+existing wrapper session grants, even if no permission request occurred while
+tainted. The next call requires a fresh human response; choosing `allow_session`
+there enables reuse again until another acknowledgement or session reset.
+Clearing alone cannot restore a grant. It does **not** clear source labels,
+declassify data, grant execution permission, or change sink and durable-memory
+decisions. Later untrusted active
 ingest, including rereading the same source, re-arms the prompt. See
 [ingest acknowledgement](authorization.md#ingest-acknowledgement) for eligibility
 and audit failure behavior.

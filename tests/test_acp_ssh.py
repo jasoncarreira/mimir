@@ -598,7 +598,10 @@ async def test_early_child_failure_cancels_open_client_stdin(monkeypatch: pytest
 
 
 @pytest.mark.asyncio
-async def test_actual_subprocess_cancellation_terminates_child(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+@pytest.mark.parametrize("feed_auth", [False, True], ids=["idle-input", "queued-auth"])
+async def test_actual_subprocess_cancellation_terminates_child(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, feed_auth: bool,
+) -> None:
     profile, _ = remote_profile(tmp_path)
     marker = tmp_path / "terminated"
     ssh = _fake_ssh(tmp_path, """
@@ -608,10 +611,13 @@ def stop(*args):
  raise SystemExit(0)
 signal.signal(signal.SIGTERM,stop)
 with open(os.environ['MARKER'] + '.ready','w') as stream: stream.write('ready')
-for line in sys.stdin.buffer: time.sleep(10)
+# Teardown closes stdin before sending SIGTERM. Stay alive on EOF, even if
+# cancellation beats delivery of the queued authentication request.
+while True: time.sleep(1)
 """)
     reader = asyncio.StreamReader()
-    reader.feed_data(b'{"jsonrpc":"2.0","id":1,"method":"authenticate","params":{"methodId":"mimir-web-key"}}\n')
+    if feed_auth:
+        reader.feed_data(b'{"jsonrpc":"2.0","id":1,"method":"authenticate","params":{"methodId":"mimir-web-key"}}\n')
     output = io.BytesIO()
     transport = type("Transport", (), {"close": lambda self: None})()
     monkeypatch.setattr("mimir.acp.ssh.open_stdio", lambda target: asyncio.sleep(0, result=(reader, Output(target), transport)))

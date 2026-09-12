@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import multiprocessing
+from contextlib import nullcontext
 import os
 import re
 import shlex
@@ -1645,6 +1647,275 @@ def test_push_failure_blocks_build_and_reports_publication_step(tmp_path: Path) 
     assert failure["step"] == "push"
     assert failure["error"] == "remote rejected publication"
     _reset_logger_for_tests()
+
+
+@pytest.mark.parametrize("fenced", [True, False], ids=["fenced", "negative-control"])
+@pytest.mark.parametrize("crash", [False, True], ids=["live", "process-death"])
+def test_publication_replacement_interleaving(tmp_path: Path, monkeypatch, fenced, crash) -> None:
+    """A distinct controller is admitted after remote creation, before evidence.
+
+    The fake tracker models the reaper's stolen/released lock and ready label;
+    neither heartbeat nor claim ownership is used as the publication guarantee.
+    Disabling only the new fence reproduces two PRs through the real pipeline.
+    """
+    import mimir.worklink.orchestrator as module
+
+    if not fenced:
+        monkeypatch.setattr(
+            module, "_leaf_publication",
+            lambda *args: nullcontext(SimpleNamespace(pr_started=False, completed=False)),
+        )
+    ctx = multiprocessing.get_context("fork")
+    published = ctx.Event()
+    finish = ctx.Event()
+    publications = ctx.Value("i", 0)
+    results = ctx.Queue()
+    repo = tmp_path / "repo"
+
+    def run_attempt(attempt):
+        issue = json.loads(ISSUE_JSON)
+        if attempt == 2:
+            issue["comments"] = [ClaimRecord(
+                441, 1, "original", datetime(2020, 1, 1, tzinfo=UTC),
+            ).to_comment()]
+        worktree = repo.parent / ".worklink" / repo.name / f"441-{attempt}"
+        calls, base_runner = _orchestrator_runner(repo, worktree, issue_json=json.dumps(issue))
+
+        def runner(args, **kwargs):
+            if isinstance(args, list) and args[:3] == ["gh", "pr", "create"]:
+                with publications.get_lock():
+                    publications.value += 1
+                if attempt == 1:
+                    published.set()
+                    assert finish.wait(30), "replacement never finished"
+            return base_runner(args, **kwargs)
+
+        registry = BackendRegistry(WorklinkConfig())
+        registry.register(FakeBackend())
+        result = asyncio.run(WorklinkRunner(
+            home=tmp_path, repo=repo, runner=runner, registry=registry,
+        ).run(441, backend_name="fake", test_command="echo ok"))
+        assert ["chainlink", "locks", "claim", "441"] in calls
+        assert result.attempt == attempt
+        return result
+
+    def original():
+        results.put(run_attempt(1).status)
+
+    process = ctx.Process(target=original)
+    process.start()
+    try:
+        assert published.wait(30), "original never published"
+        evidence = tmp_path / "state/worklink/evidence/441-1.json"
+        assert not json.loads(evidence.read_text())["pr_url"]
+        # Model loss of disposable run metadata as well as the stolen claim.
+        # The acceptance case is an admitted replacement, not reliable liveness.
+        module.clear_run_state(tmp_path, 441)
+        if crash:
+            process.terminate()
+            process.join(10)
+            assert not process.is_alive()
+        replacement = run_attempt(2)
+        assert replacement.status == ("blocked" if fenced else "completed")
+        assert publications.value == (1 if fenced else 2)
+        if fenced:
+            assert "publication fence failed" in replacement.reason
+        if not crash:
+            finish.set()
+            process.join(10)
+            assert process.exitcode == 0
+            assert results.get(timeout=5) == "completed"
+    finally:
+        if not crash:
+            finish.set()
+        process.join(10)
+        if process.is_alive():
+            process.terminate()
+            process.join(10)
+        results.close()
+
+
+@pytest.mark.parametrize("failure", [
+    "push", "pr", "intent", "intent-sync", "existing-intent", "evidence-read",
+    "evidence-list", "corrupt-evidence", "invalid-json", "completed-evidence",
+])
+def test_publication_fence_failures_and_retry(tmp_path: Path, monkeypatch, failure) -> None:
+    import mimir.worklink.orchestrator as module
+
+    repo = tmp_path / "repo"
+    worktree = repo.parent / ".worklink" / repo.name / "441-1"
+    calls, base_runner = _orchestrator_runner(repo, worktree)
+    publications = []
+    fail = True
+    original_open = Path.open
+    original_read = Path.read_text
+    original_iterdir = Path.iterdir
+    original_fsync = os.fsync
+    original_write = module._write_evidence
+
+    def open_path(path, *args, **kwargs):
+        if fail and failure == "intent" and path.parent.name == "publications":
+            raise PermissionError("intent storage unavailable")
+        return original_open(path, *args, **kwargs)
+
+    def read_path(path, *args, **kwargs):
+        if fail and path.name == "441-0.json":
+            if failure == "evidence-read":
+                raise PermissionError("evidence storage unavailable")
+            if failure == "corrupt-evidence":
+                return "{}"
+            if failure == "invalid-json":
+                return "{"
+        return original_read(path, *args, **kwargs)
+
+    def list_paths(path):
+        if fail and failure == "evidence-list" and path.name == "evidence" and intent.exists():
+            raise PermissionError("evidence listing unavailable")
+        return original_iterdir(path)
+
+    def sync(fd):
+        if fail and failure == "intent-sync" and intent.exists():
+            raise OSError("intent sync unavailable")
+        return original_fsync(fd)
+
+    def write_evidence(home, evidence):
+        if fail and failure == "completed-evidence" and evidence.pr_url:
+            raise OSError("completed evidence unavailable")
+        return original_write(home, evidence)
+
+    monkeypatch.setattr(Path, "open", open_path)
+    monkeypatch.setattr(Path, "read_text", read_path)
+    monkeypatch.setattr(Path, "iterdir", list_paths)
+    monkeypatch.setattr(os, "fsync", sync)
+    monkeypatch.setattr(module, "_write_evidence", write_evidence)
+    evidence_dir = tmp_path / "state/worklink/evidence"
+    evidence_dir.mkdir(parents=True)
+    (evidence_dir / "441-0.json").write_text('{"status":"failed"}')
+    intent = tmp_path / "state/worklink/publications/441.json"
+    if failure == "existing-intent":
+        intent.parent.mkdir(parents=True)
+        intent.write_text("{corrupt intent")
+
+    def runner(args, **kwargs):
+        if isinstance(args, list):
+            if args[:3] == ["gh", "pr", "create"]:
+                publications.append(args)
+                if fail and failure == "pr":
+                    return cp(args, returncode=1, stderr="ambiguous remote failure")
+            if fail and failure == "push" and args[3:4] == ["push"]:
+                return cp(args, returncode=1, stderr="push rejected")
+        return base_runner(args, **kwargs)
+
+    registry = BackendRegistry(WorklinkConfig())
+    registry.register(FakeBackend())
+    orchestrator = WorklinkRunner(home=tmp_path, repo=repo, runner=runner, registry=registry)
+    result = asyncio.run(orchestrator.run(441, backend_name="fake", test_command="echo ok"))
+    assert result.status in {"blocked", "failed"}
+    assert len(publications) == (1 if failure in {"pr", "completed-evidence"} else 0)
+    retained = failure in {"pr", "completed-evidence", "intent-sync", "existing-intent"}
+    assert intent.exists() == retained
+    fail = False
+    issue = json.loads(ISSUE_JSON)
+    issue["comments"] = [ClaimRecord(
+        441, 1, "original", datetime(2020, 1, 1, tzinfo=UTC),
+    ).to_comment()]
+    worktree = worktree.with_name("441-2")
+    calls, base_runner = _orchestrator_runner(repo, worktree, issue_json=json.dumps(issue))
+    retried = asyncio.run(orchestrator.run(441, backend_name="fake", test_command="echo ok"))
+    assert retried.status == ("blocked" if retained else "completed"), retried.reason
+    assert len(publications) == (0 if failure in {"intent-sync", "existing-intent"} else 1)
+    if failure == "pr":
+        # Operator reconciliation: the creator and its children have stopped,
+        # and GitHub confirms this deliberately rejected request created no PR.
+        # A nonzero CLI exit alone was NOT enough to authorize this retry.
+        intent.unlink()
+        issue["comments"].append(ClaimRecord(
+            441, 2, "replacement", datetime(2020, 1, 2, tzinfo=UTC),
+        ).to_comment())
+        calls, base_runner = _orchestrator_runner(
+            repo, worktree.with_name("441-3"), issue_json=json.dumps(issue),
+        )
+        reconciled = asyncio.run(orchestrator.run(
+            441, backend_name="fake", test_command="echo ok",
+        ))
+        assert reconciled.status == "completed", reconciled.reason
+        assert len(publications) == 2  # one rejected request, one successful PR
+
+
+def test_publication_fence_accepts_missing_evidence_directory(tmp_path: Path) -> None:
+    from mimir.worklink.orchestrator import _leaf_publication
+
+    evidence_dir = tmp_path / "state/worklink/evidence"
+    assert not evidence_dir.exists()
+    with _leaf_publication(tmp_path, 441, 1):
+        assert evidence_dir.is_dir()
+        assert (tmp_path / "state/worklink/publications/441.json").is_file()
+    assert not (tmp_path / "state/worklink/publications/441.json").exists()
+
+
+def test_first_publication_creates_evidence_directory(tmp_path: Path) -> None:
+    """A fresh home must publish on attempt one, without seeded evidence."""
+    repo = tmp_path / "repo"
+    worktree = repo.parent / ".worklink" / repo.name / "441-1"
+    calls, runner = _orchestrator_runner(repo, worktree)
+    evidence_dir = tmp_path / "state/worklink/evidence"
+    assert not evidence_dir.exists()
+    registry = BackendRegistry(WorklinkConfig())
+    registry.register(FakeBackend())
+    result = asyncio.run(WorklinkRunner(
+        home=tmp_path, repo=repo, runner=runner, registry=registry,
+    ).run(441, backend_name="fake", test_command="echo ok"))
+    assert result.status == "completed", result.reason
+    assert sum(c[:3] == ["gh", "pr", "create"] for c in calls if isinstance(c, list)) == 1
+    evidence = json.loads((evidence_dir / "441-1.json").read_text())
+    assert evidence["status"] == "completed"
+    assert evidence["pr_url"] == result.pr_url
+    assert result.pr_url
+    assert not (tmp_path / "state/worklink/publications/441.json").exists()
+
+
+def test_publication_fence_reads_older_completed_evidence(tmp_path: Path) -> None:
+    """Late replacement passes latest-only admission, but cannot publish."""
+    repo = tmp_path / "repo"
+    worktree = repo.parent / ".worklink" / repo.name / "441-3"
+    issue = json.loads(ISSUE_JSON)
+    issue["comments"] = [ClaimRecord(
+        441, 2, "replacement", datetime(2020, 1, 1, tzinfo=UTC),
+    ).to_comment()]
+    calls, runner = _orchestrator_runner(repo, worktree, issue_json=json.dumps(issue))
+    evidence_dir = tmp_path / "state/worklink/evidence"
+    evidence_dir.mkdir(parents=True)
+    (evidence_dir / "441-1.json").write_text(json.dumps({
+        "status": "completed", "pr_url": "https://github.com/jasoncarreira/mimir/pull/999",
+    }))
+    (evidence_dir / "441-2.json").write_text('{"status":"failed"}')
+    registry = BackendRegistry(WorklinkConfig())
+    registry.register(FakeBackend())
+    result = asyncio.run(WorklinkRunner(
+        home=tmp_path, repo=repo, runner=runner, registry=registry,
+    ).run(441, backend_name="fake", test_command="echo ok"))
+    assert ["chainlink", "locks", "claim", "441"] in calls
+    assert result.status == "blocked"
+    assert "publication already recorded" in result.reason
+    assert not any(c[:3] == ["gh", "pr", "create"] for c in calls if isinstance(c, list))
+
+
+def test_publication_fence_allows_archived_closed_unmerged_pr(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    worktree = repo.parent / ".worklink" / repo.name / "441-1"
+    calls, runner = _orchestrator_runner(repo, worktree)
+    evidence_dir = tmp_path / "state/worklink/evidence"
+    evidence_dir.mkdir(parents=True)
+    (evidence_dir / "441-0.json.closed-unmerged").write_text(json.dumps({
+        "status": "completed", "pr_url": "https://github.com/jasoncarreira/mimir/pull/998",
+    }))
+    registry = BackendRegistry(WorklinkConfig())
+    registry.register(FakeBackend())
+    result = asyncio.run(WorklinkRunner(
+        home=tmp_path, repo=repo, runner=runner, registry=registry,
+    ).run(441, backend_name="fake", test_command="echo ok"))
+    assert result.status == "completed"
+    assert sum(c[:3] == ["gh", "pr", "create"] for c in calls if isinstance(c, list)) == 1
 
 
 def test_post_pr_comment_failure_does_not_demote_completed_run(tmp_path: Path) -> None:

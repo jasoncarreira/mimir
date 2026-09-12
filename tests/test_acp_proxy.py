@@ -365,6 +365,60 @@ async def test_grants_clear_on_load_exit_and_daemon_generation_change() -> None:
 
 
 @pytest.mark.asyncio
+async def test_ingest_acknowledgement_revokes_all_grants_and_stale_responses() -> None:
+    router, client, daemon = await active_router()
+    try:
+        await grant_session(router, 1, "session")
+        await grant_session(router, 2, "session", "hands_python")
+        await router.route_daemon(permission_request(3, "session", "hands_shell"))
+        request = permission_request(4, "session")
+        request["params"]["_meta"]["mimir.ingest_acknowledgement"] = "a" * 32
+        await router.route_daemon(request)
+        assert messages(client)[-1]["id"] == 4
+        assert len(router._grants) == 0
+        # An answer to a pre-boundary request cannot reinstall a standing grant.
+        await router.route_client({
+            "jsonrpc": "2.0", "id": 3,
+            "result": {"outcome": {"outcome": "selected", "optionId": "allow_session"}},
+        })
+        assert not router._grants.allows("session", "hands_shell")
+        await router.route_client({
+            "jsonrpc": "2.0", "id": 4,
+            "result": {"outcome": {"outcome": "selected", "optionId": "allow_session"}},
+        })
+        request["id"] = 5
+        client.data.clear()
+        await router.route_daemon(request)
+        assert not client.data  # Same acknowledged snapshot reuses fresh consent.
+        await router.route_daemon(permission_request(6, "session"))
+        assert not client.data  # A fresh turn does not revoke fresh consent.
+        assert messages(daemon)[-1]["result"]["_meta"] == {
+            "mimir.permission_source": "session_grant",
+        }
+        await router.route_daemon(permission_request(7, "session", "hands_python"))
+        assert messages(client)[-1]["id"] == 7  # Old grants never resume next turn.
+    finally:
+        await router.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("boundary", [None, False, 1, "", "a" * 31, "g" * 32, "a" * 33])
+async def test_malformed_ingest_acknowledgement_fails_closed(boundary: Any) -> None:
+    router, client, daemon = await active_router()
+    try:
+        await grant_session(router, 1, "session")
+        client.data.clear()
+        daemon.data.clear()
+        request = permission_request(2, "session")
+        request["params"]["_meta"]["mimir.ingest_acknowledgement"] = boundary
+        with pytest.raises(ProxyError, match="invalid reserved permission metadata"):
+            await router.route_daemon(request)
+        assert not client.data and not daemon.data
+    finally:
+        await router.close()
+
+
+@pytest.mark.asyncio
 async def test_tainted_matching_request_bypasses_grant_and_reaches_human() -> None:
     router, client, _ = await active_router()
     try:

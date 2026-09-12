@@ -248,8 +248,8 @@ class Dispatcher:
                     if self._on_inject is not None:
                         await self._on_inject(event)
                     return True
-                # "no_active_turn" — the turn ended during the race; fall
-                # through and enqueue it as a normal next-turn event.
+                # A finished turn or mismatched/unknown principal needs a fresh
+                # turn with its own authority, never the running turn's carrier.
 
         queue = self._queues.get(channel_id)
         if queue is None:
@@ -405,8 +405,9 @@ class Dispatcher:
         the turn's first model boundary, so fold them into the starting turn
         instead of processing them as separate follow-up turns.
 
-        Only drain the contiguous user_message prefix. A non-user predecessor
-        is a hard ordering boundary: anything behind it must not overtake it,
+        Only drain the contiguous same-principal user_message prefix. A non-user
+        or mismatched/unknown-principal predecessor is a hard ordering boundary:
+        anything behind it must not overtake it,
         even if it is a user_message. For every queue.get() consumed here we
         call task_done() immediately; the event is no longer a queued turn, and
         the turn record's ``injected_inputs`` is the durable accounting surface.
@@ -418,6 +419,8 @@ class Dispatcher:
             return []
 
         drained: list[AgentEvent] = []
+        from .mid_turn_injection import can_inject_authenticated_message
+
         while queue.qsize() > 0:
             try:
                 next_event = queue.get_nowait()
@@ -426,7 +429,13 @@ class Dispatcher:
             # A non-user event is a hard boundary; so is a ``force_new_turn``
             # event (chainlink #384 — a deferred message must get its own turn,
             # never be folded, even into a starting turn).
-            if next_event.trigger != "user_message" or next_event.extra.get("force_new_turn"):
+            if (
+                next_event.trigger != "user_message"
+                or next_event.extra.get("force_new_turn")
+                or not can_inject_authenticated_message(
+                    channel_id, next_event, self._identity_resolver,
+                )
+            ):
                 # We consumed one queue item speculatively. Mark that get() done
                 # before re-inserting it as queued work; putleft/put_nowait will
                 # create the replacement unfinished-task accounting entry.

@@ -8,7 +8,7 @@ import pytest
 from langchain_core.messages import AIMessage, ToolMessage
 
 import mimir.turn_event_bus as turn_event_bus
-from mimir.models import AgentEvent
+from mimir.models import AgentEvent, InformationFlowLabels, TurnContext
 from mimir.turn_event_bus import TurnEventBus, TurnEventEmitter
 from mimir.turn_event_redaction import MAX_LIVE_STRING_CHARS
 
@@ -332,6 +332,34 @@ def test_emitter_noop_when_bus_none():
     emitter.turn_started()
     emitter.blocks_from_messages([AIMessage(content="hi")])
     emitter.turn_ended()
+
+
+@pytest.mark.parametrize(
+    "live_labels",
+    [None, InformationFlowLabels(), InformationFlowLabels(labels=frozenset({"private"}))],
+    ids=["missing", "empty", "populated"],
+)
+def test_emitter_keeps_carrier_only_when_context_labels_are_none(monkeypatch, live_labels):
+    import mimir._context as context
+
+    initial = InformationFlowLabels(labels=frozenset({"internal"}))
+    ctx = TurnContext(
+        turn_id="t1", session_id="c", trigger="user_message",
+        channel_id="c", started_at=0.0, ifc_labels=live_labels,
+    )
+    monkeypatch.setattr(context, "get_current_turn", lambda: ctx)
+    bus = TurnEventBus()
+    queue = bus.subscribe("c")
+    emitter = TurnEventEmitter(bus, turn_id="t1", channel_id="c", ifc_labels=initial)
+
+    emitter._emit("turn", "start")
+    expected = initial if live_labels is None else live_labels
+    assert queue.get_nowait()["_ifc_labels"] is expected
+
+    # A later missing carrier must retain the most recently adopted labels.
+    ctx.ifc_labels = None
+    emitter._emit("turn", "end")
+    assert queue.get_nowait()["_ifc_labels"] is expected
 
 
 def test_emitter_turn_bracket_envelope():

@@ -178,25 +178,16 @@ def test_missing_db_not_created(tmp_path, provider):
 @pytest.mark.parametrize("absolute_db", [False, True])
 def test_cli_home_config_and_options(tmp_path, monkeypatch, home_source, absolute_db):
     from mimir.cli import main
-    from mimir.saga import _config_io
     from mimir.saga import reembed as module
     from mimir import config
 
-    monkeypatch.delenv("SAGA_CONFIG", raising=False)
+    monkeypatch.setenv("SAGA_CONFIG", "")
     monkeypatch.delenv("MIMIR_HOME", raising=False)
     home = tmp_path / "home"
     home.mkdir()
-    (home / "saga.toml").write_text("[storage]\ndb_path='custom.db'\n")
     monkeypatch.setattr(config, "_load_home_dotenv", Mock())
     configured = str(tmp_path / "absolute.db") if absolute_db else "custom.db"
-
-    def get_config():
-        assert os.environ["MIMIR_HOME"] == str(home)
-        assert os.environ["SAGA_CONFIG"] == str(home / "saga.toml")
-        config._load_home_dotenv.assert_called_once_with(home)
-        return lambda *args: configured
-
-    monkeypatch.setattr(_config_io, "get_config", get_config)
+    (home / "saga.toml").write_text(f"[storage]\ndb_path='{configured}'\n")
     run = Mock()
     monkeypatch.setattr(module, "reembed", run)
     argv = ["saga-reembed", "--dry-run", "--batch-size", "7", "--batch-delay", "0.25"]
@@ -208,6 +199,9 @@ def test_cli_home_config_and_options(tmp_path, monkeypatch, home_source, absolut
     else:
         monkeypatch.chdir(home)
     main(argv)
+    assert os.environ["MIMIR_HOME"] == str(home)
+    assert os.environ["SAGA_CONFIG"] == str(home / "saga.toml")
+    config._load_home_dotenv.assert_called_once_with(home)
     assert run.call_args.args == (Path(configured) if absolute_db else home / ".mimir/custom.db",)
     assert run.call_args.kwargs["dry_run"] is True
     assert run.call_args.kwargs["batch_size"] == 7

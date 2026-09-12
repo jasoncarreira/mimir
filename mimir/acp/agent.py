@@ -70,7 +70,7 @@ from .sdk import (
     validate_acp_mcp_server,
 )
 from .session_store import SessionRecord, SessionStore
-from .updates import UpdateDispatcher
+from .updates import UpdateClient, UpdateDispatcher
 
 if TYPE_CHECKING:
     from mimir.models import AuthContext
@@ -132,6 +132,7 @@ class SessionState:
     execution_session_key: int = 0
     active_prompt: ActivePrompt | None = None
     dirty: bool = False
+    ingest_acknowledgement: str | None = None
 
 
 @dataclass
@@ -171,6 +172,12 @@ class ActivePrompt:
     def report_final_text_delivery_failure(self, reason: str) -> None:
         if self.final_text_delivery_failure is None:
             self.final_text_delivery_failure = reason
+
+    def acknowledge_ingest(self) -> None:
+        # Session-owned: a clear may be the last tool call of the current turn.
+        if not self._is_current():
+            raise RuntimeError("ingest acknowledgement requires a live ACP prompt")
+        self.session.ingest_acknowledgement = uuid.uuid4().hex
 
     async def request_permission(
         self, eligibility: PermissionEligibility
@@ -240,6 +247,7 @@ class ActivePrompt:
                 snapshot,
                 wrapper_name=trusted_metadata[0],
                 tainted=trusted_metadata[1],
+                ingest_acknowledgement=self.session.ingest_acknowledgement,
             )
         provider = self.session.provider
         peer = provider.peer if provider is not None else None
@@ -673,7 +681,10 @@ class MimirAcpAgent:
         turn_id = str(uuid.uuid4())
         lease = JournalLease(turn_id, state.generation, epoch)
         publisher = _TurnPublisher(journal, client, lease)
-        dispatcher = UpdateDispatcher(publisher, lease, epoch)
+        dispatcher = UpdateDispatcher(
+            publisher, lease, epoch,
+            on_stall=lambda: self._on_update_stalled(state.generation),
+        )
         queue = self._bundle.turn_event_bus.subscribe_exact_turn(turn_id)
         forwarder = asyncio.create_task(self._forward_updates(queue, dispatcher))
         bridge_publisher = _OrderedTurnPublisher(
@@ -899,6 +910,25 @@ class MimirAcpAgent:
         replaced_generations = getattr(self, "_replaced_generations", None)
         if replaced_generations is not None:
             replaced_generations.discard(generation)
+
+    def _on_update_stalled(self, generation: int) -> None:
+        connection = self._connections.get(generation)
+        if connection is None or connection.transport_dead:
+            return
+        # Fence further replay/live writes immediately. Cleanup must run outside
+        # the delivery worker, since it cancels and joins that same worker.
+        connection.transport_dead = True
+        task = asyncio.create_task(self.on_transport_closed(generation))
+        self._retirement_tasks.add(task)
+        task.add_done_callback(self._retirement_tasks.discard)
+        task.add_done_callback(_consume_background_task)
+
+    def _on_update_progress(self, generation: int) -> None:
+        # Replay holds the journal lock ahead of a worker. Its successful writes
+        # are peer progress too, not grounds for timing out the waiting drain.
+        for active in self._active_prompts.values():
+            if active.generation == generation:
+                active.dispatcher._made_progress()
 
     async def _retire_replaced_generation(self, generation: int) -> None:
         await asyncio.sleep(ACP_GENERATION_RETIRE_GRACE_SECONDS)
@@ -1168,7 +1198,12 @@ class MimirAcpAgent:
         if connection is not None:
             if connection is not self._connection or connection.closed:
                 raise internal_error()
-            return connection.peer
+            return UpdateClient(
+                connection.peer,
+                lambda: self._on_update_stalled(connection.generation),
+                lambda: connection.transport_dead,
+                lambda: self._on_update_progress(connection.generation),
+            )
         if self._client is None:
             raise internal_error()
         return self._client

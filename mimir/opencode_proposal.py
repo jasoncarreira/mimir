@@ -11,7 +11,9 @@ import re
 import subprocess
 from typing import Any
 
+from .access_control import _MAINTENANCE_GIT_BASE_OVERRIDES, _maintenance_git_filter_overrides
 from .contained_execution import SensitiveMaterialScrubber
+from .repo_tools import _sanitized_git_env
 
 __all__ = (
     "OpenCodeProposal",
@@ -161,13 +163,23 @@ def _stop_process(process: subprocess.Popen[bytes]) -> None:
 
 
 def _run_git(checkout: Path, *args: str, limit: int | None = None) -> bytes:
-    command = ("git", "-C", os.fspath(checkout), *args)
+    env = _sanitized_git_env()
+    filters = _maintenance_git_filter_overrides(
+        checkout, "git", effective_config=True, env=env,
+    )
+    if filters is None:
+        raise OSError("proposal Git filter configuration unavailable")
+    command = (
+        "git", "-C", os.fspath(checkout),
+        *_MAINTENANCE_GIT_BASE_OVERRIDES, *filters, *args,
+    )
     if limit is None:
         completed = subprocess.run(
             command,
             check=False,
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
+            env=env,
         )
         if completed.returncode != 0:
             raise OSError("proposal Git operation failed")
@@ -176,6 +188,7 @@ def _run_git(checkout: Path, *args: str, limit: int | None = None) -> bytes:
         command,
         stdout=subprocess.PIPE,
         stderr=subprocess.DEVNULL,
+        env=env,
     )
     if process.stdout is None:
         _stop_process(process)
@@ -208,6 +221,7 @@ def build_opencode_proposal(
             "--name-only",
             "-z",
             "--no-ext-diff",
+            "--no-textconv",
             limit=MAX_PROPOSAL_NAME_STREAM_BYTES + 1,
         )
         if len(name_stream) > MAX_PROPOSAL_NAME_STREAM_BYTES:
@@ -233,6 +247,7 @@ def build_opencode_proposal(
             "--binary",
             "--full-index",
             "--no-ext-diff",
+            "--no-textconv",
             limit=MAX_PROPOSAL_PATCH_BYTES + 1,
         )
         if len(patch) > MAX_PROPOSAL_PATCH_BYTES:

@@ -8,6 +8,8 @@ the tests don't depend on a running daemon.
 from __future__ import annotations
 
 import json
+import os
+import stat
 import textwrap
 from pathlib import Path
 
@@ -195,6 +197,101 @@ def test_emit_writes_jsonl(deployment: Path):
 
 
 # ── full rotation flow (docker mocked) ──────────────────────────────
+
+
+@pytest.mark.parametrize("existing_mode", [None, 0o644, 0o666, 0o600])
+def test_emit_private_before_writing(deployment, monkeypatch, existing_mode):
+    path = deployment / "rotations.jsonl"
+    previous = '{"type": "previous"}\n'
+    if existing_mode is not None:
+        path.write_text(previous)
+        path.chmod(existing_mode)
+    dumps = json.dumps
+    os_open = os.open
+
+    def checked_open(file, flags, mode=0o777):
+        fd = os_open(file, flags, mode)
+        if existing_mode is None:
+            try:
+                assert stat.S_IMODE(os.fstat(fd).st_mode) == 0o600
+            except BaseException:
+                os.close(fd)
+                raise
+        return fd
+
+    def checked_dumps(record):
+        assert stat.S_IMODE(path.stat().st_mode) == 0o600
+        return dumps(record)
+
+    monkeypatch.setattr(cred_rotate.json, "dumps", checked_dumps)
+    monkeypatch.setattr(cred_rotate.os, "open", checked_open)
+    old_umask = os.umask(0)
+    try:
+        cred_rotate._emit(deployment, "first", detail="Authenticated as alice")
+        cred_rotate._emit(deployment, "second")
+    finally:
+        os.umask(old_umask)
+    records = [json.loads(line) for line in path.read_text().splitlines()]
+    assert [record["type"] for record in records] == (
+        (["previous"] if existing_mode is not None else []) + ["first", "second"]
+    )
+    assert records[-2]["detail"] == "Authenticated as alice"
+    assert stat.S_IMODE(path.stat().st_mode) == 0o600
+
+
+def test_emit_redacts_at_audit_sink(deployment):
+    secret = "ghp_" + "a" * 36
+    cred_rotate._emit(deployment, "probe", detail=f"failure {secret}", verify="clean result")
+    record = json.loads((deployment / "rotations.jsonl").read_text())
+    assert record["detail"] == "failure [REDACTED]"
+    assert record["verify"] == "clean result"
+
+
+def test_emit_does_not_write_when_permissions_cannot_be_secured(
+    deployment, monkeypatch, capsys,
+):
+    path = deployment / "rotations.jsonl"
+    previous = '{"type": "previous"}\n'
+    path.write_text(previous)
+    path.chmod(0o644)
+
+    def denied(fd, mode):
+        raise PermissionError("cannot secure audit file")
+
+    monkeypatch.setattr(cred_rotate.os, "fchmod", denied)
+    cred_rotate._emit(deployment, "new")
+    assert path.read_text() == previous
+    assert "warn: failed to write rotations.jsonl" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("rc", [0, 1])
+@pytest.mark.parametrize("stream", ["stdout", "stderr"])
+@pytest.mark.parametrize("secret", [None, "ghp_" + "a" * 36])
+def test_rotate_redacts_probe_output(
+    fake_registry, monkeypatch, capsys, rc, stream, secret,
+):
+    detail = "Authenticated as alice" + (f" using {secret}" if secret else "")
+    expected = "Authenticated as alice" + (" using [REDACTED]" if secret else "")
+
+    def docker(compose_file, *args, **kwargs):
+        if args[0] == "up":
+            return 0, "", ""
+        if args[0] == "ps":
+            return 0, json.dumps({"Service": "agent", "State": "running"}), ""
+        assert args[0] == "exec"
+        return rc, detail if stream == "stdout" else "", detail if stream == "stderr" else ""
+
+    monkeypatch.setattr(cred_rotate, "_docker_compose", docker)
+    assert cred_rotate.run_rotate(
+        "GITHUB_TOKEN", new_value="replacement", deployment_dir=fake_registry,
+    ) == rc
+    audit = (fake_registry / "rotations.jsonl").read_text()
+    record = json.loads(audit.splitlines()[-1])
+    assert record["verify" if rc == 0 else "detail"] == expected
+    output = capsys.readouterr()
+    assert expected in (output.out if rc == 0 else output.err)
+    if secret:
+        assert secret not in audit + output.out + output.err
 
 
 @pytest.fixture

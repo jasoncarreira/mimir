@@ -441,7 +441,6 @@ def test_core_phase_contains_only_adapter_prerequisites(
 ) -> None:
     import mimir.chat_skills
     import mimir.identities
-    from mimir.saga import _config_io
 
     calls: list[Any] = []
 
@@ -463,9 +462,10 @@ def test_core_phase_contains_only_adapter_prerequisites(
         "from_config",
         lambda config: calls.append(("registry", config)) or registry,
     )
-    monkeypatch.setattr(_config_io, "get_config", lambda: lambda *args: "data/saga.sqlite")
     config = _config(tmp_path)
-    (tmp_path / "saga.toml").write_text("[storage]\n", encoding="utf-8")
+    (tmp_path / "saga.toml").write_text(
+        '[storage]\ndb_path = "data/saga.sqlite"\n', encoding="utf-8"
+    )
 
     core = runtime.create_core_services(config)
 
@@ -473,7 +473,7 @@ def test_core_phase_contains_only_adapter_prerequisites(
     assert core.aliases_loaded == 11
     assert core.chat_skill_registry is registry
     assert core.saga_db_path == tmp_path / ".mimir" / "data" / "saga.sqlite"
-    assert os.environ["SAGA_CONFIG"] == str(tmp_path / "saga.toml")
+    assert "SAGA_CONFIG" not in os.environ
 
 
 def test_core_phase_does_not_construct_runtime_or_entrypoint_collaborators(
@@ -540,13 +540,14 @@ def test_core_phase_does_not_construct_runtime_or_entrypoint_collaborators(
     assert core.saga_db_path == tmp_path / ".mimir" / "saga.db"
 
 
+@pytest.mark.parametrize("db_name", [None, "relative.db", "/elsewhere/absolute.db"])
 def test_core_preserves_saga_config_and_db_path_behavior(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    db_name: str | None,
 ) -> None:
     import mimir.chat_skills
     import mimir.identities
-    from mimir.saga import _config_io
 
     class Resolver:
         def __init__(self, *, home: Path) -> None:
@@ -563,34 +564,72 @@ def test_core_preserves_saga_config_and_db_path_behavior(
     )
     config = _config(tmp_path)
     saga_toml = tmp_path / "saga.toml"
-    saga_toml.write_text("[storage]\n", encoding="utf-8")
+    saga_toml.write_text(
+        "[storage]\n" + (f'db_path = "{db_name}"\n' if db_name else ""),
+        encoding="utf-8",
+    )
+    monkeypatch.delenv("SAGA_CONFIG", raising=False)
+    core = runtime.create_core_services(config)
+    expected = Path(db_name or "saga.db")
+    assert core.saga_db_path == tmp_path / ".mimir" / expected
+    assert "SAGA_CONFIG" not in os.environ
 
-    missing = object()
-    previous = os.environ.pop("SAGA_CONFIG", missing)
-    try:
-        monkeypatch.setattr(_config_io, "get_config", lambda: lambda *args: "relative.db")
-        core = runtime.create_core_services(config)
-        assert core.saga_db_path == tmp_path / ".mimir" / "relative.db"
-        assert os.environ["SAGA_CONFIG"] == str(saga_toml)
 
-        absolute_path = tmp_path / "elsewhere" / "absolute.db"
-        os.environ["SAGA_CONFIG"] = "/already/configured.toml"
-        monkeypatch.setattr(_config_io, "get_config", lambda: lambda *args: str(absolute_path))
-        core = runtime.create_core_services(config)
-        assert core.saga_db_path == absolute_path
-        assert os.environ["SAGA_CONFIG"] == "/already/configured.toml"
+@pytest.mark.parametrize("reverse", [False, True])
+def test_resolve_saga_db_path_is_independent_of_home_order(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, reverse: bool,
+) -> None:
+    monkeypatch.delenv("SAGA_CONFIG", raising=False)
+    homes = [tmp_path / "a", tmp_path / "b"]
+    names = ["first.db", "second.db"]
+    for home, name in zip(homes, names):
+        home.mkdir()
+        (home / "saga.toml").write_text(f'[storage]\ndb_path = "{name}"\n')
+    cases = list(zip(homes, names))
+    if reverse:
+        cases.reverse()
+    for home, name in cases + cases[::-1]:
+        assert runtime.resolve_saga_db_path(home) == home / ".mimir" / name
+    assert "SAGA_CONFIG" not in os.environ
 
-        saga_toml.unlink()
-        os.environ.pop("SAGA_CONFIG")
-        monkeypatch.setattr(_config_io, "get_config", lambda: lambda *args: "saga.db")
-        core = runtime.create_core_services(config)
-        assert core.saga_db_path == tmp_path / ".mimir" / "saga.db"
-        assert "SAGA_CONFIG" not in os.environ
-    finally:
-        if previous is missing:
-            os.environ.pop("SAGA_CONFIG", None)
-        else:
-            os.environ["SAGA_CONFIG"] = previous
+
+def test_resolve_saga_db_path_operator_config_wins(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("SAGA_CONFIG", raising=False)
+    (tmp_path / "saga.toml").write_text('[storage]\ndb_path = "home.db"\n')
+    assert runtime.resolve_saga_db_path(tmp_path) == tmp_path / ".mimir/home.db"
+    operator_config = tmp_path / "operator.toml"
+    operator_config.write_text('[storage]\ndb_path = "operator.db"\n')
+    monkeypatch.setenv("SAGA_CONFIG", str(operator_config))
+    assert runtime.resolve_saga_db_path(tmp_path) == tmp_path / ".mimir/operator.db"
+    assert os.environ["SAGA_CONFIG"] == str(operator_config)
+
+
+def test_resolve_saga_db_path_does_not_use_or_change_cached_config(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from mimir.saga import _config_io
+
+    monkeypatch.delenv("SAGA_CONFIG", raising=False)
+    cached = {"storage": {"db_path": "cached.db"}}
+    monkeypatch.setattr(_config_io, "_config", cached)
+    monkeypatch.setattr(_config_io, "_config_loaded", True)
+    (tmp_path / "saga.toml").write_text('[storage]\ndb_path = "home.db"\n')
+    assert runtime.resolve_saga_db_path(tmp_path) == tmp_path / ".mimir/home.db"
+    assert _config_io.get_config()("storage", "db_path") == "cached.db"
+    assert runtime.resolve_saga_db_path(tmp_path / "no-config") == (
+        tmp_path / "no-config/.mimir/cached.db"
+    )
+
+
+def test_resolve_saga_db_path_invalid_toml_uses_default(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture,
+) -> None:
+    monkeypatch.delenv("SAGA_CONFIG", raising=False)
+    (tmp_path / "saga.toml").write_text("[storage\n")
+    assert runtime.resolve_saga_db_path(tmp_path) == tmp_path / ".mimir/saga.db"
+    assert "Using defaults." in caplog.text
 
 
 @pytest.mark.asyncio

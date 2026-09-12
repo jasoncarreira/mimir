@@ -5,9 +5,11 @@ import io
 import json
 import os
 import re
+import shlex
 import signal
 import sys
-from collections.abc import AsyncIterator, Callable
+import time
+from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from pathlib import Path
 from types import SimpleNamespace
@@ -194,6 +196,17 @@ async def _shutdown_ceiling(
 async def _accept_unavailable_backend_risk_for_lifecycle(session_id: str) -> bool:
     """Explicit test operator consent; available backends still must confine."""
     return True
+
+
+@pytest.fixture
+def lifecycle_shell(monkeypatch: pytest.MonkeyPatch) -> str:
+    # Only generation teardown may finish this shell, not a sleep or tool timer.
+    import mimir.acp.hosted as hosted
+
+    monkeypatch.setattr(hosted, "asyncio", SimpleNamespace(**{
+        **vars(asyncio), "timeout_at": lambda deadline: asyncio.timeout(None),
+    }))
+    return f"exec {shlex.quote(sys.executable)} -c 'import signal; signal.pause()'"
 
 
 @pytest.mark.asyncio
@@ -571,9 +584,31 @@ raise SystemExit(bootstrap.main([]))
             await process.communicate()
 
 
+async def _await_diagnostic(progress: Path, marker: str, *, timeout: float = 30) -> str:
+    """Wait for a diagnostic written by the child's watchdog THREAD.
+
+    ``armed`` is written by ``Timer.start()`` on the thread that CALLS start, so
+    it orders nothing about markers written inside ``run()`` by the timer thread
+    itself. Callers must await this while the child is still ALIVE: once the
+    protocol has escalated and reaped it, no writer remains and polling the final
+    file only delays the same failure.
+    """
+    path = progress.with_suffix(".diagnostics")
+    deadline = time.monotonic() + timeout
+    while True:
+        text = path.read_text() if path.exists() else ""
+        if marker in text:
+            return text
+        assert time.monotonic() < deadline, (
+            f"{marker!r} not observed within {timeout}s; diagnostics:\n{text or '<empty>'}"
+        )
+        await asyncio.sleep(0.01)
+
+
 async def _signal_exit_protocol(
     process: asyncio.subprocess.Process, progress: Path,
     signum: signal.Signals, repeat: bool, *, timeout: float = 120,
+    after_armed: Callable[[], Awaitable[None]] | None = None,
 ) -> None:
     outstanding = "ready"
 
@@ -585,6 +620,11 @@ async def _signal_exit_protocol(
             assert observed == marker.encode() + b"\n", (marker, observed)
             if marker == "ready":
                 process.send_signal(signum)
+            elif marker == "armed" and after_armed is not None:
+                # Still alive here: escalation and communicate() come after the
+                # loop, so this is the only point where a child-thread marker
+                # can be synchronised on.
+                await after_armed()
         outstanding = "exit"
         if repeat:
             signum = signal.SIGINT if signum != signal.SIGINT else signal.SIGTERM
@@ -708,7 +748,18 @@ raise SystemExit(bootstrap.main([]))
         # The controlled watchdog and resistant stage prove the exit boundary:
         # only expiration or a second signal can release the child, regardless
         # of how long the parent takes to observe each ordered marker.
-        await _signal_exit_protocol(process, progress, signum, repeat)
+        async def _observe_input_wait() -> None:
+            # Written by the timer THREAD; the 'armed' marker above is written by
+            # the thread that CALLS start() and orders nothing about it. This must
+            # run while the child is alive: escalation and communicate() follow the
+            # protocol loop, after which no writer remains and polling the final
+            # file would only delay the same failure. Ordering only — later
+            # assertions re-read the file for markers written after this point.
+            await _await_diagnostic(progress, "watchdog-input-wait")
+
+        await _signal_exit_protocol(
+            process, progress, signum, repeat, after_armed=_observe_input_wait,
+        )
         assert progress.read_text().splitlines()[:8] == [
             "child-started", "install-enter", "handlers-installed", "ready",
             f"signal-enter:{signum}", "watchdog-start-enter",
@@ -716,7 +767,6 @@ raise SystemExit(bootstrap.main([]))
         ]
         delivered = [signum]
         diagnostics = progress.with_suffix(".diagnostics").read_text()
-        assert "watchdog-input-wait" in diagnostics
         assert "watchdog-timed-wait" not in diagnostics
         if repeat:
             delivered.append(signal.SIGINT if signum != signal.SIGINT else signal.SIGTERM)
@@ -792,6 +842,8 @@ asyncio.run(run())
     try:
         async with _shutdown_ceiling(process, progress, lambda: "flush handshake"):
             assert await process.stdout.readline() == b"flush-blocked\n"
+            # The main-thread flush marker does not order the timer thread.
+            await _await_diagnostic(progress, "watchdog-input-wait")
         with pytest.raises(pytest.fail.Exception) as failure:
             async with _shutdown_ceiling(process, progress, lambda: "exit", timeout=0.05):
                 await process.wait()
@@ -1273,7 +1325,15 @@ from types import SimpleNamespace
 from mimir.acp import bootstrap, profiles, proxy
 profiles.ProfileStore = lambda: SimpleNamespace(get=lambda name: SimpleNamespace(remote=None))
 profiles.selected_profile = lambda name: 'test'
-proxy.SIGNAL_EXIT_TIMEOUT = 0.5
+proxy.threading.Timer = InputTimer
+observed_failure = False
+original_record_failure = proxy._ShutdownHooks.record_failure
+def record_failure(self, error):
+    global observed_failure
+    original_record_failure(self, error)
+    if isinstance(error, ValueError):
+        observed_failure = True
+proxy._ShutdownHooks.record_failure = record_failure
 async def run_proxy(name, output):
     class Failing:
         async def read(self, size):
@@ -1286,7 +1346,9 @@ async def run_proxy(name, output):
                 try:
                     await asyncio.sleep(60)
                 except asyncio.CancelledError:
-                    pass
+                    assert observed_failure
+                    output.write(b'failure-draining\n')
+                    output.flush()
     await proxy.run_router(Failing(), proxy._OutputWriter(io.BytesIO()),
                            Resistant(), proxy._OutputWriter(io.BytesIO()), 'secret')
 proxy.run_proxy = run_proxy
@@ -1294,12 +1356,16 @@ raise SystemExit(bootstrap.main([]))
 '''
     process = await asyncio.create_subprocess_exec(
         sys.executable, "-c", source,
+        stdin=asyncio.subprocess.PIPE,
         stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
         cwd=Path(__file__).resolve().parents[1],
     )
     try:
         async with _shutdown_ceiling(process, progress, lambda: "exit"):
-            stdout, stderr = await process.communicate()
+            assert await process.stdout.readline() == b"failure-draining\n"
+            # Failure precedence, not scheduler speed against a real timer, is
+            # the subject. Expire only after observation and resistant drain.
+            stdout, stderr = await process.communicate(b"x")
             assert process.returncode == 1
             assert stdout == b""
             assert stderr.startswith(b"detail: ValueError at <string>:")
@@ -1772,7 +1838,7 @@ async def test_candidate_connection_does_not_retire_active_generation() -> None:
 
 @pytest.mark.asyncio
 async def test_proxy_generation_teardown_retires_hosted_ids_grants_calls_and_workers(
-    tmp_path: Path,
+    tmp_path: Path, lifecycle_shell: str,
 ) -> None:
     class Writer:
         def write(self, data: bytes) -> None:
@@ -1806,7 +1872,7 @@ async def test_proxy_generation_teardown_retires_hosted_ids_grants_calls_and_wor
             router._provider.request(
                 connection_id,
                 "tools/call",
-                {"name": "shell", "arguments": {"command": "sleep 30"}},
+                {"name": "shell", "arguments": {"command": lifecycle_shell}},
                 request_id="shell",
             )
         )
@@ -1836,7 +1902,7 @@ async def test_proxy_generation_teardown_retires_hosted_ids_grants_calls_and_wor
 
 @pytest.mark.asyncio
 async def test_daemon_eof_retires_generation_before_client_grace(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, lifecycle_shell: str,
 ) -> None:
     class Writer:
         def __init__(self) -> None:
@@ -1889,7 +1955,7 @@ async def test_daemon_eof_retires_generation_before_client_grace(
             "params": {
                 "connectionId": connection_id,
                 "method": "tools/call",
-                "params": {"name": "shell", "arguments": {"command": "sleep 30"}},
+                "params": {"name": "shell", "arguments": {"command": lifecycle_shell}},
             },
         })
         while not router._provider._processes:

@@ -1708,6 +1708,127 @@ async def test_detach_waits_for_prompt_before_reloading(
         await asyncio.gather(first, loading, cancellation_started, return_exceptions=True)
 
 
+@pytest.mark.parametrize("route", ["drain", "ordered", "failure"])
+async def test_stalled_read_peer_prompt_then_load_is_bounded(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, route: str,
+) -> None:
+    from mimir.acp import updates
+
+    bundle, core = _bundle(tmp_path)
+    agent = MimirAcpAgent(bundle)
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    class StalledClient(Client):
+        async def session_update(self, session_id: str, update: Any) -> None:
+            if entered.is_set() or update.session_update == "tool_call":
+                entered.set()
+                await release.wait()
+            await super().session_update(session_id, update)
+
+    client = StalledClient()
+    generation = agent.on_connect(client)
+    await agent.initialize(1)
+    await agent.authenticate("mimir-web-key", **{"mimir.webKey": "secret"})
+    session_id = (await agent.new_session("/one")).session_id
+    connection = agent._connections[generation]
+    state = agent._sessions[session_id]
+    monkeypatch.setattr(updates, "UPDATE_DELIVERY_TIMEOUT", 0.1)
+
+    async def turn(event: Any, **kwargs: Any) -> None:
+        core.bus.publish({
+            "turn_id": kwargs["turn_id"], "channel_id": event.channel_id,
+            "type": "tool_call", "phase": "start", "id": "stalled-tool",
+            "tool_name": "lookup",
+        })
+        await entered.wait()
+        if route == "ordered":
+            await core.channels.send(event.channel_id, "answer")
+        elif route == "failure":
+            raise RuntimeError("model failed")
+
+    core.run_turn = turn
+    prompting = asyncio.create_task(agent.prompt(session_id, [sdk.TextContentBlock(type="text", text="first")]))
+    loading = None
+    try:
+        await asyncio.wait_for(entered.wait(), 2)
+        active = state.active_prompt
+        assert active is not None
+        loading = asyncio.create_task(agent.load_session("/two", session_id))
+        # Shield so a missing production bound fails here by TimeoutError,
+        # rather than test cancellation accidentally rescuing the handler.
+        with pytest.raises(sdk.RequestError):
+            await asyncio.wait_for(asyncio.shield(loading), 3)
+        with pytest.raises(sdk.RequestError):
+            await asyncio.wait_for(asyncio.shield(prompting), 3)
+        await asyncio.wait_for(asyncio.gather(*agent._retirement_tasks), 3)
+        assert connection.transport_dead and active.transport_dead
+        assert active.completed.is_set()
+        assert not release.is_set()
+
+        replacement = Client()
+        agent.on_connect(replacement)
+        await agent.authenticate("mimir-web-key", **{"mimir.webKey": "secret"})
+        await agent.load_session("/reconnected", session_id)
+        tool_updates = [item for item in replacement.updates if getattr(item, "tool_call_id", None) == "stalled-tool"]
+        assert [item.status for item in tool_updates] == ["pending", "failed"]
+        assert not any(getattr(item, "tool_call_id", None) == "stalled-tool" for item in client.updates)
+    finally:
+        release.set()
+        tasks = [prompting, *([loading] if loading is not None else [])]
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        await asyncio.gather(*agent._retirement_tasks, return_exceptions=True)
+
+
+async def test_slow_replay_renews_waiting_prompt_drain_budget(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from mimir.acp import updates
+
+    agent, client, core = await _ready(tmp_path)
+    session_id = (await agent.new_session("/one")).session_id
+    core.pressure = 30
+    await agent.prompt(session_id, [sdk.TextContentBlock(type="text", text="history")])
+    core.pressure = 0
+    core.gate = asyncio.Event()
+    core.entered.clear()
+    prompting = asyncio.create_task(agent.prompt(session_id, [sdk.TextContentBlock(type="text", text="live")]))
+    await core.entered.wait()
+    connection = agent._connection
+    replay_started = asyncio.Event()
+    original = client.session_update
+    loop = asyncio.get_running_loop()
+
+    async def slow_update(session: str, update: Any) -> None:
+        replay_started.set()
+        ready = asyncio.Event()
+        timer = loop.call_later(0.1, ready.set)
+        try:
+            await ready.wait()
+            await original(session, update)
+        finally:
+            timer.cancel()
+
+    monkeypatch.setattr(client, "session_update", slow_update)
+    started = loop.time()
+    loading = asyncio.create_task(agent.load_session("/two", session_id))
+    try:
+        await asyncio.wait_for(replay_started.wait(), 2)
+        core.gate.set()
+        await asyncio.wait_for(asyncio.shield(loading), 15)
+        await asyncio.wait_for(asyncio.shield(prompting), 15)
+        assert loop.time() - started > updates.UPDATE_DELIVERY_TIMEOUT
+        assert not connection.transport_dead
+        assert agent._sessions[session_id].environment.cwd == "/two"
+    finally:
+        core.gate.set()
+        prompting.cancel()
+        loading.cancel()
+        await asyncio.gather(prompting, loading, return_exceptions=True)
+
+
 async def test_detaching_state_blocks_prompts_without_unbinding_replacement(tmp_path: Path) -> None:
     bundle, _ = _bundle(tmp_path)
     agent = MimirAcpAgent(bundle)
@@ -2683,7 +2804,7 @@ async def test_permission_outcome_after_trusted_cwd_read(
 
 
 @pytest.mark.parametrize("wrapper", ["hands_edit", "hands_shell", "hands_python"])
-async def test_admin_clear_restores_proxy_session_grant_until_later_ingest(
+async def test_model_clear_requires_fresh_proxy_session_grant_after_ingest(
     tmp_path: Path, middleware_event_logger: None, wrapper: str,
 ) -> None:
     from langchain.agents.middleware import ToolCallRequest
@@ -2719,12 +2840,15 @@ async def test_admin_clear_restores_proxy_session_grant_until_later_ingest(
                 "method": "session/request_permission",
                 "params": sdk.permission_request_params(session_id, snapshot),
             })
-            if snapshot.tainted:
+            if request_id in (1, 2, 4, 5, 7):
                 assert client_wire.messages[-1]["id"] == request_id
                 await router.route_client({
                     "jsonrpc": "2.0", "id": request_id,
-                    "result": {"outcome": {"outcome": "selected", "optionId": "allow_once"}},
+                    "result": {"outcome": {"outcome": "selected", "optionId":
+                        "allow_once" if request_id == 4 else "allow_session"}},
                 })
+            else:
+                assert client_wire.messages[-1]["id"] != request_id
             assert daemon_wire.messages[-1]["id"] == request_id
             return sdk.PermissionCompletion.from_response(daemon_wire.messages[-1]["result"])
 
@@ -2735,14 +2859,17 @@ async def test_admin_clear_restores_proxy_session_grant_until_later_ingest(
     await agent.authenticate("mimir-web-key", **{"mimir.webKey": "secret"})
     session_id = (await agent.new_session(str(tmp_path), mcp_servers=_hands("server"))).session_id
     router._active_sessions.add(session_id)
-    router._grants.add(session_id, wrapper)
     arguments = {
         "hands_edit": {"path": "/private/notes.txt", "old_text": "old", "new_text": "new"},
         "hands_shell": {"command": "private command"},
         "hands_python": {"code": "private_value = 1"},
     }[wrapper]
 
+    turn_count = 0
+
     async def integrated_turn(event: Any, **kwargs: Any) -> None:
+        nonlocal turn_count
+        turn_count += 1
         labels = _initialize_ifc_labels(event, resolver=bundle.core.identity_resolver)
         state = InformationFlowState(labels=labels)
         ingest = InformationFlowLabels().with_source(SourceLabel(
@@ -2750,7 +2877,6 @@ async def test_admin_clear_restores_proxy_session_grant_until_later_ingest(
             bridge_instance=None, sensitivity="public", source_kind="protected_tool",
             integrity=Integrity.UNTRUSTED, integrity_effect=IntegrityEffect.ACTIVE_INGEST,
         ))
-        state.merge(ingest)
         auth = dataclasses.replace(
             event.continuation_auth_context, interactivity=TurnInteractivity.INTERACTIVE,
             ifc_labels=labels, ifc_state=state, saga_session_id=kwargs["saga_session_id"],
@@ -2764,15 +2890,18 @@ async def test_admin_clear_restores_proxy_session_grant_until_later_ingest(
             active = agent._active_prompts[session_id]
             marker = issue_client_authorized_host_execution(
                 request_identity=object(), auth_context_identity=auth,
-                wrapper_name=wrapper, tainted=True,
+                wrapper_name=wrapper, tainted=False,
             )
             assert marker is not None
-            original = state.current()
-            for index, tainted in enumerate((True, False, True, False)):
-                if index == 2:
+            steps = range(7) if turn_count == 1 else range(7, 9)
+            for index in steps:
+                tainted = index == 3
+                if index in (1, 3, 6):
                     # Even a repeated, deduplicated source is a new ingest.
                     state.merge(ingest)
-                elif index in (1, 3):
+                if index in (1, 4, 6):
+                    # Model follows injected instructions before the proxy has
+                    # observed taint. Clearing is not an operator approval.
                     request = ToolCallRequest(
                         tool_call={"name": "clear_ingest_taint", "args": {},
                                    "id": f"clear-{index}", "type": "tool_call"},
@@ -2784,8 +2913,11 @@ async def test_admin_clear_restores_proxy_session_grant_until_later_ingest(
 
                     result = await BudgetGateMiddleware().awrap_tool_call(request, unreachable_handler)
                     assert result.status == "success", result.content
-                assert state.current() == original
-                assert state.has_untrusted_active_ingest() is True
+                if index == 6:
+                    # No post-clear permission request in this turn. The next
+                    # clean turn must still invalidate the standing grant.
+                    continue
+                assert state.has_untrusted_active_ingest() is (1 <= index <= 5)
                 assert state.permission_has_untrusted_active_ingest() is tainted
                 assert client_authorized_host_execution_metadata(marker) == (wrapper, tainted)
                 tool_id = f"hands-{index}"
@@ -2796,7 +2928,10 @@ async def test_admin_clear_restores_proxy_session_grant_until_later_ingest(
                 decision = await active.request_permission(PermissionEligibility(
                     tool_id, wrapper, "other", arguments, marker,
                 ))
-                assert decision == PermissionDecision.ALLOW_ONCE
+                assert decision == (
+                    PermissionDecision.ALLOW_SESSION if index in (0, 1, 4, 7)
+                    else PermissionDecision.ALLOW_ONCE
+                )
                 assert router._grants.allows(session_id, wrapper)
         finally:
             reset_current_turn(token)
@@ -2805,7 +2940,9 @@ async def test_admin_clear_restores_proxy_session_grant_until_later_ingest(
     try:
         response = await agent.prompt(session_id, [sdk.TextContentBlock(type="text", text="review ingest")])
         assert response.stop_reason == "end_turn"
-        assert [message["id"] for message in client_wire.messages] == [1, 3]
+        response = await agent.prompt(session_id, [sdk.TextContentBlock(type="text", text="continue")])
+        assert response.stop_reason == "end_turn"
+        assert [message["id"] for message in client_wire.messages] == [1, 2, 4, 5, 7]
         events = [json.loads(line) for line in (tmp_path / "middleware-events.jsonl").read_text().splitlines()]
         outcomes = [event for event in events if event["type"] == "acp_permission_outcome"]
         payloads = [{key: event[key] for key in (
@@ -2814,11 +2951,13 @@ async def test_admin_clear_restores_proxy_session_grant_until_later_ingest(
         assert payloads == [
             {"wrapper_name": wrapper, "tainted": tainted,
              "resource_resolvable": wrapper == "hands_edit", "outcome": outcome}
-            for tainted, outcome in ((True, "operator_allow"), (False, "session_grant"),
-                                     (True, "operator_allow"), (False, "session_grant"))
+            for tainted, outcome in ((False, "operator_allow"), (False, "operator_allow"),
+                                     (False, "session_grant"), (True, "operator_allow"),
+                                     (False, "operator_allow"), (False, "session_grant"),
+                                     (False, "operator_allow"), (False, "session_grant"))
         ]
         clears = [event for event in events if event["type"] == "ifc_ingest_taint_cleared"]
-        assert len(clears) == 2
+        assert len(clears) == 3
         assert all(event["source_count"] == 1 for event in clears)
         assert all(event["authenticated_admin"] == {
             "principal": "operator", "canonical_principal": "operator",
@@ -3202,17 +3341,20 @@ async def test_detach_cancels_turn_and_reload_reconstructs_released_journal(tmp_
     # No draining publisher survives detach. Drop our own task/ActivePrompt
     # references and prove reload works from disk, not incidental frame liveness.
     del active, prompting
+    # asyncio timeout handles retain their captured Context until the loop
+    # removes cancelled timers, even after the owning handler has completed.
+    await asyncio.sleep(0)
     gc.collect()
     assert reference() is None
     assert dict(agent._journals._retired) == {}
     await agent.load_session("/two", session_id)
     journal = agent._journals._sessions[session_id]
-    assert journal.current_client is client
+    assert journal.current_client.peer is client
     assert journal.next_sequence == 1
     successor_key = agent._execution_keys[session_id]
     await agent._detach_state(state)
     assert agent._journals._sessions[session_id] is journal
-    assert journal.current_client is client
+    assert journal.current_client.peer is client
     assert agent._execution_keys[session_id] == successor_key
     assert agent._environments[session_id][1].cwd == "/two"
     core.gate.set()
@@ -3256,7 +3398,7 @@ async def test_failed_load_releases_only_unowned_journal(
         assert agent._execution_keys == {}
     client.updates.clear()
     await agent.load_session("/retry", session_id)
-    assert agent._journals._sessions[session_id].current_client is client
+    assert agent._journals._sessions[session_id].current_client.peer is client
     assert [u.field_meta["mimir.sequence"] for u in client.updates] == list(range(5))
 
 

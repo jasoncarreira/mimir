@@ -903,6 +903,54 @@ that has never had a base must be provisioned with this clone before startup;
 Worklink does not guess a checkout or clone destination on first use and fails
 closed when `WORKLINK_REPO` is absent.
 
+### Leaf publication fence and manual reconciliation
+
+Leaf publication uses **coordination**, not GitHub-side idempotency: exclusive
+creation of `<MIMIR_HOME>/state/worklink/publications/<issue-id>.json` fences
+push/PR creation across processes sharing the same Worklink home. The record
+contains `issue` and `attempt`; both the file and its parent directory are
+fsynced before publication. After acquiring the fence, the controller scans
+all `<MIMIR_HOME>/state/worklink/evidence/<issue-id>-<attempt>.json` files, not
+just the latest attempt. Any recorded `pr_url` blocks another publication.
+The evidence directory is created if absent; unreadable or corrupt evidence
+still fails closed. Controllers using different homes are not coordinated.
+
+The trade-off is availability: the intent is removed after a failure before
+PR creation starts, or after completed PR evidence is durable. Once PR creation
+starts, an ambiguous result, cancellation, or process death can retain the
+intent indefinitely. There is no TTL-based release: claim expiry, a nonzero
+`gh` exit, or a missing `pr_url` does not prove that GitHub created no PR.
+Empty/corrupt intents also block rather than being overwritten.
+
+Operator reconciliation (manual; no automatic stale-intent deletion):
+
+1. Pause dispatch for this leaf and confirm the original controller, any
+   replacements, and their publishing subprocesses have stopped. Releasing a
+   Chainlink claim alone is insufficient. Keep the intent in place while
+   investigating; preserve copies of it, all attempt evidence, and transcripts.
+2. Read the intent's attempt and inspect **all** matching evidence and
+   transcripts under `<MIMIR_HOME>/state/worklink/`. Identify the actual remote
+   repository and every attempted branch/head; do not infer publication from
+   the most recent evidence alone.
+3. Query GitHub for PRs in **all states** for those branches, and verify the
+   repository, base, head, and issue association. An open or merged PR means
+   the leaf has published: continue with that PR, do not dispatch a new one.
+   Reconcile its URL into the correct attempt's durable evidence, preserving
+   the other fields and observed validation; never fabricate passing evidence.
+   If completed evidence cannot be safely reconstructed, retain the intent
+   and keep the leaf blocked. Only after a durable `pr_url` barrier exists may
+   the operator remove the exact intent file.
+4. If GitHub authoritatively confirms **no PR was created**, and all publishers
+   are stopped, the operator may remove that exact intent file, record the
+   verification in Chainlink, and retry under normal attempt/claim rules.
+   Never clear the publications directory wholesale. If GitHub is unavailable
+   or the outcome is ambiguous, leave the intent and the leaf blocked.
+5. A closed-unmerged PR requires an explicit decision not to resume that PR.
+   After verifying its state and preserving the records, archive its evidence
+   with a `.closed-unmerged` suffix (outside the active `.json` scan), then
+   clear the reconciled intent before an authorized retry. Do not archive
+   evidence of an open or merged PR to force a retry.
+
 Current slice-1 recovery is manual:
 
 - **PR remediation checkout lease:** never rebase inside a lease whose destination

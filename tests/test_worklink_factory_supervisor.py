@@ -43,13 +43,18 @@ s = importlib.util.spec_from_file_location('s', sys.argv[1])
 m = importlib.util.module_from_spec(s)
 s.loader.exec_module(m)
 observe = m._observe
-adopted = False
+pending = set()
 def observed(channel, primary, adoptions):
-    global adopted
+    # _observe only enumerates; the reap runs after it, over the pids it
+    # returned. An adoptee can be re-parented while still ALIVE, and then that
+    # iteration's waitpid(WNOHANG) reaps nothing. Signal on a pid we saw having
+    # LEFT the child set, which is what reaping it means, rather than on merely
+    # having seen it.
     children = observe(channel, primary, adoptions)
-    if adopted:
+    live = {pid for pid in children if pid != primary}
+    if pending and not (pending & live):
         open(sys.argv[-1] + '.checked', 'w').close()
-    adopted = adopted or any(pid != primary for pid in children)
+    pending.update(live)
     return children
 m._observe = observed
 sys.exit(m.main(sys.argv[2:]))
@@ -264,7 +269,10 @@ def test_cancellation_reaps_escaped_descendant(tmp_path):
 @pytest.mark.parametrize("payload", [ESCAPED + "\nwhile True: time.sleep(1)\n", RESPAWN],
                          ids=["escaped", "respawning"])
 def test_signalled_supervisor_reaps_every_descendant(tmp_path, mode, payload):
-    result = run_isolated(tmp_path, payload, mode=mode)
+    # The adoption assertion needs an orphan even if TERM handlers are not
+    # scheduled within the supervisor's grace period.
+    result = run_isolated(tmp_path, payload, mode=mode,
+                          term_ready_pids=6 if payload == RESPAWN else 0)
     assert_clean(result)
     assert result["reaped"], "supervisor must prove ECHILD, not just signal descendants"
     assert result["result"] == 0

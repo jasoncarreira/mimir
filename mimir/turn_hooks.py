@@ -164,8 +164,8 @@ class CommitmentExtractionHook(TurnHook):
     synthesis output and persists net-new records to the
     ``CommitmentsStore``.
 
-    Best-effort throughout: every failure path logs + returns; the
-    synthesis turn's own record is unaffected.
+    Best-effort except writer-lock timeouts, which propagate to the hook
+    dispatcher for reporting; the synthesis turn's own record is unaffected.
 
     Events emitted:
     * ``commitments_extracted`` on ≥1 added record (carries count,
@@ -215,6 +215,7 @@ class CommitmentExtractionHook(TurnHook):
             extract_commitments,
         )
         from .history import SYNTHETIC_CHANNEL_PREFIXES
+        from .commitments.store import run_store_io
 
         # Synthetic channels (``scheduler:*`` / ``poller:*``) are never
         # delivery targets for the commitment poller or prompt-block
@@ -269,14 +270,15 @@ class CommitmentExtractionHook(TurnHook):
 
         # Snapshot active dedupe keys once — N×|JSONL| in the prior
         # find_by_dedupe_key-per-record shape, N+|JSONL| this way.
-        # ``current_state`` returns active records only, matching the
-        # find_by_dedupe_key semantics.
-        state = self._store.current_state()
-        existing_keys = {
-            r.dedupe_key
-            for r in state.values()
-            if r.dedupe_key and not r.is_terminal()
-        }
+        # Offload both replay and the unbounded active-key scan.
+        def active_keys() -> set[str]:
+            return {
+                r.dedupe_key
+                for r in self._store.current_state().values()
+                if r.dedupe_key and not r.is_terminal()
+            }
+
+        existing_keys = await run_store_io(active_keys)
 
         added = 0
         skipped_dedupe = 0
@@ -303,6 +305,8 @@ class CommitmentExtractionHook(TurnHook):
                 await self._store.add(rec)
                 added += 1
                 existing_keys.add(rec.dedupe_key)
+            except TimeoutError:
+                raise
             except Exception:  # noqa: BLE001
                 log.exception(
                     "commitments store.add failed for record %s", rec.id,

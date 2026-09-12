@@ -2,18 +2,115 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import os
 import shlex
 import shutil
 import subprocess
 import sys
+import threading
 from pathlib import Path
 
 import pytest
 
 from mimir.tools import _shell_env
 from mimir.tools._shell_env import direct_exec_env, direct_exec_env_overlay
+
+
+@pytest.mark.parametrize("executable", ["gh", "git", "echo"])
+def test_output_mask_includes_only_granted_child_values(monkeypatch, executable):
+    monkeypatch.setattr(_shell_env, "direct_exec_pass_env", lambda argv: (
+        "DECLARED", "EMPTY", "ABSENT", "GITHUB_TOKEN",
+    ))
+    monkeypatch.setenv("GITHUB_TOKEN", "different-parent-secret")
+    names = _shell_env.direct_exec_redact_names([f"/usr/bin/{executable}"])
+    assert names.count("GITHUB_TOKEN") == 1
+    env = {
+        "DECLARED": "child-token-suffix", "GITHUB_TOKEN": "child-token",
+        "EMPTY": "", "HOME": "/safe/home", "PATH": "/usr/bin",
+        "LANG": "C", "GIT_OPTIONAL_LOCKS": "0",
+    }
+    text = "child-token-suffix child-token /safe/home /usr/bin C 0 different-parent-secret"
+    assert _shell_env.redact_direct_exec_output(text, env, names) == (
+        "[REDACTED] [REDACTED] /safe/home /usr/bin C 0 different-parent-secret"
+    )
+    monkeypatch.setattr(_shell_env, "direct_exec_pass_env", lambda argv: ())
+    assert _shell_env.direct_exec_redact_names([f"/usr/bin/{executable}"]) == (
+        ("GITHUB_TOKEN",) if executable == "gh" else ()
+    )
+
+
+@pytest.mark.parametrize("async_job", [False, True], ids=["sync", "async-job"])
+@pytest.mark.parametrize("exit_code", [0, 1])
+async def test_implicit_gh_token_is_masked_in_child_output(
+    tmp_path, monkeypatch, async_job, exit_code,
+):
+    from mimir.forge import github as github_module
+    from mimir.shell_jobs import ShellJobRegistry
+    from mimir.tools import forge as forge_tools, shell_async
+    from mimir.tools.extra import shell_exec
+
+    secret = "opaque-private-value-1666"
+    monkeypatch.setenv("GITHUB_TOKEN", secret)
+    monkeypatch.setenv("GH_TOKEN", "ungranted-alternate")
+    monkeypatch.setenv("UNDECLARED_TOKEN", "ungranted-private")
+    monkeypatch.setenv("MIMIR_GITHUB_SELF_LOGIN", "reviewer")
+    monkeypatch.setattr(github_module, "_verified_identity", (
+        "reviewer", hashlib.sha256(secret.encode()).hexdigest(),
+    ))
+    monkeypatch.setattr(forge_tools, "_github_identity_degraded", False)
+    monkeypatch.setattr(forge_tools, "_github_identity_degraded_error", None)
+    executable = tmp_path / "gh"
+    executable.write_text(
+        f"#!{sys.executable}\n"
+        "import os, sys\n"
+        f"assert os.environ['GITHUB_TOKEN'] == {secret!r}\n"
+        "assert 'GH_TOKEN' not in os.environ\n"
+        "assert 'UNDECLARED_TOKEN' not in os.environ\n"
+        "assert sys.argv[1:] == ['api', 'user']\n"
+        "for stream, limit in ((sys.stdout, 4000), (sys.stderr, 2000)):\n"
+        "    print('child-ok ' + os.environ['GITHUB_TOKEN'], file=stream)\n"
+        "    print('x' * (limit - 38) + os.environ['GITHUB_TOKEN'] + ' trailer' * 20, file=stream)\n"
+        f"sys.exit({exit_code})\n"
+    )
+    executable.chmod(0o755)
+    argv = [str(executable), "api", "user"]
+    token = _shell_env.bind_direct_exec_argv(argv)
+    try:
+        assert _shell_env.direct_exec_pass_env(argv) == ()
+        if async_job:
+            registry = ShellJobRegistry(jobs_dir=tmp_path / "jobs")
+            completed = threading.Event()
+            captured = []
+
+            def on_complete(job):
+                captured.append(job)
+                completed.set()
+
+            monkeypatch.setattr(shell_async, "_REGISTRY", registry)
+            monkeypatch.setattr(shell_async, "_ON_COMPLETE", on_complete)
+            result = await shell_async.bash_async.coroutine(command="gh api user")
+            assert "Spawned job" in result
+            assert await asyncio.to_thread(completed.wait, 10)
+            job = captured[0]
+            assert job.exit_code == exit_code
+            output = registry.read_job_output(job)
+            texts = [job.stdout_path.read_text(), job.stderr_path.read_text(),
+                     output["stdout_tail"], output["stderr_tail"]]
+        else:
+            result = shell_exec.invoke({"command": "gh api user"})
+            assert f"exit={exit_code}" in result
+            assert result.count("child-ok [REDACTED]") == 2
+            assert result.count("[REDACTED]") == 4
+            assert "[shell stdout truncated]" in result
+            assert "[shell stderr truncated]" in result
+            texts = [result]
+    finally:
+        _shell_env.reset_direct_exec_argv(token)
+    for text in texts:
+        assert "child-ok [REDACTED]" in text
+        assert "opaque" not in text
 
 
 @pytest.mark.parametrize("overlay", [False, True])

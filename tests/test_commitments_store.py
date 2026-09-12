@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import asyncio
+import fcntl
 import json
 import os
 import sqlite3
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -28,6 +30,117 @@ from mimir.commitments.models import CommitmentOwnershipProvenance
 
 
 # ─── make_dedupe_key ────────────────────────────────────────────────
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("operation", ["replay_async", "current_state_async", "complete", "alarm_pileup", "trim"])
+async def test_replay_leaves_loop_and_default_pool_free(tmp_path, monkeypatch, operation):
+    store = CommitmentsStore(tmp_path / "c.jsonl")
+    await store.add(CommitmentRecord(id="owned", channel_id="c1", text="Follow up"))
+    loop = asyncio.get_running_loop()
+    entered = asyncio.Event()
+    release = threading.Event()
+    replay = store.replay
+    run_in_executor = loop.run_in_executor
+    executors = []
+
+    def submit(executor, func, *args):
+        executors.append(executor)
+        assert executor is not None
+        return run_in_executor(executor, func, *args)
+
+    def blocked_replay():
+        loop.call_soon_threadsafe(entered.set)
+        assert release.wait(5), "loop did not release replay"
+        return replay()
+
+    monkeypatch.setattr(loop, "run_in_executor", submit)
+    monkeypatch.setattr(store, "replay", blocked_replay)
+    args = ("owned",) if operation in {"complete", "alarm_pileup"} else ()
+    task = asyncio.create_task(getattr(store, operation)(*args))
+    try:
+        await asyncio.wait_for(entered.wait(), 2)
+        await asyncio.sleep(0)
+        assert not task.done()
+        assert executors
+    finally:
+        release.set()
+        await task
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cancel", [False, True])
+@pytest.mark.parametrize("operation", ["add", "complete"])
+async def test_append_awaits_locked_flush_fsync(tmp_path, monkeypatch, cancel, operation):
+    store = CommitmentsStore(tmp_path / "c.jsonl")
+    await store.add(CommitmentRecord(id="owned", channel_id="c1", text="Follow up"))
+    loop = asyncio.get_running_loop()
+    entered = asyncio.Event()
+    release = threading.Event()
+    fsync = os.fsync
+
+    def blocked_fsync(fd):
+        loop.call_soon_threadsafe(entered.set)
+        assert release.wait(5), "loop did not release fsync"
+        fsync(fd)
+
+    monkeypatch.setattr("mimir.commitments.store.os.fsync", blocked_fsync)
+    arg = CommitmentRecord(id="new", channel_id="c1", text="Check result") if operation == "add" else "owned"
+    task = asyncio.create_task(getattr(store, operation)(arg))
+    try:
+        await asyncio.wait_for(entered.wait(), 2)
+        # Bytes are flushed, but neither lock nor await may finish before fsync.
+        assert len(store.path.read_text().splitlines()) == 2
+        with store.path.with_suffix(".jsonl.lock").open("a") as lock:
+            with pytest.raises(BlockingIOError):
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        if cancel:
+            task.cancel()
+            await asyncio.sleep(0)
+            task.cancel()
+            await asyncio.sleep(0)
+        assert not task.done()
+        assert store._lock.locked()
+    finally:
+        release.set()
+        if cancel:
+            with pytest.raises(asyncio.CancelledError):
+                await task
+        else:
+            await task
+    assert not store._lock.locked()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("operation", ["add", "complete"])
+async def test_writer_timeout_propagates_while_loop_progresses(tmp_path, monkeypatch, operation):
+    store = CommitmentsStore(tmp_path / "c.jsonl")
+    await store.add(CommitmentRecord(id="owned", channel_id="c1", text="Follow up"))
+    loop = asyncio.get_running_loop()
+    contended = asyncio.Event()
+    flock = fcntl.flock
+
+    def observe_flock(fd, flags):
+        try:
+            return flock(fd, flags)
+        except BlockingIOError:
+            loop.call_soon_threadsafe(contended.set)
+            raise
+
+    with store.path.with_suffix(".jsonl.lock").open("a") as lock:
+        flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        monkeypatch.setattr("mimir.commitments.store.fcntl.flock", observe_flock)
+        arg = CommitmentRecord(id="new", channel_id="c1", text="Check result") if operation == "add" else "owned"
+        started = time.monotonic()
+        task = asyncio.create_task(getattr(store, operation)(arg))
+        try:
+            await asyncio.wait_for(contended.wait(), 2)
+            assert not task.done()
+        finally:
+            with pytest.raises(TimeoutError, match="writer lock busy"):
+                await task
+        assert time.monotonic() - started >= 0.25
+    assert len(store.path.read_text().splitlines()) == 1
+    assert not store._inflight_lifecycle_ids
 
 
 def test_dedupe_key_stable_for_same_inputs():
@@ -413,14 +526,14 @@ async def test_concurrent_complete_and_expire_append_one_transition(
     ))
     entered = asyncio.Event()
     release = asyncio.Event()
-    real_to_thread = asyncio.to_thread
+    real_current_state = store.current_state_async
 
-    async def paused_to_thread(func, /, *args, **kwargs):
+    async def paused_current_state():
         entered.set()
         await release.wait()
-        return await real_to_thread(func, *args, **kwargs)
+        return await real_current_state()
 
-    monkeypatch.setattr(asyncio, "to_thread", paused_to_thread)
+    monkeypatch.setattr(store, "current_state_async", paused_current_state)
     complete = asyncio.create_task(store.complete(rec.id, message_id="m-1"))
     await asyncio.wait_for(entered.wait(), timeout=1)
     expire = asyncio.create_task(store.expire(rec.id))

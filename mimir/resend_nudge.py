@@ -16,15 +16,18 @@ raise into a turn.
 """
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import Sequence
 
-from .jsonl_snapshot import iter_window_records
 from .web_channels import WEB_CHANNEL_PREFIX
 
 #: The under-send signal the 24h tally counts — emitted by the forgot-to-send
 #: guard (#423) on every interactive turn that produced text but didn't deliver.
 _NO_SEND_EVENT = "interactive_turn_no_send_message"
+
+# Recovery needs a useful recent tally, not an exhaustive firehose scan.
+_MAX_SCAN_BYTES = 1024 * 1024
 
 
 def channel_prefix_enabled(channel_id: str | None, prefixes: Sequence[str]) -> bool:
@@ -75,16 +78,32 @@ def build_nudge_text(channel_id: str, count: int) -> str:
 
 def count_recent_no_sends(events_path: Path | str, channel_id: str, cutoff_iso: str) -> int:
     """Count prior ``interactive_turn_no_send_message`` events for ``channel_id``
-    in the window ``[cutoff_iso, now]``, read from ``events.jsonl`` the same way
-    the algedonic block counts (a windowed tail scan via
-    :func:`iter_window_records`) — one source of truth, not a parallel counter.
+    in the window ``[cutoff_iso, now]``, newest-first from ``events.jsonl``.
+
+    Reads at most 1 MiB from EOF, bounding I/O and allocation even for a huge
+    single record. Unlike ``iter_window_records``, this deliberately accepts
+    undercounting on busy logs: only the bounded tail is counted, and its first
+    line is discarded when truncated (it may be a partial record). The time
+    cutoff still stops counting early. Async callers should use ``to_thread``.
 
     Returns the count of PRIOR occurrences (the caller adds 1 for the current,
     not-yet-emitted one). Best-effort: 0 on a missing/unreadable log.
     """
     try:
         count = 0
-        for ev in iter_window_records(None, Path(events_path)):  # newest-first
+        with Path(events_path).open("rb") as stream:
+            start = max(0, stream.seek(0, 2) - _MAX_SCAN_BYTES)
+            stream.seek(start)
+            tail = stream.read(_MAX_SCAN_BYTES)
+        if start:
+            tail = tail.partition(b"\n")[2]
+        for line in reversed(tail.split(b"\n")):
+            try:
+                ev = json.loads(line)
+            except (ValueError, UnicodeError):
+                continue
+            if not isinstance(ev, dict):
+                continue
             ts = ev.get("timestamp")
             if not isinstance(ts, str) or ts < cutoff_iso:
                 if isinstance(ts, str):

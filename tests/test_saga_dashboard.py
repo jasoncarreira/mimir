@@ -1177,6 +1177,87 @@ class TestValidateSqlReadonly:
         assert _validate_sql_readonly("SELECT * FROM atoms; DELETE FROM atoms") is not None
 
 
+@pytest.mark.parametrize("key", ["MIMIR_SAGA_SQL_TIMEOUT_S", "MIMIR_SAGA_SQL_MAX_VALUE_BYTES"])
+def test_bad_sql_limit_does_not_crash_import(monkeypatch, key):
+    import subprocess
+    import sys
+
+    monkeypatch.setenv(key, "5s")
+    subprocess.run(
+        [sys.executable, "-c", "import mimir.web_ui"], check=True,
+        capture_output=True, text=True,
+    )
+
+
+@pytest.mark.parametrize(
+    "dotenv_values,process_values,expected",
+    [
+        (("30", "2000"), (None, None), (30.0, 2000)),
+        (("30", "2000"), ("7", "1000"), (7.0, 1000)),
+        (("5s", "5s"), (None, None), (5.0, 10_000_000)),
+        (("30", "2000"), ("5s", "5s"), (5.0, 10_000_000)),
+        ((None, None), (None, None), (5.0, 10_000_000)),
+        (("", ""), (None, None), (5.0, 10_000_000)),
+        (("30", "2000"), ("", ""), (5.0, 10_000_000)),
+    ],
+)
+def test_sql_limits_from_env(
+    tmp_path, monkeypatch, caplog, dotenv_values, process_values, expected
+):
+    from types import SimpleNamespace
+    from unittest.mock import Mock
+
+    from mimir import saga_dashboard as sd
+    from mimir.config import Config
+
+    keys = ("MIMIR_SAGA_SQL_TIMEOUT_S", "MIMIR_SAGA_SQL_MAX_VALUE_BYTES")
+    monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
+    lines = []
+    for key, dotenv_value, process_value in zip(keys, dotenv_values, process_values):
+        monkeypatch.delenv(key, raising=False)
+        if dotenv_value is not None:
+            lines.append(f"{key}={dotenv_value}\n")
+        if process_value is not None:
+            monkeypatch.setenv(key, process_value)
+    (tmp_path / ".env").write_text("".join(lines))
+    config = Config.from_env()
+    db_path = config.home / "saga.db"
+    _make_db(db_path).close()
+    timeout_s, max_bytes = expected
+
+    # Exercise SQLite's actual handler just before and after the resolved budget,
+    # without waiting for a real default/override timeout or patching shared time.
+    clock = Mock(side_effect=[100.0, 100.0 + timeout_s - 0.1, 100.0 + timeout_s + 0.1])
+    monkeypatch.setattr(sd, "time", SimpleNamespace(monotonic=clock))
+    result = build_sql_payload(db_path, (
+        "WITH RECURSIVE c(x) AS ("
+        "SELECT 1 UNION ALL SELECT x + 1 FROM c WHERE x < 10000"
+        ") SELECT count(*) FROM c"
+    ))
+    assert result == {
+        "error": f"query exceeded the {timeout_s:g}s time limit", "rejected": False,
+    }
+    assert clock.call_count == 3
+
+    clock.side_effect = None
+    clock.return_value = 100.0
+    result = build_sql_payload(db_path, f"SELECT length(zeroblob({max_bytes - 1}))")
+    assert result["rows"] == [[max_bytes - 1]]
+    result = build_sql_payload(db_path, f"SELECT length(zeroblob({max_bytes + 1}))")
+    assert result.get("rejected") is False
+    assert "too big" in result["error"]
+
+    for key, dotenv_value, process_value, kind, default in zip(
+        keys, dotenv_values, process_values, ("float", "integer"), (5.0, 10_000_000)
+    ):
+        value = process_value if process_value is not None else dotenv_value
+        warning = f"{key}='5s' is not a valid {kind}; using default {default!r}"
+        if value == "5s":
+            assert warning in caplog.text
+        else:
+            assert warning not in caplog.text
+
+
 class TestBuildSqlPayload:
     """Unit-tests for build_sql_payload (uses a real in-memory DB path)."""
 
@@ -1233,7 +1314,7 @@ class TestBuildSqlPayload:
         """chainlink #611: a CPU-bound recursive CTE (which the 1000-row cap
         does NOT bound — it returns a single count()) is aborted by the
         wall-clock budget instead of pinning a to_thread worker indefinitely."""
-        monkeypatch.setattr("mimir.saga_dashboard._SQL_TIMEOUT_S", 0.1)
+        monkeypatch.setenv("MIMIR_SAGA_SQL_TIMEOUT_S", "0.1")
         db_path = tmp_path / "saga.db"
         _make_db(db_path).close()
         bomb = (
@@ -1253,7 +1334,7 @@ class TestBuildSqlPayload:
         rather than OOMing the worker."""
         if not hasattr(sqlite3.Connection, "setlimit"):
             pytest.skip("Connection.setlimit requires Python 3.11+")
-        monkeypatch.setattr("mimir.saga_dashboard._SQL_MAX_VALUE_BYTES", 1000)
+        monkeypatch.setenv("MIMIR_SAGA_SQL_MAX_VALUE_BYTES", "1000")
         db_path = tmp_path / "saga.db"
         _make_db(db_path).close()
         result = build_sql_payload(db_path, "SELECT zeroblob(5000000)")

@@ -229,7 +229,9 @@ class TurnEventEmitter:
 
             ctx = get_current_turn()
             if ctx is not None and getattr(ctx, "turn_id", None) == self._turn_id:
-                self._ifc_labels = getattr(ctx, "ifc_labels", self._ifc_labels)
+                # Missing live labels must not erase the last known carrier.
+                if ctx.ifc_labels is not None:
+                    self._ifc_labels = ctx.ifc_labels
                 self._auth_context = getattr(ctx, "auth_context", self._auth_context)
             self._seq += 1
             event = {

@@ -49,6 +49,8 @@ from typing import Any, Callable, Literal
 
 import yaml
 
+from .redaction import redact_text
+
 log = logging.getLogger(__name__)
 
 
@@ -465,6 +467,7 @@ def verify(name: str, home: Path | None = None) -> ProbeResult:
             detail=f"unknown credential: {name!r}",
         )
     ok, detail = probe.fn()
+    detail = redact_text(detail)
     status: ProbeStatus
     if probe.kind == "not_implemented":
         status = "skipped"

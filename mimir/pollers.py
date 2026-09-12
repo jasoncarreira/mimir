@@ -504,6 +504,23 @@ def _redact_poller_env_values(
     return out
 
 
+def _redact_poller_payload(
+    value: Any, env: dict[str, str], redact_keys: set[str] | frozenset[str],
+) -> Any:
+    """Copy JSON metadata, masking explicitly forwarded values at every depth."""
+    if isinstance(value, str):
+        return _redact_poller_env_values(value, env, redact_keys)
+    if isinstance(value, dict):
+        return {
+            (_redact_poller_env_values(key, env, redact_keys)
+             if isinstance(key, str) else key): _redact_poller_payload(item, env, redact_keys)
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [_redact_poller_payload(item, env, redact_keys) for item in value]
+    return value
+
+
 def _github_api_attestation(
     endpoint: str,
     token: str,
@@ -2870,6 +2887,9 @@ async def run_poller(
         if not prompt:
             continue
 
+        # Mask before either prompt cap can leave a partial secret behind.
+        prompt = _redact_poller_env_values(prompt, env, explicit_env_redact_keys)
+
         # Per-item cap: only when batch_size > 1. Prevents one runaway
         # item from starving others in a batched render. Marks the
         # truncation as ``scope=per_item`` so an operator can tell it
@@ -3035,7 +3055,7 @@ async def run_poller(
             content=content,
             source="poller",
             source_id=f"{POLLER_CHANNEL_PREFIX}{poller.name}:{fire_ts_ms}:batch:{batch_idx}",
-            extra=extra,
+            extra=_redact_poller_payload(extra, env, explicit_env_redact_keys),
             # Stamp provenance before recovery stashes the event. Retries now
             # round-trip the exact service label instead of rebuilding it from
             # ambient state after a failed turn.

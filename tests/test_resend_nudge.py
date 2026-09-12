@@ -92,6 +92,74 @@ def test_count_recent_no_sends_missing_log_returns_zero(tmp_path):
     assert count_recent_no_sends(tmp_path / "nope.jsonl", "discord-1", "2026-06-17T00:00:00+00:00") == 0
 
 
+@pytest.mark.parametrize("trailing_newline", [False, True])
+def test_count_recent_no_sends_byte_cap(tmp_path, monkeypatch, trailing_newline):
+    from mimir import resend_nudge
+
+    events = tmp_path / "events.jsonl"
+    row = json.dumps({
+        "timestamp": "2026-06-17T12:00:00+00:00",
+        "type": "interactive_turn_no_send_message",
+        "channel_id": "discord-1",
+        "text": "\u00e9",
+    }, ensure_ascii=False).encode()
+    suffix = b"\n" if trailing_newline else b""
+    events.write_bytes((row + b"\n") * 10 + row + suffix)
+    # Include two complete records, but not the beginning of the third.
+    monkeypatch.setattr(resend_nudge, "_MAX_SCAN_BYTES", 2 * len(row) + 2 + len(suffix))
+    assert count_recent_no_sends(events, "discord-1", "2026-06-17") == 2
+
+
+@pytest.mark.parametrize("recent_record", [False, True])
+def test_count_recent_no_sends_huge_record_read_is_bounded(tmp_path, monkeypatch, recent_record):
+    from pathlib import Path
+    from mimir import resend_nudge
+
+    events = tmp_path / "events.jsonl"
+    row = json.dumps({
+        "timestamp": "2026-06-17T12:00:00+00:00",
+        "type": "interactive_turn_no_send_message",
+        "channel_id": "discord-1",
+    }).encode() + b"\n"
+    cap = resend_nudge._MAX_SCAN_BYTES
+    events.write_bytes(b'{"text":"' + b"x" * (cap * 3) + b'"}\n' + (row if recent_record else b""))
+    original_open = Path.open
+    reads = []
+
+    class TrackedFile:
+        def __enter__(self):
+            self.stream = original_open(events, "rb")
+            return self
+
+        def __exit__(self, *args):
+            self.stream.close()
+
+        def seek(self, *args):
+            return self.stream.seek(*args)
+
+        def read(self, size=-1):
+            assert 0 <= size <= cap
+            data = self.stream.read(size)
+            reads.append(len(data))
+            return data
+
+    monkeypatch.setattr(Path, "open", lambda *args, **kwargs: TrackedFile())
+    assert count_recent_no_sends(events, "discord-1", "2026-06-17") == int(recent_record)
+    assert sum(reads) == cap
+
+
+def test_count_recent_no_sends_skips_bad_records(tmp_path):
+    events = tmp_path / "events.jsonl"
+    _write_events(events, [{
+        "timestamp": "2026-06-17T00:00:00+00:00",
+        "type": "interactive_turn_no_send_message",
+        "channel_id": "discord-1",
+    }])
+    with events.open("ab") as stream:
+        stream.write(b'\nnull\n[]\n42\n{}\n{"timestamp": 123}\n\xff\n{"torn":')
+    assert count_recent_no_sends(events, "discord-1", "2026-06-17T00:00:00+00:00") == 1
+
+
 def test_config_resend_nudge_channels_env(monkeypatch):
     monkeypatch.setenv("MIMIR_HOME", "/tmp/resend-nudge-test-home")
     monkeypatch.setenv("MIMIR_RESEND_NUDGE_CHANNELS", "discord-, slack-")

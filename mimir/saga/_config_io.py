@@ -204,8 +204,6 @@ _DEFAULTS = {
         "max_stability": 10.0,
         "intentional_forgetting_enabled": False,
         "intentional_forgetting_mode": "flag",  # "flag" | "auto"
-        "forgetting_contribution_threshold": 0.15,
-        "forgetting_contradiction_threshold": 0.85,
         "protection_days": 7,
         "compaction_full_min_age_days": 7,
         "compaction_full_max_access": 3,

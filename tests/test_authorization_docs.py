@@ -13,6 +13,16 @@ def _section(text: str, heading: str) -> str:
     return remainder.split("\n### ", 1)[0]
 
 
+def test_mid_turn_injection_documents_principal_not_audience_authority() -> None:
+    section = _section(DOC.read_text(encoding="utf-8"), "Mid-turn injection")
+    for phrase in (
+        "frozen `AuthContext`", "Same-principal aliases", "unknown identities",
+        "shadow mode", "fresh turn", "FIFO", "IFC `authorized_principals`",
+        "before consent is", "different operator cannot inject",
+    ):
+        assert phrase in section
+
+
 def test_contained_execution_surfaces_are_not_listed_as_agent_user() -> None:
     text = DOC.read_text(encoding="utf-8")
     residual = _section(text, "Surfaces that still execute as the agent user")

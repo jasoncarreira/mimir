@@ -68,6 +68,18 @@ class ProxySignalExit(Exception):
 class PermissionGrantStore:
     def __init__(self) -> None:
         self._grants: set[tuple[str, str]] = set()
+        self._ingest_acknowledgements: dict[str, str] = {}
+
+    def ingest_boundary(self, session_id: str, acknowledgement: str | None = None) -> str | None:
+        # A model can acknowledge ingest, but cannot renew a human's grant.
+        # Retain the boundary across fresh turns (which have no acknowledgement).
+        if (
+            acknowledgement is not None
+            and acknowledgement != self._ingest_acknowledgements.get(session_id)
+        ):
+            self.revoke_session(session_id)
+            self._ingest_acknowledgements[session_id] = acknowledgement
+        return self._ingest_acknowledgements.get(session_id)
 
     def add(self, session_id: str, wrapper_name: str) -> None:
         self._grants.add((session_id, wrapper_name))
@@ -76,12 +88,14 @@ class PermissionGrantStore:
         return (session_id, wrapper_name) in self._grants
 
     def revoke_session(self, session_id: str) -> None:
+        self._ingest_acknowledgements.pop(session_id, None)
         self._grants = {
             grant for grant in self._grants if grant[0] != session_id
         }
 
     def clear(self) -> None:
         self._grants.clear()
+        self._ingest_acknowledgements.clear()
 
     def __len__(self) -> int:
         return len(self._grants)
@@ -202,6 +216,7 @@ class _PendingPermission:
     session_id: str
     wrapper_name: str
     generation: object
+    ingest_boundary: str | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -248,7 +263,7 @@ def _related_permission(message: dict[str, Any]) -> bool:
 
 def _permission_candidate(
     message: dict[str, Any], kind: str
-) -> tuple[str, str, bool] | None:
+) -> tuple[str, str, bool, str | None] | None:
     if not _related_permission(message):
         return None
     if kind != "request" or set(message) != {"jsonrpc", "id", "method", "params"}:
@@ -263,7 +278,13 @@ def _permission_candidate(
     reserved = {
         key for key in metadata if key == "mimir" or key.startswith("mimir.")
     }
-    if not reserved.issubset({"mimir.wrapper", "mimir.tainted"}):
+    if not reserved.issubset({"mimir.wrapper", "mimir.tainted", "mimir.ingest_acknowledgement"}):
+        raise ProxyError("invalid reserved permission metadata")
+    acknowledgement = metadata.get("mimir.ingest_acknowledgement")
+    if "mimir.ingest_acknowledgement" in metadata and (
+        not isinstance(acknowledgement, str) or len(acknowledgement) != 32
+        or any(char not in "0123456789abcdef" for char in acknowledgement)
+    ):
         raise ProxyError("invalid reserved permission metadata")
     wrapper_name = metadata.get("mimir.wrapper")
     if wrapper_name not in HANDS_PERMISSION_ARGUMENTS:
@@ -296,7 +317,7 @@ def _permission_candidate(
         or any(not isinstance(value, str) for value in raw_input.values())
     ):
         raise ProxyError("invalid reserved permission request")
-    return session_id, wrapper_name, "mimir.tainted" in metadata
+    return session_id, wrapper_name, "mimir.tainted" in metadata, acknowledgement
 
 
 def _permission_response_decision(message: dict[str, Any]) -> str | None:
@@ -462,6 +483,7 @@ class ProxyRouter:
             if (
                 isinstance(pending, _PendingPermission)
                 and decision == "allow_session"
+                and pending.ingest_boundary == self._grants.ingest_boundary(pending.session_id)
             ):
                 self._grants.add(
                     pending.session_id, pending.wrapper_name
@@ -512,13 +534,14 @@ class ProxyRouter:
             key = _request_key(message["id"])
             self._register_daemon(key)
             if candidate is not None:
-                session_id, wrapper_name, tainted = candidate
+                session_id, wrapper_name, tainted, acknowledgement = candidate
                 if session_id not in self._active_sessions:
                     self._daemon_requests.pop(key, None)
                     self._grants.revoke_session(session_id)
                     raise ProxyError("stale reserved permission request")
                 pending_permission = _PendingPermission(
-                    session_id, wrapper_name, self._generation
+                    session_id, wrapper_name, self._generation,
+                    self._grants.ingest_boundary(session_id, acknowledgement),
                 )
                 if self._grants.allows(session_id, wrapper_name) and not tainted:
                     self._daemon_requests.pop(key)

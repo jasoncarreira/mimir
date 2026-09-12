@@ -432,6 +432,14 @@ class GitHubForgeClient:
             base_sha=str(base.get("sha", "")),
         )
 
+    def author_is_trusted(self, repository: str, author: str) -> bool | None:
+        """Share poller collaborator/org attestation, not payload trust claims."""
+        from ..pollers import _github_author_is_trusted
+
+        return _github_author_is_trusted(
+            repository, author, self._token, timeout=self._timeout,
+        )
+
     def get_pull_request(self, scope: RepoPRActionScope) -> PullRequestProjection:
         repository, number = self._target(scope)
         data = self._request("GET", f"/repos/{repository}/pulls/{number}")

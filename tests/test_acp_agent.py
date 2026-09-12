@@ -94,7 +94,7 @@ async def test_load_session_reads_and_validates_once_off_loop(
         assert threading.get_ident() == loop_thread
         updates.append(update)
 
-    client = agent._require_client()
+    client = agent._require_client().peer
     client.session_update = session_update
     loop_thread = threading.get_ident()
     await journal.publish_live(sdk.UserMessageChunk(
@@ -120,6 +120,23 @@ async def test_load_session_reads_and_validates_once_off_loop(
     assert updates[0].content.text == "persisted"
     assert updates[0].field_meta == {"mimir.sequence": 0}
     assert agent._journals._sessions[session_id].next_sequence == 1
+
+
+async def test_update_progress_is_scoped_to_connection(tmp_path: Path) -> None:
+    agent, _, generation = await _agent_with_session(tmp_path)
+    renewed = []
+    agent._active_prompts = {
+        "current": SimpleNamespace(
+            generation=generation,
+            dispatcher=SimpleNamespace(_made_progress=lambda: renewed.append("current")),
+        ),
+        "other": SimpleNamespace(
+            generation=generation + 1,
+            dispatcher=SimpleNamespace(_made_progress=lambda: renewed.append("other")),
+        ),
+    }
+    agent._on_update_progress(generation)
+    assert renewed == ["current"]
 
 
 def _dump(response: Any) -> dict[str, Any]:

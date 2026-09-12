@@ -488,13 +488,38 @@ class InformationFlowLabels:
 
 
 @dataclass
+class RepositoryAuthorTrustCache:
+    """Turn-local GitHub verdicts; transport uncertainty is never cached."""
+
+    _verdicts: dict[tuple[str, str], bool] = field(default_factory=dict, repr=False)
+    _lock: Any = field(default_factory=threading.Lock, repr=False, compare=False)
+
+    def resolve(self, repository: str, author: str, attest: Any) -> bool | None:
+        key = (repository.casefold(), author.casefold())
+        # Serialize concurrent reads so one author incurs only one attestation.
+        # Callers execute in worker threads, never on the event loop.
+        with self._lock:
+            if key in self._verdicts:
+                return self._verdicts[key]
+            verdict = attest()
+            if type(verdict) is bool:
+                self._verdicts[key] = verdict
+                return verdict
+            return None
+
+
+@dataclass
 class InformationFlowState:
     """Turn-local monotonic IFC state shared by frozen runtime carriers."""
 
+    repository_author_trust: RepositoryAuthorTrustCache = field(
+        default_factory=RepositoryAuthorTrustCache, repr=False, compare=False, init=False,
+    )
     labels: InformationFlowLabels | None = None
     _declassification: "DeclassificationCapability | None" = field(
         default=None, repr=False, compare=False,
     )
+    _shadow_declassification_used: bool = field(default=False, repr=False, compare=False)
     _sink_category_capabilities: dict[str, "SinkCategoryCapability"] = field(
         default_factory=dict, repr=False, compare=False,
     )
@@ -703,6 +728,7 @@ class InformationFlowState:
                 issued_at=issued_at,
                 expires_at=expires_at,
             )
+            self._shadow_declassification_used = False
             return True
 
     def consume_sink_approval(
@@ -713,14 +739,16 @@ class InformationFlowState:
         destination: str,
         canonical_principal: str,
         turn_id: str | None = None,
+        shadow: bool = False,
     ) -> bool:
-        """Admit an exact one-shot or matching reusable category capability."""
+        """Admit a capability, accounting shadow one-shot use without spending it."""
         with self._lock:
             live = self.labels if self.labels is not None else current
             capability = self._declassification
-            if capability is not None:
+            if capability is not None and not (shadow and self._shadow_declassification_used):
                 if time.monotonic() > capability.expires_at:
-                    self._declassification = None
+                    if not shadow:
+                        self._declassification = None
                 else:
                     matches = (
                         capability.sink_category == sink_category
@@ -732,7 +760,10 @@ class InformationFlowState:
                         and capability.sources == live.sources == current.sources
                     )
                     if matches:
-                        self._declassification = None
+                        if shadow:
+                            self._shadow_declassification_used = True
+                        else:
+                            self._declassification = None
                         return True
             category_capability = self._sink_category_capabilities.get(sink_category)
             return bool(

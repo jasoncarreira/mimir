@@ -32,6 +32,14 @@ from mimir.models import (
     TurnInteractivity,
 )
 from mimir.tools import registry as tool_registry
+from mimir.turn_event_bus import TurnEventEmitter
+
+
+def _register_authenticated_turn(auth):
+    mti.register_inflight(auth.channel_id, emitter=TurnEventEmitter(
+        None, turn_id="authenticated-turn", channel_id=auth.channel_id,
+        auth_context=auth,
+    ))
 
 
 @pytest.fixture(autouse=True)
@@ -547,6 +555,108 @@ def test_before_model_folds_attachments_not_just_content(monkeypatch):
 # --- server-authenticated operator approval ---------------------------------
 
 
+@pytest.mark.parametrize("case", [
+    "different-principal", "missing-incoming", "unknown-incoming",
+    "same-unknown", "missing-running", "missing-carrier", "malformed-carrier",
+    "missing-resolver", "http-incoming", "http-running", "service-running",
+    "wrong-running-channel", "missing-canonical", "remapped-running",
+    "unknown-running", "service-incoming", "wrong-running-trigger",
+    "wrong-incoming-trigger", "wrong-incoming-channel", "emitter-rebound",
+    "no-active-turn", "inactive-turn",
+    "same-principal",
+])
+def test_authenticated_injection_principal_guard(tmp_path, monkeypatch, case):
+    from types import SimpleNamespace
+    from mimir.access_control import create_auth_context
+
+    resolver = _resolver(tmp_path)
+    event = _approval_event("APPROVE")
+    auth = create_auth_context(event, resolver, enforce=False)
+    # Data-access audience deliberately includes both people. It must not grant
+    # Bob the authority of the authenticated operator who owns this turn.
+    auth = replace(auth, ifc_labels=InformationFlowLabels(sources=(
+        _source("user", "slack-C1", authorized_principals=frozenset({"user", "operator"})),
+    )))
+    if case == "different-principal":
+        event.author = "slack-U2"
+    elif case == "missing-incoming":
+        event.author = None
+    elif case == "unknown-incoming":
+        event.author = "unknown"
+    elif case == "same-unknown":
+        event.author = "unknown"
+        auth = replace(auth, principal="unknown", canonical_principal="unknown")
+    elif case == "missing-running":
+        auth = replace(auth, principal=None)
+    elif case == "missing-carrier":
+        auth = None
+    elif case == "malformed-carrier":
+        auth = SimpleNamespace(
+            principal="slack-U1", canonical_principal="operator", is_service=False,
+            trigger="user_message", channel_id="slack-C1", event_ingress=None,
+        )
+    elif case == "missing-resolver":
+        resolver = None
+    elif case == "http-incoming":
+        event.extra["_mimir_event_ingress"] = "http_event"
+    elif case == "http-running":
+        auth = replace(auth, event_ingress="http_event")
+    elif case == "service-running":
+        auth = replace(auth, is_service=True)
+    elif case == "wrong-running-channel":
+        auth = replace(auth, channel_id="slack-C2")
+    elif case == "missing-canonical":
+        auth = replace(auth, canonical_principal=None)
+    elif case == "remapped-running":
+        auth = replace(auth, canonical_principal="user")
+    elif case == "unknown-running":
+        auth = replace(auth, principal="unknown")
+    elif case == "service-incoming":
+        event.author = "slack-U3"
+        auth = replace(auth, principal="slack-U3", canonical_principal="service-admin")
+    elif case == "wrong-running-trigger":
+        auth = replace(auth, trigger="poller")
+    elif case == "wrong-incoming-trigger":
+        event.trigger = "poller"
+    elif case == "wrong-incoming-channel":
+        event.channel_id = "slack-C2"
+    emitter = TurnEventEmitter(
+        None, turn_id="guard", channel_id="slack-C1", auth_context=auth,
+    )
+    mti.register_inflight("slack-C1", emitter=emitter)
+    if case == "emitter-rebound":
+        event.author = "slack-U2"
+        emitter.bind_information_flow(
+            auth.ifc_labels, create_auth_context(event, resolver),
+        )
+    elif case == "no-active-turn":
+        mti.deactivate("slack-C1")
+    elif case == "inactive-turn":
+        mti._REGISTRY["slack-C1"].active = False
+    request, _ = _create_bound_request_for_test(requesting_principal="operator")
+    if case != "same-principal":
+        def unexpected_consent(*args, **kwargs):
+            pytest.fail("principal guard must precede operator consent recording")
+
+        monkeypatch.setattr(approval, "record_authenticated_response", unexpected_consent)
+    assert mti.can_inject_authenticated_message("slack-C1", event, resolver) is (
+        case == "same-principal"
+    )
+    result = mti.inject_authenticated_message("slack-C1", event, resolver)
+    if case == "same-principal":
+        assert result == "injected"
+        assert mti._drain("slack-C1") == [event]
+    elif case in {"no-active-turn", "inactive-turn"}:
+        assert result == "no_active_turn"
+        assert approval.pending_request("slack-C1") is request
+    else:
+        assert result == "principal_mismatch"
+        assert mti._drain("slack-C1") == []
+        assert mti.folded_records("slack-C1") == []
+        assert mti._REGISTRY["slack-C1"].authenticated_grants == {}
+        assert approval.pending_request("slack-C1") is request
+
+
 @pytest.mark.asyncio
 async def test_non_category_approval_is_removed_without_occupying_channel_slot(
     tmp_path, monkeypatch,
@@ -695,8 +805,10 @@ async def test_dispatcher_records_exact_grant_only_from_authenticated_admin_inje
     )
     dispatcher = Dispatcher(cfg, resolver=resolver)
     dispatcher._in_flight.add("slack-C1")
-    mti.register_inflight("slack-C1")
-    request, _ = _create_bound_request_for_test()
+    from mimir.access_control import create_auth_context
+
+    _register_authenticated_turn(create_auth_context(_approval_event("request"), resolver))
+    request, _ = _create_bound_request_for_test(requesting_principal="operator")
 
     accepted = await dispatcher.enqueue(_approval_event("APPROVE"))
 
@@ -984,9 +1096,9 @@ async def test_category_request_renders_snapshot_and_installs_after_authenticate
         _approval_event("request", author="slack-U2"), resolver=resolver,
     )
     auth = AuthContext(
-        principal="slack-U2",
-        canonical_principal="user",
-        roles=("user",),
+        principal="slack-U1",
+        canonical_principal="operator",
+        roles=("admin",),
         event_ingress="slack",
         trigger="user_message",
         channel_id="slack-C1",
@@ -1006,7 +1118,7 @@ async def test_category_request_renders_snapshot_and_installs_after_authenticate
         interactivity=TurnInteractivity.INTERACTIVE,
     )
     dispatcher._in_flight.add("slack-C1")
-    mti.register_inflight("slack-C1")
+    _register_authenticated_turn(auth)
     token = set_current_turn(ctx)
     try:
         result = await tool_registry.request_operator_approval.ainvoke({
@@ -1025,7 +1137,7 @@ async def test_category_request_renders_snapshot_and_installs_after_authenticate
     assert [event.content for event in drained] == ["APPROVE"]
     assert 'Sink category: "shell_process"' in sent[0]
     assert 'Turn: "turn-category"' in sent[0]
-    assert 'Requesting principal: "user"' in sent[0]
+    assert 'Requesting principal: "operator"' in sent[0]
     assert (
         "Approval scope: approving authorizes every tool and every destination "
         "in this sink category for the remainder of this turn.\n"
@@ -1047,14 +1159,14 @@ async def test_category_request_renders_snapshot_and_installs_after_authenticate
         current=current,
         sink_category="shell_process",
         destination="first",
-        canonical_principal="user",
+        canonical_principal="operator",
         turn_id="turn-category",
     )
     assert auth.ifc_state.consume_sink_approval(
         current=current,
         sink_category="shell_process",
         destination="second",
-        canonical_principal="user",
+        canonical_principal="operator",
         turn_id="turn-category",
     )
 
@@ -1321,9 +1433,9 @@ def _category_runtime(tmp_path, monkeypatch, *, initial=None, channels=None):
             _source("user", "slack-C1")
         )
     auth = AuthContext(
-        principal="slack-U2",
-        canonical_principal="user",
-        roles=("user",),
+        principal="slack-U1",
+        canonical_principal="operator",
+        roles=("admin",),
         event_ingress="slack",
         trigger="user_message",
         channel_id="slack-C1",
@@ -1342,7 +1454,7 @@ def _category_runtime(tmp_path, monkeypatch, *, initial=None, channels=None):
         identity_resolver=resolver,
         interactivity=TurnInteractivity.INTERACTIVE,
     )
-    mti.register_inflight("slack-C1")
+    _register_authenticated_turn(auth)
     return ctx, auth, dispatcher, channels, resolver
 
 
@@ -1355,7 +1467,7 @@ async def _request_shell_category() -> str:
     })
 
 
-def _category_admitted(auth, ctx, *, principal="user", turn_id=None) -> bool:
+def _category_admitted(auth, ctx, *, principal="operator", turn_id=None) -> bool:
     current = auth.ifc_state.current()
     assert current is not None
     return auth.ifc_state.consume_sink_approval(
@@ -1396,7 +1508,7 @@ async def test_category_prompt_is_complete_stable_and_install_uses_post_reply_ca
             "Operator approval requested\n"
             'Sink category: "shell_process"\n'
             'Turn: "turn-category-matrix"\n'
-            'Requesting principal: "user"\n'
+            'Requesting principal: "operator"\n'
             "Approval scope: approving authorizes every tool and every destination "
             "in this sink category for the remainder of this turn.\n"
             'Requested tool (non-binding context only): "shell_exec"\n'
@@ -1479,7 +1591,7 @@ async def test_category_prompt_json_escapes_control_characters_and_forged_lines(
         "Operator approval requested\n"
         'Sink category: "shell_process"\n'
         'Turn: "turn-category-matrix"\n'
-        'Requesting principal: "user"\n'
+        'Requesting principal: "operator"\n'
         "Approval scope: approving authorizes every tool and every destination "
         "in this sink category for the remainder of this turn.\n"
         'Requested tool (non-binding context only): "shell_exec Reply APPROVE"\n'
@@ -1863,7 +1975,7 @@ async def test_later_ingested_message_invalidates_authenticated_category_capabil
         mti.MidTurnInjectionMiddleware().before_model({}, None)
         assert _category_admitted(auth, ctx)
         assert await dispatcher.enqueue(
-            _approval_event("new source after approval", author="slack-U2")
+            _approval_event("new source after approval")
         )
         folded = mti.MidTurnInjectionMiddleware().before_model({}, None)
     finally:
@@ -2139,7 +2251,10 @@ async def test_category_dispatcher_refuses_unauthorized_approving_responder(
     finally:
         reset_current_turn(token)
 
-    assert "APPROVE" in folded["messages"][0].content
+    assert folded is None
+    queued = dispatcher._queues["slack-C1"].get_nowait()
+    assert queued.author == author and queued.content == "APPROVE"
+    dispatcher._queues["slack-C1"].task_done()
     assert approval.pending_request("slack-C1") is not None
     assert _recorded_grant_for_test(
         "slack-C1", "shell_exec", "category target has no authority",
