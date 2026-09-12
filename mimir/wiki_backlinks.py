@@ -40,6 +40,7 @@ import re
 import sys
 import tempfile
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
@@ -489,6 +490,11 @@ def render_backlinks_index_md(
 # ─── Driver ──────────────────────────────────────────────────────────
 
 
+# Keep wiki scans off the shared default pool and serialize report writers.
+# Threads start on first submission and are joined at interpreter shutdown.
+_BACKLINKS_EXECUTOR = ThreadPoolExecutor(max_workers=1, thread_name_prefix="wiki-backlinks")
+
+
 def _atomic_write_text(path: Path, content: str) -> None:
     """Write text via a same-directory temporary file and atomic replace."""
     fd, tmp_name = tempfile.mkstemp(
@@ -506,12 +512,8 @@ def _atomic_write_text(path: Path, content: str) -> None:
         raise
 
 
-async def run(home: Path) -> dict:
-    """Walk the wiki, write all three reports, emit the algedonic event
-    if the wiki has any orphans or dangling links.
-
-    Returns a summary dict with ``page_count``, ``orphan_count``,
-    ``dangling_count`` — useful for the CLI's stdout summary."""
+def _scan_and_write_reports(home: Path) -> tuple[BacklinksGraph, str]:
+    """Perform the complete synchronous scan/render/write job off-loop."""
     wiki_dir = home / "state" / "wiki"
     if not wiki_dir.is_dir():
         raise FileNotFoundError(f"no wiki at {wiki_dir}")
@@ -529,6 +531,22 @@ async def run(home: Path) -> dict:
         wiki_dir / "backlinks-index.md", render_backlinks_index_md(graph, generated_at),
     )
 
+    return graph, generated_at
+
+
+async def run(home: Path) -> dict:
+    """Walk the wiki, write all three reports, emit the algedonic event
+    if the wiki has any orphans or dangling links.
+
+    Returns a summary dict with ``page_count``, ``orphan_count``,
+    ``dangling_count`` — useful for the CLI's stdout summary.
+
+    Filesystem work runs on a dedicated executor; logging stays on this loop.
+    Cancellation stops awaiting the job, not an already-running report write.
+    """
+    graph, generated_at = await asyncio.get_running_loop().run_in_executor(
+        _BACKLINKS_EXECUTOR, _scan_and_write_reports, home,
+    )
     page_count = len(graph.pages)
     orphan_count = len(graph.orphans)
     dangling_count = len(graph.dangling)

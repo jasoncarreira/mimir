@@ -1411,6 +1411,8 @@ class Agent:
         self._agent_tools: list[Any] | None = None
         self._agent_middleware: tuple[Any, ...] | None = None
         self._cached_skill_catalog_fingerprint: str | None = None
+        self._skill_fingerprint_executor: concurrent.futures.ThreadPoolExecutor | None = None
+        self._skill_fingerprint_cache: tuple[tuple, str] | None = None
         self._cached_coding_enabled: bool | None = None
 
         # Memory-tool dep injection — only used if saga_client is a
@@ -1582,34 +1584,80 @@ class Agent:
             skill_sources.append(str(operator_dir))
         return skill_sources
 
-    def _skill_catalog_fingerprint(self, skill_sources: list[str]) -> str:
+    async def _skill_catalog_fingerprint(self, skill_sources: list[str]) -> str:
         """Fingerprint the discovered skill catalog inputs.
 
         Deepagents' SkillsMiddleware receives source directories, but the
         middleware may cache the discovered catalog inside the compiled graph.
         Include every ``SKILL.md`` file's path and content hash in the graph
         cache key so adding/removing/editing a skill takes effect on the next
-        turn without rebuilding model/tool objects.
+        turn without rebuilding model/tool objects. Unchanged metadata avoids
+        content reads; ctime catches edits that restore mtime. The recursive
+        scan is still catalogue-sized, but runs off-loop on one dedicated worker.
         """
-        digest = hashlib.sha256()
-        for source in skill_sources:
-            root = Path(source)
-            digest.update(str(root).encode("utf-8", "surrogateescape"))
-            digest.update(b"\0")
-            if not root.is_dir():
-                digest.update(b"missing\0")
-                continue
-            for path in sorted(root.rglob("SKILL.md")):
-                try:
-                    rel = path.relative_to(root)
-                    data = path.read_bytes()
-                except OSError:
+        if self._skill_fingerprint_executor is None:
+            self._skill_fingerprint_executor = concurrent.futures.ThreadPoolExecutor(
+                max_workers=1, thread_name_prefix="mimir-skill-fingerprint",
+            )
+
+        def scan() -> tuple:
+            signature = []
+            for source in skill_sources:
+                root = Path(source)
+                entries = []
+                exists = root.is_dir()
+                if exists:
+                    for path in sorted(root.rglob("SKILL.md")):
+                        try:
+                            stat = path.stat()
+                            metadata = (
+                                stat.st_ino, stat.st_ctime_ns,
+                                stat.st_mtime_ns, stat.st_size,
+                            )
+                        except OSError:
+                            metadata = None
+                        entries.append((path, metadata))
+                signature.append((root, exists, tuple(entries)))
+            return tuple(signature)
+
+        def fingerprint() -> str:
+            signature = scan()
+            if self._skill_fingerprint_cache is not None:
+                previous, value = self._skill_fingerprint_cache
+                if signature == previous:
+                    return value
+            digest = hashlib.sha256()
+            readable = True
+            for root, exists, entries in signature:
+                digest.update(str(root).encode("utf-8", "surrogateescape"))
+                digest.update(b"\0")
+                if not exists:
+                    digest.update(b"missing\0")
                     continue
-                digest.update(str(rel).encode("utf-8", "surrogateescape"))
-                digest.update(b"\0")
-                digest.update(hashlib.sha256(data).digest())
-                digest.update(b"\0")
-        return digest.hexdigest()
+                for path, metadata in entries:
+                    try:
+                        data = path.read_bytes()
+                    except OSError:
+                        readable = False
+                        continue
+                    readable = readable and metadata is not None
+                    digest.update(str(path.relative_to(root)).encode("utf-8", "surrogateescape"))
+                    digest.update(b"\0")
+                    digest.update(hashlib.sha256(data).digest())
+                    digest.update(b"\0")
+            value = digest.hexdigest()
+            # Never pair a post-edit signature with a pre-edit hash. If the
+            # tree moved during hashing, leave it uncached for the next call.
+            self._skill_fingerprint_cache = (
+                (signature, value) if readable and scan() == signature else None
+            )
+            return value
+
+        # Cache reads/writes stay on the single worker, even if an awaiting
+        # turn is cancelled while its filesystem operation is still running.
+        return await asyncio.get_running_loop().run_in_executor(
+            self._skill_fingerprint_executor, fingerprint,
+        )
 
     async def _build_agent_if_needed(self) -> Any:
         # ``create_deep_agent`` freezes ``system_prompt`` at graph
@@ -1620,7 +1668,7 @@ class Agent:
         # without a process restart (chainlink #369).
         system_prompt = self._current_system_prompt(emit_health_events=False)
         skill_sources = self._current_skill_sources()
-        skill_catalog_fingerprint = self._skill_catalog_fingerprint(skill_sources)
+        skill_catalog_fingerprint = await self._skill_catalog_fingerprint(skill_sources)
         coding_enabled = self._config.coding_enabled
         if coding_enabled:
             from .tools.forge import github_identity_is_degraded
@@ -1648,7 +1696,7 @@ class Agent:
             # the prompt may have changed again on disk.
             system_prompt = self._current_system_prompt(emit_health_events=False)
             skill_sources = self._current_skill_sources()
-            skill_catalog_fingerprint = self._skill_catalog_fingerprint(skill_sources)
+            skill_catalog_fingerprint = await self._skill_catalog_fingerprint(skill_sources)
             coding_enabled = self._config.coding_enabled
             if coding_enabled:
                 from .tools.forge import github_identity_is_degraded
@@ -2063,7 +2111,7 @@ class Agent:
             # channels don't share state — multi-channel-correctness
             # invariant from the SDK build. Empty dict when the wiki dir
             # doesn't exist; finalize early-returns in that case.
-            ctx.wiki_mtime_snapshot = self._snapshot_wiki_mtimes()
+            ctx.wiki_mtime_snapshot = await self._snapshot_wiki_mtimes_async()
 
             ctx_token = set_current_turn(ctx)
             # Populate the module-global current_channel_id as a fallback
@@ -2491,7 +2539,9 @@ class Agent:
         try:
             cutoff_iso = (datetime.now(timezone.utc) - timedelta(hours=24)).isoformat()
             events_path = self._config.home / "logs" / "events.jsonl"
-            count = count_recent_no_sends(events_path, event.channel_id, cutoff_iso) + 1
+            count = await asyncio.to_thread(
+                count_recent_no_sends, events_path, event.channel_id, cutoff_iso,
+            ) + 1
         except Exception:  # noqa: BLE001 — counting must never fail the turn
             log.exception("resend-nudge count failed")
             count = 1
@@ -3570,6 +3620,14 @@ class Agent:
                 continue
         return snapshot
 
+    async def _snapshot_wiki_mtimes_async(self) -> dict[str, float]:
+        from .wiki_backlinks import _BACKLINKS_EXECUTOR
+
+        # Keep each complete start/end observation on the dedicated wiki pool.
+        return await asyncio.get_running_loop().run_in_executor(
+            _BACKLINKS_EXECUTOR, self._snapshot_wiki_mtimes,
+        )
+
     async def _post_turn_wiki_backlinks(self, ctx: Any) -> None:
         """Regenerate the wiki backlinks/orphans/dangling outputs when
         ANY non-generated state/wiki/*.md page changed mtime relative
@@ -3580,7 +3638,7 @@ class Agent:
         if not wiki.is_dir():
             return
         before: dict[str, float] = getattr(ctx, "wiki_mtime_snapshot", {}) or {}
-        after = self._snapshot_wiki_mtimes()
+        after = await self._snapshot_wiki_mtimes_async()
 
         touched = False
         for path_str, mtime in after.items():
@@ -4454,7 +4512,10 @@ class Agent:
                 fire_cost_runaway_alarm_if_warranted(event_kind, event_kwargs)
             )
         upcoming_block = use(self._assemble_upcoming_block(auth_context))
-        commitments_block = use(self._assemble_commitments_block(
+        from .commitments.store import run_store_io
+
+        commitments_block = use(await run_store_io(
+            self._assemble_commitments_block,
             channel_id=event.channel_id,
             auth_context=auth_context,
         ))
