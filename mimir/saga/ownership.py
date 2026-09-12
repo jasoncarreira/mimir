@@ -257,7 +257,9 @@ def get_authorization_scope(auth_context: Any) -> AuthorizationScope:
     )
 
     principal = getattr(auth_context, "canonical_principal", None) or getattr(auth_context, "principal", None)
-    is_admin = check_is_admin(auth_context)
+    # OPEN tools also read SAGA: never trust ingress-carried admin roles, even
+    # if a future carrier producer forgets to attenuate them.
+    is_admin = auth_context.event_ingress is None and check_is_admin(auth_context)
     service = get_trusted_service_from_auth_context(auth_context)
 
     if service:

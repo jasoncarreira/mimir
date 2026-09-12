@@ -3305,8 +3305,67 @@ class TestHandleEvent:
         assert event.author_id == "alice"
         assert event.service_principal is None
         auth_context = create_auth_context(event, resolver, enforce=True)
-        assert auth_context.roles == ("user",)
+        assert auth_context.roles == ()
         assert auth_context.is_service is False
+        assert auth_context.canonical_principal == "alice"
+        assert auth_context.channel_id == web_channel_for_identity("alice")
+
+        import sqlite3
+        from mimir.saga.ownership import authorization_predicate, get_authorization_scope
+
+        scope = get_authorization_scope(auth_context)
+        assert scope.is_admin is False
+        predicate, params = authorization_predicate(scope)
+        with sqlite3.connect(":memory:") as conn:
+            rows = conn.execute(
+                "WITH atoms(owner_principal, visibility) AS "
+                "(VALUES ('alice', 'private'), ('operator', 'private')) "
+                f"SELECT owner_principal FROM atoms WHERE {predicate}", params,
+            ).fetchall()
+        assert rows == [("alice",)]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("master_key", [None, "master-secret"])
+    async def test_transport_only_event_preserves_body_attribution(
+        self, tmp_path, monkeypatch, master_key,
+    ) -> None:
+        from mimir.access_control import create_auth_context
+        from mimir.identities import IdentityResolver
+        from mimir.identities_populator import issue_web_key
+        from mimir.saga.ownership import authorization_predicate, get_authorization_scope
+
+        # The keyless gate must see no issued keys, independently of the resolver
+        # used below to model the claimed author's configured admin role.
+        monkeypatch.delenv("MIMIR_API_KEY", raising=False)
+        monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
+        stub = MagicMock()
+        stub.enqueue = AsyncMock(return_value=True)
+        app = web.Application(middlewares=[_make_auth_middleware(master_key)])
+        app["dispatcher"] = stub
+        app.router.add_post("/event", _handle_event)
+        async with TestClient(TestServer(app)) as client:
+            resp = await client.post(
+                "/event",
+                headers={"X-API-Key": master_key} if master_key else {},
+                json={
+                    "trigger": "user_message", "channel_id": "automation-target",
+                    "author": "jason", "author_id": "body-id",
+                    "author_display": "Automation attribution",
+                },
+            )
+        assert resp.status == 200
+        event = stub.enqueue.call_args.args[0]
+        assert event.author == "jason"
+        assert event.author_id == "body-id"
+        assert event.author_display == "Automation attribution"
+        assert event.channel_id == "automation-target"
+
+        issue_web_key(tmp_path, "jason", roles=["admin"])
+        resolver = IdentityResolver(tmp_path)
+        resolver.reload()
+        context = create_auth_context(event, resolver)
+        assert context.roles == ()
+        assert authorization_predicate(get_authorization_scope(context)) != ("1=1", [])
 
     @pytest.mark.asyncio
     async def test_empty_body_returns_400(self) -> None:
