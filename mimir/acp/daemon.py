@@ -314,10 +314,17 @@ class AcpDaemon:
         peer = _Peer(writer, task)
         self._peers.add(peer)
 
-        def finished(_: asyncio.Task[None]) -> None:
+        def finished(task: asyncio.Task[None]) -> None:
             if peer in self._peers:
                 self._peers.discard(peer)
                 self._admitted -= 1
+            if not task.cancelled():
+                failure = task.exception()
+                if failure is not None:
+                    _LOGGER.error(
+                        "ACP peer connection failed on %s", self.socket_path,
+                        exc_info=(type(failure), failure, failure.__traceback__),
+                    )
 
         task.add_done_callback(finished)
 
