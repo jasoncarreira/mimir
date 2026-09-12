@@ -1324,11 +1324,18 @@ class MimirAcpAgent:
         connection.bound_sessions.add(state.record.session_id)
 
     async def _detach_session(self, session_id: str) -> None:
-        state = self._sessions.get(session_id)
-        if state is not None:
+        while (state := self._sessions.get(session_id)) is not None:
             await self._detach_state(state)
 
     async def _detach_state(self, state: SessionState) -> None:
+        # Block new turns throughout cancellation and provider disconnection.
+        state.dirty = True
+        active = state.active_prompt
+        if active is not None:
+            await self._cancel_active(active, transport=False)
+            # Cancellation's grace period may expire, or another caller may
+            # already be cancelling. Neither permits replacing a running turn.
+            await active.completed.wait()
         session_id = state.record.session_id
         connection = self._connections.get(state.generation)
         provider = state.provider
@@ -1341,9 +1348,9 @@ class MimirAcpAgent:
             await self._disconnect_provider(provider, connection)
         if state.declaration is not None and connection is not None and connection.server_sessions.get(state.declaration.server_id) is state:
             connection.server_sessions.pop(state.declaration.server_id, None)
-        if connection is not None:
-            connection.bound_sessions.discard(session_id)
         if self._sessions.get(session_id) is state:
+            if connection is not None:
+                connection.bound_sessions.discard(session_id)
             self._sessions.pop(session_id, None)
             self._environments.pop(session_id, None)
 
@@ -1419,7 +1426,10 @@ class _OrderedTurnPublisher:
     async def publish_live(self, update: Any) -> Any:
         await _wait_for_forwarded_updates(self._queue, self._forwarder)
         await self._dispatcher.drain()
-        return await self._publisher.publish_live(update)
+        published = await self._publisher.publish_live(update)
+        if published is None:
+            raise RuntimeError("ACP turn publication rejected")
+        return published
 
 
 async def _wait_for_forwarded_updates(
