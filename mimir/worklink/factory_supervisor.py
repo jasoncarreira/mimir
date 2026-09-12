@@ -145,14 +145,27 @@ def supervise(channel: socket.socket, argv: list[str]) -> int:
     adoptions = _Adoptions()
     error = None
     exit_code = None
+    stop_requested = False
+
+    def request_stop(signum, frame):
+        nonlocal stop_requested
+        # Do not raise here: Popen must finish assigning the owned payload, and
+        # repeated signals during teardown must not interrupt/reset its budget.
+        stop_requested = True
+
+    previous_handlers = {}
     try:
+        # SIGKILL cannot be handled; the controller's
+        # worklink_factory_supervisor_lost path covers that residual case.
+        for signum in (signal.SIGTERM, signal.SIGINT):
+            previous_handlers[signum] = signal.signal(signum, request_stop)
         channel.set_inheritable(False)
         channel.setblocking(False)
         _enable_subreaper()
         if not _send(channel, {"kind": "ready"}, report=True):
             raise RuntimeError("could not report supervisor readiness")
         payload = subprocess.Popen(argv, start_new_session=True, close_fds=True)
-        while True:
+        while not stop_requested:
             children = _observe(channel, payload.pid, adoptions)
             if adoptions.lost:
                 break
@@ -169,20 +182,24 @@ def supervise(channel: socket.socket, argv: list[str]) -> int:
     except Exception as exc:
         error = f"{type(exc).__name__}: {exc}"[:500]
     finally:
-        if payload is not None:
-            try:
-                exit_code = _teardown(channel, payload, adoptions)
-            except Exception as exc:
-                error = f"{type(exc).__name__}: {exc}"[:500]
-        if adoptions.lost:
-            loss = f"adoption event delivery failed: {adoptions.lost} event(s) lost"
-            error = f"{loss}; {error}" if error else loss
-        if error is not None:
-            _send(channel, {"kind": "event", "event": "worklink_factory_reap_refused", "error": error}, report=True)
-            _send(channel, {"kind": "terminal", "error": error}, report=True)
-        else:
-            if _send(channel, {"kind": "terminal", "exit_code": exit_code}, report=True):
-                return 0
+        try:
+            if payload is not None:
+                try:
+                    exit_code = _teardown(channel, payload, adoptions)
+                except Exception as exc:
+                    error = f"{type(exc).__name__}: {exc}"[:500]
+            if adoptions.lost:
+                loss = f"adoption event delivery failed: {adoptions.lost} event(s) lost"
+                error = f"{loss}; {error}" if error else loss
+            if error is not None:
+                _send(channel, {"kind": "event", "event": "worklink_factory_reap_refused", "error": error}, report=True)
+                _send(channel, {"kind": "terminal", "error": error}, report=True)
+            else:
+                if _send(channel, {"kind": "terminal", "exit_code": exit_code}, report=True):
+                    return 0
+        finally:
+            for signum, handler in previous_handlers.items():
+                signal.signal(signum, handler)
     return 1
 
 
