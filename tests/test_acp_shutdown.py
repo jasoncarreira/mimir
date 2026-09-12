@@ -26,11 +26,21 @@ def _journal_source(progress: Path) -> str:
     # Keep C-level bytes separate: they have no line framing and must not alter
     # the existing text journal's ordered prefix. Neither file needs pipe EOF.
     return f"_journal_path = {str(progress)!r}\n" + r'''
-import os, signal, socket, threading
+import faulthandler, os, signal, socket, threading, time
 from mimir.acp import proxy
 _journal_fd = os.open(_journal_path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
 _wakeup_fd = os.open(_journal_path + '.wakeup',
                      os.O_WRONLY | os.O_CREAT | os.O_APPEND | os.O_NONBLOCK, 0o600)
+_diagnostic_fd = os.open(_journal_path + '.diagnostics',
+                         os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+_stack_fd = os.open(_journal_path + '.stacks',
+                    os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+def diagnose(value):
+    os.write(_diagnostic_fd, (f'{time.monotonic():.6f} thread={threading.get_ident()} '
+                             + value + '\n').encode())
+# The C watchdog can dump even when Python dispatch or the journal tee stalls.
+# This is observation only: it neither expires the controlled timer nor exits.
+faulthandler.dump_traceback_later(proxy.SIGNAL_EXIT_TIMEOUT, repeat=True, file=_stack_fd)
 def record(value):
     os.write(_journal_fd, value + b'\n')
 record(b'child-started')
@@ -39,9 +49,13 @@ _tee_writer = None
 _tee_ack = threading.Event()
 def _journal_flush():
     if _tee_writer is not None:
+        diagnose('flush-enter')
         _tee_ack.clear()
+        diagnose('flush-cleared')
         _tee_writer.sendall(b'\0')
+        diagnose('flush-sent')
         _tee_ack.wait()
+        diagnose('flush-returned')
 
 _journal_install = proxy._ShutdownHooks.install
 def _install(self):
@@ -60,14 +74,18 @@ def _install(self):
                     if value == 255:
                         return
                     if value == 0:
+                        diagnose('tee-ack-enter')
                         _tee_ack.set()
+                        diagnose('tee-ack-returned')
                         continue
                     os.write(_wakeup_fd, bytes([value]))
+                    diagnose(f'tee-forward-enter:{value}')
                     try:
                         os.write(production_fd, bytes([value]))
                     except BlockingIOError:
                         # A full production socket is already readable.
                         pass
+                    diagnose(f'tee-forward-returned:{value}')
     _tee_thread = threading.Thread(target=forward, daemon=True)
     _tee_thread.start()
     record(b'handlers-installed')
@@ -88,6 +106,7 @@ def _close_wakeup(self):
 proxy._ShutdownHooks._close_wakeup = _close_wakeup
 _journal_signal = proxy._ShutdownHooks._handle_signal
 def _handle_signal(self, signum, frame):
+    diagnose(f'signal-dispatch:{signum} interrupted={frame.f_code.co_name}:{frame.f_lineno}')
     _journal_flush()
     record(b'signal-enter:' + str(signum).encode())
     return _journal_signal(self, signum, frame)
@@ -99,6 +118,7 @@ def _force_exit(self):
 proxy._ShutdownHooks._force_exit = _force_exit
 _journal_exit = os._exit
 def _exit(code):
+    diagnose(f'exit-dispatch:{code}')
     _journal_flush()
     _journal_exit(code)
 os._exit = _exit
@@ -114,6 +134,31 @@ class JournalTimer(threading.Timer):
         record(b'watchdog-start-enter')
         super().start()
         record(b'watchdog-start-returned')
+
+    def run(self):
+        diagnose(f'watchdog-timed-wait:{self.interval}')
+        try:
+            super().run()
+        finally:
+            diagnose(f'watchdog-run-returned:finished={self.finished.is_set()}')
+
+    def cancel(self):
+        diagnose('watchdog-cancel-enter')
+        super().cancel()
+        diagnose('watchdog-cancel-returned')
+
+class InputTimer(JournalTimer):
+    def run(self):
+        # No wall-clock deadline: EOF in the escalation protocol is NOT expiry.
+        diagnose('watchdog-input-wait')
+        token = os.read(0, 1)
+        cancelled = self.finished.is_set()
+        diagnose(f'watchdog-input-returned:{token!r} cancelled={cancelled}')
+        if token == b'x' and not cancelled:
+            self.function(*self.args, **self.kwargs)
+        self.finished.set()
+        diagnose('watchdog-input-run-returned')
+
 proxy.threading.Timer = JournalTimer
 '''
 
@@ -133,10 +178,16 @@ async def _shutdown_ceiling(
             " ".join(f"wakeup-byte:{value}" for value in wakeup.read_bytes()) or "<no wakeup bytes>"
             if wakeup.exists() else "<wakeup journal not created>"
         )
+        details = []
+        for suffix in ("diagnostics", "stacks"):
+            path = Path(str(progress) + "." + suffix)
+            content = path.read_text() if path.exists() else "<not created>"
+            details.append(f"{suffix}:\n{content or '<empty>'}")
         pytest.fail(
             f"ACP shutdown ceiling expired: outstanding={outstanding()}, "
             f"pid={process.pid}, returncode={process.returncode}; child progress:\n{state}"
             f"\nsignal delivery: {delivery}"
+            + "\n" + "\n".join(details)
         )
 
 
@@ -577,17 +628,10 @@ def mark(value):
     sink.write(value + b'\n')
     sink.flush()
 
-class ControlledTimer(threading.Timer):
+class ControlledTimer(InputTimer):
     def start(self):
         super().start()
         mark(b'armed')
-
-    def run(self):
-        # Only the parent can expire this watchdog. EOF is not expiration,
-        # and Timer.cancel() must still prevent the product callback.
-        if os.read(0, 1) == b'x' and not self.finished.is_set():
-            self.function(*self.args, **self.kwargs)
-        self.finished.set()
 
 proxy.threading.Timer = ControlledTimer
 
@@ -627,7 +671,9 @@ async def run_proxy(name, output):
     async def close():
         if stage == 'blocked':
             mark(b'draining')
+            diagnose('teardown-block-enter:router.close')
             threading.Event().wait()
+            diagnose('teardown-block-returned:router.close')
         if stage == 'close':
             await stuck()
         await original_close()
@@ -669,16 +715,99 @@ raise SystemExit(bootstrap.main([]))
             "watchdog-start-returned", "armed",
         ]
         delivered = [signum]
+        diagnostics = progress.with_suffix(".diagnostics").read_text()
+        assert "watchdog-input-wait" in diagnostics
+        assert "watchdog-timed-wait" not in diagnostics
         if repeat:
             delivered.append(signal.SIGINT if signum != signal.SIGINT else signal.SIGTERM)
             assert f"signal-enter:{delivered[-1]}" in progress.read_text().splitlines()
         else:
             assert progress.read_text().splitlines()[-2:] == ["watchdog-fired", "force-exit-enter"]
+            assert "watchdog-input-returned:b'x' cancelled=False" in diagnostics
         assert progress.with_suffix(".wakeup").read_bytes() == bytes(delivered)
     finally:
         if process.returncode is None:
             process.kill()
             await process.communicate()
+
+
+@pytest.mark.parametrize("mode", ["expire", "eof", "cancel"])
+def test_controlled_watchdog_reports_why_callback_did_not_run(mode: str, tmp_path: Path) -> None:
+    import subprocess
+
+    progress = tmp_path / "child-progress"
+    source = _journal_source(progress) + r'''
+import sys
+fired = []
+timer = InputTimer(proxy.SIGNAL_EXIT_TIMEOUT, lambda: fired.append(True))
+if sys.argv[1] == 'cancel':
+    timer.cancel()
+timer.start()
+timer.join()
+assert fired == ([True] if sys.argv[1] == 'expire' else [])
+'''
+    result = subprocess.run(
+        [sys.executable, "-c", source, mode],
+        input=b"" if mode == "eof" else b"x", capture_output=True, timeout=120,
+        cwd=Path(__file__).resolve().parents[1],
+    )
+    assert (result.returncode, result.stdout, result.stderr) == (0, b"", b"")
+    diagnostics = progress.with_suffix(".diagnostics").read_text()
+    token = b"" if mode == "eof" else b"x"
+    assert f"watchdog-input-returned:{token!r} cancelled={mode == 'cancel'}" in diagnostics
+    assert "watchdog-input-run-returned" in diagnostics
+    assert "watchdog-timed-wait" not in diagnostics
+    assert ("watchdog-fired" in progress.read_text().splitlines()) == (mode == "expire")
+
+
+@pytest.mark.asyncio
+async def test_shutdown_diagnostics_locate_signal_before_journal_flush(tmp_path: Path) -> None:
+    progress = tmp_path / "child-progress"
+    source = _journal_source(progress) + r'''
+import asyncio
+from types import SimpleNamespace
+
+def blocked_ack():
+    # Simulate the surviving pre-marker stall, after the first handler succeeded.
+    faulthandler.dump_traceback(file=_stack_fd)
+    os.write(1, b'flush-blocked\n')
+    threading.Event().wait()
+
+async def run():
+    hooks = proxy._ShutdownHooks(SimpleNamespace(terminate_owned_children=lambda: None))
+    hooks.install()
+    proxy.threading.Timer = InputTimer
+    os.kill(os.getpid(), signal.SIGTERM)
+    _tee_ack.wait = blocked_ack
+    os.kill(os.getpid(), signal.SIGINT)
+
+asyncio.run(run())
+'''
+    process = await asyncio.create_subprocess_exec(
+        sys.executable, "-c", source,
+        stdin=asyncio.subprocess.PIPE,
+        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+        cwd=Path(__file__).resolve().parents[1],
+    )
+    try:
+        async with _shutdown_ceiling(process, progress, lambda: "flush handshake"):
+            assert await process.stdout.readline() == b"flush-blocked\n"
+        with pytest.raises(pytest.fail.Exception) as failure:
+            async with _shutdown_ceiling(process, progress, lambda: "exit", timeout=0.05):
+                await process.wait()
+        message = str(failure.value)
+        assert f"signal-enter:{signal.SIGTERM}\n" in message
+        assert f"signal-enter:{signal.SIGINT}\n" not in message
+        assert f"signal-dispatch:{signal.SIGINT} interrupted=run:" in message
+        assert "flush-sent" in message
+        assert "in blocked_ack" in message
+        assert "in _journal_flush" in message
+        assert "watchdog-input-wait" in message
+        assert "watchdog-fired" not in message
+    finally:
+        if process.returncode is None:
+            process.kill()
+        await process.communicate()
 
 
 @pytest.mark.asyncio
@@ -979,6 +1108,7 @@ asyncio.run(run())
             assert "handlers-installed\nmain-blocked\nworker-signalled\n" in message
             assert f"wakeup-byte:{signal.SIGTERM}" in message
             assert "signal-enter:" not in message
+            assert "signal-dispatch:" not in message
             assert "watchdog-start-enter" not in message
             assert "recv-returned" not in message
             assert process.returncode is None
