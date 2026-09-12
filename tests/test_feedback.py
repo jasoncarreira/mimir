@@ -2200,6 +2200,39 @@ def test_poller_reload_invalid_cron_classified_negative():
     )
 
 
+@pytest.mark.parametrize(("event_type", "tag"), [
+    ("poller_reload_invalid_manifest", "poller_invalid_manifest"),
+    ("poller_reload_invalid_entry", "poller_invalid_entry"),
+    ("poller_tick_hard_deadline", "poller_tick_hard_deadline"),
+    ("poller_pr_reconcile_truncated", "poller_pr_reconcile_truncated"),
+])
+def test_poller_failures_classified_and_surfaced(tmp_path: Path, event_type: str, tag: str):
+    from mimir.feedback import classify
+
+    assert classify(event_type) == ("negative", tag)
+    log = _make_log(tmp_path, events=[{
+        "timestamp": _ts(0.5),
+        "type": event_type,
+        "poller": "github-activity",
+        "manifest_path": "/home/skills/gh/pollers.json",
+        "error": "broken manifest",
+    }])
+    block = log.recent_block()
+    assert block is not None
+    assert "Negative" in block
+
+
+def test_unrelated_poller_events_are_not_failures(tmp_path: Path):
+    from mimir.feedback import classify
+
+    assert classify("poller_complete") is None
+    assert classify("poller_reload_unknown") is None
+    log = _make_log(tmp_path, events=[{
+        "timestamp": _ts(0.5), "type": "poller_reload_unknown", "poller": "github-activity",
+    }])
+    assert log.recent_block() is None
+
+
 def test_poller_reload_invalid_cron_renders_preserved_variant(tmp_path: Path):
     """Preserved case: a previously-installed poller keeps firing on
     its last-known-good cron — the rendered line must say so, so the
