@@ -508,8 +508,8 @@ async def _handle_event(request: web.Request) -> web.Response:
                     status=403,
                 )
     else:
-        # Preserve master-key and dev/open automation compatibility. Neither
-        # path has a per-user identity to bind here.
+        # Preserve body attribution for master-key automation and keyless
+        # user messages. Keyless callers still face the trigger allowlist below.
         author = body.get("author")
         author_display = body.get("author_display")
         author_id = body.get("author_id")
@@ -640,15 +640,25 @@ def _is_admin_required(path: str) -> bool:
 
 _STATE_CHANGING_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
 
-_UNAUTHENTICATED_WARNING = (
-    "MIMIR_API_KEY is not set — local clients can use POST /event and "
-    "POST /chat without authentication. Loopback binding limits network "
+_KEYLESS_ACCESS_WARNING = (
+    "MIMIR_API_KEY is not set. With no per-user web keys configured or "
+    "previously loaded, local unauthenticated requests have these auth outcomes: "
+    "POST /event (user_message): 200 when queued; "
+    "POST /event (saga_end_session): 403; "
+    "GET /api/ops: 401; GET /api/memory: 401; "
+    "POST /chat: 401; GET /chat/stream: 401. "
+    "Administration requires an admin credential; chat requires a per-user key. "
+    "Loopback binding limits network "
     "exposure but is not an authentication boundary; browser cross-site "
     "writes and DNS-rebinding Host headers are rejected, while local "
-    "processes can still inject messages or trigger saga_end_session. "
+    "processes can still inject messages. "
     "Set MIMIR_API_KEY before exposing to a network. "
-    "For development on localhost, set MIMIR_ALLOW_UNAUTHENTICATED=true "
-    "to suppress this warning."
+)
+
+_UNAUTHENTICATED_WARNING = (
+    _KEYLESS_ACCESS_WARNING
+    + "For development on localhost, set MIMIR_ALLOW_UNAUTHENTICATED=true "
+    "to downgrade this startup reminder to DEBUG; the access warning remains."
 )
 
 
@@ -1341,13 +1351,7 @@ def build_app(config: Config) -> web.Application:
     app["consolidate_guard"] = _ConsolidateGuard()
 
     if not config.api_key:
-        log.warning(
-            "MIMIR_API_KEY is unset — every route accepts unauthenticated "
-            "requests (POST /event, GET /api/turns, GET /api/events, GET "
-            "/api/ops, POST /chat, GET /chat/stream, plus the HTML shells "
-            "at /turns and /ops). Set the env var before exposing the "
-            "port beyond localhost."
-        )
+        log.warning(_KEYLESS_ACCESS_WARNING)
 
     app.router.add_get("/", _handle_root)
     app.router.add_post("/event", _handle_event)

@@ -162,9 +162,11 @@ class ActivityPanel:
     async def run(self) -> None:
         if self._queue is None:
             self._queue = self._bus.subscribe("*")
+        # stop() clears the field before awaiting cleanup and cancelling us.
+        queue = self._queue
         try:
             while True:
-                event = await self._queue.get()
+                event = await queue.get()
                 try:
                     await self.handle_event(event)
                 except Exception:  # noqa: BLE001

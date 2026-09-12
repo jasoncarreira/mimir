@@ -84,6 +84,7 @@ class _ChatRequestError:
 class _Subscriber:
     queue: asyncio.Queue
     allowed_channels: frozenset[str] | None = None
+    canonical: str | None = None
 
 
 def _web_channel_for(canonical: str) -> str:
@@ -170,6 +171,8 @@ class WebChatBridge(Bridge):
     Args:
         enqueue: dispatcher's enqueue coroutine (set at construction; the
             bridge has no other inbound machinery).
+        max_subscribers: cap per resolved canonical, including role-admins.
+            Master keys and unauthenticated callers cannot subscribe to chat.
     """
 
     enqueue: EnqueueFn
@@ -418,9 +421,10 @@ class WebChatBridge(Bridge):
         return frozenset({_web_channel_for(identity.canonical)})
 
     async def _handle_stream(self, request: web.Request) -> web.StreamResponse:
-        _, auth_error = _chat_identity(request)
+        identity, auth_error = _chat_identity(request)
         if auth_error is not None:
             return auth_error.legacy_response()
+        assert identity is not None
 
         if self._lock is None:
             self._lock = asyncio.Lock()
@@ -429,9 +433,9 @@ class WebChatBridge(Bridge):
         # concurrent connection attempts could all pass a separate len() check
         # before any of them appended, overshooting the cap.
         q: asyncio.Queue = asyncio.Queue(maxsize=128)
-        subscriber = _Subscriber(q, self._allowed_stream_channels(request))
+        subscriber = _Subscriber(q, self._allowed_stream_channels(request), identity.canonical)
         async with self._lock:
-            if len(self._subscribers) >= self.max_subscribers:
+            if sum(s.canonical == identity.canonical for s in self._subscribers) >= self.max_subscribers:
                 return web.Response(text="too many chat streams", status=429)
             self._subscribers.append(subscriber)
 

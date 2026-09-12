@@ -696,6 +696,21 @@ def _normalize_web_channel(raw: str, *, default_web: bool = True) -> str:
     return channel
 
 
+def _stream_identity_bucket(request: web.Request) -> tuple[str, str]:
+    """Cap each canonical (including role-admins), not each key or channel.
+
+    Master-key requests share one operator bucket; dev/open unauthenticated
+    requests share a separate bucket. Tagged keys cannot collide with users.
+    Live-event and turn-event routes each maintain their own cap.
+    """
+    if request.get("auth_is_master"):
+        return ("master", "")
+    identity = request.get("auth_identity")
+    if identity is not None:
+        return ("identity", identity.canonical)
+    return ("unauthenticated", "")
+
+
 def _request_user_web_channel(request: web.Request) -> str | None:
     """Return the only channel a non-admin web identity may see, if scoped.
 
@@ -1226,21 +1241,23 @@ def register_routes(
             data["degraded"] = True
         return json_success(data, meta=meta)
 
-    live_events_active = 0
+    live_events_active: dict[tuple[str, str], int] = {}
     live_events_lock = asyncio.Lock()
 
-    async def _try_acquire_live_event_slot() -> bool:
-        nonlocal live_events_active
+    async def _try_acquire_live_event_slot(bucket: tuple[str, str]) -> bool:
         async with live_events_lock:
-            if live_events_active >= max_event_streams:
+            if live_events_active.get(bucket, 0) >= max_event_streams:
                 return False
-            live_events_active += 1
+            live_events_active[bucket] = live_events_active.get(bucket, 0) + 1
             return True
 
-    async def _release_live_event_slot() -> None:
-        nonlocal live_events_active
+    async def _release_live_event_slot(bucket: tuple[str, str]) -> None:
         async with live_events_lock:
-            live_events_active = max(0, live_events_active - 1)
+            remaining = live_events_active[bucket] - 1
+            if remaining:
+                live_events_active[bucket] = remaining
+            else:
+                del live_events_active[bucket]
 
     async def _live_event_items(
         request: web.Request,
@@ -1294,7 +1311,8 @@ def register_routes(
                 "X-Accel-Buffering": "no",
             },
         )
-        if not await _try_acquire_live_event_slot():
+        bucket = _stream_identity_bucket(request)
+        if not await _try_acquire_live_event_slot(bucket):
             return web.Response(text="too many live event streams", status=429)
 
         delivered = request.query.get("since", "").strip() or None
@@ -1335,24 +1353,26 @@ def register_routes(
         except (ConnectionResetError, asyncio.CancelledError):
             pass
         finally:
-            await _release_live_event_slot()
+            await _release_live_event_slot(bucket)
         return resp
 
-    turn_events_active = 0
+    turn_events_active: dict[tuple[str, str], int] = {}
     turn_events_lock = asyncio.Lock()
 
-    async def _try_acquire_turn_event_slot() -> bool:
-        nonlocal turn_events_active
+    async def _try_acquire_turn_event_slot(bucket: tuple[str, str]) -> bool:
         async with turn_events_lock:
-            if turn_events_active >= max_event_streams:
+            if turn_events_active.get(bucket, 0) >= max_event_streams:
                 return False
-            turn_events_active += 1
+            turn_events_active[bucket] = turn_events_active.get(bucket, 0) + 1
             return True
 
-    async def _release_turn_event_slot() -> None:
-        nonlocal turn_events_active
+    async def _release_turn_event_slot(bucket: tuple[str, str]) -> None:
         async with turn_events_lock:
-            turn_events_active = max(0, turn_events_active - 1)
+            remaining = turn_events_active[bucket] - 1
+            if remaining:
+                turn_events_active[bucket] = remaining
+            else:
+                del turn_events_active[bucket]
 
     async def turn_events_stream(request: web.Request) -> web.StreamResponse:
         """Live SSE stream of in-turn events (chainlink #583 slice 1).
@@ -1368,7 +1388,8 @@ def register_routes(
         if error is not None:
             return error
         channel = channel if channel is not None else request.query.get("channel") or "*"
-        if not await _try_acquire_turn_event_slot():
+        bucket = _stream_identity_bucket(request)
+        if not await _try_acquire_turn_event_slot(bucket):
             return web.Response(text="too many turn event streams", status=429)
         resp = web.StreamResponse(
             status=200,
@@ -1416,7 +1437,7 @@ def register_routes(
         finally:
             if queue is not None:
                 turn_event_bus.unsubscribe(channel, queue)
-            await _release_turn_event_slot()
+            await _release_turn_event_slot(bucket)
         return resp
 
     async def react_app(request: web.Request) -> web.StreamResponse:

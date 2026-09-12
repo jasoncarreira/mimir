@@ -727,6 +727,71 @@ async def test_panel_stop_cancels_grace_task_and_deletes_panel():
 
 
 @pytest.mark.asyncio
+async def test_panel_stop_while_run_finishes_in_flight_event(monkeypatch):
+    panel, bridge = _panel()
+    await panel.handle_event(
+        {
+            "type": "turn", "phase": "start", "turn_id": "t1",
+            "channel_id": "slack-C01", "trigger": "user_message",
+        }
+    )
+    await panel.handle_event(
+        {
+            "type": "outbound_message", "phase": "end", "turn_id": "t1",
+            "channel_id": "slack-C01", "sent": True,
+        }
+    )
+    send_entered = asyncio.Event()
+    release_send = asyncio.Event()
+    send_finished = asyncio.Event()
+    original_send = bridge.send
+    original_delete = bridge.delete_message
+
+    async def blocked_send(*args, **kwargs):
+        send_entered.set()
+        await release_send.wait()
+        result = await original_send(*args, **kwargs)
+        send_finished.set()
+        return result
+
+    async def shutdown_delete(channel_id, message_id):
+        # Resume the non-idle consumer after stop has cleared its queue field.
+        assert panel._queue is None
+        release_send.set()
+        await send_finished.wait()
+        return await original_delete(channel_id, message_id)
+
+    monkeypatch.setattr(bridge, "send", blocked_send)
+    monkeypatch.setattr(bridge, "delete_message", shutdown_delete)
+    run_task = panel.start()
+    assert run_task is not None
+    queue = panel._queue
+    try:
+        panel._bus.publish(
+            {
+                "type": "turn", "phase": "start", "turn_id": "t2",
+                "channel_id": "slack-C01", "trigger": "user_message",
+            }
+        )
+        await asyncio.wait_for(send_entered.wait(), timeout=1.0)
+        assert not run_task.done()
+        await asyncio.wait_for(panel.stop(), timeout=1.0)
+
+        assert send_finished.is_set()
+        assert len(bridge.sends) == 2
+        assert bridge.deletes == [("slack-C01", "panel-1")]
+        assert run_task.cancelled()
+        assert panel._queue is None
+        assert queue not in panel._bus._subscribers.get("*", set())
+        assert panel.models == {}
+        assert panel._pending == {}
+        assert panel._delete_tasks == {}
+    finally:
+        run_task.cancel()
+        await asyncio.gather(run_task, return_exceptions=True)
+
+
+@pytest.mark.asyncio
 async def test_panel_delete_failure_leaves_compact_done_state(caplog):
     panel, bridge = _panel(delete_grace=0.0)
     bridge.delete_result = SendResult(sent=False, message_id="panel-1", error="delete unsupported")
