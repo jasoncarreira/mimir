@@ -308,6 +308,105 @@ previous_writer.close()
     assert (result.returncode, result.stdout, result.stderr) == (0, b"", b"")
 
 
+@pytest.mark.parametrize("mode", ["double", "fifo", "lifo", "other-loop", "replacement"])
+def test_shutdown_hooks_restore_only_owned_resources(mode: str) -> None:
+    import subprocess
+
+    source = r'''
+import asyncio, signal, socket, sys
+from types import SimpleNamespace
+from mimir.acp import proxy
+
+mode = sys.argv[1]
+loop = asyncio.new_event_loop()
+other_loop = asyncio.new_event_loop() if mode == 'other-loop' else loop
+original_close = loop.close
+other_close = other_loop.close
+signals = (signal.SIGTERM, signal.SIGINT, signal.SIGHUP)
+previous_handlers = {sig: signal.getsignal(sig) for sig in signals}
+previous_reader, previous_writer = socket.socketpair()
+previous_writer.setblocking(False)
+signal.set_wakeup_fd(previous_writer.fileno())
+sockets = []
+socketpair = socket.socketpair
+def tracked_pair():
+    pair = socketpair()
+    sockets.extend(pair)
+    return pair
+proxy.socket.socketpair = tracked_pair
+
+async def make():
+    return proxy._ShutdownHooks(SimpleNamespace(terminate_owned_children=lambda: None))
+
+# Construct both before installing either: predecessor capture belongs to install.
+first = loop.run_until_complete(make())
+second = other_loop.run_until_complete(make())
+first.install()
+first_pair = first._wakeup
+assert loop.close is first._close_loop
+if mode == 'double':
+    first.install()
+    assert first._wakeup is first_pair
+    assert len(sockets) == 2
+    first.close()
+elif mode == 'replacement':
+    replacement_close = lambda: None
+    replacement_handler = lambda sig, frame: None
+    loop.close = replacement_close
+    for sig in signals:
+        signal.signal(sig, replacement_handler)
+    signal.set_wakeup_fd(previous_writer.fileno())
+    first.close()
+    # Negative controls: foreign hooks must not be overwritten by cleanup.
+    assert loop.close is replacement_close
+    assert all(signal.getsignal(sig) is replacement_handler for sig in signals)
+    loop.close = original_close
+    for sig, handler in previous_handlers.items():
+        signal.signal(sig, handler)
+else:
+    second.install()
+    second_pair = second._wakeup
+    assert len(sockets) == 4
+    if mode == 'lifo':
+        second.close()
+        assert loop.close is first._close_loop
+        assert signal.set_wakeup_fd(first_pair[1].fileno()) == first_pair[1].fileno()
+        assert all(signal.getsignal(sig) is first._handler for sig in signals)
+        first.close()
+    else:
+        first.close()
+        first.close()
+        assert other_loop.close is second._close_loop
+        assert all(sock.fileno() == -1 for sock in first_pair)
+        assert all(sock.fileno() >= 0 for sock in second_pair)
+        assert second._previous_wakeup_fd == previous_writer.fileno()
+        assert signal.set_wakeup_fd(second_pair[1].fileno()) == second_pair[1].fileno()
+        assert all(signal.getsignal(sig) is second._handler for sig in signals)
+        second.close()
+
+assert first._wakeup is None
+assert all(sock.fileno() == -1 for sock in sockets)
+assert not proxy._ShutdownHooks._wakeup_owners
+assert signal.set_wakeup_fd(-1) == previous_writer.fileno()
+assert all(signal.getsignal(sig) is handler for sig, handler in previous_handlers.items())
+assert loop.close == original_close
+assert other_loop.close == other_close
+assert len(loop._selector.get_map()) == 1
+assert len(other_loop._selector.get_map()) == 1
+loop.close()
+other_loop.close()
+first.close()
+second.close()
+previous_reader.close()
+previous_writer.close()
+'''
+    result = subprocess.run(
+        [sys.executable, "-c", source, mode], capture_output=True, timeout=120,
+        cwd=Path(__file__).resolve().parents[1],
+    )
+    assert (result.returncode, result.stdout, result.stderr) == (0, b"", b"")
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("signum", [signal.SIGTERM, signal.SIGINT, signal.SIGHUP, None])
 @pytest.mark.parametrize("stage", ["read", "idle", "close", "failure", "read-failure", "drain-failure", "close-failure"])

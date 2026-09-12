@@ -1195,6 +1195,8 @@ class _SignalReapFilter(logging.Filter):
 
 
 class _ShutdownHooks:
+    _wakeup_owners: set[_ShutdownHooks] = set()
+
     def __init__(
         self, router: ProxyRouter, signal_cleanup: Callable[[], None] | None = None,
     ) -> None:
@@ -1212,6 +1214,7 @@ class _ShutdownHooks:
         self._wakeup: tuple[socket.socket, socket.socket] | None = None
         self._previous_wakeup_fd = -1
         self._loop_close = self._loop.close
+        self._close_loop = self._close_loop
 
     def _drain_wakeup(self) -> None:
         assert self._wakeup is not None
@@ -1226,13 +1229,33 @@ class _ShutdownHooks:
             return
         # Detach before closing descriptors, so a signal cannot write to a
         # recycled fd. The Python handler deliberately has a longer lifetime.
-        signal.set_wakeup_fd(self._previous_wakeup_fd)
         reader, writer = self._wakeup
+        # Unlink saved restore targets before releasing this owner's sockets.
+        # Wakeup ownership is process-wide, even across different event loops.
+        for owner in self._wakeup_owners:
+            if owner is self:
+                continue
+            if owner._previous_wakeup_fd == writer.fileno():
+                owner._previous_wakeup_fd = self._previous_wakeup_fd
+            if owner._loop_close is self._close_loop:
+                owner._loop_close = self._loop_close
+            for signum, previous in self._signals.items():
+                if owner._signals.get(signum) is self._handler:
+                    owner._signals[signum] = previous
+        # set_wakeup_fd has no getter. Preserve a replacement owner's fd rather
+        # than restoring ours over it; never close a descriptor still installed.
+        current = signal.set_wakeup_fd(-1)
+        signal.set_wakeup_fd(
+            self._previous_wakeup_fd if current == writer.fileno() else current,
+            warn_on_full_buffer=False,
+        )
         self._loop.remove_reader(reader.fileno())
         reader.close()
         writer.close()
         self._wakeup = None
-        self._loop.close = self._loop_close
+        self._wakeup_owners.discard(self)
+        if self._loop.close is self._close_loop:
+            self._loop.close = self._loop_close
 
     def _close_loop(self) -> None:
         if self._loop.is_running():
@@ -1243,6 +1266,8 @@ class _ShutdownHooks:
         self._loop_close()
 
     def install(self) -> None:
+        if self._wakeup is not None:
+            return
         if threading.current_thread() is threading.main_thread():
             reader, writer = socket.socketpair()
             try:
@@ -1258,8 +1283,10 @@ class _ShutdownHooks:
                 writer.close()
                 raise
             self._wakeup = reader, writer
+            self._wakeup_owners.add(self)
             # asyncio has no public close-callback API. Bind cleanup to close,
             # not task cancellation: Runner still drains tasks and the executor.
+            self._loop_close = self._loop.close
             self._loop.close = self._close_loop
             for signum in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
                 self._signals[signum] = signal.getsignal(signum)
@@ -1282,8 +1309,8 @@ class _ShutdownHooks:
             for signum, previous in self._signals.items():
                 if signal.getsignal(signum) is self._handler:
                     signal.signal(signum, previous)
-        self._signals.clear()
         self._close_wakeup()
+        self._signals.clear()
 
     def _cleanup(self) -> None:
         try:
