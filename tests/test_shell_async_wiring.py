@@ -398,6 +398,10 @@ async def test_job_complete_inherits_enforced_auth_for_same_channel_reply(
     assert auth.principal == origin_auth.principal
     assert auth.canonical_principal == origin_auth.canonical_principal
     assert auth.roles == origin_auth.roles
+    assert auth.trigger == event.trigger == "shell_job_complete"
+    assert auth.origin_trigger == "user_message"
+    assert auth.interactivity is TurnInteractivity.INTERACTIVE
+    assert auth.ifc_state is not origin_auth.ifc_state
     assert same_channel.allowed is True
     assert same_channel.reason != "ifc_label_blocked:same_channel"
     assert cross_channel.allowed is False
@@ -442,7 +446,9 @@ async def test_shell_job_complete_handler_failure_is_persisted(
 
 
 def test_job_complete_preserves_registered_service_provenance() -> None:
-    from mimir.access_control import SinkGate
+    from dataclasses import replace
+
+    from mimir.access_control import SinkGate, get_trusted_service_from_auth_context
     from mimir.agent import _create_turn_auth_context, _initialize_ifc_labels
     from mimir.models import AgentEvent, AuthContext, TurnInteractivity
 
@@ -476,8 +482,18 @@ def test_job_complete_preserves_registered_service_provenance() -> None:
         "send_message", channel_id, labels, auth, enforce=True,
     )
 
-    assert auth.trigger == "scheduled_tick"
+    assert auth.trigger == "shell_job_complete"
+    assert auth.origin_trigger == "scheduled_tick"
+    assert auth.interactivity is TurnInteractivity.NON_INTERACTIVE
     assert decision.allowed is True
+    assert get_trusted_service_from_auth_context(auth).canonical == "scheduler"
+    for change in (
+        {"is_service": False},
+        {"canonical_principal": "unregistered"},
+        {"event_ingress": "http-api"},
+        {"origin_trigger": None},
+    ):
+        assert get_trusted_service_from_auth_context(replace(auth, **change)) is None
 
 
 # ─── bash_jobs_list ────────────────────────────────────────────────

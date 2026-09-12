@@ -3202,6 +3202,8 @@ print(json.dumps({{"poller": "redaction-offloop", "prompt": "ok"}}))
     original_redact = pollers._redact_poller_env_values
 
     def slow_redact(text, env, redact_keys):
+        if not text.startswith("diagnostic "):
+            return original_redact(text, env, redact_keys)
         released = threading.Event()
         loop.call_soon_threadsafe(released.set)
         responsive = released.wait(timeout=2.0)
@@ -4615,6 +4617,76 @@ print(json.dumps({
     assert len(rejections) == 1
     assert "correct-horse-battery-staple" not in rejections[0]["prompt_preview"]
     assert rejections[0]["prompt_preview"] == "rejecting hmac=[REDACTED]"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("forwarding", ["pass_env", "env"])
+@pytest.mark.parametrize("surface", ["prompt", "extra", "extra_key"])
+@pytest.mark.parametrize("batch_size", [1, 2])
+async def test_run_poller_accepted_event_redacts_exact_env_values(
+    tmp_path: Path, home: Path, monkeypatch: pytest.MonkeyPatch,
+    forwarding: str, surface: str, batch_size: int,
+) -> None:
+    from mimir.models import TurnRecord
+    from mimir.redaction import redact_text
+    from mimir.turn_logger import TurnLogger
+
+    secret = "correct-horse-battery-staple"
+    assert redact_text(secret) == secret  # The durable logger alone cannot catch it.
+    values = {"WEBHOOK_HMAC": secret, "SHORT_FLAG": "yes"}
+    for key, value in values.items():
+        monkeypatch.setenv(key, value)
+    skill_dir = tmp_path / "skill"
+    _install_script(skill_dir, "poller.py", f"""
+import json, os
+for index in range({batch_size}):
+    value = os.environ['WEBHOOK_HMAC']
+    metadata_key = "metadata-" + (value if {surface!r} == "extra_key" else "benign")
+    print(json.dumps({{
+        "poller": "accepted-redaction",
+        "prompt": "ordinary update " + (value if {surface!r} == "prompt" else "ready"),
+        "detail": value if {surface!r} == "extra" else "ordinary detail",
+        "nested": [{{"value": value if {surface!r} == "extra" else "ordinary nested"}}],
+        metadata_key: {{metadata_key: "ordinary keyed detail", "benign-key": "retained"}},
+        "benign": ["release-1665", os.environ['SHORT_FLAG'], index, True, None],
+    }}))
+""")
+    cfg = PollerConfig(
+        name="accepted-redaction", command=f"{sys.executable} poller.py",
+        cron="* * * * *", skill_dir=skill_dir, batch_size=batch_size,
+        env=values if forwarding == "env" else {},
+        pass_env=tuple(values) if forwarding == "pass_env" else (),
+    )
+    enq = _CapturingEnqueue()
+    assert await run_poller(cfg, enqueue=enq) == 1
+    [event] = enq.events
+    assert secret not in event.content
+    assert secret not in json.dumps(event.extra)
+    assert "ordinary update " + ("[REDACTED]" if surface == "prompt" else "ready") in event.content
+    for index, item in enumerate(event.extra["items"]):
+        assert item["detail"] == ("[REDACTED]" if surface == "extra" else "ordinary detail")
+        assert item["nested"] == [{
+            "value": "[REDACTED]" if surface == "extra" else "ordinary nested",
+        }]
+        assert item["benign"] == ["release-1665", "yes", index, True, None]
+        metadata_key = "metadata-" + ("[REDACTED]" if surface == "extra_key" else "benign")
+        assert item[metadata_key] == {
+            metadata_key: "ordinary keyed detail", "benign-key": "retained",
+        }
+
+    turns_path = home / "logs" / "turns.jsonl"
+    # Exercise the real sink with the event input and a model echo of metadata.
+    await TurnLogger(turns_path).write(TurnRecord(
+        ts="2026-09-12T00:00:00+00:00", turn_id="accepted-redaction",
+        session_id="test-pollers", saga_session_id=None,
+        trigger=event.trigger, channel_id=event.channel_id, input=event.content,
+        events=[{"type": "tool_call", "name": "inspect", "args": event.extra}],
+    ))
+    durable = turns_path.read_text(encoding="utf-8")
+    assert secret not in durable
+    [record] = [json.loads(line) for line in durable.splitlines()]
+    assert record["input"] == event.content
+    assert record["events"][0]["args"] == event.extra
 
 
 @pytest.mark.asyncio

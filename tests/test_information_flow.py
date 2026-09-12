@@ -53,6 +53,7 @@ from mimir.access_control import (
 )
 from mimir.agent import (
     Agent,
+    _create_turn_auth_context,
     _initialize_ifc_labels,
     _auto_recall_source_labels,
     _merge_ifc_labels,
@@ -6669,7 +6670,15 @@ def test_cross_channel_sink_refusal_matrix(case: str) -> None:
     if case == "non_admin":
         auth = replace(auth, roles=("user",))
     elif case == "shell_job_complete":
-        auth = replace(auth, trigger="shell_job_complete")
+        completion = AgentEvent(
+            trigger="shell_job_complete", channel_id=event.channel_id,
+            source="system", continuation_auth_context=auth,
+        )
+        # Keep trusted labels to isolate the human-request guard, not taint.
+        auth = _create_turn_auth_context(
+            completion, None, policy_version="test", enforce=True,
+            ifc_labels=labels,
+        )
     elif case == "indeterminate_ifc":
         auth = replace(auth, ifc_state=SimpleNamespace(
             has_untrusted_active_ingest=lambda _: None,
@@ -6705,6 +6714,60 @@ def test_cross_channel_sink_refusal_matrix(case: str) -> None:
     )
     assert decision.allowed is False
     assert decision.reason == "ifc_label_blocked:same_channel"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("origin_trigger", ["user_message", "acp_session"])
+async def test_shell_continuation_is_not_a_fresh_operator_request(
+    monkeypatch: pytest.MonkeyPatch, origin_trigger: str,
+) -> None:
+    from mimir._context import reset_current_turn, set_current_turn
+    from mimir.access_control import can_resolve_forge_review_scope, clear_live_ingest_taint
+    from mimir.models import TurnContext
+    from mimir.tools.registry import request_operator_approval
+
+    event = AgentEvent(
+        trigger="user_message", channel_id="slack-C1", author="operator",
+        source="slack", source_id="message-1",
+    )
+    origin, labels = _runtime_operator_context(event)
+    origin = replace(origin, origin_trigger=origin_trigger)
+    completion = AgentEvent(
+        trigger="shell_job_complete", channel_id=event.channel_id,
+        source="system", continuation_auth_context=origin,
+    )
+    auth = _create_turn_auth_context(
+        completion, None, policy_version="test", enforce=True, ifc_labels=labels,
+    )
+    assert auth.origin_trigger == origin_trigger
+    assert auth.origin_ref == "message-1"
+    assert auth.interactivity is TurnInteractivity.INTERACTIVE
+    assert SinkGate._is_trusted_operator_turn(labels, origin) is True
+    assert SinkGate._is_trusted_operator_turn(labels, auth) is False
+    for stage in ("stored", "fetch", "accept"):
+        assert can_resolve_forge_review_scope(origin, stage=stage) is True
+        assert can_resolve_forge_review_scope(auth, stage=stage) is False
+
+    # Own the live turn so refusal cannot be masked by missing runtime state.
+    turn = TurnContext(
+        turn_id="completion", session_id=event.channel_id,
+        trigger=completion.trigger, channel_id=event.channel_id,
+        started_at=0.0, auth_context=auth, ifc_labels=labels,
+    )
+    monkeypatch.setattr("mimir.event_logger.log_durable_event_sync", lambda *a, **kw: None)
+    token = set_current_turn(turn)
+    try:
+        assert clear_live_ingest_taint(auth, turn_id=turn.turn_id) == (
+            False, "user_origin_required",
+        )
+        refusal = await request_operator_approval.coroutine(
+            tool_name="shell_exec", target="pwd", reason="continue",
+        )
+        assert refusal == "request_operator_approval refused: no interactive operator turn"
+        turn.auth_context = origin
+        assert clear_live_ingest_taint(origin, turn_id=turn.turn_id) == (True, "cleared")
+    finally:
+        reset_current_turn(token)
 
 
 def test_noninteractive_delivery_only_allows_configured_operator_alert(

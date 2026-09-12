@@ -28,6 +28,7 @@ from typing import Iterable, Literal
 from ._jsonl_tail import _tail_lines, count_lines_chunked
 from .access_control import ChannelResourceAdapter
 from .pollers import POLLER_CHANNEL_PREFIX
+from .prompt_safety import sanitize_prompt_field
 from .scheduler import SCHEDULER_CHANNEL_PREFIX
 
 #: Channel-id prefixes that identify synthetic per-tick channels (no
@@ -671,6 +672,8 @@ def render_recent_activity(
             )
         if m.kind == "assistant_message":
             author = "(assistant)"
+        # Identity labels are untrusted; sanitize only the prompt-facing copy.
+        author = sanitize_prompt_field(author)
         content = m.content or ""
         if max_chars > 0 and len(content) > max_chars:
             content = content[:max_chars] + "…[truncated]"
@@ -687,7 +690,7 @@ def render_recent_activity(
             if callable(channel_lookup):
                 display = channel_lookup(m.channel_id)
                 if display:
-                    channel_field = f"{display} ({m.channel_id})"
+                    channel_field = f"{sanitize_prompt_field(display)} ({m.channel_id})"
         lines.append(f"[{ts_short} {channel_field}{id_part}] {author}: {content}")
     return "\n".join(lines)
 
@@ -737,20 +740,21 @@ def render_identity_context(
 
     lines: list[str] = []
     for canonical, identity in seen.items():
-        parts = [f"- **{canonical}**"]
+        parts = [f"- **{sanitize_prompt_field(canonical)}**"]
         if getattr(identity, "display_name", None):
-            parts.append(f" — {identity.display_name}")
+            parts.append(f" — {sanitize_prompt_field(identity.display_name)}")
         if getattr(identity, "notes", None):
-            parts.append(f" ({identity.notes})")
+            parts.append(f" ({sanitize_prompt_field(identity.notes)})")
         aliases = getattr(identity, "aliases", None) or []
         if aliases:
-            parts.append(f" · aliases: {', '.join(aliases)}")
+            parts.append(f" · aliases: {', '.join(sanitize_prompt_field(a) for a in aliases)}")
         # Captured DM channels — so the agent can DM this person directly
         # (send_message to the channel_id, NOT the user id).
         dm_channels = getattr(identity, "dm_channels", None) or {}
         if dm_channels:
             dm_str = ", ".join(
-                f"{platform}: {cid}" for platform, cid in sorted(dm_channels.items())
+                f"{sanitize_prompt_field(platform)}: {sanitize_prompt_field(cid)}"
+                for platform, cid in sorted(dm_channels.items())
             )
             parts.append(f" · DM: {dm_str}")
         lines.append("".join(parts))
