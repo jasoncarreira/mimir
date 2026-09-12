@@ -326,12 +326,8 @@ class IndexGenerator:
 
     def _write_memory(self) -> None:
         path = self._home / "memory" / "INDEX.md"
-        path.parent.mkdir(parents=True, exist_ok=True)
-        _sweep_orphaned_tmps(path)
         body = build_memory_index(self._home)
-        tmp = _unique_tmp(path)
-        tmp.write_text(body, encoding="utf-8")
-        tmp.replace(path)
+        self._write_generated_file(path, body)
         # Regenerate skills-catalog.md if drift detected (chainlink #109).
         # A diff check prevents unnecessary writes when nothing changed.
         self._refresh_skills_catalog()
@@ -357,22 +353,15 @@ class IndexGenerator:
                 pass  # treat missing/unreadable as empty → always write
         if fresh == existing:
             return  # already current; skip the write
-        _sweep_orphaned_tmps(catalog_path)
-        tmp = _unique_tmp(catalog_path)
         try:
-            tmp.write_text(fresh, encoding="utf-8")
-            tmp.replace(catalog_path)
-        except OSError:
+            self._write_generated_file(catalog_path, fresh)
+        except (OSError, ValueError):
             log.warning("failed to write skills-catalog.md", exc_info=True)
 
     def _write_state(self) -> None:
         path = self._home / "state" / "INDEX.md"
-        path.parent.mkdir(parents=True, exist_ok=True)
-        _sweep_orphaned_tmps(path)
         body = build_state_index(self._home)
-        tmp = _unique_tmp(path)
-        tmp.write_text(body, encoding="utf-8")
-        tmp.replace(path)
+        self._write_generated_file(path, body)
 
     def _write_wiki(self) -> None:
         # Lowercase index.md (not INDEX.md) — the wiki convention pre-dates
@@ -380,12 +369,23 @@ class IndexGenerator:
         # Keeping the filename matches the wiki/AGENTS.md doc + every page's
         # link reference.
         path = self._home / "state" / "wiki" / "index.md"
-        path.parent.mkdir(parents=True, exist_ok=True)
-        _sweep_orphaned_tmps(path)
         body = build_wiki_index(self._home)
-        tmp = _unique_tmp(path)
-        tmp.write_text(body, encoding="utf-8")
-        tmp.replace(path)
+        self._write_generated_file(path, body)
+
+    def _write_generated_file(self, path: Path, body: str) -> None:
+        from .access_control import record_framework_file_integrity
+
+        content = body.encode("utf-8")
+
+        def publish() -> None:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            _sweep_orphaned_tmps(path)
+            tmp = _unique_tmp(path)
+            with tmp.open("xb") as stream:
+                stream.write(content)
+            tmp.replace(path)
+
+        record_framework_file_integrity(self._home, {path: content}, publish)
 
     def read_memory_index(self) -> str:
         """Return the current memory/INDEX.md body, generating in-memory if missing."""

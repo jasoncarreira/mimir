@@ -4714,7 +4714,8 @@ async def test_run_turn_arms_injection_before_saga_setup(tmp_path: Path):
     assert "during setup" in record.injected_inputs[0]["text"]
 
 
-async def test_run_turn_drains_startup_queued_followups(tmp_path: Path):
+@pytest.mark.parametrize("author", ["alice", "bob", "unknown", None])
+async def test_run_turn_drains_startup_queued_followups(tmp_path: Path, author):
     """chainlink #383 facet 1: user messages already queued behind the current
     event at turn start are folded into the starting turn and do not remain in
     the dispatcher queue as separate follow-up turns."""
@@ -4729,6 +4730,17 @@ async def test_run_turn_drains_startup_queued_followups(tmp_path: Path):
     )
     agent = _build_agent(tmp_path, fake_agent=fake_agent, fake_saga=None)
     agent._dispatcher = disp
+    resolver = _resolver(tmp_path / "home", """people:
+  - canonical: alice
+    aliases: [slack-U1]
+    access: {roles: [admin]}
+  - canonical: bob
+    aliases: [slack-U2]
+    access: {roles: [user]}
+""")
+    agent._identity_resolver = resolver
+    agent._buffer.resolver = resolver
+    disp._identity_resolver = resolver
 
     q = disp._queues["ch-1"] = asyncio.Queue()
     await q.put(
@@ -4736,15 +4748,23 @@ async def test_run_turn_drains_startup_queued_followups(tmp_path: Path):
             trigger="user_message",
             channel_id="ch-1",
             content="queued followup",
+            author=author,
         ),
     )
 
     record = await agent.run_turn(
-        AgentEvent(trigger="user_message", channel_id="ch-1", content="first"),
+        AgentEvent(trigger="user_message", channel_id="ch-1", content="first", author="slack-U1"),
     )
 
-    assert "queued followup" in record.injected_inputs[0]["text"]
-    assert q.qsize() == 0
+    q = disp._queues["ch-1"]
+    if author == "alice":
+        assert "queued followup" in record.injected_inputs[0]["text"]
+        assert q.qsize() == 0
+    else:
+        assert record.injected_inputs == []
+        assert q.qsize() == 1
+        assert q.get_nowait().author == author
+        q.task_done()
     await asyncio.wait_for(q.join(), timeout=1.0)
 
 

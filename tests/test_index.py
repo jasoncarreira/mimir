@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 from pathlib import Path
@@ -418,6 +419,56 @@ async def test_memory_flush_skips_write_when_catalog_already_current(tmp_path: P
 
 
 # ── unique tmp + orphan sweep (chainlink #272) ─────────────────────
+
+
+@pytest.mark.parametrize("scope,relative", [
+    ("memory", "memory/INDEX.md"),
+    ("state", "state/INDEX.md"),
+    ("wiki", "state/wiki/index.md"),
+    ("memory", "memory/skills-catalog.md"),
+])
+@pytest.mark.parametrize("failure", ["malformed-ledger", "publication"])
+@pytest.mark.asyncio
+async def test_generator_integrity_failures_do_not_trust_output(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    scope: str, relative: str, failure: str,
+):
+    from mimir.access_control import _filesystem_result_integrity, write_framework_file
+
+    monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
+    monkeypatch.delenv("MIMIR_FILE_TOOL_ROOTS", raising=False)
+    destination = tmp_path / relative
+    write_framework_file(tmp_path, destination, b"old")
+    metadata = tmp_path / ".mimir/file-integrity.json"
+    if failure == "malformed-ledger":
+        metadata.write_text("{broken")
+    else:
+        original_replace = Path.replace
+
+        def fail_publication(path, target):
+            if target == destination:
+                raise OSError("publication failed")
+            return original_replace(path, target)
+
+        monkeypatch.setattr(Path, "replace", fail_publication)
+
+    gen = IndexGenerator(tmp_path)
+    gen.mark_dirty(scope)
+    # Catalog publication is best-effort; other failures remain retryable.
+    if relative.endswith("skills-catalog.md") and failure == "publication":
+        await gen.flush()
+    else:
+        with pytest.raises((OSError, ValueError)):
+            await gen.flush()
+
+    assert destination.read_bytes() == b"old"
+    if failure == "publication":
+        assert json.loads(metadata.read_text())[relative] == "untrusted"
+    else:
+        assert metadata.read_text() == "{broken"
+    assert _filesystem_result_integrity(None, str(destination)) == (
+        "untrusted", "active_ingest",
+    )
 
 
 def test_unique_tmp_names_differ(tmp_path: Path):

@@ -333,6 +333,28 @@ def test_python_probe_handles_script_exception(
 # ── Discovery walker ─────────────────────────────────────────────────
 
 
+@pytest.mark.parametrize("ok", [True, False])
+@pytest.mark.parametrize("kind", ["subprocess", "python"])
+@pytest.mark.parametrize("secret", [None, "ghp_" + "a" * 36])
+def test_verify_redacts_probe_details(monkeypatch, capsys, ok, kind, secret):
+    detail = "Authenticated as alice" + (f" using {secret}" if secret else "")
+    expected = "Authenticated as alice" + (" using [REDACTED]" if secret else "")
+    probe = cred_verify.Probe(
+        name="TEST", cred_type="A", env_vars=(), description="",
+        kind=kind, fn=lambda: (ok, detail), source="test",
+    )
+    monkeypatch.setattr(cred_verify, "get_probes", lambda home=None: {"TEST": probe})
+    result = verify("TEST")
+    assert result.ok is ok
+    assert result.detail == expected
+    assert run_verify_cred_cmd("TEST") == (0 if ok else 1)
+    assert run_verify_creds_cmd() == (0 if ok else 1)
+    output = capsys.readouterr().out
+    assert output.count(expected) == 2
+    if secret:
+        assert secret not in output
+
+
 def test_discovery_walks_both_skill_roots(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ):

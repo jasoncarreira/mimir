@@ -166,6 +166,43 @@ async def test_bash_async_declared_failure_hides_values(fake_registry, monkeypat
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("value", ["child-secret", "", None])
+async def test_bash_async_snapshots_implicit_gh_child_token(fake_registry, monkeypatch, value):
+    from mimir.tools import _shell_env
+
+    monkeypatch.setenv("GITHUB_TOKEN", "different-parent-secret")
+    overlay = {"GITHUB_TOKEN": value, "GH_TOKEN": None, "HOME": "/safe/home"}
+    monkeypatch.setattr(_shell_env, "direct_exec_env_overlay", lambda argv: overlay)
+    out = await shell_async.bash_async.coroutine(
+        command="gh api user", mimir_direct_argv=["/usr/bin/gh", "api", "user"],
+    )
+    assert "Spawned job" in out
+    overlay["GITHUB_TOKEN"] = "rotated-secret"
+    assert fake_registry._spawned_log[0]["redact_values"] == ((value,) if value else ())
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure_site", ["overlay", "spawn"])
+async def test_bash_async_implicit_gh_failure_hides_values(fake_registry, monkeypatch, failure_site):
+    from mimir.tools import _shell_env
+
+    def fail(*args, **kwargs):
+        raise RuntimeError("opaque-private-value-1666")
+
+    monkeypatch.setattr(_shell_env, "direct_exec_env_overlay", lambda argv: {
+        "GITHUB_TOKEN": "opaque-private-value-1666",
+    })
+    if failure_site == "overlay":
+        monkeypatch.setattr(_shell_env, "direct_exec_env_overlay", fail)
+    else:
+        monkeypatch.setattr(fake_registry, "spawn", fail)
+    out = await shell_async.bash_async.coroutine(
+        command="gh api user", mimir_direct_argv=["/usr/bin/gh", "api", "user"],
+    )
+    assert out == "bash_async failed: RuntimeError"
+
+
+@pytest.mark.asyncio
 async def test_bash_async_rejects_empty_command(fake_registry: ShellJobRegistry) -> None:
     out = await shell_async.bash_async.ainvoke({"command": "  "})
     assert "command is required" in out

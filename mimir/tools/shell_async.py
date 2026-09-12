@@ -345,7 +345,7 @@ async def bash_async(
         from ._shell_env import (
             bound_direct_exec_argv,
             direct_exec_env_overlay,
-            direct_exec_pass_env,
+            direct_exec_redact_names,
             login_shell_command,
         )
         direct_argv = bound_direct_exec_argv()
@@ -365,7 +365,7 @@ async def bash_async(
         if cwd:
             spawn_kwargs["cwd"] = str(Path(cwd).expanduser())
         if direct_argv is not None:
-            redact_names = direct_exec_pass_env(argv)
+            redact_names = direct_exec_redact_names(argv)
             overlay = direct_exec_env_overlay(argv)
             spawn_kwargs["env_overlay"] = overlay
             if redact_names:

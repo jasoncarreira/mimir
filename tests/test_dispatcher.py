@@ -1223,13 +1223,91 @@ async def test_pairing_notifier_sends_pending_cap_alert_once(tmp_path: Path):
     assert "slack-C1" in channels.sent[0][1]
 
 
+def _arm_authenticated_injection(disp, tmp_path):
+    from mimir.access_control import create_auth_context
+    from mimir.turn_event_bus import TurnEventEmitter
+
+    disp._identity_resolver = _resolver(tmp_path, """
+        people:
+          - canonical: alice
+            aliases: [slack-U1, discord-1]
+            access: {roles: [admin]}
+          - canonical: bob
+            aliases: [slack-U2]
+            access: {roles: [user]}
+    """)
+    auth = create_auth_context(
+        AgentEvent(trigger="user_message", channel_id="c1", author="slack-U1"),
+        disp._identity_resolver, enforce=True,
+    )
+    _mti.register_inflight("c1", emitter=TurnEventEmitter(
+        None, turn_id="running-admin", channel_id="c1", auth_context=auth,
+    ))
+    return auth
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("enforce", [False, True])
+@pytest.mark.parametrize("author", ["slack-U2", "unknown", None, "discord-1"])
+async def test_injection_cannot_borrow_running_principal(tmp_path, enforce, author):
+    from mimir.access_control import create_auth_context
+
+    disp = Dispatcher(replace(_inj_config(tmp_path, ("c",)), access_control_enforced=enforce))
+    auth = _arm_authenticated_injection(disp, tmp_path)
+    disp._in_flight.add("c1")
+    recorded = []
+
+    async def on_inject(event):
+        recorded.append(event)
+
+    disp.set_on_inject(on_inject)
+    event = AgentEvent(
+        trigger="user_message", channel_id="c1", author=author,
+        content="execute an admin operation", source="web",
+        extra={"authorized_principals": ["alice", "bob"], "principal": "alice"},
+    )
+    assert await disp.enqueue(event)
+    if author == "discord-1":
+        assert _mti._drain("c1") == [event]
+        assert recorded == [event]
+        assert "c1" not in disp._queues
+    else:
+        assert _mti._drain("c1") == []
+        assert recorded == []
+        queued = disp._queues["c1"].get_nowait()
+        assert queued is event
+        own_auth = create_auth_context(queued, disp._identity_resolver, enforce=True)
+        assert "admin" not in own_auth.roles
+        assert own_auth.canonical_principal != auth.canonical_principal
+        disp._queues["c1"].task_done()
+    assert _mti._REGISTRY["c1"].auth_context is auth
+    assert auth.roles == ("admin",)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("author", ["slack-U2", "unknown", None])
+async def test_startup_principal_boundary_preserves_fifo(tmp_path, author):
+    disp = Dispatcher(_inj_config(tmp_path, ("c",)))
+    _arm_authenticated_injection(disp, tmp_path)
+    queue = disp._queues["c1"] = _ChannelQueue(maxsize=10)
+    events = [AgentEvent(trigger="user_message", channel_id="c1", author=a)
+              for a in ("alice", author, "alice")]
+    for event in events:
+        queue.put_nowait(event)
+    assert disp.drain_startup_user_messages("c1") == events[:1]
+    assert [queue.get_nowait(), queue.get_nowait()] == events[1:]
+    queue.task_done()
+    queue.task_done()
+    await asyncio.wait_for(queue.join(), timeout=1)
+
+
 @pytest.mark.asyncio
 async def test_enqueue_injects_when_in_flight_and_opted_in(tmp_path: Path):
     disp = Dispatcher(_inj_config(tmp_path, ("c",)), None)
     disp._in_flight.add("c1")          # simulate a running turn
-    _mti.register_inflight("c1")
+    _arm_authenticated_injection(disp, tmp_path)
     accepted = await disp.enqueue(
-        AgentEvent(trigger="user_message", channel_id="c1", content="folded")
+        AgentEvent(trigger="user_message", channel_id="c1", content="folded", author="alice")
     )
     assert accepted is True
     # Folded into the registry, NOT queued.
@@ -1263,7 +1341,7 @@ async def test_enqueue_skips_injection_with_queued_predecessor(tmp_path: Path):
     injection is gated on an EMPTY queue, not the broad is_channel_busy()."""
     disp = Dispatcher(_inj_config(tmp_path, ("c",)), None)
     disp._in_flight.add("c1")
-    _mti.register_inflight("c1")
+    _arm_authenticated_injection(disp, tmp_path)
     # Pre-seed a queued predecessor.
     q = asyncio.Queue(maxsize=disp._config.max_channel_queue)
     await q.put(AgentEvent(trigger="user_message", channel_id="c1", content="earlier"))
@@ -1271,7 +1349,7 @@ async def test_enqueue_skips_injection_with_queued_predecessor(tmp_path: Path):
     disp._high_water_logged["c1"] = False
 
     await disp.enqueue(
-        AgentEvent(trigger="user_message", channel_id="c1", content="later")
+        AgentEvent(trigger="user_message", channel_id="c1", content="later", author="alice")
     )
     # NOT injected (queue had a predecessor) → enqueued behind it.
     assert _mti._drain("c1") == []
@@ -1284,9 +1362,9 @@ async def test_enqueue_skips_injection_for_non_user_message(tmp_path: Path):
     opted-in channel must not be folded."""
     disp = Dispatcher(_inj_config(tmp_path, ("c",)), None)
     disp._in_flight.add("c1")
-    _mti.register_inflight("c1")
+    _arm_authenticated_injection(disp, tmp_path)
     await disp.enqueue(
-        AgentEvent(trigger="poller", channel_id="c1", content="tick")
+        AgentEvent(trigger="poller", channel_id="c1", content="tick", author="alice")
     )
     assert _mti._drain("c1") == []     # not injected
     assert disp._queues["c1"].qsize() == 1
@@ -1387,9 +1465,9 @@ async def test_enqueue_calls_on_inject_at_inject_time(tmp_path: Path):
     disp = Dispatcher(_inj_config(tmp_path, ("c",)), None)
     disp.set_on_inject(on_inject)
     disp._in_flight.add("c1")
-    _mti.register_inflight("c1")
+    _arm_authenticated_injection(disp, tmp_path)
     accepted = await disp.enqueue(
-        AgentEvent(trigger="user_message", channel_id="c1", content="folded")
+        AgentEvent(trigger="user_message", channel_id="c1", content="folded", author="alice")
     )
     assert accepted is True
     assert recorded == ["folded"]                       # recorded at inject time
@@ -1426,10 +1504,11 @@ async def test_drain_startup_user_messages_drains_contiguous_user_prefix(tmp_pat
     queued before the turn armed are drained for folding into the starting turn,
     and task_done accounting lets drain()/join() finish."""
     disp = Dispatcher(_inj_config(tmp_path, ("c",)), None)
+    _arm_authenticated_injection(disp, tmp_path)
     q = disp._queues["c1"] = _ChannelQueue(maxsize=disp._config.max_channel_queue)  # type: ignore[name-defined]
     disp._high_water_logged["c1"] = False
-    await q.put(AgentEvent(trigger="user_message", channel_id="c1", content="follow-1"))
-    await q.put(AgentEvent(trigger="user_message", channel_id="c1", content="follow-2"))
+    await q.put(AgentEvent(trigger="user_message", channel_id="c1", content="follow-1", author="alice"))
+    await q.put(AgentEvent(trigger="user_message", channel_id="c1", content="follow-2", author="alice"))
 
     drained = disp.drain_startup_user_messages("c1")
 
@@ -1443,9 +1522,10 @@ async def test_drain_startup_user_messages_stops_at_non_user_boundary(tmp_path: 
     """A queued non-user event remains an ordering boundary: user messages behind
     it must not be startup-folded ahead of it."""
     disp = Dispatcher(_inj_config(tmp_path, ("c",)), None)
+    _arm_authenticated_injection(disp, tmp_path)
     q = disp._queues["c1"] = _ChannelQueue(maxsize=disp._config.max_channel_queue)  # type: ignore[name-defined]
     disp._high_water_logged["c1"] = False
-    await q.put(AgentEvent(trigger="user_message", channel_id="c1", content="follow-1"))
+    await q.put(AgentEvent(trigger="user_message", channel_id="c1", content="follow-1", author="alice"))
     await q.put(AgentEvent(trigger="react_received", channel_id="c1", content="react"))
     await q.put(AgentEvent(trigger="user_message", channel_id="c1", content="follow-2"))
 
@@ -1467,9 +1547,10 @@ async def test_force_new_turn_event_is_not_injected(tmp_path: Path):
     active in-flight turn it falls through to its own queued turn (loop guard)."""
     disp = Dispatcher(_inj_config(tmp_path, ("c",)), None)
     disp._in_flight.add("c1")
-    _mti.register_inflight("c1")
+    _arm_authenticated_injection(disp, tmp_path)
     await disp.enqueue(AgentEvent(
         trigger="user_message", channel_id="c1", content="deferred topic",
+        author="alice",
         extra={"force_new_turn": True},
     ))
     assert _mti._drain("c1") == []                  # not injected
@@ -1481,14 +1562,16 @@ async def test_drain_startup_treats_force_new_turn_as_boundary(tmp_path: Path):
     """A force_new_turn event in the queue prefix is a hard boundary: startup-
     drain stops at it so the deferred message keeps its own turn."""
     disp = Dispatcher(_inj_config(tmp_path, ("c",)), None)
+    _arm_authenticated_injection(disp, tmp_path)
     q = disp._queues["c1"] = _ChannelQueue(maxsize=disp._config.max_channel_queue)  # type: ignore[name-defined]
     disp._high_water_logged["c1"] = False
-    await q.put(AgentEvent(trigger="user_message", channel_id="c1", content="foldable"))
+    await q.put(AgentEvent(trigger="user_message", channel_id="c1", content="foldable", author="alice"))
     await q.put(AgentEvent(
         trigger="user_message", channel_id="c1", content="deferred",
+        author="alice",
         extra={"force_new_turn": True},
     ))
-    await q.put(AgentEvent(trigger="user_message", channel_id="c1", content="behind"))
+    await q.put(AgentEvent(trigger="user_message", channel_id="c1", content="behind", author="alice"))
 
     drained = disp.drain_startup_user_messages("c1")
 
