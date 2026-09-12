@@ -1729,7 +1729,31 @@ async def _read_sse_data(resp, *, timeout: float = 2.0) -> dict:
 
 
 @pytest.mark.asyncio
-async def test_api_v1_turn_events_sse_scrubs_tool_args_results_and_text(tmp_path: Path):
+@pytest.mark.parametrize("enforced", [False, True])
+async def test_api_v1_turn_events_sse_scrubs_tool_args_results_and_text(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, enforced: bool,
+):
+    from mimir.models import (
+        AuthContext, InformationFlowLabels, SourceLabel, TurnInteractivity,
+    )
+
+    monkeypatch.setenv("MIMIR_ACCESS_CONTROL_ENFORCED", str(enforced).lower())
+    labels = InformationFlowLabels(
+        labels=frozenset({"private"}),
+        source_channels=frozenset({"web-alice"}),
+        sources=(SourceLabel(
+            principal="alice", domain="channel", resource_id="web-alice",
+            bridge_instance="web", sensitivity="private",
+            authorized_principals=frozenset({"alice"}),
+        ),),
+    )
+    auth = AuthContext(
+        principal="alice", canonical_principal="alice", roles=(),
+        event_ingress=None, trigger="user_message", channel_id="web-alice",
+        interactivity=TurnInteractivity.INTERACTIVE,
+        enforcement_enabled=enforced, domain="channel",
+        resource_id="web-alice", bridge_instance="web",
+    )
     bus = TurnEventBus()
     a = web.Application()
     web_ui.register_routes(
@@ -1759,6 +1783,8 @@ async def test_api_v1_turn_events_sse_scrubs_tool_args_results_and_text(tmp_path
                 },
                 "content_delta": f"result TOKEN=abc {secret} attachments/private.txt",
                 "text": f"reasoning saw {secret} in memory/core/00-identity.md",
+                "_ifc_labels": labels,
+                "_auth_context": auth,
             }
         )
         event = await _read_sse_data(resp)
@@ -1777,6 +1803,93 @@ async def test_api_v1_turn_events_sse_scrubs_tool_args_results_and_text(tmp_path
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("enforced", [False, True])
+@pytest.mark.parametrize("taint", ["snapshot", "live", "missing"])
+@pytest.mark.parametrize("subscription", ["web-alice", "*"])
+async def test_api_v1_turn_events_gates_content(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    enforced: bool, taint: str, subscription: str,
+):
+    from mimir.models import (
+        AuthContext, InformationFlowLabels, SourceLabel, TurnInteractivity,
+    )
+
+    monkeypatch.setenv("MIMIR_ACCESS_CONTROL_ENFORCED", str(enforced).lower())
+    sink_events = []
+    monkeypatch.setattr(
+        "mimir.harness_egress.log_event_sync",
+        lambda kind, **fields: sink_events.append((kind, fields)),
+    )
+
+    def labels(channel):
+        return InformationFlowLabels(
+            labels=frozenset({"private"}),
+            source_channels=frozenset({channel}),
+            sources=(SourceLabel(
+                principal="alice", domain="channel", resource_id=channel,
+                bridge_instance="web", sensitivity="private",
+                authorized_principals=frozenset({"alice"}),
+            ),),
+        )
+
+    def auth():
+        return AuthContext(
+            principal="alice", canonical_principal="alice", roles=(),
+            event_ingress=None, trigger="user_message", channel_id="web-alice",
+            interactivity=TurnInteractivity.INTERACTIVE,
+            enforcement_enabled=enforced, domain="channel",
+            resource_id="web-alice", bridge_instance="web",
+        )
+
+    carrier = auth()
+    event_labels = labels("web-private")
+    if taint == "live":
+        # The queued snapshot is compatible; the live turn gained private taint.
+        carrier.ifc_state.merge(event_labels)
+        event_labels = labels("web-alice")
+    elif taint == "missing":
+        carrier = None
+        event_labels = None
+
+    bus = TurnEventBus()
+    a = web.Application()
+    web_ui.register_routes(
+        a, turns_log=tmp_path / "turns.jsonl",
+        events_log=tmp_path / "events.jsonl", turn_event_bus=bus,
+    )
+    async with TestClient(TestServer(a)) as client:
+        resp = await client.get(f"/api/v1/turn-events?channel={subscription}")
+        assert resp.status == 200
+        event = {
+            "type": "tool_result", "phase": "chunk", "turn_id": "private-turn",
+            "channel_id": "web-alice", "seq": 1,
+            "content_delta": "confidential tool output",
+            "_ifc_labels": event_labels, "_auth_context": carrier,
+        }
+        bus.publish(event)
+        bus.publish({
+            **event, "turn_id": "allowed-turn", "content_delta": "allowed output",
+            "_ifc_labels": labels("web-alice"), "_auth_context": auth(),
+        })
+        received = [await _read_sse_data(resp)]
+        if not enforced:
+            received.append(await _read_sse_data(resp))
+        resp.close()
+
+    # Enforcement omits the entire denied event, without closing the stream or
+    # leaking its content in a placeholder. A subsequent allowed turn still flows.
+    assert [item["content_delta"] for item in received] == (
+        ["allowed output"] if enforced
+        else ["confidential tool output", "allowed output"]
+    )
+    assert all("_ifc_labels" not in item and "_auth_context" not in item for item in received)
+    assert sink_events == [("sink_blocked", {
+        "sink": "web_turn_events",
+        "reason": "missing_ifc_labels" if taint == "missing" else "ifc_label_blocked:same_channel",
+        "sink_category": "same_channel", "target_channel": "web-alice",
+        "allowed": not enforced, "status": "denied" if enforced else "would_block",
+        "enforcement_enabled": enforced, "is_shadow_decision": not enforced,
+    })]
 @pytest.mark.parametrize("endpoint", ["live-events", "turn-events"])
 @pytest.mark.parametrize(
     "dotenv_value,process_value,expected",
