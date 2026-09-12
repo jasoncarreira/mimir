@@ -1246,6 +1246,149 @@ def test_selected_test_env_survives_state_evidence_and_recovery(
         assert restored.to_json()["test_env"] == {}
 
 
+@pytest.mark.parametrize("stop", ["complete", "cancel", "error"])
+@pytest.mark.parametrize("recover", [False, True])
+@pytest.mark.parametrize("gate_round", [1, 2])
+def test_gate_heartbeat_prevents_reaping_and_stops_with_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, stop: str, recover: bool, gate_round: int
+) -> None:
+    import mimir.worklink.orchestrator as orchestrator
+    from mimir.worklink.run_state import WorklinkRunState, save_run_state
+
+    repo = tmp_path / "repo"
+    worktree = repo.parent / ".worklink" / repo.name / "441-1"
+    calls, base_runner = _orchestrator_runner(repo, worktree)
+    now = datetime.now(UTC)
+    ttl = timedelta(seconds=3600)
+    comments: list[str] = []
+    held = True
+    beats: list[asyncio.Task] = []
+    gate_entered = asyncio.Event()
+    finish_gate = asyncio.Event()
+    observations = 0
+
+    def runner(args: Sequence[str] | str, **kwargs: Any) -> subprocess.CompletedProcess:
+        nonlocal held
+        if isinstance(args, list):
+            if args[:3] == ["chainlink", "issue", "comment"]:
+                comments.append(args[-1])
+            if args[:3] == ["chainlink", "locks", "steal"]:
+                held = False
+            if args[:3] == ["chainlink", "locks", "release"]:
+                # Model a dead controller that cannot release its lock. The real
+                # reaper must still reclaim it after the heartbeat stops.
+                if stop != "complete":
+                    return cp(args, returncode=1, stderr="release unavailable")
+                held = False
+        return base_runner(args, **kwargs)
+
+    original_heartbeat = ChainlinkClaims.heartbeat_issue
+
+    def heartbeat(self: ChainlinkClaims, record: ClaimRecord) -> ClaimRecord:
+        self.clock = lambda: now
+        beats.append(asyncio.current_task())
+        return original_heartbeat(self, record)
+
+    monkeypatch.setattr(ChainlinkClaims, "heartbeat_issue", heartbeat)
+    monkeypatch.setattr(orchestrator, "_CLAIM_HEARTBEAT_INTERVAL_S", 0)
+    original_observe = orchestrator.observe_evidence
+
+    async def observe(**kwargs: Any) -> EvidenceValidation:
+        nonlocal observations
+        observations += 1
+        if observations == gate_round:
+            gate_entered.set()
+            await finish_gate.wait()
+            if stop == "error":
+                raise RuntimeError("gate died")
+        return await original_observe(**kwargs)
+
+    monkeypatch.setattr(orchestrator, "observe_evidence", observe)
+    reaper = ChainlinkClaims(agent_id="reaper", runner=runner, clock=lambda: now)
+    monkeypatch.setattr(reaper, "_lock_still_held_by", lambda _: held)
+    monkeypatch.setattr(reaper, "_issue_has_label", lambda _, label, **kw: label == "worklink:in-progress")
+    monkeypatch.setattr(reaper, "_list_issue_ids", lambda _: [441])
+    monkeypatch.setattr(reaper, "_active_worklink_lock_ids", lambda **kw: [441] if held else [])
+    monkeypatch.setattr(reaper, "_issue_comments", lambda _: comments)
+    registry = BackendRegistry(WorklinkConfig(defaults=WorklinkDefaults(
+        compute_backend="fake_compute", timeout_s=1800, reaper_ttl_s=3600,
+    )))
+    registry.register(FakeBackend())
+
+    class PersistentCompute(SlowTestCompute):
+        def capabilities(self) -> ComputeCaps:
+            return ComputeCaps(True, False, True, True)
+
+    registry.register_compute(PersistentCompute(shared_filesystem=True))
+    controller = WorklinkRunner(home=tmp_path, repo=repo, runner=runner, registry=registry)
+    if recover:
+        worktree.mkdir(parents=True)
+        save_run_state(tmp_path, WorklinkRunState(
+            issue_id=441, attempt=1, backend="fake", compute_name="fake_compute",
+            handle_substrate="fake_compute", handle_identifier="original-job",
+            branch="issue/441-a1", base_ref="main", local_base="main", repo=str(repo),
+            repo_url="git@github.com:jasoncarreira/mimir.git", test_command="echo ok",
+            started_at=now.isoformat(),
+        ))
+        monkeypatch.setattr(ChainlinkClaims, "review_ready_evidence", lambda *_: None)
+        monkeypatch.setattr(ChainlinkClaims, "_issue_has_label", lambda *_: True)
+        monkeypatch.setattr(orchestrator, "_create_observation_worktree", lambda *a, **kw: CheckoutLease(
+            issue_id=441, attempt=1, repo=repo, path=worktree, branch="issue/441-a1",
+            base_ref="main", local_base="main", isolated_checkout=True,
+        ))
+        monkeypatch.setattr(orchestrator, "_remove_observation_worktree", lambda *a, **kw: None)
+
+    async def exercise() -> None:
+        nonlocal now
+        task = asyncio.create_task(
+            controller.reattach(441) if recover else
+            controller.run(441, backend_name="fake", test_command="echo ok")
+        )
+        try:
+            await asyncio.wait_for(gate_entered.wait(), timeout=5)
+            gate_start = now
+            # Advance a virtual clock while allowing the actual heartbeat task
+            # to run. The gate stays alive for longer than the configured TTL.
+            for _ in range(5):
+                now += timedelta(seconds=900)
+                await asyncio.sleep(0)
+                await asyncio.sleep(0)
+                assert claim_records_from_comments(comments)
+                assert not reaper.reap_home(ttl=ttl).reaped
+                assert held
+            assert now - gate_start > ttl
+            if stop == "cancel":
+                task.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await task
+            else:
+                finish_gate.set()
+                result = await task
+                assert result.status == ("completed" if stop == "complete" else "failed")
+            assert beats and all(beat.done() for beat in beats)
+            count = len(beats)
+            now += ttl + timedelta(seconds=1)
+            await asyncio.sleep(0)
+            assert len(beats) == count
+            if stop != "complete":
+                assert held
+                assert reaper.reap_home(ttl=ttl).reaped
+                assert not held
+            else:
+                assert observations == 2
+                assert not held
+                assert len([args for args in calls if args[:3] == ["gh", "pr", "create"]]) == 1
+        finally:
+            if not task.done():
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+
+    asyncio.run(exercise())
+
+
 @pytest.mark.parametrize("later_exit_code", [0, 1])
 def test_gate_flakes_survive_second_observation_without_masking_failure(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, later_exit_code: int

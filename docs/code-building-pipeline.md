@@ -252,7 +252,7 @@ The detached executor, not the poller, owns the claim protocol:
 
 1. It atomically reserves the issue with `chainlink locks claim`.
 2. It removes `worklink:ready`, adds `worklink:in-progress`, and writes a structured `WORKLINK_CLAIM` comment.
-3. While backend compute is active it appends a refreshed claim heartbeat every 60 seconds.
+3. While awaiting backend compute or finalization (including both evidence gates and their reruns), it appends a refreshed claim heartbeat every 60 seconds. Each heartbeat task is cancelled and awaited when its phase returns, fails, or is cancelled; it cannot keep a dead run alive.
 4. It creates an isolated attempt checkout, runs the backend, independently derives the diff and configured test evidence, and writes evidence under `<MIMIR_HOME>/state/worklink/evidence/`.
 5. It releases the lock after the terminal label transition.
 
@@ -260,10 +260,20 @@ The stale-claim reaper is enabled by setting a schedule for
 `MIMIR_WORKLINK_REAPER_CRON`. It uses `defaults.reaper_ttl_s` (default 86400)
 against the latest claim/heartbeat timestamp, steals only stale locks, and
 returns the leaf to `worklink:ready` unless its attempt budget is exhausted.
-Existing deployments must set this value to at least twice the greater of
-`defaults.timeout_s` and `MIMIR_FACTORY_RUN_TIMEOUT_S` (86400 with the shipped
-12-hour factory timeout). During migration, lower configured values are raised
-to that floor with a warning rather than disabling Worklink at startup.
+The minimum is `2 * defaults.timeout_s` (3600 for a 1800-second leaf timeout).
+Lower configured values are raised to that floor with a warning. Factory claims
+are excluded from this reaper and do not contribute to the floor. This is a
+lost-heartbeat recovery grace, not a bound on the combined backend/gate runtime;
+long gates continue heartbeating instead of requiring a larger TTL.
+
+Heartbeats prevent gate duration alone from making a publishing run stale, but
+are not atomic publication fencing. If the tracker cannot accept heartbeats or
+the controller stalls longer than the TTL, a reap can still race publication.
+Admission refuses `worklink:review` or the latest active completed evidence with
+a PR URL, preventing a later retry after that evidence is durable. There is no
+such guarantee for an attempt admitted before publication is recorded, or a PR
+created just before a crash loses its evidence. Those cases require publication
+coordination/idempotency, not a larger default TTL.
 
 The leaf claim budget is three charged attempts in the current runtime. The
 parsed `defaults.max_claim_attempts` key is compatibility-only and does not

@@ -46,7 +46,13 @@ def factory_run_timeout_s() -> float:
 
 
 def minimum_reaper_ttl_s(timeout_s: int) -> int:
-    """Return the leaf-claim floor, twice the maximum leaf worker runtime.
+    """Return the leaf-claim recovery grace, twice the backend timeout.
+
+    This is not a bound on total run duration: both backend waiting and
+    finalization (including every gate/rerun) heartbeat the claim. The TTL
+    measures time since the last successful heartbeat, not time since the
+    backend finished. It is a recovery grace for lost heartbeats, not a
+    publication fence if the controller or tracker stalls longer than it.
 
     Live factory claims are excluded by ``ChainlinkClaims.reap_home`` and have
     their own durable recovery path. Only stale review-only epic locks may be
