@@ -36,6 +36,48 @@ def test_is_user_accessible_is_fail_closed(
     assert is_user_accessible(visibility) is accessible
 
 
+@pytest.mark.parametrize("ingress", ["http_event", "http-api", ""])
+def test_ingress_carrier_admin_roles_cannot_grant_full_corpus(ingress: str) -> None:
+    from mimir.models import AuthContext, TurnInteractivity
+    from mimir.saga.ownership import authorization_predicate, get_authorization_scope
+
+    context = AuthContext(
+        principal="jason", canonical_principal="jason",
+        roles=("admin",), event_ingress=ingress,
+        trigger="user_message", channel_id="attacker-chosen",
+        interactivity=TurnInteractivity.NON_INTERACTIVE,
+    )
+    scope = get_authorization_scope(context)
+
+    assert scope.is_admin is False
+    assert authorization_predicate(scope) != ("1=1", [])
+
+
+@pytest.mark.parametrize("service", ["scheduler", "heartbeat", "synthesis"])
+def test_registered_service_factory_retains_full_corpus(
+    service: str, tmp_path: Path,
+) -> None:
+    from mimir.access_control import builtin_trigger_service_principal, create_auth_context
+    from mimir.models import AgentEvent
+    from mimir.saga.ownership import authorization_predicate, get_authorization_scope
+
+    context = create_auth_context(AgentEvent(
+        trigger="saga_session_end" if service == "synthesis" else "scheduled_tick",
+        channel_id="internal", service_principal=service,
+        service_authority=(
+            builtin_trigger_service_principal("heartbeat", tmp_path)
+            if service == "heartbeat" else None
+        ),
+    ))
+    scope = get_authorization_scope(context)
+
+    assert scope.is_admin is False
+    assert scope.is_service is True
+    assert scope.service_canonical == service
+    assert scope.is_platform_service is True
+    assert authorization_predicate(scope) == ("1=1", [])
+
+
 def test_ownership_to_columns_serializes_deterministic_json() -> None:
     ownership = Ownership(
         owner_principal="user:123",

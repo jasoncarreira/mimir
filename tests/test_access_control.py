@@ -2795,6 +2795,49 @@ def test_auth_context_carries_ingress_provenance(tmp_path: Path) -> None:
     assert auth_ctx.channel_id == "slack-C1"
 
 
+@pytest.mark.parametrize("stamp_source", ["argument", "extra", "bridge"])
+def test_auth_context_ingress_claimed_admin_memory_scope(
+    tmp_path: Path, stamp_source: str,
+) -> None:
+    from mimir.saga.ownership import authorization_predicate, get_authorization_scope
+
+    resolver = _resolver(
+        tmp_path,
+        """
+        people:
+          - canonical: jason
+            aliases: [slack-admin]
+            access: {roles: [admin]}
+        """,
+    )
+    event = AgentEvent(
+        trigger="user_message",
+        channel_id="attacker-chosen",
+        author="slack-admin",
+        extra=(
+            {HTTP_EVENT_INGRESS_EXTRA_KEY: "http_event"}
+            if stamp_source == "extra" else {}
+        ),
+    )
+    context = create_auth_context(
+        event, resolver,
+        event_ingress="http_event" if stamp_source == "argument" else None,
+    )
+    scope = get_authorization_scope(context)
+    predicate = authorization_predicate(scope)
+
+    assert context.principal == "slack-admin"
+    assert context.canonical_principal == "jason"
+    if stamp_source == "bridge":
+        assert context.roles == ("admin",)
+        assert scope.is_admin is True
+        assert predicate == ("1=1", [])
+    else:
+        assert predicate != ("1=1", [])
+        assert scope.is_admin is False
+        assert context.roles == ()
+
+
 def test_auth_context_service_identity(tmp_path: Path) -> None:
     """Verify AuthContext captures service identity from identity resolver."""
     resolver = _resolver(

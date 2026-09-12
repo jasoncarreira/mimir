@@ -11278,10 +11278,15 @@ def create_auth_context(
     roles: tuple[str, ...] = ()
     is_service = False
 
+    if event_ingress is None and isinstance(event.extra, dict):
+        event_ingress = event.extra.get(HTTP_EVENT_INGRESS_EXTRA_KEY)
+
     if author is not None and resolver is not None:
         canonical = resolver.resolve(author)
         access = resolver.access_metadata(author)
-        roles = access.roles
+        # HTTP body attribution is not proof of identity. Preserve attribution,
+        # but never import its roles on an ingress-stamped turn.
+        roles = access.roles if event_ingress is None else ()
         is_service = access.is_service
 
     registered_service = get_event_service_principal(event)
@@ -11344,11 +11349,7 @@ def create_auth_context(
         principal=author,
         canonical_principal=canonical,
         roles=roles,
-        event_ingress=(
-            event_ingress
-            if event_ingress is not None
-            else event.extra.get(HTTP_EVENT_INGRESS_EXTRA_KEY) if isinstance(event.extra, dict) else None
-        ),
+        event_ingress=event_ingress,
         trigger=event.trigger,
         channel_id=event.channel_id,
         interactivity=TurnInteractivity.NON_INTERACTIVE,
