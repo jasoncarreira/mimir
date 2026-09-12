@@ -176,6 +176,10 @@ _EVENT_RULES: dict[str, tuple[Polarity, str]] = {
     # instead of discovering it via a poller that never updated (or
     # never started).
     "poller_reload_invalid_cron": ("negative", "poller_invalid_cron"),
+    "poller_reload_invalid_manifest": ("negative", "poller_invalid_manifest"),
+    "poller_reload_invalid_entry": ("negative", "poller_invalid_entry"),
+    "poller_tick_hard_deadline": ("negative", "poller_tick_hard_deadline"),
+    "poller_pr_reconcile_truncated": ("negative", "poller_pr_reconcile_truncated"),
     # chainlink #108: env_required validation — emitted when a poller's
     # declared required env vars are absent from the assembled subprocess
     # env.  The poller run is skipped entirely for that tick.  Negative so

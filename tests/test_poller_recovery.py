@@ -550,6 +550,111 @@ async def test_reconcile_drops_tool_budget_exhaustion_without_retry(tmp_path: Pa
     assert state["last_reconciled"] != ""
 
 
+@pytest.mark.parametrize("marker_age", [None, 100, 101, 1000])
+def test_restart_scan_stops_at_enqueue_bound(tmp_path: Path, monkeypatch, marker_age):
+    events = tmp_path / "events.jsonl"
+    events.touch()
+    now = datetime.now(tz=timezone.utc)
+    cutoff = now - timedelta(seconds=100)
+    records = [{"type": "heartbeat", "timestamp": now.isoformat()}]
+    if marker_age is not None:
+        records.append({
+            "type": "liveness_unclean_restart",
+            "timestamp": (now - timedelta(seconds=marker_age)).isoformat(),
+        })
+    records.append({
+        "type": "heartbeat",
+        "timestamp": (cutoff - timedelta(seconds=6)).isoformat(),
+    })
+    seen = []
+
+    def tail(path):
+        for record in records:
+            seen.append(record)
+            yield record
+        pytest.fail("restart scan reached irrelevant history")
+
+    monkeypatch.setattr(poller_recovery, "tail_jsonl_records", tail)
+    assert poller_recovery._read_last_unclean_restart(events, cutoff) == ""
+    assert len(seen) == (2 if marker_age in (None, 1000) else 3)
+
+
+def test_restart_scan_preserves_disorder_grace(tmp_path: Path):
+    events = tmp_path / "events.jsonl"
+    now = datetime.now(tz=timezone.utc)
+    cutoff = now - timedelta(seconds=100)
+    restart = (cutoff + timedelta(seconds=1)).isoformat()
+    _write_unclean_restart(events, ts=restart)
+    _write_outcome(
+        events, type_="heartbeat", channel_id="other", source_id="other",
+        ts=(cutoff - timedelta(seconds=1)).isoformat(),
+    )
+    _write_unclean_restart(events, ts="invalid")
+    assert poller_recovery._read_last_unclean_restart(events, cutoff) == restart
+
+
+async def test_restart_scan_uses_oldest_eligible_enqueue_and_moves_after_replay(
+    tmp_path: Path, monkeypatch,
+):
+    events = tmp_path / "events.jsonl"
+    now = datetime.now(tz=timezone.utc)
+    monkeypatch.setattr(poller_recovery, "_utc_now", lambda: now)
+    old_enqueue = now - timedelta(seconds=100)
+    for source_id, age in (("current", 10), ("lost", 100), ("finished", 1000)):
+        await poller_recovery.stash_enqueued_event(
+            tmp_path, _make_event(source_id),
+            enqueued_at=(now - timedelta(seconds=age)).isoformat(),
+        )
+    state = poller_recovery._load_state(tmp_path)
+    state["inflight"]["finished"]["last_outcome_at"] = _ts(900)
+    # Neither the outcome watermark nor the first entry is a safe restart bound.
+    state["last_reconciled"] = now.isoformat()
+    poller_recovery._save_state(tmp_path, state)
+    _write_unclean_restart(events, ts=(now - timedelta(seconds=50)).isoformat())
+    with events.open("a", encoding="utf-8") as stream:
+        for _ in range(12000):
+            stream.write(json.dumps({
+                "type": "heartbeat",
+                "timestamp": (now - timedelta(seconds=20)).isoformat(),
+            }) + "\n")
+
+    real_read = poller_recovery._read_last_unclean_restart
+    cutoffs = []
+    scan_counts = []
+    real_tail = poller_recovery.tail_jsonl_records
+    loop_thread = threading.get_ident()
+
+    def tail(path):
+        for record in real_tail(path):
+            scan_counts[-1] += 1
+            yield record
+
+    def read(path, since):
+        assert threading.get_ident() != loop_thread
+        cutoffs.append(since)
+        scan_counts.append(0)
+        return real_read(path, since)
+
+    # Isolate restart record counts from the independent outcome scanner.
+    monkeypatch.setattr(poller_recovery, "_read_outcomes_since", lambda *args: [])
+    monkeypatch.setattr(poller_recovery, "tail_jsonl_records", tail)
+    monkeypatch.setattr(poller_recovery, "_read_last_unclean_restart", read)
+    common = dict(
+        poller_name="gmail", channel_id="poller:gmail",
+        persist_dir=tmp_path, events_path=events, recover_failed_turns=False,
+    )
+    rejected = await poller_recovery.reconcile_failed_turns(**common, enqueue=_FullEnqueue())
+    assert rejected["deferred"] == 1
+    enqueue = _FakeEnqueue()
+    recovered = await poller_recovery.reconcile_failed_turns(**common, enqueue=enqueue)
+    repeated = await poller_recovery.reconcile_failed_turns(**common, enqueue=enqueue)
+    assert recovered["unclean_reenqueued"] == 1
+    assert repeated["unclean_reenqueued"] == 0
+    assert [event.source_id for event in enqueue.calls] == ["lost"]
+    assert cutoffs == [old_enqueue, old_enqueue, now - timedelta(seconds=10)]
+    assert scan_counts == [12001, 12001, 1]
+
+
 async def test_unclean_restart_reenqueues_no_outcome_exactly_once(tmp_path: Path):
     """At-least-once contract: an accepted enqueue with no durable outcome
     before a later unclean-restart marker is replayed once. If the turn really
@@ -935,7 +1040,7 @@ async def test_reconcile_empty_watermark_uses_bounded_off_loop_scan(
         return real_read(events_path, channel_id, since_iso)
 
     monkeypatch.setattr(poller_recovery, "_read_outcomes_since", read_spy)
-    monkeypatch.setattr(poller_recovery, "_read_last_unclean_restart", lambda path: "")
+    monkeypatch.setattr(poller_recovery, "_read_last_unclean_restart", lambda path, since: "")
 
     await poller_recovery.reconcile_failed_turns(
         poller_name="gmail",

@@ -2682,6 +2682,9 @@ async def test_reload_pollers_emits_invalid_manifest_event(
     ]
     assert len(invalid_events) == 1
     _et, payload = invalid_events[0]
+    from mimir.feedback import classify
+
+    assert classify(_et) == ("negative", "poller_invalid_manifest")
     assert payload["manifest_path"] == str(bad_path)
     assert "JSONDecodeError" in payload["error"]
     # The preserved-pollers list carries the names that were rescued

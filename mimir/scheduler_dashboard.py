@@ -20,6 +20,12 @@ ACTIVE_COMMITMENT_STATUSES = frozenset({
     CommitmentStatus.SNOOZED.value,
 })
 
+POLLER_REGISTRATION_ERROR_TYPES = frozenset({
+    "poller_reload_invalid_manifest",
+    "poller_reload_invalid_entry",
+    "poller_reload_invalid_cron",
+})
+
 SECRET_MARKERS = (
     "KEY",
     "TOKEN",
@@ -89,6 +95,13 @@ def _event_detail(event: dict[str, Any]) -> str:
         emitted = event.get("events_emitted", 0)
         rejected = event.get("events_rejected", 0)
         return f"emitted={emitted} rejected={rejected}"
+    if event_type in {"poller_tick_hard_deadline", "poller_pr_reconcile_truncated"}:
+        fields = (
+            "elapsed_seconds", "startup_consumed_seconds", "hard_deadline_seconds",
+            "deadline_seconds", "truncated",
+        )
+        details = " ".join(f"{key}={event[key]}" for key in fields if key in event)
+        return f"{event_type}: {details}" if details else event_type
     return event_type
 
 
@@ -143,6 +156,8 @@ def _schedule_name_from_event(event: dict[str, Any]) -> str:
 
 def _poller_name_from_event(event: dict[str, Any]) -> str:
     name = str(event.get("poller") or event.get("job_id") or "")
+    if not name and event.get("type") in POLLER_REGISTRATION_ERROR_TYPES:
+        return str(event.get("manifest_path") or "")
     if name.startswith(POLLER_CHANNEL_PREFIX):
         name = name[len(POLLER_CHANNEL_PREFIX):]
     return name
@@ -185,6 +200,9 @@ def _recent_poller_events(
         "poller_event_rejected",
         "poller_circuit_open",
         "poller_missing_required_env",
+        *POLLER_REGISTRATION_ERROR_TYPES,
+        "poller_tick_hard_deadline",
+        "poller_pr_reconcile_truncated",
     }
     for event in events:
         event_type = str(event.get("type") or "")
@@ -293,6 +311,9 @@ def _poller_rows(
                 "poller_misfired",
                 "poller_circuit_open",
                 "poller_missing_required_env",
+                *POLLER_REGISTRATION_ERROR_TYPES,
+                "poller_tick_hard_deadline",
+                "poller_pr_reconcile_truncated",
             )
         ))
         last_event = _newest_event(last_ok, suppressed, recent_error)
@@ -327,7 +348,36 @@ def _poller_rows(
             "manifest_path": str(poller.manifest_path) if poller.manifest_path else None,
             "usage": row_usage.to_dict() if row_usage is not None else None,
         })
-    return rows
+    # Failed registrations never enter the live registry, including at boot.
+    for name, by_type in recent.items():
+        if name in scheduler._pollers:  # noqa: SLF001
+            continue
+        error = _newest_event(*(by_type.get(kind) for kind in POLLER_REGISTRATION_ERROR_TYPES))
+        if error is None:
+            continue
+        rows.append({
+            "id": f"{POLLER_CHANNEL_PREFIX}{name}",
+            "name": name,
+            "kind": "poller",
+            "cron": error.get("cron"),
+            "time_of_day": None,
+            "next_run_at": None,
+            "last_run_at": _event_ts(error),
+            "channel": None,
+            "deliver": None,
+            "priority": None,
+            "prompt_source": "none",
+            "pass_env": [],
+            "env_required": [],
+            "config": {},
+            "recent_result": None,
+            "recent_error": _event_detail(error),
+            "suppression_reason": None,
+            "suppression_severity": None,
+            "manifest_path": error.get("manifest_path"),
+            "usage": None,
+        })
+    return sorted(rows, key=lambda row: row["name"])
 
 
 def _commitment_due_bucket(rec: CommitmentRecord, *, now_unix: float) -> str:
