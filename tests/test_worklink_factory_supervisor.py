@@ -269,7 +269,10 @@ def test_cancellation_reaps_escaped_descendant(tmp_path):
 @pytest.mark.parametrize("payload", [ESCAPED + "\nwhile True: time.sleep(1)\n", RESPAWN],
                          ids=["escaped", "respawning"])
 def test_signalled_supervisor_reaps_every_descendant(tmp_path, mode, payload):
-    result = run_isolated(tmp_path, payload, mode=mode)
+    # The adoption assertion needs an orphan even if TERM handlers are not
+    # scheduled within the supervisor's grace period.
+    result = run_isolated(tmp_path, payload, mode=mode,
+                          term_ready_pids=6 if payload == RESPAWN else 0)
     assert_clean(result)
     assert result["reaped"], "supervisor must prove ECHILD, not just signal descendants"
     assert result["result"] == 0

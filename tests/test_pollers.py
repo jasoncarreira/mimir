@@ -3206,7 +3206,11 @@ print(json.dumps({{"poller": "redaction-offloop", "prompt": "ok"}}))
             return original_redact(text, env, redact_keys)
         released = threading.Event()
         loop.call_soon_threadsafe(released.set)
-        responsive = released.wait(timeout=2.0)
+        # An on-loop mutation cannot service its own callback. Detect it
+        # directly; off-loop delivery is synchronized, not timed against load.
+        responsive = threading.get_ident() != loop_thread
+        if responsive:
+            released.wait()
         observations.append((text, responsive, threading.get_ident()))
         return original_redact(text, env, redact_keys)
 
@@ -4866,8 +4870,8 @@ async def test_run_poller_reaps_subprocess_on_timeout(
     long-lived mimir process to accumulate."""
     skill_dir = tmp_path / "skill"
     _install_script(skill_dir, "poller.py", """
-import time
-time.sleep(120)
+import signal
+signal.pause()
 """)
     cfg = PollerConfig(
         name="x", command=f"{sys.executable} poller.py",
