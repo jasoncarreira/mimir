@@ -21,6 +21,9 @@ operator-visible limits are:
   File access walks canonical path components with no-follow directory handles;
   reads and atomic edits use the pinned parent, not a re-resolved pathname.
   Replacement symlinks cannot redirect access between validation and use.
+  Reading a file requires read permission on every ancestor directory within the
+  boundary, not merely search permission, because access is performed through
+  pinned directory descriptors.
   Inspecting symlinks before granting access is not a substitute for these
   checks: a child can create links after the grant.
 - **macOS Seatbelt remains the only execution-confinement backend verified on real hardware.** `hands_shell`
