@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import asyncio
 import sqlite3
+import threading
 from pathlib import Path
 
 import pytest
@@ -44,6 +45,12 @@ async def test_saga_query_uses_independent_connections_for_concurrent_reads(
     conn = store._ensure_conn()
     _install_minimal_atom(conn)
 
+    # gather() schedules concurrent work but does not guarantee that tiny reads
+    # overlap on a busy CI runner. Rendezvous pairs while both handles are live;
+    # a serialized read implementation must fail rather than pass by scheduling
+    # luck. Two parties avoid requiring eight default-executor worker threads.
+    read_barrier = threading.Barrier(2, timeout=10)
+    observation_lock = threading.Lock()
     active = 0
     max_active = 0
     connections: list[sqlite3.Connection] = []
@@ -54,9 +61,10 @@ async def test_saga_query_uses_independent_connections_for_concurrent_reads(
     def observed_operation_conn():
         nonlocal active, max_active
         conn, should_close = original_operation_conn()
-        connections.append(conn)
-        active += 1
-        max_active = max(max_active, active)
+        with observation_lock:
+            connections.append(conn)
+            active += 1
+            max_active = max(max_active, active)
 
         class ObservedConnection:
             def __getattr__(self, name: str):
@@ -67,14 +75,18 @@ async def test_saga_query_uses_independent_connections_for_concurrent_reads(
                 try:
                     conn.close()
                 finally:
-                    active -= 1
+                    with observation_lock:
+                        active -= 1
 
         wrapper = ObservedConnection()
-        operation_wrappers.append(wrapper)
+        with observation_lock:
+            operation_wrappers.append(wrapper)
         return wrapper, should_close
 
     def observed_boundary_pathway(conn, *_args, **_kwargs):
-        boundary_connections.append(conn)
+        with observation_lock:
+            boundary_connections.append(conn)
+        read_barrier.wait()
         return []
 
     monkeypatch.setattr(store, "_operation_conn", observed_operation_conn)
