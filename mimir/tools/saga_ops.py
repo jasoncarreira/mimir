@@ -33,6 +33,7 @@ from langchain_core.tools import tool
 from pydantic import BeforeValidator, Field
 
 from ..models import AuthContext
+from ..sagatools import _ATOM_CONTENT_CAP
 from .memory import _MEMORY_STATE
 
 log = logging.getLogger(__name__)
@@ -436,6 +437,8 @@ async def saga_record_skill_learning(
             ``"success-pattern"``.
         content: The learning, one self-contained sentence — written so a
             future run understands it without this session's context.
+            Maximum 1200 characters, including surrounding whitespace;
+            shorten longer learnings before retrying.
         session_id: Optional override; defaults to the active turn's.
 
     Returns:
@@ -474,6 +477,12 @@ async def saga_record_skill_learning(
         return f"saga_record_skill_learning failed: {exc}"
     if not content or not content.strip():
         return "saga_record_skill_learning failed: content is required"
+    if len(content) > _ATOM_CONTENT_CAP:
+        return (
+            "saga_record_skill_learning failed: content exceeds "
+            f"{_ATOM_CONTENT_CAP} characters (got {len(content)}). "
+            "Shorten the learning to one self-contained sentence within the limit."
+        )
 
     provenance = get_provenance_from_auth_context(auth_context)
     owner_principal = provenance["created_by"]

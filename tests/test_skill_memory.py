@@ -13,6 +13,7 @@ import pytest
 
 from mimir.models import AuthContext
 from mimir.saga.client import SagaStore
+from mimir.sagatools import _ATOM_CONTENT_CAP
 from mimir.skill_memory import (
     ALL_KINDS,
     NEGATIVE_KINDS,
@@ -355,6 +356,21 @@ class TestGeneralRecallExcludesSkillLearning:
 
 
 class TestRenderAndAugment:
+    @pytest.mark.parametrize("integrity", ["trusted", "untrusted"])
+    @pytest.mark.parametrize("size", [20, _ATOM_CONTENT_CAP, _ATOM_CONTENT_CAP + 1, 100_000])
+    def test_render_content_bound(self, integrity, size):
+        from mimir.skill_memory import render_skill_learnings
+
+        content = "x" * size
+        learning = {"kind": "tip", "content": content, "integrity": integrity}
+        out = render_skill_learnings([learning])
+
+        expected = content
+        if size > _ATOM_CONTENT_CAP:
+            expected = content[:_ATOM_CONTENT_CAP] + "\u2026"
+        assert out == f"{integrity.title()}-origin learnings:\n- [tip] {expected}"
+        assert learning["content"] == content
+
     def test_render_empty(self):
         from mimir.skill_memory import render_skill_learnings
 

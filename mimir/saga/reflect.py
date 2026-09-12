@@ -24,6 +24,7 @@ sessions row and short-circuits without mutating its identity or contents.
 from __future__ import annotations
 
 import json
+import logging
 import sqlite3
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -148,7 +149,11 @@ def reflect(
             if emb_result:
                 emb_bytes, _, _, emb_dim = emb_result
         except Exception:
-            pass
+            logging.getLogger(__name__).warning(
+                "Session %s summary embedding failed; closing without embedding",
+                session_id,
+                exc_info=True,
+            )
 
     now = _utc_now_iso()
 
