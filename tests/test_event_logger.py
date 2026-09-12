@@ -212,11 +212,66 @@ async def test_async_log_redaction_keeps_loop_responsive_under_logger_lock(
     responsive, redaction_thread, lock_held = observations[0]
     assert responsive, "redaction blocked the event-loop callback"
     assert redaction_thread != loop_thread
-    assert lock_held, "record construction must remain inside the logger async lock"
+    assert lock_held, "redaction must remain inside the logger async lock"
     record = json.loads(path.read_text())
     assert record["nested"] == {"detail": "token=[REDACTED]"}
     assert record["type"] == "tool_result"
     assert record["session_id"] == "redaction-offloop"
+
+
+@pytest.mark.asyncio
+async def test_async_log_stamps_before_lock_and_worker_delay(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import mimir.event_logger as event_logger
+    from types import SimpleNamespace
+
+    path = tmp_path / "events.jsonl"
+    logger = EventLogger(path, session_id="occurrence", agent_id="agent")
+    lock = logger._ensure_lock()
+    loop_thread = threading.get_ident()
+    now = "2026-09-12T10:00:00+00:00"
+    stamps = []
+    submitted = asyncio.Event()
+    release_worker = asyncio.Event()
+
+    def stamp():
+        stamps.append((now, threading.get_ident()))
+        return now
+
+    async def delayed_to_thread(func, *args, **kwargs):
+        submitted.set()
+        await release_worker.wait()
+        return await asyncio.to_thread(func, *args, **kwargs)
+
+    monkeypatch.setattr(event_logger, "_utc_now_iso", stamp)
+    # Patch only the logger's asyncio binding, not the shared module.
+    monkeypatch.setattr(event_logger, "asyncio", SimpleNamespace(
+        to_thread=delayed_to_thread,
+    ))
+    await lock.acquire()
+    task = asyncio.create_task(logger.log("queued", detail="safe"))
+    try:
+        await asyncio.sleep(0)  # log reaches the held lock without a worker.
+        assert stamps == [("2026-09-12T10:00:00+00:00", loop_thread)]
+        assert not submitted.is_set()
+        now = "2026-09-12T10:01:00+00:00"
+        lock.release()
+        await asyncio.wait_for(submitted.wait(), timeout=2)
+        assert not path.exists()
+        now = "2026-09-12T10:02:00+00:00"
+    finally:
+        if lock.locked() and not submitted.is_set():
+            lock.release()
+        release_worker.set()
+        await asyncio.wait_for(task, timeout=5)
+
+    assert stamps == [("2026-09-12T10:00:00+00:00", loop_thread)]
+    assert json.loads(path.read_text()) == {
+        "timestamp": "2026-09-12T10:00:00+00:00",
+        "type": "queued", "session_id": "occurrence", "agent_id": "agent",
+        "detail": "safe",
+    }
 
 
 def test_log_sync_does_not_mkdir_after_initialization(tmp_path: Path, monkeypatch):
