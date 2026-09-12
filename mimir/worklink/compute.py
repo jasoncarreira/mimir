@@ -513,9 +513,14 @@ class LocalSubprocessComputeBackend:
 
         async def monitor_output() -> None:
             while True:
-                overflow = await asyncio.to_thread(
+                check_task = asyncio.create_task(asyncio.to_thread(
                     lambda: stdout_sink.overflowed() or stderr_sink.overflowed()
-                )
+                ))
+                try:
+                    overflow = await asyncio.shield(check_task)
+                finally:
+                    # Cancellation cannot stop a thread that still uses the sinks.
+                    await asyncio.gather(check_task, return_exceptions=True)
                 if overflow and not capture.output_overflow:
                     capture.output_overflow = True
                     capture.kill_task = asyncio.create_task(self.cancel(handle))
@@ -833,6 +838,19 @@ class LocalSubprocessComputeBackend:
             raise KeyError(f"unknown {self.name} handle: {handle.identifier}")
         if known is None:
             return
+        capture = self._direct_captures.get(handle.identifier)
+        if capture is not None:
+            if capture.monitor_task is not None:
+                capture.monitor_task.cancel()
+                await asyncio.gather(capture.monitor_task, return_exceptions=True)
+            # The monitor can publish kill_task until it has finished.
+            tasks = [
+                task for task in (capture.collect_task, capture.kill_task)
+                if task is not None
+            ]
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
         self._jobs.pop(handle.identifier, None)
         self._handles.pop(handle.identifier)
         self._worker_clients.pop(handle.identifier, None)

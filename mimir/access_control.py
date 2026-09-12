@@ -7605,24 +7605,10 @@ class OperationCatalog:
     ) -> None:
         """Register a custom decision for an operation."""
         saga_mutations = globals().get("_SAGA_MUTATION_OPERATIONS", frozenset())
-        protected_decision = (
-            OperationDecision.RESOURCE_SCOPED
-            if name in self._RESOURCE_SCOPED_OPERATIONS
-            else OperationDecision.ADMIN_REQUIRED
-        )
-        is_protected_catalogued = (
-            name in self._ADMIN_REQUIRED_OPERATIONS
-            or name in self._RESOURCE_SCOPED_OPERATIONS
-            or name in self._ADMIN_BUILTIN_TOOL_NAMES
-            or any(
-                name.endswith(f"__{catalogued}")
-                or name.endswith(f"_{catalogued}")
-                for catalogued in self._ADMIN_REQUIRED_OPERATIONS
-            )
-        )
+        protected_decision = self.get_decision(name, None)
         if name in saga_mutations:
             protected_decision = OperationDecision.ADMIN_REQUIRED
-        if (is_protected_catalogued or name in saga_mutations) and decision != protected_decision:
+        if protected_decision != OperationDecision.UNKNOWN and decision != protected_decision:
             raise ValueError(
                 f"cannot downgrade protected operation {name!r} "
                 f"from {protected_decision.value}"

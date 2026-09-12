@@ -10,6 +10,7 @@ from langgraph.prebuilt import ToolNode
 from langgraph.runtime import Runtime
 
 from mimir.access_control import (
+    ChannelResourceAdapter,
     HTTP_EVENT_INGRESS_EXTRA_KEY,
     OperationCatalog,
     OperationDecision,
@@ -578,14 +579,23 @@ def test_resource_scoped_operation_is_gated_by_live_path() -> None:
         catalog.disable_shadow_logging()
 
 
-@pytest.mark.parametrize("operation", ["memory_store", "shell_exec"])
+@pytest.mark.parametrize("operation", [
+    "memory_store", "shell_exec", "send_message", "react", "fetch_channel_history",
+    "custom_hook_operation",
+])
 def test_register_operation_refuses_protected_downgrade(operation: str) -> None:
     catalog = OperationCatalog()
+    catalog.register_adapter_hook(ChannelResourceAdapter.get_decision)
+    catalog.register_adapter_hook(
+        lambda name, context: OperationDecision.RESOURCE_SCOPED
+        if name == "custom_hook_operation" else None
+    )
+    original_decision = catalog.get_decision(operation)
 
     with pytest.raises(ValueError, match="cannot downgrade protected operation"):
         catalog.register_operation(operation, OperationDecision.OPEN)
 
-    assert catalog.get_decision(operation) == OperationDecision.ADMIN_REQUIRED
+    assert catalog.get_decision(operation) == original_decision
 
 
 def test_runtime_inventory_replaced_from_final_model_surface() -> None:

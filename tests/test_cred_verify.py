@@ -455,6 +455,46 @@ def test_unknown_probe_kind_skipped(
     assert "OK_KEY" in probes
 
 
+@pytest.mark.parametrize("probe_spec", [
+    pytest.param("{kind: subprocess, cmd: [tool, status]}", id="missing-binary"),
+    pytest.param("{kind: subprocess, binary: tool}", id="missing-cmd"),
+    pytest.param("{kind: python}", id="missing-script"),
+])
+def test_known_probe_kind_missing_subkeys_doesnt_kill_registry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture, probe_spec: str,
+):
+    manifest = tmp_path / "skills" / "broken" / "credentials.yaml"
+    _write_manifest(manifest, f"""
+        credentials:
+          - name: BROKEN_KEY
+            cred_type: D
+            probe: {probe_spec}
+          - name: SAME_MANIFEST_KEY
+            cred_type: D
+            probe: {{kind: not_implemented}}
+    """)
+    _write_manifest(tmp_path / "skills" / "later" / "credentials.yaml", """
+        credentials:
+          - name: LATER_MANIFEST_KEY
+            cred_type: D
+            probe: {kind: not_implemented}
+    """)
+    monkeypatch.setattr(cred_verify, "_PACKAGE_MANIFEST", tmp_path / "missing.yaml")
+
+    probes = get_probes(home=tmp_path)
+
+    assert set(probes) == {"SAME_MANIFEST_KEY", "LATER_MANIFEST_KEY"}
+    assert any(
+        record.name == "mimir.cred_verify"
+        and record.levelname == "WARNING"
+        and "credentials_manifest_skipped" in record.getMessage()
+        and str(manifest) in record.getMessage()
+        and "BROKEN_KEY" in record.getMessage()
+        for record in caplog.records
+    )
+
+
 def test_package_manifest_loaded_by_default(monkeypatch: pytest.MonkeyPatch):
     """The mimir-core ``credentials.yaml`` shipped with the package
     must be discovered even when MIMIR_HOME is unset."""
