@@ -550,6 +550,9 @@ def _create_turn_auth_context(
     else:
         context = replace(
             inherited,
+            # Continuation ownership is inherited, not a fresh human request.
+            trigger=event.trigger,
+            origin_trigger=inherited.origin_trigger or inherited.trigger,
             policy_version=policy_version,
             enforcement_enabled=enforce,
             ifc_labels=ifc_labels,
