@@ -198,6 +198,11 @@ class ActivePrompt:
         try:
             return await task
         except asyncio.CancelledError:
+            # A withdrawn child is a denial; cancellation of this caller must
+            # continue through the gate to the model turn's awaiter.
+            current = asyncio.current_task()
+            if current is not None and current.cancelling() > 0:
+                raise
             return ToolPermissionDecision.CANCELLED
         finally:
             self.permission_tasks.discard(task)
@@ -295,6 +300,9 @@ class ActivePrompt:
         except asyncio.CancelledError:
             if handle is not None:
                 handle.abandon()
+            current = asyncio.current_task()
+            if current is not None and current.cancelling() > 0:
+                raise
             return ToolPermissionDecision.CANCELLED
         finally:
             if handle is not None and handle in self.permission_handles:
