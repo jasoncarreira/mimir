@@ -95,7 +95,13 @@ async def test_events_only_at_90_and_100(tmp_path: Path):
     ctx = _ctx(budget=20)
     token = set_current_turn(ctx)
     try:
-        _drive(IterationGateMiddleware(), 20)
+        rets = _drive(IterationGateMiddleware(), 60)
+        for count, result in enumerate(rets[19:], start=20):
+            assert result["jump_to"] == "end"
+            assert isinstance(result["messages"][0], AIMessage)
+            assert f"({count}/20 model steps)" in result["messages"][0].content
+        assert ctx.iteration_hard_stopped is True
+        assert ctx.iteration_count == 60
         await asyncio.sleep(0.1)  # let fire-and-forget log tasks flush
     finally:
         reset_current_turn(token)

@@ -91,11 +91,12 @@ class IterationGateMiddleware(AgentMiddleware):
         t90 = max(1, int(budget * 0.90))
 
         # Highest tier first so each count lands in exactly one branch; the
-        # one-shot flags ensure each tier fires once across the turn.
-        if count >= budget and not getattr(ctx, "_iteration_cap_emitted", False):
-            ctx._iteration_cap_emitted = True
+        # hard stop persists on graph re-entry; only its event is one-shot.
+        if count >= budget:
             ctx.iteration_hard_stopped = True  # run_turn sends the channel notice
-            _emit_event_sync("iteration_budget_reached", count=count, budget=budget)
+            if not getattr(ctx, "_iteration_cap_emitted", False):
+                ctx._iteration_cap_emitted = True
+                _emit_event_sync("iteration_budget_reached", count=count, budget=budget)
             # Force the agent loop to terminate cleanly with a final message.
             return {
                 "jump_to": "end",

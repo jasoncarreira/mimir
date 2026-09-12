@@ -163,6 +163,13 @@ async def test_build_agent_registers_structured_subagents(
         "critic-structured",
     ]
     middleware = capture.kwargs[0]["middleware"]
+    # These hooks operate on the parent's skill catalog and inbound queue.
+    # Any new parent middleware needs an explicit child-inheritance decision.
+    parent_only = {"SkillMemoryInjectionMiddleware", "MidTurnInjectionMiddleware"}
+    shared = [item.name for item in middleware if item.name not in parent_only]
+    for spec in subagents:
+        child_only = {"StructuredOutputRetryMiddleware"}
+        assert [item.name for item in spec["middleware"] if item.name not in child_only] == shared
     todo_middleware = [item for item in middleware if item.name == "TodoListMiddleware"]
     assert len(todo_middleware) == 1
     assert [tool.name for tool in todo_middleware[0].tools] == ["write_todos"]
