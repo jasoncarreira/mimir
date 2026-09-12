@@ -199,6 +199,23 @@ def dispatch(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
 
         print(f"error: {redact_text(f'{type(exc).__name__}: {exc}')}", file=sys.stderr)
         return 1
+    except BaseException as exc:
+        from ..worklink.orchestrator import _record_run_failure
+        from ..worklink.run_state import load_run_state
+
+        try:
+            state = load_run_state(home, args.issue_id)
+            _record_run_failure(
+                home=home,
+                issue_id=args.issue_id,
+                attempt=state.attempt if state is not None else None,
+                error=exc,
+                exit_status=130 if isinstance(exc, (KeyboardInterrupt, asyncio.CancelledError)) else 1,
+                autonomous=args.autonomous,
+            )
+        finally:
+            # Failure telemetry must never turn interruption into a normal exit.
+            raise exc
 
     if result.dry_run:
         return 0

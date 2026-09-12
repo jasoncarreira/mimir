@@ -1378,6 +1378,70 @@ async def test_worklink_run_dispatches_when_clear_using_worklink_repo(_tool_env)
 
 
 @pytest.mark.asyncio
+async def test_worklink_run_cancellation_leaves_executor_running(
+    _tool_env, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import asyncio
+    import threading
+
+    import mimir.worklink.orchestrator as orch
+
+    registry, dispatched, repo_dir = _tool_env
+    registry.set_arbiter(_FakeArbiter(fire=True))
+    fake_run_worklink = orch.run_worklink
+    loop = asyncio.get_running_loop()
+    entered = asyncio.Event()
+    finished = asyncio.Event()
+    release = threading.Event()
+    worker_thread: int | None = None
+    results = []
+
+    def blocked_run_worklink(**kwargs):
+        nonlocal worker_thread
+        worker_thread = threading.get_ident()
+        loop.call_soon_threadsafe(entered.set)
+        try:
+            if not release.wait(timeout=10):
+                raise TimeoutError("test did not release executor")
+            result = fake_run_worklink(**kwargs)
+            results.append(result)
+            return result
+        finally:
+            loop.call_soon_threadsafe(finished.set)
+
+    monkeypatch.setattr(orch, "run_worklink", blocked_run_worklink)
+    run_task = asyncio.create_task(
+        registry.worklink_run.ainvoke({"issue_id": 443})
+    )
+    try:
+        await asyncio.wait_for(entered.wait(), timeout=5)
+        assert worker_thread != threading.get_ident()
+        run_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(run_task, timeout=5)
+        assert run_task.cancelled()
+        assert not finished.is_set()
+        assert dispatched == []
+
+        # Cancellation ends the awaiter, not the synchronous executor.
+        release.set()
+        await asyncio.wait_for(finished.wait(), timeout=5)
+        assert [result.status for result in results] == ["completed"]
+        assert [item["issue_id"] for item in dispatched] == [443]
+        assert dispatched[0]["repo"] == str(repo_dir)
+        assert dispatched[0]["autonomous"] is True
+    finally:
+        release.set()
+        if not run_task.done():
+            run_task.cancel()
+        await asyncio.wait_for(
+            asyncio.gather(run_task, return_exceptions=True), timeout=5
+        )
+        if entered.is_set():
+            await asyncio.wait_for(finished.wait(), timeout=5)
+
+
+@pytest.mark.asyncio
 async def test_worklink_run_tool_propagates_refused_result(_tool_env, monkeypatch: pytest.MonkeyPatch) -> None:
     registry, dispatched, _repo = _tool_env
     registry.set_arbiter(_FakeArbiter(fire=True))
