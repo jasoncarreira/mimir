@@ -260,7 +260,7 @@ def _stop(args: argparse.Namespace) -> int:
     result = stop_worklink(home, args.issue_id)
     if not result.stopped:
         print(f"worklink #{args.issue_id}: nothing stopped ({result.reason})")
-        return 1
+        return 0 if result.reason == "no live run" else 1
     print(
         f"worklink #{args.issue_id}: stopped; "
         f"state={'cleared' if result.state_cleared else 'unchanged'}, "
