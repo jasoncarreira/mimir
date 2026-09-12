@@ -15786,7 +15786,7 @@ def test_non_hands_native_sink_inventory_keeps_untrusted_ingest_veto(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     expected = {
-        SinkCategory.SAME_CHANNEL: {"send_message", "react", "harness_auto_deliver", "harness_resend_nudge"},
+        SinkCategory.SAME_CHANNEL: {"send_message", "react", "harness_auto_deliver", "harness_resend_nudge", "web_turn_events"},
         SinkCategory.CROSS_CHANNEL: {"post_message"},
         SinkCategory.HTTP_WEBHOOK: {"webhook", "http_request"},
         SinkCategory.NETWORK: {"fetch_url", "web_search"},

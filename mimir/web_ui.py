@@ -55,6 +55,7 @@ from .dashboard_extensions import (
     first_party_dashboard_extensions,
 )
 from .event_logger import log_durable_event_sync, safe_log_event
+from .harness_egress import harness_sink_allowed
 from .chainlink_board import (
     build_chainlink_board_payload,
     resolve_worklink_artifact,
@@ -1389,6 +1390,17 @@ def register_routes(
                     )
                 except asyncio.TimeoutError:
                     await resp.write(b": heartbeat\n\n")
+                    continue
+                # This stream carries tool-result content, not the activity
+                # panel's metadata-only HARNESS_DISPLAY payload. Evaluate turn
+                # taint as same-channel egress, including each wildcard event's
+                # channel. Enforced denials omit the event; the stream stays open.
+                if not harness_sink_allowed(
+                    "web_turn_events",
+                    event.get("channel_id") if channel == "*" else channel,
+                    event.get("_ifc_labels"),
+                    event.get("_auth_context"),
+                ):
                     continue
                 public_event = {
                     key: value for key, value in event.items()

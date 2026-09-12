@@ -183,6 +183,7 @@ _SINK_CATEGORY_MAP: dict[str, SinkCategory] = {
     # named explicitly and checked at their final send/edit boundary.
     "harness_auto_deliver": SinkCategory.SAME_CHANNEL,
     "harness_resend_nudge": SinkCategory.SAME_CHANNEL,
+    "web_turn_events": SinkCategory.SAME_CHANNEL,
     # These harness-only sinks accept metadata-only payloads. They are not
     # model-selected messages and intentionally do not share SAME_CHANNEL.
     "activity_panel_post": SinkCategory.HARNESS_DISPLAY,
