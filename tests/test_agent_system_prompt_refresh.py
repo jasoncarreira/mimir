@@ -82,6 +82,73 @@ async def test_build_agent_reuses_graph_when_prompt_unchanged(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("failed_first_build", [False, True])
+async def test_build_agent_routes_lease_root_created_after_first_build(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failed_first_build: bool,
+) -> None:
+    from mimir.tools import registry
+
+    agent = _make_agent(tmp_path, monkeypatch)
+    _stub_deepagent_build(monkeypatch)
+    lease_root = tmp_path / "leases"
+    monkeypatch.setenv("MIMIR_PR_CHECKOUT_LEASE_ROOT", str(lease_root))
+    monkeypatch.setattr("mimir.tools.forge._github_identity_degraded", False)
+    monkeypatch.setattr("mimir.providers.opencode_available", lambda: True)
+    agent._config.coding_enabled = failed_first_build
+    monkeypatch.setattr("mimir.tools.all_mimir_tools", registry.all_mimir_tools)
+
+    if failed_first_build:
+        with pytest.raises(RuntimeError, match="lease root is unavailable"):
+            await agent._build_agent_if_needed()
+    else:
+        await agent._build_agent_if_needed()
+    previous_backend = agent._backend
+    checkout = lease_root / "checkout"
+    checkout.mkdir(parents=True)
+    target = checkout / "review.txt"
+    target.write_text("leased checkout content\n", encoding="utf-8")
+    assert "outside_file_tool_roots" in previous_backend.read(str(target)).error
+
+    if not failed_first_build:
+        _write_core(agent._config.home, "<!-- desc: test -->\n# Changed core\n")
+    graph = await agent._build_agent_if_needed()
+    result = agent._backend.read(str(target))
+    assert result.error is None
+    assert result.file_data["content"] == "leased checkout content\n"
+    refreshed_backend = agent._backend
+    assert refreshed_backend is not previous_backend
+    assert await agent._build_agent_if_needed() is graph
+    assert agent._backend is refreshed_backend
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("invalid", ["symlink", "relative", "missing", "file"])
+async def test_build_agent_does_not_route_invalid_lease_root(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, invalid: str,
+) -> None:
+    agent = _make_agent(tmp_path, monkeypatch)
+    _stub_deepagent_build(monkeypatch)
+    target_root = tmp_path / "outside"
+    target_root.mkdir()
+    target = target_root / "private.txt"
+    target.write_text("not routed", encoding="utf-8")
+    lease_root = tmp_path / "leases"
+    if invalid == "symlink":
+        lease_root.symlink_to(target_root, target_is_directory=True)
+    elif invalid == "relative":
+        monkeypatch.chdir(tmp_path)
+        lease_root = Path("outside")
+    elif invalid == "file":
+        lease_root.write_text("not a directory", encoding="utf-8")
+    monkeypatch.setenv("MIMIR_PR_CHECKOUT_LEASE_ROOT", str(lease_root))
+
+    await agent._build_agent_if_needed()
+
+    assert str(lease_root.resolve()) + "/" not in getattr(agent._backend, "routes", {})
+    assert agent._backend.read(str(target)).error is not None
+
+
+@pytest.mark.asyncio
 async def test_build_agent_rebuilds_without_coding_tools_after_identity_latch(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
