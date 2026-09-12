@@ -138,21 +138,40 @@ def test_install_copies_directory(fake_optional_root: Path, fake_home: Path):
     assert result.pollers_registered_hint is True
 
 
+@pytest.mark.parametrize("existing", [False, True])
 def test_install_records_post_epoch_skill_as_trusted_informational(
     fake_optional_root: Path,
     fake_home: Path,
     monkeypatch: pytest.MonkeyPatch,
+    existing: bool,
 ) -> None:
     monkeypatch.setenv("MIMIR_HOME", str(fake_home))
     assert access_control.initialize_file_integrity_ledger(fake_home) is True
+    dest = fake_home / "skills" / "fake-skill"
+    if existing:
+        dest.mkdir(parents=True)
+        (dest / "SKILL.md").write_text("old content")
+        (dest / "local.txt").write_text("local content")
 
     result = install(
-        "fake-skill", fake_home, optional_skills_root=fake_optional_root,
+        "fake-skill", fake_home, force=existing,
+        optional_skills_root=fake_optional_root,
     )
 
+    assert result.overwrote is existing
+    assert (dest / "SKILL.md").read_bytes() == (
+        fake_optional_root / "fake-skill" / "SKILL.md"
+    ).read_bytes()
+    assert set(dest.iterdir()) == {dest / "SKILL.md"}
+    assert set(dest.parent.iterdir()) == {dest}
     assert access_control._filesystem_result_integrity(
         None, str(result.dest / "SKILL.md"),
     ) == ("trusted", "informational")
+    dropped = dest / "unrecorded.md"
+    dropped.write_text("hostile instructions")
+    assert access_control._filesystem_result_integrity(None, str(dropped)) == (
+        "untrusted", "active_ingest",
+    )
 
 
 @pytest.mark.parametrize("created_before_epoch", [False, True])
@@ -175,22 +194,69 @@ def test_unrecorded_skill_file_remains_untrusted(
     )
 
 
-def test_install_fails_closed_when_integrity_ledger_is_corrupt(
+@pytest.mark.parametrize("failure", ["malformed", "non-dict", "unwritable"])
+@pytest.mark.parametrize("existing", [False, True])
+def test_install_rolls_back_when_integrity_record_fails(
     fake_optional_root: Path,
     fake_home: Path,
     monkeypatch: pytest.MonkeyPatch,
+    existing: bool,
+    failure: str,
 ) -> None:
     monkeypatch.setenv("MIMIR_HOME", str(fake_home))
+    assert access_control.initialize_file_integrity_ledger(fake_home) is True
+    dest = fake_home / "skills" / "fake-skill"
+    if existing:
+        install("fake-skill", fake_home, optional_skills_root=fake_optional_root)
+        (dest / "local.txt").write_bytes(b"local content\x00\xff")
+        (dest / "alias.txt").symlink_to("local.txt")
+        old_content = (dest / "SKILL.md").read_bytes()
+    (fake_optional_root / "fake-skill" / "SKILL.md").write_text("new content")
+    (fake_optional_root / "fake-skill" / "new.txt").write_text("new file")
     metadata = fake_home / ".mimir" / "file-integrity.json"
-    metadata.parent.mkdir()
-    metadata.write_text("not json", encoding="utf-8")
+    if failure == "malformed":
+        metadata.write_text("not json", encoding="utf-8")
+    elif failure == "non-dict":
+        metadata.write_text("[]", encoding="utf-8")
+    else:
+        # A directory blocks the recorder's actual write even under root.
+        metadata.with_suffix(".tmp").mkdir()
+    old_metadata = metadata.read_bytes()
 
     with pytest.raises(OSError, match="failed to record trusted skill integrity"):
-        install("fake-skill", fake_home, optional_skills_root=fake_optional_root)
+        install(
+            "fake-skill", fake_home, force=existing,
+            optional_skills_root=fake_optional_root,
+        )
 
-    installed = fake_home / "skills" / "fake-skill" / "SKILL.md"
-    assert installed.is_file()
-    assert access_control._filesystem_result_integrity(None, str(installed)) == (
+    assert metadata.read_bytes() == old_metadata
+    assert set(dest.parent.iterdir()) == ({dest} if existing else set())
+    if existing:
+        assert (dest / "SKILL.md").read_bytes() == old_content
+        assert (dest / "local.txt").read_bytes() == b"local content\x00\xff"
+        assert (dest / "alias.txt").is_symlink()
+        assert (dest / "alias.txt").readlink() == Path("local.txt")
+        assert set(p.name for p in dest.iterdir()) == {
+            "SKILL.md", "local.txt", "alias.txt",
+        }
+        expected = (
+            ("trusted", "informational") if failure == "unwritable"
+            else ("untrusted", "active_ingest")
+        )
+        assert access_control._filesystem_result_integrity(
+            None, str(dest / "SKILL.md"),
+        ) == expected
+        assert access_control._filesystem_result_integrity(
+            None, str(dest / "local.txt"),
+        ) == ("untrusted", "active_ingest")
+    else:
+        assert not dest.exists()
+
+    # Files dropped without a successful record must never gain trust.
+    dest.mkdir(exist_ok=True)
+    dropped = dest / "new.txt"
+    dropped.write_text("new file")
+    assert access_control._filesystem_result_integrity(None, str(dropped)) == (
         "untrusted", "active_ingest",
     )
 

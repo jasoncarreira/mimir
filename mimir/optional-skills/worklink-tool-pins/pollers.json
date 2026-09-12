@@ -13,7 +13,10 @@
         "scoped_roots": ["state"]
       },
       "pass_env": [
-        "MIMIR_HOME"
+        "MIMIR_HOME",
+        "WORKLINK_CONFIG",
+        "CHAINLINK_CWD",
+        "CHAINLINK_BIN"
       ]
     }
   ]

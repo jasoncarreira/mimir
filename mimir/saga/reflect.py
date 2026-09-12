@@ -103,6 +103,7 @@ def reflect(
     channel_id: str | None,
     embed_fn,
     boundary_synth_fn: BoundarySynthFn,
+    expected_embedding_dim: int | None = None,
     boundary_context: dict | None = None,
     agent_id: str = "default",
     owner_principal: str | None = None,
@@ -117,6 +118,10 @@ def reflect(
     (summary, topics_discussed, decisions_made, unfinished,
     emotional_state, closed_since) plus an embedding of the summary
     for ``search_sessions()``. Does NOT write atoms.
+
+    When ``expected_embedding_dim`` is known, incompatible dimensions or
+    float32 byte lengths raise ``ValueError`` before writing the session.
+    Provider failures still allow the session to close without an embedding.
 
     Does NOT synthesize observations — that's consolidate.py's job
     (cron-driven, cross-session).
@@ -153,6 +158,14 @@ def reflect(
                 "Session %s summary embedding failed; closing without embedding",
                 session_id,
                 exc_info=True,
+            )
+
+    # Provider failures remain best-effort; incompatible vectors must not land.
+    if emb_bytes is not None and expected_embedding_dim is not None:
+        if emb_dim != expected_embedding_dim or len(emb_bytes) != expected_embedding_dim * 4:
+            raise ValueError(
+                f"reflect embedding dimension mismatch: expected {expected_embedding_dim}, "
+                f"got {emb_dim} ({len(emb_bytes)} bytes)"
             )
 
     now = _utc_now_iso()

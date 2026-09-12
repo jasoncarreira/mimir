@@ -2066,6 +2066,11 @@ def test_poller_dispatches_only_after_failure_alert_is_durably_acked(
         "error_signature": "failed-201",
         "failure_occurrence_id": "occurrence-201",
     }
+    with poller.failure_state_transaction(dispatch_failure_state_dir(home)) as state:
+        state["issues"]["201"] = {
+            "active": True, "signature": alert["error_signature"],
+            "occurrence_id": alert["failure_occurrence_id"], "notified_signatures": [],
+        }
     order: list[str] = []
     receipt = False
 
@@ -2137,6 +2142,11 @@ def test_poller_reports_scan_when_alert_delivery_leaves_insufficient_budget(
         "error_signature": "failed-201",
         "failure_occurrence_id": "occurrence-201",
     }
+    with poller.failure_state_transaction(dispatch_failure_state_dir(home)) as state:
+        state["issues"]["201"] = {
+            "active": True, "signature": alert["error_signature"],
+            "occurrence_id": alert["failure_occurrence_id"], "notified_signatures": [],
+        }
     events: list[dict] = []
     receipt = False
 
@@ -2238,6 +2248,12 @@ def test_poller_stops_after_emitting_when_later_failure_ack_errors(
         "error_signature": "second-signature",
         "failure_occurrence_id": "second-occurrence",
     }
+    with poller.failure_state_transaction(dispatch_failure_state_dir(home)) as state:
+        for alert in (first, second):
+            state["issues"][str(alert["issue_id"])] = {
+                "active": True, "signature": alert["error_signature"],
+                "occurrence_id": alert["failure_occurrence_id"], "notified_signatures": [],
+            }
     emitted: list[dict] = []
     continuation_called = False
 

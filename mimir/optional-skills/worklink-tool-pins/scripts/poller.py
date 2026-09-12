@@ -330,7 +330,7 @@ def _chainlink_cwd(home: Path) -> Path:
 
 
 def _chainlink_bin() -> str:
-    return os.environ.get("CHAINLINK_BIN", "/usr/local/bin/chainlink")
+    return os.environ.get("CHAINLINK_BIN") or "chainlink"
 
 
 def _chainlink_runner(cwd: Path):
