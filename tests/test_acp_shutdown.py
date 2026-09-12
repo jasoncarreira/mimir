@@ -8,7 +8,8 @@ import re
 import signal
 import sys
 import time
-from collections.abc import AsyncIterator, Callable
+import time
+from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from pathlib import Path
 from types import SimpleNamespace
@@ -594,9 +595,31 @@ async def _await_diagnostic(progress: Path, marker: str, *, timeout: float = 30)
         await asyncio.sleep(0.01)
 
 
+async def _await_diagnostic(progress: Path, marker: str, *, timeout: float = 30) -> str:
+    """Wait for a diagnostic written by the child's watchdog THREAD.
+
+    ``armed`` is written by ``Timer.start()`` on the thread that CALLS start, so
+    it orders nothing about markers written inside ``run()`` by the timer thread
+    itself. Callers must await this while the child is still ALIVE: once the
+    protocol has escalated and reaped it, no writer remains and polling the final
+    file only delays the same failure.
+    """
+    path = progress.with_suffix(".diagnostics")
+    deadline = time.monotonic() + timeout
+    while True:
+        text = path.read_text() if path.exists() else ""
+        if marker in text:
+            return text
+        assert time.monotonic() < deadline, (
+            f"{marker!r} not observed within {timeout}s; diagnostics:\n{text or '<empty>'}"
+        )
+        await asyncio.sleep(0.01)
+
+
 async def _signal_exit_protocol(
     process: asyncio.subprocess.Process, progress: Path,
     signum: signal.Signals, repeat: bool, *, timeout: float = 120,
+    after_armed: Callable[[], Awaitable[None]] | None = None,
 ) -> None:
     outstanding = "ready"
 
@@ -608,6 +631,11 @@ async def _signal_exit_protocol(
             assert observed == marker.encode() + b"\n", (marker, observed)
             if marker == "ready":
                 process.send_signal(signum)
+            elif marker == "armed" and after_armed is not None:
+                # Still alive here: escalation and communicate() come after the
+                # loop, so this is the only point where a child-thread marker
+                # can be synchronised on.
+                await after_armed()
         outstanding = "exit"
         if repeat:
             signum = signal.SIGINT if signum != signal.SIGINT else signal.SIGTERM
@@ -731,14 +759,25 @@ raise SystemExit(bootstrap.main([]))
         # The controlled watchdog and resistant stage prove the exit boundary:
         # only expiration or a second signal can release the child, regardless
         # of how long the parent takes to observe each ordered marker.
-        await _signal_exit_protocol(process, progress, signum, repeat)
+        async def _observe_input_wait() -> None:
+            # Written by the timer THREAD; the 'armed' marker above is written by
+            # the thread that CALLS start() and orders nothing about it. This must
+            # run while the child is alive: escalation and communicate() follow the
+            # protocol loop, after which no writer remains and polling the final
+            # file would only delay the same failure. Ordering only — later
+            # assertions re-read the file for markers written after this point.
+            await _await_diagnostic(progress, "watchdog-input-wait")
+
+        await _signal_exit_protocol(
+            process, progress, signum, repeat, after_armed=_observe_input_wait,
+        )
         assert progress.read_text().splitlines()[:8] == [
             "child-started", "install-enter", "handlers-installed", "ready",
             f"signal-enter:{signum}", "watchdog-start-enter",
             "watchdog-start-returned", "armed",
         ]
         delivered = [signum]
-        diagnostics = await _await_diagnostic(progress, "watchdog-input-wait")
+        diagnostics = progress.with_suffix(".diagnostics").read_text()
         assert "watchdog-timed-wait" not in diagnostics
         if repeat:
             delivered.append(signal.SIGINT if signum != signal.SIGINT else signal.SIGTERM)
