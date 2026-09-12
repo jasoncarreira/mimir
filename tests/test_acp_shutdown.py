@@ -7,6 +7,7 @@ import os
 import re
 import signal
 import sys
+import time
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -571,6 +572,28 @@ raise SystemExit(bootstrap.main([]))
             await process.communicate()
 
 
+async def _await_diagnostic(progress: Path, marker: str, *, timeout: float = 30) -> str:
+    """Wait for a diagnostic written by the child's watchdog THREAD.
+
+    ``armed`` is written by ``Timer.start()`` on the thread that CALLS start;
+    the markers inside ``run()`` are written by the timer thread itself. So
+    observing ``armed`` does not order them, and asserting one straight after
+    it races a thread that may not have been scheduled yet — which is how this
+    failed on a loaded runner while passing locally. Wait for the condition
+    instead, bounded, and report what was actually observed on expiry.
+    """
+    path = progress.with_suffix(".diagnostics")
+    deadline = time.monotonic() + timeout
+    while True:
+        text = path.read_text() if path.exists() else ""
+        if marker in text:
+            return text
+        assert time.monotonic() < deadline, (
+            f"{marker!r} not observed within {timeout}s; diagnostics:\n{text or '<empty>'}"
+        )
+        await asyncio.sleep(0.01)
+
+
 async def _signal_exit_protocol(
     process: asyncio.subprocess.Process, progress: Path,
     signum: signal.Signals, repeat: bool, *, timeout: float = 120,
@@ -715,8 +738,7 @@ raise SystemExit(bootstrap.main([]))
             "watchdog-start-returned", "armed",
         ]
         delivered = [signum]
-        diagnostics = progress.with_suffix(".diagnostics").read_text()
-        assert "watchdog-input-wait" in diagnostics
+        diagnostics = await _await_diagnostic(progress, "watchdog-input-wait")
         assert "watchdog-timed-wait" not in diagnostics
         if repeat:
             delivered.append(signal.SIGINT if signum != signal.SIGINT else signal.SIGTERM)
