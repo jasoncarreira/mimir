@@ -522,6 +522,63 @@ async def test_preauth_timeout_cancels_connection_runner(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("outcome", ["timeout", "success", "cancelled"])
+async def test_admitted_peer_completion_retrieves_and_reports_failure(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+    caplog: pytest.LogCaptureFixture, outcome: str,
+) -> None:
+    daemon = AcpDaemon(_bundle(tmp_path))
+    daemon._agent = object()
+    retrieved = []
+    create_task = asyncio.create_task
+
+    class ObservedTask(asyncio.Task):
+        def exception(self):
+            result = super().exception()
+            retrieved.append(result)
+            return result
+
+    def observe_peer(coro, **kwargs):
+        if coro.cr_code.co_name == "_run_peer":
+            return ObservedTask(coro, **kwargs)
+        return create_task(coro, **kwargs)
+
+    async def runner(*args: object, **kwargs: object) -> None:
+        if outcome != "success":
+            await asyncio.Event().wait()
+
+    monkeypatch.setattr(asyncio, "create_task", observe_peer)
+    monkeypatch.setattr("mimir.acp.daemon._peer_uid", lambda sock: os.getuid())
+    monkeypatch.setattr("mimir.acp.daemon.run_stdio_agent", runner)
+    monkeypatch.setattr("mimir.acp.daemon.ACP_AUTH_TIMEOUT", 0.01)
+    writer = _Writer()
+    await daemon._admit_peer(asyncio.StreamReader(), writer)
+    task = next(iter(daemon._peers)).task
+    await asyncio.sleep(0)
+    if outcome == "cancelled":
+        task.cancel()
+    # Unlike awaiting _run_peer under pytest.raises, wait does not retrieve
+    # the exception. Only the production completion callback can do that.
+    done, pending = await asyncio.wait({task}, timeout=1)
+    assert done == {task} and not pending
+    await asyncio.sleep(0)
+    assert not daemon._peers
+    assert daemon._admitted == 0
+    assert writer.closed
+    records = [r for r in caplog.records if "ACP peer connection failed" in r.message]
+    if outcome == "timeout":
+        assert len(retrieved) == 1
+        assert isinstance(retrieved[0], AcpDaemonError)
+        assert "authentication timed out" in str(retrieved[0])
+        assert len(records) == 1
+        assert str(daemon.socket_path) in records[0].message
+        assert records[0].exc_info[1] is retrieved[0]
+    else:
+        assert retrieved == ([] if outcome == "cancelled" else [None])
+        assert not records
+
+
+@pytest.mark.asyncio
 async def test_shutdown_closes_at_most_four_peers_concurrently(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

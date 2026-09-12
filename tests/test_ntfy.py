@@ -23,6 +23,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+import subprocess
+import sys
 import threading
 from datetime import datetime, timedelta, timezone
 from typing import Any
@@ -1122,3 +1124,248 @@ async def test_last_post_table_prunes_stale_entries(
 
     assert "fresh:key" in ntfy._LAST_POST
     assert "ancient:key" not in ntfy._LAST_POST
+
+
+@pytest.mark.parametrize("threshold", [60, 240])
+def test_heartbeat_scan_stops_at_time_bound(monkeypatch, tmp_path, threshold):
+    from mimir import _jsonl_tail
+
+    now = datetime(2026, 5, 27, 4, tzinfo=timezone.utc)
+    cutoff = now - timedelta(minutes=threshold)
+
+    def records(*args, **kwargs):
+        yield None
+        yield []
+        yield {"timestamp": "bad"}
+        yield {"timestamp": now.isoformat(), "type": "other"}
+        yield {"timestamp": cutoff.isoformat(), "type": "other"}
+        pytest.fail("heartbeat scan consumed history beyond the cron window")
+
+    monkeypatch.setattr(_jsonl_tail, "tail_jsonl_records", records)
+    assert ntfy._last_heartbeat_timestamp(
+        tmp_path / "events.jsonl", window_start=cutoff,
+    ) == (None, True)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cron,threshold", [("*/30 * * * *", 60), ("0 */2 * * *", 240)])
+async def test_old_wedge_cutoff_grace_survives_restart(
+    tmp_path, monkeypatch, cron, threshold,
+):
+    now = datetime(2026, 5, 27, 4, tzinfo=timezone.utc)
+    events_file = tmp_path / "events.jsonl"
+    scheduler = _write_scheduler_yaml(tmp_path, cron)
+    _write_events(events_file, [
+        _heartbeat_event((now - timedelta(days=10)).isoformat()),
+        {"timestamp": (now - timedelta(days=2)).isoformat(), "type": "other"},
+        {"timestamp": now.isoformat(), "type": "other"},
+    ])
+    alarm = AsyncMock()
+    monkeypatch.setattr(ntfy, "post_algedonic_alarm", alarm)
+    for minutes in [0, threshold - 1]:
+        await ntfy.fire_scheduler_wedge_alarm_if_warranted(
+            events_file, scheduler_yaml_path=scheduler,
+            now=now + timedelta(minutes=minutes),
+        )
+        alarm.assert_not_awaited()
+    state_file, = tmp_path.glob(".scheduler-wedge-*.json")
+    assert json.loads(state_file.read_text()) == {
+        "last_tick": None, "monitoring_since": now.isoformat(),
+    }
+    # A fresh interpreter must load the observation, not restart grace.
+    later = now + timedelta(minutes=threshold)
+    result = subprocess.run(
+        [sys.executable, "-c", """
+import sys
+from pathlib import Path
+from datetime import datetime
+from mimir.ntfy import _assess_scheduler_wedge
+a = _assess_scheduler_wedge(
+    Path(sys.argv[1]), scheduler_yaml_path=Path(sys.argv[2]),
+    channel_id='scheduler:heartbeat', safety_factor=2,
+    now=datetime.fromisoformat(sys.argv[3]),
+)
+assert a.classification == 'wedge'
+assert a.last_tick is None
+assert a.monitoring_since.isoformat() == sys.argv[4]
+""", str(events_file), str(scheduler), later.isoformat(), now.isoformat()],
+        capture_output=True, text=True, timeout=30,
+    )
+    assert result.returncode == 0, result.stderr
+    await ntfy.fire_scheduler_wedge_alarm_if_warranted(
+        events_file, scheduler_yaml_path=scheduler, now=later,
+    )
+    alarm.assert_awaited_once()
+    assert "of monitoring" in alarm.call_args.kwargs["body"]
+    assert json.loads(state_file.read_text())["monitoring_since"] == now.isoformat()
+
+
+def test_retained_tick_alarms_beyond_bound_and_recent_tick_recovers(tmp_path):
+    now = datetime(2026, 5, 27, 4, tzinfo=timezone.utc)
+    events_file = tmp_path / "events.jsonl"
+    scheduler = _write_scheduler_yaml(tmp_path)
+
+    def assess(at):
+        return ntfy._assess_scheduler_wedge(
+            events_file, scheduler_yaml_path=scheduler, safety_factor=2,
+            channel_id="scheduler:heartbeat", now=at,
+        )
+
+    _write_events(events_file, [_heartbeat_event(now.isoformat())])
+    assert assess(now).last_tick == now
+    later = now + timedelta(days=3)
+    _write_events(events_file, [
+        _heartbeat_event(now.isoformat()),
+        _suppress_event((now + timedelta(minutes=10)).isoformat()),
+        {"timestamp": (later - timedelta(hours=2)).isoformat(), "type": "other"},
+        {"timestamp": later.isoformat(), "type": "other"},
+    ])
+    stale = assess(later)
+    assert stale.last_tick == now
+    assert stale.monitoring_since is None
+    assert stale.classification == "wedge"
+    assert stale.elapsed_minutes == 3 * 24 * 60
+    with events_file.open("a") as stream:
+        stream.write(json.dumps(_suppress_event(later.isoformat())) + "\n")
+    assert assess(later).classification == "suppressed"
+    with events_file.open("a") as stream:
+        stream.write(json.dumps(_heartbeat_event(later.isoformat())) + "\n")
+    recovered = assess(later)
+    assert recovered.last_tick == later
+    assert recovered.monitoring_since is None
+    assert recovered.classification is None
+
+
+def test_bof_without_tick_clears_observation_and_stays_silent(tmp_path):
+    now = datetime(2026, 5, 27, 4, tzinfo=timezone.utc)
+    events_file = tmp_path / "events.jsonl"
+    scheduler = _write_scheduler_yaml(tmp_path)
+
+    def assess(at):
+        return ntfy._assess_scheduler_wedge(
+            events_file, scheduler_yaml_path=scheduler, safety_factor=2,
+            channel_id="scheduler:heartbeat", now=at,
+        )
+
+    _write_events(events_file, [{"timestamp": (now - timedelta(days=1)).isoformat()}])
+    assert assess(now).monitoring_since == now
+    for minutes in [0, 90, 180]:
+        later = now + timedelta(minutes=minutes)
+        _write_events(events_file, [{"timestamp": later.isoformat()}])
+        assessment = assess(later)
+        assert assessment.last_tick is None
+        assert assessment.monitoring_since is None
+        assert assessment.classification is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["state_write", "state_read", "log_read", "malformed_state"])
+async def test_wedge_state_failures_are_nonfatal(tmp_path, monkeypatch, failure):
+    from mimir import _atomic, _jsonl_tail
+    from pathlib import Path
+
+    now = datetime(2026, 5, 27, 4, tzinfo=timezone.utc)
+    events_file = tmp_path / "events.jsonl"
+    scheduler = _write_scheduler_yaml(tmp_path)
+    _write_events(events_file, [{"timestamp": (now - timedelta(days=1)).isoformat()}])
+    alarm = AsyncMock()
+    monkeypatch.setattr(ntfy, "post_algedonic_alarm", alarm)
+    await ntfy.fire_scheduler_wedge_alarm_if_warranted(
+        events_file, scheduler_yaml_path=scheduler, now=now,
+    )
+    state_file, = tmp_path.glob(".scheduler-wedge-*.json")
+    if failure == "malformed_state":
+        state_file.write_text('{"last_tick": [], "monitoring_since": {}}')
+    elif failure == "state_read":
+        original = Path.open
+
+        def deny_state(path, *args, **kwargs):
+            if path == state_file:
+                raise PermissionError("test state read denied")
+            return original(path, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "open", deny_state)
+    elif failure == "state_write":
+        state_file.unlink()
+
+        def deny_write(*args, **kwargs):
+            raise PermissionError("test state write denied")
+
+        monkeypatch.setattr(_atomic, "atomic_write_json", deny_write)
+    else:
+        def deny_log(*args, read_status, **kwargs):
+            read_status.error = PermissionError("test log read denied")
+            return iter(())
+
+        monkeypatch.setattr(_jsonl_tail, "tail_jsonl_records", deny_log)
+    await ntfy.fire_scheduler_wedge_alarm_if_warranted(
+        events_file, scheduler_yaml_path=scheduler, now=now + timedelta(minutes=90),
+    )
+    alarm.assert_not_awaited()
+
+
+@pytest.mark.parametrize("cron,safety_factor,threshold", [
+    ("*/30 * * * *", 2, 60), ("0 */2 * * *", 3, 360),
+])
+def test_both_wedge_scans_use_cron_bound(
+    tmp_path, monkeypatch, cron, safety_factor, threshold,
+):
+    from mimir import _jsonl_tail
+
+    now = datetime(2026, 5, 27, 4, tzinfo=timezone.utc)
+    events_file = tmp_path / "events.jsonl"
+    scheduler = _write_scheduler_yaml(tmp_path, cron)
+    _write_events(events_file, [_heartbeat_event(now.isoformat())])
+    kwargs = dict(
+        scheduler_yaml_path=scheduler, safety_factor=safety_factor,
+        channel_id="scheduler:heartbeat",
+    )
+    ntfy._assess_scheduler_wedge(events_file, now=now, **kwargs)
+    later = now + timedelta(days=3)
+    boundary = later - timedelta(minutes=threshold)
+    scans = []
+
+    def records(*args, **kwargs):
+        scans.append(True)
+        # Busy logs cannot truncate the window at an arbitrary record cap.
+        for _ in range(10_000):
+            yield {"timestamp": later.isoformat(), "type": "other"}
+        yield {"timestamp": boundary.isoformat(), "type": "other"}
+        pytest.fail("scan crossed its cron-derived time boundary")
+
+    monkeypatch.setattr(_jsonl_tail, "tail_jsonl_records", records)
+    assessment = ntfy._assess_scheduler_wedge(events_file, now=later, **kwargs)
+    assert assessment.classification == "wedge"
+    assert assessment.last_tick == now
+    assert len(scans) == 2
+
+
+def test_wedge_state_isolated_by_log_scheduler_and_channel(tmp_path):
+    now = datetime(2026, 5, 27, 4, tzinfo=timezone.utc)
+    events_file = tmp_path / "events.jsonl"
+    scheduler = _write_scheduler_yaml(tmp_path)
+    _write_events(events_file, [{"timestamp": (now - timedelta(days=1)).isoformat()}])
+    kwargs = dict(scheduler_yaml_path=scheduler, safety_factor=2,
+                  channel_id="scheduler:heartbeat")
+    ntfy._assess_scheduler_wedge(events_file, now=now, **kwargs)
+    later = now + timedelta(minutes=90)
+    assert ntfy._assess_scheduler_wedge(
+        events_file, now=later, **kwargs,
+    ).classification == "wedge"
+    other_log = tmp_path / "other.jsonl"
+    _write_events(other_log, [{"timestamp": (now - timedelta(days=1)).isoformat()}])
+    other_scheduler = tmp_path / "other.yaml"
+    other_scheduler.write_text(scheduler.read_text())
+    for path, overrides in [
+        (other_log, {}),
+        (events_file, {"scheduler_yaml_path": other_scheduler}),
+        (events_file, {"channel_id": "../../outside/channel"}),
+    ]:
+        assessment = ntfy._assess_scheduler_wedge(
+            path, now=later, **(kwargs | overrides),
+        )
+        assert assessment.monitoring_since == later
+        assert assessment.classification is None
+    state_files = list(tmp_path.glob(".scheduler-wedge-*.json"))
+    assert len(state_files) == 4
+    assert all(path.stat().st_mode & 0o777 == 0o600 for path in state_files)

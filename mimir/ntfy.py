@@ -51,10 +51,13 @@ block in mimir/feedback.py — wiring deferred to chainlink #65):
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
 import logging
+import math
 import os
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import aiohttp
@@ -454,34 +457,37 @@ def _classify_silence(
 def _last_heartbeat_timestamp(
     events_path: Path,
     *,
+    window_start: datetime,
     channel_id: str = _HEARTBEAT_CHANNEL_ID,
-) -> datetime | None:
+) -> tuple[datetime | None, bool]:
     """Scan ``events_path`` in reverse and return the timestamp of the most
     recent ``scheduled_tick`` event for ``channel_id``.
 
-    Returns ``None`` if:
-    - the file does not exist or cannot be read,
-    - no matching event is found (e.g. first boot, very small log).
-
-    Never raises.
-
-    chainlink #244: switched from ``read_text()`` (full file in memory)
-    to :func:`tail_jsonl_records` which yields newest-first via 8 KiB
-    chunks. The freshest matching tick wins, so most calls return
-    after a handful of records.
+    The second result distinguishes a time cutoff from actual exhaustion.
+    As with _classify_silence, timestamps are assumed chronological. Work
+    is O(records in the time window), not O(total log history). A matching
+    tick at the boundary is still usable. Read failures propagate to the
+    public coroutine's soft-fail guard rather than masquerading as BOF.
     """
-    from ._jsonl_tail import tail_jsonl_records
+    from ._jsonl_tail import JsonlReadStatus, tail_jsonl_records
 
-    for event in tail_jsonl_records(events_path):
+    status = JsonlReadStatus()
+    for event in tail_jsonl_records(events_path, read_status=status):
+        if not isinstance(event, dict):
+            continue
+        ts = _parse_event_ts(event.get("timestamp", ""))
+        if ts is None:
+            continue
         if (
             event.get("type") == "scheduled_tick"
             and event.get("channel_id") == channel_id
         ):
-            ts = _parse_event_ts(event.get("timestamp", ""))
-            if ts is not None:
-                return ts
-            continue
-    return None
+            return ts, False
+        if ts <= window_start:
+            return None, True
+    if status.error is not None:
+        raise status.error
+    return None, False
 
 
 @dataclass(frozen=True)
@@ -489,6 +495,7 @@ class _SchedulerWedgeAssessment:
     heartbeat_cron: str | None
     threshold_minutes: float | None = None
     last_tick: datetime | None = None
+    monitoring_since: datetime | None = None
     elapsed_minutes: float | None = None
     classification: str | None = None
     suppress_reason: str | None = None
@@ -515,33 +522,84 @@ def _assess_scheduler_wedge(
 
     period_min = _cron_period_minutes(heartbeat_cron)
     threshold_minutes = period_min * safety_factor
+    if not math.isfinite(threshold_minutes) or threshold_minutes <= 0:
+        return _SchedulerWedgeAssessment(heartbeat_cron=heartbeat_cron)
+    window_start = now - timedelta(minutes=threshold_minutes)
 
-    last_tick = _last_heartbeat_timestamp(events_path, channel_id=channel_id)
-    if last_tick is None:
+    last_tick, cutoff = _last_heartbeat_timestamp(
+        events_path, channel_id=channel_id, window_start=window_start,
+    )
+    # Separate files isolate logs, scheduler configurations and channels;
+    # hashing prevents channel IDs from becoming path components.
+    identity = json.dumps([
+        str(events_path.resolve()), str(scheduler_yaml_path.resolve()), channel_id,
+    ])
+    state_path = events_path.resolve().parent / (
+        ".scheduler-wedge-" + hashlib.sha256(identity.encode()).hexdigest() + ".json"
+    )
+    state = {}
+    try:
+        with state_path.open(encoding="utf-8") as stream:
+            saved = json.loads(stream.read(4096))
+        if isinstance(saved, dict):
+            state = saved
+    except (OSError, ValueError):
+        pass
+    monitoring_since = None
+    if cutoff:
+        last_tick = _parse_event_ts(state.get("last_tick"))
+        monitoring_since = _parse_event_ts(state.get("monitoring_since"))
+        if last_tick is not None and last_tick > now:
+            last_tick = None
+        if last_tick is None:
+            if monitoring_since is None or monitoring_since > now:
+                monitoring_since = now
+        else:
+            monitoring_since = None
+    updated = {
+        "last_tick": last_tick.isoformat() if last_tick is not None else None,
+        "monitoring_since": (
+            monitoring_since.isoformat() if monitoring_since is not None else None
+        ),
+    }
+    if updated != state and (last_tick is not None or cutoff or state):
+        from ._atomic import atomic_write_json
+
+        try:
+            atomic_write_json(state_path, updated)
+        except OSError:
+            # A known tick still supports an assessment on read-only storage.
+            # An unpersisted first observation cannot survive a restart.
+            _log.warning("Unable to persist scheduler wedge baseline", exc_info=True)
+
+    baseline = last_tick if last_tick is not None else monitoring_since
+    if baseline is None:
         return _SchedulerWedgeAssessment(
             heartbeat_cron=heartbeat_cron,
             threshold_minutes=threshold_minutes,
         )
 
-    elapsed_minutes = (now - last_tick).total_seconds() / 60.0
+    elapsed_minutes = (now - baseline).total_seconds() / 60.0
     if elapsed_minutes < threshold_minutes:
         return _SchedulerWedgeAssessment(
             heartbeat_cron=heartbeat_cron,
             threshold_minutes=threshold_minutes,
             last_tick=last_tick,
+            monitoring_since=monitoring_since,
             elapsed_minutes=elapsed_minutes,
         )
 
     classification, suppress_reason = _classify_silence(
         events_path,
         channel_id=channel_id,
-        window_start=last_tick,
+        window_start=max(baseline, window_start),
         window_end=now,
     )
     return _SchedulerWedgeAssessment(
         heartbeat_cron=heartbeat_cron,
         threshold_minutes=threshold_minutes,
         last_tick=last_tick,
+        monitoring_since=monitoring_since,
         elapsed_minutes=elapsed_minutes,
         classification=classification,
         suppress_reason=suppress_reason,
@@ -568,6 +626,13 @@ async def fire_scheduler_wedge_alarm_if_warranted(
     heartbeat job is absent or has no cron (i.e. intentionally disabled), the
     function returns silently — a missing heartbeat entry is not a wedge.
 
+    Searches only the latest threshold-sized time window. On a cutoff with
+    no retained tick, a durable monitoring-since baseline starts one threshold
+    of grace (not a fabricated tick). Later cutoffs retain that baseline across
+    polls/restarts. Actual exhaustion without a tick clears it and stays silent.
+    State lives beside the event log; unwritable state cannot retain new grace
+    across polls. Suppression must be within the latest threshold window.
+
     Parameters
     ----------
     events_path:
@@ -592,22 +657,25 @@ async def fire_scheduler_wedge_alarm_if_warranted(
     if now is None:
         now = datetime.now(timezone.utc)
 
-    assessment = await asyncio.to_thread(
-        _assess_scheduler_wedge,
-        events_path,
-        scheduler_yaml_path=scheduler_yaml_path,
-        safety_factor=safety_factor,
-        channel_id=channel_id,
-        now=now,
-    )
+    try:
+        assessment = await asyncio.to_thread(
+            _assess_scheduler_wedge,
+            events_path,
+            scheduler_yaml_path=scheduler_yaml_path,
+            safety_factor=safety_factor,
+            channel_id=channel_id,
+            now=now,
+        )
+    except Exception:  # noqa: BLE001 - health probing must not crash the caller
+        _log.warning("Unable to assess scheduler wedge", exc_info=True)
+        return
     if (
         assessment.heartbeat_cron is None
         or assessment.threshold_minutes is None
-        or assessment.last_tick is None
         or assessment.elapsed_minutes is None
         or assessment.classification is None
     ):
-        # Heartbeat disabled/unreadable, no baseline tick, or still within
+        # Heartbeat disabled/unreadable, no baseline, or still within
         # the threshold.  The synchronous YAML/JSONL reads above ran off-loop;
         # no event/alarm work is needed for these normal no-op cases.
         return
@@ -615,6 +683,11 @@ async def fire_scheduler_wedge_alarm_if_warranted(
     heartbeat_cron = assessment.heartbeat_cron
     threshold_minutes = assessment.threshold_minutes
     elapsed_minutes = assessment.elapsed_minutes
+    silence = (
+        f"{channel_id} hasn't fired in {elapsed_minutes:.0f} min "
+        if assessment.last_tick is not None
+        else f"No {channel_id} tick observed during {elapsed_minutes:.0f} min of monitoring "
+    )
 
     # chainlink #221: distinguish genuine wedge from intentional
     # suppression. The legacy alarm fired identically when APScheduler
@@ -657,8 +730,8 @@ async def fire_scheduler_wedge_alarm_if_warranted(
         category="scheduler-wedge",
         title="mimir: scheduler wedge — heartbeat stale",
         body=(
-            f"scheduler:heartbeat hasn't fired in {elapsed_minutes:.0f} min "
-            f"(threshold: {threshold_minutes:.0f} min, "
+            silence
+            + f"(threshold: {threshold_minutes:.0f} min, "
             f"derived from cron '{heartbeat_cron}' × {safety_factor}). "
             "APScheduler may be wedged — check logs and consider restart."
         ),
