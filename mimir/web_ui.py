@@ -48,6 +48,7 @@ from . import __version__
 from ._jsonl_tail import JsonlReadStatus, count_lines_chunked, tail_jsonl_records
 from .admin_config import build_admin_config_payload
 from .admin_users import build_users_payload, roles_for_request
+from .config import _env_int
 from .dashboard_extensions import (
     DashboardBackendRoute,
     DashboardExtensionRegistry,
@@ -183,8 +184,6 @@ SKIN_TOKEN_NAMES = frozenset(
 )
 LIVE_EVENTS_HEARTBEAT_S = 15.0
 LIVE_EVENTS_POLL_S = 1.0
-LIVE_EVENTS_MAX_STREAMS = int(os.environ.get("MIMIR_LIVE_EVENTS_MAX_STREAMS", "8"))
-TURN_EVENTS_MAX_STREAMS = LIVE_EVENTS_MAX_STREAMS
 # The scheduler dashboard needs older persisted state than the generic 5k event
 # tail, but it must stay bounded: newly-added or monthly jobs may have no event
 # yet, so "scan until every configured job is found" can otherwise become a
@@ -926,6 +925,7 @@ def register_routes(
     # for the agent to edit (its name + skin).
     ensure_web_ui_config(home)
 
+    max_event_streams = _env_int("MIMIR_LIVE_EVENTS_MAX_STREAMS", 8)
     existing = {(r.method, r.resource.canonical) for r in app.router.routes()}
     configured_react_dist = os.environ.get("MIMIR_REACT_APP_DIST", "").strip()
     _react_app_dist = (
@@ -1232,7 +1232,7 @@ def register_routes(
     async def _try_acquire_live_event_slot() -> bool:
         nonlocal live_events_active
         async with live_events_lock:
-            if live_events_active >= LIVE_EVENTS_MAX_STREAMS:
+            if live_events_active >= max_event_streams:
                 return False
             live_events_active += 1
             return True
@@ -1344,7 +1344,7 @@ def register_routes(
     async def _try_acquire_turn_event_slot() -> bool:
         nonlocal turn_events_active
         async with turn_events_lock:
-            if turn_events_active >= TURN_EVENTS_MAX_STREAMS:
+            if turn_events_active >= max_event_streams:
                 return False
             turn_events_active += 1
             return True

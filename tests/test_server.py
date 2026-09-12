@@ -2863,6 +2863,27 @@ class TestHandleEvent:
         )
         assert durable_acl.visibility == "private"
 
+    async def test_event_strips_server_and_worklink_extra(self) -> None:
+        from mimir.http_ingress import SERVER_OWNED_EXTRA_KEYS
+        from mimir.worklink.continuation import (
+            HTTP_EVENT_INGRESS_EXTRA_KEY,
+            HTTP_EVENT_INGRESS_EXTRA_VALUE,
+            WORKLINK_HINT_EXTRA_KEYS,
+        )
+
+        extra = dict.fromkeys(SERVER_OWNED_EXTRA_KEYS | WORKLINK_HINT_EXTRA_KEYS, "forged")
+        extra["keep"] = "me"
+        extra["nested"] = [dict.fromkeys(WORKLINK_HINT_EXTRA_KEYS, "forged")]
+        app, stub = _event_app()
+        async with TestClient(TestServer(app)) as client:
+            response = await client.post("/event", json={"channel_id": "c", "extra": extra})
+        assert response.status == 200
+        assert stub.enqueue.call_args.args[0].extra == {
+            "keep": "me",
+            "nested": [{}],
+            HTTP_EVENT_INGRESS_EXTRA_KEY: HTTP_EVENT_INGRESS_EXTRA_VALUE,
+        }
+
     async def test_event_strips_client_asserted_saga_session_id(self) -> None:
         from mimir.worklink.continuation import (
             HTTP_EVENT_INGRESS_EXTRA_KEY,
