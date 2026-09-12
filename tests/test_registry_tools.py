@@ -587,7 +587,11 @@ class TestTriggerPseudoChannels:
                 service, capabilities=(), configured_delivery_channel="chan-1",
             ))
         elif case == "authorized-channel":
-            auth = _auth_runtime().context
+            # Same-channel IFC authority needs the resource and bridge binding,
+            # not just requester membership in the source ACL.
+            auth = replace(
+                _auth_runtime().context, resource_id="chan-1", bridge_instance="discord",
+            )
         elif case == "missing-auth":
             auth = None
         turn.auth_context = auth

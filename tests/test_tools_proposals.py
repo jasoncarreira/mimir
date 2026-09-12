@@ -230,11 +230,14 @@ def poller_runtime(monkeypatch, tmp_path):
         trigger="poller", channel_id=service.canonical, source="poller",
         source_id="feed:item:42", service_principal=service.canonical,
         service_authority=service,
-    ), enforce=True, ifc_labels=InformationFlowLabels(sources=(SourceLabel(
-        principal=None, domain="public", resource_id="https://arxiv.org/abs/2609.00042",
-        bridge_instance=None, sensitivity="public", source_kind="fetch_url",
-        integrity="untrusted", integrity_effect="active_ingest",
-    ),)))
+    ), enforce=True, ifc_labels=InformationFlowLabels(
+        source_channels=frozenset({service.canonical}),
+        sources=(SourceLabel(
+            principal=None, domain="public", resource_id="https://arxiv.org/abs/2609.00042",
+            bridge_instance=None, sensitivity="public", source_kind="fetch_url",
+            integrity="untrusted", integrity_effect="active_ingest",
+        ),),
+    ))
     turn = TurnContext(
         turn_id="papers-turn-42", session_id=service.canonical, trigger="poller",
         channel_id=service.canonical, started_at=0, auth_context=auth,

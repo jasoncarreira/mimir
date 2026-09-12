@@ -2427,6 +2427,51 @@ def test_every_known_label_can_flow_to_compatible_same_channel(label: str):
     assert decision.reason == "ifc_allowed"
 
 
+def test_source_only_carrier_obeys_forge_allowed_sinks():
+    source = SourceLabel(
+        principal="user-1", domain="channel", resource_id="slack-C1",
+        bridge_instance="slack", sensitivity="private",
+        authorized_principals=frozenset({"user-1"}),
+        integrity=Integrity.TRUSTED,
+    )
+    direct = InformationFlowLabels(sources=(source,))
+    incremental = InformationFlowLabels().with_source(source)
+    for labels in (incremental, direct):
+        allowed_sinks = SinkGate._get_allowed_sinks(
+            "pr_comment", SinkCategory.FORGE, _auth(),
+            ifc_labels=labels, target="owner/repo#17",
+        )
+        assert allowed_sinks == frozenset()
+        decision = SinkGate.check_sink_flow(
+            "pr_comment", "owner/repo#17", labels, _auth(), enforce=True,
+        )
+        assert decision.allowed is False
+        assert decision.reason == "ifc_label_blocked:forge"
+        assert decision.forge_scope_mismatch is None
+        assert labels.can_flow_to("owner/repo#17", allowed_sinks) is False
+    assert direct.labels == incremental.labels == frozenset({"private"})
+
+
+@pytest.mark.parametrize("labelled", [False, True])
+def test_sourceless_carrier_only_skips_sink_gate_when_unlabelled(labelled):
+    labels = InformationFlowLabels(
+        labels=frozenset({"private"}) if labelled else frozenset(),
+    )
+    assert labels.sources == ()
+    decision = SinkGate.check_sink_flow(
+        "pr_comment", "owner/repo#17", labels, _auth(), enforce=True,
+    )
+    assert decision.allowed is (not labelled)
+    assert decision.reason == ("ifc_label_blocked:forge" if labelled else "no_labels")
+
+
+def test_constructor_unions_source_sensitivities_with_explicit_labels():
+    sources = _labels(labels=frozenset({"private", "internal"})).sources
+    labels = InformationFlowLabels(labels=frozenset({"future-secret"}), sources=sources)
+    assert labels.labels == frozenset({"private", "internal", "future-secret"})
+    assert labels.can_flow_to("slack-C1", frozenset({"*"})) is False
+
+
 def test_all_labels_must_be_destination_compatible_to_pass():
     compatible = SinkGate.check_sink_flow(
         "send_message",
@@ -4998,7 +5043,7 @@ def test_same_scope_synthesis_write_remains_allowed():
             source_kind="service",
             integrity=Integrity.TRUSTED,
             integrity_effect=IntegrityEffect.INFORMATIONAL,
-        ),)),
+        ),)).with_channel(channel),
     )
 
     assert decision.allowed is True
@@ -5042,7 +5087,10 @@ def test_saga_forget_uses_active_ingest_only_taint_boundary() -> None:
         integrity_effect="active_ingest",
     )
 
-    for source, allowed in ((informational, True), (active, False)):
+    for source, reason in (
+        (informational, "ifc_label_blocked:saga"),
+        (active, "saga_mutation_blocked_by_tainted_turn"),
+    ):
         labels = InformationFlowLabels(sources=(trusted, source))
         auth = replace(
             _auth(roles=("admin",)), ifc_labels=labels,
@@ -5051,10 +5099,10 @@ def test_saga_forget_uses_active_ingest_only_taint_boundary() -> None:
         decision = ToolRegistry().authorize_tool(
             "saga_forget", auth, enforce=True, ifc_labels=labels,
         )
-        assert decision.allowed is allowed
-        assert decision.reason is (
-            None if allowed else "saga_mutation_blocked_by_tainted_turn"
-        )
+        # Informational recall passes integrity, but private data still needs
+        # independent SAGA sink authority; an admin role does not supply it.
+        assert decision.allowed is False
+        assert decision.reason == reason
 
 
 @pytest.mark.parametrize(

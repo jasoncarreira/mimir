@@ -2374,26 +2374,26 @@ def test_admin_action_follows_canonical_aliases_across_slack_discord(
 
 
 @pytest.mark.parametrize(
-    "tool_name",
+    "tool_name, expected_reason",
     [
-        "memory_store",
-        "memory_query",
-        "memory_get",
-        "saga_feedback",
-        "saga_mark_contributions",
-        "saga_end_session",
-        "saga_record_skill_learning",
-        "bash_jobs_list",
-        "bash_job_output",
-        "write_todos",
-        "defer_injected_message",
-        "commitment_complete",
-        "commitment_snooze",
-        "commitment_dismiss",
+        ("memory_store", "ifc_label_blocked:saga"),
+        ("memory_query", None),
+        ("memory_get", None),
+        ("saga_feedback", "ifc_label_blocked:saga"),
+        ("saga_mark_contributions", "ifc_label_blocked:saga"),
+        ("saga_end_session", "ifc_label_blocked:saga"),
+        ("saga_record_skill_learning", "ifc_label_blocked:saga"),
+        ("bash_jobs_list", None),
+        ("bash_job_output", None),
+        ("write_todos", None),
+        ("defer_injected_message", "ifc_label_blocked:saga"),
+        ("commitment_complete", "ifc_label_blocked:saga"),
+        ("commitment_snooze", "ifc_label_blocked:saga"),
+        ("commitment_dismiss", "ifc_label_blocked:saga"),
     ],
 )
-def test_admin_turn_can_use_routine_cataloged_tools_when_enforced(
-    tool_name: str,
+def test_admin_turn_routine_cataloged_tools_respect_ifc_when_enforced(
+    tool_name: str, expected_reason: str | None,
 ) -> None:
     labels = InformationFlowLabels(sources=(SourceLabel(
         principal="root", domain="channel", resource_id="slack-C1",
@@ -2424,9 +2424,11 @@ def test_admin_turn_can_use_routine_cataloged_tools_when_enforced(
         ifc_labels=labels,
     )
 
-    assert result.allowed is True
+    # Admin operation authority does not declassify private context for SAGA sinks.
+    assert result.allowed is (expected_reason is None)
     assert result.decision is not OperationDecision.UNKNOWN
-    assert result.reason is None
+    assert result.reason == expected_reason
+    assert result.would_block is (expected_reason is not None)
 
 
 def _interactive_operator_auth(
@@ -5538,7 +5540,8 @@ async def test_service_capability_allowed_admin_operation_emits_no_shadow_decisi
         authorized_principals=frozenset({"service:synthesis"}),
         source_kind="service", integrity=Integrity.TRUSTED,
         integrity_effect=IntegrityEffect.INFORMATIONAL,
-    ),))
+    ),)).with_channel("poller:test")
+    # The synthesis capability permits SAGA flow only from its own turn channel.
     auth = _service_auth(service, labels)
     with pytest.MonkeyPatch.context() as monkeypatch:
         monkeypatch.setattr("mimir.event_logger.log_event", capture)

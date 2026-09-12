@@ -4803,6 +4803,9 @@ class _Arm2LiveState:
     def merge(self, added: Any, fallback: Any = None) -> Any:
         return self.state.merge(added, fallback=fallback)
 
+    def consume_sink_approval(self, **kwargs: Any) -> bool:
+        return self.state.consume_sink_approval(**kwargs)
+
     def has_untrusted_active_ingest(self, _fallback: Any = None) -> object:
         if self.outcome == "error":
             raise RuntimeError("live IFC unavailable")
