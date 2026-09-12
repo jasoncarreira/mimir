@@ -328,7 +328,7 @@ async def _heartbeat_while(
     record: ClaimRecord,
     interval_s: float | None = None,
 ) -> Any:
-    """Keep the Chainlink claim fresh while a long compute await is active."""
+    """Keep the claim fresh until the awaited phase returns, fails, or is cancelled."""
     if interval_s is None:
         interval_s = _CLAIM_HEARTBEAT_INTERVAL_S
 
@@ -902,25 +902,31 @@ class WorklinkRunner:
                 )
             else:
                 compute_result = await invoke_backend()
-            result = await self._finalize(
-                issue=issue,
+            # Gates (including reruns) can outlast the claim TTL independently
+            # of the backend. Keep the claim alive through publication as well.
+            result = await _heartbeat_while(
+                self._finalize(
+                    issue=issue,
+                    claims=claims,
+                    claim_record=record,
+                    attempt=record.attempt,
+                    config=config,
+                    backend=backend,
+                    compute=compute,
+                    compute_result=compute_result,
+                    order=order,
+                    lease=lease,
+                    spec=spec,
+                    started=started,
+                    test_cmd=test_cmd,
+                    root_dirty_before=root_dirty_before,
+                    runner=runner,
+                    publication=publication,
+                    executor_report_dir=executor_report_dir,
+                    terminal_release=terminal_release,
+                ),
                 claims=claims,
-                claim_record=record,
-                attempt=record.attempt,
-                config=config,
-                backend=backend,
-                compute=compute,
-                compute_result=compute_result,
-                order=order,
-                lease=lease,
-                spec=spec,
-                started=started,
-                test_cmd=test_cmd,
-                root_dirty_before=root_dirty_before,
-                runner=runner,
-                publication=publication,
-                executor_report_dir=executor_report_dir,
-                terminal_release=terminal_release,
+                record=record,
             )
             delete_authorized_checkout = bool(
                 worker_uid_drop and result.review_ready and result.pr_url
@@ -1634,23 +1640,27 @@ class WorklinkRunner:
                 return WorklinkRunResult(
                     issue_id, state.attempt, "failed", reason="reattach: worker lost"
                 )
-            return await self._finalize(
-                issue=issue,
+            return await _heartbeat_while(
+                self._finalize(
+                    issue=issue,
+                    claims=claims,
+                    claim_record=claim_record,
+                    attempt=state.attempt,
+                    config=config,
+                    backend=backend,
+                    compute=compute,
+                    compute_result=compute_result,
+                    order=order,
+                    lease=lease,
+                    spec=spec,
+                    started=started,
+                    test_cmd=test_cmd,
+                    root_dirty_before=(),
+                    runner=runner,
+                    terminal_release=terminal_release,
+                ),
                 claims=claims,
-                claim_record=claim_record,
-                attempt=state.attempt,
-                config=config,
-                backend=backend,
-                compute=compute,
-                compute_result=compute_result,
-                order=order,
-                lease=lease,
-                spec=spec,
-                started=started,
-                test_cmd=test_cmd,
-                root_dirty_before=(),
-                runner=runner,
-                terminal_release=terminal_release,
+                record=claim_record,
             )
         except Exception as exc:
             if terminal_release():
