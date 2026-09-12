@@ -1729,7 +1729,31 @@ async def _read_sse_data(resp, *, timeout: float = 2.0) -> dict:
 
 
 @pytest.mark.asyncio
-async def test_api_v1_turn_events_sse_scrubs_tool_args_results_and_text(tmp_path: Path):
+@pytest.mark.parametrize("enforced", [False, True])
+async def test_api_v1_turn_events_sse_scrubs_tool_args_results_and_text(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, enforced: bool,
+):
+    from mimir.models import (
+        AuthContext, InformationFlowLabels, SourceLabel, TurnInteractivity,
+    )
+
+    monkeypatch.setenv("MIMIR_ACCESS_CONTROL_ENFORCED", str(enforced).lower())
+    labels = InformationFlowLabels(
+        labels=frozenset({"private"}),
+        source_channels=frozenset({"web-alice"}),
+        sources=(SourceLabel(
+            principal="alice", domain="channel", resource_id="web-alice",
+            bridge_instance="web", sensitivity="private",
+            authorized_principals=frozenset({"alice"}),
+        ),),
+    )
+    auth = AuthContext(
+        principal="alice", canonical_principal="alice", roles=(),
+        event_ingress=None, trigger="user_message", channel_id="web-alice",
+        interactivity=TurnInteractivity.INTERACTIVE,
+        enforcement_enabled=enforced, domain="channel",
+        resource_id="web-alice", bridge_instance="web",
+    )
     bus = TurnEventBus()
     a = web.Application()
     web_ui.register_routes(
@@ -1759,6 +1783,8 @@ async def test_api_v1_turn_events_sse_scrubs_tool_args_results_and_text(tmp_path
                 },
                 "content_delta": f"result TOKEN=abc {secret} attachments/private.txt",
                 "text": f"reasoning saw {secret} in memory/core/00-identity.md",
+                "_ifc_labels": labels,
+                "_auth_context": auth,
             }
         )
         event = await _read_sse_data(resp)
