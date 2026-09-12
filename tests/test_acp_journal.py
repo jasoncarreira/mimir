@@ -1,18 +1,130 @@
 from __future__ import annotations
 
 import asyncio
+import gc
 import json
 import os
+import weakref
 from pathlib import Path
 
 import pytest
 
 import mimir.acp.journal as journal_module
-from mimir.acp.journal import SessionJournal, _line, _with_sequence
+from mimir.acp.journal import JournalCache, SessionJournal, _line, _with_sequence
 from mimir.acp.sdk import AgentMessageChunk, RequestError, TextContentBlock, UserMessageChunk
 from mimir.acp.session_store import SessionStore
 
 TURN_ID = "00000000-0000-4000-8000-000000000000"
+
+
+@pytest.mark.asyncio
+async def test_cache_release_preserves_live_sequencer_then_reopens_durable_replay(tmp_path: Path) -> None:
+    store = SessionStore(tmp_path)
+    record = store.create_session("owner")
+    cache = JournalCache(store)
+    client = Client()
+    journal = cache.open(record, client)
+    await journal.publish_live(update("first"), turn_id=TURN_ID)
+    reference = weakref.ref(journal)
+    cache.release(record.session_id)
+    assert cache._sessions == {}
+    assert journal.current_client is None
+    successor = Client()
+    assert cache.open(record, successor) is journal
+    await journal.publish_live(update("second"), turn_id=TURN_ID)
+    assert successor.updates[-1][1].field_meta == {"mimir.sequence": 1}
+    cache.release(record.session_id)
+    del journal
+    gc.collect()
+    assert reference() is None
+    assert dict(cache._retired) == {}
+    reopened = cache.open(store.load_owned(record.session_id, "owner"), successor)
+    before = record.journal_path.read_bytes()
+    await reopened.send_replay()
+    assert record.journal_path.read_bytes() == before
+    assert reopened.next_sequence == 2
+    assert [u.field_meta["mimir.sequence"] for _, u in successor.updates] == [1, 0, 1]
+
+
+@pytest.mark.asyncio
+async def test_cache_release_during_delivery_keeps_one_lock_and_sequence(tmp_path: Path) -> None:
+    store = SessionStore(tmp_path)
+    record = store.create_session("owner")
+    cache = JournalCache(store)
+    client = BlockingClient()
+    journal = cache.open(record, client)
+    publishing = asyncio.create_task(journal.publish_live(update(), turn_id=TURN_ID))
+    await client.entered.wait()
+    cache.release(record.session_id)
+    successor = Client()
+    reopened = cache.open(record, successor)
+    assert reopened is journal
+    replaying = asyncio.create_task(reopened.send_replay())
+    await asyncio.sleep(0)
+    assert successor.updates == []
+    client.release.set()
+    await publishing
+    await replaying
+    await reopened.publish_live(update("next"), turn_id=TURN_ID)
+    assert [u.field_meta["mimir.sequence"] for _, u in successor.updates] == [0, 1]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("released_before_failure", [False, True])
+async def test_cache_release_keeps_fatal_fence_until_marker_is_durable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, released_before_failure: bool,
+) -> None:
+    store = SessionStore(tmp_path)
+    record = store.create_session("owner")
+    cache = JournalCache(store)
+    client = Client()
+    peer_ref = weakref.ref(client)
+    journal = cache.open(record, client)
+    mark = store.try_mark
+    monkeypatch.setattr(store, "try_mark", lambda *args: False)
+    monkeypatch.setattr(journal, "_append_durable", lambda body: (_ for _ in ()).throw(OSError("disk")))
+    if released_before_failure:
+        cache.release(record.session_id)
+    with pytest.raises(RequestError):
+        await journal.publish_live(update(), client)
+    assert cache._sessions[record.session_id] is journal
+    cache.release(record.session_id)
+    del client
+    gc.collect()
+    assert peer_ref() is None
+    assert cache._sessions[record.session_id] is journal
+    assert cache.open(store.load_owned(record.session_id, "owner")) is journal
+    with pytest.raises(RequestError, match="io_failed"):
+        await journal.send_replay(Client())
+    monkeypatch.setattr(store, "try_mark", mark)
+    cache.release(record.session_id)
+    assert cache._sessions == {}
+    with pytest.raises(RequestError, match="io_failed"):
+        store.load_owned(record.session_id, "owner")
+
+
+@pytest.mark.asyncio
+async def test_replay_validation_failure_remains_fatal_when_marker_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = SessionStore(tmp_path)
+    record = store.create_session("owner")
+    cache = JournalCache(store)
+    client = Client()
+    journal = cache.open(record, client)
+    await journal.publish_live(update())
+    cache.release(record.session_id)
+    monkeypatch.setattr(store, "try_mark", lambda *args: False)
+    with monkeypatch.context() as patch:
+        patch.setattr(journal, "_read_validated", lambda: (_ for _ in ()).throw(OSError("read")))
+        with pytest.raises(RequestError, match="io_failed"):
+            await journal.send_replay(client)
+    assert cache._sessions[record.session_id] is journal
+    with pytest.raises(RequestError, match="io_failed"):
+        await journal.send_replay(client)
+    with pytest.raises(RequestError, match="Internal error"):
+        await journal.publish_live(update(), client)
+    assert len(client.updates) == 1
 
 
 class Client:

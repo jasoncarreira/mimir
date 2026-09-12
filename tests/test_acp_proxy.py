@@ -625,6 +625,220 @@ async def test_explicit_hands_disconnect_revokes_session_grants_transparently() 
         await router.close()
 
 
+def explicit_session_request(request_id: str, server_ids: list[str]) -> dict[str, Any]:
+    return {
+        "jsonrpc": "2.0", "id": request_id, "method": "session/new",
+        "params": {
+            "cwd": "/workspace",
+            "mcpServers": [
+                {"type": "acp", "name": "mimir-hands", "serverId": server_id}
+                for server_id in server_ids
+            ],
+        },
+    }
+
+
+async def explicit_connect(
+    router: ProxyRouter, request_id: int, server_id: str, connection_id: str,
+) -> None:
+    await router.route_daemon({
+        "jsonrpc": "2.0", "id": request_id, "method": "mcp/connect",
+        "params": {"serverId": server_id},
+    })
+    await router.route_client({
+        "jsonrpc": "2.0", "id": request_id, "result": {"connectionId": connection_id},
+    })
+
+
+@pytest.mark.asyncio
+async def test_proxy_active_session_bound_and_reload_negative_control(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("mimir.acp.proxy.MAX_GENERATION_SERVER_IDS", 2)
+    client, daemon = Writer(), Writer()
+    router = ProxyRouter(client, daemon, "secret")
+    try:
+        for index in range(2):
+            # An unrelated explicit provider bypasses hosted-ID allocation.
+            request = explicit_session_request(str(index), ["other"])
+            request["params"]["mcpServers"][0]["name"] = "other"
+            await router.route_client(request)
+            await router.route_daemon({
+                "jsonrpc": "2.0", "id": str(index), "result": {"sessionId": str(index)},
+            })
+        assert router._active_sessions == {"0", "1"}
+        assert not router._used_server_ids
+        reload_request = explicit_session_request("reload", ["other"])
+        reload_request["method"] = "session/load"
+        reload_request["params"]["sessionId"] = "0"
+        await router.route_client(reload_request)
+        await router.route_daemon({"jsonrpc": "2.0", "id": "reload", "result": {}})
+        assert router._active_sessions == {"0", "1"}
+        await router.route_client(explicit_session_request("overflow", ["other"]))
+        before = bytes(client.data)
+        with pytest.raises(ProxyError, match="too many active sessions"):
+            await router.route_daemon({
+                "jsonrpc": "2.0", "id": "overflow", "result": {"sessionId": "2"},
+            })
+        assert bytes(client.data) == before
+        assert router._active_sessions == {"0", "1"}
+    finally:
+        await router.close()
+    assert not router._active_sessions
+    assert not router._explicit_server_sessions
+
+
+@pytest.mark.asyncio
+async def test_proxy_explicit_server_bounds_pending_and_promotion(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("mimir.acp.proxy.MAX_GENERATION_SERVER_IDS", 2)
+    client, daemon = Writer(), Writer()
+    router = ProxyRouter(client, daemon, "secret")
+    try:
+        with pytest.raises(ProxyError, match="too many explicit server IDs"):
+            await router.route_client(explicit_session_request("oversized", ["a", "b", "c"]))
+        assert not daemon.data
+        assert not router._explicit_server_sessions
+        # Duplicate IDs do not consume extra map capacity or alter forwarded bytes.
+        request = explicit_session_request("one", ["a", "b", "a"])
+        raw = frame(request)
+        await router.route_client(request, raw)
+        assert bytes(daemon.data) == raw
+        await router.route_daemon({
+            "jsonrpc": "2.0", "id": "one", "result": {"sessionId": "one"},
+        })
+        assert router._explicit_server_sessions == {"a": "one", "b": "one"}
+        await router.route_client(explicit_session_request("two", ["c"]))
+        before = bytes(client.data)
+        with pytest.raises(ProxyError, match="too many explicit server IDs"):
+            await router.route_daemon({
+                "jsonrpc": "2.0", "id": "two", "result": {"sessionId": "two"},
+            })
+        assert bytes(client.data) == before
+        assert router._active_sessions == {"one"}
+        assert router._explicit_server_sessions == {"a": "one", "b": "one"}
+    finally:
+        await router.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("pending", [False, True])
+async def test_proxy_explicit_connection_bound_and_duplicate_negative_control(
+    monkeypatch: pytest.MonkeyPatch, pending: bool,
+) -> None:
+    monkeypatch.setattr("mimir.acp.proxy.MAX_GENERATION_CONNECTION_IDS", 2)
+    client, daemon = Writer(), Writer()
+    router = ProxyRouter(client, daemon, "secret")
+    try:
+        await router.route_client(explicit_session_request("new", ["a", "b", "c", "d"]))
+        owner = router._client_requests[(str, "new")]
+        if not pending:
+            await router.route_daemon({
+                "jsonrpc": "2.0", "id": "new", "result": {"sessionId": "session"},
+            })
+        await explicit_connect(router, 1, "a", "first")
+        await explicit_connect(router, 2, "b", "second")
+        await explicit_connect(router, 3, "c", "first")
+        assert owner is not None
+        retained = owner.explicit_connection_ids if pending else router._explicit_connection_sessions
+        assert set(retained) == {"first", "second"}
+        before = bytes(daemon.data)
+        with pytest.raises(ProxyError, match="too many .*connections"):
+            await explicit_connect(router, 4, "d", "third")
+        assert bytes(daemon.data) == before
+        assert set(retained) == {"first", "second"}
+        if pending:
+            await router.route_daemon({
+                "jsonrpc": "2.0", "id": "new", "result": {"sessionId": "session"},
+            })
+        assert router._explicit_connection_sessions == {"first": "session", "second": "session"}
+        await grant_session(router, 10, "session")
+        await router.route_daemon({
+            "jsonrpc": "2.0", "id": 11, "method": "mcp/disconnect",
+            "params": {"connectionId": "first"},
+        })
+        assert not router._grants.allows("session", "hands_edit")
+        await router.route_client({"jsonrpc": "2.0", "id": 11, "result": {}})
+        await explicit_connect(router, 12, "a", "replacement")
+        assert router._explicit_connection_sessions == {"second": "session", "replacement": "session"}
+    finally:
+        await router.close()
+    assert not router._explicit_connection_sessions
+
+
+@pytest.mark.asyncio
+async def test_proxy_explicit_connection_promotion_is_bounded_atomically(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("mimir.acp.proxy.MAX_GENERATION_CONNECTION_IDS", 2)
+    client, daemon = Writer(), Writer()
+    router = ProxyRouter(client, daemon, "secret")
+    try:
+        for index in range(2):
+            await router.route_client(explicit_session_request(str(index), [str(index)]))
+        await explicit_connect(router, 1, "0", "first")
+        await router.route_daemon({
+            "jsonrpc": "2.0", "id": "0", "result": {"sessionId": "0"},
+        })
+        await explicit_connect(router, 2, "1", "second")
+        # A live connect can consume the remaining capacity before promotion.
+        await explicit_connect(router, 3, "0", "third")
+        before = bytes(client.data)
+        with pytest.raises(ProxyError, match="too many explicit connections"):
+            await router.route_daemon({
+                "jsonrpc": "2.0", "id": "1", "result": {"sessionId": "1"},
+            })
+        assert bytes(client.data) == before
+        assert router._active_sessions == {"0"}
+        assert router._explicit_server_sessions == {"0": "0"}
+        assert router._explicit_connection_sessions == {"first": "0", "third": "0"}
+    finally:
+        await router.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("pending", [False, True])
+async def test_proxy_client_id_lengths_before_retention_and_passthrough_control(pending: bool) -> None:
+    from mimir.acp.proxy import MAX_CLIENT_ID_LENGTH
+
+    client, daemon = Writer(), Writer()
+    router = ProxyRouter(client, daemon, "secret")
+    boundary = "x" * MAX_CLIENT_ID_LENGTH
+    oversized = boundary + "x"
+    try:
+        with pytest.raises(ProxyError, match="client server ID too long"):
+            await router.route_client(explicit_session_request("bad", [oversized]))
+        assert not daemon.data
+        assert router._client_requests[(str, "bad")] is None
+        request = explicit_session_request("new", [boundary, "other"])
+        await router.route_client(request)
+        owner = router._client_requests[(str, "new")]
+        if not pending:
+            await router.route_daemon({
+                "jsonrpc": "2.0", "id": "new", "result": {"sessionId": "session"},
+            })
+        await explicit_connect(router, 1, boundary, boundary)
+        before = bytes(daemon.data)
+        with pytest.raises(ProxyError, match="client connection ID too long"):
+            await explicit_connect(router, 2, "other", oversized)
+        assert bytes(daemon.data) == before
+        assert owner is not None
+        retained = owner.explicit_connection_ids if pending else router._explicit_connection_sessions
+        assert set(retained) == {boundary}
+        # IDs belonging to unrelated providers are not retained or constrained here.
+        unrelated = explicit_session_request("unrelated", [oversized])
+        unrelated["params"]["mcpServers"][0]["name"] = "other-provider"
+        raw = frame(unrelated)
+        await router.route_client(unrelated, raw)
+        assert bytes(daemon.data).endswith(raw)
+        await explicit_connect(router, 3, oversized, oversized)
+        assert messages(daemon)[-1]["result"] == {"connectionId": oversized}
+        assert set(retained) == {boundary}
+    finally:
+        await router.close()
+
+
 @pytest.mark.asyncio
 async def test_framing_and_generation_failures_revoke_grants(
     monkeypatch: pytest.MonkeyPatch,

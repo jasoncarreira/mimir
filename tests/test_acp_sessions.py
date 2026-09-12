@@ -3,9 +3,11 @@ from __future__ import annotations
 import asyncio
 import copy
 import dataclasses
+import gc
 import json
 import time
 import uuid
+import weakref
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -2868,8 +2870,9 @@ async def test_journal_boundary_linearizes_prepared_delivery_sent_and_close(tmp_
     assert len(client.updates) == 1
 
 
+@pytest.mark.parametrize("ownership", ["installed", "detached", "successor"])
 async def test_cancel_timeout_dirties_execution_and_requires_fresh_load(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, ownership: str,
 ) -> None:
     agent, _, _ = await _ready(tmp_path)
     session_id = (await agent.new_session("/one")).session_id
@@ -2907,14 +2910,28 @@ async def test_cancel_timeout_dirties_execution_and_requires_fresh_load(
     agent._active_prompts[session_id] = active
     monkeypatch.setattr(agent_module, "ACP_PROMPT_CANCEL_GRACE_SECONDS", 0.01)
 
+    if ownership == "detached":
+        await agent._detach_state(state)
+    elif ownership == "successor":
+        await agent.load_session("/successor", session_id)
+        await agent.load_session("/successor", session_id)
     await agent._cancel_active(active, transport=False)
     await resisted.wait()
     assert state.dirty is True
-    assert agent._sessions[session_id] is state
-    assert session_id not in agent._environments
-    assert agent._execution_keys[session_id] == 1
-    with pytest.raises(sdk.RequestError):
-        await agent.prompt(session_id, [])
+    if ownership == "detached":
+        assert session_id not in agent._sessions
+        assert session_id not in agent._execution_keys
+    elif ownership == "successor":
+        assert agent._sessions[session_id] is not state
+        assert agent._execution_keys[session_id] == 2
+        assert agent._environments[session_id][1].cwd == "/successor"
+    else:
+        assert agent._sessions[session_id] is state
+        assert agent._execution_keys[session_id] == 1
+    if ownership != "successor":
+        assert session_id not in agent._environments
+        with pytest.raises(sdk.RequestError):
+            await agent.prompt(session_id, [])
 
     release.set()
     await model
@@ -2937,6 +2954,206 @@ async def test_idle_and_repeated_cancel_are_structured_owned_noops(
         {"event": "acp_cancel_noop", "session_id": "missing"},
         {"event": "acp_cancel_noop", "session_id": "missing"},
     ]
+
+
+@pytest.mark.parametrize("authenticated", [False, True])
+async def test_oversized_cancel_bounds_retained_and_logged_id_without_cancelling_live_turn(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture, authenticated: bool,
+) -> None:
+    agent, _, core = await _ready(tmp_path)
+    session_id = (await agent.new_session("/one")).session_id
+    core.gate = asyncio.Event()
+    prompting = asyncio.create_task(agent.prompt(session_id, [sdk.TextContentBlock(type="text", text="wait")]))
+    await core.entered.wait()
+    active = agent._active_prompts[session_id]
+    oversized = "x" * 256 + "private-suffix" * 10000
+    if not authenticated:
+        agent.on_connect(Client())
+    try:
+        with caplog.at_level("INFO", logger="mimir.acp.agent"):
+            for _ in range(agent_module.ACP_AUDIT_EVENT_LIMIT + 1):
+                await agent.cancel(oversized)
+            await agent.cancel("short-control")
+        events = [r.acp_audit for r in caplog.records if r.message == "acp_cancel_noop"]
+        expected = {"event": "acp_cancel_noop", "session_id": "x" * 256}
+        if not authenticated:
+            expected["reason"] = "unauthenticated"
+        assert events[:-1] == [expected] * (agent_module.ACP_AUDIT_EVENT_LIMIT + 1)
+        assert events[-1]["session_id"] == "short-control"
+        assert list(agent._audit_events) == events[-agent_module.ACP_AUDIT_EVENT_LIMIT:]
+        assert active.cancelling is False
+        assert not prompting.done()
+        assert "private-suffix" not in json.dumps(events)
+    finally:
+        core.gate.set()
+        await prompting
+
+
+async def test_repeated_generation_retirement_releases_maps_and_peers_but_keeps_replay(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(agent_module, "ACP_GENERATION_RETIRE_GRACE_SECONDS", 0)
+    agent, client, _ = await _ready(tmp_path)
+    retired_peers = []
+    session_ids = []
+    for _ in range(6):
+        session_id = (await agent.new_session("/one")).session_id
+        session_ids.append(session_id)
+        await agent.prompt(session_id, [sdk.TextContentBlock(type="text", text="hello")])
+        await agent.load_session("/two", session_id)
+        assert agent._execution_keys[session_id] == 1
+        retired_peers.append(weakref.ref(client))
+        client = Client()
+        agent.on_connect(client)
+        await agent.authenticate("mimir-web-key", **{"mimir.webKey": "secret"})
+        await asyncio.gather(*agent._retirement_tasks)
+        gc.collect()
+        assert all(ref() is None for ref in retired_peers)
+        assert len(agent._connections) == 1
+        assert agent._sessions == agent._environments == agent._execution_keys == {}
+        assert agent._journals._sessions == {}
+        assert dict(agent._journals._retired) == {}
+    await agent.load_session("/replay", session_ids[0])
+    assert [u.field_meta["mimir.sequence"] for u in client.updates] == list(range(5))
+    await agent.prompt(session_ids[0], [sdk.TextContentBlock(type="text", text="next")])
+    assert [u.field_meta["mimir.sequence"] for u in client.updates] == list(range(10))
+
+
+async def test_detach_releases_cache_but_live_publisher_survives_reload(tmp_path: Path) -> None:
+    agent, client, core = await _ready(tmp_path)
+    session_id = (await agent.new_session("/one")).session_id
+    state = agent._sessions[session_id]
+    core.gate = asyncio.Event()
+    prompting = asyncio.create_task(agent.prompt(session_id, [sdk.TextContentBlock(type="text", text="hello")]))
+    await core.entered.wait()
+    journal = agent._journals._sessions[session_id]
+    await agent._detach_state(state)
+    assert agent._execution_keys == agent._journals._sessions == {}
+    assert agent._journals._retired[session_id] is journal
+    await agent.load_session("/two", session_id)
+    assert agent._journals._sessions[session_id] is journal
+    assert journal.current_client is client
+    successor_key = agent._execution_keys[session_id]
+    await agent._detach_state(state)
+    assert agent._journals._sessions[session_id] is journal
+    assert journal.current_client is client
+    assert agent._execution_keys[session_id] == successor_key
+    assert agent._environments[session_id][1].cwd == "/two"
+    core.gate.set()
+    await prompting
+    assert journal.next_sequence == 5
+    assert [u.field_meta["mimir.sequence"] for u in client.updates] == [0, 0, 1, 2, 3, 4]
+
+
+@pytest.mark.parametrize("installed", [False, True])
+@pytest.mark.parametrize("protocol_error", [False, True])
+async def test_failed_load_releases_only_unowned_journal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, installed: bool, protocol_error: bool,
+) -> None:
+    agent, client, _ = await _ready(tmp_path)
+    session_id = (await agent.new_session("/one")).session_id
+    await agent.prompt(session_id, [sdk.TextContentBlock(type="text", text="hello")])
+    if not installed:
+        await agent._detach_session(session_id)
+    prior = agent._journals._sessions.get(session_id)
+    previous_client = Client()
+    if prior is not None:
+        prior.bind_client(previous_client)
+
+    async def fail_update(*args: Any) -> None:
+        if protocol_error:
+            raise sdk.invalid_params_error()
+        raise RuntimeError("delivery failed")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(client, "session_update", fail_update)
+        with pytest.raises(sdk.RequestError):
+            await agent.load_session("/failed", session_id)
+    if installed:
+        assert agent._journals._sessions[session_id] is prior
+        assert prior.current_client is previous_client
+        assert agent._environments[session_id][1].cwd == "/one"
+    else:
+        gc.collect()
+        assert agent._journals._sessions == {}
+        assert dict(agent._journals._retired) == {}
+        assert agent._execution_keys == {}
+    client.updates.clear()
+    await agent.load_session("/retry", session_id)
+    assert agent._journals._sessions[session_id].current_client is client
+    assert [u.field_meta["mimir.sequence"] for u in client.updates] == list(range(5))
+
+
+async def test_live_overflow_keeps_sequence_and_failed_load_keeps_cache(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import mimir.acp.journal as journal_module
+
+    agent, client, _ = await _ready(tmp_path)
+    session_id = (await agent.new_session("/one")).session_id
+    reference = weakref.ref(agent._journals._sessions[session_id])
+    monkeypatch.setattr(journal_module, "MAX_JOURNAL_BYTES", 0)
+    await agent.prompt(session_id, [sdk.TextContentBlock(type="text", text="first")])
+    gc.collect()
+    assert reference() is agent._journals._sessions[session_id]
+    assert reference().journal_enabled is False
+    with pytest.raises(sdk.RequestError, match="overflowed"):
+        await agent.load_session("/failed", session_id)
+    await agent.prompt(session_id, [sdk.TextContentBlock(type="text", text="second")])
+    assert [u.field_meta["mimir.sequence"] for u in client.updates] == list(range(10))
+    generation = agent._generation
+    await agent.on_transport_closed(generation)
+    gc.collect()
+    assert reference() is None
+    assert agent._journals._sessions == agent._execution_keys == {}
+    agent.on_connect(Client())
+    await agent.authenticate("mimir-web-key", **{"mimir.webKey": "secret"})
+    with pytest.raises(sdk.RequestError, match="overflowed"):
+        await agent.load_session("/retry", session_id)
+
+
+def test_audit_mapping_traversal_stops_at_limit() -> None:
+    visited = []
+
+    class ObservedMapping(dict):
+        def items(self):
+            for key, value in super().items():
+                visited.append(key)
+                yield key, value
+
+    payload = ObservedMapping({str(index): index for index in range(100)})
+    assert agent_module._bounded_audit_value(payload) == {
+        str(index): index for index in range(16)
+    }
+    assert visited == [str(index) for index in range(16)]
+
+
+def test_audit_client_fields_are_bounded_with_scalar_controls(caplog: pytest.LogCaptureFixture) -> None:
+    owner = SimpleNamespace(_audit_events=[])
+    provider = object()
+    ownership = SimpleNamespace(provider=provider, generation=1, epoch=2)
+    active = SimpleNamespace(progress_tokens={"owned": ownership}, _is_current=lambda: True, epoch=2)
+    state = SimpleNamespace(generation=1, provider=provider, active_prompt=active)
+    huge = "x" * 10000
+    with caplog.at_level("INFO", logger="mimir.acp.agent"):
+        MimirAcpAgent._audit_progress(owner, state, {
+            "progressToken": "owned", "progress": 1 << 10000, "total": 42, "message": huge,
+        })
+        MimirAcpAgent._audit_message(owner, state, {
+            "level": huge, "logger": huge,
+            "data": {"password": huge, "value": [huge] * 100, "control": [None, True, -42, 1.5]},
+        })
+    progress, message = owner._audit_events
+    assert progress == {
+        "event": "acp_mcp_progress", "generation": 1, "status": "accepted",
+        "progress": "[truncated]", "total": 42, "message": "x" * 256,
+    }
+    assert message["level"] == message["logger"] == "x" * 256
+    assert message["data"] == {
+        "password": "[redacted]", "value": ["x" * 256] * 16,
+        "control": [None, True, -42, 1.5],
+    }
+    assert [r.acp_audit for r in caplog.records if hasattr(r, "acp_audit")] == owner._audit_events
 
 
 @pytest.mark.parametrize("notification", ["progress", "message"])

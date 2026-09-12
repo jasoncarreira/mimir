@@ -9,6 +9,7 @@ from collections import deque
 from collections.abc import Mapping
 from contextvars import ContextVar
 from dataclasses import dataclass, field, replace
+from itertools import islice
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -615,6 +616,8 @@ class MimirAcpAgent:
             raise invalid_params_error()
         state: SessionState | None = None
         prior_state = self._sessions.get(session_id)
+        prior_journal = self._journals._sessions.get(session_id)
+        prior_client = prior_journal.current_client if prior_journal is not None else None
         try:
             record = self._store.load_owned(session_id, owner)
             journal = self._journals.open(record, client)
@@ -626,14 +629,23 @@ class MimirAcpAgent:
                 await self._discard_candidate(state)
             if prior_state is not None:
                 self._restore_state_indexes(prior_state)
+                if prior_journal is not None:
+                    prior_journal.bind_client(prior_client)
+            else:
+                self._journals.release(session_id)
             raise
         except BaseException:
             if state is not None:
                 await self._discard_candidate(state)
             if prior_state is not None:
                 self._restore_state_indexes(prior_state)
+                if prior_journal is not None:
+                    prior_journal.bind_client(prior_client)
+            else:
+                self._journals.release(session_id)
             raise internal_error() from None
         await self._detach_session(session_id)
+        self._journals.open(record, client)
         self._install_state(state)
         return LoadSessionResponse()
 
@@ -787,7 +799,7 @@ class MimirAcpAgent:
                 active = state.active_prompt if state is not None else None
                 if active is not None and await self._cancel_active(active, transport=False):
                     return None
-        event = {"event": "acp_cancel_noop", "session_id": session_id}
+        event = {"event": "acp_cancel_noop", "session_id": _bounded_audit_text(session_id)}
         if refusal_reason is not None:
             event["reason"] = refusal_reason
         self._audit_events.append(event)
@@ -852,8 +864,9 @@ class MimirAcpAgent:
             state.dirty = True
             state.execution_session_key += 1
             session_id = state.record.session_id
-            self._execution_keys[session_id] = state.execution_session_key
-            self._environments.pop(session_id, None)
+            if self._sessions.get(session_id) is state:
+                self._execution_keys[session_id] = state.execution_session_key
+                self._environments.pop(session_id, None)
             provider = state.provider
             connection = self._connections.get(state.generation)
             if provider is not None:
@@ -933,6 +946,8 @@ class MimirAcpAgent:
             if self._sessions.get(state.record.session_id) is state:
                 self._sessions.pop(state.record.session_id, None)
                 self._environments.pop(state.record.session_id, None)
+                self._execution_keys.pop(state.record.session_id, None)
+                self._journals.release(state.record.session_id)
         connection.server_sessions.clear()
         connection.connection_sessions.clear()
         connection.bound_sessions.clear()
@@ -1346,6 +1361,8 @@ class MimirAcpAgent:
         if self._sessions.get(session_id) is state:
             self._sessions.pop(session_id, None)
             self._environments.pop(session_id, None)
+            self._execution_keys.pop(session_id, None)
+            self._journals.release(session_id)
 
     @staticmethod
     def _validate_directories(additional_directories: list[str] | None) -> None:
@@ -1465,11 +1482,13 @@ def _bounded_audit_value(value: Any, depth: int = 0) -> Any:
         return "[truncated]"
     if isinstance(value, str):
         return value[:256]
+    if isinstance(value, int) and value.bit_length() > 64:
+        return "[truncated]"
     if value is None or isinstance(value, (bool, int, float)):
         return value
     if isinstance(value, Mapping):
         result: dict[str, Any] = {}
-        for key, item in list(value.items())[:16]:
+        for key, item in islice(value.items(), 16):
             name = str(key)[:64]
             if any(part in name.lower() for part in ("token", "secret", "password", "authorization", "key")):
                 result[name] = "[redacted]"

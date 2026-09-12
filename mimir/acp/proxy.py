@@ -30,6 +30,7 @@ MAX_FRAME_BYTES = 1024 * 1024
 MAX_OUTSTANDING_REQUESTS = 1024
 MAX_GENERATION_SERVER_IDS = 1024
 MAX_GENERATION_CONNECTION_IDS = 4096
+MAX_CLIENT_ID_LENGTH = 1024
 MAX_LIVE_CONNECTIONS = 1024
 SCOPE_PERMISSION_TIMEOUT_SECONDS = 60.0
 MAX_SCOPE_PERMISSION_REQUESTS = 1024
@@ -440,10 +441,22 @@ class ProxyRouter:
                 result = message.get("result")
                 connection_id = result.get("connectionId") if isinstance(result, dict) else None
                 if isinstance(connection_id, str) and connection_id:
+                    if len(connection_id) > MAX_CLIENT_ID_LENGTH:
+                        raise ProxyError("client connection ID too long")
                     session_id = pending.session_id
                     if session_id in self._active_sessions:
+                        if (
+                            connection_id not in self._explicit_connection_sessions
+                            and len(self._explicit_connection_sessions) >= MAX_GENERATION_CONNECTION_IDS
+                        ):
+                            raise ProxyError("too many explicit connections")
                         self._explicit_connection_sessions[connection_id] = session_id
                     elif isinstance(pending.owner, _PendingSession):
+                        if (
+                            connection_id not in pending.owner.explicit_connection_ids
+                            and len(pending.owner.explicit_connection_ids) >= MAX_GENERATION_CONNECTION_IDS
+                        ):
+                            raise ProxyError("too many pending explicit connections")
                         pending.owner.explicit_connection_ids.add(connection_id)
             await self._write_daemon(message, raw)
             if (
@@ -775,25 +788,27 @@ class ProxyRouter:
             await self._retire_session(session_id)
         servers = params.get("mcpServers")
         if "mcpServers" in params and servers != []:
-            explicit_hands_server_ids = (
-                tuple(
-                    server["serverId"]
-                    for server in servers
-                    if isinstance(server, dict)
+            explicit_ids: dict[str, None] = {}
+            for server in servers if isinstance(servers, list) else ():
+                if (
+                    isinstance(server, dict)
                     and server.get("type") == "acp"
                     and server.get("name") == "mimir-hands"
                     and isinstance(server.get("serverId"), str)
                     and server["serverId"]
-                )
-                if isinstance(servers, list)
-                else ()
-            )
+                ):
+                    server_id = server["serverId"]
+                    if len(server_id) > MAX_CLIENT_ID_LENGTH:
+                        raise ProxyError("client server ID too long")
+                    if server_id not in explicit_ids and len(explicit_ids) >= MAX_GENERATION_SERVER_IDS:
+                        raise ProxyError("too many explicit server IDs")
+                    explicit_ids[server_id] = None
             return _PendingSession(
                 method,
                 params["cwd"],
                 None,
                 session_id,
-                explicit_hands_server_ids,
+                tuple(explicit_ids),
                 resolved_session_id=session_id,
             ), False
         server_id = self._new_server_id()
@@ -841,6 +856,14 @@ class ProxyRouter:
             if session_id is None:
                 raise ProxyError("invalid frame")
             pending.resolved_session_id = session_id
+        # Check the whole promotion before retaining any of its state. Pending
+        # connects may have completed while the session response was in flight.
+        if session_id not in self._active_sessions and len(self._active_sessions) >= MAX_GENERATION_SERVER_IDS:
+            raise ProxyError("too many active sessions")
+        if len(self._explicit_server_sessions.keys() | set(pending.explicit_hands_server_ids)) > MAX_GENERATION_SERVER_IDS:
+            raise ProxyError("too many explicit server IDs")
+        if len(self._explicit_connection_sessions.keys() | pending.explicit_connection_ids) > MAX_GENERATION_CONNECTION_IDS:
+            raise ProxyError("too many explicit connections")
         self._active_sessions.add(session_id)
         for server_id in pending.explicit_hands_server_ids:
             self._explicit_server_sessions[server_id] = session_id
