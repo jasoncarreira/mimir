@@ -6,14 +6,18 @@ All notable changes will land here. Format loosely follows
 
 ## [Unreleased]
 
-- Upgrade `feature-factory` and `opencode-feature-factory` to 0.8.6, which
-  reconciles the autonomous-mode prose with the publication block it contradicted.
+- Upgrade `feature-factory` and `opencode-feature-factory` from 0.8.5 to 0.8.7,
+  reconciling the autonomous-mode prose with the publication block it contradicted.
   0.8.5's executable path already selected ready-for-review publication for
   `PR_DRAFT=false`, but its narrative described the autonomous terminal state purely
   in draft terms, so a driver reading it saw a conflict against this repository's
   `.factory.json` `"pr_draft": false` and parked rather than guessing. Mimir requires
   ready-for-review PRs — `orchestrator.py` refuses a draft at both the factory-status
   and GitHub-verification gates — so the setting was correct and the prose was not.
+  0.8.7 also makes park-publication step 3 explicitly exclude only the plane-root
+  `factory.lock` and require a lock-named file below that root to match, aligning
+  the driver-facing staging contract with `planeInventory`'s exact root-relative
+  exclusion and the nested-lock regression. The contract test pins both rules.
 - Upgrade `feature-factory` and `opencode-feature-factory` to 0.8.5, which makes
   both skills carry the complete `factory init` invocation, bound to `WORKFLOW.md`
   by byte equality. 0.8.4 described that command's tail three incompatible ways —
