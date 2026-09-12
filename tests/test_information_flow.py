@@ -6845,6 +6845,7 @@ def test_cross_channel_sink_refusal_matrix(
 @pytest.mark.parametrize("origin_trigger", ["user_message", "acp_session"])
 async def test_shell_continuation_is_not_a_fresh_operator_request(
     monkeypatch: pytest.MonkeyPatch, origin_trigger: str,
+    ingress_resolver: IdentityResolver,
 ) -> None:
     from mimir._context import reset_current_turn, set_current_turn
     from mimir.access_control import can_resolve_forge_review_scope, clear_live_ingest_taint
@@ -6855,7 +6856,7 @@ async def test_shell_continuation_is_not_a_fresh_operator_request(
         trigger="user_message", channel_id="slack-C1", author="operator",
         source="slack", source_id="message-1",
     )
-    origin, labels = _runtime_operator_context(event)
+    origin, labels = _runtime_operator_context(event, ingress_resolver)
     origin = replace(origin, origin_trigger=origin_trigger)
     completion = AgentEvent(
         trigger="shell_job_complete", channel_id=event.channel_id,
