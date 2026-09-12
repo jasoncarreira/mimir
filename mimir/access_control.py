@@ -9962,25 +9962,12 @@ def _acp_failed_tool_error_result(
     result: Any,
     auth_context: "AuthContext | None",
     provenance: ProtectedResultProvenance | None,
-    *,
-    hands_failure: bool = False,
 ) -> "InformationFlowLabels | None":
-    """Label an error-only ACP result as informational session-channel input."""
-    from langchain_core.messages import ToolMessage
-
+    """Label a rejected ACP provider contract, not tool output, as informational."""
     from .models import InformationFlowLabels, SourceLabel
     from .tools.client_provider import ClientProviderResultError
 
-    if not hands_failure and (
-        provenance is not None
-        or not (
-            isinstance(result, ClientProviderResultError)
-            or (
-                isinstance(result, ToolMessage)
-                and getattr(result, "status", None) == "error"
-            )
-        )
-    ):
+    if provenance is not None or not isinstance(result, ClientProviderResultError):
         return None
     if getattr(auth_context, "origin_trigger", None) != "acp_session":
         return None
@@ -10036,6 +10023,8 @@ def classify_protected_result(
     downgrade it. Unknown provenance is intentionally incomplete and therefore
     fails closed at every egress gate.
     """
+    from langchain_core.messages import ToolMessage
+
     from .models import InformationFlowLabels, SourceLabel
 
     artifact = getattr(result, "artifact", None)
@@ -10109,10 +10098,13 @@ def classify_protected_result(
         return InformationFlowLabels().with_source(source)
 
     if tool_name in _ACP_HANDS_RESULT_TOOLS:
-        if failed:
-            # Failed Hands calls expose an error, not the attempted file/process input.
+        # Error-looking host output is still host output, not a provider failure.
+        if failed and (
+            isinstance(result, BaseException)
+            or isinstance(result, ToolMessage) and result.status == "error"
+        ):
             error_labels = _acp_failed_tool_error_result(
-                result, auth_context, provenance, hands_failure=True,
+                result, auth_context, None,
             )
             if error_labels is not None:
                 # An error does not erase sources captured before the failure.
