@@ -2080,8 +2080,10 @@ def _execute_declassification_action(
     arguments: dict[str, Any] | None,
 ) -> ToolMessage:
     arguments = arguments or {}
+    turn = _get_current_turn_context()
     approved, outcome = approve_live_declassification(
         auth_context,
+        turn_id=getattr(turn, "turn_id", None),
         sink_category=arguments.get("sink_category"),
         destination=arguments.get("destination"),
         reason=arguments.get("reason"),

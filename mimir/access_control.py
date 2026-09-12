@@ -7070,11 +7070,13 @@ def clear_live_ingest_taint(
 def approve_live_declassification(
     auth_context: Any,
     *,
+    turn_id: str | None,
     sink_category: Any,
     destination: Any,
     reason: Any,
 ) -> tuple[bool, str]:
     """Approve one exact sink on the exact live admin request carrier."""
+    from ._context import get_current_turn
     from .models import AuthContext, InformationFlowState
 
     if not isinstance(auth_context, AuthContext):
@@ -7087,6 +7089,19 @@ def approve_live_declassification(
         return False, "missing_authenticated_admin"
     if not isinstance(canonical_principal, str) or not canonical_principal.strip():
         return False, "missing_authenticated_admin"
+    if (
+        auth_context.is_service
+        or "service" in auth_context.roles
+        or auth_context.service_authority is not None
+        or any(value.strip().lower().startswith("service:") for value in (principal, canonical_principal))
+    ):
+        return False, "service_identity_forbidden"
+    if (
+        auth_context.trigger != "user_message"
+        or auth_context.origin_trigger not in (None, "user_message", "acp_session")
+        or auth_context.event_ingress is not None
+    ):
+        return False, "user_origin_required"
     if not isinstance(reason, str) or not reason.strip():
         return False, "invalid_reason"
     try:
@@ -7099,6 +7114,17 @@ def approve_live_declassification(
     state = auth_context.ifc_state
     if not isinstance(state, InformationFlowState):
         return False, "missing_ifc_state"
+
+    turn = get_current_turn()
+    if (
+        not isinstance(turn_id, str)
+        or not turn_id.strip()
+        or turn is None
+        or turn.turn_id != turn_id
+        or not isinstance(getattr(turn, "auth_context", None), AuthContext)
+        or turn.auth_context.ifc_state is not state
+    ):
+        return False, "missing_live_turn"
 
     def durable_audit(
         labels: InformationFlowLabels, issued_at: float, expires_at: float,
