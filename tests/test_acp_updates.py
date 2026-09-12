@@ -32,6 +32,75 @@ async def finish(dispatcher: UpdateDispatcher) -> None:
     await dispatcher.close()
 
 
+@pytest.mark.parametrize("method", ["drain", "terminalize_failure", "terminalize_cancelled"])
+@pytest.mark.asyncio
+async def test_stalled_dispatcher_join_is_bounded(monkeypatch, method) -> None:
+    from mimir.acp import updates
+
+    monkeypatch.setattr(updates, "UPDATE_DELIVERY_TIMEOUT", 0.02)
+    publisher = Publisher()
+    publisher.block = True
+    stalled = asyncio.Event()
+    dispatcher = UpdateDispatcher(publisher, on_stall=stalled.set)
+    dispatcher.enqueue({"type": "tool_call", "phase": "start", "id": "tool"})
+    await publisher.entered.wait()
+    try:
+        with pytest.raises(TimeoutError, match="ACP update delivery stalled"):
+            await asyncio.wait_for(getattr(dispatcher, method)(), 1)
+        assert stalled.is_set()
+        assert isinstance(dispatcher.failure, RuntimeError if method == "terminalize_failure" else TimeoutError)
+        assert not publisher.release.is_set()
+    finally:
+        publisher.release.set()
+        await dispatcher.close()
+
+
+@pytest.mark.asyncio
+async def test_unusable_update_client_rejects_further_writes() -> None:
+    from mimir.acp.updates import UpdateClient
+
+    calls = []
+
+    class Peer:
+        async def session_update(self, session_id, update):
+            calls.append(update)
+
+    client = UpdateClient(Peer(), lambda: None, lambda: True)
+    with pytest.raises(ConnectionError, match="unusable"):
+        await client.session_update("session", "update")
+    assert calls == []
+
+
+@pytest.mark.asyncio
+async def test_slow_dispatcher_progress_renews_drain_budget() -> None:
+    from mimir.acp import updates
+
+    loop = asyncio.get_running_loop()
+
+    class SlowPublisher(Publisher):
+        async def publish_live(self, update):
+            ready = asyncio.Event()
+            timer = loop.call_later(0.1, ready.set)
+            try:
+                await ready.wait()
+                await super().publish_live(update)
+            finally:
+                timer.cancel()
+
+    publisher = SlowPublisher()
+    dispatcher = UpdateDispatcher(publisher)
+    for index in range(30):
+        dispatcher.enqueue({"type": "tool_call", "phase": "start", "id": str(index)})
+    started = loop.time()
+    try:
+        await asyncio.wait_for(dispatcher.drain(), 15)
+        assert loop.time() - started > updates.UPDATE_DELIVERY_TIMEOUT
+        assert len(publisher.updates) == 30
+        assert dispatcher.failure is None
+    finally:
+        await dispatcher.close()
+
+
 _MISSING = object()
 _PRESENTATION_CASES = [
     ("read_file", {"file_path": "src/example.py"}, "Read src/example.py", "read"),
