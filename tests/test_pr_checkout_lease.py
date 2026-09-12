@@ -25,6 +25,8 @@ from mimir.models import (
 )
 from mimir.pr_checkout_lease import (
     PRCheckoutLease,
+    _foreign_candidate_head,
+    _retained_candidate_head,
     _preserve_checkout_head,
     _preserve_dirty_worktree,
     _recover_retained_checkout,
@@ -227,9 +229,91 @@ def test_later_turn_refuses_same_pr_candidate_from_another_source_root(
     assert metadata_path.read_bytes() == original_metadata
 
 
-def test_later_turn_reuses_patch_identical_rebased_candidate(
+@pytest.mark.parametrize(
+    "field", ["canonical_repo", "canonical_origin", "source_root", "owner", "pr_number", "destination_ref"],
+)
+def test_foreign_candidate_identity_boundary(tmp_path: Path, field: str) -> None:
+    _repo, scope = _repo_and_scope(tmp_path)
+    root = tmp_path / "leases"
+    root.mkdir()
+    lease = create_pr_checkout_lease(scope, owner=scope.principal, lease_root=root)
+    other_source = tmp_path / "other-source"
+    other_source.mkdir()
+    values = {
+        "canonical_repo": "other/repo",
+        "canonical_origin": "https://example.com/other.git",
+        "source_root": other_source,
+        "owner": "other-bot",
+        "pr_number": scope.pr_number + 1,
+        "destination_ref": "refs/heads/other",
+    }
+    mismatched = replace(lease, **{field: values[field]})
+
+    def runner(args):
+        return subprocess.run(args, capture_output=True, text=True, check=False)
+
+    assert _foreign_candidate_head(
+        mismatched, scope, owner=scope.principal, runner=runner,
+    ) == (scope.observed_head_sha, False)
+
+
+@pytest.mark.parametrize("path", ["foreign", "exact"])
+@pytest.mark.parametrize("field", ["origin", "branch"])
+def test_recovery_runtime_identity(tmp_path: Path, path: str, field: str) -> None:
+    _repo, scope = _repo_and_scope(tmp_path)
+    root = tmp_path / "leases"
+    root.mkdir()
+    lease = create_pr_checkout_lease(scope, owner=scope.principal, lease_root=root)
+
+    def runner(args):
+        if field == "origin" and "remote.origin.url" in args:
+            return subprocess.CompletedProcess(args, 0, "https://example.com/other.git", "")
+        if field == "branch" and "symbolic-ref" in args:
+            return subprocess.CompletedProcess(args, 0, "other", "")
+        return subprocess.run(args, capture_output=True, text=True, check=False)
+
+    if path == "foreign":
+        assert _foreign_candidate_head(
+            lease, scope, owner=scope.principal, runner=runner,
+        ) == (scope.observed_head_sha, False)
+    else:
+        with pytest.raises(RuntimeError, match="identity mismatch"):
+            recover_pr_checkout_lease(
+                lease.path, scope, owner=scope.principal, lease_root=root, runner=runner,
+            )
+
+
+@pytest.mark.parametrize("entry", ["acquire", "recover", "retained"])
+def test_exact_recovery_metadata_boundary(tmp_path: Path, entry: str) -> None:
+    _repo, scope = _repo_and_scope(tmp_path)
+    root = tmp_path / "leases"
+    root.mkdir()
+    lease = create_pr_checkout_lease(scope, owner=scope.principal, lease_root=root)
+    metadata_path = lease.path / ".git/mimir-pr-checkout-lease.json"
+    metadata = json.loads(metadata_path.read_text())
+    metadata["owner"] = "other-bot"
+    metadata_path.write_text(json.dumps(metadata))
+    original_metadata = metadata_path.read_bytes()
+    with pytest.raises(RuntimeError, match="scope mismatch"):
+        if entry == "acquire":
+            acquire_pr_checkout_lease(scope, owner=scope.principal, lease_root=root)
+        elif entry == "retained":
+            _retained_candidate_head(
+                lease.path, scope, owner=scope.principal, root=root,
+                runner=lambda args: subprocess.run(args, capture_output=True, text=True, check=False),
+            )
+        else:
+            recover_pr_checkout_lease(lease.path, scope, owner=scope.principal, lease_root=root)
+    assert metadata_path.read_bytes() == original_metadata
+
+
+@pytest.mark.parametrize(
+    "control", [None, "equivalent", "edited_patch", "forge_stale", "remote_stale", "origin", "branch", "destination"],
+)
+def test_later_turn_reuses_rebased_candidate_with_added_fix(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    control: str | None,
 ) -> None:
     repo, scope = _repo_and_scope(tmp_path)
     lease_root = tmp_path / "leases"
@@ -246,45 +330,125 @@ def test_later_turn_reuses_patch_identical_rebased_candidate(
     _git(repo, "push", "-q", "origin", "HEAD:main")
     _git(earlier.path, "fetch", "-q", "origin", "main")
     _git(earlier.path, "rebase", "origin/main")
+    if control == "edited_patch":
+        (earlier.path / "file.txt").write_text("corrected PR patch\n", encoding="utf-8")
+        _git(earlier.path, "commit", "--amend", "-qam", "correct published patch")
+    if control != "equivalent":
+        (earlier.path / "fix.txt").write_text("additional fix\n", encoding="utf-8")
+        _git(earlier.path, "add", "fix.txt")
+        _git(earlier.path, "commit", "-q", "-m", "additional fix after rebase")
     rebased_head = _git(earlier.path, "rev-parse", "HEAD")
-    current_scope = replace(scope, observed_base_sha=advanced_base)
+    current_scope = replace(
+        scope, observed_base_sha=advanced_base,
+    )
+    assert current_scope.scope_id != earlier_scope.scope_id
+    assert subprocess.run(
+        ["git", "-C", str(earlier.path), "merge-base", "--is-ancestor",
+         scope.observed_head_sha, rebased_head],
+        capture_output=True, check=False,
+    ).returncode == 1
+    if control == "forge_stale":
+        current_scope = replace(current_scope, observed_head_sha="f" * 40)
+    elif control == "remote_stale":
+        _git(repo, "checkout", "-q", "worklink/7")
+        _advance_pr_head(repo, scope)
+    elif control == "origin":
+        _git(earlier.path, "remote", "set-url", "origin", "https://example.com/other.git")
+    elif control == "branch":
+        _git(earlier.path, "branch", "-m", "other")
+    elif control == "destination":
+        metadata_path = earlier.path / ".git/mimir-pr-checkout-lease.json"
+        metadata = json.loads(metadata_path.read_text())
+        metadata["destination_ref"] = "refs/heads/other"
+        metadata_path.write_text(json.dumps(metadata))
+    metadata_path = earlier.path / ".git/mimir-pr-checkout-lease.json"
+    original_metadata = metadata_path.read_bytes()
     monkeypatch.setattr(
         "mimir.pr_checkout_lease._observe_current_pr_head",
-        lambda _scope: current_scope.observed_head_sha,
+        lambda _scope: scope.observed_head_sha,
     )
+    state = RepoReviewState(current_scope)
+
+    if control not in {None, "equivalent", "edited_patch"}:
+        with pytest.raises(RuntimeError, match="include another scope|PR head advanced"):
+            acquire_pr_checkout_lease(
+                current_scope, owner=current_scope.principal, lease_root=lease_root,
+                review_state=state,
+            )
+        assert metadata_path.read_bytes() == original_metadata
+        assert _git(earlier.path, "rev-parse", "HEAD") == rebased_head
+        assert state.checkout_lease is None
+        return
 
     resumed, candidates = acquire_pr_checkout_lease(
         current_scope, owner=current_scope.principal, lease_root=lease_root,
+        review_state=state,
     )
 
     assert resumed.path == earlier.path
     assert resumed.scope_id == current_scope.scope_id
     assert candidates == (rebased_head,)
+    assert resumed.head_sha == current_scope.observed_head_sha
+    assert state.checkout_lease is resumed
+    assert state.git_expected_head == rebased_head
+    assert _git(resumed.path, "rev-parse", "HEAD") == rebased_head
+    if control != "equivalent":
+        assert (resumed.path / "fix.txt").read_text() == "additional fix\n"
+    assert _git(resumed.path, "rev-parse", "refs/mimir/pr-checkout-lease/published") == scope.observed_head_sha
 
 
-def test_later_turn_refuses_genuinely_divergent_same_pr_candidate(
+@pytest.mark.parametrize("same_scope", [False, True])
+@pytest.mark.parametrize("control", [None, "remote_stale", "origin", "branch", "metadata"])
+def test_turn_recovers_genuinely_divergent_same_pr_candidate(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    same_scope: bool,
+    control: str | None,
 ) -> None:
-    _repo, scope = _repo_and_scope(tmp_path)
+    repo, scope = _repo_and_scope(tmp_path)
     lease_root = tmp_path / "leases"
     lease_root.mkdir()
-    earlier_scope = replace(scope, event_type="pr_review_requested")
+    earlier_scope = scope if same_scope else replace(scope, event_type="pr_review_requested")
     earlier = create_pr_checkout_lease(
         earlier_scope, owner=earlier_scope.principal, lease_root=lease_root,
     )
     _git(earlier.path, "reset", "--hard", "refs/remotes/origin/main")
+    head = _git(earlier.path, "rev-parse", "HEAD")
+    metadata_path = earlier.path / ".git/mimir-pr-checkout-lease.json"
+    if control == "remote_stale":
+        _advance_pr_head(repo, scope)
+    elif control == "origin":
+        _git(earlier.path, "remote", "set-url", "origin", "https://example.com/other.git")
+    elif control == "branch":
+        _git(earlier.path, "branch", "-m", "other")
+    elif control == "metadata":
+        metadata = json.loads(metadata_path.read_text())
+        metadata["canonical_origin"] = "https://example.com/other.git"
+        metadata_path.write_text(json.dumps(metadata))
+    original_metadata = metadata_path.read_bytes()
     monkeypatch.setattr(
         "mimir.pr_checkout_lease._observe_current_pr_head",
         lambda _scope: scope.observed_head_sha,
     )
 
-    with pytest.raises(RuntimeError, match="include another scope"):
-        acquire_pr_checkout_lease(
-            scope, owner=scope.principal, lease_root=lease_root,
+    state = RepoReviewState(scope)
+    if control:
+        with pytest.raises(RuntimeError, match="mismatch|include another scope|PR head advanced"):
+            acquire_pr_checkout_lease(
+                scope, owner=scope.principal, lease_root=lease_root, review_state=state,
+            )
+        assert metadata_path.read_bytes() == original_metadata
+        assert state.checkout_lease is None
+    else:
+        resumed, candidates = acquire_pr_checkout_lease(
+            scope, owner=scope.principal, lease_root=lease_root, review_state=state,
         )
-
-    assert earlier.path.is_dir()
+        assert resumed.path == earlier.path
+        assert resumed.recovered
+        assert candidates == (head,)
+        assert state.git_expected_head == head
+        assert state.checkout_lease is resumed
+    assert _git(earlier.path, "rev-parse", "HEAD") == head
 
 
 def test_fresh_acquisition_records_actual_checkout_head(
@@ -653,7 +817,6 @@ def test_acquire_refuses_and_reports_foreign_scope_candidate(
     (foreign.path / "foreign.txt").write_text("foreign fix\n", encoding="utf-8")
     _git(foreign.path, "add", "foreign.txt")
     _git(foreign.path, "commit", "-q", "-m", "foreign fix")
-    _git(foreign.path, "branch", "-M", scope.head_ref)
     candidates.append(_git(foreign.path, "rev-parse", "HEAD"))
 
     events: list[tuple[str, dict[str, object]]] = []
@@ -953,13 +1116,6 @@ def test_acquire_bundles_unpublished_superseded_work_and_releases_lease(
     )
 
     unpublished = _git(old_lease.path, "rev-parse", "HEAD")
-
-    def stale_patch_comparison(*args, **kwargs):
-        pytest.fail("stale recorded head must not authorize patch-equivalent reuse")
-
-    monkeypatch.setattr(
-        "mimir.pr_checkout_lease._patches_match_published_head", stale_patch_comparison,
-    )
 
     fresh_lease, candidates = acquire_pr_checkout_lease(
         fresh_scope, owner=fresh_scope.principal, lease_root=lease_root,

@@ -525,13 +525,11 @@ def recover_pr_checkout_lease(
         runner, ["git", "-C", str(path), "symbolic-ref", "--quiet", "--short", "HEAD"],
         "recovered PR checkout is detached",
     )
-    ancestor = runner([
-        "git", "-C", str(path), "merge-base", "--is-ancestor", lease.head_sha.lower(), head,
-    ])
+    # Recovery grants no push authority: preserve divergent fixes for explicit
+    # reconciliation, enforcing checkout identity and a fresh remote head instead.
     if (
         origin != lease.canonical_origin
         or branch != scope.head_ref
-        or ancestor.returncode != 0
     ):
         raise RuntimeError("recovered PR checkout identity mismatch")
     _assert_self_contained_checkout(path, runner=runner)
@@ -966,7 +964,7 @@ def _retained_candidate_head(
     owner: str,
     runner: Runner,
 ) -> str:
-    """Validate retained metadata and local ancestry without renewing the lease."""
+    """Validate retained metadata without renewing or granting publication rights."""
     path = _safe_lease_path(root, path, must_exist=True)
     try:
         raw = json.loads((path / _METADATA).read_text(encoding="utf-8"))
@@ -990,67 +988,7 @@ def _retained_candidate_head(
         runner, ["git", "-C", str(path), "rev-parse", "--verify", "HEAD"],
         "retained PR checkout has no HEAD",
     ).lower()
-    ancestor = runner([
-        "git", "-C", str(path), "merge-base", "--is-ancestor",
-        scope.observed_head_sha.lower(), head,
-    ])
-    if ancestor.returncode != 0:
-        raise RuntimeError(f"retained PR checkout ancestry mismatch at {path}")
     return head
-
-
-def _patches_match_published_head(
-    lease: PRCheckoutLease,
-    *,
-    head: str,
-    base_ref: str,
-    runner: Runner,
-) -> bool:
-    """Compare the PR-side patches on divergent published and retained histories."""
-    base_name = base_ref.removeprefix("refs/heads/")
-    if runner(["git", "check-ref-format", "--branch", base_name]).returncode != 0:
-        raise RuntimeError("PR checkout lease tracked base ref is invalid")
-    tracked_base = _run(
-        runner,
-        [
-            "git", "-C", str(lease.path), "rev-parse", "--verify",
-            f"refs/remotes/origin/{base_name}^{{commit}}",
-        ],
-        "PR checkout lease tracked base is unavailable",
-    ).lower()
-
-    def unique_base(revision: str) -> str:
-        bases = _run(
-            runner,
-            ["git", "-C", str(lease.path), "merge-base", "--all", revision, tracked_base],
-            "PR checkout lease candidate has no verifiable tracked base",
-        ).splitlines()
-        if len(bases) != 1:
-            raise RuntimeError("PR checkout lease candidate has no unique tracked base")
-        return bases[0].lower()
-
-    def only_equivalent(upstream: str, revision: str, limit: str) -> bool:
-        result = runner([
-            "git", "-C", str(lease.path), "cherry", upstream, revision, limit,
-        ])
-        if result.returncode != 0:
-            raise RuntimeError(
-                (result.stderr or result.stdout).strip()
-                or "PR checkout lease patch comparison failed"
-            )
-        records = [line for line in result.stdout.splitlines() if line]
-        return all(
-            len(line) == 42
-            and line.startswith("- ")
-            and all(character in "0123456789abcdef" for character in line[2:].lower())
-            for line in records
-        )
-
-    published = lease.head_sha.lower()
-    return (
-        only_equivalent(published, head, unique_base(head))
-        and only_equivalent(head, published, unique_base(published))
-    )
 
 
 def _foreign_candidate_head(
@@ -1090,6 +1028,11 @@ def _foreign_candidate_head(
         return head, False
     _assert_self_contained_checkout(lease.path, runner=runner)
     observed_head = scope.observed_head_sha.lower()
+    # Same-identity work must remain resumable even after rewriting its patches.
+    # This grants no push authority; rebind freshly verifies the remote head and
+    # publication must separately reconcile it. Keep stale-head cleanup below.
+    if lease.head_sha.lower() == observed_head:
+        return head, True
     if runner([
         "git", "-C", str(lease.path), "cat-file", "-e", f"{observed_head}^{{commit}}",
     ]).returncode != 0:
@@ -1117,16 +1060,7 @@ def _foreign_candidate_head(
             (ancestor.stderr or ancestor.stdout).strip()
             or "PR checkout lease candidate ancestry inspection failed"
         )
-    # Keep rebased-patch reuse only against the current publication, never stale metadata.
-    if lease.head_sha.lower() != observed_head:
-        return head, False
-    try:
-        equivalent = _patches_match_published_head(
-            lease, head=head, base_ref=scope.base_ref, runner=runner,
-        )
-    except RuntimeError:
-        equivalent = False
-    return head, equivalent
+    return head, False
 
 
 def _rebind_foreign_candidate(
