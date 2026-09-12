@@ -581,6 +581,114 @@ raise SystemExit(bootstrap.main([]))
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("delivery", ["before-install", "before-handler"])
+async def test_preinstall_sigint_exits_without_blocked_teardown(
+    delivery: str, tmp_path: Path,
+) -> None:
+    progress = tmp_path / "child-progress"
+    source = _journal_source(progress) + r'''
+import asyncio, io, sys
+from types import SimpleNamespace
+from mimir.acp import bootstrap, profiles
+profiles.ProfileStore = lambda: SimpleNamespace(get=lambda name: SimpleNamespace(remote=None))
+profiles.selected_profile = lambda name: 'test'
+
+original_install = _journal_install
+def deliver_install(self):
+    if sys.argv[1] == 'before-install':
+        os.kill(os.getpid(), signal.SIGINT)
+    original_install(self)
+    record(b'handlers-installed:cancelling=' + str(asyncio.current_task().cancelling()).encode())
+_journal_install = deliver_install
+original_signal = signal.signal
+def install_handler(signum, handler):
+    if sys.argv[1] == 'before-handler' and signum == signal.SIGINT:
+        os.kill(os.getpid(), signal.SIGINT)
+    return original_signal(signum, handler)
+
+class ArmedTimer(JournalTimer):
+    def start(self):
+        super().start()
+        record(b'armed')
+proxy.threading.Timer = ArmedTimer
+
+async def run_proxy(name, output):
+    # Only intercept the product registration, not bootstrap's startup handler.
+    signal.signal = install_handler
+    class Reader:
+        async def read(self, size):
+            record(b'ready')
+            await asyncio.Future()
+    async def close(self):
+        record(b'draining:blocked-close')
+        output.write(b'blocked\n')
+        threading.Event().wait()
+    proxy.ProxyRouter.close = close
+    await proxy.run_router(Reader(), proxy._OutputWriter(io.BytesIO()),
+                           asyncio.StreamReader(), proxy._OutputWriter(io.BytesIO()), 'secret')
+proxy.run_proxy = run_proxy
+raise SystemExit(bootstrap.main([]))
+'''
+    process = await asyncio.create_subprocess_exec(
+        sys.executable, "-c", source, delivery,
+        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+        cwd=Path(__file__).resolve().parents[1],
+    )
+    try:
+        async with _shutdown_ceiling(process, progress, lambda: "startup SIGINT exit"):
+            observed = await process.stdout.readline()
+            state = progress.read_text().splitlines()
+            # A blocked-close handshake makes the unfixed failure immediate and
+            # proves it is a live, unarmed child, not just an unexpected exit code.
+            assert observed == b"", (process.returncode, state)
+            stdout, stderr = await process.communicate()
+            assert (process.returncode, stdout, stderr) == (128 + signal.SIGINT, b"", b"")
+            assert state == ["child-started", "install-enter"]
+    finally:
+        if process.returncode is None:
+            process.kill()
+            await process.communicate()
+
+
+@pytest.mark.parametrize("finish", ["eof", "startup-error"])
+def test_startup_sigint_handler_restored(finish: str) -> None:
+    import subprocess
+
+    source = r'''
+import argparse, asyncio, io, signal, sys
+from types import SimpleNamespace
+from mimir.acp import bootstrap, profiles, proxy
+previous = signal.getsignal(signal.SIGINT)
+profiles.ProfileStore = lambda: SimpleNamespace(get=lambda name: SimpleNamespace(remote=None))
+profiles.selected_profile = lambda name: 'test'
+async def run_proxy(name, output):
+    handler = signal.getsignal(signal.SIGINT)
+    assert handler is not previous
+    assert handler.__name__ == 'startup_sigint'  # Runner must not take ownership
+    if sys.argv[1] == 'startup-error':
+        raise ValueError('startup failed')
+    reader = asyncio.StreamReader()
+    reader.feed_eof()
+    await proxy.run_router(reader, proxy._OutputWriter(io.BytesIO()),
+                           reader, proxy._OutputWriter(io.BytesIO()), 'secret')
+    assert signal.getsignal(signal.SIGINT) is handler
+proxy.run_proxy = run_proxy
+try:
+    assert bootstrap._proxy(argparse.Namespace(proxy_profile=None), io.BytesIO()) == 0
+except ValueError:
+    assert sys.argv[1] == 'startup-error'
+else:
+    assert sys.argv[1] == 'eof'
+assert signal.getsignal(signal.SIGINT) is previous
+'''
+    result = subprocess.run(
+        [sys.executable, "-c", source, finish], capture_output=True, timeout=120,
+        cwd=Path(__file__).resolve().parents[1],
+    )
+    assert (result.returncode, result.stdout, result.stderr) == (0, b"", b"")
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("outstanding", ["armed", "terminated", "draining"])
 async def test_signal_exit_timeout_reports_child_progress(
     outstanding: str, tmp_path: Path,
