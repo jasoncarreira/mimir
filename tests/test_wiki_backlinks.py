@@ -2,13 +2,16 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
+import threading
 from pathlib import Path
 
 import pytest
 
 from mimir.event_logger import init_logger
+from mimir import wiki_backlinks
 from mimir.wiki_backlinks import (
     build_graph,
     build_wiki_payload,
@@ -460,6 +463,102 @@ def test_render_backlinks_index_marks_orphans(wiki: Path):
 
 
 # ─── End-to-end run ──────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stage", [
+    "find_pages", "render_orphans_md", "render_dangling_md",
+    "render_backlinks_index_md", "orphans.md", "dangling-links.md",
+    "backlinks-index.md",
+])
+async def test_run_loop_progress_during_scan_and_reports(wiki: Path, monkeypatch, stage):
+    loop = asyncio.get_running_loop()
+    loop_thread = threading.get_ident()
+    entered = asyncio.Event()
+    release = threading.Event()
+    is_write = stage.endswith(".md")
+    name = "_atomic_write_text" if is_write else stage
+    original = getattr(wiki_backlinks, name)
+    submit = loop.run_in_executor
+    submissions = []
+
+    def dedicated_submit(executor, func, *args):
+        assert executor is wiki_backlinks._BACKLINKS_EXECUTOR
+        assert executor is not None
+        submissions.append(func)
+        return submit(executor, func, *args)
+
+    def blocked(*args, **kwargs):
+        if not is_write or args[0].name == stage:
+            assert threading.get_ident() != loop_thread
+            loop.call_soon_threadsafe(entered.set)
+            assert release.wait(5), "event loop did not release the worker"
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(loop, "run_in_executor", dedicated_submit)
+    monkeypatch.setattr(wiki_backlinks, name, blocked)
+    task = asyncio.create_task(run(wiki.parent.parent))
+    try:
+        await asyncio.wait_for(entered.wait(), timeout=5)
+        # Only the loop can release this owned gate while the job is blocked.
+        assert not task.done()
+    finally:
+        release.set()
+        await asyncio.wait_for(task, timeout=5)
+    assert len(submissions) == 1
+
+
+@pytest.mark.asyncio
+async def test_run_preserves_reports_and_async_logging(wiki: Path, monkeypatch):
+    _write(wiki, "concepts/foo.md", "[[ghost]]")
+    _write(wiki, "topics/foo.md", "# Foo")
+    graph = build_graph(wiki)
+    loop = asyncio.get_running_loop()
+    events = []
+    reports = {
+        "orphans.md": render_orphans_md,
+        "dangling-links.md": render_dangling_md,
+        "backlinks-index.md": render_backlinks_index_md,
+    }
+
+    async def log(event, **fields):
+        assert asyncio.get_running_loop() is loop
+        await asyncio.sleep(0)
+        for filename, render in reports.items():
+            assert (wiki / filename).read_text() == render(graph, fields["generated_at"])
+        events.append((event, fields))
+
+    monkeypatch.setattr(wiki_backlinks, "log_event", log)
+    summary = await run(wiki.parent.parent)
+    assert summary == {
+        "page_count": 2, "orphan_count": 2, "dangling_count": 1,
+        "generated_at": summary["generated_at"],
+    }
+    assert events == [
+        ("wiki_backlinks_unhealthy", summary),
+        ("wiki_slug_collision", {
+            "slug": "foo", "paths": ["concepts/foo.md", "topics/foo.md"],
+            "generated_at": summary["generated_at"],
+        }),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_run_write_failure_propagates_without_logging(wiki: Path, monkeypatch):
+    _write(wiki, "concepts/foo.md", "[[ghost]]")
+    events = []
+
+    def fail_write(*args):
+        raise OSError("report write failed")
+
+    async def log(*args, **kwargs):
+        events.append(args)
+
+    monkeypatch.setattr(wiki_backlinks, "_atomic_write_text", fail_write)
+    monkeypatch.setattr(wiki_backlinks, "log_event", log)
+    with pytest.raises(OSError, match="report write failed"):
+        await run(wiki.parent.parent)
+    assert events == []
 
 
 @pytest.mark.asyncio

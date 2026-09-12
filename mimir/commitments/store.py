@@ -26,10 +26,13 @@ import os
 import sqlite3
 import tempfile
 import time
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
+from contextvars import copy_context
 from dataclasses import dataclass
+from functools import partial
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any, Callable, Iterator, ParamSpec, TypeVar
 
 from mimir.models import AuthContext
 
@@ -46,6 +49,32 @@ from .models import (
 )
 
 log = logging.getLogger(__name__)
+
+_STORE_EXECUTOR = ThreadPoolExecutor(max_workers=4, thread_name_prefix="commitments")
+_P = ParamSpec("_P")
+_T = TypeVar("_T")
+
+
+async def run_store_io(func: Callable[_P, _T], *args: _P.args, **kwargs: _P.kwargs) -> _T:
+    """Run store work outside the loop and default pool, awaiting completion.
+
+    Cancellation is deferred until the worker finishes: callers holding a store
+    lock must not release it while a durable write is still in flight. Worker
+    failures (including writer-lock TimeoutError) propagate unchanged.
+    """
+    future = asyncio.get_running_loop().run_in_executor(
+        _STORE_EXECUTOR, copy_context().run, partial(func, *args, **kwargs),
+    )
+    cancelled = False
+    while not future.done():
+        try:
+            await asyncio.shield(future)
+        except asyncio.CancelledError:
+            cancelled = True
+    result = future.result()
+    if cancelled:
+        raise asyncio.CancelledError
+    return result
 
 
 # Number of days terminal records are retained before ``trim()`` drops them.
@@ -188,6 +217,7 @@ class CommitmentsStore:
         snapshot may replace this append-only, multi-process log. Preparation
         and fsync of replacements never hold the writer lock.
         """
+        self.path.parent.mkdir(parents=True, exist_ok=True)
         with self._writer_lock(), self.path.open("a", encoding="utf-8") as f:
             f.write(json.dumps(event, ensure_ascii=True, default=str) + "\n")
             f.flush()
@@ -202,8 +232,7 @@ class CommitmentsStore:
         # overwrite handles a stray copy-paste in the lifecycle methods.
         event = {**event, "v": COMMITMENTS_JSONL_SCHEMA_VERSION}
         async with self._lock:
-            self.path.parent.mkdir(parents=True, exist_ok=True)
-            self._append_line_sync(event)
+            await run_store_io(self._append_line_sync, event)
 
     async def add(self, record: CommitmentRecord) -> CommitmentRecord:
         """Append ``commitment_added`` with the full initial record.
@@ -405,7 +434,7 @@ class CommitmentsStore:
         self._inflight_lifecycle_ids.add(id)
         try:
             async with self._lock:
-                state = await asyncio.to_thread(self.current_state)
+                state = await self.current_state_async()
                 if not self._can_apply(
                     state,
                     id,
@@ -414,8 +443,7 @@ class CommitmentsStore:
                     actor_is_admin=actor_is_admin,
                 ):
                     return False
-                self.path.parent.mkdir(parents=True, exist_ok=True)
-                self._append_line_sync(event)
+                await run_store_io(self._append_line_sync, event)
             return True
         finally:
             self._inflight_lifecycle_ids.remove(id)
@@ -590,7 +618,7 @@ class CommitmentsStore:
         Annotational, not a status transition: ``VALID_TRANSITIONS``
         isn't consulted; the record's status is untouched. Returns
         True if appended, False on unknown id."""
-        if id not in self.current_state():
+        if id not in await self.current_state_async():
             log.warning(
                 "commitments: alarm_pileup for unknown id %s", id,
             )
@@ -604,6 +632,14 @@ class CommitmentsStore:
         return True
 
     # ─── Replay-to-state ────────────────────────────────────────────
+
+    async def replay_async(self) -> CommitmentsReplay:
+        """Replay on the dedicated store executor, including diagnostics."""
+        return await run_store_io(self.replay)
+
+    async def current_state_async(self) -> dict[str, CommitmentRecord]:
+        """Read current records without running the replay on the event loop."""
+        return await run_store_io(self.current_state)
 
     def replay(self) -> CommitmentsReplay:
         """Replay the JSONL and return records with immutable diagnostics."""
@@ -966,6 +1002,9 @@ class CommitmentsStore:
         of publishing a stale snapshot; callers may retry. Only validation and
         publication hold the cross-process lock, with a bounded acquisition wait.
         """
+        return await run_store_io(self._trim_sync, now_unix=now_unix)
+
+    def _trim_sync(self, *, now_unix: float | None = None) -> int:
         if not self.path.exists():
             return 0
 

@@ -16,7 +16,11 @@ Coverage:
 
 from __future__ import annotations
 
+import asyncio
+import threading
+from types import SimpleNamespace
 from typing import Any
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -276,3 +280,36 @@ def test_agent_add_hook_appends_to_chain(tmp_path):
     agent.add_hook(h1)
     agent.add_hook(h2)
     assert agent._hooks == [h1, h2]
+@pytest.mark.asyncio
+async def test_extraction_replay_offloaded_and_write_timeout_propagates(tmp_path, monkeypatch):
+    from mimir.commitments import CommitmentRecord, CommitmentsStore
+    from mimir.turn_hooks import CommitmentExtractionHook
+
+    store = CommitmentsStore(tmp_path / "c.jsonl")
+    loop = asyncio.get_running_loop()
+    entered = asyncio.Event()
+    release = threading.Event()
+    replay = store.current_state
+
+    def blocked_state():
+        loop.call_soon_threadsafe(entered.set)
+        assert release.wait(5), "loop did not release extraction replay"
+        return replay()
+
+    monkeypatch.setattr(store, "current_state", blocked_state)
+    monkeypatch.setattr(store, "add", AsyncMock(side_effect=TimeoutError("writer lock busy")))
+    monkeypatch.setattr(
+        "mimir.commitments.extractor.extract_commitments",
+        AsyncMock(return_value=[CommitmentRecord(id="owned", channel_id="c1", text="Follow up")]),
+    )
+    monkeypatch.setattr("mimir.turn_hooks.log_event", AsyncMock())
+    ctx = SimpleNamespace(trigger="saga_session_end", channel_id="c1", turn_id="t1", auth_context=None)
+    record = SimpleNamespace(integrity="trusted", output="x" * 5000)
+    task = asyncio.create_task(CommitmentExtractionHook(store).finalize(ctx, None, record))
+    try:
+        await asyncio.wait_for(entered.wait(), 2)
+        assert not task.done()
+    finally:
+        release.set()
+        with pytest.raises(TimeoutError, match="writer lock busy"):
+            await task
