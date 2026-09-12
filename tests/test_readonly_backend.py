@@ -1338,6 +1338,222 @@ class TestCreateOnlyWrites:
         assert "no lines were read because `limit` was 0" in zero_result.content
 
 
+class TestWriteGuardFileIdentity:
+    @pytest.fixture
+    def case_insensitive_home(self, home: Path) -> Path:
+        probe = home / "case-probe"
+        probe.write_text("probe")
+        variant = probe.with_name(probe.name.upper())
+        if not variant.exists() or not variant.samefile(probe):
+            pytest.skip("test filesystem does not alias upper-case file names")
+        return home
+
+    @pytest.mark.parametrize("protected", ["state/identities.yaml", "memory/core/persona.md"])
+    @pytest.mark.parametrize("operation", ["edit", "write", "upload"])
+    @pytest.mark.parametrize("resource_exists", [True, False])
+    def test_case_variant_blocked_with_legacy_negative_control(
+        self, case_insensitive_home: Path, monkeypatch: pytest.MonkeyPatch,
+        protected: str, operation: str, resource_exists: bool,
+    ) -> None:
+        from mimir._context import _current_turn
+        from mimir.models import TurnContext
+
+        home = case_insensitive_home
+        target = home / protected
+        if resource_exists:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text("original")
+        identities = protected.startswith("state/")
+        variant = "/state/IDENTITIES.yaml" if identities else "/memory/CORE/persona.md"
+        if operation == "write" and not identities:
+            variant = "/memory/CORE/new/note.md"
+        b = WriteGuardBackend(home, ["state", "memory"])
+        # Explicitly own the context, including identities' unconditional deny.
+        ctx = None if identities else TurnContext(
+            turn_id="identity-test", session_id="s", trigger="user_message",
+            channel_id="test", started_at=0.0,
+        )
+        token = _current_turn.set(ctx)
+        try:
+            assert b._is_write_allowed(variant)
+
+            def attempt():
+                if operation == "edit":
+                    return b.edit(variant, "original", "changed").error
+                if operation == "upload":
+                    return b.upload_files([(variant, b"changed")])[0].error
+                return b.write(variant, "changed").error
+
+            error = attempt()
+            assert error
+            if operation != "upload":
+                assert ("identities.yaml" if identities else "read-only") in error
+            if resource_exists:
+                assert target.read_text() == "original"
+            else:
+                assert not target.exists()
+            assert not (home / "memory/core/new/note.md").exists()
+
+            # The pre-fix predicates admit the very same filesystem alias.
+            resolved = b._resolve_target(variant)
+            assert resolved is not None
+            if identities:
+                legacy_blocked = resolved == b._identities_path
+                monkeypatch.setattr(b, "_is_identities_write_blocked", lambda _: legacy_blocked)
+            else:
+                legacy_blocked = (
+                    resolved == b._memory_core_root
+                    or resolved.is_relative_to(b._memory_core_root)
+                )
+                monkeypatch.setattr(b, "_is_core_memory_write_blocked", lambda _: legacy_blocked)
+            assert not legacy_blocked
+            # write() is create-only; an existing identities file would be
+            # refused downstream even with the vulnerable predicate.
+            if (operation != "write" or not identities or not resource_exists) and (
+                operation != "edit" or resource_exists
+            ):
+                assert attempt() is None
+        finally:
+            _current_turn.reset(token)
+
+    def test_identities_hardlink_and_atomic_replacement(self, home: Path) -> None:
+        from mimir._context import _current_turn
+
+        target = home / "state/identities.yaml"
+        target.write_text("original")
+        b = WriteGuardBackend(home, ["state"], enforce_core_memory_readonly=False)
+        alias = home / "state/alias.yaml"
+        alias.hardlink_to(target)
+        token = _current_turn.set(None)
+        try:
+            assert "identities.yaml" in b.edit("/state/alias.yaml", "original", "bad").error
+            assert target.read_text() == "original"
+            replacement = home / "state/replacement.yaml"
+            replacement.write_text("replacement")
+            replacement.replace(target)
+            alias.unlink()
+            alias.hardlink_to(target)
+            assert "identities.yaml" in b.edit("/state/alias.yaml", "replacement", "bad").error
+            assert target.read_text() == "replacement"
+            assert b.write("/state/new/sub/note.md", "ok").error is None
+            assert b.edit("/state/new/sub/note.md", "ok", "updated").error is None
+        finally:
+            _current_turn.reset(token)
+
+    @pytest.mark.parametrize("protected", ["state/identities.yaml", "memory/core"])
+    def test_missing_leaf_under_identity_aliased_parent(
+        self, home: Path, monkeypatch: pytest.MonkeyPatch, protected: str,
+    ) -> None:
+        from mimir.models import TurnContext
+
+        # Exercise ancestor identity on case-sensitive CI as well. The real
+        # filesystem case-alias regression above never uses this mock.
+        target = home / protected
+        target.parent.mkdir(parents=True, exist_ok=True)
+        if protected == "memory/core":
+            target.mkdir()
+            variant = "/memory/CORE/new/note.md"
+            alias, real = home / "memory/CORE", target
+        else:
+            variant = "/STATE/identities.yaml"
+            alias, real = home / "STATE", home / "state"
+        original = Path.samefile
+
+        def samefile(path, other):
+            if path == alias and other == real:
+                return True
+            return original(path, other)
+
+        monkeypatch.setattr(Path, "samefile", samefile)
+        b = WriteGuardBackend(home, ["state", "memory"])
+        token = set_current_turn(TurnContext(
+            turn_id="alias-test", session_id="s", trigger="user_message",
+            channel_id="test", started_at=0.0,
+        ))
+        try:
+            guard = b._is_identities_write_blocked if protected.startswith("state") else b._is_core_memory_write_blocked
+            assert guard(variant)
+        finally:
+            reset_current_turn(token)
+
+    @pytest.mark.parametrize("protected", ["state/identities.yaml", "memory/core/new.md"])
+    @pytest.mark.parametrize("error_at", ["stat", "probe"])
+    def test_identity_stat_error_fails_closed(
+        self, home: Path, monkeypatch: pytest.MonkeyPatch, protected: str,
+        error_at: str,
+    ) -> None:
+        from mimir.models import TurnContext
+
+        b = WriteGuardBackend(
+            home, ["state", "memory"],
+            enforce_core_memory_readonly=protected.startswith("memory"),
+        )
+
+        original = Path.samefile
+        unreadable_target = b._memory_core_root if protected.startswith("memory") else b._identities_path
+
+        def unreadable(path, other):
+            if other == unreadable_target:
+                raise PermissionError("cannot inspect identity")
+            return original(path, other)
+
+        if error_at == "stat":
+            monkeypatch.setattr(Path, "samefile", unreadable)
+            variant = "/" + protected
+        else:
+            def probe_unavailable(*args, **kwargs):
+                raise PermissionError("cannot probe filesystem names")
+
+            monkeypatch.setattr("mimir.readonly_backend.tempfile.TemporaryDirectory", probe_unavailable)
+            variant = "/state/IDENTITIES.yaml" if protected.startswith("state") else "/memory/CORE/new.md"
+        token = set_current_turn(TurnContext(
+            turn_id="stat-test", session_id="s", trigger="user_message",
+            channel_id="test", started_at=0.0,
+        ))
+        try:
+            result = b.write(variant, "bad")
+            assert ("identities.yaml" if protected.startswith("state") else "read-only") in result.error
+            assert not (home / protected).exists()
+        finally:
+            reset_current_turn(token)
+
+    @pytest.mark.parametrize("protected", ["state/identities.yaml", "memory/core"])
+    def test_absent_resource_name_probe(
+        self, home: Path, monkeypatch: pytest.MonkeyPatch, protected: str,
+    ) -> None:
+        from mimir._context import _current_turn
+        from mimir.models import TurnContext
+
+        b = WriteGuardBackend(home, ["state", "memory"])
+        original = Path.samefile
+        probe_calls = []
+
+        def samefile(path, other):
+            if path.parent.name.startswith(".mimir-path-probe-"):
+                probe_calls.append((path, other))
+                alias = "IDENTITIES.yaml" if protected.startswith("state") else "CORE"
+                if path.name == alias and other.name == Path(protected).name:
+                    return True
+            return original(path, other)
+
+        monkeypatch.setattr(Path, "samefile", samefile)
+        ctx = None if protected.startswith("state") else TurnContext(
+            turn_id="probe-test", session_id="s", trigger="user_message",
+            channel_id="test", started_at=0.0,
+        )
+        token = _current_turn.set(ctx)
+        try:
+            variant = "/state/IDENTITIES.yaml" if protected.startswith("state") else "/memory/CORE/new.md"
+            result = b.write(variant, "bad")
+            assert ("identities.yaml" if protected.startswith("state") else "read-only") in result.error
+            assert probe_calls
+            assert all(not path.parent.exists() for path, _ in probe_calls)
+            assert not (home / protected).exists()
+            assert not (home / variant.lstrip("/")).exists()
+        finally:
+            _current_turn.reset(token)
+
+
 class TestCoreMemoryReflectionGate:
     """memory/core/ is read-only at runtime (chainlink #342).
 
