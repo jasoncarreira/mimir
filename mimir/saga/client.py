@@ -2451,6 +2451,15 @@ class SagaStore:
         auth_context: Any = None,
     ) -> dict[str, Any]:
         scope = _saga_mutation_scope(auth_context, "saga_forget")
+        # Unsupported thresholds and authorization scope are not selection criteria.
+        if not dry_run and all(
+            value is None for value in (min_retrievals, confidence_floor, grace_days)
+        ):
+            raise ValueError(
+                "Destructive forget requires a narrowing criterion: supply "
+                "min_retrievals, confidence_floor, or grace_days; "
+                "use dry_run=True for a broad preview."
+            )
 
         # Map saga's criteria-based forget to forget_by_criteria. Also
         # synchronizes the in-memory FAISS index — ``forget_by_criteria``

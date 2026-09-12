@@ -362,6 +362,10 @@ async def saga_forget(
     reviewing — forgetting is irreversible. Use this when ``## Self-
     state`` reports pending forget candidates; a successful non-dry-
     run call clears that line until the next decay cycle.
+
+    Destructive calls require min_retrievals, confidence_floor, or grace_days.
+    Contribution and contradiction thresholds alone do not narrow the
+    in-process engine's selection. Broad dry-run previews remain available.
     """
     from ..access_control import can_write_saga, saga_mutation_taint_refusal
 

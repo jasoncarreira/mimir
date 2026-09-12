@@ -254,6 +254,30 @@ def test_forget_by_criteria_dry_run_returns_preview(conn):
     assert count == 0
 
 
+@pytest.mark.parametrize("max_atoms", [1000, 1])
+@pytest.mark.parametrize("scope", [
+    {},
+    {"agent_id": "agent_a"},
+    {"owner_principal": "U_jason"},
+    {"owner_principal": "U_jason", "origin_domains": ("session",)},
+], ids=["unscoped", "agent", "owner", "owner-origin"])
+def test_forget_by_criteria_refuses_criterionless_destructive(conn, max_atoms, scope):
+    atom_id = store(
+        conn, "keep me", embed_fn=_fake_embed,
+        agent_id=scope.get("agent_id", "default"),
+        owner_principal="U_jason", origin_domain="session",
+    ).atom_id
+
+    with pytest.raises(ValueError, match="requires at least one selection criterion") as exc:
+        forget_by_criteria(conn, dry_run=False, max_atoms=max_atoms, **scope)
+
+    assert "max_atoms do not count" in str(exc.value)
+    assert "dry_run=True" in str(exc.value)
+    assert conn.execute(
+        "SELECT tombstoned FROM atoms WHERE id = ?", (atom_id,),
+    ).fetchone() == (0,)
+
+
 def test_forget_by_criteria_stream_filter(conn):
     """Stream-specific bulk forget targets only matching stream."""
     sem = store(conn, "semantic atom", embed_fn=_fake_embed,
@@ -274,7 +298,7 @@ def test_forget_by_criteria_protects_pinned_atoms(conn):
                    is_pinned=True).atom_id
     regular = store(conn, "regular", embed_fn=_fake_embed).atom_id
 
-    result = forget_by_criteria(conn, dry_run=False)
+    result = forget_by_criteria(conn, min_retrievals=1, dry_run=False)
     assert pinned not in result.tombstoned_ids
     assert regular in result.tombstoned_ids
 
@@ -360,6 +384,26 @@ def test_forget_by_criteria_max_atoms_caps_result(conn):
         store(conn, f"a{i}", embed_fn=_fake_embed)
     result = forget_by_criteria(conn, max_atoms=5, dry_run=True)
     assert len(result.tombstoned_ids) == 5
+
+
+def test_forget_by_criteria_narrowed_destructive_respects_cap(conn):
+    other = store(conn, "other stream", embed_fn=_fake_embed, stream="semantic").atom_id
+    candidates = {
+        store(conn, f"episode {i}", embed_fn=_fake_embed, stream="episodic").atom_id
+        for i in range(3)
+    }
+
+    result = forget_by_criteria(conn, stream="episodic", max_atoms=1, dry_run=False)
+
+    assert result.dry_run is False
+    assert result.tombstoned_count == 1
+    assert len(result.tombstoned_ids) == 1
+    assert set(result.tombstoned_ids) <= candidates
+    states = dict(conn.execute("SELECT id, tombstoned FROM atoms"))
+    assert states[other] == 0
+    assert {atom_id for atom_id, tombstoned in states.items() if tombstoned} == set(
+        result.tombstoned_ids
+    )
 
 
 def test_forget_by_criteria_activation_below(conn):

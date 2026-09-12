@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import importlib
+import json
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -534,6 +536,50 @@ async def test_mixed_contribution_batch_fails_before_access_events(client: SagaS
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("criteria", [{}, {"contribution_threshold": 0.1}, {"contradiction_threshold": 0.9}])
+async def test_admin_forget_requires_implemented_criterion(client: SagaStore, monkeypatch, criteria):
+    from mimir.tools.memory import _MEMORY_STATE
+    from mimir.tools.saga_ops import saga_forget
+
+    alice = await _atom(client, "alice default forget", owner="alice")
+    bob = await _atom(client, "bob default forget", owner="bob")
+    auth = _auth("admin", admin=True)
+    monkeypatch.setitem(_MEMORY_STATE, "client", client)
+    runtime = SimpleNamespace(context=auth)
+
+    preview = json.loads(await saga_forget.coroutine(runtime=runtime))
+    assert set(preview["preview_ids"]) == {alice, bob}
+    with pytest.raises(ValueError, match="supply min_retrievals"):
+        await client.forget(dry_run=False, auth_context=auth, **criteria)
+    result = await saga_forget.coroutine(dry_run=False, runtime=runtime, **criteria)
+    assert "saga_forget failed:" in result
+    assert "supply min_retrievals, confidence_floor, or grace_days" in result
+    assert client._ensure_conn().execute(
+        "SELECT COUNT(*) FROM atoms WHERE tombstoned = 1"
+    ).fetchone()[0] == 0
+
+
+@pytest.mark.asyncio
+async def test_admin_tool_narrowed_forget_preserves_nonmatching_atom(client: SagaStore, monkeypatch):
+    from mimir.tools.memory import _MEMORY_STATE
+    from mimir.tools.saga_ops import saga_forget
+
+    old = await _atom(client, "old alice memory", owner="alice")
+    young = await _atom(client, "young bob memory", owner="bob")
+    conn = client._ensure_conn()
+    conn.execute("UPDATE atoms SET created_at = '2000-01-01T00:00:00+00:00' WHERE id = ?", (old,))
+    conn.commit()
+    monkeypatch.setitem(_MEMORY_STATE, "client", client)
+    runtime = SimpleNamespace(context=_auth("admin", admin=True))
+    preview = json.loads(await saga_forget.coroutine(grace_days=14, runtime=runtime))
+    assert preview["preview_ids"] == [old]
+    result = json.loads(await saga_forget.coroutine(dry_run=False, grace_days=14, runtime=runtime))
+    assert result["tombstoned_count"] == 1
+    assert conn.execute("SELECT tombstoned FROM atoms WHERE id = ?", (old,)).fetchone()[0] == 1
+    assert conn.execute("SELECT tombstoned FROM atoms WHERE id = ?", (young,)).fetchone()[0] == 0
+
+
+@pytest.mark.asyncio
 async def test_forget_preview_contains_only_authorized_ids(client: SagaStore):
     own = await _atom(client, "alice preview", owner="alice")
     await _atom(client, "bob preview", owner="bob")
@@ -576,7 +622,7 @@ async def test_forget_denies_unauthorized_dependent_observation_before_write(
     )
     conn.commit()
 
-    result = await client.forget(dry_run=False, auth_context=_auth("alice"))
+    result = await client.forget(dry_run=False, min_retrievals=1, auth_context=_auth("alice"))
 
     assert result == {
         "tombstoned_count": 0,
@@ -637,7 +683,7 @@ async def test_forget_updates_only_authorized_dependents_and_index(
     client._index = index
     monkeypatch.setattr(client, "_rebuild_index_if_needed", lambda _conn: None)
 
-    result = await client.forget(dry_run=False, auth_context=_auth("alice"))
+    result = await client.forget(dry_run=False, min_retrievals=1, auth_context=_auth("alice"))
 
     assert result["tombstoned_count"] == 1
     assert index.removed == [own]
@@ -689,7 +735,7 @@ async def test_forget_rolls_back_tombstones_when_dependent_refresh_fails(
     monkeypatch.setattr(forget_module, "refresh_trend", fail_refresh)
 
     with pytest.raises(RuntimeError, match="injected dependent refresh failure"):
-        await client.forget(dry_run=False, auth_context=_auth("alice"))
+        await client.forget(dry_run=False, min_retrievals=1, auth_context=_auth("alice"))
 
     assert (
         conn.execute(
@@ -717,7 +763,7 @@ async def test_forgotten_source_atom_hides_derived_triples(client: SagaStore):
         auth_context=_auth("admin", admin=True),
     )
 
-    result = await client.forget(dry_run=False, auth_context=_auth("alice"))
+    result = await client.forget(dry_run=False, min_retrievals=1, auth_context=_auth("alice"))
 
     assert result["tombstoned_count"] == 1
     assert (
@@ -870,6 +916,7 @@ async def test_non_platform_service_can_read_and_forget_own_domainless_write(
         )
         forget_result = await client.forget(
             dry_run=False,
+            min_retrievals=1,
             auth_context=auth_context,
         )
     finally:
