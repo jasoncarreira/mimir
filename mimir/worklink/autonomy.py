@@ -46,7 +46,14 @@ from .claims import (
 )
 from .checkout import prune_attempt_checkouts, report_foreign_owned_git_objects
 from .control import _claim_mutex
-from .factory_state import factory_process_is_alive, list_factory_records
+from .factory_state import (
+    LIVE_CONTROLLER_PHASES,
+    RETAINED_CONTROLLER_PHASES,
+    factory_checkout_interlock,
+    factory_process_is_alive,
+    factory_process_is_verified_dead,
+    list_factory_records,
+)
 from .run_state import (
     OrphanBlockRecord,
     clear_orphan_block_record,
@@ -212,12 +219,19 @@ def _attempt_is_active(child: Path, records: Sequence[object] = ()) -> bool:
         if resolved_sandbox != resolved and resolved not in resolved_sandbox.parents:
             continue
         phase = getattr(candidate, "controller_phase", None)
-        if phase is not None:
+        if phase in LIVE_CONTROLLER_PHASES and not factory_process_is_verified_dead(candidate):
+            return True
+        if phase not in LIVE_CONTROLLER_PHASES | RETAINED_CONTROLLER_PHASES:
+            return True
+        if factory_process_is_alive(candidate):
             return True
         status = getattr(candidate, "status", None)
-        if status is not None and (status.is_terminal or status.is_parked):
-            return status.is_parked
-        return factory_process_is_alive(candidate)
+        if status is not None and status.is_parked:
+            return True
+        if status is not None and status.is_terminal:
+            continue
+        if not factory_process_is_verified_dead(candidate):
+            return True
     return False
 
 
@@ -235,22 +249,24 @@ def prune_stale_attempt_checkouts_for_home(
     without bound.  If no Worklink repo is configured, return silently; homes can
     opt into claim reaping before they opt into autonomous dispatch.
 
-    Any durable factory record in a retained controller phase keeps its sandbox
-    out of the TTL prune path until the factory handoff archives it.
+    Factory controllers exclude reclamation through a cross-process interlock;
+    abandoned records are evaluated only after acquiring it and rereading state.
     """
     defaults = worklink_defaults(home)
     repo_raw = repo or os.environ.get("WORKLINK_REPO") or os.environ.get("MIMIR_WORKLINK_REPO")
     if not repo_raw:
         return []
-    try:
-        factory_records = list_factory_records(home)
-    except Exception:
-        return []
-    retained_run_paths = {
-        Path(state.checkout).resolve() for state in list_run_states(home) if state.checkout
-    }
     run = runner or _home_runner(home)
-    with _claim_mutex(home):
+    with factory_checkout_interlock(home, pruning=True) as acquired, _claim_mutex(home):
+        if not acquired:
+            return []
+        try:
+            factory_records = list_factory_records(home)
+        except Exception:
+            return []
+        retained_run_paths = {
+            Path(state.checkout).resolve() for state in list_run_states(home) if state.checkout
+        }
         records = {Path(record.checkout).resolve(): record for record in list_orphan_block_records(home)}
         pruned = prune_attempt_checkouts(
             Path(repo_raw),

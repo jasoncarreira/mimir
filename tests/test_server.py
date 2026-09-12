@@ -66,10 +66,20 @@ def test_server_startup_routes_factory_recovery_to_run_epic(
     import mimir.worklink.control as control
     import mimir.worklink.factory_state as factory_state
 
-    record = SimpleNamespace(
+    record = factory_state.FactoryRunRecord(
+        run_id="chainlink-700",
         issue_id=700,
+        attempt=1,
+        repository="owner/repo",
+        base_ref="main",
+        branch="epic/700",
+        launcher="/opt/factory.js",
+        sandbox=str(tmp_path / ".factory-sandboxes" / "chainlink-700"),
+        session=None,
+        handle=None,
+        observed_at=None,
         controller_phase="running",
-        status=SimpleNamespace(is_terminal=False),
+        status=None,
     )
     monkeypatch.setenv("WORKLINK_REPO", "/workspace/mimir")
     monkeypatch.setattr(control, "reconcile_run_states", lambda *args, **kwargs: [])

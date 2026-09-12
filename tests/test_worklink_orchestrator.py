@@ -34,6 +34,7 @@ from mimir.worklink.backends.feature_factory import FeatureFactoryBackend, parse
 from mimir.worklink.factory_state import (
     FactoryRunRecord,
     archive_factory_record,
+    factory_checkout_interlock,
     load_factory_record,
     save_factory_record,
 )
@@ -60,6 +61,87 @@ from mimir.worklink.orchestrator import (
     run_worklink_epic,
     validate_leaf,
 )
+
+
+@pytest.mark.parametrize("pruning", [False, True])
+def test_factory_checkout_interlock_cross_process(tmp_path: Path, pruning: bool) -> None:
+    script = """
+import json, sys
+from pathlib import Path
+from mimir.worklink.factory_state import factory_checkout_interlock
+results = []
+for pruning in (False, True):
+    with factory_checkout_interlock(Path(sys.argv[1]), pruning=pruning) as acquired:
+        results.append(acquired)
+print(json.dumps(results))
+"""
+    with factory_checkout_interlock(tmp_path, pruning=pruning) as acquired:
+        assert acquired
+        lock = tmp_path / "state" / "worklink" / "factory-checkouts.lock"
+        inode = lock.stat().st_ino
+        child = subprocess.run(
+            [sys.executable, "-c", script, str(tmp_path)],
+            capture_output=True, text=True, check=True, timeout=30,
+        )
+        assert json.loads(child.stdout) == [not pruning, False]
+        with factory_checkout_interlock(tmp_path / "other", pruning=True) as other:
+            assert other
+    with factory_checkout_interlock(tmp_path, pruning=True) as acquired:
+        assert acquired
+        assert lock.stat().st_ino == inode
+
+
+@pytest.mark.parametrize("unsafe", ["ancestor", "symlink", "directory", "fifo", "hardlink"])
+def test_factory_checkout_interlock_fails_closed(tmp_path: Path, unsafe: str) -> None:
+    state = tmp_path / "state"
+    target = tmp_path / "target"
+    target.mkdir()
+    if unsafe == "ancestor":
+        state.symlink_to(target, target_is_directory=True)
+    else:
+        directory = state / "worklink"
+        directory.mkdir(parents=True)
+        lock = directory / "factory-checkouts.lock"
+        if unsafe == "symlink":
+            lock.symlink_to(target / "lock")
+        elif unsafe == "directory":
+            lock.mkdir()
+        elif unsafe == "fifo":
+            os.mkfifo(lock)
+        else:
+            lock.touch()
+            os.link(lock, target / "lock")
+    with factory_checkout_interlock(tmp_path, pruning=True) as acquired:
+        assert not acquired
+    assert not (target / "worklink").exists()
+
+
+@pytest.mark.parametrize("cancel", [False, True])
+def test_factory_run_interlock_refuses_busy_and_releases_on_exit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, cancel: bool,
+) -> None:
+    calls = []
+
+    async def run_locked(self: WorklinkRunner, issue_id: int, *, autonomous: bool):
+        calls.append(issue_id)
+        with factory_checkout_interlock(tmp_path, pruning=True) as acquired:
+            assert not acquired
+        if cancel:
+            raise asyncio.CancelledError
+        raise RuntimeError("controller failure")
+
+    monkeypatch.setattr(WorklinkRunner, "_run_factory_070_locked", run_locked)
+    runner = WorklinkRunner(home=tmp_path, repo=tmp_path)
+    with factory_checkout_interlock(tmp_path, pruning=True) as acquired:
+        assert acquired
+        result = asyncio.run(runner._run_factory_070(700, autonomous=False))
+        assert result.status == "refused"
+        assert calls == []
+    with pytest.raises(asyncio.CancelledError if cancel else RuntimeError):
+        asyncio.run(runner._run_factory_070(700, autonomous=False))
+    assert calls == [700]
+    with factory_checkout_interlock(tmp_path, pruning=True) as acquired:
+        assert acquired
 
 
 @pytest.mark.parametrize("value", [None, "invalid", "0", "-1"])
@@ -6256,6 +6338,7 @@ def test_factory_recovery_uses_run_id_first_lock_resume_and_authoritative_status
     local_compute: bool,
 ) -> None:
     from mimir.worklink.compute import LocalSubprocessComputeBackend
+    from mimir.worklink.run_state import process_start_ticks
 
     _configure_opencode_oauth(tmp_path, monkeypatch)
     attempt = 3 if local_compute else 1
@@ -6265,6 +6348,26 @@ def test_factory_recovery_uses_run_id_first_lock_resume_and_authoritative_status
         if local_compute else tmp_path / "sandbox"
     )
     sandbox.mkdir(parents=True)
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    if local_compute:
+        os.utime(original_checkout, (1, 1))
+
+    def prune_in_child() -> list[str]:
+        # Exercise production pruning in another process, including its interlock.
+        script = """
+import json, sys
+from pathlib import Path
+from mimir.worklink.autonomy import prune_stale_attempt_checkouts_for_home
+home, repo = map(Path, sys.argv[1:])
+pruned = prune_stale_attempt_checkouts_for_home(home, repo=repo)
+print(json.dumps([str(path) for path in pruned]))
+"""
+        child = subprocess.run(
+            [sys.executable, "-c", script, str(tmp_path), str(repo)],
+            capture_output=True, text=True, timeout=30, check=True,
+        )
+        return json.loads(child.stdout)
     historical = {"reason": "opaque and nonauthoritative"}
 
     def status(value: str, lock_value: str, next_value: str | None = None):
@@ -6301,7 +6404,7 @@ def test_factory_recovery_uses_run_id_first_lock_resume_and_authoritative_status
     ])
     calls: list[tuple[str, ...]] = []
 
-    class Backend:
+    class Backend(FeatureFactoryBackend):
         poll_interval_s = 0
 
         def status(self, run_id: str, *, sandbox: Path, launcher: str):
@@ -6328,14 +6431,33 @@ def test_factory_recovery_uses_run_id_first_lock_resume_and_authoritative_status
             )
 
     class Compute:
+        name = "local_subprocess"
+
         def __init__(self) -> None:
-            self.handle = LaunchHandle("local_subprocess", "123", 456)
+            self.handle = LaunchHandle("local_subprocess", "99999998", 456)
+            self.process: subprocess.Popen | None = None
             self.cancelled = False
             self.cleaned = False
             self.launches = 0
 
         async def launch(self, spec: WorkSpec) -> LaunchHandle:
             self.launches += 1
+            if local_compute:
+                self.process = subprocess.Popen(
+                    [sys.executable, "-c", "import time; time.sleep(300)"],
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+                ticks = process_start_ticks(self.process.pid)
+                assert ticks is not None
+                self.handle = LaunchHandle("local_subprocess", str(self.process.pid), ticks)
+                # The durable record still names the dead worker while the
+                # replacement is launching, before save_factory_record.
+                assert load_factory_record(tmp_path, "700") == retained
+                assert prune_in_child() == []
+                assert self.process.poll() is None
+                assert sandbox.is_dir()
             assert spec.local_argv is not None
             session_index = tuple(spec.local_argv).index("--session")
             assert spec.local_argv[session_index + 1] == "session-1"
@@ -6351,9 +6473,19 @@ def test_factory_recovery_uses_run_id_first_lock_resume_and_authoritative_status
             return True
 
         async def cancel(self, handle: LaunchHandle) -> None:
+            if self.process is not None:
+                self.process.terminate()
+                self.process.wait(timeout=10)
             self.cancelled = True
 
         async def cleanup(self, handle: LaunchHandle) -> None:
+            if local_compute:
+                # Publication is not enough: finalization still needs the tree
+                # when the replacement worker has already died.
+                assert self.process is not None and self.process.poll() is not None
+                assert load_factory_record(tmp_path, "700").handle == self.handle
+                assert prune_in_child() == []
+                assert sandbox.is_dir()
             self.cleaned = True
 
     class LocalCompute(Compute, LocalSubprocessComputeBackend):
@@ -6362,6 +6494,11 @@ def test_factory_recovery_uses_run_id_first_lock_resume_and_authoritative_status
             return await super().launch(spec)
 
     def runner(args: Sequence[str] | str, **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        if isinstance(args, list) and args[:4] == ["chainlink", "issue", "show", "700"]:
+            return cp(args, stdout=json.dumps({
+                "id": 700, "title": "epic", "description": "build",
+                "labels": ["worklink", "worklink:epic", "worklink:ready"], "comments": [],
+            }))
         if isinstance(args, list) and args[-2:] == ["rev-parse", "--show-toplevel"]:
             return cp(args, stdout=f"{sandbox}\n")
         if isinstance(args, list) and args[-2:] == ["rev-parse", "--absolute-git-dir"]:
@@ -6395,32 +6532,40 @@ def test_factory_recovery_uses_run_id_first_lock_resume_and_authoritative_status
         700, attempt, "agent", datetime.now(UTC),
         budget_attempt=4 if local_compute else None,
     )
-    class Claims:
-        agent_id = "agent"
+    save_factory_record(tmp_path, retained)
 
-        def _lock_still_held_by(self, record: ClaimRecord) -> bool:
-            return record is claim
+    def claim_issue(self: object, *args: object, **kwargs: Any) -> ClaimResult:
+        if local_compute:
+            assert prune_in_child() == []
+        kwargs["before_claim"]()
+        return ClaimResult(True, claim)
 
-        def transition_issue(self, *args: object, **kwargs: object) -> None:
-            return None
+    def release_issue(*args: object, **kwargs: object) -> bool:
+        if local_compute:
+            assert prune_in_child() == []
+            assert sandbox.is_dir()
+        return True
 
+    monkeypatch.setattr(ChainlinkClaims, "claim_issue", claim_issue)
+    monkeypatch.setattr(ChainlinkClaims, "_lock_still_held_by", lambda self, record: record is claim)
+    monkeypatch.setattr(ChainlinkClaims, "transition_issue", lambda *args, **kwargs: None)
+    monkeypatch.setattr(ChainlinkClaims, "release_issue", release_issue)
+    monkeypatch.setattr(FeatureFactoryBackend, "admit", lambda self: Path(retained.launcher))
     compute = LocalCompute() if local_compute else Compute()
-    result = asyncio.run(
-        WorklinkRunner(home=tmp_path, repo=tmp_path / "repo", agent_id="agent")._recover_factory_070(
-            issue=IssueContext(700, "epic", "build", {"worklink:epic"}),
-            claim_record=claim,
-            claims=Claims(),
-            backend=Backend(),
-            compute=compute,
-            retained=retained,
-            launcher=Path(retained.launcher),
-            repo_slug="owner/repo",
-            base="main",
-            test_cmd="uv run pytest -q",
-            runner=runner,
+    backend = Backend(entrypoint=retained.launcher)
+    try:
+        result = asyncio.run(
+            WorklinkRunner(
+                home=tmp_path, repo=repo, agent_id="agent", runner=runner,
+                registry=SimpleNamespace(get=lambda name: backend, select_compute=lambda **kw: compute),
+            )._run_factory_070(700, autonomous=False)
         )
-    )
-    assert result.status == "needs-human"
+    finally:
+        if compute.process is not None:
+            if compute.process.poll() is None:
+                compute.process.kill()
+            compute.process.wait(timeout=10)
+    assert result.status == "needs-human", result.reason
     expected = [("status", "700", str(sandbox), retained.launcher)]
     if action is not None:
         expected.extend([
@@ -6436,6 +6581,13 @@ def test_factory_recovery_uses_run_id_first_lock_resume_and_authoritative_status
     assert compute.cancelled and compute.cleaned
     assert compute.launches == 1
     if local_compute:
+        finalized = load_factory_record(tmp_path, "700")
+        assert finalized.controller_phase == "parked"
+        assert prune_in_child() == []
+        assert sandbox.is_dir()
+        save_factory_record(tmp_path, replace(finalized, status=None, controller_phase="failed"))
+        assert prune_in_child() == [str(original_checkout)]
+        assert not original_checkout.exists()
         assert compute.spec.local_checkout == original_checkout
         assert compute.spec.issue_id == retained.issue_id == 700
         assert compute.spec.attempt == retained.attempt == 3
