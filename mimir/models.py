@@ -393,6 +393,10 @@ class InformationFlowLabels:
         # is stably de-duplicated, so direct ``sources=`` construction honors the
         # same unique+append-only contract as ``with_source``.
         object.__setattr__(self, "sources", _dedup_source_labels(self.sources))
+        # Direct construction must not let source-bearing carriers skip the sink gate.
+        object.__setattr__(
+            self, "labels", self.labels | frozenset(s.sensitivity for s in self.sources),
+        )
 
     def with_label(self, label: str) -> "InformationFlowLabels":
         """Return new instance with added label (monotonic - only adds)."""

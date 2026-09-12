@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -115,6 +116,20 @@ def test_saga_mutation_service_capability_matrix_matches_at_both_guards(
     auth_context = _service_auth(trigger, service.canonical)
     expected = operation in allowed_operations
 
+    # Capability authority alone does not authorize IFC flow from an unbound turn.
+    unbound = ToolRegistry().authorize_tool(
+        operation, auth_context, enforce=True, ifc_labels=auth_context.ifc_labels,
+    )
+    assert unbound.allowed is False
+    assert unbound.reason == ("ifc_label_blocked:saga" if expected else "admin_required")
+    assert can_write_saga(auth_context, operation) is expected
+
+    source_channel = auth_context.ifc_labels.sources[0].resource_id
+    labels = auth_context.ifc_labels.with_channel(source_channel)
+    auth_context = replace(
+        auth_context, channel_id=source_channel, ifc_labels=labels,
+        ifc_state=InformationFlowState(labels=labels),
+    )
     middleware = ToolRegistry().authorize_tool(
         operation,
         auth_context,
