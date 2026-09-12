@@ -67,7 +67,10 @@ def test_build_memory_index_includes_core_with_tag(tmp_path: Path):
     assert "- INDEX.md" not in body
 
 
-def test_missing_memory_index_omits_untrusted_descriptions(tmp_path: Path, monkeypatch):
+@pytest.mark.parametrize("persisted", [False, True])
+def test_unusable_memory_index_omits_untrusted_descriptions(
+    tmp_path: Path, monkeypatch, caplog, persisted: bool,
+):
     from mimir.access_control import initialize_file_integrity_ledger, record_file_write_integrity
     from mimir.prompts import build_system_prompt
 
@@ -80,6 +83,12 @@ def test_missing_memory_index_omits_untrusted_descriptions(tmp_path: Path, monke
     assert initialize_file_integrity_ledger(tmp_path)
     monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
     assert record_file_write_integrity(str(untrusted), None)
+    index = memory / "INDEX.md"
+    if persisted:
+        index.write_text("REJECTED_PERSISTED_INDEX_PAYLOAD")
+        assert record_file_write_integrity(str(index), None)
+    ledger = tmp_path / ".mimir" / "file-integrity.json"
+    ledger_before = ledger.read_bytes()
     monkeypatch.setenv("MIMIR_HOME", str(tmp_path / "different-home"))
 
     body = IndexGenerator(tmp_path).read_memory_index()
@@ -87,6 +96,18 @@ def test_missing_memory_index_omits_untrusted_descriptions(tmp_path: Path, monke
     assert "TRUSTED_DESCRIPTION" in prompt
     assert "UNTRUSTED_DESCRIPTION" not in prompt
     assert "untrusted.md" not in prompt
+    assert "REJECTED_PERSISTED_INDEX_PAYLOAD" not in prompt
+    assert "prompt_file_integrity_omitted" in caplog.text
+    assert str(untrusted) in caplog.text
+    assert "UNTRUSTED_DESCRIPTION" not in caplog.text
+    assert "REJECTED_PERSISTED_INDEX_PAYLOAD" not in caplog.text
+    # Regeneration must neither overwrite nor bless the rejected persisted file.
+    assert ledger.read_bytes() == ledger_before
+    if persisted:
+        assert str(index) in caplog.text
+        assert index.read_text() == "REJECTED_PERSISTED_INDEX_PAYLOAD"
+    else:
+        assert not index.exists()
 
 
 def test_build_memory_index_survives_non_utf8_file(tmp_path: Path):

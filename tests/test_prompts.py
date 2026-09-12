@@ -18,7 +18,7 @@ from mimir.prompts import build_system_prompt
 @pytest.mark.parametrize("reader", ["core", "channel", "index"])
 @pytest.mark.parametrize("write_kind", ["recorded_untrusted", "external", "invalid_ledger"])
 def test_prompt_readers_omit_ledger_untrusted_files(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, reader: str, write_kind: str,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog, reader: str, write_kind: str,
 ):
     from mimir.access_control import (
         _persisted_file_integrity,
@@ -71,8 +71,16 @@ def test_prompt_readers_omit_ledger_untrusted_files(
     monkeypatch.setenv("MIMIR_HOME", str(tmp_path / "different-home"))
     rendered = prompt()
     assert "UNTRUSTED_MEMORY_PAYLOAD" not in rendered
-    section = {"core": "Core memory", "channel": "Channel context", "index": "Memory index"}
-    assert f"## {section[reader]}" not in rendered.splitlines()
+    if reader == "index":
+        # The rejected persisted index is replaced by a filtered in-memory index.
+        assert "## Memory index" in rendered.splitlines()
+    else:
+        section = {"core": "Core memory", "channel": "Channel context"}
+        assert f"## {section[reader]}" not in rendered.splitlines()
+    assert "prompt_file_integrity_omitted" in caplog.text
+    assert str(target) in caplog.text
+    assert "reason=untrusted" in caplog.text
+    assert "UNTRUSTED_MEMORY_PAYLOAD" not in caplog.text
 
 
 # ---- v0.4 §6: operator alert channel surfacing ---------------------------

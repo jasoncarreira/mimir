@@ -390,11 +390,9 @@ class IndexGenerator:
         record_framework_file_integrity(self._home, {path: content}, publish)
 
     def read_memory_index(self) -> str:
-        """Return a trusted memory index, generating in-memory only if missing."""
+        """Return a trusted index; regenerate from filtered sources if unusable."""
         path = self._home / "memory" / "INDEX.md"
-        if path.is_file():
-            if not _prompt_file_is_trusted(self._home, path):
-                return ""
+        if path.is_file() and _prompt_file_is_trusted(self._home, path):
             try:
                 return read_text_lossy(path)
             except OSError:

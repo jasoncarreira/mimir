@@ -160,8 +160,17 @@ def _prompt_file_is_trusted(home: Path, path: Path) -> bool:
         home = home.resolve(strict=True)
         relative = path.resolve(strict=True).relative_to(home)
     except (OSError, RuntimeError, ValueError):
+        log.warning(
+            "prompt_file_integrity_omitted path=%s reason=invalid_or_outside_home", path,
+        )
         return False
-    return _persisted_file_integrity(home, relative) == "trusted"
+    if _persisted_file_integrity(home, relative) != "trusted":
+        # Report the omission, never the rejected contents or ledger payload.
+        log.warning(
+            "prompt_file_integrity_omitted path=%s reason=untrusted", path,
+        )
+        return False
+    return True
 
 
 def load_core(home: Path) -> list[CoreBlock]:
