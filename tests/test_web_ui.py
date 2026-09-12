@@ -1777,10 +1777,65 @@ async def test_api_v1_turn_events_sse_scrubs_tool_args_results_and_text(tmp_path
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("endpoint", ["live-events", "turn-events"])
+@pytest.mark.parametrize(
+    "dotenv_value,process_value,expected",
+    [("32", None, 32), ("32", "2", 2), ("8x", None, 8), ("32", "8x", 8)],
+)
+async def test_event_stream_cap_from_env(
+    tmp_path, monkeypatch, caplog, endpoint, dotenv_value, process_value, expected
+):
+    from mimir.config import Config
+
+    key = "MIMIR_LIVE_EVENTS_MAX_STREAMS"
+    monkeypatch.delenv(key, raising=False)
+    monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
+    if process_value is not None:
+        monkeypatch.setenv(key, process_value)
+    (tmp_path / ".env").write_text(f"{key}={dotenv_value}\n")
+    config = Config.from_env()
+    app = web.Application()
+    web_ui.register_routes(
+        app,
+        home=config.home,
+        turns_log=tmp_path / "turns.jsonl",
+        events_log=tmp_path / "events.jsonl",
+        turn_event_bus=TurnEventBus(),
+    )
+    if (process_value or dotenv_value) == "8x":
+        assert f"{key}='8x' is not a valid integer; using default 8" in caplog.text
+
+    async with TestClient(TestServer(app)) as client:
+        streams = []
+        try:
+            for _ in range(expected):
+                response = await client.get(f"/api/v1/{endpoint}")
+                streams.append(response)
+                assert response.status == 200
+            rejected = await client.get(f"/api/v1/{endpoint}")
+            streams.append(rejected)
+            assert rejected.status == 429
+        finally:
+            for response in streams:
+                response.close()
+
+
+def test_bad_stream_cap_does_not_crash_import(monkeypatch):
+    import subprocess
+    import sys
+
+    monkeypatch.setenv("MIMIR_LIVE_EVENTS_MAX_STREAMS", "8x")
+    subprocess.run(
+        [sys.executable, "-c", "import mimir.web_ui"], check=True,
+        capture_output=True, text=True,
+    )
+
+
+@pytest.mark.asyncio
 async def test_api_v1_turn_events_rejects_when_stream_cap_exhausted(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setattr(web_ui, "TURN_EVENTS_MAX_STREAMS", 1)
+    monkeypatch.setenv("MIMIR_LIVE_EVENTS_MAX_STREAMS", "1")
     bus = TurnEventBus()
     app = web.Application()
     web_ui.register_routes(
@@ -2088,7 +2143,7 @@ async def test_api_v1_live_events_auth_uses_header_not_query_param(tmp_path: Pat
 
 @pytest.mark.asyncio
 async def test_api_v1_live_events_rejects_when_stream_cap_exhausted(tmp_path: Path, monkeypatch):
-    monkeypatch.setattr(web_ui, "LIVE_EVENTS_MAX_STREAMS", 0)
+    monkeypatch.setenv("MIMIR_LIVE_EVENTS_MAX_STREAMS", "0")
     a = web.Application()
     web_ui.register_routes(
         a,
@@ -2108,7 +2163,7 @@ async def test_api_v1_live_events_rejects_when_stream_cap_exhausted(tmp_path: Pa
 async def test_api_v1_live_events_releases_slot_when_prepare_fails(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):
-    monkeypatch.setattr(web_ui, "LIVE_EVENTS_MAX_STREAMS", 1)
+    monkeypatch.setenv("MIMIR_LIVE_EVENTS_MAX_STREAMS", "1")
     a = web.Application()
     web_ui.register_routes(
         a,

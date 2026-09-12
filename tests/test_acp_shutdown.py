@@ -16,7 +16,9 @@ import pytest
 
 from mimir.acp.agent import ConnectionState, MimirAcpAgent
 from mimir.acp.host import _FrameDelivery, close_protocol_writer
+from mimir.acp.journal import JournalCache
 from mimir.acp.proxy import ProxyRouter, _OutputWriter, run_router
+from mimir.acp.session_store import SessionStore
 from mimir.acp.transport import close_writer, pump_stream
 
 
@@ -1548,7 +1550,7 @@ async def test_writer_close_uses_exact_finite_drain_close_and_abort_bounds(monke
 
 
 @pytest.mark.asyncio
-async def test_transport_death_tears_down_only_bound_generation() -> None:
+async def test_transport_death_tears_down_only_bound_generation(tmp_path: Path) -> None:
     class Peer:
         def __init__(self) -> None:
             self.disconnects: list[str] = []
@@ -1561,8 +1563,12 @@ async def test_transport_death_tears_down_only_bound_generation() -> None:
     new_connection = ConnectionState(2, new_peer)
     old_provider = SimpleNamespace(peer=old_peer, connection_id="old", closed=False)
     new_provider = SimpleNamespace(peer=new_peer, connection_id="new", closed=False)
-    old_state = SimpleNamespace(generation=1, active_prompt=None, provider=old_provider, record=SimpleNamespace(session_id="old-only"))
-    successor = SimpleNamespace(generation=2, active_prompt=None, provider=new_provider, record=SimpleNamespace(session_id="shared"))
+    store = SessionStore(tmp_path)
+    old_record = store.create_session("owner")
+    new_record = store.create_session("owner")
+    old_id, new_id = old_record.session_id, new_record.session_id
+    old_state = SimpleNamespace(generation=1, active_prompt=None, provider=old_provider, record=old_record)
+    successor = SimpleNamespace(generation=2, active_prompt=None, provider=new_provider, record=new_record)
     old_connection.connection_sessions["old"] = old_state
     new_connection.connection_sessions["new"] = successor
     agent = object.__new__(MimirAcpAgent)
@@ -1570,12 +1576,20 @@ async def test_transport_death_tears_down_only_bound_generation() -> None:
     agent._connection = new_connection
     agent._client = new_peer
     agent._bridge = SimpleNamespace(_connected=True)
-    agent._sessions = {"old-only": old_state, "shared": successor}
-    agent._environments = {"old-only": (1, object()), "shared": (2, object())}
+    agent._sessions = {old_id: old_state, new_id: successor}
+    agent._environments = {old_id: (1, object()), new_id: (2, object())}
+    agent._execution_keys = {old_id: 1, new_id: 2}
+    agent._journals = JournalCache(store)
+    old_journal = agent._journals.open(old_record, old_peer)
+    new_journal = agent._journals.open(new_record, new_peer)
     agent._boundary_lock = asyncio.Lock()
     await agent.on_transport_closed(1)
-    assert "old-only" not in agent._sessions
-    assert agent._sessions["shared"] is successor
+    assert old_id not in agent._sessions
+    assert agent._sessions[new_id] is successor
+    assert agent._execution_keys == {new_id: 2}
+    assert agent._journals._sessions == {new_id: new_journal}
+    assert old_journal.current_client is None
+    assert new_journal.current_client is new_peer
     assert agent._connection is new_connection
     assert new_provider.closed is False
 

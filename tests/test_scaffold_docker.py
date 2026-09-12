@@ -744,6 +744,32 @@ def test_render_start_sh_expands_extras():
     assert "UV_EXTRAS=\"--extra discord --extra claude-code\"" in out
 
 
+def test_workspace_start_builds_frontend_only_when_absent(tmp_path):
+    import subprocess
+
+    out = render_start_sh()
+    guard = 'if [ ! -f "mimir/react_app/dist/index.html" ]; then'
+    start = out.index(guard)
+    end = out.index("\nfi", start) + len("\nfi")
+    assert out.index("uv sync $UV_EXTRAS") < start < out.index("uv run mimir setup")
+    assert "npm ci --include=dev\n    npm run build" in out[start:end]
+    assert "npm " not in render_start_sh(mode="pypi")
+
+    # Execute the rendered build block with npm stubbed, without network access.
+    script = 'set -euo pipefail\nnpm() { printf "%s\\n" "$*"; }\n' + out[start:end]
+    first = subprocess.run(
+        ["bash", "-c", script], cwd=tmp_path, check=True, capture_output=True, text=True,
+    )
+    assert "ci --include=dev\nrun build\n" in first.stdout
+    dist = tmp_path / "mimir/react_app/dist"
+    dist.mkdir(parents=True)
+    (dist / "index.html").write_text("built console")
+    restart = subprocess.run(
+        ["bash", "-c", script], cwd=tmp_path, check=True, capture_output=True, text=True,
+    )
+    assert restart.stdout == ""
+
+
 def test_render_start_sh_enable_claude_code_adds_adapter_extra():
     from mimir.scaffold_docker import render_start_sh
     out = render_start_sh(uv_extras=["discord"])

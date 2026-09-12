@@ -27,12 +27,11 @@ from aiohttp import web
 from .background_tasks import cancel_background_tasks, spawn_background
 from .bridges.bench import BenchBridge
 from .bridges.web_chat import WebChatBridge
-from .chat_skills import strip_chat_skill_extra
 from .channel_registry import ChannelRegistry
 from .config import Config
 from .dispatcher import Dispatcher
 from .event_logger import init_logger, log_durable_event_sync, log_event, log_event_sync
-from .http_ingress import strip_bridge_authority_extra, strip_server_owned_extra
+from .http_ingress import sanitize_http_extra
 from .models import AgentEvent, make_process_session_id
 from .access_control import builtin_trigger_service_principal, repo_binding_startup_alerts
 from .rate_limits import RateLimitStore
@@ -50,7 +49,6 @@ from .prompt_templates import seed_prompts
 from .subagent_defs import seed_subagent_defs
 from .worklink.continuation import (
     stamp_http_event_ingress_extra,
-    strip_worklink_hint_extra,
 )
 from . import web_ui
 
@@ -479,11 +477,7 @@ async def _handle_event(request: web.Request) -> web.Response:
     # continuation hints, and bridge-owned authority metadata before constructing
     # the AgentEvent. Otherwise a client could forge privileged metadata or
     # declassify its synthesized durable outputs as public.
-    extra = strip_server_owned_extra(
-        strip_bridge_authority_extra(
-            strip_worklink_hint_extra(strip_chat_skill_extra(extra))
-        )
-    )
+    extra = sanitize_http_extra(extra)
     extra = stamp_http_event_ingress_extra(extra)
     attachment_names = body.get("attachment_names")
     if attachment_names is not None and not isinstance(attachment_names, list):

@@ -19,8 +19,10 @@ from mimir.turn_event_bus import TurnEventBus
 @pytest.mark.parametrize("admin", [False, True])
 @pytest.mark.parametrize("release", ["cancel", "prepare_failure"])
 async def test_stream_caps_isolate_identities_and_release(tmp_path, monkeypatch, path, admin, release):
-    monkeypatch.setattr(web_ui, "LIVE_EVENTS_MAX_STREAMS", 8)
-    monkeypatch.setattr(web_ui, "TURN_EVENTS_MAX_STREAMS", 8)
+    # #1965 removed the module constants; both routes now read one call-time
+    # _env_int at register_routes. Pin the same cap through the env var so an
+    # ambient value cannot change what this test measures.
+    monkeypatch.setenv("MIMIR_LIVE_EVENTS_MAX_STREAMS", "8")
     app = web.Application()
     web_ui.register_routes(
         app,

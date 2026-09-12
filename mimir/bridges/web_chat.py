@@ -37,9 +37,8 @@ from ..chat_skills import (
     ChatSkillError,
     ChatSkillInvocation,
     ChatSkillRegistry,
-    strip_chat_skill_extra,
 )
-from ..http_ingress import strip_bridge_authority_extra
+from ..http_ingress import sanitize_http_extra
 from ..models import AgentEvent
 from ..web_channels import DEFAULT_WEB_CHANNEL, web_channel_for_identity
 from ..web_contracts import (
@@ -48,7 +47,6 @@ from ..web_contracts import (
     make_chat_message_event,
     make_chat_reaction_event,
 )
-from ..worklink.continuation import strip_http_event_ingress_extra
 from .base import Bridge, SendResult
 
 log = logging.getLogger(__name__)
@@ -133,9 +131,7 @@ def _chat_identity(request: web.Request):
 
 
 def _sanitize_extra(extra: dict[str, Any] | None) -> dict[str, Any]:
-    return strip_bridge_authority_extra(
-        strip_http_event_ingress_extra(strip_chat_skill_extra(extra))
-    )
+    return sanitize_http_extra(extra)
 
 
 def _slash_command_error(parsed: ChatSkillError) -> _ChatRequestError:
