@@ -175,14 +175,28 @@ class AgentRuntimeBundle:
 
 
 def resolve_saga_db_path(home: Path) -> Path:
-    """Resolve SAGA storage paths relative to the home's .mimir directory."""
-    home_saga_toml = home / "saga.toml"
-    if home_saga_toml.is_file() and not os.environ.get("SAGA_CONFIG"):
-        os.environ["SAGA_CONFIG"] = str(home_saga_toml)
+    """Resolve storage without pinning a home's config in process-global state."""
+    import tomllib
 
     from .saga._config_io import get_config
 
-    db_path = Path(get_config()("storage", "db_path", "saga.db"))
+    home_saga_toml = home / "saga.toml"
+    env_config = os.environ.get("SAGA_CONFIG")
+    config_path = Path(env_config) if env_config else home_saga_toml
+    if config_path.is_file():
+        # Read locally: neither the environment nor SAGA's config singleton
+        # may retain this home's settings for another caller (including threads).
+        try:
+            with config_path.open("rb") as stream:
+                config = tomllib.load(stream)
+        except (OSError, ValueError) as exc:
+            logging.getLogger("saga.config").warning(
+                "Failed to load %s: %s. Using defaults.", config_path, exc
+            )
+            config = {}
+        db_path = Path(config.get("storage", {}).get("db_path", "saga.db"))
+    else:
+        db_path = Path(get_config()("storage", "db_path", "saga.db"))
     return db_path if db_path.is_absolute() else home / ".mimir" / db_path
 
 
