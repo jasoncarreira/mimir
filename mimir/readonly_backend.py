@@ -31,6 +31,7 @@ import os
 import re
 import stat
 import subprocess
+import tempfile
 import time
 from collections.abc import Callable, Iterable, Iterator
 from contextvars import ContextVar
@@ -1869,6 +1870,39 @@ class WriteGuardBackend:
             for root in self._writable_roots
         )
 
+    @staticmethod
+    def _same_write_target(target: Path, protected: Path) -> bool:
+        """Compare live file identity, retaining protection for future creates.
+
+        Missing components have no inode. Compare their parents first; when
+        both names are absent and differ, ask the filesystem via an empty,
+        private temporary probe in the nearest existing parent. This retains
+        case/normalization semantics without guessing them or creating the
+        protected resource. Probe/stat errors propagate to the fail-closed
+        guards. Do not cache identities: admin updates can replace the file.
+        """
+        try:
+            return target.samefile(protected)
+        except FileNotFoundError:
+            if target.parent == target or protected.parent == protected:
+                return target == protected
+            if not WriteGuardBackend._same_write_target(target.parent, protected.parent):
+                return False
+            if target.name == protected.name:
+                return True
+            if target.exists() or protected.exists():
+                return False
+            parent = protected.parent
+            while not parent.exists():
+                parent = parent.parent
+            with tempfile.TemporaryDirectory(prefix=".mimir-path-probe-", dir=parent) as probe:
+                reference = Path(probe) / protected.name
+                reference.touch()
+                try:
+                    return (Path(probe) / target.name).samefile(reference)
+                except FileNotFoundError:
+                    return False
+
     def _is_core_memory_write_blocked(self, file_path: str) -> bool:
         """True iff this write should be refused — ``memory/core/`` is
         read-only at runtime (chainlink #342).
@@ -1891,10 +1925,16 @@ class WriteGuardBackend:
         resolved = self._resolve_target(file_path)
         if resolved is None:
             return False
-        under_core = (
-            resolved == self._memory_core_root
-            or resolved.is_relative_to(self._memory_core_root)
-        )
+        try:
+            # Include missing descendants: a create under an existing core
+            # directory is still a protected write, whatever its spelling.
+            under_core = any(
+                self._same_write_target(parent, self._memory_core_root)
+                for parent in (resolved, *resolved.parents)
+            )
+        except OSError:
+            # An unreadable identity is not evidence that the target is safe.
+            under_core = True
         if not under_core:
             return False
         # Lazy import to avoid a module cycle (mimir._context → models →
@@ -1913,7 +1953,10 @@ class WriteGuardBackend:
         resolved = self._resolve_target(file_path)
         if resolved is None:
             return False
-        return resolved == self._identities_path
+        try:
+            return self._same_write_target(resolved, self._identities_path)
+        except OSError:
+            return True
 
     def _is_prompts_path(self, file_path: str) -> bool:
         """True if ``file_path`` resolves under ``prompts/`` — used only to
