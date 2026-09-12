@@ -55,16 +55,37 @@ m._observe = observed
 sys.exit(m.main(sys.argv[2:]))
 """
     command = [sys.executable, '-I', '-c', wrapper] + command[2:]
+if mode in ("SIGTERM", "SIGINT"):
+    wrapper = """import importlib.util, os, signal, sys
+s = importlib.util.spec_from_file_location('s', sys.argv[1])
+m = importlib.util.module_from_spec(s)
+s.loader.exec_module(m)
+waitid = m.os.waitid
+def checked_waitid(*args):
+    try:
+        return waitid(*args)
+    except ChildProcessError:
+        assert args == (os.P_ALL, 0, os.WEXITED | os.WNOHANG | os.WNOWAIT)
+        open(sys.argv[-1] + '.reaped', 'w').close()
+        raise
+m.os.waitid = checked_waitid
+sys.exit(m.main(sys.argv[2:]))
+"""
+    if mutate == "signals":
+        wrapper = wrapper.replace("sys.exit(m.main", "m.signal.signal = lambda sig, handler: signal.SIG_DFL\nsys.exit(m.main")
+    command = [sys.executable, '-I', '-c', wrapper] + command[2:]
 process = subprocess.Popen(command, pass_fds=(child.fileno(),))
 child.close()
 events = []
 try:
     ready = json.loads(parent.recv(4096))
     assert ready == {"kind": "ready"}, ready
-    if mode in ("stop", "eof"):
+    if mode in ("stop", "eof", "SIGTERM", "SIGINT"):
         while not os.path.exists(registry + ".ready"):
             time.sleep(.01)
-        if mode == "eof":
+        if mode in ("SIGTERM", "SIGINT"):
+            process.send_signal(getattr(signal, mode))
+        elif mode == "eof":
             parent.close()
         else:
             parent.send(b"stop, not necessarily JSON")
@@ -74,7 +95,7 @@ try:
     if mode != "eof":
         while True:
             packet = parent.recv(4096)
-            if not packet and mode == "backpressure":
+            if not packet and mode in ("backpressure", "SIGTERM", "SIGINT"):
                 break
             assert packet, events
             event = json.loads(packet)
@@ -85,7 +106,14 @@ try:
     with open(registry) as stream:
         pids = [int(line) for line in stream]
     leaked = [pid for pid in pids if os.path.exists('/proc/' + str(pid))]
+    live = []
+    for pid in leaked:
+        with open('/proc/%s/stat' % pid) as stream:
+            if stream.read().split(')')[1].split()[0] != 'Z':
+                live.append(pid)
     print(json.dumps(dict(events=events, result=result, pids=pids, leaked=leaked,
+                         live=live,
+                         reaped=os.path.exists(registry + '.reaped'),
                          supervisor_gone=not os.path.exists('/proc/' + str(process.pid)))))
 finally:
     parent.close()
@@ -171,7 +199,7 @@ while True:
 def run_isolated(tmp_path, payload, *, mode="normal", mutate=False):
     completed = subprocess.run(
         [sys.executable, "-I", "-c", HARNESS, str(SOURCE), str(tmp_path / "pids"),
-         mode, "yes" if mutate else "no", payload],
+         mode, mutate if isinstance(mutate, str) else "yes" if mutate else "no", payload],
         # One ceiling covers harness startup, descendants, reporting and reaping.
         capture_output=True, text=True, timeout=240,
     )
@@ -215,6 +243,27 @@ def test_cancellation_reaps_escaped_descendant(tmp_path):
     assert_clean(result)
     assert result["result"] == 0
     assert result["events"][-1]["exit_code"] == -signal.SIGTERM
+
+
+@pytest.mark.parametrize("mode", ["SIGTERM", "SIGINT"])
+@pytest.mark.parametrize("payload", [ESCAPED + "\nwhile True: time.sleep(1)\n", RESPAWN],
+                         ids=["escaped", "respawning"])
+def test_signalled_supervisor_reaps_every_descendant(tmp_path, mode, payload):
+    result = run_isolated(tmp_path, payload, mode=mode)
+    assert_clean(result)
+    assert result["reaped"], "supervisor must prove ECHILD, not just signal descendants"
+    assert result["result"] == 0
+    assert "exit_code" in result["events"][-1]
+    assert any(e.get("event") == "worklink_factory_orphan_adopted" for e in result["events"])
+
+
+def test_disabled_signal_handlers_leave_surviving_descendant(tmp_path):
+    result = run_isolated(tmp_path, ESCAPED + "\nwhile True: time.sleep(1)\n",
+                          mode="SIGTERM", mutate="signals")
+    assert result["live"], "negative control must observe live surviving descendants"
+    assert not result["reaped"]
+    with pytest.raises(AssertionError):
+        assert_clean(result)
 
 
 def test_failure_exit_is_reported_not_supervisor_exit(tmp_path):
@@ -416,6 +465,53 @@ def test_permission_denied_survivor_hits_overall_bound(monkeypatch):
     monkeypatch.setattr(supervisor.os, "waitid", lambda *args: None)
     with pytest.raises(supervisor.FactoryReapRefused, match="deadline"):
         supervisor._teardown(None, SimpleNamespace(pid=42), supervisor._Adoptions())
+
+
+@pytest.mark.parametrize("signalled", [False, True])
+def test_signals_during_spawn_and_teardown_do_not_extend_budget(monkeypatch, signalled):
+    now = 0.0
+    handlers = {}
+    originals = {sig: signal.getsignal(sig) for sig in (signal.SIGTERM, signal.SIGINT)}
+    packets = []
+
+    def install(sig, handler):
+        previous = handlers.get(sig, originals[sig])
+        handlers[sig] = handler
+        return previous
+
+    def request_signals():
+        if signalled:
+            for sig, handler in handlers.items():
+                handler(sig, None)
+
+    def spawn(*args, **kwargs):
+        request_signals()  # Before Popen has returned the ownership anchor.
+        return SimpleNamespace(pid=42)
+
+    def sleep(delay):
+        nonlocal now
+        request_signals()  # Repeated throughout TERM grace and the reap loop.
+        now += delay
+
+    monkeypatch.setattr(supervisor.signal, "signal", install)
+    monkeypatch.setattr(supervisor, "_enable_subreaper", lambda: None)
+    monkeypatch.setattr(supervisor.subprocess, "Popen", spawn)
+    monkeypatch.setattr(supervisor.time, "monotonic", lambda: now)
+    monkeypatch.setattr(supervisor.time, "sleep", sleep)
+    monkeypatch.setattr(supervisor, "_observe", lambda *args: [42])
+    monkeypatch.setattr(supervisor, "_signal", lambda *args, **kwargs: None)
+    monkeypatch.setattr(supervisor.os, "getpgid", lambda pid: pid)
+    monkeypatch.setattr(supervisor.os, "waitpid", lambda *args: (0, 0))
+    monkeypatch.setattr(supervisor.os, "waitid", lambda kind, *args: object() if kind == os.P_PID else None)
+    monkeypatch.setattr(supervisor, "_send", lambda channel, packet, **kw: packets.append(packet) or True)
+    parent, child = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+    with parent, child:
+        assert supervisor.supervise(child, ["payload"]) == 1
+    budget = supervisor.TERM_GRACE + supervisor.REAP_TIMEOUT
+    assert budget <= now <= budget + supervisor.INTERVAL
+    assert handlers == originals
+    assert packets[-2]["event"] == "worklink_factory_reap_refused"
+    assert "deadline" in packets[-1]["error"]
 
 
 @pytest.mark.parametrize("failure", ["platform", "prctl", "spawn"])
