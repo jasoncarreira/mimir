@@ -526,11 +526,18 @@ def test_external_head_advance_rereads_review_state_before_checkout(
     assert client.review_calls == 1
 
 
-def test_repo_source_label_is_exact_and_survives_to_bound_forge_sink() -> None:
+@pytest.mark.parametrize("tool_name", [
+    "pr_diff", "pr_comments", "pr_metadata", "pr_reviews", "repo_status",
+    "repo_test", "repo_checkout", "repo_push", "pr_submit_review",
+])
+@pytest.mark.parametrize("failed", [False, True])
+def test_repo_source_label_is_exact_and_survives_to_bound_forge_sink(
+    tool_name: str, failed: bool,
+) -> None:
     scope = _scope(RepoPRAction.INSPECT, RepoPRAction.PR_COMMENT)
     auth = _auth(scope)
     authorization = ToolAuthorization(
-        tool_name="pr_diff",
+        tool_name=tool_name,
         decision="resource_scoped",
         allowed=True,
         enforcement_enabled=True,
@@ -538,11 +545,13 @@ def test_repo_source_label_is_exact_and_survives_to_bound_forge_sink() -> None:
         repo_pr_action_scope=scope,
     )
 
-    added = classify_protected_result("pr_diff", {}, auth, authorization)
+    added = classify_protected_result(tool_name, {}, auth, authorization, failed=failed)
     assert added is not None
     source = next(source for source in added.sources if source.domain == "repository")
     assert source.resource_id == f"owner/repo#pull/7@{'a' * 40}"
-    assert source.integrity_effect == "informational"
+    assert source.integrity == "untrusted"
+    assert source.integrity_effect == "active_ingest"
+    assert added.has_untrusted_active_ingest
 
     merged = auth.ifc_labels
     assert merged is not None

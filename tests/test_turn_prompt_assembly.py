@@ -1940,6 +1940,8 @@ def test_channel_bearing_source_inventory_is_closed() -> None:
         ("producer", "mimir/poller_recovery.py", "_restore_event", "SourceLabel"): 1,
         ("producer", "mimir/pollers.py", "run_poller", "SourceLabel"): 1,
         ("producer", "mimir/prompt_sources.py", "prompt_source_label", "SourceLabel"): 1,
+        # Native forge reads publish exact-PR/head author-attested provenance.
+        ("producer", "mimir/tools/forge.py", "_publish_author_attestation", "SourceLabel"): 1,
         ("recent_loader", "mimir/agent.py", "Agent._select_recent_activity", "self._buffer.assemble_recent_activity_candidates"): 1,
         ("recovery_call", "mimir/poller_recovery.py", "_restore_event", "_event_from_stash"): 1,
         ("recovery_call", "mimir/poller_recovery.py", "stash_enqueued_event", "_event_to_stash"): 1,
