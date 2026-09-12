@@ -145,6 +145,24 @@ def _retained_record(home: Path, repository: Path, *, sandbox_exists: bool = Tru
     return expected
 
 
+@pytest.mark.parametrize("verified_dead", [False, True])
+def test_report_abandoned_running_record(tmp_path: Path, monkeypatch, verified_dead: bool) -> None:
+    import mimir.worklink.factory_state as factory_state
+
+    expected = record(tmp_path)
+    save_factory_record(tmp_path, expected)
+    monkeypatch.setattr(factory_state, "factory_process_is_verified_dead", lambda value: verified_dead)
+    events = []
+    report_retained_factory_records(
+        tmp_path, event_logger=lambda event, **payload: events.append((event, payload))
+    )
+    assert bool(events) is verified_dead
+    if verified_dead:
+        assert events[0][1]["phase"] == "running"
+        assert events[0][1]["run_id"] == expected.run_id
+    assert load_factory_record(tmp_path, expected.run_id) == expected
+
+
 def test_report_retained_factory_records_preserves_control_plane(
     tmp_path: Path,
 ) -> None:

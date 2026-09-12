@@ -81,6 +81,7 @@ from .backends.registry import factory_run_timeout_s
 from .backends.opencode import transcript_path, write_transcript
 from .factory_state import (
     FactoryRunRecord,
+    factory_checkout_interlock,
     factory_process_is_alive,
     factory_process_is_verified_dead,
     factory_record_run_ids,
@@ -1680,6 +1681,21 @@ class WorklinkRunner:
         return await self._run_factory_070(issue_id, autonomous=autonomous)
 
     async def _run_factory_070(
+        self,
+        issue_id: int,
+        *,
+        autonomous: bool,
+    ) -> WorklinkRunResult:
+        with factory_checkout_interlock(self.home) as acquired:
+            if not acquired:
+                return WorklinkRunResult(
+                    issue_id, None, "refused", reason="factory checkout interlock unavailable"
+                )
+            # Keep checkout protection even after the worker dies, until failure
+            # preservation, terminal handling and claim cleanup have finished.
+            return await self._run_factory_070_locked(issue_id, autonomous=autonomous)
+
+    async def _run_factory_070_locked(
         self,
         issue_id: int,
         *,

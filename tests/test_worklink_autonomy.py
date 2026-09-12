@@ -28,6 +28,14 @@ from mimir.worklink import autonomy, orchestrator
 from mimir.worklink.autonomy import check_concurrency
 from mimir.worklink.claims import CLAIM_RESET_PREFIX, ChainlinkClaims, ClaimRecord, ReapResult
 from mimir.worklink.backends.registry import WorklinkConfig, WorklinkDefaults
+from mimir.worklink.backends.feature_factory import FactoryStatus
+from mimir.worklink.compute import LaunchHandle
+from mimir.worklink.factory_state import (
+    FactoryRunRecord,
+    factory_checkout_interlock,
+    list_factory_records,
+    save_factory_record,
+)
 from mimir.worklink.dispatch_failures import (
     dispatch_failure_state_dir,
     failure_state_transaction,
@@ -694,22 +702,65 @@ def _seed_factory_run(child: Path, issue_id: int, status: str) -> None:
     )
 
 
-def test_attempt_is_active_true_for_nested_nonterminal_run(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+@pytest.fixture
+def factory_process_ticks(monkeypatch: pytest.MonkeyPatch) -> None:
+    # These tests exercise record/pruning policy, not Linux /proc parsing.
+    # Keep a real live PID but supply deterministic identity evidence on macOS too.
+    monkeypatch.setattr(
+        "mimir.worklink.factory_state.process_start_ticks", lambda pid: 100,
+    )
+
+
+def _factory_record(
+    sandbox: Path,
+    *,
+    phase: str = "running",
+    status: str | None = "running",
+    process: str = "live",
+) -> FactoryRunRecord:
+    pid = os.getpid()
+    ticks = 100
+    handle = LaunchHandle(
+        substrate="unknown" if process == "unknown-substrate" else "local_subprocess",
+        identifier=str(pid),
+        process_start_ticks=(
+            None if process == "missing-ticks" else ticks + int(process == "dead")
+        ),
+    )
+    run_id = sandbox.name
+    return FactoryRunRecord(
+        run_id=run_id,
+        issue_id=int(run_id.removeprefix("chainlink-")),
+        attempt=1,
+        repository="owner/repo",
+        base_ref="main",
+        branch=f"worklink/{run_id}",
+        launcher=str(sandbox.parent.parent),
+        sandbox=str(sandbox),
+        session=None,
+        handle=None if process == "missing-handle" else handle,
+        status=(
+            FactoryStatus(run_id=run_id, valid=True, sandbox_path=str(sandbox), status=status)
+            if status is not None else None
+        ),
+        observed_at=None,
+        controller_phase=phase,
+    )
+
+
+@pytest.mark.usefixtures("factory_process_ticks")
+def test_attempt_is_active_true_for_nested_nonterminal_run(tmp_path: Path) -> None:
     child = tmp_path / ".worklink" / "840-1"
     child.mkdir(parents=True)
-    record = SimpleNamespace(
-        sandbox=str(child / ".factory-sandboxes" / "chainlink-840"),
-        status=SimpleNamespace(is_terminal=False, is_parked=False),
-    )
-    monkeypatch.setattr(autonomy, "factory_process_is_alive", lambda candidate: candidate is record)
+    record = _factory_record(child / ".factory-sandboxes" / "chainlink-840")
     assert autonomy._attempt_is_active(child, [record]) is True
 
 
 @pytest.mark.parametrize("inner", [False, True])
+@pytest.mark.parametrize("phase", ["running", "failed", "stopped", "terminal"])
+@pytest.mark.usefixtures("factory_process_ticks")
 def test_prune_keeps_old_attempt_with_live_nested_factory(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, inner: bool,
+    tmp_path: Path, inner: bool, phase: str,
 ) -> None:
     _write_worklink_yaml(tmp_path)
     repo = tmp_path / "repo"
@@ -718,20 +769,19 @@ def test_prune_keeps_old_attempt_with_live_nested_factory(
     sandbox = (child / "checkout" if inner else child) / ".factory-sandboxes" / "chainlink-840"
     sandbox.mkdir(parents=True)
     os.utime(child, (0, 0))
-    record = SimpleNamespace(
-        sandbox=str(sandbox),
-        status=SimpleNamespace(is_terminal=False, is_parked=False),
-    )
-    monkeypatch.setattr(autonomy, "list_factory_records", lambda home: [record])
-    monkeypatch.setattr(autonomy, "factory_process_is_alive", lambda candidate: candidate is record)
+    record = _factory_record(sandbox, phase=phase, status="completed")
+    save_factory_record(tmp_path, record)
 
     assert autonomy.prune_stale_attempt_checkouts_for_home(tmp_path, repo=repo) == []
     assert child.exists()
 
 
 @pytest.mark.parametrize("inner", [False, True])
-def test_prune_keeps_old_attempt_with_failed_unresumed_factory(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, inner: bool,
+@pytest.mark.parametrize("phase", ["terminal", "failed", "stopped", "running"])
+@pytest.mark.parametrize("status", [None, "running", "completed"])
+@pytest.mark.usefixtures("factory_process_ticks")
+def test_prune_removes_old_attempt_with_verified_dead_unresumed_factory(
+    tmp_path: Path, inner: bool, phase: str, status: str | None,
 ) -> None:
     _write_worklink_yaml(tmp_path, reaper_ttl_s=3600)
     repo = tmp_path / "repo"
@@ -742,30 +792,149 @@ def test_prune_keeps_old_attempt_with_failed_unresumed_factory(
     manifest.parent.mkdir(parents=True)
     manifest.write_text("{}", encoding="utf-8")
     os.utime(child, (0, 0))
-    record = SimpleNamespace(
-        sandbox=str(sandbox),
-        controller_phase="failed",
-        status=SimpleNamespace(is_terminal=False, is_parked=False),
-    )
-    monkeypatch.setattr(autonomy, "list_factory_records", lambda home: [record])
-    monkeypatch.setattr(autonomy, "factory_process_is_alive", lambda candidate: False)
+    record = _factory_record(sandbox, phase=phase, status=status, process="dead")
+    save_factory_record(tmp_path, record)
 
-    assert autonomy.prune_stale_attempt_checkouts_for_home(tmp_path, repo=repo) == []
-    assert manifest.is_file()
+    assert autonomy.prune_stale_attempt_checkouts_for_home(tmp_path, repo=repo) == [child]
+    assert not child.exists()
+    assert not manifest.exists()
 
 
+@pytest.mark.usefixtures("factory_process_ticks")
 def test_attempt_is_active_false_for_terminal_or_absent(tmp_path: Path) -> None:
     done = tmp_path / ".worklink" / "841-1"
     done.mkdir(parents=True)
-    record = SimpleNamespace(
-        sandbox=str(done / ".factory-sandboxes" / "chainlink-841"),
-        status=SimpleNamespace(is_terminal=True, is_parked=False),
+    record = _factory_record(
+        done / ".factory-sandboxes" / "chainlink-841",
+        phase="terminal", status="completed", process="dead",
     )
     assert autonomy._attempt_is_active(done, [record]) is False
 
     bare = tmp_path / ".worklink" / "842-1"
     bare.mkdir(parents=True)
     assert autonomy._attempt_is_active(bare) is False
+
+
+@pytest.mark.parametrize("phase", ["parked", "running", "failed", "stopped", "terminal"])
+@pytest.mark.usefixtures("factory_process_ticks")
+def test_prune_preserves_parked_factory(tmp_path: Path, phase: str) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    child = tmp_path / ".worklink" / repo.name / "841-1"
+    sandbox = child / ".factory-sandboxes" / "chainlink-841"
+    sandbox.mkdir(parents=True)
+    os.utime(child, (0, 0))
+    record = _factory_record(sandbox, phase=phase, status="needs-human", process="dead")
+    save_factory_record(tmp_path, record)
+
+    assert autonomy._attempt_is_active(child, [record]) is True
+    assert autonomy.prune_stale_attempt_checkouts_for_home(tmp_path, repo=repo) == []
+    assert sandbox.is_dir()
+
+
+@pytest.mark.parametrize("phase", ["running", "failed"])
+@pytest.mark.parametrize("status", [None, "running"])
+@pytest.mark.parametrize(
+    "process", ["missing-handle", "missing-ticks", "unknown-substrate", "unreadable-ticks"]
+)
+@pytest.mark.usefixtures("factory_process_ticks")
+def test_prune_fails_closed_without_process_verification(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, phase: str,
+    status: str | None, process: str,
+) -> None:
+    from mimir.worklink import factory_state
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    child = tmp_path / ".worklink" / repo.name / "841-1"
+    sandbox = child / ".factory-sandboxes" / "chainlink-841"
+    sandbox.mkdir(parents=True)
+    os.utime(child, (0, 0))
+    record = _factory_record(sandbox, phase=phase, status=status, process=process)
+    save_factory_record(tmp_path, record)
+    if process == "unreadable-ticks":
+        monkeypatch.setattr(factory_state, "process_start_ticks", lambda pid: None)
+
+    assert autonomy._attempt_is_active(child, [record]) is True
+    assert autonomy.prune_stale_attempt_checkouts_for_home(tmp_path, repo=repo) == []
+    assert sandbox.is_dir()
+
+
+@pytest.mark.usefixtures("factory_process_ticks")
+def test_prune_preserves_unknown_factory_phase(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    child = tmp_path / ".worklink" / repo.name / "841-1"
+    sandbox = child / ".factory-sandboxes" / "chainlink-841"
+    sandbox.mkdir(parents=True)
+    os.utime(child, (0, 0))
+    record = _factory_record(
+        sandbox, phase="future-phase", status="completed", process="dead",
+    )
+    save_factory_record(tmp_path, record)
+
+    assert list_factory_records(tmp_path) == [record]
+    assert autonomy.prune_stale_attempt_checkouts_for_home(tmp_path, repo=repo) == []
+    assert sandbox.is_dir()
+
+
+@pytest.mark.usefixtures("factory_process_ticks")
+def test_prune_checks_live_record_after_dead_record_for_same_checkout(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    child = tmp_path / ".worklink" / repo.name / "840-1"
+    dead = _factory_record(
+        child / ".factory-sandboxes" / "chainlink-840",
+        phase="terminal", status="completed", process="dead",
+    )
+    live = _factory_record(child / ".factory-sandboxes" / "chainlink-841")
+    Path(dead.sandbox).mkdir(parents=True)
+    Path(live.sandbox).mkdir(parents=True)
+    os.utime(child, (0, 0))
+    save_factory_record(tmp_path, dead)
+    save_factory_record(tmp_path, live)
+
+    assert list_factory_records(tmp_path) == [dead, live]
+    assert autonomy._attempt_is_active(child, [dead, live]) is True
+    assert autonomy.prune_stale_attempt_checkouts_for_home(tmp_path, repo=repo) == []
+    assert Path(dead.sandbox).is_dir()
+    assert Path(live.sandbox).is_dir()
+
+
+@pytest.mark.parametrize("interlock", ["busy", "symlink", "directory", "hardlink"])
+def test_prune_refuses_interlock_before_record_reads(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, interlock: str,
+) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    child = tmp_path / ".worklink" / repo.name / "841-1"
+    child.mkdir(parents=True)
+    os.utime(child, (0, 0))
+
+    def unexpected_read(home: Path) -> None:
+        pytest.fail("pruner read records without acquiring the checkout interlock")
+
+    for name in ("list_factory_records", "list_run_states", "list_orphan_block_records"):
+        monkeypatch.setattr(autonomy, name, unexpected_read)
+
+    if interlock == "busy":
+        with factory_checkout_interlock(tmp_path) as acquired:
+            assert acquired
+            assert autonomy.prune_stale_attempt_checkouts_for_home(tmp_path, repo=repo) == []
+    else:
+        lock = tmp_path / "state" / "worklink" / "factory-checkouts.lock"
+        lock.parent.mkdir(parents=True)
+        target = tmp_path / "lock-target"
+        target.write_text("untouched", encoding="utf-8")
+        if interlock == "symlink":
+            lock.symlink_to(target)
+        elif interlock == "hardlink":
+            lock.hardlink_to(target)
+        else:
+            lock.mkdir()
+        assert autonomy.prune_stale_attempt_checkouts_for_home(tmp_path, repo=repo) == []
+        assert target.read_text(encoding="utf-8") == "untouched"
+    assert child.is_dir()
 
 
 def test_reap_for_home_uses_config_ttl(

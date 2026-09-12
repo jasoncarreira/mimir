@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass, replace
+import fcntl
 import json
 import os
 from pathlib import Path
 import stat
-from typing import Any, Callable
+from typing import Any, Callable, Iterator
 
 from .._atomic import atomic_write_json
 from .backends.feature_factory import FactoryStatus, epic_run_id, parse_factory_status
@@ -15,7 +17,9 @@ from .run_state import process_is_zombie, process_start_ticks
 
 FACTORY_RECORD_VERSION = 2
 _MAX_RECORD_BYTES = 2 * 1024 * 1024
-_RETAINED_CONTROLLER_PHASES = frozenset({"failed", "parked", "stopped", "terminal"})
+# Emitted by the factory controller and the operator stop path.
+LIVE_CONTROLLER_PHASES = frozenset({"running"})
+RETAINED_CONTROLLER_PHASES = frozenset({"failed", "parked", "stopped", "terminal"})
 
 
 def _valid_record_run_id(run_id: str) -> bool:
@@ -211,6 +215,57 @@ def factory_records_dir(home: Path) -> Path:
     return home / "state" / "worklink" / "factory-runs"
 
 
+@contextmanager
+def factory_checkout_interlock(home: Path, *, pruning: bool = False) -> Iterator[bool]:
+    """Try a home-wide, cross-process checkout lock without waiting.
+
+    Controllers hold a shared lock from before the authoritative retained read
+    through supervision/finalization (not just durable handle publication).
+    Pruners hold an exclusive lock across record reads and checkout deletion,
+    returning without doing either when acquisition fails. Never unlink this
+    stable lock file: replacing its inode would split the interlock.
+    """
+    directory_fd: int | None = None
+    lock_fd: int | None = None
+    acquired = False
+    try:
+        try:
+            # Walk without following symlinks, including in the home ancestors.
+            directory_fd = os.open("/", os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+            directory = home.absolute() / "state" / "worklink"
+            for component in directory.parts[1:]:
+                try:
+                    os.mkdir(component, mode=0o700, dir_fd=directory_fd)
+                except FileExistsError:
+                    pass
+                child_fd = os.open(
+                    component,
+                    os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+                    dir_fd=directory_fd,
+                )
+                os.close(directory_fd)
+                directory_fd = child_fd
+            lock_fd = os.open(
+                "factory-checkouts.lock",
+                os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK,
+                0o600,
+                dir_fd=directory_fd,
+            )
+            value = os.fstat(lock_fd)
+            if stat.S_ISREG(value.st_mode) and value.st_nlink == 1:
+                fcntl.flock(lock_fd, (fcntl.LOCK_EX if pruning else fcntl.LOCK_SH) | fcntl.LOCK_NB)
+                acquired = True
+        except OSError:
+            # Busy, unsafe or unavailable state must never authorize deletion.
+            pass
+        yield acquired
+    finally:
+        if lock_fd is not None:
+            os.close(lock_fd)
+        if directory_fd is not None:
+            os.close(directory_fd)
+
+
 def factory_record_run_ids(issue_id: int) -> tuple[str, str]:
     """Return canonical and legacy record keys for an epic issue."""
     return epic_run_id(issue_id), str(issue_id)
@@ -401,7 +456,10 @@ def report_retained_factory_records(
 
         event_logger = log_event_sync
     for record in list_factory_records(home):
-        if record.controller_phase not in _RETAINED_CONTROLLER_PHASES:
+        if record.controller_phase not in RETAINED_CONTROLLER_PHASES and not (
+            record.controller_phase in LIVE_CONTROLLER_PHASES
+            and factory_process_is_verified_dead(record)
+        ):
             continue
         event_logger(
             "worklink_factory_run_retained",
