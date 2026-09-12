@@ -11,8 +11,12 @@ with **no live state to reconcile against** (gmail, github
 issue/comment turns) this module closes it generically via the event
 log:
 
-* At every accepted enqueue, the framework stashes the ``AgentEvent`` keyed by its
-  ``source_id`` (the poller batch's stable per-fire id).
+* At every accepted enqueue or scheduler headroom rejection, the framework
+  stashes the ``AgentEvent`` keyed by its ``source_id``. Headroom rejections
+  carry ``pending_enqueue`` and wait for budgeted delivery independently of
+  failed-turn recovery opt-in. They bypass the abandoned-turn TTL (#310), but
+  a separate 1,000-entry per-poller pending cap bounds growth. Overflow retires
+  the oldest pending entries with an operator-visible give-up signal.
 * Turn outcomes are logged with that ``source_id``
   (``turn_failed`` / ``turn_completed``, #517). Each poll cycle the
   framework reads outcomes since the last reconcile and, per stashed
@@ -82,6 +86,12 @@ DEFAULT_MAX_DEFER_SECONDS = 15 * 60.0
 #: can't grow unbounded. Generous: an item still unresolved after two days
 #: is abandoned, not in-flight.
 DEFAULT_STASH_TTL_HOURS = 48.0
+
+#: Pending initial deliveries bypass the abandoned-turn TTL. Keep at most
+#: 1,000 per poller: over a day of a 5-batch/10-minute source outpacing
+#: 3 deliveries/hour (27 net/hour), while also bounding same-tick bursts.
+#: Prefer recent work on overflow; retirement emits poller_pending_gave_up.
+MAX_PENDING_ENQUEUE = 1000
 
 _TURN_OUTCOME_TYPES = ("turn_completed", "turn_failed")
 _UNCLEAN_RESTART_TYPE = "liveness_unclean_restart"
@@ -233,6 +243,7 @@ async def stash_enqueued_event(
     event: AgentEvent,
     *,
     enqueued_at: str | None = None,
+    pending_enqueue: bool = False,
 ) -> None:
     """Record an enqueued poller ``AgentEvent`` as in-flight, keyed by its
     ``source_id``, so a later failed turn can re-enqueue it.
@@ -242,12 +253,18 @@ async def stash_enqueued_event(
     should be captured immediately before the accepted enqueue so an empty
     reconciliation watermark has a safe lower scan bound.
 
+    ``pending_enqueue`` records a fresh event rejected by scheduler headroom.
+    Existing entries belong to reconciliation and must not be overwritten by
+    its budget callback. Pending delivery is independent of failed-turn opt-in.
+
     No-op when the event has no ``source_id`` — without it the outcome event
     can't be correlated back, so it isn't recoverable this way.
     """
     if not event.source_id:
         return
     state = await asyncio.to_thread(_load_state, persist_dir)
+    if pending_enqueue and event.source_id in state["inflight"]:
+        return
     stashed_dt = _utc_now()
     stashed_at = stashed_dt.isoformat()
     state["inflight"][event.source_id] = {
@@ -265,7 +282,56 @@ async def stash_enqueued_event(
         ).isoformat(),
         "event": _event_to_stash(event),
     }
+    if pending_enqueue:
+        state["inflight"][event.source_id]["pending_enqueue"] = True
+        await _bound_pending_enqueue(
+            state["inflight"], event.channel_id.removeprefix("poller:"),
+            event.channel_id,
+        )
     await asyncio.to_thread(_save_state, persist_dir, state)
+
+
+async def _bound_pending_enqueue(
+    inflight: dict, poller_name: str, channel_id: str,
+) -> int:
+    """Retire oldest pending entries above the cap, never accepted deliveries.
+
+    Enforce at admission as well as reconciliation, including old oversized
+    ledgers. Aggregate overflow into one payload-free operator signal per call.
+    Like _emit_gave_up, logging is best-effort and cannot strand the ledger.
+    """
+    pending = [
+        source_id for source_id, entry in inflight.items()
+        if isinstance(entry, dict) and entry.get("pending_enqueue") is True
+    ]
+    excess = len(pending) - MAX_PENDING_ENQUEUE
+    if excess <= 0:
+        return 0
+
+    def first_seen(source_id: str) -> datetime:
+        dt = _parse_iso(inflight[source_id].get("stashed_at"))
+        # Malformed legacy timestamps are oldest, not immortal. Stable sorting
+        # preserves insertion order for equal timestamps (same-tick batches).
+        return dt if dt is not None and dt.tzinfo is not None else datetime.min.replace(
+            tzinfo=timezone.utc,
+        )
+
+    for source_id in sorted(pending, key=first_seen)[:excess]:
+        del inflight[source_id]
+    log.warning(
+        "poller recovery: pending cap exceeded poller=%s retired=%d cap=%d",
+        poller_name, excess, MAX_PENDING_ENQUEUE,
+    )
+    try:
+        await log_event(
+            "poller_pending_gave_up", poller=poller_name, channel_id=channel_id,
+            reason="pending_count_limit", retired=excess, limit=MAX_PENDING_ENQUEUE,
+            detail=f"{poller_name}: pending backlog exceeded {MAX_PENDING_ENQUEUE}; "
+                   f"retired {excess} oldest undelivered events",
+        )
+    except Exception as exc:  # noqa: BLE001 — match the #318 give-up contract
+        log.warning("poller recovery: pending give-up emit failed (%s)", type(exc).__name__)
+    return excess
 
 
 def _event_from_stash(d: Any) -> AgentEvent | None:
@@ -335,6 +401,8 @@ def _gc_expired_inflight(
             del inflight[source_id]
             dropped += 1
             continue
+        if entry.get("pending_enqueue") is True:
+            continue  # Intentional budget waiting is not an abandoned turn.
         dt = _parse_iso(entry.get("stashed_at"))
         if dt is None:
             entry["stashed_at"] = now_dt.isoformat()  # backfill; GC next window
@@ -583,6 +651,10 @@ async def reconcile_failed_turns(
         inflight, stash_ttl_hours, now_dt,
     )
 
+    # Pending entries have a separate count ceiling, including legacy ledgers
+    # that grew before this bound existed. Run before any replay can defer.
+    summary["gave_up"] += await _bound_pending_enqueue(inflight, poller_name, channel_id)
+
     # Fast path: nothing stashed → nothing to reconcile. Advance the
     # watermark so the first real reconcile after events accrue doesn't
     # rescan history (safe with no in-flight items: any future outcome has
@@ -783,16 +855,20 @@ async def reconcile_failed_turns(
     # to silently losing a one-shot notification.
     restart_iso = await asyncio.to_thread(_read_last_unclean_restart, events_path)
     restart_dt = _parse_iso(restart_iso)
-    if restart_dt is not None and not summary["deferred"]:
+    # Pending initial deliveries need neither a restart nor a failed outcome.
+    # Both paths use the same identity restore and budgeted enqueue callback.
+    if not summary["deferred"]:
         for source_id in list(inflight):
             entry = inflight.get(source_id)
             if not isinstance(entry, dict):
                 continue
+            pending_enqueue = entry.get("pending_enqueue") is True
             enqueued_iso = entry.get("enqueued_at") or entry.get("stashed_at")
             enqueued_dt = _parse_iso(enqueued_iso)
             outcome_dt = _parse_iso(entry.get("last_outcome_at"))
-            if (
-                enqueued_dt is None
+            if not pending_enqueue and (
+                restart_dt is None
+                or enqueued_dt is None
                 or enqueued_dt >= restart_dt
                 or (outcome_dt is not None and outcome_dt >= enqueued_dt)
                 or entry.get("unclean_replayed_at") == restart_iso
@@ -810,7 +886,7 @@ async def reconcile_failed_turns(
                 del inflight[source_id]
                 summary["stale_dropped"] += 1
                 continue
-            if attempts > max_attempts:
+            if not pending_enqueue and attempts > max_attempts:
                 try:
                     await _emit_gave_up(poller_name, channel_id, entry, source_id)
                 except Exception as exc:  # noqa: BLE001
@@ -825,6 +901,7 @@ async def reconcile_failed_turns(
                 del inflight[source_id]
                 summary["dropped"] += 1
                 continue
+            enqueued_at = _utc_now_iso()
             try:
                 accepted = await enqueue(event)
             except Exception as exc:  # noqa: BLE001
@@ -836,11 +913,16 @@ async def reconcile_failed_turns(
             if not accepted:
                 summary["deferred"] += 1
                 break
-            entry["attempts"] = attempts
-            entry["enqueued_at"] = _utc_now_iso()
-            entry["unclean_replayed_at"] = restart_iso
+            entry["enqueued_at"] = enqueued_at
+            if pending_enqueue:
+                entry.pop("pending_enqueue")
+                # Start the abandoned-turn TTL only after initial delivery.
+                entry["stashed_at"] = enqueued_at
+            else:
+                entry["attempts"] = attempts
+                entry["unclean_replayed_at"] = restart_iso
+                summary["unclean_reenqueued"] += 1
             summary["reenqueued"] += 1
-            summary["unclean_reenqueued"] += 1
 
     if summary["deferred"]:
         # We stopped on back-pressure. Persist the watermark exactly where

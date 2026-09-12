@@ -2458,6 +2458,11 @@ class Scheduler:
             ) -> bool:
                 nonlocal accepted_this_fire, headroom_logged
                 if turn_headroom is not None and accepted_this_fire >= turn_headroom:
+                    from .poller_recovery import stash_enqueued_event
+
+                    await stash_enqueued_event(
+                        poller.resolved_persist_dir(), event, pending_enqueue=True,
+                    )
                     if not headroom_logged:
                         headroom_logged = True
                         await log_event(
