@@ -3863,7 +3863,12 @@ receipt = Path(os.environ["STATE_DIR"]) / ".delivery-receipts" / hashlib.sha256(
 while not receipt.exists():
     time.sleep(0.01)
 if receipt.exists():
-    Path({str(dispatch_started)!r}).write_text("started", encoding="utf-8")
+    # Publish readiness only after the payload is fully written and closed.
+    # An existence-only observer can otherwise kill us between open and write.
+    marker = Path({str(dispatch_started)!r})
+    pending = marker.with_suffix(".pending")
+    pending.write_text("started", encoding="utf-8")
+    pending.replace(marker)
     import signal
     signal.pause()
 """)
