@@ -1800,7 +1800,7 @@ def _hands(server_id: str) -> list[dict[str, Any]]:
          "edit mismatch: oldText occurs 0 times"),
     ],
 )
-async def test_provider_tool_error_becomes_tool_message_and_agent_reply(
+async def test_provider_tool_error_becomes_tool_message_but_taints_agent_reply(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: str,
     tool_name: str, arguments: dict[str, str], provider_arguments: dict[str, str],
     provider_message: str,
@@ -1881,12 +1881,12 @@ async def test_provider_tool_error_becomes_tool_message_and_agent_reply(
         emitter.blocks_from_messages(messages)
         await bundle.turn_event_bus._exact_turn_subscribers[kwargs["turn_id"]].join()
         await agent._active_prompts[session_id].dispatcher.drain()
-        if result.status == "error":
-            assert harness_egress.harness_sink_allowed(
-                "harness_auto_deliver", event.channel_id, labels, auth,
-            ) is True
-            delivered = await core.channels.send(event.channel_id, f"Read failed: {result.content}")
-            assert delivered.sent
+        assert result.status == "error"
+        current = auth.ifc_state.current(labels)
+        assert current.has_untrusted_active_ingest is True
+        assert harness_egress.harness_sink_allowed(
+            "harness_auto_deliver", event.channel_id, current, auth,
+        ) is False
 
     monkeypatch.setattr(core, "run_turn", integrated_turn)
     channel = f"acp:{session_id}"
@@ -1904,19 +1904,17 @@ async def test_provider_tool_error_becomes_tool_message_and_agent_reply(
             if update.session_update == "tool_call_update" and update.status == "failed"
         ]
         assert len(failed) == 1
-        failed_index, update = failed[0]
+        _, update = failed[0]
         assert update.tool_call_id == "missing-file"
         assert update.raw_output == provider_message
         replies = [
             (index, update.content.text) for index, update in enumerate(client.updates)
             if update.session_update == "agent_message_chunk"
         ]
-        assert replies
-        assert all(index > failed_index for index, _ in replies)
-        assert "".join(text for _, text in replies) == f"Read failed: {provider_message}"
+        assert replies == []
         assert len([entry for entry in client.messages if entry[1] == "tools/call"]) == 1
         assert internal_detail not in str(client.updates)
-        assert "sink_blocked" not in sink_events
+        assert "sink_blocked" in sink_events
 
         monkeypatch.setattr(core, "run_turn", original_turn)
         client.updates.clear()

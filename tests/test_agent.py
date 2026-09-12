@@ -6163,7 +6163,7 @@ async def test_acp_hands_read_result_allows_final_response_delivery(
     assert client.updates[1].content.text == "NOTES ANSWER"
 
 
-async def test_acp_failed_tool_result_allows_final_response_delivery(
+async def test_acp_failed_native_read_without_provenance_refuses_final_delivery(
     tmp_path: Path,
 ) -> None:
     probe = _AcpFailedReadProbeAgent()
@@ -6176,13 +6176,15 @@ async def test_acp_failed_tool_result_allows_final_response_delivery(
         [acp_sdk.TextContentBlock(type="text", text="read outside root")],
     )
 
-    assert response.stop_reason == "end_turn"
+    assert response.stop_reason == "refusal"
     assert probe.result is not None and probe.result.status == "error"
-    assert [update.session_update for update in client.updates] == [
-        "user_message_chunk",
-        "agent_message_chunk",
-    ]
-    assert client.updates[1].content.text == "FAILURE EXPLAINED"
+    assert response.field_meta == {
+        "mimir.refusal": {
+            "reason": "ifc_label_blocked:same_channel",
+            "sinkCategory": "same_channel",
+        }
+    }
+    assert [update.session_update for update in client.updates] == ["user_message_chunk"]
 
 
 async def test_acp_failed_provider_result_allows_final_response_delivery(

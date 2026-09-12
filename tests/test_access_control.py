@@ -8934,12 +8934,14 @@ def test_authorized_tainted_edit_and_shell_results_reply_only_to_originating_acp
     "invalid_field",
     [None, "origin_trigger", "canonical_principal", "channel_id", "bridge_instance", "domain"],
 )
-def test_failed_hands_result_is_informational_only_with_complete_acp_context(
-    tool_name: str, invalid_field: str | None,
+@pytest.mark.parametrize("contract_error", [False, True])
+def test_failed_hands_result_is_informational_only_with_complete_acp_contract_error(
+    tool_name: str, invalid_field: str | None, contract_error: bool,
 ) -> None:
     from langchain_core.messages import ToolMessage
     from mimir.access_control import ProtectedResultProvenance, ToolAuthorization
     from mimir.harness_egress import harness_sink_allowed
+    from mimir.tools.client_provider import ClientProviderResultError
 
     channel = "acp:session-1"
     context = dict(
@@ -8955,11 +8957,14 @@ def test_failed_hands_result_is_informational_only_with_complete_acp_context(
     labels = classify_protected_result(
         tool_name, {"path": "notes.txt"}, auth,
         ToolAuthorization(tool_name=tool_name, decision=OperationDecision.ADMIN_REQUIRED, allowed=True),
-        result=ToolMessage(content="provider error", tool_call_id="failed", status="error"),
+        result=(
+            ClientProviderResultError("missing structuredContent") if contract_error
+            else ToolMessage(content="provider error", tool_call_id="failed", status="error")
+        ),
         provenance=ProtectedResultProvenance(sources=()), failed=True,
     )
     assert labels is not None
-    if invalid_field is not None or tool_name == "read_file":
+    if invalid_field is not None or tool_name == "read_file" or not contract_error:
         assert any(not source.is_complete for source in labels.sources)
         assert labels.has_untrusted_active_ingest is True
         assert harness_sink_allowed("harness_auto_deliver", channel, labels, auth) is False
