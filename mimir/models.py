@@ -495,6 +495,7 @@ class InformationFlowState:
     _declassification: "DeclassificationCapability | None" = field(
         default=None, repr=False, compare=False,
     )
+    _shadow_declassification_used: bool = field(default=False, repr=False, compare=False)
     _sink_category_capabilities: dict[str, "SinkCategoryCapability"] = field(
         default_factory=dict, repr=False, compare=False,
     )
@@ -703,6 +704,7 @@ class InformationFlowState:
                 issued_at=issued_at,
                 expires_at=expires_at,
             )
+            self._shadow_declassification_used = False
             return True
 
     def consume_sink_approval(
@@ -713,14 +715,16 @@ class InformationFlowState:
         destination: str,
         canonical_principal: str,
         turn_id: str | None = None,
+        shadow: bool = False,
     ) -> bool:
-        """Admit an exact one-shot or matching reusable category capability."""
+        """Admit a capability, accounting shadow one-shot use without spending it."""
         with self._lock:
             live = self.labels if self.labels is not None else current
             capability = self._declassification
-            if capability is not None:
+            if capability is not None and not (shadow and self._shadow_declassification_used):
                 if time.monotonic() > capability.expires_at:
-                    self._declassification = None
+                    if not shadow:
+                        self._declassification = None
                 else:
                     matches = (
                         capability.sink_category == sink_category
@@ -732,7 +736,10 @@ class InformationFlowState:
                         and capability.sources == live.sources == current.sources
                     )
                     if matches:
-                        self._declassification = None
+                        if shadow:
+                            self._shadow_declassification_used = True
+                        else:
+                            self._declassification = None
                         return True
             category_capability = self._sink_category_capabilities.get(sink_category)
             return bool(

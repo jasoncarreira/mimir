@@ -1409,7 +1409,7 @@ def test_recent_content_and_labels_are_selected_together(tmp_path: Path) -> None
     assert source.resource_id == "discord-D1"
 
 
-def test_recent_activity_admission_respects_enforcement_and_shadow_logs_would_block(
+def test_recent_activity_admission_omits_incompatible_sources_in_both_modes(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1472,26 +1472,14 @@ def test_recent_activity_admission_respects_enforcement_and_shadow_logs_would_bl
         replace(shadow_auth, enforcement_enabled=True),
     )
 
-    assert shadow_recent == [candidate]
-    assert [block.content for block in shadow_blocks] == ["CROSS-CHANNEL-CONTEXT"]
+    assert shadow_recent == []
+    assert shadow_blocks == ()
     assert enforced_recent == []
     assert enforced_blocks == ()
-    assert events == [(
-        "sink_blocked",
-        {
-            "sink": "harness_auto_deliver",
-            "reason": "ifc_label_blocked:same_channel",
-            "sink_category": "same_channel",
-            "target_channel": "slack-GROUP",
-            "allowed": True,
-            "status": "would_block",
-            "enforcement_enabled": False,
-            "is_shadow_decision": True,
-        },
-    )]
+    assert events == []
 
 
-def test_recent_activity_shadow_records_predicate_without_rechecking_sink_gate(
+def test_recent_activity_shadow_omits_without_logging_or_rechecking_sink_gate(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1551,11 +1539,115 @@ def test_recent_activity_shadow_records_predicate_without_rechecking_sink_gate(
 
     recent, blocks = agent._select_recent_activity(event, auth)
 
-    assert recent == [candidate]
-    assert [block.content for block in blocks] == ["CROSS-CHANNEL-CONTEXT"]
-    assert events[0][0] == "sink_blocked"
-    assert events[0][1]["status"] == "would_block"
-    assert events[0][1]["reason"] == "ifc_label_blocked:same_channel"
+    assert recent == []
+    assert blocks == ()
+    assert events == []
+
+
+@pytest.mark.asyncio
+async def test_recent_activity_shadow_enforced_send_message_parity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from mimir.access_control import ToolRegistry
+    from mimir.identities import Identity
+
+    class Resolver:
+        def identity(self, author):
+            return Identity(canonical="alice") if author == "slack-alice" else None
+
+        def resolve(self, author):
+            return "alice" if author == "slack-alice" else author
+
+        def display_name(self, author):
+            return None
+
+        def all_identities(self):
+            return []
+
+        def resolve_channel(self, channel_id):
+            return None
+
+    class Provider:
+        def audience_for(self, channel_id, *, principal):
+            if channel_id == "slack-D-alice" and principal == "alice":
+                return frozenset({"alice"})
+            return None
+
+    events = []
+
+    async def capture(kind, **fields):
+        events.append((kind, fields))
+
+    monkeypatch.setattr("mimir.event_logger.log_event", capture)
+    monkeypatch.setattr(
+        "mimir.harness_egress.log_event_sync",
+        lambda kind, **fields: events.append((kind, fields)),
+    )
+    agent = _make_agent(tmp_path)
+    resolver = Resolver()
+    agent._identity_resolver = resolver
+    agent._buffer.resolver = resolver
+    for channel, content in (
+        ("slack-D-alice", "FOREIGN PRIVATE SENTINEL"),
+        ("slack-GROUP", "COMPATIBLE RECENT SENTINEL"),
+    ):
+        agent._buffer._append_in_memory(agent._buffer.make_message(
+            channel_id=channel, kind="user_message", content=content,
+            author="slack-alice", msg_id=channel, source="slack",
+        ))
+    event = AgentEvent(
+        trigger="user_message", channel_id="slack-GROUP", author="slack-alice",
+        content="reply here", source="slack",
+    )
+    results = []
+    for enforced in (False, True):
+        events.clear()
+        agent._config.access_control_enforced = enforced
+        auth = AuthContext(
+            principal="slack-alice", canonical_principal="alice", roles=("admin",),
+            event_ingress=None, trigger=event.trigger, channel_id=event.channel_id,
+            interactivity=None, enforcement_enabled=enforced, domain="channel",
+            resource_id=event.channel_id, bridge_instance="slack",
+            audience_provider=Provider(),
+        )
+        ctx = _make_ctx(event)
+        ctx.auth_context = auth
+        ctx.ifc_labels = InformationFlowLabels().with_source(SourceLabel(
+            principal="alice", domain="channel", resource_id=event.channel_id,
+            bridge_instance="slack", sensitivity="private",
+            authorized_principals=frozenset({"alice"}),
+        ))
+        prompt, recent = await agent._build_turn_prompt(
+            ctx, event, saga_block=None, initial_auth_context=auth,
+        )
+        assert "FOREIGN PRIVATE SENTINEL" not in prompt
+        assert "COMPATIBLE RECENT SENTINEL" in prompt
+        assert [message.channel_id for message in recent] == ["slack-GROUP"]
+        sources = ctx.ifc_labels.sources
+        assert any(source.source_kind == "recent_activity_user" for source in sources)
+        assert all(source.resource_id != "slack-D-alice" for source in sources)
+        registry = ToolRegistry()
+        registry.enable_shadow_logging()
+        decision = registry.authorize_tool(
+            "send_message",
+            replace(auth, ifc_state=InformationFlowState(labels=ctx.ifc_labels)),
+            enforce=enforced, target_channel=event.channel_id,
+            ifc_labels=ctx.ifc_labels,
+            arguments={"channel_id": event.channel_id, "content": "reply"},
+        )
+        await asyncio.sleep(0)
+        census = Counter(
+            (kind, fields.get("reason")) for kind, fields in events
+            if kind in {"shadow_tool_decision", "sink_blocked"}
+        )
+        assert decision.allowed is True
+        assert decision.would_block is False
+        assert census == Counter()
+        results.append((
+            sources, decision.decision, decision.allowed, decision.would_block,
+            decision.reason, census,
+        ))
+    assert results[0] == results[1]
 
 
 def test_excluded_recent_messages_add_no_identity_or_recent_labels(

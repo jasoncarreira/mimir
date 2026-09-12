@@ -6263,8 +6263,7 @@ class SinkGate:
         ):
             canonical_principal = getattr(auth_context, "canonical_principal", None)
             if (
-                enforce
-                and normalized_target is not None
+                normalized_target is not None
                 and isinstance(canonical_principal, str)
                 and state is not None
                 and state.consume_sink_approval(
@@ -6272,6 +6271,7 @@ class SinkGate:
                     sink_category=sink_category.value,
                     destination=normalized_target,
                     canonical_principal=canonical_principal,
+                    shadow=not enforce,
                 )
             ):
                 return ToolAuthorization(
@@ -6602,8 +6602,7 @@ class SinkGate:
             state = getattr(auth_context, "ifc_state", None)
             canonical_principal = getattr(auth_context, "canonical_principal", None)
             if (
-                enforce
-                and normalized_target is not None
+                normalized_target is not None
                 and isinstance(canonical_principal, str)
                 and state is not None
                 and state.consume_sink_approval(
@@ -6616,6 +6615,7 @@ class SinkGate:
                         if sink_category in _SINK_CATEGORY_CAPABILITY_ELIGIBLE
                         else None
                     ),
+                    shadow=not enforce,
                 )
             ):
                 return ToolAuthorization(
@@ -8459,13 +8459,35 @@ class ToolRegistry:
         The ifc_labels parameter enables information flow control sink gate
         checks (chainlink #871).
         """
+        sink_target = target_channel
+        requested_target = target_channel
+        sink_category = None
+        shadow_sink = None
+
+        def finish(auth: ToolAuthorization) -> ToolAuthorization:
+            # Shadow mode continues past a sink refusal; enforcement would not.
+            audit_auth = shadow_sink if shadow_sink is not None else auth
+            if not enforce and audit_auth.is_shadow_decision:
+                self._emit_shadow_decision(
+                    audit_auth, auth_context=auth_context, target=sink_target,
+                    requested_target=(
+                        requested_read_target_from_arguments(tool_name, arguments)
+                        if shadow_sink is None and auth.reason == "read_scope"
+                        else requested_target
+                    ),
+                    arguments=arguments,
+                    ifc_labels=ifc_labels, sink_category=sink_category,
+                    operator_shell_audit=operator_shell_audit if shadow_sink is not None else None,
+                )
+            return auth
+
         if tool_name == "hands_request_scope":
             # This can only ask the editor for scope; it neither executes input
             # nor grants IFC/host-execution authority. Never shadow-allow it.
             from .tools.client_provider import client_scope_request_allowed
 
             allowed = client_scope_request_allowed(auth_context, arguments)
-            return ToolAuthorization(
+            return finish(ToolAuthorization(
                 tool_name=tool_name,
                 decision=OperationDecision.ADMIN_REQUIRED,
                 allowed=allowed,
@@ -8474,7 +8496,7 @@ class ToolRegistry:
                 enforcement_enabled=True,
                 would_block=not allowed,
                 flow_direction=ToolFlowDirection.NEITHER,
-            )
+            ))
         if tool_name.startswith(MCPResourceAdapter._MCP_TOOL_PREFIX) and mcp_tool is not None:
             if ifc_labels is None and auth_context is not None:
                 ifc_labels = getattr(auth_context, "ifc_labels", None)
@@ -8486,14 +8508,8 @@ class ToolRegistry:
                 enforce=enforce,
                 ifc_labels=ifc_labels,
             )
-            if auth.is_shadow_decision:
-                self._emit_shadow_decision(
-                    auth, auth_context=auth_context, target=target_channel,
-                    requested_target=target_channel,
-                    ifc_labels=ifc_labels,
-                    sink_category=SinkCategory.EXTERNAL_MCP,
-                )
-            return auth
+            sink_category = SinkCategory.EXTERNAL_MCP
+            return finish(auth)
         if tool_name.startswith(MCPResourceAdapter._MCP_TOOL_PREFIX):
             auth = ToolAuthorization(
                 tool_name=tool_name,
@@ -8505,12 +8521,7 @@ class ToolRegistry:
                 is_shadow_decision=not enforce,
                 would_block=True,
             )
-            if auth.is_shadow_decision:
-                self._emit_shadow_decision(
-                    auth, auth_context=auth_context, target=target_channel,
-                    requested_target=target_channel,
-                )
-            return auth
+            return finish(auth)
 
         flow_direction = get_tool_flow_direction(tool_name)
         sink_category = get_sink_category(tool_name)
@@ -8525,7 +8536,7 @@ class ToolRegistry:
         )
         if skill_write is not None:
             skill_write.flow_direction = flow_direction
-            return skill_write
+            return finish(skill_write)
         catalog = get_operation_catalog()
         preliminary_decision = catalog.get_decision(tool_name, auth_context)
         preliminary_service = (
@@ -8550,7 +8561,7 @@ class ToolRegistry:
                     if getattr(source, "domain", None) == "repository"
                 )
                 if not repository_sources:
-                    return ToolAuthorization(
+                    return finish(ToolAuthorization(
                         tool_name=tool_name,
                         decision=OperationDecision.ADMIN_REQUIRED,
                         allowed=not enforce,
@@ -8559,7 +8570,7 @@ class ToolRegistry:
                         enforcement_enabled=enforce,
                         is_shadow_decision=not enforce,
                         would_block=True,
-                    )
+                    ))
                 from .tools.forge import resolve_issue_comment_target
 
                 try:
@@ -8568,7 +8579,7 @@ class ToolRegistry:
                         (arguments or {}).get("issue"),
                     )
                 except ToolException as exc:
-                    return ToolAuthorization(
+                    return finish(ToolAuthorization(
                         tool_name=tool_name,
                         decision=OperationDecision.ADMIN_REQUIRED,
                         allowed=not enforce,
@@ -8578,7 +8589,7 @@ class ToolRegistry:
                         is_shadow_decision=not enforce,
                         would_block=True,
                         refusal_detail=str(exc),
-                    )
+                    ))
                 repo_pr_action_scope = issue_target
             elif tool_name in _TYPED_REPO_PR_TOOL_ACTIONS:
                 tool_arguments = arguments or {}
@@ -8621,7 +8632,7 @@ class ToolRegistry:
                             tool_arguments.get("pull_request"),
                         )
                     except ToolException as exc:
-                        return ToolAuthorization(
+                        return finish(ToolAuthorization(
                             tool_name=tool_name,
                             decision=OperationDecision.RESOURCE_SCOPED,
                             allowed=not enforce,
@@ -8632,7 +8643,7 @@ class ToolRegistry:
                             would_block=True,
                             refusal_detail=str(exc),
                             flow_direction=flow_direction,
-                        )
+                        ))
                     repo_pr_action_scope = state.action_scope
             else:
                 repo_pr_action_scope = getattr(
@@ -8671,7 +8682,7 @@ class ToolRegistry:
             and str((arguments or {}).get("lane") or "agent").strip().lower()
             not in {"agent", "poller"}
         ):
-            return ToolAuthorization(
+            return finish(ToolAuthorization(
                 tool_name=tool_name,
                 decision=OperationDecision.ADMIN_REQUIRED,
                 allowed=not enforce,
@@ -8680,7 +8691,7 @@ class ToolRegistry:
                 enforcement_enabled=enforce,
                 is_shadow_decision=not enforce,
                 would_block=True,
-            )
+            ))
         operator_shell_allowed = _operator_can_invoke_admin_shell(
             tool_name, ifc_labels, auth_context,
         )
@@ -8734,15 +8745,9 @@ class ToolRegistry:
             )
             sink_check.repo_pr_action_scope = repo_pr_action_scope
             if not sink_check.allowed and enforce and not preliminary_admin_denied:
-                return sink_check
-            if sink_check.is_shadow_decision:
-                self._emit_shadow_decision(
-                    sink_check, auth_context=auth_context, target=sink_target,
-                    requested_target=target_channel,
-                    ifc_labels=ifc_labels,
-                    sink_category=sink_category,
-                    operator_shell_audit=operator_shell_audit,
-                )
+                return finish(sink_check)
+            if sink_check.is_shadow_decision and sink_check.would_block and not preliminary_admin_denied:
+                shadow_sink = sink_check
 
         decision = preliminary_decision
         service_principal = None
@@ -8833,14 +8838,10 @@ class ToolRegistry:
                     flow_direction=flow_direction,
                     result_integrity="trusted" if in_scope else "untrusted",
                 )
-                if hands_auth.is_shadow_decision:
-                    self._emit_shadow_decision(
-                        hands_auth,
-                        auth_context=auth_context,
-                        target=resource,
-                        requested_target=(arguments or {}).get("path"),
-                    )
-                return hands_auth
+                if shadow_sink is None:
+                    sink_target = resource
+                    requested_target = (arguments or {}).get("path")
+                return finish(hands_auth)
             if tool_name in _TYPED_REPO_PR_TOOL_ACTIONS:
                 forge_auth = authorize_repo_pr_tool(
                     tool_name,
@@ -8849,12 +8850,9 @@ class ToolRegistry:
                     enforce=enforce,
                     flow_direction=flow_direction,
                 )
-                if forge_auth.is_shadow_decision:
-                    self._emit_shadow_decision(
-                        forge_auth, auth_context=auth_context, target=None,
-                        requested_target=None,
-                    )
-                return forge_auth
+                if shadow_sink is None:
+                    sink_target = requested_target = None
+                return finish(forge_auth)
             if tool_name in ChannelResourceAdapter._CHANNEL_OPERATIONS:
                 channel_auth = ChannelResourceAdapter.authorize_channel_operation(
                     tool_name,
@@ -8863,7 +8861,7 @@ class ToolRegistry:
                     enforce=enforce,
                 )
                 channel_auth.flow_direction = flow_direction
-                return channel_auth
+                return finish(channel_auth)
             if tool_name in WriteResourceAdapter._RESOURCE_OPERATIONS:
                 write_auth = WriteResourceAdapter.authorize_operation(
                     tool_name,
@@ -8875,12 +8873,7 @@ class ToolRegistry:
                 )
                 write_auth.flow_direction = flow_direction
                 write_auth.repo_pr_action_scope = repo_pr_action_scope
-                if write_auth.is_shadow_decision:
-                    self._emit_shadow_decision(
-                        write_auth, auth_context=auth_context, target=sink_target,
-                        requested_target=target_channel,
-                    )
-                return write_auth
+                return finish(write_auth)
             if tool_name in READ_RESOURCE_OPERATIONS:
                 target_in_active_lease = False
                 if (
@@ -9024,18 +9017,7 @@ class ToolRegistry:
             repo_pr_action_scope=repo_pr_action_scope,
         )
 
-        if is_shadow:
-            requested_target = (
-                requested_read_target_from_arguments(tool_name, arguments)
-                if reason == "read_scope"
-                else target_channel
-            )
-            self._emit_shadow_decision(
-                auth, auth_context=auth_context, target=sink_target,
-                requested_target=requested_target, arguments=arguments,
-            )
-
-        return auth
+        return finish(auth)
 
 
 _PROTECTED_RESULT_DOMAINS: dict[str, str] = {
