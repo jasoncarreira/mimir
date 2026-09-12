@@ -861,6 +861,18 @@ class RepoGitTools:
                     ("merge", "--no-edit", "--", self._state.checkout_lease.base_sha),
                     identity=True,
                 )
+                # A recovered candidate may already contain base but not the
+                # published PR head. Merge that immutable head too: recovery
+                # must offer a fast-forward path without granting rewrite authority.
+                self._refresh_expected_head()
+                publication_merge = self._command(
+                    ("merge", "--no-edit", "--", self._scope.observed_head_sha),
+                    identity=True,
+                )
+                result = GitProcessResult(
+                    0, result.stdout + publication_merge.stdout,
+                    result.stderr + publication_merge.stderr,
+                )
             except GitRefusal as exc:
                 if exc.code != "git_failed":
                     raise
@@ -884,7 +896,8 @@ class RepoGitTools:
                 raise GitRefusal(
                     "rebase_in_lease_refused",
                     "rebase inside a PR checkout lease is refused because this scope "
-                    "cannot publish rewritten history; use repo_merge to merge main instead",
+                    "cannot publish rewritten history; use repo_merge to merge the base "
+                    "and scoped published PR head, resolve any conflicts, then repo_push",
                 )
             continuing = self._has_in_progress_merge_or_rebase()
             if continuing:
@@ -955,8 +968,9 @@ class RepoGitTools:
             if rewritten_history and not _history_rewrite_push_permitted(self._scope):
                 raise GitRefusal(
                     "force_push_refused",
-                    "push would not be a fast-forward; operator approval and publication "
-                    "must be completed from the same turn holding this checkout lease",
+                    "push would not be a fast-forward; use repo_merge to merge the base "
+                    "and scoped published PR head, resolve any conflicts, then repo_push; "
+                    "retained work can also be resumed by a later turn for this PR",
                 )
             try:
                 push_remote, auth_env, sensitive_values = self._push_remote()

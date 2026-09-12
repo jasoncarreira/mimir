@@ -36,6 +36,7 @@ from mimir.contained_snapshot import SnapshotCredentialsRefused, create_git_snap
 from mimir.models import RepoPRAction, RepoPRActionScope, RepoReviewState
 from mimir.pr_checkout_lease import (
     PRCheckoutLease,
+    acquire_pr_checkout_lease,
     cleanup_pr_checkout_lease,
     create_pr_checkout_lease,
 )
@@ -564,11 +565,70 @@ def test_rebase_is_refused_when_lease_cannot_publish_rewritten_history(
         RepoGitTools(state).execute(GitRebase())
 
     assert refusal.value.code == "rebase_in_lease_refused"
-    assert "use repo_merge to merge main instead" in str(refusal.value)
+    assert "use repo_merge to merge the base and scoped published PR head" in str(refusal.value)
     assert _git(lease.path, "rev-parse", "HEAD") == original_head
     assert _git(lease.path, "status", "--porcelain=v1", "--untracked-files=all") == original_status
     assert metadata_path.read_bytes() == original_metadata
     assert not (lease.path / ".git" / "rebase-merge").exists()
+
+
+def test_retained_non_fast_forward_fix_can_resume_and_publish_next_turn(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    origin, source, scope, original_state = _repo_scope_and_state(tmp_path)
+    _git(source, "checkout", "-q", "main")
+    (source / "base-update.txt").write_text("advanced base\n")
+    _git(source, "add", "base-update.txt")
+    _git(source, "commit", "-qm", "advance base")
+    advanced_base = _git(source, "rev-parse", "HEAD")
+    _git(source, "push", "-q", "origin", "HEAD:main")
+    scope = replace(scope, event_type="pr_review_requested", observed_base_sha=advanced_base)
+    lease = original_state.checkout_lease
+    _git(lease.path, "fetch", "origin", "main")
+    _git(lease.path, "-c", "user.name=Test", "-c", "user.email=test@example.com", "rebase", "origin/main")
+    monkeypatch.setattr(
+        "mimir.pr_checkout_lease._observe_current_pr_head",
+        lambda _scope: scope.observed_head_sha,
+    )
+    state = RepoReviewState(scope)
+    resumed, _ = acquire_pr_checkout_lease(
+        scope, owner=scope.principal, lease_root=lease.lease_root, review_state=state,
+    )
+    assert resumed.path == lease.path
+    tools = RepoGitTools(state)
+    (lease.path / "fix.txt").write_text("retained fix\n")
+    tools.execute(GitCommit(("fix.txt",), "fix after retained rebase"))
+    fix_head = _git(lease.path, "rev-parse", "HEAD")
+    with pytest.raises(GitRefusal) as refused:
+        tools.execute(GitPush())
+    assert refused.value.code == "force_push_refused"
+    # Reproduce the old fallback exactly: base is already included, so merging
+    # it alone cannot reconcile the published PR history.
+    assert "Already up to date" in _git(lease.path, "merge", "--no-edit", advanced_base)
+    with pytest.raises(GitRefusal) as refused:
+        tools.execute(GitPush())
+    assert refused.value.code == "force_push_refused"
+    with pytest.raises(GitRefusal) as refused:
+        tools.execute(GitRebase())
+    assert refused.value.code == "rebase_in_lease_refused"
+
+    later_scope = replace(scope, event_type="pr_review_submitted")
+    assert later_scope.scope_id != scope.scope_id
+    later_state = RepoReviewState(later_scope)
+    later_lease, candidates = acquire_pr_checkout_lease(
+        later_scope, owner=scope.principal, lease_root=lease.lease_root,
+        review_state=later_state,
+    )
+    assert later_lease.path == lease.path
+    assert candidates == (fix_head,)
+    assert _git(lease.path, "rev-parse", "HEAD") == fix_head
+    later_tools = RepoGitTools(later_state)
+    assert later_tools.execute(GitMerge()).ok
+    assert _git(lease.path, "merge-base", "--is-ancestor", scope.observed_head_sha, "HEAD") == ""
+    assert _git(lease.path, "merge-base", "--is-ancestor", fix_head, "HEAD") == ""
+    assert later_tools.execute(GitPush()).ok
+    assert _git(origin, "rev-parse", scope.destination_ref) == _git(lease.path, "rev-parse", "HEAD")
+    assert (lease.path / "fix.txt").read_text() == "retained fix\n"
 
 
 def test_rebase_conflict_has_separately_modeled_working_abort(tmp_path: Path) -> None:
@@ -1311,7 +1371,7 @@ def test_unrelated_event_force_push_refuses_before_any_network_call(
     with pytest.raises(GitRefusal) as refusal:
         tools.execute(GitPush())
     assert refusal.value.code == "force_push_refused"
-    assert "same turn holding this checkout lease" in str(refusal.value)
+    assert "use repo_merge to merge the base and scoped published PR head" in str(refusal.value)
     assert network_seen is False
 
 
