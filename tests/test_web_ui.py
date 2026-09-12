@@ -48,6 +48,46 @@ def app(tmp_path: Path) -> tuple[web.Application, Path, Path]:
     return a, turns_log, events_log
 
 
+@pytest.mark.parametrize("explicit", [False, True])
+@pytest.mark.parametrize("config_source", ["home", "env"])
+async def test_saga_route_uses_configured_path(tmp_path, monkeypatch, explicit, config_source):
+    from mimir.saga import _config_io
+
+    monkeypatch.setattr(_config_io, "_config", None)
+    monkeypatch.setattr(_config_io, "_config_loaded", False)
+    monkeypatch.setattr(_config_io, "_explicit_keys", {})
+    monkeypatch.delenv("SAGA_CONFIG", raising=False)
+    (tmp_path / "saga.toml").write_text('[storage]\ndb_path = "custom.db"\n')
+    configured = tmp_path / ".mimir" / "custom.db"
+    if config_source == "env":
+        configured = tmp_path / "external.db"
+        config = tmp_path / "external.toml"
+        config.write_text(f'[storage]\ndb_path = "{configured}"\n')
+        monkeypatch.setenv("SAGA_CONFIG", str(config))
+    override = tmp_path / "override.db"
+    expected = override if explicit else configured
+    seen = []
+
+    def stats(path):
+        seen.append(path)
+        return {"configured_path": str(path)}
+
+    monkeypatch.setattr(web_ui, "build_db_stats_payload", stats)
+    app = web.Application()
+    web_ui.register_routes(
+        app, turns_log=tmp_path / "turns.jsonl",
+        events_log=tmp_path / "events.jsonl", home=tmp_path,
+        saga_db=override if explicit else None,
+    )
+    async with TestClient(TestServer(app)) as client:
+        response = await client.get("/api/saga?view=stats")
+        assert response.status == 200
+        assert (await response.json())["configured_path"] == str(expected)
+    assert seen == [expected]
+    assert not expected.exists()
+    assert not (tmp_path / ".mimir" / "saga.db").exists()
+
+
 def test_generated_typescript_contracts_are_current():
     generated = Path("frontend/src/api/generated/contracts.ts").read_text(
         encoding="utf-8"

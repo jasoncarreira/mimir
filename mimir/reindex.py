@@ -84,6 +84,7 @@ class ReindexReport:
     elapsed_seconds: float
     provider: str
     dimension: int
+    error: str | None = None
 
 
 def _expected_blob_len(dimension: int) -> int:
@@ -164,6 +165,7 @@ def reindex_saga_atoms(
             reindexed=0, failed=1, estimated_input_chars=0,
             elapsed_seconds=time.time() - started,
             provider=provider_name, dimension=dim,
+            error=str(exc),
         )
 
     total = result.get("atoms_total", 0)
@@ -333,6 +335,8 @@ def _reindex_table(
 def _print_report(report: ReindexReport, *, dry_run: bool) -> None:
     """Human-readable summary written to stdout."""
     mode = "DRY RUN" if dry_run else "APPLIED"
+    if report.error:
+        print(f"ERROR: reindex {report.target} at {report.db_path}: {report.error}", file=sys.stderr)
     print(
         f"\n=== reindex {report.target} ({mode}) ===\n"
         f"  db:                  {report.db_path}\n"
@@ -461,13 +465,10 @@ def dispatch(args: argparse.Namespace) -> int:
 
     reports: list[ReindexReport] = []
     if args.target in ("atoms", "both"):
-        # saga's db_path comes from saga.toml [storage] db_path —
-        # reading from config rather than hardcoding so non-default
-        # layouts work. Used only for ReindexReport display since
-        # saga.calibration.re_embed reads via get_db() internally.
-        atoms_db = Path(cfg("storage", "db_path", str(home / ".mimir" / "saga.db")))
-        if not atoms_db.is_absolute():
-            atoms_db = home / atoms_db
+        from .runtime import resolve_saga_db_path
+
+        # This is the store calibration opens and updates, not just a display path.
+        atoms_db = resolve_saga_db_path(home)
         reports.append(reindex_saga_atoms(
             atoms_db, dry_run=dry_run, batch_size=args.batch_size,
         ))

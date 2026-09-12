@@ -10,7 +10,8 @@ Two databases checked:
   - ``<home>/.mimir/index.db`` — the file-corpus index that backs
     ``file_search``. Schema: ``files`` (metadata) + ``chunks``
     (content + dense vector) + ``chunks_fts`` (FTS5 over content).
-  - ``<home>/.mimir/saga.db`` — SAGA's atom store. Schema includes
+  - Configured SAGA database (default ``<home>/.mimir/saga.db``).
+    Schema includes
     ``atoms`` + ``atoms_fts`` (FTS5) + ``embeddings`` (per-atom vectors).
 
 Checks run per DB:
@@ -50,6 +51,8 @@ import logging
 import sqlite3
 from dataclasses import dataclass, field
 from pathlib import Path
+
+from .runtime import resolve_saga_db_path
 
 log = logging.getLogger(__name__)
 
@@ -98,7 +101,7 @@ def _check_sqlite_integrity(db_path: Path, db_name: str) -> IntegrityCheck:
     when the database is healthy, or one row per detected issue
     otherwise (up to a default of 100 issues)."""
     try:
-        conn = sqlite3.connect(str(db_path))
+        conn = sqlite3.connect(f"{db_path.resolve().as_uri()}?mode=rw", uri=True)
     except sqlite3.Error as exc:
         return IntegrityCheck(
             "sqlite_integrity_check", db_name, False,
@@ -136,7 +139,7 @@ def _check_foreign_keys(db_path: Path, db_name: str) -> IntegrityCheck:
     Each returned row is ``(child_table, rowid, parent_table, fkid)``
     pointing at an orphaned reference."""
     try:
-        conn = sqlite3.connect(str(db_path))
+        conn = sqlite3.connect(f"{db_path.resolve().as_uri()}?mode=rw", uri=True)
     except sqlite3.Error as exc:
         return IntegrityCheck(
             "foreign_key_check", db_name, False, f"can't open db: {exc}",
@@ -181,7 +184,7 @@ def _check_fts5_integrity(
     INSERT proper)."""
     check_name = f"fts5_integrity_{fts_table}"
     try:
-        conn = sqlite3.connect(str(db_path))
+        conn = sqlite3.connect(f"{db_path.resolve().as_uri()}?mode=rw", uri=True)
     except sqlite3.Error as exc:
         return IntegrityCheck(check_name, db_name, False, f"can't open db: {exc}")
     try:
@@ -210,7 +213,7 @@ def _check_fts5_row_count_match(
     propagate to the other — e.g. crash mid-write."""
     check_name = f"fts5_sync_{fts_table}"
     try:
-        conn = sqlite3.connect(str(db_path))
+        conn = sqlite3.connect(f"{db_path.resolve().as_uri()}?mode=rw", uri=True)
     except sqlite3.Error as exc:
         return IntegrityCheck(check_name, db_name, False, f"can't open db: {exc}")
     try:
@@ -244,7 +247,7 @@ def _check_embedding_dim_uniform(
     silently wrong."""
     check_name = f"embedding_dim_uniform_{table}"
     try:
-        conn = sqlite3.connect(str(db_path))
+        conn = sqlite3.connect(f"{db_path.resolve().as_uri()}?mode=rw", uri=True)
     except sqlite3.Error as exc:
         return IntegrityCheck(check_name, db_name, False, f"can't open db: {exc}")
     try:
@@ -300,11 +303,11 @@ def check_file_corpus(home: Path) -> list[IntegrityCheck]:
 
 
 def check_saga(home: Path) -> list[IntegrityCheck]:
-    """Run all checks against ``<home>/.mimir/saga.db``. SAGA's FAISS
+    """Run all checks against the configured SAGA database. SAGA's FAISS
     vector index is in-memory and rebuilt on startup from the atoms
     table, so we check the atoms persistence layer; FAISS itself
     will be consistent if the underlying data is."""
-    db_path = home / ".mimir" / "saga.db"
+    db_path = resolve_saga_db_path(home)
     if not db_path.is_file():
         return [IntegrityCheck(
             "saga_db_present", "saga", False,
