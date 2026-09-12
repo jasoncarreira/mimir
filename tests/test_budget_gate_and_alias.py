@@ -6042,7 +6042,7 @@ def test_failed_tool_events_record_only_bounded_allowlisted_arguments(
             assert payload["paired_tool_call"] is True
 
 
-def test_failed_pr_tool_events_keep_top_level_repository_and_pull_request(
+def test_failed_pr_tool_events_keep_repository_and_pull_request_in_arguments(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     captured: list[tuple[str, dict[str, Any]]] = []
@@ -6058,13 +6058,46 @@ def test_failed_pr_tool_events_keep_top_level_repository_and_pull_request(
         arguments={"repository": "owner/repo", "pull_request": 1297},
     )
 
+    assert [kind for kind, _ in captured] == ["tool_call", "tool_error"]
     for _, payload in captured:
-        assert payload["repository"] == "owner/repo"
-        assert payload["pull_request"] == 1297
+        assert "repository" not in payload
+        assert "pull_request" not in payload
         assert payload["arguments"] == {
             "repository": "owner/repo",
             "pull_request": 1297,
         }
+
+
+@pytest.mark.parametrize("argument", ["repository", "pull_request"])
+@pytest.mark.parametrize("event_type", ["tool_call", "tool_error"])
+def test_pr_tool_event_records_bound_oversized_arguments(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    argument: str,
+    event_type: str,
+) -> None:
+    from mimir.event_logger import EventLogger
+
+    path = tmp_path / "bounded-events" / "events.jsonl"
+    logger = EventLogger(path, session_id="bounded-pr-arguments")
+    monkeypatch.setattr("mimir.tools.budget_gate._emit_event_sync", logger.log_sync)
+    arguments = {"repository": "owner/repo", "pull_request": 1297}
+    arguments[argument] = "x" * 100_000
+
+    _emit_tool_call_sync("pr_diff", ok=False, error="failed", arguments=arguments)
+
+    lines = path.read_bytes().splitlines(keepends=True)
+    records = [json.loads(line) for line in lines]
+    assert [record["type"] for record in records] == ["tool_call", "tool_error"]
+    line, record = next(
+        (line, record)
+        for line, record in zip(lines, records)
+        if record["type"] == event_type
+    )
+    assert len(line) < 2048
+    assert record["arguments"][argument] == "x" * 200
+    assert "repository" not in record
+    assert "pull_request" not in record
 
 
 @pytest.mark.asyncio

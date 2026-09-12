@@ -477,10 +477,12 @@ def test_experimental_warning_matches_shipped_execution_confinement_contract() -
         assert value in opening
     assert "not shipped" not in opening.lower()
     assert "execution is unconfined" not in opening.lower()
-    # Keep the separate direct-file boundary visible instead of implying that
-    # OS execution confinement also hardens the lexical read/edit tools.
-    assert "File confinement is lexical, not a sandbox." in opening
-    assert "follow in-cwd symlinks even when their targets are outside it" in opening
+    # Direct-file enforcement is separate from OS execution confinement.
+    assert "Hosted file access checks resolved targets." in opening
+    assert "refuse targets outside the session cwd unless explicitly scope-approved" in opening
+    assert "Edits must instead use the canonical absolute target path, even after approval" in opening
+    assert "Replacement symlinks cannot redirect access between validation and use" in opening
+    assert "follow in-cwd symlinks even when their targets are outside it" not in opening
     status = "The Linux AppArmor backend is merged, and its parser syntax is verified in Linux CI via #1601; real-hardware enforcement remains unverified."
     assert " ".join(DOCS.split()).count(status) == 2
 

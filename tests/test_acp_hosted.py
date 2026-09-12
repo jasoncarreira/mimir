@@ -300,6 +300,134 @@ async def test_edit_cardinality_atomic_mode_and_symlink_contract(tmp_path: Path)
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("operation", ["read", "edit"])
+async def test_runtime_symlink_escape_requires_scope(tmp_path: Path, operation: str) -> None:
+    cwd = tmp_path / "project"
+    cwd.mkdir()
+    outside = tmp_path / "secret"
+    outside.write_text("before")
+    provider, connection = await _connected(cwd)
+    try:
+        result = await provider.request(connection, "tools/call", {
+            "name": "shell", "arguments": {
+                "command": f"ln -s {shlex.quote(str(outside))} notes.md"
+            },
+        })
+        assert result["structuredContent"]["exitCode"] == 0
+        arguments = {"path": "notes.md"}
+        if operation == "edit":
+            arguments.update(oldText="before", newText="after")
+        for path in ("notes.md", str(outside)):
+            arguments["path"] = path
+            with pytest.raises(HostedMcpError, match="Path resolved outside the boundary"):
+                await provider.request(connection, "tools/call", {
+                    "name": operation, "arguments": arguments,
+                })
+        assert outside.read_text() == "before"
+    finally:
+        await provider.close()
+
+
+@pytest.mark.parametrize("recursive", [False, True])
+def test_external_scope_read_and_honest_edit_path(tmp_path: Path, recursive: bool) -> None:
+    cwd = tmp_path / "project"
+    cwd.mkdir()
+    vendor = tmp_path / "vendor"
+    vendor.mkdir()
+    target = vendor / "file"
+    target.write_text("before")
+    provider = HostedHandsProvider()
+    session = hosted.HostedSession("session", cwd)
+    (cwd / "vendor").symlink_to(vendor, target_is_directory=True)
+    session.scope.approved.add(hosted.ScopeApproval(vendor if recursive else target, recursive))
+    assert provider._read(session, "vendor/file") == {"content": "before"}
+    with pytest.raises(HostedMcpError, match="canonical absolute path"):
+        provider._edit(session, "vendor/file", "before", "after")
+    assert target.read_text() == "before"
+    assert provider._edit(session, str(target), "before", "after") == {"changed": True}
+    assert target.read_text() == "after"
+
+
+@pytest.mark.parametrize("operation", ["read", "edit"])
+@pytest.mark.parametrize("component", ["directory", "file"])
+def test_symlink_swap_after_resolution_is_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, operation: str, component: str,
+) -> None:
+    cwd = tmp_path / "project"
+    directory = cwd / "subdir"
+    directory.mkdir(parents=True)
+    target = directory / "file"
+    target.write_text("before")
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    secret = outside / "file"
+    secret.write_text("before secret")
+    session = hosted.HostedSession("session", cwd)
+    realpath = hosted.os.path.realpath
+    swapped = False
+
+    def swap(path, *args, **kwargs):
+        nonlocal swapped
+        resolved = realpath(path, *args, **kwargs)
+        if Path(path) == target and not swapped:
+            swapped = True
+            if component == "directory":
+                directory.rename(cwd / "saved")
+                directory.symlink_to(outside, target_is_directory=True)
+            else:
+                target.unlink()
+                target.symlink_to(secret)
+        return resolved
+
+    monkeypatch.setattr(hosted.os.path, "realpath", swap)
+    provider = HostedHandsProvider()
+    with pytest.raises(HostedMcpError, match=f"hands_{operation} failed"):
+        if operation == "read":
+            provider._read(session, str(target))
+        else:
+            provider._edit(session, str(target), "before", "after")
+    assert swapped
+    assert secret.read_text() == "before secret"
+
+
+def test_edit_parent_swap_at_replace_stays_pinned(tmp_path: Path, monkeypatch) -> None:
+    cwd = tmp_path / "project"
+    directory = cwd / "subdir"
+    directory.mkdir(parents=True)
+    (directory / "file").write_text("before")
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "file").write_text("secret")
+    replace = os.replace
+
+    def swap(src, dst, **kwargs):
+        directory.rename(cwd / "saved")
+        directory.symlink_to(outside, target_is_directory=True)
+        return replace(src, dst, **kwargs)
+
+    monkeypatch.setattr(hosted.os, "replace", swap)
+    provider = HostedHandsProvider()
+    assert provider._edit(hosted.HostedSession("session", cwd), "subdir/file", "before", "after") == {"changed": True}
+    assert (outside / "file").read_text() == "secret"
+    assert (cwd / "saved/file").read_text() == "after"
+
+
+def test_edit_temporary_collision_does_not_follow_symlink(tmp_path: Path, monkeypatch) -> None:
+    cwd = tmp_path / "project"
+    cwd.mkdir()
+    target = cwd / "file"
+    target.write_text("before")
+    secret = tmp_path / "secret"
+    secret.write_text("secret")
+    (cwd / ".mimir-edit-collision").symlink_to(secret)
+    monkeypatch.setattr(hosted.secrets, "token_hex", lambda _: "collision")
+    with pytest.raises(HostedMcpError, match="hands_edit failed"):
+        HostedHandsProvider()._edit(hosted.HostedSession("session", cwd), "file", "before", "after")
+    assert target.read_text() == "before"
+    assert secret.read_text() == "secret"
+
+
+@pytest.mark.asyncio
 async def test_shell_uses_bin_sh_cwd_environment_and_bounded_streams(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

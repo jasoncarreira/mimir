@@ -14,6 +14,7 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 from mimir.structured_output_retry import StructuredOutputRetryMiddleware
 from mimir.tools.budget_gate import BudgetGateMiddleware
 from mimir.tools.fetched_content_inject import FetchedContentReminderMiddleware
+from mimir.tools.iteration_gate import IterationGateMiddleware
 from mimir.tools.service_tool_surface import ServiceToolSurfaceMiddleware
 
 
@@ -197,6 +198,8 @@ def build_mimir_subagents(*, home: Path | None = None) -> list[dict]:
     DeepAgents does not inherit the parent agent's middleware into subagents.
     Registering ``general-purpose`` here suppresses its otherwise ungated
     auto-added equivalent while preserving its standard prompt and tool inheritance.
+    Iteration gates share the parent's TurnContext counter: delegation does not
+    grant a fresh budget, and an exhausted child also stops the resumed parent.
     """
 
     ingestion_middleware = [FetchedContentReminderMiddleware(home)] if home else []
@@ -205,6 +208,7 @@ def build_mimir_subagents(*, home: Path | None = None) -> list[dict]:
             **GENERAL_PURPOSE_SUBAGENT,
             "middleware": [
                 TodoListMiddleware(),
+                IterationGateMiddleware(),
                 ServiceToolSurfaceMiddleware(),
                 BudgetGateMiddleware(),
                 *ingestion_middleware,
@@ -226,6 +230,7 @@ def build_mimir_subagents(*, home: Path | None = None) -> list[dict]:
             "permissions": readonly_filesystem_permissions(),
             "middleware": [
                 _NoTodoListMiddleware(),
+                IterationGateMiddleware(),
                 ServiceToolSurfaceMiddleware(),
                 BudgetGateMiddleware(),
                 *ingestion_middleware,

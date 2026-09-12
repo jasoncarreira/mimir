@@ -131,6 +131,7 @@ def test_build_mimir_subagents_registers_structured_critic_without_replacing_gp(
     general = specs[0]
     assert [middleware.name for middleware in general["middleware"]] == [
         "TodoListMiddleware",
+        "IterationGateMiddleware",
         "ServiceToolSurfaceMiddleware",
         "BudgetGateMiddleware",
     ]
@@ -138,6 +139,7 @@ def test_build_mimir_subagents_registers_structured_critic_without_replacing_gp(
     assert critic["tools"] == []
     assert [middleware.name for middleware in critic["middleware"]] == [
         "TodoListMiddleware",
+        "IterationGateMiddleware",
         "ServiceToolSurfaceMiddleware",
         "BudgetGateMiddleware",
         "StructuredOutputRetryMiddleware",
@@ -644,6 +646,95 @@ async def test_real_task_subagent_gate_uses_propagated_parent_carrier(
         isinstance(message, ToolMessage) and message.tool_call_id == "tc-task"
         for message in result["messages"]
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("subagent_name", ["general-purpose", "critic-structured"])
+async def test_subagent_refusal_loop_hits_shared_iteration_ceiling(monkeypatch, subagent_name):
+    import time
+
+    from deepagents import create_deep_agent
+    from langchain_core.language_models.fake_chat_models import GenericFakeChatModel
+    from langchain_core.tools import tool
+
+    from mimir._context import get_current_turn, reset_current_turn, set_current_turn
+    from mimir._deepagents_patches import install_deepagents_grep_context_tool
+    from mimir.models import TurnContext
+    from mimir.tools import budget_gate, iteration_gate
+
+    class ToolCallingModel(GenericFakeChatModel):
+        def bind_tools(self, tools, **kwargs):
+            return self
+
+    @tool
+    def add_schedule(name: str) -> str:
+        """Create a schedule (admin-only)."""
+        pytest.fail("authorization-denied tool executed")
+
+    auth = _auth_context(roles=("user",), enforce=True)
+    ctx = TurnContext(
+        turn_id="refusal-loop", session_id="ch-1", channel_id="ch-1",
+        trigger="user_message", started_at=time.monotonic(),
+        iteration_budget=20, tool_call_budget=100, tool_call_count=7,
+    )
+    ctx.auth_context = auth
+    ctx.ifc_labels = auth.ifc_labels
+    decisions = []
+    events = []
+    original_authorize = budget_gate._authorize_tool_call
+
+    def capture_authorization(tool_name, *args, **kwargs):
+        result = original_authorize(tool_name, *args, **kwargs)
+        if tool_name == "add_schedule":
+            assert get_current_turn() is ctx
+            assert args[0] is auth
+            decisions.append(result[0].allowed)
+        return result
+
+    def messages():
+        yield AIMessage(content="", tool_calls=[{
+            "name": "task", "id": "delegate", "type": "tool_call",
+            "args": {"description": "Keep trying add_schedule", "subagent_type": subagent_name},
+        }])
+        for i in range(40):
+            yield AIMessage(content="", tool_calls=[{
+                "name": "add_schedule", "id": f"denied-{i}", "type": "tool_call",
+                "args": {"name": "nightly"},
+            }])
+        raise AssertionError("refusal loop escaped the iteration ceiling")
+
+    monkeypatch.setattr(budget_gate, "_authorize_tool_call", capture_authorization)
+    monkeypatch.setattr(budget_gate, "_emit_event_sync", lambda *a, **kw: None)
+    monkeypatch.setattr(iteration_gate, "_emit_event_sync", lambda kind, **kw: events.append(kind))
+    specs = build_mimir_subagents()
+    for spec in specs:
+        # Arm the read-only critic with a test-only admin tool too.
+        spec["tools"] = [add_schedule]
+    install_subagent_auth_context_patch()
+    install_deepagents_grep_context_tool()
+    agent = create_deep_agent(
+        model=ToolCallingModel(messages=messages()), tools=[],
+        middleware=[iteration_gate.IterationGateMiddleware()],
+        subagents=specs, context_schema=AuthContext,
+    )
+    token = set_current_turn(ctx)
+    try:
+        result = await agent.ainvoke(
+            {"messages": [HumanMessage(content="Delegate the schedule creation")]}, context=auth,
+        )
+    finally:
+        reset_current_turn(token)
+
+    # Parent uses boundary 1; child models run at 2..19, stopping at 20.
+    # Resuming the parent must stop again at 21, without another model call.
+    assert decisions == [False] * 18
+    assert ctx.tool_call_count == 7  # refusals consume no tool budget
+    assert ctx.iteration_count == 21
+    assert ctx.iteration_hard_stopped
+    assert events == ["iteration_budget_warning", "iteration_budget_reached"]
+    task_result = next(m for m in result["messages"] if isinstance(m, ToolMessage))
+    assert "Turn force-stopped" in task_result.content
+    assert "Turn force-stopped" in result["messages"][-1].content
 
 
 @pytest.mark.asyncio

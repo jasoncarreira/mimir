@@ -114,11 +114,6 @@ _STANDING_REVIEW_TOOLS = frozenset({
     "repo_checkout", "repo_cleanup", "repo_fetch", "repo_status", "repo_test",
     "repo_diff", "repo_unmerged",
 })
-_PULL_REQUEST_TOOLS = _STANDING_REVIEW_TOOLS | frozenset({
-    "unsupported_operation", "repo_stage", "repo_commit", "repo_merge",
-    "repo_merge_abort", "repo_rebase", "repo_rebase_abort", "repo_revert",
-    "repo_revert_abort", "repo_push",
-})
 _TOOL_EVENT_ARGUMENT_ALLOWLIST = (
     "command",
     "path",
@@ -2026,9 +2021,6 @@ def _emit_tool_call_sync(
         payload.update(operator_shell_audit)
     if argument_summary:
         payload["arguments"] = argument_summary
-    if tool_name in _PULL_REQUEST_TOOLS and arguments is not None:
-        payload["repository"] = arguments.get("repository")
-        payload["pull_request"] = arguments.get("pull_request")
     if duration_ms is not None:
         payload["duration_ms"] = round(duration_ms, 3)
     if error:
@@ -2046,9 +2038,6 @@ def _emit_tool_call_sync(
             error_payload.update(operator_shell_audit)
         if argument_summary:
             error_payload["arguments"] = argument_summary
-        if tool_name in _PULL_REQUEST_TOOLS and arguments is not None:
-            error_payload["repository"] = arguments.get("repository")
-            error_payload["pull_request"] = arguments.get("pull_request")
         if error:
             error_payload["error"] = (
                 "operator_shell_tool_error"

@@ -1611,6 +1611,139 @@ async def test_repeated_load_preserves_metadata_mtime_bytes_and_sequence(tmp_pat
     assert after == before
 
 
+@pytest.mark.parametrize("route", ["load", "revalidate"])
+async def test_detach_waits_for_prompt_before_reloading(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, route: str,
+) -> None:
+    bundle, core = _bundle(tmp_path)
+    agent = MimirAcpAgent(bundle)
+    client = McpClient()
+    agent.on_connect(client)
+    await agent.authenticate("mimir-web-key", **{"mimir.webKey": "secret"})
+    session_id = (await agent.new_session("/one", mcp_servers=_hands("server"))).session_id
+    other = (await agent.new_session("/other")).session_id
+    state = agent._sessions[session_id]
+    provider = state.provider
+    entered = asyncio.Event()
+    cancelling = asyncio.Event()
+    release = asyncio.Event()
+    running = 0
+    maximum = 0
+    late_results = []
+    monkeypatch.setattr(agent_module, "ACP_PROMPT_CANCEL_GRACE_SECONDS", 0)
+
+    async def turn(event: Any, **kwargs: Any) -> None:
+        nonlocal running, maximum
+        counted = event.channel_id == state.record.thread_id
+        if counted:
+            running += 1
+            maximum = max(maximum, running)
+        try:
+            assert (await core.channels.send(event.channel_id, event.content)).sent
+            if event.content == "first":
+                entered.set()
+                try:
+                    await release.wait()
+                except asyncio.CancelledError:
+                    cancelling.set()
+                    await release.wait()
+                    late_results.append(await core.channels.send(event.channel_id, "too late"))
+                    raise
+        finally:
+            if counted:
+                running -= 1
+
+    core.run_turn = turn
+    first = asyncio.create_task(agent.prompt(session_id, [sdk.TextContentBlock(type="text", text="first")]))
+    await entered.wait()
+    active = state.active_prompt
+    assert active is not None
+
+    async def detach() -> None:
+        if route == "revalidate":
+            async def invalid_tools(candidate: SessionState) -> None:
+                raise agent_module.ProviderSchemaError("missing")
+
+            with monkeypatch.context() as patch:
+                patch.setattr(agent, "_validate_tools", invalid_tools)
+                await agent._revalidate_provider(state)
+        await agent.load_session("/two", session_id)
+
+    loading = asyncio.create_task(detach())
+    cancellation_started = asyncio.create_task(cancelling.wait())
+    try:
+        await asyncio.wait_for(
+            asyncio.wait((loading, cancellation_started), return_when=asyncio.FIRST_COMPLETED),
+            2,
+        )
+        # Another session must remain usable even while cancellation unwinds.
+        assert (await agent.prompt(other, [sdk.TextContentBlock(type="text", text="other")])).stop_reason == "end_turn"
+        if not loading.done():
+            with pytest.raises(sdk.RequestError):
+                await agent.prompt(session_id, [sdk.TextContentBlock(type="text", text="blocked")])
+            assert agent._sessions[session_id] is state
+            assert not active.completed.is_set()
+            release.set()
+        await asyncio.wait_for(loading, 2)
+        second = await agent.prompt(session_id, [sdk.TextContentBlock(type="text", text="second")])
+        assert maximum == 1, "two turns ran concurrently on the same session"
+        assert active.completed.is_set()
+        assert (await first).stop_reason == "cancelled"
+        assert second.stop_reason == "end_turn"
+        assert provider is not None and provider.closed
+        assert active.journal_lease.closed
+        assert session_id not in agent._active_prompts
+        assert len(late_results) == 1 and not late_results[0].sent
+        assert late_results[0].error == "ACP delivery failed"
+        # Replay may repeat the first chunk, but each acknowledged message is
+        # journaled exactly once and retains its own turn identity.
+        entries = [json.loads(line) for line in state.record.journal_path.read_text().splitlines()]
+        messages = [entry for entry in entries if entry["kind"] == "prepared" and entry["update"]["sessionUpdate"] == "agent_message_chunk"]
+        assert [entry["update"]["content"]["text"] for entry in messages] == ["first", "second"]
+        assert messages[0]["turn_id"] != messages[1]["turn_id"]
+        await agent.load_session("/completed", session_id)
+    finally:
+        release.set()
+        cancellation_started.cancel()
+        await asyncio.gather(first, loading, cancellation_started, return_exceptions=True)
+
+
+async def test_detaching_state_blocks_prompts_without_unbinding_replacement(tmp_path: Path) -> None:
+    bundle, _ = _bundle(tmp_path)
+    agent = MimirAcpAgent(bundle)
+    client = McpClient()
+    generation = agent.on_connect(client)
+    await agent.authenticate("mimir-web-key", **{"mimir.webKey": "secret"})
+    session_id = (await agent.new_session("/one", mcp_servers=_hands("server"))).session_id
+    state = agent._sessions[session_id]
+    disconnecting = asyncio.Event()
+    release = asyncio.Event()
+
+    async def disconnect(connection_id: str) -> None:
+        disconnecting.set()
+        await release.wait()
+
+    client.disconnect_mcp = disconnect
+    detaching = asyncio.create_task(agent._detach_state(state))
+    try:
+        await asyncio.wait_for(disconnecting.wait(), 2)
+        with pytest.raises(sdk.RequestError):
+            await agent.prompt(session_id, [sdk.TextContentBlock(type="text", text="blocked")])
+        await agent.load_session("/replacement", session_id)
+        replacement = agent._sessions[session_id]
+        assert replacement is not state
+        release.set()
+        await detaching
+        assert session_id in agent._connections[generation].bound_sessions
+        assert agent._sessions[session_id] is replacement
+        assert (await agent.prompt(session_id, [sdk.TextContentBlock(type="text", text="after")])).stop_reason == "end_turn"
+        await agent.on_transport_closed(generation)
+        assert session_id not in agent._sessions
+    finally:
+        release.set()
+        await detaching
+
+
 async def test_load_replay_excludes_live_prompt_publication(tmp_path: Path) -> None:
     agent, client, core = await _ready(tmp_path)
     session_id = (await agent.new_session("/one")).session_id

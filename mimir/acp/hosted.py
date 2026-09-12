@@ -5,7 +5,7 @@ import json
 import os
 import secrets
 import stat
-import tempfile
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -88,6 +88,33 @@ def _resolved_path(session: HostedSession, value: str) -> Path:
     if os.path.isabs(value):
         return Path(value)
     return Path(os.path.abspath(os.path.join(session.cwd, value)))
+
+
+@contextmanager
+def _file_parent(session: HostedSession, value: str, *, edit: bool = False):
+    path = Path(os.path.realpath(_resolved_path(session, value)))
+    if not session.scope.allows(path):
+        raise HostedMcpError(
+            -32000, f"Path resolved outside the boundary: {path}. "
+            "Use hands_request_scope with the resolved path for operator approval."
+        )
+    if edit and not path.is_relative_to(session.cwd) and value != str(path):
+        raise HostedMcpError(
+            -32000, f"Edit alias resolved outside the boundary: {path}. "
+            "Retry with this canonical absolute path so the permission names the target."
+        )
+    # Walk the canonical path without following any replacement symlink. Keep
+    # the parent pinned for reads, temporary creation, and atomic replacement.
+    parent = os.open(path.anchor, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        for part in path.parts[1:-1]:
+            child = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                            dir_fd=parent)
+            os.close(parent)
+            parent = child
+        yield parent, path.name
+    finally:
+        os.close(parent)
 
 
 class HostedHandsProvider:
@@ -396,17 +423,15 @@ class HostedHandsProvider:
         raise _invalid_params()
 
     def _read(self, session: HostedSession, path_value: str) -> dict[str, Any]:
-        path = Path(os.path.realpath(_resolved_path(session, path_value)))
         try:
-            with path.open("rb") as stream:
-                content = stream.read(READ_LIMIT_BYTES + 1)
+            with _file_parent(session, path_value) as (parent, name):
+                descriptor = os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=parent)
+                with os.fdopen(descriptor, "rb") as stream:
+                    content = stream.read(READ_LIMIT_BYTES + 1)
+                    size = os.fstat(stream.fileno()).st_size
         except OSError as exc:
             raise HostedMcpError(-32000, f"hands_read failed: {exc}") from None
         if len(content) > READ_LIMIT_BYTES:
-            try:
-                size = path.stat().st_size
-            except OSError:
-                size = len(content)
             raise HostedMcpError(-32000, f"file too large ({size} bytes)")
         return {"content": content.decode("utf-8", errors="replace")}
 
@@ -417,40 +442,42 @@ class HostedHandsProvider:
         old_text: str,
         new_text: str,
     ) -> dict[str, Any]:
-        path = Path(os.path.realpath(_resolved_path(session, path_value)))
-        temporary: str | None = None
         try:
-            original = path.read_bytes()
-            old = old_text.encode("utf-8")
-            new = new_text.encode("utf-8")
-            count = original.count(old)
-            if count != 1:
-                raise HostedMcpError(
-                    -32000, f"edit mismatch: oldText occurs {count} times"
-                )
-            replacement = original.replace(old, new, 1)
-            if replacement == original:
-                return {"changed": False}
-            mode = stat.S_IMODE(path.stat().st_mode)
-            descriptor, temporary = tempfile.mkstemp(dir=path.parent)
-            with os.fdopen(descriptor, "wb") as stream:
-                os.fchmod(stream.fileno(), mode)
-                stream.write(replacement)
-                stream.flush()
-                os.fsync(stream.fileno())
-            os.replace(temporary, path)
-            temporary = None
-            return {"changed": True}
+            with _file_parent(session, path_value, edit=True) as (parent, name):
+                descriptor = os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=parent)
+                with os.fdopen(descriptor, "rb") as stream:
+                    original = stream.read()
+                    mode = stat.S_IMODE(os.fstat(stream.fileno()).st_mode)
+                old = old_text.encode("utf-8")
+                new = new_text.encode("utf-8")
+                count = original.count(old)
+                if count != 1:
+                    raise HostedMcpError(
+                        -32000, f"edit mismatch: oldText occurs {count} times"
+                    )
+                replacement = original.replace(old, new, 1)
+                if replacement == original:
+                    return {"changed": False}
+                temporary = f".mimir-edit-{secrets.token_hex(16)}"
+                descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                                     0o600, dir_fd=parent)
+                try:
+                    with os.fdopen(descriptor, "wb") as stream:
+                        os.fchmod(stream.fileno(), mode)
+                        stream.write(replacement)
+                        stream.flush()
+                        os.fsync(stream.fileno())
+                    os.replace(temporary, name, src_dir_fd=parent, dst_dir_fd=parent)
+                finally:
+                    try:
+                        os.unlink(temporary, dir_fd=parent)
+                    except FileNotFoundError:
+                        pass
+                return {"changed": True}
         except HostedMcpError:
             raise
         except (OSError, UnicodeError) as exc:
             raise HostedMcpError(-32000, f"hands_edit failed: {exc}") from None
-        finally:
-            if temporary is not None:
-                try:
-                    os.unlink(temporary)
-                except FileNotFoundError:
-                    pass
 
     def _require_live_scope(self, session: HostedSession) -> None:
         if self._closed or session.scope.closed:
