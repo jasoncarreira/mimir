@@ -35,7 +35,80 @@ _PATH_PATTERN = re.compile(
 _SENSITIVE_KEY_PATTERN = re.compile(
     r"(?i)(?:token|api[_-]?key|secret|password|authorization)"
 )
+_CREDENTIAL_KEY_RUN = re.compile(r"(?i)['\"]?[A-Za-z0-9_.:-]+")
+_JWT_SEGMENT = re.compile(r"[A-Za-z0-9_-]+")
+_JWT_START = re.compile(r"\beyJ")
+_ENTROPY_RUN = re.compile(r"\b[A-Za-z0-9_+/=-]+\b")
 MAX_LIVE_STRING_CHARS = 64 * 1024
+
+
+def _sub_jwts(text: str) -> str:
+    parts: list[str] = []
+    copied_to = 0
+    for segment in _JWT_SEGMENT.finditer(text):
+        if segment.start() < copied_to or text[segment.end() : segment.end() + 1] != ".":
+            continue
+        # All starts in one header share the same payload/signature. If the
+        # earliest start fails the grammar, later (shorter) headers fail too.
+        start = _JWT_START.search(text, segment.start(), segment.end())
+        if start is None:
+            continue
+        match = JWT_PATTERN.match(text, start.start())
+        if match is None:
+            continue
+        parts.append(text[copied_to : match.start()])
+        parts.append(match.expand(r"\1[redacted]"))
+        copied_to = match.end()
+    if not parts:
+        return text
+    parts.append(text[copied_to:])
+    return "".join(parts)
+
+
+def _sub_entropy(text: str) -> str:
+    lines = text.split("\n")
+    for index, line in enumerate(lines):
+        # The original .* lookaheads inspect the entire remaining LINE, not
+        # just the blob. Preserve that behavior without rescanning each suffix.
+        reversed_line = line[::-1]
+        last_required = []
+        for alphabet in (r"[A-Z]", r"[a-z]", r"\d"):
+            match = re.search(alphabet, reversed_line)
+            last_required.append(len(line) - 1 - match.start() if match else -1)
+        eligible_through = min(last_required)
+        if eligible_through < 0:
+            continue
+        lines[index] = _ENTROPY_RUN.sub(
+            lambda match: "[redacted]"
+            if match.end() - match.start() >= 40 and match.start() <= eligible_through
+            else match.group(),
+            line,
+        )
+    return "\n".join(lines)
+
+
+def _sub_credentials(text: str, pattern: re.Pattern[str]) -> str:
+    # Like redaction._sub_colon_credentials, only match the original grammar
+    # at candidate keys. Scan maximal runs once rather than revisiting a run
+    # for each credential word (including repeated words in a non-matching key).
+    parts: list[str] = []
+    copied_to = 0
+    cursor = 0
+    while (candidate := _CREDENTIAL_KEY_RUN.search(text, cursor)) is not None:
+        cursor = candidate.end()
+        if _SENSITIVE_KEY_PATTERN.search(candidate.group()) is None:
+            continue
+        match = pattern.match(text, candidate.start())
+        if match is None:
+            continue
+        parts.append(text[copied_to : match.start()])
+        parts.append("[redacted]")
+        copied_to = match.end()
+        cursor = copied_to
+    if not parts:
+        return text
+    parts.append(text[copied_to:])
+    return "".join(parts)
 
 
 def scrub_detail(value: Any, *, limit: int = 320) -> str | None:
@@ -77,6 +150,15 @@ def scrub_value(value: Any, *, key: str | None = None) -> Any:
 def scrub_text(text: str) -> str:
     redacted = text
     for pattern in _SECRET_PATTERNS:
+        if pattern is _SECRET_PATTERNS[1]:
+            redacted = _sub_credentials(redacted, pattern)
+            continue
+        if pattern is JWT_PATTERN:
+            redacted = _sub_jwts(redacted)
+            continue
+        if pattern is _SECRET_PATTERNS[-1]:
+            redacted = _sub_entropy(redacted)
+            continue
         replacement = r"\1[redacted]" if pattern.groups == 2 else "[redacted]"
         redacted = pattern.sub(replacement, redacted)
     return _PATH_PATTERN.sub("[path]", redacted)
