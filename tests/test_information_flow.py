@@ -3217,6 +3217,63 @@ def test_fetch_url_scope_is_taint_gated_but_exact_url_is_not(
     assert shadow_decision.is_shadow_decision is True
 
 
+@pytest.mark.parametrize("base", [
+    "https://github.com/acme/widget",
+    "https://api.github.com/repos/acme/widget",
+])
+@pytest.mark.parametrize("suffix", ["/search?q=MODEL_CHOSEN_PAYLOAD", "/MODEL_CHOSEN_PAYLOAD"])
+def test_configured_github_repo_fetch_is_taint_gated(
+    base: str,
+    suffix: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("GITHUB_REPOS", "acme/widget")
+    monkeypatch.delenv("MIMIR_EGRESS_APPROVED_URLS", raising=False)
+    labels = _labels()
+    auth = replace(_auth(), ifc_labels=labels)
+    target = base + suffix
+    assert labels.has_untrusted_active_ingest is True
+    assert fetch_url_is_approved(target, auth) is True
+
+    decision = SinkGate.check_sink_flow(
+        "fetch_url", target, labels, auth, enforce=True,
+    )
+
+    assert decision.reason == "ifc_label_blocked:network"
+    assert decision.allowed is False
+    assert decision.would_block is True
+
+
+@pytest.mark.parametrize("target", [
+    "https://github.com/acme/widget",
+    "https://github.com/acme/widget/pull/7",
+    "https://api.github.com/repos/acme/widget",
+    "https://api.github.com/repos/acme/widget/pulls/7",
+    "https://api.github.com/repos/acme/widget/pulls/7/reviews",
+    "https://api.github.com/repos/acme/widget/pulls/7/comments",
+])
+def test_configured_github_repo_fetch_allows_untainted_reads(
+    target: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("GITHUB_REPOS", "acme/widget")
+    monkeypatch.delenv("MIMIR_EGRESS_APPROVED_URLS", raising=False)
+    labels = _labels()
+    labels = replace(labels, sources=tuple(
+        replace(source, integrity="trusted") for source in labels.sources
+    ))
+    auth = replace(_auth(), ifc_labels=labels)
+    assert labels.has_untrusted_active_ingest is False
+    assert fetch_url_is_approved(target, auth) is True
+
+    decision = SinkGate.check_sink_flow(
+        "fetch_url", target, labels, auth, enforce=True,
+    )
+
+    assert decision.allowed is True
+    assert decision.reason == "ifc_allowed"
+
+
 def test_heartbeat_fetches_multiple_approved_exact_urls_after_untrusted_ingest(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

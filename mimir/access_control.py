@@ -5480,10 +5480,9 @@ def _egress_target_requires_taint_gate(
     normalized = normalize_sink_destination(SinkCategory.NETWORK, target)
     if normalized is None:
         return False
-    if (
-        normalized in approved_fetch_urls(auth_context)
-        or _target_matches_configured_github_repo_fetch(target)
-    ):
+    # Repository scopes leave path and query model-chosen, just like /* scopes.
+    # They authorize the destination below, but do not exempt it from taint.
+    if normalized in approved_fetch_urls(auth_context):
         return False
     service = get_trusted_service_from_auth_context(auth_context)
     policy = service.sink_policy_for("fetch_url") if service is not None else None
