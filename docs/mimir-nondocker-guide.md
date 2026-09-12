@@ -45,7 +45,7 @@ them, so a missing tool shows up as an autonomous "command not found" error or
 | **`jq`** | Recommended | JSON/JSONL parsing in pollers, skill bodies, and operational/debug shell workflows. |
 | **`poppler-utils`** | Optional | PDF text extraction in the reading-queue / ingest pipeline. |
 | **`tesseract-ocr`** + `tesseract-ocr-eng` | Optional | OCR for scanned/image PDFs in the same pipeline. |
-| **Node.js 20+** + `npm` | Optional (source installs only) | Building the React web console (`npm run build`). PyPI and Docker installs ship the bundle **prebuilt** — see §5. |
+| **Node.js 20+** + `npm` | Optional (source installs only) | Building the React web console (`npm run build`). PyPI installs, the root Dockerfile image, and `scaffold-docker --mode pypi` ship the bundle **prebuilt**. The default workspace scaffold builds it on startup only when absent and preserves it across restarts — see §5. |
 | coding/model CLIs (`opencode-ai`, `@anthropic-ai/claude-code`) | Optional | OpenCode powers `spawn_open_code`. Claude Code is the runtime for the `claude-code:*` model provider; install `mimir-agent[claude-code]` for its Python adapter and provide the CLI separately. The `codex-plus:*` model adapter reads `~/.codex/auth.json` directly and does not require the Codex CLI. |
 
 Install the common set:
