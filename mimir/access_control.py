@@ -2961,6 +2961,7 @@ def _maintenance_git_probe_env() -> dict[str, str]:
 
 def _maintenance_git_filter_overrides(
     root: Path, git_executable: str, *, effective_config: bool = False,
+    env: dict[str, str] | None = None,
 ) -> list[str] | None:
     """Return argv overrides that disable configured content filter drivers.
 
@@ -2972,6 +2973,7 @@ def _maintenance_git_filter_overrides(
     names, then shadow each command with an empty command in the final argv.
     Repo-review opts into effective config (including global and included files);
     the default preserves the maintenance profile's local-only probe.
+    Callers with a minimal execution environment pass it for the probe too.
 
     Repo-test snapshots are owned by the controller's ``mimir_uid`` while the
     suite runs as ``worklink_uid``. Git otherwise rejects this local-config read
@@ -2993,7 +2995,7 @@ def _maintenance_git_filter_overrides(
             capture_output=True,
             timeout=5,
             check=False,
-            env=_maintenance_git_probe_env(),
+            env=_maintenance_git_probe_env() if env is None else env,
         )
     except (OSError, subprocess.SubprocessError):
         return None
