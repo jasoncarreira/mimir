@@ -152,13 +152,27 @@ def _report_non_utf8(path: Path, bad_byte: int, position: int) -> None:
         pass
 
 
+def _prompt_file_is_trusted(home: Path, path: Path) -> bool:
+    """Consult the ledger using the canonical home-relative file key."""
+    from .access_control import _persisted_file_integrity
+
+    try:
+        home = home.resolve(strict=True)
+        relative = path.resolve(strict=True).relative_to(home)
+    except (OSError, RuntimeError, ValueError):
+        return False
+    return _persisted_file_integrity(home, relative) == "trusted"
+
+
 def load_core(home: Path) -> list[CoreBlock]:
-    """Load every ``memory/core/*.md`` in lexicographic (= numeric prefix) order."""
+    """Load trusted ``memory/core/*.md`` in lexicographic (= numeric prefix) order."""
     core_dir = home / "memory" / "core"
     if not core_dir.is_dir():
         return []
     blocks: list[CoreBlock] = []
     for path in sorted(core_dir.glob("*.md")):
+        if not _prompt_file_is_trusted(home, path):
+            continue
         try:
             text = read_text_lossy(path)
         except OSError:
@@ -245,7 +259,7 @@ def _report_channel_memory_over_cap(
 
 
 def load_channel_memory(home: Path, channel_id: str) -> str | None:
-    """Load and concatenate ``memory/channels/<channel_id>/*.md`` files.
+    """Load and concatenate trusted ``memory/channels/<channel_id>/*.md`` files.
 
     Returns a rendered block string ready for ``## Channel context`` injection,
     or ``None`` when no files exist or the channel is synthetic.
@@ -277,6 +291,8 @@ def load_channel_memory(home: Path, channel_id: str) -> str | None:
 
     parts: list[str] = []
     for path in sorted(channel_dir.glob("*.md")):
+        if not _prompt_file_is_trusted(home, path):
+            continue
         try:
             text = read_text_lossy(path).rstrip()
         except OSError:

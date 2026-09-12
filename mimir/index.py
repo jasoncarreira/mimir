@@ -28,7 +28,7 @@ import uuid
 from dataclasses import dataclass
 from pathlib import Path
 
-from .core_blocks import describe_file, read_text_lossy
+from .core_blocks import _prompt_file_is_trusted, describe_file, read_text_lossy
 from .index_skip import deployment_index_skip_entries, is_index_skipped
 
 log = logging.getLogger(__name__)
@@ -232,6 +232,8 @@ def build_memory_index(home: Path) -> str:
     # knows where to edit them). They're still skipped by ``file_search``
     # because they're already inlined in the system prompt.
     files = _walk_tree(memory_root, exclude_names={"INDEX.md"})
+    # The missing-index fallback also feeds descriptions directly into the prompt.
+    files = [path for path in files if _prompt_file_is_trusted(home, path)]
     entries = _build_entries(memory_root, files)
     return render_memory_index(entries)
 
@@ -388,9 +390,11 @@ class IndexGenerator:
         tmp.replace(path)
 
     def read_memory_index(self) -> str:
-        """Return the current memory/INDEX.md body, generating in-memory if missing."""
+        """Return a trusted memory index, generating in-memory only if missing."""
         path = self._home / "memory" / "INDEX.md"
         if path.is_file():
+            if not _prompt_file_is_trusted(self._home, path):
+                return ""
             try:
                 return read_text_lossy(path)
             except OSError:
