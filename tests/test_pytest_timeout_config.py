@@ -6,6 +6,7 @@ import json
 import os
 from pathlib import Path
 import selectors
+import shlex
 import signal
 import subprocess
 import sys
@@ -16,6 +17,8 @@ from types import SimpleNamespace
 import xml.etree.ElementTree as ET
 
 import pytest
+
+from tests.nested_pytest import pytest_command
 
 
 def _kill_child_group(process):
@@ -198,6 +201,51 @@ def test_wait_for_child_drains_output_while_child_runs():
         assert stderr == "y" * 1000000
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX process groups and pipes")
+@pytest.mark.parametrize("through_bash", [False, True], ids=["direct", "bash"])
+def test_nested_pytest_reaped_without_shared_temp_cleanup(tmp_path, through_bash):
+    release_reader, release_writer = os.pipe()
+    (tmp_path / "conftest.py").write_text(textwrap.dedent(f'''\
+        import atexit
+        import os
+        from pathlib import Path
+        import _pytest.pathlib
+
+        def blocked_shared_cleanup(*args, **kwargs):
+            Path("shared-cleanup-entered").touch()
+            os.read({release_reader}, 1)
+
+        def pytest_configure(config):
+            if not hasattr(config, "workerinput"):
+                atexit.register(Path("controller-exited").touch)
+                _pytest.pathlib.cleanup_numbered_dir = blocked_shared_cleanup
+        '''))
+    (tmp_path / "test_ok.py").write_text("def test_ok(tmp_path):\n    pass\n")
+    env = {key: value for key, value in os.environ.items() if not key.startswith("PYTEST_")}
+    env["PYTEST_DISABLE_PLUGIN_AUTOLOAD"] = "1"
+    # Even the mutant must only touch a temporary root owned by this test.
+    env["PYTEST_DEBUG_TEMPROOT"] = str(tmp_path)
+    command = pytest_command(tmp_path, "-p", "xdist.plugin", "-n", "1", "-q")
+    if through_bash:
+        command = ["/bin/bash", "-c", shlex.join(command)]
+    try:
+        with subprocess.Popen(
+            command, cwd=tmp_path, env=env, stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE, pass_fds=(release_reader,), start_new_session=True,
+        ) as process:
+            stdout, stderr = _wait_for_child(process)
+        assert process.returncode == 0, stdout + stderr
+        assert "1 passed" in stdout
+        assert (tmp_path / "controller-exited").exists()
+        assert not (tmp_path / "shared-cleanup-entered").exists()
+        with pytest.raises(ChildProcessError):
+            os.waitpid(process.pid, os.WNOHANG)
+        assert process.stdout.closed and process.stderr.closed
+    finally:
+        os.close(release_reader)
+        os.close(release_writer)
+
+
 def test_timeout_policy():
     config = tomllib.loads(
         (Path(__file__).resolve().parents[1] / "pyproject.toml").read_text()
@@ -314,11 +362,11 @@ def test_hanging_async_test_fails_and_session_continues(tmp_path, workers):
            if not key.startswith("PYTEST_")}
     env["PYTEST_DISABLE_PLUGIN_AUTOLOAD"] = "1"
     env["COLUMNS"] = "200"
-    command = [
-        sys.executable, "-m", "pytest", "-p", "pytest_asyncio.plugin",
+    command = pytest_command(
+        tmp_path, "-p", "pytest_asyncio.plugin",
         "-p", "pytest_timeout", "-p", "xdist.plugin", "-n", str(workers),
         "-q", "--tb=short", "--junitxml=report.xml", "test_hang.py",
-    ]
+    )
     with subprocess.Popen(
         command, cwd=tmp_path, env=env, stdout=subprocess.PIPE,
         stderr=subprocess.PIPE, start_new_session=True,
