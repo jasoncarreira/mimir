@@ -32,6 +32,9 @@ import struct
 from typing import Callable
 
 
+EmbeddingRow = tuple[str, bytes, int, str | None, str | None, str | None]
+
+
 # Default threshold for OpenAI text-embedding-3-small (1536d) /
 # saga's canonical bench. Calibrated against LongMemEval-S via the
 # threshold sweep in `benchmarks/longmemeval_via_memory/threshold_sweep.py`:
@@ -75,12 +78,37 @@ def _mean_cosine(vec: list[float], cluster_vecs: list[list[float]]) -> float:
     return sum(_cosine(vec, v) for v in cluster_vecs) / len(cluster_vecs)
 
 
+def fetch_embedding_rows(
+    conn: sqlite3.Connection,
+    atoms: list[dict],
+) -> list[EmbeddingRow]:
+    """Fetch embedding/ACL snapshots under the caller's connection lock.
+
+    Rows are (atom_id, vec, dim, owner_principal, origin_domain, visibility).
+    This is an internal clustering input, not an authorized read API. Callers
+    must select eligible atoms and must not reuse snapshots across ACL changes.
+    No decoding or CPU clustering is performed here.
+    """
+    if not atoms:
+        return []
+    atom_ids = [a["id"] for a in atoms]
+    placeholders = ",".join(["?"] * len(atom_ids))
+    return conn.execute(
+        f"SELECT e.atom_id, e.vec, e.dim, a.owner_principal, "
+        f"a.origin_domain, a.visibility "
+        f"FROM embeddings e JOIN atoms a ON a.id = e.atom_id "
+        f"WHERE e.atom_id IN ({placeholders})",
+        atom_ids,
+    ).fetchall()
+
+
 def cluster_by_similarity(
     conn: sqlite3.Connection,
     atoms: list[dict],
     *,
     threshold: float = DEFAULT_SIMILARITY_THRESHOLD,
     scope_acl: bool = False,
+    embedding_rows: list[EmbeddingRow] | None = None,
 ) -> list[list[dict]]:
     """Greedy single-pass agglomerative clustering.
 
@@ -94,57 +122,84 @@ def cluster_by_similarity(
     if store() was used; defensive).
 
     Caller: reflect() passes this as the ``cluster_fn`` injection.
+    To release the connection lock before CPU work, fetch rows with
+    ``fetch_embedding_rows(conn, atoms)`` under that lock, then pass them as
+    ``embedding_rows`` here outside it. A supplied list (even empty) prevents
+    all connection access. Rows must be trusted embedding/ACL snapshots from
+    that helper, not caller-supplied ownership claims.
     """
     if not atoms:
         return []
 
-    # Bulk-fetch embeddings for all input atoms in one query.
-    atom_ids = [a["id"] for a in atoms]
-    placeholders = ",".join(["?"] * len(atom_ids))
-    rows = conn.execute(
-        f"SELECT e.atom_id, e.vec, e.dim, a.owner_principal, "
-        f"a.origin_domain, a.visibility "
-        f"FROM embeddings e JOIN atoms a ON a.id = e.atom_id "
-        f"WHERE e.atom_id IN ({placeholders})",
-        atom_ids,
-    ).fetchall()
-    vec_by_atom: dict[str, list[float]] = {}
+    import numpy as np
+
+    rows = fetch_embedding_rows(conn, atoms) if embedding_rows is None else embedding_rows
+    vec_by_atom: dict[str, np.ndarray] = {}
     acl_by_atom: dict[str, tuple[str, str | None, str]] = {}
     for atom_id, vec_bytes, dim, owner, domain, visibility in rows:
         # Missing ownership data cannot establish a safe cluster boundary.
         if scope_acl and (not owner or not visibility):
             continue
         try:
-            vec_by_atom[atom_id] = _unpack_vec(vec_bytes, dim)
+            if not isinstance(dim, int) or dim < 0 or len(vec_bytes) != dim * 4:
+                continue
+            vec_by_atom[atom_id] = np.frombuffer(vec_bytes, dtype=np.float32).astype(np.float64)
             if owner and visibility:
                 acl_by_atom[atom_id] = (owner, domain, visibility)
-        except struct.error:
+        except (TypeError, ValueError):
             continue  # malformed; skip atom
+
+    # Like triples._cosine_scores, batch the coordinate arithmetic in numpy.
+    # Unlike its float32 matmul, preserve Python's float64, left-to-right sums:
+    # reassociation can change exact threshold boundaries and first-cluster ties.
+    ids_by_dim: dict[int, list[str]] = {}
+    for atom_id, vec in vec_by_atom.items():
+        ids_by_dim.setdefault(len(vec), []).append(atom_id)
+    matrices = {}
+    norms = {}
+    with np.errstate(invalid="ignore", divide="ignore"):
+        for dim, ids in ids_by_dim.items():
+            mat = np.vstack([vec_by_atom[atom_id] for atom_id in ids])
+            matrices[dim] = mat
+            norms[dim] = (
+                np.sqrt(np.cumsum(mat * mat, axis=1)[:, -1])
+                if dim else np.zeros(len(ids))
+            )
 
     # Greedy single-pass.
     cluster_atoms: list[list[dict]] = []
-    cluster_vecs: list[list[list[float]]] = []
     cluster_acls: list[tuple[str, str | None, str]] = []
     for atom in atoms:
         vec = vec_by_atom.get(atom["id"])
         acl = acl_by_atom.get(atom["id"])
         if vec is None or (scope_acl and acl is None):
             continue  # no embedding/ACL; can't safely cluster
+        dim = len(vec)
+        scores = np.zeros(len(ids_by_dim[dim]))
+        if dim:
+            with np.errstate(invalid="ignore", divide="ignore"):
+                norm = np.sqrt(np.cumsum(vec * vec)[-1])
+                dots = np.cumsum(matrices[dim] * vec, axis=1)[:, -1]
+                np.divide(
+                    dots, norms[dim] * norm, out=scores,
+                    where=(norms[dim] != 0.0) & (norm != 0.0),
+                )
+        sim_by_atom = dict(zip(ids_by_dim[dim], scores.tolist()))
         best_idx = -1
         best_sim = -1.0
-        for i, vecs in enumerate(cluster_vecs):
+        for i, members in enumerate(cluster_atoms):
             if scope_acl and cluster_acls[i] != acl:
                 continue
-            sim = _mean_cosine(vec, vecs)
+            # Different dimensions and zero vectors contribute zero, but still
+            # count in the denominator. Do not normalize a cluster centroid.
+            sim = sum(sim_by_atom.get(a["id"], 0.0) for a in members) / len(members)
             if sim > best_sim:
                 best_sim = sim
                 best_idx = i
         if best_idx >= 0 and best_sim >= threshold:
             cluster_atoms[best_idx].append(atom)
-            cluster_vecs[best_idx].append(vec)
         else:
             cluster_atoms.append([atom])
-            cluster_vecs.append([vec])
             cluster_acls.append(acl or ("", None, ""))
     return cluster_atoms
 

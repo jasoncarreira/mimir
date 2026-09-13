@@ -997,8 +997,8 @@ async def test_consolidate_keeps_rollback_branch_live_atom_in_faiss_index(
 
     monkeypatch.setattr(
         cluster_mod,
-        "make_default_cluster_fn",
-        lambda *_args, **_kwargs: forced_cluster_fn,
+        "cluster_by_similarity",
+        lambda _conn, raws, **_kwargs: forced_cluster_fn(raws),
     )
 
     async def _unused_synth(*_args, **_kwargs):
