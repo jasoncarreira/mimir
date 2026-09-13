@@ -191,6 +191,10 @@ jobs:
         # shared ``poller`` / ``tests.conftest`` module names). saga has
         # its own conftest; the optional-skills trees run in the dedicated
         # per-skill step below (chainlink #299).
+        # TEMPORARY #2029 diagnostic: thread timeout lets xdist report the
+        # crashed worker's nodeid; remove this override before merging.
+        env:
+          PYTEST_ADDOPTS: "--timeout=120 --timeout-method=thread"
         run: uv run pytest -q --tb=short
 
       - name: Run optional-skills tests (per-skill, isolated)
