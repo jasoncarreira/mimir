@@ -5256,6 +5256,25 @@ def approved_fetch_urls(auth_context: Any) -> frozenset[str]:
 
 
 def _target_matches_configured_github_repo_fetch(target: str) -> bool:
+    """Exempt only bounded poller evidence endpoints from the taint gate."""
+    if not _target_within_configured_github_repo(target):
+        return False
+    parsed = urlsplit(target.strip())
+    # No free-form path or query data: immutable SHA or bounded numeric run ID,
+    # and only GitHub's documented page-size range (1..100), once, unencoded.
+    return (
+        parsed.hostname.lower() == "api.github.com"
+        and re.fullmatch(
+            r"/repos/[^/]+/[^/]+/(?:actions/runs/[1-9][0-9]{0,19}/jobs"
+            r"|commits/[0-9a-fA-F]{40}/check-runs)",
+            parsed.path,
+        ) is not None
+        and re.fullmatch(r"(?:per_page=(?:[1-9][0-9]?|100))?", parsed.query) is not None
+        and not parsed.fragment
+    )
+
+
+def _target_within_configured_github_repo(target: str) -> bool:
     """Match HTTPS API or web reads scoped to a configured GitHub repository."""
     try:
         parsed = urlsplit(target.strip())
@@ -5367,7 +5386,7 @@ def fetch_url_is_approved(target: str, auth_context: Any) -> bool:
         or _target_matches_approved_url(target, "MIMIR_EGRESS_APPROVED_URLS")
     ):
         return True
-    if _target_matches_configured_github_repo_fetch(target):
+    if _target_within_configured_github_repo(target):
         return True
     if policy is None:
         return False
