@@ -758,15 +758,30 @@ class SagaStore:
                 from .embeddings import get_provider
 
                 dim = get_provider().dimensions()
-            except Exception:
+            except Exception as exc:
                 # Provider unavailable: never infer its dimension from old rows.
-                # Cache the miss and return None — search callers
-                # (``_make_faiss_search_fn``) already handle None by
-                # returning empty results, so this gracefully
-                # degrades to FTS-only retrieval rather than
-                # building an index at a guessed dim.
-                self._index_built = True
+                # Leave the build retryable so retrieval and maintenance can
+                # recover without restarting the store. Do not log provider
+                # exception text, which can contain credentials or input data.
                 self._index = None
+                from ._config_io import get_config
+                from .ownership import _emit_saga_event
+
+                # Match get_provider's default: an omitted setting still uses
+                # Voyage (or its local fallback), not disabled embeddings.
+                configured = get_config()("embedding", "provider", "voyage")
+                if configured:
+                    log.warning(
+                        "SAGA atom index unavailable; semantic recall degraded "
+                        "to FTS5: %s", type(exc).__name__,
+                    )
+                else:
+                    log.debug("SAGA atom index unavailable: embeddings unconfigured")
+                _emit_saga_event(
+                    "saga_vector_index_degraded",
+                    reason="provider_unavailable" if configured else "embeddings_unconfigured",
+                    error_type=type(exc).__name__,
+                )
                 return None
             self._embedding_dim = dim
         self._index = VectorIndex(dimension=dim)
@@ -778,11 +793,12 @@ class SagaStore:
         """Force a full FAISS rebuild from the current DB state.
         Called by the bench harness between per-question DBs and by
         the migration importer after bulk-loading atoms."""
-        conn = self._ensure_conn()
-        if self._index is None:
-            self._ensure_index(conn)
-        else:
-            self._index.build_from_db(conn)
+        with self._db_lock:
+            with self._write_lock:
+                conn = self._ensure_conn()
+                with self._index_lock:
+                    self._index_built = False
+                    self._ensure_index(conn)
 
     def _rebuild_index_if_needed(self, conn: sqlite3.Connection) -> bool:
         """Invoke the documented >10%-soft-removed FAISS rebuild backstop.
@@ -799,9 +815,11 @@ class SagaStore:
         ordering in query()/store(). Cost: a no-op compare below the 10%
         threshold; one bulk ``build_from_db`` above it.
         """
-        if self._index is None or not self._index.built:
-            return False
         with self._index_lock:
+            if self._index is None or not self._index.built:
+                self._index_built = False
+                index = self._ensure_index(conn)
+                return index is not None and index.built
             return self._index.rebuild_if_needed(conn)
 
     async def rebuild_index_if_needed(self) -> bool:
@@ -1819,7 +1837,7 @@ class SagaStore:
         reports counts without paying any LLM cost or doing any writes.
         Useful for the bench harness's pre-flight check.
         """
-        from .cluster import make_default_cluster_fn
+        from .cluster import cluster_by_similarity, fetch_embedding_rows
 
         # Build/look up the cached LLM synth_fn. The rich variant
         # returns observation + triples + contradictions in one call;
@@ -1856,7 +1874,6 @@ class SagaStore:
             from .dedup import (
                 DEFAULT_DEDUP_THRESHOLD,
                 DedupResult,
-                dedup_pass,
                 distinct_dedup_scopes,
             )
             from .embeddings import resolve_auto_threshold
@@ -1880,12 +1897,6 @@ class SagaStore:
                     DEFAULT_DEDUP_THRESHOLD,
                 )
             )
-            dedup_cluster_fn = make_default_cluster_fn(
-                conn,
-                threshold=effective_dedup_threshold,
-                scope_acl=True,
-            )
-
             scopes = await self._db_locked(
                 lambda: distinct_dedup_scopes(conn, agent_id=self._agent_id)
             )
@@ -1899,29 +1910,21 @@ class SagaStore:
                 if remaining is not None and remaining <= 0:
                     break
 
-                def _do_dedup(
-                    owner=owner,
-                    domain=domain,
-                    scope_visibility=scope_visibility,
+                scoped_result = await self._dedup_scope(
+                    conn,
+                    threshold=effective_dedup_threshold,
+                    agent_id=self._agent_id,
+                    owner_principal=owner,
+                    origin_domain=domain,
+                    visibility=scope_visibility,
                     integrity=integrity,
-                    remaining=remaining,
-                ):
-                    return dedup_pass(
-                        conn,
-                        cluster_fn=dedup_cluster_fn,
-                        agent_id=self._agent_id,
-                        owner_principal=owner,
-                        origin_domain=domain,
-                        visibility=scope_visibility,
-                        integrity=integrity,
-                        lookback_days=lookback_days,
-                        min_cluster_size=2,
-                        dry_run=dry_run,
-                        max_clusters=remaining,
-                        reference_date=reference_date,
-                    )
+                    lookback_days=lookback_days,
+                    min_cluster_size=2,
+                    dry_run=dry_run,
+                    max_clusters=remaining,
+                    reference_date=reference_date,
+                )
 
-                scoped_result = await self._write_locked(_do_dedup)
                 dedup_result.candidates_scanned += scoped_result.candidates_scanned
                 dedup_result.clusters_formed += scoped_result.clusters_formed
                 dedup_result.canonicals_kept.extend(scoped_result.canonicals_kept)
@@ -1936,29 +1939,6 @@ class SagaStore:
                 "duplicates_tombstoned": dedup_result.duplicates_tombstoned,
                 "threshold": effective_dedup_threshold,
             }
-            # chainlink #390: remove the dedup-tombstoned raws from the FAISS
-            # index too (mirror forget()). WHERE tombstoned=0 masks them from
-            # final SQL results, but their vectors still consume FAISS top_k
-            # slots — so over-fetch climbs and genuinely-relevant atoms can get
-            # pushed out of the candidate set until a cold rebuild. Best-effort:
-            # a missed removal degrades gracefully (SQL still masks the row).
-            if (
-                not dry_run
-                and dedup_result.duplicates_tombstoned
-                and self._index is not None
-                and self._index.built
-            ):
-                with self._index_lock:
-                    for atom_id in dedup_result.duplicates_tombstoned:
-                        try:
-                            self._index.remove(atom_id)
-                        except Exception:  # noqa: BLE001
-                            log.warning(
-                                "FAISS index remove failed for dedup-tombstoned "
-                                "atom_id=%r",
-                                atom_id,
-                                exc_info=True,
-                            )
 
         # 1. Candidate selection + clustering (sync; reads only).
         # Re-fetches raws so the tombstoned duplicates from pass 1
@@ -1968,20 +1948,16 @@ class SagaStore:
             MAX_OBSERVATIONS_PER_RUN,
         )
 
-        # chainlink #386: shared-connection reads run under _db_lock so a
-        # concurrent turn's write (also _db_lock-guarded) never touches the same
-        # sqlite3 connection object at the same time — Python's sqlite3 + FTS5
-        # can segfault on concurrent access to one shared connection (class
-        # docstring / chainlink #365). The dedup pass above already clusters
-        # under the write lock; this brings the thematic read phase in line.
-        raws = await self._db_locked(
-            lambda: _candidate_raws(
+        def _snapshot():
+            raws = _candidate_raws(
                 conn,
                 lookback_days=lookback_days,
                 agent_id=self._agent_id,
                 reference_date=reference_date,
             )
-        )
+            return raws, fetch_embedding_rows(conn, raws)
+
+        raws, rows = await self._db_locked(_snapshot)
         # chainlink #331: world_state structural integrity — collapse any
         # dual-current rows from a transient cross-caller write race — is
         # independent of whether there are enough raws to consolidate. Run it for
@@ -2012,8 +1988,9 @@ class SagaStore:
                 "dedup": dedup_payload,
             }
 
-        cluster_fn = make_default_cluster_fn(conn, scope_acl=True)
-        clusters = await self._db_locked(lambda: cluster_fn(raws))  # chainlink #386
+        clusters = await asyncio.to_thread(
+            cluster_by_similarity, conn, raws, embedding_rows=rows, scope_acl=True,
+        )
 
         if dry_run:
             return {
@@ -2328,6 +2305,45 @@ class SagaStore:
             "dedup": dedup_payload,
         }
 
+    async def _dedup_scope(
+        self, conn, *, threshold, min_cluster_size, dry_run, max_clusters,
+        **candidate_options,
+    ):
+        from .cluster import cluster_by_similarity, fetch_embedding_rows
+        from .dedup import _candidate_raws_for_dedup, dedup_pass
+
+        def _snapshot():
+            raws = _candidate_raws_for_dedup(conn, **candidate_options)
+            return raws, fetch_embedding_rows(conn, raws)
+
+        raws, rows = await self._db_locked(_snapshot)
+        clusters = await asyncio.to_thread(
+            cluster_by_similarity, conn, raws, embedding_rows=rows,
+            scope_acl=True, threshold=threshold,
+        )
+
+        def _write():
+            # Serialize SQL and the entire index batch, in db -> write -> index
+            # order. dedup_pass reselects live candidates and revalidates ACLs.
+            with self._index_lock:
+                result = dedup_pass(
+                    conn, cluster_fn=lambda _: clusters,
+                    min_cluster_size=min_cluster_size, dry_run=dry_run,
+                    max_clusters=max_clusters, **candidate_options,
+                )
+                if not dry_run and self._index is not None and self._index.built:
+                    for atom_id in result.duplicates_tombstoned:
+                        try:
+                            self._index.remove(atom_id)
+                        except Exception:  # noqa: BLE001
+                            log.warning(
+                                "FAISS index remove failed for dedup-tombstoned "
+                                "atom_id=%r", atom_id, exc_info=True,
+                            )
+                return result
+
+        return await self._write_locked(_write)
+
     async def consolidate_skill_memories(
         self,
         *,
@@ -2362,11 +2378,9 @@ class SagaStore:
         with one per-skill dedup summary each.
         """
         from .consolidate import distinct_skill_scopes
-        from .cluster import make_default_cluster_fn
         from .dedup import (
             DEFAULT_DEDUP_THRESHOLD,
             DedupResult,
-            dedup_pass,
             distinct_dedup_scopes,
         )
         from .embeddings import resolve_auto_threshold
@@ -2401,15 +2415,6 @@ class SagaStore:
             )
         )
         summary["threshold"] = effective_threshold
-        # One clusterer for all skills — candidate selection inside
-        # dedup_pass (skill_scope) restricts each call to one skill's
-        # atoms, so a shared cluster_fn never crosses skills.
-        cluster_fn = make_default_cluster_fn(
-            conn,
-            threshold=effective_threshold,
-            scope_acl=True,
-        )
-
         for skill in skills:
             scopes = await self._db_locked(
                 lambda skill=skill: distinct_dedup_scopes(
@@ -2426,30 +2431,21 @@ class SagaStore:
                 if remaining is not None and remaining <= 0:
                     break
 
-                def _do_dedup(
-                    skill=skill,
-                    owner=owner,
-                    domain=domain,
-                    scope_visibility=scope_visibility,
+                scoped_result = await self._dedup_scope(
+                    conn,
+                    threshold=effective_threshold,
+                    agent_id=self._agent_id,
+                    owner_principal=owner,
+                    origin_domain=domain,
+                    visibility=scope_visibility,
                     integrity=integrity,
-                    remaining=remaining,
-                ):
-                    return dedup_pass(
-                        conn,
-                        cluster_fn=cluster_fn,
-                        agent_id=self._agent_id,
-                        owner_principal=owner,
-                        origin_domain=domain,
-                        visibility=scope_visibility,
-                        integrity=integrity,
-                        lookback_days=lookback_days,
-                        min_cluster_size=min_cluster_size,
-                        dry_run=dry_run,
-                        max_clusters=remaining,
-                        skill_scope=skill,
-                    )
+                    lookback_days=lookback_days,
+                    min_cluster_size=min_cluster_size,
+                    dry_run=dry_run,
+                    max_clusters=remaining,
+                    skill_scope=skill,
+                )
 
-                scoped_result = await self._write_locked(_do_dedup)
                 res.candidates_scanned += scoped_result.candidates_scanned
                 res.clusters_formed += scoped_result.clusters_formed
                 res.canonicals_kept.extend(scoped_result.canonicals_kept)
@@ -2458,29 +2454,6 @@ class SagaStore:
                 )
                 res.merges.update(scoped_result.merges)
 
-            # chainlink #425: mirror the #390 fix here — the general
-            # consolidate() removes dedup-tombstoned raws from the FAISS
-            # index, but this per-skill pass didn't, so a skill's merged
-            # learnings kept their vectors live and consumed top_k slots
-            # (the exact #390 regression). Best-effort: a missed removal
-            # degrades gracefully (WHERE tombstoned=0 still masks the row).
-            if (
-                not dry_run
-                and res.duplicates_tombstoned
-                and self._index is not None
-                and self._index.built
-            ):
-                with self._index_lock:
-                    for atom_id in res.duplicates_tombstoned:
-                        try:
-                            self._index.remove(atom_id)
-                        except Exception:  # noqa: BLE001
-                            log.warning(
-                                "FAISS index remove failed for dedup-tombstoned "
-                                "skill-learning atom_id=%r",
-                                atom_id,
-                                exc_info=True,
-                            )
             summary["skills"][skill] = {
                 "candidates_scanned": res.candidates_scanned,
                 "clusters_formed": res.clusters_formed,
