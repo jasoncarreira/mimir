@@ -620,10 +620,11 @@ async def test_observe_evidence_sees_untracked_files(tmp_path: Path) -> None:
         started_at=datetime(2026, 6, 11, 5, tzinfo=UTC),
         base_ref="main",
         backend_status="completed",
-        test_command="python -c 'import sys; sys.exit(0)'",
+        # The bounded gate PATH need not contain the active Python (e.g. macOS).
+        test_command=f"{shlex.quote(sys.executable)} -c 'import sys; sys.exit(0)'",
     )
 
-    assert result.review_ready is True
+    assert result.review_ready is True, result.evidence.tests
     assert result.evidence.files_changed == ["new_module.py"]
 
 
@@ -651,7 +652,8 @@ async def test_observe_evidence_sees_committed_backend_work(tmp_path: Path) -> N
         started_at=datetime(2026, 6, 11, 5, tzinfo=UTC),
         base_ref="main",
         backend_status="completed",
-        test_command="python -c 'import sys; sys.exit(0)'",
+        # The bounded gate PATH need not contain the active Python (e.g. macOS).
+        test_command=f"{shlex.quote(sys.executable)} -c 'import sys; sys.exit(0)'",
     )
 
     assert result.review_ready is True
