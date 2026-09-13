@@ -2097,7 +2097,129 @@ def test_interrupted_claim_is_reapable(
     assert "worklink:ready" in labels
 
 
-def test_bounded_timeout_releases_lock_before_failure_routing(tmp_path: Path) -> None:
+@pytest.mark.parametrize("failure_step", ["unlabel", "label"])
+@pytest.mark.parametrize("release_first", [False, True], ids=["fixed", "legacy-negative-control"])
+def test_published_transition_failure_is_reaped_to_review(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure_step: str, release_first: bool,
+) -> None:
+    import mimir.worklink.orchestrator as orchestrator
+    from mimir.worklink.claims import _ChainlinkContentionExhausted
+    from mimir.worklink.control import reconcile_run_states
+
+    repo = tmp_path / "repo"
+    checkout = repo.parent / ".worklink" / repo.name / "441-1"
+    calls, base_runner = _orchestrator_runner(repo, checkout)
+    labels = {"worklink", "worklink:ready"}
+    comments: list[str] = []
+    held = False
+    published = False
+    fail_transition = True
+
+    def runner(args, **kwargs):
+        nonlocal held, published
+        if isinstance(args, list):
+            if args[:3] == ["gh", "pr", "create"]:
+                published = True
+            if args[:2] == ["chainlink", "locks"]:
+                if args[2] in {"claim", "steal"}:
+                    held = True
+                elif args[2] == "release":
+                    held = False
+                elif args[2] == "list":
+                    return cp(args, stdout=json.dumps({"locks": [{"issue_id": 441}] if held else []}))
+            if args[:2] == ["chainlink", "issue"]:
+                if published and fail_transition and args[2] == failure_step:
+                    calls.append(args)
+                    if failure_step == "unlabel":
+                        # Exhaustion raises even for transition's check=False unlabels.
+                        raise _ChainlinkContentionExhausted("contention exhausted")
+                    return cp(args, returncode=1, stderr="label add failed")
+                if args[2] == "label":
+                    labels.add(args[4])
+                elif args[2] == "unlabel":
+                    labels.discard(args[4])
+                elif args[2] == "comment":
+                    comments.append(args[4])
+                elif args[2] == "show":
+                    issue = json.loads(ISSUE_JSON)
+                    issue.update(labels=sorted(labels), comments=comments)
+                    return cp(args, stdout=json.dumps(issue))
+                elif args[2] == "list":
+                    return cp(args, stdout=json.dumps(
+                        [{"id": 441}] if args[args.index("--label") + 1] in labels else []
+                    ))
+        return base_runner(args, **kwargs)
+
+    if release_first:
+        original_transition = ChainlinkClaims.transition_issue
+
+        def legacy_transition(self, issue_id, **kwargs):
+            if published:
+                # Reproduce the old finalizer's actual destructive operation,
+                # before the same failing Chainlink mutation as the fixed case.
+                assert orchestrator._release_issue_and_clear_run_state(
+                    self, home=tmp_path, issue_id=issue_id, attempt=1,
+                )
+            return original_transition(self, issue_id, **kwargs)
+
+        monkeypatch.setattr(ChainlinkClaims, "transition_issue", legacy_transition)
+
+    registry = BackendRegistry(WorklinkConfig())
+    registry.register(FakeBackend())
+    result = asyncio.run(WorklinkRunner(
+        home=tmp_path, repo=repo, runner=runner, registry=registry,
+    ).run(441, backend_name="fake", test_command="echo ok"))
+    assert result.status == "completed"
+    assert result.pr_url
+    assert "issue transition" in result.reason
+    evidence = json.loads(result.evidence_path.read_text())
+    assert evidence["pr_url"] == result.pr_url
+    assert "worklink:review" not in labels
+    assert ("worklink:in-progress" in labels) == (failure_step == "unlabel")
+    assert held is not release_first
+    assert load_run_state(tmp_path, 441) is None
+    labels_before = labels.copy()
+    assert reconcile_run_states(tmp_path, runner=runner, git_runner=runner) == []
+    assert labels == labels_before
+    assert held is not release_first
+
+    claims = ChainlinkClaims(
+        agent_id="reaper", home_path=tmp_path, runner=runner, max_attempts=1,
+        clock=lambda: datetime.now(UTC) + timedelta(days=1),
+    )
+    records = claim_records_from_comments(comments)
+    assert len(records) == 1
+    if release_first:
+        fail_transition = False
+        assert claims.reap_home(ttl=timedelta(minutes=1)).reaped == []
+        assert claims.reap_stale_claims(records, ttl=timedelta(minutes=1)).skipped == {
+            "lock_not_held": 1,
+        }
+        assert "worklink:review" not in labels
+        return
+
+    # The live claim is not recoverable yet, even with completed evidence.
+    claims.clock = lambda: datetime.now(UTC)
+    assert claims.reap_home(ttl=timedelta(minutes=1)).reaped == []
+    assert held
+    claims.clock = lambda: datetime.now(UTC) + timedelta(days=1)
+    # A second transition failure during recovery must also retain discovery.
+    with pytest.raises(RuntimeError):
+        claims.reap_home(ttl=timedelta(minutes=1))
+    assert held
+    fail_transition = False
+    assert claims.reap_home(ttl=timedelta(minutes=1)).reaped == records
+    assert labels == {"worklink", "worklink:review"}
+    assert not held
+    assert reconcile_run_states(tmp_path, runner=runner, git_runner=runner) == []
+    assert labels == {"worklink", "worklink:review"}
+    assert sum(isinstance(c, list) and c[:3] == ["gh", "pr", "create"] for c in calls) == 1
+    assert calls.index(["chainlink", "issue", "label", "441", "worklink:review"]) < calls.index(
+        ["chainlink", "locks", "release", "441"]
+    )
+
+
+def test_bounded_timeout_routes_failure_before_releasing_lock(tmp_path: Path) -> None:
     repo = tmp_path / "repo"
     worktree = repo.parent / ".worklink" / repo.name / "441-1"
     (tmp_path / "worklink.yaml").write_text(
@@ -2159,11 +2281,13 @@ def test_bounded_timeout_releases_lock_before_failure_routing(tmp_path: Path) ->
     assert claims.active_worklink_lock_count() == 0
     release = ["chainlink", "locks", "release", "441"]
     route = ["chainlink", "issue", "unlabel", "441", "worklink:in-progress"]
-    assert calls.index(release) < calls.index(route)
+    # Routing must retain the reservation: a failed transition then remains
+    # discoverable by the stale-lock reaper instead of becoming unlocked work.
+    assert calls.index(route) < calls.index(release)
     assert load_run_state(tmp_path, 441) is None
 
 
-def test_failed_lock_release_is_logged_and_retains_run_state(tmp_path: Path) -> None:
+def test_published_failed_lock_release_is_logged_without_orphan_run_state(tmp_path: Path) -> None:
     _reset_logger_for_tests()
     events = tmp_path / "logs" / "events.jsonl"
     init_logger(events, session_id="test-worklink")
@@ -2181,8 +2305,8 @@ def test_failed_lock_release_is_logged_and_retains_run_state(tmp_path: Path) -> 
 
     assert result.status == "failed"
     assert result.reason == "terminal recovery incomplete: Chainlink lock release failed"
-    assert load_run_state(tmp_path, 441) is not None
-    assert ["chainlink", "issue", "unlabel", "441", "worklink:in-progress"] not in calls
+    assert load_run_state(tmp_path, 441) is None
+    assert ["chainlink", "issue", "label", "441", "worklink:review"] in calls
     records = [json.loads(line) for line in events.read_text(encoding="utf-8").splitlines()]
     failure = next(
         record
@@ -2197,8 +2321,8 @@ def test_failed_lock_release_is_logged_and_retains_run_state(tmp_path: Path) -> 
         record for record in records if record["type"] == "worklink_terminal_recovery_failed"
     )
     assert recovery["lock_released"] is False
-    assert recovery["label_transition_applied"] is False
-    assert recovery["state_retained"] is True
+    assert recovery["label_transition_applied"] is True
+    assert recovery["state_retained"] is False
     _reset_logger_for_tests()
 
 

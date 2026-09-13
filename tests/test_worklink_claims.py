@@ -27,6 +27,38 @@ def completed(args: Sequence[str], returncode: int = 0) -> subprocess.CompletedP
     return subprocess.CompletedProcess(list(args), returncode, stdout="", stderr="")
 
 
+@pytest.mark.parametrize("epic", [False, True])
+def test_published_reaper_preserves_release_only_routing(tmp_path: Path, epic: bool) -> None:
+    record = ClaimRecord(439, 1, "worker", datetime(2026, 6, 11, tzinfo=UTC))
+    evidence_dir = tmp_path / "state/worklink/evidence"
+    evidence_dir.mkdir(parents=True)
+    (evidence_dir / "439-1.json").write_text(json.dumps({
+        "status": "completed", "pr_url": "https://github.com/example/repo/pull/1",
+    }))
+    labels = ["worklink:review", "worklink:epic"] if epic else ["worklink:review"]
+    calls = []
+
+    def runner(args):
+        calls.append(list(args))
+        if args[1:3] == ["locks", "list"]:
+            return subprocess.CompletedProcess(args, 0, json.dumps({"locks": [{"issue_id": 439}]}), "")
+        if args[1:3] == ["issue", "show"]:
+            return subprocess.CompletedProcess(args, 0, json.dumps({
+                "labels": labels, "comments": [record.to_comment()],
+            }), "")
+        return completed(args)
+
+    claims = ChainlinkClaims(
+        agent_id="reaper", home_path=tmp_path, runner=runner,
+        clock=lambda: record.claimed_at + timedelta(days=1),
+    )
+    claims.reap_stale_claims(
+        [record], ttl=timedelta(minutes=1), release_only_issue_ids=() if epic else (439,),
+    )
+    assert ["chainlink", "locks", "release", "439"] in calls
+    assert not any(c[1:3] in (["issue", "label"], ["issue", "unlabel"]) for c in calls)
+
+
 def test_claim_records_round_trip_and_next_attempt() -> None:
     record = ClaimRecord(
         issue_id=439,
