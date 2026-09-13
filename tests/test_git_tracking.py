@@ -25,7 +25,6 @@ from __future__ import annotations
 import asyncio
 import json
 import os
-import select
 import signal
 import subprocess
 import sys
@@ -57,7 +56,7 @@ def fake_git_process(monkeypatch):
 
 
 @pytest.mark.asyncio
-@pytest.mark.skipif(sys.platform != "linux", reason="Linux pidfds prove owned child exit")
+@pytest.mark.skipif(sys.platform != "linux", reason="Linux process-group and pipe regression")
 @pytest.mark.parametrize("cancel", [False, True], ids=["timeout", "cancel"])
 @pytest.mark.parametrize("parent_exited", [False, True], ids=["live-parent", "exited-parent"])
 async def test_git_group_drained_before_rebase_abort(
@@ -67,8 +66,31 @@ async def test_git_group_drained_before_rebase_abort(
 
     spawn = asyncio.create_subprocess_exec
     ready = asyncio.Event()
-    processes, child_fds, aborted = [], [], []
+    processes, child_pids, aborted = [], [], []
+    # Linux alone does not imply these optional CPython build capabilities.
+    # Exercise the hosted-CI capability set even on a pidfd-enabled interpreter.
+    monkeypatch.delattr(os, "pidfd_open", raising=False)
+    monkeypatch.delattr(signal, "pidfd_send_signal", raising=False)
     monkeypatch.setattr(git_tracking, "CLEANUP_JOIN_TIMEOUT", 1.0)
+
+    def writer_released():
+        # The acknowledgement is written only after the child acquires this
+        # lock, which it never explicitly releases. Unlock proves it can no
+        # longer mutate the repository, not that it has reached zombie state.
+        with (tmp_path / "writer.lock").open("a") as guard:
+            try:
+                fcntl.flock(guard, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                return False
+            return True
+
+    async def wait_writer_released():
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + 5
+        while not writer_released():
+            assert loop.time() < deadline, "child still holds writer.lock after cleanup"
+            await asyncio.sleep(0.001)
+
     # Own the reader limit and observe its public transport state instead of
     # guessing when asyncio's private StreamReader._paused flag will flip.
     class ObservedReader(asyncio.StreamReader):
@@ -124,7 +146,7 @@ async def test_git_group_drained_before_rebase_abort(
                     f"stderr: {proc.stderr.diagnostic()}"
                 )
                 await asyncio.sleep(0.001)
-            child_fds.append(os.pidfd_open(int(pid_file.read_text())))
+            child_pids.append(int(pid_file.read_text()))
             # A killed parent alone cannot close the child's inherited pipes.
             # With a 1 KiB reader limit, >2 KiB received and a non-reading
             # transport demonstrate backpressure without inspecting _paused.
@@ -151,10 +173,8 @@ async def test_git_group_drained_before_rebase_abort(
                 *args, cwd=tmp_path, timeout=60 if cancel else 0,
             )
         if args[:2] == ("rebase", "--abort"):
-            # The child holds this lock for its entire userspace lifetime. Linux
-            # may close its files before pidfd reports the final zombie state.
-            with (tmp_path / "writer.lock").open("a") as guard:
-                fcntl.flock(guard, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            # Recovery must not start while the descendant can still write.
+            assert writer_released(), "rebase abort raced the child writer"
             assert processes[0].returncode is not None
             assert processes[0].stdout.at_eof()
             assert processes[0].stderr.at_eof()
@@ -186,7 +206,7 @@ async def test_git_group_drained_before_rebase_abort(
             with pytest.raises(git_tracking.GitCleanupTimeout):
                 await task
             assert aborted == []
-            assert not select.select([child_fds[0]], [], [], 0)[0]
+            assert not writer_released(), "exited-parent case lost its live writer"
             return
         if cancel:
             with pytest.raises(asyncio.CancelledError):
@@ -194,18 +214,17 @@ async def test_git_group_drained_before_rebase_abort(
         else:
             assert await task is False
         assert aborted == [True]
-        exited = asyncio.Event()
-        loop = asyncio.get_running_loop()
-        loop.add_reader(child_fds[0], exited.set)
-        try:
-            await asyncio.wait_for(exited.wait(), 5)
-        finally:
-            loop.remove_reader(child_fds[0])
+        await wait_writer_released()
     finally:
         # Also clean up the deliberately broken implementation in the red run.
-        for fd in child_fds:
-            if not select.select([fd], [], [], 0)[0]:
-                signal.pidfd_send_signal(fd, signal.SIGKILL)
+        # Only signal the test's acknowledged writer while it retains its lock;
+        # do not signal a numeric PID after observing its lifetime has ended.
+        for pid in child_pids:
+            if not writer_released():
+                try:
+                    os.kill(pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
         async def bounded_join(awaitable):
             owned = asyncio.ensure_future(awaitable)
             done, _ = await asyncio.wait([owned], timeout=2)
@@ -216,17 +235,13 @@ async def test_git_group_drained_before_rebase_abort(
                 # Cleanup must not replace the original assertion/exception.
                 owned.exception()
 
-        try:
-            for proc in processes:
-                if proc.returncode is None:
-                    proc.kill()
-                await bounded_join(proc.communicate())
-                await bounded_join(proc.wait())
-            task.cancel()
-            await bounded_join(task)
-        finally:
-            for fd in child_fds:
-                os.close(fd)
+        for proc in processes:
+            if proc.returncode is None:
+                proc.kill()
+            await bounded_join(proc.communicate())
+            await bounded_join(proc.wait())
+        task.cancel()
+        await bounded_join(task)
 
 
 @pytest.mark.asyncio
