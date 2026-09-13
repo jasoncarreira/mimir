@@ -1187,6 +1187,10 @@ asyncio.run(run())
 
 
 @pytest.mark.asyncio
+@pytest.mark.skipif(
+    sys.platform != "linux",
+    reason="C-delivery handshake relies on Linux MSG_WAITALL copying partial data before waiting",
+)
 async def test_shutdown_journal_observer_arms_watchdog_without_python_dispatch(tmp_path: Path) -> None:
     progress = tmp_path / "child-progress"
     source = _journal_source(progress) + r'''
