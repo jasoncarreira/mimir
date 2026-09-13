@@ -1840,6 +1840,46 @@ async def test_server_startup_and_cleanup_resource_order(
 
 
 @pytest.mark.asyncio
+async def test_cleanup_joins_git_push_and_retry_registries(tmp_path, monkeypatch):
+    from mimir import git_tracking
+
+    app, control = _controlled_server_app(tmp_path, monkeypatch)
+    await _run_startup(app)
+    pending, retries = {}, {}
+    monkeypatch.setattr(git_tracking, "_pending_push_tasks", pending)
+    monkeypatch.setattr(git_tracking, "_push_retry_tasks", retries)
+    started = asyncio.Queue()
+    finished = []
+
+    async def worker(registry, key):
+        started.put_nowait(key)
+        try:
+            await asyncio.Event().wait()
+        finally:
+            await asyncio.sleep(0)
+            registry.pop(key, None)
+            finished.append(key)
+
+    tasks = []
+    for registry, key in [(pending, "push"), (retries, "retry")]:
+        task = asyncio.create_task(worker(registry, key))
+        registry[key] = task
+        tasks.append(task)
+    retries["empty"] = None
+    await started.get()
+    await started.get()
+    try:
+        await _run_cleanup(app)
+        assert all(task.done() for task in tasks)
+        assert sorted(finished) == ["push", "retry"]
+        assert pending == retries == {}
+    finally:
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+
+@pytest.mark.asyncio
 async def test_server_cleanup_stops_scheduler_before_final_channel_drain(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

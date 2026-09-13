@@ -16,6 +16,7 @@ transport layer to fail.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from collections.abc import Iterable, Mapping
@@ -275,7 +276,7 @@ class RecordingSagaClient:
         try:
             result = await fn(*args, **kwargs)
             return result
-        except Exception as exc:
+        except (Exception, asyncio.CancelledError) as exc:
             error = f"{type(exc).__name__}: {exc}"
             raise
         finally:

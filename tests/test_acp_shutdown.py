@@ -1088,10 +1088,23 @@ async def test_shutdown_journal_timeout_distinguishes_surviving_child(
 import asyncio
 from types import SimpleNamespace
 
+fire_watchdog = threading.Event()
+main_ident = threading.get_ident()
+
 class ControlledTimer(JournalTimer):
     def run(self):
-        if os.read(0, 1) == b'x':
-            self.function(*self.args, **self.kwargs)
+        fire_watchdog.wait()
+        self.function(*self.args, **self.kwargs)
+
+def deliver():
+    while token := os.read(0, 1):
+        if token == b'x':
+            fire_watchdog.set()
+        else:
+            signum = {b't': signal.SIGTERM, b'i': signal.SIGINT}[token]
+            # These stages diagnose graceful dispatch and repeat-signal exit.
+            # Process-directed delivery can leave main blocked indefinitely.
+            signal.pthread_kill(main_ident, signum)
 
 proxy.threading.Timer = ControlledTimer
 _journal_force_exit = lambda self: record(b'force-exit-survived')
@@ -1104,6 +1117,7 @@ def cleanup():
 async def run():
     hooks = proxy._ShutdownHooks(SimpleNamespace(terminate_owned_children=cleanup))
     hooks.install()
+    threading.Thread(target=deliver, daemon=True).start()
     os.write(1, b'ready\n')
     threading.Event().wait()
 
@@ -1125,7 +1139,8 @@ asyncio.run(run())
         async with _shutdown_ceiling(process, progress, lambda: "self-test handshake", timeout=600):
             assert await process.stdout.readline() == b"ready\n"
             if stage != "unarmed":
-                process.send_signal(signal.SIGTERM)
+                process.stdin.write(b"t")
+                await process.stdin.drain()
                 await await_marker("cleanup-enter")
                 await _await_diagnostic(progress, f"tee-forward-returned:{signal.SIGTERM}", timeout=None)
             if stage == "force-exit":
@@ -1133,7 +1148,8 @@ asyncio.run(run())
                 await process.stdin.drain()
                 await await_marker("force-exit-survived")
             elif stage == "escalation":
-                process.send_signal(signal.SIGINT)
+                process.stdin.write(b"i")
+                await process.stdin.drain()
                 await await_marker(f"escalation-survived:{128 + signal.SIGINT}")
                 await _await_diagnostic(progress, f"tee-forward-returned:{signal.SIGINT}", timeout=None)
             # The short timeout tests formatting, never child startup or delivery.
@@ -1151,7 +1167,7 @@ asyncio.run(run())
             else:
                 assert f"wakeup-byte:{signal.SIGTERM}" in message
                 assert f"signal-enter:{signal.SIGTERM}\n" in message
-                # The observer can start the watchdog across Python dispatch;
+                # Either the observer or main's fallback can arm the watchdog;
                 # only watchdog-start completion must precede cleanup.
                 without_dispatch = message.replace(f"signal-enter:{signal.SIGTERM}\n", "")
                 assert "watchdog-start-enter\nwatchdog-start-returned\ncleanup-enter\n" in without_dispatch
@@ -1171,35 +1187,122 @@ asyncio.run(run())
 
 
 @pytest.mark.asyncio
-@pytest.mark.timeout(120)
 @pytest.mark.skipif(
     sys.platform != "linux",
-    reason="C-delivery handshake relies on Linux socketpair MSG_WAITALL readability semantics",
+    reason="C-delivery handshake relies on Linux MSG_WAITALL copying partial data before waiting",
 )
-async def test_shutdown_journal_wakeup_without_python_signal_handler(tmp_path: Path) -> None:
+async def test_shutdown_journal_observer_arms_watchdog_without_python_dispatch(tmp_path: Path) -> None:
     progress = tmp_path / "child-progress"
     source = _journal_source(progress) + r'''
-import asyncio, ctypes, select, socket, time
+import asyncio, ctypes
 from types import SimpleNamespace
 
 reader, writer = socket.socketpair()
-writer.sendall(b'x')
-assert select.select([reader], [], [], 0)[0]
 libc = ctypes.CDLL(None)
 libc.recv.argtypes = [ctypes.c_int, ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int]
 libc.recv.restype = ctypes.c_ssize_t
 buffer = ctypes.create_string_buffer(2)
+proxy.threading.Timer = InputTimer
 
-def deliver():
-    # Losing readability proves libc consumed the first byte of MSG_WAITALL.
-    # The peer stays open and never sends the second byte. Target this worker,
-    # not main: the C handler writes a byte without interrupting main's recv.
-    while select.select([reader], [], [], 0)[0]:
+def deliver(hooks):
+    writer.sendall(b'x')
+    # Observe main's receive writing byte one, not socket readiness. Keep the
+    # peer open and withhold byte two so main stays inside the C MSG_WAITALL.
+    while buffer[0] != b'x':
         time.sleep(0.001)
     record(b'main-blocked')
     signal.pthread_kill(threading.get_ident(), signal.SIGTERM)
     record(b'worker-signalled')
     _journal_flush()
+    # The observer forwards only after _arm_watchdog returns. Unlike waiting
+    # for timer startup, this acknowledgment also completes if arming is broken.
+    forwarded = hooks._wakeup[0]
+    forwarded.setblocking(True)
+    assert forwarded.recv(1) == bytes([signal.SIGTERM])
+    os.write(1, b'observer-returned\n')
+
+def cleanup():
+    record(b'cleanup-enter')
+
+async def run():
+    hooks = proxy._ShutdownHooks(SimpleNamespace(terminate_owned_children=cleanup))
+    hooks.install()
+    threading.Thread(target=deliver, args=(hooks,), daemon=True).start()
+    libc.recv(reader.fileno(), buffer, 2, socket.MSG_WAITALL)
+    record(b'recv-returned')
+    threading.Event().wait()
+
+asyncio.run(run())
+'''
+    process = await asyncio.create_subprocess_exec(
+        sys.executable, "-c", source,
+        stdin=asyncio.subprocess.PIPE,
+        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+        cwd=Path(__file__).resolve().parents[1],
+    )
+    try:
+        async with _shutdown_ceiling(process, progress, lambda: "observer arming acknowledgment"):
+            assert await process.stdout.readline() == b"observer-returned\n"
+            state = progress.read_text()
+            diagnostics = progress.with_suffix(".diagnostics").read_text()
+            setup = [line for line in state.splitlines()
+                     if line in {"handlers-installed", "main-blocked", "worker-signalled"}]
+            assert setup == ["handlers-installed", "main-blocked", "worker-signalled"]
+            assert progress.with_suffix(".wakeup").read_bytes() == bytes([signal.SIGTERM])
+            assert "watchdog-start-enter\nwatchdog-start-returned\n" in state
+            assert "signal-enter:" not in state
+            assert "signal-dispatch:" not in diagnostics
+            assert "cleanup-enter" not in state
+            assert "recv-returned" not in state
+            assert "watchdog-fired" not in state
+            assert process.returncode is None
+    finally:
+        if process.returncode is None:
+            process.kill()
+        await process.communicate()
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(120)
+@pytest.mark.skipif(
+    sys.platform != "linux",
+    reason="C-delivery handshake relies on Linux MSG_WAITALL copying partial data before waiting",
+)
+async def test_shutdown_journal_wakeup_without_python_signal_handler(tmp_path: Path) -> None:
+    progress = tmp_path / "child-progress"
+    source = _journal_source(progress) + r'''
+import asyncio, ctypes, socket, time
+from types import SimpleNamespace
+
+reader, writer = socket.socketpair()
+libc = ctypes.CDLL(None)
+libc.recv.argtypes = [ctypes.c_int, ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int]
+libc.recv.restype = ctypes.c_ssize_t
+buffer = ctypes.create_string_buffer(2)
+watchdog_started = threading.Event()
+
+class ObservedTimer(InputTimer):
+    def start(self):
+        super().start()
+        watchdog_started.set()
+
+proxy.threading.Timer = ObservedTimer
+
+def deliver():
+    writer.sendall(b'x')
+    # Only main's recv writes this buffer: Linux copies the first byte into
+    # userspace before waiting for the rest of MSG_WAITALL. Observe that write,
+    # not socket readiness (which is not an acknowledgment from the receiver).
+    # Keep the peer open and withhold byte two, so main cannot leave this C call.
+    while buffer[0] != b'x':
+        time.sleep(0.001)
+    record(b'main-blocked')
+    # Target this worker, not main: C delivery must not interrupt main's recv.
+    signal.pthread_kill(threading.get_ident(), signal.SIGTERM)
+    record(b'worker-signalled')
+    _journal_flush()
+    # Tee completion only orders forwarding, not the observer's timer startup.
+    watchdog_started.wait()
     os.write(1, b'delivered\n')
 
 async def run():
@@ -1214,6 +1317,7 @@ asyncio.run(run())
 '''
     process = await asyncio.create_subprocess_exec(
         sys.executable, "-c", source,
+        stdin=asyncio.subprocess.PIPE,
         stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
         cwd=Path(__file__).resolve().parents[1],
     )
@@ -1227,7 +1331,10 @@ asyncio.run(run())
             message = str(failure.value)
             assert "outstanding=Python handler" in message
             assert f"pid={process.pid}, returncode=None" in message
-            assert "handlers-installed\nmain-blocked\nworker-signalled\n" in message
+            # The observer may journal timer startup before pthread_kill returns.
+            setup = [line for line in progress.read_text().splitlines()
+                     if line in {"handlers-installed", "main-blocked", "worker-signalled"}]
+            assert setup == ["handlers-installed", "main-blocked", "worker-signalled"]
             assert f"wakeup-byte:{signal.SIGTERM}" in message
             assert "signal-enter:" not in message
             assert "signal-dispatch:" not in message

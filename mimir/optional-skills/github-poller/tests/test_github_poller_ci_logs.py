@@ -67,6 +67,8 @@ def ci(monkeypatch, tmp_path):
             data = {"commit": {"committer": {"date": "2026-09-08T09:00:00Z"}}}
         elif endpoint == f"repos/o/r/commits/{HEAD}/check-runs?per_page=100":
             data = {"check_runs": [check], "total_count": 1}
+        elif endpoint == f"repos/o/r/actions/runs?head_sha={HEAD}&per_page=100":
+            data = {"workflow_runs": [run], "total_count": 1}
         elif endpoint == "repos/o/r/actions/jobs/101":
             data = job
         elif endpoint == "repos/o/r/actions/runs/50":
@@ -83,7 +85,9 @@ def ci(monkeypatch, tmp_path):
                            calls=calls, log_timeouts=log_timeouts)
 
 
-@pytest.mark.parametrize("path", ["changes_requested", "stale", "rearmed", "ci_failure"])
+@pytest.mark.parametrize("path", [
+    "changes_requested", "stale", "rearmed", "ci_failure", "ci_attention",
+])
 def test_remediation_log_read_reachable(ci, capsys, path):
     # Use the actual installed-skill declaration, not an invented test grant.
     # Removing approved_urls/fetch_url must kill this positive reachability test.
@@ -96,12 +100,24 @@ def test_remediation_log_read_reachable(ci, capsys, path):
         }}
         poller._check_own_changes_requested("o/r", "test-token", "bot", prior, now=NOW)
     else:
+        if path == "ci_attention":
+            ci.run.update(status="completed", conclusion="cancelled", workflow_id=7,
+                          created_at=SINCE, updated_at="2026-09-08T11:00:00Z")
+            ci.check["conclusion"] = ci.job["conclusion"] = "cancelled"
         poller._check_pr_ci_failures("o/r", SINCE, "test-token", "bot", {}, now=NOW)
     event = json.loads(capsys.readouterr().out)
     prompt = event["prompt"]
     assert event["head_sha"] == HEAD and event["repo"] == "o/r"
     if path == "ci_failure":
         assert event["failed_checks"][0]["name"] == "tests"
+    if path == "ci_attention":
+        assert event["event_type"] == "pr_ci_attention"
+        assert set(event) == {
+            "poller", "source_platform", "prompt", "subject_type", "event_type",
+            "repo", "number", "url", "head_sha", "cancelled_run_ids", "delivery_key",
+        }
+        assert "https://github.com/o/r/actions/runs/50" in prompt
+        assert "does not authorize remediation" in prompt
     assert "untrusted third-party content" in prompt
     assert f"CI evidence for o/r at immutable head {HEAD}" in prompt
     evidence, _ = json.JSONDecoder().raw_decode(prompt.split("before changing anything.\n", 1)[1])
@@ -112,6 +128,71 @@ def test_remediation_log_read_reachable(ci, capsys, path):
     assert "test-token" not in prompt
     assert "password=x" not in prompt and "ghp_ci_secret" not in prompt
     assert "[REDACTED]" in prompt
+    assert sum("--allow-escape-sequences" in call for call in ci.calls) == 1
+
+
+@pytest.mark.parametrize("unavailable", ["checks", "job", "logs", "binding"])
+def test_attention_keeps_run_link_and_limitation_without_evidence(ci, monkeypatch, capsys, unavailable):
+    ci.run.update(status="completed", conclusion="cancelled", workflow_id=7,
+                  created_at=SINCE, updated_at="2026-09-08T11:00:00Z")
+    ci.check["conclusion"] = ci.job["conclusion"] = "cancelled"
+    if unavailable == "binding":
+        ci.job["head_sha"] = "c" * 40
+    original = poller.subprocess.run
+
+    def gh(argv, **kwargs):
+        if unavailable == "checks" and "/check-runs?" in argv[2]:
+            return SimpleNamespace(returncode=0, stdout=json.dumps({"check_runs": [], "total_count": 0}), stderr="")
+        if unavailable == "job" and argv[2] == "repos/o/r/actions/jobs/101":
+            return SimpleNamespace(returncode=1, stdout="", stderr="unavailable")
+        if unavailable == "logs" and "--allow-escape-sequences" in argv:
+            return SimpleNamespace(returncode=1, stderr=b"unavailable")
+        return original(argv, **kwargs)
+
+    monkeypatch.setattr(poller.subprocess, "run", gh)
+    count, _ = poller._check_pr_ci_failures("o/r", SINCE, "test-token", "bot", {}, now=NOW)
+    event = json.loads(capsys.readouterr().out)
+    assert count == 1 and event["event_type"] == "pr_ci_attention"
+    assert "https://github.com/o/r/actions/runs/50" in event["prompt"]
+    assert "CI log limitation:" in event["prompt"]
+    assert "FAILED sentinel" not in event["prompt"]
+    assert not {"signal", "failed_checks", "head_repo", "head_ref", "base_sha"} & event.keys()
+
+
+def test_attention_evidence_excludes_silenced_run_checks(ci, monkeypatch, capsys):
+    ci.run.update(status="completed", conclusion="cancelled", workflow_id=7,
+                  created_at=SINCE, updated_at="2026-09-08T11:00:00Z")
+    # The unknown run's failed job is evidence, not remediation authority.
+    other_run = dict(ci.run, id=60, workflow_id=8)
+    replacement = dict(other_run, id=61, status="in_progress", conclusion=None)
+    other_check = dict(ci.check, id=100, conclusion="cancelled",
+                       details_url="https://github.com/o/r/actions/runs/60/job/102")
+    original = poller.subprocess.run
+
+    def gh(argv, **kwargs):
+        if argv[2] == f"repos/o/r/actions/runs?head_sha={HEAD}&per_page=100":
+            data = {"workflow_runs": [ci.run, other_run, replacement], "total_count": 3}
+            return SimpleNamespace(returncode=0, stdout=json.dumps(data), stderr="")
+        if "/check-runs?" in argv[2]:
+            data = {"check_runs": [other_check, ci.check], "total_count": 2}
+            return SimpleNamespace(returncode=0, stdout=json.dumps(data), stderr="")
+        return original(argv, **kwargs)  # Unexpected job/run reads fail in the fixture.
+
+    monkeypatch.setattr(poller.subprocess, "run", gh)
+    count, _ = poller._check_pr_ci_failures("o/r", SINCE, "test-token", "bot", {}, now=NOW)
+    event = json.loads(capsys.readouterr().out)
+    assert count == 1 and event["event_type"] == "pr_ci_attention"
+    assert event["cancelled_run_ids"] == [50]
+    assert "FAILED sentinel" in event["prompt"]
+    assert "/actions/runs/60" not in event["prompt"]
+
+
+def test_cancelled_evidence_reachable_for_independently_authorized_review(ci, capsys):
+    ci.check["conclusion"] = ci.job["conclusion"] = "cancelled"
+    poller._check_pr_reviews("o/r", SINCE, "test-token", "bot")
+    event = json.loads(capsys.readouterr().out)
+    assert event["event_type"] == "pr_review"
+    assert "FAILED sentinel" in event["prompt"]
     assert sum("--allow-escape-sequences" in call for call in ci.calls) == 1
 
 
@@ -160,7 +241,9 @@ def test_capture_requires_declared_authority(ci, monkeypatch, tmp_path, removed)
     "check_head", "job_head", "run_head", "run_repo", "run_head_repo", "job_run", "fork",
     "job_id", "run_id", "check_status", "job_conclusion", "check_conclusion",
 ])
-def test_rejects_unbound_log_targets(ci, target):
+@pytest.mark.parametrize("conclusion", ["failure", "cancelled"])
+def test_rejects_unbound_log_targets(ci, target, conclusion):
+    ci.check["conclusion"] = ci.job["conclusion"] = conclusion
     urls = {
         "third_party": "https://example.com/o/r/actions/runs/50/job/101",
         "other_repo": "https://github.com/o/other/actions/runs/50/job/101",

@@ -32,6 +32,7 @@ import stat
 import time
 import traceback as tb
 from dataclasses import dataclass
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Awaitable, Callable
@@ -48,6 +49,7 @@ from apscheduler.triggers.interval import IntervalTrigger
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from .billing import normalize_priority
+from .background_io import run_in_pool
 from .background_tasks import cancel_background_tasks, spawn_background
 from .access_control import (
     SCHEDULER_AUTHORITY_PROFILES,
@@ -81,6 +83,10 @@ from .poller_triggers import trigger_fifo_path
 from .saga_client import SagaClient, SagaError
 
 log = logging.getLogger(__name__)
+
+# Process-lifetime pools start threads lazily and cannot starve DNS/turn IO.
+_SCRATCH_POOL = ThreadPoolExecutor(max_workers=1, thread_name_prefix="scratch-sweep")
+_WORKLINK_POOL = ThreadPoolExecutor(max_workers=1, thread_name_prefix="worklink-reap")
 
 UTC = timezone.utc
 
@@ -1594,7 +1600,9 @@ class Scheduler:
         if not fresh_below_wall:
             return
 
-        if not tracker.clear():
+        if not await asyncio.to_thread(
+            tracker.clear_if_current, recorded_at=recorded_at,
+        ):
             return
         await log_event(
             "quota_recovered",
@@ -2428,37 +2436,6 @@ class Scheduler:
             )
             return
 
-        # Priority-banded suppression: same homeostat gate the
-        # scheduled ticks go through, keyed by the poller's declared
-        # priority. Checked BEFORE the subprocess runs, so the
-        # poller's cursor stays frozen — after recovery the next cron
-        # tick picks up everything that accumulated (events are
-        # delayed, not lost). Without this gate a ``* * * * *``
-        # poller keeps spawning turns under quota pressure: burning
-        # the last of the window, or 429ing and refreshing the pause
-        # every minute while heartbeats dutifully back off.
-        decision = await self._consult_arbiter(priority=poller.priority)
-        if decision is not None and not decision.fire:
-            await log_event(
-                "poller_fire_suppressed",
-                poller=poller_name,
-                reason=decision.reason,
-                priority=decision.priority,
-                severity=decision.severity.name,
-                **(
-                    {"burst_multiple": round(decision.burst_multiple, 3)}
-                    if decision.burst_multiple is not None else {}
-                ),
-            )
-            return
-
-        budget_exceeded = await asyncio.to_thread(
-            self._poller_budget_exceeded, poller,
-        )
-        if budget_exceeded is not None:
-            await log_event("poller_budget_suppressed", **budget_exceeded)
-            return
-
         # Acquire under a 5s timeout; emit the throttle event once if
         # we time out, then re-acquire without a timeout. Single
         # ``wait_for`` instead of locked()-probe-then-acquire avoids
@@ -2480,12 +2457,9 @@ class Scheduler:
             await self._poller_semaphore.acquire()
 
         try:
-            # #488: re-consult the arbiter AFTER the (possibly long) semaphore
-            # wait. Under many per-minute pollers contending for the slots, the
-            # pre-acquire decision can be arbitrarily stale — a 429 during the
-            # wait flips the arbiter to shed-all, and firing anyway would do real
-            # upstream calls during a hard pause, defeating the priority-banded
-            # suppression in exactly the contended load it exists for.
+            # Gate scans must be bounded by the same semaphore as subprocesses:
+            # a cron burst must not queue unbounded scans in the default pool.
+            # Checking here also observes quota pauses recorded during the wait.
             recheck = await self._consult_arbiter(priority=poller.priority)
             if recheck is not None and not recheck.fire:
                 await log_event(
@@ -3113,7 +3087,9 @@ class Scheduler:
                     close_merged_chainlinks_for_home(home),
                 )
 
-            reap_result, _, pruned_paths, closed_chainlinks = await asyncio.to_thread(_reap)
+            reap_result, _, pruned_paths, closed_chainlinks = await run_in_pool(
+                _WORKLINK_POOL, _reap,
+            )
             await log_event(
                 "worklink_claims_reaped",
                 count=len(reap_result.reaped),
@@ -3211,8 +3187,8 @@ class Scheduler:
         roots = resolve_scratch_roots()
 
         async def _fire() -> None:
-            result = await asyncio.to_thread(
-                sweep_scratch_roots, home, ttl_days=ttl_days, roots=roots
+            result = await run_in_pool(
+                _SCRATCH_POOL, sweep_scratch_roots, home, ttl_days=ttl_days, roots=roots
             )
             if result.removed or result.errors:
                 await log_event(

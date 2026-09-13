@@ -90,6 +90,8 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass
+from concurrent.futures import ThreadPoolExecutor
+from .background_io import run_in_pool
 from contextlib import ExitStack
 from datetime import datetime, timezone
 from pathlib import Path
@@ -119,6 +121,8 @@ from .poller_budget import (
 )
 
 log = logging.getLogger(__name__)
+
+_ATTESTATION_POOL = ThreadPoolExecutor(max_workers=4, thread_name_prefix="poller-attest")
 
 # Wall-clock ceiling for one poller subprocess. Overrunning it is not a partial
 # result: the timeout path discards the stdout already collected (see the
@@ -855,7 +859,8 @@ def _github_recovery_relevance_check(
                 escaped_repo = "/".join(
                     urllib.parse.quote(value, safe="") for value in parts
                 )
-                attestation = await asyncio.to_thread(
+                attestation = await run_in_pool(
+                    _ATTESTATION_POOL,
                     _github_api_attestation,
                     f"repos/{escaped_repo}/pulls/{number}",
                     token,
@@ -3072,7 +3077,8 @@ async def run_poller(
                     # These contain repository facts computed by the poller, not
                     # third-party prose. Trust still requires a matching live,
                     # agent-owned PR; active ingest remains recorded below.
-                    trusted = await asyncio.to_thread(
+                    trusted = await run_in_pool(
+                        _ATTESTATION_POOL,
                         attest_in_fire,
                         _github_framework_trigger_is_trusted,
                         repo,
@@ -3081,7 +3087,8 @@ async def run_poller(
                         env.get("MIMIR_GITHUB_SELF_LOGIN", ""),
                     )
                 elif event_type in _GITHUB_ACTOR_EVENT_TYPES:
-                    author = await asyncio.to_thread(
+                    author = await run_in_pool(
+                        _ATTESTATION_POOL,
                         attest_in_fire,
                         _github_content_author,
                         repo,
@@ -3105,7 +3112,8 @@ async def run_poller(
                         github_trust_attempts[cache_key] = (
                             github_trust_attempts.get(cache_key, 0) + 1
                         )
-                        resolved_trust = await asyncio.to_thread(
+                        resolved_trust = await run_in_pool(
+                            _ATTESTATION_POOL,
                             attest_in_fire,
                             _github_author_is_trusted,
                             repo,

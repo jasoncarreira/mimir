@@ -1246,6 +1246,8 @@ def _slow_main_harness(
                             "2026-08-22T12:00:00Z")]
         if "/check-runs" in endpoint:
             return {"check_runs": []}
+        if "/actions/runs?head_sha=" in endpoint:
+            return {"workflow_runs": [], "total_count": 0}
         if "/compare/" in endpoint:
             return {"behind_by": 1}
         if "/commits/" in endpoint:

@@ -80,6 +80,26 @@ def ctx_for_test():
 
 
 @pytest.mark.asyncio
+async def test_cancelled_query_records_failure_and_propagates(ctx_for_test):
+    entered = asyncio.Event()
+
+    class CancelledSaga(_FakeSaga):
+        async def query(self, *args, **kwargs):
+            entered.set()
+            await asyncio.Event().wait()
+
+    task = asyncio.create_task(RecordingSagaClient(CancelledSaga()).query("cancel me"))
+    await entered.wait()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert len(ctx_for_test.saga_calls) == 1
+    record = ctx_for_test.saga_calls[0]
+    assert record.error.startswith("CancelledError:")
+    assert record.result == {"ok": False}
+
+
+@pytest.mark.asyncio
 async def test_query_call_records_args_and_result(ctx_for_test):
     inner = _FakeSaga()
     wrapped = RecordingSagaClient(inner)
