@@ -752,17 +752,49 @@ def _gate_results_diverge(
     )
 
 
+@contextlib.contextmanager
+def shell_gate_environment() -> Iterator[dict[str, str]]:
+    """Provision a private home owned by the uid executing a local shell gate.
+
+    Unlike contained workers, these runners have no executor-provisioned UUID
+    home. Keep their caches/config outside the checkout and never fall back to
+    the controller's home. This bounds environment inheritance, not filesystem
+    access: the local gate still executes repository code as the current uid.
+    """
+    with tempfile.TemporaryDirectory(prefix="worklink-gate-home-") as text:
+        home = Path(text)
+        paths = {
+            "XDG_CONFIG_HOME": home / ".config",
+            "XDG_DATA_HOME": home / ".local" / "share",
+            "XDG_CACHE_HOME": home / ".cache",
+        }
+        for path in paths.values():
+            path.mkdir(parents=True, mode=0o700)
+        yield {
+            "USER": "worklink",
+            "LOGNAME": "worklink",
+            "SHELL": "/bin/sh",
+            "PATH": "/usr/local/bin:/usr/bin:/bin",
+            "LANG": "C.UTF-8",
+            "LC_ALL": "C.UTF-8",
+            "HOME": str(home),
+            **{name: str(path) for name, path in paths.items()},
+        }
+
+
 def _run(args: Sequence[str] | str, *, cwd: Path | None = None) -> subprocess.CompletedProcess[str]:
     from ..tools._shell_env import scrub_model_selection_env
 
     env = os.environ.copy()
     scrub_model_selection_env(env)
     if isinstance(args, str):
-        # Operator-configured test commands are trusted input, equivalent to
-        # poller.command; backend-generated text is never routed here.
-        return subprocess.run(
-            args, shell=True, cwd=cwd, env=env, capture_output=True, text=True, check=False
-        )
+        # Shell syntax supports configured commands and the report env prefix.
+        # Configuration must be trusted; checkout code still gets a bounded env.
+        with shell_gate_environment() as gate_env:
+            return subprocess.run(
+                args, shell=True, cwd=cwd, env=gate_env,
+                capture_output=True, text=True, check=False
+            )
     return subprocess.run(
         list(args), cwd=cwd, env=env, capture_output=True, text=True, check=False
     )
