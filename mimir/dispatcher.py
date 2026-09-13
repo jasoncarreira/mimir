@@ -474,7 +474,8 @@ class Dispatcher:
         so appending them via :meth:`enqueue` would place them behind those
         later events and break within-channel FIFO. Front-insertion restores
         arrival order; ``events`` keep their relative order. Synchronous (queue
-        ops only) — call without ``await``. Returns the count requeued.
+        ops only) — call without ``await``. Returns the count requeued; callers
+        must report any shortfall as message loss (closed or saturated queue).
         """
         if not events or self._closed:
             return 0

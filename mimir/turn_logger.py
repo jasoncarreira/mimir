@@ -31,6 +31,7 @@ from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 
 from ._jsonl_tail import _tail_lines, count_lines_chunked
 from .models import TurnRecord
+from .models import make_turn_id as make_turn_id
 from .redaction import redact_payload
 
 log = logging.getLogger(__name__)
@@ -752,8 +753,3 @@ class TurnLogger:
         tmp.write_text("\n".join(kept) + "\n", encoding="utf-8")
         tmp.rename(self._path)
         self._line_count = len(kept)
-
-
-def make_turn_id() -> str:
-    import uuid
-    return uuid.uuid4().hex[:12]
