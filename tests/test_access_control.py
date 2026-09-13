@@ -5903,14 +5903,18 @@ async def test_shadow_shell_target_masks_argv_before_truncation(
     kind, fields = captured[0]
     assert kind == "shadow_tool_decision"
     assert fields["would_block"] is True
-    assert secret not in fields["target"]
+    # Check the entire durable record, including nested diagnostic fields.
+    assert secret not in json.dumps(fields)
     assert option in fields["target"]
+    assert option in fields["requested_target"]
     argv, _ = access_control.service_shell_argv_for_log(command)
     expected = json.dumps(argv)
     assert fields["target"] == expected[:1024]
+    assert fields["requested_target"] == expected[:1024]
     if len(command) > 1024:
         assert len(expected) > 1024
         assert len(fields["target"].encode("utf-8")) == 1024
+        assert len(fields["requested_target"].encode("utf-8")) == 1024
 
 
 @pytest.mark.parametrize(
