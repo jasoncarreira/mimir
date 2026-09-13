@@ -2257,7 +2257,10 @@ def test_github_activity_integrity_classification_is_total() -> None:
     ).read_text(encoding="utf-8")
     emitted = frozenset(re.findall(r'\bevent_type\s*=\s*["\']([^"\']+)', poller_source))
 
-    assert emitted == _GITHUB_ACTIVITY_EVENT_TYPES
+    # Attention deliberately uses the untrusted default, not actor attestation
+    # or a trusted remediation trigger. It still queues a turn (tested below).
+    assert emitted == _GITHUB_ACTIVITY_EVENT_TYPES | {"pr_ci_attention"}
+    assert "pr_ci_attention" not in _GITHUB_ACTIVITY_EVENT_TYPES
     assert not (_GITHUB_ACTOR_EVENT_TYPES.keys() & _GITHUB_FRAMEWORK_TRIGGER_EVENT_TYPES.keys())
     assert all(_GITHUB_ACTOR_EVENT_TYPES.values())
     assert all(_GITHUB_FRAMEWORK_TRIGGER_EVENT_TYPES.values())
@@ -6107,6 +6110,44 @@ print(json.dumps({
 
 
 # ─── Algedonic signals from pollers ──────────────────────────────────
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("name,event_type", [
+    ("github-activity", "pr_ci_attention"),
+    ("github-ci-watch", "ci_attention"),
+])
+async def test_ci_attention_prompt_enqueues_without_pr_scope(tmp_path, home, monkeypatch, name, event_type):
+    from types import SimpleNamespace
+    from mimir.access_control import _repo_review_state_from_event
+
+    monkeypatch.setenv("MIMIR_GITHUB_SELF_LOGIN", "mimir-bot")
+    item = {
+        "poller": name, "event_type": event_type,
+        "prompt": "CI needs operator attention. Cancellation does not authorize remediation.",
+        "repo": "o/r", "number": 42, "head_sha": "a" * 40,
+        "url": "https://github.com/o/r/pull/42", "cancelled_run_ids": [123],
+    }
+    skill_dir = tmp_path / "skill"
+    _install_script(skill_dir, "poller.py", f"import json\nprint(json.dumps({item!r}))\n")
+    cfg = PollerConfig(
+        name=name, command=f"{sys.executable} poller.py", cron="* * * * *",
+        env={}, skill_dir=skill_dir, trust_source="github",
+    )
+    events = []
+
+    async def enqueue(event, **kwargs):
+        events.append(event)
+        return True
+
+    assert await run_poller(cfg, enqueue=enqueue) == 1
+    assert len(events) == 1
+    event = events[0]
+    assert event.trigger == "poller"
+    assert event.extra["items"][0]["event_type"] == event_type
+    assert {source.integrity for source in event.ifc_labels.sources} == {"untrusted"}
+    assert event.repo_pr_action_scope is None
+    assert _repo_review_state_from_event(event, SimpleNamespace(authority_profile="github")) is None
 
 
 @pytest.mark.asyncio
