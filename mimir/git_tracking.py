@@ -36,7 +36,9 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import random
+import signal
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -217,30 +219,102 @@ async def _git_once(
     timeout: float,
 ) -> GitResult:
     """Run one bounded ``git`` attempt."""
-    proc = await asyncio.create_subprocess_exec(
+    returncode, stdout_b, stderr_b = await _git_bytes(*args, cwd=cwd, timeout=timeout)
+    stdout = stdout_b.decode("utf-8", errors="replace")
+    stderr = stderr_b.decode("utf-8", errors="replace")
+    if returncode != 0:
+        raise GitError(returncode or -1, stderr, args, stdout=stdout)
+    return GitResult(stdout=stdout, stderr=stderr)
+
+
+async def _finish_cleanup(awaitable: Any) -> Any:
+    """Join owned cleanup despite repeated cancellation, then propagate it."""
+    task = asyncio.ensure_future(awaitable)
+    cancelled = None
+    while not task.done():
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError as exc:
+            cancelled = exc
+        except BaseException:
+            break
+    try:
+        return task.result()
+    finally:
+        if cancelled is not None:
+            raise cancelled
+
+
+async def _reap_git_process(proc: asyncio.subprocess.Process) -> None:
+    try:
+        if os.name == "posix":
+            # The leader may already have exited while a hook/transport still
+            # holds its pipes or writes to the repository. Kill the whole session's
+            # initial process group before allowing recovery (notably rebase abort).
+            os.killpg(proc.pid, signal.SIGKILL)
+        elif proc.returncode is None:
+            proc.kill()
+    except ProcessLookupError:
+        pass
+    try:
+        # wait() alone can hang on paused pipe transports after communicate was
+        # cancelled. Restart the readers and drain both pipes through EOF first.
+        await proc.communicate()
+    finally:
+        await proc.wait()
+
+
+async def _git_bytes(
+    *args: str, cwd: Path, timeout: float,
+) -> tuple[int | None, bytes, bytes]:
+    spawning = asyncio.create_task(asyncio.create_subprocess_exec(
         "git",
         *args,
         cwd=str(cwd),
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
-    )
+        start_new_session=os.name == "posix",
+    ))
+    try:
+        proc = await asyncio.shield(spawning)
+    except asyncio.CancelledError:
+        # Cancellation can race subprocess creation before we receive its handle.
+        async def reap_spawn() -> None:
+            proc = await spawning
+            await _reap_git_process(proc)
+
+        await _finish_cleanup(reap_spawn())
+        raise
     try:
         stdout_b, stderr_b = await asyncio.wait_for(
             proc.communicate(), timeout=timeout
         )
-    except asyncio.TimeoutError:
-        # Make sure we don't leak a runaway git process on timeout.
-        try:
-            proc.kill()
-        except ProcessLookupError:
-            pass
-        await proc.wait()
-        raise
-    stdout = stdout_b.decode("utf-8", errors="replace")
-    stderr = stderr_b.decode("utf-8", errors="replace")
-    if proc.returncode != 0:
-        raise GitError(proc.returncode or -1, stderr, args, stdout=stdout)
-    return GitResult(stdout=stdout, stderr=stderr)
+    finally:
+        await _finish_cleanup(_reap_git_process(proc))
+    return proc.returncode, stdout_b, stderr_b
+
+
+async def cancel_pending_pushes() -> None:
+    """Cancel and join git workers after their producers have quiesced."""
+    snapshots = [
+        (registry, list(registry.items()))
+        for registry in (_pending_push_tasks, _push_retry_tasks)
+    ]
+    tasks = {task for _, items in snapshots for _, task in items if task is not None}
+    for task in tasks:
+        if not task.done():
+            task.cancel()
+    try:
+        results = await _finish_cleanup(asyncio.gather(*tasks, return_exceptions=True))
+    finally:
+        # Workers can remove themselves while being joined. Never erase a replacement.
+        for registry, items in snapshots:
+            for key, task in items:
+                if registry.get(key) is task and (task is None or task.done()):
+                    registry.pop(key, None)
+    errors = [result for result in results if isinstance(result, Exception)]
+    if errors:
+        raise ExceptionGroup("git push cleanup failed", errors)
 
 
 async def _git(
@@ -572,23 +646,39 @@ async def _schedule_debounced_push(*, turn_id: str, home: Path) -> None:
     dev / parallel tests) no longer collide.
     """
     key = _home_key(home)
-    async with _get_lock(home):
-        # Cancel any pending retry task before creating a new debounce — the new
-        # debounce push will cover all unpushed commits, making the retry redundant.
-        existing_retry = _push_retry_tasks.pop(key, None)
-        if existing_retry is not None and not existing_retry.done():
-            existing_retry.cancel()
-        existing = _pending_push_tasks.get(key)
-        if existing is not None and not existing.done():
-            existing.cancel()
-        _pending_push_tasks[key] = asyncio.create_task(
-            _debounced_push(turn_id=turn_id, home=home)
-        )
+    while True:
+        async with _get_lock(home):
+            # Retain registry ownership until cleanup finishes, but never join
+            # under the home lock: a worker's recovery may need that same lock.
+            existing_retry = _push_retry_tasks.get(key)
+            existing = _pending_push_tasks.get(key)
+            for task in (existing_retry, existing):
+                if task is not None and not task.done():
+                    task.cancel()
+        await _finish_cleanup(asyncio.gather(
+            *(task for task in (existing_retry, existing) if task is not None),
+            return_exceptions=True,
+        ))
+        async with _get_lock(home):
+            # Another scheduler may have replaced either task while we joined.
+            if any(
+                current is not None and current is not previous
+                for current, previous in (
+                    (_push_retry_tasks.get(key), existing_retry),
+                    (_pending_push_tasks.get(key), existing),
+                )
+            ):
+                continue
+            _push_retry_tasks.pop(key, None)
+            _pending_push_tasks[key] = asyncio.create_task(
+                _debounced_push(turn_id=turn_id, home=home)
+            )
+            return
 
 
 async def _debounced_push(*, turn_id: str, home: Path) -> None:
     """Sleep ``DEBOUNCE_SECONDS`` then push. If cancelled (a later
-    commit superseded us), exit silently — that turn's task owns the
+    commit superseded us), propagate cancellation — that turn's task owns the
     push instead. On push failure log ``git_push_failed`` and let the
     next successful debounce catch up.
 
@@ -599,10 +689,7 @@ async def _debounced_push(*, turn_id: str, home: Path) -> None:
     ``git_push_failed`` events on every turn for a missing remote
     that's a configuration choice, not a failure.
     """
-    try:
-        await asyncio.sleep(DEBOUNCE_SECONDS)
-    except asyncio.CancelledError:
-        return  # superseded; the new task owns the push.
+    await asyncio.sleep(DEBOUNCE_SECONDS)
     if not await _has_origin_remote(home):
         return
     key = _home_key(home)
@@ -646,11 +733,7 @@ async def _debounced_push(*, turn_id: str, home: Path) -> None:
         async with _get_lock(home):
             _schedule_push_retry_locked(key=key, home=home, turn_id=turn_id)
         return
-    except (OSError, asyncio.CancelledError) as exc:
-        # OSError: git binary missing / fork failed. CancelledError
-        # post-sleep is exotic but treat the same — log and move on.
-        if isinstance(exc, asyncio.CancelledError):
-            return
+    except OSError as exc:
         await log_event(
             "git_push_failed",
             reason=_short_err(exc),
@@ -665,6 +748,8 @@ async def _debounced_push(*, turn_id: str, home: Path) -> None:
         existing_retry = _push_retry_tasks.pop(key, None)
         if existing_retry is not None and not existing_retry.done():
             existing_retry.cancel()
+    if existing_retry is not None:
+        await _finish_cleanup(asyncio.gather(existing_retry, return_exceptions=True))
     # chainlink #65 (sub B): paired-positive emit. The push succeeded;
     # surface it so the algedonic block can show "old git_push_failed
     # + recent git_push_ok = transient, recovered" against the sticky
@@ -816,15 +901,19 @@ async def _sync_remote_before_push(
             cwd=home, timeout=PUSH_TIMEOUT_SECONDS,
         )
         return True
-    except (GitError, asyncio.TimeoutError, OSError) as exc:
+    except (GitError, asyncio.TimeoutError, OSError, asyncio.CancelledError) as exc:
         # Distinguish a rebase CONFLICT from a transient/remote failure: if
         # ``rebase --abort`` succeeds there WAS a rebase in progress.
         aborted = False
         try:
-            await _git("rebase", "--abort", cwd=home, timeout=COMMAND_TIMEOUT_SECONDS)
+            await _finish_cleanup(
+                _git("rebase", "--abort", cwd=home, timeout=COMMAND_TIMEOUT_SECONDS)
+            )
             aborted = True
         except (GitError, asyncio.TimeoutError, OSError):
             pass
+        if isinstance(exc, asyncio.CancelledError):
+            raise
         if not aborted:
             return True  # unreachable remote/auth/etc.; let push retry handle it.
 
@@ -922,14 +1011,10 @@ def _is_proposal_surface_path(path: str) -> bool:
 
 async def _blob_equal(*, home: Path, left: str, right: str, path: str) -> bool:
     async def show(ref: str) -> bytes | None:
-        proc = await asyncio.create_subprocess_exec(
-            "git", "show", f"{ref}:{path}",
-            cwd=str(home),
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
+        returncode, stdout_b, _ = await _git_bytes(
+            "show", f"{ref}:{path}", cwd=home, timeout=COMMAND_TIMEOUT_SECONDS,
         )
-        stdout_b, _ = await proc.communicate()
-        if proc.returncode != 0:
+        if returncode != 0:
             return None
         return stdout_b
 
@@ -967,10 +1052,7 @@ async def _retry_push(*, home: Path, delay: float, attempt: int, turn_id: str) -
     """Retry push after backoff. Self-chains: on failure, schedules the next retry
     (or emits git_push_stale when retries exhausted). Cancellable: debounce push
     or reset_module_state cancel this task to stop the chain."""
-    try:
-        await asyncio.sleep(delay)
-    except asyncio.CancelledError:
-        return  # superseded by new commit debounce or shutdown
+    await asyncio.sleep(delay)
 
     if not await _has_origin_remote(home):
         return
@@ -1003,8 +1085,6 @@ async def _retry_push(*, home: Path, delay: float, attempt: int, turn_id: str) -
         except GitError as exc:
             error_reason = _short_err(exc)
             error_returncode = exc.returncode
-        except asyncio.CancelledError:
-            return
         except OSError as exc:
             error_reason = _short_err(exc)
 

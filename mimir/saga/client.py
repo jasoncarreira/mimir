@@ -30,11 +30,13 @@ mimir/saga rename, at which point we move the provider too.
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import json
 import logging
 import sqlite3
 import struct
 from collections.abc import Iterable, Mapping
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -54,6 +56,9 @@ from .fts import fts_search
 from .vector_index import VectorIndex
 
 log = logging.getLogger(__name__)
+
+# Keep SQLite/provider work out of the loop's DNS and general I/O pool.
+_SAGA_EXECUTOR = ThreadPoolExecutor(max_workers=8, thread_name_prefix="saga")
 
 
 _ALL_SAGA_ATOMS = object()
@@ -356,21 +361,11 @@ class SagaStore:
     pending migrations, and reuses that connection. Caller can also
     pass an open connection via ``conn=...`` for tests.
 
-    All public methods are async to match SagaClient. CPU-bound work
-    runs via ``asyncio.to_thread`` so mimir's event loop stays
-    responsive during synthesis / consolidation passes.
-
-    **Threading contract**: the shared sqlite3 connection is opened
-    with ``check_same_thread=False`` to support ``asyncio.to_thread``
-    dispatch from a single event loop. SQLite under WAL allows
-    concurrent reads but serializes writes at the file level —
-    Python's ``sqlite3`` module is not thread-safe by default, so
-    write call sites that may race (consolidate cron firing while a
-    turn is mid-store) must hold ``_write_lock``. Reads don't need
-    the lock — WAL handles snapshot isolation. Production callers
-    going through a single agent event loop already serialize through
-    the asyncio scheduler; the lock is the belt-and-suspenders for
-    cross-task / cross-coroutine writes.
+    Async operations use a dedicated worker pool. Shared-connection work
+    is serialized before submission and protected by thread locks for sync
+    callers too. Lock order is db -> write -> index. Independent read
+    connections can run concurrently; WAL does not make concurrent use of
+    a single connection safe.
     """
 
     # chainlink #242: schema migration registry + applier live in
@@ -446,6 +441,7 @@ class SagaStore:
         self._db_lock = _threading.RLock()
         self._index_lock = _threading.RLock()
         self._sessions_index_lock = _threading.RLock()
+        self._db_async_lock = asyncio.Lock()
 
     def _configure_connection(
         self,
@@ -568,6 +564,12 @@ class SagaStore:
                         exc,
                     )
 
+    async def _run_worker(self, fn, *args):
+        ctx = contextvars.copy_context()
+        return await asyncio.get_running_loop().run_in_executor(
+            _SAGA_EXECUTOR, ctx.run, fn, *args
+        )
+
     async def _db_locked(self, fn):
         """Run a callable against the shared sqlite3 connection under lock.
 
@@ -581,7 +583,24 @@ class SagaStore:
             with self._db_lock:
                 return fn()
 
-        return await asyncio.to_thread(_locked)
+        await self._db_async_lock.acquire()
+        try:
+            ctx = contextvars.copy_context()
+            worker = _SAGA_EXECUTOR.submit(ctx.run, _locked)
+        except BaseException:
+            self._db_async_lock.release()
+            raise
+        future = asyncio.wrap_future(worker)
+        # Cancellation propagates immediately, but the running thread still
+        # owns the serialization slot until it really finishes.
+        future.add_done_callback(lambda _future: self._db_async_lock.release())
+        try:
+            return await asyncio.shield(future)
+        except asyncio.CancelledError:
+            # Unlike the asyncio wrapper, this can only cancel queued work.
+            # If already running, its completion callback retains the slot.
+            worker.cancel()
+            raise
 
     async def _write_locked(self, fn):
         """Run a write-path callable in a worker thread, serialized via
@@ -591,11 +610,10 @@ class SagaStore:
         """
 
         def _locked():
-            with self._db_lock:
-                with self._write_lock:
-                    return fn()
+            with self._write_lock:
+                return fn()
 
-        return await asyncio.to_thread(_locked)
+        return await self._db_locked(_locked)
 
     def connection(self) -> sqlite3.Connection:
         """Public accessor for the underlying sqlite3 connection.
@@ -609,7 +627,8 @@ class SagaStore:
         Worker-thread callers should prefer :meth:`run_locked_read`,
         which provides that serialization for them (chainlink #411).
         """
-        return self._ensure_conn()
+        with self._db_lock:
+            return self._ensure_conn()
 
     def run_locked_read(self, fn):
         """Run ``fn(conn)`` against the shared sqlite3 connection under
@@ -778,11 +797,13 @@ class SagaStore:
         """Force a full FAISS rebuild from the current DB state.
         Called by the bench harness between per-question DBs and by
         the migration importer after bulk-loading atoms."""
-        conn = self._ensure_conn()
-        if self._index is None:
-            self._ensure_index(conn)
-        else:
-            self._index.build_from_db(conn)
+        with self._db_lock:
+            with self._index_lock:
+                conn = self._ensure_conn()
+                if self._index is None:
+                    self._ensure_index(conn)
+                else:
+                    self._index.build_from_db(conn)
 
     def _rebuild_index_if_needed(self, conn: sqlite3.Connection) -> bool:
         """Invoke the documented >10%-soft-removed FAISS rebuild backstop.
@@ -1053,11 +1074,6 @@ class SagaStore:
             returned_atom_ids = [
                 c.atom["id"] for c in (result.observations + result.raws)
             ]
-            self._mark_retrieval_access_events(
-                returned_atom_ids,
-                session_id=session_id,
-                reference_date=reference_date,
-            )
             # P42 half-2: surface a top-N triples block in the response so
             # production prompt rendering (mimir/sagatools.py:_format_saga_payload)
             # can show structured (s, p, o) facts alongside obs/raws, and
@@ -1146,18 +1162,25 @@ class SagaStore:
             }
 
         def _do():
-            conn, should_close = self._operation_conn()
             try:
-                return _do_with_conn(conn)
+                conn, should_close = self._operation_conn()
+                try:
+                    return _do_with_conn(conn)
+                finally:
+                    if should_close:
+                        conn.close()
             finally:
-                if should_close:
-                    conn.close()
+                read_authorization.finalize()
 
         if self._db_path is None:
             payload = await self._db_locked(_do)
         else:
-            payload = await asyncio.to_thread(_do)
-        read_authorization.finalize()
+            payload = await self._run_worker(_do)
+        await self._db_locked(lambda: self._mark_retrieval_access_events(
+            [atom["id"] for atom in payload["observations"] + payload["raws"]],
+            session_id=session_id,
+            reference_date=reference_date,
+        ))
         return payload
 
     def _session_boundary_atom_pathway_with_conn(
@@ -1259,7 +1282,7 @@ class SagaStore:
 
         if self._db_path is None:
             return await self._db_locked(_do)
-        return await asyncio.to_thread(_do)
+        return await self._run_worker(_do)
 
     async def get_atoms(
         self, ids: list[str], auth_context: Any = None
@@ -1401,7 +1424,7 @@ class SagaStore:
         if self._db_path is None:
             payload = await self._db_locked(_do)
         else:
-            payload = await asyncio.to_thread(_do)
+            payload = await self._run_worker(_do)
         read_authorization.finalize()
         return payload
 
@@ -1488,7 +1511,7 @@ class SagaStore:
 
             duplicate_exists = await self._db_locked(_exact_duplicate_exists)
             if not duplicate_exists:
-                effective_embedding = await asyncio.to_thread(
+                effective_embedding = await self._run_worker(
                     _embed_text_sync,
                     content,
                 )
@@ -1723,7 +1746,7 @@ class SagaStore:
         embedding = None
         if summary and summary.strip():
             try:
-                embedding = await asyncio.to_thread(_embed_text_sync, summary.strip())
+                embedding = await self._run_worker(_embed_text_sync, summary.strip())
             except Exception:
                 log.warning(
                     "Session %s summary embedding failed; closing without embedding",
@@ -2131,7 +2154,7 @@ class SagaStore:
                         log.warning("triple embed precompute failed: %s", exc)
             return obs_embeds, triple_vecs, triple_embed_errors
 
-        obs_embeds, triple_vecs, triple_embed_errors = await asyncio.to_thread(
+        obs_embeds, triple_vecs, triple_embed_errors = await self._run_worker(
             _precompute_embeddings
         )
 
@@ -2679,7 +2702,7 @@ class SagaStore:
         if self._db_path is None:
             result = await self._db_locked(_do)
         else:
-            result = await asyncio.to_thread(_do)
+            result = await self._run_worker(_do)
         read_authorization.finalize()
         return result
 
@@ -2877,7 +2900,7 @@ class SagaStore:
         # is never consulted).  The downstream helper handles query_emb==[] via
         # the existing ``if query_emb:`` guard, so the recency path still works.
         if alpha > 0.0:
-            query_emb: list[float] = await asyncio.to_thread(_query_embed_sync, query)
+            query_emb: list[float] = await self._run_worker(_query_embed_sync, query)
         else:
             query_emb = []
 
@@ -2901,7 +2924,7 @@ class SagaStore:
         if self._db_path is None:
             result = await self._db_locked(_do)
         else:
-            result = await asyncio.to_thread(_do)
+            result = await self._run_worker(_do)
         read_authorization.finalize()
         return result
 
@@ -3002,7 +3025,7 @@ class SagaStore:
         if self._db_path is None:
             result = await self._db_locked(_do)
         else:
-            result = await asyncio.to_thread(_do)
+            result = await self._run_worker(_do)
         read_authorization.finalize()
         return result
 
@@ -3083,25 +3106,27 @@ class SagaStore:
         }
 
     async def health(self) -> bool:
-        try:
+        def _do():
             conn = self._ensure_conn()
             conn.execute("SELECT 1 FROM atoms LIMIT 1")
             return True
+
+        try:
+            return await self._db_locked(_do)
         except Exception as exc:
             log.warning("SagaStore.health check failed: %s", exc)
             return False
 
     async def close(self) -> None:
-        if self._conn is not None:
-            try:
-                self._conn.close()
-            except Exception as exc:
-                # Leaked file descriptor is worth knowing about even
-                # though we don't propagate the error (close() is
-                # called from shutdown / cleanup paths that shouldn't
-                # block on a misbehaving connection).
-                log.warning("SagaStore.close failed: %s", exc)
-            self._conn = None
+        def _do():
+            if self._conn is not None:
+                try:
+                    self._conn.close()
+                except Exception as exc:
+                    log.warning("SagaStore.close failed: %s", exc)
+                self._conn = None
+
+        await self._db_locked(_do)
 
     async def __aenter__(self) -> "SagaStore":
         """Async context manager entry — opens the SQLite connection
@@ -3116,7 +3141,7 @@ class SagaStore:
         instead of remembering to call ``await store.close()`` in
         their teardown.
         """
-        self._ensure_conn()
+        await self._db_locked(self._ensure_conn)
         return self
 
     async def __aexit__(self, exc_type, exc, tb) -> None:

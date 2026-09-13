@@ -23,6 +23,10 @@ from typing import Optional
 
 from ._config_io import get_config
 
+# Set defaults before lazy imports initialize native thread pools.
+os.environ.setdefault("OMP_NUM_THREADS", str(os.cpu_count() or 1))
+os.environ.setdefault("MKL_NUM_THREADS", str(os.cpu_count() or 1))
+
 log = logging.getLogger(__name__)
 
 _cfg = get_config()
@@ -156,9 +160,14 @@ class LocalProvider(EmbeddingProvider):
         self.model_name = _cfg('embedding', 'model', 'all-MiniLM-L6-v2')
         self.max_chars = _cfg('embedding', 'max_input_chars', 2000)
         self._model = None
+        self._load_lock = threading.Lock()
 
     def _load_model(self):
-        if self._model is None:
+        if self._model is not None:
+            return self._model
+        with self._load_lock:
+            if self._model is not None:
+                return self._model
             try:
                 from sentence_transformers import SentenceTransformer
                 self._model = SentenceTransformer(self.model_name)
@@ -209,9 +218,14 @@ class ONNXProvider(EmbeddingProvider):
         self._dimensions_override = dimensions
         self.max_chars = _cfg('embedding', 'max_input_chars', 2000)
         self._model = None
+        self._load_lock = threading.Lock()
 
     def _load(self):
-        if self._model is None:
+        if self._model is not None:
+            return self._model
+        with self._load_lock:
+            if self._model is not None:
+                return self._model
             try:
                 from fastembed import TextEmbedding
             except ImportError:
@@ -221,11 +235,6 @@ class ONNXProvider(EmbeddingProvider):
                     "this only fires in standalone-saga deployments that "
                     "skipped the optional embedding deps)."
                 )
-            # Explicit thread count avoids ORT's affinity syscall,
-            # which fails in some container runtimes.
-            n = str(os.cpu_count() or 1)
-            os.environ.setdefault("OMP_NUM_THREADS", n)
-            os.environ.setdefault("MKL_NUM_THREADS", n)
             self._model = TextEmbedding(model_name=self.model_name)
         return self._model
 

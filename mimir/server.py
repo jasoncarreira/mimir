@@ -2428,6 +2428,9 @@ def build_app(config: Config) -> web.Application:
                 except BaseException as exc:
                     errors.append(_cleanup_exception(exc))
 
+        from .git_tracking import cancel_pending_pushes
+
+        await attempt(cancel_pending_pushes)
         for error in errors:
             log.error("server cleanup failed: %s", error)
         if errors:

@@ -224,7 +224,7 @@ async def test_async_log_stamps_before_lock_and_worker_delay(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     import mimir.event_logger as event_logger
-    from types import SimpleNamespace
+    from mimir.background_io import run_in_pool
 
     path = tmp_path / "events.jsonl"
     logger = EventLogger(path, session_id="occurrence", agent_id="agent")
@@ -239,16 +239,13 @@ async def test_async_log_stamps_before_lock_and_worker_delay(
         stamps.append((now, threading.get_ident()))
         return now
 
-    async def delayed_to_thread(func, *args, **kwargs):
+    async def delayed_submission(pool, func, *args, **kwargs):
         submitted.set()
         await release_worker.wait()
-        return await asyncio.to_thread(func, *args, **kwargs)
+        return await run_in_pool(pool, func, *args, **kwargs)
 
     monkeypatch.setattr(event_logger, "_utc_now_iso", stamp)
-    # Patch only the logger's asyncio binding, not the shared module.
-    monkeypatch.setattr(event_logger, "asyncio", SimpleNamespace(
-        to_thread=delayed_to_thread,
-    ))
+    monkeypatch.setattr(event_logger, "run_in_pool", delayed_submission)
     await lock.acquire()
     task = asyncio.create_task(logger.log("queued", detail="safe"))
     try:
