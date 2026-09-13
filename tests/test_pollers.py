@@ -2359,6 +2359,80 @@ def test_github_framework_trigger_trust_requires_matching_live_self_pr(
     ) is False
 
 
+@pytest.mark.parametrize("mode", ["distinct", "same", "changed", "framework-first", "actor-first"])
+@pytest.mark.asyncio
+async def test_github_fire_attestation_network_budget(
+    tmp_path: Path, home: Path, monkeypatch: pytest.MonkeyPatch, mode: str,
+) -> None:
+    from mimir import pollers
+    from unittest.mock import MagicMock
+
+    ceiling = pollers.GITHUB_TRUST_ATTEMPTS_PER_FIRE_TOTAL
+    count = ceiling + 4
+    items = []
+    for index in range(count):
+        number = 1 if mode in {"same", "changed"} else index + 1
+        actor = (mode == "actor-first" and index < 2) or (
+            mode == "framework-first" and index >= 2
+        )
+        items.append({
+            "poller": "x", "prompt": f"trigger {index}",
+            "event_type": "issue_opened" if actor else "pr_changes_requested_stale",
+            "repo": "acme/widget", "number": number,
+            "url": f"https://github.com/acme/widget/pull/{number}",
+            "author": "mimir-bot", "head_repo": "acme/widget",
+            "head_remote": "origin", "head_ref": "worklink/test",
+            "head_sha": "c" * 40 if mode == "changed" and index else "a" * 40,
+            "base_ref": "main", "base_sha": "b" * 40,
+        })
+    calls = []
+
+    def urlopen(request, *, timeout):
+        assert timeout == 10.0
+        endpoint = request.full_url.removeprefix("https://api.github.com/")
+        calls.append(endpoint)
+        response = MagicMock()
+        response.status = 200
+        if "/collaborators/" in endpoint:
+            response.status = 204
+            payload = None
+        else:
+            number = int(endpoint.rsplit("/", 1)[1])
+            payload = {
+                "state": "open", "number": number,
+                "html_url": f"https://github.com/acme/widget/pull/{number}",
+                "user": {"login": f"actor-{number}" if "/issues/" in endpoint else "mimir-bot"},
+                "head": {"ref": "worklink/test", "sha": "a" * 40,
+                         "repo": {"full_name": "acme/widget"}},
+                "base": {"ref": "main", "sha": "b" * 40},
+            }
+        response.read.return_value = json.dumps(payload).encode()
+        response.__enter__.return_value = response
+        return response
+
+    monkeypatch.setattr(pollers.urllib.request, "urlopen", urlopen)
+    skill_dir = tmp_path / "skill"
+    _install_script(skill_dir, "poller.py", f"import json\nfor item in {items!r}:\n    print(json.dumps(item))\n")
+    cfg = PollerConfig(
+        name="x", command=f"{sys.executable} poller.py", cron="* * * * *",
+        env={"GITHUB_TOKEN": "server-token", "MIMIR_GITHUB_SELF_LOGIN": "mimir-bot"},
+        skill_dir=skill_dir, trust_source="github", batch_size=1,
+    )
+    # A second fire must get a fresh budget and fresh live PR responses.
+    for _ in range(2):
+        calls.clear()
+        enq = _CapturingEnqueue()
+        await run_poller(cfg, enqueue=enq)
+        expected_calls = 1 if mode in {"same", "changed"} else ceiling
+        assert len(calls) == expected_calls
+        trusted_count = {"same": count, "changed": 1, "distinct": ceiling,
+                         "actor-first": 4, "framework-first": 4}[mode]
+        assert len(enq.events) == count
+        assert [event.ifc_labels.has_untrusted_active_ingest for event in enq.events] == (
+            [False] * trusted_count + [True] * (count - trusted_count)
+        )
+
+
 @pytest.mark.asyncio
 async def test_live_self_remediation_trigger_is_labeled_trusted(
     tmp_path: Path,
