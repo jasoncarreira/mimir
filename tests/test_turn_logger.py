@@ -713,11 +713,11 @@ def test_oversized_tool_result_truncated():
 
 @pytest.mark.parametrize("path", ["tool_events", "internal_tool_results", "tool_message"])
 @pytest.mark.parametrize("credential,remnant", [
-    ("sk-proj-" + "A" * 40, "sk-proj-" + "A" * 13),
-    ("bearer " + "B" * 40, "bearer " + "B" * 7),
+    ("sk-proj-" + "A" * 40, "sk-pr"),
+    ("glpat-" + "B" * 40, "glpa"),
 ])
 async def test_tool_result_redacted_before_truncation(tmp_path, path, credential, remnant):
-    # The old ordering leaves less than the token pattern's minimum length.
+    # Cut inside the prefix: even short recognized credentials are now masked.
     prefix = "\n" * (MAX_TOOL_RESULT_BYTES - len(remnant))
     body = prefix + credential + "\n" + "ordinary output\n" * 100
     old_body = body[:MAX_TOOL_RESULT_BYTES] + "\u2026[truncated]"

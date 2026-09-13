@@ -1017,6 +1017,9 @@ async def send_message(
         # soft failure must NOT look delivered — don't log send_message_sent,
         # don't append to history, and surface the failure to the model.
         if not getattr(result, "sent", True):
+            chunks = getattr(result, "chunks", 0)
+            uploads = getattr(result, "uploads", 0)
+            partial = bool(chunks or uploads)
             if detector is not None and detector_state is not None:
                 detector.restore(detector_state)
                 undelivered_decision = detector.record_undelivered_attempt(text)
@@ -1030,8 +1033,8 @@ async def send_message(
                     )
                     return (
                         "send_message hard stop: repeated near-duplicate "
-                        "undelivered-send loop. This send failed before "
-                        "delivery and further identical retries are refused. "
+                        "undelivered-send loop. Delivery did not complete "
+                        "and further identical retries are refused. "
                         "Reflect on the delivery failure before trying again."
                     )
             _err = getattr(result, "error", None)
@@ -1040,9 +1043,19 @@ async def send_message(
                     "send_message_failed",
                     channel_id=cid,
                     error=(str(_err)[:200] if _err else None),
+                    chunks=chunks,
+                    uploads=uploads,
+                    message_id=getattr(result, "message_id", None),
                 )
             except Exception:  # noqa: BLE001
                 pass
+            if partial:
+                return (
+                    f"send_message failed: incomplete delivery (channel={cid}; "
+                    f"{chunks} chunk(s), {uploads} upload(s) delivered; "
+                    f"message_id={getattr(result, 'message_id', None)}; {_err}). "
+                    "Warning: retrying the whole message may duplicate what already landed."
+                )
             return (
                 "send_message failed: bridge reported the message was not "
                 f"delivered (channel={cid}" + (f"; {_err}" if _err else "") + ")"
@@ -1135,7 +1148,7 @@ async def send_message(
         bridge=bridge,
         channel_id=cid,
         sent_message_id=(getattr(result, "message_id", None) if result else None),
-        fallback_message_id=None,
+        fallback_message_id=_resolve_recent_message_id(cid),
         ctx=ctx,
         detector=detector,
     )
@@ -1174,6 +1187,9 @@ async def send_message(
             streak=decision.streak,
             similarity=round(decision.similarity, 4),
         )
+
+    if not delivered_by_text and not delivered_by_directive:
+        return f"send_message failed: no text or directive was delivered (channel={cid})"
 
     # chainlink #259: surface the bare message_id, not the SendResult repr,
     # so downstream parses/greps (e.g. a later react(message_id=...)) work.
@@ -2163,12 +2179,13 @@ _SPAWN_GUARD = _SpawnGuard()
 
 
 def _spawn_guard_init() -> _SpawnGuard:
-    """Re-read env vars and (re)initialize the semaphore + lock on first
-    spawn. Env vars are read each invocation so tests can change them
-    per-case without restarting the process; the semaphore / lock are
-    created exactly once per ``max_concurrent`` value so the
-    concurrency cap is real (every fresh ``Semaphore`` would defeat
-    the gate by handing every caller a full set of slots)."""
+    """Refresh caps, applying concurrency changes only when fully idle.
+
+    Holders and queued acquires retain the old effective cap, even when
+    the requested cap is lower. No running spawn is preempted. The next
+    invocation with no holders or waiters applies the latest env value;
+    until then ``max_concurrent`` reports the old, enforced limit.
+    """
     g = _SPAWN_GUARD
     new_max_concurrent = _env_int_floor1(
         "MIMIR_SPAWN_MAX_CONCURRENT", _SPAWN_MAX_CONCURRENT_DEFAULT,
@@ -2179,12 +2196,14 @@ def _spawn_guard_init() -> _SpawnGuard:
     g.max_depth = _env_int_floor1(
         "MIMIR_SPAWN_MAX_DEPTH", _SPAWN_MAX_DEPTH_DEFAULT,
     )
-    # (Re)create only when the semaphore is missing or the cap
-    # changed — keeps the existing pending waiters in the same FIFO
-    # the loop scheduled them in. asyncio.Lock / Semaphore are
-    # loop-bound; the ``sem is None`` arm covers the cross-loop case
-    # (tests swap event loops between cases).
-    if g.sem is None or g.max_concurrent != new_max_concurrent:
+    # locked() alone misses partially occupied semaphores. Inspect both
+    # available permits and the waiter queue, including notified waiters
+    # that have not resumed yet. There is no await across this idle check.
+    if g.sem is None or (
+        g.max_concurrent != new_max_concurrent
+        and g.sem._value == g.max_concurrent
+        and not g.sem._waiters
+    ):
         g.sem = asyncio.Semaphore(new_max_concurrent)
         g.max_concurrent = new_max_concurrent
     if g.rate_lock is None:
@@ -2617,7 +2636,8 @@ async def _spawn_open_code_impl(
     except BaseException:
         os.close(artifact_directory_fd)
         artifact_directory_fd = -1
-        await _spawn_release_rate_slot(guard, rate_token)
+        if execution is None:
+            await _spawn_release_rate_slot(guard, rate_token)
         raise
     finally:
         if checkout is not None:
@@ -2633,6 +2653,8 @@ async def _spawn_open_code_impl(
                 log.warning("spawn_open_code cleanup failed")
 
     assert terminal is not None
+    if execution is None:
+        await _spawn_release_rate_slot(guard, rate_token)
     manifest = {
         "schema_version": 2,
         "run_id": run_id,

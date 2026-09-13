@@ -22,10 +22,18 @@ from typing import Any, ClassVar
 
 @dataclass
 class SendResult:
+    """``sent`` means complete delivery, including requested attachments.
+
+    On partial failure, progress counts and the last message ID are retained;
+    callers must not record the intended text as delivered or retry implicitly.
+    ``uploads`` counts files separately from message chunks.
+    """
+
     sent: bool
     message_id: str | None = None
     chunks: int = 0
     error: str | None = None
+    uploads: int = 0
 
 
 @dataclass

@@ -204,8 +204,7 @@ class EventLogger:
             record = self._record_header(event_type)
 
             def redact_and_append() -> None:
-                record.update(redact_payload(payload))
-                self._append_record_sync(record)
+                self._append_record_sync(self._record(event_type, payload, header=record))
 
             async with self._ensure_lock():
                 await run_in_pool(_EVENT_POOL, redact_and_append)
@@ -276,13 +275,24 @@ class EventLogger:
 
         Unlike the best-effort telemetry APIs, failures propagate so the caller
         can refuse the state transition that depends on this audit record.
+        Payload keys reserved for the record header are dropped with a warning.
         """
         record = self._record(event_type, payload)
         self._append_record_sync(record, durable=True)
 
-    def _record(self, event_type: str, payload: dict[str, Any]) -> dict[str, Any]:
-        rec = self._record_header(event_type)
-        rec.update(redact_payload(payload))
+    def _record(
+        self, event_type: str, payload: dict[str, Any],
+        *, header: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        rec = self._record_header(event_type) if header is None else header
+        # Reserve optional agent_id even when absent; payload cannot assert identity.
+        collisions = payload.keys() & (rec.keys() | {"agent_id"})
+        if collisions:
+            log.warning(
+                "events.jsonl dropped payload keys colliding with reserved record-header fields: %s",
+                ", ".join(sorted(collisions)),
+            )
+        rec.update(redact_payload({k: v for k, v in payload.items() if k not in collisions}))
         return rec
 
     def _record_header(self, event_type: str) -> dict[str, Any]:

@@ -96,6 +96,7 @@ def test_kill_process_group_killpg_error_returns_normally(
 ) -> None:
     proc = Mock(spec=asyncio.subprocess.Process)
     proc.pid = 12345
+    proc.returncode = None
     killpg = Mock(side_effect=error)
     monkeypatch.setattr("mimir.pollers.os.killpg", killpg)
 
@@ -110,6 +111,7 @@ def test_kill_process_group_killpg_einval_propagates(
 ) -> None:
     proc = Mock(spec=asyncio.subprocess.Process)
     proc.pid = 12345
+    proc.returncode = None
     error = OSError(errno.EINVAL, "invalid signal")
     killpg = Mock(side_effect=error)
     monkeypatch.setattr("mimir.pollers.os.killpg", killpg)
@@ -120,6 +122,14 @@ def test_kill_process_group_killpg_einval_propagates(
     assert raised.value is error
     killpg.assert_called_once_with(proc.pid, signal.SIGKILL)
     proc.kill.assert_not_called()
+
+
+def test_kill_process_group_does_not_signal_reaped_pid(monkeypatch):
+    proc = SimpleNamespace(pid=12345, returncode=0)
+    killpg = Mock()
+    monkeypatch.setattr("mimir.pollers.os.killpg", killpg)
+    _kill_process_group(proc)
+    killpg.assert_not_called()
 
 
 @pytest.fixture
@@ -1419,6 +1429,44 @@ def test_discover_required_env_satisfied_by_manifest_override(tmp_path: Path, mo
 
 
 
+@pytest.mark.parametrize("field", ["env", "pass_env"])
+@pytest.mark.parametrize("adding", [True, False], ids=["adding", "removing"])
+def test_discover_required_env_uses_operator_replacements(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, field: str, adding: bool,
+) -> None:
+    key = "MIMIR_TEST_REQUIRED_TOKEN"
+    monkeypatch.setenv(key, "present")
+    monkeypatch.delenv("MIMIR_POLLER_ENV_ALLOWLIST", raising=False)
+    populated = {key: "literal"} if field == "env" else [key]
+    empty = {} if field == "env" else []
+    skills = tmp_path / "skills"
+    _write_pollers_json(skills / "needy", [{
+        "name": "needy", "command": "python p.py", "cron": "* * * * *",
+        "env_required": [key], field: empty if adding else populated,
+    }])
+    overrides = tmp_path / "pollers-overrides.yaml"
+    overrides.write_text(yaml.safe_dump({
+        "needy": {field: populated if adding else empty},
+    }))
+    invalid_entries = []
+
+    out = discover_pollers(
+        skills, overrides_path=overrides, invalid_entries=invalid_entries,
+    )
+
+    assert [p.name for p in out] == (["needy"] if adding else [])
+    if adding:
+        assert invalid_entries == []
+        assert getattr(out[0], field) == (
+            populated if field == "env" else tuple(populated)
+        )
+    else:
+        assert invalid_entries == [(
+            skills / "needy" / "pollers.json", "needy",
+            f"required environment unset: {key}",
+        )]
+
+
 def test_discover_required_env_uses_runtime_env_model(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2643,6 +2691,9 @@ print(json.dumps({
     invalid = [e for e in events if e["type"] == "poller_invalid_usage_signal"]
     assert [e["reason"] for e in invalid] == ["poller_mismatch", "invalid_api_calls"]
     assert not [e for e in events if e["type"] == "poller_usage"]
+    complete = [e for e in events if e["type"] == "poller_complete"][-1]
+    assert complete["signals_emitted"] == 0
+    assert complete["events_emitted"] == 0
 
 
 # ─── poller_recovery framework wiring (chainlink #314) ────────────────
@@ -2659,18 +2710,40 @@ def _make_recovery_event(source_id: str) -> AgentEvent:
     )
 
 
-def test_discover_pollers_reads_recover_failed_turns_flag(tmp_path: Path):
+@pytest.mark.parametrize("raw, expected", [
+    (True, True), (False, False), (1, True), (0, False),
+    ("true", True), ("yes", True), ("on", True), ("1", True),
+    ("false", False), ("no", False), ("off", False), ("0", False),
+    ("  FaLsE  ", False), ("  TRUE  ", True),
+])
+def test_discover_pollers_reads_recover_failed_turns_flag(tmp_path: Path, raw, expected):
     skills = tmp_path / "skills"
     _write_pollers_json(skills / "skill", [
         {
             "name": "recovering",
             "command": "x",
             "cron": "* * * * *",
-            "recover_failed_turns": True,
+            "recover_failed_turns": raw,
         },
     ])
     [p] = discover_pollers(skills)
-    assert p.recover_failed_turns is True
+    assert p.recover_failed_turns is expected
+
+
+@pytest.mark.parametrize("raw", ["maybe", "", 2, -1, 1.0, None, [], {"on": True}])
+def test_manifest_invalid_recover_failed_turns_defaults_off(tmp_path: Path, caplog, raw):
+    skills = tmp_path / "skills"
+    _write_pollers_json(skills / "skill", [{
+        "name": "recovering", "command": "x", "cron": "* * * * *",
+        "recover_failed_turns": raw,
+    }])
+    invalid = []
+    [poller] = discover_pollers(skills, invalid_entries=invalid)
+    assert poller.recover_failed_turns is False
+    assert "poller_invalid_recover_failed_turns" in caplog.text
+    assert len(invalid) == 1
+    assert invalid[0][1] == "recovering"
+    assert "recover_failed_turns" in invalid[0][2]
 
 
 @pytest.mark.asyncio
@@ -2704,11 +2777,11 @@ print(json.dumps({"poller": "x", "prompt": "needs review", "id": "evt-1"}))
 
 
 @pytest.mark.asyncio
-async def test_run_poller_does_not_stash_rejected_events_by_default(
-    tmp_path: Path, home: Path,
+@pytest.mark.parametrize("raises", [False, True], ids=["rejected", "error"])
+async def test_run_poller_recovers_unaccepted_events_by_default(
+    tmp_path: Path, home: Path, raises: bool,
 ) -> None:
-    """A dispatcher rejection is back-pressure, not an in-flight turn;
-    it must not be stashed for later recovery."""
+    """Pending delivery retries without failed-turn opt-in or a restart."""
     skill_dir = tmp_path / "skill"
     persist_dir = tmp_path / "persist" / "x"
     _install_script(skill_dir, "poller.py", """
@@ -2720,10 +2793,68 @@ print(json.dumps({"poller": "x", "prompt": "queue full"}))
         cron="* * * * *", env={}, skill_dir=skill_dir,
         persist_dir=persist_dir,
     )
-    n = await run_poller(cfg, enqueue=_CapturingEnqueue(accept=False))
+    attempted = []
+
+    async def unavailable(event):
+        attempted.append(event)
+        if raises:
+            raise RuntimeError("queue unavailable")
+        return False
+
+    n = await run_poller(cfg, enqueue=unavailable)
 
     assert n == 0
-    assert poller_recovery._load_state(persist_dir)["inflight"] == {}
+    [event] = attempted
+    entry = poller_recovery._load_state(persist_dir)["inflight"][event.source_id]
+    assert entry["pending_enqueue"] is True
+    assert entry["attempts"] == 0
+    assert entry["event"]["content"] == "queue full"
+    assert entry["event"]["service_principal"] == event.service_principal
+
+    _install_script(skill_dir, "poller.py", "pass\n")
+    enq = _CapturingEnqueue()
+    assert await run_poller(cfg, enqueue=enq) == 0
+    assert [e.source_id for e in enq.events] == [event.source_id]
+    assert enq.events[0].content == event.content
+    entry = poller_recovery._load_state(persist_dir)["inflight"][event.source_id]
+    assert "pending_enqueue" not in entry
+    assert entry["attempts"] == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("raises", [False, True], ids=["rejected", "error"])
+async def test_run_poller_bounds_unaccepted_events(
+    tmp_path: Path, home: Path, monkeypatch: pytest.MonkeyPatch, raises: bool,
+) -> None:
+    monkeypatch.setattr(poller_recovery, "MAX_PENDING_ENQUEUE", 2)
+    skill_dir = tmp_path / "skill"
+    persist_dir = tmp_path / "persist" / "x"
+    _install_script(skill_dir, "poller.py", """
+import json
+for i in range(5):
+    print(json.dumps({"poller": "x", "prompt": f"event {i}"}))
+""")
+    cfg = PollerConfig(
+        name="x", command=f"{sys.executable} poller.py",
+        cron="* * * * *", env={}, skill_dir=skill_dir,
+        persist_dir=persist_dir, batch_size=1,
+    )
+
+    async def enqueue(event):
+        if event.content == "event 0":
+            return True
+        if raises:
+            raise RuntimeError("queue unavailable")
+        return False
+
+    assert await run_poller(cfg, enqueue=enqueue) == 1
+    entries = list(poller_recovery._load_state(persist_dir)["inflight"].values())
+    assert [e["event"]["content"] for e in entries] == [
+        "event 0", "event 3", "event 4",
+    ]
+    assert [e.get("pending_enqueue", False) for e in entries] == [False, True, True]
+    retired = [e for e in _read_events(home) if e["type"] == "poller_pending_gave_up"]
+    assert sum(e["retired"] for e in retired) == 2
 
 
 @pytest.mark.asyncio
@@ -3550,8 +3681,10 @@ def _control_poller_wait(monkeypatch, ready, *, expire=True, reap=False):
         return await asyncio.wait(tasks)
 
     async def wait_for(awaitable, *, timeout):
+        nonlocal reap
         calls.append(("reap", timeout))
         if reap:
+            reap = False
             awaitable.close()
             raise asyncio.TimeoutError
         return await asyncio.wait_for(awaitable, timeout=timeout)
@@ -3682,6 +3815,7 @@ with open(pgid_path, "w", encoding="utf-8") as f:
     f.write(str(os.getpgrp()))
 print(json.dumps({"poller": "x", "prompt": "would emit"}), flush=True)
 open("output-ready", "w").close()
+child.wait()
 """)
     cfg = PollerConfig(
         name="child-holder",
@@ -3744,6 +3878,96 @@ open("output-ready", "w").close()
 
 
 @pytest.mark.asyncio
+@pytest.mark.timeout(30)
+@pytest.mark.parametrize("cancel", [False, True])
+async def test_run_poller_escaped_writer_releases_resources(
+    tmp_path: Path, home: Path, monkeypatch, cancel: bool,
+):
+    """The writer escapes before expiry and stays alive until test cleanup."""
+    from mimir import pollers
+
+    skill_dir = tmp_path / "escape"
+    _install_script(skill_dir, "poller.py", """
+import os, signal
+from pathlib import Path
+if os.fork() == 0:
+    os.setsid()
+    with open('release', 'rb', buffering=0) as release:
+        os.write(1, b'{"poller":"escape","prompt":"not committed"}\\n')
+        os.write(2, b'escaped writer diagnostic\\n')
+        # Publish complete PID content before existence signals readiness.
+        Path('ready.tmp').write_text(str(os.getpid()))
+        os.rename('ready.tmp', 'ready')
+        release.read(1)
+    os.close(1)
+    os.close(2)
+    Path('finished').touch()
+    os._exit(0)
+signal.pause()
+""")
+    os.mkfifo(skill_dir / "release")
+    release_fd = os.open(skill_dir / "release", os.O_RDWR | os.O_NONBLOCK)
+    monkeypatch.setattr(pollers, "POLLER_EXIT_GRACE_SECONDS", 0.1)
+    buffers = []
+    drain = pollers._drain_capped
+
+    async def observed_drain(*args, **kwargs):
+        buffers.append(kwargs["buffer"])
+        return await drain(*args, **kwargs)
+
+    monkeypatch.setattr(pollers, "_drain_capped", observed_drain)
+    ready_event = asyncio.Event()
+
+    async def ready():
+        await _poller_file_ready(skill_dir / "ready")
+        while len(buffers) != 2 or not all(buffers):
+            await asyncio.sleep(0)
+        ready_event.set()
+        if cancel:
+            await asyncio.Future()
+
+    _control_poller_wait(monkeypatch, ready)
+    cfg = PollerConfig(
+        name="escape", command=f"{sys.executable} poller.py",
+        cron="* * * * *", env={}, skill_dir=skill_dir,
+    )
+    enq = _CapturingEnqueue()
+    from mimir.scheduler import Scheduler
+    from unittest.mock import AsyncMock
+
+    sched = Scheduler(scheduler_yaml=tmp_path / "scheduler.yaml", enqueue=enq)
+    sched._home = home
+    sched._pollers[cfg.name] = cfg
+    sched._poller_semaphore = asyncio.Semaphore(1)
+    monkeypatch.setattr(sched, "_effective_poller_timeout", AsyncMock(return_value=1))
+    task = asyncio.create_task(sched._fire_poller(poller_name=cfg.name))
+    try:
+        await ready_event.wait()
+        if cancel:
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(task, 2)
+        else:
+            await asyncio.wait_for(asyncio.shield(task), 2)
+            diagnostics = [e for e in _read_events(home) if e["type"] == "poller_stderr"]
+            assert diagnostics[0]["stderr"] == "escaped writer diagnostic"
+            assert any(e["type"] == "poller_timeout" for e in _read_events(home))
+        assert not sched._poller_fire_locks[cfg.name].locked()
+        assert not sched._poller_semaphore.locked()
+        assert enq.events == []
+        assert bytes(buffers[0]).startswith(b'{"poller":"escape"')
+        escaped_pid = int((skill_dir / "ready").read_text())
+        assert os.getpgid(escaped_pid) == escaped_pid
+        assert not (skill_dir / "finished").exists()
+    finally:
+        os.write(release_fd, b"x")
+        os.close(release_fd)
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        await _poller_file_ready(skill_dir / "finished")
+
+
+@pytest.mark.asyncio
 @pytest.mark.timeout(60)
 @pytest.mark.parametrize("count", [0, 3])
 async def test_run_poller_bounded_when_child_closes_pipes_but_keeps_running(
@@ -3777,7 +4001,7 @@ signal.pause()
         expire=False, reap=True,
     )
     n = await run_poller(cfg, enqueue=enq, timeout=2.0)
-    assert calls == [("drain", 2.0), ("reap", 2.0)]
+    assert calls == [("drain", 2.0), ("reap", 2.0), ("reap", 5.0)]
     assert n == 0
     assert enq.events == []
     events = _read_events(home)
@@ -4479,13 +4703,14 @@ def _observe_poller_barrier(monkeypatch):
     completed = asyncio.Event()
     drain = pollers._drain_capped
 
-    async def observed_drain(stream, limit, overflow, on_line=None):
+    async def observed_drain(stream, limit, overflow, on_line=None, **kwargs):
         async def observed_line(line):
             await on_line(line)
             completed.set()
 
         return await drain(
             stream, limit, overflow, observed_line if on_line else None,
+            **kwargs,
         )
 
     monkeypatch.setattr(pollers, "_drain_capped", observed_drain)
@@ -5650,7 +5875,9 @@ print('{"poller": "x", "prompt": "ok"}')
         if e.get("type") == "poller_env_passthrough_named_secret"
     ]
     assert len(passthrough_events) == 1
-    assert passthrough_events[0].get("key") == "GITHUB_TOKEN"
+    # Bare "key" is credential-shaped at the durable boundary, even when this
+    # producer puts an environment variable name rather than its value there.
+    assert passthrough_events[0].get("key") == "[REDACTED]"
     # Value must NOT leak into the event payload.
     payload = json.dumps(passthrough_events[0])
     assert "ghp_secret_should_not_appear_in_event" not in payload
@@ -5697,7 +5924,7 @@ print(json.dumps({"poller": "x", "prompt": f"observed: {val}"}))
     assert len(blocked_events) == 1, (
         f"expected one process_control_blocked event; got {len(blocked_events)}"
     )
-    assert blocked_events[0].get("key") == "LD_PRELOAD"
+    assert blocked_events[0].get("key") == "[REDACTED]"
 
     # The poller subprocess ran and emitted an event; the content shows
     # whether LD_PRELOAD made it through. Asserting that the LITERAL
@@ -5725,9 +5952,9 @@ async def test_run_poller_pass_env_process_control_vars_all_blocked(
     """chainlink #229: each var in the hard-deny set must be blocked."""
     monkeypatch.setenv(var_name, "/tmp/should-not-propagate")
     skill_dir = tmp_path / "skill"
-    _install_script(skill_dir, "poller.py", """
+    _install_script(skill_dir, "poller.py", f"""
 import json, os
-print(json.dumps({"poller": "x", "prompt": "ok"}))
+print(json.dumps({{"poller": "x", "prompt": os.environ.get({var_name!r}, "BLOCKED")}}))
 """)
     cfg = PollerConfig(
         name="x", command=f"{sys.executable} poller.py",
@@ -5737,11 +5964,12 @@ print(json.dumps({"poller": "x", "prompt": "ok"}))
     enq = _CapturingEnqueue()
     await run_poller(cfg, enqueue=enq)
 
+    assert enq.events[0].content == "BLOCKED"
     events = _read_events(home)
     blocked = [
         e for e in events
         if e.get("type") == "poller_env_process_control_blocked"
-        and e.get("key") == var_name
+        and e.get("key") == "[REDACTED]"
     ]
     assert len(blocked) == 1, (
         f"{var_name} not blocked; events: {[e.get('type') for e in events]}"
@@ -5780,7 +6008,7 @@ print('{"poller": "x", "prompt": "ok"}')
     warn_events = [e for e in events if e.get("type") == "poller_env_secret_reintroduced"]
     assert len(warn_events) == 1
     assert warn_events[0].get("poller") == "x"
-    assert warn_events[0].get("key") == "MY_API_KEY"
+    assert warn_events[0].get("key") == "[REDACTED]"
     # Value must NOT appear in the event payload.
     payload = json.dumps(warn_events[0])
     assert "literal_static_value" not in payload
@@ -5829,7 +6057,7 @@ print('{"poller": "x", "prompt": "ok"}')
     events = _read_events(home)
     warn_events = [e for e in events if e.get("type") == "poller_env_secret_reintroduced"]
     assert len(warn_events) == 1
-    assert warn_events[0].get("key") == "MIMIR_SOME_INTERNAL_KEY"
+    assert warn_events[0].get("key") == "[REDACTED]"
 
 
 @pytest.mark.asyncio
@@ -5873,7 +6101,7 @@ print(json.dumps({
     ]
     assert len(blocked) == 1
     assert blocked[0]["poller"] == "x"
-    assert blocked[0]["key"] == "LD_PRELOAD"
+    assert blocked[0]["key"] == "[REDACTED]"
     # The value must never be logged.
     assert "/tmp/evil.so" not in json.dumps(blocked[0])
 

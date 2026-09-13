@@ -24,10 +24,11 @@ from mimir.acp.session_store import SessionStore
 from mimir.acp.transport import close_writer, pump_stream
 
 
-def _journal_source(progress: Path) -> str:
+def _journal_source(progress: Path, *, controlled_exit: bool = False) -> str:
     # Keep C-level bytes separate: they have no line framing and must not alter
     # the existing text journal's ordered prefix. Neither file needs pipe EOF.
-    return f"_journal_path = {str(progress)!r}\n" + r'''
+    return (f"_journal_path = {str(progress)!r}\n"
+            f"_controlled_exit = {controlled_exit!r}\n") + r'''
 import faulthandler, os, signal, socket, threading, time
 from mimir.acp import proxy
 _journal_fd = os.open(_journal_path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
@@ -109,7 +110,8 @@ proxy._ShutdownHooks._close_wakeup = _close_wakeup
 _journal_signal = proxy._ShutdownHooks._handle_signal
 def _handle_signal(self, signum, frame):
     diagnose(f'signal-dispatch:{signum} interrupted={frame.f_code.co_name}:{frame.f_lineno}')
-    _journal_flush()
+    if not _controlled_exit:
+        _journal_flush()
     record(b'signal-enter:' + str(signum).encode())
     return _journal_signal(self, signum, frame)
 proxy._ShutdownHooks._handle_signal = _handle_signal
@@ -121,7 +123,13 @@ proxy._ShutdownHooks._force_exit = _force_exit
 _journal_exit = os._exit
 def _exit(code):
     diagnose(f'exit-dispatch:{code}')
-    _journal_flush()
+    if _controlled_exit:
+        # The parent observes this actual exit call, then checks C delivery.
+        # Never wait on the tee's shared Event inside a signal handler.
+        record(b'exit-ready:' + str(code).encode())
+        assert os.read(0, 1) == b'e'
+    else:
+        _journal_flush()
     _journal_exit(code)
 os._exit = _exit
 
@@ -359,8 +367,11 @@ async def run():
 loop.run_until_complete(run())
 loop.close()
 loop.close()
-assert len(sockets) == 2
+assert len(sockets) == 4
 assert all(sock.fileno() == -1 for sock in sockets)
+assert hooks._observer is None or not hooks._observer.is_alive()
+assert hooks._watchdog is None
+assert hooks.signum is None
 assert set_wakeup_fd(-1) == previous_writer.fileno()
 hooks.close()
 assert signal.getsignal(signal.SIGTERM) is previous_handler
@@ -413,7 +424,7 @@ assert loop.close is first._close_loop
 if mode == 'double':
     first.install()
     assert first._wakeup is first_pair
-    assert len(sockets) == 2
+    assert len(sockets) == 4
     first.close()
 elif mode == 'replacement':
     replacement_close = lambda: None
@@ -432,7 +443,7 @@ elif mode == 'replacement':
 else:
     second.install()
     second_pair = second._wakeup
-    assert len(sockets) == 4
+    assert len(sockets) == 8
     if mode == 'lifo':
         second.close()
         assert loop.close is first._close_loop
@@ -584,7 +595,7 @@ raise SystemExit(bootstrap.main([]))
             await process.communicate()
 
 
-async def _await_diagnostic(progress: Path, marker: str, *, timeout: float = 30) -> str:
+async def _await_diagnostic(progress: Path, marker: str, *, timeout: float | None = 30) -> str:
     """Wait for a diagnostic written by the child's watchdog THREAD.
 
     ``armed`` is written by ``Timer.start()`` on the thread that CALLS start, so
@@ -594,12 +605,12 @@ async def _await_diagnostic(progress: Path, marker: str, *, timeout: float = 30)
     file only delays the same failure.
     """
     path = progress.with_suffix(".diagnostics")
-    deadline = time.monotonic() + timeout
+    deadline = time.monotonic() + timeout if timeout is not None else None
     while True:
         text = path.read_text() if path.exists() else ""
         if marker in text:
             return text
-        assert time.monotonic() < deadline, (
+        assert deadline is None or time.monotonic() < deadline, (
             f"{marker!r} not observed within {timeout}s; diagnostics:\n{text or '<empty>'}"
         )
         await asyncio.sleep(0.01)
@@ -607,13 +618,14 @@ async def _await_diagnostic(progress: Path, marker: str, *, timeout: float = 30)
 
 async def _signal_exit_protocol(
     process: asyncio.subprocess.Process, progress: Path,
-    signum: signal.Signals, repeat: bool, *, timeout: float = 120,
+    signum: signal.Signals, repeat: bool, *, timeout: float = 600,
     after_armed: Callable[[], Awaitable[None]] | None = None,
 ) -> None:
     outstanding = "ready"
 
     async def protocol() -> None:
         nonlocal outstanding, signum
+        delivered = bytes([signum])
         for marker in ("ready", "armed", "terminated", "draining"):
             outstanding = marker
             observed = await process.stdout.readline()
@@ -625,13 +637,31 @@ async def _signal_exit_protocol(
                 # loop, so this is the only point where a child-thread marker
                 # can be synchronised on.
                 await after_armed()
-        outstanding = "exit"
+        outstanding = "exit-ready"
         if repeat:
+            # Retire the controlled timer's stdin reader before the exit handshake.
+            # This is not expiry; only the repeated signal may call os._exit.
+            process.stdin.write(b"n")
+            await process.stdin.drain()
+            await _await_diagnostic(progress, "watchdog-input-run-returned", timeout=None)
             signum = signal.SIGINT if signum != signal.SIGINT else signal.SIGTERM
+            delivered += bytes([signum])
             process.send_signal(signum)
         else:
             process.stdin.write(b"x")
             await process.stdin.drain()
+        marker = f"exit-ready:{128 + signum}"
+        while marker not in progress.read_text().splitlines():
+            assert process.returncode is None, (marker, progress.read_text())
+            await asyncio.sleep(0.01)
+        # The child is parked inside os._exit, not merely somewhere in teardown.
+        # Read the independently written C-delivery evidence before releasing it.
+        outstanding = "signal delivery after " + marker
+        while progress.with_suffix(".wakeup").read_bytes() != delivered:
+            await asyncio.sleep(0.01)
+        outstanding = "exit after " + marker
+        process.stdin.write(b"e")
+        await process.stdin.drain()
         stdout, stderr = await process.communicate()
         assert process.returncode == 128 + signum
         assert (stdout, stderr) == (b"", b"")
@@ -648,6 +678,7 @@ async def _signal_exit_protocol(
 
 
 @pytest.mark.asyncio
+@pytest.mark.timeout(0)  # The 600s asyncio backstop fails normally, including under xdist.
 @pytest.mark.parametrize("signum", [signal.SIGTERM, signal.SIGINT, signal.SIGHUP])
 @pytest.mark.parametrize("repeat", [False, True], ids=["deadline", "escalation"])
 @pytest.mark.parametrize("stage", ["route", "close", "writer", "outer", "post-loop", "blocked", "cleanup"])
@@ -655,7 +686,7 @@ async def test_signal_exit_bounds_entire_teardown(
     signum: signal.Signals, repeat: bool, stage: str, tmp_path: Path,
 ) -> None:
     progress = tmp_path / "child-progress"
-    source = _journal_source(progress) + r'''
+    source = _journal_source(progress, controlled_exit=True) + r'''
 import atexit, asyncio, io, os, sys, threading
 from types import SimpleNamespace
 from mimir.acp import bootstrap, profiles, proxy
@@ -665,8 +696,9 @@ profiles.selected_profile = lambda name: 'test'
 
 def mark(value):
     record(value)
-    sink.write(value + b'\n')
-    sink.flush()
+    os.write(control_fd, value + b'\n')
+
+control_fd = os.dup(1)
 
 class ControlledTimer(InputTimer):
     def start(self):
@@ -684,8 +716,6 @@ async def stuck():
             pass
 
 async def run_proxy(name, output):
-    global sink
-    sink = output
     class Reader:
         async def read(self, size):
             mark(b'ready')
@@ -755,15 +785,20 @@ raise SystemExit(bootstrap.main([]))
             # protocol loop, after which no writer remains and polling the final
             # file would only delay the same failure. Ordering only — later
             # assertions re-read the file for markers written after this point.
-            await _await_diagnostic(progress, "watchdog-input-wait")
+            await _await_diagnostic(progress, "watchdog-input-wait", timeout=None)
 
         await _signal_exit_protocol(
             process, progress, signum, repeat, after_armed=_observe_input_wait,
         )
-        assert progress.read_text().splitlines()[:8] == [
+        prefix = progress.read_text().splitlines()[:8]
+        assert prefix[:4] == [
             "child-started", "install-enter", "handlers-installed", "ready",
-            f"signal-enter:{signum}", "watchdog-start-enter",
-            "watchdog-start-returned", "armed",
+        ]
+        # C delivery may arm before Python dispatch. Cleanup still waits for
+        # the single watchdog's start to complete, preserving protocol ordering.
+        assert f"signal-enter:{signum}" in prefix[4:]
+        assert [line for line in prefix[4:] if line != f"signal-enter:{signum}"] == [
+            "watchdog-start-enter", "watchdog-start-returned", "armed",
         ]
         delivered = [signum]
         diagnostics = progress.with_suffix(".diagnostics").read_text()
@@ -772,7 +807,9 @@ raise SystemExit(bootstrap.main([]))
             delivered.append(signal.SIGINT if signum != signal.SIGINT else signal.SIGTERM)
             assert f"signal-enter:{delivered[-1]}" in progress.read_text().splitlines()
         else:
-            assert progress.read_text().splitlines()[-2:] == ["watchdog-fired", "force-exit-enter"]
+            assert progress.read_text().splitlines()[-3:] == [
+                "watchdog-fired", "force-exit-enter", f"exit-ready:{128 + signum}",
+            ]
             assert "watchdog-input-returned:b'x' cancelled=False" in diagnostics
         assert progress.with_suffix(".wakeup").read_bytes() == bytes(delivered)
     finally:
@@ -863,7 +900,9 @@ asyncio.run(run())
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("delivery", ["before-install", "before-handler"])
+@pytest.mark.parametrize("delivery", [
+    "before-install", "before-handler", "before-handler-observed",
+])
 async def test_preinstall_sigint_exits_without_blocked_teardown(
     delivery: str, tmp_path: Path,
 ) -> None:
@@ -884,15 +923,27 @@ def deliver_install(self):
 _journal_install = deliver_install
 original_signal = signal.signal
 def install_handler(signum, handler):
-    if sys.argv[1] == 'before-handler' and signum == signal.SIGINT:
+    if sys.argv[1].startswith('before-handler') and signum == signal.SIGINT:
         os.kill(os.getpid(), signal.SIGINT)
     return original_signal(signum, handler)
 
+observer_armed = threading.Event()
 class ArmedTimer(JournalTimer):
     def start(self):
         super().start()
         record(b'armed')
+        observer_armed.set()
 proxy.threading.Timer = ArmedTimer
+
+if sys.argv[1] == 'before-handler-observed':
+    # Force the observer-first interleaving without sleeps: bootstrap still
+    # calls os._exit directly, but allow the C-byte observer to finish arming
+    # before the exit completes. Ordinary variants retain the unmodified race.
+    original_exit = os._exit
+    def observed_exit(code):
+        observer_armed.wait()
+        original_exit(code)
+    os._exit = observed_exit
 
 async def run_proxy(name, output):
     # Only intercept the product registration, not bootstrap's startup handler.
@@ -920,12 +971,26 @@ raise SystemExit(bootstrap.main([]))
         async with _shutdown_ceiling(process, progress, lambda: "startup SIGINT exit"):
             observed = await process.stdout.readline()
             state = progress.read_text().splitlines()
-            # A blocked-close handshake makes the unfixed failure immediate and
-            # proves it is a live, unarmed child, not just an unexpected exit code.
+            # A blocked-close handshake makes unwanted async teardown visible,
+            # independently of whether the C-byte observer has armed its timer.
             assert observed == b"", (process.returncode, state)
             stdout, stderr = await process.communicate()
             assert (process.returncode, stdout, stderr) == (128 + signal.SIGINT, b"", b"")
-            assert state == ["child-started", "install-enter"]
+            state = progress.read_text().splitlines()
+            assert state[:2] == ["child-started", "install-enter"]
+            # Once the wakeup fd is installed, the observer can race bootstrap's
+            # immediate exit even before the product SIGINT handler is installed.
+            # Only a prefix of timer startup is legal: no Python signal dispatch,
+            # completed installation, router teardown, or watchdog expiry.
+            timer_start = ["watchdog-start-enter", "watchdog-start-returned", "armed"]
+            suffix = state[2:]
+            if delivery == "before-install":
+                assert suffix == []
+            elif delivery == "before-handler-observed":
+                assert suffix == timer_start
+            else:
+                assert suffix == timer_start[:len(suffix)]
+            assert "signal-dispatch:" not in progress.with_suffix(".diagnostics").read_text()
     finally:
         if process.returncode is None:
             process.kill()
@@ -971,7 +1036,7 @@ assert signal.getsignal(signal.SIGINT) is previous
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("outstanding", ["armed", "terminated", "draining"])
+@pytest.mark.parametrize("outstanding", ["armed", "terminated", "draining", "exit-ready"])
 async def test_signal_exit_timeout_reports_child_progress(
     outstanding: str, tmp_path: Path,
 ) -> None:
@@ -982,7 +1047,7 @@ async def test_signal_exit_timeout_reports_child_progress(
 import os, signal, sys, time
 signal.set_wakeup_fd(_wakeup_fd)
 signal.signal(signal.SIGINT, lambda signum, frame: record(b'signal-enter:' + str(signum).encode()))
-markers = ['ready', 'armed', 'terminated', 'draining']
+markers = ['ready', 'armed', 'terminated', 'draining', 'exit-ready']
 outstanding = sys.argv[1]
 record(('simulated child sleeping before ' + outstanding).encode())
 for marker in markers[:markers.index(outstanding)]:
@@ -1013,13 +1078,13 @@ time.sleep(3600)
 
 
 @pytest.mark.asyncio
-@pytest.mark.timeout(120)
+@pytest.mark.timeout(0)  # The local backstop reports progress without killing a worker.
 @pytest.mark.parametrize("stage", ["unarmed", "never-fired", "force-exit", "escalation"])
 async def test_shutdown_journal_timeout_distinguishes_surviving_child(
     stage: str, tmp_path: Path,
 ) -> None:
     progress = tmp_path / "child-progress"
-    source = _journal_source(progress) + r'''
+    source = _journal_source(progress, controlled_exit=True) + r'''
 import asyncio
 from types import SimpleNamespace
 
@@ -1057,11 +1122,12 @@ asyncio.run(run())
             await asyncio.sleep(0.01)
 
     try:
-        async with _shutdown_ceiling(process, progress, lambda: "self-test handshake"):
+        async with _shutdown_ceiling(process, progress, lambda: "self-test handshake", timeout=600):
             assert await process.stdout.readline() == b"ready\n"
             if stage != "unarmed":
                 process.send_signal(signal.SIGTERM)
                 await await_marker("cleanup-enter")
+                await _await_diagnostic(progress, f"tee-forward-returned:{signal.SIGTERM}", timeout=None)
             if stage == "force-exit":
                 process.stdin.write(b"x")
                 await process.stdin.drain()
@@ -1069,6 +1135,7 @@ asyncio.run(run())
             elif stage == "escalation":
                 process.send_signal(signal.SIGINT)
                 await await_marker(f"escalation-survived:{128 + signal.SIGINT}")
+                await _await_diagnostic(progress, f"tee-forward-returned:{signal.SIGINT}", timeout=None)
             # The short timeout tests formatting, never child startup or delivery.
             with pytest.raises(pytest.fail.Exception) as failure:
                 async with _shutdown_ceiling(process, progress, lambda: "exit", timeout=0.05):
@@ -1084,7 +1151,10 @@ asyncio.run(run())
             else:
                 assert f"wakeup-byte:{signal.SIGTERM}" in message
                 assert f"signal-enter:{signal.SIGTERM}\n" in message
-                assert "watchdog-start-enter\nwatchdog-start-returned\ncleanup-enter\n" in message
+                # The observer can start the watchdog across Python dispatch;
+                # only watchdog-start completion must precede cleanup.
+                without_dispatch = message.replace(f"signal-enter:{signal.SIGTERM}\n", "")
+                assert "watchdog-start-enter\nwatchdog-start-returned\ncleanup-enter\n" in without_dispatch
             if stage == "force-exit":
                 assert "watchdog-fired\nforce-exit-enter\nforce-exit-survived\n" in message
             else:
@@ -1161,13 +1231,138 @@ asyncio.run(run())
             assert f"wakeup-byte:{signal.SIGTERM}" in message
             assert "signal-enter:" not in message
             assert "signal-dispatch:" not in message
-            assert "watchdog-start-enter" not in message
+            assert "watchdog-start-enter" in message
             assert "recv-returned" not in message
             assert process.returncode is None
     finally:
         if process.returncode is None:
             process.kill()
         await process.communicate()
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(sys.platform != "linux", reason="uses Linux MSG_WAITALL handshake")
+@pytest.mark.parametrize("journal", [False, True], ids=["production", "journal"])
+@pytest.mark.parametrize("delivery", ["main", "worker", "main-worker", "main-main"])
+async def test_blocked_main_signal_delivery_matrix(
+    delivery: str, journal: bool, tmp_path: Path,
+) -> None:
+    progress = tmp_path / "child-progress"
+    source = (_journal_source(progress) if journal else "") + r'''
+import asyncio, ctypes, os, select, signal, socket, sys, threading
+from types import SimpleNamespace
+from mimir.acp import proxy
+
+delivery = sys.argv[1]
+main_ident = threading.get_ident()
+reader, writer = socket.socketpair()
+writer.sendall(b'x')
+cleanup_reader, cleanup_writer = socket.socketpair()
+cleanup_writer.sendall(b'x')
+libc = ctypes.CDLL(None)
+libc.recv.argtypes = [ctypes.c_int, ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int]
+libc.recv.restype = ctypes.c_ssize_t
+buffer = ctypes.create_string_buffer(2)
+
+def cleanup():
+    os.write(1, b'cleanup\n')
+    libc.recv(cleanup_reader.fileno(), buffer, 2, socket.MSG_WAITALL)
+    raise AssertionError('blocked cleanup returned')
+
+def deliver():
+    # Readability disappears only after main enters the untimed C recv. No
+    # bytecode boundary or event-loop callback can dispatch a worker's signal.
+    while select.select([reader], [], [], 0)[0]:
+        pass
+    os.write(1, b'blocked\n')
+    assert os.read(0, 1) == b'x'
+    target = threading.get_ident() if delivery == 'worker' else main_ident
+    signal.pthread_kill(target, signal.SIGTERM)
+    if '-' in delivery:
+        assert os.read(0, 1) == b'y'
+        # The marker precedes the wait. Prove cleanup is actually blocked
+        # before choosing the second delivery thread, just as for the first.
+        while select.select([cleanup_reader], [], [], 0)[0]:
+            pass
+        target = threading.get_ident() if delivery == 'main-worker' else main_ident
+        signal.pthread_kill(target, signal.SIGINT)
+
+async def run():
+    hooks = proxy._ShutdownHooks(SimpleNamespace(terminate_owned_children=cleanup))
+    hooks.install()
+    threading.Thread(target=deliver, daemon=True).start()
+    libc.recv(reader.fileno(), buffer, 2, socket.MSG_WAITALL)
+    raise AssertionError('blocked main returned')
+
+asyncio.run(run())
+'''
+    process = await asyncio.create_subprocess_exec(
+        sys.executable, "-c", source, delivery,
+        stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE, cwd=Path(__file__).resolve().parents[1],
+    )
+    try:
+        async with _shutdown_ceiling(process, progress, lambda: "blocked main handshake"):
+            assert await process.stdout.readline() == b"blocked\n"
+        # The real, unchanged five-second watchdog must release this child.
+        async with asyncio.timeout(6):
+            process.stdin.write(b"x")
+            await process.stdin.drain()
+            if delivery != "worker":
+                assert await process.stdout.readline() == b"cleanup\n"
+            if "-" in delivery:
+                process.stdin.write(b"y")
+                await process.stdin.drain()
+            stdout, stderr = await process.communicate()
+        expected = signal.SIGINT if delivery == "main-main" else signal.SIGTERM
+        assert (process.returncode, stdout, stderr) == (128 + expected, b"", b"")
+        if journal:
+            state = progress.read_text()
+            assert state.count("watchdog-start-enter") == 1
+            assert ("watchdog-fired" in state) == (delivery != "main-main")
+            if delivery == "worker":
+                assert "signal-enter:" not in state
+                assert "signal-dispatch:" not in progress.with_suffix(".diagnostics").read_text()
+    finally:
+        if process.returncode is None:
+            process.kill()
+        await process.communicate()
+
+
+def test_wakeup_observer_ignores_non_shutdown_bytes() -> None:
+    import subprocess
+
+    source = r'''
+import asyncio, os
+from types import SimpleNamespace
+from mimir.acp import proxy
+
+async def run():
+    hooks = proxy._ShutdownHooks(SimpleNamespace(terminate_owned_children=lambda: None))
+    forwarded = asyncio.Event()
+    drain = hooks._drain_wakeup
+    def observed():
+        drain()
+        forwarded.set()
+    hooks._drain_wakeup = observed
+    hooks.install()
+    observer = hooks._observer
+    assert observer.is_alive()
+    os.write(hooks._wakeup[1].fileno(), b'\0\xff')
+    await forwarded.wait()
+    assert hooks._watchdog is None
+    assert hooks.signum is None
+    hooks.close()
+    assert not observer.is_alive()
+    assert hooks._watchdog is None
+    assert hooks._observer_sockets is None
+asyncio.run(run())
+'''
+    result = subprocess.run(
+        [sys.executable, "-c", source], capture_output=True, timeout=120,
+        cwd=Path(__file__).resolve().parents[1],
+    )
+    assert (result.returncode, result.stdout, result.stderr) == (0, b"", b"")
 
 
 @pytest.mark.asyncio

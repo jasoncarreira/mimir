@@ -207,6 +207,27 @@ def bridge_with_fake_client(tmp_path: Path):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("fail_at", [1, 2])
+async def test_send_chunk_failure_preserves_progress(bridge_with_fake_client, fail_at):
+    import discord
+
+    bridge, _, _ = bridge_with_fake_client
+    send = AsyncMock(side_effect=[
+        *[SimpleNamespace(id=1001) for _ in range(fail_at - 1)],
+        discord.DiscordException("send failed"),
+    ])
+    bridge._client.get_channel(1).send = send
+    result = await bridge.send("discord-1", "x" * (DISCORD_MESSAGE_CHAR_LIMIT * 3))
+
+    assert result.sent is False
+    assert result.chunks == fail_at - 1
+    assert result.message_id == ("1001" if fail_at == 2 else None)
+    assert result.uploads == 0
+    assert send.await_count == fail_at
+    assert f"after {fail_at - 1} chunk(s)" in result.error
+
+
+@pytest.mark.asyncio
 async def test_send_chunks_long_text(bridge_with_fake_client):
     bridge, _, sent = bridge_with_fake_client
     long_text = "y" * (DISCORD_MESSAGE_CHAR_LIMIT * 2 + 100)
@@ -215,6 +236,52 @@ async def test_send_chunks_long_text(bridge_with_fake_client):
     assert result.chunks == 3  # 2*limit + 100 → 3 chunks under the limit
     # All chunks landed on the right channel.
     assert all(item["channel_id"] == 1 for item in sent)
+
+
+@pytest.mark.asyncio
+async def test_on_reaction_fetches_channel_on_cache_miss(
+    bridge_with_fake_client, tmp_path: Path,
+):
+    bridge, _, _ = bridge_with_fake_client
+    channel = bridge._client._channels.pop(1)
+    channel.fetch_message = AsyncMock(
+        return_value=SimpleNamespace(author=bridge._client.user)
+    )
+    bridge._client.fetch_channel = AsyncMock(return_value=channel)
+
+    await bridge._on_reaction(SimpleNamespace(
+        user_id=99, channel_id=1, message_id=123, emoji="👍",
+    ))
+
+    bridge._client.fetch_channel.assert_awaited_once_with(1)
+    channel.fetch_message.assert_awaited_once_with(123)
+    record = json.loads((tmp_path / "logs" / "events.jsonl").read_text())
+    assert record["type"] == "react_received"
+    assert record["channel_id"] == "discord-1"
+    assert record["target_message_id"] == "123"
+    assert record["author"] == "discord-99"
+
+
+@pytest.mark.asyncio
+async def test_on_reaction_channel_fetch_failure_is_safe(
+    bridge_with_fake_client, tmp_path: Path,
+):
+    import discord
+
+    bridge, _, _ = bridge_with_fake_client
+    channel = bridge._client._channels.pop(1)
+    channel.fetch_message = AsyncMock()
+    bridge._client.fetch_channel = AsyncMock(
+        side_effect=discord.DiscordException("missing permissions")
+    )
+
+    await bridge._on_reaction(SimpleNamespace(
+        user_id=99, channel_id=1, message_id=123, emoji="👍",
+    ))
+
+    bridge._client.fetch_channel.assert_awaited_once_with(1)
+    channel.fetch_message.assert_not_awaited()
+    assert not (tmp_path / "logs" / "events.jsonl").exists()
 
 
 @pytest.mark.asyncio
@@ -379,6 +446,39 @@ async def test_send_closes_attachment_files_when_discord_send_fails(
     assert "discord send error" in (result.error or "")
     assert len(opened_files) == 2
     assert all(file.fp.closed for file in opened_files)
+
+
+@pytest.mark.asyncio
+async def test_send_closes_opened_attachment_when_later_path_is_missing(
+    bridge_with_fake_client, tmp_path: Path, monkeypatch,
+):
+    import discord
+
+    bridge, _, sent = bridge_with_fake_client
+    attachment = tmp_path / "a.txt"
+    attachment.write_text("alpha")
+    opened_files: list[discord.File] = []
+    real_file = discord.File
+
+    def track_file(path):
+        file = real_file(path)
+        opened_files.append(file)
+        return file
+
+    monkeypatch.setattr(discord, "File", track_file)
+    try:
+        with pytest.raises(FileNotFoundError):
+            await bridge.send(
+                "discord-1", "hello",
+                attachment_paths=[attachment, tmp_path / "missing.txt"],
+            )
+
+        assert sent == []
+        assert len(opened_files) == 1
+        assert opened_files[0].fp.closed
+    finally:
+        for file in opened_files:
+            file.close()
 
 
 @pytest.mark.asyncio

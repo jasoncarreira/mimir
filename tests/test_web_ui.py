@@ -2383,6 +2383,57 @@ async def test_api_v1_live_events_releases_slot_when_prepare_fails(
     assert "too many live event streams" not in body
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("stream", ["live", "turn"])
+async def test_sse_releases_slot_under_repeated_cancellation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, stream: str,
+):
+    import inspect
+
+    from aiohttp.test_utils import make_mocked_request
+
+    monkeypatch.setenv("MIMIR_LIVE_EVENTS_MAX_STREAMS", "1")
+    a = web.Application()
+    web_ui.register_routes(
+        a, turns_log=tmp_path / "turns.jsonl",
+        events_log=tmp_path / "events.jsonl", turn_event_bus=TurnEventBus(),
+    )
+    path = f"/api/v1/{stream}-events"
+    request = make_mocked_request("GET", path, app=a)
+    handler = (await a.router.resolve(request)).handler
+    # Hold only this stream's admission lock, not shared event-loop state.
+    acquire = inspect.getclosurevars(handler).nonlocals[f"_try_acquire_{stream}_event_slot"]
+    lock = inspect.getclosurevars(acquire).nonlocals[f"{stream}_events_lock"]
+    preparing = asyncio.Event()
+
+    async def blocked_prepare(self, request):
+        preparing.set()
+        await asyncio.Future()
+
+    monkeypatch.setattr(web.StreamResponse, "prepare", blocked_prepare)
+    task = asyncio.create_task(handler(request))
+    try:
+        await asyncio.wait_for(preparing.wait(), timeout=2)
+        async with lock:
+            task.cancel()
+            # The original cleanup suspends on the held lock here, so another
+            # cancellation aborts the decrement and permanently consumes capacity.
+            await asyncio.sleep(0)
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+    async def disconnected_prepare(self, request):
+        raise ConnectionResetError("client disconnected")
+
+    monkeypatch.setattr(web.StreamResponse, "prepare", disconnected_prepare)
+    for _ in range(2):
+        response = await handler(make_mocked_request("GET", path, app=a))
+        assert response.status == 200, "cancelled stream leaked its only slot"
+
+
+@pytest.mark.asyncio
 async def test_read_jsonl_caps_at_max_records(app):
     """Pattern A (2026-05-10): ``_read_jsonl`` is bounded by
     ``max_records`` (default 5000). Pre-2026-05-10 it forward-read

@@ -18,6 +18,7 @@ import sqlite3
 import threading
 from dataclasses import dataclass, field
 from enum import StrEnum
+from time import monotonic
 from typing import Any
 
 
@@ -285,6 +286,7 @@ def get_authorization_scope(auth_context: Any) -> AuthorizationScope:
 _SHADOW_COUNT_LIMIT = 1000
 _SHADOW_TYPE_LIMIT = 8
 _SHADOW_SURFACE_LIMIT = 16
+_SHADOW_TURN_MAX_AGE_SECONDS = 3600
 _SHADOW_TURN_ACCUMULATORS: dict[str, "_ShadowReadObservation"] = {}
 _SHADOW_TURN_ACCUMULATORS_LOCK = threading.Lock()
 
@@ -296,6 +298,7 @@ class _ShadowReadObservation:
     auth_context: Any
     strict_scope: AuthorizationScope
     enforcement_enabled: bool
+    created_at: float = field(default_factory=lambda: monotonic())
     resource_counts: dict[str, int] = field(default_factory=dict)
     resource_type_counts: dict[str, dict[str, int]] = field(default_factory=dict)
     probe_failure_counts: dict[str, int] = field(default_factory=dict)
@@ -596,6 +599,18 @@ class SagaReadAuthorization:
             turn_id = getattr(turn, "turn_id", None)
             if turn_id:
                 with _SHADOW_TURN_ACCUMULATORS_LOCK:
+                    # Insertion order is creation-age order under this lock.
+                    # Late finalizers can recreate entries after turn teardown;
+                    # reclaim those too, even when capacity is never reached.
+                    cutoff = monotonic() - _SHADOW_TURN_MAX_AGE_SECONDS
+                    stale_turns = []
+                    for stale, pending in _SHADOW_TURN_ACCUMULATORS.items():
+                        if pending.created_at > cutoff:
+                            break
+                        stale_turns.append(stale)
+                    for stale in stale_turns:
+                        del _SHADOW_TURN_ACCUMULATORS[stale]
+                    aged_count = len(stale_turns)
                     observation = _SHADOW_TURN_ACCUMULATORS.get(turn_id)
                     if observation is None:
                         observation = _ShadowReadObservation(
@@ -605,11 +620,20 @@ class SagaReadAuthorization:
                         )
                         _SHADOW_TURN_ACCUMULATORS[turn_id] = observation
                     observation.merge_operation(self)
+                    overflow_count = 0
                     if len(_SHADOW_TURN_ACCUMULATORS) > 4096:
-                        # Normal turn teardown flushes entries. This is only a
-                        # safety bound for abnormal turns that never reset.
+                        # Evict oldest first, with one loss counter rather than
+                        # a burst of 2048 payloads/logger calls on the read path.
                         for stale in list(_SHADOW_TURN_ACCUMULATORS)[:2048]:
-                            _SHADOW_TURN_ACCUMULATORS.pop(stale, None)
+                            del _SHADOW_TURN_ACCUMULATORS[stale]
+                            overflow_count += 1
+                for reason, count in (("age", aged_count), ("capacity", overflow_count)):
+                    if count:
+                        _emit_saga_event(
+                            "saga_read_shadow_turns_dropped",
+                            reason=reason,
+                            dropped_turn_count=count,
+                        )
                 return
         except Exception as exc:  # noqa: BLE001 - telemetry cannot affect reads
             log.debug("saga shadow read accumulation failed: %s", exc)

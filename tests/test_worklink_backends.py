@@ -12,6 +12,8 @@ from typing import Any
 
 import pytest
 
+from tests.nested_pytest import pytest_command
+
 from mimir.opencode_config import OpenCodeInvocation
 from mimir.worklink.backends import (
     WORKLINK_MERGED_LABEL,
@@ -1233,7 +1235,7 @@ def test_opencode_test_env_reaches_pytest_through_bash(
     for options, workers in [("", 2), ("-n 1", 1)]:
         result = subprocess.run(
             [sys.executable, "-c", launcher,
-             f"{shlex.quote(sys.executable)} -m pytest {options}"],
+             shlex.join(pytest_command(tmp_path, *shlex.split(options)))],
             cwd=tmp_path, env=env, capture_output=True, text=True, timeout=60,
         )
         assert result.returncode == 0, result.stdout + result.stderr

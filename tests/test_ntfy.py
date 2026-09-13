@@ -520,6 +520,77 @@ def test_read_heartbeat_cron_ignores_authority_profile_and_disabled_records(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("document", [
+    pytest.param("- name: [heartbeat", id="syntax"),
+    pytest.param("name: heartbeat\ncron: '*/45 * * * *'", id="mapping"),
+    pytest.param("false", id="false"),
+    pytest.param("0", id="zero"),
+    pytest.param("'oops'", id="scalar"),
+    pytest.param("{}", id="empty-mapping"),
+    pytest.param("- oops", id="non-mapping-entry"),
+    pytest.param("- name: heartbeat\n  cron: []", id="non-string-cron"),
+    pytest.param(b"\xff", id="invalid-utf8"),
+])
+async def test_malformed_scheduler_yaml_uses_eager_wedge_threshold(
+    tmp_path, monkeypatch, document,
+):
+    scheduler = tmp_path / "scheduler.yaml"
+    scheduler.write_bytes(document if isinstance(document, bytes) else document.encode())
+    events_file = tmp_path / "events.jsonl"
+    now = datetime(2026, 5, 27, 4, tzinfo=timezone.utc)
+    _write_events(events_file, [_heartbeat_event(now.isoformat())])
+    alarm = AsyncMock()
+    monkeypatch.setattr(ntfy, "post_algedonic_alarm", alarm)
+    await ntfy.fire_scheduler_wedge_alarm_if_warranted(
+        events_file, scheduler_yaml_path=scheduler, now=now + timedelta(minutes=1),
+    )
+    alarm.assert_not_awaited()
+    await ntfy.fire_scheduler_wedge_alarm_if_warranted(
+        events_file, scheduler_yaml_path=scheduler, now=now + timedelta(minutes=2),
+    )
+    alarm.assert_awaited_once()
+    assert alarm.call_args.kwargs["category"] == "scheduler-wedge"
+    assert "threshold: 2 min" in alarm.call_args.kwargs["body"]
+    assert ntfy._read_heartbeat_cron(scheduler) == "*/1 * * * *"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("document", [
+    None, "", "# empty\n", "null", "[]",
+    "- name: reflect\n  cron: '0 * * * *'",
+    "- name: heartbeat", "- name: heartbeat\n  cron: null",
+    "- name: heartbeat\n  cron: ''", "- name: heartbeat\n  cron: '  '",
+    "- oops\n- name: heartbeat\n  cron: ''",
+])
+async def test_empty_or_disabled_scheduler_yaml_stays_silent(
+    tmp_path, monkeypatch, document,
+):
+    scheduler = tmp_path / "scheduler.yaml"
+    if document is not None:
+        scheduler.write_text(document)
+    assert ntfy._read_heartbeat_cron(scheduler) is None
+    events_file = tmp_path / "events.jsonl"
+    now = datetime(2026, 5, 27, 4, tzinfo=timezone.utc)
+    _write_events(events_file, [_heartbeat_event((now - timedelta(days=5)).isoformat())])
+    alarm = AsyncMock()
+    monkeypatch.setattr(ntfy, "post_algedonic_alarm", alarm)
+    await ntfy.fire_scheduler_wedge_alarm_if_warranted(
+        events_file, scheduler_yaml_path=scheduler, now=now,
+    )
+    alarm.assert_not_awaited()
+
+
+def test_unreadable_scheduler_yaml_uses_eager_cadence(tmp_path, monkeypatch):
+    from pathlib import Path
+
+    def deny_read(*args, **kwargs):
+        raise PermissionError("scheduler read denied")
+
+    monkeypatch.setattr(Path, "read_text", deny_read)
+    assert ntfy._read_heartbeat_cron(tmp_path / "scheduler.yaml") == "*/1 * * * *"
+
+
+@pytest.mark.asyncio
 async def test_scheduler_wedge_alarm_offloads_log_assessment_from_event_loop(
     tmp_path,
     monkeypatch: pytest.MonkeyPatch,

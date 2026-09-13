@@ -29,6 +29,41 @@ def _make_buffer(tmp_path: Path, **kwargs) -> MessageBuffer:
     )
 
 
+def test_trim_wait_failure_clears_flag(tmp_path, monkeypatch):
+    buf = _make_buffer(tmp_path)
+    buf._active_writers = 1
+
+    def interrupted_wait(timeout=None):
+        raise RuntimeError("interrupted wait")
+
+    monkeypatch.setattr(buf._io_condition, "wait", interrupted_wait)
+    with pytest.raises(RuntimeError, match="interrupted wait"):
+        buf._trim_sync()
+    assert not buf._trimming
+
+
+@pytest.mark.parametrize("operation", ["append", "trim"])
+def test_io_condition_waits_are_bounded_and_rechecked(tmp_path, monkeypatch, operation):
+    buf = _make_buffer(tmp_path)
+    buf._trimming = operation == "append"
+    buf._active_writers = int(operation == "trim")
+    waits = []
+
+    def timed_wait(timeout=None):
+        assert timeout is not None and timeout > 0
+        waits.append(timeout)
+        if len(waits) == 2:
+            buf._trimming = False
+            buf._active_writers = 0
+
+    monkeypatch.setattr(buf._io_condition, "wait", timed_wait)
+    if operation == "append":
+        buf._append_disk(buf.make_message(channel_id="test", kind="user_message", content="hi"))
+    else:
+        buf._trim_sync()
+    assert len(waits) == 2
+
+
 class _StrictResolver:
     def __init__(self, identities: dict[str, str]) -> None:
         self.identities = identities

@@ -3479,6 +3479,55 @@ async def test_run_turn_auto_delivers_final_text_when_enabled(tmp_path: Path):
     assert [e for e in evs if e.get("type") == "send_message_sent"]
 
 
+async def test_run_turn_auto_deliver_partial_result_is_not_credited(tmp_path: Path):
+    from mimir._context import get_current_turn
+    from mimir.bridges.base import SendResult
+
+    final_text = "Found it. The missing setting is enabled in the project config."
+    partial = SendResult(
+        sent=False, message_id="sent-1", chunks=1,
+        error="second chunk failed after one delivered chunk",
+    )
+    contexts = []
+
+    class PartialBridge(_BridgeStub):
+        async def send(self, channel_id, text, attachment_paths=None, *, final=True):
+            self.sends.append((channel_id, text, final))
+            contexts.append(get_current_turn())
+            return partial
+
+    bridge = PartialBridge()
+    registry = ChannelRegistry()
+    registry.register(bridge)
+    agent = _build_agent(
+        tmp_path, fake_agent=_FakeAgent(response_messages=[AIMessage(content=final_text)]),
+        fake_saga=_FakeSaga(),
+    )
+    agent._channels = registry
+    agent._config.auto_deliver_final_text_channels = ("ch-",)
+    agent._config.resend_nudge_channels = ()
+    record = await agent.run_turn(AgentEvent(
+        trigger="user_message", channel_id="ch-1", content="hi",
+        author="test-user", source="test",
+    ))
+
+    assert record.error is None
+    assert bridge.sends == [("ch-1", final_text, False)]
+    [ctx] = contexts
+    assert ctx is not None
+    assert ctx.send_message_count == 0
+    assert ctx.delivered_channel_ids == set()
+    assert not any(m.content == final_text for m in agent._buffer._all)
+    events_log = tmp_path / "home" / "logs" / "events.jsonl"
+    events = [json.loads(line) for line in events_log.read_text().splitlines() if line.strip()]
+    [failure] = [e for e in events if e.get("type") == "send_message_failed"]
+    assert failure["channel_id"] == "ch-1"
+    assert failure["error"] == partial.error
+    assert not any(e.get("type") in {
+        "send_message_sent", "interactive_turn_auto_delivered",
+    } for e in events)
+
+
 async def test_run_turn_auto_deliver_strips_actions_and_dispatches_react(
     tmp_path: Path,
 ):

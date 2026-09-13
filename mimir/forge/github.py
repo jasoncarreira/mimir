@@ -555,7 +555,7 @@ class GitHubForgeClient:
         if run.get("status") != "completed":
             raise ForgeError("run is still in progress; retry after completion")
         if job.get("status") != "completed" or job.get("conclusion") not in {
-            "failure", "timed_out", "startup_failure", "action_required",
+            "failure", "timed_out", "startup_failure", "action_required", "cancelled",
         }:
             raise ForgeError("job is not a completed failing job")
         from ..ci_logs import LOG_EXCERPT_BYTES, capture_job_log

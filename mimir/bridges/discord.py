@@ -38,6 +38,7 @@ except ImportError as _exc:  # pragma: no cover - optional dep
 from ..background_tasks import spawn_background
 from ..identities import IdentityResolver
 from ..models import AgentEvent
+from ._chunking import chunk_message
 from ._emoji import resolve_for_discord
 from ._history import ChannelMessage
 from ._seen_ids import SeenIdCache
@@ -133,76 +134,7 @@ def _channel_visibility(channel: Any, conversation_type: str) -> str:
 
 
 def _chunk_message(text: str, limit: int = DISCORD_MESSAGE_CHAR_LIMIT) -> list[str]:
-    """Split ``text`` so each chunk fits Discord's per-message char limit.
-
-    Prefers paragraph boundaries; falls back to line boundaries; last resort
-    is hard slicing. Same algorithm as open-strix's ``_chunk_discord_message``.
-    """
-    if limit <= 0:
-        limit = DISCORD_MESSAGE_CHAR_LIMIT
-    if len(text) <= limit:
-        return [text]
-
-    def _split_oversized_block(block: str) -> list[str]:
-        if len(block) <= limit:
-            return [block]
-        lines = block.splitlines(keepends=True)
-        if len(lines) <= 1:
-            return [block[idx : idx + limit] for idx in range(0, len(block), limit)]
-        out: list[str] = []
-        current = ""
-        for line in lines:
-            if len(line) > limit:
-                if current:
-                    out.append(current)
-                    current = ""
-                out.extend(line[idx : idx + limit] for idx in range(0, len(line), limit))
-                continue
-            if not current:
-                current = line
-                continue
-            if len(current) + len(line) <= limit:
-                current += line
-                continue
-            out.append(current)
-            current = line
-        if current:
-            out.append(current)
-        return out
-
-    paragraph_blocks: list[str] = []
-    cursor = 0
-    for match in re.finditer(r"\n\s*\n+", text):
-        end = match.end()
-        paragraph_blocks.append(text[cursor:end])
-        cursor = end
-    if cursor < len(text):
-        paragraph_blocks.append(text[cursor:])
-    if not paragraph_blocks:
-        paragraph_blocks = [text]
-
-    chunks: list[str] = []
-    current = ""
-    for block in paragraph_blocks:
-        if not block:
-            continue
-        if len(block) > limit:
-            if current:
-                chunks.append(current)
-                current = ""
-            chunks.extend(_split_oversized_block(block))
-            continue
-        if not current:
-            current = block
-            continue
-        if len(current) + len(block) <= limit:
-            current += block
-            continue
-        chunks.append(current)
-        current = block
-    if current:
-        chunks.append(current)
-    return chunks
+    return chunk_message(text, limit if limit > 0 else DISCORD_MESSAGE_CHAR_LIMIT)
 
 
 def _channel_to_id(channel: Any) -> str:
@@ -637,9 +569,11 @@ class DiscordBridge(Bridge):
 
         last_id: str | None = None
         sent_count = 0
+        upload_count = 0
         files: list[discord.File] = []
         try:
-            files = [discord.File(str(p)) for p in (attachment_paths or [])]
+            for p in (attachment_paths or []):
+                files.append(discord.File(str(p)))
             if (files or discord_embed is not None) and not chunks:
                 chunks = [""]
             for i, chunk in enumerate(chunks):
@@ -656,17 +590,20 @@ class DiscordBridge(Bridge):
                     sent_msg = await channel.send(chunk, **chunk_kwargs)
                 last_id = str(getattr(sent_msg, "id", "") or "") or last_id
                 sent_count += 1
+                if i == 0:
+                    upload_count = len(files)
         except discord.DiscordException as exc:
             return SendResult(
-                sent=sent_count > 0,
+                sent=False,
                 message_id=last_id,
                 chunks=sent_count,
+                uploads=upload_count,
                 error=f"discord send error after {sent_count} chunk(s): {exc}",
             )
         finally:
             for file in files:
                 file.close()
-        return SendResult(sent=True, message_id=last_id, chunks=sent_count)
+        return SendResult(sent=True, message_id=last_id, chunks=sent_count, uploads=upload_count)
 
     async def send_typing_indicator(self, channel_id: str) -> None:
         """Hold the Discord typing indicator open until ``send()`` /
@@ -1116,6 +1053,8 @@ class DiscordBridge(Bridge):
         # message isn't a signal about the agent's behavior.
         try:
             channel = self._client.get_channel(payload.channel_id) if self._client else None
+            if channel is None and self._client is not None:
+                channel = await self._client.fetch_channel(payload.channel_id)
             if channel is None:
                 return
             target_msg = await channel.fetch_message(payload.message_id)

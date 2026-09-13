@@ -49,14 +49,12 @@ def conn():
 
 
 def _fake_embed(text):
-    h = abs(hash(text)) % 1000
-    vec = [float(h % 7), float(h % 11), float(h % 13), float(h % 17)]
-    return struct.pack("4f", *vec), "fake", "fake-model", 4
+    return struct.pack("4f", *_qf(text)), "fake", "fake-model", 4
 
 
 def _qf(text):
-    h = abs(hash(text)) % 1000
-    return [float(h % 7), float(h % 11), float(h % 13), float(h % 17)]
+    # Forgetting tests need a match, not semantic ranking or hash-seed dependence.
+    return [1.0, 0.0, 0.0, 0.0]
 
 
 # ────────────────────────────────────────────────────────────────────
@@ -94,7 +92,7 @@ def test_forget_retracts_derived_triple_and_world_state(conn):
     ) is not None
     assert triple_augment_search(
         conn, _qf("Dana works at Acme"), dim=4, auth_context=ADMIN_SCOPE,
-    )
+    ) == [(atom_id, 1.0)]
     assert "Dana" in build_vocab_block(conn, owner_principal="legacy_admin")
 
     forget(conn, [atom_id], reason="erase")

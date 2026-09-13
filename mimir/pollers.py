@@ -376,8 +376,9 @@ POLLER_CIRCUIT_BREAKER_BACKOFF_SECONDS = 300
 # both fds and keeps running (daemonizing helper, post-cleanup hang)
 # would otherwise pin a bare ``proc.wait()`` — and the caller's
 # concurrency-semaphore slot — forever. Capped by the poller's own
-# timeout so a short-timeout caller is never held longer than 2x its
-# budget.
+# timeout for the normal EOF path. Also bounds post-kill drains/reaping:
+# five seconds allows buffered output to drain without letting escaped
+# descendants holding pipe writers pin a scheduler slot indefinitely.
 POLLER_EXIT_GRACE_SECONDS = 5.0
 
 #: Channel-id prefix for synthetic poller-tick channels. Each registered
@@ -1969,32 +1970,6 @@ def discover_pollers(
                 key = item.strip()
                 if key:
                     env_required_clean.append(key)
-            # chainlink #351/#357: don't even schedule a poller whose
-            # required env is unset in the env that ``run_poller`` will actually
-            # assemble. This must mirror runtime: scrubbed allowlist-filtered
-            # os.environ + explicit pass_env + manifest env + injected STATE_DIR
-            # / POLLER_NAME / MIMIR_HOME. Checking raw os.environ here schedules pollers that
-            # later no-op every tick because the required key is denied; failing
-            # to include injected keys skips pollers that would run.
-            if env_required_clean:
-                _env_avail = _poller_env_available_at_discovery(
-                    env_raw=env_raw,
-                    pass_env=pass_env_clean,
-                )
-                _missing_req = [k for k in env_required_clean if k not in _env_avail]
-                if _missing_req:
-                    log.warning(
-                        "poller_skipped_unset_env: %s name=%r — not scheduling; "
-                        "required env unset: %s",
-                        pollers_file, name, ", ".join(_missing_req),
-                    )
-                    if invalid_entries is not None:
-                        invalid_entries.append((
-                            pollers_file,
-                            name,
-                            f"required environment unset: {', '.join(_missing_req)}",
-                        ))
-                    continue
             persist_dir: Path | None = None
             if state_root is not None:
                 try:
@@ -2108,11 +2083,21 @@ def discover_pollers(
                         name,
                         f"batch_size {raw_batch!r} is invalid; using default",
                     ))
-            # chainlink #262: opt-in framework recovery of failed poller
-            # turns. ``bool(...)`` coerces truthy json values; a stray
-            # non-bool just reads as on/off rather than erroring (low-stakes
-            # flag, unlike batch_size which affects coalescing math).
-            recover_failed_turns = bool(entry.get("recover_failed_turns", False))
+            # Recovery is opt-in; quoted false and invalid values must not enable it.
+            raw_recovery = entry.get("recover_failed_turns", False)
+            recover_failed_turns = _parse_override_bool(raw_recovery)
+            if recover_failed_turns is None:
+                recover_failed_turns = False
+                log.warning(
+                    "poller_invalid_recover_failed_turns: %s name=%r value=%r "
+                    "(expected a bool); using default False",
+                    pollers_file, name, raw_recovery,
+                )
+                if invalid_entries is not None:
+                    invalid_entries.append((
+                        pollers_file, name,
+                        f"recover_failed_turns {raw_recovery!r} is invalid; using default False",
+                    ))
             # ``priority`` (priority-banded suppression): low | normal |
             # high. Garbage values fall back to the default with a
             # warning — a typo shouldn't silently promote a poller to
@@ -2217,7 +2202,29 @@ def discover_pollers(
             if p.name in overrides else p
             for p in pollers
         ]
-    return pollers
+    # Check the runtime env model only after overrides replace env/pass_env.
+    schedulable = []
+    for poller in pollers:
+        if poller.env_required:
+            available = _poller_env_available_at_discovery(
+                env_raw=poller.env, pass_env=poller.pass_env,
+            )
+            missing = [key for key in poller.env_required if key not in available]
+            if missing:
+                log.warning(
+                    "poller_skipped_unset_env: %s name=%r — not scheduling; "
+                    "required env unset: %s",
+                    poller.manifest_path, poller.name, ", ".join(missing),
+                )
+                if invalid_entries is not None:
+                    invalid_entries.append((
+                        poller.manifest_path,
+                        poller.name,
+                        f"required environment unset: {', '.join(missing)}",
+                    ))
+                continue
+        schedulable.append(poller)
+    return schedulable
 
 
 def _kill_process_group(proc: asyncio.subprocess.Process) -> None:
@@ -2230,6 +2237,10 @@ def _kill_process_group(proc: asyncio.subprocess.Process) -> None:
     kill the whole process group. Fall back to ``proc.kill()`` where
     process groups are unavailable.
     """
+    # Once reaped, the PID/PGID may belong to an unrelated process. In
+    # particular an escaped descendant can overflow a pipe after reap.
+    if proc.returncode is not None:
+        return
     try:
         if hasattr(os, "killpg"):
             os.killpg(proc.pid, signal.SIGKILL)
@@ -2244,6 +2255,8 @@ async def _drain_capped(
     limit: int,
     on_overflow: Callable[[], None],
     on_line: Callable[[bytes], Awaitable[None]] | None = None,
+    *,
+    buffer: bytearray | None = None,
 ) -> bytes:
     """Read from *stream* up to *limit* bytes, then stop accumulating.
 
@@ -2255,7 +2268,7 @@ async def _drain_capped(
     """
     if stream is None:
         return b""
-    buf = bytearray()
+    buf = buffer if buffer is not None else bytearray()
     line_buf = bytearray()
     overflowed = False
     while True:
@@ -2293,8 +2306,8 @@ async def run_poller(
     each emitted event. Returns the count of events successfully
     enqueued (excludes dispatcher-rejected events; those land in
     ``poller_event_rejected`` events for back-pressure auditing).
-    Timeouts deliver complete lines collected before the kill; errors and
-    silence return 0.
+    Timeouts retain stderr diagnostics but discard events (the child may
+    not have committed its cursor); errors and silence return 0.
 
     **Command parsing**: ``poller.command`` is parsed by ``/bin/sh -c``
     via ``asyncio.create_subprocess_shell``. Shell features (env-var
@@ -2629,6 +2642,9 @@ async def run_poller(
     stderr_bytes = b""
     fatal_error: str | None = None
     timed_out = False
+    drains: list[asyncio.Task[bytes]] = []
+    stdout_buffer = bytearray()
+    stderr_buffer = bytearray()
     try:
         try:
             proc = await asyncio.create_subprocess_shell(
@@ -2658,25 +2674,34 @@ async def run_poller(
                     MAX_POLLER_STDOUT_BYTES,
                     _on_overflow,
                     _accept_delivery_barrier,
+                    buffer=stdout_buffer,
                 ),
             )
             stderr_task = asyncio.create_task(
                 _drain_capped(
                     proc.stderr, MAX_POLLER_STDERR_BYTES, _on_overflow,
+                    buffer=stderr_buffer,
                 ),
             )
+            drains = [stdout_task, stderr_task]
             _, pending = await asyncio.wait(
                 {stdout_task, stderr_task}, timeout=timeout,
             )
             if pending:
                 timed_out = True
                 _kill_process_group(proc)
-                await proc.wait()
-                # Killing the group closes its pipes. Finish the capped drains
-                # rather than cancelling away their already-collected output.
-                await asyncio.gather(stdout_task, stderr_task)
-            stdout_bytes = stdout_task.result()
-            stderr_bytes = stderr_task.result()
+                # An escaped descendant can retain pipe writers after SIGKILL.
+                # wait_for cancels both drains; their capped buffers survive.
+                try:
+                    await asyncio.wait_for(
+                        asyncio.gather(stdout_task, stderr_task),
+                        timeout=POLLER_EXIT_GRACE_SECONDS,
+                    )
+                except asyncio.TimeoutError:
+                    for task in drains:
+                        task.cancel()
+            stdout_bytes = bytes(stdout_buffer) if stdout_task.cancelled() else stdout_task.result()
+            stderr_bytes = bytes(stderr_buffer) if stderr_task.cancelled() else stderr_task.result()
             # chainlink #410: the ``asyncio.wait`` above bounds only the
             # pipe drains. Both drains hitting EOF means the child closed
             # its fds, not that it exited — a poller that closes stdout/
@@ -2692,7 +2717,6 @@ async def run_poller(
             except asyncio.TimeoutError:
                 timed_out = True
                 _kill_process_group(proc)
-                await proc.wait()
             if _overflow["hit"]:
                 await log_event(
                     "poller_output_overflow",
@@ -2742,6 +2766,19 @@ async def run_poller(
                 )
             return 0
     finally:
+        for task in drains:
+            if not task.done():
+                task.cancel()
+        if drains:
+            await asyncio.gather(*drains, return_exceptions=True)
+        if proc is not None:
+            # Process has no public pipe-close API. Close our read transports,
+            # not the escaped writer's process, to release descriptors and let
+            # asyncio's process waiter complete even without pipe EOF.
+            for fd in (1, 2):
+                transport = proc._transport.get_pipe_transport(fd)
+                if transport is not None:
+                    transport.close()
         # Kill + reap on every exit path. The ``returncode is None``
         # gate makes this a no-op on the happy path (process already
         # exited via ``communicate``); on timeout or exception it
@@ -2749,8 +2786,8 @@ async def run_poller(
         if proc is not None and proc.returncode is None:
             _kill_process_group(proc)
             try:
-                await proc.wait()
-            except (ProcessLookupError, asyncio.CancelledError):
+                await asyncio.wait_for(proc.wait(), timeout=POLLER_EXIT_GRACE_SECONDS)
+            except (ProcessLookupError, asyncio.TimeoutError):
                 pass
 
     stderr_text = stderr_bytes.decode("utf-8", errors="replace").strip()
@@ -2881,7 +2918,6 @@ async def run_poller(
                         poller=poller.name,
                         reason=invalid_reason or "invalid_usage_signal",
                     )
-                    signals_emitted += 1
                     continue
                 payload = {
                     k: _redact_poller_env_values(v, env, explicit_env_redact_keys)
@@ -3119,6 +3155,9 @@ async def run_poller(
         try:
             accepted = await enqueue_for_delivery(event)
         except Exception as exc:  # noqa: BLE001
+            await poller_recovery.stash_enqueued_event(
+                persist_dir, event, enqueued_at=enqueued_at, pending_enqueue=True,
+            )
             await log_event(
                 "poller_enqueue_error",
                 poller=poller.name,
@@ -3141,6 +3180,9 @@ async def run_poller(
                 )
         else:
             rejected_count += 1
+            await poller_recovery.stash_enqueued_event(
+                persist_dir, event, enqueued_at=enqueued_at, pending_enqueue=True,
+            )
             # Back-pressure observability: when the dispatcher refuses
             # an event (queue cap hit, channel saturated, etc.) record
             # it so the events_emitted vs events_rejected gap on

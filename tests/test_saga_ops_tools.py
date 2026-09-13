@@ -12,6 +12,7 @@ Fills gaps NOT already in test_saga_ops_wiring.py:
 from __future__ import annotations
 
 import time
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 
@@ -649,3 +650,49 @@ async def test_record_skill_learning_admin_allowed(
     assert call["content"] == "Test learning"
     assert call["source_type"] == "skill_learning"
     assert call["visibility"] == "private"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("threshold", ["contribution_threshold", "contradiction_threshold"])
+@pytest.mark.parametrize("dry_run", [True, False], ids=["preview", "destructive"])
+@pytest.mark.parametrize("supported", [False, True], ids=["alone", "mixed"])
+async def test_forget_rejects_unsupported_in_process_thresholds(
+    monkeypatch, turn_with_session, threshold, dry_run, supported,
+):
+    from mimir.saga.client import SagaStore
+
+    client = Mock(spec=SagaStore)
+    client.forget = AsyncMock(return_value={"tombstoned_count": 1})
+    monkeypatch.setitem(_MEMORY_STATE, "client", client)
+    args = {"dry_run": dry_run, threshold: 0.0}
+    if supported:
+        args["min_retrievals"] = 1
+    result = await saga_ops.saga_forget.coroutine(
+        **args, runtime=_runtime(turn_with_session),
+    )
+    client.forget.assert_not_awaited()
+    assert result.startswith("saga_forget failed:")
+    assert threshold in result
+    assert "unsupported" in result
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("in_process", [True, False])
+async def test_forget_preserves_supported_backend_arguments(
+    monkeypatch, turn_with_session, in_process,
+):
+    from mimir.saga.client import SagaStore
+
+    client = Mock(spec=SagaStore) if in_process else _StubStore()
+    client.forget = AsyncMock(return_value={"tombstoned_count": 0})
+    monkeypatch.setitem(_MEMORY_STATE, "client", client)
+    args = {"dry_run": False, "min_retrievals": 1, "confidence_floor": 0.0, "grace_days": 0}
+    if not in_process:
+        args.update(contribution_threshold=0.0, contradiction_threshold=0.0)
+    result = await saga_ops.saga_forget.coroutine(
+        **args, runtime=_runtime(turn_with_session),
+    )
+    client.forget.assert_awaited_once_with(
+        **args, auth_context=turn_with_session.auth_context,
+    )
+    assert '"tombstoned_count": 0' in result

@@ -1249,6 +1249,8 @@ class _ShutdownHooks:
         self._router = router
         self._signal_cleanup = signal_cleanup
         self._watchdog: threading.Timer | None = None
+        self._watchdog_lock = threading.RLock()
+        self._signal_dispatched = False
         self._failure_detail: bytes | None = None
         self._signals: dict[int, Any] = {}
         self._handler = self._handle_signal
@@ -1258,6 +1260,8 @@ class _ShutdownHooks:
         self._loop = asyncio.get_running_loop()
         self._task = asyncio.current_task()
         self._wakeup: tuple[socket.socket, socket.socket] | None = None
+        self._observer_sockets: tuple[socket.socket, socket.socket] | None = None
+        self._observer: threading.Thread | None = None
         self._previous_wakeup_fd = -1
         self._loop_close = self._loop.close
         self._close_loop = self._close_loop
@@ -1269,6 +1273,20 @@ class _ShutdownHooks:
                 pass
         except BlockingIOError:
             pass
+
+    def _observe_wakeup(self) -> None:
+        assert self._observer_sockets is not None
+        reader, writer = self._observer_sockets
+        while data := reader.recv(4096):
+            for signum in data:
+                if signum in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+                    self._arm_watchdog(signum)
+            try:
+                writer.send(data)
+            except BlockingIOError:
+                # A full loop channel is already readable. Only this thread
+                # consumes C delivery; the loop drains the forwarded channel.
+                pass
 
     def _close_wakeup(self) -> None:
         if self._wakeup is None:
@@ -1296,6 +1314,14 @@ class _ShutdownHooks:
             warn_on_full_buffer=False,
         )
         self._loop.remove_reader(reader.fileno())
+        # EOF stops the observer, but is never a signal or watchdog expiry.
+        writer.shutdown(socket.SHUT_WR)
+        if self._observer is not None:
+            self._observer.join()
+        if self._observer_sockets is not None:
+            for sock in self._observer_sockets:
+                sock.close()
+            self._observer_sockets = None
         reader.close()
         writer.close()
         self._wakeup = None
@@ -1315,17 +1341,31 @@ class _ShutdownHooks:
         if self._wakeup is not None:
             return
         if threading.current_thread() is threading.main_thread():
-            reader, writer = socket.socketpair()
+            source, writer = socket.socketpair()
+            reader = forward = None
             try:
+                reader, forward = socket.socketpair()
                 reader.setblocking(False)
+                forward.setblocking(False)
                 writer.setblocking(False)
                 self._loop.add_reader(reader.fileno(), self._drain_wakeup)
+                self._observer_sockets = source, forward
+                self._observer = threading.Thread(target=self._observe_wakeup, daemon=True)
+                self._observer.start()
                 self._previous_wakeup_fd = signal.set_wakeup_fd(
                     writer.fileno(), warn_on_full_buffer=False,
                 )
             except BaseException:
-                self._loop.remove_reader(reader.fileno())
-                reader.close()
+                writer.shutdown(socket.SHUT_WR)
+                if self._observer is not None and self._observer.ident is not None:
+                    self._observer.join()
+                self._observer_sockets = None
+                if reader is not None:
+                    self._loop.remove_reader(reader.fileno())
+                    reader.close()
+                if forward is not None:
+                    forward.close()
+                source.close()
                 writer.close()
                 raise
             self._wakeup = reader, writer
@@ -1385,18 +1425,25 @@ class _ShutdownHooks:
                 os._exit(1)
         os._exit(128 + self.signum)
 
-    def _handle_signal(self, signum: int, frame: Any) -> None:
-        del frame
-        if self.signum is not None:
-            # A repeated supported signal explicitly abandons graceful draining.
-            os._exit(128 + signum)
-        self.signum = signum
+    def _arm_watchdog(self, signum: int) -> None:
         # wait_for/task.cancel cannot bound cancellation-resistant coroutines (or
         # a blocked event loop). Arm before synchronous cleanup, and retain until
         # process exit. Normal EOF and genuine failures never arm this watchdog.
-        self._watchdog = threading.Timer(SIGNAL_EXIT_TIMEOUT, self._force_exit)
-        self._watchdog.daemon = True
-        self._watchdog.start()
+        with self._watchdog_lock:
+            if self._watchdog is not None:
+                return
+            self.signum = signum
+            self._watchdog = threading.Timer(SIGNAL_EXIT_TIMEOUT, self._force_exit)
+            self._watchdog.daemon = True
+            self._watchdog.start()
+
+    def _handle_signal(self, signum: int, frame: Any) -> None:
+        del frame
+        if self._signal_dispatched:
+            # A repeated supported signal explicitly abandons graceful draining.
+            os._exit(128 + signum)
+        self._signal_dispatched = True
+        self._arm_watchdog(signum)
         logging.getLogger("asyncio").addFilter(_SignalReapFilter())
         if self._signal_cleanup is not None:
             try:
@@ -1407,7 +1454,13 @@ class _ShutdownHooks:
         self._cleanup()
         # Wake the loop without throwing through an interrupted selector/transport.
         try:
-            self._loop.call_soon_threadsafe(self._cancel)
+            if self._wakeup is not None:
+                # Python signal handlers run on main. The observer forwards the
+                # C byte to wake the selector; a separate self-pipe write could
+                # overtake it and return a selector batch without signal readiness.
+                self._loop.call_soon(self._cancel)
+            else:
+                self._loop.call_soon_threadsafe(self._cancel)
         except RuntimeError:
             # The loop may already be closed during atexit; the watchdog still
             # owns the process deadline and repeat-signal escalation stays armed.

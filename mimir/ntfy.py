@@ -311,27 +311,42 @@ NTFY_SCHEDULER_WEDGE_SAFETY_FACTOR: float = 2.0
 def _read_heartbeat_cron(scheduler_yaml_path: Path) -> str | None:
     """Return the cron expression for the heartbeat job in ``scheduler_yaml_path``.
 
-    Returns ``None`` if:
-    - the file doesn't exist or cannot be parsed,
-    - no job named ``'heartbeat'`` is present,
-    - the heartbeat job's cron field is empty or missing.
+    Missing files, empty/null documents, valid lists without a heartbeat,
+    and missing/null/blank heartbeat crons return ``None`` (disabled).
+
+    Unreadable or malformed configuration instead uses a one-minute fallback
+    cadence (two-minute threshold at the default safety factor). Uncertainty
+    must make the dead-man alarm more eager, not disable it. Normal baseline
+    and suppression checks still apply. An explicit heartbeat takes precedence
+    over malformed sibling records; other cron strings retain normal handling.
 
     Never raises.
     """
+    fallback = "*/1 * * * *"
     try:
         text = scheduler_yaml_path.read_text(encoding="utf-8")
         raw = yaml.safe_load(text)
+    except FileNotFoundError:
+        return None
     except Exception:  # noqa: BLE001
+        return fallback
+    if raw is None:
         return None
     if not isinstance(raw, list):
-        return None
+        return fallback
+    malformed_entry = False
     for entry in raw:
         if not isinstance(entry, dict):
+            malformed_entry = True
             continue
         if str(entry.get("name", "")).strip() == "heartbeat":
-            cron = str(entry.get("cron", "")).strip()
-            return cron if cron else None
-    return None
+            cron = entry.get("cron")
+            if cron is None:
+                return None
+            if not isinstance(cron, str):
+                return fallback
+            return cron.strip() or None
+    return fallback if malformed_entry else None
 
 
 def _cron_period_minutes(cron_expr: str) -> float:
@@ -675,7 +690,7 @@ async def fire_scheduler_wedge_alarm_if_warranted(
         or assessment.elapsed_minutes is None
         or assessment.classification is None
     ):
-        # Heartbeat disabled/unreadable, no baseline, or still within
+        # Heartbeat disabled, no baseline, or still within
         # the threshold.  The synchronous YAML/JSONL reads above ran off-loop;
         # no event/alarm work is needed for these normal no-op cases.
         return

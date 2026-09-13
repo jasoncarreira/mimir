@@ -867,17 +867,10 @@ def test_intent_suffix_key_different_uris_differ() -> None:
 
 
 @pytest.mark.asyncio
-async def test_bash_async_refuses_via_suffix_key_wrapper_escalation(
+async def test_bash_async_allows_different_action_on_same_uri(
     fake_registry_with_channel: ShellJobRegistry,
 ) -> None:
-    """Guard fires via URI suffix when the agent escalates to a bash -c wrapper.
-
-    Observed failure mode (chainlink #192, turn 201c 2026-05-25):
-      Step 3 (running): export ATPROTO_HANDLE=alice social-cli like at://X
-      Step 4 (retry):   /bin/bash -c '… /usr/bin/node cli.js dispatch at://X'
-    The prefix keys differ (social-cli vs node/cli.js, like vs dispatch), but
-    the AT-URI ``at://X`` is identical — the suffix key fires the guard.
-    """
+    """A shared URI must not conflate different executables and verbs."""
     at_uri = "at://did:plc:xxx/app.bsky.feed.post/yyy"
     running = _FakeJob(
         job_id="j_step3",
@@ -890,14 +883,11 @@ async def test_bash_async_refuses_via_suffix_key_wrapper_escalation(
 
     # Step 4 — bash wrapper with node invoking cli.js + same AT-URI
     cmd_step4 = (
-        f"/bin/bash -c 'cd /mimir-home/state/pollers/social-cli-feed "
-        f"&& export ATPROTO_HANDLE=alice ATPROTO_APP_PASSWORD=secret "
+        f"/bin/bash -c 'export ATPROTO_HANDLE=alice ATPROTO_APP_PASSWORD=secret "
         f"&& /usr/bin/node /mimir-home/.local/social-cli/dist/cli.js dispatch {at_uri}'"
     )
     out = await shell_async.bash_async.ainvoke({"command": cmd_step4})
-    assert "bash_async refused" in out
-    assert "j_step3" in out
-    assert "uri-target" in out  # match_kind should indicate suffix match
+    assert "Spawned job" in out
 
 
 @pytest.mark.asyncio
@@ -914,6 +904,7 @@ async def test_bash_async_refuses_via_prefix_after_cd_strip(
         exit_code=None,
     )
     fake_registry_with_channel._jobs["j_step1"] = running
+    running.intent_cwd = Path("/mimir-home/state/pollers/social-cli-feed").resolve()
 
     retry = f"cd /mimir-home/state/pollers/social-cli-feed && {base_cmd}"
     out = await shell_async.bash_async.ainvoke({"command": retry})
@@ -964,7 +955,7 @@ def fake_registry_with_channel(
 
     def _fake_spawn(
         command: str, *, argv: list[str], channel_id: str | None,
-        on_complete=None, auth_context=None, env_overlay=None,
+        on_complete=None, auth_context=None, env_overlay=None, cwd=None,
     ) -> _FakeJob:
         spawned.append({
             "command": command,
@@ -972,7 +963,9 @@ def fake_registry_with_channel(
             "channel_id": channel_id,
             "env_overlay": env_overlay,
         })
-        return _FakeJob(command=command, channel_id=channel_id, job_id="j_new")
+        job = _FakeJob(command=command, channel_id=channel_id, job_id="j_new")
+        reg._jobs[job.job_id] = job
+        return job
 
     monkeypatch.setattr(reg, "spawn", _fake_spawn)
     monkeypatch.setattr(reg, "_spawned_log", spawned, raising=False)
@@ -1114,6 +1107,52 @@ async def test_bash_async_skips_guard_when_finished_job(
 
 
 # ─── chainlink #193: algedonic event on refusal ───────────────────────
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("prefix", [False, True])
+async def test_duplicate_guard_scopes_effective_cwd(
+    fake_registry_with_channel, tmp_path, prefix,
+):
+    repo_a = tmp_path / "repo a"
+    repo_b = tmp_path / "repo b"
+    repo_a.mkdir()
+    repo_b.mkdir()
+    alias = tmp_path / "alias"
+    alias.symlink_to(repo_a, target_is_directory=True)
+    command = "gh pr view https://github.com/owner/repo/pull/1"
+    first = await shell_async.bash_async.ainvoke({"command": command, "cwd": str(repo_a)})
+    assert "Spawned job" in first
+
+    def args(repo):
+        if prefix:
+            return {"command": f"/bin/bash -c 'cd \"{repo.name}\" && {command}'", "cwd": str(tmp_path)}
+        return {"command": command, "cwd": str(repo)}
+
+    duplicate = await shell_async.bash_async.ainvoke(args(alias))
+    assert "same intent" in duplicate
+    different = await shell_async.bash_async.ainvoke(args(repo_b))
+    assert "Spawned job" in different
+    assert len(fake_registry_with_channel._spawned_log) == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("retry, refused", [
+    ("gh pr checks", False),
+    ("other pr view", False),
+    ("gh pr view --json title", True),
+    ("/bin/bash -c 'gh pr view", True),
+])
+async def test_duplicate_guard_requires_same_url_action(
+    fake_registry_with_channel, retry, refused,
+):
+    uri = "https://github.com/owner/repo/pull/1"
+    first = await shell_async.bash_async.ainvoke({"command": f"gh pr view {uri}"})
+    assert "Spawned job" in first
+    command = f"{retry} {uri}" + ("'" if retry.startswith("/bin/bash") else "")
+    result = await shell_async.bash_async.ainvoke({"command": command})
+    assert ("same intent" in result) is refused
+    assert len(fake_registry_with_channel._spawned_log) == (1 if refused else 2)
 
 
 @pytest.mark.asyncio

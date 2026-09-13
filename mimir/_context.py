@@ -55,9 +55,11 @@ full design and the per-tool migration sequence.
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 from contextvars import ContextVar, Token
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from threading import Lock
+from typing import TYPE_CHECKING, Any, Iterator
 
 if TYPE_CHECKING:
     from .models import TurnContext
@@ -69,6 +71,18 @@ _current_turn: ContextVar["TurnContext | None"] = ContextVar(
 # Registry of active turns keyed by turn_id. Populated by ``run_turn``,
 # read by hook callbacks that can't rely on contextvar inheritance.
 _active_turns: dict[str, "TurnContext"] = {}
+_turn_lifecycle_lock = Lock()
+
+
+@contextmanager
+def idle_turn_eviction_guard() -> Iterator[bool]:
+    """Serialize a short cache unlink with turn admission, not a whole sweep.
+
+    A snapshot before worker dispatch is insufficient: a turn can start between
+    the snapshot and deletion. Keep this lock through the unlink instead.
+    """
+    with _turn_lifecycle_lock:
+        yield not _active_turns
 
 
 class _TurnCell:
@@ -107,7 +121,8 @@ _current_client_cell: ContextVar["_TurnCell | None"] = ContextVar(
 
 
 def set_current_turn(ctx: "TurnContext") -> Token:
-    _active_turns[ctx.turn_id] = ctx
+    with _turn_lifecycle_lock:
+        _active_turns[ctx.turn_id] = ctx
     return _current_turn.set(ctx)
 
 
@@ -123,7 +138,8 @@ def reset_current_turn(token: Token) -> None:
         except Exception:
             # Teardown and successful read results must not depend on telemetry.
             pass
-        _active_turns.pop(ctx.turn_id, None)
+        with _turn_lifecycle_lock:
+            _active_turns.pop(ctx.turn_id, None)
     _current_turn.reset(token)
 
 

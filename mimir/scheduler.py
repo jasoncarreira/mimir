@@ -71,6 +71,7 @@ from .quota_windows import provider_store_keys
 from .models import AgentEvent
 from .pollers import (
     POLLER_CHANNEL_PREFIX,
+    POLLER_EXIT_GRACE_SECONDS,
     POLLER_TIMEOUT_SECONDS,
     PollerConfig,
     discover_pollers,
@@ -94,8 +95,16 @@ UTC = timezone.utc
 #: makes APScheduler skip it. Keeping the timeout strictly under the cadence
 #: means a slow run degrades into a late result rather than a lost tick.
 POLLER_CADENCE_MARGIN_SECONDS = 10.0
+#: Operational headroom for phase-3 attestation, logging and dispatch. Two
+#: minutes leaves margin over six nominal ten-second attestation attempts,
+#: but is NOT a network wall-clock bound: urllib timeouts apply per socket
+#: operation and cancelling to_thread does not stop an in-flight request.
+POLLER_DISPATCH_BACKSTOP_SECONDS = 120.0
 #: Smallest gap a 5-field cron can express.
 CRON_MIN_GRANULARITY_SECONDS = 60.0
+
+# Per JSON record, not per readiness batch. Discard oversized records to newline.
+_POLLER_TRIGGER_MAX_RECORD_BYTES = 65536
 
 
 def _loop_stall_alert_threshold() -> float:
@@ -390,7 +399,10 @@ def load_jobs_from_text(
     source: Path | str = "scheduler.yaml",
     writable_roots: tuple[Path, ...] = (),
 ) -> tuple[list[SchedulerJob], list[dict[str, Any]]]:
-    """Parse scheduler.yaml content without letting one bad job abort siblings."""
+    """Parse jobs and rejections; ``scope=document`` means no usable document.
+
+    An empty document has no rejections and remains an authoritative empty list.
+    """
     rejections: list[dict[str, Any]] = []
     try:
         raw = yaml.safe_load(text)
@@ -399,6 +411,7 @@ def load_jobs_from_text(
         return [], [{
             "path": str(source),
             "job": "<document>",
+            "scope": "document",
             "reason": f"{type(exc).__name__}: {exc}",
         }]
     if raw is None:
@@ -407,6 +420,7 @@ def load_jobs_from_text(
         return [], [{
             "path": str(source),
             "job": "<document>",
+            "scope": "document",
             "reason": "scheduler document must be a list",
         }]
     out: list[SchedulerJob] = []
@@ -586,9 +600,10 @@ def _expand_standard_dow_numeric_part(part: str) -> str:
         value = int(base)
         if not (0 <= value <= 7):
             return part
-        if step == 1:
+        if "/" not in part:
             return _standard_dow_number_to_name(value)
-        values = range(value, 7, step)
+        # Include the Sunday=7 endpoint before mapping numbers to names.
+        values = range(value, 8, step)
 
     names = []
     seen = set()
@@ -927,11 +942,13 @@ class Scheduler:
         # per poller. Signals arriving during a triggered pass coalesce into one
         # pending follow-up instead of creating unbounded tasks.
         self._poller_fire_locks: dict[str, asyncio.Lock] = {}
+        self._poller_fire_users: dict[str, int] = {}
         self._poller_trigger_tasks: dict[str, asyncio.Task[Any]] = {}
         self._poller_trigger_dirty: set[str] = set()
         self._poller_trigger_fd: int | None = None
         self._stopping = False
         self._poller_trigger_buffer = b""
+        self._poller_trigger_discarding = False
         # Strong references to fire-and-forget background tasks (chainlink #118).
         # asyncio.create_task() returns a weakly-referenced Task — if no strong
         # ref is held, the GC can collect it before it runs to completion.
@@ -1082,6 +1099,9 @@ class Scheduler:
         # operator edit cannot knock the last-known-good job offline.
         valid_prompt_jobs: list[tuple[SchedulerJob, CronTrigger]] = []
         rejection_events = list(rejections or [])
+        if any(item.get("scope") == "document" for item in rejection_events):
+            self._dispatch_reload_events("scheduler_job_rejected", rejection_events)
+            return {"registered": 0, "invalid": len(rejection_events)}
         invalid_prompt_names = {
             str(item["job"])
             for item in rejection_events
@@ -1653,9 +1673,14 @@ class Scheduler:
         else:
             _build_trigger(job, self._tz)  # validate up front
         async with self._mutate_lock:
-            current, _rejections = await asyncio.to_thread(
+            current, rejections = await asyncio.to_thread(
                 load_jobs, self._yaml_path,
             )
+            if rejections:
+                raise ValueError(
+                    "refusing to rewrite scheduler.yaml; fix rejected entries: "
+                    + ", ".join(str(item["job"]) for item in rejections)
+                )
             current = [j for j in current if j.name != job.name]
             current.append(job)
             await asyncio.to_thread(write_jobs, self._yaml_path, current)
@@ -1664,9 +1689,14 @@ class Scheduler:
 
     async def remove_job(self, name: str) -> bool:
         async with self._mutate_lock:
-            current, _rejections = await asyncio.to_thread(
+            current, rejections = await asyncio.to_thread(
                 load_jobs, self._yaml_path,
             )
+            if rejections:
+                raise ValueError(
+                    "refusing to rewrite scheduler.yaml; fix rejected entries: "
+                    + ", ".join(str(item["job"]) for item in rejections)
+                )
             kept = [j for j in current if j.name != name]
             if len(kept) == len(current):
                 return False
@@ -2201,6 +2231,18 @@ class Scheduler:
             installed += 1
         log.info("pollers reloaded: %d installed from %s", installed, self._pollers_dir)
 
+        for name in list(self._poller_fire_locks):
+            if name not in retained_names and name not in self._poller_fire_users:
+                del self._poller_fire_locks[name]
+        live_cadences = {(p.name, p.cron) for p in self._pollers.values()}
+        for key in list(self._poller_cadence_cache):
+            if key not in live_cadences:
+                del self._poller_cadence_cache[key]
+        self._poller_trigger_dirty.intersection_update(retained_names)
+        for name, task in list(self._poller_trigger_tasks.items()):
+            if name not in retained_names and task.done():
+                del self._poller_trigger_tasks[name]
+
         # Build algedonic event payloads (chainlink #84). One per
         # invalid manifest, with the names of pollers preserved from
         # that path so the operator can correlate the log line with
@@ -2346,14 +2388,23 @@ class Scheduler:
         # No await between admission and allocation. Keep existing locks across
         # reloads: replacing one could split active holders and queued waiters.
         lock = self._poller_fire_locks.setdefault(poller_name, asyncio.Lock())
-        async with lock:
-            await log_event(
-                "poller_fire_started",
-                poller=poller_name,
-                source=source,
-                **({"trigger_reason": trigger_reason} if trigger_reason else {}),
-            )
-            await self._fire_poller_once(poller_name=poller_name)
+        # Count before awaiting: locked() is false during a pending handoff.
+        self._poller_fire_users[poller_name] = self._poller_fire_users.get(poller_name, 0) + 1
+        try:
+            async with lock:
+                await log_event(
+                    "poller_fire_started",
+                    poller=poller_name,
+                    source=source,
+                    **({"trigger_reason": trigger_reason} if trigger_reason else {}),
+                )
+                await self._fire_poller_once(poller_name=poller_name)
+        finally:
+            self._poller_fire_users[poller_name] -= 1
+            if not self._poller_fire_users[poller_name]:
+                del self._poller_fire_users[poller_name]
+                if poller_name not in self._pollers:
+                    self._poller_fire_locks.pop(poller_name, None)
 
     async def _fire_poller_once(self, *, poller_name: str) -> None:
         """APScheduler-side cron callback. Looks up the live PollerConfig
@@ -2468,14 +2519,38 @@ class Scheduler:
                     accepted_this_fire += 1
                 return accepted
 
-            await run_poller(
-                poller,
-                enqueue=enqueue_with_turn_budget,
-                home=self._home,
-                timeout=await self._effective_poller_timeout(poller),
+            timeout = await self._effective_poller_timeout(poller)
+            # Coroutine-level backstop covering execution, cleanup AND phase 3.
+            # Dispatch headroom is an operational allowance, not a guarantee
+            # that underlying threads terminate. Cooperative cancellation can
+            # abandon remaining batches; this does not make dispatch atomic.
+            deadline_seconds = (
+                timeout + 3 * POLLER_EXIT_GRACE_SECONDS
+                + POLLER_DISPATCH_BACKSTOP_SECONDS
             )
+            deadline = asyncio.timeout(deadline_seconds)
+            try:
+                async with deadline:
+                    await run_poller(
+                        poller,
+                        enqueue=enqueue_with_turn_budget,
+                        home=self._home,
+                        timeout=timeout,
+                    )
+            except TimeoutError:
+                if not deadline.expired():
+                    raise
+            else:
+                return
         finally:
             self._poller_semaphore.release()
+
+        await log_event(
+            "poller_fire_deadline_exceeded",
+            poller=poller_name,
+            timeout_seconds=timeout,
+            deadline_seconds=deadline_seconds,
+        )
 
     def trigger_poller(self, poller_name: str, *, reason: str) -> bool:
         """Request a coalesced fire through the same gates as the cron path."""
@@ -2548,12 +2623,28 @@ class Scheduler:
             return
         try:
             chunk = os.read(self._poller_trigger_fd, 65536)
-        except BlockingIOError:
+        except OSError:
             return
-        self._poller_trigger_buffer += chunk
-        lines = self._poller_trigger_buffer.split(b"\n")
-        self._poller_trigger_buffer = lines.pop()
-        for line in lines:
+        parts = chunk.split(b"\n")
+        for index, part in enumerate(parts):
+            terminated = index < len(parts) - 1
+            if self._poller_trigger_discarding:
+                if terminated:
+                    self._poller_trigger_discarding = False
+                continue
+            if len(self._poller_trigger_buffer) + len(part) > _POLLER_TRIGGER_MAX_RECORD_BYTES:
+                self._poller_trigger_buffer = b""
+                self._poller_trigger_discarding = not terminated
+                self._spawn(
+                    log_event("poller_fire_trigger_invalid"),
+                    name="poller-trigger-invalid",
+                )
+                continue
+            self._poller_trigger_buffer += part
+            if not terminated:
+                continue
+            line = self._poller_trigger_buffer
+            self._poller_trigger_buffer = b""
             try:
                 payload = json.loads(line)
                 poller_name = payload["poller"]

@@ -212,6 +212,97 @@ async def test_scheduler_reload_reports_every_rejected_yaml_entry(tmp_path: Path
     assert sched._scheduler.get_job("scheduler:bad-shell") is None
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("bad_text", ["- name: [broken", "name: not-a-list"])
+@pytest.mark.parametrize("async_reload", [False, True])
+async def test_document_rejection_preserves_entire_jobstore(
+    tmp_path, monkeypatch, bad_text, async_reload,
+):
+    from unittest.mock import Mock
+
+    path = tmp_path / "scheduler.yaml"
+    path.write_text(yaml.safe_dump([
+        {"name": "heartbeat", "prompt": "tick", "cron": "*/5 * * * *"},
+        {"name": "nightly", "prompt": "review", "cron": "0 8 * * *"},
+        {"name": "override", "callable": "demo", "cron": "0 6 * * *"},
+        {"name": "disabled", "callable": "disabled", "cron": ""},
+    ]))
+
+    async def noop(*args):
+        return True
+
+    sched = Scheduler(scheduler_yaml=path, enqueue=noop)
+    sched.register_callable("demo", noop, default_cron="0 4 * * *")
+    sched.register_callable("disabled", noop, default_cron="0 4 * * *")
+    sched.reload()
+    before = {job.id: job for job in sched._scheduler.get_jobs()}
+    assert set(before) == {"scheduler:heartbeat", "scheduler:nightly", "demo"}
+    assert "hour='6'" in str(before["demo"].trigger)
+    events = Mock()
+    monkeypatch.setattr(sched, "_dispatch_reload_events", events)
+    path.write_text(bad_text)
+    stats = await sched._reload_async() if async_reload else sched.reload()
+    after = {job.id: job for job in sched._scheduler.get_jobs()}
+    assert after == before
+    assert all(after[key] is job for key, job in before.items())
+    assert stats == {"registered": 0, "invalid": 1}
+    kind, rejected = events.call_args.args
+    assert kind == "scheduler_job_rejected"
+    assert rejected[0]["job"] == "<document>"
+    assert rejected[0]["scope"] == "document"
+
+    # A real empty schedule still removes prompts and clears callable overrides.
+    for empty in ("", "[]\n"):
+        path.write_text(empty)
+        assert sched.reload() == {"registered": 0, "invalid": 0}
+        assert {job.id for job in sched._scheduler.get_jobs()} == {"demo", "disabled"}
+        assert "hour='4'" in str(sched._scheduler.get_job("demo").trigger)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("operation", ["add", "remove", "add_schedule", "remove_schedule", "set_schedule_priority"])
+@pytest.mark.parametrize("bad_entry, rejected_name", [
+    ("- name: [broken\n", "<document>"),
+    ("- prompt: unnamed\n  cron: '0 9 * * *'\n", "entry[1]"),
+    ("- name: reflect\n  prompt: review\n  cron: '0 9 * * *'\n  time_of_day: '09:00'\n", "reflect"),
+    ("- name: mixed\n  prompt: review\n  callable: demo\n  cron: '0 9 * * *'\n", "mixed"),
+    ("- name: authority\n  prompt: review\n  cron: '0 9 * * *'\n  authority_profile: unknown\n", "authority"),
+])
+async def test_lossy_parse_refuses_mutations(
+    tmp_path, monkeypatch, operation, bad_entry, rejected_name,
+):
+    from mimir.tools import registry
+
+    path = tmp_path / "scheduler.yaml"
+    original = "# operator comment\n- name: keep\n  prompt: tick\n  cron: '0 8 * * *'\n" + bad_entry
+    path.write_text(original)
+
+    async def noop(_event):
+        return True
+
+    sched = Scheduler(scheduler_yaml=path, enqueue=noop)
+    monkeypatch.setitem(registry._STATE, "scheduler", sched)
+    if operation in {"add", "remove"}:
+        with pytest.raises(ValueError) as exc:
+            if operation == "add":
+                await sched.add_job(SchedulerJob(name="new", prompt="tick", cron="0 9 * * *"))
+            else:
+                await sched.remove_job("keep")
+        assert rejected_name in str(exc.value)
+    else:
+        tool = getattr(registry, operation)
+        args = {"name": "keep"}
+        if operation == "add_schedule":
+            args.update(name="new", prompt="tick", cron="0 9 * * *")
+        elif operation == "set_schedule_priority":
+            args["priority"] = "high"
+        result = await tool.ainvoke(args)
+        assert "failed:" in result
+        if operation != "set_schedule_priority" or rejected_name != "<document>":
+            assert rejected_name in result
+    assert path.read_bytes() == original.encode()
+
+
 def test_scheduler_channel_id_synthetic_for_global():
     assert _scheduler_channel_id("nightly", None) == "scheduler:nightly"
     assert _scheduler_channel_id("nightly", "real-channel") == "real-channel"
@@ -2454,6 +2545,85 @@ async def test_fire_poller_serializes_through_semaphore(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("external_cancel", [False, True], ids=["deadline", "cancel"])
+async def test_fire_poller_parked_run_releases_permit_and_lock(
+    tmp_path: Path, monkeypatch, external_cancel: bool,
+):
+    import mimir.scheduler as scheduler_module
+
+    monkeypatch.setenv("MIMIR_MAX_CONCURRENT_POLLERS", "1")
+    sched = Scheduler(
+        scheduler_yaml=tmp_path / "s.yaml", enqueue=mock.AsyncMock(return_value=True),
+    )
+    skills = tmp_path / "skills"
+    _drop_pollers_skill(skills, "p1")
+    sched.add_poller_jobs(skills)
+    monkeypatch.setattr(sched, "_effective_poller_timeout", mock.AsyncMock(return_value=7.0))
+    monkeypatch.setattr(scheduler_module, "POLLER_EXIT_GRACE_SECONDS", 0.5)
+    monkeypatch.setattr(scheduler_module, "POLLER_DISPATCH_BACKSTOP_SECONDS", 120.0)
+
+    deadlines = []
+
+    def controlled_timeout(delay):
+        assert delay == 128.5
+        timer = asyncio.timeout(None)
+        deadlines.append(timer)
+        return timer
+
+    monkeypatch.setattr(scheduler_module, "asyncio", SimpleNamespace(
+        **{**vars(asyncio), "timeout": controlled_timeout},
+    ))
+    entered = asyncio.Event()
+    cleaned = asyncio.Event()
+
+    async def parked_run(poller, enqueue, home=None, timeout=None):
+        assert timeout == 7.0
+        entered.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            cleaned.set()
+
+    events = []
+
+    async def capture_event(kind, **payload):
+        if kind == "poller_fire_deadline_exceeded":
+            assert not sched._poller_semaphore.locked()
+        events.append((kind, payload))
+
+    monkeypatch.setattr(scheduler_module, "run_poller", parked_run)
+    monkeypatch.setattr(scheduler_module, "log_event", capture_event)
+    task = asyncio.create_task(sched._fire_poller(poller_name="p1"))
+    try:
+        await asyncio.wait_for(entered.wait(), timeout=5)
+        assert sched._poller_semaphore.locked()
+        assert sched._poller_fire_locks["p1"].locked()
+        if external_cancel:
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+        else:
+            deadlines[0].reschedule(asyncio.get_running_loop().time())
+            await asyncio.wait_for(task, timeout=5)
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+    assert cleaned.is_set()
+    assert not sched._poller_semaphore.locked()
+    assert not sched._poller_fire_locks["p1"].locked()
+    deadline_events = [payload for kind, payload in events if kind == "poller_fire_deadline_exceeded"]
+    assert deadline_events == ([] if external_cancel else [{
+        "poller": "p1", "timeout_seconds": 7.0, "deadline_seconds": 128.5,
+    }])
+
+    recovered = mock.AsyncMock()
+    monkeypatch.setattr(scheduler_module, "run_poller", recovered)
+    await asyncio.wait_for(sched._fire_poller(poller_name="p1"), timeout=5)
+    recovered.assert_awaited_once()
+
+
+@pytest.mark.asyncio
 async def test_fire_poller_passes_scheduler_home_to_run_poller(
     tmp_path: Path, monkeypatch,
 ):
@@ -3036,6 +3206,36 @@ def test_build_trigger_honors_standard_crontab_day_of_week_ranges_lists_and_step
         None, datetime(2026, 6, 20, tzinfo=timezone.utc),
     )
     assert first == datetime(2026, 6, 21, 9, 0, tzinfo=timezone.utc)
+
+
+@pytest.mark.parametrize("dow, explicit, weekdays", [
+    ("5/2", "5-7/2", {4, 6}),
+    ("1/3", "1-7/3", {0, 3, 6}),
+    ("0/2", "0-7/2", {6, 1, 3, 5}),
+    ("7/2", "7-7/2", {6}),
+    ("5/1", "5-7/1", {4, 5, 6}),
+])
+def test_build_trigger_standard_dow_value_steps(dow, explicit, weekdays):
+    from datetime import datetime, timedelta, timezone
+
+    # Vixie entry.c accepts the explicit ranges, not bare value/step.
+    # Our shorthand extends to the same inclusive endpoint, Sunday=7.
+    # https://github.com/vixie/cron/blob/master/entry.c (get_range, load_entry)
+    start = datetime(2026, 6, 22, tzinfo=timezone.utc)  # Monday
+    expected = [
+        start + timedelta(days=day, hours=9)
+        for day in range(14) if day % 7 in weekdays
+    ]
+    for field in (dow, explicit):
+        trigger = _build_trigger(SchedulerJob(
+            name="stepped", prompt="x", cron=f"0 9 * * {field}",
+        ))
+        previous = None
+        for target in expected:
+            actual = trigger.get_next_fire_time(previous, previous or start)
+            assert actual == target
+            previous = actual
+        assert trigger.get_next_fire_time(previous, previous) >= start + timedelta(days=14)
 
 
 def test_build_trigger_defaults_to_utc_when_tz_omitted():
@@ -4873,6 +5073,182 @@ async def test_missed_completion_trigger_recovers_on_timed_fire(tmp_path: Path, 
         event["type"] == "poller_fire_started" and event["source"] == "timed"
         for event in events
     )
+
+
+@pytest.mark.asyncio
+async def test_trigger_fifo_bounds_unterminated_record_and_recovers(tmp_path: Path):
+    sched = Scheduler(scheduler_yaml=tmp_path / "s.yaml", enqueue=mock.AsyncMock())
+    sched._poller_trigger_fd = 123
+    valid = b'{"poller":"ready","reason":"completed"}\n'
+    with mock.patch.object(sched, "trigger_poller") as trigger:
+        for chunk in [b"x" * 65536, b"x", b"x" * 65536, b"x" * 65536]:
+            with mock.patch("mimir.scheduler.os.read", return_value=chunk):
+                sched._read_poller_trigger_signals()
+            assert len(sched._poller_trigger_buffer) <= 65536
+        await asyncio.gather(*sched._background_tasks)
+        assert [e["type"] for e in _scheduler_events(tmp_path)] == [
+            "poller_fire_trigger_invalid",
+        ]
+        trigger.assert_not_called()
+        # A syntactically valid suffix still belongs to the rejected record.
+        with mock.patch("mimir.scheduler.os.read", return_value=valid + valid):
+            sched._read_poller_trigger_signals()
+        trigger.assert_called_once_with("ready", reason="completed")
+    await asyncio.gather(*sched._background_tasks)
+    assert len(_scheduler_events(tmp_path)) == 1
+    assert sched._poller_trigger_buffer == b""
+
+
+@pytest.mark.asyncio
+async def test_trigger_fifo_rejects_completed_oversize_record_only(tmp_path: Path):
+    sched = Scheduler(scheduler_yaml=tmp_path / "s.yaml", enqueue=mock.AsyncMock())
+    sched._poller_trigger_fd = 123
+    valid = b'{"poller":"ready","reason":"completed"}\n'
+    with mock.patch.object(sched, "trigger_poller") as trigger:
+        for chunk in [valid + b"x" * 60000, b"x" * 5537 + b"\n" + valid]:
+            with mock.patch("mimir.scheduler.os.read", return_value=chunk):
+                sched._read_poller_trigger_signals()
+        assert trigger.call_args_list == [mock.call("ready", reason="completed")] * 2
+    await asyncio.gather(*sched._background_tasks)
+    assert [e["type"] for e in _scheduler_events(tmp_path)] == ["poller_fire_trigger_invalid"]
+    assert sched._poller_trigger_buffer == b""
+
+
+@pytest.mark.asyncio
+async def test_trigger_fifo_large_readiness_batch_and_boundary_record(tmp_path: Path):
+    sched = Scheduler(scheduler_yaml=tmp_path / "s.yaml", enqueue=mock.AsyncMock())
+    sched._poller_trigger_fd = 123
+    prefix = b'{"poller":"ready","reason":"'
+    suffix = b'"}'
+    reason = b"r" * (65536 - len(prefix) - len(suffix))
+    record = prefix + reason + suffix
+    small = b'{"poller":"ready","reason":"completed"}\n'
+    payload = record + b"\n" + small * 4000
+    with mock.patch.object(sched, "trigger_poller") as trigger:
+        for offset in range(0, len(payload), 65536):
+            with mock.patch("mimir.scheduler.os.read", return_value=payload[offset:offset + 65536]):
+                sched._read_poller_trigger_signals()
+        assert trigger.call_count == 4001
+        assert trigger.call_args_list[0] == mock.call("ready", reason=reason.decode())
+        assert trigger.call_args_list[1:] == [mock.call("ready", reason="completed")] * 4000
+    assert sched._poller_trigger_buffer == b""
+    assert not sched._background_tasks
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("error", [BlockingIOError(), OSError("read failed")])
+async def test_trigger_fifo_read_errors_preserve_partial_record(tmp_path: Path, error):
+    sched = Scheduler(scheduler_yaml=tmp_path / "s.yaml", enqueue=mock.AsyncMock())
+    sched._poller_trigger_fd = 123
+    sched._poller_trigger_buffer = b'{"poller":"ready",'
+    with mock.patch("mimir.scheduler.os.read", side_effect=error):
+        sched._read_poller_trigger_signals()
+    with mock.patch.object(sched, "trigger_poller") as trigger:
+        with mock.patch("mimir.scheduler.os.read", return_value=b'"reason":"completed"}\n'):
+            sched._read_poller_trigger_signals()
+        trigger.assert_called_once_with("ready", reason="completed")
+
+
+@pytest.mark.asyncio
+async def test_reinstall_prunes_retired_poller_maps(tmp_path: Path):
+    from dataclasses import replace
+
+    sched = Scheduler(scheduler_yaml=tmp_path / "s.yaml", enqueue=mock.AsyncMock())
+    skills = tmp_path / "skills"
+    _drop_priority_poller(skills, "kept", priority="normal")
+    sched.add_poller_jobs(skills)
+    kept = sched._pollers["kept"]
+    with mock.patch.object(sched, "_fire_poller_once", new_callable=mock.AsyncMock):
+        await sched._fire_poller(poller_name="kept")
+        kept_lock = sched._poller_fire_locks["kept"]
+        for i in range(20):
+            retired = replace(kept, name=f"retired-{i}")
+            sched._apply_reinstall([kept, retired], [], [])
+            await sched._fire_poller(poller_name=retired.name)
+            sched._poller_cadence_seconds(retired)
+        sched._poller_cadence_seconds(kept)
+        updated = replace(kept, cron="0 0 * * *")
+        sched._apply_reinstall([updated], [], [])
+    assert sched._poller_fire_locks == {"kept": kept_lock}
+    assert sched._poller_cadence_cache == {}
+    sched._poller_cadence_seconds(updated)
+    sched._apply_reinstall([updated], [], [])
+    assert set(sched._poller_cadence_cache) == {("kept", updated.cron)}
+
+
+@pytest.mark.asyncio
+async def test_reinstall_preserves_lock_during_pending_waiter_handoff(tmp_path: Path):
+    sched = Scheduler(scheduler_yaml=tmp_path / "s.yaml", enqueue=mock.AsyncMock())
+    skills = tmp_path / "skills"
+    _drop_priority_poller(skills, "p1", priority="normal")
+    sched.add_poller_jobs(skills)
+    poller = sched._pollers["p1"]
+    lock = sched._poller_fire_locks.setdefault("p1", asyncio.Lock())
+    await lock.acquire()
+    waiting = asyncio.Event()
+
+    async def fire():
+        waiting.set()
+        await sched._fire_poller(poller_name="p1")
+
+    with mock.patch.object(sched, "_fire_poller_once", new_callable=mock.AsyncMock):
+        task = asyncio.create_task(fire())
+        try:
+            await asyncio.wait_for(waiting.wait(), 5)
+            assert not task.done()
+            lock.release()
+            # No await: the waiter is runnable but has not acquired the lock.
+            assert not lock.locked()
+            sched._apply_reinstall([], [], [])
+            assert sched._poller_fire_locks["p1"] is lock
+            sched._apply_reinstall([poller], [], [])
+            assert sched._poller_fire_locks["p1"] is lock
+            await asyncio.wait_for(task, 5)
+            sched._apply_reinstall([], [], [])
+            assert sched._poller_fire_locks == {}
+        finally:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_retired_poller_lock_reclaimed_after_waiter_cancellation(tmp_path: Path):
+    sched = Scheduler(scheduler_yaml=tmp_path / "s.yaml", enqueue=mock.AsyncMock())
+    skills = tmp_path / "skills"
+    _drop_priority_poller(skills, "p1", priority="normal")
+    sched.add_poller_jobs(skills)
+    entered = asyncio.Event()
+    waiting = asyncio.Event()
+    release = asyncio.Event()
+
+    async def once(**kwargs):
+        entered.set()
+        await release.wait()
+
+    async def waiter():
+        waiting.set()
+        await sched._fire_poller(poller_name="p1")
+
+    tasks = []
+    with mock.patch.object(sched, "_fire_poller_once", new=once):
+        try:
+            tasks.append(asyncio.create_task(sched._fire_poller(poller_name="p1")))
+            await asyncio.wait_for(entered.wait(), 5)
+            lock = sched._poller_fire_locks["p1"]
+            tasks.append(asyncio.create_task(waiter()))
+            await asyncio.wait_for(waiting.wait(), 5)
+            sched._apply_reinstall([], [], [])
+            tasks[1].cancel()
+            await asyncio.gather(tasks[1], return_exceptions=True)
+            assert sched._poller_fire_locks == {"p1": lock}
+            release.set()
+            await asyncio.wait_for(tasks[0], 5)
+            assert sched._poller_fire_locks == {}
+            assert sched._poller_fire_users == {}
+        finally:
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
 
 
 @pytest.mark.asyncio

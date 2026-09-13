@@ -4,6 +4,9 @@ from __future__ import annotations
 
 import os
 import time
+import asyncio
+from types import SimpleNamespace
+from threading import Event
 from pathlib import Path
 
 import pytest
@@ -113,6 +116,72 @@ def test_symlink_entry_unlinked_target_untouched(tmp_path: Path):
 def test_missing_root_is_silent_noop(tmp_path: Path):
     result = sweep_scratch_roots(tmp_path, ttl_days=7)
     assert result == SweepResult()
+
+
+async def test_fetch_cache_retained_through_turn_lifecycle(tmp_path):
+    from mimir._context import set_current_turn, reset_current_turn
+
+    now = time.time()
+    cache = tmp_path / "attachments" / "fetch-cache"
+    cache.mkdir(parents=True)
+    files = [cache / name for name in ("body.pdf", "body.pdf.meta.json", "body.pdf.txt")]
+    for path in files:
+        path.write_text("cached content")
+        _age(path, 10, now=now)
+    inbound = tmp_path / "attachments" / "inbound"
+    inbound.mkdir()
+    attachment = inbound / "keep.txt"
+    attachment.write_text("not cache")
+    _age(attachment, 10, now=now)
+    token = set_current_turn(SimpleNamespace(turn_id="janitor-cache-test"))
+    try:
+        result = await asyncio.to_thread(sweep_scratch_roots, tmp_path, now=now)
+        assert set(result.protected) == {str(p.relative_to(tmp_path)) for p in files}
+        # The turn reads only after the janitor worker has completed.
+        assert all(p.read_text() == "cached content" for p in files)
+    finally:
+        reset_current_turn(token)
+    result = await asyncio.to_thread(sweep_scratch_roots, tmp_path, now=now)
+    assert set(result.removed) == {str(p.relative_to(tmp_path)) for p in files}
+    assert attachment.exists()
+
+
+async def test_turn_starting_during_sweep_prevents_cache_unlink(tmp_path, monkeypatch):
+    from mimir import scratch_janitor
+    from mimir._context import set_current_turn, reset_current_turn
+
+    now = time.time()
+    cache = tmp_path / "attachments" / "fetch-cache"
+    cache.mkdir(parents=True)
+    body = cache / "body.html"
+    body.write_text("still readable")
+    _age(body, 10, now=now)
+    inspected = Event()
+    proceed = Event()
+    original = scratch_janitor._tree_newest_mtime_and_size
+
+    def pause_after_inspection(path, cutoff):
+        result = original(path, cutoff)
+        if path == body:
+            inspected.set()
+            assert proceed.wait(5)
+        return result
+
+    monkeypatch.setattr(scratch_janitor, "_tree_newest_mtime_and_size", pause_after_inspection)
+    sweep = asyncio.create_task(asyncio.to_thread(sweep_scratch_roots, tmp_path, now=now))
+    token = None
+    try:
+        assert await asyncio.to_thread(inspected.wait, 5)
+        token = set_current_turn(SimpleNamespace(turn_id="janitor-admission-race"))
+        proceed.set()
+        result = await sweep
+        assert result.protected == ("attachments/fetch-cache/body.html",)
+        assert body.read_text() == "still readable"
+    finally:
+        proceed.set()
+        await sweep
+        if token is not None:
+            reset_current_turn(token)
 
 
 def test_escaping_roots_rejected(tmp_path: Path):

@@ -47,6 +47,7 @@ from ..identities import IdentityResolver
 from ..models import AgentEvent
 from ..redaction import redact_text
 from ._attachments import _SLACK_CDN_HOSTS, build_inbound_path, download_to_path
+from ._chunking import chunk_message
 from ._emoji import resolve_for_slack
 from ._history import ChannelMessage
 from ._seen_ids import SeenIdCache
@@ -122,79 +123,7 @@ def _is_dm_channel(channel: str, channel_type: str | None = None) -> bool:
 
 
 def _chunk_message(text: str, limit: int = SLACK_MESSAGE_CHAR_LIMIT) -> list[str]:
-    """Split ``text`` into chunks each ≤ ``limit`` chars.
-
-    Prefers paragraph boundaries; falls back to line boundaries; last resort
-    is hard slicing. Same algorithm as the Discord chunker — Slack just has
-    a larger natural ceiling.
-    """
-    if limit <= 0:
-        limit = SLACK_MESSAGE_CHAR_LIMIT
-    if len(text) <= limit:
-        return [text]
-
-    import re
-
-    def _split_oversized_block(block: str) -> list[str]:
-        if len(block) <= limit:
-            return [block]
-        lines = block.splitlines(keepends=True)
-        if len(lines) <= 1:
-            return [block[idx : idx + limit] for idx in range(0, len(block), limit)]
-        out: list[str] = []
-        current = ""
-        for line in lines:
-            if len(line) > limit:
-                if current:
-                    out.append(current)
-                    current = ""
-                out.extend(line[idx : idx + limit] for idx in range(0, len(line), limit))
-                continue
-            if not current:
-                current = line
-                continue
-            if len(current) + len(line) <= limit:
-                current += line
-                continue
-            out.append(current)
-            current = line
-        if current:
-            out.append(current)
-        return out
-
-    paragraph_blocks: list[str] = []
-    cursor = 0
-    for match in re.finditer(r"\n\s*\n+", text):
-        end = match.end()
-        paragraph_blocks.append(text[cursor:end])
-        cursor = end
-    if cursor < len(text):
-        paragraph_blocks.append(text[cursor:])
-    if not paragraph_blocks:
-        paragraph_blocks = [text]
-
-    chunks: list[str] = []
-    current = ""
-    for block in paragraph_blocks:
-        if not block:
-            continue
-        if len(block) > limit:
-            if current:
-                chunks.append(current)
-                current = ""
-            chunks.extend(_split_oversized_block(block))
-            continue
-        if not current:
-            current = block
-            continue
-        if len(current) + len(block) <= limit:
-            current += block
-            continue
-        chunks.append(current)
-        current = block
-    if current:
-        chunks.append(current)
-    return chunks
+    return chunk_message(text, limit if limit > 0 else SLACK_MESSAGE_CHAR_LIMIT)
 
 
 def _normalize_emoji(emoji: str) -> str:
@@ -566,6 +495,7 @@ class SlackBridge(Bridge):
 
         last_id: str | None = None
         sent_count = 0
+        upload_count = 0
         try:
             for chunk in chunks:
                 kwargs: dict[str, Any] = {"channel": slack_channel, "text": chunk}
@@ -594,25 +524,27 @@ class SlackBridge(Bridge):
                 )
                 if ts:
                     last_id = ts
-                sent_count += 1
+                upload_count += 1
         except SlackApiError as exc:
             return SendResult(
-                sent=sent_count > 0,
+                sent=False,
                 message_id=last_id,
                 chunks=sent_count,
+                uploads=upload_count,
                 error=redact_text(f"slack api error after {sent_count} chunk(s): {exc}"),
             )
         except Exception as exc:  # noqa: BLE001 — best-effort bridge send
             return SendResult(
-                sent=sent_count > 0,
+                sent=False,
                 message_id=last_id,
                 chunks=sent_count,
+                uploads=upload_count,
                 error=redact_text(
                     f"slack send error after {sent_count} chunk(s): "
                     f"{type(exc).__name__}: {exc}"
                 ),
             )
-        return SendResult(sent=True, message_id=last_id, chunks=sent_count)
+        return SendResult(sent=True, message_id=last_id, chunks=sent_count, uploads=upload_count)
 
     async def send_typing_indicator(self, channel_id: str) -> None:
         """No-op. Slack has no public typing API for bots — the

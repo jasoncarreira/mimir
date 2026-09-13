@@ -30,10 +30,12 @@ from __future__ import annotations
 
 import os
 import time
+from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path
 
 from ._rmtree import rmtree_missing_ok
+from ._context import idle_turn_eviction_guard
 
 __all__ = [
     "DEFAULT_SCRATCH_TTL_DAYS",
@@ -52,7 +54,7 @@ DEFAULT_SCRATCH_TTL_DAYS = 1
 
 #: Home-relative roots swept by default. Operators add agent-invented
 #: variants (e.g. ``.review-scratch``) via ``MIMIR_SCRATCH_JANITOR_ROOTS``.
-DEFAULT_SCRATCH_ROOTS: tuple[str, ...] = ("scratch",)
+DEFAULT_SCRATCH_ROOTS: tuple[str, ...] = ("scratch", "attachments/fetch-cache")
 
 
 def resolve_scratch_ttl_days(raw: str | None = None) -> int:
@@ -293,10 +295,24 @@ def sweep_scratch_roots(
                 if recent:
                     kept += 1
                     continue
-                if entry.is_symlink() or not entry.is_dir():
-                    entry.unlink(missing_ok=True)
-                else:
-                    rmtree_missing_ok(entry)
+                cache_root = (home / "attachments" / "fetch-cache").resolve()
+                resolved = entry.resolve()
+                touches_cache = (
+                    resolved == cache_root or cache_root in resolved.parents
+                    or resolved in cache_root.parents
+                )
+                # Protect body, sidecar and extracted text through the entire
+                # turn, including the gap between fetch_url and read_file.
+                guard = idle_turn_eviction_guard() if touches_cache else nullcontext(True)
+                with guard as idle:
+                    if not idle:
+                        kept += 1
+                        protected_entries.append(str(entry.relative_to(home)))
+                        continue
+                    if entry.is_symlink() or not entry.is_dir():
+                        entry.unlink(missing_ok=True)
+                    else:
+                        rmtree_missing_ok(entry)
                 removed.append(str(entry.relative_to(home)))
                 reclaimed += size
             except OSError as exc:

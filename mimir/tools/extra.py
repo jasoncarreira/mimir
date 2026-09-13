@@ -362,9 +362,8 @@ def _run_bounded_project_test(
             chunk = stream.read(8192)
             if not chunk:
                 return
-            remaining = _PROJECT_TEST_CAPTURE_BYTES - len(captured[name])
-            if remaining > 0:
-                captured[name].extend(chunk[:remaining])
+            captured[name].extend(chunk)
+            del captured[name][:-_PROJECT_TEST_CAPTURE_BYTES]
 
     threads = [
         threading.Thread(target=drain, args=(name, stream), daemon=True)
@@ -554,10 +553,13 @@ def shell_exec(
         session_id = _shell_session_id() if direct_argv is None else None
         if target is not None and target.is_dir() and session_id is not None:
             _remember_shell_cwd(session_id, target)
-    if stdout:
-        suffix = "\n[shell stdout truncated]" if len(stdout) > 4000 else ""
-        parts.append(f"stdout:\n{stdout[:4000]}{suffix}")
-    if stderr:
-        suffix = "\n[shell stderr truncated]" if len(stderr) > 2000 else ""
-        parts.append(f"stderr:\n{stderr[:2000]}{suffix}")
+    for name, output, limit in (("stdout", stdout, 4000), ("stderr", stderr, 2000)):
+        if output:
+            if len(output) > limit:
+                output = (
+                    output[:limit // 2]
+                    + f"\n[shell {name} truncated]\n"
+                    + output[-limit // 2:]
+                )
+            parts.append(f"{name}:\n{output}")
     return "\n\n".join(parts)
