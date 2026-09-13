@@ -535,6 +535,8 @@ def build_turn_prompt(
             if saga_session_id else ""
         )
         header = f"[scheduled_tick: {header_channel}, ts: {ts}{saga_part}]"
+        # These are trusted operator-configured instructions (or our default),
+        # not external message/output data; deliberately leave them unprefixed.
         body = event.content or HEARTBEAT_DEFAULT_PROMPT
         sections.append(f"{header}\n{body}")
     elif event.trigger == "shell_job_complete":
@@ -553,7 +555,10 @@ def build_turn_prompt(
             f"[shell_job_complete: {header_channel}, job_id: {job_id}, "
             f"exit_code: {exit_code}, ts: {ts}{saga_part}]"
         )
-        body = event.content or "(no payload)"
+        # Prefix the entire mixed summary at the rendering boundary: command
+        # strings and stdout/stderr tails are untrusted, even though surrounding
+        # status labels are framework-generated. Keep only the header unmarked.
+        body = prefix_prompt_body(event.content or "(no payload)")
         sections.append(f"{header}\n{body}")
     else:
         # Prefer the operator-configured canonical display name over platform
