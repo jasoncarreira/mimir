@@ -4188,6 +4188,22 @@ def _open_pr(
         f"{evidence.tests.exit_code if evidence.tests else 'missing'}\n"
         f"- Transcript: `{evidence.transcript or '(none)'}`\n"
     )
+    if evidence.tests is not None:
+        tests = evidence.tests
+        if tests.initial_run is not None:
+            evidence_block += (
+                f"- Original gate: `{tests.initial_run.cmd}` → {tests.initial_run.exit_code}\n"
+            )
+        if tests.rerun is not None:
+            evidence_block += (
+                f"- Diagnostic rerun (serial, failed nodes only): `{tests.rerun.cmd}` → "
+                f"{tests.rerun.exit_code}\n"
+            )
+        if tests.flaky_tests:
+            evidence_block += (
+                "- flaky_tests (passed in isolation; not proof of flakiness): "
+                f"{json.dumps([redact_text(node) for node in tests.flaky_tests])}\n"
+            )
     body = evidence_block
     if pr_body_section:
         body = (

@@ -92,12 +92,14 @@ async def test_enabled_gate_rerun_preserves_compute_spec(tmp_path, monkeypatch):
         *launcher, "-q", "-n", "0", "-k", "", "-m", "", "--", *failed,
     ]
     tests = result.evidence.tests
-    assert result.status == "completed"
-    assert result.review_ready is True
+    assert result.status == "failed"
+    assert result.review_ready is False
     assert tests.initial_run.exit_code == 1
     assert tests.initial_run.failed_tests == failed
-    assert tests.rerun.exit_code == tests.exit_code == 0
-    assert tests.failed_tests == ()
+    assert tests.rerun.exit_code == 0
+    assert tests.exit_code == 1
+    assert tests.counts == tests.initial_run.counts
+    assert tests.failed_tests == failed
     assert tests.flaky_tests == failed
 
 
