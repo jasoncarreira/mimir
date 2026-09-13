@@ -5855,6 +5855,68 @@ async def test_shadow_sink_event_records_redacted_resolved_destination() -> None
     assert fields["trigger"] == "user_message"
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "command,option,secret",
+    [
+        ("gh api --client-secret opaque-client-credential", "--client-secret", "opaque-client-credential"),
+        ('gh api --header "Authorization: Basic dXNlcjpwYXNz"', "--header", "dXNlcjpwYXNz"),
+        (
+            "gh api --client-secret " + "opaque-credential" * 100
+            + " " + " ".join("argument" * 20 for _ in range(10)),
+            "--client-secret", "opaque-credential",
+        ),
+    ],
+    ids=["client-secret", "basic-header", "long-target"],
+)
+async def test_shadow_shell_target_masks_argv_before_truncation(
+    monkeypatch: pytest.MonkeyPatch, command: str, option: str, secret: str,
+) -> None:
+    registry = ToolRegistry()
+    registry.enable_shadow_logging()
+    auth = create_auth_context(
+        AgentEvent(
+            trigger="scheduled_tick", channel_id="scheduler:test",
+            service_principal="scheduler",
+        ),
+        enforce=False,
+    )
+    captured = []
+
+    async def capture(kind, **fields):
+        captured.append((kind, fields))
+
+    monkeypatch.setattr("mimir.event_logger.log_event", capture)
+    shadow = registry.authorize_tool(
+        "shell_exec", auth, enforce=False, target_channel=command,
+        arguments={"command": command},
+    )
+    enforced = registry.authorize_tool(
+        "shell_exec", auth, enforce=True, target_channel=command,
+        arguments={"command": command},
+    )
+    await asyncio.sleep(0)
+
+    assert not enforced.allowed
+    assert shadow.allowed
+    assert len(captured) == 1
+    kind, fields = captured[0]
+    assert kind == "shadow_tool_decision"
+    assert fields["would_block"] is True
+    # Check the entire durable record, including nested diagnostic fields.
+    assert secret not in json.dumps(fields)
+    assert option in fields["target"]
+    assert option in fields["requested_target"]
+    argv, _ = access_control.service_shell_argv_for_log(command)
+    expected = json.dumps(argv)
+    assert fields["target"] == expected[:1024]
+    assert fields["requested_target"] == expected[:1024]
+    if len(command) > 1024:
+        assert len(expected) > 1024
+        assert len(fields["target"].encode("utf-8")) == 1024
+        assert len(fields["requested_target"].encode("utf-8")) == 1024
+
+
 @pytest.mark.parametrize(
     "target",
     [
