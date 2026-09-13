@@ -52,6 +52,7 @@ from .evidence import (
     observe_evidence,
     pytest_report_environment,
     read_pytest_result,
+    shell_gate_environment,
 )
 from .identities import get_identities
 from .planning import (
@@ -4404,9 +4405,7 @@ def _runner_for_home(home: Path, chainlink_bin: str) -> Runner:
         text: bool = True,
     ) -> subprocess.CompletedProcess:
         if isinstance(args, str):
-            from .evidence import _shell_gate_environment
-
-            with _shell_gate_environment() as gate_env:
+            with shell_gate_environment() as gate_env:
                 return subprocess.run(
                     args, shell=True, cwd=cwd, env=gate_env,
                     capture_output=True, text=text, check=False

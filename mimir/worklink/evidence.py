@@ -753,7 +753,7 @@ def _gate_results_diverge(
 
 
 @contextlib.contextmanager
-def _shell_gate_environment() -> Iterator[dict[str, str]]:
+def shell_gate_environment() -> Iterator[dict[str, str]]:
     """Provision a private home owned by the uid executing a local shell gate.
 
     Unlike contained workers, these runners have no executor-provisioned UUID
@@ -790,7 +790,7 @@ def _run(args: Sequence[str] | str, *, cwd: Path | None = None) -> subprocess.Co
     if isinstance(args, str):
         # Shell syntax supports configured commands and the report env prefix.
         # Configuration must be trusted; checkout code still gets a bounded env.
-        with _shell_gate_environment() as gate_env:
+        with shell_gate_environment() as gate_env:
             return subprocess.run(
                 args, shell=True, cwd=cwd, env=gate_env,
                 capture_output=True, text=True, check=False
