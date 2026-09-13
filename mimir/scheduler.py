@@ -69,6 +69,7 @@ from .quota_windows import provider_store_keys
 from .models import AgentEvent
 from .pollers import (
     POLLER_CHANNEL_PREFIX,
+    POLLER_EXIT_GRACE_SECONDS,
     POLLER_TIMEOUT_SECONDS,
     PollerConfig,
     discover_pollers,
@@ -88,6 +89,11 @@ UTC = timezone.utc
 #: makes APScheduler skip it. Keeping the timeout strictly under the cadence
 #: means a slow run degrades into a late result rather than a lost tick.
 POLLER_CADENCE_MARGIN_SECONDS = 10.0
+#: Operational headroom for phase-3 attestation, logging and dispatch. Two
+#: minutes leaves margin over six nominal ten-second attestation attempts,
+#: but is NOT a network wall-clock bound: urllib timeouts apply per socket
+#: operation and cancelling to_thread does not stop an in-flight request.
+POLLER_DISPATCH_BACKSTOP_SECONDS = 120.0
 #: Smallest gap a 5-field cron can express.
 CRON_MIN_GRANULARITY_SECONDS = 60.0
 
@@ -2520,14 +2526,38 @@ class Scheduler:
                     accepted_this_fire += 1
                 return accepted
 
-            await run_poller(
-                poller,
-                enqueue=enqueue_with_turn_budget,
-                home=self._home,
-                timeout=await self._effective_poller_timeout(poller),
+            timeout = await self._effective_poller_timeout(poller)
+            # Coroutine-level backstop covering execution, cleanup AND phase 3.
+            # Dispatch headroom is an operational allowance, not a guarantee
+            # that underlying threads terminate. Cooperative cancellation can
+            # abandon remaining batches; this does not make dispatch atomic.
+            deadline_seconds = (
+                timeout + 3 * POLLER_EXIT_GRACE_SECONDS
+                + POLLER_DISPATCH_BACKSTOP_SECONDS
             )
+            deadline = asyncio.timeout(deadline_seconds)
+            try:
+                async with deadline:
+                    await run_poller(
+                        poller,
+                        enqueue=enqueue_with_turn_budget,
+                        home=self._home,
+                        timeout=timeout,
+                    )
+            except TimeoutError:
+                if not deadline.expired():
+                    raise
+            else:
+                return
         finally:
             self._poller_semaphore.release()
+
+        await log_event(
+            "poller_fire_deadline_exceeded",
+            poller=poller_name,
+            timeout_seconds=timeout,
+            deadline_seconds=deadline_seconds,
+        )
 
     def trigger_poller(self, poller_name: str, *, reason: str) -> bool:
         """Request a coalesced fire through the same gates as the cron path."""
