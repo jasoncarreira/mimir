@@ -6772,6 +6772,62 @@ def test_factory_completion_rejection_matrix_persists_failed_evidence(
     assert evidence["failure_reason"]
 
 
+def test_factory_completion_with_real_evidence_and_wrapped_runner(tmp_path: Path) -> None:
+    import mimir.worklink.orchestrator as orchestrator
+
+    sandbox = tmp_path / "sandbox"
+    sandbox.mkdir()
+    completion_runner = _completion_runner(sandbox, case="success")
+    gate_calls = []
+
+    def controller(args, cwd=None, *, text=True):
+        if isinstance(args, str):
+            gate_calls.append((args, cwd, text))
+            return cp(args, stdout="all tests passed\n")
+        if args[-3:] == ["diff", "--name-only", "main...HEAD"]:
+            return cp(args, stdout="changed.py\n")
+        if args[-3:] == ["diff", "--stat", "main...HEAD"]:
+            return cp(args, stdout=" changed.py | 1 +\n")
+        return completion_runner(args)
+
+    evidence_path, pr_url = asyncio.run(
+        orchestrator._verify_factory_completion(
+            home=tmp_path,
+            issue=IssueContext(700, "epic", "build", {"worklink:epic"}),
+            record=_completion_record(sandbox),
+            test_command="make test",
+            started_at=datetime.now(UTC),
+            runner=orchestrator._factory_git_runner(controller),
+        )
+    )
+
+    assert gate_calls == [("make test", sandbox, True)]
+    evidence = json.loads(evidence_path.read_text(encoding="utf-8"))
+    assert pr_url == "https://github.com/owner/repo/pull/42"
+    assert evidence["status"] == "completed"
+    assert evidence["files_changed"] == ["changed.py"]
+    assert evidence["diff_observed"] is True
+    assert evidence["tests"]["observed"] is True
+    assert evidence["tests"]["exit_code"] == 0
+    assert evidence["head_sha"] == "a" * 40
+
+
+@pytest.mark.parametrize("args", ["make test", ["git", "status"]])
+@pytest.mark.parametrize("text", [True, False])
+def test_factory_git_runner_forwards_controller_options(tmp_path: Path, args, text: bool) -> None:
+    from mimir.worklink.orchestrator import _factory_git_runner
+
+    calls = []
+    result = subprocess.CompletedProcess(args, 0, "ok" if text else b"ok", "" if text else b"")
+
+    def controller(args, cwd=None, *, text=True):
+        calls.append((args, cwd, text))
+        return result
+
+    assert _factory_git_runner(controller)(args, tmp_path, text=text) is result
+    assert calls == [(args, tmp_path, text)]
+
+
 def test_factory_completion_requires_entire_success_conjunction(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

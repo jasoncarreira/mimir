@@ -169,7 +169,8 @@ def test_factory_controller_boundary_guard(tmp_path, monkeypatch, guard):
     worker.assert_not_called()
 
 
-def test_factory_git_recovery_uses_owner_not_safe_directory(tmp_path, monkeypatch):
+@pytest.mark.parametrize("text", [True, False])
+def test_factory_git_recovery_uses_owner_not_safe_directory(tmp_path, monkeypatch, text):
     from mimir.worklink import orchestrator, worker_client
 
     monkeypatch.setattr(worker_client, "WORKLINK_CHECKOUT_ROOT", tmp_path)
@@ -178,9 +179,10 @@ def test_factory_git_recovery_uses_owner_not_safe_directory(tmp_path, monkeypatc
     checkout.mkdir(parents=True)
     calls = []
 
-    def controller(args):
+    def controller(args, cwd=None, *, text=True):
+        assert cwd is None
         calls.append(("controller", args))
-        return subprocess.CompletedProcess(args, 0, "initial", "")
+        return subprocess.CompletedProcess(args, 0, "initial" if text else b"initial", "" if text else b"")
 
     def worker(root, args, **kwargs):
         assert root == checkout
@@ -193,9 +195,9 @@ def test_factory_git_recovery_uses_owner_not_safe_directory(tmp_path, monkeypatc
     run = orchestrator._factory_git_runner(controller)
     args = ["git", "-C", str(checkout / ".factory-sandboxes/run"), "rev-parse", "HEAD"]
     checkout.parent.chmod(0o2700)
-    assert run(args).stdout == "initial"
+    assert run(args, text=text).stdout == ("initial" if text else b"initial")
     checkout.parent.chmod(0o2750)
-    assert run(args).stdout == "retained"
+    assert run(args, text=text).stdout == ("retained" if text else b"retained")
     assert [who for who, _ in calls] == ["controller", "worker"]
 
 
