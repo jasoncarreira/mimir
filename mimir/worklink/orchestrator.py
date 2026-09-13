@@ -52,7 +52,6 @@ from .evidence import (
     observe_evidence,
     pytest_report_environment,
     read_pytest_result,
-    shell_gate_environment,
 )
 from .identities import get_identities
 from .planning import (
@@ -726,7 +725,8 @@ class WorklinkRunner:
                 reason=claim.reason or "claim_failed",
             )
             return WorklinkRunResult(
-                issue.issue_id, None, "failed", reason=claim.reason or "claim_failed"
+                issue.issue_id, None, _claim_refusal_status(claim.reason),
+                reason=claim.reason or "claim_failed"
             )
         record = claim.record
         terminal_release = _TerminalClaimRelease(
@@ -1292,7 +1292,11 @@ class WorklinkRunner:
         else:
             comment_evidence()
             log_evidence()
-        transition_status = "blocked" if raw.output_overflow else validation.status
+        transition_status = (
+            "blocked"
+            if raw.output_overflow or {"gate_timed_out", "gate_command_not_found"}.intersection(validation.reasons)
+            else validation.status
+        )
         transition_reason = (
             validation.evidence.failure_reason
             if raw.exit_code != 0
@@ -1890,7 +1894,7 @@ class WorklinkRunner:
                 reason=reason,
             )
             return WorklinkRunResult(
-                issue_id, None, "failed", reason=reason
+                issue_id, None, _claim_refusal_status(reason), reason=reason
             )
         claim_record = claim.record
         _log_event(
@@ -2774,6 +2778,7 @@ def _factory_git_runner(controller_runner: Runner) -> Runner:
         cwd: Path | None = None,
         *,
         text: bool = True,
+        **kwargs: Any,
     ) -> subprocess.CompletedProcess:
         if len(args) >= 3 and list(args[:2]) == ["git", "-C"]:
             binding = factory_checkout_for_path(Path(args[2]))
@@ -2791,7 +2796,7 @@ def _factory_git_runner(controller_runner: Runner) -> Runner:
                         result.stdout.decode() if text else result.stdout,
                         result.stderr.decode() if text else result.stderr,
                     )
-        return controller_runner(args, cwd=cwd, text=text)
+        return controller_runner(args, cwd=cwd, text=text, **kwargs)
 
     return run
 
@@ -3372,6 +3377,19 @@ def _record_post_publication_error(
         pass
 
 
+def _claim_refusal_status(reason: str | None) -> str:
+    # Only expected admission outcomes are benign; lock/guard faults still page.
+    if reason in {
+        "duplicate_run_live",
+        "claim_contention_exhausted",
+        "lifecycle_state_incompatible",
+        "review_ready_evidence_exists",
+        "publication_intent_exists",
+    } or (reason or "").startswith("concurrency cap reached ("):
+        return "refused"
+    return "failed"
+
+
 def run_worklink(
     *,
     home: Path,
@@ -3417,8 +3435,8 @@ def run_worklink(
         )
     elif result.status == "completed":
         _record_run_success(home, issue_id)
-    # Parked outcomes do not resolve or replace prior failure attention. Leaving
-    # it active keeps the issue backed off without inflating its consecutive count.
+    # Parked and refused outcomes do not resolve or replace prior failure attention.
+    # Leaving it active preserves backoff without inflating its consecutive count.
     return result
 
 
@@ -4018,11 +4036,8 @@ def _with_outside_checkout_detection(
     root_dirty_before: Sequence[str] = (),
 ) -> EvidenceValidation:
     # Local shared-filesystem backends are expected to write only under the
-    # attempt checkout. If the attempt diff is empty but the parent checkout is
-    # dirty, surface the containment failure explicitly instead of only reporting
-    # ``completed_empty_diff``. This is the exact fingerprint from Worklink #512.
-    if validation.evidence.files_changed:
-        return validation
+    # attempt checkout. A legitimate attempt diff must not mask escaped writes;
+    # ``completed_empty_diff`` only distinguishes the existing validation reason.
     root_paths = _new_dirty_paths(_dirty_paths(root, runner=runner), before=root_dirty_before)
     if not root_paths:
         return validation
@@ -4412,13 +4427,12 @@ def _runner_for_home(home: Path, chainlink_bin: str) -> Runner:
         cwd: Path | None = None,
         *,
         text: bool = True,
+        timeout: float = 1800,
     ) -> subprocess.CompletedProcess:
         if isinstance(args, str):
-            with shell_gate_environment() as gate_env:
-                return subprocess.run(
-                    args, shell=True, cwd=cwd, env=gate_env,
-                    capture_output=True, text=text, check=False
-                )
+            from .evidence import _run as run_gate
+
+            return run_gate(args, cwd=cwd, text=text, timeout=timeout)
         # Chainlink discovers its repository from cwd. Its configured home is
         # authoritative even when a caller also supplies a backend checkout.
         command_cwd = home if args and args[0] == chainlink_bin else cwd
@@ -4434,11 +4448,12 @@ def _run(
     *,
     cwd: Path | None = None,
     text: bool = True,
+    timeout: float = 1800,
 ) -> subprocess.CompletedProcess:
     if isinstance(args, str):
-        return subprocess.run(
-            args, shell=True, cwd=cwd, capture_output=True, text=text, check=False
-        )
+        from .evidence import _run as run_gate
+
+        return run_gate(args, cwd=cwd, text=text, timeout=timeout)
     return subprocess.run(list(args), cwd=cwd, capture_output=True, text=text, check=False)
 
 

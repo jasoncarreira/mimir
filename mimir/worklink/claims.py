@@ -388,6 +388,20 @@ class ChainlinkClaims:
         if "worklink:review" in label_set:
             return ClaimResult(False, reason="lifecycle_state_incompatible")
 
+        claim_home = Path(home_path) if home_path is not None else self.home_path
+        if claim_home is not None:
+            intent_path = claim_home / "state" / "worklink" / "publications" / f"{issue_id}.json"
+            # Presence, not parseability, is the publication fence. Do not park
+            # labels or charge an attempt: operator clearing must allow retry.
+            if intent_path.exists() or intent_path.is_symlink():
+                log.info(
+                    "Worklink claim refused: issue_id=%s reason=publication_intent_exists "
+                    "intent_path=%s",
+                    issue_id,
+                    intent_path,
+                )
+                return ClaimResult(False, reason="publication_intent_exists")
+
         review_ready = self.review_ready_evidence(issue_id, home_path=home_path)
         if review_ready is not None:
             # Completed PR evidence is the publication authority. Repair labels
@@ -407,7 +421,6 @@ class ChainlinkClaims:
             )
             return ClaimResult(False, reason="review_ready_evidence_exists")
 
-        claim_home = Path(home_path) if home_path is not None else self.home_path
         try:
             lock = self._claim_lock_with_retry(
                 issue_id, home_path=claim_home, before_claim=before_claim

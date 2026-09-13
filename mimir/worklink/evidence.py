@@ -10,6 +10,7 @@ import json
 import os
 from pathlib import Path
 import shlex
+import signal
 import subprocess
 import tempfile
 from typing import Callable, Iterator, Protocol, Sequence
@@ -59,6 +60,7 @@ class TestResult:
     initial_run: TestResult | None = None
     rerun: TestResult | None = None
     previous_observation: TestResult | None = None
+    timed_out: bool = False
 
 
 @dataclass(frozen=True)
@@ -182,6 +184,13 @@ def validate_evidence(evidence: WorklinkEvidence) -> EvidenceValidation:
     elif evidence.tests.skipped_reason is not None:
         # A recorded skip explains the missing gate; it does not pass it.
         tests_ok = False
+    elif evidence.tests.timed_out:
+        # A gate budget/configuration fault, not a failing assertion to repair.
+        reasons.append("gate_timed_out")
+        if status == "completed":
+            status = "failed"
+        if not evidence.failure_reason:
+            evidence = replace(evidence, failure_reason="test gate timed out; check gate timeout configuration")
     elif evidence.tests.exit_code == 0:
         tests_ok = True
     elif evidence.tests.exit_code == 127:
@@ -380,6 +389,7 @@ async def _observe_evidence_from_ref(
             tests = TestResult(test_command, None, "checkout failed before test", observed=False)
         else:
             async def run_gate(command: str, report_dir: Path) -> TestResult:
+                timed_out = False
                 if worker_uid_drop:
                     if compute is None:
                         raise ValueError("enabled worker evidence requires a compute backend")
@@ -393,6 +403,7 @@ async def _observe_evidence_from_ref(
                         on_launch=on_gate_launch,
                         report_dir=report_dir,
                     )
+                    timed_out = result.timed_out
                     test = subprocess.CompletedProcess(
                         ["/bin/sh", "-c", command],
                         result.exit_code,
@@ -401,7 +412,23 @@ async def _observe_evidence_from_ref(
                     )
                 else:
                     observed_command = _command_with_pytest_report(command, report_dir)
-                    test = runner(observed_command, cwd=checkout)
+                    from .backends.registry import WorklinkDefaults
+
+                    timeout_s = work_spec.timeout_s if work_spec is not None else WorklinkDefaults().timeout_s
+                    try:
+                        test = await asyncio.to_thread(
+                            runner, observed_command, cwd=checkout, timeout=timeout_s,
+                        )
+                    except subprocess.TimeoutExpired as exc:
+                        timed_out = True
+                        # TimeoutExpired may carry bytes even with text=True.
+                        stdout = exc.stdout or ""
+                        stderr = exc.stderr or ""
+                        test = subprocess.CompletedProcess(
+                            observed_command, 124,
+                            stdout.decode(errors="replace") if isinstance(stdout, bytes) else stdout,
+                            stderr.decode(errors="replace") if isinstance(stderr, bytes) else stderr,
+                        )
                 structured = read_pytest_result(command, report_dir)
                 commands.append(CommandResult(redact_text(command), test.returncode, redact_text(_summarize(test))))
                 return replace(
@@ -409,6 +436,7 @@ async def _observe_evidence_from_ref(
                     cmd=redact_text(command),
                     exit_code=test.returncode,
                     summary=redact_text(_summarize_test_output(test)),
+                    timed_out=timed_out,
                 )
 
             with _gate_report_directory(checkout, worker_uid_drop) as report_dir:
@@ -417,6 +445,7 @@ async def _observe_evidence_from_ref(
                 rerun_command = _pytest_rerun_command(test_command, failed_ids)
                 eligible = (
                     tests.exit_code == 1
+                    and not tests.timed_out
                     and tests.report_error is None
                     and tests.counts is not None
                     and tests.counts.errors == 0
@@ -434,6 +463,7 @@ async def _observe_evidence_from_ref(
                     # missing reports or a different collected set must fail closed.
                     complete = (
                         rerun.exit_code in {0, 1}
+                        and not rerun.timed_out
                         and rerun.report_error is None
                         and counts is not None
                         and counts.total == len(failed_ids)
@@ -446,7 +476,7 @@ async def _observe_evidence_from_ref(
                         and (rerun.exit_code == 0) == (counts.failed == 0)
                     )
                 initial = tests
-                tests = replace(tests, initial_run=initial, rerun=rerun)
+                tests = replace(tests, initial_run=initial, rerun=rerun, timed_out=rerun.timed_out)
                 if complete:
                     tests = replace(
                         tests,
@@ -745,11 +775,13 @@ def _gate_results_diverge(
         executor.counts,
         executor.failed_tests,
         executor.report_error,
+        executor.timed_out,
     ) != (
         measured.exit_code,
         measured.counts,
         measured.failed_tests,
         measured.report_error,
+        measured.timed_out,
     )
 
 
@@ -783,7 +815,10 @@ def shell_gate_environment() -> Iterator[dict[str, str]]:
         }
 
 
-def _run(args: Sequence[str] | str, *, cwd: Path | None = None) -> subprocess.CompletedProcess[str]:
+def _run(
+    args: Sequence[str] | str, *, cwd: Path | None = None, timeout: float = 1800,
+    text: bool = True,
+) -> subprocess.CompletedProcess[str]:
     from ..tools._shell_env import scrub_model_selection_env
 
     env = os.environ.copy()
@@ -792,10 +827,20 @@ def _run(args: Sequence[str] | str, *, cwd: Path | None = None) -> subprocess.Co
         # Shell syntax supports configured commands and the report env prefix.
         # Configuration must be trusted; checkout code still gets a bounded env.
         with shell_gate_environment() as gate_env:
-            return subprocess.run(
+            with subprocess.Popen(
                 args, shell=True, cwd=cwd, env=gate_env,
-                capture_output=True, text=True, check=False
-            )
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=text,
+                start_new_session=True,
+            ) as process:
+                try:
+                    stdout, stderr = process.communicate(timeout=timeout)
+                except subprocess.TimeoutExpired:
+                    # Kill the whole gate, not just the shell that launched it.
+                    with contextlib.suppress(ProcessLookupError):
+                        os.killpg(process.pid, signal.SIGKILL)
+                    process.wait()
+                    raise
+                return subprocess.CompletedProcess(args, process.returncode, stdout, stderr)
     return subprocess.run(
         list(args), cwd=cwd, env=env, capture_output=True, text=True, check=False
     )

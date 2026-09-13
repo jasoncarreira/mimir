@@ -7,9 +7,11 @@ import shlex
 import shutil
 import subprocess
 import sys
+import threading
 import pytest
 from pathlib import Path
 from typing import Sequence
+from unittest.mock import MagicMock
 
 from mimir.worklink.evidence import (
     TestResult,
@@ -448,7 +450,7 @@ def test_other():
 
 @pytest.mark.parametrize("fault", [
     "exit", "missing", "total", "errors", "skipped", "failures",
-    "collected", "foreign_failure", "exit_counts",
+    "collected", "foreign_failure", "exit_counts", "timeout",
 ])
 @pytest.mark.asyncio
 async def test_gate_rerun_incomplete_reports_fail_closed(tmp_path, monkeypatch, fault):
@@ -485,6 +487,8 @@ async def test_gate_rerun_incomplete_reports_fail_closed(tmp_path, monkeypatch, 
         cache.mkdir(parents=True)
         (cache / "lastfailed").write_text(json.dumps(dict.fromkeys(remaining, True)))
         (cache / "nodeids").write_text(json.dumps(collected))
+        if second and fault == "timeout":
+            raise subprocess.TimeoutExpired(command, kwargs["timeout"])
         return subprocess.CompletedProcess(command, exit_code, "output", "")
 
     monkeypatch.setattr("mimir.worklink.checkout.coding_enabled", lambda: False)
@@ -498,6 +502,11 @@ async def test_gate_rerun_incomplete_reports_fail_closed(tmp_path, monkeypatch, 
     assert result.status == "failed"
     assert result.evidence.tests.failed_tests == (node,)
     assert result.evidence.tests.flaky_tests == ()
+    if fault == "timeout":
+        assert result.evidence.tests.timed_out
+        assert result.evidence.tests.rerun.timed_out
+        assert not result.evidence.tests.initial_run.timed_out
+        assert result.reasons == ("gate_timed_out",)
 
 
 @pytest.mark.parametrize("command", [
@@ -509,6 +518,64 @@ async def test_gate_rerun_incomplete_reports_fail_closed(tmp_path, monkeypatch, 
 def test_gate_rerun_refuses_unknown_command_shapes(command):
     from mimir.worklink.evidence import _pytest_rerun_command
     assert _pytest_rerun_command(command, ("tests/test_one.py::test_one",)) is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("timeout_run", [1, 2], ids=["initial", "rerun"])
+async def test_worker_timeout_with_complete_reports_fails_closed(tmp_path, monkeypatch, timeout_run):
+    from mimir.worklink.compute import ComputeResult, LaunchHandle, WorkSpec
+
+    node = "test_sample.py::test_one"
+    specs = []
+
+    class Compute:
+        async def launch(self, spec):
+            specs.append(spec)
+            return LaunchHandle("local_subprocess", str(len(specs)))
+
+        async def wait(self, handle, timeout_s):
+            options = shlex.split(specs[-1].env["PYTEST_ADDOPTS"])
+            report = tmp_path / next(part.split("=", 1)[1] for part in options if part.startswith("--junitxml="))
+            failed = int(len(specs) == 1)
+            report.write_text(f'<testsuite tests="1" failures="{failed}" errors="0" skipped="0" />')
+            cache = report.parent / "cache" / "v" / "cache"
+            cache.mkdir(parents=True)
+            (cache / "lastfailed").write_text(json.dumps({node: True} if failed else {}))
+            (cache / "nodeids").write_text(json.dumps([node]))
+            # Compute preserves exit codes even when terminal collection times out
+            # after the gate has written reports (compute.py:718-737).
+            return ComputeResult(failed, "reports written", "", timed_out=len(specs) == timeout_run)
+
+        async def cleanup(self, handle):
+            pass
+
+    def runner(command, **kwargs):
+        assert not isinstance(command, str), "gate must use worker compute"
+        return subprocess.CompletedProcess(command, 0, "test_sample.py\n" if "--name-only" in command else "", "")
+
+    monkeypatch.setenv("MIMIR_CODING_ENABLED", "true")
+    result = await observe_evidence(
+        issue=1696, attempt=1, backend="opencode", branch="branch",
+        checkout=tmp_path, started_at=datetime.now(UTC), base_ref="main",
+        backend_status="completed", test_command="pytest -q", runner=runner,
+        work_spec=WorkSpec(1696, 1, "url", "main", "branch", "prompt", None, "pytest -q", "opencode", 7),
+        compute=Compute(),
+    )
+    assert len(specs) == timeout_run
+    assert result.reasons == ("gate_timed_out",)
+    assert not result.review_ready
+    tests = result.evidence.tests
+    assert tests.timed_out
+    assert tests.exit_code == 1
+    assert tests.counts.failed == 1
+    assert tests.failed_tests == (node,)
+    assert tests.flaky_tests == ()
+    if timeout_run == 1:
+        assert tests.rerun is None
+    else:
+        assert tests.rerun.timed_out
+        assert tests.rerun.exit_code == 0
+        assert tests.rerun.counts.passed == 1
 
 
 def test_gate_rerun_preserves_launcher_and_removes_selection():
@@ -528,13 +595,17 @@ def test_evidence_test_command_uses_bare_command_without_model_spec(
 
     captured: dict[str, object] = {}
 
-    def fake_run(args, **kwargs):
+    def fake_popen(args, **kwargs):
         captured["args"] = args
         captured["kwargs"] = kwargs
-        return subprocess.CompletedProcess(args, 0, stdout="passed", stderr="")
+        process = MagicMock()
+        process.__enter__.return_value = process
+        process.communicate.return_value = ("passed", "")
+        process.returncode = 0
+        return process
 
     monkeypatch.setenv("MIMIR_MODEL_SPEC", "codex-plus:agent-model")
-    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(subprocess, "Popen", fake_popen)
 
     _run("uv run pytest -q", cwd=Path("/tmp/checkout"))
 
@@ -553,6 +624,98 @@ def test_gate_command_not_found_is_not_tests_failed() -> None:
     assert "gate_command_not_found" in result.reasons
     assert "tests_failed" not in result.reasons
     assert result.evidence.failure_reason == "test gate command was not found (exit 127)"
+
+
+@pytest.mark.parametrize("exit_code", [0, 1, 124, 127, -15])
+def test_gate_timeout_is_configuration_fault_not_test_failure(exit_code):
+    result = validate_evidence(base_evidence(
+        tests=TestResult("pytest -q", exit_code, timed_out=True),
+    ))
+    assert result.status == "failed"
+    assert not result.review_ready
+    assert result.reasons == ("gate_timed_out",)
+    assert "timeout configuration" in result.evidence.failure_reason
+
+
+def test_gate_exit_124_alone_is_not_an_observed_timeout():
+    result = validate_evidence(base_evidence(tests=TestResult("pytest -q", 124)))
+    assert result.reasons == ("tests_failed",)
+
+
+def test_gate_timeout_is_persisted_and_counts_as_divergence():
+    from dataclasses import asdict
+    from mimir.worklink.evidence import _gate_results_diverge
+
+    executor = TestResult("pytest -q", 0)
+    measured = TestResult("pytest -q", 0, timed_out=True)
+    assert asdict(measured)["timed_out"] is True
+    assert _gate_results_diverge(executor, measured) is True
+
+
+@pytest.mark.asyncio
+async def test_controller_gate_yields_to_heartbeat_and_records_timeout(tmp_path):
+    from mimir.worklink.compute import WorkSpec
+
+    entered = threading.Event()
+    heartbeat = threading.Event()
+    calls = []
+
+    def runner(command, **kwargs):
+        if not isinstance(command, str):
+            return subprocess.CompletedProcess(command, 0, "changed.py\n", "")
+        calls.append(kwargs)
+        entered.set()
+        assert heartbeat.wait(5), "controller gate blocked the event loop"
+        raise subprocess.TimeoutExpired(command, kwargs["timeout"], b"token=secret", b"last diagnostic")
+
+    async def beat():
+        while not entered.is_set():
+            await asyncio.sleep(0.001)
+        heartbeat.set()
+
+    task = asyncio.create_task(beat())
+    try:
+        result = await observe_evidence(
+            issue=1696, attempt=1, backend="codex", branch="branch",
+            checkout=tmp_path, started_at=datetime.now(UTC), base_ref="main",
+            backend_status="completed", test_command="pytest -q", runner=runner,
+            work_spec=WorkSpec(1696, 1, "url", "main", "branch", "prompt", None, "pytest -q", "codex", 7),
+        )
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+    assert calls == [{"cwd": tmp_path, "timeout": 7}]
+    assert result.reasons == ("gate_timed_out",)
+    assert result.evidence.tests.timed_out
+    assert result.evidence.tests.exit_code == 124
+    assert "last diagnostic" in result.evidence.tests.summary
+    assert "secret" not in result.evidence.tests.summary
+    assert result.evidence.tests.rerun is None
+
+
+@pytest.mark.parametrize("runner_name", ["evidence", "orchestrator", "home"])
+def test_default_controller_runner_enforces_timeout(tmp_path, runner_name):
+    from mimir.worklink.evidence import _run
+    from mimir.worklink.orchestrator import _run as orchestrator_run, _runner_for_home
+
+    runner = {"evidence": _run, "orchestrator": orchestrator_run, "home": _runner_for_home(tmp_path, "chainlink")}[runner_name]
+
+    with pytest.raises(subprocess.TimeoutExpired):
+        runner(
+            f"{shlex.quote(sys.executable)} -c 'import time; time.sleep(10)'",
+            cwd=tmp_path, timeout=0.05,
+        )
+
+
+@pytest.mark.parametrize("for_home", [False, True])
+def test_controller_gate_runner_preserves_binary_output(tmp_path, for_home):
+    from mimir.worklink.orchestrator import _run, _runner_for_home
+
+    runner = _runner_for_home(tmp_path, "chainlink") if for_home else _run
+    result = runner("printf gate", cwd=tmp_path, text=False, timeout=5)
+    assert result.stdout == b"gate"
+    assert result.stderr == b""
+    assert result.returncode == 0
 
 
 def test_completed_requires_tests_or_skipped_reason() -> None:
@@ -712,7 +875,8 @@ async def test_observe_evidence_sees_committed_backend_work(tmp_path: Path) -> N
 
 
 @pytest.mark.asyncio
-async def test_enabled_opencode_gate_uses_authorized_compute(monkeypatch, tmp_path: Path) -> None:
+@pytest.mark.parametrize("timed_out", [False, True])
+async def test_enabled_opencode_gate_uses_authorized_compute(monkeypatch, tmp_path: Path, timed_out) -> None:
     from mimir.worklink.compute import (
         ComputeResult,
         LaunchHandle,
@@ -731,7 +895,7 @@ async def test_enabled_opencode_gate_uses_authorized_compute(monkeypatch, tmp_pa
             return LaunchHandle("local_subprocess", "job")
 
         async def wait(self, handle, timeout_s):
-            return ComputeResult(0, "passed", "", handle=handle)
+            return ComputeResult(0, "passed", "", handle=handle, timed_out=timed_out)
 
         async def cleanup(self, handle):
             self.cleaned.append(handle)
@@ -788,7 +952,10 @@ async def test_enabled_opencode_gate_uses_authorized_compute(monkeypatch, tmp_pa
         safe_git=Publication(),
     )
 
-    assert result.review_ready is True
+    assert result.review_ready is (not timed_out)
+    assert result.evidence.tests.timed_out is timed_out
+    if timed_out:
+        assert result.reasons == ("gate_timed_out",)
     assert compute.specs[0].local_argv == ("/bin/sh", "-c", "pytest -q")
     assert "PYTEST_ADDOPTS" in compute.specs[0].env
     report_option = next(
