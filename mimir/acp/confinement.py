@@ -185,6 +185,7 @@ def apparmor_profile(
                 or not re.fullmatch(r"/[\w./+-]+", value, flags=re.ASCII)):
             raise ConfinementUnavailable("AppArmor cannot represent scope path unambiguously")
         roots.add((value, grant.recursive))
+    # Network is denied by omission in this default-deny profile.
     rules = [
         # No ux/px or change_profile permission: every exec inherits this profile.
         "  /** ix,",

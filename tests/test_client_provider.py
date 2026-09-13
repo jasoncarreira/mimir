@@ -111,6 +111,36 @@ def _context(
     )
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("name", ["shell", "python"])
+@pytest.mark.parametrize("mode", [None, "confined", "unconfined", "unknown"])
+@pytest.mark.parametrize("tool_message", [False, True])
+async def test_execution_mode_survives_stock_result_and_tool_message(name, mode, tool_message):
+    import json
+    from langchain_core.messages import ToolMessage
+
+    result = ({"stdout": "", "stderr": "", "exitCode": 0} if name == "shell" else
+              {"ok": True, "stdout": "", "stderr": "", "value": "", "exception": "",
+               "timedOut": False, "kernel": "fresh"})
+    if mode is not None:
+        result["executionMode"] = mode
+    provider = _stock_provider({"content": [], "structuredContent": result})
+    token = set_turn_capability_context(_context(provider))
+    try:
+        arguments = {"command": "true"} if name == "shell" else {"code": "42"}
+        invocation = ({"type": "tool_call", "name": "hands_" + name, "id": "execution-mode", "args": arguments}
+                      if tool_message else arguments)
+        returned = await (hands_shell if name == "shell" else hands_python).ainvoke(invocation)
+        if tool_message:
+            assert isinstance(returned, ToolMessage)
+            assert returned.tool_call_id == "execution-mode"
+            returned = json.loads(returned.content)
+        assert returned == result
+        assert returned.get("executionMode", "unknown") == (mode or "unknown")
+    finally:
+        reset_turn_capability_context(token)
+
+
 
 
 def _admin_auth() -> AuthContext:
@@ -345,12 +375,13 @@ def test_profile_has_exact_provider_schemas_and_server_metadata() -> None:
                     "stdout": {"type": "string"},
                     "stderr": {"type": "string"},
                     "exitCode": {"type": "integer"},
+                    "executionMode": {"type": "string", "enum": ["confined", "unconfined", "unknown"]},
                 },
                 "required": ["stdout", "stderr", "exitCode"],
                 "additionalProperties": False,
             },
             "efcd767e81a864d776ee5d1d5757f469a0a9719f26d1cc0b3bae611597585186",
-            "0cc998ce157fd5a7389d5ea6a2e6a86d20e70d0e1b4db06d8b91e8f17ec51907",
+            "403ceebc18c9f16fc1b33e5ddc7fd0f9c2b1c7def9c6b3d0e6e5cd1e0c9668da",
         ),
         "python": (
             {
@@ -368,6 +399,7 @@ def test_profile_has_exact_provider_schemas_and_server_metadata() -> None:
                     "value": {"type": "string"},
                     "exception": {"type": "string"},
                     "timedOut": {"type": "boolean"},
+                    "executionMode": {"type": "string", "enum": ["confined", "unconfined", "unknown"]},
                     "kernel": {
                         "type": "string",
                         "enum": ["fresh", "reused", "timed_out", "crashed"],
@@ -379,7 +411,7 @@ def test_profile_has_exact_provider_schemas_and_server_metadata() -> None:
                 "additionalProperties": False,
             },
             "e5de9e79f2da6956be1f81b55a9f782098f2cdeb3996cd84a3e38f8efcf40e25",
-            "5705e1d85e12b89447ad83e52b7bacb5dea92bbe3480c5fad138364a1540303c",
+            "1dceb680f7eee4f107bcfc5f771fc844358ec34efe5d7e4084bb9c1916ebb24a",
         ),
     }
     expected["request_scope"] = ({'type': 'object', 'properties': {'path': {'type': 'string'}}, 'required': ['path'], 'additionalProperties': False}, {'type': 'object', 'properties': {'approved': {'type': 'boolean'}, 'paths': {'type': 'array', 'items': {'type': 'string'}}, 'message': {'type': 'string'}}, 'required': ['approved', 'paths', 'message'], 'additionalProperties': False}, '39b714704935190561ed407980480b9a4a0b346b97346e0bff71fb9ace820194', '942370b44a09b40aec41ffa23bd4694e3238f19b136338abd5cb8061095d54f0')
@@ -737,7 +769,8 @@ async def test_advertised_output_schemas_drive_accepted_result_shapes() -> None:
             name: property_schema.get("enum", [values_by_type[property_schema["type"]]])[0]
             for name, property_schema in schema["properties"].items()
         }
-        assert set(structured_content) == set(schema["required"])
+        optional = {"executionMode"} if policy.provider_name in {"shell", "python"} else set()
+        assert set(structured_content) == set(schema["required"]) | optional
         response = {
             "content": [{"type": "text", "text": "Tool completed"}],
             "structuredContent": structured_content,

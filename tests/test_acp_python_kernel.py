@@ -73,6 +73,7 @@ async def test_repl_executes_statements_and_reprs_final_expression(tmp_path: Pat
             "exception": "",
             "timedOut": False,
             "kernel": "fresh",
+            "executionMode": "confined",
         }
         reused = await manager.execute("one", tmp_path, "value")
         assert reused["value"] == "40"
@@ -216,6 +217,7 @@ async def test_timeout_and_crash_discard_namespace(tmp_path: Path, execution_tim
             "exception": "execution timed out after 3 seconds; namespace state lost",
             "timedOut": True,
             "kernel": "timed_out",
+            "executionMode": "confined",
         }
         assert (await manager.execute("timeout", tmp_path, "globals().get('marker')"))[
             "kernel"
@@ -262,6 +264,7 @@ async def test_timeout_and_crash_retain_streams_exactly(tmp_path: Path, executio
             "import os\nos.write(1,b'before-crash')\nos.write(2,b'err-crash')\nos._exit(31)",
         )
         assert crashed == {
+            "executionMode": "confined",
             "ok": False,
             "stdout": "before-crash",
             "stderr": "err-crash",
@@ -319,6 +322,7 @@ async def test_crash_result_survives_killpg_permission_error(
             )
         assert denied_groups == [pid]
         assert result == {
+            "executionMode": "confined",
             "ok": False,
             "stdout": "before-crash",
             "stderr": "err-crash",
@@ -1295,6 +1299,7 @@ async def test_deadline_expires_during_spawn_handshake_and_output_setup(
             "ok": False, "stdout": "", "stderr": "", "value": "",
             "exception": "execution timed out after 60 seconds; namespace state lost",
             "timedOut": True, "kernel": "timed_out",
+            "executionMode": "unknown" if phase == "spawn" else "confined",
         }
         assert manager._processes == {}
     finally:
@@ -1447,6 +1452,60 @@ def _unit_backend_on_unsupported_platform(monkeypatch):
             return PreparedCommand(tuple(argv), env)
         monkeypatch.setattr(hosted_module, "prepare_command", prepare)
         monkeypatch.setattr(kernel_module, "prepare_command", prepare)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["confined", "unconfined"])
+@pytest.mark.parametrize("ending", ["fresh", "reused", "crashed", "timed_out", "handshake_timeout"])
+async def test_execution_mode_follows_launch_not_preflight(tmp_path, monkeypatch, mode, ending):
+    from mimir.acp.confinement import PreparedCommand
+    from mimir.acp.execution_scope import UNCONFINED_WARNING
+
+    manager = PythonKernelManager()
+    preparations = []
+    def prepare(argv, **kwargs):
+        # Real child, simulated backend: preflight deliberately disagrees with launch.
+        selected = mode if len(argv) > 1 else ("unconfined" if mode == "confined" else "confined")
+        preparations.append(selected)
+        return PreparedCommand(tuple(argv), dict(os.environ), execution_mode=selected)
+    monkeypatch.setattr(kernel, "prepare_command", prepare)
+    response = manager._response
+    async def respond(worker, deadline, *, handshake=False):
+        if ending == "handshake_timeout" or (ending == "timed_out" and not handshake):
+            raise TimeoutError
+        return await response(worker, deadline, handshake=handshake)
+    monkeypatch.setattr(manager, "_response", respond)
+    try:
+        if ending == "reused":
+            await manager.execute("s", tmp_path, "kept = 42")
+            # Reuse must retain the actual worker profile, not spawn again.
+            monkeypatch.setattr(kernel, "prepare_command", lambda argv, **kw:
+                                PreparedCommand(tuple(argv), dict(os.environ), execution_mode=mode))
+        code = "import os; os._exit(31)" if ending == "crashed" else "42"
+        result = await manager.execute("s", tmp_path, code, allow_unconfined=True)
+        assert result["executionMode"] == mode
+        assert result["kernel"] == ("timed_out" if ending == "handshake_timeout" else ending)
+        assert (UNCONFINED_WARNING in result["stderr"]) is (mode == "unconfined")
+        assert preparations[:2] == ["unconfined" if mode == "confined" else "confined", mode]
+    finally:
+        await manager.close()
+
+
+@pytest.mark.asyncio
+async def test_no_execution_has_unknown_mode(tmp_path, monkeypatch):
+    manager = PythonKernelManager()
+    def no_prepare(*args, **kwargs):
+        raise TimeoutError
+    try:
+        await manager.execute("s", tmp_path, "42")
+        for code in ("%kernels", "%kernel release"):
+            assert (await manager.execute("s", tmp_path, code))["executionMode"] == "unknown"
+        monkeypatch.setattr(kernel, "prepare_command", no_prepare)
+        for code in ("42", "%kernels", "%kernel release", "%kernel kill"):
+            result = await manager.execute("s", tmp_path, code)
+            assert result["executionMode"] == "unknown"
+    finally:
+        await manager.close()
 
 
 @pytest.mark.asyncio

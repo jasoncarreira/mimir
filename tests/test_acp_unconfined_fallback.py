@@ -64,6 +64,9 @@ async def test_missing_backend_defaults_blocked_and_query_does_not_prompt(tmp_pa
 
 @pytest.mark.asyncio
 async def test_operator_acceptance_enables_both_engines_with_hardened_environment(tmp_path, unavailable, monkeypatch):
+    from mimir.access_control import classify_protected_result, ToolAuthorization, OperationDecision
+    from mimir.models import InformationFlowLabels, InformationFlowState
+
     cwd = tmp_path / "cwd"
     cwd.mkdir()
     outside = tmp_path / "outside-fixture"
@@ -81,6 +84,19 @@ async def test_operator_acceptance_enables_both_engines_with_hardened_environmen
         result = await provider.execute_python(session, f"from pathlib import Path\nPath({str(outside)!r}).read_bytes() == b''")
         assert result["value"] == "True"
         assert result["stderr"].startswith(UNCONFINED_WARNING)
+        for name, output in (("hands_shell", shell), ("hands_python", result)):
+            assert output["executionMode"] == "unconfined"
+            initial = InformationFlowLabels()
+            auth = SimpleNamespace(
+                principal="operator", canonical_principal="operator", channel_id="acp:one",
+                resource_id="acp:one", bridge_instance="acp-stdio", ifc_labels=initial,
+                ifc_state=InformationFlowState(labels=initial),
+            )
+            labels = classify_protected_result(name, {}, auth, ToolAuthorization(
+                tool_name=name, decision=OperationDecision.ADMIN_REQUIRED, allowed=True,
+            ), result=output)
+            assert labels is not None
+            assert labels.has_untrusted_active_ingest
         assert (await provider.execute_python(session, "import os\nos.read(0, 10)"))["value"] == "b''"
         approval.assert_awaited_once_with("one")
         query = await provider.request_scope(session, "")
@@ -200,6 +216,7 @@ async def test_every_unconfined_python_result_labels_mode(tmp_path, unavailable,
             execution_timers[-1].reschedule(0)
         result = await task
         assert result["stderr"].startswith(UNCONFINED_WARNING)
+        assert result["executionMode"] == "unconfined"
         assert not result["ok"]
         assert result["kernel"] == {"1/0": "reused", "import os; os._exit(31)": "crashed",
                                     "timeout": "timed_out"}[code]

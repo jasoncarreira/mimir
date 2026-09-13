@@ -172,7 +172,9 @@ async def test_real_shell_and_persistent_python_scope(tmp_path):
         for path in (sibling, cwd / "escape", Path("/etc/hosts")):
             await check(path, False)
         empty = await provider._shell(session, "cat /etc/hosts >/dev/null 2>/dev/null || true")
-        assert empty == {"stdout": "", "stderr": "", "exitCode": 0}
+        assert empty == {
+            "stdout": "", "stderr": "", "exitCode": 0, "executionMode": "confined",
+        }
     finally:
         await provider.close()
 
