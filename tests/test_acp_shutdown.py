@@ -900,7 +900,9 @@ asyncio.run(run())
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("delivery", ["before-install", "before-handler"])
+@pytest.mark.parametrize("delivery", [
+    "before-install", "before-handler", "before-handler-observed",
+])
 async def test_preinstall_sigint_exits_without_blocked_teardown(
     delivery: str, tmp_path: Path,
 ) -> None:
@@ -921,15 +923,27 @@ def deliver_install(self):
 _journal_install = deliver_install
 original_signal = signal.signal
 def install_handler(signum, handler):
-    if sys.argv[1] == 'before-handler' and signum == signal.SIGINT:
+    if sys.argv[1].startswith('before-handler') and signum == signal.SIGINT:
         os.kill(os.getpid(), signal.SIGINT)
     return original_signal(signum, handler)
 
+observer_armed = threading.Event()
 class ArmedTimer(JournalTimer):
     def start(self):
         super().start()
         record(b'armed')
+        observer_armed.set()
 proxy.threading.Timer = ArmedTimer
+
+if sys.argv[1] == 'before-handler-observed':
+    # Force the observer-first interleaving without sleeps: bootstrap still
+    # calls os._exit directly, but allow the C-byte observer to finish arming
+    # before the exit completes. Ordinary variants retain the unmodified race.
+    original_exit = os._exit
+    def observed_exit(code):
+        observer_armed.wait()
+        original_exit(code)
+    os._exit = observed_exit
 
 async def run_proxy(name, output):
     # Only intercept the product registration, not bootstrap's startup handler.
@@ -957,12 +971,26 @@ raise SystemExit(bootstrap.main([]))
         async with _shutdown_ceiling(process, progress, lambda: "startup SIGINT exit"):
             observed = await process.stdout.readline()
             state = progress.read_text().splitlines()
-            # A blocked-close handshake makes the unfixed failure immediate and
-            # proves it is a live, unarmed child, not just an unexpected exit code.
+            # A blocked-close handshake makes unwanted async teardown visible,
+            # independently of whether the C-byte observer has armed its timer.
             assert observed == b"", (process.returncode, state)
             stdout, stderr = await process.communicate()
             assert (process.returncode, stdout, stderr) == (128 + signal.SIGINT, b"", b"")
-            assert state == ["child-started", "install-enter"]
+            state = progress.read_text().splitlines()
+            assert state[:2] == ["child-started", "install-enter"]
+            # Once the wakeup fd is installed, the observer can race bootstrap's
+            # immediate exit even before the product SIGINT handler is installed.
+            # Only a prefix of timer startup is legal: no Python signal dispatch,
+            # completed installation, router teardown, or watchdog expiry.
+            timer_start = ["watchdog-start-enter", "watchdog-start-returned", "armed"]
+            suffix = state[2:]
+            if delivery == "before-install":
+                assert suffix == []
+            elif delivery == "before-handler-observed":
+                assert suffix == timer_start
+            else:
+                assert suffix == timer_start[:len(suffix)]
+            assert "signal-dispatch:" not in progress.with_suffix(".diagnostics").read_text()
     finally:
         if process.returncode is None:
             process.kill()
