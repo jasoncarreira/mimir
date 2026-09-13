@@ -50,7 +50,7 @@ async def _drain_task_callback() -> None:
 @pytest.mark.asyncio
 async def test_spawn_background_logs_task_failure(tmp_path):
     events = tmp_path / "events.jsonl"
-    init_logger(events, session_id="test-session")
+    logger = init_logger(events, session_id="test-session")
     tasks: set[asyncio.Task[Any]] = set()
 
     async def fail() -> None:
@@ -63,6 +63,7 @@ async def test_spawn_background_logs_task_failure(tmp_path):
     await _drain_task_callback()
 
     assert task not in tasks
+    await asyncio.to_thread(logger.flush_sync)
     text = events.read_text()
     assert '"type": "background_task_failed"' in text
     assert '"name": "boom-task"' in text
@@ -73,7 +74,7 @@ async def test_spawn_background_logs_task_failure(tmp_path):
 @pytest.mark.asyncio
 async def test_spawn_background_cancel_is_not_failure(tmp_path):
     events = tmp_path / "events.jsonl"
-    init_logger(events, session_id="test-session")
+    logger = init_logger(events, session_id="test-session")
     tasks: set[asyncio.Task[Any]] = set()
     started = asyncio.Event()
 
@@ -90,6 +91,7 @@ async def test_spawn_background_cancel_is_not_failure(tmp_path):
     await _drain_task_callback()
 
     assert task not in tasks
+    await asyncio.to_thread(logger.flush_sync)
     assert not events.exists() or "background_task_failed" not in events.read_text()
 
 

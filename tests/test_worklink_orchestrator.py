@@ -705,7 +705,7 @@ def test_preclaim_registry_crash_emits_scrubbed_failure_event(
 
     _reset_logger_for_tests()
     events = tmp_path / "logs" / "events.jsonl"
-    init_logger(events, session_id="test-worklink")
+    logger = init_logger(events, session_id="test-worklink")
 
     def runner(args: Sequence[str] | str, **_: object) -> subprocess.CompletedProcess[str]:
         if isinstance(args, list) and args[:4] == ["chainlink", "issue", "show", "441"]:
@@ -722,6 +722,7 @@ def test_preclaim_registry_crash_emits_scrubbed_failure_event(
     with pytest.raises(ValueError, match="unknown Worklink backend config"):
         run_worklink(home=tmp_path, repo=tmp_path, issue_id=441, autonomous=True)
 
+    logger.flush_sync()
     records = [json.loads(line) for line in events.read_text(encoding="utf-8").splitlines()]
     failure = next(record for record in records if record["type"] == "worklink_run_failed")
     assert failure["issue_id"] == 441
@@ -770,7 +771,7 @@ def test_postclaim_failure_emits_same_failure_event(
     events = tmp_path / "logs" / "events.jsonl"
     state_dir = tmp_path / "state" / "pollers" / "worklink-ready-queue"
     ambient_state_dir = tmp_path / "ambient-state"
-    init_logger(events, session_id="test-worklink")
+    logger = init_logger(events, session_id="test-worklink")
 
     async def failed_after_claim(self: WorklinkRunner, issue_id: int, **_: object):
         return orchestrator.WorklinkRunResult(
@@ -786,6 +787,7 @@ def test_postclaim_failure_emits_same_failure_event(
     result = run_worklink(home=tmp_path, repo=tmp_path, issue_id=441, autonomous=True)
 
     assert result.status == "failed"
+    logger.flush_sync()
     records = [json.loads(line) for line in events.read_text(encoding="utf-8").splitlines()]
     failure = next(record for record in records if record["type"] == "worklink_run_failed")
     assert failure["attempt"] == 2
@@ -1548,7 +1550,7 @@ def test_worklink_rereads_issue_comments_before_claiming(tmp_path: Path) -> None
 def test_worklink_runner_happy_path_fake_backend(tmp_path: Path) -> None:
     _reset_logger_for_tests()
     events = tmp_path / "logs" / "events.jsonl"
-    init_logger(events, session_id="test-worklink")
+    logger = init_logger(events, session_id="test-worklink")
     repo = tmp_path / "repo"
     worktree = repo.parent / ".worklink" / repo.name / "441-1"
     calls, runner = _orchestrator_runner(repo, worktree)
@@ -1590,6 +1592,7 @@ def test_worklink_runner_happy_path_fake_backend(tmp_path: Path) -> None:
     assert ["git", "-C", str(worktree), "checkout", "-B", "issue/441-a1", "abc123"] in calls
     pr_calls = [c for c in calls if isinstance(c, list) and c[:3] == ["gh", "pr", "create"]]
     assert pr_calls and pr_calls[0][pr_calls[0].index("--base") + 1] == "main"
+    logger.flush_sync()
     body = events.read_text(encoding="utf-8")
     assert "worklink_claimed" in body
     assert "worklink_evidence" in body
@@ -1600,7 +1603,7 @@ def test_worklink_runner_happy_path_fake_backend(tmp_path: Path) -> None:
 def test_push_failure_blocks_build_and_reports_publication_step(tmp_path: Path) -> None:
     _reset_logger_for_tests()
     events = tmp_path / "logs" / "events.jsonl"
-    init_logger(events, session_id="test-worklink-push-failure")
+    logger = init_logger(events, session_id="test-worklink-push-failure")
     repo = tmp_path / "repo"
     worktree = repo.parent / ".worklink" / repo.name / "441-1"
     calls, base_runner = _orchestrator_runner(repo, worktree)
@@ -1642,6 +1645,7 @@ def test_push_failure_blocks_build_and_reports_publication_step(tmp_path: Path) 
     assert evidence["head_sha"] is None
     assert ["chainlink", "issue", "label", "441", "worklink:blocked"] in calls
     assert ["chainlink", "issue", "label", "441", "worklink:ready"] not in calls
+    logger.flush_sync()
     records = [json.loads(line) for line in events.read_text(encoding="utf-8").splitlines()]
     failure = next(record for record in records if record["type"] == "worklink_publication_failed")
     assert failure["step"] == "push"
@@ -2290,7 +2294,7 @@ def test_bounded_timeout_routes_failure_before_releasing_lock(tmp_path: Path) ->
 def test_published_failed_lock_release_is_logged_without_orphan_run_state(tmp_path: Path) -> None:
     _reset_logger_for_tests()
     events = tmp_path / "logs" / "events.jsonl"
-    init_logger(events, session_id="test-worklink")
+    logger = init_logger(events, session_id="test-worklink")
     repo = tmp_path / "repo"
     worktree = repo.parent / ".worklink" / repo.name / "441-1"
     calls, runner = _orchestrator_runner(repo, worktree, release_returncode=1)
@@ -2307,6 +2311,7 @@ def test_published_failed_lock_release_is_logged_without_orphan_run_state(tmp_pa
     assert result.reason == "terminal recovery incomplete: Chainlink lock release failed"
     assert load_run_state(tmp_path, 441) is None
     assert ["chainlink", "issue", "label", "441", "worklink:review"] in calls
+    logger.flush_sync()
     records = [json.loads(line) for line in events.read_text(encoding="utf-8").splitlines()]
     failure = next(
         record
@@ -2789,7 +2794,7 @@ def test_zero_exit_executor_and_failed_gate_record_structured_reason_and_diverge
 def test_executor_crash_publishes_only_scrubbed_bounded_failure_reason(tmp_path: Path) -> None:
     _reset_logger_for_tests()
     events = tmp_path / "logs" / "events.jsonl"
-    init_logger(events, session_id="test-worklink-crash")
+    logger = init_logger(events, session_id="test-worklink-crash")
     repo = tmp_path / "repo"
     worktree = repo.parent / ".worklink" / repo.name / "441-1"
     calls, runner = _orchestrator_runner(repo, worktree, files_stdout="")
@@ -2831,6 +2836,7 @@ def test_executor_crash_publishes_only_scrubbed_bounded_failure_reason(tmp_path:
     assert evidence["model"] == "openai/gpt-5.6-sol"
     assert evidence["failure_reason"] == result.reason
     assert evidence["tests"]["skipped_reason"] == "executor exited nonzero before the test gate"
+    logger.flush_sync()
     records = [json.loads(line) for line in events.read_text(encoding="utf-8").splitlines()]
     evidence_event = next(record for record in records if record["type"] == "worklink_evidence")
     assert evidence_event["model"] == "openai/gpt-5.6-sol"
@@ -2851,7 +2857,7 @@ def test_executor_crash_publishes_only_scrubbed_bounded_failure_reason(tmp_path:
 def test_worklink_runner_retries_transient_claim_contention(tmp_path: Path) -> None:
     _reset_logger_for_tests()
     events = tmp_path / "logs" / "events.jsonl"
-    init_logger(events, session_id="test-worklink-contention")
+    logger = init_logger(events, session_id="test-worklink-contention")
     repo = tmp_path / "repo"
     worktree = repo.parent / ".worklink" / repo.name / "441-1"
     _, base_runner = _orchestrator_runner(repo, worktree)
@@ -2890,6 +2896,7 @@ def test_worklink_runner_retries_transient_claim_contention(tmp_path: Path) -> N
     assert result.status == "completed"
     assert result.attempt == 1
     assert claim_calls == 2
+    logger.flush_sync()
     records = [json.loads(line) for line in events.read_text(encoding="utf-8").splitlines()]
     contention = [record for record in records if record["type"] == "worklink_claim_contention"]
     assert [record["outcome"] for record in contention] == ["retrying", "succeeded"]
@@ -3186,7 +3193,7 @@ def test_worklink_runner_backend_nonzero_transitions_failed_without_pr(tmp_path:
 def test_part_a_backend_exception_failed_transition_reports_not_applied(tmp_path: Path) -> None:
     _reset_logger_for_tests()
     events_path = tmp_path / "logs" / "events.jsonl"
-    init_logger(events_path, session_id="test-worklink")
+    logger = init_logger(events_path, session_id="test-worklink")
     repo = tmp_path / "repo"
     worktree = repo.parent / ".worklink" / repo.name / "441-1"
     calls, base_runner = _orchestrator_runner(repo, worktree)
@@ -3218,6 +3225,7 @@ def test_part_a_backend_exception_failed_transition_reports_not_applied(tmp_path
     )
 
     assert result.status == "failed"
+    logger.flush_sync()
     records = [json.loads(line) for line in events_path.read_text(encoding="utf-8").splitlines()]
     transition = [record for record in records if record["type"] == "worklink_transition"][-1]
     assert transition["status"] == "failed"
@@ -3232,7 +3240,7 @@ def test_part_a_backend_exception_failed_transition_reports_not_applied(tmp_path
 def test_no_pr_blocked_failed_transition_still_emits_and_propagates(tmp_path: Path) -> None:
     _reset_logger_for_tests()
     events_path = tmp_path / "logs" / "events.jsonl"
-    init_logger(events_path, session_id="test-worklink")
+    logger = init_logger(events_path, session_id="test-worklink")
     repo = tmp_path / "repo"
     worktree = repo.parent / ".worklink" / repo.name / "441-1"
     calls, base_runner = _orchestrator_runner(repo, worktree)
@@ -3278,6 +3286,7 @@ def test_no_pr_blocked_failed_transition_still_emits_and_propagates(tmp_path: Pa
     assert not any(
         isinstance(call, list) and call[:3] == ["gh", "pr", "create"] for call in calls
     )
+    logger.flush_sync()
     records = [json.loads(line) for line in events_path.read_text(encoding="utf-8").splitlines()]
     transitions = [record for record in records if record["type"] == "worklink_transition"]
     assert len(transitions) == 2
@@ -3296,7 +3305,7 @@ def test_no_pr_blocked_failed_transition_still_emits_and_propagates(tmp_path: Pa
 def test_published_completion_failed_transition_still_emits_not_applied(tmp_path: Path) -> None:
     _reset_logger_for_tests()
     events_path = tmp_path / "logs" / "events.jsonl"
-    init_logger(events_path, session_id="test-worklink")
+    logger = init_logger(events_path, session_id="test-worklink")
     repo = tmp_path / "repo"
     worktree = repo.parent / ".worklink" / repo.name / "441-1"
     calls, base_runner = _orchestrator_runner(repo, worktree)
@@ -3325,6 +3334,7 @@ def test_published_completion_failed_transition_still_emits_not_applied(tmp_path
 
     assert result.status == "completed"
     assert result.pr_url == "https://github.com/jasoncarreira/mimir/pull/999"
+    logger.flush_sync()
     records = [json.loads(line) for line in events_path.read_text(encoding="utf-8").splitlines()]
     transitions = [record for record in records if record["type"] == "worklink_transition"]
     assert len(transitions) == 1
