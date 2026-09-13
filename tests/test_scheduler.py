@@ -2655,10 +2655,7 @@ async def test_fire_poller_passes_scheduler_home_to_run_poller(
 async def test_fire_poller_resheds_after_acquiring_semaphore(
     tmp_path: Path, monkeypatch,
 ):
-    """#488: a poller that clears the pre-acquire arbiter check but is shed
-    after the (possibly long) semaphore wait must NOT run — _fire_poller
-    re-consults the arbiter post-acquire so a 429-during-wait pause is honored.
-    """
+    """A quota pause landing during the semaphore wait must prevent firing."""
     import json
 
     from mimir.budget import FireDecision, Severity
@@ -2667,15 +2664,13 @@ async def test_fire_poller_resheds_after_acquiring_semaphore(
         return True
 
     class FlipArbiter:
-        """CLEAR pre-acquire (fire), then shed-all post-acquire (a 429 landed
-        while the poller was waiting for a slot)."""
-
         def __init__(self) -> None:
             self.calls = 0
+            self.paused = False
 
         def should_fire(self, *, priority, event_loop=None):
             self.calls += 1
-            if self.calls == 1:
+            if not self.paused:
                 return FireDecision(
                     fire=True, reason="ok", severity=Severity.CLEAR, priority=priority,
                 )
@@ -2698,11 +2693,38 @@ async def test_fire_poller_resheds_after_acquiring_semaphore(
 
     monkeypatch.setattr("mimir.scheduler.run_poller", fake_run_poller)
 
-    await sched._fire_poller(poller_name="p1")
+    class WaitingSemaphore:
+        def __init__(self):
+            self.waiting = asyncio.Event()
+            self.release_wait = asyncio.Event()
+            self.released = False
+
+        async def acquire(self):
+            self.waiting.set()
+            await self.release_wait.wait()
+
+        def release(self):
+            self.released = True
+
+    semaphore = WaitingSemaphore()
+    sched._poller_semaphore = semaphore
+    budget = mock.Mock(wraps=sched._poller_budget_status)
+    monkeypatch.setattr(sched, "_poller_budget_status", budget)
+    task = asyncio.create_task(sched._fire_poller(poller_name="p1"))
+    try:
+        await asyncio.wait_for(semaphore.waiting.wait(), 2)
+        assert arb.calls == 0
+        budget.assert_not_called()
+        arb.paused = True
+        semaphore.release_wait.set()
+        await asyncio.wait_for(task, 2)
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
 
     assert ran is False, "poller ran despite a post-acquire shed"
-    assert arb.calls == 2, "arbiter must be consulted pre- AND post-acquire"
-    assert not sched._poller_semaphore.locked()  # slot released, not leaked
+    assert arb.calls == 1
+    assert semaphore.released
     events = [
         json.loads(line)
         for line in (tmp_path / "logs" / "events.jsonl").read_text().splitlines()
@@ -5359,7 +5381,7 @@ async def test_fire_poller_budget_under_limit_still_runs(tmp_path: Path, monkeyp
     await sched._fire_poller(poller_name="p1")
 
     assert ran == ["p1"]
-    assert arbiter.consulted_priorities == ["normal", "normal"]
+    assert arbiter.consulted_priorities == ["normal"]
     events = _read_event_types(tmp_path / "logs" / "events.jsonl")
     assert not [e for e in events if e["type"] == "poller_budget_suppressed"]
 
@@ -5568,7 +5590,7 @@ async def test_fire_poller_budget_checks_do_not_block_loop_and_reuse_snapshot(
 
     assert progressed_before_check_finished
     assert ran == ["p1"]
-    assert len(calls) == 2
+    assert len(calls) == 1
     assert all(call["thread"] != loop_thread for call in calls)
     assert all(call["snapshot"] is turns_snapshot for call in calls)
 
@@ -5646,10 +5668,8 @@ async def test_fire_poller_fires_when_arbiter_clear(
     await sched._fire_poller(poller_name="p1")
 
     assert ran == ["p1"]
-    # #488: a firing poller is consulted twice — once before the semaphore wait
-    # and once after acquiring the slot (the re-check that honors a shed during
-    # the wait). Both clear here, so it runs.
-    assert arbiter.consulted_priorities == ["high", "high"]
+    # Consult once, inside the slot, so cron bursts cannot fan out gate scans.
+    assert arbiter.consulted_priorities == ["high"]
 
 
 @pytest.mark.asyncio
@@ -5849,6 +5869,35 @@ async def test_quota_recheck_early_clears_on_fresh_evidence(tmp_path: Path):
     assert catch_up is not None
     assert set(catch_up.capabilities) == set(scheduled.capabilities)
     assert catch_up == scheduled
+
+
+@pytest.mark.asyncio
+async def test_quota_recheck_rejects_evidence_for_replaced_pause(tmp_path, monkeypatch):
+    from datetime import timedelta
+    from mimir.quota_pause import QuotaPauseTracker
+
+    enqueued = []
+    sched, home, store = _paused_scheduler(tmp_path, enqueued)
+    tracker = _record_pause(home)
+    recorded_at = tracker.recorded_at
+    _fresh_snap(store, "five_hour", 0.30)
+    current = store.current
+
+    def replace_pause_during_evidence_read():
+        snapshots = current()
+        # Same reset, newer evidence identity. The checked snapshots describe
+        # the old pause and cannot authorize recovery of this one.
+        tracker.pause_until(tracker.reset_at, now=recorded_at + timedelta(seconds=1))
+        return snapshots
+
+    monkeypatch.setattr(store, "current", replace_pause_during_evidence_read)
+    await sched._recheck_quota_pause()
+    assert QuotaPauseTracker(home / ".mimir" / "quota_pause.json").is_paused().paused
+    assert enqueued == []
+    events = _read_event_types(tmp_path / "logs" / "events.jsonl") if (
+        tmp_path / "logs" / "events.jsonl"
+    ).exists() else []
+    assert not any(event["type"] == "quota_recovered" for event in events)
 
 
 @pytest.mark.asyncio

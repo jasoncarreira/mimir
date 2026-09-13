@@ -440,26 +440,44 @@ class QuotaPauseTracker:
         self._reset_at, self._reason, self._provider, self._recorded_at = previous
         return False
 
+    def clear_if_current(self, *, recorded_at: datetime) -> bool:
+        """Consume recovery evidence only for the pause it was checked against.
+
+        A newer 429 may land while the scheduler checks provider snapshots. The
+        locked reload and identity check prevent stale evidence clearing it.
+        """
+        with self._exclusive_lock():
+            if not self._load():
+                return False
+            if (
+                self._reset_at is None
+                or recorded_at is None
+                or self._recorded_at != recorded_at
+            ):
+                return False
+            return self._mark_recovered()
+
     def clear(self) -> bool:
         """Drop the pause AND the escalation state unconditionally —
         for tests and explicit resets. (Lazy-expiry uses
         :meth:`_mark_recovered`, which preserves escalation state.)"""
-        self._reset_at = None
-        self._reason = None
-        self._provider = None
-        self._recorded_at = None
-        self._consecutive = 0
-        self._last_transient_at = None
-        try:
-            self._path.unlink(missing_ok=True)
-        except OSError as exc:
-            log.warning("quota_pause: state delete failed: %s", exc)
-            self._transition_failure("quota_state_write_failed", exc)
-            self.last_save_ok = False
-            return False
-        self._clear_failure("quota_state_write_failed")
-        self.last_save_ok = True
-        return True
+        with self._exclusive_lock():
+            self._reset_at = None
+            self._reason = None
+            self._provider = None
+            self._recorded_at = None
+            self._consecutive = 0
+            self._last_transient_at = None
+            try:
+                self._path.unlink(missing_ok=True)
+            except OSError as exc:
+                log.warning("quota_pause: state delete failed: %s", exc)
+                self._transition_failure("quota_state_write_failed", exc)
+                self.last_save_ok = False
+                return False
+            self._clear_failure("quota_state_write_failed")
+            self.last_save_ok = True
+            return True
 
     def is_paused(self, *, now: datetime | None = None) -> PauseStatus:
         """Return current pause status. Lazy-expires when ``now`` is

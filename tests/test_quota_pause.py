@@ -33,6 +33,152 @@ def _codex_win(*, used_percent, reset_at=None, reset_after_seconds=None):
 # ── tracker round-trip ─────────────────────────────────────────────
 
 
+def _stale_recovery_process(path, connection):
+    tracker = QuotaPauseTracker(Path(path))
+    recorded_at = tracker.recorded_at
+    connection.send("loaded")
+    connection.recv()
+    connection.send(tracker.clear_if_current(recorded_at=recorded_at))
+    connection.close()
+
+
+def test_stale_recovery_cannot_clear_newer_multiprocess_authority(tmp_path):
+    """A newer pause with the SAME reset must not accept the old evidence."""
+    import multiprocessing
+
+    path = tmp_path / "pause.json"
+    now = datetime.now(timezone.utc)
+    reset = now + timedelta(hours=2)
+    tracker = QuotaPauseTracker(path)
+    tracker.pause_until(reset, now=now)
+    ctx = multiprocessing.get_context("spawn")
+    parent, child = ctx.Pipe()
+    process = ctx.Process(target=_stale_recovery_process, args=(str(path), child))
+    process.start()
+    child.close()
+    try:
+        assert parent.poll(10)
+        assert parent.recv() == "loaded"
+        with tracker._exclusive_lock():
+            parent.send("clear")
+            tracker.pause_until(reset, now=now + timedelta(seconds=1))
+        assert parent.poll(10)
+        assert parent.recv() is False
+        fresh = QuotaPauseTracker(path)
+        assert fresh.is_paused(now=now).paused
+        assert fresh.reset_at == reset
+        assert fresh.recorded_at == now + timedelta(seconds=1)
+    finally:
+        parent.close()
+        process.join(10)
+        if process.is_alive():
+            process.terminate()
+            process.join(10)
+    assert process.exitcode == 0
+
+
+def test_clear_if_current_preserves_escalation_and_consumes_once(tmp_path):
+    path = tmp_path / "pause.json"
+    now = datetime.now(timezone.utc)
+    tracker = QuotaPauseTracker(path)
+    tracker.record_rate_limit(RuntimeError("429"), now=now)
+    other = QuotaPauseTracker(path)
+    assert tracker.clear_if_current(recorded_at=now)
+    assert not other.clear_if_current(recorded_at=now)
+    reset, reason = other.record_rate_limit(RuntimeError("429"), now=now)
+    assert reason == "rate_limited_backoff"
+    assert reset == now + timedelta(minutes=4)
+
+
+def test_clear_if_current_refuses_unreadable_state(tmp_path):
+    path = tmp_path / "pause.json"
+    now = datetime.now(timezone.utc)
+    tracker = QuotaPauseTracker(path)
+    tracker.pause_until(now + timedelta(hours=1), now=now)
+    path.write_text("broken json")
+    assert not tracker.clear_if_current(recorded_at=now)
+    assert path.read_text() == "broken json"
+
+
+@pytest.mark.parametrize("missing", ["reset_at", "recorded_at"])
+def test_clear_if_current_requires_pause_and_evidence_identity(tmp_path, missing):
+    path = tmp_path / "pause.json"
+    now = datetime.now(timezone.utc)
+    tracker = QuotaPauseTracker(path)
+    tracker.pause_until(now + timedelta(hours=1), now=now)
+    state = json.loads(path.read_text())
+    state[missing] = None
+    path.write_text(json.dumps(state))
+    before = path.read_bytes()
+    evidence = None if missing == "recorded_at" else now
+    assert not tracker.clear_if_current(recorded_at=evidence)
+    assert path.read_bytes() == before
+
+
+def _explicit_clear_process(path, connection):
+    import mimir.quota_pause as quota_pause
+
+    tracker = QuotaPauseTracker(Path(path))
+    flock = quota_pause.fcntl.flock
+
+    def observed_flock(fd, operation):
+        if operation == quota_pause.fcntl.LOCK_EX:
+            try:
+                return flock(fd, operation | quota_pause.fcntl.LOCK_NB)
+            except BlockingIOError:
+                connection.send(("blocked", tracker.reset_at, tracker._consecutive))
+        return flock(fd, operation)
+
+    # This binding belongs to the spawned interpreter, not the test runner.
+    quota_pause.fcntl.flock = observed_flock
+    connection.send("loaded")
+    connection.recv()
+    result = tracker.clear()
+    connection.send((result, tracker.reset_at, tracker._consecutive, tracker._last_transient_at))
+    connection.close()
+
+
+def test_explicit_clear_serializes_with_writer_and_remains_unconditional(tmp_path):
+    import multiprocessing
+    import mimir.quota_pause as quota_pause
+
+    if quota_pause.fcntl is None:
+        pytest.skip("requires POSIX file locks")
+    path = tmp_path / "pause.json"
+    now = datetime.now(timezone.utc)
+    writer = QuotaPauseTracker(path)
+    writer.record_rate_limit(RuntimeError("429"), now=now)
+    old_reset, _ = writer.record_rate_limit(RuntimeError("429"), now=now)
+    ctx = multiprocessing.get_context("spawn")
+    parent, child = ctx.Pipe()
+    process = ctx.Process(target=_explicit_clear_process, args=(str(path), child))
+    process.start()
+    child.close()
+    try:
+        assert parent.poll(10)
+        assert parent.recv() == "loaded"
+        with writer._exclusive_lock():
+            writer._record_rate_limit_locked(RuntimeError("429"), now=now)
+            before = path.read_bytes()
+            parent.send("clear")
+            assert parent.poll(10)
+            # Memory reset must wait too, not just the unlink.
+            assert parent.recv() == ("blocked", old_reset, 1)
+            assert path.read_bytes() == before
+        assert parent.poll(10)
+        assert parent.recv() == (True, None, 0, None)
+        assert not path.exists()
+        reset, _ = writer.record_rate_limit(RuntimeError("429"), now=now)
+        assert reset == now + timedelta(seconds=60)
+    finally:
+        parent.close()
+        process.join(10)
+        if process.is_alive():
+            process.terminate()
+            process.join(10)
+    assert process.exitcode == 0
+
+
 def test_tracker_unpaused_when_no_state_file(tmp_path: Path):
     tracker = QuotaPauseTracker(tmp_path / "qp.json")
     status = tracker.is_paused()

@@ -109,3 +109,216 @@ async def test_saga_query_uses_independent_connections_for_concurrent_reads(
         id(conn) for conn in operation_wrappers
     }
     assert all(result["items_returned"] >= 1 for result in results)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("injected", [False, True])
+async def test_cancelled_query_worker_never_writes_access(tmp_path, monkeypatch, injected):
+    store = SagaStore(db_path=tmp_path / "cancel.db", embedding_dim=3)
+    conn = store.connection()
+    _install_minimal_atom(conn)
+    if injected:
+        store._db_path = None
+    loop = asyncio.get_running_loop()
+    entered = asyncio.Event()
+    finalized = asyncio.Event()
+    release = threading.Event()
+    writes = []
+
+    def embed(_query):
+        loop.call_soon_threadsafe(entered.set)
+        assert release.wait(10)
+        return []
+
+    monkeypatch.setattr("mimir.saga.client._query_embed_sync", embed)
+    monkeypatch.setattr(store, "_mark_retrieval_access_events", lambda *a, **kw: writes.append(a))
+    monkeypatch.setattr(
+        "mimir.saga.ownership.SagaReadAuthorization.finalize",
+        lambda self: loop.call_soon_threadsafe(finalized.set),
+    )
+    task = asyncio.create_task(store.query("concurrent query smoke term"))
+    try:
+        await asyncio.wait_for(entered.wait(), 5)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(task, 1)
+        assert not release.is_set()
+    finally:
+        release.set()
+        await asyncio.gather(task, return_exceptions=True)
+        await asyncio.wait_for(finalized.wait(), 5)
+        await store.close()
+    assert writes == []
+
+
+@pytest.mark.asyncio
+async def test_cancelled_query_discards_queued_access_write(tmp_path, monkeypatch):
+    from concurrent.futures import ThreadPoolExecutor
+
+    pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="test-saga")
+    monkeypatch.setattr("mimir.saga.client._SAGA_EXECUTOR", pool)
+    monkeypatch.setattr("mimir.saga.client._query_embed_sync", lambda _query: [])
+    store = SagaStore(db_path=tmp_path / "queued.db", embedding_dim=3)
+    conn = store.connection()
+    _install_minimal_atom(conn)
+    changes = conn.total_changes
+    loop = asyncio.get_running_loop()
+    occupied = asyncio.Event()
+    queued = asyncio.Event()
+    release = threading.Event()
+    read_finished = False
+    access_futures = []
+    submit = pool.submit
+    run_worker = store._run_worker
+
+    def blocked():
+        loop.call_soon_threadsafe(occupied.set)
+        assert release.wait(10)
+
+    def observed_submit(*args, **kwargs):
+        future = submit(*args, **kwargs)
+        if read_finished:
+            access_futures.append(future)
+            queued.set()
+        return future
+
+    async def read_then_saturate(*args):
+        nonlocal read_finished
+        payload = await run_worker(*args)
+        assert payload["items_returned"] > 0
+        submit(blocked)
+        await asyncio.wait_for(occupied.wait(), 5)
+        read_finished = True
+        return payload
+
+    monkeypatch.setattr(pool, "submit", observed_submit)
+    monkeypatch.setattr(store, "_run_worker", read_then_saturate)
+    task = asyncio.create_task(store.query("concurrent query smoke term"))
+    try:
+        await asyncio.wait_for(queued.wait(), 5)
+        assert len(access_futures) == 1
+        assert not access_futures[0].running()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(task, 1)
+        assert not release.is_set()
+        assert access_futures[0].cancelled()
+    finally:
+        read_finished = False
+        release.set()
+        await asyncio.gather(task, return_exceptions=True)
+        # A subsequent shared operation proves the slot was released and drains
+        # any wrongly retained access write before checking the actual database.
+        await store._db_locked(lambda: None)
+        final_changes = conn.total_changes
+        await store.close()
+        pool.shutdown(wait=True)
+    assert final_changes == changes
+
+
+@pytest.mark.asyncio
+async def test_shared_waiters_do_not_occupy_workers_or_default_pool(monkeypatch):
+    from concurrent.futures import ThreadPoolExecutor
+
+    pool = ThreadPoolExecutor(max_workers=2, thread_name_prefix="test-saga")
+    monkeypatch.setattr("mimir.saga.client._SAGA_EXECUTOR", pool)
+    store = SagaStore()
+    loop = asyncio.get_running_loop()
+    entered = asyncio.Event()
+    release = threading.Event()
+
+    def blocked():
+        loop.call_soon_threadsafe(entered.set)
+        assert release.wait(10)
+
+    first = asyncio.create_task(store._db_locked(blocked))
+    waiters = []
+    try:
+        await asyncio.wait_for(entered.wait(), 5)
+        first.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await first
+        waiters = [asyncio.create_task(store._db_locked(lambda: None)) for _ in range(8)]
+        await asyncio.sleep(0)
+        # The cancelled worker still owns its slot. Other shared operations
+        # wait as coroutines, leaving the second dedicated worker available.
+        name = await asyncio.wait_for(store._run_worker(lambda: threading.current_thread().name), 2)
+        assert name.startswith("test-saga")
+        default_name = await asyncio.wait_for(asyncio.to_thread(lambda: threading.current_thread().name), 2)
+        assert not default_name.startswith("test-saga")
+        assert not any(task.done() for task in waiters)
+    finally:
+        release.set()
+        await asyncio.gather(first, *waiters, return_exceptions=True)
+        pool.shutdown(wait=True)
+
+
+@pytest.mark.asyncio
+async def test_query_failure_finalizes_authorization(tmp_path, monkeypatch):
+    store = SagaStore(db_path=tmp_path / "failed.db")
+    finalized = []
+
+    def fail(_query):
+        raise RuntimeError("read failed")
+
+    monkeypatch.setattr("mimir.saga.client._query_embed_sync", fail)
+    monkeypatch.setattr("mimir.saga.ownership.SagaReadAuthorization.finalize", lambda self: finalized.append(self))
+    try:
+        with pytest.raises(RuntimeError, match="read failed"):
+            await store.query("query")
+        assert len(finalized) == 1
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_shared_connection_entry_points_lock_and_preserve_sync_api(monkeypatch):
+    store = SagaStore()
+    held = []
+    calls = []
+    loop_thread = threading.get_ident()
+
+    class Connection:
+        def execute(self, sql):
+            assert held == ["db"]
+            assert threading.get_ident() != loop_thread
+            calls.append("health")
+
+        def close(self):
+            assert held == ["db"]
+            assert threading.get_ident() != loop_thread
+            calls.append("close")
+
+    conn = Connection()
+
+    def ensure():
+        assert held[0] == "db"
+        return conn
+
+    def index(connection):
+        assert connection is conn
+        assert held == ["db", "index"]
+        calls.append("rebuild")
+
+    class Lock:
+        def __init__(self, name):
+            self.name = name
+
+        def __enter__(self):
+            held.append(self.name)
+
+        def __exit__(self, *exc):
+            assert held.pop() == self.name
+
+    store._db_lock = Lock("db")
+    store._index_lock = Lock("index")
+    monkeypatch.setattr(store, "_ensure_conn", ensure)
+    monkeypatch.setattr(store, "_ensure_index", index)
+    assert store.connection() is conn
+    assert store.rebuild_index() is None
+    assert await store.__aenter__() is store
+    assert await store.health() is True
+    store._conn = conn
+    await store.close()
+    assert store._conn is None
+    assert calls == ["rebuild", "health", "close"]
