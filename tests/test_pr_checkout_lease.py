@@ -21,6 +21,7 @@ from mimir.models import (
     RepoPRAction,
     RepoPRActionScope,
     RepoReviewState,
+    ServerDiscoveredPRStates,
     TurnInteractivity,
 )
 from mimir.pr_checkout_lease import (
@@ -1707,10 +1708,10 @@ async def test_protected_reads_allow_only_tracked_files_in_exact_authorized_pr_l
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     repo, initial_scope = _repo_and_scope(tmp_path)
-    fixture_source = Path(__file__).with_name("test_access_control.py")
+    credential = "-----BEGIN " + "OPENSSH PRIVATE KEY-----"
     published = repo / "tests" / "test_access_control.py"
     published.parent.mkdir()
-    published.write_bytes(fixture_source.read_bytes())
+    published.write_text(credential + "\n" + "fixture padding\n" * 5020, encoding="utf-8")
     tracked_protected_source = repo / ".env"
     tracked_protected_source.write_text("TOKEN=placeholder\n", encoding="utf-8")
     _git(repo, "add", "tests/test_access_control.py", ".env")
@@ -1731,11 +1732,11 @@ async def test_protected_reads_allow_only_tracked_files_in_exact_authorized_pr_l
     tracked = lease.path / "tests" / "test_access_control.py"
     tracked_protected = lease.path / ".env"
     other_tracked = other_lease.path / "tests" / "test_access_control.py"
-    assert "-----BEGIN OPENSSH PRIVATE KEY-----" in tracked.read_text(encoding="utf-8")
+    assert credential in tracked.read_text(encoding="utf-8")
 
     untracked = lease.path / "notes.txt"
     untracked.write_text(
-        "-----BEGIN OPENSSH PRIVATE KEY-----\nnot published\n", encoding="utf-8",
+        credential + "\nnot published\n", encoding="utf-8",
     )
     untracked_env = lease.path / "scratch" / ".env"
     untracked_env.parent.mkdir()
@@ -1783,7 +1784,7 @@ async def test_protected_reads_allow_only_tracked_files_in_exact_authorized_pr_l
         reset_current_turn(token)
 
     assert sync_result.error is None
-    assert "-----BEGIN OPENSSH PRIVATE KEY-----" in sync_result.file_data["content"]
+    assert credential in sync_result.file_data["content"]
     assert async_result.error is None
     assert any(match["path"].endswith("tests/test_access_control.py") for match in grep_result.matches)
     assert any(match["path"].endswith("tests/test_access_control.py") for match in glob_result.matches)
@@ -1833,6 +1834,100 @@ async def test_protected_reads_allow_only_tracked_files_in_exact_authorized_pr_l
     finally:
         reset_current_turn(token)
     assert revoked.error == result_refusal
+
+
+@pytest.mark.parametrize(
+    "case",
+    ["own", "no_active_lease", "different_pr", "outside", "untracked", "same_pr_other_state"],
+)
+def test_discovered_pr_protected_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, case: str,
+) -> None:
+    from mimir.access_control import (
+        _target_within_active_pr_checkout_lease,
+        resolve_repository_review_state,
+    )
+    from mimir.read_policy import (
+        file_contains_secret, non_admin_read_filter_enabled, protected_read_denial_reason,
+    )
+    from mimir.repo_tools import RepoGitTools
+
+    repo, initial_scope = _repo_and_scope(tmp_path)
+    credential = "ghp_" + "Synthetic9" * 4
+    (repo / "fixture.txt").write_text(credential + "\n", encoding="utf-8")
+    _git(repo, "add", "fixture.txt")
+    _git(repo, "commit", "-qm", "credential-shaped fixture")
+    _git(repo, "push", "-q", "origin", "HEAD:worklink/7")
+    scope = replace(
+        initial_scope, observed_head_sha=_git(repo, "rev-parse", "HEAD"),
+        provenance="server_discovered",
+    )
+    root = tmp_path / "leases"
+    root.mkdir()
+    state = RepoReviewState(scope)
+    lease = create_pr_checkout_lease(
+        scope, owner=scope.principal, lease_root=root, review_state=state,
+    )
+    discovered = ServerDiscoveredPRStates()
+    discovered.remember(state)
+    target = lease.path / "fixture.txt"
+    fallback = None
+    if case == "no_active_lease":
+        lease.revoke()
+    elif case == "different_pr":
+        other_scope = replace(scope, pr_number=8)
+        other_lease = create_pr_checkout_lease(
+            other_scope, owner=scope.principal, lease_root=root,
+        )
+        target = other_lease.path / "fixture.txt"
+    elif case == "outside":
+        target = repo / "fixture.txt"
+        fallback = state
+    elif case == "untracked":
+        target = lease.path / "untracked.txt"
+        target.write_text(credential + "\n", encoding="utf-8")
+    elif case == "same_pr_other_state":
+        # The same repo/PR key is not proof of ownership of this state object.
+        discovered = ServerDiscoveredPRStates()
+        discovered.remember(RepoReviewState(scope))
+        fallback = state
+
+    auth = replace(
+        _service_auth(SimpleNamespace(filesystem_read_roots=(str(tmp_path),))),
+        server_discovered_pr_states=discovered, repo_review_state=fallback,
+    )
+    assert auth.is_service and auth.roles == ()
+    assert auth.repo_pr_scope_registry is None
+    assert auth.repo_pr_action_scope is None
+    monkeypatch.setenv("MIMIR_HOME", str(tmp_path / "home"))
+    assert protected_read_denial_reason(target) is None
+    assert file_contains_secret(target)
+    resolved, refusal = resolve_repository_review_state(auth, path=str(target))
+    if case in {"no_active_lease", "different_pr"}:
+        assert resolved is None
+    else:
+        assert resolved is state and refusal is None
+        assert (discovered.resolve(state.repo, state.pr_number) is state) == (
+            case != "same_pr_other_state"
+        )
+        assert _target_within_active_pr_checkout_lease(str(target), state) == (case != "outside")
+        if case != "outside":
+            assert RepoGitTools(state).is_tracked_file(target) == (case != "untracked")
+
+    token = set_current_turn(SimpleNamespace(turn_id="discovered-pr-read", auth_context=auth))
+    try:
+        assert non_admin_read_filter_enabled()
+        result = WriteGuardBackend(target.parent, []).read(str(target))
+    finally:
+        reset_current_turn(token)
+    if case == "own":
+        assert result.error is None
+        assert credential in result.file_data["content"]
+    else:
+        assert result.error == (
+            "Read denied: protected_read_result. For published PR content, "
+            "use pr_files or pr_diff."
+        )
 
 
 def _service_auth(service) -> AuthContext:
