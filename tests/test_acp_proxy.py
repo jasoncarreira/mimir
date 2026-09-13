@@ -1087,6 +1087,7 @@ async def test_session_new_first_python_call_has_fresh_empty_namespace(
                 "exception": "",
                 "timedOut": False,
                 "kernel": "fresh",
+                "executionMode": "unconfined" if lifecycle_backend == "unavailable" else "confined",
             }
             assert acceptance.await_count == (1 if lifecycle_backend == "unavailable" else 0)
     finally:

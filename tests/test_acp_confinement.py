@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import json
 import asyncio
+import errno
 import os
 import shlex
+import socket
 import subprocess
 import sys
 import threading
@@ -109,7 +111,7 @@ async def test_prepare_off_loop(monkeypatch, tmp_path, site, outcome):
                 assert result["paths"] == [str(tmp_path)]
                 assert result["message"].startswith("BLOCKED:" if outcome == "error" else "CONFINED:")
             elif site == "shell":
-                assert result == {"stdout": "fixture", "stderr": "", "exitCode": 0}
+                assert result == {"stdout": "fixture", "stderr": "", "exitCode": 0, "executionMode": "confined"}
             elif is_kernel:
                 assert result["ok"] and result["value"] == "42"
                 reused = await manager.execute("s", tmp_path, "6 * 7")
@@ -569,6 +571,65 @@ def test_apparmor_refuses_path_syntax(suffix, source):
 def test_apparmor_requires_frozen_nonroot_path(path):
     with pytest.raises(confinement.ConfinementUnavailable):
         confinement.apparmor_profile(Path(path))
+
+
+def test_apparmor_enforce_allowlist_denies_network():
+    profile = confinement.apparmor_profile(Path("/session"))
+    header, *rules = profile.splitlines()
+    # No flags (complain/default_allow), includes, or exec transitions may widen it.
+    assert header.split() == ["profile", header.split()[1], "{"]
+    assert rules == [
+        "  deny network,",
+        "  /** ix,",
+        "  /usr/bin/** mr,", "  /bin/** mr,",
+        "  /usr/lib/** mr,", "  /usr/lib64/** mr,",
+        "  /lib/** mr,", "  /lib64/** mr,", "  /usr/local/lib/** mr,",
+        "  /etc/ld.so.cache r,",
+        "  /dev/null rw,", "  /dev/urandom r,", "  /dev/random r,",
+        "  /proc/*/attr/current r,",
+        "  /session rwk,", "  /session/ rw,", "  /session/** rwk,",
+        "}",
+    ]
+
+
+@pytest.mark.skipif(sys.platform not in ("darwin", "linux"), reason="requires Seatbelt or AppArmor")
+def test_real_sandbox_denies_network(tmp_path):
+    cwd = tmp_path.resolve()
+    interpreter = str(confinement.AppArmorBackend.interpreter) if sys.platform == "linux" else sys.executable
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
+        listener.bind(("127.0.0.1", 0))
+        listener.listen(2)
+        listener.settimeout(5)
+        script = f"""import socket
+try:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as client:
+        client.settimeout(5)
+        client.connect({listener.getsockname()!r})
+except OSError as exc:
+    print(exc.errno)
+else:
+    print('connected')
+"""
+        argv = [interpreter, "-I", "-S", "-c", script]
+        control = subprocess.run(
+            argv, cwd=cwd, env=confinement._environment(), capture_output=True,
+            text=True, timeout=15, close_fds=True,
+        )
+        assert control.returncode == 0, control.stderr
+        assert control.stdout.strip() == "connected", control.stdout
+        connection, _ = listener.accept()
+        connection.close()
+        try:
+            prepared = confinement.prepare_command(argv, cwd=cwd)
+        except confinement.BackendUnavailable as exc:
+            pytest.skip(str(exc))
+        assert prepared.execution_mode == "confined"
+        result = subprocess.run(
+            prepared.argv, cwd=cwd, env=prepared.env, capture_output=True,
+            text=True, timeout=15, close_fds=True,
+        )
+        assert result.returncode == 0, result.stderr
+        assert result.stdout.strip() in {str(errno.EACCES), str(errno.EPERM)}, result.stdout
 
 
 def test_apparmor_approved_directory_policy_includes_descendants():

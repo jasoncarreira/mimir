@@ -72,6 +72,7 @@ def test_shared_wire_contract_is_stdlib_only_and_exact() -> None:
                     "stdout": {"type": "string"},
                     "stderr": {"type": "string"},
                     "exitCode": {"type": "integer"},
+                    "executionMode": {"type": "string", "enum": ["confined", "unconfined", "unknown"]},
                 },
                 "required": ["stdout", "stderr", "exitCode"],
                 "additionalProperties": False,
@@ -95,6 +96,7 @@ def test_shared_wire_contract_is_stdlib_only_and_exact() -> None:
                     "value": {"type": "string"},
                     "exception": {"type": "string"},
                     "timedOut": {"type": "boolean"},
+                    "executionMode": {"type": "string", "enum": ["confined", "unconfined", "unknown"]},
                     "kernel": {
                         "type": "string",
                         "enum": ["fresh", "reused", "timed_out", "crashed"],
@@ -252,3 +254,20 @@ def test_scope_query_contract_is_exact() -> None:
     assert validate_tool_result("request_scope", result) == result
     with pytest.raises(HandsContractError):
         validate_tool_arguments("request_scope", {"path": "/file", "command": "hidden"})
+
+
+@pytest.mark.parametrize("name", ["shell", "python"])
+@pytest.mark.parametrize("mode", ["confined", "unconfined", "unknown", None, True, [], {}, "CONFined", ""])
+def test_execution_mode_is_optional_but_strict(name, mode):
+    result = ({"stdout": "", "stderr": "", "exitCode": 0} if name == "shell" else
+              {"ok": True, "stdout": "", "stderr": "", "value": "", "exception": "",
+               "timedOut": False, "kernel": "fresh"})
+    assert "executionMode" not in validate_tool_result(name, result)
+    result["executionMode"] = mode
+    if type(mode) is str and mode in {"confined", "unconfined", "unknown"}:
+        assert validate_tool_result(name, result) == result
+    else:
+        with pytest.raises(HandsContractError):
+            validate_tool_result(name, result)
+    with pytest.raises(HandsContractError):
+        validate_tool_arguments(name, {"command" if name == "shell" else "code": "pass", "executionMode": "confined"})

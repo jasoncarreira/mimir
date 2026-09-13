@@ -186,6 +186,7 @@ def apparmor_profile(
             raise ConfinementUnavailable("AppArmor cannot represent scope path unambiguously")
         roots.add((value, grant.recursive))
     rules = [
+        "  deny network,",
         # No ux/px or change_profile permission: every exec inherits this profile.
         "  /** ix,",
         "  /usr/bin/** mr,", "  /bin/** mr,",

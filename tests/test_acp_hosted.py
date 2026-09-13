@@ -43,6 +43,47 @@ async def _connected(tmp_path: Path) -> tuple[HostedHandsProvider, str]:
     return provider, connection
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["confined", "unconfined"])
+@pytest.mark.parametrize("name", ["shell", "python"])
+async def test_launch_mode_survives_hosted_wire_and_wrapper(tmp_path, monkeypatch, mode, name):
+    import json
+    from mimir.acp.confinement import PreparedCommand
+    from mimir.acp.execution_scope import UNCONFINED_WARNING
+    import mimir.acp.python_kernel as kernel
+    from mimir.tools.client_provider import (
+        MIMIR_HANDS_V1, TurnCapabilityContext, hands_shell, hands_python,
+        set_turn_capability_context, reset_turn_capability_context,
+    )
+
+    def prepare(argv, **kwargs):
+        return PreparedCommand(tuple(argv), dict(os.environ), execution_mode=mode)
+    monkeypatch.setattr(hosted, "prepare_command", prepare)
+    monkeypatch.setattr(kernel, "prepare_command", prepare)
+    provider, connection = await _connected(tmp_path)
+    # Consent permits fallback, but is not evidence that execution used fallback.
+    provider._sessions["session"].scope.unconfined_approved = True
+    class Connection:
+        async def call_tool(self, name, arguments):
+            response = await provider.request(connection, "tools/call", {"name": name, "arguments": arguments})
+            return json.loads(json.dumps(response))["structuredContent"]
+    token = set_turn_capability_context(TurnCapabilityContext(
+        permission_broker=None, provider=Connection(), profile_policy=MIMIR_HANDS_V1,
+        connection_generation=1, prompt_epoch=1, acp_delivery=True,
+        lease=SimpleNamespace(closed=False), cwd=str(tmp_path),
+    ))
+    try:
+        # User-controlled warning text must not determine the metadata.
+        arguments = ({"command": "printf %s " + shlex.quote(UNCONFINED_WARNING) + " >&2"}
+                     if name == "shell" else {"code": f"import sys; print({UNCONFINED_WARNING!r}, file=sys.stderr)"})
+        result = await (hands_shell if name == "shell" else hands_python).ainvoke(arguments)
+        assert UNCONFINED_WARNING in result["stderr"]
+        assert result["executionMode"] == mode
+    finally:
+        reset_turn_capability_context(token)
+        await provider.close()
+
+
 @pytest.mark.parametrize(
     "error",
     [
@@ -520,6 +561,7 @@ async def test_shell_uses_bin_sh_cwd_environment_and_bounded_streams(
         },
     )
     assert environment["structuredContent"] == {
+        "executionMode": "confined",
         "stdout": f"{tmp_path}\n",
         "stderr": "",
         "exitCode": 0,
@@ -624,6 +666,7 @@ async def test_shell_deadline_kills_pipe_holding_owned_grandchild(
             "stdout": "held\n",
             "stderr": "\n[timed out after 1 s]",
             "exitCode": -1,
+            "executionMode": "confined",
         }
         assert pgid != os.getpgrp()
         await _assert_process_stopped(pid)
@@ -951,7 +994,7 @@ async def test_tools_list_is_exact_four_tool_profile_and_extra_tool_errors(
 
 
 @pytest.mark.asyncio
-async def test_python_result_has_exact_seven_keys(tmp_path: Path) -> None:
+async def test_python_result_has_exact_execution_metadata(tmp_path: Path) -> None:
     provider, connection = await _connected(tmp_path)
     result = await provider.request(
         connection,
@@ -966,9 +1009,10 @@ async def test_python_result_has_exact_seven_keys(tmp_path: Path) -> None:
     assert result["content"] == []
     structured = result["structuredContent"]
     assert set(structured) == {
-        "ok", "stdout", "stderr", "value", "exception", "timedOut", "kernel"
+        "ok", "stdout", "stderr", "value", "exception", "timedOut", "kernel", "executionMode"
     }
     assert structured == {
+        "executionMode": "confined",
         "ok": True,
         "stdout": "out\n",
         "stderr": "",

@@ -150,7 +150,7 @@ class _Worker:
     pgid: int
     channel: socket.socket
     approved_paths: tuple[ScopeApproval, ...] = ()
-    execution_mode: str = "confined"
+    execution_mode: str = "unknown"
     usable: bool = False
     signalled: bool = False
     reaper: asyncio.Task[None] | None = None
@@ -162,7 +162,7 @@ class _Kernel:
     directory: Path | None = None
     approved_paths: tuple[ScopeApproval, ...] = ()
     allow_unconfined: bool = False
-    execution_mode: str = "confined"
+    execution_mode: str = "unknown"
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     waiters: int = 0
     worker: _Worker | None = None
@@ -246,7 +246,8 @@ class PythonKernelManager:
         stderr_path: Path | None = None
         kernel_state = "fresh"
         result: dict[str, Any] | None = None
-        execution_mode = "confined"
+        state.execution_mode = "unknown"
+        startup_mode = "unknown"
         try:
             if self._closed:
                 raise PythonKernelUnavailable("kernel manager is closed")
@@ -257,7 +258,7 @@ class PythonKernelManager:
                                        allow_unconfined=allow_unconfined)
             if self._closed:
                 raise PythonKernelUnavailable("kernel manager is closed")
-            execution_mode = prepared.execution_mode
+            startup_mode = prepared.execution_mode
             state.allow_unconfined = allow_unconfined
             # Check the actual worker's spawn-time profile on EVERY reuse,
             # including adoption by a different session after release.
@@ -275,6 +276,7 @@ class PythonKernelManager:
                     state.directory, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
                 )
             if state.worker is not None:
+                state.execution_mode = state.worker.execution_mode
                 if state.worker.process.returncode is not None:
                     result = await self._crashed(state, state.worker, None, None)
                     state.last_activity = loop.time()
@@ -359,7 +361,10 @@ class PythonKernelManager:
         except (OSError, ConfinementUnavailable, PythonKernelUnavailable) as exc:
             if state.worker is not None:
                 await self._discard(state, state.worker)
-            prefix = UNCONFINED_WARNING + " " if execution_mode == "unconfined" else ""
+            # Preserve startup risk warnings without treating an attempted launch
+            # as evidence of execution in structured results.
+            warning_mode = state.execution_mode if state.execution_mode != "unknown" else startup_mode
+            prefix = UNCONFINED_WARNING + " " if warning_mode == "unconfined" else ""
             raise PythonKernelUnavailable(prefix + str(exc)) from None
         except asyncio.CancelledError:
             if state.worker is not None:
@@ -368,8 +373,10 @@ class PythonKernelManager:
         finally:
             # Label this call's result before retiring/removing its state; looking
             # up the project after cleanup loses the mode on crash and timeout.
-            if result is not None and execution_mode == "unconfined":
-                result["stderr"] = UNCONFINED_WARNING + "\n" + result["stderr"]
+            if result is not None:
+                result["executionMode"] = state.execution_mode
+                if state.execution_mode == "unconfined":
+                    result["stderr"] = UNCONFINED_WARNING + "\n" + result["stderr"]
             try:
                 for path in (stdout_path, stderr_path):
                     if path is not None:
@@ -397,6 +404,7 @@ class PythonKernelManager:
         return {
             "ok": True, "stdout": "", "stderr": "", "value": value,
             "exception": "", "timedOut": False, "kernel": "reused",
+            "executionMode": "unknown",
         }
 
     def kernels(self) -> list[dict[str, Any]]:
@@ -495,7 +503,6 @@ class PythonKernelManager:
             )
             if self._closed:
                 raise PythonKernelUnavailable("kernel manager is closed")
-            state.execution_mode = prepared.execution_mode
             process = await self._before_deadline(
                 deadline,
                 asyncio.create_subprocess_exec(
@@ -517,6 +524,8 @@ class PythonKernelManager:
             parent.close()
             child.close()
             raise PythonKernelUnavailable(str(exc)) from None
+        # Record only a confirmed launch, before handshake/cleanup can fail.
+        state.execution_mode = prepared.execution_mode
         child.close()
         worker_state = _Worker(
             process, process.pid, parent,

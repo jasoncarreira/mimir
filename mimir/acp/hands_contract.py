@@ -38,6 +38,7 @@ def _object_schema(
 
 
 _STRING = {"type": "string"}
+_EXECUTION_MODE = {"type": "string", "enum": ["confined", "unconfined", "unknown"]}
 
 HANDS_V1_WIRE_TOOLS = tuple(
     _freeze(descriptor)
@@ -68,6 +69,7 @@ HANDS_V1_WIRE_TOOLS = tuple(
                     "stdout": _STRING,
                     "stderr": _STRING,
                     "exitCode": {"type": "integer"},
+                    "executionMode": _EXECUTION_MODE,
                 },
                 ["stdout", "stderr", "exitCode"],
             ),
@@ -84,6 +86,7 @@ HANDS_V1_WIRE_TOOLS = tuple(
                     "value": _STRING,
                     "exception": _STRING,
                     "timedOut": {"type": "boolean"},
+                    "executionMode": _EXECUTION_MODE,
                     "kernel": {
                         "type": "string",
                         "enum": ["fresh", "reused", "timed_out", "crashed"],
@@ -185,4 +188,13 @@ def validate_tool_arguments(
 
 
 def validate_tool_result(provider_name: str, result: object) -> dict[str, Any]:
+    # Shipped v1 results omit this field. Absence is unknown, never confined.
+    if provider_name in {"shell", "python"} and isinstance(result, Mapping) and "executionMode" in result:
+        result = dict(result)
+        mode = result.pop("executionMode")
+        if type(mode) is not str or mode not in _EXECUTION_MODE["enum"]:
+            raise HandsContractError("malformed Hands result")
+        validated = _validate_exact_object(provider_name, result, _RESULT_TYPES, "result")
+        validated["executionMode"] = mode
+        return validated
     return _validate_exact_object(provider_name, result, _RESULT_TYPES, "result")

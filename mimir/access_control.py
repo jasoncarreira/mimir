@@ -10196,11 +10196,35 @@ def classify_protected_result(
                 auth_context=auth_context,
             )
         labels = InformationFlowLabels().with_channel(channel)
-        # Only an authorized cwd read earns trust; consent to execute does not.
-        trusted_read = (
+        trusted_result = (
             tool_name == "hands_read"
             and authorization.result_integrity == "trusted"
         )
+        if tool_name in {"hands_shell", "hands_python"}:
+            from .acp.hands_contract import HandsContractError, validate_tool_result
+
+            execution_result = result
+            if isinstance(result, ToolMessage):
+                execution_result = None
+                if result.status == "success" and isinstance(result.content, str):
+                    try:
+                        execution_result = json.loads(result.content)
+                    except ValueError:
+                        pass
+            try:
+                execution_result = validate_tool_result(
+                    tool_name.removeprefix("hands_"), execution_result,
+                )
+            except HandsContractError:
+                execution_result = {}
+            # Launch metadata, never consent or stdout, establishes confinement.
+            # Tainted code can print external data even inside a sandbox.
+            trusted_result = (
+                execution_result.get("executionMode") == "confined"
+                and _live_untrusted_active_ingest(
+                    auth_context, getattr(auth_context, "ifc_labels", None),
+                ) is False
+            )
         for resource in resources:
             labels = labels.with_source(SourceLabel(
                 principal=principal,
@@ -10210,7 +10234,7 @@ def classify_protected_result(
                 sensitivity="internal",
                 authorized_principals=frozenset({principal}),
                 source_kind=_ACP_HANDS_RESULT_SOURCE_KIND,
-                integrity="trusted" if trusted_read else "untrusted",
+                integrity="trusted" if trusted_result else "untrusted",
                 integrity_effect="active_ingest",
             ))
         return labels

@@ -728,6 +728,7 @@ class HostedHandsProvider:
             "stdout": self._format_output(stdout_capture),
             "stderr": stderr_text,
             "exitCode": -1 if timed_out else process.returncode,
+            "executionMode": prepared.execution_mode,
         }
 
     async def _drain_output(

@@ -2996,6 +2996,195 @@ async def test_permission_outcome_after_trusted_cwd_read(
         await router.close()
 
 
+@pytest.mark.parametrize("wrapper", ["hands_python", "hands_shell"])
+@pytest.mark.parametrize("execution_mode", ["confined", "unconfined", "unknown", None])
+@pytest.mark.parametrize("already_tainted", [False, True])
+@pytest.mark.parametrize("as_tool_message", [False, True])
+async def test_permission_outcome_after_execute_result(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, wrapper: str,
+    execution_mode: str | None, already_tainted: bool, as_tool_message: bool,
+) -> None:
+    from langchain_core.messages import ToolMessage
+
+    from mimir.access_control import (
+        _live_untrusted_active_ingest, classify_protected_result, get_tool_registry,
+    )
+    from mimir.acp.proxy import ProxyRouter
+    from mimir.tools.client_provider import hands_python, issue_client_authorized_host_execution
+
+    events: list[tuple[str, dict[str, Any]]] = []
+    prompts: list[str] = []
+    executions: list[str] = []
+    remains_clean = execution_mode == "confined" and not already_tainted
+
+    async def record_event(event_type: str, **fields: Any) -> None:
+        events.append((event_type, fields))
+
+    monkeypatch.setattr(agent_module, "safe_log_event", record_event)
+
+    class Writer:
+        def __init__(self) -> None:
+            self.messages: list[dict[str, Any]] = []
+
+        def write(self, data: bytes) -> None:
+            self.messages.append(json.loads(data))
+
+        async def drain(self) -> None:
+            pass
+
+    client_wire, daemon_wire = Writer(), Writer()
+    router = ProxyRouter(client_wire, daemon_wire, "PRIVATE KEY")
+    arguments = {"code": "1 + 1"} if wrapper == "hands_python" else {"command": "pwd"}
+    provider_result = (
+        {"ok": True, "stdout": "", "stderr": "", "value": "2",
+         "exception": "", "timedOut": False, "kernel": "fresh"}
+        if wrapper == "hands_python"
+        else {"stdout": "/project", "stderr": "", "exitCode": 0}
+    )
+    if execution_mode is not None:
+        provider_result["executionMode"] = execution_mode
+
+    class RoutedClient(McpClient):
+        async def request_tool_permission(self, session_id: str, snapshot: Any) -> Any:
+            request_id = snapshot.tool_call_id
+            client_wire.messages.clear()
+            daemon_wire.messages.clear()
+            await router.route_daemon({
+                "jsonrpc": "2.0", "id": request_id,
+                "method": "session/request_permission",
+                "params": sdk.permission_request_params(session_id, snapshot),
+            })
+            assert snapshot.tainted is (
+                already_tainted if request_id == "first" else not remains_clean
+            )
+            if request_id == "second" and remains_clean:
+                assert client_wire.messages == []
+            else:
+                assert len(client_wire.messages) == 1
+                assert client_wire.messages[0]["method"] == "session/request_permission"
+                prompts.append(request_id)
+                await router.route_client({
+                    "jsonrpc": "2.0", "id": client_wire.messages[0]["id"],
+                    "result": {"outcome": {
+                        "outcome": "selected", "optionId": "allow_session",
+                    }},
+                })
+            assert len(daemon_wire.messages) == 1
+            assert daemon_wire.messages[0]["id"] == request_id
+            return sdk.PermissionCompletion.from_response(daemon_wire.messages[0]["result"])
+
+        async def message_mcp(self, connection_id: str, method: str, params: Any = None) -> Any:
+            if method != "tools/call":
+                return await super().message_mcp(connection_id, method, params)
+            assert params["name"] == wrapper.removeprefix("hands_")
+            assert params["arguments"] == arguments
+            executions.append(params["name"])
+            # Production transport mode reporting is covered separately.
+            return {"structuredContent": dict(provider_result)}
+
+    bundle, core = _bundle(tmp_path)
+    agent = MimirAcpAgent(bundle)
+    client = RoutedClient()
+    generation = agent.on_connect(client)
+    await agent.authenticate("mimir-web-key", **{"mimir.webKey": "secret"})
+    session_id = (await agent.new_session("/project", mcp_servers=_hands("hands"))).session_id
+    router._active_sessions.add(session_id)
+
+    async def integrated_turn(event: Any, **kwargs: Any) -> None:
+        labels = _initialize_ifc_labels(event, resolver=bundle.core.identity_resolver)
+        auth = dataclasses.replace(
+            event.continuation_auth_context, interactivity=TurnInteractivity.INTERACTIVE,
+            ifc_labels=labels, ifc_state=InformationFlowState(labels=labels),
+            saga_session_id=kwargs["saga_session_id"],
+        )
+        if already_tainted:
+            auth.ifc_state.merge(InformationFlowLabels().with_source(SourceLabel(
+                principal="external", domain="web", resource_id="https://untrusted.example",
+                bridge_instance="external", sensitivity="internal",
+                authorized_principals=frozenset({"operator"}), source_kind="protected_tool",
+                integrity="untrusted", integrity_effect="active_ingest",
+            )), fallback=labels)
+        active = agent._active_prompts[session_id]
+        context = get_turn_capability_context()
+        assert context is not None
+        assert context.permission_broker is active
+        assert context.provider is agent._sessions[session_id].provider
+        request_identity = object()
+        marker = issue_client_authorized_host_execution(
+            request_identity=request_identity, auth_context_identity=auth, wrapper_name=wrapper,
+            tainted=_live_untrusted_active_ingest(auth, labels),
+        )
+        assert marker is not None
+        for tool_id in ("first", "second"):
+            active.dispatcher.enqueue({
+                "type": "tool_call", "phase": "start", "id": tool_id,
+                "tool_name": wrapper, "args": arguments,
+            })
+            decision = await active.request_permission(PermissionEligibility(
+                tool_id, wrapper, "other", arguments, marker,
+            ))
+            assert decision is (
+                PermissionDecision.ALLOW_ONCE if tool_id == "second" and remains_clean
+                else PermissionDecision.ALLOW_SESSION
+            )
+            authorization = get_tool_registry().authorize_tool(
+                wrapper, auth, enforce=True, arguments=arguments,
+                client_authorized_host_execution=marker, request_identity=request_identity,
+            )
+            assert authorization.allowed
+            result = await (hands_python if wrapper == "hands_python" else hands_shell).ainvoke(arguments)
+            assert result == provider_result
+            if as_tool_message:
+                result = ToolMessage(content=json.dumps(result), tool_call_id=tool_id, name=wrapper)
+            result_labels = classify_protected_result(
+                wrapper, arguments, auth, authorization, result=result,
+            )
+            assert result_labels is not None
+            [source] = result_labels.sources
+            assert source.domain == "client_provider"
+            assert source.source_kind == "acp_hands_result"
+            assert source.integrity == ("trusted" if remains_clean else "untrusted")
+            assert source.integrity_effect == "active_ingest"
+            auth.ifc_state.merge(result_labels, fallback=labels)
+            assert _live_untrusted_active_ingest(auth, labels) is (not remains_clean)
+
+    failures: list[Exception] = []
+
+    async def checked_turn(event: Any, **kwargs: Any) -> None:
+        try:
+            await integrated_turn(event, **kwargs)
+        except Exception as exc:
+            failures.append(exc)
+            raise
+
+    monkeypatch.setattr(core, "run_turn", checked_turn)
+    try:
+        try:
+            response = await agent.prompt(
+                session_id, [sdk.TextContentBlock(type="text", text="run twice")],
+            )
+        except sdk.RequestError:
+            if failures:
+                raise failures[0]
+            raise
+        assert response.stop_reason == "end_turn"
+        assert executions == [wrapper.removeprefix("hands_")] * 2
+        assert prompts == (["first"] if remains_clean else ["first", "second"])
+        assert events == [
+            ("acp_permission_outcome", {
+                "wrapper_name": wrapper, "tainted": tainted,
+                "resource_resolvable": False, "outcome": outcome,
+            })
+            for tainted, outcome in [
+                (already_tainted, "operator_allow"),
+                (not remains_clean, "session_grant" if remains_clean else "operator_allow"),
+            ]
+        ]
+    finally:
+        await router.close()
+        await agent.on_transport_closed(generation)
+
+
 @pytest.mark.parametrize("wrapper", ["hands_edit", "hands_shell", "hands_python"])
 async def test_model_clear_requires_fresh_proxy_session_grant_after_ingest(
     tmp_path: Path, middleware_event_logger: None, wrapper: str,

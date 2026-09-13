@@ -3927,6 +3927,68 @@ def test_acp_hands_error_text_cannot_become_informational(tool_name: str, status
     assert labels.has_untrusted_active_ingest is True
 
 
+@pytest.mark.parametrize("tool_name", ["hands_python", "hands_shell"])
+@pytest.mark.parametrize("case", [
+    "confined", "unconfined", "missing_mode", "unknown", "bad_mode", "malformed",
+    "text_only", "error_message", "bad_json", "blocks", "missing_state", "broken_state",
+    "indeterminate_state", "tainted", "denied",
+])
+def test_hands_execution_integrity_fails_closed(tool_name: str, case: str) -> None:
+    initial = InformationFlowLabels()
+    state: Any = InformationFlowState(labels=initial)
+    if case == "missing_state":
+        state = None
+    elif case == "broken_state":
+        def broken(_fallback: Any) -> bool:
+            raise RuntimeError("unavailable")
+        state = SimpleNamespace(has_untrusted_active_ingest=broken)
+    elif case == "indeterminate_state":
+        state = SimpleNamespace(has_untrusted_active_ingest=lambda _: None)
+    elif case == "tainted":
+        state.merge(InformationFlowLabels().with_source(SourceLabel(
+            principal="external", domain="web", resource_id="https://untrusted.example",
+            bridge_instance="external", sensitivity="internal",
+            source_kind="protected_tool", integrity="untrusted", integrity_effect="active_ingest",
+        )), fallback=initial)
+    auth = replace(
+        _auth(channel="acp:session", roles=("admin",)),
+        principal="operator", canonical_principal="operator", resource_id="acp:session",
+        bridge_instance="acp-stdio", ifc_labels=initial, ifc_state=state,
+    )
+    authorization = ToolAuthorization(
+        tool_name=tool_name, decision=OperationDecision.ADMIN_REQUIRED,
+        allowed=case != "denied", result_integrity="trusted",
+    )
+    result: Any = (
+        {"ok": True, "stdout": "", "stderr": "", "value": "2", "exception": "",
+         "timedOut": False, "kernel": "fresh"}
+        if tool_name == "hands_python"
+        else {"stdout": "", "stderr": "", "exitCode": 0}
+    )
+    result["executionMode"] = {"unconfined": "unconfined", "unknown": "unknown", "bad_mode": True}.get(case, "confined")
+    if case == "missing_mode":
+        del result["executionMode"]
+    elif case == "malformed":
+        del result["stdout"]
+    elif case == "text_only":
+        result["stdout"] = json.dumps(result)
+        del result["executionMode"]
+    elif case in {"error_message", "bad_json", "blocks"}:
+        content: Any = json.dumps(result)
+        if case == "bad_json":
+            content = "{invalid"
+        elif case == "blocks":
+            content = [{"type": "text", "text": content}]
+        result = ToolMessage(
+            content=content, tool_call_id="execution", name=tool_name,
+            status="error" if case == "error_message" else "success",
+        )
+    labels = classify_protected_result(tool_name, {}, auth, authorization, result=result)
+    assert labels is not None
+    assert labels.has_untrusted_active_ingest is (case != "confined")
+    assert all(source.integrity_effect == "active_ingest" for source in labels.sources)
+
+
 def test_acp_successful_provider_result_keeps_active_provider_labels() -> None:
     auth = replace(
         _auth(channel="acp:session", roles=("admin",)),
