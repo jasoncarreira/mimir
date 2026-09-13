@@ -4404,12 +4404,13 @@ def _runner_for_home(home: Path, chainlink_bin: str) -> Runner:
         text: bool = True,
     ) -> subprocess.CompletedProcess:
         if isinstance(args, str):
-            from ..contained_execution import base_worker_environment
+            from .evidence import _shell_gate_environment
 
-            return subprocess.run(
-                args, shell=True, cwd=cwd, env=base_worker_environment("evidence"),
-                capture_output=True, text=text, check=False
-            )
+            with _shell_gate_environment() as gate_env:
+                return subprocess.run(
+                    args, shell=True, cwd=cwd, env=gate_env,
+                    capture_output=True, text=text, check=False
+                )
         # Chainlink discovers its repository from cwd. Its configured home is
         # authoritative even when a caller also supplies a backend checkout.
         command_cwd = home if args and args[0] == chainlink_bin else cwd

@@ -4,6 +4,7 @@ from datetime import UTC, datetime
 import asyncio
 import json
 import shlex
+import shutil
 import subprocess
 import sys
 import pytest
@@ -278,6 +279,53 @@ async def test_default_gate_bounds_checkout_environment(tmp_path, monkeypatch, b
     assert result.review_ready, result.evidence.tests
     assert result.evidence.tests.counts.passed == 1
     assert result.evidence.tests.report_error is None
+
+
+@pytest.mark.parametrize("injected", [False, True])
+def test_shell_gate_real_uv_has_provisioned_home(tmp_path, monkeypatch, injected):
+    from mimir.worklink.evidence import _run
+    from mimir.worklink.orchestrator import _runner_for_home
+
+    uv = shutil.which("uv")
+    if uv is None:
+        pytest.skip("uv executable required for real cache initialization")
+    monkeypatch.setenv("GITHUB_TOKEN", "gate-secret-sentinel")
+    monkeypatch.setenv("HOME", str(tmp_path / "controller-home"))
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "controller-cache"))
+    probe = tmp_path / "probe.py"
+    probe.write_text(
+        "import json, os\n"
+        "from pathlib import Path\n"
+        "assert 'GITHUB_TOKEN' not in os.environ\n"
+        "home = Path(os.environ['HOME'])\n"
+        "assert home.is_dir()\n"
+        "assert home.stat().st_mode & 0o777 == 0o700\n"
+        "for key in ('XDG_CONFIG_HOME', 'XDG_DATA_HOME', 'XDG_CACHE_HOME'):\n"
+        "    path = Path(os.environ[key])\n"
+        "    assert path.is_dir() and home in path.parents\n"
+        "    (path / 'writable').write_text('yes')\n"
+        "assert (Path(os.environ['XDG_CACHE_HOME']) / 'uv').is_dir()\n"
+        "print(json.dumps(str(home)))\n",
+        encoding="utf-8",
+    )
+    runner = _runner_for_home(tmp_path, "chainlink") if injected else _run
+    # Execute uv itself, not a subprocess mock or bare Python: its startup
+    # creates the cache that failed under /var/lib/mimir-worklink/homes/evidence.
+    # No project/dependency resolution keeps this regression offline.
+    command = (
+        f"{shlex.quote(uv)} run --offline --no-project "
+        f"--python {shlex.quote(sys.executable)} python {shlex.quote(str(probe))}"
+    )
+    homes = []
+    for _ in range(2):
+        result = runner(command, cwd=tmp_path)
+        assert result.returncode == 0, result.stderr
+        home = Path(json.loads(result.stdout))
+        homes.append(home)
+        assert not home.exists(), "gate home must be cleaned after execution"
+    assert homes[0] != homes[1]
+    assert not (tmp_path / "controller-cache").exists()
+    assert not (tmp_path / "controller-home").exists()
 
 
 @pytest.mark.asyncio
