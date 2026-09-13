@@ -148,6 +148,7 @@ _ensure_mimir_import_path()
 # means auto-reviewing every author's PR — the exact behaviour #1022 removed.
 from mimir.pollers import _github_author_is_trusted, _github_content_author
 from mimir.ci_logs import capture_job_log, clean_log_tail
+from mimir.ci_attention import classify_cancelled_run
 
 STATE_DIR = Path(os.environ.get("STATE_DIR", Path(__file__).parent.parent))
 CURSOR_FILE = STATE_DIR / "cursor.json"
@@ -2180,7 +2181,7 @@ def _remediation_logs(repo: str, pr: dict, token: str, checks: list | None = Non
     lines = []
     seen = set()
     for check in checks:
-        if not isinstance(check, dict) or check.get("conclusion") not in CI_FAILURE_CONCLUSIONS:
+        if not isinstance(check, dict) or check.get("conclusion") not in CI_FAILURE_CONCLUSIONS | {"cancelled"}:
             continue
         if len(lines) >= 3:
             lines.append("CI log limitation: additional failing jobs omitted (bounded evidence).")
@@ -2215,7 +2216,7 @@ def _remediation_logs(repo: str, pr: dict, token: str, checks: list | None = Non
             or run.get("id") != run_id
             or ((run.get("repository") or {}).get("full_name") or "").lower() != repo.lower()
             or ((run.get("head_repository") or {}).get("full_name") or "").lower() != repo.lower()
-            or job.get("conclusion") not in CI_FAILURE_CONCLUSIONS
+            or job.get("conclusion") not in CI_FAILURE_CONCLUSIONS | {"cancelled"}
         ):
             lines.append("CI log limitation: job/run repository or immutable head binding unavailable.")
             continue
@@ -2652,10 +2653,11 @@ def _check_pr_ci_failures(
     tick_budget: TickBudget | None = None,
     rotate_offset: int = 0,
 ) -> tuple[int, dict[str, object]]:
-    """Route newly completed check failures for open PRs.
+    """Route newly completed check failures and unexplained cancellations.
 
     Owned PRs receive a mutation-capable remediation event. Other authors only
-    produce a notification signal. API failures preserve affected cursor entries.
+    produce a notification signal. Cancellations only produce attention prompts,
+    never remediation. API failures preserve affected cursor entries.
     """
     observed_at = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
     observed_iso = observed_at.strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -2681,6 +2683,10 @@ def _check_pr_ci_failures(
         if not isinstance(number, int) or isinstance(number, bool):
             continue
         key = str(number)
+        attention_key = f"{key}:attention"
+        # Preserve both delivery lanes until this PR's listings are complete.
+        if attention_key in prior:
+            new[attention_key] = prior[attention_key]
         if _truncate_here(tick_budget, reconciled, "ci_failures"):
             # An incomplete collection holds `_last_checked` at window_since, so
             # a truncated PR's checks are re-examined next tick rather than lost.
@@ -2696,9 +2702,9 @@ def _check_pr_ci_failures(
                 new[key] = prior[key]
             continue
         if pr.get("state") != "open" or pr.get("merged") is True or pr.get("merged_at"):
+            new.pop(attention_key, None)
             continue
         head = pr.get("head") or {}
-        base = pr.get("base") or {}
         head_sha = head.get("sha") or ""
         if not head_sha:
             collection_complete = False
@@ -2710,119 +2716,75 @@ def _check_pr_ci_failures(
         )
         checks = checks_data.get("check_runs") if isinstance(checks_data, dict) else None
         total_checks = checks_data.get("total_count") if isinstance(checks_data, dict) else None
+        runs_data = _gh_api(
+            f"repos/{repo}/actions/runs?head_sha={head_sha}&per_page=100", token,
+        )
+        runs = runs_data.get("workflow_runs") if isinstance(runs_data, dict) else None
+        total_runs = runs_data.get("total_count") if isinstance(runs_data, dict) else None
         if (
             not isinstance(checks, list)
             or isinstance(total_checks, int) and total_checks > len(checks)
+            or not isinstance(runs, list)
+            or isinstance(total_runs, int) and total_runs > len(runs)
+            or any(not isinstance(run, dict) for run in runs)
         ):
             collection_complete = False
             if key in prior:
                 new[key] = prior[key]
             continue
+        cancelled = [
+            run for run in runs
+            if run.get("head_sha") == head_sha
+            and run.get("status") == "completed"
+            and run.get("conclusion") == "cancelled"
+        ]
+        def belongs_to_cancelled(check: dict, candidates: list[dict]) -> bool:
+            cancelled_ids = {str(run["id"]) for run in candidates if run.get("id")}
+            cancelled_suites = {
+                run["check_suite_id"] for run in candidates if run.get("check_suite_id")
+            }
+            if (check.get("check_suite") or {}).get("id") in cancelled_suites:
+                return True
+            for field in ("details_url", "html_url"):
+                url = check.get(field)
+                match = re.fullmatch(
+                    rf"https://github\.com/{re.escape(repo)}/actions/runs/([1-9][0-9]*)(?:/job/[1-9][0-9]*)?",
+                    url, re.IGNORECASE,
+                ) if isinstance(url, str) else None
+                if match and match[1] in cancelled_ids:
+                    return True
+            return False
+
         failures = [
             check for check in checks
             if isinstance(check, dict)
             and check.get("status") == "completed"
             and check.get("conclusion") in CI_FAILURE_CONCLUSIONS
+            and not belongs_to_cancelled(check, cancelled)
         ]
-        if not failures:
-            continue
-
-        delivery_key = _delivery_key(repo, number, head_sha, failures)
-        entry = prior.get(key)
-        same_failure = isinstance(entry, dict) and entry.get("delivery_key") == delivery_key
-        raw_emitted_at = entry.get("emitted_at") if isinstance(entry, dict) else None
-        emitted_at = (
-            _parse_utc_datetime(raw_emitted_at)
-            if isinstance(raw_emitted_at, str) else None
-        )
-        delivered = _delivery_receipt_exists(delivery_key)
-        if same_failure and (
-            entry.get("baseline") is True
-            or delivered
-            or emitted_at is not None
-            and observed_at - emitted_at < CI_DELIVERY_RETRY_INTERVAL
+        attention = [
+            dict(
+                run, name=f"run {run.get('id')}",
+                completed_at=run.get("updated_at") or run.get("created_at"),
+            )
+            for run in cancelled if classify_cancelled_run(run, runs) == "UNKNOWN"
+        ]
+        new.pop(attention_key, None)
+        for delivery_cursor, items, is_attention in (
+            (key, failures, False), (attention_key, attention, True),
         ):
-            new[key] = entry
-            continue
-
-        newly_completed = any(
-            isinstance(check.get("completed_at"), str)
-            and (completed := _parse_utc_datetime(check["completed_at"])) is not None
-            and (since_dt is None or completed > since_dt)
-            for check in failures
-        )
-        if not newly_completed and not (same_failure and not delivered):
-            new[key] = {
-                "head_sha": head_sha,
-                "delivery_key": delivery_key,
-                "emitted_at": observed_iso,
-                "baseline": True,
-            }
-            continue
-
-        if not _claim_delivery(delivery_key, observed_at):
-            new[key] = {
-                "head_sha": head_sha,
-                "delivery_key": delivery_key,
-                "emitted_at": observed_iso,
-            }
-            continue
-
-        failed_checks = [
-            {
-                "id": check.get("id"),
-                "name": check.get("name") or "unknown",
-                "conclusion": check.get("conclusion"),
-                "url": check.get("html_url") or check.get("details_url") or "",
-                "details_url": check.get("details_url") or "",
-                "external_id": check.get("external_id"),
-            }
-            for check in failures
-        ]
-        for check in failed_checks:
-            for field, value in check.items():
-                if isinstance(value, str):
-                    check[field] = clean_log_tail(BytesIO(value.encode()), 1024).decode()
-        names = ", ".join(
-            f"{check['name']} ({check['conclusion']})" for check in failed_checks
-        )
-        author = (pr.get("user") or {}).get("login") or ""
-        common = dict(
-            repo=repo,
-            number=number,
-            url=pr.get("html_url", ""),
-            head_sha=head_sha,
-            author=author,
-            failed_checks=failed_checks,
-            delivery_key=delivery_key,
-        )
-        if me and author == me:
-            prompt = (
-                f"CI failed on your open PR #{number} on {repo} at immutable head "
-                f"{head_sha}: {names}. Re-check the live PR, exact head, and current "
-                "checks before changing anything. If it is still open at this head and "
-                "still red, inspect the linked check logs, fix the failure, run the "
-                f"repository's configured tests, and push with a lease.\n{pr.get('html_url', '')}"
+            if not items:
+                continue
+            emitted, entry = _deliver_pr_ci(
+                repo, pr, token, me, items, prior.get(delivery_cursor),
+                observed_at, since_dt, attention=is_attention,
+                evidence_checks=[
+                    check for check in checks
+                    if isinstance(check, dict) and belongs_to_cancelled(check, attention)
+                ] if is_attention else None,
             )
-            prompt += _remediation_logs(repo, pr, token, failures)
-            _emit(
-                prompt,
-                event_type="pr_ci_failure",
-                head_repo=((head.get("repo") or {}).get("full_name")),
-                head_remote="origin",
-                head_ref=head.get("ref"),
-                base_ref=base.get("ref"),
-                base_sha=base.get("sha"),
-                **common,
-            )
-        else:
-            _emit_signal("pr_ci_failure_external", **common)
-        count += 1
-        new[key] = {
-            "head_sha": head_sha,
-            "delivery_key": delivery_key,
-            "emitted_at": observed_iso,
-        }
+            count += emitted
+            new[delivery_cursor] = entry
     for key, old_entry in prior.items():
         if not isinstance(old_entry, dict):
             continue
@@ -2834,6 +2796,139 @@ def _check_pr_ci_failures(
             _remove_delivery_artifacts(old_entry.get("delivery_key"))
     new["_last_checked"] = observed_iso if collection_complete else window_since
     return count, new
+
+
+def _deliver_pr_ci(
+    repo: str, pr: dict, token: str, me: str, failures: list[dict],
+    entry: object, observed_at: datetime, since_dt: datetime | None,
+    *, attention: bool = False, evidence_checks: list[dict] | None = None,
+) -> tuple[int, dict]:
+    """Share receipt, claim, baseline and retry semantics across CI deliveries."""
+    number = pr["number"]
+    head = pr.get("head") or {}
+    base = pr.get("base") or {}
+    head_sha = head["sha"]
+    observed_iso = observed_at.strftime("%Y-%m-%dT%H:%M:%SZ")
+    delivery_key = _delivery_key(repo, number, head_sha, failures)
+    if attention:
+        delivery_key += ":attention"
+    same_failure = isinstance(entry, dict) and entry.get("delivery_key") == delivery_key
+    raw_emitted_at = entry.get("emitted_at") if isinstance(entry, dict) else None
+    emitted_at = (
+        _parse_utc_datetime(raw_emitted_at)
+        if isinstance(raw_emitted_at, str) else None
+    )
+    delivered = _delivery_receipt_exists(delivery_key)
+    if same_failure and (
+        entry.get("baseline") is True
+        or delivered
+        or emitted_at is not None
+        and observed_at - emitted_at < CI_DELIVERY_RETRY_INTERVAL
+    ):
+        return 0, entry
+
+    newly_completed = any(
+        isinstance(check.get("completed_at"), str)
+        and (completed := _parse_utc_datetime(check["completed_at"])) is not None
+        and (since_dt is None or completed > since_dt)
+        for check in failures
+    )
+    if not newly_completed and not (same_failure and not delivered):
+        return 0, {
+            "head_sha": head_sha,
+            "delivery_key": delivery_key,
+            "emitted_at": observed_iso,
+            "baseline": True,
+        }
+
+    if not _claim_delivery(delivery_key, observed_at):
+        return 0, {
+            "head_sha": head_sha,
+            "delivery_key": delivery_key,
+            "emitted_at": observed_iso,
+        }
+
+    if attention:
+        prompt = (
+            f"CI needs attention on open PR #{number} on {repo} at immutable "
+            f"head {head_sha}: workflow runs were cancelled without a known "
+            "replacement. Inspect the workflow state; cancellation alone is "
+            "not a code failure and does not authorize remediation.\n"
+            + "\n".join(
+                f"https://github.com/{repo}/actions/runs/{run['id']}"
+                for run in failures if type(run.get("id")) is int and run["id"] > 0
+            )
+        )
+        if evidence_checks:
+            prompt += _remediation_logs(repo, pr, token, evidence_checks)
+        else:
+            prompt += "\nCI log limitation: no matching checks for the cancelled workflow runs."
+        _emit(
+            prompt,
+            event_type="pr_ci_attention", repo=repo, number=number,
+            url=pr.get("html_url", ""), head_sha=head_sha,
+            cancelled_run_ids=[run.get("id") for run in failures],
+            delivery_key=delivery_key,
+        )
+        return 1, {
+            "head_sha": head_sha, "delivery_key": delivery_key,
+            "emitted_at": observed_iso,
+        }
+
+    failed_checks = [
+        {
+            "id": check.get("id"),
+            "name": check.get("name") or "unknown",
+            "conclusion": check.get("conclusion"),
+            "url": check.get("html_url") or check.get("details_url") or "",
+            "details_url": check.get("details_url") or "",
+            "external_id": check.get("external_id"),
+        }
+        for check in failures
+    ]
+    for check in failed_checks:
+        for field, value in check.items():
+            if isinstance(value, str):
+                check[field] = clean_log_tail(BytesIO(value.encode()), 1024).decode()
+    names = ", ".join(
+        f"{check['name']} ({check['conclusion']})" for check in failed_checks
+    )
+    author = (pr.get("user") or {}).get("login") or ""
+    common = dict(
+        repo=repo,
+        number=number,
+        url=pr.get("html_url", ""),
+        head_sha=head_sha,
+        author=author,
+        failed_checks=failed_checks,
+        delivery_key=delivery_key,
+    )
+    if me and author == me:
+        prompt = (
+            f"CI failed on your open PR #{number} on {repo} at immutable head "
+            f"{head_sha}: {names}. Re-check the live PR, exact head, and current "
+            "checks before changing anything. If it is still open at this head and "
+            "still red, inspect the linked check logs, fix the failure, run the "
+            f"repository's configured tests, and push with a lease.\n{pr.get('html_url', '')}"
+        )
+        prompt += _remediation_logs(repo, pr, token, failures)
+        _emit(
+            prompt,
+            event_type="pr_ci_failure",
+            head_repo=((head.get("repo") or {}).get("full_name")),
+            head_remote="origin",
+            head_ref=head.get("ref"),
+            base_ref=base.get("ref"),
+            base_sha=base.get("sha"),
+            **common,
+        )
+    else:
+        _emit_signal("pr_ci_failure_external", **common)
+    return 1, {
+        "head_sha": head_sha,
+        "delivery_key": delivery_key,
+        "emitted_at": observed_iso,
+    }
 
 
 def _check_own_mergeability(

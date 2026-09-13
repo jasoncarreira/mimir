@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+import hashlib
+import json
 
 from github_poller_test_support import poller
 import pytest
@@ -47,7 +49,7 @@ def _check(conclusion: str = "failure", *, completed_at: str = "2026-08-16T10:01
     }
 
 
-def _api(pr: dict, checks: list[dict]):
+def _api(pr: dict, checks: list[dict], runs: list[dict] | None = None):
     def fake(endpoint: str, _token: str):
         if endpoint.startswith("repos/o/r/pulls?state=open"):
             return [pr]
@@ -55,6 +57,8 @@ def _api(pr: dict, checks: list[dict]):
             return pr
         if endpoint == f"repos/o/r/commits/{pr['head']['sha']}/check-runs?per_page=100":
             return {"check_runs": checks}
+        if endpoint == f"repos/o/r/actions/runs?head_sha={pr['head']['sha']}&per_page=100":
+            return {"workflow_runs": runs or [], "total_count": len(runs or [])}
         raise AssertionError(endpoint)
 
     return fake
@@ -242,6 +246,8 @@ def _multi_api(prs: list[dict], checks: list[dict]):
             return prs
         if "/check-runs" in endpoint:
             return {"check_runs": checks}
+        if "/actions/runs?head_sha=" in endpoint:
+            return {"workflow_runs": [], "total_count": 0}
         if endpoint.startswith("repos/o/r/pulls/"):
             return by_number[int(endpoint.rsplit("/", 1)[1])]
         raise AssertionError(endpoint)
@@ -288,3 +294,174 @@ def test_unbudgeted_ci_pass_reconciles_every_pr(monkeypatch, captured_emits):
     assert count == len(numbers)
     assert fresh.truncated == {}
     assert cursor["_last_checked"] != SINCE  # complete collection advances
+
+
+def _run(run_id=50, *, status="completed", conclusion="cancelled", **extra):
+    return {
+        "id": run_id, "head_sha": HEAD, "workflow_id": 7,
+        "check_suite_id": run_id + 1000,
+        "status": status, "conclusion": conclusion,
+        "created_at": "2026-08-16T10:00:00Z",
+        "updated_at": "2026-08-16T10:01:00Z", **extra,
+    }
+
+
+@pytest.mark.parametrize("author", ["mimir-bot", "contributor"])
+@pytest.mark.parametrize("outcome", ["UNKNOWN", "SUPERSEDED", "OVERTAKEN_BY_SUCCESS"])
+@pytest.mark.parametrize("binding", ["no_checks", "details_url", "html_url", "check_suite"])
+def test_cancelled_run_never_authorizes_remediation(
+    monkeypatch, tmp_path, capsys, author, outcome, binding,
+):
+    cancelled = _run()
+    runs = [cancelled]
+    if outcome != "UNKNOWN":
+        runs.append(_run(
+            51, status="in_progress" if outcome == "SUPERSEDED" else "completed",
+            conclusion=None if outcome == "SUPERSEDED" else "success",
+            workflow_id=7 if outcome == "SUPERSEDED" else 8,
+        ))
+    checks = []
+    if binding != "no_checks":
+        check = _check("failure")  # A failed job in a cancelled run is NOT authority.
+        if binding == "check_suite":
+            check["check_suite"] = {"id": 1050}
+        else:
+            check[binding] = "https://github.com/o/r/actions/runs/50/job/101"
+        checks = [check, dict(check, id=100, conclusion="cancelled")]
+    monkeypatch.setattr(poller, "STATE_DIR", tmp_path)
+    monkeypatch.setattr(poller, "_gh_api", _api(_pr(author), checks, runs))
+    monkeypatch.setattr(poller, "capture_job_log", lambda *a, **kw: pytest.fail("log capture"))
+    count, cursor = poller._check_pr_ci_failures("o/r", SINCE, "token", "mimir-bot", {})
+    output = capsys.readouterr().out
+    if outcome != "UNKNOWN":
+        assert count == 0 and output == ""
+        assert set(cursor) == {"_last_checked"}
+        return
+    assert count == 1
+    event = json.loads(output)
+    # Exact keys make adding any mutation-bearing field a regression.
+    assert set(event) == {
+        "poller", "source_platform", "prompt", "subject_type", "event_type",
+        "repo", "number", "url", "head_sha", "cancelled_run_ids", "delivery_key",
+    }
+    assert event["event_type"] == "pr_ci_attention"
+    assert event["cancelled_run_ids"] == [50]
+    assert event["head_sha"] == HEAD
+    assert "does not authorize remediation" in event["prompt"]
+    assert "https://github.com/o/r/actions/runs/50" in event["prompt"]
+    assert "CI log limitation:" in event["prompt"]
+    assert cursor["42:attention"]["delivery_key"] == event["delivery_key"]
+
+
+def test_attention_and_independent_failure_have_separate_deliveries(monkeypatch, captured_emits):
+    cancelled_check = dict(
+        _check(), details_url="https://github.com/o/r/actions/runs/50/job/101",
+    )
+    legitimate = dict(_check(), id=102, name="legitimate")
+    monkeypatch.setattr(poller, "_gh_api", _api(_pr(), [cancelled_check, legitimate], [_run()]))
+    count, cursor = poller._check_pr_ci_failures("o/r", SINCE, "token", "mimir-bot", {})
+    assert count == 2
+    failure, attention = captured_emits
+    assert failure["event_type"] == "pr_ci_failure"
+    assert [check["id"] for check in failure["failed_checks"]] == [102]
+    assert attention["event_type"] == "pr_ci_attention"
+    assert "failed_checks" not in attention and "head_ref" not in attention
+    assert cursor["42"]["delivery_key"] != cursor["42:attention"]["delivery_key"]
+
+
+def test_attention_retries_claims_receipts_and_resolution(monkeypatch, captured_emits, tmp_path):
+    now = datetime(2026, 8, 16, 10, 2, tzinfo=timezone.utc)
+    runs = [_run()]
+    monkeypatch.setattr(poller, "_gh_api", _api(_pr(), [], runs))
+    _, cursor = poller._check_pr_ci_failures("o/r", SINCE, "token", "mimir-bot", {}, now=now)
+    key = cursor["42:attention"]["delivery_key"]
+    # Even an overlapping process with an old cursor respects the atomic claim.
+    count, _ = poller._check_pr_ci_failures("o/r", SINCE, "token", "mimir-bot", {}, now=now)
+    assert count == 0
+    count, _ = poller._check_pr_ci_failures(
+        "o/r", SINCE, "token", "mimir-bot", cursor, now=now + timedelta(minutes=1),
+    )
+    assert count == 0
+    count, cursor = poller._check_pr_ci_failures(
+        "o/r", SINCE, "token", "mimir-bot", cursor,
+        now=now + poller.CI_DELIVERY_RETRY_INTERVAL,
+    )
+    assert count == 1
+    assert [e["delivery_key"] for e in captured_emits] == [key, key]
+    digest = hashlib.sha256(key.encode()).hexdigest()
+    receipt = tmp_path / poller._DELIVERY_RECEIPTS_DIR / digest
+    receipt.parent.mkdir()
+    receipt.touch()
+    count, cursor = poller._check_pr_ci_failures(
+        "o/r", SINCE, "token", "mimir-bot", cursor, now=now + timedelta(hours=1),
+    )
+    assert count == 0 and receipt.exists()
+    runs.append(_run(51, conclusion="success"))
+    count, cursor = poller._check_pr_ci_failures(
+        "o/r", SINCE, "token", "mimir-bot", cursor, now=now + timedelta(hours=2),
+    )
+    assert count == 0 and "42:attention" not in cursor
+    assert not receipt.exists()
+    assert not (tmp_path / poller._DELIVERY_CLAIMS_DIR / digest).exists()
+
+
+@pytest.mark.parametrize("listing", [
+    None, poller._GH_API_BUDGET_REFUSED, {},
+    {"workflow_runs": [_run()], "total_count": 2},
+    {"workflow_runs": [None], "total_count": 1},
+])
+@pytest.mark.parametrize("existing", [False, True])
+def test_run_listing_failure_preserves_both_cursors_and_window(
+    monkeypatch, captured_emits, listing, existing,
+):
+    prior = {"_last_checked": SINCE}
+    if existing:
+        prior.update({"42": {"delivery_key": "failure"}, "42:attention": {"delivery_key": "attention"}})
+    api = _api(_pr(), [_check()], [_run()])
+    monkeypatch.setattr(poller, "_gh_api", lambda endpoint, token: (
+        listing if "/actions/runs?" in endpoint else api(endpoint, token)
+    ))
+    monkeypatch.setattr(poller, "_remove_delivery_artifacts", lambda *a: pytest.fail("discarded receipt"))
+    count, cursor = poller._check_pr_ci_failures(
+        "o/r", "2026-08-16T10:10:00Z", "token", "mimir-bot", prior,
+    )
+    assert count == 0 and cursor == prior and captured_emits == []
+
+
+@pytest.mark.parametrize("change", [
+    {"head_sha": "c" * 40}, {"status": "in_progress"}, {"conclusion": "success"},
+])
+def test_only_completed_cancelled_current_head_runs_are_classified(monkeypatch, captured_emits, change):
+    monkeypatch.setattr(poller, "_gh_api", _api(_pr(), [], [_run(**change)]))
+    monkeypatch.setattr(poller, "classify_cancelled_run", lambda *a: pytest.fail("ineligible run"))
+    count, _ = poller._check_pr_ci_failures("o/r", SINCE, "token", "mimir-bot", {})
+    assert count == 0 and captured_emits == []
+
+
+def test_run_listing_recovers_without_losing_attention(monkeypatch, captured_emits):
+    api = _api(_pr(), [], [_run()])
+    monkeypatch.setattr(poller, "_gh_api", lambda endpoint, token: (
+        None if "/actions/runs?" in endpoint else api(endpoint, token)
+    ))
+    count, cursor = poller._check_pr_ci_failures("o/r", SINCE, "token", "mimir-bot", {})
+    assert count == 0 and cursor == {"_last_checked": SINCE}
+    monkeypatch.setattr(poller, "_gh_api", api)
+    count, _ = poller._check_pr_ci_failures(
+        "o/r", "2026-08-16T10:10:00Z", "token", "mimir-bot", cursor,
+    )
+    assert count == 1 and captured_emits[0]["event_type"] == "pr_ci_attention"
+
+
+def test_old_cancelled_run_is_baselined_without_retry(monkeypatch, captured_emits):
+    monkeypatch.setattr(poller, "_gh_api", _api(
+        _pr(), [], [_run(updated_at="2026-08-16T09:00:00Z")],
+    ))
+    now = datetime(2026, 8, 16, 10, 2, tzinfo=timezone.utc)
+    count, cursor = poller._check_pr_ci_failures(
+        "o/r", SINCE, "token", "mimir-bot", {}, now=now,
+    )
+    assert count == 0 and cursor["42:attention"]["baseline"] is True
+    count, _ = poller._check_pr_ci_failures(
+        "o/r", SINCE, "token", "mimir-bot", cursor, now=now + timedelta(hours=1),
+    )
+    assert count == 0 and captured_emits == []
