@@ -24,9 +24,13 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
+import signal
 import subprocess
+import sys
 from pathlib import Path
 from typing import Any
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 
@@ -35,6 +39,562 @@ from mimir.event_logger import init_logger
 
 
 # ─── fixtures ────────────────────────────────────────────────────────
+
+
+@pytest.fixture
+def fake_git_process(monkeypatch):
+    proc = Mock(pid=12345, returncode=None)
+    proc.communicate = AsyncMock(return_value=(b"", b""))
+    proc.wait = AsyncMock(return_value=-9)
+    proc.kill_group = Mock()
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", AsyncMock(return_value=proc))
+    if os.name == "posix":
+        monkeypatch.setattr(os, "killpg", proc.kill_group)
+    else:
+        proc.kill = proc.kill_group
+    return proc
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(sys.platform != "linux", reason="Linux process-group and pipe regression")
+@pytest.mark.parametrize("cancel", [False, True], ids=["timeout", "cancel"])
+@pytest.mark.parametrize("parent_exited", [False, True], ids=["live-parent", "exited-parent"])
+async def test_git_group_drained_before_rebase_abort(
+    tmp_path, monkeypatch, cancel, parent_exited,
+):
+    import fcntl
+
+    spawn = asyncio.create_subprocess_exec
+    ready = asyncio.Event()
+    processes, child_pids, aborted = [], [], []
+    # Linux alone does not imply these optional CPython build capabilities.
+    # Exercise the hosted-CI capability set even on a pidfd-enabled interpreter.
+    monkeypatch.delattr(os, "pidfd_open", raising=False)
+    monkeypatch.delattr(signal, "pidfd_send_signal", raising=False)
+    monkeypatch.setattr(git_tracking, "CLEANUP_JOIN_TIMEOUT", 1.0)
+
+    def writer_released():
+        # The acknowledgement is written only after the child acquires this
+        # lock, which it never explicitly releases. Unlock proves it can no
+        # longer mutate the repository, not that it has reached zombie state.
+        with (tmp_path / "writer.lock").open("a") as guard:
+            try:
+                fcntl.flock(guard, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                return False
+            return True
+
+    async def wait_writer_released():
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + 5
+        while not writer_released():
+            assert loop.time() < deadline, "child still holds writer.lock after cleanup"
+            await asyncio.sleep(0.001)
+
+    # Own the reader limit and observe its public transport state instead of
+    # guessing when asyncio's private StreamReader._paused flag will flip.
+    class ObservedReader(asyncio.StreamReader):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.received = 0
+            self.transport = None
+
+        def set_transport(self, transport):
+            super().set_transport(transport)
+            self.transport = transport
+
+        def feed_data(self, data):
+            super().feed_data(data)
+            self.received += len(data)
+
+        def saturated(self):
+            return self.received > 2048 and not self.transport.is_reading()
+
+        def diagnostic(self):
+            return (f"received={self.received}, "
+                    f"reading={self.transport.is_reading()}, eof={self.at_eof()}")
+
+    child_source = (
+        "import fcntl, os, time; from pathlib import Path; "
+        "guard = open('writer.lock', 'w'); "
+        "fcntl.flock(guard, fcntl.LOCK_EX); "
+        "Path('child.pid').write_text(str(os.getpid())); "
+        "os.write(1, b'x' * 1048576); time.sleep(300)"
+    )
+    parent_source = (
+        "import os, subprocess, sys, time; "
+        f"subprocess.Popen([sys.executable, '-c', {child_source!r}]); "
+        + ("os._exit(0)" if parent_exited else
+           "os.write(2, b'y' * 1048576); time.sleep(300)")
+    )
+
+    setup_errors = []
+    monkeypatch.setattr(asyncio.streams, "StreamReader", ObservedReader)
+
+    async def git_process(*args, **kwargs):
+        try:
+            proc = await spawn(sys.executable, "-c", parent_source, limit=1024, **kwargs)
+            processes.append(proc)
+            loop = asyncio.get_running_loop()
+            deadline = loop.time() + 8
+            pid_file = tmp_path / "child.pid"
+            while not pid_file.exists() or not pid_file.read_text():
+                assert loop.time() < deadline, (
+                    f"child did not acknowledge writer.lock ownership; "
+                    f"parent_returncode={proc.returncode}; "
+                    f"stdout: {proc.stdout.diagnostic()}; "
+                    f"stderr: {proc.stderr.diagnostic()}"
+                )
+                await asyncio.sleep(0.001)
+            child_pids.append(int(pid_file.read_text()))
+            # A killed parent alone cannot close the child's inherited pipes.
+            # With a 1 KiB reader limit, >2 KiB received and a non-reading
+            # transport demonstrate backpressure without inspecting _paused.
+            while not proc.stdout.saturated() or (
+                proc.returncode is None if parent_exited else not proc.stderr.saturated()
+            ):
+                assert loop.time() < deadline, (
+                    f"pipe precondition not reached (parent_exited={parent_exited}, "
+                    f"parent_returncode={proc.returncode}); "
+                    f"stdout: {proc.stdout.diagnostic()}; "
+                    f"stderr: {proc.stderr.diagnostic()}"
+                )
+                await asyncio.sleep(0.001)
+            return proc
+        except Exception as exc:
+            setup_errors.append(exc)
+            raise
+        finally:
+            ready.set()
+
+    async def git(*args, **kwargs):
+        if args[0] == "pull":
+            return await git_tracking._git_once(
+                *args, cwd=tmp_path, timeout=60 if cancel else 0,
+            )
+        if args[:2] == ("rebase", "--abort"):
+            # Recovery must not start while the descendant can still write.
+            assert writer_released(), "rebase abort raced the child writer"
+            assert processes[0].returncode is not None
+            assert processes[0].stdout.at_eof()
+            assert processes[0].stderr.at_eof()
+            aborted.append(True)
+        return git_tracking.GitResult("", "")
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", git_process)
+    monkeypatch.setattr(git_tracking, "_git", git)
+    monkeypatch.setattr(
+        git_tracking, "_reconcile_redundant_remote_changes", AsyncMock(return_value=False),
+    )
+    task = asyncio.create_task(git_tracking._sync_remote_before_push(
+        home=tmp_path, turn_id="group-cleanup", branch="main",
+    ))
+    try:
+        await asyncio.wait_for(ready.wait(), 10)
+        if setup_errors:
+            raise setup_errors[0]
+        if cancel:
+            task.cancel()
+        # A hang guard, not a process-startup or performance assertion. Do not
+        # use wait_for(task): cancellation-resistant cleanup could hang that too.
+        done, _ = await asyncio.wait([task], timeout=5)
+        assert task in done, "Git cleanup hung on inherited or paused pipes"
+        if parent_exited:
+            # The child deliberately outlives an already-reaped group leader.
+            # Its former numeric PID is not authority to signal a group. Bound
+            # the failed drain and refuse rebase recovery while the writer lives.
+            with pytest.raises(git_tracking.GitCleanupTimeout):
+                await task
+            assert aborted == []
+            assert not writer_released(), "exited-parent case lost its live writer"
+            return
+        if cancel:
+            with pytest.raises(asyncio.CancelledError):
+                await task
+        else:
+            assert await task is False
+        assert aborted == [True]
+        await wait_writer_released()
+    finally:
+        # Also clean up the deliberately broken implementation in the red run.
+        # Only signal the test's acknowledged writer while it retains its lock;
+        # do not signal a numeric PID after observing its lifetime has ended.
+        for pid in child_pids:
+            if not writer_released():
+                try:
+                    os.kill(pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+        async def bounded_join(awaitable):
+            owned = asyncio.ensure_future(awaitable)
+            done, _ = await asyncio.wait([owned], timeout=2)
+            if not done:
+                owned.cancel()
+                owned.add_done_callback(git_tracking._consume_cleanup_result)
+            elif not owned.cancelled():
+                # Cleanup must not replace the original assertion/exception.
+                owned.exception()
+
+        for proc in processes:
+            if proc.returncode is None:
+                proc.kill()
+            await bounded_join(proc.communicate())
+            await bounded_join(proc.wait())
+        task.cancel()
+        await bounded_join(task)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("success", [False, True], ids=["superseded", "push-success"])
+async def test_git_worker_join_releases_home_lock(tmp_path, monkeypatch, success):
+    ready = asyncio.Event()
+    finished = []
+
+    async def worker():
+        ready.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            async with git_tracking._get_lock(tmp_path):
+                finished.append(True)
+
+    old = asyncio.create_task(worker())
+    key = git_tracking._home_key(tmp_path)
+    git_tracking._push_retry_tasks[key] = old
+    await ready.wait()
+    monkeypatch.setattr(git_tracking, "DEBOUNCE_SECONDS", 0 if success else 60)
+    monkeypatch.setattr(git_tracking, "_has_origin_remote", AsyncMock(return_value=True))
+    monkeypatch.setattr(git_tracking, "_current_branch", AsyncMock(return_value="main"))
+    monkeypatch.setattr(git_tracking, "_sync_remote_before_push", AsyncMock(return_value=True))
+    monkeypatch.setattr(git_tracking, "_git", AsyncMock())
+    operation = git_tracking._debounced_push if success else git_tracking._schedule_debounced_push
+    task = asyncio.create_task(operation(home=tmp_path, turn_id="join"))
+    try:
+        done, _ = await asyncio.wait([task], timeout=5)
+        assert task in done, "worker cleanup is waiting on the joiner's home lock"
+        await task
+        assert finished == [True]
+    finally:
+        old.cancel()
+        await asyncio.gather(old, task, return_exceptions=True)
+        await git_tracking.cancel_pending_pushes()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("blob", [False, True])
+@pytest.mark.parametrize("failure", [asyncio.CancelledError, OSError, asyncio.TimeoutError])
+async def test_subprocess_failure_kills_and_reaps(tmp_path, fake_git_process, blob, failure):
+    proc = fake_git_process
+    proc.communicate.side_effect = [failure, (b"", b"")]
+    if blob and failure is not asyncio.CancelledError:
+        assert not await git_tracking._blob_equal(
+            home=tmp_path, left="HEAD", right="origin/main", path="a",
+        )
+    else:
+        with pytest.raises(failure):
+            if blob:
+                await git_tracking._blob_equal(
+                    home=tmp_path, left="HEAD", right="origin/main", path="a",
+                )
+            else:
+                await git_tracking._git_once("status", cwd=tmp_path, timeout=1)
+    if os.name == "posix":
+        proc.kill_group.assert_called_once_with(proc.pid, signal.SIGKILL)
+    else:
+        proc.kill_group.assert_called_once_with()
+    assert proc.communicate.await_count == 2
+    proc.wait.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("returncode", [0, 1])
+async def test_completed_git_never_signals_or_communicates_twice(
+    tmp_path, fake_git_process, returncode,
+):
+    proc = fake_git_process
+    proc.returncode = returncode
+    assert await git_tracking._git_bytes("status", cwd=tmp_path, timeout=1) == (
+        returncode, b"", b"",
+    )
+    proc.kill_group.assert_not_called()
+    proc.communicate.assert_awaited_once()
+    proc.wait.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_reaper_does_not_signal_reaped_pid(fake_git_process):
+    proc = fake_git_process
+    proc.returncode = 0
+    await git_tracking._reap_git_process(proc)
+    proc.kill_group.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_cleanup_deadline_survives_repeated_cancellation(monkeypatch, caplog):
+    monkeypatch.setattr(git_tracking, "CLEANUP_JOIN_TIMEOUT", 0.05)
+    release = asyncio.Event()
+    started = asyncio.Event()
+
+    async def resistant():
+        started.set()
+        while not release.is_set():
+            try:
+                await release.wait()
+            except asyncio.CancelledError:
+                pass
+
+    owned = asyncio.create_task(resistant())
+    joiner = asyncio.create_task(git_tracking._finish_cleanup(owned))
+    await started.wait()
+
+    async def cancel_repeatedly():
+        while not joiner.done():
+            joiner.cancel()
+            await asyncio.sleep(0.005)
+
+    canceller = asyncio.create_task(cancel_repeatedly())
+    try:
+        done, _ = await asyncio.wait([joiner], timeout=1)
+        assert joiner in done, "cancellation reset or escaped the cleanup deadline"
+        with pytest.raises(git_tracking.GitCleanupTimeout):
+            await joiner
+        assert "Git cleanup did not join" in caplog.text
+        assert not owned.done()  # Bounded join does not pretend the work stopped.
+    finally:
+        release.set()
+        canceller.cancel()
+        await asyncio.gather(owned, canceller, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_cleanup_timeout_is_not_hidden_by_outer_cancellation():
+    started, release = asyncio.Event(), asyncio.Event()
+
+    async def cleanup():
+        started.set()
+        await release.wait()
+        raise git_tracking.GitCleanupTimeout("nested failure")
+
+    task = asyncio.create_task(git_tracking._finish_cleanup(cleanup()))
+    await started.wait()
+    task.cancel()
+    await asyncio.sleep(0)
+    release.set()
+    with pytest.raises(git_tracking.GitCleanupTimeout, match="nested failure"):
+        await task
+
+
+@pytest.mark.asyncio
+async def test_cleanup_propagates_cancellation_after_success(monkeypatch):
+    started, release = asyncio.Event(), asyncio.Event()
+
+    async def cleanup():
+        started.set()
+        await release.wait()
+        return 42
+
+    task = asyncio.create_task(git_tracking._finish_cleanup(cleanup()))
+    await started.wait()
+    task.cancel()
+    await asyncio.sleep(0)
+    release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+
+@pytest.mark.asyncio
+async def test_cancelled_pull_aborts_without_reconciling(tmp_path, monkeypatch):
+    async def git(*args, **kwargs):
+        if args[0] == "pull":
+            raise asyncio.CancelledError
+        return git_tracking.GitResult("", "")
+
+    command = AsyncMock(side_effect=git)
+    reconcile = AsyncMock()
+    monkeypatch.setattr(git_tracking, "_git", command)
+    monkeypatch.setattr(git_tracking, "_reconcile_redundant_remote_changes", reconcile)
+    with pytest.raises(asyncio.CancelledError):
+        await git_tracking._sync_remote_before_push(
+            home=tmp_path, turn_id="cancel", branch="main",
+        )
+    assert ("rebase", "--abort") in [call.args for call in command.await_args_list]
+    reconcile.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("retry", [False, True])
+@pytest.mark.parametrize("stage", ["sleep", "push"])
+async def test_push_worker_propagates_cancellation(tmp_path, monkeypatch, retry, stage):
+    monkeypatch.setattr(git_tracking, "DEBOUNCE_SECONDS", 0)
+    monkeypatch.setattr(git_tracking, "_has_origin_remote", AsyncMock(return_value=True))
+    monkeypatch.setattr(git_tracking, "_current_branch", AsyncMock(return_value="main"))
+    monkeypatch.setattr(git_tracking, "_sync_remote_before_push", AsyncMock(return_value=True))
+    monkeypatch.setattr(git_tracking, "_git", AsyncMock(side_effect=asyncio.CancelledError))
+    if stage == "sleep":
+        monkeypatch.setattr(asyncio, "sleep", AsyncMock(side_effect=asyncio.CancelledError))
+    with pytest.raises(asyncio.CancelledError):
+        if retry:
+            await git_tracking._retry_push(home=tmp_path, delay=0, attempt=0, turn_id="cancel")
+        else:
+            await git_tracking._debounced_push(home=tmp_path, turn_id="cancel")
+    assert not git_tracking._push_retry_tasks
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("blob", [False, True])
+async def test_cancel_reaps_real_child(tmp_path, monkeypatch, blob):
+    spawn = asyncio.create_subprocess_exec
+    ready = asyncio.Event()
+    processes = []
+
+    async def child(*args, **kwargs):
+        proc = await spawn(
+            sys.executable, "-c",
+            "import time; print('ready', flush=True); time.sleep(300)",
+            **kwargs,
+        )
+        processes.append(proc)
+        assert await proc.stdout.readline() == b"ready\n"
+        ready.set()
+        return proc
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", child)
+    operation = (
+        git_tracking._blob_equal(home=tmp_path, left="a", right="b", path="x")
+        if blob else git_tracking._git_once("status", cwd=tmp_path, timeout=60)
+    )
+    task = asyncio.create_task(operation)
+    try:
+        await ready.wait()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert processes[0].returncode is not None
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        for proc in processes:
+            if proc.returncode is None:
+                proc.kill()
+            await proc.wait()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stage", ["drain", "wait"])
+async def test_repeated_cancel_waits_for_reaping(tmp_path, fake_git_process, stage):
+    reaping, release = asyncio.Event(), asyncio.Event()
+    proc = fake_git_process
+    proc.communicate.side_effect = [asyncio.CancelledError, (b"", b"")]
+
+    async def wait():
+        reaping.set()
+        await release.wait()
+        proc.returncode = -9
+
+    if stage == "drain":
+        async def communicate():
+            if not proc.kill_group.called:
+                raise asyncio.CancelledError
+            await wait()
+            return b"", b""
+
+        proc.communicate.side_effect = communicate
+    else:
+        proc.wait = AsyncMock(side_effect=wait)
+    task = asyncio.create_task(git_tracking._git_once("status", cwd=tmp_path, timeout=1))
+    try:
+        # On the broken implementation the task exits without ever entering wait().
+        entered = asyncio.create_task(reaping.wait())
+        await asyncio.wait([task, entered], return_when=asyncio.FIRST_COMPLETED)
+        assert reaping.is_set()
+        task.cancel()
+        await asyncio.sleep(0)
+        assert not task.done()
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert proc.returncode == -9
+    finally:
+        release.set()
+        entered.cancel()
+        await asyncio.gather(task, entered, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_cancel_during_spawn_reaps_result(tmp_path, monkeypatch, fake_git_process):
+    spawning, release = asyncio.Event(), asyncio.Event()
+    proc = fake_git_process
+
+    async def spawn(*args, **kwargs):
+        spawning.set()
+        await release.wait()
+        return proc
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", spawn)
+    task = asyncio.create_task(git_tracking._git_once("status", cwd=tmp_path, timeout=1))
+    try:
+        await spawning.wait()
+        task.cancel()
+        await asyncio.sleep(0)
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        proc.kill_group.assert_called_once()
+        proc.communicate.assert_awaited_once()
+        proc.wait.assert_awaited_once()
+    finally:
+        release.set()
+        await asyncio.gather(task, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_blob_show_timeout_is_bounded(tmp_path, monkeypatch, fake_git_process):
+    proc = fake_git_process
+    monkeypatch.setattr(git_tracking, "COMMAND_TIMEOUT_SECONDS", 0)
+    assert not await git_tracking._blob_equal(
+        home=tmp_path, left="a", right="b", path="x",
+    )
+    proc.kill_group.assert_called_once()
+    proc.communicate.assert_awaited_once()
+    proc.wait.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", [asyncio.CancelledError, git_tracking.GitError])
+async def test_cancellation_during_abort_finishes_recovery(tmp_path, monkeypatch, failure):
+    aborting, release = asyncio.Event(), asyncio.Event()
+    recovered = []
+
+    async def git(*args, **kwargs):
+        if args[0] == "pull":
+            if failure is asyncio.CancelledError:
+                raise failure()
+            raise failure(1, "conflict", args)
+        if args[:2] == ("rebase", "--abort"):
+            aborting.set()
+            await release.wait()
+            recovered.append(True)
+        return git_tracking.GitResult("", "")
+
+    monkeypatch.setattr(git_tracking, "_git", git)
+    task = asyncio.create_task(git_tracking._sync_remote_before_push(
+        home=tmp_path, turn_id="cancel", branch="main",
+    ))
+    entered = asyncio.create_task(aborting.wait())
+    try:
+        await asyncio.wait([task, entered], return_when=asyncio.FIRST_COMPLETED)
+        assert aborting.is_set()
+        task.cancel()
+        await asyncio.sleep(0)
+        assert not task.done()
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert recovered == [True]
+    finally:
+        release.set()
+        entered.cancel()
+        await asyncio.gather(task, entered, return_exceptions=True)
 
 
 @pytest.fixture(autouse=True)
@@ -518,16 +1078,9 @@ async def test_debounce_reset_cancels_prior_task(
     assert second_task is not first_task
     assert await entered.get() == "t2"
     assert first_task.cancelling()
-    # Yield once so the cancellation settles. The task may either land
-    # in cancelled() state OR exit cleanly via the
-    # "except CancelledError: return" branch in _debounced_push —
-    # both are acceptable; what matters is "no push fired" (asserted
-    # via the no-events check below).
-    try:
+    with pytest.raises(asyncio.CancelledError):
         await first_task
-    except asyncio.CancelledError:
-        pass
-    assert first_task.done()
+    assert first_task.cancelled()
 
     # No push event should have fired during the debounce window.
     events = _read_events(tmp_path)

@@ -20,8 +20,11 @@ from typing import Any, Final, TextIO
 
 from ._jsonl_tail import _tail_lines, count_lines_chunked
 from .redaction import redact_payload
+from .background_io import run_in_pool
 
 log = logging.getLogger(__name__)
+
+_EVENT_POOL = ThreadPoolExecutor(max_workers=1, thread_name_prefix="event-log")
 
 FEEDBACK_EVENT_VERSION: Final[str] = "v1"
 PROCESS_LOCK_TIMEOUT_SECONDS = 1.0
@@ -204,7 +207,7 @@ class EventLogger:
                 self._append_record_sync(self._record(event_type, payload, header=record))
 
             async with self._ensure_lock():
-                await asyncio.to_thread(redact_and_append)
+                await run_in_pool(_EVENT_POOL, redact_and_append)
                 # Hysteresis: trim only when over cap by ≥10%. Without the
                 # buffer, every event past the cap triggers an O(file)
                 # rewrite — a high-throughput agent under a small cap pays
@@ -312,7 +315,7 @@ class EventLogger:
         if not self._max_events:
             return
         try:
-            await asyncio.to_thread(self._trim_sync)
+            await run_in_pool(_EVENT_POOL, self._trim_sync)
         except OSError as exc:
             log.warning("events.jsonl trim failed: %s", exc)
 

@@ -401,7 +401,6 @@ async def _call_claude_code_async(
         )
     except ImportError:
         log.warning("claude-agent-sdk not installed; falling back to openai_compat")
-        import asyncio
         return await asyncio.to_thread(
             _call_openai_compat, llm,
             prompt=prompt, max_tokens=max_tokens,
@@ -409,15 +408,29 @@ async def _call_claude_code_async(
         )
 
     pool = _get_async_claude_pool()
-    runner = await pool.acquire()
+    timeout = float(llm.get("timeout", 30))
+    runner = None
+    reusable = False
     try:
-        return await runner.call(
-            prompt=prompt,
-            model=llm.get("model"),
-            system=system,
-        )
+        # Queueing and SDK work share one budget, not one per response chunk.
+        async with asyncio.timeout(timeout):
+            runner = await pool.acquire()
+            result = await runner.call(
+                prompt=prompt,
+                model=llm.get("model"),
+                system=system,
+            )
+            reusable = True
+            return result
+    except Exception as exc:  # noqa: BLE001
+        log.warning("async claude-code call failed: %s", exc)
+        return ""
     finally:
-        await pool.release(runner)
+        if runner is not None:
+            if reusable:
+                await pool.release(runner)
+            else:
+                await pool.discard(runner, timeout=timeout)
 
 
 class _AsyncClaudeRunner:
@@ -444,9 +457,8 @@ class _AsyncClaudeRunner:
 
     async def call(self, *, prompt: str, model: str | None, system: str | None) -> str:
         """Submit a prompt to the warm client and return the flattened
-        reply text. Empty string on transport failure (matches
-        sync-path semantics so saga's existing call sites swallow
-        gracefully)."""
+        reply text. Transport failures propagate so the caller can discard
+        the runner rather than reuse a potentially desynchronized stream."""
         try:
             from claude_agent_sdk import AssistantMessage
         except ImportError:
@@ -474,7 +486,7 @@ class _AsyncClaudeRunner:
             return "".join(pieces).strip()
         except Exception as exc:  # noqa: BLE001
             log.warning("async claude-code call failed: %s", exc)
-            return ""
+            raise
 
     async def _reset_client(self, *, model: str | None, system: str | None) -> None:
         """Disconnect any current client + spin up a fresh one connected
@@ -495,8 +507,9 @@ class _AsyncClaudeRunner:
             options_kwargs["system_prompt"] = system
 
         client = ClaudeSDKClient(options=ClaudeAgentOptions(**options_kwargs))
-        await client.connect()
+        # Retain even a partially connected client for failure cleanup.
         self._client = client
+        await client.connect()
         self._client_model = model
         self._call_count = 0
 
@@ -531,12 +544,12 @@ class _AsyncClaudePool(BoundedAsyncPool["_AsyncClaudeRunner"]):
 
     Recycle policy is per-runner (the runner tracks its own call count
     and reconnects every N calls). The pool itself doesn't churn
-    runners — once created they live until the pool is closed."""
+    healthy runners; failed or interrupted calls discard their runner."""
 
     def __init__(self, max_size: int, recycle_after: int) -> None:
         super().__init__(max_size)
         self._recycle_after = recycle_after
-        self._size = 0  # idle + in-flight, never decremented
+        self._size = 0  # idle + in-flight
 
     @property
     def size(self) -> int:
@@ -569,6 +582,19 @@ class _AsyncClaudePool(BoundedAsyncPool["_AsyncClaudeRunner"]):
         async with cond:
             self._idle.append(runner)
             cond.notify()
+
+    async def discard(self, runner: "_AsyncClaudeRunner", *, timeout: float) -> None:
+        """Close a broken runner without letting cleanup strand pool capacity."""
+        try:
+            async with asyncio.timeout(timeout):
+                await runner.aclose()
+        except Exception as exc:  # noqa: BLE001
+            log.warning("async claude-code discard failed: %s", exc)
+        finally:
+            cond = self._condition()
+            async with cond:
+                self._size -= 1
+                cond.notify()
 
     async def aclose(self) -> None:
         """Disconnect all idle runners and reset state. Used by tests
