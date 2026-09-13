@@ -1337,6 +1337,7 @@ async def test_worklink_run_arbiter_gate_does_not_block_loop(_tool_env) -> None:
             worker_thread = threading.get_ident()
             passed_loop = event_loop
             entered.set()
+            # Hang guard for a broken inline gate, not the normal release path.
             release.wait(timeout=1)
             finished = True
             return _FakeDecision(False, priority=priority)
@@ -1344,8 +1345,6 @@ async def test_worklink_run_arbiter_gate_does_not_block_loop(_tool_env) -> None:
     registry.set_arbiter(SlowArbiter())
     loop = asyncio.get_running_loop()
     loop_thread = threading.get_ident()
-    timer = threading.Timer(0.1, release.set)
-    timer.start()
     try:
         run_task = asyncio.create_task(
             registry.worklink_run.ainvoke({"issue_id": 443})
@@ -1353,10 +1352,10 @@ async def test_worklink_run_arbiter_gate_does_not_block_loop(_tool_env) -> None:
         while not entered.is_set():
             await asyncio.sleep(0)
         progressed_before_gate_finished = not finished
+        release.set()
         out = await run_task
     finally:
         release.set()
-        timer.cancel()
 
     assert progressed_before_gate_finished
     assert worker_thread != loop_thread
