@@ -735,7 +735,10 @@ async def test_postauth_watchdog_terminates_non_draining_peer(
     daemon._agent = Agent()
     monkeypatch.setattr("mimir.acp.daemon.run_stdio_agent", runner)
     monkeypatch.setattr("mimir.acp.daemon.ACP_PEER_WATCHDOG_INTERVAL", 0.0)
+    # Fit drain, runner cancellation/abort, and writer close inside the 0.1s bound.
     monkeypatch.setattr("mimir.acp.daemon.ACP_PEER_DRAIN_TIMEOUT", 0.01)
+    monkeypatch.setattr("mimir.acp.daemon.ACP_PEER_CANCEL_TIMEOUT", 0.01)
+    monkeypatch.setattr("mimir.acp.daemon.ACP_PEER_ABORT_TIMEOUT", 0.01)
     writer = BlockedWriter()
     with pytest.raises(AcpDaemonError, match="stopped draining"):
         await asyncio.wait_for(
