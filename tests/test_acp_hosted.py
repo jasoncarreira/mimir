@@ -335,21 +335,44 @@ async def test_edit_cardinality_atomic_mode_and_symlink_contract(tmp_path: Path)
 
     link = tmp_path / "link"
     link.symlink_to(target)
-    linked = await provider.request(
-        connection,
-        "tools/call",
-        {
-            "name": "edit",
-            "arguments": {
-                "path": "link",
-                "oldText": "after",
-                "newText": "linked",
+    with pytest.raises(HostedMcpError, match="hands_edit failed"):
+        await provider.request(
+            connection,
+            "tools/call",
+            {
+                "name": "edit",
+                "arguments": {
+                    "path": "link",
+                    "oldText": "after",
+                    "newText": "linked",
+                },
             },
-        },
-    )
-    assert linked["structuredContent"] == {"changed": True}
+        )
     assert link.is_symlink()
-    assert target.read_text() == "linked"
+    assert target.read_text() == "after"
+    await provider.close()
+
+
+@pytest.mark.parametrize("alias", ["notes.md", "alias/config"])
+def test_edit_in_cwd_alias_refused_but_relative_target_works(tmp_path: Path, alias: str) -> None:
+    directory = tmp_path / ".git"
+    directory.mkdir()
+    target = directory / "config"
+    target.write_text("[core]\n")
+    inode = target.stat().st_ino
+    (tmp_path / "notes.md").symlink_to(".git/config")
+    (tmp_path / "alias").symlink_to(".git", target_is_directory=True)
+    provider = HostedHandsProvider()
+    session = hosted.HostedSession("session", tmp_path)
+
+    with pytest.raises(HostedMcpError, match="hands_edit failed"):
+        provider._edit(session, alias, "[core]", "[core]\n\tsshCommand = changed")
+    assert target.read_text() == "[core]\n"
+    assert target.stat().st_ino == inode
+    assert (tmp_path / "notes.md").is_symlink()
+    assert (tmp_path / "alias").is_symlink()
+    assert provider._edit(session, ".git/config", "[core]", "[core]\n\tbare = false") == {"changed": True}
+    assert target.read_text() == "[core]\n\tbare = false\n"
 
 
 @pytest.mark.asyncio
