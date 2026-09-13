@@ -88,6 +88,7 @@ _WEB_KEY_FIELD = "mimir.webKey"
 #: with ``ifc_label_blocked:same_channel``. Both sites must use this constant.
 _ACP_BRIDGE_INSTANCE = "acp-stdio"
 ACP_PROMPT_CANCEL_GRACE_SECONDS = 2.0
+ACP_SESSION_DETACH_GRACE_SECONDS = 2.0
 ACP_GENERATION_RETIRE_GRACE_SECONDS = 2.0
 ACP_GENERATION_RETIRE_CANCEL_SECONDS = 2.0
 ACP_DISCONNECT_TIMEOUT_SECONDS = 1.0
@@ -640,6 +641,9 @@ class MimirAcpAgent:
             state = SessionState(record, SessionEnvironment(cwd, copy.deepcopy(mcp_servers)), self._generation, declaration, MIMIR_HANDS_V1 if declaration else None, execution_session_key=max(self._execution_keys.get(session_id, 0), self._sessions.get(session_id, SessionState(record, SessionEnvironment(cwd, None), self._generation)).execution_session_key) + 1)
             await self._admit_provider(state)
             await journal.send_replay(client)
+            # Detachment can refuse a still-running turn. The admitted candidate
+            # must be discarded and the prior session restored on that path too.
+            await self._detach_session(session_id)
         except RequestError:
             if state is not None:
                 await self._discard_candidate(state)
@@ -660,7 +664,6 @@ class MimirAcpAgent:
             else:
                 self._journals.release(session_id)
             raise internal_error() from None
-        await self._detach_session(session_id)
         self._journals.open(record, client)
         self._install_state(state)
         return LoadSessionResponse()
@@ -1392,8 +1395,14 @@ class MimirAcpAgent:
         if active is not None:
             await self._cancel_active(active, transport=False)
             # Cancellation's grace period may expire, or another caller may
-            # already be cancelling. Neither permits replacing a running turn.
-            await active.completed.wait()
+            # already be cancelling. Refuse rather than replace a live turn or
+            # hold the peer's request runner indefinitely; load can be retried.
+            try:
+                await asyncio.wait_for(active.completed.wait(), ACP_SESSION_DETACH_GRACE_SECONDS)
+            except TimeoutError:
+                raise RequestError(
+                    -32003, "Session turn is still stopping; retry session/load after it completes",
+                ) from None
         session_id = state.record.session_id
         connection = self._connections.get(state.generation)
         provider = state.provider
