@@ -1442,6 +1442,25 @@ async def test_requeue_front_delivers_when_worker_already_retired(tmp_path: Path
 
 
 @pytest.mark.asyncio
+async def test_requeue_front_reports_partial_acceptance(tmp_path: Path):
+    from dataclasses import replace
+
+    seen = []
+
+    async def runner(event):
+        seen.append(event.content)
+
+    disp = Dispatcher(replace(_inj_config(tmp_path, ("c",)), max_channel_queue=1), runner)
+    events = [
+        AgentEvent(trigger="user_message", channel_id="c1", content=content)
+        for content in ("first", "second")
+    ]
+    assert disp.requeue_front(events) == 1
+    await disp.drain()
+    assert seen == ["second"]
+
+
+@pytest.mark.asyncio
 async def test_requeue_front_noop_on_empty_or_closed(tmp_path: Path):
     """No events, or a closed dispatcher, is a zero-count no-op (never raises in
     run_turn's finally)."""
