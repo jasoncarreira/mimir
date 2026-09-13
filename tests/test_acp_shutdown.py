@@ -1190,17 +1190,6 @@ libc.recv.argtypes = [ctypes.c_int, ctypes.c_void_p, ctypes.c_size_t, ctypes.c_i
 libc.recv.restype = ctypes.c_ssize_t
 buffer = ctypes.create_string_buffer(2)
 
-# The tee flush acknowledges forwarding, not consumption by the production
-# observer. Wait for actual watchdog startup before taking the diagnostic
-# snapshot, and keep its expiry parent-controlled so scheduling delays cannot
-# turn this observation-only test into a race against the five-second exit.
-watchdog_started = threading.Event()
-class ObservedTimer(InputTimer):
-    def start(self):
-        super().start()
-        watchdog_started.set()
-proxy.threading.Timer = ObservedTimer
-
 def deliver():
     # Losing readability proves libc consumed the first byte of MSG_WAITALL.
     # The peer stays open and never sends the second byte. Target this worker,
@@ -1209,9 +1198,6 @@ def deliver():
         time.sleep(0.001)
     record(b'main-blocked')
     signal.pthread_kill(threading.get_ident(), signal.SIGTERM)
-    # Force the valid cross-thread interleaving that a contiguous-prefix
-    # assertion used to reject, rather than relying on scheduler luck.
-    watchdog_started.wait()
     record(b'worker-signalled')
     _journal_flush()
     os.write(1, b'delivered\n')
@@ -1228,7 +1214,6 @@ asyncio.run(run())
 '''
     process = await asyncio.create_subprocess_exec(
         sys.executable, "-c", source,
-        stdin=asyncio.subprocess.PIPE,
         stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
         cwd=Path(__file__).resolve().parents[1],
     )
@@ -1242,13 +1227,7 @@ asyncio.run(run())
             message = str(failure.value)
             assert "outstanding=Python handler" in message
             assert f"pid={process.pid}, returncode=None" in message
-            # The observer can record watchdog startup between delivery-thread
-            # markers; assert their order without requiring cross-thread adjacency.
-            assert (
-                message.index("handlers-installed\n")
-                < message.index("main-blocked\n")
-                < message.index("worker-signalled\n")
-            )
+            assert "handlers-installed\nmain-blocked\nworker-signalled\n" in message
             assert f"wakeup-byte:{signal.SIGTERM}" in message
             assert "signal-enter:" not in message
             assert "signal-dispatch:" not in message
