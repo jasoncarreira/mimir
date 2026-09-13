@@ -4,6 +4,7 @@ from datetime import UTC, datetime
 import asyncio
 import json
 import shlex
+import shutil
 import subprocess
 import sys
 import pytest
@@ -241,6 +242,93 @@ def _init_gate_repo(tmp_path: Path, test_source: str) -> Path:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("backend", ["opencode", "feature_factory"])
+@pytest.mark.parametrize("injected", [False, True])
+async def test_default_gate_bounds_checkout_environment(tmp_path, monkeypatch, backend, injected):
+    from mimir.worklink.checkout import coding_enabled
+    from mimir.worklink.orchestrator import _runner_for_home
+
+    monkeypatch.delenv("MIMIR_CODING_ENABLED", raising=False)
+    assert not coding_enabled()
+    credentials = (
+        "ANTHROPIC_API_KEY", "GITHUB_TOKEN", "GH_TOKEN", "SLACK_BOT_TOKEN",
+        "DISCORD_TOKEN", "MIMIR_API_KEY", "MIMIR_MODEL_SPEC", "UNLISTED_GATE_SENTINEL",
+    )
+    for name in credentials:
+        monkeypatch.setenv(name, "gate-secret-sentinel")
+    monkeypatch.setenv("PYTEST_ADDOPTS", "-W error")
+    repo = _init_gate_repo(
+        tmp_path,
+        "from pathlib import Path\ndef test_checkout():\n    assert Path('seed.txt').read_text() == 'seed\\n'\n",
+    )
+    # conftest runs before collection, just as backend-authored code would.
+    (repo / "conftest.py").write_text(
+        "import os\n"
+        f"assert not set({credentials!r}) & os.environ.keys()\n"
+        "assert '-W error' in os.environ['PYTEST_ADDOPTS']\n"
+        "assert '--junitxml=' in os.environ['PYTEST_ADDOPTS']\n",
+        encoding="utf-8",
+    )
+    result = await observe_evidence(
+        issue=1684, attempt=1, backend=backend, branch="issue/1684-a1",
+        checkout=repo, started_at=datetime.now(UTC), base_ref="main",
+        backend_status="completed",
+        test_command=f"{shlex.quote(sys.executable)} -m pytest -q test_gate_sample.py",
+        runner=_runner_for_home(tmp_path, "chainlink") if injected else None,
+    )
+    assert result.review_ready, result.evidence.tests
+    assert result.evidence.tests.counts.passed == 1
+    assert result.evidence.tests.report_error is None
+
+
+@pytest.mark.parametrize("injected", [False, True])
+def test_shell_gate_real_uv_has_provisioned_home(tmp_path, monkeypatch, injected):
+    from mimir.worklink.evidence import _run
+    from mimir.worklink.orchestrator import _runner_for_home
+
+    uv = shutil.which("uv")
+    if uv is None:
+        pytest.skip("uv executable required for real cache initialization")
+    monkeypatch.setenv("GITHUB_TOKEN", "gate-secret-sentinel")
+    monkeypatch.setenv("HOME", str(tmp_path / "controller-home"))
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "controller-cache"))
+    probe = tmp_path / "probe.py"
+    probe.write_text(
+        "import json, os\n"
+        "from pathlib import Path\n"
+        "assert 'GITHUB_TOKEN' not in os.environ\n"
+        "home = Path(os.environ['HOME'])\n"
+        "assert home.is_dir()\n"
+        "assert home.stat().st_mode & 0o777 == 0o700\n"
+        "for key in ('XDG_CONFIG_HOME', 'XDG_DATA_HOME', 'XDG_CACHE_HOME'):\n"
+        "    path = Path(os.environ[key])\n"
+        "    assert path.is_dir() and home in path.parents\n"
+        "    (path / 'writable').write_text('yes')\n"
+        "assert (Path(os.environ['XDG_CACHE_HOME']) / 'uv').is_dir()\n"
+        "print(json.dumps(str(home)))\n",
+        encoding="utf-8",
+    )
+    runner = _runner_for_home(tmp_path, "chainlink") if injected else _run
+    # Execute uv itself, not a subprocess mock or bare Python: its startup
+    # creates the cache that failed under /var/lib/mimir-worklink/homes/evidence.
+    # No project/dependency resolution keeps this regression offline.
+    command = (
+        f"{shlex.quote(uv)} run --offline --no-project "
+        f"--python {shlex.quote(sys.executable)} python {shlex.quote(str(probe))}"
+    )
+    homes = []
+    for _ in range(2):
+        result = runner(command, cwd=tmp_path)
+        assert result.returncode == 0, result.stderr
+        home = Path(json.loads(result.stdout))
+        homes.append(home)
+        assert not home.exists(), "gate home must be cleaned after execution"
+    assert homes[0] != homes[1]
+    assert not (tmp_path / "controller-cache").exists()
+    assert not (tmp_path / "controller-home").exists()
+
+
+@pytest.mark.asyncio
 async def test_gate_records_counts_from_pytest_generated_junit(tmp_path: Path) -> None:
     repo = _init_gate_repo(
         tmp_path,
@@ -318,7 +406,7 @@ import pytest
 
 @pytest.mark.parametrize("value", [1], ids=["token=top-secret ; $literal"])
 def test_candidate(value):
-    assert os.environ["WORKLINK_GATE_TEST_ENV"] == "same"
+    assert "WORKLINK_GATE_TEST_ENV" not in os.environ
     path = Path("visits")
     visits = int(path.read_text()) if path.exists() else 0
     path.write_text(str(visits + 1))
@@ -580,10 +668,11 @@ async def test_observe_evidence_sees_untracked_files(tmp_path: Path) -> None:
         started_at=datetime(2026, 6, 11, 5, tzinfo=UTC),
         base_ref="main",
         backend_status="completed",
-        test_command="python -c 'import sys; sys.exit(0)'",
+        # The bounded gate PATH need not contain the active Python (e.g. macOS).
+        test_command=f"{shlex.quote(sys.executable)} -c 'import sys; sys.exit(0)'",
     )
 
-    assert result.review_ready is True
+    assert result.review_ready is True, result.evidence.tests
     assert result.evidence.files_changed == ["new_module.py"]
 
 
@@ -611,7 +700,8 @@ async def test_observe_evidence_sees_committed_backend_work(tmp_path: Path) -> N
         started_at=datetime(2026, 6, 11, 5, tzinfo=UTC),
         base_ref="main",
         backend_status="completed",
-        test_command="python -c 'import sys; sys.exit(0)'",
+        # The bounded gate PATH need not contain the active Python (e.g. macOS).
+        test_command=f"{shlex.quote(sys.executable)} -c 'import sys; sys.exit(0)'",
     )
 
     assert result.review_ready is True

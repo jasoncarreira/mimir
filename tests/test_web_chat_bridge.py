@@ -238,7 +238,7 @@ async def test_authenticated_web_and_discord_continuity_both_directions(tmp_path
     ]
     assert web_event.author == "jason"
     assert web_event.author_display == "Jason Carreira"
-    assert "Jason Renamed: web question" in render_recent_activity(
+    assert "Jason Renamed:\n| web question" in render_recent_activity(
         discord_activity,
         resolver=resolver,
     )

@@ -29,7 +29,7 @@ from langchain.agents.middleware import AgentMiddleware
 from langchain_core.messages import HumanMessage
 from langgraph.config import get_config
 
-from .prompt_safety import sanitize_prompt_field
+from .prompt_safety import prefix_prompt_body, sanitize_prompt_field
 
 if TYPE_CHECKING:
     from .models import AgentEvent, AuthContext
@@ -458,7 +458,7 @@ def render_injected_message(
         f", msg_id: {sanitize_prompt_field(event.source_id)}"
         if event.source_id else ""
     )
-    body = event.content or "(no content)"
+    body = prefix_prompt_body(event.content or "(no content)")
     if event.attachment_names:
         paths = "\n".join(
             f"- {sanitize_prompt_field(path)}" for path in event.attachment_names
