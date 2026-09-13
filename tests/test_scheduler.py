@@ -2469,11 +2469,12 @@ async def test_fire_poller_parked_run_releases_permit_and_lock(
     sched.add_poller_jobs(skills)
     monkeypatch.setattr(sched, "_effective_poller_timeout", mock.AsyncMock(return_value=7.0))
     monkeypatch.setattr(scheduler_module, "POLLER_EXIT_GRACE_SECONDS", 0.5)
+    monkeypatch.setattr(scheduler_module, "POLLER_DISPATCH_BACKSTOP_SECONDS", 120.0)
 
     deadlines = []
 
     def controlled_timeout(delay):
-        assert delay == 8.5
+        assert delay == 128.5
         timer = asyncio.timeout(None)
         deadlines.append(timer)
         return timer
@@ -2522,7 +2523,7 @@ async def test_fire_poller_parked_run_releases_permit_and_lock(
     assert not sched._poller_fire_locks["p1"].locked()
     deadline_events = [payload for kind, payload in events if kind == "poller_fire_deadline_exceeded"]
     assert deadline_events == ([] if external_cancel else [{
-        "poller": "p1", "timeout_seconds": 7.0, "deadline_seconds": 8.5,
+        "poller": "p1", "timeout_seconds": 7.0, "deadline_seconds": 128.5,
     }])
 
     recovered = mock.AsyncMock()

@@ -89,6 +89,11 @@ UTC = timezone.utc
 #: makes APScheduler skip it. Keeping the timeout strictly under the cadence
 #: means a slow run degrades into a late result rather than a lost tick.
 POLLER_CADENCE_MARGIN_SECONDS = 10.0
+#: Operational headroom for phase-3 attestation, logging and dispatch. Two
+#: minutes leaves margin over six nominal ten-second attestation attempts,
+#: but is NOT a network wall-clock bound: urllib timeouts apply per socket
+#: operation and cancelling to_thread does not stop an in-flight request.
+POLLER_DISPATCH_BACKSTOP_SECONDS = 120.0
 #: Smallest gap a 5-field cron can express.
 CRON_MIN_GRANULARITY_SECONDS = 60.0
 
@@ -2496,8 +2501,14 @@ class Scheduler:
                 return accepted
 
             timeout = await self._effective_poller_timeout(poller)
-            # Allow bounded drain, reap, and final cleanup beyond execution.
-            deadline_seconds = timeout + 3 * POLLER_EXIT_GRACE_SECONDS
+            # Coroutine-level backstop covering execution, cleanup AND phase 3.
+            # Dispatch headroom is an operational allowance, not a guarantee
+            # that underlying threads terminate. Cooperative cancellation can
+            # abandon remaining batches; this does not make dispatch atomic.
+            deadline_seconds = (
+                timeout + 3 * POLLER_EXIT_GRACE_SECONDS
+                + POLLER_DISPATCH_BACKSTOP_SECONDS
+            )
             deadline = asyncio.timeout(deadline_seconds)
             try:
                 async with deadline:

@@ -3700,7 +3700,9 @@ if os.fork() == 0:
     with open('release', 'rb', buffering=0) as release:
         os.write(1, b'{"poller":"escape","prompt":"not committed"}\\n')
         os.write(2, b'escaped writer diagnostic\\n')
-        Path('ready').write_text(str(os.getpid()))
+        # Publish complete PID content before existence signals readiness.
+        Path('ready.tmp').write_text(str(os.getpid()))
+        os.rename('ready.tmp', 'ready')
         release.read(1)
     os.close(1)
     os.close(2)
