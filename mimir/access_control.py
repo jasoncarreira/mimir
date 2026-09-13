@@ -8394,12 +8394,23 @@ class ToolRegistry:
                     resolved_target = None
             from .redaction import redact_payload
 
-            redacted_requested_target = redact_payload(requested_target)
+            if sink_category is SinkCategory.SHELL_PROCESS and requested_target is not None:
+                # Both command fields share the durable census sink: mask argv
+                # before serialization/truncation, not just the resolved target.
+                requested_argv, _ = service_shell_argv_for_log(requested_target)
+                redacted_requested_target = json.dumps(requested_argv)
+            else:
+                redacted_requested_target = redact_payload(requested_target)
             if redacted_requested_target is not None:
                 redacted_requested_target = str(redacted_requested_target)[
                     :_MAX_REQUESTED_TARGET_LENGTH
                 ]
-            redacted_resolved_target = redact_payload(resolved_target)
+            if sink_category is SinkCategory.SHELL_PROCESS:
+                # The renderer needs shell syntax, not the JSON-resolved argv.
+                argv, _ = service_shell_argv_for_log(target or "")
+                redacted_resolved_target = json.dumps(argv)
+            else:
+                redacted_resolved_target = redact_payload(resolved_target)
             if redacted_resolved_target is not None:
                 redacted_resolved_target = str(redacted_resolved_target)[
                     :_MAX_REQUESTED_TARGET_LENGTH

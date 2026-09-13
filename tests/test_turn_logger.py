@@ -21,7 +21,9 @@ import pytest
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 
 from mimir.models import TurnRecord
+from mimir.redaction import redact_payload
 from mimir.turn_logger import (
+    MAX_TOOL_RESULT_BYTES,
     TurnLogger,
     _coerce_content,
     derive_result_fields,
@@ -706,6 +708,46 @@ def test_oversized_tool_result_truncated():
     events, _ = extract_turn_events([msg])
     assert events[0]["content"].endswith("…[truncated]")
     assert len(events[0]["content"]) < len(body)
+
+
+@pytest.mark.parametrize("path", ["tool_events", "internal_tool_results", "tool_message"])
+@pytest.mark.parametrize("credential,remnant", [
+    ("sk-proj-" + "A" * 40, "sk-proj-" + "A" * 13),
+    ("bearer " + "B" * 40, "bearer " + "B" * 7),
+])
+async def test_tool_result_redacted_before_truncation(tmp_path, path, credential, remnant):
+    # The old ordering leaves less than the token pattern's minimum length.
+    prefix = "\n" * (MAX_TOOL_RESULT_BYTES - len(remnant))
+    body = prefix + credential + "\n" + "ordinary output\n" * 100
+    old_body = body[:MAX_TOOL_RESULT_BYTES] + "\u2026[truncated]"
+    assert remnant in redact_payload(old_body)
+    if path == "tool_message":
+        msg = ToolMessage(content=body, tool_call_id="tc_1", name="shell_exec")
+    else:
+        result = {"tool_use_id": "tc_1", "name": "shell_exec"}
+        if path == "tool_events":
+            result.update(type="tool_result", result=body)
+        else:
+            result["content"] = body
+        msg = AIMessage(content="", response_metadata={path: [result]})
+    original = msg.model_dump()
+    events, output = extract_turn_events([msg])
+    record = TurnRecord(
+        ts="2026-05-15T12:00:00Z", turn_id="boundary", session_id="s",
+        saga_session_id=None, trigger="user_message", channel_id="c",
+        input="run env", output=output, events=events,
+    )
+    log_path = tmp_path / "turns.jsonl"
+    await TurnLogger(log_path).write(record)
+    stored = log_path.read_text()
+    assert remnant not in stored
+    assert credential not in stored
+    content = json.loads(stored)["events"][0]["content"]
+    expected = redact_payload(body)[:MAX_TOOL_RESULT_BYTES] + "\u2026[truncated]"
+    assert content == expected
+    assert events[0]["content"] == expected
+    assert len(content) == MAX_TOOL_RESULT_BYTES + len("\u2026[truncated]")
+    assert msg.model_dump() == original
 
 
 # ── derive_result_fields ─────────────────────────────────────────────
