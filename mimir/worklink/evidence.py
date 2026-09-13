@@ -448,8 +448,10 @@ async def _observe_evidence_from_ref(
                 initial = tests
                 tests = replace(tests, initial_run=initial, rerun=rerun)
                 if complete:
-                    # Isolation changes execution conditions. Preserve the gate's
-                    # verdict, counts and failures; the rerun is evidence only.
+                    # Deliberately supersedes Chainlink #1557's verdict-flip:
+                    # parallel-only failures (xdist ordering/shared state) are real
+                    # defects; passing in isolation must not hide them. Preserve
+                    # the gate's verdict, counts and failures; rerun is evidence only.
                     tests = replace(
                         tests,
                         flaky_tests=tuple(
