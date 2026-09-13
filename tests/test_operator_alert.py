@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import time
 from types import SimpleNamespace
 from typing import Any
@@ -7,6 +8,7 @@ from typing import Any
 import pytest
 from langchain.agents.middleware import ToolCallRequest
 from langchain_core.messages import ToolMessage
+from langchain_core.tools import ToolException
 from langgraph.runtime import Runtime
 
 from mimir._context import reset_current_turn, set_current_turn
@@ -220,3 +222,56 @@ def test_operator_alert_is_registered() -> None:
     from mimir.tools import all_mimir_tools
 
     assert "operator_alert" in {tool.name for tool in all_mimir_tools()}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["exception", "unsent"])
+async def test_failed_alert_refunds_only_its_parallel_reservation(tmp_path, failure):
+    entered = [asyncio.Event() for _ in range(3)]
+    release = [asyncio.Event() for _ in range(3)]
+    calls = []
+
+    class Channels:
+        async def send(self, channel_id, text, *, final):
+            index = len(calls)
+            calls.append(text)
+            if index < 3:
+                entered[index].set()
+                await release[index].wait()
+            if index == 0:
+                if failure == "exception":
+                    raise OSError("offline")
+                return SimpleNamespace(sent=False, error="offline")
+            return SimpleNamespace(sent=True)
+
+    set_operator_alert_dependencies(
+        Channels(), SimpleNamespace(operator_alert_channel="discord-operator"),
+    )
+    turn, _ = _tainted_poller(tmp_path)
+    token = set_current_turn(turn)
+    tasks = []
+    try:
+        for index in range(3):
+            tasks.append(asyncio.create_task(operator_alert.coroutine(text=str(index))))
+            await entered[index].wait()
+        with pytest.raises(ToolException, match="per-turn limit"):
+            await operator_alert.coroutine(text="overflow")
+        release[1].set()
+        await tasks[1]
+        release[0].set()
+        with pytest.raises(ToolException, match="offline"):
+            await tasks[0]
+        # One successful send and one pending send still own their slots.
+        assert turn.operator_alert_count == 2
+        await operator_alert.coroutine(text="retry")
+        with pytest.raises(ToolException, match="per-turn limit"):
+            await operator_alert.coroutine(text="overflow again")
+        release[2].set()
+        await tasks[2]
+        assert turn.operator_alert_count == 3
+        assert calls == ["0", "1", "2", "retry"]
+    finally:
+        for event in release:
+            event.set()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        reset_current_turn(token)

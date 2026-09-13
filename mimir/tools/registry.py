@@ -2620,7 +2620,8 @@ async def _spawn_open_code_impl(
     except BaseException:
         os.close(artifact_directory_fd)
         artifact_directory_fd = -1
-        await _spawn_release_rate_slot(guard, rate_token)
+        if execution is None:
+            await _spawn_release_rate_slot(guard, rate_token)
         raise
     finally:
         if checkout is not None:
@@ -2636,6 +2637,8 @@ async def _spawn_open_code_impl(
                 log.warning("spawn_open_code cleanup failed")
 
     assert terminal is not None
+    if execution is None:
+        await _spawn_release_rate_slot(guard, rate_token)
     manifest = {
         "schema_version": 2,
         "run_id": run_id,

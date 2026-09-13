@@ -2104,11 +2104,21 @@ def discover_pollers(
                         name,
                         f"batch_size {raw_batch!r} is invalid; using default",
                     ))
-            # chainlink #262: opt-in framework recovery of failed poller
-            # turns. ``bool(...)`` coerces truthy json values; a stray
-            # non-bool just reads as on/off rather than erroring (low-stakes
-            # flag, unlike batch_size which affects coalescing math).
-            recover_failed_turns = bool(entry.get("recover_failed_turns", False))
+            # Recovery is opt-in; quoted false and invalid values must not enable it.
+            raw_recovery = entry.get("recover_failed_turns", False)
+            recover_failed_turns = _parse_override_bool(raw_recovery)
+            if recover_failed_turns is None:
+                recover_failed_turns = False
+                log.warning(
+                    "poller_invalid_recover_failed_turns: %s name=%r value=%r "
+                    "(expected a bool); using default False",
+                    pollers_file, name, raw_recovery,
+                )
+                if invalid_entries is not None:
+                    invalid_entries.append((
+                        pollers_file, name,
+                        f"recover_failed_turns {raw_recovery!r} is invalid; using default False",
+                    ))
             # ``priority`` (priority-banded suppression): low | normal |
             # high. Garbage values fall back to the default with a
             # warning — a typo shouldn't silently promote a poller to
@@ -2907,7 +2917,6 @@ async def run_poller(
                         poller=poller.name,
                         reason=invalid_reason or "invalid_usage_signal",
                     )
-                    signals_emitted += 1
                     continue
                 payload = {
                     k: _redact_poller_env_values(v, env, explicit_env_redact_keys)

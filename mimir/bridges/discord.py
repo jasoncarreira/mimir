@@ -639,7 +639,8 @@ class DiscordBridge(Bridge):
         sent_count = 0
         files: list[discord.File] = []
         try:
-            files = [discord.File(str(p)) for p in (attachment_paths or [])]
+            for p in (attachment_paths or []):
+                files.append(discord.File(str(p)))
             if (files or discord_embed is not None) and not chunks:
                 chunks = [""]
             for i, chunk in enumerate(chunks):
@@ -1116,6 +1117,8 @@ class DiscordBridge(Bridge):
         # message isn't a signal about the agent's behavior.
         try:
             channel = self._client.get_channel(payload.channel_id) if self._client else None
+            if channel is None and self._client is not None:
+                channel = await self._client.fetch_channel(payload.channel_id)
             if channel is None:
                 return
             target_msg = await channel.fetch_message(payload.message_id)

@@ -589,9 +589,10 @@ def _expand_standard_dow_numeric_part(part: str) -> str:
         value = int(base)
         if not (0 <= value <= 7):
             return part
-        if step == 1:
+        if "/" not in part:
             return _standard_dow_number_to_name(value)
-        values = range(value, 7, step)
+        # Include the Sunday=7 endpoint before mapping numbers to names.
+        values = range(value, 8, step)
 
     names = []
     seen = set()
