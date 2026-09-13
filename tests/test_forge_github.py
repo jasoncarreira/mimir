@@ -110,7 +110,7 @@ def _run_metadata():
     }
 
 
-@pytest.mark.parametrize("conclusion", ["failure", "timed_out", "startup_failure", "action_required"])
+@pytest.mark.parametrize("conclusion", ["failure", "timed_out", "startup_failure", "action_required", "cancelled"])
 @pytest.mark.parametrize("run_id", [None, 123])
 @pytest.mark.parametrize("repo_case", ["owner/repo", "Owner/Repo"])
 def test_job_log_binds_metadata_before_capture(monkeypatch, conclusion, run_id, repo_case):
@@ -149,7 +149,7 @@ def test_job_log_binds_metadata_before_capture(monkeypatch, conclusion, run_id, 
     ("job", "run_url", "https://evil.example/repos/owner/repo/actions/runs/123"),
     ("job", "run_url", None),
     ("job", "status", "in_progress"), ("job", "status", None),
-    *[("job", "conclusion", value) for value in ["success", "cancelled", "neutral", "skipped", "stale", None]],
+    *[("job", "conclusion", value) for value in ["success", "neutral", "skipped", "stale", None]],
     ("run", "id", 124), ("run", "id", "123"), ("run", "id", 123.0), ("run", "id", None),
     ("run", "repository", {"full_name": "other/repo"}),
     ("run", "repository", None), ("run", "repository", {}),
@@ -164,6 +164,8 @@ def test_job_log_rejects_each_independent_binding_or_state(monkeypatch, target, 
     monkeypatch.setattr(ci_logs, "capture_job_log", lambda *a, **k: pytest.fail("capture before validation"))
     session = Session([Response(job), Response(run)])
     message = "run is still in progress" if target == "run" and field == "status" else None
+    if target == "job" and field in {"status", "conclusion"}:
+        message = "^job is not a completed failing job$"
     with pytest.raises(ForgeError, match=message):
         GitHubForgeClient(session=session).get_job_log(_scope(), 456)
 
