@@ -92,8 +92,14 @@ def test_matches_scalar_greedy(conn, scope_acl, threshold):
     ) == expected
 
 
+@pytest.mark.parametrize("sum_mode", ["native", "compensated"])
 @pytest.mark.parametrize("direction", [-math.inf, None, math.inf])
-def test_exact_float64_threshold(conn, direction):
+def test_exact_float64_threshold(conn, direction, sum_mode, monkeypatch):
+    if sum_mode == "compensated":
+        # Exercise non-left-to-right reduction even on Python 3.11. fsum is
+        # not a Python 3.12 sum emulator; both oracle and implementation must
+        # honor the selected scalar reduction rather than hard-code cumsum.
+        monkeypatch.setattr("mimir.saga.cluster.sum", math.fsum, raising=False)
     rng = random.Random(1701)
     rows = [_row(str(i), [rng.random() for _ in range(1536)]) for i in range(3)]
     atoms = [{"id": row[0]} for row in rows]

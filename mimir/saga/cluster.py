@@ -78,6 +78,19 @@ def _mean_cosine(vec: list[float], cluster_vecs: list[list[float]]) -> float:
     return sum(_cosine(vec, v) for v in cluster_vecs) / len(cluster_vecs)
 
 
+def _sum_rows(matrix):
+    """Reduce NumPy products with the running Python's float-sum semantics.
+
+    Python 3.12+ uses compensated float summation; neither NumPy's cumsum
+    nor its pairwise sum is equivalent at exact cosine thresholds. tolist()
+    supplies builtin floats to sum (not NumPy scalars), keeping multiplication
+    vectorized and the coordinate reduction in builtin code.
+    """
+    import numpy as np
+
+    return np.asarray([sum(row.tolist()) for row in matrix], dtype=np.float64)
+
+
 def fetch_embedding_rows(
     conn: sqlite3.Connection,
     atoms: list[dict],
@@ -149,9 +162,10 @@ def cluster_by_similarity(
         except (TypeError, ValueError):
             continue  # malformed; skip atom
 
-    # Like triples._cosine_scores, batch the coordinate arithmetic in numpy.
-    # Unlike its float32 matmul, preserve Python's float64, left-to-right sums:
-    # reassociation can change exact threshold boundaries and first-cluster ties.
+    # Batch coordinate products in NumPy, but match _cosine's builtin float
+    # reductions and math.sqrt on every supported Python version. Reassociation
+    # can change exact threshold boundaries and first-cluster ties.
+    import math
     ids_by_dim: dict[int, list[str]] = {}
     for atom_id, vec in vec_by_atom.items():
         ids_by_dim.setdefault(len(vec), []).append(atom_id)
@@ -161,9 +175,9 @@ def cluster_by_similarity(
         for dim, ids in ids_by_dim.items():
             mat = np.vstack([vec_by_atom[atom_id] for atom_id in ids])
             matrices[dim] = mat
-            norms[dim] = (
-                np.sqrt(np.cumsum(mat * mat, axis=1)[:, -1])
-                if dim else np.zeros(len(ids))
+            norms[dim] = np.asarray(
+                [math.sqrt(total) for total in _sum_rows(mat * mat)],
+                dtype=np.float64,
             )
 
     # Greedy single-pass.
@@ -178,8 +192,8 @@ def cluster_by_similarity(
         scores = np.zeros(len(ids_by_dim[dim]))
         if dim:
             with np.errstate(invalid="ignore", divide="ignore"):
-                norm = np.sqrt(np.cumsum(vec * vec)[-1])
-                dots = np.cumsum(matrices[dim] * vec, axis=1)[:, -1]
+                norm = math.sqrt(sum((vec * vec).tolist()))
+                dots = _sum_rows(matrices[dim] * vec)
                 np.divide(
                     dots, norms[dim] * norm, out=scores,
                     where=(norms[dim] != 0.0) & (norm != 0.0),
