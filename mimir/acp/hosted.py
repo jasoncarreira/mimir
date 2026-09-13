@@ -116,6 +116,9 @@ def _file_parent(session: HostedSession, value: str, *, edit: bool = False):
                             dir_fd=parent)
             os.close(parent)
             parent = child
+        # This redundant lstat is only for the actionable error message, not
+        # symlink enforcement: it is TOCTOU-racy. O_NOFOLLOW at the _edit open
+        # is the enforcing guard; this diagnostic is deliberately not independently tested.
         if edit and stat.S_ISLNK(os.lstat(path.name, dir_fd=parent).st_mode):
             raise HostedMcpError(
                 -32000, "hands_edit failed: symlink target refused; retry with the target path "
