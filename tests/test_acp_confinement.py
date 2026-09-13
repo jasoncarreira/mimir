@@ -578,8 +578,8 @@ def test_apparmor_enforce_allowlist_denies_network():
     header, *rules = profile.splitlines()
     # No flags (complain/default_allow), includes, or exec transitions may widen it.
     assert header.split() == ["profile", header.split()[1], "{"]
+    # Exact allowlist: no network grant, so the default-deny profile blocks it.
     assert rules == [
-        "  deny network,",
         "  /** ix,",
         "  /usr/bin/** mr,", "  /bin/** mr,",
         "  /usr/lib/** mr,", "  /usr/lib64/** mr,",
