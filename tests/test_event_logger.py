@@ -64,6 +64,53 @@ async def test_log_appends_record_with_session_and_type(tmp_path: Path):
     assert lines[1]["tool"] == "echo"
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("method", ["log", "log_sync", "log_durable_sync"])
+@pytest.mark.parametrize("agent_id", [None, "framework-agent"])
+async def test_payload_cannot_shadow_record_header(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog, method, agent_id,
+) -> None:
+    from mimir.feedback.rules import classify
+
+    path = tmp_path / "events.jsonl"
+    logger = EventLogger(path, session_id="framework-session", agent_id=agent_id)
+    timestamp = "2026-09-13T12:00:00+00:00"
+    monkeypatch.setattr("mimir.event_logger._utc_now_iso", lambda: timestamp)
+    payload = {
+        "type": "http_500",
+        "timestamp": "2020-01-01T00:00:00+00:00",
+        "session_id": "forged-session",
+        "agent_id": "forged-agent",
+        "poller": "demo",
+        "detail": {"message": "upstream unavailable", "token": "github_pat_11ABCDEFG_xyz0123"},
+    }
+    if method == "log":
+        await logger.log("poller_service_outage", **payload)
+    else:
+        await asyncio.to_thread(getattr(logger, method), "poller_service_outage", **payload)
+
+    record = json.loads(path.read_text())
+    assert record["type"] == "poller_service_outage"
+    assert record["timestamp"] == timestamp
+    assert record["session_id"] == "framework-session"
+    if agent_id is None:
+        assert "agent_id" not in record
+    else:
+        assert record["agent_id"] == agent_id
+    assert classify(record["type"]) == ("negative", "poller_service_outage")
+    assert record["poller"] == "demo"
+    assert record["detail"] == {"message": "upstream unavailable", "token": "[REDACTED]"}
+    assert payload["type"] == "http_500"
+    assert payload["detail"]["token"] == "github_pat_11ABCDEFG_xyz0123"
+    warnings = [r for r in caplog.records if "reserved record-header" in r.message]
+    assert len(warnings) == 1
+    assert warnings[0].levelname == "WARNING"
+    for key in ("type", "timestamp", "session_id", "agent_id"):
+        assert key in warnings[0].message
+    assert "forged" not in warnings[0].message
+    assert "github_pat" not in warnings[0].message
+
+
 def test_durable_log_fsyncs_new_file_and_parent_directory(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
