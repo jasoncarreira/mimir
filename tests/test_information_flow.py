@@ -3272,6 +3272,123 @@ def test_heartbeat_fetches_multiple_approved_exact_urls_after_untrusted_ingest(
     assert other_path.reason == "egress_destination_not_approved"
 
 
+@pytest.fixture
+def shipped_github_fetch_context(request, tmp_path, monkeypatch):
+    from mimir.pollers import _parse_poller_authority
+    from mimir.models import RepoPRActionScope, RepoReviewState
+    import mimir.access_control as access_control
+
+    monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
+    monkeypatch.setenv("GITHUB_REPOS", "acme/widget")
+    monkeypatch.delenv("MIMIR_EGRESS_APPROVED_URLS", raising=False)
+    manifest = (
+        Path(__file__).parents[1] / "mimir/optional-skills"
+        / request.param / "pollers.json"
+    )
+    raw = json.loads(manifest.read_text())["pollers"][0]
+    # The production parser builds authority via build_trigger_service_principal.
+    service = _parse_poller_authority(
+        raw["authority"], name=raw["name"], persist_dir=tmp_path,
+        state_root=None, manifest_path=manifest,
+    )
+    auth, labels = _trigger_service_context(service, integrity="untrusted")
+    scope = RepoPRActionScope(
+        provenance="poller_payload", canonical_repo="acme/widget",
+        canonical_root=str(tmp_path), canonical_origin="https://github.com/acme/widget.git",
+        principal="mimir-bot", event_type="pr_ci_failure",
+        allowed_operations=access_control._REPO_PR_CI_REMEDIATION_ACTIONS,
+        pr_number=42, head_repo="acme/widget", head_remote="origin",
+        destination_ref="refs/heads/fix", observed_head_sha="a" * 40,
+        base_ref="main", observed_base_sha="b" * 40, pull_request_author="mimir-bot",
+    )
+    auth = replace(auth, ifc_labels=labels, repo_review_state=RepoReviewState(scope))
+    assert labels.has_untrusted_active_ingest
+    assert service.sink_policy_for("fetch_url").adapter == "approved_urls"
+    assert not access_control.approved_fetch_urls(auth)
+    return auth, labels
+
+
+@pytest.mark.parametrize("shipped_github_fetch_context", ["github-ci-watch"], indirect=True)
+@pytest.mark.parametrize("suffix", [
+    "/model-chosen-payload",
+    "/actions/runs/123/jobs?q=arbitrary-payload",
+    "/actions/runs/123/jobs?per_page=payload",
+    "/actions/runs/123/jobs?per_page=101",
+    "/actions/runs/123/jobs?per_page=0",
+    "/actions/runs/123/jobs?per_page=01",
+    "/actions/runs/123/jobs?per_page=1&per_page=2",
+    "/actions/runs/123/jobs?per_page=%31",
+    "/actions/runs/123/jobs#payload",
+    "/actions/runs/payload/jobs",
+    "/actions/runs/123456789012345678901/jobs",
+    "/commits/main/check-runs",
+    f"/commits/{'a' * 41}/check-runs",
+    "/actions/runs/123/jobs/extra",
+])
+def test_configured_github_unbounded_fetch_is_taint_gated(shipped_github_fetch_context, suffix):
+    auth, labels = shipped_github_fetch_context
+    target = "https://api.github.com/repos/acme/widget" + suffix
+    decision = SinkGate.check_sink_flow("fetch_url", target, labels, auth, enforce=True)
+    assert (decision.allowed, decision.reason) == (False, "ifc_label_blocked:network")
+
+
+@pytest.mark.parametrize("target", [
+    "https://github.com/acme/widget/search?q=payload",
+    "https://github.com/acme/widget/actions/runs/123/jobs",
+    "https://api.github.com/repos/acme/other/actions/runs/123/jobs",
+    "https://api.github.com/repos/acme/widget/pulls/7",
+    "https://github.com/acme/widget",
+])
+@pytest.mark.parametrize("shipped_github_fetch_context", ["github-ci-watch"], indirect=True)
+def test_github_scope_stays_gated_and_clean_fetch_unchanged(shipped_github_fetch_context, target):
+    import mimir.access_control as access_control
+
+    auth, labels = shipped_github_fetch_context
+    assert not access_control._target_matches_configured_github_repo_fetch(target)
+    decision = SinkGate.check_sink_flow("fetch_url", target, labels, auth, enforce=True)
+    assert (decision.allowed, decision.reason) == (False, "ifc_label_blocked:network")
+    _, clean_labels = _trigger_service_context(auth.service_authority, integrity="trusted")
+    clean = SinkGate.check_sink_flow(
+        "fetch_url", target, clean_labels, replace(auth, ifc_labels=clean_labels), enforce=True,
+    )
+    assert (clean.allowed, clean.reason) == (True, "ifc_allowed")
+
+
+@pytest.mark.parametrize("target", [
+    "https://github.com/acme/widget",
+    "https://api.github.com/repos/acme/widget/pulls/7",
+    "https://github.com/acme/widget/search?q=payload",
+])
+def test_clean_configured_repo_fetch_authorization_unchanged(monkeypatch, target):
+    monkeypatch.setenv("GITHUB_REPOS", "acme/widget")
+    monkeypatch.delenv("MIMIR_EGRESS_APPROVED_URLS", raising=False)
+    assert fetch_url_is_approved(target, _auth())
+
+
+def test_bounded_github_fetch_requires_api_host(monkeypatch):
+    import mimir.access_control as access_control
+
+    # This web URL is inside the configured repos/acme repository, but is not API evidence.
+    monkeypatch.setenv("GITHUB_REPOS", "repos/acme")
+    assert not access_control._target_matches_configured_github_repo_fetch(
+        "https://github.com/repos/acme/widget/actions/runs/123/jobs",
+    )
+
+
+@pytest.mark.parametrize(("shipped_github_fetch_context", "path"), [
+    ("github-ci-watch", "/actions/runs/123/jobs"),
+    ("github-ci-watch", "/actions/runs/123/jobs?per_page=1"),
+    ("github-ci-watch", "/actions/runs/123/jobs?per_page=99"),
+    ("github-poller", f"/commits/{'a' * 40}/check-runs"),
+    ("github-poller", f"/commits/{'a' * 40}/check-runs?per_page=100"),
+], indirect=["shipped_github_fetch_context"])
+def test_shipped_github_poller_bounded_fetch_survives_taint(shipped_github_fetch_context, path):
+    auth, labels = shipped_github_fetch_context
+    target = "https://api.github.com/repos/acme/widget" + path
+    decision = SinkGate.check_sink_flow("fetch_url", target, labels, auth, enforce=True)
+    assert (decision.allowed, decision.reason) == (True, "ifc_allowed")
+
+
 def _github_fetch_service() -> ServicePrincipal:
     return ServicePrincipal(
         canonical="poller:github-activity",
