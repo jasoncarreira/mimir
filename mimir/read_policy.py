@@ -560,7 +560,7 @@ def is_tracked_file_in_current_pr_lease(path: Path) -> bool:
         _target_within_active_pr_checkout_lease,
         resolve_repository_review_state,
     )
-    from .models import RepoPRScopeRegistry
+    from .models import RepoPRScopeRegistry, ServerDiscoveredPRStates
     from .repo_tools import GitRefusal, RepoGitTools
 
     auth_context = getattr(get_current_turn(), "auth_context", None)
@@ -569,12 +569,17 @@ def is_tracked_file_in_current_pr_lease(path: Path) -> bool:
     state, refusal = resolve_repository_review_state(auth_context, path=str(path))
     if refusal is not None or state is None:
         return False
+    discovered = getattr(auth_context, "server_discovered_pr_states", None)
     if (
         not isinstance(
             getattr(auth_context, "repo_pr_scope_registry", None), RepoPRScopeRegistry,
         )
         and getattr(auth_context, "repo_pr_action_scope", None)
         is not getattr(state, "action_scope", None)
+        and not (
+            isinstance(discovered, ServerDiscoveredPRStates)
+            and discovered.resolve(state.repo, state.pr_number) is state
+        )
     ):
         return False
     if not _target_within_active_pr_checkout_lease(str(path), state):
