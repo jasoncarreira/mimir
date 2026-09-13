@@ -1017,6 +1017,9 @@ async def send_message(
         # soft failure must NOT look delivered — don't log send_message_sent,
         # don't append to history, and surface the failure to the model.
         if not getattr(result, "sent", True):
+            chunks = getattr(result, "chunks", 0)
+            uploads = getattr(result, "uploads", 0)
+            partial = bool(chunks or uploads)
             if detector is not None and detector_state is not None:
                 detector.restore(detector_state)
                 undelivered_decision = detector.record_undelivered_attempt(text)
@@ -1030,8 +1033,8 @@ async def send_message(
                     )
                     return (
                         "send_message hard stop: repeated near-duplicate "
-                        "undelivered-send loop. This send failed before "
-                        "delivery and further identical retries are refused. "
+                        "undelivered-send loop. Delivery did not complete "
+                        "and further identical retries are refused. "
                         "Reflect on the delivery failure before trying again."
                     )
             _err = getattr(result, "error", None)
@@ -1040,9 +1043,19 @@ async def send_message(
                     "send_message_failed",
                     channel_id=cid,
                     error=(str(_err)[:200] if _err else None),
+                    chunks=chunks,
+                    uploads=uploads,
+                    message_id=getattr(result, "message_id", None),
                 )
             except Exception:  # noqa: BLE001
                 pass
+            if partial:
+                return (
+                    f"send_message failed: incomplete delivery (channel={cid}; "
+                    f"{chunks} chunk(s), {uploads} upload(s) delivered; "
+                    f"message_id={getattr(result, 'message_id', None)}; {_err}). "
+                    "Warning: retrying the whole message may duplicate what already landed."
+                )
             return (
                 "send_message failed: bridge reported the message was not "
                 f"delivered (channel={cid}" + (f"; {_err}" if _err else "") + ")"

@@ -206,6 +206,48 @@ def bridge_with_fake_app():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("fail_at", [1, 2])
+@pytest.mark.parametrize("api_error", [False, True])
+async def test_send_chunk_failure_preserves_progress(bridge_with_fake_app, fail_at, api_error):
+    from slack_sdk.errors import SlackApiError
+
+    bridge, _, _ = bridge_with_fake_app
+    error = SlackApiError("send failed", {"error": "ratelimited"}) if api_error else RuntimeError("send failed")
+    send = AsyncMock(side_effect=[
+        *[{"ts": "123.001"} for _ in range(fail_at - 1)], error,
+    ])
+    bridge._app.client.chat_postMessage = send
+    result = await bridge.send("slack-C01ABC", "x" * (SLACK_MESSAGE_CHAR_LIMIT * 3))
+
+    assert result.sent is False
+    assert result.chunks == fail_at - 1
+    assert result.message_id == ("123.001" if fail_at == 2 else None)
+    assert result.uploads == 0
+    assert send.await_count == fail_at
+    assert f"after {fail_at - 1} chunk(s)" in result.error
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("fail_upload", [False, True])
+async def test_send_counts_uploads_separately(bridge_with_fake_app, tmp_path, fail_upload):
+    bridge, _, _ = bridge_with_fake_app
+    upload = AsyncMock(side_effect=[
+        {"file": {}},
+        RuntimeError("upload failed") if fail_upload else {"file": {}},
+    ])
+    bridge._app.client.files_upload_v2 = upload
+    result = await bridge.send(
+        "slack-C01ABC", "hello", attachment_paths=[tmp_path / "a", tmp_path / "b"],
+    )
+
+    assert result.sent is (not fail_upload)
+    assert result.chunks == 1
+    assert result.uploads == (1 if fail_upload else 2)
+    assert result.message_id == "1234567890.000001"
+    assert upload.await_count == 2
+
+
+@pytest.mark.asyncio
 async def test_send_chunks_long_text(bridge_with_fake_app):
     bridge, _, sent = bridge_with_fake_app
     long_text = "y" * (SLACK_MESSAGE_CHAR_LIMIT * 2 + 100)

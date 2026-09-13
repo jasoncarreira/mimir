@@ -331,6 +331,79 @@ class TestDISetters:
 
 class TestSendMessage:
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("platform", ["discord", "slack"])
+    async def test_second_chunk_failure_is_not_credited(
+        self, tmp_path, monkeypatch, platform,
+    ) -> None:
+        from types import SimpleNamespace
+
+        from mimir.event_logger import init_logger
+        from mimir.history import MessageBuffer
+
+        if platform == "discord":
+            from discord import DiscordException
+            from mimir.bridges.discord import DiscordBridge
+
+            channel_id = "discord-123"
+            network_send = AsyncMock(side_effect=[
+                SimpleNamespace(id=42), DiscordException("second chunk failed"),
+            ])
+            bridge = DiscordBridge(token="test", enqueue=AsyncMock())
+            bridge._client = SimpleNamespace(
+                is_closed=lambda: False,
+                get_channel=lambda _: SimpleNamespace(send=network_send),
+            )
+        else:
+            from slack_sdk.errors import SlackApiError
+            from mimir.bridges.slack import SlackBridge
+
+            channel_id = "slack-C123"
+            network_send = AsyncMock(side_effect=[
+                {"ts": "42"},
+                SlackApiError("second chunk failed", {"error": "test_failure"}),
+            ])
+            bridge = SlackBridge(bot_token="test", app_token="test", enqueue=AsyncMock())
+            bridge._app = SimpleNamespace(client=SimpleNamespace(chat_postMessage=network_send))
+
+        # Exercise real chunking and SendResult construction, not a bridge stub.
+        text = ("This is the intended reply. " * 400).strip()
+        set_channel_registry(_StubRegistry(bridge, channel_id=channel_id))
+        buf = MessageBuffer(history_path=tmp_path / "history.jsonl")
+        monkeypatch.setattr("mimir.history.get_global_buffer", lambda: buf)
+        init_logger(tmp_path / "events.jsonl", session_id="partial-send")
+        ctx = TurnContext(
+            turn_id="partial-send", session_id="partial-send",
+            trigger="user_message", channel_id=channel_id, started_at=0.0,
+            interactivity=TurnInteractivity.INTERACTIVE,
+            ifc_labels=InformationFlowLabels(),
+        )
+        token = set_current_turn(ctx)
+        try:
+            out = await send_message.ainvoke({
+                "type": "tool_call", "id": "partial-send", "name": "send_message",
+                "args": {"text": text, "channel_id": channel_id},
+            })
+        finally:
+            reset_current_turn(token)
+
+        assert network_send.await_count == 2
+        first_call = network_send.await_args_list[0]
+        delivered_text = first_call.args[0] if platform == "discord" else first_call.kwargs["text"]
+        assert delivered_text and len(delivered_text) < len(text)
+        assert text.startswith(delivered_text)
+        assert "send_message ok" not in out.content
+        assert "incomplete" in out.content.lower()
+        assert "warning" in out.content.lower()
+        assert ctx.send_message_count == 0
+        assert ctx.delivered_channel_ids == set()
+        assert not any(m.content == text for m in buf._all)
+        if buf.history_path.exists():
+            assert text not in [json.loads(line)["content"] for line in buf.history_path.read_text().splitlines()]
+        events = [json.loads(line) for line in (tmp_path / "events.jsonl").read_text().splitlines()]
+        assert any(e["type"] == "send_message_failed" for e in events)
+        assert not any(e["type"] == "send_message_sent" for e in events)
+
+    @pytest.mark.asyncio
     async def test_no_registry_returns_error(self) -> None:
         _STATE["channel_registry"] = None
         out = await send_message.ainvoke(

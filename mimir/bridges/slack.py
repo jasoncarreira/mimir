@@ -566,6 +566,7 @@ class SlackBridge(Bridge):
 
         last_id: str | None = None
         sent_count = 0
+        upload_count = 0
         try:
             for chunk in chunks:
                 kwargs: dict[str, Any] = {"channel": slack_channel, "text": chunk}
@@ -594,25 +595,27 @@ class SlackBridge(Bridge):
                 )
                 if ts:
                     last_id = ts
-                sent_count += 1
+                upload_count += 1
         except SlackApiError as exc:
             return SendResult(
-                sent=sent_count > 0,
+                sent=False,
                 message_id=last_id,
                 chunks=sent_count,
+                uploads=upload_count,
                 error=redact_text(f"slack api error after {sent_count} chunk(s): {exc}"),
             )
         except Exception as exc:  # noqa: BLE001 — best-effort bridge send
             return SendResult(
-                sent=sent_count > 0,
+                sent=False,
                 message_id=last_id,
                 chunks=sent_count,
+                uploads=upload_count,
                 error=redact_text(
                     f"slack send error after {sent_count} chunk(s): "
                     f"{type(exc).__name__}: {exc}"
                 ),
             )
-        return SendResult(sent=True, message_id=last_id, chunks=sent_count)
+        return SendResult(sent=True, message_id=last_id, chunks=sent_count, uploads=upload_count)
 
     async def send_typing_indicator(self, channel_id: str) -> None:
         """No-op. Slack has no public typing API for bots — the

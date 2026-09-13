@@ -637,6 +637,7 @@ class DiscordBridge(Bridge):
 
         last_id: str | None = None
         sent_count = 0
+        upload_count = 0
         files: list[discord.File] = []
         try:
             files = [discord.File(str(p)) for p in (attachment_paths or [])]
@@ -656,17 +657,20 @@ class DiscordBridge(Bridge):
                     sent_msg = await channel.send(chunk, **chunk_kwargs)
                 last_id = str(getattr(sent_msg, "id", "") or "") or last_id
                 sent_count += 1
+                if i == 0:
+                    upload_count = len(files)
         except discord.DiscordException as exc:
             return SendResult(
-                sent=sent_count > 0,
+                sent=False,
                 message_id=last_id,
                 chunks=sent_count,
+                uploads=upload_count,
                 error=f"discord send error after {sent_count} chunk(s): {exc}",
             )
         finally:
             for file in files:
                 file.close()
-        return SendResult(sent=True, message_id=last_id, chunks=sent_count)
+        return SendResult(sent=True, message_id=last_id, chunks=sent_count, uploads=upload_count)
 
     async def send_typing_indicator(self, channel_id: str) -> None:
         """Hold the Discord typing indicator open until ``send()`` /
