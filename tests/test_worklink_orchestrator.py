@@ -2717,6 +2717,7 @@ def test_executor_crash_publishes_only_scrubbed_bounded_failure_reason(tmp_path:
         if isinstance(call, list) and call[:3] == ["chainlink", "issue", "comment"]
     ]
     assert any(result.reason in comment for comment in published_comments)
+    assert any("executor exited nonzero before the test gate" in comment for comment in published_comments)
     assert "top-secret" not in json.dumps(evidence)
     assert "top-secret" not in json.dumps(records)
     assert "top-secret" not in "\n".join(published_comments)

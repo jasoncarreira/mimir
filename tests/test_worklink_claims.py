@@ -778,11 +778,13 @@ def test_transition_failed_exhausted_attempt_blocks() -> None:
     assert ["chainlink", "issue", "label", "2", "worklink:ready"] not in calls
 
 
-def _reclaim_runner(calls, stdout="You already hold the lock on issue #783"):
+def _reclaim_runner(calls, stdout="You already hold the lock on issue #783", comments=()):
     def runner(args):
         calls.append(list(args))
         if list(args)[1:3] == ["locks", "claim"]:
             return subprocess.CompletedProcess(list(args), 0, stdout=stdout, stderr="")
+        if list(args)[1:3] == ["issue", "show"]:
+            return subprocess.CompletedProcess(list(args), 0, stdout=json.dumps({"comments": list(comments)}), stderr="")
         return subprocess.CompletedProcess(list(args), 0, stdout="", stderr="")
     return runner
 
@@ -792,8 +794,8 @@ def test_same_agent_reclaim_with_fresh_heartbeat_is_refused():
     duplicate process while the owner's claim heartbeat is fresh."""
     now = datetime(2026, 7, 3, 19, 0, tzinfo=UTC)
     calls: list[list[str]] = []
-    claims = ChainlinkClaims(agent_id="mimir-worklink-epic", runner=_reclaim_runner(calls), clock=lambda: now)
     fresh = ClaimRecord(issue_id=783, attempt=1, agent_id="mimir-worklink-epic", claimed_at=now, heartbeat_at=now)
+    claims = ChainlinkClaims(agent_id="mimir-worklink-epic", runner=_reclaim_runner(calls, comments=[fresh.to_comment()]), clock=lambda: now)
 
     result = claims.claim_issue(783, [fresh.to_comment()])
 
@@ -812,8 +814,8 @@ def test_same_agent_reclaim_with_fresh_heartbeat_is_refused():
 def test_same_agent_reclaim_with_stale_heartbeat_steals_and_proceeds():
     now = datetime(2026, 7, 3, 19, 0, tzinfo=UTC)
     calls: list[list[str]] = []
-    claims = ChainlinkClaims(agent_id="mimir-worklink-epic", runner=_reclaim_runner(calls), clock=lambda: now)
     stale = ClaimRecord(issue_id=783, attempt=1, agent_id="mimir-worklink-epic", claimed_at=now - timedelta(hours=2), heartbeat_at=now - timedelta(hours=1))
+    claims = ChainlinkClaims(agent_id="mimir-worklink-epic", runner=_reclaim_runner(calls, comments=[stale.to_comment()]), clock=lambda: now)
 
     result = claims.claim_issue(783, [stale.to_comment()])
 
@@ -821,7 +823,20 @@ def test_same_agent_reclaim_with_stale_heartbeat_steals_and_proceeds():
     assert any(call[1:3] == ["locks", "steal"] for call in calls)
 
 
-def test_part_b_claim_steals_report_degraded_guard_and_both_steal_outcomes() -> None:
+def test_same_agent_reclaim_with_no_tracker_comments_steals():
+    now = datetime(2026, 7, 3, 19, 0, tzinfo=UTC)
+    calls: list[list[str]] = []
+    claims = ChainlinkClaims(agent_id="mimir-worklink-epic", runner=_reclaim_runner(calls), clock=lambda: now)
+    caller_record = ClaimRecord(issue_id=783, attempt=1, agent_id="prior-worker", claimed_at=now)
+
+    result = claims.claim_issue(783, [caller_record.to_comment()])
+
+    assert result.claimed is True
+    assert any(call[1:3] == ["locks", "steal"] for call in calls)
+
+
+@pytest.mark.parametrize("read_failure", ["exception", "nonzero", "invalid_json", "invalid_shape", "empty"])
+def test_degraded_claim_guard_refuses_steal(read_failure: str) -> None:
     now = datetime(2026, 7, 3, 19, 0, tzinfo=UTC)
     stale = ClaimRecord(
         issue_id=783,
@@ -832,14 +847,22 @@ def test_part_b_claim_steals_report_degraded_guard_and_both_steal_outcomes() -> 
     )
     events: list[tuple[str, dict[str, object]]] = []
     issue_show_calls = 0
+    calls: list[list[str]] = []
 
     def degraded_runner(args: Sequence[str]) -> subprocess.CompletedProcess[str]:
         nonlocal issue_show_calls
         call = list(args)
+        calls.append(call)
         if call[1:3] == ["issue", "show"]:
             issue_show_calls += 1
             if issue_show_calls == 2:
-                raise OSError("comments unavailable")
+                if read_failure == "exception":
+                    raise OSError("comments unavailable")
+                return subprocess.CompletedProcess(
+                    call, 1 if read_failure == "nonzero" else 0,
+                    stdout={"nonzero": "", "invalid_json": "{", "invalid_shape": '{"comments": {}}', "empty": ""}[read_failure],
+                    stderr="comments unavailable",
+                )
             return subprocess.CompletedProcess(call, 0, stdout="{}", stderr="")
         if call[1:3] == ["locks", "claim"]:
             return subprocess.CompletedProcess(call, 0, stdout="already hold", stderr="")
@@ -854,29 +877,23 @@ def test_part_b_claim_steals_report_degraded_guard_and_both_steal_outcomes() -> 
         event_logger=lambda event, **payload: events.append((event, payload)),
     ).claim_issue(783, [stale.to_comment()])
 
-    assert result.claimed is True
+    assert result.claimed is False
+    assert result.reason == "claim_guard_degraded"
+    assert not any(call[1:3] in (["locks", "steal"], ["locks", "release"], ["issue", "label"], ["issue", "unlabel"], ["issue", "comment"]) for call in calls)
     relevant_events = [
         item
         for item in events
         if item[0] in {"worklink_claim_guard_degraded", "worklink_claim_stolen"}
     ]
-    assert relevant_events == [
-        (
-            "worklink_claim_guard_degraded",
-            {"issue_id": 783, "error": "OSError: comments unavailable"},
-        ),
-        (
-            "worklink_claim_stolen",
-            {
-                "issue_id": 783,
-                "prior_agent_id": "prior-worker",
-                "heartbeat_age_s": 3600.0,
-                "guard_outcome": "degraded",
-                "steal_succeeded": False,
-                "error": "steal denied",
-            },
-        ),
-    ]
+    assert len(relevant_events) == 1
+    assert relevant_events[0][0] == "worklink_claim_guard_degraded"
+    assert relevant_events[0][1]["issue_id"] == 783
+    assert relevant_events[0][1]["error"]
+
+
+def test_reaper_reports_successful_steal() -> None:
+    now = datetime(2026, 7, 3, 19, 0, tzinfo=UTC)
+    stale = ClaimRecord(issue_id=783, attempt=1, agent_id="prior-worker", claimed_at=now - timedelta(hours=2), heartbeat_at=now - timedelta(hours=1))
 
     reaper_events: list[tuple[str, dict[str, object]]] = []
 
@@ -916,11 +933,11 @@ def test_duplicate_vs_live_final_attempt_never_labels_blocked():
     declared attempts_exhausted and mislabeled the healthy epic blocked."""
     now = datetime(2026, 7, 3, 22, 20, tzinfo=UTC)
     calls: list[list[str]] = []
-    claims = ChainlinkClaims(agent_id="mimir-worklink-epic", runner=_reclaim_runner(calls), clock=lambda: now)
     live_final = ClaimRecord(
         issue_id=783, attempt=3, agent_id="mimir-worklink-epic",
         claimed_at=now - timedelta(minutes=10), heartbeat_at=now - timedelta(minutes=1),
     )
+    claims = ChainlinkClaims(agent_id="mimir-worklink-epic", runner=_reclaim_runner(calls, comments=[live_final.to_comment()]), clock=lambda: now)
 
     result = claims.claim_issue(783, [live_final.to_comment()])
 

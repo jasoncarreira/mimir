@@ -179,8 +179,9 @@ def validate_evidence(evidence: WorklinkEvidence) -> EvidenceValidation:
     elif not evidence.tests.observed:
         reasons.append("tests_not_observed")
         status = "failed"
-    elif evidence.tests.skipped_reason:
-        tests_ok = True
+    elif evidence.tests.skipped_reason is not None:
+        # A recorded skip explains the missing gate; it does not pass it.
+        tests_ok = False
     elif evidence.tests.exit_code == 0:
         tests_ok = True
     elif evidence.tests.exit_code == 127:

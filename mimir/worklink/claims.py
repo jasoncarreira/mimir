@@ -428,10 +428,9 @@ class ChainlinkClaims:
             # Read comments through our own JSON reader rather than trusting the
             # caller's parse — a caller-side key mismatch here means stealing a
             # LIVE run's lock (exactly how the guard's first live test failed).
-            guard_comments = list(comments) or []
             guard_outcome = "claim_record_missing"
             try:
-                guard_comments = self._issue_comments(issue_id) or guard_comments
+                guard_comments = self._issue_comments(issue_id, strict=True)
             except Exception as exc:
                 guard_outcome = "degraded"
                 if self.event_logger is not None:
@@ -440,6 +439,7 @@ class ChainlinkClaims:
                         issue_id=issue_id,
                         error=f"{type(exc).__name__}: {exc}"[:500],
                     )
+                return ClaimResult(False, reason=f"claim_guard_{guard_outcome}")
             for existing in claim_records_from_comments(guard_comments):
                 if existing.issue_id != issue_id:
                     continue
@@ -450,8 +450,7 @@ class ChainlinkClaims:
                 age_s = (self.clock() - anchor).total_seconds()
                 if age_s < self.duplicate_freshness_s:
                     return ClaimResult(False, reason="duplicate_run_live")
-                if guard_outcome != "degraded":
-                    guard_outcome = "stale_heartbeat"
+                guard_outcome = "stale_heartbeat"
             steal = self._run("locks", "steal", str(issue_id), check=False)
             self._emit_claim_stolen(
                 issue_id=issue_id,
@@ -1212,14 +1211,24 @@ class ChainlinkClaims:
             ids.add(raw)
         return ids
 
-    def _issue_comments(self, issue_id: int) -> list[str]:
+    def _issue_comments(self, issue_id: int, *, strict: bool = False) -> list[str]:
         result = self._run("issue", "show", str(issue_id), "--json", check=False)
         if result.returncode != 0:
+            if strict:
+                raise RuntimeError("chainlink issue show failed while reading comments")
             return []
         try:
-            payload = json.loads(result.stdout or "{}")
+            payload = json.loads(result.stdout if strict else result.stdout or "{}")
         except json.JSONDecodeError:
+            if strict:
+                raise
             return []
+        if strict and (
+            not isinstance(payload, dict)
+            or not isinstance(payload.get("comments"), list)
+            or any(not isinstance(item, (str, dict)) for item in payload["comments"])
+        ):
+            raise RuntimeError("chainlink issue show returned unexpected comments shape")
         out: list[str] = []
         for item in payload.get("comments") or ():
             if isinstance(item, str):

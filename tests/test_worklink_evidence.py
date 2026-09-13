@@ -98,12 +98,15 @@ def test_review_rejects_unobserved_fabricated_tests() -> None:
     assert "tests_not_observed" in result.reasons
 
 
-def test_explicit_skipped_tests_can_be_review_ready() -> None:
-    result = validate_evidence(base_evidence(tests=TestResult(None, skipped_reason="docs only")))
+@pytest.mark.parametrize("exit_code", [None, 0])
+def test_explicit_skipped_tests_are_not_review_ready(exit_code: int | None) -> None:
+    result = validate_evidence(base_evidence(tests=TestResult("pytest", exit_code, skipped_reason="executor exited nonzero before the test gate")))
 
     assert result.status == "completed"
-    assert result.review_ready is True
+    assert result.review_ready is False
     assert result.reasons == ()
+    assert result.evidence.tests.skipped_reason == "executor exited nonzero before the test gate"
+    assert validate_evidence(base_evidence()).review_ready is True
 
 
 def test_blocked_requires_reason() -> None:
