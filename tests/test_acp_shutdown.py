@@ -1088,25 +1088,13 @@ async def test_shutdown_journal_timeout_distinguishes_surviving_child(
 import asyncio
 from types import SimpleNamespace
 
-watchdog_started = threading.Event()
 fire_watchdog = threading.Event()
 main_ident = threading.get_ident()
 
 class ControlledTimer(JournalTimer):
-    def start(self):
-        super().start()
-        watchdog_started.set()
-
     def run(self):
         fire_watchdog.wait()
         self.function(*self.args, **self.kwargs)
-
-original_signal = _journal_signal
-def observer_first_signal(self, signum, frame):
-    # Require C-byte observer arming, not the handler's fallback arming.
-    watchdog_started.wait()
-    return original_signal(self, signum, frame)
-_journal_signal = observer_first_signal
 
 def deliver():
     while token := os.read(0, 1):
@@ -1179,7 +1167,7 @@ asyncio.run(run())
             else:
                 assert f"wakeup-byte:{signal.SIGTERM}" in message
                 assert f"signal-enter:{signal.SIGTERM}\n" in message
-                # The observer can start the watchdog across Python dispatch;
+                # Either the observer or main's fallback can arm the watchdog;
                 # only watchdog-start completion must precede cleanup.
                 without_dispatch = message.replace(f"signal-enter:{signal.SIGTERM}\n", "")
                 assert "watchdog-start-enter\nwatchdog-start-returned\ncleanup-enter\n" in without_dispatch
@@ -1191,6 +1179,82 @@ asyncio.run(run())
             if stage == "escalation":
                 assert f"wakeup-byte:{signal.SIGINT}" in message
                 assert f"signal-enter:{signal.SIGINT}\nescalation-survived:" in message
+            assert process.returncode is None
+    finally:
+        if process.returncode is None:
+            process.kill()
+        await process.communicate()
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(
+    sys.platform != "linux",
+    reason="C-delivery handshake relies on Linux MSG_WAITALL copying partial data before waiting",
+)
+async def test_shutdown_journal_observer_arms_watchdog_without_python_dispatch(tmp_path: Path) -> None:
+    progress = tmp_path / "child-progress"
+    source = _journal_source(progress) + r'''
+import asyncio, ctypes
+from types import SimpleNamespace
+
+reader, writer = socket.socketpair()
+libc = ctypes.CDLL(None)
+libc.recv.argtypes = [ctypes.c_int, ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int]
+libc.recv.restype = ctypes.c_ssize_t
+buffer = ctypes.create_string_buffer(2)
+proxy.threading.Timer = InputTimer
+
+def deliver(hooks):
+    writer.sendall(b'x')
+    # Observe main's receive writing byte one, not socket readiness. Keep the
+    # peer open and withhold byte two so main stays inside the C MSG_WAITALL.
+    while buffer[0] != b'x':
+        time.sleep(0.001)
+    record(b'main-blocked')
+    signal.pthread_kill(threading.get_ident(), signal.SIGTERM)
+    record(b'worker-signalled')
+    _journal_flush()
+    # The observer forwards only after _arm_watchdog returns. Unlike waiting
+    # for timer startup, this acknowledgment also completes if arming is broken.
+    forwarded = hooks._wakeup[0]
+    forwarded.setblocking(True)
+    assert forwarded.recv(1) == bytes([signal.SIGTERM])
+    os.write(1, b'observer-returned\n')
+
+def cleanup():
+    record(b'cleanup-enter')
+
+async def run():
+    hooks = proxy._ShutdownHooks(SimpleNamespace(terminate_owned_children=cleanup))
+    hooks.install()
+    threading.Thread(target=deliver, args=(hooks,), daemon=True).start()
+    libc.recv(reader.fileno(), buffer, 2, socket.MSG_WAITALL)
+    record(b'recv-returned')
+    threading.Event().wait()
+
+asyncio.run(run())
+'''
+    process = await asyncio.create_subprocess_exec(
+        sys.executable, "-c", source,
+        stdin=asyncio.subprocess.PIPE,
+        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+        cwd=Path(__file__).resolve().parents[1],
+    )
+    try:
+        async with _shutdown_ceiling(process, progress, lambda: "observer arming acknowledgment"):
+            assert await process.stdout.readline() == b"observer-returned\n"
+            state = progress.read_text()
+            diagnostics = progress.with_suffix(".diagnostics").read_text()
+            setup = [line for line in state.splitlines()
+                     if line in {"handlers-installed", "main-blocked", "worker-signalled"}]
+            assert setup == ["handlers-installed", "main-blocked", "worker-signalled"]
+            assert progress.with_suffix(".wakeup").read_bytes() == bytes([signal.SIGTERM])
+            assert "watchdog-start-enter\nwatchdog-start-returned\n" in state
+            assert "signal-enter:" not in state
+            assert "signal-dispatch:" not in diagnostics
+            assert "cleanup-enter" not in state
+            assert "recv-returned" not in state
+            assert "watchdog-fired" not in state
             assert process.returncode is None
     finally:
         if process.returncode is None:
